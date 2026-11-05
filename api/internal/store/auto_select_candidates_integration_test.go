@@ -374,7 +374,10 @@ func TestAutoSelectCandidatesLiveDB(t *testing.T) {
 	// MaxStaleness is 15m here so `aged` classifies stale on its own merits rather
 	// than because a zero policy makes everything stale, which would let three of
 	// these cases pass for the same wrong reason.
-	classifyPolicy := autoselect.Policy{MinHeadroom: 15, HeadroomTiePct: 5, MaxStaleness: 15 * time.Minute}
+	//
+	// Order is pinned to headroom_first (#3844): the A/B/C permutation check below is the
+	// anchor/cluster (R1) guard, which only the headroom ranking has.
+	classifyPolicy := autoselect.Policy{Order: autoselect.OrderHeadroomFirst, MinHeadroom: 15, HeadroomTiePct: 5, MaxStaleness: 15 * time.Minute}
 	for _, tc := range []struct {
 		name   string
 		id     uuid.UUID
@@ -537,7 +540,7 @@ func TestAutoSelectCandidatesLiveDB(t *testing.T) {
 func sameCandidate(a, b autoselect.Candidate) (string, bool) {
 	// 🔴 THE FIELD COUNT IS THE OTHER HALF OF THIS HELPER, and without it the whole
 	// differential is one struct change away from being decorative. The comparison
-	// below enumerates eleven fields BY HAND; add a twelfth to autoselect.Candidate and
+	// below enumerates twelve fields BY HAND; add a thirteenth to autoselect.Candidate and
 	// it is silently uncompared, so D21's test — the entire reason this seam exists —
 	// would go on agreeing about a field it never looked at. That failure is invisible
 	// in every existing fixture, which is precisely the class this repo keeps getting
@@ -547,8 +550,8 @@ func sameCandidate(a, b autoselect.Candidate) (string, bool) {
 	// EXTEND it with five more fixture cases, and M5/M6 are the milestones most likely
 	// to widen Candidate. Reflection is the Go-side equivalent of the exhaustive
 	// Record<AutoStatus, …> the web already gets from its typechecker.
-	if n := reflect.TypeOf(autoselect.Candidate{}).NumField(); n != 11 {
-		return fmt.Sprintf("autoselect.Candidate has %d fields and this comparison covers 11 by "+
+	if n := reflect.TypeOf(autoselect.Candidate{}).NumField(); n != 12 {
+		return fmt.Sprintf("autoselect.Candidate has %d fields and this comparison covers 12 by "+
 			"hand; add the new one below or the differential silently stops checking it", n), false
 	}
 	i16 := func(p *int16) string {
@@ -573,6 +576,7 @@ func sameCandidate(a, b autoselect.Candidate) (string, bool) {
 		{"SevenDayPct", i16(a.SevenDayPct), i16(b.SevenDayPct)},
 		{"FiveResetsAt", ts(a.FiveResetsAt), ts(b.FiveResetsAt)},
 		{"SevenResetsAt", ts(a.SevenResetsAt), ts(b.SevenResetsAt)},
+		{"WeeklyResetsAt", ts(a.WeeklyResetsAt), ts(b.WeeklyResetsAt)},
 		{"SyncedAt", ts(a.SyncedAt), ts(b.SyncedAt)},
 		{"InFlight", fmt.Sprint(a.InFlight), fmt.Sprint(b.InFlight)},
 	} {

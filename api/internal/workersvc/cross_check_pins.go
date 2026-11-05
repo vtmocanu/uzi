@@ -65,7 +65,7 @@ func (s *Service) preflightCrossCheckPins(ctx context.Context, worker store.Work
 		workerModel = row.DefaultCodexModel
 	}
 	resolved := agenttmpl.ResolveCrossCheck(row.CheckerHarness.String, textPtr(row.Model), textPtr(row.Effort),
-		textPtr(workerModel), textPtr(row.TemplateModel))
+		textPtr(workerModel), textPtr(row.TemplateModel), textPtr(row.TemplateCodexModel))
 	// The custom-model capability gates Codex roots only: a Claude model is never a Codex id.
 	if row.CheckerHarness.String == "codex" && resolved.Model != nil && !agenttmpl.CuratedCodexModels[*resolved.Model] &&
 		!slices.Contains(worker.ProtocolCapabilities, capability.CodexCustomModelV1) {

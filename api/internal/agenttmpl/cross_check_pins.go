@@ -74,8 +74,7 @@ func ValidateFamilyEffort(harness, raw string) (string, error) {
 	return effort, nil
 }
 
-// CrossCheckResolution preserves independent field provenance. templateModel is
-// the first delivered lead/orchestrator's model, even when that model is nil.
+// CrossCheckResolution preserves independent model and effort provenance.
 // An unpinned effort is CrossCheckDefaultEffort, never the worker effort.
 type CrossCheckResolution struct {
 	Model        *string
@@ -84,19 +83,24 @@ type CrossCheckResolution struct {
 	EffortSource string
 }
 
-func ResolveCrossCheck(harness string, model, effort, workerModel, templateModel *string) CrossCheckResolution {
+// ResolveCrossCheck uses the first delivered lead/orchestrator's per-harness
+// template pins after the checker pin and worker lane.
+func ResolveCrossCheck(harness string, model, effort, workerModel, templateModel, templateCodexModel *string) CrossCheckResolution {
 	r := CrossCheckResolution{Model: workerModel, Effort: CrossCheckDefaultEffort,
 		ModelSource: CrossCheckWorkerDefault, EffortSource: CrossCheckDefaultSource}
 	if r.Model == nil {
-		if harness == "codex" {
+		var templatePin string
+		if harness == "codex" && templateCodexModel != nil {
+			templatePin = PinForHarness(harness, "", *templateCodexModel)
+		} else if harness == "claude" && templateModel != nil {
+			templatePin = PinForHarness(harness, *templateModel, "")
+		}
+		if m, err := ValidateModel(templatePin); err == nil && m != "" {
+			r.Model = &m
+		}
+		if harness == "codex" && r.Model == nil {
 			fallback := DefaultCodexModel
 			r.Model = &fallback
-		} else if templateModel != nil {
-			// Reject known curated Codex IDs in the lead template; invalid values use the SDK
-			// default. Custom IDs remain provider-validated.
-			if m, err := ValidateFamilyModel("claude", *templateModel); err == nil {
-				r.Model = &m
-			}
 		}
 	}
 	if model != nil {

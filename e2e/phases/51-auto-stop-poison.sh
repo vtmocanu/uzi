@@ -239,7 +239,7 @@ pass "doc remedy proven: 'uzi worker list' shows the VERSION column and the work
 # LIVE poller for B, so the cancel is only enqueued (stop_kind='cancelled' stamped) and
 # waits for the worker; it never polls inputs, so B stayed `running` and the driver's
 # quarantine logged a LEAK. Do the worker's half the way a real one does after consuming
-# a cancel: report `failed`, which the api routes to CancelRunByWorker because
+# a cancel: report `failed`, which the api routes to CancelRunByWorkerSettlingCancel because
 # stop_kind is already 'cancelled' (workersvc SetState, "failed" arm).
 # Report `failed` only after the cancel was accepted: without the stamped stop_kind the
 # report would record an ordinary agent failure instead of a cancellation.

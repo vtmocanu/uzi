@@ -11,7 +11,7 @@ type Context = ReturnType<WorkerMemoryCommands["begin"]>;
 type Sinks = Readonly<{
   feedback: (result: WorkerMemoryPressureResult, context: Context, signal: AbortSignal, remainingMs: number) => Promise<void>;
   /** Retain every outcome before bounded delivery or tool completion can be skipped. */
-  prepareFeedback: (context: Context, result: WorkerMemoryPressureResult) => void;
+  prepareFeedback: (context: Context, result: WorkerMemoryPressureResult, diagnostics?: unknown) => void;
   preserve: (context: Context, signal: AbortSignal, remainingMs: number) => Promise<void>;
   /** Must synchronously retain this flight's clone/session intent and revoke admission. */
   preparePreservation: (context: Context, result: WorkerMemoryPressureResult) => void;
@@ -119,7 +119,7 @@ export class WorkerMemoryRuntime {
         const bound = sink(context);
         return this.ownedSink(context, "preserve", () => bound.preserve(context, signal, ms));
       },
-      prepareFeedback: (context, result) => sink(context).prepareFeedback(context, result),
+      prepareFeedback: (context, result, diagnostics) => sink(context).prepareFeedback(context, result, diagnostics),
       preparePreservation: (context, result) => sink(context).preparePreservation(context, result),
       preservationBudgetMs: (context) => sink(context).preservationBudgetMs,
     });

@@ -1,5 +1,5 @@
 {
-  "note": "Shared drift-predicate contract (issue #223 item 3). Each case's `shipped` and `stored` are the four mutable columns of an agent template. `expected.differs` pins the two boolean predicates -- agenttmpl.SameContent (Go) and mockApi.sameContent (TS) -- as `differs == !same`. `expected.columns` pins driftedColumns (TS) exactly, in display order and label spelling (note `prompt body`, a space, not `prompt_body`). The Go half has no column notion, so it reads `differs` only. See README.md before editing -- the cases are load-bearing and must not be tidied. Do not add an -update flag on either side.",
+  "note": "Shared drift-predicate contract (issue #223 item 3). Each case's `shipped` and `stored` are the five mutable columns (codex_model is optional; absent means null) of an agent template. `expected.differs` pins the two boolean predicates -- agenttmpl.SameContent (Go) and mockApi.sameContent (TS) -- as `differs == !same`. `expected.columns` pins driftedColumns (TS) exactly, in display order and label spelling (note `prompt body`, a space, not `prompt_body`). The Go half has no column notion, so it reads `differs` only. See README.md before editing -- the cases are load-bearing and must not be tidied. Do not add an -update flag on either side.",
   "cases": [
     {
       "name": "identical",
@@ -84,6 +84,24 @@
       "shipped": { "description": "Implements features.", "model": "opus", "tools": ["Bash", "Read", "Edit"], "prompt_body": "You are the coder.\n" },
       "stored":  { "description": "Implements everything.", "model": "sonnet", "tools": ["Read", "Bash", "Edit"], "prompt_body": "You are the coder. Be terse.\n" },
       "expected": { "differs": true, "columns": ["description", "model", "tools", "prompt body"] }
+    },
+    {
+      "name": "codex-model-value-change",
+      "shipped": { "description": "Implements features.", "model": "sonnet", "codex_model": null, "tools": [], "prompt_body": "You are the coder.\n" },
+      "stored": { "description": "Implements features.", "model": "sonnet", "codex_model": "gpt-6-sol", "tools": [], "prompt_body": "You are the coder.\n" },
+      "expected": { "differs": true, "columns": ["codex model"] }
+    },
+    {
+      "name": "codex-model-null-vs-empty-agree",
+      "shipped": { "description": "Implements features.", "model": null, "codex_model": null, "tools": [], "prompt_body": "You are the coder.\n" },
+      "stored": { "description": "Implements features.", "model": null, "codex_model": "", "tools": [], "prompt_body": "You are the coder.\n" },
+      "expected": { "differs": false, "columns": [] }
+    },
+    {
+      "name": "model-moved-between-harnesses",
+      "shipped": { "description": "Implements features.", "model": "gpt-6-sol", "codex_model": null, "tools": [], "prompt_body": "You are the coder.\n" },
+      "stored": { "description": "Implements features.", "model": null, "codex_model": "gpt-6-sol", "tools": [], "prompt_body": "You are the coder.\n" },
+      "expected": { "differs": true, "columns": ["model", "codex model"] }
     }
   ]
 }

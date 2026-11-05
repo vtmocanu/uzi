@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/validation"
 )
@@ -131,6 +132,10 @@ type Config struct {
 	// kubernetes.io/arch=amd64, because the published agent images are amd64 only and
 	// would crash-loop on an arm64 node of a mixed-arch cluster.
 	WorkerNodeSelector map[string]string
+	// WorkerTolerations are rendered onto every worker pod, all three tiers
+	// (UZI_WORKER_TOLERATIONS, a JSON array of Kubernetes tolerations). Unset, empty,
+	// "null" or "[]" means none, which keeps the pod template hash unchanged.
+	WorkerTolerations []corev1.Toleration
 	// WorkerEphemeralRequest overrides the WORKER container's
 	// requests.ephemeral-storage for a PLAIN worker (issue #224 M-b;
 	// UZI_WORKER_EPHEMERAL_REQUEST). Empty ⇒ the render side's built-in 512Mi.
@@ -316,7 +321,7 @@ type Config struct {
 	WorkerDockerMaxPVCStorage string
 	// WorkerDinDDataSize overrides the size of the DinD daemon's data-root PVC (issue
 	// #224 M-a — it was an emptyDir on node ephemeral storage, which is what got
-	// workers evicted). Empty ⇒ the render side's built-in default (20Gi). Optional
+	// workers evicted). Empty ⇒ the preset table's per-size default (s/m 20Gi, l/l-highmem 50Gi, issue #3890); a set value is a cluster-wide override that wins at every preset. Optional
 	// even when the docker tier is on, and validated as a k8s Quantity when set, so a
 	// typo fails at boot rather than at admission. Note the worker namespaces'
 	// LimitRange caps a PVC at maxPVCStorage (50Gi by default on both worker tiers), so a larger value here is
@@ -489,6 +494,11 @@ func loadWorkerSettings(cfg *Config) error {
 		return err
 	}
 	cfg.WorkerNodeSelector = sel
+	tol, err := parseTolerations(os.Getenv("UZI_WORKER_TOLERATIONS"))
+	if err != nil {
+		return err
+	}
+	cfg.WorkerTolerations = tol
 
 	// The per-worker slot cap (UZI_WORKER_MAX_CONCURRENT_RUNS). Default 1 (empty/unset),
 	// operator-configurable in [1, workerMaxConcurrentRunsCeiling]. A non-integer or an
@@ -806,6 +816,70 @@ func parseNodeSelector(raw string) (map[string]string, error) {
 		return nil, nil
 	}
 	return sel, nil
+}
+
+// parseTolerations reads UZI_WORKER_TOLERATIONS, a JSON array of tolerations, and
+// applies the API server's toleration rules (Equal/Exists only) at boot: a Deployment carrying a toleration
+// the API server rejects would otherwise surface only as workers that never appear.
+// Unknown fields are refused so a misspelt key (e.g. "efect") fails loudly instead of
+// widening the toleration to every effect.
+func parseTolerations(raw string) ([]corev1.Toleration, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "null" {
+		return nil, nil
+	}
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var tols []corev1.Toleration
+	if err := dec.Decode(&tols); err != nil {
+		return nil, fmt.Errorf("UZI_WORKER_TOLERATIONS=%q is not a JSON array of tolerations: %w", raw, err)
+	}
+	if dec.More() {
+		return nil, fmt.Errorf("UZI_WORKER_TOLERATIONS=%q has trailing data after the array", raw)
+	}
+	for i, t := range tols {
+		if err := validateToleration(t); err != nil {
+			return nil, fmt.Errorf("UZI_WORKER_TOLERATIONS[%d]: %w", i, err)
+		}
+	}
+	if len(tols) == 0 {
+		return nil, nil
+	}
+	return tols, nil
+}
+
+// validateToleration applies the API server's per-toleration rules to the supported
+// subset: operators Equal and Exists. The feature-gated Lt and Gt are refused.
+func validateToleration(t corev1.Toleration) error {
+	if t.Key != "" {
+		if errs := validation.IsQualifiedName(t.Key); len(errs) > 0 {
+			return fmt.Errorf("key %q is not a valid label key: %s", t.Key, strings.Join(errs, "; "))
+		}
+	}
+	switch t.Operator {
+	case corev1.TolerationOpEqual, "":
+		if t.Key == "" {
+			return fmt.Errorf("an empty key requires operator Exists")
+		}
+		if errs := validation.IsValidLabelValue(t.Value); len(errs) > 0 {
+			return fmt.Errorf("value %q is not a valid label value: %s", t.Value, strings.Join(errs, "; "))
+		}
+	case corev1.TolerationOpExists:
+		if t.Value != "" {
+			return fmt.Errorf("operator Exists takes no value, got %q", t.Value)
+		}
+	default:
+		return fmt.Errorf("operator %q is not Equal or Exists", t.Operator)
+	}
+	switch t.Effect {
+	case "", corev1.TaintEffectNoSchedule, corev1.TaintEffectPreferNoSchedule, corev1.TaintEffectNoExecute:
+	default:
+		return fmt.Errorf("effect %q is not NoSchedule, PreferNoSchedule or NoExecute", t.Effect)
+	}
+	if t.TolerationSeconds != nil && t.Effect != corev1.TaintEffectNoExecute {
+		return fmt.Errorf("tolerationSeconds requires effect NoExecute")
+	}
+	return nil
 }
 
 // parseQuantityEnv reads an optional k8s-quantity env var into dst, leaving dst

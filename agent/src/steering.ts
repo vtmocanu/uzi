@@ -1698,6 +1698,24 @@ export class SteeringChannel {
         owner.claim_released === false) this.markCancelled();
   }
 
+  /** One bounded, NON-COMMITTING, read-only probe for the held-predecessor seam: a single
+   * ownership read, never an input read (an older api consumes inputs on read, so reading them here
+   * could lose a cancel). `cancel` only when the server reports `cancellation_requested === true` for
+   * a row that is positively this claim generation, unreleased and in an accepted status; anything
+   * else, including a field an older api does not serve, is `unknown`. It never calls markCancelled
+   * and never routes: the caller commits only after its own safety re-check. */
+  async readCancellationRequested(
+    signal: AbortSignal, acceptedStatuses: readonly string[],
+  ): Promise<"cancel" | "unknown"> {
+    const blocked = (): boolean => this.fence !== undefined || this.terminalLifecycle.signal.aborted;
+    if (!Number.isSafeInteger(this.claimGeneration) || this.claimGeneration <= 0 || blocked()) return "unknown";
+    const owner = await this.client.getRunOwnership(this.runId, signal);
+    signal.throwIfAborted();
+    return owner.cancellation_requested === true && acceptedStatuses.includes(owner.status) &&
+      owner.claim_generation === this.claimGeneration && owner.claim_released === false && !blocked()
+      ? "cancel" : "unknown";
+  }
+
   /** Register the re-armable pause-now interrupt (see pauseNowInterrupt, PRD #1190 rework N2).
    *  Last-wins; the runner wires it to the executor's per-run trip so a `now` pause drops the
    *  current turn even after the shared abort controller has been spent by an earlier `now`. */

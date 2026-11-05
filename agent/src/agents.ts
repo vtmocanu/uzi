@@ -10,8 +10,8 @@
 // worker subagents (coder/reviewer/tester). The wire contract carries no
 // explicit role flag, so the lead is identified by name convention
 // (`lead`/`orchestrator`); its prompt_body becomes the main-thread system
-// prompt and it is NOT also registered as an invokable subagent. Every other
-// template becomes an invokable subagent.
+// prompt. All owner templates with lead-shaped names are withheld from the
+// invokable subagents; the remaining templates become invokable subagents.
 //
 // Read-only roles are enforced via each AgentDefinition's `tools` allowlist —
 // subagents inherit the parent's `bypassPermissions` mode and cannot override it,
@@ -132,6 +132,16 @@ export function subagentWriteCapabilities(
  * a test pins that shipped name to this regex so the two never drift.
  */
 export const LEAD_NAME_RE = /^(lead|orchestrator)$/i;
+
+/** The first delivered owner lead wins, even when it has no model pin. */
+export function selectLeadTemplate(templates: readonly AgentTemplate[]): AgentTemplate | undefined {
+  return templates.find((t) => LEAD_NAME_RE.test(t.name));
+}
+
+/** All owner lead-shaped templates are reserved for the root, never delegation. */
+export function ownSubagentTemplates(templates: readonly AgentTemplate[]): AgentTemplate[] {
+  return templates.filter((t) => !LEAD_NAME_RE.test(t.name));
+}
 
 export interface AssembledAgents {
   /** Invokable subagents, keyed by name, for `options.agents`. */
@@ -255,14 +265,12 @@ export function assembleAgents(
   repoSkillNames: readonly string[] = [],
 ): AssembledAgents {
   const result: AssembledAgents = { subagents: {} };
-  let leadSeen = false;
-  for (const t of templates) {
-    if (!leadSeen && LEAD_NAME_RE.test(t.name)) {
-      leadSeen = true;
-      result.leadSystemPrompt = t.prompt_body;
-      if (t.model) result.leadModel = t.model;
-      continue;
-    }
+  const lead = selectLeadTemplate(templates);
+  if (lead) {
+    result.leadSystemPrompt = lead.prompt_body;
+    if (lead.model) result.leadModel = lead.model;
+  }
+  for (const t of ownSubagentTemplates(templates)) {
     result.subagents[t.name] = toDefinition(t, availableSkills, repoSkillNames);
   }
   return result;
@@ -487,10 +495,10 @@ export function selectSubagents(
  * rather than from SDK AgentDefinitions; the template-level counterpart of
  * {@link selectSubagents}, with the same source/exclusion semantics (PRD #37 Decision 5).
  *
- *   - "own":  the owner's templates minus the one named exactly `lead` (the lead is the root
+ *   - "own":  the owner's templates minus every lead-shaped name (the lead is the root
  *             thread, never a delegation target) minus the exclusions.
  *   - "repo": every repo template minus the exclusions. A repo file named `lead` stays an
- *             ordinary subagent: the lead prompt is always uzi's builtin under either source.
+ *             ordinary subagent: the lead prompt always comes from the owner's selected lead.
  *
  * Exclusions are re-applied here worker-side, as in selectSubagents; naming an agent that is
  * not in the chosen source is a harmless no-op.
@@ -502,6 +510,6 @@ export function selectSubagentTemplates(
   exclusions: readonly string[],
 ): AgentTemplate[] {
   const exclude = new Set(exclusions);
-  const pool = source === "repo" ? repoTemplates : ownTemplates.filter((t) => t.name !== "lead");
+  const pool = source === "repo" ? repoTemplates : ownSubagentTemplates(ownTemplates);
   return pool.filter((t) => !exclude.has(t.name));
 }

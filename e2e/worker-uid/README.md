@@ -194,6 +194,60 @@ capability set, `no-new-privileges` and tmpfs `/data` first. Not reproduced, bec
 `CAP_SYS_ADMIN`: the dind container's subPath-only mount view (a process cannot replace or traverse above a
 bind-mount root) and the kubelet's fsGroup application.
 
+After the runner-shared phase, a browser phase (issue #3907) starts the ONE container whose `/nix` is not
+masked. Every container above mounts `--tmpfs /nix`, so the baked Chromium (`/opt/uzi-toolchain/bin/chromium`
+resolves into `/nix/store`) is absent there. The browser container has the same posture as the worker proof:
+root-started through the real `/usr/local/sbin/uzi-entrypoint` (so the real worker/runner/command uid split),
+exactly the entrypoint's five startup capabilities (`CHOWN`, `DAC_OVERRIDE`, `SETPCAP`, `SETUID`, `SETGID`;
+no new capability), `no-new-privileges`, no network, tmpfs `/data`, and the same read-only binds of
+`e2e/worker-uid`, `agent/src`, `agent/test` and `agent/templates`. The only difference is `/nix`: it is a named
+volume `<name>-nix` created by `run.sh` with the invocation label `io.uzi.worker-uid.invocation=<token>`, and
+Docker populates an empty named volume from the image's `/nix` on first mount. Ownership follows the
+other volumes: the name is journaled (`owned_request volume`) BEFORE it is created, `bounded.py verify-volume`
+confirms the label after creation, the container is journaled after the volume so cleanup removes the
+container first, and cleanup removes the volume by exact name only after re-verifying its label. A failed
+create or a foreign label skips the container and fails the run.
+
+The phase runs `e2e/worker-uid/browser-discovery-real.test.mts` (inventory lane
+`node e2e/worker-uid/inventory.mjs browser`; it is not in the default worker lane): two required literal
+leaves under one `INIT_SKIP` gate, so a skip is rejected by the checker. Both launch a real headless Chromium
+through only the variables the production env builders export (`CHROME_PATH` and
+`AGENT_BROWSER_EXECUTABLE_PATH`, both `/usr/local/bin/uzi-chromium`) and decode the PNG screenshot of a
+synthetic page (a solid `rgb(255,0,0)` block on white; compact in-file decoder, no dependency) to prove it
+rendered:
+
+- Claude lane: the real `ClaudeCommandLane` with `cliEnv` from `buildSdkEnv`, so each command gets
+  `guardedCommandEnv(buildSdkEnv(...))` at the runner uid. Separate lane commands launch `$CHROME_PATH`,
+  `$AGENT_BROWSER_EXECUTABLE_PATH` and `agent-browser` through the shim (open, screenshot and close in one
+  command, so its daemon is in the command's tree), then two concurrent `$CHROME_PATH` launches with no
+  `--user-data-dir`, which must create exactly two new private `profile.*` directories under
+  `$HOME/.uzi-chromium`. Afterwards `lane.quiesce` must resolve, the lane must not be poisoned and the real
+  `quiesceRunAttempt` (own mode, real procfs) must report `quiescent` with nothing left to kill: the browser
+  and agent-browser daemon trees are gone. Cleanup failures are recorded and rethrown after every cleanup step
+  has been attempted, so a command that passed with unconfirmed cleanup still fails the test. The agent-browser
+  socket path under the short per-test `HOME` fits a Unix socket (the test asserts it), so no
+  `AGENT_BROWSER_SOCKET_DIR` is set.
+- Codex lane (no claim about agent-browser): the production `makeDefaultSpawnCommand` over the real
+  `launchCodexEffectRoot`, with `buildCommandEnv(..., browserDiscovery = true)` and sandbox mode `off`, runs a
+  shell command as uid 10003 in a runner-group 2770 worktree that the test makes inside the 3775 root made by `runnerTeardownFixture`. The test closes the
+  registry the supported way (`quiesceChildren`, `reapProcesses` must be `observed_empty`, `disposeTools` must be
+  accepted by `acceptsTerminalDisposal` and the registry must not be poisoned).
+
+The container gets a 595-second watchdog plus five-second kill grace (600 seconds). On first mount Docker
+copies the image's `/nix` into the named volume (measured 138 seconds for a 4.1 GB, 181,971-entry store on one
+host, including a du/find), and the entrypoint runs a recursive `chown` over the copied store on first boot
+(estimated 150 to 250 seconds together). The leaves' own timeouts are 200 and 150 seconds (350 seconds), so the
+watchdog holds up to 245 seconds of copy-up plus chown with both leaves running to their full timeouts.
+Both leaves also scan the real procfs after their cleanup checks for any live process of the runner (10002) or
+command (10003) uid whose `comm` or `argv[0]` basename matches `chrom`, `agent-browser` or `crashpad`, polling
+up to five seconds before failing.
+
+Cleanup of the multi-GB `<name>-nix` volume is bounded separately: `bounded.py` gives only the `volume rm` call
+`VOLUME_RM_SECONDS` (120 seconds; removal measured 8.8 seconds for that store) and extends the overall cleanup
+deadline by the same amount; container and image removals keep their 10-second bound. A hard kill (SIGKILL) of
+`run.sh` skips the cleanup trap and can leave the browser container and that volume behind: the `attempted`
+journal under the report directory names them, so remove them by exact name (never a prefix or glob sweep).
+
 `task test:worker-uid-harness` runs the Docker-free checker, shell wrapper and
 required-check regression tests. The wrapper tests stub Node inventory/pattern,
 Docker and timeout, use the real checker, and verify status reporting, stderr,

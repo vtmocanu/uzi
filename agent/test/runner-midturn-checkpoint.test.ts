@@ -4748,3 +4748,112 @@ describe("ownershipRepairAdmitted (issue #3780 M2)", () => {
     assert.equal(admitted(base(safety("closed"))), true);
   });
 });
+
+describe("mid-turn checkpoint tick step logging (issue #3896)", () => {
+  const TICK_STEP = "mid-turn checkpoint tick step";
+  const tickSteps = (lines: unknown[]): Array<Record<string, unknown>> =>
+    (lines as Array<Record<string, unknown>>).filter((l) => l.msg === TICK_STEP);
+
+  it("a publishing tick logs its steps in order, each carrying the run id", async () => {
+    const tmp = scratchDir("tickstep");
+    const shim = writeShim(tmp, "detect");
+    const ctl = control();
+    const pub = stubPublish(async (_n, _tip, pack) => {
+      await drain(pack);
+      return LANDED;
+    });
+    const claim = gitlabClaim(3896_001);
+    const { logger, lines } = recordingLogger();
+    let outcome = "";
+    let before = 0;
+    let during: Array<Record<string, unknown>> = [];
+    try {
+      await mkRunner(
+        mkGit(fx.dataDir, shim),
+        turn(async (ctx) => {
+          commitIn(ctx.worktreePath, "T.txt", "t\n");
+          ctl.advance(INTERVAL_MS + 1);
+          before = tickSteps(lines).length;
+          outcome = await ctl.fire();
+          during = tickSteps(lines).slice(before);
+        }),
+        ctl,
+        {},
+        logger,
+      ).execute(claim);
+      assert.equal(outcome, "published");
+      const steps = during.map((l) => l.step);
+      // The expected subsequence the tick passes through; repeats between them are allowed.
+      const expected = ["fetch_back", "checkpoint_post_import", "checkpoint_steer", "checkpoint_bridge", "checkpoint_overlay"];
+      let at = 0;
+      for (const s of steps) if (s === expected[at]) at++;
+      assert.equal(at, expected.length, `ordered subsequence ${expected.join(",")} in ${JSON.stringify(steps)}`);
+      for (const l of during) {
+        assert.equal(l.run_id, claim.run_id);
+        assert.equal(l.level, "info");
+      }
+      assert.ok(during.every((l) => l.durationMs === undefined && l.outcome === undefined), "enter-only: no duration or outcome fields");
+    } finally {
+      pub.restore();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("the owed publish (a done checkpoint with no ticker) emits no tick step lines", async () => {
+    const tmp = scratchDir("owedstep");
+    const shim = writeShim(tmp, "detect");
+    const safety: CodexExecutionSafety = {
+      kind: "codex",
+      acceptsTerminalDisposal: () => false,
+      withBoundary: async (req, action) => {
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(new Error("boundary deadline")), req.deadlineMs);
+        try {
+          return await action({ epoch: 1, boundary: req.boundary, signal: ac.signal } as unknown as BoundaryPermit);
+        } finally {
+          clearTimeout(timer);
+        }
+      },
+      spawnBoundaryProcess: async (_permit, request) => {
+        const [command, ...args] = request.argv;
+        const child = spawn(command!, args, { cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"] });
+        const completed = new Promise<{ code: number }>((resolve, reject) => {
+          child.once("error", reject);
+          child.once("exit", (code, sig) => resolve({ code: code ?? (sig ? 128 : 1) }));
+        });
+        return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, cancel: async () => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await completed; }, completed };
+      },
+      dispose: async () => ({ kind: "disposed" }),
+    };
+    const pub = stubPublish(async (_n, _tip, pack) => {
+      await drain(pack);
+      return LANDED;
+    });
+    const ctl = control();
+    const claim = gitlabClaim(3896_002);
+    const { logger, lines } = recordingLogger();
+    let sha = "";
+    try {
+      const factory: ExecutorFactory = () => ({
+        executor: {
+          run: async (ctx: RunContext) => {
+            sha = commitIn(ctx.worktreePath, "O.txt", "o\n");
+            await ctx.checkpoint!({ reap: true, sink: "done_checkpoint" });
+            return { branch: ctx.branch };
+          },
+          safety,
+        },
+      });
+      await mkRunner(mkGit(fx.dataDir, shim), factory, ctl, { checkpointTickIntervalMs: 0, codexBoundaryDeadlineMs: 5_000 }, logger).execute(claim);
+      assert.ok(
+        (lines as Array<Record<string, unknown>>).some((l) => l.msg === "checkpoint publish deferred out of the Codex permit (scan_deferred)"),
+        "the done checkpoint deferred its publish, so the owed publish ran",
+      );
+      assert.ok(pub.tips.includes(sha), "the owed publish went out");
+      assert.deepEqual(tickSteps(lines), []);
+    } finally {
+      pub.restore();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});

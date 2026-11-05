@@ -48,7 +48,7 @@ func newPoolFix(t *testing.T) *poolFix {
 	// global, so a leftover owner would leak into later reserve LiveDB tests in this package.
 	t.Cleanup(func() { _, _ = env.pool.Exec(context.Background(), `DELETE FROM users WHERE id = $1`, userID) })
 	svc := atomicSvc(env)
-	svc.p.Autoselect = autoselect.Policy{MinHeadroom: 10, HeadroomTiePct: 5, InflightPenalty: 10}
+	svc.p.Autoselect = autoselect.Policy{Order: autoselect.OrderHeadroomFirst, MinHeadroom: 10, HeadroomTiePct: 5, InflightPenalty: 10}
 	svc.p.CodexUsagePollInterval = 10 * time.Minute
 	cfg, err := pgxpool.ParseConfig(os.Getenv("UZI_TEST_DATABASE_URL"))
 	if err != nil {
@@ -282,6 +282,81 @@ func TestCodexSelectRanksByHeadroomLiveDB(t *testing.T) {
 			assertBound(t, fx.mustCreate(), want.alias, tc.reason)
 		})
 	}
+}
+
+// TestCodexSelectResetFirstPrefersSoonerWeeklyResetLiveDB (#3844): with two eligible accounts the
+// one whose weekly window resets sooner wins under the default reset_first order even though it
+// has LESS headroom; headroom_first, the escape hatch, still picks the emptier account. The
+// 5-hour window of each is nearly empty so the weekly window binds and decides headroom.
+func TestCodexSelectResetFirstPrefersSoonerWeeklyResetLiveDB(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		order autoselect.Order
+		want  string // "a" (sooner weekly reset, 30% headroom) | "b" (later reset, 90% headroom)
+	}{
+		{"reset_first picks the sooner weekly reset", autoselect.OrderResetFirst, "a"},
+		{"default order is reset_first", "", "a"},
+		{"headroom_first picks the emptier account", autoselect.OrderHeadroomFirst, "b"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newPoolFix(t)
+			fx.svc.p.Autoselect.Order = tc.order
+			def := fx.newAccount("def")
+			fx.makeDefault(def.alias)
+			a, b := fx.newAccount("a"), fx.newAccount("b")
+			fx.pool(a.alias, b.alias)
+			fx.readingRaw(a, poolBuckets(true, false, poolWindow(fiveHourSecs, 5, 100000), poolWindow(weekSecs, 70, 5000)), "1 minute")
+			fx.readingRaw(b, poolBuckets(true, false, poolWindow(fiveHourSecs, 5, 100000), poolWindow(weekSecs, 10, 200000)), "1 minute")
+			fx.mode("auto")
+			want := a
+			if tc.want == "b" {
+				want = b
+			}
+			assertBound(t, fx.mustCreate(), want.alias, codexselect.ReasonAuto)
+		})
+	}
+}
+
+// TestCodexSelectResetFirstRanksOnWeeklyNotBindingResetLiveDB (#3844): when the 5-hour window
+// binds (fuller than the weekly one) the binding reset is the 5-hour reset. reset_first must
+// still rank on the WEEKLY reset, so the account with the sooner weekly reset wins even though
+// its 5-hour (binding) reset is the later one. The winner is the higher account key so a
+// key tie-break cannot mask a wrong ranking key.
+func TestCodexSelectResetFirstRanksOnWeeklyNotBindingResetLiveDB(t *testing.T) {
+	fx := newPoolFix(t)
+	fx.svc.p.Autoselect.Order = autoselect.OrderResetFirst
+	def := fx.newAccount("def")
+	fx.makeDefault(def.alias)
+	a, b := fx.newAccount("a"), fx.newAccount("b")
+	fx.pool(a.alias, b.alias)
+	lo, hi := lowerAccount(a, b)
+	// Both: 5h window 80% used (binds, 20 headroom), weekly 40% used.
+	// lo: sooner 5h reset (1000s), later weekly reset (100000s).
+	fx.readingRaw(lo, poolBuckets(true, false, poolWindow(fiveHourSecs, 80, 1000), poolWindow(weekSecs, 40, 100000)), "1 minute")
+	// hi: later 5h reset (9000s), sooner weekly reset (50000s): must win.
+	fx.readingRaw(hi, poolBuckets(true, false, poolWindow(fiveHourSecs, 80, 9000), poolWindow(weekSecs, 40, 50000)), "1 minute")
+	fx.mode("auto")
+	assertBound(t, fx.mustCreate(), hi.alias, codexselect.ReasonAuto)
+}
+
+// TestCodexSelectPoolExhaustedReleaseFollowsBindingResetLiveDB (#3844): pool_exhausted release
+// timing keeps using the binding (5-hour) reset of a limit-reached account; the weekly reset that
+// reset_first ranks on must not leak into it. Each account's weekly reset order is the opposite of
+// its binding reset order, and the winner is the higher account key.
+func TestCodexSelectPoolExhaustedReleaseFollowsBindingResetLiveDB(t *testing.T) {
+	fx := newPoolFix(t)
+	fx.svc.p.Autoselect.Order = autoselect.OrderResetFirst
+	def := fx.newAccount("def")
+	fx.makeDefault(def.alias)
+	a, b := fx.newAccount("a"), fx.newAccount("b")
+	fx.pool(a.alias, b.alias)
+	lo, hi := lowerAccount(a, b)
+	// lo: binding 5h reset late (7200s) but weekly reset soon (1000s).
+	fx.readingRaw(lo, poolBuckets(false, true, poolWindow(fiveHourSecs, 100, 7200), poolWindow(weekSecs, 40, 1000)), "1 minute")
+	// hi: binding 5h reset soon (1800s) but weekly reset late (90000s): releases first.
+	fx.readingRaw(hi, poolBuckets(false, true, poolWindow(fiveHourSecs, 100, 1800), poolWindow(weekSecs, 40, 90000)), "1 minute")
+	fx.mode("auto")
+	assertBound(t, fx.mustCreate(), hi.alias, codexselect.ReasonPoolExhausted)
 }
 
 // TestCodexSelectPoolStaleLiveDB: with the reserve off, accounts with no measurable reading
@@ -728,7 +803,7 @@ func TestCodexSelectMRReworkUsesPoolLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	userID, workerID, repoID := env.seedCodexInfra(t)
 	fx := &poolFix{t: t, env: env, userID: userID, repoID: repoID, svc: atomicMRReworkSvc(env), iid: 100}
-	fx.svc.p.Autoselect = autoselect.Policy{MinHeadroom: 10, HeadroomTiePct: 5, InflightPenalty: 10}
+	fx.svc.p.Autoselect = autoselect.Policy{Order: autoselect.OrderHeadroomFirst, MinHeadroom: 10, HeadroomTiePct: 5, InflightPenalty: 10}
 	fx.svc.p.CodexUsagePollInterval = 10 * time.Minute
 
 	def := fx.newAccount("def")
@@ -757,7 +832,7 @@ func TestCodexSelectMRReworkUsesPoolLiveDB(t *testing.T) {
 func TestCodexSelectPlanCrossCheckChildUsesPoolLiveDB(t *testing.T) {
 	f, w := admissionCheckerBase(t, "plan")
 	fx := &poolFix{t: t, env: f.env, userID: f.userID, svc: f.svc}
-	f.svc.p.Autoselect = autoselect.Policy{MinHeadroom: 10, HeadroomTiePct: 5, InflightPenalty: 10}
+	f.svc.p.Autoselect = autoselect.Policy{Order: autoselect.OrderHeadroomFirst, MinHeadroom: 10, HeadroomTiePct: 5, InflightPenalty: 10}
 	f.svc.p.CodexUsagePollInterval = 10 * time.Minute
 	def := poolAccount{alias: f.aliasID, account: fx.accountOf(f.aliasID)}
 	other := fx.newAccount("other")

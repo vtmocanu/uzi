@@ -75,6 +75,8 @@ describe("installJsDeps: the installer is chosen by the lockfile", () => {
         "--ignore-scripts",
         "--ignore-pnpmfile",
         "--config.manage-package-manager-versions=false",
+        "--config.virtual-store-dir=node_modules/.pnpm",
+        "--config.store-dir=/run/home/.local/share/pnpm/store",
       ],
     },
     {
@@ -103,7 +105,7 @@ describe("installJsDeps: the installer is chosen by the lockfile", () => {
     it(`${c.name}: ${c.lockfile} → ${c.argv.join(" ")}`, async () => {
       const root = mkClone({ "package.json": PKG, [c.lockfile]: "" });
       const { calls, exec } = recorder();
-      const { results, truncated } = await installJsDeps(root, { PATH: "/base/bin" }, { exec });
+      const { results, truncated } = await installJsDeps(root, { PATH: "/base/bin", HOME: "/run/home" }, { exec });
 
       assert.equal(calls.length, 1, "exactly one install");
       assert.deepEqual([calls[0]!.command, ...calls[0]!.args], c.argv);
@@ -130,7 +132,7 @@ describe("installJsDeps: the installer is chosen by the lockfile", () => {
   it("prefers the non-npm lockfile when a stale package-lock.json is left behind", async () => {
     const root = mkClone({ "package.json": PKG, "package-lock.json": "", "pnpm-lock.yaml": "" });
     const { calls, exec } = recorder();
-    const { results } = await installJsDeps(root, {}, { exec });
+    const { results } = await installJsDeps(root, { HOME: "/run/home" }, { exec });
     assert.equal(results[0]!.manager, "pnpm");
     assert.equal(calls[0]!.command, "pnpm");
   });
@@ -172,10 +174,10 @@ describe("installJsDeps: every measured repo-code-execution path is suppressed",
     assert.equal(results[0]!.detail, "YARN_IGNORE_PATH=1 yarn install --frozen-lockfile --ignore-scripts ok");
   });
 
-  it("pnpm carries --ignore-pnpmfile and disables packageManager version handoff", async () => {
+  it("pnpm carries --ignore-pnpmfile, disables packageManager version handoff and pins the virtual store and the per-run store", async () => {
     const root = mkClone({ "package.json": PKG, "pnpm-lock.yaml": "" });
     const { calls, exec } = recorder();
-    await installJsDeps(root, {}, { exec });
+    await installJsDeps(root, { HOME: "/run/home" }, { exec });
     assert.ok(
       calls[0]!.args.includes("--ignore-pnpmfile"),
       "a repo .pnpmfile.cjs executes under --ignore-scripts; this flag is what stops it",
@@ -184,13 +186,32 @@ describe("installJsDeps: every measured repo-code-execution path is suppressed",
       calls[0]!.args.includes("--config.manage-package-manager-versions=false"),
       "without this pnpm fetches and RUNS the pnpm build the repo names in packageManager",
     );
+    assert.ok(
+      calls[0]!.args.includes("--config.virtual-store-dir=node_modules/.pnpm"),
+      "without this a repo .npmrc virtual-store-dir=<abs> makes the install write repo-authored files outside the clone",
+    );
+    assert.ok(
+      calls[0]!.args.includes("--config.store-dir=/run/home/.local/share/pnpm/store"),
+      "without this a repo .npmrc store-dir=<abs> makes the install write pnpm's store outside the clone",
+    );
+  });
+
+  it("pnpm is refused, not run unpinned, when the env has no clean absolute HOME", async () => {
+    for (const env of [{}, { HOME: "" }, { HOME: "relative/home" }, { HOME: "/a/../b" }]) {
+      const root = mkClone({ "package.json": PKG, "pnpm-lock.yaml": "" });
+      const { calls, exec } = recorder();
+      const { results } = await installJsDeps(root, env, { exec });
+      assert.equal(calls.length, 0, `HOME=${JSON.stringify(env)}: the install must not be spawned`);
+      assert.equal(results[0]!.ok, false);
+      assert.match(results[0]!.detail, /could not run: pnpm install needs a clean absolute per-run HOME/);
+    }
   });
 
   it("--ignore-scripts is on EVERY manager's install (settled decision, PRD #121)", async () => {
     for (const lockfile of ["package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock"]) {
       const root = mkClone({ "package.json": PKG, [lockfile]: "" });
       const { calls, exec } = recorder();
-      await installJsDeps(root, {}, { exec });
+      await installJsDeps(root, { HOME: "/run/home" }, { exec });
       assert.ok(calls[0]!.args.includes("--ignore-scripts"), `${lockfile} must suppress lifecycle scripts`);
     }
   });
@@ -238,7 +259,7 @@ describe("installJsDeps: monorepo workspaces resolve to a SINGLE root install", 
       "packages/a/package-lock.json": "",
     });
     const { calls, exec } = recorder();
-    const { results } = await installJsDeps(root, {}, { exec });
+    const { results } = await installJsDeps(root, { HOME: "/run/home" }, { exec });
     assert.equal(calls.length, 1);
     assert.deepEqual(results.map((r) => r.dir), ["."]);
     assert.equal(results[0]!.manager, "pnpm");
@@ -251,7 +272,7 @@ describe("installJsDeps: monorepo workspaces resolve to a SINGLE root install", 
       "packages/a/package.json": PKG,
     });
     const { calls, exec } = recorder();
-    const { results } = await installJsDeps(root, {}, { exec });
+    const { results } = await installJsDeps(root, { HOME: "/run/home" }, { exec });
     assert.equal(calls.length, 1, "the one install that would have worked must be attempted");
     assert.equal(calls[0]!.cwd, root);
     assert.deepEqual(results.map((r) => r.dir), ["."]);

@@ -157,7 +157,7 @@ func TestEffortDefaultsFixtureChecker(t *testing.T) {
 	var ids []string
 	for _, c := range f.Checker {
 		ids = append(ids, c.ID)
-		r := agenttmpl.ResolveCrossCheck(c.Family, nil, c.Pin, nil, nil)
+		r := agenttmpl.ResolveCrossCheck(c.Family, nil, c.Pin, nil, nil, nil)
 		if r.Effort != c.Expect.Effort || r.EffortSource != c.Expect.Source {
 			t.Errorf("%s: checker = %q/%q, want %q/%q", c.ID, r.Effort, r.EffortSource, c.Expect.Effort, c.Expect.Source)
 		}

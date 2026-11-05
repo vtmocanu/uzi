@@ -991,21 +991,21 @@ custody_case "rollback waits for cancellation before renegotiating snapshots" pa
 # permitting the next leg's credential changes or final token teardown.
 autoselect_cancel_boundary() {
   local mode="${1:-delayed}" run
-  AS_RUN=A; AS_RUN2=B; AS_RUN3=C
+  AS_RUN=A; AS_RUN_RF=D; AS_RUN2=B; AS_RUN3=C
   eval "$(awk '/^wait_status\(\) \{/,/^\}/' "$LIB")"
-  for run in "$AS_RUN" "$AS_RUN2" "$AS_RUN3"; do
+  for run in "$AS_RUN" "$AS_RUN_RF" "$AS_RUN2" "$AS_RUN3"; do
     echo 0 > "$SEQ_DIR/as-$run-polls"
     echo pending > "$SEQ_DIR/as-$run-state"
   done
   apipost() {
     [ "$2" = '{"kind":"cancel","body":""}' ] || fail 'unexpected autoselect input'
-    case "$1" in /api/runs/A/inputs|/api/runs/B/inputs|/api/runs/C/inputs) ;; *) fail 'unexpected autoselect cancel route';; esac
+    case "$1" in /api/runs/A/inputs|/api/runs/B/inputs|/api/runs/C/inputs|/api/runs/D/inputs) ;; *) fail 'unexpected autoselect cancel route';; esac
     [ "$mode" != post-failed ] || return 1
     echo '{}'
   }
   apiget() {
     local run="${1##*/}" n status=awaiting_approval
-    case "$run" in A|B|C) ;; *) fail 'unexpected autoselect status route';; esac
+    case "$run" in A|B|C|D) ;; *) fail 'unexpected autoselect status route';; esac
     n="$(cat "$SEQ_DIR/as-$run-polls")"
     echo $((n + 1)) > "$SEQ_DIR/as-$run-polls"
     if [ "$mode" = failed ]; then status=failed
@@ -1013,13 +1013,13 @@ autoselect_cancel_boundary() {
     fi
     jq -nc --arg status "$status" '{run:{status:$status,failure_reason:"fixture terminal outcome"}}'
   }
-  eval "$(awk '/^apipost "\/api\/runs\/\$AS_RUN[23]?\/inputs"/ || /^wait_status "\$AS_RUN[23]?" cancelled/' "$ROOT/e2e/phases/48-auto-selection.sh")"
-  for run in "$AS_RUN" "$AS_RUN2" "$AS_RUN3"; do
+  eval "$(awk '/^apipost "\/api\/runs\/\$AS_RUN(2|3|_RF)?\/inputs"/ || /^wait_status "\$AS_RUN(2|3|_RF)?" cancelled/' "$ROOT/e2e/phases/48-auto-selection.sh")"
+  for run in "$AS_RUN" "$AS_RUN_RF" "$AS_RUN2" "$AS_RUN3"; do
     [ "$(cat "$SEQ_DIR/as-$run-state")" = cancelled ] || fail 'token teardown would start with cancellation still pending'
   done
   echo 'all owned cancellations observed before token teardown'
 }
-custody_case "autoselect observes all three cancellations before credential teardown" pass 'all owned cancellations observed' autoselect_cancel_boundary delayed
+custody_case "autoselect observes all four cancellations before credential teardown" pass 'all owned cancellations observed' autoselect_cancel_boundary delayed
 custody_case "autoselect cancel POST failure cannot proceed to teardown" fail 'could not cancel auto-selection run' autoselect_cancel_boundary post-failed
 custody_case "autoselect unexpected failed outcome cannot proceed to teardown" fail "entered 'failed'" autoselect_cancel_boundary failed
 

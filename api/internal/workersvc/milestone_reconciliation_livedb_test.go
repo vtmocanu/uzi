@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -51,11 +52,24 @@ func seedMilestoneReconciliationFix(t *testing.T, historicalStop ...string) (*ga
 // Publish the replacement through SetStateReport, including the canonical H/P witness.
 func newMilestoneReconciliationFix(t *testing.T, historicalStop ...string) (*gateFix, uuid.UUID, SubmitInputOptions) {
 	t.Helper()
+	return newMilestoneReconciliationFixWith(t, nil, nil, historicalStop...)
+}
+
+// newMilestoneReconciliationFixWith lets a test adjust the published request
+// (before publish) and the run row (before the reset-state digest is read).
+func newMilestoneReconciliationFixWith(t *testing.T, tweakReq func(*StateRequest), afterPublish func(*gateFix, uuid.UUID), historicalStop ...string) (*gateFix, uuid.UUID, SubmitInputOptions) {
+	t.Helper()
 	f, id := seedMilestoneReconciliationFix(t, historicalStop...)
 	req := gateReq(i64(1), uid())
+	if tweakReq != nil {
+		tweakReq(&req)
+	}
 	req.Milestones = &[]Milestone{{ID: "M1", Title: "Replacement one"}, {ID: "M2", Title: "Replacement two"}}
 	req.GateCheckpointWitness = &apitypes.GateCheckpointWitness{SourceHead: "1111111111111111111111111111111111111111", PublishedCheckpoint: retentionTestTip}
 	f.mustPublish(id, req, 1)
+	if afterPublish != nil {
+		afterPublish(f, id)
+	}
 	r, err := f.q.GetRunByID(f.ctx, id)
 	if err != nil {
 		t.Fatal(err)
@@ -84,6 +98,56 @@ func assertReconciliationProgressEmpty(t *testing.T, r store.Run) {
 		!jsonEqual(t, r.MilestonesAgents, "[]") || r.ScopeCeiling.Valid || r.StopKind.Valid || r.StopReason.Valid {
 		t.Fatalf("old progress or scope survived: completed=%s in_progress=%s agents=%s scope=%v stop=%v/%v",
 			r.MilestonesCompleted, r.MilestonesInProgress, r.MilestonesAgents, r.ScopeCeiling, r.StopKind, r.StopReason)
+	}
+}
+
+// Large plan and issue text on the run must not push the audit snapshots over
+// the 8 KiB read cap (the audit would otherwise report details_omitted).
+func TestMilestoneReconciliationAuditLargeRunFieldsLiveDB(t *testing.T) {
+	big := strings.Repeat("x", 20*1024)
+	f, id, opts := newMilestoneReconciliationFixWith(t,
+		func(req *StateRequest) { req.PlanMd = &big },
+		func(f *gateFix, id uuid.UUID) {
+			f.exec("UPDATE runs SET issue_description=$2, issue_comments=$3 WHERE id=$1", id, big,
+				[]byte(`[{"body":"`+big+`"}]`))
+		})
+	f.exec("UPDATE runs SET session_id='predecessor-transcript' WHERE id=$1", id)
+	opts.ExpectedResetStateDigest, _ = ResetStateDigest(reconciliationRow(t, f, id))
+	if _, err := f.svc.SubmitInputWithOptions(f.ctx, f.userID, id, "approve_plan", "", nil, opts); err != nil {
+		t.Fatal(err)
+	}
+	audit, err := f.svc.MilestoneReconciliationAudit(f.ctx, f.userID, id)
+	if err != nil || len(audit) != 1 {
+		t.Fatalf("audit count=%d err=%v", len(audit), err)
+	}
+	var record struct {
+		BeforeState    json.RawMessage `json:"before_state"`
+		AfterState     json.RawMessage `json:"after_state"`
+		DetailsOmitted bool            `json:"details_omitted"`
+	}
+	if err := json.Unmarshal(audit[0], &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.DetailsOmitted || len(record.BeforeState) == 0 || string(record.BeforeState) == "null" ||
+		len(record.AfterState) == 0 || string(record.AfterState) == "null" {
+		t.Fatalf("snapshots omitted: details_omitted=%v before=%d after=%d", record.DetailsOmitted, len(record.BeforeState), len(record.AfterState))
+	}
+	var beforeLen, afterLen int
+	if err := f.pool.QueryRow(f.ctx, `SELECT octet_length(before_state::text), octet_length(after_state::text)
+ FROM run_milestone_reconciliations WHERE run_id=$1`, id).Scan(&beforeLen, &afterLen); err != nil {
+		t.Fatal(err)
+	}
+	if beforeLen > reconciliationSnapshotBytes || afterLen > reconciliationSnapshotBytes {
+		t.Fatalf("snapshot text exceeds %d bytes: before=%d after=%d", reconciliationSnapshotBytes, beforeLen, afterLen)
+	}
+	var old struct {
+		SessionID *string `json:"session_id"`
+	}
+	if err := json.Unmarshal(record.BeforeState, &old); err != nil {
+		t.Fatal(err)
+	}
+	if old.SessionID == nil || *old.SessionID != "predecessor-transcript" {
+		t.Fatal("before_state session_id not preserved")
 	}
 }
 

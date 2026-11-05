@@ -190,6 +190,10 @@ func TestSummaryUsageClaudePricingAndUnreported(t *testing.T) {
 	}{
 		{"priced from the standard table without a provider cost", "claude-haiku-4-5-20251001",
 			`{"inputTokens":400,"outputTokens":40}`, "metered", 600},
+		{"a token-only Haiku 5.5 entry is priced at its base tier (#3920)", "claude-haiku-5-5",
+			`{"inputTokens":400,"outputTokens":40}`, "metered", 60},
+		{"a Haiku 5.5 entry whose prompt is over 100k stays unreported (#3920)", "claude-haiku-5-5",
+			`{"inputTokens":400,"cacheReadInputTokens":99601,"outputTokens":40}`, "unreported", 0},
 		{"a provider cost wins over the table", "claude-haiku-4-5-20251001",
 			`{"inputTokens":400,"outputTokens":40,"costUSD":0.01}`, "metered", 10000},
 		{"an unknown model is unreported, never a metered zero", "claude-unknown-9",

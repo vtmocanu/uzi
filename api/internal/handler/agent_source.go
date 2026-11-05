@@ -69,6 +69,8 @@ type agentSourceRoleDTO struct {
 	Reason      string   `json:"reason,omitempty"`
 	Description string   `json:"description,omitempty"`
 	Model       string   `json:"model,omitempty"`
+	ClaudeModel string   `json:"claude_model"`
+	CodexModel  string   `json:"codex_model"`
 	Tools       []string `json:"tools,omitempty"`
 	PromptBody  string   `json:"prompt_body,omitempty"`
 	// BodySanitized is true when display-sanitization actually altered PromptBody, i.e.
@@ -372,6 +374,7 @@ func stagedToDTO(staged store.AgentSourceStaged, lastAppliedSHA string) *agentSo
 		// not be spoofable by a hostile source's body. Reuse the result for both the
 		// preview body and the body_sanitized honesty flag (do not sanitize twice).
 		sanitizedBody := termsafe.SanitizeTTY(role.PromptBody)
+		def := role.Definition()
 		r := agentSourceRoleDTO{
 			Name: role.Name,
 			OK:   role.OK,
@@ -379,6 +382,8 @@ func stagedToDTO(staged store.AgentSourceStaged, lastAppliedSHA string) *agentSo
 			Reason:      role.Reason,
 			Description: termsafe.CellText(role.Description),
 			Model:       termsafe.CellText(role.Model),
+			ClaudeModel: termsafe.CellText(def.Model),
+			CodexModel:  termsafe.CellText(def.CodexModel),
 			Tools:       role.Tools,
 			PromptBody:  sanitizedBody,
 			// body_sanitized: true only when sanitization changed the body, i.e. the raw

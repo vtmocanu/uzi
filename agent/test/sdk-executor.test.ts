@@ -51,7 +51,7 @@ import type {
 } from "../src/summary-runner.js";
 import { RequestError } from "../src/client.js";
 import { REASON_COMPLETION_STALL } from "../src/completion-attempt.js";
-import { makeClaim, nonexistentWorktreeFactory, nullLogger, recordingLogger } from "./helpers.js";
+import { leadRequestCaseAgents, makeClaim, nonexistentWorktreeFactory, nullLogger, recordingLogger } from "./helpers.js";
 import { makeGitRepo, PR_SUMMARY_EXPECTED, PR_SUMMARY_INPUT } from "./pr-summary-fixture.js";
 
 // A worktree path that is UNIQUE PER PROCESS AND PER CALL, and that deliberately
@@ -2590,7 +2590,8 @@ describe("SdkExecutor guardrail options", () => {
           // worker secret. TMPDIR is not a secret. AGENT_BROWSER_ARGS is a non-secret browser launch
           // FLAG (buildSdkEnv, issue #709): it guarantees --no-sandbox survives a shim bypass, not a
           // credential — the no-PAT / no-join-token assertions below still hold.
-          const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENT_BROWSER_ARGS"]);
+          const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENT_BROWSER_ARGS",
+          "AGENT_BROWSER_EXECUTABLE_PATH", "CHROME_PATH"]);
           if (process.env.UZI_RUNNER_TMPDIR || process.env.TMPDIR) expected.add("TMPDIR");
           if (sqlcDir !== undefined) expected.add("UZI_SQLC_DIR");
           assert.deepStrictEqual(new Set(Object.keys(env)), expected);
@@ -3199,13 +3200,14 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
   it("every claude request_case of the shared matrix is what the executor actually sends to the SDK", async () => {
     const contract = JSON.parse(
       fs.readFileSync(path.join(import.meta.dirname, "..", "..", "fixtures", "lead-config", "contract.json"), "utf8"),
-    ) as { request_cases: Array<{ id: string; harness: string; phase: "plan" | "implement"; config: ClaimConfig; templateModel?: string; expect: { model?: string; effort?: string } }> };
+    ) as { request_cases: Array<{ id: string; harness: string; phase: "plan" | "implement"; config: ClaimConfig; templateModel?: string; agents?: Array<{ name: string; model?: string | null }>; expect: import("../src/lead-config-report.js").LeadRequest }> };
     const cases = contract.request_cases.filter((c) => c.harness === "claude");
-    assert.ok(cases.length >= 5, "the claude matrix is loaded, not empty");
+    assert.equal(cases.length, 10, "all Claude request cases loaded");
     const visited: string[] = [];
     for (const c of cases) {
-      const { model: _drop, ...leadNoModel } = lead;
-      const leadT: AgentTemplate = c.templateModel !== undefined ? { ...leadNoModel, model: c.templateModel } : leadNoModel;
+      const agents = leadRequestCaseAgents(c);
+      const { posts, make } = reporterRig();
+      const reporter = make(c.config);
       const planPhase = c.phase === "plan";
       const { queryFn, turns } = fakeTurns(
         planPhase
@@ -3214,8 +3216,8 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
       );
       const { ctx } = makeCtx(
         planPhase
-          ? { agents: [leadT, coder], config: c.config }
-          : { agents: [leadT, coder], config: c.config, planApproved: true, seeded: true, sessionId: null, approvedPlan: "# Approved" },
+          ? { agents, config: c.config, leadConfig: reporter }
+          : { agents, config: c.config, leadConfig: reporter, planApproved: true, seeded: true, sessionId: null, approvedPlan: "# Approved" },
         approveWith("own"),
       );
       await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
@@ -3229,9 +3231,24 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
         if (c.expect.effort === undefined) assert.ok(!("effort" in t.options), `${c.id}: no effort key`);
         else assert.equal(t.options.effort, c.expect.effort, `${c.id}: sent effort`);
       }
+      const phasePosts = posts.filter((p) => p.phase === c.phase);
+      if (leadConfigActive(c.config)) {
+        assert.ok(phasePosts.length > 0, `${c.id}: requested report posted`);
+        for (const p of phasePosts) {
+          assert.deepEqual(
+            [p.requested_model, p.requested_model_source, p.requested_effort, p.requested_effort_mode, p.requested_effort_source],
+            [c.expect.model ?? null, c.expect.modelSource, c.expect.effort ?? null, c.expect.effortMode, c.expect.effortSource],
+            `${c.id}: requested report`,
+          );
+        }
+      } else {
+        assert.equal(reporter.enabled, false, c.id);
+        assert.equal(posts.length, 0, `${c.id}: old claims stay inactive`);
+      }
       visited.push(c.id);
     }
     assert.deepEqual(visited, cases.map((c) => c.id));
+    assert.equal(visited.length, 10);
   });
 
   /** fakeTurns plus init frames carrying `effort`, and an optional getSettings on each instance. */

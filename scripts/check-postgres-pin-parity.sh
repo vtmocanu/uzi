@@ -4,14 +4,14 @@
 #   check-postgres-pin-parity.sh [<compose-file> <ci-workflow> <store-it-script>]
 #     defaults: docker-compose.yml .github/workflows/ci.yml e2e/run-store-it.sh
 #
-# 1. ci.yml's test-api-store-it UZI_CI_PG_IMAGE pins the same tag AND digest as
+# 1. ci.yml's UZI_CI_PG_IMAGE (the single LiveDB job, test-codex-refresh-lostreply-e2e) pins the same tag AND digest as
 #    docker-compose.yml's db. The CI step pulls through mirror.gcr.io
 #    (Docker Hub's anonymous rate limit), so Renovate sees two packages (`postgres`,
 #    `mirror.gcr.io/library/postgres`). renovate.json groups them into one branch
 #    (#2622); this fails the gate if they still drift (a hand edit, or a branch
 #    carrying only one).
-# 2. Every floating `postgres:<tag>` reference in ci.yml and run-store-it.sh (the codex
-#    job's UZI_STORE_IT_PG_IMAGE, its docker-pull-fallback.sh argument, the script's
+# 2. Every floating `postgres:<tag>` reference in ci.yml and run-store-it.sh (any
+#    UZI_STORE_IT_PG_IMAGE or docker-pull-fallback.sh argument, the script's
 #    default) uses the pinned tag. Renovate does not manage floating tags, so a major
 #    bump of the pins must carry them by hand; this makes that bump's PR red until it does.
 #

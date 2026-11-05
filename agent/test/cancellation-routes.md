@@ -46,7 +46,7 @@ another observation. Expiry retains evidence for a later bounded attempt.
 | handler/v1_jobs.go V1JobCancel; workersvc/jobs.go CancelJob; workersvc/job_sweeps.go CancelRevokedProductJobs | SubmitInputWithOptions cancel; H during download/session/result upload | job-runner.test.ts all three owner cancel phases |
 | forgesvc/mr_watch.go cancel adapter; workersvc/mr_rework_cancel.go CancelReworkForMR | Live CreateStopVerdictInput or direct CancelRunServerSide; N/T/U | runner-owner-cancel-v2.test.ts; recovery-inventory.test.ts terminal run-kind matrix |
 | workersvc/autostop.go auto-stop live branch | cancel wire with auto_stopped verdict; failed preservation, no new discard policy | steering.test.ts epoch-exempt cancel; recovery-inventory.test.ts failed matrix |
-| workersvc/service.go SetState stopped failure or stamped cancelled verdict | CancelRunByWorker; N/T/U; worker cannot request cancelled directly | runner-owner-cancel-v2.test.ts terminal ACK; runner-cancellation-deadline.test.ts |
+| workersvc/service.go SetState stopped failure or stamped cancelled verdict | CancelRunByWorker for stopped failure; CancelRunByWorkerSettlingCancel for a stamped cancelled verdict, including the held-predecessor refusal report, settles pending cancel inputs atomically; N/T/U; worker cannot request cancelled directly | runner-owner-cancel-v2.test.ts terminal ACK; runner-cancellation-deadline.test.ts; runner-held-seam-cancel.test.ts |
 | workersvc/service.go SetState BranchMoved | SupersedeRunByWorker for mr_rework/ci_fix; N/T/U; no stale-claim grant | recovery-inventory.test.ts kind matrix; runner-stopped-source.test.ts fencing |
 | workersvc/forgepark.go parkForgeUnreachable; providerpark.go parkProviderOutage; diskpark.go parkDataVolumeFull; codex_account_runpark.go parkRunningCodexAccountTx | Locked stop takes precedence over park through CancelRunByWorker; N/T/U | runner-unadopted-guarded-settle.test.ts terminal ACK/probe and stale controls; runner-codex-sinks-vault-recovery.test.ts |
 | workersvc/submit.go cancelPendingOutcomeRun | Row-locked CancelRunServerSideWithPendingOutcome after explicit confirmation; N/T/U; discard bit selects pending outcome, not source | runner-terminal-journal.test.ts first winner; runner-owner-cancel-v2.test.ts source preservation |
@@ -62,6 +62,7 @@ Installed triggers are enumerated separately below.
 | runtime.sql | CancelRunServerSide |
 | runtime.sql | CancelRunServerSideWithPendingOutcome |
 | runtime.sql | CancelRunByWorker |
+| runtime.sql | CancelRunByWorkerSettlingCancel |
 | runtime.sql | SupersedeRunByWorker |
 | runtime.sql | ExpirePlanCrossCheck |
 | runtime.sql | SupersedeExitedPlanCrossChecks |
