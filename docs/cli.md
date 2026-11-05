@@ -469,6 +469,10 @@ A few worth knowing:
   `milestone_reconciliations_next_before_gate_revision`; omitted cursor means
   no further page. Server-shortened reasons or omitted oversized snapshots
   are marked `reason_truncated` / `details_omitted`.
+  Before and after snapshots carry a fixed set of reconciliation fields
+  (milestones, contract, gate and claim state), not the whole run, so plan and
+  issue text do not count against the size limit; oversized milestone or
+  contract values can still be omitted.
 - **`run stop <id>`** gracefully winds down a run. On an **interactive**
   task run (one created with `uzi handoff --interactive`; see [Interactive
   mode](./handoff.md#interactive-mode)) the current turn
