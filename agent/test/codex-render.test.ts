@@ -1,5 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { parseCodexAgentFile } from "../src/repoagents-codex.js";
+import { filterRepoAgentModel } from "../src/repoagents.js";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -403,6 +405,25 @@ describe("renderCodexRun — custom worker-root model passthrough (PRD #1551)", 
 });
 
 describe("renderCodexRun — per-role resolution and root-ness", () => {
+  it("resolves parsed and projected TOML pins through perRoleModels with unchanged effort", () => {
+    for (const pin of ['model = "gpt-6-luna"', "", 'model = ""']) {
+      const parsed = parseCodexAgentFile(
+        'name = "coder"\ndescription = "Works."\ndeveloper_instructions = "Implement."\n' + pin, "file",
+      );
+      assert.equal(parsed.ok, true);
+      if (!parsed.ok) return;
+      const template = filterRepoAgentModel(parsed.template, "codex");
+      const run = renderCodexRun(runRequest({
+        model: "gpt-6-astra", effort: "low",
+        agents: { coder: agent({ description: template.description, prompt: template.prompt_body, model: template.model ?? undefined }) },
+      }));
+      assert.deepEqual(run.perRoleModels.get("coder"), {
+        model: pin === 'model = "gpt-6-luna"' ? "gpt-6-luna" : "gpt-6-astra",
+        modelReasoningEffort: "low",
+      });
+    }
+  });
+
   it("an agent model overrides the request model; absent inherits it; effort is request-scoped", () => {
     const run = renderCodexRun(
       runRequest({

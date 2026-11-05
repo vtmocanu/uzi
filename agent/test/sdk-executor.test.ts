@@ -934,13 +934,13 @@ describe("SdkExecutor agent selection at the gate boundary (PRD #37)", () => {
     assert.ok(!append.includes("REPO LEAD BODY"), "the repo lead body never reaches the main-thread prompt");
   });
 
-  it("issue #2085: a .codex/agents TOML-sourced template gets the repo guards (untrusted passage, structural Agent denial, no tools or model)", { skip: !HAS_PROCFS ? "reads procfs (Linux only)" : realProcfsSkip("SdkExecutor: TOML repo guards") }, async () => {
+  it("issue #2085: a .codex/agents TOML-sourced template gets the repo guards (untrusted passage, structural Agent denial, no tools or Claude model pin)", { skip: !HAS_PROCFS ? "reads procfs (Linux only)" : realProcfsSkip("SdkExecutor: TOML repo guards") }, async () => {
     const clone = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-sdk-toml-"));
     try {
       fs.mkdirSync(path.join(clone, ".codex", "agents"), { recursive: true });
       fs.writeFileSync(
         path.join(clone, ".codex", "agents", "t.toml"),
-        'name = "toml-agent"\ndescription = "From toml."\ndeveloper_instructions = "TOML BODY"\nmodel = "gpt-5"\n',
+        'name = "toml-agent"\ndescription = "From toml."\ndeveloper_instructions = "TOML BODY"\nmodel = "gpt-6-luna"\n',
       );
       const detected = await detectRepoAgents(clone, "claude");
       assert.deepStrictEqual(detected.agents.map((a) => a.name), ["toml-agent"]);
