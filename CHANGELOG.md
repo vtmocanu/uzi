@@ -29,7 +29,7 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 ## [Unreleased]
 
-## [0.86.1] - 2026-11-01
+## [0.86.1] - 2026-11-05
 
 ### Added
 
