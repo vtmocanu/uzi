@@ -1489,8 +1489,8 @@ uzi run recovery <run-id> [--json]
   automatically on archive readiness; guarded holds await final inventory acknowledgment.
   The narrow recovery-hold exception is an OPEN hold for `recovery_wait` /
   `worker_requeue_exhausted`, `worker_memory_pressure`,
-  `retained_recovery_exhausted` (timed or held), or
-  `retained_recovery_adoption_failed`: it remains `source_only`, or `needs_action` after a failed
+  `retained_recovery_exhausted` (timed or held),
+  `retained_recovery_adoption_failed`, or `retained_continuation_unwitnessed`: it remains `source_only`, or `needs_action` after a failed
   latest capture, even with an available archive or capture in flight. Retained
   exhaustion with a finite retry can retry automatically; its NULL retry requires
   owner Resume/Cancel. Adoption failure always requires owner Resume/Cancel.
@@ -3648,9 +3648,12 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   without an automatic timer. Retained-source budget exhaustion can use cause
   `retained_recovery_exhausted`: three timed retries by default, then an owner
   hold with no countdown. An integrity refusal uses `retained_recovery_adoption_failed`,
-  requiring owner Resume or Cancel with no automatic retry. See
-  [Retained recovery exhausted](#retained-recovery-exhausted) and
-  [Retained recovery adoption failed](#retained-recovery-adoption-failed). A Codex credential
+  requiring owner Resume or Cancel with no automatic retry. A retained continuation
+  whose departure was never witnessed uses the server-only cause
+  `retained_continuation_unwitnessed`, with the same owner-only Resume or Cancel.
+  See [Retained recovery exhausted](#retained-recovery-exhausted),
+  [Retained recovery adoption failed](#retained-recovery-adoption-failed) and
+  [Unwitnessed continuation hold](#unwitnessed-continuation-hold). A Codex credential
   refresh or release that found the owner's vault locked also parks here
   (cause `vault_locked`); it takes the same capped backoff and no lifetime
   cap. The owner's successful explicit vault unlock or eligible foreground
@@ -3978,6 +3981,18 @@ NEEDS YOU. Explicit `--until` keeps its selected status set. See
 [Retained recovery adoption failed](run-recovery-wait.md#retained-recovery-adoption-failed)
 for storage risks and rollout requirements.
 
+### Unwitnessed continuation hold
+
+`recovery_wait` / `retained_continuation_unwitnessed` means a retained
+continuation (a run with an open custody hold from an earlier claim generation)
+was claimed, its `running` report was refused, and no flight departure was
+witnessed within twice the claim grace. The claim is released and local work and
+custody are kept; there is **no automatic retry**. `uzi run get`, `list`, the
+inputs view and the TUI show an owner hold. Read `uzi run recovery <id>`, then
+`uzi run resume <id>` or `uzi run cancel <id>`. Default `uzi run wait` and log
+follow stop for this decision; explicit `--until` keeps its status set. See
+[Unwitnessed continuation hold](run-recovery-wait.md#unwitnessed-continuation-hold).
+
 ### Waiting for a state: `uzi run wait`
 
 `uzi run wait <id>` blocks until the run reaches a state you can act on — the
@@ -3988,8 +4003,8 @@ built-in primitive for driving a gated run headless, replacing the hand-rolled
 rest (`queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/`recovery_wait`/`paused`),
 except a default wait also stops at `recovery_wait` with cause
 `worker_requeue_exhausted`, `worker_memory_pressure`,
-`retained_recovery_adoption_failed`, or owner-held `retained_recovery_exhausted`
-or `codex_idle_stall` (NULL retry), and at a `paused` run held on
+`retained_recovery_adoption_failed`, `retained_continuation_unwitnessed`, or
+owner-held `retained_recovery_exhausted` or `codex_idle_stall` (NULL retry), and at a `paused` run held on
 `base_attestation_missing`, for an owner decision:
 timed limit and recovery waits retry on a timer, pool waits need an available pooled token,
 and ordinary owner or lead pauses need `uzi run resume`. A bare `run wait` means

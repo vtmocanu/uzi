@@ -1071,7 +1071,13 @@ type Store interface {
 	UpdateRunLastSeq(ctx context.Context, arg store.UpdateRunLastSeqParams) (int64, error)
 
 	// Sweeper + register-time orphan recovery.
-	SweepClaimedNeverStarted(ctx context.Context, cutoff pgtype.Timestamptz) ([]store.SweepClaimedNeverStartedRow, error)
+	// SweepClaimedNeverStartedCohort (issue #3859) runs the claimed-never-started passes in ONE
+	// transaction: charge (or park at the cap) a witnessed retained-custody departure, park an
+	// unwitnessed continuation whose witness window passed, then reset the rest uncharged.
+	SweepClaimedNeverStartedCohort(ctx context.Context, arg store.SweepClaimedNeverStartedCohortParams) (store.SweepClaimedNeverStartedCohortResult, error)
+	// RecordRunRegistrationEvidence (issue #3859) stores the worker's registration witness from
+	// its first running report. It runs BEFORE SetRunRunning and does not depend on that write.
+	RecordRunRegistrationEvidence(ctx context.Context, arg store.RecordRunRegistrationEvidenceParams) (int64, error)
 	// SweepTaskNeverDispatched terminalizes a kind='task' (handoff) run left queued with
 	// dispatched_at NULL past the dispatch grace window (issue #1367): the CLI never landed
 	// its push/dispatch, so ClaimRun never offers it and no other sweep touches it. Server-
@@ -4095,6 +4101,13 @@ func branchMovedStopReason(reason *string) string {
 // column and the M2 worker client); the Go field stays
 // `State` to avoid churn in the switch below.
 type StateRequest struct {
+	// RegistrationEvidence (issue #3859, feature run_registration_evidence_v1) is the worker's own
+	// (claim_generation, register_nonce, registration epoch) on a `running` report. It is recorded
+	// BEFORE the status write and independently of whether that write applies, so a report a
+	// SetRunRunning guard refuses still leaves the witness that lets the sweep tell a departed
+	// flight from a slow one. Valid only on `running`; httpx.DecodeJSON rejects unknown fields, so
+	// the field MUST exist here or a new worker's report 400s.
+	RegistrationEvidence       *RegistrationEvidence           `json:"registration_evidence,omitempty"`
 	SourcePublication          *SourcePublicationReport        `json:"source_publication,omitempty"`
 	RegisterNonce              string                          `json:"register_nonce,omitempty"`
 	MemoryEpisode              *int64                          `json:"memory_episode,omitempty"`
@@ -8554,6 +8567,14 @@ func (s *Service) hasLivePoller(ctx context.Context, run store.Run) (bool, error
 type SweepResult struct {
 	WorkersOffline int64
 	ClaimedReset   int64
+	// ClaimedCharged and ClaimedExhausted (issue #3859) count claimed-never-started
+	// continuations the charge pass requeued with requeue_count + 1, and parked at
+	// recovery_wait/worker_requeue_exhausted once the episode budget was spent.
+	ClaimedCharged   int64
+	ClaimedExhausted int64
+	// ClaimedUnwitnessed counts continuations parked at recovery_wait /
+	// retained_continuation_unwitnessed after their witness window passed (issue #3859).
+	ClaimedUnwitnessed int64
 	// TaskUndispatchedFailed is the number of kind='task' (handoff) runs this pass
 	// terminalized because they sat queued with dispatched_at NULL past DispatchGrace —
 	// the CLI never landed their push/dispatch (issue #1367). Normally 0: a handoff is

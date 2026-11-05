@@ -199,6 +199,7 @@ func TestForgeCooldownStatesAndHostileRenderers(t *testing.T) {
 func TestForgeAdvicePreservesActionableBoardGuidance(t *testing.T) {
 	for _, tc := range []struct{ name, status, cause, hold string }{
 		{"retained adoption", "recovery_wait", "retained_recovery_adoption_failed", ""},
+		{"retained unwitnessed", "recovery_wait", "retained_continuation_unwitnessed", ""},
 		{"retained exhaustion", "recovery_wait", "retained_recovery_exhausted", ""},
 		{"memory", "recovery_wait", "worker_memory_pressure", ""},
 		{"provider", "recovery_wait", "provider_outage", ""},

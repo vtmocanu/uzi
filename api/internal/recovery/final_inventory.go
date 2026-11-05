@@ -52,7 +52,7 @@ func finalInventoryEligible(hold store.RecoveryCustodyHold, workerID uuid.UUID, 
 	}
 	// Requeue exhaustion and memory pressure release the claim but leave custody an owner-only decision
 	// (Resume/Cancel); a worker's archive or settled proof must not end it implicitly.
-	if run.status == "recovery_wait" && run.parkCause.Valid && (run.parkCause.String == "worker_requeue_exhausted" || run.parkCause.String == "worker_memory_pressure" || run.parkCause.String == "retained_recovery_exhausted" || run.parkCause.String == "retained_recovery_adoption_failed") {
+	if run.status == "recovery_wait" && run.parkCause.Valid && (run.parkCause.String == "worker_requeue_exhausted" || run.parkCause.String == "worker_memory_pressure" || run.parkCause.String == "retained_recovery_exhausted" || run.parkCause.String == "retained_recovery_adoption_failed" || run.parkCause.String == "retained_continuation_unwitnessed") {
 		return false
 	}
 	// A forge_unreachable park is a pre-clone park of a generation that may have adopted nothing:

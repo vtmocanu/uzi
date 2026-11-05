@@ -34,7 +34,7 @@ function tagCase(block: string): string {
 const EXPECTED_TAG_CASE =
   "(CASE WHEN (r.status = 'awaiting_approval' AND NOT r.auto_approve) " +
   "OR r.status IN ('awaiting_input', 'paused') " +
-  "OR (r.status = 'recovery_wait' AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_adoption_failed')) " +
+  "OR (r.status = 'recovery_wait' AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')) " +
   "OR (r.status = 'recovery_wait' AND r.recovery_wait_cause IN ('retained_recovery_exhausted', 'codex_idle_stall') AND r.recovery_retry_not_before IS NULL) " +
   "THEN 'needs_owner' ELSE 'progressing' END)";
 
@@ -49,7 +49,7 @@ function parseList(list: string): Set<string> {
 function serverShape(block: string) {
   const status = block.match(/r\.status IN \('awaiting_input', 'paused'\)/);
   const owner = block.match(
-    /r\.recovery_wait_cause IN (\('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_adoption_failed'\))/,
+    /r\.recovery_wait_cause IN (\('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed'\))/,
   );
   const stamped = block.match(
     /r\.recovery_wait_cause IN (\('retained_recovery_exhausted', 'codex_idle_stall'\)) AND r\.recovery_retry_not_before IS NULL/,
@@ -112,7 +112,7 @@ describe("parkDisposition against ListMaintenanceHeldRuns", () => {
   it("finds the server's owner conditions in the SQL", () => {
     expect(shape.statusOwner).toBe(true);
     expect(shape.alwaysOwnerCauses).toEqual(
-      new Set(["worker_requeue_exhausted", "worker_memory_pressure", "retained_recovery_adoption_failed"]),
+      new Set(["worker_requeue_exhausted", "worker_memory_pressure", "retained_recovery_adoption_failed", "retained_continuation_unwitnessed"]),
     );
     expect(shape.nullStampOwnerCauses).toEqual(new Set(["retained_recovery_exhausted", "codex_idle_stall"]));
   });

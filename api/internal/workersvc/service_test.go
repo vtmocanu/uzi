@@ -340,7 +340,15 @@ type fakeStore struct {
 	stampWorkerStaleCutoff pgtype.Timestamptz
 	stampRows              int64
 	// Rows the sweep queries return (PRD #25 M3): each drives a published transition.
-	sweptClaimed       []store.SweepClaimedNeverStartedRow
+	sweptClaimed []store.SweepClaimedNeverStartedRow
+	// Issue #3859: the claimed-never-started charge pass and the registration evidence write.
+	chargedClaimed     []store.ChargeClaimedNeverStartedContinuationsRow
+	cohortArg          *store.SweepClaimedNeverStartedCohortParams
+	unwitnessedClaimed []store.ParkUnwitnessedContinuationsRow
+	chargeErr          error
+	evidenceArgs       []store.RecordRunRegistrationEvidenceParams
+	evidenceRows       int64
+	evidenceErr        error
 	sweptUndispatched  []store.SweepTaskNeverDispatchedRow // issue #1367
 	sweptWallRequested []store.RequestWallParksRow         // PRD #1497 M1: RequestWallParks rows
 	sweptWallParked    []store.ParkRunsAtWallRow           // PRD #1497 M1: ParkRunsAtWall rows
@@ -1420,10 +1428,15 @@ func (f *fakeStore) MarkStaleWorkersOffline(_ context.Context, cutoff pgtype.Tim
 	f.callOrder = append(f.callOrder, "mark_stale")
 	return 0, nil
 }
-func (f *fakeStore) SweepClaimedNeverStarted(_ context.Context, cutoff pgtype.Timestamptz) ([]store.SweepClaimedNeverStartedRow, error) {
-	f.claimCutoff = cutoff
+func (f *fakeStore) SweepClaimedNeverStartedCohort(_ context.Context, arg store.SweepClaimedNeverStartedCohortParams) (store.SweepClaimedNeverStartedCohortResult, error) {
+	f.cohortArg = &arg
+	f.claimCutoff = arg.Cutoff
 	f.callOrder = append(f.callOrder, "claimed_never_started")
-	return f.sweptClaimed, nil
+	return store.SweepClaimedNeverStartedCohortResult{Charged: f.chargedClaimed, Unwitnessed: f.unwitnessedClaimed, Reset: f.sweptClaimed}, f.chargeErr
+}
+func (f *fakeStore) RecordRunRegistrationEvidence(_ context.Context, arg store.RecordRunRegistrationEvidenceParams) (int64, error) {
+	f.evidenceArgs = append(f.evidenceArgs, arg)
+	return f.evidenceRows, f.evidenceErr
 }
 func (f *fakeStore) SweepTaskNeverDispatched(_ context.Context, arg store.SweepTaskNeverDispatchedParams) ([]store.SweepTaskNeverDispatchedRow, error) {
 	f.taskDispatchCutoff = arg.Cutoff

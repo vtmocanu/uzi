@@ -2819,7 +2819,20 @@ export type CapabilityInferenceEvidence = Partial<Record<"docker" | "jvm", {
   truncated: boolean;
 }>>;
 
+/** Issue #3859: negotiated feature for the `running` report's registration witness. */
+export const RUN_REGISTRATION_EVIDENCE_FEATURE = "run_registration_evidence_v1";
+
+/** Issue #3859: the witness that this worker registered the flight at `registration_epoch`
+ *  under `register_nonce`. Attached by the client to a `running` report only. */
+export interface RunRegistrationEvidence {
+  register_nonce: string;
+  claim_generation: number;
+  registration_epoch: number;
+}
+
 export interface StateRequest {
+  /** Issue #3859: set by the client alone, never by a caller. */
+  registration_evidence?: RunRegistrationEvidence;
   /** Memory-pressure park fence, bound to the current registration. */
   register_nonce?: string;
   /** Memory-pressure episode; zero is the first episode. */
@@ -3249,6 +3262,9 @@ export interface StateAck {
   completedPublicationReceipt?: CompletedPublicationReceipt;
   completedPublicationReason?: CompletedPublicationReason;
   reconciliation?: PlanCrossCheckReconciliation;
+  /** Issue #3859: the server's top-level answer to a report that carried registration_evidence.
+   *  Logged only; no behavior branches on it. */
+  registrationEvidence?: "recorded" | "refused";
   /** Whether the server applied the transition. Diagnostics and logging only —
    *  see the warning above before branching on it. */
   applied: boolean;

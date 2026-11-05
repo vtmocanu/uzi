@@ -222,7 +222,7 @@ queue the run. An available archive does not automatically release this
 hold's retained custody. After discarded/released precedence, an OPEN hold at
 `recovery_wait` for `worker_memory_pressure`,
 `worker_requeue_exhausted`, `retained_recovery_exhausted` (timed or held),
-or `retained_recovery_adoption_failed`,
+`retained_recovery_adoption_failed`, or `retained_continuation_unwitnessed`,
 reports `needs_action` when its latest capture failed,
 otherwise `source_only`, before available unguarded archives or capture progress.
 Other custody attention decisions retain their existing ordering.
@@ -593,6 +593,11 @@ retained recovery keep same-path continuity.
 
 A confirmed `adoption_failed` blocker can instead hold at `recovery_wait` /
 `retained_recovery_adoption_failed` for owner Resume or Cancel, with no timer.
+A retained continuation whose `running` report the server refuses, and whose
+flight departed or showed presence without a witnessed departure, is charged
+against the requeue budget or held at `retained_continuation_unwitnessed`
+instead of being reset uncharged; see
+[Unwitnessed continuation hold](run-recovery-wait.md#unwitnessed-continuation-hold).
 A fresh owned claim and a new raw owner grant charge one reservation in a new
 three-iteration/five-minute window; a higher derived episode alone cannot renew
 adoption. Without a new grant it reholds without capture or model execution;
@@ -2021,7 +2026,7 @@ trusted unsent outcome protected against a second execution.
 The open hold for that originating worker and exact claim generation G
 stays in custody. An OPEN hold for `recovery_wait` /
 `worker_requeue_exhausted`, `retained_recovery_exhausted` (timed or held),
-or `retained_recovery_adoption_failed` reports `source_only`, or `needs_action`
+`retained_recovery_adoption_failed`, or `retained_continuation_unwitnessed` reports `source_only`, or `needs_action`
 if its latest
 capture failed, before archive readiness or capture progress is considered.
 The same narrow OPEN-hold exception applies to `worker_memory_pressure` at

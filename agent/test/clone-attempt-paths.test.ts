@@ -14,7 +14,9 @@ import { execFileSync } from "node:child_process";
 import type { ExecutorResult, RunContext } from "../src/executor.js";
 import { CapturePathMismatchError, GitCache, type AttemptSeedOptions, type RecoveryJournalEntry } from "../src/git.js";
 import { LimitReachedError } from "../src/limit.js";
-import { RunRunner, failOriginForReason, type ExecutorFactory } from "../src/runner.js";
+import { RunRunner, StaleClaimError, failOriginForReason, type ExecutorFactory } from "../src/runner.js";
+import { ActiveRunRegistry } from "../src/active-run-registry.js";
+import { RUN_REGISTRATION_EVIDENCE_FEATURE } from "../src/protocol.js";
 import { CodexSessionStore } from "../src/codex/session-state.js";
 import { formatAttemptId, formatResidueName, parseAttemptPath } from "../src/attempt-path.js";
 import { InvalidRecoveryClonePathError } from "../src/recovery-progress.js";
@@ -1858,6 +1860,236 @@ describe("issue #3404 M2 U3: a retained predecessor is admitted before its captu
     await runner.execute(gitlabClaim(iid, { run_id: runId, claim_generation: 6 }));
     assert.ok(reserve.mock.callCount() > 0, "a confirmed source end allows the next claim to reserve");
     assert.equal(started(), 1, "the release control reaches the successor executor");
+  });
+
+  // ─── issue #3859: registration evidence on the running report ahead of every retained refusal ───
+
+  const EVIDENCE_NONCE = "nonce-3859-registration";
+  /** A registered worker whose api advertises run_registration_evidence_v1, plus an active-run registry. */
+  async function evidenceWorld(): Promise<ActiveRunRegistry> {
+    api.setRegisterProtocolFeatures(["claim_generation_fence", RUN_REGISTRATION_EVIDENCE_FEATURE]);
+    api.registerNonce = EVIDENCE_NONCE;
+    await client.register("w-3859", undefined, 1, undefined, ["credential_switch_v1"]);
+    return new ActiveRunRegistry();
+  }
+  /** Every `running` body of one claim generation as it reached the wire, refused or not. */
+  const runningWire = (runId: string, generation: number) =>
+    api.stateWire.filter((s) => s.runId === runId && s.body.status === "running" && s.body.claim_generation === generation).map((s) => s.body);
+  const nonTerminalReports = (runId: string) =>
+    api.states.filter((s) => s.runId === runId && ["failed", "completed", "limit_wait", "recovery_wait", "paused", "cancelled"].includes(s.body.status));
+
+  /** The claim's single running body carries the witness for this generation and nonce, with an
+   *  epoch in [claim-lane snapshot, next built snapshot), and the next built snapshot omits the run. */
+  function assertWitness(registry: ActiveRunRegistry, runId: string, generation: number, preClaimEpoch: number, continues = false): void {
+    const bodies = runningWire(runId, generation);
+    if (continues) {
+      assert.ok(bodies.length >= 1, "a continuing claim reports running");
+      for (const later of bodies.slice(1)) assert.equal("registration_evidence" in later, false, "only the first running report carries the witness");
+    } else assert.equal(bodies.length, 1, `exactly one running report for generation ${generation}`);
+    const evidence = bodies[0]!.registration_evidence;
+    assert.ok(evidence, `generation ${generation} running report carries registration_evidence`);
+    assert.equal(evidence.register_nonce, EVIDENCE_NONCE);
+    assert.equal(evidence.claim_generation, generation);
+    assert.ok(evidence.registration_epoch >= preClaimEpoch, `epoch ${evidence.registration_epoch} >= pre-claim snapshot ${preClaimEpoch}`);
+    const next = registry.build();
+    assert.ok(evidence.registration_epoch < next.snapshot_epoch, "the next built snapshot has a strictly larger epoch");
+    assert.equal(next.active.some((e) => e.run_id === runId), false, "the next built snapshot omits the departed flight");
+  }
+
+  it("issue #3859: a guard-refused running report still carries evidence for every repeated held-predecessor claim", async (t) => {
+    const iid = 2905;
+    const runId = randomUUID();
+    const pred = await seedPredecessor(iid, runId, { attempt: true });
+    const before = treeHash(pred.clonePath);
+    const { current } = await runtimes();
+    const earlier = new Set<string>();
+    await current.recordAdmissions(earlier, () => current.bindSource(pred.clonePath));
+    current.retireSink(earlier);
+    const registry = await evidenceWorld();
+    const journal = readJournal(iid);
+    const ledger = readLedger(iid);
+    const { factory, started } = transientFactory();
+    const { calls, quiesceRun } = recorded(fastQuiesce);
+    const { runner, git: runnerGit } = restartedWorker(factory, { quiesceRun, authority: current, activeRuns: registry });
+    const reserve = t.mock.method(runnerGit, "reserveRecoveryIteration");
+    for (const generation of [2, 3, 4, 5]) {
+      api.setOwnershipStatus(runId, "running", generation);
+      // The server refuses this claim's running report: not applied, status still claimed.
+      api.failStateWhen(runId, (b) => b.status === "running", { httpStatus: 409, runStatus: "claimed" });
+      const preClaimEpoch = registry.build().snapshot_epoch;
+      await runner.execute(gitlabClaim(iid, { run_id: runId, claim_generation: generation }));
+      assertWitness(registry, runId, generation, preClaimEpoch);
+      assert.equal(reserve.mock.callCount(), 0, "a held source never charges a recovery iteration");
+      assert.deepEqual(calls, [], "no capture or quiesce proof ran");
+      assert.equal(started(), 0, "no model start");
+      assert.deepEqual(nonTerminalReports(runId), [], "no terminal or park report");
+      assert.deepEqual(readJournal(iid), journal, "the journal is unchanged");
+      assert.deepEqual(readLedger(iid), ledger, "the ledger is unchanged");
+      assert.equal(treeHash(pred.clonePath), before, "the tree is unchanged");
+    }
+  });
+
+  it("issue #3859: a late SourceUseHeldRefusal after a passed precheck consumes exactly one reservation and the next claim stops at the precheck", async (t) => {
+    const iid = 2906;
+    const runId = randomUUID();
+    const pred = await seedPredecessor(iid, runId, { attempt: true });
+    const before = treeHash(pred.clonePath);
+    const { current } = await runtimes();
+    const earlier = new Set<string>();
+    await current.recordAdmissions(earlier, () => current.bindSource(pred.clonePath));
+    current.retireSink(earlier);
+    const registry = await evidenceWorld();
+    const { factory, started } = transientFactory();
+    const { calls, quiesceRun } = recorded(fastQuiesce);
+    const { logger, lines } = recordingLogger();
+    const { runner, git: runnerGit } = restartedWorker(factory, { quiesceRun, authority: current, activeRuns: registry }, logger);
+    const reserve = t.mock.method(runnerGit, "reserveRecoveryIteration");
+    // The runner's precheck reads "not held"; the authoritative admission then still refuses.
+    t.mock.method(current, "heldByOtherSink", () => false, { times: 1 });
+
+    api.setOwnershipStatus(runId, "running", 2);
+    let preClaimEpoch = registry.build().snapshot_epoch;
+    await runner.execute(gitlabClaim(iid, { run_id: runId, claim_generation: 2 }));
+    assertWitness(registry, runId, 2, preClaimEpoch);
+    assert.equal(reserve.mock.callCount(), 1, "the late refusal consumed exactly one reservation");
+    assert.equal(readJournal(iid)?.recovery?.blocker, undefined, "no blocker was persisted");
+    assert.deepEqual(nonTerminalReports(runId), [], "no terminal or park report");
+    assert.equal(started(), 0, "no model work");
+    assert.deepEqual(calls, [], "the refusal precedes the capture's first proof");
+    assert.equal(treeHash(pred.clonePath), before);
+
+    const mark = lines.length;
+    api.setOwnershipStatus(runId, "running", 3);
+    preClaimEpoch = registry.build().snapshot_epoch;
+    await runner.execute(gitlabClaim(iid, { run_id: runId, claim_generation: 3 }));
+    assertWitness(registry, runId, 3, preClaimEpoch);
+    assert.ok(lines.slice(mark).some((l) => (l as { msg?: string }).msg?.includes("held by an earlier flight")), "the next claim stopped at the precheck");
+    assert.equal(reserve.mock.callCount(), 1, "the next claim reserved nothing");
+    assert.deepEqual(nonTerminalReports(runId), []);
+    assert.equal(started(), 0);
+  });
+
+  it("issue #3859: a valid handoff after the earlier use ended carries evidence, reserves and continues", async (t) => {
+    const iid = 2907;
+    const runId = randomUUID();
+    const pred = await seedPredecessor(iid, runId, { attempt: true });
+    const { current } = await runtimes();
+    const earlier = new Set<string>();
+    await current.recordAdmissions(earlier, () => current.bindSource(pred.clonePath));
+    current.retireSink(earlier);
+    assert.equal((await current.endSourceUse([pred.clonePath], { sink: earlier })).ended.length, 1);
+    const registry = await evidenceWorld();
+    const { factory, started } = transientFactory();
+    const { runner, git: runnerGit } = restartedWorker(factory, { quiesceRun: fastQuiesce, authority: current, activeRuns: registry });
+    const reserve = t.mock.method(runnerGit, "reserveRecoveryIteration");
+    api.setOwnershipStatus(runId, "running", 6);
+    const preClaimEpoch = registry.build().snapshot_epoch;
+    await runner.execute(gitlabClaim(iid, { run_id: runId, claim_generation: 6 }));
+    assert.ok(reserve.mock.callCount() > 0, "a confirmed source end allows the claim to reserve");
+    assert.equal(started(), 1, "the continuation reaches the successor executor");
+    assertWitness(registry, runId, 6, preClaimEpoch, true);
+  });
+
+  it("issue #3859: a genuine capture failure still reaches the bounded failure path with evidence on its running report", async () => {
+    const iid = 2908;
+    const runId = randomUUID();
+    const pred = await seedPredecessor(iid, runId, { attempt: true });
+    const journalBefore = readJournal(iid);
+    const registry = await evidenceWorld();
+    const { factory, started } = transientFactory();
+    const { calls, quiesceRun } = recorded(captureAnswers("unverified"));
+    const preClaimEpoch = registry.build().snapshot_epoch;
+    const timedOut = await boundedExecute(wired(factory, { quiesceRun, activeRuns: registry }), gitlabClaim(iid, { run_id: runId, claim_generation: 2 }));
+    assert.equal(timedOut, false, "the capture is refused up front, never retried to the bound");
+    assert.equal(calls[0]?.site, "predecessor_capture");
+    assert.equal(api.states.filter((s) => s.body.status === "failed").at(-1)?.body.fail_origin, "worker_residue_blocked");
+    assert.equal(started(), 0);
+    assertChargedSource(iid, journalBefore!, "quiescence_failed");
+    assert.equal(fs.existsSync(path.join(pred.clonePath, "ONLY_COPY.txt")), true);
+    const bodies = runningWire(runId, 2);
+    assert.equal(bodies.length, 1);
+    assert.equal(bodies[0]!.registration_evidence?.claim_generation, 2);
+    assert.ok((bodies[0]!.registration_evidence?.registration_epoch ?? -1) >= preClaimEpoch);
+  });
+
+  it("issue #3859: a live flight whose claim the server released stops nonterminally with its own source retained and leaves the registry", async () => {
+    const iid = 2909;
+    const runId = randomUUID();
+    const pred = await seedPredecessor(iid, runId, { attempt: true });
+    const { current } = await runtimes();
+    // The predecessor's source use ended, so the claim is admitted and the flight binds ITS OWN source.
+    const earlier = new Set<string>();
+    await current.recordAdmissions(earlier, () => current.bindSource(pred.clonePath));
+    current.retireSink(earlier);
+    assert.equal((await current.endSourceUse([pred.clonePath], { sink: earlier })).ended.length, 1);
+    const registry = await evidenceWorld();
+    // The harness has no awaited mid-flight report an executor can trigger (the roster and session-id
+    // reports are fire-and-forget), so the executor throws the StaleClaimError that the reportState
+    // closure throws on a stale_claim ack. From then on every process proof is unverified, so this
+    // flight's source-capable tails are not positively joined.
+    let stale = false;
+    let started = 0;
+    let before: { path: string; journal: ReturnType<typeof readJournal>; ledger: Map<string, LedgerEntry>; accounting: string[] } | undefined;
+    const factory: ExecutorFactory = (id) => ({
+      homeDir: path.join(homeDir, id),
+      executor: {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          started++;
+          before = { path: ctx.worktreePath, journal: readJournal(iid), ledger: readLedger(iid), accounting: configGetAll(`uzi-recoveryowner.${runId}.record`) };
+          stale = true;
+          throw new StaleClaimError();
+        },
+      },
+    });
+    const quiesceRun = async (req: QuiesceRunRequest): Promise<QuiesceRunOutcome> => stale
+      ? { process: { state: "unverified", processes: [], killed: [], detail: "scripted unverified" }, docker: { state: "docker_unconfirmed", removed: [], detail: "" } }
+      : fastQuiesce(req);
+    const { logger, lines } = recordingLogger();
+    const { runner } = restartedWorker(factory, { quiesceRun, authority: current, activeRuns: registry }, logger);
+    api.setOwnershipStatus(runId, "running", 6);
+    const preClaimEpoch = registry.build().snapshot_epoch;
+    await runner.execute(gitlabClaim(iid, { run_id: runId, claim_generation: 6 }));
+    assert.ok(before, "the flight bound its own source and reached the executor");
+    assert.notEqual(path.resolve(before.path), path.resolve(pred.clonePath), "the flight's own source is not the predecessor's");
+    // (1) source retained: this flight's clone stays on disk and its slot is not ended while the tails are unjoined.
+    assert.equal(fs.existsSync(before.path), true);
+    const slot = await slotOf(current, before.path);
+    assert.equal(slot?.state, "active", "the flight's own source slot is not ended while its tails are unjoined");
+    assert.ok(lines.some((l) => (l as { msg?: string }).msg?.includes("not positively joined")), "the unjoined-tails early return ran");
+    assert.ok(lines.some((l) => (l as { msg?: string }).msg === "run claim superseded server-side (stale_claim); stopping this flight"), "the stale_claim stop ran");
+    // (2) nonterminal stop: no terminal or park report, no further model work.
+    assert.deepEqual(nonTerminalReports(runId), []);
+    assert.equal(started, 1);
+    // (3) registry exit: the witness was sent and the next built snapshot omits the flight.
+    assertWitness(registry, runId, 6, preClaimEpoch, true);
+    // (4) custody unchanged by the stop.
+    assert.deepEqual(readJournal(iid), before.journal);
+    assert.deepEqual(readLedger(iid), before.ledger);
+    assert.deepEqual(configGetAll(`uzi-recoveryowner.${runId}.record`), before.accounting);
+  });
+
+  it("issue #3859: the registration epoch is captured once at registration, not re-read from a snapshot built before the first running report", async (t) => {
+    const iid = 2910;
+    const runId = randomUUID();
+    const registry = await evidenceWorld();
+    const add = registry.add.bind(registry);
+    let epochAtAdd: number | undefined;
+    let builtBetween: number | undefined;
+    t.mock.method(registry, "add", (...args: Parameters<ActiveRunRegistry["add"]>) => {
+      const token = add(...args);
+      // The flight captures the epoch synchronously after add() returns; a snapshot built right after
+      // that (before the first running report is sent) must not move the witness.
+      epochAtAdd = registry.latestBuiltEpoch();
+      queueMicrotask(() => { builtBetween = registry.build().snapshot_epoch; });
+      return token;
+    });
+    const { factory } = transientFactory();
+    api.setOwnershipStatus(runId, "running", 3);
+    await wired(factory, { activeRuns: registry }).execute(gitlabClaim(iid, { run_id: runId, claim_generation: 3 }));
+    assert.ok(epochAtAdd !== undefined && builtBetween !== undefined, "a snapshot was built between registration and the first report");
+    assert.ok(epochAtAdd < builtBetween, "the in-between snapshot has a later epoch");
+    const first = runningWire(runId, 3)[0];
+    assert.equal(first?.registration_evidence?.registration_epoch, epochAtAdd, "the witness names the epoch captured at registration");
   });
 
   it("a predecessor whose previous use ended is admitted with a fresh epoch before the first proof", async () => {
