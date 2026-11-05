@@ -223,9 +223,13 @@ type fakeStore struct {
 	activeRunsAllErr error
 
 	// Ownership + messages + state.
-	runOwned             store.Run
-	runOwnedErr          error
-	livePublishAttemptID uuid.UUID
+	runOwned    store.Run
+	runOwnedErr error
+	// Issue #3937: GetRunOwnershipByWorker returns runOwned/runOwnedErr plus this explicitly
+	// configured held-seam cancel signal, and records its params.
+	cancellationRequested bool
+	ownershipParams       *store.GetRunOwnershipByWorkerParams
+	livePublishAttemptID  uuid.UUID
 	// Orphan-classification read (issue #1319): orphanParams captures the args so a test
 	// can prove the owner-scope (user_id + the claimant's repo_id, NOT worker_id);
 	// orphanRow/orphanErr drive the return.
@@ -1093,6 +1097,10 @@ func (f *fakeStore) MarkCheckpointPublishAttemptReady(_ context.Context, id uuid
 
 func (f *fakeStore) GetRunOwnedByWorker(context.Context, store.GetRunOwnedByWorkerParams) (store.Run, error) {
 	return f.runOwned, f.runOwnedErr
+}
+func (f *fakeStore) GetRunOwnershipByWorker(_ context.Context, arg store.GetRunOwnershipByWorkerParams) (store.GetRunOwnershipByWorkerRow, error) {
+	f.ownershipParams = &arg
+	return store.GetRunOwnershipByWorkerRow{Run: f.runOwned, CancellationRequested: f.cancellationRequested}, f.runOwnedErr
 }
 func (f *fakeStore) GetRunOrphanIdentity(_ context.Context, arg store.GetRunOrphanIdentityParams) (store.GetRunOrphanIdentityRow, error) {
 	f.orphanParams = &arg

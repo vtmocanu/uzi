@@ -12,21 +12,10 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// ownershipQueryStore adds the optional GetRunOwnershipByWorker query to fakeStore, the way
-// *store.Queries has it, so RunOwnership takes the signal-bearing read.
-type ownershipQueryStore struct {
-	*fakeStore
-	row store.GetRunOwnershipByWorkerRow
-	err error
-}
-
-func (s *ownershipQueryStore) GetRunOwnershipByWorker(context.Context, store.GetRunOwnershipByWorkerParams) (store.GetRunOwnershipByWorkerRow, error) {
-	return s.row, s.err
-}
-
-// Issue #3860: a store without GetRunOwnershipByWorker (the unit fakes) falls back to
-// GetRunOwnedByWorker and reports cancellationRequested=false, even for a stamped run.
-func TestRunOwnershipFallbackReportsNoCancellation(t *testing.T) {
+// Issue #3937: GetRunOwnershipByWorker is a required Store query, so RunOwnership reports exactly
+// the signal the query returns. A run stamped stop_kind='cancelled' whose query signal is false
+// (no deliverable cancel input) reports false: the Go side never infers it from stop_kind.
+func TestRunOwnershipExplicitFalseSignal(t *testing.T) {
 	run := store.Run{ID: uuid.New(), Kind: "issue", Status: "running", ClaimGeneration: 5,
 		StopKind: pgtype.Text{String: "cancelled", Valid: true}}
 	s := New(&fakeStore{runOwned: run}, nil, testParams())
@@ -36,29 +25,38 @@ func TestRunOwnershipFallbackReportsNoCancellation(t *testing.T) {
 	}
 }
 
-// With the query available, the signal rides the same row and the Go-side ownership refusals
-// (cross_check at generation 0, lane mismatch, no row) still apply.
-func TestRunOwnershipQueryPathSignalAndRefusals(t *testing.T) {
+// The signal rides the query's row, and the Go-side ownership refusals (cross_check at
+// generation 0, lane mismatch, no row) and query errors still apply.
+func TestRunOwnershipQuerySignalAndRefusals(t *testing.T) {
 	id := uuid.New()
 	issue := store.Run{ID: id, Kind: "issue", Status: "running", ClaimGeneration: 2}
+	stamped := issue
+	stamped.StopKind = pgtype.Text{String: "cancelled", Valid: true}
 	for name, tc := range map[string]struct {
-		row     store.GetRunOwnershipByWorkerRow
-		err     error
-		wkr     store.Worker
-		want    bool
-		wantErr error
+		run       store.Run
+		requested bool
+		err       error
+		wkr       store.Worker
+		want      bool
+		wantErr   error
 	}{
-		"signal true":          {row: store.GetRunOwnershipByWorkerRow{Run: issue, CancellationRequested: true}, want: true},
-		"signal false":         {row: store.GetRunOwnershipByWorkerRow{Run: issue}},
-		"no row":               {err: pgx.ErrNoRows, wantErr: ErrRunNotOwned},
-		"cross_check gen 0":    {row: store.GetRunOwnershipByWorkerRow{Run: store.Run{ID: id, Kind: "cross_check"}, CancellationRequested: true}, wantErr: ErrRunNotOwned},
-		"lane mismatch":        {row: store.GetRunOwnershipByWorkerRow{Run: issue, CancellationRequested: true}, wkr: store.Worker{IsolatedLane: true}, wantErr: ErrRunNotOwned},
-		"unrelated query fail": {err: errors.New("boom"), wantErr: errors.New("boom")},
+		"signal true":                 {run: stamped, requested: true, want: true},
+		"signal false":                {run: stamped},
+		"signal true, NULL stop_kind": {run: issue, requested: true, want: true},
+		"no row":                      {err: pgx.ErrNoRows, requested: true, wantErr: ErrRunNotOwned},
+		"cross_check gen 0":           {run: store.Run{ID: id, Kind: "cross_check"}, requested: true, wantErr: ErrRunNotOwned},
+		"lane mismatch":               {run: stamped, requested: true, wkr: store.Worker{IsolatedLane: true}, wantErr: ErrRunNotOwned},
+		"unrelated query fail":        {err: errors.New("boom"), requested: true, wantErr: errors.New("boom")},
 	} {
 		tc.wkr.ID = uuid.New()
-		s := New(&ownershipQueryStore{fakeStore: &fakeStore{}, row: tc.row, err: tc.err}, nil, testParams())
+		fs := &fakeStore{runOwned: tc.run, runOwnedErr: tc.err, cancellationRequested: tc.requested}
+		s := New(fs, nil, testParams())
 		_, _, _, _, _, _, got, err := s.RunOwnership(context.Background(), tc.wkr, id)
 		switch {
+		case fs.ownershipParams == nil:
+			t.Errorf("%s: GetRunOwnershipByWorker was not called", name)
+		case fs.ownershipParams.ID != id || fs.ownershipParams.WorkerID.Bytes != tc.wkr.ID:
+			t.Errorf("%s: query params = %+v, want run %s worker %s", name, *fs.ownershipParams, id, tc.wkr.ID)
 		case tc.wantErr == ErrRunNotOwned && !errors.Is(err, ErrRunNotOwned):
 			t.Errorf("%s: err = %v, want ErrRunNotOwned", name, err)
 		case tc.wantErr != nil && tc.wantErr != ErrRunNotOwned && (err == nil || err.Error() != tc.wantErr.Error()):
