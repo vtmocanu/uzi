@@ -220,6 +220,32 @@ describe("OverviewNext for an admin", () => {
   });
 });
 
+describe("Capacity rail", () => {
+  it("lists every owner worker on the rail, including one with no stats, and drops Worker load", async () => {
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [
+        aWorker({ id: "w1", name: "statless-worker", active_runs: 1, max_concurrent_runs: 2 }),
+        aWorker({ id: "w2", name: "gone-worker", status: "offline" }),
+      ],
+    });
+    await mount();
+    expect(screen.queryByText("Worker load")).toBeNull();
+    const rail = screen.getByRole("heading", { name: /Capacity/ }).closest("section") as HTMLElement;
+    expect(within(rail).getByText("1 of 2")).toBeTruthy();
+    expect(within(rail).getByText("statless-worker")).toBeTruthy();
+    expect(within(rail).getByText("gone-worker")).toBeTruthy();
+    expect(within(rail).getAllByText("No stats reported")).toHaveLength(2);
+  });
+
+  it("keeps Worker load on /dashboard", async () => {
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [aWorker({ stats_cpu_pct: 10, stats_mem_bytes: 1024, stats_source: "cgroup" })],
+    });
+    await mount("dashboard");
+    expect(screen.getByText("Worker load")).toBeTruthy();
+  });
+});
+
 describe("carried-over sections take the same inputs as Dashboard", () => {
   it("feeds the custody alert the viewer's own recovery_wait count only, never the admin rows", async () => {
     vi.mocked(useAuth).mockReturnValue(authValue(admin));

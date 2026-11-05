@@ -125,3 +125,73 @@ describe("OverviewNext at 400px", () => {
     );
   });
 });
+
+describe("OverviewNext capacity rail", () => {
+  function mountPreview() {
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [
+        aWorker({
+          id: "w1",
+          name: "a-worker-with-an-exceedingly-long-name-that-must-truncate-rather-than-push-the-rail-sideways",
+          status: "online",
+          active_runs: 1,
+          max_concurrent_runs: 2,
+          stats_cpu_pct: 34,
+          stats_mem_bytes: 2147483648,
+          stats_mem_limit_bytes: 4294967296,
+          stats_source: "cgroup",
+        }),
+        aWorker({ id: "w2", name: "quiet", status: "offline" }),
+      ],
+    });
+    render(
+      <MemoryRouter initialEntries={["/overview/next"]}>
+        <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+          <OverviewNext />
+        </main>
+      </MemoryRouter>,
+    );
+  }
+
+  it("opens and closes a worker disclosure to reveal its stat line", async () => {
+    await page.viewport(1280, 900);
+    mountPreview();
+    await screen.findByText("Capacity");
+    const stat = await screen.findByText(/cpu 34%/);
+    const details = stat.closest("details") as HTMLDetailsElement;
+    expect(details.open).toBe(false);
+    expect(stat.checkVisibility(), "closed: stat line hidden").toBe(false);
+    (details.querySelector("summary") as HTMLElement).click();
+    expect(details.open).toBe(true);
+    expect(stat.checkVisibility(), "open: stat line visible").toBe(true);
+    (details.querySelector("summary") as HTMLElement).click();
+    expect(details.open).toBe(false);
+  });
+
+  it("sits beside the runs widget on desktop", async () => {
+    await page.viewport(1280, 900);
+    mountPreview();
+    await screen.findByText("Capacity");
+    await document.fonts.ready;
+    const runs = (screen.getByRole("heading", { name: "Runs" }).closest("div.rounded-xl") as HTMLElement).getBoundingClientRect();
+    const rail = (screen.getByRole("heading", { name: /Capacity/ }).closest("div.rounded-xl") as HTMLElement).getBoundingClientRect();
+    expect(rail.left).toBeGreaterThanOrEqual(runs.right);
+  });
+
+  it("stacks below the runs widget at 400px with no horizontal overflow", async () => {
+    await page.viewport(400, 900);
+    mountPreview();
+    await screen.findByText("Capacity");
+    await document.fonts.ready;
+    expect(window.innerWidth).toBe(400);
+    const runs = (screen.getByRole("heading", { name: "Runs" }).closest("div.rounded-xl") as HTMLElement).getBoundingClientRect();
+    const railCard = screen.getByRole("heading", { name: /Capacity/ }).closest("div.rounded-xl") as HTMLElement;
+    const rail = railCard.getBoundingClientRect();
+    expect(rail.top, "rail below the runs widget").toBeGreaterThanOrEqual(runs.bottom);
+    expect(rail.right).toBeLessThanOrEqual(window.innerWidth);
+    for (const el of railCard.querySelectorAll<HTMLElement>("li, li *")) {
+      expect.soft(el.getBoundingClientRect().right, `${el.tagName}`).toBeLessThanOrEqual(rail.right + 1);
+    }
+    expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(window.innerWidth);
+  });
+});

@@ -22,7 +22,7 @@ import { UsageCard } from "../components/UsageCards";
 import { OnboardingChecklist } from "../components/OnboardingChecklist";
 import { NeedsDecisionCard } from "../components/NeedsDecisionCard";
 import { OverviewRunsWidget } from "../components/OverviewRunsWidget";
-import { WorkerLoadCard } from "../components/WorkerLoadCard";
+import { CapacityRail } from "../components/CapacityRail";
 import { CustodyBoardAlert } from "../components/CustodyBoardAlert";
 import { HealthPlatformLine } from "../components/HealthPlatformLine";
 import { HealthChip } from "../components/HealthChip";
@@ -96,17 +96,21 @@ export function OverviewNext() {
       <CustodyBoardAlert recoveryWaitCount={ownRecoveryWaitCount(ownRuns)} />
       <HealthPlatformLine isAdmin={isAdmin} runs={ownRuns} workers={data?.workers ?? []} />
 
-      <OverviewRunsWidget
-        ownRuns={ownRuns}
-        adminRuns={isAdmin ? adminRuns : null}
-        isAdmin={isAdmin}
-        viewerEmail={user.email}
-        now={now}
-        demo={demo}
-        loading={!data}
-      />
-
-      {data && <WorkerLoadCard workers={data.workers} />}
+      {/* Runs on the left, the right-hand rail beside it; the rail stacks below at narrow widths. */}
+      <div className="grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_20rem]">
+        <div className="min-w-0">
+          <OverviewRunsWidget
+            ownRuns={ownRuns}
+            adminRuns={isAdmin ? adminRuns : null}
+            isAdmin={isAdmin}
+            viewerEmail={user.email}
+            now={now}
+            demo={demo}
+            loading={!data}
+          />
+        </div>
+        <div className="min-w-0 space-y-6">{data && <CapacityRail workers={data.workers} />}</div>
+      </div>
 
       {/* Factory usage is rendered only from the admin-gated response. */}
       {data?.selfUsage && (
