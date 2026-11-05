@@ -893,7 +893,9 @@ it("index parser refuses each hostile shape in strict mode and names the reason"
   refused(withExtension(index, "EOIE", Buffer.alloc(24)), /unsupported index extension EOIE/);
   refused(withExtension(index, "IEOT", Buffer.alloc(12)), /unsupported index extension IEOT/);
   assert.deepEqual(parseGitIndex(withExtension(index, "EOIE", Buffer.alloc(24)), { maxEntries: 100 }, "inspect").extensions, ["EOIE"]);
-  parseGitIndex(withExtension(withExtension(index, "TREE", Buffer.alloc(3)), "REUC"), { maxEntries: 100 });
+  parseGitIndex(withExtension(index, "TREE", Buffer.alloc(3)), { maxEntries: 100 });
+  // Resolve-undo names conflict-side blobs Git keeps alive: strict mode refuses it.
+  refused(withExtension(withExtension(index, "TREE", Buffer.alloc(3)), "REUC"), /unsupported index extension REUC/);
 });
 
 it("index parser refuses unsafe tracked paths and unsorted entries", () => {
@@ -1675,7 +1677,25 @@ it("G1: an oversized or FIFO reflog, or an oversized ORIG_HEAD, keeps the source
   assert.equal(await observation(), false, "oversized ORIG_HEAD");
   assertNoGit(rec);
 });
-it("G2: an unreadable .git/objects/info is UNKNOWN, not a settled keep", async () => {
+it("G3: a resolve-undo (REUC) index naming a conflict-side blob held only by an unreferenced bare object is a keep", async () => {
+  const tracked = command(clonePath, "ls-files").split("\n")[0]!;
+  const ours = command(clonePath, "rev-parse", `HEAD:${tracked}`);
+  const theirs = spawnSync("git", ["-C", clonePath, "hash-object", "-w", "--stdin"],
+    { env: ENV, input: "conflict side only the index names\n", encoding: "utf8" }).stdout.trim();
+  const stages = [`0 ${"0".repeat(40)}\t${tracked}`, `100644 ${ours} 1\t${tracked}`, `100644 ${ours} 2\t${tracked}`, `100644 ${theirs} 3\t${tracked}`].join("\n") + "\n";
+  assert.equal(spawnSync("git", ["-C", clonePath, "update-index", "--index-info"], { env: ENV, input: stages }).status, 0);
+  command(clonePath, "add", "--", tracked);
+  assert.match(command(clonePath, "ls-files", "--resolve-undo"), new RegExp(theirs));
+  assert.equal(command(clonePath, "diff", "--cached", "--name-only", "HEAD"), "", "the index again equals HEAD");
+  // Move the blob into the bare as an unreferenced object and drop the clone's own copy.
+  const blob = spawnSync("git", ["-C", clonePath, "cat-file", "blob", theirs], { env: ENV }).stdout;
+  assert.equal(spawnSync("git", ["-C", bare, "hash-object", "-w", "--stdin"], { env: ENV, input: blob }).status, 0);
+  fs.rmSync(inClone(".git", "objects", theirs.slice(0, 2), theirs.slice(2)));
+  assert.equal(spawnSync("git", ["-C", clonePath, "cat-file", "-e", theirs], { env: ENV }).status, 0, "readable through the alternate");
+  assert.equal(await observation(), false);
+});
+it("G2: an unreadable .git/objects/info is UNKNOWN, not a settled keep", async t => {
+  if (process.getuid?.() === 0) return t.skip("root ignores directory permissions");
   const info = inClone(".git", "objects", "info");
   fs.chmodSync(info, 0o000);
   try { await proveUnknown(); } finally { fs.chmodSync(info, 0o700); }
