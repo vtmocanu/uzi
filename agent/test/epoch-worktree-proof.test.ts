@@ -143,6 +143,18 @@ function assertNoContentRead(rec: Recorder): void {
   for (const sub of ["ls-files", "check-ignore", "status"]) assert.equal(rec.count(sub), 0, `${sub} must not run`);
 }
 
+/**
+ * The proof no longer launches `status`. These tests still pin the argv and environment of the
+ * launches it does make against hostile attribute, fsmonitor and hook inputs, so they build a
+ * `status` launch from a real, pinned `ls-files` launch (same pins, same audited environment).
+ */
+function pinnedStatus(rec: Recorder): { command: string; args: string[]; env: NodeJS.ProcessEnv } {
+  const at = rec.launches.findIndex(l => l.sub === "ls-files");
+  const launch = rec.launches[at]!;
+  return { command: launch.command, env: { ...rec.envs[at]! },
+    args: [...launch.args.slice(0, launch.args.indexOf("ls-files")), "status", "--porcelain"] };
+}
+
 // ---------------------------------------------------------------------------------------------
 // Positives.
 
@@ -150,7 +162,7 @@ it("proves a clean clone, with each Git read pinned and in order", async t => {
   const rec = recordLaunches(t);
   assert.equal(await prove(), true);
   // `.uzi` is untracked and not itself ignored; its only entry, `scratch`, is: a second question.
-  assert.deepEqual(rec.launches.map(l => l.sub), ["version", "config", "ls-tree", "ls-files", "check-ignore", "check-ignore", "status"]);
+  assert.deepEqual(rec.launches.map(l => l.sub), ["version", "config", "ls-tree", "ls-files", "check-ignore", "check-ignore"]);
   const tail = rec.launches.slice(1);
   for (const [i, launch] of tail.entries()) {
     const env = rec.envs[i + 1]!;
@@ -167,9 +179,6 @@ it("proves a clean clone, with each Git read pinned and in order", async t => {
     assert.equal(env.GIT_OPTIONAL_LOCKS, "0");
     assert.equal(env.GIT_NO_REPLACE_OBJECTS, "1");
   }
-  const status = tail.find(l => l.sub === "status")!;
-  assert.deepEqual(status.args.slice(status.args.indexOf("status")),
-    ["status", "--porcelain", "-uno", "--no-renames", "--ignore-submodules=none"]);
   const tree = tail.find(l => l.sub === "ls-tree")!;
   assert.deepEqual(tree.args.slice(tree.args.indexOf("ls-tree")), ["ls-tree", "-r", "-z", "--full-tree", "HEAD"]);
   const files = tail.find(l => l.sub === "ls-files")!;
@@ -179,7 +188,8 @@ it("proves a clean clone, with each Git read pinned and in order", async t => {
 });
 
 it("keeps an ignored node_modules directory eligible without reading anything inside it", async t => {
-  fs.appendFileSync(inClone(".git", "info", "exclude"), "node_modules/\n*.log\n");
+  fs.writeFileSync(inClone(".gitignore"), "node_modules/\n*.log\n");
+  commitAll("ignore rules");
   fs.mkdirSync(inClone("node_modules", "pkg"), { recursive: true });
   sparse(inClone("node_modules", "pkg", "big.bin"), 200 * 1024 * 1024);
   // Hostile files inside an ignored directory: never listed, never read.
@@ -188,7 +198,7 @@ it("keeps an ignored node_modules directory eligible without reading anything in
   fs.writeFileSync(inClone("dir", "debug.log"), "ignored\n");
   const rec = recordLaunches(t);
   assert.equal(await prove(), true);
-  assert.equal(rec.count("status"), 1);
+  assert.equal(rec.count("status"), 0);
 });
 
 it("still proves a racily-clean tracked file under budget, and sees a same-size edit", async t => {
@@ -197,7 +207,7 @@ it("still proves a racily-clean tracked file under budget, and sees a same-size 
   fs.utimesSync(tracked, future, future);
   const rec = recordLaunches(t);
   assert.equal(await prove(), true);
-  assert.equal(rec.count("status"), 1);
+  assert.equal(rec.count("status"), 0);
   fs.writeFileSync(tracked, "INNER\n");
   fs.utimesSync(tracked, future, future);
   assert.equal(await prove(), false);
@@ -313,8 +323,7 @@ function filterRun(t: TestContext, channel: "worktree" | "tracked" | "attr.tree"
   return (async () => {
     // The real status launch of a pristine clone supplies the exact argv and environment.
     assert.equal(await prove(), true);
-    const at = rec.launches.findIndex(l => l.sub === "status");
-    const launch = rec.launches[at]!, env = { ...rec.envs[at]! };
+    const { env, ...launch } = pinnedStatus(rec);
     const rule = "tracked.txt filter=x\n";
     if (channel === "worktree") fs.writeFileSync(inClone(".gitattributes"), rule);
     if (channel === "tracked") { fs.writeFileSync(inClone(".gitattributes"), rule); commitAll("attributes"); }
@@ -373,12 +382,11 @@ it("P1: a filter or attribute configuration in the clone is refused before statu
   assert.equal(fs.existsSync(marker), false);
 });
 
-it("P4: status never detects renames and lists no untracked files", async t => {
+it("P4: no status launch exists, so no rename detection or index stat cache is consulted", async t => {
   const rec = recordLaunches(t);
   assert.equal(await prove(), true);
-  const status = rec.launches.find(l => l.sub === "status")!;
-  assert.ok(status.args.includes("--no-renames"));
-  assert.ok(status.args.includes("-uno"));
+  assert.equal(rec.count("status"), 0);
+  assert.equal(rec.count("diff"), 0);
 });
 
 it("P6: a FIFO at a tracked .gitignore is refused by its type before any launch", async t => {
@@ -533,12 +541,15 @@ it("refuses an untracked non-ignored file or directory content and accepts ignor
   fs.rmSync(inClone("fresh"), { recursive: true });
   fs.writeFileSync(inClone("loose.txt"), "x");
   assert.equal(await prove(), false);
-  fs.appendFileSync(inClone(".git", "info", "exclude"), "loose.txt\n");
+  fs.writeFileSync(inClone(".gitignore"), "loose.txt\n");
+  commitAll("ignore rules");
   assert.equal(await prove(), true);
 });
 
 it("refuses a pathspec-magic looking untracked name instead of letting check-ignore reinterpret it", async t => {
-  fs.appendFileSync(inClone(".git", "info", "exclude"), "*\n");
+  fs.writeFileSync(inClone(".gitignore"), "*\n");
+  command(clonePath, "add", "-f", ".gitignore");
+  commitAll("ignore everything");
   fs.writeFileSync(inClone(":(top)x"), "x");
   const rec = recordLaunches(t);
   assert.equal(await prove(), false);
@@ -560,7 +571,7 @@ it("a tracked file that grows while Git runs is an unknown keep", async t => {
   const exec = git["execEpochNative"].bind(git);
   t.mock.method(git as unknown as { execEpochNative: typeof exec }, "execEpochNative", async (...a: Parameters<typeof exec>) => {
     const result = await exec(...a);
-    if (subcommand(a[1]) === "status") fs.appendFileSync(inClone("dir", "inner.txt"), "grown");
+    if (subcommand(a[1]) === "check-ignore") fs.appendFileSync(inClone("dir", "inner.txt"), "grown");
     return result;
   });
   assert.equal(await prove(), false);
@@ -570,7 +581,7 @@ it("an index that changes while Git runs is an unknown keep", async t => {
   const exec = git["execEpochNative"].bind(git);
   t.mock.method(git as unknown as { execEpochNative: typeof exec }, "execEpochNative", async (...a: Parameters<typeof exec>) => {
     const result = await exec(...a);
-    if (subcommand(a[1]) === "status") {
+    if (subcommand(a[1]) === "check-ignore") {
       const index = inClone(".git", "index");
       const bytes = fs.readFileSync(index);
       bytes.writeUInt8(bytes.readUInt8(bytes.length - 1) ^ 1, bytes.length - 1);
@@ -585,34 +596,34 @@ it("admits exactly the new argv shapes and no old or widened ones", async t => {
   const rec = recordLaunches(t);
   assert.equal(await prove(), true);
   const find = (sub: string) => rec.launches.find(l => l.sub === sub)!.args;
+  const statusBase = find("ls-files");
   const internal = git as unknown as {
     preflightEpochNative(command: string, args: string[], env: NodeJS.ProcessEnv, identity: "command" | "worker_pat"): NodeJS.ProcessEnv;
   };
   const tail = (args: string[], sub: string) => args.slice(0, args.indexOf(sub));
-  const shape = (sub: string, ...rest: string[]) => [...tail(find(sub), sub), sub, ...rest];
+  // `status` is never launched, so its (refused) shapes borrow the prefix of a real launch.
+  const shape = (sub: string, ...rest: string[]) => [...tail(find(sub === "status" ? "ls-files" : sub), sub === "status" ? "ls-files" : sub), sub, ...rest];
   const proof = git.createEpochDiscardProof(input);
   await git["withEpochNativeReads"](proof, async () => {
     const admit = (args: string[]) => internal.preflightEpochNative("/usr/bin/git", args, {}, "command");
     const refuse = (args: string[]) => assert.throws(() => admit(args), /unaudited/);
-    admit(shape("status", "--porcelain", "-uno", "--no-renames", "--ignore-submodules=none"));
+    refuse(shape("status", "--porcelain", "-uno", "--no-renames", "--ignore-submodules=none"));
     admit(shape("ls-files", "--others", "--directory", "-z"));
     admit(shape("ls-tree", "-r", "-z", "--full-tree", "HEAD"));
     refuse(shape("ls-tree", "-r", "-z", "HEAD"));
     refuse(shape("ls-tree", "-r", "-z", "--full-tree", "refs/heads/x"));
     refuse(shape("ls-tree", "-r", "-z", "--full-tree", "HEAD", "--", "dir"));
     admit(shape("check-ignore", "--no-index", "--stdin", "-z"));
-    refuse(shape("status", "--porcelain", "--ignore-submodules=none"));
-    refuse(shape("status", "--porcelain", "-uall", "--no-renames", "--ignore-submodules=none"));
-    refuse(shape("status", "--porcelain", "-uno", "--ignore-submodules=none"));
+    refuse(shape("status", "--porcelain"));
     refuse(shape("ls-files", "--stage", "-z"));
     refuse(shape("ls-files", "-v", "-z"));
     refuse(shape("ls-files", "--others", "-z"));
     refuse(shape("ls-files", "--others", "--directory", "--exclude-standard", "-z"));
     refuse(shape("check-ignore", "--stdin", "-z"));
     refuse(shape("check-ignore", "--no-index", "--stdin", "-z", "-v"));
-    refuse([...find("status").slice(0, 2), "-c", "core.hooksPath=/tmp", ...find("status").slice(2)]);
-    refuse([...find("status").slice(0, 2), "-c", "status.showUntrackedFiles=all", ...find("status").slice(2)]);
-    refuse(find("status").map(v => v.startsWith("--attr-source=") ? "--attr-source=" + "a".repeat(40) : v));
+    refuse([...statusBase.slice(0, 2), "-c", "core.hooksPath=/tmp", ...statusBase.slice(2)]);
+    refuse([...statusBase.slice(0, 2), "-c", "status.showUntrackedFiles=all", ...statusBase.slice(2)]);
+    refuse(statusBase.map(v => v.startsWith("--attr-source=") ? "--attr-source=" + "a".repeat(40) : v));
   });
 });
 
@@ -1126,8 +1137,7 @@ it("a planted executing core.fsmonitor is refused, and the proof's own status la
   const { marker, script } = markerScript();
   const rec = recordLaunches(t);
   assert.equal(await prove(), true);
-  const at = rec.launches.findIndex(l => l.sub === "status");
-  const launch = rec.launches[at]!, env = rec.envs[at]!;
+  const { env, ...launch } = pinnedStatus(rec);
   command(clonePath, "config", "core.fsmonitor", script);
   const future = new Date(Date.now() + 7200_000);
   fs.utimesSync(inClone("README.md"), future, future);
@@ -1154,8 +1164,7 @@ it("a planted executing core.hooksPath hook is refused and the proof's own statu
   const rec = recordLaunches(t);
   assert.equal(await prove(), true);
   assert.equal(fs.existsSync(marker), false, "a hook in the default hooks directory ran during the proof");
-  const at = rec.launches.findIndex(l => l.sub === "status");
-  const launch = rec.launches[at]!, env = rec.envs[at]!;
+  const { env, ...launch } = pinnedStatus(rec);
   command(clonePath, "config", "core.hooksPath", hooks);
   const future = new Date(Date.now() + 7200_000);
   fs.utimesSync(inClone("README.md"), future, future);
@@ -1198,4 +1207,168 @@ it("a global or system config with include.path (naming a filter) is never read 
       if (value === undefined) delete process.env[key]; else process.env[key] = value;
     }
   }
+});
+
+// ---------------------------------------------------------------------------------------------
+// Review rework (issue #3431): F1 version 4 name length, F2 forged stat cache, F3 info/exclude
+// baseline, F4 config includes and object-store entries Git opens at startup.
+
+it("F1: a version 4 entry whose flags length differs from its real name is refused, as Git would walk it differently", async t => {
+  const repo = newRepo();
+  const sha = blob(repo, "x");
+  indexInfo(repo, [{ mode: "100644", sha, path: Buffer.from("aaaa") }, { mode: "100644", sha, path: Buffer.from("aaab") }]);
+  command(repo, "update-index", "--index-version", "4");
+  const index = readIndex(repo);
+  assert.equal(parseGitIndex(index, { maxEntries: 4 }).entries.length, 2, "control: Git's own v4 index parses");
+  const flagsAt = 12 + 60;
+  assert.equal(index.readUInt16BE(flagsAt) & 0xfff, 4);
+  const withLength = (n: number) => patched(index, b => b.writeUInt16BE((b.readUInt16BE(flagsAt) & ~0xfff) | n, flagsAt));
+  for (const n of [3, 5, 0, 0xfff]) {
+    assert.throws(() => parseGitIndex(withLength(n), { maxEntries: 4 }),
+      error => error instanceof GitIndexError && error.kind === "refused" && /disagrees/.test(error.message), `length ${n}`);
+  }
+  // Through the proof: the clone's own index rewritten the same way is refused before any launch.
+  command(clonePath, "update-index", "--index-version", "4");
+  const file = inClone(".git", "index");
+  const real = fs.readFileSync(file);
+  assert.equal(await prove(), true);
+  fs.writeFileSync(file, patched(real, b => b.writeUInt16BE((b.readUInt16BE(flagsAt) & ~0xfff) | 0xfff, flagsAt)));
+  const rec = recordLaunches(t);
+  assert.equal(await prove(), false);
+  assertNoGit(rec);
+});
+
+/**
+ * The reviewer's forgery: edit a tracked file, stage it, then rewrite the index so the entry carries
+ * HEAD's object id while keeping the edited file's real stat data, and let the index be rewritten
+ * more than a second after the edit so Git does not call the entry racily clean.
+ */
+async function forgeEntryToHead(rel: string): Promise<void> {
+  const headOid = command(clonePath, "rev-parse", `HEAD:${rel}`);
+  command(clonePath, "add", rel);
+  await new Promise(resolve => setTimeout(resolve, 1100));
+  const file = inClone(".git", "index");
+  const original = fs.readFileSync(file);
+  const at = original.indexOf(Buffer.concat([Buffer.from(rel), Buffer.from([0])]));
+  assert.ok(at >= 12 + 62, "entry name located in the index");
+  const forged = patched(original, b => { Buffer.from(headOid, "hex").copy(b, at - 22); });
+  fs.writeFileSync(file, withCacheTree(forged, Buffer.alloc(0)));
+}
+
+it("F2: an entry carrying HEAD's oid with the edited file's real stat data is refused by hashing, before any launch", async t => {
+  fs.writeFileSync(inClone("dir", "other.txt"), "edited!\n");
+  await forgeEntryToHead("dir/other.txt");
+  const naive = spawnSync("git", ["-C", clonePath, "status", "--porcelain", "-uno"], { env: { ...ENV, GIT_OPTIONAL_LOCKS: "0" }, encoding: "utf8" });
+  assert.equal(naive.stdout, "", "control: the forged stat cache makes status report clean");
+  const rec = recordLaunches(t);
+  assert.equal(await prove(), false);
+  assertNoGit(rec);
+});
+
+it("F2: a forged tracked .gitignore rewritten to '*' cannot hide untracked work, and is refused before check-ignore", async t => {
+  fs.writeFileSync(inClone(".gitignore"), "# nothing ignored\n");
+  commitAll("ignore file");
+  assert.equal(await prove(), true);
+  fs.writeFileSync(inClone(".gitignore"), "*\n");
+  fs.writeFileSync(inClone("work.txt"), "unsaved work\n");
+  await forgeEntryToHead(".gitignore");
+  const naive = spawnSync("git", ["-C", clonePath, "status", "--porcelain", "-uno"], { env: { ...ENV, GIT_OPTIONAL_LOCKS: "0" }, encoding: "utf8" });
+  assert.equal(naive.stdout, "", "control: the forged entry makes status report clean");
+  const rec = recordLaunches(t);
+  assert.equal(await prove(), false);
+  assertNoGit(rec);
+  assert.equal(rec.count("check-ignore"), 0);
+});
+
+it("F2: a same-size edit, a lost executable bit and a retargeted symlink are each refused", async t => {
+  fs.symlinkSync("dir/inner.txt", inClone("link"));
+  fs.writeFileSync(inClone("run.sh"), "#!/bin/sh\n", { mode: 0o755 });
+  commitAll("shapes");
+  assert.equal(await prove(), true);
+  const rec = recordLaunches(t);
+  fs.writeFileSync(inClone("dir", "other.txt"), "OTHER\n");
+  assert.equal(await prove(), false);
+  fs.writeFileSync(inClone("dir", "other.txt"), "other\n");
+  fs.chmodSync(inClone("run.sh"), 0o644);
+  assert.equal(await prove(), false);
+  fs.chmodSync(inClone("run.sh"), 0o755);
+  fs.rmSync(inClone("link"));
+  fs.symlinkSync("dir/other.txt", inClone("link"));
+  assert.equal(await prove(), false);
+  assertNoGit(rec);
+});
+
+it("F3: an info/exclude rule beyond the worker baseline is refused before check-ignore, whatever it hides", async t => {
+  fs.appendFileSync(inClone(".git", "info", "exclude"), "*\n");
+  fs.writeFileSync(inClone("work.txt"), "unsaved work\n");
+  const rec = recordLaunches(t);
+  assert.equal(await prove(), false);
+  assertNoGit(rec);
+  for (const rule of ["!keep", "/.uzi/scratch", " /.uzi/scratch/", "# ok\r\nfoo", "\0"]) {
+    fs.writeFileSync(inClone(".git", "info", "exclude"), `# seeded\n\n/.uzi/scratch/\n${rule}\n`);
+    assert.equal(await prove(), false, JSON.stringify(rule));
+  }
+  assertNoGit(rec);
+});
+
+it("F3: the seeded baseline, comments and blank lines still prove", async () => {
+  fs.writeFileSync(inClone(".git", "info", "exclude"), "# comment\n\n   \n/.uzi/scratch/\n/.uzi/scratch/\n");
+  assert.equal(await prove(), true);
+});
+
+it("F4: an include.path naming a FIFO is refused promptly, without any Git launch", async t => {
+  const fifo = path.join(scratchDir("wt-include-"), "fifo");
+  mkfifo(fifo);
+  fs.appendFileSync(inClone(".git", "config"), `[include]\n\tpath = ${fifo}\n`);
+  const rec = recordLaunches(t);
+  const started = Date.now();
+  assert.equal(await prove(), false);
+  assert.ok(Date.now() - started < 10_000, "must not wait on the FIFO");
+  assertNoGit(rec);
+});
+
+it("F4: an includeIf naming a 300 MiB file is refused without a launch, so the file is never read", async t => {
+  const big = path.join(scratchDir("wt-include-"), "big");
+  sparse(big, 300 * 1024 * 1024, "[core]\n");
+  fs.appendFileSync(inClone(".git", "config"), `[includeIf "gitdir:/"]\n\tpath = ${big}\n[ INCLUDE ]\n\tpath = ${big}\n`);
+  const rec = recordLaunches(t);
+  assert.equal(await prove(), false);
+  assertNoGit(rec);
+});
+
+it("F4: a FIFO at .git/objects/info/alternates is refused promptly, without any Git launch", async t => {
+  const alternates = inClone(".git", "objects", "info", "alternates");
+  fs.mkdirSync(path.dirname(alternates), { recursive: true });
+  fs.rmSync(alternates, { force: true });
+  mkfifo(alternates);
+  const rec = recordLaunches(t);
+  const started = Date.now();
+  assert.equal(await prove(), false);
+  assert.ok(Date.now() - started < 10_000, "must not wait on the FIFO");
+  assertNoGit(rec);
+});
+
+it("F4: http-alternates, an unknown entry or a symlinked objects/info are refused; alternates, packs and commit-graph files are admitted", async t => {
+  const info = inClone(".git", "objects", "info");
+  fs.mkdirSync(info, { recursive: true });
+  fs.writeFileSync(path.join(info, "packs"), "\n");
+  fs.writeFileSync(path.join(info, "commit-graph"), "unread: core.commitGraph is pinned off");
+  fs.mkdirSync(path.join(info, "commit-graphs"));
+  assert.equal(await prove(), true);
+  fs.rmSync(path.join(info, "commit-graph"));
+  fs.rmSync(path.join(info, "commit-graphs"), { recursive: true });
+  const rec = recordLaunches(t);
+  for (const name of ["http-alternates", "unknown-entry"]) {
+    const file = path.join(info, name);
+    fs.writeFileSync(file, "x");
+    assert.equal(await prove(), false, name);
+    fs.rmSync(file);
+  }
+  mkfifo(path.join(info, "commit-graph"));
+  assert.equal(await prove(), false, "a FIFO commit-graph");
+  fs.rmSync(path.join(info, "commit-graph"));
+  fs.rmSync(info, { recursive: true });
+  fs.symlinkSync(os.tmpdir(), info);
+  assert.equal(await prove(), false);
+  assertNoGit(rec);
 });

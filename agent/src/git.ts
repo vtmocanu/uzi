@@ -1333,8 +1333,9 @@ const READ_ONLY_STATUS = { env: { ...NO_REPLACE_ENV, GIT_OPTIONAL_LOCKS: "0" } a
 const EPOCH_EMPTY_TREE_OID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 /** Config overrides carried by every clone-side native read of the automatic worktree proof
  *  (`core.worktree=<clone>` is added per launch). They outrank every config file the clone's
- *  agent can write. Shared by the launcher and by `preflightEpochNative`'s admission, so the two
- *  cannot drift. */
+ *  agent can write. Shared by the launcher and by `preflightEpochNative`'s admission, which
+ *  permits exactly these `-c` values (plus `core.worktree`) but does not require them: the
+ *  launcher is what carries every pin on each launch. */
 const EPOCH_CLONE_READ_PINS: readonly string[] = [
   "core.fsmonitor=false", "core.excludesFile=/dev/null", "core.trustctime=true", "core.checkStat=default",
   "core.fileMode=true", "core.ignoreCase=false", "core.untrackedCache=false", "core.attributesFile=/dev/null",
@@ -3263,15 +3264,14 @@ export class GitCache {
       sub === "symbolic-ref" && exact(sub, "refs/remotes/origin/HEAD") ||
       sub === "check-ref-format" && tail.length === 1 && operand(tail[0]!) ||
       sub === "cat-file" && tail.length === 2 && tail[0] === "-t" && /^[0-9a-f]{40}$/.test(tail[1]!) ||
-      // The automatic worktree proof's three content reads. Untracked listing takes no exclude
-      // option (it must not read any ignore file); `status` never lists untracked files and never
-      // detects renames (rename detection reads blobs).
+      // The automatic worktree proof's content reads. Untracked listing takes no exclude option
+      // (it must not read any ignore file). There is no `status` shape: worktree-versus-index is
+      // hashed in Node.
       sub === "ls-files" && exact(sub, "--others", "--directory", "-z") ||
       // Index-versus-HEAD: the flattened HEAD tree, compared with the Node-parsed index entries.
       // `ls-tree` never consults the index's cache-tree, which a forged index can lie through.
       sub === "ls-tree" && exact(sub, "-r", "-z", "--full-tree", "HEAD") ||
       sub === "check-ignore" && exact(sub, "--no-index", "--stdin", "-z") ||
-      sub === "status" && exact(sub, "--porcelain", "-uno", "--no-renames", "--ignore-submodules=none") ||
       sub === "rev-list" && tail[0] === "--objects" && tail[1] === "-n" && tail[2] === "1" &&
         tail.slice(3).filter(v => v !== "--not").every(v => /^[0-9a-f]{40}$/.test(v)) && tail.includes("--not")
     );
@@ -11599,19 +11599,24 @@ export class GitCache {
    *     the files are regular and charged; `HEAD` is a small regular file naming a branch ref (or
    *     an object id) and that loose ref, when present, a small regular file holding an object id;
    *  1. `.git/index` is read once through a bounded descriptor and parsed ({@link readBoundedIndex}:
-   *     SHA-1, version 2/3, no link/sdir/UNTR/FSMN extension, no assume-valid, skip-worktree,
+   *     SHA-1, version 2, 3 or 4, no link/sdir/UNTR/FSMN extension, no assume-valid, skip-worktree,
    *     intent-to-add, staged or odd-mode entry);
+   *  1b. `.git/config` is read in Node and refused if it names an include (Git opens include
+   *     targets at startup); `.git/info/exclude` is read in Node and must hold only the worker-source
+   *     baseline; `.git/objects/info` holds at most `alternates` and `packs`, typed and charged;
    *  2. every tracked path (and each of its directories) is lstat'd by raw bytes and must have
    *     the type its mode names; regular sizes and link lengths are charged to the worktree-content
-   *     counter; a gitlink keeps the empty-directory rule; each tracked directory is listed under a
-   *     cumulative entry cap;
+   *     counter; every tracked regular file and symlink is hashed here as a Git blob (never more
+   *     bytes than were charged) and compared with its index entry, and the owner execute bit must
+   *     match the mode, so the index's forgeable stat cache is never trusted; a gitlink keeps the
+   *     empty-directory rule; each tracked directory is listed under a cumulative entry cap;
    * and only then Git runs, every launch carrying the attribute/config pins and
    * `GIT_ATTR_NOSYSTEM`: a version check, the clone's config (strict key allowlist), the untracked
    * listing (no exclude option; an untracked `.gitignore`, `.gitattributes` or `.gitmodules` is a
-   * keep), `check-ignore` of that listing (the ignored set must equal it), `ls-tree -r` of HEAD
+   * keep), `check-ignore` of that listing (the ignored set must equal it), and `ls-tree -r` of HEAD
    * compared exactly with the parsed index entries (the index-versus-HEAD half, which `status`
-   * would answer from a forgeable cache-tree), and `status -uno --no-renames` for worktree versus
-   * index. Finally the index and every recorded path are re-read: a change is a keep.
+   * would answer from a forgeable cache-tree). There is no `status` launch. Finally the index and
+   * every recorded path are re-read: a change is a keep.
    *
    * Three counters stay distinct so their limits can be set independently later: `metadataBytes`
    * (config, index, exclude, packed-refs and every Git output; limit `maxMetadataBytes`),
@@ -11706,9 +11711,67 @@ export class GitCache {
           if (name.toString("latin1") !== "exclude") throw refusal(".git/info holds an unadmitted entry");
         });
       }
-      await regular(path.join(gitDir, "config"), true, ".git/config");
-      await regular(path.join(infoDir, "exclude"), false, ".git/info/exclude");
+      // Read the bytes in Node, bounded by what is left of the metadata budget, and remembered for
+      // the final re-check. `readSmallRegularFile` types the file (a FIFO or link is refused
+      // without blocking) and verifies the descriptor and size around the read.
+      const readBounded = async (file: string, required: boolean, what: string): Promise<Buffer | undefined> => {
+        try {
+          const got = await readSmallRegularFile(file, limits.maxMetadataBytes - counters.metadataBytes, read);
+          chargeMetadata(got.bytes.length, what);
+          fixed.set("f:" + file, { target: file, signature: got.signature });
+          return got.bytes;
+        } catch (error) {
+          if (!required && (error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+          if (error instanceof GitIndexError) throw error.kind === "limit" ? unknown(`${what}: ${error.message}`) : refusal(`${what}: ${error.message}`);
+          throw error;
+        }
+      };
+      // Git opens every `include.path` target while it starts up in the clone, even for a read that
+      // asks for no includes (a FIFO target hangs it, a huge one is read uncharged), so a config that
+      // names one is refused here, before any Git launch in the clone. The scan is deliberately
+      // coarse: any `[include` section opener, in any case and spacing, anywhere in the file.
+      const configBytes = (await readBounded(path.join(gitDir, "config"), true, ".git/config"))!;
+      if (/\[\s*include/i.test(configBytes.toString("latin1"))) throw refusal("clone config names an include");
+      // `.git/info/exclude` is agent-written and decides what counts as ignored, so only the
+      // worker-source baseline is trusted: the exact `/.uzi/scratch/` line, column-zero comments and
+      // blank lines. This is the same rule the owner-cancel proof (`CANCEL_CONTENT_HELPER`) applies.
+      const excludeBytes = await readBounded(path.join(infoDir, "exclude"), false, ".git/info/exclude");
+      if (excludeBytes !== undefined) {
+        if (!isUtf8(excludeBytes) || excludeBytes.includes(0)) throw refusal(".git/info/exclude encoding");
+        const lines = excludeBytes.toString("utf8").split("\n");
+        for (const [i, raw] of lines.entries()) {
+          const line = i < lines.length - 1 && raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+          if (line.includes("\r") || !(line.startsWith("#") || /^ *$/.test(line) || line === "/.uzi/scratch/"))
+            throw refusal(".git/info/exclude holds a rule beyond the worker-source baseline");
+        }
+      }
       await regular(path.join(gitDir, "packed-refs"), false, ".git/packed-refs");
+      // `objects/info` is read by Git at startup too. `alternates` (which `clone --shared` writes) and
+      // `packs` are typed and charged, as is a `commit-graph` file; a `commit-graphs` directory is
+      // typed only (every launch pins `core.commitGraph=false`, so Git never opens either). Any
+      // other entry, `http-alternates` included, is a keep.
+      const objectsInfo = path.join(gitDir, "objects", "info");
+      let infoStat: import("node:fs").BigIntStats | undefined;
+      try { infoStat = await lstatPath(objectsInfo); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      if (infoStat) {
+        if (!infoStat.isDirectory()) throw refusal(".git/objects/info is not a real directory");
+        remember("d:" + objectsInfo, objectsInfo, infoStat);
+        const names: string[] = [];
+        await listDirectory(objectsInfo, name => {
+          const text = name.toString("latin1");
+          if (!["alternates", "packs", "commit-graph", "commit-graphs"].includes(text))
+            throw refusal(".git/objects/info holds an unadmitted entry");
+          names.push(text);
+        });
+        for (const name of names) {
+          const file = path.join(objectsInfo, name);
+          if (name !== "commit-graphs") { await regular(file, true, `.git/objects/info/${name}`); continue; }
+          const st = await lstatPath(file);
+          if (!st.isDirectory()) throw refusal(".git/objects/info/commit-graphs is not a real directory");
+          remember("d:" + file, file, st);
+        }
+      }
 
       // HEAD names the one loose ref `status` and `ls-tree` resolve. Both it and that ref are
       // small regular files read here through a bounded descriptor; a symbolic indirection, a
@@ -11784,6 +11847,32 @@ export class GitCache {
         if (!st.isDirectory()) throw refusal("tracked directory is not a real directory");
         remember("d:" + key, absolute(rel), st);
       }
+      const gitBlobOid = (data: Buffer) => createHash("sha1").update(`blob ${data.length}\0`).update(data).digest("hex");
+      // Worktree versus index is decided here, from the bytes: `status` would trust the index's stat
+      // cache, which the clone's agent can forge, and would hash racy content uncharged. The file is
+      // read through one descriptor (no link followed, no blocking open) whose identity and size
+      // must match the lstat just charged, at most that many bytes, and must be unchanged afterwards.
+      const hashRegularFile = async (file: Buffer, st: import("node:fs").BigIntStats): Promise<string> => {
+        const handle = await read(() => fs.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK));
+        try {
+          const opened = await read(() => handle.stat({ bigint: true }));
+          if (!opened.isFile() || opened.dev !== st.dev || opened.ino !== st.ino || opened.size !== st.size)
+            throw refusal("tracked file changed while opening");
+          const size = Number(st.size);
+          const hash = createHash("sha1").update(`blob ${size}\0`);
+          const chunk = Buffer.allocUnsafe(Math.max(1, Math.min(size, 65536)));
+          for (let done = 0; done < size;) {
+            const { bytesRead } = await read(() => handle.read(chunk, 0, Math.min(chunk.length, size - done), done));
+            if (bytesRead === 0) throw refusal("tracked file truncated while reading");
+            hash.update(chunk.subarray(0, bytesRead));
+            done += bytesRead;
+          }
+          if ((await read(() => handle.read(Buffer.alloc(1), 0, 1, size))).bytesRead !== 0) throw refusal("tracked file grew while reading");
+          if (statSignature(await read(() => handle.stat({ bigint: true }))) !== statSignature(opened))
+            throw refusal("tracked file changed while reading");
+          return hash.digest("hex");
+        } finally { await handle.close(); }
+      };
       const gitlinks: Buffer[] = [];
       for (const entry of index.entries) {
         const st = await lstatPath(absolute(entry.path));
@@ -11794,9 +11883,16 @@ export class GitCache {
         } else if (entry.mode === 0o120000) {
           if (!st.isSymbolicLink()) throw refusal("tracked symlink is not a symlink");
           chargeContent(Number(st.size), "tracked symlink");
+          // The target bytes, as Git hashes a symlink blob.
+          const target = await read(() => fs.readlink(absolute(entry.path), { encoding: "buffer" }));
+          if (BigInt(target.length) !== st.size) throw refusal("tracked symlink changed while reading");
+          if (gitBlobOid(target) !== entry.sha) throw refusal("worktree differs from the index");
         } else {
           if (!st.isFile()) throw refusal("tracked file is not a regular file");
           chargeContent(Number(st.size), "tracked file");
+          // `core.fileMode=true`: Git compares only the owner execute bit.
+          if (((st.mode & 0o100n) !== 0n) !== (entry.mode === 0o100755)) throw refusal("worktree differs from the index");
+          if (await hashRegularFile(absolute(entry.path), st) !== entry.sha) throw refusal("worktree differs from the index");
         }
         remember(key, absolute(entry.path), st);
       }
@@ -11926,11 +12022,7 @@ export class GitCache {
         frontier = next;
       }
 
-      const status = await git(["status", "--porcelain", "-uno", "--no-renames", "--ignore-submodules=none"],
-        READ_ONLY_STATUS.env);
-      chargeMetadata(Buffer.byteLength(status), "status output");
-      this.automaticCollection(status, "\n");
-      if (status.split("\n").some(line => line.length > 0)) throw refusal("worktree differs from the index");
+      // No `status` launch: worktree-versus-index was decided from the hashed bytes above.
 
       // Nothing we proved may have moved while Git ran.
       if (!(await indexUnchanged(indexPath, index, read))) throw unknown("index changed during the proof");
