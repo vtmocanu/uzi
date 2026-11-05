@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import type { Readable } from "node:stream";
 import { execFileSync } from "node:child_process";
 import { hermeticGitEnv, makeClaim, nullLogger, testGitCacheOptions } from "./helpers.js";
 import { GitCache } from "../src/git.js";
@@ -106,6 +107,22 @@ async function withHoldSpy<T>(fn: (requests: HoldRequest[]) => Promise<T>): Prom
   } finally {
     (client as unknown as { requestRepoAgentSourceHold: unknown }).requestRepoAgentSourceHold = orig;
   }
+}
+
+function landPublishes(branch: string): { tip: () => string | undefined; restore: () => void } {
+  let tip: string | undefined;
+  const orig = client.publishCheckpoint.bind(client);
+  (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async (
+    _runId: string, tipOid: string, pack: Readable,
+  ) => {
+    const chunks: Buffer[] = [];
+    for await (const c of pack) chunks.push(Buffer.from(c as Buffer));
+    execFileSync("git", ["-C", fx.originPath, "index-pack", "--stdin", "--fix-thin"], { env: hermeticGitEnv(), input: Buffer.concat(chunks) });
+    gitIn(fx.originPath, ["update-ref", `refs/uzi-checkpoints/${branch}`, tipOid]);
+    tip = tipOid;
+    return { ok: true, body: { published: true, ref: `refs/uzi-checkpoints/${branch}` } };
+  };
+  return { tip: () => tip, restore: () => { (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = orig; } };
 }
 
 function statusTexts(runId: string): string[] {
@@ -384,6 +401,78 @@ describe("repo-agent roster pinned to the default-branch revision (issue #3913)"
         statusTexts(claim.run_id).join("\n"));
     }));
   });
+
+  for (const [name, refusePin] of [["an acknowledged pin", false], ["a refused pin report", true]] as const) {
+    it(`a missing base attestation with ${name} keeps the captured revision after the default branch moves`, async () => {
+      await withHoldSpy(async (sourceHolds) => {
+        const h = HARNESSES[0]!;
+        const trusted = commitOnOrigin({ [h.file]: h.content("Original review body") }, "ship the reviewer");
+        const iid = refusePin ? 77 : 76;
+        const seen: RunContext[] = [];
+        const leg: Executor = {
+          run: async (ctx) => {
+            seen.push(ctx);
+            fs.writeFileSync(path.join(ctx.worktreePath, `leg${seen.length}.txt`), `leg ${seen.length}\n`);
+            gitIn(ctx.worktreePath, ["add", "-A"]);
+            gitIn(ctx.worktreePath, [...IDENT, "commit", "-q", "-m", `leg ${seen.length}`]);
+            if (seen.length === 1) {
+              await ctx.parkForWall?.({ completedCount: 0 });
+              return { branch: ctx.branch, walled: { reason: "run exceeded its wall-clock timeout" } };
+            }
+            return { branch: ctx.branch };
+          },
+        };
+        const first = claimFor(h, {
+          issue_iid: iid, issue_title: name, plan_approved: true, plan_source: "seeded", plan_md: "# Seeded plan\n- do it",
+          session_id: null, planned_base_commit: trusted, require_base_match: true, claim_generation: 1,
+        });
+        const landed = landPublishes(`agent/issue-${iid}`);
+        const baseHolds: { head: string; claimGeneration: number }[] = [];
+        const origHold = client.requestBaseAttestationHold.bind(client);
+        (client as unknown as { requestBaseAttestationHold: unknown }).requestBaseAttestationHold = async (
+          _runId: string, args: { head: string; claimGeneration: number },
+        ): Promise<BaseAttestationHoldOutcome> => {
+          baseHolds.push(args);
+          return { outcome: "held", status: "paused" };
+        };
+        const nextSeq = () => Math.max(0, ...api.messages(first.run_id).map((m) => m.seq));
+        try {
+          await newRunner(leg).execute(first);
+          assert.equal(seen.length, 1, "sanity: leg 1 ran");
+          const freshData = fs.mkdtempSync(path.join(path.dirname(fx.dataDir), "data-base-hold-"));
+          await withFeature(async () => {
+            if (refusePin) api.failStateWhen(first.run_id, (b) => b.repo_agent_source_commit !== undefined, { httpStatus: 400 });
+            const held = { ...first, claim_generation: 2, checkpoint_tip: landed.tip() ?? null, checkpoint_attested_source: null, last_seq: nextSeq() };
+            api.setOwnershipStatus(first.run_id, "running", 2);
+            await newRunner(leg, freshData).execute(held);
+            assert.equal(seen.length, 1, "the executor did not run before the hold");
+            if (refusePin) {
+              assert.deepEqual(baseHolds, [], "a refused pin holds on the repo-agent source instead");
+              assert.deepEqual(sourceHolds, [{ runId: first.run_id, commit: trusted, claimGeneration: 2 }]);
+            } else {
+              assert.equal(baseHolds.length, 1, "the run was held on the missing base attestation");
+              assert.deepEqual(sourceHolds, []);
+              assert.equal(api.repoAgentSourceByRun.get(first.run_id), trusted, "the revision was recorded before the hold");
+            }
+
+            commitOnOrigin({ [h.file]: h.content("A newer default body") }, "main moves on");
+            const resumed = {
+              ...held, claim_generation: 3, checkpoint_attested_source: landed.tip() ?? null,
+              repo_agent_source_commit: api.repoAgentSourceByRun.get(first.run_id) ?? sourceHolds[0]?.commit ?? null, last_seq: nextSeq(),
+            };
+            api.setOwnershipStatus(first.run_id, "running", 3);
+            await newRunner(leg, freshData).execute(resumed);
+          });
+        } finally {
+          landed.restore();
+          (client as unknown as { requestBaseAttestationHold: unknown }).requestBaseAttestationHold = origHold;
+        }
+        assert.equal(seen.length, 2, "the resumed claim reached the executor");
+        assert.equal(reviewerBody(seen[1]), "Original review body");
+        assert.ok(reportedCommits(first.run_id).every((c) => c === trusted), JSON.stringify(reportedCommits(first.run_id)));
+      });
+    });
+  }
 
   it("without the api feature a failed roster report does not stop the run", async () => {
     const h = HARNESSES[0]!;

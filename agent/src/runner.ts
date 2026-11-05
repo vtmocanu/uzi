@@ -14195,16 +14195,21 @@ export class RunRunner {
     }
     if (requireBase && barePath) {
       const identity = runnerClone.adoptedContentSource ?? runnerClone.adoptedSource;
-      evaluateRequiredBase({
-        plannedBase: claim.planned_base_commit!,
-        identity,
-        attestedSource: flight.checkpointClaimEvidence.attestedSource,
-        continuation: runnerClone.seededFrom === "tracking" || runnerClone.seededFrom === "checkpoint",
-        wipCherryPicked: runnerClone.wipCherryPicked === true,
-        planned: await this.git.resolveCommitUnique(barePath, claim.planned_base_commit!),
-        identityTree: await this.git.commitTreeOid(barePath, identity),
-        materializedTree: await this.git.indexTreeOid(runnerClone.path),
-      });
+      try {
+        evaluateRequiredBase({
+          plannedBase: claim.planned_base_commit!,
+          identity,
+          attestedSource: flight.checkpointClaimEvidence.attestedSource,
+          continuation: runnerClone.seededFrom === "tracking" || runnerClone.seededFrom === "checkpoint",
+          wipCherryPicked: runnerClone.wipCherryPicked === true,
+          planned: await this.git.resolveCommitUnique(barePath, claim.planned_base_commit!),
+          identityTree: await this.git.commitTreeOid(barePath, identity),
+          materializedTree: await this.git.indexTreeOid(runnerClone.path),
+        });
+      } catch (err) {
+        if (err instanceof BaseAttestationMissingError) await this.pinRepoAgentSourceBeforeHold(claim, flight);
+        throw err;
+      }
       flight.baseAccepted = true;
     }
     const staleWarning = requireBase ? undefined : evaluateBaseStaleness(
@@ -24205,6 +24210,12 @@ export class RunRunner {
       return { unresolved: `the default branch ${sanitizeForLog(name)} could not be resolved from this claim's fetch to read repo agents from` };
     }
     return { commit: capturedTip };
+  }
+
+  private async pinRepoAgentSourceBeforeHold(claim: ClaimResponse, flight: RunFlight): Promise<void> {
+    const tip = flight.defaultBranchTip;
+    if (!tip || claim.repo_agent_source_commit || !this.client.protocolFeatures.includes(REPO_AGENT_SOURCE_FEATURE)) return;
+    await this.confirmRepoAgentSourcePin(flight.reportState, { status: "running", repo_agent_source_commit: tip }, flight.runLog);
   }
 
   private async confirmRepoAgentSourcePin(
