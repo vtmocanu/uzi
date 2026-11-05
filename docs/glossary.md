@@ -65,5 +65,5 @@ _Avoid_: API key, model token
 ## Who sets it up
 
 **First admin account**:
-The admin account that the API creates at its first start from the `UZI_SEED_*` values of `.env`.
+The admin account that the API creates at its first start when `UZI_SEED_EMAIL` and `UZI_SEED_PASSWORD` are set in `.env`. Without them, the first account that registers becomes the admin.
 _Avoid_: seeded admin, bootstrap admin

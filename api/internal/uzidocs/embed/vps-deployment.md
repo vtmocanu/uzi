@@ -30,7 +30,7 @@ New words such as forge, worker or plan gate are in the [Glossary](./glossary.md
 1. A Debian or Ubuntu VPS, an account that can use `sudo`, and a firewall that lets HTTP and HTTPS in. See [Initial Server Setup with Ubuntu](https://www.digitalocean.com/community/tutorials/initial-server-setup-with-ubuntu).
 2. Docker Engine and the Docker Compose v2 plugin. Follow Docker's [Ubuntu guide](https://docs.docker.com/engine/install/ubuntu/), then add your account to the `docker` group with the [post-installation steps](https://docs.docker.com/engine/install/linux-postinstall/) and log in again.
 3. 4 vCPUs, 8 GB of RAM and 20 GB of free disk for uzi alone. The worker takes 2 CPUs and 4 GiB of these. See [worker sizing](./worker-setup.md#resource-stats-and-sizing). If your provider has no server of this size, choose one by your needs.
-4. `curl`, Bash, `openssl`, `jq` and `cosign`. Install `cosign` from its [`.deb` package](https://docs.sigstore.dev/cosign/system_config/installation/), because `apt` on Ubuntu does not carry it.
+4. `curl`, Bash, `openssl`, `jq` and `cosign` 3.1.3 or newer (see [Container signing](./container-signing.md)). Install `cosign` from its [`.deb` package](https://docs.sigstore.dev/cosign/system_config/installation/), because `apt` on Ubuntu does not carry it. Check the version with `cosign version`.
 
 **The domain and the proxy**
 
@@ -83,14 +83,15 @@ bash scripts/init-env.sh
 printf '\nUZI_VERSION=%s\n' "$UZI_VERSION" >> .env
 ```
 
-Check the signatures of the three images. Stop if one check fails:
+Check the signatures of the three images. Each image prints `ok`. Stop if one prints `FAILED`:
 
 ```sh
 for image in api web agent-base; do
   cosign verify \
     --certificate-identity "https://github.com/vtmocanu/uzi/.github/workflows/release.yml@refs/tags/v${UZI_VERSION}" \
     --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
-    "ghcr.io/vtmocanu/uzi/${image}:${UZI_VERSION}" > /dev/null && echo "$image ok"
+    "ghcr.io/vtmocanu/uzi/${image}:${UZI_VERSION}" > /dev/null || { echo "$image FAILED"; break; }
+  echo "$image ok"
 done
 ```
 
@@ -216,9 +217,12 @@ Steps 6 and 7 call the uzi API with your admin session. The `uzi` CLI cannot do 
 URL=https://your_domain
 # Type the admin password. The terminal does not show it.
 read -rs UZI_PASSWORD
+# jq reads the password from the environment, so ps does not show it.
+export UZI_PASSWORD
 # Sign in, and keep the session cookie in the file uzi-cookies.
-jq -n --arg email you@example.com --arg password "$UZI_PASSWORD" '{email:$email,password:$password}' \
+jq -n --arg email you@example.com '{email:$email,password:env.UZI_PASSWORD}' \
   | curl -fsS -c uzi-cookies -H "Origin: $URL" -H 'Content-Type: application/json' --data @- -o /dev/null "$URL/api/auth/login"
+unset UZI_PASSWORD
 # Each call that changes data needs the CSRF value of the session.
 CSRF=$(awk '$6=="uzi_csrf"{print $7}' uzi-cookies)
 # api sends the cookie and the CSRF value with each call.
@@ -233,7 +237,8 @@ Create the worker, and write its join token into `.env`. uzi shows the token onl
 
 ```sh
 TOKEN=$(api -d '{"name":"your_worker","template":"base"}' "$URL/api/workers" | jq -r .token)
-sed -i "s|^UZI_WORKER_TOKEN=.*|UZI_WORKER_TOKEN=$TOKEN|" .env
+# sed reads its script from printf, so ps does not show the token.
+printf 's|^UZI_WORKER_TOKEN=.*|UZI_WORKER_TOKEN=%s|\n' "$TOKEN" | sed -i -f - .env
 unset TOKEN
 ```
 
@@ -261,9 +266,11 @@ Connect the bot token from the prerequisites, then check its rights. The check p
 ```sh
 # Type the bot token. The terminal does not show it.
 read -rs BOT_TOKEN
+export BOT_TOKEN
 # Always send forge_type: the API picks GitLab when it is missing.
-CONNECTION=$(jq -n --arg token "$BOT_TOKEN" '{base_url:"https://github.com",forge_type:"github",token:$token}' \
+CONNECTION=$(jq -n '{base_url:"https://github.com",forge_type:"github",token:env.BOT_TOKEN}' \
   | api --data @- "$URL/api/forge/connections" | jq -r .connection.id)
+unset BOT_TOKEN
 api -X POST "$URL/api/forge/connections/$CONNECTION/privilege-check" | jq -r .report.status
 ```
 
@@ -298,7 +305,7 @@ docker compose exec db-backup backup-now
 sudo ls -l /opt/uzi/backups
 ```
 
-Copy `/opt/uzi/backups`, `.env`, `compose.yaml`, `caddy.yaml` and `backup.yaml` off the VPS with your backup routine. Test a restore away from the live database before you rely on it: see the [restore recipe](https://nfrastack.com/db-backup/recipes/restore).
+Copy `/opt/uzi/backups`, `.env`, `compose.yaml`, `caddy.yaml` and `backup.yaml` off the VPS with your backup routine. Only root and UID `10000` can read `/opt/uzi/backups`, so run the copy with `sudo`. Test a restore away from the live database before you rely on it: see the [restore recipe](https://nfrastack.com/db-backup/recipes/restore).
 
 ## Upgrades
 
