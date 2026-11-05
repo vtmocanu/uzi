@@ -86,7 +86,7 @@ Flags:
 | `--forge-type` | Required: `gitlab`, `forgejo` or `github`. No default, no detection. |
 | `--forge-base-url` | Required: the forge URL; it must be in `FORGE_ALLOWED_BASE_URLS`. |
 | `--forge-token-file PATH` | Required: a file holding the bot token, or `-` for stdin. The token is never read from a flag value or an environment variable. At most 16 KiB. |
-| `--repos a/b,c/d` | Comma-separated `path_with_namespace` values to enable. At most 200. |
+| `--repos a/b,c/d` | Comma-separated `path_with_namespace` values to enable, spelled with the same case as on the forge. At most 200. |
 | `--worker-name NAME` | Optional: create the first self-hosted worker with this name (at most 200 bytes). Without it setup skips the worker step and reports `not_requested`. |
 | `--worker-template NAME` | Optional, needs `--worker-name`: the worker template. |
 

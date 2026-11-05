@@ -64,6 +64,9 @@ type fakeGuardForge struct {
 	server *httptest.Server
 	mu     sync.Mutex
 	prot   map[int64]protMode
+	// labelsRefused makes every label call answer 403, the forge refusing the
+	// board column labels.
+	labelsRefused bool
 }
 
 func newFakeGuardForge(t *testing.T) *fakeGuardForge {
@@ -71,7 +74,14 @@ func newFakeGuardForge(t *testing.T) *fakeGuardForge {
 	fg := &fakeGuardForge{prot: map[int64]protMode{}}
 	fg.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
+		fg.mu.Lock()
+		labelsRefused := fg.labelsRefused
+		fg.mu.Unlock()
 		switch {
+		case labelsRefused && strings.HasSuffix(path, "/labels"):
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"403 Forbidden"}`))
+			return
 		case strings.HasSuffix(path, "/api/v4/user"):
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": guardBotUserID, "username": "uzi-bot"})
@@ -284,6 +294,42 @@ func TestSetRepoEnableGuardAllowsCleanLiveDB(t *testing.T) {
 	if !f.repoEnabled(ctx, t, repoID) {
 		t.Errorf("a clean repo must be enabled after a 200")
 	}
+	// PRD #3760 Decision 13: the web enable creates the default board columns, so
+	// the run lifecycle can resolve a card's column without a board read first.
+	if got := f.boardColumns(ctx, t, repoID); got != 4 {
+		t.Errorf("board_columns after enable = %d, want 4", got)
+	}
+}
+
+// The forge refuses the board column labels → 502, the repo stays disabled and
+// has no columns (PRD #3760 Decision 13).
+func TestSetRepoEnableLabelsRefusedIs502LiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newEnableGuardFixture(ctx, t)
+	repoID := f.seedRepo(ctx, t, 107, false, protClean)
+	f.forge.mu.Lock()
+	f.forge.labelsRefused = true
+	f.forge.mu.Unlock()
+
+	w := f.setEnabled(t, repoID, true)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (body %s)", w.Code, w.Body.String())
+	}
+	if f.repoEnabled(ctx, t, repoID) {
+		t.Errorf("a repo whose labels the forge refused must stay disabled")
+	}
+	if got := f.boardColumns(ctx, t, repoID); got != 0 {
+		t.Errorf("board_columns after a refused enable = %d, want 0", got)
+	}
+}
+
+func (f enableGuardFixture) boardColumns(ctx context.Context, t *testing.T, repoID uuid.UUID) int {
+	t.Helper()
+	var n int
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM board_columns WHERE repo_id = $1`, repoID).Scan(&n); err != nil {
+		t.Fatalf("count board_columns: %v", err)
+	}
+	return n
 }
 
 // A branch-protection read error refuses the enable (fail closed, D3).

@@ -453,6 +453,53 @@ func TestSetupCmdConcurrentWorkerCreateMakesOneLiveDB(t *testing.T) {
 	}
 }
 
+// The per-owner lock alone keeps the first-worker step to one worker. The full
+// runs above spread out during connect and discovery, so they can pass without
+// the lock; these calls start together at the lock itself. Without the
+// pg_advisory_xact_lock in poolWorkers.CreateFirst, every call sees no worker
+// and more than one is created.
+func TestSetupCmdCreateFirstLockSerializesLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newSetupFixture(ctx, t, true)
+	workers := setupcmd.NewPoolWorkers(f.pool, f.box)
+
+	const n = 8
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		start   = make(chan struct{})
+		created int
+		exists  int
+	)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			res, err := workers.CreateFirst(ctx, f.userID, "vps-1", "")
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err != nil:
+				t.Errorf("CreateFirst: %v", err)
+			case res.Created:
+				created++
+			default:
+				exists++
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if created != 1 || exists != n-1 {
+		t.Fatalf("created=%d exists=%d, want 1 and %d", created, exists, n-1)
+	}
+	if got := f.count(ctx, t, `SELECT count(*) FROM workers WHERE user_id = $1`, f.userID); got != 1 {
+		t.Fatalf("workers = %d, want exactly 1", got)
+	}
+}
+
 // A worker request behind a refused repo mints nothing: no worker row exists.
 func TestSetupCmdRefusedRepoMintsNoWorkerLiveDB(t *testing.T) {
 	ctx := context.Background()

@@ -403,7 +403,7 @@ func TestRunForgeFailureSkipsDependentSteps(t *testing.T) {
 		t.Fatalf("exit = %d, want 1", code)
 	}
 	rep := h.report(t)
-	if rep.Forge.Status != StatusFailed || rep.Discovery != nil {
+	if rep.Forge.Status != StatusFailed || rep.Discovery == nil || rep.Discovery.Status != StatusSkippedDependency {
 		t.Fatalf("forge=%+v discovery=%+v", rep.Forge, rep.Discovery)
 	}
 	for _, p := range []string{"acme/app", "acme/lib"} {

@@ -173,6 +173,10 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	r.report = &Report{SchemaVersion: ReportSchemaVersion, Status: ReportOK}
 	conn, forgeOK := r.connectForge(ctx, prov, be.Q, owner.ID, in, normBase)
 	discovered := forgeOK && r.discoverRepos(ctx, prov, owner.ID, conn.ID)
+	if !forgeOK {
+		// The report names every step (PRD #3760), so a skipped discovery shows.
+		r.report.Discovery = &Step{Status: StatusSkippedDependency}
+	}
 	r.enableRepos(ctx, prov, be.Q, owner.ID, conn.ID, in.repos, discovered)
 	r.createWorker(ctx, be.Workers, owner.ID, in)
 
