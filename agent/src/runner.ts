@@ -15208,7 +15208,7 @@ export class RunRunner {
     // checkedFailure for any other exit, and by the attemptCredentialSwitch hook on a release. The
     // closures die with this flight, which ends them.
     let pendingCheckedApproval: {
-      claimGeneration: number; round: number; candidateDigest: string; planMd: string; milestones: string;
+      claimGeneration: number; planMd: string; milestones: string;
       response: Extract<Awaited<ReturnType<typeof checkPlan>>, { kind: "approve" }>["response"];
       releaseStateBarrier: (() => void) | undefined; failStateBarrier: ((error: unknown) => void) | undefined;
     } | undefined;
@@ -15754,18 +15754,15 @@ export class RunRunner {
         // A switch is in play when one is latched by the hold, or already pending (the hold has no
         // effect then and latched() is false).
         const switchInPlay = (): boolean => hold?.latched() === true || steering.pendingCredentialSwitch() !== undefined;
-        // A switch that surfaces after the checker approved but before gatePlan retains the canonical
-        // storage (the semantic review, the resumed-delivery wait, gatePlan's own early awaits) must
-        // not lose the approval: the give-up re-run would otherwise auto-approve without it. Re-stash
-        // it, bound exactly like the S1 stash. Rethrows `error` in every case.
-        const restashApproval = (error: unknown): never => {
-          if (error instanceof CredentialSwitchSignal && checkedApproval && !continueCheckedStorage) {
-            pendingCheckedApproval = { claimGeneration: flight.claimGeneration, round: checkedApproval.round,
-              candidateDigest: checkedApproval.candidate_digest, planMd,
-              milestones: JSON.stringify(milestones ?? []), response: checkedApproval,
-              releaseStateBarrier, failStateBarrier };
-          }
-          throw error;
+        // Stash the checker's approval for the give-up re-run (non-throwing). Used at the S1 control
+        // exit and when a switch surfaces after the approve but before gatePlan retains the canonical
+        // storage (the semantic review, gatePlan's early awaits): the re-run would otherwise lose the
+        // approval. Once storage is retained, continueCheckedStorage owns the resume instead.
+        const stashApproval = (): void => {
+          if (!checkedApproval || continueCheckedStorage) return;
+          pendingCheckedApproval = { claimGeneration: flight.claimGeneration, planMd,
+            milestones: JSON.stringify(milestones ?? []), response: checkedApproval,
+            releaseStateBarrier, failStateBarrier };
         };
         // The give-up re-run consumes (or the mismatch clears) the stashed approve at entry.
         const adopted = pendingCheckedApproval;
@@ -15773,7 +15770,8 @@ export class RunRunner {
         pendingCheckedRevise = undefined;
         if (adopted) {
           if (!eligible || adopted.claimGeneration !== flight.claimGeneration || adopted.planMd !== planMd ||
-              adopted.milestones !== JSON.stringify(milestones ?? [])) {
+              adopted.milestones !== JSON.stringify(milestones ?? []) ||
+              (semanticCompiled && adopted.response.candidate_digest !== semanticCompiled.candidate.digest)) {
             const mismatch = new Error("plan cross-check: stashed decision does not match the re-presented candidate");
             adopted.failStateBarrier?.(mismatch);
             return checkedFailure(mismatch);
@@ -15818,7 +15816,7 @@ export class RunRunner {
                   ? "interrupted" : latest.fallback_reason;
                 checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: reason };
                 crossCheckReason = `plan cross-check: ${reason.replaceAll("_", " ")}`;
-                checkedHuman = { phase: "publishinginitial", onApplied: () => { releaseStateBarrier?.(); serviceHold(); } };
+                checkedHuman = { phase: "publishinginitial", onApplied: () => releaseStateBarrier?.() };
               }
             }
             // Discovery completed: a switch that interrupted it re-runs it with the re-selection.
@@ -15828,14 +15826,14 @@ export class RunRunner {
             } else if (codexLeadUnsupported) {
               crossCheckReason = "plan cross-check: not yet supported for a Codex lead";
               checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: "codex_lead_unsupported" };
-              checkedHuman = { phase: "publishinginitial", onApplied: () => { releaseStateBarrier?.(); serviceHold(); } };
+              checkedHuman = { phase: "publishinginitial", onApplied: () => releaseStateBarrier?.() };
             } else {
               const captured = semanticDiff ?? await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, barePath, steering.lifecycleSignal(), runLog);
               if ("refusal" in captured) {
                 crossCheckReason = `plan cross-check: planning diff refused (${captured.refusal}: ${captured.diagnostic})`;
                 checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: "planning_diff_refused",
                   plan_cross_check_diff_refusal: captured.refusal };
-                checkedHuman = { phase: "publishinginitial", onApplied: () => { releaseStateBarrier?.(); serviceHold(); } };
+                checkedHuman = { phase: "publishinginitial", onApplied: () => releaseStateBarrier?.() };
               } else {
                 const checkOptions = {
                   client: this.client, runId, generation: flight.claimGeneration,
@@ -15864,10 +15862,7 @@ export class RunRunner {
                   // of this is synchronous, so no switch can slip in between.
                   if (switchInPlay()) {
                     stashed = true;
-                    pendingCheckedApproval = { claimGeneration: flight.claimGeneration, round: decision.response.round,
-                      candidateDigest: decision.response.candidate_digest, planMd,
-                      milestones: JSON.stringify(milestones ?? []), response: decision.response,
-                      releaseStateBarrier, failStateBarrier };
+                    stashApproval();
                   }
                   serviceHold();
                   steering.lifecycleSignal().throwIfAborted();
@@ -15942,7 +15937,6 @@ export class RunRunner {
               if (!stashed && !batcher.hasCandidateReservation()) {
                 releaseStateBarrier?.();
                 crossCheckSelected = false;
-                checkedHuman = undefined;
               }
             } else failStateBarrier?.(error);
             closeHoldNoService();
@@ -15960,7 +15954,10 @@ export class RunRunner {
         if (semanticGate && semanticCompiled && semanticSources) {
           // The SERVER's coverage authority decides; the review result is display evidence only.
           const { review: coverage, outcome } = await semanticGate.reviewForGate(semanticCompiled, planMd, semanticSources.sources)
-            .catch(restashApproval);
+            .catch((error: unknown) => {
+              if (error instanceof CredentialSwitchSignal) stashApproval();
+              throw error;
+            });
           batcher.emit({ kind: "status", agent: "worker", payload: { event: "semantic_plan_coverage", ...coverage,
             server_outcome: outcome } });
           const maintainers = semanticCompiled.candidate.criteria.filter(c => c.kind === "maintainer").length;
@@ -15987,8 +15984,7 @@ export class RunRunner {
         // replayed approve read after it would approve a plan no human saw. Resolves at once once
         // delivered (an SDK claim already awaited it in takeResumedGateEvent).
         if (claim.plan_approved !== true && !!claim.plan_md?.trim() && !effectiveAutoApprove)
-          await this.awaitResumedDelivery(runId, steering, batcher, runLog, checkedHuman ? steering.lifecycleSignal() : cancel.signal)
-            .catch(restashApproval);
+          await this.awaitResumedDelivery(runId, steering, batcher, runLog, checkedHuman ? steering.lifecycleSignal() : cancel.signal);
         const semanticReports = new WeakMap<StateRequest, PlanCrossCheckStateRequest>();
         const reportSemanticState = (body: StateRequest): Promise<StateAck> => {
           let frozen = semanticReports.get(body);
@@ -16064,9 +16060,7 @@ export class RunRunner {
         ).catch((error) => {
           if (checkedHuman || checkedApproval) {
             if (error instanceof CredentialSwitchSignal) {
-              if (checkedApproval && !continueCheckedStorage) {
-                try { restashApproval(error); } catch { /* restash only; the failure path below rethrows */ }
-              }
+              stashApproval();
             } else failStateBarrier?.(error);
             return checkedFailure(error);
           }
