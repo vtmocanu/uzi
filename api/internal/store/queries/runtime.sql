@@ -5758,6 +5758,9 @@ WITH candidates AS MATERIALIZED (
   -- departure stamp would otherwise turn the exclusion NULL and strand the run). A NULL
   -- @witness_cutoff disables the deferral.
   AND NOT COALESCE((runs.kind <> 'cross_check'
+      -- Issue #3859: a pending server-stamped stop keeps the pre-#3859 uncharged reset (the charge and
+      -- unwitnessed-park arms skip it), so the reclaimed flight observes the stop.
+      AND COALESCE(runs.stop_kind, '') = ''
       AND runs.claim_released_at IS NULL
       AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
       AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
@@ -5766,6 +5769,9 @@ WITH candidates AS MATERIALIZED (
       AND EXISTS (SELECT 1 FROM workers w WHERE w.id = runs.worker_id AND w.snapshot_register_nonce IS NOT NULL AND runs.snapshot_departed_nonce = w.snapshot_register_nonce AND runs.snapshot_departed_epoch <= w.snapshot_epoch)
       AND NOT EXISTS (SELECT 1 FROM worker_active_runs a WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.claim_generation = runs.claim_generation)), false)
   AND NOT COALESCE((runs.kind <> 'cross_check'
+      -- Issue #3859: a pending server-stamped stop keeps the pre-#3859 uncharged reset (the charge and
+      -- unwitnessed-park arms skip it), so the reclaimed flight observes the stop.
+      AND COALESCE(runs.stop_kind, '') = ''
       AND runs.claim_released_at IS NULL
       AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
       AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
@@ -5855,6 +5861,9 @@ WHERE runs.status = 'claimed' AND runs.claimed_at < @cutoff
                            WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
   -- Issue #3859: the same two exclusions, rechecked against the locked row.
   AND NOT COALESCE((runs.kind <> 'cross_check'
+      -- Issue #3859: a pending server-stamped stop keeps the pre-#3859 uncharged reset (the charge and
+      -- unwitnessed-park arms skip it), so the reclaimed flight observes the stop.
+      AND COALESCE(runs.stop_kind, '') = ''
       AND runs.claim_released_at IS NULL
       AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
       AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
@@ -5863,6 +5872,9 @@ WHERE runs.status = 'claimed' AND runs.claimed_at < @cutoff
       AND EXISTS (SELECT 1 FROM workers w WHERE w.id = runs.worker_id AND w.snapshot_register_nonce IS NOT NULL AND runs.snapshot_departed_nonce = w.snapshot_register_nonce AND runs.snapshot_departed_epoch <= w.snapshot_epoch)
       AND NOT EXISTS (SELECT 1 FROM worker_active_runs a WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.claim_generation = runs.claim_generation)), false)
   AND NOT COALESCE((runs.kind <> 'cross_check'
+      -- Issue #3859: a pending server-stamped stop keeps the pre-#3859 uncharged reset (the charge and
+      -- unwitnessed-park arms skip it), so the reclaimed flight observes the stop.
+      AND COALESCE(runs.stop_kind, '') = ''
       AND runs.claim_released_at IS NULL
       AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
       AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)

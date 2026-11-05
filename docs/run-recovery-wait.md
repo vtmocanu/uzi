@@ -426,7 +426,9 @@ claim opened another custody hold until the owner reached the admission limit
   server-only: the claim is released, local work and custody are kept, and
   there is **no automatic retry**.
 - Everything else keeps the uncharged reset: first-generation claims,
-  non-continuations and workers without the evidence capability.
+  non-continuations and workers without the evidence capability. A run you
+  already cancelled while it was claimed also keeps the reset, so the reclaimed
+  worker sees that cancel; you do not need to cancel it again.
 
 For `retained_continuation_unwitnessed`, read `uzi run recovery <id>` and export
 an available archive, then choose `uzi run resume <id>` or `uzi run cancel <id>`.
