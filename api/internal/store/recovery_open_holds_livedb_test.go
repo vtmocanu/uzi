@@ -38,9 +38,24 @@ func TestCountOpenHoldsForOwnedRunLiveDB(t *testing.T) {
 	owner, other, connID, repoID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	exec := func(sql string, args ...any) {
 		t.Helper()
-		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+		// Every fixture INSERT must affect exactly one row: recovery_custody_holds has BEFORE
+		// INSERT guards that RETURN NULL, which drops a row without an error and would make a
+		// "not counted" assertion vacuous.
+		tag, err := pool.Exec(ctx, sql, args...)
+		if err != nil {
 			t.Fatalf("exec %q: %v", sql, err)
 		}
+		if tag.RowsAffected() != 1 {
+			t.Fatalf("exec %q affected %d rows, want 1 (a BEFORE INSERT guard may have dropped the row)", sql, tag.RowsAffected())
+		}
+	}
+	rawRows := func(run uuid.UUID) int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM recovery_custody_holds WHERE run_id=$1`, run).Scan(&n); err != nil {
+			t.Fatalf("raw row count: %v", err)
+		}
+		return n
 	}
 	for _, u := range []uuid.UUID{owner, other} {
 		exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, u, fmt.Sprintf("ropen-%s@e2e", u))
@@ -82,6 +97,9 @@ func TestCountOpenHoldsForOwnedRunLiveDB(t *testing.T) {
 	for gen, state := range []string{"open", "open", "open", "released", "discarded", "released"} {
 		addHold(mixed, owner, gen+1, state)
 	}
+	if n := rawRows(mixed); n != 6 {
+		t.Fatalf("raw hold rows for mixed run = %d, want 6 (a fixture row was dropped)", n)
+	}
 	row, err := count(mixed, owner)
 	if err != nil {
 		t.Fatalf("count mixed: %v", err)
@@ -93,6 +111,9 @@ func TestCountOpenHoldsForOwnedRunLiveDB(t *testing.T) {
 	// A hold stamped with a different user_id still counts: the count carries no hold-level
 	// owner filter, authorization is runs.user_id alone.
 	addHold(mixed, other, 7, "open")
+	if n := rawRows(mixed); n != 7 {
+		t.Fatalf("raw hold rows for mixed run = %d, want 7", n)
+	}
 	if row, err = count(mixed, owner); err != nil || row.OpenHolds != 4 {
 		t.Fatalf("count with foreign-stamped hold = %+v, %v; want 4", row, err)
 	}
@@ -101,8 +122,32 @@ func TestCountOpenHoldsForOwnedRunLiveDB(t *testing.T) {
 	done := newRun(owner, "completed", 2)
 	addHold(done, owner, 1, "released")
 	addHold(done, owner, 2, "discarded")
+	if n := rawRows(done); n != 2 {
+		t.Fatalf("raw hold rows for terminal run = %d, want 2", n)
+	}
 	if row, err = count(done, owner); err != nil || row.RunID != done || row.OpenHolds != 0 {
 		t.Fatalf("terminal zero = %+v, %v; want run %s with 0 open holds", row, err, done)
+	}
+
+	// The original bug: the worker-scoped list behind ListHoldsForWorkerRun returns only holds
+	// the CALLING worker originally took, so another worker's open hold on the run is invisible
+	// to it, while the run-wide count includes that hold.
+	foreign := newRun(owner, "recovery_wait", 3)
+	workerA, workerB := uuid.New(), uuid.New()
+	exec(`INSERT INTO recovery_custody_holds (id,user_id,run_id,generation,state,original_worker_id,original_worker_identity)
+	      VALUES ($1,$2,$3,1,'open',$4,'fixture')`, uuid.New(), owner, foreign, workerB)
+	if n := rawRows(foreign); n != 1 {
+		t.Fatalf("raw hold rows for foreign-worker run = %d, want 1", n)
+	}
+	scoped, err := q.ListCustodyHoldsForWorkerRun(ctx, store.ListCustodyHoldsForWorkerRunParams{RunID: foreign, WorkerID: workerA})
+	if err != nil {
+		t.Fatalf("worker-scoped list: %v", err)
+	}
+	if len(scoped) != 0 {
+		t.Fatalf("worker A's scoped list = %d holds, want 0 (worker B's hold must be invisible)", len(scoped))
+	}
+	if row, err = count(foreign, owner); err != nil || row.OpenHolds != 1 {
+		t.Fatalf("run-wide count = %+v, %v; want 1 (counts worker B's hold)", row, err)
 	}
 
 	// Another user's run yields no row, whatever it holds.
