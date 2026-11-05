@@ -59,6 +59,8 @@ func (g *fakeGuard) GuardRepo(_ context.Context, in privcheck.GuardInput) privch
 
 type fakeStore struct {
 	conn      *store.UpsertForgeConnectionParams
+	created   *store.CreateForgeConnectionIfAbsentParams
+	existing  *store.ForgeConnection // a row that already holds the target
 	repoRow   store.GetRepoForUserRow
 	repoErr   error
 	upserted  []store.UpsertRepoParams
@@ -71,6 +73,19 @@ type fakeStore struct {
 func (s *fakeStore) UpsertForgeConnection(_ context.Context, a store.UpsertForgeConnectionParams) (store.ForgeConnection, error) {
 	s.conn = &a
 	return store.ForgeConnection{ID: uuid.New(), UserID: a.UserID, ForgeType: a.ForgeType, BaseUrl: a.BaseUrl}, nil
+}
+func (s *fakeStore) CreateForgeConnectionIfAbsent(_ context.Context, a store.CreateForgeConnectionIfAbsentParams) (store.ForgeConnection, error) {
+	if s.existing != nil {
+		return store.ForgeConnection{}, pgx.ErrNoRows
+	}
+	s.created = &a
+	return store.ForgeConnection{ID: uuid.New(), UserID: a.UserID, ForgeType: a.ForgeType, BaseUrl: a.BaseUrl}, nil
+}
+func (s *fakeStore) GetForgeConnectionByTarget(context.Context, store.GetForgeConnectionByTargetParams) (store.ForgeConnection, error) {
+	if s.existing == nil {
+		return store.ForgeConnection{}, pgx.ErrNoRows
+	}
+	return *s.existing, nil
 }
 func (s *fakeStore) GetForgeConnectionForUser(_ context.Context, a store.GetForgeConnectionForUserParams) (store.ForgeConnection, error) {
 	return store.ForgeConnection{ID: a.ID, UserID: a.UserID, ForgeType: "gitlab", BaseUrl: "https://forge.example"}, nil
@@ -149,6 +164,53 @@ func TestConnectForgeStoresSealedToken(t *testing.T) {
 	}
 	if st.conn == nil || string(st.conn.TokenCiphertext) != "sealed:tok" || st.conn.BotUsername != "bot" {
 		t.Fatalf("stored connection = %+v", st.conn)
+	}
+}
+
+func TestConnectForgeCreateOnlyStoresNewConnection(t *testing.T) {
+	st := &fakeStore{}
+	svc := New(st, fakeForges{&fakeForge{identity: forge.BotIdentity{Username: "bot", ForgeUserID: 7}}}, &fakeGuard{}, allowAll)
+
+	conn, created, err := svc.ConnectForgeCreateOnly(context.Background(), uuid.New(), "github", "https://forge.example/", "tok")
+	if err != nil || !created {
+		t.Fatalf("created=%v err=%v, want a new connection", created, err)
+	}
+	if st.created == nil || string(st.created.TokenCiphertext) != "sealed:tok" || conn.BaseUrl != "https://forge.example" {
+		t.Fatalf("stored = %+v, conn = %+v", st.created, conn)
+	}
+	if st.conn != nil {
+		t.Fatal("create-only must never call the upsert")
+	}
+}
+
+func TestConnectForgeCreateOnlyReusesWinnerWithoutRotating(t *testing.T) {
+	winner := store.ForgeConnection{ID: uuid.New(), ForgeType: "github", BaseUrl: "https://forge.example", TokenCiphertext: []byte("sealed:old")}
+	st := &fakeStore{existing: &winner}
+	svc := New(st, fakeForges{&fakeForge{identity: forge.BotIdentity{Username: "bot", ForgeUserID: 7}}}, &fakeGuard{}, allowAll)
+
+	conn, created, err := svc.ConnectForgeCreateOnly(context.Background(), uuid.New(), "github", "https://forge.example", "new-token")
+	if err != nil || created {
+		t.Fatalf("created=%v err=%v, want the existing connection reused", created, err)
+	}
+	if conn.ID != winner.ID || string(conn.TokenCiphertext) != "sealed:old" {
+		t.Fatalf("conn = %+v, want the winner unchanged", conn)
+	}
+	if st.conn != nil || st.created != nil {
+		t.Fatal("a reused connection must not be written")
+	}
+}
+
+func TestConnectForgeCreateOnlyRefusesOverPrivilegedToken(t *testing.T) {
+	st := &fakeStore{}
+	g := &fakeGuard{violations: []string{"token has the sudo scope"}}
+	svc := New(st, fakeForges{&fakeForge{}}, g, allowAll)
+
+	_, _, err := svc.ConnectForgeCreateOnly(context.Background(), uuid.New(), "gitlab", "https://forge.example", "tok")
+	if pe := asProvisionError(t, err); pe.Kind != KindOverPrivileged {
+		t.Fatalf("kind = %v, want KindOverPrivileged", pe.Kind)
+	}
+	if st.created != nil {
+		t.Fatal("an over-privileged token must not be stored")
 	}
 }
 

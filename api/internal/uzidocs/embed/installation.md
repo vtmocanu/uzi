@@ -53,6 +53,61 @@ This builds and starts three services (`db`, `api`, `web`) in dependency order: 
 
 Register the first account — it becomes admin automatically. Subsequent registrations are regular users.
 
+## First setup from a script
+
+`/server setup` connects the forge and enables repos for the seed admin without the web UI. It is a subcommand of the API binary. You run it inside the deployment, so it needs no admin password and no new token. It applies the same checks as the web UI: the bot token must be least-privilege, a repo is enabled only if the default branch is protected, and an enabled repo gets its board columns.
+
+Before you run it:
+
+- The API has started once, so the database is migrated. Setup never migrates and refuses (exit 2) a database that is not at the API's schema version.
+- `UZI_SEED_EMAIL` names an existing admin account. Setup acts for that user and never creates or promotes one. It does not need `UZI_SEED_PASSWORD`.
+- The forge base URL is in `FORGE_ALLOWED_BASE_URLS`.
+
+Docker Compose, with the token on stdin:
+
+```sh
+printf '%s' "$PAT" | docker compose exec -T api /server setup \
+  --forge-type github --forge-base-url https://github.com \
+  --forge-token-file - --repos acme/app,acme/lib
+```
+
+Kubernetes (Helm chart). The API pod must have `UZI_SEED_EMAIL` set (see the `UZI_SEED_*` notes in the chart values). Use `-i` so stdin reaches the container:
+
+```sh
+printf '%s' "$PAT" | kubectl exec -i deploy/<release>-api -- /server setup \
+  --forge-type github --forge-base-url https://github.com \
+  --forge-token-file - --repos acme/app,acme/lib
+```
+
+Flags:
+
+| Flag | Meaning |
+|---|---|
+| `--forge-type` | Required: `gitlab`, `forgejo` or `github`. No default, no detection. |
+| `--forge-base-url` | Required: the forge URL; it must be in `FORGE_ALLOWED_BASE_URLS`. |
+| `--forge-token-file PATH` | Required: a file holding the bot token, or `-` for stdin. The token is never read from a flag value or an environment variable. At most 16 KiB. |
+| `--repos a/b,c/d` | Comma-separated `path_with_namespace` values to enable. At most 200. |
+
+`--worker-name` and `--worker-template` are reserved for worker creation, which setup does not do yet; setup refuses them (exit 2) before it writes anything.
+
+Setup writes one JSON document to stdout and progress notes to stderr. Neither carries the token. The document has `schema_version`, an overall `status`, and one entry per step (`forge`, `discovery`, each repo in `repos`, `worker`). Step statuses:
+
+| Status | Meaning |
+|---|---|
+| `connected` | The forge connection was created. |
+| `present` | A connection for the same forge type and base URL already existed. Setup reuses it untouched: it does not re-verify it, and a different token never replaces it. |
+| `done` | Discovery listed the forge's repos. |
+| `enabled` | The repo is enabled and has its board columns. Re-running re-checks the guard and reports `enabled` again. |
+| `refused` | The token is over-privileged, or the repo guard blocked the repo. `findings` lists the reasons, the same as the web UI shows. |
+| `not_found` | The bot cannot see the repo on the forge. |
+| `failed` | The forge or the database failed; `message` says which step. |
+| `skipped_dependency` | An earlier step failed, so this one did not run. |
+| `not_requested` | Not asked for (the `worker` entry until worker creation ships). |
+
+Exit codes: `0` every requested step is done or already present; `1` a step failed or was refused, and the report says which; `2` a usage, configuration, schema or owner precondition failed and nothing was written. Writes that completed stay in place. Fix the cause and run the same command again.
+
+Setup runs in its own process, so it cannot wake the API's repo sync. The report sets `issue_sync` to `pending`: the poller imports the new repos' issues on its next interval (`FORGE_POLL_INTERVAL`).
+
 ## Codex account admission upgrades
 
 Deploy the **API first, then workers**. The API applies the additive

@@ -257,6 +257,56 @@ func (q *Queries) CountOpenCustodyHoldsForRepo(ctx context.Context, repoID uuid.
 	return count, err
 }
 
+const createForgeConnectionIfAbsent = `-- name: CreateForgeConnectionIfAbsent :one
+INSERT INTO forge_connections (
+    user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, last_verified_at
+) VALUES ($1, $2, $3, $4, $5, $6, now())
+ON CONFLICT (user_id, forge_type, base_url) DO NOTHING
+RETURNING id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at, privilege_report, privilege_checked_at, privilege_status, human_username
+`
+
+type CreateForgeConnectionIfAbsentParams struct {
+	UserID          uuid.UUID `json:"user_id"`
+	ForgeType       string    `json:"forge_type"`
+	BaseUrl         string    `json:"base_url"`
+	BotUsername     string    `json:"bot_username"`
+	BotForgeUserID  int64     `json:"bot_forge_user_id"`
+	TokenCiphertext []byte    `json:"token_ciphertext"`
+}
+
+// Create-only counterpart of UpsertForgeConnection for the operator setup
+// command (PRD #3760): it never updates an existing row, so a concurrent or
+// earlier connection keeps its token and bot identity. No row is returned on a
+// (user, forge_type, base_url) conflict; the caller then reads the winner with
+// GetForgeConnectionByTarget.
+func (q *Queries) CreateForgeConnectionIfAbsent(ctx context.Context, arg CreateForgeConnectionIfAbsentParams) (ForgeConnection, error) {
+	row := q.db.QueryRow(ctx, createForgeConnectionIfAbsent,
+		arg.UserID,
+		arg.ForgeType,
+		arg.BaseUrl,
+		arg.BotUsername,
+		arg.BotForgeUserID,
+		arg.TokenCiphertext,
+	)
+	var i ForgeConnection
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.ForgeType,
+		&i.BaseUrl,
+		&i.BotUsername,
+		&i.BotForgeUserID,
+		&i.TokenCiphertext,
+		&i.CreatedAt,
+		&i.LastVerifiedAt,
+		&i.PrivilegeReport,
+		&i.PrivilegeCheckedAt,
+		&i.PrivilegeStatus,
+		&i.HumanUsername,
+	)
+	return i, err
+}
+
 const deleteBoardColumnsByRepo = `-- name: DeleteBoardColumnsByRepo :exec
 DELETE FROM board_columns WHERE repo_id = $1
 `
@@ -389,6 +439,38 @@ func (q *Queries) DeleteRepoForUser(ctx context.Context, arg DeleteRepoForUserPa
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const getForgeConnectionByTarget = `-- name: GetForgeConnectionByTarget :one
+SELECT id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at, privilege_report, privilege_checked_at, privilege_status, human_username FROM forge_connections
+WHERE user_id = $1 AND forge_type = $2 AND base_url = $3
+`
+
+type GetForgeConnectionByTargetParams struct {
+	UserID    uuid.UUID `json:"user_id"`
+	ForgeType string    `json:"forge_type"`
+	BaseUrl   string    `json:"base_url"`
+}
+
+func (q *Queries) GetForgeConnectionByTarget(ctx context.Context, arg GetForgeConnectionByTargetParams) (ForgeConnection, error) {
+	row := q.db.QueryRow(ctx, getForgeConnectionByTarget, arg.UserID, arg.ForgeType, arg.BaseUrl)
+	var i ForgeConnection
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.ForgeType,
+		&i.BaseUrl,
+		&i.BotUsername,
+		&i.BotForgeUserID,
+		&i.TokenCiphertext,
+		&i.CreatedAt,
+		&i.LastVerifiedAt,
+		&i.PrivilegeReport,
+		&i.PrivilegeCheckedAt,
+		&i.PrivilegeStatus,
+		&i.HumanUsername,
+	)
+	return i, err
 }
 
 const getForgeConnectionForUser = `-- name: GetForgeConnectionForUser :one

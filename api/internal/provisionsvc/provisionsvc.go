@@ -59,6 +59,8 @@ func internal() *Error { return &Error{Kind: KindInternal, Message: "internal er
 // Store is the slice of *store.Queries the service uses.
 type Store interface {
 	UpsertForgeConnection(ctx context.Context, arg store.UpsertForgeConnectionParams) (store.ForgeConnection, error)
+	CreateForgeConnectionIfAbsent(ctx context.Context, arg store.CreateForgeConnectionIfAbsentParams) (store.ForgeConnection, error)
+	GetForgeConnectionByTarget(ctx context.Context, arg store.GetForgeConnectionByTargetParams) (store.ForgeConnection, error)
 	GetForgeConnectionForUser(ctx context.Context, arg store.GetForgeConnectionForUserParams) (store.ForgeConnection, error)
 	UpsertRepo(ctx context.Context, arg store.UpsertRepoParams) (store.Repo, error)
 	GetRepoForUser(ctx context.Context, arg store.GetRepoForUserParams) (store.GetRepoForUserRow, error)
@@ -98,37 +100,105 @@ func New(q Store, forges Forges, guard Guard, baseURLAllowed func(raw string) bo
 // verification, least-privilege check, encryption, upsert. An empty forgeType
 // means GitLab.
 func (s *Service) ConnectForge(ctx context.Context, userID uuid.UUID, forgeType, baseURL, token string) (store.ForgeConnection, error) {
+	p, err := s.validateConnection(ctx, forgeType, baseURL, token)
+	if err != nil {
+		return store.ForgeConnection{}, err
+	}
+	conn, err := s.q.UpsertForgeConnection(ctx, store.UpsertForgeConnectionParams{
+		UserID:          userID,
+		ForgeType:       p.forgeType,
+		BaseUrl:         p.baseURL,
+		BotUsername:     p.identity.Username,
+		BotForgeUserID:  p.identity.ForgeUserID,
+		TokenCiphertext: p.ciphertext,
+	})
+	if err != nil {
+		slog.Error("upsert forge connection", "error", err)
+		return store.ForgeConnection{}, internal()
+	}
+	return conn, nil
+}
+
+// ConnectForgeCreateOnly runs the same validation as ConnectForge but stores
+// the connection create-only (the operator setup command, PRD #3760 D12). When
+// a connection for the same user, forge type and base URL already exists, it
+// is returned unchanged with created=false: its token and bot identity are
+// never rotated, including when the row won a race with this call.
+func (s *Service) ConnectForgeCreateOnly(ctx context.Context, userID uuid.UUID, forgeType, baseURL, token string) (conn store.ForgeConnection, created bool, err error) {
+	p, err := s.validateConnection(ctx, forgeType, baseURL, token)
+	if err != nil {
+		return store.ForgeConnection{}, false, err
+	}
+	conn, err = s.q.CreateForgeConnectionIfAbsent(ctx, store.CreateForgeConnectionIfAbsentParams{
+		UserID:          userID,
+		ForgeType:       p.forgeType,
+		BaseUrl:         p.baseURL,
+		BotUsername:     p.identity.Username,
+		BotForgeUserID:  p.identity.ForgeUserID,
+		TokenCiphertext: p.ciphertext,
+	})
+	if err == nil {
+		return conn, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		slog.Error("create forge connection", "error", err)
+		return store.ForgeConnection{}, false, internal()
+	}
+	// Conflict: a connection already holds this target. Reuse the winner.
+	conn, err = s.q.GetForgeConnectionByTarget(ctx, store.GetForgeConnectionByTargetParams{
+		UserID: userID, ForgeType: p.forgeType, BaseUrl: p.baseURL,
+	})
+	if err != nil {
+		slog.Error("read winning forge connection", "error", err)
+		return store.ForgeConnection{}, false, internal()
+	}
+	return conn, false, nil
+}
+
+// validatedConnection is the result of the shared validation steps.
+type validatedConnection struct {
+	forgeType  string
+	baseURL    string
+	identity   forge.BotIdentity
+	ciphertext []byte
+}
+
+// validateConnection is the validation half of a connect: forge type, token
+// presence, base-URL allowlist, normalisation, client build, token
+// verification, least-privilege check, encryption. Shared by ConnectForge and
+// ConnectForgeCreateOnly so the two cannot drift.
+func (s *Service) validateConnection(ctx context.Context, forgeType, baseURL, token string) (validatedConnection, error) {
 	forgeType = strings.TrimSpace(forgeType)
 	if forgeType == "" {
 		forgeType = string(forge.TypeGitLab)
 	}
 	if forgeType != string(forge.TypeGitLab) && forgeType != string(forge.TypeForgejo) && forgeType != string(forge.TypeGitHub) {
-		return store.ForgeConnection{}, &Error{Kind: KindBadRequest, Message: "unsupported forge type"}
+		return validatedConnection{}, &Error{Kind: KindBadRequest, Message: "unsupported forge type"}
 	}
 	if strings.TrimSpace(token) == "" {
-		return store.ForgeConnection{}, &Error{Kind: KindBadRequest, Message: "a bot token is required"}
+		return validatedConnection{}, &Error{Kind: KindBadRequest, Message: "a bot token is required"}
 	}
 	if !s.baseURLAllowed(baseURL) {
-		return store.ForgeConnection{}, &Error{Kind: KindBadRequest, Message: "base URL is not in the allowed forge list"}
+		return validatedConnection{}, &Error{Kind: KindBadRequest, Message: "base URL is not in the allowed forge list"}
 	}
 	norm, err := config.NormalizeForgeBaseURL(baseURL)
 	if err != nil {
-		return store.ForgeConnection{}, &Error{Kind: KindBadRequest, Message: "invalid base URL"}
+		return validatedConnection{}, &Error{Kind: KindBadRequest, Message: "invalid base URL"}
 	}
 
 	f, err := s.forges.ForgeForToken(forge.Type(forgeType), norm, token)
 	if err != nil {
-		return store.ForgeConnection{}, &Error{Kind: KindBadRequest, Message: "could not initialize forge client"}
+		return validatedConnection{}, &Error{Kind: KindBadRequest, Message: "could not initialize forge client"}
 	}
 	identity, err := f.VerifyToken(ctx)
 	if err != nil {
 		// err is already PAT-redacted by the driver.
-		return store.ForgeConnection{}, &Error{Kind: KindBadGateway, Message: "token verification failed: " + err.Error()}
+		return validatedConnection{}, &Error{Kind: KindBadGateway, Message: "token verification failed: " + err.Error()}
 	}
 
 	// Least-privilege gate (PRD #5): token-level violations block the save.
 	if tr := s.guard.CheckToken(ctx, f, forge.Type(forgeType), identity.IsAdmin); len(tr.Violations) > 0 {
-		return store.ForgeConnection{}, &Error{
+		return validatedConnection{}, &Error{
 			Kind:       KindOverPrivileged,
 			Message:    "the bot token is over-privileged and was not saved; mint a least-privilege token (see the bot setup doc)",
 			Violations: tr.Violations,
@@ -138,21 +208,9 @@ func (s *Service) ConnectForge(ctx context.Context, userID uuid.UUID, forgeType,
 	ciphertext, err := s.forges.EncryptToken(token)
 	if err != nil {
 		slog.Error("encrypt token", "error", err)
-		return store.ForgeConnection{}, internal()
+		return validatedConnection{}, internal()
 	}
-	conn, err := s.q.UpsertForgeConnection(ctx, store.UpsertForgeConnectionParams{
-		UserID:          userID,
-		ForgeType:       forgeType,
-		BaseUrl:         norm,
-		BotUsername:     identity.Username,
-		BotForgeUserID:  identity.ForgeUserID,
-		TokenCiphertext: ciphertext,
-	})
-	if err != nil {
-		slog.Error("upsert forge connection", "error", err)
-		return store.ForgeConnection{}, internal()
-	}
-	return conn, nil
+	return validatedConnection{forgeType: forgeType, baseURL: norm, identity: identity, ciphertext: ciphertext}, nil
 }
 
 // DiscoverRepos lists the connection's forge projects and upserts each as a

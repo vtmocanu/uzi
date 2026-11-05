@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"net/mail"
 	"net/url"
 	"os"
 	"slices"
@@ -1860,12 +1859,12 @@ func loadFetcherToken(cfg *Config) error {
 // (a set-but-invalid seed should be a loud misconfiguration, not a silent
 // skip). The email is normalized to match how registration stores it.
 func loadSeedAdmin(cfg *Config) error {
-	email := strings.TrimSpace(strings.ToLower(os.Getenv("UZI_SEED_EMAIL")))
+	email, err := parseSeedEmail(os.Getenv("UZI_SEED_EMAIL"))
+	if err != nil {
+		return err
+	}
 	if email == "" {
 		return nil
-	}
-	if _, err := mail.ParseAddress(email); err != nil {
-		return fmt.Errorf("UZI_SEED_EMAIL is not a valid email address")
 	}
 	password := os.Getenv("UZI_SEED_PASSWORD")
 	if len(password) < auth.MinPasswordLen {

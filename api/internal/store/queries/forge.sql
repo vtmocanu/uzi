@@ -23,6 +23,22 @@ SET bot_username      = EXCLUDED.bot_username,
     last_verified_at  = now()
 RETURNING *;
 
+-- name: CreateForgeConnectionIfAbsent :one
+-- Create-only counterpart of UpsertForgeConnection for the operator setup
+-- command (PRD #3760): it never updates an existing row, so a concurrent or
+-- earlier connection keeps its token and bot identity. No row is returned on a
+-- (user, forge_type, base_url) conflict; the caller then reads the winner with
+-- GetForgeConnectionByTarget.
+INSERT INTO forge_connections (
+    user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, last_verified_at
+) VALUES ($1, $2, $3, $4, $5, $6, now())
+ON CONFLICT (user_id, forge_type, base_url) DO NOTHING
+RETURNING *;
+
+-- name: GetForgeConnectionByTarget :one
+SELECT * FROM forge_connections
+WHERE user_id = $1 AND forge_type = $2 AND base_url = $3;
+
 -- name: ListForgeConnectionsByUser :many
 SELECT * FROM forge_connections WHERE user_id = $1 ORDER BY created_at ASC;
 
