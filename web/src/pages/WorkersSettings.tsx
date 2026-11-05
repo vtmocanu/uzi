@@ -1146,10 +1146,8 @@ export function WorkersSettings() {
                     aria-label={`Why ${stripUnsafeChars(w.name)} cannot be deleted yet`}
                     className="space-y-2 rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 text-xs text-muted outline-hidden"
                   >
-                    <p>
-                      <strong className="font-medium text-fg">This worker can't be deleted yet</strong>
-                      {" "}These holds protect unpublished committed work from these runs. Recover it first:
-                    </p>
+                    <p className="font-medium text-fg">This worker can't be deleted yet</p>
+                    <p>These holds protect unpublished committed work from these runs. Recover it first:</p>
                     {(custodyRefusal.holds.length > 0 || custodyRefusal.total > custodyRefusal.holds.length) && (
                       <ul aria-label="Holds blocking this delete" className="space-y-1">
                         {custodyRefusal.holds.map((h) => {

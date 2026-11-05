@@ -24,8 +24,19 @@ type ManualState = Pick<Worker, "manual_cordoned_at" | "manual_cordoned_by" | "m
 };
 const manualStates = new Map<string, ManualState>();
 
+// The custody scenario's holds (runs.ts seedCustodyHolds) name worker "wkr-jvm", which is not
+// in the seeded fleet. List it, as a hosted worker, only under ?mock=custody so a hosted
+// Delete on it meets the 409 custody refusal; every other scenario keeps the fleet unchanged.
+function custodyHostedWorker(): Worker {
+  const base = mockWorkers.find((w) => w.id === "w-hosted-eu")!;
+  return { ...base, id: "wkr-jvm", name: "jvm-worker" };
+}
+
 function ownerWorkers(): Worker[] {
-  return mockScenario() === "health-incident" ? incidentFleetWorkers() : workers;
+  const scenario = mockScenario();
+  if (scenario === "health-incident") return incidentFleetWorkers();
+  if (scenario === "custody") return [...workers, custodyHostedWorker()];
+  return workers;
 }
 
 function projectedWorker<T extends Worker>(w: T): T {
@@ -228,7 +239,7 @@ export const workersApi = {
           hold_id: h.id,
           run_id: h.run_id,
           generation: h.generation,
-          kind: "code",
+          kind: getRun(h.run_id)?.kind ?? "",
           title: getRun(h.run_id)?.title ?? "",
         })),
         blocking_holds_total: blocking.length,

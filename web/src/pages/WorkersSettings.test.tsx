@@ -1116,6 +1116,21 @@ describe("WorkersSettings hosted delete confirms; external delete does not (PRD 
       expect(text).toContain("may release on its own");
       expect(text).toContain("review its recovery options in Held work");
       expect(text).toContain("This worker can't be deleted yet");
+      // Binding order of the whole callout: heading, lead, hold list, export, in-flight, discard.
+      const ordered = [
+        "This worker can't be deleted yet",
+        "These holds protect unpublished committed work from these runs. Recover it first:",
+        "Resolve hold",
+        "If a recovery archive exists, export it with",
+        "A hold whose run is still in flight may release on its own once its capture or run settles. If it remains, review its recovery options in Held work.",
+        "Or, to permanently drop that work, discard each hold explicitly with",
+      ].map((s) => text.replace(/\s+/g, " ").indexOf(s));
+      expect(ordered.every((i) => i >= 0)).toBe(true);
+      expect([...ordered].sort((a, b) => a - b)).toEqual(ordered);
+      // The heading is its own block, not inline text run into the lead.
+      const heading = within(callout()).getByText("This worker can't be deleted yet");
+      expect(heading.parentElement).toBe(callout());
+      expect(heading.textContent).toBe("This worker can't be deleted yet");
       expect(text).not.toContain("--yes");
       expect(text).not.toMatch(/last copy/i);
       expect(text).not.toContain("releases on its own");
