@@ -203,8 +203,7 @@ describe("R1 coverage spans clone, bare and a bounded alternates closure", () =>
   it("refuses an http-alternates entry", async () => {
     assert.equal(await observation(), true);
     fs.writeFileSync(path.join(sourceObjects(), "info/http-alternates"), "http://127.0.0.1:1/objects\n");
-    // The Node-only clone shape stage runs first and keeps the source: `objects/info` admits no such entry.
-    assert.equal(await observation(), false);
+    await unknown({}, /unsupported object info entry/);
   });
   it("refuses an alternate outside the managed repositories", async () => {
     const outside = path.join(fx.dataDir, "outside.git");
@@ -460,6 +459,30 @@ describe("R7 matrix", () => {
   it("an indexed unpublished blob blocks even when only the source holds it", async () => {
     packBoth();
     packObjects(clonePath, [hashObject("indexed unpublished blob")]);
+    assert.equal(await observation(), false);
+  });
+});
+
+describe("F2 required objects are the clone's own store, not the shared bare's", () => {
+  it("keeps a published clone eligible when the shared bare holds an unrelated blob and another run's unpublished branch", async () => {
+    assert.equal(await observation(), true, "control");
+    const blob = execFileSync("git", ["-C", bare, "hash-object", "-w", "--stdin"],
+      { env: ENV, encoding: "utf8", input: "another run's unrelated blob" }).trim();
+    const commit = command(bare, "-c", "user.name=fixture", "-c", "user.email=fixture@example.test",
+      "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "another run's unpublished commit");
+    command(bare, "update-ref", "refs/heads/agent/issue-9999", commit);
+    assert.equal(command(bare, "cat-file", "-t", blob), "blob");
+    assert.equal(await observation(), true);
+  });
+  it("keeps a commit that only the clone's own store holds and no root reaches", async () => {
+    assert.equal(await observation(), true, "control");
+    unpublishedCommit();
+    hashObject("clone-only blob");
+    assert.equal(await observation(), false);
+  });
+  it("keeps a clone-only object even when no ref of the clone names it", async () => {
+    assert.equal(await observation(), true, "control");
+    hashObject("clone-only blob, unreferenced");
     assert.equal(await observation(), false);
   });
 });

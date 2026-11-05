@@ -2,6 +2,7 @@ import { afterEach, beforeEach, it } from "node:test";
 import type { TestContext } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawn, spawnSync, type SpawnOptions } from "node:child_process";
@@ -119,6 +120,11 @@ async function observation(limits: Limits = {}): Promise<boolean> {
   const state = git["epochDiscardProofs"].get(proof)!;
   return git["epochRetained"].run(git["epochLimits"](limits), () =>
     git["withEpochNativeReads"](proof, () => git["automaticContentPreserved"](state)));
+}
+
+/** The stage-alone proof must end in AutomaticCompletenessUnknown (the PRD keeps unreadable object info UNKNOWN). */
+async function proveUnknown(limits: Limits = {}): Promise<void> {
+  await assert.rejects(prove(limits), error => (error as Error).constructor.name === "AutomaticCompletenessUnknown");
 }
 
 interface Launch { command: string; args: string[]; sub: string }
@@ -270,18 +276,45 @@ it("leaves the legacy proof on its own path: it still reads status and refuses a
 // ---------------------------------------------------------------------------------------------
 // H1-H4: the bypasses of the old "charge before status" proof.
 
-it("H1: a tracked non-UTF-8 path over budget is charged by its raw bytes and refused before status", async t => {
-  const name = Buffer.concat([Buffer.from(clonePath + "/"), Buffer.from([0x62, 0xff, 0x2e, 0x62, 0x69, 0x6e])]);
-  // Control: the same path with a small file is provable, so the refusal below is the charge.
-  fs.writeFileSync(name, "small");
-  commitAll("non-utf8 path");
-  assert.equal(await prove(), true);
-  sparse(name, 1024 * 1024);
-  const future = new Date(Date.now() + 3600_000);
-  fs.utimesSync(name, future, future);
+/**
+ * A tracked file that matches both HEAD and the worktree (a committed sparse file), so only the byte
+ * budget can refuse it: without the tracked-content charge it would be opened, hashed and accepted.
+ * Asserts the refusal reason and that the file is never opened or read.
+ */
+async function assertChargedBeforeAnyRead(t: TestContext, file: string | Buffer): Promise<void> {
+  assert.equal(await prove(), true, "control: the committed file is provable under the default budget");
+  const target = Buffer.from(file).toString("latin1");
+  const touched: string[] = [];
+  const open = fsp.open.bind(fsp);
+  t.mock.method(fsp, "open", async (...args: Parameters<typeof fsp.open>) => {
+    if (Buffer.from(args[0] as string | Buffer).toString("latin1") === target) touched.push("open");
+    return open(...args);
+  });
+  const reasons: string[] = [];
+  const debug = git["log"].debug.bind(git["log"]);
+  t.mock.method(git["log"], "debug", (message: string, fields?: { error?: unknown }) => {
+    if (typeof fields?.error === "string") reasons.push(fields.error);
+    return debug(message, fields as never);
+  });
   const rec = recordLaunches(t);
   assert.equal(await prove({ maxMetadataBytes: 65536 }), false);
+  assert.deepEqual(touched, [], "the over-budget file must never be opened");
+  assert.ok(reasons.some(reason => /tracked file: tracked content byte limit/.test(reason)), `refused by the charge: ${reasons.join("|")}`);
   assertNoGit(rec);
+}
+
+it("H1: a tracked non-UTF-8 path over budget is charged by its raw bytes and refused before any read", async t => {
+  const name = Buffer.concat([Buffer.from(clonePath + "/"), Buffer.from([0x62, 0xff, 0x2e, 0x62, 0x69, 0x6e])]);
+  sparse(name, 1024 * 1024);
+  commitAll("large non-utf8 path");
+  await assertChargedBeforeAnyRead(t, name);
+});
+
+it("F3: a committed, index-matched tracked file over the byte budget is refused by the charge, unopened", async t => {
+  const big = inClone("dir", "big.bin");
+  sparse(big, 1024 * 1024);
+  commitAll("large tracked file");
+  await assertChargedBeforeAnyRead(t, big);
 });
 
 it("H2: a split index is refused before any Git command, by file name and by extension", async t => {
@@ -1421,19 +1454,19 @@ it("F4: an includeIf naming a 300 MiB file is refused without a launch, so the f
   assertNoGit(rec);
 });
 
-it("F4: a FIFO at .git/objects/info/alternates is refused promptly, without any Git launch", async t => {
+it("F4: a FIFO at .git/objects/info/alternates is UNKNOWN promptly, without any Git launch", async t => {
   const alternates = inClone(".git", "objects", "info", "alternates");
   fs.mkdirSync(path.dirname(alternates), { recursive: true });
   fs.rmSync(alternates, { force: true });
   mkfifo(alternates);
   const rec = recordLaunches(t);
   const started = Date.now();
-  assert.equal(await prove(), false);
+  await proveUnknown();
   assert.ok(Date.now() - started < 10_000, "must not wait on the FIFO");
   assertNoGit(rec);
 });
 
-it("F4: http-alternates, an unknown entry or a symlinked objects/info are refused; alternates, packs and commit-graph files are admitted", async t => {
+it("F4: http-alternates, an unknown entry or a symlinked objects/info are UNKNOWN; alternates, packs and commit-graph files are admitted", async t => {
   const info = inClone(".git", "objects", "info");
   fs.mkdirSync(info, { recursive: true });
   fs.writeFileSync(path.join(info, "packs"), "\n");
@@ -1446,15 +1479,15 @@ it("F4: http-alternates, an unknown entry or a symlinked objects/info are refuse
   for (const name of ["http-alternates", "unknown-entry"]) {
     const file = path.join(info, name);
     fs.writeFileSync(file, "x");
-    assert.equal(await prove(), false, name);
+    await proveUnknown();
     fs.rmSync(file);
   }
   mkfifo(path.join(info, "commit-graph"));
-  assert.equal(await prove(), false, "a FIFO commit-graph");
+  await proveUnknown();
   fs.rmSync(path.join(info, "commit-graph"));
   fs.rmSync(info, { recursive: true });
   fs.symlinkSync(os.tmpdir(), info);
-  assert.equal(await prove(), false);
+  await proveUnknown();
   assertNoGit(rec);
 });
 
@@ -1521,4 +1554,81 @@ it("a FIFO or oversized .git entry keeps the source before any Git launch of the
   sparse(inClone(".git", "packed-refs"), 4 * 1024 * 1024, "# pack-refs\n");
   assert.equal(await observation({ maxMetadataBytes: 65536 }), false);
   assertNoGit(rec);
+});
+
+// ---------------------------------------------------------------------------------------------
+// F1: Git reads every loose ref, so the shape stage walks `.git/refs` in Node before any launch.
+
+const REF_BYTES = 1024;
+async function assertRefsRefusedBeforeGit(t: TestContext, why: string): Promise<void> {
+  const rec = recordLaunches(t);
+  assert.equal(await observation(), false, why);
+  assertNoGit(rec);
+}
+it("F1: a sparse oversize loose ref keeps the source with no native launch", async t => {
+  const big = inClone(".git", "refs", "heads", "zzbig");
+  sparse(big, 3 * 1024 * 1024 * 1024);
+  await assertRefsRefusedBeforeGit(t, "3 GiB loose ref");
+  fs.rmSync(big);
+  sparse(big, REF_BYTES + 1);
+  await assertRefsRefusedBeforeGit(t, "one byte over the ref limit");
+  fs.rmSync(big);
+  sparse(big, REF_BYTES);
+  assert.equal(await prove(), true, "the shape stage admits a regular ref of exactly the limit");
+  fs.rmSync(big);
+  assert.equal(await observation(), true, "control: the clone is provable again");
+});
+it("F1: a FIFO under refs/heads keeps the source with no native launch", async t => {
+  const fifo = inClone(".git", "refs", "heads", "zzfifo");
+  mkfifo(fifo);
+  const started = Date.now();
+  await assertRefsRefusedBeforeGit(t, "FIFO ref");
+  assert.ok(Date.now() - started < 10_000, "must not wait on the FIFO");
+});
+it("F1: a symlinked refs subdirectory or ref file keeps the source with no native launch", async t => {
+  const dir = inClone(".git", "refs", "heads", "linked");
+  fs.symlinkSync(os.tmpdir(), dir);
+  await assertRefsRefusedBeforeGit(t, "symlinked refs directory");
+  fs.rmSync(dir);
+  fs.symlinkSync(inClone("dir", "inner.txt"), inClone(".git", "refs", "heads", "linkedfile"));
+  await assertRefsRefusedBeforeGit(t, "symlinked ref file");
+});
+it("F1: every refs entry counts against the record limit, nested directories included", async t => {
+  assert.equal(await observation({ maxMetadataRecords: 64 }), true, "control: the clone fits the limit");
+  const dir = inClone(".git", "refs", "heads", "many", "deeper");
+  fs.mkdirSync(dir, { recursive: true });
+  for (let i = 0; i < 80; i++) fs.writeFileSync(path.join(dir, `r${i}`), "0".repeat(40) + "\n");
+  const rec = recordLaunches(t);
+  assert.equal(await observation({ maxMetadataRecords: 64 }), false);
+  assertNoGit(rec);
+});
+it("F1: a ref changed after it was typed is a keep at the final re-check", async () => {
+  const ref = inClone(".git", "refs", "heads", "late");
+  fs.writeFileSync(ref, command(clonePath, "rev-parse", "HEAD") + "\n");
+  const proof = git.createEpochDiscardProof(input);
+  const result = await git["epochRetained"].run(git["epochLimits"]({}), () => git["withEpochNativeReads"](proof, async () => {
+    const automatic = { roots: [], checkLive: () => {}, objectCoverage: async () => true, finalStoreCheck: async () => {} };
+    if (!await git["automaticCloneShape"](clonePath, automatic)) return "shape";
+    fs.writeFileSync(ref, "0".repeat(40) + "\n");
+    return git["worktreeCleanHardened"](clonePath, automatic);
+  }));
+  assert.equal(result, false);
+});
+it("F1: any for-each-ref stderr (a broken ref warning) is unknown, never clean", async () => {
+  fs.writeFileSync(inClone(".git", "refs", "heads", "broken"), "not-an-object-id\n");
+  await assert.rejects(observation(), error => (error as Error).constructor.name === "AutomaticCompletenessUnknown" &&
+    /for-each-ref/.test((error as Error).message));
+});
+
+// ---------------------------------------------------------------------------------------------
+// F4: the index must have exactly HEAD's entries; a staged addition that sorts last is not clean.
+
+it("F4: a staged addition that sorts after every HEAD entry is a keep even when its blob is published", async () => {
+  fs.copyFileSync(inClone("dir", "inner.txt"), inClone("zz-copy.md"));
+  command(clonePath, "add", "zz-copy.md");
+  assert.equal(command(clonePath, "ls-files").split("\n").at(-1), "zz-copy.md");
+  assert.equal(await prove(), false);
+  command(clonePath, "rm", "--cached", "-q", "zz-copy.md");
+  fs.rmSync(inClone("zz-copy.md"));
+  assert.equal(await prove(), true, "control: without the addition the clone is provable");
 });
