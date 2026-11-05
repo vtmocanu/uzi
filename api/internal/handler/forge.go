@@ -95,7 +95,7 @@ func parsePrivilegeReport(raw []byte, connID uuid.UUID) *privcheck.Report {
 		// D7: rows written before PRD #65 hold "role" as a number, which no longer
 		// unmarshals against the Role string field. The report blanks until the next
 		// privilege sweep (UZI_PRIVILEGE_CHECK_INTERVAL, default 24h) re-stamps it in
-		// the new shape. This log is deliberate - the pre-#65 code discarded the
+		// the new shape. This log is deliberate — the pre-#65 code discarded the
 		// error, which would hide a real corruption behind the same silent blank as
 		// this expected one-time migration miss.
 		slog.Warn("forge connection privilege report failed to unmarshal; blanking until the next privilege sweep re-stamps it",
@@ -108,7 +108,7 @@ func parsePrivilegeReport(raw []byte, connID uuid.UUID) *privcheck.Report {
 // guardrailBlockedForRepo computes the authoritative "would a run be refused on this
 // repo right now" from its OWNING connection's STORED privilege_report (PRD #66 M9,
 // D8). It applies the admin per-repo override via the SINGLE shared
-// privcheck.DowngradeOverridden - the same primitive the live gates use - so the web
+// privcheck.DowngradeOverridden — the same primitive the live gates use — so the web
 // never re-derives the waivable set. A nil report (connection never swept, or
 // UZI_PRIVILEGE_CHECK_INTERVAL=0) yields false, which is "unknown, not safe": the
 // enable/run gates still fail closed live (M4-M6), and the admin blocked-repos list
@@ -130,7 +130,7 @@ func guardrailBlockedForRepo(rep *privcheck.Report, repoID string, overridden bo
 // state is offline-unit-testable. It is called ONLY for a repo that actually has a
 // link row, so Linked is always true; Healthy is "the last sync recorded no error"
 // (last_error IS NULL/empty). LastError/LastSyncedAt copy through from the pgtype
-// fields when present. No forge call - purely the stored row.
+// fields when present. No forge call — purely the stored row.
 func syncHealthForLink(link store.GithubProjectLink) *apitypes.RepoProjectSyncHealth {
 	h := &apitypes.RepoProjectSyncHealth{Linked: true}
 	if link.LastError.Valid && link.LastError.String != "" {
@@ -187,7 +187,7 @@ func repoToDTO(r store.Repo) apitypes.RepoDTO {
 		dto.DefaultBranch = &r.DefaultBranch.String
 	}
 	// #66 M8 (D8): expose the admin per-repo override metadata when active. The
-	// reason NULL is the discriminator - a non-NULL reason means the override is on.
+	// reason NULL is the discriminator — a non-NULL reason means the override is on.
 	// Display-only surfacing for M9's badge; no findings downgrade happens here.
 	if r.GuardrailOverrideReason.Valid {
 		ov := &apitypes.GuardrailOverrideDTO{Reason: r.GuardrailOverrideReason.String}
@@ -287,6 +287,263 @@ func (h *Handler) VerifyConnection(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	conn, err := h.q.GetForgeConnectionForUser(r.Context(), store.GetForgeConnectionForUserParams{ID: id, UserID: user.ID})
+	if err != nil {
+		httpx.Error(w, http.StatusNotFound, "connection not found")
+		return
+	}
+	f, err := h.svc.ForgeForConnection(conn.ForgeType, conn.BaseUrl, conn.TokenCiphertext)
+	if err != nil {
+		slog.Error("build forge for connection", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if _, err := f.VerifyToken(r.Context()); err != nil {
+		httpx.Error(w, http.StatusBadGateway, "token verification failed: "+err.Error())
+		return
+	}
+	updated, err := h.q.TouchForgeConnectionVerified(r.Context(), store.TouchForgeConnectionVerifiedParams{ID: id, UserID: user.ID})
+	if err != nil {
+		slog.Error("touch connection verified", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"connection": connToDTO(updated)})
+}
+
+type updateConnectionRequest struct {
+	HumanUsername string `json:"human_username"`
+}
+
+// maxHumanUsernameLen bounds the self-declared username; GitLab usernames top out
+// well under this, so it only fences off absurd input written to a TEXT column.
+const maxHumanUsernameLen = 255
+
+const (
+	// usernameNotFoundWarning is surfaced when the forge has no such account. The
+	// value is still saved (verified-or-warned, PRD #19 Decision 3) — a warning,
+	// not a hard reject, because a user may connect before their account is visible
+	// to the bot, and hard-failing would be worse than a stored typo.
+	usernameNotFoundWarning = "Saved, but no forge account with this username was found — double-check it matches your own forge username."
+	// usernameUnverifiedWarning is surfaced when the lookup itself fails (forge
+	// unreachable, rate-limited). The save is not blocked on our ability to verify.
+	usernameUnverifiedWarning = "Saved, but the username could not be verified against the forge right now."
+)
+
+// UpdateConnection edits a connection's mutable fields — today only
+// human_username, the owning user's own forge account used for autopilot
+// attribution (PRD #19 M3). Saving is verified-or-warned: a value that does not
+// resolve to a forge user is still stored, with a warning, never hard-rejected
+// (Decision 3 — identity is self-declared). A value another uzi user has already
+// mapped on the same host IS hard-rejected (409) by the partial unique index. An
+// empty value clears the mapping (and skips the forge round-trip).
+func (h *Handler) UpdateConnection(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id, ok := httpx.PathUUID(w, r, "id", "connection")
+	if !ok {
+		return
+	}
+	var req updateConnectionRequest
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	username := strings.TrimSpace(req.HumanUsername)
+	if utf8.RuneCountInString(username) > maxHumanUsernameLen {
+		httpx.Error(w, http.StatusBadRequest, "username is too long")
+		return
+	}
+
+	conn, err := h.q.GetForgeConnectionForUser(r.Context(), store.GetForgeConnectionForUserParams{ID: id, UserID: user.ID})
+	if err != nil {
+		httpx.Error(w, http.StatusNotFound, "connection not found")
+		return
+	}
+
+	// Best-effort verify BEFORE the write so the warning describes exactly the
+	// value we are about to store. Skip the round-trip entirely when clearing.
+	var warning string
+	if username != "" {
+		f, ferr := h.svc.ForgeForConnection(conn.ForgeType, conn.BaseUrl, conn.TokenCiphertext)
+		if ferr != nil {
+			slog.Error("build forge for connection", "error", ferr)
+			warning = usernameUnverifiedWarning
+		} else {
+			warning = humanUsernameWarning(r.Context(), f, username)
+		}
+	}
+
+	updated, err := h.q.SetForgeConnectionHumanUsername(r.Context(), store.SetForgeConnectionHumanUsernameParams{
+		ID:            id,
+		UserID:        user.ID,
+		HumanUsername: pgconv.TextOrNull(username),
+	})
+	if err != nil {
+		if isUniqueViolation(err) {
+			httpx.Error(w, http.StatusConflict, "that forge username is already mapped by another user on this host")
+			return
+		}
+		if errors.Is(err, pgx.ErrNoRows) {
+			// The connection was deleted between the read above and this write.
+			httpx.Error(w, http.StatusNotFound, "connection not found")
+			return
+		}
+		slog.Error("set connection human username", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	resp := map[string]any{"connection": connToDTO(updated)}
+	if warning != "" {
+		resp["warning"] = warning
+	}
+	httpx.JSON(w, http.StatusOK, resp)
+}
+
+// humanUsernameWarning best-effort confirms username resolves to a forge account.
+// It returns "" when the user exists, and a warning string when the forge says no
+// such user or the lookup itself fails — a forge blip must never block the save
+// (PRD #19 Decision 3, verified-or-warned).
+func humanUsernameWarning(ctx context.Context, f forge.Forge, username string) string {
+	exists, err := f.UserExists(ctx, username)
+	if err != nil {
+		return usernameUnverifiedWarning
+	}
+	if !exists {
+		return usernameNotFoundWarning
+	}
+	return ""
+}
+
+// PrivilegeCheck runs the full PAT least-privilege report for a connection
+// (token + every enabled repo), persists it, and returns it. Owner-only, behind
+// the per-user forge rate limiter (it is the heaviest forge-proxying route: two
+// token-level calls — VerifyToken + TokenInfo — plus two per enabled repo). It
+// never blocks — the report surfaces findings, the badge reflects them, and the
+// user acts.
+func (h *Handler) PrivilegeCheck(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id, ok := httpx.PathUUID(w, r, "id", "connection")
+	if !ok {
+		return
+	}
+	conn, err := h.q.GetForgeConnectionForUser(r.Context(), store.GetForgeConnectionForUserParams{ID: id, UserID: user.ID})
+	if err != nil {
+		httpx.Error(w, http.StatusNotFound, "connection not found")
+		return
+	}
+	report, err := h.pcheck.CheckConnection(r.Context(), conn)
+	if err != nil {
+		slog.Error("privilege check", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"report": report})
+}
+
+// DeleteConnection removes a connection (cascading its repos, board columns, and
+// cached issues via FK).
+func (h *Handler) DeleteConnection(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id, ok := httpx.PathUUID(w, r, "id", "connection")
+	if !ok {
+		return
+	}
+	// PRD #1867 M2: the connection delete cascades its repos and their runs, so a failed
+	// run's live salvage row (live_run_id ON DELETE RESTRICT while its salvage copy is being
+	// made or exists on the forge) would otherwise error mid-cascade. Refuse with a 409
+	// naming the salvage refs and pending runs instead. Owner-scoped: a foreign id counts
+	// nothing and 404s below.
+	salvage, err := h.q.CountLiveSalvageForConnection(r.Context(), store.CountLiveSalvageForConnectionParams{ConnectionID: id, UserID: user.ID})
+	if err != nil {
+		slog.Error("count salvage refs for connection delete", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if salvage > 0 {
+		h.writeConnectionSalvageConflict(r.Context(), w, id, user.ID, salvage)
+		return
+	}
+	// Issue #2545: a failed run's held-work publication keeps live_run_id (ON DELETE RESTRICT)
+	// while its refs/uzi-held ref may exist on the forge, and deleting the connection would also
+	// destroy the credential the retention delete needs. Refuse with a 409 naming the held refs.
+	held, err := h.q.CountLiveHeldPublicationsForConnection(r.Context(), store.CountLiveHeldPublicationsForConnectionParams{ConnectionID: id, UserID: user.ID})
+	if err != nil {
+		slog.Error("count held refs for connection delete", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if held > 0 {
+		h.writeConnectionHeldConflict(r.Context(), w, id, user.ID, held)
+		return
+	}
+	prerequisites, err := h.q.CountLivePrerequisiteClosuresForConnection(r.Context(), store.CountLivePrerequisiteClosuresForConnectionParams{ConnectionID: id, UserID: user.ID})
+	if err != nil {
+		slog.Error("count prerequisite closures for connection delete", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if prerequisites > 0 {
+		writePrerequisiteConflict(w, prerequisites)
+		return
+	}
+	rows, err := h.q.DeleteForgeConnectionForUser(r.Context(), store.DeleteForgeConnectionForUserParams{ID: id, UserID: user.ID})
+	if err != nil {
+		// A sweep recorded a salvage row between the count above and this delete: the
+		// RESTRICT FK refused the cascade. Same 409 as the guard, never a 500.
+		if isSalvageRestrict(err) {
+			h.writeConnectionSalvageConflict(r.Context(), w, id, user.ID, -1)
+			return
+		}
+		// Same race for a held publication recorded between its count and this delete.
+		if isHeldRestrict(err) {
+			h.writeConnectionHeldConflict(r.Context(), w, id, user.ID, -1)
+			return
+		}
+		if isPrerequisiteRestrict(err) {
+			count, countErr := h.q.CountLivePrerequisiteClosuresForConnection(r.Context(), store.CountLivePrerequisiteClosuresForConnectionParams{ConnectionID: id, UserID: user.ID})
+			if countErr != nil {
+				slog.Error("recount prerequisite closures for connection delete", "error", countErr)
+			}
+			writePrerequisiteConflict(w, count)
+			return
+		}
+		slog.Error("delete connection", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if rows == 0 {
+		httpx.Error(w, http.StatusNotFound, "connection not found")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ListProjects fetches the bot's live membership list from the forge and upserts
+// each project as a repo row (enabled=false) so it is addressable, then returns
+// the repos with their current enabled state.
+func (h *Handler) ListProjects(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id, ok := httpx.PathUUID(w, r, "id", "connection")
+	if !ok {
+		return
+	}
 	conn, err := h.provisioner().DiscoverRepos(r.Context(), user.ID, id)
 	if err != nil {
 		writeProvisionError(w, err)
@@ -309,7 +566,7 @@ func (h *Handler) VerifyConnection(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("list projects: default-branch pipelines", "error", err)
 	}
 	// The badge STATE (PRD #66 M9) comes from this connection's stored report, run
-	// through the single shared downgrade - parsed once for the whole page.
+	// through the single shared downgrade — parsed once for the whole page.
 	report := parsePrivilegeReport(conn.PrivilegeReport, conn.ID)
 	allowSet, blockedSet := h.dockerFlagsForRepos(r.Context(), user.ID, "list projects")
 	// PRD #576 M2: batch-load each repo's GitHub Projects v2 sync-health once per
@@ -318,7 +575,7 @@ func (h *Handler) VerifyConnection(w http.ResponseWriter, r *http.Request) {
 	// the whole list, matching the docker-allowlist direction.
 	syncLinks := syncLinksForRepos(r.Context(), h.q, repoIDs, "list projects")
 	// PRD #1432: the member's latest override-request per repo, so a not-yet-enabled
-	// blocked repo can surface what they already asked for. Non-fatal on error - this
+	// blocked repo can surface what they already asked for. Non-fatal on error — this
 	// is enrichment like GuardrailBlocked, so a store failure logs and leaves the map
 	// empty (the field stays nil) rather than failing the whole list.
 	reqMap := map[uuid.UUID]store.GuardrailOverrideRequest{}
@@ -359,7 +616,7 @@ func (h *Handler) VerifyConnection(w http.ResponseWriter, r *http.Request) {
 // PRD #361: read the Docker-worker allowlist once per request. M1's per-repo
 // docker_allowlisted flag membership-tests it; M3's docker_blocked reuses it to ask
 // the DB which of the caller's repos a Docker-allowlist gap is actively blocking. The
-// list itself is never sent - both fields are booleans about the caller's own repos.
+// list itself is never sent — both fields are booleans about the caller's own repos.
 func (h *Handler) dockerFlagsForRepos(ctx context.Context, userID uuid.UUID, logPrefix string) (allowSet, blockedSet map[uuid.UUID]bool) {
 	var allowlist []uuid.UUID
 	allowlistOK := false
@@ -377,7 +634,7 @@ func (h *Handler) dockerFlagsForRepos(ctx context.Context, userID uuid.UUID, log
 	// docker_blocked reuses the same allowlist to ask the DB which repos a gap is actively
 	// blocking. Only run it when the allowlist read SUCCEEDED: with an untrustworthy
 	// (empty) allowlist the eligibility test fails closed and would over-escalate an
-	// actually-allowlisted repo to blocked - the opposite of docker_allowlisted's
+	// actually-allowlisted repo to blocked — the opposite of docker_allowlisted's
 	// degrade-to-false. On a read failure, degrade to neutral (empty blockedSet, no
 	// escalation) instead, matching M1's direction.
 	blockedSet = map[uuid.UUID]bool{}
@@ -399,7 +656,7 @@ func (h *Handler) dockerFlagsForRepos(ctx context.Context, userID uuid.UUID, log
 
 // syncLinksForRepos batch-loads the GitHub Projects v2 link rows for a set of repo
 // ids and returns them keyed by repo id, for the caller-scoped sync-health badge
-// (PRD #576 M2). A query error is non-fatal - the badge is enrichment, so it logs and
+// (PRD #576 M2). A query error is non-fatal — the badge is enrichment, so it logs and
 // returns an empty map (every repo's field stays nil), mirroring how the docker
 // enrichments degrade rather than failing the whole list.
 func syncLinksForRepos(ctx context.Context, q *store.Queries, repoIDs []uuid.UUID, logPrefix string) map[uuid.UUID]store.GithubProjectLink {
@@ -444,7 +701,7 @@ func (h *Handler) ListRepos(w http.ResponseWriter, r *http.Request) {
 	}
 	// The badge STATE (PRD #66 M9) reads each repo's OWNING connection's stored
 	// report. These repos span the user's connections, so parse each connection's
-	// blob once into a map keyed by connection id. Non-fatal on error - the badge is
+	// blob once into a map keyed by connection id. Non-fatal on error — the badge is
 	// enrichment, and a missing report reads as "unknown" (false), never as "safe".
 	reports := map[uuid.UUID]*privcheck.Report{}
 	if conns, err := h.q.ListForgeConnectionsByUser(r.Context(), user.ID); err != nil {
@@ -478,7 +735,7 @@ type setRepoEnabledRequest struct {
 
 // blockFindingMessages extracts the human messages of exactly the SeverityBlock
 // findings, for the 422 "violations" array (PRD #66 D1 layer 1). Overridden and
-// warn findings are excluded - only findings that actually refuse the run are
+// warn findings are excluded — only findings that actually refuse the run are
 // reported as the reason it was refused.
 func blockFindingMessages(findings []privcheck.Finding) []string {
 	msgs := make([]string, 0, len(findings))
@@ -492,8 +749,8 @@ func blockFindingMessages(findings []privcheck.Finding) []string {
 
 // blockFindingDTOs maps exactly the SeverityBlock findings to the wire DTO carried by
 // the enable-refusal 422's "findings" and snapshotted onto a member's override request
-// (PRD #1432). Same filter as blockFindingMessages - overridden and warn findings are
-// excluded - but it keeps the machine-readable Code and Severity alongside the message,
+// (PRD #1432). Same filter as blockFindingMessages — overridden and warn findings are
+// excluded — but it keeps the machine-readable Code and Severity alongside the message,
 // so the member UI can drive its "Request admin approval" affordance off the codes
 // rather than parsing prose. Never nil.
 func blockFindingDTOs(findings []privcheck.Finding) []apitypes.GuardrailFindingDTO {
@@ -571,12 +828,12 @@ func (h *Handler) SetRepoEnabled(w http.ResponseWriter, r *http.Request) {
 // DeleteRepo removes a single repo row (PRD #357), cascading its derived data
 // (runs, cached issues, board columns, ...) via existing FKs. Owner-scoped: a
 // non-owned or unknown id is a 404. Two structural guards keep this from nuking an
-// actively-tracked repo's board/history: an ENABLED repo is refused with 409 (D2 -
+// actively-tracked repo's board/history: an ENABLED repo is refused with 409 (D2 —
 // disable is the "I've stopped tracking this" state removal is reachable from), and
-// a repo with a non-terminal run is refused with 409 (D7 - disabling drops the repo
+// a repo with a non-terminal run is refused with 409 (D7 — disabling drops the repo
 // from the poll set but does not cancel an in-flight run). The DELETE itself also
 // carries `AND enabled = false` (D6), so a concurrent enable between the fetch and
-// the delete cannot slip a tracked repo through - the fetch drives the precise
+// the delete cannot slip a tracked repo through — the fetch drives the precise
 // status code, the predicate is the atomic guard. 204 on success, mirroring
 // DeleteConnection.
 func (h *Handler) DeleteRepo(w http.ResponseWriter, r *http.Request) {
@@ -613,10 +870,10 @@ func (h *Handler) DeleteRepo(w http.ResponseWriter, r *http.Request) {
 		httpx.JSON(w, http.StatusConflict, map[string]any{"error": "this repo has a run in progress; wait for it to finish before removing"})
 		return
 	}
-	// PRD #1296 M4 (D3): refuse GRACEFULLY when the repo's runs still hold OPEN custody -
+	// PRD #1296 M4 (D3): refuse GRACEFULLY when the repo's runs still hold OPEN custody —
 	// DeleteRepoForUser cascades the repo's runs (runs.repo_id ON DELETE CASCADE), which
 	// would otherwise hit an open hold's live_run_id ON DELETE RESTRICT FK and error
-	// mid-cascade, and - worse - destroy the last local source of unpublished work. Convert
+	// mid-cascade, and — worse — destroy the last local source of unpublished work. Convert
 	// that into an enumerated 409 naming how many recovery archives the delete would
 	// destroy, so the owner must explicitly discard them (or let recovery complete) first.
 	// A deliberate destructive delete that would drop the final source must name affected
@@ -670,7 +927,7 @@ func (h *Handler) DeleteRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The :execrows return may be 0 if a concurrent enable slipped in between the
-	// fetch above and this delete - that is the D6 `enabled = false` guard working, so
+	// fetch above and this delete — that is the D6 `enabled = false` guard working, so
 	// treat 0 rows as an already-gone no-op and still return 204, never 500.
 	if _, err := h.q.DeleteRepoForUser(r.Context(), store.DeleteRepoForUserParams{ID: id, UserID: user.ID}); err != nil {
 		// A sweep recorded a salvage row between the salvage count above and this delete:
@@ -928,12 +1185,12 @@ type patchRepoRequest struct {
 	RepoSkillsEnabled *bool `json:"repo_skills_enabled"`
 	// RepoClaudemdEnabled is the trusted-repo instructions opt-in (PRD #246): let the
 	// lead read the clone's root CLAUDE.md as advisory context. Pointer so an omitted
-	// field is a no-op. A sibling trust flag of RepoSkillsEnabled - the two may be set
+	// field is a no-op. A sibling trust flag of RepoSkillsEnabled — the two may be set
 	// together or individually in one request (the "Trusted repo" master).
 	RepoClaudemdEnabled *bool `json:"repo_claudemd_enabled"`
 	// RepoDevboxOptIn is the tier-2 opt-in (PRD #18 M5): union the repo's own
 	// devbox.json packages (packages-only) into provisioning. Pointer = omitted is a
-	// no-op. Its own exclusive path - cannot be combined with the trust flags.
+	// no-op. Its own exclusive path — cannot be combined with the trust flags.
 	RepoDevboxOptIn *bool `json:"repo_devbox_opt_in"`
 	// RepoRequiredCapabilities is the static per-repo capability hint (PRD #84 M2): the
 	// non-provisionable capabilities every run on this repo requires ({docker,jvm}).
@@ -945,7 +1202,7 @@ type patchRepoRequest struct {
 	RepoIgnoredInferredCapabilities *[]string `json:"ignored_inferred_capabilities"`
 	// RepoFoldImproveUziBacklog is the per-repo capability flag (PRD #686 M1). Pointer
 	// so an omitted field is a no-op; a present value replaces the stored flag. Its own
-	// exclusive path - cannot be combined with the devbox, trust or capability paths.
+	// exclusive path — cannot be combined with the devbox, trust or capability paths.
 	RepoFoldImproveUziBacklog *bool `json:"repo_fold_improve_uzi_backlog"`
 }
 

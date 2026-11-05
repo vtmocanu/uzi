@@ -166,7 +166,7 @@ func newEnableGuardFixture(ctx context.Context, t *testing.T) enableGuardFixture
 	fg := newFakeGuardForge(t)
 
 	// A real forgesvc builds the real GitLab driver against the fake server, and a
-	// real privcheck.Service runs GuardRepo through it - no fakes on the guard path.
+	// real privcheck.Service runs GuardRepo through it — no fakes on the guard path.
 	svc := newZeroWaitForgeService(q, box)
 	pcheck := privcheck.NewService(q, svc)
 
@@ -255,7 +255,7 @@ func TestSetRepoEnableGuardBlocksCanPushLiveDB(t *testing.T) {
 	}
 }
 
-// An unprotected default branch is refused too - the Protected-first inversion must
+// An unprotected default branch is refused too — the Protected-first inversion must
 // not read false,false as safe.
 func TestSetRepoEnableGuardBlocksUnprotectedLiveDB(t *testing.T) {
 	ctx := context.Background()

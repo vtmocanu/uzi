@@ -1,7 +1,7 @@
 // Package seed provides optional startup seeding that mirrors the admin-user
 // seed: it provisions a forge connection and enables a set of repos for the
-// seed admin from environment config. Like the admin seed it is create-only -
-// it never overwrites an existing connection - and it is a no-op unless a seed
+// seed admin from environment config. Like the admin seed it is create-only —
+// it never overwrites an existing connection — and it is a no-op unless a seed
 // PAT is configured. It reuses the same verify → encrypt → store primitives the
 // connect handler uses rather than duplicating them.
 package seed
@@ -24,7 +24,7 @@ import (
 // forge-type site: the presence check, the client build, and the persisted row
 // below must all name the same forge, and before this constant they were three
 // independent literals that merely happened to agree. Disagreement between them
-// is not a compile error - it is a seed that verifies one forge, stores another,
+// is not a compile error — it is a seed that verifies one forge, stores another,
 // and re-seeds on every boot because its own presence check never matches the row
 // it wrote. One name makes that class of bug unrepresentable.
 //
@@ -33,7 +33,7 @@ import (
 // since PRD #238 M5, 'github' too), but that widening is only safe while nothing
 // can write such a row: handler/forge.go still refuses those types (:158), so the
 // API cannot create one. The seed bypasses
-// that handler entirely - it calls UpsertForgeConnection directly - so an
+// that handler entirely — it calls UpsertForgeConnection directly — so an
 // operator-settable seed type would be a second, ungated door to the exact row
 // the gate exists to prevent, and PRD #65's dark-landing property ("no forgejo row
 // can exist while the handler rejects the type") would be false the moment it
@@ -57,7 +57,7 @@ type Store interface {
 }
 
 // ForgeService is the subset of *forgesvc.Service the seed needs: it builds a
-// forge client from a plaintext PAT and seals the PAT for storage - the same
+// forge client from a plaintext PAT and seals the PAT for storage — the same
 // primitives the connect handler uses.
 type ForgeService interface {
 	EncryptToken(pat string) ([]byte, error)
@@ -90,7 +90,7 @@ func ForgeConnection(ctx context.Context, q Store, svc ForgeService, cfg config.
 	}
 
 	// Never touch an existing connection: if the seed user already has one for
-	// (seedForgeType, base_url), do nothing - no re-verify, no overwrite -
+	// (seedForgeType, base_url), do nothing — no re-verify, no overwrite —
 	// consistent with the never-touch-existing-user stance of the admin seed.
 	conns, err := q.ListForgeConnectionsByUser(ctx, user.ID)
 	if err != nil {
@@ -105,7 +105,7 @@ func ForgeConnection(ctx context.Context, q Store, svc ForgeService, cfg config.
 	}
 
 	// Both forge calls run BEFORE any write, so a forge failure leaves no
-	// half-seeded connection - which the guard above would otherwise skip
+	// half-seeded connection — which the guard above would otherwise skip
 	// forever, stranding the repos. Once we persist below, the connection and
 	// its repo enablement land together in this same pass.
 	f, err := svc.ForgeForToken(seedForgeType, cfg.SeedForgeBaseURL, cfg.SeedForgePAT)
