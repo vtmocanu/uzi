@@ -311,11 +311,12 @@ type ClaimPayload struct {
 	// JudgeModel is the model alias a JUDGE run runs on (PRD #46 Decision 7), resolved
 	// from the judge_model setting at claim assembly. Present only for kind=judge.
 	JudgeModel *string `json:"judge_model,omitempty"`
-	// SummaryModel is the model alias the inline run-summary generator runs on (PRD
-	// #362 Decision 8), resolved user-value-wins from users.summary_model over the
-	// instance summary_model at ISSUE-run claim assembly. Unlike JudgeModel it rides
-	// the issue-run claim, not the judge claim; nil (omitted) when unresolved so an
-	// old worker's wire shape is unchanged.
+	// SummaryModel is the summary model for this claim's harness (PRD #362 Decision 8,
+	// PRD #3248 D3): the inline run-summary generator's model, resolved user-value-wins
+	// over the instance value and the built-in from the harness's own lane
+	// (summary_model for Claude, codex_summary_model for Codex) at ISSUE-run claim
+	// assembly. Unlike JudgeModel it rides the issue-run claim, not the judge claim;
+	// nil (omitted) when no settings are wired so an old worker's wire shape is unchanged.
 	SummaryModel *string `json:"summary_model,omitempty"`
 	// SummaryIntentPresent tells the worker the run's intent summary is ALREADY set
 	// (PRD #362 M3c, Decision 3), so the executor skips INTENT generation on a

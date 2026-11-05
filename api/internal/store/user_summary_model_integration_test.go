@@ -12,8 +12,8 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// TestUserSummaryModelLiveDB executes the two queries migration 00132 adds a column
-// for — GetUserSummaryModel and SetUserSummaryModel (PRD #362 M2) — against real
+// TestUserSummaryModelLiveDB executes the queries migrations 00132 and 00404 add columns
+// for — GetUserSummaryModels, SetUserSummaryModel (PRD #362 M2) and SetUserCodexSummaryModel (migration 00404, PRD #3248) — against real
 // Postgres. Per .claude/rules/go.md a green `sqlc generate` is not evidence a query
 // runs (sqlc's type deduction is not Postgres's), so the nullable-text round-trip
 // (pristine NULL, a set value, and clearing back to NULL) is only settled by the
@@ -43,12 +43,12 @@ func TestUserSummaryModelLiveDB(t *testing.T) {
 
 	// A never-written column is NULL, which must read as invalid (inherit the
 	// instance summary_model), not an error — the no-backfill contract in 00132.
-	got, err := q.GetUserSummaryModel(ctx, user)
+	both, err := q.GetUserSummaryModels(ctx, user)
 	if err != nil {
-		t.Fatalf("get summary model (pristine row): %v", err)
+		t.Fatalf("get summary models (pristine row): %v", err)
 	}
-	if got.Valid {
-		t.Fatalf("pristine summary_model = %+v, want NULL/invalid (inherit)", got)
+	if both.SummaryModel.Valid || both.CodexSummaryModel.Valid {
+		t.Fatalf("pristine summary models = %+v, want both NULL/invalid (inherit)", both)
 	}
 
 	// A set value round-trips through the RETURNING clause and a fresh read.
@@ -62,12 +62,41 @@ func TestUserSummaryModelLiveDB(t *testing.T) {
 	if !ret.Valid || ret.String != "opus" {
 		t.Fatalf("RETURNING summary_model = %+v, want opus", ret)
 	}
-	got, err = q.GetUserSummaryModel(ctx, user)
+	both, err = q.GetUserSummaryModels(ctx, user)
 	if err != nil {
-		t.Fatalf("get summary model (populated): %v", err)
+		t.Fatalf("get summary models (populated): %v", err)
 	}
-	if !got.Valid || got.String != "opus" {
-		t.Fatalf("read-back summary_model = %+v, want opus", got)
+	if !both.SummaryModel.Valid || both.SummaryModel.String != "opus" || both.CodexSummaryModel.Valid {
+		t.Fatalf("read-back summary models = %+v, want claude=opus, codex NULL", both)
+	}
+
+	// The Codex lane round-trips independently of the Claude lane.
+	codexRet, err := q.SetUserCodexSummaryModel(ctx, store.SetUserCodexSummaryModelParams{
+		ID:                user,
+		CodexSummaryModel: pgtype.Text{String: "gpt-6-astra", Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("set codex summary model: %v", err)
+	}
+	if !codexRet.Valid || codexRet.String != "gpt-6-astra" {
+		t.Fatalf("RETURNING codex_summary_model = %+v, want gpt-6-astra", codexRet)
+	}
+	both, err = q.GetUserSummaryModels(ctx, user)
+	if err != nil {
+		t.Fatalf("get summary models (both set): %v", err)
+	}
+	if both.SummaryModel.String != "opus" || both.CodexSummaryModel.String != "gpt-6-astra" {
+		t.Fatalf("read-back summary models = %+v, want opus / gpt-6-astra", both)
+	}
+	codexRet, err = q.SetUserCodexSummaryModel(ctx, store.SetUserCodexSummaryModelParams{
+		ID:                user,
+		CodexSummaryModel: pgtype.Text{Valid: false},
+	})
+	if err != nil {
+		t.Fatalf("clear codex summary model: %v", err)
+	}
+	if codexRet.Valid {
+		t.Fatalf("RETURNING after codex clear = %+v, want NULL/invalid", codexRet)
 	}
 
 	// Clearing with a NULL is the "back to inherit the instance model" write.
@@ -81,11 +110,11 @@ func TestUserSummaryModelLiveDB(t *testing.T) {
 	if ret.Valid {
 		t.Fatalf("RETURNING after clear = %+v, want NULL/invalid", ret)
 	}
-	got, err = q.GetUserSummaryModel(ctx, user)
+	both, err = q.GetUserSummaryModels(ctx, user)
 	if err != nil {
-		t.Fatalf("get summary model (cleared): %v", err)
+		t.Fatalf("get summary models (cleared): %v", err)
 	}
-	if got.Valid {
-		t.Fatalf("read-back after clear = %+v, want NULL/invalid", got)
+	if both.SummaryModel.Valid || both.CodexSummaryModel.Valid {
+		t.Fatalf("read-back after clear = %+v, want both NULL/invalid", both)
 	}
 }

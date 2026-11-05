@@ -38,14 +38,6 @@ func (c *Cache) JudgeEnforceAll(ctx context.Context) (bool, error) {
 	return c.boolSetting(ctx, KeyJudgeEnforceAll)
 }
 
-// SummaryModel returns the model alias the inline run-summary generator runs on
-// (PRD #362 Decision 8). Falls back to DefaultSummaryModel ("haiku"). The per-user
-// override (users.summary_model) is resolved user-value-wins at issue-run claim
-// assembly, mirroring JudgeModel but on the issue-run claim rather than the judge.
-func (c *Cache) SummaryModel(ctx context.Context) (string, error) {
-	return c.get(ctx, KeySummaryModel)
-}
-
 // JudgeCooldownSeconds returns the per-user judge cooldown in seconds (PRD #69 M5
 // Decision 9); 0 disables the cooldown guard. Best-effort at the enqueue gate — the
 // caller proceeds (fails open) on a read error, since the guard is a soft cost
@@ -86,6 +78,23 @@ func validateCodexJudgeModel(value string) error {
 	}
 	if !agenttmpl.CuratedCodexModels[m] {
 		return errors.New("is not a Codex judge model")
+	}
+	return nil
+}
+
+// validateCodexSummaryModel is the write-time gate for the instance Codex
+// summary model (PRD #3248): blank (or whitespace-only) is the explicit reset
+// to the built-in; otherwise the trimmed value must be a Codex role id.
+func validateCodexSummaryModel(value string) error {
+	m := strings.TrimSpace(value)
+	if m == "" {
+		return nil
+	}
+	if agenttmpl.KnownClaudeAliases[m] {
+		return errors.New("must be a Codex model; this is a Claude model alias")
+	}
+	if !agenttmpl.CodexRoleModels[m] {
+		return errors.New("is not a Codex summary model")
 	}
 	return nil
 }
