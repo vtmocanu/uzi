@@ -18154,7 +18154,7 @@ try {
    *  (i) `confirmedPublication`: this worker's exact confirmed tip (the mirror can be stale);
    *  (ii) `opts.attemptedTip`: the tip of a publish whose ack was lost (it may have landed), so
    *  it is proven with `checkpointTipState` (the #2753 overlay peel and the `wip(park):` marker
-   *  exception, then the #2967 all-parent proof), not the confirmed leg's `boundaryProof`
+   *  exception, otherwise the #2967 all-parent proof), not the confirmed leg's `boundaryProof`
    *  alone; a state other than `content_free` blocks;
    *  (iii) the mirrored `refs/uzi-checkpoints/<checkpointKey>`.
    *  Recovery coverage is content-free only when EVERY commit outside the recovery

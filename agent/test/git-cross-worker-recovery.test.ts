@@ -1256,13 +1256,14 @@ describe("GitCache.hasCommittedCheckpoint (#3944 stale local mirror, attempted t
   });
 
   /** Scope a runGit stub to the `ls-remote` call only; every other call goes to the real runGit. */
-  function stubLsRemote(git: GitCache, answer: string): void {
+  function stubLsRemote(git: GitCache, answer: string): () => void {
     const target = git as unknown as { runGit: (...args: unknown[]) => Promise<string> };
     const original = target.runGit.bind(git);
     target.runGit = (...args: unknown[]) => {
       const argv = args[1] as string[];
       return argv.includes("ls-remote") ? Promise.resolve(answer) : original(...args);
     };
+    return () => { target.runGit = original; };
   }
 
   const SHA_A = "a".repeat(40);
@@ -1276,16 +1277,24 @@ describe("GitCache.hasCommittedCheckpoint (#3944 stale local mirror, attempted t
     it(`g3 blocks when ls-remote answers ${name} (unknown, not absent)`, async () => {
       const f = await fixture();
       f.mirror(f.work);
-      stubLsRemote(f.git, answer);
-      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), true);
+      const restore = stubLsRemote(f.git, answer);
+      try {
+        assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), true);
+      } finally {
+        restore();
+      }
     });
   }
 
   it("g3 control: an empty ls-remote answer through the same stub is absent (discounted)", async () => {
     const f = await fixture();
     f.mirror(f.work);
-    stubLsRemote(f.git, "");
-    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), false);
+    const restore = stubLsRemote(f.git, "");
+    try {
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), false);
+    } finally {
+      restore();
+    }
   });
 
   it("g3 the probe's ls-remote receives pat, the http scope of the repo url, and username", async () => {
@@ -1302,7 +1311,11 @@ describe("GitCache.hasCommittedCheckpoint (#3944 stale local mirror, attempted t
       return original(...args);
     };
     const probe = { pat: "fixture-pat-value", repoUrl: "https://forge.example.test/org/repo.git", username: "fixture-user-value" };
-    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: probe }), false);
+    try {
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: probe }), false);
+    } finally {
+      target.runGit = original;
+    }
     assert.ok(lsRemote, "ls-remote ran");
     assert.deepEqual(lsRemote!.slice(2), ["fixture-pat-value", "https://forge.example.test/", "fixture-user-value"]);
   });
@@ -1339,6 +1352,22 @@ describe("GitCache.hasCommittedCheckpoint (#3944 stale local mirror, attempted t
       target.runGit = origRun;
       target.tryGitExit = origExit;
     }
+  });
+
+  it("g13 marker path: the floor-ancestry check ignores refs/replace (a replaced floor must not hide parent work)", async () => {
+    const f = await fixture();
+    // The marker's single parent carries work and is not an ancestor of the real floor.
+    const marker = mkCommit(f.bare, f.floorTree, [f.work], MARKER);
+    const opts = { attemptedTip: marker };
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), true, "control: real parent blocks");
+    // Replace the FLOOR with a commit that lists the work as a parent: honouring replace objects
+    // would make the work look like an ancestor of the floor, i.e. marker-only.
+    const replacement = mkCommit(f.bare, f.floorTree, [f.olderFloor, f.work], "replacement floor");
+    gitIn(f.bare, ["replace", f.floor, replacement]);
+    assert.ok(gitIn(f.bare, ["rev-list", "-n", "1", "--parents", "refs/remotes/origin/main"]).split(" ").includes(f.work),
+      "sanity: with replace objects honoured the floor lists the work as a parent");
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), true,
+      "a replace ref on the floor must not turn parent work into marker-only");
   });
 
   it("g4 blocks a content-bearing attempted tip even with no mirror (and with a null key)", async () => {
