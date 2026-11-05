@@ -1721,6 +1721,16 @@ Design record: [ADR-3845](../adr/3845-limit-aware-automatic-harness.md).
 - Prediction caveat: only a run claimed by an auto-select-bound worker re-applies the Claude ranking at claim; a pinned- or default-bound worker spends its own token, so the objective can be missed. Documented, not enforced. (AI-synced 2026-11-04)
 - Not shipped: moving existing or parked runs, freezing the Claude token at creation, per-run cost estimation, chat runs. (AI-synced 2026-11-04)
 
+## Feature #3878 — Overview preview, decisions first
+
+Design record: `prds/done/3878-overview-preview-decisions.md` (epic #3873).
+
+- A new Overview lives at `/overview/next`, linked both ways with the current Overview at `/dashboard`, which is unchanged apart from that link; both read one shared data hook. (AI-synced 2026-11-05)
+- The page header shows a greeting and one status sentence: decisions and (deduplicated) pull requests waiting on the viewer, or "Nothing needs you right now.", then executing / queued / parked counts, across the factory for admins. Admins get a compact health chip. (AI-synced 2026-11-05)
+- On that page the app-wide banner stack renders under the header; every other page keeps it above the content. The stack never remounts on navigation, so snoozes and dismissals survive moving to and from the preview. (AI-synced 2026-11-05)
+- Needs your decision lists only the viewer's own plan reviews, questions, owner-action parks and open PRs (one verb each, with age) for admins too, and hides when empty. A parked run counts as resuming on its own only with evidence (account cooldown, weekly-reserve pause, limit / pool wait, a parseable scheduled retry); anything else is an owner action. Review PR opens the forge only for an https URL. (AI-synced 2026-11-05)
+- Runs are grouped Yours, then for admins Other users (admin) with the owner email (masked in demo mode); another user's waiting run reads "waits on owner". A failed admin read shows "Other users' runs are unavailable" with the last good read time, and a non-admin never calls an admin endpoint. (AI-synced 2026-11-05)
+
 ## Demo mode branding
 
 - Web demo mode shows the stock uzi factory icon and wordmark, default tab title and favicon base, and hides all instance POWERED BY branding and the optional build-time license credit. Toggling it off restores the real branding live. This is per-device presentation only; server settings and the Admin Branding live preview stay real. (AI-synced 2026-11-01)

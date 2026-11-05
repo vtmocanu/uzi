@@ -1,6 +1,6 @@
 # PRD #3878: Overview preview, decisions first
 
-**Status**: Draft, parked (`Later`). Child of epic #3873. Blocked by: none.
+**Status**: Done (2026-11-05, uzi run on branch `agent/issue-3878`). Child of epic #3873. Blocked by: none.
 
 **Design brief**: `prds/3873-overview-redesign.md` (model-fidelity rules, data readiness, reuse map, constraints, mock contract). This PRD wins where it is more specific.
 
@@ -77,7 +77,29 @@ The Runs widget replaces Recent runs on the preview: Yours first, Other users (a
 
 Acceptance: admin and non-admin tests; mock parity for the widget.
 
+## Delivered
+
+All three milestones landed on one branch, each reviewed (reviewer + tester as gate owner; auditor on M2; web-ux for parity) with in-run `task check:web`, the focused Vitest files, `npm run build`, `task scan:secrets` and `task sast:semgrep` green. Full `test:web`, `test:web-browser`, `gate:repo` and the `build-web-mock` CI job are left to exact-head PR CI.
+
+- **M1** (`e459be7a`): `useOverviewData` (Dashboard sends exactly its old requests; `adminListRuns` only for admins on the preview), `AppBanners` with a shell header slot, `/overview/next` with greeting, status sentence and admin health chip, carried-over sections with Dashboard's inputs, links both ways, the `overview-next` mock scenario. Existing `Dashboard` and `AppShell` tests unchanged and green; new tests show the banner snooze and dismissal surviving navigation (red against a remounting design).
+- **M2** (`d717bf36`): `parkDisposition` (fail-closed), `openPrs`, `overviewDecisions`, the Needs your decision card and the sentence's decision clause. Tests per rule, a server pin over `ListMaintenanceHeldRuns` including its `recovery_retry_not_before IS NULL` predicate, and Review PR href tests (red against an unguarded href).
+- **M3** (`af31d480`, review fixes `1f59dc10`, `3b8799ae`): the Runs widget (Yours, Other users (admin) with masked owner, the unavailable note), "waits on owner" on other users' rows, the `overview-calm` mock scenario, a 400 px browser test, and admin-poll robustness (no overlapping requests, a 30 s deadline for a hung request, reset on revoke).
+- **Mock parity**: side-by-side screenshots, app left and mock right, desktop and 400 px, Ember and Dawn, plus the calm state: [desktop Ember](../mockups/3878/side-by-side-desktop-ember.png), [desktop Dawn](../mockups/3878/side-by-side-desktop-dawn.png), [400 px Ember](../mockups/3878/side-by-side-mobile-ember.png), [400 px Dawn](../mockups/3878/side-by-side-mobile-dawn.png), [calm](../mockups/3878/side-by-side-calm-desktop-ember.png), [other users' runs](../mockups/3878/detail-next-desktop-ember-others.png).
+
+### Mock deviations
+
+- Needs your decision is a one-column list without kind icons or detail lines (summary rows carry no plan or question text), with one Review PR row per PR (this PRD's text) rather than the mock's grouped "Review PRs" row, and no row cap; ages read "waiting 14m" / "waiting 3d".
+- Runs rows keep today's anatomy (this PRD's text), so they carry no action buttons or harness label; group headings are sentence case.
+- The header greets with the full display name, the sentence counts are not bold, and it carries a "Back to the current Overview" link; the Search button is #3875.
+- `CustodyBoardAlert` and `HealthPlatformLine` sit right under Needs your decision; worker load and usage at the bottom.
+
 ## Decision Log
+
+- **Banners under the header via a shell header slot, not by moving the stack** (2026-11-05): the shell keeps one `AppBanners` at a fixed position on every route and the preview portals its header into a slot above it, so a banner never remounts and its local state (danger snooze, attention dismissals) survives navigation (`specs/human.md` health attention entry). Rejected: rendering the stack inside the page and omitting it from the shell there, which reset that state on every visit. This replaces the "shell renders it on every route except `/overview/next`" wording in Modules and seams.
+- **`parkDisposition` fails closed** (owner review, 2026-11-05): a plain `recovery_wait` or `provider_outage` is automatic only with a parseable `recovery_retry_not_before`; a null, absent or invalid stamp, and every `*_unknown`, is an owner action, although the server's held-runs readout tags those `progressing`. The divergence is listed in the server pin test.
+- **Status sentence counts**: decisions exclude PR items; pull requests count deduplicated open PRs, so an open PR is never counted twice.
+- **Review PR uses the Runs page's HTTPS guard** (`preferForgeUrl` with the reconstructed URL), falling back to the run page.
+- **Other users' waiting runs read "waits on owner"** through an optional `RunProgressCell` subject; every other caller keeps "waits on you".
 
 - **Preview route, not a per-user setting** (brief option B): no migration, nothing persisted, reversible; #3877 promotes or drops it. Rejected: a layout preference now (option C), which doubles maintenance before the trial says it is wanted.
 - **Prefactor the data loading first**: two Overviews reading one hook cannot drift in what they fetch or how they poll. Rejected: copying `Dashboard`'s effects into the new page.
