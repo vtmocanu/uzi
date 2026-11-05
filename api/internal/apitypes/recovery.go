@@ -299,6 +299,17 @@ type RecoveryHoldDTO struct {
 type RecoveryHoldsResponse struct {
 	RunID string            `json:"run_id"`
 	Holds []RecoveryHoldDTO `json:"holds"`
+	// OpenHoldsAllWorkers is the run-wide count of open holds across every worker and
+	// generation (issue #3431). Present only for a worker that advertised
+	// recovery_run_open_holds_v1 and only when the count was read for a run the caller's
+	// owner owns; absent otherwise (never 0 as a stand-in for unknown).
+	OpenHoldsAllWorkers *RecoveryRunOpenHolds `json:"open_holds_all_workers,omitempty"`
+}
+
+// RecoveryRunOpenHolds is the run-wide open custody hold count carried by RecoveryHoldsResponse.
+type RecoveryRunOpenHolds struct {
+	RunID string `json:"run_id"`
+	Count int64  `json:"count"`
 }
 
 // RecoveryExactHoldsResponse is the V2-only observation branch of the worker hold endpoint.
