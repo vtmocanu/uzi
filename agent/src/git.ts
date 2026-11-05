@@ -18296,9 +18296,8 @@ try {
     // parent is marker-only iff it is an ancestor-or-equal of the floor; a parent that strictly
     // descends the floor or DIVERGED from it is committed work a report-only completion would orphan.
     try {
-      const floorRef = (await this.refExists(barePath, `refs/remotes/origin/${branch}`))
-        ? `refs/remotes/origin/${branch}`
-        : await this.defaultBranchRef(barePath);
+      const floorRef = await this.proofFloorRef(barePath, branch);
+      if (floorRef === null) return "unprovable";
       const status = await this.tryGitExit(barePath, ["--no-replace-objects", "merge-base", "--is-ancestor", parents[0]!, floorRef],
         undefined, undefined, PROOF_READ_ENV);
       return status === 0 ? "content_free" : status === 1 ? "carries_work" : "unprovable";
@@ -18312,6 +18311,46 @@ try {
       });
       return "unprovable";
     }
+  }
+
+  /** #3944: the proof's recovery floor, chosen like the reseed's (origin's branch if pushed, else
+   *  the default branch) but error-aware and under PROOF_READ_ENV. `refExists` and
+   *  `defaultBranchRef` collapse a failed read into "absent" and would silently fall back to a
+   *  different floor; here only a proven absence (exit 1) falls through, and any other outcome
+   *  returns `null`, which the callers treat as `unprovable`. Ref existence is read with
+   *  `show-ref` (no object read); the caller's own `^{commit}` read under PROOF_READ_ENV then
+   *  fails an unreadable floor object. */
+  private async proofFloorRef(barePath: string, branch: string): Promise<string | null> {
+    const exit = (args: string[]): Promise<number | null> =>
+      this.tryGitExit(barePath, args, undefined, undefined, PROOF_READ_ENV);
+    const refState = async (ref: string): Promise<"present" | "absent" | "unknown"> => {
+      const code = await exit(["show-ref", "--verify", "--quiet", ref]);
+      return code === 0 ? "present" : code === 1 ? "absent" : "unknown";
+    };
+    const branchRef = `refs/remotes/origin/${branch}`;
+    const branchState = await refState(branchRef);
+    if (branchState === "present") return branchRef;
+    if (branchState === "unknown") return null;
+    // 1) origin/HEAD, set by `remote set-head --auto`.
+    const headCode = await exit(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]);
+    if (headCode === 0) {
+      const head = (await this.runGitWithEnv(barePath, ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+        PROOF_READ_ENV)).trim();
+      const headState = await refState(head);
+      if (headState === "present") return head;
+      if (headState === "unknown") return null;
+    } else if (headCode !== 1) {
+      return null;
+    }
+    // 2) common defaults, remote-tracking then mirror-layout fallback.
+    for (const cand of ["refs/remotes/origin/main", "refs/remotes/origin/master", "refs/heads/main", "refs/heads/master"]) {
+      const state = await refState(cand);
+      if (state === "present") return cand;
+      if (state === "unknown") return null;
+    }
+    // 3) last resort: the bare repo's own HEAD.
+    const headExit = await exit(["rev-parse", "--verify", "--quiet", "HEAD"]);
+    return headExit === 0 ? "HEAD" : null;
   }
 
   /** Positive proof only: command failure, missing objects or truncated history block. */
@@ -18330,8 +18369,8 @@ try {
     const git = (args: string[]): Promise<string> => this.runGitWithEnv(barePath, args, PROOF_READ_ENV);
     try {
       if ((await git(["rev-parse", "--is-shallow-repository"])).trim() !== "false") return "unprovable";
-      const floorRef = (await this.refExists(barePath, `refs/remotes/origin/${branch}`))
-        ? `refs/remotes/origin/${branch}` : await this.defaultBranchRef(barePath);
+      const floorRef = await this.proofFloorRef(barePath, branch);
+      if (floorRef === null) return "unprovable";
       const floor = (await git(["--no-replace-objects", "rev-parse", "--verify", `${floorRef}^{commit}`])).trim();
       const exactTip = (await git(["--no-replace-objects", "rev-parse", "--verify", `${tip}^{commit}`])).trim();
       const tree = (await git(["--no-replace-objects", "rev-parse", "--verify", `${floor}^{tree}`])).trim();

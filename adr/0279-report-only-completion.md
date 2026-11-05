@@ -150,8 +150,12 @@ floor ancestry with `--no-replace-objects` (exit 1 means work, any other error b
 or more parents get no marker exception and take the all-parent proof. Every object read
 in the tip proof, including the overlay peel, ignores replace refs and `info/grafts`
 (`GIT_NO_REPLACE_OBJECTS`, `GIT_GRAFT_FILE=/dev/null`), so a replaced or grafted commit
-cannot make work look marker-only or content-free. The confirmed publication leg keeps its
-logic; it now reads through the same replace- and graft-free view.
+cannot make work look marker-only or content-free. The recovery floor itself (origin's
+branch if present, else the default branch) is chosen through the same view and
+error-aware: only a proven absence falls through to the next candidate, and a failed or
+incomplete ref read makes the proof unprovable rather than silently falling back to a
+different floor. The confirmed publication leg keeps its logic; it now reads through the
+same replace- and graft-free view.
 
 **Issue-run fallback (#3360).** On issue runs only, when the lead declares `report_only`
 but `hasCommittedCheckpoint` cannot establish that the checkpoint is content-free (same proof as above,

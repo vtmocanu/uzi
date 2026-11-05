@@ -1224,6 +1224,33 @@ describe("GitCache.hasCommittedCheckpoint (#3944 stale local mirror, attempted t
       "provable work, origin answers absent: discounted");
   });
 
+  it("g14 a failed read of the origin-branch floor is unprovable: no fallback floor, no probe, blocks", async () => {
+    const f = await fixture();
+    f.mirror(f.work);
+    // The default floor stays readable; only reads naming origin's copy of the branch fail with a
+    // real non-1 exit. A collapsed "absent" answer would fall back to the default floor, find
+    // provable work there and let the origin probe discount it.
+    const branchFloor = `refs/remotes/origin/${f.branch}`;
+    const seam = f.git as unknown as { execScoped: (cmd: string, args: string[], ...rest: unknown[]) => Promise<unknown> };
+    const original = seam.execScoped.bind(f.git);
+    seam.execScoped = async (cmd, args, ...rest) => {
+      if (args.some(a => a.includes(branchFloor))) {
+        throw Object.assign(new Error(`Command failed: git ${args.join(" ")}`), { code: 128, stderr: "fatal: unable to read ref" });
+      }
+      return original(cmd, args, ...rest);
+    };
+    const probe = spyProbe(f.git);
+    try {
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), true,
+        "an unreadable branch floor must not fall back to the default floor and be discounted");
+      assert.equal(probe.calls, 0, "unprovable proof never consults the origin probe");
+    } finally {
+      seam.execScoped = original;
+    }
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), false,
+      "control: with the floor read restored the same state is discounted");
+  });
+
   it("g12 a discount writes no ref in the bare or on origin", async () => {
     const f = await fixture();
     f.mirror(f.work);
