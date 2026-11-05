@@ -3146,6 +3146,8 @@ export class GitCache {
   /** Local recovery clocks, including queued locks and actual child settlement. */
   async withRecoveryOperation<T>(signal: AbortSignal, deadline: number, action: (signal: AbortSignal) => Promise<T>, budget?: MaintenanceBudget,
     opts?: { closureBudget?: { delivered: number; limit: number } }): Promise<T> {
+    // A caller-shared decoded-byte account is used by identity, but never above this cache's own ceiling.
+    if (opts?.closureBudget) opts.closureBudget.limit = Math.min(opts.closureBudget.limit, this.recoveryDecodedLimitBytes);
     const parent = this.recoveryOperations.getStore();
     budget = parent?.budget ?? MaintenanceBudget.current() ?? budget;
     deadline = Math.min(deadline, parent?.deadline ?? Infinity);

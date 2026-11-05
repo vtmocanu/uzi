@@ -199,8 +199,10 @@ async function harness(opts: HarnessOptions = {}) {
   const options = (over: Partial<PredecessorOperation> = {}, extra: FrozenOperationOptions = {}): FrozenOperationOptions => ({
     ...extra, predecessor: { claimGeneration: 8, repoId: REPO, boundary: token, live: () => s.live, uploadAllowance: allowance, measurements, ...over },
   });
-  const operate = (over: Partial<PredecessorOperation> = {}, extra: FrozenOperationOptions = {}, from: RecoveryRecord = record) =>
-    coordinator.operateFrozenInventory({ record: from, barePath: context.barePath, defaultBranch: "main" }, options(over, extra));
+  const operate = (over: Partial<PredecessorOperation> = {}, extra: FrozenOperationOptions = {}, from: RecoveryRecord = record,
+    signal?: AbortSignal) =>
+    coordinator.operateFrozenInventory({ record: from, barePath: context.barePath, defaultBranch: "main", ...(signal ? { signal } : {}) },
+      options(over, extra));
   const saved = async (): Promise<RecoveryRecord> => (await coordinator.inspect(RUN)).find(r => r.generation === 7)!;
   const file = (r: Pick<RecoveryRecord, "runId" | "captureId">) => path.join(root, "journal", r.runId, r.captureId + ".json");
   const key = createHmac("sha256", "local-worker-fixture").update("uzi-recovery-journal-v1").digest();
@@ -370,22 +372,37 @@ async function savedArchiveFinal(h: Harness, lost: boolean): Promise<RecoveryRec
   return record;
 }
 
-it("a lost ACK replays the identical saved archive FINAL even though the hold closed and observation would refuse", async () => {
+it("a lost ACK whose closed hold is journaled is skipped in flight with zero POSTs, then replayed by the ordinary pass", async () => {
   const h = await harness();
   try {
     const record = await savedArchiveFinal(h, true);
     assert.equal(h.s.holdState, "released", "the api committed the release behind the lost ACK");
     const request = record.finalRequest;
-    const releasesBefore = h.s.releases.length;
-    const listBefore = h.s.listReads;
+    const posts = h.s.releases.length;
+    const outcome = await h.operate();
+    assert.equal(outcome.held, "settled", "a journaled closed hold is an unconditional pre-entry skip");
+    assert.equal(h.s.releases.length, posts, "no POST in flight");
+    const settled = await h.saved();
+    assert.equal(settled.holdSettlement?.state, "released");
+    assert.equal(settled.finalAcknowledged, undefined);
+    assert.equal(h.s.produced, 1); assert.equal(h.s.uploads, 1); assert.equal(h.s.reserves, 1);
+    // After the flight the run is no longer executing and the ordinary re-drive replays exactly that request.
+    h.s.live = false; h.s.executing = false; h.s.status = "failed";
+    await h.coordinator.resumePending(undefined, [settled]);
+    assert.equal(h.s.releases.length, posts + 1);
+    assert.deepEqual(h.s.releases.at(-1)![3], request!.disposition);
+  } finally { await h.close(); }
+});
+
+it("a lost ACK with the hold not yet journaled as settled replays the identical request inside the flight", async () => {
+  const h = await harness();
+  try {
+    const record = await savedArchiveFinal(h, false);
+    assert.equal(h.s.holdState, "open");
     const outcome = await h.operate();
     assert.equal(outcome.held, "acked");
-    assert.equal(h.s.releases.length, releasesBefore + 1);
-    assert.deepEqual(h.s.releases.at(-1)![3], request!.disposition, "the very same disposition is replayed");
-    assert.equal(h.s.listReads, listBefore, "replay needed no fresh hold listing");
-    assert.deepEqual((await h.saved()).finalRequest, request);
-    assert.equal((await h.saved()).finalAcknowledged, true);
-    assert.equal(h.s.produced, 1); assert.equal(h.s.uploads, 1); assert.equal(h.s.reserves, 1, "nothing was produced or uploaded again");
+    assert.deepEqual(h.s.releases.at(-1)![3], record.finalRequest!.disposition);
+    assert.deepEqual((await h.saved()).finalRequest, record.finalRequest);
   } finally { await h.close(); }
 });
 
@@ -620,6 +637,7 @@ it("an upload larger than the remaining allowance is refused before the reserve 
     assert.equal(h.measurements.reusedBytes, size);
     assert.equal(h.allowance.remaining, 0, "an allowance equal to the bundle is exactly spent");
     assert.equal(h.measurements.chargedBytes, size); assert.equal(h.measurements.uploadedBytes, size); assert.equal(h.measurements.uploadCount, 1);
+    assert.equal(h.measurements.retainedUnuploadedBytes, 0, "a refused bundle that later uploads is not counted as retained twice");
   } finally { await h.close(); }
 });
 
@@ -727,6 +745,11 @@ for (const [name, arm, dispatched] of [
       await assert.rejects(h.operate(), PredecessorAuthorityLost);
       assert.equal(dispatched(h), 0);
       assert.equal(h.s.releases.length, 0);
+      if (name === "the bundle install") {
+        const files = await fs.readdir(path.join(h.root, "journal", RUN));
+        assert.deepEqual(files.filter(f => f.endsWith(".bundle")), [], "the bundle was never renamed into place");
+        assert.equal((await h.saved()).bundlePath, undefined);
+      }
     } finally { await h.close(); }
   });
 }
@@ -801,7 +824,7 @@ it("the classification table has disjoint lists and unknown codes are integrity"
     assert.equal(classifyPredecessorRefusal(code), "ordinary", code);
   }
   for (const code of ["bundle_header", "local_bytes_unverified", "frozen_coverage", "source_proof", "record_unauthenticated", "record_removed",
-    "inventory_snapshot_changed", "inventory_quiescence_breach"]) assert.equal(classifyPredecessorRefusal(code), "integrity", code);
+    "inventory_snapshot_changed", "inventory_quiescence_breach", "source_advanced", "coverage_context"]) assert.equal(classifyPredecessorRefusal(code), "integrity", code);
 });
 
 it("every refusal code the coordinator can record is classified", async () => {
@@ -1048,4 +1071,127 @@ it("an ordinary caller's cycle in the same coordinator is untouched by a predece
     const probe = h.coordinator as unknown as Disqualifier;
     assert.equal(await probe.inactiveInventoryDisqualifier(await h.saved()), "executing");
   } finally { await h.close(); }
+});
+
+// ── M1 rework ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+it("a record removed mid-cycle keeps the orphan bundle and latches record_removed", async () => {
+  const h = await harness();
+  try {
+    h.s.reserveHook = async () => { await fs.rm(path.join(h.root, "journal", RUN, h.record.captureId + ".json")); };
+    const outcome = await h.operate();
+    assert.equal(outcome.predecessor?.integrityFailure, "record_removed");
+    assert.equal(outcome.reason, "record_removed");
+    const bundles = (await fs.readdir(path.join(h.root, "journal", RUN))).filter(f => f.endsWith(".bundle"));
+    assert.equal(bundles.length, 1, "the only local bundle copy survives");
+    assert.equal(h.s.releases.length, 0);
+  } finally { await h.close(); }
+});
+
+it("losing authority during the capture-status read rejects instead of becoming an ordinary refusal", async () => {
+  const h = await harness();
+  try {
+    // Authority is cut after the last proof before the status read, so the status RPC itself refuses to dispatch.
+    const git = (h.coordinator as unknown as { git: { buildRecoveryCoverage(...a: unknown[]): Promise<unknown> } }).git;
+    const build = git.buildRecoveryCoverage.bind(git);
+    git.buildRecoveryCoverage = async (...a: unknown[]) => { const out = await build(...a); h.s.live = false; return out; };
+    await assert.rejects(h.operate(), PredecessorAuthorityLost);
+    assert.equal(h.s.releases.length, 0);
+  } finally { await h.close(); }
+});
+
+it("a record that vanishes during the observation-free FINAL path is never reported acked", async () => {
+  const h = await harness();
+  try {
+    await uploadedSelfContained(h);
+    const target = h.coordinator as unknown as Record<string, unknown>;
+    target.finalizeInventory = async () => { await fs.rm(path.join(h.root, "journal", RUN, h.record.captureId + ".json")); return undefined; };
+    const outcome = await h.operate();
+    assert.notEqual(outcome.held, "acked");
+    assert.equal(outcome.predecessor?.integrityFailure, "record_removed");
+  } finally { await h.close(); }
+});
+
+it("a genuine bundle failure latches integrity; the same failure caused by the operation's own abort does not", async () => {
+  const real = await harness();
+  try {
+    real.s.produceHook = () => { throw new Error("pack-objects crashed"); };
+    const outcome = await real.operate();
+    assert.equal(outcome.predecessor?.integrityFailure, "bundle_failed");
+  } finally { await real.close(); }
+  const aborted = await harness();
+  try {
+    const controller = new AbortController();
+    aborted.s.produceHook = () => { controller.abort(new Error("cap")); throw new Error("aborted by the cap"); };
+    const outcome = await aborted.operate({}, {}, aborted.record, controller.signal);
+    assert.equal(outcome.reason, "bundle_failed");
+    assert.equal(outcome.predecessor, undefined, "an abort-caused failure stays unrecorded for the runner to classify");
+  } finally { await aborted.close(); }
+});
+
+for (const [name, binding] of [
+  ["hold id", { holdId: "00000000-0000-4000-8000-0000000000dd", repoId: REPO }],
+  ["repo id", { holdId: HOLD, repoId: "00000000-0000-4000-8000-0000000000ee" }],
+] as const) {
+  it(`a journaled exact binding that differs in its ${name} refuses the observation`, async () => {
+    const h = await harness();
+    try {
+      await h.patch({ exactHoldBinding: binding });
+      const outcome = await h.operate();
+      assert.equal(outcome.reason, "predecessor_observation_refused");
+      assert.deepEqual(h.sideEffects(), NONE);
+    } finally { await h.close(); }
+  });
+}
+
+it("an ended scope exempts and writes nothing even while live() still answers true", async () => {
+  const h = await harness();
+  try {
+    const probe = h.coordinator as unknown as Disqualifier & {
+      writeExistingRecord(r: RecoveryRecord, m: (c: RecoveryRecord) => RecoveryRecord | undefined): Promise<unknown>;
+    };
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let late: Promise<unknown> | undefined, lateWrite: Promise<unknown> | undefined;
+    // Both continuations start inside the scope and resume after it ended.
+    h.s.reserveHook = () => { late = (async () => { await gate; return probe.inactiveInventoryDisqualifier(await h.saved()); })(); late.catch(() => undefined); };
+    h.s.uploadHook = () => { lateWrite = (async () => { await gate; return probe.writeExistingRecord(h.record, cur => ({ ...cur, reason: "late" })); })(); lateWrite.catch(() => undefined); };
+    await assertAcked(h, await h.operate());
+    assert.equal(h.s.live, true, "live() is still true: only the ended scope refuses");
+    const before = await h.snapshot();
+    release();
+    await assert.rejects(late!, PredecessorAuthorityLost);
+    await assert.rejects(lateWrite!, PredecessorAuthorityLost);
+    assert.ok((await h.snapshot()).bytes.equals(before.bytes), "the late write changed nothing");
+  } finally { await h.close(); }
+});
+
+it("a record of another run with the scope's capture id and generation gets no exemption", async () => {
+  const h = await harness();
+  try {
+    const probe = h.coordinator as unknown as Disqualifier;
+    let seen: string | undefined = "unset";
+    h.s.reserveHook = async () => { seen = await probe.inactiveInventoryDisqualifier({ ...(await h.saved()), runId: "other-run" }); };
+    await h.operate();
+    assert.equal(seen, "executing");
+  } finally { await h.close(); }
+});
+
+it("an explicit closure budget is used by identity and clamped to the cache's decoded ceiling", async () => {
+  const { GitCache } = await import("../src/git.js");
+  const { testGitCacheOptions } = await import("./helpers.js");
+  const data = makeScratchRoot("closure-budget-", os.tmpdir());
+  try {
+    const cache = new GitCache(data, nullLogger(), undefined, testGitCacheOptions());
+    const shared = { delivered: 5, limit: cache.recoveryDecodedLimitBytes + 1000 };
+    let seen: unknown;
+    await cache.withRecoveryOperation(new AbortController().signal, Infinity, async () => {
+      seen = (cache as unknown as { recoveryOperations: { getStore(): { closureBudget: unknown } } }).recoveryOperations.getStore().closureBudget;
+    }, undefined, { closureBudget: shared });
+    assert.equal(seen, shared, "the very same mutable object");
+    assert.equal(shared.limit, cache.recoveryDecodedLimitBytes, "clamped to the cache ceiling");
+    const small = { delivered: 0, limit: 10 };
+    await cache.withRecoveryOperation(new AbortController().signal, Infinity, async () => undefined, undefined, { closureBudget: small });
+    assert.equal(small.limit, 10, "a lower limit is kept");
+  } finally { await fs.rm(data, { recursive: true, force: true }); }
 });
