@@ -2,7 +2,6 @@
 // own fleet, a segmented bar, and every owner worker as a row with its stats behind a
 // disclosure. "Open" means advertised spare slots, not a promise that a run is claimed.
 
-import type { CSSProperties } from "react";
 import { Link } from "react-router-dom";
 import type { Worker } from "../lib/api";
 import { capacitySlots, rollNote, workerTakesNoNewRuns, type CapacitySlots } from "../lib/capacity";
@@ -52,7 +51,7 @@ export function CapacityRail({ workers }: { workers: Worker[] }) {
               <LegendItem kind="open" label={`Open ${slots.open}`} />
             </div>
             <p className="mt-2 text-xs text-faint">
-              Open slots are advertised spare capacity; admission still decides claims.
+              Open slots are advertised spare capacity; credentials, cordons and admission still decide claims.
             </p>
             <Exclusions slots={slots} />
             <ul className="mt-3 divide-y divide-edge">
@@ -87,22 +86,19 @@ function Exclusions({ slots }: { slots: CapacitySlots }) {
 type CellKind = "in-use" | "closed" | "open";
 
 // In use is solid, closed is hatched, open is an outline only, so the three read apart
-// without relying on colour contrast between two greys.
+// without relying on colour contrast between two greys. The hatch is a class over the
+// edge-strong token, so inline style stays limited to the bar widths.
+const CLOSED_HATCH = "bg-[repeating-linear-gradient(135deg,rgb(var(--edge-strong))_0_2px,transparent_2px_5px)]";
 const CELL_CLASS: Record<CellKind, string> = {
   "in-use": "bg-info",
-  closed: "border border-edge-strong",
+  closed: `border border-edge-strong ${CLOSED_HATCH}`,
   open: "border border-edge-strong",
-};
-const CELL_STYLE: Record<CellKind, CSSProperties | undefined> = {
-  "in-use": undefined,
-  closed: { background: "repeating-linear-gradient(135deg, rgb(var(--edge-strong)) 0 2px, transparent 2px 5px)" },
-  open: undefined,
 };
 
 function LegendItem({ kind, label }: { kind: CellKind; label: string }) {
   return (
     <span className="inline-flex items-center gap-1.5">
-      <span aria-hidden="true" className={cx("h-[9px] w-[9px] shrink-0 rounded-[2px]", CELL_CLASS[kind])} style={CELL_STYLE[kind]} />
+      <span aria-hidden="true" className={cx("h-[9px] w-[9px] shrink-0 rounded-[2px]", CELL_CLASS[kind])} />
       {label}
     </span>
   );
@@ -122,7 +118,7 @@ function SlotBar({ slots }: { slots: CapacitySlots }) {
     return (
       <div aria-hidden="true" className="mt-2 flex gap-1">
         {cells.map((k, i) => (
-          <span key={i} data-slot={k} className={cx("h-3 flex-1 rounded-[3px]", CELL_CLASS[k])} style={CELL_STYLE[k]} />
+          <span key={i} data-slot={k} className={cx("h-3 flex-1 rounded-[3px]", CELL_CLASS[k])} />
         ))}
       </div>
     );
@@ -136,7 +132,7 @@ function SlotBar({ slots }: { slots: CapacitySlots }) {
   return (
     <div aria-hidden="true" className="mt-2 flex h-3 w-full gap-px overflow-hidden rounded">
       {segments.filter(([, n]) => n > 0).map(([k, n]) => (
-        <span key={k} data-slot={k} className={CELL_CLASS[k]} style={{ ...CELL_STYLE[k], width: pct(n) }} />
+        <span key={k} data-slot={k} className={CELL_CLASS[k]} style={{ width: pct(n) }} />
       ))}
     </div>
   );

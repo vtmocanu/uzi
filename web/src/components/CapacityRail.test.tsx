@@ -38,7 +38,7 @@ describe("CapacityRail", () => {
 
   it("carries the advertised-capacity note and never promises a run", () => {
     const { container } = mount(fleet());
-    expect(screen.getByText("Open slots are advertised spare capacity; admission still decides claims.")).toBeTruthy();
+    expect(screen.getByText("Open slots are advertised spare capacity; credentials, cordons and admission still decide claims.")).toBeTruthy();
     expect(container.textContent).not.toMatch(/available|guaranteed|will run/i);
   });
 
@@ -85,7 +85,8 @@ describe("CapacityRail", () => {
     expect(cells.map((c) => c.dataset.slot)).toEqual(["in-use", "closed", "closed", "open", "open"]);
     const closed = cells.find((c) => c.dataset.slot === "closed") as HTMLElement;
     const open = cells.find((c) => c.dataset.slot === "open") as HTMLElement;
-    expect(closed.style.background).toContain("repeating-linear-gradient");
+    expect(closed.className).toContain("repeating-linear-gradient");
+    expect(closed.getAttribute("style") ?? "").not.toContain("background");
     expect(closed.className).toContain("border-edge-strong");
     expect(open.className).toContain("border-edge-strong");
   });
