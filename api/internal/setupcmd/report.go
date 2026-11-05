@@ -9,11 +9,14 @@ import (
 // when a field is removed or changes meaning; adding a field does not.
 const ReportSchemaVersion = 1
 
-// Exit codes. Exit 3 (a worker already exists) arrives with the worker step.
+// Exit codes.
 const (
 	ExitOK     = 0 // every requested step done or already present
 	ExitFailed = 1 // a step failed or was refused; the report says which
 	ExitUsage  = 2 // usage, configuration, schema or owner precondition; nothing written
+	// ExitWorkerExists: every other requested step succeeded, but the owner
+	// already has a worker, so no join token was issued and none is recoverable.
+	ExitWorkerExists = 3
 )
 
 // Step statuses. A script branches on these strings, so they are a contract.
@@ -27,12 +30,17 @@ const (
 	StatusFailed            = "failed"
 	StatusSkippedDependency = "skipped_dependency"
 	StatusNotRequested      = "not_requested"
+	StatusCreated           = "created"
+	StatusExists            = "exists"
 )
 
 // Report overall statuses.
 const (
 	ReportOK     = "ok"
 	ReportFailed = "failed"
+	// ReportWorkerExists: everything else succeeded, the worker already
+	// existed, no token was issued (exit 3).
+	ReportWorkerExists = "worker_exists"
 	// ReportRejected: a precondition failed before any write (exit 2).
 	ReportRejected = "rejected"
 )
@@ -44,6 +52,12 @@ type Step struct {
 	ConnectionID string   `json:"connection_id,omitempty"`
 	BotUsername  string   `json:"bot_username,omitempty"`
 	Findings     []string `json:"findings,omitempty"`
+	// WorkerID, Name and JoinToken are set only on a worker entry with status
+	// created. JoinToken is the one secret in the report: it is shown once, here,
+	// and only on stdout.
+	WorkerID  string `json:"worker_id,omitempty"`
+	Name      string `json:"name,omitempty"`
+	JoinToken string `json:"join_token,omitempty"`
 }
 
 // RepoStep is the entry for one requested repo.

@@ -44,7 +44,8 @@ Rules the implementation keeps:
 - Completed writes are kept. Each step is independently valid, as when the web
   UI builds the same state step by step. The report says what exists.
 - Exit codes: 0 done or already present, 1 a step failed or was refused, 2
-  usage, configuration, schema or owner precondition with nothing written.
+  usage, configuration, schema or owner precondition with nothing written, 3
+  everything succeeded but the worker already exists (M3).
 
 ## Consequences
 
@@ -52,7 +53,26 @@ The command runs in another process than the API, so it cannot call the API's
 in-process repo-sync invalidation. The report marks issue sync `pending`; the
 poller imports issues on its next interval.
 
-The worker step and exit code 3 follow in a later milestone of the PRD.
+## Worker step (M3)
+
+- `--worker-name` creates the owner's first self-hosted worker through
+  `workersvc.CreateWorker`, the call the web handler makes. The step is
+  create-only: if the owner owns any worker, setup reports `exists`, prints no
+  token and exits 3.
+- The existence check and the creation run in one transaction behind a
+  per-owner advisory lock (`poolWorkers` in `setupcmd/prod.go`). A second
+  concurrent run waits, then sees the first run's worker. The web path takes no
+  such lock and keeps its behaviour. The lock is a transaction-scoped
+  advisory lock, so a crash releases it and no schema change is needed.
+- The worker step runs only when the forge and every requested repo succeeded.
+  Otherwise it is `skipped_dependency` and no token is minted. Exit 1 wins over
+  exit 3.
+- The join token is a field of the worker entry in the one stdout document. The
+  worker error text is never copied into the report or to stderr, so a failure
+  message cannot carry a token. If the report write itself fails, the token is
+  lost; the operator deletes the worker and runs setup again.
+- Hosted (Kubernetes) workers are out of scope: setup creates join-token
+  workers only, and an operator on the Helm chart omits `--worker-name`.
 
 ## Rejected
 

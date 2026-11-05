@@ -176,7 +176,38 @@ func (s *fakeStore) flipsFor(path string) int {
 	return 0
 }
 
+// testJoinToken is a fixture join token; assembled so no token-shaped literal
+// sits in source.
+var testJoinToken = "uzw" + "_fixtureJoinToken" + "9876543210"
+
+// fakeWorkers stands in for the per-owner serialised create-first step.
+type fakeWorkers struct {
+	exists       bool
+	err          error
+	calls        int
+	gotName      string
+	gotTemplate  string
+	gotOwner     uuid.UUID
+	errWithToken bool
+}
+
+func (w *fakeWorkers) CreateFirst(_ context.Context, owner uuid.UUID, name, template string) (WorkerResult, error) {
+	w.calls++
+	w.gotOwner, w.gotName, w.gotTemplate = owner, name, template
+	if w.err != nil {
+		if w.errWithToken {
+			return WorkerResult{}, errors.New("insert failed for " + testJoinToken + " and " + testToken)
+		}
+		return WorkerResult{}, w.err
+	}
+	if w.exists {
+		return WorkerResult{Created: false}, nil
+	}
+	return WorkerResult{Created: true, WorkerID: uuid.New(), Name: name, JoinToken: testJoinToken}, nil
+}
+
 type harness struct {
+	workers *fakeWorkers
 	st      *fakeStore
 	forge   *fakeForge
 	guard   *fakeGuard
@@ -191,10 +222,11 @@ type harness struct {
 
 func newHarness() *harness {
 	return &harness{
-		st:    newFakeStore(),
-		forge: &fakeForge{projects: []forge.Project{{ForgeProjectID: 1, PathWithNamespace: "acme/app"}, {ForgeProjectID: 2, PathWithNamespace: "acme/lib"}}},
-		guard: &fakeGuard{blocked: map[string]bool{}},
-		stdin: strings.NewReader(testToken + "\n"),
+		workers: &fakeWorkers{},
+		st:      newFakeStore(),
+		forge:   &fakeForge{projects: []forge.Project{{ForgeProjectID: 1, PathWithNamespace: "acme/app"}, {ForgeProjectID: 2, PathWithNamespace: "acme/lib"}}},
+		guard:   &fakeGuard{blocked: map[string]bool{}},
+		stdin:   strings.NewReader(testToken + "\n"),
 	}
 }
 
@@ -213,7 +245,7 @@ func (h *harness) env() Env {
 		Open: func(context.Context, config.SetupConfig) (*Backend, func(), error) {
 			h.opened = true
 			return &Backend{
-				Q: h.st, Forges: fakeForges{h.forge}, Guard: h.guard,
+				Q: h.st, Forges: fakeForges{h.forge}, Guard: h.guard, Workers: h.workers,
 				CheckSchema: func(context.Context) error { return h.schema },
 			}, func() {}, nil
 		},
@@ -494,14 +526,126 @@ func TestRunInvalidInputExitsTwoBeforeAnyIO(t *testing.T) {
 	}
 }
 
-func TestRunWorkerRequestIsRefusedUntilImplemented(t *testing.T) {
+// Acceptance 1 (worker half): the worker is created for the owner, and the
+// join token appears exactly once, in the stdout document, never on stderr.
+func TestRunCreatesTheWorkerAndPrintsTheJoinTokenOnceOnStdout(t *testing.T) {
 	h := newHarness()
-	code := h.run(context.Background(), baseArgs("--repos", "acme/app", "--worker-name", "vps-1")...)
-	if code != ExitUsage || !strings.Contains(h.report(t).Error, "not implemented") {
-		t.Fatalf("exit = %d, report = %s", code, h.stdout.String())
+	code := h.run(context.Background(), baseArgs("--repos", "acme/app", "--worker-name", "vps-1", "--worker-template", "base")...)
+	if code != ExitOK {
+		t.Fatalf("exit = %d, stderr:\n%s", code, h.stderr.String())
 	}
-	if h.opened || h.st.writes != 0 {
-		t.Error("the refusal must come before any write")
+	rep := h.report(t)
+	if rep.Worker == nil || rep.Worker.Status != StatusCreated || rep.Worker.JoinToken != testJoinToken {
+		t.Fatalf("worker = %+v, want created with the join token", rep.Worker)
+	}
+	if rep.Worker.WorkerID == "" || rep.Worker.Name != "vps-1" {
+		t.Errorf("worker entry lacks id or name: %+v", rep.Worker)
+	}
+	if n := strings.Count(h.stdout.String(), testJoinToken); n != 1 {
+		t.Errorf("join token appears %d times on stdout, want exactly 1", n)
+	}
+	if strings.Contains(h.stderr.String(), testJoinToken) {
+		t.Error("the join token reached stderr")
+	}
+	if strings.Contains(h.stdout.String()+h.stderr.String(), testToken) {
+		t.Error("the forge token leaked")
+	}
+	if h.workers.gotOwner != h.st.user.ID || h.workers.gotName != "vps-1" || h.workers.gotTemplate != "base" {
+		t.Errorf("worker call = owner %v name %q template %q", h.workers.gotOwner, h.workers.gotName, h.workers.gotTemplate)
+	}
+}
+
+// Acceptance 3: an existing worker gives exit 3 and no token.
+func TestRunExistingWorkerExitsThreeWithoutAToken(t *testing.T) {
+	h := newHarness()
+	h.workers.exists = true
+	code := h.run(context.Background(), baseArgs("--repos", "acme/app", "--worker-name", "vps-1")...)
+	if code != ExitWorkerExists {
+		t.Fatalf("exit = %d, want 3\nstderr:\n%s", code, h.stderr.String())
+	}
+	rep := h.report(t)
+	if rep.Worker.Status != StatusExists || rep.Worker.JoinToken != "" || rep.ExitCode != ExitWorkerExists {
+		t.Fatalf("report = %+v worker = %+v", rep, rep.Worker)
+	}
+	if strings.Contains(h.stdout.String()+h.stderr.String(), testJoinToken) {
+		t.Error("a token was issued for an existing worker")
+	}
+}
+
+// Exit 1 wins over exit 3, and a repo that is not enabled prevents the worker
+// step entirely: no worker is created and no token is minted.
+func TestRunRefusedRepoSkipsTheWorkerAndExitOneBeatsThree(t *testing.T) {
+	for _, exists := range []bool{false, true} {
+		h := newHarness()
+		h.workers.exists = exists
+		h.guard.blocked["acme/lib"] = true
+		code := h.run(context.Background(), baseArgs("--repos", "acme/app,acme/lib", "--worker-name", "vps-1")...)
+		if code != ExitFailed {
+			t.Fatalf("exists=%v: exit = %d, want 1", exists, code)
+		}
+		rep := h.report(t)
+		if rep.Worker.Status != StatusSkippedDependency {
+			t.Errorf("exists=%v: worker = %+v, want skipped_dependency", exists, rep.Worker)
+		}
+		if h.workers.calls != 0 {
+			t.Errorf("exists=%v: the worker step ran after a refused repo", exists)
+		}
+		if strings.Contains(h.stdout.String(), testJoinToken) {
+			t.Error("a join token was minted")
+		}
+	}
+}
+
+func TestRunForgeFailureSkipsTheWorker(t *testing.T) {
+	h := newHarness()
+	h.forge.verifyErr = errors.New("connection refused")
+	code := h.run(context.Background(), baseArgs("--repos", "acme/app", "--worker-name", "vps-1")...)
+	if code != ExitFailed {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if rep := h.report(t); rep.Worker.Status != StatusSkippedDependency || h.workers.calls != 0 {
+		t.Errorf("worker = %+v calls = %d", rep.Worker, h.workers.calls)
+	}
+}
+
+// A worker failure is exit 1 with a failed worker entry that carries neither
+// token, even when the underlying error text does.
+func TestRunWorkerFailureExitsOneAndLeaksNoToken(t *testing.T) {
+	h := newHarness()
+	h.workers.err = errors.New("database unavailable")
+	h.workers.errWithToken = true
+	code := h.run(context.Background(), baseArgs("--repos", "acme/app", "--worker-name", "vps-1")...)
+	if code != ExitFailed {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	rep := h.report(t)
+	if rep.Worker.Status != StatusFailed || rep.Status != ReportFailed {
+		t.Fatalf("report = %+v worker = %+v", rep, rep.Worker)
+	}
+	out := h.stdout.String() + h.stderr.String()
+	if strings.Contains(out, testJoinToken) || strings.Contains(out, testToken) {
+		t.Errorf("a token leaked:\n%s", out)
+	}
+}
+
+func TestRunWithoutAWorkerNameNeverTouchesWorkers(t *testing.T) {
+	h := newHarness()
+	if code := h.run(context.Background(), baseArgs("--repos", "acme/app")...); code != ExitOK {
+		t.Fatalf("exit = %d", code)
+	}
+	if h.workers.calls != 0 || h.report(t).Worker.Status != StatusNotRequested {
+		t.Error("worker step must report not_requested and not run")
+	}
+}
+
+// A worker name with no repos is valid: forge connect, then the worker.
+func TestRunWorkerWithoutReposStillCreates(t *testing.T) {
+	h := newHarness()
+	if code := h.run(context.Background(), baseArgs("--worker-name", "vps-1")...); code != ExitOK {
+		t.Fatalf("exit = %d, stderr:\n%s", code, h.stderr.String())
+	}
+	if h.report(t).Worker.Status != StatusCreated {
+		t.Error("worker not created")
 	}
 }
 

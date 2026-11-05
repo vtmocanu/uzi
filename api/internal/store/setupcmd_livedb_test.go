@@ -19,6 +19,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/forge/forgetest"
 	"github.com/vtmocanu/uzi/api/internal/forgesvc"
+	"github.com/vtmocanu/uzi/api/internal/jointoken"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/setupcmd"
@@ -135,6 +136,7 @@ func (f *setupFixture) env(pool *pgxpool.Pool) setupcmd.Env {
 			return &setupcmd.Backend{
 				Q: q, Forges: svc, Guard: privcheck.NewService(q, svc),
 				CheckSchema: func(ctx context.Context) error { return setupcmd.CheckSchemaAtHead(ctx, pool) },
+				Workers:     setupcmd.NewPoolWorkers(pool, f.box),
 			}, func() {}, nil
 		},
 	}
@@ -347,5 +349,121 @@ func TestSetupCmdConcurrentConnectsNeverRotateLiveDB(t *testing.T) {
 	if after.ID != winner.ID || !bytes.Equal(after.TokenCiphertext, winner.TokenCiphertext) ||
 		after.BotUsername != winner.BotUsername || !after.LastVerifiedAt.Time.Equal(winner.LastVerifiedAt.Time) {
 		t.Fatal("a later setup run rotated the stored connection")
+	}
+}
+
+// PRD #3760 M3, acceptance 1 and 3: the worker is created once, the join token
+// appears once and only on stdout, its hash is what is stored, and the re-run
+// exits 3 with no token and no second worker.
+func TestSetupCmdWorkerCreateThenExistsLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newSetupFixture(ctx, t, true)
+	repos := f.appPath() + "," + f.libPath()
+	token := "tok-" + uuid.NewString()
+
+	code, rep, stdout, stderr := f.run(ctx, f.env(f.pool), token, "--repos", repos, "--worker-name", "vps-1")
+	if code != 0 || rep.Worker == nil || rep.Worker.Status != setupcmd.StatusCreated {
+		t.Fatalf("exit = %d, want 0 with a created worker\n%s", code, stdout)
+	}
+	join := rep.Worker.JoinToken
+	if join == "" {
+		t.Fatal("no join token in the report")
+	}
+	if n := strings.Count(stdout, join); n != 1 {
+		t.Fatalf("join token appears %d times on stdout, want 1", n)
+	}
+	if strings.Contains(stderr, join) || strings.Contains(stdout+stderr, token) {
+		t.Fatal("a token reached the wrong stream")
+	}
+	var stored []byte
+	if err := f.pool.QueryRow(ctx, `SELECT token_hash FROM workers WHERE user_id = $1`, f.userID).Scan(&stored); err != nil {
+		t.Fatalf("worker row: %v", err)
+	}
+	if !jointoken.Equal(stored, jointoken.Hash(join)) {
+		t.Fatal("the stored hash is not the hash of the printed token")
+	}
+
+	code, rep, stdout, stderr = f.run(ctx, f.env(f.pool), token, "--repos", repos, "--worker-name", "vps-1")
+	if code != 3 || rep.Worker.Status != setupcmd.StatusExists || rep.Worker.JoinToken != "" {
+		t.Fatalf("re-run exit = %d, want 3 with an existing worker and no token\n%s", code, stdout)
+	}
+	if strings.Contains(stdout+stderr, join) {
+		t.Fatal("the re-run printed the first run's token")
+	}
+	var after []byte
+	if err := f.pool.QueryRow(ctx, `SELECT token_hash FROM workers WHERE user_id = $1`, f.userID).Scan(&after); err != nil || !bytes.Equal(after, stored) {
+		t.Fatalf("the re-run changed the worker token (err=%v)", err)
+	}
+	if n := f.count(ctx, t, `SELECT count(*) FROM workers WHERE user_id = $1`, f.userID); n != 1 {
+		t.Fatalf("workers = %d, want 1", n)
+	}
+}
+
+// Concurrent invocations must not mint two first workers: exactly one run
+// creates, every other exits 3, and exactly one join token exists across all
+// the outputs.
+func TestSetupCmdConcurrentWorkerCreateMakesOneLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newSetupFixture(ctx, t, true)
+	env := f.env(f.pool)
+
+	const n = 8
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		start   = make(chan struct{})
+		created int
+		exists  int
+		joins   []string
+	)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			code, rep, stdout, _ := f.run(ctx, env, fmt.Sprintf("tok-%d-%s", i, uuid.NewString()), "--worker-name", "vps-1")
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case code == 0 && rep.Worker != nil && rep.Worker.Status == setupcmd.StatusCreated:
+				created++
+				joins = append(joins, rep.Worker.JoinToken)
+			case code == 3 && rep.Worker != nil && rep.Worker.Status == setupcmd.StatusExists && rep.Worker.JoinToken == "":
+				exists++
+			default:
+				t.Errorf("unexpected outcome: exit %d\n%s", code, stdout)
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	if created != 1 || exists != n-1 {
+		t.Fatalf("created=%d exists=%d, want 1 and %d", created, exists, n-1)
+	}
+	if got := f.count(ctx, t, `SELECT count(*) FROM workers WHERE user_id = $1`, f.userID); got != 1 {
+		t.Fatalf("workers = %d, want exactly 1", got)
+	}
+	var stored []byte
+	if err := f.pool.QueryRow(ctx, `SELECT token_hash FROM workers WHERE user_id = $1`, f.userID).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if len(joins) != 1 || !jointoken.Equal(stored, jointoken.Hash(joins[0])) {
+		t.Fatal("the one printed token does not match the stored worker")
+	}
+}
+
+// A worker request behind a refused repo mints nothing: no worker row exists.
+func TestSetupCmdRefusedRepoMintsNoWorkerLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newSetupFixture(ctx, t, true)
+	f.forge.protection[f.libID] = pushableProtection
+	code, rep, stdout, _ := f.run(ctx, f.env(f.pool), "tok-"+uuid.NewString(),
+		"--repos", f.appPath()+","+f.libPath(), "--worker-name", "vps-1")
+	if code != 1 || rep.Worker.Status != setupcmd.StatusSkippedDependency {
+		t.Fatalf("exit = %d, want 1 with a skipped worker\n%s", code, stdout)
+	}
+	if got := f.count(ctx, t, `SELECT count(*) FROM workers WHERE user_id = $1`, f.userID); got != 0 {
+		t.Fatalf("workers = %d, want 0", got)
 	}
 }

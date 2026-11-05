@@ -87,8 +87,29 @@ Flags:
 | `--forge-base-url` | Required: the forge URL; it must be in `FORGE_ALLOWED_BASE_URLS`. |
 | `--forge-token-file PATH` | Required: a file holding the bot token, or `-` for stdin. The token is never read from a flag value or an environment variable. At most 16 KiB. |
 | `--repos a/b,c/d` | Comma-separated `path_with_namespace` values to enable. At most 200. |
+| `--worker-name NAME` | Optional: create the first self-hosted worker with this name (at most 200 bytes). Without it setup skips the worker step and reports `not_requested`. |
+| `--worker-template NAME` | Optional, needs `--worker-name`: the worker template. |
 
-`--worker-name` and `--worker-template` are reserved for worker creation, which setup does not do yet; setup refuses them (exit 2) before it writes anything.
+Setup validates every flag before it writes anything; invalid input exits 2.
+
+### The first worker
+
+With `--worker-name`, setup creates a self-hosted worker for the seed admin and prints its join token. The step is create-only. It runs only after the forge and every requested repo succeeded, so one refused repo means no worker and no token (`skipped_dependency`). If the seed admin already owns any worker, setup creates nothing and prints no token: a join token is stored as a hash and cannot be shown again, and setup never rotates one. The existence check and the creation run in one database transaction under a per-owner lock, so two setup runs at the same time cannot create two workers.
+
+The join token appears once, in the `join_token` field of the `worker` entry of the stdout document, and nowhere else: not on stderr, not in a log. Capture stdout, extract the field and write it into `UZI_WORKER_TOKEN` in `.env`. If the document is lost, the token is lost; delete the worker in Settings → Workers and create a new one.
+
+```sh
+printf '%s' "$PAT" | docker compose exec -T api /server setup \
+  --forge-type github --forge-base-url https://github.com \
+  --forge-token-file - --repos acme/app,acme/lib --worker-name vps-1 > setup.json
+token=$(jq -r '.worker.join_token // empty' setup.json)
+printf 'UZI_WORKER_TOKEN=%s\n' "$token" >> .env
+docker compose --profile agent up -d
+```
+
+`setup.json` holds the token; protect it and delete it after you copy the token. See [configuration.md](configuration.md) for `UZI_WORKER_TOKEN` and `UZI_WORKER_TOKEN_FILE`.
+
+On Kubernetes the primary worker path is hosted workers, which the controller creates; see [openshift.md](openshift.md) and the `workers.*` chart values. Setup creates join-token workers only, so on a hosted-worker install omit `--worker-name`: the step reports `not_requested` and exit codes work as before. Use `--worker-name` on Kubernetes only to start a self-hosted worker outside the cluster.
 
 Setup writes one JSON document to stdout and progress notes to stderr. Neither carries the token. The document has `schema_version`, an overall `status`, and one entry per step (`forge`, `discovery`, each repo in `repos`, `worker`). Step statuses:
 
@@ -102,9 +123,11 @@ Setup writes one JSON document to stdout and progress notes to stderr. Neither c
 | `not_found` | The bot cannot see the repo on the forge. |
 | `failed` | The forge or the database failed; `message` says which step. |
 | `skipped_dependency` | An earlier step failed, so this one did not run. |
-| `not_requested` | Not asked for (the `worker` entry until worker creation ships). |
+| `not_requested` | Not asked for (the `worker` entry without `--worker-name`). |
+| `created` | The worker was created. The `worker` entry carries `worker_id`, `name` and the one-time `join_token`. |
+| `exists` | The seed admin already owns a worker. No token is issued and none can be recovered. |
 
-Exit codes: `0` every requested step is done or already present; `1` a step failed or was refused, and the report says which; `2` a usage, configuration, schema or owner precondition failed and nothing was written. Writes that completed stay in place. Fix the cause and run the same command again.
+Exit codes: `0` every requested step is done or already present; `1` a step failed or was refused, and the report says which; `2` a usage, configuration, schema or owner precondition failed and nothing was written; `3` everything else succeeded but the worker already exists, so no token was issued (the report `status` is `worker_exists`). Exit `1` wins over exit `3`. Writes that completed stay in place. Fix the cause and run the same command again.
 
 Setup runs in its own process, so it cannot wake the API's repo sync. The report sets `issue_sync` to `pending`: the poller imports the new repos' issues on its next interval (`FORGE_POLL_INTERVAL`).
 

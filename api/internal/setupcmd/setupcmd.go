@@ -9,9 +9,10 @@
 // binary's schema head. Exactly one JSON Report goes to stdout; diagnostics go
 // to stderr; neither stream carries the forge token.
 //
-// Steps are methods on runner, run in order by Run. The worker step (a later
-// milestone) is one more method beside connectForge, discoverRepos and
-// enableRepos.
+// Steps are methods on runner, run in order by Run: connectForge,
+// discoverRepos, enableRepos, then createWorker when --worker-name is given.
+// The worker step is create-only; the join token it mints goes into the one
+// stdout document and nowhere else.
 package setupcmd
 
 import (
@@ -25,6 +26,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/config"
@@ -52,6 +54,26 @@ type Backend struct {
 	// CheckSchema returns nil only when the database schema is at this
 	// binary's head.
 	CheckSchema func(ctx context.Context) error
+	// Workers creates the owner's first worker. Required only when
+	// --worker-name is given.
+	Workers Workers
+}
+
+// WorkerResult is the outcome of Workers.CreateFirst.
+type WorkerResult struct {
+	// Created is false when the owner already had a worker; nothing was minted.
+	Created   bool
+	WorkerID  uuid.UUID
+	Name      string
+	JoinToken string
+}
+
+// Workers creates the first worker for an owner. The existence check and the
+// creation are one step serialised per owner, so two concurrent setup runs
+// cannot both mint a first worker. An owner who already has any worker gets
+// Created=false and no token.
+type Workers interface {
+	CreateFirst(ctx context.Context, ownerID uuid.UUID, name, template string) (WorkerResult, error)
 }
 
 // Env supplies configuration and the backend.
@@ -122,12 +144,6 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	if err != nil {
 		return r.reject(stdout, errors.New("--forge-base-url is not a valid https URL"))
 	}
-	if in.workerName != "" {
-		// Replaced by the worker step in the next milestone. Refused before any
-		// write so a script never half-runs a request this build cannot finish.
-		return r.reject(stdout, errors.New("worker creation is not implemented yet; omit --worker-name"))
-	}
-
 	token, err := readToken(ctx, in.tokenFile, stdin)
 	if err != nil {
 		return r.reject(stdout, err)
@@ -158,13 +174,19 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	conn, forgeOK := r.connectForge(ctx, prov, be.Q, owner.ID, in, normBase)
 	discovered := forgeOK && r.discoverRepos(ctx, prov, owner.ID, conn.ID)
 	r.enableRepos(ctx, prov, be.Q, owner.ID, conn.ID, in.repos, discovered)
-	r.report.Worker = &Step{Status: StatusNotRequested}
+	r.createWorker(ctx, be.Workers, owner.ID, in)
 
-	if r.report.failed() {
+	switch {
+	case r.report.failed():
 		r.report.Status = ReportFailed
 		r.report.ExitCode = ExitFailed
+	case r.report.Worker.Status == StatusExists:
+		r.report.Status = ReportWorkerExists
+		r.report.ExitCode = ExitWorkerExists
 	}
 	if err := writeReport(stdout, r.report); err != nil {
+		// The join token, if one was minted, was in the document that did not
+		// arrive. It is not repeated here: it stays on stdout only.
 		r.diag("could not write the report: %v", err)
 		return ExitFailed
 	}

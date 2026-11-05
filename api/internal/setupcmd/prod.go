@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/config"
@@ -13,6 +14,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // poolMaxConns bounds the setup process's database pool.
@@ -44,7 +46,49 @@ func openProd(ctx context.Context, cfg config.SetupConfig) (*Backend, func(), er
 		Forges:      svc,
 		Guard:       privcheck.NewService(q, svc),
 		CheckSchema: func(ctx context.Context) error { return CheckSchemaAtHead(ctx, pool) },
+		Workers:     NewPoolWorkers(pool, box),
 	}, pool.Close, nil
+}
+
+// poolWorkers is the production Workers: the check and the create run in one
+// transaction that holds a per-owner advisory lock, so a second setup run for
+// the same owner waits, then sees the first run's worker and creates nothing.
+type poolWorkers struct {
+	pool *pgxpool.Pool
+	box  *secretbox.Box
+}
+
+// NewPoolWorkers returns the Workers that serialises per owner over pool.
+func NewPoolWorkers(pool *pgxpool.Pool, box *secretbox.Box) Workers {
+	return &poolWorkers{pool: pool, box: box}
+}
+
+func (p *poolWorkers) CreateFirst(ctx context.Context, ownerID uuid.UUID, name, template string) (WorkerResult, error) {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return WorkerResult{}, err
+	}
+	// Rollback after Commit is a no-op; it releases the lock on every error path.
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('uzi-setup-first-worker:' || $1::text, 0))`, ownerID.String()); err != nil {
+		return WorkerResult{}, err
+	}
+	q := store.New(tx)
+	existing, err := q.ListWorkersByUser(ctx, ownerID)
+	if err != nil {
+		return WorkerResult{}, err
+	}
+	if len(existing) > 0 {
+		return WorkerResult{Created: false}, nil
+	}
+	wkr, token, err := workersvc.New(q, p.box, workersvc.Params{}).CreateWorker(ctx, ownerID, name, template, "")
+	if err != nil {
+		return WorkerResult{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return WorkerResult{}, err
+	}
+	return WorkerResult{Created: true, WorkerID: wkr.ID, Name: wkr.Name, JoinToken: token}, nil
 }
 
 // CheckSchemaAtHead returns nil only when every migration this binary embeds

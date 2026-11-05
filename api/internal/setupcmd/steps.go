@@ -105,6 +105,44 @@ func (r *runner) discoverRepos(ctx context.Context, prov *provisionsvc.Service, 
 	return true
 }
 
+// createWorker creates the owner's first worker when --worker-name was given.
+// It runs only when every earlier step succeeded: any failed, refused or
+// missing repo (or a forge failure) makes it skipped_dependency and mints no
+// token. The error text from the creation is never copied into the report: the
+// entry says only that creation failed, so no secret can ride along.
+func (r *runner) createWorker(ctx context.Context, workers Workers, ownerID uuid.UUID, in input) {
+	if in.workerName == "" {
+		r.report.Worker = &Step{Status: StatusNotRequested}
+		return
+	}
+	if r.report.failed() {
+		r.report.Worker = &Step{Status: StatusSkippedDependency}
+		return
+	}
+	r.diag("creating the worker")
+	if workers == nil {
+		r.report.Worker = &Step{Status: StatusFailed, Message: "worker creation is not available"}
+		return
+	}
+	res, err := workers.CreateFirst(ctx, ownerID, in.workerName, in.workerTemplate)
+	if err != nil {
+		r.diag("worker creation failed")
+		r.report.Worker = &Step{Status: StatusFailed, Message: "could not create the worker"}
+		return
+	}
+	if !res.Created {
+		r.diag("a worker already exists; its join token cannot be recovered")
+		r.report.Worker = &Step{Status: StatusExists, Message: "the owner already has a worker; no join token was issued and none can be recovered"}
+		return
+	}
+	r.report.Worker = &Step{
+		Status:    StatusCreated,
+		WorkerID:  res.WorkerID.String(),
+		Name:      res.Name,
+		JoinToken: res.JoinToken,
+	}
+}
+
 // enableRepos evaluates every requested repo independently through
 // provisionsvc.EnableRepo (the guard, then the board columns, then the flip).
 // With no usable discovery every repo is skipped_dependency. A missing or
