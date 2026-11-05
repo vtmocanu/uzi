@@ -29,7 +29,7 @@ Acceptance examples:
 
 ## Out of scope
 
-The issue-work line (#3879), the capacity rail and Held work (#3880), the usage recomposition (#3881), the command menu and the header Search button (#3875), promotion to `/dashboard` (#3877), the provider split (#3876). Banners stay in the shell slot on every page except this one.
+The issue-work line (#3879), the capacity rail and Held work (#3880), the usage recomposition (#3881), the command menu and the header Search button (#3875), promotion to `/dashboard` (#3877), the provider split (#3876). Banners stay in the shell on every page, this one included; here the page header renders above them (see the Decision Log).
 
 ## Modules and seams
 
@@ -38,7 +38,7 @@ The issue-work line (#3879), the capacity rail and Held work (#3880), the usage 
 - **`openPrs(runs)`** (pure, shared with #3879): the viewer's completed issue runs with `mr_iid != null` and `mr_state === "opened"`, deduplicated by `(repo_id, mr_iid)`.
 - **`overviewDecisions(ownRuns)`** (pure, `web/src/lib`): ordered decision items from the viewer's own runs only (the `listRuns` rows, never the admin rows): plan reviews (`awaiting_approval` without `is_revising`), questions and follow-ups, parks whose `parkDisposition` is `owner`, and `openPrs`. #3880 adds a second input, the holds aggregate.
 - **`overviewCounts(runs)`** (pure): executing, queued and parked counts that bucket on the **raw** status, as today's `activeRunBuckets` does (`Dashboard.tsx:42`), with an account cooldown counted as waiting; feeding it effective statuses would drop runs. For an admin the row set is the viewer's own runs plus the admin rows whose `owner_email` differs from the viewer's, merged by run id.
-- **`AppBanners`**: the stack now inline in `AppShell` (`web/src/components/AppShell.tsx:1403` to `:1418`) extracted unchanged into one component. The shell renders it on every route except `/overview/next`; the new page renders it under its header. Invariant: exactly one stack per page, same order, same self-gating.
+- **`AppBanners`**: the stack now inline in `AppShell` (`web/src/components/AppShell.tsx:1403` to `:1418`) extracted unchanged into one component. The shell keeps one instance at a fixed position on every route, `/overview/next` included, and the preview portals its header into a slot above it (`PageHeaderSlot`), so the stack appears under the header there without remounting. Invariant: exactly one stack per page, same order, same self-gating.
 - **Runs widget**: extract today's Overview Recent-runs row (`Dashboard.tsx`) into one shared row component with an optional owner field (masked with `maskEmail` in demo mode) and use it on both pages. Not `RunRow` from the Runs page (`web/src/pages/RunsList.tsx:285`): it adds duration, tokens, cost and Expedite, and its "now" line lacks the Overview's held-status check, so a parked run would show a stale, pulsing activity line. The owner split copies `RunsList.tsx:664`. Yours lists the viewer's active runs only (today's Recent runs also shows finished ones); its empty state reads "No active runs. Start one from a board card."
 - Untrusted text (issue titles, question text, agent activity) goes through `stripUnsafeChars`; demo mode masks names, emails and repo paths as today.
 
@@ -46,7 +46,7 @@ The issue-work line (#3879), the capacity rail and Held work (#3880), the usage 
 
 - Unit tests for `overviewDecisions` and `overviewCounts`, one per brief rule (revising, stalled, weekly-reserve pause, owner-action park, PR sourcing, own-only for admins). Follow the style of `web/src/lib/runBadge.test.ts`.
 - Page tests (Vitest + Testing Library) in the style of `web/src/pages/Dashboard.test.tsx`: admin vs non-admin (assert `adminListRuns` is never called for a non-admin, and never by `Dashboard`), an admin-fetch failure that keeps the personal sections and shows the unavailable note, the self-hiding card, the calm sentence.
-- An `AppShell` test that the banner stack is absent from the shell on `/overview/next` and present on another route, and a page test that it renders under the header.
+- An `AppShell` test that the shell renders the banner stack once on every route, under the portalled header on `/overview/next` and above the content elsewhere, including the locked-vault banner, and that banner state survives navigation.
 - A mock-mode scenario seeded like the design mock (decisions, own and other users' runs, banners) so screenshots compare like for like: `web/src/mocks/mockScenario.ts` only reads the `?mock=` name, so the seeding goes in `web/src/mocks/mockApi/` and `web/src/mocks/data/`; add it to the known-scenario list in `docs/dev-conventions.md` and run `task docs:sync`.
 - A test that the owner email is masked in demo mode, asserting on the rendered attribute where it reaches `title=` (`.claude/rules/web.md`, untrusted values in attributes).
 - A browser test at 400 px width (`*.browser.test.tsx`) for layout and no horizontal scroll.
