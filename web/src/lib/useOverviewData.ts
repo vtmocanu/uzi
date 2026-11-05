@@ -52,7 +52,7 @@ function readUsageWindow(): UsageWindow {
 // How long an admin run-list request may stay pending before it counts as failed.
 const ADMIN_RUNS_DEADLINE_MS = 30_000;
 
-const NO_ADMIN_RUNS: AdminRunsState ={ runs: null, failed: false, lastOkAt: null };
+const NO_ADMIN_RUNS: AdminRunsState = { runs: null, failed: false, lastOkAt: null };
 
 export function useOverviewData(opts?: { includeAdminRuns?: boolean }) {
   const { user } = useAuth();
@@ -142,13 +142,15 @@ export function useOverviewData(opts?: { includeAdminRuns?: boolean }) {
   // The admin list rides its own request on both the first load and the 10 s poll, caught
   // separately so its failure can never fail the personal load. A failure keeps the last
   // good rows and flags `failed`; the next success clears the flag and stamps the read time.
-  // At most one request is in flight: a tick that finds one pending skips, so a response
-  // slower than the poll interval is still applied (never starved by newer requests) and
-  // responses cannot arrive out of order.
+  // Normally one request at a time: a tick that finds one pending skips, so a response
+  // slower than the poll interval is still applied (never starved by newer requests).
   // The api client has no request timeout, so a request that never settles must not pin
   // the marker forever: a tick that finds one older than ADMIN_RUNS_DEADLINE_MS counts it
-  // as failed and issues a new request. Only the latest issued id may write state or clear
-  // the marker, so the abandoned request settling later changes nothing.
+  // as failed and issues a new request. The stuck one is abandoned, not aborted (the api
+  // client has no abort signal), so two requests can then be in flight; only the latest
+  // issued id may write state or clear the marker, so the abandoned one settling later
+  // changes nothing. A server consistently slower than the deadline therefore keeps
+  // `failed` true.
   const adminInFlightRef = useRef<{ id: number; startedAt: number } | null>(null);
   const adminRequestIdRef = useRef(0);
   const fetchAdminRuns = useCallback(async () => {

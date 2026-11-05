@@ -163,6 +163,62 @@ describe("useOverviewData admin runs", () => {
     expect(mockApi.adminListRuns.mock.calls.length).toBeGreaterThan(callsBefore);
   });
 
+  // Hung request A at mount; the tick at the 30 s deadline issues B (callbacks of both returned).
+  function hungThenPending() {
+    const a: { resolve: (v: { runs: ReturnType<typeof rows> }) => void; reject: (e: Error) => void } = {
+      resolve: () => {}, reject: () => {},
+    };
+    const b = { ...a };
+    mockApi.adminListRuns
+      .mockImplementationOnce(() => new Promise((res, rej) => { a.resolve = res; a.reject = rej; }))
+      .mockImplementationOnce(() => new Promise((res, rej) => { b.resolve = res; b.reject = rej; }));
+    return { a, b };
+  }
+
+  it("keeps the replacement's in-flight marker when the abandoned request settles", async () => {
+    const { a } = hungThenPending();
+    const { result } = renderHook(() => useOverviewData({ includeAdminRuns: true }));
+    await settle(30_000); // A abandoned at the deadline, B issued and still pending
+    expect(mockApi.adminListRuns).toHaveBeenCalledTimes(2);
+    a.resolve({ runs: rows("stale") });
+    await settle(10_000); // next poll tick: B is still pending, so no third request
+    expect(mockApi.adminListRuns).toHaveBeenCalledTimes(2);
+    expect(result.current.adminRuns.runs).toBeNull();
+  });
+
+  it("does not let an abandoned request's failure flag the replacement's success", async () => {
+    const { a, b } = hungThenPending();
+    const { result } = renderHook(() => useOverviewData({ includeAdminRuns: true }));
+    await settle(30_000);
+    b.resolve({ runs: rows("new") });
+    await settle();
+    expect(ids(result.current.adminRuns.runs)).toEqual(["new"]);
+    expect(result.current.adminRuns.failed).toBe(false);
+    a.reject(new Error("late"));
+    await settle();
+    expect(result.current.adminRuns.failed).toBe(false);
+    expect(ids(result.current.adminRuns.runs)).toEqual(["new"]);
+  });
+
+  it("orphans a pending request on revoke so a re-grant fetches immediately", async () => {
+    const pending: { resolve: (v: { runs: ReturnType<typeof rows> }) => void } = { resolve: () => {} };
+    mockApi.adminListRuns.mockImplementationOnce(() => new Promise((res) => { pending.resolve = res; }));
+    const { result, rerender } = renderHook(() => useOverviewData({ includeAdminRuns: true }));
+    await settle();
+    expect(mockApi.adminListRuns).toHaveBeenCalledTimes(1);
+    vi.mocked(useAuth).mockReturnValue(authValue(aUser));
+    rerender();
+    await settle();
+    pending.resolve({ runs: rows("stale") });
+    await settle();
+    expect(result.current.adminRuns).toEqual({ runs: null, failed: false, lastOkAt: null });
+
+    vi.mocked(useAuth).mockReturnValue(authValue(admin));
+    rerender();
+    await settle();
+    expect(mockApi.adminListRuns).toHaveBeenCalledTimes(2);
+  });
+
   it("resets admin runs when admin access is revoked", async () => {
     mockApi.adminListRuns.mockResolvedValueOnce({ runs: rows("a") });
     const { result, rerender } = renderHook(() => useOverviewData({ includeAdminRuns: true }));
