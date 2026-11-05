@@ -3617,7 +3617,8 @@ export class GitCache {
   }
 
   /** Clone the repo bare if absent, else fetch to refresh. Returns the bare path. */
-  async ensureClone(repoUrl: string, pat?: string, username?: string, checkpointKey?: string, onDirectSuccess?: () => void): Promise<string> {
+  async ensureClone(repoUrl: string, pat?: string, username?: string, checkpointKey?: string, onDirectSuccess?: () => void,
+    defaultBranch?: { name: string; tip?: string }): Promise<string> {
     const barePath = this.barePathFor(repoUrl);
     const scope = httpScopeForUrl(repoUrl);
     return this.withLock(barePath, async () => {
@@ -3653,6 +3654,7 @@ export class GitCache {
           label: "clone/fetch",
         });
       }
+      if (defaultBranch) defaultBranch.tip = await this.defaultBranchTip(barePath, defaultBranch.name);
       if (checkpointKey !== undefined) {
         if (!/^uzi\/task\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(checkpointKey)) throw new Error("invalid task checkpoint key");
         const proofKey = barePath + "\n" + checkpointKey;
@@ -6084,7 +6086,7 @@ export class GitCache {
     return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
   }
 
-  async defaultBranchTip(barePath: string, name: string): Promise<string | undefined> {
+  private async defaultBranchTip(barePath: string, name: string): Promise<string | undefined> {
     if (!(await this.isRemoteBranchName(barePath, name))) return undefined;
     return (await this.originBranchTip(barePath, name)) ?? undefined;
   }

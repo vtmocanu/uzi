@@ -283,6 +283,37 @@ describe("repo-agent roster pinned to the default-branch revision (issue #3913)"
     });
   }
 
+  it("a claim pins the default-branch tip of its own fetch when another claim fetches a newer tip before preflight", async () => {
+    await withFeature(async () => {
+      const h = HARNESSES[0]!;
+      const trusted = commitOnOrigin({ [h.file]: h.content("Original review body") }, "ship the reviewer");
+      let moved = "";
+      const seenA: RunContext[] = [];
+      const seenB: RunContext[] = [];
+      const first = claimFor(h, { issue_iid: 73, issue_title: "claim A", claim_generation: 1 });
+      const second = claimFor(h, { issue_iid: 74, issue_title: "claim B", claim_generation: 1 });
+      const runnerA = newRunner({ run: async (ctx) => { seenA.push(ctx); return { branch: ctx.branch }; } });
+      const runnerB = newRunner({ run: async (ctx) => { seenB.push(ctx); return { branch: ctx.branch }; } });
+      const gitA = Reflect.get(runnerA, "git") as GitCache;
+      const ensure = gitA.ensureClone.bind(gitA);
+      gitA.ensureClone = async (...args: Parameters<GitCache["ensureClone"]>) => {
+        const bare = await ensure(...args);
+        if (!moved) {
+          moved = commitOnOrigin({ [h.file]: h.content("A newer default body") }, "main moves on");
+          await runnerB.execute(second);
+        }
+        return bare;
+      };
+      await runnerA.execute(first);
+      assert.equal(seenB.length, 1, "the interleaved claim reached the executor");
+      assert.equal(reviewerBody(seenB[0]), "A newer default body");
+      assert.deepEqual([...new Set(reportedCommits(second.run_id))], [moved]);
+      assert.equal(seenA.length, 1, "the first claim reached the executor");
+      assert.equal(reviewerBody(seenA[0]), "Original review body");
+      assert.deepEqual([...new Set(reportedCommits(first.run_id))], [trusted]);
+    });
+  });
+
   it("a held first pin keeps its revision after the default branch moves", async () => {
     await withFeature(() => withHoldSpy(async (requests) => {
       const h = HARNESSES[0]!;

@@ -2386,7 +2386,7 @@ interface RunFlight {
   initialPlanningEligible?: boolean;
   policyReservation?: symbol;
   forgeCloneSuccess?: AbortController;
-  cloneFetched?: true;
+  defaultBranchTip?: string;
   operationAdmission?: CodexOperationController;
   operationScope?: ReturnType<typeof acquireCodexOperationScope>;
   releaseOperationAdmission?: () => void;
@@ -13667,6 +13667,7 @@ export class RunRunner {
     // a run's first claim and every Codex run. The worker-wide check runs on EVERY claim.
     await this.checkWorkerResidueBeforeFetch(runId, "pre_clone", runLog);
     let barePath: string;
+    const defaultBranch = this.defaultBranchCapture(claim);
     try {
       // PRD #1809 D6: a clone/fetch that fails because the data volume is full runs the D7
       // reclaim and retries once; still full → DataVolumeFullError, which executeClaim parks
@@ -13690,9 +13691,10 @@ export class RunRunner {
                 flight.forgeCloneSuccess.signal, flight.cancel.signal, this.shutdownSignal.signal,
               ]));
             },
+            defaultBranch,
           ),
       );
-      flight.cloneFetched = true;
+      flight.defaultBranchTip = defaultBranch?.tip;
     } catch (err) {
       if (err instanceof DataVolumeFullError) throw err;
       if (classifyForgeError(err) === "transient") {
@@ -14221,7 +14223,7 @@ export class RunRunner {
     const detection = await this.parseRepoAgents(
       claim,
       barePath,
-      flight.cloneFetched === true,
+      flight.defaultBranchTip,
       claim.secrets.codex ? "codex" : "claude",
       batcher,
       runLog,
@@ -24186,6 +24188,11 @@ export class RunRunner {
     return this.client.protocolFeatures.includes(REPO_AGENT_FOLDER_FEATURE) ? (folder ?? undefined) : undefined;
   }
 
+  private defaultBranchCapture(claim: ClaimResponse): { name: string; tip?: string } | undefined {
+    const name = claim.repo.default_branch?.trim();
+    return name ? { name } : undefined;
+  }
+
   private async confirmRepoAgentSourcePin(
     reportState: RunFlight["reportState"],
     body: Parameters<RunFlight["reportState"]>[0] & { repo_agent_source_commit: string },
@@ -24213,7 +24220,7 @@ export class RunRunner {
   private async parseRepoAgents(
     claim: ClaimResponse,
     barePath: string | undefined,
-    fetched: boolean,
+    capturedTip: string | undefined,
     harness: RepoAgentHarness,
     batcher: MessageBatcher,
     runLog: Logger,
@@ -24245,7 +24252,7 @@ export class RunRunner {
     } else {
       const name = claim.repo.default_branch?.trim();
       if (!name) return unavailable("the repository has no configured default branch to read repo agents from", "");
-      const resolved = fetched ? await this.git.defaultBranchTip(barePath, name) : undefined;
+      const resolved = capturedTip;
       if (!resolved) {
         return unavailable(`the default branch ${sanitizeForLog(name)} could not be resolved from this claim's fetch to read repo agents from`, "");
       }
@@ -26393,8 +26400,10 @@ export class RunRunner {
           await check();
           await this.checkWorkerResidueBeforeFetch(claim.run_id, "retained_recovery", flight.runLog);
           await check();
+          const defaultBranch = this.defaultBranchCapture(claim);
           await this.git.ensureClone(claim.repo.clone_url, claim.secrets.forge_pat, claim.secrets.forge_username,
-            flight.runKind === "task" ? flight.checkpointCoordinates?.checkpoint_key : undefined);
+            flight.runKind === "task" ? flight.checkpointCoordinates?.checkpoint_key : undefined, undefined, defaultBranch);
+          flight.defaultBranchTip = defaultBranch?.tip;
           await check();
           const captureResult = await this.runFreeCapture(claim, flight, iteration.deadline, signal, async held => {
             const check = async () => {
