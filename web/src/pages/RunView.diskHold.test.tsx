@@ -153,7 +153,8 @@ it("does not retry a failed refetch", async () => {
   refreshRun.mockRejectedValueOnce(new Error("Refresh failed"));
   render(view(held(), true));
   fireEvent.click(screen.getByRole("button", { name: "Resume" }));
-  await waitFor(() => expect(screen.getByText("Refresh failed")).toBeTruthy());
+  // Generic errors use the safe fallback; only ApiError messages are exposed.
+  await waitFor(() => expect(screen.getByText("Action failed")).toBeTruthy());
   expect(vi.mocked(api.resumeRun).mock.calls).toEqual([["disk"]]);
   expect(refreshRun).toHaveBeenCalledOnce();
 });
