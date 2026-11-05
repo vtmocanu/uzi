@@ -548,6 +548,12 @@ export class MessageBatcher {
     if (seq > this.pendingRangeLast) this.pendingRangeLast = seq;
   }
 
+  /** Whether a candidate transport reservation is installed (cancelled ones stay installed until
+   * releaseReservation clears them). Read-only. */
+  hasCandidateReservation(): boolean {
+    return this.reservation !== undefined;
+  }
+
   /** Synchronously stop sequence assignment before a candidate submission.
    * Preparation owns no service loop. Its deadline bounds requests; one failed
    * ACK ends the attempt and retains the reservation and original replay.

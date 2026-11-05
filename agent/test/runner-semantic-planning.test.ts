@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import type { Executor } from "../src/executor.js";
 import { RequestError, type PlanCrossCheckCandidate } from "../src/client.js";
+import { CredentialSwitchSignal } from "../src/steering.js";
 import { api, client, git, installHarness, runner, fakeGitlab } from "./runner-harness.js";
 import { freshClaim, gates, newApi, row, send } from "./gate-revision-harness.js";
 import { enrollment, proposal, boundedTransport, hash } from "./semantic-coverage-fixture.js";
@@ -436,6 +437,40 @@ it("M4 complete coverage with a checker APPROVE and no maintainers still auto-ap
   } };
   await runner(exec, fakeGitlab().gitlab, undefined, { semanticCoverageTestTransport: transport,
     planCrossCheckTiming: timing, planApprovalTimeoutMs: 4000 }).execute(c);
+  assert.equal(gates(c.run_id).length, 0, JSON.stringify(api.states));
+});
+
+it("M4 a credential switch during the coverage review keeps the checker approval: the give-up re-run never plain auto-approves", { skip: LINUX_CAPTURE }, async () => {
+  const c = semanticClaim({ plan_cross_check_required: true });
+  const events: string[] = [];
+  const server = serverWithAck(events);
+  checkerAnswering(server, "approve");
+  const transport = await boundedTransport("claude", server.report, events);
+  const status = client.semanticCoverageStatus.bind(client);
+  let switched = false;
+  client.semanticCoverageStatus = async (...args) => {
+    // The first coverage read after the checker's APPROVE is interrupted by a serviced switch.
+    if (!switched) { switched = true; throw new CredentialSwitchSignal(); }
+    return status(...args);
+  };
+  let verdict: Awaited<ReturnType<NonNullable<Parameters<Executor["run"]>[0]["gatePlan"]>>> | undefined;
+  const exec: Executor = { run: async ctx => {
+    const call = () => ctx.gatePlan!("Implement A", milestones, undefined, undefined, submitted(c.issue_iid));
+    try { verdict = await call(); }
+    catch (error) {
+      assert.ok(error instanceof CredentialSwitchSignal, String(error));
+      verdict = await ctx.continueExistingPlanGate!(call);
+    }
+    return { branch: ctx.branch };
+  } };
+  try {
+    await runner(exec, fakeGitlab().gitlab, undefined, { semanticCoverageTestTransport: transport,
+      planCrossCheckTiming: timing, planApprovalTimeoutMs: 4000 }).execute(c);
+  } finally { client.semanticCoverageStatus = status; }
+  assert.equal(switched, true);
+  assert.ok(verdict?.kind === "approve" && verdict.approval === "cross_check", JSON.stringify(verdict));
+  assert.match(verdict.canonical.candidate_digest, /^[a-f0-9]{64}$/);
+  assert.equal(api.crossCheckRequests.length, 1, "the checked decision is adopted, never resubmitted");
   assert.equal(gates(c.run_id).length, 0, JSON.stringify(api.states));
 });
 

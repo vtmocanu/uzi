@@ -198,6 +198,7 @@ import {
   MAX_FOLLOW_UP_BATCH_RUNES,
   MAX_PRIOR_OWNER_HISTORY_ENTRIES,
   type AnswerVerdict,
+  type CredentialSwitchHold,
   type PlanVerdict,
 } from "./steering.js";
 import { GitLabClient, ForgeError, ForgejoClient, GitHubClient, type ForgeClient } from "./forge.js";
@@ -1014,6 +1015,21 @@ function checkpointStopFields(steering: SteeringChannel, now: () => number): Omi
 
 /** Marks checked-gate failures whose escalation may be refused by held transport. */
 class PlanCrossCheckFailure extends Error {}
+
+const CANDIDATE_TRANSPORT_INVARIANT_MESSAGE =
+  "candidate transport invariant violated: credential switch reached an installed reservation; held unassigned events could not be preserved";
+
+/** A credential switch reached enterCredentialSwitch while a candidate transport reservation was
+ * installed. The plan cross-check holds the switch (SteeringChannel.holdCredentialSwitch) for the
+ * whole reservation, so this is a bug guard, not a path: it fails the run generically (it is NOT a
+ * checked lifecycle control) instead of capturing, releasing or clearing a switch that would drop
+ * the reservation's held unassigned events. */
+export class CandidateTransportInvariantError extends Error {
+  constructor() {
+    super(CANDIDATE_TRANSPORT_INVARIANT_MESSAGE);
+    this.name = "CandidateTransportInvariantError";
+  }
+}
 
 /** Keep executeClaim's lifecycle and custody dispositions through checked-gate catches.
  * Presentation refusals are deliberately excluded: associated gates fail terminally. */
@@ -6014,6 +6030,15 @@ export class RunRunner {
         // at B/C. Caught here BEFORE the generic terminal path so a switch NEVER becomes a `failed`
         // run. Enter the same two-phase release; enterCredentialSwitch already set the flight's flags
         // and (on release) reported credential_switch, so NEITHER branch reports a terminal state.
+        if (batcher.hasCandidateReservation()) {
+          // Invariant guard (CandidateTransportInvariantError): the plan cross-check holds a switch
+          // for the whole reservation, so reaching here with one installed is a bug. Releasing or
+          // clearing the switch would drop the reservation's held unassigned events.
+          runLog.error(CANDIDATE_TRANSPORT_INVARIANT_MESSAGE, { run_id: flight.runId });
+          await batcher.close().catch(() => undefined);
+          await this.reportGenericFailure(claim, flight, new CandidateTransportInvariantError());
+          return;
+        }
         if (flight.retainedEpisode || flight.retainedLocalCustody || flight.retainedEpisodeCustody ||
             flight.completedRetainedSuccessor) {
           if (await this.enterRetainedCredentialSwitch(claim, flight, runLog) === "held") {
@@ -15176,6 +15201,18 @@ export class RunRunner {
     let crossCheckSelected = false;
     let crossCheckRound = 1;
     let crossCheckDiscoveryDone = false;
+    // Issue #3953: the checker's decision, kept across the CredentialSwitchSignal control exit a
+    // held switch is serviced with (SteeringChannel.holdCredentialSwitch), so the give-up re-run of
+    // onPlan adopts it instead of resubmitting a candidate whose reservation was already released.
+    // Claim-scoped and one-shot: consumed or cleared at the first same-generation continuation, by
+    // checkedFailure for any other exit, and by the attemptCredentialSwitch hook on a release. The
+    // closures die with this flight, which ends them.
+    let pendingCheckedApproval: {
+      claimGeneration: number; round: number; candidateDigest: string; planMd: string; milestones: string;
+      response: Extract<Awaited<ReturnType<typeof checkPlan>>, { kind: "approve" }>["response"];
+      releaseStateBarrier: (() => void) | undefined; failStateBarrier: ((error: unknown) => void) | undefined;
+    } | undefined;
+    let pendingCheckedRevise: { claimGeneration: number; nextRound: number; verdict: PlanVerdict } | undefined;
     // PRD #1230 M4 (D3/D4): the one-way, flight-scoped human-gate latch of a semantic run. Once
     // coverage was not complete, a maintainer criterion exists, or the required checker did not
     // APPROVE, this execution never auto-approves again, including a later (e.g. human-revised)
@@ -15198,6 +15235,11 @@ export class RunRunner {
       return flight.reportState(frozen, steering.lifecycleSignal(), true);
     };
     const checkedFailure = (error: unknown): never => {
+      // Only the CredentialSwitchSignal control exit keeps a stashed decision (see above).
+      if (!(error instanceof CredentialSwitchSignal)) {
+        pendingCheckedApproval = undefined;
+        pendingCheckedRevise = undefined;
+      }
       if (isCheckedLifecycleControl(error)) throw error;
       steering.lifecycleSignal().throwIfAborted();
       const reason = errMessage(error).startsWith("plan cross-check:") ? errMessage(error) :
@@ -15245,7 +15287,7 @@ export class RunRunner {
     };
     const semanticPlanning = claim.semantic_planning === undefined ? undefined : parseSemanticEnrollment(claim.semantic_planning);
     const semanticGate = semanticPlanning ? new SemanticPlanningGate(this.client, runId, flight.claimGeneration,
-      steering.lifecycleSignal(), this.semanticCoverageTestTransport) : undefined;
+      () => steering.lifecycleSignal(), this.semanticCoverageTestTransport) : undefined;
     // issue #3870: the managed Go work leaf for a Claude flight on Linux. A Codex executor's `safety`
     // is only populated inside run(), so it is excluded here by the signals known before launch
     // (`claim.secrets.codex`, `sandboxesCommands`), as isCodexCapture does. Only an ordinary
@@ -15507,6 +15549,13 @@ export class RunRunner {
       // issue #1597 M2: gated end to end — from the wip marker captureRecoveryRestorePoint commits to
       // the give-up's undoWipMarker — so a mid-turn tick can never publish that throwaway marker.
       attemptCredentialSwitch: async () => {
+        if (batcher.hasCandidateReservation()) {
+          // Invariant guard: no capture, report, clear or continuation. Not a checked lifecycle
+          // control, so it reaches dispatchFailure's generic branch (reportGenericFailure closes
+          // the batcher, which preserves the reservation's held events as a failed close).
+          runLog.error(CANDIDATE_TRANSPORT_INVARIANT_MESSAGE, { run_id: flight.runId });
+          throw new CandidateTransportInvariantError();
+        }
         const outcome = await this.runGatedSink(flight, async () => {
           const outcome = await this.enterCredentialSwitch(claim, flight, runLog);
           if (outcome === "retained_held") throw new CredentialSwitchRetainedStop(true);
@@ -15538,6 +15587,10 @@ export class RunRunner {
         // The marker cleanup and the switch settle must leave the sink before the next tick starts.
         // A release or an uncertain settle keeps the interrupted lifecycle sticky.
         if (outcome === "gave_up") steering.rearmLifecycle();
+        if (outcome === "released") {
+          pendingCheckedApproval = undefined;
+          pendingCheckedRevise = undefined;
+        }
         return outcome;
       },
       resumePhase: claim.resume_phase,
@@ -15684,9 +15737,52 @@ export class RunRunner {
         let gatedPass: Extract<Awaited<ReturnType<typeof checkPlan>>, { kind: "gated_pass" }> | undefined;
         let releaseStateBarrier: (() => void) | undefined;
         let failStateBarrier: ((error: unknown) => void) | undefined;
-        if (eligible && !crossCheckSelected && !checkedHuman) {
+        // Issue #3953: a held credential switch. The hold (SteeringChannel.holdCredentialSwitch) is
+        // opened just before the checker's candidate transport can be reserved, and is serviced only
+        // once that transport is verified released, so the switch never aborts a live reservation.
+        // While a reservation stays installed (a gated pass or forced human gate) both helpers are
+        // no-ops: the hold stays open until the applied gate releases it. Never cancels the
+        // reservation and arms no timer.
+        let hold: CredentialSwitchHold | undefined;
+        let stashed = false;
+        const serviceHold = (): void => {
+          if (hold && !batcher.hasCandidateReservation()) hold.close({ service: true });
+        };
+        const closeHoldNoService = (): void => {
+          if (hold && !batcher.hasCandidateReservation()) hold.close({ service: false });
+        };
+        // A switch is in play when one is latched by the hold, or already pending (the hold has no
+        // effect then and latched() is false).
+        const switchInPlay = (): boolean => hold?.latched() === true || steering.pendingCredentialSwitch() !== undefined;
+        // A switch that surfaces after the checker approved but before gatePlan retains the canonical
+        // storage (the semantic review, the resumed-delivery wait, gatePlan's own early awaits) must
+        // not lose the approval: the give-up re-run would otherwise auto-approve without it. Re-stash
+        // it, bound exactly like the S1 stash. Rethrows `error` in every case.
+        const restashApproval = (error: unknown): never => {
+          if (error instanceof CredentialSwitchSignal && checkedApproval && !continueCheckedStorage) {
+            pendingCheckedApproval = { claimGeneration: flight.claimGeneration, round: checkedApproval.round,
+              candidateDigest: checkedApproval.candidate_digest, planMd,
+              milestones: JSON.stringify(milestones ?? []), response: checkedApproval,
+              releaseStateBarrier, failStateBarrier };
+          }
+          throw error;
+        };
+        // The give-up re-run consumes (or the mismatch clears) the stashed approve at entry.
+        const adopted = pendingCheckedApproval;
+        pendingCheckedApproval = undefined;
+        pendingCheckedRevise = undefined;
+        if (adopted) {
+          if (!eligible || adopted.claimGeneration !== flight.claimGeneration || adopted.planMd !== planMd ||
+              adopted.milestones !== JSON.stringify(milestones ?? [])) {
+            const mismatch = new Error("plan cross-check: stashed decision does not match the re-presented candidate");
+            adopted.failStateBarrier?.(mismatch);
+            return checkedFailure(mismatch);
+          }
+          checkedApproval = adopted.response;
+          releaseStateBarrier = adopted.releaseStateBarrier;
+          failStateBarrier = adopted.failStateBarrier;
+        } else if (eligible && !crossCheckSelected && !checkedHuman) {
           const discoverRound = !crossCheckDiscoveryDone && flight.claimGeneration > 1;
-          crossCheckDiscoveryDone = true;
           crossCheckSelected = true;
           const barrier = new Promise<void>((resolve, reject) => {
             releaseStateBarrier = () => { flight.checkedStateBarrier = undefined; resolve(); };
@@ -15722,22 +15818,24 @@ export class RunRunner {
                   ? "interrupted" : latest.fallback_reason;
                 checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: reason };
                 crossCheckReason = `plan cross-check: ${reason.replaceAll("_", " ")}`;
-                checkedHuman = { phase: "publishinginitial", onApplied: () => releaseStateBarrier?.() };
+                checkedHuman = { phase: "publishinginitial", onApplied: () => { releaseStateBarrier?.(); serviceHold(); } };
               }
             }
+            // Discovery completed: a switch that interrupted it re-runs it with the re-selection.
+            crossCheckDiscoveryDone = true;
             if (checkedHuman) {
               // Discovery selected an existing fallback, without adopting a human presentation.
             } else if (codexLeadUnsupported) {
               crossCheckReason = "plan cross-check: not yet supported for a Codex lead";
               checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: "codex_lead_unsupported" };
-              checkedHuman = { phase: "publishinginitial", onApplied: () => releaseStateBarrier?.() };
+              checkedHuman = { phase: "publishinginitial", onApplied: () => { releaseStateBarrier?.(); serviceHold(); } };
             } else {
               const captured = semanticDiff ?? await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, barePath, steering.lifecycleSignal(), runLog);
               if ("refusal" in captured) {
                 crossCheckReason = `plan cross-check: planning diff refused (${captured.refusal}: ${captured.diagnostic})`;
                 checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: "planning_diff_refused",
                   plan_cross_check_diff_refusal: captured.refusal };
-                checkedHuman = { phase: "publishinginitial", onApplied: () => releaseStateBarrier?.() };
+                checkedHuman = { phase: "publishinginitial", onApplied: () => { releaseStateBarrier?.(); serviceHold(); } };
               } else {
                 const checkOptions = {
                   client: this.client, runId, generation: flight.claimGeneration,
@@ -15752,6 +15850,7 @@ export class RunRunner {
                   round: crossCheckRound, allowAutomaticRevision: true as const };
                 // Literal-mode calls select the typed overloads: the gated result excludes
                 // "approve" at compile time (the runtime throw below stays as a backstop).
+                hold = steering.holdCredentialSwitch();
                 const gatedDecision: Exclude<CheckedPlanDecision, { kind: "approve" }> | undefined =
                   gatedEligible ? await checkPlan({ ...checkOptions, mode: "gated" }) : undefined;
                 const decision = gatedDecision ?? await checkPlan({ ...checkOptions, mode: "required" });
@@ -15759,6 +15858,19 @@ export class RunRunner {
                   // Gated mode never mints an approval: checkPlan returns gated_pass instead.
                   if (gatedEligible) throw new Error("plan cross-check: unexpected approval in gated mode");
                   checkedApproval = decision.response;
+                  // The reservation is released: if a switch is in play, stash this decision before
+                  // anything else can fail or emit, then service the hold. The throw below is the
+                  // CredentialSwitchSignal control exit; the give-up re-run adopts the stash. All
+                  // of this is synchronous, so no switch can slip in between.
+                  if (switchInPlay()) {
+                    stashed = true;
+                    pendingCheckedApproval = { claimGeneration: flight.claimGeneration, round: decision.response.round,
+                      candidateDigest: decision.response.candidate_digest, planMd,
+                      milestones: JSON.stringify(milestones ?? []), response: decision.response,
+                      releaseStateBarrier, failStateBarrier };
+                  }
+                  serviceHold();
+                  steering.lifecycleSignal().throwIfAborted();
                 } else if (decision.kind === "gated_pass") {
                   // The checker approved, and a human still approves: present the ordinary gate
                   // from the canonical candidate the checker read, bound to its digest. The
@@ -15773,21 +15885,31 @@ export class RunRunner {
                   const rounds = decision.response.round;
                   crossCheckReason = `plan cross-check: passed after ${rounds} ${rounds === 1 ? "round" : "rounds"}`;
                   checkedHuman.onApplied = async (ack) => {
-                    if (!decision.reservation.releaseAppliedGate(ack))
+                    if (!decision.reservation.releaseAppliedGate(ack)) {
+                      closeHoldNoService();
                       throw new Error("plan cross-check: gated pass settlement receipts unavailable");
+                    }
                     releaseStateBarrier?.();
+                    serviceHold();
                   };
                 } else if (decision.kind === "revise") {
                   // checkPlan has released the decided proof and settled usage. Release and
                   // await this exact barrier before allowing another executor planning turn.
                   releaseStateBarrier?.();
                   await barrier;
-                  steering.lifecycleSignal().throwIfAborted();
                   crossCheckRound = decision.response.round + 1;
                   crossCheckSelected = false;
-                  return { kind: "revise", automatic: true, round: decision.response.round,
+                  const reviseVerdict: PlanVerdict = { kind: "revise", automatic: true, round: decision.response.round,
                     feedback: decision.response.findings?.summary ?? "Plan cross-check requested changes.",
                     ...(decision.response.findings ? { items: decision.response.findings.items } : {}) };
+                  if (switchInPlay()) {
+                    stashed = true;
+                    pendingCheckedRevise = { claimGeneration: flight.claimGeneration, nextRound: crossCheckRound,
+                      verdict: reviseVerdict };
+                  }
+                  serviceHold();
+                  steering.lifecycleSignal().throwIfAborted();
+                  return reviseVerdict;
                 } else {
                   checkedHuman = { phase: "publishinginitial" };
                   checkedFields = decision.fields;
@@ -15797,16 +15919,33 @@ export class RunRunner {
                       reason === "timed_out" ? "plan cross-check: timed out" :
                         `plan cross-check: ${reason.replaceAll("_", " ")}`;
                   checkedHuman.onApplied = async (ack) => {
-                    await decision.completePreparation?.(steering.lifecycleSignal());
-                    if (decision.reservation && !decision.reservation.releaseAppliedGate(ack))
-                      throw new Error("plan cross-check: forced gate settlement receipts unavailable");
+                    try {
+                      await decision.completePreparation?.(steering.lifecycleSignal());
+                      if (decision.reservation && !decision.reservation.releaseAppliedGate(ack))
+                        throw new Error("plan cross-check: forced gate settlement receipts unavailable");
+                    } catch (error) {
+                      closeHoldNoService();
+                      throw error;
+                    }
                     releaseStateBarrier?.();
+                    serviceHold();
                   };
                 }
               }
             }
           } catch (error) {
-            if (!(error instanceof CredentialSwitchSignal)) failStateBarrier?.(error);
+            if (error instanceof CredentialSwitchSignal) {
+              // A switch before any decision was stashed (discovery, planning-diff capture, or a
+              // switch already pending when the hold opened) leaves no reservation: drop this
+              // selection so the give-up re-run re-selects from scratch. A stashed decision keeps
+              // its barrier for the adopting re-run.
+              if (!stashed && !batcher.hasCandidateReservation()) {
+                releaseStateBarrier?.();
+                crossCheckSelected = false;
+                checkedHuman = undefined;
+              }
+            } else failStateBarrier?.(error);
+            closeHoldNoService();
             return checkedFailure(error);
           }
         } else if (checkedHuman) {
@@ -15820,7 +15959,8 @@ export class RunRunner {
         let semanticPark: SemanticPark | undefined;
         if (semanticGate && semanticCompiled && semanticSources) {
           // The SERVER's coverage authority decides; the review result is display evidence only.
-          const { review: coverage, outcome } = await semanticGate.reviewForGate(semanticCompiled, planMd, semanticSources.sources);
+          const { review: coverage, outcome } = await semanticGate.reviewForGate(semanticCompiled, planMd, semanticSources.sources)
+            .catch(restashApproval);
           batcher.emit({ kind: "status", agent: "worker", payload: { event: "semantic_plan_coverage", ...coverage,
             server_outcome: outcome } });
           const maintainers = semanticCompiled.candidate.criteria.filter(c => c.kind === "maintainer").length;
@@ -15847,7 +15987,8 @@ export class RunRunner {
         // replayed approve read after it would approve a plan no human saw. Resolves at once once
         // delivered (an SDK claim already awaited it in takeResumedGateEvent).
         if (claim.plan_approved !== true && !!claim.plan_md?.trim() && !effectiveAutoApprove)
-          await this.awaitResumedDelivery(runId, steering, batcher, runLog, checkedHuman ? steering.lifecycleSignal() : cancel.signal);
+          await this.awaitResumedDelivery(runId, steering, batcher, runLog, checkedHuman ? steering.lifecycleSignal() : cancel.signal)
+            .catch(restashApproval);
         const semanticReports = new WeakMap<StateRequest, PlanCrossCheckStateRequest>();
         const reportSemanticState = (body: StateRequest): Promise<StateAck> => {
           let frozen = semanticReports.get(body);
@@ -15922,7 +16063,11 @@ export class RunRunner {
             claimGeneration: flight.claimGeneration } : undefined,
         ).catch((error) => {
           if (checkedHuman || checkedApproval) {
-            if (!(error instanceof CredentialSwitchSignal)) failStateBarrier?.(error);
+            if (error instanceof CredentialSwitchSignal) {
+              if (checkedApproval && !continueCheckedStorage) {
+                try { restashApproval(error); } catch { /* restash only; the failure path below rethrows */ }
+              }
+            } else failStateBarrier?.(error);
             return checkedFailure(error);
           }
           throw error;
@@ -15949,6 +16094,13 @@ export class RunRunner {
       },
       ...((claim.auto_approve && claim.plan_cross_check_required || !claim.auto_approve && claim.plan_cross_check_gated) && !seeded ? {
         continueExistingPlanGate: async (otherwise: () => Promise<PlanVerdict>) => {
+          // Issue #3953: a serviced switch after an automatic checker REVISE resumes with that
+          // exact verdict (one-shot) instead of re-running the plan gate; any other continuation
+          // clears it.
+          const revise = pendingCheckedRevise;
+          pendingCheckedRevise = undefined;
+          if (revise && revise.claimGeneration === flight.claimGeneration && crossCheckRound === revise.nextRound)
+            return revise.verdict;
           if (continueCheckedStorage) return continueCheckedStorage();
           if (!checkedHuman) return otherwise();
           if (!checkedHuman.continueWait || checkedHuman.phase === "terminal" || checkedHuman.phase === "revisionplanning")
