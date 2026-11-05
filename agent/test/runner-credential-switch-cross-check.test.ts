@@ -702,41 +702,71 @@ describe("issue #3953 m3: stash lifetime, ambiguous submit and pre-reserve switc
 describe("issue #3953 m3: boundaries keep their dispositions; the latch is never serviced", () => {
   const noSwitchReports = (runId: string) => assert.deepEqual(switchReports(runId), [], "no credential_switch report of any kind");
 
-  for (const withSwitch of [false, true]) {
-    it(`an owner cancel during the hold (${withSwitch ? "after the switch is latched" : "alone"}) ends the run as cancelled; nothing is stored`, { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
-      const cancel = async (c: ReturnType<typeof claim>) => {
-        const [row0] = send(c.run_id, row("cancel"));
-        await routed(c.run_id, row0!.id);
+  it("an owner cancel row sent during the hold, with no switch, ends the run as cancelled; nothing is stored", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const d = await drive({ capture: "release", switchRounds: [], duringPending: async (c) => {
+      const [cancel] = send(c.run_id, row("cancel"));
+      await routed(c.run_id, cancel!.id);
+    } });
+    assert.deepEqual(d.storage, [], "no approval is stored after a cancel");
+    assert.equal(d.counter.calls, 1);
+    assert.ok(!statuses(d.c.run_id).includes("completed"));
+    failedWith(d.c.run_id, "run cancelled");
+    noSwitchReports(d.c.run_id);
+    assert.deepEqual(d.attempts, []);
+    assert.deepEqual(d.tl.events.filter((e) => e === "capture"), [], "the latch is never serviced");
+  });
+
+  it("an owner cancel row sent while a latched switch is pending is withheld until the switch is serviced; the release leaves it for the reclaim", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    let cancelId = 0;
+    // The cancel row is only sent; nothing waits on it (the api withholds every row while a switch is pending).
+    const d = await drive({ capture: "release", switchRounds: [1], afterSwitch: async (c) => {
+      cancelId = send(c.run_id, row("cancel"))[0]!.id;
+    } });
+    const { c } = d;
+    assert.ok(cancelId > 0);
+    assert.deepEqual(switchReports(c.run_id), ["credential_switch"]);
+    assert.ok(!statuses(c.run_id).includes("failed"), JSON.stringify(statuses(c.run_id)));
+    const releaseAt = api.timeline.findIndex((e) => e.type === "state" && e.runId === c.run_id && e.status === "credential_switch");
+    assert.ok(releaseAt >= 0);
+    assert.deepEqual(api.timeline.slice(0, releaseAt).filter((e) => e.type !== "state" && e.runId === c.run_id && e.ids.includes(cancelId)), [],
+      "the withheld row was never ACKed or receipted before the credential_switch report");
+    assert.equal(api.isAcked(c.run_id, cancelId), false);
+    assert.equal(api.isApplied(c.run_id, cancelId), false, "the row stays unapplied for the reclaim");
+    assert.deepEqual(d.storage, []);
+    assert.equal(d.counter.calls, 1);
+    // The reclaim receives the row and ends cancelled.
+    const c2 = reclaim(c);
+    api.crossCheckLatestHandler = () => ({ status: 200, body: {
+      result: "latest", round: 1, candidate_generation: 1, automatic_revision_limit: 2,
+      automatic_rounds_enabled: true, next_round: null, next_round_eligible: false, fallback_reason: "approve" } });
+    const exec2: Executor = { run: async (ctx) =>
+      new SdkExecutor(nullLogger(), homeDir, { queryFn: scriptedQuery([PLAN], { calls: 0 }) }).run(ctx) };
+    await runner(exec2, fakeGitlab().gitlab, undefined, { planCrossCheckTiming: timing, recoveryRetryMs: 1,
+      planApprovalTimeoutMs: 3000 }).execute(c2);
+    failedWith(c.run_id, "run cancelled");
+  });
+
+  it("a server terminal cancel (getInputs terminalCancelled) during a hold with a latched switch ends the flight: no switch attempt, capture, gate or storage", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const injected = { calls: 0 };
+    const getInputs = client.getInputs.bind(client);
+    const d = await drive({ capture: "release", switchRounds: [1], afterSwitch: async (c) => {
+      // The switch is latched under the hold; now the server reports the run terminally cancelled.
+      client.getInputs = async (runId, ...rest) => {
+        if (runId === c.run_id) { injected.calls++; return { inputs: [], terminalCancelled: { run_id: runId, generation: 1 } }; }
+        return getInputs(runId, ...rest);
       };
-      // With a switch: it is requested first and latched under the hold, then the cancel is routed.
-      const d = await drive(withSwitch
-        ? { capture: "release", switchRounds: [1], afterSwitch: cancel }
-        : { capture: "release", switchRounds: [], duringPending: cancel });
-      assert.deepEqual(d.storage, [], "no approval is stored after a cancel");
-      assert.equal(d.counter.calls, 1);
-      assert.ok(!statuses(d.c.run_id).includes("completed"));
-      if (!withSwitch) {
-        failedWith(d.c.run_id, "run cancelled");
-        noSwitchReports(d.c.run_id);
-        assert.deepEqual(d.attempts, []);
-        assert.deepEqual(d.tl.events.filter((e) => e === "capture"), [], "the latch is never serviced");
-        return;
-      }
-      // The switch was latched first (d.trace.requests === 1, before any terminal state): the cancel
-      // aborts the checker, a forced gate is presented, and the held switch is then serviced after the
-      // applied gate released the reservation. The switch wins, as it would without a hold (it trips at
-      // the poll); the routed cancel row is not applied, so the reclaim still sees it.
-      const ev = d.tl.events;
-      assert.equal(d.trace.requests, 1);
-      assert.ok(ev.indexOf("switch-requested") >= 0 && ev.indexOf("switch-requested") < ev.indexOf("state:awaiting_approval"));
-      assert.ok(!statuses(d.c.run_id).includes("failed"), JSON.stringify(statuses(d.c.run_id)));
-      assert.deepEqual(switchReports(d.c.run_id), ["credential_switch"]);
-      assert.equal((gates(d.c.run_id) as PlanCrossCheckStateRequest[])[0]!.plan_cross_check_gate_reason, "checker_failed");
-      assert.ok(ev.indexOf("capture") > ev.indexOf("release"), `no capture while the reservation is installed: ${JSON.stringify(ev)}`);
-      const cancelRow = api.inputRows(d.c.run_id).find((r) => r.kind === "cancel")!;
-      assert.equal(api.isApplied(d.c.run_id, cancelRow.id), false, "the cancel stays for the reclaim");
-    });
-  }
+      await handlerWait(() => injected.calls > 0);
+    } });
+    assert.ok(injected.calls > 0);
+    const states = statuses(d.c.run_id);
+    assert.deepEqual(switchReports(d.c.run_id), []);
+    assert.deepEqual(d.attempts, [], "the latch is never serviced");
+    assert.deepEqual(d.tl.events.filter((e) => e === "capture"), []);
+    assert.equal(gates(d.c.run_id).length, 0);
+    assert.deepEqual(d.storage, []);
+    assert.equal(d.counter.calls, 1);
+    assert.ok(!states.includes("completed") && !states.includes("failed"), `fenced flight reports no terminal: ${JSON.stringify(states)}`);
+  });
 
   it("a claim fence during the hold ends the flight quietly; the latch is never serviced", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
     const d = await drive({ capture: "release", switchRounds: [], duringPending: async (c) => {
