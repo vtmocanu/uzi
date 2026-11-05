@@ -39,26 +39,30 @@ describe("Codex TOML model projection", () => {
     });
   }
 
-  const hostile = [
-    "1", "1.5", "true", "[]", '["gpt-6-astra"]', '{ pin = "gpt-6-astra" }',
+  const hostile: { literal: string; raw?: string }[] = [
+    ...["1", "1.5", "true", "[]", '["gpt-6-astra"]', '{ pin = "gpt-6-astra" }',
     "1979-05-27T07:32:00Z",
+    ].map((literal) => ({ literal })),
     ...[
       " ", " gpt-6-astra", "gpt-6-astra ", "gpt-6 astra", "gpt-6\tastra",
       "gpt-6\nastra", "gpt-6\u0000astra", "gpt-6\u007fastra", "gpt-6\u202eastra",
       "gpt-6\u200bastra", "gpt-6\ufffdastra", "x".repeat(101), "é".repeat(101),
       "opus", "sonnet", "haiku", "claude-opus-4-8", "claude-sonnet-4-6",
       "gpt-5", "gpt-7-custom-preview", "gpt-6-astra-unknown",
-    ].map((value) => JSON.stringify(value).replace(/\u007f/g, "\\u007f")),
+    ].map((raw) => ({ literal: JSON.stringify(raw).replace(/\u007f/g, "\\u007f"), raw })),
   ];
-  hostile.forEach((value, index) => {
+  hostile.forEach(({ literal, raw }, index) => {
     it(`rejects hostile model case ${index} with a bounded non-echoing note`, () => {
-      const parsed = parseCodexAgentFile(source(`model = ${value}`), "file");
+      const parsed = parseCodexAgentFile(source(`model = ${literal}`), "file");
       assert.deepEqual(parsed, { ok: false, name: "coder", reason: "invalid" });
       if (parsed.ok) return;
       const note = describeRepoAgentNote(parsed);
+      assert.equal(note, 'repo agent "coder" was skipped: unreadable or invalid file, name, description, model, or empty body');
       assert.ok(note.length < 200);
       assert.equal(note.includes("model ="), false);
-      assert.equal(note.includes(value), false);
+      assert.equal(note.includes(literal), false);
+      // Normal prose contains spaces; the exact-message assertion covers whitespace-only values.
+      if (raw !== undefined && raw.trim() !== "") assert.equal(note.includes(raw), false);
     });
   });
 
