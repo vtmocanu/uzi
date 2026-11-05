@@ -3,7 +3,8 @@ import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { useState } from "react";
 import { SummarySettingsCard } from "./SummarySettingsCard";
-import { api, type AppSettings, type SettingsResponse } from "../../lib/api";
+import { CODEX_ROLE_MODELS } from "../../lib/codexModels";
+import { api, type AppSettings, type SettingSource, type SettingsResponse } from "../../lib/api";
 
 vi.mock("../../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../lib/api")>();
@@ -11,100 +12,162 @@ vi.mock("../../lib/api", async (importOriginal) => {
 });
 const mockApi = vi.mocked(api);
 
-const settings = (summary: string, now = "true"): AppSettings =>
-  ({ summary_model: summary, now_summary_enabled: now }) as AppSettings;
-const response = (s: AppSettings): SettingsResponse => ({ settings: s, secrets: {}, sources: {}, slack_status: "disabled" });
+const DEFAULTS = { summary_model: "haiku", codex_summary_model: "gpt-6-luna" };
 
-function Harness({ initial }: { initial: string }) {
-  const [saved, setSaved] = useState(settings(initial));
-  return <SummarySettingsCard settings={saved} onSaved={(r) => setSaved(r.settings)} />;
+// A server-shaped view: a source of "default" reports the built-in as the effective value.
+const view = (
+  claude: string,
+  codex: string,
+  now = "true",
+): { settings: AppSettings; sources: Record<string, SettingSource> } => ({
+  settings: {
+    summary_model: claude === "" ? "haiku" : claude,
+    codex_summary_model: codex === "" ? "gpt-6-luna" : codex,
+    now_summary_enabled: now,
+  } as AppSettings,
+  sources: {
+    summary_model: claude === "" ? "default" : "db",
+    codex_summary_model: codex === "" ? "default" : "db",
+  },
+});
+const response = (v: ReturnType<typeof view>): SettingsResponse =>
+  ({ ...v, secrets: {}, defaults: DEFAULTS, slack_status: "disabled" }) as SettingsResponse;
+
+function Harness({ claude, codex }: { claude: string; codex: string }) {
+  const [v, setV] = useState(view(claude, codex));
+  return (
+    <SummarySettingsCard
+      settings={v.settings}
+      sources={v.sources}
+      defaults={DEFAULTS}
+      onSaved={(r) => setV({ settings: r.settings, sources: r.sources })}
+    />
+  );
 }
 
-const picker = () => screen.getByRole("combobox", { name: "Summary model" }) as HTMLSelectElement;
-const customInput = () => screen.getByRole("textbox", { name: "Custom summary model ID" }) as HTMLInputElement;
+const claudePicker = () => screen.getByRole("combobox", { name: "Claude summary model" }) as HTMLSelectElement;
+const codexPicker = () => screen.getByRole("combobox", { name: "Codex summary model" }) as HTMLSelectElement;
 const save = () => screen.getByRole("button", { name: "Save run summary settings" }) as HTMLButtonElement;
-const optionValues = () => Array.from(picker().options).map((o) => o.value);
+const optionText = (s: HTMLSelectElement) => Array.from(s.options).map((o) => o.text);
 
 afterEach(() => {
   cleanup();
   vi.resetAllMocks();
 });
 
-describe("SummarySettingsCard model picker (#3255)", () => {
-  it("renders a curated stored alias selected, with no Default option", () => {
-    render(<Harness initial="haiku" />);
-    expect(picker().value).toBe("haiku");
-    expect(optionValues()).not.toContain("inherit");
-    expect(Array.from(picker().options).some((o) => /default/i.test(o.text))).toBe(false);
-    expect(screen.queryByRole("textbox")).toBeNull();
+describe("SummarySettingsCard Claude | Codex pair (#3248)", () => {
+  it("renders both pickers with a Default option naming the built-in, selected when unpinned", () => {
+    render(<Harness claude="" codex="" />);
+    expect(claudePicker().value).toBe("inherit");
+    expect(codexPicker().value).toBe("inherit");
+    expect(optionText(claudePicker())).toContain("Default · haiku (built-in)");
+    expect(optionText(codexPicker())).toContain("Default · gpt-6-luna (built-in)");
+    expect(save().disabled).toBe(true);
   });
 
-  it("opens a stored custom value in custom mode and an unrelated save does not send it", async () => {
-    mockApi.updateSettings.mockResolvedValue(response(settings("claude-x-1", "false")));
-    render(<Harness initial="claude-x-1" />);
-    expect(picker().value).toBe("custom");
-    expect(customInput().value).toBe("claude-x-1");
-    fireEvent.click(screen.getByRole("checkbox", { name: "Model-written Now line" }));
+  it("selects the pinned model, not Default, when the source is not default", () => {
+    render(<Harness claude="sonnet" codex="gpt-6-astra" />);
+    expect(claudePicker().value).toBe("sonnet");
+    expect(codexPicker().value).toBe("gpt-6-astra");
+  });
+
+  it("offers exactly the Codex role models in the Codex picker, with no custom entry", () => {
+    render(<Harness claude="" codex="" />);
+    const values = Array.from(codexPicker().options).map((o) => o.value).filter((v) => v !== "inherit");
+    expect(values).toEqual([...CODEX_ROLE_MODELS]);
+  });
+
+  it("selects a stored gpt-6-luna as itself, not as a custom ID", () => {
+    render(<Harness claude="" codex="gpt-6-luna" />);
+    expect(codexPicker().value).toBe("gpt-6-luna");
+    expect(screen.queryByRole("textbox", { name: "Custom Codex summary model ID" })).toBeNull();
+  });
+
+  it("sends only the changed Codex key", async () => {
+    mockApi.updateSettings.mockResolvedValue(response(view("", "gpt-6-astra")));
+    render(<Harness claude="" codex="" />);
+    fireEvent.change(codexPicker(), { target: { value: "gpt-6-astra" } });
     fireEvent.click(save());
     await screen.findByText("Run summary settings saved.");
-    expect(mockApi.updateSettings).toHaveBeenCalledWith({ now_summary_enabled: "false" });
+    expect(mockApi.updateSettings).toHaveBeenCalledWith({ codex_summary_model: "gpt-6-astra" });
+    expect(codexPicker().value).toBe("gpt-6-astra");
   });
 
-  it("warns beneath the picker on an invalid custom ID and blocks Save", () => {
-    render(<Harness initial="haiku" />);
-    fireEvent.change(picker(), { target: { value: "custom" } });
-    fireEvent.change(customInput(), { target: { value: "bad id" } });
-    expect(screen.getByText("Model must be a single token with no spaces.")).toBeTruthy();
+  it("sends only the changed Claude key", async () => {
+    mockApi.updateSettings.mockResolvedValue(response(view("sonnet", "")));
+    render(<Harness claude="" codex="" />);
+    fireEvent.change(claudePicker(), { target: { value: "sonnet" } });
+    fireEvent.click(save());
+    await screen.findByText("Run summary settings saved.");
+    expect(mockApi.updateSettings).toHaveBeenCalledWith({ summary_model: "sonnet" });
+    expect(claudePicker().value).toBe("sonnet");
+  });
+
+  it("sends an empty string when a pinned lane is reset to Default", async () => {
+    mockApi.updateSettings.mockResolvedValue(response(view("sonnet", "")));
+    render(<Harness claude="sonnet" codex="gpt-6-astra" />);
+    fireEvent.change(codexPicker(), { target: { value: "inherit" } });
+    fireEvent.click(save());
+    await screen.findByText("Run summary settings saved.");
+    expect(mockApi.updateSettings).toHaveBeenCalledWith({ codex_summary_model: "" });
+    expect(codexPicker().value).toBe("inherit");
+    expect(claudePicker().value).toBe("sonnet");
+  });
+
+  it("refuses a Codex role id in the Claude lane and blocks Save", () => {
+    render(<Harness claude="" codex="" />);
+    fireEvent.change(claudePicker(), { target: { value: "custom" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Custom Claude summary model ID" }), {
+      target: { value: "gpt-6-astra" },
+    });
+    expect(screen.getByText(/That is a Codex model/)).toBeTruthy();
     expect(save().disabled).toBe(true);
     fireEvent.submit(save().closest("form")!);
     expect(mockApi.updateSettings).not.toHaveBeenCalled();
   });
 
-  it("blocks Save and explains when custom mode is empty", () => {
-    render(<Harness initial="haiku" />);
-    fireEvent.change(picker(), { target: { value: "custom" } });
-    expect(screen.getByRole("alert").textContent).toBe("Enter a model ID, or choose a listed model.");
+  it("warns on a stored Codex id in the Claude lane without locking an unrelated save", async () => {
+    mockApi.updateSettings.mockResolvedValue(response(view("gpt-6-astra", "gpt-6-astra")));
+    render(<Harness claude="gpt-6-astra" codex="" />);
+    expect(screen.getByText(/Not a Claude model/)).toBeTruthy();
+    fireEvent.change(codexPicker(), { target: { value: "gpt-6-astra" } });
+    expect(save().disabled).toBe(false);
+    fireEvent.click(save());
+    await screen.findByText("Run summary settings saved.");
+    expect(mockApi.updateSettings).toHaveBeenCalledWith({ codex_summary_model: "gpt-6-astra" });
+  });
+
+  it("warns beneath the picker on an invalid custom ID and blocks Save", () => {
+    render(<Harness claude="" codex="" />);
+    fireEvent.change(claudePicker(), { target: { value: "custom" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Custom Claude summary model ID" }), {
+      target: { value: "bad id" },
+    });
+    expect(screen.getByText("Model must be a single token with no spaces.")).toBeTruthy();
     expect(save().disabled).toBe(true);
   });
 
-  it("sends only summary_model when a curated alias is chosen", async () => {
-    mockApi.updateSettings.mockResolvedValue(response(settings("sonnet")));
-    render(<Harness initial="haiku" />);
-    fireEvent.change(picker(), { target: { value: "sonnet" } });
-    expect(save().disabled).toBe(false);
-    fireEvent.click(save());
-    await screen.findByText("Run summary settings saved.");
-    expect(mockApi.updateSettings).toHaveBeenCalledWith({ summary_model: "sonnet" });
-    expect(picker().value).toBe("sonnet");
+  it("blocks Save when custom mode is empty rather than sending the reset", () => {
+    render(<Harness claude="sonnet" codex="" />);
+    fireEvent.change(claudePicker(), { target: { value: "custom" } });
+    expect(screen.getByText("Enter a model ID, or choose Default.")).toBeTruthy();
+    expect(save().disabled).toBe(true);
   });
 
-  it("saves an edited custom ID verbatim and keeps it in custom mode", async () => {
-    mockApi.updateSettings.mockResolvedValue(response(settings("claude-y-2")));
-    render(<Harness initial="claude-x-1" />);
-    fireEvent.change(customInput(), { target: { value: "claude-y-2" } });
-    expect(save().disabled).toBe(false);
-    fireEvent.click(save());
-    await screen.findByText("Run summary settings saved.");
-    expect(mockApi.updateSettings).toHaveBeenCalledWith({ summary_model: "claude-y-2" });
-    expect(picker().value).toBe("custom");
-    expect(customInput().value).toBe("claude-y-2");
-  });
-
-  it("shows a stored non-Claude value in custom mode and never re-sends it on an unrelated save", async () => {
-    mockApi.updateSettings.mockResolvedValue(response(settings("gpt-6.1-sol", "false")));
-    render(<Harness initial="gpt-6.1-sol" />);
-    expect(picker().value).toBe("custom");
-    expect(customInput().value).toBe("gpt-6.1-sol");
+  it("does not resend an untouched stored custom value when only the Now line changes", async () => {
+    mockApi.updateSettings.mockResolvedValue(response(view("claude-x-1", "", "false")));
+    render(<Harness claude="claude-x-1" codex="" />);
+    expect(claudePicker().value).toBe("custom");
     fireEvent.click(screen.getByRole("checkbox", { name: "Model-written Now line" }));
     fireEvent.click(save());
     await screen.findByText("Run summary settings saved.");
     expect(mockApi.updateSettings).toHaveBeenCalledWith({ now_summary_enabled: "false" });
-    expect(customInput().value).toBe("gpt-6.1-sol");
   });
 
-  it("keeps the accessible names while in custom mode", () => {
-    render(<Harness initial="claude-x-1" />);
-    expect(picker()).toBeTruthy();
-    expect(customInput()).toBeTruthy();
+  it("describes the credential neutrally, not as an Anthropic token", () => {
+    render(<Harness claude="" codex="" />);
+    const text = document.body.textContent ?? "";
+    expect(text).not.toContain("own Anthropic token");
+    expect(text).toContain("credential for the run");
   });
 });

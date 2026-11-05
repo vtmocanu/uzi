@@ -271,6 +271,12 @@ export interface UserSettings {
    *  instance summary_model (which itself falls back to haiku). Written through
    *  PUT /me/settings alongside judge_model, validated by the same model rules. */
   summary_model: string | null;
+  /** Per-user Codex summary model (PRD #3248); null inherits the instance Codex summary
+   *  model, then the built-in. A Codex role id when set. Optional for older servers. */
+  codex_summary_model?: string | null;
+  /** Read-only resolved view of both summary lanes (PRD #3248), claude then codex.
+   *  Never sent on a PUT. Optional for older servers. */
+  summary_models?: ModelSettingCell[];
   theme: string | null;
   /** PRD #1167 "Lights on" (m2): the four RAW per-user appearance overrides, each
    *  null = inherit the instance default. appearance_mode is system|light|dark;
@@ -340,6 +346,8 @@ export interface UserSettingsPatch {
   codex_judge_model?: string | null;
   /** Per-user run-summary model (PRD #362 M2); present-null clears back to inherit. */
   summary_model?: string | null;
+  /** Per-user Codex summary model (PRD #3248); present-null clears back to inherit. */
+  codex_summary_model?: string | null;
   theme?: string | null;
   /** PRD #1167 "Lights on" (m2): tri-state appearance override fields — absent leaves
    *  the field unchanged, present-null clears it back to inherit, a value sets it
@@ -1175,6 +1183,11 @@ export interface AppSettings {
   // generator runs on (haiku by default), served as a raw string like every other
   // setting. Mirrors judge_model's admin machinery but delivers on the issue-run claim.
   summary_model: string;
+  // codex_summary_model (PRD #3248) is the instance Codex-lane summary model: a Codex role
+  // id, or "" for the built-in (the admin GET reports the built-in with source "default").
+  // summary_model likewise accepts "" as the reset to the built-in haiku.
+  // Optional so an older server (and fixtures that predate it) stay valid.
+  codex_summary_model?: string;
   // Run-health detector keys (PRD #47, #1170). health_enabled is the text "true"/"false".
   // The *_seconds keys are integer seconds as strings; health_near_timeout_pct is a
   // percent of the run's wall-clock budget (0 to disable, else [50, 99]). The API serves

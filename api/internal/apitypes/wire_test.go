@@ -1186,6 +1186,8 @@ func TestUserSettingsDTOTags(t *testing.T) {
 		"now_summary_enabled",
 		// PRD #3245: the Codex judge lane and the read-only resolved judge cells.
 		"codex_judge_model", "judge_models",
+		// PRD #3248: the Codex summary lane and the read-only resolved summary cells.
+		"codex_summary_model", "summary_models",
 		// PRD #3247: the read-only resolved ordinary effort cells.
 		"effort_settings",
 		// PRD #3522: the weekly usage reserve (null threshold ⇒ off).

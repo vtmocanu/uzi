@@ -1431,9 +1431,10 @@ type Store interface {
 	// Per-user judge model lanes (PRD #69 M2, PRD #3245): read at judge-claim assembly,
 	// keyed on the run owner. NULL ⇒ inherit the instance value for that harness.
 	GetUserJudgeModels(ctx context.Context, id uuid.UUID) (store.GetUserJudgeModelsRow, error)
-	// Per-user run-summary model override (PRD #362 M2): read at ISSUE-run claim
-	// assembly, keyed on the run owner. NULL ⇒ inherit the instance summary_model.
-	GetUserSummaryModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
+	// Per-user run-summary model overrides, Claude lane (PRD #362 M2) and Codex lane
+	// (PRD #3248): read at ISSUE-run claim assembly, keyed on the run owner. NULL ⇒
+	// inherit the instance value for that harness.
+	GetUserSummaryModels(ctx context.Context, id uuid.UUID) (store.GetUserSummaryModelsRow, error)
 	// ListClaimAgentTemplates resolves template allocations for the run owner
 	// (PRD #18 M7): only the builtin/global defaults ± the owner's overlay + the
 	// owner's own allocated user templates ride the claim, not every template.
@@ -1818,10 +1819,6 @@ type SettingsReader interface {
 	// InstanceModel is the trimmed instance-tier value of a non-secret model key
 	// ("" when unset). On an error the caller treats the tier as unset (PRD #3245).
 	InstanceModel(ctx context.Context, key string) (string, error)
-	// SummaryModel is the instance-default model the inline run-summary generator
-	// runs on (PRD #362 Decision 8), the fallback when the run owner has no per-user
-	// summary_model override. Falls back to the compiled-in default ("haiku").
-	SummaryModel(ctx context.Context) (string, error)
 	// UziLabel is the single run-eligibility label an issue must carry to be runnable
 	// (PRD #764 M1). It is read here rather than passed in by each caller because the
 	// gate is shared: the board handler, the scheduler, and the poller's autopilot must
