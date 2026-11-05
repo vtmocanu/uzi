@@ -150,7 +150,7 @@ it("proves a clean clone, with each Git read pinned and in order", async t => {
   const rec = recordLaunches(t);
   assert.equal(await prove(), true);
   // `.uzi` is untracked and not itself ignored; its only entry, `scratch`, is: a second question.
-  assert.deepEqual(rec.launches.map(l => l.sub), ["version", "config", "ls-files", "check-ignore", "check-ignore", "status"]);
+  assert.deepEqual(rec.launches.map(l => l.sub), ["version", "config", "ls-tree", "ls-files", "check-ignore", "check-ignore", "status"]);
   const tail = rec.launches.slice(1);
   for (const [i, launch] of tail.entries()) {
     const env = rec.envs[i + 1]!;
@@ -170,6 +170,8 @@ it("proves a clean clone, with each Git read pinned and in order", async t => {
   const status = tail.find(l => l.sub === "status")!;
   assert.deepEqual(status.args.slice(status.args.indexOf("status")),
     ["status", "--porcelain", "-uno", "--no-renames", "--ignore-submodules=none"]);
+  const tree = tail.find(l => l.sub === "ls-tree")!;
+  assert.deepEqual(tree.args.slice(tree.args.indexOf("ls-tree")), ["ls-tree", "-r", "-z", "--full-tree", "HEAD"]);
   const files = tail.find(l => l.sub === "ls-files")!;
   assert.deepEqual(files.args.slice(files.args.indexOf("ls-files")), ["ls-files", "--others", "--directory", "-z"]);
   const ignore = tail.find(l => l.sub === "check-ignore")!;
@@ -594,6 +596,10 @@ it("admits exactly the new argv shapes and no old or widened ones", async t => {
     const refuse = (args: string[]) => assert.throws(() => admit(args), /unaudited/);
     admit(shape("status", "--porcelain", "-uno", "--no-renames", "--ignore-submodules=none"));
     admit(shape("ls-files", "--others", "--directory", "-z"));
+    admit(shape("ls-tree", "-r", "-z", "--full-tree", "HEAD"));
+    refuse(shape("ls-tree", "-r", "-z", "HEAD"));
+    refuse(shape("ls-tree", "-r", "-z", "--full-tree", "refs/heads/x"));
+    refuse(shape("ls-tree", "-r", "-z", "--full-tree", "HEAD", "--", "dir"));
     admit(shape("check-ignore", "--no-index", "--stdin", "-z"));
     refuse(shape("status", "--porcelain", "--ignore-submodules=none"));
     refuse(shape("status", "--porcelain", "-uall", "--no-renames", "--ignore-submodules=none"));
@@ -739,7 +745,7 @@ it("index parser refuses each hostile shape in strict mode and names the reason"
       return true;
     });
   };
-  refused(patched(index, b => b.writeUInt32BE(4, 4)), /version/);
+  refused(patched(index, b => b.writeUInt32BE(5, 4)), /version/);
   refused(patched(index, b => b.writeUInt32BE(1, 4)), /version/);
   refused(patched(index, b => b.write("XXXX", 0, "latin1")), /signature/);
   refused(index.subarray(0, 20), /short/);
@@ -803,7 +809,8 @@ it("readBoundedIndex reads one regular file within its byte bound and refuses li
 
 // Hostile index shapes reaching the proof itself: verdict plus no Git launch at all.
 const HOSTILE: [string, (index: Buffer) => Buffer][] = [
-  ["a version 4 index", index => patched(index, b => b.writeUInt32BE(4, 4))],
+  ["a version 5 index", index => patched(index, b => b.writeUInt32BE(5, 4))],
+  ["a version 4 header over version 2 entries", index => patched(index, b => b.writeUInt32BE(4, 4))],
   ["a link extension", index => withExtension(index, "link", Buffer.alloc(20))],
   ["an sdir extension", index => withExtension(index, "sdir")],
   ["an UNTR extension", index => withExtension(index, "UNTR", Buffer.alloc(8))],
@@ -842,4 +849,353 @@ it("index: the TREE cache extension Git writes is accepted", async () => {
   const file = inClone(".git", "index");
   assert.ok(parseGitIndex(fs.readFileSync(file), { maxEntries: 100 }).extensions.includes("TREE"));
   assert.equal(await prove(), true);
+});
+
+// ---------------------------------------------------------------------------------------------
+// B1: index versus HEAD is compared from the parsed entries, never trusted to `status`.
+
+/** Replace the index's cache-tree extension with `data`, resealing the checksum. */
+function withCacheTree(index: Buffer, data: Buffer): Buffer {
+  const content = body(index);
+  for (let at = content.indexOf("TREE"); at >= 0; at = content.indexOf("TREE", at + 1)) {
+    if (at >= 12 && at + 8 + content.readUInt32BE(at + 4) === content.length) {
+      const header = Buffer.alloc(8);
+      header.write("TREE", 0, "latin1"); header.writeUInt32BE(data.length, 4);
+      return reseal(Buffer.concat([content.subarray(0, at), header, data]));
+    }
+  }
+  throw new Error("index has no trailing TREE extension to replace");
+}
+
+it("B1: a forged cache-tree hides a staged change from status, and the proof refuses it by comparing with HEAD", async t => {
+  fs.writeFileSync(inClone("dir", "inner.txt"), "staged change\n");
+  command(clonePath, "add", "dir/inner.txt");
+  const subtree = command(clonePath, "rev-parse", "HEAD:dir");
+  const file = inClone(".git", "index");
+  // Root invalid (-1 entries, 1 subtree); `dir` claims to be exactly HEAD:dir.
+  const forged = Buffer.concat([Buffer.from("\0-1 1\n"), Buffer.from("dir\x002 0\n", "latin1"), Buffer.from(subtree, "hex")]);
+  fs.writeFileSync(file, withCacheTree(fs.readFileSync(file), forged));
+  // Control: the staged change is real, yet a plain `git status` on the forged index prints nothing.
+  assert.match(command(clonePath, "diff", "--cached", "--name-only", "--no-renames"), /dir\/inner\.txt|^$/);
+  const naive = spawnSync("git", ["-C", clonePath, "status", "--porcelain"], { env: { ...ENV, GIT_OPTIONAL_LOCKS: "0" }, encoding: "utf8" });
+  assert.equal(naive.stdout, "", "control: the forged cache-tree makes status report clean");
+  const rec = recordLaunches(t);
+  assert.equal(await prove(), false);
+  assert.equal(rec.count("ls-tree"), 1);
+  assert.equal(rec.count("status"), 0, "refused by the HEAD comparison, before status");
+});
+
+it("B1: an honestly staged change, a staged deletion and a staged addition are each refused before status", async t => {
+  const rec = recordLaunches(t);
+  fs.writeFileSync(inClone("dir", "inner.txt"), "staged change\n");
+  command(clonePath, "add", "dir/inner.txt");
+  assert.equal(await prove(), false);
+  command(clonePath, "reset", "-q", "--hard", "HEAD");
+  command(clonePath, "rm", "-q", "dir/other.txt");
+  assert.equal(await prove(), false);
+  command(clonePath, "reset", "-q", "--hard", "HEAD");
+  fs.writeFileSync(inClone("added.txt"), "new\n");
+  command(clonePath, "add", "added.txt");
+  assert.equal(await prove(), false);
+  assert.equal(rec.count("status"), 0);
+  command(clonePath, "reset", "-q", "--hard", "HEAD");
+  fs.rmSync(inClone("added.txt"), { force: true });
+  assert.equal(await prove(), true);
+});
+
+it("B1: a staged mode change and a retargeted symlink are refused by the HEAD comparison", async t => {
+  fs.symlinkSync("dir/inner.txt", inClone("link"));
+  commitAll("link");
+  assert.equal(await prove(), true);
+  const rec = recordLaunches(t);
+  fs.chmodSync(inClone("README.md"), 0o755);
+  command(clonePath, "add", "README.md");
+  assert.equal(await prove(), false);
+  command(clonePath, "reset", "-q", "--hard", "HEAD");
+  fs.rmSync(inClone("link"));
+  fs.symlinkSync("dir/other.txt", inClone("link"));
+  command(clonePath, "add", "link");
+  assert.equal(await prove(), false);
+  assert.equal(rec.count("status"), 0);
+});
+
+// ---------------------------------------------------------------------------------------------
+// B2: `.git` is an allowlist; every state file Git might read is typed and charged.
+
+it("B2: a FIFO at .git/sequencer/todo is refused without hanging and without any Git launch", async t => {
+  fs.mkdirSync(inClone(".git", "sequencer"));
+  mkfifo(inClone(".git", "sequencer", "todo"));
+  const rec = recordLaunches(t);
+  assert.equal(await prove(), false);
+  assertNoGit(rec);
+});
+
+it("B2: a FIFO at .git/rebase-merge/head-name (with interactive) is refused without a hang or a status", async t => {
+  fs.mkdirSync(inClone(".git", "rebase-merge"));
+  mkfifo(inClone(".git", "rebase-merge", "head-name"));
+  fs.writeFileSync(inClone(".git", "rebase-merge", "interactive"), "");
+  const rec = recordLaunches(t);
+  assert.equal(await prove(), false);
+  assertNoGit(rec);
+  assert.equal(rec.count("status"), 0);
+});
+
+it("B2: a 200 MB regular file in .git/sequencer or .git/rebase-merge is never read", async t => {
+  fs.mkdirSync(inClone(".git", "sequencer"));
+  sparse(inClone(".git", "sequencer", "todo"), 200 * 1024 * 1024, "pick abc\n");
+  const rec = recordLaunches(t);
+  assert.equal(await prove(), false);
+  fs.rmSync(inClone(".git", "sequencer"), { recursive: true });
+  fs.mkdirSync(inClone(".git", "rebase-merge"));
+  sparse(inClone(".git", "rebase-merge", "head-name"), 200 * 1024 * 1024, "refs/heads/x\n");
+  assert.equal(await prove(), false);
+  assertNoGit(rec);
+});
+
+for (const name of ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG",
+  "BISECT_START", "AUTO_MERGE", "rebase-apply", "shallow", "worktrees", "rr-cache", "unknown-state"]) {
+  it(`B2: .git/${name} is not an admitted entry and is refused before any launch`, async t => {
+    if (name === "rebase-apply" || name === "worktrees" || name === "rr-cache") fs.mkdirSync(inClone(".git", name));
+    else fs.writeFileSync(inClone(".git", name), "0".repeat(40) + "\n");
+    const rec = recordLaunches(t);
+    assert.equal(await prove(), false);
+    assertNoGit(rec);
+  });
+}
+
+it("B2: HEAD must be a small regular file naming a branch ref or an object id", async t => {
+  const head = inClone(".git", "HEAD"), saved = fs.readFileSync(head);
+  const rec = recordLaunches(t);
+  const refused = async (what: string, plant: () => void) => {
+    fs.rmSync(head); plant();
+    assert.equal(await prove(), false, what);
+    fs.rmSync(head, { force: true }); fs.writeFileSync(head, saved);
+  };
+  await refused("FIFO", () => mkfifo(head));
+  await refused("symlink", () => fs.symlinkSync("../elsewhere", head));
+  await refused("oversize", () => sparse(head, 200 * 1024 * 1024, "ref: refs/heads/main\n"));
+  await refused("non-branch ref", () => fs.writeFileSync(head, "ref: refs/remotes/origin/main\n"));
+  await refused("traversal", () => fs.writeFileSync(head, "ref: refs/heads/../../x\n"));
+  await refused("no newline", () => fs.writeFileSync(head, "ref: refs/heads/main"));
+  assertNoGit(rec);
+  t.mock.restoreAll();
+  assert.equal(await prove(), true);
+});
+
+it("B2: the loose ref HEAD names is typed and charged: a FIFO, an oversize file and a symref are refused", async t => {
+  const loose = inClone(".git", "refs", "heads", "agent", "issue-3431"), saved = fs.readFileSync(loose);
+  const rec = recordLaunches(t);
+  for (const plant of [() => mkfifo(loose), () => sparse(loose, 200 * 1024 * 1024, "0".repeat(40) + "\n"),
+    () => fs.writeFileSync(loose, "ref: refs/heads/main\n"), () => fs.symlinkSync("/dev/zero", loose)]) {
+    fs.rmSync(loose); plant();
+    assert.equal(await prove(), false);
+    fs.rmSync(loose, { force: true }); fs.writeFileSync(loose, saved);
+  }
+  assertNoGit(rec);
+  // A symlinked ancestor of the loose ref is refused too, before it can be resolved.
+  const parent = inClone(".git", "refs", "heads", "agent"), moved = parent + ".moved";
+  fs.renameSync(parent, moved);
+  fs.symlinkSync(moved, parent);
+  assert.equal(await prove(), false);
+  assertNoGit(rec);
+});
+
+it("B2: a detached HEAD at an object id, a packed-only branch and regular ORIG_HEAD/FETCH_HEAD are admitted", async () => {
+  const sha = command(clonePath, "rev-parse", "HEAD");
+  fs.writeFileSync(inClone(".git", "ORIG_HEAD"), sha + "\n");
+  fs.writeFileSync(inClone(".git", "FETCH_HEAD"), `${sha}\t\tbranch 'main' of x\n`);
+  assert.equal(await prove(), true);
+  command(clonePath, "pack-refs", "--all", "--prune");
+  assert.equal(await prove(), true);
+  command(clonePath, "checkout", "-q", "--detach");
+  assert.equal(await prove(), true);
+  for (const name of ["ORIG_HEAD", "FETCH_HEAD", "COMMIT_EDITMSG"]) {
+    const file = inClone(".git", name);
+    fs.rmSync(file, { force: true }); mkfifo(file);
+    assert.equal(await prove(), false, name);
+    fs.rmSync(file);
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
+// V4: prefix-compressed names, differential against `git ls-files --stage -z`.
+
+it("index parser agrees with git ls-files --stage on a version 4 index (prefix-compressed names)", () => {
+  const repo = newRepo();
+  const sha = blob(repo, "x");
+  indexInfo(repo, [
+    { mode: "100644", sha, path: Buffer.from("a") },
+    { mode: "100644", sha, path: Buffer.from("alpha/one.txt") },
+    { mode: "100644", sha, path: Buffer.from("alpha/one.txt.bak") },
+    { mode: "100755", sha, path: Buffer.from("alpha/two.sh") },
+    { mode: "100644", sha, path: Buffer.from("alpha/sub/deeper/file") },
+    { mode: "100644", sha, path: Buffer.from("alpha/sub/deeper/files") },
+    { mode: "100644", sha, path: Buffer.from("beta") },
+    { mode: "120000", sha, path: Buffer.from("beta.lnk") },
+    { mode: "160000", sha: "2".repeat(40), path: Buffer.from("mod") },
+    { mode: "100644", sha, path: Buffer.from([0x7a, 0x2f, 0xff, 0x6f]) },
+    { mode: "100644", sha, path: Buffer.from([0x7a, 0x2f, 0xff, 0x70]) },
+    { mode: "100644", sha, path: Buffer.from("x".repeat(300) + "/" + "y".repeat(200)) },
+    { mode: "100644", sha, path: Buffer.from("x".repeat(300) + "/" + "y".repeat(200) + "z") },
+  ]);
+  fs.writeFileSync(path.join(repo, "real.txt"), "hello");
+  command(repo, "add", "real.txt");
+  command(repo, "update-index", "--index-version", "4");
+  const index = readIndex(repo);
+  assert.equal(index.readUInt32BE(4), 4);
+  const parsed = parseGitIndex(index, { maxEntries: 100 });
+  assert.equal(parsed.version, 4);
+  const view = gitView(repo);
+  assert.equal(parsed.entries.length, view.stage.length);
+  parsed.entries.forEach((e, i) => {
+    assert.deepEqual({ mode: e.mode, sha: e.sha, stage: e.stage }, { mode: view.stage[i]!.mode, sha: view.stage[i]!.sha, stage: view.stage[i]!.stage });
+    assert.ok(e.path.equals(view.stage[i]!.path), `path ${i}`);
+  });
+  // Raw stat fields are kept for a later racily-clean check.
+  const real = parsed.entries.find(e => e.path.toString() === "real.txt")!;
+  const st = fs.statSync(path.join(repo, "real.txt"), { bigint: true });
+  assert.deepEqual({ size: real.size, mtimeS: real.mtimeS, ctimeS: real.ctimeS, ino: real.ino, uid: real.uid },
+    { size: 5, mtimeS: Number(st.mtimeMs / 1000n), ctimeS: Number(st.ctimeMs / 1000n), ino: Number(st.ino & 0xffffffffn), uid: Number(st.uid) });
+});
+
+it("index parser refuses hostile version 4 names", () => {
+  const repo = newRepo();
+  const sha = blob(repo, "x");
+  indexInfo(repo, [{ mode: "100644", sha, path: Buffer.from("aaaa") }, { mode: "100644", sha, path: Buffer.from("aaab") }]);
+  command(repo, "update-index", "--index-version", "4");
+  const index = readIndex(repo);
+  parseGitIndex(index, { maxEntries: 4 });
+  // Entry layout: 62 fixed bytes, a varint strip count, then the NUL-terminated suffix.
+  const first = 12, second = 12 + 62 + 1 + 5;
+  assert.equal(index[first + 62], 0);
+  assert.equal(index[second + 62], 1);
+  const refused = (data: Buffer, pattern: RegExp) => assert.throws(() => parseGitIndex(data, { maxEntries: 4 }), pattern);
+  refused(patched(index, b => { b[first + 62] = 1; }), /strip length exceeds/);
+  refused(patched(index, b => { b[second + 62] = 9; }), /strip length exceeds/);
+  refused(patched(index, b => { b[second + 62] = 0x80; }), /./);
+  refused(patched(index, b => { b[first + 62 + 1 + 4] = 0x61; }), /./);
+});
+
+it("index: a version 4 index Git wrote for the clone is proven", async () => {
+  command(clonePath, "update-index", "--index-version", "4");
+  assert.equal(parseGitIndex(fs.readFileSync(inClone(".git", "index")), { maxEntries: 100 }).version, 4);
+  assert.equal(await prove(), true);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Differential against this repository's own index.
+
+it("index parser agrees with git ls-files --stage on this repository's own index", t => {
+  const here = path.dirname(new URL(import.meta.url).pathname);
+  const top = spawnSync("git", ["-C", here, "rev-parse", "--show-toplevel"], { env: ENV, encoding: "utf8" });
+  if (top.status !== 0) { t.skip("not inside a git checkout: no repository index to compare"); console.log("SKIP: not inside a git checkout"); return; }
+  const root = top.stdout.trim();
+  for (let attempt = 0; ; attempt++) {
+    const where = execFileSync("git", ["-C", root, "rev-parse", "--git-path", "index"], { env: ENV, encoding: "utf8" }).trim();
+    const file = path.resolve(root, where);
+    const bytes = fs.readFileSync(file);
+    const listing = execFileSync("git", ["-C", root, "ls-files", "--stage", "-z"], { env: ENV, maxBuffer: 1 << 28 }).toString("latin1");
+    if (!bytes.equals(fs.readFileSync(file))) { assert.ok(attempt < 3, "the repository index kept changing"); continue; }
+    const parsed = parseGitIndex(bytes, { maxEntries: 5_000_000 }, "inspect");
+    if (parsed.extensions.includes("link")) { t.skip("split index: entries are partial"); return; }
+    const rows = listing.split("\0").filter(Boolean);
+    assert.equal(parsed.entries.length, rows.length);
+    for (const [i, row] of rows.entries()) {
+      const m = /^(\d{6}) ([0-9a-f]{40}) (\d)\t([\s\S]*)$/.exec(row)!;
+      const e = parsed.entries[i]!;
+      if (e.mode !== parseInt(m[1]!, 8) || e.sha !== m[2] || e.stage !== Number(m[3]) || !e.path.equals(Buffer.from(m[4]!, "latin1")))
+        assert.fail(`first mismatch at entry ${i}: ${e.path.toString("latin1").slice(0, 80)}`);
+    }
+    console.log(`checked ${rows.length} entries of ${file} (version ${parsed.version})`);
+    return;
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
+// Planted executing inputs and the launcher's environment.
+
+function markerScript(): { dir: string; marker: string; script: string } {
+  const dir = scratchDir("wt-exec-");
+  const marker = path.join(dir, "marker");
+  const script = path.join(dir, "run.sh");
+  fs.writeFileSync(script, `#!/bin/sh\necho ran >> '${marker}'\nprintf '\\0'\n`, { mode: 0o755 });
+  return { dir, marker, script };
+}
+
+it("a planted executing core.fsmonitor is refused, and the proof's own status launch never runs it", async t => {
+  const { marker, script } = markerScript();
+  const rec = recordLaunches(t);
+  assert.equal(await prove(), true);
+  const at = rec.launches.findIndex(l => l.sub === "status");
+  const launch = rec.launches[at]!, env = rec.envs[at]!;
+  command(clonePath, "config", "core.fsmonitor", script);
+  const future = new Date(Date.now() + 7200_000);
+  fs.utimesSync(inClone("README.md"), future, future);
+  spawnSync("git", ["-C", clonePath, "status", "--porcelain"], { env: { ...ENV, GIT_OPTIONAL_LOCKS: "0" } });
+  assert.equal(fs.existsSync(marker), true, "control: an unpinned status runs the fsmonitor script");
+  fs.rmSync(marker);
+  const result = spawnSync(launch.command, launch.args, { env });
+  assert.equal(result.status, 0, String(result.stderr));
+  assert.equal(fs.existsSync(marker), false, "the pinned launch must not run it");
+  const before = rec.launches.length;
+  assert.equal(await prove(), false);
+  assert.equal(rec.launches.slice(before).some(l => l.sub === "status"), false);
+  assert.equal(fs.existsSync(marker), false);
+});
+
+it("a planted executing core.hooksPath hook is refused and the proof's own status launch never runs it", async t => {
+  const { dir, marker } = markerScript();
+  const hooks = path.join(dir, "hooks");
+  fs.mkdirSync(hooks);
+  for (const hook of ["post-index-change", "fsmonitor-watchman", "pre-commit", "reference-transaction"])
+    fs.writeFileSync(path.join(hooks, hook), `#!/bin/sh\necho ran >> '${marker}'\n`, { mode: 0o755 });
+  for (const hook of ["post-index-change", "fsmonitor-watchman"])
+    fs.writeFileSync(inClone(".git", "hooks", hook), `#!/bin/sh\necho ran >> '${marker}'\n`, { mode: 0o755 });
+  const rec = recordLaunches(t);
+  assert.equal(await prove(), true);
+  assert.equal(fs.existsSync(marker), false, "a hook in the default hooks directory ran during the proof");
+  const at = rec.launches.findIndex(l => l.sub === "status");
+  const launch = rec.launches[at]!, env = rec.envs[at]!;
+  command(clonePath, "config", "core.hooksPath", hooks);
+  const future = new Date(Date.now() + 7200_000);
+  fs.utimesSync(inClone("README.md"), future, future);
+  const result = spawnSync(launch.command, launch.args, { env });
+  assert.equal(result.status, 0, String(result.stderr));
+  assert.equal(fs.existsSync(marker), false, "the pinned launch must not run a hook");
+  const before = rec.launches.length;
+  assert.equal(await prove(), false);
+  assert.equal(rec.launches.slice(before).some(l => l.sub === "status"), false);
+  assert.equal(fs.existsSync(marker), false);
+});
+
+it("a global or system config with include.path (naming a filter) is never read by any launch", async t => {
+  const dir = scratchDir("wt-global-");
+  const marker = path.join(dir, "marker");
+  const included = path.join(dir, "included");
+  const global = path.join(dir, "global");
+  fs.writeFileSync(included, `[filter "x"]\n\tclean = sh -c 'echo ran >> ${marker}; cat'\n[core]\n\thooksPath = ${dir}\n`);
+  fs.writeFileSync(global, `[include]\n\tpath = ${included}\n`);
+  const saved = { global: process.env.GIT_CONFIG_GLOBAL, system: process.env.GIT_CONFIG_SYSTEM };
+  process.env.GIT_CONFIG_GLOBAL = global;
+  process.env.GIT_CONFIG_SYSTEM = global;
+  try {
+    const rec = recordLaunches(t);
+    assert.equal(await prove(), true);
+    assert.ok(rec.envs.length >= 6);
+    for (const env of rec.envs) {
+      assert.equal(env.GIT_CONFIG_GLOBAL, "/dev/null");
+      assert.equal(env.GIT_CONFIG_SYSTEM, "/dev/null");
+      assert.equal(env.GIT_CONFIG_NOSYSTEM, "1");
+      assert.equal(env.HOME, "/");
+    }
+    // Control: with the file in the environment, git does read the include.
+    const listed = (env: NodeJS.ProcessEnv) => spawnSync("git", ["-C", clonePath, "config", "--list"], { env, encoding: "utf8" }).stdout;
+    assert.match(listed({ ...ENV, GIT_CONFIG_GLOBAL: global }), /filter\.x\.clean=/);
+    assert.doesNotMatch(listed({ ...rec.envs[1]!, PATH: process.env.PATH }), /filter\.x\.clean=|include\.path=/);
+    assert.equal(fs.existsSync(marker), false);
+  } finally {
+    for (const [key, value] of [["GIT_CONFIG_GLOBAL", saved.global], ["GIT_CONFIG_SYSTEM", saved.system]] as const) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
 });
