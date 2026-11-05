@@ -81,7 +81,7 @@ func TestPolicyHoldConvertedJournalReplayReceiptOnly(t *testing.T) {
 		{"original journal", func(_ *policyReplayTx, _ *PolicyHoldRequest) {}, "already_applied", ""},
 		{"conversion envelope", func(_ *policyReplayTx, r *PolicyHoldRequest) {
 			r.ClaimGeneration = 2
-			r.Detail = "resume_rejected"
+			r.Detail, r.Cause = "resume_rejected", "attempt_path"
 			r.PolicyTag, r.Phase, r.CorrelationID = nil, nil, nil
 		}, "already_applied", ""},
 		{"unrecorded worker", func(tx *policyReplayTx, _ *PolicyHoldRequest) {

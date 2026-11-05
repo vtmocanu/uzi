@@ -24,4 +24,16 @@ type PolicyHoldDTO struct {
 	Published          *bool      `json:"published"`
 	// Current unresolved hold only; later ordinary capture cannot rewrite policy history.
 	CapturedHead *string `json:"captured_head"`
+	// HoldCause is the closed reason the latest episode was held (refused, attempt_path,
+	// saved_work_missing, session_missing, transcript_unknown, provider_resume_rejected,
+	// pending_conversion, fresh_start_uncertain); null for an episode recorded before the field.
+	HoldCause *string `json:"hold_cause"`
+	// ResumeModes lists the owner resume modes this exact episode accepts right now. Empty (never
+	// null) unless the run is paused on an unresolved codex_policy_hold.
+	ResumeModes []string `json:"resume_modes"`
+	// RecoveryRequired is true when a required recovery head is recorded for the run.
+	RecoveryRequired bool `json:"recovery_required"`
+	// RecoveryVerifiedThisClaim is true when the worker holding the current claim generation has
+	// recorded verification of the required recovery head.
+	RecoveryVerifiedThisClaim bool `json:"recovery_verified_this_claim"`
 }

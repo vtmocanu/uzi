@@ -10,7 +10,7 @@ import (
 func policyHoldFixture() PolicyHoldRequest {
 	tag, phase, correlation := "cyberPolicy", "planning", "pr-00000000000000000000000000000000-1"
 	return PolicyHoldRequest{OutcomeID: uuid.NewString(), SourceGeneration: 1, ClaimGeneration: 1,
-		Detail: "refused", ContinuationMode: "same_conversation", PolicyTag: &tag, Phase: &phase, CorrelationID: &correlation}
+		Detail: "refused", Cause: "refused", ContinuationMode: "same_conversation", PolicyTag: &tag, Phase: &phase, CorrelationID: &correlation}
 }
 
 func TestPolicyHoldValidation(t *testing.T) {
@@ -32,6 +32,11 @@ func TestPolicyHoldValidation(t *testing.T) {
 		"future source":                func(r *PolicyHoldRequest) { r.SourceGeneration = 2 },
 		"unsafe generation":            func(r *PolicyHoldRequest) { r.ClaimGeneration = 9007199254740992 },
 		"unknown detail":               func(r *PolicyHoldRequest) { r.Detail = "failed" },
+		"missing cause":                func(r *PolicyHoldRequest) { r.Cause = "" },
+		"unknown cause":                func(r *PolicyHoldRequest) { r.Cause = "because" },
+		"refused cause on re-hold":     func(r *PolicyHoldRequest) { r.Detail = "resume_rejected" },
+		"re-hold cause on refusal":     func(r *PolicyHoldRequest) { r.Cause = "session_missing" },
+		"fresh start uncertain":        func(r *PolicyHoldRequest) { r.Detail, r.Cause = "resume_rejected", "fresh_start_uncertain" },
 		"unknown mode":                 func(r *PolicyHoldRequest) { r.ContinuationMode = "fresh" },
 		"missing tag":                  func(r *PolicyHoldRequest) { r.PolicyTag = nil },
 		"missing phase":                func(r *PolicyHoldRequest) { r.Phase = nil },
@@ -60,6 +65,7 @@ func TestPolicyHoldValidation(t *testing.T) {
 	}
 	r := policyHoldFixture()
 	r.Detail = "resume_rejected"
+	r.Cause = "attempt_path"
 	r.PolicyTag = nil
 	r.Phase = nil
 	r.CorrelationID = nil

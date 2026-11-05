@@ -159,6 +159,7 @@ import {
   type SpawnedBoundaryProcess,
 } from "./safety.js";
 import { bindCaptureLaunch, isCaptureRequest } from "../git.js";
+import { PolicyContinuationRejected } from "../provider-policy-refusal.js";
 import {
   CodexHarness,
   CodexResumeError,
@@ -5798,6 +5799,9 @@ export class CodexExecutor implements Executor {
           // A rejected thread/resume has started no model turn. The persisted rollout may
           // have disappeared or the provider may refuse it despite a successful preflight.
           if (!resumeId || !(error instanceof CodexResumeError)) throw error;
+          // A policy-held conversation never falls back: no lineage-break notice (no fresh admission
+          // happened) and no thread/start. The runner re-holds the run for its owner.
+          if (ctx.preserveConversation === true) throw new PolicyContinuationRejected("provider_resume_rejected");
           this.log.warn("codex provider rejected resumed thread; starting a fresh session", { run_id: ctx.runId });
           ctx.emit({ kind: "status", agent: "worker", payload: {
             text: "the earlier Codex session was rejected by the provider — continuing WITHOUT its earlier context, so some work may be repeated",
@@ -6622,6 +6626,10 @@ export class CodexExecutor implements Executor {
         ? { modelSource: "worker_default" as const }
         : {}),
       ...(resumeId !== undefined ? { resumeSessionId: resumeId } : {}),
+      // Every root lead request of a policy-held claim (epoch recreation, plan to implement, adoption of
+      // a fresh epoch, the rejected-resume retry) carries it, so the harness's one fresh-thread branch
+      // can refuse. Side passes never use this builder.
+      ...(ctx.preserveConversation === true ? { preserveConversation: true } : {}),
       ...(effort !== undefined ? { effort } : {}),
     };
     return request;

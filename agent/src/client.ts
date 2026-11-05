@@ -1,4 +1,8 @@
-import { validatePolicyHoldRequest, decodePolicyHoldReply, POLICY_HOLD_MAX_BYTES } from "./protocol.js";
+import {
+  validatePolicyHoldRequest, decodePolicyHoldReply, POLICY_HOLD_MAX_BYTES, normalizePolicyPreserveClaim,
+  validatePolicyRecoveryVerifiedRequest, decodePolicyRecoveryVerifiedReply, POLICY_RECOVERY_VERIFIED_MAX_BYTES,
+  type PolicyRecoveryVerifiedRequest, type PolicyRecoveryVerifiedReply,
+} from "./protocol.js";
 import { decodeCodexOperationDecision, validCodexOperationRequest } from "./codex-operation-admission.js";
 import type { CodexOperationRequest, CodexOperationDecision } from "./protocol.js";
 import { CodexAdmissionReporter } from "./codex/admission-signal.js";
@@ -2222,6 +2226,7 @@ export class WorkerClient {
       validateClaimMemory(claim);
       dropMalformedMemoryParkReference(claim, this.log);
       this.dropUnknownDefaultEffort(claim);
+      if (isRecord(claim)) normalizePolicyPreserveClaim(claim as unknown as Record<string, unknown>);
       if (isRecord(claim) && claim.inventory_guarded !== undefined &&
           (typeof claim.inventory_guarded !== "boolean" ||
            (claim.inventory_guarded === true &&
@@ -2600,6 +2605,22 @@ export class WorkerClient {
     if (res.status !== 200 && res.status !== 409) throw await this.toError("POST", path, res);
     const reply = decodePolicyHoldReply(JSON.parse(await readBoundedText(res, POLICY_HOLD_MAX_BYTES, true, signal)), request);
     if ((res.status === 409) !== (reply.disposition === "pending")) throw new Error("invalid policy hold HTTP disposition");
+    return reply;
+  }
+
+  /** One bounded attempt (the caller owns any retry). 409 is the typed `pending` disposition. The record
+   *  only enables a later server-side supersede; it never clears the preserve-only requirement. A lost
+   *  reply may still have committed the record, so whether a supersede is allowed depends only on the
+   *  server's own predicates, never on this worker having seen a confirmation; a new claim generation
+   *  re-verifies before any supersede. */
+  async reportPolicyRecoveryVerified(runId: string, body: PolicyRecoveryVerifiedRequest, signal?: AbortSignal): Promise<PolicyRecoveryVerifiedReply> {
+    const request = validatePolicyRecoveryVerifiedRequest(body);
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/policy-recovery-verified`;
+    const res = await this.fetchRaw("POST", path, request, this.httpTimeoutMs, signal);
+    if (res.status !== 200 && res.status !== 409) throw await this.toError("POST", path, res);
+    const reply = decodePolicyRecoveryVerifiedReply(
+      JSON.parse(await readBoundedText(res, POLICY_RECOVERY_VERIFIED_MAX_BYTES, true, signal)));
+    if ((res.status === 409) !== (reply.disposition === "pending")) throw new Error("invalid policy recovery verification HTTP disposition");
     return reply;
   }
 

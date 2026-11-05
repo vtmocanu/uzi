@@ -13,7 +13,7 @@ const run = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const body: PolicyHoldRequest = {
   outcome_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
   source_generation: 7, claim_generation: 7,
-  detail: "refused", continuation_mode: "same_conversation", published: false,
+  detail: "refused", cause: "refused", continuation_mode: "same_conversation", published: false,
   correlation_id: "pr-" + "a".repeat(32) + "-1", session_id: "session", tag: "cyberPolicy", phase: "implementation",
 };
 

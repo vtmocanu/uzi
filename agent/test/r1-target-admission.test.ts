@@ -401,7 +401,7 @@ for (const sourceKind of ["malformed", "signed policy"] as const) {
     if (sourceKind === "signed policy") {
       assert.equal((await writer.journalPolicyHold(run, {
         outcome_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", source_generation: 7, claim_generation: 7,
-        detail: "refused", continuation_mode: "same_conversation", tag: "cyberPolicy", phase: "implementation",
+        detail: "refused", cause: "refused", continuation_mode: "same_conversation", tag: "cyberPolicy", phase: "implementation",
         correlation_id: "pr-" + "a".repeat(32) + "-1", session_id: "session", head: "a".repeat(40),
         published: true, checkpoint_contains_latest: true,
       })).journaled, true);
@@ -460,7 +460,7 @@ it("R1 B1 a newly authenticated alias cannot replace an independent selected fil
   await fs.rename(source, parked);
   assert.equal((await writer.journalPolicyHold(run, {
     outcome_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", source_generation: 7, claim_generation: 7,
-    detail: "refused", continuation_mode: "same_conversation", tag: "cyberPolicy", phase: "implementation",
+    detail: "refused", cause: "refused", continuation_mode: "same_conversation", tag: "cyberPolicy", phase: "implementation",
     correlation_id: "pr-" + "a".repeat(32) + "-1", session_id: "session", head: "a".repeat(40),
     published: true, checkpoint_contains_latest: true,
   })).journaled, true);
@@ -509,7 +509,7 @@ it("R1 B1 live policy selection during intake authentication keeps its original 
   await fs.unlink(source);
   const policy = {
     outcome_id: id, source_generation: 7, claim_generation: 7,
-    detail: "refused" as const, continuation_mode: "same_conversation" as const,
+    detail: "refused" as const, cause: "refused" as const, continuation_mode: "same_conversation" as const,
     tag: "cyberPolicy" as const, phase: "implementation" as const,
     correlation_id: "pr-" + "a".repeat(32) + "-1", session_id: "session", head: "a".repeat(40),
     published: true, checkpoint_contains_latest: true,

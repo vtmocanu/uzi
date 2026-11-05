@@ -22,5 +22,26 @@ func policyHoldDTO(r store.Run) *apitypes.PolicyHoldDTO {
 		RefusalCount: int(r.PolicyRefusalCount), PolicyTag: textPtrValue(r.PolicyRefusalTag.Valid, r.PolicyRefusalTag.String),
 		Phase: textPtrValue(r.PolicyRefusalPhase.Valid, r.PolicyRefusalPhase.String), CorrelationID: textPtrValue(r.PolicyRefusalCorrelationID.Valid, r.PolicyRefusalCorrelationID.String),
 		Published: boolPtrValue(r.PolicyHoldPublished), CapturedHead: capturedHead,
+		HoldCause: textPtrValue(r.PolicyHoldCause.Valid, r.PolicyHoldCause.String), ResumeModes: policyResumeModes(r),
+		RecoveryRequired: r.PolicyRequiredHead.Valid,
+		RecoveryVerifiedThisClaim: r.PolicyRequiredHead.Valid && r.PolicyRecoveryVerifiedGeneration.Valid &&
+			r.PolicyRecoveryVerifiedGeneration.Int64 == r.ClaimGeneration &&
+			r.PolicyRecoveryVerifiedHead.Valid && r.PolicyRecoveryVerifiedHead.String == r.PolicyRequiredHead.String,
 	}
+}
+
+// policyResumeModes names the owner actions the exact held episode accepts. Only the shipped modes
+// appear: the lane decides which one, and any other state offers none.
+func policyResumeModes(r store.Run) []string {
+	modes := []string{}
+	if r.Status != "paused" || r.HoldReason.String != "codex_policy_hold" || r.PolicyResolvedAt.Valid {
+		return modes
+	}
+	switch r.PolicyContinuationMode.String {
+	case "fresh_from_saved_work":
+		modes = append(modes, "fresh_from_saved_work")
+	case "same_conversation":
+		modes = append(modes, "preserve")
+	}
+	return modes
 }

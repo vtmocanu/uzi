@@ -2196,7 +2196,7 @@ async function r1LateEvidence(outbox: Outbox, mode: typeof r1Modes[number], curr
   if (mode === "empty") return;
   const result = await outbox.journalPolicyHold(mode.startsWith("same") ? current : "cccccccc-cccc-4ccc-8ccc-cccccccccccc", {
     outcome_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", source_generation: 1, claim_generation: 1,
-    detail: "refused", continuation_mode: "same_conversation", published: false,
+    detail: "refused", cause: "refused", continuation_mode: "same_conversation", published: false,
     tag: "cyberPolicy", phase: "implementation", correlation_id: "pr-" + "a".repeat(32) + "-1",
   });
   assert.equal(result.journaled, false);

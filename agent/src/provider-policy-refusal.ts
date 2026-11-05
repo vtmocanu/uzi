@@ -71,6 +71,25 @@ export function policyRefusalMessage(tag: PolicyRefusalTag): string {
   return `Codex provider safety-policy refusal (${tag})`;
 }
 
+/** Why a preserve-only continuation could not proceed. Each maps 1:1 onto the policy-hold report cause. */
+export type PolicyContinuationCause = "attempt_path" | "saved_work_missing" | "session_missing"
+  | "transcript_unknown" | "provider_resume_rejected";
+
+/** A preserve-only claim could not continue the earlier conversation (or its saved work). Typed so the
+ *  runner re-holds the run for its owner instead of failing it or starting a fresh conversation. Carries
+ *  only the closed cause, never provider text. */
+export class PolicyContinuationRejected extends Error {
+  override readonly cause: PolicyContinuationCause;
+  /** True when the claim decided this before any model work (clone admission), so there is nothing new to capture. */
+  readonly beforeModelWork: boolean;
+  constructor(cause: PolicyContinuationCause, beforeModelWork = false) {
+    super(`policy-held conversation cannot be continued (${cause})`);
+    this.name = "PolicyContinuationRejected";
+    this.cause = cause;
+    this.beforeModelWork = beforeModelWork;
+  }
+}
+
 /** Neutral typed failure: only validated worker metadata, never provider message fields. */
 export class ProviderPolicyRefusal extends Error {
   readonly policyRefusal: PolicyRefusalPayload;

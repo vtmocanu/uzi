@@ -7,6 +7,7 @@
       "source_generation": 1,
       "claim_generation": 1,
       "detail": "refused",
+      "cause": "refused",
       "continuation_mode": "same_conversation",
       "tag": "cyberPolicy",
       "phase": "planning",
@@ -22,6 +23,7 @@
       "source_generation": 1,
       "claim_generation": 1,
       "detail": "refused",
+      "cause": "refused",
       "continuation_mode": "same_conversation",
       "tag": "cyberPolicy",
       "phase": "planning",
@@ -39,6 +41,7 @@
       "source_generation": 1,
       "claim_generation": 1,
       "detail": "refused",
+      "cause": "refused",
       "continuation_mode": "same_conversation",
       "tag": "cyberPolicy",
       "phase": "planning",
@@ -57,6 +60,7 @@
       "source_generation": 1,
       "claim_generation": 3,
       "detail": "resume_rejected",
+      "cause": "attempt_path",
       "continuation_mode": "fresh_from_saved_work",
       "published": false
     }
@@ -69,6 +73,7 @@
       "source_generation": 1,
       "claim_generation": 1,
       "detail": "refused",
+      "cause": "refused",
       "continuation_mode": "same_conversation",
       "tag": "cyberPolicy",
       "phase": "planning",
@@ -84,6 +89,7 @@
       "source_generation": 1,
       "claim_generation": 9007199254740992,
       "detail": "refused",
+      "cause": "refused",
       "continuation_mode": "same_conversation",
       "tag": "cyberPolicy",
       "phase": "planning",
@@ -99,6 +105,7 @@
       "source_generation": 2,
       "claim_generation": 1,
       "detail": "refused",
+      "cause": "refused",
       "continuation_mode": "same_conversation",
       "tag": "cyberPolicy",
       "phase": "planning",
@@ -114,6 +121,7 @@
       "source_generation": 1,
       "claim_generation": 1,
       "detail": "refused",
+      "cause": "refused",
       "continuation_mode": "fresh",
       "tag": "cyberPolicy",
       "phase": "planning",
@@ -129,6 +137,7 @@
       "source_generation": 1,
       "claim_generation": 1,
       "detail": "refused",
+      "cause": "refused",
       "continuation_mode": "same_conversation",
       "tag": "cyberPolicy",
       "phase": "planning",
@@ -144,6 +153,7 @@
       "source_generation": 1,
       "claim_generation": 1,
       "detail": "refused",
+      "cause": "refused",
       "continuation_mode": "same_conversation",
       "tag": "cyberPolicy",
       "phase": "planning",
@@ -160,6 +170,7 @@
       "source_generation": 1,
       "claim_generation": 1,
       "detail": "refused",
+      "cause": "refused",
       "continuation_mode": "same_conversation",
       "tag": "cyberPolicy",
       "phase": "planning",
@@ -175,6 +186,7 @@
       "source_generation": 1,
       "claim_generation": 1,
       "detail": "refused",
+      "cause": "refused",
       "continuation_mode": "same_conversation",
       "tag": "cyberPolicy",
       "phase": "planning",
@@ -190,6 +202,7 @@
       "source_generation": 1,
       "claim_generation": 1,
       "detail": "refused",
+      "cause": "refused",
       "continuation_mode": "same_conversation",
       "tag": "cyberPolicy",
       "phase": "planning",
@@ -206,6 +219,7 @@
       "source_generation": 1,
       "claim_generation": 1,
       "detail": "refused",
+      "cause": "refused",
       "continuation_mode": "same_conversation",
       "tag": "cyberPolicy",
       "phase": "planning",
@@ -221,6 +235,7 @@
       "source_generation": 1,
       "claim_generation": 1,
       "detail": "refused",
+      "cause": "refused",
       "continuation_mode": "same_conversation",
       "tag": "cyberPolicy",
       "phase": "planning",
@@ -237,6 +252,7 @@
       "source_generation": 1,
       "claim_generation": 1,
       "detail": "refused",
+      "cause": "refused",
       "continuation_mode": "same_conversation",
       "tag": "cyberPolicy",
       "phase": "planning",
@@ -253,6 +269,7 @@
       "source_generation": 1,
       "claim_generation": 1,
       "detail": "refused",
+      "cause": "refused",
       "continuation_mode": "same_conversation",
       "tag": "cyberPolicy",
       "phase": "planning",
@@ -269,6 +286,7 @@
       "source_generation": 1,
       "claim_generation": 1,
       "detail": "refused",
+      "cause": "refused",
       "continuation_mode": "same_conversation",
       "tag": null,
       "phase": "planning",
@@ -284,6 +302,7 @@
       "source_generation": 1,
       "claim_generation": 1,
       "detail": "refused",
+      "cause": "refused",
       "continuation_mode": "same_conversation",
       "tag": "cyberPolicy",
       "phase": null,
@@ -299,6 +318,7 @@
       "source_generation": 1,
       "claim_generation": 1,
       "detail": "refused",
+      "cause": "refused",
       "continuation_mode": "same_conversation",
       "tag": "cyberPolicy",
       "phase": "planning",
@@ -314,6 +334,7 @@
       "source_generation": 1,
       "claim_generation": 1,
       "detail": "refused",
+      "cause": "refused",
       "continuation_mode": "same_conversation",
       "tag": "cyberPolicy",
       "phase": "planning",
@@ -330,6 +351,7 @@
       "source_generation": 1,
       "claim_generation": 1,
       "detail": "refused",
+      "cause": "refused",
       "continuation_mode": "same_conversation",
       "tag": "cyberPolicy",
       "phase": "planning",
@@ -344,6 +366,7 @@
       "source_generation": 1,
       "claim_generation": 1,
       "detail": "refused",
+      "cause": "refused",
       "continuation_mode": "same_conversation",
       "Tag": "cyberPolicy",
       "phase": "planning",
@@ -359,6 +382,7 @@
       "source_generation": 1,
       "claim_generation": 3,
       "detail": "resume_rejected",
+      "cause": "attempt_path",
       "continuation_mode": "fresh_from_saved_work",
       "published": false,
       "tag": null
@@ -372,6 +396,7 @@
       "source_generation": 1,
       "claim_generation": 1,
       "detail": "refused",
+      "cause": "refused",
       "continuation_mode": "same_conversation",
       "tag": "cyberPolicy",
       "phase": "planning",
@@ -389,6 +414,7 @@
       "source_generation": 1,
       "claim_generation": 1,
       "detail": "refused",
+      "cause": "refused",
       "continuation_mode": "same_conversation",
       "tag": "cyberPolicy",
       "phase": "planning",
@@ -405,6 +431,7 @@
       "source_generation": 1,
       "claim_generation": 1,
       "detail": "refused",
+      "cause": "refused",
       "continuation_mode": "same_conversation",
       "tag": "cyberPolicy",
       "phase": "planning",
@@ -421,6 +448,7 @@
       "source_generation": 1,
       "claim_generation": 1,
       "detail": "refused",
+      "cause": "refused",
       "continuation_mode": "same_conversation",
       "tag": "cyberPolicy",
       "phase": "planning",
@@ -437,12 +465,158 @@
       "source_generation": 1,
       "claim_generation": 1,
       "detail": "refused",
+      "cause": "refused",
       "continuation_mode": "same_conversation",
       "tag": "cyberPolicy",
       "phase": "planning",
       "correlation_id": "pr-00000000000000000000000000000000-1",
       "published": false,
       "session_id": "\\ud800"
+    }
+  },
+  {
+    "name": "re-hold session missing",
+    "valid": true,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 3,
+      "detail": "resume_rejected",
+      "cause": "session_missing",
+      "continuation_mode": "same_conversation",
+      "published": false
+    }
+  },
+  {
+    "name": "re-hold saved work missing",
+    "valid": true,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 3,
+      "detail": "resume_rejected",
+      "cause": "saved_work_missing",
+      "continuation_mode": "same_conversation",
+      "published": false
+    }
+  },
+  {
+    "name": "re-hold transcript unknown",
+    "valid": true,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 3,
+      "detail": "resume_rejected",
+      "cause": "transcript_unknown",
+      "continuation_mode": "same_conversation",
+      "published": false
+    }
+  },
+  {
+    "name": "re-hold provider resume rejected",
+    "valid": true,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 3,
+      "detail": "resume_rejected",
+      "cause": "provider_resume_rejected",
+      "continuation_mode": "same_conversation",
+      "published": false
+    }
+  },
+  {
+    "name": "re-hold pending conversion",
+    "valid": true,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 3,
+      "detail": "resume_rejected",
+      "cause": "pending_conversion",
+      "continuation_mode": "fresh_from_saved_work",
+      "published": false
+    }
+  },
+  {
+    "name": "cause missing",
+    "valid": false,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 3,
+      "detail": "resume_rejected",
+      "continuation_mode": "same_conversation",
+      "published": false
+    }
+  },
+  {
+    "name": "cause unknown",
+    "valid": false,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 3,
+      "detail": "resume_rejected",
+      "cause": "because",
+      "continuation_mode": "same_conversation",
+      "published": false
+    }
+  },
+  {
+    "name": "cause refused with resume_rejected detail",
+    "valid": false,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 3,
+      "detail": "resume_rejected",
+      "cause": "refused",
+      "continuation_mode": "same_conversation",
+      "published": false
+    }
+  },
+  {
+    "name": "cause re-hold with refused detail",
+    "valid": false,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 1,
+      "detail": "refused",
+      "cause": "session_missing",
+      "continuation_mode": "same_conversation",
+      "published": false,
+      "tag": "cyberPolicy",
+      "phase": "planning",
+      "correlation_id": "pr-00000000000000000000000000000000-1"
+    }
+  },
+  {
+    "name": "cause fresh_start_uncertain not shipped",
+    "valid": false,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 3,
+      "detail": "resume_rejected",
+      "cause": "fresh_start_uncertain",
+      "continuation_mode": "same_conversation",
+      "published": false
+    }
+  },
+  {
+    "name": "cause null",
+    "valid": false,
+    "body": {
+      "outcome_id": "11111111-1111-4111-8111-111111111111",
+      "source_generation": 1,
+      "claim_generation": 3,
+      "detail": "resume_rejected",
+      "continuation_mode": "same_conversation",
+      "published": false,
+      "cause": null
     }
   }
 ]

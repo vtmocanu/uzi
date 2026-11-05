@@ -44,7 +44,7 @@ describe("policy admission on every production claim", () => {
   });
   const original: PolicyHoldRequest = {
     outcome_id: "22222222-2222-4222-8222-222222222222", source_generation: 1, claim_generation: 1,
-    detail: "refused", continuation_mode: "same_conversation", published: false,
+    detail: "refused", cause: "refused", continuation_mode: "same_conversation", published: false,
     tag: "cyberPolicy", phase: "implementation", correlation_id: "pr-" + "b".repeat(32) + "-1",
     session_id: "original-session",
   };
@@ -86,7 +86,7 @@ describe("policy admission on every production claim", () => {
     await runner.execute(claim);
     assert.equal(models, 0);
     assert.deepEqual(packets.at(-1), {
-      outcome_id: original.outcome_id, source_generation: 1, claim_generation: 3, detail: "resume_rejected",
+      outcome_id: original.outcome_id, source_generation: 1, claim_generation: 3, detail: "resume_rejected", cause: "pending_conversion" as const,
       continuation_mode: attempt ? "fresh_from_saved_work" : "same_conversation", published: false,
     });
     assert.equal(states.length, 0, "admission latch suppresses ordinary running and session-drop writes");
@@ -121,7 +121,7 @@ describe("policy admission on every production claim", () => {
     assert.equal(await fs.readFile(path.join(clone.path, "retained.txt"), "utf8"), "keep this work");
     assert.deepEqual(packets.at(-1), {
       outcome_id: original.outcome_id, source_generation: 1, claim_generation: 3,
-      detail: "resume_rejected", continuation_mode: "fresh_from_saved_work", published: false,
+      detail: "resume_rejected", cause: "pending_conversion" as const, continuation_mode: "fresh_from_saved_work", published: false,
     });
     assert.deepEqual((await outbox.readTerminalJournal(claim.run_id, 1))?.body, original);
     const after = await git.discoverRetainedRecovery(fx.originPath, clone.branch, "issue-3707", claim.run_id);

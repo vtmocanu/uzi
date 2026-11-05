@@ -552,7 +552,7 @@ describe("R1 policy reconciliation precedes memory continuation classification",
       await outbox.init();
       const original: PolicyHoldRequest = {
         outcome_id: "22222222-2222-4222-8222-222222222222", source_generation: 7, claim_generation: 7,
-        detail: "refused", continuation_mode: "same_conversation", published: false,
+        detail: "refused", cause: "refused", continuation_mode: "same_conversation", published: false,
         tag: "cyberPolicy", phase: "implementation", correlation_id: "pr-" + "b".repeat(32) + "-1",
       };
       await outbox.journalPolicyHold(p.f.claim.run_id, original);
@@ -570,7 +570,7 @@ describe("R1 policy reconciliation precedes memory continuation classification",
       assert.ok(packets.length > 1, "policy reconciliation ran after establishing custody, even for a held source");
       assert.deepEqual(packets.at(-1), {
         outcome_id: original.outcome_id, source_generation: 7, claim_generation: 8,
-        detail: "resume_rejected", continuation_mode: "fresh_from_saved_work", published: false,
+        detail: "resume_rejected", cause: "pending_conversion" as const, continuation_mode: "fresh_from_saved_work", published: false,
       }, "retained custody reconciles the original outcome under the current claim");
       assertNothingDone(c.counters);
       assert.equal(c.counters.reports, cleared && !heldSource ? 1 : 0);
@@ -606,7 +606,7 @@ it("policy feature loss sends nothing and retains memory predecessor protection"
   await outbox.init();
   const original: PolicyHoldRequest = {
     outcome_id: "22222222-2222-4222-8222-222222222222", source_generation: 7, claim_generation: 7,
-    detail: "refused", continuation_mode: "same_conversation", published: false,
+    detail: "refused", cause: "refused", continuation_mode: "same_conversation", published: false,
     tag: "cyberPolicy", phase: "implementation", correlation_id: "pr-" + "b".repeat(32) + "-1",
   };
   await outbox.journalPolicyHold(p.f.claim.run_id, original);
