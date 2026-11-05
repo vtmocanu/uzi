@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync, type SpawnOptions } from "node:child_process";
 import { createHash } from "node:crypto";
 import type { PodEpochReclaimScope } from "../templates/pod-epoch-init.cjs";
 import { formatAttemptId } from "../src/attempt-path.js";
@@ -28,6 +28,7 @@ const PINS = [
   "core.fileMode=true", "core.ignoreCase=false", "core.untrackedCache=false", "core.attributesFile=/dev/null",
   "core.autocrlf=false", "core.eol=lf", "core.safecrlf=false", "core.symlinks=true", "core.sparseCheckout=false",
   "index.sparse=false", "core.splitIndex=false", "core.preloadIndex=false", "core.bigFileThreshold=1m",
+  "core.hooksPath=/dev/null", "diff.external=/bin/false",
 ];
 let fx: Fixture;
 let git: GitCache;
@@ -104,9 +105,13 @@ type Limits = { maxMetadataRecords?: number; maxMetadataBytes?: number };
 async function prove(limits: Limits = {}): Promise<boolean> {
   const proof = git.createEpochDiscardProof(input);
   return git["epochRetained"].run(git["epochLimits"](limits), () =>
-    git["withEpochNativeReads"](proof, () => git["worktreeCleanHardened"](clonePath, { roots: [], checkLive: () => {},
+    git["withEpochNativeReads"](proof, async () => {
       // The stage requires the object-store observation to have run; this stage-alone helper stands in for it.
-      objectCoverage: async () => true, finalStoreCheck: async () => {} })));
+      const automatic = { roots: [], checkLive: () => {}, objectCoverage: async () => true, finalStoreCheck: async () => {} };
+      // ... and the Node-only shape stage, which the full proof runs before any Git launch.
+      if (!await git["automaticCloneShape"](clonePath, automatic)) return false;
+      return git["worktreeCleanHardened"](clonePath, automatic);
+    }));
 }
 /** The whole automatic content proof (object stores included). */
 async function observation(limits: Limits = {}): Promise<boolean> {
@@ -124,9 +129,31 @@ function subcommand(args: string[]): string {
   }
   return "";
 }
-/** Records every native launch (argv before the launcher's own pins) and its audited environment. */
-function recordLaunches(t: TestContext) {
+interface Spawned { command: string; args: string[]; env: NodeJS.ProcessEnv; sub: string }
+/**
+ * Records every native launch (argv before the launcher's own pins) and its audited environment.
+ * With `spawns`, it also records the argv and environment the child process really received, after
+ * the launcher spliced its pins in.
+ */
+function recordLaunches(t: TestContext, spawns = false) {
   const launches: Launch[] = [], envs: NodeJS.ProcessEnv[] = [];
+  const spawned: Spawned[] = [];
+  if (spawns) {
+    (git as unknown as { epochNativeTestDependencies?: unknown }).epochNativeTestDependencies = {
+      spawn: ((cmd: string, args: string[], opts: SpawnOptions) => {
+        spawned.push({ command: cmd, args: [...args], env: { ...opts.env }, sub: subcommand(args) });
+        return spawn(cmd, args, opts);
+      }) as typeof spawn,
+      alive: (pid: number) => {
+        try { process.kill(-pid, 0); return true; }
+        catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
+      },
+      kill: (pid: number) => {
+        try { process.kill(-pid, "SIGKILL"); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+      },
+      joinMs: 2_000,
+    };
+  }
   const exec = git["execEpochNative"].bind(git);
   t.mock.method(git as unknown as { execEpochNative: typeof exec }, "execEpochNative", async (...a: Parameters<typeof exec>) => {
     launches.push({ command: a[0], args: [...a[1]], sub: subcommand(a[1]) });
@@ -135,7 +162,7 @@ function recordLaunches(t: TestContext) {
   const preflight = git["preflightEpochNative"].bind(git);
   t.mock.method(git as unknown as { preflightEpochNative: typeof preflight }, "preflightEpochNative",
     (...a: Parameters<typeof preflight>) => { const env = preflight(...a); envs.push(env); return env; });
-  return { launches, envs, count: (sub: string) => launches.filter(l => l.sub === sub).length };
+  return { launches, envs, spawned, count: (sub: string) => launches.filter(l => l.sub === sub).length };
 }
 type Recorder = ReturnType<typeof recordLaunches>;
 function assertNoGit(rec: Recorder): void {
@@ -151,9 +178,9 @@ function assertNoContentRead(rec: Recorder): void {
  * `status` launch from a real, pinned `ls-files` launch (same pins, same audited environment).
  */
 function pinnedStatus(rec: Recorder): { command: string; args: string[]; env: NodeJS.ProcessEnv } {
-  const at = rec.launches.findIndex(l => l.sub === "ls-files");
-  const launch = rec.launches[at]!;
-  return { command: launch.command, env: { ...rec.envs[at]! },
+  // Environment-hardening control: the argv and environment are those the child really received.
+  const launch = rec.spawned.find(l => l.sub === "ls-files")!;
+  return { command: launch.command, env: { ...launch.env },
     args: [...launch.args.slice(0, launch.args.indexOf("ls-files")), "status", "--porcelain"] };
 }
 
@@ -373,10 +400,10 @@ function filterRun(t: TestContext, channel: "worktree" | "tracked" | "attr.tree"
   const attributes = path.join(dir, "attributes");
   fs.writeFileSync(inClone("tracked.txt"), "tracked\n");
   commitAll("tracked");
-  const rec = recordLaunches(t);
+  const rec = recordLaunches(t, true);
   return (async () => {
     // The real status launch of a pristine clone supplies the exact argv and environment.
-    assert.equal(await prove(), true);
+    assert.equal(await observation(), true);
     const { env, ...launch } = pinnedStatus(rec);
     const rule = "tracked.txt filter=x\n";
     if (channel === "worktree") fs.writeFileSync(inClone(".gitattributes"), rule);
@@ -404,7 +431,7 @@ function filterRun(t: TestContext, channel: "worktree" | "tracked" | "attr.tree"
     fs.rmSync(marker, { force: true });
     if (channel === "info") {
       // No pin reaches `.git/info/attributes`; the shape gate refuses its presence instead.
-      assert.equal(await prove(), false);
+      assert.equal(await observation(), false);
       assert.equal(rec.launches.length, launched, "refused before any launch");
       return { naive, pinned: fs.existsSync(marker) };
     }
@@ -729,7 +756,7 @@ function plainRepo(): { repo: string; index: Buffer } {
     { mode: "160000", sha: "1".repeat(40), path: Buffer.from("sub") },
     { mode: "100644", sha, path: Buffer.from([0x66, 0xff, 0x6f]) },
     { mode: "100644", sha, path: Buffer.from([0xe2, 0x82]) },
-    ...[4094, 4095, 4096, 5000].map(n => ({ mode: "100644", sha, path: pathOfLength(n) })),
+    ...[4094, 4095, 4096].map(n => ({ mode: "100644", sha, path: pathOfLength(n) })),
   ]);
   return { repo, index: readIndex(repo) };
 }
@@ -828,7 +855,10 @@ it("index parser refuses each hostile shape in strict mode and names the reason"
     refused(withExtension(index, signature, Buffer.from("data")), /unsupported index extension/);
   refused(reseal(Buffer.concat([body(index), Buffer.from("TREE"), Buffer.from([0, 0, 1, 0])])), /extension length/);
   refused(reseal(Buffer.concat([body(index), Buffer.from("TRE")])), /truncated index extension/);
-  parseGitIndex(withExtension(withExtension(index, "EOIE", Buffer.alloc(24)), "IEOT", Buffer.alloc(12)), { maxEntries: 100 });
+  // EOIE and IEOT are never validated by this parser, so strict mode does not admit them (inspect still walks them).
+  refused(withExtension(index, "EOIE", Buffer.alloc(24)), /unsupported index extension EOIE/);
+  refused(withExtension(index, "IEOT", Buffer.alloc(12)), /unsupported index extension IEOT/);
+  assert.deepEqual(parseGitIndex(withExtension(index, "EOIE", Buffer.alloc(24)), { maxEntries: 100 }, "inspect").extensions, ["EOIE"]);
   parseGitIndex(withExtension(withExtension(index, "TREE", Buffer.alloc(3)), "REUC"), { maxEntries: 100 });
 });
 
@@ -860,7 +890,7 @@ it("readBoundedIndex reads one regular file within its byte bound and refuses li
   fs.writeFileSync(file, index);
   const read = await readBoundedIndex(file, { maxBytes: index.length, maxEntries: 100 });
   assert.equal(read.size, index.length);
-  assert.equal(read.entries.length, 11);
+  assert.equal(read.entries.length, 10);
   assert.match(read.signature, /^\d+:\d+:\d+:\d+:\d+:\d+$/);
   await assert.rejects(readBoundedIndex(file, { maxBytes: index.length - 1, maxEntries: 100 }),
     error => error instanceof GitIndexError && error.kind === "limit");
@@ -1189,8 +1219,8 @@ function markerScript(): { dir: string; marker: string; script: string } {
 
 it("a planted executing core.fsmonitor is refused, and the proof's own status launch never runs it", async t => {
   const { marker, script } = markerScript();
-  const rec = recordLaunches(t);
-  assert.equal(await prove(), true);
+  const rec = recordLaunches(t, true);
+  assert.equal(await observation(), true);
   const { env, ...launch } = pinnedStatus(rec);
   command(clonePath, "config", "core.fsmonitor", script);
   const future = new Date(Date.now() + 7200_000);
@@ -1202,7 +1232,7 @@ it("a planted executing core.fsmonitor is refused, and the proof's own status la
   assert.equal(result.status, 0, String(result.stderr));
   assert.equal(fs.existsSync(marker), false, "the pinned launch must not run it");
   const before = rec.launches.length;
-  assert.equal(await prove(), false);
+  assert.equal(await observation(), false);
   assert.equal(rec.launches.slice(before).some(l => l.sub === "status"), false);
   assert.equal(fs.existsSync(marker), false);
 });
@@ -1215,8 +1245,8 @@ it("a planted executing core.hooksPath hook is refused and the proof's own statu
     fs.writeFileSync(path.join(hooks, hook), `#!/bin/sh\necho ran >> '${marker}'\n`, { mode: 0o755 });
   for (const hook of ["post-index-change", "fsmonitor-watchman"])
     fs.writeFileSync(inClone(".git", "hooks", hook), `#!/bin/sh\necho ran >> '${marker}'\n`, { mode: 0o755 });
-  const rec = recordLaunches(t);
-  assert.equal(await prove(), true);
+  const rec = recordLaunches(t, true);
+  assert.equal(await observation(), true);
   assert.equal(fs.existsSync(marker), false, "a hook in the default hooks directory ran during the proof");
   const { env, ...launch } = pinnedStatus(rec);
   command(clonePath, "config", "core.hooksPath", hooks);
@@ -1226,7 +1256,7 @@ it("a planted executing core.hooksPath hook is refused and the proof's own statu
   assert.equal(result.status, 0, String(result.stderr));
   assert.equal(fs.existsSync(marker), false, "the pinned launch must not run a hook");
   const before = rec.launches.length;
-  assert.equal(await prove(), false);
+  assert.equal(await observation(), false);
   assert.equal(rec.launches.slice(before).some(l => l.sub === "status"), false);
   assert.equal(fs.existsSync(marker), false);
 });
@@ -1242,10 +1272,10 @@ it("a global or system config with include.path (naming a filter) is never read 
   process.env.GIT_CONFIG_GLOBAL = global;
   process.env.GIT_CONFIG_SYSTEM = global;
   try {
-    const rec = recordLaunches(t);
-    assert.equal(await prove(), true);
-    assert.ok(rec.envs.length >= 6);
-    for (const env of rec.envs) {
+    const rec = recordLaunches(t, true);
+    assert.equal(await observation(), true);
+    assert.ok(rec.spawned.length >= 6);
+    for (const { env } of rec.spawned) {
       assert.equal(env.GIT_CONFIG_GLOBAL, "/dev/null");
       assert.equal(env.GIT_CONFIG_SYSTEM, "/dev/null");
       assert.equal(env.GIT_CONFIG_NOSYSTEM, "1");
@@ -1356,11 +1386,11 @@ it("F3: an info/exclude rule beyond the worker baseline is refused before check-
   fs.appendFileSync(inClone(".git", "info", "exclude"), "*\n");
   fs.writeFileSync(inClone("work.txt"), "unsaved work\n");
   const rec = recordLaunches(t);
-  assert.equal(await prove(), false);
+  assert.equal(await observation(), false);
   assertNoGit(rec);
   for (const rule of ["!keep", "/.uzi/scratch", " /.uzi/scratch/", "# ok\r\nfoo", "\0"]) {
     fs.writeFileSync(inClone(".git", "info", "exclude"), `# seeded\n\n/.uzi/scratch/\n${rule}\n`);
-    assert.equal(await prove(), false, JSON.stringify(rule));
+    assert.equal(await observation(), false, JSON.stringify(rule));
   }
   assertNoGit(rec);
 });

@@ -1334,13 +1334,17 @@ const EPOCH_EMPTY_TREE_OID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 /** Config overrides carried by every clone-side native read of the automatic worktree proof
  *  (`core.worktree=<clone>` is added per launch). They outrank every config file the clone's
  *  agent can write. Shared by the launcher and by `preflightEpochNative`'s admission, which
- *  permits exactly these `-c` values (plus `core.worktree`) but does not require them: the
- *  launcher is what carries every pin on each launch. */
+ *  permits exactly these `-c` values (plus `core.worktree`). `execEpochNative` splices every one of
+ *  them (and `--attr-source`) into every Git launch of the epoch native scope, bare reads included,
+ *  and `requireEpochNativePins` refuses a launch that lacks one. */
 const EPOCH_CLONE_READ_PINS: readonly string[] = [
   "core.fsmonitor=false", "core.excludesFile=/dev/null", "core.trustctime=true", "core.checkStat=default",
   "core.fileMode=true", "core.ignoreCase=false", "core.untrackedCache=false", "core.attributesFile=/dev/null",
   "core.autocrlf=false", "core.eol=lf", "core.safecrlf=false", "core.symlinks=true", "core.sparseCheckout=false",
   "index.sparse=false", "core.splitIndex=false", "core.preloadIndex=false", "core.bigFileThreshold=1m",
+  // No hook directory and no external diff driver: neither is reachable from an admitted
+  // subcommand, so these are belt and braces for any future widening of the admitted shapes.
+  "core.hooksPath=/dev/null", "diff.external=/bin/false",
 ];
 /**
  * The only keys the automatic worktree proof admits in a runner clone's `.git/config`. This is
@@ -2509,6 +2513,12 @@ interface AutomaticPreservation {
   owedBytes?: number;
   finalStoreCheck?: () => Promise<void>;
   objectCoverage?: (head: string) => Promise<boolean>;
+  /** Stage one of the worktree proof ({@link GitCache.automaticCloneShape}); set before any Git launch. */
+  shape?: AutomaticCloneShape;
+}
+interface AutomaticCloneShape {
+  ctx: ReturnType<GitCache["automaticProofContext"]>;
+  index: BoundedIndex;
 }
 
 export interface RetainedDiscardOptions {
@@ -3179,6 +3189,8 @@ export class GitCache {
     allowedIndices?: Set<string>;
     configMutation?: readonly string[];
     beforeLaunch?: () => Promise<void>;
+    /** Whether the installed Git takes `--attr-source`; set by the automatic proof before its first read. */
+    attrSource?: boolean;
   }>();
   private epochSettlementFault?: (step: string) => Promise<void>;
   private epochNativeTestDependencies?: {
@@ -3293,7 +3305,32 @@ export class GitCache {
       GIT_SHALLOW_FILE: "/dev/null", GIT_GRAFT_FILE: "/dev/null",
       // No system gitattributes; with --attr-source and core.attributesFile pinned, no attribute
       // source remains that could name a clean filter.
-      GIT_ATTR_NOSYSTEM: "1" };
+      GIT_ATTR_NOSYSTEM: "1", GIT_CONFIG_NOSYSTEM: "1" };
+  }
+
+  /** The `-c` pins every Git launch of the epoch native scope carries; `core.worktree` only for a clone-side read. */
+  private epochNativePins(cwd: string | undefined, state: { paths: readonly string[] }): string[] {
+    return [...EPOCH_CLONE_READ_PINS, ...(cwd !== undefined && cwd === state.paths[0] ? [`core.worktree=${cwd}`] : [])];
+  }
+
+  /** Refuse a spliced Git launch that lacks any pin, `--attr-source` included once Git is known to take it. */
+  private requireEpochNativePins(args: string[], gitPosition: number,
+    state: { paths: readonly string[]; attrSource?: boolean }, bareSubcommand: boolean): void {
+    const global = args.slice(gitPosition);
+    const cwd = global[0] === "-C" ? global[1] : undefined;
+    const have = new Set<string>();
+    for (let i = 0; i < global.length; i++) if (global[i] === "-c") have.add(global[i + 1]!);
+    const missing = this.epochNativePins(cwd, state).filter(pin => !have.has(pin));
+    if (missing.length || state.attrSource === true && !bareSubcommand &&
+        !global.includes(`--attr-source=${EPOCH_EMPTY_TREE_OID}`))
+      throw new Error("epoch native read lacks its pins");
+  }
+
+  /** `git version` is the one launch that cannot carry `--attr-source` (older Git rejects the option). */
+  private async epochGitSupportsAttrSource(): Promise<boolean> {
+    const version = await this.execScoped("git", ["version"], { env: gitEnv(), timeout: 10_000 });
+    const parts = /^git version (\d+)\.(\d+)/.exec(version.stdout);
+    return !!parts && !(Number(parts[1]) < 2 || Number(parts[1]) === 2 && Number(parts[2]) < 40);
   }
 
   private async execEpochNative(
@@ -3312,6 +3349,13 @@ export class GitCache {
       args = [...args];
       const gitPosition = command === GIT_BIN ? 0 : runnerCommand(GIT_BIN, []).args.length;
       const position = gitPosition + (args[gitPosition] === "-C" ? 2 : 0);
+      const versionOnly = args[position] === "version" || args[position] === "--version";
+      const cwd = args[gitPosition] === "-C" ? args[gitPosition + 1] : undefined;
+      const present = new Set(args.flatMap((arg, i) => arg === "-c" ? [args[i + 1]!] : []));
+      const attr = `--attr-source=${EPOCH_EMPTY_TREE_OID}`;
+      args.splice(position, 0, ...(state.attrSource === true && !versionOnly && !args.includes(attr) ? [attr] : []),
+        ...this.epochNativePins(cwd, state).filter(pin => !present.has(pin)).flatMap(pin => ["-c", pin]));
+      this.requireEpochNativePins(args, gitPosition, state, versionOnly);
       args.splice(position, 0, "-c", "core.multiPackIndex=false", "-c", "core.commitGraph=false",
         "-c", "pack.writeReverseIndex=false", "-c", "pack.readReverseIndex=false",
         "-c", "pack.useBitmaps=false", "-c", "pack.threads=1", "-c", "index.threads=1",
@@ -10962,6 +11006,11 @@ export class GitCache {
           await read(() => fs.realpath(cwd)) !== cwd ||
           await read(() => fs.realpath(path.join(cwd, ".git"))) !== path.join(cwd, ".git") ||
           !await standalone()) return false;
+      // Node-only shape checks first: no Git may launch in a clone whose `.git` was not typed and bounded.
+      if (!await this.automaticCloneShape(cwd, automatic)) return false;
+      const native = this.epochNative.getStore()!;
+      native.attrSource = await read(() => this.epochGitSupportsAttrSource());
+      if (!native.attrSource) return false;
       automatic.objectCoverage = await this.automaticObserveStores(epoch.barePath, cwd, automatic);
       // Resolve the trusted default using the existing lookup, but reject its HEAD-only fallback.
       const db = await read(() => this.defaultBranchName(epoch.barePath));
@@ -11583,61 +11632,11 @@ export class GitCache {
     }
   }
 
-  /**
-   * The automatic epoch worktree proof: is the clone's tracked and untracked non-ignored state
-   * provably empty, without letting Git be the first reader of anything unbounded or hostile?
-   *
-   * Git's own `status` hashes any stat-dirty or racily-clean tracked file, runs clean filters named
-   * by attributes, reads ignore files and `.gitattributes`, detects renames by reading blobs and
-   * follows a split index, `commondir` and the clone's config. So everything that can steer or
-   * enlarge that work is bounded and typed here in Node FIRST, on raw-byte paths, and a failure
-   * keeps the source before any Git command runs:
-   *  0. `.git` is a real directory whose every top-level entry is on an allowlist (see
-   *     `EPOCH_GIT_DIR_FILES`/`EPOCH_GIT_DIR_DIRECTORIES`; no `commondir`, `modules`, `reftable`,
-   *     `sharedindex.*`, sequencer or merge/rebase state) and typed, `info` holds only `exclude`;
-   *     the files are regular and charged; `HEAD` is a small regular file naming a branch ref (or
-   *     an object id) and that loose ref, when present, a small regular file holding an object id;
-   *  1. `.git/index` is read once through a bounded descriptor and parsed ({@link readBoundedIndex}:
-   *     SHA-1, version 2, 3 or 4, no link/sdir/UNTR/FSMN extension, no assume-valid, skip-worktree,
-   *     intent-to-add, staged or odd-mode entry);
-   *  1b. `.git/config` is read in Node and refused if it names an include (Git opens include
-   *     targets at startup); `.git/info/exclude` is read in Node and must hold only the worker-source
-   *     baseline; `.git/objects/info` holds at most `alternates`, `packs` and `commit-graph` (typed
-   *     and charged) and a `commit-graphs` directory (typed only);
-   *  2. every tracked path (and each of its directories) is lstat'd by raw bytes and must have
-   *     the type its mode names; regular sizes and link lengths are charged to the worktree-content
-   *     counter; every tracked regular file and symlink is hashed here as a Git blob (never more
-   *     bytes than were charged) and compared with its index entry, and the owner execute bit must
-   *     match the mode, so the index's forgeable stat cache is never trusted; a gitlink keeps the
-   *     empty-directory rule; each tracked directory is listed under a cumulative entry cap;
-   * and only then Git runs, every launch carrying the attribute/config pins and
-   * `GIT_ATTR_NOSYSTEM`: a version check, the clone's config (strict key allowlist), the untracked
-   * listing (no exclude option; an untracked `.gitignore`, `.gitattributes` or `.gitmodules` is a
-   * keep), `check-ignore` of that listing (the ignored set must equal it), and `ls-tree -r` of HEAD
-   * compared exactly with the parsed index entries (the index-versus-HEAD half, which `status`
-   * would answer from a forgeable cache-tree). There is no `status` launch. Finally the index and
-   * every recorded path are re-read: a change is a keep.
-   *
-   * Three counters stay distinct so their limits can be set independently later: `metadataBytes`
-   * (config, index, exclude, packed-refs and every Git output; limit `maxMetadataBytes`),
-   * `pathRecords` (index entries, directory entries, untracked records; each limited to
-   * `maxMetadataRecords`) and `worktreeContentBytes` (tracked regular sizes and link lengths;
-   * limit currently `maxMetadataBytes`).
-   *
-   * Outcome: every failure here, an exceeded bound included, returns `false`. An exceeded bound is
-   * thrown internally as {@link AutomaticCompletenessUnknown} and a hostile or unsupported source
-   * as {@link AutomaticContentRefusal}, but this method's catch converts both to `false`, so the
-   * discard core records `epoch_content_unproven` (a settled keep that does not stop the epoch
-   * scope). Only the object-store observation lets AutomaticCompletenessUnknown escape to the
-   * discard's `unknown` outcome.
-   */
-  private async worktreeProvenCleanAutomatic(cwd: string, automatic: AutomaticPreservation): Promise<boolean> {
+  /** Counters, charge helpers and typed-read helpers shared by the two stages of the automatic worktree proof. */
+  private automaticProofContext(automatic: AutomaticPreservation) {
     const read = <T>(action: () => Promise<T>) => this.automaticPreservationRead(automatic, action);
     const limits = this.epochRetained.getStore();
     if (!limits || !this.epochNative.getStore()) throw new Error("automatic worktree proof outside the epoch native scope");
-    // The object-store observation (which sets both) must already have run: it is what makes the
-    // clone's object stores and alternates safe for the Git launches below. Not established: keep.
-    if (!automatic.objectCoverage || !automatic.finalStoreCheck) return false;
     const refusal = (why: string) => new AutomaticContentRefusal(why);
     const unknown = (why: string) => new AutomaticCompletenessUnknown(why);
     const counters = { metadataBytes: 0, worktreeContentBytes: 0,
@@ -11668,8 +11667,23 @@ export class GitCache {
         }
       } finally { await handle.close(); }
     };
-    const steersGit = (name: string) => name === ".gitignore" || name === ".gitattributes" || name === ".gitmodules";
+    return { read, limits, refusal, unknown, counters, chargeMetadata, chargeContent, chargeRecords, fixed, remember,
+      lstatPath, listDirectory };
+  }
+
+  /**
+   * Stage one of the automatic worktree proof: everything that needs no Git. The shape of `.git`
+   * (allowlist, typed and charged), its config bytes, exclude rules, `objects/info`, HEAD and the
+   * loose ref, and the bounded index parse. It runs BEFORE any Git launch of the automatic content
+   * proof ({@link automaticContentPreserved}), so a hostile FIFO or oversized file is refused by
+   * type or size before Git can open, hang on or read it. The result is kept in `automatic.shape`
+   * for {@link worktreeProvenCleanAutomatic}, which keeps the final re-check. False is a settled keep.
+   */
+  private async automaticCloneShape(cwd: string, automatic: AutomaticPreservation): Promise<boolean> {
     try {
+      const ctx = this.automaticProofContext(automatic);
+      const { read, limits, refusal, unknown, counters, chargeMetadata, chargeRecords, fixed, remember, lstatPath,
+        listDirectory } = ctx;
       // 0. Shape of `.git`.
       const gitDir = path.join(cwd, ".git");
       if (!(await lstatPath(gitDir)).isDirectory()) throw refusal(".git is not a real directory");
@@ -11827,6 +11841,75 @@ export class GitCache {
       chargeMetadata(index.size, ".git/index");
       chargeRecords("index", index.entries.length, "index entry");
 
+      automatic.shape = { ctx, index };
+      return true;
+    } catch (err) {
+      this.log.debug("stopped source clone shape could not be proven", { cwd, error: gitErrorMessage(err) });
+      return false;
+    }
+  }
+
+
+  /**
+   * The automatic epoch worktree proof: is the clone's tracked and untracked non-ignored state
+   * provably empty, without letting Git be the first reader of anything unbounded or hostile?
+   *
+   * Git's own `status` hashes any stat-dirty or racily-clean tracked file, runs clean filters named
+   * by attributes, reads ignore files and `.gitattributes`, detects renames by reading blobs and
+   * follows a split index, `commondir` and the clone's config. So everything that can steer or
+   * enlarge that work is bounded and typed here in Node FIRST, on raw-byte paths, and a failure
+   * keeps the source before any Git command runs:
+   *  0. `.git` is a real directory whose every top-level entry is on an allowlist (see
+   *     `EPOCH_GIT_DIR_FILES`/`EPOCH_GIT_DIR_DIRECTORIES`; no `commondir`, `modules`, `reftable`,
+   *     `sharedindex.*`, sequencer or merge/rebase state) and typed, `info` holds only `exclude`;
+   *     the files are regular and charged; `HEAD` is a small regular file naming a branch ref (or
+   *     an object id) and that loose ref, when present, a small regular file holding an object id;
+   *  1. `.git/index` is read once through a bounded descriptor and parsed ({@link readBoundedIndex}:
+   *     SHA-1, version 2, 3 or 4, no link/sdir/UNTR/FSMN extension, no assume-valid, skip-worktree,
+   *     intent-to-add, staged or odd-mode entry);
+   *  1b. `.git/config` is read in Node and refused if it names an include (Git opens include
+   *     targets at startup); `.git/info/exclude` is read in Node and must hold only the worker-source
+   *     baseline; `.git/objects/info` holds at most `alternates`, `packs` and `commit-graph` (typed
+   *     and charged) and a `commit-graphs` directory (typed only);
+   *  2. every tracked path (and each of its directories) is lstat'd by raw bytes and must have
+   *     the type its mode names; regular sizes and link lengths are charged to the worktree-content
+   *     counter; every tracked regular file and symlink is hashed here as a Git blob (never more
+   *     bytes than were charged) and compared with its index entry, and the owner execute bit must
+   *     match the mode, so the index's forgeable stat cache is never trusted; a gitlink keeps the
+   *     empty-directory rule; each tracked directory is listed under a cumulative entry cap;
+   * and only then Git runs, every launch carrying the attribute/config pins and
+   * `GIT_ATTR_NOSYSTEM`: a version check, the clone's config (strict key allowlist), the untracked
+   * listing (no exclude option; an untracked `.gitignore`, `.gitattributes` or `.gitmodules` is a
+   * keep), `check-ignore` of that listing (the ignored set must equal it), and `ls-tree -r` of HEAD
+   * compared exactly with the parsed index entries (the index-versus-HEAD half, which `status`
+   * would answer from a forgeable cache-tree). There is no `status` launch. Finally the index and
+   * every recorded path are re-read: a change is a keep.
+   *
+   * Three counters stay distinct so their limits can be set independently later: `metadataBytes`
+   * (config, index, exclude, packed-refs and every Git output; limit `maxMetadataBytes`),
+   * `pathRecords` (index entries, directory entries, untracked records; each limited to
+   * `maxMetadataRecords`) and `worktreeContentBytes` (tracked regular sizes and link lengths;
+   * limit currently `maxMetadataBytes`).
+   *
+   * Outcome: every failure here, an exceeded bound included, returns `false`. An exceeded bound is
+   * thrown internally as {@link AutomaticCompletenessUnknown} and a hostile or unsupported source
+   * as {@link AutomaticContentRefusal}, but this method's catch converts both to `false`, so the
+   * discard core records `epoch_content_unproven` (a settled keep that does not stop the epoch
+   * scope). Only the object-store observation lets AutomaticCompletenessUnknown escape to the
+   * discard's `unknown` outcome.
+   */
+  private async worktreeProvenCleanAutomatic(cwd: string, automatic: AutomaticPreservation): Promise<boolean> {
+    // The object-store observation (which sets both) must already have run: it is what makes the
+    // clone's object stores and alternates safe for the Git launches below. Not established: keep.
+    // Likewise the clone shape (stage one) must have been proven before any Git launched.
+    if (!automatic.objectCoverage || !automatic.finalStoreCheck || !automatic.shape) return false;
+    const { ctx, index } = automatic.shape;
+    const { read, refusal, unknown, chargeMetadata, chargeContent, chargeRecords, fixed, remember, lstatPath,
+      listDirectory } = ctx;
+    const steersGit = (name: string) => name === ".gitignore" || name === ".gitattributes" || name === ".gitmodules";
+    const indexPath = path.join(cwd, ".git", "index");
+    try {
+
       // 2. Typed lstat of every tracked path by raw bytes, before any Git command.
       const slash = Buffer.from("/");
       const root = Buffer.from(cwd);
@@ -11936,10 +12019,9 @@ export class GitCache {
       }
 
       // From here Git runs. Every launch carries the attribute source and config pins.
-      const version = await read(() => this.execScoped("git", ["version"], { env: gitEnv(), timeout: 10_000 }));
-      const parts = /^git version (\d+)\.(\d+)/.exec(version.stdout);
-      if (!parts || Number(parts[1]) < 2 || Number(parts[1]) === 2 && Number(parts[2]) < 40)
-        throw unknown("git lacks --attr-source");
+      const native = this.epochNative.getStore()!;
+      native.attrSource ??= await read(() => this.epochGitSupportsAttrSource());
+      if (!native.attrSource) throw unknown("git lacks --attr-source");
       const pins = [`--attr-source=${EPOCH_EMPTY_TREE_OID}`,
         ...EPOCH_CLONE_READ_PINS.flatMap(pin => ["-c", pin]), "-c", `core.worktree=${cwd}`];
       const git = (args: string[], env: NodeJS.ProcessEnv, extra: { input?: Buffer; encoding?: "latin1" } = {}) =>
@@ -12046,6 +12128,8 @@ export class GitCache {
       // No `status` launch: worktree-versus-index was decided from the hashed bytes above.
 
       // Nothing we proved may have moved while Git ran.
+      // The second bounded read of the index is charged like the first.
+      chargeMetadata(index.size, ".git/index re-read");
       if (!(await indexUnchanged(indexPath, index, read))) throw unknown("index changed during the proof");
       for (const { target, signature } of fixed.values()) {
         if (statSignature(await lstatPath(target)) !== signature) throw unknown("worktree changed during the proof");

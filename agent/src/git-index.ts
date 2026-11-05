@@ -64,11 +64,11 @@ const FLAG_EXTENDED = 0x4000;
 const EXT_SKIP_WORKTREE = 0x4000;
 const EXT_INTENT_TO_ADD = 0x2000;
 /** Extensions that carry only derived caches; any other signature changes what Git would read. */
-const ALLOWED_EXTENSIONS: ReadonlySet<string> = new Set(["TREE", "REUC", "EOIE", "IEOT"]);
+const ALLOWED_EXTENSIONS: ReadonlySet<string> = new Set(["TREE", "REUC"]);
 const ALLOWED_MODES: ReadonlySet<number> = new Set([0o100644, 0o100755, 0o120000, 0o160000]);
 
-/** A path longer than this cannot exist; it also bounds each rebuilt version 4 name. */
-const MAX_V4_PATH = 4096;
+/** A path longer than this cannot exist; it bounds every index path of every version and each rebuilt version 4 name. */
+const MAX_INDEX_PATH = 4096;
 
 const refused = (message: string): never => { throw new GitIndexError("refused", message); };
 const limit = (message: string): never => { throw new GitIndexError("limit", message); };
@@ -131,14 +131,14 @@ export function parseGitIndex(buf: Buffer, limits: GitIndexLimits, policy: "stri
         if (at >= end) refused("truncated version 4 path");
         byte = buf[at++]!;
         strip = first ? byte & 0x7f : ((strip + 1) * 128) + (byte & 0x7f);
-        if (strip > MAX_V4_PATH) refused("version 4 strip length");
+        if (strip > MAX_INDEX_PATH) refused("version 4 strip length");
       }
       const previousName = previous ?? Buffer.alloc(0);
       if (strip > previousName.length) refused("version 4 strip length exceeds the previous path");
       const nul = buf.indexOf(0, at);
       if (nul < 0 || nul >= end) refused("unterminated index path");
       const keep = previousName.length - strip;
-      if (keep + (nul - at) > MAX_V4_PATH) refused("version 4 path exceeds PATH_MAX");
+      if (keep + (nul - at) > MAX_INDEX_PATH) refused("version 4 path exceeds PATH_MAX");
       name = Buffer.concat([previousName.subarray(0, keep), buf.subarray(at, nul)]);
       // Git sizes the entry from the flags' length field when it is not saturated, so a name
       // that disagrees would be walked differently by Git than by this parser.
@@ -155,6 +155,7 @@ export function parseGitIndex(buf: Buffer, limits: GitIndexLimits, policy: "stri
       } else if (nameOffset + nameLength >= end || buf[nameOffset + nameLength] !== 0) {
         refused("index path length");
       }
+      if (nameLength > MAX_INDEX_PATH) refused("index path exceeds PATH_MAX");
       name = Buffer.from(buf.subarray(nameOffset, nameOffset + nameLength));
       if (name.includes(0)) refused("index path contains NUL");
       size = (nameOffset + nameLength + 8 - p) & ~7;
@@ -206,6 +207,8 @@ export interface BoundedIndex extends ParsedGitIndex {
   signature: string;
   /** Bytes read; the caller charges them to its metadata budget. */
   size: number;
+  /** The exact image that was parsed, kept so {@link indexUnchanged} can compare a second read with it. */
+  bytes: Buffer;
 }
 
 type Step = <T>(action: () => Promise<T>) => Promise<T>;
@@ -239,7 +242,7 @@ export async function readBoundedIndex(file: string,
     if ((await step(() => handle.read(Buffer.alloc(1), 0, 1, size))).bytesRead !== 0) refused("index grew while reading");
     const after = await step(() => handle.stat({ bigint: true }));
     if (statSignature(after) !== statSignature(opened)) refused("index changed while reading");
-    return { ...parseGitIndex(buf, options), signature: statSignature(before), size };
+    return { ...parseGitIndex(buf, options), signature: statSignature(before), size, bytes: buf };
   } finally {
     await handle.close();
   }
@@ -276,18 +279,18 @@ export async function readSmallRegularFile(file: string, maxBytes: number,
   }
 }
 
-/** True only when the file still has the read signature and the same verified trailer. */
+/**
+ * True only when the file still has the read signature (dev, ino, mode, size, mtime, ctime) AND a
+ * second bounded read returns exactly the bytes the first read parsed. A trailer-only comparison
+ * would miss a rewrite that kept the trailer. The second read costs `original.size` bytes, which
+ * the caller must charge.
+ */
 export async function indexUnchanged(file: string, original: BoundedIndex, step: Step = direct): Promise<boolean> {
-  const st = await step(() => fs.lstat(file, { bigint: true }));
-  if (!st.isFile() || statSignature(st) !== original.signature) return false;
-  const handle = await step(() => fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK));
   try {
-    const opened = await step(() => handle.stat({ bigint: true }));
-    if (!opened.isFile() || statSignature(opened) !== original.signature) return false;
-    const tail = Buffer.alloc(TRAILER_BYTES);
-    const { bytesRead } = await step(() => handle.read(tail, 0, TRAILER_BYTES, original.size - TRAILER_BYTES));
-    return bytesRead === TRAILER_BYTES && tail.equals(original.trailer);
-  } finally {
-    await handle.close();
+    const again = await readSmallRegularFile(file, original.size, step);
+    return again.signature === original.signature && again.bytes.equals(original.bytes);
+  } catch (error) {
+    if (error instanceof GitIndexError) return false;
+    throw error;
   }
 }
