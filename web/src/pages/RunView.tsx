@@ -40,6 +40,7 @@ import { useNow } from "../lib/useNow";
 import { useMaintenance } from "../lib/useMaintenance";
 import { ForgeOriginStatus } from "../components/ForgeOriginStatus";
 import { forgeWaitMode, forgeWaitLabel, forgeWaitPhase, publicationHoldCopy } from "../lib/forgeCooldown";
+import { diskWaitMode, diskWaitLabel, diskWaitDescription } from "../lib/diskRecovery";
 import { credentialSwitchHold } from "../lib/credentialSwitchHold";
 import {
   effectiveRunStatus,
@@ -1495,13 +1496,11 @@ function codexHoldCopy(
  * is the scheduled fallback, and a worker still picks up the queued run.
  *
  * PRD #1809 M5: when the cause is `data_volume_full` (the worker's data volume is full or nearly
- * full) the panel renders DiskFullParkBody: waiting for disk space, the next retry time, and the
- * run's lifetime count of counted disk parks (`disk_park_count`), with a disk-specific footer.
+ * full) DiskFullParkBody distinguishes an explicit-null owner hold from a finite scheduled
+ * retry and unknown timing. The lifetime counted disk parks (`disk_park_count`) are retained.
  *
  * A null/other cause keeps the generic transient-interruption copy (issue #1197, widened
- * by issue #1088). The forge, vault and disk wording matches the TUI and `uzi run get`: the
- * same heading words ("waiting for the forge", "waiting for vault unlock", "waiting for disk
- * space"), with the vault retry fallback and disk retry time shown as local HH:MM.
+ * by issue #1088). The vault fallback and finite disk retry time are shown as local HH:MM.
  *
  * Exported like the sibling panels so its copy is reachable without mounting the page.
  */
@@ -1756,9 +1755,8 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
   // Issue #1766: a vault_locked park waits for the run owner's vault to be unlocked; it
   // explicit unlock queues it promptly, and the timer remains the fallback (#1792).
   const vaultPark = run.recovery_wait_cause === "vault_locked";
-  // PRD #1809 M5: a data_volume_full park waits for disk space on its worker; it resumes at
-  // its next retry while uzi frees space on that worker.
-  const diskPark = run.recovery_wait_cause === "data_volume_full";
+  const diskMode = diskWaitMode(run);
+  const diskPark = diskMode !== null;
   // PRD #1590 D6: a Codex account hold has its own copy and, unlike the forge park, NO
   // retry time or park count — the hold has no timer, so nothing may count down.
   const codexHold =
@@ -1794,7 +1792,7 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
               : vaultPark
                 ? "Waiting for vault unlock"
                 : diskPark
-                  ? "Waiting for disk space"
+                  ? diskWaitLabel(run)
                   : "Recovering and resuming automatically"}
         </p>
         {codexHold ? (
@@ -1848,7 +1846,7 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
         ) : vaultPark ? (
           <VaultLockedParkBody retryAt={retryAt} />
         ) : diskPark ? (
-          <DiskFullParkBody retryAt={retryAt} parkCount={run.disk_park_count ?? 0} />
+          <DiskFullParkBody run={run} retryAt={retryAt} ownerProof={ownerProof} busy={busy} onResume={onResume} onCancel={onCancel} />
         ) : (
           <>
             <p className="mt-0.5 text-xs text-muted">
@@ -1912,24 +1910,32 @@ function VaultLockedParkBody({ retryAt }: { retryAt: string | null }) {
   );
 }
 
-/**
- * PRD #1809 M5: the body of a `data_volume_full` recovery park. The worker's data volume is full
- * or nearly full (a park can be preventive, before the volume fills), uzi frees space on that
- * worker, and the run resumes at its next retry (`retryAt`,
- * HH:MM, or null when the server sent no stamp), the same words as `uzi run get` and the TUI.
- * `parkCount` is the run's lifetime count of COUNTED disk parks: preventive parks are not
- * counted, so it can read 0 across several parks. The server's cap on it is not on the DTO (and
- * can be disabled), so the copy hedges that the run can fail without naming a number.
- */
-function DiskFullParkBody({ retryAt, parkCount }: { retryAt: string | null; parkCount: number }) {
+// The lifetime counted parks remain historical across an owner-authorized attempt.
+function DiskFullParkBody({ run, retryAt, ownerProof, busy, onResume, onCancel }: {
+  run: Run; retryAt: string | null; ownerProof: boolean; busy: boolean;
+  onResume: () => void; onCancel: () => void;
+}) {
+  const mode = diskWaitMode(run);
   return (
     <>
-      <p className="mt-0.5 text-xs text-muted">
-        {`The worker's disk is full or nearly full. uzi frees space on the worker and the run resumes at its next retry${retryAt ? ` (${retryAt})` : ""}. No action is needed.`}
-      </p>
+      <p className="mt-0.5 text-xs text-muted">{diskWaitDescription(mode)}</p>
       <p className="mt-1.5 text-xs text-muted">
-        {`Counted disk parks so far: ${parkCount}. If the disk stays full, the run can fail after repeated counted parks.`}
+        {mode === "timed" && retryAt ? `Retry at ${retryAt}. ` : ""}
+        Counted disk parks so far: {run.disk_park_count ?? 0}. Resume does not reset this count.
       </p>
+      {mode === "held" && <>
+        <p className="mt-1.5 text-xs text-muted">
+          Resume permits one bounded ordinary attempt. Admission may refuse execution; there is no automatic retry of this owner action or loop waiting for capacity.
+        </p>
+        <p className="mt-1.5 text-xs text-muted">
+          Unpublished local work may be lost with the worker or if recovery cannot restore it. A pushed checkpoint may not contain the latest local edits.
+        </p>
+        {run.health_reason && <p className="mt-1.5 text-xs text-muted">Admission: {displayHealthReason(run)}</p>}
+        {ownerProof ? <div className="mt-3 flex flex-wrap gap-2">
+          <Button size="sm" disabled={busy} onClick={onResume}>Resume</Button>
+          <Button size="sm" variant="ghost" disabled={busy} onClick={onCancel}>Cancel</Button>
+        </div> : <p className="mt-1.5 text-xs text-muted">Only the confirmed run owner can Resume or Cancel.</p>}
+      </>}
     </>
   );
 }
@@ -2025,8 +2031,9 @@ export function RunView() {
   const policyPending = run != null && isPolicyPending(run);
   const policyBlocked = policyHeld || policyPending;
   const forgeHeld = run != null && forgeWaitMode(run) === "held";
+  const diskHeld = run != null && diskWaitMode(run) === "held";
   const iterationHeld = run?.status === "paused" && run.hold_reason === "iteration_budget_exhausted";
-  const ownerDecisionHold = policyBlocked || iterationHeld || forgeHeld || retainedRecovery || workerExhausted || memoryHeld || providerHeld || switchHeld;
+  const ownerDecisionHold = policyBlocked || iterationHeld || forgeHeld || diskHeld || retainedRecovery || workerExhausted || memoryHeld || providerHeld || switchHeld;
   const canSteer = optimisticCanSteer && (!ownerDecisionHold || confirmedOwner === true);
   const planCheckSeqs = useRef(new Map<string, number>());
   const planCheckRefresh = useRef<{ runId: string; busy: boolean; queued: boolean } | null>(null);
@@ -2133,7 +2140,7 @@ export function RunView() {
     setBusy(false);
   };
   const resumeWorkerHold = async () => {
-    if (!canSteer || !(forgeHeld || workerExhausted || memoryHeld || retainedRecovery) || run?.id !== id) return;
+    if (!canSteer || !(forgeHeld || diskHeld || workerExhausted || memoryHeld || retainedRecovery) || run?.id !== id || (diskHeld && currentAction.current !== null)) return;
     const requestRunId = id;
     const isCurrent = startAction();
     try {
@@ -2320,7 +2327,7 @@ export function RunView() {
     setDiscardOutcomeErr("");
   };
   const cancelRun = async (discardPendingOutcome = false): Promise<boolean> => {
-    if (ownerDecisionHold && !canSteer) return false;
+    if ((ownerDecisionHold && !canSteer) || (diskHeld && (run?.id !== id || currentAction.current !== null))) return false;
     const requestRunId = id;
     const isCurrent = startAction();
     // A fresh attempt clears the modal-local error so a stale reason never lingers under a retry.
@@ -2448,9 +2455,9 @@ export function RunView() {
                 run.recovery_wait_cause === "vault_locked"
                 ? "vault_locked"
                 : // PRD #1809 M5: a data_volume_full park waits on disk space, not a
-                  // transient interruption, so it gets its own stable key and sentence.
+                  // transient interruption. Timing mode changes re-announce the new state.
                   run.recovery_wait_cause === "data_volume_full"
-                  ? "data_volume_full"
+                  ? `disk:${diskWaitMode(run)}`
                   : run.recovery_wait_cause === "forge_unreachable"
                     ? forgeWaitPhase(run) === "publication"
                       ? `publication:${forgeWaitMode(run)}:${run.publication_hold_reason ?? ""}`
@@ -2526,8 +2533,8 @@ export function RunView() {
             ? "This run paused to recover from a transient interruption and will resume automatically."
             : parkKey === "vault_locked"
               ? "This run is waiting for vault unlock. The run owner's vault was locked when this Codex run needed its credential. The run owner's explicit vault unlock queues this run promptly; work resumes when a worker picks it up. The scheduled retry remains the fallback."
-            : parkKey === "data_volume_full"
-              ? "This run is waiting for disk space. The worker's disk is full or nearly full; uzi frees space on the worker and the run resumes at its next retry."
+            : parkKey.startsWith("disk:")
+              ? diskWaitDescription(parkKey.slice(5) as ReturnType<typeof diskWaitMode>)
             : parkKey.startsWith("codex:")
               ? codexHoldCopy(parkKey.slice("codex:".length) || null, "").announce
             : parkKey === "credential_disabled"
@@ -3369,7 +3376,7 @@ export function RunView() {
           nothing for every other kind. */}
       <JobResultPanel run={run} />
 
-      {(!(forgeHeld || workerExhausted || memoryHeld || retainedRecovery) || canSteer) && <RecoveryArchivesPanel run={run} />}
+      {(!(forgeHeld || diskHeld || workerExhausted || memoryHeld || retainedRecovery) || canSteer) && <RecoveryArchivesPanel run={run} />}
 
       {/* Checkpoint salvage (PRD #1867): the bounded archive copy of a failed run's last
           published checkpoint at refs/uzi-salvage/<run-id>. Renders only for a failed run

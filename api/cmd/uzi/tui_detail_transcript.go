@@ -447,6 +447,7 @@ func (m tuiModel) transcriptBudgetWithoutCard() int {
 	chrome := len(forgeRunLines(m.detail.run)) + len(workerExhaustionTUILines(m.detail.run)) + len(m.detailHeaderLines()) // the priority header: always 1 row (detailHeaderLines)
 	// Wrapped provider copy: each element is one physical row.
 	chrome += len(m.providerDetailLines())
+	chrome += len(m.diskHoldDetailLines())
 	chrome += len(m.iterationDetailLines())
 	providerHold := isProviderUnavailableHold(m.detail.run)
 	if limitWaitLine(m.detail.run, time.Now()) != "" ||

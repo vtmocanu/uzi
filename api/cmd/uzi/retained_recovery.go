@@ -86,6 +86,13 @@ func recoveryDecisionTUILines(r apitypes.RunDTO) []string {
 // even when status and cause have not changed.
 func workerHoldNoticeKey(r apitypes.RunDTO) string {
 	key := r.Status + "/" + strOr(r.HoldReason, "") + "/" + strOr(r.RecoveryWaitCause, "")
+	if isDiskFullPark(r) {
+		key += "/disk/" + itoa(int(diskWaitOf(r)))
+		if diskWaitOf(r) == diskWaitTimed {
+			key += "/" + r.RecoveryRetryNotBefore.UTC().Format(time.RFC3339Nano)
+		}
+		return key
+	}
 	if isRecoveryDecisionPark(r) || isForgePark(r) {
 		if isRecoveryDecisionHold(r) || isForgeOwnerHold(r) {
 			return key + "/held"

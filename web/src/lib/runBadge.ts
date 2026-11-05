@@ -14,6 +14,7 @@ import type {
   StopKind,
 } from "./apiTypes";
 import { forgeWaitLabel, forgeWaitMode, forgeWaitPhase } from "./forgeCooldown";
+import { diskWaitLabel, diskWaitMode, diskWaitDescription } from "./diskRecovery";
 import { isTerminalRun } from "./runStatus";
 import { credentialSwitchHold } from "./credentialSwitchHold";
 import { forgeNounSentence, forgeNounLower, forgePlatform } from "./forgeNoun";
@@ -185,6 +186,8 @@ const PARK_LABELS = {
 // completion hold (raw status "paused") and an exhausted recovery read as they do on the
 // status pill. An unlisted status falls back to its de-underscored enum, never "".
 export function parkLabel(run: Parameters<typeof effectiveRunStatus>[0]): string {
+  const disk = diskWaitLabel(run);
+  if (disk) return disk;
   const forge = forgeWaitLabel(run);
   if (forge) return forge;
   const eff = effectiveRunStatus(run);
@@ -704,6 +707,9 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
   if (isRejectedRun(run.status, run.fail_origin)) {
     return { kind: "badge", label: "rejected", tone: "neutral", pulse: false };
   }
+  const diskMode = diskWaitMode(run);
+  if (diskMode) return { kind: "badge", label: diskWaitLabel(run)!, tone: "warning", pulse: false,
+    title: diskWaitDescription(diskMode) };
   const forgeMode = forgeWaitMode(run);
   if (forgeMode) {
     if (forgeWaitPhase(run) === "publication") {

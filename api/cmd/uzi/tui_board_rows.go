@@ -629,6 +629,10 @@ func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
 	// bands into NEEDS YOU via runBandOf; its line keeps the wait ink). The line carries
 	// the owner's alias label (user-authored), folded through cellText by
 	// codexAccountActionLine and through renderer.Plain here (D7).
+	if isDiskOwnerHold(r.RunDTO) {
+		out := prefix + paintSeg(m.pal.amber, bg, false, "Disk held · Resume/Cancel · detail: enter")
+		return padSeg(clampVisual(out, m.width), m.width, bg)
+	}
 	if isForgeOwnerHold(r.RunDTO) {
 		hold := "Owner-held · Resume/Cancel · detail: enter"
 		if isPublicationPark(r.RunDTO) {

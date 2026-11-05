@@ -914,6 +914,20 @@ func (m tuiModel) providerDetailLines() []string {
 	return rows
 }
 
+// diskHoldDetailLines wraps owner guidance into physical rows, shared with the
+// transcript budget so narrow terminals keep their footer.
+func (m tuiModel) diskHoldDetailLines() []string {
+	var rows []string
+	for _, line := range diskHoldLines(m.detail.run) {
+		plain := m.renderer.Plain(line, len([]rune(line)))
+		wrapped := ansi.Hardwrap(ansi.Wrap(plain, max(1, m.width), " "), max(1, m.width), true)
+		for _, row := range strings.Split(wrapped, "\n") {
+			rows = append(rows, m.pal.state(crewWaiting).Render(row))
+		}
+	}
+	return rows
+}
+
 func (m tuiModel) renderDetail() string {
 	if m.detail.answer.open {
 		return m.renderAnswerDetail()
@@ -973,6 +987,10 @@ func (m tuiModel) renderDetail() string {
 	}
 	if line := fitDiskParkLine(d.run, m.width); line != "" {
 		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 240)), m.width) + "\n")
+	}
+
+	for _, line := range m.diskHoldDetailLines() {
+		sb.WriteString(line + "\n")
 	}
 
 	for _, line := range m.providerDetailLines() {

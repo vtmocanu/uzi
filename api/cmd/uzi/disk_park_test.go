@@ -26,7 +26,7 @@ func diskParkRun(id string) apitypes.RunDTO {
 }
 
 // TestDiskParkLine pins the shared sentence: the retry clause carries local HH:MM, the park
-// count reads "counted disk parks: N", the retry time is dropped without a stamp, and any other run
+// count reads "counted disk parks: N", missing timing is unknown, and any other run
 // (including a vault park) gets "". Reddening mutation: drop the count clause, or key
 // isDiskFullPark on the cause alone.
 func TestDiskParkLine(t *testing.T) {
@@ -40,8 +40,8 @@ func TestDiskParkLine(t *testing.T) {
 		t.Errorf("diskParkLine borrowed the forge cap: %q", diskParkLine(r))
 	}
 	r.RecoveryRetryNotBefore = nil
-	if got := diskParkLine(r); !strings.HasSuffix(got, "resumes at its next retry; counted disk parks: 2") {
-		t.Errorf("diskParkLine(no stamp) = %q, want the retry clause without a time", got)
+	if got := diskParkLine(r); !strings.HasSuffix(got, "retry timing unknown; counted disk parks: 2") {
+		t.Errorf("diskParkLine(no stamp) = %q, want unknown timing", got)
 	}
 	running := diskParkRun("r1")
 	running.Status = "running"
@@ -80,8 +80,8 @@ func TestFitDiskParkLine(t *testing.T) {
 		}
 	}
 	r.RecoveryRetryNotBefore = nil
-	if got := fitDiskParkLine(r, 30); got != "waiting for disk space" {
-		t.Errorf("fitDiskParkLine(no stamp, 30) = %q, want the bare lead", got)
+	if got := fitDiskParkLine(r, 30); got != "Disk wait · timing unknown" {
+		t.Errorf("fitDiskParkLine(no stamp, 30) = %q, want unknown timing", got)
 	}
 	if got := fitDiskParkLine(vaultParkRun("r2"), 200); got != "" {
 		t.Errorf("fitDiskParkLine(vault park) = %q, want \"\"", got)
@@ -92,10 +92,10 @@ func TestFitDiskParkLine(t *testing.T) {
 // Reddening mutation: drop the dataVolumeFullCause arm in steerState.
 func TestSteerStateDataVolumeFull(t *testing.T) {
 	consumed := time.Now()
-	if got, want := steerState(queuedIn(), statusRecoveryWait, dataVolumeFullCause), "queued (run waiting for disk space)"; got != want {
+	if got, want := steerState(queuedIn(), statusRecoveryWait, dataVolumeFullCause), "queued (run waiting for disk space; retry timing unknown)"; got != want {
 		t.Errorf("steerState(unconsumed, data_volume_full) = %q, want %q", got, want)
 	}
-	if got, want := steerState(receivedIn(consumed), statusRecoveryWait, dataVolumeFullCause), "received (run waiting for disk space)"; got != want {
+	if got, want := steerState(receivedIn(consumed), statusRecoveryWait, dataVolumeFullCause), "received (run waiting for disk space; retry timing unknown)"; got != want {
 		t.Errorf("steerState(consumed, data_volume_full) = %q, want %q", got, want)
 	}
 }
