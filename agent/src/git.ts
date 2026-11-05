@@ -3320,7 +3320,6 @@ export class GitCache {
     if (args.includes("config") && !args.includes("--no-includes")) {
       args = [...args]; args.splice(args.indexOf("config") + 1, 0, "--no-includes");
     }
-    if (args.includes("status")) args = args.map(v => v === "--ignore-submodules=none" ? "--ignore-submodules=all" : v);
     if ((command === "/bin/setpriv" && identity !== "command") ||
         (uidSplitActive() && identity === "command" && command !== "/bin/setpriv"))
       throw new Error("epoch native group identity mismatch");
@@ -11603,7 +11602,8 @@ export class GitCache {
    *     intent-to-add, staged or odd-mode entry);
    *  1b. `.git/config` is read in Node and refused if it names an include (Git opens include
    *     targets at startup); `.git/info/exclude` is read in Node and must hold only the worker-source
-   *     baseline; `.git/objects/info` holds at most `alternates` and `packs`, typed and charged;
+   *     baseline; `.git/objects/info` holds at most `alternates`, `packs` and `commit-graph` (typed
+   *     and charged) and a `commit-graphs` directory (typed only);
    *  2. every tracked path (and each of its directories) is lstat'd by raw bytes and must have
    *     the type its mode names; regular sizes and link lengths are charged to the worktree-content
    *     counter; every tracked regular file and symlink is hashed here as a Git blob (never more
@@ -11635,6 +11635,9 @@ export class GitCache {
     const read = <T>(action: () => Promise<T>) => this.automaticPreservationRead(automatic, action);
     const limits = this.epochRetained.getStore();
     if (!limits || !this.epochNative.getStore()) throw new Error("automatic worktree proof outside the epoch native scope");
+    // The object-store observation (which sets both) must already have run: it is what makes the
+    // clone's object stores and alternates safe for the Git launches below. Not established: keep.
+    if (!automatic.objectCoverage || !automatic.finalStoreCheck) return false;
     const refusal = (why: string) => new AutomaticContentRefusal(why);
     const unknown = (why: string) => new AutomaticCompletenessUnknown(why);
     const counters = { metadataBytes: 0, worktreeContentBytes: 0,
@@ -11728,7 +11731,7 @@ export class GitCache {
       };
       // Git opens every `include.path` target while it starts up in the clone, even for a read that
       // asks for no includes (a FIFO target hangs it, a huge one is read uncharged), so a config that
-      // names one is refused here, before any Git launch in the clone. The scan is deliberately
+      // names one is refused here, before any Git launch by this stage. The scan is deliberately
       // coarse: any `[include` section opener, in any case and spacing, anywhere in the file.
       const configBytes = (await readBounded(path.join(gitDir, "config"), true, ".git/config"))!;
       if (/\[\s*include/i.test(configBytes.toString("latin1"))) throw refusal("clone config names an include");
@@ -11773,7 +11776,7 @@ export class GitCache {
         }
       }
 
-      // HEAD names the one loose ref `status` and `ls-tree` resolve. Both it and that ref are
+      // HEAD names the one loose ref `ls-tree` resolves. Both it and that ref are
       // small regular files read here through a bounded descriptor; a symbolic indirection, a
       // link or a FIFO is a keep.
       const headFile = await readSmallRegularFile(path.join(gitDir, "HEAD"), EPOCH_REF_FILE_MAX_BYTES, read)
@@ -11900,12 +11903,30 @@ export class GitCache {
       // would read as an ignore, attributes or submodules file is seen even when `ls-files` omits
       // it (a FIFO, say). Only a tracked, already typed path may carry one of those names.
       const tracked = new Set(index.entries.map(entry => entry.path.toString("latin1")));
+      // Git's untracked listing probes every top-level untracked directory for a nested repository
+      // (it reads `<dir>/.git` as a gitfile, up to 1 MiB uncharged, and opens `<gitdir>/HEAD`, which
+      // blocks on a FIFO). So an untracked child directory that holds any `.git` entry, of any
+      // type, is refused here before the listing is launched; a `.git` inside a tracked directory
+      // other than the root is refused the same way. `--directory` does not descend further.
       for (const [key, rel] of ordered) {
+        const children: Buffer[] = [];
         await listDirectory(absolute(rel), name => {
           const text = name.toString("latin1");
-          if (steersGit(text) && !tracked.has(key === "" ? text : `${key}/${text}`))
-            throw refusal("untracked entry steers Git");
+          const childKey = key === "" ? text : `${key}/${text}`;
+          if (steersGit(text) && !tracked.has(childKey)) throw refusal("untracked entry steers Git");
+          if (text === ".git" && key !== "") throw refusal("nested .git entry");
+          if (!tracked.has(childKey) && !(key === "" && text === ".git")) children.push(Buffer.from(name));
         });
+        for (const name of children) {
+          const child = Buffer.concat([rel, rel.length ? slash : Buffer.alloc(0), name]);
+          chargeRecords("directory", 1, "nested repository probe");
+          const st = await lstatPath(absolute(child));
+          if (!st.isDirectory()) continue;
+          chargeRecords("directory", 1, "nested repository probe");
+          try { await lstatPath(Buffer.concat([absolute(child), slash, Buffer.from(".git")])); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+          throw refusal("untracked directory holds a .git entry");
+        }
       }
       for (const rel of gitlinks) {
         // The Buffer to string round trip must be exact: a lossy name could name another directory.

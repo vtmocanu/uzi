@@ -104,7 +104,9 @@ type Limits = { maxMetadataRecords?: number; maxMetadataBytes?: number };
 async function prove(limits: Limits = {}): Promise<boolean> {
   const proof = git.createEpochDiscardProof(input);
   return git["epochRetained"].run(git["epochLimits"](limits), () =>
-    git["withEpochNativeReads"](proof, () => git["worktreeCleanHardened"](clonePath, { roots: [], checkLive: () => {} })));
+    git["withEpochNativeReads"](proof, () => git["worktreeCleanHardened"](clonePath, { roots: [], checkLive: () => {},
+      // The stage requires the object-store observation to have run; this stage-alone helper stands in for it.
+      objectCoverage: async () => true, finalStoreCheck: async () => {} })));
 }
 /** The whole automatic content proof (object stores included). */
 async function observation(limits: Limits = {}): Promise<boolean> {
@@ -298,6 +300,58 @@ it("H3: an untracked .gitignore FIFO (invisible to ls-files) is refused without 
   const rec = recordLaunches(t);
   assert.equal(await prove(), false);
   assertNoGit(rec);
+});
+
+// Git probes every top-level untracked directory for a nested repository during `ls-files --others
+// --directory`: it reads `<dir>/.git` as a gitfile and opens `<gitdir>/HEAD`, which blocks on a FIFO.
+async function refusedPromptly(t: TestContext): Promise<void> {
+  const rec = recordLaunches(t);
+  const started = Date.now();
+  assert.equal(await prove(), false);
+  assert.ok(Date.now() - started < 10_000, "the refusal must not wait for Git");
+  assert.equal(rec.count("ls-files"), 0, "ls-files must not launch");
+  assertNoGit(rec);
+}
+
+it("N1: an untracked directory with a .git directory whose HEAD is a FIFO is refused without launching ls-files", async t => {
+  fs.mkdirSync(inClone("u", ".git", "objects"), { recursive: true });
+  fs.mkdirSync(inClone("u", ".git", "refs"));
+  mkfifo(inClone("u", ".git", "HEAD"));
+  await refusedPromptly(t);
+});
+
+it("N1b: an untracked directory whose gitfile points outside at a FIFO HEAD is refused without launching ls-files", async t => {
+  const outside = scratchDir("nested-gitdir-");
+  fs.mkdirSync(path.join(outside, "objects"));
+  fs.mkdirSync(path.join(outside, "refs"));
+  mkfifo(path.join(outside, "HEAD"));
+  fs.mkdirSync(inClone("v"));
+  fs.writeFileSync(inClone("v", ".git"), `gitdir: ${outside}\n`);
+  await refusedPromptly(t);
+});
+
+it("N2: 64 untracked directories each with a 1 MiB sparse .git file are refused without launching ls-files", async t => {
+  for (let i = 0; i < 64; i++) {
+    fs.mkdirSync(inClone(`s${i}`));
+    sparse(inClone(`s${i}`, ".git"), 1024 * 1024, "gitdir: x\n");
+  }
+  await refusedPromptly(t);
+});
+
+it("N3: a .git entry of any type inside a tracked non-root directory is refused without a launch", async t => {
+  fs.mkdirSync(inClone("dir", ".git"));
+  await refusedPromptly(t);
+});
+
+it("N4 (control): a nested repository two levels inside an untracked directory is not probed by ls-files, which the proof then expands and refuses", async t => {
+  fs.mkdirSync(inClone("u", "w", ".git", "objects"), { recursive: true });
+  fs.mkdirSync(inClone("u", "w", ".git", "refs"));
+  mkfifo(inClone("u", "w", ".git", "HEAD"));
+  const rec = recordLaunches(t);
+  const started = Date.now();
+  assert.equal(await prove(), false);
+  assert.ok(Date.now() - started < 10_000, "Git must not have opened the nested HEAD");
+  assert.equal(rec.count("ls-files"), 1);
 });
 
 for (const [name, file] of [[".gitattributes", ".gitattributes"], [".gitmodules", "dir/.gitmodules"], [".gitattributes", "dir/.gitattributes"]] as const) {
