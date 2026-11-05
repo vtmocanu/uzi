@@ -58,10 +58,9 @@ appears in `uzi run logs` and the terminal UI. It names one of four reasons:
 the credential needed a refresh that summaries may not do, the run owner's
 vault is locked, the run's Codex account is unavailable, or the provider
 rejected the credential. Only these four typed cases produce a line; a timeout,
-a network error, a refusal or an empty answer is still skipped silently, unless
-the call had already been refused a credential refresh, which reports that
-refresh. The
-line is informational: no summary is written, the run's outcome does not
+a network error, a refusal or an empty answer is still skipped silently; a
+network error or refusal after the call was refused a credential refresh reports
+that refresh instead. The line is informational: no summary is written, the run's outcome does not
 change, and the summary is not retried.
 
 Planning and seeded or pre-approved runs of all three kinds are eligible for

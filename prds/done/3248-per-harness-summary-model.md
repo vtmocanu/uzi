@@ -263,7 +263,7 @@ The note is `ctx.emit({ kind: "status", agent: "worker", payload: { text, event:
   Follow `TestPutMySettingsSummaryModelRoundTrip` and its siblings (`user_settings_test.go`). Update the contract fixtures.
 - **Store:** LiveDB round trip of the column, following `TestUserSummaryModelLiveDB`.
 - **Claim:**
-  - `TestClaimCarriesSummaryModelFromInstanceDefault`, `TestClaimSummaryModelUserOverrideWins` and `TestClaimOmitsSummaryModelWhenNoSettings` (`service_test.go`) stay green, repointed to `InstanceModel`.
+  - `TestClaimCarriesSummaryModelFromInstanceDefault`, `TestClaimSummaryModelUserOverrideWins` and `TestClaimOmitsSummaryModelWhenNoSettings` (`service_test.go`) stay green, repointed to `InstanceModel`. (Superseded for the nil-settings test, see D14.)
   - New Codex siblings. A Codex claim carries the user's `gpt-6-astra`, **watched red** on current code (it carries the Claude value).
   - A Claude claim with a legacy stored `gpt-6-sol` carries the instance value.
 - **Agent model selection** (`agent/test/summary-runner-codex.test.ts`): parametrize the Codex selection test over the claim `model` ∈ {absent, `gpt-6-astra`, a Claude alias, an unknown ID}.
