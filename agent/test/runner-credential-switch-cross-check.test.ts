@@ -36,7 +36,11 @@ beforeEach(() => {
 });
 // Prototype wrappers installed by watchSwitchDelivery are undone after every test.
 const restorers: (() => void)[] = [];
-afterEach(() => { while (restorers.length) restorers.pop()!(); });
+// Waits inside api-fake handlers must not outlive their test (they would poll the next test's api).
+let testOver = false;
+beforeEach(() => { testOver = false; });
+afterEach(() => { testOver = true; while (restorers.length) restorers.pop()!(); });
+const handlerWait = (pred: () => boolean): Promise<boolean> => until(() => testOver || pred());
 
 const PLAN = "# PLAN\n- local proposal";
 const NORMALIZED = "# PLAN\n- server normalized proposal";
@@ -272,9 +276,9 @@ async function drive(o: DriveOpts) {
         tl.events.push("switch-requested");
         if ((o.entry ?? "poll") === "poll") {
           api.requestCredentialSwitch(runId, 1);
-          assert.ok(await until(() => switchSeen.delivered), "the worker polled the switch while the checker is pending");
+          assert.ok(await handlerWait(() => switchSeen.delivered), "the worker polled the switch while the checker is pending");
           switchSeen.delivered = false;
-          assert.ok(await until(() => switchSeen.latched()), "the hold latched the switch");
+          assert.ok(await handlerWait(() => switchSeen.latched()), "the hold latched the switch");
         } else api.armStateAckCredentialSwitchOnce(runId, 1, "awaiting_approval");
         await o.afterSwitch?.(c);
       }
@@ -614,8 +618,8 @@ describe("issue #3953 m3: stash lifetime, ambiguous submit and pre-reserve switc
       if (latestCalls === 1) {
         tl.events.push("switch-requested");
         api.requestCredentialSwitch(runId, 2);
-        assert.ok(await until(() => switchSeen.delivered), "the worker polled the switch during discovery");
-        assert.ok(await until(() => switchSeen.trips > 0), "the channel tripped the switch (no hold is open yet)");
+        assert.ok(await handlerWait(() => switchSeen.delivered), "the worker polled the switch during discovery");
+        assert.ok(await handlerWait(() => switchSeen.trips > 0), "the channel tripped the switch (no hold is open yet)");
       }
       return { status: 200, body: { result: "no_row", round: 0, candidate_generation: 0,
         automatic_revision_limit: 0, automatic_rounds_enabled: false, next_round: 1, next_round_eligible: true, fallback_reason: "" } };
@@ -699,18 +703,38 @@ describe("issue #3953 m3: boundaries keep their dispositions; the latch is never
   const noSwitchReports = (runId: string) => assert.deepEqual(switchReports(runId), [], "no credential_switch report of any kind");
 
   for (const withSwitch of [false, true]) {
-    it(`an owner cancel during the hold (${withSwitch ? "then a switch" : "alone"}) ends the run as cancelled; nothing is stored`, { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
-      const d = await drive({ capture: "release", switchRounds: withSwitch ? [1] : [], duringPending: async (c) => {
-        const [cancel] = send(c.run_id, row("cancel"));
-        await routed(c.run_id, cancel!.id);
-      } });
+    it(`an owner cancel during the hold (${withSwitch ? "after the switch is latched" : "alone"}) ends the run as cancelled; nothing is stored`, { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+      const cancel = async (c: ReturnType<typeof claim>) => {
+        const [row0] = send(c.run_id, row("cancel"));
+        await routed(c.run_id, row0!.id);
+      };
+      // With a switch: it is requested first and latched under the hold, then the cancel is routed.
+      const d = await drive(withSwitch
+        ? { capture: "release", switchRounds: [1], afterSwitch: cancel }
+        : { capture: "release", switchRounds: [], duringPending: cancel });
       assert.deepEqual(d.storage, [], "no approval is stored after a cancel");
       assert.equal(d.counter.calls, 1);
       assert.ok(!statuses(d.c.run_id).includes("completed"));
-      failedWith(d.c.run_id, "run cancelled");
-      noSwitchReports(d.c.run_id);
-      assert.deepEqual(d.attempts, []);
-      assert.deepEqual(d.tl.events.filter((e) => e === "capture"), [], "the latch is never serviced");
+      if (!withSwitch) {
+        failedWith(d.c.run_id, "run cancelled");
+        noSwitchReports(d.c.run_id);
+        assert.deepEqual(d.attempts, []);
+        assert.deepEqual(d.tl.events.filter((e) => e === "capture"), [], "the latch is never serviced");
+        return;
+      }
+      // The switch was latched first (d.trace.requests === 1, before any terminal state): the cancel
+      // aborts the checker, a forced gate is presented, and the held switch is then serviced after the
+      // applied gate released the reservation. The switch wins, as it would without a hold (it trips at
+      // the poll); the routed cancel row is not applied, so the reclaim still sees it.
+      const ev = d.tl.events;
+      assert.equal(d.trace.requests, 1);
+      assert.ok(ev.indexOf("switch-requested") >= 0 && ev.indexOf("switch-requested") < ev.indexOf("state:awaiting_approval"));
+      assert.ok(!statuses(d.c.run_id).includes("failed"), JSON.stringify(statuses(d.c.run_id)));
+      assert.deepEqual(switchReports(d.c.run_id), ["credential_switch"]);
+      assert.equal((gates(d.c.run_id) as PlanCrossCheckStateRequest[])[0]!.plan_cross_check_gate_reason, "checker_failed");
+      assert.ok(ev.indexOf("capture") > ev.indexOf("release"), `no capture while the reservation is installed: ${JSON.stringify(ev)}`);
+      const cancelRow = api.inputRows(d.c.run_id).find((r) => r.kind === "cancel")!;
+      assert.equal(api.isApplied(d.c.run_id, cancelRow.id), false, "the cancel stays for the reclaim");
     });
   }
 
@@ -985,8 +1009,8 @@ describe("issue #3953 m3: semantic coverage forces a human gate after the checke
       const { stage: _stage, claim_generation: _generation, round = 1, ...candidate } = body;
       events.push("switch-requested");
       api.requestCredentialSwitch(runId, 1);
-      assert.ok(await until(() => switchSeen.delivered), "the worker polled the switch while the checker is pending");
-      assert.ok(await until(() => switchSeen.latched()), "the hold latched the switch");
+      assert.ok(await handlerWait(() => switchSeen.delivered), "the worker polled the switch while the checker is pending");
+      assert.ok(await handlerWait(() => switchSeen.latched()), "the hold latched the switch");
       const identity = server.compiled().candidate;
       return { status: 200, body: {
         result: "candidate", round, checker_run_id: child, candidate_digest: identity.digest, candidate_generation: 1,
