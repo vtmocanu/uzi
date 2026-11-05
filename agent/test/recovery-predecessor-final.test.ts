@@ -1195,3 +1195,82 @@ it("an explicit closure budget is used by identity and clamped to the cache's de
     assert.equal(small.limit, 10, "a lower limit is kept");
   } finally { await fs.rm(data, { recursive: true, force: true }); }
 });
+
+// ── M1 rework round 2 ──────────────────────────────────────────────────────────────────────────────────────────
+
+it("two operations sharing one allowance cannot both charge it: the late re-check refuses the second", async () => {
+  const a = await harness(), b = await harness();
+  try {
+    const size = bundleBytes(a.record.sourceSha, false).length;
+    const shared = { remaining: Math.floor(size * 1.5) };
+    let arrived = 0;
+    let open!: () => void;
+    const barrier = new Promise<void>(resolve => { open = resolve; });
+    const hook = async () => { if (++arrived === 2) open(); await barrier; };
+    a.s.reserveHook = hook; b.s.reserveHook = hook;
+    const [x, y] = await Promise.all([a.operate({ uploadAllowance: shared }), b.operate({ uploadAllowance: shared })]);
+    assert.equal(a.s.uploads + b.s.uploads, 1, "exactly one upload dispatched");
+    assert.deepEqual([x.reason, y.reason].filter(r => r === "predecessor_upload_budget").length, 1);
+    assert.ok(shared.remaining >= 0, "the allowance never goes negative");
+    assert.equal(shared.remaining, Math.floor(size * 1.5) - size);
+  } finally { await a.close(); await b.close(); }
+});
+
+it("a non-live scope with a matching record is lost authority even where no RPC would run", async () => {
+  const h = await harness();
+  try {
+    const probe = h.coordinator as unknown as Disqualifier;
+    const client = (h.coordinator as unknown as { client: { hasFeature(name: string): boolean } }).client;
+    const hasFeature = client.hasFeature;
+    let seen = "unset";
+    h.s.reserveHook = async () => {
+      const record = await h.saved();
+      h.s.live = false; client.hasFeature = () => false;
+      try { seen = String(await probe.inactiveInventoryDisqualifier(record)); }
+      catch (error) { seen = error instanceof PredecessorAuthorityLost ? "authority_lost" : "other:" + String(error); }
+      client.hasFeature = hasFeature; h.s.live = true;
+    };
+    await h.operate();
+    assert.equal(seen, "authority_lost", "not inventory_feature: the exemption itself requires a live scope");
+  } finally { await h.close(); }
+});
+
+for (const scoped of [true, false]) {
+  it(`installBundle ${scoped ? "keeps" : "removes"} the renamed bundle when the journal write fails (${scoped ? "predecessor" : "ordinary"})`, async () => {
+    const h = await harness();
+    try {
+      const target = h.coordinator as unknown as Record<string, (...a: unknown[]) => Promise<void>>;
+      const write = target["writeRecordUnlocked"]!.bind(h.coordinator);
+      let failed = false;
+      target["writeRecordUnlocked"] = async (record: unknown) => {
+        if (!failed && (record as RecoveryRecord).state === "bundled") { failed = true; throw new Error("disk full"); }
+        return write(record);
+      };
+      if (scoped) await h.operate();
+      else {
+        h.s.executing = false; h.s.status = "failed";
+        await h.coordinator.captureAndUpload({ record: h.record, barePath: h.context.barePath, defaultBranch: "main" });
+      }
+      assert.equal(failed, true);
+      const bundles = (await fs.readdir(path.join(h.root, "journal", RUN))).filter(f => f.endsWith(".bundle"));
+      assert.equal(bundles.length, scoped ? 1 : 0);
+    } finally { await h.close(); }
+  });
+}
+
+it("a closure budget limit that is NaN or negative admits nothing; infinity is capped", async () => {
+  const { GitCache } = await import("../src/git.js");
+  const { testGitCacheOptions } = await import("./helpers.js");
+  const data = makeScratchRoot("closure-budget-", os.tmpdir());
+  try {
+    const cache = new GitCache(data, nullLogger(), undefined, testGitCacheOptions());
+    const run = (limit: number) => {
+      const budget = { delivered: 0, limit };
+      return cache.withRecoveryOperation(new AbortController().signal, Infinity, async () => budget.limit, undefined, { closureBudget: budget });
+    };
+    assert.equal(await run(Number.NaN), 0);
+    assert.equal(await run(-5), 0);
+    assert.equal(await run(Number.NEGATIVE_INFINITY), 0);
+    assert.equal(await run(Number.POSITIVE_INFINITY), cache.recoveryDecodedLimitBytes);
+  } finally { await fs.rm(data, { recursive: true, force: true }); }
+});

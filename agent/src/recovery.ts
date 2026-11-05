@@ -3811,8 +3811,8 @@ export class RecoveryCoordinator {
   /** The capture cycle; the caller holds the record's capture-cycle lock. */
   private async captureCycle(input: CaptureInput, closureMint: ClosureMint): Promise<RecoveryOutcome> {
     let record = input.record;
-    // The bundle bytes are dropped only when the record's file is CONFIRMED absent; a record that is
-    // present but unreadable keeps them (they may be the only copy) and nothing is written.
+    // The bundle bytes are dropped only when the record's file is CONFIRMED absent and no predecessor scope is
+    // active; a record that is present but unreadable keeps them (they may be the only copy), nothing is written.
     const removed = async (err: RecordGoneError): Promise<RecoveryOutcome> => {
       if (!err.absent) {
         this.predecessorNote("record_unauthenticated");
@@ -4155,6 +4155,9 @@ export class RecoveryCoordinator {
     if (predecessor) {
       // Charged synchronously with the dispatch decision and never refunded: a lost answer still spent the bytes.
       this.assertPredecessorAuthority();
+      // Re-check and charge with no await between them: concurrent operations sharing one allowance cannot both pass.
+      const late = overAllowance();
+      if (late) return late;
       predecessor.allowance.remaining -= current.byteSize!;
       if (predecessor.measurements) predecessor.measurements.chargedBytes += current.byteSize!;
     }

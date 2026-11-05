@@ -3147,7 +3147,11 @@ export class GitCache {
   async withRecoveryOperation<T>(signal: AbortSignal, deadline: number, action: (signal: AbortSignal) => Promise<T>, budget?: MaintenanceBudget,
     opts?: { closureBudget?: { delivered: number; limit: number } }): Promise<T> {
     // A caller-shared decoded-byte account is used by identity, but never above this cache's own ceiling.
-    if (opts?.closureBudget) opts.closureBudget.limit = Math.min(opts.closureBudget.limit, this.recoveryDecodedLimitBytes);
+    if (opts?.closureBudget) {
+      // A NaN or negative limit is a refusal (0 admits nothing); anything else is capped at the ceiling.
+      const requested = opts.closureBudget.limit;
+      opts.closureBudget.limit = Number.isNaN(requested) || requested < 0 ? 0 : Math.min(requested, this.recoveryDecodedLimitBytes);
+    }
     const parent = this.recoveryOperations.getStore();
     budget = parent?.budget ?? MaintenanceBudget.current() ?? budget;
     deadline = Math.min(deadline, parent?.deadline ?? Infinity);
