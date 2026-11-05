@@ -114,7 +114,8 @@ present, otherwise the resolved default branch. It can advance during reclaims:
 coverage over an older published base remains content-free even when today's floor
 tree differs. Conversely, an outside tree matching only the newer floor tip, with
 no matching boundary tree, does not prove content-free coverage.
-An outside tree matching no boundary, or unreadable proof, blocks report-only completion. A confirmed
+An outside tree matching no boundary, or unreadable proof, blocks report-only completion
+(except the #3944 stale-mirror discount below). A confirmed
 publication with an unknown tip also blocks; a genuinely absent checkpoint without
 confirmed publication does not. The existing mirrored marker-only `wip(park):`
 exception (#759) retains its ancestry-based handling.
@@ -124,9 +125,10 @@ preservation and publication are unchanged. This is a content proof for the exis
 report-only decision, not a new worker-to-forge deletion capability.
 
 **Three-way tip classification and stale-mirror discount (#3944).** The mirrored-checkpoint
-leg classifies a tip as `content_free`, `carries_work` or `unprovable`. Any failed read, an
-unreadable tip, boundary or unmatched outside tree, shallow history or a failed marker
-parent read is `unprovable` and always blocks. The claim-time mirror fetch never prunes, so
+leg classifies a tip as `content_free`, `carries_work` or `unprovable`. A failed read inside
+the proof (the shallow check, the tip resolve, the boundary walk, a boundary or unmatched
+outside tree read, or the marker parent read) is `unprovable` and always blocks. A failed
+marker-subject or overlay-peel read only sends the tip to the all-parent proof. The claim-time mirror fetch never prunes, so
 a predecessor's checkpoint that origin no longer holds (after supersession or released
 custody) stayed in the local mirror and refused a no-change report-only run. On issue runs
 only, a local mirror whose tip positively `carries_work` is therefore discounted when an
@@ -140,8 +142,9 @@ retention arm (`reconcilePublishAttempts`), not by this guard.
 All three guard sites (declared `report_only`, the issue scope-capped zero slice and the
 prompt zero-diff completion) also require this run's unconfirmed attempted publish tip (a
 lost-ack publish) to be content-free, by the all-parent proof above or the `wip(park):`
-marker exception; otherwise the guard blocks, and issue runs then take the #3360 fallback
-below or the #299 failure as before. The marker exception is hardened: zero parents count
+marker exception; otherwise the guard blocks and each site keeps its prior blocked outcome
+(the #3360 fallback below for a declared issue `report_only`, push and MR for the
+scope-capped slice, the #299 failure for prompt runs and other kinds). The marker exception is hardened: zero parents count
 only on a positive, readable, non-shallow parent read; exactly one parent is checked by
 floor ancestry with `--no-replace-objects` (exit 1 means work, any other error blocks); two
 or more parents get no marker exception and take the all-parent proof. The confirmed
@@ -149,7 +152,7 @@ publication leg is unchanged.
 
 **Issue-run fallback (#3360).** On issue runs only, when the lead declares `report_only`
 but `hasCommittedCheckpoint` cannot establish that the checkpoint is content-free (same proof as above,
-unchanged), the worker no longer fails the run (#299). It sets a non-closing declaration
+including the #3944 discount and attempted-tip check), the worker no longer fails the run (#299). It sets a non-closing declaration
 (static worker reason "The lead declared report_only after committing work; the worker
 delivered it without closing the issue."), unless the lead or an earlier persisted claim
 already declared one, and routes the work through normal delivery as a non-closing MR. All
