@@ -447,10 +447,7 @@ func TestDindMaintenanceOwnershipBeforeFenceLiveDB(t *testing.T) {
 				cancel()
 				_ = tx.Rollback(context.Background())
 				select {
-				case err := <-done:
-					if err != nil {
-						t.Logf("fence goroutine: %v", err)
-					}
+				case <-done:
 				case <-time.After(2 * time.Second):
 					t.Error("fence goroutine did not stop")
 				}
@@ -508,10 +505,7 @@ func TestDindMaintenanceFenceBeforeOwnershipLiveDB(t *testing.T) {
 			defer func() {
 				cancel()
 				select {
-				case err := <-fenceDone:
-					if err != nil {
-						t.Logf("fence goroutine: %v", err)
-					}
+				case <-fenceDone:
 				case <-time.After(2 * time.Second):
 					t.Error("fence goroutine did not stop")
 				}
@@ -1069,7 +1063,7 @@ func TestDindMaintenanceReadyACKClockBoundaryLiveDB(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			env, w, svc, op := dindLiveFixture(t)
-			clk := dindLiveClocked(t, env, svc)
+			dindLiveClocked(t, env, svc)
 			// A terminal owned run is idle for the ready fence; only the hold case then pins it with custody.
 			owned := dindLiveRun(t, env, w, "issue", "completed", true)
 			ready, err := svc.TransitionDindMaintenance(env.ctx, w.ID, op)
@@ -1078,7 +1072,6 @@ func TestDindMaintenanceReadyACKClockBoundaryLiveDB(t *testing.T) {
 			}
 			before := dindLiveWorker(t, env, w.ID)
 			floor := before.MaintenanceActivityFloor.Time
-			clk.advanceTo(t, floor)
 			zero := 0
 			ack := DindMaintenanceReadyACK{DindMaintenance: *ready, LocalClaims: &zero, LocalExecutions: &zero, CustodyClear: true}
 			if tc.mutate != nil {
