@@ -1255,6 +1255,92 @@ describe("GitCache.hasCommittedCheckpoint (#3944 stale local mirror, attempted t
       "control: with the URL restored the same state is discounted");
   });
 
+  /** Scope a runGit stub to the `ls-remote` call only; every other call goes to the real runGit. */
+  function stubLsRemote(git: GitCache, answer: string): void {
+    const target = git as unknown as { runGit: (...args: unknown[]) => Promise<string> };
+    const original = target.runGit.bind(git);
+    target.runGit = (...args: unknown[]) => {
+      const argv = args[1] as string[];
+      return argv.includes("ls-remote") ? Promise.resolve(answer) : original(...args);
+    };
+  }
+
+  const SHA_A = "a".repeat(40);
+  const SHA_B = "b".repeat(40);
+  for (const [name, answer] of [
+    ["a well-formed line naming a different ref", `${SHA_A}\trefs/uzi-checkpoints/agent/issue-other\n`],
+    ["two lines", `${SHA_A}\trefs/uzi-checkpoints/agent/issue-3944\n${SHA_B}\trefs/uzi-checkpoints/agent/issue-3944\n`],
+    ["a malformed line", "not-a-sha refs/uzi-checkpoints/agent/issue-3944\n"],
+    ["a short sha", `${"a".repeat(39)}\trefs/uzi-checkpoints/agent/issue-3944\n`],
+  ] as const) {
+    it(`g3 blocks when ls-remote answers ${name} (unknown, not absent)`, async () => {
+      const f = await fixture();
+      f.mirror(f.work);
+      stubLsRemote(f.git, answer);
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), true);
+    });
+  }
+
+  it("g3 control: an empty ls-remote answer through the same stub is absent (discounted)", async () => {
+    const f = await fixture();
+    f.mirror(f.work);
+    stubLsRemote(f.git, "");
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), false);
+  });
+
+  it("g3 the probe's ls-remote receives pat, the http scope of the repo url, and username", async () => {
+    const f = await fixture();
+    f.mirror(f.work);
+    const target = f.git as unknown as { runGit: (...args: unknown[]) => Promise<string> };
+    const original = target.runGit.bind(f.git);
+    let lsRemote: unknown[] | undefined;
+    target.runGit = (...args: unknown[]) => {
+      if ((args[1] as string[]).includes("ls-remote")) {
+        lsRemote = args;
+        return Promise.resolve("");
+      }
+      return original(...args);
+    };
+    const probe = { pat: "fixture-pat-value", repoUrl: "https://forge.example.test/org/repo.git", username: "fixture-user-value" };
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: probe }), false);
+    assert.ok(lsRemote, "ls-remote ran");
+    assert.deepEqual(lsRemote!.slice(2), ["fixture-pat-value", "https://forge.example.test/", "fixture-user-value"]);
+  });
+
+  it("g13 marker path: a non-0/1 merge-base exit or an unreadable/malformed parents row is refused", async () => {
+    const f = await fixture();
+    const onFloor = mkCommit(f.bare, f.workTree, [f.floor], MARKER);
+    const opts = { attemptedTip: onFloor };
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), false, "control");
+    const target = f.git as unknown as {
+      runGit: (...args: unknown[]) => Promise<string>;
+      tryGitExit: (...args: unknown[]) => Promise<number | null>;
+    };
+    const origRun = target.runGit.bind(f.git);
+    const origExit = target.tryGitExit.bind(f.git);
+    try {
+      target.tryGitExit = (...args: unknown[]) => {
+        const argv = args[1] as string[];
+        return argv.includes("--is-ancestor") ? Promise.resolve(128) : origExit(...args);
+      };
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), true, "exit 128");
+      target.tryGitExit = origExit;
+      for (const behaviour of ["throw", "malformed"] as const) {
+        target.runGit = (...args: unknown[]) => {
+          const argv = args[1] as string[];
+          if (argv.includes("rev-list") && argv.includes("--no-replace-objects")) {
+            return behaviour === "throw" ? Promise.reject(new Error("boom")) : Promise.resolve("garbage\n");
+          }
+          return origRun(...args);
+        };
+        assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), true, behaviour);
+      }
+    } finally {
+      target.runGit = origRun;
+      target.tryGitExit = origExit;
+    }
+  });
+
   it("g4 blocks a content-bearing attempted tip even with no mirror (and with a null key)", async () => {
     const f = await fixture();
     assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { attemptedTip: f.work }), true);

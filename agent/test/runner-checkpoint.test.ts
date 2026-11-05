@@ -1880,6 +1880,8 @@ describe("RunRunner — report_only orphan guard vs a stale local checkpoint mir
     /** Runs inside the executor before the commit and checkpoint. */
     beforeWork?: (bare: string, dir: string) => void;
     delivery?: boolean;
+    /** Return an operator scope-capped zero slice instead of a report_only result. */
+    scopeCapped?: boolean;
     /** Runs after the claim is built and before it executes. */
     prepare?: (claim: { run_id: string }) => void;
   }
@@ -1906,6 +1908,9 @@ describe("RunRunner — report_only orphan guard vs a stale local checkpoint mir
         opts.inExecutor?.(bare, ctx.worktreePath);
         snapshots.bare = snap(bare);
         snapshots.origin = snap(fx.originPath);
+        if (opts.scopeCapped) {
+          return { branch: ctx.branch, scopeCapped: { completedCount: 0, total: 3 }, summary: "scope capped zero slice" };
+        }
         return opts.reportOnly === false
           ? { branch: ctx.branch }
           : { branch: ctx.branch, reportOnly: true, summary: "stale mirror report" };
@@ -1963,6 +1968,66 @@ describe("RunRunner — report_only orphan guard vs a stale local checkpoint mir
     assert.ok(res.snapshots.bare.includes(`${pred.ref} ${pred.tip}`), "the snapshot is not vacuous");
     assert.equal(res.after.bare, res.snapshots.bare, "the bare's checkpoint, held, recovery and runner refs are untouched");
     assert.equal(res.after.origin, res.snapshots.origin, "origin's refs are untouched");
+  });
+
+  it("r1c hands the claim's credentials and clone url to the origin probe", async () => {
+    const pred = seedPredecessor(39461);
+    const target = git as unknown as { originCheckpointRefState: (...a: unknown[]) => Promise<unknown> };
+    const original = target.originCheckpointRefState.bind(git);
+    const seen: unknown[][] = [];
+    target.originCheckpointRefState = (...args: unknown[]) => {
+      seen.push(args);
+      return original(...args);
+    };
+    const res = await drive({
+      n: 39461,
+      prepare: (claim) => {
+        const secrets = (claim as unknown as { secrets: Record<string, string> }).secrets;
+        secrets.forge_pat = "fixture-pat-value";
+        secrets.forge_username = "fixture-user-value";
+      },
+      inExecutor: () => g(fx.originPath, ["update-ref", "-d", pred.ref]),
+    });
+    assertReportOnlyCompletion(res);
+    assert.equal(seen.length, 1, "the origin probe ran once");
+    assert.equal(seen[0]![1], pred.ref);
+    assert.deepEqual(seen[0]![2], {
+      pat: "fixture-pat-value",
+      repoUrl: fx.originPath,
+      username: "fixture-user-value",
+    });
+  });
+
+  it("r1d scope-capped zero slice completes (scope_capped) when the stale mirror is absent on origin", async () => {
+    const pred = seedPredecessor(39462);
+    const res = await drive({
+      n: 39462,
+      scopeCapped: true,
+      inExecutor: () => g(fx.originPath, ["update-ref", "-d", pred.ref]),
+    });
+    assert.equal(res.failed, undefined, `no failure expected, got ${JSON.stringify(res.failed)}`);
+    assert.ok(res.completed, "the run completed");
+    assert.equal(res.completed.report_only, true);
+    assert.equal(res.completed.scope_capped, true);
+    assert.equal(res.calls.length, 0, "no MR is opened");
+  });
+
+  it("r1e scope-capped zero slice does not take the no-MR completion over a content-bearing lost-ack attempted tip", async () => {
+    const res = await drive({
+      n: 39463,
+      scopeCapped: true,
+      delivery: true,
+      commit: (dir) => {
+        commitInClone(dir, "HIDDEN.txt");
+        g(dir, ["revert", "--no-edit", "HEAD"]);
+      },
+    });
+    assert.ok(res.events.includes("publish"));
+    // Falls through to the normal push + (partial) MR delivery, not the no-MR zero-slice completion.
+    assert.equal(res.failed, undefined);
+    assert.ok(res.completed, "the run completes through delivery");
+    assert.notEqual(res.completed.report_only, true, "not the MR-less scope-capped report-only completion");
+    assert.equal(res.calls.filter((c) => c.method === "POST").length, 1, "exactly one MR opened");
   });
 
   it("r1s keeps the predecessor tip under origin's recovery ref untouched while completing", async () => {
@@ -2138,7 +2203,7 @@ describe("RunRunner — report_only orphan guard vs a stale local checkpoint mir
   for (const withCheckpoint of [true, false]) {
     const label = withCheckpoint ? "a content-free attempted tip" : "no publish at all";
     for (const kind of ["tip", "boundary", "outside-tree", "shallow"] as const) {
-      it(`r8 fails (#299) over an unreadable mirror proof (${kind}) with ${label}, origin ref absent`, async () => {
+      it(`r8 ${kind === "tip" ? "is refused (fails before the guard, at fetch-back)" : "fails (#299)"} over an unreadable mirror proof (${kind}) with ${label}, origin ref absent`, async () => {
         const pred = seedPredecessor(39460);
         const res = await drive({
           n: 39460,

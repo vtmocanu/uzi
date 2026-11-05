@@ -18153,7 +18153,9 @@ try {
   /** Report-only orphan guard (#299, #759, #2967, #3944). Three legs, any of which blocks:
    *  (i) `confirmedPublication`: this worker's exact confirmed tip (the mirror can be stale);
    *  (ii) `opts.attemptedTip`: the tip of a publish whose ack was lost (it may have landed), so
-   *  it is proven the same way as a confirmed tip, a state other than `content_free` blocks;
+   *  it is proven with `checkpointTipState` (the #2753 overlay peel and the `wip(park):` marker
+   *  exception, then the #2967 all-parent proof), not the confirmed leg's `boundaryProof`
+   *  alone; a state other than `content_free` blocks;
    *  (iii) the mirrored `refs/uzi-checkpoints/<checkpointKey>`.
    *  Recovery coverage is content-free only when EVERY commit outside the recovery
    *  floor's history matches a floor-reachable boundary parent's tree. The current
@@ -18279,7 +18281,7 @@ try {
       const floorRef = (await this.refExists(barePath, `refs/remotes/origin/${branch}`))
         ? `refs/remotes/origin/${branch}`
         : await this.defaultBranchRef(barePath);
-      const status = await this.tryGitExit(barePath, ["merge-base", "--is-ancestor", parents[0]!, floorRef]);
+      const status = await this.tryGitExit(barePath, ["--no-replace-objects", "merge-base", "--is-ancestor", parents[0]!, floorRef]);
       return status === 0 ? "content_free" : status === 1 ? "carries_work" : "unprovable";
     } catch (err) {
       this.rethrowProofAbort(err);
