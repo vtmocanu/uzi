@@ -363,7 +363,10 @@ func TestRecoveryInventoryWorkerDeleteLockAllLiveDB(t *testing.T) {
 		_ = tx.Rollback(cleanupCtx)
 		if !deleteJoined {
 			select {
-			case <-result:
+			case err := <-result:
+				if err != nil {
+					t.Logf("worker DELETE ended during cancelled cleanup: %v", err)
+				}
 			case <-cleanupCtx.Done():
 				t.Error("worker DELETE goroutine did not return during cleanup")
 			}

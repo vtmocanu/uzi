@@ -212,7 +212,9 @@ func TestDiskHoldConcurrentReportAndResumeLiveDB(t *testing.T) {
 	}
 	close(start)
 	x, y := <-resume, <-resume
-	if !((x == nil && errors.Is(y, pgx.ErrNoRows)) || (y == nil && errors.Is(x, pgx.ErrNoRows))) {
+	firstWon := x == nil && errors.Is(y, pgx.ErrNoRows)
+	secondWon := y == nil && errors.Is(x, pgx.ErrNoRows)
+	if !firstWon && !secondWon {
 		t.Fatalf("resume race=%v/%v", x, y)
 	}
 }

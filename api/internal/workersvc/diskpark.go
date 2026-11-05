@@ -183,5 +183,5 @@ func diskHoldRefusesReport(run store.Run, req StateRequest) bool {
 		return false
 	}
 	return isDataVolumeFullHeld(run) && req.State != "cancelled" &&
-		!(req.State == "failed" && run.StopKind.Valid && run.StopKind.String != "")
+		(req.State != "failed" || !run.StopKind.Valid || run.StopKind.String == "")
 }
