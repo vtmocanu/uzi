@@ -2,7 +2,7 @@
 
 **Issue:** #3248
 **Sibling issues (children of #1703):** A #3255, B #3247, B2 #3251, C #3245, D #3248, E #3257, F #3254, G #3249, H #3244, I #3263, J1 #3256, J2 #3260, K #3261, L #3262, M #3259, N #3258, O #3264, P #3250, Q-spike #3246, Q-claude #3252, Q-codex #3253.  
-**Status:** Draft r4 2026-11-05 (child D of epic #1703). Source anchors written against origin/main `522aab1ba` and rechecked at `3f0858ef5` (2026-11-05): every consumed child C seam is on main under the names below, and the summary, Codex runner, credential-error and Run defaults behavior still matches the baseline, although later commits touched the claim-assembly and Run defaults files, so re-read each anchor before editing it. The `ModelSelect` `models` prop has landed (`web/src/components/ModelSelect.tsx`): reuse it. #3234 added `testOwnedPassHomeRoot()` (`agent/test/teardown-fixtures.ts`), which new agent tests use. Consumes child C's final names.
+**Status:** Done 2026-11-05: M1, M2 and M3 implemented on branch `agent/issue-3248` (see D14 for implementation precisions). Draft r4 2026-11-05 (child D of epic #1703) was the approved spec.
 **Priority:** Normal.
 **Parent:** #1703. **Closes:** #1454. Child #3245 lands first (#3248 is blocked by #3245), and its PR says `Part of #1454`; this PR says `Closes #1454`. #3245 answers #1454's Judge question; this PRD answers its Summary question (option 2, one model per harness).
 **Blocked by:** child #3245. This PRD consumes #3245's shared seams by their exact names and defines no copies (see "Consumed from child #3245").
@@ -418,3 +418,8 @@ Blocked by: M1 (the same agent seams; serial in one PR).
   - Reason: one posture on a shared seam.
 - **D13. No ADR.**
   - The invariants are pinned by tests and stated in `docs/run-summaries.md`: a Codex summary model is always a `role` member, and a credential note is only ever the closed reason.
+- **D14. Implementation precisions (2026-11-05).**
+  - `refresh_denied` precedence: when the deny bridge fired during the call and the call then ends in an error terminal or a thrown failure that is not a timeout or abort, the reason is `refresh_denied`; a later network error or refusal therefore reports the refresh, and the docs say so.
+  - The pass owns the deny flag: it sets `onRefreshDenied` on the params it hands to `buildHarness` (threaded through `CodexAdviceHarnessBuildParams` to `buildAdviceAuthConfig`), so `ReadOnlyModelPassOpts.codex` gained no option.
+  - Accepted boundary: the pass treats a failure within 25 ms of its deadline as a timeout (no note), because for executor-owned summaries the advice harness's timer targets the same instant and can fire first. Node timers can fire early by loop latency, so this narrows rather than removes the race; the worst case is a silent skip or a `refresh_denied` note for a call whose refresh really was denied. Replacing it with typed timeout evidence is a possible follow-up.
+  - The claim's nil-settings case is pinned by the CI claim wire-contract tests instead of a dedicated `TestClaimOmitsSummaryModelWhenNoSettings`; per-harness claim lanes are tested through `resolveClaimSummaryModel`.
