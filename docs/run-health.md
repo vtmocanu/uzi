@@ -19,7 +19,7 @@ left to the deadline (e.g. `1h 5m left`).
 | Flag | Shows up when | What to do |
 |---|---|---|
 | ⚠ looping | The agent has repeated the exact same tool call with the same result and success/error status 4+ times recently — or its updates can't be saved, so it keeps resending them. | Open the run view and check what it's stuck repeating (or whether it's stuck retrying a save); it may need a nudge or a cancel. |
-| ⚠ stalled | No new activity for a while, and nothing is currently running (a long build or test suite in progress does **not** count as stalled) — or one tool call has been running far longer than a normal build or test suite would (see [Long tool calls](#long-tool-calls)). | Open the run view — it's either quietly working on something the flag doesn't see, or genuinely wedged. |
+| ⚠ stalled | No new activity for a while, and nothing is currently running (a long build or test suite in progress does **not** count as stalled) — or one tool call has been running far longer than a normal build or test suite would, or a delegated subagent has sent no updates for that long (see [Long tool calls](#long-tool-calls)). | Open the run view — it's either quietly working on something the flag doesn't see, or genuinely wedged. |
 | ⚠ near timeout | Has used most (default 85%) of its wall-clock budget while running, gate time excluded; it will park and wait for you at the timeout, not fail — see [Running out of time](#running-out-of-time). | Let it finish if it is on its last milestone, `uzi run scope --through N` / `run stop` to finalize what is committed, or [give it more time](#giving-a-run-more-time) instead. Raising `RUN_TIMEOUT` only helps a run whose budget isn't already frozen — a milestone-scaled run freezes its `budget_wall_seconds` at plan approval, so a later `RUN_TIMEOUT` bump won't extend it. |
 | ⚠ waiting for worker | Queued longer than expected with no worker claiming it — or, for a repo the Docker worker allowlist blocks, as soon as the next health sweep detects it (see below). | The reason names why, if you own the run: no worker online, your protected vault is locked, or just a wait — start a worker or unlock your vault as needed. A judge or self-improve run instead reads **deprioritized** (yielding to interactive work on purpose, not stuck) or, once it's waited past the grace window, **priority restored** — see [Queue priority](#queue-priority). |
 | waiting for account cooldown | Required new Codex subscription work is blocked by a current account cooldown in `claimed`, `running` or `awaiting_approval`; this is an expected wait, not a fault. | Wait for a fresh admission check, or use the existing run controls. Earliest eligibility does not promise dispatch; see [Account cooldown waits](#account-cooldown-waits). |
@@ -92,19 +92,35 @@ has been in progress longer than the configured threshold"_, when both hold:
   **Stalled after** window (or for the long-tool-call threshold itself, if
   **Stalled after** is `0`).
 
-A call to a subagent (a delegation) is never aged, and while one is open
-among the run's recent tool calls this flag stays off. A delegation whose
-subagent is still sending updates is never flagged. The one exception is a
-delegation old enough to have dropped out of those recent calls: if its
-subagent has gone quiet past the window while an ordinary call of the main
-agent has been open past the threshold, the run is flagged. The age is
-measured from when uzi received the call. A run whose older calls all fall
-outside the recent window still trips the plain **stalled** flag once it
-goes quiet. During an api outage, when the run's worker reports its updates
-queued, the reason says so instead. The flag clears on the next check once
-no open call is past the threshold or new activity has arrived. Setting
-**Long tool call after** to `0` turns this signal off. Like every flag, it
-never stops the run.
+A call to a subagent (a delegation) is never aged by the check above. A
+separate silent-delegation check covers it: when the main agent has a
+delegation open among the run's recent tool calls and the run has sent no
+updates for at least the larger of **Long tool call after** and **Stalled
+after** (just **Long tool call after** if **Stalled after** is `0`), the run is
+flagged ⚠ stalled with the owner's reason _"a delegated subagent has sent no
+updates for longer than the configured threshold"_. Silence is measured from
+the run's last activity, or from when it started if that is later. It fires
+whether or not an ordinary call of the main agent is also open. The age of an
+ordinary call is measured from when uzi received it. During an api outage, when
+the run's worker reports its updates queued, the reason says so instead. The
+flag clears on the next check once no open call is past the threshold or new
+activity has arrived. Setting **Long tool call after** to `0` turns off both
+signals. Like every flag, it is advisory and never cancels or changes the run.
+
+The silent-delegation flag is deliberately blunt:
+
+- A subagent running one long command past the threshold (for example a
+  20-minute-plus test suite) is flagged on purpose.
+- Batches made only of progress notes or usage summaries do not count as
+  activity.
+- Silence is measured for the whole run, so a still-streaming sibling delegation
+  masks a silent one.
+- Periodic status frames that do count as activity keep the run unflagged.
+- The Codex harness's 15-minute subagent budget (below) means a Codex subagent
+  usually ends before the 20-minute default threshold.
+- A delegation old enough to have dropped out of the recent tool calls is not
+  seen by this check; the plain **stalled** flag, or another open call's signal,
+  catches it once the run goes quiet.
 
 Separately from these flags, which never stop anything: on the Codex harness
 each subagent has a 15-minute turn budget of its own (raised from 10 minutes).

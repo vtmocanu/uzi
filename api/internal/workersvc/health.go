@@ -864,11 +864,12 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 	// here, so the quiet guard covers it: every nested subagent frame bumps
 	// runs.last_activity_at (AppendMessages), so a streaming delegation keeps the run
 	// below the quiet window and this arm cannot fire. Limits, stated honestly: a
-	// delegation that has dropped out of the tail is caught only by plain stalled, or by
-	// this arm when another open ordinary call is in the tail; a still-streaming sibling
-	// delegation masks a silent one (the measure is run-level silence); batches made only
-	// of progress_note / summary_usage frames do not bump last_activity_at (quiet_activity,
-	// PRD #2603), so they count as silence.
+	// delegation that has dropped out of the tail is caught only by plain stalled (when no
+	// other lead call is open in the tail), by this arm when another open ordinary call is
+	// in the tail, or by the silent-delegation arm when another delegation is open in the
+	// tail; a still-streaming sibling delegation masks a silent one (the measure is
+	// run-level silence); batches made only of progress_note / summary_usage frames do not
+	// bump last_activity_at (quiet_activity, PRD #2603), so they count as silence.
 	//
 	// The quiet window is health_stall_seconds, the same "quiet" the stalled flag means,
 	// so Slack's "gone quiet" head and the amber lane dot stay truthful; with stall
