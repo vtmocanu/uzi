@@ -1153,7 +1153,15 @@ otherwise be idle or recycled. Such a worker shows a **retaining work**
 badge in the worker list. Deleting that worker is refused until the work is
 recovered or explicitly discarded, and the refusal names how many holds are
 blocking the delete and the exact commands to clear them (`uzi run recovery`
-to list, then `uzi run export` or `uzi run discard`). `uzi worker rm` never
+to list, then `uzi run export` or `uzi run discard`). It also lists the
+blocking holds themselves — up to 10, oldest first, with the total — by run,
+generation and hold id. These are the holds whose live holder is this worker,
+which is not always the worker that first created them. On the Workers page
+the refusal appears in the worker's own row, recovery first: each hold links
+to **Held work** opened at that exact hold, even one the panel would
+otherwise hide, and discarding comes last as the explicit destructive
+choice. `uzi worker rm` prints the same holds on stderr and carries them in
+`--json` as `blocking_holds` and `blocking_holds_total`. `uzi worker rm` never
 force-discards held work for you. Removing a repo that still has a run
 retaining custody this way is refused the same way, naming how many runs are
 retaining unpublished work.
