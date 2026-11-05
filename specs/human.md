@@ -1734,6 +1734,15 @@ Design record: `prds/done/3878-overview-preview-decisions.md` (epic #3873).
 - Needs your decision lists only the viewer's own plan reviews, questions and follow-ups, owner-action parks and open PRs (one verb each, with age) for admins too, and hides when empty. A parked run counts as resuming on its own only with evidence (account cooldown, weekly-reserve pause, limit / pool wait, a parseable scheduled retry); anything else is an owner action. Review PR opens the forge only for an https URL. (AI-synced 2026-11-05)
 - Runs are grouped Yours, then for admins Other users (admin) with the owner email (masked in demo mode); another user's waiting run reads "waits on owner". A failed admin read shows "Other users' runs are unavailable" with the last good read time, and a non-admin never calls an admin endpoint. (AI-synced 2026-11-05)
 
+## Feature #3880 — Overview preview, capacity rail and held work
+
+Design record: `prds/done/3880-overview-capacity-held-work.md` (epic #3873).
+
+- On `/overview/next` a right-hand rail beside the runs replaces the worker-load card and custody banner; `/dashboard` keeps both. Everything in the rail is the viewer's own, for admins too. (AI-synced 2026-11-05)
+- Capacity: run slots in use, closed and open across the viewer's online workers with a known advertised cap; a draining, cordoned or hosted-upgrading worker's spare slots are closed, and "open" is advertised spare capacity, not a promised claim. Every worker is listed (offline and no-stats included, uncounted ones labelled) with today's badges and its stats behind a disclosure; "Rolls to X once fully idle" needs a hosted upgrading report, a target and a drain. (AI-synced 2026-11-05)
+- Held work always shows custody slots used of the configured limit, open holds and holds needing a decision, keeps the custody alert's headline and tone when it applies, and offers Review held work only when a decision is pending. Its holds read polls on its own, keeps the last good data and never waits on the runs load. (AI-synced 2026-11-05)
+- Needs your decision gains one held-work row when open holds need a decision; the header counts the aggregate decisions once, and the row names a run only for a single listed decision hold. (AI-synced 2026-11-05)
+
 ## Demo mode branding
 
 - Web demo mode shows the stock uzi factory icon and wordmark, default tab title and favicon base, and hides all instance POWERED BY branding and the optional build-time license credit. Toggling it off restores the real branding live. This is per-device presentation only; server settings and the Admin Branding live preview stay real. (AI-synced 2026-11-01)
