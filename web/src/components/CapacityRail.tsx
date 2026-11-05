@@ -156,7 +156,7 @@ function WorkerRow({ worker: w }: { worker: Worker }) {
               <WorkerCordonBadge worker={w} />
               <WorkerRunBadge worker={w} hideIdleCrossChecks />
             </div>
-            <span data-worker-name className="min-w-[6rem] flex-1 truncate whitespace-nowrap text-sm font-medium text-fg">
+            <span data-worker-name className="min-w-[5rem] flex-1 truncate whitespace-nowrap text-sm font-medium text-fg">
               {stripUnsafeChars(w.name)}
             </span>
           </div>

@@ -154,6 +154,16 @@ describe("OverviewNext capacity rail", () => {
           active_cross_checks: 1,
           max_cross_check_slots: 2,
         }),
+        // The mock's three-pill row (online, draining, 1/2 runs): its name is the one the
+        // name min-width keeps readable at 320px.
+        aWorker({
+          id: "w4",
+          name: "base.l-highmem-b54d",
+          status: "online",
+          draining_since: "2026-07-05T12:00:00Z",
+          active_runs: 1,
+          max_concurrent_runs: 2,
+        }),
       ],
     });
     render(
@@ -223,7 +233,7 @@ describe("OverviewNext capacity rail", () => {
 // many badges the worker shows.
 function expectRailSummariesFit(railCard: HTMLElement) {
   const summaries = railCard.querySelectorAll<HTMLElement>("li summary");
-  expect(summaries.length).toBe(3);
+  expect(summaries.length).toBe(4);
   for (const s of summaries) {
     expect.soft(s.scrollWidth, `summary ${s.textContent?.slice(0, 30)} overflow`).toBeLessThanOrEqual(s.clientWidth + 1);
     const name = s.querySelector<HTMLElement>("[data-worker-name]") as HTMLElement;
