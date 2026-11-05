@@ -1,0 +1,98 @@
+// The Overview preview's "Needs your decision" card (PRD #3878 M2): the viewer's own plan
+// reviews, questions, owner-action parks and open pull requests, each with one verb and its
+// age. Self-hiding when empty. The caller passes only the viewer's own items.
+
+import { Link } from "react-router-dom";
+import { preferForgeUrl } from "../lib/api";
+import { maskRepoPath } from "../lib/demoMask";
+import { mrAbbrev } from "../lib/forgeNoun";
+import { mergeRequestUrl, projectWebUrlFromIssue } from "../lib/forgeUrls";
+import type { DecisionItem } from "../lib/overview";
+import { activityAge } from "../lib/runActivity";
+import { stripUnsafeChars } from "../lib/safeText";
+import { RunIssueRef } from "./RunIssueRef";
+import { SectionTitle } from "./ui";
+
+// The secondary small Button look, on a real anchor: a Button inside a link would nest
+// interactive elements.
+const ACTION_CLASS =
+  "inline-flex h-7 shrink-0 select-none items-center justify-center gap-1 rounded-lg border border-edge bg-raised px-2.5 text-xs font-medium text-fg transition-colors hover:border-edge-strong hover:bg-raised/70";
+
+function summary(items: DecisionItem[]): string {
+  const prs = items.filter((i) => i.kind === "pr").length;
+  const decisions = items.length - prs;
+  return [
+    decisions > 0 ? `${decisions} ${decisions === 1 ? "decision" : "decisions"}` : null,
+    prs > 0 ? `${prs} PR ${prs === 1 ? "review" : "reviews"}` : null,
+  ]
+    .filter((s): s is string => s !== null)
+    .join(", ");
+}
+
+function DecisionRow({ item, now, demo }: { item: DecisionItem; now: number; demo: boolean }) {
+  const { run } = item;
+  const age = activityAge(item.since, now);
+  // Same derivation as RunsList's MR chip: the persisted forge URL when it is https, else
+  // rebuilt from the run's issue URL; a malformed value yields null and falls back to the run.
+  const prHref =
+    item.kind === "pr"
+      ? preferForgeUrl(
+          run.mr_web_url,
+          run.mr_iid != null && run.issue_web_url
+            ? mergeRequestUrl(projectWebUrlFromIssue(run.issue_web_url), run.mr_iid, run.forge_type)
+            : null,
+        )
+      : null;
+  return (
+    <li className="flex items-center gap-3 py-2.5">
+      <div className="min-w-0 flex-1">
+        <p className="truncate text-sm font-medium text-fg">{stripUnsafeChars(run.issue_title)}</p>
+        <p className="flex flex-wrap items-center gap-x-2 text-xs text-faint">
+          <span>
+            {run.repo_path ? <>{maskRepoPath(run.repo_path, demo)} </> : null}
+            <RunIssueRef
+              issueIid={run.issue_iid}
+              issueWebUrl={run.issue_web_url}
+              kind={run.kind}
+              forgeType={run.forge_type}
+            />
+          </span>
+          {item.kind === "pr" && <span>{mrAbbrev(run.forge_type)} state as last seen by uzi</span>}
+          {age && <span>waiting {age}</span>}
+        </p>
+      </div>
+      {prHref ? (
+        <a href={prHref} target="_blank" rel="noopener noreferrer" className={ACTION_CLASS}>
+          {item.verb}
+        </a>
+      ) : (
+        <Link to={`/runs/${run.id}`} className={ACTION_CLASS}>
+          {item.verb}
+        </Link>
+      )}
+    </li>
+  );
+}
+
+export function NeedsDecisionCard({ items, now, demo }: { items: DecisionItem[]; now: number; demo: boolean }) {
+  if (items.length === 0) return null;
+  // Card (components/ui) has no attribute passthrough, so this repeats its classes to carry
+  // data-attention, which only the Shadow theme styles.
+  return (
+    <section
+      aria-label="Needs your decision"
+      data-attention=""
+      className="rounded-xl border border-edge bg-surface p-5"
+    >
+      <div className="flex items-center justify-between">
+        <SectionTitle>Needs your decision</SectionTitle>
+        <span className="text-xs text-faint">{summary(items)}</span>
+      </div>
+      <ul className="mt-2 divide-y divide-edge">
+        {items.map((item) => (
+          <DecisionRow key={`${item.kind}:${item.run.id}`} item={item} now={now} demo={demo} />
+        ))}
+      </ul>
+    </section>
+  );
+}

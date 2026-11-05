@@ -249,3 +249,39 @@ describe("carried-over sections take the same inputs as Dashboard", () => {
     expect(screen.queryByRole("status", { name: "Your hosted workers" })).toBeNull();
   });
 });
+
+describe("Needs your decision", () => {
+  const prRun = (over = {}) =>
+    aRun({ id: "pr-1", status: "completed", kind: "issue", mr_iid: 4, mr_state: "opened", mr_web_url: "https://github.com/o/r/pull/4", forge_type: "github", issue_title: "Open PR run", finished_at: "2026-07-05T12:00:00Z", ...over });
+
+  it("lists a plan to review, then drops the card once the run moves on", async () => {
+    mockApi.listRuns.mockResolvedValue({ runs: [aRun({ id: "plan-1", status: "awaiting_approval", issue_title: "Plan me" })] });
+    await mount();
+    expect(screen.getByText("Needs your decision")).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Review plan" }).getAttribute("href")).toBe("/runs/plan-1");
+    expect(screen.getByText(/^1 decision is waiting on you\./)).toBeTruthy();
+    mockApi.listRuns.mockResolvedValue({ runs: [aRun({ id: "plan-1", status: "running", issue_title: "Plan me" })] });
+    await settle(10_000);
+    expect(screen.queryByText("Needs your decision")).toBeNull();
+    expect(screen.getByText(/^Nothing needs you right now\./)).toBeTruthy();
+  });
+
+  it("counts a plan and an open pull request in the sentence", async () => {
+    mockApi.listRuns.mockResolvedValue({ runs: [aRun({ id: "plan-1", status: "awaiting_approval" }), prRun()] });
+    await mount();
+    expect(screen.getByText(/^1 decision and 1 pull request are waiting on you\./)).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Review PR" }).getAttribute("href")).toBe("https://github.com/o/r/pull/4");
+  });
+
+  it("never lists another user's item for an admin, and counts none", async () => {
+    vi.mocked(useAuth).mockReturnValue(authValue(admin));
+    mockApi.listRuns.mockResolvedValue({ runs: [aRun()] });
+    mockApi.adminListRuns.mockResolvedValue({
+      runs: [aRun({ id: "x-1", status: "awaiting_approval", owner_email: "mira@uzi.local", issue_title: "Theirs" })],
+    });
+    await mount();
+    expect(screen.queryByText("Needs your decision")).toBeNull();
+    expect(screen.queryByText("Theirs")).toBeNull();
+    expect(screen.getByText(/^Nothing needs you right now\./)).toBeTruthy();
+  });
+});

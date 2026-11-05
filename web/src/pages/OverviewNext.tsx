@@ -13,6 +13,7 @@ import { useOverviewData } from "../lib/useOverviewData";
 import {
   mergeOverviewRows,
   overviewCounts,
+  overviewDecisions,
   ownRecoveryWaitCount,
   setupComplete,
   statusSentence,
@@ -20,6 +21,7 @@ import {
 } from "../lib/overview";
 import { UsageCard } from "../components/UsageCards";
 import { OnboardingChecklist } from "../components/OnboardingChecklist";
+import { NeedsDecisionCard } from "../components/NeedsDecisionCard";
 import { OverviewRunRow } from "../components/OverviewRunRow";
 import { WorkerLoadCard } from "../components/WorkerLoadCard";
 import { CustodyBoardAlert } from "../components/CustodyBoardAlert";
@@ -40,6 +42,7 @@ export function OverviewNext() {
   // The viewer's OWN runs: what the custody alert, the platform line and (from M2) the
   // decisions read. Never the admin rows, for an admin too.
   const ownRuns = data?.runs ?? [];
+  const decisions = overviewDecisions(ownRuns);
   // The counts follow the viewer's scope: own runs, or for an admin every user's runs
   // while the admin list is readable. An unreadable admin list falls back to the viewer's
   // own runs and the sentence says so.
@@ -50,9 +53,8 @@ export function OverviewNext() {
       : null;
   const sentence = data
     ? statusSentence({
-        // M2 wires the viewer's decisions and open pull requests.
-        decisions: 0,
-        prs: 0,
+        decisions: decisions.filter((d) => d.kind !== "pr").length,
+        prs: decisions.filter((d) => d.kind === "pr").length,
         counts: overviewCounts(factoryRows ?? ownRuns),
         acrossFactory: factoryRows != null,
         adminUnavailable,
@@ -89,7 +91,8 @@ export function OverviewNext() {
         />
       )}
 
-      {/* M2 inserts the "Needs your decision" card here. */}
+      {/* The viewer's own items only (decisions is computed from ownRuns). */}
+      <NeedsDecisionCard items={decisions} now={now} demo={demo} />
 
       {/* Same inputs as Dashboard: the viewer's own runs, never the admin rows. */}
       <CustodyBoardAlert recoveryWaitCount={ownRecoveryWaitCount(ownRuns)} />
