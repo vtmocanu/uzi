@@ -50,6 +50,18 @@ prevent approval or implementation. A summary still in flight at the first
 implementation checkpoint or at run end is not kept for the result, as for
 autopilot.
 
+On a Codex run, one failure is not silent. When the intent or plan summary is
+skipped because the run's Codex credential could not be used, the run's
+activity feed shows a single status line, for example "Plan summary skipped:
+the run's Codex account is unavailable. The run continues." The same line
+appears in `uzi run logs` and the terminal UI. It names one of four reasons:
+the credential needed a refresh that summaries may not do, the run owner's
+vault is locked, the run's Codex account is unavailable, or the provider
+rejected the credential. Only these four typed cases produce a line; a timeout,
+a network error, a refusal or an empty answer is still skipped silently. The
+line is informational: no summary is written, the run's outcome does not
+change, and the summary is not retried.
+
 Planning and seeded or pre-approved runs of all three kinds are eligible for
 an intent summary on both harnesses, unless an intent summary already exists.
 Intent generation runs alongside planning or implementation without delaying it.
@@ -129,7 +141,9 @@ that value is not a valid Claude model). Codex PR descriptions do not follow
 either lane: they use a fixed Codex model.
 
 Codex summary calls use the existing run credential and are denied credential
-refresh; an expired credential makes the summary fail.
+refresh. If the credential needs a refresh, or cannot be used for one of the
+reasons listed under [It's advisory](#its-advisory--failures-dont-stop-your-run),
+the summary is skipped and the run feed says so.
 The Now summary keeps its separate scheduler, switches and model selection.
 
 ## From the CLI

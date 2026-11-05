@@ -432,6 +432,10 @@ Tracked as GitLab issue vtmocanu/uzi#46; PRD at `prds/done/46-run-judge-self-imp
   `gpt-6-luna` (Codex); the Codex lane takes only Codex role models, the Claude lane
   rejects them; the Claude value also drives Claude PR descriptions. (#3248)
   (AI-synced 2026-11-05)
+- A Codex intent/plan summary skipped because the run's Codex credential could not
+  be used (refresh denied, vault locked, account unavailable, credential rejected;
+  typed evidence only) shows one fixed worker status line in the run feed; the run
+  continues. (#3248) (AI-synced 2026-11-05)
 - Per-user opt-in/out; admin can toggle the feature globally and force-disable
   per user (existing admin settings). [user 2026-07-12]
 - Recommendations show on the Judge page and the run page (users see their own)

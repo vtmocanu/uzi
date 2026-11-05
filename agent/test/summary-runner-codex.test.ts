@@ -180,3 +180,87 @@ describe("summary fixture pin (#3248)", () => {
     assert.equal(isCodexRoleModel(DEFAULT_CODEX_SUMMARY_MODEL), true);
   });
 });
+
+// Issue #3248 M3: stub-harness cases for the skip classification that the real advice harness
+// cannot produce (an `authorization` terminal) or cannot order deterministically (deny then timeout).
+describe("Codex summary skip reasons, stub harness (#3248 M3)", () => {
+  const root = testOwnedPassHomeRoot();
+  const claim = { run_id: "run-summary", secrets: { codex: bindings[0] } };
+  const failedTerminal = (category: string): HarnessTerminal => ({
+    ...success, outcome: "failed", subtype: "error_during_execution", errors: ["provider failed"],
+    failure: { materialize: () => ({ failure: { category, message: "x" }, original: new Error("x") }) } as never,
+  });
+  type Harness = (params: { onRefreshDenied?: () => void }, req: AdviceRequest, policy: AdviceResultPolicy, ctl: AbortController) => Promise<{ text: string; end: unknown }>;
+  async function drive(pass: "intent" | "plan", harness: Harness | "missing" | "malformed", timeoutMs = 1000) {
+    const ctl = new AbortController();
+    let claude = 0;
+    let builds = 0;
+    const factory = (async (params: { onRefreshDenied?: () => void }) => {
+      builds++;
+      return { kind: "codex", run: (req: AdviceRequest, policy: AdviceResultPolicy) => (harness as Harness)(params, req, policy, ctl) };
+    }) as unknown as CodexAdviceHarnessFactory;
+    const r = new SummaryRunner(nullLogger(), {
+      homeRoot: root, modelTimeoutMs: timeoutMs,
+      queryFn: (() => { claude++; throw new Error("unexpected Claude"); }) as unknown as SdkQueryFn,
+      codexAdviceHarnessFactory: harness === "missing" ? undefined : factory,
+    });
+    const reasons: string[] = [];
+    const input: IntentSummaryInput = {
+      ...base, signal: ctl.signal, onSkip: (reason) => { reasons.push(reason); },
+      claim: { run_id: "run-summary", secrets: { codex: harness === "malformed" ? { auth_mode: "subscription" } : claim.secrets.codex } },
+    };
+    const out = pass === "intent" ? await r.generateIntentSummary(input) : await r.generatePlanSummary({ ...input, planMd: "# Plan" });
+    return { out, reasons, claude, builds };
+  }
+
+  for (const pass of ["intent", "plan"] as const) {
+    describe(pass, () => {
+      it("an authorization error terminal stays silent", async () => {
+        const r = await drive(pass, async (_p, _req, policy) => {
+          const t = failedTerminal("authorization");
+          policy.onTerminal(t, { isError: true, latest: undefined });
+          return { text: "", end: { kind: "terminal", terminal: t } };
+        });
+        assert.deepEqual({ out: r.out, reasons: r.reasons, claude: r.claude, builds: r.builds }, { out: null, reasons: [], claude: 0, builds: 1 });
+      });
+      it("an authentication error terminal reports credential_rejected through the pass policy", async () => {
+        const r = await drive(pass, async (_p, _req, policy) => {
+          const t = failedTerminal("authentication");
+          policy.onTerminal(t, { isError: true, latest: undefined });
+          return { text: "", end: { kind: "terminal", terminal: t } };
+        });
+        assert.deepEqual({ out: r.out, reasons: r.reasons, claude: r.claude }, { out: null, reasons: ["credential_rejected"], claude: 0 });
+      });
+      it("a denied refresh then a model-pass timeout stays silent", async () => {
+        const r = await drive(pass, (p, req) => {
+          p.onRefreshDenied?.();
+          return new Promise((_, reject) => setTimeout(() => reject(new Error(`summary model call exceeded ${req.timeoutMs}ms`)), req.timeoutMs));
+        }, 80);
+        assert.deepEqual({ out: r.out, reasons: r.reasons, claude: r.claude }, { out: null, reasons: [], claude: 0 });
+      });
+      it("a denied refresh then an abort stays silent", async () => {
+        const r = await drive(pass, async (p, _req, _policy, ctl) => {
+          p.onRefreshDenied?.();
+          ctl.abort();
+          throw new Error("summary model call aborted");
+        });
+        assert.deepEqual({ out: r.out, reasons: r.reasons, claude: r.claude }, { out: null, reasons: [], claude: 0 });
+      });
+      it("a denied refresh then a thrown failure reports refresh_denied", async () => {
+        const r = await drive(pass, async (p) => {
+          p.onRefreshDenied?.();
+          throw new Error("codex advice transport failed");
+        });
+        assert.deepEqual({ out: r.out, reasons: r.reasons, claude: r.claude }, { out: null, reasons: ["refresh_denied"], claude: 0 });
+      });
+      it("a missing factory stays silent", async () => {
+        const r = await drive(pass, "missing");
+        assert.deepEqual({ out: r.out, reasons: r.reasons, claude: r.claude, builds: r.builds }, { out: null, reasons: [], claude: 0, builds: 0 });
+      });
+      it("a malformed codex binding stays silent", async () => {
+        const r = await drive(pass, "malformed");
+        assert.deepEqual({ out: r.out, reasons: r.reasons, claude: r.claude, builds: r.builds }, { out: null, reasons: [], claude: 0, builds: 0 });
+      });
+    });
+  }
+});

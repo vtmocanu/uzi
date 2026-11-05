@@ -20,7 +20,7 @@ import { diagramEvent, type DiagramParserReason, type DiagramReason } from "./di
 
 import { fenceNonce } from "./prompt.js";
 import { defaultQueryFn } from "./sdk-messages.js";
-import { runReadOnlyModelPass, type ReadOnlyModelPassOpts } from "./model-pass.js";
+import { ModelPassCredentialError, runReadOnlyModelPass, type ModelPassCredentialReason, type ReadOnlyModelPassOpts } from "./model-pass.js";
 import { extractJsonObject } from "./judge-runner.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
 import { selectCodexBinding } from "./codex/select.js"; // the pure, fail-closed claim-shape discriminator, NOT a Codex class construction
@@ -31,6 +31,10 @@ import { isCodexRoleModel } from "./codex/render.js";
 import type { DeliveryContext } from "./pr-description-context.js";
 import type { PrDescriptionDiagram } from "./protocol.js";
 import type { AdviceUsageSnapshot } from "./harness.js";
+
+/** Why a Codex intent or plan summary was skipped because the run's Codex credential could not be
+ *  used (issue #3248 M3). A closed set decided from typed evidence in the model pass. */
+export type SummarySkipReason = ModelPassCredentialReason;
 
 /** Which summary pass a usage report belongs to (the `summary_usage` message's `pass`). */
 export type SummaryPassName = "intent" | "plan" | "pr_description";
@@ -107,6 +111,9 @@ export interface IntentSummaryInput {
   /** Issue #2686: an external abort. Rejects the pass at once (the generation then returns
    *  null) and still delivers any already-observed usage through `onUsage`. */
   signal?: AbortSignal;
+  /** Issue #3248 M3: called at most once, on the Codex branch only, when the pass failed on a
+   *  typed credential-state refusal. The generator still returns null; a throw is swallowed. */
+  onSkip?(reason: SummarySkipReason): void;
 }
 
 export interface PlanSummaryInput extends IntentSummaryInput {
@@ -427,10 +434,12 @@ export class SummaryRunner {
    *  result so the public methods can catch → null. */
   private async runModel(pass: "intent" | "plan", input: IntentSummaryInput, prompt: string): Promise<string> {
     const reportUsage = this.usageReporter(pass, input.onUsage);
+    let onCodex = false;
     try {
       const selection = selectCodexBinding({ codex: input.claim?.secrets.codex });
       let harness: Pick<ReadOnlyModelPassOpts, "token" | "model" | "effort" | "codex">;
       if (selection.kind === "codex") {
+        onCodex = true;
         if (!this.codexAdviceHarnessFactory) throw new Error("Codex claim but no Codex advice-harness factory is wired");
         const configured = isCodexRoleModel(input.model);
         if (!configured && input.model !== "") {
@@ -464,6 +473,15 @@ export class SummaryRunner {
         onUsage: reportUsage.onUsage,
         ...(input.signal ? { signal: input.signal } : {}),
       });
+    } catch (err) {
+      if (onCodex && err instanceof ModelPassCredentialError) {
+        try {
+          input.onSkip?.(err.reason);
+        } catch (cbErr) {
+          this.log.warn("summary skip callback failed", { pass, error_class: errorClass(cbErr) });
+        }
+      }
+      throw err;
     } finally {
       reportUsage.finish();
     }
