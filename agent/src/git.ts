@@ -44,7 +44,7 @@ import {
   parseAttemptPath,
   parseRetainedArtifactName,
 } from "./attempt-path.js";
-import { GitIndexError, indexUnchanged, readBoundedIndex, statSignature, type BoundedIndex } from "./git-index.js";
+import { GitIndexError, indexUnchanged, readBoundedIndex, readSmallRegularFile, statSignature, type BoundedIndex } from "./git-index.js";
 import { InvalidRecoveryClonePathError, recoveryProgress, recoverySource, sameRecoverySource, type RecoveryBlocker, type RecoveryProgress, type RecoverySource } from "./recovery-progress.js";
 import { parseSourceFence, serializeSourceFence, type CompletionSourceFence } from "./completion-source.js";
 import type { GitAuthorityHooks, AuthoritySettlement } from "./git-authority-hooks.js";
@@ -1357,6 +1357,21 @@ const EPOCH_CLONE_CONFIG_KEYS: ReadonlySet<string> = new Set([
   "maintenance.auto", "gc.auto", "remote.origin.url", "remote.origin.fetch", "user.name", "user.email",
   "commit.gpgsign",
 ]);
+/**
+ * The only top-level entries of a settled runner clone's `.git` that the automatic worktree proof
+ * admits (verified by listing a clone made by `runnerCloneForBranch` after a commit). Anything else
+ * (`sequencer/`, `rebase-merge/`, `rebase-apply/`, `MERGE_*`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`,
+ * `BISECT_*`, `AUTO_MERGE`, `shallow`, `commondir`, `modules`, `worktrees`, `sharedindex.*`,
+ * `reftable`, ...) is an in-progress operation or state the proof cannot account for: a keep. Each
+ * admitted entry is typed by lstat (a real directory or a regular file, never a FIFO or link) before
+ * Git runs; the files are charged to the metadata budget.
+ */
+const EPOCH_GIT_DIR_DIRECTORIES: ReadonlySet<string> = new Set(["branches", "hooks", "info", "logs", "objects", "refs"]);
+const EPOCH_GIT_DIR_FILES: ReadonlySet<string> = new Set([
+  "HEAD", "config", "description", "index", "packed-refs", "COMMIT_EDITMSG", "ORIG_HEAD", "FETCH_HEAD",
+]);
+/** A `.git/HEAD` or loose ref file is a line of at most this many bytes. */
+const EPOCH_REF_FILE_MAX_BYTES = 1024;
 /** Levels of non-ignored untracked directories the automatic proof will expand (each is one `check-ignore`). */
 const EPOCH_UNTRACKED_EXPANSION_DEPTH = 32;
 const EPOCH_CLONE_CONFIG_KEY_PATTERNS: readonly RegExp[] = [/^branch\..+\.(?:remote|merge)$/];
@@ -3252,6 +3267,9 @@ export class GitCache {
       // option (it must not read any ignore file); `status` never lists untracked files and never
       // detects renames (rename detection reads blobs).
       sub === "ls-files" && exact(sub, "--others", "--directory", "-z") ||
+      // Index-versus-HEAD: the flattened HEAD tree, compared with the Node-parsed index entries.
+      // `ls-tree` never consults the index's cache-tree, which a forged index can lie through.
+      sub === "ls-tree" && exact(sub, "-r", "-z", "--full-tree", "HEAD") ||
       sub === "check-ignore" && exact(sub, "--no-index", "--stdin", "-z") ||
       sub === "status" && exact(sub, "--porcelain", "-uno", "--no-renames", "--ignore-submodules=none") ||
       sub === "rev-list" && tail[0] === "--objects" && tail[1] === "-n" && tail[2] === "1" &&
@@ -11575,9 +11593,11 @@ export class GitCache {
    * follows a split index, `commondir` and the clone's config. So everything that can steer or
    * enlarge that work is bounded and typed here in Node FIRST, on raw-byte paths, and a failure
    * keeps the source before any Git command runs:
-   *  0. `.git` is a real directory with no `commondir`, `info/attributes`, `info/sparse-checkout`,
-   *     `modules`, `reftable` or `sharedindex.*`; `.git/config`, `info/exclude` and `packed-refs`
-   *     are regular files (charged);
+   *  0. `.git` is a real directory whose every top-level entry is on an allowlist (see
+   *     `EPOCH_GIT_DIR_FILES`/`EPOCH_GIT_DIR_DIRECTORIES`; no `commondir`, `modules`, `reftable`,
+   *     `sharedindex.*`, sequencer or merge/rebase state) and typed, `info` holds only `exclude`;
+   *     the files are regular and charged; `HEAD` is a small regular file naming a branch ref (or
+   *     an object id) and that loose ref, when present, a small regular file holding an object id;
    *  1. `.git/index` is read once through a bounded descriptor and parsed ({@link readBoundedIndex}:
    *     SHA-1, version 2/3, no link/sdir/UNTR/FSMN extension, no assume-valid, skip-worktree,
    *     intent-to-add, staged or odd-mode entry);
@@ -11588,8 +11608,10 @@ export class GitCache {
    * and only then Git runs, every launch carrying the attribute/config pins and
    * `GIT_ATTR_NOSYSTEM`: a version check, the clone's config (strict key allowlist), the untracked
    * listing (no exclude option; an untracked `.gitignore`, `.gitattributes` or `.gitmodules` is a
-   * keep), `check-ignore` of that listing (the ignored set must equal it), and `status -uno
-   * --no-renames`. Finally the index and every recorded path are re-read: a change is a keep.
+   * keep), `check-ignore` of that listing (the ignored set must equal it), `ls-tree -r` of HEAD
+   * compared exactly with the parsed index entries (the index-versus-HEAD half, which `status`
+   * would answer from a forgeable cache-tree), and `status -uno --no-renames` for worktree versus
+   * index. Finally the index and every recorded path are re-read: a change is a keep.
    *
    * Three counters stay distinct so their limits can be set independently later: `metadataBytes`
    * (config, index, exclude, packed-refs and every Git output; limit `maxMetadataBytes`),
@@ -11626,10 +11648,6 @@ export class GitCache {
     const remember = (key: string, target: string | Buffer, st: import("node:fs").BigIntStats) =>
       fixed.set(key, { target, signature: statSignature(st) });
     const lstatPath = (p: string | Buffer) => read(() => fs.lstat(p, { bigint: true }));
-    const absent = async (p: string): Promise<boolean> => {
-      try { await lstatPath(p); return false; }
-      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return true; throw error; }
-    };
     // Entry names stay raw bytes (`encoding: "buffer"`); every entry is charged before it is visited.
     const listDirectory = async (dir: string | Buffer, visit?: (name: Buffer) => void): Promise<void> => {
       const handle = await read(() => fs.opendir(dir, { encoding: "buffer" as BufferEncoding }));
@@ -11647,17 +11665,6 @@ export class GitCache {
       // 0. Shape of `.git`.
       const gitDir = path.join(cwd, ".git");
       if (!(await lstatPath(gitDir)).isDirectory()) throw refusal(".git is not a real directory");
-      const infoDir = path.join(gitDir, "info");
-      let info: import("node:fs").BigIntStats | undefined;
-      try { info = await lstatPath(infoDir); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-      if (info && !info.isDirectory()) throw refusal(".git/info is not a real directory");
-      for (const rel of ["commondir", "modules", "reftable", ...(info ? ["info/attributes", "info/sparse-checkout"] : [])]) {
-        if (!(await absent(path.join(gitDir, rel)))) throw refusal(`.git/${rel} is present`);
-      }
-      await listDirectory(gitDir, name => {
-        if (name.toString("latin1").startsWith("sharedindex.")) throw refusal("split index shared file is present");
-      });
       const regular = async (file: string, required: boolean, what: string) => {
         let st: import("node:fs").BigIntStats;
         try { st = await lstatPath(file); }
@@ -11666,9 +11673,80 @@ export class GitCache {
         chargeMetadata(Number(st.size), what);
         remember("f:" + file, file, st);
       };
+      // Allowlist, not denylist: every top-level entry must be a known one of the right type, so
+      // no state file `status` or `ls-tree` might read (a sequencer todo, a rebase head-name, a
+      // merge head, ...) goes untyped or uncharged. The files charged below are charged once.
+      const gitEntries: Buffer[] = [];
+      await listDirectory(gitDir, name => gitEntries.push(name));
+      const chargedElsewhere = new Set(["config", "packed-refs", "index"]);
+      for (const raw of gitEntries) {
+        const entry = raw.toString("latin1");
+        const label = `.git/${sanitizeForLog(entry, 64)}`;
+        const isDirectory = EPOCH_GIT_DIR_DIRECTORIES.has(entry);
+        if (!isDirectory && !EPOCH_GIT_DIR_FILES.has(entry)) throw refusal(`${label} is not an admitted .git entry`);
+        const file = path.join(gitDir, entry);
+        if (isDirectory) {
+          const st = await lstatPath(file);
+          if (!st.isDirectory()) throw refusal(`${label} is not a real directory`);
+          // Only the directories Git resolves refs and excludes through are re-checked at the end.
+          if (entry === "refs" || entry === "info") remember("d:" + file, file, st);
+        } else if (!chargedElsewhere.has(entry)) {
+          // `description` is never read by Git here; it is typed but not charged.
+          if (entry === "description") {
+            const st = await lstatPath(file);
+            if (!st.isFile()) throw refusal(`${label} is not a regular file`);
+            remember("f:" + file, file, st);
+          } else await regular(file, true, label);
+        }
+      }
+      const infoDir = path.join(gitDir, "info");
+      if (gitEntries.some(raw => raw.toString("latin1") === "info")) {
+        // Only the clone's own exclude file: `attributes` and `sparse-checkout` steer Git.
+        await listDirectory(infoDir, name => {
+          if (name.toString("latin1") !== "exclude") throw refusal(".git/info holds an unadmitted entry");
+        });
+      }
       await regular(path.join(gitDir, "config"), true, ".git/config");
       await regular(path.join(infoDir, "exclude"), false, ".git/info/exclude");
       await regular(path.join(gitDir, "packed-refs"), false, ".git/packed-refs");
+
+      // HEAD names the one loose ref `status` and `ls-tree` resolve. Both it and that ref are
+      // small regular files read here through a bounded descriptor; a symbolic indirection, a
+      // link or a FIFO is a keep.
+      const headFile = await readSmallRegularFile(path.join(gitDir, "HEAD"), EPOCH_REF_FILE_MAX_BYTES, read)
+        .catch((error: unknown) => { throw error instanceof GitIndexError ? refusal(`.git/HEAD: ${error.message}`) : error; });
+      chargeMetadata(headFile.bytes.length, ".git/HEAD");
+      const headText = headFile.bytes.toString("latin1");
+      const symbolic = /^ref: (refs\/heads\/[A-Za-z0-9._/-]+)\n$/.exec(headText);
+      if (!symbolic && !/^[0-9a-f]{40}\n$/.test(headText)) throw refusal(".git/HEAD is neither a branch ref nor an object id");
+      fixed.set("f:HEAD", { target: path.join(gitDir, "HEAD"), signature: headFile.signature });
+      if (symbolic) {
+        const ref = symbolic[1]!;
+        const parts = ref.split("/");
+        if (parts.some(part => part === "" || part.startsWith(".") || part.endsWith(".lock") || part.includes("..")) || ref.endsWith("."))
+          throw refusal(".git/HEAD names an unsafe ref");
+        // Walk down from `.git`: every ancestor must be a real directory before the loose ref is
+        // looked at (a symlinked ancestor would hide a FIFO); a missing one means "packed".
+        let current = gitDir;
+        let looseRef: string | undefined;
+        for (const [i, part] of parts.entries()) {
+          current = path.join(current, part);
+          let st: import("node:fs").BigIntStats;
+          try { st = await lstatPath(current); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") break; throw error; }
+          if (i < parts.length - 1) {
+            if (!st.isDirectory()) throw refusal("a ref ancestor is not a real directory");
+            remember("d:" + current, current, st);
+          } else looseRef = current;
+        }
+        if (looseRef) {
+          const loose = await readSmallRegularFile(looseRef, EPOCH_REF_FILE_MAX_BYTES, read)
+            .catch((error: unknown) => { throw error instanceof GitIndexError ? refusal(`loose ref: ${error.message}`) : error; });
+          chargeMetadata(loose.bytes.length, "loose ref");
+          if (!/^[0-9a-f]{40}\n$/.test(loose.bytes.toString("latin1"))) throw refusal("loose ref is not an object id");
+          fixed.set("f:" + looseRef, { target: looseRef, signature: loose.signature });
+        }
+      }
 
       // 1. The index, parsed by us before Git reads it.
       const indexPath = path.join(gitDir, "index");
@@ -11771,6 +11849,24 @@ export class GitCache {
         if (exact !== undefined && value !== exact) throw refusal(`clone config ${key} has an unadmitted value`);
       }
 
+      // Index versus HEAD, from the entries themselves. `status` cannot be trusted for this half:
+      // it consults the index's cache-tree extension, and a forged one that claims a subtree equals
+      // HEAD's makes a staged change vanish from its output. `ls-tree` never reads the cache-tree.
+      // Every entry must match, byte for byte and in order, the flattened HEAD tree (gitlinks print
+      // as `commit`, symlinks as 120000).
+      const headTree = await git(["ls-tree", "-r", "-z", "--full-tree", "HEAD"], NO_REPLACE_ENV, { encoding: "latin1" });
+      chargeMetadata(headTree.length, "ls-tree output");
+      this.automaticCollection(headTree, "\0");
+      if (headTree !== "" && !headTree.endsWith("\0")) throw refusal("unterminated ls-tree output");
+      const headRows = headTree === "" ? [] : headTree.slice(0, -1).split("\0");
+      if (headRows.length !== index.entries.length) throw refusal("index differs from HEAD");
+      for (const [i, row] of headRows.entries()) {
+        const m = /^([0-7]{6}) (blob|commit) ([0-9a-f]{40})\t([\s\S]*)$/.exec(row);
+        const entry = index.entries[i]!;
+        if (!m || m[1] !== entry.mode.toString(8).padStart(6, "0") || m[3] !== entry.sha ||
+            !Buffer.from(m[4]!, "latin1").equals(entry.path)) throw refusal("index differs from HEAD");
+      }
+
       // Untracked entries: listed without any exclude option, so no ignore file is read here. A
       // collapsed untracked directory is one record. A record that is not itself ignored (a clone
       // always has `.uzi/`, whose only content is the ignored `scratch`) is expanded one level at a
@@ -11809,7 +11905,7 @@ export class GitCache {
         for (const { name, directory } of frontier) {
           if (matched.has(name)) continue;
           // A file that is not ignored is untracked content. A directory that is not ignored is
-          // clean only if everything inside it is ignored (or it is empty, which Git never lists).
+          // clean only if everything inside it is ignored (an empty directory is listed too and expands to nothing).
           if (!directory) throw refusal("an untracked file is not ignored");
           const dir = Buffer.from(name, "latin1");
           const before = await lstatPath(absolute(dir));

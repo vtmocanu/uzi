@@ -5,9 +5,11 @@ import fs from "node:fs/promises";
 /**
  * Bounded, read-only parser for a Git index file (`.git/index`), used by the automatic epoch
  * worktree proof so that nothing Git does is the first reader of a hostile index. It admits the
- * plain SHA-1 formats the runner clones use and REFUSES everything else rather than interpreting
- * it: version 4 (prefix-compressed names), split indexes (`link`), sparse directories (`sdir`),
- * the untracked cache (`UNTR`), fsmonitor (`FSMN`) and every unknown extension. Per entry it also
+ * plain SHA-1 formats the runner clones use (versions 2, 3 and 4; version 4 prefix-compresses names)
+ * and REFUSES everything else rather than interpreting it: split indexes (`link`), sparse
+ * directories (`sdir`), the untracked cache (`UNTR`), fsmonitor (`FSMN`) and every unknown extension.
+ * The `TREE` cache-tree extension is only skipped, never trusted: a forged one can claim an
+ * unchanged subtree, so index-versus-HEAD must be compared from the entries themselves. Per entry it also
  * refuses the flags that hide a worktree difference from `git status` (assume-valid,
  * skip-worktree, intent-to-add), any merge stage, and any mode other than a regular file,
  * executable, symlink or gitlink. Paths stay raw bytes: Git paths need not be UTF-8.
@@ -28,10 +30,20 @@ export interface GitIndexEntry {
   assumeValid: boolean;
   skipWorktree: boolean;
   intentToAdd: boolean;
+  /** Raw stat data as stored, kept so a caller can later detect racily-clean entries. */
+  ctimeS: number;
+  ctimeNs: number;
+  mtimeS: number;
+  mtimeNs: number;
+  dev: number;
+  ino: number;
+  uid: number;
+  gid: number;
+  size: number;
 }
 
 export interface ParsedGitIndex {
-  version: 2 | 3;
+  version: 2 | 3 | 4;
   entries: GitIndexEntry[];
   /** The verified SHA-1 trailer. */
   trailer: Buffer;
@@ -55,6 +67,9 @@ const EXT_INTENT_TO_ADD = 0x2000;
 const ALLOWED_EXTENSIONS: ReadonlySet<string> = new Set(["TREE", "REUC", "EOIE", "IEOT"]);
 const ALLOWED_MODES: ReadonlySet<number> = new Set([0o100644, 0o100755, 0o120000, 0o160000]);
 
+/** A path longer than this cannot exist; it also bounds each rebuilt version 4 name. */
+const MAX_V4_PATH = 4096;
+
 const refused = (message: string): never => { throw new GitIndexError("refused", message); };
 const limit = (message: string): never => { throw new GitIndexError("limit", message); };
 
@@ -74,14 +89,15 @@ function checkTrackedPath(name: Buffer): void {
 /**
  * Parse and verify one index image. `strict` (the default) applies the full refusal policy.
  * `inspect` keeps the structural checks but reports per-entry flags, stages and modes instead of
- * refusing them; it exists so a differential test can compare the parser with `git ls-files`.
+ * refusing them, and walks any extension by its length alone; it exists so a differential test can
+ * compare the parser with `git ls-files`.
  */
 export function parseGitIndex(buf: Buffer, limits: GitIndexLimits, policy: "strict" | "inspect" = "strict"): ParsedGitIndex {
   const strict = policy === "strict";
   if (buf.length < HEADER_BYTES + TRAILER_BYTES) refused("index is too short");
   if (buf.toString("latin1", 0, 4) !== "DIRC") refused("index signature");
   const version = buf.readUInt32BE(4);
-  if (version !== 2 && version !== 3) refused("unsupported index version");
+  if (version !== 2 && version !== 3 && version !== 4) refused("unsupported index version");
   const count = buf.readUInt32BE(8);
   if (count > limits.maxEntries) limit("index entry limit");
   const end = buf.length - TRAILER_BYTES;
@@ -104,22 +120,48 @@ export function parseGitIndex(buf: Buffer, limits: GitIndexLimits, policy: "stri
       extended = buf.readUInt16BE(nameOffset);
       nameOffset += 2;
     }
-    let nameLength = flags & NAME_SATURATED;
-    if (nameLength === NAME_SATURATED) {
-      const nul = buf.indexOf(0, nameOffset);
+    let name: Buffer;
+    let size: number;
+    if (version === 4) {
+      // Prefix-compressed: a varint count of bytes to strip from the previous name, then the
+      // NUL-terminated suffix. No padding follows. The flags' length field is not used.
+      let at = nameOffset;
+      let strip = 0;
+      for (let first = true, byte = 0x80; byte & 0x80; first = false) {
+        if (at >= end) refused("truncated version 4 path");
+        byte = buf[at++]!;
+        strip = first ? byte & 0x7f : ((strip + 1) * 128) + (byte & 0x7f);
+        if (strip > MAX_V4_PATH) refused("version 4 strip length");
+      }
+      const previousName = previous ?? Buffer.alloc(0);
+      if (strip > previousName.length) refused("version 4 strip length exceeds the previous path");
+      const nul = buf.indexOf(0, at);
       if (nul < 0 || nul >= end) refused("unterminated index path");
-      nameLength = nul - nameOffset;
-    } else if (nameOffset + nameLength >= end || buf[nameOffset + nameLength] !== 0) {
-      refused("index path length");
+      const keep = previousName.length - strip;
+      if (keep + (nul - at) > MAX_V4_PATH) refused("version 4 path exceeds PATH_MAX");
+      name = Buffer.concat([previousName.subarray(0, keep), buf.subarray(at, nul)]);
+      size = nul + 1 - p;
+    } else {
+      let nameLength = flags & NAME_SATURATED;
+      if (nameLength === NAME_SATURATED) {
+        const nul = buf.indexOf(0, nameOffset);
+        if (nul < 0 || nul >= end) refused("unterminated index path");
+        nameLength = nul - nameOffset;
+      } else if (nameOffset + nameLength >= end || buf[nameOffset + nameLength] !== 0) {
+        refused("index path length");
+      }
+      name = Buffer.from(buf.subarray(nameOffset, nameOffset + nameLength));
+      if (name.includes(0)) refused("index path contains NUL");
+      size = (nameOffset + nameLength + 8 - p) & ~7;
     }
-    const name = Buffer.from(buf.subarray(nameOffset, nameOffset + nameLength));
-    if (name.includes(0)) refused("index path contains NUL");
-    const size = (nameOffset + nameLength + 8 - p) & ~7;
     if (p + size > end) refused("index entry padding");
     const entry: GitIndexEntry = {
       path: name, mode, sha: buf.toString("hex", p + 40, p + 60), stage: (flags >> 12) & 3,
       assumeValid: (flags & FLAG_ASSUME_VALID) !== 0,
       skipWorktree: (extended & EXT_SKIP_WORKTREE) !== 0, intentToAdd: (extended & EXT_INTENT_TO_ADD) !== 0,
+      ctimeS: buf.readUInt32BE(p), ctimeNs: buf.readUInt32BE(p + 4), mtimeS: buf.readUInt32BE(p + 8),
+      mtimeNs: buf.readUInt32BE(p + 12), dev: buf.readUInt32BE(p + 16), ino: buf.readUInt32BE(p + 20),
+      uid: buf.readUInt32BE(p + 28), gid: buf.readUInt32BE(p + 32), size: buf.readUInt32BE(p + 36),
     };
     if (strict) {
       if (entry.assumeValid) refused("assume-valid entry");
@@ -140,13 +182,13 @@ export function parseGitIndex(buf: Buffer, limits: GitIndexLimits, policy: "stri
     const signature = buf.toString("latin1", p, p + 4);
     const length = buf.readUInt32BE(p + 4);
     if (length > end - p - 8) refused("index extension length");
-    if (!ALLOWED_EXTENSIONS.has(signature)) {
+    if (strict && !ALLOWED_EXTENSIONS.has(signature)) {
       refused(`unsupported index extension ${/^[A-Za-z]{4}$/.test(signature) ? signature : "(non-alphabetic)"}`);
     }
     extensions.push(signature);
     p += 8 + length;
   }
-  return { version: version as 2 | 3, entries, trailer, extensions };
+  return { version: version as 2 | 3 | 4, entries, trailer, extensions };
 }
 
 /** Identity and size of a file as lstat saw it; any difference later means the file changed. */
@@ -193,6 +235,37 @@ export async function readBoundedIndex(file: string,
     const after = await step(() => handle.stat({ bigint: true }));
     if (statSignature(after) !== statSignature(opened)) refused("index changed while reading");
     return { ...parseGitIndex(buf, options), signature: statSignature(before), size };
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Read one small regular file whole: lstat it as a regular file at most `maxBytes` long, open it
+ * without following links and without blocking, check the descriptor is that file and that nothing
+ * changed or grew while reading. Returns the bytes and the lstat {@link statSignature}.
+ */
+export async function readSmallRegularFile(file: string, maxBytes: number,
+  step: Step = direct): Promise<{ bytes: Buffer; signature: string }> {
+  const before = await step(() => fs.lstat(file, { bigint: true }));
+  if (!before.isFile()) refused("not a regular file");
+  if (before.size > BigInt(Math.max(0, maxBytes))) limit("file byte limit");
+  const size = Number(before.size);
+  const handle = await step(() => fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK));
+  try {
+    const opened = await step(() => handle.stat({ bigint: true }));
+    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino || opened.size !== before.size)
+      refused("file changed while opening");
+    const bytes = Buffer.allocUnsafe(size);
+    let read = 0;
+    while (read < size) {
+      const { bytesRead } = await step(() => handle.read(bytes, read, size - read, read));
+      if (bytesRead === 0) refused("file truncated while reading");
+      read += bytesRead;
+    }
+    if ((await step(() => handle.read(Buffer.alloc(1), 0, 1, size))).bytesRead !== 0) refused("file grew while reading");
+    if (statSignature(await step(() => handle.stat({ bigint: true }))) !== statSignature(opened)) refused("file changed while reading");
+    return { bytes, signature: statSignature(before) };
   } finally {
     await handle.close();
   }
