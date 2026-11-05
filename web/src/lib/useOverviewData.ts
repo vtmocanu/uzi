@@ -208,19 +208,23 @@ export function useOverviewData(opts?: { includeAdminRuns?: boolean; includeReco
   const [holds, setHolds] = useState<RecoveryCustodyHolds | null>(null);
   const [holdsRequestFailed, setHoldsRequestFailed] = useState(false);
   // The mount fetch is outside the poll's in-flight gate, so a slow first response can settle after
-  // a newer one: only the latest issued request may write state (like adminRequestIdRef).
+  // a newer one. A response applies when it is newer than the last APPLIED success, not only when it
+  // is the latest issued: a newer request that hangs or fails must not discard good data that did
+  // arrive, while an older response never overwrites a newer one.
   const holdsRequestIdRef = useRef(0);
+  const holdsAppliedIdRef = useRef(0);
   const loadHolds = useCallback(async () => {
     if (!holdsEnabled) return;
     const id = ++holdsRequestIdRef.current;
     try {
       const next = await api.getRecoveryHolds();
-      if (!pollAliveRef.current || holdsRequestIdRef.current !== id) return;
+      if (!pollAliveRef.current || id <= holdsAppliedIdRef.current) return;
+      holdsAppliedIdRef.current = id;
       setHolds(next);
       setHoldsRequestFailed(false);
     } catch {
       // keep the last-good holds
-      if (!pollAliveRef.current || holdsRequestIdRef.current !== id) return;
+      if (!pollAliveRef.current || id <= holdsAppliedIdRef.current) return;
       setHoldsRequestFailed(true);
     }
   }, [holdsEnabled]);
