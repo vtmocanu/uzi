@@ -53,14 +53,14 @@ func TestWorkerListRecoveryHoldsOpenHoldCount(t *testing.T) {
 	t.Run("capability off", func(t *testing.T) {
 		st := newStore()
 		code, body := get(st, []string{capability.RecoveryInventoryV1}, "")
-		if _, present := body["open_holds_all_workers"]; code != 200 || present || len(st.calls) != 0 {
+		if _, present := body["run_open_holds"]; code != 200 || present || len(st.calls) != 0 {
 			t.Fatalf("code=%d body=%v count calls=%d", code, body, len(st.calls))
 		}
 	})
 	t.Run("capability on", func(t *testing.T) {
 		st := newStore()
 		code, body := get(st, []string{capability.RecoveryRunOpenHoldsV1}, "")
-		got, _ := body["open_holds_all_workers"].(map[string]any)
+		got, _ := body["run_open_holds"].(map[string]any)
 		if code != 200 || got["run_id"] != run.String() || got["count"] != float64(4) || len(body["holds"].([]any)) != 1 {
 			t.Fatalf("code=%d body=%v", code, body)
 		}
@@ -73,7 +73,7 @@ func TestWorkerListRecoveryHoldsOpenHoldCount(t *testing.T) {
 			st := newStore()
 			st.countErr = err
 			code, body := get(st, []string{capability.RecoveryRunOpenHoldsV1}, "")
-			if _, present := body["open_holds_all_workers"]; code != 200 || present || len(body["holds"].([]any)) != 1 {
+			if _, present := body["run_open_holds"]; code != 200 || present || len(body["holds"].([]any)) != 1 {
 				t.Fatalf("code=%d body=%v", code, body)
 			}
 		})
@@ -81,7 +81,7 @@ func TestWorkerListRecoveryHoldsOpenHoldCount(t *testing.T) {
 	t.Run("exact generation branch never counts", func(t *testing.T) {
 		st := newStore()
 		code, body := get(st, []string{capability.RecoveryRunOpenHoldsV1, capability.RecoveryBindinglessClosedV1}, "?generation=0")
-		if _, present := body["open_holds_all_workers"]; code != 200 || present || len(st.calls) != 0 {
+		if _, present := body["run_open_holds"]; code != 200 || present || len(st.calls) != 0 {
 			t.Fatalf("code=%d body=%v count calls=%d", code, body, len(st.calls))
 		}
 	})
