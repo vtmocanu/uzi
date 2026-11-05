@@ -29,7 +29,17 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 ## [Unreleased]
 
-## [0.86.1] - 2026-11-01
+## [0.87.0] - 2026-11-05
+
+### Fixed
+
+- **A worker delete refused for held work now shows why, at the worker ([#3921](https://github.com/vtmocanu/uzi/pull/3921), [#3949](https://github.com/vtmocanu/uzi/pull/3949)).**
+  The refusal lists the blocking custody holds in the worker's row with links to each exact hold, recovery first, and `uzi worker rm` prints them and carries them in `--json`.
+
+- **Milestone reconciliation audit snapshots no longer drop when the run has large plan or issue text ([#3945](https://github.com/vtmocanu/uzi/pull/3945), [#3947](https://github.com/vtmocanu/uzi/pull/3947)).**
+  Before and after snapshots now carry a fixed set of reconciliation fields instead of the whole run row, so unrelated plan and issue text no longer pushes them over the audit size limit.
+
+## [0.86.1] - 2026-11-05
 
 ### Added
 
@@ -6501,7 +6511,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.86.1...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.87.0...HEAD
+[0.87.0]: https://github.com/vtmocanu/uzi/compare/v0.86.1...v0.87.0
 [0.86.1]: https://github.com/vtmocanu/uzi/compare/v0.86.0...v0.86.1
 [0.86.0]: https://github.com/vtmocanu/uzi/compare/v0.85.2...v0.86.0
 [0.85.2]: https://github.com/vtmocanu/uzi/compare/v0.85.1...v0.85.2

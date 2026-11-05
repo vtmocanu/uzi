@@ -7,7 +7,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -15,6 +17,7 @@ import (
 // health_long_tool_call_test.go pins issue #2046: a running run whose oldest open LEAD
 // tool call has been in flight longer than health_tool_call_seconds, on a run that has
 // also gone quiet for the stall window, is flagged stalled with reasonLongToolCall.
+// Issue #3950 adds the sibling arm for an open delegation (Agent / Task), reasonSilentDelegation.
 // Every case drives detectRunHealth through healthFakeStore.messages, so the lead-lane
 // window, the created_at ageing and the arm's guards are exercised together.
 
@@ -210,11 +213,16 @@ func TestHealthLongToolCallTailOverflow(t *testing.T) {
 	wantHealth(t, "open call inside the tail", h, why, healthStalled, reasonLongToolCall)
 }
 
-func TestHealthLongToolCallSkipsOpenDelegation(t *testing.T) {
+// TestHealthLongToolCallOpenDelegationTakesSilentDelegationArm: an open delegation never
+// takes the long-call arm; once the run is silent past the threshold it takes the
+// silent-delegation arm instead (issue #3950), and below it the run stays ok.
+func TestHealthLongToolCallOpenDelegationTakesSilentDelegationArm(t *testing.T) {
 	for _, name := range []string{"Agent", "Task"} {
 		m := []fakeRunMessage{lcUse(t, 1, "d", name, 25*time.Minute)}
 		h, why := lcDetect(t, lcRun(25*time.Minute), m, longCallSettings())
-		wantHealth(t, "old open "+name, h, why, healthOK, "")
+		wantHealth(t, "old open "+name, h, why, healthStalled, reasonSilentDelegation)
+		h, why = lcDetect(t, lcRun(19*time.Minute), m, longCallSettings())
+		wantHealth(t, "19m-quiet open "+name, h, why, healthOK, "")
 	}
 	// A delegation does not launder an ordinary old call next to it.
 	m := []fakeRunMessage{
@@ -222,7 +230,162 @@ func TestHealthLongToolCallSkipsOpenDelegation(t *testing.T) {
 		lcUse(t, 2, "b", "Bash", 25*time.Minute),
 	}
 	h, why := lcDetect(t, lcRun(25*time.Minute), m, longCallSettings())
-	wantHealth(t, "old Agent plus old Bash", h, why, healthOK, "")
+	wantHealth(t, "old Agent plus old Bash", h, why, healthStalled, reasonSilentDelegation)
+	h, why = lcDetect(t, lcRun(6*time.Minute), m, longCallSettings())
+	wantHealth(t, "old Agent plus old Bash, 6m quiet", h, why, healthOK, "")
+	h, why = lcDetect(t, lcRun(19*time.Minute), m, longCallSettings())
+	wantHealth(t, "old Agent plus old Bash, 19m quiet", h, why, healthOK, "")
+}
+
+func agentOpen(t *testing.T, name string) []fakeRunMessage {
+	return []fakeRunMessage{lcUse(t, 1, "d", name, 3*time.Hour)}
+}
+
+func TestHealthSilentDelegationThreshold(t *testing.T) {
+	for _, name := range []string{"Agent", "Task"} {
+		m := agentOpen(t, name)
+		h, why := lcDetect(t, lcRun(19*time.Minute), m, longCallSettings())
+		wantHealth(t, name+" 19m", h, why, healthOK, "")
+		h, why = lcDetect(t, lcRun(20*time.Minute), m, longCallSettings())
+		wantHealth(t, name+" 20m", h, why, healthStalled, reasonSilentDelegation)
+	}
+
+	// The threshold is max(toolCall, stall): a larger stall wins.
+	big := fakeHealthSettings{enabled: true, stall: 1800, toolCall: 1200}
+	m := agentOpen(t, "Agent")
+	h, why := lcDetect(t, lcRun(25*time.Minute), m, big)
+	wantHealth(t, "stall 1800, 25m", h, why, healthOK, "")
+	h, why = lcDetect(t, lcRun(30*time.Minute), m, big)
+	wantHealth(t, "stall 1800, 30m", h, why, healthStalled, reasonSilentDelegation)
+
+	// stall disabled: the tool-call threshold alone.
+	noStall := fakeHealthSettings{enabled: true, stall: 0, toolCall: 1200}
+	h, why = lcDetect(t, lcRun(19*time.Minute), m, noStall)
+	wantHealth(t, "stall 0, 19m", h, why, healthOK, "")
+	h, why = lcDetect(t, lcRun(20*time.Minute), m, noStall)
+	wantHealth(t, "stall 0, 20m", h, why, healthStalled, reasonSilentDelegation)
+
+	// toolCall 0 disables the arm; the stalled arm is suppressed by the open call.
+	off := fakeHealthSettings{enabled: true, stall: 300, toolCall: 0}
+	for _, q := range []time.Duration{25 * time.Minute, 3 * time.Hour} {
+		h, why = lcDetect(t, lcRun(q), m, off)
+		if why == reasonSilentDelegation {
+			t.Errorf("toolCall=0, %v quiet: silent-delegation fired", q)
+		}
+		wantHealth(t, fmt.Sprintf("toolCall 0, %v", q), h, why, healthOK, "")
+	}
+}
+
+func TestHealthSilentDelegationBaseline(t *testing.T) {
+	m := agentOpen(t, "Agent")
+	// started_at later than last_activity_at is the baseline (GREATEST).
+	r := lcRun(3 * time.Hour)
+	r.StartedAt = ago(19 * time.Minute)
+	h, why := lcDetect(t, r, m, longCallSettings())
+	wantHealth(t, "started 19m ago", h, why, healthOK, "")
+	r.StartedAt = ago(20 * time.Minute)
+	h, why = lcDetect(t, r, m, longCallSettings())
+	wantHealth(t, "started 20m ago", h, why, healthStalled, reasonSilentDelegation)
+
+	// No baseline at all: never flagged.
+	r = lcRun(0)
+	r.StartedAt = pgtype.Timestamptz{}
+	r.LastActivityAt = pgtype.Timestamptz{}
+	h, why = lcDetect(t, r, m, longCallSettings())
+	wantHealth(t, "no baseline", h, why, healthOK, "")
+}
+
+func TestHealthSilentDelegationOutboxQueuedForOwner(t *testing.T) {
+	r := lcRun(25 * time.Minute)
+	w := uuid.New()
+	r.WorkerID = pgconv.UUID(w)
+	fs := &healthFakeStore{
+		active:   []store.ListActiveRunsForHealthRow{r},
+		messages: map[uuid.UUID][]fakeRunMessage{r.ID: agentOpen(t, "Agent")},
+	}
+	svc := healthSvc(fs, longCallSettings())
+	svc.outbox.record(w, []OutboxEntry{{RunID: r.ID, PendingMessages: 3, Since: t0.Add(-time.Minute)}}, t0)
+	svc.detectRunHealth(context.Background(), t0)
+	got := lastWrite(t, fs, r.ID)
+	if got.Health != healthStalled || got.HealthReason.String != reasonOutboxQueued {
+		t.Fatalf("(health, reason) = (%q, %q), want stalled/%q", got.Health, got.HealthReason.String, reasonOutboxQueued)
+	}
+}
+
+func TestHealthSilentDelegationPrecedence(t *testing.T) {
+	st := fakeHealthSettings{enabled: true, stall: 300, toolCall: 1200, nearTimeoutPct: 85}
+
+	// Outranks near-timeout.
+	r := lcRun(25 * time.Minute)
+	r.StartedAt = ago(110 * time.Minute)
+	h, why := lcDetect(t, r, agentOpen(t, "Agent"), st)
+	wantHealth(t, "past near-timeout with silent delegation", h, why, healthStalled, reasonSilentDelegation)
+	// Control: delegation closed.
+	closed := []fakeRunMessage{lcUse(t, 1, "d", "Agent", 3*time.Hour), lcRes(t, 2, "d")}
+	h, why = lcDetect(t, r, closed, fakeHealthSettings{enabled: true, stall: 0, toolCall: 1200, nearTimeoutPct: 85})
+	wantHealth(t, "delegation closed control", h, why, healthSlow, reasonNearTimeout)
+
+	// Active account cooldown outranks it.
+	r = lcRun(25 * time.Minute)
+	r.StartedAt = ago(time.Hour) // well inside the wall-clock budget
+	r.AccountCooldownClass = pgconv.TextOrNull("rate_limit")
+	r.AccountCooldownEligibleAt = pgconv.Time(t0.Add(time.Minute))
+	h, why = lcDetect(t, r, agentOpen(t, "Agent"), longCallSettings())
+	wantHealth(t, "account cooldown", h, why, healthWaitingAccountCooldown, apitypes.AccountCooldownReason)
+
+	// Looping outranks it.
+	var loop []fakeRunMessage
+	for i := int32(0); i < 5; i++ {
+		id := fmt.Sprintf("loop-%d", i)
+		loop = append(loop, fakeMsg(t, 2*i+1, "tool_use", "", map[string]any{"id": id, "name": "Bash", "input": map[string]any{"command": "same"}}))
+		if i < 4 {
+			loop = append(loop, fakeMsg(t, 2*i+2, "tool_result", "", map[string]any{"tool_use_id": id, "content": "same output"}))
+		}
+	}
+	loop[len(loop)-1] = lcUse(t, 9, "loop-4", "Bash", 25*time.Minute)
+	loop = append(loop, lcUse(t, 10, "d", "Agent", 25*time.Minute))
+	h, why = lcDetect(t, lcRun(25*time.Minute), loop, longCallSettings())
+	wantHealth(t, "looping with open Agent", h, why, healthLooping, reasonLooping)
+}
+
+func TestHealthSilentDelegationIgnoresDispatchBeforeABoundary(t *testing.T) {
+	for _, event := range []string{"init", "result"} {
+		m := []fakeRunMessage{
+			lcUse(t, 1, "d", "Agent", 25*time.Minute),
+			fakeMsg(t, 2, "status", "", map[string]any{"event": event}),
+		}
+		h, why := lcDetect(t, lcRun(25*time.Minute), m, longCallSettings())
+		wantHealth(t, event+" boundary", h, why, healthStalled, reasonStalled)
+	}
+}
+
+// TestHealthSilentDelegationUnderNestedTraffic is the issue #1394 shape: a parent Agent
+// with 50 completed nested pairs. Quiet below the threshold stays ok.
+func TestHealthSilentDelegationUnderNestedTraffic(t *testing.T) {
+	const parent = "parent-agent"
+	msgs := []fakeRunMessage{
+		fakeMsg(t, 1, "status", "", map[string]any{"event": "init", "model": "m"}),
+		fakeMsg(t, 2, "tool_use", "", map[string]any{"id": parent, "name": "Agent", "input": map[string]any{"description": "work"}}),
+	}
+	seq := int32(3)
+	for i := 0; i < 50; i++ {
+		id := fmt.Sprintf("nested-%d", i)
+		msgs = append(msgs,
+			fakeMsg(t, seq, "tool_use", parent, map[string]any{"id": id, "name": "Read", "input": map[string]any{"file_path": fmt.Sprintf("f%d.go", i)}}),
+			fakeMsg(t, seq+1, "tool_result", parent, map[string]any{"tool_use_id": id}),
+		)
+		seq += 2
+	}
+	h, why := lcDetect(t, lcRun(19*time.Minute), msgs, longCallSettings())
+	wantHealth(t, "nested traffic, 19m", h, why, healthOK, "")
+	h, why = lcDetect(t, lcRun(20*time.Minute), msgs, longCallSettings())
+	wantHealth(t, "nested traffic, 20m", h, why, healthStalled, reasonSilentDelegation)
+}
+
+func TestHealthSilentDelegationReasonIsFixedString(t *testing.T) {
+	if reasonSilentDelegation != "a delegated subagent has sent no updates for longer than the configured threshold" {
+		t.Errorf("reasonSilentDelegation = %q", reasonSilentDelegation)
+	}
 }
 
 func TestHealthLongToolCallDelegationBeyondTailIsCoveredByQuietGuard(t *testing.T) {

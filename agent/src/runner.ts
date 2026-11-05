@@ -9745,6 +9745,26 @@ export class RunRunner {
         run_id: runId,
       });
     };
+    // #3944: the one orphan-guard probe shared by the three report-only sites below. It also
+    // proves a publish whose ack was lost (the attempted tip), and for an ISSUE run only lets
+    // hasCommittedCheckpoint discount a provably work-bearing but stale LOCAL mirror when origin
+    // answers that the checkpoint ref is gone (the claim fetch never prunes the mirror).
+    const hasPublishedCheckpoint = (): Promise<boolean> =>
+      this.git.hasCommittedCheckpoint(barePath, runnerClone.branch,
+        landedCheckpoint ? { tip: flight.lastCheckpointRefTip } : undefined,
+        flight.checkpointCoordinates?.checkpoint_key ?? (flight.runKind === "task" ? null : runnerClone.branch),
+        {
+          attemptedTip: flight.lastAttemptedCheckpointRefTip,
+          ...(resolveRunKind(claim.kind) === "issue"
+            ? {
+              originProbe: {
+                pat: claim.secrets.forge_pat,
+                repoUrl: claim.repo.clone_url,
+                username: claim.secrets.forge_username,
+              },
+            }
+            : {}),
+        });
     if (result.reportOnly) {
       // #299/#2967: report-only opens no MR to supersede a published checkpoint.
       // Check the prior/cross-worker mirrored ref AND this worker's exact confirmed
@@ -9752,10 +9772,7 @@ export class RunRunner {
       // carries no content; retained commits with differing trees still block.
       // Missing evidence for a confirmed publication blocks. The prior-worker
       // marker-only park exception remains in hasCommittedCheckpoint.
-      const publishedCheckpoint =
-        await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch,
-          landedCheckpoint ? { tip: flight.lastCheckpointRefTip } : undefined,
-          flight.checkpointCoordinates?.checkpoint_key ?? (flight.runKind === "task" ? null : runnerClone.branch));
+      const publishedCheckpoint = await hasPublishedCheckpoint();
       if (publishedCheckpoint) {
         if (resolveRunKind(claim.kind) !== "issue") {
           await failReportOnlyOrphan();
@@ -10073,10 +10090,7 @@ export class RunRunner {
         // which (PRD #759) ignores a marker-only `wip(park):` checkpoint while a real
         // committed milestone still blocks.
         if (result.scopeCapped) {
-          const publishedCheckpoint =
-            await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch,
-              landedCheckpoint ? { tip: flight.lastCheckpointRefTip } : undefined,
-              flight.checkpointCoordinates?.checkpoint_key ?? (flight.runKind === "task" ? null : runnerClone.branch));
+          const publishedCheckpoint = await hasPublishedCheckpoint();
           if (!publishedCheckpoint) {
             // Bind a zero slice to its committed base in the runner-owned clone, without pushing.
             let cappedHead: string | undefined;
@@ -10155,10 +10169,7 @@ export class RunRunner {
         // mirrored and exact confirmed-published tips. Only positively proven
         // published-boundary coverage (or the existing mirrored park-marker exception)
         // carries no committed content; unknown confirmed publication still blocks.
-        const publishedCheckpoint =
-          await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch,
-            landedCheckpoint ? { tip: flight.lastCheckpointRefTip } : undefined,
-            flight.checkpointCoordinates?.checkpoint_key ?? (flight.runKind === "task" ? null : runnerClone.branch));
+        const publishedCheckpoint = await hasPublishedCheckpoint();
         if (publishedCheckpoint) {
           batcher.emit({
             kind: "status",
