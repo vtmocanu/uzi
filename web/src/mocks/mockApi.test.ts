@@ -1057,14 +1057,65 @@ describe("mockApi judge_model reset (PRD #3245 M1)", () => {
     }
   });
 
-  it("still refuses a blank summary_model and a multi-token judge_model", async () => {
+  it("accepts a blank summary_model as the reset and still refuses a multi-token judge_model", async () => {
     installStorage();
     const api = await reload();
-    await expect(api.updateSettings({ summary_model: "" })).rejects.toMatchObject({
-      status: 400,
-      message: expect.stringContaining("must not be empty"),
-    });
+    const initial = await api.getSettings();
+    expect(initial.settings.summary_model).toBe("haiku");
+    expect(initial.sources.summary_model).toBe("default");
+    expect(initial.defaults?.summary_model).toBe("haiku");
+
+    await api.updateSettings({ summary_model: " sonnet " });
+    const reset = await api.updateSettings({ summary_model: "" });
+    expect(reset.settings.summary_model).toBe("haiku");
+    expect(reset.sources.summary_model).toBe("default");
+
+    await expect(api.updateSettings({ summary_model: "two words" })).rejects.toMatchObject({ status: 400 });
     await expect(api.updateSettings({ judge_model: "two words" })).rejects.toMatchObject({ status: 400 });
+  });
+});
+
+describe("mockApi codex_summary_model (PRD #3248)", () => {
+  it("reports the built-in as default, trims a Codex role id and accepts blank as the reset", async () => {
+    installStorage();
+    const api = await reload();
+
+    const initial = await api.getSettings();
+    expect(initial.settings.codex_summary_model).toBe("gpt-6-luna");
+    expect(initial.sources.codex_summary_model).toBe("default");
+    expect(initial.defaults?.codex_summary_model).toBe("gpt-6-luna");
+
+    const pinned = await api.updateSettings({ codex_summary_model: " gpt-6-astra " });
+    expect(pinned.settings.codex_summary_model).toBe("gpt-6-astra");
+    expect(pinned.sources.codex_summary_model).toBe("db");
+
+    const reset = await api.updateSettings({ codex_summary_model: "   " });
+    expect(reset.settings.codex_summary_model).toBe("gpt-6-luna");
+    expect(reset.sources.codex_summary_model).toBe("default");
+  });
+
+  it("refuses a Claude alias or a non-role id with field-prefixed messages", async () => {
+    installStorage();
+    const api = await reload();
+    await expect(api.updateSettings({ codex_summary_model: "sonnet" })).rejects.toMatchObject({
+      status: 400,
+      message: "codex_summary_model: must be a Codex model; this is a Claude model alias",
+    });
+    await expect(api.updateSettings({ codex_summary_model: "not-a-model" })).rejects.toMatchObject({
+      status: 400,
+      message: "codex_summary_model: is not a Codex summary model",
+    });
+    await expect(api.updateSettings({ summary_model: "gpt-6-astra" })).rejects.toMatchObject({ status: 400 });
+  });
+
+  it("feeds the admin Codex value into the user-side summary resolver", async () => {
+    installStorage();
+    const api = await reload();
+    await api.updateSettings({ codex_summary_model: "gpt-6-astra" });
+    const cells = (await api.getMySettings()).settings.summary_models ?? [];
+    const codex = cells.find((c) => c.harness === "codex");
+    expect(codex?.resolved_model).toBe("gpt-6-astra");
+    expect(codex?.source).toBe("instance_default");
   });
 });
 

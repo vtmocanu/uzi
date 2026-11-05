@@ -159,6 +159,19 @@ describe("truncate", () => {
   });
 });
 
+describe("summary skipped note (#3248)", () => {
+  const text = "Intent summary skipped: the run owner's vault is locked. The run continues.";
+  const payload = { text, event: "summary_skipped", pass: "intent", reason: "vault_locked" };
+
+  it("describeStatus shows the fixed worker text", () => {
+    expect(describeStatus(payload)).toBe(text);
+  });
+  it("the status row renders the fixed text", () => {
+    const r = render(<RunEventRow msg={msg({ seq: 3, kind: "status", agent: "worker", payload })} live={false} />);
+    expect(r.container.textContent).toContain(text);
+  });
+});
+
 describe("describeStatus", () => {
   it("renders worker progress text as-is", () => {
     expect(describeStatus({ text: "worktree ready on agent/issue-7" })).toBe(

@@ -1791,6 +1791,7 @@ type User struct {
 	VaultSlotGeneration       int64              `json:"vault_slot_generation"`
 	CodexAccountMode          string             `json:"codex_account_mode"`
 	HarnessOverflowEnabled    bool               `json:"harness_overflow_enabled"`
+	CodexSummaryModel         pgtype.Text        `json:"codex_summary_model"`
 }
 
 type UserCrossCheckPin struct {

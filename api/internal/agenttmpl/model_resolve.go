@@ -17,6 +17,13 @@ const (
 	DefaultCodexJudgeModel = "gpt-6.1-sol"
 )
 
+// Built-in run-summary models per harness. fixtures/model-settings/summary.json
+// pins both (and settings.Defaults) to the same values.
+const (
+	DefaultClaudeSummaryModel = "haiku"
+	DefaultCodexSummaryModel  = "gpt-6-luna"
+)
+
 // ModelResolution is the result of walking the user, instance and built-in
 // tiers. DefaultModel/DefaultSource are the same walk without the user tier
 // (what "Default" means to this user). Dropped lists each non-blank candidate
@@ -68,4 +75,17 @@ func ResolveJudgeModel(harness, user, instance string) ModelResolution {
 	}
 	return ResolveTieredModel(func(m string) bool { return !CodexRoleModels[m] },
 		user, instance, DefaultClaudeJudgeModel)
+}
+
+// ResolveSummaryModel resolves the run-summary model for a harness. Codex
+// accepts only CodexRoleModels members (so a Codex Model is always one of
+// them); every other harness uses the Claude rules, which refuse a Codex role
+// id and pass any other value through.
+func ResolveSummaryModel(harness, user, instance string) ModelResolution {
+	if harness == "codex" {
+		return ResolveTieredModel(func(m string) bool { return CodexRoleModels[m] },
+			user, instance, DefaultCodexSummaryModel)
+	}
+	return ResolveTieredModel(func(m string) bool { return !CodexRoleModels[m] },
+		user, instance, DefaultClaudeSummaryModel)
 }

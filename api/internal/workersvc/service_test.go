@@ -172,6 +172,7 @@ type fakeStore struct {
 	// instance value unchanged. summaryModelErr models a user-row read fault, which
 	// must fall back to the instance value best-effort (never an empty model).
 	summaryModel        pgtype.Text
+	codexSummaryModel   pgtype.Text // the Codex lane (PRD #3248)
 	summaryModelErr     error
 	templates           []store.AgentTemplate
 	skillAllocations    []store.ListRunSkillAllocationsRow
@@ -1062,8 +1063,8 @@ func (f *fakeStore) GetUserAttributionEnabled(context.Context, uuid.UUID) (bool,
 func (f *fakeStore) GetUserJudgeModels(context.Context, uuid.UUID) (store.GetUserJudgeModelsRow, error) {
 	return store.GetUserJudgeModelsRow{JudgeModel: f.judgeModel, CodexJudgeModel: f.codexJudgeModel}, f.judgeModelErr
 }
-func (f *fakeStore) GetUserSummaryModel(context.Context, uuid.UUID) (pgtype.Text, error) {
-	return f.summaryModel, f.summaryModelErr
+func (f *fakeStore) GetUserSummaryModels(context.Context, uuid.UUID) (store.GetUserSummaryModelsRow, error) {
+	return store.GetUserSummaryModelsRow{SummaryModel: f.summaryModel, CodexSummaryModel: f.codexSummaryModel}, f.summaryModelErr
 }
 func (f *fakeStore) ListClaimAgentTemplates(context.Context, pgtype.UUID) ([]store.AgentTemplate, error) {
 	return f.templates, nil
@@ -2541,20 +2542,20 @@ func TestClaimNoScheduleModelUsesUserDefault(t *testing.T) {
 	}
 }
 
-// PRD #362 M2: an ISSUE-run claim carries SummaryModel resolved from the instance
-// summary_model setting when the owner has no per-user override. Unlike judge_model,
-// this rides the issue-run claim (not the judge claim).
+// PRD #362 M2 / PRD #3248: an ISSUE-run claim carries SummaryModel resolved from the
+// instance summary_model setting when the owner has no per-user override. Unlike
+// judge_model, this rides the issue-run claim (not the judge claim).
 func TestClaimCarriesSummaryModelFromInstanceDefault(t *testing.T) {
 	fs := scheduleModelStore(t, pgtype.Text{}, pgtype.Text{})
 	// summaryModel left NULL ⇒ inherit the instance value.
 	svc := newOffModeService(fs, newBox(t), testParams())
-	svc.SetSettings(fakeSettings{summaryModel: "haiku"})
+	svc.SetSettings(fakeSettings{summaryModel: "sonnet"})
 
 	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
-	if payload.SummaryModel == nil || *payload.SummaryModel != "haiku" {
+	if payload.SummaryModel == nil || *payload.SummaryModel != "sonnet" {
 		t.Fatalf("issue claim should carry the instance summary_model; got %+v", payload.SummaryModel)
 	}
 }
@@ -2576,24 +2577,117 @@ func TestClaimSummaryModelUserOverrideWins(t *testing.T) {
 	}
 }
 
-// PRD #362 M2: with no settings wired the issue claim omits summary_model entirely —
-// omitempty keeps the wire byte-identical for a deployment that has not wired settings.
-func TestClaimOmitsSummaryModelWhenNoSettings(t *testing.T) {
+// PRD #3248 D12: with settings wired but nothing set on either tier, a Claude claim
+// carries the built-in haiku rather than omitting the field.
+func TestClaimSummaryModelBuiltinWhenNothingSet(t *testing.T) {
 	fs := scheduleModelStore(t, pgtype.Text{}, pgtype.Text{})
-	// newOffModeService(...) leaves s.settings nil unless SetSettings is called.
+	svc := newOffModeService(fs, newBox(t), testParams())
+	svc.SetSettings(fakeSettings{})
+	payload, err := svc.Claim(context.Background(), worker(), nil)
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload.SummaryModel == nil || *payload.SummaryModel != "haiku" {
+		t.Fatalf("Claude claim with nothing set should carry the built-in haiku; got %+v", payload.SummaryModel)
+	}
+}
+
+// PRD #3248: a deployment with no settings reader wired tells the summary generator
+// nothing: the claim's SummaryModel stays nil rather than carrying the built-in.
+func TestClaimSummaryModelNilWhenSettingsUnwired(t *testing.T) {
+	fs := scheduleModelStore(t, pgtype.Text{}, pgtype.Text{})
+	fs.summaryModel = pgconv.TextOrNull("opus") // a stored user value must not leak through
 	payload, err := newOffModeService(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
 	if payload.SummaryModel != nil {
-		t.Fatalf("no settings wired should leave SummaryModel nil; got %+v", payload.SummaryModel)
+		t.Fatalf("unwired settings should leave SummaryModel nil; got %q", *payload.SummaryModel)
 	}
-	b, err := json.Marshal(payload)
+}
+
+// PRD #3248: a user-row read error logs and resolves as if the user tier were unset
+// (instance, then built-in); it never fails the claim.
+func TestClaimSummaryModelUserReadErrorFallsBackToInstance(t *testing.T) {
+	fs := scheduleModelStore(t, pgtype.Text{}, pgtype.Text{})
+	fs.summaryModelErr = errors.New("db down")
+	// A row value alongside the error must not be read: the user tier counts as unset.
+	fs.summaryModel = pgtype.Text{String: "opus", Valid: true}
+	svc := newOffModeService(fs, newBox(t), testParams())
+	svc.SetSettings(fakeSettings{summaryModel: "sonnet"})
+	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
-		t.Fatalf("marshal payload: %v", err)
+		t.Fatalf("a user-row read error must not fail the claim: %v", err)
 	}
-	if strings.Contains(string(b), "summary_model") {
-		t.Fatalf("unset summary_model must be omitted from the wire; got %s", b)
+	if payload.SummaryModel == nil || *payload.SummaryModel != "sonnet" {
+		t.Fatalf("user-row error should resolve the instance tier; got %+v", payload.SummaryModel)
+	}
+}
+
+// PRD #3248 D12: an instance-tier read error logs and counts as unset, so the claim
+// still resolves (user value, else the built-in) and never fails.
+func TestClaimSummaryModelInstanceReadErrorFallsBack(t *testing.T) {
+	cases := []struct {
+		name string
+		user pgtype.Text
+		want string
+	}{
+		{"no user value resolves the built-in", pgtype.Text{}, "haiku"},
+		{"user value still wins", pgtype.Text{String: "opus", Valid: true}, "opus"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := scheduleModelStore(t, pgtype.Text{}, pgtype.Text{})
+			fs.summaryModel = tc.user
+			svc := newOffModeService(fs, newBox(t), testParams())
+			svc.SetSettings(fakeSettings{summaryModel: "sonnet", summaryModelErr: errors.New("cache down")})
+			payload, err := svc.Claim(context.Background(), worker(), nil)
+			if err != nil {
+				t.Fatalf("an instance read error must not fail the claim: %v", err)
+			}
+			if payload.SummaryModel == nil || *payload.SummaryModel != tc.want {
+				t.Fatalf("SummaryModel = %v, want %q", payload.SummaryModel, tc.want)
+			}
+		})
+	}
+}
+
+// PRD #3248 D3/D5: the summary model rides the lane of the run's own harness. The
+// stored Claude-lane value of a Codex run's owner is ignored, and a legacy stored
+// Codex id on the Claude lane is dropped for a Claude run.
+func TestClaimSummaryModelLanes(t *testing.T) {
+	cases := []struct {
+		name    string
+		harness string
+		userC   string // users.summary_model
+		userX   string // users.codex_summary_model
+		instC   string
+		instX   string
+		want    string
+	}{
+		{name: "codex user value", harness: "codex", userC: "opus", userX: "gpt-6-astra", instX: "gpt-6-sol", want: "gpt-6-astra"},
+		{name: "codex nothing set", harness: "codex", userC: "opus", instC: "sonnet", want: "gpt-6-luna"},
+		{name: "codex instance only", harness: "codex", userC: "opus", instX: "gpt-6.1-sol", want: "gpt-6.1-sol"},
+		{name: "claude legacy codex id", harness: "claude", userC: "gpt-6-sol", instC: "sonnet", want: "sonnet"},
+		{name: "claude ignores codex lane", harness: "claude", userX: "gpt-6-astra", want: "haiku"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := scheduleModelStore(t, pgtype.Text{}, pgtype.Text{})
+			fs.summaryModel = pgconv.TextOrNull(tc.userC)
+			fs.codexSummaryModel = pgconv.TextOrNull(tc.userX)
+			svc := newOffModeService(fs, newBox(t), testParams())
+			svc.SetSettings(fakeSettings{summaryModel: tc.instC, codexSummaryModel: tc.instX})
+			// A full Codex claim needs a bound Codex credential, so the lane choice is
+			// exercised through the resolver the claim assembly calls.
+			got := svc.resolveClaimSummaryModel(context.Background(), store.Run{ID: uuid.New(), UserID: uuid.New(), Harness: tc.harness})
+			if got == nil {
+				t.Fatalf("summary model = nil, want %q", tc.want)
+			}
+			if *got != tc.want {
+				t.Fatalf("summary model = %q, want %q", *got, tc.want)
+			}
+		})
 	}
 }
 
