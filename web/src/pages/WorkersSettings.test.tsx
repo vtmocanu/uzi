@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { WorkersSettings } from "./WorkersSettings";
 import { ApiError } from "../lib/apiError";
@@ -1048,6 +1048,116 @@ describe("WorkersSettings hosted delete confirms; external delete does not (PRD 
 
       expect(await screen.findByText(MSG)).toBeTruthy();
       expect(screen.queryByRole("list", { name: LIST })).toBeNull();
+    });
+  });
+
+  describe("409 custody refusal", () => {
+    const MSG =
+      "this worker is retaining unpublished committed work for recovery in 3 custody hold(s); recover it (uzi run export) or explicitly discard those recovery archives before removing it";
+    const LIST = "Holds blocking this delete";
+    const body = {
+      error: MSG,
+      custody_holds: 3,
+      blocking_holds: [
+        { hold_id: "hold-1", run_id: "run-1", generation: 2, kind: "issue", title: "Fix login" },
+        { hold_id: "hold-2", run_id: "chat-2", generation: 1, kind: "chat", title: "" },
+      ],
+      blocking_holds_total: 4,
+    };
+    const row = () => document.getElementById("worker-row-w-h") as HTMLElement;
+    const callout = () => document.getElementById("worker-custody-refusal-w-h") as HTMLElement;
+
+    async function refuse(b: unknown = body, status = 409) {
+      mockApi.listWorkers.mockResolvedValue({ workers: [hostedW] });
+      mockApi.deleteWorker.mockRejectedValue(new ApiError(status, MSG, b));
+      renderPage();
+      fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+      fireEvent.click(await screen.findByRole("button", { name: "Delete anyway" }));
+      await waitFor(() => expect(callout()).toBeTruthy());
+    }
+
+    it("renders the callout inside the acted-on row, focused, with exact links and a plain-text overflow", async () => {
+      await refuse();
+      expect(row().contains(callout())).toBe(true);
+      expect(document.activeElement).toBe(callout());
+      expect(callout().textContent).toContain("Fix login");
+
+      const list = within(callout()).getByRole("list", { name: LIST });
+      expect(within(list).getByRole("link", { name: "Fix login" }).getAttribute("href")).toBe("/runs/run-1");
+      // A blank title falls back to the run id; a chat links to /chat.
+      expect(within(list).getByRole("link", { name: "chat-2" }).getAttribute("href")).toBe("/chat/chat-2");
+      const resolve = within(list).getAllByRole("link", { name: "Resolve hold" });
+      expect(resolve.map((a) => a.getAttribute("href"))).toEqual([
+        "/workers?tab=workers&hold=hold-1#recovery-hold-hold-1",
+        "/workers?tab=workers&hold=hold-2#recovery-hold-hold-2",
+      ]);
+      const more = within(list).getByText("and 2 more");
+      expect(more.tagName).toBe("LI");
+      expect(more.closest("a")).toBeNull();
+      expect(more.querySelector("a")).toBeNull();
+    });
+
+    it("leaves the page-top alert as the only renderer of the server message", async () => {
+      await refuse();
+      expect(screen.getAllByText(MSG)).toHaveLength(1);
+      expect(callout().textContent).not.toContain(MSG);
+    });
+
+    it("leads with recovery and keeps discard last, without a pasteable discard or false promises", async () => {
+      await refuse();
+      const text = callout().textContent ?? "";
+      const discard = text.indexOf("uzi run discard");
+      expect(discard).toBeGreaterThan(-1);
+      for (const earlier of ["Recover it first", "Resolve hold", "uzi run export"]) {
+        const i = text.indexOf(earlier);
+        expect(i, earlier).toBeGreaterThan(-1);
+        expect(i, earlier).toBeLessThan(discard);
+      }
+      expect(text).toContain("may release on its own");
+      expect(text).toContain("review its recovery options in Held work");
+      expect(text).toContain("This worker can't be deleted yet");
+      expect(text).not.toContain("--yes");
+      expect(text).not.toMatch(/last copy/i);
+      expect(text).not.toContain("releases on its own");
+    });
+
+    it("renders the lead without list items for an older server that sends only custody_holds", async () => {
+      await refuse({ error: MSG, custody_holds: 3 });
+      expect(callout().textContent).toContain("Recover it first");
+      expect(within(callout()).queryByRole("list", { name: LIST })).toBeNull();
+      expect(within(callout()).queryAllByRole("listitem")).toHaveLength(0);
+    });
+
+    it("renders nothing for a non-409 even when the body carries custody_holds", async () => {
+      mockApi.listWorkers.mockResolvedValue({ workers: [hostedW] });
+      mockApi.deleteWorker.mockRejectedValue(new ApiError(500, "boom", body));
+      renderPage();
+      fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+      fireEvent.click(await screen.findByRole("button", { name: "Delete anyway" }));
+      expect(await screen.findByText("boom")).toBeTruthy();
+      expect(callout()).toBeNull();
+    });
+
+    it("renders no custody callout for an active-runs body", async () => {
+      mockApi.listWorkers.mockResolvedValue({ workers: [hostedW] });
+      mockApi.deleteWorker.mockRejectedValue(
+        new ApiError(409, "worker has active runs", { error: "worker has active runs", active_runs: [], active_runs_total: 1 }),
+      );
+      renderPage();
+      fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+      fireEvent.click(await screen.findByRole("button", { name: "Delete anyway" }));
+      expect(await screen.findByText("worker has active runs")).toBeTruthy();
+      expect(callout()).toBeNull();
+    });
+
+    it("clears when a different action follows", async () => {
+      await refuse();
+      mockApi.createWorker.mockRejectedValue(new ApiError(500, "create exploded", { error: "create exploded" }));
+      openAddTab();
+      fireEvent.change(screen.getByPlaceholderText(/laptop, ci-runner-1/), { target: { value: "nas" } });
+      fireEvent.click(screen.getByRole("button", { name: "Generate join token" }));
+      expect(await screen.findByText("create exploded")).toBeTruthy();
+      expect(callout()).toBeNull();
     });
   });
 

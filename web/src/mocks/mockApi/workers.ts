@@ -9,6 +9,10 @@ import { delay, mockScenario, requireSession } from "./shared";
 // unbinds workers pinned to a deleted token. Both reads are inside function bodies and no
 // module-level initializer crosses the modules, so the cycle cannot throw at import.
 import { secrets } from "./secrets";
+// runs ↔ workers is a second import cycle (runs → secrets → workers); deleteWorker reads
+// runsApi only inside its body, so no module-level initializer crosses the modules.
+import { runsApi } from "./runs";
+import { getRun } from "../store";
 
 export let workers: Worker[] = mockWorkers.map((w) => ({ ...w }));
 let workerCounter = 0;
@@ -208,6 +212,28 @@ export const workersApi = {
     return delay({ worker: { ...w }, token });
   },
   deleteWorker: async (id: string) => {
+    // Mirrors the server's custody refusal. The live holder is approximated with the
+    // original worker (the owner listing's worker_id is the original worker), so open mock
+    // holds whose worker_id is this worker block the delete, oldest first, capped at 10.
+    const { holds } = await runsApi.getRecoveryHolds();
+    const blocking = holds
+      .filter((h) => h.state === "open" && h.worker_id === id)
+      .sort((a, b) => a.created_at.localeCompare(b.created_at));
+    if (blocking.length > 0) {
+      const msg = `this worker is retaining unpublished committed work for recovery in ${blocking.length} custody hold(s); recover it (uzi run export) or explicitly discard those recovery archives before removing it`;
+      throw new ApiError(409, msg, {
+        error: msg,
+        custody_holds: blocking.length,
+        blocking_holds: blocking.slice(0, 10).map((h) => ({
+          hold_id: h.id,
+          run_id: h.run_id,
+          generation: h.generation,
+          kind: "code",
+          title: getRun(h.run_id)?.title ?? "",
+        })),
+        blocking_holds_total: blocking.length,
+      });
+    }
     workers = workers.filter((w) => w.id !== id);
     manualStates.delete(id);
     return delay(null);
