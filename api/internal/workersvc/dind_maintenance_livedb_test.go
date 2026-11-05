@@ -447,7 +447,10 @@ func TestDindMaintenanceOwnershipBeforeFenceLiveDB(t *testing.T) {
 				cancel()
 				_ = tx.Rollback(context.Background())
 				select {
-				case <-done:
+				case err := <-done:
+					if err != nil {
+						t.Logf("fence goroutine: %v", err)
+					}
 				case <-time.After(2 * time.Second):
 					t.Error("fence goroutine did not stop")
 				}
@@ -505,7 +508,10 @@ func TestDindMaintenanceFenceBeforeOwnershipLiveDB(t *testing.T) {
 			defer func() {
 				cancel()
 				select {
-				case <-fenceDone:
+				case err := <-fenceDone:
+					if err != nil {
+						t.Logf("fence goroutine: %v", err)
+					}
 				case <-time.After(2 * time.Second):
 					t.Error("fence goroutine did not stop")
 				}
