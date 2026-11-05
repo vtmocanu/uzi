@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -93,6 +94,9 @@ func TestListHoldsForWorkerRunOpenHoldCount(t *testing.T) {
 		res, err := New(st, nil, nil, Limits{}, nil).ListHoldsForWorkerRun(context.Background(), wkr(capability.RecoveryRunOpenHoldsV1), run)
 		if err != nil || res.RunOpenHolds == nil || res.RunOpenHolds.Count != 0 {
 			t.Fatalf("res=%+v err=%v", res, err)
+		}
+		if want := `"run_open_holds":{"run_id":"` + run.String() + `","count":0}`; !strings.Contains(marshal(res), want) {
+			t.Fatalf("body = %s, want %s", marshal(res), want)
 		}
 	})
 
