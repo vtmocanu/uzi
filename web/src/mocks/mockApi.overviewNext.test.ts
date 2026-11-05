@@ -45,6 +45,20 @@ describe("overview-next mock scenario", () => {
     expect(doc.blocking).toBe(false);
   });
 
+  it("serves an owner fleet covering every capacity state, only under the scenario", async () => {
+    const api = await freshApi("overview-next");
+    const fleet = (await api.listWorkers()).workers;
+    const byId = new Map(fleet.map((w) => [w.id, w]));
+    expect(byId.get("w-ov-rolling")).toMatchObject({ kind: "hosted", upgrade_status: "upgrading", upgrade_target: "v0.86.1-rc.2", active_runs: 1 });
+    expect(byId.get("w-ov-rolling")?.draining_since).toEqual(expect.any(String));
+    expect(byId.get("w-ov-cordoned")).toMatchObject({ effective_cordoned: true, active_runs: 0, max_concurrent_runs: 1 });
+    expect(byId.get("w-ov-offline")?.status).toBe("offline");
+    expect(byId.get("w-ov-nocap")?.max_concurrent_runs).toBeNull();
+    expect(byId.get("w-ov-nostats")?.stats_source).toBeNull();
+    const plain = await freshApi(null);
+    expect((await plain.listWorkers()).workers.some((w) => w.id.startsWith("w-ov-"))).toBe(false);
+  });
+
   it("seeds none of it outside the scenario", async () => {
     const api = await freshApi(null);
     const factory = (await api.adminListRuns({ view: "summary" })).runs;

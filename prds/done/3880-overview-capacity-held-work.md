@@ -1,6 +1,6 @@
 # PRD #3880: Overview preview, capacity rail and held work
 
-**Status**: Ready for dispatch (AI-synced 2026-11-05). Child of epic #3873. Blocked by: #3878, satisfied by merged PR #3952 (`699e4425`).
+**Status**: Implemented (AI-synced 2026-11-05). Child of epic #3873. Blocked by: #3878, satisfied by merged PR #3952 (`699e4425`). M1 (capacity rail) and M2 (Held work card, independent holds poll, held-work decision row and header count) are built on branch `agent/issue-3880`. In-run evidence: focused Vitest for the touched files and the mock scenarios, the `OverviewNext` browser cases (including 400 px and 320 px rows), `task check:web`, `npm run build`, `task deadcode:web`, `task check-docs:web`, `task check:changelog-entry`, `task check:token-literals`, `task scan:secrets` and `task sast:semgrep` all passed. Each milestone has a regression test watched failing on the pre-change code. Side-by-side screenshots at 1440 px and 400 px in Ember and Dawn, app and mock, are in `prds/mockups/3880/`. Pending exact-head PR CI (landing obligation, not verified in-run): full `test:web`, `test:web-browser`, `gate:repo` and the mock image build.
 
 **Design brief**: `prds/3873-overview-redesign.md` (model-fidelity rules, data readiness, reuse map, constraints, mock contract). This PRD wins where it is more specific.
 

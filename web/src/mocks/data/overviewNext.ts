@@ -1,6 +1,7 @@
-import type { Run } from "../../lib/api";
+import type { Run, Worker } from "../../lib/api";
 import { minsAgo, minsAhead } from "./time";
 import { mockRuns } from "./runs";
+import { mockWorkers } from "./workers";
 import { mockOtherUserRuns } from "./runHistories";
 
 // ?mock=overview-next (PRD #3878): extra runs for the /overview/next preview, seeded only
@@ -80,3 +81,69 @@ const ownDuplicateMrRun: Run = {
 };
 
 export const overviewNextRuns: Run[] = [...otherRuns, ownDuplicateMrRun];
+
+// The owner fleet for the Capacity rail (PRD #3880 M1): full, draining mid-roll, manually
+// cordoned, offline, with no advertised cap and with no stats. Replaces the default seeded
+// workers under this scenario only.
+const fleetBase = mockWorkers[0];
+const noStats = {
+  stats_cpu_pct: null,
+  stats_mem_bytes: null,
+  stats_mem_limit_bytes: null,
+  stats_source: null,
+  stats_disk_nix_bytes: null,
+  stats_disk_nix_total_bytes: null,
+  stats_disk_data_bytes: null,
+  stats_disk_data_total_bytes: null,
+} satisfies Partial<Worker>;
+
+function fleetWorker(over: Partial<Worker> & Pick<Worker, "id" | "name">): Worker {
+  return {
+    ...fleetBase,
+    forge_origin_cooldowns: [],
+    retaining_unpublished_work: false,
+    custody_decisions_needed: 0,
+    pending_outcome_count: 0,
+    pending_overflow: false,
+    status: "online",
+    kind: "external",
+    hosted_size: null,
+    busy: false,
+    active_runs: 0,
+    max_concurrent_runs: 2,
+    last_heartbeat_at: minsAgo(0.2),
+    online_since: minsAgo(120),
+    draining_since: null,
+    manual_cordoned_at: null,
+    effective_cordoned: false,
+    ...over,
+  };
+}
+
+export function overviewNextOwnerWorkers(): Worker[] {
+  return [
+    fleetWorker({ id: "w-ov-full-a", name: "base.l-highmem-3a1f", busy: true, active_runs: 2, max_concurrent_runs: 2, stats_cpu_pct: 30, stats_mem_bytes: 6442450944, stats_mem_limit_bytes: 34359738368, stats_source: "cgroup" }),
+    fleetWorker({ id: "w-ov-full-b", name: "base.l-highmem-7c2e", busy: true, active_runs: 2, max_concurrent_runs: 2, stats_cpu_pct: 100, stats_mem_bytes: 7194132480, stats_mem_limit_bytes: 34359738368, stats_source: "cgroup" }),
+    fleetWorker({
+      id: "w-ov-rolling",
+      name: "base.l-highmem-b54d",
+      kind: "hosted",
+      hosted_size: "l-highmem",
+      busy: true,
+      active_runs: 1,
+      max_concurrent_runs: 2,
+      draining_since: minsAgo(8),
+      effective_cordoned: true,
+      upgrade_status: "upgrading",
+      upgrade_target: "v0.86.1-rc.2",
+      stats_cpu_pct: 78,
+      stats_mem_bytes: 7405568000,
+      stats_mem_limit_bytes: 34359738368,
+      stats_source: "cgroup",
+    }),
+    fleetWorker({ id: "w-ov-cordoned", name: "bench-cordoned", max_concurrent_runs: 1, manual_cordoned_at: minsAgo(30), manual_cordoned_by_label: "you", effective_cordoned: true, stats_cpu_pct: 2, stats_mem_bytes: 536870912, stats_mem_limit_bytes: 8589934592, stats_source: "cgroup" }),
+    fleetWorker({ id: "w-ov-offline", name: "ci-runner-offline", status: "offline", max_concurrent_runs: 2, last_heartbeat_at: minsAgo(240), online_since: null, ...noStats }),
+    fleetWorker({ id: "w-ov-nocap", name: "legacy-no-cap", max_concurrent_runs: null, active_runs: 1, busy: true, stats_cpu_pct: 12, stats_mem_bytes: 1073741824, stats_mem_limit_bytes: null, stats_source: "process" }),
+    fleetWorker({ id: "w-ov-nostats", name: "quiet-worker", ...noStats }),
+  ];
+}
