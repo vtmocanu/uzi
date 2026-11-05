@@ -124,7 +124,7 @@ export function parseGitIndex(buf: Buffer, limits: GitIndexLimits, policy: "stri
     let size: number;
     if (version === 4) {
       // Prefix-compressed: a varint count of bytes to strip from the previous name, then the
-      // NUL-terminated suffix. No padding follows. The flags' length field is not used.
+      // NUL-terminated suffix. No padding follows. The flags' length field must agree with the rebuilt name (checked below).
       let at = nameOffset;
       let strip = 0;
       for (let first = true, byte = 0x80; byte & 0x80; first = false) {
@@ -140,6 +140,11 @@ export function parseGitIndex(buf: Buffer, limits: GitIndexLimits, policy: "stri
       const keep = previousName.length - strip;
       if (keep + (nul - at) > MAX_V4_PATH) refused("version 4 path exceeds PATH_MAX");
       name = Buffer.concat([previousName.subarray(0, keep), buf.subarray(at, nul)]);
+      // Git sizes the entry from the flags' length field when it is not saturated, so a name
+      // that disagrees would be walked differently by Git than by this parser.
+      const declared = flags & NAME_SATURATED;
+      if (declared !== NAME_SATURATED ? name.length !== declared : name.length < NAME_SATURATED)
+        refused("version 4 path length disagrees with the entry flags");
       size = nul + 1 - p;
     } else {
       let nameLength = flags & NAME_SATURATED;
