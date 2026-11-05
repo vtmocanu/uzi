@@ -1143,6 +1143,18 @@ describe("WorkersSettings hosted delete confirms; external delete does not (PRD 
       expect(within(callout()).queryAllByRole("listitem")).toHaveLength(0);
     });
 
+    it("falls back to custody_holds for the total when blocking_holds_total is absent", async () => {
+      await refuse({ error: MSG, custody_holds: 3, blocking_holds: [body.blocking_holds[0]] });
+      const list = within(callout()).getByRole("list", { name: LIST });
+      expect(within(list).getByText("and 2 more")).toBeTruthy();
+    });
+
+    it("renders no bare overflow line when the server listed no hold but reports a positive total", async () => {
+      await refuse({ error: MSG, custody_holds: 3, blocking_holds: [], blocking_holds_total: 3 });
+      expect(within(callout()).queryByRole("list", { name: LIST })).toBeNull();
+      expect(callout().textContent).not.toMatch(/\bmore\b/);
+    });
+
     it("renders nothing for a non-409 even when the body carries custody_holds", async () => {
       mockApi.listWorkers.mockResolvedValue({ workers: [hostedW] });
       mockApi.deleteWorker.mockRejectedValue(new ApiError(500, "boom", body));

@@ -32,10 +32,14 @@ function custodyHostedWorker(): Worker {
   return { ...base, id: "wkr-jvm", name: "jvm-worker" };
 }
 
+// The custody worker is synthesised per listing rather than stored in `workers`, so a
+// successful delete (after its holds are resolved) is remembered here or it would reappear.
+let custodyWorkerDeleted = false;
+
 function ownerWorkers(): Worker[] {
   const scenario = mockScenario();
   if (scenario === "health-incident") return incidentFleetWorkers();
-  if (scenario === "custody") return [...workers, custodyHostedWorker()];
+  if (scenario === "custody") return custodyWorkerDeleted ? workers : [...workers, custodyHostedWorker()];
   return workers;
 }
 
@@ -246,6 +250,7 @@ export const workersApi = {
       });
     }
     workers = workers.filter((w) => w.id !== id);
+    if (id === custodyHostedWorker().id) custodyWorkerDeleted = true;
     manualStates.delete(id);
     return delay(null);
   },

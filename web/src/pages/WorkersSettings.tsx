@@ -110,14 +110,8 @@ function readCustodyBlock(body: unknown): { holds: BlockingHold[]; total: number
       });
     }
   }
-  // An older server sends only the count, with no list to overflow from, so the total
-  // falls back to custody_holds only when a list was sent.
-  const total =
-    typeof b.blocking_holds_total === "number"
-      ? b.blocking_holds_total
-      : Array.isArray(b.blocking_holds)
-        ? b.custody_holds
-        : holds.length;
+  // The total is authoritative; an older server omits it, so it falls back to custody_holds.
+  const total = typeof b.blocking_holds_total === "number" ? b.blocking_holds_total : b.custody_holds;
   return { holds, total };
 }
 
@@ -1148,7 +1142,10 @@ export function WorkersSettings() {
                   >
                     <p className="font-medium text-fg">This worker can't be deleted yet</p>
                     <p>These holds protect unpublished committed work from these runs. Recover it first:</p>
-                    {(custodyRefusal.holds.length > 0 || custodyRefusal.total > custodyRefusal.holds.length) && (
+                    {/* No listed hold (older server, or holds released mid-request): no list at
+                        all, so a bare "and N more" never stands alone; the page-top alert
+                        still carries the count. */}
+                    {custodyRefusal.holds.length > 0 && (
                       <ul aria-label="Holds blocking this delete" className="space-y-1">
                         {custodyRefusal.holds.map((h) => {
                           const title = stripUnsafeChars(h.title).trim() || h.runId;

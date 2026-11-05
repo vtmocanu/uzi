@@ -71,3 +71,21 @@ it("deletes a worker without open holds as before", async () => {
   await vi.advanceTimersByTimeAsync(1000);
   await expect(p).resolves.toBeNull();
 });
+
+// Last in the file: it discards the scenario's holds and deletes the synthetic holder, which is
+// module state the earlier cases rely on.
+it("keeps the custody holder deleted after its holds are discarded and it is deleted", async () => {
+  vi.useFakeTimers();
+  for (const [runId, holdId] of [["run-b1", "hold-b1"], ["run-b2", "hold-b2"]]) {
+    const d = mockApi.discardHold(runId, holdId);
+    await vi.advanceTimersByTimeAsync(1000);
+    await d;
+  }
+  const del = mockApi.deleteWorker("wkr-jvm");
+  await vi.advanceTimersByTimeAsync(1000);
+  await expect(del).resolves.toBeNull();
+
+  const listP = mockApi.listWorkers();
+  await vi.advanceTimersByTimeAsync(1000);
+  expect((await listP).workers.some((w) => w.id === "wkr-jvm")).toBe(false);
+});
