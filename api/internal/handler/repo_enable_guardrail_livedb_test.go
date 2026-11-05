@@ -76,6 +76,12 @@ func newFakeGuardForge(t *testing.T) *fakeGuardForge {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": guardBotUserID, "username": "uzi-bot"})
 			return
+		case strings.HasSuffix(path, "/labels") && r.Method == http.MethodGet:
+			// Enabling a repo now ensures its board labels; an empty list lets the
+			// create calls (answered by the catch-all below) succeed.
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte("[]"))
+			return
 		case strings.Contains(path, "/members/all/"):
 			// The bot is exactly a Developer (30, the compliant write role): a clean
 			// role, so the only findings under test come from branch protection.
@@ -160,7 +166,7 @@ func newEnableGuardFixture(ctx context.Context, t *testing.T) enableGuardFixture
 	fg := newFakeGuardForge(t)
 
 	// A real forgesvc builds the real GitLab driver against the fake server, and a
-	// real privcheck.Service runs GuardRepo through it — no fakes on the guard path.
+	// real privcheck.Service runs GuardRepo through it - no fakes on the guard path.
 	svc := newZeroWaitForgeService(q, box)
 	pcheck := privcheck.NewService(q, svc)
 
@@ -249,7 +255,7 @@ func TestSetRepoEnableGuardBlocksCanPushLiveDB(t *testing.T) {
 	}
 }
 
-// An unprotected default branch is refused too — the Protected-first inversion must
+// An unprotected default branch is refused too - the Protected-first inversion must
 // not read false,false as safe.
 func TestSetRepoEnableGuardBlocksUnprotectedLiveDB(t *testing.T) {
 	ctx := context.Background()
