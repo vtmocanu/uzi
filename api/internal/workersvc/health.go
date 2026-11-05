@@ -1110,7 +1110,8 @@ func analyzeToolWindow(rows []store.ListRunToolWindowRow) bool {
 // wall-clock limit (SweepRunningTimeout). Codex emits `init` once per claim leg,
 // not once per internal provider epoch, so the leg is the granularity here.
 //
-// Issue #2046 reuses the same single scan for the long-tool-call arm: of the unmatched
+// Issue #2046 reuses the same single scan for the long-tool-call arm (and issue #3950
+// for the silent-delegation arm): of the unmatched
 // uses it also reports whether any is a delegation dispatch and the created_at of the
 // oldest unmatched non-delegation one (see leadWindowStats).
 func leadInFlight(rows []store.ListRunLeadToolWindowRow) bool {
@@ -1135,7 +1136,7 @@ type leadWindowStats struct {
 
 // analyzeLeadWindow is the one scan behind leadInFlight (same boundary rule, see
 // there) that also reports the delegation / oldest-open facts the long-tool-call arm
-// needs.
+// (issue #2046) and the silent-delegation arm (issue #3950) need.
 func analyzeLeadWindow(rows []store.ListRunLeadToolWindowRow) leadWindowStats {
 	type openUse struct {
 		id      string
