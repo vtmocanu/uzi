@@ -230,6 +230,36 @@ describe("useOverviewData admin runs", () => {
     expect(result.current.adminRuns).toEqual({ runs: null, failed: false, lastOkAt: null });
   });
 
+  describe("when a personal request hangs after the first load", () => {
+    it("keeps applying new admin rows on the 10 s ticks", async () => {
+      let n = 0;
+      mockApi.adminListRuns.mockImplementation(async () => ({ runs: rows(`r${++n}`) }));
+      const { result } = renderHook(() => useOverviewData({ includeAdminRuns: true }));
+      await settle();
+      expect(ids(result.current.adminRuns.runs)).toEqual(["r1"]);
+      mockApi.listRuns.mockImplementation(() => new Promise(() => {}));
+      await settle(10_000); // the personal poll hangs from here on
+      await settle(10_000);
+      await settle(10_000);
+      expect(mockApi.listRuns.mock.calls.length).toBe(2); // later personal ticks are suppressed
+      expect(ids(result.current.adminRuns.runs)).toEqual(["r4"]);
+      expect(result.current.adminRuns.failed).toBe(false);
+    });
+
+    it("still fails a hung admin request at the 30 s deadline", async () => {
+      mockApi.adminListRuns.mockResolvedValueOnce({ runs: rows("a") });
+      const { result } = renderHook(() => useOverviewData({ includeAdminRuns: true }));
+      await settle();
+      mockApi.listWorkers.mockImplementation(() => new Promise(() => {}));
+      mockApi.adminListRuns.mockImplementation(() => new Promise(() => {}));
+      await settle(10_000);
+      expect(result.current.adminRuns.failed).toBe(false);
+      await settle(30_000);
+      expect(result.current.adminRuns.failed).toBe(true);
+      expect(ids(result.current.adminRuns.runs)).toEqual(["a"]);
+    });
+  });
+
   it("never calls the admin endpoint for a non-admin, even when asked", async () => {
     vi.mocked(useAuth).mockReturnValue(authValue(aUser));
     const { result } = renderHook(() => useOverviewData({ includeAdminRuns: true }));

@@ -14,8 +14,31 @@ function heldRunsBlock(src: string): string {
   if (start < 0) throw new Error("ListMaintenanceHeldRuns not found in intake_pause.sql");
   const rest = src.slice(start + 1);
   const next = rest.indexOf("-- name:");
-  return (next < 0 ? rest : rest.slice(0, next)).replace(/\s+/g, " ");
+  // SQL line comments are dropped before whitespace is normalised, so editing a comment
+  // never breaks the pin.
+  return (next < 0 ? rest : rest.slice(0, next)).replace(/--[^\n]*/g, "").replace(/\s+/g, " ");
 }
+
+// The whole `(CASE WHEN ... END)` that produces the needs_owner / progressing tag.
+function tagCase(block: string): string {
+  const start = block.indexOf("(CASE WHEN");
+  const tagAt = block.indexOf("::text AS tag");
+  if (start < 0 || tagAt < start) throw new Error("tag CASE expression not found in ListMaintenanceHeldRuns");
+  const expr = block.slice(start, tagAt).trim();
+  if (!expr.endsWith("END)")) throw new Error("tag CASE expression does not end with END)");
+  return expr;
+}
+
+// Copied verbatim (comments stripped, whitespace normalised) from ListMaintenanceHeldRuns.
+// Any change to the server's owner predicate must be mirrored here AND in parkDisposition.
+const EXPECTED_TAG_CASE =
+  "(CASE WHEN (r.status = 'awaiting_approval' AND NOT r.auto_approve) " +
+  "OR r.status IN ('awaiting_input', 'paused') " +
+  "OR (r.status = 'recovery_wait' AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_adoption_failed')) " +
+  "OR (r.status = 'recovery_wait' AND r.recovery_wait_cause IN ('retained_recovery_exhausted', 'codex_idle_stall') AND r.recovery_retry_not_before IS NULL) " +
+  "THEN 'needs_owner' ELSE 'progressing' END)";
+
+const matchesPinnedCase = (block: string) => tagCase(block) === EXPECTED_TAG_CASE;
 
 const QUOTED_LIST = /\(((?:'[a-z_]+'(?:, )?)+)\)/;
 function parseList(list: string): Set<string> {
@@ -125,6 +148,31 @@ describe("parkDisposition against ListMaintenanceHeldRuns", () => {
       /\('retained_recovery_exhausted', 'codex_idle_stall'\) AND r\.recovery_retry_not_before IS NULL/,
     );
     expect(serverShape(mutated).nullStampOwnerCauses).toBeNull();
+  });
+
+  it("pins the entire tag CASE expression exactly", () => {
+    expect(tagCase(heldRunsBlock(sql))).toBe(EXPECTED_TAG_CASE);
+  });
+
+  it("rejects a CASE expression whose NULL-stamp predicate was removed", () => {
+    const mutated = heldRunsBlock(sql).replace(" AND r.recovery_retry_not_before IS NULL", "");
+    expect(mutated).not.toBe(heldRunsBlock(sql));
+    expect(matchesPinnedCase(mutated)).toBe(false);
+  });
+
+  it("rejects a CASE expression whose predicate was widened with OR TRUE", () => {
+    const mutated = heldRunsBlock(sql).replace(
+      "AND r.recovery_retry_not_before IS NULL",
+      "AND r.recovery_retry_not_before IS NULL OR TRUE",
+    );
+    expect(mutated).not.toBe(heldRunsBlock(sql));
+    expect(matchesPinnedCase(mutated)).toBe(false);
+  });
+
+  it("accepts the real expression and ignores comment edits", () => {
+    expect(matchesPinnedCase(heldRunsBlock(sql))).toBe(true);
+    const edited = heldRunsBlock(sql.replace("-- #3495:", "-- reworded note:"));
+    expect(matchesPinnedCase(edited)).toBe(true);
   });
 
   it("behaves as documented on every divergence", () => {

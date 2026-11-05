@@ -236,6 +236,33 @@ describe("AppShell banner stack and header slot (PRD #3878)", () => {
     expect(danger()).toBeTruthy();
   });
 
+  describe("with a protected, locked vault", () => {
+    beforeEach(() => {
+      vi.mocked(useAuth).mockReturnValue({
+        ...vi.mocked(useAuth)(),
+        vaultMode: "protected",
+        vaultUnlocked: false,
+        vaultExists: true,
+        hasPassword: true,
+      });
+      mockApi.getAdminHealth.mockResolvedValue(healthySilentDoc());
+    });
+    const locked = () => screen.queryAllByRole("alert").filter((el) => /Vault locked/.test(el.textContent ?? ""));
+
+    it("renders the vault-locked banner once, after the portalled header, on /overview/next", async () => {
+      await mountAt("/overview/next");
+      expect(locked()).toHaveLength(1);
+      expect(follows(screen.getByRole("heading", { name: "Hdr" }), locked()[0])).toBe(true);
+      expect(follows(locked()[0], screen.getByText("preview content"))).toBe(true);
+    });
+
+    it("renders the vault-locked banner once, before the page content, on /runs", async () => {
+      await mountAt("/runs");
+      expect(locked()).toHaveLength(1);
+      expect(follows(locked()[0], screen.getByRole("heading", { name: "Runs page" }))).toBe(true);
+    });
+  });
+
   it("leaves no header slot content or spacing on a page that has no header", async () => {
     mockApi.getAdminHealth.mockResolvedValue(healthySilentDoc());
     const { container } = await mountAt("/runs");

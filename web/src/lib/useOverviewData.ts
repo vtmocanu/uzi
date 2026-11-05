@@ -184,8 +184,16 @@ export function useOverviewData(opts?: { includeAdminRuns?: boolean }) {
     void fetchAdminRuns();
   }, [adminRunsEnabled, fetchAdminRuns]);
 
-  const poll = useCallback(async () => {
+  // Admin runs poll on their own cadence, NOT inside `poll`: usePollWhileVisible skips
+  // ticks while a callback's promise is pending, so coupling them would let one hung
+  // personal request stop admin polling and its deadline handling. This callback returns
+  // immediately (fetchAdminRuns is fire-and-forget), so its own in-flight gate never blocks.
+  const pollAdmin = useCallback(() => {
     if (adminRunsEnabled) void fetchAdminRuns();
+  }, [adminRunsEnabled, fetchAdminRuns]);
+  usePollWhileVisible(pollAdmin, 10000);
+
+  const poll = useCallback(async () => {
     try {
       const [{ runs }, { workers }] = await Promise.all([api.listRuns({ view: "summary" }), api.listWorkers()]);
       if (!pollAliveRef.current) return;
@@ -203,7 +211,7 @@ export function useOverviewData(opts?: { includeAdminRuns?: boolean }) {
     } catch {
       // keep the last-good data
     }
-  }, [adminRunsEnabled, fetchAdminRuns]);
+  }, []);
   usePollWhileVisible(poll, 10000);
   // #2399: usage has its own cadence and failure handling. Each successful
   // endpoint updates immediately; a failure retains only its own last-good data.
