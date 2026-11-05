@@ -906,6 +906,23 @@ const GIT_TIMEOUT_MS = 10 * 60_000; // 10m — clones can be large on cold cache
  *  files, so it is bounded far below GIT_TIMEOUT_MS (a planted FIFO would otherwise stall it). */
 const SCRATCH_IGNORE_CHECK_TIMEOUT_MS = 15_000;
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
+/** Caps for {@link GitCache.inventorySourceContentProof} and {@link GitCache.inventoryIgnoredResidue}: tracked entries
+ *  examined, and bytes of any one command's output or of the hashed-path stdin. A hit is `over_bound`. */
+export interface InventoryContentProofBounds { maxEntries: number; maxBytes: number }
+export const INVENTORY_CONTENT_PROOF_BOUNDS: InventoryContentProofBounds = { maxEntries: 50_000, maxBytes: 8 * 1024 * 1024 };
+
+/** The one `ls-files --directory` entry that is not residue: `.uzi/` collapsed because it is ignored as a whole. */
+const UZI_DIR_ENTRY = Buffer.from(".uzi/");
+
+/** Split NUL-terminated records (the `-z` form); undefined when non-empty output is not NUL-terminated. */
+function splitNulRecords(buf: Buffer): Buffer[] | undefined {
+  if (buf.length === 0) return [];
+  if (buf[buf.length - 1] !== 0) return undefined;
+  const records: Buffer[] = [];
+  let start = 0;
+  for (let i = buf.indexOf(0); i >= 0; start = i + 1, i = buf.indexOf(0, start)) records.push(buf.subarray(start, i));
+  return records;
+}
 /** Wall-clock ceiling on the preserved_patch scan (the patch is already byte-capped by
  *  REVIEW_DIFF_MAX_BYTES, so gitleaks stdin finishes in well under a second in practice). */
 const PATCH_SCAN_TIMEOUT_MS = 2 * 60_000;
@@ -11371,10 +11388,12 @@ export class GitCache {
   /** Read only worker-journaled/ledger-owned heads. Ref files are size-bounded;
    * no retries, and any failed sibling read refuses the whole verification.
    * Runner config is never consulted, and every traversed component rejects symlinks. */
-  async readInventoryCloneHeads(barePath: string, runId: string, underLock = false): ReturnType<GitCache["readInventoryCloneHeadsUnderLock"]> {
+  async readInventoryCloneHeads(barePath: string, runId: string, underLockOrOptions: boolean | { cloneIdentity?: boolean } = false): ReturnType<GitCache["readInventoryCloneHeadsUnderLock"]> {
+    const underLock = typeof underLockOrOptions === "boolean" ? underLockOrOptions : false;
+    const cloneIdentity = typeof underLockOrOptions === "object" && underLockOrOptions.cloneIdentity === true;
     if (underLock) return this.readInventoryCloneHeadsUnderLock(barePath, runId);
     try {
-      return await this.withLock(barePath, () => this.readInventoryCloneHeadsUnderLock(barePath, runId));
+      return await this.withLock(barePath, () => this.readInventoryCloneHeadsUnderLock(barePath, runId, cloneIdentity));
     } catch (err) {
       this.checkRecoveryInterruption();
       if (this.reportProofs.getStore()) throw err;
@@ -11383,7 +11402,7 @@ export class GitCache {
   }
 
   /** Observational variant: the caller already holds B. */
-  async readInventoryCloneHeadsUnderLock(barePath: string, runId: string): Promise<
+  async readInventoryCloneHeadsUnderLock(barePath: string, runId: string, cloneIdentity = false): Promise<
     { kind: "verified"; heads: string[]; clones: Array<{ clonePath: string; branch: string; runId: string; head?: string; identity?: string }>; foreignOwners: string[] } | { kind: "unknown"; cause?: InventoryReadCause }
   > {
     let cause: InventoryReadCause = "other";
@@ -11510,7 +11529,8 @@ export class GitCache {
           const head = await atFailure("clone_head_unreadable", () => this.readReportCloneHead(clone));
           heads.add(head);
           clones.push({ clonePath: clone, ...owner,
-            ...(this.reportProofs.getStore() ? { head, identity: `${st.dev}:${st.ino}` } : {}) });
+            // cloneIdentity adds the per-clone tuple parts without report-proof semantics (presence stays optional).
+            ...(this.reportProofs.getStore() || cloneIdentity ? { head, identity: `${st.dev}:${st.ino}` } : {}) });
         }
         return { kind: "verified", heads: [...heads], clones, foreignOwners: [...foreignOwners] };
       }
@@ -15209,6 +15229,105 @@ try {
         error: gitErrorMessage(err),
       });
       return null;
+    }
+  }
+
+  /**
+   * Strict, byte-exact working-tree proof for the inventory FINAL source boundary (issue #2969). Unlike
+   * {@link worktreeStatus} it never trusts the index stat cache alone and refuses anything it cannot read exactly:
+   *  1. `status --porcelain=v1 -z --untracked-files=all` (non-zero exit or any stderr: unreadable; any output: dirty);
+   *  2. `ls-files -v -z`: any tag but `H` (assume-unchanged, skip-worktree, unmerged) is unreadable;
+   *  3. `ls-files -s -z`: a malformed record, a non-zero stage or a gitlink is unreadable; symlinks (mode 120000)
+   *     are covered by step 1 and are not hashed;
+   *  4. a regular file whose path holds an LF, starts with `"` or ends with CR is refused (unreadable) BEFORE any
+   *     dispatch: `hash-object --stdin-paths` reads one path per line, C-unquotes a leading quote and strips a
+   *     trailing CR, so such a path would hash a different file;
+   *  5. `hash-object --no-filters --stdin-paths` over the exact path bytes (stdin only, never argv);
+   *  6. exactly one object id per path, in order, in the repository's object format (`rev-parse --show-object-format`);
+   *  7. each id must equal the index blob id, else dirty (so content that differs with an unchanged stat is dirty);
+   *  8. an entry or byte cap hit is `over_bound`.
+   * Runs as the runner uid with GIT_OPTIONAL_LOCKS=0 and never decodes a path to a JS string.
+   */
+  async inventorySourceContentProof(cwd: string, bounds: InventoryContentProofBounds = INVENTORY_CONTENT_PROOF_BOUNDS):
+    Promise<"clean" | "dirty" | "unreadable" | "over_bound"> {
+    const env = { GIT_OPTIONAL_LOCKS: "0" };
+    const run = (args: string[], input?: Buffer) => this.runGitAsRunnerBytes(cwd, args,
+      { env, maxBuffer: bounds.maxBytes, ...(input ? { input } : {}) });
+    try {
+      const status = await run(["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+      if (status.exceeded) return "over_bound";
+      if (status.code !== 0 || status.stderr.length > 0) return "unreadable";
+      if (status.stdout.length > 0) return "dirty";
+      const flags = await run(["ls-files", "-v", "-z"]);
+      if (flags.exceeded) return "over_bound";
+      if (flags.code !== 0 || flags.stderr.length > 0) return "unreadable";
+      const staged = await run(["ls-files", "-s", "-z"]);
+      if (staged.exceeded) return "over_bound";
+      if (staged.code !== 0 || staged.stderr.length > 0) return "unreadable";
+      const tagged = splitNulRecords(flags.stdout), records = splitNulRecords(staged.stdout);
+      if (!tagged || !records || tagged.length !== records.length) return "unreadable";
+      if (records.length > bounds.maxEntries) return "over_bound";
+      if (tagged.some(r => r.length < 3 || r[0] !== 0x48 || r[1] !== 0x20)) return "unreadable";
+      const files: Array<{ path: Buffer; oid: string }> = [];
+      for (const record of records) {
+        const tab = record.indexOf(0x09);
+        const header = /^(\d{6}) ([0-9a-f]{40}|[0-9a-f]{64}) (\d)$/.exec(tab < 0 ? "" : record.subarray(0, tab).toString("latin1"));
+        const entryPath = tab < 0 ? undefined : record.subarray(tab + 1);
+        if (!header || !entryPath || entryPath.length === 0 || header[3] !== "0") return "unreadable";
+        if (header[1] === "120000") continue;
+        if (header[1] !== "100644" && header[1] !== "100755") return "unreadable";
+        if (entryPath.includes(0x0a) || entryPath[0] === 0x22 || entryPath[entryPath.length - 1] === 0x0d) return "unreadable";
+        files.push({ path: entryPath, oid: header[2]! });
+      }
+      if (files.length === 0) return "clean";
+      const format = await run(["rev-parse", "--show-object-format"]);
+      if (format.code !== 0 || format.stderr.length > 0) return "unreadable";
+      const idLength = { sha1: 40, sha256: 64 }[format.stdout.toString("latin1").trim() as "sha1" | "sha256"];
+      if (idLength === undefined || files.some(f => f.oid.length !== idLength)) return "unreadable";
+      // Bounded by construction: the path bytes are a subset of the `ls-files -s` output already held to maxBytes.
+      const input = Buffer.concat(files.flatMap(f => [f.path, Buffer.from("\n")]));
+      const hashed = await run(["hash-object", "--no-filters", "--stdin-paths"], input);
+      if (hashed.exceeded) return "over_bound";
+      if (hashed.code !== 0 || hashed.stderr.length > 0) return "unreadable";
+      const text = hashed.stdout.toString("latin1");
+      if (!text.endsWith("\n")) return "unreadable";
+      const lines = text.slice(0, -1).split("\n");
+      if (lines.length !== files.length) return "unreadable";
+      const idShape = new RegExp(`^[0-9a-f]{${idLength}}$`);
+      if (lines.some(line => !idShape.test(line))) return "unreadable";
+      return lines.every((line, i) => line === files[i]!.oid) ? "clean" : "dirty";
+    } catch (err) {
+      this.checkRecoveryInterruption();
+      this.log.debug("inventory source content proof failed (-> unreadable)", { cwd, error: gitErrorMessage(err) });
+      return "unreadable";
+    }
+  }
+
+  /**
+   * Predecessor-only loss boundary (issue #2969 D6): whether the clone holds ignored files outside `.uzi/scratch/`
+   * (a build directory, `node_modules`, a log). A `:(exclude)` pathspec does not remove a collapsed `--directory`
+   * entry (verified on git 2.54: `.uzi/scratch/` and an ignored `.uzi/` are still listed), so two listings run: the
+   * first lists everything outside `.uzi` collapsed to directories, where the single collapsed entry `.uzi/` (the
+   * directory is ignored as a whole) is not itself residue; the second lists `.uzi` file by file without
+   * `.uzi/scratch`. Any other entry, any stderr or a non-zero exit is `residue`; a cap hit is `over_bound`. No allowlist.
+   */
+  async inventoryIgnoredResidue(cwd: string, bounds: InventoryContentProofBounds = INVENTORY_CONTENT_PROOF_BOUNDS):
+    Promise<"clean" | "residue" | "over_bound"> {
+    const listing = ["ls-files", "-z", "--others", "--ignored", "--exclude-standard"];
+    try {
+      for (const pathspec of [["--directory", "--", ".", ":(exclude).uzi"], ["--", ".uzi", ":(exclude).uzi/scratch"]]) {
+        const out = await this.runGitAsRunnerBytes(cwd, [...listing, ...pathspec],
+          { env: { GIT_OPTIONAL_LOCKS: "0" }, maxBuffer: bounds.maxBytes });
+        if (out.exceeded) return "over_bound";
+        if (out.code !== 0 || out.stderr.length > 0) return "residue";
+        const entries = splitNulRecords(out.stdout);
+        if (!entries || entries.some(entry => !entry.equals(UZI_DIR_ENTRY))) return "residue";
+      }
+      return "clean";
+    } catch (err) {
+      this.checkRecoveryInterruption();
+      this.log.debug("inventory ignored-residue listing failed (-> residue)", { cwd, error: gitErrorMessage(err) });
+      return "residue";
     }
   }
 
@@ -18972,9 +19091,9 @@ try {
   /** Active maintenance uses raw pipes so refusal precedes buffering, including stderr. */
   private async execMeteredNative(
     command: string, args: string[],
-    options: { env: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; cwd?: string; input?: string | Buffer },
+    options: { env: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; cwd?: string; input?: string | Buffer; bytes?: true },
     signal?: AbortSignal,
-  ): Promise<{ stdout: string; stderr: string }> {
+  ): Promise<{ stdout: string; stderr: string; stdoutBytes?: Buffer; stderrBytes?: Buffer }> {
     signal?.throwIfAborted();
     assertNoCredentialedGitWhileQuarantined(options.env);
     MaintenanceResources.consumeIfActive("launches", 1);
@@ -19015,7 +19134,8 @@ try {
     signal?.removeEventListener("abort", abort);
     if (timer) clearTimeout(timer);
     if (killTimer) clearTimeout(killTimer);
-    const result = { stdout: Buffer.concat(stdout).toString(), stderr: Buffer.concat(stderr).toString() };
+    const result = { stdout: Buffer.concat(stdout).toString(), stderr: Buffer.concat(stderr).toString(),
+      ...(options.bytes ? { stdoutBytes: Buffer.concat(stdout), stderrBytes: Buffer.concat(stderr) } : {}) };
     if (failure || code !== 0) {
       const error = Object.assign(failure instanceof Error ? failure : new Error(result.stderr || "git subprocess failed"), result);
       if (!("code" in error)) Object.assign(error, { code });
@@ -19143,9 +19263,9 @@ try {
   private async execScoped(
     command: string,
     args: string[],
-    options: { env: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; cwd?: string; input?: string | Buffer },
+    options: { env: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; cwd?: string; input?: string | Buffer; bytes?: true },
     identity: BoundaryProcessRequest["identity"] = "worker_pat",
-  ): Promise<{ stdout: string; stderr: string }> {
+  ): Promise<{ stdout: string; stderr: string; stdoutBytes?: Buffer; stderrBytes?: Buffer }> {
     const boundary = this.boundaryProcesses.getStore();
     const epoch = this.epochRetained.getStore();
     if (epoch) options = { ...options, maxBuffer: Math.min(options.maxBuffer ?? Infinity, epoch.maxMetadataBytes) };
@@ -19157,7 +19277,7 @@ try {
     const operationSignals = [report?.signal, recovery?.signal].filter((s): s is AbortSignal => s !== undefined);
     const operationSignal = operationSignals.length ? AbortSignal.any(operationSignals) : undefined;
     if (recovery) options = { ...options, timeout: Math.min(options.timeout ?? Infinity, this.recoveryRemaining(recovery)) };
-    const { input, ...execOptions } = options;
+    const { input, bytes: wantBytes, ...execOptions } = options;
     if (!boundary) {
       // issue #2213: the second quarantine check, keyed on the credential itself, synchronously
       // before the child is created (nothing awaits between this and execFileAsync).
@@ -19170,6 +19290,7 @@ try {
       // issue #1597 M2: optional stdin (the checkpoint scan's cat-file / gitleaks stdin). An EPIPE on
       // an early-exiting child is swallowed here; the exit status carries the failure.
       const pending = execFileAsync(command, args, { ...execOptions,
+        ...(wantBytes ? { encoding: "buffer" as const } : {}),
         ...(operationSignal ? { signal: operationSignal, ...(report ? { killSignal: "SIGKILL" as const } : {}) } : {}),
       });
       const closed = new Promise<void>(resolve => pending.child.once("close", () => resolve()));
@@ -19186,7 +19307,8 @@ try {
         this.checkRecoveryInterruption();
         const stdout = String(result.stdout);
         this.checkEpochMetadata(args, stdout);
-        return { stdout, stderr: String(result.stderr) };
+        return { stdout, stderr: String(result.stderr),
+          ...(wantBytes ? { stdoutBytes: Buffer.from(result.stdout), stderrBytes: Buffer.from(result.stderr) } : {}) };
       } catch (error) {
         try {
           if (epoch && (error as { code?: unknown })?.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER")
@@ -19362,7 +19484,8 @@ try {
       throw failure;
     }
     this.checkEpochMetadata(args, out);
-    return { stdout: out, stderr: err };
+    return { stdout: out, stderr: err,
+      ...(wantBytes ? { stdoutBytes: Buffer.concat(stdout.chunks), stderrBytes: Buffer.concat(stderr.chunks) } : {}) };
   }
 
   private async runGit(cwd: string | undefined, args: string[], pat?: string, scope?: string, username?: string,
@@ -19885,8 +20008,59 @@ try {
    * security-relevant key.
    */
   private async runGitAsRunner(cwd: string | undefined, args: string[], opts: { timeoutMs?: number; env?: NodeJS.ProcessEnv; input?: string } = {}): Promise<string> {
-    this.assertCaptureDecoration(opts.env);
-    const base = { ...gitEnv(), ...opts.env };
+    const { env, wrapped } = this.runnerGitInvocation(cwd, args, opts.env);
+    this.log.debug("git (runner uid)", { cwd, args });
+    try {
+      const { stdout } = await this.execScoped(wrapped.command, wrapped.args, {
+        env,
+        timeout: opts.timeoutMs ?? GIT_TIMEOUT_MS,
+        maxBuffer: GIT_MAX_BUFFER,
+        ...(opts.input !== undefined ? { input: opts.input } : {}),
+      }, "command");
+      return stdout;
+    } catch (err) {
+      throw this.runnerGitFailure(err, args);
+    }
+  }
+
+  /**
+   * The byte-exact twin of {@link runGitAsRunner} for the strict inventory content proof: the same runner
+   * identity, env, worker-mark rules and wrapping (both build them through {@link runnerGitInvocation}), but
+   * stdin, stdout and stderr are Buffers, no path is decoded to a JS string, and a non-zero exit is a RESULT
+   * (`code`), not a throw, so the caller classifies it. `exceeded` is set (with code -1 and empty output) when
+   * output passed `maxBuffer`. An abort, a timeout or a spawn failure still throws.
+   */
+  private async runGitAsRunnerBytes(cwd: string, args: string[],
+    opts: { input?: Buffer; timeoutMs?: number; env?: NodeJS.ProcessEnv; maxBuffer?: number } = {},
+  ): Promise<{ code: number; stdout: Buffer; stderr: Buffer; exceeded?: true }> {
+    const { env, wrapped } = this.runnerGitInvocation(cwd, args, opts.env);
+    this.log.debug("git (runner uid, bytes)", { cwd, args });
+    try {
+      const result = await this.execScoped(wrapped.command, wrapped.args, {
+        env,
+        timeout: opts.timeoutMs ?? GIT_TIMEOUT_MS,
+        maxBuffer: opts.maxBuffer ?? GIT_MAX_BUFFER,
+        bytes: true,
+        ...(opts.input !== undefined ? { input: opts.input } : {}),
+      }, "command");
+      return { code: 0, stdout: result.stdoutBytes ?? Buffer.alloc(0), stderr: result.stderrBytes ?? Buffer.alloc(0) };
+    } catch (err) {
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
+      const e = err as { code?: unknown; outputExceeded?: unknown; stderr?: unknown };
+      if (e.outputExceeded === true || e.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER")
+        return { code: -1, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), exceeded: true };
+      if (typeof e.code === "number" && e.code !== 0)
+        return { code: e.code, stdout: Buffer.alloc(0), stderr: Buffer.from(typeof e.stderr === "string" ? e.stderr : "") };
+      throw this.runnerGitFailure(err, args);
+    }
+  }
+
+  /** The env and wrapped command shared by every runner-uid git ({@link runGitAsRunner}, {@link runGitAsRunnerBytes}). */
+  private runnerGitInvocation(cwd: string | undefined, args: string[], extraEnv: NodeJS.ProcessEnv | undefined):
+    { env: NodeJS.ProcessEnv; wrapped: { command: string; args: string[] } } {
+    this.assertCaptureDecoration(extraEnv);
+    const base = { ...gitEnv(), ...extraEnv };
     // issue #1783 (R4): worker-marked ONLY when the subcommand can run no code the clone
     // configures (runnerGitCarriesWorkerMark), so a concurrent reap never kills that op. Every
     // other runner git here (status, add, commit, checkout, reset, merge, rebase, …) can start an
@@ -19909,26 +20083,19 @@ try {
     const wrapped = this.boundaryProcesses.getStore()
       ? { command: GIT_BIN, args: withDir(cwd, args) }
       : runnerCommand("git", withDir(cwd, args));
-    this.log.debug("git (runner uid)", { cwd, args });
-    try {
-      const { stdout } = await this.execScoped(wrapped.command, wrapped.args, {
-        env,
-        timeout: opts.timeoutMs ?? GIT_TIMEOUT_MS,
-        maxBuffer: GIT_MAX_BUFFER,
-        ...(opts.input !== undefined ? { input: opts.input } : {}),
-      }, "command");
-      return stdout;
-    } catch (err) {
-      const abort = this.boundaryAbortError(err);
-      if (abort) throw abort;
-      // Preserve git's numeric exit code on the wrapped error so a caller can discriminate
-      // an expected non-zero status (e.g. `config --unset-all` exit 5 = key absent) from a
-      // real failure — the same `.code` idiom `tryGit` reads off the raw execFile error.
-      const failure = new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
-      const code = (err as { code?: unknown }).code;
-      if (typeof code === "number") (failure as { code?: number }).code = code;
-      throw failure;
-    }
+    return { env, wrapped };
+  }
+
+  private runnerGitFailure(err: unknown, args: string[]): Error {
+    const abort = this.boundaryAbortError(err);
+    if (abort) return abort;
+    // Preserve git's numeric exit code on the wrapped error so a caller can discriminate
+    // an expected non-zero status (e.g. `config --unset-all` exit 5 = key absent) from a
+    // real failure — the same `.code` idiom `tryGit` reads off the raw execFile error.
+    const failure = new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
+    const code = (err as { code?: unknown }).code;
+    if (typeof code === "number") (failure as { code?: number }).code = code;
+    return failure;
   }
 
   /**

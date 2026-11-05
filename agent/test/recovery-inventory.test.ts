@@ -2658,7 +2658,7 @@ for (const after of [false, true]) for (const sample of cases3467) {
         trace.push("inventory");
         return { kind: "verified", heads: [], clones: [{ clonePath: "/fixture/owned", branch: "task", runId: "run-1" }], foreignOwners: [] } as never;
       };
-      f.git.worktreeStatus = async () => { trace.push("status"); return []; };
+      f.git.inventorySourceContentProof = async () => { trace.push("status"); return "clean"; };
       const sibling = Promise.resolve();
       if (sample.sibling) f.runnerState().executionTails.set("sibling", sibling);
       const capturedLogs: Array<{ message: string; fields: unknown }> = [];
@@ -2885,6 +2885,7 @@ async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = 
   };
   const git = {
     worktreeStatus: async () => [] as string[],
+    inventorySourceContentProof: async () => "clean" as "clean" | "dirty" | "unreadable" | "over_bound",
     recoverySettlementRoot: path.join(root, "settlement"),
     deleteRecoveryPin: async () => { state.pinDeletes++; state.candidates = []; },
     readInventoryCloneHeads: async () => state.cloneReadable

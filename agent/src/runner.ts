@@ -128,7 +128,7 @@ import type {
 import { resolveAgentSelection, RUN_KINDS } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
-import { RecoveryCoordinator, canonicalJson, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, inventoryProcessDiagnostic, type ClosedSourceObservation, type InventorySourceBoundaryContext, type CompletionSource, type DurableCompletionRetirement, type HandoffRetirement, type RetainedBoundaryReason, type RecoveryRecord, type RecoveryCoordinatorOptions, type OperatorRequestSignals, type DescribeLocalRecordsResult, type ResolveLocalRecordResult } from "./recovery.js";
+import { RecoveryCoordinator, canonicalJson, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, inventoryProcessDiagnostic, type ClosedSourceObservation, type InventorySourceBoundaryContext, type InventorySourceDiagnostic, type CompletionSource, type DurableCompletionRetirement, type HandoffRetirement, type RetainedBoundaryReason, type RecoveryRecord, type RecoveryCoordinatorOptions, type OperatorRequestSignals, type DescribeLocalRecordsResult, type ResolveLocalRecordResult } from "./recovery.js";
 import { classifyRecoveryOrigin } from "./recovery-origin.js";
 import {
   PUSHED_HEAD_UNRECORDED,
@@ -678,6 +678,53 @@ type RecoveryParkCause =
 
 /* Exact local revocation from assertHeldFreeCapture, distinct from an arbitrary refusal. */
 class FreeCaptureScopeExpired extends TrustedExecutionRefusal {}
+
+/** A refusal a predecessor boundary recorded in its grant: every closed coordinator check, plus the runner-only codes. */
+type PredecessorRefusalCheck = InventorySourceDiagnostic["check"] |
+  "ignored_residue" | "over_bound" | "predecessor_scope_invalid" | "codex_attempt_mismatch" | "baseline_drift";
+
+/** The runner-private authority behind a predecessor `PredecessorOperation.boundary` token (issue #2969). */
+interface PredecessorBoundaryGrant {
+  readonly flight: RunFlight;
+  /** The flight's own execution tail; the run's current tail must stay exactly this promise. */
+  readonly tail: Promise<ClosedSourceObservation | void>;
+  /** Generations a boundary may name; each must also be strictly below `flight.claimGeneration`. */
+  readonly generations: ReadonlySet<number>;
+  readonly held: HeldFreeCapture;
+  /** Codex flight: the capture attempt may only prove its own clone path. */
+  readonly codex: boolean;
+  readonly captureAttempt: RunAttempt | undefined;
+  readonly deadlineAt: number;
+  /** Canonical per-clone [clonePath, branch, head, dev:ino] tuples; seeded once, compared on every prove. */
+  baseline: string | undefined;
+  readonly refusals: Array<{ check: PredecessorRefusalCheck; clonePath?: string }>;
+  settlementLate: boolean;
+  readonly live: () => boolean;
+}
+
+/** What {@link RunRunner.registerPredecessorBoundary} hands the held callback. */
+interface PredecessorBoundaryRegistration {
+  /** The opaque `PredecessorOperation.boundary`. */
+  readonly token: object;
+  /** The `PredecessorOperation.live`: registered, exact tail, valid held scope, before the deadline, not cancelled. */
+  readonly live: () => boolean;
+  /** Every refusal recorded so far (live array; first entries are the earliest). */
+  readonly refusals: ReadonlyArray<{ check: PredecessorRefusalCheck; clonePath?: string }>;
+  readonly settlementLate: boolean;
+  markSettlementLate(): void;
+  /** Kills the token; `live()` is false afterwards. */
+  dispose(): void;
+}
+
+/** Canonical key of a clone set's [clonePath, branch, head, dev:ino] tuples, or undefined when any head/identity is absent. */
+function predecessorBaselineKey(clones: ReadonlyArray<{ clonePath: string; branch: string; head?: string; identity?: string }>): string | undefined {
+  const tuples: string[][] = [];
+  for (const c of clones) {
+    if (typeof c.head !== "string" || typeof c.identity !== "string") return undefined;
+    tuples.push([c.clonePath, c.branch, c.head, c.identity]);
+  }
+  return JSON.stringify(tuples.sort((a, b) => (a[0]! < b[0]! ? -1 : a[0]! > b[0]! ? 1 : 0)));
+}
 
 /** Runner-local capability, valid only inside its matching flight's callback. */
 interface HeldFreeCapture {
@@ -3320,6 +3367,8 @@ export class RunRunner {
   /** Whole-execution ownership, including factory setup, batcher close and every
    * finally cleanup. A promoted claim can arrive before an old park ACK returns. */
   private readonly inventoryReservations = new Set<string>();
+  /** issue #2969: live predecessor boundary grants by their opaque token (see registerPredecessorBoundary). */
+  private readonly predecessorBoundaryGrants = new WeakMap<object, PredecessorBoundaryGrant>();
   private readonly commandSettlements = new WeakMap<Executor, { confirmed: boolean; failed: boolean }>();
   private readonly executionTails = new Map<string, Promise<ClosedSourceObservation | void>>();
   /** issue #3645: terminal owner run id -> the one claimant flight currently running the coordinated handoff for it.
@@ -4132,8 +4181,10 @@ export class RunRunner {
     context: InventorySourceBoundaryContext,
     action: (prove: () => Promise<boolean>) => Promise<void>,
   ): Promise<"passed" | "retained"> {
-    const { runId, barePath } = context;
+    const { runId } = context;
     const refuse = inventorySourceReporter(context);
+    // A predecessor token selects the per-call boundary: it never installs a tail or a reservation of its own.
+    if (context.predecessor !== undefined) return this.withPredecessorSourceBoundary(context, refuse, action);
     // Never wait on an executing lane: terminal-journal drain can call recovery itself.
     if (this.executionTails.has(runId)) { refuse({ check: "execution_tail_present" }); return "retained"; }
     let release!: () => void;
@@ -4141,40 +4192,8 @@ export class RunRunner {
     this.executionTails.set(runId, tail);
     this.inventoryReservations.add(runId);
     try {
-      let sourceIdentity: string | undefined;
-      const prove = async (): Promise<boolean> => {
-        const inventory = await this.git.readInventoryCloneHeads(barePath, runId);
-        if (inventory.kind !== "verified")
-          return refuse({ check: "inventory_read_not_verified", cause: inventoryReadCause(inventory) });
-        const identity = JSON.stringify({ heads: inventory.heads, clones: inventory.clones });
-        if (sourceIdentity !== undefined && sourceIdentity !== identity) return refuse({ check: "source_identity_changed" });
-        sourceIdentity = identity;
-        // Each owned physical source is checked once per proof; a failed sibling blocks FINAL.
-        for (const clone of inventory.clones) {
-          const request = {
-            mode: "capture" as const, attempt: undefined,
-            cloneKey: cloneKeyOf(clone.clonePath).cloneKey, targetPaths: [clone.clonePath],
-            processes: process.platform === "linux", dockerHost: this.dockerHost,
-            registry: this.liveAttempts,
-            otherClaimInFlight: [...this.executionTails.keys()].some(id => id !== runId),
-            site: "inventory_source",
-          };
-          if (process.platform !== "linux") return refuse({ check: "non_linux_host" });
-          if (this.liveAttempts.isLivePath(clone.clonePath)) return refuse({ check: "live_attempt_path" });
-          const before = await this.quiesceImpl(request);
-          if (before.process?.state !== "quiescent") return refuse(inventoryProcessDiagnostic("process_not_quiescent_before_git", before.process, request.otherClaimInFlight));
-          const status = await this.git.worktreeStatus(clone.clonePath);
-          const after = await this.quiesceImpl({ ...request, dockerHost: undefined, site: "inventory_source:after_runner_git" });
-          if (status === null) return refuse({ check: "worktree_status_unreadable" });
-          if (status.length !== 0) return refuse({ check: "worktree_status_dirty" });
-          if (after.process?.state !== "quiescent") return refuse(inventoryProcessDiagnostic("process_not_quiescent_after_git", after.process, request.otherClaimInFlight));
-        }
-        const afterGit = await this.git.readInventoryCloneHeads(barePath, runId);
-        if (afterGit.kind !== "verified")
-          return refuse({ check: "inventory_read_not_verified", cause: inventoryReadCause(afterGit) });
-        return JSON.stringify({ heads: afterGit.heads, clones: afterGit.clones }) === sourceIdentity ||
-          refuse({ check: "source_identity_changed" });
-      };
+      const state: { sourceIdentity?: string } = {};
+      const prove = (): Promise<boolean> => this.proveInventorySources(context, refuse, state);
       if (!await prove()) return "retained";
       await action(prove);
       return "passed";
@@ -4187,6 +4206,177 @@ export class RunRunner {
       if (this.executionTails.get(runId) === tail) this.executionTails.delete(runId);
       release();
     }
+  }
+
+  /**
+   * issue #2969: register the boundary authority a predecessor FINAL needs while this flight's own claim executes.
+   * Called by the held `runFreeCapture` callback; the returned `token` is the opaque
+   * `PredecessorOperation.boundary` and `live` its `PredecessorOperation.live`. Throws (registering nothing) unless
+   * the flight's own execution tail is the run's current tail and every generation is strictly below the flight's.
+   * `baseline` seeds the per-clone `[clonePath, branch, head, dev:ino]` tuples (a pre-entry
+   * `readInventoryCloneHeads(..., { cloneIdentity: true })` read, Codex); without it the first in-scope prove seeds it
+   * (Claude). Dispose in the callback's `finally`; the token is dead afterwards.
+   */
+  registerPredecessorBoundary(flight: RunFlight, held: HeldFreeCapture, opts: {
+    generations: readonly number[]; deadlineAt: number;
+    baseline?: ReadonlyArray<{ clonePath: string; branch: string; head?: string; identity?: string }>;
+  }): PredecessorBoundaryRegistration {
+    const tail = flight.executionTail;
+    if (!tail || this.executionTails.get(flight.runId) !== tail) throw new TrustedExecutionRefusal("predecessor boundary needs the flight's own execution tail");
+    if (opts.generations.length === 0 || opts.generations.some(g => !Number.isSafeInteger(g) || g < 1 || g >= flight.claimGeneration))
+      throw new TrustedExecutionRefusal("predecessor boundary generation is not below the executing claim");
+    const baseline = opts.baseline === undefined ? undefined : predecessorBaselineKey(opts.baseline);
+    if (opts.baseline !== undefined && baseline === undefined) throw new TrustedExecutionRefusal("predecessor boundary baseline is incomplete");
+    const token = Object.freeze({});
+    const grant: PredecessorBoundaryGrant = {
+      flight, tail, generations: new Set(opts.generations), held,
+      codex: flight.executor.withCredentialFreeCapture !== undefined,
+      captureAttempt: flight.executor.withCredentialFreeCapture ? flight.activeCaptureAttempt : undefined,
+      deadlineAt: Math.min(opts.deadlineAt, held.deadlineAt), baseline, refusals: [], settlementLate: false,
+      live: () => live(),
+    };
+    const heldValid = (): boolean => { try { this.assertHeldFreeCapture(flight, held); return true; } catch { return false; } };
+    const live = (): boolean => this.predecessorBoundaryGrants.get(token) === grant &&
+      this.executionTails.get(flight.runId) === tail && flight.executionTail === tail &&
+      Date.now() < grant.deadlineAt && heldValid() &&
+      !flight.steering.isCancelled() && flight.steering.claimFence() === undefined;
+    this.predecessorBoundaryGrants.set(token, grant);
+    return {
+      token, live,
+      get refusals() { return grant.refusals; },
+      get settlementLate() { return grant.settlementLate; },
+      markSettlementLate: () => { grant.settlementLate = true; },
+      dispose: () => { this.predecessorBoundaryGrants.delete(token); },
+    };
+  }
+
+  /**
+   * The predecessor per-call boundary (issue #2969 D4): selected only by a registered token; it installs no tail and
+   * no inventory reservation, and runs the SAME {@link proveInventorySources} as the ordinary boundary. A scope that
+   * is not valid (tail replaced, generation not allowed or not below the flight's, grant not live, non-Linux)
+   * records `predecessor_scope_invalid` and reports `execution_tail_present`, as the ordinary boundary does for an
+   * executing lane.
+   */
+  private async withPredecessorSourceBoundary(
+    context: InventorySourceBoundaryContext,
+    refuse: (diagnostic: InventorySourceDiagnostic) => false,
+    action: (prove: () => Promise<boolean>) => Promise<void>,
+  ): Promise<"passed" | "retained"> {
+    const grant = context.predecessor === undefined ? undefined : this.predecessorBoundaryGrants.get(context.predecessor);
+    const flight = grant?.flight;
+    if (!grant || !flight || process.platform !== "linux" || context.runId !== flight.runId ||
+        this.executionTails.get(flight.runId) !== grant.tail || flight.executionTail !== grant.tail ||
+        !grant.generations.has(context.generation) || context.generation >= flight.claimGeneration || !grant.live()) {
+      grant?.refusals.push({ check: "predecessor_scope_invalid" });
+      refuse({ check: "execution_tail_present" });
+      return "retained";
+    }
+    try {
+      const state: { sourceIdentity?: string } = {};
+      const prove = (): Promise<boolean> => this.proveInventorySources(context, refuse, state, grant);
+      if (!await prove()) return "retained";
+      await action(prove);
+      return "passed";
+    } catch (err) {
+      grant.refusals.push({ check: "boundary_exception" });
+      refuse({ check: "boundary_exception" });
+      this.log.warn("recovery: predecessor physical source retained", { run_id: context.runId, error: errMessage(err) });
+      return "retained";
+    }
+  }
+
+  /**
+   * One proof of every owned physical source of `context.runId`, shared by the ordinary and the predecessor
+   * boundary. Per clone: the live-path refusal, quiescence before, the byte-exact content proof, (predecessor only)
+   * the ignored-residue gate, quiescence after, then an identity re-read. The ordinary caller passes no `grant`.
+   * A failed sibling blocks FINAL; the first refusal wins at the reporter.
+   */
+  private async proveInventorySources(
+    context: InventorySourceBoundaryContext,
+    refuse: (diagnostic: InventorySourceDiagnostic) => false,
+    state: { sourceIdentity?: string },
+    grant?: PredecessorBoundaryGrant,
+  ): Promise<boolean> {
+    const { runId, barePath } = context;
+    const fail = (check: PredecessorRefusalCheck, diagnostic: InventorySourceDiagnostic, clonePath?: string): false => {
+      grant?.refusals.push(clonePath === undefined ? { check } : { check, clonePath });
+      return refuse(diagnostic);
+    };
+    const read = () => grant ? this.git.readInventoryCloneHeads(barePath, runId, { cloneIdentity: true })
+      : this.git.readInventoryCloneHeads(barePath, runId);
+    // Held validity and the grant's own liveness, before and after each clone.
+    const scope = (): void => {
+      if (!grant) return;
+      this.assertHeldFreeCapture(grant.flight, grant.held);
+      if (!grant.live()) {
+        grant.refusals.push({ check: "predecessor_scope_invalid" });
+        throw new FreeCaptureScopeExpired("predecessor boundary scope is no longer live");
+      }
+    };
+    scope();
+    const inventory = await read();
+    if (inventory.kind !== "verified")
+      return fail("inventory_read_not_verified", { check: "inventory_read_not_verified", cause: inventoryReadCause(inventory) });
+    const identity = JSON.stringify({ heads: inventory.heads, clones: inventory.clones });
+    if (state.sourceIdentity !== undefined && state.sourceIdentity !== identity) return fail("source_identity_changed", { check: "source_identity_changed" });
+    state.sourceIdentity = identity;
+    // The cross-call baseline: per-clone path, branch, head and dev:ino. Seeded once, compared on every prove.
+    const baselineDrift = (clones: typeof inventory.clones): boolean => {
+      if (!grant) return false;
+      const key = predecessorBaselineKey(clones);
+      if (key === undefined) return true;
+      grant.baseline ??= key;
+      return grant.baseline !== key;
+    };
+    if (baselineDrift(inventory.clones)) return fail("baseline_drift", { check: "source_identity_changed" });
+    for (const clone of inventory.clones) {
+      if (process.platform !== "linux") return fail("non_linux_host", { check: "non_linux_host" });
+      scope();
+      let request: QuiesceRunRequest;
+      const otherClaimInFlight = [...this.executionTails.keys()].some(id => id !== runId);
+      if (grant?.codex) {
+        // The Codex capture attempt owns exactly its own clone path; any other source is a STOP.
+        const attempt = grant.captureAttempt;
+        if (!attempt || resolvePath(clone.clonePath) !== attempt.clonePath)
+          return fail("codex_attempt_mismatch", { check: "boundary_exception" }, clone.clonePath);
+        request = {
+          mode: "capture", attempt, cloneKey: attempt.cloneKey, targetPaths: [attempt.clonePath],
+          processes: process.platform === "linux", dockerHost: this.dockerHost, registry: this.liveAttempts,
+          otherClaimInFlight, site: "inventory_source",
+        };
+      } else {
+        request = {
+          mode: "capture", attempt: undefined,
+          cloneKey: cloneKeyOf(clone.clonePath).cloneKey, targetPaths: [clone.clonePath],
+          processes: process.platform === "linux", dockerHost: this.dockerHost, registry: this.liveAttempts,
+          otherClaimInFlight, site: "inventory_source",
+        };
+      }
+      if (this.liveAttempts.isLivePath(clone.clonePath)) return fail("live_attempt_path", { check: "live_attempt_path" }, clone.clonePath);
+      const before = await this.quiesceImpl(request);
+      if (before.process?.state !== "quiescent")
+        return fail("process_not_quiescent_before_git", inventoryProcessDiagnostic("process_not_quiescent_before_git", before.process, otherClaimInFlight), clone.clonePath);
+      const content = await this.git.inventorySourceContentProof(clone.clonePath);
+      const ignored = grant && content === "clean" ? await this.git.inventoryIgnoredResidue(clone.clonePath) : "clean";
+      const after = await this.quiesceImpl({ ...request, dockerHost: undefined, site: "inventory_source:after_runner_git" });
+      scope();
+      if (content === "unreadable") return fail("worktree_status_unreadable", { check: "worktree_status_unreadable" }, clone.clonePath);
+      if (content === "over_bound") return fail("over_bound", { check: "worktree_status_unreadable" }, clone.clonePath);
+      if (content === "dirty") return fail("worktree_status_dirty", { check: "worktree_status_dirty" }, clone.clonePath);
+      // Predecessor only: a build directory or node_modules the successor would lose is residue, reported as dirty.
+      if (ignored === "residue") return fail("ignored_residue", { check: "worktree_status_dirty" }, clone.clonePath);
+      if (ignored === "over_bound") return fail("over_bound", { check: "worktree_status_unreadable" }, clone.clonePath);
+      if (after.process?.state !== "quiescent")
+        return fail("process_not_quiescent_after_git", inventoryProcessDiagnostic("process_not_quiescent_after_git", after.process, otherClaimInFlight), clone.clonePath);
+    }
+    scope();
+    const afterGit = await read();
+    if (afterGit.kind !== "verified")
+      return fail("inventory_read_not_verified", { check: "inventory_read_not_verified", cause: inventoryReadCause(afterGit) });
+    if (JSON.stringify({ heads: afterGit.heads, clones: afterGit.clones }) !== state.sourceIdentity)
+      return fail("source_identity_changed", { check: "source_identity_changed" });
+    if (baselineDrift(afterGit.clones)) return fail("baseline_drift", { check: "source_identity_changed" });
+    return true;
   }
 
   /** Whether a completion-source binder (preparation or binding; keys are completionSourceIdentity tuples) is pending for `clonePath`. */

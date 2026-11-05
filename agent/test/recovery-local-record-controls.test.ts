@@ -231,7 +231,7 @@ async function boundaryWorld(identityOf: (read: number) => string = () => "stabl
       return { kind: "verified" as const, heads: [], foreignOwners: [],
         clones: [{ clonePath, branch: w.f.context.branch, runId: w.runId, identity: identityOf(reads.inventory) }] };
     },
-    worktreeStatus: async () => { reads.status++; return [] as string[]; },
+    inventorySourceContentProof: async () => { reads.status++; return "clean" as const; },
   };
   const runner = new RunRunner({} as never, fakeGit as never, () => { throw new Error("no executor"); }, nullLogger(), 20, undefined, { pollMs: 5 });
   const diagnostics: Array<{ check: string }> = [];
