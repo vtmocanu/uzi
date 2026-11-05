@@ -277,11 +277,13 @@ describe("overviewDecisions", () => {
     ]);
   });
 
-  it("lists a run once: an awaiting_approval run in an account cooldown is a plan only", () => {
+  it("keeps unparseable timestamps last, in input order, without a NaN comparator", () => {
     const got = overviewDecisions([
-      run({ id: "x", status: "awaiting_approval", health: "waiting_account_cooldown" }),
+      run({ id: "bad-1", status: "awaiting_approval", status_since: "garbage" }),
+      run({ id: "bad-2", status: "awaiting_approval", status_since: "nope" }),
+      run({ id: "good", status: "awaiting_approval", status_since: at(5) }),
     ]);
-    expect(got.map((d) => d.kind)).toEqual(["plan"]);
+    expect(got.map((d) => d.run.id)).toEqual(["good", "bad-1", "bad-2"]);
   });
 });
 

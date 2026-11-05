@@ -22,7 +22,7 @@ function parseList(list: string): Set<string> {
   return new Set([...list.matchAll(/'([a-z_]+)'/g)].map((m) => m[1]));
 }
 
-// What the server pins, extracted from the SQL text. Exported shape is only for the checks below.
+// What the server pins, extracted from the SQL text. The extracted shape is only for the checks below.
 function serverShape(block: string) {
   const status = block.match(/r\.status IN \('awaiting_input', 'paused'\)/);
   const owner = block.match(

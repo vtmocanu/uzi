@@ -2,6 +2,7 @@
 // reviews, questions, owner-action parks and open pull requests, each with one verb and its
 // age. Self-hiding when empty. The caller passes only the viewer's own items.
 
+import { useId } from "react";
 import { Link } from "react-router-dom";
 import { preferForgeUrl } from "../lib/api";
 import { maskRepoPath } from "../lib/demoMask";
@@ -32,6 +33,10 @@ function summary(items: DecisionItem[]): string {
 function DecisionRow({ item, now, demo }: { item: DecisionItem; now: number; demo: boolean }) {
   const { run } = item;
   const age = activityAge(item.since, now);
+  // The row's title describes its action link, so several "Review plan" links are told apart
+  // without changing the link's name. The external link also points at a hidden new-tab note.
+  const titleId = useId();
+  const newTabId = useId();
   // Same derivation as RunsList's MR chip: the persisted forge URL when it is https, else
   // rebuilt from the run's issue URL; a malformed value yields null and falls back to the run.
   const prHref =
@@ -46,7 +51,9 @@ function DecisionRow({ item, now, demo }: { item: DecisionItem; now: number; dem
   return (
     <li className="flex items-center gap-3 py-2.5">
       <div className="min-w-0 flex-1">
-        <p className="truncate text-sm font-medium text-fg">{stripUnsafeChars(run.issue_title)}</p>
+        <p id={titleId} className="truncate text-sm font-medium text-fg">
+          {stripUnsafeChars(run.issue_title)}
+        </p>
         <p className="flex flex-wrap items-center gap-x-2 text-xs text-faint">
           <span>
             {run.repo_path ? <>{maskRepoPath(run.repo_path, demo)} </> : null}
@@ -62,11 +69,22 @@ function DecisionRow({ item, now, demo }: { item: DecisionItem; now: number; dem
         </p>
       </div>
       {prHref ? (
-        <a href={prHref} target="_blank" rel="noopener noreferrer" className={ACTION_CLASS}>
-          {item.verb}
-        </a>
+        <>
+          <a
+            href={prHref}
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-describedby={`${titleId} ${newTabId}`}
+            className={ACTION_CLASS}
+          >
+            {item.verb}
+          </a>
+          <span id={newTabId} className="sr-only">
+            (opens in a new tab)
+          </span>
+        </>
       ) : (
-        <Link to={`/runs/${run.id}`} className={ACTION_CLASS}>
+        <Link to={`/runs/${run.id}`} aria-describedby={titleId} className={ACTION_CLASS}>
           {item.verb}
         </Link>
       )}

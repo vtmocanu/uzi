@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 // PRD #3878 M1: the /overview/next preview page.
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { OverviewNext } from "./OverviewNext";
 import { Dashboard } from "./Dashboard";
@@ -90,6 +90,7 @@ describe("OverviewNext for a non-admin", () => {
     expect(sentence()).toBe("Nothing needs you right now. 1 run is executing.");
     expect(screen.getByText("Live run row")).toBeTruthy();
     for (const call of adminEndpoints()) expect(call).not.toHaveBeenCalled();
+    expect(screen.queryByText(/Other users/)).toBeNull();
     // The health chip is admin-only.
     expect(screen.queryByRole("link", { name: /System health/ })).toBeNull();
   });
@@ -149,8 +150,9 @@ describe("OverviewNext for an admin", () => {
     expect(mockApi.adminListRuns).toHaveBeenCalledWith({ view: "summary" });
     expect(mockApi.adminListRuns).toHaveBeenCalledTimes(1);
     expect(sentence()).toBe("Nothing needs you right now. 2 runs are executing across the factory and 1 queued.");
-    // Other users' rows are not in the temporary viewer-only Runs card.
-    expect(screen.getAllByText("Live run row")).toHaveLength(1);
+    // The admin's own row is shown once, under Yours; the other users' rows under Other users.
+    expect(within(screen.getByRole("list", { name: "Your runs" })).getAllByText("Live run row")).toHaveLength(1);
+    expect(within(screen.getByRole("list", { name: "Other users' runs" })).getAllByText("Live run row")).toHaveLength(2);
     await settle(10_000);
     expect(mockApi.adminListRuns).toHaveBeenCalledTimes(2);
   });
@@ -175,6 +177,22 @@ describe("OverviewNext for an admin", () => {
     expect(sentence()).toBe("Nothing needs you right now. 1 run is executing. Counting only your runs.");
     await settle(10_000);
     expect(sentence()).toContain("2 runs are executing across the factory");
+  });
+
+  it("shows both run groups, and says so when the admin list becomes unavailable", async () => {
+    mockApi.listRuns.mockResolvedValue({ runs: [aRun({ id: "own-1", issue_title: "Mine" })] });
+    mockApi.adminListRuns.mockResolvedValue({
+      runs: [aRun({ id: "x-1", owner_email: "mira@uzi.local", issue_title: "Theirs" })],
+    });
+    await mount();
+    expect(screen.getByText("Yours")).toBeTruthy();
+    expect(screen.getByText("Other users (admin)")).toBeTruthy();
+    expect(within(screen.getByRole("list", { name: "Other users' runs" })).getByText("Theirs")).toBeTruthy();
+    mockApi.adminListRuns.mockRejectedValueOnce(new Error("blip"));
+    await settle(10_000);
+    expect(screen.getByText(/Other users' runs are unavailable \(last read/)).toBeTruthy();
+    expect(screen.queryByText("Theirs")).toBeNull();
+    expect(screen.getByText("Mine")).toBeTruthy();
   });
 
   it("does not fail the personal load when the admin request is the only failure", async () => {
@@ -281,7 +299,9 @@ describe("Needs your decision", () => {
     });
     await mount();
     expect(screen.queryByText("Needs your decision")).toBeNull();
-    expect(screen.queryByText("Theirs")).toBeNull();
+    // They appear only as a read-only row under Other users, with no action.
+    expect(screen.getByText("Theirs")).toBeTruthy();
+    expect(screen.queryByRole("link", { name: "Review plan" })).toBeNull();
     expect(screen.getByText(/^Nothing needs you right now\./)).toBeTruthy();
   });
 });

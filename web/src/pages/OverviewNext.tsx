@@ -5,7 +5,6 @@
 
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
-import { isTerminalRun } from "../lib/api";
 import { useNow } from "../lib/useNow";
 import { useDemoMode } from "../lib/demoMode";
 import { maskName } from "../lib/demoMask";
@@ -22,13 +21,13 @@ import {
 import { UsageCard } from "../components/UsageCards";
 import { OnboardingChecklist } from "../components/OnboardingChecklist";
 import { NeedsDecisionCard } from "../components/NeedsDecisionCard";
-import { OverviewRunRow } from "../components/OverviewRunRow";
+import { OverviewRunsWidget } from "../components/OverviewRunsWidget";
 import { WorkerLoadCard } from "../components/WorkerLoadCard";
 import { CustodyBoardAlert } from "../components/CustodyBoardAlert";
 import { HealthPlatformLine } from "../components/HealthPlatformLine";
 import { HealthChip } from "../components/HealthChip";
 import { InShellHeader } from "../components/PageHeaderSlot";
-import { Card, PageHeader, SectionTitle, Skeleton } from "../components/ui";
+import { PageHeader } from "../components/ui";
 
 export function OverviewNext() {
   const demo = useDemoMode();
@@ -60,7 +59,6 @@ export function OverviewNext() {
         adminUnavailable,
       })
     : undefined;
-  const active = ownRuns.filter((r) => !isTerminalRun(r.status));
   const joined = workerJoined(data?.workers ?? []);
   const ready = data ? setupComplete(data, joined) : false;
 
@@ -98,29 +96,15 @@ export function OverviewNext() {
       <CustodyBoardAlert recoveryWaitCount={ownRecoveryWaitCount(ownRuns)} />
       <HealthPlatformLine isAdmin={isAdmin} runs={ownRuns} workers={data?.workers ?? []} />
 
-      {/* Temporary Runs card: M3 replaces it with the grouped Yours / Other users widget. */}
-      <Card>
-        <div className="flex items-center justify-between">
-          <SectionTitle>Runs</SectionTitle>
-          <Link to="/runs" className="text-xs font-medium text-brand hover:text-brand-hover">
-            All runs →
-          </Link>
-        </div>
-        {!data ? (
-          <div className="mt-3 space-y-2">
-            <Skeleton className="h-10" />
-            <Skeleton className="h-10" />
-          </div>
-        ) : active.length === 0 ? (
-          <p className="mt-3 text-sm text-faint">No active runs. Start one from a board card.</p>
-        ) : (
-          <ul className="mt-2 divide-y divide-edge">
-            {active.map((r) => (
-              <OverviewRunRow key={r.id} run={r} now={now} demo={demo} />
-            ))}
-          </ul>
-        )}
-      </Card>
+      <OverviewRunsWidget
+        ownRuns={ownRuns}
+        adminRuns={isAdmin ? adminRuns : null}
+        isAdmin={isAdmin}
+        viewerEmail={user.email}
+        now={now}
+        demo={demo}
+        loading={!data}
+      />
 
       {data && <WorkerLoadCard workers={data.workers} />}
 

@@ -187,23 +187,25 @@ const DECISION_VERB: Record<DecisionKind, DecisionItem["verb"]> = {
 };
 
 // The viewer's decision items, grouped plan, question, park, pr and oldest first inside a
-// group. A run appears once (the first group wins). Callers pass ONLY the viewer's own rows
-// (listRuns), never the admin rows.
+// group. The groups are disjoint by raw status, so no run-level guard is needed: plan is
+// awaiting_approval, question is awaiting_input / awaiting_followup, pr is completed, and
+// park is a PARKED_STATUSES status, or an account cooldown, which parkDisposition always
+// calls "automatic" and so never lands in the owner-only park group. Callers pass ONLY the
+// viewer's own rows (listRuns), never the admin rows.
 export function overviewDecisions(ownRuns: ReadonlyArray<RunSummaryItem>): DecisionItem[] {
-  const seen = new Set<string>();
   const out: DecisionItem[] = [];
   const add = (kind: DecisionKind, runs: ReadonlyArray<RunSummaryItem>, sinceOf: (r: RunSummaryItem) => string) => {
-    const items: DecisionItem[] = [];
-    for (const run of runs) {
-      if (seen.has(run.id)) continue;
-      seen.add(run.id);
-      items.push({ kind, run, verb: DECISION_VERB[kind], since: sinceOf(run) });
-    }
+    const items: DecisionItem[] = runs.map((run) => ({ kind, run, verb: DECISION_VERB[kind], since: sinceOf(run) }));
+    // An unparseable timestamp sorts last; two of them compare equal (Infinity - Infinity is NaN).
     const t = (i: DecisionItem) => {
       const ms = Date.parse(i.since);
       return Number.isNaN(ms) ? Number.POSITIVE_INFINITY : ms;
     };
-    items.sort((a, b) => t(a) - t(b));
+    items.sort((a, b) => {
+      const ta = t(a);
+      const tb = t(b);
+      return ta === tb ? 0 : ta < tb ? -1 : 1;
+    });
     out.push(...items);
   };
   const since = (r: RunSummaryItem) => r.status_since ?? r.created_at;

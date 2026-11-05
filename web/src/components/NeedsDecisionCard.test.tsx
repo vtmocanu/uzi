@@ -95,4 +95,40 @@ describe("NeedsDecisionCard", () => {
     const title = screen.getByText(/Fix/);
     expect(title.textContent).not.toMatch(/[​‮]/);
   });
+
+  it("describes each action link by its row title, so repeated verbs are distinguishable", () => {
+    mount([
+      item("plan", { id: "p1", issue_title: "First plan" }),
+      item("plan", { id: "p2", issue_title: "Second plan" }),
+    ]);
+    const links = screen.getAllByRole("link", { name: "Review plan" });
+    expect(links).toHaveLength(2);
+    const describedBy = (el: HTMLElement) =>
+      (el.getAttribute("aria-describedby") ?? "")
+        .split(" ")
+        .map((id) => document.getElementById(id)?.textContent)
+        .join(" ");
+    expect(describedBy(links[0])).toBe("First plan");
+    expect(describedBy(links[1])).toBe("Second plan");
+  });
+
+  it("tells assistive tech that the PR link opens a new tab without renaming it", () => {
+    mount([prItem({ issue_title: "Ship it", mr_web_url: "https://github.com/o/r/pull/12" })]);
+    const a = screen.getByRole("link", { name: "Review PR" });
+    const described = (a.getAttribute("aria-describedby") ?? "")
+      .split(" ")
+      .map((id) => document.getElementById(id)?.textContent?.trim())
+      .join(" ");
+    expect(described).toBe("Ship it (opens in a new tab)");
+  });
+
+  it("masks the repo path in demo mode and shows it otherwise", () => {
+    const run = { repo_path: "acme-corp/secret-repo" };
+    mount([item("plan", run)], true);
+    expect(screen.getByText(/demo\/secret-repo/)).toBeTruthy();
+    expect(screen.queryByText(/acme-corp/)).toBeNull();
+    cleanup();
+    mount([item("plan", run)], false);
+    expect(screen.getByText(/acme-corp\/secret-repo/)).toBeTruthy();
+  });
 });

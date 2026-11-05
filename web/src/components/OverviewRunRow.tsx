@@ -58,7 +58,7 @@ export function OverviewRunRow({
     r.status !== "pool_wait" &&
     r.status !== "recovery_wait";
   const nowMilestone = firstInProgressMilestoneId(r);
-  const ownerLabel = owner != null ? maskEmail(owner, demo) : null;
+  const ownerLabel = owner != null ? stripUnsafeChars(maskEmail(owner, demo)) : null;
   return (
     // Issue #485 NB1: RunIssueRef renders a real forge <a>, which cannot nest
     // inside the row's navigational <Link> (also an <a> — invalid HTML). The
