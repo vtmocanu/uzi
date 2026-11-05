@@ -1242,6 +1242,7 @@ describe("AgentRosterSummary — roster revision (issue #3913)", () => {
 
   it("shows no revision line when none was recorded", () => {
     render(<AgentRosterSummary run={run({ status: "running", agent_source: "repo", repo_agents: [] })} />);
+    expect(screen.getByText(/This run used the repository's own agents/i)).toBeTruthy();
     expect(screen.queryByText(/read at default-branch revision/i)).toBeNull();
   });
 });
