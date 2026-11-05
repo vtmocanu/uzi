@@ -7,16 +7,18 @@
 import { Link } from "react-router-dom";
 import type { RecoveryCustodyHolds } from "../lib/api";
 import { custodyAlertView, recoveryCapacityUsed } from "../lib/recovery";
-import { ChevronRightIcon } from "./icons";
 import { Card, SectionTitle, cx } from "./ui";
 
 export const HELD_WORK_HREF = "/workers?tab=workers#recovery-holds";
 
 export function HeldWorkCard({
   holds,
+  holdsFailed = false,
   recoveryWaitCount,
 }: {
   holds: RecoveryCustodyHolds | null;
+  // True only when a request failed and no good holds exist; before the first response the card loads.
+  holdsFailed?: boolean;
   recoveryWaitCount: number;
 }) {
   const title = (
@@ -31,7 +33,9 @@ export function HeldWorkCard({
       <Card>
         <section aria-labelledby="held-work-heading">
           {title}
-          <p className="mt-3 text-sm text-muted">Held work is unavailable right now.</p>
+          <p className="mt-3 text-sm text-muted">
+            {holdsFailed ? "Held work is unavailable right now." : "Loading held work…"}
+          </p>
         </section>
       </Card>
     );
@@ -60,7 +64,14 @@ export function HeldWorkCard({
             }
           : { "aria-labelledby": "held-work-heading" })}
       >
-        <div className="flex items-center justify-between gap-2">{title}</div>
+        <div className="flex items-center justify-between gap-2">
+          {title}
+          {view && view.decisionNeeded > 0 && (
+            <Link to={HELD_WORK_HREF} className="text-xs font-medium text-brand hover:text-brand-hover">
+              Review held work →
+            </Link>
+          )}
+        </div>
 
         {view && <h3 className={cx("mt-3 text-sm font-semibold", accent)}>{view.headline}</h3>}
 
@@ -82,23 +93,6 @@ export function HeldWorkCard({
           Holds protect each run&apos;s committed but unpushed work, while it runs and after a worker is lost.
           {limit > 0 && ` New runs wait for admission once all ${limit} custody slots are taken.`}
         </p>
-
-        {view && view.decisionNeeded > 0 && (
-          <div className="mt-3">
-            {/* A Link styled as a button, never a Link wrapping a Button (two tab stops). */}
-            <Link
-              to={HELD_WORK_HREF}
-              className={cx(
-                "inline-flex h-7 shrink-0 select-none items-center justify-center gap-1 rounded-lg px-2.5 text-xs font-medium transition-colors",
-                danger
-                  ? "bg-brand text-on-brand hover:bg-brand-hover"
-                  : "border border-edge bg-raised text-fg hover:border-edge-strong hover:bg-raised/70",
-              )}
-            >
-              Review held work <ChevronRightIcon aria-hidden="true" />
-            </Link>
-          </div>
-        )}
       </section>
     </Card>
   );
@@ -108,7 +102,7 @@ function Figure({ value, label }: { value: string; label: string }) {
   return (
     <div className="min-w-0">
       <strong className="block text-lg font-semibold tabular-nums text-fg">{value}</strong>
-      <span className="text-xs text-muted">{label}</span>
+      <span className="block text-xs leading-snug text-muted">{label}</span>
     </div>
   );
 }
@@ -120,7 +114,7 @@ function SlotMeter({ used, limit, fill }: { used: number; limit: number; fill: s
     return (
       <div aria-hidden="true" className="mt-3 flex gap-1">
         {Array.from({ length: limit }, (_, i) => (
-          <span key={i} className={cx("h-3 flex-1 rounded-[3px]", i < used ? fill : "bg-edge")} />
+          <span key={i} className={cx("h-3 flex-1 rounded-[3px]", i < used ? fill : "border border-edge-strong")} />
         ))}
       </div>
     );

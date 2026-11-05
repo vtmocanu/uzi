@@ -58,7 +58,7 @@ describe("HeldWorkCard", () => {
     expect(screen.getByText(a.open_holds === 1 ? "open custody hold" : "open custody holds")).toBeTruthy();
     expect(screen.getByText(a.decision_needed === 1 ? "hold needs a decision" : "holds need a decision")).toBeTruthy();
 
-    const link = screen.queryByRole("link", { name: "Review held work" });
+    const link = screen.queryByRole("link", { name: "Review held work →" });
     if (view && view.decisionNeeded > 0) {
       expect(link?.getAttribute("href")).toBe("/workers?tab=workers#recovery-holds");
     } else {
@@ -101,12 +101,42 @@ describe("HeldWorkCard", () => {
     expect(screen.queryByText(/waiting to recover/)).toBeNull();
   });
 
-  it("says the data is unavailable, with no figures, before holds have loaded", () => {
+  it("says it is loading, with no figures, before the first holds response", () => {
     const { container } = mount(null);
-    expect(screen.getByText("Held work is unavailable right now.")).toBeTruthy();
+    expect(screen.getByText("Loading held work…").className).toContain("text-muted");
+    expect(screen.queryByText(/unavailable/)).toBeNull();
     expect(screen.queryByText("custody slots used")).toBeNull();
     expect(screen.queryByRole("link")).toBeNull();
     expect(container.querySelector("[role]")).toBeNull();
+  });
+
+  it("says the data is unavailable only when the request failed and no holds exist", () => {
+    const { container } = render(
+      <MemoryRouter>
+        <HeldWorkCard holds={null} holdsFailed recoveryWaitCount={0} />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText("Held work is unavailable right now.")).toBeTruthy();
+    expect(screen.queryByText(/Loading held work/)).toBeNull();
+    expect(screen.queryByText("custody slots used")).toBeNull();
+    expect(container.querySelector("[role]")).toBeNull();
+  });
+
+  it("keeps showing the figures when holds exist, even if holdsFailed is set", () => {
+    render(
+      <MemoryRouter>
+        <HeldWorkCard holds={{ aggregate: agg({ open_holds: 2, admission_counted_holds: 2 }), holds: [] }} holdsFailed recoveryWaitCount={0} />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText("2 / 8")).toBeTruthy();
+    expect(screen.queryByText(/unavailable|Loading held work/)).toBeNull();
+  });
+
+  it("puts the review link in the card header", () => {
+    mount(agg({ open_holds: 1, admission_counted_holds: 1, decision_needed: 1 }));
+    const link = screen.getByRole("link", { name: "Review held work →" });
+    expect(link.className).toContain("text-xs font-medium text-brand hover:text-brand-hover");
+    expect(link.parentElement?.contains(screen.getByRole("heading", { name: /Held work/, level: 2 }))).toBe(true);
   });
 
   it("fills as many meter cells as slots are used, in the tone of the headline", () => {
@@ -114,6 +144,10 @@ describe("HeldWorkCard", () => {
     const cells = container.querySelectorAll("[aria-hidden=true] > span");
     expect(cells).toHaveLength(8);
     expect([...cells].filter((c) => c.className.includes("bg-danger"))).toHaveLength(3);
+    // Empty slots are outlined, not filled.
+    const empty = [...cells].filter((c) => !c.className.includes("bg-danger"));
+    expect(empty).toHaveLength(5);
+    for (const c of empty) expect(c.className).toContain("border-edge-strong");
   });
 
   it("falls back to a proportional bar past 12 slots", () => {

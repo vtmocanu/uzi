@@ -206,13 +206,22 @@ export function useOverviewData(opts?: { includeAdminRuns?: boolean; includeReco
   // success). Without the opt-in no request is made, so Dashboard sends its historic requests.
   const holdsEnabled = opts?.includeRecoveryHolds === true;
   const [holds, setHolds] = useState<RecoveryCustodyHolds | null>(null);
+  const [holdsRequestFailed, setHoldsRequestFailed] = useState(false);
+  // The mount fetch is outside the poll's in-flight gate, so a slow first response can settle after
+  // a newer one: only the latest issued request may write state (like adminRequestIdRef).
+  const holdsRequestIdRef = useRef(0);
   const loadHolds = useCallback(async () => {
     if (!holdsEnabled) return;
+    const id = ++holdsRequestIdRef.current;
     try {
       const next = await api.getRecoveryHolds();
-      if (pollAliveRef.current) setHolds(next);
+      if (!pollAliveRef.current || holdsRequestIdRef.current !== id) return;
+      setHolds(next);
+      setHoldsRequestFailed(false);
     } catch {
       // keep the last-good holds
+      if (!pollAliveRef.current || holdsRequestIdRef.current !== id) return;
+      setHoldsRequestFailed(true);
     }
   }, [holdsEnabled]);
   useEffect(() => {
@@ -254,5 +263,6 @@ export function useOverviewData(opts?: { includeAdminRuns?: boolean; includeReco
   }, [user?.is_admin]);
   usePollWhileVisible(pollUsage, 30_000);
 
-  return { data, usageWindow, changeUsageWindow, adminRuns, holds };
+  // holdsFailed: a request failed and there is no good data to show (only meaningful with the opt-in).
+  return { data, usageWindow, changeUsageWindow, adminRuns, holds, holdsFailed: holdsRequestFailed && holds === null };
 }

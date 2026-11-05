@@ -374,7 +374,7 @@ describe("overviewDecisions held work", () => {
 
   it("collapses several decision holds into one row with the oldest age and no run", () => {
     const got = held(heldHolds({ open_holds: 2, decision_needed: 2 }, [decisionHold("newer", T2), decisionHold("older", T1)]));
-    expect(got).toEqual([{ kind: "held", verb: "Review held work", count: 2, runId: null, since: T1 }]);
+    expect(got).toEqual([{ kind: "held", verb: "Review held work", count: 2, runId: null, since: T1, label: "Decision required" }]);
   });
 
   it("names the run of a single decision hold", () => {
@@ -384,12 +384,12 @@ describe("overviewDecisions held work", () => {
         decisionHold("healthy", T1, { attention: "active" }),
       ]),
     );
-    expect(got).toEqual([{ kind: "held", verb: "Review held work", count: 1, runId: "only", since: T2 }]);
+    expect(got).toEqual([{ kind: "held", verb: "Review held work", count: 1, runId: "only", since: T2, label: "Decision required" }]);
   });
 
   it("stays generic when the aggregate says 1 but the list has no decision hold", () => {
     const got = held(heldHolds({ open_holds: 1, decision_needed: 1 }, [decisionHold("x", T1, { attention: "active" })]));
-    expect(got).toEqual([{ kind: "held", verb: "Review held work", count: 1, runId: null, since: null }]);
+    expect(got).toEqual([{ kind: "held", verb: "Review held work", count: 1, runId: null, since: null, label: null }]);
   });
 
   it("ignores released holds when picking the row's run and age", () => {
@@ -397,6 +397,16 @@ describe("overviewDecisions held work", () => {
       heldHolds({ open_holds: 1, decision_needed: 1 }, [decisionHold("gone", T1, { state: "released" }), decisionHold("live", T2)]),
     );
     expect(got).toMatchObject([{ runId: "live", since: T2 }]);
+  });
+
+  it("labels the row with the oldest decision hold's state", () => {
+    const got = held(
+      heldHolds({ open_holds: 2, decision_needed: 2 }, [
+        decisionHold("newer", T2, { attention: "source_only" }),
+        decisionHold("older", T1, { attention: "needs_action" }),
+      ]),
+    );
+    expect(got).toMatchObject([{ label: "Needs attention" }]);
   });
 
   it("sorts an unparseable created_at after a parseable one", () => {

@@ -149,6 +149,7 @@ describe("NeedsDecisionCard", () => {
       count: 1,
       runId: "a83c51f0-6d2e-4b7a-9c14-0e5f8a1d3b27",
       since: "2026-07-05T10:20:00Z",
+      label: "Decision required",
       ...over,
     });
 
@@ -157,15 +158,22 @@ describe("NeedsDecisionCard", () => {
       const title = screen.getByText(/Held work from run/);
       expect(title.textContent).toBe("Held work from run a83c51f0 needs a decision");
       expect(screen.getByText("a83c51f0").className).toContain("font-mono");
-      expect(screen.getByText("Custody")).toBeTruthy();
+      expect(screen.getByText("Decision required")).toBeTruthy();
+      expect(screen.queryByText("Custody")).toBeNull();
       expect(screen.getByText("waiting 2h")).toBeTruthy();
+    });
+
+    it("falls back to Custody when the hold has no label", () => {
+      mount([heldItem({ label: null })]);
+      expect(screen.getByText("Custody")).toBeTruthy();
     });
 
     it("reads as a count for several decisions and stays generic when the run is unknown", () => {
       mount([heldItem({ count: 3, runId: null })]);
-      expect(screen.getByText("3 held-work holds need a decision")).toBeTruthy();
+      expect(screen.getByText("Held work needs 3 decisions")).toBeTruthy();
+      expect(screen.getByText("Custody")).toBeTruthy();
       cleanup();
-      mount([heldItem({ runId: null, since: null })]);
+      mount([heldItem({ runId: null, since: null, label: null })]);
       expect(screen.getByText("Held work needs a decision")).toBeTruthy();
       expect(screen.queryByText(/waiting/)).toBeNull();
     });

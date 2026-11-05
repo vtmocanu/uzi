@@ -53,7 +53,7 @@ function HeldDecisionRow({ item, now }: { item: HeldDecisionItem; now: number })
       <div className="min-w-0 flex-1">
         <p id={titleId} className="text-sm font-medium text-fg">
           {item.count > 1 ? (
-            `${item.count} held-work holds need a decision`
+            `Held work needs ${item.count} decisions`
           ) : shortId ? (
             <>
               Held work from run <span className="font-mono">{shortId}</span> needs a decision
@@ -63,7 +63,8 @@ function HeldDecisionRow({ item, now }: { item: HeldDecisionItem; now: number })
           )}
         </p>
         <p className="flex flex-wrap items-center gap-x-2 text-xs text-faint">
-          <span>Custody</span>
+          {/* The oldest hold's state names a single hold; several holds stay generic. */}
+          <span>{item.count === 1 && item.label ? item.label : "Custody"}</span>
           {age && <span>waiting {age}</span>}
         </p>
       </div>

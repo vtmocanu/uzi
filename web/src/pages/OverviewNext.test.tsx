@@ -345,7 +345,7 @@ describe("Held work card", () => {
     expect([...card.querySelectorAll("strong")].map((e) => e.textContent)).toEqual(["2 / 8", "2", "0"]);
     expect(within(card).getByText("open custody holds")).toBeTruthy();
     expect(within(card).getByText("holds need a decision")).toBeTruthy();
-    expect(within(card).queryByRole("link", { name: "Review held work" })).toBeNull();
+    expect(within(card).queryByRole("link", { name: /^Review held work/ })).toBeNull();
     expect(screen.queryByText("Needs your decision")).toBeNull();
     expect(sentence()).toBe("Nothing needs you right now. 1 run is executing.");
   });
@@ -359,13 +359,16 @@ describe("Held work card", () => {
     expect(sentence()).toBe("2 decisions are waiting on you. 1 run is executing.");
     const needs = screen.getByRole("region", { name: "Needs your decision" });
     expect(within(needs).getAllByRole("listitem")).toHaveLength(1);
-    expect(within(needs).getByText("2 held-work holds need a decision")).toBeTruthy();
+    expect(within(needs).getByText("Held work needs 2 decisions")).toBeTruthy();
     expect(within(needs).getByText("2 decisions")).toBeTruthy();
     expect(within(needs).getByRole("link", { name: "Review held work" }).getAttribute("href")).toBe(
       "/workers?tab=workers#recovery-holds",
     );
-    // The card's own link is the second one on the page.
-    expect(screen.getAllByRole("link", { name: "Review held work" })).toHaveLength(2);
+    // The card header carries its own link, beside the row's.
+    expect(within(heldCard()).getByRole("link", { name: "Review held work →" }).getAttribute("href")).toBe(
+      "/workers?tab=workers#recovery-holds",
+    );
+    expect(screen.getAllByRole("link", { name: /^Review held work/ })).toHaveLength(2);
   });
 
   it("names the run of a single decision hold", async () => {
@@ -387,7 +390,7 @@ describe("Held work card", () => {
     const card = screen.getByRole("alert", { name: "Held work" });
     expect(within(card).getByRole("heading", { level: 3 }).textContent).toBe("Held work is blocking new runs");
     expect(within(card).getByRole("heading", { level: 3 }).className).toContain("text-danger");
-    expect(screen.queryByRole("link", { name: "Review held work" })).toBeNull();
+    expect(screen.queryByRole("link", { name: /^Review held work/ })).toBeNull();
     expect(screen.queryByText("Needs your decision")).toBeNull();
     expect(sentence()).toBe("Nothing needs you right now. 1 run is executing.");
   });
@@ -397,6 +400,36 @@ describe("Held work card", () => {
     await mount();
     expect(within(heldCard()).getByText("Held work is unavailable right now.")).toBeTruthy();
     expect(screen.getByText("Live run row")).toBeTruthy();
+  });
+
+  it("says it is loading, not unavailable, until the first holds response", async () => {
+    mockApi.getRecoveryHolds.mockImplementation(() => new Promise(() => {}));
+    await mount();
+    expect(within(heldCard()).getByText("Loading held work…")).toBeTruthy();
+    expect(screen.queryByText(/Held work is unavailable/)).toBeNull();
+  });
+
+  it("still shows the danger headline and the held row when a first-load endpoint rejects", async () => {
+    mockApi.listRepos.mockRejectedValue(new Error("repos down"));
+    mockApi.getRecoveryHolds.mockResolvedValue({
+      aggregate: heldAggregate({ open_holds: 3, admission_counted_holds: 3, decision_needed: 1, blocked_runs: 2 }),
+      holds: [decisionHold("a83c51f0-aaaa", "2026-07-05T10:00:00Z")],
+    });
+    await mount();
+    const card = screen.getByRole("alert", { name: "Held work" });
+    expect(within(card).getByRole("heading", { level: 3 }).textContent).toBe("Held work is blocking new runs");
+    expect(within(card).getByRole("link", { name: "Review held work →" })).toBeTruthy();
+    expect(within(screen.getByRole("region", { name: "Needs your decision" })).getByText(/Held work from run/)).toBeTruthy();
+  });
+
+  it("shows the Held work card with its figures while the runs request never resolves", async () => {
+    mockApi.listRuns.mockImplementation(() => new Promise(() => {}));
+    mockApi.getRecoveryHolds.mockResolvedValue({
+      aggregate: heldAggregate({ open_holds: 2, admission_counted_holds: 2 }),
+      holds: [],
+    });
+    await mount();
+    expect([...heldCard().querySelectorAll("strong")].map((e) => e.textContent)).toEqual(["2 / 8", "2", "0"]);
   });
 
   it("does not fetch holds on Dashboard beyond its own alert", async () => {

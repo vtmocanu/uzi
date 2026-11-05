@@ -340,14 +340,61 @@ describe("useOverviewData recovery holds", () => {
     expect(mockApi.listRuns).toHaveBeenCalledTimes(2);
   });
 
-  it("applies nothing after unmount", async () => {
-    let resolve: (v: RecoveryCustodyHolds) => void = () => {};
-    mockApi.getRecoveryHolds.mockImplementation(() => new Promise((res) => { resolve = res; }));
-    const { result, unmount } = renderHook(() => useOverviewData({ includeRecoveryHolds: true }));
+  it("keeps the newer holds when an older request settles after a newer one", async () => {
+    const first: { resolve: (v: RecoveryCustodyHolds) => void } = { resolve: () => {} };
+    mockApi.getRecoveryHolds.mockImplementationOnce(() => new Promise((res) => { first.resolve = res; }));
+    const { result } = renderHook(() => useOverviewData({ includeRecoveryHolds: true }));
     await settle();
-    unmount();
-    resolve(holdsWith(5));
+    // The mount request is still pending; a later tick issues a newer one that settles first.
+    mockApi.getRecoveryHolds.mockResolvedValue(holdsWith(4));
+    await settle(10_000);
+    expect(mockApi.getRecoveryHolds).toHaveBeenCalledTimes(2);
+    expect(result.current.holds?.aggregate.open_holds).toBe(4);
+    first.resolve(holdsWith(1));
+    await settle();
+    expect(result.current.holds?.aggregate.open_holds).toBe(4);
+  });
+
+  it("ignores a superseded request's failure", async () => {
+    const first: { reject: (e: Error) => void } = { reject: () => {} };
+    mockApi.getRecoveryHolds.mockImplementationOnce(() => new Promise((_, rej) => { first.reject = rej; }));
+    const { result } = renderHook(() => useOverviewData({ includeRecoveryHolds: true }));
+    await settle();
+    mockApi.getRecoveryHolds.mockResolvedValue(holdsWith(2));
+    await settle(10_000);
+    first.reject(new Error("late"));
+    await settle();
+    expect(result.current.holds?.aggregate.open_holds).toBe(2);
+    expect(result.current.holdsFailed).toBe(false);
+  });
+
+  it("reports holdsFailed only when a request failed and no holds exist, and clears it on success", async () => {
+    mockApi.getRecoveryHolds.mockRejectedValueOnce(new Error("down"));
+    const { result } = renderHook(() => useOverviewData({ includeRecoveryHolds: true }));
+    expect(result.current.holdsFailed).toBe(false); // before the first response
     await settle();
     expect(result.current.holds).toBeNull();
+    expect(result.current.holdsFailed).toBe(true);
+    await settle(10_000); // default mock resolves
+    expect(result.current.holds?.aggregate.open_holds).toBe(1);
+    expect(result.current.holdsFailed).toBe(false);
+    mockApi.getRecoveryHolds.mockRejectedValueOnce(new Error("blip"));
+    await settle(10_000);
+    expect(result.current.holds?.aggregate.open_holds).toBe(1); // last good kept
+    expect(result.current.holdsFailed).toBe(false);
+  });
+
+  it("keeps holds intact and refreshing when the runs/workers poll rejects", async () => {
+    const { result } = renderHook(() => useOverviewData({ includeRecoveryHolds: true }));
+    await settle();
+    expect(result.current.holds?.aggregate.open_holds).toBe(1);
+    mockApi.listRuns.mockRejectedValue(new Error("runs down"));
+    mockApi.listWorkers.mockRejectedValue(new Error("workers down"));
+    await settle(10_000);
+    expect(result.current.data).not.toBeNull();
+    expect(result.current.holds?.aggregate.open_holds).toBe(1);
+    mockApi.getRecoveryHolds.mockResolvedValue(holdsWith(6));
+    await settle(10_000);
+    expect(result.current.holds?.aggregate.open_holds).toBe(6);
   });
 });

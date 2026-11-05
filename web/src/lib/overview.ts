@@ -11,6 +11,7 @@ import {
 } from "./api";
 import { custodyHoldView } from "./recovery";
 import { effectiveRunStatus, isAccountCooldownWaiting, isReserveHeldPause } from "./runBadge";
+import { stripUnsafeChars } from "./safeText";
 
 // Exhaustive over the wire status union; a new status needs an explicit bucket.
 export const activeRunBuckets: Record<RunStatus, "running" | "needsYou" | "queued" | "waiting" | null> = {
@@ -196,6 +197,8 @@ export interface HeldDecisionItem {
   count: number;
   runId: string | null;
   since: string | null;
+  // The oldest decision hold's state label (sanitized), null when the list cannot name one.
+  label: string | null;
 }
 
 export type DecisionItem = RunDecisionItem | HeldDecisionItem;
@@ -266,6 +269,7 @@ function heldDecision(holds: RecoveryCustodyHolds | null | undefined): HeldDecis
     count,
     runId: oldest && count === 1 ? oldest.run_id : null,
     since: oldest ? oldest.created_at : null,
+    label: oldest ? stripUnsafeChars(custodyHoldView(oldest).stateLabel) || null : null,
   };
 }
 
