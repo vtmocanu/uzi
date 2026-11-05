@@ -496,6 +496,10 @@ describe("buildSignalMcpServer prd_done_path schema gate (PRD #72 M4)", () => {
       // worker's 32768 transport clamp, and never a parameter offered only on some runs
       // (report_only and decisions_memo are gated); pr_summary is meant for PR-opening runs.
       for (const absent of ["One-line", "32768", "report_only", "decisions_memo", "pr_summary"]) assert.ok(!description.includes(absent), absent);
+      // The report-only summary IS the stored report (runner.ts report_md: result.summary), so
+      // findings must stay in it; only logs and gate output move to the final message (MR !3943).
+      assert.ok(!description.includes("detailed findings in your final message"), "findings not routed to the final message");
+      assert.ok(description.includes("keep the findings in this summary"), "report-only keeps findings in the summary");
     }
   });
 
