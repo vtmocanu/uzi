@@ -21,6 +21,8 @@ ALTER TABLE runs
 
 -- The unwitnessed park (retained_continuation_unwitnessed) records its observation next to the
 -- historic exhaustion snapshot, so the evidence check admits four optional keys.
+-- Both widened CHECKs are installed without scanning runs under ACCESS EXCLUSIVE.
+-- 00405 validates them separately while ordinary reads and writes can continue.
 ALTER TABLE runs DROP CONSTRAINT runs_worker_recovery_evidence_check;
 ALTER TABLE runs ADD CONSTRAINT runs_worker_recovery_evidence_check CHECK (
     worker_recovery_evidence IS NULL OR (
@@ -40,7 +42,7 @@ ALTER TABLE runs ADD CONSTRAINT runs_worker_recovery_evidence_check CHECK (
         AND (NOT worker_recovery_evidence ? 'presence' OR worker_recovery_evidence->>'presence' IN ('p1', 'p2'))
         AND pg_column_size(worker_recovery_evidence) <= 1024
     )
-);
+) NOT VALID;
 
 -- New recovery cause: a retained continuation whose first running report was refused and whose
 -- departure is still unproven after the presence window; the flight may still be live (parked
@@ -51,7 +53,7 @@ ALTER TABLE runs ADD CONSTRAINT runs_recovery_wait_cause_check CHECK (
         'forge_unreachable','empty_turn','provider_outage','codex_account_unavailable',
         'vault_locked','data_volume_full','worker_requeue_exhausted','worker_memory_pressure','retained_recovery_exhausted','codex_idle_stall','retained_recovery_adoption_failed','retained_continuation_unwitnessed'
     )
-);
+) NOT VALID;
 -- +goose StatementBegin
 CREATE OR REPLACE FUNCTION fn_custody_attention(hold_state text, available boolean, guarded boolean,
                                     capture_state text, run_status text, recovery_wait_cause text)
