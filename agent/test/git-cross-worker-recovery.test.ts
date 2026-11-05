@@ -1251,6 +1251,26 @@ describe("GitCache.hasCommittedCheckpoint (#3944 stale local mirror, attempted t
       "control: with the floor read restored the same state is discounted");
   });
 
+  it("g15 a real corrupt loose origin-branch floor ref is not proven absent: blocks, no probe", async () => {
+    const f = await fixture();
+    f.mirror(f.work);
+    // A broken loose ref file: show-ref/rev-parse report it exactly like a missing ref (exit 1),
+    // so an exit-code absence check would fall back to the default floor and discount the work.
+    const refFile = path.join(f.bare, "refs", "remotes", "origin", ...f.branch.split("/"));
+    fs.mkdirSync(path.dirname(refFile), { recursive: true });
+    fs.writeFileSync(refFile, "not-an-object-id\n");
+    const probe = spyProbe(f.git);
+    try {
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), true,
+        "a corrupt branch-floor ref must not be read as absent");
+      assert.equal(probe.calls, 0, "unprovable proof never consults the origin probe");
+    } finally {
+      fs.unlinkSync(refFile);
+    }
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), false,
+      "control: with the ref genuinely absent the same state is discounted");
+  });
+
   it("g12 a discount writes no ref in the bare or on origin", async () => {
     const f = await fixture();
     f.mirror(f.work);

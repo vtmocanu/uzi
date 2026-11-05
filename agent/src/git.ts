@@ -18316,16 +18316,31 @@ try {
   /** #3944: the proof's recovery floor, chosen like the reseed's (origin's branch if pushed, else
    *  the default branch) but error-aware and under PROOF_READ_ENV. `refExists` and
    *  `defaultBranchRef` collapse a failed read into "absent" and would silently fall back to a
-   *  different floor; here only a proven absence (exit 1) falls through, and any other outcome
-   *  returns `null`, which the callers treat as `unprovable`. Ref existence is read with
-   *  `show-ref` (no object read); the caller's own `^{commit}` read under PROOF_READ_ENV then
-   *  fails an unreadable floor object. */
+   *  different floor; here only a proven absence falls through, and any other outcome returns
+   *  `null`, which the callers treat as `unprovable`. Ref existence is read with `for-each-ref`
+   *  (no object read): git reports a missing ref and a corrupt or unreadable loose ref file alike
+   *  through `show-ref`/`rev-parse` exit 1, but `for-each-ref` warns "ignoring broken ref" on
+   *  stderr for the latter, so absence is proven only by a clean, empty, successful listing.
+   *  The caller's own `^{commit}` read under PROOF_READ_ENV then fails an unreadable floor object. */
   private async proofFloorRef(barePath: string, branch: string): Promise<string | null> {
     const exit = (args: string[]): Promise<number | null> =>
       this.tryGitExit(barePath, args, undefined, undefined, PROOF_READ_ENV);
     const refState = async (ref: string): Promise<"present" | "absent" | "unknown"> => {
-      const code = await exit(["show-ref", "--verify", "--quiet", ref]);
-      return code === 0 ? "present" : code === 1 ? "absent" : "unknown";
+      this.assertCaptureDecoration(PROOF_READ_ENV);
+      try {
+        const { stdout, stderr } = await this.execScoped(
+          "git", withDir(barePath, ["for-each-ref", "--format=%(refname)", ref]),
+          { env: { ...gitEnv(), ...PROOF_READ_ENV }, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER });
+        // Any diagnostic (e.g. "warning: ignoring broken ref") means the ref's state is unknown.
+        if (stderr.trim() !== "") return "unknown";
+        // The pattern also matches refs below `ref/`; those cannot coexist with `ref` itself.
+        return stdout.split("\n").map(line => line.trim()).includes(ref) ? "present" : "absent";
+      } catch (err) {
+        if (err instanceof RunResidueBlockedError) throw err;
+        const abort = this.boundaryAbortError(err);
+        if (abort) throw abort;
+        return "unknown";
+      }
     };
     const branchRef = `refs/remotes/origin/${branch}`;
     const branchState = await refState(branchRef);
