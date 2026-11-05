@@ -72,6 +72,32 @@ describe("detectRepoAgentsAtRevision over git objects (issue #3913)", () => {
     assert.equal(got.agents[0]?.prompt_body.trim(), "Old body");
   });
 
+  it("projects a Codex model from the pinned revision, never a newer commit or working tree", async () => {
+    fs.rmSync(path.join(repo, ".claude"), { recursive: true, force: true });
+    const toml = (model: string) => `name = "coder"\ndescription = "Codes."\ndeveloper_instructions = "Committed instructions"\nmodel = "${model}"\n`;
+    const rev = commit({ ".codex/agents/coder.toml": toml("gpt-6-luna") });
+    commit({ ".codex/agents/coder.toml": toml("gpt-6-sol") });
+    fs.writeFileSync(path.join(repo, ".codex/agents/coder.toml"), toml("gpt-6-astra"));
+    const codex = await detectRepoAgentsAtRevision(git.revisionTreeReader(repo, rev), "codex");
+    assert.equal(codex.folder, ".codex/agents");
+    assert.equal(codex.agents[0]?.model, "gpt-6-luna");
+    const claude = await detectRepoAgentsAtRevision(git.revisionTreeReader(repo, rev), "claude");
+    assert.equal(claude.folder, ".codex/agents");
+    assert.equal(claude.agents.length, 1);
+    assert.equal(Object.hasOwn(claude.agents[0]!, "model"), false);
+  });
+
+  it("an invalid pinned TOML model is final even when the worktree fixes it", async () => {
+    const rev = commit({
+      ".codex/agents/coder.toml": 'name = "coder"\ndescription = "Codes."\ndeveloper_instructions = "Committed instructions"\nmodel = 12\n',
+      ".claude/agents/reviewer.md": agent("reviewer", "Fallback must not run"),
+    });
+    fs.writeFileSync(path.join(repo, ".codex/agents/coder.toml"), 'name = "coder"\ndescription = "Codes."\ndeveloper_instructions = "Worktree instructions"\nmodel = "gpt-6-luna"\n');
+    const got = await detectRepoAgentsAtRevision(git.revisionTreeReader(repo, rev), "codex");
+    assert.deepEqual(got, { agents: [], notes: [{ name: "coder", reason: "invalid" }], folder: ".codex/agents" });
+    fs.rmSync(path.join(repo, ".codex"), { recursive: true, force: true });
+  });
+
   it("prefers the harness's own folder and falls back to the other", async () => {
     const rev = commit({
       ".claude/agents/reviewer.md": agent("reviewer", "Claude body"),

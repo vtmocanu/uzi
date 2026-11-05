@@ -171,7 +171,7 @@ export type RepoAgentNoteReason =
    *  aggregated with a `count`, never per file (a 10k-file repo must not flood the
    *  run stream with 10k rows). */
   | "over_limit"
-  /** No frontmatter, bad name, missing/oversized/unsafe description, or empty body. */
+  /** Bad file/name/description/body, or an invalid Codex TOML model declaration. */
   | "invalid"
   /** An earlier file already claimed this name (first wins). */
   | "duplicate"
@@ -219,7 +219,7 @@ export interface DetectedRepoAgents {
 export type RepoAgentFolder = NonNullable<RepoAgentSummary["folder"]>;
 export type RepoAgentHarness = "claude" | "codex";
 
-/** Project a raw Markdown model pin for delivery to one harness, silently
+/** Project a parsed repo-agent model pin for delivery to one harness, silently
  *  inheriting when the pin belongs to the other family. Parsing stays raw. */
 export function filterRepoAgentModel(template: AgentTemplate, harness: RepoAgentHarness): AgentTemplate {
   const { model, ...rest } = template;
@@ -250,7 +250,7 @@ export function describeRepoAgentNote(note: RepoAgentNote): string {
     case "over_limit":
       return `${note.count ?? 0} agent file(s) past the cap of ${REPO_AGENTS_MAX_FILES} were ignored`;
     case "invalid":
-      return `repo agent "${note.name}" was skipped: unreadable or invalid file, name, description, or empty body`;
+      return `repo agent "${note.name}" was skipped: unreadable or invalid file, name, description, model, or empty body`;
     case "duplicate":
       return `repo agent "${note.name}" was skipped: an earlier agent file already declares that name`;
     case "tools_all_denied":
@@ -482,7 +482,7 @@ export async function detectRepoAgents(
     }
     const agentsReal = located.agentsReal;
     const entries = await fs.readdir(agentsReal, { withFileTypes: true });
-    return projectForHarness(spec, harness, await loadFolder(spec, {
+    return projectForHarness(harness, await loadFolder(spec, {
       names: entries.filter((e) => e.isFile()).map((e) => e.name),
       read: (file) => readContainedFile(path.join(agentsReal, file), agentsReal, opts),
     }));
@@ -490,10 +490,8 @@ export async function detectRepoAgents(
   return none;
 }
 
-function projectForHarness(spec: FolderSpec, harness: RepoAgentHarness, detected: DetectedRepoAgents): DetectedRepoAgents {
-  if (spec === CLAUDE_SPEC) {
-    detected.agents = detected.agents.map((template) => filterRepoAgentModel(template, harness));
-  }
+function projectForHarness(harness: RepoAgentHarness, detected: DetectedRepoAgents): DetectedRepoAgents {
+  detected.agents = detected.agents.map((template) => filterRepoAgentModel(template, harness));
   return detected;
 }
 
@@ -545,7 +543,7 @@ export async function detectRepoAgentsAtRevision(
         .filter((e) => e.type === "blob" && GIT_FILE_MODES.has(e.mode))
         .map((e) => [e.name, e] as const),
     );
-    return projectForHarness(spec, harness, await loadFolder(spec, {
+    return projectForHarness(harness, await loadFolder(spec, {
       names: [...files.keys()],
       read: async (file) => {
         const entry = files.get(file);
