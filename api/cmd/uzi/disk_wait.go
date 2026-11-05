@@ -18,7 +18,7 @@ func diskWaitOf(r apitypes.RunDTO) diskWaitState {
 		return diskWaitNone
 	}
 	if retry := r.RecoveryRetryNotBefore; retry != nil {
-		if retry.IsZero() || retry.Year() < 1 || retry.Year() > 9999 {
+		if retry.Year() < 0 || retry.Year() > 9999 {
 			return diskWaitUnknown
 		}
 		return diskWaitTimed

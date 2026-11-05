@@ -37,7 +37,7 @@ func diskTimingRun(t *testing.T, timing string) apitypes.RunDTO {
 }
 
 // Decode real wire shapes before exercising the CLI and board classification.
-// Due stamps remain timed; omission and invalid zero stamps never imply NULL.
+// Due stamps, including year 1, remain timed; omission never implies NULL.
 func TestDiskTimingSurfaces(t *testing.T) {
 	for _, timing := range []string{"future", "due", "held", "omitted", "zero"} {
 		t.Run(timing, func(t *testing.T) {
@@ -64,7 +64,7 @@ func TestDiskTimingSurfaces(t *testing.T) {
 					if args[1] == "get" {
 						requireWorkerCopy(t, out, "no automatic resume", "one further ordinary attempt", "counters persist", "admission may refuse", "Local unpublished work is not guaranteed on worker loss")
 					}
-				case "omitted", "zero":
+				case "omitted":
 					requireWorkerCopy(t, out, "timing unknown")
 					if strings.Contains(out, "resumes at") || strings.Contains(out, "owner-held") {
 						t.Fatalf("unknown timing promised a retry or hold: %s", out)
@@ -76,7 +76,7 @@ func TestDiskTimingSurfaces(t *testing.T) {
 			wantSteer := "queued (run waiting for disk space)"
 			if held {
 				wantSteer = "queued (disk held; owner Resume/Cancel)"
-			} else if timing == "omitted" || timing == "zero" {
+			} else if timing == "omitted" {
 				wantSteer = "queued (run waiting for disk space; retry timing unknown)"
 			}
 			if got := steerStateWithRun(queuedIn(), r.Status, []string{dataVolumeFullCause}, &r); got != wantSteer {
@@ -233,18 +233,30 @@ func TestDiskHoldTUILayoutAndSanitization(t *testing.T) {
 				m := tuiTestModel(t, &uzicli.FakeClient{}, r.ID)
 				m = applyDetail(m, r, nil)
 				m = step(m, tea.WindowSizeMsg{Width: width, Height: 40})
-				out := stripANSI(m.View().Content)
-				assertNoRawControls(t, "disk detail", out)
-				if strings.Contains(out, "\nFORGED") {
-					t.Fatal("injected terminal row")
+				raw := m.View().Content
+				assertNoRawControls(t, "disk detail", raw)
+				out := stripANSI(raw)
+				for _, line := range diskHoldLines(r) {
+					assertNoRawControls(t, "unwrapped disk guidance", line)
+					if strings.ContainsAny(line, "\r\n") {
+						t.Fatalf("unwrapped guidance contains an injected row: %q", line)
+					}
 				}
-				if timing == "held" {
+				switch timing {
+				case "held":
 					copy := strings.Join(strings.Fields(out), " ")
 					requireWorkerCopy(t, copy, "Resume", "Cancel", "counters persist", "admission may refuse", "Local unpublished work is not guaranteed on worker loss.")
-				} else {
+				case "omitted":
 					requireWorkerCopy(t, out, "timing unknown")
 					if strings.Contains(out, "resumes in") || strings.Contains(out, "retry 00:00") {
 						t.Fatal("unknown timing got a countdown")
+					}
+				default:
+					if !strings.Contains(out, "retry") && !strings.Contains(out, "resumes at") {
+						t.Fatal("valid year-1 timing lost its retry guidance")
+					}
+					if strings.Contains(out, "timing unknown") {
+						t.Fatal("valid year-1 timing became unknown")
 					}
 				}
 				rows := strings.Split(out, "\n")
@@ -260,10 +272,18 @@ func TestDiskHoldTUILayoutAndSanitization(t *testing.T) {
 				m.width, m.height = width, 20
 				m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: []apitypes.RunListItemDTO{{RunDTO: r}}})
 				out = stripANSI(m.View().Content)
-				if timing == "held" {
+				switch timing {
+				case "held":
 					requireWorkerCopy(t, out, "disk held", "Resume/Cancel")
-				} else {
+				case "omitted":
 					requireWorkerCopy(t, out, "timing unknown")
+				default:
+					if !strings.Contains(out, "retry") && !strings.Contains(out, "resumes at") {
+						t.Fatal("valid year-1 board timing lost its retry guidance")
+					}
+					if strings.Contains(out, "timing unknown") {
+						t.Fatal("valid year-1 board timing became unknown")
+					}
 				}
 				for _, row := range strings.Split(out, "\n") {
 					if visualWidth(row) > width {
@@ -272,6 +292,81 @@ func TestDiskHoldTUILayoutAndSanitization(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestDiskTimingDateValidation(t *testing.T) {
+	for _, stamp := range []string{"not-a-date", "2026-02-30T00:00:00Z"} {
+		t.Run(stamp, func(t *testing.T) {
+			r := diskTimingRun(t, "omitted")
+			body := []byte(`{"status":"recovery_wait","recovery_wait_cause":"data_volume_full","recovery_retry_not_before":` + quoteJSON(stamp) + "}")
+			if err := json.Unmarshal(body, &r); err == nil {
+				t.Fatal("malformed retry timestamp decoded")
+			}
+			if got := diskWaitOf(r); got != diskWaitUnknown {
+				t.Fatalf("rejected timestamp inferred state %v", got)
+			}
+		})
+	}
+	for _, year := range []int{-1, 0, 1, 9999, 10000} {
+		t.Run(fmt.Sprintf("typed-year-%d", year), func(t *testing.T) {
+			r := diskTimingRun(t, "held")
+			stamp := time.Date(year, time.January, 1, 0, 0, 0, 0, time.UTC)
+			r.RecoveryRetryNotBefore = &stamp
+			want := diskWaitTimed
+			if year < 0 || year > 9999 {
+				want = diskWaitUnknown
+			}
+			if got := diskWaitOf(r); got != want {
+				t.Fatalf("typed year %d state %v want %v", year, got, want)
+			}
+		})
+	}
+}
+
+func TestDiskHoldDetailHeightBudget(t *testing.T) {
+	const id = "12345678-1234-4234-8234-123456789abc"
+	for _, size := range []struct{ width, height int }{
+		{40, 16}, {40, 12}, {40, 10}, {30, 16}, {30, 12}, {30, 10}, {40, 40}, {80, 40},
+	} {
+		t.Run(fmt.Sprintf("%dx%d", size.width, size.height), func(t *testing.T) {
+			r := diskTimingRun(t, "held")
+			r.ID = id
+			m := tuiTestModel(t, &uzicli.FakeClient{}, id)
+			// Cover populated transcripts here; the hostile-ID matrix covers empty
+			// transcripts. Both retain exact physical height and footer assertions.
+			m = applyDetail(m, r, []apitypes.MessageDTO{{Seq: 1, Kind: "text", Payload: json.RawMessage(`{"text":"Disk recovery paused."}`)}})
+			m = step(m, tea.WindowSizeMsg{Width: size.width, Height: size.height})
+			raw := m.View().Content
+			assertNoRawControls(t, "disk hold height", raw)
+			out := stripANSI(raw)
+			rows := strings.Split(out, "\n")
+			if len(rows) != size.height {
+				t.Fatalf("detail height %d want %d: %q", len(rows), size.height, out)
+			}
+			requireWorkerCopy(t, rows[len(rows)-1], "esc back", "? keys")
+			requireWorkerCopy(t, out, "Resume/Cancel")
+			for i, row := range rows {
+				if visualWidth(row) > size.width {
+					t.Fatalf("row %d exceeds width %d: %q", i, size.width, row)
+				}
+			}
+			guidance := strings.Join(strings.Fields(out), " ")
+			// Wrapping can break a UUID at a hyphen. Verify every command character
+			// survives, without treating the physical line break as part of the ID.
+			commandChars := strings.Join(strings.Fields(out), "")
+			if size.height >= 40 || (size.width == 40 && size.height == 16) {
+				requireWorkerCopy(t, commandChars, "uzirunresume"+id, "uziruncancel"+id)
+			}
+			switch {
+			case size.height >= 40:
+				requireWorkerCopy(t, guidance, "one further ordinary attempt", "counters persist", "admission may refuse", "Local unpublished work is not guaranteed on worker loss.")
+			case size.width == 40 && size.height == 16:
+				requireWorkerCopy(t, guidance, "Counted parks: 7", "counters persist", "One more attempt", "admission may refuse", "Worker loss may lose unpublished work.")
+			default:
+				requireWorkerCopy(t, guidance, "uzi run get")
+			}
+		})
 	}
 }
 
