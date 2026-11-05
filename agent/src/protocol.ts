@@ -3274,6 +3274,7 @@ export interface StateAck {
    *  a plain stop. null/absent (older server, an unparseable body, a run with no hold) leaves it
    *  undefined, treated as "no hold" — the safe default. */
   holdReason?: string | null;
+  repoAgentSourceCommit?: string;
   /** The server-computed effective per-run budget (PRD #122 M2, Decisions 5/5b), read
    *  off the SAME `{run: RunDTO}` body as `status`. `budgetMaxIterations` is the scaled
    *  total implement/review turn ceiling; `budgetWallSeconds` is the effective wall clock

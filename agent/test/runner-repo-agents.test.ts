@@ -7,6 +7,7 @@ import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import { StubExecutor, type Executor } from "../src/executor.js";
 import { detectRepoAgentsAtRevision } from "../src/repoagents.js";
 import { RunRunner } from "../src/runner.js";
+import { REPO_AGENT_SOURCE_FEATURE, type BaseAttestationHoldOutcome } from "../src/protocol.js";
 import {
   api,
   client,
@@ -33,6 +34,7 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
           id: "r1",
           url: "https://gitlab.example.test/org/repo",
           clone_url: repoFx.originPath,
+          default_branch: "main",
         },
         last_seq: 0,
         secrets: {
@@ -123,7 +125,7 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
     );
   });
 
-  it("fails closed on a detection FAILURE: no roster is reported and the run fails", async () => {
+  it("without the pin feature a detection FAILURE reports no roster and the run still completes", async () => {
     const repoFx = makeFixture({});
     try {
       const { gitlab } = fakeGitlab();
@@ -134,6 +136,7 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
           id: "r1",
           url: "https://gitlab.example.test/org/repo",
           clone_url: repoFx.originPath,
+          default_branch: "main",
         },
         last_seq: 0,
         secrets: {
@@ -171,11 +174,11 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
         "a detection failure reports no roster",
       );
       assert.ok(
-        !texts.some((t) => t.includes("continuing with your own agent templates")),
+        texts.some((t) => t.includes("could not read the repo's .claude/agents/")),
         texts.join("\n"),
       );
       assert.ok(
-        states.some((s) => s.status === "failed") && !states.some((s) => s.status === "completed"),
+        states.some((s) => s.status === "completed"),
         JSON.stringify(states.map((s) => s.status)),
       );
     } finally {
@@ -203,6 +206,7 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
           id: "r1",
           url: "https://gitlab.example.test/org/repo",
           clone_url: repoFx.originPath,
+          default_branch: "main",
         },
         last_seq: 0,
         secrets: {
@@ -280,6 +284,7 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
             id: "r1",
             url: "https://gitlab.example.test/org/repo",
             clone_url: repoFx.originPath,
+            default_branch: "main",
           },
           last_seq: 0,
           secrets: {
@@ -364,7 +369,7 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
         const claim = makeClaim({
           issue_iid: 41,
           issue_title: "roster source",
-          repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: repoFx.originPath },
+          repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: repoFx.originPath, default_branch: "main" },
           last_seq: 0,
           secrets: o.codex
             ? CODEX_SECRETS
@@ -480,14 +485,33 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
       assert.deepStrictEqual(order, ["detect", "run"]);
     });
 
-    it("the failure names both folders and the revision", async () => {
-      const { states } = await runWith({}, {
-        detect: async () => {
-          throw new Error("boom");
-        },
-      });
-      const failed = states.find((s) => s.status === "failed");
-      assert.match(String(failed?.failure_reason ?? ""), /the repo's \.claude\/agents\/ or \.codex\/agents\/ could not be read at revision [0-9a-f]{12}/);
+    it("with the pin feature a detection failure holds the run, naming both folders and the revision", async () => {
+      const holds: { commit: string }[] = [];
+      const orig = client.requestRepoAgentSourceHold.bind(client);
+      (client as unknown as { requestRepoAgentSourceHold: unknown }).requestRepoAgentSourceHold = async (
+        _runId: string, args: { commit: string },
+      ): Promise<BaseAttestationHoldOutcome> => {
+        holds.push({ commit: args.commit });
+        return { outcome: "held", status: "paused" };
+      };
+      try {
+        const { states, texts } = await runWith({}, {
+          features: [REPO_AGENT_SOURCE_FEATURE],
+          detect: async () => {
+            throw new Error("boom");
+          },
+        });
+        assert.equal(holds.length, 1);
+        assert.match(holds[0]!.commit, /^[0-9a-f]{40}$/);
+        assert.ok(!states.some((s) => s.status === "failed" || s.status === "completed"), JSON.stringify(states.map((s) => s.status)));
+        assert.ok(
+          texts.some((t) => /the repo's \.claude\/agents\/ or \.codex\/agents\/ could not be read at revision [0-9a-f]{12}/.test(t) &&
+            t.includes("The agent did not start")),
+          texts.join("\n"),
+        );
+      } finally {
+        (client as unknown as { requestRepoAgentSourceHold: unknown }).requestRepoAgentSourceHold = orig;
+      }
     });
   });
 

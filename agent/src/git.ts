@@ -6084,8 +6084,9 @@ export class GitCache {
     return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
   }
 
-  async defaultBranchCommit(barePath: string): Promise<string | undefined> {
-    return this.defaultBranchSha(barePath);
+  async defaultBranchTip(barePath: string, name: string): Promise<string | undefined> {
+    if (!(await this.isRemoteBranchName(barePath, name))) return undefined;
+    return (await this.originBranchTip(barePath, name)) ?? undefined;
   }
 
   async ensureCommitPresent(barePath: string, commit: string, repoUrl: string, pat?: string, username?: string): Promise<boolean> {

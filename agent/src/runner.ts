@@ -2386,6 +2386,7 @@ interface RunFlight {
   initialPlanningEligible?: boolean;
   policyReservation?: symbol;
   forgeCloneSuccess?: AbortController;
+  cloneFetched?: true;
   operationAdmission?: CodexOperationController;
   operationScope?: ReturnType<typeof acquireCodexOperationScope>;
   releaseOperationAdmission?: () => void;
@@ -13691,6 +13692,7 @@ export class RunRunner {
             },
           ),
       );
+      flight.cloneFetched = true;
     } catch (err) {
       if (err instanceof DataVolumeFullError) throw err;
       if (classifyForgeError(err) === "transient") {
@@ -14219,26 +14221,36 @@ export class RunRunner {
     const detection = await this.parseRepoAgents(
       claim,
       barePath,
+      flight.cloneFetched === true,
       claim.secrets.codex ? "codex" : "claude",
       batcher,
       runLog,
     );
     const repoAgents = detection.agents;
     const repoAgentFolder = detection.folder;
-    // Non-fatal, and fire-and-forget (matching the session-id report below): an
-    // INFORMATIONAL roster report must never fail a run. An older API without the
-    // repo_agents field 400s DisallowUnknownFields, which the client treats as
-    // permanent — awaiting the report here would turn a working run into a failed
-    // one over a field the run does not depend on.
-    void reportState({
-      status: "running",
-      repo_agents: repoAgentSummaries(repoAgents, this.reportedRepoAgentFolder(repoAgentFolder)),
-      ...(this.client.protocolFeatures.includes(REPO_AGENT_SOURCE_FEATURE) ? { repo_agent_source_commit: detection.commit } : {}),
-    }).catch((e) =>
-      runLog.warn("could not report repo agent roster", {
-        error: errMessage(e),
-      }),
-    );
+    const pinsSource = this.client.protocolFeatures.includes(REPO_AGENT_SOURCE_FEATURE);
+    if (detection.commit !== undefined && pinsSource && !claim.repo_agent_source_commit) {
+      await this.confirmRepoAgentSourcePin(reportState, {
+        status: "running",
+        repo_agents: repoAgentSummaries(repoAgents, this.reportedRepoAgentFolder(repoAgentFolder)),
+        repo_agent_source_commit: detection.commit,
+      }, runLog);
+    } else if (detection.commit !== undefined) {
+      // Non-fatal, and fire-and-forget (matching the session-id report below): an
+      // INFORMATIONAL roster report must never fail a run. An older API without the
+      // repo_agents field 400s DisallowUnknownFields, which the client treats as
+      // permanent — awaiting the report here would turn a working run into a failed
+      // one over a field the run does not depend on.
+      void reportState({
+        status: "running",
+        repo_agents: repoAgentSummaries(repoAgents, this.reportedRepoAgentFolder(repoAgentFolder)),
+        ...(pinsSource ? { repo_agent_source_commit: detection.commit } : {}),
+      }).catch((e) =>
+        runLog.warn("could not report repo agent roster", {
+          error: errMessage(e),
+        }),
+      );
+    }
 
     // PRD #84 M4: infer the run's requirement set from the checked-out clone with the
     // deterministic scan, ONCE, best-effort. A scan failure must never break a run, so
@@ -24174,15 +24186,53 @@ export class RunRunner {
     return this.client.protocolFeatures.includes(REPO_AGENT_FOLDER_FEATURE) ? (folder ?? undefined) : undefined;
   }
 
+  private async confirmRepoAgentSourcePin(
+    reportState: RunFlight["reportState"],
+    body: Parameters<RunFlight["reportState"]>[0] & { repo_agent_source_commit: string },
+    runLog: Logger,
+  ): Promise<void> {
+    const commit = body.repo_agent_source_commit;
+    let ack: Awaited<ReturnType<RunFlight["reportState"]>>;
+    try {
+      ack = await reportState(body);
+    } catch (err) {
+      if (!(err instanceof RequestError) && !isTransient(err)) throw err;
+      runLog.warn("repo-agent source revision report failed", { commit, error: errMessage(err) });
+      throw new RepoAgentSourceUnavailableError(
+        `the repo-agent source revision ${commit.slice(0, 12)} could not be recorded`, commit);
+    }
+    if (ack.repoAgentSourceCommit !== commit) {
+      runLog.warn("repo-agent source revision not confirmed", {
+        commit, applied: ack.applied, server_status: ack.status ?? "unknown", stored: ack.repoAgentSourceCommit ?? null,
+      });
+      throw new RepoAgentSourceUnavailableError(
+        `the api did not confirm the repo-agent source revision ${commit.slice(0, 12)}`, commit);
+    }
+  }
+
   private async parseRepoAgents(
     claim: ClaimResponse,
     barePath: string | undefined,
+    fetched: boolean,
     harness: RepoAgentHarness,
     batcher: MessageBatcher,
     runLog: Logger,
-  ): Promise<{ agents: AgentTemplate[]; folder: RepoAgentFolder | null; commit: string }> {
+  ): Promise<{ agents: AgentTemplate[]; folder: RepoAgentFolder | null; commit: string | undefined }> {
     const pinned = claim.repo_agent_source_commit ?? undefined;
-    if (!barePath) throw new RepoAgentSourceUnavailableError("the repo-agent source revision cannot be read: this run has no repository cache", pinned ?? "");
+    const failClosed = pinned !== undefined || this.client.protocolFeatures.includes(REPO_AGENT_SOURCE_FEATURE);
+    const unavailable = (message: string, commit: string) => {
+      if (failClosed) throw new RepoAgentSourceUnavailableError(message, commit);
+      runLog.warn("repo agent detection unavailable", { error: message });
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: "could not read the repo's .claude/agents/ or .codex/agents/; continuing with your own agent templates",
+        },
+      });
+      return { agents: [], folder: null, commit: undefined };
+    };
+    if (!barePath) return unavailable("the repo-agent source revision cannot be read: this run has no repository cache", pinned ?? "");
     let commit: string;
     if (pinned !== undefined) {
       if (!/^[0-9a-f]{40}$/.test(pinned)) throw new RepoAgentSourceUnavailableError("the run's recorded repo-agent source revision is malformed", "");
@@ -24193,8 +24243,12 @@ export class RunRunner {
       }
       commit = pinned;
     } else {
-      const resolved = await this.git.defaultBranchCommit(barePath);
-      if (!resolved) throw new RepoAgentSourceUnavailableError("the default branch commit could not be resolved to read repo agents from", "");
+      const name = claim.repo.default_branch?.trim();
+      if (!name) return unavailable("the repository has no configured default branch to read repo agents from", "");
+      const resolved = fetched ? await this.git.defaultBranchTip(barePath, name) : undefined;
+      if (!resolved) {
+        return unavailable(`the default branch ${sanitizeForLog(name)} could not be resolved from this claim's fetch to read repo agents from`, "");
+      }
       commit = resolved;
     }
     let detected: DetectedRepoAgents;
@@ -24202,8 +24256,7 @@ export class RunRunner {
       detected = await this.detect(this.git.revisionTreeReader(barePath, commit), harness);
     } catch (err) {
       runLog.warn("repo agent detection failed", { commit, error: errMessage(err) });
-      throw new RepoAgentSourceUnavailableError(
-        `the repo's .claude/agents/ or .codex/agents/ could not be read at revision ${commit.slice(0, 12)}`, commit);
+      return unavailable(`the repo's .claude/agents/ or .codex/agents/ could not be read at revision ${commit.slice(0, 12)}`, commit);
     }
     for (const note of detected.notes) {
       batcher.emit({

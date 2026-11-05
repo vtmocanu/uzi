@@ -3024,6 +3024,8 @@ export class WorkerClient {
           // can recognise a SERVER-side wall park (paused + budget_exhausted) on a fenced stale ACK.
           if (fields.holdReason !== undefined)
             ack.holdReason = fields.holdReason;
+          if (fields.repoAgentSourceCommit !== undefined)
+            ack.repoAgentSourceCommit = fields.repoAgentSourceCommit;
           if (fields.budgetMaxIterations !== undefined)
             ack.budgetMaxIterations = fields.budgetMaxIterations;
           if (fields.budgetWallSeconds !== undefined)
@@ -5618,6 +5620,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   memoryParkUndisposed?: boolean;
   status?: string;
   holdReason?: string | null;
+  repoAgentSourceCommit?: string;
   budgetMaxIterations?: number;
   budgetWallSeconds?: number;
   contractRevision?: number;
@@ -5668,6 +5671,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
         // PRD #1497 M2: the run's hold_reason on the RunDTO, read beside `status` to recognise a
         // SERVER-side wall park (paused + budget_exhausted) from a fenced stale-claim ACK.
         hold_reason?: unknown;
+        repo_agent_source_commit?: unknown;
         budget_max_iterations?: unknown;
         budget_wall_seconds?: unknown;
         // Issue #1626: the frozen completion-contract revision (RunDTO.completion_revision).
@@ -5709,6 +5713,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       memoryParkUndisposed?: boolean;
       status?: string;
       holdReason?: string | null;
+      repoAgentSourceCommit?: string;
       budgetMaxIterations?: number;
       budgetWallSeconds?: number;
       contractRevision?: number;
@@ -5768,6 +5773,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     // non-string (older server that omits it, a null hold, an unparseable value) leaves it absent,
     // which the ServerWallParkedError check reads as "no hold" (never a wall park).
     if (typeof run?.hold_reason === "string") out.holdReason = run.hold_reason;
+    if (typeof run?.repo_agent_source_commit === "string" && /^[0-9a-f]{40}$/.test(run.repo_agent_source_commit))
+      out.repoAgentSourceCommit = run.repo_agent_source_commit;
     if (typeof run?.budget_max_iterations === "number")
       out.budgetMaxIterations = run.budget_max_iterations;
     if (typeof run?.budget_wall_seconds === "number")
