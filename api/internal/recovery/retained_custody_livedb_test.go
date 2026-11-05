@@ -26,8 +26,7 @@ func TestRetainedCustodyV1ReleaseRunBeforeHoldLiveDB(t *testing.T) {
 func testRetainedCustodyV1ReleaseRunBeforeHoldLiveDB(t *testing.T, cause string) {
 	for _, timed := range retainedCustodyTimings(cause) {
 		t.Run(fmt.Sprintf("timed=%v", timed), func(t *testing.T) {
-			e := newInventoryEnv(t)
-			e.exec("UPDATE recovery_custody_holds SET inventory_guarded=false WHERE id=$1", e.hold)
+			e := newLegacyInventoryEnv(t)
 			var capture uuid.UUID
 			var body []byte
 			if cause == "data_volume_full" {
@@ -135,8 +134,7 @@ func TestRetainedCustodyLegacyWorkerReleaseRefusedLiveDB(t *testing.T) {
 func testRetainedCustodyLegacyWorkerReleaseRefusedLiveDB(t *testing.T, cause string) {
 	for _, timed := range retainedCustodyTimings(cause) {
 		t.Run(fmt.Sprintf("timed=%v", timed), func(t *testing.T) {
-			e := newInventoryEnv(t)
-			e.exec("UPDATE recovery_custody_holds SET inventory_guarded=false WHERE id=$1", e.hold)
+			e := newLegacyInventoryEnv(t)
 			id := e.reserve("legacy-retained")
 			body := e.upload(id)
 			e.exec("UPDATE runs SET status='recovery_wait', recovery_wait_cause=$3, recovery_retry_not_before=CASE WHEN $2::boolean THEN now()+interval '1 hour' END, claim_released_at=CASE WHEN $3::text <> 'data_volume_full' THEN now() END WHERE id=$1", e.run, timed, cause)
@@ -153,6 +151,10 @@ func testRetainedCustodyLegacyWorkerReleaseRefusedLiveDB(t *testing.T, cause str
 			if state != "open" {
 				t.Fatalf("legacy custody state=%s", state)
 			}
+			e.bytes(id, body)
+			// Positive control: the same legacy release works after owner cancellation.
+			e.exec("UPDATE runs SET status='cancelled',recovery_wait_cause=NULL WHERE id=$1", e.run)
+			e.release(apitypes.RecoveryReleaseRequest{Generation: &e.gen})
 			e.bytes(id, body)
 		})
 	}

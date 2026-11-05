@@ -35,7 +35,11 @@ func TestDiskParkHoldPreservesStateAndFencesLiveDB(t *testing.T) {
 			if err != nil || !applied || !isDataVolumeFullHeld(run) || run.RecoveryWaitCount != 8 || e.fpPreserved(t, id) != before {
 				t.Fatalf("hold status=%s count=%d applied=%v err=%v", run.Status, run.RecoveryWaitCount, applied, err)
 			}
+			// The instance-wide readout is bounded; put this fixture on its first
+			// page without relying on other LiveDB tests having removed their rows.
+			e.exec(t, `UPDATE runs SET status_since=(SELECT min(status_since)-interval '1 second' FROM runs) WHERE id=$1`, id)
 			readout, err := store.ReadMaintenanceReadout(e.ctx, e.pool)
+			e.exec(t, `UPDATE runs SET status_since=$2 WHERE id=$1`, id, run.StatusSince)
 			if err != nil {
 				t.Fatal(err)
 			}

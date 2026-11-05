@@ -8,8 +8,7 @@ import (
 )
 
 func TestDiskCustodyLegacyReconcilerSelectionLiveDB(t *testing.T) {
-	e := newInventoryEnv(t)
-	e.exec("UPDATE recovery_custody_holds SET inventory_guarded=false WHERE id=$1", e.hold)
+	e := newLegacyInventoryEnv(t)
 	capture := e.reserve("disk-reconciler")
 	body := e.upload(capture)
 	selected := func() bool {
@@ -37,6 +36,12 @@ func TestDiskCustodyLegacyReconcilerSelectionLiveDB(t *testing.T) {
 		t.Fatalf("legacy per-hold release=%d/%v", n, err)
 	}
 	e.bytes(capture, body)
+	// Only NULL timing is owner-held; the existing finite disk retry is eligible.
+	e.exec("UPDATE runs SET recovery_retry_not_before=now()+interval '1 hour' WHERE id=$1", e.run)
+	if !selected() {
+		t.Fatal("finite disk retry lost ordinary archive eligibility")
+	}
+	e.exec("UPDATE runs SET recovery_retry_not_before=NULL WHERE id=$1", e.run)
 	e.exec("UPDATE runs SET status='cancelled',recovery_wait_cause=NULL WHERE id=$1", e.run)
 	if !selected() {
 		t.Fatal("cancellation did not restore legacy eligibility")
