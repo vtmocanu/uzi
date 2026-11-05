@@ -82,7 +82,7 @@ The `agent` container runs a model against a user's cloned repo, which is semi-h
 
 Distinct client IPs need two changes: `web/nginx.conf` must append to `X-Forwarded-For` instead of overwriting it, and `TRUSTED_PROXIES` must name only the web container.
 
-These are necessary changes, not a sufficient configuration recipe. After an append, the rightmost non-trusted entry can still be the outer proxy or Docker bridge rather than the browser. The outer proxy must sanitize client-supplied forwarding headers, and topology-specific hop handling must be verified before claiming distinct client IPs. The [VPS deployment tutorial](./vps-deployment.md#step-4---route-https-through-your-existing-reverse-proxy) retains the packaged nginx configuration and the empty trust set; it does not implement those changes. The hosted-worker TLS hop is scoped separately (see [configuration.md](configuration.md) §The optional TLS listener).
+These are necessary changes, not a sufficient configuration recipe. After an append, the rightmost non-trusted entry can still be the outer proxy or Docker bridge rather than the browser. The outer proxy must sanitize client-supplied forwarding headers, and topology-specific hop handling must be verified before claiming distinct client IPs. The [VPS deployment tutorial](./vps-deployment.md#your-own-reverse-proxy) retains the packaged nginx configuration and the empty trust set; it does not implement those changes. The hosted-worker TLS hop is scoped separately (see [configuration.md](configuration.md) §The optional TLS listener).
 
 ## Accepted limitations
 
