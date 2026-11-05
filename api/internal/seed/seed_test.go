@@ -3,6 +3,7 @@ package seed
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/google/uuid"
@@ -10,6 +11,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/forge/forgetest"
+	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -21,11 +23,13 @@ type fakeForge struct {
 	verifyErr  error
 	projects   []forge.Project
 	projectErr error
+	labelsErr  error
 }
 
 func (f *fakeForge) VerifyToken(context.Context) (forge.BotIdentity, error) {
 	return f.identity, f.verifyErr
 }
+func (f *fakeForge) EnsureLabels(context.Context, int64, []forge.Label) error { return f.labelsErr }
 func (f *fakeForge) ListProjects(context.Context) ([]forge.Project, error) {
 	return f.projects, f.projectErr
 }
@@ -57,6 +61,19 @@ type fakeStore struct {
 	enabled       []store.SetRepoEnabledForUserParams
 
 	repoIDByPath map[string]uuid.UUID
+
+	columns map[uuid.UUID][]string // board_columns label names per repo, in insert order
+}
+
+func (s *fakeStore) CountBoardColumns(_ context.Context, repoID uuid.UUID) (int64, error) {
+	return int64(len(s.columns[repoID])), nil
+}
+func (s *fakeStore) InsertBoardColumn(_ context.Context, arg store.InsertBoardColumnParams) error {
+	if s.columns == nil {
+		s.columns = map[uuid.UUID][]string{}
+	}
+	s.columns[arg.RepoID] = append(s.columns[arg.RepoID], arg.LabelName)
+	return nil
 }
 
 func (s *fakeStore) GetUserByEmail(context.Context, string) (store.User, error) {
@@ -210,5 +227,48 @@ func TestForgeConnectionUserLookupErrorIsFatal(t *testing.T) {
 
 	if err := ForgeConnection(context.Background(), st, svc, baseCfg()); err == nil {
 		t.Fatal("a DB error looking up the seed admin must be fatal (returned)")
+	}
+}
+
+// Regression (PRD #3760): a repo the startup seed turns on must get the default
+// board columns, in DefaultColumns order, or its cards never resolve a column.
+func TestForgeConnectionCreatesBoardColumnsForEnabledRepo(t *testing.T) {
+	st := &fakeStore{user: store.User{ID: uuid.New(), Email: "admin@uzi.test"}}
+	ff := &fakeForge{
+		identity: forge.BotIdentity{ForgeUserID: 42, Username: "uzi-bot"},
+		projects: []forge.Project{{ForgeProjectID: 1, PathWithNamespace: "vtmocanu/uzi"}},
+	}
+	if err := ForgeConnection(context.Background(), st, &fakeSvc{forge: ff}, baseCfg()); err != nil {
+		t.Fatalf("ForgeConnection: %v", err)
+	}
+	var want []string
+	for _, c := range forgesvc.DefaultColumns {
+		want = append(want, c.Name)
+	}
+	got := st.columns[st.repoIDByPath["vtmocanu/uzi"]]
+	if !slices.Equal(got, want) {
+		t.Fatalf("board columns = %v, want %v", got, want)
+	}
+	if len(st.enabled) != 1 {
+		t.Fatalf("expected the repo enabled, got %d enables", len(st.enabled))
+	}
+}
+
+// A forge that refuses the labels must not stop boot or the enable.
+func TestForgeConnectionColumnFailureIsNonFatal(t *testing.T) {
+	st := &fakeStore{user: store.User{ID: uuid.New(), Email: "admin@uzi.test"}}
+	ff := &fakeForge{
+		identity:  forge.BotIdentity{ForgeUserID: 42, Username: "uzi-bot"},
+		projects:  []forge.Project{{ForgeProjectID: 1, PathWithNamespace: "vtmocanu/uzi"}},
+		labelsErr: errors.New("forge down"),
+	}
+	if err := ForgeConnection(context.Background(), st, &fakeSvc{forge: ff}, baseCfg()); err != nil {
+		t.Fatalf("a label failure must not fail the seed: %v", err)
+	}
+	if len(st.enabled) != 1 {
+		t.Fatalf("repo must still be enabled, got %d enables", len(st.enabled))
+	}
+	if n := len(st.columns[st.repoIDByPath["vtmocanu/uzi"]]); n != 0 {
+		t.Fatalf("no columns may be recorded when the labels failed, got %d", n)
 	}
 }

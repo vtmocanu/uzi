@@ -72,9 +72,9 @@ type cardDTO struct {
 	// ForgeUpdatedAt is the issue's forge-side updated_at (issues.forge_updated_at,
 	// NOT NULL), for the board's "Last updated" sort mode (PRD #102 M5).
 	//
-	// It must be set by BOTH card builders — assembleCards AND issueToCard. Missing
+	// It must be set by BOTH card builders - assembleCards AND issueToCard. Missing
 	// it in issueToCard (the single-card path, behind MoveIssue, PromoteIssue AND
-	// CreateIssue in handler/issues.go — three call sites, not the two this comment
+	// CreateIssue in handler/issues.go - three call sites, not the two this comment
 	// named until 2026-07-27) is silent: the card comes back with the zero time,
 	// marshals as "0001-01-01T00:00:00Z", and instantly sinks to the bottom in Last
 	// updated mode while every other card is fine. The typechecker cannot see it; only
@@ -113,7 +113,7 @@ type latestRunDTO struct {
 	Status                    string   `json:"status"`
 	MrIID                     *int64   `json:"mr_iid"`
 	// MrWebURL is the forge-supplied merge/pull-request web URL persisted by the
-	// worker at MR creation (PRD #65 D8), null on rows created before it landed —
+	// worker at MR creation (PRD #65 D8), null on rows created before it landed -
 	// the web renders it directly (through isHttpsUrl) and falls back to the legacy
 	// GitLab URL reconstruction only for those null rows. Stops uzi guessing a URL
 	// the forge already told it, and is the ONLY correct MR link on Forgejo (whose
@@ -126,7 +126,7 @@ type latestRunDTO struct {
 	MrState *string `json:"mr_state"`
 	// FailureReason is OWNER-ONLY (PRD #33 Decision 5): it can carry a user's verbatim
 	// typed reject reason or a raw agent error, so a shared board must not expose it
-	// to non-owner viewers — they get null. Owners keep it (the failed-badge tooltip).
+	// to non-owner viewers - they get null. Owners keep it (the failed-badge tooltip).
 	// The non-sensitive StopKind enum below stays visible to everyone for the
 	// stopped-vs-failed badge, so classification never depends on this field.
 	FailureReason *string `json:"failure_reason"`
@@ -139,12 +139,12 @@ type latestRunDTO struct {
 	// StopReason carries an optional operator reason or server-composed supersession
 	// diagnostics (cause and superseding tip). Unlike
 	// the non-sensitive StopKind enum above, it is owner-gated below (assigned only when
-	// IsMine) exactly like FailureReason — a shared board must not leak another user's
+	// IsMine) exactly like FailureReason - a shared board must not leak another user's
 	// typed text (PRD #33 Decision 5). Null for a non-owner viewer and when no reason was given.
 	StopReason *string `json:"stop_reason"`
 	// Health is the run-health flag (PRD #47): ok|stalled|looping|slow|
 	// waiting_worker|approval_idle. Non-sensitive (like StopKind), so it rides the
-	// shared board card unconditionally — runBadge renders the warn variant only for
+	// shared board card unconditionally - runBadge renders the warn variant only for
 	// a flaggable status. HealthSince (when the flag was raised) is likewise
 	// unconditional and drives the "stuck for Xm" elapsed. HealthReason, which can
 	// name owner state ("your vault is locked"), is OWNER-ONLY, exactly like
@@ -176,7 +176,7 @@ type latestRunDTO struct {
 	// (running, iteration_count 0, no persisted plan yet; chat/judge excluded).
 	IsPlanning bool `json:"is_planning"`
 	// IsRevising is issue #750's plan-revise display flag on the board card: true when
-	// the run's latest plan-ish message ({plan, plan_revising}) is a plan_revising — a
+	// the run's latest plan-ish message ({plan, plan_revising}) is a plan_revising - a
 	// "revise" replan in flight. Non-sensitive, rides the shared card unconditionally
 	// like IsPlanning/Status. Server-computed (planRevisingSet), meaningful only while
 	// status == "awaiting_approval". Set by assembleCards after mapLatestRun, since the
@@ -203,7 +203,7 @@ type latestRunDTO struct {
 // mapLatestRun builds the card's run summary from the shared run + owner + worker
 // columns the board and single-card queries both return. viewerID is the board
 // viewer; IsMine is set when the run belongs to them (only then does the client
-// render the run-view link). ownerName is the owner's display name or empty — never
+// render the run-view link). ownerName is the owner's display name or empty - never
 // the email (PRD #33 Decision 5): a shared board must not leak another user's email
 // on a card, and the web already renders a no-owner badge for empty. The query no
 // longer even selects the email, so there is nothing to fall back to here.
@@ -248,7 +248,7 @@ func mapLatestRun(runID, ownerID uuid.UUID, status string, kind string, iteratio
 		v := mrIID.Int64
 		dto.MrIID = &v
 	}
-	// Display name or empty — never the email (Decision 5). An empty owner_name is a
+	// Display name or empty - never the email (Decision 5). An empty owner_name is a
 	// legal, rendered no-owner badge on the web.
 	if ownerName.Valid {
 		dto.OwnerName = ownerName.String
@@ -259,7 +259,7 @@ func mapLatestRun(runID, ownerID uuid.UUID, status string, kind string, iteratio
 // setLatestRunRevising stamps issue #750's derived is_revising flag on a
 // single-card latest-run DTO. The board-wide path (assembleCards) uses the batch
 // PlanRevisingForRuns map; the single-card refresh responses (drag, promote) go
-// through here so a revising run keeps the flag — otherwise the card
+// through here so a revising run keeps the flag - otherwise the card
 // would blank it and pop the attention ring back until the next full board poll.
 // Best-effort like the batch path: the flag is decoration, so a query error just
 // leaves it false rather than failing the response.
@@ -301,7 +301,7 @@ type boardDTO struct {
 // GetBoard returns a repo's kanban board: its configured columns plus the cached
 // issues as cards, each resolved to a column. The first time a board is opened (no
 // columns yet) it seeds the default columns as labels on the forge and imports the
-// current issues — a deliberate, documented side effect.
+// current issues - a deliberate, documented side effect.
 //
 // The payload carries every cached issue, PRD-labelled or not (PRD #102 M6). The
 // non-PRD ones are filtered CLIENT-side, at render, behind a per-browser toggle:
@@ -341,7 +341,7 @@ func (h *Handler) GetBoard(w http.ResponseWriter, r *http.Request) {
 // ensureHumanReviewColumn makes sure the repo's board has the Human Review column
 // (label on the forge + board_columns row), positioned right after In Progress.
 // It is idempotent: once present, later loads see it and return without touching
-// the forge. A forge outage is non-fatal — the board still renders with its
+// the forge. A forge outage is non-fatal - the board still renders with its
 // existing columns and the next successful load ensures the column. Returns false
 // (after writing an error) only on a DB failure.
 func (h *Handler) ensureHumanReviewColumn(w http.ResponseWriter, r *http.Request, repo store.GetRepoForUserRow) bool {
@@ -353,7 +353,7 @@ func (h *Handler) ensureHumanReviewColumn(w http.ResponseWriter, r *http.Request
 	}
 	pos, needed := humanReviewPlacement(cols)
 	if !needed {
-		return true // already present — idempotent, no forge or DB work
+		return true // already present - idempotent, no forge or DB work
 	}
 
 	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
@@ -368,7 +368,7 @@ func (h *Handler) ensureHumanReviewColumn(w http.ResponseWriter, r *http.Request
 		return true // non-fatal: render with existing columns, retry next load
 	}
 	// Bump the columns Human Review displaces up one so the new column lands right
-	// after In Progress with a distinct position — the same RELATIVE placement fresh
+	// after In Progress with a distinct position - the same RELATIVE placement fresh
 	// boards seed. (PRD #102 Decision 2 moved Planned ahead of In Progress, so a
 	// fresh board no longer leads with In Progress; humanReviewPlacement anchors off
 	// In Progress's position rather than an absolute index, which is what keeps this
@@ -396,7 +396,7 @@ func (h *Handler) ensureHumanReviewColumn(w http.ResponseWriter, r *http.Request
 
 // humanReviewPlacement decides whether the Human Review column must be added to a
 // board and at what position. needed is false when the column is already present
-// (which is what makes the retrofit idempotent — no re-shift on later loads).
+// (which is what makes the retrofit idempotent - no re-shift on later loads).
 // Otherwise the position is right after In Progress, or the end of the board when
 // In Progress is somehow absent.
 func humanReviewPlacement(cols []store.BoardColumn) (pos int, needed bool) {
@@ -429,20 +429,15 @@ func (h *Handler) seedBoard(w http.ResponseWriter, r *http.Request, repo store.G
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return false
 	}
-	if err := f.EnsureLabels(r.Context(), repo.ForgeProjectID, forgesvc.DefaultColumns); err != nil {
-		httpx.Error(w, http.StatusBadGateway, "could not seed board labels on the forge: "+err.Error())
-		return false
-	}
-	for i, col := range forgesvc.DefaultColumns {
-		if err := h.q.InsertBoardColumn(r.Context(), store.InsertBoardColumnParams{
-			RepoID:    repo.ID,
-			LabelName: col.Name,
-			Position:  int32(i),
-		}); err != nil {
-			slog.Error("insert board column", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
+	if err := forgesvc.EnsureBoardColumns(r.Context(), h.q, f, repo.ID, repo.ForgeProjectID); err != nil {
+		var seedErr *forgesvc.LabelSeedError
+		if errors.As(err, &seedErr) {
+			httpx.Error(w, http.StatusBadGateway, "could not seed board labels on the forge: "+seedErr.Error())
 			return false
 		}
+		slog.Error("ensure board columns", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return false
 	}
 	if _, err := h.svc.FullSync(r.Context(), repo.ID, repo.ForgeProjectID, f); err != nil {
 		// Non-fatal: the board renders empty and the poller/Refresh will fill it.
@@ -480,7 +475,7 @@ func (h *Handler) buildBoard(w http.ResponseWriter, r *http.Request, repo store.
 	}
 
 	// CI badges (PRD #6): the board header shows the repo's default-branch pipeline;
-	// each card shows its most-recent run's branch pipeline. Both are enrichment —
+	// each card shows its most-recent run's branch pipeline. Both are enrichment -
 	// a cache-read failure logs and renders the board without badges.
 	repoPipeline := h.defaultBranchPipeline(r, repo)
 	cardPipelines := h.cardPipelines(r, repo.ID)
@@ -518,7 +513,7 @@ func (h *Handler) buildBoard(w http.ResponseWriter, r *http.Request, repo store.
 
 // defaultBranchPipeline reads the repo's default-branch CI status from the cache
 // for the board header (PRD #6). Returns nil when the repo has no default branch,
-// no cached pipeline for it, or on a read error (logged) — the badge is enrichment.
+// no cached pipeline for it, or on a read error (logged) - the badge is enrichment.
 func (h *Handler) defaultBranchPipeline(r *http.Request, repo store.GetRepoForUserRow) *apitypes.PipelineDTO {
 	if !repo.DefaultBranch.Valid || repo.DefaultBranch.String == "" {
 		return nil
@@ -583,7 +578,7 @@ func setAutofixHalt(card *cardDTO, iid int64, halts map[int64]int32) {
 // function rather than two inline unmarshals.
 //
 // The column is `jsonb NOT NULL DEFAULT '[]'`, and SQL NOT NULL does not exclude
-// the jsonb scalar `null` — a distinct value that json.Unmarshal decodes into a
+// the jsonb scalar `null` - a distinct value that json.Unmarshal decodes into a
 // nil slice with NO error, so the error branch below never sees it. A nil slice
 // marshals as JSON `null`, not `[]`, and the web then calls .filter and .includes
 // on it.
@@ -620,7 +615,7 @@ func nonNilLabels(labels []string) []string {
 // card DTO ships (PRD #767 M5), mirroring decodeLabels. It GUARANTEES a non-nil
 // result for the same reason: the column is `jsonb NOT NULL DEFAULT '[]'`, but the
 // jsonb scalar `null` decodes into a nil slice with no error, which marshals back as
-// JSON `null` — and the web calls .includes on it. Return an empty (non-nil) slice on
+// JSON `null` - and the web calls .includes on it. Return an empty (non-nil) slice on
 // nil or a decode error so it always serializes as `[]`.
 func decodeAssigneeIDs(raw []byte) []int64 {
 	var ids []int64
@@ -679,7 +674,7 @@ func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRo
 			Column:      col,
 			Closed:      closed,
 			Conflict:    conflict,
-			// Sibling of issueToCard's — keep the two in step (see cardDTO.ForgeUpdatedAt).
+			// Sibling of issueToCard's - keep the two in step (see cardDTO.ForgeUpdatedAt).
 			ForgeUpdatedAt: is.ForgeUpdatedAt.Time,
 			LatestRun:      latestByIID[is.ForgeIssueIid],
 			Pipeline:       cardPipelines[is.ForgeIssueIid],
@@ -726,7 +721,7 @@ func (h *Handler) ConfigureColumns(w http.ResponseWriter, r *http.Request) {
 		// Two reserved close sentinels: "closed" (MoveIssue canonicalizes a
 		// case-insensitive "closed" target to the literal and routes it to CloseIssue)
 		// and "__closed__" (the web's CLOSED_KEY for the synthetic Closed lane, which
-		// Board.tsx maps to the wire value "closed" — web/src/pages/Board.tsx). A user
+		// Board.tsx maps to the wire value "closed" - web/src/pages/Board.tsx). A user
 		// column named either could never receive a card (a drop onto it closes the
 		// issue), and "__closed__" additionally collides with the synthetic lane's key
 		// in the board's column map. Reject both at configuration time rather than
@@ -843,7 +838,7 @@ func (h *Handler) SetBoardOrder(w http.ResponseWriter, r *http.Request) {
 	// whole point. Checking it after would size the two allocations below off the
 	// decoded body rather than off the cap: measured, a maximal 1 MiB body decodes to
 	// 524,283 iids that dedupe down to 1, having already cost ~22 MiB of
-	// pre-allocation — on a route that deliberately carries no forge limiter. Reject
+	// pre-allocation - on a route that deliberately carries no forge limiter. Reject
 	// first, then allocate against a bounded length.
 	//
 	// Consequence, stated because it is a real behaviour choice: a body that is over
@@ -926,21 +921,21 @@ type moveIssueRequest struct {
 // MoveIssue moves a card by writing to the forge FIRST, then updating the cache.
 // The target column disambiguates three actions (PRD #1034 M3):
 //
-//   - a configured column (or Open, "" / "open") — an ordinary single-column move:
+//   - a configured column (or Open, "" / "open") - an ordinary single-column move:
 //     the target column label is added and every other column label removed in one
 //     atomic call; Open removes all column labels.
-//   - "closed" (drag a card into the Closed lane) — CLOSE the issue on the forge.
+//   - "closed" (drag a card into the Closed lane) - CLOSE the issue on the forge.
 //     Close is state-only: labels are left untouched (CloseIssue never moves them),
 //     and issueToCard→board.ResolveColumn renders closed=true from the issue's state
 //     regardless of any column labels, so the returned card lands in the Closed lane.
-//   - any open target when the SOURCE card is already closed (drag a closed card out) —
+//   - any open target when the SOURCE card is already closed (drag a closed card out) -
 //     REOPEN the issue and move it to the drop target (Backlog "" clears column labels).
 //     Reopen composes a state-flip then a label move; if only the move half fails the
 //     handler still 502s (the card snaps back optimistically and the next poll
 //     reconciles to the reopened state), preserving the 502-on-forge-error contract.
 //
 // Two intended (not-bug) behaviours from the PRD: closing a card whose run is still in
-// flight does NOT stop the run or its MR — ResolveColumn forces closed=true regardless
+// flight does NOT stop the run or its MR - ResolveColumn forces closed=true regardless
 // of lifecycle labels, so the card just moves to Closed while the run keeps going. And a
 // stale poll fetched before a manual close lands can briefly re-render a just-closed card
 // as open (a pre-existing race class shared with label moves); no fix here.
@@ -1070,7 +1065,7 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("latest run for moved card", "error", err)
 	}
 	// Carry the card's CI badge too (PRD #6), so a manual drag never blanks it (a
-	// drag touches neither runs nor pipelines — the client replaces the whole card).
+	// drag touches neither runs nor pipelines - the client replaces the whole card).
 	card.Pipeline = h.cardPipelines(r, repo.ID)[iid]
 	// And the CI-autofix halt marker (PRD #1650 D3a), for the same reason. Keyed by
 	// the route iid like the pipeline above.
@@ -1203,7 +1198,7 @@ func issueToCard(is store.Issue, position map[string]int, forgeType string) card
 		Column:      col,
 		Closed:      closed,
 		Conflict:    conflict,
-		// Sibling of assembleCards' — this is the single-card path (MoveIssue,
+		// Sibling of assembleCards' - this is the single-card path (MoveIssue,
 		// PromoteIssue), and omitting it here is the silent half of the bug
 		// cardDTO.ForgeUpdatedAt describes: only a just-dragged card would carry the
 		// zero time, so every other card looks right.
