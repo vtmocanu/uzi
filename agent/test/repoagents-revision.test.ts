@@ -6,12 +6,11 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { GitCache } from "../src/git.js";
 import { detectRepoAgentsAtRevision } from "../src/repoagents.js";
-import { nullLogger, testGitCacheOptions } from "./helpers.js";
+import { hermeticGitEnv, nullLogger, testGitCacheOptions } from "./helpers.js";
 
-const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
 const IDENT = ["-c", "user.name=t", "-c", "user.email=t@example.test", "-c", "commit.gpgsign=false"];
 const gitIn = (dir: string, args: string[]): string =>
-  execFileSync("git", ["-C", dir, ...args], { env: GIT_ENV, encoding: "utf8" }).trim();
+  execFileSync("git", ["-C", dir, ...args], { env: hermeticGitEnv(), encoding: "utf8" }).trim();
 
 const agent = (name: string, body: string) => `---\nname: ${name}\ndescription: ${name} agent.\n---\n\n${body}\n`;
 
@@ -23,10 +22,24 @@ describe("detectRepoAgentsAtRevision over git objects (issue #3913)", () => {
   before(() => {
     base = fs.mkdtempSync(path.join(os.tmpdir(), "cdr-3913-rev-"));
     repo = path.join(base, "repo");
-    execFileSync("git", ["init", "-q", "-b", "main", repo], { env: GIT_ENV });
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { env: hermeticGitEnv() });
     git = new GitCache(path.join(base, "data"), nullLogger(), undefined, testGitCacheOptions());
   });
   after(() => fs.rmSync(base, { recursive: true, force: true }));
+
+  it("test git ignores an inherited repository location", () => {
+    const saved = { dir: process.env.GIT_DIR, tree: process.env.GIT_WORK_TREE };
+    process.env.GIT_DIR = path.join(base, "foreign.git");
+    process.env.GIT_WORK_TREE = base;
+    try {
+      assert.equal(fs.realpathSync(gitIn(repo, ["rev-parse", "--absolute-git-dir"])), fs.realpathSync(path.join(repo, ".git")));
+    } finally {
+      if (saved.dir === undefined) delete process.env.GIT_DIR;
+      else process.env.GIT_DIR = saved.dir;
+      if (saved.tree === undefined) delete process.env.GIT_WORK_TREE;
+      else process.env.GIT_WORK_TREE = saved.tree;
+    }
+  });
 
   function commit(files: Record<string, string | { symlink: string }>): string {
     for (const [rel, content] of Object.entries(files)) {
@@ -89,7 +102,7 @@ describe("detectRepoAgentsAtRevision over git objects (issue #3913)", () => {
 
   it("an absent folder yields an empty roster and an unknown revision throws", async () => {
     const empty = fs.mkdtempSync(path.join(base, "empty-"));
-    execFileSync("git", ["init", "-q", "-b", "main", empty], { env: GIT_ENV });
+    execFileSync("git", ["init", "-q", "-b", "main", empty], { env: hermeticGitEnv() });
     gitIn(empty, [...IDENT, "commit", "-q", "--allow-empty", "-m", "root"]);
     const rev = gitIn(empty, ["rev-parse", "HEAD"]);
     assert.deepEqual(await detectRepoAgentsAtRevision(git.revisionTreeReader(empty, rev), "claude"), { agents: [], notes: [], folder: null });

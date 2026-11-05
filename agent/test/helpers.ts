@@ -100,6 +100,24 @@ export function recordingLogger(): { logger: Logger; lines: unknown[] } {
   return { logger: make({}), lines };
 }
 
+const GIT_LOCATION_VARS = [
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_INDEX_FILE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_COMMON_DIR",
+  "GIT_NAMESPACE",
+  "GIT_CEILING_DIRECTORIES",
+  "GIT_PREFIX",
+];
+
+export function hermeticGitEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of GIT_LOCATION_VARS) delete env[key];
+  return { ...env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+}
+
 /** A minimal valid claim; override any field per test. */
 export function makeClaim(overrides: Partial<ClaimResponse> = {}): ClaimResponse {
   return {

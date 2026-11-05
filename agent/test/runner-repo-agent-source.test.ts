@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { makeClaim, nullLogger, testGitCacheOptions } from "./helpers.js";
+import { hermeticGitEnv, makeClaim, nullLogger, testGitCacheOptions } from "./helpers.js";
 import { GitCache } from "../src/git.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import type { Executor, RunContext } from "../src/executor.js";
@@ -14,10 +14,9 @@ import { api, client, fakeGitlab, fx, installHarness } from "./runner-harness.js
 
 installHarness();
 
-const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
 const IDENT = ["-c", "user.name=t", "-c", "user.email=t@example.test", "-c", "commit.gpgsign=false"];
 const gitIn = (dir: string, args: string[]): string =>
-  execFileSync("git", ["-C", dir, ...args], { env: GIT_ENV, encoding: "utf8" }).trim();
+  execFileSync("git", ["-C", dir, ...args], { env: hermeticGitEnv(), encoding: "utf8" }).trim();
 
 const CLAUDE_AGENT = (body: string) => `---\nname: reviewer\ndescription: Reviews changes.\n---\n\n${body}\n`;
 const CODEX_AGENT = (body: string) =>
