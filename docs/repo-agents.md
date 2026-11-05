@@ -111,11 +111,13 @@ agent folders, are not read.
 ### Which revision is read
 
 uzi never reads the agent folders from the run's working tree. On a run's
-first claim the worker fetches the repo, resolves the default branch's current
-commit, reads `.claude/agents/` and `.codex/agents/` from git objects at that
-commit, and reports the commit together with the roster before any agent turn
-starts. The server records the commit once per run and refuses a later report
-that names a different one.
+first claim the worker fetches the repo and resolves the repository's
+configured default branch from its remote-tracking ref after that fetch, never
+from another branch. It reads `.claude/agents/` and `.codex/agents/` from git
+objects at that commit and reports the commit together with the roster. No
+agent turn starts until the server confirms it recorded that commit. The server
+records the commit once per run and refuses a later report that names a
+different one.
 
 Every later claim of the same run (a resume, a requeue, a restart on another
 worker) reads the agent folders at the recorded commit. Edits a run makes to its
@@ -132,13 +134,30 @@ The read follows the same rules as the folder layout above: a symlink for
 still counts as present, so there is no fallback to the other folder), symlinks
 and submodules inside the folder are skipped, and the same caps apply.
 
-If the worker cannot read the recorded commit (for example, it is missing from
-the worker's repository cache and fetching it fails), the agent does not start.
-The run is held as **repo agents unreadable** (`hold_reason`
-`repo_agent_source_unavailable`); resume it once the repository can be fetched,
-or cancel it. A worker that predates the recorded revision does not claim such a
-run. When the API is older than the worker, nothing is recorded and each claim
-reads the agent folders at the default branch's commit at that time.
+The agent does not start, and the run is held as **repo agents unreadable**
+(`hold_reason` `repo_agent_source_unavailable`), when the worker:
+
+- cannot resolve the configured default branch (the repository has none, or the
+  branch is missing from the fetch);
+- cannot get the server's confirmation that it recorded the commit (the report
+  failed, was refused, or its answer did not name the commit);
+- cannot read the agent folders at the commit, or the recorded commit is missing
+  from its repository cache and fetching it fails.
+
+When the worker resolved a commit, the hold records it under the same
+record-once rule, so the claim after an owner resume reads the same commit even
+if the default branch has moved since. Resume the run once the repository can
+be fetched, or cancel it.
+
+Only a worker that reports the `repo_agent_source_v1` protocol capability
+claims a run that reads repo agents, its first claim included. Judge, job,
+cross-check, task-review and isolated-fetch runs do not read repo agents and
+are exempt. While no such worker is online, a queued run's health reason names
+the capability.
+
+When the API is older than the worker, nothing is recorded: each claim reads
+the agent folders at the configured default branch's commit at that time, and
+a failure to read them leaves the run on the owner's own agent templates.
 
 ## What is loaded, and what is never
 
