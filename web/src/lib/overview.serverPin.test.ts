@@ -171,7 +171,9 @@ describe("parkDisposition against ListMaintenanceHeldRuns", () => {
 
   it("accepts the real expression and ignores comment edits", () => {
     expect(matchesPinnedCase(heldRunsBlock(sql))).toBe(true);
-    const edited = heldRunsBlock(sql.replace("-- #3495:", "-- reworded note:"));
+    const editedSql = sql.replace("-- #3495:", "-- reworded note:");
+    expect(editedSql).not.toBe(sql);
+    const edited = heldRunsBlock(editedSql);
     expect(matchesPinnedCase(edited)).toBe(true);
   });
 
