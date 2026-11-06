@@ -176,7 +176,7 @@ Measured on 2026-11-06 with `run.sh` and the harness at commit `86341fb8` (the l
 - **Image:** `pbd-measure:1fca12dd`, built on the measuring host from `agent/templates/base/Dockerfile` at `1fca12dd` (`docker build`, 1559 s). It replaces the `uzi-agent-home-split:base` image of the section above, which was absent on this host. Baseline controls (repo, synthetic-50000, wide-1024x1024) were re-run in this image so the rows below compare with each other; they are not directly comparable with the earlier section's image.
 - **Commands:** one invocation, `REPO_SHA=86341fb8 FIXTURES="repo synthetic-50000 wide-256x1024 wide-512x1024 wide-1024x1024 longpath-d60n250w2000f1 longpath-d60n250w2000f2 longpath-d60n250w2000f4 longpath-d64n250w0f64" MEM_CONFIGS="1536m:1:full,control 4g:2:full"`, 823 s, every job exited 0 with no OOM.
 - **Raw records:** `results-2026-11-06-bound-m1.jsonl` beside this file (27 records).
-- **Charged work** is the analytic model's (basis `analytic`), used only for rows whose discovery completed. On every such row the meter's fetched tree-entry total matched the model exactly (`meterMatch`). The one row that did not complete discovery (`longpath-d64n250w0f64`, stopped by `git_deadline` after about 3,300–3,760 of 4,097 tree reads) is reported as a fetched upper bound and is not used below.
+- **Charged work** is the analytic model's (basis `analytic`), used only for rows whose discovery completed. On every such row the meter's fetched tree-entry total matched the model exactly (`meterMatch`). The one fixture whose discovery did not complete (`longpath-d64n250w0f64`, both `full` rows and its `control`, stopped by `git_deadline` after about 3,300–3,760 of 4,097 tree reads) is reported as a fetched upper bound and is not used below.
 
 ## Per-unit cost (container cgroup peak at the end of the capture, `control` = uninstrumented production path, 1536 MiB / 1 CPU)
 
@@ -192,12 +192,12 @@ Measured on 2026-11-06 with `run.sh` and the harness at commit `86341fb8` (the l
 | longpath-d60n250w2000f4 | 8,240 | 124,317,080 | 3.9 s | 258.9 MiB | 263.9 MiB |
 
 - The wide fixtures complete discovery and are then stopped by `git_deadline` in the post-discovery phase, which in these `--no-checkout` fixtures diffs every base path as a deletion (see the section above). The long-path fixtures complete discovery and are then refused with `errno:ENAMETOOLONG`, when the post-discovery walk reaches a path longer than the host's `PATH_MAX`. Peaks therefore cover discovery plus whatever post-discovery work ran.
-- **Per entry occurrence** (wide, about 15 path bytes each): (374.2 − 193.8) MiB / 787,200 entries ≈ **240 bytes per entry**, intercept ≈ 134 MiB. This is an empirical estimate for base discovery on this host and image only.
-- **Per charged path byte** (long-path, few entries): 1.91 (f1 → f2) and 1.14 (f2 → f4) bytes of container memory per path byte; ≈ 1.40 over the whole range. The conservative 1.91 is used below. This is likewise an empirical estimate.
+- **Per entry occurrence** (wide, about 15 path bytes each): (374.2 − 193.8) MiB / 787,200 entries ≈ **240 bytes per entry**, intercept ≈ 134 MiB. This is an empirical estimate for base discovery on this host and image only; the 4g/2 CPU rows give about 274 bytes per entry.
+- **Per charged path byte** (long-path, few entries): 1.91 (f1 → f2) and 1.14 (f2 → f4) bytes of container memory per path byte; ≈ 1.40 over the whole range (the instrumented `full` 1 CPU rows give 1.64 and 1.50). The largest, 1.91, is used below; it is noisy, driven partly by the f1 `control` peak sitting above its `full` row. This is likewise an empirical estimate.
 
 ## Realistic trees (rule 5a)
 
-Counted on 2026-11-06 from depth-1, blob-less bare clones of each repository's default branch with `git ls-tree -r -t -z --name-only HEAD`. Entries are files plus directories, and path bytes are the sum of every entry's full relative path, which is exactly what the caps charge.
+Counted on 2026-11-06 from depth-1, blob-less bare clones of each repository's default branch with `git ls-tree -r -t -z --name-only HEAD`. Entries are files, directories and gitlinks (Chromium has 273 submodule entries; Linux none), and path bytes are the sum of every entry's full relative path, which is exactly what the caps charge.
 
 | repository | commit | entries | path bytes | longest path |
 |---|---|---|---|---|
@@ -209,4 +209,4 @@ Counted on 2026-11-06 from depth-1, blob-less bare clones of each repository's d
 - **`baseDiscoveryEntryCap` = 1,200,000** (2.13× Chromium's 563,282 entries).
 - **`baseDiscoveryPathByteCap` = 100,663,296 (96 MiB)** (2.36× Chromium's 42,616,138 path bytes).
 - **Estimated container peak with both caps reached:** 134 MiB + 1,200,000 × 240 B (≈ 275 MiB, already including about 15 path bytes per entry) + (96 MiB − 17 MiB) × 1.91 (≈ 151 MiB) ≈ **560 MiB**, inside the 1536 MiB per-slot budget. This is an estimate only; M3 measures the capped helper and decides acceptance.
-- **Time:** at 1 CPU the wide fixtures charge about 44,000 entries/s, so a base near the entry cap reaches the 28 s helper deadline before the cap. The entry cap is the binding bound on hosts fast enough to reach it within the deadline (the 2 CPU rows charge about 51,000 entries/s), and the deadline otherwise. The path-byte cap is reached in seconds.
+- **Time:** at 1 CPU the wide fixtures charge about 44,000 entries/s, so a wide base reaches the entry cap after about 27.5 s (projected from wide-1024x1024), within about 0.5 s of the 28 s helper deadline. Which one binds depends on host speed (the 2 CPU rows charge 50,700–54,150 entries/s). The path-byte cap is reached in seconds (about 3 s for 96 MiB at the f4 rate).
