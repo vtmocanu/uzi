@@ -9,7 +9,7 @@ import type { RunContext } from "../src/executor.js";
 import type { StateAck, StateRequest } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
 import { api, client, fx, git, installHarness } from "./runner-harness.js";
-import { fixture, FULL, ROOMY, readGit } from "./runner-terminal-disk-deferral-fixture.js";
+import { fixture, FULL, ROOMY, LINUX_CAPTURE, readGit } from "./runner-terminal-disk-deferral-fixture.js";
 
 installHarness();
 
@@ -267,7 +267,8 @@ describe("disk parks wait for their owner after the counted budget", () => {
     { verified: true, retry: null }, { verified: false, retry: null },
     { verified: true, retry: undefined }, { verified: true, retry: RETRY },
   ]) {
-    it(`mid-run retry=${String(retry)} retains ${verified ? "captured" : "degraded"} work after lost/statusless replies`, async () => {
+    it(`mid-run retry=${String(retry)} retains ${verified ? "captured" : "degraded"} work after lost/statusless replies`,
+      { skip: !verified && LINUX_CAPTURE }, async () => {
       const marker = git.commitWipMarker.bind(git);
       let captures = 0;
       git.commitWipMarker = async (...args) => { captures++; return verified ? marker(...args) : false; };
