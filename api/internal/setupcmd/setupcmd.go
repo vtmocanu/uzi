@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strings"
@@ -36,6 +37,11 @@ import (
 
 // Deadline covers input acquisition and everything after it.
 const Deadline = 5 * time.Minute
+
+// dbStartupMessage replaces the raw error when the database cannot be opened.
+// pgx redacts the password from a malformed connection string only best-effort,
+// so the error itself never reaches either stream.
+const dbStartupMessage = "database: could not connect; check DATABASE_URL and that the database is reachable"
 
 // Store is the slice of *store.Queries setup uses: the provisioning service's
 // own slice plus the owner and repo lookups.
@@ -110,7 +116,49 @@ func (r *runner) clean(s string) string {
 }
 
 func (r *runner) diag(format string, a ...any) {
-	fmt.Fprintf(r.stderr, "setup: %s\n", r.clean(fmt.Sprintf(format, a...)))
+	_, _ = fmt.Fprintf(r.stderr, "setup: %s\n", r.clean(fmt.Sprintf(format, a...)))
+}
+
+// scrubWriter passes every write through runner.clean before stderr. slog's
+// text handler writes one whole record per Write, so a token never spans two
+// writes.
+type scrubWriter struct{ r *runner }
+
+func (w scrubWriter) Write(p []byte) (int, error) {
+	if _, err := io.WriteString(w.r.stderr, w.r.clean(string(p))); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// scrubLogs routes the default slog logger, which provisionsvc and forgesvc
+// write to, through the scrubber onto setup's stderr, and returns the restore.
+func (r *runner) scrubLogs() func() {
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(scrubWriter{r}, nil)))
+	return func() { slog.SetDefault(prev) }
+}
+
+// emit scrubs every string in the report that came from outside this package,
+// then writes it. JoinToken is the one secret meant for stdout and is kept.
+func (r *runner) emit(stdout io.Writer, rep *Report) error {
+	rep.Error = r.clean(rep.Error)
+	rep.IssueSync = r.clean(rep.IssueSync)
+	for _, s := range []*Step{rep.Forge, rep.Discovery, rep.Worker} {
+		if s == nil {
+			continue
+		}
+		s.Status, s.Message = r.clean(s.Status), r.clean(s.Message)
+		s.ConnectionID, s.BotUsername = r.clean(s.ConnectionID), r.clean(s.BotUsername)
+		s.WorkerID, s.Name = r.clean(s.WorkerID), r.clean(s.Name)
+		s.Findings = cleanAll(r, s.Findings)
+	}
+	for i := range rep.Repos {
+		rp := &rep.Repos[i]
+		rp.Path, rp.Status, rp.RepoID, rp.Message = r.clean(rp.Path), r.clean(rp.Status), r.clean(rp.RepoID), r.clean(rp.Message)
+		rp.Findings = cleanAll(r, rp.Findings)
+	}
+	return writeReport(stdout, rep)
 }
 
 // reject writes a rejected report (exit 2): nothing was written.
@@ -118,7 +166,7 @@ func (r *runner) reject(stdout io.Writer, err error) int {
 	msg := r.clean(err.Error())
 	r.diag("%s", msg)
 	rep := &Report{SchemaVersion: ReportSchemaVersion, Status: ReportRejected, ExitCode: ExitUsage, Error: msg}
-	_ = writeReport(stdout, rep)
+	_ = r.emit(stdout, rep)
 	return ExitUsage
 }
 
@@ -149,10 +197,11 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return r.reject(stdout, err)
 	}
 	r.token = token
+	defer r.scrubLogs()()
 
 	be, closeBackend, err := env.Open(ctx, cfg)
 	if err != nil {
-		return r.reject(stdout, fmt.Errorf("database: %w", err))
+		return r.reject(stdout, errors.New(dbStartupMessage))
 	}
 	defer closeBackend()
 	if err := be.CheckSchema(ctx); err != nil {
@@ -188,7 +237,7 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		r.report.Status = ReportWorkerExists
 		r.report.ExitCode = ExitWorkerExists
 	}
-	if err := writeReport(stdout, r.report); err != nil {
+	if err := r.emit(stdout, r.report); err != nil {
 		// The join token, if one was minted, was in the document that did not
 		// arrive. It is not repeated here: it stays on stdout only.
 		r.diag("could not write the report: %v", err)

@@ -83,6 +83,9 @@ type fakeStore struct {
 	flips     map[uuid.UUID]int
 	writes    int
 	creations int
+	// getRepoErr makes GetRepoForUser fail; provisionsvc logs that error
+	// through slog, the path a scrub test needs.
+	getRepoErr error
 }
 
 func newFakeStore() *fakeStore {
@@ -142,6 +145,9 @@ func (s *fakeStore) ListReposByConnectionForUser(context.Context, store.ListRepo
 	return out, nil
 }
 func (s *fakeStore) GetRepoForUser(_ context.Context, a store.GetRepoForUserParams) (store.GetRepoForUserRow, error) {
+	if s.getRepoErr != nil {
+		return store.GetRepoForUserRow{}, s.getRepoErr
+	}
 	r, ok := s.repos[a.ID]
 	if !ok {
 		return store.GetRepoForUserRow{}, pgx.ErrNoRows
@@ -220,6 +226,7 @@ type harness struct {
 	stderr  bytes.Buffer
 	opened  bool
 	allowed []string
+	openErr error
 }
 
 func newHarness() *harness {
@@ -246,6 +253,9 @@ func (h *harness) env() Env {
 		},
 		Open: func(context.Context, config.SetupConfig) (*Backend, func(), error) {
 			h.opened = true
+			if h.openErr != nil {
+				return nil, nil, h.openErr
+			}
 			return &Backend{
 				Q: h.st, Forges: fakeForges{h.forge}, Guard: h.guard, Workers: h.workers,
 				CheckSchema: func(context.Context) error { return h.schema },
@@ -689,7 +699,7 @@ func TestRunReadsTheTokenFromAFile(t *testing.T) {
 // the only way Run returns is the cancellation; the test needs no sleeps.
 func TestRunCancellationInterruptsABlockedStdinRead(t *testing.T) {
 	pr, pw := io.Pipe()
-	defer pw.Close()
+	defer func() { _ = pw.Close() }()
 	h := newHarness()
 	h.stdin = pr
 	ctx, cancel := context.WithCancel(context.Background())
