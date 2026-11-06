@@ -79,9 +79,21 @@ Measured on 2026-11-06, 12:08–12:29 UTC, with `run.sh` and the harness at comm
 
 **Caveats:**
 - The adversarial clones are `--no-checkout`. Production would first have to check out the base.
-- Tree RSS double-counts shared pages and is sampled every 10 ms, so it can miss short peaks. The container peak includes the harness parent (about 60 MiB) and page cache.
+- Tree RSS double-counts shared pages and is sampled every 10 ms, so it can miss short peaks.
+- The parent-observed "disc" values (tree RSS and cgroup peak) were read at the parent's first 10 ms poll after the helper's boundary snapshot. They can include a few ms of post-discovery work, so treat them as upper bounds for discovery. The helper maxRSS "disc" value is taken synchronously at the boundary. The container peak includes the harness parent (about 60 MiB) and page cache.
 - There is no UID split or sandbox.
 - Everything was measured on one host. See README.md.
+
+## Instrumentation validation (m1 smoke and matrix cross-checks)
+
+- **Counts against the analytic manifests:**
+  - completed discovery matches the manifest exactly: fanout2-d8 (511 trees / 766 entries), chain-d64 (65), synthetic-10000 (101 / 10,100), synthetic-50000 (501 / 50,500), repo (333) and wide-1024x1024 (1,025 / 1,049,600);
+  - d12 and deeper cannot finish under the production 28 s deadline, so a full comparison is impossible there. Instead, every instrumented binary-DAG run (fanout2-d12 to d64 at both limits, plus an earlier d12 smoke) matched the exact DFS-prefix entry count for its observed occurrences. The last spawned tree read may be unclosed at the stop.
+- **Controlled faults (m1 smoke, harness at m1):**
+  - a deadline injected between the sizing batch close and the index open reported discovery not completed, with `capture_deadline`;
+  - wide-4096x4096 at 256 MiB reported `oom` (oom_kill delta 1, Docker OOMKilled) with `≥` / `n/a` peaks;
+  - a short `START_TIMEOUT` reported `killed_by_harness`, exit 137, not `oom`.
+- **Raw records:** `results-2026-11-06.jsonl` beside this file holds the 56 per-job result records with their termination records. It is the source of the table below.
 
 ## Table (verbatim `results/results.md`)
 
@@ -95,7 +107,7 @@ Legend:
 - `control` rows are uninstrumented, so their occurrence, byte and helper-RSS cells are `n/a`.
 - `≥` marks a lower bound.
 - Discovery is "done" only when the helper opened the clone index.
-- Rows sort by job label string (`fixture__mode__mem`).
+- Rows sort by job label string: `fixture__mode__mem` in this dataset. The harness now appends `-<cpus>cpu` to the label, so two configurations sharing a memory limit cannot collide.
 - `cancelled` rows also carry a token, `unclassified` (see 5); Observation 8 explains the `refused unclassified` rows.
 
 | fixture | mode | mem/cpus | outcome | discovery done | discovery ms | capture ms | tree occ (obs / expected) | tree entries | discovery object bytes | readSync bytes | helper maxRSS MiB (disc / final) | tree RSS peak MiB (disc / all) | cgroup peak MiB (disc / end) | cancel: settle ms, cleanup |

@@ -140,7 +140,8 @@ for config in $MEM_CONFIGS; do
       continue
     fi
     for mode in ${modes//,/ }; do
-      label="${spec}__${mode}__${mem}"
+      # CPU is part of the identity: two configs may share a memory limit.
+      label="${spec}__${mode}__${mem}-${cpus}cpu"
       inject=false
       if [ "$SMOKE_INJECT" = "1" ]; then label="${label}__inject"; inject=true; fi
       run_job "$name" "$label" "$START_TIMEOUT" \

@@ -103,7 +103,12 @@ discovery git close is kept in the JSON as a lower bound, not as completion. A s
 report `no`.
 
 **Memory columns:**
-- **helper maxRSS:** `process.resourceUsage().maxRSS` at the boundary and at exit.
+- **helper maxRSS:** `process.resourceUsage().maxRSS` at the boundary and at exit. The
+  boundary value is taken synchronously inside the helper, so it is exact for discovery.
+- **Parent-observed discovery columns are polled, not synchronous.** The parent's tree-RSS
+  discovery peak and its cgroup `memory.peak` at the boundary are taken when the parent first
+  reads the helper's boundary snapshot. It polls every 10 ms, so they can include a few ms of
+  post-discovery work and are upper bounds for discovery.
 - **tree RSS:** the sum of VmRSS over the helper and its descendants, sampled every 10 ms. It
   can miss short peaks, and it double-counts shared pages.
 - **cgroup peak:** `memory.peak` at the boundary and at the end. It is the authoritative
