@@ -11,6 +11,7 @@ import (
 const (
 	codexModelsFixture = "../../../fixtures/codex-models/models.json"
 	judgeModelFixture  = "../../../fixtures/model-settings/judge.json"
+	summaryFixture     = "../../../fixtures/model-settings/summary.json"
 )
 
 // The fixtures live above api/, so a fixture-only edit is not in the package's
@@ -110,5 +111,59 @@ func TestJudgeBuiltinsMatchFixture(t *testing.T) {
 	}
 	if DefaultCodexJudgeModel != fx.Builtins["codex"] {
 		t.Errorf("DefaultCodexJudgeModel = %q, want fixtures/model-settings/judge.json builtins.codex %q", DefaultCodexJudgeModel, fx.Builtins["codex"])
+	}
+}
+
+func loadSummaryFixture(t *testing.T) judgeFixture {
+	t.Helper()
+	raw, err := os.ReadFile(summaryFixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fx judgeFixture
+	if err := json.Unmarshal(raw, &fx); err != nil {
+		t.Fatal(err)
+	}
+	return fx
+}
+
+func TestResolveSummaryModelFixtureCases(t *testing.T) {
+	fx := loadSummaryFixture(t)
+	if len(fx.Cases) == 0 {
+		t.Fatal("fixtures/model-settings/summary.json has no cases")
+	}
+	ran := 0
+	for _, tc := range fx.Cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			ran++
+			got := ResolveSummaryModel(tc.Harness, tc.User, tc.Instance)
+			if got.Model != tc.Want.Model || got.Source != tc.Want.Source ||
+				got.DefaultModel != tc.Want.DefaultModel || got.DefaultSource != tc.Want.DefaultSource {
+				t.Errorf("got %+v, want %+v", got, tc.Want)
+			}
+			if len(got.Dropped) != len(tc.Want.Dropped) ||
+				(len(got.Dropped) > 0 && !reflect.DeepEqual(got.Dropped, tc.Want.Dropped)) {
+				t.Errorf("Dropped = %v, want %v", got.Dropped, tc.Want.Dropped)
+			}
+			if tc.Harness == "codex" && !CodexRoleModels[got.Model] {
+				t.Errorf("codex Model %q is not a Codex role model", got.Model)
+			}
+			if got.Model == "" {
+				t.Errorf("Model is empty although the built-in is accepted")
+			}
+		})
+	}
+	if ran != len(fx.Cases) {
+		t.Errorf("ran %d cases, fixture has %d", ran, len(fx.Cases))
+	}
+}
+
+func TestSummaryBuiltinsMatchFixture(t *testing.T) {
+	fx := loadSummaryFixture(t)
+	if DefaultClaudeSummaryModel != fx.Builtins["claude"] {
+		t.Errorf("DefaultClaudeSummaryModel = %q, want fixtures/model-settings/summary.json builtins.claude %q", DefaultClaudeSummaryModel, fx.Builtins["claude"])
+	}
+	if DefaultCodexSummaryModel != fx.Builtins["codex"] {
+		t.Errorf("DefaultCodexSummaryModel = %q, want fixtures/model-settings/summary.json builtins.codex %q", DefaultCodexSummaryModel, fx.Builtins["codex"])
 	}
 }

@@ -677,30 +677,43 @@ func TestShippedEphemeralDefaultsFitAWholeFleetOnRealNodes(t *testing.T) {
 	}
 }
 
-// The controller's OWN dind data-root default must fit the chart's docker-tier PVC
-// ceiling (audit A18.2). This is the UNSET path, and it was unguarded on both sides.
+// The controller's per-preset dind data-root defaults must each fit the chart's
+// docker-tier PVC ceiling (audit A18.2). This is the UNSET path, and it was unguarded
+// on both sides.
 //
 // An absent or empty workers.docker.dindDataSize does not mean "no claim": the
-// controller falls back to dindDataDefaultSize and creates that PVC anyway. The chart
-// guard originally skipped an empty value, so an empty string plus a lowered
+// controller falls back to the preset's DinDDataSize and creates that PVC anyway. The
+// chart guard originally skipped an empty value, so an empty string plus a lowered
 // maxPVCStorage rendered clean and every docker worker's third claim was rejected at
-// admission — the provisions-and-never-appears failure, through the default rather than
+// admission, the provisions-and-never-appears failure through the default rather than
 // through an override.
 //
-// The chart now defaults the value before comparing, which fixes the render-time half.
-// This is the other half: it ties the CONTROLLER's constant to the chart's ceiling, so
-// raising dindDataDefaultSize past maxPVCStorage reddens here rather than in a cluster.
-// The two are a genuine cross-toolchain pair — Helm cannot read a Go constant — and this
-// is what keeps them honest.
-func TestDinDDataDefaultFitsTheChartsLimitRangeMax(t *testing.T) {
+// The chart now defaults the value (to the per-preset maximum) before comparing, which
+// fixes the render-time half. This is the other half: it ties each preset's quantity to
+// the chart's ceiling, so raising one past maxPVCStorage reddens here rather than in a
+// cluster.
+func TestDinDDataPresetsFitTheChartsDockerLimitRangeMax(t *testing.T) {
 	max := chartDockerMaxPVCStorage(t)
-	def := resource.MustParse(dindDataDefaultSize)
-	if def.Cmp(max) > 0 {
-		t.Errorf("dindDataDefaultSize = %s exceeds workers.docker.limitRange.maxPVCStorage = %s. Every docker "+
-			"worker that does not override workers.docker.dindDataSize would have its dind data-root PVC "+
-			"rejected at admission and would provision and never appear. Raise maxPVCStorage in "+
-			"deploy/chart/values.yaml (and quota.requestsStorage with it), or lower the constant.",
-			def.String(), max.String())
+	names := preset.SizeNames()
+	if len(names) == 0 {
+		t.Fatal("no preset sizes: the assertion below would pass vacuously")
+	}
+	r := testResolver(t)
+	for _, size := range names {
+		spec, err := r.Resolve("base", size)
+		if err != nil {
+			t.Fatalf("resolve base/%s: %v", size, err)
+		}
+		if spec.Size.DinDDataSize.Sign() <= 0 {
+			t.Errorf("preset %q has no DinDDataSize; its docker worker would claim a zero-size dind PVC", size)
+		}
+		if spec.Size.DinDDataSize.Cmp(max) > 0 {
+			t.Errorf("preset %q: DinDDataSize = %s exceeds workers.docker.limitRange.maxPVCStorage = %s. Every "+
+				"docker worker of that size that does not override workers.docker.dindDataSize would have its "+
+				"dind data-root PVC rejected at admission and would provision and never appear. Raise "+
+				"maxPVCStorage in deploy/chart/values.yaml (and quota.requestsStorage with it), or lower the size.",
+				size, spec.Size.DinDDataSize.String(), max.String())
+		}
 	}
 }
 
@@ -922,16 +935,14 @@ func TestDinDDataVolumeIsAPVCAndRunWorkdirIsADataPVCSubPathNotAnEmptyDir(t *test
 	}
 }
 
-// The size is flat, chart-overridable, and — deliberately — NOT part of the pod's
+// The size is per-preset, chart-overridable, and — deliberately — NOT part of the pod's
 // spec hash.
 //
 // That last property is easy to read as a bug and is the correct behaviour: the pod
-// template only NAMES the claim, so raising the size cannot roll a worker, and it must
-// not pretend to. PVCs are never patched here (RenderPVCs' own header), so a size
-// change applies to newly-provisioned workers and existing ones need delete +
-// reprovision — exactly what /data and /nix already do. A roll would produce a pod
-// that restarts and then mounts the SAME old claim, i.e. a disruption that changes
-// nothing.
+// template only NAMES the claim, so changing the size cannot roll a worker, and it must
+// not pretend to. RenderPVCs sets the creation size only; existing claims are converged
+// upward by the materializer (issue #3890). A roll would produce a pod that restarts
+// and then mounts the SAME claim, i.e. a disruption that changes nothing.
 func TestDinDDataSizeDefaultsOverridesAndDoesNotRollThePod(t *testing.T) {
 	dindPVC := func(cfg RenderConfig) *corev1.PersistentVolumeClaim {
 		t.Helper()

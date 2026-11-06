@@ -69,8 +69,13 @@ type Size struct {
 	MemoryRequest resource.Quantity
 	MemoryLimit   resource.Quantity
 	// DataSize is the /data PVC: the bare-clone cache, worktrees and per-run
-	// workspaces. The only volume that varies by size.
+	// workspaces. Varies by size (as does DinDDataSize); the nix store is flat.
 	DataSize resource.Quantity
+	// DinDDataSize is the default size of the DinD daemon data-root PVC for Docker
+	// workers (issue #3890 owner decision 2026-11-04: s/m 20Gi, l/l-highmem 50Gi).
+	// The cluster override UZI_WORKER_DIND_DATA_SIZE (chart workers.docker.dindDataSize)
+	// wins over it when set. It sizes a PVC only and never enters the pod template.
+	DinDDataSize resource.Quantity
 }
 
 // Spec is a fully resolved (template, size) pair — everything the renderer needs
@@ -133,6 +138,7 @@ var sizes = map[string]Size{
 		MemoryRequest: resource.MustParse("2Gi"),
 		MemoryLimit:   resource.MustParse("4Gi"),
 		DataSize:      resource.MustParse("5Gi"),
+		DinDDataSize:  resource.MustParse("20Gi"),
 	},
 	"m": {
 		CPURequest:    resource.MustParse("1"),
@@ -140,6 +146,7 @@ var sizes = map[string]Size{
 		MemoryRequest: resource.MustParse("8Gi"),
 		MemoryLimit:   resource.MustParse("12Gi"),
 		DataSize:      resource.MustParse("25Gi"),
+		DinDDataSize:  resource.MustParse("20Gi"),
 	},
 	"l": {
 		CPURequest:    resource.MustParse("1"),
@@ -147,6 +154,7 @@ var sizes = map[string]Size{
 		MemoryRequest: resource.MustParse("14Gi"),
 		MemoryLimit:   resource.MustParse("20Gi"),
 		DataSize:      resource.MustParse("50Gi"), // issue #2013: headroom for long runs and concurrent build caches
+		DinDDataSize:  resource.MustParse("50Gi"),
 	},
 	// l-highmem (issue #3383) is an operator-selectable capacity choice for memory-heavy
 	// gates, not an OOM guarantee: same CPU and data size as `l`, 24Gi request / 32Gi limit.
@@ -156,6 +164,7 @@ var sizes = map[string]Size{
 		MemoryRequest: resource.MustParse("24Gi"),
 		MemoryLimit:   resource.MustParse("32Gi"),
 		DataSize:      resource.MustParse("50Gi"),
+		DinDDataSize:  resource.MustParse("50Gi"),
 	},
 }
 

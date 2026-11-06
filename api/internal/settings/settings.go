@@ -498,7 +498,11 @@ func Validate(key, value string) error {
 	case KeyCodexJudgeModel:
 		return validateCodexJudgeModel(value)
 	case KeySummaryModel:
-		return validateModelAlias(value)
+		// Blank is the explicit reset to the built-in summary model (PRD #3248).
+		_, err := agenttmpl.ValidateClaudeLaneModel(value)
+		return err
+	case KeyCodexSummaryModel:
+		return validateCodexSummaryModel(value)
 	case KeyAgentSourceInterval:
 		return validateAgentSourceInterval(value)
 	case KeyAgentSourceRepoURL:

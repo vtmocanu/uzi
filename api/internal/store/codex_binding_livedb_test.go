@@ -706,7 +706,7 @@ func TestSweepClaimedNeverStartedCodexPreservationLiveDB(t *testing.T) {
 		t.Fatalf("GetRunByID(plain before): %v", err)
 	}
 
-	if _, err := q.SweepClaimedNeverStarted(ctx, cutoff); err != nil {
+	if _, err := q.SweepClaimedNeverStarted(ctx, store.SweepClaimedNeverStartedParams{Cutoff: cutoff}); err != nil {
 		t.Fatalf("SweepClaimedNeverStarted: %v", err)
 	}
 
@@ -773,6 +773,53 @@ func TestSweepClaimedNeverStartedCodexPreservationLiveDB(t *testing.T) {
 			if err != nil || persisted.CodexClaimEpoch != epoch || string(persisted.CodexCapHash) != "new-cap" {
 				t.Fatalf("persisted fresh mint: hash=%q epoch=%d err=%v, want (new-cap, 7, nil)", persisted.CodexCapHash, persisted.CodexClaimEpoch, err)
 			}
+		}
+	}
+
+	// Issue #3859: a retained-custody continuation whose flight provably departed is charged by
+	// ChargeClaimedNeverStartedContinuations BEFORE the uncharged sweep above would see it. The
+	// charged arm revokes the capability and bumps the epoch like FrozenRequeue (the departed
+	// flight's capability must not stay replayable) but keeps the claim; the exhausted park
+	// revokes the capability, bumps the epoch and releases the claim.
+	nonce := "departed-" + uuid.NewString()
+	mustExec(ctx, t, pool, `UPDATE workers SET snapshot_register_nonce = $2, snapshot_epoch = 5 WHERE id = $1`, worker, nonce)
+	for i, tc := range []struct {
+		name       string
+		count      int32
+		wantStatus string
+		wantCap    string
+		wantEpoch  int64
+		released   bool
+	}{
+		{"charged", 0, "queued", "", 10, false},
+		{"parked", 1, "recovery_wait", "", 10, true},
+	} {
+		run := insertCodexRun(ctx, t, pool, user, repo, worker, int64(303+i), "claimed", "continuation-"+tc.name)
+		mustExec(ctx, t, pool,
+			`UPDATE runs SET codex_cap_hash = $2, codex_claim_epoch = 9, claimed_at = $3, claim_generation = 2, requeue_count = $4,
+			        snapshot_departed_generation = 2, snapshot_departed_nonce = $5, snapshot_departed_epoch = 5 WHERE id = $1`,
+			run, []byte("live-cap"), old, tc.count, nonce)
+		mustExec(ctx, t, pool,
+			`INSERT INTO recovery_custody_holds (user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity)
+			 VALUES ($1, $2, $3, 1, 'open', $4, 'fixture-identity')`, user, repo, run, worker)
+		rows, err := q.ChargeClaimedNeverStartedContinuations(ctx, store.ChargeClaimedNeverStartedContinuationsParams{Cutoff: cutoff, MaxRequeues: 1})
+		if err != nil {
+			t.Fatalf("%s: ChargeClaimedNeverStartedContinuations: %v", tc.name, err)
+		}
+		found := false
+		for _, r := range rows {
+			found = found || (r.ID == run && r.Status == tc.wantStatus)
+		}
+		if !found {
+			t.Fatalf("%s: charge rows %+v do not report run %s as %s", tc.name, rows, run, tc.wantStatus)
+		}
+		after, err := q.GetRunByID(ctx, run)
+		if err != nil {
+			t.Fatalf("%s: GetRunByID: %v", tc.name, err)
+		}
+		if after.Status != tc.wantStatus || string(after.CodexCapHash) != tc.wantCap || after.CodexClaimEpoch != tc.wantEpoch || after.ClaimReleasedAt.Valid != tc.released {
+			t.Fatalf("%s: status=%q cap=%q epoch=%d released=%v, want (%s, %q, %d, %v)", tc.name,
+				after.Status, after.CodexCapHash, after.CodexClaimEpoch, after.ClaimReleasedAt.Valid, tc.wantStatus, tc.wantCap, tc.wantEpoch, tc.released)
 		}
 	}
 }

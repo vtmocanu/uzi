@@ -60,22 +60,44 @@ func (e overflowEvidence) comparison() pgtype.Float8 {
 	return e.Measured
 }
 
+// Harness creation decision reasons. The overflow reasons apply to an explicit default; the
+// auto_* reasons (#3845) to an unset ("Default · automatic") default, where auto_fallback
+// always keeps Claude.
+const (
+	harnessReasonOff               = "off"
+	harnessReasonPreferred         = "preferred"
+	harnessReasonOverflow          = "overflow"
+	harnessReasonUnknownUsage      = "unknown_usage"
+	harnessReasonExcluded          = "excluded"
+	harnessReasonAutoSoonestReset  = "auto_soonest_reset"
+	harnessReasonAutoOnlyQualified = "auto_only_qualified"
+	harnessReasonAutoFallback      = "auto_fallback"
+)
+
+// harnessDecisionReasons is the closed reason vocabulary of runs.harness_decision_reason. It
+// must equal the set in the runs_harness_decision_shape CHECK; harness_decision_vocab_test.go
+// guards that against the newest migration defining the constraint.
+var harnessDecisionReasons = []string{
+	harnessReasonOff, harnessReasonPreferred, harnessReasonOverflow, harnessReasonUnknownUsage, harnessReasonExcluded,
+	harnessReasonAutoSoonestReset, harnessReasonAutoOnlyQualified, harnessReasonAutoFallback,
+}
+
 func overflowReason(enabled, eligible bool, preferred, other overflowEvidence) string {
 	if !enabled {
-		return "off"
+		return harnessReasonOff
 	}
 	if !eligible {
-		return "excluded"
+		return harnessReasonExcluded
 	}
 	p, o := preferred.comparison(), other.comparison()
 	if !p.Valid || !o.Valid {
-		return "unknown_usage"
+		return harnessReasonUnknownUsage
 	}
 	if other.Destination && !other.Held && p.Float64 < overflowPreferredBelow &&
 		o.Float64 >= overflowOtherAtLeast && o.Float64-p.Float64 >= overflowAdvantageAtLeast {
-		return "overflow"
+		return harnessReasonOverflow
 	}
-	return "preferred"
+	return harnessReasonPreferred
 }
 
 type harnessCreationDecision struct {
@@ -83,10 +105,20 @@ type harnessCreationDecision struct {
 	Reason            string
 	PreferredEvidence overflowEvidence
 	OtherEvidence     overflowEvidence
+
+	// Automatic decisions (#3845): the chosen harness, both sides, their weekly resets (the
+	// record's *_weekly_reset_at) and the instant the decision was made at.
+	Chosen                                 Harness
+	ClaudeSide, CodexSide                  autoSide
+	PreferredWeeklyReset, OtherWeeklyReset *time.Time
+	decidedAt                              time.Time
 }
 
 func (d *harnessCreationDecision) chosen() Harness {
-	if d.Reason != "overflow" {
+	if isAutomaticReason(d.Reason) {
+		return d.Chosen
+	}
+	if d.Reason != harnessReasonOverflow {
 		return d.Preferred
 	}
 	if d.Preferred == HarnessClaude {
@@ -204,10 +236,18 @@ var errHarnessOverflowFence = errors.New("harness overflow decision changed at c
 // evaluateCreationOverflow runs under the shared secret-mutation lock before any
 // run/branch/alias lock. It retains both the exact Codex pick and the alternate
 // resolution so the final fence cannot silently change the selected harness.
-func (s *Service) evaluateCreationOverflow(ctx context.Context, q *store.Queries, userID uuid.UUID, res resolvedHarness, p store.GetHarnessCreationPolicyRow, origin harnessCreationOrigin) (resolvedHarness, *codexPoolPick, error) {
+func (s *Service) evaluateCreationOverflow(ctx context.Context, q *store.Queries, userID uuid.UUID, explicit *Harness, res resolvedHarness, p store.GetHarnessCreationPolicyRow, origin harnessCreationOrigin) (resolvedHarness, *codexPoolPick, error) {
 	d := &harnessCreationDecision{Preferred: res.Harness}
 	res.CreationPolicy = &p
 	res.Decision = d
+	if automaticHarnessEligible(res, explicit, origin, p) {
+		// The overflow toggle is irrelevant here: an unset default has no preferred harness.
+		return s.evaluateAutomaticHarness(ctx, q, userID, res)
+	}
+	if res.DefaultUnset {
+		d.Reason = harnessReasonExcluded
+		return res, nil, nil
+	}
 	eligible := origin.eligible(p)
 	if !p.HarnessOverflowEnabled || !eligible {
 		d.Reason = overflowReason(p.HarnessOverflowEnabled, eligible, overflowEvidence{}, overflowEvidence{})
@@ -220,7 +260,7 @@ func (s *Service) evaluateCreationOverflow(ctx context.Context, q *store.Queries
 	other, err := s.resolveRunHarnessQ(ctx, userID, &otherHarness, q)
 	if err != nil {
 		if errors.Is(err, errNoCredentialForHarness) || errors.Is(err, errNoUsableCredential) || errors.Is(err, errCodexPoolUnavailable) {
-			d.Reason = "excluded"
+			d.Reason = harnessReasonExcluded
 			return res, nil, nil
 		}
 		return res, nil, err
@@ -250,7 +290,7 @@ func (s *Service) evaluateCreationOverflow(ctx context.Context, q *store.Queries
 		if !codexPoolRowStructural(r) && res.Harness == HarnessClaude {
 			// The legacy default resolver still regards this linked account as
 			// usable. An unavailable destination must not fail the Claude run.
-			d.Reason = "excluded"
+			d.Reason = harnessReasonExcluded
 			return res, nil, nil
 		}
 		cs, e := s.scoreCodexCandidates(ctx, q, userID, []store.ListCodexPoolAliasesRow{r}, s.selectionNow())
@@ -293,6 +333,7 @@ func (s *Service) persistHarnessDecision(ctx context.Context, q *store.Queries, 
 		ID: run.ID, UserID: run.UserID, Preferred: string(d.Preferred), Reason: d.Reason,
 		PreferredScore: p.comparison(), OtherScore: o.comparison(), PreferredMeasured: p.Measured, OtherMeasured: o.Measured,
 		PreferredHeld: p.Held, OtherHeld: o.Held,
+		PreferredWeeklyResetAt: timestamptzOf(d.PreferredWeeklyReset), OtherWeeklyResetAt: timestamptzOf(d.OtherWeeklyReset),
 	})
 	if err != nil {
 		return err
@@ -306,6 +347,8 @@ func (s *Service) persistHarnessDecision(ctx context.Context, q *store.Queries, 
 	run.HarnessPreferredMeasured, run.HarnessOtherMeasured = p.Measured, o.Measured
 	run.HarnessPreferredHeld = pgtype.Bool{Bool: p.Held, Valid: true}
 	run.HarnessOtherHeld = pgtype.Bool{Bool: o.Held, Valid: true}
+	run.HarnessPreferredWeeklyResetAt = timestamptzOf(d.PreferredWeeklyReset)
+	run.HarnessOtherWeeklyResetAt = timestamptzOf(d.OtherWeeklyReset)
 	return nil
 }
 

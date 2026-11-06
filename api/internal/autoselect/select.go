@@ -398,7 +398,7 @@ type scored struct {
 // penalized rank; then the lower secret id. A reset at or before now is treated as
 // unknown, since a stale value carries no information about when allowance returns.
 func resetFirstLess(a, b scored, now time.Time) bool {
-	ra, rb := futureReset(a.c.WeeklyResetsAt, now), futureReset(b.c.WeeklyResetsAt, now)
+	ra, rb := FutureWeeklyReset(a.c.WeeklyResetsAt, now), FutureWeeklyReset(b.c.WeeklyResetsAt, now)
 	switch {
 	case (ra != nil) != (rb != nil):
 		return ra != nil
@@ -410,8 +410,8 @@ func resetFirstLess(a, b scored, now time.Time) bool {
 	return compareUUID(a.c.SecretID, b.c.SecretID) < 0
 }
 
-// futureReset returns r when it is strictly after now, else nil.
-func futureReset(r *time.Time, now time.Time) *time.Time {
+// FutureWeeklyReset returns r when it is strictly after now, else nil.
+func FutureWeeklyReset(r *time.Time, now time.Time) *time.Time {
 	if r != nil && r.After(now) {
 		return r
 	}

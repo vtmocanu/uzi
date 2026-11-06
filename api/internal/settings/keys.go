@@ -72,6 +72,9 @@ const (
 	// validated with the PRD #17 model rules) but rides the ISSUE-RUN claim, not the
 	// judge claim. Admin-writable with a compiled-in default.
 	KeySummaryModel = "summary_model"
+	// KeyCodexSummaryModel (PRD #3248) is the instance Codex-lane summary model: a
+	// Codex role id, or "" for the built-in. KeySummaryModel is the Claude lane.
+	KeyCodexSummaryModel = "codex_summary_model"
 	// GitHub Projects v2 Status sync (PRD #364). Instance-wide kill-switch
 	// (text "true"/"false"): OFF until an admin enables it, so the whole sync
 	// feature is a strict no-op on a fresh instance. Admin-writable with a
@@ -363,7 +366,7 @@ const (
 	// lighter and produced per-run (1 intent + 1 plan + one per revise round), so the
 	// fast, near-free model is the right default — unlike the judge, which defaults to
 	// the strong opus because its recommendations feed self-improvement.
-	DefaultSummaryModel = "haiku"
+	DefaultSummaryModel = agenttmpl.DefaultClaudeSummaryModel
 	// PRD #47 run-health defaults (Decision 5). On by default; a fresh instance with
 	// no seeded rows detects health out of the box. The thresholds mirror the table
 	// in the PRD's Solution Overview.
@@ -382,7 +385,7 @@ const (
 	// cache keeps the cached value.
 	DefaultCompletionInterlockRollout = "true"
 	DefaultHealthStallSeconds         = "300"  // 5m of silence (no tool in flight)
-	DefaultHealthToolCallSeconds      = "1200" // 20m: one lead tool call open this long on a quiet run
+	DefaultHealthToolCallSeconds      = "1200" // 20m: open lead tool call or silent delegation on a quiet run
 	DefaultHealthNearTimeoutPct       = "85"   // PRD #1170: flag at 85% of the run's wall-clock budget
 	DefaultHealthQueuedSeconds        = "600"  // 10m stuck queued
 	DefaultHealthApprovalSeconds      = "3600" // 1h idle awaiting approval
@@ -522,7 +525,8 @@ var Defaults = map[string]string{
 	// PRD #362 Decision 8 run-summary model. Same no-seeded-row pattern as the judge
 	// keys: an absent row synthesizes to DefaultSummaryModel ("haiku"), so All/AdminView
 	// surface it to the settings page on every instance and no migration seeds it.
-	KeySummaryModel: DefaultSummaryModel,
+	KeySummaryModel:      DefaultSummaryModel,
+	KeyCodexSummaryModel: agenttmpl.DefaultCodexSummaryModel,
 	// PRD #47 run-health keys. Same no-seeded-row pattern: an absent row synthesizes
 	// to these defaults, so All/AdminView surface them to the settings page and no
 	// migration seeds them.

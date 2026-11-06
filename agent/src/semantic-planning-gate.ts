@@ -18,12 +18,19 @@ const sameBinding = (a: SemanticBinding, b: SemanticBinding) =>
  */
 export class SemanticPlanningGate {
   constructor(private readonly client: WorkerClient, private readonly runId: string,
-    private readonly generation: number, private readonly signal: AbortSignal,
+    private readonly generation: number, private readonly signalSource: AbortSignal | (() => AbortSignal),
     private readonly testTransport?: BoundedCoverageTestTransport) {}
+
+  /** The signal for one public call, resolved once on entry. A provider lets a caller whose
+   * lifecycle controller is replaced (a credential-switch give-up) hand each call the live one. */
+  private currentSignal(): AbortSignal {
+    return typeof this.signalSource === "function" ? this.signalSource() : this.signalSource;
+  }
 
   async compile(structural: PlanCrossCheckCandidate, proposal: SemanticSubmission | undefined,
     sources: readonly unknown[]): Promise<Compiled> {
-    const compiled = await this.client.submitSemanticCandidate(this.runId, this.generation, structural, proposal, sources, this.signal);
+    const signal = this.currentSignal();
+    const compiled = await this.client.submitSemanticCandidate(this.runId, this.generation, structural, proposal, sources, signal);
     if (compiled.plan !== Buffer.from(structural.plan_md).toString("base64")) throw new Error("Foreign semantic plan");
     parseSemanticCandidate(compiled.candidate, { sources: compiled.sources, milestoneIds: structural.milestones.map(m => (m as { id: string }).id) });
     return compiled;
@@ -35,22 +42,23 @@ export class SemanticPlanningGate {
    * coverage call is coverage-unavailable; an owner abort, a malformed or foreign response and a
    * binding mismatch stay fail-closed (rethrown). A provider safety refusal never throws out of
    * review: it settles as an uncertain result, which the server also reports unavailable. */
-  async reviewForGate(compiled: Compiled, plan: string, rawSources: readonly unknown[]):
+  async reviewForGate(compiled: Compiled, plan: string, _rawSources: readonly unknown[]):
     Promise<{ review: PlanContractReviewResult; outcome: SemanticCoverageOutcome }> {
+    const signal = this.currentSignal();
     const { candidate, binding } = compiled;
     let review: PlanContractReviewResult | undefined;
     try {
-      review = await this.review(compiled, plan, rawSources);
+      review = await this.reviewWith(signal, compiled, plan);
     } catch (error) {
-      if (!isCoverageTransportFailure(error, this.signal)) throw error;
+      if (!isCoverageTransportFailure(error, signal)) throw error;
     }
     const unavailable = (): PlanContractReviewResult => ({ outcome: "uncertain", reason: "coverage_unavailable",
       candidate_digest: candidate.digest, report: null, invocations: 0, tokens: 0, elapsed_ms: 0 });
     let status: Awaited<ReturnType<WorkerClient["semanticCoverageStatus"]>>;
     try {
-      status = await this.client.semanticCoverageStatus(this.runId, this.generation, this.signal);
+      status = await this.client.semanticCoverageStatus(this.runId, this.generation, signal);
     } catch (error) {
-      if (!isCoverageTransportFailure(error, this.signal)) throw error;
+      if (!isCoverageTransportFailure(error, signal)) throw error;
       return { review: review ?? unavailable(), outcome: "unavailable" };
     }
     if (status.outcome === "unavailable") return { review: review ?? unavailable(), outcome: "unavailable" };
@@ -62,10 +70,14 @@ export class SemanticPlanningGate {
   }
 
   async review(compiled: Compiled, plan: string, _rawSources: readonly unknown[]): Promise<PlanContractReviewResult> {
+    return this.reviewWith(this.currentSignal(), compiled, plan);
+  }
+
+  private async reviewWith(signal: AbortSignal, compiled: Compiled, plan: string): Promise<PlanContractReviewResult> {
     const { candidate, binding } = compiled;
     if (compiled.plan !== Buffer.from(plan).toString("base64")) throw new Error("Foreign semantic plan");
     const sources = compiled.sources.map(s => semanticSourceCaptureSchema.parse(s));
-    const status = await this.client.semanticCoverageStatus(this.runId, this.generation, this.signal);
+    const status = await this.client.semanticCoverageStatus(this.runId, this.generation, signal);
     if (status.report && sameBinding(status, binding)) {
       const report = validateCoverageReport(JSON.stringify(status.report), candidate, sources, binding);
       const complete = candidate.source_outcome === "complete" &&
@@ -87,7 +99,7 @@ export class SemanticPlanningGate {
           // One UUID per invocation, retained if an HTTP layer retries the request.
           const body = { ...binding, request_id: randomUUID(), ...(reviewId ? { review_id: reviewId } : {}),
             supported: this.testTransport?.kind === "bounded-test" };
-          const reserved = await this.client.reserveSemanticCoverage(this.runId, this.generation, body, this.signal);
+          const reserved = await this.client.reserveSemanticCoverage(this.runId, this.generation, body, signal);
           if (reserved.outcome !== "reserved") return null;
           if (!sameBinding(reserved, binding) || !reserved.review_id || !reserved.invocation_id ||
               reserved.model !== "sonnet" || (reviewId && reserved.review_id !== reviewId))
@@ -107,7 +119,7 @@ export class SemanticPlanningGate {
             deadlineMs: Math.min(Date.parse(reserved.deadline), request.deadlineMs) };
         } catch (error) {
           // An owner pause, credential switch or cancellation keeps its identity for the runner.
-          if (this.signal.aborted || error instanceof CoverageRefusal || isCoverageTransportFailure(error, this.signal)) throw error;
+          if (signal.aborted || error instanceof CoverageRefusal || isCoverageTransportFailure(error, signal)) throw error;
           throw new CoverageRefusal(error instanceof Error ? error.message : "coverage reservation refused", { cause: error });
         } },
         settle: async (reservation: CoverageReservation, usage) => {
@@ -116,7 +128,7 @@ export class SemanticPlanningGate {
           await this.client.settleSemanticCoverage(this.runId, this.generation, {
             review_id: admitted.review_id!, invocation_id: admitted.invocation_id!, status: usage.status,
             ...(!usage.conservative ? { tokens: usage.tokens } : {}),
-          }, this.signal);
+          }, signal);
         },
       },
     });
@@ -124,7 +136,7 @@ export class SemanticPlanningGate {
     if (result.report && last?.review_id && last.invocation_id && result.reason !== "coverage_settlement_failed") {
       await this.client.publishSemanticCoverage(this.runId, this.generation, {
         review_id: last.review_id, invocation_id: last.invocation_id, report: result.report,
-      }, this.signal);
+      }, signal);
     }
     return result;
   }

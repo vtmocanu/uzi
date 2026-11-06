@@ -42,6 +42,7 @@ func TestHarnessOverflowClaimParkPromoteReclaimFrozenLiveDB(t *testing.T) {
 	workerID := env.seedCapableCodexWorker(t, fx.userID)
 	env.exec("UPDATE workers SET anthropic_bind_mode='auto', protocol_capabilities=$2 WHERE id=$1",
 		workerID, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.RecoveryArchiveV1})
+	env.exec(`UPDATE workers SET protocol_capabilities = array_append(protocol_capabilities, 'repo_agent_source_v1') WHERE id = $1`, workerID)
 	w := wkrRow(t, env, workerID)
 	wait := true
 	run, err := svc.CreateRun(env.ctx, fx.userID, fx.repoID, fx.nextIssue(),

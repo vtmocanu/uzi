@@ -263,8 +263,12 @@ func TestClaimCustodyContinuationLiveDB(t *testing.T) {
 	})
 
 	t.Run("never-started requeue loop stops at the per-run bound", func(t *testing.T) {
-		// A claimed run that never reports running is swept back to queued without a hold
-		// release (SweepClaimedNeverStarted); each reclaim opens another generation hold.
+		// f.requeue models an UNCHARGED requeue: a claimed run that never reports running and
+		// whose flight the api never saw depart (no departure witness) is reset by
+		// SweepClaimedNeverStarted without a hold release or a requeue charge, and each reclaim
+		// opens another generation hold. The per-run custody bound is what ends such a loop. A
+		// run whose departure IS witnessed is charged and parked by the sweep instead; see
+		// claimed_never_started_charge_livedb_test.go (issue #3859).
 		f := newCustodyContinuationFixture(t, env)
 		run := f.seedRun("queued", 0)
 		for wantGen := int64(1); wantGen <= testCustodyLimit; wantGen++ {

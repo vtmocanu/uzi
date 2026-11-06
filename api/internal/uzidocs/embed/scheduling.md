@@ -358,8 +358,40 @@ A schedule either **pins** a harness (Claude or Codex) or leaves it
 **unpinned**. Pin it with the modal's **Harness (optional)** picker (shown
 only when you hold a usable credential for both harnesses) or with
 `uzi schedule create/edit --harness claude|codex`; `--harness ""` clears the
-pin. Its default option is "Use my default" — leave it there to resolve the
-harness automatically at fire time.
+pin. The picker sits in the modal's **Where it runs: harness, model & token**
+fieldset, together with the Model, Anthropic token and subagent-model
+controls. The harness, pinned or not, is fixed when the schedule fires
+(a model pin is too; a model left on **Default** is read when a worker
+picks the run up). The harness default option names the source rather
+than guessing:
+
+- `Default · Claude (your default)` or `Default · Codex (your default)` when
+  your default harness is usable.
+- `Default · Claude (your default; may overflow to Codex when it fires)` (or
+  the mirror) when the modal shows that overflow may apply: the overflow
+  setting is on, your default harness and both credentials are usable, the
+  schedule is an issue or sweep schedule, and it carries no harness, model or
+  token pin. The Model default is then neutral (`Default · your worker
+  model`). The server can still decline to overflow, for example when Plan or
+  Code cross-check is on or the issue carries a `harness::` label; see
+  [Overflow to the other harness](./worker-model.md#overflow-to-the-other-harness).
+- `Default · automatic (chosen when it fires)` when you have no usable
+  default, both credentials are usable, and the schedule is an issue or sweep
+  schedule with no harness, model or token pin: the server may then pick the
+  harness by weekly limits (it still uses Claude when Plan or Code
+  cross-check is on, which the modal cannot see).
+- `Default · Claude (no usable default set)` when you have no usable default
+  but the fire cannot choose automatically (a prompt, self-improve or CI-watch
+  schedule, or a model or token pin): both usable resolves to Claude.
+
+The Anthropic token's default option reads `Default · worker's token (worker
+binding)`, and the auto-rework inherit option reads `Default · on (your
+setting)` or `Default · off (your setting)`.
+
+Schedule rows and job catalog cards show a model chip: `model: default`, or
+`model: <value> · pinned` when the schedule pins a model. Rows add `+ agents`
+when the subagent toggle is on. Catalog cards never show a value specific to
+the viewer.
 
 For **automatic issue starts**, exact forge labels `harness::codex` and
 `harness::claude` select the harness from the fresh issue-input capture,
@@ -374,7 +406,7 @@ The precedence inside an issue fire is:
 
 | Fresh issue labels | Schedule harness pin | Result |
 |---|---|---|
-| No `harness::*` label | None | Existing automatic resolution (D11): usable user default, otherwise a usable harness, Claude if both. |
+| No `harness::*` label | None | Existing automatic resolution (D11): usable user default; otherwise your only usable harness; with both usable and no default, [chosen by weekly limits](./rate-limits.md#how-the-automatic-default-picks-a-harness) for an eligible run and Claude otherwise. |
 | No `harness::*` label | Claude or Codex | Use the stored pin, without cross-harness fallback. |
 | Exactly `harness::claude` or `harness::codex` | None | Explicitly select that harness, without credential fallback to the other. |
 | One recognized label | Matching pin | Use the pin. |

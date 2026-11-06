@@ -76,8 +76,9 @@ type Settings interface {
 	HealthEnabled(ctx context.Context) (bool, error)
 	HealthStallSeconds(ctx context.Context) (int, error)
 	// HealthToolCallSeconds is how long the oldest open lead tool call may stay in
-	// flight on a quiet run before it is flagged stalled (issue #2046). 0 disables
-	// the long-tool-call arm.
+	// flight on a quiet run before it is flagged stalled (issue #2046). It is also,
+	// together with the stall threshold, the silence threshold for an open delegation
+	// (issue #3950). 0 disables both arms.
 	HealthToolCallSeconds(ctx context.Context) (int, error)
 	HealthNearTimeoutPct(ctx context.Context) (int, error)
 	HealthQueuedSeconds(ctx context.Context) (int, error)
@@ -216,6 +217,7 @@ const (
 	// required_capabilities and the capability-aware kill-switch, so an all-old-image fleet
 	// leaves the run queued until a worker that enforces the guard comes online.
 	reasonNoCIConfigGuardCapableWorker      = "no online worker enforces the CI-config push guard (ci_config_guard_v1); provision a capable worker"
+	reasonNoRepoAgentSourceCapableWorker    = "no online worker reads repo agents at a recorded default-branch revision (repo_agent_source_v1); upgrade a worker"
 	reasonNoAgentSourceRequestCapableWorker = "no online worker honours the run's requested agent source (agent_source_request_v1); upgrade a worker"
 	// reasonNoCodexCapableWorker (PRD #1332 M5A, D3) is emitted for a CODEX-INDICATING queued run
 	// (harness='codex', or a surviving M1 binding sentinel) whose owner has NO online worker
@@ -353,6 +355,12 @@ const (
 	// CHECK-constrained, so no migration. Same fixed-string contract as its siblings: no tool
 	// name, no tool input, no live duration.
 	reasonLongToolCall = "a tool call has been in progress longer than the configured threshold"
+	// reasonSilentDelegation (issue #3950) flags a running run with an open lead delegation
+	// dispatch (Agent / Task tool_use without a result) whose whole run has been quiet for
+	// max(health_tool_call_seconds, health_stall_seconds). It maps to healthStalled, advisory
+	// only. runs.health_reason is free text, so no migration. Same fixed-string contract as
+	// its siblings: no tool name, no tool input, no live duration.
+	reasonSilentDelegation = "a delegated subagent has sent no updates for longer than the configured threshold"
 )
 
 // pendingOutcomeFlagHeartbeats (issue #1994) is how many worker heartbeat intervals a pending
@@ -711,8 +719,8 @@ type liveCodeCrossCheckReader interface {
 }
 
 // runningTarget computes the flag for a running run, priority persist-looping >
-// tool-looping > live plan cross-check > live code cross-check > stalled > long tool call > near-timeout (Decision 3, extended by
-// PRD #108 M4, #1170 D5 and issue #2046): looping is the strongest evidence of
+// tool-looping > live plan cross-check > live code cross-check > stalled > long tool call > silent delegation > near-timeout
+// (Decision 3, extended by PRD #108 M4, #1170 D5, issue #2046 and issue #3950): looping is the strongest evidence of
 // pathology, and near-timeout is a budget-relative backstop that must not mask a
 // more specific signal.
 func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds) (string, string) {
@@ -833,8 +841,9 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 	// flight (Decision 9, lead lane only since issue #1394; see leadInFlight). A long
 	// build/test-suite emits one tool_use then nothing until its result — that is
 	// working, not stalled; the same holds for an open parent `Agent` dispatch whose
-	// subagent is still working. A pathological single call is covered by the
-	// long-tool-call arm below (issue #2046), then by the wall-clock slow signal.
+	// subagent is still working, but one that has gone silent is covered by the
+	// silent-delegation arm below (issue #3950). A pathological single call is covered by
+	// the long-tool-call arm below (issue #2046), then by the wall-clock slow signal.
 	if th.stall > 0 && !stats.inFlight {
 		if base := stallBaseline(r); !base.IsZero() && now.Sub(base) >= th.stall {
 			// The silence may be an api outage, not a stall (see outboxQueuedForOwner).
@@ -851,14 +860,18 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 	// until the wall clock killed it; this arm is mutually exclusive with it (it needs an
 	// unmatched non-empty-id use, which is inFlight by definition).
 	//
-	// Delegation dispatches (Agent / Task) are excluded twice. (i) One visible in the tail
-	// skips the arm outright: a parent dispatch is legitimately open for as long as its
-	// subagent works. (ii) One older than the leadToolWindowFetch-row tail is invisible
+	// Delegation dispatches (Agent / Task) stay excluded from THIS arm. (i) One visible in
+	// the tail skips the arm outright and is handled by the silent-delegation arm below
+	// (issue #3950). (ii) One older than the leadToolWindowFetch-row tail is invisible
 	// here, so the quiet guard covers it: every nested subagent frame bumps
 	// runs.last_activity_at (AppendMessages), so a streaming delegation keeps the run
-	// below the quiet window and this arm cannot fire. Guarantee, stated honestly: an
-	// emitting delegation is never flagged; a delegation outside the tail whose subagent
-	// has gone quiet can be.
+	// below the quiet window and this arm cannot fire. Limits, stated honestly: a
+	// delegation that has dropped out of the tail is caught only by plain stalled (when no
+	// other lead call is open in the tail), by this arm once another open ordinary call in
+	// the tail reaches the threshold, or by the silent-delegation arm when another delegation is open in the
+	// tail; a still-streaming sibling delegation masks a silent one (the measure is
+	// run-level silence); batches made only of progress_note / summary_usage frames do not
+	// bump last_activity_at (quiet_activity, PRD #2603), so they count as silence.
 	//
 	// The quiet window is health_stall_seconds, the same "quiet" the stalled flag means,
 	// so Slack's "gone quiet" head and the amber lane dot stay truthful; with stall
@@ -877,6 +890,23 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 				return healthStalled, reasonOutboxQueued
 			}
 			return healthStalled, reasonLongToolCall
+		}
+	}
+
+	// silent delegation (issue #3950): an open lead Agent / Task dispatch suppresses the
+	// stalled arm (inFlight) and the long-call arm (!delegationOpen), so a run silent behind
+	// a delegation was invisible. This arm measures run-level silence via stallBaseline with
+	// threshold max(health_tool_call_seconds, health_stall_seconds). It is mutually exclusive
+	// with stalled (needs !inFlight; delegationOpen implies inFlight) and with the long-call
+	// arm (needs !delegationOpen), and fires whether or not an ordinary lead call is also
+	// open. Advisory only: it never touches the lease or the run status.
+	if th.toolCall > 0 && stats.delegationOpen {
+		quiet := max(th.toolCall, th.stall)
+		if base := stallBaseline(r); !base.IsZero() && now.Sub(base) >= quiet {
+			if s.outboxQueuedForOwner(r) {
+				return healthStalled, reasonOutboxQueued
+			}
+			return healthStalled, reasonSilentDelegation
 		}
 	}
 
@@ -925,7 +955,7 @@ type toolWindowStats struct {
 	inFlight bool
 	// delegationOpen is true when an unmatched lead tool_use in the window is a
 	// delegation dispatch (delegationToolNames); the long-tool-call arm skips then
-	// (issue #2046).
+	// (issue #2046) and the silent-delegation arm applies instead (issue #3950).
 	delegationOpen bool
 	// oldestOpen is the created_at of the OLDEST unmatched non-delegation lead
 	// tool_use with a non-empty id and a valid created_at; zero when there is none.
@@ -1083,7 +1113,8 @@ func analyzeToolWindow(rows []store.ListRunToolWindowRow) bool {
 // wall-clock limit (SweepRunningTimeout). Codex emits `init` once per claim leg,
 // not once per internal provider epoch, so the leg is the granularity here.
 //
-// Issue #2046 reuses the same single scan for the long-tool-call arm: of the unmatched
+// Issue #2046 reuses the same single scan for the long-tool-call arm (and issue #3950
+// for the silent-delegation arm): of the unmatched
 // uses it also reports whether any is a delegation dispatch and the created_at of the
 // oldest unmatched non-delegation one (see leadWindowStats).
 func leadInFlight(rows []store.ListRunLeadToolWindowRow) bool {
@@ -1092,7 +1123,8 @@ func leadInFlight(rows []store.ListRunLeadToolWindowRow) bool {
 
 // delegationToolNames are the lead tool names that dispatch a subagent: "Agent" (Claude
 // SDK, and the Codex DISPATCH_TOOL_NAME in agent/src/codex/codex-harness.ts) and "Task"
-// (the legacy SDK alias). Such a call is legitimately open as long as its subagent works.
+// (the legacy SDK alias). Such a call is legitimately open while its subagent works, but
+// is flagged once the run goes silent past the threshold (issue #3950).
 var delegationToolNames = map[string]bool{"Agent": true, "Task": true}
 
 // leadWindowStats is analyzeLeadWindow's result.
@@ -1107,7 +1139,7 @@ type leadWindowStats struct {
 
 // analyzeLeadWindow is the one scan behind leadInFlight (same boundary rule, see
 // there) that also reports the delegation / oldest-open facts the long-tool-call arm
-// needs.
+// (issue #2046) and the silent-delegation arm (issue #3950) need.
 func analyzeLeadWindow(rows []store.ListRunLeadToolWindowRow) leadWindowStats {
 	type openUse struct {
 		id      string
@@ -1447,6 +1479,18 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 			slog.Error("health: count online workers satisfying CI-config guard", "run_id", r.ID, "error", gerr)
 		} else if g == 0 {
 			return reasonNoCIConfigGuardCapableWorker
+		}
+	}
+	if r.RepoAgentSourceRequired || r.RepoAgentSourceCommit.Valid {
+		if q, ok := s.q.(interface {
+			CountOnlineWorkersSatisfyingRepoAgentSource(context.Context, uuid.UUID) (int64, error)
+		}); ok {
+			n, err := q.CountOnlineWorkersSatisfyingRepoAgentSource(ctx, r.UserID)
+			if err != nil {
+				slog.Error("health: count repo agent source capable workers", "run_id", r.ID, "error", err)
+			} else if n == 0 {
+				return reasonNoRepoAgentSourceCapableWorker
+			}
 		}
 	}
 	if r.AgentSourceRequested.Valid {

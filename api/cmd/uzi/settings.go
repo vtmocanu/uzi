@@ -45,7 +45,8 @@ func newSettingsCmd(env Env, gf *globalFlags) *cobra.Command {
 			p.Println(settingsReserveLine(settings))
 			// Issue #3719: how new Codex runs choose a login.
 			p.Println(settingsCodexModeLine(settings))
-			p.Println(harnessOverflowLine(settings.HarnessOverflowEnabled))
+			p.Println(settingsDefaultHarnessLine(settings.DefaultHarness))
+			p.Println(harnessOverflowLine(settings.HarnessOverflowEnabled, settings.DefaultHarness))
 			return nil
 		},
 	})
@@ -53,6 +54,14 @@ func newSettingsCmd(env Env, gf *globalFlags) *cobra.Command {
 	cmd.AddCommand(newSettingsCodexModeCmd(env, gf))
 	cmd.AddCommand(newSettingsHarnessOverflowCmd(env, gf))
 	return cmd
+}
+
+// settingsDefaultHarnessLine renders the per-user default harness; nil is automatic.
+func settingsDefaultHarnessLine(h *string) string {
+	if h == nil {
+		return "Default harness: automatic (chosen per run by weekly limits when both harnesses are usable)"
+	}
+	return "Default harness: " + cellText(*h)
 }
 
 func settingsCrossCheckRows(s apitypes.UserSettingsDTO) [][]string {

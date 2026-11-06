@@ -120,8 +120,8 @@ func newSeededPlanFixture(ctx context.Context, t *testing.T) seededPlanFixture {
 	wkrID := uuid.New()
 	tokenHash := uuid.New()
 	mustExecT(ctx, t, pool, `INSERT INTO workers (id, user_id, name, token_hash, status, protocol_capabilities) VALUES ($1, $2, 'seed-worker', $3, 'online', $4)`,
-		wkrID, f.owner, tokenHash[:], []string{capability.AgentSourceRequestV1})
-	f.wkr = store.Worker{ID: wkrID, UserID: f.owner}
+		wkrID, f.owner, tokenHash[:], []string{capability.RepoAgentSourceV1, capability.AgentSourceRequestV1})
+	f.wkr = store.Worker{ID: wkrID, UserID: f.owner, ProtocolCapabilities: []string{capability.RepoAgentSourceV1, capability.AgentSourceRequestV1}}
 	return f
 }
 

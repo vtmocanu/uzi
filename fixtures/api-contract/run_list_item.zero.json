@@ -107,6 +107,7 @@
   "updated_at": "0001-01-01T00:00:00Z",
   "status_since": null,
   "repo_agents": null,
+  "repo_agent_source_commit": null,
   "agent_source": null,
   "agent_exclusions": null,
   "agent_source_requested": null,

@@ -38,6 +38,12 @@ import {
 import { hasAnthropicToken, isCodexUsable } from "../lib/hasToken";
 import { TokenPicker } from "./TokenPicker";
 import { HarnessPicker } from "./HarnessPicker";
+import {
+  harnessInheritLabel,
+  modelDefaultLabel,
+  mrReworkInheritLabel,
+  type ExecutionLabelInput,
+} from "../lib/scheduleExecutionLabels";
 import { useAuth } from "../auth/AuthContext";
 import {
   Alert,
@@ -372,6 +378,15 @@ export function ScheduleModal({
   // Issue #3719: the owner's codex_account_mode, from the same settings read, so the
   // Codex-usability gate applies the pool rule when the owner picks automatically.
   const [ownerCodexMode, setOwnerCodexMode] = useState<string | undefined>(undefined);
+  // Label-only facts from the same settings read (never sent): they only word the
+  // "Default" options. `loaded` stays false when the read fails.
+  const [ownerLabels, setOwnerLabels] = useState<{
+    loaded: boolean;
+    overflowEnabled: boolean;
+    mrRework: boolean | null | undefined;
+    claudeModel: string | null | undefined;
+    codexModel: string | null | undefined;
+  }>({ loaded: false, overflowEnabled: false, mrRework: undefined, claudeModel: undefined, codexModel: undefined });
   const [credentialSel, setCredentialSel] = useState<CredentialSelection>(
     selectionFromOverride(editing?.credential_override, []),
   );
@@ -386,6 +401,13 @@ export function ScheduleModal({
         setAllSecrets(secrets);
         setOwnerDefaultHarness(settings.default_harness);
         setOwnerCodexMode(settings.codex_account_mode);
+        setOwnerLabels({
+          loaded: true,
+          overflowEnabled: settings.harness_overflow_enabled === true,
+          mrRework: settings.mr_rework_enabled,
+          claudeModel: settings.default_claude_model,
+          codexModel: settings.default_codex_model,
+        });
         const anthropic = secrets.filter((s) => s.kind === "anthropic_token");
         setTokens(anthropic);
         // Re-seed to resolve a pinned label→id now that the list is known — unless the
@@ -453,6 +475,20 @@ export function ScheduleModal({
     : harnessSel === "inherit"
       ? undefined
       : harnessSel;
+  // Label-only inputs for the "Default" option text. Never feeds a payload, the token
+  // gate (scheduleStartsOnCodex) or the model vocabulary (scheduleModelHarness).
+  const execLabels: ExecutionLabelInput = {
+    target,
+    harnessSel,
+    model,
+    credentialMode: credentialSel.mode,
+    claudeUsable: claudeUsableForHarness,
+    codexUsable: codexUsableForHarness,
+    ownerDefaultHarness,
+    overflowEnabled: ownerLabels.overflowEnabled,
+    defaultClaudeModel: ownerLabels.claudeModel,
+    defaultCodexModel: ownerLabels.codexModel,
+  };
   // PRD #929 M1: per-schedule output mode for prompt-target schedules. "" = inherit the
   // catalog/job default; "mr" opens a merge request from an idea file, "issues" files issues.
   const [outputMode, setOutputMode] = useState<string>(
@@ -1380,97 +1416,104 @@ export function ScheduleModal({
             </div>
           </details>
 
-          {/* PRD #1429 M4a: per-schedule harness pin, shown ONLY when the caller has a
-              usable credential for BOTH harnesses (D2) — a single-harness user never
-              sees a redundant picker. Placed ahead of Model: the model vocabulary below
-              is scoped to whichever harness is picked here. Allowed on every target
-              including self_improve — a pin is a selection, not a per-run credential
-              override. */}
-          {showHarnessPicker && (
-            <Field label="Harness (optional)" htmlFor="sched-harness">
-              <HarnessPicker id="sched-harness" label="Harness for this schedule" value={harnessSel} onChange={onHarnessChange} />
-              <p className="mt-1 text-[11px] text-faint">
-                Runs fired by this schedule use this harness, frozen at fire time. Leave on
-                &ldquo;Use my default&rdquo; to resolve it automatically.
-              </p>
-            </Field>
-          )}
-
-          {/* Model override — shown for ALL targets (unlike guidance), in the common area.
-              The vocabulary follows the EFFECTIVE harness, like the token picker below: an
-              "inherit" pin that will resolve to Codex must offer Codex models, or the pick
-              is accepted by the API and then dropped at claim (D6 fallback). */}
-          <Field label="Model (optional)" htmlFor="sched-model">
-            <ModelSelect
-              id="sched-model"
-              value={model}
-              onChange={setModel}
-              harness={scheduleModelHarness}
-              defaultLabel={
-                scheduleModelHarness === "claude"
-                  ? "Default · your Claude worker model"
-                  : scheduleModelHarness === "codex"
-                    ? "Default · your Codex worker model"
-                    : "Default · your worker model"
-              }
-            />
-            <p className="mt-1 text-[11px] text-faint">
-              Runs fired by this schedule use this model on every target. Leave on Default to use
-              your worker model for this schedule's harness (Settings → Run defaults → Harness and
-              worker models).
-            </p>
-          </Field>
-          {modelWarning && <Alert message={modelWarning} tone="warning" />}
-
-          {/* PRD #1247 M6/M7: per-schedule Anthropic credential override, beside the model.
-              HIDDEN for self_improve (that lane 409s an explicit override) and for a schedule
-              that will EFFECTIVELY fire on Codex — an explicit pin, OR (M4a review fix) a
-              Codex-only owner whose picker is hidden but who WILL resolve to Codex implicitly
-              (a Codex run spends a Codex credential, never an Anthropic one — PRD #1429
-              M4a) — each with a note in its place, so the modal never sends an override in
-              either case. Inherit follows the worker binding. */}
-          {target === "self_improve" ? (
+          {/* Where it runs: harness, model and token read as one group so the Default
+              options and their help can be read together. Payloads are unchanged. */}
+          <fieldset className="space-y-3 rounded-xl border border-edge p-4">
+            <legend className="px-1.5 text-[13px] font-semibold">Where it runs: harness, model &amp; token</legend>
             <p className="text-[11px] text-faint">
-              Self-improvement runs always use your worker&rsquo;s token — no per-schedule override.
+              Leave a field on Default to follow Settings. Harness is fixed when the schedule fires.
+              A model pin is fixed when it fires; Default is read when a worker picks the run up.
             </p>
-          ) : scheduleStartsOnCodex ? (
-            <p className="text-[11px] text-faint">
-              This schedule fires on Codex — it spends a Codex credential, not an Anthropic
-              token.
-            </p>
-          ) : (
-            <Field label="Anthropic token (optional)" htmlFor="sched-token">
-              <TokenPicker
-                id="sched-token"
-                label="Anthropic token for this schedule"
-                value={credentialSel}
-                onChange={onCredentialChange}
-                tokens={tokens}
+
+            {/* PRD #1429 M4a: per-schedule harness pin, shown ONLY when the caller has a
+                usable credential for BOTH harnesses (D2) — a single-harness user never
+                sees a redundant picker. Placed ahead of Model: the model vocabulary below
+                is scoped to whichever harness is picked here. Allowed on every target
+                including self_improve — a pin is a selection, not a per-run credential
+                override. */}
+            {showHarnessPicker && (
+              <Field label="Harness (optional)" htmlFor="sched-harness">
+                <HarnessPicker
+                  id="sched-harness"
+                  label="Harness for this schedule"
+                  value={harnessSel}
+                  onChange={onHarnessChange}
+                  inheritLabel={harnessInheritLabel(execLabels)}
+                />
+                <p className="mt-1 text-[11px] text-faint">Fixed when the schedule fires.</p>
+              </Field>
+            )}
+
+            {/* Model override — shown for ALL targets (unlike guidance), in the common area.
+                The vocabulary follows the EFFECTIVE harness, like the token picker below: an
+                "inherit" pin that will resolve to Codex must offer Codex models, or the pick
+                is accepted by the API and then dropped at claim (D6 fallback). */}
+            <Field label="Model (optional)" htmlFor="sched-model">
+              <ModelSelect
+                id="sched-model"
+                value={model}
+                onChange={setModel}
+                harness={scheduleModelHarness}
+                defaultLabel={modelDefaultLabel(execLabels)}
               />
               <p className="mt-1 text-[11px] text-faint">
-                Runs fired by this schedule spend this token. Leave on Inherit to follow the
-                worker&rsquo;s binding.
+                A pin is fixed when the schedule fires; Default is read when a worker picks the run up.
               </p>
             </Field>
-          )}
+            {modelWarning && <Alert message={modelWarning} tone="warning" />}
 
-          {/* PRD #305: apply the run model to every subagent. Always enabled — first-class
-              on Inherit (the applied model is the same one the lead resolves). Editable on a
-              catalog default too (issue #691): the server now accepts it on a default patch,
-              so it is a first-class run option on every schedule. */}
-          <div className="flex items-start gap-3">
-            <Toggle
-              checked={overrideSubagentModel}
-              onChange={setOverrideSubagentModel}
-              label="Apply model also to agents"
-            />
-            <span className="text-[13px] text-fg">
-              Apply model also to agents
-              <span className="block text-[11px] text-faint">
-                Subagents run on the same model as the lead — overrides each agent's own model.
+            {/* PRD #1247 M6/M7: per-schedule Anthropic credential override, beside the model.
+                HIDDEN for self_improve (that lane 409s an explicit override) and for a schedule
+                that will EFFECTIVELY fire on Codex — an explicit pin, OR (M4a review fix) a
+                Codex-only owner whose picker is hidden but who WILL resolve to Codex implicitly
+                (a Codex run spends a Codex credential, never an Anthropic one — PRD #1429
+                M4a) — each with a note in its place, so the modal never sends an override in
+                either case. Inherit follows the worker binding. */}
+            {target === "self_improve" ? (
+              <p className="text-[11px] text-faint">
+                Self-improvement runs always use your worker&rsquo;s token — no per-schedule override.
+              </p>
+            ) : scheduleStartsOnCodex ? (
+              <p className="text-[11px] text-faint">
+                This schedule fires on Codex — it spends a Codex credential, not an Anthropic
+                token.
+              </p>
+            ) : (
+              <Field label="Anthropic token (optional)" htmlFor="sched-token">
+                <TokenPicker
+                  id="sched-token"
+                  label="Anthropic token for this schedule"
+                  value={credentialSel}
+                  onChange={onCredentialChange}
+                  tokens={tokens}
+                  inheritLabel="Default · worker's token (worker binding)"
+                />
+                <p className="mt-1 text-[11px] text-faint">
+                  Runs fired by this schedule spend this token. Leave on Default to follow the
+                  worker&rsquo;s binding.
+                </p>
+              </Field>
+            )}
+
+            {/* PRD #305: apply the run model to every subagent. Always enabled — first-class
+                on Default (the applied model is the same one the lead resolves). Editable on a
+                catalog default too (issue #691): the server now accepts it on a default patch,
+                so it is a first-class run option on every schedule. */}
+            <div className="flex items-start gap-3">
+              <Toggle
+                checked={overrideSubagentModel}
+                onChange={setOverrideSubagentModel}
+                label="Use the run's resolved model for subagents too"
+              />
+              <span className="text-[13px] text-fg">
+                Use the run&rsquo;s resolved model for subagents too
+                <span className="block text-[11px] text-faint">
+                  On: overrides every subagent&rsquo;s own model pin. Off: subagents with their own pin keep it;
+                  the rest follow the lead. Effort is not changed.
+                </span>
               </span>
-            </span>
-          </div>
+            </div>
+          </fieldset>
 
           {/* Options */}
           <div className="space-y-3">
@@ -1497,12 +1540,12 @@ export function ScheduleModal({
                   )
                 }
               >
-                <option value="inherit">Inherit (use my default)</option>
+                <option value="inherit">{mrReworkInheritLabel(ownerLabels.loaded, ownerLabels.mrRework)}</option>
                 <option value="on">On</option>
                 <option value="off">Off</option>
               </Select>
               <p className="mt-1 text-[11px] text-faint">
-                Auto-rework this schedule's MRs when reviewers leave comments. Inherit follows your account default.
+                Auto-rework this schedule's MRs when reviewers leave comments. Default follows your account setting.
               </p>
             </Field>
             {/* A self_improve run is always auto-approved (the server forces auto_approve=true),

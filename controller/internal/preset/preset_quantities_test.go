@@ -13,11 +13,12 @@ func TestResolveReturnsTheApprovedQuantitiesPerPreset(t *testing.T) {
 		size                     string
 		cpuReq, cpuLim           string
 		memReq, memLim, dataSize string
+		dindDataSize             string
 	}{
-		{"s", "250m", "1", "2Gi", "4Gi", "5Gi"},
-		{"m", "1", "4", "8Gi", "12Gi", "25Gi"},
-		{"l", "1", "4", "14Gi", "20Gi", "50Gi"},
-		{"l-highmem", "1", "4", "24Gi", "32Gi", "50Gi"},
+		{"s", "250m", "1", "2Gi", "4Gi", "5Gi", "20Gi"},
+		{"m", "1", "4", "8Gi", "12Gi", "25Gi", "20Gi"},
+		{"l", "1", "4", "14Gi", "20Gi", "50Gi", "50Gi"},
+		{"l-highmem", "1", "4", "24Gi", "32Gi", "50Gi", "50Gi"},
 	} {
 		spec, err := r.Resolve("base", tc.size)
 		if err != nil {
@@ -30,6 +31,7 @@ func TestResolveReturnsTheApprovedQuantitiesPerPreset(t *testing.T) {
 			"MemoryRequest": {got.MemoryRequest.String(), tc.memReq},
 			"MemoryLimit":   {got.MemoryLimit.String(), tc.memLim},
 			"DataSize":      {got.DataSize.String(), tc.dataSize},
+			"DinDDataSize":  {got.DinDDataSize.String(), tc.dindDataSize},
 		} {
 			if pair[0] != pair[1] {
 				t.Errorf("size %q %s = %s, want %s", tc.size, field, pair[0], pair[1])

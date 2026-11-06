@@ -17,7 +17,8 @@ Both settings live together in one **Settings → Run defaults** card:
 
 - A **default harness** picker, shown only when you have a usable credential
   for both Claude and Codex. It decides which harness a run uses when
-  nothing else names one, subject to the optional creation-time overflow below.
+  nothing else names one. With an explicit default it is subject to the
+  optional creation-time overflow below.
 - One **model lane per usable harness**: Anthropic and Codex side by side
   when both are usable, or a single lane when only one is. With no usable
   credential yet, the card still shows the Claude lane so you can
@@ -27,9 +28,17 @@ Each picker's empty option is a **Default · …** label naming where the value
 comes from: the Claude model picker reads `Default · lead template` (the
 `lead` template's model) and the Codex model picker reads
 `Default · gpt-6.1-sol (built-in)`. The harness picker's empty option reads
-`Default · automatic`: uzi picks your only usable harness, or Claude when both
-are usable. Schedules and the start-run form still say **Use my default** for
-the harness.
+`Default · automatic`: uzi picks your only usable harness, or, when both are
+usable, chooses by weekly limits for eligible new issue runs (started
+manually, by autopilot or by a schedule, with no explicit harness or issue
+harness label, model pin, Anthropic credential override or Plan/Code
+cross-check; other runs keep the usual resolution: an explicit harness, else
+Claude). It picks the harness whose weekly allowance
+resets soonest, falling back to Claude when usage is unknown; see [How the
+automatic default picks a harness](./rate-limits.md#how-the-automatic-default-picks-a-harness).
+The start-run form still says **Use my default** for the harness; the
+schedule modal names the source instead (see [Which harness a schedule runs
+on](./scheduling.md#which-harness-a-schedule-runs-on)).
 
 Switching the default harness never clears either model. Each lane is its
 own retained preference, so alternating between Claude and Codex keeps both
@@ -45,6 +54,10 @@ In **Settings → Run defaults**, turn on **Overflow to the other harness when m
 This per-user boolean is off by default and saves automatically, separately
 from **Save defaults**. The CLI equivalent is
 `uzi settings harness-overflow on|off`; `uzi settings get` reads it back.
+Overflow applies only when your default harness is an explicit Claude or
+Codex. With **Default · automatic** the toggle has no effect: the card
+disables it with an explanation, and the CLI prints `(inactive: default
+harness is automatic)`.
 
 Overflow applies at creation to **new issue runs** started manually, by
 autopilot or by a schedule, when both harnesses are usable and the harness
@@ -64,14 +77,17 @@ The harness and creation explanation are frozen atomically. Existing runs,
 including resumes and usage-limit parks, never switch harness through
 overflow. The owner's run page, `uzi run get <id>` (human and `--json`) and
 TUI detail rail show the stored preferred/chosen harness, reason, comparison
-scores, measured headroom and holds. This is creation-time evidence, not
+scores, measured headroom and holds (and, for an automatic choice, the weekly
+resets compared). This is creation-time evidence, not
 live usage; legacy or unavailable evidence reads **not recorded**.
 
 ## Model precedence
 
 For a given run, uzi resolves the harness first (an explicit run/schedule
 choice, then your default harness, then whichever harness you have a
-credential for, with eligible overflow applied at creation), and only then
+credential for; with an explicit default, eligible overflow is applied at
+creation, and with **Default · automatic** and both harnesses usable, the
+harness is chosen by weekly limits), and only then
 reads that harness's model lane:
 
 1. The **schedule's model**, if the run was started by a
@@ -159,20 +175,31 @@ nightly "propose a feature" run on `fable`) while your interactive runs
 stay on your normal model.
 
 Set it in the schedule's create/edit form, in the **Model (optional)**
-control, or with `uzi schedule create --model <alias|id>`. Leaving it on
-**Default** uses your worker model for the schedule's harness; the label
-names it, for example `Default · your Claude worker model`, `Default · your
-Codex worker model` or `Default · your worker model` when the harness is not
-pinned. The schedule field accepts a single token of at most 100
+control, or with `uzi schedule create --model <alias|id>`. The modal groups
+Harness, Model, Anthropic token and the subagent toggle in a **Where it runs:
+harness, model & token** fieldset. A model pin is fixed when the schedule
+fires; **Default** is read later, when a worker picks the run up. Leaving it
+on **Default** uses your worker model for the schedule's harness, and the
+label names the source rather than guessing. When your saved per-harness
+worker model is known it is shown, for example `Default · opus (your Claude
+default)`; otherwise it reads `Default · your Claude worker model` or
+`Default · your Codex worker model`. It reads `Default · your worker model`
+when the harness is not determined: automatic selection, or a schedule that
+may overflow to the other harness when it fires (see [Which harness a
+schedule runs on](./scheduling.md#which-harness-a-schedule-runs-on)). The
+schedule field accepts a single token of at most 100
 characters; blank means Default. The Codex schedule picker remains curated;
 the custom Codex worker-root escape hatch does not extend to schedule pins.
 The frozen model is readable with `uzi run get <id> --field model` (or in
 `uzi run get <id> --json`); to see the model a run actually used, see [See
 which model a run used](#see-which-model-a-run-used).
 
-Tick **"Apply model also to agents"** (or pass `uzi schedule create
---apply-model-to-agents`) to make the schedule's model apply to every
-subagent too, not just the lead. This is useful for a cheap recurring bot
+Tick **"Use the run's resolved model for subagents too"** (or pass `uzi
+schedule create --apply-model-to-agents`; the flag name is unchanged) to
+make the run's resolved model apply to every subagent too, not just the
+lead, overriding each subagent's own model pin. With it off, a subagent
+that has its own pin keeps it and the rest follow the lead. Reasoning effort
+is not changed either way. This is useful for a cheap recurring bot
 whose subagents would otherwise run on their own pinned (and pricier) models.
 Whether a given run applied the model fleet-wide is readable with `uzi run
 get <id> --field override_subagent_model` (or `uzi run get <id> --json`).

@@ -97,7 +97,17 @@ function Quiet({ state, word }: { state: string; word: string }) {
   );
 }
 
-export function RunProgressCell({ run, now }: { run: ProgressRun; now?: number }) {
+// `subject` names who a waiting run waits on: the viewer ("you", the default) or, on an
+// admin's list of another user's runs, the run's owner.
+export function RunProgressCell({
+  run,
+  now,
+  subject = "you",
+}: {
+  run: ProgressRun;
+  now?: number;
+  subject?: "you" | "owner";
+}) {
   const p = run.progress;
   if (!p) return null;
   const clock = now ?? Date.now();
@@ -111,16 +121,17 @@ export function RunProgressCell({ run, now }: { run: ProgressRun; now?: number }
     case "waiting": {
       const reason = waitReason(run.status);
       const at = formatLocalTime(run.status_since);
-      const action = WAIT_ACTIONS[run.status];
+      const owner = subject === "owner";
+      const action = WAIT_ACTIONS[run.status]?.replace("your", owner ? "the owner's" : "your");
       const title =
         action && at
           ? `Waiting for ${action} since ${at}.`
-          : "This run is waiting on you: a plan approval, a question or a follow-up.";
+          : `This run is waiting on ${owner ? "its owner" : "you"}: a plan approval, a question or a follow-up.`;
       return (
         <span data-run-progress="waiting" className="inline-flex">
           <Badge tone="warning" dot title={title}>
             <span>
-              waits on you{reason && ` · ${reason}`}
+              waits on {owner ? "owner" : "you"}{reason && ` · ${reason}`}
               <Since iso={run.status_since} clock={clock} />
             </span>
           </Badge>

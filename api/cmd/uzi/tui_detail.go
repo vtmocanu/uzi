@@ -780,7 +780,7 @@ func joinTags(sep string, parts ...string) string {
 func (m tuiModel) detailHeaderLines() []string {
 	d := &m.detail
 
-	crumb := m.pal.faint.Render("‹ floor") + m.pal.faint.Render("  run ") + m.pal.title.Render(shortRunID(d.runID))
+	crumb := m.pal.faint.Render("‹ floor") + m.pal.faint.Render("  run ") + m.pal.title.Render(m.renderer.Plain(shortRunID(d.runID), 8))
 	if d.run.ID != "" && d.run.Kind != "" {
 		crumb += m.pal.faint.Render(" · " + m.renderer.Plain(d.run.Kind, 12))
 	}
@@ -914,6 +914,44 @@ func (m tuiModel) providerDetailLines() []string {
 	return rows
 }
 
+// diskHoldDetailLines sheds guidance before wrapping would consume the minimum
+// three transcript rows or the footer. Commands retain their complete run ID.
+func (m tuiModel) diskHoldDetailLines() []string {
+	if !isDiskOwnerHold(m.detail.run) {
+		return nil
+	}
+	budget := max(0, m.transcriptBudgetWithoutDiskGuidance()-3)
+	id := cellText(m.detail.run.ID)
+	// At most four fixed copy variants are wrapped; an oversized variant never
+	// prevents trying the smaller one. No command is clipped to the row budget.
+	variants := [][]string{
+		diskHoldLines(m.detail.run),
+		{
+			"uzi run resume " + id,
+			"uzi run cancel " + id,
+			"Counted parks: " + itoa(m.detail.run.DiskParkCount) + "; counters persist.",
+			"One more attempt; admission may refuse.",
+			"Worker loss may lose unpublished work.",
+		},
+		{"Resume/Cancel: see uzi run get " + id},
+		{"See: uzi run get"},
+	}
+	for _, lines := range variants {
+		var rows []string
+		for _, line := range lines {
+			plain := m.renderer.Plain(line, len([]rune(line)))
+			wrapped := ansi.Hardwrap(ansi.Wrap(plain, max(1, m.width), " "), max(1, m.width), true)
+			for _, row := range strings.Split(wrapped, "\n") {
+				rows = append(rows, m.pal.state(crewWaiting).Render(row))
+			}
+		}
+		if len(rows) <= budget {
+			return rows
+		}
+	}
+	return nil
+}
+
 func (m tuiModel) renderDetail() string {
 	if m.detail.answer.open {
 		return m.renderAnswerDetail()
@@ -973,6 +1011,10 @@ func (m tuiModel) renderDetail() string {
 	}
 	if line := fitDiskParkLine(d.run, m.width); line != "" {
 		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 240)), m.width) + "\n")
+	}
+
+	for _, line := range m.diskHoldDetailLines() {
+		sb.WriteString(line + "\n")
 	}
 
 	for _, line := range m.providerDetailLines() {

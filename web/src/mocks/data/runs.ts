@@ -393,6 +393,7 @@ export const mockRuns: Run[] = [
       preferred_score: 0, other_score: 65,
       preferred_measured: 37.5, other_measured: 65,
       preferred_held: true, other_held: false,
+      preferred_weekly_reset_at: null, other_weekly_reset_at: null,
     },
     // PRD #320 M6 demo: an EXPEDITED interactive run the owner bumped to the front, so
     // its "Expedited" pill and the "Undo" control render. Owned by the session.
@@ -531,7 +532,15 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(1),
   },
   {
-    harness_decision: null,
+    // Automatic default with both accounts qualified: Claude's weekly allowance resets sooner.
+    harness_decision: {
+      preferred: "claude", chosen: "claude", reason: "auto_soonest_reset",
+      preferred_score: 80, other_score: 70,
+      preferred_measured: 80, other_measured: 70,
+      preferred_held: false, other_held: false,
+      preferred_weekly_reset_at: minsAhead(2 * 24 * 60),
+      other_weekly_reset_at: minsAhead(5 * 24 * 60),
+    },
     id: LIVE_RUN_ID,
     repo_id: "repo-uzi",
     issue_iid: 24,

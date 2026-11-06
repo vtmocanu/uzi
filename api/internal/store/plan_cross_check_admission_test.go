@@ -67,7 +67,7 @@ func TestPlanCrossCheckChildAdmissionLiveDB(t *testing.T) {
 				case "ReleaseCredentialSwitch":
 					_, err = f.q.ReleaseCredentialSwitch(ctx, store.ReleaseCredentialSwitchParams{ID: fx.checkerID, WorkerID: pgU(f.workerID), Generation: 1})
 				case "SweepClaimedNeverStarted":
-					_, err = f.q.SweepClaimedNeverStarted(ctx, planCrossCheckTime(time.Now().Add(-time.Minute)))
+					_, err = f.q.SweepClaimedNeverStarted(ctx, store.SweepClaimedNeverStartedParams{Cutoff: planCrossCheckTime(time.Now().Add(-time.Minute))})
 				case "RequeueAttestedFinalizeRuns":
 					_, err = f.q.RequeueAttestedFinalizeRuns(ctx, store.RequeueAttestedFinalizeRunsParams{WorkerID: pgU(f.workerID), MaxRequeues: 5, RunIds: []uuid.UUID{fx.checkerID}, ClaimGenerations: []int64{1}})
 				case "ReadoptRunsFromSnapshot":

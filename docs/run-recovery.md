@@ -222,7 +222,7 @@ queue the run. An available archive does not automatically release this
 hold's retained custody. After discarded/released precedence, an OPEN hold at
 `recovery_wait` for `worker_memory_pressure`,
 `worker_requeue_exhausted`, `retained_recovery_exhausted` (timed or held),
-or `retained_recovery_adoption_failed`,
+`retained_recovery_adoption_failed`, or `retained_continuation_unwitnessed`,
 reports `needs_action` when its latest capture failed,
 otherwise `source_only`, before available unguarded archives or capture progress.
 Other custody attention decisions retain their existing ordering.
@@ -593,6 +593,11 @@ retained recovery keep same-path continuity.
 
 A confirmed `adoption_failed` blocker can instead hold at `recovery_wait` /
 `retained_recovery_adoption_failed` for owner Resume or Cancel, with no timer.
+A retained continuation whose `running` report the server refuses, and whose
+flight departed or showed presence without a witnessed departure, is charged
+against the requeue budget or held at `retained_continuation_unwitnessed`
+instead of being reset uncharged; see
+[Unwitnessed continuation hold](run-recovery-wait.md#unwitnessed-continuation-hold).
 A fresh owned claim and a new raw owner grant charge one reservation in a new
 three-iteration/five-minute window; a higher derived episode alone cannot renew
 adoption. Without a new grant it reholds without capture or model execution;
@@ -1153,7 +1158,15 @@ otherwise be idle or recycled. Such a worker shows a **retaining work**
 badge in the worker list. Deleting that worker is refused until the work is
 recovered or explicitly discarded, and the refusal names how many holds are
 blocking the delete and the exact commands to clear them (`uzi run recovery`
-to list, then `uzi run export` or `uzi run discard`). `uzi worker rm` never
+to list, then `uzi run export` or `uzi run discard`). It also lists the
+blocking holds themselves — up to 10, oldest first, with the total — by run,
+generation and hold id. These are the holds whose live holder is this worker,
+which is not always the worker that first created them. On the Workers page
+the refusal appears in the worker's own row, recovery first: each hold links
+to **Held work** opened at that exact hold, even one the panel would
+otherwise hide, and discarding comes last as the explicit destructive
+choice. `uzi worker rm` prints the same holds on stderr and carries them in
+`--json` as `blocking_holds` and `blocking_holds_total`. `uzi worker rm` never
 force-discards held work for you. Removing a repo that still has a run
 retaining custody this way is refused the same way, naming how many runs are
 retaining unpublished work.
@@ -1527,6 +1540,11 @@ locally (no journal record for the generation, no retained pin or clone of
 the run); on any doubt the hold stays open. The API accepts that release for
 a parked run only for a `forge_unreachable` park and only for the settled
 `forge_no_output` class. A parked run that adopted source keeps its hold.
+The same release closes the hold of a generation held as **repo agents
+unreadable** (`repo_agent_source_unavailable`) right after its fetch, before
+any clone was seeded, because its default branch had no resolvable commit. The
+run stays paused for its owner. The API accepts it only for that hold on a run
+with no recorded repo-agent revision.
 
 A dirty or unverified source, or an unproven process boundary, retains the
 clone and hold, reports **Needs action**, and uses bounded retries. Boot
@@ -2013,7 +2031,7 @@ trusted unsent outcome protected against a second execution.
 The open hold for that originating worker and exact claim generation G
 stays in custody. An OPEN hold for `recovery_wait` /
 `worker_requeue_exhausted`, `retained_recovery_exhausted` (timed or held),
-or `retained_recovery_adoption_failed` reports `source_only`, or `needs_action`
+`retained_recovery_adoption_failed`, or `retained_continuation_unwitnessed` reports `source_only`, or `needs_action`
 if its latest
 capture failed, before archive readiness or capture progress is considered.
 The same narrow OPEN-hold exception applies to `worker_memory_pressure` at

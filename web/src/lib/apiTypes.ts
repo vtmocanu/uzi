@@ -271,6 +271,12 @@ export interface UserSettings {
    *  instance summary_model (which itself falls back to haiku). Written through
    *  PUT /me/settings alongside judge_model, validated by the same model rules. */
   summary_model: string | null;
+  /** Per-user Codex summary model (PRD #3248); null inherits the instance Codex summary
+   *  model, then the built-in. A Codex role id when set. Optional for older servers. */
+  codex_summary_model?: string | null;
+  /** Read-only resolved view of both summary lanes (PRD #3248), claude then codex.
+   *  Never sent on a PUT. Optional for older servers. */
+  summary_models?: ModelSettingCell[];
   theme: string | null;
   /** PRD #1167 "Lights on" (m2): the four RAW per-user appearance overrides, each
    *  null = inherit the instance default. appearance_mode is system|light|dark;
@@ -340,6 +346,8 @@ export interface UserSettingsPatch {
   codex_judge_model?: string | null;
   /** Per-user run-summary model (PRD #362 M2); present-null clears back to inherit. */
   summary_model?: string | null;
+  /** Per-user Codex summary model (PRD #3248); present-null clears back to inherit. */
+  codex_summary_model?: string | null;
   theme?: string | null;
   /** PRD #1167 "Lights on" (m2): tri-state appearance override fields — absent leaves
    *  the field unchanged, present-null clears it back to inherit, a value sets it
@@ -1176,6 +1184,11 @@ export interface AppSettings {
   // generator runs on (haiku by default), served as a raw string like every other
   // setting. Mirrors judge_model's admin machinery but delivers on the issue-run claim.
   summary_model: string;
+  // codex_summary_model (PRD #3248) is the instance Codex-lane summary model: a Codex role
+  // id, or "" for the built-in (the admin GET reports the built-in with source "default").
+  // summary_model likewise accepts "" as the reset to the built-in haiku.
+  // Optional so an older server (and fixtures that predate it) stay valid.
+  codex_summary_model?: string;
   // Run-health detector keys (PRD #47, #1170). health_enabled is the text "true"/"false".
   // The *_seconds keys are integer seconds as strings; health_near_timeout_pct is a
   // percent of the run's wall-clock budget (0 to disable, else [50, 99]). The API serves
@@ -3247,6 +3260,9 @@ export interface HarnessDecision {
   other_measured: number | null;
   preferred_held: boolean;
   other_held: boolean;
+  /** Weekly reset of the preferred (auto_*: Claude) / other (auto_*: Codex) account; null when unknown or pre-change rows. */
+  preferred_weekly_reset_at: string | null;
+  other_weekly_reset_at: string | null;
 }
 
 export interface Run {
@@ -3578,6 +3594,7 @@ export interface Run {
    *  none (the plan gate's repo card is inert, NOT the same as null). Names +
    *  descriptions only — REPO-SUPPLIED, untrusted text; render as plain JSX. */
   repo_agents: RepoAgent[] | null;
+  repo_agent_source_commit?: string | null;
   /** PRD #37: which roster the run's subagents came from, once a selection is made
    *  (at the gate, or an autopilot run's resolved default). null before then. */
   agent_source: AgentSource | null;
@@ -3758,12 +3775,17 @@ export interface Run {
    *  credential refresh or release found the run owner's vault locked; the run resumes at its
    *  next retry, `recovery_retry_not_before`, once the vault is unlocked, and waits `queued`
    *  while it stays locked), and "data_volume_full" (PRD #1809 M5: the worker's data volume
-   *  was full or about to fill; the run resumes at its next retry, see disk_park_count);
+   *  was full or about to fill; explicit null retry timing holds for the owner,
+   *  a finite timestamp schedules a retry, see disk_park_count);
    *  "provider_outage" is a counted provider interruption with a scheduled retry;
    *  "retained_recovery_exhausted" can be timed or owner-held (see recovery_retry_not_before);
    *  "retained_recovery_adoption_failed" means integrity checks refused adoption of retained
    *  work: always owner-held with local work and custody preserved, no automatic retry.
    *  Only the owner can Resume or Cancel, through the existing owner authorization.
+   *  "retained_continuation_unwitnessed" (issue #3859) means a retained-custody continuation's
+   *  claimed worker flight was never witnessed starting or departing within a bounded window;
+   *  the claim was released, local work and custody are kept, and only the owner can Resume or
+   *  Cancel. Owner-held with no automatic retry, and not an integrity refusal.
    *  "empty_turn" remains reserved. Render an unrecognised value honestly (a
    *  newer server may ship a cause this build has not heard of), the same rule as
    *  rate_limit_type. */
@@ -3812,7 +3834,8 @@ export interface Run {
    *  recovery-parked. For forge_unreachable and retained_recovery_exhausted, explicit null means owner-held;
    *  a valid timestamp means timed retry (including when already due). Missing or invalid
    *  timing is unknown. For retained_recovery_adoption_failed this is always null and must
-   *  never produce a retry countdown, even if a malformed response supplies a timestamp.
+   *  never produce a retry countdown, even if a malformed response supplies a timestamp;
+   *  the same holds for retained_continuation_unwitnessed.
    *  ISO-8601 string, like every other timestamp on this type. */
   recovery_retry_not_before?: string | null;
   /** PRD #1392 M1: how many times this run has forge-parked in its lifetime — the
@@ -4290,7 +4313,7 @@ export interface RunListItem extends Run {
  *  or ordering reads only these keys; the run detail page fetches the full Run. */
 export type RunSummaryItem = Omit<
   RunListItem,
-  "plan_md" | "repo_agents" | "issue_description" | "preserved_patch"
+  "plan_md" | "repo_agents" | "repo_agent_source_commit" | "issue_description" | "preserved_patch"
   | "reset_state_digest" | "milestone_reconciliations" | "milestone_reconciliations_next_before_gate_revision"
   | "semantic_gate" | "completion_pending" | "semantic_drift"
   | "capability_provenance" | "lead_config" | "created_issues"

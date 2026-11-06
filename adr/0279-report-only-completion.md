@@ -99,7 +99,7 @@ the issue-run fallback below (#3360) applies instead. This mirrors the `not_code
 and the lead prompt frames report_only as "no code change to land"; documented here, not
 guarded.
 
-**Checkpoint/resume: orphan guard (#299, refined by #759 and #2967).** A
+**Checkpoint/resume: orphan guard (#299, refined by #759, #2967 and #3944).** A
 report-only completion opens no branch or MR to supersede a published checkpoint.
 The original convention, "a genuine zero-code run never checkpoints", is insufficient:
 worker recovery can publish content-free coverage commits without agent code changes.
@@ -114,7 +114,8 @@ present, otherwise the resolved default branch. It can advance during reclaims:
 coverage over an older published base remains content-free even when today's floor
 tree differs. Conversely, an outside tree matching only the newer floor tip, with
 no matching boundary tree, does not prove content-free coverage.
-An outside tree matching no boundary, or unreadable proof, blocks report-only completion. A confirmed
+An outside tree matching no boundary, or unreadable proof, blocks report-only completion
+(except the #3944 stale-mirror discount below). A confirmed
 publication with an unknown tip also blocks; a genuinely absent checkpoint without
 confirmed publication does not. The existing mirrored marker-only `wip(park):`
 exception (#759) retains its ancestry-based handling.
@@ -123,9 +124,43 @@ No checkpoint ref is deleted or rewritten by this guard. Recovery coverage creat
 preservation and publication are unchanged. This is a content proof for the existing
 report-only decision, not a new worker-to-forge deletion capability.
 
+**Three-way tip classification and stale-mirror discount (#3944).** The mirrored-checkpoint
+leg classifies a tip as `content_free`, `carries_work` or `unprovable`. A failed read inside
+the proof (the shallow check, the tip resolve, the boundary walk, a boundary or unmatched
+outside tree read, or the marker parent read) is `unprovable` and always blocks. A failed
+marker-subject or overlay-peel read only sends the tip to the all-parent proof. The claim-time mirror fetch never prunes, so
+a predecessor's checkpoint that origin no longer holds (after supersession or released
+custody) stayed in the local mirror and refused a no-change report-only run. On issue runs
+only, a local mirror whose tip positively `carries_work` is therefore discounted when an
+exact `git ls-remote --refs -- origin <ref>` succeeds with empty output at decision time.
+A present ref, an unknown result or a failed probe blocks. Prompt and other non-issue kinds
+never get the discount. The probe is read-only and the discount is only this run's
+completion decision: it writes, moves, deletes or settles no ref, hold or custody. A
+predecessor's late unknown-outcome publish stays protected by the server's attempts and
+retention arm (`reconcilePublishAttempts`), not by this guard.
+
+All three guard sites (declared `report_only`, the issue scope-capped zero slice and the
+prompt zero-diff completion) also require this run's unconfirmed attempted publish tip (a
+lost-ack publish) to be content-free, by the all-parent proof above or the `wip(park):`
+marker exception; otherwise the guard blocks and each site keeps its prior blocked outcome
+(the #3360 fallback below for a declared issue `report_only`, push and MR for the
+scope-capped slice, the #299 failure for prompt runs and other kinds). The marker exception is hardened: zero parents count
+only on a positive, readable, non-shallow parent read; exactly one parent is checked by
+floor ancestry with `--no-replace-objects` (exit 1 means work, any other error blocks); two
+or more parents get no marker exception and take the all-parent proof. Every object read
+in the tip proof, including the overlay peel, ignores replace refs and `info/grafts`
+(`GIT_NO_REPLACE_OBJECTS`, `GIT_GRAFT_FILE=/dev/null`), so a replaced or grafted commit
+cannot make work look marker-only or content-free. The recovery floor itself (origin's
+branch if present, else the default branch) is chosen through the same view and
+error-aware: only a proven absence (a clean, empty, successful listing, and no loose ref
+file at that exact path) falls through to the next candidate. A failed or incomplete ref
+read, or a corrupt, unreadable or dangling ref, which git otherwise reports like a missing
+one, makes the proof unprovable rather than silently falling back to a different floor. The confirmed publication leg keeps its logic; it now reads through the
+same replace- and graft-free view.
+
 **Issue-run fallback (#3360).** On issue runs only, when the lead declares `report_only`
 but `hasCommittedCheckpoint` cannot establish that the checkpoint is content-free (same proof as above,
-unchanged), the worker no longer fails the run (#299). It sets a non-closing declaration
+including the #3944 discount and attempted-tip check), the worker no longer fails the run (#299). It sets a non-closing declaration
 (static worker reason "The lead declared report_only after committing work; the worker
 delivered it without closing the issue."), unless the lead or an earlier persisted claim
 already declared one, and routes the work through normal delivery as a non-closing MR. All

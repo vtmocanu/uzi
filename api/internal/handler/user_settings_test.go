@@ -26,13 +26,13 @@ import (
 // SetUserDefaultEffort/SetUserJudgeModel/SetUserSummaryModel/SetUserTheme UPDATEs QueryRow a
 // single Text RETURNING column (discarded by the handler) and SetUserSidebarTokens a uuid[]
 // one; SetUserHarnessModels (PRD #1551 M1) PATCHes the harness, both lanes and the legacy
-// default_model in one conditional UPDATE; GetUserSettings QueryRows twenty (default_model,
+// default_model in one conditional UPDATE; GetUserSettings QueryRows twenty-one (default_model,
 // default_effort, judge_model, summary_model, theme, sidebar_token_ids,
 // mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface — the four
 // appearance columns joined the read in PRD #1167 M1 — default_harness, which joined
 // in PRD #1429 M1, sidebar_codex_account_ids, which joined in PRD #1209 M1, and the two
 // per-harness lanes, which joined in PRD #1551 M1) — summary_model rides that
-// one-row read, so the settings handler makes no separate GetUserSummaryModel call.
+// one-row read, so the settings handler makes no separate GetUserSummaryModels call.
 // The UPDATE paths record the written value so the round-trip is observable.
 type fakeSettingsDB struct {
 	model           pgtype.Text
@@ -41,6 +41,7 @@ type fakeSettingsDB struct {
 	judge           pgtype.Text
 	codexJudge      pgtype.Text
 	summary         pgtype.Text
+	codexSummary    pgtype.Text
 	theme           pgtype.Text
 	mrRework        pgtype.Bool
 	nowSummary      pgtype.Bool
@@ -139,6 +140,10 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		if j, ok := args[0].(pgtype.Text); ok {
 			f.codexJudge = j // SetUserCodexJudgeModel: $1 = codex_judge_model
 		}
+	case strings.Contains(sql, "UPDATE users SET codex_summary_model") && len(args) >= 1:
+		if s, ok := args[0].(pgtype.Text); ok {
+			f.codexSummary = s // SetUserCodexSummaryModel: $1 = codex_summary_model
+		}
 	case strings.Contains(sql, "UPDATE users SET summary_model") && len(args) >= 1:
 		if s, ok := args[0].(pgtype.Text); ok {
 			f.summary = s // SetUserSummaryModel: $1 = summary_model
@@ -201,6 +206,7 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		judge:           f.judge,
 		codexJudge:      f.codexJudge,
 		summary:         f.summary,
+		codexSummary:    f.codexSummary,
 		theme:           f.theme,
 		mrRework:        f.mrRework,
 		nowSummary:      f.nowSummary,
@@ -225,6 +231,7 @@ type fakeSettingsRow struct {
 	judge           pgtype.Text
 	codexJudge      pgtype.Text
 	summary         pgtype.Text
+	codexSummary    pgtype.Text
 	theme           pgtype.Text
 	mrRework        pgtype.Bool
 	nowSummary      pgtype.Bool
@@ -272,9 +279,9 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[3].(*pgtype.Text); ok {
 			*p = r.typeface
 		}
-	case 20:
+	case 21:
 		// GetUserSettings: SELECT default_model, default_effort, judge_model,
-		// summary_model, theme, sidebar_token_ids, mr_rework_enabled,
+		// codex_judge_model, summary_model, codex_summary_model, theme, sidebar_token_ids, mr_rework_enabled,
 		// appearance_mode, light_theme, dark_theme, typeface, default_harness,
 		// sidebar_codex_account_ids, default_claude_model, default_codex_model (the four
 		// before default_harness are PRD #1167 M1's appearance columns; default_harness
@@ -296,51 +303,55 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[4].(*pgtype.Text); ok {
 			*p = r.summary
 		}
+		// codex_summary_model (PRD #3248) rides the read right after summary_model.
 		if p, ok := dest[5].(*pgtype.Text); ok {
+			*p = r.codexSummary
+		}
+		if p, ok := dest[6].(*pgtype.Text); ok {
 			*p = r.theme
 		}
-		if p, ok := dest[6].(*[]uuid.UUID); ok {
+		if p, ok := dest[7].(*[]uuid.UUID); ok {
 			*p = r.sidebarIDs
 		}
-		if p, ok := dest[7].(*pgtype.Bool); ok {
+		if p, ok := dest[8].(*pgtype.Bool); ok {
 			*p = r.mrRework
 		}
-		if p, ok := dest[8].(*pgtype.Text); ok {
+		if p, ok := dest[9].(*pgtype.Text); ok {
 			*p = r.apprMode
 		}
-		if p, ok := dest[9].(*pgtype.Text); ok {
+		if p, ok := dest[10].(*pgtype.Text); ok {
 			*p = r.lightTheme
 		}
-		if p, ok := dest[10].(*pgtype.Text); ok {
+		if p, ok := dest[11].(*pgtype.Text); ok {
 			*p = r.darkTheme
 		}
-		if p, ok := dest[11].(*pgtype.Text); ok {
+		if p, ok := dest[12].(*pgtype.Text); ok {
 			*p = r.typeface
 		}
-		if p, ok := dest[12].(*pgtype.Text); ok {
+		if p, ok := dest[13].(*pgtype.Text); ok {
 			*p = r.defaultHarness
 		}
-		if p, ok := dest[13].(*[]uuid.UUID); ok {
+		if p, ok := dest[14].(*[]uuid.UUID); ok {
 			*p = r.sidebarCodexIDs
 		}
-		if p, ok := dest[14].(*pgtype.Text); ok {
+		if p, ok := dest[15].(*pgtype.Text); ok {
 			*p = r.claudeModel
 		}
-		if p, ok := dest[15].(*pgtype.Text); ok {
+		if p, ok := dest[16].(*pgtype.Text); ok {
 			*p = r.codexModel
 		}
-		if p, ok := dest[16].(*pgtype.Text); ok {
+		if p, ok := dest[17].(*pgtype.Text); ok {
 			*p = r.codexEffort
 		}
-		// now_summary_enabled (PRD #2603) rides the read as the 18th column.
-		if p, ok := dest[17].(*pgtype.Bool); ok {
+		// now_summary_enabled (PRD #2603) rides the read as the 19th column.
+		if p, ok := dest[18].(*pgtype.Bool); ok {
 			*p = r.nowSummary
 		}
-		// weekly_reserve_pct and weekly_reserve_pause_running (PRD #3522) are columns 19 and 20.
-		if p, ok := dest[18].(*pgtype.Int2); ok {
+		// weekly_reserve_pct and weekly_reserve_pause_running (PRD #3522) are columns 20 and 21.
+		if p, ok := dest[19].(*pgtype.Int2); ok {
 			*p = r.weeklyPct
 		}
-		if p, ok := dest[19].(*bool); ok {
+		if p, ok := dest[20].(*bool); ok {
 			*p = r.weeklyPause
 		}
 	}

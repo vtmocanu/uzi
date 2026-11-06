@@ -424,6 +424,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 	} else {
 		dto.RepoAgents = agents
 	}
+	dto.RepoAgentSourceCommit = textPtrValue(r.RepoAgentSourceCommit.Valid, r.RepoAgentSourceCommit.String)
 	if excl, err := workersvc.DecodeExclusions(r.AgentExclusions); err != nil {
 		slog.Error("decode run agent exclusions", "run_id", r.ID, "error", err)
 	} else {
@@ -832,7 +833,7 @@ func runJobDTO(d *workersvc.JobRunDetail) *apitypes.RunJobDTO {
 // Evidence is historical; it never asserts latest work or current forge availability.
 func workerRecoveryDTO(r store.Run, limit int) *apitypes.WorkerRecoveryDTO {
 	if r.WorkerRecoveryEpisode == 0 && len(r.WorkerRecoveryEvidence) == 0 &&
-		(!r.RecoveryWaitCause.Valid || (r.RecoveryWaitCause.String != "worker_requeue_exhausted" && r.RecoveryWaitCause.String != "retained_recovery_exhausted" && r.RecoveryWaitCause.String != "retained_recovery_adoption_failed")) {
+		(!r.RecoveryWaitCause.Valid || (r.RecoveryWaitCause.String != "worker_requeue_exhausted" && r.RecoveryWaitCause.String != "retained_recovery_exhausted" && r.RecoveryWaitCause.String != "retained_recovery_adoption_failed" && r.RecoveryWaitCause.String != "retained_continuation_unwitnessed")) {
 		return nil
 	}
 	used := r.RequeueCount - r.RequeueEpisodeBaseline
@@ -941,8 +942,17 @@ func harnessDecisionForViewer(r store.Run, viewer store.User) *apitypes.HarnessD
 		}
 		return &v.Float64
 	}
+	nullableTime := func(v pgtype.Timestamptz) *time.Time {
+		if !v.Valid {
+			return nil
+		}
+		t := v.Time.UTC()
+		return &t
+	}
 	return &apitypes.HarnessDecisionDTO{
-		Preferred: r.HarnessPreferred.String, Chosen: r.Harness, Reason: r.HarnessDecisionReason.String,
+		PreferredWeeklyResetAt: nullableTime(r.HarnessPreferredWeeklyResetAt),
+		OtherWeeklyResetAt:     nullableTime(r.HarnessOtherWeeklyResetAt),
+		Preferred:              r.HarnessPreferred.String, Chosen: r.Harness, Reason: r.HarnessDecisionReason.String,
 		PreferredScore: nullableFloat(r.HarnessPreferredScore), OtherScore: nullableFloat(r.HarnessOtherScore),
 		PreferredMeasured: nullableFloat(r.HarnessPreferredMeasured), OtherMeasured: nullableFloat(r.HarnessOtherMeasured),
 		PreferredHeld: r.HarnessPreferredHeld.Bool, OtherHeld: r.HarnessOtherHeld.Bool,

@@ -1,6 +1,6 @@
 import type { HealthDoc } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
-import { confirmedDrainDoc, degradedDoc, healthySilentDoc, incidentDoc, maintenanceDoc, ownerOnlyDoc } from "../data";
+import { confirmedDrainDoc, degradedDoc, healthySilentDoc, incidentDoc, maintenanceDoc, overviewNextDoc, ownerOnlyDoc } from "../data";
 import { delay, mockScenario, requireAdmin } from "./shared";
 import { agentSourceHealthCheck } from "./agentSource";
 
@@ -29,6 +29,8 @@ function withAgentSource(doc: HealthDoc): HealthDoc {
 //   ?mock=health-owner-only → owner danger without an instance blocker or episode
 //   ?mock=health-confirmed-drain → orderly upgrade wait, all checks ok and no episode
 //   ?mock=health-silent    → every check passing (healthy/all-ok)
+//   ?mock=overview-next    → one owner warning that raises the admin attention banner
+//                            (the Overview preview scenario, PRD #3878)
 //   ?mock=maintenance      → maintenance.active warns (PRD #3454; see mockApi/maintenance.ts)
 //   (default)              → healthy, same as health-silent
 //
@@ -53,6 +55,8 @@ export const healthApi = {
         return delay(withAgentSource(confirmedDrainDoc()));
       case "maintenance":
         return delay(withAgentSource(maintenanceDoc()));
+      case "overview-next":
+        return delay(withAgentSource(overviewNextDoc()));
       case "health-incident": {
         const d = incidentDoc();
         // Reflect a prior snooze so the banner stays hidden until the snooze expires or a
