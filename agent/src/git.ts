@@ -2548,12 +2548,16 @@ function isBoundOverflow(error: unknown): boolean {
 // A fully observed, explicitly forbidden source setting is a settled keep;
 // it is not an incomplete observation of an admitted object store.
 class AutomaticContentRefusal extends Error {}
-/** Unknown errors the clone shape stage raised for an INDIRECTION-BEARING input it cannot account for: a source
- *  `objects/info` entry (unreadable, indirect or past the budget) or the clone's `.git/config` (an UNKNOWN-class key,
- *  or a file past the budget). An overflow while reading such an input is UNKNOWN, never a keep (the rule recorded
+/** Unknown errors the clone shape stage raised for an INDIRECTION-BEARING input it cannot account for: a clone
+ *  `.git/objects` or `objects/info` entry (a non-directory, an unlisted name, unreadable, indirect or past the
+ *  budget), the clone's `.git/config` (an UNKNOWN-class key, a file that is missing, not regular or past the budget),
+ *  and whatever `afterIndirection` (the Node-only topology of the object stores: entry types and names, commondir,
+ *  shallow, grafts, replace refs) raises. An overflow while reading such an input is UNKNOWN, never a keep (the rule recorded
  *  above {@link GitCache.automaticContentPreserved}). {@link GitCache.automaticCloneShape} rethrows these instead of
  *  returning false. */
 const SHAPE_INDIRECTION_UNKNOWN = new WeakSet<Error>();
+/** A `git config --list` key of a promisor remote (any remote name; Git lowercases the section and variable only). */
+const PROMISOR_KEY_RE = /^remote\..*\.(?:promisor|partialclonefilter)$/i;
 /** The first clone-config key (Git reads names case-insensitively) that the object-store observation treats as
  *  UNKNOWN: it changes where objects or refs live or pulls in more config, so the physical observation cannot account
  *  for it. This is a Node-only scan of the bytes of `.git/config`, a superset of that observation's `git config` key
@@ -2564,10 +2568,15 @@ const SHAPE_INDIRECTION_UNKNOWN = new WeakSet<Error>();
 function cloneConfigIndirection(config: Buffer): string | undefined {
   const text = config.toString("latin1");
   const keyAt = (name: string) => new RegExp(`(?:^|\\])[ \\t\\r\\f\\v]*${name}(?![A-Za-z0-9-])`, "im");
-  for (const key of ["partialclone", "refstorage", "compatobjectformat", "worktreeconfig", "worktree"])
+  // `promisor` and `partialclonefilter` are the keys a modern partial clone writes under `[remote "<name>"]`
+  // (`git clone --filter=...`, no `extensions.partialclone`): it lazily fetches missing objects from another repo.
+  for (const key of ["partialclone", "partialclonefilter", "promisor", "refstorage", "compatobjectformat",
+    "worktreeconfig", "worktree"])
     if (keyAt(key).test(text)) return key;
-  for (const found of text.matchAll(/(?:^|\])[ \t\r\f\v]*objectformat(?![A-Za-z0-9-])([^\n\r]*)/gim))
-    if (!/^[ \t]*=[ \t]*sha1[ \t]*(?:[#;].*)?$/.test(found[1]!)) return "objectformat";
+  // The capture runs to the end of the LINE (`\n`), so a lone `\r` inside the value is part of it and fails the
+  // `sha1` match; only a final `\r` (CRLF) is dropped.
+  for (const found of text.matchAll(/(?:^|\])[ \t\r\f\v]*objectformat(?![A-Za-z0-9-])([^\n]*)/gim))
+    if (!/^[ \t]*=[ \t]*sha1[ \t]*(?:[#;].*)?$/.test(found[1]!.replace(/\r$/, ""))) return "objectformat";
   return undefined;
 }
 
@@ -11237,7 +11246,9 @@ export class GitCache {
    *
    * THE RULE (owner answer seq 1162, 2026-11-06 (R9)). An INDIRECTION is anything that lets some OTHER source's
    * deletion break the work this source retains: an alternate into another store, a partialclone/promisor, another
-   * ref or object format, a worktree or include redirect, a symlinked or noncanonical object path. An indirection
+   * ref or object format, a worktree or common-directory redirect, a symlinked or noncanonical object path or config.
+   * (A config INCLUDE is the one exception: it is a settled keep, because no Git launch reads its target before the
+   * refusal, and the refusal is ordered after every indirection input has been classified.) An indirection
    * stops the whole epoch scope (UNKNOWN). A budget overflow, by contrast, is a settled keep of only this source. If
    * bulk data an attacker controls could use up a budget before an indirection input was classified, the attacker
    * would hide the indirection behind a keep. Therefore, in EVERY stage of this proof (the clone shape stage
@@ -11269,9 +11280,9 @@ export class GitCache {
     // A gitfile, a symlinked `.git` or one that resolves elsewhere is the same redirect.
     const ownGitDir = async () => {
       const st = await read(() => fs.lstat(path.join(cwd, ".git")));
-      if (st.isSymbolicLink() || st.isFile() ||
-          await read(() => fs.realpath(path.join(cwd, ".git"))) !== path.join(cwd, ".git"))
-        throw new AutomaticCompletenessUnknown("redirected .git");
+      // Both callers have just verified `realpath(cwd) === cwd`, so a `.git` that lstat reports as a real directory
+      // resolves to `cwd/.git`: no separate realpath of it is needed.
+      if (st.isSymbolicLink() || st.isFile()) throw new AutomaticCompletenessUnknown("redirected .git");
       return true;
     };
     try {
@@ -11287,7 +11298,9 @@ export class GitCache {
       }
       if (presence.presence === "missing") return true;
       if (presence.presence !== "present" || await read(() => fs.realpath(cwd)) !== cwd) return false;
-      if (!await ownGitDir() || !await standalone() || !(await read(() => this.realCloneDir(cwd)))) return false;
+      await ownGitDir();
+      await standalone();
+      if (!(await read(() => this.realCloneDir(cwd)))) return false;
       // Node-only shape checks first: no Git may launch in a clone whose `.git` was not typed and bounded. The shape
       // stage classifies every other indirection input of the clone before any bulk input (see its afterIndirection).
       if (!await this.automaticCloneShape(cwd, automatic,
@@ -11320,11 +11333,13 @@ export class GitCache {
       if (await read(() => this.worktreeHead(cwd)) !== head || await root() !== rootSha ||
           JSON.stringify(await owedRoots()) !== JSON.stringify(owed)) return false;
       const after = await read(() => this.clonePresence(cwd));
-      const unchanged = after.presence === "present" && after.devIno === presence.devIno && await standalone() &&
-        await read(() => this.realCloneDir(cwd)) &&
-        await read(() => fs.realpath(cwd)) === cwd && await ownGitDir();
+      const unchanged = after.presence === "present" && after.devIno === presence.devIno;
+      if (unchanged) await standalone();
+      const stillReal = unchanged && await read(() => this.realCloneDir(cwd)) &&
+        await read(() => fs.realpath(cwd)) === cwd;
+      if (stillReal) await ownGitDir();
       await automatic.finalStoreCheck?.();
-      return unchanged;
+      return stillReal;
     } catch (error) {
       if (error instanceof AutomaticCompletenessUnknown) throw error;
       return false;
@@ -11356,7 +11371,7 @@ export class GitCache {
     // file is UNKNOWN) are read and classified before any object content is charged, so an UNKNOWN-class indirection
     // or an illegal name can never be hidden behind a content overflow (and a name is classified as it is read,
     // before it is counted). ANY overflow during the topology stage, whatever its kind (byte, entry, edge, store
-    // count, config listing, a loose directory with more leaves than the entry limit), is UNKNOWN: the part of the
+    // count, config listing, more loose leaves than the record limit), is UNKNOWN: the part of the
     // topology past the limit (an alternate line, a pack member, a config key, a leaf that is a symlink) was never
     // read and may hold an indirection. Overflows are settled keeps only in the content stage, which reads bytes of
     // objects already typed (and in the shape/worktree budgets, after their indirection inputs). Residual: a content-stage overflow in one
@@ -11367,7 +11382,7 @@ export class GitCache {
     // (see automaticCloneShape): the same topology walk, with the config judged by a byte scan instead of a Git
     // launch, and nothing of the content stage.
     const snapshot = async (afterTopology?: () => Promise<void>, topologyOnly = false) => {
-      let entries = 0, bytes = 0, occurrences = 0, edges = 0;
+      let entries = 0, looseLeaves = 0, bytes = 0, occurrences = 0, edges = 0;
       let topologyStage = true;
       const rows = new Map<string, string>();
       type Store = { ids: Set<string>; alternates: string[]; names: string[]; pack?: string[];
@@ -11399,7 +11414,11 @@ export class GitCache {
       };
       // Each name is classified (`classify` throws UNKNOWN for an illegal one, and may type the entry) as it is read,
       // before it is counted.
-      const directory = async (p: string, classify?: (name: string) => void | Promise<void>) => {
+      // `leaves` marks a loose fan-out directory: its object files are objects, so they count against the record
+      // limit (`maxMetadataRecords`, which also caps object occurrences) and not against the snapshot-wide
+      // directory entry limit, which a run committing many files would otherwise cross (R9 lead decision). Every
+      // other listing (the fan-out directories themselves, `pack`, `info`, ...) counts against the entry limit.
+      const directory = async (p: string, classify?: (name: string) => void | Promise<void>, leaves = false) => {
         const st = await stat(p);
         if (!st?.isDirectory()) unknown("object directory type");
         let handle: import("node:fs").Dir | undefined;
@@ -11410,7 +11429,8 @@ export class GitCache {
             const entry = await read(() => handle!.read());
             if (!entry) break;
             await classify?.(entry.name);
-            if (++entries > limits.maxDirectoryEntries) over("object directory entry limit");
+            if (leaves) { if (++looseLeaves > limits.maxMetadataRecords) over("loose object leaf limit"); }
+            else if (++entries > limits.maxDirectoryEntries) over("object directory entry limit");
             MaintenanceResources.consumeIfActive("adminEntries", 1);
             charge(Buffer.byteLength(entry.name)); names.push(entry.name);
           }
@@ -11557,7 +11577,7 @@ export class GitCache {
             throw new AutomaticContentRefusal("source config indirection is not eligible");
           if (key === "extensions.compatobjectformat" || key === "extensions.objectformat" && value !== "sha1" ||
               key === "extensions.refstorage" || key === "extensions.worktreeconfig" || key === "extensions.partialclone" ||
-              key === "core.worktree" || key?.startsWith("include.") || key?.startsWith("includeif."))
+              key === "core.worktree" || key !== undefined && PROMISOR_KEY_RE.test(key) || key?.startsWith("include.") || key?.startsWith("includeif."))
             unknown("object format or config indirection unsupported");
         }
       };
@@ -11571,7 +11591,7 @@ export class GitCache {
           const listing = await directory(p, async leaf => {
             if (!/^[0-9a-f]{38}$/.test(leaf)) unknown("unsupported loose object");
             if (!(await stat(path.join(p, leaf)))?.isFile()) unknown("unsupported loose object");
-          });
+          }, true);
           store.loose.set(name, listing.names);
         }
       };
@@ -11897,7 +11917,7 @@ export class GitCache {
               // and objects live, which the physical-store observation below cannot account for.
               if (key === "extensions.compatobjectformat" || key === "extensions.objectformat" && value !== "sha1" ||
                   key === "extensions.refstorage" || key === "extensions.partialclone" ||
-                  key?.startsWith("include.") || key?.startsWith("includeif.")) unknown("object format or config indirection unsupported");
+                  key !== undefined && PROMISOR_KEY_RE.test(key) || key?.startsWith("include.") || key?.startsWith("includeif.")) unknown("object format or config indirection unsupported");
             }
             // The count check runs after the classification loop only so that an UNKNOWN-class key is named as such;
             // an overflow is UNKNOWN too, so the order changes the message, not the outcome.
@@ -12379,7 +12399,7 @@ export class GitCache {
       // `.git`, whole, and every UNKNOWN-class key in it (partialclone, refstorage, the object formats, worktreeconfig,
       // core.worktree) is classified before anything bulk is charged, so neither a reflog nor a packed-refs can use
       // up the budget it needs, and no later keep of this stage can stand in front of the key. A config past the
-      // budget cannot be classified and is UNKNOWN. A config that is not a regular file stays a refusal (settled keep).
+      // budget cannot be classified and is UNKNOWN; so is one that is not a regular file (a config redirect) or is missing.
       const configFile = path.join(gitDir, "config");
       let configBytes: Buffer;
       try {
@@ -12387,9 +12407,12 @@ export class GitCache {
         configBytes = got.bytes;
         fixed.set("f:" + configFile, { target: configFile, signature: got.signature });
       } catch (error) {
-        if (error instanceof GitIndexError) {
-          if (error.kind !== "limit") throw refusal(`.git/config: ${error.message}`);
-          const unknownConfig = new AutomaticCompletenessUnknown(`.git/config: ${error.message}`, { cause: error });
+        // A config that cannot be read as a regular file of the budgeted size (a symlink or other non-regular file, a
+        // missing file, one past the budget) is a config redirect or an unclassifiable one: UNKNOWN. Ending the stage
+        // here as a keep would run before `afterIndirection` and hide the object-path indirections it classifies.
+        const code = (error as NodeJS.ErrnoException | undefined)?.code;
+        if (error instanceof GitIndexError || typeof code === "string" && /^E[A-Z0-9]+$/.test(code)) {
+          const unknownConfig = new AutomaticCompletenessUnknown(`.git/config: ${(error as Error).message}`, { cause: error });
           SHAPE_INDIRECTION_UNKNOWN.add(unknownConfig);
           throw unknownConfig;
         }
@@ -12669,11 +12692,12 @@ export class GitCache {
    *
    * Outcome: every failure here, an exceeded bound included, returns `false`, except that the shape
    * stage rethrows a {@link SHAPE_INDIRECTION_UNKNOWN} error for an indirection input it cannot
-   * account for (an `objects/info` entry or the config: unreadable, indirect or past the budget). An exceeded bound is thrown internally as
+   * account for (an `objects/info` entry, the config (missing, not regular, an UNKNOWN-class key or past the budget),
+   * an object-path entry type or name, commondir, shallow, grafts or replace refs). An exceeded bound is thrown internally as
    * {@link AutomaticBoundExceeded} and a hostile or unsupported source
    * as {@link AutomaticContentRefusal}, but this method's catch converts both to `false`, so the
    * discard core records `epoch_content_unproven` (a settled keep that does not stop the epoch
-   * scope). Only the object-store observation and that `objects/info` case let
+   * scope). Only the object-store observation and those indirection inputs let
    * AutomaticCompletenessUnknown escape to the discard's `unknown` outcome.
    */
   private async worktreeProvenCleanAutomatic(cwd: string, automatic: AutomaticPreservation): Promise<boolean> {
