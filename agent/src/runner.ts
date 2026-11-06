@@ -43,6 +43,7 @@ import {
   isPushProtectionRejection,
   isWorkflowScopeRejection,
   INVENTORY_CONTENT_PROOF_BOUNDS,
+  RECOVERY_MAX_BUNDLE_BYTES,
 } from "./git.js";
 import type { SecretFinding } from "./secret-scan-guard.js";
 import {
@@ -129,7 +130,7 @@ import type {
 import { resolveAgentSelection, RUN_KINDS } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
-import { RecoveryCoordinator, canonicalJson, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, inventoryProcessDiagnostic, type ClosedSourceObservation, type InventorySourceBoundaryContext, type InventorySourceDiagnostic, type CompletionSource, type DurableCompletionRetirement, type HandoffRetirement, type RetainedBoundaryReason, type RecoveryRecord, type RecoveryCoordinatorOptions, type OperatorRequestSignals, type DescribeLocalRecordsResult, type ResolveLocalRecordResult } from "./recovery.js";
+import { RecoveryCoordinator, PredecessorAuthorityLost, canonicalJson, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, inventoryProcessDiagnostic, type ClosedSourceObservation, type InventorySourceBoundaryContext, type InventorySourceDiagnostic, type CompletionSource, type DurableCompletionRetirement, type HandoffRetirement, type RetainedBoundaryReason, type RecoveryRecord, type PredecessorMeasurements, type RecoveryOutcome, type RecoveryCoordinatorOptions, type OperatorRequestSignals, type DescribeLocalRecordsResult, type ResolveLocalRecordResult } from "./recovery.js";
 import { classifyRecoveryOrigin } from "./recovery-origin.js";
 import {
   PUSHED_HEAD_UNRECORDED,
@@ -1341,6 +1342,21 @@ class RetainedSeedCapacityShortfall extends Error {
 }
 
 const RETAINED_EXHAUSTED_FEATURE = "recovery_cause_retained_recovery_exhausted";
+
+/* issue #2969: the time budget of the predecessor FINAL pass a retained re-claim runs before it prepares its successor.
+ * The retained iteration window is `now + 300_000` ms (see recoverRetainedClaim). The pass reserves, out of the
+ * iteration deadline, two Codex boundary deadlines (the held scope's own entry and exit) plus this successor-prep
+ * allowance, so a pass can never consume the time the successor adoption below it needs. */
+const PREDECESSOR_SUCCESSOR_PREP_ALLOWANCE_MS = 60_000;
+/** The longest one pass may run its candidates, however much of the iteration window is left. */
+const PREDECESSOR_ACTION_CAP_MS = 120_000;
+/** The gap kept between the action cap and the held scope's deadline, so a capped pass settles before the scope dies. */
+const PREDECESSOR_SETTLEMENT_MARGIN_MS = 5_000;
+
+/** Grant refusals that mean "this clone still holds uncaptured bytes": a clean skip, never a stop. Any other recorded
+ *  refusal (including a check this list does not know) stops the retained recovery with custody retained. */
+const PREDECESSOR_RESIDUE_CHECKS: ReadonlySet<string> =
+  new Set(["worktree_status_dirty", "worktree_status_unreadable", "over_bound", "ignored_residue"]);
 /** Wall-clock budget of one predecessor footprint measurement (the retained inspection budget). */
 const RETAINED_SEED_MEASURE_BUDGET_MS = 5_000;
 
@@ -3075,6 +3091,9 @@ export interface RunnerOptions {
    *  executor is Codex-selected (`executor.safety`); a Claude/stub run ignores it. The finalize
    *  boundary uses its own deadline (`codexFinalizeBoundaryDeadlineMs`, issue #1900). */
   codexBoundaryDeadlineMs?: number;
+  /** TEST-ONLY (issue #2969): shortens the predecessor FINAL pass budget of a retained re-claim. Each field falls
+   *  back to its PREDECESSOR_* constant when absent or not a non-negative finite number. */
+  predecessorFinalBudgetMs?: { successorPrepAllowanceMs?: number; actionCapMs?: number; settlementMarginMs?: number };
   /** issue #3181: the allowance (ms) a retained successor's credential switch spends proving its run
    *  processes stopped before it reports. Defaults to `codexBoundaryDeadlineMs`; a test shortens it. */
   retainedSwitchSettlementMs?: number;
@@ -3290,6 +3309,8 @@ export class RunRunner {
   private readonly heldSeamCancelObserveMs: number;
   /** PRD #1171 m4: bounded absolute deadline (ms) for a Codex durability-sink withBoundary. */
   private readonly codexBoundaryDeadlineMs: number;
+  /** issue #2969: the predecessor FINAL pass budget (constants unless a test shortens them). */
+  private readonly predecessorFinalBudget: { successorPrepAllowanceMs: number; actionCapMs: number; settlementMarginMs: number };
   /** issue #3181: see RunnerOptions.retainedSwitchSettlementMs. */
   private readonly retainedSwitchSettlementMs: number;
   /** issue #3181: see RunnerOptions.retainedSwitchVerificationMs. */
@@ -3571,6 +3592,13 @@ export class RunRunner {
       opts.codexBoundaryDeadlineMs && opts.codexBoundaryDeadlineMs > 0
         ? opts.codexBoundaryDeadlineMs
         : 30_000;
+    const predecessorBudget = (value: number | undefined, fallback: number): number =>
+      typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
+    this.predecessorFinalBudget = {
+      successorPrepAllowanceMs: predecessorBudget(opts.predecessorFinalBudgetMs?.successorPrepAllowanceMs, PREDECESSOR_SUCCESSOR_PREP_ALLOWANCE_MS),
+      actionCapMs: predecessorBudget(opts.predecessorFinalBudgetMs?.actionCapMs, PREDECESSOR_ACTION_CAP_MS),
+      settlementMarginMs: predecessorBudget(opts.predecessorFinalBudgetMs?.settlementMarginMs, PREDECESSOR_SETTLEMENT_MARGIN_MS),
+    };
     this.retainedSwitchSettlementMs =
       opts.retainedSwitchSettlementMs && opts.retainedSwitchSettlementMs > 0
         ? opts.retainedSwitchSettlementMs
@@ -26594,6 +26622,12 @@ export class RunRunner {
           }, "capture", "strict");
           if (captureResult.kind !== "observed_empty") { blocker = "quiescence_failed"; throw finalize; }
           await check();
+          // issue #2969: settle the lower generations' guarded holds from the predecessor source before the
+          // successor replaces it. A stop keeps custody and the predecessor; a clean skip changes nothing.
+          if (await this.settlePredecessorHolds(claim, flight, bare, source, iteration, signal) === "stop") {
+            blocker = "quiescence_failed"; throw finalize;
+          }
+          await check();
           blocker = "adoption_failed";
           const attemptId = mintAttemptId(claim.claim_generation, new Date(this.now()));
           let deferredRestrictions: { tip: string; findings: SecretFinding[] } | undefined;
@@ -26794,6 +26828,184 @@ export class RunRunner {
         this.retainedLifecycleGuard(flight);
       }
     }
+  }
+
+  /**
+   * issue #2969: before a retained re-claim replaces its predecessor source with a successor, settle the guarded holds
+   * of the LOWER claim generations from that still-intact source (the predecessor FINAL). It runs inside one held
+   * credential-free scope that is awaited to settlement, under the exact execution tail of this flight, with a
+   * predecessor boundary grant (registerPredecessorBoundary) that proves the source quiescent and byte-clean on every
+   * coordinator source check.
+   *
+   * Returns "proceed" for a clean skip or a finished pass, and "stop" when the caller must keep custody and the
+   * predecessor (blocker quiescence_failed): the held scope was incomplete or expired, authority or the grant was lost,
+   * the coordinator latched an integrity failure, the scope settled late, or the grant recorded a refusal other than
+   * residue (PREDECESSOR_RESIDUE_CHECKS; an unknown refusal check stops). Anything that has not been proven (an
+   * unreadable journal, an unknown Codex inventory, a sibling source, a spent time budget) skips and leaves the
+   * holds exactly as before, which is the pre-existing behaviour. Only RetainedRecoveryStop, CredentialSwitchSignal
+   * and a lost run ownership propagate.
+   *
+   * Budget: the pass reserves 2 * codexBoundaryDeadlineMs + the successor-prep allowance out of `iteration.deadline`
+   * (that is the held scope's `scopeDeadline`) and caps its own action at the earlier of the action cap and
+   * `scopeDeadline - margin`. The cap aborts the in-flight candidate at its next checkpoint; nothing here races or
+   * abandons it, so every started operation has settled before the scope closes.
+   */
+  private async settlePredecessorHolds(
+    claim: ClaimResponse, flight: RunFlight, bare: string, source: RecoveryJournalEntry,
+    iteration: { attempts: number; deadline: number }, signal: AbortSignal,
+  ): Promise<"proceed" | "stop"> {
+    if (claim.inventory_guarded !== true || !this.recovery.enabled || process.platform !== "linux" ||
+        !Number.isSafeInteger(flight.claimGeneration) || flight.claimGeneration <= 1 ||
+        claim.claim_generation !== flight.claimGeneration || !this.client.hasFeature("recovery_inventory_v1")) return "proceed";
+    const log = flight.runLog;
+    const skip = (reason: string): "proceed" => {
+      log.info("retained predecessor FINAL skipped", { reason, claim_generation: flight.claimGeneration });
+      return "proceed";
+    };
+    const passthrough = (error: unknown): boolean =>
+      error instanceof RetainedRecoveryStop || error instanceof CredentialSwitchSignal || isRunOwnershipLost(error, flight.runId);
+    const startedAt = Date.now();
+    const reserveMs = 2 * this.codexBoundaryDeadlineMs + this.predecessorFinalBudget.successorPrepAllowanceMs;
+    const scopeDeadline = iteration.deadline - reserveMs;
+    const capDeadline = Math.min(startedAt + this.predecessorFinalBudget.actionCapMs,
+      scopeDeadline - this.predecessorFinalBudget.settlementMarginMs);
+    if (capDeadline <= startedAt) return skip("budget");
+    let candidates: RecoveryRecord[];
+    try { candidates = await this.recovery.predecessorRecords(claim.run_id, flight.claimGeneration); }
+    catch (error) {
+      this.retainedLifecycleGuard(flight);
+      if (passthrough(error)) throw error;
+      log.warn("retained predecessor records unreadable; holds untouched", formatRetainedRecoveryDiagnostic(error, flight.redactText));
+      return skip("records_unreadable");
+    }
+    if (candidates.length === 0) return "proceed";
+    // Codex: the capture attempt owns exactly the predecessor clone, so any other source, or an inventory that is not
+    // fully identified, cannot be proven here. The pre-entry read is also the baseline a later change is drift against.
+    let baseline: Array<{ clonePath: string; branch: string; head?: string; identity?: string }> | undefined;
+    if (flight.executor.withCredentialFreeCapture) {
+      let inventory: Awaited<ReturnType<GitCache["readInventoryCloneHeads"]>>;
+      try { inventory = await this.git.readInventoryCloneHeads(bare, claim.run_id, { cloneIdentity: true }); }
+      catch (error) {
+        this.retainedLifecycleGuard(flight);
+        if (passthrough(error)) throw error;
+        return skip("codex_inventory_unknown");
+      }
+      if (inventory.kind !== "verified") return skip("codex_inventory_unknown");
+      if (inventory.clones.length === 0 || inventory.clones.some(c => typeof c.head !== "string" || typeof c.identity !== "string"))
+        return skip("codex_inventory_incomplete");
+      const sourcePath = resolvePath(source.clonePath);
+      if (inventory.clones.some(c => resolvePath(c.clonePath) !== sourcePath)) return skip("codex_sibling_source");
+      baseline = inventory.clones;
+    }
+    const measurements: PredecessorMeasurements = {
+      uploadedBytes: 0, chargedBytes: 0, uploadCount: 0, retainedUnuploadedBytes: 0, reusedBytes: 0,
+    };
+    // One allowance and one decoded-closure account for the whole pass, shared by every candidate (by identity).
+    const allowance = { remaining: RECOVERY_MAX_BUNDLE_BYTES };
+    const closureBudget = { delivered: 0, limit: this.git.recoveryDecodedLimitBytes };
+    const verdict: { stop?: string; residue: boolean; capped: boolean; operated: number; outcomes: string[] } =
+      { residue: false, capped: false, operated: 0, outcomes: [] };
+    const stop = (reason: string): void => { verdict.stop ??= reason; };
+    let proof: Awaited<ReturnType<RunRunner["runFreeCapture"]>> | undefined;
+    try {
+      proof = await this.runFreeCapture(claim, flight, scopeDeadline, signal, async held => {
+        const defaultBranch = claim.repo.default_branch?.trim() || await this.git.defaultBranchName(bare) || "main";
+        const registration = this.registerPredecessorBoundary(flight, held, {
+          generations: candidates.map(r => r.generation!), deadlineAt: scopeDeadline, ...(baseline ? { baseline } : {}),
+        });
+        // The watchdog only records lateness; the scope itself dies at scopeDeadline (grant.live), and the pass still
+        // waits for the running operation to settle.
+        const watchdog = setTimeout(() => registration.markSettlementLate(), Math.max(0, scopeDeadline - Date.now()));
+        watchdog.unref?.();
+        const capAbort = new AbortController();
+        const capTimer = setTimeout(() => {
+          verdict.capped = true;
+          capAbort.abort(new Error("predecessor action cap reached"));
+        }, Math.max(0, capDeadline - Date.now()));
+        capTimer.unref?.();
+        const capSignal = AbortSignal.any([capAbort.signal, signal, this.retainedLifecycleSignal(flight),
+          ...(held.signal ? [held.signal] : [])]);
+        let seen = 0;
+        const sweepRefusals = (): void => {
+          for (; seen < registration.refusals.length; seen++) {
+            const refusal = registration.refusals[seen]!;
+            if (PREDECESSOR_RESIDUE_CHECKS.has(refusal.check)) verdict.residue = true;
+            else stop(`refusal:${refusal.check}`);
+          }
+        };
+        try {
+          for (const record of candidates) {
+            if (verdict.stop || verdict.residue || verdict.capped) break;
+            if (Date.now() >= capDeadline) { verdict.capped = true; break; }
+            if (!registration.live()) { stop("scope_not_live"); break; }
+            verdict.operated++;
+            let outcome: RecoveryOutcome | undefined;
+            try {
+              // runProducer, not run(): the flight's own attempt context is shared by its steering, flush and cancellation
+              // continuations, and run() would attach this pass's clock to it. The producer scope is isolated, inherits
+              // the flight's budget and signals, and runs 50ms past the cap so the cap signal is the one that fires.
+              await MaintenanceBudget.runProducer(async () => {
+                outcome = await this.git.withRecoveryOperation(capSignal, capDeadline, () => MaintenanceBudget.runOwned(capSignal, () =>
+                  this.recovery.operateFrozenInventory({
+                    record, barePath: bare, defaultBranch: record.defaultBranch ?? defaultBranch, signal: capSignal,
+                    onCancellationObserved: () => this.observeCancellation(flight), closureMint: "deny",
+                  }, {
+                    predecessor: {
+                      claimGeneration: flight.claimGeneration, repoId: claim.repo.id, boundary: registration.token,
+                      live: registration.live, uploadAllowance: allowance, measurements,
+                    },
+                  })), undefined, { closureBudget });
+              }, { durationMs: Math.max(0, capDeadline - Date.now()) + 50, signal: capSignal });
+            } catch (error) {
+              this.retainedLifecycleGuard(flight);
+              if (passthrough(error)) throw error;
+              // An operation that settled with an outcome before the producer scope's own end-of-action check threw has
+              // still answered: judge that outcome, never the late abort.
+              if (outcome === undefined) {
+                sweepRefusals();
+                if (error instanceof PredecessorAuthorityLost) stop("authority_lost");
+                // The action cap aborts the candidate at a checkpoint: nothing was released, the hold stays as it was.
+                else if (!verdict.capped) {
+                  log.warn("retained predecessor FINAL operation failed", formatRetainedRecoveryDiagnostic(error, flight.redactText));
+                  stop("operation_error");
+                }
+                break;
+              }
+            }
+            if (outcome === undefined) { stop("operation_error"); break; }
+            verdict.outcomes.push(`${record.generation}:${outcome.held ?? outcome.state}${outcome.reason ? "/" + outcome.reason : ""}`);
+            if (outcome.predecessor?.integrityFailure !== undefined) stop(`integrity:${outcome.predecessor.integrityFailure}`);
+            sweepRefusals();
+            // A residue refusal leaves every dependent (later) candidate on the same clone unsettled by design.
+            if (verdict.stop || verdict.residue) break;
+          }
+          sweepRefusals();
+          if (registration.settlementLate) stop("settlement_late");
+        } finally {
+          clearTimeout(watchdog);
+          clearTimeout(capTimer);
+          registration.dispose();
+        }
+      }, "capture", "strict");
+    } catch (error) {
+      this.retainedLifecycleGuard(flight);
+      if (passthrough(error)) throw error;
+      log.warn("retained predecessor FINAL scope failed; stopping with custody retained",
+        formatRetainedRecoveryDiagnostic(error, flight.redactText));
+      stop(error instanceof FreeCaptureScopeExpired ? "scope_expired"
+        : error instanceof TrustedExecutionRefusal ? "scope_refused" : "scope_error");
+    }
+    if (proof && proof.kind !== "observed_empty") stop("scope_incomplete");
+    if (!proof) stop("scope_unavailable");
+    log.info("retained predecessor FINAL pass", {
+      claim_generation: flight.claimGeneration, verdict: verdict.stop ? "stop" : "proceed", stop_reason: verdict.stop,
+      residue: verdict.residue, capped: verdict.capped, candidates: candidates.length, operated: verdict.operated,
+      outcomes: verdict.outcomes, uploaded_bytes: measurements.uploadedBytes, charged_bytes: measurements.chargedBytes,
+      upload_count: measurements.uploadCount, retained_unuploaded_bytes: measurements.retainedUnuploadedBytes,
+      reused_bytes: measurements.reusedBytes, added_ms: Date.now() - startedAt, reserve_ms: reserveMs,
+      scope_ms: scopeDeadline - startedAt, cap_ms: capDeadline - startedAt,
+    });
+    return verdict.stop ? "stop" : "proceed";
   }
 
   private async runnerCloneForClaim(

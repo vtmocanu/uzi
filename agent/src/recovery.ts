@@ -6723,6 +6723,20 @@ export class RecoveryCoordinator {
     return this.listRecords(runId);
   }
 
+  /**
+   * issue #2969: the guarded, ordinary-origin records of generations strictly below `claimGeneration` whose FINAL is
+   * not yet acknowledged, oldest generation first. A pure authenticated read (it never freezes, writes or contacts the
+   * api), so the retained-claim runner can decide whether a predecessor pass has anything to do before it enters one.
+   */
+  async predecessorRecords(runId: string, claimGeneration: number): Promise<RecoveryRecord[]> {
+    if (!this.enabled || !Number.isSafeInteger(claimGeneration) || claimGeneration < 2) return [];
+    return (await this.listRecords(runId))
+      .filter(r => r.runId === runId && r.inventoryGuarded === true && r.finalAcknowledged !== true &&
+        classifyRecoveryOrigin(r.captureId) === "ordinary" && typeof r.generation === "number" &&
+        Number.isSafeInteger(r.generation) && r.generation >= 1 && r.generation < claimGeneration)
+      .sort((a, b) => a.generation! - b.generation!);
+  }
+
   // Only active runner binders retain this evidence; idle generations leave no tombstone.
   private readonly completionCleanupWitnesses = new Map<string, { fullyForgotten: boolean; active: number }>();
 
