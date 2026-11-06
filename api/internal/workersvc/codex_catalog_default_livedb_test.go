@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
@@ -247,6 +249,39 @@ func TestRecordCodexCatalogDefaultReleaseAfterEarlyFenceLiveDB(t *testing.T) {
 	}
 }
 
+// The report transaction holds the per-user secret mutation lock in shared mode: while it is open
+// (inside the post-upsert hook) an exclusive LockSecretMutation from another connection cannot be
+// granted, and the report still commits afterwards.
+func TestCodexCatalogReportHoldsSecretLockSharedLiveDB(t *testing.T) {
+	e := setupCatalog(t, false)
+	ctxID := e.claimContext(t)
+	other := e.dedicatedPool(t, 2)
+	var lockErr error
+	e.svc.codexCatalogHooks = &codexCatalogTestHooks{afterUpsert: func(codexCatalogRow) {
+		tx, err := other.Begin(e.ctx)
+		if err != nil {
+			lockErr = err
+			return
+		}
+		defer func() { _ = tx.Rollback(e.ctx) }()
+		if _, err := tx.Exec(e.ctx, `SET LOCAL lock_timeout = '200ms'`); err != nil {
+			lockErr = err
+			return
+		}
+		lockErr = store.LockSecretMutation(e.ctx, tx, e.userID)
+	}}
+	if err := e.report(ctxID, "gpt-6.1-sol", "0.164.0", "low"); err != nil {
+		t.Fatalf("report: %v", err)
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(lockErr, &pgErr) || pgErr.Code != "55P03" {
+		t.Fatalf("exclusive secret lock while the report is open: %v, want SQLSTATE 55P03", lockErr)
+	}
+	if n := e.rows(t); n != 1 {
+		t.Fatalf("rows = %d, want 1", n)
+	}
+}
+
 // Rotation, order (a): the claim was assembled at revision N, the material is replaced, then the
 // report arrives. It must be refused and store nothing.
 func TestCodexCatalogRotationBeforeReportLiveDB(t *testing.T) {
@@ -258,12 +293,35 @@ func TestCodexCatalogRotationBeforeReportLiveDB(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			e := setupCatalog(t, sub)
 			ctxID := e.claimContext(t)
+			// BumpCodexMaterialRevision drops a subscription's account link, which leaves no
+			// current context to derive. Put the link back after the bump so the current
+			// context exists and the frozen-vs-echo half is the only half that can refuse.
+			var link pgtype.UUID
+			if err := e.pool.QueryRow(e.ctx, `SELECT provider_account_id FROM codex_credential_state WHERE user_secret_id = $1`, e.aliasID).Scan(&link); err != nil {
+				t.Fatal(err)
+			}
 			e.bump(t)
 			if err := e.report(ctxID, "gpt-6.1-sol", "0.164.0", "low"); !errors.Is(err, ErrStaleCatalogContext) {
 				t.Fatalf("report after rotation: %v, want ErrStaleCatalogContext", err)
 			}
 			if n := e.rows(t); n != 0 {
 				t.Fatalf("rows = %d, want 0", n)
+			}
+			if sub {
+				e.exec(`UPDATE codex_credential_state SET provider_account_id = $1 WHERE user_secret_id = $2`, link, e.aliasID)
+			}
+			// The context the alias yields now is derivable and matches the live alias, so the
+			// current-context half passes; only the frozen half (echo != the run's frozen binding)
+			// can refuse a report that echoes it.
+			current, ok, err := currentCodexCatalogContext(e.ctx, e.q, e.userID, e.aliasID, e.mode)
+			if err != nil || !ok || current == ctxID {
+				t.Fatalf("post-rotation context = %q ok=%v err=%v; want a derivable context different from %q", current, ok, err, ctxID)
+			}
+			if err := e.report(current, "gpt-6.1-sol", "0.164.0", "low"); !errors.Is(err, ErrStaleCatalogContext) {
+				t.Fatalf("report with the post-rotation context: %v, want ErrStaleCatalogContext (frozen mismatch)", err)
+			}
+			if n := e.rows(t); n != 0 {
+				t.Fatalf("rows = %d, want 0 after the post-rotation report", n)
 			}
 		})
 	}

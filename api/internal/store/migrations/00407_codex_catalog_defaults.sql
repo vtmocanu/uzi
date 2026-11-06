@@ -1,6 +1,8 @@
 -- +goose Up
--- First statement: bound any lock wait below. The table is new and empty, so the DDL is
--- instant; a wait past the bound fails the migration, which can be rerun.
+-- First statement: bound any lock wait below. The table is new and empty, so there is no data to
+-- scan, but the foreign key to users takes a SHARE ROW EXCLUSIVE lock on users and can wait behind
+-- concurrent writers; lock_timeout bounds that wait, and a wait past the bound fails the
+-- migration, which can be rerun.
 SET LOCAL lock_timeout = '5s';
 -- Issue #3251: the Codex catalog's default reasoning effort, as last reported by a worker, per
 -- user. context_id is an opaque SHA-256 hash of (user, secret id, auth mode, material revision,

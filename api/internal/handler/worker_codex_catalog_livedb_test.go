@@ -178,7 +178,9 @@ func TestWorkerRecordCodexCatalogDefaultRouteLiveDB(t *testing.T) {
 		"empty effort":      body(map[string]any{"default_effort": nil}),
 		"not json":          []byte(`{`),
 		"trailing value":    append(body(nil), []byte(` {}`)...),
-		"over 1024 bytes":   body(map[string]any{"model": strings.Repeat("m", 100), "catalog_context": echo, "runtime_version": "0.164.0", "pad": strings.Repeat("p", 1100)}),
+		// Every declared field is length-bounded below 1024 bytes, so only the body size bound can
+		// refuse a body that is otherwise valid: trailing JSON whitespace is accepted at any size.
+		"over 1024 bytes": append(body(nil), []byte(strings.Repeat(" ", 1100))...),
 	}
 	for name, b := range invalid {
 		rec := do(tok, runID, b)

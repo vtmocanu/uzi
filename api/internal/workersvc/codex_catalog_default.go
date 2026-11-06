@@ -448,10 +448,16 @@ func selectCatalogDefault(rows []store.ListFreshCodexCatalogDefaultsRow, now tim
 }
 
 // CodexWorkerDefaultModel mirrors the worker's root-model precedence for a Codex run with no
-// schedule-frozen model: the lane default_codex_model, else the lead template's Codex pin when it
-// is a Codex role model (the worker ignores any other), else the provider default.
+// schedule-frozen model: a set (non-NULL) lane default_codex_model always wins, as the worker's
+// `config.default_model ?? template ?? provider` does not skip an empty string; an empty lane
+// then resolves to the provider default (the worker's render drops ""). With a NULL lane, the lead
+// template's Codex pin when it is a Codex role model (the worker ignores any other), else the
+// provider default.
 func CodexWorkerDefaultModel(lane, leadCodexPin pgtype.Text) string {
-	if lane.Valid && lane.String != "" {
+	if lane.Valid {
+		if lane.String == "" {
+			return agenttmpl.DefaultCodexModel
+		}
 		return lane.String
 	}
 	if leadCodexPin.Valid && agenttmpl.CodexRoleModels[leadCodexPin.String] {
