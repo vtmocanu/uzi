@@ -199,6 +199,7 @@ import {
   MAX_FOLLOW_UP_BATCH_RUNES,
   MAX_PRIOR_OWNER_HISTORY_ENTRIES,
   type AnswerVerdict,
+  type CredentialSwitchHold,
   type PlanVerdict,
 } from "./steering.js";
 import { GitLabClient, ForgeError, ForgejoClient, GitHubClient, type ForgeClient } from "./forge.js";
@@ -1015,6 +1016,21 @@ function checkpointStopFields(steering: SteeringChannel, now: () => number): Omi
 
 /** Marks checked-gate failures whose escalation may be refused by held transport. */
 class PlanCrossCheckFailure extends Error {}
+
+const CANDIDATE_TRANSPORT_INVARIANT_MESSAGE =
+  "candidate transport invariant violated: credential switch reached an installed reservation; held unassigned events could not be preserved";
+
+/** A credential switch reached enterCredentialSwitch while a candidate transport reservation was
+ * installed. The plan cross-check holds the switch (SteeringChannel.holdCredentialSwitch) for the
+ * whole reservation, so this is a bug guard, not a path: it fails the run generically (it is NOT a
+ * checked lifecycle control) instead of capturing, releasing or clearing a switch that would drop
+ * the reservation's held unassigned events. */
+export class CandidateTransportInvariantError extends Error {
+  constructor() {
+    super(CANDIDATE_TRANSPORT_INVARIANT_MESSAGE);
+    this.name = "CandidateTransportInvariantError";
+  }
+}
 
 /** Keep executeClaim's lifecycle and custody dispositions through checked-gate catches.
  * Presentation refusals are deliberately excluded: associated gates fail terminally. */
@@ -3757,6 +3773,19 @@ export class RunRunner {
    *  abort. Undefined outside disk mode. */
   private diskParkCaptureWait(flight: RunFlight, boundaryMs: number = this.codexBoundaryDeadlineMs): AuthorityWait | undefined {
     if (flight.steering.getPauseMode() !== "disk") return undefined;
+    return this.terminalLifecycleCaptureWait(flight, boundaryMs);
+  }
+
+  /** The wait for A of a non-held capture taken for a credential switch (issue #3953). The switch aborts
+   *  both the run's cancel signal and its lifecycle with its own "run released for a credential switch"
+   *  signal, so authorityWait would reject the fetch-back on the switch's own abort and the capture would
+   *  never verify. terminalLifecycleSignal is not aborted by a switch; a real cancel, a claim fence, a
+   *  receipt failure and shutdown still abort it. Same acquisition-only bound as diskParkCaptureWait. */
+  private credentialSwitchCaptureWait(flight: RunFlight, boundaryMs: number = this.codexBoundaryDeadlineMs): AuthorityWait {
+    return this.terminalLifecycleCaptureWait(flight, boundaryMs);
+  }
+
+  private terminalLifecycleCaptureWait(flight: RunFlight, boundaryMs: number): AuthorityWait {
     const budget = MaintenanceBudget.current()?.remainingMs() ?? Infinity;
     return {
       signal: AbortSignal.any([flight.steering.terminalLifecycleSignal(), this.shutdownSignal.signal]),
@@ -6002,6 +6031,15 @@ export class RunRunner {
         // at B/C. Caught here BEFORE the generic terminal path so a switch NEVER becomes a `failed`
         // run. Enter the same two-phase release; enterCredentialSwitch already set the flight's flags
         // and (on release) reported credential_switch, so NEITHER branch reports a terminal state.
+        if (batcher.hasCandidateReservation()) {
+          // Invariant guard (CandidateTransportInvariantError): the plan cross-check holds a switch
+          // for the whole reservation, so reaching here with one installed is a bug. Releasing or
+          // clearing the switch would drop the reservation's held unassigned events.
+          runLog.error(CANDIDATE_TRANSPORT_INVARIANT_MESSAGE, { run_id: flight.runId });
+          await batcher.close().catch(() => undefined);
+          await this.reportGenericFailure(claim, flight, new CandidateTransportInvariantError());
+          return;
+        }
         if (flight.retainedEpisode || flight.retainedLocalCustody || flight.retainedEpisodeCustody ||
             flight.completedRetainedSuccessor) {
           if (await this.enterRetainedCredentialSwitch(claim, flight, runLog) === "held") {
@@ -7878,10 +7916,10 @@ export class RunRunner {
   }
 
   /**
-   * PRD #1392 M2 (D7) / PRD #1809 D6 — release THIS claim generation's custody hold before a
-   * pre-clone park, and report whether the release is POSITIVELY proven to have settled exactly
+   * PRD #1392 M2 (D7) / PRD #1809 D6 — release an UNGUARDED claim generation's custody hold
+   * before a pre-clone park, and report whether the release is POSITIVELY proven to have settled exactly
    * that generation (released && generation===gen && holds_released===1 && !retained). ClaimRun
-   * opens a hold for every custody-capable claim, and a pre-clone generation adopted no source,
+   * opens a hold for every custody-capable claim, and an unguarded pre-clone generation adopted no source,
    * so nothing else would ever release it: a park that leaves it open keeps the worker
    * custody-held forever (recycle skipped, DeleteWorker refused). NO release_evidence: the
    * worker's release endpoint allowlists only publication/forge_no_output, and an older api need
@@ -8334,28 +8372,28 @@ export class RunRunner {
 
   /**
    * PRD #1809 D6 — park a run whose data-volume write stayed disk-full. Every such park happens
-   * BEFORE the clone/fetch (the preflight, or the retry around ensureClone), so it is a pre-clone
-   * park and takes the forge pre-clone park's release-then-park sequence (ADR-1392 D3/D7):
+   * BEFORE the clone/fetch (the preflight, or the retry around ensureClone). An unguarded claim
+   * takes the forge pre-clone park's release-then-park sequence (ADR-1392 D3/D7):
    *
-   *   1. release THIS generation's custody hold and require positive proof of an exact release
-   *      ({@link releasePreCloneHoldWithProof}). The api's data_volume_full park settles no hold
-   *      (a mid-run disk park must keep custody), and no later path releases a pre-clone
-   *      generation's hold, so without this the hold stays open forever and the worker counts as
-   *      custody-held. Needs `recovery_release_exact_echo` (every api that has the typed cause
-   *      advertises it); without it, or without proof, the run takes today's failed path.
+   *   1. release THIS generation's unguarded custody hold and require positive proof of an exact
+   *      release ({@link releasePreCloneHoldWithProof}). The api's data_volume_full park settles no
+   *      hold (a mid-run disk park must keep custody). Needs `recovery_release_exact_echo`;
+   *      without it, or without proof, the unguarded run takes today's failed path. An inventory-
+   *      guarded claim cannot use that legacy release. With the typed cause it parks while keeping
+   *      guarded custody intact; without the typed cause it takes the failed path.
    *   2. report the park through the shared claim-fenced report and ack dispatch (D10): the TYPED
    *      `{recovery_wait, recovery_cause: data_volume_full}` when the api advertises
    *      `recovery_cause_data_volume_full` (a counted park; `disk_park_preventive` is M4's and is
    *      never sent here), else the untyped `{recovery_wait}`. The reportState closure stamps
    *      claim_generation.
    *
-   * The release is not atomic with the park; that is safe because the released generation adopted
-   * nothing: a park that then fails (400, unrecognised ack) or turns into a stop leaves no work
-   * behind the released hold. Before the clone the failed path has no settle of its own to run
+   * The unguarded release is not atomic with the park; that is safe because the released generation
+   * adopted nothing: a park that then fails (400, unrecognised ack) or turns into a stop leaves no
+   * work behind the released hold. Before the clone the failed path has no settle of its own to run
    * (reapRecoveryProviderForSettle returns false while `flight.barePath` is unset), so this release
-   * is the only one the generation gets. The arms that return "fail" BEFORE the release (no claim
-   * generation, no exact-release echo, no positive proof) therefore leave the pre-clone hold open,
-   * as every other pre-clone failure does today.
+   * is the only one an unguarded generation gets. Guarded claims keep custody on a disk park;
+   * an authoritative terminal outcome may still use the existing empty-inventory FINAL
+   * settlement.
    *
    * N2: every such park is pre-clone by construction. The release is guarded on it: a
    * DataVolumeFullError that arrives with a clone in place (`flight.barePath` set) releases nothing
@@ -8387,7 +8425,17 @@ export class RunRunner {
       return "fail";
     }
     const features = this.client.protocolFeatures;
-    if (!features.includes("recovery_release_exact_echo")) {
+    const guarded = claim.inventory_guarded === true;
+    const typed = features.includes(DATA_VOLUME_FULL_FEATURE);
+    if (guarded && !typed) {
+      runLog.warn("data volume full, but this guarded claim cannot use a legacy untyped park; taking today's failed path", {
+        run_id: flight.runId,
+        operation: err.operation,
+        cause: "data_volume_full",
+      });
+      return "fail";
+    }
+    if (!guarded && !features.includes("recovery_release_exact_echo")) {
       runLog.warn("data volume full, but the api cannot prove an exact custody release; taking today's failed path", {
         run_id: flight.runId,
         operation: err.operation,
@@ -8396,15 +8444,17 @@ export class RunRunner {
       });
       return "fail";
     }
-    const typed = features.includes(DATA_VOLUME_FULL_FEATURE);
-    runLog.warn("data volume full after a reclaim and a retry; releasing this generation's custody and parking the run", {
+    runLog.warn(guarded
+      ? "data volume full after a reclaim and a retry; retaining guarded custody and parking the run"
+      : "data volume full after a reclaim and a retry; releasing this generation's custody and parking the run", {
       run_id: flight.runId,
       operation: err.operation,
       cause: "data_volume_full",
       typed,
+      guarded,
       detail: err.message,
     });
-    if (!(await this.releasePreCloneHoldWithProof(flight, claim.claim_generation, runLog, DATA_VOLUME_PARK_COPY))) {
+    if (!guarded && !(await this.releasePreCloneHoldWithProof(flight, claim.claim_generation, runLog, DATA_VOLUME_PARK_COPY))) {
       return "fail";
     }
     const body: StateRequest = typed
@@ -8508,7 +8558,7 @@ export class RunRunner {
       return "parked";
     }
     if (ack.status && TERMINAL_RUN_STATUSES.has(ack.status)) {
-      // cancelled, or failed when the cap branch committed the terminal state, or any other
+      // cancelled, failed by a legacy server or another terminal cause, or any other
       // authoritative terminal status: close the still-open batcher, no park event, no second
       // report. A guarded pre-clone hold still needs positive empty-inventory evidence
       // after this confirmed terminal outcome; the finally does ordinary cleanup.
@@ -8571,8 +8621,8 @@ export class RunRunner {
     copy: PreCloneParkCopy = FORGE_PARK_COPY,
   ): Promise<void> {
     const { batcher } = flight;
-    const when = retryAt === null && copy === FORGE_PARK_COPY
-      ? "automatic forge retries exhausted; waiting for owner Resume or Cancel"
+    const when = retryAt === null && (copy === FORGE_PARK_COPY || copy === DATA_VOLUME_PARK_COPY)
+      ? `automatic ${copy === DATA_VOLUME_PARK_COPY ? "disk" : "forge"} retries exhausted; waiting for owner Resume or Cancel`
       : retryAt ? `retry at ${retryAt}` : "retry after backoff";
     batcher.emit({
       kind: "status",
@@ -15164,6 +15214,24 @@ export class RunRunner {
     let crossCheckSelected = false;
     let crossCheckRound = 1;
     let crossCheckDiscoveryDone = false;
+    // Issue #3953: the checker's decision, kept across the CredentialSwitchSignal control exit a
+    // held switch is serviced with (SteeringChannel.holdCredentialSwitch), so the give-up re-run of
+    // onPlan adopts it instead of resubmitting a candidate whose reservation was already released.
+    // Claim-scoped and one-shot: consumed or cleared at the first same-generation continuation, by
+    // checkedFailure for any other exit, and by the attemptCredentialSwitch hook on a release. The
+    // closures die with this flight, which ends them.
+    let pendingCheckedApproval: {
+      claimGeneration: number; round: number; candidate_digest: string; planMd: string; milestones: string;
+      response: Extract<Awaited<ReturnType<typeof checkPlan>>, { kind: "approve" }>["response"];
+      releaseStateBarrier: (() => void) | undefined; failStateBarrier: ((error: unknown) => void) | undefined;
+    } | undefined;
+    // The revise stash is bound to the candidate the checker read (planMd and the milestones JSON)
+    // and to the round it decided; presentedCandidate records the candidate each gatePlan entry
+    // presents, which continueExistingPlanGate compares it with.
+    let pendingCheckedRevise: {
+      claimGeneration: number; round: number; nextRound: number; planMd: string; milestones: string; verdict: PlanVerdict;
+    } | undefined;
+    let presentedCandidate: { planMd: string; milestones: string } | undefined;
     // PRD #1230 M4 (D3/D4): the one-way, flight-scoped human-gate latch of a semantic run. Once
     // coverage was not complete, a maintainer criterion exists, or the required checker did not
     // APPROVE, this execution never auto-approves again, including a later (e.g. human-revised)
@@ -15186,6 +15254,11 @@ export class RunRunner {
       return flight.reportState(frozen, steering.lifecycleSignal(), true);
     };
     const checkedFailure = (error: unknown): never => {
+      // Only the CredentialSwitchSignal control exit keeps a stashed decision (see above).
+      if (!(error instanceof CredentialSwitchSignal)) {
+        pendingCheckedApproval = undefined;
+        pendingCheckedRevise = undefined;
+      }
       if (isCheckedLifecycleControl(error)) throw error;
       steering.lifecycleSignal().throwIfAborted();
       const reason = errMessage(error).startsWith("plan cross-check:") ? errMessage(error) :
@@ -15233,7 +15306,7 @@ export class RunRunner {
     };
     const semanticPlanning = claim.semantic_planning === undefined ? undefined : parseSemanticEnrollment(claim.semantic_planning);
     const semanticGate = semanticPlanning ? new SemanticPlanningGate(this.client, runId, flight.claimGeneration,
-      steering.lifecycleSignal(), this.semanticCoverageTestTransport) : undefined;
+      () => steering.lifecycleSignal(), this.semanticCoverageTestTransport) : undefined;
     // issue #3870: the managed Go work leaf for a Claude flight on Linux. A Codex executor's `safety`
     // is only populated inside run(), so it is excluded here by the signals known before launch
     // (`claim.secrets.codex`, `sandboxesCommands`), as isCodexCapture does. Only an ordinary
@@ -15507,6 +15580,13 @@ export class RunRunner {
       // issue #1597 M2: gated end to end — from the wip marker captureRecoveryRestorePoint commits to
       // the give-up's undoWipMarker — so a mid-turn tick can never publish that throwaway marker.
       attemptCredentialSwitch: async () => {
+        if (batcher.hasCandidateReservation()) {
+          // Invariant guard: no capture, report, clear or continuation. Not a checked lifecycle
+          // control, so it reaches dispatchFailure's generic branch (reportGenericFailure closes
+          // the batcher, which preserves the reservation's held events as a failed close).
+          runLog.error(CANDIDATE_TRANSPORT_INVARIANT_MESSAGE, { run_id: flight.runId });
+          throw new CandidateTransportInvariantError();
+        }
         const outcome = await this.runGatedSink(flight, async () => {
           const outcome = await this.enterCredentialSwitch(claim, flight, runLog);
           if (outcome === "retained_held") throw new CredentialSwitchRetainedStop(true);
@@ -15538,6 +15618,10 @@ export class RunRunner {
         // The marker cleanup and the switch settle must leave the sink before the next tick starts.
         // A release or an uncertain settle keeps the interrupted lifecycle sticky.
         if (outcome === "gave_up") steering.rearmLifecycle();
+        if (outcome === "released") {
+          pendingCheckedApproval = undefined;
+          pendingCheckedRevise = undefined;
+        }
         return outcome;
       },
       resumePhase: claim.resume_phase,
@@ -15634,23 +15718,34 @@ export class RunRunner {
         let semanticSources: Awaited<ReturnType<typeof captureSemanticSources>> | undefined;
         let semanticDiff: Awaited<ReturnType<RunRunner["captureCheckedPlanningDiff"]>> | undefined;
         if (semanticGate) {
-          if (!barePath) throw new Error("semantic candidate: bare source unavailable");
-          semanticDiff = await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, barePath, steering.lifecycleSignal(), runLog);
-          if ("refusal" in semanticDiff) throw new Error(`semantic candidate: planning diff unavailable (${semanticDiff.refusal}: ${semanticDiff.diagnostic})`);
-          semanticSources = await captureSemanticSources(this.git, {
-            barePath, repo: claim.repo.id, headSha: runnerClone.baseCommit,
-            issue: { id: "issue:" + claim.issue_iid, bytes: Buffer.from(claim.issue_description) },
-            planBytes: Buffer.from(planMd), timeoutMs: 3000, signal: steering.lifecycleSignal(),
-          });
-          semanticCompiled = await semanticGate.compile({
-            plan_md: planMd, milestones: milestones ?? [],
-            required_capabilities: toolchainDetection?.required_capabilities ?? [],
-            required_tools: toolchainDetection?.required_tools ?? [],
-            size_class: toolchainDetection?.size_class ?? "s", base_commit: runnerClone.baseCommit,
-            planning_diff: semanticDiff.diff,
-          }, semanticSubmission, semanticSources.sources);
-          flight.semanticDrift = { barePath, headSha: runnerClone.baseCommit,
-            sources: semanticCompiled.candidate.sources.map(({ id, kind, hash, completeness }) => ({ id, kind, hash, completeness })) };
+          try {
+            if (!barePath) throw new Error("semantic candidate: bare source unavailable");
+            semanticDiff = await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, barePath, steering.lifecycleSignal(), runLog);
+            if ("refusal" in semanticDiff) throw new Error(`semantic candidate: planning diff unavailable (${semanticDiff.refusal}: ${semanticDiff.diagnostic})`);
+            semanticSources = await captureSemanticSources(this.git, {
+              barePath, repo: claim.repo.id, headSha: runnerClone.baseCommit,
+              issue: { id: "issue:" + claim.issue_iid, bytes: Buffer.from(claim.issue_description) },
+              planBytes: Buffer.from(planMd), timeoutMs: 3000, signal: steering.lifecycleSignal(),
+            });
+            semanticCompiled = await semanticGate.compile({
+              plan_md: planMd, milestones: milestones ?? [],
+              required_capabilities: toolchainDetection?.required_capabilities ?? [],
+              required_tools: toolchainDetection?.required_tools ?? [],
+              size_class: toolchainDetection?.size_class ?? "s", base_commit: runnerClone.baseCommit,
+              planning_diff: semanticDiff.diff,
+            }, semanticSubmission, semanticSources.sources);
+            flight.semanticDrift = { barePath, headSha: runnerClone.baseCommit,
+              sources: semanticCompiled.candidate.sources.map(({ id, kind, hash, completeness }) => ({ id, kind, hash, completeness })) };
+          } catch (error) {
+            // The stash is consumed at the adoption point below, after this pre-adoption work. Only the
+            // switch control exit keeps it for the next give-up re-run; any other failure drops it.
+            if (!(error instanceof CredentialSwitchSignal)) {
+              pendingCheckedApproval?.failStateBarrier?.(error);
+              pendingCheckedApproval = undefined;
+              pendingCheckedRevise = undefined;
+            }
+            throw error;
+          }
         }
         // Issue #3149: a resume whose earlier owner follow-ups could not be restored needs a human
         // approval, even on autopilot (no cross-check, no auto-approve), for the whole claim.
@@ -15684,9 +15779,55 @@ export class RunRunner {
         let gatedPass: Extract<Awaited<ReturnType<typeof checkPlan>>, { kind: "gated_pass" }> | undefined;
         let releaseStateBarrier: (() => void) | undefined;
         let failStateBarrier: ((error: unknown) => void) | undefined;
-        if (eligible && !crossCheckSelected && !checkedHuman) {
+        // Issue #3953: a held credential switch. The hold (SteeringChannel.holdCredentialSwitch) is
+        // opened just before the checker's candidate transport can be reserved, and is serviced only
+        // once that transport is verified released, so the switch never aborts a live reservation.
+        // While a reservation stays installed (a gated pass or forced human gate) both helpers are
+        // no-ops: the hold stays open until the applied gate releases it. Never cancels the
+        // reservation and arms no timer.
+        let hold: CredentialSwitchHold | undefined;
+        let stashed = false;
+        const serviceHold = (): void => {
+          if (hold && !batcher.hasCandidateReservation()) hold.close({ service: true });
+        };
+        const closeHoldNoService = (): void => {
+          if (hold && !batcher.hasCandidateReservation()) hold.close({ service: false });
+        };
+        // A switch is in play when one is latched by the hold, or already pending (the hold has no
+        // effect then and latched() is false).
+        const switchInPlay = (): boolean => hold?.latched() === true || steering.pendingCredentialSwitch() !== undefined;
+        // Stash the checker's approval for the give-up re-run (non-throwing). Used at the S1 control
+        // exit and when a switch surfaces after the approve but before gatePlan retains the canonical
+        // storage (the semantic review, gatePlan's early awaits): the re-run would otherwise lose the
+        // approval. Once storage is retained, continueCheckedStorage owns the resume instead.
+        const stashApproval = (): void => {
+          if (!checkedApproval || continueCheckedStorage) return;
+          pendingCheckedApproval = { claimGeneration: flight.claimGeneration, planMd,
+            round: checkedApproval.round, candidate_digest: checkedApproval.candidate_digest,
+            milestones: JSON.stringify(milestones ?? []), response: checkedApproval,
+            releaseStateBarrier, failStateBarrier };
+        };
+        // The give-up re-run consumes (or the mismatch clears) the stashed approve at entry.
+        const adopted = pendingCheckedApproval;
+        pendingCheckedApproval = undefined;
+        pendingCheckedRevise = undefined;
+        presentedCandidate = { planMd, milestones: JSON.stringify(milestones ?? []) };
+        // The digest is comparable only on a semantic run (semanticCompiled carries the canonical
+        // candidate digest); a non-semantic run has no re-presented digest, and the server owns that
+        // hash, so planMd, milestones, generation and round are the binding there.
+        if (adopted) {
+          if (!eligible || adopted.claimGeneration !== flight.claimGeneration || adopted.planMd !== planMd ||
+              adopted.milestones !== JSON.stringify(milestones ?? []) || adopted.round !== crossCheckRound ||
+              (semanticCompiled && adopted.candidate_digest !== semanticCompiled.candidate.digest)) {
+            const mismatch = new Error("plan cross-check: stashed decision does not match the re-presented candidate");
+            adopted.failStateBarrier?.(mismatch);
+            return checkedFailure(mismatch);
+          }
+          checkedApproval = adopted.response;
+          releaseStateBarrier = adopted.releaseStateBarrier;
+          failStateBarrier = adopted.failStateBarrier;
+        } else if (eligible && !crossCheckSelected && !checkedHuman) {
           const discoverRound = !crossCheckDiscoveryDone && flight.claimGeneration > 1;
-          crossCheckDiscoveryDone = true;
           crossCheckSelected = true;
           const barrier = new Promise<void>((resolve, reject) => {
             releaseStateBarrier = () => { flight.checkedStateBarrier = undefined; resolve(); };
@@ -15725,6 +15866,8 @@ export class RunRunner {
                 checkedHuman = { phase: "publishinginitial", onApplied: () => releaseStateBarrier?.() };
               }
             }
+            // Discovery completed: a switch that interrupted it re-runs it with the re-selection.
+            crossCheckDiscoveryDone = true;
             if (checkedHuman) {
               // Discovery selected an existing fallback, without adopting a human presentation.
             } else if (codexLeadUnsupported) {
@@ -15752,6 +15895,7 @@ export class RunRunner {
                   round: crossCheckRound, allowAutomaticRevision: true as const };
                 // Literal-mode calls select the typed overloads: the gated result excludes
                 // "approve" at compile time (the runtime throw below stays as a backstop).
+                hold = steering.holdCredentialSwitch();
                 const gatedDecision: Exclude<CheckedPlanDecision, { kind: "approve" }> | undefined =
                   gatedEligible ? await checkPlan({ ...checkOptions, mode: "gated" }) : undefined;
                 const decision = gatedDecision ?? await checkPlan({ ...checkOptions, mode: "required" });
@@ -15759,6 +15903,16 @@ export class RunRunner {
                   // Gated mode never mints an approval: checkPlan returns gated_pass instead.
                   if (gatedEligible) throw new Error("plan cross-check: unexpected approval in gated mode");
                   checkedApproval = decision.response;
+                  // The reservation is released: if a switch is in play, stash this decision before
+                  // anything else can fail or emit, then service the hold. The throw below is the
+                  // CredentialSwitchSignal control exit; the give-up re-run adopts the stash. All
+                  // of this is synchronous, so no switch can slip in between.
+                  if (switchInPlay()) {
+                    stashed = true;
+                    stashApproval();
+                  }
+                  serviceHold();
+                  steering.lifecycleSignal().throwIfAborted();
                 } else if (decision.kind === "gated_pass") {
                   // The checker approved, and a human still approves: present the ordinary gate
                   // from the canonical candidate the checker read, bound to its digest. The
@@ -15773,21 +15927,32 @@ export class RunRunner {
                   const rounds = decision.response.round;
                   crossCheckReason = `plan cross-check: passed after ${rounds} ${rounds === 1 ? "round" : "rounds"}`;
                   checkedHuman.onApplied = async (ack) => {
-                    if (!decision.reservation.releaseAppliedGate(ack))
+                    if (!decision.reservation.releaseAppliedGate(ack)) {
+                      closeHoldNoService();
                       throw new Error("plan cross-check: gated pass settlement receipts unavailable");
+                    }
                     releaseStateBarrier?.();
+                    serviceHold();
                   };
                 } else if (decision.kind === "revise") {
                   // checkPlan has released the decided proof and settled usage. Release and
                   // await this exact barrier before allowing another executor planning turn.
                   releaseStateBarrier?.();
                   await barrier;
-                  steering.lifecycleSignal().throwIfAborted();
                   crossCheckRound = decision.response.round + 1;
                   crossCheckSelected = false;
-                  return { kind: "revise", automatic: true, round: decision.response.round,
+                  const reviseVerdict: PlanVerdict = { kind: "revise", automatic: true, round: decision.response.round,
                     feedback: decision.response.findings?.summary ?? "Plan cross-check requested changes.",
                     ...(decision.response.findings ? { items: decision.response.findings.items } : {}) };
+                  if (switchInPlay()) {
+                    stashed = true;
+                    pendingCheckedRevise = { claimGeneration: flight.claimGeneration, round: decision.response.round,
+                      nextRound: crossCheckRound, planMd, milestones: JSON.stringify(milestones ?? []),
+                      verdict: reviseVerdict };
+                  }
+                  serviceHold();
+                  steering.lifecycleSignal().throwIfAborted();
+                  return reviseVerdict;
                 } else {
                   checkedHuman = { phase: "publishinginitial" };
                   checkedFields = decision.fields;
@@ -15797,16 +15962,32 @@ export class RunRunner {
                       reason === "timed_out" ? "plan cross-check: timed out" :
                         `plan cross-check: ${reason.replaceAll("_", " ")}`;
                   checkedHuman.onApplied = async (ack) => {
-                    await decision.completePreparation?.(steering.lifecycleSignal());
-                    if (decision.reservation && !decision.reservation.releaseAppliedGate(ack))
-                      throw new Error("plan cross-check: forced gate settlement receipts unavailable");
+                    try {
+                      await decision.completePreparation?.(steering.lifecycleSignal());
+                      if (decision.reservation && !decision.reservation.releaseAppliedGate(ack))
+                        throw new Error("plan cross-check: forced gate settlement receipts unavailable");
+                    } catch (error) {
+                      closeHoldNoService();
+                      throw error;
+                    }
                     releaseStateBarrier?.();
+                    serviceHold();
                   };
                 }
               }
             }
           } catch (error) {
-            if (!(error instanceof CredentialSwitchSignal)) failStateBarrier?.(error);
+            if (error instanceof CredentialSwitchSignal) {
+              // A switch before any decision was stashed (discovery, planning-diff capture, or a
+              // switch already pending when the hold opened) leaves no reservation: drop this
+              // selection so the give-up re-run re-selects from scratch. A stashed decision keeps
+              // its barrier for the adopting re-run.
+              if (!stashed && !batcher.hasCandidateReservation()) {
+                releaseStateBarrier?.();
+                crossCheckSelected = false;
+              }
+            } else failStateBarrier?.(error);
+            closeHoldNoService();
             return checkedFailure(error);
           }
         } else if (checkedHuman) {
@@ -15820,7 +16001,11 @@ export class RunRunner {
         let semanticPark: SemanticPark | undefined;
         if (semanticGate && semanticCompiled && semanticSources) {
           // The SERVER's coverage authority decides; the review result is display evidence only.
-          const { review: coverage, outcome } = await semanticGate.reviewForGate(semanticCompiled, planMd, semanticSources.sources);
+          const { review: coverage, outcome } = await semanticGate.reviewForGate(semanticCompiled, planMd, semanticSources.sources)
+            .catch((error: unknown) => {
+              if (error instanceof CredentialSwitchSignal) stashApproval();
+              throw error;
+            });
           batcher.emit({ kind: "status", agent: "worker", payload: { event: "semantic_plan_coverage", ...coverage,
             server_outcome: outcome } });
           const maintainers = semanticCompiled.candidate.criteria.filter(c => c.kind === "maintainer").length;
@@ -15922,7 +16107,9 @@ export class RunRunner {
             claimGeneration: flight.claimGeneration } : undefined,
         ).catch((error) => {
           if (checkedHuman || checkedApproval) {
-            if (!(error instanceof CredentialSwitchSignal)) failStateBarrier?.(error);
+            if (error instanceof CredentialSwitchSignal) {
+              stashApproval();
+            } else failStateBarrier?.(error);
             return checkedFailure(error);
           }
           throw error;
@@ -15949,6 +16136,18 @@ export class RunRunner {
       },
       ...((claim.auto_approve && claim.plan_cross_check_required || !claim.auto_approve && claim.plan_cross_check_gated) && !seeded ? {
         continueExistingPlanGate: async (otherwise: () => Promise<PlanVerdict>) => {
+          // Issue #3953: a serviced switch after an automatic checker REVISE resumes with that
+          // exact verdict (one-shot) instead of re-running the plan gate; any other continuation
+          // clears it.
+          const revise = pendingCheckedRevise;
+          pendingCheckedRevise = undefined;
+          if (revise) {
+            if (revise.claimGeneration !== flight.claimGeneration || crossCheckRound !== revise.nextRound ||
+                revise.round + 1 !== revise.nextRound || !presentedCandidate ||
+                revise.planMd !== presentedCandidate.planMd || revise.milestones !== presentedCandidate.milestones)
+              return checkedFailure(new Error("plan cross-check: stashed decision does not match the re-presented candidate"));
+            return revise.verdict;
+          }
           if (continueCheckedStorage) return continueCheckedStorage();
           if (!checkedHuman) return otherwise();
           if (!checkedHuman.continueWait || checkedHuman.phase === "terminal" || checkedHuman.phase === "revisionplanning")
@@ -22017,10 +22216,13 @@ export class RunRunner {
             return true;
           }
           if (ack.status === "recovery_wait" && !credentialDeferred && disk) {
-            runLog.info("run parked mid-run for its data volume; its caches are dropped and it resumes automatically", {
+            const held = ack.recoveryRetryNotBefore === null;
+            const continuation = held ? "it waits for owner Resume or Cancel" : "it resumes automatically";
+            runLog.info(`run parked mid-run for its data volume; ${continuation}`, {
               run_id: flight.runId,
               cause: "data_volume_full",
               preventive: disk.preventive,
+              retry_not_before: ack.recoveryRetryNotBefore,
               typed: parkBody.recovery_cause !== undefined,
               published: capture.published,
             });
@@ -22029,10 +22231,10 @@ export class RunRunner {
               agent: "worker",
               payload: {
                 text: degraded
-                  ? "paused for a full data volume; the unverified work and session are retained on this worker only until capture succeeds"
+                  ? `paused for a full data volume; the unverified work and session are retained on this worker only until capture succeeds${held ? "; the run waits for owner Resume or Cancel" : ""}`
                   : disk.preventive
-                  ? "paused because this run's build caches stayed over their size cap; the caches are dropped and it resumes automatically"
-                  : "paused because the worker's data volume is nearly full; this run's build caches are dropped and it resumes automatically",
+                  ? `paused because this run's build caches stayed over their size cap; the caches are dropped and ${continuation}`
+                  : `paused because the worker's data volume is nearly full; this run's build caches are dropped and ${continuation}`,
               },
             });
             // No reapThenSettleRecoveryGeneration: the custody hold is kept (see `disk` above).
@@ -22899,8 +23101,9 @@ export class RunRunner {
     }
     const captureDeadline = Math.min(opts.episode?.deadlineAt ?? Infinity,
       opts.heldCapture?.deadlineAt ?? Infinity, opts.heldAuthenticated?.deadlineAt ?? Infinity);
-    const diskWait = (opts.heldCapture ?? opts.heldAuthenticated) ? undefined : this.diskParkCaptureWait(flight);
-    const bodySignal = opts.signal ?? diskWait?.signal;
+    const captureWait = (opts.heldCapture ?? opts.heldAuthenticated) ? undefined
+      : this.diskParkCaptureWait(flight) ?? (site === "credential_switch" ? this.credentialSwitchCaptureWait(flight) : undefined);
+    const bodySignal = opts.signal ?? captureWait?.signal;
     await this.bootstrapRemediationRestrictions(flight, undefined, undefined, bodySignal, captureDeadline);
     // issue #1783 (auditor M2): prove the clone quiescent BEFORE the capture (its wip marker, the
     // fetch-back and the credentialed overlay + publish). On survivors/unverified NOTHING runs:
@@ -22965,7 +23168,7 @@ export class RunRunner {
       await opts.beforeMutation?.();
       const held = opts.heldCapture ?? opts.heldAuthenticated;
       await this.fetchTracking(flight, barePath, worktreePath, branch, {}, undefined,
-        held ? { signal: held.signal, timeoutMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, held.deadlineAt - Date.now())) } : diskWait);
+        held ? { signal: held.signal, timeoutMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, held.deadlineAt - Date.now())) } : captureWait);
       await opts.beforeMutation?.();
     } catch (e) {
       if (opts.beforeMutation) throw e;

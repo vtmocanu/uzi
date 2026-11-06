@@ -13,6 +13,7 @@ import {
 } from "react";
 import { Link } from "react-router-dom";
 import { forgeWaitLabel } from "../lib/forgeCooldown";
+import { diskWaitLabel } from "../lib/diskRecovery";
 import { effectiveRunStatus } from "../lib/runBadge";
 import type { RunHealth, RunProgress } from "../lib/apiTypes";
 import { ArrowLeftIcon, EyeIcon, EyeOffIcon } from "./icons";
@@ -646,6 +647,7 @@ export function StatusPill({ status: rawStatus, progress, health, recovery_wait_
   const cfg = accountWait ? { tone: "info" as BadgeTone, pulse: false } :
     RUN_STATUS_TONES[status] ?? { tone: "neutral" as BadgeTone };
   const label = accountWait ? "waiting" :
+    diskWaitLabel({ status: rawStatus, recovery_wait_cause, recovery_retry_not_before }) ??
     forgeWaitLabel({ status: rawStatus, recovery_wait_cause, recovery_retry_not_before, recovery_wait_phase }) ?? RUN_STATUS_LABELS[status] ?? status.replace(/_/g, " ");
   const showsProgress = status === "running" || status === "completion_checking" || status === "completion_reworking";
   const pct = !accountWait && showsProgress && progress?.state === "percent" &&

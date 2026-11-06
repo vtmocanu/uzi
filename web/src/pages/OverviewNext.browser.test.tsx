@@ -1,6 +1,7 @@
+/// <reference types="@vitest/browser-playwright" />
 import "../index.css";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { page } from "vitest/browser";
+import { cdp, page, userEvent } from "vitest/browser";
 import { cleanup, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { OverviewNext } from "./OverviewNext";
@@ -123,6 +124,204 @@ describe("OverviewNext at 400px", () => {
     expect.soft(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(
       window.innerWidth,
     );
+  });
+});
+
+describe("OverviewNext issue work line", () => {
+  function mountLine() {
+    // Two live stations (Planning and Building) so their flowing segments render.
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({ id: "q", status: "queued", issue_iid: 1, issue_title: LONG_TITLE }),
+        aRun({ id: "p", status: "running", is_planning: true, issue_iid: 2 }),
+        aRun({ id: "g", status: "awaiting_approval", issue_iid: 3 }),
+        aRun({ id: "b", status: "running", issue_iid: 4 }),
+        aRun({ id: "a", status: "awaiting_input", issue_iid: 5 }),
+        aRun({ id: "k", status: "limit_wait", issue_iid: 6 }),
+        aRun({ id: "o", kind: "ci_fix", status: "running", issue_iid: null }),
+        aRun({ id: "pr", status: "completed", mr_iid: 4, mr_state: "opened", finished_at: "2026-07-05T12:00:00Z" }),
+      ],
+    });
+    render(
+      <MemoryRouter initialEntries={["/overview/next"]}>
+        <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+          <OverviewNext />
+        </main>
+      </MemoryRouter>,
+    );
+  }
+  const stations = () =>
+    ["queued", "planning", "review", "building", "pr"].map(
+      (s) => screen.getByRole("region", { name: "Issue work" }).querySelector(`[data-stage="${s}"]`) as HTMLElement,
+    );
+
+  it("draws the stations side by side on desktop", async () => {
+    await page.viewport(1280, 900);
+    mountLine();
+    await screen.findByRole("region", { name: "Issue work" });
+    await document.fonts.ready;
+    const rects = stations().map((el) => el.getBoundingClientRect());
+    for (let i = 1; i < rects.length; i++) {
+      expect.soft(rects[i].top, `station ${i} top`).toBe(rects[0].top);
+      expect.soft(rects[i].left, `station ${i} is right of the previous`).toBeGreaterThanOrEqual(rects[i - 1].right - 1);
+    }
+    const bays = ["asking", "parked", "other"].map(
+      (s) => (screen.getByRole("region", { name: "Issue work" }).querySelector(`[data-stage="${s}"]`) as HTMLElement).getBoundingClientRect(),
+    );
+    for (const b of bays) expect.soft(b.top, "bays share a row").toBe(bays[0].top);
+    expect(bays[0].top).toBeGreaterThanOrEqual(Math.max(...rects.map((r) => r.bottom)));
+  });
+
+  for (const width of [400, 320]) {
+    it(`stacks the line vertically at ${width}px with no horizontal overflow`, async () => {
+      await page.viewport(width, 900);
+      mountLine();
+      const card = await screen.findByRole("region", { name: "Issue work" });
+      await document.fonts.ready;
+      expect(window.innerWidth).toBe(width);
+      const rects = stations().map((el) => el.getBoundingClientRect());
+      for (let i = 1; i < rects.length; i++) {
+        expect.soft(rects[i].left, `station ${i} left edge`).toBe(rects[0].left);
+        expect.soft(rects[i].top, `station ${i} below the previous`).toBeGreaterThanOrEqual(rects[i - 1].bottom - 1);
+      }
+      const cardRight = card.getBoundingClientRect().right;
+      for (const el of card.querySelectorAll<HTMLElement>("*")) {
+        expect.soft(el.getBoundingClientRect().right, `${el.tagName} ${el.textContent?.slice(0, 24)}`).toBeLessThanOrEqual(
+          cardRight + 1,
+        );
+      }
+      const bays = ["asking", "parked", "other"].map(
+        (s) => (card.querySelector(`[data-stage="${s}"]`) as HTMLElement).getBoundingClientRect(),
+      );
+      for (let i = 1; i < bays.length; i++) expect.soft(bays[i].top, `bay ${i} below the previous`).toBeGreaterThanOrEqual(bays[i - 1].bottom - 1);
+      expect(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(window.innerWidth);
+    });
+  }
+
+  it("stops the flowing segments under prefers-reduced-motion", async () => {
+    // The stylesheet is the contract: a media rule for reduced motion must set animation
+    // none on .issue-line-flow. (Walks every sheet; a cross-origin sheet cannot be read.)
+    const found: string[] = [];
+    const walk = (rules: CSSRuleList, reduced: boolean) => {
+      for (const rule of Array.from(rules)) {
+        if (rule instanceof CSSMediaRule) {
+          const text = rule.conditionText || rule.media.mediaText;
+          walk(rule.cssRules, reduced || /prefers-reduced-motion:\s*reduce/.test(text));
+        } else if (rule instanceof CSSStyleRule && reduced && rule.selectorText.includes(".issue-line-flow")) {
+          if (rule.style.animationName === "none" || rule.style.animation.includes("none")) found.push(rule.selectorText);
+        } else if ("cssRules" in rule && (rule as CSSGroupingRule).cssRules) {
+          walk((rule as CSSGroupingRule).cssRules, reduced);
+        }
+      }
+    };
+    for (const sheet of Array.from(document.styleSheets)) {
+      let rules: CSSRuleList;
+      try {
+        rules = sheet.cssRules;
+      } catch {
+        continue;
+      }
+      walk(rules, false);
+    }
+    expect(found.length).toBeGreaterThan(0);
+
+    // Source order decides which same-specificity rule wins, so also check the computed
+    // style under real reduced-motion emulation.
+    await page.viewport(1280, 900);
+    mountLine();
+    const card = await screen.findByRole("region", { name: "Issue work" });
+    const live = card.querySelector('[data-segment="flow"]') as HTMLElement;
+    expect(live).not.toBeNull();
+    expect(getComputedStyle(live).animationName, "animates without the preference").toBe("issue-line-flow");
+    const session = cdp();
+    try {
+      await session.send("Emulation.setEmulatedMedia", {
+        features: [{ name: "prefers-reduced-motion", value: "reduce" }],
+      });
+      expect(getComputedStyle(live).animationName).toBe("none");
+    } finally {
+      await session.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "" }] });
+    }
+  });
+
+  it("hides the connecting segments when the line stacks, keeping the vertical rail", async () => {
+    await page.viewport(400, 900);
+    mountLine();
+    const card = await screen.findByRole("region", { name: "Issue work" });
+    const segments = Array.from(card.querySelectorAll<HTMLElement>("[data-segment]"));
+    expect(segments.length).toBeGreaterThan(0);
+    for (const seg of segments) expect(getComputedStyle(seg).display).toBe("none");
+    // The rail pieces join into one rail from the first node's centre to the last node's centre.
+    const rails = Array.from(card.querySelectorAll<HTMLElement>("[data-rail]"))
+      .filter((el) => getComputedStyle(el).display !== "none")
+      .map((el) => el.getBoundingClientRect())
+      .sort((a, b) => a.top - b.top);
+    const nodes = Array.from(card.querySelectorAll<HTMLElement>("[data-node]")).map((el) => {
+      const r = el.getBoundingClientRect();
+      return r.top + r.height / 2;
+    });
+    expect(rails).toHaveLength(nodes.length);
+    expect(rails[0].top).toBeCloseTo(nodes[0], 0);
+    let reach = rails[0].bottom;
+    for (const r of rails.slice(1)) {
+      expect(r.top - reach).toBeLessThanOrEqual(1);
+      reach = Math.max(reach, r.bottom);
+    }
+    expect(reach).toBeCloseTo(nodes[nodes.length - 1], 0);
+  });
+
+  it("filters the Runs card from the keyboard: Tab to a station, Enter picks it, Space lets go", async () => {
+    await page.viewport(1280, 900);
+    mountLine();
+    const card = await screen.findByRole("region", { name: "Issue work" });
+    const at = (stage: string) => card.querySelector(`[data-stage="${stage}"]`) as HTMLElement;
+    const yours = () => screen.getByRole("list", { name: "Your runs" }).querySelectorAll("li").length;
+    const all = yours();
+    expect(all).toBeGreaterThan(1);
+    at("queued").focus();
+    await userEvent.tab();
+    await userEvent.tab();
+    expect(document.activeElement).toBe(at("review"));
+    await userEvent.keyboard("{Enter}");
+    expect(at("review").getAttribute("aria-pressed")).toBe("true");
+    expect(card.querySelectorAll('[aria-pressed="true"]')).toHaveLength(1);
+    expect(yours()).toBe(1);
+    expect(screen.getByRole("link", { name: /All runs/ }).previousElementSibling?.textContent).toBe("Plan review");
+    await userEvent.keyboard(" ");
+    expect(at("review").getAttribute("aria-pressed")).toBe("false");
+    expect(yours()).toBe(all);
+  });
+
+  it("filters the Runs card from the keyboard on a bay: Enter picks Parked, Space lets go", async () => {
+    await page.viewport(1280, 900);
+    mountLine();
+    const card = await screen.findByRole("region", { name: "Issue work" });
+    const bay = card.querySelector('[data-stage="parked"]') as HTMLElement;
+    const yours = () => screen.getByRole("list", { name: "Your runs" }).querySelectorAll("li").length;
+    const all = yours();
+    expect(all).toBeGreaterThan(1);
+    bay.focus();
+    expect(document.activeElement).toBe(bay);
+    await userEvent.keyboard("{Enter}");
+    expect(bay.getAttribute("aria-pressed")).toBe("true");
+    expect(card.querySelectorAll('[aria-pressed="true"]')).toHaveLength(1);
+    expect(yours()).toBeGreaterThan(0);
+    expect(yours()).toBeLessThan(all);
+    expect(screen.getByRole("link", { name: /All runs/ }).previousElementSibling?.textContent).toBe("Parked");
+    await userEvent.keyboard(" ");
+    expect(bay.getAttribute("aria-pressed")).toBe("false");
+    expect(yours()).toBe(all);
+  });
+
+  it("animates a live segment and leaves a static one still", async () => {
+    await page.viewport(1280, 900);
+    mountLine();
+    const card = await screen.findByRole("region", { name: "Issue work" });
+    const live = card.querySelector('[data-segment="flow"]') as HTMLElement;
+    expect(live).not.toBeNull();
+    expect(getComputedStyle(live).animationName).toBe("issue-line-flow");
+    const still = card.querySelector('[data-segment="static"]') as HTMLElement;
+    expect(getComputedStyle(still).animationName).toBe("none");
   });
 });
 

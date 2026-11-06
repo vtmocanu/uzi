@@ -80,6 +80,7 @@ export function TokenPicker({
   id,
   disabled = false,
   className = "",
+  inheritLabel = "Inherit the worker's token",
 }: {
   value: CredentialSelection;
   onChange: (next: CredentialSelection) => void;
@@ -93,6 +94,8 @@ export function TokenPicker({
   id?: string;
   disabled?: boolean;
   className?: string;
+  // Text of the first (inherit) option; the schedule modal words it as a Default.
+  inheritLabel?: string;
 }) {
   const [fetched, setFetched] = useState<SecretMeta[]>([]);
   const footerId = useId();
@@ -148,7 +151,7 @@ export function TokenPicker({
         onChange(valueToSelection(v));
       }}
     >
-      <option value={INHERIT_VALUE}>Inherit the worker's token</option>
+      <option value={INHERIT_VALUE}>{inheritLabel}</option>
       <option value={DEFAULT_VALUE}>Use my default token</option>
       <option value={AUTO_VALUE}>Auto-select from my pool</option>
       <optgroup label="Pin to a token">

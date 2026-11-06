@@ -19,7 +19,7 @@ import (
 )
 
 // PRD #1809 M5 (D6) data-volume-full park, against a REAL Postgres: the counted park stores the
-// cause and bumps disk_park_count, the cap fails the run with fail_origin='data_volume_full', a
+// cause and bumps disk_park_count, the cap holds the run for owner Resume, a
 // PREVENTIVE park is never counted or capped, and the widened CHECKs accept the new values. These
 // drive the real Service (real *store.Queries + the pool as the tx beginner).
 //
@@ -156,8 +156,8 @@ func TestDiskParkReleasedClaimRefusedLiveDB(t *testing.T) {
 }
 
 // TestDiskParkStampedStopCancelsLiveDB: a stop verdict stamped on the run wins over the disk
-// park, as in the forge park. Both at the cap (where a plain report would fail the run
-// 'data_volume_full') and below it (where it would park), a stamped owner cancel ends the run
+// park, as in the forge park. Both at the cap (where a plain report would hold for owner
+// Resume) and below it (where it would retry automatically), a stamped owner cancel ends the run
 // 'cancelled' with fail_origin NULL: never parked, never failed, disk_park_count untouched, no
 // judge enqueued (enableJudge makes judges==0 a real assertion).
 func TestDiskParkStampedStopCancelsLiveDB(t *testing.T) {
@@ -197,10 +197,8 @@ func TestDiskParkStampedStopCancelsLiveDB(t *testing.T) {
 	}
 }
 
-// TestDiskParkCapFailsRunLiveDB: with the cap at 3, the fourth counted park fails the run with
-// the server-derived fail_origin data_volume_full and the fixed count-naming reason, and enqueues
-// no judge (enableJudge makes the judge path reachable, so judges==0 is a real assertion).
-func TestDiskParkCapFailsRunLiveDB(t *testing.T) {
+// The exhausted disk allowance holds without failing or judging the run.
+func TestDiskParkCapHoldsRunLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
 	svc := e.diskParkService(t, 3)
 	e.enableJudge(t, svc)
@@ -226,22 +224,11 @@ func TestDiskParkCapFailsRunLiveDB(t *testing.T) {
 	if err != nil || !applied {
 		t.Fatalf("cap-exceeding park: applied=%v err=%v", applied, err)
 	}
-	if run.Status != "failed" {
-		t.Fatalf("run status = %q, want failed (past the cap)", run.Status)
+	if run.Status != "recovery_wait" || run.RecoveryWaitCause.String != recoveryCauseDataVolumeFull || run.RecoveryRetryNotBefore.Valid || run.FailOrigin.Valid {
+		t.Fatalf("cap result status=%s cause=%v retry=%v origin=%v", run.Status, run.RecoveryWaitCause, run.RecoveryRetryNotBefore, run.FailOrigin)
 	}
-	status, _, disk, _, origin := e.dpRun(t, runID)
-	if status != "failed" || !origin.Valid || origin.String != "data_volume_full" {
-		t.Fatalf("status=%q fail_origin=%v, want failed/data_volume_full", status, origin)
-	}
-	if disk != 3 {
-		t.Fatalf("disk_park_count = %d after the cap-fail, want 3 (the failing park is not a park)", disk)
-	}
-	var reason pgtype.Text
-	if err := e.pool.QueryRow(e.ctx, `SELECT failure_reason FROM runs WHERE id = $1`, runID).Scan(&reason); err != nil {
-		t.Fatalf("read failure_reason: %v", err)
-	}
-	if !reason.Valid || reason.String != "the worker's data volume stayed full after 3 parks (cap 3)" {
-		t.Fatalf("failure_reason = %q, want the reason naming disk_park_count and the cap", reason.String)
+	if run.DiskParkCount != 3 {
+		t.Fatalf("cap consumed allowance: %d", run.DiskParkCount)
 	}
 	var judges int
 	if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM runs WHERE kind = 'judge' AND target_run_id = $1`, runID).Scan(&judges); err != nil {

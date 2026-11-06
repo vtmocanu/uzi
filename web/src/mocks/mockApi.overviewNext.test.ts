@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { issueLineModel, issueLineStage, type LineStage } from "../lib/issueLine";
 
 // ?mock=overview-next (PRD #3878): scenario-gated seeding for the Overview preview. The
 // scenario is read when the store seeds, so each test re-imports a fresh mockApi.
@@ -34,6 +35,39 @@ describe("overview-next mock scenario", () => {
     const dup = runs.find((r) => r.id === "run-ov-ci-halted-retry")!;
     expect(dup).toMatchObject({ status: "completed", kind: "issue", mr_state: "opened" });
     expect([dup.repo_id, dup.mr_iid]).toEqual([halted.repo_id, halted.mr_iid]);
+  });
+
+  it("puts at least one run at every stage of the issue-work line for the demo admin", async () => {
+    const api = await freshApi("overview-next");
+    const own = (await api.listRuns({ view: "summary" })).runs;
+    const factory = (await api.adminListRuns({ view: "summary" })).runs;
+    const model = issueLineModel({ ownRuns: own, otherRuns: factory });
+    const stages: LineStage[] = ["queued", "planning", "review", "building", "asking", "parked", "other"];
+    for (const stage of stages) {
+      expect(model.entries[stage].length, `stage ${stage}`).toBeGreaterThan(0);
+    }
+    expect(model.prs.length).toBeGreaterThan(0);
+    // The line holds other users' runs too (planning, asking and Other work among them).
+    for (const id of ["run-ov-lena-planning", "run-ov-omar-asking", "run-ov-ines-prompt"]) {
+      expect(factory.find((r) => r.id === id), id).toBeDefined();
+      expect(own.some((r) => r.id === id)).toBe(false);
+    }
+    const stageOf = (id: string) => issueLineStage([...own, ...factory].find((r) => r.id === id)!, new Set());
+    expect(stageOf("run-ov-lena-planning")).toBe("planning");
+    expect(stageOf("run-ov-omar-asking")).toBe("asking");
+    expect(stageOf("run-ov-ines-prompt")).toBe("other");
+  });
+
+  it("seeds the viewer's revising, cooldown and ci_fix runs on the stages the line gives them", async () => {
+    const api = await freshApi("overview-next");
+    const own = (await api.listRuns({ view: "summary" })).runs;
+    const stageOf = (id: string) => issueLineStage(own.find((r) => r.id === id)!, new Set());
+    expect(own.find((r) => r.id === "run-ov-own-revising")).toMatchObject({ status: "awaiting_approval", is_revising: true });
+    expect(stageOf("run-ov-own-revising")).toBe("planning");
+    expect(own.find((r) => r.id === "run-ov-own-cooldown")).toMatchObject({ status: "running", health: "waiting_account_cooldown" });
+    expect(stageOf("run-ov-own-cooldown")).toBe("parked");
+    expect(own.find((r) => r.id === "run-ov-own-cifix")).toMatchObject({ kind: "ci_fix" });
+    expect(stageOf("run-ov-own-cifix")).toBe("other");
   });
 
   it("turns maintenance on and serves a health document that raises the admin attention banner", async () => {

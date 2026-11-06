@@ -19,6 +19,7 @@ import { useDemoMode } from "../lib/demoMode";
 import { maskRepoPath } from "../lib/demoMask";
 import { humanizeCron } from "../lib/schedulePresets";
 import { nextFireOf } from "../lib/scheduleList";
+import { modelChipText } from "../lib/modelChip";
 import { relativeFromNow } from "./ScheduleModal";
 import { LastRunOutcome, LastFireDetail, RecentFiresPanel, formatStamp } from "./LastRun";
 import { AddAnotherRepo } from "./AddAnotherRepo";
@@ -463,12 +464,12 @@ function KindPill({ s }: { s: Schedule }) {
   return null;
 }
 
-// A default row's chips (D4): model or "default model", the sealed sweep labels, max
+// A default row's chips (D4): the model chip, the sealed sweep labels, max
 // issues, then the run flags, all read from the row's own effective values.
 function DefaultOptions({ s, showApprove }: { s: Schedule; showApprove: boolean }) {
   return (
     <>
-      <OptionChip>{s.model ? `model ${s.model}` : "default model"}</OptionChip>
+      <ModelChips s={s} />
       {s.target === "sweep" && s.labels?.map((l) => <OptionChip key={l}>label {l}</OptionChip>)}
       <CapacityOptions s={s} />
       {s.wait_on_limit && <OptionChip>wait-on-limit</OptionChip>}
@@ -478,11 +479,12 @@ function DefaultOptions({ s, showApprove }: { s: Schedule; showApprove: boolean 
   );
 }
 
-// A user row keeps today's chips: only explicit run flags earn one (PRD #841: a null
-// mr-rework is inherit and shows nothing), with "defaults" when none apply.
+// A user row shows the model chip, then only explicit run flags earn a chip (PRD #841:
+// a null mr-rework is inherit and shows nothing); "defaults" ties to the run flags only.
 function UserOptions({ s, showApprove }: { s: Schedule; showApprove: boolean }) {
   return (
     <>
+      <ModelChips s={s} />
       <CapacityOptions s={s} />
       {s.wait_on_limit && <OptionChip>wait-on-limit</OptionChip>}
       {showApprove && <OptionChip>auto-approve</OptionChip>}
@@ -490,6 +492,15 @@ function UserOptions({ s, showApprove }: { s: Schedule; showApprove: boolean }) 
       {s.target !== "sweep" && !s.wait_on_limit && !showApprove && s.mr_rework_enabled == null && (
         <span className="text-[12px] text-faint">defaults</span>
       )}
+    </>
+  );
+}
+
+function ModelChips({ s }: { s: Schedule }) {
+  return (
+    <>
+      <OptionChip>{modelChipText(s.model)}</OptionChip>
+      {s.override_subagent_model && <OptionChip>+ agents</OptionChip>}
     </>
   );
 }

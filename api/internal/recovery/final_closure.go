@@ -179,7 +179,7 @@ func (s *Service) finalClosureRead(ctx context.Context, wkr store.Worker, runID 
 		}
 		return v, nil, err
 	}
-	if !finalInventoryEligible(v.hold, wkr.ID, finalRunFacts{run.Status, run.ClaimGeneration, run.ClaimReleasedAt, run.RecoveryWaitCause}, generation, false) {
+	if !finalInventoryEligible(v.hold, wkr.ID, finalRunFacts{run.Status, run.ClaimGeneration, run.ClaimReleasedAt, run.RecoveryWaitCause, run.RecoveryRetryNotBefore}, generation, false) {
 		return v, nil, ErrNotAuthorized
 	}
 	err = finalStmt(ctx, func(c context.Context) (err error) {
@@ -361,8 +361,8 @@ func (s *Service) finalClosureCommit(ctx context.Context, wkr store.Worker, runI
 	}
 	var run finalRunFacts
 	if err := finalStmt(ctx, func(c context.Context) error {
-		return tx.QueryRow(c, "SELECT status, claim_generation, claim_released_at, recovery_wait_cause FROM runs WHERE id=$1 AND user_id=$2 FOR UPDATE",
-			runID, wkr.UserID).Scan(&run.status, &run.gen, &run.released, &run.parkCause)
+		return tx.QueryRow(c, "SELECT status, claim_generation, claim_released_at, recovery_wait_cause, recovery_retry_not_before FROM runs WHERE id=$1 AND user_id=$2 FOR UPDATE",
+			runID, wkr.UserID).Scan(&run.status, &run.gen, &run.released, &run.parkCause, &run.retry)
 	}); err != nil {
 		return apitypes.RecoveryReleaseResponse{}, notFound(err)
 	}

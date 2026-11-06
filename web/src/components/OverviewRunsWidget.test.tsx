@@ -146,4 +146,105 @@ describe("OverviewRunsWidget", () => {
     expect(screen.queryByText(raw)).toBeNull();
     expect(document.body.innerHTML).not.toContain(raw);
   });
+
+  describe("with a stage picked on the issue-work line", () => {
+    const own = [
+      run({ id: "o-plan", status: "awaiting_approval", issue_title: "Own plan" }),
+      run({ id: "o-build", status: "running", issue_title: "Own build" }),
+      run({
+        id: "o-pr",
+        status: "completed",
+        mr_iid: 3,
+        mr_state: "opened",
+        finished_at: "2026-07-05T12:00:00Z",
+        issue_title: "Own PR",
+      }),
+    ];
+    const others = [
+      theirs({ id: "t-plan", status: "awaiting_approval", issue_title: "Their plan" }),
+      theirs({ id: "t-build", status: "running", issue_title: "Their build" }),
+    ];
+    const prRuns = [own[2]];
+    const base = { isAdmin: true, ownRuns: own, adminRuns: good(others), prRuns };
+    const titles = (list: string) =>
+      within(screen.getByRole("list", { name: list })).getAllByRole("listitem").map((li) => li.textContent ?? "");
+    const scope = () => screen.getByRole("link", { name: /All runs/ }).previousElementSibling?.textContent;
+
+    it("reads Active runs and shows every active run without a stage", () => {
+      mount(base);
+      expect(scope()).toBe("Active runs");
+      expect(titles("Your runs")).toHaveLength(2);
+      expect(titles("Other users' runs")).toHaveLength(2);
+    });
+
+    it("keeps only the runs at the stage in both groups, and names the stage in the card head", () => {
+      mount({ ...base, stage: "review" });
+      expect(scope()).toBe("Plan review");
+      expect(titles("Your runs")).toEqual([expect.stringContaining("Own plan")]);
+      expect(titles("Other users' runs")).toEqual([expect.stringContaining("Their plan")]);
+    });
+
+    it("lists the open pull requests under Yours at the PR stage, and none under Other users", () => {
+      mount({ ...base, stage: "pr" });
+      expect(scope()).toBe("Open pull requests");
+      expect(titles("Your runs")).toEqual([expect.stringContaining("Own PR")]);
+      expect(screen.queryByRole("list", { name: "Other users' runs" })).toBeNull();
+      expect(screen.queryByText("Other users (admin)")).toBeNull();
+    });
+
+    it("lists one row for two runs of one pull request", () => {
+      const first = run({ id: "pr-a", status: "completed", mr_iid: 9, mr_state: "opened", finished_at: "2026-07-05T11:00:00Z", issue_title: "Older" });
+      const second = { ...first, id: "pr-b", finished_at: "2026-07-05T12:00:00Z", issue_title: "Newer" };
+      mount({ ownRuns: [first, second], prRuns: [second], stage: "pr" });
+      expect(titles("Your runs")).toEqual([expect.stringContaining("Newer")]);
+    });
+
+    it("hides an empty group, with no empty-state sentence", () => {
+      mount({ ...base, adminRuns: good([]), stage: "review" });
+      expect(screen.getByText("Yours")).toBeTruthy();
+      expect(screen.queryByText("Other users (admin)")).toBeNull();
+      cleanup();
+      mount({ ...base, ownRuns: [run({ id: "b", status: "running" })], stage: "review" });
+      expect(screen.queryByText("Yours")).toBeNull();
+      expect(screen.queryByRole("list", { name: "Your runs" })).toBeNull();
+      expect(screen.queryByText(/No active runs/)).toBeNull();
+      expect(screen.getByText("Other users (admin)")).toBeTruthy();
+    });
+
+    it("says No runs at this stage when both groups are empty", () => {
+      mount({ ...base, stage: "parked" });
+      expect(screen.getByText("No runs at this stage.")).toBeTruthy();
+      expect(screen.queryByText("Yours")).toBeNull();
+      expect(screen.queryByText(/No active runs/)).toBeNull();
+    });
+
+    it("keeps the unavailable notice visible under a filter", () => {
+      mount({ ...base, adminRuns: { runs: null, failed: true, lastOkAt: null }, stage: "review" });
+      expect(screen.getByRole("status").textContent).toBe("Other users' runs are unavailable");
+      expect(titles("Your runs")).toHaveLength(1);
+    });
+
+    it("ignores the last good rows of a failed admin read under a filter, as the line does", () => {
+      const stale = [theirs({ id: "t-q", status: "awaiting_input", issue_title: "Stale question" })];
+      const failed = { runs: stale, failed: true, lastOkAt: NOW - 60_000 };
+      mount({ isAdmin: true, ownRuns: [run({ id: "o-b", status: "running" })], adminRuns: failed, stage: "asking" });
+      expect(scope()).toBe("Asking you");
+      expect(screen.getByText("No runs at this stage.")).toBeTruthy();
+      expect(screen.queryByText("Stale question")).toBeNull();
+      expect(screen.getByRole("status").textContent).toBe("Other users' runs are unavailable");
+      cleanup();
+      mount({ isAdmin: true, ownRuns: [run({ id: "o-q", status: "awaiting_input" })], adminRuns: failed, stage: "asking" });
+      expect(scope()).toBe("Asking you");
+      expect(screen.queryByText("No runs at this stage.")).toBeNull();
+    });
+
+    it("calls the asking group Questions when another user's question is in it", () => {
+      const q = [theirs({ id: "t-q", status: "awaiting_input" })];
+      mount({ isAdmin: true, ownRuns: [run({ id: "o-q", status: "awaiting_input" })], adminRuns: good(q), stage: "asking" });
+      expect(scope()).toBe("Questions");
+      cleanup();
+      mount({ isAdmin: true, ownRuns: [run({ id: "o-q", status: "awaiting_input" })], adminRuns: good([]), stage: "asking" });
+      expect(scope()).toBe("Asking you");
+    });
+  });
 });

@@ -93,8 +93,8 @@ Each TOML file becomes one subagent:
   or non-string value skips the agent with a bounded invalid-file note that
   does not echo the model value. On Claude runs the pin is omitted, so the
   subagent follows the resolved lead model.
-- **Model override and effort:** the schedule's "Apply model also to agents"
-  setting (`override_subagent_model`) overrides the TOML pin. Reasoning effort
+- **Model override and effort:** the schedule's "Use the run's resolved model
+  for subagents too" toggle (`override_subagent_model`) overrides the TOML pin. Reasoning effort
   still comes from the existing run settings; `model_reasoning_effort` is ignored.
 - **Default tools:** a TOML agent runs with the run's full default tool set,
   which can include `Bash`, subject to the guards below.

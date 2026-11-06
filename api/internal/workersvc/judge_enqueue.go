@@ -76,7 +76,7 @@ var neverJudgeFailOrigins = map[string]bool{
 	// PRD #1795 M1: the refusal cap on plan-gate re-presentation fails the run inside SetState's
 	// awaiting_approval transaction. Server-derived (see failorigin.go), never an agent defect.
 	"gate_presentation_refused": true,
-	// PRD #1809 M5 (D6): a run failed past the disk park cap (its worker's data volume stayed
+	// Historical PRD #1809 M5 (D6): a run failed past the disk park cap (its worker's data volume stayed
 	// full). Server-derived (stamped in parkDataVolumeFull, never a worker report) and an
 	// environment failure, not an agent defect, so it skips the judge regardless of
 	// iteration_count: it lands mid-run, where iteration_count is usually > 0.

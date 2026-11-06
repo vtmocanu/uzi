@@ -75,7 +75,7 @@ describe("AgentNew real editor model pins", () => {
       "Default · lead's model", "gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna",
     ]);
     expect(within(claude).getByRole("option", { name: "Default · lead's model" })).toBeTruthy();
-    const help = screen.getByText("Leave a harness on Default so this subagent uses whatever the lead runs on. A schedule with “Apply model also to agents” on overrides these pins.");
+    const help = screen.getByText("Leave a harness on Default so this subagent uses whatever the lead runs on. A schedule with “Use the run's resolved model for subagents too” on overrides these pins.");
     expect(claude.getAttribute("aria-describedby")).toBe(help.id);
     expect(codex.getAttribute("aria-describedby")).toBe(help.id);
 
