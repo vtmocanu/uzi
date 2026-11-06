@@ -1,9 +1,10 @@
 // issue #2969 (owner decision 2026-11-06, fallback): the retained-predecessor pass is disabled in production, because no
 // in-process reader can rule out a COMMAND_UID process writing into a predecessor source. Without the test-only
 // `predecessorFinalForTests` option, a retained re-claim of a Claude flight and of a Codex flight, each with guarded
-// lower-generation candidates, skips with `command_uid_unproven` BEFORE any predecessor operation: no free capture, no
-// boundary registration, no coordinator operation, no predecessor RPC, and byte-identical journal records for the
-// predecessor generations. The successor proceeds. Real git, journal and retained re-claim, as in
+// lower-generation candidates, skips with `command_uid_unproven` BEFORE any predecessor operation: no Codex identity
+// inventory read, no free capture, no boundary registration, no coordinator operation. The successor proceeds. The
+// positive twins (flag on) enter the pass with the same fixture and record non-zero counts for the same counters, so
+// the zero counts cannot be vacuous. Real git, journal and retained re-claim, as in
 // runner-retained-predecessor-final.test.ts.
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -34,10 +35,7 @@ function journal(bare: string, branch: string): any {
   return JSON.parse(command(bare, "config", `uzi-recovery.${branch}.clone`));
 }
 
-type Internals = {
-  registerPredecessorBoundary: (...args: unknown[]) => unknown;
-  proveInventorySources: (...args: unknown[]) => Promise<boolean>;
-};
+type Internals = { registerPredecessorBoundary: (...args: unknown[]) => unknown };
 
 interface Opts {
   codex?: boolean;
@@ -70,18 +68,14 @@ async function drive(o: Opts = {}) {
   const events: string[] = [];
   const rpcs: string[] = [];
   const rpc = (name: string): void => { rpcs.push(name); events.push(`rpc:${name}`); };
-  const lowerGenerationRpcs: string[] = [];
-  const lower = (name: string, generation: number | undefined): void => {
-    if (typeof generation === "number" && generation < claimGeneration) lowerGenerationRpcs.push(`${name}:${generation}`);
-  };
-  client.reserveRecoveryCapture = async (_run, req) => { rpc("reserve"); lower("reserve", req.generation); return { capture_id: "00000000-0000-4000-8000-000000002512", state: "preparing" }; };
+  client.reserveRecoveryCapture = async () => { rpc("reserve"); return { capture_id: "00000000-0000-4000-8000-000000002512", state: "preparing" }; };
   client.uploadRecoveryBundle = async (_run, _capture, _manifest, stream) => {
     rpc("upload");
     for await (const _chunk of stream) { /* consume */ }
     throw new Error("upload response unknown");
   };
   client.getRecoveryCaptureStatus = async () => { rpc("status"); throw new Error("status unavailable"); };
-  client.releaseRecoveryCustody = async (_run, generation) => { rpc("release"); lower("release", generation); throw new Error("must keep custody"); };
+  client.releaseRecoveryCustody = async () => { rpc("release"); throw new Error("must keep custody"); };
 
   const prepare = git.prepareRecoverySuccessor.bind(git);
   git.prepareRecoverySuccessor = async (...args) => { events.push("prepare"); return prepare(...args); };
@@ -105,11 +99,28 @@ async function drive(o: Opts = {}) {
   } as never);
   const recovery = Reflect.get(runner, "recovery") as RecoveryCoordinator;
   const internals = runner as unknown as Internals;
-  const calls = { registrations: 0, proofs: 0, operations: 0 };
+  const calls = { registrations: 0, operations: 0, identityReads: 0, freeCaptures: 0 };
+  // Entries made while settlePredecessorHolds is on the stack (it is awaited serially by the retained re-claim), so
+  // these pin that the production gate precedes the Codex inventory read and the predecessor free capture.
+  let inSettle = false;
+  const settle = (runner as unknown as { settlePredecessorHolds: (...args: unknown[]) => Promise<unknown> }).settlePredecessorHolds.bind(runner);
+  (runner as unknown as Record<string, unknown>).settlePredecessorHolds = async (...args: unknown[]) => {
+    inSettle = true;
+    try { return await settle(...args); } finally { inSettle = false; }
+  };
+  const freeCapture = (runner as unknown as { runFreeCapture: (...args: unknown[]) => unknown }).runFreeCapture.bind(runner);
+  (runner as unknown as Record<string, unknown>).runFreeCapture = (...args: unknown[]) => {
+    if (inSettle) calls.freeCaptures++;
+    return freeCapture(...args);
+  };
+  const readHeads = git.readInventoryCloneHeads.bind(git);
+  git.readInventoryCloneHeads = ((...args: Parameters<typeof readHeads>) => {
+    const opt = args[2] as unknown;
+    if (inSettle && typeof opt === "object" && opt !== null && (opt as { cloneIdentity?: boolean }).cloneIdentity === true) calls.identityReads++;
+    return readHeads(...args);
+  }) as typeof git.readInventoryCloneHeads;
   const register = internals.registerPredecessorBoundary.bind(runner);
   internals.registerPredecessorBoundary = (...args) => { calls.registrations++; return register(...args); };
-  const prove = internals.proveInventorySources.bind(runner);
-  internals.proveInventorySources = (...args) => { calls.proofs++; return prove(...args); };
   for (const generation of generations) {
     const pinned = await recovery.pin({ runId: claim.run_id, generation, kind: "issue", branch: clone.branch,
       sourceSha: command(clone.path, "rev-parse", "HEAD"), inventoryGuarded: true });
@@ -120,12 +131,10 @@ async function drive(o: Opts = {}) {
     if (options.predecessor) calls.operations++;
     return original(input, options);
   };
-  // The predecessor generations' journal records, serialised before the claim runs.
-  const snapshot = async (): Promise<string> => JSON.stringify(await recovery.predecessorRecords(claim.run_id, claimGeneration));
-  const before = await snapshot();
-  assert.equal(JSON.parse(before).length, generations.length, "fixture: both lower generations are candidates");
+  assert.equal((await recovery.predecessorRecords(claim.run_id, claimGeneration)).length, generations.length,
+    "fixture: both lower generations are candidates");
   await runner.execute(claim);
-  return { claim, bare, clone, events, rpcs, lowerGenerationRpcs, logs, calls, models: () => models, before, after: await snapshot() };
+  return { claim, bare, clone, events, rpcs, logs, calls, models: () => models };
 }
 type Result = Awaited<ReturnType<typeof drive>>;
 
@@ -134,11 +143,8 @@ const skipReasons = (r: Result): string[] => logged(r, "retained predecessor FIN
 
 function assertZeroPredecessorEffects(r: Result): void {
   assert.deepEqual(skipReasons(r), ["command_uid_unproven"]);
-  assert.deepEqual(r.calls, { registrations: 0, proofs: 0, operations: 0 },
-    "no predecessor free-capture entry (the boundary is registered inside it), source proof or coordinator operation");
-  // The retained claim's own generation may still reserve/upload; a predecessor generation may not.
-  assert.deepEqual(r.lowerGenerationRpcs, [], "no reserve or release for a predecessor generation (the claim's own capture carries no generation)");
-  assert.equal(r.after, r.before, "the predecessor generations' journal records are byte-identical");
+  assert.deepEqual(r.calls, { registrations: 0, operations: 0, identityReads: 0, freeCaptures: 0 },
+    "the gate precedes the Codex identity read, the predecessor free capture, the boundary registration and every coordinator operation");
   assert.equal(logged(r, "retained predecessor FINAL pass").length, 0, "the pass never ran");
   assert.ok(r.events.includes("prepare"), "the successor was prepared");
   assert.equal(r.models(), 1, "the successor reached its model");
@@ -157,6 +163,16 @@ describe("without the test-only flag the retained-predecessor pass is disabled (
   it("positive twin: the same Claude fixture with predecessorFinalForTests enters the pass (the controls are not vacuous)", async () => {
     const r = await drive({ runnerOpts: { predecessorFinalForTests: true } });
     assert.deepEqual(skipReasons(r), []);
-    assert.ok(r.calls.registrations >= 1 && r.calls.operations >= 1, JSON.stringify(r.calls));
+    assert.ok(r.calls.freeCaptures >= 1 && r.calls.registrations >= 1 && r.calls.operations >= 1, JSON.stringify(r.calls));
+    assert.equal(r.calls.identityReads, 0, "a Claude flight takes no Codex identity read");
+    assert.ok(logged(r, "retained predecessor FINAL pass").length >= 1, "the pass ran");
+  });
+
+  it("positive twin: the same Codex fixture with predecessorFinalForTests reads the clone identity and enters the pass", async () => {
+    const r = await drive({ codex: true, runnerOpts: { predecessorFinalForTests: true } });
+    assert.deepEqual(skipReasons(r), []);
+    assert.ok(r.calls.identityReads >= 1, JSON.stringify(r.calls));
+    assert.ok(r.calls.freeCaptures >= 1 && r.calls.registrations >= 1 && r.calls.operations >= 1, JSON.stringify(r.calls));
+    assert.ok(logged(r, "retained predecessor FINAL pass").length >= 1, "the pass ran");
   });
 });

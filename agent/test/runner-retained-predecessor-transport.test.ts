@@ -189,8 +189,6 @@ interface Opts {
   duringModel?: (world: Pre) => Promise<void>;
   /** Extra state: when the successor model never runs, the test may end the flight itself. */
   stopFlight?: boolean;
-  /** Extra RunnerOptions (issue #2969: the command-uid detector). */
-  runnerOpts?: Record<string, unknown>;
 }
 interface Pre {
   claim: ReturnType<typeof gitlabClaim>; bare: string; clone: { path: string; branch: string };
@@ -271,7 +269,6 @@ async function drive(o: Opts = {}) {
     recoveryRetryMs: 1, quiesceRun: quiesceRunAttempt, codexBoundaryDeadlineMs: CODEX_BOUNDARY_MS,
     predecessorFinalForTests: true, // the pass is disabled in production (issue #2969 fallback)
     ...(o.budget ? { predecessorFinalBudgetMs: o.budget } : {}),
-    ...o.runnerOpts,
   } as never);
   const recovery = Reflect.get(runner, "recovery") as RecoveryCoordinator;
 

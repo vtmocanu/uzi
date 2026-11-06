@@ -1343,7 +1343,8 @@ class RetainedSeedCapacityShortfall extends Error {
 
 const RETAINED_EXHAUSTED_FEATURE = "recovery_cause_retained_recovery_exhausted";
 
-/* issue #2969: the time budget of the predecessor FINAL pass a retained re-claim runs before it prepares its successor.
+/* issue #2969: the time budget of the predecessor FINAL pass a retained re-claim runs before it prepares its successor
+ * (disabled in production; see settlePredecessorHolds).
  * The retained iteration window is `now + 300_000` ms (see recoverRetainedClaim). The pass reserves, out of the
  * iteration deadline, two Codex boundary deadlines (the held scope's own entry and exit) plus this successor-prep
  * allowance, so a pass can never consume the time the successor adoption below it needs. */
@@ -26629,8 +26630,8 @@ export class RunRunner {
           }, "capture", "strict");
           if (captureResult.kind !== "observed_empty") { blocker = "quiescence_failed"; throw finalize; }
           await check();
-          // issue #2969: settle the lower generations' guarded holds from the predecessor source before the
-          // successor replaces it. A stop keeps custody and the predecessor; a clean skip changes nothing.
+          // issue #2969 (disabled in production; see settlePredecessorHolds): settle the lower generations' guarded
+          // holds from the predecessor source before the successor replaces it. A stop keeps custody and the predecessor; a clean skip changes nothing.
           if (await this.settlePredecessorHolds(claim, flight, bare, source, iteration, signal) === "stop") {
             blocker = "quiescence_failed"; throw finalize;
           }
