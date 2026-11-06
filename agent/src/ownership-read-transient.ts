@@ -9,6 +9,9 @@
  * The transport-phase marker (`isFetchRejection`) is required because a truncated 200 body
  * surfaces from the body read as `TypeError("terminated")` with cause `UND_ERR_SOCKET`,
  * the same shape as a socket failure while connecting; only the marker tells them apart.
+ * The marker records object identity, so an object that was marked as a transport rejection and
+ * is later reused as an abort reason stays marked; callers must not re-raise a caught fetch
+ * rejection as an abort reason for an ownership read (no current site does).
  */
 import { isFetchRejection, RequestError } from "./client.js";
 import { WORKER_API_PREFIX } from "./protocol.js";

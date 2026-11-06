@@ -210,6 +210,23 @@ describe("transientOwnershipReadCause: failures after the transport settled", ()
     });
   });
 
+  it("does not classify an owned-scope abort whose reason looks like a transport failure (real fetch)", async () => {
+    let onRequest: () => void = () => {};
+    const requested = new Promise<void>(resolve => { onRequest = resolve; });
+    await withServer((_req, _res) => { onRequest(); }, async (url) => {
+      const ac = new AbortController();
+      const client = makeClient(url);
+      const result = caught(() => MaintenanceBudget.runOwned(ac.signal, () => client.getRunOwnership(RUN)));
+      await requested;
+      const reason = resetReason();
+      ac.abort(reason);
+      const error = await result;
+      assert.equal(error, reason);
+      assert.equal(isFetchRejection(error), false);
+      assert.equal(classify(error), undefined);
+    });
+  });
+
   it("does not classify an already-aborted signal reused for a second read (real fetch)", async () => {
     await withServer(hang, async (url) => {
       const ac = new AbortController();
