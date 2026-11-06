@@ -24,7 +24,7 @@ function renderEditor(name: string) {
 }
 
 const WORKER_MODEL_HELP = "Each harness's Run defaults model takes precedence over its lead template pin.";
-const MODEL_HELP = "Leave a harness on Default so this subagent uses whatever the lead runs on. A schedule with “Apply model also to agents” on overrides these pins.";
+const MODEL_HELP = "Leave a harness on Default so this subagent uses whatever the lead runs on. A schedule with “Use the run's resolved model for subagents too” on overrides these pins.";
 
 describe("AgentTemplateEditor model Default label (#3255)", () => {
   it("names the SDK/account default for the lead and explains the user override", () => {

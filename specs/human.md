@@ -75,7 +75,8 @@ Tracked as GitLab issue vtmocanu/uzi#3; PRD at `prds/done/3-agent-templates-anth
 
 - Agent templates stored in the DB, editable via the UI (the agents themselves sit with the code).
 - Every template stores a Claude pin and a Codex pin, validated by family and projected for the run's actual frozen harness. Claude allows custom IDs except Codex role IDs; Codex pins use the closed five-role vocabulary, including `gpt-6-luna`. (AI-synced 2026-11-03)
-- An empty subagent pin follows the resolved lead model; editing either builtin pin customizes the template, and Reset restores both shipped pins. The editor, list, detail, drift and source approval show both pins. A schedule's Apply model also to agents overrides subagent pins. (AI-synced 2026-11-03)
+- An empty subagent pin follows the resolved lead model; editing either builtin pin customizes the template, and Reset restores both shipped pins. The editor, list, detail, drift and source approval show both pins. A schedule's "Use the run's resolved model for subagents too" toggle overrides subagent pins. (AI-synced 2026-11-06)
+- Schedule modal groups harness, model, token and the subagent toggle under "Where it runs"; Default labels name the source and never guess (overflow-eligible schedules show a neutral model Default); schedule rows and catalog cards show `model: default` / `model: <v> · pinned` (+ agents on schedule rows when the subagent toggle is on). (AI-synced 2026-11-06)
 - Admin-only template writes; all authenticated users can read/preview. [AI-proposed, user-confirmed 2026-07-03]
 - Each user stores their own Anthropic OAuth token via the webui, encrypted in the DB.
 - A doc explaining how to obtain the token.
