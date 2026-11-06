@@ -125,3 +125,11 @@ UPDATE account_reset_links
 SET superseded_at = now()
 WHERE redeemed_at IS NULL AND superseded_at IS NULL
   AND (issued_by = @id OR (@as_target::boolean AND user_id = @id));
+
+-- name: LockUserTokenVersionForShare :one
+-- CLI login approve fence (PRD #3989): share-locks the approving user's row so an
+-- approve cannot interleave with a reset redemption (which holds the row FOR UPDATE
+-- and bumps token_version). The caller compares the returned token_version with the
+-- session's; a reset that committed first changed it and the approve is refused,
+-- one that has not yet committed makes this wait.
+SELECT token_version FROM users WHERE id = @id FOR SHARE;

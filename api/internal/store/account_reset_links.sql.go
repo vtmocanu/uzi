@@ -309,6 +309,22 @@ func (q *Queries) LockResetLinkForRedeem(ctx context.Context, tokenHash []byte) 
 	return i, err
 }
 
+const lockUserTokenVersionForShare = `-- name: LockUserTokenVersionForShare :one
+SELECT token_version FROM users WHERE id = $1 FOR SHARE
+`
+
+// CLI login approve fence (PRD #3989): share-locks the approving user's row so an
+// approve cannot interleave with a reset redemption (which holds the row FOR UPDATE
+// and bumps token_version). The caller compares the returned token_version with the
+// session's; a reset that committed first changed it and the approve is refused,
+// one that has not yet committed makes this wait.
+func (q *Queries) LockUserTokenVersionForShare(ctx context.Context, id uuid.UUID) (int32, error) {
+	row := q.db.QueryRow(ctx, lockUserTokenVersionForShare, id)
+	var token_version int32
+	err := row.Scan(&token_version)
+	return token_version, err
+}
+
 const lockUsersForResetIssue = `-- name: LockUsersForResetIssue :many
 
 SELECT id, email, is_active, is_admin, (password_hash IS NOT NULL)::boolean AS has_password

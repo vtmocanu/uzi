@@ -249,6 +249,9 @@ func (f *fakeVaultStore) UpdatePassword(context.Context, store.UpdatePasswordPar
 func (f *fakeVaultStore) SetUserActive(context.Context, store.SetUserActiveParams) (store.User, error) {
 	return store.User{}, errFakeBrowser
 }
+func (f *fakeVaultStore) SupersedeLiveResetLinksForUser(context.Context, store.SupersedeLiveResetLinksForUserParams) (int64, error) {
+	return 0, errFakeBrowser
+}
 
 var (
 	_ Store        = (*fakeVaultStore)(nil)
