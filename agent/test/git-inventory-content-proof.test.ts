@@ -113,6 +113,9 @@ describe("inventorySourceContentProof (issue #2969 D5)", () => {
   }, async t => {
     const f = fixture(t);
     f.g("config", "core.trustctime", "false");
+    // The proof pins core.trustctime=true and git compares ctime at second granularity, so the write, commit and
+    // chmod below must share one ctime second: start just after a second boundary.
+    await new Promise(resolve => setTimeout(resolve, 1005 - (Date.now() % 1000)));
     const file = path.join(f.root, "secret.txt");
     fs.writeFileSync(file, "s\n");
     const past = new Date(Date.now() - 3_600_000);
@@ -120,7 +123,7 @@ describe("inventorySourceContentProof (issue #2969 D5)", () => {
     f.commitAll();
     fs.chmodSync(file, 0);
     // git's stat cache still calls it clean (the readable-bit change is invisible to it), so only the content read fails.
-    assert.equal(f.g("status", "--porcelain"), "", "precondition: status does not read the file");
+    assert.equal(f.g("-c", "core.trustctime=true", "status", "--porcelain"), "", "precondition: status (with the proof's ctime pin) does not read the file");
     assert.equal(await f.proof(), "unreadable");
   });
 
