@@ -61,7 +61,9 @@ web controls. `uzi settings get` reports the result (see
 
 Each harness also offers **Runtime default** beside **Default · medium
 (built-in)** and the five levels. The option is labelled **Runtime default · value
-not reported** for Claude and **Runtime default · Codex decides** for Codex.
+not reported** for Claude. For Codex the label carries the catalog default last
+reported for your credential, or says it is unknown (see [What the Codex catalog
+default means](#what-the-codex-catalog-default-means)).
 It is stored as the token `runtime` in the same preference (`default_effort`
 or `default_codex_effort` on `PUT /api/me/settings`, cookie-only; `GET`
 returns the stored token).
@@ -101,6 +103,23 @@ source at commit `6aaac694` (`codex-rs/core/src/client.rs:957-966`).
   they cannot change the default.
 - A resume that reattaches to a still-running Codex thread keeps that thread's
   level.
+
+Workers report the catalog default after a Codex run's `model/list`, and the
+server stores it per user and per Codex credential (and, for a subscription,
+account). Settings show the report for the credential a new run of yours would
+use, if it is at most 30 days old. The Codex **Runtime default** option reads:
+
+| Label after **Runtime default ·** | Meaning |
+| --- | --- |
+| `catalog default: {effort} ({model}, Codex {version})` | Known: the level the catalog default is, for your Codex model, as last reported. |
+| `catalog default: none (no reasoning level requested) (...)` | Known, and the level is `none` (see above). |
+| `catalog default: ultra (Codex substitutes another level) (...)` | Known, and the level is `ultra` (see above). |
+| `... · may differ on workers still on another version` | Varies: workers on different Codex runtime versions reported different levels for the current credential. The label shows one of them. |
+| `catalog default unknown until a Codex run reports it` | Unknown: no report within 30 days for the current credential, no usable Codex credential, an unlinked subscription, or account pool mode (the credential is chosen only when a run is created, so none can be predicted). |
+
+Saving a different Codex model refreshes the label. Because the value is a
+report from an earlier run, it can lag a Codex runtime upgrade or a credential
+change until a new run reports.
 
 ### Effort reporting
 

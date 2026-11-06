@@ -3125,9 +3125,27 @@ for example:
 effort  claude  runtime default  medium  runtime default (value not reported)  your choice
 ```
 
+The Codex row's `RESOLVED` shows the catalog default last reported for your
+credential ([details](./worker-effort.md#what-the-codex-catalog-default-means)):
+
+| `RESOLVED` | Meaning |
+| --- | --- |
+| `runtime default (catalog default: low, gpt-6.1-sol, Codex 0.164.0)` | Known. |
+| `runtime default (catalog default: none, no reasoning level requested, gpt-6.1-sol, Codex 0.164.0)` | Known; the level is `none`. |
+| `runtime default (catalog default: ultra, Codex substitutes another level, gpt-6.1-sol, Codex 0.164.0)` | Known; the level is `ultra`. |
+| `runtime default (catalog default: medium, gpt-6.1-sol, Codex 0.164.0) · may differ on workers still on another version` | Varies. |
+| `runtime default (catalog default unknown)` | Unknown (also shown for an absent or unrecognised state). |
+
+```text
+effort  codex  runtime default  medium  runtime default (catalog default: low, gpt-6.1-sol, Codex 0.164.0)  your choice
+```
+
 `--json` carries the effort rows as the read-only `effort_settings` (ordered
 claude, codex: `harness`, `effort`, `default_effort`, `default_source`,
-`resolved_effort`, `source`, `mode`). `resolved_effort` is `null` exactly when
+`resolved_effort`, `source`, `mode`, and on the `codex` cell only
+`catalog_default`: `state` (`known`, `unknown` or `varies`), `effort`, `model`,
+`runtime_version`, `observed_at`, the last four `null` when `state` is
+`unknown`). `resolved_effort` is `null` exactly when
 `mode` is `runtime_default`. The CLI cannot set effort: the write endpoint is
 cookie-only, so use **Settings → Run defaults → Reasoning effort**. See
 [Reasoning effort](./worker-effort.md#runtime-default).
