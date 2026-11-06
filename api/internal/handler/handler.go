@@ -131,6 +131,9 @@ type Handler struct {
 	svc                  *forgesvc.Service
 	wsvc                 *workersvc.Service
 	heldSvc              heldPublisher // test seam for WorkerRunHeldPublication; nil = wsvc
+	// catalogDefaults is the test seam for the settings cell's Codex catalog default read
+	// (issue #3251); nil = wsvc, and a nil wsvc reads unknown.
+	catalogDefaults codexCatalogReader
 	// pcheck runs the PAT least-privilege checks (PRD #5): the save-time token
 	// gate and the on-demand full connection check.
 	pcheck *privcheck.Service

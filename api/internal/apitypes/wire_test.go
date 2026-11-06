@@ -1202,8 +1202,13 @@ func TestModelSettingCellDTOTags(t *testing.T) {
 }
 
 func TestEffortSettingCellDTOTags(t *testing.T) {
-	assertTags(t, "EffortSettingCellDTO", EffortSettingCellDTO{},
-		"harness", "effort", "default_effort", "default_source", "resolved_effort", "source", "mode")
+	assertTags(t, "EffortSettingCellDTO", EffortSettingCellDTO{CatalogDefault: &CatalogDefaultDTO{}},
+		"harness", "effort", "default_effort", "default_source", "resolved_effort", "source", "mode", "catalog_default")
+}
+
+func TestCatalogDefaultDTOTags(t *testing.T) {
+	assertTags(t, "CatalogDefaultDTO", CatalogDefaultDTO{},
+		"state", "effort", "model", "runtime_version", "observed_at")
 }
 
 func TestCrossCheckPinDTOTags(t *testing.T) {
