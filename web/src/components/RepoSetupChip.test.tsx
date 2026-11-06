@@ -178,3 +178,16 @@ describe("RepoSetupChip — popover", () => {
     expect(tooltip.getAttribute("title")).toBeNull();
   });
 });
+
+describe("RepoSetupChip — default agents readout (PRD #3914)", () => {
+  it.each([
+    [undefined, "not set (today’s behaviour)"],
+    [null, "not set (today’s behaviour)"],
+    ["own" as const, "uzi templates"],
+    ["repo" as const, "repo agents"],
+  ])("agent_source_default %s reads %s", (value, label) => {
+    render(<RepoSetupChip repo={repo({ agent_source_default: value })} />);
+    const tip = screen.getByRole("tooltip", { hidden: true });
+    expect(within(tip).getByText(/Default agents for my runs:/).textContent).toBe(`Default agents for my runs: ${label}`);
+  });
+});

@@ -2,6 +2,7 @@ import { needsAttention } from "../../components/WorkerUpgradeBadge";
 import type { BindMode, Worker } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { healthyFleetWorkers, incidentFleetWorkers, mockAdminWorkers, mockWorkers } from "../data";
+import { overviewNextOwnerWorkers } from "../data/overviewNext";
 import { minsAgo } from "../data/time";
 import { delay, mockScenario, requireSession } from "./shared";
 // secrets ↔ workers is the one accepted import cycle (PRD #991 D4): setWorkerBindMode
@@ -39,6 +40,7 @@ let custodyWorkerDeleted = false;
 function ownerWorkers(): Worker[] {
   const scenario = mockScenario();
   if (scenario === "health-incident") return incidentFleetWorkers();
+  if (scenario === "overview-next") return overviewNextOwnerWorkers();
   if (scenario === "custody") return custodyWorkerDeleted ? workers : [...workers, custodyHostedWorker()];
   return workers;
 }

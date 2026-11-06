@@ -22,6 +22,7 @@
   "judge_model": "x",
   "codex_judge_model": "x",
   "summary_model": "x",
+  "codex_summary_model": "x",
   "theme": "x",
   "mr_rework_enabled": true,
   "now_summary_enabled": true,
@@ -37,6 +38,16 @@
   "typeface": "x",
   "default_harness": "x",
   "judge_models": [
+    {
+      "harness": "x",
+      "model": "x",
+      "default_model": "x",
+      "default_source": "x",
+      "resolved_model": "x",
+      "source": "x"
+    }
+  ],
+  "summary_models": [
     {
       "harness": "x",
       "model": "x",

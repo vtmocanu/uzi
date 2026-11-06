@@ -1809,3 +1809,54 @@ Mixed-version limits, all fail closed:
 - C1b binary against the C2 schema: it never writes the new `prerequisite_closure` evidence or `final_closure_id`.
 
 Accepted residuals: a thin FINAL stays stuck and is retried while the pin or the feature is unavailable; available-pin audits run at about 24 hours, so an external deletion can go unnoticed for up to a day before release-time listing records the absence and refuses; an external writer deleting or rewriting the pin after release defeats restore (the external-writer residual above is unchanged). A closure-released hold remains not history-safe for forge placement (`fn_forge_source_history_safe` is unchanged).
+
+## Amendment 2026-11-06, #3994: transient API connection failures retry the ownership check in place
+
+Decision record (AI-synced 2026-11-06). This qualifies the #3527 owner hold
+([amendment](#amendment-2026-10-27-3527-owner-held-retained-adoption-retry)) for a class of
+failures, motivated by one observed failure: during a release rollout, the worker's post-adoption
+ownership check failed (logged `fetch failed`, then
+`retained_successor_post_adoption_check`) for a verified, journaled retained
+successor. The rollout timing is consistent with temporary API unavailability,
+but the evidence does not identify the error (cause code) of the ownership
+request, and the adoption-failure owner hold in that generation was not
+confirmed. If that error was not one of the codes retried below (for example a
+DNS failure or a timeout), this change would not have avoided the hold. Before
+this change, any failure of that check that was not a stop followed the
+`adoption_failed` path, including a short connection outage in which no
+integrity check had failed.
+
+**Decision.** After `prepareRecoverySuccessor` has verified and journaled the
+successor, the worker's read-only ownership check (and the second check in the
+Codex/safety branch after executor disposal) retries in place when, and only
+when, the failure is positively classified as a temporary API connection
+problem. It runs on the same claim and successor: no recapture, no second
+successor and no extra recovery-attempt charge.
+
+**Classifier.** Qualifying: a request that failed before any response whose
+cause code is `ECONNREFUSED`, `ECONNRESET` or `UND_ERR_SOCKET`, or an ownership
+route answer of 502, 503 or 504. The transport case requires a marker recorded
+on the rejection of the fetch promise itself, so a failure while reading a
+response body (a truncated 200 surfaces with the same `UND_ERR_SOCKET` shape)
+never qualifies. The marker is by object identity, and abort reasons are not
+marked. Unknown errors, malformed responses, other statuses, deadline expiry,
+ownership or claim loss, and cancel, pause, stop or credential switch keep their
+existing outcomes.
+
+**Cap and deadline.** At most 5 attempts, with delays of 1, 2, 4 and 8 times the
+recovery retry interval (about 15 s by default), always inside the iteration's
+existing deadline. If the deadline actually passes, the outcome is the existing
+`budget_exhausted`. If retries are exhausted, the failure is not positively
+transient, or the next wait would not fit before the deadline, the helper gives
+up and the site's existing outcome follows. For the first check that is the
+existing `adoption_failed` path: an owner hold at `recovery_wait` /
+`retained_recovery_adoption_failed` when its existing preconditions hold (API
+feature, persisted blocker, proven quiescence), otherwise the existing generic
+failure with custody kept. For the second check in the Codex/safety branch it is
+the existing `quiescence_failed` blocker, a failure with custody kept and not an
+owner hold.
+
+**Unchanged.** No new status, no API change and no persistence: retry state is
+in-process only, so a worker restart starts the check afresh. The #3527 hold
+keeps no automatic retry, and a genuine adoption failure still holds. This makes
+no durability claim beyond the bounded in-process window.

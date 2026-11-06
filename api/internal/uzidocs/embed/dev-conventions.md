@@ -712,11 +712,16 @@ scenarios are mutually exclusive by construction. Known values:
   a non-passing health chip), and three other users' runs join the admin
   all-users list (one awaiting approval, one running, one in a usage-limit
   wait). One of your own completed runs shares its open MR with `run-ci-halted`,
-  so the pull-request list has a duplicate to collapse. Nothing is seeded
-  outside the scenario. (PRD #3878.)
+  so the pull-request list has a duplicate to collapse. Your fleet gains seven
+  workers for the Capacity card (full, draining and upgrading, manually
+  cordoned, offline, no advertised slot cap and no stats), and four open
+  custody holds feed the Held work card, two of them needing a decision, so
+  Needs your decision carries one held-work row. Nothing is seeded outside the
+  scenario. (PRD #3878, PRD #3880.)
 - `overview-calm` — `/overview/next?mock=overview-calm`: you have active runs
   but nothing waiting on a decision (no plan review, question, owner-action
-  park or open pull request), so the decision card stays hidden. (PRD #3878.)
+  park, open pull request or custody hold), so the decision card stays hidden.
+  (PRD #3878, PRD #3880.)
 
 ### What keeps the mock build current
 

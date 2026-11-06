@@ -9,8 +9,8 @@
 | PRD | Outcome | Blocked by |
 |---|---|---|
 | #3878 (`prds/done/3878-overview-preview-decisions.md`) | The new Overview at `/overview/next`: header with status sentence and health chip, banners under the header, Needs your decision, runs grouped Yours / Other users (admin) | none |
-| #3879 (`prds/3879-overview-issue-line.md`) | The issue-work line, filtering the runs widget | #3878 |
-| #3880 (`prds/3880-overview-capacity-held-work.md`) | Capacity rail and Held work; retires the worker-load card and custody banner on the preview | #3878 |
+| #3879 (`prds/done/3879-overview-issue-line.md`) | The issue-work line, filtering the runs widget | #3878 |
+| #3880 (`prds/done/3880-overview-capacity-held-work.md`) | Capacity rail and Held work; retires the worker-load card and custody banner on the preview | #3878 |
 | #3881 (`prds/3881-overview-usage-by-user.md`) | Usage card with the You / Factory toggle and the admin by-user table | #3878 |
 | #3875 (`prds/3875-command-menu.md`) | The Cmd K command menu | #3878, #3880 |
 | #3876 (`prds/3876-usage-harness-split.md`) | Per-user Claude / Codex split in admin usage (API, CLI, table column) | #3881 |
@@ -62,7 +62,7 @@ Ranked, from `web/src/pages/Dashboard.tsx` and a live instance:
 
 The page keeps today's shell and content column (`max-w-[68rem]`, `web/src/components/AppShell.tsx:1402`).
 
-0. **App-wide banners.** On the Overview only, the banner stack renders **under the page header** (below the greeting and status sentence, above Needs your decision; maintainer calls D18 and D20). Every other page keeps today's shell slot above its content (`AppShell.tsx:1403` to `:1418`). One shared component renders the stack in both places. Order and behaviour stay as today: vault required prompt, vault locked banner with its inline unlock form (`VaultLockedBanner`, `web/src/components/VaultControls.tsx:65`), maintenance mode (`MaintenanceBanner.tsx:28`), update escalation (admins), instance-health danger (`HealthDangerBanner.tsx:32`, admins) and health attention (`HealthAttentionBanner.tsx:8`, admins). The Overview adds no second health card; its header chip mirrors the same severity. The sidebar's vault chip stays as today.
+0. **App-wide banners.** On the Overview only, the stack appears **under the page header** (below the greeting and status sentence, above Needs your decision; maintainer calls D18 and D20). PR #3952 kept one `AppBanners` instance mounted in `AppShell` on every route and portalled the preview header into a shell slot above it (`web/src/components/PageHeaderSlot.tsx`); snooze and dismissal state therefore survives navigation. Order and behaviour stay as today: vault required prompt, vault locked banner with its inline unlock form (`VaultLockedBanner`, `web/src/components/VaultControls.tsx`), maintenance mode (`MaintenanceBanner`), update escalation (admins), instance-health danger (`HealthDangerBanner`, admins) and health attention (`HealthAttentionBanner`, admins). The Overview adds no second health card; its header chip mirrors the same severity. The sidebar's vault chip stays as today.
 1. **Page header** (`PageHeader`): "Welcome, <name>" plus one status sentence ("3 decisions and 2 pull requests are waiting on you. 4 runs are executing, 1 is queued and 1 is parked until its usage window reopens."). Actions on the right: a compact health chip for admins (fed by `HealthOverviewCard`'s data; replaces today's full-width health strip) and a Search <kbd>⌘K</kbd> button. Non-admins keep today's `HealthPlatformLine` (`web/src/components/HealthPlatformLine.tsx:47`) when their own hosted fleet is stuck.
 2. **Needs your decision** card: plan review, question, held-work decision, PRs open for review. **Only the viewer's own items, for admins too**: these are owner actions, and nobody can decide for another user. One explicit verb each: Review plan, Answer, Review held work, Review PR. **It self-hides when nothing needs the owner**, as the custody banner does today; the status sentence then reads "Nothing needs you right now." It replaces the custody banner as the place a held-work decision surfaces, but **must keep every state the banner covers today** (`custodyAlertView`, `web/src/lib/recovery.ts:202`): blocked runs (danger tone, "Held work is blocking new runs"), admission at its limit ("Custody capacity reached") and pending decisions, each even when the others are zero. No Review CTA unless `decision_needed > 0`; the Held work card shows the capacity and blocked states with today's headlines.
    - The onboarding checklist ("Get the factory running", shown until token, forge, repo and worker are all set) stays, above the decisions card for a new user.
@@ -92,7 +92,7 @@ The mocks were checked against these; the real build needs a test per rule.
 - **PR open shows only PRs opened by the viewer's own uzi runs, for admins too** (see Run populations): a run with `mr_iid != null` and an observed `mr_state === "opened"`, deduplicated by repository and PR number. Human, Renovate and other bot PRs on the same repos are out of scope here; a full forge PR view is a separate feature. The "Review PRs" decision lists only the viewer's own PRs. `mr_state` is a cached hint (`apiTypes.ts:3405` on `Run`), so word it that way ("PR state as last seen by uzi"). Count PRs (deduplicated), not runs, and keep them out of active totals. Completed does not mean merged, and not every run opens a PR. The action is Review PR, never Merge.
 - **Custody:** custody slots, open holds and decisions needed stay three separate figures (`RecoveryCustodyHolds`, `apiTypes.ts:5660`; `decision_needed`, `apiTypes.ts:5627`). A hold protects committed but unpublished work per claim generation (`docs/cli.md:1423`), during healthy execution too, not only after a worker is lost.
 - **Workers:** online can mean draining, and draining alone is not owner attention. An image roll waits for genuine idle, so never promise "rolls after this run". Ephemeral workers retire after completion once retained work is safe.
-- **Slots:** "open" means advertised spare capacity (`max_concurrent_runs`, `apiTypes.ts:2609`), not guaranteed schedulability: credentials, cordons, capabilities and admission also gate a claim. Cross-check lanes count separately, and unknown caps exist.
+- **Slots:** "open" means advertised spare capacity (`max_concurrent_runs` on `Worker` in `web/src/lib/apiTypes.ts`), not guaranteed schedulability: credentials, cordons, capabilities and admission also gate a claim. Dedicated cross-check slots count separately, while legacy cross-checks remain in `active_runs`; unknown caps exist.
 - **Usage:** costs are API-equivalent estimates; keep the incomplete-data disclosure (`aggregateDisclosure` from `web/src/lib/costStatus`, used by `web/src/components/UsageCards.tsx`). The failed-run rate is failed / finished, with plan_rejected split out (`RunOutcomes`, `apiTypes.ts:4304`). `last_failed_*` is lifetime-only (`apiTypes.ts:4306`), so Latest failure is labelled all time. Cost per PR divides by PRs opened.
 - Factory usage and instance health are admin-scoped; a non-admin sees only their own.
 - Findings (bugs in target code) and Judge recommendations (factory improvements) stay distinct.
@@ -105,9 +105,9 @@ The mocks were checked against these; the real build needs a test per rule.
 | Stages, live activity, milestones, iterations, stalled flag | `api.listRuns({ view: "summary" })` (`Dashboard.tsx:154`), own-scoped (`ListRuns`, `api/internal/handler/runs.go`) | none |
 | Admin: other users' runs, line counts | `api.adminListRuns({ view: "summary" })` (`web/src/lib/api.ts:486`) → `GET /api/admin/runs` (`AdminListRuns`, `api/internal/handler/runs.go:137`, `routes_admin.go:48`), same summary projection; `owner_email` is the discriminator since `RunSummaryItem` has no `is_mine` | none; a non-admin must never call it |
 | Plan reviews and questions | run statuses | none |
-| Held-work decision and custody figures | `GET /api/recovery/holds` (`CustodyBoardAlert.tsx`) | none |
+| Held-work decision and custody figures | Owner `GET /api/recovery/holds?state=open` (`api.getRecoveryHolds`, `CustodyBoardAlert.tsx`); PR #3952 still renders that alert on the preview | none; #3880 moves the preview read into an independent shared hook poll |
 | PRs open | `mr_iid`, `mr_state` on runs | no freshness timestamp; use cached-state wording or add one |
-| Slots, workers, cpu / mem / disk | `api.listWorkers()` | closed slots derive from cordon or drain state; see the "open" caveat above |
+| Slots, workers, cpu / mem / disk | `api.listWorkers()` through `useOverviewData`; preview currently renders `WorkerLoadCard` only for workers with stats | #3880 must list every owner worker; closed slots derive from cordon, drain or an in-progress hosted upgrade, with offline and unknown-cap workers outside the bar |
 | Outcome figures and causes | `SelfUsage` (`apiTypes.ts:4326`) and the admin usage response | none |
 | By user: runs, PRs, failed, fail rate, last failure, cost, both windows | `AdminUsage.users` (`AdminUsageUser`: `run_count` / `last7_run_count`, `outcomes` / `last7_outcomes` incl. lifetime `last_failed_at`, `pr_count` / `last7_pr_count`, `usage` / `last_7_days`) | none |
 | By user: Claude / Codex split | none | needs a per-user aggregate by harness (Proposed); check CLI parity (`uzi admin usage`) |
@@ -124,17 +124,17 @@ The mocks were checked against these; the real build needs a test per rule.
 
 ## Reuse map
 
-Build from what exists; do not re-implement these. Anchors verified on `origin/main` `ba230ce3`.
+Build from what exists; do not re-implement these. The original anchors were checked on `ba230ce3`; capacity and held-work seams below were refreshed on `origin/main` `e6cafe3f2` (2026-11-05). Other children's anchors remain historical until their dispatch checks.
 
 | Need | Reuse |
 |---|---|
-| Effective status, buckets for the status sentence | `effectiveRunStatus` (`web/src/lib/runBadge.ts:202`), `isAccountCooldownWaiting` (`runBadge.ts:533`), `activeRunBuckets` (`web/src/pages/Dashboard.tsx:42`) |
+| Effective status, buckets for the status sentence | `effectiveRunStatus` (`web/src/lib/runBadge.ts`), `isAccountCooldownWaiting` (`runBadge.ts`), `activeRunBuckets` (`web/src/lib/overview.ts`, moved there by #3878) |
 | Status pill, iteration and milestone badges | `StatusPill` (`web/src/components/ui.tsx:634`), `Badge`, `milestoneBadge` (`runBadge.ts:1029`) |
 | Stalled and waiting flags, health word | `RunProgressCell` / `progressShowsStall` (`web/src/components/RunProgressCell.tsx:100`, `:38`), `RunHealthBadge` (`web/src/components/RunHealthBadge.tsx:12`) |
 | Issue ref and PR chip | `RunIssueRef` (`web/src/components/RunIssueRef.tsx:11`), `MrChip` (`web/src/components/MrChip.tsx:27`) |
 | "Now" line age | `activityAge` (`web/src/lib/runActivity.ts:126`) |
-| Worker badges and stat line | `WorkerRunBadge`, `WorkerCordonBadge` (`web/src/components/WorkerRunBadge.tsx:6`, `WorkerCordonBadge.tsx:6`), `WorkerStatLine` (`web/src/components/WorkerStats.tsx:262`) |
-| Custody states and headlines | `custodyAlertView` (`web/src/lib/recovery.ts:202`) |
+| Worker badges, upgrade evidence and stat line | `WorkerRunBadge`, `WorkerCordonBadge`, `WorkerUpgradeBadge`, `WorkerStatLine` (`web/src/components/WorkerRunBadge.tsx`, `WorkerCordonBadge.tsx`, `WorkerUpgradeBadge.tsx`, `WorkerStats.tsx`); current preview's `WorkerLoadCard` filters to `hasStats` |
+| Custody states, admission slots and headlines | `custodyAlertView` and `recoveryCapacityUsed` (`web/src/lib/recovery.ts`), `CustodyBoardAlert` (`web/src/components/CustodyBoardAlert.tsx`) |
 | Health | `HealthOverviewCard` (`web/src/components/HealthOverviewCard.tsx:36`), `HealthPlatformLine` (`HealthPlatformLine.tsx:47`) |
 | Usage figures, disclosure, window preference | `UsageCard` (`web/src/components/UsageCards.tsx:253`) and its helpers (`FailedRunsBlock`, `TopCauses`, `SinceLastFailedRun`) |
 | By-user table | `PerUserUsageTable` (`UsageCards.tsx:321`), trimmed |

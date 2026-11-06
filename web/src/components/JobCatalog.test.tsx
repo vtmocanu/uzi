@@ -109,10 +109,17 @@ describe("JobCatalog — cards", () => {
     expect(within(bug).getByText(/catalog default/).parentElement!.textContent).toBe("Every day at 02:00 · UTC · catalog default");
     expect(within(bug).getByText("label bug")).toBeTruthy();
     expect(within(bug).getByText("max 3")).toBeTruthy();
-    expect(within(bug).getByText("default model")).toBeTruthy();
+    expect(within(bug).getByText("model: default")).toBeTruthy();
+    expect(within(bug).queryByText("+ agents")).toBeNull();
     expect(within(bug).getByLabelText("Baked prompt, read-only")).toBeTruthy();
     expect(within(bug).getByText("sweep")).toBeTruthy();
     expect(within(card("docs-hygiene")).getByText("prompt")).toBeTruthy();
+  });
+
+  it("marks a pinned catalog model", () => {
+    renderCatalog({ catalog: { entries: [entry({ model: "claude-opus-4-1" })], enablements: [] } });
+    expect(within(card("bug-triage")).getByText("model: claude-opus-4-1 · pinned")).toBeTruthy();
+    expect(within(card("bug-triage")).queryByText("model: default")).toBeNull();
   });
 
   it("a self_improve entry carries no lock marker", () => {

@@ -3,8 +3,9 @@
 // implement, from the issue + PRD) and a "plan" summary + deltas (what the proposed
 // plan will do and how it diverges from the original ask). Unlike the Judge it is NOT a
 // run kind: it runs INLINE inside a normal, in-flight eligible run (Decision 1), on the
-// claim's harness: Codex uses the injected isolated advice factory with private
-// model/effort pins and refresh denied; absent Codex uses the legacy Anthropic token
+// claim's harness: Codex uses the injected isolated advice factory with the claim's
+// validated Codex summary model (else the built-in), a fixed effort pin and refresh
+// denied; absent Codex uses the legacy Anthropic token
 // and model. It reuses the read-only model pass's timeout, usage and abort mechanics,
 // and extractJsonObject for plan/deltas JSON, without the JudgeRunner's lifecycle.
 //
@@ -20,15 +21,21 @@ import { diagramEvent, type DiagramParserReason, type DiagramReason } from "./di
 
 import { fenceNonce } from "./prompt.js";
 import { defaultQueryFn } from "./sdk-messages.js";
-import { runReadOnlyModelPass, type ReadOnlyModelPassOpts } from "./model-pass.js";
+import { ModelPassCredentialError, runReadOnlyModelPass, type ModelPassCredentialReason, type ReadOnlyModelPassOpts } from "./model-pass.js";
 import { extractJsonObject } from "./judge-runner.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
 import { selectCodexBinding } from "./codex/select.js"; // the pure, fail-closed claim-shape discriminator, NOT a Codex class construction
 import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js"; // type-only: the injected seam, never constructed here
 import { CODEX_PR_DESCRIPTION_MODEL } from "./codex/pr-description-model.js"; // leaf value import (no runtime dep on codex-executor)
+import { CODEX_SUMMARY_EFFORT, DEFAULT_CODEX_SUMMARY_MODEL } from "./codex/summary-model.js"; // leaf value import
+import { isCodexRoleModel } from "./codex/render.js";
 import type { DeliveryContext } from "./pr-description-context.js";
 import type { PrDescriptionDiagram } from "./protocol.js";
 import type { AdviceUsageSnapshot } from "./harness.js";
+
+/** Why a Codex intent or plan summary was skipped because the run's Codex credential could not be
+ *  used (issue #3248 M3). A closed set decided from typed evidence in the model pass. */
+export type SummarySkipReason = ModelPassCredentialReason;
 
 /** Which summary pass a usage report belongs to (the `summary_usage` message's `pass`). */
 export type SummaryPassName = "intent" | "plan" | "pr_description";
@@ -44,10 +51,6 @@ import type { Logger } from "./log.js";
 // summaryModelTimeoutMs, the one parser), or per-instance via the constructor for
 // deterministic tests.
 const SUMMARY_MODEL_TIMEOUT_MS = summaryModelTimeoutMs(process.env);
-
-// Issue #2833 M1: private intent/plan pins, independent of the delivery editor model.
-const CODEX_INTENT_PLAN_MODEL = "gpt-6-luna";
-const CODEX_INTENT_PLAN_EFFORT = "low";
 
 /** PRD #1798 M5: the Claude model the editor pass runs on when the claim carries no usable
  *  `summary_model`. The api resolves `summary_model` (user value, else the instance setting,
@@ -96,6 +99,8 @@ export interface IntentSummaryInput {
    *  With no Codex block, the legacy token/model inputs below are used unchanged. */
   claim?: { readonly run_id: string; readonly claim_generation?: number; readonly secrets: { readonly codex?: unknown } };
   token: string;
+  /** The resolved summary model. Claude lane: used as is. Codex lane (#3248): used when it is a
+   *  Codex role model, else the built-in fallback (an older server sends the Claude value). */
   model: string;
   issueTitle: string;
   issueBody: string;
@@ -107,6 +112,9 @@ export interface IntentSummaryInput {
   /** Issue #2686: an external abort. Rejects the pass at once (the generation then returns
    *  null) and still delivers any already-observed usage through `onUsage`. */
   signal?: AbortSignal;
+  /** Issue #3248 M3: called at most once, on the Codex branch only, when the pass failed on a
+   *  typed credential-state refusal. The generator still returns null; a throw is swallowed. */
+  onSkip?(reason: SummarySkipReason): void;
 }
 
 export interface PlanSummaryInput extends IntentSummaryInput {
@@ -427,14 +435,20 @@ export class SummaryRunner {
    *  result so the public methods can catch → null. */
   private async runModel(pass: "intent" | "plan", input: IntentSummaryInput, prompt: string): Promise<string> {
     const reportUsage = this.usageReporter(pass, input.onUsage);
+    let onCodex = false;
     try {
       const selection = selectCodexBinding({ codex: input.claim?.secrets.codex });
       let harness: Pick<ReadOnlyModelPassOpts, "token" | "model" | "effort" | "codex">;
       if (selection.kind === "codex") {
+        onCodex = true;
         if (!this.codexAdviceHarnessFactory) throw new Error("Codex claim but no Codex advice-harness factory is wired");
+        const configured = isCodexRoleModel(input.model);
+        if (!configured && input.model !== "") {
+          this.log.info("summary model is not a Codex role model; using the built-in Codex summary model", { pass });
+        }
         harness = {
-          model: CODEX_INTENT_PLAN_MODEL,
-          effort: CODEX_INTENT_PLAN_EFFORT,
+          model: configured ? input.model : DEFAULT_CODEX_SUMMARY_MODEL,
+          effort: CODEX_SUMMARY_EFFORT,
           codex: {
             runId: input.claim!.run_id,
             claimGeneration: input.claim!.claim_generation,
@@ -460,6 +474,15 @@ export class SummaryRunner {
         onUsage: reportUsage.onUsage,
         ...(input.signal ? { signal: input.signal } : {}),
       });
+    } catch (err) {
+      if (onCodex && err instanceof ModelPassCredentialError) {
+        try {
+          input.onSkip?.(err.reason);
+        } catch (cbErr) {
+          this.log.warn("summary skip callback failed", { pass, error_class: errorClass(cbErr) });
+        }
+      }
+      throw err;
     } finally {
       reportUsage.finish();
     }

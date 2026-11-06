@@ -23,6 +23,10 @@ func retainedRecoveryRun(timing string) apitypes.RunDTO {
 		cause = "retained_recovery_adoption_failed"
 		timing = strings.TrimPrefix(timing, "adoption/")
 	}
+	if strings.HasPrefix(timing, "unwitnessed/") {
+		cause = "retained_continuation_unwitnessed"
+		timing = strings.TrimPrefix(timing, "unwitnessed/")
+	}
 	r.RecoveryWaitCause = &cause
 	r.RecoveryRetryNotBefore = nil
 	r.RecoveryRetryNotBeforePresent = true
@@ -519,5 +523,106 @@ func TestRetainedAdoptionTUI(t *testing.T) {
 		if code != 0 || strings.Contains(out+errout, "adoption failed") || runBandOf(row) == bandNeedsYou || strings.Contains(runStateWord(row), "recovery") {
 			t.Fatalf("stale hold: %d %s %s", code, out, errout)
 		}
+	}
+}
+
+// The unwitnessed-continuation park is owner-held even when a malformed response
+// supplies a finite retry stamp, and never claims quiescence, lost work or a retry.
+func TestRetainedContinuationUnwitnessedClassification(t *testing.T) {
+	for _, timing := range []string{"held", "future", "due"} {
+		r := retainedRecoveryRun("unwitnessed/" + timing)
+		if !isRecoveryDecisionPark(r) || !isRecoveryDecisionHold(r) || !isOwnerRequiredWorkerHold(r) {
+			t.Fatalf("%s: not a decision park/hold", timing)
+		}
+		if got := recoveryDecisionWord(r); got != "recovery held" {
+			t.Fatalf("%s: word %q", timing, got)
+		}
+		line := workerExhaustionLine(r)
+		requireWorkerCopy(t, line, "not witnessed", "owner decision needed", "claim released",
+			"local work and custody kept", "no retry scheduled", "uzi run resume r1", "uzi run cancel r1")
+		for _, bad := range []string{"timed retry", "2099-", "2000-", "transient", "lost", "quiescent"} {
+			if strings.Contains(line, bad) {
+				t.Errorf("%s: misleading %q: %s", timing, bad, line)
+			}
+		}
+	}
+	if got := steerState(queuedIn(), statusRecoveryWait, "retained_continuation_unwitnessed"); got != "queued (owner Resume/Cancel)" {
+		t.Fatalf("steerState: %s", got)
+	}
+	if glyph, word := stateGlyphWord(statusRecoveryWait, "", false, false, "", "", "retained_continuation_unwitnessed"); glyph != "!" || word != "recovery held" {
+		t.Fatalf("token: %s %s", glyph, word)
+	}
+}
+
+func TestRetainedContinuationUnwitnessedCLI(t *testing.T) {
+	r := retainedRecoveryRun("unwitnessed/future")
+	for _, verb := range []string{"get", "list", "inputs"} {
+		t.Run(verb, func(t *testing.T) {
+			polls, mutation := 0, false
+			srv := workerExhaustionServer(t, []apitypes.RunDTO{r}, &polls, &mutation)
+			defer srv.Close()
+			args := []string{"run", verb}
+			if verb != "list" {
+				args = append(args, "r1")
+			}
+			out, errout, code := runCLI(t, httpEnv(srv), args...)
+			if code != 0 || mutation {
+				t.Fatalf("exit %d mutation %v: %s", code, mutation, errout)
+			}
+			requireWorkerCopy(t, out+errout, "not witnessed", "owner decision needed", "no automatic resume",
+				"uzi run resume r1", "uzi run cancel r1")
+			if strings.Contains(out+errout, "2099-") || strings.Contains(out+errout, "transient interruption") {
+				t.Errorf("misleading copy: %s %s", out, errout)
+			}
+		})
+	}
+}
+
+func TestRetainedContinuationUnwitnessedWait(t *testing.T) {
+	old := logsPollInterval
+	logsPollInterval = time.Millisecond
+	t.Cleanup(func() { logsPollInterval = old })
+	r := retainedRecoveryRun("unwitnessed/future")
+	done := r
+	done.Status = "completed"
+	polls, mutation := 0, false
+	srv := workerExhaustionServer(t, []apitypes.RunDTO{r, done}, &polls, &mutation)
+	defer srv.Close()
+	_, errout, code := runCLI(t, httpEnv(srv), "run", "wait", "r1", "--interval", "1ms", "--timeout", "1s", "--min-plan-seq", "99")
+	if code != 0 || polls != 1 || mutation {
+		t.Fatalf("exit %d polls %d mutation %v: %s", code, polls, mutation, errout)
+	}
+	requireWorkerCopy(t, errout, "not witnessed", "owner decision needed")
+}
+
+func TestRetainedContinuationUnwitnessedTUI(t *testing.T) {
+	for _, timing := range []string{"held", "future"} {
+		t.Run(timing, func(t *testing.T) {
+			r := retainedRecoveryRun("unwitnessed/" + timing)
+			row := apitypes.RunListItemDTO{RunDTO: r}
+			m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+			m.width, m.height = 60, 36
+			m = step(m, tea.ColorProfileMsg{Profile: colorprofile.Ascii})
+			m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: []apitypes.RunListItemDTO{row}})
+			if runBandOf(row) != bandNeedsYou || runStateWord(row) != "recovery held" {
+				t.Fatal("missing owner attention")
+			}
+			requireWorkerCopy(t, stripANSI(m.View().Content), "NEEDS YOU", "recovery held", "Owner-held")
+			m = tuiTestModel(t, &uzicli.FakeClient{}, r.ID)
+			m = applyDetail(m, r, nil)
+			m = step(m, tea.ColorProfileMsg{Profile: colorprofile.Ascii})
+			m = step(m, tea.WindowSizeMsg{Width: 60, Height: 36})
+			out := stripANSI(m.View().Content)
+			requireWorkerCopy(t, out, "never witnessed", "no retry scheduled", "custody kept",
+				"uzi run resume r1", "uzi run cancel r1")
+			for _, line := range strings.Split(out, "\n") {
+				if visualWidth(line) > 60 {
+					t.Errorf("overflow: %q", line)
+				}
+			}
+			if strings.Contains(out, "Timed retry") || strings.Contains(out, "2099-") {
+				t.Fatalf("held timer: %s", out)
+			}
+		})
 	}
 }

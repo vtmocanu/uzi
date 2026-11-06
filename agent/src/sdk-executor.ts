@@ -66,6 +66,7 @@ import {
 import {
   resolveAgentSelection,
   seedAgentSelection,
+  gateVerdictSelection,
   type AgentSelectionParse,
   type AskUserQuestion,
   type ClaimConfig,
@@ -2767,7 +2768,7 @@ export class SdkExecutor implements Executor {
         // Issue #3178: keyed on the post-gate resumeId (a revise turn may have produced a
         // session), never ctx.sessionId. Cross-check approvals carry the canonical contract.
         drive.gateApprovedWithoutSession = verdict.approval !== "cross_check" && resumeId === undefined;
-        approvedSelection = verdict.selection;
+        approvedSelection = gateVerdictSelection(verdict.selection, ctx.approvedSelection, ctx.requestedAgentSource);
         // PRD #122 M6: freeze the APPROVED milestone breakdown for the implement loop.
         // `candidateMilestones` is block-scoped and REPLACED across revision rounds
         // (Decision 2), so this captures the final approved list — the one the loop names
@@ -2876,7 +2877,7 @@ export class SdkExecutor implements Executor {
       // repo": an ABSENT selection resolves to repo when a roster was detected, which
       // is what a gate-less run and an older server both get (see further up).
       const repoAvailable = (ctx.repoAgents?.length ?? 0) > 0;
-      const resolved = resolveAgentSelection(approvedSelection, repoAvailable);
+      const resolved = resolveAgentSelection(approvedSelection, repoAvailable, ctx.requestedAgentSource);
       if (resolved.note)
         ctx.emit({
           kind: "status",

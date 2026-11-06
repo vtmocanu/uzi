@@ -39,6 +39,46 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Milestone reconciliation audit snapshots no longer drop when the run has large plan or issue text ([#3945](https://github.com/vtmocanu/uzi/pull/3945), [#3947](https://github.com/vtmocanu/uzi/pull/3947)).**
   Before and after snapshots now carry a fixed set of reconciliation fields instead of the whole run row, so unrelated plan and issue text no longer pushes them over the audit size limit.
 
+- **Repo TOML agents honour supported Codex model pins ([#3265](https://github.com/vtmocanu/uzi/pull/3265), [#3972](https://github.com/vtmocanu/uzi/pull/3972)).**
+  Optional top-level model pins use the existing Codex role vocabulary; invalid values skip the agent, Claude follows the lead, and the schedule model override takes precedence.
+
+- **A retained continuation whose running report is refused no longer loops through uncharged requeues ([#3859](https://github.com/vtmocanu/uzi/pull/3859), [#3960](https://github.com/vtmocanu/uzi/pull/3960)).**
+  A witnessed flight departure is now charged against RUN_MAX_REQUEUES and parks at `worker_requeue_exhausted` at the cap, and presence without a departure within 2x the claim grace parks at the new owner-held `retained_continuation_unwitnessed` (Resume or Cancel); old agents and re-registering workers stay bounded only by the custody hold limit.
+
+- **A no-change report-only issue run is no longer failed by a predecessor's checkpoint that origin no longer holds ([#3944](https://github.com/vtmocanu/uzi/pull/3944), [#3948](https://github.com/vtmocanu/uzi/pull/3948)).**
+  The completion guard now ignores a stale local checkpoint copy only when origin positively reports the ref absent; a present, unknown or unreadable result, or an unproven lost-ack publish, still blocks, and no ref, hold or custody is changed.
+
+- **A credential switch during an automatic plan cross-check no longer fails the run ([#3953](https://github.com/vtmocanu/uzi/pull/3953), [#3979](https://github.com/vtmocanu/uzi/pull/3979)).**
+  The worker defers the switch until the checker's reservation settles (at most about 31 minutes after an approve or revise and about 53 minutes at a first checked human gate with the default 30-minute deadline), then switches; a cancel or other failure keeps its normal outcome. Known limit: an owner Cancel pressed during that wait takes effect only once the check settles and the switch is serviced ([#3974](https://github.com/vtmocanu/uzi/pull/3974) tracks a prompt Cancel).
+
+- **Repeated disk pressure waits for owner Resume instead of failing a run ([#3969](https://github.com/vtmocanu/uzi/pull/3969), [#3973](https://github.com/vtmocanu/uzi/pull/3973)).**
+  Runs that exhaust counted disk parks keep their work and recovery budgets in an owner hold; CLI and web offer Resume for one more attempt or Cancel.
+
+### Added
+
+- **A preview of the new Overview at /overview/next, decisions first ([#3878](https://github.com/vtmocanu/uzi/pull/3878), [#3952](https://github.com/vtmocanu/uzi/pull/3952)).**
+  It leads with a status sentence, the app banners under the header, what needs your decision and your runs, linked both ways with the current Overview.
+
+- **Run uzi on one VPS with Docker Compose ([#1173](https://github.com/vtmocanu/uzi/pull/1173), [#3951](https://github.com/vtmocanu/uzi/pull/3951)).**
+  Add `docs/vps-deployment.md`, a tutorial from a bare VPS to a first run with Caddy for HTTPS and a daily database dump, plus `docs/glossary.md`. Add `deploy/compose/compose.yaml`, a server Compose file of signed release images that restarts after a reboot, with parity checks against the laptop Compose stack that keep worker hardening, persistent storage and mounted token secrets.
+
+- **Intent and plan summaries pick their model per harness ([#3248](https://github.com/vtmocanu/uzi/pull/3248), [#3961](https://github.com/vtmocanu/uzi/pull/3961)).**
+  Users and admins can set a Codex summary model beside the Claude one, and admins can reset either lane to its built-in; each run uses its own harness's lane, and the run feed notes a Codex summary skipped because its credential could not be used.
+
+- **Issue work line on the Overview preview ([#3879](https://github.com/vtmocanu/uzi/pull/3879), [#3978](https://github.com/vtmocanu/uzi/pull/3978)).**
+  `/overview/next` shows where issue runs stand (queued, planning, plan review, building, PR open, plus questions, parked and other work); clicking a stage filters the Runs list.
+
+### Changed
+
+- **The Overview preview shows your capacity and held work in a right-hand rail ([#3880](https://github.com/vtmocanu/uzi/pull/3880), [#3971](https://github.com/vtmocanu/uzi/pull/3971)).**
+  Run slots in use, closed and open with every worker behind a disclosure replace the worker-load card, and a Held work card plus one held-work decision row replace the custody banner on /overview/next.
+
+- **Run health flags a run gone silent behind an open subagent delegation ([#3950](https://github.com/vtmocanu/uzi/pull/3950), [#3955](https://github.com/vtmocanu/uzi/pull/3955)).**
+  An open Agent or Task delegation no longer hides a quiet run: once the run sends no updates for the longer of Long tool call after and Stalled after, it is flagged stalled with a fixed advisory reason.
+
+- **Schedule modal groups where a run executes and says what Default means ([#3256](https://github.com/vtmocanu/uzi/pull/3256), [#3977](https://github.com/vtmocanu/uzi/pull/3977)).**
+  Harness, model, token and the renamed subagent-model toggle now sit together, with Default labels and model chips that show whether a value is pinned at fire.
+
 ## [0.86.1] - 2026-11-05
 
 ### Added

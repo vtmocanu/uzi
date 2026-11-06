@@ -3,6 +3,11 @@ package workersvc
 import (
 	"context"
 	"errors"
+	"fmt"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -45,6 +50,100 @@ func dindLiveFixture(t *testing.T) (codexTestEnv, store.Worker, *Service, DindMa
 	op := *DindMaintenanceFromWorker(w)
 	op.Phase = "ready"
 	return env, w, svc, op
+}
+
+// dindLiveClock is the service clock of a readiness flow. It never reads the host clock: it is
+// seeded from the database once and only moves forward to database stamps the flow read back, so
+// a host skewed against Postgres cannot reorder the checks the service makes against s.now().
+type dindLiveClock struct {
+	mu sync.Mutex
+	at time.Time
+}
+
+// dindLiveClocked installs a fresh clock on svc. Call it right after dindLiveFixture, before any
+// transition: the fixture's meter seed is then not after the clock.
+func dindLiveClocked(t *testing.T, env codexTestEnv, svc *Service) *dindLiveClock {
+	t.Helper()
+	var seed time.Time
+	if err := env.pool.QueryRow(env.ctx, `SELECT clock_timestamp()`).Scan(&seed); err != nil {
+		t.Fatal(err)
+	}
+	clk := &dindLiveClock{at: seed}
+	svc.SetClock(clk.now)
+	return clk
+}
+
+func (c *dindLiveClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.at
+}
+
+// advanceTo moves the clock forward to stamp; it never moves it back.
+func (c *dindLiveClock) advanceTo(t *testing.T, stamp time.Time) {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if stamp.After(c.at) {
+		c.at = stamp
+	}
+}
+
+// observeAfter returns a custody observation strictly after floor and not after the clock: the
+// clock first advances to one Postgres tick past floor.
+func (c *dindLiveClock) observeAfter(t *testing.T, floor time.Time) time.Time {
+	t.Helper()
+	c.advanceTo(t, floor.Add(time.Microsecond))
+	obs := c.now()
+	if !obs.After(floor) || obs.After(c.now()) {
+		t.Fatalf("observation %s is not in (floor %s, clock %s]", obs, floor, c.now())
+	}
+	return obs
+}
+
+func dindLiveWorker(t *testing.T, env codexTestEnv, id uuid.UUID) store.Worker {
+	t.Helper()
+	w, err := env.q.GetWorkerByID(env.ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w
+}
+
+// dindAckDiag describes why a readiness ACK would pass or fail. It prints times, booleans and
+// counts only: no nonces, ids or credentials.
+func dindAckDiag(w store.Worker, ack DindMaintenanceReadyACK, now time.Time) string {
+	floor := w.MaintenanceActivityFloor.Time
+	age := now.Sub(ack.CustodyCheckedAt)
+	count := func(p *int) string {
+		if p == nil {
+			return "nil"
+		}
+		return strconv.Itoa(*p)
+	}
+	return fmt.Sprintf("floor=%s custody_checked_at=%s now=%s age=%s after_floor=%t future=%t stale=%t phase=%s fenced=%t "+
+		"binding_matches=%t register_nonce_matches=%t local_claims=%s local_executions=%s custody_clear=%t",
+		floor.Format(time.RFC3339Nano), ack.CustodyCheckedAt.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), age,
+		ack.CustodyCheckedAt.After(floor), ack.CustodyCheckedAt.After(now), age > 45*time.Second,
+		w.MaintenancePhase, w.MaintenanceFenced, maintenanceMatches(w, ack.DindMaintenance),
+		w.SnapshotRegisterNonce.String == ack.RegisterNonce, count(ack.LocalClaims), count(ack.LocalExecutions), ack.CustodyClear)
+}
+
+// dindLiveAckDiag reads the worker and describes ack against the service clock.
+func dindLiveAckDiag(t *testing.T, env codexTestEnv, svc *Service, id uuid.UUID, ack DindMaintenanceReadyACK) string {
+	t.Helper()
+	return dindAckDiag(dindLiveWorker(t, env, id), ack, svc.now())
+}
+
+// dindLiveObserve reads the activity floor the last transition stamped and returns a valid
+// custody observation after it. Reverting this to the host clock is the regression of #3883.
+func dindLiveObserve(t *testing.T, env codexTestEnv, id uuid.UUID, clk *dindLiveClock, src *hostSource) time.Time {
+	t.Helper()
+	floor := dindLiveWorker(t, env, id).MaintenanceActivityFloor.Time
+	if src != nil {
+		src.record(t, floor)
+	}
+	return clk.observeAfter(t, floor)
 }
 
 func dindLiveRun(t *testing.T, env codexTestEnv, w store.Worker, kind, status string, owned bool) uuid.UUID {
@@ -147,8 +246,42 @@ func (tx *dindLiveCommitTx) Commit(ctx context.Context) error {
 	}
 }
 
+// requireCompletionHeartbeatValid fails unless every completion precondition on the replacement
+// heartbeat holds under the service clock, so a later refusal is the intended one, not a stale or
+// future heartbeat in disguise.
+func requireCompletionHeartbeatValid(t *testing.T, w store.Worker, clk *dindLiveClock) {
+	t.Helper()
+	now := clk.now()
+	hb, floor := w.LastHeartbeatAt.Time, w.DindRegisterFloor.Time
+	age := now.Sub(hb)
+	if !w.LastHeartbeatAt.Valid || !w.DindRegisterFloor.Valid || !hb.After(floor) || hb.After(now) || age > 45*time.Second ||
+		w.Status != "online" || !slices.Contains(w.ProtocolCapabilities, capability.DindMaintenanceV1) || !w.MaintenanceFenced ||
+		!w.SnapshotRegisterNonce.Valid || strings.TrimSpace(w.SnapshotRegisterNonce.String) == "" ||
+		w.SnapshotRegisterNonce.String == w.MaintenanceRegisterNonce {
+		t.Fatalf("completion heartbeat not valid under the service clock: %s", dindCompletionDiag(w, clk))
+	}
+}
+
+// dindCompletionDiag prints the clock, heartbeat, floors and age of a worker, with no identifiers.
+func dindCompletionDiag(w store.Worker, clk *dindLiveClock) string {
+	now := clk.now()
+	return fmt.Sprintf("clock=%s heartbeat=%s(valid=%t) register_floor=%s activity_floor=%s age=%s status=%s fenced=%t capability=%t phase=%s",
+		now.Format(time.RFC3339Nano), w.LastHeartbeatAt.Time.Format(time.RFC3339Nano), w.LastHeartbeatAt.Valid,
+		w.DindRegisterFloor.Time.Format(time.RFC3339Nano), w.MaintenanceActivityFloor.Time.Format(time.RFC3339Nano),
+		now.Sub(w.LastHeartbeatAt.Time), w.Status, w.MaintenanceFenced,
+		slices.Contains(w.ProtocolCapabilities, capability.DindMaintenanceV1), w.MaintenancePhase)
+}
+
+// The flow runs under the nominal host and under a database stamped ahead of the host. Neither
+// feeds the observation or the service clock; reverting those to src.now() is the regression this
+// catches.
 func TestDindMaintenanceReplacementReadinessLiveDB(t *testing.T) {
+	eachHost(t, dindReplacementReadiness)
+}
+
+func dindReplacementReadiness(t *testing.T, src *hostSource) {
 	env, w, svc, op := dindLiveFixture(t)
+	clk := dindLiveClocked(t, env, svc)
 	transition := func(phase string) DindMaintenance {
 		t.Helper()
 		op.Phase = phase
@@ -160,10 +293,8 @@ func TestDindMaintenanceReplacementReadinessLiveDB(t *testing.T) {
 	}
 	read := func() store.Worker {
 		t.Helper()
-		current, err := env.q.GetWorkerByID(env.ctx, w.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
+		current := dindLiveWorker(t, env, w.ID)
+		src.record(t, current.MaintenanceActivityFloor.Time)
 		return current
 	}
 	refuse := func(name, phase string) {
@@ -172,22 +303,24 @@ func TestDindMaintenanceReplacementReadinessLiveDB(t *testing.T) {
 		request := op
 		request.Phase = "complete"
 		if got, err := svc.TransitionDindMaintenance(env.ctx, w.ID, request); !errors.Is(err, ErrDindMaintenanceConflict) {
-			t.Fatalf("%s completed: got=%+v err=%v", name, got, err)
+			t.Fatalf("%s completed: got=%+v err=%v: %s", name, got, err, dindCompletionDiag(before, clk))
 		}
 		current := read()
 		if current.MaintenancePhase != phase || !current.MaintenanceFenced ||
 			current.MaintenanceRegisterNonce != w.MaintenanceRegisterNonce ||
 			!current.MaintenanceActivityFloor.Time.Equal(before.MaintenanceActivityFloor.Time) {
-			t.Fatalf("%s changed fenced operation: %+v", name, current)
+			t.Fatalf("%s changed fenced operation: %+v: %s", name, current, dindCompletionDiag(current, clk))
 		}
 	}
+	observe := func() time.Time { return dindLiveObserve(t, env, w.ID, clk, src) }
 	op = transition("ready")
 	zero := 0
-	if _, err := svc.AckDindMaintenance(env.ctx, w.ID, DindMaintenanceReadyACK{
+	readyACK := DindMaintenanceReadyACK{
 		DindMaintenance: op, LocalClaims: &zero, LocalExecutions: &zero,
-		CustodyClear: true, CustodyCheckedAt: time.Now(),
-	}); err != nil {
-		t.Fatal(err)
+		CustodyClear: true, CustodyCheckedAt: observe(),
+	}
+	if _, err := svc.AckDindMaintenance(env.ctx, w.ID, readyACK); err != nil {
+		t.Fatalf("ready ACK: %v: %s", err, dindLiveAckDiag(t, env, svc, w.ID, readyACK))
 	}
 	op = transition("stopping")
 	refuse("stopping old registration", "stopping")
@@ -207,6 +340,9 @@ func TestDindMaintenanceReplacementReadinessLiveDB(t *testing.T) {
 		!registered.LastHeartbeatAt.Time.Equal(registered.DindRegisterFloor.Time) {
 		t.Fatalf("registration lost fence/binding or stamped unequal heartbeat/floor: %+v", registered)
 	}
+	// Registration stamps the heartbeat at the database clock; advance to it so this refusal is the
+	// heartbeat-not-after-floor check alone, not a heartbeat in the clock's future.
+	clk.advanceTo(t, registered.LastHeartbeatAt.Time)
 	refuse("replacement registration without heartbeat", "recycling")
 	fresh, err := svc.Heartbeat(env.ctx, read(), nil, nil, nil)
 	if err != nil {
@@ -215,6 +351,7 @@ func TestDindMaintenanceReplacementReadinessLiveDB(t *testing.T) {
 	if !fresh.LastHeartbeatAt.Time.After(fresh.DindRegisterFloor.Time) {
 		t.Fatal("heartbeat did not follow replacement registration")
 	}
+	clk.advanceTo(t, fresh.LastHeartbeatAt.Time)
 	env.exec("UPDATE workers SET last_heartbeat_at = NULL WHERE id = $1", w.ID)
 	refuse("missing replacement heartbeat", "recycling")
 	env.exec(`UPDATE workers SET dind_register_floor = now() - interval '2 minutes',
@@ -224,6 +361,7 @@ func TestDindMaintenanceReplacementReadinessLiveDB(t *testing.T) {
 		w.ID, fresh.DindRegisterFloor, fresh.LastHeartbeatAt)
 	refuse("replacement without maintenance capability", "recycling")
 	env.exec("UPDATE workers SET protocol_capabilities = $2 WHERE id = $1", w.ID, fresh.ProtocolCapabilities)
+	requireCompletionHeartbeatValid(t, read(), clk)
 
 	// Terminal-only busy checking must include owned parked and queued lifecycles.
 	for _, status := range []string{"queued", "awaiting_approval", "awaiting_input", "awaiting_followup", "limit_wait", "pool_wait", "paused", "recovery_wait"} {
@@ -309,7 +447,10 @@ func TestDindMaintenanceOwnershipBeforeFenceLiveDB(t *testing.T) {
 				cancel()
 				_ = tx.Rollback(context.Background())
 				select {
-				case <-done:
+				case err := <-done:
+					if err != nil {
+						t.Logf("fence goroutine: %v", err)
+					}
 				case <-time.After(2 * time.Second):
 					t.Error("fence goroutine did not stop")
 				}
@@ -367,7 +508,10 @@ func TestDindMaintenanceFenceBeforeOwnershipLiveDB(t *testing.T) {
 			defer func() {
 				cancel()
 				select {
-				case <-fenceDone:
+				case err := <-fenceDone:
+					if err != nil {
+						t.Logf("fence goroutine: %v", err)
+					}
 				case <-time.After(2 * time.Second):
 					t.Error("fence goroutine did not stop")
 				}
@@ -444,23 +588,37 @@ func TestDindMaintenanceEveryNonterminalBlocksReadyACKLiveDB(t *testing.T) {
 	} {
 		t.Run(status, func(t *testing.T) {
 			env, w, svc, op := dindLiveFixture(t)
+			clk := dindLiveClocked(t, env, svc)
 			id := dindLiveRun(t, env, w, "issue", status, true)
+			// The clock follows the meter seed, so only ownership can refuse this transition.
 			if _, err := svc.TransitionDindMaintenance(env.ctx, w.ID, op); !errors.Is(err, ErrDindMaintenanceConflict) {
 				t.Fatalf("%s ownership did not block ready: %v", status, err)
 			}
 			// Even zero local counts cannot override the authoritative SQL ownership.
-			env.exec(`UPDATE workers SET maintenance_phase = 'ready', maintenance_fenced = true WHERE id = $1`, w.ID)
+			env.exec(`UPDATE workers SET maintenance_phase = 'ready', maintenance_fenced = true,
+				maintenance_activity_floor = now() WHERE id = $1`, w.ID)
 			zero := 0
-			_, err := svc.AckDindMaintenance(env.ctx, w.ID, DindMaintenanceReadyACK{
-				DindMaintenance: op, LocalClaims: &zero, LocalExecutions: &zero,
-				CustodyClear: true, CustodyCheckedAt: time.Now(),
-			})
-			if !errors.Is(err, ErrDindMaintenanceConflict) {
-				t.Fatalf("%s ownership accepted zero-count ACK: %v", status, err)
+			ack := DindMaintenanceReadyACK{
+				DindMaintenance: op, LocalClaims: &zero, LocalExecutions: &zero, CustodyClear: true,
 			}
-			current, err := env.q.GetWorkerByID(env.ctx, w.ID)
-			if err != nil || current.MaintenanceReadyAck {
-				t.Fatalf("ACK persisted for owned run %s: ack=%v err=%v", id, current.MaintenanceReadyAck, err)
+			observe := func() time.Time { return dindLiveObserve(t, env, w.ID, clk, nil) }
+			ack.CustodyCheckedAt = observe()
+			_, err := svc.AckDindMaintenance(env.ctx, w.ID, ack)
+			if !errors.Is(err, ErrDindMaintenanceConflict) {
+				t.Fatalf("%s ownership accepted zero-count ACK: %v: %s", status, err, dindLiveAckDiag(t, env, svc, w.ID, ack))
+			}
+			current := dindLiveWorker(t, env, w.ID)
+			if current.MaintenanceReadyAck {
+				t.Fatalf("ACK persisted for owned run %s: ack=%v", id, current.MaintenanceReadyAck)
+			}
+			// Positive control: the same ACK is valid once the run is terminal, so ownership was the cause.
+			env.exec("UPDATE runs SET status = 'completed' WHERE id = $1", id)
+			ack.CustodyCheckedAt = observe()
+			if _, err := svc.AckDindMaintenance(env.ctx, w.ID, ack); err != nil {
+				t.Fatalf("%s ACK refused after the run completed: %v: %s", status, err, dindLiveAckDiag(t, env, svc, w.ID, ack))
+			}
+			if current := dindLiveWorker(t, env, w.ID); !current.MaintenanceReadyAck || !current.MaintenanceAckAt.Valid {
+				t.Fatalf("%s ACK not persisted after the run completed: %s", status, dindLiveAckDiag(t, env, svc, w.ID, ack))
 			}
 		})
 	}
@@ -712,16 +870,21 @@ func TestDindMaintenanceLegacyDrainHandoffLiveDB(t *testing.T) {
 	}
 }
 
+// Run under both host sources; see TestDindMaintenanceReplacementReadinessLiveDB.
 func TestDindMaintenanceDrainCancellationRegistrationLiveDB(t *testing.T) {
+	eachHost(t, dindDrainCancellationRegistration)
+}
+
+func dindDrainCancellationRegistration(t *testing.T, src *hostSource) {
 	env, w, svc, target := dindLiveFixture(t)
+	clk := dindLiveClocked(t, env, svc)
+	observe := func() time.Time { return dindLiveObserve(t, env, w.ID, clk, src) }
 	env.exec(`UPDATE workers SET maintenance_phase = '', maintenance_fenced = false,
 		maintenance_owns_drain = false, draining_since = NULL WHERE id = $1`, w.ID)
 	read := func() store.Worker {
 		t.Helper()
-		current, err := env.q.GetWorkerByID(env.ctx, w.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
+		current := dindLiveWorker(t, env, w.ID)
+		src.record(t, current.MaintenanceActivityFloor.Time)
 		return current
 	}
 	transition := func(op DindMaintenance) DindMaintenance {
@@ -749,10 +912,10 @@ func TestDindMaintenanceDrainCancellationRegistrationLiveDB(t *testing.T) {
 	zero := 0
 	ack := DindMaintenanceReadyACK{
 		DindMaintenance: oldReady, LocalClaims: &zero, LocalExecutions: &zero,
-		CustodyClear: true, CustodyCheckedAt: time.Now(),
+		CustodyClear: true, CustodyCheckedAt: observe(),
 	}
 	if got, err := svc.AckDindMaintenance(env.ctx, w.ID, ack); err != nil || got == nil || !got.ReadyACK {
-		t.Fatalf("initial ready ACK: %+v err=%v", got, err)
+		t.Fatalf("initial ready ACK: %+v err=%v: %s", got, err, dindLiveAckDiag(t, env, svc, w.ID, ack))
 	}
 	freshNonce := uuid.NewString()
 	if _, err := env.q.RegisterWorker(env.ctx, store.RegisterWorkerParams{
@@ -768,14 +931,16 @@ func TestDindMaintenanceDrainCancellationRegistrationLiveDB(t *testing.T) {
 		!current.DrainingSince.Valid || !current.DrainingSince.Time.Equal(drain) {
 		t.Fatalf("registration lost fence/drain or retained old evidence: %+v", current)
 	}
-	ack.CustodyCheckedAt = time.Now()
+	ack.CustodyCheckedAt = observe()
 	if _, err := svc.AckDindMaintenance(env.ctx, w.ID, ack); !errors.Is(err, ErrDindMaintenanceConflict) {
-		t.Fatalf("old ACK accepted after registration: %v", err)
+		t.Fatalf("old ACK accepted after registration: %v: %s", err, dindLiveAckDiag(t, env, svc, w.ID, ack))
 	}
 	// Seed admission evidence as dindLiveFixture does; meter SQL is exercised separately.
 	env.exec(`UPDATE workers SET dind_register_floor = now() - interval '1 minute',
 		dind_meter_at = date_trunc('second', now()) - interval '1 second',
 		dind_pressure_streak = 2 WHERE id = $1`, w.ID)
+	// The re-seeded meter must not be after the service clock for the refresh below.
+	clk.advanceTo(t, read().DindMeterAt.Time)
 	polled.Phase = "requested"
 	refreshed := transition(polled)
 	current = read()
@@ -790,14 +955,14 @@ func TestDindMaintenanceDrainCancellationRegistrationLiveDB(t *testing.T) {
 	if current.MaintenancePhase != "ready" || !current.MaintenanceFenced || current.MaintenanceReadyAck {
 		t.Fatalf("refreshed ready fence not persisted: %+v", current)
 	}
-	ack.CustodyCheckedAt = time.Now()
+	ack.CustodyCheckedAt = observe()
 	if _, err := svc.AckDindMaintenance(env.ctx, w.ID, ack); !errors.Is(err, ErrDindMaintenanceConflict) {
-		t.Fatalf("old ACK accepted against refreshed ready binding: %v", err)
+		t.Fatalf("old ACK accepted against refreshed ready binding: %v: %s", err, dindLiveAckDiag(t, env, svc, w.ID, ack))
 	}
 	ack.DindMaintenance = freshReady
-	ack.CustodyCheckedAt = time.Now()
+	ack.CustodyCheckedAt = observe()
 	if got, err := svc.AckDindMaintenance(env.ctx, w.ID, ack); err != nil || got == nil || !got.ReadyACK {
-		t.Fatalf("fresh ready ACK: %+v err=%v", got, err)
+		t.Fatalf("fresh ready ACK: %+v err=%v: %s", got, err, dindLiveAckDiag(t, env, svc, w.ID, ack))
 	}
 	current = read()
 	if current.MaintenancePhase != "ready" || !current.MaintenanceFenced || !current.MaintenanceReadyAck ||
@@ -846,5 +1011,101 @@ func TestDindMaintenanceDrainCancellationRegistrationLiveDB(t *testing.T) {
 	}
 	if current := read(); current.DrainingSince.Valid {
 		t.Fatalf("uncordon retained healthy legacy drain: %+v", current)
+	}
+}
+
+// The ready ACK is judged against the persisted activity floor, the service clock and the
+// 45-second window, each at its exact boundary. Every case reaches ready under the advance-only
+// clock, reads the floor, and only then pins the clock, so the refusal is the one named.
+func TestDindMaintenanceReadyACKClockBoundaryLiveDB(t *testing.T) {
+	const window = 45 * time.Second
+	tick := time.Microsecond
+	plus := func(d time.Duration) func(time.Time) time.Time {
+		return func(floor time.Time) time.Time { return floor.Add(d) }
+	}
+	validObs := func(floor, _ time.Time) time.Time { return floor.Add(tick) }
+	type mutation func(t *testing.T, env codexTestEnv, w store.Worker, owned uuid.UUID, ack *DindMaintenanceReadyACK)
+	for _, tc := range []struct {
+		name string
+		// clock and obs derive the pinned service clock and the observation from the floor.
+		clock  func(floor time.Time) time.Time
+		obs    func(floor, clock time.Time) time.Time
+		mutate mutation
+		accept bool
+	}{
+		{name: "before_floor", clock: plus(time.Second), obs: func(f, _ time.Time) time.Time { return f.Add(-tick) }},
+		{name: "at_floor", clock: plus(time.Second), obs: func(f, _ time.Time) time.Time { return f }},
+		{name: "future", clock: plus(time.Second), obs: func(_, c time.Time) time.Time { return c.Add(tick) }},
+		{name: "stale", clock: plus(time.Minute), obs: func(_, c time.Time) time.Time { return c.Add(-window - tick) }},
+		{name: "wrong_operation_nonce", clock: plus(time.Second), obs: validObs,
+			mutate: func(_ *testing.T, _ codexTestEnv, _ store.Worker, _ uuid.UUID, ack *DindMaintenanceReadyACK) {
+				ack.Nonce = uuid.NewString()
+			}},
+		{name: "snapshot_nonce_changed", clock: plus(time.Second), obs: validObs,
+			// The operation still matches its MaintenanceRegisterNonce binding; only the worker's
+			// current registration moved.
+			mutate: func(_ *testing.T, env codexTestEnv, w store.Worker, _ uuid.UUID, _ *DindMaintenanceReadyACK) {
+				env.exec("UPDATE workers SET snapshot_register_nonce = $2 WHERE id = $1", w.ID, uuid.NewString())
+			}},
+		{name: "local_claims", clock: plus(time.Second), obs: validObs,
+			mutate: func(_ *testing.T, _ codexTestEnv, _ store.Worker, _ uuid.UUID, ack *DindMaintenanceReadyACK) {
+				one := 1
+				ack.LocalClaims = &one
+			}},
+		{name: "custody_not_clear", clock: plus(time.Second), obs: validObs,
+			mutate: func(_ *testing.T, _ codexTestEnv, _ store.Worker, _ uuid.UUID, ack *DindMaintenanceReadyACK) {
+				ack.CustodyClear = false
+			}},
+		{name: "open_custody_hold", clock: plus(time.Second), obs: validObs,
+			mutate: func(_ *testing.T, env codexTestEnv, w store.Worker, owned uuid.UUID, _ *DindMaintenanceReadyACK) {
+				env.exec(`INSERT INTO recovery_custody_holds
+					(id, user_id, repo_id, run_id, generation, state, original_worker_id,
+					 original_worker_identity, live_worker_id, live_run_id)
+					SELECT $1, user_id, repo_id, id, claim_generation, 'open', $2, 'maintenance-test', $2, id
+					FROM runs WHERE id = $3`, uuid.New(), w.ID, owned)
+			}},
+		{name: "accept_one_tick_after_floor", clock: plus(tick), obs: func(f, _ time.Time) time.Time { return f.Add(tick) }, accept: true},
+		{name: "accept_window_boundary", clock: plus(time.Minute), obs: func(_, c time.Time) time.Time { return c.Add(-window) }, accept: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env, w, svc, op := dindLiveFixture(t)
+			dindLiveClocked(t, env, svc)
+			// A terminal owned run is idle for the ready fence; only the hold case then pins it with custody.
+			owned := dindLiveRun(t, env, w, "issue", "completed", true)
+			ready, err := svc.TransitionDindMaintenance(env.ctx, w.ID, op)
+			if err != nil || ready == nil {
+				t.Fatalf("transition to ready: %+v err=%v", ready, err)
+			}
+			before := dindLiveWorker(t, env, w.ID)
+			floor := before.MaintenanceActivityFloor.Time
+			zero := 0
+			ack := DindMaintenanceReadyACK{DindMaintenance: *ready, LocalClaims: &zero, LocalExecutions: &zero, CustodyClear: true}
+			if tc.mutate != nil {
+				tc.mutate(t, env, w, owned, &ack)
+			}
+			pinned := tc.clock(floor)
+			svc.SetClock(func() time.Time { return pinned })
+			ack.CustodyCheckedAt = tc.obs(floor, pinned)
+			got, err := svc.AckDindMaintenance(env.ctx, w.ID, ack)
+			current := dindLiveWorker(t, env, w.ID)
+			diag := dindAckDiag(current, ack, pinned)
+			if tc.accept {
+				if err != nil || got == nil || !got.ReadyACK {
+					t.Fatalf("ACK refused: got=%+v err=%v: %s", got, err, diag)
+				}
+				if !current.MaintenanceReadyAck || !current.MaintenanceAckAt.Valid ||
+					!current.MaintenanceAckAt.Time.Equal(ack.CustodyCheckedAt.Truncate(time.Microsecond)) {
+					t.Fatalf("ACK not persisted: %s", diag)
+				}
+				return
+			}
+			if !errors.Is(err, ErrDindMaintenanceConflict) {
+				t.Fatalf("ACK not refused: got=%+v err=%v: %s", got, err, diag)
+			}
+			if current.MaintenanceReadyAck || current.MaintenanceAckAt.Valid || current.MaintenancePhase != before.MaintenancePhase ||
+				!current.MaintenanceActivityFloor.Time.Equal(floor) {
+				t.Fatalf("refused ACK changed the worker: %s", diag)
+			}
+		})
 	}
 }

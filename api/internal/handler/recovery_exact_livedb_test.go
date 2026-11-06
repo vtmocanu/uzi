@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -98,7 +99,9 @@ func TestExactRecoveryHoldRouteLiveDB(t *testing.T) {
 	if body := observe(worker, "?generation=1"); body["exact_hold"] == nil {
 		t.Fatalf("original custody lost: %v", body)
 	}
-	exec("UPDATE recovery_custody_holds SET state='discarded', live_worker_id=NULL, live_run_id=NULL, release_evidence='owner_discard', released_at=now() WHERE id=$1", e.holdID)
+	if ok, err := h.recoverySvc.DiscardHold(e.ctx, e.user, e.run, e.holdID); err != nil || !ok {
+		t.Fatalf("owner discard ok=%t err=%v", ok, err)
+	}
 	body = observe(worker, "?generation=1")
 	exact, ok = body["exact_hold"].(map[string]any)
 	if !ok || exact["state"] != "discarded" || exact["release_evidence"] != "owner_discard" || exact["final_receipt"] != nil {
@@ -210,9 +213,9 @@ func TestExactRecoveryRawCandidatesLiveDB(t *testing.T) {
 		{"blank identity", "original_worker_identity='   '", "original_worker_identity='   '", false, false},
 		{"unguarded", "inventory_guarded=false", "NOT inventory_guarded", false, false},
 		{"wrong generation", "generation=2", "generation=2", false, false},
-		{"unsupported historical ancestry", "state='released',release_evidence='ancestry',release_pushed_sha=repeat('a',40),release_source_sha=repeat('b',40),release_adopted_sha=repeat('c',40),release_final_head_sha=repeat('d',40),release_successor_generation=2,release_branch='work'", "release_evidence='ancestry' AND release_successor_generation=2", false, false},
-		{"mismatched disposition", "state='released',final_disposition='no_adopted_source'", "final_disposition='no_adopted_source'", false, false},
-		{"forged archive", "state='released',release_evidence='archive',final_disposition='archive',final_capture_id=gen_random_uuid(),final_source_sha='aaaa1111',final_coverage_digest=repeat('b',64)", "final_disposition='archive'", false, false},
+		{"unsupported historical ancestry", "state='released',released_at=now(),release_evidence='ancestry',release_pushed_sha=repeat('a',40),release_source_sha=repeat('b',40),release_adopted_sha=repeat('c',40),release_final_head_sha=repeat('d',40),release_successor_generation=2,release_branch='work'", "release_evidence='ancestry' AND release_successor_generation=2", false, false},
+		{"mismatched disposition", "state='released',released_at=now(),final_disposition='no_adopted_source'", "final_disposition='no_adopted_source'", false, false},
+		{"forged archive", "state='released',released_at=now(),release_evidence='archive',final_disposition='archive',final_capture_id=gen_random_uuid(),final_source_sha='aaaa1111',final_coverage_digest=repeat('b',64)", "final_disposition='archive'", false, false},
 		{"two closed", "", "", true, false},
 		{"closed and open", "state='open',live_worker_id=$5,live_run_id=$2,release_evidence=NULL,released_at=NULL", "state='open'", true, false},
 		{"closed and invalid owner", "user_id=gen_random_uuid()", "user_id<>$3", true, false},
@@ -233,8 +236,9 @@ func TestExactRecoveryRawCandidatesLiveDB(t *testing.T) {
 			if err != nil || tag.RowsAffected() != 1 {
 				t.Fatalf("advance run: %v %v", tag, err)
 			}
-			exactFixtureMutation(t, e, "UPDATE recovery_custody_holds SET state='discarded',live_worker_id=NULL,live_run_id=NULL,release_evidence='owner_discard',released_at=now() WHERE id=$1",
-				"SELECT state='discarded' AND release_evidence='owner_discard' FROM recovery_custody_holds WHERE id=$1", e.holdID)
+			// Production owner-discard shape: DiscardCustodyHoldForOwner leaves released_at NULL (#4002).
+			exactFixtureMutation(t, e, "UPDATE recovery_custody_holds SET state='discarded',live_worker_id=NULL,live_run_id=NULL,release_evidence='owner_discard' WHERE id=$1",
+				"SELECT state='discarded' AND release_evidence='owner_discard' AND released_at IS NULL FROM recovery_custody_holds WHERE id=$1", e.holdID)
 			id := e.holdID
 			if tc.sibling {
 				id = uuid.New()
@@ -308,8 +312,9 @@ func TestExactRecoveryProductionBearerRoutesLiveDB(t *testing.T) {
 	if err != nil || tag.RowsAffected() != 1 {
 		t.Fatalf("run setup: %v %v", tag, err)
 	}
-	exactFixtureMutation(t, e, "UPDATE recovery_custody_holds SET state='discarded',live_worker_id=NULL,live_run_id=NULL,release_evidence='owner_discard',released_at=now() WHERE id=$1",
-		"SELECT state='discarded' AND release_evidence='owner_discard' FROM recovery_custody_holds WHERE id=$1", e.holdID)
+	if ok, err := h.recoverySvc.DiscardHold(e.ctx, e.user, e.run, e.holdID); err != nil || !ok {
+		t.Fatalf("owner discard ok=%t err=%v", ok, err)
+	}
 	foreign := newRecoveryEnvGuarded(t, true)
 	foreignToken := "foreign-fixture-" + uuid.NewString()
 	foreignHash := sha256.Sum256([]byte(foreignToken))
@@ -370,5 +375,102 @@ func TestExactRecoveryProductionBearerRoutesLiveDB(t *testing.T) {
 		if rec.Code != 403 {
 			t.Fatalf("%s lane guard=%d body=%s", name, rec.Code, rec.Body)
 		}
+	}
+}
+
+// #4002: the real owner discard writer leaves released_at NULL, and the worker's exact read must
+// still report it closed, as refusal evidence only (no FINAL, no publication receipt), with the
+// available archive untouched.
+func TestExactRecoveryOwnerDiscardObservationLiveDB(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		advance   bool
+		wantClaim float64
+	}{{"successor generation", true, 2}, {"equal generation", false, 1}} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newRecoveryEnvGuarded(t, true)
+			svc := e.service(recoveryTestLimits())
+			h := e.handler()
+			h.recoverySvc = svc
+			mustOne := func(sql string, args ...any) {
+				t.Helper()
+				tag, err := e.pool.Exec(e.ctx, sql, args...)
+				if err != nil || tag.RowsAffected() != 1 {
+					t.Fatalf("exec %q: %v %v", sql, tag, err)
+				}
+			}
+			// Guarded upload needs the run claimed at the hold's generation by its original worker.
+			mustOne("UPDATE runs SET claim_generation=1, worker_id=$2 WHERE id=$1", e.run, e.worker.ID)
+			data := bytes.Repeat([]byte("d"), 4096)
+			res := e.reserve(svc, e.worker, "k-owner-discard", "dddd1111")
+			if _, err := svc.Upload(e.ctx, e.worker, e.run, uuid.MustParse(res.CaptureID), manifestFor(data), cappedBody(data, e.svcCap())); err != nil {
+				t.Fatalf("upload: %v", err)
+			}
+			if st := e.captureState(res.CaptureID); st != "available" {
+				t.Fatalf("capture state = %q, want available", st)
+			}
+			chunks := e.chunkCount(res.CaptureID)
+			if chunks == 0 {
+				t.Fatal("available archive has no chunks")
+			}
+			if tc.advance {
+				mustOne("UPDATE runs SET worker_id=NULL, claim_generation=2, status='failed' WHERE id=$1", e.run)
+			}
+			if ok, err := svc.DiscardHold(e.ctx, e.user, e.run, e.holdID); err != nil || !ok {
+				t.Fatalf("owner discard ok=%t err=%v", ok, err)
+			}
+			var production bool
+			if err := e.pool.QueryRow(e.ctx, "SELECT state='discarded' AND release_evidence='owner_discard' AND released_at IS NULL AND live_worker_id IS NULL AND live_run_id IS NULL FROM recovery_custody_holds WHERE id=$1", e.holdID).Scan(&production); err != nil || !production {
+				t.Fatalf("discard row is not the production shape: %t %v", production, err)
+			}
+			w := e.worker
+			w.ProtocolCapabilities = []string{capability.RecoveryBindinglessClosedV1}
+			observe := func(w store.Worker) *httptest.ResponseRecorder {
+				t.Helper()
+				rec := exactHoldRoute(h, w, e.run, "?generation=1")
+				if rec.Code != 200 {
+					t.Fatalf("status=%d body=%s", rec.Code, rec.Body)
+				}
+				return rec
+			}
+			rec := observe(w)
+			var body struct {
+				ExactHold map[string]any `json:"exact_hold"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			exact := body.ExactHold
+			if exact == nil || exact["hold_id"] != e.holdID.String() || exact["state"] != "discarded" ||
+				exact["release_evidence"] != "owner_discard" || exact["current_claim_generation"] != tc.wantClaim {
+				t.Fatalf("owner discard not observed: %s", rec.Body)
+			}
+			for _, key := range []string{"final_receipt", "completed_publication_receipt", "live_worker_id", "live_run_id"} {
+				if _, present := exact[key]; present {
+					t.Fatalf("owner discard observation carries %s: %s", key, rec.Body)
+				}
+			}
+			if st := e.captureState(res.CaptureID); st != "available" || e.chunkCount(res.CaptureID) != chunks {
+				t.Fatalf("available archive changed: state=%q chunks=%d want %d", st, e.chunkCount(res.CaptureID), chunks)
+			}
+			foreign := w
+			foreign.ID = uuid.New()
+			foreignUser := w
+			foreignUser.UserID = uuid.New()
+			lane := w
+			lane.IsolatedLane = true
+			for _, other := range []store.Worker{foreign, foreignUser, lane} {
+				var scoped struct {
+					ExactHold json.RawMessage `json:"exact_hold"`
+				}
+				r := observe(other)
+				if err := json.Unmarshal(r.Body.Bytes(), &scoped); err != nil {
+					t.Fatal(err)
+				}
+				if len(scoped.ExactHold) > 0 && string(scoped.ExactHold) != "null" {
+					t.Fatalf("foreign scope disclosed owner discard: %s", r.Body)
+				}
+			}
+		})
 	}
 }

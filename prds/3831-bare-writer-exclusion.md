@@ -517,14 +517,19 @@ Gate B re-reads `prds/3430-pod-epoch-lock-shadow.md` and `prds/3431-pod-epoch-re
 | Q9 | No pruning; measure growth | 6(f), 8.1 |
 | Q10 | First restart without a predecessor record refuses; disclosed in recovery docs and release notes | 6(d) R2, 6(f), 8.1 |
 
-**Open owner questions.**
-- **Q11** (3.2). Compose slot identity: if no container ID is readable unprivileged, compose never restores and phases 45 and 52 cannot be its acceptance signal. Accept, or name another source.
-- **Q12** (3.2). Compose teardown gaps and earlier containers on the same volume: accept as for Q4, or compose refuses.
-- **Q13** (3.2). Nested DinD containers and the daemon can reach S's fresh attempt under `/data/runner`: cover them (for example a location outside `runner-shared`) or accept.
-- **Q14** (3.2). New pod: inherit #3431's refusal of exit 137 and 255 (which also refuses OOM-killed predecessors), or a restore-specific reading.
-- **Q15.** Confirm that Q4's wording ("in-pod restarts", no lane named) covers kube-native in-pod restarts. If not, (d) refuses.
-- **Q16.** Does Q4's reliance on runtime teardown for "every earlier container instance in the pod" extend to earlier instances inside the predecessor pod X on the new-pod path? If not, (c) needs per-instance evidence that does not exist and refuses.
-- **Q17.** Adopt #3431-style descriptor inheritance for bare writers (3.0), so a held kernel lock also covers orphan children? Not needed by this contract; an owner choice.
+**Owner decisions on Q11 to Q17 (2026-11-04) [M].** Recorded on the issue (https://github.com/vtmocanu/uzi/issues/3831#issuecomment-6641783122) as scope changes, not evidence. Sections 3.2 and 6 are not yet revised to them; that revision is owed by #3644 Gate B together with the record update it already owes. Until then these rows override any conflicting text in 3.2 and 6.
+
+| Item | Decision | Sections Gate B revises |
+|---|---|---|
+| Q11 | The container hostname is the compose slot identity (Docker's default hostname is the container ID; the agent service sets no `hostname:`). "Default hostname, no override" is a documented supported-deployment assumption, checked against the rendered compose configuration and validated live before this path is enabled; that evidence is pending. Kill plus start keeps the slot; recreate is a new slot and refuses. Phases 45 and 52 remain the compose acceptance signal. | 3.0, 3.2 (a), 6(b) |
+| Q12 | Accepted as named residuals, extending the amendment: no termination history; shim or daemon death; a container reported exited while its init lives; earlier containers that used the same data volume. Not a proof that those writers stopped. | 3.2 (a), 6(a) |
+| Q13 | Gate B first traces whether predecessor containers bind the exact source or a parent directory, then designs an isolation that keeps the successor's Docker working (for example a fresh-attempt location they cannot see). Until that isolation exists, in-pod restore on the DinD lane refuses. Removing currently visible containers is not sufficient: an accepted create can still complete later. | 3.2 (b), 6(d) |
+| Q14 | Restore gets a specific OOMKilled case. The controller evidence must carry the kubelet termination reason (an evidence-format change in Gate B scope). Unexplained 137 and 255 still refuse. #3431's reclaim and deletion rules are unchanged. | 3.2 (c), 6(c) |
+| Q15 | Q4 covers supported kube-native in-pod restarts. They still require a declared runtime and readable identity. | 3.2 (d), 6(d) |
+| Q16 | On the new-pod path, Q4's reliance on runtime teardown extends to earlier container instances inside the predecessor pod. Attested terminal evidence for its final instance is still required. | 3.2 (c), 6(c) |
+| Q17 | Deferred: the amended contract does not need descriptor inheritance for bare writers. | 3.0 |
+
+No owner question remains open in this record. Gate B is held until #3431's current milestone lands (owner, 2026-11-05).
 
 ### 9.2 Decision Log
 

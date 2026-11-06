@@ -1,0 +1,9 @@
+{
+  "status": "running",
+  "claim_generation": 2,
+  "registration_evidence": {
+    "register_nonce": "fixture-register-nonce",
+    "claim_generation": 2,
+    "registration_epoch": 5
+  }
+}

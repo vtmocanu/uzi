@@ -159,7 +159,10 @@ opt a token into the pool, or on demand with `uzi run resume-now`. See
 for the pooled-token wait. `recovery_wait` covers transient interruptions and
 other recovery causes; `worker_requeue_exhausted` requires explicit owner
 Resume or Cancel and has no automatic retry, as does an integrity refusal with
-cause `retained_recovery_adoption_failed`. `retained_recovery_exhausted`
+cause `retained_recovery_adoption_failed` and an unwitnessed retained
+continuation with cause `retained_continuation_unwitnessed` (not an integrity
+refusal: the continuation's departure was never witnessed).
+`retained_recovery_exhausted`
 instead has bounded timed retries followed by an owner hold with a NULL retry
 and no countdown — see
 [Recovering from a transient interruption](run-recovery-wait.md).
