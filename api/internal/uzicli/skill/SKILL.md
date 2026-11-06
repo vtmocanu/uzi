@@ -364,8 +364,12 @@ uzi version
   `codex_account_mode`, and `harness_overflow_enabled`.
 - `uzi settings codex-mode default|auto` — choose how a NEW Codex run picks its login:
   `default` binds your default Codex login (today's behaviour), `auto` picks, at run
-  creation, the pooled login with the most limit headroom (pool logins with `uzi token
-  pool <label> --kind codex --on`; with nothing pooled, auto falls back to the default).
+  creation, the pooled login picked by the operator's order (default: soonest weekly reset,
+  where, for picks above the headroom floor, the in-flight penalty only breaks exact
+  weekly-reset ties, so a burst of runs can concentrate on one login just above that
+  floor, meaning more mid-run limit pauses and resumes). Pool logins with
+  `uzi token pool <label> --kind codex --on`; with
+  nothing pooled, auto falls back to the default.
   `uzi settings get` shows it as `Codex account mode:`; `uzi run get` explains the pick on
   the `CODEX_ALIAS` row. When `auto` cannot bind any pooled login the run start is refused
   with a 422 whose reason is `codex_pool_unavailable`.
@@ -461,7 +465,10 @@ uzi version
   retained-source budget exhaustion, `retained_recovery_exhausted`, with three
   timed retries by default followed by an owner hold (NULL retry) — or
   an integrity refusal, `retained_recovery_adoption_failed`, owner Resume/Cancel
-  with no automatic retry regardless of retry timing — or
+  with no automatic retry regardless of retry timing — or an unwitnessed
+  retained-custody continuation, `retained_continuation_unwitnessed` (server-only; claim
+  released, work and custody kept), owner Resume/Cancel only, no automatic retry, not an
+  integrity refusal — or
   because the forge was unreachable at clone — cause `forge_unreachable`, with up to
   `RUN_FORGE_UNREACHABLE_MAX_PARKS` timed parks (`0` means unlimited), followed by an
   owner Resume/Cancel hold with NULL retry. Resume queues one bounded attempt without
@@ -525,7 +532,7 @@ uzi version
   waiting through `queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/
   `recovery_wait`/`paused`, except a default wait stops on recovery cause
   `worker_requeue_exhausted`, `worker_memory_pressure`,
-  `retained_recovery_adoption_failed`, owner-held
+  `retained_recovery_adoption_failed`, `retained_continuation_unwitnessed`, owner-held
   `retained_recovery_exhausted` (NULL retry), or a paused credential-switch hold (`credential_switch_settling` /
   `credential_switch_unsettled`; it prints the next step on stderr): timed limit and recovery waits retry on a timer, pool waits
   need an available pooled token, and ordinary owner or lead pauses need `uzi run resume`. A
@@ -877,7 +884,10 @@ uzi version
   local work and custody are preserved, with no automatic retry regardless of
   retry timing. Read `uzi run recovery <id>` and export an available archive
   before owner Resume/Cancel. Resume requests another bounded attempt; success
-  is not assured and repeated adoption failure holds again. Without a new owner
+  is not assured and repeated adoption failure holds again. An unwitnessed continuation
+  (`recovery_wait` / `retained_continuation_unwitnessed`, not an integrity refusal) is the
+  same owner decision: claim released, work and custody kept, no automatic retry; export
+  an available archive, then Resume or Cancel. Without a new owner
   grant, redispatch reholds without capture or model execution. A fresh positive
   claim generation and unconsumed raw `worker_recovery_owner_episode` grant,
   exact source/reservation identity, current ownership and quiescence are required;
@@ -1778,7 +1788,11 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
   Anthropic credential a worker's runs spend. A **label** pins it to that token;
   **`--default`** uses your default one; **`--auto`** lets uzi pick per claim from
   the tokens you opted into the pool with `uzi token pool`, preferring the account
-  with the most rate-limit headroom (PRD #111). Exactly one of the three is
+  whose weekly allowance resets soonest, or the most headroom if the operator set
+  `UZI_AUTOSELECT_ORDER=headroom_first` (PRD #111, #3844). Under the default, for picks
+  above the headroom floor, the in-flight penalty only breaks exact weekly-reset
+  ties, so a burst of claims can concentrate on one token just above that floor,
+  meaning more mid-run limit pauses and resumes. Exactly one of the three is
   required. It takes effect on the worker's **next claim** — no restart, no new
   join token — and `worker list` shows `anthropic_bind_mode` alongside
   `anthropic_secret_label`. Rebinding is allowed from the CLI, unlike minting,

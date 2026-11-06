@@ -66,6 +66,7 @@ import {
 import {
   resolveAgentSelection,
   seedAgentSelection,
+  gateVerdictSelection,
   type AgentSelectionParse,
   type AskUserQuestion,
   type ClaimConfig,
@@ -1562,7 +1563,7 @@ export class SdkExecutor implements Executor {
 
     // issue #1783 (R2): the runner's attempt marker rides the CLI env, so every process the
     // agent starts is positively attributable to this attempt by the quiescence reaper.
-    const env = buildSdkEnv(oauthToken, this.homeDir, toolEnv, this.dockerHost, ctx.runAttempt);
+    const env = buildSdkEnv(oauthToken, this.homeDir, toolEnv, this.dockerHost, ctx.runAttempt, ctx.managedGoWorkDir);
     // issue #1866 M2: measure the lead's execution environment once, before the plan turn. The
     // probe runs as the runner uid with this SDK env in its own process group: a baseline for
     // what the lead's commands can do, NOT provably identical to an SDK Bash tool call (the SDK
@@ -2767,7 +2768,7 @@ export class SdkExecutor implements Executor {
         // Issue #3178: keyed on the post-gate resumeId (a revise turn may have produced a
         // session), never ctx.sessionId. Cross-check approvals carry the canonical contract.
         drive.gateApprovedWithoutSession = verdict.approval !== "cross_check" && resumeId === undefined;
-        approvedSelection = verdict.selection;
+        approvedSelection = gateVerdictSelection(verdict.selection, ctx.approvedSelection, ctx.requestedAgentSource);
         // PRD #122 M6: freeze the APPROVED milestone breakdown for the implement loop.
         // `candidateMilestones` is block-scoped and REPLACED across revision rounds
         // (Decision 2), so this captures the final approved list — the one the loop names
@@ -2876,7 +2877,7 @@ export class SdkExecutor implements Executor {
       // repo": an ABSENT selection resolves to repo when a roster was detected, which
       // is what a gate-less run and an older server both get (see further up).
       const repoAvailable = (ctx.repoAgents?.length ?? 0) > 0;
-      const resolved = resolveAgentSelection(approvedSelection, repoAvailable);
+      const resolved = resolveAgentSelection(approvedSelection, repoAvailable, ctx.requestedAgentSource);
       if (resolved.note)
         ctx.emit({
           kind: "status",
@@ -4597,7 +4598,7 @@ export class SdkExecutor implements Executor {
     toolEnv: Record<string, string> | undefined,
     signal: AbortSignal,
   ): Promise<JsDepsInstall> {
-    return startDepsInstall(ctx, this.log, this.homeDir, toolEnv, signal, this.installDeps);
+    return startDepsInstall(ctx, this.log, this.homeDir, toolEnv, signal, this.installDeps, ctx.managedGoWorkDir);
   }
 
   private async joinDepsInstall(

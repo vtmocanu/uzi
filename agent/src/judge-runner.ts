@@ -113,19 +113,42 @@ Produce a verdict and recommendations. A recommendation's "category" is one of e
 - improve_agent        — improve a specific agent, including a repo agent file (name it in "target")
 - add_agent            — propose a missing agent for the repo (name a proposed agent in "target")
 - improve_uzi          — improve uzi itself (a bug, feature, or refactor)
-- cost_efficiency      — a way this run could have reached the SAME outcome for fewer tokens, turns,
-                         or agents, WITHOUT reducing correctness, verification depth, or code quality.
-                         Code quality and best-practice patterns come FIRST: a cost cut that would
+- cost_efficiency      — a way this run could have reached the SAME outcome with fewer tokens, turns or
+                         agents, or less wall-clock time, WITHOUT reducing correctness, verification
+                         depth or code quality. Flag avoidable work, not necessary verification.
+                         Code quality and best-practice patterns come FIRST: a saving that would
                          weaken a real check is never a valid recommendation — e.g. do NOT propose
                          dropping the adversarial/security pass on a trust-boundary change, skipping a
-                         gate a change actually needed, or thinning review on risky code. Only flag
-                         waste that costs tokens and buys nothing: a full gate re-run duplicated across
-                         separate validator sessions when one shared result would do; routing a
-                         mechanical or trivial validator to the strong model where a cheap model was
-                         sufficient; over-validating a trivial change (a many-agent wave on a one-line
-                         doc fix); an agent burning turns re-deriving context it was already handed; or
-                         idle round-trips that added no information. Name what should change in
-                         "target" (a template, the lead's orchestration, a specific agent, etc.).
+                         gate a change actually needed, or thinning review on risky code. Never
+                         recommend bypassing a required check or replacing it with a narrower check
+                         without the required authority. Only flag waste that buys nothing: a full
+                         gate re-run duplicated across separate validator sessions when one shared
+                         result for the same revision and relevant tree state would do; a gate rerun
+                         before the failure was triaged; setup redone when a valid earlier result
+                         could be reused; routing a mechanical or trivial validator to the strong
+                         model where a cheap model was sufficient; over-validating a trivial change (a
+                         many-agent wave on a one-line doc fix); an agent burning turns re-deriving
+                         context it was already handed; idle round-trips that added no information;
+                         or independent work run serially when the execution lane and repository
+                         policy permit overlapping it. Name what should change in "target" (a
+                         template, the lead's orchestration, a specific agent, etc.).
+                         Use cost_efficiency for avoidable agent decisions or orchestration; use
+                         improve_uzi when the remedy requires changing the factory runtime, worker
+                         image, provisioning or its own CI. External infrastructure delay alone is
+                         not a factory defect. Do not duplicate one proposed remedy across both
+                         categories.
+
+WALL-CLOCK TIME: for elapsed-time claims, cite the observed start and end timestamps available in
+the trace. Missing timestamps mean unknown elapsed time; identify agent-reported timings as reported
+rather than independently established. Distinguish observed duration from estimated or unmeasured
+potential savings. Do not sum overlapping intervals as end-to-end elapsed time or claim that
+shortening an off-critical-path task necessarily shortens the run. Report queueing, pool/credential
+limits, owner waits and parked intervals separately; do not attribute them to agent inefficiency
+unless the evidence shows an avoidable agent action caused or extended the wait. Missing trace
+intervals are unknown, not idle time. Respect dependencies, resource contention, frozen-tree
+requirements, command-lane serialization and repository rules requiring serial gates: a serialized
+command lane is not itself evidence of orchestration waste. Recommend overlap only through a
+supported mechanism, and preserve the single gate owner and independent hypothesis/mutation proofs.
 
 EVIDENCE INTERPRETATION:
 Coverage describes fetched sequence ranges and retained samples, not the entire run when completion

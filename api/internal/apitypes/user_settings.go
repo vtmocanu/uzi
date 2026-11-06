@@ -40,6 +40,10 @@ type UserSettingsDTO struct {
 	// judge lanes, ordered claude then codex.
 	CodexJudgeModel *string `json:"codex_judge_model"`
 	SummaryModel    *string `json:"summary_model"`
+	// CodexSummaryModel is the Codex summary lane mirror (PRD #3248): null inherits the
+	// instance Codex summary model. SummaryModels is the read-only resolved view of both
+	// summary lanes, ordered claude then codex.
+	CodexSummaryModel *string `json:"codex_summary_model"`
 	// Theme is the DEPRECATED legacy single-theme override mirror (PRD #21); kept
 	// one release. The appearance override lives in the four fields below (PRD #1167).
 	Theme *string `json:"theme"`
@@ -64,8 +68,9 @@ type UserSettingsDTO struct {
 	DarkTheme      *string `json:"dark_theme"`
 	Typeface       *string `json:"typeface"`
 	// DefaultHarness is the CLI decode mirror of the per-user default harness (PRD #1429
-	// M1 / D3); null = "no preference". Fidelity only — there is deliberately no CLI setter
-	// for the user default (D3), so this is carried so a decode never drops it.
+	// M1 / D3); null = "Default · automatic" (#3845: chosen per run by weekly limits when both
+	// harnesses are usable). `uzi settings get` displays it; there is deliberately no CLI
+	// setter for the user default (D3).
 	DefaultHarness *string `json:"default_harness"`
 	// DefaultClaudeModel and DefaultCodexModel are the CLI decode mirrors of the retained
 	// per-harness worker-model lanes (PRD #1551 M1 / D2); each null = inherit. Fidelity only.
@@ -73,6 +78,8 @@ type UserSettingsDTO struct {
 	DefaultCodexModel  *string `json:"default_codex_model"`
 	// JudgeModels is read-only (never sent on a PUT): one cell per harness, claude then codex.
 	JudgeModels []ModelSettingCellDTO `json:"judge_models"`
+	// SummaryModels is read-only (never sent on a PUT): one cell per harness, claude then codex.
+	SummaryModels []ModelSettingCellDTO `json:"summary_models"`
 	// EffortSettings is read-only (never sent on a PUT): the resolved ordinary effort
 	// preference per harness (PRD #3247), claude then codex.
 	EffortSettings []EffortSettingCellDTO `json:"effort_settings"`

@@ -28,6 +28,7 @@ import type { JsDepsResult } from "../src/js-deps.js";
 import { mrCompletionBlock } from "../src/runner.js";
 import { SEEDED_PLAN_RULES } from "../src/seeded-plan.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
+import { guardedCommandEnv } from "../src/claude-command/env.js";
 import { detectRepoAgents } from "../src/repoagents.js";
 import { FINDINGS_SERVER_NAME, reportIncidentalIssueToolName } from "../src/findings-tools.js";
 import {
@@ -50,8 +51,9 @@ import type {
 } from "../src/summary-runner.js";
 import { RequestError } from "../src/client.js";
 import { REASON_COMPLETION_STALL } from "../src/completion-attempt.js";
-import { makeClaim, nonexistentWorktreeFactory, nullLogger, recordingLogger } from "./helpers.js";
+import { leadRequestCaseAgents, makeClaim, nonexistentWorktreeFactory, nullLogger, recordingLogger } from "./helpers.js";
 import { makeGitRepo, PR_SUMMARY_EXPECTED, PR_SUMMARY_INPUT } from "./pr-summary-fixture.js";
+import { REQUESTED_SOURCE_TABLE, NO_ROSTER_NOTE, caseLabel } from "./requested-agent-source-table.js";
 
 // A worktree path that is UNIQUE PER PROCESS AND PER CALL, and that deliberately
 // never exists. Both halves matter. Non-existence is the point of these fixtures --
@@ -332,6 +334,30 @@ afterEach(() => {
     if (v === undefined) delete process.env[k];
     else process.env[k] = v;
   }
+});
+
+describe("issue #3870: managed Go work dir reaches the lead CLI env", () => {
+  const launchEnv = async (overrides: Partial<RunContext>) => {
+    const { queryFn, turns } = fakeTurns([[assistantText("model output"), signalDone(), resultSuccess()]]);
+    const { ctx } = makeCtx({ seeded: true, planApproved: true, approvedPlan: "# Approved", config: { max_iterations: 1 }, ...overrides });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx).catch(() => undefined);
+    assert.ok(turns.length > 0, "precondition: the SDK was queried");
+    return turns[0]!.options;
+  };
+
+  it("sets GOTMPDIR from ctx.managedGoWorkDir, keeps it through guardedCommandEnv, and gives subagents no env override", async () => {
+    const options = await launchEnv({ managedGoWorkDir: "/home/run/.uzi-go-work/g7" });
+    assert.equal(options.env?.GOTMPDIR, "/home/run/.uzi-go-work/g7");
+    assert.equal(guardedCommandEnv(options.env!).GOTMPDIR, "/home/run/.uzi-go-work/g7");
+    for (const [name, def] of Object.entries(options.agents ?? {})) {
+      assert.equal(Object.hasOwn(def as object, "env"), false, `subagent ${name} must inherit, not override, the env`);
+    }
+  });
+
+  it("launches without GOTMPDIR when the ctx carries no managed dir", async () => {
+    const options = await launchEnv({});
+    assert.equal(Object.hasOwn(options.env ?? {}, "GOTMPDIR"), false);
+  });
 });
 
 describe("settled model recovery notification", () => {
@@ -909,13 +935,13 @@ describe("SdkExecutor agent selection at the gate boundary (PRD #37)", () => {
     assert.ok(!append.includes("REPO LEAD BODY"), "the repo lead body never reaches the main-thread prompt");
   });
 
-  it("issue #2085: a .codex/agents TOML-sourced template gets the repo guards (untrusted passage, structural Agent denial, no tools or model)", { skip: !HAS_PROCFS ? "reads procfs (Linux only)" : realProcfsSkip("SdkExecutor: TOML repo guards") }, async () => {
+  it("issue #2085: a .codex/agents TOML-sourced template gets the repo guards (untrusted passage, structural Agent denial, no tools or Claude model pin)", { skip: !HAS_PROCFS ? "reads procfs (Linux only)" : realProcfsSkip("SdkExecutor: TOML repo guards") }, async () => {
     const clone = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-sdk-toml-"));
     try {
       fs.mkdirSync(path.join(clone, ".codex", "agents"), { recursive: true });
       fs.writeFileSync(
         path.join(clone, ".codex", "agents", "t.toml"),
-        'name = "toml-agent"\ndescription = "From toml."\ndeveloper_instructions = "TOML BODY"\nmodel = "gpt-5"\n',
+        'name = "toml-agent"\ndescription = "From toml."\ndeveloper_instructions = "TOML BODY"\nmodel = "gpt-6-luna"\n',
       );
       const detected = await detectRepoAgents(clone, "claude");
       assert.deepStrictEqual(detected.agents.map((a) => a.name), ["toml-agent"]);
@@ -1026,6 +1052,57 @@ describe("SdkExecutor agent selection at the gate boundary (PRD #37)", () => {
       plan.agents!["fact-checker"]!.mcpServers?.includes("forge"),
       `fact-checker must keep its forge mcpServers on the plan turn: ${JSON.stringify(plan.agents!["fact-checker"]!.mcpServers)}`,
     );
+  });
+
+  it("PRD #3914: an absent approval follows the run's requested source", async () => {
+    const absent: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+    const own = await runWith({ repoAgents: [repoCoder, repoAuditor], requestedAgentSource: "own" }, absent);
+    assert.deepStrictEqual(Object.keys(own.turns[1]!.options.agents ?? {}).sort(), ["coder", "reviewer"]);
+    assert.strictEqual(own.result.agentSelection!.source, "own");
+    const repo = await runWith({ repoAgents: [repoCoder, repoAuditor], requestedAgentSource: "repo" }, absent);
+    assert.deepStrictEqual(Object.keys(repo.turns[1]!.options.agents ?? {}).sort(), ["auditor", "coder"]);
+    assert.strictEqual(repo.result.agentSelection!.source, "repo");
+    const unset = await runWith({ repoAgents: [repoCoder, repoAuditor] }, absent);
+    assert.deepStrictEqual(Object.keys(unset.turns[1]!.options.agents ?? {}).sort(), ["auditor", "coder"]);
+  });
+
+  it("PRD #3914: an absent approval on a requested repo run keeps a saved own selection", async () => {
+    const absent: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+    const own = await runWith({ repoAgents: [repoCoder, repoAuditor], requestedAgentSource: "repo",
+      approvedSelection: { source: "own", exclusions: [] } }, absent);
+    assert.deepStrictEqual(Object.keys(own.turns[1]!.options.agents ?? {}).sort(), ["coder", "reviewer"]);
+    assert.strictEqual(own.result.agentSelection!.source, "own");
+  });
+
+  it("PRD #3914: an absent approval on a requested repo run keeps a saved repo selection's exclusions", async () => {
+    const absent: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+    const repo = await runWith({ repoAgents: [repoCoder, repoAuditor], requestedAgentSource: "repo",
+      approvedSelection: { source: "repo", exclusions: ["auditor"] } }, absent);
+    assert.deepStrictEqual(Object.keys(repo.turns[1]!.options.agents ?? {}).sort(), ["coder"]);
+    assert.strictEqual(repo.result.agentSelection!.source, "repo");
+  });
+
+  for (const c of REQUESTED_SOURCE_TABLE) {
+    it(`PRD #3914 shared call-site table at the gate: ${caseLabel(c)}`, async () => {
+      const absent: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+      const { probe, result } = await runWith({ repoAgents: c.roster ? [repoCoder, repoAuditor] : [], requestedAgentSource: c.requested }, absent);
+      assert.strictEqual(result.agentSelection!.source, c.want);
+      assert.strictEqual(probe.emits.some((m) => String(m.payload.text ?? "") === NO_ROSTER_NOTE), c.note);
+    });
+  }
+
+  it("PRD #3914: a requested repo source with no roster degrades to own with the no-roster note", async () => {
+    const absent: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+    const { turns, probe, result } = await runWith({ requestedAgentSource: "repo" }, absent);
+    assert.deepStrictEqual(Object.keys(turns[1]!.options.agents ?? {}).sort(), ["coder", "reviewer"]);
+    assert.strictEqual(result.agentSelection!.source, "own");
+    assert.ok(probe.emits.some((m) => String(m.payload.text ?? "").includes("this clone has no repo agent roster")));
+  });
+
+  it("PRD #3914: an explicit gate selection wins over the requested source", async () => {
+    const { turns, result } = await runWith({ repoAgents: [repoCoder, repoAuditor], requestedAgentSource: "own" }, approveWith("repo"));
+    assert.deepStrictEqual(Object.keys(turns[1]!.options.agents ?? {}).sort(), ["auditor", "coder"]);
+    assert.strictEqual(result.agentSelection!.source, "repo");
   });
 
   it("a malformed selection resolves to own, never the repo source", async () => {
@@ -2565,7 +2642,8 @@ describe("SdkExecutor guardrail options", () => {
           // worker secret. TMPDIR is not a secret. AGENT_BROWSER_ARGS is a non-secret browser launch
           // FLAG (buildSdkEnv, issue #709): it guarantees --no-sandbox survives a shim bypass, not a
           // credential — the no-PAT / no-join-token assertions below still hold.
-          const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENT_BROWSER_ARGS"]);
+          const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENT_BROWSER_ARGS",
+          "AGENT_BROWSER_EXECUTABLE_PATH", "CHROME_PATH"]);
           if (process.env.UZI_RUNNER_TMPDIR || process.env.TMPDIR) expected.add("TMPDIR");
           if (sqlcDir !== undefined) expected.add("UZI_SQLC_DIR");
           assert.deepStrictEqual(new Set(Object.keys(env)), expected);
@@ -3174,13 +3252,14 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
   it("every claude request_case of the shared matrix is what the executor actually sends to the SDK", async () => {
     const contract = JSON.parse(
       fs.readFileSync(path.join(import.meta.dirname, "..", "..", "fixtures", "lead-config", "contract.json"), "utf8"),
-    ) as { request_cases: Array<{ id: string; harness: string; phase: "plan" | "implement"; config: ClaimConfig; templateModel?: string; expect: { model?: string; effort?: string } }> };
+    ) as { request_cases: Array<{ id: string; harness: string; phase: "plan" | "implement"; config: ClaimConfig; templateModel?: string; agents?: Array<{ name: string; model?: string | null }>; expect: import("../src/lead-config-report.js").LeadRequest }> };
     const cases = contract.request_cases.filter((c) => c.harness === "claude");
-    assert.ok(cases.length >= 5, "the claude matrix is loaded, not empty");
+    assert.equal(cases.length, 10, "all Claude request cases loaded");
     const visited: string[] = [];
     for (const c of cases) {
-      const { model: _drop, ...leadNoModel } = lead;
-      const leadT: AgentTemplate = c.templateModel !== undefined ? { ...leadNoModel, model: c.templateModel } : leadNoModel;
+      const agents = leadRequestCaseAgents(c);
+      const { posts, make } = reporterRig();
+      const reporter = make(c.config);
       const planPhase = c.phase === "plan";
       const { queryFn, turns } = fakeTurns(
         planPhase
@@ -3189,8 +3268,8 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
       );
       const { ctx } = makeCtx(
         planPhase
-          ? { agents: [leadT, coder], config: c.config }
-          : { agents: [leadT, coder], config: c.config, planApproved: true, seeded: true, sessionId: null, approvedPlan: "# Approved" },
+          ? { agents, config: c.config, leadConfig: reporter }
+          : { agents, config: c.config, leadConfig: reporter, planApproved: true, seeded: true, sessionId: null, approvedPlan: "# Approved" },
         approveWith("own"),
       );
       await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
@@ -3204,9 +3283,24 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
         if (c.expect.effort === undefined) assert.ok(!("effort" in t.options), `${c.id}: no effort key`);
         else assert.equal(t.options.effort, c.expect.effort, `${c.id}: sent effort`);
       }
+      const phasePosts = posts.filter((p) => p.phase === c.phase);
+      if (leadConfigActive(c.config)) {
+        assert.ok(phasePosts.length > 0, `${c.id}: requested report posted`);
+        for (const p of phasePosts) {
+          assert.deepEqual(
+            [p.requested_model, p.requested_model_source, p.requested_effort, p.requested_effort_mode, p.requested_effort_source],
+            [c.expect.model ?? null, c.expect.modelSource, c.expect.effort ?? null, c.expect.effortMode, c.expect.effortSource],
+            `${c.id}: requested report`,
+          );
+        }
+      } else {
+        assert.equal(reporter.enabled, false, c.id);
+        assert.equal(posts.length, 0, `${c.id}: old claims stay inactive`);
+      }
       visited.push(c.id);
     }
     assert.deepEqual(visited, cases.map((c) => c.id));
+    assert.equal(visited.length, 10);
   });
 
   /** fakeTurns plus init frames carrying `effort`, and an optional getSettings on each instance. */
@@ -4729,6 +4823,26 @@ describe("SdkExecutor JS dependency provisioning (PRD #121 M2)", () => {
     }
   });
 
+  it("issue #3870: the install env carries GOTMPDIR from ctx.managedGoWorkDir, and none without it", async () => {
+    const goWork = path.join(homeDir, ".uzi-go-work", "g1");
+    const seen: Array<NodeJS.ProcessEnv> = [];
+    for (const managedGoWorkDir of [goWork, undefined]) {
+      const { queryFn } = fakeTurns([
+        [submitPlan("# plan"), resultSuccess()],
+        [signalDone(), resultSuccess()],
+      ]);
+      const installDeps: SdkExecutorOptions["installDeps"] = async (_root, env) => {
+        seen.push(env);
+        return { results: [], truncated: false };
+      };
+      const probe = makeCtx(managedGoWorkDir ? { managedGoWorkDir } : {});
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn, installDeps }).run(probe.ctx);
+    }
+    assert.equal(seen.length, 2);
+    assert.strictEqual(seen[0]!.GOTMPDIR, goWork);
+    assert.strictEqual(seen[1]!.GOTMPDIR, undefined);
+  });
+
   it("says so plainly when the repo has no JS dependencies to install", async () => {
     const { queryFn } = fakeTurns([
       [submitPlan("# plan"), resultSuccess()],
@@ -4862,6 +4976,19 @@ describe("SdkExecutor — pre-approved resume skips the planning turn and the ga
     });
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
     assert.deepStrictEqual(Object.keys(turns[0]!.options.agents ?? {}).sort(), ["coder"]);
+  });
+
+  it("PRD #3914: a pre-approved resume with no persisted selection follows the requested source", async () => {
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const probe = makeCtx({
+      ...preApproved,
+      agents: [lead, coder, reviewer],
+      repoAgents: [repoCoder, repoAuditor],
+      approvedSelection: undefined,
+      requestedAgentSource: "own",
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.deepStrictEqual(Object.keys(turns[0]!.options.agents ?? {}).sort(), ["coder", "reviewer"]);
   });
 
   it("falls back to the absent-default when the claim carried no selection", async () => {

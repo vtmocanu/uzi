@@ -92,9 +92,6 @@
 // that fails or disagrees fails closed (the file is skipped), with no pathname
 // fallback, so a platform without that path reads nothing. (3) The size check and
 // the bounded read use that same handle. The handle-path check is the proof.
-// SUPPORTING evidence only: detection runs in the runner's phasePreflightHandoff,
-// after the clone phases and before any executor run(), in a clone owned by the
-// runner uid, so the repo's own code has not yet been run against the tree.
 
 import { constants as fsc } from "node:fs";
 import fs from "node:fs/promises";
@@ -102,6 +99,7 @@ import path from "node:path";
 import { AGENT_NAME_MAX_LEN, AGENT_NAME_RE, type AgentTemplate, type RepoAgentSummary } from "./protocol.js";
 import { ASYNC_DEFERRAL_TOOLS, NESTED_AGENT_TOOL } from "./guardrails.js";
 import { isValidModel } from "./models.js";
+import { isCodexRoleModel } from "./codex/render.js";
 import { parseCodexAgentFile } from "./repoagents-codex.js";
 
 /** Tools a repo-authored subagent can never receive, whatever its frontmatter
@@ -173,7 +171,7 @@ export type RepoAgentNoteReason =
    *  aggregated with a `count`, never per file (a 10k-file repo must not flood the
    *  run stream with 10k rows). */
   | "over_limit"
-  /** No frontmatter, bad name, missing/oversized/unsafe description, or empty body. */
+  /** Bad file/name/description/body, or an invalid Codex TOML model declaration. */
   | "invalid"
   /** An earlier file already claimed this name (first wins). */
   | "duplicate"
@@ -221,6 +219,14 @@ export interface DetectedRepoAgents {
 export type RepoAgentFolder = NonNullable<RepoAgentSummary["folder"]>;
 export type RepoAgentHarness = "claude" | "codex";
 
+/** Project a parsed repo-agent model pin for delivery to one harness, silently
+ *  inheriting when the pin belongs to the other family. Parsing stays raw. */
+export function filterRepoAgentModel(template: AgentTemplate, harness: RepoAgentHarness): AgentTemplate {
+  const { model, ...rest } = template;
+  if (model && isCodexRoleModel(model) !== (harness === "codex")) return rest;
+  return { ...template };
+}
+
 /** The `.claude/agents` path inside the clone. Production detection walks both
  *  agent folders itself (see `detectRepoAgents`); this helper has no production
  *  caller and exists for tests that build or inspect a `.claude/agents` fixture. */
@@ -244,7 +250,7 @@ export function describeRepoAgentNote(note: RepoAgentNote): string {
     case "over_limit":
       return `${note.count ?? 0} agent file(s) past the cap of ${REPO_AGENTS_MAX_FILES} were ignored`;
     case "invalid":
-      return `repo agent "${note.name}" was skipped: unreadable or invalid file, name, description, or empty body`;
+      return `repo agent "${note.name}" was skipped: unreadable or invalid file, name, description, model, or empty body`;
     case "duplicate":
       return `repo agent "${note.name}" was skipped: an earlier agent file already declares that name`;
     case "tools_all_denied":
@@ -381,13 +387,14 @@ async function readContainedFile(full: string, agentsReal: string, opts: DetectO
   }
 }
 
-async function loadFolder(spec: FolderSpec, agentsReal: string, opts: DetectOptions): Promise<DetectedRepoAgents> {
+interface FolderFiles {
+  names: string[];
+  read: (file: string) => Promise<ReadResult>;
+}
+
+async function loadFolder(spec: FolderSpec, source: FolderFiles): Promise<DetectedRepoAgents> {
   const notes: RepoAgentNote[] = [];
-  const entries = await fs.readdir(agentsReal, { withFileTypes: true });
-  const allFiles = entries
-    .filter((e) => e.isFile() && e.name.endsWith(spec.ext))
-    .map((e) => e.name)
-    .sort();
+  const allFiles = source.names.filter((name) => name.endsWith(spec.ext)).sort();
 
   // Only the first REPO_AGENTS_MAX_FILES (by name) are considered; the rest are
   // ignored with a SINGLE aggregated note, before any file is opened. A hostile
@@ -401,7 +408,7 @@ async function loadFolder(spec: FolderSpec, agentsReal: string, opts: DetectOpti
 
   for (const file of files) {
     const slug = safeLabel(file.slice(0, -spec.ext.length));
-    const read = await readContainedFile(path.join(agentsReal, file), agentsReal, opts);
+    const read = await source.read(file);
     if (read.kind === "skip") continue;
     if (read.kind === "unreadable") {
       notes.push({ name: slug, reason: "invalid" });
@@ -473,9 +480,80 @@ export async function detectRepoAgents(
     if (located.kind === "rejected") {
       return { agents: [], notes: [{ name: "", reason: "unsafe_path", folder: spec.folder }], folder: spec.folder };
     }
-    return loadFolder(spec, located.agentsReal, opts);
+    const agentsReal = located.agentsReal;
+    const entries = await fs.readdir(agentsReal, { withFileTypes: true });
+    return projectForHarness(harness, await loadFolder(spec, {
+      names: entries.filter((e) => e.isFile()).map((e) => e.name),
+      read: (file) => readContainedFile(path.join(agentsReal, file), agentsReal, opts),
+    }));
   }
   return none;
+}
+
+function projectForHarness(harness: RepoAgentHarness, detected: DetectedRepoAgents): DetectedRepoAgents {
+  detected.agents = detected.agents.map((template) => filterRepoAgentModel(template, harness));
+  return detected;
+}
+
+export interface RepoAgentTreeEntry {
+  name: string;
+  mode: string;
+  type: string;
+  oid: string;
+  size: number | undefined;
+}
+
+export interface RepoAgentRevisionReader {
+  entry(repoPath: string): Promise<RepoAgentTreeEntry | undefined>;
+  list(treeOid: string): Promise<RepoAgentTreeEntry[]>;
+  blob(oid: string): Promise<string>;
+}
+
+const GIT_SYMLINK_MODE = "120000";
+const GIT_FILE_MODES: ReadonlySet<string> = new Set(["100644", "100755"]);
+
+type LocatedTree = { kind: "absent" } | { kind: "rejected" } | { kind: "ok"; oid: string };
+
+async function locateAgentsTree(reader: RepoAgentRevisionReader, spec: FolderSpec): Promise<LocatedTree> {
+  let repoPath = "";
+  let found: RepoAgentTreeEntry | undefined;
+  for (const part of spec.parts) {
+    repoPath = repoPath === "" ? part : `${repoPath}/${part}`;
+    found = await reader.entry(repoPath);
+    if (!found) return { kind: "absent" };
+    if (found.mode === GIT_SYMLINK_MODE) return { kind: "rejected" };
+    if (found.type !== "tree") return { kind: "absent" };
+  }
+  return found ? { kind: "ok", oid: found.oid } : { kind: "absent" };
+}
+
+export async function detectRepoAgentsAtRevision(
+  reader: RepoAgentRevisionReader,
+  harness: RepoAgentHarness = "claude",
+): Promise<DetectedRepoAgents> {
+  const order = harness === "codex" ? [CODEX_SPEC, CLAUDE_SPEC] : [CLAUDE_SPEC, CODEX_SPEC];
+  for (const spec of order) {
+    const located = await locateAgentsTree(reader, spec);
+    if (located.kind === "absent") continue;
+    if (located.kind === "rejected") {
+      return { agents: [], notes: [{ name: "", reason: "unsafe_path", folder: spec.folder }], folder: spec.folder };
+    }
+    const files = new Map(
+      (await reader.list(located.oid))
+        .filter((e) => e.type === "blob" && GIT_FILE_MODES.has(e.mode))
+        .map((e) => [e.name, e] as const),
+    );
+    return projectForHarness(harness, await loadFolder(spec, {
+      names: [...files.keys()],
+      read: async (file) => {
+        const entry = files.get(file);
+        if (!entry) return { kind: "skip" };
+        if (entry.size === undefined || entry.size > REPO_AGENT_MAX_BYTES) return { kind: "too_large" };
+        return { kind: "ok", raw: await reader.blob(entry.oid) };
+      },
+    }));
+  }
+  return { agents: [], notes: [], folder: null };
 }
 
 /** A parsed file: either a template (plus the non-fatal clamps applied to it), or

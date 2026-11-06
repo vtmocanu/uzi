@@ -309,18 +309,23 @@ var knownInstructions = []knownInstruction{
 	},
 	{
 		command:  "uzi run resume",
-		evidence: evidenceHelpOnly,
-		// ARRIVED WITH PRD #1190 M4. Backticked cross-references in two Long/help fields:
-		// `uzi run pause`'s Long ("Resume it later with `uzi run resume <id>`", run_steer.go)
-		// and `uzi run wait`'s Long ("resumes on demand with `uzi run resume`", run_wait.go).
-		// classifyKind reads a cobra Long field as documentation, so the kind derives HELP.
-		// matchesCommand is word-boundary, so this entry does NOT absorb `uzi run resume-now`
-		// (the "-now" is not a space), which carries its own entry below. The complete bar for
-		// a help reference is that the path RESOLVES — `uzi run resume` is a real subcommand,
-		// pinned by TestCommandTree and exercised by run_resume_test.go.
-		note: "HELP: `uzi run pause` and `uzi run wait` cross-link `uzi run resume` as the way " +
-			"to resume a paused run (run_steer.go, run_wait.go). Never emitted at runtime; the " +
-			"path-resolution check is the complete bar.",
+		evidence: evidenceGoTest,
+		where:    "TestDiskOwnerActionsSinglePOST",
+		// The disk owner hold now prints this command at runtime as well as in help.
+		// The existing word-boundary match still excludes the distinct resume-now verb.
+		note: "RUNTIME: disk owner-hold guidance requests one further attempt. " +
+			"TestDiskOwnerActionsSinglePOST executes the real cobra command against an HTTP " +
+			"fixture, asserting one bodyless Resume POST, queued success and refusal/error exits. " +
+			"This is CLI/HTTP evidence; the fixture is not a booted API.",
+	},
+	{
+		command:  "uzi run cancel",
+		evidence: evidenceGoTest,
+		where:    "TestDiskOwnerActionsSinglePOST",
+		note: "RUNTIME: disk owner-hold guidance offers Cancel. TestDiskOwnerActionsSinglePOST " +
+			"executes the real cobra command against an HTTP fixture, asserting one cancel input " +
+			"POST with the required kind and the success/refusal/error exits. " +
+			"This is CLI/HTTP evidence; the fixture is not a booted API.",
 	},
 	{
 		command:  "uzi run extend",

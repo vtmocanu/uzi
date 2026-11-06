@@ -34,7 +34,9 @@ func TestM2IssueCreateClaimPersistedDowngradeLiveDB(t *testing.T) {
 	}
 	// Drive the real claim query and service payload assembly over the committed row.
 	env.exec(`UPDATE runs SET created_at=now()-interval '3 hours',updated_at=now()-interval '3 hours' WHERE id=$1`, run.ID)
-	claimed, err := env.q.ClaimRun(env.ctx, claimRunParams(wkrRow(t, env, worker)))
+	params := claimRunParams(wkrRow(t, env, worker))
+	params.WorkerProtocolCaps = []string{capability.RepoAgentSourceV1}
+	claimed, err := env.q.ClaimRun(env.ctx, params)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +69,7 @@ func TestM2IssueCreateClaimPersistedDowngradeLiveDB(t *testing.T) {
 	// Requeue and reclaim the same persisted run after the forge author is promoted.
 	svc.SetForges(m2Builder{&m2Forge{disposition: forge.AuthorEligible}})
 	env.exec("UPDATE runs SET status='queued',worker_id=NULL,updated_at=now()-interval '3 hours' WHERE id=$1", run.ID)
-	reclaimed, err := env.q.ClaimRun(env.ctx, claimRunParams(wkrRow(t, env, worker)))
+	reclaimed, err := env.q.ClaimRun(env.ctx, params)
 	if err != nil {
 		t.Fatal(err)
 	}

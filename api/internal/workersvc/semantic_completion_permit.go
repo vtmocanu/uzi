@@ -31,8 +31,9 @@ func semanticScopeCapEligibility(run store.Run) (bool, bool) {
 		int64(len(done)) >= int64(run.ScopeCeiling.Int32) && len(done) < len(ms), true
 }
 
-// Headless full completion still requires every frozen milestone. Pending work
-// never manufactures a completed milestone in the server's persisted union.
+// Headless completion requires every frozen milestone except owner-deferred ones
+// (Scope.Out). Pending work never manufactures a completed milestone in the server's
+// persisted union.
 func semanticHeadlessCompletedUnion(run store.Run, req StateRequest) ([]byte, bool) {
 	if _, err := CompletionPending(run); err != nil {
 		return nil, false
@@ -60,18 +61,8 @@ func semanticHeadlessCompletedUnion(run store.Run, req StateRequest) ([]byte, bo
 	}
 	declared, _ := progressParams(run.Kind, run.MilestonesFrozen, req.MilestonesCompleted, nil)
 	merged := unionMilestoneIDs(run.MilestonesCompleted, declared)
-	ids, err := DecodeMilestoneIDs(merged)
-	if err != nil || len(ids) != len(members) {
+	if !deliversNonDeferred(run, members, merged) {
 		return nil, false
-	}
-	done := map[string]bool{}
-	for _, id := range ids {
-		done[id] = true
-	}
-	for id := range members {
-		if !done[id] {
-			return nil, false
-		}
 	}
 	return merged, true
 }

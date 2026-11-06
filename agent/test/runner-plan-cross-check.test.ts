@@ -455,7 +455,9 @@ describe("U2 real runner checked gate", () => {
     client.postMessages = async (id, msgs, generation, signal) => {
       if (id === c.run_id && msgs.some((m) => (m.payload as { text?: string }).text === "switch prefix")) {
         preparationAttempts++;
-        if (preparationAttempts > 1) assert.ok(applied && gaveUp, "retry retains the applied ACK across give-up");
+        // The switch requested during the applied report is held while the candidate reservation is
+        // installed (issue #3953): the remaining preparation runs before any give-up.
+        if (preparationAttempts > 1) assert.ok(applied && !gaveUp, "retry retains the applied ACK before the held switch is serviced");
       }
       return post(id, msgs, generation, signal);
     };
@@ -464,9 +466,9 @@ describe("U2 real runner checked gate", () => {
       if (id === c.run_id && fields.status === "awaiting_approval") {
         requests.push(fields);
         applied = ack.applied;
+        // The switch is requested while the forced gate's reservation is installed, so it is held
+        // (not tripped) until the applied gate releases that reservation.
         api.requestCredentialSwitch(c.run_id, 1);
-        // Keep the real applied receipt until the real input control interrupts its owner.
-        if (!signal?.aborted) await new Promise<void>((resolve) => signal!.addEventListener("abort", () => resolve(), { once: true }));
       }
       return ack;
     };
@@ -623,7 +625,8 @@ describe("U2 real runner checked gate", () => {
       const session = path.join(root, "session");
       const { exec, verdicts } = checkedExec(async (ctx) => {
         clone = ctx.worktreePath;
-        fs.mkdirSync(session);
+        // Recursive like SdkExecutor: the runner may already have created the home (issue #3870).
+        fs.mkdirSync(session, { recursive: true });
         fs.writeFileSync(path.join(session, "transcript"), "resume");
         fs.mkdirSync(skillsPluginDir(clone), { recursive: true });
         fs.writeFileSync(path.join(skillsPluginDir(clone), "marker"), "resume");

@@ -223,6 +223,37 @@ test("runner pressure joins the original tool/feed, refuses retries, rearms at s
   } finally { await f.memory.stop(); await monitoring; }
 });
 
+test("runner status feed carries memory_diagnostics only when the port supplies it; the stored result never does", async () => {
+  const f = await setup();
+  let executorError: unknown;
+  const executor: Executor = { run: async ctx => {
+    try {
+      const captured = ctx.capturedMemory!()!;
+      const sinks = (f.memory as unknown as { sinks: WeakMap<object, { prepareFeedback: (c: unknown, r: unknown, d?: unknown) => void; feedback: (r: unknown, c: unknown, s: AbortSignal, ms: number) => Promise<void> }> }).sinks;
+      const sink = sinks.get(captured.context)!;
+      const result = (id: string) => ({ code: "worker_memory_pressure", claim_generation: 7, intervention_id: id });
+      sink.prepareFeedback(captured.context, result("with-diagnostics"), { version: 1, unavailable: "error" });
+      sink.prepareFeedback(captured.context, result("without-diagnostics"));
+      const stored = (captured.flight as unknown as { workerMemory: { feedback: Map<string, { result: object }> } }).workerMemory.feedback;
+      assert.equal(stored.size, 2);
+      for (const { result: kept } of stored.values()) assert.equal("memory_diagnostics" in kept, false, "stored result is unchanged");
+      // Deliver through the flight's own flush so the status feed reaches the API.
+      await sink.feedback(result("with-diagnostics"), captured.context, new AbortController().signal, 1000);
+    } catch (error) { executorError = error; throw error; }
+    throw new Error("fixture completed its proof");
+  } };
+  try {
+    await runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined,
+      { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 1000 }).execute(f.claim);
+    if (executorError) throw executorError;
+    const feed = api.messages(f.claim.run_id).filter(m => m.payload.event === "worker_memory_pressure");
+    const byId = new Map(feed.map(m => [m.payload.intervention_id, m.payload]));
+    assert.deepEqual(byId.get("with-diagnostics")?.memory_diagnostics, { version: 1, unavailable: "error" });
+    assert.equal("memory_diagnostics" in byId.get("without-diagnostics")!, false);
+    assert.equal(byId.size, 2);
+  } finally { await f.memory.stop(); }
+});
+
 test("runner human revise keeps the original phase context without a premature Running write", async () => {
   const f = await setup();
   let proof = false, executorError: unknown;

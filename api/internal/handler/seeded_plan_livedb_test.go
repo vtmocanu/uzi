@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/vault"
@@ -118,9 +119,9 @@ func newSeededPlanFixture(ctx context.Context, t *testing.T) seededPlanFixture {
 	// from a fresh uuid rather than a fixed constant that would collide across fixtures.
 	wkrID := uuid.New()
 	tokenHash := uuid.New()
-	mustExecT(ctx, t, pool, `INSERT INTO workers (id, user_id, name, token_hash, status) VALUES ($1, $2, 'seed-worker', $3, 'online')`,
-		wkrID, f.owner, tokenHash[:])
-	f.wkr = store.Worker{ID: wkrID, UserID: f.owner}
+	mustExecT(ctx, t, pool, `INSERT INTO workers (id, user_id, name, token_hash, status, protocol_capabilities) VALUES ($1, $2, 'seed-worker', $3, 'online', $4)`,
+		wkrID, f.owner, tokenHash[:], []string{capability.RepoAgentSourceV1, capability.AgentSourceRequestV1})
+	f.wkr = store.Worker{ID: wkrID, UserID: f.owner, ProtocolCapabilities: []string{capability.RepoAgentSourceV1, capability.AgentSourceRequestV1}}
 	return f
 }
 

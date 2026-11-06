@@ -38,9 +38,9 @@ func newRepoCmd(env Env, gf *globalFlags) *cobra.Command {
 			rows := make([][]string, 0, len(repos))
 			for _, r := range repos {
 				rows = append(rows, []string{r.ID, r.PathWithNamespace, boolStr(r.Enabled), boolStr(r.DockerAllowlisted),
-					crossCheckGuidanceCell(r.CodeCrossCheckGuidance), boolStr(r.CrossCheckRepoInstructionsEnabled)})
+					crossCheckGuidanceCell(r.CodeCrossCheckGuidance), boolStr(r.CrossCheckRepoInstructionsEnabled), sanitizeTTY(strOr(r.AgentSourceDefault, "unset"))})
 			}
-			return p.Table([]string{"ID", "PATH", "ENABLED", "DOCKER", "CHECK_GUIDANCE", "CHECK_REPO_INSTRUCTIONS"}, rows)
+			return p.Table([]string{"ID", "PATH", "ENABLED", "DOCKER", "CHECK_GUIDANCE", "CHECK_REPO_INSTRUCTIONS", "DEFAULT_AGENTS"}, rows)
 		},
 	}
 

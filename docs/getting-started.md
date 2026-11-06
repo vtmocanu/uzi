@@ -18,7 +18,8 @@ automatically; every account after that is a regular user.
 ## 2. Create a bot and connect a forge
 
 uzi acts on your behalf through a bot account, never your own identity.
-Create one and connect its token: see [GitLab bot setup](./gitlab-bot-setup.md) or
+Create one and connect its token: see [GitHub bot setup](./github-bot-setup.md),
+[GitLab bot setup](./gitlab-bot-setup.md) or
 [Forgejo bot setup](./forgejo-bot-setup.md), whichever forge you use.
 
 ## 3. Open a board
@@ -34,7 +35,12 @@ Settings: see [Anthropic token](./anthropic-token.md). Prefer Codex
 instead? Connect a [Codex credential](./codex-credentials.md) rather than
 an Anthropic token; uzi picks the harness for your runs from whichever
 credential(s) you hold. Hold both, and you choose the default harness
-yourself from **Settings → Run defaults** — see [Harness and worker
+yourself from **Settings → Run defaults** (or leave it automatic, so uzi
+chooses by weekly limits for eligible new issue runs: manual, autopilot or
+schedule, with no explicit harness or issue harness label, model pin,
+Anthropic credential override or Plan/Code cross-check; other runs keep the
+usual resolution, see [the
+rules](./rate-limits.md#how-the-automatic-default-picks-a-harness)) — see [Harness and worker
 models](./worker-model.md#harness-and-worker-models).
 
 ## 5. Run an agent
@@ -44,6 +50,8 @@ Register a worker and start a run from a board card: see
 
 ## Along the way
 
+- [Glossary](./glossary.md): the words uzi uses, such as forge, run,
+  worker and plan gate.
 - **The browser tab icon** carries a small status dot for the most urgent
   thing across your runs, so a backgrounded tab still tells you: rose once
   one of your runs has freshly failed, amber once one is awaiting your

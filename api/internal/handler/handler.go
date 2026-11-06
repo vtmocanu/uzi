@@ -1262,6 +1262,7 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// retained work no checkpoint attests; the service parks its own live claim (running ->
 		// paused, hold_reason='base_attestation_missing') before the agent ever runs.
 		r.Post("/runs/{id}/base-attestation-hold", h.WorkerRunBaseAttestationHold)
+		r.Post("/runs/{id}/repo-agent-source-hold", h.WorkerRunRepoAgentSourceHold)
 
 		// Ownership/terminality probe (#559): worker-authenticated, run-scoped,
 		// READ ONLY. The interactive park-SKIP path polls it to detect a mid-turn

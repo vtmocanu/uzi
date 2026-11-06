@@ -112,6 +112,8 @@ func validExactClosedObservation(out apitypes.RecoveryExactHold, owner uuid.UUID
 
 // raw_candidates deliberately counts custody before any authorization or proof predicate.
 // MATERIALIZED plus LIMIT 2 bounds ambiguity detection in this same statement snapshot.
+// Owner discards keep released_at NULL (DiscardCustodyHoldForOwner), so no discard class may
+// depend on released_at here (#4002, #2884); released_at gates only the released branches.
 const exactHoldObservationSQL = `
 WITH raw_candidates AS MATERIALIZED (
  SELECT * FROM recovery_custody_holds WHERE run_id=$1 AND generation=$2 LIMIT 2
@@ -145,9 +147,8 @@ WHERE h.run_id=$1 AND h.generation=$2 AND h.original_worker_id=$3 AND h.user_id=
        AND (
         (h.state='discarded' AND h.release_evidence='merged_predecessor_discard'
           AND h.merged_predecessor_discard_binding IS NOT NULL)
-        OR (h.released_at IS NOT NULL AND (
-        (h.state='discarded' AND h.release_evidence='owner_discard' AND h.final_disposition IS NULL)
-        OR (h.state='released' AND (
+        OR (h.state='discarded' AND h.release_evidence='owner_discard' AND h.final_disposition IS NULL)
+        OR (h.released_at IS NOT NULL AND h.state='released' AND (
          (h.final_disposition='settled' AND h.release_evidence IN ('publication','forge_no_output')
           AND h.final_capture_id IS NULL AND h.final_publication_id IS NULL AND h.final_source_sha IS NULL
           AND h.final_coverage_digest='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')
@@ -180,5 +181,5 @@ WHERE h.run_id=$1 AND h.generation=$2 AND h.original_worker_id=$3 AND h.user_id=
           AND h.completed_publication_receipt->>'worker_id'=h.original_worker_id::text
           AND h.completed_publication_receipt->>'generation'=h.generation::text)
         ))
-       )))))
+       )))
 `

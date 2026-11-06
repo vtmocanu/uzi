@@ -10,7 +10,8 @@ Loaded when you touch `web/`. The repo-wide map is the root `CLAUDE.md`.
 ## Commands
 
 ```sh
-task gate:web          # deps-check + lint + deadcode + check-docs + typecheck + test
+task gate:web          # full local gate: check:web + test + test-browser
+task check:web         # in-run boundary (AGENTS.md Run economy): gate:web minus both test suites
 task lint:web          # lint slot alone (oxlint; NOT ratcheted)
 task deadcode:web      # dead-code slot alone (knip)
 task test:web          # vitest run (jsdom/node: no layout engine)

@@ -121,7 +121,8 @@ uzi worker set-token <worker-id> --default     # clear the binding
 A worker can choose its token per claim instead of being pinned to one. Set
 its picker to **Auto-select from the pool** (or `uzi worker set-token
 <worker-id> --auto`) and each claim spends whichever of your **pooled**
-tokens has the most rate-limit headroom.
+tokens resets its weekly allowance soonest (see [How it
+chooses](#how-it-chooses)).
 
 Your **first (or only) token starts in the pool automatically** — a
 single-token account gets auto-selection for free, nothing to opt in. That's
@@ -142,8 +143,8 @@ else, which is the whole reason it starts out.
 > capability](./scheduling.md#auto-provisioning-a-worker-for-an-unmet-capability),
 > a hosted worker you provision yourself, or one you join with a plain join
 > token — comes up set to **Auto-select from the pool** as long as you have
-> at least one pooled token, so a burst of new workers spreads across your
-> pool instead of leaning on one credential. If your pool is empty at worker
+> at least one pooled token, so you don't have to pick a credential for each
+> new worker. If your pool is empty at worker
 > creation, the worker starts in **Default** mode instead. This is a
 > creation-time choice, not a fallback for an **Auto-select** worker: an
 > existing auto-select worker whose pool becomes empty holds its run and
@@ -178,17 +179,37 @@ account](codex-credentials.md#letting-uzi-pick-the-account).
 ### How it chooses
 
 Headroom is whichever window is fuller: `min(100 − 5-hour %, 100 − 7-day %)`.
-The emptiest token wins. When two are within a few points of each other, the
-one that **replenishes soonest** wins — and it is the reset of the window
-that is actually holding it back, because a 5-hour reset does not relieve a
-7-day cap. Ties beyond that are broken deterministically, so the same inputs
-always give the same answer. A token whose plan has no 5-hour window is ranked
-on its 7-day headroom alone.
+A token whose plan has no 5-hour window is measured on its 7-day headroom alone.
 
-A small bias spreads work: each run already in flight on a token counts
-slightly against it, so several claims arriving inside one polling interval
-do not all pile onto the same credential. It is a nudge, not a cap — an empty
-token still wins with a couple of runs on it.
+By default (`UZI_AUTOSELECT_ORDER=reset_first`) uzi spends the allowance that
+expires soonest. Among the tokens that are measurable, not held back and have at
+least the minimum headroom (`UZI_AUTOSELECT_MIN_HEADROOM`), the one whose
+**7-day window resets soonest** wins. Allowance left on a token when its week
+rolls over is lost, so it is spent first. Ties on the reset are broken by
+headroom (with the in-flight nudge below), then deterministically, so the same
+inputs always give the same answer. A token with no known upcoming 7-day reset
+sorts after every token that has one. The 5-hour window still counts toward
+headroom and the floor, and its reset still decides when a limit-paused run
+resumes; it just no longer decides which token goes first.
+
+If every measured token is below the minimum headroom, uzi falls back to the
+previous ranking: the emptiest token wins, and tokens within a few points
+(`UZI_AUTOSELECT_HEADROOM_TIE_PCT`) of each other go to whichever replenishes
+soonest, the reset of the window that is actually holding it back. This
+fallback applies under either order.
+
+**Cost:** reset-first deliberately concentrates work on the soonest-expiring
+token until it falls under the floor, instead of spreading it. Each run
+already in flight on a token counts slightly against it
+(`UZI_AUTOSELECT_INFLIGHT_PENALTY`), but under reset-first, for picks above
+the floor, that only breaks exact reset ties. A burst of claims inside one polling interval, such as a
+sweep firing several issues, therefore lands on one token that may sit just
+above the floor, which can mean more mid-run usage-limit pauses and resumes. If
+you prefer to spread work, set `UZI_AUTOSELECT_ORDER=headroom_first`: the
+emptiest token wins, near-ties go to the soonest reset, and the in-flight
+nudge spreads simultaneous claims. See
+[Configuration](configuration.md#auto-selecting-an-anthropic-token-prd-111).
+The decision is recorded in [ADR-3844](../adr/3844-reset-first-pool-order.md).
 
 A credential that just paused a run on a usage limit is excluded from that
 run's next claim, so an `auto` worker doesn't immediately pick the token that

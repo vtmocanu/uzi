@@ -14,7 +14,7 @@
 # Usage: watch-run.sh <run-id> [stop-csv] [interval-secs] [max-polls] [min-plan-seq] [min-question-seq]
 #   stop-csv (default) covers a plan gate, a question park, and every terminal
 #   state: completed,failed,cancelled,awaiting_approval,awaiting_input
-#   (`paused`, recovery_wait/worker_requeue_exhausted, recovery_wait/retained_recovery_adoption_failed and recovery_wait/worker_memory_pressure always stop; retained_recovery_exhausted stops when owner-held; see below)
+#   (`paused`, recovery_wait/worker_requeue_exhausted, recovery_wait/retained_recovery_adoption_failed, recovery_wait/retained_continuation_unwitnessed and recovery_wait/worker_memory_pressure always stop; retained_recovery_exhausted stops when owner-held; see below)
 #   For "watch to the end only" (after you have approved), pass:
 #     watch-run.sh <id> completed,failed,cancelled 60
 #
@@ -76,6 +76,9 @@
 # work first, then ask the owner to Resume or Cancel.
 # A retained_recovery_adoption_failed park always stops as an owner decision regardless of retry stamp:
 # integrity checks refused adoption; local work and custody are preserved, with no automatic retry.
+# A retained_continuation_unwitnessed park (server-only; a claimed flight never witnessed starting)
+# also always stops as an owner decision regardless of retry stamp: the claim was released, local
+# work and custody are preserved, and there is no automatic retry (not an integrity refusal).
 # Other recovery_wait causes keep polling unless the stop set names
 # recovery_wait, except a `data_volume_full` park, which is an attention signal (above).
 # `paused` never resumes on its own either (an owner pause, or hold_reason budget_exhausted /
@@ -189,6 +192,12 @@ while [ "$i" -lt "$MAX" ]; do
     if [ "$rc_cause" = retained_recovery_adoption_failed ]; then
       printf 'STOP=recovery_wait:retained_recovery_adoption_failed\n'
       printf 'NOTE owner decision: integrity check refused adoption; local work and custody preserved; no automatic retry; owner uzi run resume or cancel; source/archive availability unverified\n'
+      printf 'RESULT=stop:recovery_wait\n'
+      exit 0
+    fi
+    if [ "$rc_cause" = retained_continuation_unwitnessed ]; then
+      printf 'STOP=recovery_wait:retained_continuation_unwitnessed\n'
+      printf 'NOTE owner decision: the continuation flight was never witnessed starting; claim released; local work and custody preserved; no automatic retry; owner uzi run resume or cancel; source/archive availability unverified\n'
       printf 'RESULT=stop:recovery_wait\n'
       exit 0
     fi

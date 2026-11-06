@@ -1,6 +1,8 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import { Readable } from "node:stream";
+import fs from "node:fs";
+import { fileURLToPath } from "node:url";
 import { RunRunner } from "../src/runner.js";
 import { GitCache, ScratchPublicationError, type CheckpointPublicationContext } from "../src/git.js";
 import { WorkerClient } from "../src/client.js";
@@ -85,6 +87,7 @@ for (const [code, expected] of [
   ["CERT_HAS_EXPIRED", "tls"], ["UNABLE_TO_VERIFY_LEAF_SIGNATURE", "tls"], ["DEPTH_ZERO_SELF_SIGNED_CERT", "tls"],
   ["SELF_SIGNED_CERT_IN_CHAIN", "tls"], ["UNABLE_TO_GET_ISSUER_CERT_LOCALLY", "tls"],
   ["ERR_TLS_CERT_ALTNAME_INVALID", "tls"],
+  ["ERR_HTTP2_STREAM_ERROR", "stream_reset"],
 ]) {
   it(`nested fetch ${code} yields only the fixed label and key, without retries`, async () => {
     const h = harness();
@@ -100,6 +103,25 @@ for (const [code, expected] of [
     assert.equal(h.flight.lastAttemptedCheckpointRefTip, TIP);
   });
 }
+
+// The recorded chain a real HTTP/2 server reset produced through global fetch (see the fixture's
+// provenance): classification must come from the code at the second node, never from the text.
+it("classifies the recorded HTTP/2 stream reset chain as stream_reset", async () => {
+  const fixture = JSON.parse(fs.readFileSync(
+    fileURLToPath(new URL("./fixtures/checkpoint-publish-h2-reset.json", import.meta.url)), "utf8")) as {
+    chain: Array<{ code: string | null; message: string }>; expected_class: string;
+  };
+  let error: Error | undefined;
+  for (const node of [...fixture.chain].reverse()) {
+    const next = new Error(node.message, error ? { cause: error } : undefined);
+    if (node.code) Object.assign(next, { code: node.code });
+    error = next;
+  }
+  const h = harness();
+  assert.deepEqual(await h.fail(error), { published: false, reason: "error" });
+  assert.deepEqual(h.feed.map(e => e.payload.text), [label("publish_request", fixture.expected_class)]);
+  assert.equal(fixture.expected_class, "stream_reset");
+});
 
 it("uses the first recognized code and does not infer from text or aggregate collections", async () => {
   const h = harness();

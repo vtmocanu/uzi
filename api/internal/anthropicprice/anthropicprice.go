@@ -12,9 +12,9 @@
 // unpriced is never rendered as zero.
 //
 // Units. Anthropic quotes USD per million tokens, which is exactly microdollars per token. Some
-// rates carry cents (12.50, 0.25), so a rate is held as an integer count of hundredths of a
-// microdollar per token, and a cost as an integer count of hundredths of a microdollar
-// (1e-8 USD). All arithmetic is integer (math/big, so a hostile token count cannot overflow the COST
+// rates carry fractions of a cent (Haiku 5.5's 0.125), so a rate is held as an integer count of
+// nanodollars per token (USD per MTok x 1000), and a cost as an integer count of nanodollars
+// (1e-9 USD). All arithmetic is integer (math/big, so a hostile token count cannot overflow the COST
 // computation; token COUNTS summed elsewhere are the caller's to saturate); nothing is float64
 // until USD converts the final exact figure for display.
 package anthropicprice
@@ -25,7 +25,7 @@ import (
 
 // AnthropicPriceTableVersion identifies this table. It changes whenever a rate, a model row or a
 // pricing rule changes, so a stored-nothing estimate can say which table produced it.
-const AnthropicPriceTableVersion = "anthropic-standard-2026-10-13"
+const AnthropicPriceTableVersion = "anthropic-standard-2026-11-04"
 
 // AnthropicPriceSourceURL is the official pricing page the rates were transcribed from.
 const AnthropicPriceSourceURL = "https://platform.claude.com/docs/en/about-claude/pricing"
@@ -33,7 +33,7 @@ const AnthropicPriceSourceURL = "https://platform.claude.com/docs/en/about-claud
 // AnthropicPriceFetchedAt is the date the pricing page (and the model-id pages named in
 // pricing-source notes: https://platform.claude.com/docs/en/about-claude/models/overview and
 // https://platform.claude.com/docs/en/build-with-claude/fast-mode) were fetched.
-const AnthropicPriceFetchedAt = "2026-10-03"
+const AnthropicPriceFetchedAt = "2026-11-04"
 
 // Standard-pricing markers a usage record must carry (or omit) to be priced from this table.
 const (
@@ -43,33 +43,43 @@ const (
 	unavailableInferenceGeo = "not_available"
 )
 
-// rates is one model's price in hundredths of a microdollar per token (USD per MTok x 100).
+// rates is one model's price in nanodollars per token (USD per MTok x 1000).
 type rates struct {
 	input, cacheRead, cacheWrite5m, cacheWrite1h, output int64
 	predatesInferenceGeo                                 bool
+	// basePromptLimit, when positive, is the largest prompt (input + cache reads + cache
+	// writes) these rates cover. Above it the model bills a higher per-request tier this table
+	// does not carry, so Price refuses such a usage record.
+	basePromptLimit int64
 }
 
 // table maps an exact API model id to its rates. USD per MTok, from the pricing page "Model
 // pricing" table: base input / 5m cache write / 1h cache write / cache hits / output.
 //
-//	Claude Fable 5.1   10   / 12.50 / 20   / 0.25 / 50
-//	Claude Opus 5.5     4   /  5    /  8   / 0.20 / 20
-//	Claude Opus 5       5   /  6.25 / 10   / 0.50 / 25
-//	Claude Opus 4.8     5   /  6.25 / 10   / 0.50 / 25
-//	Claude Sonnet 5.5   2   /  2.50 /  4   / 0.10 / 10
-//	Claude Haiku 4.5    1   /  1.25 /  2   / 0.10 /  5
+//	Claude Fable 5.1   10   / 12.50  / 20   / 0.25 / 50
+//	Claude Opus 5.5     4   /  5     /  8   / 0.20 / 20
+//	Claude Opus 5       5   /  6.25  / 10   / 0.50 / 25
+//	Claude Opus 4.8     5   /  6.25  / 10   / 0.50 / 25
+//	Claude Sonnet 5.5   2   /  2.50  /  4   / 0.10 / 10
+//	Claude Haiku 5.5    0.10 / 0.125 / 0.20 / 0.01 / 0.50  (prompts up to 100,000 tokens)
+//	Claude Haiku 4.5    1   /  1.25  /  2   / 0.10 /  5
 //
-// No long-context premium row exists: the fetched pages state the 1M context window is at
-// standard pricing for the 4.6-and-later models listed, and Haiku 4.5's window is 200K.
-// Sonnet 5.5's cache-hit rate was corrected from the pricing page on 2026-10-13.
+// Haiku 5.5 is priced per request by prompt length: a request whose prompt (all input tokens,
+// cache reads and writes included) is over 100,000 tokens pays 5x rates for the whole request.
+// Only the base tier is recorded. A usage record may sum several requests (a side pass), and a
+// sum within the limit proves every request was too; above it the tier mix is unknown. The other
+// 4.6-and-later rows have no long-context premium (the 1M window is at standard pricing), and
+// Haiku 4.5's window is 200K. Sonnet 5.5's cache-hit rate was corrected from the pricing page
+// on 2026-10-13; Haiku 5.5 was added on 2026-11-04 (#3920).
 var table = map[string]rates{
-	"claude-fable-5-1":          {input: 1000, cacheRead: 25, cacheWrite5m: 1250, cacheWrite1h: 2000, output: 5000},
-	"claude-opus-5-5":           {input: 400, cacheRead: 20, cacheWrite5m: 500, cacheWrite1h: 800, output: 2000},
-	"claude-opus-5":             {input: 500, cacheRead: 50, cacheWrite5m: 625, cacheWrite1h: 1000, output: 2500},
-	"claude-opus-4-8":           {input: 500, cacheRead: 50, cacheWrite5m: 625, cacheWrite1h: 1000, output: 2500},
-	"claude-sonnet-5-5":         {input: 200, cacheRead: 10, cacheWrite5m: 250, cacheWrite1h: 400, output: 1000},
-	"claude-haiku-4-5-20251001": {input: 100, cacheRead: 10, cacheWrite5m: 125, cacheWrite1h: 200, output: 500, predatesInferenceGeo: true},
-	"claude-haiku-4-5":          {input: 100, cacheRead: 10, cacheWrite5m: 125, cacheWrite1h: 200, output: 500, predatesInferenceGeo: true},
+	"claude-fable-5-1":          {input: 10000, cacheRead: 250, cacheWrite5m: 12500, cacheWrite1h: 20000, output: 50000},
+	"claude-opus-5-5":           {input: 4000, cacheRead: 200, cacheWrite5m: 5000, cacheWrite1h: 8000, output: 20000},
+	"claude-opus-5":             {input: 5000, cacheRead: 500, cacheWrite5m: 6250, cacheWrite1h: 10000, output: 25000},
+	"claude-opus-4-8":           {input: 5000, cacheRead: 500, cacheWrite5m: 6250, cacheWrite1h: 10000, output: 25000},
+	"claude-sonnet-5-5":         {input: 2000, cacheRead: 100, cacheWrite5m: 2500, cacheWrite1h: 4000, output: 10000},
+	"claude-haiku-5-5":          {input: 100, cacheRead: 10, cacheWrite5m: 125, cacheWrite1h: 200, output: 500, basePromptLimit: 100_000},
+	"claude-haiku-4-5-20251001": {input: 1000, cacheRead: 100, cacheWrite5m: 1250, cacheWrite1h: 2000, output: 5000, predatesInferenceGeo: true},
+	"claude-haiku-4-5":          {input: 1000, cacheRead: 100, cacheWrite5m: 1250, cacheWrite1h: 2000, output: 5000, predatesInferenceGeo: true},
 }
 
 // Usage is one message's token usage and the response markers that decide whether it is priced
@@ -94,8 +104,8 @@ type Usage struct {
 	InferenceGeo          string
 }
 
-// Cost is an exact price in hundredths of a microdollar (1e-8 USD). The zero Cost is zero
-// dollars; use it only as the starting point of a sum of priced messages.
+// Cost is an exact price in nanodollars (1e-9 USD). The zero Cost is zero dollars; use it only
+// as the starting point of a sum of priced messages.
 type Cost struct {
 	v big.Int
 }
@@ -103,22 +113,23 @@ type Cost struct {
 // Add adds o to c.
 func (c *Cost) Add(o Cost) { c.v.Add(&c.v, &o.v) }
 
-// HundredthMicroUSD returns the exact figure as a decimal string, for tests and logs.
-func (c Cost) HundredthMicroUSD() string { return c.v.String() }
+// NanoUSD returns the exact figure as a decimal string, for tests and logs.
+func (c Cost) NanoUSD() string { return c.v.String() }
 
 // USD converts the exact figure to dollars for display: one correctly rounded division of two
-// exactly representable operands for any realistic total (below 2^53 hundredth-microdollars,
-// about 90 million dollars).
+// exactly representable operands for any realistic total (below 2^53 nanodollars, about
+// 9 million dollars).
 func (c Cost) USD() float64 {
-	f, _ := new(big.Float).Quo(new(big.Float).SetInt(&c.v), big.NewFloat(1e8)).Float64()
+	f, _ := new(big.Float).Quo(new(big.Float).SetInt(&c.v), big.NewFloat(1e9)).Float64()
 	return f
 }
 
 // Price prices one message. ok is false, and the Cost meaningless, when the message cannot be
 // priced from this table: the model is not a row, service_tier / speed / inference_geo is present
 // and not the standard value (except inference_geo "not_available" on a row known to predate
-// geographic routing), cache-creation tokens arrive without a consistent 5m/1h split, or a
-// token count is negative. Callers must treat !ok as "cost unknown", never as zero.
+// geographic routing), cache-creation tokens arrive without a consistent 5m/1h split, a token
+// count is negative, or the prompt exceeds the row's basePromptLimit. Callers must treat !ok as
+// "cost unknown", never as zero.
 func Price(u Usage) (Cost, bool) {
 	r, found := table[u.Model]
 	if !found {
@@ -136,6 +147,9 @@ func Price(u Usage) (Cost, bool) {
 		return Cost{}, false
 	}
 	if u.InputTokens < 0 || u.CacheReadInputTokens < 0 || u.CacheCreationInputTokens < 0 || u.OutputTokens < 0 {
+		return Cost{}, false
+	}
+	if r.basePromptLimit > 0 && !promptWithin(r.basePromptLimit, u.InputTokens, u.CacheReadInputTokens, u.CacheCreationInputTokens) {
 		return Cost{}, false
 	}
 	var w5m, w1h int64
@@ -169,4 +183,17 @@ func Price(u Usage) (Cost, bool) {
 	add(w1h, r.cacheWrite1h)
 	add(u.OutputTokens, r.output)
 	return c, true
+}
+
+// promptWithin reports whether the non-negative prompt token counts sum to at most limit,
+// without overflowing on hostile counts: each count is checked against what remains.
+func promptWithin(limit int64, counts ...int64) bool {
+	remaining := limit
+	for _, n := range counts {
+		if n > remaining {
+			return false
+		}
+		remaining -= n
+	}
+	return true
 }

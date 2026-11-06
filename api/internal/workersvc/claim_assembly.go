@@ -26,6 +26,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/secretopen"
+	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/toolprofile"
 	"github.com/vtmocanu/uzi/api/internal/toolseed"
@@ -647,27 +648,8 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		}
 	}
 
-	// Run-summary model resolution is user-value-wins (PRD #362 Decision 8), the same
-	// shape as the judge model in assembleJudgeClaim but delivered on this ISSUE-run
-	// claim: the run owner's per-user summary_model overrides the instance
-	// summary_model; NULL/blank inherits the instance value. Guarded by s.settings !=
-	// nil — a nil-settings deployment leaves it nil (the summary generator is advisory
-	// and skips when no model rides). On a user-row read error we fall back to the
-	// instance value best-effort with a log; we never send an empty model.
-	var summaryModel *string
-	if s.settings != nil {
-		if um, uerr := s.q.GetUserSummaryModel(ctx, run.UserID); uerr != nil {
-			slog.Warn("issue claim: read user summary model", "user", run.UserID.String(), "error", uerr)
-		} else if um.Valid && strings.TrimSpace(um.String) != "" {
-			m := um.String
-			summaryModel = &m
-		}
-		if summaryModel == nil {
-			if m, merr := s.settings.SummaryModel(ctx); merr == nil && strings.TrimSpace(m) != "" {
-				summaryModel = &m
-			}
-		}
-	}
+	// Run-summary model for this claim's harness (see resolveClaimSummaryModel).
+	summaryModel := s.resolveClaimSummaryModel(ctx, run)
 
 	// PRD #517 M5: deliver the interactive-task park idle backstop ONLY on an interactive
 	// task claim (the sole path that parks on awaitFollowUp). Left zero for every other run
@@ -892,12 +874,14 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// so both re-deliver unchanged on every resume. PlannedBaseCommit is nil for a run
 		// that supplied no commit (the compare is then inert); RequireBaseMatch is a plain
 		// bool (NOT NULL DEFAULT false), false for every non-opted-in run.
-		PlannedBaseCommit: textPtr(run.PlannedBaseCommit),
-		RequireBaseMatch:  run.RequireBaseMatch,
+		PlannedBaseCommit:     textPtr(run.PlannedBaseCommit),
+		RequireBaseMatch:      run.RequireBaseMatch,
+		RepoAgentSourceCommit: textPtr(run.RepoAgentSourceCommit),
 		// Ships with PlanApproved, deliberately adjacent: the two halves of one human
 		// verdict, and propagating the approval without the exclusions is what silently
 		// gives a user back a subagent they excluded. See ClaimPayload.AgentSelection.
-		AgentSelection: persistedSelection(run),
+		AgentSelection:       persistedSelection(run),
+		RequestedAgentSource: textPtr(run.AgentSourceRequested),
 		// PRD #122 M1: the frozen milestone list, decoded above. omitempty keeps a
 		// milestone-less run's claim byte-identical to today's.
 		Milestones:          milestones,
@@ -924,7 +908,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			ForgePAT:            string(botPAT),
 			AnthropicOAuthToken: string(anthropic),
 		},
-		Agents:        agentsFromTemplates(templates, skills.perTemplate),
+		Agents:        agentsFromTemplates(templates, skills.perTemplate, run.Harness),
 		Skills:        skills.union,
 		SkillsDropped: skills.dropped,
 		Config: ClaimConfig{
@@ -1369,4 +1353,37 @@ func (e legacyReviewClaimError) Unwrap() error { return errGuardrailBlockedClaim
 // checked before its human gate.
 func planCrossCheckCodexLeadSupported(run store.Run) bool {
 	return (run.PlanCrossCheckRequired || run.PlanCrossCheckGated) && run.Harness == harnessCodex
+}
+
+// resolveClaimSummaryModel resolves the run-summary model riding an ISSUE-run claim
+// (PRD #362 Decision 8, PRD #3248): the summary model for this claim's harness,
+// walking the run owner's per-user lane, the instance lane and the built-in
+// (agenttmpl.ResolveSummaryModel). Guarded by s.settings != nil: a nil-settings
+// deployment leaves it nil, so the summary generator (advisory) is simply not told a
+// model. A read error on either tier is logged and that tier is treated as unset;
+// it never fails the claim and never sends an empty model.
+func (s *Service) resolveClaimSummaryModel(ctx context.Context, run store.Run) *string {
+	if s.settings == nil {
+		return nil
+	}
+	harness := Harness(run.Harness)
+	instanceKey := settings.KeySummaryModel
+	if harness == harnessCodex {
+		instanceKey = settings.KeyCodexSummaryModel
+	}
+	var user string
+	if ums, uerr := s.q.GetUserSummaryModels(ctx, run.UserID); uerr != nil {
+		slog.Warn("issue claim: read user summary models", "user", run.UserID.String(), "error", uerr)
+	} else if harness == harnessCodex {
+		user = ums.CodexSummaryModel.String
+	} else {
+		user = ums.SummaryModel.String
+	}
+	instance, ierr := s.settings.InstanceModel(ctx, instanceKey)
+	if ierr != nil {
+		slog.Warn("issue claim: read instance summary model", "key", instanceKey, "error", ierr)
+		instance = ""
+	}
+	m := agenttmpl.ResolveSummaryModel(string(harness), user, instance).Model
+	return &m
 }

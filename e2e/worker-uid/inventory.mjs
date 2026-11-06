@@ -19,7 +19,15 @@ const epochLeaves = [
   'pod epoch private API CA survives both real UID launch chains without relaxing preload refusal',
   'pod epoch restores observable persistent worker and runner scratch in both UID modes and refuses invalid saved paths',
 ];
-const e2eFiles = new Set(['memory-command-real', 'claude-command-real', singleFile, sharedFile, epochFile]);
+// Issue #3907: the one lane whose container leaves /nix unmasked (a labelled named volume), so the
+// baked Chromium exists. Two literal leaves under one literal suite, gated by one INIT_SKIP.
+const browserFile = 'browser-discovery-real';
+const browserSuite = 'real browser discovery under the worker identities';
+const browserLeaves = [
+  'launches Chromium and agent-browser from the exported discovery paths in the Claude lane and leaves no browser process behind',
+  'launches Chromium from the exported discovery paths in an off-mode Codex command and closes the registry cleanly',
+];
+const e2eFiles = new Set(['memory-command-real', 'claude-command-real', singleFile, sharedFile, epochFile, browserFile]);
 const captureSuite = 'Unit2 runner source capture';
 const captureLeaves = new Set([
   'cancels during worktree comparisons and leaves no temp tree',
@@ -84,6 +92,7 @@ export function inventoryForSource(source, file) {
   const planning = file === 'git-planning-diff';
   const command = file === 'memory-command-real' || file === singleFile || file === sharedFile || file === epochFile;
   const claudeReal = file === 'claude-command-real';
+  const browser = file === browserFile;
   const retained = file === 'git-retained-permissions';
   const expected = [];
   const identities = new Set();
@@ -111,7 +120,7 @@ export function inventoryForSource(source, file) {
           const identity = JSON.stringify(names);
           if (identities.has(identity)) throw new Error(`duplicate source leaf identity: ${file}: ${identity}`);
           identities.add(identity);
-          expected.push({ file: command || claudeReal ? `e2e/worker-uid/${file}.test.mts` : `agent/test/${file}.test.ts`, names });
+          expected.push({ file: command || claudeReal || browser ? `e2e/worker-uid/${file}.test.mts` : `agent/test/${file}.test.ts`, names });
           return;
         }
         const callback = node.arguments[node.arguments.length - 1];
@@ -139,6 +148,13 @@ export function inventoryForSource(source, file) {
     for (const leaf of claudeRealLeaves) {
       if (!expected.some(test => test.names.length === 2 && test.names[0] === claudeRealSuite && test.names[1] === leaf)) {
         throw new Error(`${file}: missing required literal Claude command proof: ${leaf}`);
+      }
+    }
+  } else if (browser) {
+    if (gates !== 1) throw new Error(`${file}: expected one UID gate, found ${gates}`);
+    for (const leaf of browserLeaves) {
+      if (!expected.some(test => test.names.length === 2 && test.names[0] === browserSuite && test.names[1] === leaf)) {
+        throw new Error(`${file}: missing required literal browser proof: ${leaf}`);
       }
     }
   } else if (file === singleFile) {
@@ -190,8 +206,8 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     const snapshot = api.updateSnapshot({ openProjects: [path.join(repo, 'e2e/worker-uid/tsconfig.json')] });
     const program = snapshot.getProjects()[0].program;
     const lane = process.argv[2] ?? 'worker';
-    if (!['worker', 'command', 'single', 'shared'].includes(lane)) throw new Error(`unknown lane: ${lane}`);
-    const selected = lane === 'command' ? ['memory-command-real'] : lane === 'single' ? [singleFile] : lane === 'shared' ? [sharedFile, epochFile] : files;
+    if (!['worker', 'command', 'single', 'shared', 'browser'].includes(lane)) throw new Error(`unknown lane: ${lane}`);
+    const selected = lane === 'command' ? ['memory-command-real'] : lane === 'single' ? [singleFile] : lane === 'shared' ? [sharedFile, epochFile] : lane === 'browser' ? [browserFile] : files;
     const expected = selected.flatMap(file => {
       const filename = path.join(repo, e2eFiles.has(file)
         ? `e2e/worker-uid/${file}.test.mts` : `agent/test/${file}.test.ts`);

@@ -24,6 +24,9 @@ func writeWorkerRunClaim(w http.ResponseWriter, payload *workersvc.ClaimPayload)
 	if payload.CrossCheck.CandidateIdentityVersion == "semantic_v1" {
 		w.Header().Set("X-Uzi-Candidate-Identity-Version", "semantic_v1")
 	}
+	if payload.CrossCheckOwnerSteering != nil {
+		w.Header().Set("X-Uzi-Owner-Steering", "v1")
+	}
 	w.Header().Set("X-Uzi-Claim-Kind", "cross_check")
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)

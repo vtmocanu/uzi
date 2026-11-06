@@ -52,7 +52,7 @@ class CheckerTest(unittest.TestCase):
         self.assertEqual(check(self.expected, self.report(self.case())), [])
 
     def test_command_identity_and_failures(self):
-        for name in ("memory-command-real", "claude-command-real", "single-uid-preflight"):
+        for name in ("memory-command-real", "claude-command-real", "single-uid-preflight", "browser-discovery-real"):
             with self.subTest(file=name):
                 self.command_identity(name)
 

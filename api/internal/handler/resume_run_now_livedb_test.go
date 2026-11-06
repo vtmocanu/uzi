@@ -79,6 +79,67 @@ func TestResumeRunNowDispatchLiveDB(t *testing.T) {
 		}
 		return s
 	}
+	t.Run("disk hold bodyless dispatch", func(t *testing.T) {
+		id := newRun("recovery_wait")
+		exec(`UPDATE runs SET recovery_wait_cause='data_volume_full',recovery_retry_not_before=NULL,
+		 budget_wall_seconds=86400,disk_park_count=3 WHERE id=$1`, id)
+		snapshot := func() string {
+			t.Helper()
+			var value string
+			if err := pool.QueryRow(ctx, "SELECT to_jsonb(r)::text FROM runs r WHERE id=$1", id).Scan(&value); err != nil {
+				t.Fatal(err)
+			}
+			return value
+		}
+		before := snapshot()
+		if rec := call(id, store.User{ID: uuid.New()}); rec.Code != http.StatusNotFound {
+			t.Fatalf("foreign disk resume=%d", rec.Code)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/api/runs/"+id.String()+"/resume-now", nil)
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("id", id.String())
+		req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+		rec := httptest.NewRecorder()
+		h.ResumeRunNow(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("unauthenticated disk resume=%d", rec.Code)
+		}
+		if snapshot() != before {
+			t.Fatal("unauthorized disk resume mutated hold")
+		}
+		if rec := call(id, owner); rec.Code != http.StatusOK {
+			t.Fatalf("disk resume=%d %s", rec.Code, rec.Body.String())
+		}
+		var released bool
+		if err := pool.QueryRow(ctx, `SELECT claim_released_at IS NOT NULL FROM runs WHERE id=$1`, id).Scan(&released); err != nil || !released || statusOf(id) != "queued" {
+			t.Fatalf("disk resume release=%v err=%v", released, err)
+		}
+		if rec := call(id, owner); rec.Code != http.StatusConflict {
+			t.Fatalf("duplicate=%d", rec.Code)
+		}
+		var audits int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM run_user_inputs WHERE run_id=$1 AND kind='resume'", id).Scan(&audits); err != nil || audits != 1 {
+			t.Fatalf("disk resume audits=%d err=%v", audits, err)
+		}
+		id = newRun("recovery_wait")
+		exec(`UPDATE runs SET recovery_wait_cause='data_volume_full', recovery_retry_not_before=NULL,stop_kind='cancelled',budget_wall_seconds=86400 WHERE id=$1`, id)
+		before = snapshot()
+		if rec := call(id, owner); rec.Code != http.StatusConflict {
+			t.Fatalf("stamped cancel disk resume=%d", rec.Code)
+		}
+		if snapshot() != before {
+			t.Fatal("conflicting disk resume mutated hold")
+		}
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM run_user_inputs WHERE run_id=$1 AND kind='resume'", id).Scan(&audits); err != nil || audits != 0 {
+			t.Fatalf("cancel conflict audits=%d err=%v", audits, err)
+		}
+
+		id = newRun("recovery_wait")
+		exec(`UPDATE runs SET recovery_wait_cause='data_volume_full',recovery_retry_not_before=now()+interval '1 hour' WHERE id=$1`, id)
+		if rec := call(id, owner); rec.Code != http.StatusConflict {
+			t.Fatalf("finite disk park=%d", rec.Code)
+		}
+	})
 	// newHold seeds a PAUSED issue run carrying hold_reason, started 3h ago and parked 1m ago (so a
 	// paused row's active elapsed is ~3h). Remaining budget for a paused row is
 	// total - (status_since - started_at - budget_paused_seconds): budgetPaused banks the elapsed, so

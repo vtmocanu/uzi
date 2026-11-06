@@ -146,6 +146,54 @@ test("generation cleanup preserves a later reused source and its adoption after 
   }
 });
 
+
+for (const keepOriginalPin of [true, false]) {
+  test(`M2 restarted reused capture ${keepOriginalPin ? "selects S with original pin" : "retains W without original pin"}`, async () => {
+    const first = await cache.buildRecoveryCoverage(bare, context, [head], head);
+    const next = { ...context, generation: 2 };
+    await fixtureFetchTracking(cache, bare, clone, branch, runId, 2);
+    const reused = await cache.buildRecoveryCoverage(bare, next, [head], first.sha, reuse);
+    assert.equal(reused.sha, first.sha);
+    assert.notEqual(reused.fingerprint, first.fingerprint, "the reused generation has a different capture fingerprint");
+    if (!keepOriginalPin) {
+      const frozen = await cache.enumerateOwedCandidates(bare, runId);
+      assert.equal(await cache.cleanupRecoveryGeneration(bare, context, frozen,
+        [{ fingerprint: first.fingerprint, sha: first.sha, coveredHeads: [head] }],
+        [head, first.sha], first.sha), "removed");
+      assert.equal(git(bare, "for-each-ref", "--format=%(objectname)", first.coverageRef), "");
+      assert.equal(git(bare, "rev-parse", reused.coverageRef), first.sha);
+    }
+    const refsBeforeRestart = git(bare, "for-each-ref", "--format=%(refname) %(objectname)");
+    const restarted = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+    assert.deepEqual(await restarted.buildRecoveryCoverage(bare, next, [head], first.sha,
+      { reuseCoveredCurrent: "required" }), reused);
+    assert.equal(git(bare, "for-each-ref", "--format=%(refname) %(objectname)"), refsBeforeRestart,
+      "reconstruction neither overwrites the reused pin nor recreates an absent original pin");
+    git(clone, "fetch", bare, first.sha);
+    git(clone, "reset", "--hard", first.sha);
+    await restarted.markRecoveryCapture(bare, clone, branch, runId);
+    const source = { runId, clonePath: clone };
+    const reservation = await restarted.reserveRecoveryIteration(bare, branch, "issue-2512", source, 1, 2, 0, 0);
+    await restarted.recordRecoveryCapture(bare, branch, "issue-2512", source, reservation.attempts, reused.sha, head);
+    const readJournal = () => JSON.parse(git(bare, "config", `uzi-recovery.${branch}.clone`));
+    assert.equal(readJournal().recovery.restoreSource, head, "the reused capture retains the content source association");
+    const refs = git(bare, "for-each-ref", "--format=%(refname) %(objectname)");
+    const frozen = await restarted.enumerateOwedCandidates(bare, runId);
+    const successor = await restarted.prepareRecoverySuccessor(bare, branch, "issue-2512", source,
+      reservation.attempts, "20261029T123600Z-g2-0123456789abcdef");
+    assert.equal(git(successor.path, "rev-parse", "HEAD"), keepOriginalPin ? head : first.sha);
+    assert.equal(successor.adoptedSource, first.sha);
+    assert.equal(successor.adoptedContentSource, head);
+    assert.equal(readJournal().recovery.restoreTip, first.sha);
+    assert.equal(readJournal().recovery.restoreSource, head);
+    assert.equal(git(bare, "for-each-ref", "--format=%(refname) %(objectname)"), refs);
+    assert.deepEqual(await restarted.enumerateOwedCandidates(bare, runId), frozen);
+    assert.equal(git(clone, "rev-parse", "HEAD"), first.sha, "predecessor stays intact");
+    assert.equal(git(successor.path, "status", "--porcelain"), "");
+    assert.equal(fs.readFileSync(path.join(successor.path, "RETAINED.txt"), "utf8"), "work before outage\n");
+  });
+}
+
 test("clean coverage-shaped forgery has the same adoption outcome with and without reuse", async () => {
   const tree = git(bare, "rev-parse", head + "^{tree}");
   const who = "uzi-agent <uzi-agent@uzi.local> 946684800 +0000";

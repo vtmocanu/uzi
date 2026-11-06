@@ -213,3 +213,62 @@ func TestEffortSettingRowsResolvedFollowsMode(t *testing.T) {
 		t.Fatalf("rows = %+v, want runtime default label for runtime_default and unknown for explicit without a level", rows)
 	}
 }
+
+// Summary rows follow the judge rows and precede the effort rows (PRD #3248): a
+// stored pin, an instance default with nothing stored, an unknown source token, and
+// a third cell that is never read.
+func TestSettingsGetSummaryRows(t *testing.T) {
+	pin, judgePin := "sonnet", "opus"
+	level := "high"
+	fc := &uzicli.FakeClient{Settings: apitypes.UserSettingsDTO{
+		JudgeModels: []apitypes.ModelSettingCellDTO{
+			{Harness: "claude", Model: &judgePin, DefaultModel: "opus", DefaultSource: "builtin", ResolvedModel: "opus", Source: "user_default"},
+		},
+		SummaryModels: []apitypes.ModelSettingCellDTO{
+			{Harness: "claude", Model: &pin, DefaultModel: "haiku", DefaultSource: "builtin", ResolvedModel: "sonnet", Source: "user_default"},
+			{Harness: "codex", DefaultModel: "gpt-6.1-sol", DefaultSource: "instance_default", ResolvedModel: "gpt-6.1-sol", Source: "instance_default"},
+			{Harness: "third", DefaultModel: "ignored", ResolvedModel: "ignored", Source: "builtin"},
+		},
+		EffortSettings: []apitypes.EffortSettingCellDTO{
+			{Harness: "codex", Effort: &level, DefaultEffort: "medium", DefaultSource: "builtin", ResolvedEffort: &level, Source: "user_default", Mode: "explicit"},
+		},
+	}}
+	out, stderr, code := runCLI(t, fakeEnv(fc), "settings", "get")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	idx := strings.Index(out, "Model settings")
+	if idx < 0 {
+		t.Fatalf("no Model settings table: %q", out)
+	}
+	lines := strings.Split(strings.TrimSpace(out[idx:]), "\n")
+	want := []string{
+		"Model settings",
+		"SETTING HARNESS STORED DEFAULT RESOLVED SOURCE",
+		"judge claude Pin · opus opus opus your choice",
+		"summary claude Pin · sonnet haiku sonnet your choice",
+		"summary codex Default gpt-6.1-sol gpt-6.1-sol instance default",
+		"effort codex Pin · high medium high your choice",
+	}
+	for i, w := range want {
+		if i >= len(lines) {
+			t.Fatalf("missing line %d (%q) in %q", i, w, out)
+		}
+		if got := strings.Join(strings.Fields(lines[i]), " "); got != w {
+			t.Errorf("line %d: %q, want %q", i, got, w)
+		}
+	}
+	if strings.Contains(out, "ignored") {
+		t.Errorf("third summary cell was read: %q", out)
+	}
+}
+
+func TestSettingsGetSummaryRowsUnknownSource(t *testing.T) {
+	fc := &uzicli.FakeClient{Settings: apitypes.UserSettingsDTO{SummaryModels: []apitypes.ModelSettingCellDTO{
+		{Harness: "claude", DefaultModel: "haiku", ResolvedModel: "haiku", Source: "from_the_future"},
+	}}}
+	out, _, code := runCLI(t, fakeEnv(fc), "settings", "get")
+	if code != 0 || !strings.Contains(strings.Join(strings.Fields(out), " "), "summary claude Default haiku haiku unknown") {
+		t.Fatalf("unknown source row missing: exit %d %q", code, out)
+	}
+}

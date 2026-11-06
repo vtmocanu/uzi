@@ -13,6 +13,7 @@ import { decodeCompletionPending, type CompletionPending } from "./completion-pe
 import { SEMANTIC_GATE_ACK_MAX_BYTES, semanticGateAckSchema } from "./semantic-gate-wire.js";
 import { decodeInterruptedCalls, interruptedRegistration, type InterruptedRegistration, type InterruptedCalls } from "./interrupted-calls.js";
 import { Readable } from "node:stream";
+import { checkpointPublishDispatcher } from "./checkpoint-publish-transport.js";
 import type { ReadableStreamReadResult } from "node:stream/web";
 import { MaintenanceResources } from "./recovery-maintenance.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
@@ -25,6 +26,7 @@ import type { UsageWireRequest } from "./usage-recorder.js";
 import {
   WORKER_API_PREFIX,
   CAPABILITY_INFERENCE_EVIDENCE_FEATURE,
+  RUN_REGISTRATION_EVIDENCE_FEATURE,
   type MemoryBinding,
   type MemoryPolicy,
   type MemoryOutcome,
@@ -78,6 +80,7 @@ import {
   type RegisterRequest,
   type RegisterResponse,
   type StateAck,
+  type RunRegistrationEvidence,
   type CompletedPublicationReceipt,
   type CompletedPublicationReason,
   type PlanCrossCheckReconciliation,
@@ -128,13 +131,14 @@ import {
   type RecoverySettleResponse,
   type BaseAttestationHoldOutcome,
   BASE_ATTESTATION_HOLD_REASON,
+  REPO_AGENT_SOURCE_HOLD_REASON,
 } from "./protocol.js";
 
 export type PlanCrossCheckGateReason = "revise" | "block" | "malformed" | "model_error" | "model_timeout"
   | "checker_unavailable" | "confinement_failed" | "timed_out" | "superseded"
   | "codex_lead_unsupported" | "planning_diff_refused" | "interrupted" | "candidate_refused" | "checker_failed"
   | "approved_not_stored" | "revisions_exhausted";
-import { decodeCodeSnapshotCleanup, type CodeSnapshotCleanup, decodeCrossCheckClaim, decodeCodeCrossCheckStatus, decodeCodeFindings, type CodeCrossCheckStatus, type CodeFinding, decodeCodeCrossCheckDispositions, type CodeCrossCheckDispositionBatch, type CodeCrossCheckInstructions } from "./code-cross-check-contract.js";
+import { decodeCodeSnapshotCleanup, type CodeSnapshotCleanup, decodeCrossCheckClaim, decodeOwnerSteering, OWNER_STEERING_HEADER, OWNER_STEERING_WIRE_MAX_BYTES, decodeCodeCrossCheckStatus, decodeCodeFindings, type CodeCrossCheckStatus, type CodeFinding, decodeCodeCrossCheckDispositions, type CodeCrossCheckDispositionBatch, type CodeCrossCheckInstructions } from "./code-cross-check-contract.js";
 
 export type ClaimResponse = ProtocolClaimResponse & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
 export type WorkerRunDetail = ProtocolWorkerRunDetail & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
@@ -349,11 +353,41 @@ export interface InputReceipt {
   reason?: string;
 }
 
-/** Error carrying the server's HTTP status + (truncated) body for retry logic. */
 /** Issue #2545 step A: the per-request timeout of the held-publication upload, and of no other route.
  *  The api's write deadline for the route is 120 s upload + 150 s service + 30 s answer grace = 300 s;
- *  30 s of margin lets an answer written at the server's deadline still arrive. */
+ *  30 s of signal margin lets an answer written at the server's deadline still arrive. This route
+ *  keeps native fetch's 300 s defaults: HTTP/1.1 re-arms its header wait at upload completion,
+ *  and HTTP/2 uses an inactivity timer refreshed by upload writes. The post-upload service (150 s),
+ *  detached outcome write (10 s) and answer grace (30 s) fit below that timeout. */
 export const HELD_PUBLICATION_TIMEOUT_MS = 330_000;
+
+/** The logical-operation allowance of one checkpoint publish (POST .../runs/{id}/publish), and of no
+ *  other route: a streamed pack upload can legitimately outlive WORKER_HTTP_TIMEOUT (30 s), which is
+ *  deliberately NOT raised. The api extends this route's own write deadline to cover 60 s of upload,
+ *  the service bound and a 15 s answer grace; this value adds transit margin on top, so an answer
+ *  written at the api's deadline still arrives (the committed fixture fixtures/checkpoint-publish-budget.json
+ *  pins both numbers). It is an UPPER bound only: the caller's boundary signal, a current
+ *  MaintenanceBudget (see maintenanceSignal) and the runner's shared allowance all win when earlier.
+ *
+ *  Callers of publishCheckpointOutcome and the limit that actually applies (verified in runner.ts):
+ *   1 Codex milestone, in a permit: any(permit.signal, soft) -> 10 s soft / 30 s hard
+ *   2 Claude milestone, deferred post-permit publish, iteration boundary (reap:false): no signal -> 480 s
+ *   3 mid-turn tick: tick signal, MIDTURN_TICK_TIMEOUT_MS 120 s cap
+ *   4 done checkpoint: any(permit.signal, soft) -> 60 s soft / 90 s hard
+ *   5 shutdown: Codex bounded by the boundary permit signal; Claude: the 15 s shutdown race
+ *     (shutdownPublishTimeoutMs) abandons the wait, but the request itself is bounded only by the
+ *     allowance or process exit (cause.deadlineAt feeds remediation hold/admission, never the request
+ *     signal, and the workerShutdown stopSignal has no timer)
+ *   6 limit-wait park: permit?.signal (Codex boundary 30 s); none on Claude -> 480 s
+ *   7 pause park: held.signal (Codex: capture-context deadline; Claude: caller signal, may be none -> 480 s)
+ *   8 recovery capture, credential-free: opts.signal (episode signal; none or never fired -> 480 s)
+ *   9 recovery capture, overlay: opts.signal ?? permit?.signal (same fallback)
+ *  10 completion hold: heldAuthenticated?.signal ?? permit?.signal (same fallback)
+ *  11 retained free capture: held.signal (same rule as 7)
+ *  Any caller whose signal never fires (rows 2, 6 on Claude, 7-11) is bounded by this 480 s alone.
+ *  A MaintenanceBudget (600 s default) becomes current only once a cancellation was observed for the
+ *  attempt (observeCancellation), so rows 1-4 normally run without one. */
+export const CHECKPOINT_PUBLISH_TIMEOUT_MS = 480_000;
 
 /** The held-publication feature string, advertised by the worker and by the api's protocol_features. */
 export const HELD_PUBLICATION_FEATURE = "recovery_held_publication_v1";
@@ -921,6 +955,8 @@ export interface ClientOptions {
   /** Monotonic clock in ms, for the permit retry deadline. Injected by tests. */
   now?: () => number;
   httpTimeoutMs?: number;
+  /** Test seam: overrides {@link CHECKPOINT_PUBLISH_TIMEOUT_MS}, the allowance of one checkpoint publish. */
+  checkpointPublishTimeoutMs?: number;
   /** Codex external-auth worker→API slice. Kept below app-server's fixed 10s callback
    *  deadline; the API finishes within 7.5s, leaving response-delivery margin. */
   codexHTTPTimeoutMs?: number;
@@ -1341,6 +1377,7 @@ export class WorkerClient {
   private readonly permitRetryBudgetMs: number;
   private readonly now: () => number;
   private readonly httpTimeoutMs: number;
+  private readonly checkpointPublishTimeoutValue: number;
   private readonly codexHTTPTimeoutMs: number;
   private readonly interruptedCallsTimeoutMs: number;
   /**
@@ -1353,6 +1390,8 @@ export class WorkerClient {
   private operationNegotiation = 0;
   private readonly operationFlights = new Map<string, { generation: number; token: symbol; reportingUnavailable?: boolean }>();
 
+  /** The allowance of one checkpoint publish; the runner shares one of this length across its retries. */
+  get checkpointPublishTimeoutMs(): number { return this.checkpointPublishTimeoutValue; }
   /** Positive negotiation serial survives feature clearing and worker re-registration. */
   get codexOperationNegotiation(): number { return this.operationNegotiation; }
 
@@ -1525,6 +1564,10 @@ export class WorkerClient {
    * optimistic so the next request self-recovers once the api rolls forward).
    */
   private hasCredentialSwitchCapability = false;
+  /** Issue #3859: set when this registration's api proved (strict-decode 400) it cannot decode
+   *  `registration_evidence`. Sticky until the next register(); a heartbeat feature refresh does
+   *  not reopen it, which is why it is not simply dropFeature(). */
+  private registrationEvidenceDropped = false;
 
   /**
    * The per-registration nonce the api minted on the last successful register (PRD #1390
@@ -1726,6 +1769,7 @@ export class WorkerClient {
     this.permitRetryBudgetMs = opts.permitRetryBudgetMs ?? DEFAULT_PERMIT_RETRY_BUDGET_MS;
     this.now = opts.now ?? (() => performance.now());
     this.httpTimeoutMs = opts.httpTimeoutMs ?? 30_000;
+    this.checkpointPublishTimeoutValue = opts.checkpointPublishTimeoutMs ?? CHECKPOINT_PUBLISH_TIMEOUT_MS;
     this.codexHTTPTimeoutMs = opts.codexHTTPTimeoutMs ?? 8_000;
     this.interruptedCallsTimeoutMs = opts.interruptedCallsTimeoutMs ?? 2_000;
   }
@@ -1803,6 +1847,7 @@ export class WorkerClient {
     this.hasBindinglessHoldCapability = false;
     this.latestDindMaintenanceValue = undefined;
     this.registerNonce = undefined;
+    this.registrationEvidenceDropped = false;
     this.registrationReport = undefined;
     const originalCapabilities = Array.isArray(protocolCapabilities) ? [...protocolCapabilities] : undefined;
     const body: RegisterRequest = { name, version: this.version };
@@ -2154,9 +2199,18 @@ export class WorkerClient {
       }
       // Dedicated requests are bounded even without a marker; unmarked ordinary
       // claims are read under CLAIM_RESPONSE_MAX_BYTES.
+      // Owner steering (issue #3841): only the exact value v1, on a cross-check claim, grants the
+      // read the steering field's own wire allowance on top of the existing cap.
+      const steeringHeader = res.headers.get(OWNER_STEERING_HEADER);
+      if (steeringHeader !== null && steeringHeader !== "v1") {
+        if (ownedResponses.has(res)) await discardResponse(res);
+        else await res.body?.cancel();
+        throw new Error("unknown owner steering marker");
+      }
+      const steeringAllowance = steeringHeader === "v1" && (dedicated || marker === "cross_check") ? OWNER_STEERING_WIRE_MAX_BYTES : 0;
       const claim = (dedicated || marker === "cross_check" || res.headers.has("X-Uzi-Candidate-Identity-Version")
         ? JSON.parse(await readCrossCheckText(res, 2 * 1024 * 1024, deadline,
-          dedicated || marker === "cross_check" ? "claim" : undefined))
+          dedicated || marker === "cross_check" ? "claim" : undefined, steeringAllowance))
         : JSON.parse(await readBoundedText(res, CLAIM_RESPONSE_MAX_BYTES, true, deadline))) as ClaimResponse;
       if (isRecord(claim) && (!Number.isSafeInteger(claim.worker_recovery_episode) ||
           (claim.worker_recovery_episode as number) < 0)) delete claim.worker_recovery_episode;
@@ -2192,6 +2246,13 @@ export class WorkerClient {
       if (claim?.kind === "cross_check" && claim.cross_check !== undefined) {
         claim.cross_check = decodeCrossCheckClaim(claim.cross_check);
       }
+      // The header and the field must agree, and the field is a plan cross-check claim's alone.
+      const hasSteeringField = isRecord(claim) && claim.cross_check_owner_steering !== undefined;
+      if ((steeringHeader !== null) !== hasSteeringField ||
+          (hasSteeringField && (claim.kind !== "cross_check" || steeringAllowance === 0))) {
+        throw new Error("owner steering header and field disagree");
+      }
+      if (hasSteeringField) claim.cross_check_owner_steering = decodeOwnerSteering(claim.cross_check_owner_steering, claim.cross_check?.stage);
       // PRD #1798 D9: the pr_description is validated or dropped, never cast (decodePrState, the
       // same check as the bind / lookup / ack responses). The warning carries the run id only,
       // never the value (untrusted text). The isRecord guard keeps a `null` (or other non-object)
@@ -2577,7 +2638,7 @@ export class WorkerClient {
    * fail on real runs.
    */
   async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal,
-    options?: { iterationCancellation?: true }): Promise<StateAck> {
+    options?: { iterationCancellation?: true; registrationEpoch?: number }): Promise<StateAck> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
     if (options?.iterationCancellation) {
       // Snapshot before any asynchronous work; only the iteration sink cancellation
@@ -2724,6 +2785,13 @@ export class WorkerClient {
     if (!this.hasFeature("recovery_completed_publication_v1")) delete outbound.completion_final_head;
     const included = this.includeClaimGeneration(body.claim_generation);
     if (!included) delete outbound.provider_progress_turns;
+    // Issue #3859: the registration witness. Only this generic path can carry it: a `running`
+    // report never takes the credential-switch, memory-park, publication, retained-recovery,
+    // require_running or revision-source early returns above (those are other statuses or
+    // fields), and a caller-supplied copy is discarded so the client alone chooses presence.
+    delete outbound.registration_evidence;
+    const witness = this.registrationEvidenceFor(body, included, options?.registrationEpoch);
+    if (witness) outbound.registration_evidence = witness;
     // PRD #1795 M3: the api refuses an id-bearing awaiting_approval report without
     // claim_generation (400 claim_generation_required), and the strict-decode fallback exists for
     // an api that rolled back past the fields. So whenever claim_generation is NOT on the wire, the
@@ -2745,7 +2813,36 @@ export class WorkerClient {
         b.claim_generation,
       );
     try {
-      if (outbound.capability_inference_evidence !== undefined && this.hasFeature(CAPABILITY_INFERENCE_EVIDENCE_FEATURE)) {
+      if (outbound.registration_evidence !== undefined) {
+        // Issue #3859. Ordering with the older claim_generation fallback: the evidence strip comes
+        // FIRST (it is the newer field). Attempt 1 carries evidence and claim_generation; on the
+        // exact strict-decode 400 attempt 2 is the identical body with ONLY registration_evidence
+        // removed (claim_generation and every other field intact). If attempt 2 itself gets the
+        // strict-decode 400 (a stale advertised feature set against an api that decodes neither
+        // field), the evidence-free body continues into the pre-existing claim_generation
+        // fallback exactly as before this feature: one more send with claim_generation stripped.
+        // Evidence is never re-attached and there is no second evidence-stripping resend, so the
+        // worst case is three sends. A transient failure is retried inside reportStateVariant
+        // with the SAME variant, never with evidence stripped.
+        try {
+          ack = await sendWith(outbound)(true);
+        } catch (err) {
+          // The exact one-key decoder refusal only (StateDecodeRefusalError), narrower than the
+          // loose generation-fallback regex: prose that merely mentions the phrase is not a rollback.
+          if (!isStrictDecodeError(err) || !(err instanceof StateDecodeRefusalError)) throw err;
+          const stripped = { ...outbound };
+          delete stripped.registration_evidence;
+          this.registrationEvidenceDropped = true;
+          this.log.warn("registration evidence rejected by an api that cannot decode it; re-sent without it and stopped sending it for this registration", { run_id: runId });
+          try {
+            ack = await sendWith(stripped)(true);
+          } catch (err2) {
+            if (!isStrictDecodeError(err2)) throw err2;
+            if (!this.hasCredentialSwitchCapability) this.clearFeatures();
+            ack = await sendWith(stripped)(false);
+          }
+        }
+      } else if (outbound.capability_inference_evidence !== undefined && this.hasFeature(CAPABILITY_INFERENCE_EVIDENCE_FEATURE)) {
         // Advisory rollback is resolved before the legacy generation fallback.
         // A refusal of its stripped variant must never select an unfenced third body.
         ack = await sendWith(outbound)(included);
@@ -2788,6 +2885,20 @@ export class WorkerClient {
     }
     if (body.completion_final_head !== undefined && !this.hasFeature("recovery_completed_publication_v1")) ack.completedPublicationReason = "unsupported_feature";
     return ack;
+  }
+
+  /** Issue #3859: the registration witness for a `running` report, or undefined. Every guard is
+   *  required: negotiated and not dropped for this registration, a known register nonce, a
+   *  supplied epoch (non-negative safe integer), and a claim generation that is a safe integer
+   *  >= 1 which `included` says is really on the wire (the witness must name the same generation
+   *  the report is fenced on). Never for a non-running report. */
+  private registrationEvidenceFor(body: StateRequest, included: boolean, epoch: number | undefined): RunRegistrationEvidence | undefined {
+    const generation = body.claim_generation;
+    if (body.status !== "running" || !included || this.registrationEvidenceDropped ||
+        !this.hasFeature(RUN_REGISTRATION_EVIDENCE_FEATURE) || !this.registerNonce ||
+        epoch === undefined || !Number.isSafeInteger(epoch) || epoch < 0 ||
+        generation === undefined || !Number.isSafeInteger(generation) || generation < 1) return undefined;
+    return { register_nonce: this.registerNonce, claim_generation: generation, registration_epoch: epoch };
   }
 
   /** Validate proof only at the authenticated state-report seam. This does not settle local custody. */
@@ -2970,6 +3081,8 @@ export class WorkerClient {
           // can recognise a SERVER-side wall park (paused + budget_exhausted) on a fenced stale ACK.
           if (fields.holdReason !== undefined)
             ack.holdReason = fields.holdReason;
+          if (fields.repoAgentSourceCommit !== undefined)
+            ack.repoAgentSourceCommit = fields.repoAgentSourceCommit;
           if (fields.budgetMaxIterations !== undefined)
             ack.budgetMaxIterations = fields.budgetMaxIterations;
           if (fields.budgetWallSeconds !== undefined)
@@ -3030,6 +3143,10 @@ export class WorkerClient {
           if (ack.applied && fields.reconciliation !== undefined &&
               fields.reconciliation.claimGeneration === body.claim_generation)
             ack.reconciliation = fields.reconciliation;
+          if (body.registration_evidence !== undefined && fields.registrationEvidence !== undefined) {
+            ack.registrationEvidence = fields.registrationEvidence;
+            this.log.info("registration evidence answered", { run_id: runId, registration_evidence: fields.registrationEvidence });
+          }
           if (!ack.applied) {
             this.log.info("state report not applied server-side", {
               run_id: runId,
@@ -3097,9 +3214,14 @@ export class WorkerClient {
    * (`published: false`). The acknowledgment is read through {@link readBoundedText} under
    * {@link CHECKPOINT_PUBLISH_ACK_MAX_BYTES}: an oversized body, a read failure or an abort
    * THROWS (a `ResponseBodyOverflowError` for overflow), which leaves the publish outcome
-   * ambiguous for the caller. The bearer/version header assembly mirrors fetchRaw; the same
-   * per-request timeout is used — generous enough for a real pack, and an abort is just
-   * another best-effort miss (it throws, caught by the caller's warn-and-swallow).
+   * ambiguous for the caller. The bearer/version header assembly mirrors fetchRaw; the request
+   * is bounded by {@link CHECKPOINT_PUBLISH_TIMEOUT_MS} (not httpTimeoutMs, which is too short for
+   * a real pack), or earlier by the caller's boundary signal or a current MaintenanceBudget, and
+   * undici's own 300 s headers/body timeouts are raised to that allowance for this request
+   * ({@link checkpointPublishDispatcher}). The caller
+   * retries an explicit 5xx (250 ms, 1 s backoff) up to three requests, all inside one shared
+   * allowance of this size. An abort is just another best-effort miss (it throws, caught by the
+   * caller's warn-and-swallow).
    */
   async publishCheckpoint(
     runId: string,
@@ -3114,8 +3236,8 @@ export class WorkerClient {
       ? `?claim_generation=${encodeURIComponent(claimGeneration)}` : "";
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/publish${query}`;
     const signal = boundarySignal
-      ? AbortSignal.any([boundarySignal, maintenanceSignal(this.httpTimeoutMs)])
-      : maintenanceSignal(this.httpTimeoutMs);
+      ? AbortSignal.any([boundarySignal, maintenanceSignal(this.checkpointPublishTimeoutMs)])
+      : maintenanceSignal(this.checkpointPublishTimeoutMs);
     const init: RequestInit = {
       method: "POST",
       headers: {
@@ -3131,22 +3253,30 @@ export class WorkerClient {
       duplex: "half",
       signal,
     };
-    const res = await maintenanceFetch(fetch, this.baseUrl + path, init);
-    if (res.status < 200 || res.status >= 300) {
-      // Discard remote content without exposing it or changing the HTTP outcome.
-      if (ownedResponses.has(res)) await discardResponse(res);
-      else if (MaintenanceBudget.current()) void res.body?.cancel().catch(() => undefined);
-      else await res.body?.cancel().catch(() => undefined);
-      MaintenanceBudget.current()?.check();
-      return { ok: false, httpStatus: res.status };
+    const dispatcher = checkpointPublishDispatcher(this.checkpointPublishTimeoutMs);
+    Object.assign(init, { dispatcher });
+    try {
+      const res = await maintenanceFetch(fetch, this.baseUrl + path, init);
+      if (res.status < 200 || res.status >= 300) {
+        // Discard remote content without exposing it or changing the HTTP outcome.
+        if (ownedResponses.has(res)) await discardResponse(res);
+        else if (MaintenanceBudget.current()) void res.body?.cancel().catch(() => undefined);
+        else await res.body?.cancel().catch(() => undefined);
+        MaintenanceBudget.current()?.check();
+        return { ok: false, httpStatus: res.status };
+      }
+      // Bounded by streamed bytes: an overflow, a read failure or an abort throws, so the caller
+      // records the publish as ambiguous instead of reading an unbounded acknowledgment.
+      const text = await readBoundedText(res, CHECKPOINT_PUBLISH_ACK_MAX_BYTES, true, signal);
+      // A 2xx with no body cannot confirm the publish landed; treat it as a non-confirming
+      // outcome carrying the 2xx code rather than fabricating a body.
+      if (!text) return { ok: false, httpStatus: res.status };
+      return { ok: true, body: JSON.parse(text) as PublishResponse };
+    } finally {
+      // Destroy rather than graceful-close: failed/aborted uploads and partially read ACKs must
+      // not keep a pool alive or delay a caller's cancellation waiting for an idle connection.
+      await dispatcher.destroy();
     }
-    // Bounded by streamed bytes: an overflow, a read failure or an abort throws, so the caller
-    // records the publish as ambiguous instead of reading an unbounded acknowledgment.
-    const text = await readBoundedText(res, CHECKPOINT_PUBLISH_ACK_MAX_BYTES, true, signal);
-    // A 2xx with no body cannot confirm the publish landed; treat it as a non-confirming
-    // outcome carrying the 2xx code rather than fabricating a body.
-    if (!text) return { ok: false, httpStatus: res.status };
-    return { ok: true, body: JSON.parse(text) as PublishResponse };
   }
 
   /**
@@ -4402,13 +4532,32 @@ export class WorkerClient {
       return { outcome: "unknown", detail: "no claim generation to fence the hold" };
     }
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/base-attestation-hold`;
+    return this.requestPreflightHold(path, { head: args.head, claim_generation: args.claimGeneration }, BASE_ATTESTATION_HOLD_REASON, signal);
+  }
+
+  async requestRepoAgentSourceHold(
+    runId: string,
+    args: { commit: string; claimGeneration: number },
+    signal?: AbortSignal,
+  ): Promise<BaseAttestationHoldOutcome> {
+    if (!Number.isSafeInteger(args.claimGeneration) || args.claimGeneration <= 0) {
+      return { outcome: "unknown", detail: "no claim generation to fence the hold" };
+    }
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/repo-agent-source-hold`;
+    return this.requestPreflightHold(path, { commit: args.commit, claim_generation: args.claimGeneration }, REPO_AGENT_SOURCE_HOLD_REASON, signal);
+  }
+
+  private async requestPreflightHold(
+    path: string,
+    body: Record<string, unknown>,
+    reason: string,
+    signal?: AbortSignal,
+  ): Promise<BaseAttestationHoldOutcome> {
     try {
-      const res = await this.fetchRaw(
-        "POST", path, { head: args.head, claim_generation: args.claimGeneration }, this.httpTimeoutMs, signal,
-      );
+      const res = await this.fetchRaw("POST", path, body, this.httpTimeoutMs, signal);
       if (res.status === 200) {
         const fields = await readRunAck(res);
-        if (fields.status === "paused" && fields.holdReason === BASE_ATTESTATION_HOLD_REASON) {
+        if (fields.status === "paused" && fields.holdReason === reason) {
           return { outcome: "held", status: fields.status };
         }
         return { outcome: "unknown", detail: `unexpected hold acknowledgement (status ${fields.status ?? "none"})` };
@@ -5243,16 +5392,33 @@ function maintenanceSignal(timeoutMs: number): AbortSignal {
   return AbortSignal.any([budget.signal, AbortSignal.timeout(duration), ...(pending ? [pending] : [])]);
 }
 
+// Rejections of the transport (fetch) promise itself, as opposed to budget checks or body reads.
+const fetchRejections = new WeakSet<object>();
+
+function markTransportRejection<T>(p: Promise<T>, signal?: AbortSignal | null): Promise<T> {
+  return p.catch((error: unknown) => {
+    // undici rejects with `signal.reason` itself on abort; that is an abort, not a transport failure.
+    if (signal?.aborted && error === signal.reason) throw error;
+    if ((typeof error === "object" || typeof error === "function") && error !== null) fetchRejections.add(error);
+    throw error;
+  });
+}
+
+/** True only for an error object that the transport promise rejected with (identity-preserved). */
+export function isFetchRejection(error: unknown): boolean {
+  return (typeof error === "object" || typeof error === "function") && error !== null && fetchRejections.has(error);
+}
+
 async function maintenanceFetch(transport: typeof fetch, url: string, init: RequestInit): Promise<Response> {
   MaintenanceResources.consumeIfActive("rpcAttempts", 1);
   const resourceSignal = MaintenanceResources.signalIfActive();
   if (resourceSignal) init = { ...init, signal: AbortSignal.any([resourceSignal, ...(init.signal ? [init.signal] : [])]) };
   const budget = MaintenanceBudget.current();
-  if (!budget && !resourceSignal && !MaintenanceBudget.ownedSignal()) return transport(url, init);
+  if (!budget && !resourceSignal && !MaintenanceBudget.ownedSignal()) return markTransportRejection(transport(url, init), init.signal);
   if (!budget || MaintenanceBudget.ownedSignal()) {
     budget?.check();
     init.signal?.throwIfAborted();
-    const res = await transport(url, init);
+    const res = await markTransportRejection(transport(url, init), init.signal);
     if (init.signal) responseSignals.set(res, init.signal);
     ownResponse(res, init.signal);
     if (MaintenanceBudget.ownedSignal()) {
@@ -5263,7 +5429,7 @@ async function maintenanceFetch(transport: typeof fetch, url: string, init: Requ
   }
   budget.check();
   const signal = AbortSignal.any([budget.signal, ...(init.signal ? [init.signal] : [])]);
-  const res = await budget.raceIO(() => transport(url, { ...init, signal }), late => {
+  const res = await budget.raceIO(() => markTransportRejection(transport(url, { ...init, signal }), signal), late => {
     // One detached cancellation attempt; an uncooperative body cannot block the caller.
     void late.body?.cancel().catch(() => undefined);
   }, signal);
@@ -5377,14 +5543,14 @@ async function readBoundedText(res: Response, maxBytes: number, rejectOverflow =
 /** The server marker grants a bounded transport budget only. The complete
  * semantic candidate and its enclosing digest must still validate after reading. */
 async function readCrossCheckText(res: Response, maxBytes: number, signal?: AbortSignal,
-  semanticContext?: { generation: number; round: number } | "claim"): Promise<string> {
+  semanticContext?: { generation: number; round: number } | "claim", allowanceBytes = 0): Promise<string> {
   const marker = res.headers.get("X-Uzi-Candidate-Identity-Version");
   if (marker !== null && (marker !== "semantic_v1" || !semanticContext)) {
     if (ownedResponses.has(res)) await discardResponse(res);
     else void res.body?.cancel().catch(() => undefined);
     throw new Error("invalid cross-check candidate identity marker");
   }
-  const raw = await readBoundedBytes(res, marker === "semantic_v1" ? SEMANTIC_ENVELOPE_MAX_BYTES : maxBytes, true, signal);
+  const raw = await readBoundedBytes(res, (marker === "semantic_v1" ? SEMANTIC_ENVELOPE_MAX_BYTES : maxBytes) + allowanceBytes, true, signal);
   const text = new TextDecoder().decode(raw);
   if (semanticContext) {
     const wire: unknown = text ? JSON.parse(text) : undefined;
@@ -5532,6 +5698,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   memoryParkUndisposed?: boolean;
   status?: string;
   holdReason?: string | null;
+  repoAgentSourceCommit?: string;
   budgetMaxIterations?: number;
   budgetWallSeconds?: number;
   contractRevision?: number;
@@ -5556,6 +5723,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   supersededRevisionInputIds?: number[];
   staleRevisionSource?: boolean;
   reconciliation?: PlanCrossCheckReconciliation;
+  registrationEvidence?: "recorded" | "refused";
 }> {
   const pendingMarker = res.headers.get(COMPLETION_PENDING_HEADER);
   const ackCap = maxAckBytes === undefined ? undefined
@@ -5582,6 +5750,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
         // PRD #1497 M2: the run's hold_reason on the RunDTO, read beside `status` to recognise a
         // SERVER-side wall park (paused + budget_exhausted) from a fenced stale-claim ACK.
         hold_reason?: unknown;
+        repo_agent_source_commit?: unknown;
         budget_max_iterations?: unknown;
         budget_wall_seconds?: unknown;
         // Issue #1626: the frozen completion-contract revision (RunDTO.completion_revision).
@@ -5606,6 +5775,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       gate_revision?: unknown;
       revision_input_id?: unknown;
       superseded_revision_input_ids?: unknown;
+      // Issue #3859: top-level answer to a report that carried registration_evidence.
+      registration_evidence?: unknown;
     };
     const run = parsed?.run;
     const out: {
@@ -5623,6 +5794,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       memoryParkUndisposed?: boolean;
       status?: string;
       holdReason?: string | null;
+      repoAgentSourceCommit?: string;
       budgetMaxIterations?: number;
       budgetWallSeconds?: number;
       contractRevision?: number;
@@ -5647,6 +5819,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       supersededRevisionInputIds?: number[];
       staleRevisionSource?: boolean;
       reconciliation?: PlanCrossCheckReconciliation;
+      registrationEvidence?: "recorded" | "refused";
     } = {};
     if (isRecord(parsed) && (Object.hasOwn(parsed, "semantic_presentation") || Object.hasOwn(parsed, "semantic_approval"))) {
       try {
@@ -5682,6 +5855,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     // non-string (older server that omits it, a null hold, an unparseable value) leaves it absent,
     // which the ServerWallParkedError check reads as "no hold" (never a wall park).
     if (typeof run?.hold_reason === "string") out.holdReason = run.hold_reason;
+    if (typeof run?.repo_agent_source_commit === "string" && /^[0-9a-f]{40}$/.test(run.repo_agent_source_commit))
+      out.repoAgentSourceCommit = run.repo_agent_source_commit;
     if (typeof run?.budget_max_iterations === "number")
       out.budgetMaxIterations = run.budget_max_iterations;
     if (typeof run?.budget_wall_seconds === "number")
@@ -5789,6 +5964,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       out.revisionInputId = revisionId;
       out.supersededRevisionInputIds = superseded;
     }
+    if (parsed?.registration_evidence === "recorded" || parsed?.registration_evidence === "refused")
+      out.registrationEvidence = parsed.registration_evidence;
     const gateRev = parsed?.gate_revision;
     if (typeof gateRev === "number" && Number.isSafeInteger(gateRev) && gateRev >= 1) out.gateRevision = gateRev;
     const reconciliation = readPlanCrossCheckReconciliation(parsed);

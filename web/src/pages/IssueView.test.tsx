@@ -638,9 +638,9 @@ describe("IssueView Start gate (PRD #764)", () => {
   });
 
   // Positive control: a both-usable user with the harness picker left on inherit (the
-  // untouched default) also still sees the Anthropic picker — D11 rule 4 resolves
-  // inherit to Claude when both are usable and no default is set, so hiding it here
-  // would be wrong.
+  // untouched default) also still sees the Anthropic picker. The usage-free resolver
+  // answer for inherit with both usable is Claude; creation of an eligible implicit issue
+  // run may pick by weekly limits instead (#3845), so hiding it here would be wrong.
   it("still shows the Anthropic token picker for a both-usable user on the untouched inherit default", async () => {
     setAuth();
     mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
@@ -1563,6 +1563,16 @@ it.each([null, "2099-01-01T00:00:00Z"])("adoption refusal history uses integrity
   mockApi.listRuns.mockResolvedValue({ runs: [aRunItem({ status: "recovery_wait", recovery_wait_cause: "retained_recovery_adoption_failed", recovery_retry_not_before: stamp } as Partial<RunListItem>)] });
   renderIssueView();
   const badge = await screen.findByText("retained recovery integrity hold");
+  expect(badge.classList.contains("text-warn")).toBe(true);
+  expect(screen.queryByText("retained recovery retrying")).toBeNull();
+});
+
+it.each([null, "2099-01-01T00:00:00Z"])("unwitnessed continuation history uses its hold label with timestamp %s", async (stamp) => {
+  setAuth();
+  mockApi.getIssue.mockResolvedValue({ issue: anIssue() });
+  mockApi.listRuns.mockResolvedValue({ runs: [aRunItem({ status: "recovery_wait", recovery_wait_cause: "retained_continuation_unwitnessed", recovery_retry_not_before: stamp } as Partial<RunListItem>)] });
+  renderIssueView();
+  const badge = await screen.findByText("unwitnessed continuation hold");
   expect(badge.classList.contains("text-warn")).toBe(true);
   expect(screen.queryByText("retained recovery retrying")).toBeNull();
 });

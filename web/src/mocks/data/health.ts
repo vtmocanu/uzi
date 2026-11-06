@@ -147,6 +147,22 @@ export function maintenanceDoc(): HealthDoc {
   );
 }
 
+// overview-next (PRD #3878): one owner warning that opts into the admin attention banner,
+// so the Overview preview shows that banner and a non-passing health chip.
+export function overviewNextDoc(): HealthDoc {
+  return doc(
+    build({
+      "recovery.storage": {
+        severity: "warn",
+        attention_banner: true,
+        summary: "2 captures currently marked quota-refused.",
+        since: minsAgo(45),
+        evidence: [{ label: "Quota-refused captures", value: "2" }],
+      },
+    }),
+  );
+}
+
 // health-degraded: two checks need attention.
 export function degradedDoc(): HealthDoc {
   return doc(

@@ -10,6 +10,48 @@ the full Decision Log (D1-D9), the milestone breakdown and the verified code anc
 ADR restates the invariants a future edit to a claim clause, a custody-release path or a
 cleanup guard must not silently break.
 
+## Amendment (#2969): predecessor guarded-hold settlement is built and disabled in production
+
+**Status**: Built behind a constructor-only test option; **disabled in production**. Every retained re-claim skips the predecessor pass, so production behavior is unchanged. Owner decision 2026-11-06, fallback.
+
+The design lets a retained re-claim settle a **lower** generation's guarded inventory hold while a later claim generation of the same run executes. What the branch contains:
+
+- **Coordinator (`agent/src/recovery.ts`).** An in-memory, never-journaled `predecessor` option on `operateFrozenInventory`, carried by an `AsyncLocalStorage` scope. One exemption in `inactiveInventoryDisqualifier` tolerates an executing run only for that record, only for a generation strictly below the executing claim, and only while the scope is live. Grants 1, 3 and 4 are denied; grant 2 requires `current_claim_generation > generation` from a fresh exact hold observation, and a failed observation returns `predecessor_observation_refused` before any capture, upload or write. There is no freeze. Saved archive FINAL requests are preserved and replayed. Each pass has a 64 MiB upload allowance; a typed quota refusal skips, a bare 507 is not quota. Predecessor RPCs are awaited, not detached. An integrity channel classifies refusal codes (unknown means integrity, so STOP) and survives a thrown operation.
+- **Runner (`agent/src/runner.ts`, `agent/src/git.ts`).** A per-call source boundary grant (exact execution tail, generation strictly lower, live held scope, Linux) proves each clone with quiescence before and after, plus a strict byte-exact content proof (`GitCache.inventorySourceContentProof`: binary-safe git output, `hash-object --no-filters --stdin-paths`, capped, refusing assume-unchanged, skip-worktree, gitlink and filter attributes). A predecessor-only `ignored_residue` gate skips when non-scratch ignored files exist (`node_modules`, build output); `.uzi/scratch/` is excluded. Per-clone head and device:inode baseline drift is a STOP. `settlePredecessorHolds` runs inside `recoverRetainedClaim` after the mandatory capture and before successor adoption, with a budget, an owned/joined action cap, a settlement watchdog, a Codex pre-entry single-source gate and STOP/skip classification.
+- **Observed `--stdin-paths` behavior.** On git 2.54.0, `hash-object --stdin-paths` C-unquotes a line that starts with `"` and strips a trailing CR. The proof therefore refuses, before dispatch, any path containing LF, starting with `"`, or ending in CR, rather than hashing a different file than it named.
+- **The ordinary terminal FINAL is unchanged.** It keeps `worktreeStatus`. The plan proposed the strict content proof there too; it was dropped because a clean repository with `eol`, `ident`, `working-tree-encoding` or filter attributes hashes differently under `--no-filters` and would be refused forever.
+- **API.** No server change. `TestRecoveryPredecessorFinalWhileSuccessorRunsLiveDB` characterizes that the server already accepts an older-generation FINAL while the successor runs.
+
+**Why disabled.** The existing quiescence scan targets only the runner uid and cannot see a leftover process of the separate command uid writing into a predecessor clone. An in-process procfs detector was tried and removed: review showed an unprivileged process can cycle the pid counter without being counted (clones that fail after pid allocation, thread pids), so absence could not be proven. A retained re-claim that has lower-generation guarded records to settle logs `command_uid_unproven` and skips the pass before any predecessor operation (other skips log their own reason, such as `budget`); no retained re-claim runs a predecessor operation, and the holds stay open and counted exactly as before. The same command-uid blind spot exists in the ordinary terminal FINAL's quiescence check; it is a known gap, deferred next to #3851.
+
+**Enablement.** Turning the pass on requires a separately reviewed proof contract that rules out a command-uid writer into the predecessor source. Removing the test-only gate alone is not enough. The real UID-split end-to-end lane (M4) belongs to that enablement work; the existing worker-uid CI job does not satisfy it.
+
+**Accepted residual (owner decision 2026-11-06), separate from the command-uid defect.** The scoped quiescence scan does not prove that no arbitrary writer exists: it excludes a process outside the target paths that carries no attempt marker. Such a process can modify the source after the last proof, and those later bytes can be absent from the archive even though the hold is released. The held callback and strict hashing do not exclude it. This residual applies once the pass is enabled and is disclosed, not fixed; [#3831](https://github.com/vtmocanu/uzi/issues/3831) is related design work, not a guaranteed fix. The command-uid defect above is what keeps the pass disabled.
+
+**Deferred, not shipped:**
+
+- A sound command-uid source proof (the prerequisite for enabling the pass).
+- A Codex older-sibling source proof.
+- A regenerable ignored-path allowlist.
+- Empty or unadopted predecessor settlement.
+- The shared-quota risk tracked in #2544.
+- The real UID-split end-to-end lane; it was not built or run.
+
+Cleanup of predecessor records is unchanged and stays with the [ADR-2417 amendment](2417-guarded-local-retention.md#amendment-2969-predecessor-record-cleanup-deferral).
+
+## Amendment 2026-11-04: operator local-record resolution (#3885)
+
+A worker-local operator command can now retire guarded local recovery records,
+but only for Case A: the exact closed hold was released with a receipt matching the saved
+FINAL request, with or without the FINAL ACK already saved (an ACK with a
+discarded hold is refused). The binding, lock order, retention exclusions and
+failure model are in the
+[ADR-2417 amendment](2417-guarded-local-retention.md#amendment-2026-11-04-operator-resolution-of-guarded-local-records-3885).
+The owner-disposition surface (D6) is unchanged, and no new server authority is
+added. Case B (a discarded hold, or a release without this record's matching
+receipt) remains owner-pending and is refused (typically `case_b_pending_owner_review`);
+its proposed contract is recorded in that ADR and is not accepted.
+
 ## Amendment 2026-10-30 — same-issue witness policy
 
 The approved #3654 policy adds the narrow cross-run `basis = same_issue_witness` to existing
@@ -750,7 +792,7 @@ Limitations: lineage does not survive a retired clone (an earlier marker still o
 
 ## Amendment 2026-10-29: reuse covered marker-free recovery sources
 
-Repeated provider retries without model progress must not nest another recovery wrapper merely because a clean successor adopted the preceding aggregate as its HEAD. New guarded inventories may reuse that current aggregate when its bounded commit shape and worker identity match and every original root is positively ancestral to it. The shared bounded wrapper walk must establish the exact marker-free case in which successor adoption does not consult provenance pins. A coverage-looking header is shape, not provenance; marker involvement, divergent roots or unproven eligibility never gain reuse authority. This reuse amendment leaves the original successor verifier, including its eight-aggregate bound, unchanged. The separate [2026-11-02 source-selection amendment](#amendment-2026-11-02--durable-remediation-source-selection) permits proven divergent adoption; it does not widen marker-free reuse.
+Repeated provider retries without model progress must not nest another recovery wrapper merely because a successor retained the preceding aggregate as its physical HEAD. New guarded inventories may reuse that current aggregate when its bounded commit shape and worker identity match and every original root is positively ancestral to it. This bounded marker-free reuse proof does not consult provenance pins; it supplies no successor source-selection authority. A coverage-looking header is shape, not provenance; marker involvement, divergent roots or unproven eligibility never gain reuse authority. The [2026-11-03 amendment](#amendment-2026-11-03--ordinary-marker-free-source-selection-3781) separately requires authenticated provenance to select the journaled content source for execution, retaining the eight-aggregate bound. The [2026-11-02 source-selection amendment](#amendment-2026-11-02--durable-remediation-source-selection) permits proven divergent adoption; it does not widen marker-free reuse.
 
 Reuse preserves the current tree and all frozen roots, recomputes the inventory fingerprint, and writes a separate ref in the existing run/generation/fingerprint namespace. It does not share ref ownership across generations or release any source, archive or custody. Eligibility depends on immutable objects and ancestry, not on whether an earlier generation's coverage pin survives cleanup. A new inventory fingerprint need not equal the reused commit's embedded fingerprint, so the optional archive-redundancy reader may return no claim. Full frozen-source proof and ordinary archive FINAL do not depend on that optimization.
 
@@ -796,7 +838,7 @@ the implementing PR.
 
 D5's refusal of a thin archive FINAL is narrowed, not removed. For an inventory-guarded **archive** FINAL only, a capture that lists prerequisites may release its hold when the API proves, at release time, that the capture's closure is pinned: the closure row is bound to the exact capture and hold, its checksum and prerequisites match the capture, no absence is recorded, and one fresh listing of `refs/uzi-prereq/<capture-id>` on GitHub.com shows the recorded tip. The hold then records `release_evidence = prerequisite_closure` with a `final_closure_id`. Without a positive listing the hold stays open: a recorded absence is refused as `prerequisite_pin_missing`, a different tip as `prerequisite_pin_foreign` (409), and an unlistable pin, timeout or limiter refusal as `prerequisite_pin_unavailable` (503). The proof is archive-only; it adds nothing for publication, held-publication or empty-inventory dispositions, and the server still does not parse bundle bytes (T1-T5 of ADR-3591 are unchanged).
 
-The worker mints a thin archive FINAL only under a transient grant and only against a pinned, matching closure; an unknown or transient result never grants. There are two grantors. The frozen path (`frozenOperationCycle`) can pass four grants: (1) missing v2 held metadata on a non-uncertain create; (2) proven held ineligibility; (3) an attested held-publication fallback in the same pass; (4) a feature snapshot naming the closure feature and neither held feature. The #2969 retained-claim caller (`captureAndUpload` with `closureMint: "retained_claim"`) is limited to grants 1 and 4; it runs while the run still executes, so it captures without minting and the mint comes from the later frozen pass. At the API, a committed release replays to its original ACK without forge I/O or admission. A saved thin FINAL's worker replay uses its MAC and bundle header independent of the pin, expiry or knob, subject to the fresh captured-C restriction guards in the [2026-11-02 amendment](#amendment-2026-11-02--durable-remediation-source-selection).
+The worker mints a thin archive FINAL only under a transient grant and only against a pinned, matching closure; an unknown or transient result never grants. There are two grantors. The frozen path (`frozenOperationCycle`) can pass four grants: (1) missing v2 held metadata on a non-uncertain create; (2) proven held ineligibility; (3) an attested held-publication fallback in the same pass; (4) a feature snapshot naming the closure feature and neither held feature. The #2969 retained-claim caller (`captureAndUpload` with `closureMint: "retained_claim"`) is limited to grants 1 and 4; it runs while the run still executes, so it captures without minting and the mint comes from the later frozen pass. The wider predecessor settlement built for #2969 is disabled in production; see the [#2969 amendment](#amendment-2969-predecessor-guarded-hold-settlement-is-built-and-disabled-in-production). At the API, a committed release replays to its original ACK without forge I/O or admission. A saved thin FINAL's worker replay uses its MAC and bundle header independent of the pin, expiry or knob, subject to the fresh captured-C restriction guards in the [2026-11-02 amendment](#amendment-2026-11-02--durable-remediation-source-selection).
 
 Mixed-version limits, all fail closed:
 
@@ -825,8 +867,11 @@ the 2026-11-01 C2 release amendment remain separate contracts.
 The refusal also applies beyond enrolled remediation: missing or unverified
 `restoreSource`, or divergent marker-free coverage without verified
 source-selection evidence, refuses before successor clone creation, retaining
-work, pins and custody. Source-bound ordinary ancestor-only adoption is
-unchanged. Source-less legacy coverage could previously seed C and then require
+work, pins and custody. Source-bound ordinary ancestor-only adoption now selects
+the authenticated journaled source under the full proof in the
+[2026-11-03 amendment](#amendment-2026-11-03--ordinary-marker-free-source-selection-3781);
+definite ordinary ineligibility alone retains the pre-existing tip fallback.
+Source-less legacy coverage could previously seed C and then require
 a base hold; the current refusal occurs before successor creation when source
 binding is absent. Equal trees or leaf dominance cannot supply authenticated S,
 and no legacy exception grants new authority. The existing feature-gated,
@@ -985,3 +1030,103 @@ passing proof. The sanitized trace establishes neither adopt nor release
 authority. #3583 independently owns its historical publication investigation
 and any release of rewritten roots; this change neither diagnoses it nor depends
 on publishing those roots.
+
+## Amendment 2026-11-03 — ordinary marker-free source selection (#3781)
+
+### Execution source and custody envelope
+
+For general ordinary marker-free recovery, successor preparation selects the
+content source S instead of executing the coverage wrapper W only after
+authenticating the current run/clone/attempt and captured episode journal,
+including its exact `restoreTip = W` and `restoreSource = S` binding and episode
+pin. Neither equal trees nor a dominant leaf establishes that binding.
+
+The complete bounded wrapper graph must verify: at most eight aggregates and
+66 leaves, exact coverage messages, worker author and committer identities at
+2000-01-01 UTC, every aggregate tree equal to S's tree, one common embedded
+fingerprint that recomputes from the complete leaf set and S (with or without
+S among the fingerprint's roots), S itself present as a leaf, and every other
+leaf positively ancestral to S. The original embedded fingerprint must name a
+`refs/uzi-coverage/<runId>/<generation>/<fingerprint>` ref pointing to exact W.
+A later reuse pin with a different inventory fingerprint does not substitute
+for that original provenance pin. Nested aggregates with the same fingerprint
+can qualify; mixed fingerprints cannot establish this proof.
+
+These checks run under the existing bare-lock/handoff boundary. Independent
+source ownership, attempt/episode, reservation, object-closure, quiescence and
+source-use admission checks still apply, including the final HEAD/tree recheck.
+
+On success, execution HEAD and index tree are exactly S, with no unstaged
+diff. Raw `RunnerClone.adoptedSource` can still be W for capture attribution;
+`adoptedContentSource` is S. The frozen coverage envelope, original roots,
+source mapping, generation context, coverage and episode refs, predecessor
+clone and archive custody remain intact. Source selection releases nothing.
+The aggregate's custody role does not make it execution history.
+
+A definite negative provenance result permits keeping W only in the
+pre-existing ordinary branch: no marker source or marker leaf, no divergent
+leaf and no remediation enrollment. For example, a positively observed missing
+original coverage pin or mismatched fingerprints can make that branch
+ineligible for the S peel. This is not a new fallback for errors. Missing or
+unverified source binding, missing objects, failed reads, unknown ancestry,
+walk-bound exhaustion, marker verification failures and remediation refusals
+still refuse before successor ledger or clone effects. The #3239 divergent
+marker/lineage rules and the separately authenticated remediation exception
+remain unchanged.
+
+The 2026-10-29 aggregate reuse proof is deliberately separate: bounded,
+pin-independent reuse may preserve physical W even when W lacks authority to
+select S. It preserves the frozen inventory and writes its own generation pin;
+it cannot mint provenance or replace the original embedded-fingerprint pin.
+Owed roots are settled separately by later `reconcileOwedCandidates` against
+confirmed published ancestry. Selecting S, retaining bytes or preparing a
+successor does not itself settle them.
+
+### Publication and restriction boundaries
+
+For publication-only recovery, S must equal the exact recorded candidate C,
+not merely have the same tree or contain C. Authenticated W may cover C without
+becoming C or adding its parents to execution history. ACK-lost reconciliation
+continues to reconcile the existing publication intent and candidate under its
+own proofs; this amendment grants no new publication, release, FINAL or ACK
+authority. Existing publication floors and committed work remain protected;
+genuine progress beyond C still requires the existing model-required hold.
+
+The #3816 fresh restriction-facts, lifecycle and denial-revision checks remain in force. Durable
+negative evidence is read afresh and rechecked across awaited work and locked
+writes; a changed restriction fingerprint, blocked or unavailable evidence
+cannot be replaced by an earlier positive observation. Capture restrictions
+still apply to the actual captured envelope (called C in the 2026-11-02
+remediation amendment), not the clean execution source. Source selection does
+not bypass denial, restrictions, prerequisite proof or custody reconciliation.
+There is no database, journal schema, protocol feature or accounting change.
+
+### Observed lifecycle and upgrade limits
+
+Controlled real lifecycle fixtures exercise both producer/consumer orders:
+original aggregate production with the new consumer, and new reuse production
+with controlled original source selection. They perform actual immutable
+freeze, upload, capture-journal recording and successor preparation. They are
+not live deployment evidence. With eligible source selection, the Claude and
+Codex publication fixtures repark on another MR-create outage and complete
+after explicit owner Resume without model/helper/session execution; stable
+roots reuse the same W and execution remains exact C.
+
+The observed legacy boundary is narrower than universal upgrade repair. When
+original selection first executes W and holds, a subsequent authenticated W/W
+recapture can initially peel to C on owner Resume while the original matching
+pin survives. Authenticated source carry-forward requires the newly captured
+source to equal the previous restore tip exactly; a same-tree object cannot
+supply that mapping. A second MR-create park leaves unpublished W as an owed root;
+the next envelope can then mix embedded fingerprints and retain W through the
+ordinary fallback, preserving the model-required hold. In the sibling fixture,
+lawful generation cleanup removes the original pin while a later reuse pin
+survives. Fresh GitCache/coordinator consumers after restart retain W and the
+hold; that later pin does not restore original provenance authority.
+
+These retained cases require manual export, recovery and delivery under the
+existing safety and custody rules. No automatic upgrade repair, source discard
+or release is promised. Old wrapper history and floors are preserved; an
+already overbound graph is not bypassed. #3583's historical publication
+investigation and #1324's separate maintainer acceptance remain unresolved
+and outside this fix.

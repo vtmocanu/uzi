@@ -67,6 +67,7 @@ import { checkedImplementationContext, nextAutomaticRound, validateCheckedPlanBu
 import { recordRoot, type RecordedRoot, type StartTimeReader } from "../worker-spawn-mark.js";
 import path from "node:path";
 import { ATTEMPT_ID_RE, cloneKeyOf } from "../attempt-path.js";
+import { BROWSER_DISCOVERY_ENV } from "../browser-env.js";
 import type { SdkAttemptEnv } from "../sdk-env.js";
 import { goConcurrencyEnv } from "../go-concurrency.js";
 import { randomUUID } from "node:crypto";
@@ -138,12 +139,13 @@ import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts,
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
 import { errMessage } from "../util.js";
-import { SummaryRunner, type PlanSummaryResult } from "../summary-runner.js";
+import { SummaryRunner, type PlanSummaryResult, type SummarySkipReason } from "../summary-runner.js";
+import { summarySkipPayload } from "./summary-skip.js";
 import { resolvePrdInput } from "../prd-link.js";
 import { appendLeadTextTail, emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "../plan-missing.js";
 import { makeTextRedactor } from "../redact.js";
-import { resolveAgentSelection, seedAgentSelection, type AgentSelection, type AgentTemplate, type AskUserQuestion, type ClaimSkill, type IterationBudget, type Milestone, type MilestoneProgress } from "../protocol.js";
-import { selectSubagentTemplates } from "../agents.js";
+import { gateVerdictSelection, resolveAgentSelection, seedAgentSelection, type AgentSelection, type AgentTemplate, type AskUserQuestion, type ClaimSkill, type IterationBudget, type Milestone, type MilestoneProgress } from "../protocol.js";
+import { ownSubagentTemplates, selectLeadTemplate, selectSubagentTemplates } from "../agents.js";
 import { REPO_AGENT_DENIED_TOOLS } from "../repoagents.js";
 import type { CommandSandboxMode } from "../config.js";
 
@@ -286,7 +288,7 @@ const COMMAND_ENV_PATH = "/opt/uzi-toolchain/bin:/usr/local/sbin:/usr/local/bin:
  *  identity pins these, and sdk-env.ts's PROTECTED_ENV_KEYS deliberately OMITS
  *  PATH/TMPDIR/LANG, so relying on it alone would leave those open) with a MIRROR of that
  *  module-private PROTECTED_ENV_KEYS set (the OAuth credential + the two ANTHROPIC_* keys +
- *  the browser flag), plus Docker endpoint/configuration keys owned by trusted startup wiring.
+ *  the browser flag and the two browser discovery paths), plus Docker endpoint/configuration keys owned by trusted startup wiring.
  *  So a hostile/malformed `toolEnv` can neither breach the command
  *  boundary NOR reintroduce a credential-adjacent key. PATH is additionally handled
  *  specially in {@link buildCommandEnv} (fixed prefix, provisioned value appended). */
@@ -313,6 +315,9 @@ const COMMAND_ENV_PROTECTED_KEYS: ReadonlySet<string> = new Set([
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
   "AGENT_BROWSER_ARGS",
+  // Issue #3907: the browser discovery keys (sdk-env.ts protects them too; set only by
+  // buildCommandEnv's browserDiscovery flag, never by a provisioned toolEnv).
+  ...Object.keys(BROWSER_DISCOVERY_ENV),
   "UZI_SQLC_DIR",
   // issue #1783: the run-attempt marker and worker spawn mark sdk-env.ts protects too.
   "UZI_RUN_ATTEMPT",
@@ -1187,6 +1192,7 @@ export async function makeCodexAdviceHarness(
   ownership?: SummaryOwnership,
   admissionReporter?: CodexAdmissionReporter,
   operationScope?: CodexAdviceHarnessOptions["operationScope"],
+  onRefreshDenied?: () => void,
 ): Promise<CodexAdviceHarness> {
   // Register EVERY advice token — the initial release AND any subscription refresh — with the
   // harness redactor so neither can ride a log line verbatim. The advice lane has no separate
@@ -1201,7 +1207,7 @@ export async function makeCodexAdviceHarness(
   const initial = await bridge.release(signal);
   ownership?.guard();
   registerToken(initial);
-  const appServerAuth = createCodexAppServerAuth(buildAdviceAuthConfig(bridge, initial, registerToken, refresh === "deny"));
+  const appServerAuth = createCodexAppServerAuth(buildAdviceAuthConfig(bridge, initial, registerToken, refresh === "deny", onRefreshDenied));
   return new CodexAdviceHarness({ launchRoot, provider, appServerAuth, authMode: bridge.authMode, log, admissionReporter, operationScope });
 }
 
@@ -1259,6 +1265,7 @@ function buildAdviceAuthConfig(
   initial: string,
   registerToken: (token: string) => void,
   denyRefresh = false,
+  onRefreshDenied?: () => void,
 ): CodexAppServerAuthConfig {
   if (bridge.authMode !== "subscription") {
     return { mode: "api_key", apiKey: initial };
@@ -1274,7 +1281,7 @@ function buildAdviceAuthConfig(
     // PRD #2603: the Now summary shares the RUN's credential, so its advice call must never
     // advance the run's committed generation: a refresh request fails the (advisory) call instead.
     bridge: denyRefresh
-      ? { refresh: () => Promise.reject(new Error("codex advice refresh is denied for this call")) }
+      ? { refresh: () => { onRefreshDenied?.(); return Promise.reject(new Error("codex advice refresh is denied for this call")); } }
       : bridge.buildSubscriptionRefreshBridge(registerToken),
   };
 }
@@ -1430,6 +1437,9 @@ export interface CodexAdviceHarnessBuildParams {
   /** PRD #2603: "deny" makes the call's app-server refresh bridge fail instead of calling
    *  refreshCodex, for callers sharing the run's credential (Now, intent and plan summaries). */
   readonly refresh?: "deny";
+  /** Issue #3248 M3: called when the deny bridge refuses a refresh the app-server requested
+   *  during this call (only with `refresh: "deny"`). The model pass reads it as a typed flag. */
+  readonly onRefreshDenied?: () => void;
 }
 
 /** The injected judge/review advice-harness seam (PRD #1429 M3): built ONLY here and in
@@ -1454,7 +1464,7 @@ export function makeProductionCodexAdviceHarnessFactory(
   deps: { launchRoot?: LaunchAdviceRootSeam } = {},
 ): CodexAdviceHarnessFactory {
   return async (params: CodexAdviceHarnessBuildParams): Promise<CodexAdviceHarness> => {
-    const { runId, binding, signal, refresh } = params;
+    const { runId, binding, signal, refresh, onRefreshDenied } = params;
     const ownership = summaryOwnership.get(params);
     ownership?.guard();
     // Retain the owner's scope before credential release can yield. A delayed advice
@@ -1469,7 +1479,8 @@ export function makeProductionCodexAdviceHarnessFactory(
       const launchRoot = deps.launchRoot ?? makeProductionLaunchAdviceRoot(homeRoot, binding.authMode, log, ownership);
       return await makeCodexAdviceHarness(bridge, CODEX_PRODUCTION_PROVIDER, launchRoot, log, signal, refresh, ownership,
         binding.authMode === "subscription" ? client.codexAdmissionReporter?.(runId, params.claimGeneration) : undefined,
-        scope ? () => ({ prepare: (signal, check) => scope.prepare("advice", signal, () => { ownership?.guard(); check(); }), close }) : undefined);
+        scope ? () => ({ prepare: (signal, check) => scope.prepare("advice", signal, () => { ownership?.guard(); check(); }), close }) : undefined,
+        onRefreshDenied);
     } catch (error) { close(); throw error; }
   };
 }
@@ -3212,8 +3223,10 @@ export class CodexExecutor implements Executor {
             if (!allowed()) return;
             const inputs = await summaryInputs();
             if (!allowed()) return;
+            const skip: { reason?: SummarySkipReason } = {};
             const result = await this.summaryRunner.generatePlanSummary({
               ...inputs, planMd, signal: AbortSignal.any([lifecycleSignal, owned.ctrl.signal]),
+              onSkip: reason => { skip.reason = reason; },
               // Spend observed during bounded settlement counts even after close/abort; only
               // abandonment, a fence or a superseding flight drops it (as for the intent pass).
               onUsage: usage => {
@@ -3223,7 +3236,12 @@ export class CodexExecutor implements Executor {
                 ctx.emit({ kind: "summary_usage", agent: "worker", payload: { pass: "plan", model_usage: usage } });
               },
             });
-            if (!result || !allowed()) return;
+            if (!result) {
+              // Issue #3248 M3: one visible note under the same guards as the post it replaces.
+              if (skip.reason && allowed()) ctx.emit({ kind: "status", agent: "worker", payload: summarySkipPayload("plan", skip.reason) });
+              return;
+            }
+            if (!allowed()) return;
             await this.opts.client.postPlanSummary(ctx.runId, {
               ...result, plan_md: planMd.replaceAll("\u0000", ""),
             });
@@ -3592,6 +3610,9 @@ export class CodexExecutor implements Executor {
           this.deps.commandTmpdir ?? "/tmp",
           provisioned.toolEnv,
           this.opts.dockerWiring?.dockerHost,
+          // Issue #3907: every model command runs under `commandSandbox` (makeDefaultSpawnCommand);
+          // only the fileop root is forced to "required" for cross_check, and it runs no browser.
+          commandSandbox === "off",
         ),
         await canonicalCheckoutPath(worktreePath),
       );
@@ -3869,16 +3890,20 @@ export class CodexExecutor implements Executor {
           try {
             const inputs = await summaryInputs();
             if (!summaryAllowed() || flight.ctrl.signal.aborted) return;
+            const skip: { reason?: SummarySkipReason } = {};
             const summary = await this.summaryRunner.generateIntentSummary({
               ...inputs, signal: flight.ctrl.signal,
+              onSkip: reason => { skip.reason = reason; },
               onUsage: usage => {
                 if (flight.delivered || flight.abandoned || ctx.claimFenced?.() || this.intentFlight !== flight) return;
                 flight.delivered = true;
                 ctx.emit({ kind: "summary_usage", agent: "worker", payload: { pass: "intent", model_usage: usage } });
               },
             });
-            if (summary && !flight.abandoned && !flight.ctrl.signal.aborted && summaryAllowed() && this.intentFlight === flight) {
-              await this.opts.client.postIntentSummary(ctx.runId, summary);
+            if ((summary || skip.reason) && !flight.abandoned && !flight.ctrl.signal.aborted && summaryAllowed() && this.intentFlight === flight) {
+              // Issue #3248 M3: a skipped summary posts nothing and leaves one visible note instead.
+              if (summary) await this.opts.client.postIntentSummary(ctx.runId, summary);
+              else if (skip.reason) ctx.emit({ kind: "status", agent: "worker", payload: summarySkipPayload("intent", skip.reason) });
             }
           } catch (error) {
             this.log.warn("intent summary hook failed", { run_id: ctx.runId, error: errMessage(error) });
@@ -4176,7 +4201,7 @@ export class CodexExecutor implements Executor {
           gatedPlan = planMd;
           approvedMilestones = planResult.milestones;
         }
-        approvedSelection = verdict.selection;
+        approvedSelection = gateVerdictSelection(verdict.selection, ctx.approvedSelection, ctx.requestedAgentSource);
 
         // NEW-ROOT RESUME at plan approval. The plan turn's provider root holds a live credential
         // it does not need during the approval wait, so: persist the credential-free session,
@@ -4234,7 +4259,7 @@ export class CodexExecutor implements Executor {
       // gate), before any implement turn. An invalid selection forces `own` and a repo selection
       // with no detected roster degrades to `own` (resolveAgentSelection owns both rules), so a
       // malformed verdict can never activate attacker-authored repo agents.
-      const resolvedSelection = resolveAgentSelection(approvedSelection, (ctx.repoAgents?.length ?? 0) > 0);
+      const resolvedSelection = resolveAgentSelection(approvedSelection, (ctx.repoAgents?.length ?? 0) > 0, ctx.requestedAgentSource);
       if (resolvedSelection.note) {
         ctx.emit({ kind: "status", agent: "worker", payload: { text: resolvedSelection.note } });
       }
@@ -6503,13 +6528,14 @@ export class CodexExecutor implements Executor {
   }
 
   /** PRD #3244: the lead's requested model/effort for a phase, from the one worker resolver. Pure in
-   *  (ctx.config, provider model), so the request built per turn and the row reported at the phase
+   *  (ctx.config, owner roster, provider model), so the request built per turn and the row reported at the phase
    *  entry cannot differ. */
   private leadRequestFor(ctx: RunContext, phase: "plan" | "implement"): LeadRequest {
     return resolveLeadRequest({
       harness: "codex",
       phase,
       config: ctx.config,
+      templateModel: selectLeadTemplate(ctx.agents ?? [])?.model ?? undefined,
       providerDefaultModel: this.opts.provider.model,
     });
   }
@@ -6524,27 +6550,20 @@ export class CodexExecutor implements Executor {
     repoInstructions?: string,
     ownerCompletionRecheck = false,
   ): RunTurnRequest {
-    let leadBody: string | undefined;
+    const leadBody = selectLeadTemplate(ctx.agents ?? [])?.prompt_body;
     const agents: Record<string, HarnessAgent> = {};
     let repoSourced = false;
     if (phase === "plan") {
       // The plan phase is deliberately independent of the selection: it runs before the human
       // approves one, with the owner's roster, exactly as before issue #1718.
-      for (const t of ctx.agents ?? []) {
-        // The lead is the ROOT thread, not a subagent — its body seeds the lead system
-        // prompt; every other template is a delegation target.
-        if (t.name === "lead") {
-          leadBody = t.prompt_body;
-          continue;
-        }
+      for (const t of ownSubagentTemplates(ctx.agents ?? [])) {
         agents[t.name] = toHarnessAgent(t);
       }
     } else {
       if (!selection) throw new TrustedExecutionRefusal("codex implement request built without a resolved agent selection");
       repoSourced = selection.source === "repo";
-      // The lead body is ALWAYS the owner's `lead` template (uzi's builtin) under either source;
-      // a repo file named `lead` is only ever a subagent (selectSubagentTemplates).
-      leadBody = (ctx.agents ?? []).find((t) => t.name === "lead")?.prompt_body;
+      // The root body always comes from the selected owner lead. Every repo template,
+      // including lead-shaped names, stays a subagent (selectSubagentTemplates).
       const repoSkills = repoSourced ? (ctx.skills ?? []).map((s) => s.name) : undefined;
       for (const t of implementTemplates(ctx, selection)) agents[t.name] = toHarnessAgent(t, repoSkills);
       // Every implement request, including replacement and continuation prompts,
@@ -6608,7 +6627,7 @@ export class CodexExecutor implements Executor {
       signal,
       // Honor the SERVER-RESOLVED per-run/schedule model (owner default or PRD #300 schedule
       // freeze) that the api already harness-validated against the closed Codex set and shipped on
-      // the claim; fall back to the fixed provider default when the claim carries none. render.ts's
+      // the claim; otherwise use the selected valid owner pin, then the provider default. render.ts's
       // resolveModel re-validates request.model downstream and codex-harness.ts's
       // `rendered.lead.model ?? this.provider.model` supplies the same default for an out-of-set value.
       model: leadRequest.model!,
@@ -7592,11 +7611,18 @@ export function commandSandboxArgv(
  *     PROTECTED_ENV_KEYS member — {@link COMMAND_ENV_PROTECTED_KEYS} unions both, because
  *     PROTECTED_ENV_KEYS alone omits PATH/TMPDIR/LANG. `commandEffectSpec` later overrides
  *     HOME/TMPDIR to the per-command private tmp, so those stay boundary-safe regardless.
+ *   - issue #3907: when `browserDiscovery` is true, AGENT_BROWSER_EXECUTABLE_PATH and
+ *     CHROME_PATH (the uzi-chromium wrapper) are set after the fold. The caller passes true
+ *     only when the worker's command sandbox mode is `off`. Under `required` discovery is
+ *     not advertised: Chromium was observed failing under the enforced Landlock policy
+ *     (/proc and /sys are not granted). Under `best-effort` it is not advertised either, by
+ *     design, even on a Landlock-less (degraded, unconfined) kernel where Chromium might run:
+ *     discovery is advertised only for the mode whose launch the worker-uid proof covers.
  *   - issue #1716: a `toolEnv` entry can NEVER inject git config (GIT_CONFIG_COUNT,
  *     GIT_CONFIG_KEY_n/VALUE_n, GIT_CONFIG_PARAMETERS); run() adds the worker's own
  *     trust afterwards ({@link withCommandGitTrust}).
  */
-export function buildCommandEnv(tmpdir: string, toolEnv: Record<string, string>, dockerHost?: string): NodeJS.ProcessEnv {
+export function buildCommandEnv(tmpdir: string, toolEnv: Record<string, string>, dockerHost?: string, browserDiscovery = false): NodeJS.ProcessEnv {
   const provisionedPath = toolEnv.PATH;
   const env: NodeJS.ProcessEnv = {
     // The fixed boundary dirs come first; a provisioned PATH is appended (never prepended,
@@ -7617,6 +7643,7 @@ export function buildCommandEnv(tmpdir: string, toolEnv: Record<string, string>,
   // Issue #3382: the worker's optional Go build concurrency defaults, applied after the fold.
   Object.assign(env, goConcurrencyEnv());
   if (dockerHost !== undefined) env.DOCKER_HOST = dockerHost;
+  if (browserDiscovery) Object.assign(env, BROWSER_DISCOVERY_ENV);
   return env;
 }
 

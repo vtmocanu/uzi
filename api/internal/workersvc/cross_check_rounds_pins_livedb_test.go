@@ -270,7 +270,7 @@ func TestCrossCheckRoundsPinsFleetPlacementLiveDB(t *testing.T) {
 				// Test refusal of new foreign work, rather than draining this worker's pinned child.
 				env.exec("UPDATE runs SET worker_id=NULL WHERE id=$1 AND status='queued'", uuid.UUID(cc.CheckerRunID.Bytes))
 			case "round2 runtime missing":
-				caps = []string{capability.CrossCheckV1, capability.CrossCheckRoundsV1, capability.CrossCheckPinsV1, capability.CodexCustomModelV1, capability.CodexHarnessV1}
+				caps = []string{capability.CrossCheckV1, capability.CrossCheckRoundsV1, capability.CrossCheckPinsV1, capability.CodexCustomModelV1, capability.CodexHarnessV1, capability.CrossCheckOwnerSteeringV1}
 			}
 			env.exec("UPDATE workers SET protocol_capabilities=$2 WHERE id=$1", w.ID, caps)
 			child := uuid.UUID(cc.CheckerRunID.Bytes)

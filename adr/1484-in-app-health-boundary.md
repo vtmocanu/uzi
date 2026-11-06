@@ -37,7 +37,7 @@ today: `automountServiceAccountToken: false` on the api Deployment
 that walks the whole `api` build graph. The controller's own RBAC (`Role`s in
 `deploy/chart/templates/worker-rbac.yaml`) is scoped to the two worker namespaces,
 where its access to pods is `pods: ["list"]` and nothing more — no `get`, no
-`watch`, no pod logs; there is no `ClusterRole` in the chart and no
+`watch`, no pod logs; there is no `ClusterRole` in the chart (but one: see the #3890 note below) and no
 Role at all on the release namespace where `api`, `web`, the database, and the
 controller itself run. Building this feature by widening any of that would trade a
 credential-free `api` — the security boundary the hosted-worker feature's own RBAC
@@ -92,6 +92,7 @@ this one.
 - `deploy/chart/templates/worker-rbac.yaml` and every other RBAC object in the
   chart are unchanged by this feature; there is no new `Role`, no new
   `ClusterRole`, no widened verb set.
+  **Supersession note (#3890, 2026-11-04):** the chart now carries exactly one `ClusterRole`, `<fullname>-controller-storageclass-read` (`get` on `storageclasses`, nothing else), an owner-authorized exception added later for PVC expansion. This feature still reads no Kubernetes API and adds no RBAC of its own. See [ADR-3890](3890-worker-pvc-expansion.md).
 - The wire contract of `POST /api/controller/status` is unchanged; the controller
   needed no code change to make its existing report useful to this feature.
 - A future contributor proposing to read pod state, node state, or any other

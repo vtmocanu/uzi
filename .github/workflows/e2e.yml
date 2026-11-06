@@ -133,6 +133,8 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      # Only scheduled or manual main runs update the nightly tracker; branch dispatches
+      # validate changes before merge and must not count against main's nightly streak.
       # On failure or a timed-out lane, keep exactly ONE open issue PER LANE: comment on the existing one,
       # else open it. Uses the built-in GITHUB_TOKEN (no PAT). The label is upserted
       # first so the `gh issue list --label` lookup cannot error on a missing label.
@@ -140,7 +142,7 @@ jobs:
       # and avoids a create race between the parallel matrix lanes. The body embeds
       # summary.md so the tracker shows every failing phase, not just a run URL.
       - name: Open or update failure issue
-        if: ${{ failure() || cancelled() }}
+        if: ${{ (failure() || cancelled()) && (github.event_name == 'schedule' || github.ref == 'refs/heads/main') }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FORGE_LANE: ${{ matrix.forge }}

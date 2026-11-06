@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
@@ -123,5 +124,32 @@ func TestCrossCheckStatusLegacyAndErrorRemainUnmarked(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCheckerClaimResponseOwnerSteeringHeader(t *testing.T) {
+	snapshot := `{"version":1}`
+	sum := sha256.Sum256([]byte(snapshot))
+	p := checkerResponseFixture(t)
+	rec := httptest.NewRecorder()
+	writeWorkerRunClaim(rec, p)
+	if rec.Code != http.StatusOK || rec.Header().Get("X-Uzi-Owner-Steering") != "" || strings.Contains(rec.Body.String(), "cross_check_owner_steering") {
+		t.Fatal("claim without steering carries the marker or field")
+	}
+	p.CrossCheckOwnerSteering = &workersvc.ClaimOwnerSteering{Snapshot: snapshot, Digest: hex.EncodeToString(sum[:])}
+	rec = httptest.NewRecorder()
+	writeWorkerRunClaim(rec, p)
+	if rec.Code != http.StatusOK || rec.Header().Get("X-Uzi-Owner-Steering") != "v1" {
+		t.Fatalf("steering claim: status=%d marker=%q", rec.Code, rec.Header().Get("X-Uzi-Owner-Steering"))
+	}
+	var decoded workersvc.ClaimPayload
+	if err := json.Unmarshal(rec.Body.Bytes(), &decoded); err != nil || decoded.CrossCheckOwnerSteering == nil || decoded.CrossCheckOwnerSteering.Snapshot != snapshot {
+		t.Fatalf("steering bytes not delivered unchanged: %v", err)
+	}
+	p.CrossCheckOwnerSteering.Digest = strings.Repeat("0", 64)
+	rec = httptest.NewRecorder()
+	writeWorkerRunClaim(rec, p)
+	if rec.Code != http.StatusInternalServerError || rec.Header().Get("X-Uzi-Owner-Steering") != "" {
+		t.Fatal("tampered steering delivered")
 	}
 }

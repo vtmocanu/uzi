@@ -103,5 +103,6 @@ func settingRowsTable(rows []settingRow) [][]string {
 
 // settingsModelRows collects every setting family's rows for `uzi settings get`.
 func settingsModelRows(s apitypes.UserSettingsDTO) []settingRow {
-	return append(modelSettingRows("judge", s.JudgeModels), effortSettingRows(s.EffortSettings)...)
+	rows := append(modelSettingRows("judge", s.JudgeModels), modelSettingRows("summary", s.SummaryModels)...)
+	return append(rows, effortSettingRows(s.EffortSettings)...)
 }

@@ -20,7 +20,7 @@ import (
 // "pooled nothing" from "pooled one token, and it is excluded".
 func TestSelectPoolNonEmptyWhenSoleTokenExcluded(t *testing.T) {
 	only := cand(1, 90, at(time.Hour)) // fresh, eligible, about to be excluded
-	got := Select([]Candidate{only}, id(1), testPolicy(), now)
+	got := Select([]Candidate{only}, id(1), headroomFirstPolicy(), now)
 	if got.Picked {
 		t.Fatalf("excluding the only pooled token still picked %v", got.SecretID)
 	}
@@ -48,7 +48,7 @@ func TestSelectPoolNonEmptyFalseWhenNothingPooled(t *testing.T) {
 		{"a candidate that is not pooled", []Candidate{unpooled}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := Select(tc.cands, uuid.Nil, testPolicy(), now)
+			got := Select(tc.cands, uuid.Nil, headroomFirstPolicy(), now)
 			if got.Reason != ReasonPoolEmpty {
 				t.Fatalf("reason = %q, want %q", got.Reason, ReasonPoolEmpty)
 			}
@@ -62,7 +62,7 @@ func TestSelectPoolNonEmptyFalseWhenNothingPooled(t *testing.T) {
 // TestSelectPoolNonEmptyOnSuccessfulPick: an ordinary pick reports PoolNonEmpty=true,
 // so the field is populated on the Picked return too, not only the fallback returns.
 func TestSelectPoolNonEmptyOnSuccessfulPick(t *testing.T) {
-	got := Select([]Candidate{cand(1, 80, at(time.Hour))}, uuid.Nil, testPolicy(), now)
+	got := Select([]Candidate{cand(1, 80, at(time.Hour))}, uuid.Nil, headroomFirstPolicy(), now)
 	if !got.Picked {
 		t.Fatalf("picked nothing (reason %q); the fixture is a healthy eligible token", got.Reason)
 	}
@@ -80,7 +80,7 @@ func TestFloorReturnsSoleStaleToken(t *testing.T) {
 	stale := cand(1, 80, at(time.Hour))
 	stale.SyncedAt = at(-99 * time.Hour) // aged out ⇒ Select cannot pick it
 
-	if got := Select([]Candidate{stale}, uuid.Nil, testPolicy(), now); got.Picked {
+	if got := Select([]Candidate{stale}, uuid.Nil, headroomFirstPolicy(), now); got.Picked {
 		t.Fatalf("Select picked %v; the fixture is meant to be unrankable", got.SecretID)
 	}
 	sid, ok := Floor([]Candidate{stale}, uuid.Nil, now)
@@ -143,7 +143,7 @@ func TestFloorEmptyPool(t *testing.T) {
 	if _, ok := Floor([]Candidate{only}, id(1), now); ok {
 		t.Fatalf("Floor over the excluded sole token ok = true, want false")
 	}
-	if out := Select([]Candidate{only}, id(1), testPolicy(), now); !out.PoolNonEmpty {
+	if out := Select([]Candidate{only}, id(1), headroomFirstPolicy(), now); !out.PoolNonEmpty {
 		t.Fatalf("Select PoolNonEmpty = false, want true — the pool has one member, it is just excluded")
 	}
 }
@@ -165,7 +165,7 @@ func TestFloorOrderIndependent(t *testing.T) {
 	if !ok {
 		t.Fatalf("baseline Floor found nothing")
 	}
-	rng := rand.New(rand.NewSource(4242))
+	rng := rand.New(rand.NewSource(4242)) //nolint:gosec // G404: a deterministic seed is the point — this asserts Floor is order-independent, not a security context
 	for i := 0; i < 200; i++ {
 		shuffled := append([]Candidate(nil), cands...)
 		rng.Shuffle(len(shuffled), func(a, b int) { shuffled[a], shuffled[b] = shuffled[b], shuffled[a] })

@@ -275,8 +275,24 @@ async function purgeChildrenAsAgents(target: string): Promise<void> {
  * one costs a resumed run time, never state. Nothing outside this list is ever deleted
  * by {@link rmHomeSubtree}: the session transcript, `.claude.json`, `go/bin` and every
  * unknown file stay. Adding an entry needs code evidence that it is rebuildable.
+ *
+ * The one other name {@link rmHomeSubtree} accepts is not a cache: the park-only managed Go
+ * scratch leaf `.uzi-go-work/g<N>` ({@link isParkScratchSubtree}), which is never listed here
+ * and never measured or trimmed as a cache.
  */
 export const RUN_CACHE_SUBTREES = [".cache/go-build", "go/pkg/mod", ".npm/_cacache"] as const;
+
+/** One leaf of the managed Go work dir: `g` plus a positive decimal generation, at most 16 digits. */
+const PARK_SCRATCH_RE = /^\.uzi-go-work\/g([1-9][0-9]{0,15})$/;
+
+/**
+ * True for exactly `.uzi-go-work/g<N>` (N a positive safe integer). The parent `.uzi-go-work`,
+ * a deeper path, a leading-zero or non-numeric leaf, and any other spelling are not park scratch.
+ */
+export function isParkScratchSubtree(rel: string): boolean {
+  const m = PARK_SCRATCH_RE.exec(rel);
+  return m !== null && Number.isSafeInteger(Number(m[1]));
+}
 
 type RunCacheSubtree = (typeof RUN_CACHE_SUBTREES)[number];
 
@@ -754,8 +770,9 @@ export interface SubtreeRemovalOptions {
 }
 
 /**
- * PRD #1809 D3: remove ONE named cache subtree (a {@link RUN_CACHE_SUBTREES} entry)
- * inside a run HOME, leaving the HOME root and every sibling intact. Resolves "removed"
+ * PRD #1809 D3: remove ONE named cache subtree (a {@link RUN_CACHE_SUBTREES} entry, or the
+ * park-only scratch leaf {@link isParkScratchSubtree}, which is not a cache and is never used
+ * for cache eviction) inside a run HOME, leaving the HOME root and every sibling intact. Resolves "removed"
  * or "absent" (nothing to drop); throws on a refusal, on an exhausted budget or deadline,
  * or when the subtree is still there.
  *
@@ -791,7 +808,7 @@ export async function rmHomeSubtree(
   // The helper takes both as bare `node -e` arguments, so a relative or dash-leading
   // HOME, or an unlisted `rel`, is refused before anything runs.
   if (!path.isAbsolute(home)) throw new Error(`rmHomeSubtree: refusing non-absolute HOME ${home}`);
-  if (!isRunCacheSubtree(rel)) {
+  if (!isRunCacheSubtree(rel) && !isParkScratchSubtree(rel)) {
     throw new Error(`rmHomeSubtree: refusing ${JSON.stringify(rel)}, not a listed cache subtree`);
   }
   const wrappers = opts.wrappers ?? agentWrappers("remove");

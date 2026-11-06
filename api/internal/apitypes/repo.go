@@ -14,6 +14,7 @@ type RepoDTO struct {
 	DefaultBranch                     *string `json:"default_branch"`
 	Enabled                           bool    `json:"enabled"`
 	RepoSkillsEnabled                 bool    `json:"repo_skills_enabled"`
+	AgentSourceDefault                *string `json:"agent_source_default"`
 	// RepoClaudemdEnabled is the trusted-repo instructions opt-in (PRD #246): when
 	// true, the lead reads the clone's root CLAUDE.md as a nonce-fenced,
 	// UNTRUSTED/ADVISORY block. Independent of RepoSkillsEnabled (both sit under the

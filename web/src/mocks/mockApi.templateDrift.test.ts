@@ -56,6 +56,7 @@ describe("the drift fixture set still discriminates (issue #201 M4a)", () => {
       return [
         row.description !== def.description && "description",
         (row.model ?? "") !== (def.model ?? "") && "model",
+        (row.codex_model ?? "") !== (def.codex_model ?? "") && "codex_model",
         row.prompt_body !== def.prompt_body && "prompt_body",
         (a.length !== b.length || a.some((t, i) => t !== b[i])) && "tools",
       ].filter(Boolean);

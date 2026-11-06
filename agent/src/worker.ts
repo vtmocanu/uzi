@@ -118,6 +118,8 @@ export class Worker {
     // issue #1759 M3: the DinD prune controller, present only on a docker worker with
     // UZI_DIND_PRUNE_ENABLED=true (createDindPrune). Its gate pauses BOTH claim loops while
     // a prune holds it; the heartbeat feeds it the custody flag; run() starts its loop.
+    // Issue #3891: that loop also runs the optional anonymous-volume leg, which ignores
+    // idleness and custody and never holds the gate.
     private readonly dindPrune?: DindPruneController,
     // PRD #1809 D5/D7: the disk-pressure controller, present when UZI_DISK_RECLAIM or
     // UZI_DISK_ADMISSION is on. The heartbeat feeds it each data-volume sample, the run lane
@@ -1031,11 +1033,16 @@ export class Worker {
           // UNCONDITIONALLY: the api makes each a hard claim clause of its semantic runs only,
           // so structural/legacy claims are unaffected.
           "cross_check_semantic_plan_v1",
+          // Issue #3841: this image reads the frozen owner-steering sibling of a plan cross-check
+          // claim. Advertised UNCONDITIONALLY; the api sends it only to a worker advertising it.
+          "cross_check_owner_steering_v1",
           "completion_semantic_publication_v1",
           // Default-branch CI repair (issue #2865): this image enforces claim.config.ci_config_guard
           // at the early check and immediately before every final push. Advertised UNCONDITIONALLY:
           // the api offers a guarded repair run only to a worker advertising it.
           "ci_config_guard_v1",
+          "repo_agent_source_v1",
+          "agent_source_request_v1",
           // Verified artifact files use Linux descriptor anchoring; other hosts remain logs-only.
           ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),
         ];

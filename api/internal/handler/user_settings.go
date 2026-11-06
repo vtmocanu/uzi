@@ -55,6 +55,9 @@ type userSettingsDTO struct {
 	// Codex judge model; a value is a curated Codex id.
 	CodexJudgeModel *string `json:"codex_judge_model"`
 	SummaryModel    *string `json:"summary_model"`
+	// CodexSummaryModel is the Codex summary lane (PRD #3248): null = inherit the
+	// instance Codex summary model; a value is a Codex role id.
+	CodexSummaryModel *string `json:"codex_summary_model"`
 	// Theme is the DEPRECATED legacy single-theme override (PRD #21); kept one
 	// release. The appearance override lives in the four fields below (PRD #1167).
 	Theme *string `json:"theme"`
@@ -88,6 +91,9 @@ type userSettingsDTO struct {
 	// JudgeModels is the read-only resolved view of both judge lanes (PRD #3245), ordered
 	// claude then codex. It is never accepted on a PUT.
 	JudgeModels []apitypes.ModelSettingCellDTO `json:"judge_models"`
+	// SummaryModels is the read-only resolved view of both summary lanes (PRD #3248),
+	// ordered claude then codex. It is never accepted on a PUT.
+	SummaryModels []apitypes.ModelSettingCellDTO `json:"summary_models"`
 	// EffortSettings is the read-only resolved view of both ordinary effort preferences
 	// (PRD #3247), ordered claude then codex. It is never accepted on a PUT.
 	EffortSettings []apitypes.EffortSettingCellDTO `json:"effort_settings"`
@@ -161,19 +167,24 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 	// back to the built-ins rather than failing the settings read.
 	instance := map[string]string{}
 	if h.settings != nil {
-		vals, ierr := h.settings.InstanceModels(r.Context(), []string{settings.KeyJudgeModel, settings.KeyCodexJudgeModel})
+		vals, ierr := h.settings.InstanceModels(r.Context(), []string{
+			settings.KeyJudgeModel, settings.KeyCodexJudgeModel,
+			settings.KeySummaryModel, settings.KeyCodexSummaryModel,
+		})
 		if ierr != nil {
-			slog.Error("read instance judge models", "error", ierr)
+			slog.Error("read instance judge and summary models", "error", ierr)
 		} else {
 			instance = vals
 		}
 	}
 	judgeLane := textPtrValue(s.JudgeModel.Valid, s.JudgeModel.String)
 	codexJudgeLane := textPtrValue(s.CodexJudgeModel.Valid, s.CodexJudgeModel.String)
-	// summary_model rides the GetUserSettings one-row read (it is the same users row),
-	// so the settings surface reads it from `s` — no separate query. GetUserSummaryModel
-	// stays the narrow read for issue-run claim assembly, where no other user field is
-	// needed (PRD #362 M2).
+	// summary_model and codex_summary_model ride the GetUserSettings one-row read (the
+	// same users row), so the settings surface reads them from `s` — no separate query.
+	// GetUserSummaryModels stays the narrow read for issue-run claim assembly, where no
+	// other user field is needed (PRD #362 M2, PRD #3248).
+	summaryLane := textPtrValue(s.SummaryModel.Valid, s.SummaryModel.String)
+	codexSummaryLane := textPtrValue(s.CodexSummaryModel.Valid, s.CodexSummaryModel.String)
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"settings": userSettingsDTO{
 			VaultAutoReunlock:      settingsAutoReunlock(r),
@@ -185,7 +196,8 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 			DefaultCodexEffort:     textPtrValue(s.DefaultCodexEffort.Valid, s.DefaultCodexEffort.String),
 			JudgeModel:             judgeLane,
 			CodexJudgeModel:        codexJudgeLane,
-			SummaryModel:           textPtrValue(s.SummaryModel.Valid, s.SummaryModel.String),
+			SummaryModel:           summaryLane,
+			CodexSummaryModel:      codexSummaryLane,
 			Theme:                  textPtrValue(s.Theme.Valid, s.Theme.String),
 			MrReworkEnabled:        boolPtrValue(s.MrReworkEnabled),
 			NowSummaryEnabled:      boolPtrValue(s.NowSummaryEnabled),
@@ -197,6 +209,7 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 			Typeface:               textPtrValue(s.Typeface.Valid, s.Typeface.String),
 			DefaultHarness:         textPtrValue(s.DefaultHarness.Valid, s.DefaultHarness.String),
 			JudgeModels:            judgeModelCells(judgeLane, codexJudgeLane, instance),
+			SummaryModels:          summaryModelCells(summaryLane, codexSummaryLane, instance),
 			EffortSettings: effortSettingCells(
 				textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String),
 				textPtrValue(s.DefaultCodexEffort.Valid, s.DefaultCodexEffort.String)),
@@ -275,6 +288,7 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		JudgeModel         json.RawMessage `json:"judge_model"`
 		CodexJudgeModel    json.RawMessage `json:"codex_judge_model"`
 		SummaryModel       json.RawMessage `json:"summary_model"`
+		CodexSummaryModel  json.RawMessage `json:"codex_summary_model"`
 		Theme              json.RawMessage `json:"theme"`
 		MrReworkEnabled    json.RawMessage `json:"mr_rework_enabled"`
 		NowSummaryEnabled  json.RawMessage `json:"now_summary_enabled"`
@@ -441,14 +455,31 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusBadRequest, "invalid summary_model")
 			return
 		}
-		// Same validator as judge_model (PRD #362 M2): nil/blank trims to NULL =
-		// inherit the instance summary_model; a bad model is a 400.
-		v, err := validateModel(raw)
+		// Same Claude-lane validator as judge_model (PRD #362 M2, PRD #3248): nil/blank
+		// trims to NULL = inherit the instance summary_model; a bad model or a Codex
+		// role id is a 400.
+		v, err := validateClaudeJudgeModel(raw)
 		if err != nil {
-			httpx.Error(w, http.StatusBadRequest, err.Error())
+			httpx.Error(w, http.StatusBadRequest, "summary_model: "+err.Error())
 			return
 		}
 		summaryVal = v
+	}
+
+	var codexSummaryVal pgtype.Text
+	codexSummaryPresent := req.CodexSummaryModel != nil
+	if codexSummaryPresent {
+		var raw *string
+		if err := json.Unmarshal(req.CodexSummaryModel, &raw); err != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid codex_summary_model")
+			return
+		}
+		v, err := validateCodexSummaryModel(raw)
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, "codex_summary_model: "+err.Error())
+			return
+		}
+		codexSummaryVal = v
 	}
 
 	// The legacy theme field (DEPRECATED, PRD #1167) still writes users.theme via
@@ -715,6 +746,17 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			SummaryModel: summaryVal,
 		}); err != nil {
 			slog.Error("set user summary model", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	if codexSummaryPresent {
+		if _, err := h.q.SetUserCodexSummaryModel(r.Context(), store.SetUserCodexSummaryModelParams{
+			ID:                user.ID,
+			CodexSummaryModel: codexSummaryVal,
+		}); err != nil {
+			slog.Error("set user codex summary model", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}

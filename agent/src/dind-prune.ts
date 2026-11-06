@@ -31,7 +31,11 @@
 // Stopped containers are NEVER removed (no `container prune`, no `rm`): the run harness
 // creates no labelled containers this worker could prove it owns, so any stopped
 // container may be a user's deliberate state. `image prune` only removes images no
-// container (running or stopped) references, and volumes are never touched.
+// container (running or stopped) references, and THIS controller never touches volumes.
+// The one volume exception is issue #3891's separate pressure-only anonymous-volume leg
+// (dind-volume-prune.ts), which has its own loop, runs even on a busy or custody-held
+// worker, never closes this gate, and never removes images, build cache, containers or
+// named volumes.
 //
 // The commands run as the WORKER uid, not through the runner-uid wrapper: they carry no
 // model or repo input (the argv is a frozen constant, validated again at exec time),
@@ -50,6 +54,7 @@ import { join } from "node:path";
 import type { Config } from "./config.js";
 import type { Logger } from "./log.js";
 import { readDindMeterSample, type DindMeterSample } from "./dind-meter.js";
+import type { DindVolumePruneController } from "./dind-volume-prune.js";
 import { errMessage, sleep as abortableSleep } from "./util.js";
 
 /** Pressure threshold: a sample at or above this fraction of bytes OR inodes is "over". */
@@ -57,13 +62,13 @@ const HIGH_WATERMARK = 0.85;
 /** Re-arm threshold: after an attempt, a sample below this on BOTH bytes and inodes re-arms. */
 const LOW_WATERMARK = 0.75;
 /** Consecutive distinct over-threshold samples needed to trigger (debounce). */
-const TRIGGER_STREAK = 2;
+export const TRIGGER_STREAK = 2;
 /** After an attempt (any outcome), re-trigger no sooner than this unless re-armed by LOW_WATERMARK. */
-const BACKOFF_MS = 60 * 60_000;
+export const BACKOFF_MS = 60 * 60_000;
 /** Evaluation cadence: matches the meter's 30s sampling interval. */
-const TICK_MS = 30_000;
+export const TICK_MS = 30_000;
 /** Two over samples further apart than this (1.5 meter intervals) are not consecutive. */
-const MAX_CONSECUTIVE_GAP_S = 45;
+export const MAX_CONSECUTIVE_GAP_S = 45;
 /** Bound on waiting for claims that were in flight when the gate closed. */
 const CLAIM_DRAIN_TIMEOUT_MS = 60_000;
 const CLAIM_DRAIN_POLL_MS = 250;
@@ -90,8 +95,10 @@ const POST_SAMPLE_POLL_MS = 5_000;
 const MAX_STDOUT_BYTES = 16 * 1024 * 1024;
 
 /**
- * THE ONLY docker argv this module ever runs, frozen. Deliberately absent: `volume prune`,
- * `system prune`, `--volumes`, `container prune`, `rm`/`rmi` of anything by name.
+ * THE ONLY docker argv this controller ever runs, frozen. Deliberately absent: `volume prune`
+ * (issue #3891's separate leg in dind-volume-prune.ts owns its own exact-match guard and
+ * this table still rejects it), `system prune`, `--volumes`, `container prune`, `rm`/`rmi`
+ * of anything by name.
  */
 export const DIND_PRUNE_ARGV = Object.freeze({
   /** Running containers; any output aborts the attempt. */
@@ -284,6 +291,10 @@ export interface DindPruneOptions {
   /** Wall clock, epoch ms. */
   now?: () => number;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+  /** Issue #3891: the pressure-only anonymous-volume prune leg (dind-volume-prune.ts). It
+   *  has its own loop/streak/backoff, runs concurrently with this controller's loop and
+   *  never closes the gate. Type-only import: no runtime edge from this module to the leg. */
+  volumeLeg?: DindVolumePruneController;
 }
 
 /**
@@ -304,15 +315,15 @@ export function createDindPrune(
   });
 }
 
-function isOver(s: DindMeterSample): boolean {
+export function isOver(s: DindMeterSample): boolean {
   return s.bytesUsed / s.bytesTotal >= HIGH_WATERMARK || s.inodesUsed / s.inodesTotal >= HIGH_WATERMARK;
 }
 
-function isBelowLow(s: DindMeterSample): boolean {
+export function isBelowLow(s: DindMeterSample): boolean {
   return s.bytesUsed / s.bytesTotal < LOW_WATERMARK && s.inodesUsed / s.inodesTotal < LOW_WATERMARK;
 }
 
-function ratios(s: DindMeterSample): Record<string, number> {
+export function ratios(s: DindMeterSample): Record<string, number> {
   return {
     bytes_pct: Math.round((s.bytesUsed / s.bytesTotal) * 1000) / 10,
     inodes_pct: Math.round((s.inodesUsed / s.inodesTotal) * 1000) / 10,
@@ -330,6 +341,7 @@ export class DindPruneController {
   private readonly exec: DockerExec;
   private readonly now: () => number;
   private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
+  private readonly volumeLeg?: DindVolumePruneController;
 
   private workerId?: string;
   private custody?: { retaining: boolean | undefined; atMs: number };
@@ -362,11 +374,13 @@ export class DindPruneController {
     this.exec = opts.exec ?? execDocker;
     this.now = opts.now ?? Date.now;
     this.sleep = opts.sleep ?? abortableSleep;
+    this.volumeLeg = opts.volumeLeg;
   }
 
   /** The api-assigned worker id, once registration returns it. */
   setWorkerId(id: string | undefined): void {
     if (id) this.workerId = id;
+    this.volumeLeg?.setWorkerId(id);
   }
 
   /** Record the custody flag from a SUCCESSFUL heartbeat (undefined when the response
@@ -384,8 +398,14 @@ export class DindPruneController {
     this.lastBusyAtMs = this.now();
   }
 
-  /** Evaluate every TICK_MS until abort. Never throws. */
+  /** Runs the cache loop and, when wired, the volume leg's independent loop (issue #3891)
+   *  concurrently. Neither can starve the other; the leg's loop never rejects. */
   async loop(signal: AbortSignal): Promise<void> {
+    await Promise.all([this.cacheLoop(signal), this.volumeLeg?.loop(signal)]);
+  }
+
+  /** Evaluate every TICK_MS until abort. Never throws. */
+  private async cacheLoop(signal: AbortSignal): Promise<void> {
     while (!signal.aborted) {
       try {
         await this.tick(signal);

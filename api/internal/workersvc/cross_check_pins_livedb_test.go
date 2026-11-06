@@ -21,7 +21,7 @@ func setCheckerPin(f crossCheckContentionFixture, harness string, model, effort 
 }
 
 func checkerPinCaps(pins, custom bool) []string {
-	caps := []string{capability.CrossCheckV1, capability.CodexHarnessV1, capability.CodexRuntimeV2}
+	caps := []string{capability.CrossCheckV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CrossCheckOwnerSteeringV1}
 	if pins {
 		caps = append(caps, capability.CrossCheckPinsV1)
 	}

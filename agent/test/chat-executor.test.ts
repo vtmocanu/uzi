@@ -338,7 +338,8 @@ describe("ChatExecutor session env + assembly", () => {
         // Core keys + TMPDIR (5-bis per-uid scratch, when the ambient env has one); TMPDIR is not a secret.
         // AGENT_BROWSER_ARGS is a non-secret browser launch FLAG (buildSdkEnv, issue #709) — it guarantees
         // --no-sandbox survives a shim bypass; it is not a credential or a worktree path.
-        const expectedEnvKeys = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENT_BROWSER_ARGS"]);
+        const expectedEnvKeys = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENT_BROWSER_ARGS",
+          "AGENT_BROWSER_EXECUTABLE_PATH", "CHROME_PATH"]);
         if (process.env.UZI_RUNNER_TMPDIR || process.env.TMPDIR) expectedEnvKeys.add("TMPDIR");
         if (sqlcDir !== undefined) expectedEnvKeys.add("UZI_SQLC_DIR");
         assert.deepStrictEqual(new Set(Object.keys(o.env!)), expectedEnvKeys);

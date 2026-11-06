@@ -172,6 +172,7 @@ type fakeStore struct {
 	// instance value unchanged. summaryModelErr models a user-row read fault, which
 	// must fall back to the instance value best-effort (never an empty model).
 	summaryModel        pgtype.Text
+	codexSummaryModel   pgtype.Text // the Codex lane (PRD #3248)
 	summaryModelErr     error
 	templates           []store.AgentTemplate
 	skillAllocations    []store.ListRunSkillAllocationsRow
@@ -223,9 +224,13 @@ type fakeStore struct {
 	activeRunsAllErr error
 
 	// Ownership + messages + state.
-	runOwned             store.Run
-	runOwnedErr          error
-	livePublishAttemptID uuid.UUID
+	runOwned    store.Run
+	runOwnedErr error
+	// Issue #3937: GetRunOwnershipByWorker returns runOwned/runOwnedErr plus this explicitly
+	// configured held-seam cancel signal, and records its params.
+	cancellationRequested bool
+	ownershipParams       *store.GetRunOwnershipByWorkerParams
+	livePublishAttemptID  uuid.UUID
 	// Orphan-classification read (issue #1319): orphanParams captures the args so a test
 	// can prove the owner-scope (user_id + the claimant's repo_id, NOT worker_id);
 	// orphanRow/orphanErr drive the return.
@@ -336,7 +341,15 @@ type fakeStore struct {
 	stampWorkerStaleCutoff pgtype.Timestamptz
 	stampRows              int64
 	// Rows the sweep queries return (PRD #25 M3): each drives a published transition.
-	sweptClaimed       []store.SweepClaimedNeverStartedRow
+	sweptClaimed []store.SweepClaimedNeverStartedRow
+	// Issue #3859: the claimed-never-started charge pass and the registration evidence write.
+	chargedClaimed     []store.ChargeClaimedNeverStartedContinuationsRow
+	cohortArg          *store.SweepClaimedNeverStartedCohortParams
+	unwitnessedClaimed []store.ParkUnwitnessedContinuationsRow
+	chargeErr          error
+	evidenceArgs       []store.RecordRunRegistrationEvidenceParams
+	evidenceRows       int64
+	evidenceErr        error
 	sweptUndispatched  []store.SweepTaskNeverDispatchedRow // issue #1367
 	sweptWallRequested []store.RequestWallParksRow         // PRD #1497 M1: RequestWallParks rows
 	sweptWallParked    []store.ParkRunsAtWallRow           // PRD #1497 M1: ParkRunsAtWall rows
@@ -621,6 +634,9 @@ type fakeStore struct {
 	// was called with (the reconciler).
 	openCustodyHolds           int64
 	countCustodyWorkerParams   *store.CountOpenCustodyHoldsForWorkerParams
+	listCustodyWorkerParams    *store.ListOpenCustodyHoldsForWorkerParams
+	listCustodyRows            []store.ListOpenCustodyHoldsForWorkerRow
+	listCustodyErr             error
 	releasableHolds            []store.ListReleasableCustodyHoldsRow
 	releaseCustodyRows         int64
 	releasedCustodyRuns        []uuid.UUID
@@ -1047,8 +1063,8 @@ func (f *fakeStore) GetUserAttributionEnabled(context.Context, uuid.UUID) (bool,
 func (f *fakeStore) GetUserJudgeModels(context.Context, uuid.UUID) (store.GetUserJudgeModelsRow, error) {
 	return store.GetUserJudgeModelsRow{JudgeModel: f.judgeModel, CodexJudgeModel: f.codexJudgeModel}, f.judgeModelErr
 }
-func (f *fakeStore) GetUserSummaryModel(context.Context, uuid.UUID) (pgtype.Text, error) {
-	return f.summaryModel, f.summaryModelErr
+func (f *fakeStore) GetUserSummaryModels(context.Context, uuid.UUID) (store.GetUserSummaryModelsRow, error) {
+	return store.GetUserSummaryModelsRow{SummaryModel: f.summaryModel, CodexSummaryModel: f.codexSummaryModel}, f.summaryModelErr
 }
 func (f *fakeStore) ListClaimAgentTemplates(context.Context, pgtype.UUID) ([]store.AgentTemplate, error) {
 	return f.templates, nil
@@ -1093,6 +1109,10 @@ func (f *fakeStore) MarkCheckpointPublishAttemptReady(_ context.Context, id uuid
 
 func (f *fakeStore) GetRunOwnedByWorker(context.Context, store.GetRunOwnedByWorkerParams) (store.Run, error) {
 	return f.runOwned, f.runOwnedErr
+}
+func (f *fakeStore) GetRunOwnershipByWorker(_ context.Context, arg store.GetRunOwnershipByWorkerParams) (store.GetRunOwnershipByWorkerRow, error) {
+	f.ownershipParams = &arg
+	return store.GetRunOwnershipByWorkerRow{Run: f.runOwned, CancellationRequested: f.cancellationRequested}, f.runOwnedErr
 }
 func (f *fakeStore) GetRunOrphanIdentity(_ context.Context, arg store.GetRunOrphanIdentityParams) (store.GetRunOrphanIdentityRow, error) {
 	f.orphanParams = &arg
@@ -1409,10 +1429,15 @@ func (f *fakeStore) MarkStaleWorkersOffline(_ context.Context, cutoff pgtype.Tim
 	f.callOrder = append(f.callOrder, "mark_stale")
 	return 0, nil
 }
-func (f *fakeStore) SweepClaimedNeverStarted(_ context.Context, cutoff pgtype.Timestamptz) ([]store.SweepClaimedNeverStartedRow, error) {
-	f.claimCutoff = cutoff
+func (f *fakeStore) SweepClaimedNeverStartedCohort(_ context.Context, arg store.SweepClaimedNeverStartedCohortParams) (store.SweepClaimedNeverStartedCohortResult, error) {
+	f.cohortArg = &arg
+	f.claimCutoff = arg.Cutoff
 	f.callOrder = append(f.callOrder, "claimed_never_started")
-	return f.sweptClaimed, nil
+	return store.SweepClaimedNeverStartedCohortResult{Charged: f.chargedClaimed, Unwitnessed: f.unwitnessedClaimed, Reset: f.sweptClaimed}, f.chargeErr
+}
+func (f *fakeStore) RecordRunRegistrationEvidence(_ context.Context, arg store.RecordRunRegistrationEvidenceParams) (int64, error) {
+	f.evidenceArgs = append(f.evidenceArgs, arg)
+	return f.evidenceRows, f.evidenceErr
 }
 func (f *fakeStore) SweepTaskNeverDispatched(_ context.Context, arg store.SweepTaskNeverDispatchedParams) ([]store.SweepTaskNeverDispatchedRow, error) {
 	f.taskDispatchCutoff = arg.Cutoff
@@ -1705,6 +1730,13 @@ func (f *fakeStore) CancelRunByWorker(_ context.Context, arg store.CancelRunByWo
 	return 1, nil
 }
 
+// CancelRunByWorkerSettlingCancel (issue #3860) is the settling variant SetState's
+// stop_kind='cancelled' arm uses. It records into the same cancelledByWorker slot with the
+// same rows semantics, so the tests that assert the cancelled arm keep their meaning.
+func (f *fakeStore) CancelRunByWorkerSettlingCancel(ctx context.Context, arg store.CancelRunByWorkerSettlingCancelParams) (int64, error) {
+	return f.CancelRunByWorker(ctx, store.CancelRunByWorkerParams(arg))
+}
+
 // SupersedeRunByWorker records a live-worker branch_moved supersession and its
 // server-composed reason. Returns 1 (applied) like the CancelRunByWorker fake.
 func (f *fakeStore) SupersedeRunByWorker(_ context.Context, arg store.SupersedeRunByWorkerParams) (int64, error) {
@@ -1854,6 +1886,10 @@ func (f *fakeStore) CountOpenCustodyHoldsForWorker(_ context.Context, arg store.
 	f.countCustodyWorkerParams = &arg
 	return f.openCustodyHolds, nil
 }
+func (f *fakeStore) ListOpenCustodyHoldsForWorker(_ context.Context, arg store.ListOpenCustodyHoldsForWorkerParams) ([]store.ListOpenCustodyHoldsForWorkerRow, error) {
+	f.listCustodyWorkerParams = &arg
+	return f.listCustodyRows, f.listCustodyErr
+}
 func (f *fakeStore) GetCustodyAdmissionForRun(_ context.Context, _ store.GetCustodyAdmissionForRunParams) (store.GetCustodyAdmissionForRunRow, error) {
 	return store.GetCustodyAdmissionForRunRow{OpenHolds: f.openCustodyHolds, AdmissionCountedHolds: f.openCustodyHolds}, nil
 }
@@ -1972,7 +2008,7 @@ func TestClaimAssemblesPayloadWithDecryptedSecrets(t *testing.T) {
 	fs := &fakeStore{
 		claimRun: store.Run{
 			ID: uuid.New(), IssueIid: pgtype.Int8{Int64: 4, Valid: true}, IssueTitle: "Do the thing",
-			IssueDescription: "see prds/4.md", Status: "claimed",
+			IssueDescription: "see prds/4.md", Status: "claimed", Harness: "claude",
 			LastSeq: 7, IterationCount: 2, RequeueCount: 1,
 			SessionID: pgconv.TextOrNull("sess-abc"), Branch: pgconv.TextOrNull(branch),
 		},
@@ -2301,7 +2337,7 @@ func scheduleModelStore(t *testing.T, runModel, userDefault pgtype.Text) *fakeSt
 	return &fakeStore{
 		claimRun: store.Run{
 			ID: uuid.New(), IssueIid: pgtype.Int8{Int64: 30, Valid: true}, Status: "claimed",
-			Model: runModel,
+			Model: runModel, Harness: "claude",
 		},
 		claimCtx: store.GetRunClaimContextRow{
 			RepoWebUrl: "https://gitlab.example.com/g/p", RepoPath: "g/p",
@@ -2506,20 +2542,20 @@ func TestClaimNoScheduleModelUsesUserDefault(t *testing.T) {
 	}
 }
 
-// PRD #362 M2: an ISSUE-run claim carries SummaryModel resolved from the instance
-// summary_model setting when the owner has no per-user override. Unlike judge_model,
-// this rides the issue-run claim (not the judge claim).
+// PRD #362 M2 / PRD #3248: an ISSUE-run claim carries SummaryModel resolved from the
+// instance summary_model setting when the owner has no per-user override. Unlike
+// judge_model, this rides the issue-run claim (not the judge claim).
 func TestClaimCarriesSummaryModelFromInstanceDefault(t *testing.T) {
 	fs := scheduleModelStore(t, pgtype.Text{}, pgtype.Text{})
 	// summaryModel left NULL ⇒ inherit the instance value.
 	svc := newOffModeService(fs, newBox(t), testParams())
-	svc.SetSettings(fakeSettings{summaryModel: "haiku"})
+	svc.SetSettings(fakeSettings{summaryModel: "sonnet"})
 
 	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
-	if payload.SummaryModel == nil || *payload.SummaryModel != "haiku" {
+	if payload.SummaryModel == nil || *payload.SummaryModel != "sonnet" {
 		t.Fatalf("issue claim should carry the instance summary_model; got %+v", payload.SummaryModel)
 	}
 }
@@ -2541,24 +2577,117 @@ func TestClaimSummaryModelUserOverrideWins(t *testing.T) {
 	}
 }
 
-// PRD #362 M2: with no settings wired the issue claim omits summary_model entirely —
-// omitempty keeps the wire byte-identical for a deployment that has not wired settings.
-func TestClaimOmitsSummaryModelWhenNoSettings(t *testing.T) {
+// PRD #3248 D12: with settings wired but nothing set on either tier, a Claude claim
+// carries the built-in haiku rather than omitting the field.
+func TestClaimSummaryModelBuiltinWhenNothingSet(t *testing.T) {
 	fs := scheduleModelStore(t, pgtype.Text{}, pgtype.Text{})
-	// newOffModeService(...) leaves s.settings nil unless SetSettings is called.
+	svc := newOffModeService(fs, newBox(t), testParams())
+	svc.SetSettings(fakeSettings{})
+	payload, err := svc.Claim(context.Background(), worker(), nil)
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload.SummaryModel == nil || *payload.SummaryModel != "haiku" {
+		t.Fatalf("Claude claim with nothing set should carry the built-in haiku; got %+v", payload.SummaryModel)
+	}
+}
+
+// PRD #3248: a deployment with no settings reader wired tells the summary generator
+// nothing: the claim's SummaryModel stays nil rather than carrying the built-in.
+func TestClaimSummaryModelNilWhenSettingsUnwired(t *testing.T) {
+	fs := scheduleModelStore(t, pgtype.Text{}, pgtype.Text{})
+	fs.summaryModel = pgconv.TextOrNull("opus") // a stored user value must not leak through
 	payload, err := newOffModeService(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
 	if payload.SummaryModel != nil {
-		t.Fatalf("no settings wired should leave SummaryModel nil; got %+v", payload.SummaryModel)
+		t.Fatalf("unwired settings should leave SummaryModel nil; got %q", *payload.SummaryModel)
 	}
-	b, err := json.Marshal(payload)
+}
+
+// PRD #3248: a user-row read error logs and resolves as if the user tier were unset
+// (instance, then built-in); it never fails the claim.
+func TestClaimSummaryModelUserReadErrorFallsBackToInstance(t *testing.T) {
+	fs := scheduleModelStore(t, pgtype.Text{}, pgtype.Text{})
+	fs.summaryModelErr = errors.New("db down")
+	// A row value alongside the error must not be read: the user tier counts as unset.
+	fs.summaryModel = pgtype.Text{String: "opus", Valid: true}
+	svc := newOffModeService(fs, newBox(t), testParams())
+	svc.SetSettings(fakeSettings{summaryModel: "sonnet"})
+	payload, err := svc.Claim(context.Background(), worker(), nil)
 	if err != nil {
-		t.Fatalf("marshal payload: %v", err)
+		t.Fatalf("a user-row read error must not fail the claim: %v", err)
 	}
-	if strings.Contains(string(b), "summary_model") {
-		t.Fatalf("unset summary_model must be omitted from the wire; got %s", b)
+	if payload.SummaryModel == nil || *payload.SummaryModel != "sonnet" {
+		t.Fatalf("user-row error should resolve the instance tier; got %+v", payload.SummaryModel)
+	}
+}
+
+// PRD #3248 D12: an instance-tier read error logs and counts as unset, so the claim
+// still resolves (user value, else the built-in) and never fails.
+func TestClaimSummaryModelInstanceReadErrorFallsBack(t *testing.T) {
+	cases := []struct {
+		name string
+		user pgtype.Text
+		want string
+	}{
+		{"no user value resolves the built-in", pgtype.Text{}, "haiku"},
+		{"user value still wins", pgtype.Text{String: "opus", Valid: true}, "opus"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := scheduleModelStore(t, pgtype.Text{}, pgtype.Text{})
+			fs.summaryModel = tc.user
+			svc := newOffModeService(fs, newBox(t), testParams())
+			svc.SetSettings(fakeSettings{summaryModel: "sonnet", summaryModelErr: errors.New("cache down")})
+			payload, err := svc.Claim(context.Background(), worker(), nil)
+			if err != nil {
+				t.Fatalf("an instance read error must not fail the claim: %v", err)
+			}
+			if payload.SummaryModel == nil || *payload.SummaryModel != tc.want {
+				t.Fatalf("SummaryModel = %v, want %q", payload.SummaryModel, tc.want)
+			}
+		})
+	}
+}
+
+// PRD #3248 D3/D5: the summary model rides the lane of the run's own harness. The
+// stored Claude-lane value of a Codex run's owner is ignored, and a legacy stored
+// Codex id on the Claude lane is dropped for a Claude run.
+func TestClaimSummaryModelLanes(t *testing.T) {
+	cases := []struct {
+		name    string
+		harness string
+		userC   string // users.summary_model
+		userX   string // users.codex_summary_model
+		instC   string
+		instX   string
+		want    string
+	}{
+		{name: "codex user value", harness: "codex", userC: "opus", userX: "gpt-6-astra", instX: "gpt-6-sol", want: "gpt-6-astra"},
+		{name: "codex nothing set", harness: "codex", userC: "opus", instC: "sonnet", want: "gpt-6-luna"},
+		{name: "codex instance only", harness: "codex", userC: "opus", instX: "gpt-6.1-sol", want: "gpt-6.1-sol"},
+		{name: "claude legacy codex id", harness: "claude", userC: "gpt-6-sol", instC: "sonnet", want: "sonnet"},
+		{name: "claude ignores codex lane", harness: "claude", userX: "gpt-6-astra", want: "haiku"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := scheduleModelStore(t, pgtype.Text{}, pgtype.Text{})
+			fs.summaryModel = pgconv.TextOrNull(tc.userC)
+			fs.codexSummaryModel = pgconv.TextOrNull(tc.userX)
+			svc := newOffModeService(fs, newBox(t), testParams())
+			svc.SetSettings(fakeSettings{summaryModel: tc.instC, codexSummaryModel: tc.instX})
+			// A full Codex claim needs a bound Codex credential, so the lane choice is
+			// exercised through the resolver the claim assembly calls.
+			got := svc.resolveClaimSummaryModel(context.Background(), store.Run{ID: uuid.New(), UserID: uuid.New(), Harness: tc.harness})
+			if got == nil {
+				t.Fatalf("summary model = nil, want %q", tc.want)
+			}
+			if *got != tc.want {
+				t.Fatalf("summary model = %q, want %q", *got, tc.want)
+			}
+		})
 	}
 }
 
@@ -5284,6 +5413,54 @@ func TestDeleteWorkerRejectedWhileHoldingCustody(t *testing.T) {
 	}
 }
 
+func TestDeleteWorkerCustodyErrorCarriesHoldList(t *testing.T) {
+	// #3921: the refusal names the blocking holds; Holds stays the authoritative total even
+	// when the (capped) list is shorter.
+	rows := []store.ListOpenCustodyHoldsForWorkerRow{
+		{ID: uuid.New(), RunID: uuid.New(), Generation: 3, RunKind: "issue", RunTitle: "Fix the thing"},
+		{ID: uuid.New(), RunID: uuid.New(), Generation: 1},
+	}
+	fs := &fakeStore{openCustodyHolds: 14, listCustodyRows: rows, deleteWorkerRows: 1}
+	svc := New(fs, newBox(t), testParams())
+	user, wkrID := uuid.New(), uuid.New()
+	err := svc.DeleteWorker(context.Background(), user, wkrID)
+	var ce *WorkerHasCustodyError
+	if !errors.As(err, &ce) {
+		t.Fatalf("err = %v, want *WorkerHasCustodyError", err)
+	}
+	if ce.Holds != 14 {
+		t.Fatalf("Holds = %d, want the count 14", ce.Holds)
+	}
+	if len(ce.List) != 2 || ce.List[0] != rows[0] || ce.List[1] != rows[1] {
+		t.Fatalf("List = %+v, want %+v", ce.List, rows)
+	}
+	if fs.listCustodyWorkerParams == nil || fs.listCustodyWorkerParams.UserID != user || fs.listCustodyWorkerParams.WorkerID != wkrID {
+		t.Fatalf("list params = %+v, want worker %s scoped to user %s", fs.listCustodyWorkerParams, wkrID, user)
+	}
+	if fs.deleteWorkerParams != nil {
+		t.Fatal("no delete should be issued while the worker holds custody")
+	}
+}
+
+func TestDeleteWorkerCustodyListErrorIsReturned(t *testing.T) {
+	// #3921: a listing failure is returned as-is (the handler maps it to 500), mirroring the
+	// active-runs listing; it must not be swallowed into a bare custody refusal.
+	boom := errors.New("list boom")
+	fs := &fakeStore{openCustodyHolds: 2, listCustodyErr: boom, deleteWorkerRows: 1}
+	svc := New(fs, newBox(t), testParams())
+	err := svc.DeleteWorker(context.Background(), uuid.New(), uuid.New())
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the list error", err)
+	}
+	var ce *WorkerHasCustodyError
+	if errors.As(err, &ce) {
+		t.Fatalf("err = %v, must not be a *WorkerHasCustodyError", err)
+	}
+	if fs.deleteWorkerParams != nil {
+		t.Fatal("no delete should be issued after a list error")
+	}
+}
+
 func TestCreateWorkerReturnsTokenOnce(t *testing.T) {
 	fs := &fakeStore{createWorkerResult: store.Worker{ID: uuid.New(), Name: "laptop"}}
 	svc := New(fs, newBox(t), testParams())
@@ -6175,6 +6352,42 @@ func TestSaveMemoryNormalizesBasisAtWrite(t *testing.T) {
 				}
 			} else if fs.memInsertParams.Basis.String != tc.want {
 				t.Errorf("basis %q stored as %q, want %q", tc.in, fs.memInsertParams.Basis.String, tc.want)
+			}
+		})
+	}
+}
+
+func TestAgentsFromTemplatesHarnessPins(t *testing.T) {
+	rows := []store.AgentTemplate{
+		{Name: "legacy", Model: pgconv.TextOrNull("gpt-6-sol")},
+		{Name: "sonnet-only", Model: pgconv.TextOrNull("sonnet")},
+		{Name: "codex-only", CodexModel: pgconv.TextOrNull("gpt-6-luna")},
+		{Name: "dual", Model: pgconv.TextOrNull("custom-claude"), CodexModel: pgconv.TextOrNull("gpt-6-sol")},
+		{Name: "lead", Model: pgconv.TextOrNull("opus"), CodexModel: pgconv.TextOrNull("gpt-6.1-sol")},
+	}
+	for _, tc := range []struct {
+		harness string
+		want    []string
+	}{
+		{"claude", []string{"", "sonnet", "", "custom-claude", "opus"}},
+		{"codex", []string{"", "", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol"}},
+	} {
+		t.Run(tc.harness, func(t *testing.T) {
+			agents := agentsFromTemplates(rows, nil, tc.harness)
+			if len(agents) != len(rows) {
+				t.Fatalf("agents=%d", len(agents))
+			}
+			for i, agent := range agents {
+				got := ""
+				if agent.Model != nil {
+					got = *agent.Model
+				}
+				if got != tc.want[i] {
+					t.Errorf("%s model=%q, want %q", agent.Name, got, tc.want[i])
+				}
+				if tc.want[i] == "" && agent.Model != nil {
+					t.Errorf("%s must omit model", agent.Name)
+				}
 			}
 		})
 	}

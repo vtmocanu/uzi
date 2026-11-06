@@ -238,13 +238,13 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    (usually a lost worker resumed from the default branch): before steering the new gate with
    `uzi-watcher`, check `uzi run recovery RUN` for committed work worth landing instead; `limit_wait` / `pool_wait` / `recovery_wait` → one trail line,
    keep polling (`limit_wait` and `pool_wait` resume on their own; a `recovery_wait` may need an owner action, so read its cause; a `data_volume_full` park is counted and exits the poller 4), except `recovery_wait` with cause
-   `worker_requeue_exhausted`, `retained_recovery_adoption_failed` (regardless of retry timing),
+   `worker_requeue_exhausted`, `retained_recovery_adoption_failed` and `retained_continuation_unwitnessed` (each regardless of retry timing),
    `worker_memory_pressure` (regardless of remaining interventions),
    or `retained_recovery_exhausted` with its retry stamp explicitly null: the poller
    stops on it (exit 0) because only the owner can Resume or Cancel; back up first (`uzi-watcher` recovery).
    Adoption failure means an integrity check refused adoption, with local work and custody
    preserved and no automatic retry. Resume requests a bounded attempt; success is not assured,
-   and repeated failure holds again. `paused` stops the poller because it never
+   and repeated failure holds again. Unwitnessed means a claimed flight was never seen starting; claim released, work and custody kept, no automatic retry, not an integrity refusal. `paused` stops the poller because it never
    resumes on its own: read `hold_reason`. A run that hit its wall-clock limit is `paused`
    with `hold_reason: budget_exhausted` (PRD #1497), never `failed`: extend it (`uzi run
    extend RUN --by 2h`) and re-arm the poller; an owner pause waits for its owner.
@@ -423,7 +423,7 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    `--fresh`. After a merge or renumber, regenerate sqlc (a renumber reorders generated
    columns) and run the full gate on CI: a clean merge can still break a signature one side changed. Resolve a conflicted generated `*.sql.go` by regenerating it
    after its `queries/*.sql`, never by hand. When either side adds a migration, require the
-   `test-api-store-it` job's `LiveDB: N passed, 0 skipped` line on the exact head, since a test
+   `test-codex-refresh-lostreply-e2e` job's `LiveDB: N passed, 0 skipped` line (`test-api-store-it` only mirrors that job's result) on the exact head, since a test
    pinned to an older schema can break on the other side's new columns.
    Ordinary PRs add their own lowercase UUID-v4 fragment before a PR exists, initially citing
    the relevant issue; see [fragment guidance](../../../changelog.d/README.md). Do not union
@@ -495,8 +495,9 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    Pass the exact SHA from `merge.sh`; never hand-complete a prefix. The poller resolves it
    through GitHub and exits 3 before polling when it is invalid or unknown.
    Exit 0 green (a partial dispatch counts; confirm a gate fix another way), 1 red (use the
-   per-job live-log commands it prints, then fix on a branch, never `main`; flake → rerun +
-   file), 2 budget exhausted, 3 no run appeared or lookup failed. `--follow` prints each
+   per-job live-log commands it prints, then fix on a branch, never `main`; flake → file, and
+   rerun only while that SHA is still the `main` head), 2 budget exhausted, 3 no run appeared
+   or lookup failed. `--follow` prints each
    `FOLLOW sha=OLD -> NEW` switch to the current branch head without resetting `--max-ticks`;
    the final verdict covers the last watched SHA. Without it, 4 superseded → re-watch the current `main` head
    (references/merge-mechanics.md). Append the terminal result to the preserved trail
@@ -680,8 +681,10 @@ session-peers registry, so a Codex thread with a shim is a peer like any Claude 
 ## Waiting, uniformly
 
 Every long wait uses a bundled poller with an owned continuation, not merely a
-background process. Claude Code's native background task and OpenCode's background
-shell can notify on exit; verify actual STARTED coverage and retain a private log.
+background process. Claude Code's native background task (the Bash tool's
+`run_in_background`, never a `&`/`nohup` inside a foreground call, which never
+notifies) and OpenCode's background shell can notify on exit; verify actual STARTED
+coverage and retain a private log.
 A Codex managed exec ID alone is not a verified wake subscription.
 
 Load session-peers' completion guidance. Use its bounded owner-only `watch start`

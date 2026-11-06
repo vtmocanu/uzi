@@ -714,4 +714,36 @@ describe("SdkExecutor — issue #1830 reclaimCachesInPlace", () => {
     assert.deepStrictEqual(seen.beforeJoin, [false, false, true], "Go caches dropped, the npm cache kept while the install runs");
     assert.deepStrictEqual(seen.afterJoin, [false, false, false], "after the join the npm cache goes too");
   });
+
+  it("leaves the managed Go work leaves (issue #3870) alone: it drops caches, not park scratch", async (t) => {
+    if (!HAS_PIN_WALK) return t.skip("no descriptor-pinned walk on this host: the cache drop refuses here by design");
+    fs.mkdirSync(path.join(homeDir, ".cache", "go-build", "0a"), { recursive: true });
+    fs.writeFileSync(path.join(homeDir, ".cache", "go-build", "0a", "x-d"), "x");
+    fs.mkdirSync(path.join(homeDir, "go", "pkg", "mod", "example.com"), { recursive: true });
+    const leaf = path.join(homeDir, ".uzi-go-work", "g3", "go-build1", "x.o");
+    fs.mkdirSync(path.dirname(leaf), { recursive: true });
+    fs.writeFileSync(leaf, "obj");
+    // The managed shape (single-uid mode 0700), so removeGoWorkLeaves WOULD remove the leaf: the
+    // assertion below then proves the in-place drop leaves it, not that the parent was refused.
+    fs.chmodSync(path.join(homeDir, ".uzi-go-work"), 0o700);
+    const exec = new SdkExecutor(nullLogger(), homeDir, {
+      queryFn: spawningTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]),
+      spawn: () => ({ pid: 8201 }),
+      kill: () => true,
+      cliGroupPresent: () => false,
+    });
+    const { ctx } = makeCtx({
+      gatePlan: async () => {
+        await exec.reclaimCachesInPlace();
+        return { kind: "approve", selection: { status: "absent" } };
+      },
+      cacheCapBoundary: async () => {
+        await exec.reclaimCachesInPlace();
+        return "continue";
+      },
+    });
+    await exec.run(ctx);
+    assert.ok(!fs.existsSync(path.join(homeDir, ".cache", "go-build")), "precondition: the in-place drop ran");
+    assert.strictEqual(fs.readFileSync(leaf, "utf8"), "obj", "the leaf is untouched");
+  });
 });

@@ -220,8 +220,8 @@ var runDTOKeys = []string{
 	"claim_generation",
 	"finished_at", "created_at", "updated_at",
 	// issue #1727: when the run entered its current status; null only defensively.
-	"status_since", "repo_agents", "agent_source",
-	"agent_exclusions", "own_agents",
+	"status_since", "repo_agents", "repo_agent_source_commit", "agent_source",
+	"agent_exclusions", "agent_source_requested", "agent_source_requested_basis", "own_agents",
 	// PRD #111 M1: which Anthropic credential the claim spent. The label is a
 	// snapshot and outlives the id, so both keys are always on the wire.
 	"anthropic_secret_id", "anthropic_secret_label",
@@ -846,7 +846,7 @@ func TestSecretDTOTags(t *testing.T) {
 func TestRepoDTOTags(t *testing.T) {
 	assertTags(t, "RepoDTO", RepoDTO{},
 		"id", "connection_id", "forge_project_id", "path_with_namespace", "web_url",
-		"default_branch", "enabled", "repo_skills_enabled", "repo_claudemd_enabled", "repo_devbox_opt_in",
+		"default_branch", "enabled", "repo_skills_enabled", "agent_source_default", "repo_claudemd_enabled", "repo_devbox_opt_in",
 		"code_cross_check_guidance", "cross_check_repo_instructions_enabled",
 		// PRD #686 D1: the per-repo self-improve dogfooding capability (folds the
 		// improve_uzi backlog + selects the uzi worker directive). Default false.
@@ -1186,6 +1186,8 @@ func TestUserSettingsDTOTags(t *testing.T) {
 		"now_summary_enabled",
 		// PRD #3245: the Codex judge lane and the read-only resolved judge cells.
 		"codex_judge_model", "judge_models",
+		// PRD #3248: the Codex summary lane and the read-only resolved summary cells.
+		"codex_summary_model", "summary_models",
 		// PRD #3247: the read-only resolved ordinary effort cells.
 		"effort_settings",
 		// PRD #3522: the weekly usage reserve (null threshold ⇒ off).

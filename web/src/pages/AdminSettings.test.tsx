@@ -70,6 +70,7 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   release_check_enabled: "true",
   release_check_banner_enabled: "true",
   summary_model: "haiku",
+  codex_summary_model: "gpt-6-luna",
   health_enabled: "true",
   health_stall_seconds: "300",
   health_tool_call_seconds: "1200",
@@ -121,9 +122,16 @@ const response = (
     slack_app_token: "default",
     judge_model: "default",
     codex_judge_model: "default",
+    summary_model: "default",
+    codex_summary_model: "default",
     ...sources,
   } as Record<string, Src>,
-  defaults: { judge_model: "opus", codex_judge_model: "gpt-6.1-sol" },
+  defaults: {
+    judge_model: "opus",
+    codex_judge_model: "gpt-6.1-sol",
+    summary_model: "haiku",
+    codex_summary_model: "gpt-6-luna",
+  },
   slack_status,
 });
 
@@ -163,11 +171,13 @@ const pendingAgentSource = (): import("../lib/api").AgentSourceView => ({
         name: "planner",
         ok: true,
         description: "Plans work.",
+        claude_model: "",
+        codex_model: "",
         prompt_body: "You are the planner.",
         // The raw body carried hidden control/bidi chars stripped for this preview.
         body_sanitized: true,
       },
-      { name: "broken-role", ok: false, reason: "invalid" },
+      { name: "broken-role", ok: false, reason: "invalid", claude_model: "", codex_model: "" },
     ],
     diff: [
       { name: "planner", action: "add", detail: "new synced-only role" },
@@ -734,7 +744,8 @@ describe("AdminSettings — run judge (PRD #46)", () => {
     const codex = (await screen.findByLabelText("Codex judge model")) as HTMLSelectElement;
     expect(codex.value).toBe("inherit");
     expect(codex.options[codex.selectedIndex].textContent).toBe("Default \u00b7 gpt-6.1-sol (built-in)");
-    expect(screen.getAllByText("Follows the built-in model.")).toHaveLength(2);
+    // Judge and summary cards each show a Claude and a Codex lane.
+    expect(screen.getAllByText("Follows the built-in model.")).toHaveLength(4);
   });
 
   it("resets to the built-in by sending an empty judge model", async () => {
@@ -938,15 +949,23 @@ describe("AdminSettings — ephemeral workers (PRD #649 M1)", () => {
 
 describe("AdminSettings — run summaries (PRD #362)", () => {
   it("loads the current summary model", async () => {
-    mockApi.getSettings.mockResolvedValue(response({ summary_model: "sonnet" }));
+    mockApi.getSettings.mockResolvedValue(response({ summary_model: "sonnet" }, {}, { summary_model: "db" }));
     renderPage();
-    expect((await screen.findByLabelText("Summary model") as HTMLInputElement).value).toBe("sonnet");
+    expect((await screen.findByLabelText("Claude summary model") as HTMLSelectElement).value).toBe("sonnet");
+  });
+
+  it("shows the Codex summary lane on Default when unpinned, with the built-in named", async () => {
+    mockApi.getSettings.mockResolvedValue(response());
+    renderPage();
+    const codex = (await screen.findByLabelText("Codex summary model")) as HTMLSelectElement;
+    expect(codex.value).toBe("inherit");
+    expect(Array.from(codex.options).map((o) => o.text)).toContain("Default · gpt-6-luna (built-in)");
   });
 
   it("saves the summary model through the settings update path", async () => {
-    mockApi.updateSettings.mockResolvedValue(response({ summary_model: "opus" }));
+    mockApi.updateSettings.mockResolvedValue(response({ summary_model: "opus" }, {}, { summary_model: "db" }));
     renderPage();
-    fireEvent.change(await screen.findByLabelText("Summary model"), { target: { value: "opus" } });
+    fireEvent.change(await screen.findByLabelText("Claude summary model"), { target: { value: "opus" } });
     const btn = screen.getByRole("button", { name: /save run summary settings/i }) as HTMLButtonElement;
     expect(btn.disabled).toBe(false);
     fireEvent.click(btn);
@@ -974,13 +993,13 @@ describe("AdminSettings — run summaries (PRD #362)", () => {
     await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ now_summary_enabled: "false" }));
   });
 
-  it("blocks an empty summary model client-side without calling the API", async () => {
+  it("resets a pinned summary model by sending an empty string", async () => {
+    mockApi.getSettings.mockResolvedValue(response({ summary_model: "sonnet" }, {}, { summary_model: "db" }));
+    mockApi.updateSettings.mockResolvedValue(response({}));
     renderPage();
-    await screen.findByLabelText("Summary model");
-    fireEvent.change(screen.getByLabelText("Summary model"), { target: { value: "  " } });
+    fireEvent.change(await screen.findByLabelText("Claude summary model"), { target: { value: "inherit" } });
     fireEvent.click(screen.getByRole("button", { name: /save run summary settings/i }));
-    expect(await screen.findByText(/summary model must not be empty/i)).toBeTruthy();
-    expect(mockApi.updateSettings).not.toHaveBeenCalled();
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ summary_model: "" }));
   });
 });
 
@@ -1310,6 +1329,36 @@ describe("AdminSettings — agent source (PRD #602 M5)", () => {
     // A healthy sync shows the short SHA of the last sync (it also appears on the
     // staged snapshot, which shares the SHA — so at least one, not exactly one).
     expect(c.getAllByText("9f2c17a4e0").length).toBeGreaterThan(0);
+  });
+
+  it("reviews both harness pins, including default-only roles, before approval", async () => {
+    const source = pendingAgentSource();
+    source.staged!.roles = [
+      { name: "lead", ok: true, claude_model: "", codex_model: "", prompt_body: "lead body" },
+      { name: "coder", ok: true, claude_model: "", codex_model: "", prompt_body: "coder body" },
+      { name: "sol", ok: true, model: "gpt-6-sol", claude_model: "", codex_model: "gpt-6-sol", prompt_body: "sol body" },
+      { name: "luna", ok: true, model: "gpt-6-luna", claude_model: "", codex_model: "gpt-6-luna", prompt_body: "luna body" },
+      { name: "custom", ok: true, model: "us.anthropic.claude-custom:v1", claude_model: "us.anthropic.claude-custom:v1", codex_model: "", prompt_body: "custom body" },
+    ];
+    source.staged!.diff = source.staged!.roles.map(({ name }) => ({ name, action: "add" }));
+    source.staged!.counts = { staged: 5, changed: 5, failed: 0 };
+    mockApi.getAgentSource.mockResolvedValue({ agent_source: source });
+    renderPage();
+    await screen.findByLabelText("Repository URL");
+    const c = card();
+    c.getAllByRole("button", { name: "Show body" }).forEach((button) => fireEvent.click(button));
+    for (const role of source.staged!.roles) {
+      const row = within(c.getByText(role.name, { selector: "code" }).closest("li")!);
+      expect(row.getByText("Claude model").nextElementSibling?.textContent).toBe(
+        role.claude_model || (role.name === "lead" ? "Default · SDK/account default (built-in)" : "Default · lead's model"),
+      );
+      expect(row.getByText("Codex model").nextElementSibling?.textContent).toBe(
+        role.codex_model || (role.name === "lead" ? "Default · built-in (gpt-6.1-sol)" : "Default · lead's model"),
+      );
+      expect(row.queryByText("Model", { exact: true })).toBeNull();
+    }
+    expect(c.getByRole("button", { name: "Approve & apply" })).toBeTruthy();
+    expect(mockApi.applyAgentSource).not.toHaveBeenCalled();
   });
 
   it("saves the config through updateSettings with the agent_source_* keys, omitting an untyped credential", async () => {

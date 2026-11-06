@@ -42,7 +42,7 @@ afterEach(() => {
 });
 
 describe("buildSdkEnv", () => {
-  it("contains only the OAuth token, HOME, PATH, AGENT_BROWSER_ARGS, TMPDIR (plus explicitly-unset ANTHROPIC_*)", () => {
+  it("contains only the OAuth token, HOME, PATH, AGENT_BROWSER_ARGS, the browser discovery paths, TMPDIR (plus explicitly-unset ANTHROPIC_*)", () => {
     const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR);
 
     assert.strictEqual(env.CLAUDE_CODE_OAUTH_TOKEN, FAKE_OAUTH);
@@ -57,10 +57,28 @@ describe("buildSdkEnv", () => {
 
     // Exactly the core keys (+ TMPDIR, the 5-bis per-uid scratch dir, when the ambient
     // env has one) — no other WORKER env is spread in. TMPDIR is not a secret.
-    const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENT_BROWSER_ARGS"]);
+    const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENT_BROWSER_ARGS",
+      "AGENT_BROWSER_EXECUTABLE_PATH", "CHROME_PATH"]);
     if (process.env.UZI_RUNNER_TMPDIR || process.env.TMPDIR) expected.add("TMPDIR");
     if (process.env.UZI_SQLC_DIR) expected.add("UZI_SQLC_DIR");
     assert.deepStrictEqual(new Set(Object.keys(env)), expected);
+  });
+
+  it("issue #3907: browser discovery points at the uzi-chromium wrapper and adds no Puppeteer/CHROME_BIN key", () => {
+    const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR);
+    assert.strictEqual(env.AGENT_BROWSER_EXECUTABLE_PATH, "/usr/local/bin/uzi-chromium");
+    assert.strictEqual(env.CHROME_PATH, "/usr/local/bin/uzi-chromium");
+    assert.ok(!("PUPPETEER_EXECUTABLE_PATH" in env));
+    assert.ok(!("CHROME_BIN" in env));
+  });
+
+  it("issue #3907: a hostile toolEnv cannot replace the browser discovery paths", () => {
+    const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR, {
+      AGENT_BROWSER_EXECUTABLE_PATH: "/evil/chromium",
+      CHROME_PATH: "/evil/chrome",
+    });
+    assert.strictEqual(env.AGENT_BROWSER_EXECUTABLE_PATH, "/usr/local/bin/uzi-chromium");
+    assert.strictEqual(env.CHROME_PATH, "/usr/local/bin/uzi-chromium");
   });
 
   it("uses a nonempty runner pin ahead of the ambient PATH", () => {
@@ -221,5 +239,33 @@ describe("Go concurrency defaults (issue #3382)", () => {
     const only = buildCheckEnv({ GOFLAGS: "-x" }, HOME_DIR);
     assert.equal(only.GOMAXPROCS, "4");
     assert.equal(Object.hasOwn(only, "GOFLAGS"), false);
+  });
+  it("issue #3870: GOTMPDIR is set last when given and absent otherwise; nothing else changes", () => {
+    configureGoConcurrency({ buildParallelism: 2, maxProcs: 3 });
+    try {
+      const tool = { PATH: "/nix/bin", GOTMPDIR: "/provisioned/tmp", GOFLAGS: "-x" };
+      const without = buildSdkEnv(FAKE_OAUTH, HOME_DIR, tool, "unix:///run/dind.sock");
+      assert.equal(without.GOTMPDIR, "/provisioned/tmp", "no managed dir: a provisioned GOTMPDIR passes as before");
+      const withDir = buildSdkEnv(FAKE_OAUTH, HOME_DIR, tool, "unix:///run/dind.sock", undefined, "/home/run/.uzi-go-work/g3");
+      assert.equal(withDir.GOTMPDIR, "/home/run/.uzi-go-work/g3", "the managed dir overrides a provisioned GOTMPDIR");
+      assert.deepEqual({ ...withDir, GOTMPDIR: undefined }, { ...without, GOTMPDIR: undefined });
+      const bare = buildSdkEnv(FAKE_OAUTH, HOME_DIR);
+      assert.equal(Object.hasOwn(bare, "GOTMPDIR"), false);
+      const bareWith = buildSdkEnv(FAKE_OAUTH, HOME_DIR, {}, undefined, undefined, "/w/g1");
+      assert.equal(bareWith.GOTMPDIR, "/w/g1");
+      assert.deepEqual({ ...bareWith, GOTMPDIR: undefined }, { ...bare, GOTMPDIR: undefined });
+    } finally {
+      configureGoConcurrency({});
+    }
+  });
+
+  it("issue #3870: buildCheckEnv sets GOTMPDIR last when given and adds no key otherwise", () => {
+    const src = { PATH: "/img" };
+    const tool = { PATH: "/nix/bin", GOTMPDIR: "/provisioned/tmp" };
+    const without = buildCheckEnv(src, HOME_DIR, tool);
+    assert.equal(Object.hasOwn(without, "GOTMPDIR"), false, "buildCheckEnv never carried a provisioned GOTMPDIR");
+    const withDir = buildCheckEnv(src, HOME_DIR, tool, "/home/run/.uzi-go-work/g2");
+    assert.equal(withDir.GOTMPDIR, "/home/run/.uzi-go-work/g2");
+    assert.deepEqual({ ...withDir, GOTMPDIR: undefined }, { ...without, GOTMPDIR: undefined });
   });
 });

@@ -13,6 +13,7 @@ import (
 
 const recoveryCauseRetainedRecoveryExhausted = "retained_recovery_exhausted"
 const recoveryCauseRetainedRecoveryAdoptionFailed = "retained_recovery_adoption_failed"
+const recoveryCauseRetainedContinuationUnwitnessed = "retained_continuation_unwitnessed"
 
 // claimRecoveryEpisode projects harness recovery restarts without changing the stored
 // worker-death allowance or its finalize/requeue predicates.

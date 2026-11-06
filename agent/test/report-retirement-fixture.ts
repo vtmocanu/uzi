@@ -181,7 +181,8 @@ export async function reportRetirementFixture(t: TestContext, options: {
   let priorFinal: RecoveryRecord | undefined;
   let predecessorClone: string | undefined;
   let predecessorH1 = "", predecessorH2 = "";
-  let successorAdmission: { head: string; clone: string; stage?: string; restoreTip?: string; attemptId?: string } | undefined;
+  let successorAdmission: { head: string; clone: string; stage?: string; restoreTip?: string; restoreSource?: string;
+    adoptedSource?: string; adoptedContentSource?: string; attemptId?: string } | undefined;
   if (options.priorPendingArchiveFinal) {
     assert.equal(options.olderOpenHold, true, "earlier producer requires its exact-generation hold");
     ownership.generation = 1;
@@ -265,6 +266,15 @@ export async function reportRetirementFixture(t: TestContext, options: {
       return { ok: true, body: { published: true, ref, tip } };
     };
   }
+  let preparedSuccessor: Awaited<ReturnType<typeof git.prepareRecoverySuccessor>> | undefined;
+  if (options.priorPendingArchiveFinal) {
+    const prepare = git.prepareRecoverySuccessor.bind(git);
+    t.mock.method(git, "prepareRecoverySuccessor", async (...args: Parameters<typeof prepare>) => {
+      const successor = await prepare(...args);
+      preparedSuccessor = successor;
+      return successor;
+    });
+  }
   api.refuseStateWith409(claim.run_id);
   let foreground = !options.priorPendingArchiveFinal;
   const processObservation = { killed: [] as number[], calls: 0 };
@@ -279,6 +289,8 @@ export async function reportRetirementFixture(t: TestContext, options: {
       assert.ok(admitted, "public discovery reads the actual admitted successor");
       successorAdmission = { head: cmd(clone, ["rev-parse", "HEAD"]), clone,
         stage: admitted.journal.recovery?.stage, restoreTip: admitted.journal.recovery?.restoreTip,
+        restoreSource: admitted.journal.recovery?.restoreSource,
+        adoptedSource: preparedSuccessor?.adoptedSource, adoptedContentSource: preparedSuccessor?.adoptedContentSource,
         attemptId: admitted.journal.attemptId };
       admissionCapture = false;
       historyEvents.push("G2 SDK admitted on actual fresh attempt");

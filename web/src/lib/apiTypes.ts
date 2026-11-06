@@ -115,7 +115,7 @@ export interface User {
   judge_anthropic_secret_label: string | null;
   // Which bind mode this user's RETROSPECTIVES use (PRD #1140): default / pinned /
   // auto. The EFFECTIVE mode (a pinned binding whose token was deleted reports
-  // default). auto spreads retrospectives across the user's pooled tokens.
+  // default). auto picks retrospectives' token from the user's pool.
   judge_anthropic_bind_mode: BindMode;
   created_at: string;
   last_login: string | null;
@@ -271,6 +271,12 @@ export interface UserSettings {
    *  instance summary_model (which itself falls back to haiku). Written through
    *  PUT /me/settings alongside judge_model, validated by the same model rules. */
   summary_model: string | null;
+  /** Per-user Codex summary model (PRD #3248); null inherits the instance Codex summary
+   *  model, then the built-in. A Codex role id when set. Optional for older servers. */
+  codex_summary_model?: string | null;
+  /** Read-only resolved view of both summary lanes (PRD #3248), claude then codex.
+   *  Never sent on a PUT. Optional for older servers. */
+  summary_models?: ModelSettingCell[];
   theme: string | null;
   /** PRD #1167 "Lights on" (m2): the four RAW per-user appearance overrides, each
    *  null = inherit the instance default. appearance_mode is system|light|dark;
@@ -340,6 +346,8 @@ export interface UserSettingsPatch {
   codex_judge_model?: string | null;
   /** Per-user run-summary model (PRD #362 M2); present-null clears back to inherit. */
   summary_model?: string | null;
+  /** Per-user Codex summary model (PRD #3248); present-null clears back to inherit. */
+  codex_summary_model?: string | null;
   theme?: string | null;
   /** PRD #1167 "Lights on" (m2): tri-state appearance override fields — absent leaves
    *  the field unchanged, present-null clears it back to inherit, a value sets it
@@ -388,13 +396,14 @@ export interface SlackLink {
 }
 
 // AgentTemplate is a stored agent definition. tools is null when the template
-// inherits all tools; model is null when it inherits the model. scope/user_id
+// inherits all tools; model/codex_model are the nullable Claude/Codex pins. scope/user_id
 // carry the M6 ownership model; is_builtin is retained (== scope 'builtin').
 export interface AgentTemplate {
   id: string;
   name: string;
   description: string;
   model: string | null;
+  codex_model: string | null;
   tools: string[] | null;
   prompt_body: string;
   is_builtin: boolean;
@@ -402,7 +411,7 @@ export interface AgentTemplate {
   user_id: string | null;
   updated_by: string | null;
   // differs_from_builtin is computed server-side per request (issue #201 M4a):
-  // whether this row's four mutable columns still match the definition the
+  // whether this row's five mutable columns still match the definition the
   // running release ships under the same name. It is false for anything that has
   // no shipped counterpart — a global row, a user row that merely shares a
   // builtin's name, and a builtin this release no longer ships.
@@ -438,6 +447,7 @@ export interface BuiltinDefinition {
   name: string;
   description: string;
   model: string | null;
+  codex_model: string | null;
   tools: string[] | null;
   prompt_body: string;
 }
@@ -450,6 +460,8 @@ export interface AgentTemplateInput {
   name?: string;
   description: string;
   model: string | null;
+  // Omitted on PUT preserves the stored pin; null or blank clears it.
+  codex_model?: string | null;
   tools: string[] | null;
   prompt_body: string;
   scope?: "global" | "user";
@@ -639,6 +651,7 @@ export interface Repo {
   // skills from the repo's own .claude/skills/ (skills only, never hooks/
   // settings/commands). Default false.
   repo_skills_enabled: boolean;
+  agent_source_default?: AgentSource | null;
   // Repo-instructions opt-in (PRD #246): when true, the lead reads the repo's
   // root CLAUDE.md as nonce-fenced, advisory, lead-only context. It is the second
   // capability behind the "Trusted repo" affordance, independently revocable from
@@ -1171,6 +1184,11 @@ export interface AppSettings {
   // generator runs on (haiku by default), served as a raw string like every other
   // setting. Mirrors judge_model's admin machinery but delivers on the issue-run claim.
   summary_model: string;
+  // codex_summary_model (PRD #3248) is the instance Codex-lane summary model: a Codex role
+  // id, or "" for the built-in (the admin GET reports the built-in with source "default").
+  // summary_model likewise accepts "" as the reset to the built-in haiku.
+  // Optional so an older server (and fixtures that predate it) stay valid.
+  codex_summary_model?: string;
   // Run-health detector keys (PRD #47, #1170). health_enabled is the text "true"/"false".
   // The *_seconds keys are integer seconds as strings; health_near_timeout_pct is a
   // percent of the run's wall-clock budget (0 to disable, else [50, 99]). The API serves
@@ -1372,7 +1390,11 @@ export interface AgentSourceStagedRole {
   ok: boolean;
   reason?: string;
   description?: string;
+  // Raw source model remains optional for compatibility with older staged JSON.
   model?: string;
+  // Review pins are always present; empty means Default for that harness.
+  claude_model: string;
+  codex_model: string;
   tools?: string[];
   prompt_body?: string;
   // True when the displayed `prompt_body` differs from the raw applied body because
@@ -2751,7 +2773,7 @@ export interface Worker {
   anthropic_secret_label: string | null;
   /** How this worker's run-lane claims choose a credential (PRD #111 M3):
    *  "default" (the owner's default), "pinned" (the id above), or "auto" (uzi picks
-   *  per claim from the owner's opted-in pool, preferring the most headroom).
+   *  per claim from the owner's opted-in pool, by the server's auto-select order).
    *
    *  🔴 It is the EFFECTIVE mode, not the stored column. Deleting a pinned token
    *  nulls the worker's id server-side and leaves the stored mode alone, so the
@@ -3238,6 +3260,9 @@ export interface HarnessDecision {
   other_measured: number | null;
   preferred_held: boolean;
   other_held: boolean;
+  /** Weekly reset of the preferred (auto_*: Claude) / other (auto_*: Codex) account; null when unknown or pre-change rows. */
+  preferred_weekly_reset_at: string | null;
+  other_weekly_reset_at: string | null;
 }
 
 export interface Run {
@@ -3569,11 +3594,14 @@ export interface Run {
    *  none (the plan gate's repo card is inert, NOT the same as null). Names +
    *  descriptions only — REPO-SUPPLIED, untrusted text; render as plain JSX. */
   repo_agents: RepoAgent[] | null;
+  repo_agent_source_commit?: string | null;
   /** PRD #37: which roster the run's subagents came from, once a selection is made
    *  (at the gate, or an autopilot run's resolved default). null before then. */
   agent_source: AgentSource | null;
   /** PRD #37: the names excluded from the chosen source. null before a selection. */
   agent_exclusions: string[] | null;
+  agent_source_requested?: AgentSource | null;
+  agent_source_requested_basis?: AgentSourceRequestedBasis | null;
   /** PRD #37 M4-fix: the owner's OWN-source subagent roster (name + description) —
    *  exactly the allocation-resolved templates the worker runs for source="own",
    *  lead already stripped. The plan gate's "My agent templates" card is built from
@@ -3747,12 +3775,17 @@ export interface Run {
    *  credential refresh or release found the run owner's vault locked; the run resumes at its
    *  next retry, `recovery_retry_not_before`, once the vault is unlocked, and waits `queued`
    *  while it stays locked), and "data_volume_full" (PRD #1809 M5: the worker's data volume
-   *  was full or about to fill; the run resumes at its next retry, see disk_park_count);
+   *  was full or about to fill; explicit null retry timing holds for the owner,
+   *  a finite timestamp schedules a retry, see disk_park_count);
    *  "provider_outage" is a counted provider interruption with a scheduled retry;
    *  "retained_recovery_exhausted" can be timed or owner-held (see recovery_retry_not_before);
    *  "retained_recovery_adoption_failed" means integrity checks refused adoption of retained
    *  work: always owner-held with local work and custody preserved, no automatic retry.
    *  Only the owner can Resume or Cancel, through the existing owner authorization.
+   *  "retained_continuation_unwitnessed" (issue #3859) means a retained-custody continuation's
+   *  claimed worker flight was never witnessed starting or departing within a bounded window;
+   *  the claim was released, local work and custody are kept, and only the owner can Resume or
+   *  Cancel. Owner-held with no automatic retry, and not an integrity refusal.
    *  "empty_turn" remains reserved. Render an unrecognised value honestly (a
    *  newer server may ship a cause this build has not heard of), the same rule as
    *  rate_limit_type. */
@@ -3801,7 +3834,8 @@ export interface Run {
    *  recovery-parked. For forge_unreachable and retained_recovery_exhausted, explicit null means owner-held;
    *  a valid timestamp means timed retry (including when already due). Missing or invalid
    *  timing is unknown. For retained_recovery_adoption_failed this is always null and must
-   *  never produce a retry countdown, even if a malformed response supplies a timestamp.
+   *  never produce a retry countdown, even if a malformed response supplies a timestamp;
+   *  the same holds for retained_continuation_unwitnessed.
    *  ISO-8601 string, like every other timestamp on this type. */
   recovery_retry_not_before?: string | null;
   /** PRD #1392 M1: how many times this run has forge-parked in its lifetime — the
@@ -4279,7 +4313,7 @@ export interface RunListItem extends Run {
  *  or ordering reads only these keys; the run detail page fetches the full Run. */
 export type RunSummaryItem = Omit<
   RunListItem,
-  "plan_md" | "repo_agents" | "issue_description" | "preserved_patch"
+  "plan_md" | "repo_agents" | "repo_agent_source_commit" | "issue_description" | "preserved_patch"
   | "reset_state_digest" | "milestone_reconciliations" | "milestone_reconciliations_next_before_gate_revision"
   | "semantic_gate" | "completion_pending" | "semantic_drift"
   | "capability_provenance" | "lead_config" | "created_issues"
@@ -5210,6 +5244,7 @@ export interface SteerInput {
 // own agent folder (.claude/agents/ or .codex/agents/), or the user's uzi templates. The lead orchestrator is
 // always uzi's builtin and is never selectable.
 export type AgentSource = "repo" | "own";
+export type AgentSourceRequestedBasis = "explicit" | "repo_default";
 
 // RepoAgent is one agent the worker detected in the cloned repo's .claude/agents/
 // or .codex/agents/

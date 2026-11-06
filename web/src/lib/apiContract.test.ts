@@ -853,14 +853,14 @@ void _releaseCheckStatusFull;
 // ZeroOf exemption: sidebar_token_ids and sidebar_codex_account_ids — the handler mapper
 // runs uuidStrings on both, which returns a non-nil [] (handler/user_settings.go), so the
 // wire is [] though the nil-slice zero marshals null. Every other field is typed X|null in
-// TS. cross_check_pins, judge_models and effort_settings also exempt the Go nil-slice zero; GET always emits their cells.
+// TS. cross_check_pins, judge_models, summary_models and effort_settings also exempt the Go nil-slice zero; GET always emits their cells.
 {
   const _userSettingsMissing: never = null as unknown as Exclude<keyof UserSettings, keyof typeof userSettingsFull>;
   const _userSettingsExtra: never = null as unknown as Exclude<keyof typeof userSettingsFull, keyof UserSettings>;
-  const _userSettingsZero: ZeroOf<UserSettings, "sidebar_token_ids" | "sidebar_codex_account_ids" | "cross_check_pins" | "judge_models" | "effort_settings"> = userSettingsZero;
+  const _userSettingsZero: ZeroOf<UserSettings, "sidebar_token_ids" | "sidebar_codex_account_ids" | "cross_check_pins" | "judge_models" | "summary_models" | "effort_settings"> = userSettingsZero;
   const _userSettingsFull: Widen<UserSettings> = userSettingsFull;
   const _settingsUserFull: Widen<UserSettings> = settingsUserSettingsFull;
-  const _settingsUserZero: ZeroOf<UserSettings, "sidebar_token_ids" | "sidebar_codex_account_ids" | "cross_check_pins" | "judge_models" | "effort_settings"> = settingsUserSettingsZero;
+  const _settingsUserZero: ZeroOf<UserSettings, "sidebar_token_ids" | "sidebar_codex_account_ids" | "cross_check_pins" | "judge_models" | "summary_models" | "effort_settings"> = settingsUserSettingsZero;
   void _settingsUserFull;
   void _settingsUserZero;
   void _userSettingsMissing;
@@ -2006,7 +2006,9 @@ describe("harness overflow shared DTO contract", () => {
       expect(Object.keys(decision).sort()).toEqual([
         "preferred", "chosen", "reason", "preferred_score", "other_score",
         "preferred_measured", "other_measured", "preferred_held", "other_held",
+        "preferred_weekly_reset_at", "other_weekly_reset_at",
       ].sort());
+      for (const key of ["preferred_weekly_reset_at", "other_weekly_reset_at"] as const) expect(typeof decision[key]).toBe("string");
       for (const key of ["preferred_score", "other_score", "preferred_measured", "other_measured"] as const) expect(typeof decision[key]).toBe("number");
       expect(typeof decision.preferred_held).toBe("boolean");
       expect(typeof decision.other_held).toBe("boolean");
@@ -2015,6 +2017,7 @@ describe("harness overflow shared DTO contract", () => {
       preferred: "claude", chosen: "claude", reason: "unknown_usage",
       preferred_score: null, other_score: null, preferred_measured: null, other_measured: null,
       preferred_held: false, other_held: false,
+      preferred_weekly_reset_at: null, other_weekly_reset_at: null,
     };
     expect(unknown.preferred_score).toBeNull();
   });

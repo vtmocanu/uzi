@@ -1,9 +1,9 @@
 # ADR-2149: Server-enforced plan cross-check
 
-**Status**: Accepted (implementation); hosted acceptance pending
+**Status**: Accepted (implementation); hosted acceptance closed by maintainer decision on #2152 (2026-10-23)
 **Date**: 2026-10-06
 **Issue**: [vtmocanu/uzi#2149](https://github.com/vtmocanu/uzi/issues/2149)
-**Extends**: [PRD #2149](../prds/2149-plan-cross-check.md), especially D1, D4–D7 and D16. The PRD remains in `prds/` until maintainer-owned hosted acceptance is complete.
+**Extends**: [PRD #2149](../prds/done/2149-plan-cross-check.md), especially D1, D4–D7 and D16. Its hosted acceptance was closed by maintainer decision on #2152 (2026-10-23).
 
 ## Context
 
@@ -429,3 +429,157 @@ now goes through the checked-plan loop before its first human gate. Decisions:
   added and dispositions never gate approval.
 
 Not shipped: live k8s acceptance of the wait and a hosted rollback rehearsal (PRD #3708 M3).
+
+## Amendment 2026-11-03 — #3841: owner steering in plan checker input
+
+A plan checker could not verify a plan claim attributed to the run owner (for example "the
+owner answered that the migration may be skipped"), so such claims stayed uninspectable and
+unverified. Each new plan-stage round now freezes a bounded snapshot of the run owner's own
+answers and revise feedback for the checker. Decisions:
+
+- **Source and attribution.** Owner attribution comes from the write path, not from content.
+  Answers come from the owner-scoped answer writer (`CreateRunAnswerInput` via the owner's
+  `submitAnswer`); revise feedback comes from `CreateRunReviseInputIfUnderCap`. System
+  completion-continue answers are excluded through a `completion_decision` audit row carrying
+  the `question_id`, written before the answer so no answer is ever visible without its mark.
+  The question text is context, attributed to the lead or worker that asked it, never to the
+  owner. Documented gap: a generic `CreateRunInput` call with a variable kind is not guarded at
+  Go level; today's callers are the two writers above.
+- **One-statement cutoff.** One SQL statement (`SnapshotOwnerSteering`, one MVCC snapshot)
+  takes the cutoff as the highest committed input id visible to that statement and reads the
+  entries up to it. An insert still in flight lands in the next round. The snapshot is written
+  in the same transaction as the round row; a retry writes nothing, so every claim of a round
+  delivers identical bytes with a sha256 digest. The digest is an integrity check, not
+  tamper-proofing.
+- **Shape guards and caps.** A malformed answer or question context gets a status marker and
+  never fails the round. Owner text is scrubbed before the cap. Caps: the 32 newest entries,
+  8 KiB per answer or revise entry, 4 KiB per question context, 64 KiB per snapshot; overflow
+  is marked `entry_cap` or `byte_cap`.
+- **Context binding.** An answer is paired with its question context by `question_id`: no
+  occurrence is `unavailable`; more than one distinct variant is `ambiguous`; a context whose
+  status is not ok is `malformed` or `oversized`; identical re-emissions share one context.
+  Only a bound, complete context lets a checker rely on what an answer meant.
+- **Revise binding.** Each revise entry carries its gate binding: `bound`, `unbound`, or null
+  when none applies, so the checker can tell which plan the feedback addressed.
+- **Child table.** The snapshot lives in the child table `cross_check_owner_steering`, not on
+  the hot `cross_checks` row: the existing row is untouched, no row means "none supplied" for
+  legacy rounds, and the immutability trigger is scoped to the child. Migration files are
+  drafts renumbered at landing, so they are not named here.
+- **Owner decision 2026-11-03: capability rollout accepted.** Only plan-stage checker children
+  with an owner-steering row require the new capability `cross_check_owner_steering_v1`.
+  Legacy rows and code-stage checks keep today's eligibility. Availability cost: the api rolls
+  first and from then every new plan round has a row, while workers move to the new image only
+  when they next roll while idle, so a new api can face an all-old checker pool. Until a
+  capable worker registers, steering-bearing plan checks are not claimed; the health reason
+  "Plan cross-check is waiting: no online worker supports owner-steering checks
+  (cross_check_owner_steering_v1)" explains the wait, and at the deadline the check takes the
+  existing fallback to the ordinary human plan gate.
+- **Envelope allowance, header-scoped.** The server's existing claim-size limit is evaluated on
+  the payload without steering; the steering bytes are bounded separately (6 x 65536 + 64 + 57
+  = 393337 wire bytes). The claim response carries `X-Uzi-Owner-Steering: v1` only when the
+  field is present, and the worker applies its larger read allowance only on the claim read
+  carrying that header. All other boundaries are unchanged.
+- **Unchanged.** `candidate_digest` and the code-stage checks are unchanged. The checker
+  brief renders two nonce-fenced data sections, `owner_steering` (owner-authored) and
+  `owner_steering_questions` (lead or worker authored, never owner), and states that an absent,
+  omitted, truncated or unparseable owner entry, or an answer whose question context is
+  unavailable, ambiguous, malformed or truncated, cannot by itself establish an exception.
+  Because issue and lead-authored text could carry a lookalike `owner_steering` block, the plan
+  prompt opens with a worker-authored line naming the two genuine fence suffixes, and the brief
+  says only those blocks are supplied steering.
+
+## Amendment 2026-11-06 — #3953: credential switch during a candidate reservation
+
+A credential switch that arrives while an automatic plan cross-check holds its candidate
+transport reservation (`checkPlan` reserves the batcher before submit) used to abort the
+reservation and fail the run. The worker now defers it; the dispositions above are unchanged.
+
+- **Hold.** The runner opens `SteeringChannel.holdCredentialSwitch()` immediately before
+  `checkPlan`. While held, a switch (from the poll, a state ACK or a `switch_pending` input
+  receipt) is latched: nothing is aborted, `shutdownStop` included, and no waiter is rejected.
+  Cancel, claim fence, receipt failure, worker shutdown and disk stop are not held.
+- **Service points.** The latch is serviced synchronously only once the reservation is released
+  and verified, before any other checker round, storage, plan execution or model call: S1 after
+  an APPROVE returns (before the semantic review or any emit), S2 after an automatic REVISE
+  (before the revision turn), S3 in each checked human gate's `onApplied` after
+  `releaseAppliedGate`. A give-up of a human gate resumes the presented gate (same presentation,
+  revision and verdict binding, no republish). No other exit ever services the latch: the hold
+  is closed without service when the reservation was released, and otherwise stays open with the
+  unreleased reservation for the rest of the flight, which that failure ends. A failure therefore
+  keeps its existing disposition and is never turned into a switch. No timer cancels a live
+  reservation.
+- **Decision stashes.** At S1/S2, when a switch is in play, the checker decision is kept for the
+  give-up re-run. Both stashes are bound to the claim generation, round, plan text and
+  milestones; the approve stash also carries the candidate digest, compared on semantic runs
+  (elsewhere the server owns the hash). It survives only the
+  `CredentialSwitchSignal` control exit, is adopted once at the first same-generation
+  continuation, and is cleared on mismatch (fail closed), any other failure, the next plan-gate
+  entry, a release and flight end. On a release the next claim re-discovers; the round-1 findings
+  text is not carried.
+- **Invariant guards.** If a reservation is ever installed when the in-place switch hook (G1) or
+  the outer `CredentialSwitchSignal` arm (G2) runs, the run fails terminally as an invariant
+  violation (`CandidateTransportInvariantError`): no switch report, the batcher is closed, and
+  the held-event loss is logged. Tests drive the poll, state-ACK and `switch_pending` receipt
+  trip entries (the state-ACK and receipt entries pin ordering) and show none reaches either
+  guard during a reservation.
+- **Residual window.** A `switch_pending` input receipt can arrive after the human gate's
+  presentation; a ready input is parked and a held batch is left unapplied for the next claim,
+  so no input is lost.
+
+### Deferral bound (audited at 3fc80e34; gate checkpoint re-audited at ad711991)
+
+The switch can wait only as long as the reservation lives. Bounds are read from code with the
+production defaults (request 3 s, preparation ≤3 s, poll ≤15 s, HTTP 30 s, server deadline
+`PLAN_CROSS_CHECK_TIMEOUT` default 30 m, worker-side cap 2 h in `checkPlan`):
+
+| Path | Components | Default deadline | Worst case (2 h deadline) |
+|---|---|---|---|
+| APPROVE / automatic REVISE | prepare ≤3 s, submit stage ≤30 s, poll window to the deadline, final transport check ≤3 s | ≈31 min | ≈2 h 1 min (7,236 s) |
+| Checked human gate (timed out, block, gated pass), first gate | the above + 3 s, semantic review ≤60 s, resumed-delivery wait ≤153 s (failure path), `planChangedFiles` ≤600 s, receipt settlement ≤60 s, presentation report ≤422 s, preparation ≤9 s | ≈53 min (rounded up) | ≈2 h 23 min (8,543 s, rounded up) |
+
+**Open: the gate checkpoint on a re-plan gate.** `prepareGateCheckpoint` runs only when the
+claim carries frozen execution milestones and the candidate's milestones differ from them, so a
+first plan gate never reaches it (the table above). On such a re-plan gate it runs with the
+reservation still installed, and on Claude its 60 s signal does not bound it: the runner-uid git
+commands in the capture take only the 600 s git timeout, and the bare-repository lock waits and
+the attributed-process reap joins it can reach have no timer at all (a single hung git command
+alone takes it well past 600 s; Codex's capture scope does cap it near 60 s). Under the approved plan an
+unbounded component is a stop condition, so this step has no stated bound here and awaits an
+owner design decision; no timer was added and no reservation is cancelled. The owner accepted
+it as documented, with a follow-up to bound the step.
+
+**Accepted limit: an owner Cancel during the hold.** While the switch stamp is pending, the
+server's input consume returns only the switch signal and withholds every input row, and with a
+live poller an owner Cancel is queued as such a row rather than applied server-side. So a Cancel
+pressed during the hold takes effect only after the reservation settles and the switch is
+serviced: on a give-up the held flight applies it; after a release it waits for the next claim.
+Its bound is the hold's own: the audited bounds in the table above for the listed paths; on a
+re-plan gate (the open item above) it has no fixed bound until that follow-up lands. Meanwhile the checker child may keep running until
+its verdict or deadline. A server-side terminal cancel still ends the held flight at once, and a
+second Cancel after the release applies at once. The owner accepted this limit for #3953; prompt
+Cancel during the hold is #3974.
+
+**Amendment (#3974): an owner Cancel during the hold is observed promptly.** The server still
+withholds the cancel row. While the switch is withheld, by this hold or by the M5b revision-turn
+defer, each worker poll that sees the current-generation switch signal makes one bounded,
+read-only ownership probe for `cancellation_requested` (the #3860 field). A positive answer,
+re-checked synchronously, commits the cancel exactly as a delivered cancel input would. A sticky
+flag then makes every later switch trip a no-op, and the runner's switch entry points take the
+ordinary "run cancelled" route instead: no switch capture, no `credential_switch*` report, no
+plan storage or gate presentation. The worker's `failed` report then settles the lead, the stamp,
+the cancel row, and, through the exit trigger, the pending round and the checker child in one
+transaction. Custody is the ordinary owner-cancel disposition; observing the Cancel starts no
+switch-specific custody operation. A probe failure, timeout or `false` counts as unknown and
+commits nothing, so an api without the field keeps the limit above. Remaining limits: on a
+re-plan gate the worker latches the Cancel promptly, but an in-flight gate checkpoint step (the
+open item above) delays the terminal report with no fixed bound until #3980; it presents no gate
+and services no switch afterwards. Graceful stop and auto-stop rows stay withheld (the probe reads
+only `stop_kind = 'cancelled'`); auto-stop still escalates server-side on its own timer. A Cancel
+pressed during the hold that a release beats still waits for the reclaim; one pressed after the
+release applies at once. A cancel controller already spent by a refused "now" pause
+stops the SDK turn only at its next boundary.
+
+These rest on stated assumptions: request timeouts propagate through `fetch` and body reads; the
+poll compares against the worker clock; executor-sequenced sink callbacks do not run during the
+plan gate; and the resumed-delivery wait, which predates this change, is bounded by its failure
+and stall counters rather than a wall-clock timer.

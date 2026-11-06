@@ -21,6 +21,11 @@ import (
 // reporting the given protocol capabilities.
 func (f *crFix) guardWorker(t *testing.T, maxRuns int, proto ...string) store.Worker {
 	t.Helper()
+	return f.protocolWorker(t, maxRuns, append([]string{capability.RepoAgentSourceV1}, proto...)...)
+}
+
+func (f *crFix) protocolWorker(t *testing.T, maxRuns int, proto ...string) store.Worker {
+	t.Helper()
 	id := uuid.New()
 	a, b := uuid.New(), uuid.New()
 	if proto == nil {

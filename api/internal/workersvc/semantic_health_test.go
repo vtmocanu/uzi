@@ -34,6 +34,9 @@ func TestHealthSemanticQueuedReasons(t *testing.T) {
 		{"semantic checker, capable worker online", store.GetRunSemanticHealthRow{PlanCheckerEnrolled: true, PlanCheckerCapable: 1}, nil, reasonWaitingWorker},
 		{"semantic lead, no capable worker", store.GetRunSemanticHealthRow{LeadEnrolled: true}, nil, reasonNoSemanticPublicationCapableWorker},
 		{"semantic lead, capable worker online", store.GetRunSemanticHealthRow{LeadEnrolled: true, PublicationCapable: 2}, nil, reasonWaitingWorker},
+		{"steering child, no capable worker", store.GetRunSemanticHealthRow{OwnerSteeringEnrolled: true}, nil, reasonNoOwnerSteeringCapableWorker},
+		{"steering child, capable worker online", store.GetRunSemanticHealthRow{OwnerSteeringEnrolled: true, OwnerSteeringCapable: 1}, nil, reasonWaitingWorker},
+		{"semantic reason keeps precedence", store.GetRunSemanticHealthRow{PlanCheckerEnrolled: true, OwnerSteeringEnrolled: true}, nil, reasonNoSemanticPlanCheckerCapableWorker},
 		{"structural run is never named", store.GetRunSemanticHealthRow{}, nil, reasonWaitingWorker},
 		{"lookup failure falls through", store.GetRunSemanticHealthRow{LeadEnrolled: true}, errors.New("boom"), reasonWaitingWorker},
 	} {

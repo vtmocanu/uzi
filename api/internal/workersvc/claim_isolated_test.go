@@ -93,10 +93,11 @@ func TestAssembleClaimRefusesLaneMismatch(t *testing.T) {
 	}
 }
 
-// PRD #1906 M5 (Decision D-D): runOwnedByWorker's purpose check. A run the store says the
-// worker holds is still not owned when its binding disagrees with the worker's lane marker, so
-// no worker-facing run operation acts on it; an agreeing pair is owned.
-func TestRunOwnedByWorkerPurposeCheck(t *testing.T) {
+// PRD #1906 M5 (Decision D-D): the ownership read's purpose check (ownedRunOrRefusal, shared by
+// runOwnedByWorker and RunOwnership's runOwnershipRead). A run the store says the worker holds
+// is still not owned when its binding disagrees with the worker's lane marker, so no
+// worker-facing run operation acts on it; an agreeing pair is owned.
+func TestRunOwnershipPurposeCheck(t *testing.T) {
 	bound := pgtype.UUID{Bytes: uuid.New(), Valid: true}
 	for name, tc := range map[string]struct {
 		bound, lane, owned bool
@@ -111,7 +112,7 @@ func TestRunOwnedByWorkerPurposeCheck(t *testing.T) {
 			run.EgressProfileID = bound
 		}
 		s := New(&fakeStore{runOwned: run}, nil, testParams())
-		status, _, gen, _, _, _, err := s.RunOwnership(context.Background(), store.Worker{ID: uuid.New(), IsolatedLane: tc.lane}, run.ID)
+		status, _, gen, _, _, _, _, err := s.RunOwnership(context.Background(), store.Worker{ID: uuid.New(), IsolatedLane: tc.lane}, run.ID)
 		switch {
 		case tc.owned && (err != nil || status != "running" || gen != 3):
 			t.Errorf("%s: RunOwnership = %q, %d, %v; want the owned run", name, status, gen, err)

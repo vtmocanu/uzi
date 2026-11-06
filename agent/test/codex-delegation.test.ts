@@ -6,6 +6,8 @@ import { PassThrough } from "node:stream";
 import { createCodexTransport } from "../src/codex/transport.js";
 import assert from "node:assert/strict";
 import { buildCodexRunPlan } from "../src/codex/run-builder.js";
+import { parseCodexAgentFile } from "../src/repoagents-codex.js";
+import { filterRepoAgentModel } from "../src/repoagents.js";
 
 import {
   CodexDelegationRunner,
@@ -170,6 +172,34 @@ function makeRunner(opts: {
   });
   return { runner, registry, spawn, fileop, startSpecs };
 }
+
+describe("TOML model delegation delivery", () => {
+  it("carries parsed and projected pins into StartChildTurnSpec with inherited effort", async () => {
+    for (const pin of ['model = "gpt-6-luna"', "", 'model = ""']) {
+      const parsed = parseCodexAgentFile(
+        'name = "coder"\ndescription = "Works."\ndeveloper_instructions = "Implement."\n' + pin, "file",
+      );
+      assert.equal(parsed.ok, true);
+      if (!parsed.ok) return;
+      const template = filterRepoAgentModel(parsed.template, "codex");
+      const plan = buildCodexRunPlan({
+        phase: "implement", prompt: "task", systemPrompt: "lead", signal: new AbortController().signal,
+        model: "gpt-6-astra", effort: "low", leadSkills: [],
+        agents: { coder: {
+          description: template.description, prompt: template.prompt_body, model: template.model ?? undefined,
+          tools: { kind: "inherit" }, deniedTools: [], skills: [], toolServers: [],
+        } },
+      });
+      const controller = new FakeController({ notes: [] });
+      withNotes(controller, [turnCompletedNote(controller, "completed")]);
+      const b = makeRunner({ roles: new Map(plan.roles), controller });
+      assert.equal((await b.runner.run(delegReq())).ok, true);
+      assert.equal(b.startSpecs.length, 1);
+      assert.equal(b.startSpecs[0]!.model, pin === 'model = "gpt-6-luna"' ? "gpt-6-luna" : "gpt-6-astra");
+      assert.equal(b.startSpecs[0]!.effort, "low");
+    }
+  });
+});
 
 describe("Codex instruction guidance delivery (#2264 M1)", () => {
   for (const phase of ["plan", "implement"] as const) {

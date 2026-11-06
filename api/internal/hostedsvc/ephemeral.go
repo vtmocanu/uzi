@@ -98,7 +98,8 @@ type EphemeralConfig struct {
 	// The saturation trigger path (issue #747) relies on this SAME (c) idle-stolen arm:
 	// when a burst worker loses the race and a freed base slot claims its bound run, the
 	// now-idle burst pod is reaped here. That race resolves in seconds while this grace is
-	// 10m, so a lost-race burst pod (DinD, 20Gi PVC) can sit fully provisioned and idle for
+	// 10m, so a lost-race burst pod (DinD, with its per-preset data claim: 20Gi for s/m, 50Gi for
+	// l/l-highmem, issue #3890) can sit fully provisioned and idle for
 	// up to the deadline before GC. This cost is ACCEPTED (issue #747 M3): the debounce
 	// lowers the race probability, and a shorter idle-grace for the saturation arm would
 	// require a second knob, which collides with the "one deadline" decision above — so the
