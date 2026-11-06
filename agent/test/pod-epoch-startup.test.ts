@@ -287,4 +287,6 @@ test("the deletion dependencies main builds bind the runner reservation, never c
 test("main binds the deletion quiesce to the worker-wide terminal maintenance proof over the Docker host", () => {
   const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
   assert.match(code, /quiesce\s*:\s*\(\s*\)\s*=>\s*terminalMaintenanceProof\s*\(\s*3\s*,\s*parts\s*\.\s*dockerHost\s*\)/);
+  // The deletion binding is worker-wide and never takes a per-pass daemon guard.
+  assert.doesNotMatch(code, /openDaemonGuard/);
 });
