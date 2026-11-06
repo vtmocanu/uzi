@@ -287,3 +287,42 @@ func TestApprovalWithoutChoiceKeepsSavedSelectionLiveDB(t *testing.T) {
 		})
 	}
 }
+
+func TestEmptyApprovalDeliversSavedSelectionLiveDB(t *testing.T) {
+	f := newGateFix(t, 3)
+	f.liveWorker()
+	for _, c := range persistedSelectionCases {
+		t.Run(c.name, func(t *testing.T) {
+			run := f.gatedRun()
+			setPersistedSelection(f, run, c)
+			if _, err := f.svc.SubmitInputWithOptions(f.ctx, f.userID, run, "approve_plan", "", nil, SubmitInputOptions{}); err != nil {
+				t.Fatalf("approve: %v", err)
+			}
+			got, err := f.svc.ConsumeInputs(f.ctx, f.wkr, run)
+			if err != nil {
+				t.Fatalf("consume: %v", err)
+			}
+			var verdict *InputDTO
+			for i := range got.Inputs {
+				if got.Inputs[i].Kind == "approve_plan" {
+					verdict = &got.Inputs[i]
+				}
+			}
+			if verdict == nil || verdict.Body == nil {
+				t.Fatalf("no approve_plan verdict delivered: %+v", got.Inputs)
+			}
+			var sel AgentSelection
+			if err := json.Unmarshal([]byte(*verdict.Body), &sel); err != nil {
+				t.Fatalf("approve_plan body %q is not a selection: %v", *verdict.Body, err)
+			}
+			if sel.Source != c.want || !jsonEqual(t, mustJSON(t, sel.Exclusions), c.wantExcl) {
+				t.Fatalf("delivered selection = %+v, want (%s, %s)", sel, c.want, c.wantExcl)
+			}
+			r, err := f.q.GetRunByID(f.ctx, run)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertSelectionColumns(t, r, c)
+		})
+	}
+}

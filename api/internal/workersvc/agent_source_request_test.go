@@ -2,6 +2,7 @@ package workersvc
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 
@@ -46,14 +47,21 @@ func TestMaterializeRequestedSelection(t *testing.T) {
 			}
 		})
 	}
-	t.Run("a saved selection is kept when no choice is made", func(t *testing.T) {
-		for _, saved := range []string{AgentSourceOwn, AgentSourceRepo} {
-			for _, exclusions := range [][]byte{[]byte(`[]`), []byte(`["site-plan-check"]`), []byte(`not json`)} {
-				run := store.Run{AgentSourceRequested: requested("repo"), RepoAgents: roster,
-					AgentSource: pgtype.Text{String: saved, Valid: true}, AgentExclusions: exclusions}
-				if got := materializeRequestedSelection(run, nil); got != nil {
-					t.Fatalf("saved %s %s: got %+v, want no replacement", saved, exclusions, *got)
-				}
+	t.Run("a saved selection is sent explicitly when no choice is made", func(t *testing.T) {
+		for _, tc := range []struct {
+			saved, exclusions, wantSource string
+			wantExclusions                []string
+		}{
+			{AgentSourceOwn, `[]`, AgentSourceOwn, []string{}},
+			{AgentSourceRepo, `[]`, AgentSourceRepo, []string{}},
+			{AgentSourceRepo, `["site-plan-check"]`, AgentSourceRepo, []string{"site-plan-check"}},
+			{AgentSourceRepo, `not json`, AgentSourceOwn, []string{}},
+		} {
+			run := store.Run{AgentSourceRequested: requested("repo"), RepoAgents: roster,
+				AgentSource: pgtype.Text{String: tc.saved, Valid: true}, AgentExclusions: []byte(tc.exclusions)}
+			got := materializeRequestedSelection(run, nil)
+			if got == nil || got.Source != tc.wantSource || !slices.Equal(got.Exclusions, tc.wantExclusions) {
+				t.Fatalf("saved %s %s: got %+v, want {%s %v}", tc.saved, tc.exclusions, got, tc.wantSource, tc.wantExclusions)
 			}
 		}
 	})
