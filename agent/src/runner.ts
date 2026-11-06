@@ -1972,7 +1972,7 @@ export class BaseAttestationMissingError extends Error {
 }
 
 export class RepoAgentSourceUnavailableError extends Error {
-  constructor(message: string, readonly commit: string) {
+  constructor(message: string, readonly commit: string, readonly beforeSeed = false) {
     super(message);
     this.name = "RepoAgentSourceUnavailableError";
   }
@@ -6058,6 +6058,7 @@ export class RunRunner {
         await this.enterBaseAttestationHold(claim, flight, err, runLog);
       } else if (err instanceof RepoAgentSourceUnavailableError && this.client.protocolFeatures.includes(REPO_AGENT_SOURCE_FEATURE)) {
         await this.enterRepoAgentSourceHold(claim, flight, err, runLog);
+        if (err.beforeSeed && flight.parked) await this.settleUnadoptedGuardedClaim(claim, flight, runLog, true);
       } else if (codexDeferralOf(err) !== undefined) {
         // Codex credentials were deferred by a vault lock, an unknown boundary refresh,
         // or exhausted epoch-start release retries. Vault locks also arise mid-turn.
@@ -7773,14 +7774,14 @@ export class RunRunner {
    * on any doubt; this method only gates on the flight never having reached a clone. Best-effort:
    * it never throws and never changes the run's honest report.
    */
-  private async settleUnadoptedGuardedClaim(claim: ClaimResponse, flight: RunFlight, runLog: Logger): Promise<void> {
+  private async settleUnadoptedGuardedClaim(claim: ClaimResponse, flight: RunFlight, runLog: Logger, fetchedOnly = false): Promise<void> {
     if (flight.cancellationBudget && this.cancellationExpired(flight)) return;
     if (!MaintenanceBudget.current() && flight.cancellationBudget) {
-      return this.runCancellationMaintenance(flight, () => this.settleUnadoptedGuardedClaim(claim, flight, runLog)).catch(() => undefined);
+      return this.runCancellationMaintenance(flight, () => this.settleUnadoptedGuardedClaim(claim, flight, runLog, fetchedOnly)).catch(() => undefined);
     }
     if (claim.inventory_guarded !== true || !claim.claim_generation || !this.recovery.enabled ||
         !isCodePublishingKind(resolveRunKind(claim.kind)) ||
-        flight.barePath !== undefined || flight.worktreePath !== undefined || flight.runnerClone !== undefined) return;
+        (flight.barePath !== undefined && !fetchedOnly) || flight.worktreePath !== undefined || flight.runnerClone !== undefined) return;
     try {
       const outcome = await this.recovery.settleUnadoptedGuardedGeneration({
         runId: claim.run_id, generation: claim.claim_generation,
@@ -13731,7 +13732,7 @@ export class RunRunner {
     const capturedSource = this.capturedRepoAgentSource(claim, flight.defaultBranchTip);
     if ("unresolved" in capturedSource && !claim.repo_agent_source_commit && claim.publication_resume === undefined &&
         this.client.protocolFeatures.includes(REPO_AGENT_SOURCE_FEATURE)) {
-      throw new RepoAgentSourceUnavailableError(capturedSource.unresolved, "");
+      throw new RepoAgentSourceUnavailableError(capturedSource.unresolved, "", true);
     }
     // issue #1783 M2: attempt-path mode mints this attempt's id BEFORE the seed: it names the
     // fresh attempt clone path, and the journal, the ledger and the attempt marker reuse it.

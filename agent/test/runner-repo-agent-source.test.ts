@@ -9,6 +9,7 @@ import { GitCache } from "../src/git.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import type { Executor, RunContext } from "../src/executor.js";
 import { RunRunner } from "../src/runner.js";
+import { RecoveryCoordinator } from "../src/recovery.js";
 import type { BaseAttestationHoldOutcome, ClaimResponse } from "../src/protocol.js";
 import { REPO_AGENT_SOURCE_FEATURE } from "../src/protocol.js";
 import { api, client, fakeGitlab, fx, installHarness } from "./runner-harness.js";
@@ -93,14 +94,17 @@ function reportedCommits(runId: string): string[] {
 
 type HoldRequest = { runId: string; commit: string; claimGeneration: number };
 
-async function withHoldSpy<T>(fn: (requests: HoldRequest[]) => Promise<T>): Promise<T> {
+async function withHoldSpy<T>(
+  fn: (requests: HoldRequest[]) => Promise<T>,
+  answer: BaseAttestationHoldOutcome = { outcome: "held", status: "paused" },
+): Promise<T> {
   const requests: HoldRequest[] = [];
   const orig = client.requestRepoAgentSourceHold.bind(client);
   (client as unknown as { requestRepoAgentSourceHold: unknown }).requestRepoAgentSourceHold = async (
     runId: string, args: { commit: string; claimGeneration: number },
   ): Promise<BaseAttestationHoldOutcome> => {
     requests.push({ runId, ...args });
-    return { outcome: "held", status: "paused" };
+    return answer;
   };
   try {
     return await fn(requests);
@@ -123,6 +127,56 @@ function landPublishes(branch: string): { tip: () => string | undefined; restore
     return { ok: true, body: { published: true, ref: `refs/uzi-checkpoints/${branch}` } };
   };
   return { tip: () => tip, restore: () => { (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = orig; } };
+}
+
+const EMPTY_DIGEST = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+interface CustodyRig {
+  cache: GitCache;
+  coordinator: RecoveryCoordinator;
+  releases: { runId: string; generation?: number; evidence?: string; disposition?: unknown }[];
+  settled: [string, number][];
+  runner: (executor: Executor) => RunRunner;
+}
+
+function custodyRig(generation: number): CustodyRig {
+  client.protocolFeatures = [REPO_AGENT_SOURCE_FEATURE, "recovery_inventory_v1"];
+  client.hasFeature = (name: string) => name === "recovery_inventory_v1";
+  client.listRecoveryHolds = async (runId: string) => ({ run_id: runId, holds: [
+    { hold_id: "hold", generation, inventory_guarded: true, has_available_capture: false },
+  ] });
+  const releases: CustodyRig["releases"] = [];
+  client.releaseRecoveryCustody = async (runId, gen, evidence, disposition) => {
+    releases.push({ runId, generation: gen, evidence, disposition });
+    return { run_id: runId, generation: gen, released: true, holds_released: 1 };
+  };
+  const settled: [string, number][] = [];
+  (client as unknown as { markInventoryGuardedClaimSettled: (r: string, g: number) => void })
+    .markInventoryGuardedClaimSettled = (r, g) => { settled.push([r, g]); };
+  const cache = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
+  const coordinator = new RecoveryCoordinator({
+    client, git: cache, log: nullLogger(), recoveryRoot: cache.recoveryRoot, workerToken: "journal-key",
+    unadoptedSettleRetryDelaysMs: [0, 0, 0],
+  });
+  const { gitlab } = fakeGitlab();
+  return {
+    cache, coordinator, releases, settled,
+    runner: (executor) => new RunRunner(client, cache, () => ({ executor }), nullLogger(), 20, "journal-key",
+      { pollMs: 5, planApprovalTimeoutMs: 0, gitlab, recovery: coordinator }),
+  };
+}
+
+function emptyOrigin(kind: "empty" | "unborn"): string {
+  const dir = fs.mkdtempSync(path.join(path.dirname(fx.dataDir), `${kind}-origin-`));
+  execFileSync("git", ["init", "-q", "-b", "main", dir], { env: hermeticGitEnv() });
+  if (kind === "unborn") {
+    gitIn(dir, ["checkout", "-q", "-b", "elsewhere"]);
+    fs.writeFileSync(path.join(dir, "README.md"), "elsewhere\n");
+    gitIn(dir, ["add", "-A"]);
+    gitIn(dir, [...IDENT, "commit", "-q", "-m", "only on another branch"]);
+    gitIn(dir, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+  }
+  return dir;
 }
 
 function statusTexts(runId: string): string[] {
@@ -473,6 +527,76 @@ describe("repo-agent roster pinned to the default-branch revision (issue #3913)"
       });
     });
   }
+
+  for (const kind of ["empty", "unborn"] as const) {
+    it(`an ${kind} default branch settles the generation's empty custody hold while the run stays held`, async () => {
+      await withHoldSpy(async (requests) => {
+        const rig = custodyRig(5);
+        let ran = false;
+        const claim = claimFor(HARNESSES[0]!, { issue_iid: 78, issue_title: `${kind} custody`, claim_generation: 5, inventory_guarded: true });
+        claim.repo = { ...claim.repo, clone_url: emptyOrigin(kind) };
+        await rig.runner({ run: async (ctx) => { ran = true; return { branch: ctx.branch }; } }).execute(claim);
+        assert.equal(ran, false, "the agent never started");
+        assert.deepEqual(requests, [{ runId: claim.run_id, commit: "", claimGeneration: 5 }]);
+        assert.deepEqual(rig.releases, [{ runId: claim.run_id, generation: 5, evidence: "forge_no_output",
+          disposition: { kind: "settled", coverage_digest: EMPTY_DIGEST } }]);
+        assert.deepEqual(rig.settled, [[claim.run_id, 5]]);
+        const states = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
+        assert.ok(!states.some((s) => s === "completed" || s === "failed"), JSON.stringify(states));
+      });
+    });
+  }
+
+  for (const source of ["journal record", "retained clone"] as const) {
+    it(`an empty default branch keeps the custody hold when a ${source} of the generation exists`, async () => {
+      await withHoldSpy(async (requests) => {
+        const rig = custodyRig(5);
+        const claim = claimFor(HARNESSES[0]!, { issue_iid: 79, issue_title: source, claim_generation: 5, inventory_guarded: true });
+        claim.repo = { ...claim.repo, clone_url: emptyOrigin("empty") };
+        if (source === "journal record") {
+          await rig.coordinator.pin({ runId: claim.run_id, generation: 5, kind: "issue", branch: "agent/issue-79",
+            sourceSha: "a".repeat(40), inventoryGuarded: true });
+        } else {
+          rig.cache.readInventoryCloneHeads = async () => ({ kind: "verified", heads: [],
+            clones: [{ path: "retained" }], foreignOwners: [] }) as never;
+        }
+        let ran = false;
+        await rig.runner({ run: async (ctx) => { ran = true; return { branch: ctx.branch }; } }).execute(claim);
+        assert.equal(ran, false, "the agent never started");
+        assert.equal(requests.length, 1, "the run was held");
+        assert.deepEqual(rig.releases, []);
+        assert.deepEqual(rig.settled, []);
+      });
+    });
+  }
+
+  it("an unconfirmed pre-seed source hold keeps the custody hold", async () => {
+    await withHoldSpy(async (requests) => {
+      const rig = custodyRig(5);
+      const claim = claimFor(HARNESSES[0]!, { issue_iid: 80, issue_title: "stale hold", claim_generation: 5, inventory_guarded: true });
+      claim.repo = { ...claim.repo, clone_url: emptyOrigin("empty") };
+      await rig.runner({ run: async (ctx) => ({ branch: ctx.branch }) }).execute(claim);
+      assert.equal(requests.length, 1);
+      assert.deepEqual(rig.releases, []);
+      assert.deepEqual(rig.settled, []);
+    }, { outcome: "stale", status: "running" });
+  });
+
+  it("a source hold after the clone was seeded keeps the custody hold", async () => {
+    await withHoldSpy(async (requests) => {
+      const rig = custodyRig(5);
+      const h = HARNESSES[0]!;
+      const trusted = commitOnOrigin({ [h.file]: h.content("Original review body") }, "ship the reviewer");
+      const claim = claimFor(h, { issue_iid: 81, issue_title: "seeded hold", claim_generation: 5, inventory_guarded: true });
+      api.failStateWhen(claim.run_id, (b) => b.repo_agent_source_commit !== undefined, { httpStatus: 400 });
+      let ran = false;
+      await rig.runner({ run: async (ctx) => { ran = true; return { branch: ctx.branch }; } }).execute(claim);
+      assert.equal(ran, false, "the agent never started");
+      assert.deepEqual(requests, [{ runId: claim.run_id, commit: trusted, claimGeneration: 5 }]);
+      assert.deepEqual(rig.releases, []);
+      assert.deepEqual(rig.settled, []);
+    });
+  });
 
   it("without the api feature a failed roster report does not stop the run", async () => {
     const h = HARNESSES[0]!;
