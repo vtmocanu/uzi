@@ -10,7 +10,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import type { InventorySourceBoundaryContext, InventorySourceDiagnostic } from "../src/recovery.js";
 import { newRunAttempt, type QuiesceRunRequest, type RunAttempt } from "../src/run-quiescence.js";
-import { GitCache } from "../src/git.js";
+import { GitCache, INVENTORY_CONTENT_PROOF_BOUNDS } from "../src/git.js";
 import { fakeGitlab, git, installHarness, runner } from "./runner-harness.js";
 installHarness();
 
@@ -43,8 +43,8 @@ const clone = (name: string, head = "a".repeat(40), identity = "1:1"): Clone =>
 function world(opts: { codex?: boolean; claimGeneration?: number; deadlineAt?: number; clones?: () => Clone[];
   baseline?: Clone[]; attemptPath?: string; quiesce?: (req: QuiesceRunRequest) => void | Promise<void> } = {}) {
   const requests: QuiesceRunRequest[] = [];
-  const w: { cancelled: boolean; fence: unknown; clones: () => Clone[]; reads: unknown[][]; content: (p: string) => string; ignored: (p: string) => string } = {
-    cancelled: false, fence: undefined, reads: [], clones: opts.clones ?? (() => [clone("issue-1")]),
+  const w: { cancelled: boolean; fence: unknown; clones: () => Clone[]; reads: unknown[][]; bounds: unknown[]; content: (p: string) => string; ignored: (p: string) => string } = {
+    cancelled: false, fence: undefined, reads: [], bounds: [], clones: opts.clones ?? (() => [clone("issue-1")]),
     content: () => "clean", ignored: () => "clean",
   };
   const r = runner({ run: async () => { throw new Error("unreached executor"); } }, fakeGitlab().gitlab, undefined, {
@@ -66,8 +66,8 @@ function world(opts: { codex?: boolean; claimGeneration?: number; deadlineAt?: n
     const clones = w.clones();
     return { kind: "verified", heads: [...new Set(clones.map(c => c.head))], clones, foreignOwners: [] };
   }) as typeof git.readInventoryCloneHeads;
-  git.inventorySourceContentProof = (async (p: string) => w.content(p)) as typeof git.inventorySourceContentProof;
-  git.inventoryIgnoredResidue = (async (p: string) => w.ignored(p)) as typeof git.inventoryIgnoredResidue;
+  git.inventorySourceContentProof = (async (p: string, b?: unknown) => { w.bounds.push(b); return w.content(p); }) as typeof git.inventorySourceContentProof;
+  git.inventoryIgnoredResidue = (async (p: string, b?: unknown) => { w.bounds.push(b); return w.ignored(p); }) as typeof git.inventoryIgnoredResidue;
   git.worktreeStatus = async () => { throw new Error("worktreeStatus is not part of the inventory boundary"); };
   const registration = internals.registerPredecessorBoundary(flight, held, {
     generations: [1, 2], deadlineAt: opts.deadlineAt ?? Infinity,
@@ -148,6 +148,17 @@ describe("predecessor boundary: grant, tail and scope", () => {
     });
     assert.equal(out.result, "retained");
     assert.deepEqual(out.diagnostics, [{ check: "boundary_exception" }]);
+  });
+
+  it("the predecessor path hands the grant deadline to both proofs; the ordinary path keeps the default", async () => {
+    const deadlineAt = Date.now() + 600_000;
+    const x = world({ deadlineAt });
+    assert.equal((await x.enter(1, x.registration.token, async prove => { await prove(); })).result, "passed");
+    assert.deepEqual(x.w.bounds, Array(4).fill({ ...INVENTORY_CONTENT_PROOF_BOUNDS, deadlineAt }), "content proof and residue listing, on each of two proves");
+    x.w.bounds.length = 0;
+    await x.internals.withInventorySourceBoundary({ runId: "run-ordinary", generation: 1, barePath: "/fixture/repo.git" },
+      async prove => { await prove(); });
+    assert.deepEqual(x.w.bounds, [undefined, undefined], "ordinary: content proof only, default bounds");
   });
 
   it("a valid token with a foreign runId is refused", async () => {

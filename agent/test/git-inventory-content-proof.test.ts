@@ -7,7 +7,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { GitCache, type InventoryContentProofBounds } from "../src/git.js";
+import { GitCache, runnerGitCarriesWorkerMark, type InventoryContentProofBounds } from "../src/git.js";
 import { nullLogger } from "./helpers.js";
 
 const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
@@ -18,7 +18,7 @@ interface Seam {
   runGitAsRunnerBytes(cwd: string, args: string[], opts?: { input?: Buffer; timeoutMs?: number }): Promise<BytesResult>;
 }
 // `args` is the subcommand argv with the leading --git-dir/--work-tree pins split off into `pins`.
-interface Call { args: string[]; pins: string[]; input?: Buffer; timeoutMs?: number }
+interface Call { args: string[]; pins: string[]; config: string[]; input?: Buffer; timeoutMs?: number }
 const isPin = (a: string): boolean => a.startsWith("--git-dir=") || a.startsWith("--work-tree=");
 
 function fixture(t: test.TestContext) {
@@ -37,8 +37,12 @@ function fixture(t: test.TestContext) {
   const calls: Call[] = [];
   let override: ((args: string[], real: () => Promise<BytesResult>) => Promise<BytesResult> | undefined) | undefined;
   seam.runGitAsRunnerBytes = async (cwd, args, opts) => {
-    const bare = args.filter(a => !isPin(a));
-    calls.push({ args: bare, pins: args.filter(isPin), ...(opts?.input ? { input: opts.input } : {}),
+    // Strip the pins and any leading `-c key=value` pairs; the pins stay recorded, the -c pairs in `config`.
+    const noPins = args.filter(a => !isPin(a));
+    const config: string[] = [];
+    while (noPins[0] === "-c") config.push(...noPins.splice(0, 2).slice(1));
+    const bare = noPins;
+    calls.push({ args: bare, pins: args.filter(isPin), config, ...(opts?.input ? { input: opts.input } : {}),
       ...(opts?.timeoutMs === undefined ? {} : { timeoutMs: opts.timeoutMs }) });
     return override?.(bare, () => real(cwd, args, opts)) ?? real(cwd, args, opts);
   };
@@ -224,6 +228,81 @@ describe("inventorySourceContentProof (issue #2969 D5)", () => {
     }
   });
 
+  test("--git-dir/--work-tree pins keep the worker mark of ls-files and leave status unmarked", () => {
+    assert.equal(runnerGitCarriesWorkerMark(["--git-dir=a", "--work-tree=b", "ls-files"]), true);
+    assert.equal(runnerGitCarriesWorkerMark(["--git-dir=a", "--work-tree=b", "-c", "k=v", "rev-parse"]), true);
+    assert.equal(runnerGitCarriesWorkerMark(["--git-dir=a", "--work-tree=b", "status"]), false);
+  });
+
+  test("a replace ref over a large blob never yields a clean proof or a large read", async t => {
+    const f = fixture(t);
+    const big = path.join(f.root, "big.bin");
+    fs.writeFileSync(big, "");
+    fs.truncateSync(big, 8 * 1024 * 1024);
+    f.commitAll();
+    const bigOid = f.g("rev-parse", "HEAD:big.bin");
+    const tiny = execFileSync("git", ["-C", f.root, "hash-object", "-w", "--stdin"], { env: GIT_ENV, input: "tiny\n", encoding: "utf8" }).trim();
+    f.g("replace", bigOid, tiny);
+    // With replacement honoured the index would report 5 bytes for an 8 MiB blob; the pin makes the real size visible.
+    const result = await f.proof({ maxEntries: 100, maxBytes: 1 << 20, maxContentBytes: 1024 * 1024 });
+    assert.equal(result, "over_bound");
+    assert.equal(f.hashCalls().length, 0);
+    assert.ok(f.calls.length > 0);
+    assert.equal(await f.proof(), "clean", "with the default cap the genuine content still proves clean");
+  });
+
+  test("a path with a filter attribute is unreadable with zero hash dispatch", async t => {
+    const f = fixture(t);
+    fs.writeFileSync(path.join(f.root, ".gitattributes"), "*.lfs filter=lfs\n");
+    fs.writeFileSync(path.join(f.root, "pointer.lfs"), "tiny pointer\n");
+    fs.writeFileSync(path.join(f.root, "plain.txt"), "p\n");
+    f.commitAll();
+    assert.equal(await f.proof(), "unreadable");
+    assert.equal(f.hashCalls().length, 0);
+    // filter=unset / no attribute is fine
+    fs.writeFileSync(path.join(f.root, ".gitattributes"), "*.lfs -filter\n");
+    f.commitAll();
+    assert.equal(await f.proof(), "clean");
+  });
+
+  test("core.checkStat=minimal in .git/config does not stop the status rescan (the pin overrides it)", async t => {
+    const f = fixture(t);
+    f.g("config", "core.trustctime", "false");
+    f.g("config", "core.checkStat", "minimal");
+    const file = path.join(f.root, "data.txt");
+    fs.writeFileSync(file, "AAAA\n");
+    const past = new Date(Date.now() - 3_600_000);
+    fs.utimesSync(file, past, past);
+    f.commitAll();
+    // ctime moves on rewrite; only a pinned trustctime=true notices it when the config says otherwise.
+    fs.writeFileSync(file, "BBBB\n");
+    fs.utimesSync(file, past, past);
+    assert.equal(f.g("status", "--porcelain"), "", "precondition: the repository's own config calls it clean");
+    const status = f.calls.length;
+    assert.equal(await f.proof(), "dirty");
+    const statusCall = f.calls.slice(status).find(c => c.args[0] === "status")!;
+    assert.ok(statusCall.config.includes("core.checkStat=default") && statusCall.config.includes("core.trustctime=true") &&
+      statusCall.config.includes("core.untrackedCache=false"));
+  });
+
+  test("the whole proof shares one time budget", async t => {
+    const f = fixture(t);
+    fs.writeFileSync(path.join(f.root, "a.txt"), "a\n");
+    f.commitAll();
+    const timeouts: number[] = [];
+    const seam = f.git as unknown as Seam;
+    const inner = seam.runGitAsRunnerBytes;
+    seam.runGitAsRunnerBytes = async (cwd, args, opts) => {
+      timeouts.push(opts?.timeoutMs ?? -1);
+      await new Promise(resolve => setTimeout(resolve, 120));
+      return inner(cwd, args, opts);
+    };
+    assert.equal(await f.proof({ maxEntries: 10, maxBytes: 1 << 20, deadlineAt: Date.now() + 300 }), "unreadable");
+    assert.ok(timeouts.length >= 2 && timeouts.length < 6, "stopped dispatching once the budget was gone: " + timeouts.length);
+    for (let i = 1; i < timeouts.length; i++) assert.ok(timeouts[i]! < timeouts[i - 1]!, "each call gets only what is left");
+    assert.ok(timeouts[0]! <= 300);
+  });
+
   test("every git call pins --git-dir and --work-tree to the clone", async t => {
     const f = fixture(t);
     fs.writeFileSync(path.join(f.root, "a.txt"), "a\n");
@@ -280,7 +359,7 @@ describe("inventorySourceContentProof (issue #2969 D5)", () => {
     assert.ok(f.calls.length > 0 && f.calls.every(c => c.timeoutMs !== undefined && c.timeoutMs <= 5_000 && c.timeoutMs > 0));
     f.calls.length = 0;
     assert.equal(await f.proof(), "clean");
-    assert.ok(f.calls.every(c => c.timeoutMs === 60_000), "an explicit per-call timeout without a deadline");
+    assert.ok(f.calls.every(c => c.timeoutMs! <= 60_000 && c.timeoutMs! > 59_000), "the 60s total budget bounds each call without a deadline");
   });
 
   describe("caps", () => {

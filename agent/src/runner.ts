@@ -42,6 +42,7 @@ import {
   isNonFastForwardRejection,
   isPushProtectionRejection,
   isWorkflowScopeRejection,
+  INVENTORY_CONTENT_PROOF_BOUNDS,
 } from "./git.js";
 import type { SecretFinding } from "./secret-scan-guard.js";
 import {
@@ -4356,8 +4357,10 @@ export class RunRunner {
       const before = await this.quiesceImpl(request);
       if (before.process?.state !== "quiescent")
         return fail("process_not_quiescent_before_git", inventoryProcessDiagnostic("process_not_quiescent_before_git", before.process, otherClaimInFlight), clone.clonePath);
-      const content = await this.git.inventorySourceContentProof(clone.clonePath);
-      const ignored = grant && content === "clean" ? await this.git.inventoryIgnoredResidue(clone.clonePath) : "clean";
+      const bounds = grant ? { ...INVENTORY_CONTENT_PROOF_BOUNDS, deadlineAt: grant.deadlineAt } : undefined;
+      const content = bounds ? await this.git.inventorySourceContentProof(clone.clonePath, bounds)
+        : await this.git.inventorySourceContentProof(clone.clonePath);
+      const ignored = grant && content === "clean" ? await this.git.inventoryIgnoredResidue(clone.clonePath, bounds) : "clean";
       const after = await this.quiesceImpl({ ...request, dockerHost: undefined, site: "inventory_source:after_runner_git" });
       scope();
       if (content === "unreadable") return fail("worktree_status_unreadable", { check: "worktree_status_unreadable" }, clone.clonePath);

@@ -912,14 +912,21 @@ export interface InventoryContentProofBounds {
   maxEntries: number;
   /** Bytes of any one listing's output. */
   maxBytes: number;
-  /** Cumulative index-recorded size of every regular file `hash-object` would read (default {@link INVENTORY_CONTENT_PROOF_BOUNDS}). */
+  /**
+   * Cheap early refusal on the cumulative `%(objectsize)` of every regular file `hash-object` would read (default
+   * {@link INVENTORY_CONTENT_PROOF_BOUNDS}). It bounds only HONESTLY reported sizes: the index size is
+   * agent-influenced, and a file grown by a multiple of 2^32 bytes with its mtime restored can keep a stale 32-bit
+   * stat size. That residual case is bounded by the aggregate wall budget below and ends as `dirty` or
+   * `unreadable`, never `clean`.
+   */
   maxContentBytes?: number;
-  /** Epoch ms the caller's operation ends; each git call's timeout is clipped to it and a passed deadline is unreadable. */
+  /** Epoch ms the caller's operation ends; the proof's total budget is clipped to it. A passed deadline is unreadable. */
   deadlineAt?: number;
 }
 export const INVENTORY_CONTENT_PROOF_BOUNDS = { maxEntries: 50_000, maxBytes: 8 * 1024 * 1024, maxContentBytes: 256 * 1024 * 1024 } as const;
-/** Ceiling for any single git call of the content proof or the residue listing. */
-const INVENTORY_PROOF_CALL_TIMEOUT_MS = 60_000;
+/** Total wall budget for the WHOLE content proof (or the whole residue listing), shared by all of its git calls:
+ *  each call's timeout is the time left in it, and an exhausted budget is unreadable. */
+const INVENTORY_PROOF_TOTAL_BUDGET_MS = 60_000;
 
 /** The one `ls-files --directory` entry that is not residue: `.uzi/` collapsed because it is ignored as a whole. */
 const UZI_DIR_ENTRY = Buffer.from(".uzi/");
@@ -15245,7 +15252,7 @@ try {
   /**
    * Strict, byte-exact working-tree proof for the inventory FINAL source boundary (issue #2969). Unlike
    * {@link worktreeStatus} it never trusts the index stat cache alone and refuses anything it cannot read exactly:
-   *  1. `status --porcelain=v1 -z --untracked-files=all` (non-zero exit or any stderr: unreadable; any output: dirty);
+   *  1. `status --porcelain=v1 -z --untracked-files=all` with checkStat/trustctime/untrackedCache pinned (non-zero exit or any stderr: unreadable; any output: dirty);
    *  2. `ls-files -v -z`: any tag but `H` (assume-unchanged, skip-worktree, unmerged) is unreadable;
    *  3. `ls-files -z --format=...` (mode, id, stage, size, path): a malformed record, a non-zero stage or a gitlink is unreadable; symlinks (mode 120000)
    *     are covered by step 1 and are not hashed;
@@ -15266,7 +15273,8 @@ try {
       const pinned = await this.pinnedInventoryGit(cwd, bounds);
       if (!pinned) return "unreadable";
       const run = pinned;
-      const status = await run(["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+      const status = await run(["-c", "core.checkStat=default", "-c", "core.trustctime=true", "-c", "core.untrackedCache=false",
+        "status", "--porcelain=v1", "-z", "--untracked-files=all"]);
       if (!status) return "unreadable";
       if (status.exceeded) return "over_bound";
       if (status.code !== 0 || status.stderr.length > 0) return "unreadable";
@@ -15297,9 +15305,24 @@ try {
         contentBytes += Number(header[4]);
         files.push({ path: entryPath, oid: header[2]! });
       }
-      // Decided from the index sizes BEFORE any byte is hashed. A worktree size that differs from the index is dirty via status.
+      // Decided from the index sizes BEFORE any byte is hashed (honest sizes only; see maxContentBytes). The
+      // %(objectsize) listing reads every blob header, so a missing object makes the listing fail: unreadable.
       if (contentBytes > maxContentBytes) return "over_bound";
       if (files.length === 0) return "clean";
+      // A clean/smudge filter (LFS included) makes the blob small while the worktree file may be huge, with status
+      // still clean. Any regular path with a filter attribute set is refused before a byte is hashed.
+      const attrs = await run(["check-attr", "-z", "--stdin", "filter"],
+        Buffer.concat(files.flatMap(f => [f.path, Buffer.from([0])])));
+      if (!attrs) return "unreadable";
+      if (attrs.exceeded) return "over_bound";
+      if (attrs.code !== 0 || attrs.stderr.length > 0) return "unreadable";
+      const triples = splitNulRecords(attrs.stdout);
+      if (!triples || triples.length !== files.length * 3) return "unreadable";
+      for (const [i, f] of files.entries()) {
+        const value = triples[i * 3 + 2]!.toString("latin1");
+        if (!triples[i * 3]!.equals(f.path) || triples[i * 3 + 1]!.toString("latin1") !== "filter" ||
+            (value !== "unspecified" && value !== "unset")) return "unreadable";
+      }
       const format = await run(["rev-parse", "--show-object-format"]);
       if (!format || format.code !== 0 || format.stderr.length > 0) return "unreadable";
       const idLength = { sha1: 40, sha256: 64 }[format.stdout.toString("latin1").trim() as "sha1" | "sha256"];
@@ -15334,12 +15357,16 @@ try {
     const gitDir = path.join(cwd, ".git");
     const st = await fs.lstat(gitDir);
     if (!st.isDirectory() || st.isSymbolicLink()) return undefined;
+    // One budget for every call of this proof, not one per call.
+    const endsAt = Math.min(Date.now() + INVENTORY_PROOF_TOTAL_BUDGET_MS, bounds.deadlineAt ?? Infinity);
     return async (args: string[], input?: Buffer) => {
-      const remaining = bounds.deadlineAt === undefined ? Infinity : bounds.deadlineAt - Date.now();
+      const remaining = endsAt - Date.now();
       if (remaining <= 0) return undefined;
-      return this.runGitAsRunnerBytes(cwd, [`--git-dir=${gitDir}`, `--work-tree=${cwd}`, ...args], {
-        env: { GIT_OPTIONAL_LOCKS: "0" }, maxBuffer: bounds.maxBytes,
-        timeoutMs: Math.min(INVENTORY_PROOF_CALL_TIMEOUT_MS, remaining), ...(input ? { input } : {}),
+      // GIT_NO_REPLACE_OBJECTS: a replace ref must not make the proof read a different blob than the index names.
+      const pins = [`--git-dir=${gitDir}`, `--work-tree=${cwd}`];
+      return this.runGitAsRunnerBytes(cwd, [...pins, ...args], {
+        env: { ...NO_REPLACE_ENV, GIT_OPTIONAL_LOCKS: "0" }, maxBuffer: bounds.maxBytes,
+        timeoutMs: remaining, ...(input ? { input } : {}),
       });
     };
   }
