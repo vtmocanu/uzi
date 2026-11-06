@@ -1591,7 +1591,7 @@ describe("issue #3953 m3: semantic coverage forces a human gate after the checke
       if (captures === 2) throw new Error("planning diff capture failed after the give-up");
       return Buffer.from("");
     };
-    const outcome: { rerunError?: unknown; later?: { kind: string } } = {};
+    const outcome: { rerunError?: unknown; later?: { kind: string }; sessionReported?: boolean } = {};
     const exec: Executor = { run: async (ctx) => {
       failingCapture();
       const call = (md = "Implement A") => ctx.gatePlan!(md, milestones, undefined, undefined, submitted(c.issue_iid));
@@ -1602,6 +1602,11 @@ describe("issue #3953 m3: semantic coverage forces a human gate after the checke
         // The give-up re-run fails in its pre-adoption work with a non-switch error.
         outcome.rerunError = await ctx.continueExistingPlanGate!(() => call()).then(() => undefined, (e: unknown) => e);
       }
+      // The failed re-run settled the dropped stash's state barrier: a non-checked `running` report (the
+      // session-id persist) goes out rather than waiting on it.
+      ctx.onSessionId?.("session-after-failed-rerun");
+      outcome.sessionReported = await until(() => api.states.some((s) => s.runId === c.run_id &&
+        s.body.status === "running" && s.body.session_id === "session-after-failed-rerun"), 4000);
       // A later entry of the same flight presents a different candidate.
       outcome.later = await call("Implement A, as revised after the failure");
       return { branch: ctx.branch };
@@ -1610,6 +1615,7 @@ describe("issue #3953 m3: semantic coverage forces a human gate after the checke
       planCrossCheckTiming: timing, recoveryRetryMs: 1, planApprovalTimeoutMs: 4000 }).execute(c);
     assert.ok(outcome.rerunError instanceof Error && !(outcome.rerunError instanceof CredentialSwitchSignal) &&
       outcome.rerunError.message.includes("planning diff"), `the re-run failed outside the switch path: ${String(outcome.rerunError)}`);
+    assert.equal(outcome.sessionReported, true, "a non-checked running report reached the api, not held by the dropped stash's state barrier");
     assert.ok(!everyState(c.run_id).some((s) => s.failure_reason?.includes("stashed decision")),
       "the stale stash was never consulted by the later entry");
     assert.equal(outcome.later?.kind, "approve", `the later entry presented its own gate: ${JSON.stringify(everyState(c.run_id).map((s) => [s.status, s.failure_reason]))}`);
