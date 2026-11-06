@@ -370,7 +370,7 @@ it("combined #3994/#3995: post-adoption transport retry settles an owner pause i
   assert.equal(run.claims.length, 1, "the owner pause must not cause a second claim");
   assert.equal(run.model.requeues, 0, "the owner pause must not consume automatic requeue allowance");
   assert.equal(run.ownershipReads, 2, "the failed transport read is retried before pause settlement");
-  assert.equal(run.logs.lines.filter(line => line.msg === "retained post-adoption ownership read transient; retrying").length, 1);
+  assert.equal((run.logs.lines as Array<Record<string, any>>).filter(line => line.msg === "retained post-adoption ownership read transient; retrying").length, 1);
   assert.equal(run.model.requeueCount, 0);
   assert.equal(run.model.status, "paused");
   assert.equal(run.model.pausedApplied, 1, "one server-confirmed pause");
