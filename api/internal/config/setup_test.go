@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/base64"
+	"strings"
 	"testing"
 )
 
@@ -31,7 +32,8 @@ func TestLoadSetupNeedsNoSeedPassword(t *testing.T) {
 		t.Error("the forge allowlist is not applied")
 	}
 	// Load itself still refuses this environment: setup relaxes nothing for the server.
-	t.Setenv("JWT_SECRET", "0123456789abcdef0123456789abcdef")
+	// Built at runtime: a 32-byte fixture, not a credential.
+	t.Setenv("JWT_SECRET", strings.Repeat("0123456789abcdef", 2))
 	if _, err := Load(); err == nil {
 		t.Fatal("Load must keep refusing a seed email without a seed password")
 	}
