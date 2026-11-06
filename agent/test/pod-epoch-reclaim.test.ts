@@ -7,6 +7,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { resolve, join } from "node:path";
 import { runPodEpochShadow, readPodEpochProjection, PodEpochSettlementError, EPOCH_RECLAIM_DELETION_ENABLED } from "../src/pod-epoch-reclaim.js";
+import { PodEpochDaemonError } from "../src/pod-epoch-daemon.js";
 import { WorkerClient } from "../src/client.js";
 import { buildPodEpochDeletionDeps } from "../src/main.js";
 import { nullLogger } from "./helpers.js";
@@ -1414,6 +1415,26 @@ test("fatal outcomes throw PodEpochSettlementError, keep EX and never reach the 
     } finally { for (const cancel of timers) cancel(); await d.close(); }
   }
 });
+test("the coordinator itself is fatal for a pending child or stop latch after a discard, even when finish would succeed", async () => {
+  for (const latch of ["pending", "stopped"] as const) {
+    const w = deletionWorld(2, world => {
+      world.discard = (_o, path) => {
+        if (latch === "pending") world.pending = 1; else world.stopped = true;
+        return { kind: "done", sources: [{ clonePath: path, outcome: "removed" }], metadata: "retired", tookOver: true };
+      };
+    });
+    const d = await daemon(); w.options.dockerHost = d.host;
+    const timers: Array<() => void> = [];
+    w.options.schedule = (callback, ms) => { const t = setTimeout(callback, ms); const c = () => clearTimeout(t); timers.push(c); return c; };
+    try {
+      await assert.rejects(runPodEpochShadow(w.options), PodEpochSettlementError, latch);
+      assert.equal(w.spies.finishes, 0, latch + ": finish is never reached");
+      assert.equal(w.calls.handovers, 0, latch); assert.ok(!w.events.includes("handover"), latch);
+      assert.deepEqual(w.spies.reserved, ["run0"], latch + ": the second source never starts");
+      assert.equal(w.spies.discards.length, 1, latch);
+    } finally { for (const cancel of timers) cancel(); await d.close(); }
+  }
+});
 test("shutdown mid-pass starts no new source and leaves the handover to the process exit", async () => {
   const reads: string[] = [];
   await withDeletion(3, w => {
@@ -1494,13 +1515,37 @@ test("a mid-deletion daemon veto stops the loop with the daemon reason and keeps
     assert.equal(w.spies.proofs.length, 1);
   } finally { await d.close(); }
 });
+test("a daemon error from a guard that has not aborted still ends the pass with its reason, not a per-source keep", async () => {
+  const w = deletionWorld(3);
+  let armed = false;
+  const guard = { signal: new AbortController().signal, close: async () => {},
+    assertHealthy() { if (armed) throw new PodEpochDaemonError("daemon_event"); } };
+  w.options.openDaemonGuard = async () => guard;
+  const inner = w.options.git.inspectRetainedSources;
+  let second = 0;
+  w.options.git.inspectRetainedSources = async o => {
+    // The deletion-phase re-inspect of run1 (its shadow inspection was the first).
+    if (o.selector!.runId === "run1" && ++second === 2) armed = true;
+    return inner(o);
+  };
+  const result = (await runPodEpochShadow(w.options))!;
+  assert.equal(guard.signal.aborted, false, "the guard never aborted, so no veto listener fired");
+  assert.equal(result.reason, "daemon_event");
+  assert.equal(result.deleted, 1, "run0 was deleted before the error");
+  assert.equal(result.kept_after_refusal, 0, "a daemon error is not a per-source keep");
+  assert.deepEqual(w.spies.reserved, ["run0"], "no later source reaches the reservation");
+  assert.equal(w.spies.discards.length, 1);
+});
 test("a path observed in two groups with a different bare path or selector is demoted and never deleted", async () => {
-  const variants: Array<[string, { barePath: string; attempt: string }]> = [
+  const variants: Array<[string, { barePath: string; attempt: string; runId?: string; generation?: number }]> = [
     ["bare path", { barePath: "/bare2", attempt: "attempt" }], ["selector", { barePath: "/bare", attempt: "other" }],
+    ["run id only", { barePath: "/bare", attempt: "attempt", runId: "run1" }],
+    ["generation only", { barePath: "/bare", attempt: "attempt", generation: 2 }],
   ];
   for (const [label, second] of variants) {
     await withDeletion(1, w => {
-      w.groups.push({ barePath: second.barePath, selector: { runId: "run0", generation: 1, attempt: second.attempt }, paths: ["/tree/0"] });
+      w.groups.push({ barePath: second.barePath,
+        selector: { runId: second.runId ?? "run0", generation: second.generation ?? 1, attempt: second.attempt }, paths: ["/tree/0"] });
       const inner = w.options.git.inspectRetainedSources;
       w.options.git.inspectRetainedSources = async o => {
         const r = await inner(o);

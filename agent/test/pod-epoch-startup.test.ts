@@ -283,3 +283,8 @@ test("the deletion dependencies main builds bind the runner reservation, never c
   // Without a recorded maintenance bootstrap the proof is a denial; it never reaches Docker or retains a source.
   assert.equal(await deps.quiesce(["/tree/0"]), false);
 });
+
+test("main binds the deletion quiesce to the worker-wide terminal maintenance proof over the Docker host", () => {
+  const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+  assert.match(code, /quiesce\s*:\s*\(\s*\)\s*=>\s*terminalMaintenanceProof\s*\(\s*3\s*,\s*parts\s*\.\s*dockerHost\s*\)/);
+});
