@@ -94,11 +94,13 @@ source at commit `6aaac694` (`codex-rs/core/src/client.rs:957-966`).
 
 - `none` means no reasoning level is requested: either the catalog has no
   default for the model, or its default is `none`.
-- A catalog default of `ultra` is not sent as-is; Codex substitutes a supported
+- A catalog default of `ultra` is not sent as-is; Codex substitutes another
   level.
-- Repository `.codex/config.toml` files are not loaded (uzi marks the checkout
-  untrusted), so they cannot change the default.
-- A resumed session may keep the level it last used.
+- Repository `.codex/config.toml` files are ignored (Codex disables project
+  config for untrusted checkouts, and uzi marks the checkout untrusted), so
+  they cannot change the default.
+- A resume that reattaches to a still-running Codex thread keeps that thread's
+  level.
 
 ### Effort reporting
 
