@@ -130,8 +130,17 @@ function StationButton({
           }`}
         />
       )}
-      {/* Vertical layout only: the line continues down to the next station. */}
-      {!last && <span aria-hidden="true" className="absolute bottom-0 left-6 top-[23px] w-0.5 bg-edge-strong md:hidden" />}
+      {/* Vertical layout only: one continuous rail from the first node's centre to the last
+          node's centre. Each piece reaches 1px past the button's padding box to cross its
+          transparent border; the node centre sits 23px down (top-3.5 plus half the node). */}
+      <span
+        aria-hidden="true"
+        data-rail=""
+        className={`absolute left-6 w-0.5 bg-edge-strong md:hidden ${first ? "top-[23px]" : "-top-px"} ${
+          last ? "h-6" : "-bottom-px"
+        }`}
+      />
+
       <span
         aria-hidden="true"
         data-node={station.gate ? "gate" : live ? "fill" : "outline"}

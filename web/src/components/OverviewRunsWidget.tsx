@@ -58,12 +58,15 @@ export function OverviewRunsWidget({
   const onStage = (r: RunSummaryItem) => stage == null || issueLineStage(r, openPrIds) === stage;
   const filtered = stage != null;
   const yours = stage === "pr" ? prRuns : ownRuns.filter((r) => !isTerminalRun(r.status) && onStage(r));
-  const others = (adminRuns?.runs ?? []).filter(
-    (r) => r.owner_email !== viewerEmail && !isTerminalRun(r.status) && onStage(r),
-  );
+  const adminFailed = isAdmin && adminRuns?.failed === true;
+  // A failed admin read keeps its last good rows, but the line is drawn without them
+  // (otherRuns is empty), so they must not shape the label or the empty sentence either.
+  const others =
+    isAdmin && !adminFailed
+      ? (adminRuns?.runs ?? []).filter((r) => r.owner_email !== viewerEmail && !isTerminalRun(r.status) && onStage(r))
+      : [];
   // "Questions" when another user's question is in the group, as the line's bay says.
   const scope = stage == null ? "Active runs" : stage === "asking" && others.length > 0 ? "Questions" : STAGE_NAMES[stage];
-  const adminFailed = isAdmin && adminRuns?.failed === true;
 
   return (
     <Card>

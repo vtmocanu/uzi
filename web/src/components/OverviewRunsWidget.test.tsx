@@ -224,6 +224,20 @@ describe("OverviewRunsWidget", () => {
       expect(titles("Your runs")).toHaveLength(1);
     });
 
+    it("ignores the last good rows of a failed admin read under a filter, as the line does", () => {
+      const stale = [theirs({ id: "t-q", status: "awaiting_input", issue_title: "Stale question" })];
+      const failed = { runs: stale, failed: true, lastOkAt: NOW - 60_000 };
+      mount({ isAdmin: true, ownRuns: [run({ id: "o-b", status: "running" })], adminRuns: failed, stage: "asking" });
+      expect(scope()).toBe("Asking you");
+      expect(screen.getByText("No runs at this stage.")).toBeTruthy();
+      expect(screen.queryByText("Stale question")).toBeNull();
+      expect(screen.getByRole("status").textContent).toBe("Other users' runs are unavailable");
+      cleanup();
+      mount({ isAdmin: true, ownRuns: [run({ id: "o-q", status: "awaiting_input" })], adminRuns: failed, stage: "asking" });
+      expect(scope()).toBe("Asking you");
+      expect(screen.queryByText("No runs at this stage.")).toBeNull();
+    });
+
     it("calls the asking group Questions when another user's question is in it", () => {
       const q = [theirs({ id: "t-q", status: "awaiting_input" })];
       mount({ isAdmin: true, ownRuns: [run({ id: "o-q", status: "awaiting_input" })], adminRuns: good(q), stage: "asking" });

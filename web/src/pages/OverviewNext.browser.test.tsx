@@ -232,9 +232,23 @@ describe("OverviewNext issue work line", () => {
     const segments = Array.from(card.querySelectorAll<HTMLElement>("[data-segment]"));
     expect(segments.length).toBeGreaterThan(0);
     for (const seg of segments) expect(getComputedStyle(seg).display).toBe("none");
-    // The rail piece under each station but the last stays drawn.
-    const rails = Array.from(card.querySelectorAll<HTMLElement>('[data-stage="queued"] > span[aria-hidden="true"]'));
-    expect(rails.some((el) => getComputedStyle(el).display !== "none" && el.getBoundingClientRect().height > 0)).toBe(true);
+    // The rail pieces join into one rail from the first node's centre to the last node's centre.
+    const rails = Array.from(card.querySelectorAll<HTMLElement>("[data-rail]"))
+      .filter((el) => getComputedStyle(el).display !== "none")
+      .map((el) => el.getBoundingClientRect())
+      .sort((a, b) => a.top - b.top);
+    const nodes = Array.from(card.querySelectorAll<HTMLElement>("[data-node]")).map((el) => {
+      const r = el.getBoundingClientRect();
+      return r.top + r.height / 2;
+    });
+    expect(rails).toHaveLength(nodes.length);
+    expect(rails[0].top).toBeCloseTo(nodes[0], 0);
+    let reach = rails[0].bottom;
+    for (const r of rails.slice(1)) {
+      expect(r.top - reach).toBeLessThanOrEqual(1);
+      reach = Math.max(reach, r.bottom);
+    }
+    expect(reach).toBeCloseTo(nodes[nodes.length - 1], 0);
   });
 
   it("filters the Runs card from the keyboard: Tab to a station, Enter picks it, Space lets go", async () => {
