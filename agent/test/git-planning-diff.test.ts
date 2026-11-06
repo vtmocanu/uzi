@@ -2273,8 +2273,9 @@ describe("Base discovery aggregate caps (#3543)", { skip: process.platform !== "
     } finally { await f.dispose(); }
   });
 
-  // 50,000 files in 500 directories (50,500 entries), each file a few bytes so the capture time is
-  // dominated by base discovery rather than reading and hashing file content.
+  // 50,000 files in 500 directories (50,500 entries). Each file is a few bytes, so content reads
+  // and hashing add little; the remaining capture time is per-tree and per-directory git spawns
+  // and per-file opens.
   it("captures a 50k-file synthetic tree at production defaults", { timeout: 90_000 }, async t => {
     const setupStarted = Date.now();
     const f = await fixture({ gitTimeoutMs: 80000, seed: async seed => {
