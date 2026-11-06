@@ -172,8 +172,8 @@ describe("RunRunner — PRD #1809 D4 soft layer: a run that stays over the cap p
 
   it("repeated soft parks never produce a failure, even past the api's counted-park cap", async () => {
     await withHomeRoot(async (homeRoot) => {
-      // A fake api with the real cap rule: past 3 COUNTED parks a disk park fails the run; a
-      // preventive park is never counted.
+      // Counted parks saturate at three and then wait for the owner; preventive parks
+      // keep a timed retry and never consume that budget.
       class CappedApiClient extends WorkerClient {
         counted = 0;
         readonly acks: string[] = [];
@@ -183,10 +183,11 @@ describe("RunRunner — PRD #1809 D4 soft layer: a run that stays over the cap p
         }
         override async reportState(runId: string, body: StateRequest): Promise<StateAck> {
           if (body.status !== "recovery_wait") return await super.reportState(runId, body);
-          if (body.recovery_cause === "data_volume_full" && body.disk_park_preventive !== true) this.counted++;
-          const status = this.counted > 3 ? "failed" : "recovery_wait";
+          const held = body.disk_park_preventive !== true && this.counted >= 3;
+          if (body.recovery_cause === "data_volume_full" && body.disk_park_preventive !== true && !held) this.counted++;
+          const status = "recovery_wait";
           this.acks.push(status);
-          return { applied: true, status };
+          return { applied: true, status, recoveryRetryNotBefore: held ? null : "2026-11-06T12:00:00Z" };
         }
       }
       const capped = new CappedApiClient();

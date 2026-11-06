@@ -8500,7 +8500,7 @@ export class RunRunner {
       return "parked";
     }
     if (ack.status && TERMINAL_RUN_STATUSES.has(ack.status)) {
-      // cancelled, or failed when the cap branch committed the terminal state, or any other
+      // cancelled, failed by a legacy server or another terminal cause, or any other
       // authoritative terminal status: close the still-open batcher, no park event, no second
       // report. A guarded pre-clone hold still needs positive empty-inventory evidence
       // after this confirmed terminal outcome; the finally does ordinary cleanup.
@@ -8563,8 +8563,8 @@ export class RunRunner {
     copy: PreCloneParkCopy = FORGE_PARK_COPY,
   ): Promise<void> {
     const { batcher } = flight;
-    const when = retryAt === null && copy === FORGE_PARK_COPY
-      ? "automatic forge retries exhausted; waiting for owner Resume or Cancel"
+    const when = retryAt === null && (copy === FORGE_PARK_COPY || copy === DATA_VOLUME_PARK_COPY)
+      ? `automatic ${copy === DATA_VOLUME_PARK_COPY ? "disk" : "forge"} retries exhausted; waiting for owner Resume or Cancel`
       : retryAt ? `retry at ${retryAt}` : "retry after backoff";
     batcher.emit({
       kind: "status",
@@ -21985,10 +21985,13 @@ export class RunRunner {
             return true;
           }
           if (ack.status === "recovery_wait" && !credentialDeferred && disk) {
-            runLog.info("run parked mid-run for its data volume; its caches are dropped and it resumes automatically", {
+            const held = ack.recoveryRetryNotBefore === null;
+            const continuation = held ? "it waits for owner Resume or Cancel" : "it resumes automatically";
+            runLog.info(`run parked mid-run for its data volume; ${continuation}`, {
               run_id: flight.runId,
               cause: "data_volume_full",
               preventive: disk.preventive,
+              retry_not_before: ack.recoveryRetryNotBefore,
               typed: parkBody.recovery_cause !== undefined,
               published: capture.published,
             });
@@ -21997,10 +22000,10 @@ export class RunRunner {
               agent: "worker",
               payload: {
                 text: degraded
-                  ? "paused for a full data volume; the unverified work and session are retained on this worker only until capture succeeds"
+                  ? `paused for a full data volume; the unverified work and session are retained on this worker only until capture succeeds${held ? "; the run waits for owner Resume or Cancel" : ""}`
                   : disk.preventive
-                  ? "paused because this run's build caches stayed over their size cap; the caches are dropped and it resumes automatically"
-                  : "paused because the worker's data volume is nearly full; this run's build caches are dropped and it resumes automatically",
+                  ? `paused because this run's build caches stayed over their size cap; the caches are dropped and ${continuation}`
+                  : `paused because the worker's data volume is nearly full; this run's build caches are dropped and ${continuation}`,
               },
             });
             // No reapThenSettleRecoveryGeneration: the custody hold is kept (see `disk` above).
