@@ -361,7 +361,7 @@ describe("automatic approved content roots", () => {
   }
 });
 
-it("refuses unpublished local refs and objects hidden by a common-directory redirect", async () => {
+it("is UNKNOWN for unpublished local refs and objects hidden by a common-directory redirect", async () => {
   const sha = command(clonePath, "-c", "user.name=fixture", "-c", "user.email=fixture@example.test",
     "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "unpublished source");
   command(clonePath, "update-ref", "refs/private/side", sha);
