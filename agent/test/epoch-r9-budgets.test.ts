@@ -1003,16 +1003,14 @@ describe("the clone shape stage classifies its indirection inputs before it char
     bigReflogs();
     await assert.rejects(observation({ maxMetadataBytes: 12_000 }), unknownOf(/^noncanonical object path/));
   });
-  it("a symlinked loose leaf in the clone is UNKNOWN behind an include, which is otherwise a settled keep", async () => {
+  it("a symlinked loose leaf in the clone is UNKNOWN even behind an include, which is itself UNKNOWN", async () => {
     linkedClone("ee");
     fs.appendFileSync(cloneConfigFile(), "[include]\n\tpath = /nonexistent\n");
-    await assert.rejects(observation(), unknownOf(/^noncanonical object path/));
+    await assert.rejects(observation(), unknownOf(/names an include|^noncanonical object path/));
   });
-  it("control: an include alone is a settled keep of the shape stage", async t => {
+  it("control: an include alone is UNKNOWN in the shape stage", async () => {
     fs.appendFileSync(cloneConfigFile(), "[include]\n\tpath = /nonexistent\n");
-    const reasons = reasonsOf(t);
-    assert.equal(await observation(), false);
-    assert.ok(reasons.some(reason => /clone config names an include/.test(reason)), reasons.join("|"));
+    await assert.rejects(observation(), unknownOf(/names an include/));
   });
   it("a symlinked pack member in the clone is UNKNOWN behind an oversized packed-refs", async () => {
     const name = "pack-" + "a".repeat(40);
