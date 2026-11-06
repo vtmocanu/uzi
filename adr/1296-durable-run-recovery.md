@@ -24,6 +24,10 @@ The design lets a retained re-claim settle a **lower** generation's guarded inve
 
 **Why disabled.** The existing quiescence scan targets only the runner uid and cannot see a leftover process of the separate command uid writing into a predecessor clone. An in-process procfs detector was tried and removed: review showed an unprivileged process can cycle the pid counter without being counted (clones that fail after pid allocation, thread pids), so absence could not be proven. A retained re-claim that has lower-generation guarded records to settle logs `command_uid_unproven` and skips the pass before any predecessor operation (other skips log their own reason, such as `budget`); no retained re-claim runs a predecessor operation, and the holds stay open and counted exactly as before. The same command-uid blind spot exists in the ordinary terminal FINAL's quiescence check; it is a known gap, deferred next to #3851.
 
+**Enablement.** Turning the pass on requires a separately reviewed proof contract that rules out a command-uid writer into the predecessor source. Removing the test-only gate alone is not enough. The real UID-split end-to-end lane (M4) belongs to that enablement work; the existing worker-uid CI job does not satisfy it.
+
+**Accepted residual (owner decision 2026-11-06), separate from the command-uid defect.** The scoped quiescence scan does not prove that no arbitrary writer exists: it excludes a process outside the target paths that carries no attempt marker. Such a process can modify the source after the last proof, and those later bytes can be absent from the archive even though the hold is released. The held callback and strict hashing do not exclude it. This residual applies once the pass is enabled and is disclosed, not fixed; [#3831](https://github.com/vtmocanu/uzi/issues/3831) is related design work, not a guaranteed fix. The command-uid defect above is what keeps the pass disabled.
+
 **Deferred, not shipped:**
 
 - A sound command-uid source proof (the prerequisite for enabling the pass).

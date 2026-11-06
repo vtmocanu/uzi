@@ -1941,11 +1941,20 @@ completed-run check above.
 older generation's guarded (inventory) hold is still open, does not yet settle that
 older hold in production. The code exists but is switched off until a proof that no
 leftover command-user process can still write into the older clone is built, so
-those holds stay open and counted toward the admission limit exactly as before;
-resolve them with `uzi run export` or `uzi run discard`. The worker logs
-`command_uid_unproven` when it skips. The quiescence check used before an ordinary
-terminal inventory FINAL has the same blind spot for command-user processes; it is
-a known gap, not yet closed. See the
+those holds stay open and counted toward the admission limit exactly as before.
+To resolve one, first preserve its work with `uzi run export` (export saves the
+evidence but does not settle the hold), then apply a separately authorized
+disposition such as `uzi run discard`. The worker logs `command_uid_unproven` when
+it skips. Enabling the pass will require a separately reviewed proof contract, not
+just removing the switch. The quiescence check used before an ordinary terminal
+inventory FINAL has the same blind spot for command-user processes; it is a known
+gap, not yet closed.
+
+Even once enabled, the pass carries an accepted residual: the scoped quiescence scan
+does not see an unmarked process running outside the clone, so writes such a
+process makes after the last proof can be missing from the archive even though the
+hold is released. This is a disclosed limit, separate from the command-user gap that
+keeps the pass switched off. See the
 [ADR-1296 amendment](../adr/1296-durable-run-recovery.md#amendment-2969-predecessor-guarded-hold-settlement-is-built-and-disabled-in-production).
 
 ## Reviewing and resolving held work
