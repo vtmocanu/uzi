@@ -43,6 +43,10 @@ import {
 } from "./attempt-path.js";
 import { InvalidRecoveryClonePathError, recoveryProgress, recoverySource, sameRecoverySource, type RecoveryBlocker, type RecoveryProgress, type RecoverySource } from "./recovery-progress.js";
 import { parseSourceFence, serializeSourceFence, type CompletionSourceFence } from "./completion-source.js";
+import {
+  RestoreCompositeBlockedError, RestoreCompositeError, parseRestoreValue, restoreDigest, restoreEnvelopeJson, restoreJournalKey,
+  restoreKeyBranch, restoreTombstoneJson, type RestoreBasis, type RestoreStage, type RestoreSuccessor,
+} from "./restore-journal.js";
 import type { GitAuthorityHooks, AuthoritySettlement } from "./git-authority-hooks.js";
 import { ownerGrant, ownerJournalBeforeMatches, ownerJournalMatches, RecoveryChargeInterruptedError, ownerReservation, parseRecoveryOwner, sameOwnerReservation, type RecoveryOwnerRecord } from "./recovery-owner.js";
 export { RecoveryChargeInterruptedError } from "./recovery-owner.js";
@@ -2127,6 +2131,93 @@ function recoveryJournalJson(journal: RecoveryJournalEntry): string {
   return JSON.stringify({ ...withPark, completionSourceFence: parseSourceFence(completionSourceFence) });
 }
 
+// ---- issue #3644 Gate B: the independent-restore journal (plan 3.5) -------------------------------------------------
+//
+// P's `uzi-recovery.<branch>.clone` stays byte-identical for the whole restore; S's own state lives at
+// `uzi-restore.<branch>.journal` (see restore-journal.ts). The strict parsers below validate the remainder of an
+// entry with parseRecoveryJournal and allow no key beyond the five a restored successor's plain journal can carry.
+
+export { RestoreCompositeBlockedError, RestoreCompositeError } from "./restore-journal.js";
+export type { RestoreBasis, RestoreStage, RestoreSuccessor } from "./restore-journal.js";
+
+const RESTORE_REMAINDER_KEYS: ReadonlySet<string> = new Set(["runId", "clonePath", "attemptId", "memoryPark", "completionSourceFence"]);
+
+/** S's decoded `seeding`/`ready` entry. `journal.attemptId` is always present. */
+export interface RestoreEntry {
+  basis: RestoreBasis;
+  stage: RestoreStage;
+  journal: RecoveryJournalEntry & { attemptId: string };
+}
+
+/** Strictly decode a `seeding`/`ready` restore value. Throws {@link RestoreCompositeError}. */
+export function parseRestoreJournal(value: string): RestoreEntry {
+  const v = parseRestoreValue(value);
+  if (v.kind !== "entry") throw new RestoreCompositeError("restore entry is a tombstone");
+  const keys = Object.keys(v.remainder);
+  if (keys.some(k => !RESTORE_REMAINDER_KEYS.has(k)) || typeof v.remainder.attemptId !== "string") {
+    throw new RestoreCompositeError("invalid restore remainder");
+  }
+  let journal: RecoveryJournalEntry;
+  try { journal = parseRecoveryJournal(JSON.stringify(v.remainder)); }
+  catch { throw new RestoreCompositeError("invalid restore remainder"); }
+  // A plain journal's attempt id is not checked against its path by parseRecoveryJournal; S is always an attempt clone.
+  if (journal.attemptId === undefined || !journal.clonePath.endsWith(`.attempt-${journal.attemptId}`)) throw new RestoreCompositeError("invalid restore remainder");
+  return { basis: v.basis, stage: v.stage, journal: journal as RecoveryJournalEntry & { attemptId: string } };
+}
+
+/** Strictly decode a `retired` tombstone. Throws {@link RestoreCompositeError}. */
+export function parseRestoreTombstone(value: string): { basis: RestoreBasis; successor: RestoreSuccessor } {
+  const v = parseRestoreValue(value);
+  if (v.kind !== "tombstone") throw new RestoreCompositeError("restore entry is not a tombstone");
+  return { basis: v.basis, successor: v.successor };
+}
+
+/** The persisted spelling of S's entry: the envelope, then the remainder in {@link recoveryJournalJson} order. */
+export function restoreJournalJson(basis: RestoreBasis, stage: RestoreStage, journal: RecoveryJournalEntry): string {
+  return restoreEnvelopeJson(basis, stage, recoveryJournalJson(journal));
+}
+
+/** What one branch's journal keys resolve to (see {@link GitCache.resolveBranchJournal}). */
+export type BranchJournal =
+  | { kind: "none" }
+  | { kind: "plain"; journal: RecoveryJournalEntry; raw: string }
+  | {
+    kind: "composite";
+    basis: RestoreBasis;
+    stage: RestoreStage | "retired";
+    predecessor: { journal: RecoveryJournalEntry; raw: string };
+    successor: { kind: "entry"; journal: RecoveryJournalEntry & { attemptId: string }; raw: string }
+      | { kind: "tombstone"; successor: RestoreSuccessor; raw: string };
+    ledger: AttemptLedgerEntry;
+  };
+
+/** The result of {@link GitCache.discoverOpaque}: bare config only, never a path under the runner root. */
+export type OpaqueDiscovery =
+  | { kind: "sameRun"; journal: RecoveryJournalEntry; raw: string; source: "active" | "descriptor" }
+  | { kind: "composite"; composite: Extract<BranchJournal, { kind: "composite" }> }
+  | { kind: "other" };
+
+/** issue #3644: a restore composite's predecessor, as the inventory readers report it. Its path is never read. */
+export interface RetainedPredecessor { clonePath: string; branch: string; runId: string; attemptId: string; generation: number }
+
+/** One raw attribution key/value of the bare's config (`valueless`: the key had no value at all). */
+export interface BareAttributionEntry { key: string; value: string; valueless?: true }
+
+const ATTRIBUTION_PREFIXES = ["uzi-recovery.", "uzi-restore.", "uzi-attempts.", "uzi-stopped.", "uzi-retained."] as const;
+
+/** The attribution keys of one `config --null --list` output, in config order. Pure. */
+function attributionEntries(list: readonly string[]): BareAttributionEntry[] {
+  const out: BareAttributionEntry[] = [];
+  for (const item of list) {
+    if (!item) continue;
+    const nl = item.indexOf("\n");
+    const key = nl < 0 ? item : item.slice(0, nl);
+    if (!ATTRIBUTION_PREFIXES.some(p => key.startsWith(p))) continue;
+    out.push(nl < 0 ? { key, value: "", valueless: true } : { key, value: item.slice(nl + 1) });
+  }
+  return out;
+}
+
 function parseAttemptLedgerEntry(value: string): AttemptLedgerEntry | undefined {
   let parsed: unknown;
   try {
@@ -4171,6 +4262,7 @@ export class GitCache {
       // recovery capture failed. The journal is in WORKER-owned bare config, never
       // in the runner-owned clone. An unreadable journal fails closed before rm.
       const pending = await this.readRecoveryCapture(barePath, branch);
+      await this.refuseOtherRunRestore(barePath, branch, runId); // issue #3644
       // issue #1786: a retained stopped canonical clone refuses reuse before any journal case.
       await this.assertNoStoppedMarker(barePath, clonePath, pending);
       if (pending) {
@@ -4408,6 +4500,7 @@ export class GitCache {
       const canonical = this.runnerClonePath(barePath, key);
       const clonePath = attemptClonePath(canonical, attempt.attemptId);
       const pending = await this.readRecoveryCapture(barePath, branch);
+      await this.refuseOtherRunRestore(barePath, branch, runId); // issue #3644
       // issue #1786: a retained stopped canonical clone refuses reuse before any journal case.
       if (pending) await this.assertNoStoppedMarker(barePath, pending.clonePath, pending);
       if (pending) {
@@ -7388,9 +7481,9 @@ export class GitCache {
    * (retireRunnerClone), never before the rename. */
   private async remediationSourceUnderLock(barePath: string, branch: string,
     source: { runId: string; clonePath: string; attemptId: string },
-    snapshot?: RecoveryReadSnapshot): Promise<{ journal: RecoveryJournalEntry; raw: string }> {
+    snapshot?: RecoveryReadSnapshot): Promise<{ journal: RecoveryJournalEntry; raw: string; restore?: { basis: RestoreBasis; stage: RestoreStage } }> {
     const entries = snapshot && this.recoverySnapshotEntries(barePath, snapshot);
-    const stored = await this.readRecoveryCaptureWithRaw(barePath, branch, entries);
+    const stored = await this.readJournalFor(barePath, branch, source, entries); // issue #3644: S's entry when composite
     const shape = parseAttemptPath(source.clonePath, path.resolve(this.runnerRoot));
     const ledger = (await this.readAttemptLedger(barePath, branch, entries)).get(source.attemptId);
     if (!stored || !sameRecoverySource(stored.journal, source) || shape?.attemptId !== source.attemptId ||
@@ -7404,12 +7497,14 @@ export class GitCache {
     return stored;
   }
 
-  private async writeRemediationUnderLock(barePath: string, branch: string, stored: { journal: RecoveryJournalEntry; raw: string },
+  private async writeRemediationUnderLock(barePath: string, branch: string,
+    stored: { journal: RecoveryJournalEntry; raw: string; restore?: { basis: RestoreBasis; stage: RestoreStage } },
     record: RemediationRecovery, durability: MemoryParkDurability = {}): Promise<void> {
-    if (await this.readRecoveryCaptureRaw(barePath, branch) !== stored.raw) throw new Error("remediation journal changed");
+    if ((await this.readJournalFor(barePath, branch, stored.journal))?.raw !== stored.raw) throw new Error("remediation journal changed");
     const value = { ...stored.journal, remediationRecovery: parseRemediationRecovery(record) };
+    // issue #3644: a restored successor's entry cannot carry remediationRecovery (strict shape); writeRecovery refuses it.
     await this.writeRecovery(barePath, branch, value);
-    await this.syncJournalAndReadBack(barePath, branch, recoveryJournalJson(value), durability);
+    await this.syncJournalAndReadBack(barePath, branch, this.journalValueFor(stored, value), durability, stored.journal);
   }
 
   /**
@@ -7691,8 +7786,18 @@ export class GitCache {
         const activeEntries = entries.filter(e => e === key || e.startsWith(key + "\n"));
         if (activeEntries.length > 1 || activeEntries.some(e => !e.startsWith(key + "\n")))
           throw new Error("ambiguous restriction journal");
-        const activeRaw = activeEntries[0]?.slice(key.length + 1) || undefined;
-        const active = activeRaw === undefined ? undefined : parseRecoveryJournal(activeRaw);
+        let activeRaw = activeEntries[0]?.slice(key.length + 1) || undefined;
+        let active = activeRaw === undefined ? undefined : parseRecoveryJournal(activeRaw);
+        // issue #3644: under a composite the active journal is S's entry (P is opaque and plain, a tombstone has none).
+        let activeSource: { runId: string; clonePath: string; attemptId?: string } | undefined;
+        if (this.restoreValueIn(entries, branch) !== undefined) {
+          const composite = await this.resolveBranchJournal(barePath, branch, entries);
+          if (composite.kind !== "composite") throw new Error("restriction restore composite unavailable");
+          const live = composite.successor.kind === "entry" && composite.stage !== "retired" ? composite.successor : undefined;
+          active = live?.journal;
+          activeRaw = live?.raw;
+          activeSource = live?.journal;
+        }
         // Ordinary journals retain their legacy writer order. Strict parsing and the two
         // identical raw reads prove absence; only enrolled evidence requires canonical bytes.
         if (active?.remediationRecovery && recoveryJournalJson(active) !== activeRaw)
@@ -7713,10 +7818,10 @@ export class GitCache {
         relevant.push(...protectedRecords.map(r => r.journal));
         if (relevant.some(j => j.remediationRecovery && j.remediationRecovery.branch !== branch))
           throw new Error("restriction record branch mismatch");
-        return { activeRaw, protectedRaw, relevant };
+        return { activeRaw, protectedRaw, relevant, activeSource };
       };
       const first = await read();
-      await this.syncJournalAndReadBack(barePath, branch, first.activeRaw, durability);
+      await this.syncJournalAndReadBack(barePath, branch, first.activeRaw, durability, first.activeSource);
       const second = await read();
       if (first.activeRaw !== second.activeRaw ||
           JSON.stringify(first.protectedRaw) !== JSON.stringify(second.protectedRaw))
@@ -7753,7 +7858,8 @@ export class GitCache {
       // including recovery-enabled unwired workers. Canonical sources omit the attempt id.
       await this.assertRecoveryBare(barePath);
       const source = recoverySource({ runId, clonePath, ...(attemptId === undefined ? {} : { attemptId }) });
-      const pending = await this.readRecoveryCapture(barePath, branch);
+      // issue #3644: under a composite the journal naming this source is S's entry (rewritten in S's key), else P's, which refuses.
+      const pending = (await this.readJournalFor(barePath, branch, source))?.journal;
       if (pending && !sameRecoverySource(pending, source)) throw new Error("recovery attribution cannot be overwritten");
       // issue #3239: the seed's adopt-time `reset --soft` leg peeled this marker out of the clone's
       // history; journal it as lineage for a later coverage wrapper over this attempt's successor marker.
@@ -7788,7 +7894,7 @@ export class GitCache {
     const want = parseSourceFence(fence);
     const section = async (): Promise<CompletionSourceFence> => {
       await this.assertRecoveryBare(barePath);
-      const journal = await this.readRecoveryCapture(barePath, branch);
+      const journal = (await this.readJournalFor(barePath, branch, expected))?.journal; // issue #3644: S's entry when composite
       if (!journal || journal.runId !== expected.runId || journal.clonePath !== expected.clonePath ||
           journal.attemptId !== expected.attemptId) {
         throw new CompletionSourceFenceError("completion source journal does not name this source");
@@ -7814,7 +7920,7 @@ export class GitCache {
       try { await sync(config, "config"); } finally { await config.close(); }
       const dir = await fs.open(barePath, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
       try { await sync(dir, "directory"); } finally { await dir.close(); }
-      const after = await this.readRecoveryCapture(barePath, branch);
+      const after = (await this.readJournalFor(barePath, branch, expected))?.journal;
       if (!after || after.clonePath !== journal.clonePath || after.attemptId !== journal.attemptId ||
           after.runId !== journal.runId || after.completionSourceFence === undefined ||
           serializeSourceFence(after.completionSourceFence) !== serializeSourceFence(want)) {
@@ -7835,7 +7941,7 @@ export class GitCache {
   ): Promise<CompletionSourceFence | undefined> {
     return this.withLock(barePath, async () => {
       await this.assertRecoveryBare(barePath);
-      const journal = await this.readRecoveryCapture(barePath, branch);
+      const journal = (await this.readJournalFor(barePath, branch, expected))?.journal; // issue #3644: S's entry when composite
       if (!journal || journal.runId !== expected.runId || journal.clonePath !== expected.clonePath ||
           journal.attemptId !== expected.attemptId) return undefined;
       return journal.completionSourceFence;
@@ -7857,7 +7963,7 @@ export class GitCache {
     { state: "fenced"; fence: CompletionSourceFence; attemptId?: string; retained: boolean }> {
     return this.withLock(barePath, async () => {
       await this.assertRecoveryBare(barePath);
-      const journal = await this.readRecoveryCapture(barePath, branch);
+      const journal = (await this.readJournalFor(barePath, branch, { runId: ownerRunId, clonePath }))?.journal; // issue #3644
       if (!journal || journal.runId !== ownerRunId || journal.clonePath !== clonePath) return { state: "changed" as const };
       const retained = !!journal.recovery || !!journal.retainedSources?.length;
       if (!this.authorityRequired || journal.completionSourceFence === undefined) return { state: "unfenced" as const, retained };
@@ -7869,13 +7975,16 @@ export class GitCache {
   }
 
   /** fsync `<bare>/config`, fsync the bare directory, then require the journal's raw value to read back as exactly `want`. */
-  private async syncJournalAndReadBack(barePath: string, branch: string, want: string | undefined, opts: MemoryParkDurability): Promise<void> {
+  private async syncJournalAndReadBack(barePath: string, branch: string, want: string | undefined, opts: MemoryParkDurability,
+    expected?: { runId: string; clonePath: string; attemptId?: string }): Promise<void> {
     const sync = opts.sync ?? (async (h: { sync(): Promise<void> }) => { await h.sync(); });
     const config = await fs.open(path.join(barePath, "config"), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
     try { await sync(config, "config"); } finally { await config.close(); }
     const dir = await fs.open(barePath, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
     try { await sync(dir, "directory"); } finally { await dir.close(); }
-    const read = () => this.readRecoveryCaptureRaw(barePath, branch);
+    // issue #3644: the key that holds `expected` (S's restore key when composite and S matches, else P's).
+    const read = expected === undefined ? () => this.readRecoveryCaptureRaw(barePath, branch)
+      : async () => (await this.readJournalFor(barePath, branch, expected))?.raw;
     const back = opts.readback ? await opts.readback(read) : await read();
     if (back !== want) throw new Error("memory park read-back differs");
   }
@@ -7915,10 +8024,11 @@ export class GitCache {
       ? { ...incoming, settlement: { ...incoming.settlement, confirmed } } : incoming;
     const draft = withFlag(false);
     const final = withFlag(true);
-    const section = <T>(fn: (stored: { journal: RecoveryJournalEntry; raw: string }) => Promise<T>, signal: AbortSignal | null = opts.signal ?? null): Promise<T> =>
+    type StoredJournal = { journal: RecoveryJournalEntry; raw: string; restore?: { basis: RestoreBasis; stage: RestoreStage } };
+    const section = <T>(fn: (stored: StoredJournal) => Promise<T>, signal: AbortSignal | null = opts.signal ?? null): Promise<T> =>
       this.withLock(barePath, async () => {
         await this.assertRecoveryBare(barePath);
-        const stored = await this.readRecoveryCaptureWithRaw(barePath, branch);
+        const stored = await this.readJournalFor(barePath, branch, expected); // issue #3644: S's entry when composite
         if (!stored || stored.journal.runId !== expected.runId || stored.journal.clonePath !== expected.clonePath ||
             stored.journal.attemptId !== expected.attemptId) {
           throw new Error("memory park journal does not name this source");
@@ -7937,10 +8047,10 @@ export class GitCache {
         return fn(stored);
       }, signal ?? undefined);
     /** Write `target` unless the stored bytes already are exactly it, then ALWAYS sync and read back. */
-    const commit = async (stored: { journal: RecoveryJournalEntry; raw: string }, target: MemoryParkRecord): Promise<void> => {
-      const wanted = recoveryJournalJson({ ...stored.journal, memoryPark: target });
+    const commit = async (stored: StoredJournal, target: MemoryParkRecord): Promise<void> => {
+      const wanted = this.journalValueFor(stored, { ...stored.journal, memoryPark: target });
       if (stored.raw !== wanted) await this.writeRecovery(barePath, branch, { ...stored.journal, memoryPark: target });
-      await this.syncJournalAndReadBack(barePath, branch, wanted, opts);
+      await this.syncJournalAndReadBack(barePath, branch, wanted, opts, expected);
     };
     const refused = (error: unknown): "unconfirmed" => {
       this.log.warn("memory park not recorded: the source is stopped or protected", { error: gitErrorMessage(error) });
@@ -8023,13 +8133,14 @@ export class GitCache {
       if (expected.record.settlement?.confirmed === false) return undefined;
       return await this.withLock(barePath, async () => {
         await this.assertRecoveryBare(barePath);
-        const first = await this.readRecoveryCaptureRaw(barePath, branch);
-        if (first === undefined) return undefined;
-        const journal = parseRecoveryJournal(first);
+        const found = await this.readJournalFor(barePath, branch, expected); // issue #3644: S's entry when composite
+        if (found === undefined) return undefined;
+        const first = found.raw;
+        const journal = found.journal;
         if (journal.runId !== expected.runId || journal.clonePath !== expected.clonePath ||
             journal.attemptId !== expected.attemptId || journal.memoryPark === undefined ||
             serializeMemoryPark(journal.memoryPark) !== want) return undefined;
-        await this.syncJournalAndReadBack(barePath, branch, first, opts);
+        await this.syncJournalAndReadBack(barePath, branch, first, opts, expected);
         return journal.memoryPark;
       }, opts.signal);
     } catch {
@@ -8127,6 +8238,17 @@ export class GitCache {
           // Bound, detached, malformed and overflow markers all protect. Absence
           // alone never establishes non-stopped provenance.
           if (name.startsWith("uzi-stopped.")) throw new Error("stopped or ambiguous source");
+          if (name.startsWith("uzi-restore.")) {
+            // issue #3644: a restored run's family is two live attempts by design and is never maintained; any other run is
+            // unaffected. An undecodable value cannot say whose it is, so it refuses the whole bare.
+            if (raw === undefined || restoreKeyBranch(name) === undefined) throw new Error("malformed restore entry");
+            if (raw !== "") {
+              const v = parseRestoreValue(raw);
+              const restored = v.kind === "entry" ? v.remainder.runId : v.successor.runId;
+              if (restored === runId) throw new Error("restored source");
+            }
+            continue;
+          }
           if (name.startsWith("uzi-attempts.")) {
             count();
             const m = /^uzi-attempts\.(.+)\.entry$/.exec(name);
@@ -8311,6 +8433,7 @@ export class GitCache {
   async terminalRetainedSnapshot(barePath: string, branch: string, key: string, expected: Pick<RecoverySource, "runId" | "clonePath">):
     Promise<{ journal: RecoveryJournalEntry; paths: string[] } | undefined> {
     return this.withLock(barePath, async () => {
+      await this.assertNoRestoreEntry(barePath, branch, expected.runId); // issue #3644: refuses (TODO m2b: S's terminal snapshot)
       await this.protectedRecoveries(barePath);
       const journal = await this.readRecoveryCapture(barePath, branch);
       if (!journal || journal.runId !== expected.runId || journal.clonePath !== expected.clonePath) throw new Error("recovery identity changed");
@@ -8329,6 +8452,7 @@ export class GitCache {
   async detachTerminalRetained(barePath: string, branch: string, key: string, expected: RecoveryJournalEntry): Promise<void> {
     expected = parseRecoveryJournal(JSON.stringify(expected));
     await this.withLock(barePath, async () => {
+      await this.assertNoRestoreEntry(barePath, branch, expected.runId); // issue #3644: P's key is never touched while a restore entry exists
       await this.refuseMarkedPaths(barePath, this.recoverySources(expected).map((x) => x.clonePath), expected.runId);
       const records = await this.protectedRecoveries(barePath);
       const prior = records.find(r => r.journal.runId === expected.runId);
@@ -8406,6 +8530,8 @@ export class GitCache {
     barePath: string, branch: string, key: string, expected: RecoverySource, allowMissing = false,
     detached?: RecoveryJournalEntry, allowLegacyRepair = true,
   ): Promise<RecoveryJournalEntry> {
+    // issue #3644: this lstats every recorded source, a restored predecessor's included; it refuses first while a restore entry exists.
+    await this.assertNoRestoreEntry(barePath, branch, expected.runId);
     const { journal, repair } = await this.attributedRecovery(barePath, branch, key, expected, detached, allowLegacyRepair);
     let missing = false;
     // One pass over the recorded sources, no retries. Any unsafe sibling refuses discovery.
@@ -8467,6 +8593,7 @@ export class GitCache {
           operation.budget?.check();
         };
         check();
+        // issue #3644: P's path and key stay untouched; checkedRecovery below refuses while a restore entry exists.
         const attribution = async () => {
           const journal = await this.checkedRecovery(barePath, branch, key, expectedSource);
           const kind = await this.classifyOwnerClonePath(barePath, branch, key, expectedSource.runId, expectedSource.clonePath);
@@ -8721,11 +8848,31 @@ export class GitCache {
   private async writeRecovery(barePath: string, branch: string, journal: RecoveryJournalEntry, guard?: () => void | Promise<void>): Promise<void> {
     const value = recoveryJournalJson(journal);
     parseRecoveryJournal(value);
-    const prior = await this.readRecoveryCapture(barePath, branch);
+    // issue #3644: while a restore entry exists P's key is never written; the successor's own journal goes to its key.
+    const entries = await this.configEntries(barePath);
+    if (this.restoreValueIn(entries, branch) !== undefined) return this.writeRestoreJournal(barePath, branch, journal, guard, entries);
+    const prior = await this.readRecoveryCapture(barePath, branch, entries);
     this.assertRemediationPreserved(prior, journal);
     await this.assertRecoveryBare(barePath);
     if (guard) await guard();
     await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), value]);
+  }
+
+  /** issue #3644: rewrite S's `seeding`/`ready` entry with `journal` (same stage and basis); any other target refuses. */
+  private async writeRestoreJournal(barePath: string, branch: string, journal: RecoveryJournalEntry,
+    guard: (() => void | Promise<void>) | undefined, entries: readonly string[]): Promise<void> {
+    const r = await this.resolveBranchJournal(barePath, branch, entries);
+    if (r.kind !== "composite") throw new RestoreCompositeError("restore entry without a composite");
+    if (r.predecessor.journal.runId !== journal.runId)
+      throw new RestoreCompositeBlockedError("the branch is held by another run's restore", r.predecessor.journal.runId);
+    if (r.successor.kind !== "entry" || r.stage === "retired" || journal.clonePath !== r.successor.journal.clonePath ||
+        journal.attemptId !== r.successor.journal.attemptId) throw new RestoreCompositeError("the predecessor journal is not written while a restore entry exists");
+    this.assertRemediationPreserved(r.successor.journal, journal);
+    const value = restoreJournalJson(r.basis, r.stage, journal);
+    parseRestoreJournal(value);
+    await this.assertRecoveryBare(barePath);
+    if (guard) await guard();
+    await this.runGit(barePath, ["config", "--local", restoreJournalKey(branch), value]);
   }
 
   /**
@@ -8811,6 +8958,8 @@ export class GitCache {
         await this.checkedRecovery(barePath, branch, key, read, false, undefined, false);
         return { barePath, journal: read };
       }
+      // issue #3644: legacy discovery stats P's path and may heal; a composite goes through discoverOpaque instead.
+      await this.assertNoRestoreEntry(barePath, branch, runId);
       if (!stored) return undefined;
       const journal = stored.journal;
       // issue #1786: a pending plain journal that a VALID marker names exactly (same run and path,
@@ -8837,6 +8986,7 @@ export class GitCache {
    */
   private async healBoundStoppedJournal(barePath: string, branch: string, stored: { journal: RecoveryJournalEntry; raw: string }): Promise<boolean> {
     const { journal, raw } = stored;
+    await this.assertNoRestoreEntry(barePath, branch, journal.runId); // issue #3644: the heal clears P's key
     if (journal.attemptId !== undefined || journal.recovery || journal.retainedSources?.length) return false;
     if (journal?.remediationRecovery || this.dropsFence(journal)) return false;
     if (residueQuarantine() !== undefined) return false;
@@ -8893,6 +9043,7 @@ export class GitCache {
   async canRenewRecoveryAdoption(barePath: string, branch: string, key: string, expected: RecoverySource,
     claimGeneration: number | undefined, grant: number | undefined): Promise<boolean> {
     return this.withLock(barePath, async () => {
+      await this.assertNoRestoreEntry(barePath, branch, expected.runId); // issue #3644: P's key is never touched while a restore entry exists
       const journal = await this.checkedRecovery(barePath, branch, key, expected);
       const record = await this.readRecoveryOwner(barePath, branch, key, expected.runId);
       return journal.recovery?.stage === "blocked" && journal.recovery.blocker === "adoption_failed" &&
@@ -8909,6 +9060,7 @@ export class GitCache {
   async recoveryReservationSnapshot(barePath: string, branch: string, key: string,
     expected: RecoverySource, reservation: RecoveryProgress): Promise<RecoveryJournalEntry> {
     return this.withLock(barePath, async () => {
+      await this.assertNoRestoreEntry(barePath, branch, expected.runId); // issue #3644: P's key is never touched while a restore entry exists
       const record = await this.readRecoveryOwner(barePath, branch, key, expected.runId);
       const journal = await this.readRecoveryCapture(barePath, branch);
       if (!journal || !journal.recovery ||
@@ -8941,6 +9093,7 @@ export class GitCache {
     if (!Number.isSafeInteger(recoveryRetryMs) || recoveryRetryMs < 1 || recoveryRetryMs > 30_000) throw new Error("invalid recovery backoff");
     if (!Number.isSafeInteger(episode) || (episode as number) < 0) episode = undefined;
     return this.withLock(barePath, async () => {
+      await this.assertNoRestoreEntry(barePath, branch, expected.runId); // issue #3644: P's key is never touched while a restore entry exists
       const journal = await this.checkedRecovery(barePath, branch, key, expected);
       const old = journal.recovery;
       if (old?.claimGeneration !== undefined && (claimGeneration === undefined || claimGeneration < old.claimGeneration)) {
@@ -9026,6 +9179,7 @@ export class GitCache {
   /** Check every recorded source against its existing restore pin; one incomplete source refuses all. */
   async verifiedRetainedRecoveryRestorePoint(barePath: string, branch: string, key: string, expected: RecoveryJournalEntry): Promise<boolean> {
     return this.withLock(barePath, async () => {
+      await this.assertNoRestoreEntry(barePath, branch, expected.runId); // issue #3644: P's key is never touched while a restore entry exists
       const journal = await this.checkedRecovery(barePath, branch, key, expected);
       if (JSON.stringify(journal) !== JSON.stringify(expected)) return false;
       // The finite descriptor and caller's shared recovery-operation deadline bound this pass.
@@ -9040,6 +9194,7 @@ export class GitCache {
 
   async verifiedRecoveryRestorePoint(barePath: string, branch: string, key: string, expected: RecoverySource, tip: string): Promise<boolean> {
     return this.withLock(barePath, async () => {
+      await this.assertNoRestoreEntry(barePath, branch, expected.runId); // issue #3644: P's key is never touched while a restore entry exists
       await this.checkedRecovery(barePath, branch, key, expected);
       return this.verifiedRecoverySourceBytes(barePath, expected, tip);
     });
@@ -9169,6 +9324,7 @@ export class GitCache {
     if (!SHA40_RE.test(tip)) throw new Error("invalid recovery tip");
     if (capturedSource !== undefined && !SHA40_RE.test(capturedSource)) throw new Error("invalid recovery source");
     await this.withLock(barePath, async () => {
+      await this.assertNoRestoreEntry(barePath, branch, expected.runId); // issue #3644: P's key is never touched while a restore entry exists
       const journal = await this.checkedRecovery(barePath, branch, key, expected);
       const owner = await this.readRecoveryOwner(barePath, branch, key, expected.runId);
       if (owner && (owner.state !== "committed" || !ownerJournalMatches(owner, journal)))
@@ -9205,6 +9361,7 @@ export class GitCache {
   ): Promise<void> {
     if (!["capture_failed", "source_missing", "adoption_failed", "budget_exhausted", "clock_invalid", "oversize", "prerequisites_unavailable", "quiescence_failed", "preservation_failed", "decoded_history_limit", "readiness_cleanup_unconfirmed"].includes(reason)) throw new Error("invalid blocker");
     await this.withLock(barePath, async () => {
+      await this.assertNoRestoreEntry(barePath, branch, expected.runId); // issue #3644: P's key is never touched while a restore entry exists
       const journal = await this.checkedRecovery(barePath, branch, key, expected, true);
       guard?.();
       if (expectedEpisode === null && journal.recovery) throw new Error("recovery episode changed");
@@ -9510,6 +9667,7 @@ export class GitCache {
   ): Promise<RunnerClone> {
     if (!ATTEMPT_ID_RE.test(attemptId)) throw annotateRetainedSuccessorError(new Error("invalid successor attempt"), "attempt_invalid");
     return this.withLock(barePath, async () => {
+      await this.assertNoRestoreEntry(barePath, branch, expected.runId); // issue #3644: P's key is never touched while a restore entry exists
       const journal = await this.checkedRecovery(barePath, branch, key, expected);
       const owner = await this.readRecoveryOwner(barePath, branch, key, expected.runId);
       if (owner && (owner.state !== "committed" || !ownerJournalMatches(owner, journal)))
@@ -9691,6 +9849,7 @@ export class GitCache {
     if (evidence.settled !== true || !Number.isSafeInteger(evidence.processedEvents) ||
         evidence.processedEvents <= 0 || evidence.attemptId !== expected.attemptId) throw new Error("model processing evidence required");
     return this.withLock(barePath, async () => {
+      await this.assertNoRestoreEntry(barePath, branch, expected.runId); // issue #3644: P's key is never touched while a restore entry exists
       const journal = await this.checkedRecovery(barePath, branch, key, expected);
       const owner = await this.readRecoveryOwner(barePath, branch, key, expected.runId);
       if (owner && (owner.state !== "committed" || !ownerJournalMatches(owner, journal)))
@@ -9711,6 +9870,7 @@ export class GitCache {
   ): Promise<void> {
     if (ownerDiscard !== true) throw new Error("explicit owner discard required");
     await this.withLock(barePath, async () => {
+      await this.assertNoRestoreEntry(barePath, branch, expected.runId); // issue #3644: P's key is never touched while a restore entry exists
       // issue #3404: this wrapper has no production caller and carries none of the operator discard's checks, so
       // it must not be a way to drop a published fence under authority.
       this.refuseFenceDrop(await this.readRecoveryCapture(barePath, branch), "discardRetainedRecovery");
@@ -9729,6 +9889,7 @@ export class GitCache {
     barePath: string, branch: string, key: string, expected: RecoverySource,
     expectedSnapshot?: { descriptor: string | undefined; active: string | undefined },
   ): Promise<void> {
+    await this.assertNoRestoreEntry(barePath, branch, expected.runId); // issue #3644: P's key is never touched while a restore entry exists
     recoverySource({ runId: expected.runId, clonePath: expected.clonePath,
       ...(expected.attemptId === undefined ? {} : { attemptId: expected.attemptId }) }); // Validate before constructing the descriptor key.
     const protectedRecord = (await this.protectedRecoveries(barePath, expected.runId))[0];
@@ -9997,6 +10158,9 @@ export class GitCache {
     try {
       return await this.withLock(barePath, async () => {
         await this.assertRecoveryBare(barePath);
+        // issue #3644: a restore composite keeps P and S as they are (S is retained by the flight's own custody, and a
+        // `reclaimed` ledger entry would be an invalid pair); nothing is written.
+        if (this.restoreHolder(await this.configEntries(barePath), branch) !== undefined) return "unknown";
         const source = recoverySource({ runId: input.runId, clonePath: input.clonePath, attemptId: input.attemptId });
         const parsed = parseAttemptPath(source.clonePath, path.resolve(this.runnerRoot));
         if (parsed?.attemptId !== input.attemptId) return "unknown";
@@ -10051,6 +10215,7 @@ export class GitCache {
     try {
       return await this.withLock(barePath, async () => {
         await this.assertRecoveryBare(barePath);
+        await this.assertNoRestoreEntry(barePath, branch, input.runId); // issue #3644: a marker clears P's key
         if (!/^[A-Za-z0-9_-]{1,160}$/.test(key)) return "unknown";
         const source = recoverySource({ runId: input.runId, clonePath: input.clonePath });
         if (source.clonePath !== this.runnerClonePath(barePath, key)) return "unknown";
@@ -10152,6 +10317,8 @@ export class GitCache {
     try {
       return await this.withLock(barePath, async () => {
         await this.assertRecoveryBare(barePath);
+        // issue #3644: never read P's clone, and S's coverage is not claimed here either (TODO m2b).
+        if (this.restoreHolder(await this.configEntries(barePath), branch) !== undefined) return "not_covered";
         const src = recoverySource({ runId: source.runId, clonePath: source.clonePath,
           ...(source.attemptId === undefined ? {} : { attemptId: source.attemptId }) });
         if (!/^[A-Za-z0-9_-]+$/.test(key)) return "not_covered";
@@ -10396,11 +10563,22 @@ export class GitCache {
     const active = new Map<string, { raw: string; journal: RecoveryJournalEntry | undefined }>();
     const descriptorRaw = new Map<string, string>();
     const bareProblems: string[] = [];
+    // issue #3644: a restore composite's predecessor path is opaque; it is reported but never statted.
+    const basisPaths = new Set<string>();
     for (const item of list) {
       const nl = item.indexOf("\n");
       if (nl < 0) continue;
       const k = item.slice(0, nl);
       const v = item.slice(nl + 1);
+      if (restoreKeyBranch(k) !== undefined) {
+        if (v === "") continue;
+        try { basisPaths.add(parseRestoreValue(v).basis.predecessor.clonePath); }
+        catch {
+          if (this.epochRetained.getStore()) throw new Error("unreadable epoch restore entry");
+          bareProblems.push("restore_entry_unreadable");
+        }
+        continue;
+      }
       let m = /^uzi-attempts\.(.+)\.entry$/.exec(k);
       if (m) {
         const e = parseAttemptLedgerEntry(v);
@@ -10464,7 +10642,7 @@ export class GitCache {
       return out;
     };
     const part = async (clonePath: string, attemptId: string | undefined, generation: number | null): Promise<GatheredPart> => {
-      const { presence, devIno } = await this.clonePresence(clonePath);
+      const { presence, devIno } = basisPaths.has(clonePath) ? { presence: "unsafe" as const, devIno: "restore-predecessor" } : await this.clonePresence(clonePath);
       const e = attemptId === undefined ? undefined : ledger.get(attemptId);
       return { clonePath, attemptId, generation, presence, devIno, ledgerState: e && e.clonePath === clonePath ? e.state : "none" };
     };
@@ -10577,6 +10755,7 @@ export class GitCache {
       }
       const gen = attemptGenerationEvidence(e.attemptId);
       if (gen.unreadable) problems.push("attribution_unknown");
+      if (basisPaths.has(e.clonePath)) problems.push("restore_predecessor_retained");
       const p = await part(e.clonePath, e.attemptId, gen.generation);
       const a = active.get(e.branch);
       const plainNames = a?.journal !== undefined && !a.journal.recovery && !a.journal.retainedSources?.length &&
@@ -11235,6 +11414,8 @@ export class GitCache {
             const candidates = g.records.filter((r) => this.matchesRetainedSelector(r, sel));
             if (candidates.length !== 1) return refused(candidates.length === 0 ? "not_found" : "ambiguous");
             const rec = candidates[0]!;
+            // issue #3644: a restore entry on this branch keeps P and S; the restore-aware exit is a separate guarded discard.
+            await this.assertNoRestoreEntry(bare, rec.branch, rec.runId);
             if (!wantKinds.includes(rec.kind)) return refused("wrong_discard_kind", [rec.kind]);
             if (rec.digest !== opts.confirm) return refused("descriptor_changed");
             const ev = await this.evaluateRetained(g, rec, {
@@ -11375,7 +11556,9 @@ export class GitCache {
 
   /** Observational variant: the caller already holds B. */
   async readInventoryCloneHeadsUnderLock(barePath: string, runId: string): Promise<
-    { kind: "verified"; heads: string[]; clones: Array<{ clonePath: string; branch: string; runId: string; head?: string; identity?: string }>; foreignOwners: string[] } | { kind: "unknown"; cause?: InventoryReadCause }
+    { kind: "verified"; heads: string[]; clones: Array<{ clonePath: string; branch: string; runId: string; head?: string; identity?: string }>; foreignOwners: string[];
+      /** issue #3644: present only under a restore composite of this run; those paths are excluded and never read. */
+      retainedPredecessors?: RetainedPredecessor[] } | { kind: "unknown"; cause?: InventoryReadCause }
   > {
     let cause: InventoryReadCause = "other";
     let physicalFailure = false;
@@ -11413,6 +11596,22 @@ export class GitCache {
           for (const source of this.recoverySources(record.journal)) paths.set(source.clonePath, { branch: record.branch, runId });
         }
         const entries = config.split("\0");
+        // issue #3644: this run's restore composites. The predecessor P is opaque: its journal and ledger paths are
+        // reported as retainedPredecessors and never statted; S's entry stands in for the journal P's key would hold.
+        const predecessors = new Map<string, RetainedPredecessor>();
+        const successors = new Map<string, RecoveryJournalEntry>();
+        for (const item of entries) {
+          const nl = item.indexOf("\n");
+          const restoreBranch = nl < 0 ? undefined : restoreKeyBranch(item.slice(0, nl));
+          if (restoreBranch === undefined || item.slice(nl + 1) === "") continue;
+          let composite: BranchJournal;
+          try { composite = await this.resolveBranchJournal(barePath, restoreBranch, entries); }
+          catch (err) { cause = "attribution_unreadable"; throw err; }
+          if (composite.kind !== "composite" || composite.predecessor.journal.runId !== runId) continue;
+          const b = composite.basis.predecessor;
+          predecessors.set(b.clonePath, { clonePath: b.clonePath, branch: restoreBranch, runId, attemptId: b.attemptId, generation: b.generation });
+          if (composite.successor.kind === "entry") successors.set(restoreBranch, composite.successor.journal);
+        }
         const journals = new Map<string, string>();
         for (const item of entries) {
           const nl = item.indexOf("\n");
@@ -11420,10 +11619,12 @@ export class GitCache {
           if (!match) continue;
           journals.set(match[1]!, item.slice(nl + 1));
         }
+        for (const [branch, journal] of successors) paths.set(journal.clonePath, { branch, runId });
         for (const [branch, value] of journals) {
           // Retirement clears this key to empty. Like readRecoveryCapture, the
           // latest value is authoritative; nonempty invalid attribution still refuses FINAL.
           if (value === "") continue;
+          if ([...predecessors.values()].some(p => p.branch === branch)) continue; // the restored predecessor's journal
           const journal = await (async () => {
             try { return await this.readRecoveryCapture(barePath, branch, entries); }
             catch (err) {
@@ -11455,6 +11656,7 @@ export class GitCache {
         }
         for (const entry of (await atFailure("git_or_filesystem_error", () => this.readAllAttemptLedgers(barePath))).values()) {
           if (entry.runId !== runId) { foreignOwners.add(entry.runId); continue; }
+          if (predecessors.has(entry.clonePath)) continue;
           paths.set(entry.clonePath, { branch: entry.branch, runId });
         }
         // issue #1786: a kept canonical clone is attributed by its stopped marker once the journal is
@@ -11503,7 +11705,8 @@ export class GitCache {
           clones.push({ clonePath: clone, ...owner,
             ...(this.reportProofs.getStore() ? { head, identity: `${st.dev}:${st.ino}` } : {}) });
         }
-        return { kind: "verified", heads: [...heads], clones, foreignOwners: [...foreignOwners] };
+        return { kind: "verified", heads: [...heads], clones, foreignOwners: [...foreignOwners],
+          ...(predecessors.size ? { retainedPredecessors: [...predecessors.values()] } : {}) };
       }
     } catch (error) {
       this.checkRecoveryInterruption();
@@ -11519,7 +11722,7 @@ export class GitCache {
    * relationship; at most 256 paths are probed once, and any ambiguity refuses all. */
   async readAcknowledgedReportSourcesUnderLock(barePath: string, runId: string): Promise<
     { kind: "verified"; heads: string[]; clones: Array<{ clonePath: string; branch: string; runId: string; head: string; identity: string }>;
-      snapshot: string } | { kind: "unknown"; cause?: string }
+      snapshot: string; retainedPredecessors?: RetainedPredecessor[] } | { kind: "unknown"; cause?: string }
   > {
     try {
       this.checkReportProof();
@@ -11580,6 +11783,7 @@ export class GitCache {
         if (paths.size > 256) throw new Error("ACK path bound");
       };
       const seenProtected = new Set<string>();
+      const restoreBranches: string[] = [];
       for (const item of entries) {
         this.checkReportProof();
         const nl = item.indexOf("\n");
@@ -11605,6 +11809,8 @@ export class GitCache {
           if (value) journals.set(recovery[1]!, parseRecoveryJournal(value));
           else journals.delete(recovery[1]!);
         }
+        const restoreBranch = restoreKeyBranch(name);
+        if (restoreBranch !== undefined && value) restoreBranches.push(restoreBranch);
         const ledger = /^uzi-attempts\.(.+)\.entry$/.exec(name);
         if (ledger) {
           const entry = parseAttemptLedgerEntry(value);
@@ -11615,6 +11821,17 @@ export class GitCache {
           ledgers.set(entry.attemptId, { ...entry, branch: ledger[1]! });
         }
       }
+      // issue #3644: this run's restore composites. P's journal and ledger paths are opaque (reported, never probed) and S's
+      // entry stands in for the journal P's key would hold.
+      const predecessors = new Map<string, RetainedPredecessor>();
+      for (const restoreBranch of restoreBranches) {
+        const composite = await this.resolveBranchJournal(barePath, restoreBranch, entries);
+        if (composite.kind !== "composite" || composite.predecessor.journal.runId !== runId) continue;
+        const b = composite.basis.predecessor;
+        predecessors.set(b.clonePath, { clonePath: b.clonePath, branch: restoreBranch, runId, attemptId: b.attemptId, generation: b.generation });
+        journals.delete(restoreBranch);
+        if (composite.successor.kind === "entry") add(restoreBranch, composite.successor.journal);
+      }
       for (const [branch, journal] of journals) for (const source of this.recoverySources(journal)) add(branch, source);
       for (const record of protectedRecords) {
         const active = journals.get(record.branch);
@@ -11622,7 +11839,7 @@ export class GitCache {
           throw new Error("ACK protected conflict");
         for (const source of this.recoverySources(record.journal)) add(record.branch, source, record.key);
       }
-      for (const entry of ledgers.values()) add(entry.branch, entry);
+      for (const entry of ledgers.values()) if (!predecessors.has(entry.clonePath)) add(entry.branch, entry);
       const markers = await this.readStoppedMarkers(barePath, entries);
       if (markers.malformed.length || markers.overflow.size) throw new Error("ACK malformed stopped marker");
       for (const { marker } of markers.valid) add(marker.branch, marker, marker.key);
@@ -11662,7 +11879,8 @@ export class GitCache {
       }
       this.checkReportProof();
       return { kind: "verified", heads: [...new Set(clones.map(c => c.head))], clones,
-        snapshot: JSON.stringify([identity, raw.toString("base64"), observations, clones]) };
+        snapshot: JSON.stringify([identity, raw.toString("base64"), observations, clones]),
+        ...(predecessors.size ? { retainedPredecessors: [...predecessors.values()] } : {}) };
     } catch (err) {
       this.checkReportProof();
       return { kind: "unknown", cause: gitErrorMessage(err) };
@@ -11730,6 +11948,213 @@ export class GitCache {
     return parseRecoveryJournal(value);
   }
 
+  // ---- issue #3644 Gate B: restore composite resolution, opaque discovery and the P-key guards (plan 3.0, 3.5) ----
+
+  /** The raw `uzi-restore.<branch>.journal` value of a config listing, or undefined when absent or cleared. The key is
+   *  single-valued: a repeated or valueless key is ambiguous evidence and refuses. */
+  private restoreValueIn(entries: readonly string[], branch: string): string | undefined {
+    const key = restoreJournalKey(branch);
+    const own = entries.filter(item => item === key || item.startsWith(`${key}\n`));
+    if (own.length > 1) throw new RestoreCompositeError("ambiguous restore entry");
+    if (own[0] === key) throw new RestoreCompositeError("valueless restore entry");
+    return own[0] === undefined ? undefined : own[0].slice(key.length + 1) || undefined;
+  }
+
+  private async configEntries(barePath: string): Promise<string[]> {
+    return (await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"])).split("\0");
+  }
+
+  /**
+   * Which journal keys hold what for `branch`, under the caller's bare lock (it takes none). No restore entry: P's
+   * plain journal or none. A restore entry: it must pair with P's journal (same run, P's raw value hashing to the basis
+   * digest, a non-empty P key) and with S's attempt ledger entry in one of the four valid pairs (seeding+live,
+   * ready+live, ready+retired, retired+retired); anything else throws {@link RestoreCompositeError}. Config reads only.
+   */
+  async resolveBranchJournal(barePath: string, branch: string, snapshot?: readonly string[]): Promise<BranchJournal> {
+    const entries = snapshot ?? await this.configEntries(barePath);
+    const pPrefix = `${recoveryCaptureKey(branch)}\n`;
+    const pRaw = entries.filter(item => item.startsWith(pPrefix)).at(-1)?.slice(pPrefix.length) || undefined;
+    const sRaw = this.restoreValueIn(entries, branch);
+    if (sRaw === undefined) return pRaw === undefined ? { kind: "none" } : { kind: "plain", journal: parseRecoveryJournal(pRaw), raw: pRaw };
+    if (pRaw === undefined) throw new RestoreCompositeError("predecessor journal is empty");
+    let predecessor: RecoveryJournalEntry;
+    try { predecessor = parseRecoveryJournal(pRaw); }
+    catch { throw new RestoreCompositeError("predecessor journal is unreadable"); }
+    const value = parseRestoreValue(sRaw);
+    const successor = value.kind === "entry"
+      ? { kind: "entry" as const, journal: parseRestoreJournal(sRaw).journal, raw: sRaw }
+      : { kind: "tombstone" as const, successor: value.successor, raw: sRaw };
+    const sRun = successor.kind === "entry" ? successor.journal.runId : successor.successor.runId;
+    const sAttempt = successor.kind === "entry" ? successor.journal.attemptId : successor.successor.attemptId;
+    const sPath = successor.kind === "entry" ? successor.journal.clonePath : successor.successor.clonePath;
+    const basis = value.basis;
+    if (sRun !== predecessor.runId) throw new RestoreCompositeError("restore entry names another run");
+    if (restoreDigest(pRaw) !== basis.journalDigest) throw new RestoreCompositeError("predecessor journal changed");
+    if (predecessor.clonePath !== basis.predecessor.clonePath || predecessor.attemptId !== basis.predecessor.attemptId ||
+        sAttempt === predecessor.attemptId || sPath === predecessor.clonePath) throw new RestoreCompositeError("restore basis does not match the predecessor");
+    const ledger = (await this.readAttemptLedger(barePath, branch, entries)).get(sAttempt);
+    if (!ledger || ledger.runId !== sRun || ledger.clonePath !== sPath) throw new RestoreCompositeError("restore entry has no matching attempt ledger entry");
+    const stage: RestoreStage | "retired" = value.kind === "entry" ? value.stage : "retired";
+    const valid = (stage === "seeding" && ledger.state === "live") || (stage === "ready" && (ledger.state === "live" || ledger.state === "retired")) ||
+      (stage === "retired" && ledger.state === "retired");
+    if (!valid) throw new RestoreCompositeError(`restore state ${stage} with ledger ${ledger.state}`);
+    return { kind: "composite", basis, stage, predecessor: { journal: predecessor, raw: pRaw }, successor, ledger };
+  }
+
+  /**
+   * issue #3644 plan 3.0: classify the branch's attribution for `runId` from the bare's config ALONE, under the bare
+   * lock, before any path of the runner root is inspected. It never stats, opens or lists a path under the runner root and
+   * never repairs, heals or writes. `sameRun` is any decodable journal of this run, whatever its shape (the active key,
+   * else the run's protected descriptor); `composite` a valid restore pairing of this run; `other` none, another run's or an
+   * undecodable one (today's full discovery then decides). An invalid composite throws {@link RestoreCompositeError}, and a
+   * valid one of another run {@link RestoreCompositeBlockedError}: neither may fall through to legacy discovery.
+   */
+  async discoverOpaque(barePath: string, branch: string, runId: string): Promise<OpaqueDiscovery> {
+    return this.withLock(barePath, async () => {
+      const entries = await this.configEntries(barePath);
+      this.assertRecoveryConfigKeys(entries.map(item => { const nl = item.indexOf("\n"); return nl < 0 ? item : item.slice(0, nl); }));
+      if (this.restoreValueIn(entries, branch) !== undefined) {
+        const composite = await this.resolveBranchJournal(barePath, branch, entries);
+        if (composite.kind !== "composite") throw new RestoreCompositeError("restore entry without a composite");
+        if (composite.predecessor.journal.runId !== runId)
+          throw new RestoreCompositeBlockedError("the branch is held by another run's restore", composite.predecessor.journal.runId);
+        return { kind: "composite" as const, composite };
+      }
+      const pPrefix = `${recoveryCaptureKey(branch)}\n`;
+      const raw = entries.filter(item => item.startsWith(pPrefix)).at(-1)?.slice(pPrefix.length);
+      if (raw) {
+        try {
+          const journal = parseRecoveryJournal(raw);
+          return journal.runId === runId ? { kind: "sameRun" as const, journal, raw, source: "active" as const } : { kind: "other" as const };
+        } catch { return { kind: "other" as const }; }
+      }
+      const dKey = `uzi-retained.${runId}.journal`;
+      const dv = entries.filter(item => item.startsWith(`${dKey}\n`));
+      if (dv.length === 1) {
+        const dRaw = dv[0]!.slice(dKey.length + 1);
+        try {
+          const d = JSON.parse(dRaw);
+          if (d && typeof d === "object" && !Array.isArray(d) && d.version === 1 && Object.keys(d).sort().join(",") === "branch,journal,key,version" &&
+              d.branch === branch && typeof d.key === "string" && /^[A-Za-z0-9_-]+$/.test(d.key)) {
+            const journal = parseRecoveryJournal(JSON.stringify(d.journal));
+            if (journal.runId === runId) return { kind: "sameRun" as const, journal, raw: dRaw, source: "descriptor" as const };
+          }
+        } catch { /* undecodable: other */ }
+      }
+      return { kind: "other" as const };
+    });
+  }
+
+  /**
+   * Every attribution key/value of the bare's config (`uzi-recovery.`, `uzi-restore.`, `uzi-attempts.`, `uzi-stopped.`,
+   * `uzi-retained.`), raw and in config order, for the restore census. `complete` is false when the read failed or hit a
+   * metadata cap (see checkEpochMetadata); a caller must then refuse. Read-only; the caller holds the bare lock.
+   */
+  async readBareAttributionConfig(barePath: string): Promise<{ entries: BareAttributionEntry[]; complete: boolean }> {
+    try {
+      return { entries: attributionEntries(await this.configEntries(barePath)), complete: true };
+    } catch {
+      this.checkRecoveryInterruption();
+      return { entries: [], complete: false };
+    }
+  }
+
+  /** The journal naming `expected` ((a) sites): S's entry when a composite's S matches it, else P's plain journal. */
+  private async readJournalFor(barePath: string, branch: string, expected: { runId: string; clonePath: string; attemptId?: string },
+    snapshot?: readonly string[]): Promise<{ journal: RecoveryJournalEntry; raw: string; composite?: true; restore?: { basis: RestoreBasis; stage: RestoreStage } } | undefined> {
+    const r = await this.resolveBranchJournal(barePath, branch, snapshot);
+    if (r.kind === "none") return undefined;
+    if (r.kind === "plain") return { journal: r.journal, raw: r.raw };
+    if (r.successor.kind === "entry" && r.stage !== "retired" && r.successor.journal.runId === expected.runId &&
+        r.successor.journal.clonePath === expected.clonePath && (expected.attemptId === undefined || r.successor.journal.attemptId === expected.attemptId)) {
+      return { journal: r.successor.journal, raw: r.successor.raw, composite: true, restore: { basis: r.basis, stage: r.stage } };
+    }
+    return { journal: r.predecessor.journal, raw: r.predecessor.raw, composite: true };
+  }
+
+  /**
+   * issue #3644 plan 3.5: the single-write transitions of the restore entry, each validated against the resulting
+   * pairing (P digest, run, S's attempt ledger entry) BEFORE the write and read back after it. Under the caller's bare lock.
+   *   seeding : none -> `seeding`        (P plain and unchanged; S's ledger entry is `live`)
+   *   ready   : `seeding` -> `ready`
+   *   retired : `ready` + ledger `retired` -> tombstone (idempotent on an existing tombstone)
+   *   cleared : `ready` + ledger `retired`, or a tombstone -> "" (S's guarded discard / P's guarded discard)
+   * P's key is never written. Anything else throws {@link RestoreCompositeError} with nothing written.
+   */
+  async advanceRestoreEntry(barePath: string, branch: string, to: "seeding" | "ready" | "retired" | "cleared",
+    seed?: { basis: RestoreBasis; journal: RecoveryJournalEntry }): Promise<void> {
+    const entries = await this.configEntries(barePath);
+    const key = restoreJournalKey(branch);
+    const current = await this.resolveBranchJournal(barePath, branch, entries);
+    let value: string;
+    let expect: (r: BranchJournal) => boolean;
+    if (to === "seeding") {
+      if (current.kind !== "plain" || !seed) throw new RestoreCompositeError("restore entry cannot be created here");
+      value = restoreJournalJson(seed.basis, "seeding", seed.journal);
+      parseRestoreJournal(value);
+      expect = r => r.kind === "composite" && r.stage === "seeding";
+    } else {
+      if (current.kind !== "composite") throw new RestoreCompositeError("no restore entry to advance");
+      if (to === "ready") {
+        if (current.stage !== "seeding" || current.successor.kind !== "entry") throw new RestoreCompositeError("restore entry is not seeding");
+        value = restoreJournalJson(current.basis, "ready", current.successor.journal);
+        expect = r => r.kind === "composite" && r.stage === "ready";
+      } else if (to === "retired") {
+        if (current.stage === "retired") return;
+        if (current.stage !== "ready" || current.successor.kind !== "entry" || current.ledger.state !== "retired")
+          throw new RestoreCompositeError("restore entry is not ready with a retired attempt");
+        const j = current.successor.journal;
+        value = restoreTombstoneJson(current.basis, { runId: j.runId, attemptId: j.attemptId, clonePath: j.clonePath });
+        parseRestoreTombstone(value);
+        expect = r => r.kind === "composite" && r.stage === "retired";
+      } else {
+        if (current.ledger.state !== "retired") throw new RestoreCompositeError("restore entry's attempt is not retired");
+        value = "";
+        expect = r => r.kind === "plain";
+      }
+    }
+    const next = entries.filter(item => item !== key && !item.startsWith(`${key}\n`));
+    if (value !== "") next.push(`${key}\n${value}`);
+    if (!expect(await this.resolveBranchJournal(barePath, branch, next))) throw new RestoreCompositeError("restore transition is not valid here");
+    await this.assertRecoveryBare(barePath);
+    await this.runGit(barePath, ["config", "--local", key, value]);
+    if ((this.restoreValueIn(await this.configEntries(barePath), branch) ?? "") !== value) throw new Error("restore entry read-back differs");
+  }
+
+  /** The stored spelling of `journal` in the key that `found` was read from. */
+  private journalValueFor(found: { restore?: { basis: RestoreBasis; stage: RestoreStage } }, journal: RecoveryJournalEntry): string {
+    return found.restore ? restoreJournalJson(found.restore.basis, found.restore.stage, journal) : recoveryJournalJson(journal);
+  }
+
+  /** Throws before any write while a restore entry exists for `branch`: P's key is never written then (plan 3.5 (b)). A
+   *  restore entry of another run than `writerRunId` is {@link RestoreCompositeBlockedError}. */
+  private async assertNoRestoreEntry(barePath: string, branch: string, writerRunId?: string, snapshot?: readonly string[]): Promise<void> {
+    const holder = this.restoreHolder(snapshot ?? await this.configEntries(barePath), branch);
+    if (holder === undefined) return;
+    if (holder.runId !== undefined && writerRunId !== undefined && holder.runId !== writerRunId)
+      throw new RestoreCompositeBlockedError("the branch is held by another run's restore", holder.runId);
+    throw new RestoreCompositeError("a restore entry exists for this branch");
+  }
+
+  /** Seeds only: another run (or an unknown one) may not seed a branch a restore entry holds; the restored run's own seed keeps
+   *  the pre-existing same-run journal refusal. */
+  private async refuseOtherRunRestore(barePath: string, branch: string, runId: string | undefined): Promise<void> {
+    const holder = this.restoreHolder(await this.configEntries(barePath), branch);
+    if (holder === undefined || (holder.runId !== undefined && holder.runId === runId)) return;
+    throw new RestoreCompositeBlockedError("the branch is held by another run's restore", holder.runId);
+  }
+
+  /** Who the branch's restore entry names, or undefined when there is none; `runId` is undefined for an undecodable value. */
+  private restoreHolder(entries: readonly string[], branch: string): { runId?: string } | undefined {
+    const raw = this.restoreValueIn(entries, branch);
+    if (raw === undefined) return undefined;
+    try {
+      const v = parseRestoreValue(raw);
+      const runId = v.kind === "entry" ? v.remainder.runId : v.successor.runId;
+      return typeof runId === "string" ? { runId } : {};
+    } catch { return {}; }
+  }
+
   /** Every clone path any branch's recovery journal names (issue #1783 M2: the retention sweep
    *  never deletes a journaled path). Throws on an unreadable config or a malformed journal. */
   private async journaledClonePaths(barePath: string, warningScope?: RecoveryPhysicalWarningScope): Promise<Set<string>> {
@@ -11744,6 +12169,13 @@ export class GitCache {
         const nl = item.indexOf("\n");
         if (nl < 0) continue;
         const k = item.slice(0, nl);
+        // issue #3644: a restored successor's clone path is journaled in its own key, so the retention sweep keeps it.
+        const restoreBranch = restoreKeyBranch(k);
+        if (restoreBranch !== undefined && item.slice(nl + 1)) {
+          const composite = await this.resolveBranchJournal(barePath, restoreBranch);
+          if (composite.kind === "composite" && composite.successor.kind === "entry") out.add(composite.successor.journal.clonePath);
+          continue;
+        }
         if (!/^uzi-recovery\..+\.clone$/.test(k)) continue;
         const v = item.slice(nl + 1);
         if (v) {
@@ -11796,6 +12228,11 @@ export class GitCache {
   private async compactAttemptLedger(barePath: string, branch: string): Promise<void> {
     try {
       const key = attemptLedgerKey(branch);
+      // issue #3644: compaction lstats every ledger path, a restored predecessor's included; it waits while a restore entry exists.
+      if ((await this.configEntries(barePath)).some(item => {
+        const nl = item.indexOf("\n");
+        return nl > 0 && nl < item.length - 1 && restoreKeyBranch(item.slice(0, nl)) !== undefined;
+      })) return;
       const raw = (await this.readAllAttemptLedgerRaw(barePath)).filter(([b]) => b === branch).map(([, v]) => v);
       const last = new Map<string, AttemptLedgerEntry>();
       for (const v of raw) {
@@ -11957,6 +12394,7 @@ export class GitCache {
     state: "abandoned" | "reclaimed",
   ): Promise<void> {
     await this.withLock(barePath, async () => {
+      await this.assertNoRestoreEntry(barePath, branch, runId); // issue #3644: P's key is never touched while a restore entry exists
       const pending = await this.readRecoveryCapture(barePath, branch);
       if (pending?.runId !== runId || pending.clonePath !== clonePath) {
         throw new CapturePathMismatchError(pending?.clonePath ?? "", clonePath, branch, runId);
@@ -13455,7 +13893,17 @@ export class GitCache {
       const open = async (): Promise<boolean> =>
         processOpen() && !await this.hasPhysicalTerminalProtection(runId) && processOpen() && residueQuarantine() === undefined;
       if (!await open()) return false;
-      const pending = await this.readRecoveryCapture(barePath, branch);
+      // issue #3644: under a composite this source is S, whose entry (or tombstone) is the journal.
+      const restoreState = await this.resolveBranchJournal(barePath, branch);
+      const foundS = restoreState.kind === "composite" && restoreState.successor.kind === "entry" && restoreState.stage !== "retired" &&
+        restoreState.successor.journal.runId === runId && restoreState.successor.journal.clonePath === clonePath &&
+        restoreState.successor.journal.attemptId === attemptId;
+      const tombstoned = restoreState.kind === "composite" && restoreState.successor.kind === "tombstone" &&
+        restoreState.successor.successor.runId === runId && restoreState.successor.successor.clonePath === clonePath &&
+        restoreState.successor.successor.attemptId === attemptId;
+      if (restoreState.kind === "composite" && !foundS && !tombstoned) return false; // the predecessor or another run
+      const pending = restoreState.kind === "composite" ? (foundS && restoreState.successor.kind === "entry" ? restoreState.successor.journal : undefined)
+        : restoreState.kind === "plain" ? restoreState.journal : undefined;
       if (!processOpen()) return false;
       if (pending && (pending.runId !== runId || pending.clonePath !== clonePath || pending.attemptId !== attemptId))
         return false; // A successor/adoption owns this branch now.
@@ -13466,7 +13914,8 @@ export class GitCache {
       // The retired ledger proves attribution only. The caller may independently require live process exclusion.
       if (pending) {
         if (!processOpen()) return false;
-        await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+        if (foundS) await this.advanceRestoreEntry(barePath, branch, "retired"); // issue #3644: tombstone, P's key stays
+        else await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
       }
       return processOpen();
     });
@@ -13499,8 +13948,10 @@ export class GitCache {
     return this.withLock(barePath, async () => {
       if (!processOpen()) return false;
       await this.assertRecoveryBare(barePath);
-      const stored = await this.readRecoveryCaptureWithRaw(barePath, branch);
+      const stored = await this.readJournalFor(barePath, branch, { runId, clonePath, ...(attemptId === undefined ? {} : { attemptId }) });
       const pending = stored?.journal;
+      // issue #3644: a composite's predecessor is never cleared here; S's entry becomes the tombstone instead.
+      if (stored?.composite && !stored.restore) return false;
       if (!stored || !pending || pending.runId !== runId || pending.clonePath !== clonePath || pending.attemptId !== attemptId) return false;
       if (pending.remediationRecovery || pending.recovery || pending.retainedSources?.length || pending.completionSourceFence === undefined) return false;
       try {
@@ -13520,12 +13971,13 @@ export class GitCache {
       catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
       if (!processOpen() || await this.hasPhysicalTerminalProtection(runId) || residueQuarantine() !== undefined || !processOpen()) return false;
       // Nothing may have changed the journal while the guards above awaited.
-      if (await this.readRecoveryCaptureRaw(barePath, branch) !== stored.raw || !processOpen()) return false;
+      if ((await this.readJournalFor(barePath, branch, { runId, clonePath, ...(attemptId === undefined ? {} : { attemptId }) }))?.raw !== stored.raw || !processOpen()) return false;
       if (appendRetired) {
         await this.appendAttemptLedger(barePath, branch, { attemptId: attemptId!, runId, clonePath, state: "retired" });
         if (!processOpen()) return false;
       }
-      await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+      if (stored.restore) await this.advanceRestoreEntry(barePath, branch, "retired");
+      else await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
       return processOpen();
     });
   }
@@ -13543,7 +13995,8 @@ export class GitCache {
       await this.assertRecoveryBare(barePath);
       try { await fs.lstat(clonePath); return false; }
       catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
-      const pending = await this.readRecoveryCapture(barePath, branch);
+      // issue #3644: under a composite S's entry is the journal that may name this source; P stays an opaque, plain journal.
+      const pending = (await this.readJournalFor(barePath, branch, { runId, clonePath, ...(attemptId === undefined ? {} : { attemptId }) }))?.journal;
       if (pending?.runId === runId && pending.clonePath === clonePath && pending.attemptId === attemptId) return false;
       if (pending?.recovery || pending?.retainedSources?.some(source => source.clonePath === clonePath)) return false;
       return !await this.hasPhysicalTerminalProtection(runId);
@@ -13635,7 +14088,18 @@ export class GitCache {
       //    to STILL be journaled before moving anything. A missing/malformed journal, or
       //    a lock-gap rewrite to a different runId/path, moves NOTHING and fails closed.
       checkProcessProof();
-      const pending = await this.readRecoveryCapture(barePath, branch);
+      // issue #3644: under a composite only the successor's certified completion retires, and it reads S's entry; P's key
+      // is never cleared and another run's retirement is a nonterminal block.
+      const entries = await this.configEntries(barePath);
+      let pending = await this.readRecoveryCapture(barePath, branch, entries);
+      if (this.restoreHolder(entries, branch) !== undefined) {
+        const found = await this.readJournalFor(barePath, branch, { runId: ownerRunId, clonePath, ...(opts.attemptId === undefined ? {} : { attemptId: opts.attemptId }) }, entries);
+        if (!opts.completionSource || !found?.restore) {
+          if (found!.journal.runId !== ownerRunId) throw new RestoreCompositeBlockedError("the branch is held by another run's restore", found!.journal.runId);
+          throw new RestoreCompositeError("a restore entry exists for this branch");
+        }
+        pending = found.journal;
+      }
       stage = "journal_validation";
       if (pending?.runId !== ownerRunId || pending.clonePath !== clonePath) {
         throw new CapturePathMismatchError(pending?.clonePath ?? "", clonePath, branch, ownerRunId);
@@ -14109,7 +14573,9 @@ export class GitCache {
         // Full disposal succeeded in this held lock. Retry only a metadata write, once;
         // every attempt rechecks exact ownership and exclusion. Failure keeps the receipt.
         const finishMetadata = async (): Promise<void> => {
-          const pending = await this.readRecoveryCapture(barePath, branch);
+          const identity = { runId: ownerRunId, clonePath, ...(opts.attemptId === undefined ? {} : { attemptId: opts.attemptId }) };
+          const foundNow = await this.readJournalFor(barePath, branch, identity);
+          const pending = foundNow?.journal;
           if (pending?.runId !== ownerRunId || pending.clonePath !== clonePath || pending.attemptId !== opts.attemptId)
             throw new Error("completion source journal changed");
           const canonicalAbsent = await fs.lstat(clonePath).then(() => false, (err: NodeJS.ErrnoException) => {
@@ -14131,11 +14597,15 @@ export class GitCache {
               } catch (error) { return retryWrite(error); }
             }
           }
-          const still = await this.readRecoveryCapture(barePath, branch);
+          const still = (await this.readJournalFor(barePath, branch, identity))?.journal;
           if (still?.runId !== ownerRunId || still.clonePath !== clonePath || still.attemptId !== opts.attemptId)
             throw new Error("completion source journal changed");
           open();
-          try { await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]); }
+          // issue #3644: S's entry becomes the tombstone (ready -> retired, after the ledger `retired` above); P's key stays.
+          try {
+            if (foundNow?.restore) await this.advanceRestoreEntry(barePath, branch, "retired");
+            else await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+          }
           catch (error) { return retryWrite(error); }
         };
         let retried = false;
@@ -14151,7 +14621,8 @@ export class GitCache {
         const movedTo = scratch ? path.join(scratch, "clone") : holding;
         if (movedTo) {
           try {
-            const pending = await this.readRecoveryCapture(barePath, branch);
+            const pending = (await this.readJournalFor(barePath, branch, { runId: ownerRunId, clonePath,
+              ...(opts.attemptId === undefined ? {} : { attemptId: opts.attemptId }) }))?.journal;
             if (pending?.runId !== ownerRunId || pending.clonePath !== clonePath || pending.attemptId !== opts.attemptId)
               throw new Error("completion rollback journal changed");
             const canonicalAbsent = await fs.lstat(clonePath).then(() => false, (err: NodeJS.ErrnoException) => {
@@ -19118,7 +19589,7 @@ try {
         start = i + 1;
         const nl = item.indexOf("\n");
         const key = item.slice(0, nl);
-        if (!/^(uzi-recovery\.|uzi-retained\.|uzi-attempts\.|uzi-stopped\.)/.test(key)) continue;
+        if (!/^(uzi-recovery\.|uzi-restore\.|uzi-retained\.|uzi-attempts\.|uzi-stopped\.)/.test(key)) continue;
         sources++;
         try {
           const parsed = JSON.parse(item.slice(nl + 1));
