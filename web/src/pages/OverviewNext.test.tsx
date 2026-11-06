@@ -475,3 +475,96 @@ describe("Needs your decision", () => {
     expect(screen.getByText(/^Nothing needs you right now\./)).toBeTruthy();
   });
 });
+
+describe("Issue work line", () => {
+  const line = () => screen.getByRole("region", { name: "Issue work" });
+  const stationOf = (stage: string) => line().querySelector(`[data-stage="${stage}"]`) as HTMLElement;
+  const countOf = (stage: string) => Number(stationOf(stage).getAttribute("data-count"));
+  const activeStages = ["queued", "planning", "review", "building", "asking", "parked", "other"];
+  const widgetRows = () => {
+    const rows = (name: string) => screen.queryAllByRole("list", { name }).flatMap((l) => within(l).getAllByRole("listitem"));
+    return rows("Your runs").length + rows("Other users' runs").length;
+  };
+
+  it("sits right after the decision card, only once the data has loaded", async () => {
+    mockApi.listRuns.mockResolvedValue({ runs: [aRun({ id: "plan-1", status: "awaiting_approval" })] });
+    await mount();
+    const needs = screen.getByRole("region", { name: "Needs your decision" });
+    expect(needs.nextElementSibling).toBe(line());
+    cleanup();
+    mockApi.listRuns.mockImplementation(() => new Promise(() => {}));
+    await mount();
+    expect(screen.queryByRole("region", { name: "Issue work" })).toBeNull();
+  });
+
+  it("counts another user's queued run for an admin, naming the owner in the badge tooltip", async () => {
+    vi.mocked(useAuth).mockReturnValue(authValue(admin));
+    mockApi.listRuns.mockResolvedValue({ runs: [aRun({ id: "own-1", status: "running" })] });
+    mockApi.adminListRuns.mockResolvedValue({
+      runs: [aRun({ id: "x-1", status: "queued", issue_iid: 55, owner_email: "mira@uzi.local" })],
+    });
+    await mount();
+    expect(countOf("queued")).toBe(1);
+    expect(within(stationOf("queued")).getByText("#55").getAttribute("title")).toBe("mira@uzi.local");
+    expect(within(line()).getByText("2 runs on the line, 0 other, all users")).toBeTruthy();
+  });
+
+  it("never counts another user's run on a non-admin's line, and never asks for the admin list", async () => {
+    mockApi.adminListRuns.mockResolvedValue({
+      runs: [aRun({ id: "x-1", status: "queued", owner_email: "mira@uzi.local" })],
+    });
+    await mount();
+    expect(countOf("queued")).toBe(0);
+    expect(countOf("building")).toBe(1);
+    for (const call of adminEndpoints()) expect(call).not.toHaveBeenCalled();
+    expect(within(line()).queryByText(/all users/)).toBeNull();
+  });
+
+  it("counts only the viewer's runs when the admin list is unreadable", async () => {
+    vi.mocked(useAuth).mockReturnValue(authValue(admin));
+    mockApi.adminListRuns.mockRejectedValue(new Error("down"));
+    await mount();
+    expect(activeStages.reduce((n, s) => n + countOf(s), 0)).toBe(1);
+    expect(within(line()).queryByText(/all users/)).toBeNull();
+  });
+
+  const mixed = () => [
+    aRun({ id: "o1", status: "queued" }),
+    aRun({ id: "o2", status: "awaiting_approval", is_revising: true }),
+    aRun({ id: "o3", status: "awaiting_approval" }),
+    aRun({ id: "o4", status: "awaiting_input" }),
+    aRun({ id: "o5", status: "paused" }),
+    aRun({ id: "o6", status: "running", health: "waiting_account_cooldown" }),
+    aRun({ id: "o7", kind: "ci_fix", status: "running" }),
+    aRun({ id: "o8", status: "running" }),
+    aRun({ id: "o9", status: "completed", mr_iid: 3, mr_state: "opened", finished_at: "2026-07-05T12:00:00Z" }),
+    aRun({ id: "o10", status: "failed" }),
+  ];
+
+  it("totals the stations and bays to the Runs widget's rows for a non-admin, PRs apart", async () => {
+    mockApi.listRuns.mockResolvedValue({ runs: mixed() });
+    await mount();
+    expect(widgetRows()).toBe(8);
+    expect(activeStages.reduce((n, s) => n + countOf(s), 0)).toBe(widgetRows());
+    expect(countOf("pr")).toBe(1);
+  });
+
+  it("totals the stations and bays to Yours plus Other users for an admin", async () => {
+    vi.mocked(useAuth).mockReturnValue(authValue(admin));
+    mockApi.listRuns.mockResolvedValue({ runs: mixed() });
+    mockApi.adminListRuns.mockResolvedValue({
+      runs: [
+        ...mixed().map((r) => ({ ...r, owner_email: admin.email })),
+        aRun({ id: "x1", status: "queued", owner_email: "mira@uzi.local" }),
+        aRun({ id: "x2", status: "awaiting_input", owner_email: "mira@uzi.local" }),
+        aRun({ id: "x3", status: "limit_wait", owner_email: "andrei@uzi.local" }),
+        aRun({ id: "x4", status: "completed", owner_email: "andrei@uzi.local" }),
+        aRun({ id: "x5", kind: "job", status: "running", owner_email: "andrei@uzi.local" }),
+      ],
+    });
+    await mount();
+    expect(widgetRows()).toBe(8 + 4);
+    expect(activeStages.reduce((n, s) => n + countOf(s), 0)).toBe(widgetRows());
+    expect(countOf("pr")).toBe(1);
+  });
+});
