@@ -66,6 +66,7 @@ import { PlanRejectedError } from "./executor.js";
 import { acquireCodexOperationScope } from "./codex-operation-scope.js";
 import { type CodexOperationController, type CodexOperationWaitPolicy } from "./codex-operation-controller.js";
 import { CodexOperationAdmissionError } from "./client.js";
+import { transientOwnershipReadCause } from "./ownership-read-transient.js";
 import { PLAN_REVISION_RETRY_FEATURE, PlanRevisionRecovery, PlanRevisionRecoveryStoppedError, type PlanRevisionRetryPolicy } from "./plan-revision-retry.js";
 import { checkPlan, type CheckedHumanGate, type CheckedPlanDecision, type PlanCrossCheckTiming } from "./plan-cross-check-gate.js";
 import { gatedPlanPresentation } from "./checked-plan.js";
@@ -385,6 +386,10 @@ const CREDENTIAL_SWITCH_CAPTURE_ATTEMPTS = 3;
  *  not clear on its own, failing closed is the maintainer's decision, and per-attempt cgroup v2
  *  containment is the follow-up that removes the case. */
 const RECOVERY_CAPTURE_BLOCKED_ATTEMPTS = 5;
+
+/** issue #3994: backoff multipliers (of recoveryRetryMs) between the up-to-5 post-adoption
+ *  ownership reads of a retained successor; see confirmPostAdoptionOwnership. */
+const POST_ADOPTION_OWNERSHIP_RETRY_FACTORS = [1, 2, 4, 8] as const;
 
 /** PRD #1226 M4 (D5): the STATIC, content-free failure_reason a worker reports when the completion
  *  interlock cannot report completed AND cannot park the run for recovery (the restore point never
@@ -5607,6 +5612,13 @@ export class RunRunner {
         if (flight.steering.getPauseMode() === "disk") err = new DiskParkSignal(false);
         else if (authority.aborted) err = authority.reason;
         else err = new RetainedRecoveryStop({ cause: err });
+      }
+      // Issue #3974: an owner cancel was committed while a credential switch was withheld, and the
+      // switch signal then escaped. Never enter the switch: take the ordinary cancelled route, the
+      // same "run cancelled" failure a cancel input produces, so no capture or credential_switch*
+      // report happens for this flight.
+      if (err instanceof CredentialSwitchSignal && flight.steering?.cancelCommittedUnderWithheldSwitch()) {
+        err = new Error("run cancelled");
       }
       // PRD #35: a usage-limit death is not an ordinary failure. Handled before the
       // generic path below because that path is terminal in both senses — it reports
@@ -15789,6 +15801,7 @@ export class RunRunner {
       // selection whether or not this particular resume skips the gate, and the
       // executor only reads it on the path that has no verdict to supply one.
       approvedSelection: claim.agent_selection,
+      requestedAgentSource: claim.requested_agent_source ?? null,
       signal: cancel.signal,
       terminalLifecycleSignal: steering.terminalLifecycleSignal(),
       lifecycleSignal: () => steering.lifecycleSignal(),
@@ -15858,6 +15871,10 @@ export class RunRunner {
       // issue #1597 M2: gated end to end — from the wip marker captureRecoveryRestorePoint commits to
       // the give-up's undoWipMarker — so a mid-turn tick can never publish that throwaway marker.
       attemptCredentialSwitch: async () => {
+        // Issue #3974: an owner cancel was committed while the switch was withheld. Do not enter the
+        // switch (no capture, no credential_switch* report): throw the ordinary cancel error so the
+        // executor lets it reach executeClaim's dispatchFailure, which reports "run cancelled".
+        if (steering.cancelCommittedUnderWithheldSwitch()) throw new Error("run cancelled");
         if (batcher.hasCandidateReservation()) {
           // Invariant guard: no capture, report, clear or continuation. Not a checked lifecycle
           // control, so it reaches dispatchFailure's generic branch (reportGenericFailure closes
@@ -16383,6 +16400,7 @@ export class RunRunner {
           } : undefined,
           gatedPresentation ? { ...gatedPresentation, milestones: presentedMilestones ?? [],
             claimGeneration: flight.claimGeneration } : undefined,
+          claim.requested_agent_source,
         ).catch((error) => {
           if (checkedHuman || checkedApproval) {
             if (error instanceof CredentialSwitchSignal) {
@@ -26172,6 +26190,33 @@ export class RunRunner {
     if (deadline !== undefined && Date.now() >= deadline) throw new Error("recovery deadline exhausted");
   }
 
+  /**
+   * issue #3994: the ownership re-check after a retained successor is adopted. A transient
+   * transport/gateway failure of that read (positively classified by
+   * {@link transientOwnershipReadCause}) is retried in place, within the iteration deadline,
+   * rather than failing the adoption. Anything else, an exhausted attempt budget, or a wait
+   * the deadline cannot afford rethrows the original error object unchanged.
+   */
+  private async confirmPostAdoptionOwnership(flight: RunFlight, deadline: number, signal: AbortSignal): Promise<void> {
+    const attempts = POST_ADOPTION_OWNERSHIP_RETRY_FACTORS.length + 1;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await this.requireRetainedOwnership(flight, deadline, signal);
+        return;
+      } catch (error) {
+        const token = transientOwnershipReadCause(error, flight.runId);
+        if (token === undefined || attempt >= attempts) throw error;
+        const delay = this.recoveryRetryMs * POST_ADOPTION_OWNERSHIP_RETRY_FACTORS[attempt - 1]!;
+        this.retainedLifecycleGuard(flight);
+        if (Date.now() + delay >= deadline) throw error;
+        flight.runLog.warn("retained post-adoption ownership read transient; retrying",
+          { attempt, cause_class: token, claim_generation: flight.claimGeneration });
+        try { await this.waitRecoveryRetry(flight, true, delay, signal); }
+        catch (waitError) { this.retainedLifecycleGuard(flight); throw waitError; }
+      }
+    }
+  }
+
   /** Two identical reports and at most two ownership probes, under one boundary deadline.
    * Ownership only authorizes replay: only the report ACK's exact status/cause confirms.
    * Any unresolved outcome stops this flight without terminal reporting or releasing custody. */
@@ -27137,7 +27182,7 @@ export class RunRunner {
             () => flight.executor.recordedRootPids?.() ?? [], new Date(this.now()), attemptId);
           flight.attempt = attempt;
           this.liveAttempts.add(attempt);
-          try { await check(); }
+          try { await this.confirmPostAdoptionOwnership(flight, iteration.deadline, signal); }
           catch (error) {
             try {
               if (!(error instanceof RetainedRecoveryStop) && !(error instanceof CredentialSwitchSignal) &&
@@ -27154,7 +27199,7 @@ export class RunRunner {
             blocker = "quiescence_failed";
             await flight.executor.closeAndSettlePlanSummary?.(Math.max(0, Math.min(this.codexBoundaryDeadlineMs, iteration.deadline - Date.now())));
             const disposal = await flight.executor.safety?.dispose({ boundary: "shutdown", deadlineMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, iteration.deadline - Date.now())) });
-            await check();
+            await this.confirmPostAdoptionOwnership(flight, iteration.deadline, signal);
             if (flight.executor.safety && disposal?.kind !== "disposed") throw finalize;
             flight.executor = publicationOnlyExecutor(claim, this.makeExecutor(claim.run_id, claim.secrets.codex).executor);
             this.registerEvidenceExecutor(flight);
@@ -27707,6 +27752,7 @@ export class RunRunner {
     semanticPark?: SemanticPark,
     onSemanticPresented?: (ack: StateAck) => Promise<void>,
     presentedCanonical?: Extract<PlanVerdict, { approval: "cross_check" }>["canonical"],
+    requestedSource?: AgentSource | null,
   ): Promise<PlanVerdict> {
     // PRD #1795 (decision 6): nothing is confirmed until THIS gate's own applied awaiting_approval
     // ACK says which revision it published, so a verdict bound to an earlier gate cannot act on
@@ -27742,10 +27788,12 @@ export class RunRunner {
       // templates) is resolved here, persisted via the running report (the only
       // channel a no-input run has, Decision 6), and stated on the feed. The
       // executor re-resolves the SAME absent-parse to build the identical roster.
-      const selection = resolveAgentSelection(
+      const resolved = resolveAgentSelection(
         { status: "absent" },
         repoAgents.length > 0,
-      ).selection;
+        requestedSource,
+      );
+      const selection = resolved.selection;
       // Make this report self-contained (F1): carry the roster alongside the selection
       // so both validate + persist atomically, even if the fire-and-forget running
       // roster report above failed and left the column NULL. Gated on length > 0 — on
@@ -27808,6 +27856,7 @@ export class RunRunner {
             runLog.warn("plan summary hook failed", { run_id: runId, error: errMessage(error) });
           }
         }
+        if (resolved.note) batcher.emit({ kind: "status", agent: "worker", payload: { text: resolved.note } });
         batcher.emit({
           kind: "status",
           agent: "worker",

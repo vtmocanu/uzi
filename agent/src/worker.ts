@@ -1042,6 +1042,7 @@ export class Worker {
           // the api offers a guarded repair run only to a worker advertising it.
           "ci_config_guard_v1",
           "repo_agent_source_v1",
+          "agent_source_request_v1",
           // Verified artifact files use Linux descriptor anchoring; other hosts remain logs-only.
           ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),
         ];

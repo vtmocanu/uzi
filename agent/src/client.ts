@@ -5410,16 +5410,33 @@ function maintenanceSignal(timeoutMs: number): AbortSignal {
   return AbortSignal.any([budget.signal, AbortSignal.timeout(duration), ...(pending ? [pending] : [])]);
 }
 
+// Rejections of the transport (fetch) promise itself, as opposed to budget checks or body reads.
+const fetchRejections = new WeakSet<object>();
+
+function markTransportRejection<T>(p: Promise<T>, signal?: AbortSignal | null): Promise<T> {
+  return p.catch((error: unknown) => {
+    // undici rejects with `signal.reason` itself on abort; that is an abort, not a transport failure.
+    if (signal?.aborted && error === signal.reason) throw error;
+    if ((typeof error === "object" || typeof error === "function") && error !== null) fetchRejections.add(error);
+    throw error;
+  });
+}
+
+/** True only for an error object that the transport promise rejected with (identity-preserved). */
+export function isFetchRejection(error: unknown): boolean {
+  return (typeof error === "object" || typeof error === "function") && error !== null && fetchRejections.has(error);
+}
+
 async function maintenanceFetch(transport: typeof fetch, url: string, init: RequestInit): Promise<Response> {
   MaintenanceResources.consumeIfActive("rpcAttempts", 1);
   const resourceSignal = MaintenanceResources.signalIfActive();
   if (resourceSignal) init = { ...init, signal: AbortSignal.any([resourceSignal, ...(init.signal ? [init.signal] : [])]) };
   const budget = MaintenanceBudget.current();
-  if (!budget && !resourceSignal && !MaintenanceBudget.ownedSignal()) return transport(url, init);
+  if (!budget && !resourceSignal && !MaintenanceBudget.ownedSignal()) return markTransportRejection(transport(url, init), init.signal);
   if (!budget || MaintenanceBudget.ownedSignal()) {
     budget?.check();
     init.signal?.throwIfAborted();
-    const res = await transport(url, init);
+    const res = await markTransportRejection(transport(url, init), init.signal);
     if (init.signal) responseSignals.set(res, init.signal);
     ownResponse(res, init.signal);
     if (MaintenanceBudget.ownedSignal()) {
@@ -5430,7 +5447,7 @@ async function maintenanceFetch(transport: typeof fetch, url: string, init: Requ
   }
   budget.check();
   const signal = AbortSignal.any([budget.signal, ...(init.signal ? [init.signal] : [])]);
-  const res = await budget.raceIO(() => transport(url, { ...init, signal }), late => {
+  const res = await budget.raceIO(() => markTransportRejection(transport(url, { ...init, signal }), signal), late => {
     // One detached cancellation attempt; an uncooperative body cannot block the caller.
     void late.body?.cancel().catch(() => undefined);
   }, signal);

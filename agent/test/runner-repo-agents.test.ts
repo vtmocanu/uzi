@@ -8,6 +8,7 @@ import { StubExecutor, type Executor } from "../src/executor.js";
 import { detectRepoAgentsAtRevision } from "../src/repoagents.js";
 import { RunRunner } from "../src/runner.js";
 import { REPO_AGENT_SOURCE_FEATURE, type BaseAttestationHoldOutcome } from "../src/protocol.js";
+import { REQUESTED_SOURCE_TABLE, caseLabel } from "./requested-agent-source-table.js";
 import {
   api,
   client,
@@ -271,6 +272,44 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
       repoFx.cleanup();
     }
   });
+
+  for (const c of REQUESTED_SOURCE_TABLE) {
+    it(`PRD #3914 shared call-site table, autopilot: ${caseLabel(c)}`, async () => {
+      const repoFx = makeFixture(c.roster ? { ".claude/agents/coder.md": "---\nname: coder\ndescription: c.\n---\n\nbody\n" } : {});
+      try {
+        const { gitlab } = fakeGitlab();
+        const claim = makeClaim({
+          issue_iid: 37,
+          issue_title: "autopilot requested source",
+          repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: repoFx.originPath, default_branch: "main" },
+          last_seq: 0,
+          secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan" },
+          auto_approve: true,
+          ...(c.requested === undefined ? {} : { requested_agent_source: c.requested }),
+        });
+        const r = new RunRunner(
+          client,
+          new GitCache(repoFx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() })),
+          () => ({ executor: new StubExecutor(nullLogger(), { planGate: true }) }),
+          nullLogger(),
+          20,
+          undefined,
+          { pollMs: 5, planApprovalTimeoutMs: 0, gitlab },
+        );
+        await r.execute(claim);
+        const selection = api.states
+          .filter((st) => st.runId === claim.run_id)
+          .map((st) => st.body)
+          .find((b) => b.agent_selection !== undefined)?.agent_selection;
+        assert.deepStrictEqual(selection, { source: c.want, exclusions: [] });
+        const texts = api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => String(m.payload.text));
+        assert.equal(texts.includes("this clone has no repo agent roster; using your own agent templates"),
+          c.requested === "repo" && !c.roster, texts.join("\n"));
+      } finally {
+        repoFx.cleanup();
+      }
+    });
+  }
 
   it("autopilot with no repo agents resolves + reports the OWN default", async () => {
     const { states, texts } = await (async () => {

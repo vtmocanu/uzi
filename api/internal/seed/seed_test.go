@@ -34,14 +34,16 @@ func (f *fakeForge) ListProjects(context.Context) ([]forge.Project, error) {
 // (to prove the existing-connection path never re-verifies) and seals PATs with
 // a recognizable prefix so the stored ciphertext can be asserted.
 type fakeSvc struct {
-	forge    forge.Forge
-	buildErr error
-	built    int
+	forge     forge.Forge
+	buildErr  error
+	built     int
+	builtType forge.Type
 }
 
 func (s *fakeSvc) EncryptToken(pat string) ([]byte, error) { return []byte("sealed:" + pat), nil }
-func (s *fakeSvc) ForgeForToken(forge.Type, string, string) (forge.Forge, error) {
+func (s *fakeSvc) ForgeForToken(t forge.Type, _, _ string) (forge.Forge, error) {
 	s.built++
+	s.builtType = t
 	return s.forge, s.buildErr
 }
 
@@ -86,6 +88,7 @@ func (s *fakeStore) SetRepoEnabledForUser(_ context.Context, arg store.SetRepoEn
 func baseCfg() config.Config {
 	return config.Config{
 		SeedEmail:        "admin@uzi.test",
+		SeedForgeType:    forge.TypeGitLab,
 		SeedForgePAT:     "glpat-xxx",
 		SeedForgeBaseURL: "https://gitlab.example.com",
 		SeedForgeRepos:   []string{"vtmocanu/uzi", "vtmocanu/missing"},
@@ -128,6 +131,69 @@ func TestForgeConnectionHappyPath(t *testing.T) {
 	if got.ID != st.repoIDByPath["vtmocanu/uzi"] || !got.Enabled || got.UserID != userID {
 		t.Fatalf("wrong repo enabled: %+v", got)
 	}
+}
+
+// The seed provisions the configured forge (issue #3785): the client build and
+// the stored row both carry UZI_SEED_FORGE_TYPE, so a GitHub or Forgejo token no
+// longer reaches the GitLab driver.
+func TestForgeConnectionUsesConfiguredForgeType(t *testing.T) {
+	for _, ft := range []forge.Type{forge.TypeGitLab, forge.TypeForgejo, forge.TypeGitHub} {
+		t.Run(string(ft), func(t *testing.T) {
+			st := &fakeStore{user: store.User{ID: uuid.New()}}
+			svc := &fakeSvc{forge: &fakeForge{identity: forge.BotIdentity{ForgeUserID: 7, Username: "uzi-bot"}}}
+			cfg := baseCfg()
+			cfg.SeedForgeType = ft
+
+			if err := ForgeConnection(context.Background(), st, svc, cfg); err != nil {
+				t.Fatalf("ForgeConnection: %v", err)
+			}
+			if svc.builtType != ft {
+				t.Fatalf("client built for %q, want %q", svc.builtType, ft)
+			}
+			if st.upsertedConn == nil {
+				t.Fatal("expected a connection to be created")
+			}
+			if st.upsertedConn.ForgeType != string(ft) {
+				t.Fatalf("stored forge_type = %q, want %q", st.upsertedConn.ForgeType, ft)
+			}
+		})
+	}
+}
+
+// The presence check matches on the configured type too: a GitLab row at the
+// same base URL does not stop a GitHub seed, and a GitHub row does stop it.
+func TestForgeConnectionPresenceCheckMatchesConfiguredType(t *testing.T) {
+	const base = "https://gitlab.example.com"
+	t.Run("other type at same URL still seeds", func(t *testing.T) {
+		st := &fakeStore{
+			user:  store.User{ID: uuid.New()},
+			conns: []store.ForgeConnection{{ForgeType: "gitlab", BaseUrl: base}},
+		}
+		svc := &fakeSvc{forge: &fakeForge{}}
+		cfg := baseCfg()
+		cfg.SeedForgeType = forge.TypeGitHub
+		if err := ForgeConnection(context.Background(), st, svc, cfg); err != nil {
+			t.Fatalf("ForgeConnection: %v", err)
+		}
+		if st.upsertedConn == nil || st.upsertedConn.ForgeType != "github" {
+			t.Fatalf("expected a github connection to be seeded, got %+v", st.upsertedConn)
+		}
+	})
+	t.Run("same type at same URL is a no-op", func(t *testing.T) {
+		st := &fakeStore{
+			user:  store.User{ID: uuid.New()},
+			conns: []store.ForgeConnection{{ForgeType: "github", BaseUrl: base}},
+		}
+		svc := &fakeSvc{forge: &fakeForge{}}
+		cfg := baseCfg()
+		cfg.SeedForgeType = forge.TypeGitHub
+		if err := ForgeConnection(context.Background(), st, svc, cfg); err != nil {
+			t.Fatalf("ForgeConnection: %v", err)
+		}
+		if svc.built != 0 || st.upsertedConn != nil {
+			t.Fatal("existing connection of the configured type must be left untouched")
+		}
+	})
 }
 
 func TestForgeConnectionExistingIsNoOp(t *testing.T) {

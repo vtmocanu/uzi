@@ -8146,12 +8146,13 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			// staleness-guard pair (planned_base_commit, require_base_match) is here for the
 			// same reason — require_base_match is NOT NULL DEFAULT false, so omitting it would
 			// silently opt every seeded run out of the fail-on-divergence behaviour.
-			PlanMd:            planMD,
-			PlanSource:        planSource,
-			AgentSource:       agentSource,
-			AgentExclusions:   agentExclusions,
-			PlannedBaseCommit: plannedBaseCommit,
-			RequireBaseMatch:  requireBaseMatch,
+			PlanMd:               planMD,
+			PlanSource:           planSource,
+			AgentSource:          agentSource,
+			AgentExclusions:      agentExclusions,
+			AgentSourceRequested: agentSource,
+			PlannedBaseCommit:    plannedBaseCommit,
+			RequireBaseMatch:     requireBaseMatch,
 			// PRD #300: the per-schedule model override, frozen onto the run at fire time.
 			// nil for every non-scheduled caller (interactive, label-poller autopilot) →
 			// NULL → the run inherits the owner's per-user Worker default at claim assembly.

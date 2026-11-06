@@ -1029,6 +1029,7 @@ type Repo struct {
 	CodeCrossCheckGuidance            pgtype.Text        `json:"code_cross_check_guidance"`
 	CrossCheckRepoInstructionsEnabled bool               `json:"cross_check_repo_instructions_enabled"`
 	IgnoredInferredCapabilities       []string           `json:"ignored_inferred_capabilities"`
+	AgentSourceDefault                pgtype.Text        `json:"agent_source_default"`
 }
 
 type RepoToolProfile struct {
@@ -1284,6 +1285,8 @@ type Run struct {
 	SnapshotDepartedEpoch          pgtype.Int8        `json:"snapshot_departed_epoch"`
 	RepoAgentSourceCommit          pgtype.Text        `json:"repo_agent_source_commit"`
 	RepoAgentSourceRequired        bool               `json:"repo_agent_source_required"`
+	AgentSourceRequested           pgtype.Text        `json:"agent_source_requested"`
+	AgentSourceRequestedBasis      pgtype.Text        `json:"agent_source_requested_basis"`
 }
 
 type RunCompletionAttempt struct {

@@ -144,7 +144,7 @@ import { summarySkipPayload } from "./summary-skip.js";
 import { resolvePrdInput } from "../prd-link.js";
 import { appendLeadTextTail, emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "../plan-missing.js";
 import { makeTextRedactor } from "../redact.js";
-import { resolveAgentSelection, seedAgentSelection, type AgentSelection, type AgentTemplate, type AskUserQuestion, type ClaimSkill, type IterationBudget, type Milestone, type MilestoneProgress } from "../protocol.js";
+import { gateVerdictSelection, resolveAgentSelection, seedAgentSelection, type AgentSelection, type AgentTemplate, type AskUserQuestion, type ClaimSkill, type IterationBudget, type Milestone, type MilestoneProgress } from "../protocol.js";
 import { ownSubagentTemplates, selectLeadTemplate, selectSubagentTemplates } from "../agents.js";
 import { REPO_AGENT_DENIED_TOOLS } from "../repoagents.js";
 import type { CommandSandboxMode } from "../config.js";
@@ -4201,7 +4201,7 @@ export class CodexExecutor implements Executor {
           gatedPlan = planMd;
           approvedMilestones = planResult.milestones;
         }
-        approvedSelection = verdict.selection;
+        approvedSelection = gateVerdictSelection(verdict.selection, ctx.approvedSelection, ctx.requestedAgentSource);
 
         // NEW-ROOT RESUME at plan approval. The plan turn's provider root holds a live credential
         // it does not need during the approval wait, so: persist the credential-free session,
@@ -4259,7 +4259,7 @@ export class CodexExecutor implements Executor {
       // gate), before any implement turn. An invalid selection forces `own` and a repo selection
       // with no detected roster degrades to `own` (resolveAgentSelection owns both rules), so a
       // malformed verdict can never activate attacker-authored repo agents.
-      const resolvedSelection = resolveAgentSelection(approvedSelection, (ctx.repoAgents?.length ?? 0) > 0);
+      const resolvedSelection = resolveAgentSelection(approvedSelection, (ctx.repoAgents?.length ?? 0) > 0, ctx.requestedAgentSource);
       if (resolvedSelection.note) {
         ctx.emit({ kind: "status", agent: "worker", payload: { text: resolvedSelection.note } });
       }

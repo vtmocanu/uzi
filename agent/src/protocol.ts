@@ -1940,6 +1940,7 @@ export interface ClaimResponse extends ClaimMemoryState {
    *  missing key as "absent", never as "source own with no exclusions". Also absent
    *  from an older server, which is the same case and wants the same handling. */
   agent_selection?: AgentSelection;
+  requested_agent_source?: AgentSource | null;
   /** This run's usage-limit opt-in (PRD #35 Decision 7), read from the runs row on
    *  EVERY claim so a resumed or re-queued run keeps it — the same convention as
    *  `auto_approve` above, and for the same reason: an unattended resume must not
@@ -2747,25 +2748,38 @@ export function parseAgentSelection(
 export function resolveAgentSelection(
   parse: AgentSelectionParse,
   repoAvailable: boolean,
+  requested?: AgentSource | null,
 ): { selection: AgentSelection; note?: string } {
   switch (parse.status) {
     case "ok":
-      if (parse.selection.source === "repo" && !repoAvailable)
-        return {
-          selection: { source: "own", exclusions: [] },
-          note: "this clone has no repo agent roster; using your own agent templates",
-        };
-      return { selection: parse.selection };
+      return degradeRepoWithoutRoster(parse.selection, repoAvailable);
     case "invalid":
       return {
         selection: { source: "own", exclusions: [] },
         note: "the submitted agent selection was malformed; using your own agent templates",
       };
     case "absent":
-      return {
-        selection: { source: repoAvailable ? "repo" : "own", exclusions: [] },
-      };
+      return degradeRepoWithoutRoster(
+        { source: requestedAgentSource(requested) ?? (repoAvailable ? "repo" : "own"), exclusions: [] },
+        repoAvailable,
+      );
   }
+}
+
+function degradeRepoWithoutRoster(
+  selection: AgentSelection,
+  repoAvailable: boolean,
+): { selection: AgentSelection; note?: string } {
+  if (selection.source === "repo" && !repoAvailable)
+    return {
+      selection: { source: "own", exclusions: [] },
+      note: "this clone has no repo agent roster; using your own agent templates",
+    };
+  return { selection };
+}
+
+function requestedAgentSource(raw: unknown): AgentSource | undefined {
+  return raw === "repo" || raw === "own" ? raw : undefined;
 }
 
 /**
@@ -2780,6 +2794,14 @@ export function resolveAgentSelection(
  */
 export function seedAgentSelection(persisted?: AgentSelection | null): AgentSelectionParse {
   return persisted ? { status: "ok", selection: persisted } : { status: "absent" };
+}
+
+export function gateVerdictSelection(
+  verdict: AgentSelectionParse,
+  persisted: AgentSelection | null | undefined,
+  requested: AgentSource | null | undefined,
+): AgentSelectionParse {
+  return verdict.status === "absent" && requested && persisted ? seedAgentSelection(persisted) : verdict;
 }
 
 /** Body of POST /runs/:id/state. Fields are set per target status.
