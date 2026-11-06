@@ -15,7 +15,7 @@ import { isUtf8 } from "node:buffer";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { finished, pipeline } from "node:stream/promises";
-import { constants as zlibConstants, crc32, deflateSync, inflateSync } from "node:zlib";
+import { crc32, createInflate, deflateSync, inflateSync } from "node:zlib";
 import { PassThrough, Readable, Transform, Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { RUN_KINDS, type RunKind } from "./protocol.js";
@@ -1415,7 +1415,8 @@ const MIRROR_SPLIT_LAUNCHES = 64;
 const MIRROR_TIP_CHUNK = 128;
 /** Git's own `core.deltaBaseCacheLimit` default. The cache only holds delta bases in a Git child's memory, so
  *  it changes speed, never a verdict; it is deliberately NOT the 4 GiB object-store budget, which would let
- *  every child hold that much memory. A smaller cache re-inflates bases (R9: delta work dominates cost). */
+ *  every child hold that much memory (that budget counts logical work, and the Node-side observation streams
+ *  through fixed windows, see OBSERVE_READ_WINDOW). A smaller cache re-inflates bases (R9: delta work dominates cost). */
 const EPOCH_DELTA_BASE_CACHE_BYTES = 96 * 1024 * 1024;
 
 /** How long an aborted prepared ref transaction may take to exit on its own before it is killed. */
@@ -2552,6 +2553,175 @@ class AutomaticContentRefusal extends Error {}
  *  keeps these UNKNOWN, not a settled keep, so {@link GitCache.automaticCloneShape} rethrows them instead of
  *  returning false. */
 const OBJECT_INFO_UNKNOWN = new WeakSet<Error>();
+
+// The object-store observation of the automatic content proof streams: its memory is bounded by the windows
+// below, never by the (logical, 4 GiB) work budget `maxObjectStoreBytes`, which counts bytes produced or consumed.
+/** One positioned read window over a pack, idx or loose file. */
+const OBSERVE_READ_WINDOW = 8 * 1024 * 1024;
+/** zlib's output window: the most inflated bytes alive at once for a streaming record. */
+const OBSERVE_INFLATE_WINDOW = 256 * 1024;
+/** Compressed input handed to zlib per write. */
+const OBSERVE_INPUT_PIECE = 1024 * 1024;
+/** A span this small, expected to inflate to at most {@link OBSERVE_SYNC_OUTPUT}, takes the one-shot inflater. */
+const OBSERVE_SYNC_SPAN = 256 * 1024;
+const OBSERVE_SYNC_OUTPUT = 1024 * 1024;
+
+/** A bounded one-shot inflate; `undefined` when the output would pass `cap` (the caller then streams instead). */
+function inflateSmall(span: Buffer, cap: number): { buffer: Buffer; consumed: number } | undefined {
+  try {
+    // Node returns the zlib result envelope for info:true; its declarations expose only Buffer.
+    const result = inflateSync(span, { maxOutputLength: cap, info: true }) as unknown as
+      { buffer: Buffer; engine: { bytesWritten: number } };
+    return { buffer: result.buffer, consumed: result.engine.bytesWritten };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ERR_BUFFER_TOO_LARGE") return undefined;
+    throw error;
+  }
+}
+
+/**
+ * Incremental zlib inflate of `pieces`: every output buffer (at most {@link OBSERVE_INFLATE_WINDOW}) goes to `sink`
+ * as it is produced, and a throw from `sink` stops the inflater at once. Returns how many input bytes the engine
+ * consumed (a stream that ends early leaves the rest unconsumed). A corrupt or truncated stream rejects with the
+ * zlib error. The caller must not touch the pieces' memory until the returned promise settles.
+ */
+async function inflateStream(pieces: AsyncIterable<Buffer>, sink: (out: Buffer) => void): Promise<number> {
+  const inflate = createInflate({ chunkSize: OBSERVE_INFLATE_WINDOW });
+  let failure: unknown;
+  const failed = new Promise<never>((_, reject) => inflate.once("error", reject));
+  failed.catch(() => {});
+  inflate.on("data", (out: Buffer) => {
+    if (failure !== undefined) return;
+    try { sink(out); } catch (error) { failure = error; inflate.destroy(); }
+  });
+  inflate.on("error", error => { failure ??= error; });
+  try {
+    for await (const piece of pieces) {
+      await Promise.race([new Promise<void>((resolve, reject) =>
+        inflate.write(piece, error => error ? reject(error) : resolve())), failed]);
+      if (failure !== undefined) break;
+    }
+    if (failure === undefined) { inflate.end(); await Promise.race([finished(inflate), failed]); }
+  } catch (error) { failure ??= error; }
+  finally { inflate.destroy(); }
+  if (failure !== undefined) throw failure;
+  return inflate.bytesWritten;
+}
+
+/** A sliding window over one open file: sequential positions, one positioned read per window refill. */
+class ObservedWindow {
+  private readonly buf: Buffer;
+  private from = 0;
+  private to = 0;
+  constructor(private readonly size: number,
+    private readonly pull: (into: Buffer, intoOffset: number, position: number, length: number) => Promise<number>) {
+    this.buf = Buffer.allocUnsafe(Math.max(1, Math.min(OBSERVE_READ_WINDOW, size)));
+  }
+  /** Make `[position, position + need)` (clamped to the end of the file) readable through {@link view}. */
+  async ensure(position: number, need: number): Promise<void> {
+    const wanted = Math.min(need, this.size - position);
+    if (wanted > this.buf.length) throw new AutomaticCompletenessUnknown("object window request");
+    if (position >= this.from && position + wanted <= this.to) return;
+    const keep = position >= this.from && position < this.to ? this.to - position : 0;
+    if (keep) this.buf.copyWithin(0, position - this.from, this.to - this.from);
+    this.from = position; this.to = position + keep;
+    while (this.to - this.from < wanted) {
+      const length = Math.min(this.buf.length - (this.to - this.from), this.size - this.to);
+      const got = await this.pull(this.buf, this.to - this.from, this.to, length);
+      if (!got) throw new AutomaticCompletenessUnknown("short object metadata");
+      this.to += got;
+    }
+  }
+  /** Bytes already ensured at `position`, at most `length` of them. */
+  view(position: number, length: number): Buffer {
+    return this.buf.subarray(position - this.from, position - this.from + Math.min(length, this.to - position));
+  }
+  /** The compressed input `[position, position + length)` in pieces; each stays valid until the next is requested. */
+  async *pieces(position: number, length: number): AsyncGenerator<Buffer> {
+    for (let at = position; at < position + length;) {
+      await this.ensure(at, 1);
+      const piece = this.view(at, Math.min(OBSERVE_INPUT_PIECE, position + length - at));
+      yield piece; at += piece.length;
+    }
+  }
+}
+
+/**
+ * Resumable parser of a pack delta program, fed the inflated bytes piece by piece (an instruction may straddle
+ * pieces). It charges the content each instruction generates AS it executes, and checks every copy against the
+ * delta's declared base length, which the caller verifies against the actual base (see `onHeader`).
+ */
+class PackDeltaParser {
+  baseLength = 0;
+  logical = 0;
+  generated = 0;
+  private programBytes = 0;
+  private state: "base" | "logical" | "opcode" | "args" | "insert" = "base";
+  private value = 0;
+  private factor = 1;
+  private opcode = 0;
+  private argBit = 0;
+  private offset = 0;
+  private length = 0;
+  private insertLeft = 0;
+  constructor(private readonly hooks: { unknown: (message: string) => never; charge: (n: number) => void;
+    onHeader: () => void }) {}
+  feed(buf: Buffer): void {
+    this.programBytes += buf.length;
+    for (let i = 0; i < buf.length; i++) {
+      if (this.state === "insert") {
+        const take = Math.min(this.insertLeft, buf.length - i);
+        this.hooks.charge(take); this.generated += take; this.insertLeft -= take; i += take - 1;
+        if (!this.insertLeft) this.state = "opcode";
+        continue;
+      }
+      const byte = buf[i]!;
+      switch (this.state) {
+        case "base": case "logical": {
+          this.value += (byte & 127) * this.factor;
+          if (!Number.isSafeInteger(this.value) || !Number.isSafeInteger(this.factor)) this.hooks.unknown("delta integer overflow");
+          this.factor *= 128;
+          if (byte & 128) break;
+          if (this.state === "base") { this.baseLength = this.value; this.state = "logical"; }
+          else { this.logical = this.value; this.state = "opcode"; this.hooks.onHeader(); }
+          this.value = 0; this.factor = 1;
+          break;
+        }
+        case "opcode": {
+          this.opcode = byte;
+          if (byte & 128) { this.argBit = 0; this.offset = 0; this.length = 0; this.nextArg(); break; }
+          // Git's patch_delta: a zero opcode is reserved; an insert of n bytes follows the opcode.
+          if (!byte) this.hooks.unknown("invalid delta insert");
+          if (byte > this.logical - this.generated) this.hooks.unknown("delta generated size mismatch");
+          this.insertLeft = byte; this.state = "insert";
+          break;
+        }
+        case "args": {
+          if (this.argBit < 4) this.offset += byte * 2 ** (8 * this.argBit);
+          else this.length += byte * 2 ** (8 * (this.argBit - 4));
+          this.argBit++; this.nextArg();
+          break;
+        }
+      }
+    }
+  }
+  private nextArg(): void {
+    while (this.argBit < 7 && !(this.opcode & (1 << this.argBit))) this.argBit++;
+    if (this.argBit < 7) { this.state = "args"; return; }
+    if (!this.length) this.length = 65536;
+    if (this.offset > this.baseLength || this.length > this.baseLength - this.offset) this.hooks.unknown("delta copy outside base");
+    if (this.length > this.logical - this.generated) this.hooks.unknown("delta generated size mismatch");
+    this.hooks.charge(this.length); this.generated += this.length;
+    this.state = "opcode";
+  }
+  /** The program ended: it must end between instructions and have generated exactly the declared result. */
+  finish(): void {
+    if (this.programBytes < 4) this.hooks.unknown("short delta program");
+    if (this.state === "base" || this.state === "logical" || this.state === "args") this.hooks.unknown("truncated delta instruction");
+    if (this.state === "insert") this.hooks.unknown("invalid delta insert");
+    if (this.generated !== this.logical) this.hooks.unknown("delta generated size mismatch");
+  }
+}
 
 interface AutomaticPreservation {
   checkLive: () => void;
@@ -11123,13 +11293,31 @@ export class GitCache {
     const same = (a: Set<string>, b: Set<string>) => a.size === b.size && [...a].every(id => b.has(id));
     const signature = (st: import("node:fs").BigIntStats) =>
       [st.dev, st.ino, st.mode, st.nlink, st.uid, st.gid, st.size, st.mtimeNs, st.ctimeNs].join(":");
-    const snapshot = async () => {
+    // One observation of every store. The TOPOLOGY comes first and overflows are deferred while it runs: every
+    // store's config, object root, `info` and `pack` names, and the whole alternate graph are read and classified
+    // before any object content is charged, so an UNKNOWN-class indirection or an illegal name can never be hidden
+    // behind a content overflow (and a name is classified as it is read, before it is counted). A deferred overflow is
+    // raised only after the topology (and `afterTopology`) found nothing UNKNOWN. Residual: corrupt bytes lying beyond
+    // a budget that the observation had to stop at cannot be observed, so they never turn an overflow into UNKNOWN.
+    const snapshot = async (afterTopology?: (overflowKnown: boolean) => Promise<void>) => {
       let entries = 0, bytes = 0, occurrences = 0, edges = 0;
+      let deferring = false;
+      let pending: AutomaticBoundExceeded | undefined;
       const rows = new Map<string, string>();
-      const stores = new Map<string, { ids: Set<string>; alternates: string[] }>();
+      type Store = { ids: Set<string>; alternates: string[]; names: string[]; pack?: string[] };
+      const stores = new Map<string, Store>();
       const pairs = new Set<string>();
-      // `bytes` is local to one snapshot: the budget resets for each of the proof's snapshots.
-      const charge = (n: number) => { if ((bytes += n) > limits.maxObjectStoreBytes) exceeded("object metadata byte limit"); };
+      const over = (message: string): void => {
+        if (!deferring) exceeded(message);
+        pending ??= new AutomaticBoundExceeded(message);
+      };
+      // `bytes` is local to one snapshot: the budget resets for each of the proof's snapshots. It counts bytes
+      // actually read from disk or produced by inflation or by a delta instruction, never a size a file declares.
+      const charge = (n: number) => { if ((bytes += n) > limits.maxObjectStoreBytes) over("object metadata byte limit"); };
+      const contentCharge = (n: number) => {
+        charge(n); MaintenanceResources.consumeIfActive("metadataBytes", n);
+      };
+      const tick = () => { automatic.checkLive(); this.checkRecoveryInterruption(); };
       const stat = async (p: string, optional = false) => {
         try {
           const st = await read(() => fs.lstat(p, { bigint: true }));
@@ -11143,59 +11331,154 @@ export class GitCache {
           throw error;
         }
       };
-      const directory = async (p: string) => {
+      // Each name is classified (`classify` throws UNKNOWN for an illegal one) as it is read, before it is counted.
+      // `fixedSet` marks a directory whose legal names are few (`objects/`: 258, `objects/info`: 4): a deferred entry
+      // overflow keeps reading it, which is bounded because an illegal name ends the read. Other directories stop at
+      // the overflow (names past it are the unobservable residual).
+      const directory = async (p: string, classify?: (name: string) => void, fixedSet = false) => {
         const st = await stat(p);
         if (!st?.isDirectory()) unknown("object directory type");
         let handle: import("node:fs").Dir | undefined;
         const names: string[] = [];
+        let cut = false;
         try {
           await read(async () => { handle = await fs.opendir(p, { bufferSize: 1 }); });
           for (;;) {
             const entry = await read(() => handle!.read());
             if (!entry) break;
-            if (++entries > limits.maxDirectoryEntries) exceeded("object directory entry limit");
+            classify?.(entry.name);
+            if (++entries > limits.maxDirectoryEntries) {
+              over("object directory entry limit");
+              if (!fixedSet) { cut = true; break; }
+            }
             MaintenanceResources.consumeIfActive("adminEntries", 1);
             charge(Buffer.byteLength(entry.name)); names.push(entry.name);
           }
         } finally { if (handle) await this.automaticPreservationClose(automatic, () => handle!.close()); }
         rows.set(p + "/", JSON.stringify(names.sort()));
-        return names;
+        return { names, cut };
       };
-      const file = async (p: string, length?: number) => {
+      type Opened = {
+        size: number;
+        /** One positioned read of at most `length` bytes; returns the bytes read and charges them as consumed. */
+        fill(into: Buffer, intoOffset: number, position: number, length: number): Promise<number>;
+        readInto(into: Buffer, intoOffset: number, position: number, length: number): Promise<void>;
+      };
+      // Observation does not mutate the inode. Participating writers are excluded through aliases by the epoch
+      // contract; fingerprints never replace that exclusion. Mutation-specific hardlink guards elsewhere remain
+      // unchanged. The file is never read whole unless the caller bounded it: it is read through `fill`.
+      const withFile = async <T>(p: string, use: (f: Opened) => Promise<T>): Promise<T> => {
         const st = await stat(p);
-        // Observation does not mutate the inode. Participating writers are excluded
-        // through aliases by the epoch contract; fingerprints never replace that exclusion.
-        // Mutation-specific hardlink guards elsewhere remain unchanged.
         if (!st?.isFile()) unknown("object file type");
-        const n = length ?? Number(st!.size);
-        if (!Number.isSafeInteger(n) || n < 0 || st!.size < BigInt(n)) unknown("object file size");
-        charge(n);
+        const size = Number(st!.size);
+        if (!Number.isSafeInteger(size)) unknown("object file size");
         let handle: import("node:fs/promises").FileHandle | undefined;
         try {
           await read(async () => { handle = await fs.open(p, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK); });
           if (signature(await read(() => handle!.stat({ bigint: true }))) !== signature(st!)) unknown("object file replaced");
-          const buf = Buffer.alloc(n);
-          let offset = 0;
-          // At most n nonempty reads; EOF before n is incomplete.
-          while (offset < n) {
-            const result = await read(() => handle!.read(buf, offset, n - offset, offset));
-            if (!result.bytesRead) unknown("short object metadata");
+          const fill: Opened["fill"] = async (into, intoOffset, position, length) => {
+            const result = await read(() => handle!.read(into, intoOffset, length, position));
             MaintenanceResources.consumeIfActive("metadataBytes", result.bytesRead);
-            offset += result.bytesRead;
-          }
+            charge(result.bytesRead);
+            return result.bytesRead;
+          };
+          // At most `length` nonempty reads; EOF before `length` is incomplete.
+          const readInto: Opened["readInto"] = async (into, intoOffset, position, length) => {
+            for (let done = 0; done < length;) {
+              const got = await fill(into, intoOffset + done, position + done, length - done);
+              if (!got) unknown("short object metadata");
+              done += got;
+            }
+          };
+          const result = await use({ size, fill, readInto });
           if (signature(await read(() => handle!.stat({ bigint: true }))) !== signature(st!)) unknown("object file changed");
-          return buf;
+          return result;
         } finally { if (handle) await this.automaticPreservationClose(automatic, () => handle!.close()); }
       };
+      // Config and alternates are read whole, bounded by the existing metadata byte limit.
+      const small = (p: string): Promise<Buffer> => withFile(p, async f => {
+        if (f.size > limits.maxMetadataBytes) { over("object metadata read byte limit"); return Buffer.alloc(0); }
+        const out = Buffer.alloc(f.size);
+        await f.readInto(out, 0, 0, f.size);
+        return out;
+      });
       const add = (ids: Set<string>, id: string) => {
-        if (++occurrences > Math.min(EPOCH_MAX_OBJECT_OCCURRENCES, limits.maxMetadataRecords)) exceeded("physical object occurrence limit");
+        if (++occurrences > Math.min(EPOCH_MAX_OBJECT_OCCURRENCES, limits.maxMetadataRecords)) over("physical object occurrence limit");
         ids.add(id);
       };
-      const visit = async (root: string): Promise<void> => {
+      const managed = (root: string) => path.dirname(path.dirname(root)) === path.resolve(this.reposRoot) && path.basename(root) === "objects";
+
+      // ---- Stage one: topology. Nothing here charges object content. ----
+      const topologyInfo = async (root: string, store: Store) => {
+        const p = path.join(root, "info");
+        const { names: members } = await directory(p, member => {
+          if (!["commit-graphs", "commit-graph", "packs", "alternates"].includes(member)) unknown("unsupported object info entry");
+        }, true);
+        for (const member of members) {
+          const full = path.join(p, member);
+          if (member === "commit-graphs") {
+            const children = await directory(full, child => {
+              if (child !== "commit-graph-chain" && !/^graph-[0-9a-f]{40}\.graph$/.test(child)) unknown("unsupported commit graph entry");
+            });
+            for (const child of children.names)
+              if (!(await stat(path.join(full, child)))?.isFile()) unknown("commit graph type");
+          } else if (["commit-graph", "packs"].includes(member)) {
+            if (!(await stat(full))?.isFile()) unknown("object info type");
+          } else {
+            const data = await small(full);
+            if (!isUtf8(data)) unknown("alternate encoding");
+            rows.set(full + ":bytes", data.toString("hex"));
+            const text = data.toString("utf8");
+            if (text && !text.endsWith("\n")) unknown("unterminated alternates");
+            for (const line of text ? text.slice(0, -1).split("\n") : []) {
+              // Syntax and the managed-path rule come first: a line past the edge limit is still checked.
+              if (!/^[!-~]+$/.test(line) || /["\\]/.test(line)) unknown("unsupported alternate syntax");
+              const target = path.resolve(root, line);
+              // EX covers managed stores only. Fingerprints alone do not exclude outside writers.
+              if (target !== source && target !== bare && !managed(target)) unknown("alternate writer exclusion unavailable");
+              if (++edges > limits.maxMetadataRecords) { over("alternate edge limit"); continue; }
+              store.alternates.push(target);
+            }
+          }
+        }
+        for (const absent of ["alternates", "http-alternates", "commit-graph", "commit-graphs"])
+          if (!members.includes(absent)) await stat(path.join(p, absent), true);
+      };
+      const topologyPack = async (root: string, store: Store) => {
+        const p = path.join(root, "pack");
+        const listing = await directory(p, member => {
+          if (member !== "multi-pack-index.d" && member !== "multi-pack-index" &&
+              !/^multi-pack-index-[0-9a-f]{40}\.(rev|bitmap)$/.test(member) &&
+              !/^pack-[0-9a-f]{40}\.(pack|idx|keep|promisor|rev|bitmap|mtimes)$/.test(member)) unknown("unsupported pack entry");
+        });
+        store.pack = listing.names;
+        if (listing.cut) return;
+        const present = new Set(listing.names);
+        for (const member of listing.names) {
+          const full = path.join(p, member);
+          if (member === "multi-pack-index.d") {
+            const children = await directory(full, child => {
+              if (child !== "multi-pack-index-chain" && !/^multi-pack-index-[0-9a-f]{40}\.(midx|rev|bitmap)$/.test(child))
+                unknown("unsupported incremental MIDX");
+            });
+            for (const child of children.names)
+              if (!(await stat(path.join(full, child)))?.isFile()) unknown("MIDX type");
+            continue;
+          }
+          if (member === "multi-pack-index" || /^multi-pack-index-[0-9a-f]{40}\.(rev|bitmap)$/.test(member)) {
+            if (!(await stat(full))?.isFile()) unknown("MIDX type");
+            continue;
+          }
+          const match = /^(pack-[0-9a-f]{40})\.(?:pack|idx|keep|promisor|rev|bitmap|mtimes)$/.exec(member);
+          if (!match || !(await stat(full))?.isFile()) unknown("unsupported pack entry");
+          if (!present.has(match![1] + ".pack") || !present.has(match![1] + ".idx")) unknown("incomplete pack pair");
+        }
+      };
+      const topology = async (root: string): Promise<void> => {
         if (stores.has(root)) return;
-        if (stores.size >= limits.maxMetadataRecords) exceeded("object store limit");
+        if (stores.size >= limits.maxMetadataRecords) { over("object store limit"); return; }
         // EX covers managed stores only. Fingerprints alone do not exclude outside writers.
-        const managedBare = path.dirname(path.dirname(root)) === path.resolve(this.reposRoot) && path.basename(root) === "objects";
+        const managedBare = managed(root);
         if (root !== source && root !== bare && !managedBare) unknown("alternate writer exclusion unavailable");
         for (const parent of [path.dirname(path.dirname(root)), path.dirname(root)]) {
           if (!(await stat(parent))?.isDirectory()) unknown("object ancestor type");
@@ -11205,13 +11488,21 @@ export class GitCache {
           if (owner!.uid !== BigInt(process.getuid!()) || (owner!.mode & 0o022n) !== 0n) unknown("unowned alternate store");
         }
         const config = path.join(path.dirname(root), "config");
-        const configBytes = await file(config);
+        const configBytes = await small(config);
         rows.set(config + ":bytes", configBytes.toString("hex"));
-        const parsed = await read(() => this.execScoped("git",
-          ["config", "--file", "-", "--no-includes", "--null", "--list"],
-          { env: gitEnv(), input: configBytes, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER }));
-        this.automaticCollection(parsed.stdout, "\0");
-        for (const row of parsed.stdout.split("\0")) {
+        let listing: string | undefined;
+        try {
+          const parsed = await read(() => this.execScoped("git",
+            ["config", "--file", "-", "--no-includes", "--null", "--list"],
+            { env: gitEnv(), input: configBytes, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER }));
+          this.automaticCollection(parsed.stdout, "\0");
+          listing = parsed.stdout;
+        } catch (error) {
+          // A joined stdout overrun is a limit; the rest of the topology is still read.
+          if (!isBoundOverflow(error)) throw error;
+          over("object completeness output limit");
+        }
+        for (const row of listing === undefined ? [] : listing.split("\0")) {
           const [key, value] = row.split("\n");
           if (root === source && (key?.startsWith("include.") || key?.startsWith("includeif.")))
             throw new AutomaticContentRefusal("source config indirection is not eligible");
@@ -11223,255 +11514,259 @@ export class GitCache {
         for (const name of ["commondir", "shallow", "info/grafts", "refs/replace"]) {
           if (await stat(path.join(path.dirname(root), name), true)) unknown("unsupported object topology");
         }
-        const store = { ids: new Set<string>(), alternates: [] as string[] };
+        const store: Store = { ids: new Set<string>(), alternates: [], names: [] };
         stores.set(root, store);
-        const names = await directory(root);
-        for (const name of names) {
+        store.names = (await directory(root, name => {
+          if (!/^[0-9a-f]{2}$/.test(name) && name !== "pack" && name !== "info") unknown("unsupported object root entry");
+        }, true)).names;
+        if (store.names.includes("info")) await topologyInfo(root, store);
+        if (store.names.includes("pack")) await topologyPack(root, store);
+        for (const absent of ["pack", "info"]) if (!store.names.includes(absent)) await stat(path.join(root, absent), true);
+        for (const alternate of store.alternates) await topology(alternate);
+      };
+
+      // ---- Stage two: content, streamed through bounded windows. ----
+      /** Inflates `length` compressed bytes at `position` of `win` into `sink`; returns the bytes consumed. */
+      const inflateSpan = async (win: ObservedWindow, position: number, length: number,
+        sink: (out: Buffer) => void): Promise<number> => {
+        if (length <= OBSERVE_SYNC_SPAN) {
+          await win.ensure(position, length);
+          tick();
+          const small = inflateSmall(win.view(position, length),
+            Math.max(1, Math.min(OBSERVE_SYNC_OUTPUT, limits.maxObjectStoreBytes - bytes)));
+          if (small) { sink(small.buffer); return small.consumed; }
+        }
+        return inflateStream(win.pieces(position, length), sink);
+      };
+      // Overflow rule for a loose object: the output is charged as it is produced, and it is an overflow only when
+      // the object's own header declares at least what was produced (a stream that outgrows its declared size, or
+      // whose header cannot be read, is corrupt: UNKNOWN).
+      const looseObject = (file: string, id: string, store: Store) => withFile(file, async f => {
+        const win = new ObservedWindow(f.size, f.fill);
+        const hash = createHash("sha1");
+        let produced = 0, uncharged = 0, head = Buffer.alloc(0);
+        const header: { declared?: number } = {};
+        const sink = (out: Buffer) => {
+          tick();
+          produced += out.length;
+          hash.update(out);
+          if (header.declared === undefined) {
+            head = Buffer.concat([head, out.subarray(0, 48 - head.length)]);
+            const nul = head.indexOf(0);
+            if (nul >= 0) {
+              const match = /^(?:blob|tree|commit|tag) (0|[1-9][0-9]*)$/.exec(head.toString("latin1", 0, nul));
+              if (!match || !Number.isSafeInteger(Number(match[1]))) unknown("invalid loose object");
+              header.declared = Number(match![1]) + nul + 1;
+            } else if (head.length >= 48) unknown("invalid loose object");
+          }
+          // Nothing is charged before the header is read: an overrun is only ever counted against a declaration.
+          if (header.declared === undefined) { uncharged += out.length; return; }
+          // Produced bytes that pass the declared size contradict the header: corrupt, not over budget.
+          if (produced > header.declared) unknown("invalid loose object");
+          const n = uncharged + out.length;
+          uncharged = 0;
+          if (bytes + n > limits.maxObjectStoreBytes) exceeded("loose output byte limit");
+          contentCharge(n);
+        };
+        if (await inflateSpan(win, 0, f.size, sink) !== f.size) unknown("trailing loose input");
+        if (header.declared === undefined || produced !== header.declared || hash.digest("hex") !== id) unknown("invalid loose object");
+        tick();
+        add(store.ids, id);
+      });
+      type PackRecord = { logical: number; baseLength?: number; base?: number; state: number };
+      const packIndex = (idxPath: string, store: Store) => withFile(idxPath, async f => {
+        const size = f.size;
+        const headLength = Math.min(size, 8 + 1024);
+        const head = Buffer.alloc(headLength);
+        await f.readInto(head, 0, 0, headLength);
+        const v2 = size >= 8 && head.readUInt32BE(0) === 0xff744f63;
+        if (v2 && head.readUInt32BE(4) !== 2) unknown("unsupported pack index version");
+        const base = v2 ? 8 : 0;
+        if (size < base + 1024 + 40) unknown("short pack index");
+        let previous = 0;
+        for (let i = 0; i < 256; i++) {
+          const count = head.readUInt32BE(base + 4 * i);
+          if (count < previous) unknown("pack fanout limit or order");
+          previous = count;
+        }
+        const count = previous, table = base + 1024;
+        // The declared count is compared with the limit only once the file size accounts for it exactly.
+        const floor = table + (v2 ? 28 : 24) * count + 40;
+        if (size < floor) unknown(v2 ? "short v2 index tables" : "pack index size");
+        if (v2 ? size > floor + 8 * count : size !== floor) unknown("pack index size");
+        if (count > limits.maxMetadataRecords) {
+          if (v2) {
+            let large = 0;
+            const piece = Buffer.alloc(Math.min(OBSERVE_INPUT_PIECE, 4 * count));
+            for (let at = 0; at < 4 * count; at += piece.length) {
+              const n = Math.min(piece.length, 4 * count - at);
+              await f.readInto(piece, 0, table + 24 * count + at, n);
+              for (let k = 0; k < n; k += 4) if (piece.readUInt32BE(k) >= 0x80000000) large++;
+            }
+            if (size !== floor + 8 * large) unknown("pack index size");
+          }
+          exceeded("pack index object count limit");
+        }
+        // Here the idx is at most about 36 bytes per object of a count within the limit: read it whole.
+        const idx = Buffer.alloc(size);
+        head.copy(idx);
+        await f.readInto(idx, headLength, headLength, size - headLength);
+        let large = 0;
+        if (v2) {
+          const slots = new Set<number>();
+          for (let i = 0; i < count; i++) {
+            const off = idx.readUInt32BE(table + 24 * count + 4 * i);
+            if (off >= 0x80000000) { large++; slots.add(off - 0x80000000); }
+          }
+          if (slots.size !== large || [...slots].some(slot => slot >= large)) unknown("invalid large offset table");
+        }
+        if (idx.length !== table + (v2 ? 28 : 24) * count + 8 * large + 40) unknown("pack index size");
+        let last = "";
+        const fanout = Array<number>(256).fill(0);
+        const offsets = new Map<string, number>();
+        for (let i = 0; i < count; i++) {
+          const offset = table + (v2 ? 20 * i : 24 * i + 4);
+          const oid = idx.subarray(offset, offset + 20).toString("hex");
+          if (oid <= last) unknown("pack OID table order");
+          last = oid; fanout[idx[offset]!]!++; add(store.ids, oid);
+          const rawOffset = idx.readUInt32BE(v2 ? table + 24 * count + 4 * i : table + 24 * i);
+          const physical = v2 && rawOffset >= 0x80000000
+            ? idx.readBigUInt64BE(table + 28 * count + 8 * (rawOffset - 0x80000000))
+            : BigInt(rawOffset);
+          if (physical > BigInt(Number.MAX_SAFE_INTEGER)) unknown("pack offset overflow");
+          offsets.set(oid, Number(physical));
+        }
+        let total = 0;
+        for (let i = 0; i < 256; i++) if ((total += fanout[i]!) !== idx.readUInt32BE(base + 4 * i)) unknown("pack fanout mismatch");
+        return { count, offsets };
+      });
+      // Each span and instruction is bounded by the shared observation budget, charged as it is produced. A failure
+      // aborts before any pair verifier. That before-verifier guarantee relies on the epoch writer-exclusion
+      // contract: the pack and idx are not re-checked between this snapshot and each verify-pack launch, and
+      // finalStoreCheck refuses a change afterwards.
+      const packRecords = (packPath: string, count: number, offsets: Map<string, number>) => withFile(packPath, async f => {
+        const size = f.size;
+        if (size < 32) unknown("pack header mismatch");
+        const win = new ObservedWindow(size, f.fill);
+        await win.ensure(0, 12);
+        const header = win.view(0, 12);
+        if (header.toString("ascii", 0, 4) !== "PACK" || ![2, 3].includes(header.readUInt32BE(4)) ||
+            header.readUInt32BE(8) !== count) unknown("pack header mismatch");
+        const starts = [...offsets.values()].sort((a, b) => a - b);
+        if (new Set(starts).size !== count || (count ? starts[0] !== 12 : size !== 32) ||
+            starts.some(start => start < 12 || start >= size - 20)) unknown("invalid pack offsets");
+        const records = new Map<number, PackRecord>();
+        for (let i = 0; i < starts.length; i++) {
+          tick();
+          const start = starts[i]!, end = starts[i + 1] ?? size - 20;
+          const avail = Math.min(64, end - start);
+          await win.ensure(start, avail);
+          const bytesOfHeader = win.view(start, avail);
+          let pos = start;
+          const byte = () => { if (pos >= start + avail) unknown("truncated pack record"); return bytesOfHeader[pos++ - start]!; };
+          let b = byte(), declared = b & 15, scale = 16;
+          const type = (b >> 4) & 7;
+          while (b & 128) {
+            if (!Number.isSafeInteger(scale)) unknown("pack entry size integer overflow");
+            b = byte(); declared += (b & 127) * scale;
+            if (!Number.isSafeInteger(declared)) unknown("pack entry size integer overflow");
+            scale *= 128;
+          }
+          if (![1, 2, 3, 4, 6, 7].includes(type)) unknown("unsupported pack record type");
+          let baseOffset: number | undefined;
+          if (type === 6) {
+            b = byte(); let distance = b & 127;
+            while (b & 128) {
+              b = byte(); distance = (distance + 1) * 128 + (b & 127);
+              if (!Number.isSafeInteger(distance) || distance > start) unknown("OFS offset overflow");
+            }
+            baseOffset = start - distance;
+            if (!distance || !records.has(baseOffset)) unknown("OFS base is not an earlier record");
+          } else if (type === 7) {
+            if (end - pos < 20 || pos + 20 > start + avail) unknown("truncated REF base");
+            baseOffset = offsets.get(bytesOfHeader.subarray(pos - start, pos - start + 20).toString("hex")); pos += 20;
+            if (baseOffset === undefined) unknown("missing same-pack REF base");
+          }
+          // The declared size is never compared with the budget: only the bytes actually produced are, and a
+          // stream that disagrees with its declared size is corrupt (UNKNOWN), however large either is.
+          const record: PackRecord = { logical: declared, base: baseOffset, state: 0 };
+          let produced = 0, unverifiedBase = false;
+          const parser: PackDeltaParser | undefined = type === 6 || type === 7 ? new PackDeltaParser({
+            unknown,
+            // Generated content is checked against the declared base length. For a base that is not yet verified (a
+            // REF base later in the pack), an overflow cannot be told from the effect of a lying base length: UNKNOWN.
+            charge: n => {
+              if (bytes + n > limits.maxObjectStoreBytes) {
+                if (unverifiedBase) unknown("delta base length not yet verified");
+                exceeded("delta generated byte limit");
+              }
+              contentCharge(n);
+            },
+            onHeader: () => {
+              record.baseLength = parser!.baseLength; record.logical = parser!.logical;
+              const baseRecord = baseOffset === undefined ? undefined : records.get(baseOffset);
+              if (baseRecord) { if (record.baseLength !== baseRecord.logical) unknown("delta base length mismatch"); }
+              else unverifiedBase = true;
+            },
+          }) : undefined;
+          const sink = (out: Buffer) => {
+            tick();
+            produced += out.length;
+            if (produced > declared) unknown("pack compressed span or size");
+            if (bytes + out.length > limits.maxObjectStoreBytes) exceeded("pack inflated byte limit");
+            contentCharge(out.length);
+            parser?.feed(out);
+          };
+          const consumed = await inflateSpan(win, pos, end - pos, sink);
+          if (consumed !== end - pos || produced !== declared) unknown("pack compressed span or size");
+          parser?.finish();
+          records.set(start, record);
+        }
+        // The functional graph visits each record at most twice. IDX lookup
+        // is unverified here, so reject cycles before Git collision reads.
+        for (const start of starts) {
+          const stack: PackRecord[] = [];
+          let current = records.get(start);
+          while (current && current.state !== 2) {
+            tick();
+            if (current.state === 1) unknown("cyclic pack delta graph");
+            current.state = 1; stack.push(current);
+            if (current.base === undefined) break;
+            const target = records.get(current.base);
+            if (!target || current.baseLength !== target.logical) unknown("delta base length mismatch");
+            current = target;
+          }
+          for (const record of stack) record.state = 2;
+        }
+      });
+      const content = async (root: string) => {
+        const store = stores.get(root)!;
+        for (const name of store.names) {
           const p = path.join(root, name);
           if (/^[0-9a-f]{2}$/.test(name)) {
-            for (const leaf of await directory(p)) {
-              if (!/^[0-9a-f]{38}$/.test(leaf) || !(await stat(path.join(p, leaf)))?.isFile()) unknown("unsupported loose object");
-              const compressed = await file(path.join(p, leaf));
-              const remaining = limits.maxObjectStoreBytes - bytes;
-              if (remaining <= 0) exceeded("loose output byte limit");
-              automatic.checkLive(); this.checkRecoveryInterruption();
-              // Node returns the zlib result envelope for info:true; its declarations expose only Buffer.
-              // A loose object declares its size only inside the stream, so inflating past the remaining
-              // budget is the overflow itself; any other inflate failure is a corrupt store (UNKNOWN).
-              let inflated: { buffer: Buffer; engine: { bytesWritten: number } };
-              try {
-                inflated = inflateSync(compressed, { maxOutputLength: remaining, info: true }) as unknown as
-                  { buffer: Buffer; engine: { bytesWritten: number } };
-              } catch (error) {
-                if ((error as NodeJS.ErrnoException).code === "ERR_BUFFER_TOO_LARGE") {
-                  // Positive identification: the stream's own header declares a size past the remaining budget.
-                  // A header that is unreadable, or declares a size that fits, contradicts the overrun: corrupt.
-                  let declared: RegExpExecArray | null = null;
-                  try {
-                    const head = inflateSync(compressed.subarray(0, 64),
-                      { finishFlush: zlibConstants.Z_SYNC_FLUSH, maxOutputLength: 1 << 20 });
-                    declared = /^(?:blob|tree|commit|tag) (0|[1-9][0-9]{0,15})\0/.exec(head.toString("latin1", 0, 40));
-                  } catch { /* an unreadable header is not a declaration */ }
-                  if (declared && Number(declared[1]) + declared[0].length > remaining) exceeded("loose output byte limit");
-                }
-                throw error;
-              }
-              automatic.checkLive(); this.checkRecoveryInterruption();
-              MaintenanceResources.consumeIfActive("metadataBytes", inflated.buffer.length);
-              charge(inflated.buffer.length);
-              if (inflated.engine.bytesWritten !== compressed.length) unknown("trailing loose input");
-              const nul = inflated.buffer.indexOf(0);
-              const header = inflated.buffer.subarray(0, nul).toString("latin1");
-              if (nul < 0 || !/^(blob|tree|commit|tag) (0|[1-9][0-9]*)$/.test(header) ||
-                  !Number.isSafeInteger(Number(header.slice(header.indexOf(" ") + 1))) ||
-                  Number(header.slice(header.indexOf(" ") + 1)) !== inflated.buffer.length - nul - 1 ||
-                  createHash("sha1").update(inflated.buffer).digest("hex") !== name + leaf)
-                unknown("invalid loose object");
-              automatic.checkLive(); this.checkRecoveryInterruption();
-              add(store.ids, name + leaf);
+            const leaves = await directory(p, leaf => { if (!/^[0-9a-f]{38}$/.test(leaf)) unknown("unsupported loose object"); });
+            for (const leaf of leaves.names) {
+              if (!(await stat(path.join(p, leaf)))?.isFile()) unknown("unsupported loose object");
+              await looseObject(path.join(p, leaf), name + leaf, store);
             }
           } else if (name === "pack") {
-            const members = await directory(p);
-            for (const member of members) {
+            for (const member of store.pack ?? []) {
+              const match = /^(pack-[0-9a-f]{40})\.idx$/.exec(member);
+              if (!match) continue;
               const full = path.join(p, member);
-              if (member === "multi-pack-index.d") {
-                for (const child of await directory(full)) {
-                  if (child !== "multi-pack-index-chain" && !/^multi-pack-index-[0-9a-f]{40}\.(midx|rev|bitmap)$/.test(child)) unknown("unsupported incremental MIDX");
-                  if (!(await stat(path.join(full, child)))?.isFile()) unknown("MIDX type");
-                }
-                continue;
-              }
-              if (member === "multi-pack-index" || /^multi-pack-index-[0-9a-f]{40}\.(rev|bitmap)$/.test(member)) {
-                if (!(await stat(full))?.isFile()) unknown("MIDX type"); continue;
-              }
-              const match = /^(pack-[0-9a-f]{40})\.(pack|idx|keep|promisor|rev|bitmap|mtimes)$/.exec(member);
-              if (!match || !(await stat(full))?.isFile()) unknown("unsupported pack entry");
-              if (!members.includes(match![1] + ".pack") || !members.includes(match![1] + ".idx")) unknown("incomplete pack pair");
-              if (match![2] !== "idx") continue;
-              const idx = await file(full);
-              const v2 = idx.length >= 8 && idx.readUInt32BE(0) === 0xff744f63;
-              if (v2 && idx.readUInt32BE(4) !== 2) unknown("unsupported pack index version");
-              const base = v2 ? 8 : 0;
-              if (idx.length < base + 1024 + 40) unknown("short pack index");
-              let previous = 0;
-              for (let i = 0; i < 256; i++) {
-                const count = idx.readUInt32BE(base + 4 * i);
-                if (count < previous) unknown("pack fanout limit or order");
-                if (count > limits.maxMetadataRecords) exceeded("pack fanout limit or order");
-                previous = count;
-              }
-              const count = previous, table = base + 1024;
-              let large = 0;
-              if (v2) {
-                if (idx.length < table + 28 * count + 40) unknown("short v2 index tables");
-                const slots = new Set<number>();
-                for (let i = 0; i < count; i++) {
-                  const off = idx.readUInt32BE(table + 24 * count + 4 * i);
-                  if (off >= 0x80000000) { large++; slots.add(off - 0x80000000); }
-                }
-                if (slots.size !== large || [...slots].some(slot => slot >= large)) unknown("invalid large offset table");
-              }
-              if (idx.length !== table + (v2 ? 28 : 24) * count + 8 * large + 40) unknown("pack index size");
-              let last = "";
-              const fanout = Array<number>(256).fill(0);
-              const offsets = new Map<string, number>();
-              for (let i = 0; i < count; i++) {
-                const offset = table + (v2 ? 20 * i : 24 * i + 4);
-                const id = idx.subarray(offset, offset + 20).toString("hex");
-                if (id <= last) unknown("pack OID table order");
-                last = id; fanout[idx[offset]!]!++; add(store.ids, id);
-                const rawOffset = idx.readUInt32BE(v2 ? table + 24 * count + 4 * i : table + 24 * i);
-                const physical = v2 && rawOffset >= 0x80000000
-                  ? idx.readBigUInt64BE(table + 28 * count + 8 * (rawOffset - 0x80000000))
-                  : BigInt(rawOffset);
-                if (physical > BigInt(Number.MAX_SAFE_INTEGER)) unknown("pack offset overflow");
-                offsets.set(id, Number(physical));
-              }
-              let total = 0;
-              for (let i = 0; i < 256; i++) if ((total += fanout[i]!) !== idx.readUInt32BE(base + 4 * i)) unknown("pack fanout mismatch");
-              const pack = await file(path.join(p, match![1] + ".pack"));
-              if (pack.length < 32 || pack.toString("ascii", 0, 4) !== "PACK" ||
-                  ![2, 3].includes(pack.readUInt32BE(4)) || pack.readUInt32BE(8) !== count) unknown("pack header mismatch");
-              const starts = [...offsets.values()].sort((a, b) => a - b);
-              if (new Set(starts).size !== count || (count ? starts[0] !== 12 : pack.length !== 32) ||
-                  starts.some(start => start < 12 || start >= pack.length - 20)) unknown("invalid pack offsets");
-              type Record = { logical: number; baseLength?: number; base?: number; state: number };
-              const records = new Map<number, Record>();
-              const contentCharge = (n: number) => {
-                charge(n); MaintenanceResources.consumeIfActive("metadataBytes", n);
-              };
-              // Each span and instruction is bounded by the shared observation
-              // budget. A failure aborts before any pair verifier. That before-verifier
-              // guarantee relies on the epoch writer-exclusion contract: the pack and idx
-              // are not re-checked between this snapshot and each verify-pack launch, and
-              // finalStoreCheck refuses a change afterwards.
-              for (let i = 0; i < starts.length; i++) {
-                automatic.checkLive(); this.checkRecoveryInterruption();
-                const start = starts[i]!, end = starts[i + 1] ?? pack.length - 20;
-                let pos = start;
-                const byte = () => { if (pos >= end) unknown("truncated pack record"); return pack[pos++]!; };
-                let b = byte(), size = b & 15, scale = 16;
-                const type = (b >> 4) & 7;
-                while (b & 128) {
-                  if (!Number.isSafeInteger(scale)) unknown("pack entry size integer overflow");
-                  b = byte(); size += (b & 127) * scale;
-                  if (!Number.isSafeInteger(size)) unknown("pack entry size limit");
-                  if (size > limits.maxObjectStoreBytes) exceeded("pack entry size limit");
-                  scale *= 128;
-                }
-                if (![1, 2, 3, 4, 6, 7].includes(type)) unknown("unsupported pack record type");
-                let baseOffset: number | undefined;
-                if (type === 6) {
-                  b = byte(); let distance = b & 127;
-                  while (b & 128) {
-                    b = byte(); distance = (distance + 1) * 128 + (b & 127);
-                    if (!Number.isSafeInteger(distance) || distance > start) unknown("OFS offset overflow");
-                  }
-                  baseOffset = start - distance;
-                  if (!distance || !records.has(baseOffset)) unknown("OFS base is not an earlier record");
-                } else if (type === 7) {
-                  if (end - pos < 20) unknown("truncated REF base");
-                  baseOffset = offsets.get(pack.subarray(pos, pos + 20).toString("hex")); pos += 20;
-                  if (baseOffset === undefined) unknown("missing same-pack REF base");
-                }
-                const remaining = limits.maxObjectStoreBytes - bytes;
-                // A declared size past the budget is the overflow. Once the declaration fits, an inflate that
-                // still overruns `remaining` contradicts the header (a corrupt pack: UNKNOWN below).
-                if (remaining <= 0 || size > remaining) exceeded("pack inflated byte limit");
-                const inflated = inflateSync(pack.subarray(pos, end), { maxOutputLength: remaining, info: true }) as unknown as
-                  { buffer: Buffer; engine: { bytesWritten: number } };
-                automatic.checkLive(); this.checkRecoveryInterruption();
-                contentCharge(inflated.buffer.length);
-                if (inflated.engine.bytesWritten !== end - pos || inflated.buffer.length !== size) unknown("pack compressed span or size");
-                const record: Record = { logical: size, base: baseOffset, state: 0 };
-                if (type === 6 || type === 7) {
-                  const program = inflated.buffer; let cursor = 0;
-                  // Git's patch_delta requires DELTA_SIZE_MIN=4, before reading headers.
-                  if (program.length < 4) unknown("short delta program");
-                  const next = () => { if (cursor >= program.length) unknown("truncated delta instruction"); return program[cursor++]!; };
-                  const integer = () => {
-                    let value = 0, factor = 1, part: number;
-                    do {
-                      part = next(); value += (part & 127) * factor;
-                      if (!Number.isSafeInteger(value) || !Number.isSafeInteger(factor)) unknown("delta integer overflow");
-                      factor *= 128;
-                    } while (part & 128);
-                    return value;
-                  };
-                  record.baseLength = integer(); record.logical = integer();
-                  if (record.logical > limits.maxObjectStoreBytes - bytes) exceeded("delta logical byte limit");
-                  let generated = 0;
-                  while (cursor < program.length) {
-                    automatic.checkLive(); this.checkRecoveryInterruption();
-                    const opcode = next(); let length = 0;
-                    if (opcode & 128) {
-                      let offset = 0;
-                      for (let j = 0; j < 4; j++) if (opcode & (1 << j)) offset += next() * 2 ** (8 * j);
-                      for (let j = 0; j < 3; j++) if (opcode & (1 << (j + 4))) length += next() * 2 ** (8 * j);
-                      if (!length) length = 65536;
-                      if (offset > record.baseLength || length > record.baseLength - offset) unknown("delta copy outside base");
-                    } else {
-                      length = opcode;
-                      if (!length || length > program.length - cursor) unknown("invalid delta insert");
-                      cursor += length;
-                    }
-                    if (length > record.logical - generated) unknown("delta generated size mismatch");
-                    contentCharge(length); generated += length;
-                  }
-                  if (generated !== record.logical) unknown("delta generated size mismatch");
-                }
-                records.set(start, record);
-              }
-              // The functional graph visits each record at most twice. IDX lookup
-              // is unverified here, so reject cycles before Git collision reads.
-              for (const start of starts) {
-                const stack: Record[] = [];
-                let current = records.get(start);
-                while (current && current.state !== 2) {
-                  automatic.checkLive(); this.checkRecoveryInterruption();
-                  if (current.state === 1) unknown("cyclic pack delta graph");
-                  current.state = 1; stack.push(current);
-                  if (current.base === undefined) break;
-                  const target = records.get(current.base);
-                  if (!target || current.baseLength !== target.logical) unknown("delta base length mismatch");
-                  current = target;
-                }
-                for (const record of stack) record.state = 2;
-              }
+              const { count, offsets } = await packIndex(full, store);
+              await packRecords(path.join(p, match[1] + ".pack"), count, offsets);
               pairs.add(full);
             }
-          } else if (name === "info") {
-            const members = await directory(p);
-            for (const member of members) {
-              const full = path.join(p, member);
-              if (member === "commit-graphs") {
-                for (const child of await directory(full)) {
-                  if (child !== "commit-graph-chain" && !/^graph-[0-9a-f]{40}\.graph$/.test(child)) unknown("unsupported commit graph entry");
-                  if (!(await stat(path.join(full, child)))?.isFile()) unknown("commit graph type");
-                }
-              } else if (["commit-graph", "packs"].includes(member)) {
-                if (!(await stat(full))?.isFile()) unknown("object info type");
-              } else if (member === "alternates") {
-                const data = await file(full);
-                if (!isUtf8(data)) unknown("alternate encoding");
-                rows.set(full + ":bytes", data.toString("hex"));
-                const text = data.toString("utf8");
-                if (text && !text.endsWith("\n")) unknown("unterminated alternates");
-                for (const line of text ? text.slice(0, -1).split("\n") : []) {
-                  if (++edges > limits.maxMetadataRecords) exceeded("alternate edge limit");
-                  if (!/^[!-~]+$/.test(line) || /["\\]/.test(line)) unknown("unsupported alternate syntax");
-                  store.alternates.push(path.resolve(root, line));
-                }
-              } else unknown("unsupported object info entry");
-            }
-            for (const absent of ["alternates", "http-alternates", "commit-graph", "commit-graphs"])
-              if (!members.includes(absent)) await stat(path.join(p, absent), true);
-          } else unknown("unsupported object root entry");
+          }
         }
-        for (const absent of ["pack", "info"]) if (!names.includes(absent)) await stat(path.join(root, absent), true);
-        for (const alternate of store.alternates) await visit(alternate);
       };
-      await visit(source); await visit(bare);
+      deferring = true;
+      await topology(source); await topology(bare);
+      deferring = false;
+      await afterTopology?.(pending !== undefined);
+      if (pending) throw pending;
+      for (const root of stores.keys()) await content(root);
       const expected = (root: string) => {
         const seen = new Set<string>(), ids = new Set<string>();
         const walk = (p: string) => {
@@ -11488,30 +11783,53 @@ export class GitCache {
         bareOwn: new Set(stores.get(bare)!.ids), pairs };
     };
     try {
-      const initial = await snapshot();
-      for (const runner of [true, false]) {
-        const args = ["config", "--local", "--no-includes", "--null", "--list"];
-        const config = await read(() => runner ? this.runGitAsRunner(cwd, args,
-          { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } })
-          : this.runGitWithEnv(barePath, args, NO_REPLACE_ENV));
-        this.automaticCollection(config, "\0");
-        for (const row of config.split("\0")) {
-          const [key, value] = row.split("\n");
-          // refstorage (reftable) and partialclone (promisor objects fetched lazily) change where refs
-          // and objects live, which the physical-store observation below cannot account for.
-          if (key === "extensions.compatobjectformat" || key === "extensions.objectformat" && value !== "sha1" ||
-              key === "extensions.refstorage" || key === "extensions.partialclone" ||
-              key?.startsWith("include.") || key?.startsWith("includeif.")) unknown("object format or config indirection unsupported");
+      // Part of the topology, so it runs before any content is charged: an overflow met here waits for the second
+      // iteration, an UNKNOWN answer does not.
+      const configChecks = async (overflowKnown: boolean) => {
+        let overflow: unknown;
+        for (const runner of [true, false]) {
+          try {
+            const args = ["config", "--local", "--no-includes", "--null", "--list"];
+            const config = await read(() => runner ? this.runGitAsRunner(cwd, args,
+              { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } })
+              : this.runGitWithEnv(barePath, args, NO_REPLACE_ENV));
+            this.automaticCollection(config, "\0");
+            for (const row of config.split("\0")) {
+              const [key, value] = row.split("\n");
+              // refstorage (reftable) and partialclone (promisor objects fetched lazily) change where refs
+              // and objects live, which the physical-store observation below cannot account for.
+              if (key === "extensions.compatobjectformat" || key === "extensions.objectformat" && value !== "sha1" ||
+                  key === "extensions.refstorage" || key === "extensions.partialclone" ||
+                  key?.startsWith("include.") || key?.startsWith("includeif.")) unknown("object format or config indirection unsupported");
+            }
+          } catch (error) {
+            if (error instanceof AutomaticCompletenessUnknown) throw error;
+            // The wrapper around a Git launch drops the overrun facts, so once the topology has identified an
+            // overflow of these same files, a Git failure here is that overflow seen again, not a new unknown.
+            if (isBoundOverflow(error)) overflow ??= error;
+            else if (!overflowKnown) throw error;
+          }
         }
-      }
+        if (overflow !== undefined) throw overflow;
+      };
+      const initial = await snapshot(configChecks);
       for (const idx of initial.pairs) {
         native.allowedIndices!.add(idx);
         try { await read(() => this.runGitWithEnv(barePath, ["verify-pack", "--", idx], NO_REPLACE_ENV)); }
         finally { native.allowedIndices!.delete(idx); }
       }
-      automatic.finalStoreCheck = async () => {
-        if ((await snapshot()).fingerprint !== initial.fingerprint) unknown("object topology changed");
+      // A re-read repeats an observation whose first instance fit every limit. A limit overflow now means the
+      // store is no longer what was observed: UNKNOWN, never a settled keep.
+      const reread = async <T>(action: () => Promise<T>): Promise<T> => {
+        try { return await action(); }
+        catch (error) {
+          if (isBoundOverflow(error)) throw new AutomaticCompletenessUnknown("object observations changed", { cause: error });
+          throw error;
+        }
       };
+      automatic.finalStoreCheck = () => reread(async () => {
+        if ((await snapshot()).fingerprint !== initial.fingerprint) unknown("object topology changed");
+      });
       return async (head: string) => {
         try {
           const parse = (out: string) => {
@@ -11562,9 +11880,9 @@ export class GitCache {
           const required = new Set(initial.own); required.add(head);
           for (const id of automatic.shape?.namedIds ?? []) required.add(id);
           for (const ref of cloneRefs) if (!mirrors.satisfied.has(ref.name)) required.add(ref.id);
-          if (!same(sourceIds, await inventory(true)) || !same(bareIds, await inventory(false)) ||
+          if (await reread(async () => !same(sourceIds, await inventory(true)) || !same(bareIds, await inventory(false)) ||
               !same(held, await closure()) || out !== await refs() ||
-              mirrors.proof !== (await this.automaticMirrorRefs(barePath, unheld, initial.bareOwn, parse, read, unknown)).proof)
+              mirrors.proof !== (await this.automaticMirrorRefs(barePath, unheld, initial.bareOwn, parse, read, unknown)).proof))
             unknown("object observations changed");
           await automatic.finalStoreCheck!();
           return !stash && [...required].every(id => held.has(id));
@@ -11826,13 +12144,13 @@ export class GitCache {
       fixed.set(key, { target, signature: statSignature(st) });
     const lstatPath = (p: string | Buffer) => read(() => fs.lstat(p, { bigint: true }));
     // Entry names stay raw bytes (`encoding: "buffer"`); every entry is charged before it is visited.
-    const listDirectory = async (dir: string | Buffer, visit?: (name: Buffer) => void): Promise<void> => {
+    const listDirectory = async (dir: string | Buffer, visit?: (name: Buffer) => void, charged = true): Promise<void> => {
       const handle = await read(() => fs.opendir(dir, { encoding: "buffer" as BufferEncoding }));
       try {
         for (;;) {
           const entry = await read(() => handle.read());
           if (entry === null) break;
-          chargeRecords("directory", 1, "directory entry");
+          if (charged) chargeRecords("directory", 1, "directory entry");
           visit?.(entry.name as unknown as Buffer);
         }
       } finally { await handle.close(); }
@@ -11865,6 +12183,93 @@ export class GitCache {
         chargeMetadata(Number(st.size), what);
         remember("f:" + file, file, st);
       };
+      // Topology first (owner answer seq 1162, 2026-11-06 (R9)): `objects/info` decides whether the object store is
+      // accounted for at all, so it is read, classified and typed before anything else of `.git` is charged. A huge
+      // `packed-refs` or config can then never hide an outside alternate behind a settled keep.
+      // `objects/info` is read by Git at startup too. `alternates` (which `clone --shared` writes) and
+      // `packs` are typed and charged, as is a `commit-graph` file; a `commit-graphs` directory is
+      // typed only (every launch pins `core.commitGraph=false`, so Git never opens either). Any
+      // other entry, `http-alternates` included, is UNKNOWN.
+      const objectsDir = path.join(gitDir, "objects");
+      let objectsStat: import("node:fs").BigIntStats | undefined;
+      try { objectsStat = await lstatPath(objectsDir); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      if (objectsStat && !objectsStat.isDirectory()) throw refusal(".git/objects is not a real directory");
+      const objectsInfo = path.join(objectsDir, "info");
+      try {
+        let infoStat: import("node:fs").BigIntStats | undefined;
+        if (objectsStat) {
+          try { infoStat = await lstatPath(objectsInfo); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+        }
+        if (infoStat) {
+          if (!infoStat.isDirectory()) throw refusal(".git/objects/info is not a real directory");
+          remember("d:" + objectsInfo, objectsInfo, infoStat);
+          // A fixed set of four legal names: each is classified as it is read and before it is counted, so a fifth
+          // (or any illegal) name is UNKNOWN by construction and never a keep. The count is charged afterwards.
+          const names: string[] = [];
+          await listDirectory(objectsInfo, name => {
+            const text = name.toString("latin1");
+            if (!["alternates", "packs", "commit-graph", "commit-graphs"].includes(text))
+              throw refusal("unsupported object info entry");
+            names.push(text);
+          }, false);
+          // Type every entry before any is charged.
+          const typed: { name: string; file: string; st: import("node:fs").BigIntStats }[] = [];
+          for (const name of names) {
+            const file = path.join(objectsInfo, name);
+            const st = await lstatPath(file);
+            if (name === "commit-graphs" ? !st.isDirectory() : !st.isFile())
+              throw refusal(name === "commit-graphs" ? ".git/objects/info/commit-graphs is not a real directory"
+                : `.git/objects/info/${name} is not a regular file`);
+            typed.push({ name, file, st });
+          }
+          chargeRecords("directory", names.length, "directory entry");
+          // `alternates` is read and judged before anything else is charged (an outside store, a bad line or a
+          // bad encoding is UNKNOWN whatever else overflows); the object-store observation applies the same rules.
+          for (const { name, file } of typed) {
+            if (name !== "alternates") continue;
+            const size = typed.find(entry => entry.name === "alternates")!.st.size;
+            chargeMetadata(Number(size), ".git/objects/info/alternates");
+            let got: Awaited<ReturnType<typeof readSmallRegularFile>>;
+            try { got = await readSmallRegularFile(file, Number(size), read); }
+            catch (error) {
+              if (error instanceof GitIndexError) throw refusal(`.git/objects/info/alternates: ${error.message}`);
+              throw error;
+            }
+            if (!isUtf8(got.bytes)) throw refusal("alternates encoding");
+            const text = got.bytes.toString("utf8");
+            if (text && !text.endsWith("\n")) throw refusal("unterminated alternates");
+            for (const line of text ? text.slice(0, -1).split("\n") : []) {
+              if (!/^[!-~]+$/.test(line) || /["\\]/.test(line)) throw refusal("unsupported alternate syntax");
+              const target = path.resolve(objectsDir, line);
+              if (target !== objectsDir && !(path.dirname(path.dirname(target)) === path.resolve(this.reposRoot) &&
+                  path.basename(target) === "objects")) throw refusal("alternate writer exclusion unavailable");
+            }
+            fixed.set("f:" + file, { target: file, signature: got.signature });
+          }
+          for (const { name, file, st } of typed) {
+            if (name === "alternates") continue;
+            if (name === "commit-graphs") { remember("d:" + file, file, st); continue; }
+            chargeMetadata(Number(st.size), `.git/objects/info/${name}`);
+            remember("f:" + file, file, st);
+          }
+        }
+      } catch (error) {
+        // A typed refusal and any non-ENOENT filesystem error (an unreadable directory, say) leave the
+        // object store unaccounted for: UNKNOWN. An exceeded bound is a positively identified overflow
+        // and stays a settled keep (owner answer seq 1162, 2026-11-06 (R9)).
+        if (error instanceof AutomaticBoundExceeded) throw error;
+        const code = (error as NodeJS.ErrnoException | undefined)?.code;
+        const fsError = typeof code === "string" && /^E[A-Z0-9]+$/.test(code) && code !== "ENOENT";
+        if (fsError || error instanceof AutomaticContentRefusal || error instanceof AutomaticCompletenessUnknown) {
+          const unknownInfo = new AutomaticCompletenessUnknown((error as Error).message, { cause: error });
+          OBJECT_INFO_UNKNOWN.add(unknownInfo);
+          throw unknownInfo;
+        }
+        throw error;
+      }
+
       // Allowlist, not denylist: every top-level entry must be a known one of the right type, so
       // no state file `status` or `ls-tree` might read (a sequencer todo, a rebase head-name, a
       // merge head, ...) goes untyped or uncharged. The files charged below are charged once.
@@ -12001,48 +12406,6 @@ export class GitCache {
         }
       }
       await regular(path.join(gitDir, "packed-refs"), false, ".git/packed-refs");
-      // `objects/info` is read by Git at startup too. `alternates` (which `clone --shared` writes) and
-      // `packs` are typed and charged, as is a `commit-graph` file; a `commit-graphs` directory is
-      // typed only (every launch pins `core.commitGraph=false`, so Git never opens either). Any
-      // other entry, `http-alternates` included, is a keep.
-      const objectsInfo = path.join(gitDir, "objects", "info");
-      try {
-        let infoStat: import("node:fs").BigIntStats | undefined;
-        try { infoStat = await lstatPath(objectsInfo); }
-        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-        if (infoStat) {
-        if (!infoStat.isDirectory()) throw refusal(".git/objects/info is not a real directory");
-        remember("d:" + objectsInfo, objectsInfo, infoStat);
-        const names: string[] = [];
-        await listDirectory(objectsInfo, name => {
-          const text = name.toString("latin1");
-          if (!["alternates", "packs", "commit-graph", "commit-graphs"].includes(text))
-            throw refusal("unsupported object info entry");
-          names.push(text);
-        });
-        for (const name of names) {
-          const file = path.join(objectsInfo, name);
-          if (name !== "commit-graphs") { await regular(file, true, `.git/objects/info/${name}`); continue; }
-          const st = await lstatPath(file);
-          if (!st.isDirectory()) throw refusal(".git/objects/info/commit-graphs is not a real directory");
-          remember("d:" + file, file, st);
-        }
-        }
-      } catch (error) {
-        // A typed refusal and any non-ENOENT filesystem error (an unreadable directory, say) leave the
-        // object store unaccounted for: UNKNOWN. An exceeded bound is a positively identified overflow
-        // and stays a settled keep (owner answer seq 1162, 2026-11-06 (R9)).
-        if (error instanceof AutomaticBoundExceeded) throw error;
-        const code = (error as NodeJS.ErrnoException | undefined)?.code;
-        const fsError = typeof code === "string" && /^E[A-Z0-9]+$/.test(code) && code !== "ENOENT";
-        if (fsError || error instanceof AutomaticContentRefusal || error instanceof AutomaticCompletenessUnknown) {
-          const unknownInfo = new AutomaticCompletenessUnknown((error as Error).message, { cause: error });
-          OBJECT_INFO_UNKNOWN.add(unknownInfo);
-          throw unknownInfo;
-        }
-        throw error;
-      }
-
       // HEAD names the one loose ref `ls-tree` resolves. Both it and that ref are
       // small regular files read here through a bounded descriptor; a symbolic indirection, a
       // link or a FIFO is a keep.
@@ -12131,8 +12494,10 @@ export class GitCache {
    *  1b. `.git/config` is read in Node and refused if it names an include (Git opens include
    *     targets at startup); `.git/info/exclude` is read in Node and must hold only the worker-source
    *     baseline; `.git/objects/info` holds at most `alternates`, `packs` and `commit-graph` (typed
-   *     and charged) and a `commit-graphs` directory (typed only), any other `objects/info` entry
-   *     (`http-alternates` included) or an over-budget one being UNKNOWN, not a settled keep;
+   *     and charged) and a `commit-graphs` directory (typed only); any other entry (`http-alternates`
+   *     included), or an unreadable one, is UNKNOWN, an over-budget legal one a settled keep. It is
+   *     classified FIRST, before item 0 charges anything of `.git` (config, packed-refs, refs, reflogs), so
+   *     an outside alternate is never hidden behind an overflow of another file;
    *  2. every tracked path (and each of its directories) is lstat'd by raw bytes and must have
    *     the type its mode names; regular sizes and link lengths are charged to the worktree-content
    *     counter; every tracked regular file and symlink is hashed here as a Git blob (never more
@@ -12147,7 +12512,7 @@ export class GitCache {
    * would answer from a forgeable cache-tree). There is no `status` launch. Finally the index and
    * every recorded path are re-read: a change is a keep.
    *
-   * Three counters stay distinct so their limits can be set independently later: `metadataBytes`
+   * Three counters, each with its own limit: `metadataBytes`
    * (config, index, exclude, packed-refs and every Git output; limit `maxMetadataBytes`),
    * `pathRecords` (index entries, directory entries, untracked records; each limited to
    * `maxMetadataRecords`) and `worktreeContentBytes` (tracked regular sizes and link lengths;

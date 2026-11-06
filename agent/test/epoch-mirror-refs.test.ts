@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import type { PodEpochReclaimScope } from "../templates/pod-epoch-init.cjs";
 import { formatAttemptId } from "../src/attempt-path.js";
 import { GitCache, type EpochDiscardProofOptions, type RetainedDiscardOptions } from "../src/git.js";
@@ -112,6 +112,25 @@ function borrow(alt: string): void {
 async function unknown(message: RegExp): Promise<void> {
   await assert.rejects(observation(), error => (error as Error).constructor.name === "AutomaticCompletenessUnknown" &&
     message.test((error as Error).message));
+}
+
+/** Every result of the mirror-ref proof, so its `satisfied` set can be read. */
+function mirrorResults(t: import("node:test").TestContext): { satisfied: Set<string>; proof: string }[] {
+  const original = git["automaticMirrorRefs"].bind(git);
+  const results: { satisfied: Set<string>; proof: string }[] = [];
+  t.mock.method(git as unknown as { automaticMirrorRefs: typeof original }, "automaticMirrorRefs",
+    async (...args: Parameters<typeof original>) => { const result = await original(...args); results.push(result); return result; });
+  return results;
+}
+/** A commit written into the bare's own store whose tree and blob live only in the alternate `alt` (borrowed by the bare). */
+function splitClosureCommit(alt: string): string {
+  const blob = execFileSync("git", ["-C", alt, "hash-object", "-w", "--stdin"], { env: ENV, encoding: "utf8", input: "alternate blob\n" }).trim();
+  const tree = execFileSync("git", ["-C", alt, "mktree"], { env: ENV, encoding: "utf8", input: `100644 blob ${blob}\tf\n` }).trim();
+  const id = command(alt, ...IDENT, "commit-tree", tree, "-m", "split closure");
+  const body = execFileSync("git", ["-C", alt, "cat-file", "commit", id], { env: ENV });
+  const written = execFileSync("git", ["-C", bare, "hash-object", "-w", "--literally", "-t", "commit", "--stdin"], { env: ENV, encoding: "utf8", input: body }).trim();
+  assert.equal(written, id);
+  return id;
 }
 
 describe("mirror refs", () => {
@@ -288,5 +307,72 @@ describe("mirror refs", () => {
       });
       await unknown(/object observations changed/);
     });
+  });
+
+  describe("the per-tip split and its launch cap", () => {
+    it("proves the good tip after the split when the chunk also holds a bad one", async t => {
+      const alt = bareAlternate("mirror-alt.git");
+      borrow(alt);
+      const good = bareCommit("good");
+      bareRef("refs/heads/good", good); cloneRef("refs/remotes/origin/good", good);
+      const bad = splitClosureCommit(alt);
+      bareRef("refs/heads/bad", bad); cloneRef("refs/remotes/origin/bad", bad);
+      const results = mirrorResults(t);
+      // The bad ref's closure is not in the bare's own store, so its tip stays required (and unreachable): a keep.
+      assert.equal(await observation(), false);
+      assert.ok(results[0]!.satisfied.has("refs/remotes/origin/good"), "the good tip is proved by the per-tip retry");
+      assert.ok(!results[0]!.satisfied.has("refs/remotes/origin/bad"));
+    });
+    it("tips beyond MIRROR_SPLIT_LAUNCHES (64) stay required, however good", async t => {
+      const alt = bareAlternate("mirror-alt.git");
+      borrow(alt);
+      // One bad tip sorted first plus 127 good ones: a single chunk of 128 that fails as a whole.
+      const bad = splitClosureCommit(alt);
+      bareRef("refs/heads/a-bad", bad); cloneRef("refs/remotes/origin/a-bad", bad);
+      const names: string[] = [];
+      for (let i = 0; i < 127; i++) {
+        const name = `g-${String(i).padStart(3, "0")}`;
+        const id = bareCommit(name);
+        bareRef(`refs/heads/${name}`, id); cloneRef(`refs/remotes/origin/${name}`, id); names.push(name);
+      }
+      const results = mirrorResults(t);
+      assert.equal(await observation(), false);
+      const satisfied = results[0]!.satisfied;
+      // Launch 1 is the bad tip, launches 2..64 the first 63 good tips; every later tip is never retried.
+      assert.equal(satisfied.size, 63);
+      for (const name of names.slice(0, 63)) assert.ok(satisfied.has(`refs/remotes/origin/${name}`), name);
+      for (const name of names.slice(63)) assert.ok(!satisfied.has(`refs/remotes/origin/${name}`), name);
+    });
+  });
+  describe("a Git failure in the bare closure", () => {
+    it("a truly missing object makes the whole proof UNKNOWN, not a keep", async () => {
+      const blob = execFileSync("git", ["-C", bare, "hash-object", "-w", "--stdin"], { env: ENV, encoding: "utf8", input: "doomed\n" }).trim();
+      const tree = execFileSync("git", ["-C", bare, "mktree"], { env: ENV, encoding: "utf8", input: `100644 blob ${blob}\tf\n` }).trim();
+      const id = command(bare, ...IDENT, "commit-tree", tree, "-m", "missing tree");
+      bareRef("refs/heads/broken", id); cloneRef("refs/remotes/origin/broken", id);
+      fs.rmSync(path.join(bare, "objects", tree.slice(0, 2), tree.slice(2)));
+      assert.notEqual(spawnSync("git", ["-C", bare, "rev-list", "--objects", id], { env: ENV }).status, 0, "control: rev-list errors");
+      await unknown(/object coverage unavailable/);
+    });
+  });
+  describe("an overflow while re-reading the mirror proof", () => {
+    const overrun = () => Object.assign(new Error("git subprocess maxBuffer exceeded"), {
+      outputExceeded: true, outputStream: "stdout", code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", epochProcessJoined: true });
+    for (const [nth, label] of [[2, "the first read is the settled keep"], [4, "the repeat is UNKNOWN"]] as const) {
+      it(label, async t => {
+        const id = bareCommit("feature");
+        cloneRef("refs/remotes/origin/feature", id); bareRef("refs/heads/feature", id);
+        const original = git["runGitWithEnv"].bind(git);
+        let launches = 0;
+        t.mock.method(git as unknown as { runGitWithEnv: typeof original }, "runGitWithEnv", async (...args: Parameters<typeof original>) => {
+          // rev-list order: the root closure, the mirror proof, then the same two again at the re-check.
+          if (args[1].includes("rev-list") && ++launches === nth) throw overrun();
+          return original(...args);
+        });
+        if (nth === 2) assert.equal(await observation(), false);
+        else await unknown(/object observations changed/);
+        assert.equal(launches, nth);
+      });
+    }
   });
 });

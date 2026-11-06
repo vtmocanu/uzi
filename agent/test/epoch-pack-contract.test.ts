@@ -91,6 +91,16 @@ async function unknown(limits: { maxMetadataRecords?: number; maxMetadataBytes?:
     (!reason || reason.test((error as Error).message)));
 }
 
+/** The object-store snapshot alone ends in a settled keep for exactly this limit. */
+async function exceeded(limits: { maxMetadataRecords?: number; maxMetadataBytes?: number }, reason: RegExp): Promise<void> {
+  const proof = git.createEpochDiscardProof(input);
+  const state = git["epochDiscardProofs"].get(proof)!;
+  await assert.rejects(git["epochRetained"].run(git["epochLimits"](limits), () => git["withEpochNativeReads"](proof, () => {
+    const automatic = { roots: [], checkLive: () => git["checkEpochDiscardLive"](state) };
+    return git["automaticObserveStores"](bare, clonePath, automatic as never);
+  })), error => (error as Error).constructor.name === "AutomaticBoundExceeded" && reason.test((error as Error).message));
+}
+
 const sourceObjects = () => path.join(clonePath, ".git", "objects");
 const bareObjects = () => path.join(bare, "objects");
 function packObjects(cwd: string, ids: string[]): string {
@@ -228,6 +238,7 @@ describe("R1 coverage spans clone, bare and a bounded alternates closure", () =>
     assert.equal(await observation(limits), true, "control: a short chain is within the bound");
     chain(names.length);
     // Past the store bound is a positively identified overflow: a settled keep, not UNKNOWN.
+    await exceeded(limits, /object store limit/);
     assert.equal(await observation(limits), false);
     assert.equal(journal(), raw);
   });
