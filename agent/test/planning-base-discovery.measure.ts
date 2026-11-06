@@ -702,6 +702,9 @@ async function measure(job: MeasureJob): Promise<string[]> {
   // not exported); reading it records the limits the helper really receives, so production rows
   // carry whatever caps the helper ships with and a validation row replaces only what it names.
   const limitsHolder = cache as unknown as { planningLimits: Record<string, number> };
+  if (typeof limitsHolder.planningLimits !== "object" || limitsHolder.planningLimits === null) {
+    throw new Error("GitCache.planningLimits is not an object: the harness cannot read the helper's defaults");
+  }
   const validation = job.limits !== undefined;
   if (job.limits !== undefined) {
     cache.setPlanningLimitsForTest({ ...limitsHolder.planningLimits, ...validateLimits(job.limits, limitsHolder.planningLimits) });
@@ -773,6 +776,12 @@ async function measure(job: MeasureJob): Promise<string[]> {
     derived = d.derived;
     derivedReason = d.reason ?? null;
     if (d.assertionFailed) failures.push(`DERIVATION_ASSERTION: ${d.reason}`);
+    // A cap token with no known cap value means the harness and helper disagree on the key name.
+    else if (d.derived === null) failures.push(`CAP_UNKNOWN: ${d.reason}`);
+  }
+  // A validation row exists to exercise injected caps; the helper rejecting them is a harness error.
+  if (validation && outcome.kind === "refused" && outcome.token === "invalid_limits") {
+    failures.push("VALIDATION_LIMITS_REJECTED: the helper refused the injected limits (invalid_limits)");
   }
   if (failures.length > 0) outcome = { ...outcome, flag: failures.join("; ") };
   const result = {
