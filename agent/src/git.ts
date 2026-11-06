@@ -22894,7 +22894,7 @@ function command(args, cap = METADATA_LIMIT, input, allowDiff = false, cwd = tem
       s.on("error", fail);
     }
     collect(p.stdout, false); collect(p.stderr, true);
-    const timer = setTimeout(() => fail(refusal("git_deadline")), Math.min(5000, deadline - Date.now()));
+    const timer = setTimeout(() => fail(refusal("git_deadline")), Math.max(0, Math.min(5000, deadline - Date.now())));
     p.on("error", fail);
     p.on("close", code => {
       clearTimeout(timer); child = undefined;
