@@ -77,7 +77,8 @@ recognise falls back to medium and is never forwarded, and workers drop any
 claimed default effort outside the five levels when decoding the claim,
 without logging the value.
 
-Settings do not report the level the runtime then uses; a run's lead record
+For Claude, settings report no level. For Codex they show the catalog default as
+last reported, which a given run may still not use. A run's lead record
 shows what the runtime reported for that run (see [Read requested and
 effective effort](#read-requested-and-effective-effort)). A resumed session or thread
 may keep a level it was previously driven with: omitting effort does not clear
@@ -104,7 +105,9 @@ source at commit `6aaac694` (`codex-rs/core/src/client.rs:957-966`).
 - A resume that reattaches to a still-running Codex thread keeps that thread's
   level.
 
-Workers report the catalog default after a Codex run's `model/list`, and the
+Workers report the catalog default when an issue or lead-lane Codex run starts
+(from its `model/list` probe; cross-check, review and judge runs do not
+report), once per claim and without retry. The
 server stores it per user and per Codex credential (and, for a subscription,
 account). Settings show the report for the credential a new run of yours would
 use, if it is at most 30 days old. The Codex **Runtime default** option reads:
@@ -114,19 +117,25 @@ use, if it is at most 30 days old. The Codex **Runtime default** option reads:
 | `catalog default: {effort} ({model}, Codex {version})` | Known: the level the catalog default is, for your Codex model, as last reported. |
 | `catalog default: none (no reasoning level requested) (...)` | Known, and the level is `none` (see above). |
 | `catalog default: ultra (Codex substitutes another level) (...)` | Known, and the level is `ultra` (see above). |
-| `... · may differ on workers still on another version` | Varies: workers on different Codex runtime versions reported different levels for the current credential. The label shows one of them. |
-| `catalog default unknown until a Codex run reports it` | Unknown: no report within 30 days for the current credential, no usable Codex credential, an unlinked subscription, or account pool mode (the credential is chosen only when a run is created, so none can be predicted). |
+| `... · may differ on workers still on another version` | Varies: workers on different Codex runtime versions reported different levels for the current credential. The label shows the highest runtime version's level (ties: the latest report). |
+| `catalog default unknown until a Codex run reports it` | Unknown: no report within 30 days for the current credential, no usable Codex credential, an unlinked subscription, or Codex account mode `auto` with at least one pooled login (the login is chosen only when a run is created, so none can be predicted). With `auto` and an empty pool uzi uses the default credential, so the label can be known. |
 
 Saving a different Codex model refreshes the label. Because the value is a
-report from an earlier run, it can lag a Codex runtime upgrade or a credential
-change until a new run reports.
+report from an earlier run, it can lag a Codex runtime upgrade, or a catalog
+refresh on your account (the default can change with no version or credential
+change), until a new run reports. After a worker image rollback the newer
+version's value can remain the label for up to 30 days. A replaced or
+re-linked credential reads unknown until a run reports with it; a token refresh
+alone keeps the label.
 
 ### Effort reporting
 
 `GET` and `PUT /api/me/settings` return a read-only `effort_settings` with two
 cells, `claude` and `codex`: `harness`, `effort` (stored), `default_effort`,
 `default_source`, `resolved_effort`, `source` (`user_default` or `builtin`) and
-`mode`. `resolved_effort` is `null` exactly when `mode` is `runtime_default`.
+`mode`. The `codex` cell also carries `catalog_default` (`state`, `effort`,
+`model`, `runtime_version`, `observed_at`; the value fields are `null` when the
+state is unknown). `resolved_effort` is `null` exactly when `mode` is `runtime_default`.
 `uzi settings get` shows them as two `effort` rows; see
 [CLI](./cli.md#plan-cross-check-settings).
 

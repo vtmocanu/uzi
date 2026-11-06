@@ -3125,8 +3125,9 @@ for example:
 effort  claude  runtime default  medium  runtime default (value not reported)  your choice
 ```
 
-The Codex row's `RESOLVED` shows the catalog default last reported for your
-credential ([details](./worker-effort.md#what-the-codex-catalog-default-means)):
+When the preference is Runtime default, the Codex row's `RESOLVED` shows the
+catalog default last reported for your credential by issue and lead-lane Codex
+runs ([details](./worker-effort.md#what-the-codex-catalog-default-means)):
 
 | `RESOLVED` | Meaning |
 | --- | --- |
