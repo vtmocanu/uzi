@@ -3,7 +3,8 @@
 //
 // Best-effort and one-shot: at most one POST per claim, no retry, and every refusal or transport
 // error ends in one bounded log line. It never throws into a turn, so a failed, slow or refused
-// report cannot change what the run does. Modelled on LeadConfigReporter (lead-config-report.ts).
+// POST cannot change what the run does (the probe's pending-request residual is documented in
+// codex-harness.ts runCatalogProbe). Modelled on LeadConfigReporter (lead-config-report.ts).
 
 import type { LeadConfigPostOutcome } from "../client.js";
 import type { Logger } from "../log.js";

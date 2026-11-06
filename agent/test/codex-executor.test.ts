@@ -6693,6 +6693,41 @@ describe("CodexExecutor: #3247 catalog probe and effort_not_in_catalog policy", 
     assert.ok(rig.epochs[1]!.transport.requests.some((r) => r.method === "turn/start"));
   });
 
+  it("a Runtime default with a reporter: a recreated later epoch sends no second model/list", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "checkpoint", {}, th, tn, "checkpoint")).push(turnCompleted("completed", th, tn));
+      }),
+      resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
+        t.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    rig.deps = { ...rig.deps, catalogProbeTimeoutMs: 10 };
+    const reporterClient = new ReportStub();
+    const { ctx } = makeCtx({
+      config: {}, checkpoint: async () => undefined,
+      codexCatalogReport: new CodexCatalogReporter({
+        client: reporterClient, runId: "run-1", claimGeneration: 7, catalogContext: CATALOG_CTX, logger: noopLog,
+      }),
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "two-epoch run");
+    assert.equal(rig.providerLaunches(), 2, "a second epoch was really built");
+    const listed = rig.epochs.map((e) => e.transport.requests.filter((r) => r.method === "model/list").length);
+    assert.deepEqual(listed, [1, 0]);
+    assert.ok(rig.epochs[1]!.transport.requests.some((r) => r.method === "turn/start"));
+  });
+
+  it("a Runtime default with a reporter: a resume rejection fallback probes at most once", async () => {
+    const reporterClient = new ReportStub();
+    const { rig, error } = await run({
+      reporterClient, list: () => withDefault("gpt-6-astra", ["high"], "high"), sessionId: "claimed-thread", rejectResume: true,
+    });
+    assert.equal(error, undefined);
+    assert.ok(rig.transport.requests.some((r) => r.method === "thread/resume"));
+    assert.equal(rig.transport.requests.filter((r) => r.method === "model/list").length, 1);
+    assert.equal(rig.transport.requests.filter((r) => r.method === "turn/start").length, 1);
+  });
+
   it("a resume rejection fallback probes at most once and sends one root turn/start", async () => {
     const { rig, error } = await run({
       effort: "max", list: () => catalog("gpt-6-astra", ["high"]), sessionId: "claimed-thread", rejectResume: true,
