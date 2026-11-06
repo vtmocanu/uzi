@@ -479,8 +479,8 @@ function DefaultOptions({ s, showApprove }: { s: Schedule; showApprove: boolean 
   );
 }
 
-// A user row keeps today's chips: only explicit run flags earn one (PRD #841: a null
-// mr-rework is inherit and shows nothing), with "defaults" when none apply.
+// A user row shows the model chip, then only explicit run flags earn a chip (PRD #841:
+// a null mr-rework is inherit and shows nothing); "defaults" ties to the run flags only.
 function UserOptions({ s, showApprove }: { s: Schedule; showApprove: boolean }) {
   return (
     <>

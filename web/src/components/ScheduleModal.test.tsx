@@ -935,7 +935,7 @@ describe("editing a catalog default (PRD #589)", () => {
     expect(input?.run_at).toBeUndefined();
   });
 
-  it("renders the 'Apply model also to agents' toggle on a default, and submits override_subagent_model:true when turned on (issue #691)", async () => {
+  it("renders the subagent-model toggle on a default, and submits override_subagent_model:true when turned on (issue #691)", async () => {
     mockApi.updateSchedule.mockResolvedValue(defaultFixture({ override_subagent_model: true }));
     render(
       <MemoryRouter>
