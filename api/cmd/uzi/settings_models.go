@@ -91,9 +91,14 @@ func codexRuntimeDefaultResolved(cd *apitypes.CatalogDefaultDTO) string {
 		cd.Effort == nil || cd.Model == nil || cd.RuntimeVersion == nil {
 		return unknown
 	}
+	// PRD D13: Codex 0.164.0 sends every stored level as-is except ultra, which
+	// resolve_reasoning_effort replaces before the request.
 	effort := crossCheckPlain(*cd.Effort)
-	if effort == "none" {
+	switch effort {
+	case "none":
 		effort = "none, no reasoning level requested"
+	case "ultra":
+		effort = "ultra, Codex substitutes another level"
 	}
 	out := label + " (" + catalog + ": " + effort + ", " + crossCheckPlain(*cd.Model) + ", Codex " + crossCheckPlain(*cd.RuntimeVersion) + ")"
 	if cd.State == "varies" {
