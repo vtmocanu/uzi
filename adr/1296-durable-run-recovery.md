@@ -10,6 +10,31 @@ the full Decision Log (D1-D9), the milestone breakdown and the verified code anc
 ADR restates the invariants a future edit to a claim clause, a custody-release path or a
 cleanup guard must not silently break.
 
+## Amendment (#2969): predecessor guarded-hold settlement is built and disabled in production
+
+**Status**: Built behind a constructor-only test option; **disabled in production**. Every retained re-claim skips the predecessor pass, so production behavior is unchanged. Owner decision 2026-11-06, fallback.
+
+The design lets a retained re-claim settle a **lower** generation's guarded inventory hold while a later claim generation of the same run executes. What the branch contains:
+
+- **Coordinator (`agent/src/recovery.ts`).** An in-memory, never-journaled `predecessor` option on `operateFrozenInventory`, carried by an `AsyncLocalStorage` scope. One exemption in `inactiveInventoryDisqualifier` tolerates an executing run only for that record, only for a generation strictly below the executing claim, and only while the scope is live. Grants 1, 3 and 4 are denied; grant 2 requires `current_claim_generation > generation` from a fresh exact hold observation, and a failed observation returns `predecessor_observation_refused` before any capture, upload or write. There is no freeze. Saved archive FINAL requests are preserved and replayed. Each pass has a 64 MiB upload allowance; a typed quota refusal skips, a bare 507 is not quota. Predecessor RPCs are awaited, not detached. An integrity channel classifies refusal codes (unknown means integrity, so STOP) and survives a thrown operation.
+- **Runner (`agent/src/runner.ts`, `agent/src/git.ts`).** A per-call source boundary grant (exact execution tail, generation strictly lower, live held scope, Linux) proves each clone with quiescence before and after, plus a strict byte-exact content proof (`GitCache.inventorySourceContentProof`: binary-safe git output, `hash-object --no-filters --stdin-paths`, capped, refusing assume-unchanged, skip-worktree, gitlink and filter attributes). A predecessor-only `ignored_residue` gate skips when non-scratch ignored files exist (`node_modules`, build output); `.uzi/scratch/` is excluded. Per-clone head and device:inode baseline drift is a STOP. `settlePredecessorHolds` runs inside `recoverRetainedClaim` after the mandatory capture and before successor adoption, with a budget, an owned/joined action cap, a settlement watchdog, a Codex pre-entry single-source gate and STOP/skip classification.
+- **Observed `--stdin-paths` behavior.** On git 2.54.0, `hash-object --stdin-paths` C-unquotes a line that starts with `"` and strips a trailing CR. The proof therefore refuses, before dispatch, any path containing LF, starting with `"`, or ending in CR, rather than hashing a different file than it named.
+- **The ordinary terminal FINAL is unchanged.** It keeps `worktreeStatus`. The plan proposed the strict content proof there too; it was dropped because a clean repository with `eol`, `ident`, `working-tree-encoding` or filter attributes hashes differently under `--no-filters` and would be refused forever.
+- **API.** No server change. `TestRecoveryPredecessorFinalWhileSuccessorRunsLiveDB` characterizes that the server already accepts an older-generation FINAL while the successor runs.
+
+**Why disabled.** The existing quiescence scan targets only the runner uid and cannot see a leftover process of the separate command uid writing into a predecessor clone. An in-process procfs detector was tried and removed: review showed an unprivileged process can cycle the pid counter without being counted (clones that fail after pid allocation, thread pids), so absence could not be proven. Every retained re-claim logs `command_uid_unproven`, skips the pass before any predecessor operation, and leaves the holds open and counted exactly as before. The same command-uid blind spot exists in the ordinary terminal FINAL's quiescence check; it is a known gap, deferred next to #3851.
+
+**Deferred, not shipped:**
+
+- A sound command-uid source proof (the prerequisite for enabling the pass).
+- A Codex older-sibling source proof.
+- A regenerable ignored-path allowlist.
+- Empty or unadopted predecessor settlement.
+- The shared-quota risk tracked in #2544.
+- The real UID-split end-to-end lane; it was not built or run.
+
+Cleanup of predecessor records is unchanged and stays with the [ADR-2417 amendment](2417-guarded-local-retention.md#amendment-2969-predecessor-record-cleanup-deferral).
+
 ## Amendment 2026-11-04: operator local-record resolution (#3885)
 
 A worker-local operator command can now retire guarded local recovery records,
@@ -809,7 +834,7 @@ the implementing PR.
 
 D5's refusal of a thin archive FINAL is narrowed, not removed. For an inventory-guarded **archive** FINAL only, a capture that lists prerequisites may release its hold when the API proves, at release time, that the capture's closure is pinned: the closure row is bound to the exact capture and hold, its checksum and prerequisites match the capture, no absence is recorded, and one fresh listing of `refs/uzi-prereq/<capture-id>` on GitHub.com shows the recorded tip. The hold then records `release_evidence = prerequisite_closure` with a `final_closure_id`. Without a positive listing the hold stays open: a recorded absence is refused as `prerequisite_pin_missing`, a different tip as `prerequisite_pin_foreign` (409), and an unlistable pin, timeout or limiter refusal as `prerequisite_pin_unavailable` (503). The proof is archive-only; it adds nothing for publication, held-publication or empty-inventory dispositions, and the server still does not parse bundle bytes (T1-T5 of ADR-3591 are unchanged).
 
-The worker mints a thin archive FINAL only under a transient grant and only against a pinned, matching closure; an unknown or transient result never grants. There are two grantors. The frozen path (`frozenOperationCycle`) can pass four grants: (1) missing v2 held metadata on a non-uncertain create; (2) proven held ineligibility; (3) an attested held-publication fallback in the same pass; (4) a feature snapshot naming the closure feature and neither held feature. The #2969 retained-claim caller (`captureAndUpload` with `closureMint: "retained_claim"`) is limited to grants 1 and 4; it runs while the run still executes, so it captures without minting and the mint comes from the later frozen pass. At the API, a committed release replays to its original ACK without forge I/O or admission. A saved thin FINAL's worker replay uses its MAC and bundle header independent of the pin, expiry or knob, subject to the fresh captured-C restriction guards in the [2026-11-02 amendment](#amendment-2026-11-02--durable-remediation-source-selection).
+The worker mints a thin archive FINAL only under a transient grant and only against a pinned, matching closure; an unknown or transient result never grants. There are two grantors. The frozen path (`frozenOperationCycle`) can pass four grants: (1) missing v2 held metadata on a non-uncertain create; (2) proven held ineligibility; (3) an attested held-publication fallback in the same pass; (4) a feature snapshot naming the closure feature and neither held feature. The #2969 retained-claim caller (`captureAndUpload` with `closureMint: "retained_claim"`) is limited to grants 1 and 4; it runs while the run still executes, so it captures without minting and the mint comes from the later frozen pass. The wider predecessor settlement built for #2969 is disabled in production; see the [#2969 amendment](#amendment-2969-predecessor-guarded-hold-settlement-is-built-and-disabled-in-production). At the API, a committed release replays to its original ACK without forge I/O or admission. A saved thin FINAL's worker replay uses its MAC and bundle header independent of the pin, expiry or knob, subject to the fresh captured-C restriction guards in the [2026-11-02 amendment](#amendment-2026-11-02--durable-remediation-source-selection).
 
 Mixed-version limits, all fail closed:
 

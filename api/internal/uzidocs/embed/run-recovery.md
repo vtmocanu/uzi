@@ -958,7 +958,9 @@ needs all of the following.
   serves park-observed records in `paused`, `recovery_wait` or `limit_wait`) can pass
   any of four grants, and the #2969 retained-claim caller passes only grants 1 and 4
   (it runs while the run still executes, so it captures without minting; the mint
-  comes from the later frozen pass):
+  comes from the later frozen pass; that retained-claim path does not yet settle older
+  generations' holds in production, see
+  [Automatic settlement of an older held generation](#automatic-settlement-of-an-older-held-generation)):
   (1) a missing v2 metadata record; (2) a proven held-publication ineligibility;
   (3) a held-publication fallback in the same pass that the server explicitly
   refused (a 409, 413 or 422 with a bounded reason, a 200 `create_refused`, or a
@@ -1935,6 +1937,17 @@ reclaimed, or moved in the meantime keeps the hold. An older generation taken
 by a *different* worker is never settled this way; it waits for you or for the
 completed-run check above.
 
+**Known limits.** A retained re-claim, which starts a later generation while an
+older generation's guarded (inventory) hold is still open, does not yet settle that
+older hold in production. The code exists but is switched off until a proof that no
+leftover command-user process can still write into the older clone is built, so
+those holds stay open and counted toward the admission limit exactly as before;
+resolve them with `uzi run export` or `uzi run discard`. The worker logs
+`command_uid_unproven` when it skips. The quiescence check used before an ordinary
+terminal inventory FINAL has the same blind spot for command-user processes; it is
+a known gap, not yet closed. See the
+[ADR-1296 amendment](../adr/1296-durable-run-recovery.md#amendment-2969-predecessor-guarded-hold-settlement-is-built-and-disabled-in-production).
+
 ## Reviewing and resolving held work
 
 Once the **admission-counted holds per owner** limit (the *Admission-counted
@@ -2675,7 +2688,7 @@ Subsequent #2852 C adds exact post-disposal registered-process proof for positiv
 sources; the accepted limit still applies to writers outside that boundary.
 
 This extension adds no model-free blocked/orphan producer (#3031),
-live-predecessor widening (#2969), writer design (#2852), plan-rejection
+live-predecessor widening (#2969, built but disabled in production), writer design (#2852), plan-rejection
 producer/discard policy (#2884), zero-write fast path or workflow-file editing
 authority. Full-root/WIP coverage, non-ignored untracked work, secret and
 workflow guards remain required; it adds no holdless kinds or model reopening.
