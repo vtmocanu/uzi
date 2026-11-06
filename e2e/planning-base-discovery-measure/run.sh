@@ -34,9 +34,16 @@ for spec in $FIXTURES; do
     repo|synthetic-[0-9]*|chain-d[0-9]*|fanout2-d[0-9]*|wide-[0-9]*x[0-9]*) ;;
     *) echo "unknown fixture spec: $spec" >&2; exit 2 ;;
   esac
-  case "$spec" in *[!a-z0-9x-]*) echo "unsafe fixture spec: $spec" >&2; exit 2 ;; esac
+  case "$spec" in *[!a-z0-9-]*) echo "unsafe fixture spec: $spec" >&2; exit 2 ;; esac
 done
-[ -n "$MEM_CONFIGS" ] || { echo "MEM_CONFIGS is empty" >&2; exit 2; }
+# shellcheck disable=SC2086 # deliberate word split: count the configurations.
+set -- $MEM_CONFIGS
+[ "$#" -gt 0 ] || { echo "MEM_CONFIGS has no configurations" >&2; exit 2; }
+for config in "$@"; do
+  case "$config" in
+    *[!a-z0-9:,]*) echo "unsafe MEM_CONFIGS entry: $config" >&2; exit 2 ;;
+  esac
+done
 
 mkdir -p "$OUT/inputs" "$OUT/fixtures" "$OUT/results" "$OUT/tmp" "$OUT/logs"
 
@@ -97,7 +104,10 @@ run_job() {
     docker kill "$name" >/dev/null 2>&1 || true
     code="$(docker wait "$name" 2>/dev/null || echo unknown)"
   elif [ "$rc" -ne 0 ]; then
+    # Never leave a job running into the next one: stop it, and record that it was not a timeout.
     code="wait_failed_rc_$rc"
+    docker kill "$name" >/dev/null 2>&1 || true
+    docker wait "$name" >/dev/null 2>&1 || true
   fi
   local oom
   oom="$(docker inspect -f '{{.State.OOMKilled}}' "$name")"
@@ -140,7 +150,6 @@ for config in $MEM_CONFIGS; do
 done
 
 log "rendering $OUT/results/results.md"
-rm -f "$OUT/results/report.term.json"
 run_job "${CREATED[0]}" "report" 300 '{"kind":"report","out":"/out/results"}'
 mv "$OUT/results/report.term.json" "$OUT/logs/report.term.json"
 cat "$OUT/results/results.md"

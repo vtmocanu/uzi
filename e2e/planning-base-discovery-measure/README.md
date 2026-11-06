@@ -36,8 +36,8 @@ command, and yields about every 20 ms.
     (`AGENT_MEM_LIMIT:-4g`, `AGENT_CPUS:-2`) and the chart's namespace LimitRange default. Hosted
     workers use size presets instead.
 - Each container first runs a no-op warm-up start. A fresh container's first start carries a
-  node/tsx startup transient (about 140 MiB cgroup peak, against about 60 MiB later), so no
-  measurement is a first start.
+  node/tsx startup transient (about 140 MiB at start, against about 60 MiB later, observed once),
+  so no measurement is a first start. The warm-up logs its cgroup figures to `logs/warmup__N.log`.
 
 ```sh
 OUT=/abs/out REPO_SHA=<commit> ./e2e/planning-base-discovery-measure/run.sh   # full matrix
@@ -88,8 +88,8 @@ would have to happen before any capture.
   3. no `uzi-planning-*` remains in the helper's actual TMPDIR, the one recorded from the spawn
      request. That TMPDIR must also equal the job's own temp dir.
 
-  The abort must also have landed before the capture's outcome. A trigger that fires afterwards
-  is marked `after outcome` and is not `ok`, and only then is a refusal relabelled `cancelled`.
+  A cancel cannot arm once the capture's outcome is known, and only an abort that landed before
+  the outcome relabels a refusal `cancelled`. The `after outcome` marker is a defensive check.
 
   Helper exit 143 only means the SIGTERM handler reached `process.exit`. That handler is
   `try { cleanup(); } finally { process.exit(143); }`, so 143 is not proof of cleanup.
@@ -118,7 +118,8 @@ report `no`.
 - `killed_unknown` for any other exit 137.
 - `helper_killed_unknown` when the helper died by a signal (TickSpawner code 128) that the
   envelope did not send, with no OOM evidence and no cancel.
-- `harness_error` for other failures of the harness process itself.
+- `harness_error` for other failures without a result: the harness process itself, or a failed
+  `docker wait` (`wait_failed_rc_N`, after which `run.sh` stops the container).
 
 For killed runs, values from the last persisted snapshot (every 100 ms) are shown as `≥` lower
 bounds. Unavailable values are `n/a`.

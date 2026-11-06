@@ -569,6 +569,11 @@ async function main(): Promise<void> {
     process.stdout.write(`measured ${job.label}\n`);
   } else if (job.kind === "report") {
     report(job.out);
+  } else if (job.kind === "noop") {
+    // Kept in the container log so the first-start transient stays inspectable.
+    process.stdout.write(`warmup: cgroup memory.current=${cgroupNumber("memory.current")} memory.peak=${cgroupNumber("memory.peak")}\n`);
+  } else {
+    throw new Error(`unknown job kind ${String((job as { kind?: unknown }).kind)}`);
   }
 }
 
