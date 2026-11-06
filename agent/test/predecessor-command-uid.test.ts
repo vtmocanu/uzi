@@ -31,7 +31,12 @@ afterEach(() => { for (const dir of tmpRoots.splice(0)) fs.rmSync(dir, { recursi
 function uidLine(a: number, b = a, c = a, d = a): string { return `Uid:\t${a}\t${b}\t${c}\t${d}\n`; }
 function statusText(uid: string, state = "S (sleeping)"): string { return `Name:\tproc\nState:\t${state}\n${uid}Gid:\t0\t0\t0\t0\n`; }
 
-interface Fake { root: string; proc: ProcSource; add(pid: number, status: string): void; mountinfo(text: string): void; lastPid(text: string | number): void }
+interface Fake {
+  root: string; proc: ProcSource; add(pid: number, status: string): void; mountinfo(text: string): void;
+  lastPid(text: string | number): void; stat(text: string): void; forks(n: number): void; pidMax(text: string | number): void;
+}
+const PID_MAX = 4_194_304;
+const FORKS = 1_000_000;
 
 function fakeProc(opts: { mountinfo?: (root: string) => string; self?: number } = {}): Fake {
   const self = opts.self ?? SELF;
@@ -47,9 +52,14 @@ function fakeProc(opts: { mountinfo?: (root: string) => string; self?: number } 
     },
     mountinfo: text => fs.writeFileSync(path.join(root, String(self), "mountinfo"), text),
     lastPid: text => fs.writeFileSync(path.join(root, "sys", "kernel", "ns_last_pid"), `${text}\n`),
+    stat: text => fs.writeFileSync(path.join(root, "stat"), text),
+    forks: n => fake.stat(`cpu  1 2 3\nctxt 99\nprocesses ${n}\nprocs_running 1\n`),
+    pidMax: text => fs.writeFileSync(path.join(root, "sys", "kernel", "pid_max"), `${text}\n`),
   };
   fs.mkdirSync(path.join(root, "sys", "kernel"), { recursive: true });
   fake.lastPid(NS_LAST_PID);
+  fake.forks(FORKS);
+  fake.pidMax(PID_MAX);
   fake.mountinfo((opts.mountinfo ?? defaultMountinfo)(root));
   fake.add(self, statusText(uidLine(0)));
   fake.add(1, statusText(uidLine(0)));
@@ -256,6 +266,83 @@ describe("proveNoCommandUid (Go proveNoUser plus a pid-counter bracket)", () => 
       assert.equal(proveNoCommandUid(f.proc), "absent");
       f.add(101, statusText(uidLine(COMMAND_UID)));
       assert.equal(proveNoCommandUid(f.proc), "present");
+    });
+  });
+
+  describe("fork-total bound and the pre-listing order", () => {
+    const SMALL_PID_MAX = 32_768;
+    function small(): Fake {
+      const f = fakeProc();
+      f.pidMax(SMALL_PID_MAX);
+      f.lastPid(5000);
+      f.add(100, statusText(uidLine(RUNNER_UID)));
+      return f;
+    }
+
+    it("a full counter cycle during one scan (counter ends above where it began) is unproven on every scan", () => {
+      const f = small();
+      // P (4000, command uid) exits and its child C (350, command uid) is created behind the cursor after a full cycle:
+      // neither is in the listing the scan reads, and the counter ends at 5003 >= 5000.
+      f.add(4000, statusText(uidLine(COMMAND_UID)));
+      f.add(350, statusText(uidLine(COMMAND_UID)));
+      let scans = 0, forks = FORKS;
+      const proof = proveNoCommandUid({ ...f.proc, beforeScan: () => { scans++; }, listing: names => {
+        f.lastPid(5003);
+        f.forks(forks += SMALL_PID_MAX);
+        return names.filter(n => n !== "4000" && n !== "350");
+      } });
+      assert.equal(proof, "unproven");
+      assert.equal(scans, 5);
+    });
+
+    it("a small fork delta during the scan (ordinary activity): absent", () => {
+      const f = small();
+      assert.equal(proveNoCommandUid({ ...f.proc, listing: names => { f.forks(FORKS + 100); return names; } }), "absent");
+    });
+
+    it("the delta limit is pid_max - 300 - listed pids: one below proves, the limit itself does not", () => {
+      for (const [delta, expected] of [[32_464, "absent"], [32_465, "unproven"]] as const) {
+        const f = small(); // listed: SELF, 1, 100
+        let forks = FORKS;
+        assert.equal(proveNoCommandUid({ ...f.proc, listing: names => { f.forks(forks += delta); return names; } }), expected, `delta ${delta}`);
+      }
+    });
+
+    it("a fork total that goes backwards is unproven on every scan", () => {
+      const f = small();
+      let scans = 0, forks = FORKS;
+      assert.equal(proveNoCommandUid({ ...f.proc, beforeScan: () => { scans++; }, listing: names => { f.forks(--forks); return names; } }), "unproven");
+      assert.equal(scans, 5);
+    });
+
+    for (const [name, write] of [
+      ["stat missing", (f: Fake) => fs.rmSync(path.join(f.root, "stat"))],
+      ["stat without a processes line", (f: Fake) => f.stat("cpu 1 2 3\n")],
+      ["a malformed processes line", (f: Fake) => f.stat("processes abc\n")],
+      ["a repeated processes line", (f: Fake) => f.stat("processes 5\nprocesses 6\n")],
+      ["a stat over 1 MiB", (f: Fake) => f.stat("processes 5\n" + "x".repeat(1024 * 1024 + 1))],
+      ["pid_max missing", (f: Fake) => fs.rmSync(path.join(f.root, "sys", "kernel", "pid_max"))],
+      ["pid_max non-numeric", (f: Fake) => f.pidMax("abc")],
+      ["pid_max zero", (f: Fake) => f.pidMax("0")],
+    ] as const) {
+      it(`${name}: unproven`, () => {
+        const f = small();
+        write(f);
+        assert.equal(proveNoCommandUid(f.proc), "unproven");
+      });
+    }
+
+    it("the counter and fork reads precede the directory listing: a pid added between them forces a retake", () => {
+      const f = small();
+      let scans = 0, hooked = false;
+      const proof = proveNoCommandUid({ ...f.proc, beforeScan: () => { scans++; }, beforeListing: () => {
+        if (hooked) return;
+        hooked = true;
+        f.lastPid(5200); // a fork burst after the pre-listing read ...
+        f.add(5100, statusText(uidLine(RUNNER_UID))); // ... lands a pid between the old and the new counter
+      } });
+      assert.equal(proof, "absent");
+      assert.equal(scans, 2, "the pid above the pre-listing counter retook the scan");
     });
   });
 

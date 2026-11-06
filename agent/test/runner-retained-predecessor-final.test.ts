@@ -445,18 +445,33 @@ it("an unexpected failure of the coordinator operation fails closed", async () =
 
 // ── time budget ──────────────────────────────────────────────────────────────────────────────────────────────────────
 
-/** The held scope's deadline for the running pass: the iteration deadline in the journal minus R. */
-function scopeDeadlineOf(world: World, prepMs: number): number {
-  return journal(world.bare, world.clone.branch).recovery.deadline - (2 * CODEX_BOUNDARY_MS + prepMs);
+/**
+ * Pins the held scope's deadline to `afterMs` after the pass actually starts, whatever time the fixture spent before
+ * it. The runner reads its successor-prep allowance once, at pass entry, to derive the scope deadline from the
+ * iteration deadline in the journal; this replaces that allowance with a getter that is evaluated at that moment, so
+ * the pass can never be skipped for `budget` because the host was slow to reach it.
+ */
+function pinScopeAfterPassStart(world: World, afterMs: number, settlementMarginMs: number): { scopeDeadline(): number } {
+  let scope: number | undefined;
+  const base = Reflect.get(world.internals, "predecessorFinalBudget") as { actionCapMs: number };
+  Reflect.set(world.internals, "predecessorFinalBudget", {
+    actionCapMs: base.actionCapMs,
+    settlementMarginMs,
+    get successorPrepAllowanceMs(): number {
+      const deadline = journal(world.bare, world.clone.branch).recovery.deadline as number;
+      scope ??= Date.now() + afterMs;
+      return deadline - scope - 2 * CODEX_BOUNDARY_MS;
+    },
+  });
+  return { scopeDeadline: () => { assert.notEqual(scope, undefined, "the pass has started"); return scope!; } };
 }
-// The scope deadline sits 15s after the iteration window opened; the pass starts a few seconds into the window.
-const LATE_PREP_MS = 300_000 - 15_000 - 2 * CODEX_BOUNDARY_MS;
 
 it("an operation that settles after the scope deadline is a late settlement and stops", async () => {
+  let pinned!: { scopeDeadline(): number };
   const r = await drive({
-    budget: { successorPrepAllowanceMs: LATE_PREP_MS, settlementMarginMs: 500 },
-    operate: async (call, world) => {
-      await sleep(Math.max(0, scopeDeadlineOf(world, LATE_PREP_MS) - Date.now() + 150));
+    observe: world => { pinned = pinScopeAfterPassStart(world, 15_000, 500); },
+    operate: async call => {
+      await sleep(Math.max(0, pinned.scopeDeadline() - Date.now() + 150));
       return { state: call.record.state, captureId: call.record.captureId, held: "acked" };
     },
   });

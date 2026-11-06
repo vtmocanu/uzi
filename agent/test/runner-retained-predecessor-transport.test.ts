@@ -359,11 +359,26 @@ const journalFiles = (runId: string): Record<string, string> => {
 };
 const savedRecord = async (r: { recovery: RecoveryCoordinator; claim: { run_id: string } }, generation: number): Promise<RecoveryRecord> =>
   (await r.recovery.inspect(r.claim.run_id)).find(x => x.generation === generation)!;
-/** The held scope's deadline for the running pass: the iteration deadline in the journal minus R. */
-function scopeDeadlineOf(world: Pre, prepMs: number): number {
-  return journal(world.bare, world.clone.branch).recovery.deadline - (2 * CODEX_BOUNDARY_MS + prepMs);
+/**
+ * Pins the held scope's deadline to `afterMs` after the pass actually starts, whatever time the fixture spent before
+ * it. The runner reads its successor-prep allowance once, at pass entry, to derive the scope deadline from the
+ * iteration deadline in the journal; this replaces that allowance with a getter evaluated at that moment, so the pass
+ * can never be skipped for `budget` because the host was slow to reach it.
+ */
+function pinScopeAfterPassStart(world: Pre, afterMs: number, settlementMarginMs: number): { scopeDeadline(): number } {
+  let scope: number | undefined;
+  const base = Reflect.get(world.runner, "predecessorFinalBudget") as { actionCapMs: number };
+  Reflect.set(world.runner, "predecessorFinalBudget", {
+    actionCapMs: base.actionCapMs,
+    settlementMarginMs,
+    get successorPrepAllowanceMs(): number {
+      const deadline = journal(world.bare, world.clone.branch).recovery.deadline as number;
+      scope ??= Date.now() + afterMs;
+      return deadline - scope - 2 * CODEX_BOUNDARY_MS;
+    },
+  });
+  return { scopeDeadline: () => { assert.notEqual(scope, undefined, "the pass has started"); return scope!; } };
 }
-const LATE_PREP_MS = 300_000 - 15_000 - 2 * CODEX_BOUNDARY_MS;
 /** An abort reason as the platform raises it, for a transport that settles by rejecting. */
 const abortError = (signal: AbortSignal | null | undefined): unknown => signal?.reason ?? new DOMException("aborted", "AbortError");
 
@@ -416,11 +431,12 @@ it("late headers after the abort already settled: clean skip, and nothing the la
 
 it("an abort that settles only after the scope deadline keeps the flight held while pending, then stops (quiescence_failed)", async () => {
   const seen: { events?: string[]; aborted?: boolean; pastScope?: boolean } = {};
+  let pinned!: { scopeDeadline(): number };
   const r = await drive({
-    budget: { successorPrepAllowanceMs: LATE_PREP_MS, settlementMarginMs: 500 },
+    arrange: (_server, world) => { pinned = pinScopeAfterPassStart(world, 15_000, 500); },
     transport: async (kind, init, next, world) => {
       if (kind !== "reserve") return next();
-      const scopeDeadline = scopeDeadlineOf(world, LATE_PREP_MS);
+      const scopeDeadline = pinned.scopeDeadline();
       // An uncooperative transport: it ignores the signal until the scope deadline is behind it.
       await sleep(Math.max(0, scopeDeadline - Date.now()) + 300);
       seen.events = [...world.events];
@@ -442,8 +458,12 @@ it("an abort that never settles leaves the flight held with no successor; cancel
   const gate = new Promise<void>(resolve => { release = resolve; });
   let entered = false;
   let world!: Pre;
+  // The cap clock starts with the pass, so it must outlast everything that precedes the reserve request on a loaded
+  // host; the wait below is event-driven (the dispatch) and then bounded by this same cap.
+  const CAP_MS = 15_000;
+  let drained = false;
   const running = drive({
-    budget: { actionCapMs: 600 },
+    budget: { actionCapMs: CAP_MS },
     arrange: (_server, w) => { world = w; },
     transport: async (kind, init, next) => {
       if (kind !== "reserve") return next();
@@ -454,11 +474,13 @@ it("an abort that never settles leaves the flight held with no successor; cancel
   });
   try {
     const startedAt = Date.now();
+    running.then(() => { drained = true; }, () => { drained = true; });
     while (!entered) {
-      if (Date.now() - startedAt > 60_000) assert.fail("the reserve request was never dispatched");
+      if (drained) assert.fail("the claim ended before the reserve request was dispatched");
+      if (Date.now() - startedAt > 120_000) assert.fail("the reserve request was never dispatched");
       await sleep(25);
     }
-    await sleep(600 + 2_500);
+    await sleep(CAP_MS + 2_500);
     assert.equal(world.events.includes("prepare"), false, "no successor within a bounded wait after the cap");
     assert.equal(world.events.includes("model"), false);
     assert.equal(world.events.filter(e => e.startsWith("operate:")).length, 1);
