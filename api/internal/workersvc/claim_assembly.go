@@ -874,12 +874,14 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// so both re-deliver unchanged on every resume. PlannedBaseCommit is nil for a run
 		// that supplied no commit (the compare is then inert); RequireBaseMatch is a plain
 		// bool (NOT NULL DEFAULT false), false for every non-opted-in run.
-		PlannedBaseCommit: textPtr(run.PlannedBaseCommit),
-		RequireBaseMatch:  run.RequireBaseMatch,
+		PlannedBaseCommit:     textPtr(run.PlannedBaseCommit),
+		RequireBaseMatch:      run.RequireBaseMatch,
+		RepoAgentSourceCommit: textPtr(run.RepoAgentSourceCommit),
 		// Ships with PlanApproved, deliberately adjacent: the two halves of one human
 		// verdict, and propagating the approval without the exclusions is what silently
 		// gives a user back a subagent they excluded. See ClaimPayload.AgentSelection.
-		AgentSelection: persistedSelection(run),
+		AgentSelection:       persistedSelection(run),
+		RequestedAgentSource: textPtr(run.AgentSourceRequested),
 		// PRD #122 M1: the frozen milestone list, decoded above. omitempty keeps a
 		// milestone-less run's claim byte-identical to today's.
 		Milestones:          milestones,

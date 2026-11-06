@@ -593,6 +593,9 @@ retained recovery keep same-path continuity.
 
 A confirmed `adoption_failed` blocker can instead hold at `recovery_wait` /
 `retained_recovery_adoption_failed` for owner Resume or Cancel, with no timer.
+A temporary API connection failure of the ownership check after the successor
+is verified is retried in place first; see
+[Retained recovery adoption failed](run-recovery-wait.md#retained-recovery-adoption-failed).
 A retained continuation whose `running` report the server refuses, and whose
 flight departed or showed presence without a witnessed departure, is charged
 against the requeue budget or held at `retained_continuation_unwitnessed`
@@ -963,7 +966,9 @@ needs all of the following.
   serves park-observed records in `paused`, `recovery_wait` or `limit_wait`) can pass
   any of four grants, and the #2969 retained-claim caller passes only grants 1 and 4
   (it runs while the run still executes, so it captures without minting; the mint
-  comes from the later frozen pass):
+  comes from the later frozen pass; that retained-claim path does not yet settle older
+  generations' holds in production, see
+  [Automatic settlement of an older held generation](#automatic-settlement-of-an-older-held-generation)):
   (1) a missing v2 metadata record; (2) a proven held-publication ineligibility;
   (3) a held-publication fallback in the same pass that the server explicitly
   refused (a 409, 413 or 422 with a bounded reason, a 200 `create_refused`, or a
@@ -1540,6 +1545,11 @@ locally (no journal record for the generation, no retained pin or clone of
 the run); on any doubt the hold stays open. The API accepts that release for
 a parked run only for a `forge_unreachable` park and only for the settled
 `forge_no_output` class. A parked run that adopted source keeps its hold.
+The same release closes the hold of a generation held as **repo agents
+unreadable** (`repo_agent_source_unavailable`) right after its fetch, before
+any clone was seeded, because its default branch had no resolvable commit. The
+run stays paused for its owner. The API accepts it only for that hold on a run
+with no recorded repo-agent revision.
 
 A dirty or unverified source, or an unproven process boundary, retains the
 clone and hold, reports **Needs action**, and uses bounded retries. Boot
@@ -1939,6 +1949,26 @@ still live on that worker at that generation. A run that was cancelled,
 reclaimed, or moved in the meantime keeps the hold. An older generation taken
 by a *different* worker is never settled this way; it waits for you or for the
 completed-run check above.
+
+**Known limits.** A retained re-claim, which starts a later generation while an
+older generation's guarded (inventory) hold is still open, does not yet settle that
+older hold in production. The code exists but is switched off until a proof that no
+leftover command-user process can still write into the older clone is built, so
+those holds stay open and counted toward the admission limit exactly as before.
+To resolve one, first preserve its work with `uzi run export` (export saves the
+evidence but does not settle the hold), then apply a separately authorized
+disposition such as `uzi run discard`. The worker logs `command_uid_unproven` when
+it skips. Enabling the pass will require a separately reviewed proof contract, not
+just removing the switch. The quiescence check used before an ordinary terminal
+inventory FINAL has the same blind spot for command-user processes; it is a known
+gap, not yet closed.
+
+Even once enabled, the pass carries an accepted residual: the scoped quiescence scan
+does not see an unmarked process running outside the clone, so writes such a
+process makes after the last proof can be missing from the archive even though the
+hold is released. This is a disclosed limit, separate from the command-user gap that
+keeps the pass switched off. See the
+[ADR-1296 amendment](../adr/1296-durable-run-recovery.md#amendment-2969-predecessor-guarded-hold-settlement-is-built-and-disabled-in-production).
 
 ## Reviewing and resolving held work
 
@@ -2680,7 +2710,7 @@ Subsequent #2852 C adds exact post-disposal registered-process proof for positiv
 sources; the accepted limit still applies to writers outside that boundary.
 
 This extension adds no model-free blocked/orphan producer (#3031),
-live-predecessor widening (#2969), writer design (#2852), plan-rejection
+live-predecessor widening (#2969, built but disabled in production), writer design (#2852), plan-rejection
 producer/discard policy (#2884), zero-write fast path or workflow-file editing
 authority. Full-root/WIP coverage, non-ignored untracked work, secret and
 workflow guards remain required; it adds no holdless kinds or model reopening.

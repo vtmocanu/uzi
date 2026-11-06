@@ -99,6 +99,7 @@ const githubClaim = (iid: number, overrides = {}) =>
       id: "r1",
       url: "https://github.com/org/repo",
       clone_url: fx.originPath,
+      default_branch: "main",
       forge_type: "github",
     },
     ...overrides,

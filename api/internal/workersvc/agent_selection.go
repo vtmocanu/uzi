@@ -335,3 +335,20 @@ func persistedSelection(run store.Run) *AgentSelection {
 	}
 	return &AgentSelection{Source: run.AgentSource.String, Exclusions: exclusions}
 }
+
+func materializeRequestedSelection(run store.Run, sel *AgentSelection) *AgentSelection {
+	if sel != nil || !run.AgentSourceRequested.Valid {
+		return sel
+	}
+	if run.AgentSource.Valid && run.AgentSource.String != "" {
+		if saved := persistedSelection(run); saved != nil {
+			return saved
+		}
+		return &AgentSelection{Source: AgentSourceOwn, Exclusions: []string{}}
+	}
+	materialized := AgentSelection{Source: run.AgentSourceRequested.String, Exclusions: []string{}}
+	if validateSelection(materialized, repoAgentNames(run.RepoAgents)) != nil {
+		materialized.Source = AgentSourceOwn
+	}
+	return &materialized
+}

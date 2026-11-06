@@ -20,7 +20,11 @@ import {
   type RepoAgentNoteReason,
 } from "../src/repoagents.js";
 import { assembleAgents, subagentsFromTemplates } from "../src/agents.js";
+import { REQUESTED_SOURCE_TABLE, NO_ROSTER_NOTE, caseLabel } from "./requested-agent-source-table.js";
 import {
+  type AgentSelection,
+  type AgentSelectionParse,
+  type AgentSource,
   type AgentTemplate,
   AGENT_EXCLUSIONS_MAX,
   encodeAgentSelection,
@@ -593,6 +597,41 @@ describe("resolveAgentSelection — the fallback never resolves toward the untru
       selection: { source: "own", exclusions: [] },
     });
   });
+});
+
+describe("resolveAgentSelection — the requested source (PRD #3914)", () => {
+  const own = { source: "own" as const, exclusions: [] };
+  const repo = { source: "repo" as const, exclusions: [] };
+  const noRoster = "this clone has no repo agent roster; using your own agent templates";
+  const cases: [string, AgentSelectionParse, boolean, unknown, { selection: AgentSelection; note?: string }][] = [
+    ["absent, unset, roster", { status: "absent" }, true, undefined, { selection: repo }],
+    ["absent, unset, no roster", { status: "absent" }, false, undefined, { selection: own }],
+    ["absent, null, roster", { status: "absent" }, true, null, { selection: repo }],
+    ["absent, own, roster", { status: "absent" }, true, "own", { selection: own }],
+    ["absent, own, no roster", { status: "absent" }, false, "own", { selection: own }],
+    ["absent, repo, roster", { status: "absent" }, true, "repo", { selection: repo }],
+    ["absent, repo, no roster", { status: "absent" }, false, "repo", { selection: own, note: noRoster }],
+    ["absent, unknown value, roster", { status: "absent" }, true, "both", { selection: repo }],
+    ["absent, unknown value, no roster", { status: "absent" }, false, "both", { selection: own }],
+    ["ok own wins over repo", { status: "ok", selection: { source: "own", exclusions: ["x"] } }, true, "repo", { selection: { source: "own", exclusions: ["x"] } }],
+    ["ok repo wins over own", { status: "ok", selection: { source: "repo", exclusions: ["x"] } }, true, "own", { selection: { source: "repo", exclusions: ["x"] } }],
+    ["ok repo, no roster, own requested", { status: "ok", selection: { source: "repo", exclusions: ["x"] } }, false, "own", { selection: own, note: noRoster }],
+    ["invalid ignores a repo request", { status: "invalid" }, true, "repo", {
+      selection: own, note: "the submitted agent selection was malformed; using your own agent templates" }],
+  ];
+  for (const [name, parse, roster, requested, want] of cases) {
+    it(name, () => {
+      assert.deepEqual(resolveAgentSelection(parse, roster, requested as AgentSource | null | undefined), want);
+    });
+  }
+
+  for (const c of REQUESTED_SOURCE_TABLE) {
+    it(`shared call-site table: ${caseLabel(c)}`, () => {
+      const resolved = resolveAgentSelection(seedAgentSelection(undefined), c.roster, c.requested);
+      assert.equal(resolved.selection.source, c.want);
+      assert.equal(resolved.note === NO_ROSTER_NOTE, c.note);
+    });
+  }
 });
 
 describe("seedAgentSelection (issue #1718)", () => {

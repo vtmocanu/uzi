@@ -263,6 +263,7 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 	if r.SizeClass != "" {
 		rows = append(rows, []string{"SIZE_CLASS", sanitizeTTY(r.SizeClass)})
 	}
+	rows = append(rows, agentSourceRows(r)...)
 	// Emitted only when set, like its two neighbours — every non-stopped run would
 	// otherwise carry a blank row. It is a server-controlled enum, so sanitizeTTY is
 	// not strictly required; applied anyway for uniformity with the free text above,
@@ -608,6 +609,8 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 		clauses = append(clauses, credentialSwitchAction(r))
 	case holdBaseAttestation:
 		clauses = append(clauses, baseAttestationAction(r))
+	case holdRepoAgentSource:
+		clauses = append(clauses, "resume once the repository can be fetched: uzi run resume "+cellText(r.ID))
 	case holdWeeklyReserve:
 		clauses = append(clauses, weeklyReserveAction(r))
 	}
@@ -636,6 +639,8 @@ func holdReasonLabel(reason string) string {
 		return "credential switch unsettled"
 	case holdBaseAttestation:
 		return "base not attested"
+	case holdRepoAgentSource:
+		return "repo agents unreadable"
 	case holdWeeklyReserve:
 		return "weekly usage reserve"
 	default:
@@ -2884,4 +2889,38 @@ func iterationHoldAction(r apitypes.RunDTO) string {
 		action += "; wall time exhausted; add time: uzi run extend " + id + " --by 2h; Extend adds time only, then Resume"
 	}
 	return action
+}
+
+func agentSourceLabel(source string) string {
+	switch source {
+	case "own":
+		return "my templates"
+	case "repo":
+		return "repo agents"
+	}
+	return sanitizeTTY(source)
+}
+
+func agentSourceRows(r apitypes.RunDTO) [][]string {
+	var rows [][]string
+	requested := strOr(r.AgentSourceRequested, "")
+	if requested != "" {
+		basis := "this run"
+		if strOr(r.AgentSourceRequestedBasis, "") == "repo_default" {
+			basis = "repo default"
+		}
+		rows = append(rows, []string{"AGENTS_REQUESTED", agentSourceLabel(requested) + " (" + basis + ")"})
+	}
+	if implemented := strOr(r.AgentSource, ""); implemented != "" {
+		cell := agentSourceLabel(implemented)
+		switch requested {
+		case "":
+		case implemented:
+			cell += " (as requested)"
+		default:
+			cell += " (changed at approval)"
+		}
+		rows = append(rows, []string{"IMPLEMENTED_WITH", cell})
+	}
+	return rows
 }

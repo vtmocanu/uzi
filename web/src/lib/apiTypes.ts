@@ -651,6 +651,7 @@ export interface Repo {
   // skills from the repo's own .claude/skills/ (skills only, never hooks/
   // settings/commands). Default false.
   repo_skills_enabled: boolean;
+  agent_source_default?: AgentSource | null;
   // Repo-instructions opt-in (PRD #246): when true, the lead reads the repo's
   // root CLAUDE.md as nonce-fenced, advisory, lead-only context. It is the second
   // capability behind the "Trusted repo" affordance, independently revocable from
@@ -3593,11 +3594,14 @@ export interface Run {
    *  none (the plan gate's repo card is inert, NOT the same as null). Names +
    *  descriptions only — REPO-SUPPLIED, untrusted text; render as plain JSX. */
   repo_agents: RepoAgent[] | null;
+  repo_agent_source_commit?: string | null;
   /** PRD #37: which roster the run's subagents came from, once a selection is made
    *  (at the gate, or an autopilot run's resolved default). null before then. */
   agent_source: AgentSource | null;
   /** PRD #37: the names excluded from the chosen source. null before a selection. */
   agent_exclusions: string[] | null;
+  agent_source_requested?: AgentSource | null;
+  agent_source_requested_basis?: AgentSourceRequestedBasis | null;
   /** PRD #37 M4-fix: the owner's OWN-source subagent roster (name + description) —
    *  exactly the allocation-resolved templates the worker runs for source="own",
    *  lead already stripped. The plan gate's "My agent templates" card is built from
@@ -4309,7 +4313,7 @@ export interface RunListItem extends Run {
  *  or ordering reads only these keys; the run detail page fetches the full Run. */
 export type RunSummaryItem = Omit<
   RunListItem,
-  "plan_md" | "repo_agents" | "issue_description" | "preserved_patch"
+  "plan_md" | "repo_agents" | "repo_agent_source_commit" | "issue_description" | "preserved_patch"
   | "reset_state_digest" | "milestone_reconciliations" | "milestone_reconciliations_next_before_gate_revision"
   | "semantic_gate" | "completion_pending" | "semantic_drift"
   | "capability_provenance" | "lead_config" | "created_issues"
@@ -5240,6 +5244,7 @@ export interface SteerInput {
 // own agent folder (.claude/agents/ or .codex/agents/), or the user's uzi templates. The lead orchestrator is
 // always uzi's builtin and is never selectable.
 export type AgentSource = "repo" | "own";
+export type AgentSourceRequestedBasis = "explicit" | "repo_default";
 
 // RepoAgent is one agent the worker detected in the cloned repo's .claude/agents/
 // or .codex/agents/

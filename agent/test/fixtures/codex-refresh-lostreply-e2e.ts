@@ -212,7 +212,7 @@ const runner = new RunRunner(client, cache, (_runId, codex) => {
 try {
   const registration = await client.register("lostreply", undefined, 1, [], [
     "codex_harness_v1", "codex_runtime_v2", "codex_completion_interlock_v1", "completion_interlock_v1",
-    "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "codex_refresh_recovery_v1",
+    "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "codex_refresh_recovery_v1", "repo_agent_source_v1",
     ...(cfg.variant === "account-unavailable" ? ["codex_account_park_v1"] : []),
   ]);
   const first = await client.claimRun();

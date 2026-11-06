@@ -752,9 +752,12 @@ type RunDTO struct {
 	// The names and descriptions here are REPO-SUPPLIED text. The gate panel
 	// renders them as plain JSX, never through <Markdown>: an attacker-authored
 	// description must not put a clickable link inside an approval dialog.
-	RepoAgents      []RepoAgent `json:"repo_agents"`
-	AgentSource     *string     `json:"agent_source"`
-	AgentExclusions []string    `json:"agent_exclusions"`
+	RepoAgents                []RepoAgent `json:"repo_agents"`
+	RepoAgentSourceCommit     *string     `json:"repo_agent_source_commit"`
+	AgentSource               *string     `json:"agent_source"`
+	AgentExclusions           []string    `json:"agent_exclusions"`
+	AgentSourceRequested      *string     `json:"agent_source_requested"`
+	AgentSourceRequestedBasis *string     `json:"agent_source_requested_basis"`
 	// OwnAgents is the OWN-source subagent roster (name + description) the run's
 	// owner would run: exactly what ListClaimAgentTemplates delivers to a claim,
 	// minus the lead. It is the single source of truth the plan-gate "My agent
@@ -1650,8 +1653,10 @@ type RunSummaryItemDTO struct {
 	// Per-run agent selection (PRD #37). The detected repo_agents roster is a detail field and is
 	// omitted from this summary; see RunDTO.RepoAgents. AgentSource/AgentExclusions stay null
 	// until a selection is made, at the gate or by an autopilot run's self-resolved default.
-	AgentSource     *string  `json:"agent_source"`
-	AgentExclusions []string `json:"agent_exclusions"`
+	AgentSource               *string  `json:"agent_source"`
+	AgentExclusions           []string `json:"agent_exclusions"`
+	AgentSourceRequested      *string  `json:"agent_source_requested"`
+	AgentSourceRequestedBasis *string  `json:"agent_source_requested_basis"`
 	// OwnAgents is the OWN-source subagent roster (name + description) the run's
 	// owner would run: exactly what ListClaimAgentTemplates delivers to a claim,
 	// minus the lead. It is the single source of truth the plan-gate "My agent
@@ -2138,6 +2143,8 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		StatusSince:                   item.StatusSince,
 		AgentSource:                   item.AgentSource,
 		AgentExclusions:               item.AgentExclusions,
+		AgentSourceRequested:          item.AgentSourceRequested,
+		AgentSourceRequestedBasis:     item.AgentSourceRequestedBasis,
 		OwnAgents:                     item.OwnAgents,
 		AnthropicSecretID:             item.AnthropicSecretID,
 		AnthropicSecretLabel:          item.AnthropicSecretLabel,
@@ -2326,6 +2333,8 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			StatusSince:                   s.StatusSince,
 			AgentSource:                   s.AgentSource,
 			AgentExclusions:               s.AgentExclusions,
+			AgentSourceRequested:          s.AgentSourceRequested,
+			AgentSourceRequestedBasis:     s.AgentSourceRequestedBasis,
 			OwnAgents:                     s.OwnAgents,
 			AnthropicSecretID:             s.AnthropicSecretID,
 			AnthropicSecretLabel:          s.AnthropicSecretLabel,

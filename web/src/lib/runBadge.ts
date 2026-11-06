@@ -176,6 +176,7 @@ const PARK_LABELS = {
   provider_unavailable: "provider unavailable: owner hold",
   codex_policy_hold: "Codex policy hold",
   base_attestation_missing: "base unverified: owner hold",
+  repo_agent_source_unavailable: "repo agents unreadable: owner hold",
   provider_outage: "waiting for provider",
   completion_blocked: "Completion blocked",
   credential_switch_settling: "settling: token switch",
@@ -226,6 +227,7 @@ export function effectiveRunStatus(
   // Issue #3194: a --require-base run whose adopted work no checkpoint attests to the planned
   // base. Server-held (raw status "paused"), so overlaid like the other holds.
   if (run.status === "paused" && run.hold_reason === "base_attestation_missing") return "base_attestation_missing";
+  if (run.status === "paused" && run.hold_reason === "repo_agent_source_unavailable") return "repo_agent_source_unavailable";
   if (run.status === "recovery_wait" && run.recovery_wait_cause === "provider_outage") return "provider_outage";
   if (isPlanningRun(run)) return "planning";
   if (isRevisingRun(run)) return "revising";
@@ -395,7 +397,7 @@ export function runStatusTone(
   if (status === "completion_blocked") return "warning";
   // PRD #1732: held on a disabled credential. Warn like the other involuntary holds.
   if (status === "iteration_budget_exhausted") return "warning";
-  if (status === "credential_disabled" || status === "provider_unavailable" || status === "codex_policy_hold" || status === "base_attestation_missing" || status === "provider_outage") return "warning";
+  if (status === "credential_disabled" || status === "provider_unavailable" || status === "codex_policy_hold" || status === "base_attestation_missing" || status === "repo_agent_source_unavailable" || status === "provider_outage") return "warning";
   // Issue #3181: both token-switch holds wait on something outside the run; warn, never danger.
   if (status === "credential_switch_settling" || status === "credential_switch_unsettled") return "warning";
   if (status === "awaiting_approval" || status === "awaiting_input")
@@ -814,6 +816,9 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
     case "base_attestation_missing":
       return { kind: "badge", label: PARK_LABELS.base_attestation_missing, tone: "warning", pulse: false,
         title: "The retained work is not attested to the planned base commit, so the agent was not started. Open the run to recover the work or start a successor." };
+    case "repo_agent_source_unavailable":
+      return { kind: "badge", label: PARK_LABELS.repo_agent_source_unavailable, tone: "warning", pulse: false,
+        title: "The repo agents could not be read at the run's recorded default-branch revision, so the agent was not started. Open the run to Resume once the repository can be fetched, or Cancel." };
     case "provider_outage":
       return { kind: "badge", label: PARK_LABELS.provider_outage, tone: "warning", pulse: false,
         title: "Provider outage. Open the run for park count, streak start and next retry." };
@@ -1227,6 +1232,7 @@ export function needsHumanAttention(status: string): boolean {
     status === "codex_policy_hold" ||
     status === "credential_switch_settling" ||
     status === "credential_switch_unsettled" ||
-    status === "base_attestation_missing"
+    status === "base_attestation_missing" ||
+    status === "repo_agent_source_unavailable"
   );
 }

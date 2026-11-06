@@ -364,7 +364,10 @@ A few worth knowing:
   [proposal output](./scheduling.md#proposal-output-mr-or-issues) for record scope
   and ordering; run lists and summaries do not carry this field.
 - **`run approve` picks the subagent roster explicitly.** By default a run
-  uses its own default roster; `--agent-source own|repo` overrides it
+  uses its own default roster: the run's frozen
+  [per-repo default](repo-agents.md#set-a-default-for-your-runs-on-a-repo) when
+  one was set, else the repo roster when one is detected and your templates
+  otherwise. `--agent-source own|repo` overrides it
   (`own` = your template roster, `repo` = the agents the worker detected in
   the clone's `.claude/agents/` or `.codex/agents/`), and `--exclude-agents a,b`
   drops individual subagents from that source. `--exclude-agents` requires
@@ -373,6 +376,16 @@ A few worth knowing:
   empty or invalid. See [Repo agents](repo-agents.md#which-folder-is-read).
   `run create --plan-file` takes the same two flags, for the seeded run's
   roster.
+- **`run get` shows the requested and implemented agents.** A run that carries
+  a frozen agent-source request shows `AGENTS_REQUESTED` (for example
+  `repo agents (repo default)`, or `(this run)` for a seeded plan's source), and
+  once a selection is recorded `IMPLEMENTED_WITH` shows the roster used, with
+  `(as requested)` or `(changed at approval)` when a request exists. `--json`
+  carries `agent_source_requested` and `agent_source_requested_basis`.
+- **`repo list` shows each repo's default agents.** The `DEFAULT_AGENTS` column
+  reads `own`, `repo` or `unset`; `--json` carries `agent_source_default`
+  (`"own"`, `"repo"` or `null`). The setting is changed on the Repos page; the
+  CLI only reads it.
 - **`run approve <id> --override-capabilities`** clears this run's required
   capabilities and approves even when its assigned worker cannot satisfy them.
   Use it only when the plan can proceed without those capabilities. It does not
@@ -3749,6 +3762,13 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   `uzi run recovery <id>`, recover the work with `uzi run export <id>
   --output <path>`, or start a successor run. See [Seeded
   plans](seeded-plans.md).
+  A `paused` run can also be **held because its repo agents could not be
+  read** (`hold_reason: repo_agent_source_unavailable`): the worker could not
+  resolve, record or read the default-branch revision it reads
+  `.claude/agents/` and `.codex/agents/` from, so the agent never started. `run get` prints a
+  `HOLD` row reading `repo agents unreadable`; resume the run with
+  `uzi run resume <id>` once the repository can be fetched, or cancel it. See
+  [Repo agents](repo-agents.md#which-revision-is-read).
 
 For an ordinary pause, human `run get` makes one supplemental message read
 (`tail=100`). Its pause detail reads **paused by the run's lead** for

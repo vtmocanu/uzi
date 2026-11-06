@@ -482,6 +482,7 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		// the roster. Advertised UNCONDITIONALLY: an older api's strict decoder 400s the
 		// unknown field, so a worker sends it only after seeing this token.
 		{"repo_agent_folder"},
+		{workersvc.RepoAgentSourceFeature},
 		{"terminal_rejection_report"}, // Issue #1974 M1; independent of active snapshots.
 		// Issue #3181: this api accepts {status:"credential_switch_held"} and
 		// {status:"credential_switch_hold_settled"} (each with claim_generation AND the reporting worker's
@@ -1476,6 +1477,10 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, workersvc.ErrClaimGenerationRequired) {
 			httpx.ErrorReason(w, http.StatusBadRequest, "presentation_id and adopt_gate_revision require claim_generation", "claim_generation_required")
+			return
+		}
+		if errors.Is(err, workersvc.ErrRepoAgentSourceConflict) {
+			httpx.ErrorReason(w, http.StatusConflict, err.Error(), "repo_agent_source_conflict")
 			return
 		}
 		// PRD #1392 M1: the two forge-park precedence refusals are 409 with a {run, reason}

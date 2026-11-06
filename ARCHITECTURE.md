@@ -857,8 +857,8 @@ escaping sibling/symlink reads are denied. This does not prove network
 isolation. Web and CLI show bounded findings and recorded child metadata,
 with current gate reason separate from historical candidate evidence; Slack
 shows the reason without findings. See [ADR-2149](adr/2149-cross-check.md) for
-confinement/proof limits and [PRD #2149](prds/2149-plan-cross-check.md) for
-rationale, validation provenance and pending hosted acceptance. The Codex-lead
+confinement/proof limits and [PRD #2149](prds/done/2149-plan-cross-check.md) for
+rationale, validation provenance and its closed hosted acceptance (#2152). The Codex-lead
 direction is [PRD #2460](prds/done/2460-codex-lead-plan-cross-check.md) and the
 [ADR-2149 addendum](adr/2149-cross-check.md#2460-addendum-codex-lead-claude-checker). Automatic rounds extend the original #2149
 scope through [PRD #2150](prds/done/2150-plan-cross-check-auto-revise.md) and
@@ -2043,8 +2043,9 @@ Four independent layers, any one of which failing still leaves the others:
    projects has. The one deliberate, user-gated exception is per-run agent
    selection (PRD #37): the *worker* parses `.claude/agents/*.md` (or, issue #2085,
    `.codex/agents/*.toml`, projected onto the same shape; the harness's native
-   folder wins, never merged) itself and
-   feeds them through the same programmatic `agents` map, only when the user
+   folder wins, never merged) itself, from git objects at the default-branch
+   commit the run recorded on its first claim (issue #3913), never from the
+   working tree, and feeds them through the same programmatic `agents` map, only when the user
    picks the repo source at the plan gate. `settingSources` stays `[]`; repo
    hooks/settings/commands never load; and repo subagents are still bound by
    the `disallowedTools` list and the deny-hook above. See the Repo agents docs

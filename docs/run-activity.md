@@ -811,6 +811,40 @@ most of the places that check are not the end of the run:
   cleared, the run normally continues on the old credential in place (its
   clone and session are kept); otherwise it is stopped and left to be
   requeued rather than continuing on uncertain ground.
+- A credential switch requested during an automatic plan cross-check does not
+  fail the run: it waits for the check to settle, then switches. With the
+  default 30-minute checker deadline the wait is up to about 31 minutes when
+  the check ends in an approve or revise, and up to about 53 minutes when it
+  ends at a first human gate; with the 2-hour maximum, about 2 h 1 min and
+  2 h 23 min. A human gate on a re-plan after an approval whose milestones
+  changed can take longer, with no fixed limit yet.
+  If the switch cannot complete and the run continues on its current
+  credential, an approved plan is kept and not re-checked, an automatic revise
+  runs its revision turn, and a checked human gate stays presented with no
+  republish. If the switch releases the run to another claim, that claim
+  re-presents the plan for human approval after an approve or a human gate,
+  and continues with the next checker round after an automatic revise. A cancel or other failure during the wait keeps its
+  normal outcome ([ADR-2149](../adr/2149-cross-check.md)).
+  An owner **Cancel** pressed during this wait takes effect promptly (#3974).
+  The server still holds the Cancel back behind the pending switch, but on
+  each poll while the switch waits the worker makes one short, read-only check
+  for a requested cancel. It sees the Cancel at its next poll and ends the run
+  **cancelled**. The switch is never serviced, no plan is stored and no gate
+  is presented afterwards. The pending checker round is recorded as failed and
+  the checker run is cancelled. Kept work is handled as for any other Cancel.
+  The same applies during an automatic revise's revision turn, including a
+  question it asks you.
+  **Known limits:** on a re-plan gate after an approval whose milestones
+  changed, the worker sees the Cancel promptly, but if the gate checkpoint
+  step is already running, the run's final status waits for that step to
+  return, with no fixed limit yet (#3980). A Cancel is still held until the
+  switch is serviced when the server or worker predates this check (#3860,
+  #3974). Graceful **Stop** is held this way too, and so is auto-stop, unless the
+  server's 60-second escalation fails a run that is still running. A Cancel pressed during the wait that the
+  switch releases before the worker sees it waits for the next claim; pressing
+  Cancel again after the release takes effect at once. If an earlier
+  "pause now" was refused, the agent's current turn stops at its next step
+  boundary rather than immediately.
 - A Claude recovery capture that cannot prove the clone stopped is retried a
   bounded number of times; if proof still fails, the run fails the same way
   finalize does (see below), with the clone kept. Codex ordinary recovery can

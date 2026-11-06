@@ -272,7 +272,7 @@ Connect the bot token from the prerequisites, then check its rights. The check p
 # Type the bot token. The terminal does not show it.
 read -rs BOT_TOKEN
 export BOT_TOKEN
-# Always send forge_type: the API picks GitLab when it is missing.
+# Always send forge_type: the API refuses a connection without it.
 CONNECTION=$(jq -n '{base_url:"https://github.com",forge_type:"github",token:env.BOT_TOKEN}' \
   | api --data @- "$URL/api/forge/connections" | jq -r .connection.id)
 unset BOT_TOKEN

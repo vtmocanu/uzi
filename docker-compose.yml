@@ -105,6 +105,7 @@ services:
       # is non-fatal (logged and skipped); a bad static config (PAT without email,
       # non-allowlisted base URL) refuses to boot.
       UZI_SEED_FORGE_PAT: ${UZI_SEED_FORGE_PAT:-}
+      UZI_SEED_FORGE_TYPE: ${UZI_SEED_FORGE_TYPE:-}
       UZI_SEED_FORGE_BASE_URL: ${UZI_SEED_FORGE_BASE_URL:-}
       UZI_SEED_FORGE_REPOS: ${UZI_SEED_FORGE_REPOS:-}
       # Optional startup Anthropic-token seed (belongs to the admin above), so a

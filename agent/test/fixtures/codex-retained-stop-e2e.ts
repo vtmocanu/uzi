@@ -263,7 +263,7 @@ try {
   const registration = await client.register("retained-stop", undefined, 1, [], [
     "codex_harness_v1", "codex_runtime_v2", "codex_completion_interlock_v1", "completion_interlock_v1",
     "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "codex_refresh_recovery_v1",
-    "active_run_snapshot",
+    "active_run_snapshot", "repo_agent_source_v1",
   ], active.buildRegisterSnapshot());
   assert.ok(client.hasFeature("active_run_snapshot"));
   const first = await client.claimRun(active.build());

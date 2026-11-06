@@ -74,6 +74,7 @@ type stateRequestMinusGateRevision struct {
 	ScopeCapped                 *bool                              `json:"scope_capped"`
 	BranchMoved                 *bool                              `json:"branch_moved"`
 	RepoAgents                  *[]workersvc.RepoAgent             `json:"repo_agents"`
+	RepoAgentSourceCommit       *string                            `json:"repo_agent_source_commit"`
 	PlanChangedFiles            *[]string                          `json:"plan_changed_files"`
 	Milestones                  *[]workersvc.Milestone             `json:"milestones"`
 	MilestonesCompleted         *[]string                          `json:"milestones_completed"`

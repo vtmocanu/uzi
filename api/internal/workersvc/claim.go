@@ -264,7 +264,8 @@ type ClaimPayload struct {
 	// the feed (runs.require_base_match, PRD #209 M4 Open Question 3). Always present (the
 	// column is NOT NULL); false for every run that did not opt in, so an old worker that
 	// ignores it, and every non-seeded run, keep today's behaviour.
-	RequireBaseMatch bool `json:"require_base_match"`
+	RequireBaseMatch      bool    `json:"require_base_match"`
+	RepoAgentSourceCommit *string `json:"repo_agent_source_commit,omitempty"`
 	// AgentSelection is the run's PERSISTED subagent selection (runs.agent_source /
 	// agent_exclusions), replayed on every claim. Omitted when the run has none.
 	//
@@ -288,7 +289,8 @@ type ClaimPayload struct {
 	// Nil, not an empty selection, when the run never reached a gate — the worker's
 	// absent-default is correct there and must stay reachable. Additive on the wire:
 	// an old worker ignores the key and behaves exactly as it does today.
-	AgentSelection *AgentSelection `json:"agent_selection,omitempty"`
+	AgentSelection       *AgentSelection `json:"agent_selection,omitempty"`
+	RequestedAgentSource *string         `json:"requested_agent_source,omitempty"`
 
 	// Milestones is the run's FROZEN, human-approved milestone list (PRD #122 M1),
 	// decoded from runs.milestones_frozen and replayed on every claim so a resumed
