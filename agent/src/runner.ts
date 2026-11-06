@@ -15715,6 +15715,7 @@ export class RunRunner {
             // The stash is consumed at the adoption point below, after this pre-adoption work. Only the
             // switch control exit keeps it for the next give-up re-run; any other failure drops it.
             if (!(error instanceof CredentialSwitchSignal)) {
+              pendingCheckedApproval?.failStateBarrier?.(error);
               pendingCheckedApproval = undefined;
               pendingCheckedRevise = undefined;
             }

@@ -535,7 +535,7 @@ production defaults (request 3 s, preparation ≤3 s, poll ≤15 s, HTTP 30 s, s
 | Path | Components | Default deadline | Worst case (2 h deadline) |
 |---|---|---|---|
 | APPROVE / automatic REVISE | prepare ≤3 s, submit stage ≤30 s, poll window to the deadline, final transport check ≤3 s | ≈31 min | ≈2 h 1 min (7,236 s) |
-| Checked human gate (timed out, block, gated pass), first gate | the above + 3 s, semantic review ≤60 s, resumed-delivery wait ≤153 s (failure path), `planChangedFiles` ≤600 s, receipt settlement ≤60 s, presentation report ≤422 s, preparation ≤9 s | ≈53 min | ≈2 h 23 min (8,543 s) |
+| Checked human gate (timed out, block, gated pass), first gate | the above + 3 s, semantic review ≤60 s, resumed-delivery wait ≤153 s (failure path), `planChangedFiles` ≤600 s, receipt settlement ≤60 s, presentation report ≤422 s, preparation ≤9 s | ≈53 min (rounded up) | ≈2 h 23 min (8,543 s, rounded up) |
 
 **Open: the gate checkpoint on a re-plan gate.** `prepareGateCheckpoint` runs only when the
 claim carries frozen execution milestones and the candidate's milestones differ from them, so a
@@ -543,7 +543,7 @@ first plan gate never reaches it (the table above). On such a re-plan gate it ru
 reservation still installed, and on Claude its 60 s signal does not bound it: the runner-uid git
 commands in the capture take only the 600 s git timeout, and the bare-repository lock waits and
 the attributed-process reap joins it can reach have no timer at all (a single hung git command
-alone is about 865 s; Codex's capture scope does cap it near 60 s). Under the approved plan an
+alone takes it well past 600 s; Codex's capture scope does cap it near 60 s). Under the approved plan an
 unbounded component is a stop condition, so this step has no stated bound here and awaits an
 owner design decision; no timer was added and no reservation is cancelled.
 

@@ -815,8 +815,9 @@ most of the places that check are not the end of the run:
   fail the run: it waits for the check to settle, then switches. With the
   default 30-minute checker deadline the wait is up to about 31 minutes when
   the check ends in an approve or revise, and up to about 53 minutes when it
-  ends at a first human gate; with the 2-hour maximum, about 2 h 1 min and 2 h 23 min. A human gate on a re-plan whose
-  milestones changed can take longer, with no fixed limit yet.
+  ends at a first human gate; with the 2-hour maximum, about 2 h 1 min and
+  2 h 23 min. A human gate on a re-plan after an approval whose milestones
+  changed can take longer, with no fixed limit yet.
   If the switch cannot complete and the run continues on its current
   credential, an approved plan is kept and not re-checked, an automatic revise
   runs its revision turn, and a checked human gate stays presented with no
