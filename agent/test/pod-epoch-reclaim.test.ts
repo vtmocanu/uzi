@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import { resolve, join } from "node:path";
 import { runPodEpochShadow, readPodEpochProjection, PodEpochSettlementError, EPOCH_RECLAIM_DELETION_ENABLED } from "../src/pod-epoch-reclaim.js";
 import { WorkerClient } from "../src/client.js";
+import { buildPodEpochDeletionDeps } from "../src/main.js";
 import { nullLogger } from "./helpers.js";
 import { daemon, ENABLE_DELETION_FOR_TEST } from "./pod-epoch-reclaim-support.js";
 import type { PodEpochOwnership } from "../src/pod-epoch-lock.js";
@@ -1149,6 +1150,12 @@ test("nothing under agent/src references the deletion override, which only pod-e
   const main = await readFile(join(root, "main.ts"), "utf8");
   assert.ok(!main.includes("enableForTest"));
   const definition = await readFile(join(root, "pod-epoch-reclaim.ts"), "utf8");
+  assert.equal(definition.match(/enableForTest\s*===\s*TEST_ENABLE_DELETION\b/g)?.length, 1,
+    "exactly one comparison of enableForTest against the sentinel");
+  assert.equal(definition.match(/TEST_ENABLE_DELETION\b/g)?.length, 2, "the sentinel is defined once and compared once");
+  const built = buildPodEpochDeletionDeps({ authority: {} as never, runner: { withSourceReservation: async () => undefined },
+    git: {} as never, dockerHost: undefined });
+  assert.equal("enableForTest" in built, false, "the deps object main.ts builds has no enableForTest key");
   assert.equal(definition.match(/export const EPOCH_RECLAIM_DELETION_ENABLED: boolean = false;/g)?.length, 1);
 });
 test("an eligible attested pass with the override deletes present sources, settles missing ones, then finishes before handover", async () => {
@@ -1408,10 +1415,15 @@ test("fatal outcomes throw PodEpochSettlementError, keep EX and never reach the 
   }
 });
 test("shutdown mid-pass starts no new source and leaves the handover to the process exit", async () => {
+  const reads: string[] = [];
   await withDeletion(3, w => {
     const base = w.discard;
     w.discard = (o, path) => { w.parent.abort(); return base(o, path); };
+    const own = w.options.client.getRunOwnership;
+    w.options.client.getRunOwnership = (run, o) => { if (w.spies.begins > 0) reads.push(run); return own(run, o); };
   }, (w, result) => {
+    // The soft stop is checked at the loop top: the second source is neither kept nor read.
+    assert.equal(result.kept_after_refusal, 0); assert.ok(reads.length > 0 && reads.every(run => run === "run0"), "no authority read for the second source: " + reads.join());
     assert.equal(w.spies.proofs.length, 1); assert.equal(result.deleted, 1);
     assert.equal(result.verdict, "partial"); assert.equal(result.reason, "shutdown");
     assert.deepEqual(w.events, ["begin", "finish"]);
@@ -1428,4 +1440,77 @@ test("a path or entry change between the shadow and the recheck keeps the source
     let n = 0;
     w.mutateSource = s => { if (++n > 1) s.sources[0]!.live = true; };
   }, (w, result) => { noMutation(w); assert.equal(result.kept_after_refusal, 1); });
+});
+
+test("an eligible attested pass with zero admitted candidates reports reclaim_complete without opening a scope", async () => {
+  await withDeletion(0, undefined, (w, result) => {
+    noMutation(w);
+    assert.equal(result.verdict, "eligible"); assert.equal(result.reason, "reclaim_complete");
+    assert.equal(result.reclaim_bytes_state, "measured"); assert.equal(w.spies.begins, 0);
+    assert.deepEqual(w.events, ["handover"]);
+  });
+  // A source that is not a candidate (live) leaves admits empty too.
+  await withDeletion(1, w => { w.mutateSource = s => { s.sources[0]!.live = true; }; }, (w, result) => {
+    noMutation(w);
+    assert.equal(result.would_delete, 0); assert.equal(result.kept, 1);
+    assert.equal(result.verdict, "eligible"); assert.equal(result.reason, "reclaim_complete");
+    assert.equal(w.spies.begins, 0); assert.deepEqual(w.events, ["handover"]);
+  });
+});
+test("a takeover whose source use was not ended still counts as deleted, is counted and warns with fixed tokens", async () => {
+  for (const ended of [{ ended: [], kept: ["/tree/0"], endedSlots: [] }, { ended: [], kept: [], endedSlots: [] }]) {
+    const warnings: Array<[string, unknown]> = [];
+    await withDeletion(2, w => {
+      w.options.log = { warn: (message, fields) => { warnings.push([message, fields]); } };
+      const auth = w.options.deletion!.authority as { endSourceUse: unknown };
+      const base = auth.endSourceUse as (p: Iterable<string>, o: unknown) => Promise<unknown>;
+      auth.endSourceUse = async (paths: Iterable<string>, o: unknown) => {
+        const list = [...paths];
+        return list[0] === "/tree/0" ? ended : base(list, o);
+      };
+    }, (_w, result) => {
+      assert.equal(result.deleted, 2, "the delete is not dropped"); assert.equal(result.source_use_not_ended, 1);
+      assert.equal(result.verdict, "eligible"); assert.equal(result.reason, "reclaim_complete");
+      assert.deepEqual(warnings, [["pod epoch reclaim: source use not ended after a takeover", { cause: "source_use_not_ended" }]]);
+    });
+  }
+});
+test("a mid-deletion daemon veto stops the loop with the daemon reason and keeps nothing for the unreached sources", async () => {
+  const d = await daemon();
+  try {
+    const w = deletionWorld(3); w.options.dockerHost = d.host;
+    const inner = w.options.git.inspectRetainedSources;
+    let second = 0;
+    w.options.git.inspectRetainedSources = async o => {
+      // The deletion-phase re-inspect of run1 (its shadow inspection was the first).
+      if (o.selector!.runId === "run1" && ++second === 2) { d.veto(); await tick(); await tick(); }
+      return inner(o);
+    };
+    const result = (await runPodEpochShadow(w.options))!;
+    assert.equal(result.deleted, 1, "run0 was deleted before the veto");
+    assert.equal(result.verdict, "partial"); assert.equal(result.reason, "daemon_event");
+    assert.equal(result.kept_after_refusal, 0, "a veto is not a per-source keep");
+    assert.deepEqual(w.spies.reserved, ["run0"], "no later source reaches the reservation");
+    assert.equal(w.spies.proofs.length, 1);
+  } finally { await d.close(); }
+});
+test("a path observed in two groups with a different bare path or selector is demoted and never deleted", async () => {
+  const variants: Array<[string, { barePath: string; attempt: string }]> = [
+    ["bare path", { barePath: "/bare2", attempt: "attempt" }], ["selector", { barePath: "/bare", attempt: "other" }],
+  ];
+  for (const [label, second] of variants) {
+    await withDeletion(1, w => {
+      w.groups.push({ barePath: second.barePath, selector: { runId: "run0", generation: 1, attempt: second.attempt }, paths: ["/tree/0"] });
+      const inner = w.options.git.inspectRetainedSources;
+      w.options.git.inspectRetainedSources = async o => {
+        const r = await inner(o);
+        for (const src of r.sources) src.barePath = o.barePath!;
+        return r;
+      };
+    }, (w, result) => {
+      noMutation(w);
+      assert.equal(result.would_delete, 0, label); assert.equal(result.deleted, 0, label);
+      assert.equal(result.kept, 1, label); assert.equal(w.spies.journalReads.length, 0, label);
+    });
+  }
 });

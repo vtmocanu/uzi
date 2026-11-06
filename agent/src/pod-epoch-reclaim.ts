@@ -2,7 +2,7 @@ import { countPartialCause, mergePartialCauses, readFailureCause, type PartialCa
 import { constants } from "node:fs";
 import { open } from "node:fs/promises";
 import { release as osRelease } from "node:os";
-import { basename } from "node:path";
+import { basename, resolve as resolvePath } from "node:path";
 import { MaintenanceBudget } from "./maintenance-budget.js";
 import type { inspectPodEpochBootstrap } from "./pod-epoch-bootstrap.js";
 import type { PodEpochOwnership } from "./pod-epoch-lock.js";
@@ -58,14 +58,16 @@ interface Options {
   kernelRelease?: () => string;
   /** M1b deletion dependencies; used only while the activation gate is open. */
   deletion?: PodEpochDeletionDeps;
+  /** Operator log for the deletion phase; every field is a fixed token or a count, never controller text. */
+  log?: { warn(message: string, fields?: Record<string, unknown>): void };
 }
 type Basis = "discard" | "strict_plain";
 interface Candidate { run_id: string; path: string; bytes: number; presence: "present" | "missing"; basis: Basis }
 /** Private per-candidate evidence the deletion phase re-verifies; never logged. */
 interface Admit {
   clonePath: string; barePath: string; selector: RetainedSourceSelector; branch: string;
-  kind: "attempt" | "canonical" | "protected"; descriptor: string; presence: "present" | "missing";
-  protectedDiscard: boolean; parts: number; groupSize: number; bytes: number;
+  kind: "attempt" | "canonical" | "protected"; descriptor: string;
+  protectedDiscard: boolean; parts: number; groupSize: number;
 }
 // Exact crio-crun kernel releases covered by the PRD #3430 audit. Any other release defers
 // with kernel_unaudited; refreshing this list needs a reviewed PRD #3430 audit addendum.
@@ -104,7 +106,9 @@ interface Verdict {
   deleted_bytes: number;
   /** Missing sources settled by metadata only (no bytes). */
   settled: number;
-  /** A source kept before any effect: a coordinator refusal, a failed fresh recheck or a refused reservation. */
+  /** Takeovers whose endSourceUse did not report the slot ended (kept or active). The delete itself still counts. */
+  source_use_not_ended: number;
+  /** A source kept before any delete: a coordinator refusal, a failed fresh recheck or a refused reservation. */
   kept_after_refusal: number;
   /** A settled delete failure (residue): the slot stays retiring + settled_failed for the next epoch. */
   kept_residue: number;
@@ -209,7 +213,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
     authority: { result: "unproven", reason: "not_evaluated" }, evidence_version: null,
     list: [], list_overflow: 0, inventory_overflow: 0, inventory_overflow_exact: false,
     inventory_complete: false, bytes_state: "unknown", evidence_wait_ms: 0, pass_ms: 0,
-    settlement_reserve_ms: 5000, deleted: 0, deleted_bytes: 0, settled: 0, kept_after_refusal: 0, kept_residue: 0,
+    settlement_reserve_ms: 5000, deleted: 0, deleted_bytes: 0, settled: 0, source_use_not_ended: 0, kept_after_refusal: 0, kept_residue: 0,
     kept_protected: 0, kept_unrecoverable_shape: 0, reclaim_bytes_state: "unknown",
   };
   // Set once the deletion phase opened its reclaim scope; settled and finished before native handover.
@@ -456,15 +460,18 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
           }
           if (candidate && source.epochJournalExtraFields) extraFieldPaths.add(part.clonePath);
           const previous = candidates.get(part.clonePath);
-          if (!candidate || refused.has(part.clonePath) || (previous && (previous.presence !== candidate.presence || previous.run_id !== candidate.run_id ||
+          const priorAdmit = admits.get(part.clonePath);
+          if (!candidate || refused.has(part.clonePath) || (priorAdmit && (priorAdmit.barePath !== group.barePath ||
+              priorAdmit.selector.runId !== group.selector.runId ||
+              priorAdmit.selector.generation !== group.selector.generation || priorAdmit.selector.attempt !== group.selector.attempt)) || (previous && (previous.presence !== candidate.presence || previous.run_id !== candidate.run_id ||
               previous.basis !== candidate.basis || previous.bytes !== candidate.bytes))) {
             candidates.delete(part.clonePath); admits.delete(part.clonePath); refused.add(part.clonePath);
           } else {
             candidates.set(part.clonePath, candidate);
             admits.set(part.clonePath, { clonePath: part.clonePath, barePath: group.barePath, selector: group.selector,
-              branch: source.branch, kind: source.kind, descriptor: source.descriptor, presence: candidate.presence,
+              branch: source.branch, kind: source.kind, descriptor: source.descriptor,
               protectedDiscard: source.disposition?.kind === "local_protected_discard",
-              parts: source.sources.length, groupSize: group.paths.length, bytes: candidate.bytes });
+              parts: source.sources.length, groupSize: group.paths.length });
           }
         }
       }
@@ -483,12 +490,14 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
     const deps = options.deletion;
     if (deps && (EPOCH_RECLAIM_DELETION_ENABLED || deps.enableForTest === TEST_ENABLE_DELETION) &&
         result.verdict === "eligible" && result.authority.result === "attested" &&
-        !invalid && !controller.signal.aborted && typeof ownership.beginReclaim === "function" && admits.size > 0) {
-      const scope = ownership.beginReclaim();
+        !invalid && !controller.signal.aborted && typeof ownership.beginReclaim === "function") {
+      // With no admitted candidate nothing can be mutated, so no native scope is opened or finished; the pass
+      // still reports reclaim_complete. Every loop body below runs only when admits is non-empty.
+      const scope = admits.size > 0 ? ownership.beginReclaim() : undefined;
       reclaimScope = scope;
       // Pending children or a stop latch are never settled by a later step: fail closed with EX kept.
       const assertSettled = () => {
-        if (scope.stopped() || scope.pendingMutations > 0) { fatal = true; throw new PodEpochSettlementError(); }
+        if (scope && (scope.stopped() || scope.pendingMutations > 0)) { fatal = true; throw new PodEpochSettlementError(); }
       };
       const deadlineAt = () => Date.now() + Math.max(0, hardPass - 5000 - now());
       // Fresh lifecycle then holds; undefined keeps the source. Never throws: a failed, aborted or
@@ -518,7 +527,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
         if (admit.kind !== "attempt" || admit.parts !== 1 || admit.groupSize !== 1) { result.kept_unrecoverable_shape++; continue; }
         const runId = admit.selector.runId;
         let step: { result: RetainedDiscardResult } | "keep" | "shape" | undefined;
-        let effects = false;
+        let effects = false, notEnded = false;
         try {
           // 2. fresh lifecycle and holds with the deletion-side zero rule.
           const first = await owned(() => readAuthority(runId), hardPass, true);
@@ -535,7 +544,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
           const only = inspected.sources.length === 1 ? inspected.sources[0]! : undefined;
           const plain = only?.disposition?.kind === "local_discard" || only?.epochSettlement?.disposition.kind === "local_discard";
           if (!only || inspected.partial || inspected.unreadable !== 0 || only.runId !== runId || only.barePath !== admit.barePath ||
-              only.kind !== "attempt" || only.descriptor !== admit.descriptor || only.presence !== admit.presence ||
+              only.kind !== "attempt" || only.descriptor !== admit.descriptor || only.presence !== candidate.presence ||
               only.sources.length !== 1 || only.sources[0]!.clonePath !== clonePath || only.sources[0]!.live ||
               only.localRecords.length !== 0 || only.holds.state !== "read" || only.holds.ids.length !== 0 || !plain) {
             refusal(); continue;
@@ -558,7 +567,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
                 check();
               };
               const proof = deps.git.createEpochDiscardProof({
-                decision: { eligible: true, attested: true }, scope, selector: admit.selector, barePath: admit.barePath,
+                decision: { eligible: true, attested: true }, scope: scope!, selector: admit.selector, barePath: admit.barePath,
                 paths: [clonePath], confirm: only.descriptor, expectedRawJournal: raw, checkLive: live,
                 beforeEffect: async () => { check(); entry(); }, signal: controller.signal, deadline: deadlineAt(),
               });
@@ -567,7 +576,10 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
                 selector: admit.selector, confirm: only.descriptor, holds: fresh.holds, lifecycle: fresh.lifecycle,
                 isLivePath: () => false, quiesce: deps.quiesce, barePath: admit.barePath, epochProof: proof,
               });
-              if (discarded.tookOver) await deps.authority.endSourceUse([clonePath], { skipFlightOwned: true });
+              if (discarded.tookOver) {
+                const end = await deps.authority.endSourceUse([clonePath], { skipFlightOwned: true });
+                notEnded = !end?.ended?.includes(resolvePath(clonePath));
+              }
               return { result: discarded };
             })), hardPass, true);
           }
@@ -575,7 +587,13 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
           if (error instanceof PodEpochSettlementError) throw error;
           // After a discard began, a thrown error leaves the outcome unproven: EX is kept.
           if (effects) { fatal = true; throw new PodEpochSettlementError(); }
+          // A daemon veto or an invalidated pass ends the whole pass with its own reason; it is not a per-source keep.
+          if (error instanceof PodEpochDaemonError || invalid) throw error;
           step = "keep";
+        }
+        if (notEnded) {
+          result.source_use_not_ended++;
+          options.log?.warn("pod epoch reclaim: source use not ended after a takeover", { cause: "source_use_not_ended" });
         }
         // 6. classify only AFTER the reservation and the transaction are released.
         assertSettled();
@@ -584,7 +602,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
         const outcome = step.result;
         if (outcome.kind === "done") {
           const removed = outcome.sources.length === 1 ? outcome.sources[0]!.outcome : undefined;
-          if (removed === "removed") { result.deleted++; result.deleted_bytes += admit.bytes; }
+          if (removed === "removed") { result.deleted++; result.deleted_bytes += candidate.bytes; }
           else if (removed === "missing") result.settled++;
           else { fatal = true; throw new PodEpochSettlementError(); }
         } else if (outcome.kind === "refused") refusal();
