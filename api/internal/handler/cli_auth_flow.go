@@ -241,6 +241,19 @@ func (h *Handler) CLIAuthPoll(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op after a successful Commit; the roll-back-on-mismatch path relies on it
 	qtx := h.q.WithTx(tx)
 
+	// Lock the request's user row BEFORE the claim: users -> cli_auth_requests, the same
+	// order as an account-reset redeem (users FOR UPDATE, then deny the user's approved
+	// requests). Claiming first would hold the request row while CreateCLIToken's FK
+	// check waits on users, deadlocking (40P01) against the redeem. A pending or unknown
+	// request has no user to lock (ErrNoRows) and falls through to the claim as before.
+	lockedUser, err := qtx.LockCLIAuthRequestUserKeyShare(ctx, id)
+	locked := err == nil
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		slog.Error("cli auth poll: lock user", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
 	claimed, err := qtx.ClaimCLIAuthRequest(ctx, id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// No approved-and-unexpired row: report the poll status (pending → keep polling,
@@ -276,6 +289,21 @@ func (h *Handler) CLIAuthPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := uuid.UUID(claimed.UserID.Bytes)
+	if !locked {
+		// Approved between the lock read (no user yet) and the claim: this tx holds the
+		// request row without the users row, the deadlock-prone order. Roll the claim back
+		// (the row returns to 'approved') and report pending; the next poll locks first.
+		_ = tx.Rollback(ctx)
+		h.writeCLIPollStatus(w, ctx, id)
+		return
+	}
+	if userID != lockedUser {
+		// user_id never changes once approved, so this cannot happen; refuse rather than
+		// mint for a user whose row this tx did not lock.
+		slog.Error("cli auth poll: claimed user differs from locked user", "request_id", id)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
 	user, err := qtx.GetUserByID(ctx, userID)
 	if err != nil {
 		slog.Error("cli auth poll: load user", "error", err)

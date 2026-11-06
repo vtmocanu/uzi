@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -765,6 +766,84 @@ func TestResetLinkRedeemPasswordBoundsLiveDB(t *testing.T) {
 		}
 	}
 	f.assertLive(t, token)
+}
+
+// A CLI poll of an approved request racing a reset redeem must not deadlock. The redeem
+// holds users(T) FOR UPDATE and then denies T's approved requests; the poll must take its
+// users lock before claiming the request row (users -> cli_auth_requests), or it holds
+// the request while CreateCLIToken's FK check waits on users and the deny waits on the
+// request (40P01). Simulated with an open redeem-shaped transaction.
+func TestCLIPollRacingResetRedeemDoesNotDeadlockLiveDB(t *testing.T) {
+	f := newResetFixture(t)
+	ctx := context.Background()
+	target := f.target(t)
+	oldJWT := cliMintJWT(t, f.pool, target)
+	verifier := "verifier-" + uuid.NewString()
+	reqID, code := cliStart(t, f.router, s256Challenge(verifier), "poll racing reset")
+	if rec := cookieReq(t, f.router, http.MethodPost, "/api/auth/cli/approve", oldJWT,
+		fmt.Sprintf(`{"request_id":%q,"user_code":%q}`, reqID, code)); rec.Code != http.StatusOK {
+		t.Fatalf("approve = %d\n%s", rec.Code, rec.Body.String())
+	}
+
+	tx, err := f.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after Commit
+	if _, err := tx.Exec(ctx, `SELECT id FROM users WHERE id=$1 FOR UPDATE`, target); err != nil {
+		t.Fatal(err)
+	}
+	res := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		res <- cliPostJSON(f.router, "/api/auth/cli/poll", fmt.Sprintf(`{"request_id":%q,"verifier":%q}`, reqID, verifier))
+	}()
+	// Wait until the poll is parked on a lock rather than guessing with a sleep.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var waiting int
+		if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+		    WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid <> pg_backend_pid()`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting > 0 {
+			break
+		}
+		select {
+		case rec := <-res:
+			t.Fatalf("poll finished (%d) while the redeem-shaped transaction held the user row", rec.Code)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("poll never blocked on a lock")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if _, err := tx.Exec(ctx, `UPDATE cli_auth_requests SET status = 'denied' WHERE user_id = $1 AND status = 'approved'`, target); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "40P01" {
+			t.Fatalf("redeem deny deadlocked against the CLI poll: %v", err)
+		}
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case rec := <-res:
+		if rec.Code == http.StatusOK || rec.Code >= 500 {
+			t.Fatalf("poll = %d, want a terminal non-minting status\n%s", rec.Code, rec.Body.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("poll never completed")
+	}
+	var status string
+	if err := f.pool.QueryRow(ctx, `SELECT status FROM cli_auth_requests WHERE id=$1`, reqID).Scan(&status); err != nil || status != "denied" {
+		t.Fatalf("request status = %q (%v), want denied", status, err)
+	}
+	if n := cliCountTokens(t, f.pool, target); n != 0 {
+		t.Fatalf("%d CLI tokens exist for the reset user, want 0", n)
+	}
 }
 
 // A CLI approve in flight while a reset commits: the approve holds the row FOR SHARE
