@@ -811,6 +811,16 @@ most of the places that check are not the end of the run:
   cleared, the run normally continues on the old credential in place (its
   clone and session are kept); otherwise it is stopped and left to be
   requeued rather than continuing on uncertain ground.
+- A credential switch requested during an automatic plan cross-check does not
+  fail the run: it waits for the check to settle, then switches. With the
+  default 30-minute checker deadline the wait is up to about 31 minutes when
+  the check ends in an approve or revise, and up to about 56 minutes when it
+  ends at a human gate; with the 2-hour maximum, about 2 h 1 min and 2 h 26 min.
+  After the wait, an approved plan is kept and not re-checked, an automatic
+  revise runs its revision turn, and a checked human gate stays presented with
+  no republish. If the switch releases the run to another claim, that claim
+  re-presents the plan. A cancel or other failure during the wait keeps its
+  normal outcome ([ADR-2149](../adr/2149-cross-check.md)).
 - A Claude recovery capture that cannot prove the clone stopped is retried a
   bounded number of times; if proof still fails, the run fails the same way
   finalize does (see below), with the clone kept. Codex ordinary recovery can
