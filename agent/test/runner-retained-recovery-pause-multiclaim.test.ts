@@ -1,4 +1,4 @@
-import { it } from "node:test";
+import { afterEach, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -6,6 +6,8 @@ import { execFileSync } from "node:child_process";
 import type { Readable } from "node:stream";
 import type { ExecutorFactory } from "../src/runner.js";
 import type { RunContext } from "../src/executor.js";
+import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
+import { SummaryRunner } from "../src/summary-runner.js";
 import { noProofReseed, recordingLogger } from "./helpers.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 
@@ -17,7 +19,9 @@ import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness,
 // nonterminal departure without a confirmed park. Explicit owner Resume is a separate action the
 // driver never calls on its own.
 
-installHarness();
+let transportHook: typeof fetch | undefined;
+installHarness({ fetch: (input, init) => (transportHook ?? globalThis.fetch)(input, init) });
+afterEach(() => { transportHook = undefined; });
 
 const REQUEUE_CAP = 3;
 const RECOVERY_PARKS = new Set(["recovery_wait", "limit_wait", "pool_wait"]);
@@ -191,6 +195,10 @@ interface Run {
   claims: any[];
   models: number;
   reserves: number;
+  prepares: number;
+  sdkCalls: number;
+  summaryCalls: number;
+  ownershipReads: number;
   publishes: number;
   pauseParks: number;
   fired: number;
@@ -208,6 +216,9 @@ interface RunOptions {
   /** Wrap the worker's state report; throwing means the report never reached the server. */
   report?: (body: any, original: () => Promise<any>) => Promise<any>;
   adoptionFailure?: boolean;
+  /** #3994 transport rejection after adoption, with the owner pause delivered in its retry wait. */
+  transientProbe?: boolean;
+  production?: boolean;
 }
 
 /** Seed a retained clone for a claim at generation 2 and build the runner over it. */
@@ -229,12 +240,21 @@ async function setup(opts: RunOptions): Promise<Run> {
   models.set(first.run_id, model);
   if (opts.pause) model.requestPause("now");
 
-  const run = { model, bare, claims: [first], models: 0, reserves: 0, publishes: 0, pauseParks: 0, fired: 0 } as unknown as Run;
+  const run = { model, bare, claims: [first], models: 0, reserves: 0, prepares: 0, sdkCalls: 0,
+    summaryCalls: 0, ownershipReads: 0, publishes: 0, pauseParks: 0, fired: 0 } as unknown as Run;
   const logs = recordingLogger();
-  const makeExecutor: ExecutorFactory = runId => ({
-    homeDir: path.join(homeDir, runId),
-    executor: { run: async (_ctx: RunContext) => { run.models++; throw new Error("fixture ends the model run"); } } as any,
-  });
+  const makeExecutor: ExecutorFactory = runId => {
+    const homeForRun = path.join(homeDir, runId);
+    if (opts.production) {
+      const summaryQuery: SdkQueryFn = () => { run.summaryCalls++; throw new Error("summary must not start"); };
+      const queryFn: SdkQueryFn = () => { run.sdkCalls++; throw new Error("provider must not start"); };
+      return { homeDir: homeForRun, executor: new SdkExecutor(logs.logger, homeForRun, {
+        queryFn, client, summaryRunner: new SummaryRunner(logs.logger, { queryFn: summaryQuery, homeRoot: homeForRun }),
+      }) };
+    }
+    return { homeDir: homeForRun,
+      executor: { run: async (_ctx: RunContext) => { run.models++; throw new Error("fixture ends the model run"); } } as any };
+  };
   const r = runnerWith(makeExecutor, fakeGitlab().gitlab, undefined, logs.logger, { recoveryRetryMs: 1 });
   const phaseClone = (r as any).phaseClone.bind(r);
   (r as any).phaseClone = async (...args: any[]) => { run.flight = args[1]; return phaseClone(...args); };
@@ -244,13 +264,46 @@ async function setup(opts: RunOptions): Promise<Run> {
   git.reserveRecoveryIteration = async (...args) => {
     // Count only this run's reservations (a prior run in the same test leaves its wrapper in the chain).
     if (args[3] && (args[3] as any).runId === first.run_id) run.reserves++;
-    if (opts.pause && run.fired === 0 && args[3] && (args[3] as any).runId === first.run_id) {
+    if (opts.pause && !opts.transientProbe && run.fired === 0 && args[3] && (args[3] as any).runId === first.run_id) {
       run.fired++;
       // The owner pause reaches the live flight through the real steering dispatch, inside recovery.
       run.flight.steering.route("pause", "now", 1, false, undefined);
     }
     return reserve(...args);
   };
+  if (opts.transientProbe) {
+    let adopted = false, faulted = false;
+    const prepare = git.prepareRecoverySuccessor.bind(git);
+    git.prepareRecoverySuccessor = async (...args) => {
+      const successor = await prepare(...args);
+      if (args[3].runId === first.run_id) {
+        run.prepares++;
+        adopted = true;
+      }
+      return successor;
+    };
+    const realFetch = globalThis.fetch;
+    transportHook = async (input, init) => {
+      if (adopted && (init?.method ?? "GET") === "GET" && String(input).endsWith(`/runs/${first.run_id}/ownership`)) {
+        run.ownershipReads++;
+        if (!faulted) {
+          faulted = true;
+          // The real WorkerClient marks the transport rejection; no runner/classifier seam is replaced.
+          throw new TypeError("fetch failed", { cause: { code: "ECONNRESET" } });
+        }
+        adopted = false; // Subsequent ownership checks belong to pause settlement, outside this retry.
+      }
+      return realFetch(input, init);
+    };
+    const retry = (r as any).waitRecoveryRetry.bind(r);
+    (r as any).waitRecoveryRetry = async (...args: any[]) => {
+      if (adopted && faulted && opts.pause && run.fired === 0) {
+        run.fired++;
+        run.flight.steering.route("pause", "now", 1, false, undefined);
+      }
+      return retry(...args);
+    };
+  }
   if (opts.adoptionFailure) git.prepareRecoverySuccessor = async () => { throw new Error("successor adoption refused"); };
   client.publishCheckpoint = async (_run, _tip, pack) => {
     await drain(pack);
@@ -302,6 +355,33 @@ function allowance(run: Run, branch: string): string {
 }
 
 const branchFor = (iid: number) => `agent/issue-${iid}`;
+
+it("combined #3994/#3995: post-adoption transport retry settles an owner pause in one claim without a provider turn", async () => {
+  installServerModel();
+  const control = await setup({ iid: 3996, transientProbe: true });
+  await drive(control);
+  assert.equal(control.models, 1, "the fault-only control completes the retry");
+  assert.equal(control.prepares, 1);
+  assert.equal(control.ownershipReads, 2);
+
+  const run = await setup({ iid: 3995, transientProbe: true, pause: true, production: true });
+  await drive(run);
+  assert.equal(run.fired, 1, "the owner pause was delivered inside the transient retry wait");
+  assert.equal(run.claims.length, 1, "the owner pause must not cause a second claim");
+  assert.equal(run.model.requeues, 0, "the owner pause must not consume automatic requeue allowance");
+  assert.equal(run.ownershipReads, 2, "the failed transport read is retried before pause settlement");
+  assert.equal(run.logs.lines.filter(line => line.msg === "retained post-adoption ownership read transient; retrying").length, 1);
+  assert.equal(run.model.requeueCount, 0);
+  assert.equal(run.model.status, "paused");
+  assert.equal(run.model.pausedApplied, 1, "one server-confirmed pause");
+  assert.equal(run.flight.parked, true);
+  assert.equal(run.pauseParks, 1);
+  assert.equal(run.reserves, control.reserves);
+  assert.equal(run.prepares, 1, "the same adopted successor is retained throughout the retry");
+  assert.equal(allowance(run, branchFor(3995)), allowance(control, branchFor(3996)));
+  assert.equal(run.sdkCalls, 0);
+  assert.equal(run.summaryCalls, 0);
+});
 
 it("control: a run with no pause reaches the model once with one recovery reservation", async () => {
   installServerModel();
