@@ -80,6 +80,10 @@ re-inspects before retrying; the digest changes after any mutation. The 5 s
 channel close/shutdown wait neither establishes settlement nor releases
 ownership.
 
+## Amendment (#2969): predecessor record cleanup deferral
+
+Predecessor settlement (see the [ADR-1296 amendment](1296-durable-run-recovery.md#amendment-2969-predecessor-guarded-hold-settlement-is-built-and-disabled-in-production)) adds no cleanup authority. If a predecessor FINAL is ever ACKed while a later generation executes, the older generation's local records are not retired in that pass: they are retired by the ordinary `resumeInventory` / `forgetGenerationWithinCycle` path after the flight, and while the run executes the record is protected as `source_protected`. The covering-ACK rule above and the C1b/C2 pin boundaries ([ADR-3591](3591-prerequisite-closure.md)) are unchanged, and a pin still authorizes no local retirement. Custody accounting ([ADR-2445](2445-custody-admission-accounting.md)) and merged-predecessor discard ([ADR-2506](2506-merged-predecessor-discard.md)) are untouched. The pass is disabled in production, so no predecessor record is currently affected.
+
 ## Proposed (not accepted): Case B local-record disposition (#3885)
 
 Not accepted and not implemented. Today a generation in Case B refuses
