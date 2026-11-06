@@ -107,8 +107,9 @@ report `no`.
   boundary value is taken synchronously inside the helper, so it is exact for discovery.
 - **Parent-observed discovery columns are polled, not synchronous.** The parent's tree-RSS
   discovery peak and its cgroup `memory.peak` at the boundary are taken when the parent first
-  reads the helper's boundary snapshot. It polls every 10 ms, so they can include a few ms of
-  post-discovery work and are upper bounds for discovery.
+  reads the helper's boundary snapshot. The lag is up to one 10 ms poll plus the parent's
+  scheduling delay, which shares the CPU with the helper at 1 CPU. They can therefore include
+  early post-discovery work, such as the first capture spawn, and are upper bounds for discovery.
 - **tree RSS:** the sum of VmRSS over the helper and its descendants, sampled every 10 ms. It
   can miss short peaks, and it double-counts shared pages.
 - **cgroup peak:** `memory.peak` at the boundary and at the end. It is the authoritative
