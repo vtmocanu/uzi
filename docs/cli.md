@@ -2951,10 +2951,11 @@ counted park holds for owner Resume/Cancel (#3969). `0` means unlimited timed
 parks, and preventive parks stay uncounted and timed. Owner Resume queues one
 ordinary attempt without resetting counts or unrelated budgets; admission may
 refuse it and a subsequent counted park reholds. Clients send one bodyless
-`POST /api/runs/{id}/resume` per owner action, without automatic retry. Duplicate
+`POST /api/runs/{id}/resume-now` per owner action, without automatic retry. Duplicate
 requests are idempotent for the current hold only: the bodyless request has no
 durable binding to the observed hold, so a delayed duplicate crossing a later
-claim/execution/counted park is not durably fenced. No concrete single-action
+hold after another claim and counted park is not durably fenced. That park can
+happen during preflight before model execution starts. No concrete single-action
 replay has been found. See [Resuming a disk hold](run-recovery-wait.md#resuming-a-disk-hold)
 for wall accounting, rollout and custody boundaries.
 

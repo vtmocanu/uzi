@@ -77,7 +77,7 @@ timed counted parks. Preventive parks stay uncounted and timed. Stored
 `fail_origin=data_volume_full` is retained for historical read compatibility only.
 
 Authenticated owner Resume, via the existing bodyless
-`POST /api/runs/{id}/resume`, queues one ordinary attempt. It resets neither
+`POST /api/runs/{id}/resume-now`, queues one ordinary attempt. It resets neither
 counts nor recovery episodes or other grants; admission can refuse the attempt,
 and a subsequent counted park reholds. Resume banks held time after execution
 has started and retains `started_at` and the remaining wall allowance; an
@@ -89,8 +89,8 @@ invariant.
 
 Resume idempotence covers the current hold only. A bodyless request has no
 durable identity binding to the observed hold; a delayed duplicate crossing a
-later hold is not durably fenced. A later hold requires a new claim, execution
-and counted park. Clients issue one POST per owner action without automatic
+later hold is not durably fenced. A later hold requires another claim and counted park;
+that park can occur during preflight, before model execution starts. Clients issue one POST per owner action without automatic
 retry; no concrete single-action replay has been found. This does not establish
 a durable replay fence. The enforcing boundaries are the
 [locked park transaction](../api/internal/workersvc/diskpark.go), the

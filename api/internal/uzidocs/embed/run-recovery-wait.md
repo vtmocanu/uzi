@@ -978,7 +978,7 @@ exponential backoff as an empty-turn park (`RUN_RECOVERY_PARK_BASE` up to
 ### Resuming a disk hold
 
 The authenticated run owner can **Resume** (`uzi run resume <id>` or bodyless
-`POST /api/runs/{id}/resume`) or **Cancel**. Resume queues one ordinary attempt;
+`POST /api/runs/{id}/resume-now`) or **Cancel**. Resume queues one ordinary attempt;
 it does not reset the disk count, custody, worker/session affinity, recovery
 episodes or other budgets. Admission may still refuse execution because of disk
 pressure, cooldown, cordon, custody or capacity. A later counted disk park reholds;
@@ -990,8 +990,9 @@ or Resume race once its stop verdict is recorded.
 Idempotence is limited to the current hold: concurrent/duplicate requests cannot
 queue that same hold twice. The bodyless request has no durable identity binding
 to the hold the owner observed. A delayed duplicate crossing a later hold is not
-durably fenced. That later hold requires a new claim, execution and counted park;
-clients send one POST per owner action and do not automatically retry it. No
+durably fenced. That later hold requires another claim and counted park, which can happen
+during preflight before model execution starts. Clients send one POST per owner
+action and do not automatically retry it. No
 concrete single-action replay has been found; this is not a durable replay fence.
 
 On compatible serving APIs, timer, credential and generic promotion cannot wake
