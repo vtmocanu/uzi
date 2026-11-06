@@ -315,9 +315,9 @@ it("a measurement directory-close failure is partial rather than a complete byte
   assert.equal(result.sources[0]!.allocatedBytes, null);
 });
 
-it("the production 8 MiB epoch output cap refuses a bare while operator inspection stays compatible", async () => {
+it("the production 16 MiB epoch output cap (R9) refuses a bare while operator inspection stays compatible", async () => {
   attempts(1);
-  fs.appendFileSync(path.join(bare, "config"), "\n[epoch]\n\tpayload = " + "x".repeat(8 * 1024 * 1024 + 1) + "\n");
+  fs.appendFileSync(path.join(bare, "config"), "\n[epoch]\n\tpayload = " + "x".repeat(16 * 1024 * 1024 + 1) + "\n");
   const result = await cache.discoverEpochRetainedSources({ deadline: Date.now() + 90_000 });
   assert.equal(result.inventoryComplete, false);
   assert.equal(result.groups.length, 0);
