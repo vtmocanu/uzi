@@ -811,6 +811,28 @@ most of the places that check are not the end of the run:
   cleared, the run normally continues on the old credential in place (its
   clone and session are kept); otherwise it is stopped and left to be
   requeued rather than continuing on uncertain ground.
+- A credential switch requested during an automatic plan cross-check does not
+  fail the run: it waits for the check to settle, then switches. With the
+  default 30-minute checker deadline the wait is up to about 31 minutes when
+  the check ends in an approve or revise, and up to about 53 minutes when it
+  ends at a first human gate; with the 2-hour maximum, about 2 h 1 min and
+  2 h 23 min. A human gate on a re-plan after an approval whose milestones
+  changed can take longer, with no fixed limit yet.
+  If the switch cannot complete and the run continues on its current
+  credential, an approved plan is kept and not re-checked, an automatic revise
+  runs its revision turn, and a checked human gate stays presented with no
+  republish. If the switch releases the run to another claim, that claim
+  re-presents the plan for human approval after an approve or a human gate,
+  and continues with the next checker round after an automatic revise. A cancel or other failure during the wait keeps its
+  normal outcome ([ADR-2149](../adr/2149-cross-check.md)).
+  **Known limit:** while the switch is pending, the server holds back an owner
+  **Cancel** pressed during this wait. It takes effect only once the check has
+  settled and the switch is released or given up (after a release, at the
+  next claim), so within the same bounds as the wait above, and with no fixed
+  limit on a re-plan gate after an approval whose milestones changed. Until then the
+  plan checker may keep running to its verdict or deadline. Pressing Cancel
+  again after the switch releases the run takes effect at once. Prompt
+  Cancel here is tracked in #3974.
 - A Claude recovery capture that cannot prove the clone stopped is retried a
   bounded number of times; if proof still fails, the run fails the same way
   finalize does (see below), with the clone kept. Codex ordinary recovery can

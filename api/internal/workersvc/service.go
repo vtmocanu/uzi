@@ -324,7 +324,8 @@ var (
 	// ErrInvalidSelection covers both PRD #37 payloads: a worker-reported repo
 	// agent roster that breaks a cap, and a browser-submitted agent selection that
 	// names an agent the run does not have. Both map to 400.
-	ErrInvalidSelection = errors.New("invalid agent selection")
+	ErrInvalidSelection        = errors.New("invalid agent selection")
+	ErrRepoAgentSourceConflict = errors.New("the run already records a different repo-agent source revision")
 	// ErrCapabilityUnmet is the sentinel for the PRD #84 M4 4c approval gate: a plan being
 	// approved requires capabilities its OWNING worker cannot satisfy, so the approve is
 	// blocked → 409. It is carried by a *CapabilityUnmetError, which names the unmet set for
@@ -425,8 +426,14 @@ func (e *CapabilityUnmetError) Unwrap() error { return ErrCapabilityUnmet }
 // delete (PRD #1296 M4, D3), so the handler/CLI (M4b) can name how many captures a
 // forced discard would destroy. It unwraps to ErrWorkerHasCustody, so the handler both
 // matches the sentinel (→ 409) and surfaces the specific count via err.Error(). Same
-// shape as CapabilityUnmetError.
-type WorkerHasCustodyError struct{ Holds int64 }
+// shape as CapabilityUnmetError. List (#3921) names up to 10 of the blocking holds, oldest
+// first, so the operator can find the runs to recover or discard; it may be shorter than
+// Holds (cap, or holds released between the count and the listing) and Holds stays the
+// authoritative total. Error() is unchanged.
+type WorkerHasCustodyError struct {
+	Holds int64
+	List  []store.ListOpenCustodyHoldsForWorkerRow
+}
 
 func (e *WorkerHasCustodyError) Error() string {
 	return fmt.Sprintf("%s (%d custody hold(s) still open)", ErrWorkerHasCustody.Error(), e.Holds)
@@ -585,6 +592,9 @@ type Store interface {
 	ListActiveRunsAll(ctx context.Context, backgroundGraceCutoff pgtype.Timestamptz) ([]store.ListActiveRunsAllRow, error)
 	ListAllWorkers(ctx context.Context) ([]store.ListAllWorkersRow, error)
 	GetRunOwnedByWorker(ctx context.Context, arg store.GetRunOwnedByWorkerParams) (store.Run, error)
+	// GetRunOwnershipByWorker is RunOwnership's read: GetRunOwnedByWorker's row plus the
+	// held-seam cancellation_requested signal (issues #3860, #3937). Required, never optional.
+	GetRunOwnershipByWorker(ctx context.Context, arg store.GetRunOwnershipByWorkerParams) (store.GetRunOwnershipByWorkerRow, error)
 	// CountRunMessagesThrough counts the stored message seqs in [1..through] for a run, the
 	// terminal fence's contiguity probe (PRD #1391 Run B M3c, D3).
 	CountRunMessagesThrough(ctx context.Context, arg store.CountRunMessagesThroughParams) (int32, error)
@@ -720,6 +730,9 @@ type Store interface {
 	// CountOpenCustodyHoldsForWorker backs the DeleteWorker custody guard.
 	ListReleasableCustodyHolds(ctx context.Context) ([]store.ListReleasableCustodyHoldsRow, error)
 	CountOpenCustodyHoldsForWorker(ctx context.Context, arg store.CountOpenCustodyHoldsForWorkerParams) (int64, error)
+	// ListOpenCustodyHoldsForWorker names (capped) the holds that count covers, for the
+	// DeleteWorker 409 body (#3921).
+	ListOpenCustodyHoldsForWorker(ctx context.Context, arg store.ListOpenCustodyHoldsForWorkerParams) ([]store.ListOpenCustodyHoldsForWorkerRow, error)
 	// Run judge (PRD #46 M3): terminal-funnel enqueue, judge-run-scoped trace/review
 	// authz, the command-not-found scan input, and the review upsert.
 	GetUserByID(ctx context.Context, id uuid.UUID) (store.User, error)
@@ -956,6 +969,7 @@ type Store interface {
 	// carries no attestation: running -> paused with hold_reason='base_attestation_missing',
 	// fenced to this worker's live claim generation. An owner-only exit; nothing automatic leaves it.
 	SetRunBaseAttestationHold(ctx context.Context, arg store.SetRunBaseAttestationHoldParams) (store.Run, error)
+	SetRunRepoAgentSourceHold(ctx context.Context, arg store.SetRunRepoAgentSourceHoldParams) (store.Run, error)
 	ResumePausedRun(ctx context.Context, arg store.ResumePausedRunParams) (store.ResumePausedRunRow, error)
 	// PRD #1732 D14: the credential_disabled park writer (exact undelivered claim), and the
 	// promoter's two keyset worklists (one owner's held runs; owners with any held run).
@@ -1059,7 +1073,13 @@ type Store interface {
 	UpdateRunLastSeq(ctx context.Context, arg store.UpdateRunLastSeqParams) (int64, error)
 
 	// Sweeper + register-time orphan recovery.
-	SweepClaimedNeverStarted(ctx context.Context, cutoff pgtype.Timestamptz) ([]store.SweepClaimedNeverStartedRow, error)
+	// SweepClaimedNeverStartedCohort (issue #3859) runs the claimed-never-started passes in ONE
+	// transaction: charge (or park at the cap) a witnessed retained-custody departure, park an
+	// unwitnessed continuation whose witness window passed, then reset the rest uncharged.
+	SweepClaimedNeverStartedCohort(ctx context.Context, arg store.SweepClaimedNeverStartedCohortParams) (store.SweepClaimedNeverStartedCohortResult, error)
+	// RecordRunRegistrationEvidence (issue #3859) stores the worker's registration witness from
+	// its first running report. It runs BEFORE SetRunRunning and does not depend on that write.
+	RecordRunRegistrationEvidence(ctx context.Context, arg store.RecordRunRegistrationEvidenceParams) (int64, error)
 	// SweepTaskNeverDispatched terminalizes a kind='task' (handoff) run left queued with
 	// dispatched_at NULL past the dispatch grace window (issue #1367): the CLI never landed
 	// its push/dispatch, so ClaimRun never offers it and no other sweep touches it. Server-
@@ -1413,9 +1433,10 @@ type Store interface {
 	// Per-user judge model lanes (PRD #69 M2, PRD #3245): read at judge-claim assembly,
 	// keyed on the run owner. NULL ⇒ inherit the instance value for that harness.
 	GetUserJudgeModels(ctx context.Context, id uuid.UUID) (store.GetUserJudgeModelsRow, error)
-	// Per-user run-summary model override (PRD #362 M2): read at ISSUE-run claim
-	// assembly, keyed on the run owner. NULL ⇒ inherit the instance summary_model.
-	GetUserSummaryModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
+	// Per-user run-summary model overrides, Claude lane (PRD #362 M2) and Codex lane
+	// (PRD #3248): read at ISSUE-run claim assembly, keyed on the run owner. NULL ⇒
+	// inherit the instance value for that harness.
+	GetUserSummaryModels(ctx context.Context, id uuid.UUID) (store.GetUserSummaryModelsRow, error)
 	// ListClaimAgentTemplates resolves template allocations for the run owner
 	// (PRD #18 M7): only the builtin/global defaults ± the owner's overlay + the
 	// owner's own allocated user templates ride the claim, not every template.
@@ -1656,8 +1677,8 @@ type Params struct {
 	// default lives in config.go where the env is read.
 	RunForgeUnreachableMaxParks int
 	// RunDiskParkMax (PRD #1809 M5, D6), mirrored from config (UZI_RUN_DISK_PARK_MAX). The
-	// DATA-VOLUME-FULL park's lifetime cap: parkDataVolumeFull fails the run with the
-	// server-derived fail_origin='data_volume_full' instead of parking when a COUNTED park would
+	// DATA-VOLUME-FULL park's lifetime cap: parkDataVolumeFull holds the run in
+	// owner-resumed recovery_wait with NULL retry time when a COUNTED park would
 	// take disk_park_count past it. A preventive park is neither counted nor capped. 0 = unlimited.
 	RunDiskParkMax              int
 	RunRetainedRecoveryMaxParks int
@@ -1800,10 +1821,6 @@ type SettingsReader interface {
 	// InstanceModel is the trimmed instance-tier value of a non-secret model key
 	// ("" when unset). On an error the caller treats the tier as unset (PRD #3245).
 	InstanceModel(ctx context.Context, key string) (string, error)
-	// SummaryModel is the instance-default model the inline run-summary generator
-	// runs on (PRD #362 Decision 8), the fallback when the run owner has no per-user
-	// summary_model override. Falls back to the compiled-in default ("haiku").
-	SummaryModel(ctx context.Context) (string, error)
 	// UziLabel is the single run-eligibility label an issue must carry to be runnable
 	// (PRD #764 M1). It is read here rather than passed in by each caller because the
 	// gate is shared: the board handler, the scheduler, and the poller's autopilot must
@@ -3086,7 +3103,7 @@ var checkpointDurabilityParks = map[string]bool{"limit_wait": true, "recovery_wa
 // recordCheckpointDurability stores a park report's checkpoint_contains_latest (PRD #1809 M6,
 // D8) after the park transition applied. The write is guarded on the run still being this
 // worker's in the status the report asked for, so a park the transaction turned into something
-// else (a stamped forge cancellation or a disk park past its failure cap) or a run that already
+// else (a stamped cancellation) or a run that already
 // moved on records nothing.
 //
 // Each park overwrites the value with what it carried, so the flag describes the LATEST park: a
@@ -4083,6 +4100,13 @@ func branchMovedStopReason(reason *string) string {
 // column and the M2 worker client); the Go field stays
 // `State` to avoid churn in the switch below.
 type StateRequest struct {
+	// RegistrationEvidence (issue #3859, feature run_registration_evidence_v1) is the worker's own
+	// (claim_generation, register_nonce, registration epoch) on a `running` report. It is recorded
+	// BEFORE the status write and independently of whether that write applies, so a report a
+	// SetRunRunning guard refuses still leaves the witness that lets the sweep tell a departed
+	// flight from a slow one. Valid only on `running`; httpx.DecodeJSON rejects unknown fields, so
+	// the field MUST exist here or a new worker's report 400s.
+	RegistrationEvidence       *RegistrationEvidence           `json:"registration_evidence,omitempty"`
 	SourcePublication          *SourcePublicationReport        `json:"source_publication,omitempty"`
 	RegisterNonce              string                          `json:"register_nonce,omitempty"`
 	MemoryEpisode              *int64                          `json:"memory_episode,omitempty"`
@@ -4209,7 +4233,8 @@ type StateRequest struct {
 	// nothing about the roster; `[]` = detection ran and found none; non-empty = the
 	// detected agents. Only `running` carries it; it is re-validated below, never
 	// trusted from the worker.
-	RepoAgents *[]RepoAgent `json:"repo_agents"`
+	RepoAgents            *[]RepoAgent `json:"repo_agents"`
+	RepoAgentSourceCommit *string      `json:"repo_agent_source_commit"`
 	// PlanChangedFiles is the `git status --porcelain` line list the worker computed
 	// (as the RUNNER uid) at the plan gate. Tri-state pointer with repo_agents
 	// semantics: absent (nil) = a pre-#212 worker says nothing (COALESCE preserves);
@@ -4565,6 +4590,12 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	if err != nil {
 		return store.Run{}, false, err
 	}
+	if diskHoldRefusesReport(owned, req) {
+		if req.ClaimGeneration != nil && (owned.ClaimGeneration != *req.ClaimGeneration || owned.ClaimReleasedAt.Valid) {
+			return owned, false, ErrStaleClaim
+		}
+		return owned, false, nil
+	}
 	// Compact policy episodes have no generic continuation authority. Cancel remains
 	// the ordinary terminal action; the dedicated report reconciles its own replay.
 	if activePolicyHold(owned) && req.State != "cancelled" {
@@ -4838,6 +4869,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 			// stale_claim disposition. The deferred Rollback releases the lock.
 			return locked, false, ErrStaleClaim
 		}
+		if diskHoldRefusesReport(locked, req) {
+			return locked, false, nil
+		}
 		if locked.Status == "paused" && locked.HoldReason.String == IterationBudgetExhausted {
 			return locked, false, nil
 		}
@@ -4893,6 +4927,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		if err := validateSourcePublicationLive(locked, wkr, req); err != nil {
 			return locked, false, err
 		}
+		if diskHoldRefusesReport(locked, req) {
+			return locked, false, nil
+		}
 		owned = locked
 		q = qtx
 	}
@@ -4932,6 +4969,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		}
 		if err := recheckPublicationEnrollment(ctx, qtx, runID, workerLocked); err != nil {
 			return store.Run{}, false, err
+		}
+		if diskHoldRefusesReport(locked, req) {
+			return locked, false, nil
 		}
 		owned = locked
 		q = qtx
@@ -5546,8 +5586,8 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		}
 		// PRD #1809 M5 (D6): the DATA-VOLUME-FULL park is its own locked transaction too — the
 		// forge park's claim-generation fencing, a disk-only lifetime counter (bumped unless the
-		// park is preventive) and a cap past which the run fails with fail_origin
-		// 'data_volume_full'. It settles no custody hold (the park keeps custody) and, like the
+		// park is preventive) and a cap past which the run holds for owner Resume
+		// with a NULL retry deadline. It settles no custody hold (the park keeps custody) and, like the
 		// forge park, falls through to the shared post-switch fan-out. A stale claim returns
 		// early carrying the locked run for the handler's generic stale_claim 409.
 		if req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseDataVolumeFull {
@@ -6084,6 +6124,14 @@ func (s *Service) runningStateParams(ctx context.Context, run store.Run, req Sta
 		}
 	}
 
+	if req.RepoAgentSourceCommit != nil {
+		commit, err := repoAgentSourceCommitParam(run, *req.RepoAgentSourceCommit)
+		if err != nil {
+			return p, err
+		}
+		p.RepoAgentSourceCommit = commit
+	}
+
 	if req.RepoAgents != nil {
 		if err := validateRepoAgents(*req.RepoAgents); err != nil {
 			return p, err
@@ -6118,6 +6166,20 @@ func (s *Service) runningStateParams(ctx context.Context, run store.Run, req Sta
 	p.AgentExclusions = exclusions
 	return p, nil
 }
+
+func repoAgentSourceCommitParam(run store.Run, reported string) (pgtype.Text, error) {
+	if !repoAgentSourceCommitRE.MatchString(reported) {
+		return pgtype.Text{}, fmt.Errorf("%w: repo_agent_source_commit must be a full lowercase commit id", ErrInvalidState)
+	}
+	if run.RepoAgentSourceCommit.Valid && run.RepoAgentSourceCommit.String != reported {
+		slog.Warn("workersvc: refused a different repo-agent source revision",
+			"run_id", run.ID, "stored", run.RepoAgentSourceCommit.String, "reported", reported)
+		return pgtype.Text{}, ErrRepoAgentSourceConflict
+	}
+	return pgconv.TextOrNull(reported), nil
+}
+
+var repoAgentSourceCommitRE = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 // rosterFor resolves the selectable subagent names of a source for one run:
 //   - "repo": the detected roster — `reported` when this very request carries it,
@@ -6546,7 +6608,7 @@ func (s *Service) ListMemoryForRun(ctx context.Context, wkr store.Worker, runID 
 //
 // cancellationRequested (issue #3860) is the read-only signal for the worker's held-seam
 // cancel: true only when the run is stamped stop_kind='cancelled' and a cancel input is still
-// deliverable (GetRunOwnershipByWorker). A store without that query (unit fakes) reports false.
+// deliverable (GetRunOwnershipByWorker, a required Store query).
 func (s *Service) RunOwnership(ctx context.Context, wkr store.Worker, runID uuid.UUID) (status string, recoveryRetryNotBefore *time.Time, claimGeneration int64, holdReason *string, claimReleased bool, gateRevision int64, cancellationRequested bool, err error) {
 	run, cancellationRequested, err := s.runOwnershipRead(ctx, runID, wkr)
 	if err != nil {
@@ -6570,18 +6632,11 @@ func (s *Service) RunOwnership(ctx context.Context, wkr store.Worker, runID uuid
 	return run.Status, retry, run.ClaimGeneration, holdReason, run.ClaimReleasedAt.Valid, run.GateRevision, cancellationRequested, nil
 }
 
-// runOwnershipRead is RunOwnership's read: GetRunOwnershipByWorker through an optional-interface
-// assertion on s.q (the RunInventoryGuard pattern), else GetRunOwnedByWorker with
-// cancellationRequested=false for stores that lack the query.
+// runOwnershipRead is RunOwnership's read: the required GetRunOwnershipByWorker query (issue
+// #3937), whose row carries the run and its cancellation signal, under the shared Go-side
+// ownership verdict.
 func (s *Service) runOwnershipRead(ctx context.Context, runID uuid.UUID, wkr store.Worker) (store.Run, bool, error) {
-	oq, ok := s.q.(interface {
-		GetRunOwnershipByWorker(context.Context, store.GetRunOwnershipByWorkerParams) (store.GetRunOwnershipByWorkerRow, error)
-	})
-	if !ok {
-		run, err := s.runOwnedByWorker(ctx, runID, wkr)
-		return run, false, err
-	}
-	row, err := oq.GetRunOwnershipByWorker(ctx, store.GetRunOwnershipByWorkerParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)})
+	row, err := s.q.GetRunOwnershipByWorker(ctx, store.GetRunOwnershipByWorkerParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)})
 	run, err := ownedRunOrRefusal(runID, wkr, row.Run, err)
 	if err != nil {
 		return store.Run{}, false, err
@@ -7557,10 +7612,11 @@ func (s *Service) WorkerProjectionForOwner(ctx context.Context, userID, workerID
 // and a preauthorized recovery upload may still need that token to authenticate — the
 // last authenticated retry path must survive until custody is released or explicitly
 // discarded. The error carries the count so M4b's CLI confirmation can name the
-// affected captures. This guard is placed BEFORE the delete so the token row is never
-// cascaded away while an upload could still need it. (The M1 live_worker_id
-// ON DELETE RESTRICT FK is the fail-closed backstop; this guard turns it into a clean,
-// enumerated 409 instead of a raw constraint 500.)
+// affected captures, and (#3921) lists up to 10 of the blocking holds. This guard is
+// placed BEFORE the delete so the token row is never cascaded away while an upload
+// could still need it. (The M1 live_worker_id ON DELETE RESTRICT FK is the fail-closed
+// backstop; this guard turns it into a clean, enumerated 409 instead of a raw
+// constraint 500.)
 func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) error {
 	active, err := s.q.CountWorkerNonTerminalRuns(ctx, store.CountWorkerNonTerminalRunsParams{
 		WorkerID: pgconv.UUID(workerID), UserID: userID,
@@ -7589,7 +7645,16 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 		return err
 	}
 	if holds > 0 {
-		return &WorkerHasCustodyError{Holds: holds}
+		// #3921: name the blocking holds (same predicate as the count, capped). A listing
+		// failure is returned as-is (500), mirroring the active-runs listing above.
+		list, err := s.q.ListOpenCustodyHoldsForWorker(ctx, store.ListOpenCustodyHoldsForWorkerParams{
+			WorkerID: workerID,
+			UserID:   userID,
+		})
+		if err != nil {
+			return err
+		}
+		return &WorkerHasCustodyError{Holds: holds, List: list}
 	}
 	n, err := s.q.DeleteWorkerForUser(ctx, store.DeleteWorkerForUserParams{ID: workerID, UserID: userID})
 	if err != nil {
@@ -8079,12 +8144,13 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			// staleness-guard pair (planned_base_commit, require_base_match) is here for the
 			// same reason — require_base_match is NOT NULL DEFAULT false, so omitting it would
 			// silently opt every seeded run out of the fail-on-divergence behaviour.
-			PlanMd:            planMD,
-			PlanSource:        planSource,
-			AgentSource:       agentSource,
-			AgentExclusions:   agentExclusions,
-			PlannedBaseCommit: plannedBaseCommit,
-			RequireBaseMatch:  requireBaseMatch,
+			PlanMd:               planMD,
+			PlanSource:           planSource,
+			AgentSource:          agentSource,
+			AgentExclusions:      agentExclusions,
+			AgentSourceRequested: agentSource,
+			PlannedBaseCommit:    plannedBaseCommit,
+			RequireBaseMatch:     requireBaseMatch,
 			// PRD #300: the per-schedule model override, frozen onto the run at fire time.
 			// nil for every non-scheduled caller (interactive, label-poller autopilot) →
 			// NULL → the run inherits the owner's per-user Worker default at claim assembly.
@@ -8539,6 +8605,14 @@ func (s *Service) hasLivePoller(ctx context.Context, run store.Run) (bool, error
 type SweepResult struct {
 	WorkersOffline int64
 	ClaimedReset   int64
+	// ClaimedCharged and ClaimedExhausted (issue #3859) count claimed-never-started
+	// continuations the charge pass requeued with requeue_count + 1, and parked at
+	// recovery_wait/worker_requeue_exhausted once the episode budget was spent.
+	ClaimedCharged   int64
+	ClaimedExhausted int64
+	// ClaimedUnwitnessed counts continuations parked at recovery_wait /
+	// retained_continuation_unwitnessed after their witness window passed (issue #3859).
+	ClaimedUnwitnessed int64
 	// TaskUndispatchedFailed is the number of kind='task' (handoff) runs this pass
 	// terminalized because they sat queued with dispatched_at NULL past DispatchGrace —
 	// the CLI never landed their push/dispatch (issue #1367). Normally 0: a handoff is

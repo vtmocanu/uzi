@@ -84,8 +84,8 @@ back to the SDK/account default for Claude or `gpt-6.1-sol` for Codex. The
 shipped lead has a Claude pin of `opus` and an empty Codex pin.
 
 A subagent's own pin for the run's harness takes precedence over following
-the resolved root unless the schedule's **Apply model also to agents** is
-set; then subagents follow the resolved root too. The lead's Codex fallback
+the resolved root unless the schedule's **Use the run's resolved model for
+subagents too** toggle is set; then subagents follow the resolved root too. The lead's Codex fallback
 needs a worker from this release; older Codex workers use the built-in
 provider model when no higher-priority setting applies. See
 [Model precedence](./worker-model.md#model-precedence) for rollout and the
@@ -211,7 +211,8 @@ with a `shadowed` badge). Delete and recreate it under a different name to use i
    name (kebab-case, immutable after creation), description, and prompt body.
 3. Optionally set **Claude model** and **Codex model**, or restrict tools.
    Leave either harness on **Default** so a subagent follows the lead on that
-   harness. **Apply model also to agents** on a schedule overrides these pins.
+   harness. **Use the run's resolved model for subagents too** on a schedule overrides
+   these pins.
 4. The live Markdown preview exports the Claude definition, including its
    Claude pin. The Codex pin is saved separately.
 

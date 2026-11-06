@@ -23,6 +23,7 @@ export const MOCK_MODE = import.meta.env.VITE_UZI_MOCK === "1";
 // type import below names only the DTOs this module's own code (realApi, the
 // request helpers, ProjectSyncVisibility) references in its signatures.
 import type {
+  AgentSource,
   CrossCheckHistoryDTO,
   CrossCheckHistoryAvailabilityDTO,
   CrossCheckHistoryParams,
@@ -1007,6 +1008,10 @@ const realApi = {
   setRepoFoldImproveUziBacklog: (id: string, enabled: boolean) =>
     request<{ repo: Repo }>("PATCH", `/repos/${id}`, {
       repo_fold_improve_uzi_backlog: enabled,
+    }),
+  setRepoAgentSourceDefault: (id: string, value: AgentSource | null) =>
+    request<{ repo: Repo }>("PATCH", `/repos/${id}`, {
+      agent_source_default: value,
     }),
   // Static per-repo capability hint (PRD #84 M2). Owner or admin. Mutually
   // exclusive in one request with repo_devbox_opt_in and the trust flags, so it is

@@ -184,7 +184,7 @@ func TestPreStartInfraFailOriginsExact(t *testing.T) {
 // origins with no agent attempt to retrospect — forge_unreachable (PRD #1392),
 // task_undispatched (issue #1367, a handoff reaped before it was ever claimed),
 // gate_presentation_refused (PRD #1795 M1, the plan-gate refusal cap), data_volume_full (PRD
-// #1809 M5, a worker data volume that stayed full), worker_residue_blocked (issue #1783, the
+// #1809 M5, historical disk cap failures), worker_residue_blocked (issue #1783, the
 // worker could not prove the run's execution stopped or clear its clone-path residue) and
 // skills_plugin_load_failed (issue #1888, the run's selected-skills plugin failed to load). An
 // accidental add (a genuinely judgeable origin slipping into the regardless-of-iteration skip)

@@ -175,10 +175,12 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 	if line := vaultParkLine(r); line != "" {
 		rows = append(rows, []string{"VAULT", line})
 	}
-	// DISK (PRD #1809 M5): a data_volume_full park, emit-only-when-parked, with its next retry
-	// and the run's lifetime disk-park count.
+	// DISK: current retry/hold timing and the lifetime disk-park count, only while parked.
 	if line := diskParkLine(r); line != "" {
 		rows = append(rows, []string{"DISK", line})
+		for _, guidance := range diskHoldLines(r) {
+			rows = append(rows, []string{"", guidance})
+		}
 	}
 	// HOME (PRD #1809 M6, D8): the run's HOME and cache size on its worker, emit-only-when-
 	// reported (the server sets them only from a fresh worker report).
@@ -261,6 +263,7 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 	if r.SizeClass != "" {
 		rows = append(rows, []string{"SIZE_CLASS", sanitizeTTY(r.SizeClass)})
 	}
+	rows = append(rows, agentSourceRows(r)...)
 	// Emitted only when set, like its two neighbours — every non-stopped run would
 	// otherwise carry a blank row. It is a server-controlled enum, so sanitizeTTY is
 	// not strictly required; applied anyway for uniformity with the free text above,
@@ -606,6 +609,8 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 		clauses = append(clauses, credentialSwitchAction(r))
 	case holdBaseAttestation:
 		clauses = append(clauses, baseAttestationAction(r))
+	case holdRepoAgentSource:
+		clauses = append(clauses, "resume once the repository can be fetched: uzi run resume "+cellText(r.ID))
 	case holdWeeklyReserve:
 		clauses = append(clauses, weeklyReserveAction(r))
 	}
@@ -634,6 +639,8 @@ func holdReasonLabel(reason string) string {
 		return "credential switch unsettled"
 	case holdBaseAttestation:
 		return "base not attested"
+	case holdRepoAgentSource:
+		return "repo agents unreadable"
 	case holdWeeklyReserve:
 		return "weekly usage reserve"
 	default:
@@ -2125,7 +2132,7 @@ func steerStateWithRun(in apitypes.SteerInputDTO, runStatus string, recoveryCaus
 			}
 		}
 	}
-	if len(recoveryCause) > 0 && (recoveryCause[0] == workerRequeueExhaustedCause || recoveryCause[0] == workerMemoryPressureCause || recoveryCause[0] == retainedRecoveryAdoptionFailedCause) {
+	if len(recoveryCause) > 0 && (recoveryCause[0] == workerRequeueExhaustedCause || recoveryCause[0] == workerMemoryPressureCause || isAlwaysHeldRecoveryCause(recoveryCause[0])) {
 		recoveringSuffix = " (owner Resume/Cancel)"
 	}
 	if len(recoveryCause) > 0 && recoveryCause[0] == forgeUnreachableCause {
@@ -2145,7 +2152,15 @@ func steerStateWithRun(in apitypes.SteerInputDTO, runStatus string, recoveryCaus
 	// PRD #1809 M5: a run parked on a full worker data volume waits for disk space (the words
 	// diskParkLine and the web run page's "Waiting for disk space" heading use).
 	if len(recoveryCause) > 0 && recoveryCause[0] == dataVolumeFullCause {
-		recoveringSuffix = " (run waiting for disk space)"
+		recoveringSuffix = " (run waiting for disk space; retry timing unknown)"
+		if run != nil {
+			switch diskWaitOf(*run) {
+			case diskWaitHeld:
+				recoveringSuffix = " (disk held; owner Resume/Cancel)"
+			case diskWaitTimed:
+				recoveringSuffix = " (run waiting for disk space)"
+			}
+		}
 	}
 	if consumedAt == nil {
 		if terminalRunStatuses[runStatus] {
@@ -2319,10 +2334,8 @@ func checkpointDurabilityLine(r apitypes.RunDTO) string {
 }
 
 // dataVolumeFullCause is the RecoveryWaitCause of a run parked because its worker's data
-// volume was full or about to fill (PRD #1809 M5, D6), and the fail_origin of a run that failed
-// because the volume stayed full past the server's disk-park cap. Like the vault park it
-// resumes at its timer-based retry (RecoveryRetryNotBefore); the worker's reclaim frees space
-// in the meantime.
+// volume was full or about to fill (PRD #1809 M5, D6). Historical failed rows also use
+// this fail_origin; current cap exhaustion holds the run for its owner (#3969).
 const dataVolumeFullCause = "data_volume_full"
 
 // isDiskFullPark reports whether a recovery_wait run is parked on a full data volume (PRD #1809).
@@ -2342,30 +2355,43 @@ func diskParkCountClause(r apitypes.RunDTO) string {
 
 // diskParkLine is the data_volume_full park sentence (PRD #1809 M5) `uzi run get`'s DISK row,
 // the `run logs --follow` notice and the TUI share, "" for any other run. The retry clause is
-// HH:MM on the viewer's local wall clock (vaultRetryClause), dropped without a retry stamp.
+// HH:MM on the viewer's local wall clock for a finite retry; NULL holds and missing
+// or invalid timing never promise an automatic retry.
 func diskParkLine(r apitypes.RunDTO) string {
 	if !isDiskFullPark(r) {
 		return ""
 	}
-	return diskParkLead + ": the worker's data volume is full or nearly full; uzi frees space on the worker and the run resumes at " +
-		vaultRetryClause(r) + "; " + diskParkCountClause(r)
+	switch diskWaitOf(r) {
+	case diskWaitHeld:
+		return diskParkLead + ": automatic disk retries exhausted; owner-held; owner Resume/Cancel; no automatic resume; " + diskParkCountClause(r)
+	case diskWaitTimed:
+		return diskParkLead + ": the worker's data volume is full or nearly full; uzi frees space on the worker and the run resumes at " + vaultRetryClause(r) + "; " + diskParkCountClause(r)
+	default:
+		return diskParkLead + ": retry timing unknown; " + diskParkCountClause(r)
+	}
 }
 
 // fitDiskParkLine is diskParkLine shed to fit a physical width, for the TUI's one-row slots,
 // in the same order as fitVaultParkLine: the full sentence, then "waiting for disk space:
 // resumes at its next retry (HH:MM); counted disk parks: N", then the floor "waiting for disk space ·
-// retry HH:MM" (the bare lead without a stamp). The floor is never cut here; the caller's
+// retry HH:MM". Holds retain Resume/Cancel and unknown timing retains its label.
+// The floor is never cut here; the caller's
 // clampVisual is the narrow-terminal backstop. "" for any run that is not a disk park.
 func fitDiskParkLine(r apitypes.RunDTO, width int) string {
 	full := diskParkLine(r)
 	if full == "" {
 		return ""
 	}
-	floor := diskParkLead
-	if r.RecoveryRetryNotBefore != nil {
-		floor += " · retry " + r.RecoveryRetryNotBefore.Local().Format("15:04")
+	floor := "Disk wait · timing unknown"
+	short := floor + "; " + diskParkCountClause(r)
+	switch diskWaitOf(r) {
+	case diskWaitHeld:
+		floor = "Disk held · Resume/Cancel"
+		short = floor + "; " + diskParkCountClause(r)
+	case diskWaitTimed:
+		floor = diskParkLead + " · retry " + r.RecoveryRetryNotBefore.Local().Format("15:04")
+		short = diskParkLead + ": resumes at " + vaultRetryClause(r) + "; " + diskParkCountClause(r)
 	}
-	short := diskParkLead + ": resumes at " + vaultRetryClause(r) + "; " + diskParkCountClause(r)
 	for _, cand := range []string{full, short} {
 		if visualWidth(cand) <= width {
 			return cand
@@ -2375,7 +2401,7 @@ func fitDiskParkLine(r apitypes.RunDTO, width int) string {
 }
 
 // failOriginCell is `uzi run get`'s FAIL_ORIGIN cell: the typed fail_origin enum, with a plain
-// explanation for data_volume_full (PRD #1809 M5), whose raw name does not say that uzi parked
+// explanation for historical data_volume_full failures (PRD #1809 M5), whose raw name does not say that uzi parked
 // and retried before giving up. N is the counted parks only (preventive parks are uncounted). The enum is server-coerced, but an unrecognised value from a
 // newer server still prints as itself, through sanitizeTTY like the STOP_KIND row.
 func failOriginCell(r apitypes.RunDTO) string {
@@ -2488,7 +2514,14 @@ func runStatusCellAt(r apitypes.RunListItemDTO, now time.Time) string {
 	} else if isVaultLockedPark(r.RunDTO) {
 		s += " (waiting for vault unlock)"
 	} else if isDiskFullPark(r.RunDTO) {
-		s += " (waiting for disk space)"
+		switch diskWaitOf(r.RunDTO) {
+		case diskWaitHeld:
+			s += " (disk held; owner Resume/Cancel)"
+		case diskWaitTimed:
+			s += " (waiting for disk space)"
+		default:
+			s += " (waiting for disk space; retry timing unknown)"
+		}
 	}
 	if isCredentialDisabledHold(r.RunDTO) {
 		// PRD #1732 D14: say why the run is paused, so it does not read as an owner pause.
@@ -2856,4 +2889,38 @@ func iterationHoldAction(r apitypes.RunDTO) string {
 		action += "; wall time exhausted; add time: uzi run extend " + id + " --by 2h; Extend adds time only, then Resume"
 	}
 	return action
+}
+
+func agentSourceLabel(source string) string {
+	switch source {
+	case "own":
+		return "my templates"
+	case "repo":
+		return "repo agents"
+	}
+	return sanitizeTTY(source)
+}
+
+func agentSourceRows(r apitypes.RunDTO) [][]string {
+	var rows [][]string
+	requested := strOr(r.AgentSourceRequested, "")
+	if requested != "" {
+		basis := "this run"
+		if strOr(r.AgentSourceRequestedBasis, "") == "repo_default" {
+			basis = "repo default"
+		}
+		rows = append(rows, []string{"AGENTS_REQUESTED", agentSourceLabel(requested) + " (" + basis + ")"})
+	}
+	if implemented := strOr(r.AgentSource, ""); implemented != "" {
+		cell := agentSourceLabel(implemented)
+		switch requested {
+		case "":
+		case implemented:
+			cell += " (as requested)"
+		default:
+			cell += " (changed at approval)"
+		}
+		rows = append(rows, []string{"IMPLEMENTED_WITH", cell})
+	}
+	return rows
 }

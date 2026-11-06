@@ -39,6 +39,48 @@ roster is detected the message shows two approve buttons — **Approve · repo a
 and **Approve · my templates** — so you pick the source without leaving Slack.
 Per-agent exclusions are a web-only refinement; use "Open in uzi" for those.
 
+## Set a default for your runs on a repo
+
+Each repo you connect has a **Default agents for my runs on this repo** setting,
+in the repo's **Trusted repo** settings on the Repos page:
+
+- **uzi templates**: your runs on this repo use your own templates.
+- **repo agents**: your runs on this repo use the repo's roster when one is
+  detected, and fall back to your templates (with the usual "no repo agent
+  roster" note) when it is not.
+- **not set (today's behaviour)**: the defaults described above apply.
+
+The setting is yours alone. It changes only the runs you create on your own
+connection to that repo; a teammate connected to the same project keeps their
+own setting. An admin can clear it or set **uzi templates** on any repo, but only
+the repo's owner can choose **repo agents**.
+
+uzi freezes the setting onto each issue run when the run is created, whether you
+start it from the board, the CLI, chat, a schedule or autopilot. Changing the
+setting later does not change runs already queued or running. Other run kinds
+(CI fix, MR rework, self-improvement, prompt, task and job runs) are not affected.
+
+A frozen default decides the implementation agents when nothing else does:
+
+- an approval that carries no agent choice (for example `uzi run approve` with
+  no `--agent-source`, or an external dispatcher using the API) implements with
+  the default, and the run records it. When the run already records a choice
+  from an earlier approval, that choice and its exclusions are kept instead;
+- an autopilot run implements with the default;
+- an explicit choice at the plan gate (web, Slack, or `--agent-source`) still
+  wins, and the run page then shows it as "changed at approval".
+
+Planning is not yet affected: the plan turn still uses your own templates. A
+run that carries a default is claimed only by a worker new enough to honour it;
+while every online worker is older, the run stays queued and its health reason
+names the missing worker version (`agent_source_request_v1`).
+
+The run page's **Agents used** card shows the request and the outcome, for
+example "Requested: my templates (repo default) · Implemented with: my
+templates (as requested)". `uzi run get` shows the same facts as the
+`AGENTS_REQUESTED` and `IMPLEMENTED_WITH` rows, and `uzi repo list` shows each
+repo's setting (`agent_source_default` in `--json`).
+
 ## Repo agents on Codex runs
 
 On a Codex run the agent selection applies the same way: implementation
@@ -86,11 +128,20 @@ Each TOML file becomes one subagent:
   `description`, and a non-empty string `developer_instructions`, which becomes
   the agent's prompt. The `name` and `description` rules match the Markdown
   agents.
-- **No tools, no model:** a TOML agent declares neither, so it runs with the
-  run's full default tool set, which can include `Bash`, and follows the lead's
-  model on either harness.
-  `model`, `model_reasoning_effort`,
-  `nickname_candidates`, `config_file`, `includes`, and any other key are ignored.
+- **Optional model:** a top-level `model` string can pin a Codex subagent to a
+  supported Codex role ID, including `gpt-6-luna`, using the same vocabulary as
+  Markdown Codex pins. An absent `model` or exactly `model = ""` follows the
+  resolved lead model. A whitespace-only, unsafe, unsupported, wrong-family,
+  or non-string value skips the agent with a bounded invalid-file note that
+  does not echo the model value. On Claude runs the pin is omitted, so the
+  subagent follows the resolved lead model.
+- **Model override and effort:** the schedule's "Use the run's resolved model
+  for subagents too" toggle (`override_subagent_model`) overrides the TOML pin. Reasoning effort
+  still comes from the existing run settings; `model_reasoning_effort` is ignored.
+- **Default tools:** a TOML agent runs with the run's full default tool set,
+  which can include `Bash`, subject to the guards below.
+  `nickname_candidates`, `config_file`, `includes`, and other unrecognised keys
+  are ignored.
 - **Skipped, not run:** an otherwise valid file that declares `features`, `skills`,
   `sandbox_mode`, or `tools` (with any value) is skipped with a "declares a Codex
   restriction uzi cannot honour yet" note, rather than running without the
@@ -108,18 +159,59 @@ deferral tools stay denied.
 Out of scope: the `[agents]` table in `.codex/config.toml`, and other tools'
 agent folders, are not read.
 
-### How uzi keeps the read inside the clone
+### Which revision is read
 
-Detection is hardened against a repo that tries to point it elsewhere. uzi
-walks the folder's path components without following symlinks: a symlink
-anywhere in them means the folder is not read, and it still counts as present,
-so there is no fallback to the other folder. Each file is opened without
-following symlinks, and before any byte is read the opened file's real path must
-sit directly inside the agents folder; a file that fails this check is skipped.
-The size check and read use that same open handle. The check relies on Linux
-`/proc`, so on a platform without it nothing is read. As supporting context,
-detection runs during preflight, after the clone or resume and before the
-executor starts, in a clone owned by the runner.
+uzi never reads the agent folders from the run's working tree. On a run's
+first claim the worker fetches the repo and resolves the repository's
+configured default branch from its remote-tracking ref after that fetch, never
+from another branch. It reads `.claude/agents/` and `.codex/agents/` from git
+objects at that commit and reports the commit together with the roster. No
+agent turn starts until the server confirms it recorded that commit. A
+`--require-base` run held because its kept work is not attested
+(`base_attestation_missing`) has the commit recorded the same way before the
+hold. The server records the commit once per run and refuses a later report
+that names a different one.
+
+Every later claim of the same run (a resume, a requeue, a restart on another
+worker) reads the agent folders at the recorded commit. Edits a run makes to its
+own agent files, and agent files already on the branch an `mr_rework` or
+`ci_fix` run starts from, therefore never change the roster that run uses. The
+run view shows the revision under **Agents used**.
+
+Agent files stay writable: a run can still change them as part of its task. The
+change reaches runs whose first claim comes after it is merged into the default
+branch.
+
+The read follows the same rules as the folder layout above: a symlink for
+`.claude`, `.codex` or either `agents` folder means that folder is not read (it
+still counts as present, so there is no fallback to the other folder), symlinks
+and submodules inside the folder are skipped, and the same caps apply.
+
+The agent does not start, and the run is held as **repo agents unreadable**
+(`hold_reason` `repo_agent_source_unavailable`), when the worker:
+
+- cannot resolve the configured default branch (the repository has none, the
+  branch is missing from the fetch, or the repository has no commits yet);
+- cannot get the server's confirmation that it recorded the commit (the report
+  failed, was refused, or its answer did not name the commit);
+- cannot read the agent folders at the commit, or the recorded commit is missing
+  from its repository cache and fetching it fails.
+
+When the worker resolved a commit, the hold records it under the same
+record-once rule, so the claim after an owner resume reads the same commit even
+if the default branch has moved since. Resume the run once the repository can
+be fetched, or cancel it.
+
+A run that reads repo agents is marked when it is created
+(`repo_agent_source_required`). Only a worker that reports the
+`repo_agent_source_v1` protocol capability claims a marked run or a run with a
+recorded revision, its first claim included. Judge, job, cross-check,
+task-review and chat runs do not read repo agents and are not marked. While no
+such worker is online, a queued run's health reason names the capability.
+
+When the API is older than the worker, nothing is recorded: each claim reads
+the agent folders at the configured default branch's commit at that time, and
+a failure to read them leaves the run on the owner's own agent templates.
 
 ## What is loaded, and what is never
 

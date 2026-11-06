@@ -201,28 +201,40 @@ and no queued run.
 
 ## Run summaries
 
-**Summary model** sets which model [Claude run summaries](./run-summaries.md)
-generate on, instance-wide (`haiku` by default). It is a picker of the curated
-Claude models (`opus`, `sonnet`, `haiku`, `fable`) plus **Other (custom model
-ID)**. There is no empty or Default option: a blank value, an empty custom ID,
-or an invalid ID (interior spaces, control or format characters, or too long)
-is blocked before save, with a message beneath the picker; an unchanged stored
-value does not block saving the Now line switch. Each user can override it
-for their own Claude runs from **Settings → Run defaults → Run summaries →
-Summary model** (their empty option reads `Default · instance default`); the
-admin default applies while they haven't. Codex intent
-and plan summaries use fixed `gpt-6-luna` with low effort, independent of
-this picker, with no fallback model. Both lanes spend the run owner's own
-credential for the run's original harness: an Anthropic token for Claude,
-or the bound OpenAI API key or Codex subscription for Codex. There's no
-kill-switch for the intent and plan summaries; failed, refused or slow
-summaries are skipped without changing the run's outcome.
+The **Run summaries** card sets the instance default model for
+[run summaries](./run-summaries.md), one per harness, side by side:
+**Claude summary model** (`summary_model`) and **Codex summary model**
+(`codex_summary_model`). A run reads only the lane of its own harness.
+
+- **Claude summary model** is a picker of the curated Claude models (`opus`,
+  `sonnet`, `haiku`, `fable`) plus **Other (custom model ID)**. A Codex model
+  is refused here: choose it in the Codex picker.
+- **Codex summary model** is a picker of the Codex role models (including
+  `gpt-6-luna`), with no custom ID. A Claude alias is refused here.
+- Each picker has a reset option, `Default · <model> (built-in)`, naming what
+  it follows (`haiku` for Claude, `gpt-6-luna` for Codex). It is selected
+  while the instance has not pinned a model, and choosing it and saving clears
+  the pin so the lane follows the built-in again, including future changes to
+  it. Saving sends only the lanes you changed.
+- In the Claude picker, an invalid ID (interior spaces, control or format
+  characters, or too long) or an empty custom ID is blocked before save, with a message beneath the
+  picker; an unchanged stored value does not block saving the other controls.
+
+Each user can override either lane for their own runs from **Settings → Run
+defaults → Run summaries**, with a **Claude summary model** and a **Codex
+summary model** picker. Their **Default** option names the model and where it
+comes from (for example `Default · haiku (built-in)`); the admin value applies
+while they haven't chosen. Codex intent and plan summaries run at low effort.
+Both lanes spend the run owner's own credential for the run's harness: an
+Anthropic token for Claude, or the bound OpenAI API key or Codex subscription
+for Codex. There's no kill-switch for the intent and plan summaries; failed,
+refused or slow summaries are skipped without changing the run's outcome.
 
 **Model-written Now line** (`now_summary_enabled`, on by default) is the
 instance kill switch for the [Now summary](./run-activity.md#now-summary): the
 one-sentence "what the run is doing right now" line on the run progress card,
 the TUI detail and `uzi run get`. It is a checkbox in the same **Run
-summaries** card as the Summary model. Off stops the summary for every user,
+summaries** card as the summary models. Off stops the summary for every user,
 whatever their own **Settings → Run defaults → Run summaries** choice; on lets
 each user's own setting decide (also on by default). The effective setting
 for a run is the admin switch AND the run owner's setting, and reaches a
@@ -381,8 +393,8 @@ signal off, from **Admin → Instance → Run health**:
 | Setting | Default | Controls |
 |---|---|---|
 | Enable run-health detection | on | Turns the whole detector on or off. |
-| Stalled after | 300s (5m) | Seconds of silence, with no tool call in flight, before a running run is flagged stalled. |
-| Long tool call after | 1200s (20m) | `health_tool_call_seconds` — how long the oldest open tool call of a run's main agent may run, on a run that has also been silent for the **Stalled after** window (or for this threshold, if **Stalled after** is `0`), before it's flagged stalled. Calls to subagents are excluded. `0` turns this signal off. See [Long tool calls](./run-health.md#long-tool-calls). |
+| Stalled after | 300s (5m) | Seconds of silence, with no tool call in flight, before a running run is flagged stalled. Also the floor for the silent-delegation threshold, `max(Long tool call after, this)`. |
+| Long tool call after | 1200s (20m) | `health_tool_call_seconds` — how long the oldest open tool call of a run's main agent may run, on a run that has also been silent for the **Stalled after** window (or for this threshold, if **Stalled after** is `0`), before it's flagged stalled. This check is skipped while a call to a subagent is open; that case uses the silent-delegation threshold, the larger of this and **Stalled after**, measured as run-wide silence. `0` turns off both signals. See [Long tool calls](./run-health.md#long-tool-calls). |
 | Near timeout at (% of wall-clock budget) | 85 | `health_near_timeout_pct` — the share of a run's wall-clock budget (`RUN_TIMEOUT`, or its frozen `budget_wall_seconds` for a milestone-scaled run, PRD #122) it must have used, in **active** running time only (time parked at a gate is excluded), before it's flagged near timeout. |
 | Maximum per extension (seconds) | 57600 (16h) | `run_extension_cap_seconds` — the most extra wall-clock time an owner may grant in one [Extend](./run-health.md#giving-a-run-more-time) request (web chooser, `uzi run extend --by`, or the API input). It is a per-request limit, not a lifetime total per run: an owner may extend a run again and again, and each extension is an explicit, audited action. Repeated grants therefore permit longer resource use, and nothing extends a run automatically. A run's total extension is bounded only by a [technical limit](./run-health.md#how-much-time-a-run-can-have-in-total). `0` turns extending off instance-wide. |
 | Stuck queued after | 600s (10m) | Seconds a run may sit queued before it's flagged waiting for worker. A Docker worker repo allowlist block is flagged as soon as it is detected instead; `0` still disables it. |

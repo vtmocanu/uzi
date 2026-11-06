@@ -461,6 +461,7 @@ export interface RunContext {
    *  field), and the executor then applies resolveAgentSelection's absent-default —
    *  which is the CORRECT answer for a gate-less run, not a fallback to tolerate. */
   approvedSelection?: AgentSelection;
+  requestedAgentSource?: AgentSource | null;
   /** Called once with the SDK session id when first observed (for /state). */
   onSessionId?(sessionId: string): void;
   /** Aborts the SDK subprocess when signalled (cancel/shutdown; wired in M4). */

@@ -82,6 +82,41 @@ function readActiveRunsBlock(body: unknown): ActiveRunsBlock | null {
   return { runs, total };
 }
 
+// The custody holds a refused delete (409 with `custody_holds`) names, so the owner can open
+// the run and resolve the hold. Additive server contract: `blocking_holds` is absent on an
+// older server, which still sends `custody_holds`.
+type BlockingHold = { holdId: string; runId: string; generation: number | null; kind: string; title: string };
+type CustodyRefusal = { workerId: string; holds: BlockingHold[]; total: number };
+
+// Reads `custody_holds` / `blocking_holds` / `blocking_holds_total` off a 409 body. Returns
+// null unless `custody_holds` is a number; a missing or malformed `blocking_holds` yields an
+// empty list (the callout still renders its lead), and malformed entries are skipped.
+function readCustodyBlock(body: unknown): { holds: BlockingHold[]; total: number } | null {
+  if (typeof body !== "object" || body === null) return null;
+  const b = body as Record<string, unknown>;
+  if (typeof b.custody_holds !== "number") return null;
+  const holds: BlockingHold[] = [];
+  if (Array.isArray(b.blocking_holds)) {
+    for (const h of b.blocking_holds) {
+      if (typeof h !== "object" || h === null) continue;
+      const e = h as Record<string, unknown>;
+      if (typeof e.hold_id !== "string" || typeof e.run_id !== "string") continue;
+      holds.push({
+        holdId: e.hold_id,
+        runId: e.run_id,
+        generation: typeof e.generation === "number" ? e.generation : null,
+        kind: typeof e.kind === "string" ? e.kind : "",
+        title: typeof e.title === "string" ? e.title : "",
+      });
+    }
+  }
+  // The total is authoritative; an older server omits it, so it falls back to custody_holds.
+  const total = typeof b.blocking_holds_total === "number" ? b.blocking_holds_total : b.custody_holds;
+  return { holds, total };
+}
+
+const custodyRefusalId = (workerId: string) => `worker-custody-refusal-${workerId}`;
+
 // Two-tab page (PRD #1063): "Your workers" (the fleet) and "Add a worker" (the forms).
 // The tab recipe is COPIED from Schedules.tsx, not extracted into a shared primitive
 // (D6): Schedules is in another PRD's diff and the other tabbed pages carry their own
@@ -184,6 +219,10 @@ export function WorkersSettings() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [activeRunsBlock, setActiveRunsBlock] = useState<ActiveRunsBlock | null>(null);
+  // The custody-hold refusal of a delete, rendered inside the acted-on row. Separate from
+  // activeRunsBlock: the page-top Alert stays the only renderer of the server message.
+  const [custodyRefusal, setCustodyRefusal] = useState<CustodyRefusal | null>(null);
+  const custodyRef = useRef<HTMLDivElement>(null);
   // newToken holds the plaintext join token for the just-created worker. It is
   // shown exactly once (only its hash is stored server-side) and cleared on the
   // next action.
@@ -329,6 +368,7 @@ export function WorkersSettings() {
       if (!acquire(workerId)) return;
       setError("");
       setActiveRunsBlock(null);
+      setCustodyRefusal(null);
       setTokenBusy(workerId);
       const mode: BindMode = choice === AUTO_OPTION ? "auto" : choice === "" ? "default" : "pinned";
       try {
@@ -359,6 +399,7 @@ export function WorkersSettings() {
       } catch (err) {
         if (mounted.current) {
           setActiveRunsBlock(null);
+          setCustodyRefusal(null);
           setError(errorMessage(err, "Failed to change the worker's token"));
         }
       } finally {
@@ -414,6 +455,7 @@ export function WorkersSettings() {
     e.preventDefault();
     setError("");
     setActiveRunsBlock(null);
+    setCustodyRefusal(null);
     setBusy(true);
     try {
       const { worker, token } = await api.createWorker(name.trim(), template);
@@ -426,6 +468,7 @@ export function WorkersSettings() {
     } catch (err) {
       if (mounted.current) {
         setActiveRunsBlock(null);
+        setCustodyRefusal(null);
         setError(errorMessage(err, "Failed to create worker"));
       }
     } finally {
@@ -439,6 +482,7 @@ export function WorkersSettings() {
     const name = workers.find((w) => w.id === id)?.name;
     setError("");
     setActiveRunsBlock(null);
+    setCustodyRefusal(null);
     setConfirmingDelete(null);
     try {
       await api.deleteWorker(id);
@@ -455,6 +499,8 @@ export function WorkersSettings() {
     } catch (err) {
       if (mounted.current) {
         setActiveRunsBlock(err instanceof ApiError && err.status === 409 ? readActiveRunsBlock(err.body) : null);
+        const custody = err instanceof ApiError && err.status === 409 ? readCustodyBlock(err.body) : null;
+        setCustodyRefusal(custody ? { workerId: id, ...custody } : null);
         setError(errorMessage(err, "Failed to delete worker"));
       }
     } finally {
@@ -499,6 +545,12 @@ export function WorkersSettings() {
   useEffect(() => {
     if (notice) noticeRef.current?.focus();
   }, [notice]);
+
+  // Same for the custody refusal: focus moves to the callout beside the row's controls
+  // (focus scrolls it into view), where the recovery steps are, not the page-top alert.
+  useEffect(() => {
+    if (custodyRefusal) custodyRef.current?.focus();
+  }, [custodyRefusal]);
 
   // Focus the confirmation when it arms, so a keyboard user meets the warning instead
   // of hunting for it, and a screen reader reads it rather than announcing nothing.
@@ -1077,6 +1129,62 @@ export function WorkersSettings() {
                         Cancel
                       </Button>
                     </div>
+                  </div>
+                )}
+                {custodyRefusal && custodyRefusal.workerId === w.id && (
+                  <div
+                    ref={custodyRef}
+                    id={custodyRefusalId(w.id)}
+                    tabIndex={-1}
+                    role="group"
+                    aria-label={`Why ${stripUnsafeChars(w.name)} cannot be deleted yet`}
+                    className="space-y-2 rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 text-xs text-muted outline-hidden"
+                  >
+                    <p className="font-medium text-fg">This worker can't be deleted yet</p>
+                    <p>These holds protect unpublished committed work from these runs. Recover it first:</p>
+                    {/* No listed hold (older server, or holds released mid-request): no list at
+                        all, so a bare "and N more" never stands alone; the page-top alert
+                        still carries the count. */}
+                    {custodyRefusal.holds.length > 0 && (
+                      <ul aria-label="Holds blocking this delete" className="space-y-1">
+                        {custodyRefusal.holds.map((h) => {
+                          const title = stripUnsafeChars(h.title).trim() || h.runId;
+                          const to = h.kind === "chat" ? `/chat/${encodeURIComponent(h.runId)}` : `/runs/${encodeURIComponent(h.runId)}`;
+                          return (
+                            <li key={h.holdId}>
+                              <Link to={to} className="underline hover:text-fg">
+                                {title}
+                              </Link>
+                              {h.generation !== null && <> gen {h.generation}</>}
+                              {" "}
+                              <Link
+                                to={`/workers?tab=workers&hold=${encodeURIComponent(h.holdId)}#recovery-hold-${h.holdId}`}
+                                className="underline hover:text-fg"
+                              >
+                                Resolve hold
+                              </Link>
+                            </li>
+                          );
+                        })}
+                        {custodyRefusal.total > custodyRefusal.holds.length && (
+                          <li>and {custodyRefusal.total - custodyRefusal.holds.length} more</li>
+                        )}
+                      </ul>
+                    )}
+                    <p>
+                      If a recovery archive exists, export it with{" "}
+                      <code className="rounded bg-raised px-1 py-0.5">uzi run export &lt;run-id&gt; --capture &lt;capture-id&gt; --output &lt;file&gt;</code>{" "}
+                      (capture ids are listed by <code className="rounded bg-raised px-1 py-0.5">uzi run recovery &lt;run-id&gt;</code>).
+                    </p>
+                    <p>
+                      A hold whose run is still in flight may release on its own once its capture or run settles. If it remains,
+                      review its recovery options in Held work.
+                    </p>
+                    <p>
+                      Or, to permanently drop that work, discard each hold explicitly with{" "}
+                      <code className="rounded bg-raised px-1 py-0.5">uzi run discard</code>;{" "}
+                      <code className="rounded bg-raised px-1 py-0.5">uzi run recovery &lt;run-id&gt;</code> lists the hold ids.
+                    </p>
                   </div>
                 )}
                 {/* Live resource gauges (PRD #49): renders only once the worker has

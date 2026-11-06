@@ -216,6 +216,10 @@ func (h *Handler) StartRunRework(w http.ResponseWriter, r *http.Request) {
 			Comments:          comments,
 			Ledger:            state,
 			QueueBound:        queueBound,
+			// An owner asked for this rework by hand: ask the forge again about authors the
+			// six-hour cache holds as not eligible (issue #3422). Unverifiable authors stay
+			// withheld, and every other check below is unchanged.
+			RecheckNotEligible: true,
 		})
 		if err != nil {
 			slog.Error("mr-rework: assess review comment authors", "error", err)

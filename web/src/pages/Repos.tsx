@@ -3,13 +3,14 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, ApiError, isHttpsUrl, type ForgeConnection, type GuardrailFinding, type ProjectSyncOwnerKind, type ProjectSyncStatus, type Repo, type ToolAllowlistEntry } from "../lib/api";
+import { api, ApiError, isHttpsUrl, type AgentSource, type ForgeConnection, type GuardrailFinding, type ProjectSyncOwnerKind, type ProjectSyncStatus, type Repo, type ToolAllowlistEntry } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { repoFindings } from "../lib/privilege";
 import { useAuth } from "../auth/AuthContext";
 import { Alert, Badge, Button, Card, cx, EmptyState, Input, ListSkeleton, PageHeader, Select, Textarea, Toggle } from "../components/ui";
 import { PipelineBadge } from "../components/PipelineBadge";
 import { RepoSetupChip } from "../components/RepoSetupChip";
+import { RepoAgentSourceSetting } from "../components/RepoAgentSourceSetting";
 import { Modal } from "../components/Modal";
 import { BoardIcon, XIcon } from "../components/icons";
 import { DocLink } from "../components/DocLink";
@@ -69,6 +70,7 @@ export function Repos() {
   const [skillsBusyId, setSkillsBusyId] = useState<string | null>(null);
   const [claudemdBusyId, setClaudemdBusyId] = useState<string | null>(null);
   const [trustBusyId, setTrustBusyId] = useState<string | null>(null);
+  const [agentSourceBusyId, setAgentSourceBusyId] = useState<string | null>(null);
   // The repo whose "Code cross-check" panel is expanded (PRD #2170 M3). Like the
   // Trusted-repo panel it renders OUTSIDE the scrolling table. Its two inputs are a
   // draft saved together in one PATCH: owner guidance and the checker's own
@@ -616,6 +618,19 @@ export function Repos() {
     }
   };
 
+  const setRepoAgentSourceDefault = async (repo: Repo, value: AgentSource | null) => {
+    setError("");
+    setAgentSourceBusyId(repo.id);
+    try {
+      const { repo: updated } = await api.setRepoAgentSourceDefault(repo.id, value);
+      setRepos((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
+    } catch (err) {
+      setError(errorMessage(err, "Update failed"));
+    } finally {
+      setAgentSourceBusyId(null);
+    }
+  };
+
   // Master control → both trust flags in one request. Enabling defaults both on
   // (the trust decision, gated behind the confirm); disabling turns both off.
   const setRepoTrust = async (repo: Repo, enabled: boolean) => {
@@ -866,7 +881,8 @@ export function Repos() {
   // snapshot; disabling every trust control while one runs serializes them.
   const anyTrustBusy =
     trustRepo != null &&
-    (skillsBusyId === trustRepo.id || claudemdBusyId === trustRepo.id || trustBusyId === trustRepo.id);
+    (skillsBusyId === trustRepo.id || claudemdBusyId === trustRepo.id || trustBusyId === trustRepo.id ||
+      agentSourceBusyId === trustRepo.id);
   // The repo whose Code cross-check panel is expanded, and its draft's state:
   // the UTF-8 byte size the server caps, and whether the draft differs from what
   // is saved (blank and null are the same saved value).
@@ -1523,6 +1539,12 @@ export function Repos() {
                     </div>
                   </div>
                 )}
+
+                <RepoAgentSourceSetting
+                  value={trustRepo.agent_source_default}
+                  disabled={anyTrustBusy}
+                  onChange={(next) => setRepoAgentSourceDefault(trustRepo, next)}
+                />
 
                 {/* Guardrails-unchanged strip — true whether or not the repo is trusted. */}
                 <div className="rounded-md border border-ok/30 bg-ok/5 p-3">

@@ -857,8 +857,8 @@ escaping sibling/symlink reads are denied. This does not prove network
 isolation. Web and CLI show bounded findings and recorded child metadata,
 with current gate reason separate from historical candidate evidence; Slack
 shows the reason without findings. See [ADR-2149](adr/2149-cross-check.md) for
-confinement/proof limits and [PRD #2149](prds/2149-plan-cross-check.md) for
-rationale, validation provenance and pending hosted acceptance. The Codex-lead
+confinement/proof limits and [PRD #2149](prds/done/2149-plan-cross-check.md) for
+rationale, validation provenance and its closed hosted acceptance (#2152). The Codex-lead
 direction is [PRD #2460](prds/done/2460-codex-lead-plan-cross-check.md) and the
 [ADR-2149 addendum](adr/2149-cross-check.md#2460-addendum-codex-lead-claude-checker). Automatic rounds extend the original #2149
 scope through [PRD #2150](prds/done/2150-plan-cross-check-auto-revise.md) and
@@ -1678,8 +1678,8 @@ chain in the diagram above, with no intervening `running`.
   one per run backing a healthy current claim without an owner decision;
   total custody remains protected. After discarded/released precedence, an OPEN
   hold at `recovery_wait` for `worker_requeue_exhausted`,
-  `worker_memory_pressure`, `retained_recovery_exhausted`, or
-  `retained_recovery_adoption_failed` reports
+  `worker_memory_pressure`, `retained_recovery_exhausted`,
+  `retained_recovery_adoption_failed`, or `retained_continuation_unwitnessed` reports
   `needs_action` after failed latest capture,
   otherwise `source_only`, before available unguarded archives or capture
   progress. Retained-recovery exhaustion keeps this conservative protection
@@ -1891,7 +1891,12 @@ chain in the diagram above, with no intervening `running`.
   never rewritten, and the paired `run_user_inputs` row is audit-only.
 - **Sweeper** (a goroutine beside the forge poller) enforces what workers
   can't be trusted to self-report: a claimed-but-never-started run older than
-  5 minutes is re-queued; a running run older than `RUN_TIMEOUT` (default 6h)
+  5 minutes is re-queued uncharged, except a retained continuation (open custody
+  hold of an earlier generation): a witnessed flight departure is charged against
+  `RUN_MAX_REQUEUES` (parking at `worker_requeue_exhausted` at the cap), and
+  presence without a departure within 2x the claim grace parks it at
+  `recovery_wait` / `retained_continuation_unwitnessed` (owner Resume or Cancel;
+  issue #3859, [docs/run-recovery-wait.md](docs/run-recovery-wait.md#unwitnessed-continuation-hold)); a running run older than `RUN_TIMEOUT` (default 6h)
   **parks** — non-terminal `paused`, `hold_reason='budget_exhausted'` — and asks
   its owner to extend or stop it, never failed for the clock alone (PRD #1497,
   see the **running → paused (wall park)** entry above); a worker whose
@@ -2038,8 +2043,9 @@ Four independent layers, any one of which failing still leaves the others:
    projects has. The one deliberate, user-gated exception is per-run agent
    selection (PRD #37): the *worker* parses `.claude/agents/*.md` (or, issue #2085,
    `.codex/agents/*.toml`, projected onto the same shape; the harness's native
-   folder wins, never merged) itself and
-   feeds them through the same programmatic `agents` map, only when the user
+   folder wins, never merged) itself, from git objects at the default-branch
+   commit the run recorded on its first claim (issue #3913), never from the
+   working tree, and feeds them through the same programmatic `agents` map, only when the user
    picks the repo source at the plan gate. `settingSources` stays `[]`; repo
    hooks/settings/commands never load; and repo subagents are still bound by
    the `disallowedTools` list and the deny-hook above. See the Repo agents docs

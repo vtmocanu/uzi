@@ -38,14 +38,6 @@ func (c *Cache) JudgeEnforceAll(ctx context.Context) (bool, error) {
 	return c.boolSetting(ctx, KeyJudgeEnforceAll)
 }
 
-// SummaryModel returns the model alias the inline run-summary generator runs on
-// (PRD #362 Decision 8). Falls back to DefaultSummaryModel ("haiku"). The per-user
-// override (users.summary_model) is resolved user-value-wins at issue-run claim
-// assembly, mirroring JudgeModel but on the issue-run claim rather than the judge.
-func (c *Cache) SummaryModel(ctx context.Context) (string, error) {
-	return c.get(ctx, KeySummaryModel)
-}
-
 // JudgeCooldownSeconds returns the per-user judge cooldown in seconds (PRD #69 M5
 // Decision 9); 0 disables the cooldown guard. Best-effort at the enqueue gate — the
 // caller proceeds (fails open) on a read error, since the guard is a soft cost
@@ -61,18 +53,6 @@ func (c *Cache) JudgeDailyBudget(ctx context.Context) (int, error) {
 	return c.intSetting(ctx, KeyJudgeDailyBudget)
 }
 
-// validateModelAlias is the format gate for the judge model setting (PRD #46): a
-// non-empty model alias / id, checked with the shared PRD #17 rules (single token,
-// no control chars, length-capped). Blank is rejected here (unlike the per-user
-// inherit case) — the judge always needs a concrete model.
-func validateModelAlias(value string) error {
-	if strings.TrimSpace(value) == "" {
-		return errors.New("must not be empty")
-	}
-	_, err := agenttmpl.ValidateModel(value)
-	return err
-}
-
 // validateCodexJudgeModel is the write-time gate for the instance Codex judge
 // model (PRD #3245): blank (or whitespace-only) is the explicit reset to the
 // built-in; otherwise the trimmed value must be a curated Codex id.
@@ -86,6 +66,23 @@ func validateCodexJudgeModel(value string) error {
 	}
 	if !agenttmpl.CuratedCodexModels[m] {
 		return errors.New("is not a Codex judge model")
+	}
+	return nil
+}
+
+// validateCodexSummaryModel is the write-time gate for the instance Codex
+// summary model (PRD #3248): blank (or whitespace-only) is the explicit reset
+// to the built-in; otherwise the trimmed value must be a Codex role id.
+func validateCodexSummaryModel(value string) error {
+	m := strings.TrimSpace(value)
+	if m == "" {
+		return nil
+	}
+	if agenttmpl.KnownClaudeAliases[m] {
+		return errors.New("must be a Codex model; this is a Claude model alias")
+	}
+	if !agenttmpl.CodexRoleModels[m] {
+		return errors.New("is not a Codex summary model")
 	}
 	return nil
 }

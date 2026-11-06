@@ -34,7 +34,7 @@ import { rmTeardownTree, type TeardownTestDeps } from "./rmtree.js";
 import { LimitReachedError, type RateLimitObservation } from "./limit.js";
 import { errMessage } from "./util.js";
 import type { Logger } from "./log.js";
-import type { WorkerClient } from "./client.js"; // type-only — erased at runtime; client.ts imports no runner/model-pass, so no cycle
+import { codexDeferralReason, type WorkerClient } from "./client.js"; // client.ts imports no runner/model-pass, so the value import of codexDeferralReason adds no cycle
 import { postTerminalState, type TerminalOutboxDeps } from "./terminal-resolve.js";
 import type { StateRequest } from "./protocol.js";
 import type { SdkQueryFn } from "./sdk-executor.js"; // type-only — erased at runtime, so no import cycle
@@ -116,6 +116,26 @@ export interface ReadOnlyModelPassOpts {
     readonly refresh?: "deny";
   };
 }
+
+/** The closed reasons a Codex model pass failed because its credential could not be used
+ *  (issue #3248 M3). Each is decided from typed evidence only, never from message text. */
+export type ModelPassCredentialReason = "refresh_denied" | "vault_locked" | "account_unavailable" | "credential_rejected";
+
+/** Thrown by the Codex path of {@link runReadOnlyModelPass} when the failure is a typed
+ *  credential-state refusal. The message is exactly the one the pass threw before this class
+ *  existed, so judge, review, plan-contract-review and Now callers see identical text. */
+export class ModelPassCredentialError extends Error {
+  constructor(readonly reason: ModelPassCredentialReason, message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "ModelPassCredentialError";
+  }
+}
+
+/** Slack (ms) under which a failure at the wall-clock deadline is still read as a timeout: the
+ *  advice harness arms its own timer a moment after the pass's, so it can reject first. It
+ *  applies only to failures out of harness.run (terminal and throw paths), never to a
+ *  buildHarness rejection, which runs before that timer exists. */
+const DEADLINE_SLACK_MS = 25;
 
 /** Default bounded grace (ms) for the aborted SDK CLI to finish exiting before its
  *  ephemeral HOME is removed. Generous versus the near-immediate ProcessTransport.close()
@@ -350,6 +370,14 @@ export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise
  * (codex-advice-harness.ts's `decodeTerminal`), so the neutral `policy` below is the whole
  * failure contract — an error terminal throws the same generic labeled error the
  * review/summary Claude callers get.
+ *
+ * Issue #3248 M3: a failure that is typed credential evidence is thrown as a
+ * {@link ModelPassCredentialError} carrying the same message the pass threw before. The evidence
+ * is: the factory's `onRefreshDenied` signal (the `refresh: "deny"` bridge refused a refresh
+ * during this call), a `buildHarness` rejection that `codexDeferralReason` classifies, or an error
+ * terminal whose materialized failure category is `authentication`. A denied refresh outranks the
+ * other two when the call ends in an error terminal or a thrown failure. A timeout or abort never
+ * classifies, and the `authorization` category is excluded (it is ambiguous).
  */
 async function runCodexAdviceModelPass(
   opts: ReadOnlyModelPassOpts,
@@ -367,9 +395,19 @@ async function runCodexAdviceModelPass(
       reject(new Error(`${opts.label} model call exceeded ${opts.timeoutMs}ms`));
     }, opts.timeoutMs);
   });
+  let refreshDenied = false;
+  // Timeout and abort never classify: the pass's own abort covers its timer and the external
+  // signal; the deadline check covers the harness's own timer rejecting a moment first (harness.run only).
+  const stopped = (): boolean => abort.signal.aborted || Date.now() >= deadlineAt - DEADLINE_SLACK_MS;
   const policy: AdviceResultPolicy = {
-    onTerminal: (_t, { isError }) => {
-      if (isError) throw new Error(`${opts.label} model call returned an error result`);
+    onTerminal: (t, { isError }) => {
+      if (!isError) return;
+      const message = `${opts.label} model call returned an error result`;
+      if (!stopped()) {
+        if (refreshDenied) throw new ModelPassCredentialError("refresh_denied", message);
+        if (terminalCategory(t) === "authentication") throw new ModelPassCredentialError("credential_rejected", message);
+      }
+      throw new Error(message);
     },
   };
   const request: AdviceRequest = {
@@ -393,12 +431,28 @@ async function runCodexAdviceModelPass(
       binding: codex.binding,
       signal: abort.signal,
       ...(codex.refresh ? { refresh: codex.refresh } : {}),
+      onRefreshDenied: () => { refreshDenied = true; },
     };
     if (owned) summaryCallDeadlines.set(params, deadlineAt);
-    const harness = await codex.buildHarness(params);
-    const result = await harness.run(owned
-      ? { ...request, timeoutMs: Math.max(0, deadlineAt - Date.now()) } : request, policy);
-    return result.text;
+    let harness: Awaited<ReturnType<typeof codex.buildHarness>>;
+    try {
+      harness = await codex.buildHarness(params);
+    } catch (err) {
+      // Only an abort suppresses the typed deferral here: the harness timer is not armed until
+      // harness.run, so a build rejection is never a harness timeout and the slack must not hide it.
+      const reason = abort.signal.aborted ? undefined : codexDeferralReason(err);
+      throw reason ? new ModelPassCredentialError(reason, errMessage(err), { cause: err }) : err;
+    }
+    try {
+      const result = await harness.run(owned
+        ? { ...request, timeoutMs: Math.max(0, deadlineAt - Date.now()) } : request, policy);
+      return result.text;
+    } catch (err) {
+      if (refreshDenied && !stopped() && !(err instanceof ModelPassCredentialError)) {
+        throw new ModelPassCredentialError("refresh_denied", errMessage(err), { cause: err });
+      }
+      throw err;
+    }
   })();
   try {
     return await Promise.race(external ? [runPromise, timeout, external.aborted] : [runPromise, timeout]);
@@ -410,6 +464,16 @@ async function runCodexAdviceModelPass(
     if (owned) await runPromise.then(() => {}, () => {});
     else await awaitQuerySettled(runPromise, opts.graceMs ?? DEFAULT_ABORT_GRACE_MS);
     usage.flush();
+  }
+}
+
+/** The category of an error terminal's failure, read through its deferred materialization.
+ *  Undefined when there is no failure or materialization throws; the pass then keeps its generic error. */
+function terminalCategory(t: { failure?: { materialize(): { failure: { category: string } } } }): string | undefined {
+  try {
+    return t.failure?.materialize().failure.category;
+  } catch {
+    return undefined;
   }
 }
 

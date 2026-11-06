@@ -201,9 +201,10 @@ func TestTaskRunDispatchGateLiveDB(t *testing.T) {
 
 	claimParams := func() store.ClaimRunParams {
 		return store.ClaimRunParams{
-			WorkerID:       pgtype.UUID{Bytes: worker, Valid: true},
-			UserID:         userID,
-			AffinityCutoff: pgtype.Timestamptz{Time: time.Now().Add(-2 * time.Minute), Valid: true},
+			WorkerID:           pgtype.UUID{Bytes: worker, Valid: true},
+			UserID:             userID,
+			AffinityCutoff:     pgtype.Timestamptz{Time: time.Now().Add(-2 * time.Minute), Valid: true},
+			WorkerProtocolCaps: []string{"repo_agent_source_v1"},
 		}
 	}
 

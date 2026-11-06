@@ -1,0 +1,250 @@
+// @vitest-environment jsdom
+import { afterEach, describe, expect, it } from "vitest";
+import { cleanup, render, screen, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import type { RunSummaryItem } from "../lib/api";
+import type { AdminRunsState } from "../lib/useOverviewData";
+import { OverviewRunsWidget } from "./OverviewRunsWidget";
+import { aRun } from "../pages/overviewFixtures";
+
+afterEach(cleanup);
+
+const NOW = Date.parse("2026-07-05T12:20:00Z");
+const ME = "admin@uzi.local";
+
+const run = (over: Partial<RunSummaryItem> = {}) => aRun(over) as RunSummaryItem;
+const theirs = (over: Partial<RunSummaryItem> = {}) => run({ owner_email: "mira@uzi.local", ...over });
+const good = (runs: RunSummaryItem[], lastOkAt: number | null = NOW): AdminRunsState => ({ runs, failed: false, lastOkAt });
+
+function mount(props: Partial<React.ComponentProps<typeof OverviewRunsWidget>> = {}) {
+  return render(
+    <MemoryRouter>
+      <OverviewRunsWidget
+        ownRuns={[]}
+        adminRuns={null}
+        isAdmin={false}
+        viewerEmail={ME}
+        now={NOW}
+        demo={false}
+        loading={false}
+        {...props}
+      />
+    </MemoryRouter>,
+  );
+}
+
+describe("OverviewRunsWidget", () => {
+  it("titles the card and links to all runs", () => {
+    mount();
+    expect(screen.getByRole("heading", { name: "Runs" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: /All runs/ }).getAttribute("href")).toBe("/runs");
+  });
+
+  it("shows only skeletons while loading", () => {
+    const { container } = mount({ loading: true, ownRuns: [run({ issue_title: "Hidden while loading" })] });
+    expect(screen.queryByText("Hidden while loading")).toBeNull();
+    expect(screen.queryByText(/No active runs/)).toBeNull();
+    expect(container.querySelectorAll(".animate-pulse").length).toBeGreaterThan(0);
+  });
+
+  it("shows an admin both groups, and excludes terminal runs and the admin's own rows from Other users", () => {
+    mount({
+      isAdmin: true,
+      ownRuns: [run({ id: "mine", issue_title: "My active" }), run({ id: "mine-done", status: "completed", issue_title: "My done" })],
+      adminRuns: good([
+        run({ id: "mine", owner_email: ME, issue_title: "My active" }),
+        theirs({ id: "t1", issue_title: "Their active" }),
+        theirs({ id: "t2", status: "failed", issue_title: "Their failed" }),
+      ]),
+    });
+    expect(screen.getByText("Yours")).toBeTruthy();
+    expect(screen.getByText("Other users (admin)")).toBeTruthy();
+    const mine = within(screen.getByRole("list", { name: "Your runs" }));
+    expect(mine.getByText("My active")).toBeTruthy();
+    expect(mine.queryByText("My done")).toBeNull();
+    const others = within(screen.getByRole("list", { name: "Other users' runs" }));
+    expect(others.getByText("Their active")).toBeTruthy();
+    expect(others.queryByText("Their failed")).toBeNull();
+    expect(others.queryByText("My active")).toBeNull();
+    expect(others.getByText("mira@uzi.local")).toBeTruthy();
+  });
+
+  it("lists another user's awaiting_approval run only in Other users, with no action", () => {
+    mount({
+      isAdmin: true,
+      adminRuns: good([theirs({
+          id: "t1",
+          status: "awaiting_approval",
+          issue_title: "Their plan",
+          progress: { state: "waiting", pct: null, milestone_done: 0, milestone_total: 0, active_milestone_id: "", phase: "" },
+        })]),
+    });
+    const others = within(screen.getByRole("list", { name: "Other users' runs" }));
+    expect(others.getByText("Their plan")).toBeTruthy();
+    expect(screen.queryByRole("link", { name: "Review plan" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Review plan" })).toBeNull();
+    // The only link in the group is the stretched run overlay.
+    expect(others.getAllByRole("link").map((a) => a.getAttribute("href"))).toEqual(["/runs/t1"]);
+    // The row says the run waits on its owner, never on the viewer.
+    expect(others.getByText(/waits on owner/)).toBeTruthy();
+    expect(others.queryByText(/waits on you/)).toBeNull();
+  });
+
+  it("shows a non-admin only their own group", () => {
+    mount({
+      ownRuns: [run({ issue_title: "Mine" })],
+      // Even if rows were passed, a non-admin never renders them.
+      adminRuns: good([theirs({ issue_title: "Theirs" })]),
+    });
+    expect(screen.getByText("Mine")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Yours" })).toBeTruthy();
+    expect(screen.queryByText("Theirs")).toBeNull();
+    expect(screen.queryByText(/Other users/)).toBeNull();
+  });
+
+  it("hides the Other users group when it is empty and the read is healthy", () => {
+    mount({ isAdmin: true, ownRuns: [run()], adminRuns: good([theirs({ status: "completed" })]) });
+    expect(screen.queryByText("Other users (admin)")).toBeNull();
+    expect(screen.queryByText(/unavailable/)).toBeNull();
+  });
+
+  it("shows the empty state for Yours", () => {
+    mount({ ownRuns: [run({ status: "completed" })] });
+    expect(screen.getByText("No active runs. Start one from a board card.")).toBeTruthy();
+  });
+
+  it("says other users' runs are unavailable, with the last good read, instead of stale rows", () => {
+    mount({
+      isAdmin: true,
+      ownRuns: [run()],
+      adminRuns: { runs: [theirs({ issue_title: "Stale row" })], failed: true, lastOkAt: NOW - 5 * 60_000 },
+    });
+    const heading = screen.getByText("Other users (admin)");
+    expect(heading.className).toContain("text-brand");
+    // Only the static sentence is the live region; the ticking read time sits outside it.
+    expect(screen.getByRole("status").textContent).toBe("Other users' runs are unavailable");
+    expect(screen.getByRole("status").parentElement?.textContent).toBe("Other users' runs are unavailable (last read 5m ago)");
+    expect(screen.queryByText("Stale row")).toBeNull();
+    expect(screen.queryByRole("list", { name: "Other users' runs" })).toBeNull();
+  });
+
+  it("omits the read time when no read ever succeeded", () => {
+    mount({ isAdmin: true, adminRuns: { runs: null, failed: true, lastOkAt: null } });
+    expect(screen.getByRole("status").textContent).toBe("Other users' runs are unavailable");
+  });
+
+  it("masks the owner email on the text and the title attribute in demo mode", () => {
+    const raw = "mira.kovacs@uzi.local";
+    mount({
+      isAdmin: true,
+      demo: true,
+      adminRuns: good([theirs({ owner_email: raw })]),
+    });
+    const label = screen.getByText("Mira");
+    expect(label.getAttribute("title")).toBe("Mira");
+    expect(label.getAttribute("title")).not.toBe(raw);
+    expect(screen.queryByText(raw)).toBeNull();
+    expect(document.body.innerHTML).not.toContain(raw);
+  });
+
+  describe("with a stage picked on the issue-work line", () => {
+    const own = [
+      run({ id: "o-plan", status: "awaiting_approval", issue_title: "Own plan" }),
+      run({ id: "o-build", status: "running", issue_title: "Own build" }),
+      run({
+        id: "o-pr",
+        status: "completed",
+        mr_iid: 3,
+        mr_state: "opened",
+        finished_at: "2026-07-05T12:00:00Z",
+        issue_title: "Own PR",
+      }),
+    ];
+    const others = [
+      theirs({ id: "t-plan", status: "awaiting_approval", issue_title: "Their plan" }),
+      theirs({ id: "t-build", status: "running", issue_title: "Their build" }),
+    ];
+    const prRuns = [own[2]];
+    const base = { isAdmin: true, ownRuns: own, adminRuns: good(others), prRuns };
+    const titles = (list: string) =>
+      within(screen.getByRole("list", { name: list })).getAllByRole("listitem").map((li) => li.textContent ?? "");
+    const scope = () => screen.getByRole("link", { name: /All runs/ }).previousElementSibling?.textContent;
+
+    it("reads Active runs and shows every active run without a stage", () => {
+      mount(base);
+      expect(scope()).toBe("Active runs");
+      expect(titles("Your runs")).toHaveLength(2);
+      expect(titles("Other users' runs")).toHaveLength(2);
+    });
+
+    it("keeps only the runs at the stage in both groups, and names the stage in the card head", () => {
+      mount({ ...base, stage: "review" });
+      expect(scope()).toBe("Plan review");
+      expect(titles("Your runs")).toEqual([expect.stringContaining("Own plan")]);
+      expect(titles("Other users' runs")).toEqual([expect.stringContaining("Their plan")]);
+    });
+
+    it("lists the open pull requests under Yours at the PR stage, and none under Other users", () => {
+      mount({ ...base, stage: "pr" });
+      expect(scope()).toBe("Open pull requests");
+      expect(titles("Your runs")).toEqual([expect.stringContaining("Own PR")]);
+      expect(screen.queryByRole("list", { name: "Other users' runs" })).toBeNull();
+      expect(screen.queryByText("Other users (admin)")).toBeNull();
+    });
+
+    it("lists one row for two runs of one pull request", () => {
+      const first = run({ id: "pr-a", status: "completed", mr_iid: 9, mr_state: "opened", finished_at: "2026-07-05T11:00:00Z", issue_title: "Older" });
+      const second = { ...first, id: "pr-b", finished_at: "2026-07-05T12:00:00Z", issue_title: "Newer" };
+      mount({ ownRuns: [first, second], prRuns: [second], stage: "pr" });
+      expect(titles("Your runs")).toEqual([expect.stringContaining("Newer")]);
+    });
+
+    it("hides an empty group, with no empty-state sentence", () => {
+      mount({ ...base, adminRuns: good([]), stage: "review" });
+      expect(screen.getByText("Yours")).toBeTruthy();
+      expect(screen.queryByText("Other users (admin)")).toBeNull();
+      cleanup();
+      mount({ ...base, ownRuns: [run({ id: "b", status: "running" })], stage: "review" });
+      expect(screen.queryByText("Yours")).toBeNull();
+      expect(screen.queryByRole("list", { name: "Your runs" })).toBeNull();
+      expect(screen.queryByText(/No active runs/)).toBeNull();
+      expect(screen.getByText("Other users (admin)")).toBeTruthy();
+    });
+
+    it("says No runs at this stage when both groups are empty", () => {
+      mount({ ...base, stage: "parked" });
+      expect(screen.getByText("No runs at this stage.")).toBeTruthy();
+      expect(screen.queryByText("Yours")).toBeNull();
+      expect(screen.queryByText(/No active runs/)).toBeNull();
+    });
+
+    it("keeps the unavailable notice visible under a filter", () => {
+      mount({ ...base, adminRuns: { runs: null, failed: true, lastOkAt: null }, stage: "review" });
+      expect(screen.getByRole("status").textContent).toBe("Other users' runs are unavailable");
+      expect(titles("Your runs")).toHaveLength(1);
+    });
+
+    it("ignores the last good rows of a failed admin read under a filter, as the line does", () => {
+      const stale = [theirs({ id: "t-q", status: "awaiting_input", issue_title: "Stale question" })];
+      const failed = { runs: stale, failed: true, lastOkAt: NOW - 60_000 };
+      mount({ isAdmin: true, ownRuns: [run({ id: "o-b", status: "running" })], adminRuns: failed, stage: "asking" });
+      expect(scope()).toBe("Asking you");
+      expect(screen.getByText("No runs at this stage.")).toBeTruthy();
+      expect(screen.queryByText("Stale question")).toBeNull();
+      expect(screen.getByRole("status").textContent).toBe("Other users' runs are unavailable");
+      cleanup();
+      mount({ isAdmin: true, ownRuns: [run({ id: "o-q", status: "awaiting_input" })], adminRuns: failed, stage: "asking" });
+      expect(scope()).toBe("Asking you");
+      expect(screen.queryByText("No runs at this stage.")).toBeNull();
+    });
+
+    it("calls the asking group Questions when another user's question is in it", () => {
+      const q = [theirs({ id: "t-q", status: "awaiting_input" })];
+      mount({ isAdmin: true, ownRuns: [run({ id: "o-q", status: "awaiting_input" })], adminRuns: good(q), stage: "asking" });
+      expect(scope()).toBe("Questions");
+      cleanup();
+      mount({ isAdmin: true, ownRuns: [run({ id: "o-q", status: "awaiting_input" })], adminRuns: good([]), stage: "asking" });
+      expect(scope()).toBe("Asking you");
+    });
+  });
+});

@@ -212,7 +212,11 @@ park of that cause retries itself and keeps polling. An integrity refusal,
 `STOP=recovery_wait:retained_recovery_adoption_failed`) regardless of retry timing:
 local work and custody are preserved, with no automatic retry. Back up available
 work, then ask the owner to Resume or Cancel; Resume requests a bounded attempt,
-not assured success, and another adoption failure holds again. Other
+not assured success, and another adoption failure holds again. A server-only
+`retained_continuation_unwitnessed` park (claimed flight never witnessed starting;
+claim released, work and custody preserved, no automatic retry; not an integrity
+refusal) stops the same way (`STOP=recovery_wait:retained_continuation_unwitnessed`)
+regardless of retry timing: back up, then ask the owner to Resume or Cancel. Other
 `recovery_wait` causes keep polling under their existing rules. Every `worker_memory_pressure`
 park stops with `STOP=recovery_wait:worker_memory_pressure` (exit 0), regardless of `memory_hold`:
 remaining interventions do not authorize automatic retries. Back up available work first,

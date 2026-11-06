@@ -93,6 +93,16 @@ func TestGetSettingsSurfacesDefaults(t *testing.T) {
 	if resp.Settings[settings.KeyCodexJudgeModel] != "gpt-6.1-sol" || resp.Sources[settings.KeyCodexJudgeModel] != "default" {
 		t.Errorf("codex_judge_model = %q / %q, want gpt-6.1-sol / default", resp.Settings[settings.KeyCodexJudgeModel], resp.Sources[settings.KeyCodexJudgeModel])
 	}
+	// The summary keys (PRD #3248) surface both built-ins the same way.
+	if resp.Defaults[settings.KeySummaryModel] != "haiku" || resp.Defaults[settings.KeyCodexSummaryModel] != "gpt-6-luna" {
+		t.Errorf("summary defaults = %q / %q, want haiku / gpt-6-luna", resp.Defaults[settings.KeySummaryModel], resp.Defaults[settings.KeyCodexSummaryModel])
+	}
+	if resp.Settings[settings.KeySummaryModel] != "haiku" || resp.Sources[settings.KeySummaryModel] != "default" {
+		t.Errorf("summary_model = %q / %q, want haiku / default", resp.Settings[settings.KeySummaryModel], resp.Sources[settings.KeySummaryModel])
+	}
+	if resp.Settings[settings.KeyCodexSummaryModel] != "gpt-6-luna" || resp.Sources[settings.KeyCodexSummaryModel] != "default" {
+		t.Errorf("codex_summary_model = %q / %q, want gpt-6-luna / default", resp.Settings[settings.KeyCodexSummaryModel], resp.Sources[settings.KeyCodexSummaryModel])
+	}
 	// An empty stored row reads as the built-in with source default.
 	if resp.Settings[settings.KeyJudgeModel] != "opus" || resp.Sources[settings.KeyJudgeModel] != "default" {
 		t.Errorf("judge_model = %q / %q, want opus / default", resp.Settings[settings.KeyJudgeModel], resp.Sources[settings.KeyJudgeModel])
@@ -297,5 +307,24 @@ func TestUpdateSettingsCrossKeyUsesMergedState(t *testing.T) {
 	h.UpdateSettings(rec, putSettings(&admin, `{"settings":{"autopilot_label":"uzi"}}`))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 for autopilot_label==stored uzi_label", rec.Code)
+	}
+}
+
+// PRD #3248: the admin PUT refuses a Claude alias on the Codex summary key (a 400
+// naming the key) before it touches the database.
+func TestUpdateSettingsCodexSummaryModelRejectsClaudeAlias(t *testing.T) {
+	h := newSettingsHandler()
+	admin := adminUser()
+	for _, bad := range []string{"opus", "gpt-7-x", "two words"} {
+		rec := httptest.NewRecorder()
+		h.UpdateSettings(rec, putSettings(&admin, `{"settings":{"codex_summary_model":"`+bad+`"}}`))
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "codex_summary_model") {
+			t.Errorf("%q: status=%d body=%s, want 400 naming codex_summary_model", bad, rec.Code, rec.Body.String())
+		}
+	}
+	rec := httptest.NewRecorder()
+	h.UpdateSettings(rec, putSettings(&admin, `{"settings":{"summary_model":"gpt-6-luna"}}`))
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "summary_model") {
+		t.Errorf("Codex id on summary_model: status=%d body=%s, want 400", rec.Code, rec.Body.String())
 	}
 }

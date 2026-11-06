@@ -1,5 +1,6 @@
 import type {
   AdminBlockedRepos,
+  AgentSource,
   AdminDockerAllowlistRepos,
   GuardrailOverrideRequest,
   OverrideRequestState,
@@ -331,13 +332,13 @@ export const forgeApi = {
     if (keys.some((k) => !own.has(k))) {
       throw new ApiError(
         400,
-        "code cross-check inputs, repo_devbox_opt_in, required_capabilities, repo_fold_improve_uzi_backlog, and the trust flags cannot be combined in one request",
+        "code cross-check inputs, repo_devbox_opt_in, required_capabilities, repo_fold_improve_uzi_backlog, agent_source_default, and the trust flags cannot be combined in one request",
       );
     }
     if (keys.length === 0) {
       throw new ApiError(
         400,
-        "provide code cross-check inputs, repo_devbox_opt_in, required_capabilities, repo_fold_improve_uzi_backlog, or at least one trust flag",
+        "provide code cross-check inputs, repo_devbox_opt_in, required_capabilities, repo_fold_improve_uzi_backlog, agent_source_default, or at least one trust flag",
       );
     }
     const g = inputs.code_cross_check_guidance;
@@ -362,6 +363,12 @@ export const forgeApi = {
     const r = repos.find((x) => x.id === id);
     if (!r) throw new ApiError(404, "repo not found");
     r.repo_fold_improve_uzi_backlog = enabled;
+    return delay({ repo: { ...r } });
+  },
+  setRepoAgentSourceDefault: async (id: string, value: AgentSource | null) => {
+    const r = repos.find((x) => x.id === id);
+    if (!r) throw new ApiError(404, "repo not found");
+    r.agent_source_default = value;
     return delay({ repo: { ...r } });
   },
   // PRD #84 M2: static per-repo capability hint. Mirrors the server's

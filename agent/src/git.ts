@@ -19,6 +19,7 @@ import { PassThrough, Readable, Transform, Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { RUN_KINDS, type RunKind } from "./protocol.js";
 import type { Logger } from "./log.js";
+import type { RepoAgentRevisionReader, RepoAgentTreeEntry } from "./repoagents.js";
 import type { PlanCrossCheckDiffRefusal } from "./client.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest, BoundaryStep } from "./harness.js";
 import { CheckpointChildStartupTimeoutError } from "./harness.js";
@@ -906,6 +907,40 @@ const GIT_TIMEOUT_MS = 10 * 60_000; // 10m — clones can be large on cold cache
  *  files, so it is bounded far below GIT_TIMEOUT_MS (a planted FIFO would otherwise stall it). */
 const SCRATCH_IGNORE_CHECK_TIMEOUT_MS = 15_000;
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
+/** Caps for {@link GitCache.inventorySourceContentProof} and {@link GitCache.inventoryIgnoredResidue}: tracked entries
+ *  examined, and bytes of any one command's output or of the hashed-path stdin. A hit is `over_bound`. */
+export interface InventoryContentProofBounds {
+  maxEntries: number;
+  /** Bytes of any one listing's output. */
+  maxBytes: number;
+  /**
+   * Cap on the cumulative REAL `st_size` (lstat of the worktree file, 64-bit) of every regular tracked file
+   * `hash-object` would read, i.e. the bytes it actually reads (default {@link INVENTORY_CONTENT_PROOF_BOUNDS}). It is
+   * charged before status, check-attr or hash-object run; the declared `%(objectsize)` is only an extra early
+   * refusal. The total wall budget below bounds the time of the git calls; it does not bound a file that keeps growing.
+   */
+  maxContentBytes?: number;
+  /** Epoch ms the caller's operation ends; the proof's total budget is clipped to it. A passed deadline is unreadable. */
+  deadlineAt?: number;
+}
+export const INVENTORY_CONTENT_PROOF_BOUNDS = { maxEntries: 50_000, maxBytes: 8 * 1024 * 1024, maxContentBytes: 256 * 1024 * 1024 } as const;
+/** Used by the PREDECESSOR path only; the ordinary terminal FINAL keeps `worktreeStatus`.
+ *  Total wall budget for the WHOLE content proof (or the whole residue listing), shared by all of its git calls:
+ *  each call's timeout is the time left in it, and an exhausted budget is unreadable. */
+const INVENTORY_PROOF_TOTAL_BUDGET_MS = 60_000;
+
+/** The one `ls-files --directory` entry that is not residue: `.uzi/` collapsed because it is ignored as a whole. */
+const UZI_DIR_ENTRY = Buffer.from(".uzi/");
+
+/** Split NUL-terminated records (the `-z` form); undefined when non-empty output is not NUL-terminated. */
+function splitNulRecords(buf: Buffer): Buffer[] | undefined {
+  if (buf.length === 0) return [];
+  if (buf[buf.length - 1] !== 0) return undefined;
+  const records: Buffer[] = [];
+  let start = 0;
+  for (let i = buf.indexOf(0); i >= 0; start = i + 1, i = buf.indexOf(0, start)) records.push(buf.subarray(start, i));
+  return records;
+}
 /** Wall-clock ceiling on the preserved_patch scan (the patch is already byte-capped by
  *  REVIEW_DIFF_MAX_BYTES, so gitleaks stdin finishes in well under a second in practice). */
 const PATCH_SCAN_TIMEOUT_MS = 2 * 60_000;
@@ -1269,6 +1304,14 @@ const SHA40_RE = /^[0-9a-f]{40}$/;
 /** Env that stops replace refs from bending reachability or tree reads in the stopped-source proof. */
 const NO_REPLACE_ENV: NodeJS.ProcessEnv = { GIT_NO_REPLACE_OBJECTS: "1" };
 const NO_REPLACE = { env: NO_REPLACE_ENV };
+/** Original-object read view for the report-only orphan proofs (#3944): no replace refs, no
+ *  `info/grafts`, and a disabled replace-ref namespace. Shallow state is deliberately NOT
+ *  overridden, so `--is-shallow-repository` still reports the real answer. */
+const PROOF_READ_ENV: NodeJS.ProcessEnv = {
+  ...NO_REPLACE_ENV,
+  GIT_GRAFT_FILE: "/dev/null",
+  GIT_REPLACE_REF_BASE: "refs/disabled/",
+};
 /** Read-only `status` of a kept clone: GIT_OPTIONAL_LOCKS=0 stops git rewriting the clone's .git/index stat cache. */
 const READ_ONLY_STATUS = { env: { ...NO_REPLACE_ENV, GIT_OPTIONAL_LOCKS: "0" } as NodeJS.ProcessEnv };
 /** Bounds for the stopped-source ref proof: shas per rev-list argv, and refs beyond which coverage is not claimed. */
@@ -3136,7 +3179,14 @@ export class GitCache {
   }
 
   /** Local recovery clocks, including queued locks and actual child settlement. */
-  async withRecoveryOperation<T>(signal: AbortSignal, deadline: number, action: (signal: AbortSignal) => Promise<T>, budget?: MaintenanceBudget): Promise<T> {
+  async withRecoveryOperation<T>(signal: AbortSignal, deadline: number, action: (signal: AbortSignal) => Promise<T>, budget?: MaintenanceBudget,
+    opts?: { closureBudget?: { delivered: number; limit: number } }): Promise<T> {
+    // A caller-shared decoded-byte account is used by identity, but never above this cache's own ceiling.
+    if (opts?.closureBudget) {
+      // A NaN or negative limit is a refusal (0 admits nothing); anything else is capped at the ceiling.
+      const requested = opts.closureBudget.limit;
+      opts.closureBudget.limit = Number.isNaN(requested) || requested < 0 ? 0 : Math.min(requested, this.recoveryDecodedLimitBytes);
+    }
     const parent = this.recoveryOperations.getStore();
     budget = parent?.budget ?? MaintenanceBudget.current() ?? budget;
     deadline = Math.min(deadline, parent?.deadline ?? Infinity);
@@ -3152,7 +3202,9 @@ export class GitCache {
       combined.throwIfAborted();
       budget?.check();
       return this.recoveryOperations.run({ signal: combined, deadline, budget,
-        closureBudget: parent?.closureBudget ?? { delivered: 0, limit: this.recoveryDecodedLimitBytes },
+        // An explicit closureBudget is used by identity (never copied): the caller shares one mutable decoded-byte
+        // account across several operations, independent of the ambient parent's.
+        closureBudget: opts?.closureBudget ?? parent?.closureBudget ?? { delivered: 0, limit: this.recoveryDecodedLimitBytes },
         closureCache: parent?.closureCache ?? { identities: new Map(), entries: 0 },
       }, async () => {
         const result = await action(combined);
@@ -3616,7 +3668,8 @@ export class GitCache {
   }
 
   /** Clone the repo bare if absent, else fetch to refresh. Returns the bare path. */
-  async ensureClone(repoUrl: string, pat?: string, username?: string, checkpointKey?: string, onDirectSuccess?: () => void): Promise<string> {
+  async ensureClone(repoUrl: string, pat?: string, username?: string, checkpointKey?: string, onDirectSuccess?: () => void,
+    defaultBranch?: { name: string; tip?: string }): Promise<string> {
     const barePath = this.barePathFor(repoUrl);
     const scope = httpScopeForUrl(repoUrl);
     return this.withLock(barePath, async () => {
@@ -3652,6 +3705,7 @@ export class GitCache {
           label: "clone/fetch",
         });
       }
+      if (defaultBranch) defaultBranch.tip = await this.defaultBranchTip(barePath, defaultBranch.name);
       if (checkpointKey !== undefined) {
         if (!/^uzi\/task\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(checkpointKey)) throw new Error("invalid task checkpoint key");
         const proofKey = barePath + "\n" + checkpointKey;
@@ -6081,6 +6135,42 @@ export class GitCache {
   async revParse(barePath: string, rev: string): Promise<string | null> {
     const sha = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", rev])).trim();
     return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+  }
+
+  private async defaultBranchTip(barePath: string, name: string): Promise<string | undefined> {
+    if (!(await this.isRemoteBranchName(barePath, name))) return undefined;
+    return (await this.originBranchTip(barePath, name)) ?? undefined;
+  }
+
+  async ensureCommitPresent(barePath: string, commit: string, repoUrl: string, pat?: string, username?: string): Promise<boolean> {
+    if (!SHA40_RE.test(commit)) return false;
+    const present = async (): Promise<boolean> => (await this.revParse(barePath, `${commit}^{commit}`)) === commit;
+    if (await present()) return true;
+    try {
+      await this.withLock(barePath, () =>
+        this.runGit(barePath, ["fetch", "--no-tags", "--no-write-fetch-head", "origin", commit], pat, httpScopeForUrl(repoUrl), username));
+    } catch (err) {
+      if (err instanceof RunResidueBlockedError || isAbortLike(err)) throw err;
+      this.log.warn("could not fetch a pinned commit", { commit, error: gitErrorMessage(err) });
+    }
+    return present();
+  }
+
+  revisionTreeReader(barePath: string, commit: string): RepoAgentRevisionReader {
+    if (!SHA40_RE.test(commit)) throw new Error("revision tree reader needs a full commit id");
+    const lsTree = async (args: string[]): Promise<RepoAgentTreeEntry[]> =>
+      parseLsTree(await this.runGit(barePath, ["--no-replace-objects", "ls-tree", "-z", "-l", ...args]));
+    return {
+      entry: async (repoPath) => (await lsTree([commit, "--", repoPath])).find((e) => e.name === repoPath),
+      list: async (treeOid) => {
+        if (!SHA40_RE.test(treeOid)) throw new Error("invalid tree id");
+        return lsTree([treeOid]);
+      },
+      blob: async (oid) => {
+        if (!SHA40_RE.test(oid)) throw new Error("invalid blob id");
+        return this.runGit(barePath, ["--no-replace-objects", "cat-file", "blob", oid]);
+      },
+    };
   }
 
   /** PRD #1416 M3 — point the worker-side tracking ref `refs/uzi-runner/<branch>` at `sha`
@@ -11354,10 +11444,12 @@ export class GitCache {
   /** Read only worker-journaled/ledger-owned heads. Ref files are size-bounded;
    * no retries, and any failed sibling read refuses the whole verification.
    * Runner config is never consulted, and every traversed component rejects symlinks. */
-  async readInventoryCloneHeads(barePath: string, runId: string, underLock = false): ReturnType<GitCache["readInventoryCloneHeadsUnderLock"]> {
+  async readInventoryCloneHeads(barePath: string, runId: string, underLockOrOptions: boolean | { cloneIdentity?: boolean } = false): ReturnType<GitCache["readInventoryCloneHeadsUnderLock"]> {
+    const underLock = typeof underLockOrOptions === "boolean" ? underLockOrOptions : false;
+    const cloneIdentity = typeof underLockOrOptions === "object" && underLockOrOptions.cloneIdentity === true;
     if (underLock) return this.readInventoryCloneHeadsUnderLock(barePath, runId);
     try {
-      return await this.withLock(barePath, () => this.readInventoryCloneHeadsUnderLock(barePath, runId));
+      return await this.withLock(barePath, () => this.readInventoryCloneHeadsUnderLock(barePath, runId, cloneIdentity));
     } catch (err) {
       this.checkRecoveryInterruption();
       if (this.reportProofs.getStore()) throw err;
@@ -11366,7 +11458,7 @@ export class GitCache {
   }
 
   /** Observational variant: the caller already holds B. */
-  async readInventoryCloneHeadsUnderLock(barePath: string, runId: string): Promise<
+  async readInventoryCloneHeadsUnderLock(barePath: string, runId: string, cloneIdentity = false): Promise<
     { kind: "verified"; heads: string[]; clones: Array<{ clonePath: string; branch: string; runId: string; head?: string; identity?: string }>; foreignOwners: string[] } | { kind: "unknown"; cause?: InventoryReadCause }
   > {
     let cause: InventoryReadCause = "other";
@@ -11493,7 +11585,8 @@ export class GitCache {
           const head = await atFailure("clone_head_unreadable", () => this.readReportCloneHead(clone));
           heads.add(head);
           clones.push({ clonePath: clone, ...owner,
-            ...(this.reportProofs.getStore() ? { head, identity: `${st.dev}:${st.ino}` } : {}) });
+            // cloneIdentity adds the per-clone tuple parts without report-proof semantics (presence stays optional).
+            ...(this.reportProofs.getStore() || cloneIdentity ? { head, identity: `${st.dev}:${st.ino}` } : {}) });
         }
         return { kind: "verified", heads: [...heads], clones, foreignOwners: [...foreignOwners] };
       }
@@ -13311,17 +13404,19 @@ export class GitCache {
     headroom = 0,
     /** issue #2753: opt-in. Also accept a `wip(park):` marker whose single parent is a strict
      *  ancestor of `excludeTip` (the recommit that followed the park). Default: wrappers only. */
-    opts: { allowParkMarkers?: boolean } = {},
+    opts: { allowParkMarkers?: boolean; env?: NodeJS.ProcessEnv } = {},
   ): Promise<boolean> {
     try {
       if (!SHA40_RE.test(tip) || !SHA40_RE.test(excludeTip)) return false;
+      // opts.env (the #3944 proof's PROOF_READ_ENV) applies to every read below; adoption passes none.
+      const readEnv = opts.env ? { ...gitEnv(), ...opts.env } : gitEnv();
       const listed = await this.execScoped(
         "git",
         withDir(barePath, [
           "log", "-z", "--format=%H%x1f%P%x1f%s", tip, `^${excludeTip}`,
           `--max-count=${this.chainMaxWrappers + headroom + 1}`,
         ]),
-        { env: gitEnv(), timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER },
+        { env: readEnv, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER },
       );
       const out = listed.stdout;
       if (out === "") return true;
@@ -13342,7 +13437,10 @@ export class GitCache {
           if (parents.length !== 1) return false;
           const markerParent = parents[0]!;
           if (markerParent === excludeTip) return false;
-          if (!(await this.isAncestor(barePath, markerParent, excludeTip))) return false;
+          const ancestry = opts.env
+            ? await this.tryGitExit(barePath, ["merge-base", "--is-ancestor", markerParent, excludeTip], undefined, undefined, opts.env)
+            : await this.tryGit(barePath, ["merge-base", "--is-ancestor", markerParent, excludeTip]);
+          if (ancestry !== 0) return false;
           continue;
         }
         if (!subject.startsWith(OVERLAY_COMMIT_PREFIX) || parents.length < 1) return false;
@@ -13351,7 +13449,7 @@ export class GitCache {
         const diff = await this.execScoped(
           "git",
           withDir(barePath, ["diff-tree", "-r", "-z", "--no-renames", "--name-only", last, oid]),
-          { env: gitEnv(), timeout: GIT_TIMEOUT_MS, maxBuffer: this.chainMaxDiffBytes },
+          { env: readEnv, timeout: GIT_TIMEOUT_MS, maxBuffer: this.chainMaxDiffBytes },
         );
         if (diff.stdout !== "" && !diff.stdout.endsWith("\0")) return false;
         const paths = diff.stdout === "" ? [] : diff.stdout.slice(0, -1).split("\0");
@@ -15187,6 +15285,201 @@ try {
         error: gitErrorMessage(err),
       });
       return null;
+    }
+  }
+
+  /**
+   * Strict, byte-exact working-tree proof for the PREDECESSOR inventory FINAL source boundary (issue #2969); the
+   * ordinary terminal FINAL does not use it. Unlike
+   * {@link worktreeStatus} it never trusts the index stat cache alone and refuses anything it cannot read exactly:
+   * Steps, in code order:
+   *  1. `ls-files -v -z`: any tag but `H` (assume-unchanged, skip-worktree, unmerged) is unreadable;
+   *  2. `ls-files -z --format=...` (mode, id, stage, declared size, path): a malformed record, a non-zero stage or a
+   *     gitlink is unreadable; symlinks (mode 120000) are covered by status and are not hashed;
+   *  3. a regular file whose path holds an LF, starts with `"` or ends with CR is refused (unreadable) BEFORE any
+   *     dispatch: `hash-object --stdin-paths` reads one path per line, C-unquotes a leading quote and strips a
+   *     trailing CR, so such a path would hash a different file;
+   *  4. the size cap (over_bound): the declared index size is only a cheap early refusal; the bound is the REAL
+   *     `lstat` `st_size` of every regular entry (64-bit, Buffer path), charged BEFORE status, check-attr or
+   *     hash-object read anything. A non-regular entry is unreadable, a missing one dirty. The entry cap and
+   *     every listing's byte cap are over_bound too;
+   *  5. `status --porcelain=v1 -z --untracked-files=all` with checkStat/trustctime/untrackedCache pinned (non-zero
+   *     exit or any stderr: unreadable; any output: dirty);
+   *  6. `check-attr filter` (defence in depth; see the comment at the call);
+   *  7. `hash-object --no-filters --stdin-paths` over the exact path bytes (stdin only, never argv), exactly one
+   *     object id per path, in order, in the repository's object format (`rev-parse --show-object-format`);
+   *  8. each id must equal the index blob id, else dirty (content that differs with an unchanged stat is dirty).
+   * Every call pins `--git-dir`/`--work-tree` and `GIT_NO_REPLACE_OBJECTS`, and draws on ONE total wall budget.
+   *
+   * The size bound assumes the runner's quiescence proof. The scoped quiescence scan does not prove that no
+   * arbitrary writer exists: a writer that escaped the scope (cwd outside the clone, no attempt marker) can change
+   * source after the last proof, so later bytes may be missing from the archive. The wall budget bounds the git
+   * calls, not a growing file. Related design work: #3831 (not a fix).
+   * Runs as the runner uid with GIT_OPTIONAL_LOCKS=0 and never decodes a path to a JS string.
+   */
+  async inventorySourceContentProof(cwd: string, bounds: InventoryContentProofBounds = INVENTORY_CONTENT_PROOF_BOUNDS):
+    Promise<"clean" | "dirty" | "unreadable" | "over_bound"> {
+    const maxContentBytes = bounds.maxContentBytes ?? INVENTORY_CONTENT_PROOF_BOUNDS.maxContentBytes;
+    try {
+      const pinned = await this.pinnedInventoryGit(cwd, bounds);
+      if (!pinned) return "unreadable";
+      const run = pinned;
+      const flags = await run(["ls-files", "-v", "-z"]);
+      if (!flags) return "unreadable";
+      if (flags.exceeded) return "over_bound";
+      if (flags.code !== 0 || flags.stderr.length > 0) return "unreadable";
+      const staged = await run(["ls-files", "-z", "--format=%(objectmode) %(objectname) %(stage) %(objectsize)%x09%(path)"]);
+      if (!staged) return "unreadable";
+      if (staged.exceeded) return "over_bound";
+      if (staged.code !== 0 || staged.stderr.length > 0) return "unreadable";
+      const tagged = splitNulRecords(flags.stdout), records = splitNulRecords(staged.stdout);
+      if (!tagged || !records || tagged.length !== records.length) return "unreadable";
+      if (records.length > bounds.maxEntries) return "over_bound";
+      if (tagged.some(r => r.length < 3 || r[0] !== 0x48 || r[1] !== 0x20)) return "unreadable";
+      const files: Array<{ path: Buffer; oid: string }> = [];
+      let contentBytes = 0;
+      for (const record of records) {
+        const tab = record.indexOf(0x09);
+        const header = /^(\d{6}) ([0-9a-f]{40}|[0-9a-f]{64}) (\d) (\d{1,15}|-)$/.exec(tab < 0 ? "" : record.subarray(0, tab).toString("latin1"));
+        const entryPath = tab < 0 ? undefined : record.subarray(tab + 1);
+        if (!header || !entryPath || entryPath.length === 0 || header[3] !== "0") return "unreadable";
+        if (header[1] === "120000") continue;
+        if (header[1] !== "100644" && header[1] !== "100755") return "unreadable";
+        if (header[4] === "-") return "unreadable";
+        if (entryPath.includes(0x0a) || entryPath[0] === 0x22 || entryPath[entryPath.length - 1] === 0x0d) return "unreadable";
+        contentBytes += Number(header[4]);
+        files.push({ path: entryPath, oid: header[2]! });
+      }
+      // Cheap early refusal on the DECLARED sizes (the %(objectsize) listing reads every blob header, so a missing
+      // object makes the listing fail: unreadable). It is not the bound: an add-time-only filter, a hand-written
+      // index or live ident/eol/encoding expansion all make the declared size smaller than what is read.
+      if (contentBytes > maxContentBytes) return "over_bound";
+      // The authoritative bound: the REAL st_size of every regular entry, charged before status, check-attr or
+      // hash-object read anything. The path stays bytes (a Buffer path), never a JS string. TOCTOU: this bound
+      // assumes the runner's quiescence proof; an escaped writer (see the docstring, #3831) can change a file after
+      // this lstat.
+      const root = Buffer.from(cwd + "/");
+      let realBytes = 0n;
+      for (const f of files) {
+        if (pinned.expired()) return "unreadable";
+        let st;
+        try { st = await fs.lstat(Buffer.concat([root, f.path]), { bigint: true }); }
+        catch (err) { return (err as NodeJS.ErrnoException).code === "ENOENT" ? "dirty" : "unreadable"; }
+        if (!st.isFile()) return "unreadable";
+        realBytes += st.size;
+        if (realBytes > BigInt(maxContentBytes)) return "over_bound";
+      }
+      const status = await run(["-c", "core.checkStat=default", "-c", "core.trustctime=true", "-c", "core.untrackedCache=false",
+        "status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+      if (!status) return "unreadable";
+      if (status.exceeded) return "over_bound";
+      if (status.code !== 0 || status.stderr.length > 0) return "unreadable";
+      if (status.stdout.length > 0) return "dirty";
+      if (files.length === 0) return "clean";
+      // Defence in depth only: check-attr cannot tell a literal filter=unspecified/unset from no attribute, and a
+      // filter used only at add time is invisible to it. hash-object runs with --no-filters and the lstat sum above
+      // bounds what it reads. A clean/smudge filter (LFS included) makes the blob small while the worktree file may be huge, with status
+      // still clean. Any regular path with a filter attribute set is refused before a byte is hashed.
+      const attrs = await run(["check-attr", "-z", "--stdin", "filter"],
+        Buffer.concat(files.flatMap(f => [f.path, Buffer.from([0])])));
+      if (!attrs) return "unreadable";
+      if (attrs.exceeded) return "over_bound";
+      if (attrs.code !== 0 || attrs.stderr.length > 0) return "unreadable";
+      const triples = splitNulRecords(attrs.stdout);
+      if (!triples || triples.length !== files.length * 3) return "unreadable";
+      for (const [i, f] of files.entries()) {
+        const value = triples[i * 3 + 2]!.toString("latin1");
+        if (!triples[i * 3]!.equals(f.path) || triples[i * 3 + 1]!.toString("latin1") !== "filter" ||
+            (value !== "unspecified" && value !== "unset")) return "unreadable";
+      }
+      const format = await run(["rev-parse", "--show-object-format"]);
+      if (!format || format.code !== 0 || format.stderr.length > 0) return "unreadable";
+      const idLength = { sha1: 40, sha256: 64 }[format.stdout.toString("latin1").trim() as "sha1" | "sha256"];
+      if (idLength === undefined || files.some(f => f.oid.length !== idLength)) return "unreadable";
+      // The path bytes are a subset of the `ls-files` output already held to maxBytes.
+      const input = Buffer.concat(files.flatMap(f => [f.path, Buffer.from("\n")]));
+      const hashed = await run(["hash-object", "--no-filters", "--stdin-paths"], input);
+      if (!hashed) return "unreadable";
+      if (hashed.exceeded) return "over_bound";
+      if (hashed.code !== 0 || hashed.stderr.length > 0) return "unreadable";
+      const text = hashed.stdout.toString("latin1");
+      if (!text.endsWith("\n")) return "unreadable";
+      const lines = text.slice(0, -1).split("\n");
+      if (lines.length !== files.length) return "unreadable";
+      const idShape = new RegExp(`^[0-9a-f]{${idLength}}$`);
+      if (lines.some(line => !idShape.test(line))) return "unreadable";
+      return lines.every((line, i) => line === files[i]!.oid) ? "clean" : "dirty";
+    } catch (err) {
+      this.checkRecoveryInterruption();
+      this.log.debug("inventory source content proof failed (-> unreadable)", { cwd, error: gitErrorMessage(err) });
+      return "unreadable";
+    }
+  }
+
+  /**
+   * One git call of the inventory proofs, or undefined when it must not run: `<cwd>/.git` is not a real directory
+   * (a gitfile or symlink could redirect the repository), or the caller's deadline has passed. Every call names
+   * `--git-dir` and `--work-tree` explicitly, so an agent-writable `core.worktree` cannot redirect status or the
+   * listings, pins `core.fileMode=true`, `core.ignoreCase=false` and `core.excludesFile=/dev/null` as
+   * {@link worktreeCleanHardened} does (a runner-written `core.fileMode=false` would hide an exec-bit flip from
+   * status, a planted excludes file would move files out of status), and gets a timeout clipped to the caller's deadline.
+   */
+  private async pinnedInventoryGit(cwd: string, bounds: InventoryContentProofBounds) {
+    const gitDir = path.join(cwd, ".git");
+    const st = await fs.lstat(gitDir);
+    if (!st.isDirectory() || st.isSymbolicLink()) return undefined;
+    // One budget for every call of this proof, not one per call.
+    const endsAt = Math.min(Date.now() + INVENTORY_PROOF_TOTAL_BUDGET_MS, bounds.deadlineAt ?? Infinity);
+    const call = async (args: string[], input?: Buffer) => {
+      const remaining = endsAt - Date.now();
+      if (remaining <= 0) return undefined;
+      // GIT_NO_REPLACE_OBJECTS: a replace ref must not make the proof read a different blob than the index names.
+      const pins = [`--git-dir=${gitDir}`, `--work-tree=${cwd}`,
+        "-c", "core.fileMode=true", "-c", "core.ignoreCase=false", "-c", "core.excludesFile=/dev/null"];
+      return this.runGitAsRunnerBytes(cwd, [...pins, ...args], {
+        env: { ...NO_REPLACE_ENV, GIT_OPTIONAL_LOCKS: "0" }, maxBuffer: bounds.maxBytes,
+        timeoutMs: remaining, ...(input ? { input } : {}),
+      });
+    };
+    return Object.assign(call, { expired: () => Date.now() >= endsAt });
+  }
+
+  /**
+   * Predecessor-only loss boundary (issue #2969 D6): whether the clone holds ignored files outside `.uzi/scratch/`
+   * (a build directory, `node_modules`, a log). A `:(exclude)` pathspec does not remove a collapsed `--directory`
+   * entry (verified on git 2.54: `.uzi/scratch/` and an ignored `.uzi/` are still listed), so two listings run: the
+   * first lists everything outside `.uzi` collapsed to directories, where only the single collapsed entry `.uzi/`
+   * (the directory is ignored as a whole) is not residue; the second lists `.uzi` file by file without
+   * `.uzi/scratch` and accepts nothing. An existing `.uzi/.git` (a nested repository hides its content from both)
+   * is residue. Any other entry, any stderr or a non-zero exit is `residue`; a cap hit is `over_bound`. No allowlist.
+   */
+  async inventoryIgnoredResidue(cwd: string, bounds: InventoryContentProofBounds = INVENTORY_CONTENT_PROOF_BOUNDS):
+    Promise<"clean" | "residue" | "over_bound"> {
+    const listing = ["ls-files", "-z", "--others", "--ignored", "--exclude-standard"];
+    try {
+      const run = await this.pinnedInventoryGit(cwd, bounds);
+      if (!run) return "residue";
+      if (await fs.lstat(path.join(cwd, ".uzi", ".git")).then(() => true, (err: NodeJS.ErrnoException) => {
+        if (err.code === "ENOENT" || err.code === "ENOTDIR") return false;
+        throw err;
+      })) return "residue";
+      const passes: Array<{ pathspec: string[]; allowed: boolean }> = [
+        { pathspec: ["--directory", "--no-empty-directory", "--", ".", ":(exclude).uzi"], allowed: true },
+        { pathspec: ["--", ".uzi", ":(exclude).uzi/scratch"], allowed: false },
+      ];
+      for (const { pathspec, allowed } of passes) {
+        const out = await run([...listing, ...pathspec]);
+        if (!out) return "residue";
+        if (out.exceeded) return "over_bound";
+        if (out.code !== 0 || out.stderr.length > 0) return "residue";
+        const entries = splitNulRecords(out.stdout);
+        if (!entries || entries.some(entry => !(allowed && entry.equals(UZI_DIR_ENTRY)))) return "residue";
+      }
+      return "clean";
+    } catch (err) {
+      this.checkRecoveryInterruption();
+      this.log.debug("inventory ignored-residue listing failed (-> residue)", { cwd, error: gitErrorMessage(err) });
+      return "residue";
     }
   }
 
@@ -18150,128 +18443,271 @@ try {
     return (await this.tryGit(barePath, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`])) === 0;
   }
 
-  /** Report-only orphan guard (#299, #759, #2967). Check both the mirrored ref and,
-   *  when this worker published, its exact confirmed tip (the mirror can be stale).
+  /** Report-only orphan guard (#299, #759, #2967, #3944). Three legs, any of which blocks:
+   *  (i) `confirmedPublication`: this worker's exact confirmed tip (the mirror can be stale);
+   *  (ii) `opts.attemptedTip`: the tip of a publish whose ack was lost (it may have landed), so
+   *  it is proven with `checkpointTipState` (the #2753 overlay peel and the `wip(park):` marker
+   *  exception, otherwise the #2967 all-parent proof), not the confirmed leg's `boundaryProof`
+   *  alone; a state other than `content_free` blocks;
+   *  (iii) the mirrored `refs/uzi-checkpoints/<checkpointKey>`.
    *  Recovery coverage is content-free only when EVERY commit outside the recovery
    *  floor's history matches a floor-reachable boundary parent's tree. The current
    *  floor can advance past the coverage base. Include all retained merge parents.
    *  Missing confirmed-publication evidence blocks; a genuinely absent ref without
-   *  publication does not. The existing marker-only park exception remains below. */
+   *  publication does not. The marker-only park exception is `checkpointTipState`.
+   *
+   *  #3944 stale-mirror discount: the mirror is filled by every claim fetch and never pruned, so
+   *  it can hold a cancelled predecessor's work that origin no longer has. When the mirror tip
+   *  PROVABLY carries work (`carries_work`: every read succeeded, so an unreadable or shallow
+   *  proof is never discounted) and the caller supplies `opts.originProbe` (issue runs only),
+   *  one `ls-remote` of that ref on origin decides: a successful empty answer (`absent`) means no
+   *  custodian is left to orphan, so the mirror leg does not block. `present` or `unknown`
+   *  (any error, odd output) keeps blocking. The probe never runs for `unprovable`, and nothing
+   *  here writes a ref. */
   async hasCommittedCheckpoint(
     barePath: string,
     branch: string,
     confirmedPublication?: { tip: string | undefined },
     checkpointKey: string | null = branch,
+    opts?: { attemptedTip?: string; originProbe?: { pat?: string; repoUrl?: string; username?: string } },
   ): Promise<boolean> {
     if (confirmedPublication && (!confirmedPublication.tip ||
         !(await this.checkpointHasOnlyBoundaryTrees(barePath, branch, confirmedPublication.tip)))) return true;
+    if (opts?.attemptedTip &&
+        (await this.checkpointTipState(barePath, branch, opts.attemptedTip)) !== "content_free") return true;
     if (checkpointKey === null) return false;
     const ref = `refs/uzi-checkpoints/${checkpointKey}`;
     const refStatus = await this.tryGitExit(barePath, ["show-ref", "--verify", "--quiet", ref]);
     if (refStatus === 1) return false; // Proven absence, not an unreadable ref or failed command.
     if (refStatus !== 0) return true;
-    let tip = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${ref}^{commit}`])).trim();
+    const tip = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${ref}^{commit}`])).trim();
     if (!tip) return true;
+    const state = await this.checkpointTipState(barePath, branch, tip);
+    if (state === "content_free") return false;
+    if (state === "unprovable" || !opts?.originProbe) return true;
+    return (await this.originCheckpointRefState(barePath, ref, opts.originProbe)) !== "absent";
+  }
+
+  /** Does `ref` exist on origin? `absent` only on a successful, empty `ls-remote`; `present` on
+   *  exactly one line naming `ref`; everything else (error, odd output) is `unknown`. Read-only. */
+  private async originCheckpointRefState(
+    barePath: string, ref: string, probe: { pat?: string; repoUrl?: string; username?: string },
+  ): Promise<"absent" | "present" | "unknown"> {
+    const scope = probe.repoUrl ? httpScopeForUrl(probe.repoUrl) : undefined;
+    try {
+      const listed = await this.runGit(barePath, ["ls-remote", "--refs", "--", "origin", ref],
+        probe.pat, scope, probe.username);
+      if (listed === "") return "absent";
+      const lines = listed.replace(/\n$/, "").split("\n");
+      const match = lines.length === 1 ? /^[0-9a-f]{40}\t([^\n]+)$/.exec(lines[0]!) : null;
+      return match && match[1] === ref ? "present" : "unknown";
+    } catch (cause) {
+      if (cause instanceof RunResidueBlockedError) throw cause;
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
+      return "unknown";
+    }
+  }
+
+  /** Rethrow the errors that must propagate out of a proof (residue quarantine, boundary abort). */
+  private rethrowProofAbort(error: unknown): void {
+    if (error instanceof RunResidueBlockedError) throw error;
+    const abort = this.boundaryAbortError(error);
+    if (abort) throw abort;
+  }
+
+  /** What does the checkpoint commit `tip` carry beyond the recovery floor? `content_free` and
+   *  `carries_work` are positive proofs; every unreadable or unverifiable shape is `unprovable`.
+   *  Includes the issue #2753 overlay peel and the `wip(park):` marker exception (#771). */
+  private async checkpointTipState(
+    barePath: string, branch: string, startTip: string,
+  ): Promise<"content_free" | "carries_work" | "unprovable"> {
+    try {
+      if ((await this.runGitWithEnv(barePath, ["rev-parse", "--is-shallow-repository"], PROOF_READ_ENV)).trim() !== "false") return "unprovable";
+    } catch (error) {
+      this.rethrowProofAbort(error);
+      return "unprovable";
+    }
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(startTip)) return "unprovable";
+    // Every read here uses original objects (PROOF_READ_ENV: no replace refs, no grafts): a
+    // refs/replace entry or info/grafts must not make the subject say "marker" while the parent
+    // read sees the original commit, nor re-parent work under the floor.
+    let tip = (await this.tryGitStdout(barePath, ["--no-replace-objects", "rev-parse", "--verify", `${startTip}^{commit}`], PROOF_READ_ENV)).trim();
+    if (!tip) return "unprovable";
     // issue #2753: a chain over a confirmed park marker (`ckpt(overlay):` C with parents [M, ...,
     // L], L the real tip) is peeled to L when L is a park marker and C verifiably adds only
     // workflow-subtree swaps / already-published markers over L. Anything unverifiable keeps the
     // tip as is (the guard then blocks).
-    if (SHA40_RE.test(tip) && (await this.isOverlayMarker(barePath, tip))) {
-      const parents = (await this.tryGitStdout(barePath, ["rev-list", "--parents", "-n", "1", tip]))
+    if (SHA40_RE.test(tip) && (await this.isOverlayMarker(barePath, tip, { noReplace: true }))) {
+      const parents = (await this.tryGitStdout(barePath, ["--no-replace-objects", "rev-list", "--parents", "-n", "1", tip], PROOF_READ_ENV))
         .trim().split(/\s+/).filter(Boolean).slice(1);
       const last = parents[parents.length - 1];
       // A park marker has exactly one parent; a merge-shaped look-alike is not peeled.
       const lastParents = last !== undefined && SHA40_RE.test(last)
-        ? (await this.tryGitStdout(barePath, ["rev-list", "--parents", "-n", "1", last])).trim().split(/\s+/).filter(Boolean).length - 1
+        ? (await this.tryGitStdout(barePath, ["--no-replace-objects", "rev-list", "--parents", "-n", "1", last], PROOF_READ_ENV)).trim().split(/\s+/).filter(Boolean).length - 1
         : 0;
+      // verifyWrapperOnlyHistory takes PROOF_READ_ENV here, so its log, ancestry and diff-tree
+      // reads see original objects like every other read of this proof.
       if (parents.length >= 2 && last !== undefined && SHA40_RE.test(last) && lastParents === 1 &&
-          (await this.isWipParkMarker(barePath, last)) &&
-          (await this.verifyWrapperOnlyHistory(barePath, tip, last, 1, { allowParkMarkers: true }))) {
+          (await this.isWipParkMarker(barePath, last, { noReplace: true })) &&
+          (await this.verifyWrapperOnlyHistory(barePath, tip, last, 1, { allowParkMarkers: true, env: PROOF_READ_ENV }))) {
         tip = last;
       }
     }
-    if (!(await this.isWipParkMarker(barePath, tip)))
-      return !(await this.checkpointHasOnlyBoundaryTrees(barePath, branch, tip));
-    // 3) The tip IS a `wip(park):` marker. The committed work (if any) is its parent and
-    //    below. A root-commit marker (no readable parent) has nothing committed below to
-    //    orphan → false (mirrors the root-marker handling in runnerClone, git.ts ~585-591).
-    const parent = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${tip}^^{commit}`])).trim();
-    if (parent === "") return false;
-    // Compute the recovery floor similar to the way the reseed does (git.ts ~535): origin's
-    // branch if pushed, else the default branch. (Only "similar to": the reseed excludes a
-    // DISJOINT origin ref via originExists = raw existence AND non-disjoint, git.ts:475/484,
-    // whereas this helper uses raw refExists. That is acceptable here because a disjoint
-    // origin floor only pushes toward BLOCK — the safe direction: a disjoint parent is not an
-    // ancestor of it, so the committed-work test below returns true.)
-    //
-    // The parent is a marker-only checkpoint iff it is an ancestor-or-equal of the floor;
-    // anything else — the parent STRICTLY descends the floor, OR it DIVERGED from the floor
-    // (shared ancestor, neither contains the other; the "main advanced during a park" shape) —
-    // is committed work that a report-only completion would orphan, so it still blocks. This
-    // mirrors the reseed's diverged-WIP leg (git.ts:713), which uses the same
-    // isAncestor(markerParent, floor) discriminator to decide "no committed milestones live
-    // below the marker". isAncestor is TRUE at equality, so the parent == floor case is a
-    // marker-only checkpoint (allow); it also returns false on a missing/broken ref, which
-    // fails safe toward BLOCK here.
+    if (!(await this.isWipParkMarker(barePath, tip, { noReplace: true }))) return this.boundaryProof(barePath, branch, tip);
+    // The tip IS a `wip(park):` marker. The committed work (if any) is its parent and below.
+    let parents: string[];
     try {
-      const floorRef = (await this.refExists(barePath, `refs/remotes/origin/${branch}`))
-        ? `refs/remotes/origin/${branch}`
-        : await this.defaultBranchRef(barePath);
-      // Committed work exists below the marker iff the marker's parent is NOT an
-      // ancestor-or-equal of the recovery floor:
-      //   parent strictly descends floor → isAncestor(parent,floor) false → block ✓
-      //   parent == floor                → isAncestor true (true at equality) → allow ✓
-      //   parent is an ancestor of floor → isAncestor true                    → allow ✓
-      //   parent and floor DIVERGED      → isAncestor(parent,floor) false → block ✓
-      return !(await this.isAncestor(barePath, parent, floorRef));
+      const row = (await this.runGitWithEnv(barePath, ["--no-replace-objects", "rev-list", "--parents", "-n", "1", tip], PROOF_READ_ENV))
+        .trim().split(/\s+/);
+      if (row.length === 0 || row[0] !== tip || !row.every(oid => /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(oid)))
+        return "unprovable";
+      parents = row.slice(1);
+    } catch (error) {
+      this.rethrowProofAbort(error);
+      return "unprovable";
+    }
+    // A genuine root marker has nothing committed below it to orphan.
+    if (parents.length === 0) return "content_free";
+    // A merge-shaped look-alike is not a park marker: prove it like any other tip.
+    if (parents.length >= 2) return this.boundaryProof(barePath, branch, tip);
+    // Floor like the reseed's: origin's branch if pushed, else the default branch. (A disjoint
+    // origin floor only pushes toward BLOCK: a disjoint parent is not an ancestor of it.) The
+    // parent is marker-only iff it is an ancestor-or-equal of the floor; a parent that strictly
+    // descends the floor or DIVERGED from it is committed work a report-only completion would orphan.
+    try {
+      const floorRef = await this.proofFloorRef(barePath, branch);
+      if (floorRef === null) return "unprovable";
+      const status = await this.tryGitExit(barePath, ["--no-replace-objects", "merge-base", "--is-ancestor", parents[0]!, floorRef],
+        undefined, undefined, PROOF_READ_ENV);
+      return status === 0 ? "content_free" : status === 1 ? "carries_work" : "unprovable";
     } catch (err) {
-      // Fail-safe: the floor could not be resolved. Preserve the guard rather than risk
-      // orphaning committed work below the marker.
+      this.rethrowProofAbort(err);
+      // Fail-safe: the floor could not be resolved. Preserve the guard.
       this.log.warn("hasCommittedCheckpoint: could not resolve recovery floor — preserving guard", {
         branch,
         tip,
-        parent,
         error: err instanceof Error ? err.message : String(err),
       });
-      return true;
+      return "unprovable";
     }
+  }
+
+  /** #3944: the proof's recovery floor, chosen like the reseed's (origin's branch if pushed, else
+   *  the default branch) but error-aware and under PROOF_READ_ENV. `refExists` and
+   *  `defaultBranchRef` collapse a failed read into "absent" and would silently fall back to a
+   *  different floor; here only a proven absence falls through, and any other outcome returns
+   *  `null`, which the callers treat as `unprovable`. Ref existence is read with `for-each-ref`
+   *  (no object read): git reports a missing ref and a corrupt or unreadable loose ref file alike
+   *  through `show-ref`/`rev-parse` exit 1, but `for-each-ref` warns "ignoring broken ref" on
+   *  stderr for the latter, so absence is proven only by a clean, empty, successful listing.
+   *  The caller's own `^{commit}` read under PROOF_READ_ENV then fails an unreadable floor object. */
+  private async proofFloorRef(barePath: string, branch: string): Promise<string | null> {
+    const exit = (args: string[]): Promise<number | null> =>
+      this.tryGitExit(barePath, args, undefined, undefined, PROOF_READ_ENV);
+    const refState = async (ref: string): Promise<"present" | "absent" | "unknown"> => {
+      this.assertCaptureDecoration(PROOF_READ_ENV);
+      try {
+        const { stdout, stderr } = await this.execScoped(
+          "git", withDir(barePath, ["for-each-ref", "--format=%(refname)", ref]),
+          { env: { ...gitEnv(), ...PROOF_READ_ENV }, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER });
+        // Any diagnostic (e.g. "warning: ignoring broken ref") means the ref's state is unknown.
+        if (stderr.trim() !== "") return "unknown";
+        // The pattern also matches refs below `ref/`; those cannot coexist with `ref` itself.
+        if (stdout.split("\n").map(line => line.trim()).includes(ref)) return "present";
+        // A clean empty listing still hides a dangling symref (a loose ref file git skips
+        // silently), so absence also needs the exact loose-ref path to be missing, checked
+        // without following it. A directory there only holds child refs; any other entry or an
+        // unexpected read error leaves the state unknown.
+        try {
+          const entry = await fs.lstat(path.join(barePath, ...ref.split("/")));
+          return entry.isDirectory() ? "absent" : "unknown";
+        } catch (statErr) {
+          const code = (statErr as { code?: unknown }).code;
+          return code === "ENOENT" || code === "ENOTDIR" ? "absent" : "unknown";
+        }
+      } catch (err) {
+        if (err instanceof RunResidueBlockedError) throw err;
+        const abort = this.boundaryAbortError(err);
+        if (abort) throw abort;
+        return "unknown";
+      }
+    };
+    const branchRef = `refs/remotes/origin/${branch}`;
+    const branchState = await refState(branchRef);
+    if (branchState === "present") return branchRef;
+    if (branchState === "unknown") return null;
+    // 1) origin/HEAD, set by `remote set-head --auto`.
+    const headCode = await exit(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]);
+    if (headCode === 0) {
+      const head = (await this.runGitWithEnv(barePath, ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+        PROOF_READ_ENV)).trim();
+      const headState = await refState(head);
+      if (headState === "present") return head;
+      if (headState === "unknown") return null;
+    } else if (headCode !== 1) {
+      return null;
+    }
+    // 2) common defaults, remote-tracking then mirror-layout fallback.
+    for (const cand of ["refs/remotes/origin/main", "refs/remotes/origin/master", "refs/heads/main", "refs/heads/master"]) {
+      const state = await refState(cand);
+      if (state === "present") return cand;
+      if (state === "unknown") return null;
+    }
+    // 3) last resort: the bare repo's own HEAD.
+    const headExit = await exit(["rev-parse", "--verify", "--quiet", "HEAD"]);
+    return headExit === 0 ? "HEAD" : null;
   }
 
   /** Positive proof only: command failure, missing objects or truncated history block. */
   private async checkpointHasOnlyBoundaryTrees(barePath: string, branch: string, tip: string): Promise<boolean> {
+    return (await this.boundaryProof(barePath, branch, tip)) === "content_free";
+  }
+
+  /** `carries_work` only when every command succeeded, the repository is not shallow, the walk
+   *  parsed fully with at least one boundary whose tree reads, some outside tree matches no
+   *  boundary tree, and every such unmatched tree reads (`%T` prints the name of an unreadable
+   *  tree too). Anything else that is not `content_free` is `unprovable`. */
+  private async boundaryProof(
+    barePath: string, branch: string, tip: string,
+  ): Promise<"content_free" | "carries_work" | "unprovable"> {
+    // Every read uses PROOF_READ_ENV (original objects: no replace refs, no grafts).
+    const git = (args: string[]): Promise<string> => this.runGitWithEnv(barePath, args, PROOF_READ_ENV);
     try {
-      if ((await this.runGit(barePath, ["rev-parse", "--is-shallow-repository"])).trim() !== "false") return false;
-      const floorRef = (await this.refExists(barePath, `refs/remotes/origin/${branch}`))
-        ? `refs/remotes/origin/${branch}` : await this.defaultBranchRef(barePath);
-      const floor = (await this.runGit(barePath, ["--no-replace-objects", "rev-parse", "--verify", `${floorRef}^{commit}`])).trim();
-      const exactTip = (await this.runGit(barePath, ["--no-replace-objects", "rev-parse", "--verify", `${tip}^{commit}`])).trim();
-      const tree = (await this.runGit(barePath, ["--no-replace-objects", "rev-parse", "--verify", `${floor}^{tree}`])).trim();
+      if ((await git(["rev-parse", "--is-shallow-repository"])).trim() !== "false") return "unprovable";
+      const floorRef = await this.proofFloorRef(barePath, branch);
+      if (floorRef === null) return "unprovable";
+      const floor = (await git(["--no-replace-objects", "rev-parse", "--verify", `${floorRef}^{commit}`])).trim();
+      const exactTip = (await git(["--no-replace-objects", "rev-parse", "--verify", `${tip}^{commit}`])).trim();
+      const tree = (await git(["--no-replace-objects", "rev-parse", "--verify", `${floor}^{tree}`])).trim();
       // %T alone prints an object name even when that tree cannot be read.
-      await this.runGit(barePath, ["--no-replace-objects", "cat-file", "-e", `${tree}^{tree}`]);
+      await git(["--no-replace-objects", "cat-file", "-e", `${tree}^{tree}`]);
       // Boundaries are the floor-reachable parents at this checkpoint's cut, not
       // arbitrary published trees or today's newer floor tip. Walk every merge parent.
-      const walk = (await this.runGit(barePath, ["--no-replace-objects", "log", "--boundary",
+      const walk = (await git(["--no-replace-objects", "log", "--boundary",
         "--format=%m %T", exactTip, "--not", floor, "--"])).trim();
-      if (walk === "") return true; // The tip is already reachable from the floor.
+      if (walk === "") return "content_free"; // The tip is already reachable from the floor.
       const boundaryTrees = new Set<string>();
       const outsideTrees: string[] = [];
       for (const line of walk.split("\n")) {
         const row = /^([>-]) ([0-9a-f]{40}|[0-9a-f]{64})$/.exec(line);
-        if (!row) return false;
+        if (!row) return "unprovable";
         if (row[1] === "-") boundaryTrees.add(row[2]!);
         else outsideTrees.push(row[2]!);
       }
-      if (boundaryTrees.size === 0) return false;
+      if (boundaryTrees.size === 0) return "unprovable";
       for (const boundaryTree of boundaryTrees) {
         if (boundaryTree !== tree)
-          await this.runGit(barePath, ["--no-replace-objects", "cat-file", "-e", `${boundaryTree}^{tree}`]);
+          await git(["--no-replace-objects", "cat-file", "-e", `${boundaryTree}^{tree}`]);
       }
-      return outsideTrees.every(candidate => boundaryTrees.has(candidate));
+      const unmatched = new Set(outsideTrees.filter(candidate => !boundaryTrees.has(candidate)));
+      if (unmatched.size === 0) return "content_free";
+      for (const outsideTree of unmatched)
+        await git(["--no-replace-objects", "cat-file", "-e", `${outsideTree}^{tree}`]);
+      return "carries_work";
     } catch (error) {
-      if (error instanceof RunResidueBlockedError) throw error;
-      const abort = this.boundaryAbortError(error);
-      if (abort) throw abort;
-      return false;
+      this.rethrowProofAbort(error);
+      return "unprovable";
     }
   }
 
@@ -18659,8 +19095,10 @@ try {
    *  (`log -1 --format=%s`, worker-uid — no working-tree touch, so no filter-driver
    *  fire, safe). Best-effort: any failure (a missing/broken commit) answers false, so a
    *  bad read never routes the reseed onto the reset-soft / cherry-pick recovery path. */
-  private async isWipParkMarker(barePath: string, sha: string): Promise<boolean> {
-    const subject = await this.tryGitStdout(barePath, ["log", "-1", "--format=%s", `${sha}^{commit}`]);
+  private async isWipParkMarker(barePath: string, sha: string, opts: { noReplace?: boolean } = {}): Promise<boolean> {
+    const subject = await this.tryGitStdout(barePath, [
+      ...(opts.noReplace ? ["--no-replace-objects"] : []), "log", "-1", "--format=%s", `${sha}^{commit}`],
+    opts.noReplace ? PROOF_READ_ENV : undefined);
     return subject.startsWith(WIP_PARK_COMMIT_PREFIX);
   }
 
@@ -18669,8 +19107,10 @@ try {
    *  best-effort (any failure ⇒ false, so a bad read never routes adoption onto the overlay
    *  peel). Adoption peels an overlay by DISCARDING its swapped `.github/workflows` tree and
    *  re-pointing the base to its LAST parent (the real tip) — see runnerCloneForBranch. */
-  private async isOverlayMarker(barePath: string, sha: string): Promise<boolean> {
-    const subject = await this.tryGitStdout(barePath, ["log", "-1", "--format=%s", `${sha}^{commit}`]);
+  private async isOverlayMarker(barePath: string, sha: string, opts: { noReplace?: boolean } = {}): Promise<boolean> {
+    const subject = await this.tryGitStdout(barePath, [
+      ...(opts.noReplace ? ["--no-replace-objects"] : []), "log", "-1", "--format=%s", `${sha}^{commit}`],
+    opts.noReplace ? PROOF_READ_ENV : undefined);
     return subject.startsWith(OVERLAY_COMMIT_PREFIX);
   }
 
@@ -18803,9 +19243,9 @@ try {
   /** Active maintenance uses raw pipes so refusal precedes buffering, including stderr. */
   private async execMeteredNative(
     command: string, args: string[],
-    options: { env: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; cwd?: string; input?: string | Buffer },
+    options: { env: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; cwd?: string; input?: string | Buffer; bytes?: true },
     signal?: AbortSignal,
-  ): Promise<{ stdout: string; stderr: string }> {
+  ): Promise<{ stdout: string; stderr: string; stdoutBytes?: Buffer; stderrBytes?: Buffer }> {
     signal?.throwIfAborted();
     assertNoCredentialedGitWhileQuarantined(options.env);
     MaintenanceResources.consumeIfActive("launches", 1);
@@ -18846,7 +19286,8 @@ try {
     signal?.removeEventListener("abort", abort);
     if (timer) clearTimeout(timer);
     if (killTimer) clearTimeout(killTimer);
-    const result = { stdout: Buffer.concat(stdout).toString(), stderr: Buffer.concat(stderr).toString() };
+    const result = { stdout: Buffer.concat(stdout).toString(), stderr: Buffer.concat(stderr).toString(),
+      ...(options.bytes ? { stdoutBytes: Buffer.concat(stdout), stderrBytes: Buffer.concat(stderr) } : {}) };
     if (failure || code !== 0) {
       const error = Object.assign(failure instanceof Error ? failure : new Error(result.stderr || "git subprocess failed"), result);
       if (!("code" in error)) Object.assign(error, { code });
@@ -18974,9 +19415,9 @@ try {
   private async execScoped(
     command: string,
     args: string[],
-    options: { env: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; cwd?: string; input?: string | Buffer },
+    options: { env: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; cwd?: string; input?: string | Buffer; bytes?: true },
     identity: BoundaryProcessRequest["identity"] = "worker_pat",
-  ): Promise<{ stdout: string; stderr: string }> {
+  ): Promise<{ stdout: string; stderr: string; stdoutBytes?: Buffer; stderrBytes?: Buffer }> {
     const boundary = this.boundaryProcesses.getStore();
     const epoch = this.epochRetained.getStore();
     if (epoch) options = { ...options, maxBuffer: Math.min(options.maxBuffer ?? Infinity, epoch.maxMetadataBytes) };
@@ -18988,7 +19429,7 @@ try {
     const operationSignals = [report?.signal, recovery?.signal].filter((s): s is AbortSignal => s !== undefined);
     const operationSignal = operationSignals.length ? AbortSignal.any(operationSignals) : undefined;
     if (recovery) options = { ...options, timeout: Math.min(options.timeout ?? Infinity, this.recoveryRemaining(recovery)) };
-    const { input, ...execOptions } = options;
+    const { input, bytes: wantBytes, ...execOptions } = options;
     if (!boundary) {
       // issue #2213: the second quarantine check, keyed on the credential itself, synchronously
       // before the child is created (nothing awaits between this and execFileAsync).
@@ -19001,6 +19442,7 @@ try {
       // issue #1597 M2: optional stdin (the checkpoint scan's cat-file / gitleaks stdin). An EPIPE on
       // an early-exiting child is swallowed here; the exit status carries the failure.
       const pending = execFileAsync(command, args, { ...execOptions,
+        ...(wantBytes ? { encoding: "buffer" as const } : {}),
         ...(operationSignal ? { signal: operationSignal, ...(report ? { killSignal: "SIGKILL" as const } : {}) } : {}),
       });
       const closed = new Promise<void>(resolve => pending.child.once("close", () => resolve()));
@@ -19017,7 +19459,8 @@ try {
         this.checkRecoveryInterruption();
         const stdout = String(result.stdout);
         this.checkEpochMetadata(args, stdout);
-        return { stdout, stderr: String(result.stderr) };
+        return { stdout, stderr: String(result.stderr),
+          ...(wantBytes ? { stdoutBytes: Buffer.from(result.stdout), stderrBytes: Buffer.from(result.stderr) } : {}) };
       } catch (error) {
         try {
           if (epoch && (error as { code?: unknown })?.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER")
@@ -19193,7 +19636,8 @@ try {
       throw failure;
     }
     this.checkEpochMetadata(args, out);
-    return { stdout: out, stderr: err };
+    return { stdout: out, stderr: err,
+      ...(wantBytes ? { stdoutBytes: Buffer.concat(stdout.chunks), stderrBytes: Buffer.concat(stderr.chunks) } : {}) };
   }
 
   private async runGit(cwd: string | undefined, args: string[], pat?: string, scope?: string, username?: string,
@@ -19716,8 +20160,59 @@ try {
    * security-relevant key.
    */
   private async runGitAsRunner(cwd: string | undefined, args: string[], opts: { timeoutMs?: number; env?: NodeJS.ProcessEnv; input?: string } = {}): Promise<string> {
-    this.assertCaptureDecoration(opts.env);
-    const base = { ...gitEnv(), ...opts.env };
+    const { env, wrapped } = this.runnerGitInvocation(cwd, args, opts.env);
+    this.log.debug("git (runner uid)", { cwd, args });
+    try {
+      const { stdout } = await this.execScoped(wrapped.command, wrapped.args, {
+        env,
+        timeout: opts.timeoutMs ?? GIT_TIMEOUT_MS,
+        maxBuffer: GIT_MAX_BUFFER,
+        ...(opts.input !== undefined ? { input: opts.input } : {}),
+      }, "command");
+      return stdout;
+    } catch (err) {
+      throw this.runnerGitFailure(err, args);
+    }
+  }
+
+  /**
+   * The byte-exact twin of {@link runGitAsRunner} for the strict inventory content proof: the same runner
+   * identity, env, worker-mark rules and wrapping (both build them through {@link runnerGitInvocation}), but
+   * stdin, stdout and stderr are Buffers, no path is decoded to a JS string, and a non-zero exit is a RESULT
+   * (`code`), not a throw, so the caller classifies it. `exceeded` is set (with code -1 and empty output) when
+   * output passed `maxBuffer`. An abort, a timeout or a spawn failure still throws.
+   */
+  private async runGitAsRunnerBytes(cwd: string, args: string[],
+    opts: { input?: Buffer; timeoutMs?: number; env?: NodeJS.ProcessEnv; maxBuffer?: number } = {},
+  ): Promise<{ code: number; stdout: Buffer; stderr: Buffer; exceeded?: true }> {
+    const { env, wrapped } = this.runnerGitInvocation(cwd, args, opts.env);
+    this.log.debug("git (runner uid, bytes)", { cwd, args });
+    try {
+      const result = await this.execScoped(wrapped.command, wrapped.args, {
+        env,
+        timeout: opts.timeoutMs ?? GIT_TIMEOUT_MS,
+        maxBuffer: opts.maxBuffer ?? GIT_MAX_BUFFER,
+        bytes: true,
+        ...(opts.input !== undefined ? { input: opts.input } : {}),
+      }, "command");
+      return { code: 0, stdout: result.stdoutBytes ?? Buffer.alloc(0), stderr: result.stderrBytes ?? Buffer.alloc(0) };
+    } catch (err) {
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
+      const e = err as { code?: unknown; outputExceeded?: unknown; stderr?: unknown };
+      if (e.outputExceeded === true || e.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER")
+        return { code: -1, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), exceeded: true };
+      if (typeof e.code === "number" && e.code !== 0)
+        return { code: e.code, stdout: Buffer.alloc(0), stderr: Buffer.isBuffer(e.stderr) ? e.stderr : Buffer.from(typeof e.stderr === "string" ? e.stderr : "") };
+      throw this.runnerGitFailure(err, args);
+    }
+  }
+
+  /** The env and wrapped command shared by every runner-uid git ({@link runGitAsRunner}, {@link runGitAsRunnerBytes}). */
+  private runnerGitInvocation(cwd: string | undefined, args: string[], extraEnv: NodeJS.ProcessEnv | undefined):
+    { env: NodeJS.ProcessEnv; wrapped: { command: string; args: string[] } } {
+    this.assertCaptureDecoration(extraEnv);
+    const base = { ...gitEnv(), ...extraEnv };
     // issue #1783 (R4): worker-marked ONLY when the subcommand can run no code the clone
     // configures (runnerGitCarriesWorkerMark), so a concurrent reap never kills that op. Every
     // other runner git here (status, add, commit, checkout, reset, merge, rebase, …) can start an
@@ -19740,26 +20235,19 @@ try {
     const wrapped = this.boundaryProcesses.getStore()
       ? { command: GIT_BIN, args: withDir(cwd, args) }
       : runnerCommand("git", withDir(cwd, args));
-    this.log.debug("git (runner uid)", { cwd, args });
-    try {
-      const { stdout } = await this.execScoped(wrapped.command, wrapped.args, {
-        env,
-        timeout: opts.timeoutMs ?? GIT_TIMEOUT_MS,
-        maxBuffer: GIT_MAX_BUFFER,
-        ...(opts.input !== undefined ? { input: opts.input } : {}),
-      }, "command");
-      return stdout;
-    } catch (err) {
-      const abort = this.boundaryAbortError(err);
-      if (abort) throw abort;
-      // Preserve git's numeric exit code on the wrapped error so a caller can discriminate
-      // an expected non-zero status (e.g. `config --unset-all` exit 5 = key absent) from a
-      // real failure — the same `.code` idiom `tryGit` reads off the raw execFile error.
-      const failure = new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
-      const code = (err as { code?: unknown }).code;
-      if (typeof code === "number") (failure as { code?: number }).code = code;
-      throw failure;
-    }
+    return { env, wrapped };
+  }
+
+  private runnerGitFailure(err: unknown, args: string[]): Error {
+    const abort = this.boundaryAbortError(err);
+    if (abort) return abort;
+    // Preserve git's numeric exit code on the wrapped error so a caller can discriminate
+    // an expected non-zero status (e.g. `config --unset-all` exit 5 = key absent) from a
+    // real failure — the same `.code` idiom `tryGit` reads off the raw execFile error.
+    const failure = new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
+    const code = (err as { code?: unknown }).code;
+    if (typeof code === "number") (failure as { code?: number }).code = code;
+    return failure;
   }
 
   /**
@@ -19975,9 +20463,10 @@ try {
    *  sibling exists for callers (ancestry) that MUST NOT treat a broken read as a data answer. */
   private async tryGitExit(
     cwd: string | undefined, args: string[], pat?: string, notStarted?: { value: boolean },
+    extraEnv?: NodeJS.ProcessEnv,
   ): Promise<number | null> {
     if (this.boundaryProcesses.getStore()?.capture && pat !== undefined) throw new Error("capture credentials refused");
-    const env = gitEnv(pat);
+    const env = extraEnv ? { ...gitEnv(pat), ...extraEnv } : gitEnv(pat);
     try {
       await this.execScoped("git", withDir(cwd, args), { env, timeout: GIT_TIMEOUT_MS });
       return 0;
@@ -21531,9 +22020,10 @@ try {
     }
   }
 
-  private async tryGitStdout(cwd: string | undefined, args: string[]): Promise<string> {
+  private async tryGitStdout(cwd: string | undefined, args: string[], extraEnv?: NodeJS.ProcessEnv): Promise<string> {
     try {
-      const { stdout } = await this.execScoped("git", withDir(cwd, args), { env: gitEnv(), timeout: GIT_TIMEOUT_MS });
+      const { stdout } = await this.execScoped("git", withDir(cwd, args),
+        { env: extraEnv ? { ...gitEnv(), ...extraEnv } : gitEnv(), timeout: GIT_TIMEOUT_MS });
       return stdout.trim();
     } catch (err) {
       const abort = this.boundaryAbortError(err);
@@ -22693,7 +23183,7 @@ function command(args, cap = METADATA_LIMIT, input, allowDiff = false, cwd = tem
       s.on("error", fail);
     }
     collect(p.stdout, false); collect(p.stderr, true);
-    const timer = setTimeout(() => fail(refusal("git_deadline")), Math.min(5000, deadline - Date.now()));
+    const timer = setTimeout(() => fail(refusal("git_deadline")), Math.max(0, Math.min(5000, deadline - Date.now())));
     p.on("error", fail);
     p.on("close", code => {
       clearTimeout(timer); child = undefined;
@@ -23034,6 +23524,19 @@ async function indexEntries(bytes) {
 });
 `;
 
+const LS_TREE_ENTRY_RE = /^([0-7]{6}) ([a-z]+) ([0-9a-f]{40}) +(-|[0-9]+)\t([^]*)$/;
+
+function parseLsTree(out: string): RepoAgentTreeEntry[] {
+  const entries: RepoAgentTreeEntry[] = [];
+  for (const record of out.split("\0")) {
+    if (record === "") continue;
+    const m = LS_TREE_ENTRY_RE.exec(record);
+    if (!m) throw new Error("unparseable ls-tree entry");
+    entries.push({ mode: m[1]!, type: m[2]!, oid: m[3]!, size: m[4] === "-" ? undefined : Number(m[4]), name: m[5]! });
+  }
+  return entries;
+}
+
 function withDir(cwd: string | undefined, args: string[]): string[] {
   return cwd ? ["-C", cwd, ...args] : args;
 }
@@ -23225,11 +23728,14 @@ const RUNNER_GIT_MARKED_SUBCOMMANDS: ReadonlySet<string> = new Set([
 const RUNNER_GIT_NO_PROTOCOL = "none";
 
 /** The argv index of a git subcommand: the first index past any leading `-c key=value` pairs
- *  (which may be `args.length`, i.e. past the end, when nothing follows them). */
+ *  and the `--git-dir=`/`--work-tree=` pins (which may be `args.length`, i.e. past the end, when nothing follows them). */
 function firstRunnerGitSubcommandIndex(args: readonly string[]): number {
   let i = 0;
-  while (args[i] === "-c" && i + 1 < args.length) i += 2;
-  return i;
+  for (;;) {
+    if (args[i] === "-c" && i + 1 < args.length) i += 2;
+    else if (args[i]?.startsWith("--git-dir=") || args[i]?.startsWith("--work-tree=")) i += 1;
+    else return i;
+  }
 }
 
 /** The subcommand of a git argv (leading `-c key=value` pairs skipped), or undefined. */

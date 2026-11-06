@@ -271,6 +271,40 @@ it("adoption refusal requires steer permission and reacts to owner proof changes
   expect(screen.queryByRole("button", { name: /^(Resume|Cancel|Stop)/ })).toBeNull();
 });
 
+function unwitnessed(stamp: string | null = null): Run {
+  return { ...held(), recovery_wait_cause: "retained_continuation_unwitnessed", recovery_retry_not_before: stamp };
+}
+it.each([null, "2099-01-01T00:00:00Z", "2020-01-01T00:00:00Z", "invalid"])("unwitnessed continuation hold ignores retry timestamp %s and uses owner actions", async (stamp) => {
+  const { container } = render(view(unwitnessed(stamp), true));
+  expect(screen.getByText("Unwitnessed continuation hold needs your decision")).toBeTruthy();
+  expect(screen.getByText(/The continuation was never confirmed to start/, { selector: "p" })).toBeTruthy();
+  expect(screen.getByText(/Local work and its custody are kept/, { selector: "p" })).toBeTruthy();
+  expect(screen.getByText(/This hold has no scheduled retry. Only the run owner can Resume or Cancel/)).toBeTruthy();
+  expect(container.textContent).not.toMatch(/retry automatically|retrying in|retry in|Automatic retry is due|Retry timing is unavailable|integrity|quiescent|lost/i);
+  const notice = container.querySelector('div.sr-only[role="status"]')!;
+  await waitFor(() => expect(notice.textContent).toMatch(/never confirmed to start/));
+  expect(notice.textContent).toMatch(/no scheduled retry/);
+  expect(api.getRunArchives).toHaveBeenCalledWith("held");
+  fireEvent.click(screen.getByRole("button", { name: /^Resume$/ }));
+  await waitFor(() => expect(api.resumeRun).toHaveBeenCalledWith("held"));
+  await waitFor(() => expect(refreshRun).toHaveBeenCalledOnce());
+  fireEvent.click(screen.getByRole("button", { name: /^Cancel$/ }));
+  await waitFor(() => expect(submit).toHaveBeenCalledWith("cancel", "", undefined, undefined, false));
+});
+it.each([undefined, false])("unwitnessed continuation hold requires confirmed owner proof %s", (proof) => {
+  render(view(unwitnessed("2099-01-01T00:00:00Z"), proof));
+  expect(screen.queryByRole("button", { name: /^(Resume|Cancel|Stop)/ })).toBeNull();
+  expect(api.getRunArchives).not.toHaveBeenCalled();
+});
+it("unwitnessed continuation hold requires steer permission and reacts to owner proof changes", () => {
+  const { rerender } = render(view(unwitnessed(), true, false));
+  expect(screen.queryByRole("button", { name: /^(Resume|Cancel|Stop)/ })).toBeNull();
+  rerender(view(unwitnessed(), true));
+  expect((screen.getByRole("button", { name: /^Resume$/ }) as HTMLButtonElement).disabled).toBe(false);
+  rerender(view(unwitnessed(), false));
+  expect(screen.queryByRole("button", { name: /^(Resume|Cancel|Stop)/ })).toBeNull();
+});
+
 function retained(stamp: string | null): Run {
   return { ...held(), recovery_wait_cause: "retained_recovery_exhausted", recovery_retry_not_before: stamp };
 }

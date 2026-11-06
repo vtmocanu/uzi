@@ -1391,6 +1391,39 @@ phaseCp.spawn = function(...args) {
     });
   }
 
+  it("keeps a git deadline refusal classified when the deadline passes before its timer is armed", async () => {
+    // The helper's command() checks the deadline before spawning Git. Jump the
+    // clock only after that check, while holding the spawned child long enough
+    // for the command timer to fire. A negative delay makes Node print a warning
+    // ahead of the trusted refusal line, hiding the git_deadline token.
+    const hook = `
+const timerCp = require("node:child_process"), timerFs = require("node:fs");
+const timerSpawn = timerCp.spawn, timerNow = Date.now;
+let timerOffset = 0, timerHeld = false;
+Date.now = () => timerNow() + timerOffset;
+timerCp.spawn = function(...args) {
+  const p = timerSpawn.apply(this, args);
+  if (!timerHeld) {
+    timerHeld = true;
+    if (!p.kill("SIGSTOP")) throw Error("could not hold the git child");
+    timerOffset = 28001;
+    timerFs.writeFileSync(__DATA__ + "/timer-held", "1");
+  }
+  return p;
+};
+`;
+    const f = await fixture({ hook });
+    try {
+      const got = await refusalOf(f.capture());
+      assert.equal(await fs.readFile(path.join(f.data, "timer-held"), "utf8"), "1");
+      assert.deepEqual({
+        refusal: got.refusal,
+        diagnostic: got.diagnostic,
+        timeoutWarning: /TimeoutNegativeWarning/.test(got.message),
+      }, { refusal: "diff_failed", diagnostic: "git_deadline", timeoutWarning: false });
+    } finally { await f.dispose(); }
+  });
+
   it("primary proof: neutralizes poisoned Git redirect and config environment inside helper", async () => {
     const hook = `
 const poisonFs = require("node:fs"), poisonCp = require("node:child_process"), poisonSpawn = poisonCp.spawn;

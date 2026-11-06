@@ -27,6 +27,7 @@
 import { useEffect, useId, useState } from "react";
 import type { Repo } from "../lib/api";
 import { Badge, type BadgeTone, cx } from "./ui";
+import { AGENT_SOURCE_DEFAULT_LABELS } from "./RepoAgentSourceSetting";
 
 // The five booleans the chip reasons about — a subset of Repo, so the pure tone
 // helper is exercisable in a test without hand-building a whole Repo.
@@ -228,6 +229,10 @@ export function RepoSetupChip({ repo }: { repo: Repo }) {
             );
           })}
         </ul>
+        <p className="mt-2 text-[11px] text-muted">
+          Default agents for my runs:{" "}
+          <span className="text-fg">{AGENT_SOURCE_DEFAULT_LABELS[repo.agent_source_default ?? "unset"]}</span>
+        </p>
         <p className="mt-2 border-t border-edge pt-2 text-[11px] text-faint">
           Defaults are off on purpose; each one widens what an agent may do.
         </p>

@@ -92,9 +92,7 @@ func (f *lifecycleFixture) freshSettings() {
 // returns the row Claim and the worker-side calls take.
 func (f *lifecycleFixture) worker(t *testing.T, protocolCaps []string) store.Worker {
 	t.Helper()
-	if protocolCaps == nil {
-		protocolCaps = []string{}
-	}
+	protocolCaps = append([]string{"repo_agent_source_v1"}, protocolCaps...)
 	id := uuid.New()
 	f.env.exec(`INSERT INTO workers (id, user_id, name, token_hash, status, protocol_capabilities)
 	            VALUES ($1, $2, $3, $4, 'online', $5)`, id, f.userID, "lc-"+id.String()[:8], id[:], protocolCaps)

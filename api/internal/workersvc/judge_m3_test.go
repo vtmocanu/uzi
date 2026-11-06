@@ -27,13 +27,14 @@ type fakeSettings struct {
 	spendGuardErr   error  // read error for the PRD #69 M5 spend-guard accessors (fail-open)
 	model           string // instance Claude judge model (settings.KeyJudgeModel)
 	codexModel      string // instance Codex judge model (settings.KeyCodexJudgeModel)
-	// summaryModel is the instance-default run-summary model (PRD #362 M2); the zero
-	// value ("") reads as "no instance model", so an issue-run claim leaves SummaryModel
-	// nil unless a test sets it. summaryModelErr models a settings read fault.
-	summaryModel    string
-	summaryModelErr error
-	uziLabel        string
-	err             error
+	// summaryModel/codexSummaryModel are the instance-tier run-summary models (PRD
+	// #362 M2, PRD #3248); "" reads as "no instance value". summaryModelErr models a
+	// settings read fault on either summary key.
+	summaryModel      string // settings.KeySummaryModel (Claude lane)
+	codexSummaryModel string // settings.KeyCodexSummaryModel (Codex lane)
+	summaryModelErr   error
+	uziLabel          string
+	err               error
 }
 
 func (f fakeSettings) JudgeEnabled(context.Context) (bool, error)    { return f.enabled, f.err }
@@ -45,13 +46,16 @@ func (f fakeSettings) JudgeDailyBudget(context.Context) (int, error) {
 	return f.dailyBudget, f.spendGuardErr
 }
 func (f fakeSettings) InstanceModel(_ context.Context, key string) (string, error) {
+	switch key {
+	case settings.KeySummaryModel:
+		return f.summaryModel, f.summaryModelErr
+	case settings.KeyCodexSummaryModel:
+		return f.codexSummaryModel, f.summaryModelErr
+	}
 	if key == settings.KeyCodexJudgeModel {
 		return f.codexModel, f.err
 	}
 	return f.model, f.err
-}
-func (f fakeSettings) SummaryModel(context.Context) (string, error) {
-	return f.summaryModel, f.summaryModelErr
 }
 func (f fakeSettings) UziLabel(context.Context) (string, error) { return f.uziLabel, f.err }
 

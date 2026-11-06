@@ -324,6 +324,11 @@ export class FakeApi {
   unauthorized = 0;
   stateAttempts = 0;
   readonly states: Array<{ runId: string; body: StateRequest }> = [];
+  readonly repoAgentSourceByRun = new Map<string, string>();
+  repoAgentSourceAckDelayMs = 0;
+  /** Issue #3859: every /state body as it arrived on the wire, including reports the fake then
+   *  refuses (which `states` omits because the real server persists nothing for a refusal). */
+  readonly stateWire: Array<{ runId: string; body: StateRequest }> = [];
   // PRD #1247 M5b: a GLOBAL, ordered log of the mutating requests as they land, so a test can pin
   // RELATIVE ORDER across the two endpoints the single `states`/`messageBatches` arrays cannot show
   // (e.g. that a message batch DRAINED before the credential_switch state report). Each accepted
@@ -533,6 +538,36 @@ export class FakeApi {
     await new Promise<void>((resolve, reject) =>
       this.server.close((err) => (err ? reject(err) : resolve())),
     );
+  }
+
+  /** Claims served on POST /runs/claim (200 responses only). */
+  claimsServed = 0;
+  /** Requeues modelled by {@link requeueRun}. */
+  requeues = 0;
+
+  /** A MODEL of the server's requeue of a run whose flight is missing: it re-offers the run at
+   *  `nextGeneration` (the next claim) and counts one requeue. It does not reproduce the server's
+   *  detection or timing; a test calls it when it decides the server would have requeued. */
+  requeueRun(claim: ClaimResponse, nextGeneration: number): ClaimResponse {
+    this.requeues++;
+    const next = { ...claim, claim_generation: nextGeneration };
+    this.setOwnershipStatus(claim.run_id, "running", nextGeneration);
+    this.enqueueClaim(next);
+    return next;
+  }
+
+  /** Redispatches injected by {@link redispatchRun}. */
+  redispatches = 0;
+
+  /** A TEST-INJECTED redispatch: it re-offers the run at `nextGeneration` after a confirmed park, as
+   *  a test's stand-in for any later claim. It is NOT automatic requeue accounting: a confirmed owner
+   *  hold has no automatic retry, and this does not touch {@link requeues}. */
+  redispatchRun(claim: ClaimResponse, nextGeneration: number): ClaimResponse {
+    this.redispatches++;
+    const next = { ...claim, claim_generation: nextGeneration };
+    this.setOwnershipStatus(claim.run_id, "running", nextGeneration);
+    this.enqueueClaim(next);
+    return next;
   }
 
   enqueueClaim(claim: ClaimResponse): void {
@@ -1260,6 +1295,7 @@ export class FakeApi {
     if (req.method === "POST" && p === "/api/worker/runs/claim") {
       const claim = this.claimQueue.shift();
       if (!claim) return sendEmpty(res, 204);
+      this.claimsServed++;
       return send(res, 200, claim);
     }
 
@@ -1945,6 +1981,7 @@ export class FakeApi {
     json: Record<string, unknown>,
   ): Promise<void> {
     this.stateAttempts++;
+    this.stateWire.push({ runId, body: structuredClone(json) as unknown as StateRequest });
     if (this.strictDecodeStateRemaining > 0) {
       this.strictDecodeStateRemaining--;
       // The exact 400 shape httpx.DecodeJSON (DisallowUnknownFields) produces for an unknown field.
@@ -2108,6 +2145,14 @@ export class FakeApi {
         body: JSON.stringify(body), revision: gateRevision, inputId: body.revision_input_id, superseded: [...superseded],
       });
     }
+    if (body.repo_agent_source_commit !== undefined) {
+      if (this.repoAgentSourceAckDelayMs > 0) await new Promise((r) => setTimeout(r, this.repoAgentSourceAckDelayMs));
+      const stored = this.repoAgentSourceByRun.get(runId);
+      if (stored !== undefined && stored !== body.repo_agent_source_commit) {
+        return send(res, 409, { error: "the run already records a different repo-agent source revision", reason: "repo_agent_source_conflict" });
+      }
+      this.repoAgentSourceByRun.set(runId, body.repo_agent_source_commit);
+    }
     if (this.checkedTransport && body.status === "awaiting_approval") this.checkedFencedRuns.add(runId);
     this.states.push({ runId, body });
     this.requestLog.push(`state:${body.status}`);
@@ -2169,6 +2214,7 @@ export class FakeApi {
       run: {
         id: runId,
         worker_id: this.registeredWorkerId,
+        ...(this.repoAgentSourceByRun.has(runId) ? { repo_agent_source_commit: this.repoAgentSourceByRun.get(runId) } : {}),
         ...(body.recovery_cause === "worker_memory_pressure" && this.memoryWorkerId &&
             body.register_nonce === this.memoryRegisterNonce ? {
           worker_id: this.memoryWorkerId, recovery_wait_cause: body.recovery_cause,

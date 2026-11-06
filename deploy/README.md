@@ -22,11 +22,16 @@
 > that wants to run candidates tracks the Helm `targetRevision` range `0.*-0` instead of the
 > `0.*` shown above.
 
-The release + deploy runbook for uzi (PRD #52). Two deploy topologies:
+The release + deploy runbook for uzi (PRD #52). Three deploy topologies:
 
 - **compose (laptop)** — the MVP path, unchanged. `docker compose up` on
   `127.0.0.1:8080`, real `./.env` secrets. See the repo `README.md` /
   `ARCHITECTURE.md`. Workers still run here (`docker compose --profile agent`).
+- **compose (VPS)** — signed release images from the dedicated
+  [server Compose file](compose/compose.yaml), versioned with the code. For a single
+  VPS without Kubernetes, follow the [VPS guide](../docs/vps-deployment.md) for HTTPS,
+  administrator bootstrap, a base-agent worker, and backups. Optional DinD services
+  are excluded from this file.
 - **k8s (dev-cluster)** — uzi deployed to the **dev-cluster** Kubernetes cluster
   via **ArgoCD**, GitOps, the way the rest of the platform deploys. This file is about
   that path: cutting a release and getting it live.
@@ -41,15 +46,16 @@ deploys. uzi follows the Model-B release shape.
 
 ## What deploys where
 
-| | compose (laptop) | k8s (dev-cluster) |
-| --- | --- | --- |
-| Brought up by | `docker compose up` | ArgoCD (auto-sync) from `argo-apps` `apps/uzi/` |
-| web / api images | built locally | `ghcr.io/vtmocanu/uzi/{web,api}:<tag>` |
-| controller / agent images | n/a (compose runs no controller) | `ghcr.io/vtmocanu/uzi/controller:<tag>`, `ghcr.io/vtmocanu/uzi/agent-{base,jvm}:<tag>` (PRD #58 M6) |
-| Postgres | `postgres:17` container | CNPG `Cluster` (`postgres-uzi-cluster`, 1 instance, `standard`) |
-| Secrets | `./.env` | Infisical (`/uzi` folder) + CNPG-generated `-app` creds |
-| Public URL | `http://127.0.0.1:8080` | `https://uzi.example.com` (ingress-nginx, `*.example.com` wildcard TLS) |
-| Worker | `docker compose --profile agent` | laptop workers unchanged; **hosted workers ship but are OFF** — see [Hosted workers](#hosted-workers-prd-58) |
+| | compose (laptop) | compose (VPS) | k8s (dev-cluster) |
+| --- | --- | --- | --- |
+| Configuration | root `docker-compose.yml` | [compose/compose.yaml](compose/compose.yaml); [VPS guide](../docs/vps-deployment.md) | `chart/` + GitOps values |
+| Brought up by | `docker compose up` | `docker compose -f compose.yaml up -d --no-build db api web` | ArgoCD (auto-sync) from `argo-apps` `apps/uzi/` |
+| web / api images | built locally | `ghcr.io/vtmocanu/uzi/{web,api}:${UZI_VERSION}` | `ghcr.io/vtmocanu/uzi/{web,api}:<tag>` |
+| controller / agent images | n/a (compose runs no controller) | no controller; `ghcr.io/vtmocanu/uzi/agent-base:${UZI_VERSION}` | `ghcr.io/vtmocanu/uzi/controller:<tag>`, `ghcr.io/vtmocanu/uzi/agent-{base,jvm}:<tag>` (PRD #58 M6) |
+| Postgres | `postgres:17` container | digest-pinned `postgres:17` container | CNPG `Cluster` (`postgres-uzi-cluster`, 1 instance, `standard`) |
+| Secrets | `./.env` | private `/opt/uzi/.env`; worker token mounted as a Compose secret | Infisical (`/uzi` folder) + CNPG-generated `-app` creds |
+| Public URL | `http://127.0.0.1:8080` | `https://your_domain` through an existing TLS proxy to loopback web | `https://uzi.example.com` (ingress-nginx, `*.example.com` wildcard TLS) |
+| Worker | `docker compose --profile agent` | `docker compose -f compose.yaml --profile agent up -d --no-build agent` | laptop workers unchanged; **hosted workers ship but are OFF** — see [Hosted workers](#hosted-workers-prd-58) |
 
 The ArgoCD `Application` is **multi-source** (example-app precedent): the released
 chart from the public GHCR OCI registry + the per-cluster values from the argo-apps GitOps

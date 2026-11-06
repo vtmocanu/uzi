@@ -59,11 +59,60 @@ Residual: a process that changes its HOME and leaves the run's directories is in
 
 ### Counted vs uncounted disk parks
 
-Disk parks use `recovery_wait` with cause `data_volume_full`. The original four paths are: a disk-full failure of the clone/fetch, the claim/resume preflight, the soft cache cap and the mid-turn hard stop. Parks that mean the volume actually filled or hit the hard threshold (the first two, and the hard stop) are **counted** toward `UZI_RUN_DISK_PARK_MAX` (default 3; the run then fails with the `data_volume_full` fail origin). The soft-cap park is preventive and carries `disk_park_preventive: true`, so it is **uncounted**: a run that merely grew past its cap is never failed by it. The api accepts the flag only with that cause.
+Disk parks use `recovery_wait` with cause `data_volume_full`. The original four paths are: a disk-full failure of the clone/fetch, the claim/resume preflight, the soft cache cap and the mid-turn hard stop. Parks that mean the volume actually filled or hit the hard threshold (the first two, and the hard stop) are **counted** toward `UZI_RUN_DISK_PARK_MAX` (default 3 timed counted parks; the next counted park holds for owner Resume/Cancel under #3969). The soft-cap park is preventive and carries `disk_park_preventive: true`, so it is **uncounted**: a run that merely grew past its cap is never failed by it. The api accepts the flag only with that cause.
 
 Strict classify-reclaim-retry remains limited to clone/fetch and claim/resume preflight. It does not classify opaque executor errors. The separate approved #1829 policy below can defer an otherwise-terminal executor rejection when the current data volume is confirmed full.
 
 The retained-successor admission rule (#3865) is narrowly different from the claim/resume preflight and is not a fifth park path. Before a retained recovery seeds a fresh attempt, after the existing floor check, the worker samples the successor destination's volume and refuses the seed when current usage already reaches the governor's effective hard threshold, or when projected usage would. The projection is the predecessor tree's measured footprint times 1.25 plus a 1% allowance; when the measurement is incomplete it uses the larger of the partial reading and a fallback of max(1 GiB, 2%) bytes and max(100,000, 2%) inodes; the higher of the byte and inode projections decides. One bounded reclaim pass runs before a refusal. A refusal is not a park: it creates no successor, reports no `data_volume_full` and is charged to the recovery iteration the claim already reserved (at most 3 per five-minute window). Exhaustion ends as the existing `budget_exhausted` blocker and `retained_recovery_exhausted` park, which counts toward the retained-park cap and never toward `disk_park_count`. The rule applies only when the api advertises both `recovery_cause_data_volume_full` and `recovery_cause_retained_recovery_exhausted`; otherwise behaviour is unchanged. The projection is an estimate, not a quota or reservation, and the hard governor remains the backstop. No predecessor source is deleted and no recovery hold is discarded; only the existing D7 reclaim runs. Accepted costs (owner-confirmed): the check has no off switch and applies after any park cause; at the default 0.87 hard threshold on a 49 GiB volume a 1.2 GiB predecessor tree is refused from about 83% byte usage (about 83.5% on the fallback), and inode pressure can refuse earlier. Codex retained seeds are included as sibling protection, since the hard governor stops only Claude runs; a Codex run under pressure therefore spends its own retained-recovery allowance. Each claimed generation still takes its normal server-side custody hold, so holds are bounded by the retained-park cap plus one, and once that cap is spent automatic retries stop for owner Resume.
+
+### Amendment (#3969): owner hold after the counted disk allowance
+
+2026-11-06. **Supersedes the original D6 decision to fail past the cap.** After
+three timed counted parks at the default `UZI_RUN_DISK_PARK_MAX`, the next counted
+`data_volume_full` park stays in `recovery_wait` with NULL
+`recovery_retry_not_before`, without terminal failure or a judge run. The hold
+preserves the consumed `disk_park_count`, custody, worker/session affinity and
+unrelated budgets; `recovery_wait_count` still increments. `0` remains unlimited
+timed counted parks. Preventive parks stay uncounted and timed. Stored
+`fail_origin=data_volume_full` is retained for historical read compatibility only.
+
+Authenticated owner Resume, via the existing bodyless
+`POST /api/runs/{id}/resume-now`, queues one ordinary attempt. It resets neither
+counts nor recovery episodes or other grants; admission can refuse the attempt,
+and a subsequent counted park reholds. Resume banks held time after execution
+has started and retains `started_at` and the remaining wall allowance; an
+exhausted wall may require extension. A stamped cancel wins. Timer, credentials
+and generic promotion cannot wake a NULL hold on compatible serving APIs.
+Mixed old API versions retain generic promotion behavior: finish the serving-API
+rollout before relying on holds. This is application policy, not a database
+invariant.
+
+Resume idempotence covers the current hold only. A bodyless request has no
+durable identity binding to the observed hold; a delayed duplicate crossing a
+later hold is not durably fenced. A later hold requires another claim and counted park;
+that park can occur during preflight, before model execution starts. Clients issue one POST per owner action without automatic
+retry; no concrete single-action replay has been found. This does not establish
+a durable replay fence. The enforcing boundaries are the
+[locked park transaction](../api/internal/workersvc/diskpark.go), the
+[owner-scoped bodyless Resume handler](../api/internal/handler/resume.go) and
+`HoldRunDataVolumeFull` / `ResumeDataVolumeFullHold` in the
+[status-scoped queries](../api/internal/store/queries/runtime.sql).
+
+The existing Go DTO has `RecoveryRetryNotBeforePresent`: explicit JSON NULL
+identifies a hold, an omitted key means unknown timing, and a finite timestamp
+means timed even when due. Malformed non-null JSON timestamps are rejected;
+there is no new wire field. Default CLI wait/follow stops at owner holds,
+explicit `--until` preserves its targets, and CLI/TUI/web show owner Resume/Cancel
+without a countdown. See the [disk recovery contract](../docs/run-recovery-wait.md#worker-data-volume-full).
+
+Existing park stop/quiesce and safe rebuildable-cache drops bound resource
+activity; a held run runs no executor capacity-polling loop. There is no new
+capacity-based auto-resume, cleanup or reclaim authority, nor a power-loss
+durability promise. Open source custody remains protected with no
+`forge_no_output` release exception; archives remain exportable and expire
+independently. Unpublished worker-local work is not guaranteed across worker or
+storage loss. The distinct #3865/#3882 successor-refusal mechanism, #3330 recovery
+budgets and #3329 genuine-idle reclaim/no busy-pressure policy remain unchanged.
 
 ### Full-volume terminal-failure deferral (#1829)
 
@@ -71,15 +120,15 @@ Approved #1829 review supersedes the standing decision that a later disk-full ex
 
 Admission and the periodic hard layer use the higher valid byte or inode used fraction (#1829). Missing or invalid accounting, including missing or zero inode totals, falls back to the valid pair; neither valid means unknown. Existing thresholds, protocol and configuration switches are unchanged.
 
-The issue lane has one final generic arm after executor writer, ticker and report settlement. Only the direct, otherwise-untyped executor rejection qualifies; setup, finalize, bookkeeping and settlement failures do not. Typed recovery outcomes and recognizable typed, wrapped or trusted security/guardrail failures remain excluded, including admission, launcher and plan-wiring refusals. Preserved trusted types and `cause`/`interruption` wrappers remain excluded. Complete legacy reasons are recognized directly and through leading `<context>: <reason>` envelopes with a literal colon and space. Contexts may contain apostrophes; double-quoted or multiline contexts, alternate separators, quoted reason diagnostics and producer-domain near-misses are not legacy refusal envelopes. Ordinary opaque failures keep their existing handling. The exclusion fixtures in `agent/test/runner-terminal-disk-deferral.test.ts` pin this boundary. Cancellation, pause, shutdown, stale or terminal ownership, terminal journal evidence and the disk cap keep precedence. Eligibility requires the `recovery_cause_data_volume_full` feature, claim-generation stamping, ownership explicitly `running` with the exact current generation present, and direct device equality of the actual worktree and HOME with `dataDir`. A fresh sample must have valid byte accounting AND raw `files` and `ffree` present and finite, with positive `files`. Available bytes below max(256 MiB, 1% of volume size) OR free inodes below max(1000, 1% of inode total) qualify. Missing/unknown accounting, device mismatch, an old API or an `awaiting_approval` revision keeps existing handling.
+The issue lane has one final generic arm after executor writer, ticker and report settlement. Only the direct, otherwise-untyped executor rejection qualifies; setup, finalize, bookkeeping and settlement failures do not. Typed recovery outcomes and recognizable typed, wrapped or trusted security/guardrail failures remain excluded, including admission, launcher and plan-wiring refusals. Preserved trusted types and `cause`/`interruption` wrappers remain excluded. Complete legacy reasons are recognized directly and through leading `<context>: <reason>` envelopes with a literal colon and space. Contexts may contain apostrophes; double-quoted or multiline contexts, alternate separators, quoted reason diagnostics and producer-domain near-misses are not legacy refusal envelopes. Ordinary opaque failures keep their existing handling. The exclusion fixtures in `agent/test/runner-terminal-disk-deferral.test.ts` pin this boundary. Cancellation, pause, shutdown, stale or terminal ownership and terminal journal evidence keep precedence; a qualifying counted park past the disk cap now takes the #3969 owner hold. Eligibility requires the `recovery_cause_data_volume_full` feature, claim-generation stamping, ownership explicitly `running` with the exact current generation present, and direct device equality of the actual worktree and HOME with `dataDir`. A fresh sample must have valid byte accounting AND raw `files` and `ffree` present and finite, with positive `files`. Available bytes below max(256 MiB, 1% of volume size) OR free inodes below max(1000, 1% of inode total) qualify. Missing/unknown accounting, device mismatch, an old API or an `awaiting_approval` revision keeps existing handling.
 
 Once eligible, the worker waits for one bounded existing reclaim pass, then takes one counted, nonpreventive `data_volume_full` park even if room returns. It does not replay the command, provider or executor. The clone, HOME, session, journal and custody are retained for recovery.
 
 This bound now applies per park invocation to every mid-run `data_volume_full` park, not this policy alone (see [Amendment (#3916)](#amendment-3916-mid-run-disk-park-capture-bound)). Capture permits at most three nonblocked unverified attempts; five consecutive blocked proofs fail `worker_residue_blocked`. Alternating blocks allow at most 15 capture calls, followed by at most five final proof attempts, using existing waits and deadlines. After three nonblocked unverified captures, degraded parking requires affirmative quiescent Linux Claude/stub process proof, or a successful existing Codex supervisor boundary plus the applicable clone proof. Skipped, absent or unverified proof and surviving processes cannot authorize degraded parking. ACK transport reconciliation is separate from these bounds, does not reset the capture budget, and is not a fixed wall-time promise.
 
-A degraded park retains the original clone and journal without claiming a verified predecessor or a latest published checkpoint. Same-worker resume captures dirty work before admitting a fresh executor. Verified capture keeps its existing truthful checkpoint reporting. Terminal, cancellation, stale-claim and cap cleanup retain their existing dispositions; this is not perpetual retention.
+A degraded park retains the original clone and journal without claiming a verified predecessor or a latest published checkpoint. Same-worker resume captures dirty work before admitting a fresh executor. Verified capture keeps its existing truthful checkpoint reporting. Terminal, cancellation and stale-claim dispositions remain; #3969 cap exhaustion is a nonterminal hold and grants no cleanup authority. Archive expiry is independent, so this is not perpetual archive retention.
 
-Accepted residuals: an unrelated opaque execution error can coincide with fullness and be deferred. For actual trusted refusals, only completely erased-origin opaque failures remain eligible under this accepted coincidence residual. The cap bounds repetition, not misclassification; a configured unlimited cap remains unlimited. Periodic hard-stop selection depends on registered runs with measured cache bytes and a server-confirmed running executor, so it cannot guarantee this failing run parks before failure. Approval revisions are unchanged, including existing in-place cache relief; preserving approval through a new park mechanism is out of scope. Degraded recovery is worker-local and can lose newer work on cross-worker recovery.
+Accepted residuals: an unrelated opaque execution error can coincide with fullness and be deferred. For actual trusted refusals, only completely erased-origin opaque failures remain eligible under this accepted coincidence residual. The cap bounds automatic counted retries, not misclassification; a configured unlimited cap remains unlimited. Periodic hard-stop selection depends on registered runs with measured cache bytes and a server-confirmed running executor, so it cannot guarantee this failing run parks before failure. Approval revisions are unchanged, including existing in-place cache relief; preserving approval through a new park mechanism is out of scope. Degraded recovery is worker-local and can lose newer work on cross-worker recovery.
 
 ## Consequences
 
@@ -106,6 +155,6 @@ Accepted residuals: an unrelated opaque execution error can coincide with fullne
 
 - **The #1829 bound applies per park invocation to every mid-run `data_volume_full` park** (counted hard stop and preventive cache-cap; not credential-deferred), replacing "for this policy only". Three nonblocked unverified captures lead to the final quiescence proof (at most five attempts): proven gives the existing degraded park (clone, HOME, session, journal and custody retained, no verified or published checkpoint claimed, same status text); unproven fails `worker_residue_blocked` with custody kept. An incomplete capture settlement counts as a blocked attempt; five consecutive fail `worker_residue_blocked`, custody kept, with no capture run. Cancellation, shutdown and claim fence keep precedence; a pending owner or wall pause does not interrupt the proof and stays pending for resume.
 - **Soft-cap parks remain uncounted** (`disk_park_preventive` kept), including when they take the degraded park. Later preventive parks of the same run can recur under existing policy; each is bounded per park and there is no cross-flight cap on uncounted parks.
-- **The cap bounds repetition only when finite.** `UZI_RUN_DISK_PARK_MAX` limits counted parks; `0` remains unlimited.
+- **The cap bounds automatic counted retries only when finite.** `UZI_RUN_DISK_PARK_MAX` limits timed counted parks before the #3969 owner hold; `0` remains unlimited.
 - **Root fix: the park's capture waits only on terminal lifecycle and shutdown for source-authority acquisition** (`diskParkCaptureWait` in `agent/src/runner.ts`), not on the run's own pause. As a wait it bounds acquisition only; the fetch-back transport runs without that lock. The capture also uses the same signal for its remediation bootstrap and checkpoint publish, so those can be aborted. A real cancel, claim fence, receipt failure and worker shutdown still abort it.
 - **Residual.** Owed-head reconciliation after a disk-park publish still waits on the paused signal and is skipped until the next claim. It does not block the park.

@@ -18,6 +18,7 @@ import { changedMilestones } from "../../lib/milestoneReset";
 import { ApiError } from "../../lib/apiError";
 import { isCredentialSwitchRefusedLane } from "../../lib/credentialOverride";
 import { credentialSwitchHold } from "../../lib/credentialSwitchHold";
+import { diskWaitMode } from "../../lib/diskRecovery";
 import { isTerminalRun } from "../../lib/runStatus";
 import {
   LIVE_RUN_ID,
@@ -102,7 +103,7 @@ function seedCustodyHolds(): RecoveryCustodyHold[] {
     // Worker B — jvm-worker: an actionable capture failure + a source-only hold.
     // Still at its branch checkpoint slot (PRD #1810); the long branch exercises phone wrapping.
     mk({ id: "hold-b2", run_id: "run-b2", worker_id: "wkr-jvm", worker_name: "jvm-worker", generation: 2, attention: "needs_action", capture_state: "needs_action", checkpoint_ref: "refs/uzi-checkpoints/agent/issue-1810-retain-published-checkpoints-across-supersession", checkpoint_tip: "b41e7d09a2c3f58e61d4a7b90c2e5f3a1d8b6c47", checkpoint_state: "retained", counts_toward_admission: true, admission_reason: "decision_needed" }),
-    mk({ id: "hold-b1", run_id: "run-b1", worker_id: "wkr-jvm", worker_name: "jvm-worker", generation: 1, attention: "source_only", counts_toward_admission: true, admission_reason: "decision_needed" }),
+    mk({ id: "hold-b1", run_id: "run-b1", worker_id: "wkr-jvm", worker_name: "jvm-worker", generation: 1, attention: "source_only", created_at: t(200), counts_toward_admission: true, admission_reason: "decision_needed" }),
     // Worker C — hostile name: a source-only decision + healthy protection.
     mk({ id: "hold-c2", run_id: "run-c2", worker_id: "wkr-ext", worker_name: HOSTILE_WORKER_NAME, generation: 2, attention: "active", counts_toward_admission: true, admission_reason: "earlier_generation" }),
     mk({ id: "hold-c1", run_id: "run-c1", worker_id: "wkr-ext", worker_name: HOSTILE_WORKER_NAME, generation: 1, attention: "source_only", counts_toward_admission: true, admission_reason: "decision_needed" }),
@@ -111,9 +112,37 @@ function seedCustodyHolds(): RecoveryCustodyHold[] {
   ];
 }
 
+// The `?mock=overview-next` scenario's holds (PRD #3880): two decision holds on different runs
+// with different ages (one Held work row, "2 decisions") plus two healthy active holds, so
+// four are open against the default limit of 8 and nothing is blocked. The worker ids match
+// no seeded worker, so deleting a mock worker is never blocked by these.
+function seedOverviewNextHolds(): RecoveryCustodyHold[] {
+  const t = (minsAgo: number) => new Date(Date.now() - minsAgo * 60_000).toISOString();
+  const mk = (o: Partial<RecoveryCustodyHold> & Pick<RecoveryCustodyHold, "id" | "run_id" | "attention">): RecoveryCustodyHold => ({
+    generation: 1,
+    state: "open",
+    worker_id: "wkr-ov-held",
+    worker_name: "held-worker",
+    inventory_guarded: false,
+    has_available_capture: false,
+    created_at: t(180),
+    updated_at: t(20),
+    counts_toward_admission: true,
+    ...o,
+  });
+  return [
+    mk({ id: "hold-ov-1", run_id: "a83c51f0-6d2e-4b7a-9c14-0e5f8a1d3b27", attention: "source_only", created_at: t(125), admission_reason: "decision_needed" }),
+    mk({ id: "hold-ov-2", run_id: "5e7d09b4-1c3a-4f86-b2d7-9a40c6e18f35", attention: "needs_action", capture_state: "needs_action", created_at: t(45), admission_reason: "decision_needed" }),
+    mk({ id: "hold-ov-3", run_id: "run-ov-active-1", attention: "active", admission_reason: "live_claim" }),
+    mk({ id: "hold-ov-4", run_id: "run-ov-active-2", attention: "active", admission_reason: "live_claim" }),
+  ];
+}
+
 function currentCustodyHolds(): RecoveryCustodyHold[] {
-  if (mockScenario() !== "custody") return [];
-  return seedCustodyHolds().filter((h) => !discardedHolds.has(h.id));
+  const scenario = mockScenario();
+  const seeds =
+    scenario === "overview-next" ? seedOverviewNextHolds() : scenario === "custody" ? seedCustodyHolds() : [];
+  return seeds.filter((h) => !discardedHolds.has(h.id));
 }
 
 function custodyResponse(): RecoveryCustodyHolds {
@@ -779,6 +808,8 @@ export const runsApi = {
     // is lost); an unsettled hold takes the override and requeues.
     const switchHold = credentialSwitchHold(run);
     if (switchHold === "settling") throw new ApiError(409, CREDENTIAL_SWITCH_SETTLING_REFUSAL);
+    if (diskWaitMode(run) === "held")
+      throw new ApiError(409, "data_volume_full held: use Resume before switching its token");
     credentialSwitched.add(id);
     patchRun(id, {
       credential_override: overrideToRead(body),
@@ -995,10 +1026,9 @@ export const runsApi = {
 
   // PRD #1190 (D14): resume a `paused` run via the widened /resume-now endpoint. Mirrors
   // ResumePausedRun — paused → queued (the mock has no budget clock to bank, but the
-  // transition is what un-parks it). Owner-scoped; a 409 naming the status on any run that
-  // is neither paused nor pool_wait, so the panel's inline "no longer paused" note is
-  // reachable when a second click races the refetch. Also accepts a pool_wait run, since
-  // the real endpoint dispatches on status.
+  // transition is what un-parks it). Also accepts pool_wait and the supported recovery
+  // holds; a disk hold requires explicit NULL retry timing. Owner-scoped; a second click
+  // after the run is queued gets a 409 naming its status.
   resumeRun: async (id: string) => {
     const run = getRun(id);
     if (!run) throw new ApiError(404, "run not found");
@@ -1008,10 +1038,13 @@ export const runsApi = {
       throw new ApiError(404, "run not found");
     const forgeHeld = run.status === "recovery_wait" && run.recovery_wait_cause === "forge_unreachable" && run.recovery_retry_not_before === null;
     const memoryHeld = run.status === "recovery_wait" && run.recovery_wait_cause === "worker_memory_pressure";
-    if (run.status !== "paused" && run.status !== "pool_wait" && !memoryHeld && !forgeHeld)
+    const diskHeld = diskWaitMode(run) === "held";
+    if (run.status !== "paused" && run.status !== "pool_wait" && !memoryHeld && !forgeHeld && !diskHeld)
       throw new ApiError(409, `run is ${run.status}`);
     const iterationHeld = run.status === "paused" && run.hold_reason === "iteration_budget_exhausted";
-    if (iterationHeld) {
+    const diskWallLimited = diskHeld && run.kind !== "chat" && run.kind !== "judge" &&
+      run.interactive !== true && run.started_at != null;
+    if (iterationHeld || diskWallLimited) {
       const total = run.budget_total_seconds ??
         (run.budget_wall_seconds ?? 6 * 3600) + (run.budget_extension_seconds ?? 0) + (run.budget_finalize_seconds ?? 0);
       if (run.budget_used_seconds != null && total - run.budget_used_seconds <= 0)
@@ -1034,8 +1067,10 @@ export const runsApi = {
         health_reason: "Owner resumed one bounded forge attempt; origin cooldown and other admission limits may still block execution.",
       } : {}),
       ...(memoryHeld ? { memory_hold: undefined, recovery_wait_cause: null, recovery_retry_not_before: null } : {}),
+      ...(diskHeld ? { recovery_wait_cause: null, recovery_retry_not_before: null,
+        recovery_wait_phase: null, health: "ok", health_reason: null, health_since: null } : {}),
       ...(switchHold === "unsettled" ? { hold_reason: null, status_since: new Date().toISOString() } : {}),
-      ...(run.hold_reason === "provider_unavailable" ? {
+      ...(!diskHeld && run.hold_reason === "provider_unavailable" ? {
         provider_park_count: 0, provider_park_streak_started_at: null, can_stop_at_provider_hold: false,
       } : {}),
     });
