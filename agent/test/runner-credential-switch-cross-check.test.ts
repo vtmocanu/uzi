@@ -665,7 +665,49 @@ describe("issue #3953 m3: stash lifetime, ambiguous submit and pre-reserve switc
     });
   }
 
-  it("a stashed approval that does not match the re-presented candidate fails closed", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+  it("an ordinary automatic revise with no switch leaves no stash: one revision turn, each round submitted once, no adoption", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const d = await drive({ capture: "giveup", verdicts: ["revise", "approve"], plans: [PLAN, PLAN2], switchRounds: [] });
+    const { c } = d;
+    assert.deepEqual(d.attempts, [], "no switch was ever serviced");
+    assert.deepEqual(d.posts().map((r) => r.body.round), [1, 2], "each round is submitted exactly once");
+    assert.deepEqual(d.posts().map((r) => r.body.plan_md), [PLAN, PLAN2]);
+    assert.equal(d.counter.calls, 3, "plan, exactly one revision turn, implementation");
+    assert.equal(d.storage.length, 1, "canonical plan stored once, from the round-two checker answer");
+    assert.equal(d.storage[0]!.plan_md, NORMALIZED);
+    assert.deepEqual(switchReports(c.run_id), []);
+    assert.ok(statuses(c.run_id).includes("completed"), JSON.stringify(statuses(c.run_id)));
+    assert.ok(!statuses(c.run_id).includes("failed"));
+    assert.equal(gates(c.run_id).length, 0);
+    assertSeqsUnique(c.run_id);
+  });
+
+  it("a non-switch failure after a stashed revise was consumed never replays the stale revise", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    // Round one's revise is decided under a latched switch (stashed), serviced by a give-up and consumed by
+    // the continuation. Round two's checker request then fails outright (a non-switch exit) and the run
+    // falls back to a human gate; a second switch there must continue that gate, not replay round one's revise.
+    let gateSwitch = false;
+    const d = await drive({ capture: "giveup", switchRounds: [1], verdicts: ["revise", "approve"], plans: [PLAN, PLAN2],
+      duringPending: async () => { if (api.crossCheckRequests.some((r) => r.method === "POST" && Number(r.body.round) === 2)) throw new Error("checker transport down"); },
+      setup: (c) => api.onState(c.run_id, (b) => {
+        if (b.status === "awaiting_approval" && !gateSwitch) { gateSwitch = true; api.requestCredentialSwitch(c.run_id, 1); }
+      }) });
+    const { c } = d;
+    assert.ok(gateSwitch, "the human gate was presented");
+    assert.deepEqual(d.attempts, ["attempt", "gave_up", "attempt", "gave_up"], "the round-one switch and the human-gate switch");
+    const rounds = d.posts().map((r) => Number(r.body.round));
+    assert.equal(rounds.filter((r) => r === 1).length, 1, `round one is submitted once: ${JSON.stringify(rounds)}`);
+    assert.ok(rounds.every((r) => r === 1 || r === 2), JSON.stringify(rounds));
+    assert.equal(d.counter.calls, 2, "plan and one revision turn; the failed round neither replays the stale revise nor implements");
+    assert.deepEqual(d.storage, []);
+    assert.ok(!statuses(c.run_id).includes("completed"));
+    assert.equal(gates(c.run_id).length, 1, "the failed round falls back to one human gate, not the stale decision");
+    failedWith(c.run_id, "plan approval timed out");
+    assert.ok(!everyState(c.run_id).some((s) => s.failure_reason?.includes("invalid automatic plan revision round")),
+      "the stale round-one revise was not replayed at the human gate");
+    assertSeqsUnique(c.run_id);
+  });
+
+  it("a stashed approval that does not match the re-presented candidate fails closed",{ skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
     const d = await drive({ capture: "giveup", switchRounds: [1], gateMd: (n, md) => n === 1 ? md : `${md}\n- changed after the give-up` });
     const { c } = d;
     failedWith(c.run_id, "stashed decision does not match the re-presented candidate");
