@@ -253,6 +253,15 @@ type CodexActiveRunCooldown struct {
 	AccountCooldownEligibleAt pgtype.Timestamptz `json:"account_cooldown_eligible_at"`
 }
 
+type CodexCatalogDefault struct {
+	UserID         uuid.UUID          `json:"user_id"`
+	ContextID      string             `json:"context_id"`
+	Model          string             `json:"model"`
+	RuntimeVersion string             `json:"runtime_version"`
+	DefaultEffort  string             `json:"default_effort"`
+	ReportedAt     pgtype.Timestamptz `json:"reported_at"`
+}
+
 type CodexCredentialState struct {
 	UserSecretID      uuid.UUID          `json:"user_secret_id"`
 	UserID            uuid.UUID          `json:"user_id"`

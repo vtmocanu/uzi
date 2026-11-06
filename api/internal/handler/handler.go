@@ -1323,6 +1323,11 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// Lead-config record (PRD #3244): the worker reports what its lead agent was configured
 		// to use and what the runtime reported, one claim-fenced row per report.
 		r.With(h.refuseJobRuns).Post("/runs/{id}/lead-config", h.WorkerRecordLeadConfig)
+
+		// Codex catalog default (issue #3251): the claim holder reports the Codex catalog's default
+		// reasoning effort for the credential revision the claim released, one claim-fenced,
+		// context-checked row per report.
+		r.With(h.refuseJobRuns).Post("/runs/{id}/codex-catalog-default", h.WorkerRecordCodexCatalogDefault)
 		r.With(interruptedCallsDeadline, h.refuseJobRuns).Get("/runs/{id}/interrupted-calls", h.WorkerInterruptedCalls)
 
 		// Forge read surface (PRD #158 M1): worker-authenticated, run-scoped, READ

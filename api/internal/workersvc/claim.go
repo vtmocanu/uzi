@@ -679,6 +679,12 @@ type ClaimConfig struct {
 	// user_default or builtin today). PRD #3244: present on every lead-lane claim, which makes
 	// it the worker's activation signal for the lead-config reporter; absent otherwise.
 	DefaultEffortSource *string `json:"default_effort_source,omitempty"`
+	// CodexCatalogContext is the opaque catalog context (issue #3251): lowercase hex SHA-256 of
+	// the credential revision this claim releases (user, secret id, auth mode, material revision,
+	// subscription account key). The worker echoes it verbatim when it reports the Codex catalog's
+	// default reasoning effort. Present only on a Codex lead-lane claim whose frozen binding is
+	// complete; omitempty keeps every other claim byte-identical.
+	CodexCatalogContext *string `json:"codex_catalog_context,omitempty"`
 	// AttributionEnabled is the run owner's AI-attribution opt-out (issue #916), read
 	// LIVE from the owner's users row on every claim. When false, the worker suppresses
 	// the Agent SDK's Co-Authored-By: Claude commit trailer for this run (agent-side, a
