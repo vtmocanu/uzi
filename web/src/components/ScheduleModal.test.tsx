@@ -2103,6 +2103,73 @@ describe("the Where it runs fieldset (issue #3256)", () => {
       });
     });
 
+    it("untouched Codex-default overflow-state edit sends the same body as before", async () => {
+      mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken(), codexKey()] });
+      settings({ harness_overflow_enabled: true, default_harness: "codex", default_codex_model: "gpt-6-astra" });
+      mockApi.updateSchedule.mockResolvedValue(schedFixture());
+      await open();
+      expect(harnessOpts()[0]).toBe(OVERFLOW_CODEX);
+      fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+      await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+      const body = mockApi.updateSchedule.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect(JSON.parse(JSON.stringify(body))).toEqual({
+        target: "sweep",
+        labels: ["bug"],
+        max_issues: 10,
+        remove_label_on_dispatch: false,
+        capacity_limit: null,
+        capacity_room_needed: null,
+        guidance: null,
+        timing: "recurring",
+        cron_expr: "0 2 * * 1-5",
+        timezone: "UTC",
+        auto_approve: true,
+        wait_on_limit: true,
+        mr_rework_enabled: null,
+        model: null,
+        override_subagent_model: false,
+        repo_id: "repo-uzi",
+      });
+    });
+
+    it("untouched Codex-default overflow-state create sends the same body as before", async () => {
+      mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken(), codexKey()] });
+      settings({ harness_overflow_enabled: true, default_harness: "codex", default_codex_model: "gpt-6-astra" });
+      mockApi.listRepos.mockResolvedValue({
+        repos: [{ id: "repo-uzi", path_with_namespace: "vtmocanu/uzi" }] as unknown as Awaited<
+          ReturnType<typeof api.listRepos>
+        >["repos"],
+      });
+      mockApi.createSchedule.mockResolvedValue(schedFixture());
+      renderModal();
+      await waitFor(() => expect(mockApi.listRepos).toHaveBeenCalled());
+      await act(async () => {});
+      fireEvent.change(screen.getByLabelText("Issue number"), { target: { value: "142" } });
+      expect(harnessOpts()[0]).toBe(OVERFLOW_CODEX);
+      const btn = screen.getByRole("button", { name: "Create schedule" });
+      await waitFor(() => expect(btn.hasAttribute("disabled")).toBe(false));
+      fireEvent.click(btn);
+      await waitFor(() => expect(mockApi.createSchedule).toHaveBeenCalled());
+      const body = mockApi.createSchedule.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect(JSON.parse(JSON.stringify(body))).toEqual({
+        target: "issue",
+        issue_iid: 142,
+        remove_label_on_dispatch: false,
+        capacity_limit: null,
+        capacity_room_needed: null,
+        guidance: null,
+        timing: "recurring",
+        cron_expr: "0 2 * * 1-5",
+        timezone: "UTC",
+        auto_approve: true,
+        wait_on_limit: true,
+        mr_rework_enabled: null,
+        model: null,
+        override_subagent_model: false,
+        enabled: true,
+      });
+    });
+
     it.each([true, false])("subagent toggle submits override_subagent_model=%s", async (initial) => {
       mockApi.updateSchedule.mockResolvedValue(schedFixture());
       await open({ override_subagent_model: !initial });
