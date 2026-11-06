@@ -511,3 +511,31 @@ Every case keeps the source. What a later run sees depends on where the failure 
 - Operator procedure: `docs/run-recovery.md`, "When a run is stopped by a stale or fenced
   claim" and "Retained sources with no open hold (worker-local inspect and discard)".
 - **Go scratch (#3870).** A Claude run's managed Go work leaf (`<run HOME>/.uzi-go-work/g<N>`) lives inside the run HOME, so terminal HOME cleanup removes the Go-work root with the HOME. This adds no retention gate and changes no source or custody rule here; the leaf is disposable scratch, not a retained source. See the [ADR-1809 amendment](1809-per-run-cache-bounds.md#amendment-3870-park-only-go-scratch).
+
+## Amendment 2026-11-06 — PRD #3431 M1b: the plain discard as the verified-epoch disposal core
+
+Refs [PRD #3431](../prds/3431-pod-epoch-reclaim.md) M1b. The invariant above is unchanged:
+a stopped generation's source is kept until disposal, and nothing here broadens the
+operator channel. What changes is that the plain discard (`discardStoppedSource`) is also
+the single disposal core of a gated first-process deletion at a verified pod epoch. The
+mechanism, its crash table and its R9 limits are recorded in the
+[ADR-1783 amendment of the same date](1783-run-quiescence-and-attempt-clone-paths.md).
+
+- **Off by default.** `EPOCH_RECLAIM_DELETION_ENABLED` is `false`, so production startup
+  is shadow-only and every retained source stays as this ADR describes. Activation needs a
+  separate owner co-sign; hosted acceptance is pending.
+- **Plain only.** With an epoch proof, `discardRetainedSource` refuses any mode but
+  `plain`; a `local_protected_discard` source is counted `kept_protected` and keeps the
+  protected operator route.
+- **Attempts only.** The proof names one attempt: `createEpochDiscardProof` refuses a
+  canonical selector and an absent (`[]`) journal before granting a proof (R5). A
+  marker-less kept canonical clone, and any no-key attempt, is `kept_unrecoverable_shape`,
+  so the cross-worker reclaim follow-up under Consequences stays open. A successor's
+  journal is never cleared.
+- **Admitted shapes.** The strict three-key journal `{runId, clonePath, attemptId}` with
+  the ledger `live` (footprint present or missing) or `retired` (footprint missing; the
+  retry skips the retired append), and the explicitly valued `[""]` repair (metadata only).
+- **Same holds rule, stricter.** Besides a terminal lifecycle and an empty hold list, the
+  epoch path needs a run-wide `run_open_holds` count of exactly 0 for the run.
+- **Process crash only.** No storage or power-loss durability is claimed; the residual
+  window inside the `beginDestructive` save keeps the source retained, with no resolver.
