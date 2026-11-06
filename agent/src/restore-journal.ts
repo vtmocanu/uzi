@@ -161,3 +161,59 @@ export function restoreTombstoneJson(basis: RestoreBasis, succ: RestoreSuccessor
   return JSON.stringify({ restore: basisOrdered(parseRestoreBasis(basis)), restoreStage: "retired",
     successor: { runId: s.runId, attemptId: s.attemptId, clonePath: s.clonePath } });
 }
+
+// ---- the crash windows of the seed (plan 3.9) --------------------------------------------------------------------
+
+/**
+ * What a refused or interrupted seed left behind (plan 3.9), named by the typed error:
+ *   none         nothing was written (every refusal before the marker)
+ *   marker_only  the retained-home marker may exist; the bare is untouched
+ *   ledger_live  S's `live` ledger entry may exist, no restore entry (exit: the plain discard of P retires it)
+ *   seeding      the restore entry (`seeding`, or `ready` whose read-back failed) and S's ledger entry exist, maybe a partial S
+ */
+export type RestoreWindow = "none" | "marker_only" | "ledger_live" | "seeding";
+
+/** A seed that refused or failed. Nothing beyond `window` was written, and `cause` carries the underlying error. */
+export class RestoreSeedError extends Error {
+  constructor(readonly reason: string, readonly window: RestoreWindow, readonly step: string, cause?: unknown) {
+    super(`independent restore seed refused (${reason}) at ${step}; left behind: ${window}`, cause === undefined ? undefined : { cause });
+    this.name = "RestoreSeedError";
+  }
+}
+
+// ---- ref protection while a restore entry exists (plan 3.7) -------------------------------------------------------
+
+/** What the restore entries (and tombstones) of a bare keep alive, per run: every generation up to the predecessor's, and its pin. */
+export interface RestoreRefProtection {
+  /** A restore value that cannot be decoded names no run: everything is kept. */
+  all: boolean;
+  runs: Map<string, { generation: number; shas: Set<string> }>;
+}
+
+/** Fold the raw values of every `uzi-restore.<branch>.journal` key (empty = cleared) into the protection they imply. */
+export function restoreRefProtection(values: readonly string[]): RestoreRefProtection {
+  const out: RestoreRefProtection = { all: false, runs: new Map() };
+  for (const value of values) {
+    if (value === "") continue;
+    try {
+      const v = parseRestoreValue(value);
+      const runId = v.kind === "entry" ? v.remainder.runId : v.successor.runId;
+      if (typeof runId !== "string" || runId === "") { out.all = true; continue; }
+      const held = out.runs.get(runId) ?? { generation: 0, shas: new Set<string>() };
+      held.generation = Math.max(held.generation, v.basis.predecessor.generation);
+      held.shas.add(v.basis.pin.sourceSha);
+      held.shas.add(v.basis.restoreTip);
+      out.runs.set(runId, held);
+    } catch { out.all = true; }
+  }
+  return out;
+}
+
+/** True when a deleter must keep a ref of `runId`: a generation at or below the predecessor's, or the pin's SHA. */
+export function restoreProtects(p: RestoreRefProtection, runId: string, what: { generation?: number | null; sha?: string }): boolean {
+  if (p.all) return true;
+  const held = p.runs.get(runId);
+  if (!held) return false;
+  if (what.sha !== undefined && held.shas.has(what.sha)) return true;
+  return what.generation !== undefined && what.generation !== null && what.generation <= held.generation;
+}
