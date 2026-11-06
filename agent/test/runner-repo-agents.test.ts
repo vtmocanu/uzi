@@ -302,6 +302,9 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
           .map((st) => st.body)
           .find((b) => b.agent_selection !== undefined)?.agent_selection;
         assert.deepStrictEqual(selection, { source: c.want, exclusions: [] });
+        const texts = api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => String(m.payload.text));
+        assert.equal(texts.includes("this clone has no repo agent roster; using your own agent templates"),
+          c.requested === "repo" && !c.roster, texts.join("\n"));
       } finally {
         repoFx.cleanup();
       }
