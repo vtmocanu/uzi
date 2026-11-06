@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -36,7 +37,22 @@ type crsRun struct {
 
 func (f *gateFix) crsNewGatedRun(mode string) uuid.UUID {
 	f.t.Helper()
+	return f.crsNewGatedRunKind(mode, "issue")
+}
+
+func (f *gateFix) crsNewGatedRunKind(mode, kind string) uuid.UUID {
+	f.t.Helper()
+	// newRun's INSERT cannot satisfy runs_kind_shape for these kinds, so re-shape an issue run.
 	id := f.newRun("issue")
+	switch kind {
+	case "issue":
+	case "prompt":
+		f.exec(`UPDATE runs SET kind = 'prompt', issue_iid = NULL WHERE id = $1`, id)
+	case "ci_fix":
+		f.exec(`UPDATE runs SET kind = 'ci_fix', issue_iid = NULL, pipeline_id = $2, pipeline_ref = 'main' WHERE id = $1`, id, gateIssueSeq)
+	default:
+		f.t.Fatalf("unknown kind %q", kind)
+	}
 	switch mode {
 	case "gated":
 		f.exec(`UPDATE runs SET plan_cross_check_gated = true WHERE id = $1`, id)
@@ -103,7 +119,12 @@ func (f *gateFix) crsAnswer(id uuid.UUID, gen int64, question string, apply bool
 // question, answer applied.
 func (f *gateFix) crsParked(mode string) crsRun {
 	f.t.Helper()
-	id := f.crsNewGatedRun(mode)
+	return f.crsParkedKind(mode, "issue")
+}
+
+func (f *gateFix) crsParkedKind(mode, kind string) crsRun {
+	f.t.Helper()
+	id := f.crsNewGatedRunKind(mode, kind)
 	r := crsRun{id: id, gen: 1, question: crsQuestion}
 	r.revise = f.crsRevise(id, r.gen)
 	f.crsPark(id, r.gen, r.question)
@@ -206,6 +227,42 @@ func (f *gateFix) crsReplay(id uuid.UUID, gen int64, question string, revise, ga
 		f.t.Fatal(err)
 	}
 	return got
+}
+
+// crsDerived lists every column SetRunRunning derives or freezes from the candidate milestones (its
+// milestones_frozen, completion_contract, contract_revision, budget_max_iterations and
+// budget_wall_seconds assignments). The settlement must leave each of them as it found it.
+var crsDerived = []string{"milestones_frozen", "completion_contract", "contract_revision", "budget_max_iterations", "budget_wall_seconds"}
+
+// crsDerivedNull reports, per derived column, whether it is currently SQL NULL.
+func (f *gateFix) crsDerivedNull(id uuid.UUID) map[string]bool {
+	f.t.Helper()
+	out := map[string]bool{}
+	for _, c := range crsDerived {
+		var isNull bool
+		if err := f.pool.QueryRow(f.ctx, `SELECT `+c+` IS NULL FROM runs WHERE id = $1`, id).Scan(&isNull); err != nil {
+			f.t.Fatal(err)
+		}
+		out[c] = isNull
+	}
+	return out
+}
+
+func (f *gateFix) crsContractVersion(id uuid.UUID) *int32 {
+	f.t.Helper()
+	var v *int32
+	if err := f.pool.QueryRow(f.ctx, `SELECT completion_contract_version FROM runs WHERE id = $1`, id).Scan(&v); err != nil {
+		f.t.Fatal(err)
+	}
+	return v
+}
+
+func (f *gateFix) crsReviseState(revise int64) (applied bool, disposition *string) {
+	f.t.Helper()
+	if err := f.pool.QueryRow(f.ctx, `SELECT applied_at IS NOT NULL, disposition FROM run_user_inputs WHERE id = $1`, revise).Scan(&applied, &disposition); err != nil {
+		f.t.Fatal(err)
+	}
+	return applied, disposition
 }
 
 func TestClarificationRevisionSettlementControlsLiveDB(t *testing.T) {
@@ -603,6 +660,114 @@ func TestClarificationRevisionSettlementControlsLiveDB(t *testing.T) {
 		}
 		if f.crsSnapshot(r.id) != before {
 			t.Fatalf("a malformed report changed the run")
+		}
+	})
+
+	for _, kind := range []string{"prompt", "ci_fix"} {
+		t.Run(kind+" run settles to the gate", func(t *testing.T) {
+			r := f.crsParkedKind("gated", kind)
+			f.crsBackdate(r.id)
+			rest := f.crsRestSnapshot(r.id)
+			requireSettled(t, r, f.crsSix(r.id).paused)
+			if got := f.crsRestSnapshot(r.id); got != rest {
+				t.Fatalf("columns outside the settlement set changed:\nbefore %s\nafter  %s", rest, got)
+			}
+		})
+	}
+
+	t.Run("an interlocked multi-milestone candidate is not frozen or budgeted by the settlement, and plan B is approvable only at its own revision", func(t *testing.T) {
+		id := f.newRun("issue")
+		f.exec(`UPDATE runs SET plan_cross_check_gated = true, completion_contract_version = 1 WHERE id = $1`, id)
+		req := gateReq(i64(1), uid())
+		req.Milestones = &[]Milestone{{ID: "M1", Title: "First"}, {ID: "M2", Title: "Second"}}
+		f.mustPublish(id, req, 1)
+		f.liveWorker()
+		r := crsRun{id: id, gen: 1, question: crsQuestion}
+		r.revise = f.crsRevise(id, r.gen)
+		f.crsPark(id, r.gen, r.question)
+		r.answer = f.crsAnswer(id, r.gen, r.question, true)
+
+		var candidates int
+		if err := f.pool.QueryRow(f.ctx, `SELECT COALESCE(jsonb_array_length(milestones_candidate), 0) FROM runs WHERE id = $1`, id).Scan(&candidates); err != nil || candidates != 2 {
+			t.Fatalf("milestones_candidate length = %d, err %v, want the two presented milestones", candidates, err)
+		}
+		before := f.crsDerivedNull(id)
+		if !before["milestones_frozen"] {
+			t.Fatalf("fixture: milestones_frozen must start NULL, got %v", before)
+		}
+		version := f.crsContractVersion(id)
+		if version == nil || *version != 1 {
+			t.Fatalf("fixture: completion_contract_version = %v, want 1", version)
+		}
+
+		f.crsBackdate(id)
+		requireSettled(t, r, f.crsSix(id).paused)
+
+		after := f.crsDerivedNull(id)
+		for _, c := range crsDerived {
+			if after[c] != before[c] {
+				t.Errorf("derived column %s NULL-ness %v -> %v across the settlement; the settlement must not freeze or derive it", c, before[c], after[c])
+			}
+		}
+		if got := f.crsContractVersion(id); got == nil || *got != *version {
+			t.Fatalf("completion_contract_version %v -> %v, want unchanged", *version, got)
+		}
+		if st := f.crsSix(id).status; st != "awaiting_approval" {
+			t.Fatalf("status = %q, want awaiting_approval", st)
+		}
+		if applied, disp := f.crsReviseState(r.revise); applied || disp != nil {
+			t.Fatalf("the revise must stay unapplied, got applied %v disposition %v", applied, disp)
+		}
+
+		// The lead then presents plan B at the next revision with changed milestones, settling the revise.
+		planB := approvalGuardReplacement(r.revise)
+		if _, applied, err := f.svc.SetState(f.ctx, f.wkr, id, planB); err != nil || !applied {
+			t.Fatalf("plan B presentation = (applied %v, err %v), want applied", applied, err)
+		}
+		if rev := f.row(id).revision; rev != 2 {
+			t.Fatalf("gate_revision after plan B = %d, want 2", rev)
+		}
+		if applied, disp := f.crsReviseState(r.revise); !applied || disp != nil {
+			t.Fatalf("plan B must settle the revise, got applied %v disposition %v", applied, disp)
+		}
+		_, err := f.submit(id, "approve_plan", nil, SubmitInputOptions{ExpectedGateRevision: i64(1)})
+		assertMismatch(t, err, 2)
+		if _, err := f.submit(id, "approve_plan", nil, SubmitInputOptions{ExpectedGateRevision: i64(2)}); err != nil {
+			t.Fatalf("approval bound to the current revision 2 refused: %v", err)
+		}
+		var candidate string
+		if err := f.pool.QueryRow(f.ctx, `SELECT milestones_candidate::text FROM runs WHERE id = $1`, id).Scan(&candidate); err != nil || !strings.Contains(candidate, "Changed first") {
+			t.Fatalf("milestones_candidate = %q (err %v), want plan B's changed milestones", candidate, err)
+		}
+	})
+
+	t.Run("control: an already-approved implementation run keeps the generic running path", func(t *testing.T) {
+		id := f.crsNewGatedRun("gated")
+		res, err := f.submit(id, "approve_plan", nil, SubmitInputOptions{ExpectedGateRevision: i64(1)})
+		if err != nil {
+			t.Fatalf("approve: %v", err)
+		}
+		f.crsAck(id, 1, res.ID)
+		if applied, err := f.svc.ApplyInputs(f.ctx, f.wkr, id, 1, []int64{res.ID}); err != nil || !applied.Active {
+			t.Fatalf("apply approval = %+v, err %v", applied, err)
+		}
+		if _, applied, err := f.svc.SetState(f.ctx, f.wkr, id, StateRequest{State: "running", ClaimGeneration: i64(1)}); err != nil || !applied {
+			t.Fatalf("approved start = (applied %v, err %v)", applied, err)
+		}
+		f.crsPark(id, 1, crsQuestion)
+		if st := f.crsSix(id).status; st != "awaiting_input" {
+			t.Fatalf("status after the park = %q, want awaiting_input", st)
+		}
+		f.crsAnswer(id, 1, crsQuestion, true)
+		// The approval is applied for the current gate, so the clarification settlement is refused.
+		f.crsRefused(t, []uuid.UUID{id}, nil, func() (store.Run, bool, error) {
+			return f.crsSettleWith(id, 1, crsQuestion, res.ID, 1)
+		})
+		if _, applied, err := f.svc.SetState(f.ctx, f.wkr, id, StateRequest{State: "running", ClaimGeneration: i64(1)}); err != nil || !applied {
+			t.Fatalf("generic running = (applied %v, err %v), want applied", applied, err)
+		}
+		if st := f.crsSix(id).status; st != "running" {
+			t.Fatalf("status = %q, want running", st)
 		}
 	})
 

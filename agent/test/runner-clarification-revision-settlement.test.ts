@@ -65,6 +65,10 @@ interface Options {
   loseSupportWhileParked?: boolean;
   /** The old-server behaviour: refuse an unqualified running once a question is parked. */
   runningRefused?: boolean;
+  /** Approve the plan presented at the second gate (the human revise is then consumed and applied). */
+  approveSecondGate?: boolean;
+  /** Run after the human revise and before the question is asked (still inside the executor). */
+  beforeAsk?: (ctx: RunContext, settles: number | undefined) => Promise<void>;
   /** Run after the answer returned (still inside the executor). */
   after?: (ctx: RunContext, outcome: Outcome, settles: number | undefined) => Promise<void>;
 }
@@ -94,6 +98,7 @@ async function drive(t: { after: (fn: () => Promise<void>) => void }, opts: Opti
   api.onState(id, body => {
     if (body.status === "awaiting_approval" && ++gates === 1 && opts.revise !== false)
       send(id, row("revise_plan", "clarify before revising"));
+    else if (body.status === "awaiting_approval" && gates === 2 && opts.approveSecondGate) send(id, row("approve_plan"));
     if (body.status === "awaiting_input" && body.open_question_id) {
       if (opts.loseSupportWhileParked) client.protocolFeatures = client.protocolFeatures.filter(f => f !== FEATURE);
       send(id, row("answer", JSON.stringify({ question_id: body.open_question_id, answers: ["continue"] })));
@@ -106,6 +111,13 @@ async function drive(t: { after: (fn: () => Promise<void>) => void }, opts: Opti
         const verdict = await ctx.gatePlan!("# Plan A");
         assert.equal(verdict.kind, "revise");
         settles = verdict.kind === "revise" ? verdict.inputId : undefined;
+      }
+      try {
+        await opts.beforeAsk?.(ctx, settles);
+      } catch (error) {
+        outcome.error = error;
+        outcome.settled = true;
+        throw error;
       }
       const from = api.states.length;
       try {
@@ -376,6 +388,76 @@ describe("#3985 clarification settlement wire", () => {
     for (const [key, value] of Object.entries(WIRE.clarification_settlement))
       assert.equal(typeof (body.clarification_settlement as unknown as Record<string, unknown>)[key], typeof value, key);
   });
+});
+
+describe("#3985 ci_fix and prompt kinds, every ask path", () => {
+  const confirmed = [
+    { name: "askUser, ci_fix claim", ask: "user", claim: { kind: "ci_fix" } },
+    { name: "askPlanMissing, ci_fix claim", ask: "missing", claim: { kind: "ci_fix" } },
+    { name: "askPlanMissing, prompt claim", ask: "missing", claim: { kind: "prompt" } },
+  ] as const;
+  for (const scenario of confirmed) {
+    it(`${scenario.name}: the settlement binds question, revise input and gate revision, the answer returns once, no running`, async t => {
+      const o = await drive(t, { ask: scenario.ask, claim: scenario.claim as Partial<ClaimResponse> });
+      assert.equal(o.error, undefined, errorName(o.error));
+      assert.equal(o.answer?.kind, "answer");
+      assert.equal(settlements(o).length, 1);
+      assert.equal(runnings(o).length, 0, "an answer to a revise clarification is not plan approval");
+      const runId = api.states[0]!.runId;
+      const question = api.states.find(s => s.body.status === "awaiting_input")!.body.open_question_id;
+      const input = api.inputRows(runId).find(r => r.kind === "revise_plan")!;
+      const body = settlements(o)[0]!;
+      assert.equal(body.claim_generation, 1);
+      assert.equal(body.clarification_settlement?.question_id, question);
+      assert.equal(body.clarification_settlement?.revision_input_id, input.id);
+      assert.equal(typeof body.clarification_settlement?.gate_revision, "number");
+      assert.equal(api.states.filter(s => s.body.status === "awaiting_input").length, 1, "one question was asked");
+    });
+  }
+
+  for (const kind of ["prompt", "ci_fix"] as const) {
+    for (const ack of ["applied_false", "conflict", "no_disposition"] as const) {
+      for (const ask of ["user", "missing"] as const) {
+        it(`${kind} + ${ask} refuses a ${ack} ACK: stops, no answer, no running follows`, async t => {
+          const o = await drive(t, { ack, ask, claim: { kind } });
+          assert.equal(o.answer, undefined);
+          assert.match(errorName(o.error), /clarification revision settlement was not confirmed/);
+          assert.equal(settlements(o).length, 1);
+          assert.equal(runnings(o).length, 0, "a refusal never falls back to running");
+          await new Promise(r => setTimeout(r, 50));
+          const parked = api.states.findIndex(q => q.body.status === "awaiting_input");
+          assert.equal(api.states.slice(parked).filter(s => s.body.status === "running").length, 0,
+            "no unqualified running is reported later either");
+        });
+      }
+    }
+  }
+});
+
+describe("#3985 positive control: an already-approved implementation keeps the ordinary running", () => {
+  for (const kind of ["issue", "prompt", "ci_fix"] as const) {
+    it(`${kind}: revise consumed by an approved later presentation, the implementation question reports running only`, async t => {
+      const o = await drive(t, {
+        claim: { kind },
+        approveSecondGate: true,
+        beforeAsk: async (ctx, settles) => {
+          const verdict = await ctx.gatePlan!("# Plan B", undefined, undefined, settles);
+          assert.equal(verdict.kind, "approve");
+        },
+      });
+      assert.equal(o.error, undefined, errorName(o.error));
+      assert.equal(o.answer?.kind, "answer");
+      // A non-confirming caller reports running fire-and-forget, so wait for it.
+      assert.ok(await until(() => api.states.some(s => s.body.status === "running"
+        && api.states.findIndex(q => q.body.status === "awaiting_input") >= 0
+        && api.states.indexOf(s) > api.states.findIndex(q => q.body.status === "awaiting_input")), 4_000),
+      "the ordinary running report was sent after the question");
+      const sent = api.states.slice(api.states.findIndex(s => s.body.status === "awaiting_input")).map(s => s.body);
+      assert.equal(sent.filter(s => s.status === "clarification_settled").length, 0, "no settlement without a pending revise");
+      assert.equal(api.states.filter(s => s.body.status === "clarification_settled").length, 0);
+      assert.equal(sent.filter(s => s.status === "running").length >= 1, true);
+    });
+  }
 });
 
 describe("#3985 clarification settlement and the worker-memory phase hold", () => {
