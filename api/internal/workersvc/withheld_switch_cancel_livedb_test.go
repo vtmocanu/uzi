@@ -339,8 +339,9 @@ func (w withheldSwitch) requireHoldRetained(t *testing.T) {
 	}
 	check("after the cancel, before any direct record call")
 	lead := mustRun(t, w.env, w.lead)
-	if inserted, _ := w.svc.recordCheckpointRetention(w.env.ctx, w.lead, lead.Kind, lead.IssueIid); inserted {
-		t.Fatal("recordCheckpointRetention inserted a record: the terminal trigger should already have recorded it")
+	// (false, true) is the existing-row path; (false, false) would also be an insert or re-read failure.
+	if inserted, settle := w.svc.recordCheckpointRetention(w.env.ctx, w.lead, lead.Kind, lead.IssueIid); inserted || !settle {
+		t.Fatalf("recordCheckpointRetention: inserted=%v settle=%v, want false/true (the terminal trigger already recorded it)", inserted, settle)
 	}
 	check("after recordCheckpointRetention")
 }

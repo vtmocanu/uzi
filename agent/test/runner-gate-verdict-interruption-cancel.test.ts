@@ -7,6 +7,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { UserInput } from "../src/protocol.js";
+import { SteeringChannel } from "../src/steering.js";
 import { api, installHarness } from "./runner-harness.js";
 import { waitForTestEvent } from "./helpers.js";
 import {
@@ -70,18 +71,31 @@ describe("#3974 — an owner cancel during a revision turn under a deferred cred
 
   it("a revision turn that ignores the abort and submits its revised plan after the cancel was committed: the plan is never stored", () =>
     scenario(async (s) => {
-      api.deriveCancellationRequested = true;
-      const first = await s.toFirstGate();
-      const block = s.model.block("revise", { ignoreAbort: true });
-      s.send(s.input("revise_plan", FEEDBACK));
-      await waitForTestEvent(block.entered, "model turn entered");
-      api.requestCredentialSwitch(s.runId, 1);
-      const sent = s.send(s.input("cancel"));
-      // The probe finds the cancel while the turn (which ignores the abort) is still inside the defer window.
-      assert.ok(await until(() => api.ownershipRequests.length > 0), "the worker probed ownership");
-      assert.equal(first.finished, false, "the held turn keeps the flight alive until it finishes");
-      block.release();
-      assert.ok(await until(() => first.finished), "the flight ended once the turn finished");
-      assertCancelledUnderDeferredSwitch(s, first, sent);
+      // Capture the steering channel that opens the defer window, to observe the committed cancel itself.
+      const proto = SteeringChannel.prototype as unknown as { beginCredentialSwitchDefer: () => void };
+      const defer = proto.beginCredentialSwitchDefer;
+      const channels: SteeringChannel[] = [];
+      proto.beginCredentialSwitchDefer = function (this: SteeringChannel) {
+        channels.push(this);
+        return defer.call(this);
+      };
+      try {
+        api.deriveCancellationRequested = true;
+        const first = await s.toFirstGate();
+        const block = s.model.block("revise", { ignoreAbort: true });
+        s.send(s.input("revise_plan", FEEDBACK));
+        await waitForTestEvent(block.entered, "model turn entered");
+        api.requestCredentialSwitch(s.runId, 1);
+        const sent = s.send(s.input("cancel"));
+        // The probe commits the cancel while the turn (which ignores the abort) is still inside the defer window.
+        assert.ok(await until(() => channels.some((ch) => ch.cancelCommittedUnderWithheldSwitch())),
+          "the cancel committed under the withheld switch before the turn was released");
+        assert.equal(first.finished, false, "the held turn keeps the flight alive until it finishes");
+        block.release();
+        assert.ok(await until(() => first.finished), "the flight ended once the turn finished");
+        assertCancelledUnderDeferredSwitch(s, first, sent);
+      } finally {
+        proto.beginCredentialSwitchDefer = defer;
+      }
     }, {}, "turn finishing after the committed cancel"));
 });
