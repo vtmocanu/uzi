@@ -15,8 +15,8 @@ import (
 // case goes through Load() so it pins the boot behaviour, not a helper.
 
 const (
-	secretFileTestDSN = "postgres://uzi:pw@db:5432/uzi?sslmode=disable"
-	secretFileTestJWT = "unit-test-jwt-signing-key-not-a-real-secret"
+	secretFileTestDSN = "postgres://uzi:pw@db:5432/uzi?sslmode=disable" //nolint:gosec // G101: test fixture, not a credential
+	secretFileTestJWT = "unit-test-jwt-signing-key-not-a-real-secret"   //nolint:gosec // G101: test fixture, not a credential
 )
 
 func secretFileTestKey() string {
