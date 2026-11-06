@@ -5127,11 +5127,26 @@ export class CodexExecutor implements Executor {
     return {
       timeoutMs: this.deps.catalogProbeTimeoutMs ?? CODEX_CATALOG_PROBE_TIMEOUT_MS,
       onEntry: (entry: CodexCatalogEntry | undefined, model: string): void => {
+        // Issue #3251: feed the catalog default report first; it never throws and must not
+        // be skipped by the early return below.
+        try { ctx.codexCatalogReport?.report(entry, model); } catch { /* best-effort */ }
         if (entry === undefined || entry.supportedEfforts.includes(level)) return;
         ctx.emit({ kind: "status", agent: "worker", payload: {
           event: "effort_not_in_catalog",
           text: `Codex does not list reasoning effort ${level} for ${sanitizeName(model)}. uzi sends it unchanged; the provider may reject it. Choose a listed level or Runtime default.`,
         } });
+      },
+    };
+  }
+
+  /** Issue #3251: Runtime default claims with a catalog reporter. Report only (no note), and the
+   *  first turn/start does not wait for the reply. */
+  private catalogReportProbeFor(ctx: RunContext) {
+    return {
+      timeoutMs: this.deps.catalogProbeTimeoutMs ?? CODEX_CATALOG_PROBE_TIMEOUT_MS,
+      blocking: false,
+      onEntry: (entry: CodexCatalogEntry | undefined, model: string): void => {
+        try { ctx.codexCatalogReport?.report(entry, model); } catch { /* best-effort */ }
       },
     };
   }
@@ -5463,10 +5478,13 @@ export class CodexExecutor implements Executor {
         emitClaimInit: epochIndex === 0,
         // Issue #1583: projected tool frames are scrubbed of runtime-released Codex tokens.
         scrubProjected,
-        // PRD #3247 M2: advisory catalog probe, only on the claim's first root epoch and only for an
-        // explicit level (Runtime default carries none). The note is emitted from onEntry, which the
-        // harness calls before the first turn/start; the level itself is always sent unchanged.
-        ...(epochIndex === 0 && level !== undefined ? { catalogProbe: this.catalogProbeFor(ctx, level) } : {}),
+        // Advisory catalog probe, only on the claim's first root epoch. PRD #3247 M2: an explicit
+        // level gets the awaiting probe; its note is emitted from onEntry, which the harness calls
+        // before the first turn/start, and the level itself is always sent unchanged. Issue #3251:
+        // a Runtime default claim (no level) with a catalog reporter gets the report-only probe,
+        // which does not delay turn/start.
+        ...(epochIndex === 0 && level !== undefined ? { catalogProbe: this.catalogProbeFor(ctx, level) }
+          : epochIndex === 0 && ctx.codexCatalogReport !== undefined ? { catalogProbe: this.catalogReportProbeFor(ctx) } : {}),
       });
 
       const epochHarness = harness;

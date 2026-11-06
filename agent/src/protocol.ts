@@ -1098,6 +1098,16 @@ export interface LeadConfigReportBody {
   observed_effort_evidence: string | null;
 }
 
+/** Issue #3251: the body of POST /api/worker/runs/{id}/codex-catalog-default. The server schema is
+ *  closed (unknown fields are a 400). */
+export interface CodexCatalogDefaultBody {
+  claim_generation: number;
+  catalog_context: string;
+  model: string;
+  runtime_version: string;
+  default_effort: string;
+}
+
 /** Per-run caps the server may push down (PRD §Configuration). Advisory in M2.
  *  Field names + units match M1's claim.go: timeouts are in *seconds*; any
  *  future ms consumer converts at the use site. */
@@ -1157,6 +1167,9 @@ export interface ClaimConfig {
   /** PRD #3244: where `default_effort` (or its absence) came from. Always present on a lead-lane
    *  claim of an upgraded API, which makes it the worker's lead-config reporting activation signal. */
   default_effort_source?: LeadEffortSource;
+  /** Issue #3251: the opaque catalog context (64 lowercase hex) of a Codex lead-lane claim with a
+   *  complete credential binding; echoed verbatim when reporting the catalog default effort. */
+  codex_catalog_context?: string;
   /** The run owner's AI-attribution opt-out (issue #916), read live per claim. When
    *  false, the worker suppresses the Agent SDK's Co-Authored-By: Claude commit trailer
    *  for this run. Always sent by an upgraded server (NOT null); absent on an older

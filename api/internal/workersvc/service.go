@@ -1919,6 +1919,8 @@ type Service struct {
 	// fence and before writeUsagePost, and after the locked recheck and before Commit. Nil in production.
 	usageAfterFenceHook   func()
 	usageBeforeCommitHook func()
+	// codexCatalogHooks are test seams inside the locked Codex catalog write (issue #3251). Nil in production.
+	codexCatalogHooks *codexCatalogTestHooks
 	// now is time.Now in production; overridable in tests for deterministic
 	// cutoffs.
 	now func() time.Time

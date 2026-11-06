@@ -109,6 +109,7 @@ import { CodexTurnFailedError } from "./codex/terminal-normalize.js";
 import { describeLimit, LimitReachedError } from "./limit.js";
 import type { Logger } from "./log.js";
 import { LeadConfigReporter, leadConfigActive } from "./lead-config-report.js";
+import { CodexCatalogReporter, codexCatalogReportActive } from "./codex/catalog-report.js";
 import type {
   ActiveSnapshotPhase,
   AgentSelection,
@@ -15650,6 +15651,18 @@ export class RunRunner {
         active: leadConfigActive(claim.config),
         logger: runLog,
       }),
+      ...(codexCatalogReportActive(claim.config?.codex_catalog_context, claim.claim_generation)
+        ? {
+          // Issue #3251: one catalog-default reporter, only for a well-formed context.
+          codexCatalogReport: new CodexCatalogReporter({
+            client: this.client,
+            runId,
+            claimGeneration: claim.claim_generation as number,
+            catalogContext: claim.config?.codex_catalog_context as string,
+            logger: runLog,
+          }),
+        }
+        : {}),
       codexIdleStallRecovery: this.client.hasFeature("recovery_cause_codex_idle_stall_v1") &&
         Number.isSafeInteger(claim.claim_generation) && (claim.claim_generation ?? 0) > 0 &&
         this.client.stampsClaimGeneration(claim.claim_generation),

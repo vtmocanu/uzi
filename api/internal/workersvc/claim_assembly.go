@@ -940,6 +940,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			DefaultEffort:               shippedEffort,
 			DefaultModelSource:          defaultModelSource,
 			DefaultEffortSource:         defaultEffortSource,
+			CodexCatalogContext:         claimCodexCatalogContext(run),
 			AttributionEnabled:          attributionEnabled,
 			// PRD #305 M3: deliver the flag frozen onto the run at fire time (M1). Read
 			// straight off the run row — not re-derived from the schedule. false for every

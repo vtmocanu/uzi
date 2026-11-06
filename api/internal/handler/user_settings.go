@@ -125,7 +125,7 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	pins, err := h.crossCheckPinSettings(r.Context(), userID)
+	pins, leadCodexPin, err := h.crossCheckPinSettings(r.Context(), userID)
 	if err != nil {
 		slog.Error("get cross-check pins", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -185,6 +185,9 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 	// other user field is needed (PRD #362 M2, PRD #3248).
 	summaryLane := textPtrValue(s.SummaryModel.Valid, s.SummaryModel.String)
 	codexSummaryLane := textPtrValue(s.CodexSummaryModel.Valid, s.CodexSummaryModel.String)
+	// The codex cell's catalog default (issue #3251): the lane default_codex_model wins, then
+	// the lead template's Codex pin read with the pin rows above, then the provider default.
+	catalogDefault := h.codexCatalogDefaultCell(r.Context(), userID, s.DefaultCodexModel, leadCodexPin)
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"settings": userSettingsDTO{
 			VaultAutoReunlock:      settingsAutoReunlock(r),
@@ -212,7 +215,8 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 			SummaryModels:          summaryModelCells(summaryLane, codexSummaryLane, instance),
 			EffortSettings: effortSettingCells(
 				textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String),
-				textPtrValue(s.DefaultCodexEffort.Valid, s.DefaultCodexEffort.String)),
+				textPtrValue(s.DefaultCodexEffort.Valid, s.DefaultCodexEffort.String),
+				catalogDefault),
 			WeeklyReservePct:          intPtrFromInt2(s.WeeklyReservePct),
 			WeeklyReservePauseRunning: s.WeeklyReservePauseRunning,
 			CodexAccountMode:          codexMode,
@@ -1123,6 +1127,36 @@ type settingsHarnessResolver interface {
 }
 
 var _ settingsHarnessResolver = (*workersvc.Service)(nil)
+
+// codexCatalogReader is the narrow seam over h.wsvc the settings surface uses to read the
+// Codex catalog default effort (issue #3251). *workersvc.Service satisfies it.
+type codexCatalogReader interface {
+	CodexCatalogDefault(ctx context.Context, userID uuid.UUID, model string) (workersvc.CatalogDefault, error)
+}
+
+var _ codexCatalogReader = (*workersvc.Service)(nil)
+
+// codexCatalogDefaultCell reads the catalog default for the user's Codex worker default
+// model. It never fails the settings read: a nil service, or a read error (logged as an
+// error value), degrades to unknown.
+func (h *Handler) codexCatalogDefaultCell(ctx context.Context, userID uuid.UUID, laneModel, leadCodexPin pgtype.Text) *apitypes.CatalogDefaultDTO {
+	var reader codexCatalogReader
+	switch {
+	case h.catalogDefaults != nil:
+		reader = h.catalogDefaults
+	case h.wsvc != nil:
+		reader = h.wsvc
+	default:
+		return catalogDefaultDTO(workersvc.CatalogDefault{State: workersvc.CatalogStateUnknown})
+	}
+	model := workersvc.CodexWorkerDefaultModel(laneModel, leadCodexPin)
+	got, err := reader.CodexCatalogDefault(ctx, userID, model)
+	if err != nil {
+		slog.Error("read codex catalog default", "error", err)
+		return catalogDefaultDTO(workersvc.CatalogDefault{State: workersvc.CatalogStateUnknown})
+	}
+	return catalogDefaultDTO(got)
+}
 
 // resolveSettingsHarness resolves the effective harness via the D11 resolver on h.wsvc. A nil
 // worker service (unit tests, or a Handler constructed before wsvc is wired) deterministically

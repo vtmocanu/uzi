@@ -8,7 +8,7 @@ import { decodeCodeCoverage, type CodeCoverage } from "./code-cross-check-covera
 import { decodePublicationContext, validatePublicationContextRequest } from "./publication-context.js";
 import type { PublicationContextRequest, PublicationContextResponse } from "./protocol.js";
 import type { PublicationIntentRequest, PublicationIntentResult } from "./publication-intent.js";
-import type { LeadConfigReportBody } from "./protocol.js";
+import type { CodexCatalogDefaultBody, LeadConfigReportBody } from "./protocol.js";
 import { decodeCompletionPending, type CompletionPending } from "./completion-pending.js";
 import { SEMANTIC_GATE_ACK_MAX_BYTES, semanticGateAckSchema } from "./semantic-gate-wire.js";
 import { decodeInterruptedCalls, interruptedRegistration, type InterruptedRegistration, type InterruptedCalls } from "./interrupted-calls.js";
@@ -4890,6 +4890,24 @@ export class WorkerClient {
         }
         return { kind: "http", status: err.status, ...(code !== undefined ? { error: code } : {}) };
       }
+      return { kind: "transport", error: err };
+    }
+  }
+
+  // ── Codex catalog default report (issue #3251) ─────────────────────────────
+  /** POST /worker/runs/:id/codex-catalog-default (204, no body). One attempt, never throws: a
+   *  refusal (404 from an older API, 409 stale claim/context, 400) is `http`, a network failure or
+   *  timeout is `transport`. */
+  async recordCodexCatalogDefault(
+    runId: string,
+    body: CodexCatalogDefaultBody,
+    timeoutMs = 5_000,
+  ): Promise<LeadConfigPostOutcome> {
+    try {
+      await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/codex-catalog-default`, body, timeoutMs);
+      return { kind: "ok" };
+    } catch (err) {
+      if (err instanceof RequestError) return { kind: "http", status: err.status };
       return { kind: "transport", error: err };
     }
   }

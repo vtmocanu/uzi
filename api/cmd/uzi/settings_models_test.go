@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
@@ -176,8 +177,73 @@ func TestSettingsGetCodexEffortRuntimeDefaultRow(t *testing.T) {
 		{Harness: "codex", Effort: &runtime, DefaultEffort: "medium", DefaultSource: "builtin", Source: "user_default", Mode: "runtime_default"},
 	}}}
 	out, _, code := runCLI(t, fakeEnv(fc), "settings", "get")
-	if code != 0 || !strings.Contains(strings.Join(strings.Fields(out), " "), "effort codex runtime default medium runtime default your choice") {
+	if code != 0 || !strings.Contains(strings.Join(strings.Fields(out), " "), "effort codex runtime default medium runtime default (catalog default unknown) your choice") {
 		t.Fatalf("codex runtime row missing: exit %d %q", code, out)
+	}
+}
+
+// The codex Runtime default RESOLVED text carries the catalog default per state (issue
+// #3251); explicit levels and the claude row are unchanged.
+func TestEffortSettingRowsCodexCatalogDefault(t *testing.T) {
+	known := func(state, effort string) *apitypes.CatalogDefaultDTO {
+		return &apitypes.CatalogDefaultDTO{State: state, Effort: strp(effort), Model: strp("gpt-6.1-sol"), RuntimeVersion: strp("0.164.0")}
+	}
+	cases := []struct {
+		name string
+		cd   *apitypes.CatalogDefaultDTO
+		want string
+	}{
+		{"known", known("known", "low"), "runtime default (catalog default: low, gpt-6.1-sol, Codex 0.164.0)"},
+		{"none", known("known", "none"), "runtime default (catalog default: none, no reasoning level requested, gpt-6.1-sol, Codex 0.164.0)"},
+		{"ultra", known("known", "ultra"), "runtime default (catalog default: ultra, Codex substitutes another level, gpt-6.1-sol, Codex 0.164.0)"},
+		{"varies", known("varies", "medium"), "runtime default (catalog default: medium, gpt-6.1-sol, Codex 0.164.0) · may differ on workers still on another version"},
+		{"unknown", &apitypes.CatalogDefaultDTO{State: "unknown"}, "runtime default (catalog default unknown)"},
+		{"absent", nil, "runtime default (catalog default unknown)"},
+		{"known without values", &apitypes.CatalogDefaultDTO{State: "known"}, "runtime default (catalog default unknown)"},
+		{"future state", known("from_the_future", "low"), "runtime default (catalog default unknown)"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rows := effortSettingRows([]apitypes.EffortSettingCellDTO{
+				{Harness: "claude", Effort: strp("runtime"), Source: "user_default", Mode: "runtime_default", CatalogDefault: c.cd},
+				{Harness: "codex", Effort: strp("runtime"), Source: "user_default", Mode: "runtime_default", CatalogDefault: c.cd},
+			})
+			if len(rows) != 2 || rows[0].Resolved != "runtime default (value not reported)" || rows[1].Resolved != c.want {
+				t.Fatalf("rows = %+v, want codex %q and the claude row unchanged", rows, c.want)
+			}
+		})
+	}
+	explicit := effortSettingRows([]apitypes.EffortSettingCellDTO{
+		{Harness: "codex", Effort: strp("high"), ResolvedEffort: strp("high"), Source: "user_default", Mode: "explicit", CatalogDefault: known("known", "low")},
+	})
+	if explicit[0].Resolved != "high" {
+		t.Fatalf("explicit codex row = %q, want high", explicit[0].Resolved)
+	}
+}
+
+func TestSettingsGetCodexCatalogDefaultHostile(t *testing.T) {
+	hostile := "evil\x1b]8;;https://evil.example\x07link\x1b]8;;\x07\u202e\nforged row"
+	fc := &uzicli.FakeClient{Settings: apitypes.UserSettingsDTO{EffortSettings: []apitypes.EffortSettingCellDTO{
+		{Harness: "codex", Effort: strp("runtime"), DefaultEffort: "medium", Source: "user_default", Mode: "runtime_default",
+			CatalogDefault: &apitypes.CatalogDefaultDTO{State: "varies", Effort: &hostile, Model: &hostile, RuntimeVersion: &hostile}},
+	}}}
+	out, _, code := runCLI(t, fakeEnv(fc), "settings", "get")
+	if code != 0 || strings.ContainsAny(out, "\x1b\x07\u202e") || strings.Contains(out, "\nforged row") ||
+		!strings.Contains(out, "catalog default:") {
+		t.Fatalf("unsafe or missing catalog text: exit %d %q", code, out)
+	}
+}
+
+func TestDemoCatalogDefaultSamplesPerState(t *testing.T) {
+	now := time.Now()
+	for state, want := range map[string]string{
+		"known":   "runtime default (catalog default: low, gpt-6.1-sol, Codex 0.164.0)",
+		"varies":  "runtime default (catalog default: low, gpt-6.1-sol, Codex 0.164.0) · may differ on workers still on another version",
+		"unknown": "runtime default (catalog default unknown)",
+	} {
+		if got := codexRuntimeDefaultResolved(demoCatalogDefault(state, now)); got != want {
+			t.Errorf("demo %s = %q, want %q", state, got, want)
+		}
 	}
 }
 
