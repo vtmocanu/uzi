@@ -64,7 +64,8 @@ A frozen default decides the implementation agents when nothing else does:
 
 - an approval that carries no agent choice (for example `uzi run approve` with
   no `--agent-source`, or an external dispatcher using the API) implements with
-  the default, and the run records it;
+  the default, and the run records it. When the run already records a choice
+  from an earlier approval, that choice and its exclusions are kept instead;
 - an autopilot run implements with the default;
 - an explicit choice at the plan gate (web, Slack, or `--agent-source`) still
   wins, and the run page then shows it as "changed at approval".

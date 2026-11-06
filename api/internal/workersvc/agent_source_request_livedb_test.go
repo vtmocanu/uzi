@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 type requestedCols struct {
@@ -221,6 +222,68 @@ func TestNoSelectionApprovalMaterializesRequestedSourceLiveDB(t *testing.T) {
 			if err := json.Unmarshal([]byte(body.String), &sel); err != nil || sel.Source != tc.want {
 				t.Fatalf("approve_plan body = %q, want an explicit %s selection", body.String, tc.want)
 			}
+		})
+	}
+}
+
+const requestedSourceRoster = `[{"name":"repo-reviewer","description":"repo review"},{"name":"site-plan-check","description":"repo plan check"}]`
+
+type persistedSelectionCase struct {
+	name       string
+	source     any
+	exclusions string
+	want       string
+	wantExcl   string
+}
+
+var persistedSelectionCases = []persistedSelectionCase{
+	{"a saved own choice stays own", AgentSourceOwn, `[]`, AgentSourceOwn, `[]`},
+	{"a saved repo choice keeps its exclusions", AgentSourceRepo, `["repo-reviewer"]`, AgentSourceRepo, `["repo-reviewer"]`},
+	{"no saved choice takes the requested default", nil, `[]`, AgentSourceRepo, `[]`},
+}
+
+func setPersistedSelection(f *gateFix, runID uuid.UUID, c persistedSelectionCase) {
+	f.setRequested(runID, AgentSourceRepo, requestedSourceRoster)
+	f.exec(`UPDATE runs SET agent_source = $2, agent_exclusions = $3::jsonb WHERE id = $1`, runID, c.source, c.exclusions)
+}
+
+func assertSelectionColumns(t *testing.T, r store.Run, c persistedSelectionCase) {
+	t.Helper()
+	if !r.AgentSource.Valid || r.AgentSource.String != c.want || !jsonEqual(t, r.AgentExclusions, c.wantExcl) {
+		t.Fatalf("selection = (%v, %s), want (%s, %s)", r.AgentSource, r.AgentExclusions, c.want, c.wantExcl)
+	}
+	if r.AgentSourceRequested.String != AgentSourceRepo || r.AgentSourceRequestedBasis.String != "repo_default" {
+		t.Fatalf("request changed to (%v, %v)", r.AgentSourceRequested, r.AgentSourceRequestedBasis)
+	}
+}
+
+func TestReconciliationWithoutChoiceKeepsSavedSelectionLiveDB(t *testing.T) {
+	for _, c := range persistedSelectionCases {
+		t.Run(c.name, func(t *testing.T) {
+			f, id, opts := newMilestoneReconciliationFixWith(t, nil, func(f *gateFix, id uuid.UUID) { setPersistedSelection(f, id, c) })
+			if _, err := f.svc.SubmitInputWithOptions(f.ctx, f.userID, id, "approve_plan", "", nil, opts); err != nil {
+				t.Fatalf("reconcile: %v", err)
+			}
+			assertSelectionColumns(t, reconciliationRow(t, f, id), c)
+		})
+	}
+}
+
+func TestApprovalWithoutChoiceKeepsSavedSelectionLiveDB(t *testing.T) {
+	f := newGateFix(t, 3)
+	f.liveWorker()
+	for _, c := range persistedSelectionCases {
+		t.Run(c.name, func(t *testing.T) {
+			run := f.gatedRun()
+			setPersistedSelection(f, run, c)
+			if _, err := f.submit(run, "approve_plan", nil, SubmitInputOptions{}); err != nil {
+				t.Fatalf("approve: %v", err)
+			}
+			r, err := f.q.GetRunByID(f.ctx, run)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertSelectionColumns(t, r, c)
 		})
 	}
 }

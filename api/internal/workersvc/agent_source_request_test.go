@@ -46,6 +46,17 @@ func TestMaterializeRequestedSelection(t *testing.T) {
 			}
 		})
 	}
+	t.Run("a saved selection is kept when no choice is made", func(t *testing.T) {
+		for _, saved := range []string{AgentSourceOwn, AgentSourceRepo} {
+			for _, exclusions := range [][]byte{[]byte(`[]`), []byte(`["site-plan-check"]`), []byte(`not json`)} {
+				run := store.Run{AgentSourceRequested: requested("repo"), RepoAgents: roster,
+					AgentSource: pgtype.Text{String: saved, Valid: true}, AgentExclusions: exclusions}
+				if got := materializeRequestedSelection(run, nil); got != nil {
+					t.Fatalf("saved %s %s: got %+v, want no replacement", saved, exclusions, *got)
+				}
+			}
+		}
+	})
 	t.Run("an explicit selection wins", func(t *testing.T) {
 		for _, req := range []string{"", "own", "repo"} {
 			run := store.Run{AgentSourceRequested: requested(req), RepoAgents: roster}
