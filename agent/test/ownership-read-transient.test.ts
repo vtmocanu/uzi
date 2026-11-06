@@ -164,9 +164,11 @@ describe("transientOwnershipReadCause: failures after the transport settled", ()
 
   it("does not classify an error thrown after the transport resolved", async () => {
     const ac = new AbortController();
-    const transport = (async () => { ac.abort(new Error("late abort")); return new Response("{}"); }) as typeof fetch;
+    const reason = new Error("late abort");
+    const transport = (async () => { ac.abort(reason); return new Response("{}"); }) as typeof fetch;
     const client = makeClient("http://127.0.0.1:1", transport);
     const error = await caught(() => client.getRunOwnership(RUN, ac.signal));
+    assert.equal(error, reason);
     assert.equal(isFetchRejection(error), false);
     assert.equal(classify(error), undefined);
   });
@@ -234,6 +236,7 @@ describe("transientOwnershipReadCause: failures after the transport settled", ()
       const client = makeClient(url);
       for (let i = 0; i < 2; i++) {
         const error = await caught(() => client.getRunOwnership(RUN, ac.signal));
+        assert.equal(error, ac.signal.reason);
         assert.equal(isFetchRejection(error), false);
         assert.equal(classify(error), undefined);
       }
@@ -242,17 +245,32 @@ describe("transientOwnershipReadCause: failures after the transport settled", ()
 
   it("does not classify when the budget wins the race against a real fetch", async () => {
     await withServer(hang, async (url) => {
-      const client = makeClient(url);
-      const error = await caught(() => MaintenanceBudget.run(new MaintenanceBudget(50), () => client.getRunOwnership(RUN)));
+      let requestSignal: AbortSignal | null | undefined;
+      const transport: typeof fetch = (input, init) => {
+        requestSignal = init?.signal;
+        return fetch(input, init);
+      };
+      const client = makeClient(url, transport);
+      const budget = new MaintenanceBudget(50);
+      const error = await caught(() => MaintenanceBudget.run(budget, () => client.getRunOwnership(RUN)));
+      assert.ok((budget.signal.aborted && error === budget.signal.reason) ||
+        (requestSignal?.aborted === true && error === requestSignal.reason));
       assert.equal(isFetchRejection(error), false);
       assert.equal(classify(error), undefined);
     });
   });
 
   it("does not classify when the budget aborts the race", async () => {
-    const transport = (() => new Promise<Response>(() => {})) as typeof fetch;
+    let requestSignal: AbortSignal | null | undefined;
+    const transport: typeof fetch = (_input, init) => {
+      requestSignal = init?.signal;
+      return new Promise<Response>(() => {});
+    };
     const client = makeClient("http://127.0.0.1:1", transport);
-    const error = await caught(() => MaintenanceBudget.run(new MaintenanceBudget(20), () => client.getRunOwnership(RUN)));
+    const budget = new MaintenanceBudget(20);
+    const error = await caught(() => MaintenanceBudget.run(budget, () => client.getRunOwnership(RUN)));
+    assert.ok((budget.signal.aborted && error === budget.signal.reason) ||
+      (requestSignal?.aborted === true && error === requestSignal.reason));
     assert.equal(isFetchRejection(error), false);
     assert.equal(classify(error), undefined);
   });
@@ -299,7 +317,9 @@ describe("transientOwnershipReadCause: marked transport rejection shapes", () =>
   ];
   for (const [name, make] of unclassified) {
     it(`does not classify: ${name}`, async () => {
-      const error = await rejectWith(make());
+      const value = make();
+      const error = await rejectWith(value);
+      if (typeof value === "object" && value !== null) assert.ok(isFetchRejection(error));
       assert.equal(classify(error), undefined);
     });
   }
