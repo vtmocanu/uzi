@@ -193,7 +193,7 @@ Measured on 2026-11-06 with `run.sh` and the harness at commit `86341fb8` (the l
 
 - The wide fixtures complete discovery and are then stopped by `git_deadline` in the post-discovery phase, which in these `--no-checkout` fixtures diffs every base path as a deletion (see the section above). The long-path fixtures complete discovery and are then refused with `errno:ENAMETOOLONG`, when the post-discovery walk reaches a path longer than the host's `PATH_MAX`. Peaks therefore cover discovery plus whatever post-discovery work ran.
 - **Per entry occurrence** (wide, about 15 path bytes each): (374.2 − 193.8) MiB / 787,200 entries ≈ **240 bytes per entry**, intercept ≈ 134 MiB. This is an empirical estimate for base discovery on this host and image only; the 4g/2 CPU rows give about 274 bytes per entry.
-- **Per charged path byte** (long-path, few entries): 1.91 (f1 → f2) and 1.14 (f2 → f4) bytes of container memory per path byte; ≈ 1.40 over the whole range (the instrumented `full` 1 CPU rows give 1.64 and 1.50). The largest, 1.91, is used below; it is noisy, driven partly by the f1 `control` peak sitting above its `full` row. This is likewise an empirical estimate.
+- **Per charged path byte** (long-path, few entries): 1.91 (f1 → f2) and 1.14 (f2 → f4) bytes of container memory per path byte; ≈ 1.40 over the whole range (the instrumented `full` 1 CPU rows give 1.64 and 1.50). The largest, 1.91, is used below; it is noisy, driven by the f2 `control` peak sitting about 17.5 MiB above its `full` row. This is likewise an empirical estimate.
 
 ## Realistic trees (rule 5a)
 
