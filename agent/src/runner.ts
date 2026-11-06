@@ -4288,8 +4288,12 @@ export class RunRunner {
 
   /**
    * One proof of every owned physical source of `context.runId`, shared by the ordinary and the predecessor
-   * boundary. Per clone: the live-path refusal, quiescence before, the byte-exact content proof, (predecessor only)
-   * the ignored-residue gate, quiescence after, then an identity re-read. The ordinary caller passes no `grant`.
+   * boundary. Per clone: the live-path refusal, quiescence before, the source check, quiescence after, then an
+   * identity re-read. The ordinary caller passes no `grant` and keeps base behaviour: `worktreeStatus`, with no
+   * content proof, caps, budget or ignored-residue gate. ONLY the predecessor path (a `grant`) applies the strict
+   * byte-exact content proof and the ignored-residue gate. The scoped quiescence scan does not prove that no
+   * arbitrary writer exists: an escaped writer (cwd outside the clone, no attempt marker) can change source after
+   * the last proof, so later bytes may be missing from the archive (related design work: #3831, not a fix).
    * A failed sibling blocks FINAL; the first refusal wins at the reporter.
    */
   private async proveInventorySources(
@@ -4357,16 +4361,27 @@ export class RunRunner {
       const before = await this.quiesceImpl(request);
       if (before.process?.state !== "quiescent")
         return fail("process_not_quiescent_before_git", inventoryProcessDiagnostic("process_not_quiescent_before_git", before.process, otherClaimInFlight), clone.clonePath);
-      const bounds = grant ? { ...INVENTORY_CONTENT_PROOF_BOUNDS, deadlineAt: grant.deadlineAt } : undefined;
-      const content = bounds ? await this.git.inventorySourceContentProof(clone.clonePath, bounds)
-        : await this.git.inventorySourceContentProof(clone.clonePath);
-      const ignored = grant && content === "clean" ? await this.git.inventoryIgnoredResidue(clone.clonePath, bounds) : "clean";
+      if (!grant) {
+        // Ordinary terminal FINAL: byte-for-byte base behaviour (worktreeStatus, no content proof, caps or budget).
+        const status = await this.git.worktreeStatus(clone.clonePath);
+        const after = await this.quiesceImpl({ ...request, dockerHost: undefined, site: "inventory_source:after_runner_git" });
+        if (status === null) return fail("worktree_status_unreadable", { check: "worktree_status_unreadable" }, clone.clonePath);
+        if (status.length !== 0) return fail("worktree_status_dirty", { check: "worktree_status_dirty" }, clone.clonePath);
+        if (after.process?.state !== "quiescent")
+          return fail("process_not_quiescent_after_git", inventoryProcessDiagnostic("process_not_quiescent_after_git", after.process, otherClaimInFlight), clone.clonePath);
+        continue;
+      }
+      // Predecessor FINAL only: the strict byte-exact proof (agent/src/git.ts inventorySourceContentProof) and the
+      // ignored-residue gate, bounded by the grant's deadline.
+      const bounds = { ...INVENTORY_CONTENT_PROOF_BOUNDS, deadlineAt: grant.deadlineAt };
+      const content = await this.git.inventorySourceContentProof(clone.clonePath, bounds);
+      const ignored = content === "clean" ? await this.git.inventoryIgnoredResidue(clone.clonePath, bounds) : "clean";
       const after = await this.quiesceImpl({ ...request, dockerHost: undefined, site: "inventory_source:after_runner_git" });
       scope();
       if (content === "unreadable") return fail("worktree_status_unreadable", { check: "worktree_status_unreadable" }, clone.clonePath);
       if (content === "over_bound") return fail("over_bound", { check: "worktree_status_unreadable" }, clone.clonePath);
       if (content === "dirty") return fail("worktree_status_dirty", { check: "worktree_status_dirty" }, clone.clonePath);
-      // Predecessor only: a build directory or node_modules the successor would lose is residue, reported as dirty.
+      // A build directory or node_modules the successor would lose is residue, reported as dirty.
       if (ignored === "residue") return fail("ignored_residue", { check: "worktree_status_dirty" }, clone.clonePath);
       if (ignored === "over_bound") return fail("over_bound", { check: "worktree_status_unreadable" }, clone.clonePath);
       if (after.process?.state !== "quiescent")

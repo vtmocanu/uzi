@@ -57,11 +57,10 @@ it("#2507 actual runner boundary reports every refusal and preserves lane cleanu
         return { kind: "verified", heads: [active && check === "source_identity_changed" && reads > 1 ? "b".repeat(40) : "a".repeat(40)],
           clones, foreignOwners: [] };
       };
-      // The ordinary boundary proves each clone with the strict content proof, not worktreeStatus.
-      git.inventorySourceContentProof = async () => {
+      git.worktreeStatus = async () => {
         ops.push("status");
-        return active && check === "worktree_status_unreadable" ? "unreadable" :
-          active && check === "worktree_status_dirty" ? "dirty" : "clean";
+        return active && check === "worktree_status_unreadable" ? null :
+          active && check === "worktree_status_dirty" ? ["dirty"] : [];
       };
       if (check === "execution_tail_present") boundary.executionTails.set("run-1", siblingTail);
       if (!late && check === "non_linux_host") Object.defineProperty(process, "platform", { ...platform, value: "darwin" });
@@ -120,9 +119,9 @@ for (const failure of ["process", "dirty", "unreadable"] as const) {
       clones: ["first", "second", "third"].map(name => ({
         clonePath: "/fixture/" + name, branch: "task", runId: "run-1",
       })), foreignOwners: [] });
-    git.inventorySourceContentProof = async clone => {
+    git.worktreeStatus = async clone => {
       visited.push(clone + ":status");
-      return clone === "/fixture/second" ? failure === "unreadable" ? "unreadable" : "dirty" : "clean";
+      return clone === "/fixture/second" ? failure === "unreadable" ? null : ["dirty"] : [];
     };
     assert.equal(await (r as unknown as BoundaryRunner).withInventorySourceBoundary({
       runId: "run-1", generation: 7, barePath: "/fixture/repo.git", reportDiagnostic: d => diagnostics.push(d),
@@ -291,22 +290,3 @@ for (const mode of ["boot", "live"] as const) for (const source of ["dirty-unver
     assert.equal(finals,0,"unverified or dirty clone must retain generation hold after recovery");
   }
 });
-
-// issue #2969 D5: the ordinary boundary proves each clone with the strict content proof, never worktreeStatus.
-for (const [proof, check] of [["dirty", "worktree_status_dirty"], ["unreadable", "worktree_status_unreadable"],
-  ["over_bound", "worktree_status_unreadable"]] as const) {
-  it(`#2969 ordinary boundary maps content proof ${proof} to ${check} and never reads worktreeStatus`, async () => {
-    const r = runner({ run: async () => { throw new Error("unreached"); } }, fakeGitlab().gitlab, undefined,
-      { quiesceRun: async () => ({ process: { state: "quiescent", processes: [], killed: [], detail: "" }, docker: { state: "not_wired", removed: [], detail: "" } }) });
-    const diagnostics: InventorySourceDiagnostic[] = [];
-    git.readInventoryCloneHeads = async () => ({ kind: "verified", heads: ["a".repeat(40)],
-      clones: [{ clonePath: "/fixture/repo/issue-1", branch: "task", runId: "run-1" }], foreignOwners: [] });
-    git.worktreeStatus = async () => { throw new Error("worktreeStatus must not be read by the inventory boundary"); };
-    git.inventorySourceContentProof = async () => proof;
-    git.inventoryIgnoredResidue = async () => { throw new Error("the ignored-residue gate is predecessor-only"); };
-    assert.equal(await (r as unknown as BoundaryRunner).withInventorySourceBoundary({
-      runId: "run-1", generation: 7, barePath: "/fixture/repo.git", reportDiagnostic: d => diagnostics.push(d),
-    }, async () => assert.fail("release")), "retained");
-    assert.deepEqual(diagnostics, [{ check }]);
-  });
-}

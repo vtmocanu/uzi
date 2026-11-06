@@ -916,14 +916,15 @@ export interface InventoryContentProofBounds {
    * Cap on the cumulative REAL `st_size` (lstat of the worktree file, 64-bit) of every regular tracked file
    * `hash-object` would read, i.e. the bytes it actually reads (default {@link INVENTORY_CONTENT_PROOF_BOUNDS}). It is
    * charged before status, check-attr or hash-object run; the declared `%(objectsize)` is only an extra early
-   * refusal. The total wall budget below is a second bound.
+   * refusal. The total wall budget below bounds the time of the git calls; it does not bound a file that keeps growing.
    */
   maxContentBytes?: number;
   /** Epoch ms the caller's operation ends; the proof's total budget is clipped to it. A passed deadline is unreadable. */
   deadlineAt?: number;
 }
 export const INVENTORY_CONTENT_PROOF_BOUNDS = { maxEntries: 50_000, maxBytes: 8 * 1024 * 1024, maxContentBytes: 256 * 1024 * 1024 } as const;
-/** Total wall budget for the WHOLE content proof (or the whole residue listing), shared by all of its git calls:
+/** Used by the PREDECESSOR path only; the ordinary terminal FINAL keeps `worktreeStatus`.
+ *  Total wall budget for the WHOLE content proof (or the whole residue listing), shared by all of its git calls:
  *  each call's timeout is the time left in it, and an exhausted budget is unreadable. */
 const INVENTORY_PROOF_TOTAL_BUDGET_MS = 60_000;
 
@@ -15249,7 +15250,8 @@ try {
   }
 
   /**
-   * Strict, byte-exact working-tree proof for the inventory FINAL source boundary (issue #2969). Unlike
+   * Strict, byte-exact working-tree proof for the PREDECESSOR inventory FINAL source boundary (issue #2969); the
+   * ordinary terminal FINAL does not use it. Unlike
    * {@link worktreeStatus} it never trusts the index stat cache alone and refuses anything it cannot read exactly:
    * Steps, in code order:
    *  1. `ls-files -v -z`: any tag but `H` (assume-unchanged, skip-worktree, unmerged) is unreadable;
@@ -15270,10 +15272,10 @@ try {
    *  8. each id must equal the index blob id, else dirty (content that differs with an unchanged stat is dirty).
    * Every call pins `--git-dir`/`--work-tree` and `GIT_NO_REPLACE_OBJECTS`, and draws on ONE total wall budget.
    *
-   * The size bound assumes the runner's quiescence proof: a writer that escaped the quiescence scope (cwd outside
-   * the clone, no attempt marker) can still grow a file between the lstat and the hash. The proof then ends `dirty`
-   * or `unreadable` within the wall budget, never `clean`. That broader escaped-writer gap belongs to the separate
-   * writer-enrollment design (#3831).
+   * The size bound assumes the runner's quiescence proof. The scoped quiescence scan does not prove that no
+   * arbitrary writer exists: a writer that escaped the scope (cwd outside the clone, no attempt marker) can change
+   * source after the last proof, so later bytes may be missing from the archive. The wall budget bounds the git
+   * calls, not a growing file. Related design work: #3831 (not a fix).
    * Runs as the runner uid with GIT_OPTIONAL_LOCKS=0 and never decodes a path to a JS string.
    */
   async inventorySourceContentProof(cwd: string, bounds: InventoryContentProofBounds = INVENTORY_CONTENT_PROOF_BOUNDS):
@@ -15315,8 +15317,8 @@ try {
       if (contentBytes > maxContentBytes) return "over_bound";
       // The authoritative bound: the REAL st_size of every regular entry, charged before status, check-attr or
       // hash-object read anything. The path stays bytes (a Buffer path), never a JS string. TOCTOU: this bound
-      // assumes the runner's quiescence proof; an escaped writer (see the docstring, #3831) can grow a file after
-      // this lstat, which ends dirty or unreadable within the wall budget, never clean.
+      // assumes the runner's quiescence proof; an escaped writer (see the docstring, #3831) can change a file after
+      // this lstat.
       const root = Buffer.from(cwd + "/");
       let realBytes = 0n;
       for (const f of files) {

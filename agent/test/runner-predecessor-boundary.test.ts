@@ -9,7 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import type { InventorySourceBoundaryContext, InventorySourceDiagnostic } from "../src/recovery.js";
-import { newRunAttempt, type QuiesceRunRequest, type RunAttempt } from "../src/run-quiescence.js";
+import { newRunAttempt, scanOnce, type QuiesceRunRequest, type RunAttempt } from "../src/run-quiescence.js";
 import { GitCache, INVENTORY_CONTENT_PROOF_BOUNDS } from "../src/git.js";
 import { fakeGitlab, git, installHarness, runner } from "./runner-harness.js";
 installHarness();
@@ -43,8 +43,8 @@ const clone = (name: string, head = "a".repeat(40), identity = "1:1"): Clone =>
 function world(opts: { codex?: boolean; claimGeneration?: number; deadlineAt?: number; clones?: () => Clone[];
   baseline?: Clone[]; attemptPath?: string; quiesce?: (req: QuiesceRunRequest) => void | Promise<void> } = {}) {
   const requests: QuiesceRunRequest[] = [];
-  const w: { cancelled: boolean; fence: unknown; clones: () => Clone[]; reads: unknown[][]; bounds: unknown[]; content: (p: string) => string; ignored: (p: string) => string } = {
-    cancelled: false, fence: undefined, reads: [], bounds: [], clones: opts.clones ?? (() => [clone("issue-1")]),
+  const w: { cancelled: boolean; fence: unknown; clones: () => Clone[]; reads: unknown[][]; bounds: unknown[]; statusCalls: string[]; status: (p: string) => string[] | null; content: (p: string) => string; ignored: (p: string) => string } = {
+    cancelled: false, fence: undefined, reads: [], bounds: [], statusCalls: [], status: () => [], clones: opts.clones ?? (() => [clone("issue-1")]),
     content: () => "clean", ignored: () => "clean",
   };
   const r = runner({ run: async () => { throw new Error("unreached executor"); } }, fakeGitlab().gitlab, undefined, {
@@ -68,7 +68,7 @@ function world(opts: { codex?: boolean; claimGeneration?: number; deadlineAt?: n
   }) as typeof git.readInventoryCloneHeads;
   git.inventorySourceContentProof = (async (p: string, b?: unknown) => { w.bounds.push(b); return w.content(p); }) as typeof git.inventorySourceContentProof;
   git.inventoryIgnoredResidue = (async (p: string, b?: unknown) => { w.bounds.push(b); return w.ignored(p); }) as typeof git.inventoryIgnoredResidue;
-  git.worktreeStatus = async () => { throw new Error("worktreeStatus is not part of the inventory boundary"); };
+  git.worktreeStatus = async (p: string) => { w.statusCalls.push(p); return w.status(p); };
   const registration = internals.registerPredecessorBoundary(flight, held, {
     generations: [1, 2], deadlineAt: opts.deadlineAt ?? Infinity,
     ...(opts.baseline ? { baseline: opts.baseline } : {}),
@@ -104,7 +104,7 @@ describe("predecessor boundary: grant, tail and scope", () => {
     assert.equal(x.requests[0]!.attempt, undefined, "Claude requests carry no attempt");
   });
 
-  it("the ordinary boundary reads the inventory without the identity option and never calls worktreeStatus", async () => {
+  it("the ordinary boundary is base behaviour: worktreeStatus only, no identity option, no content proof or residue gate", async () => {
     const x = world();
     const diagnostics: InventorySourceDiagnostic[] = [];
     const result = await x.internals.withInventorySourceBoundary({
@@ -113,6 +113,32 @@ describe("predecessor boundary: grant, tail and scope", () => {
     assert.equal(result, "passed");
     assert.deepEqual(diagnostics, []);
     assert.deepEqual(x.w.reads.map(args => args.length), [0, 0, 0, 0]);
+    assert.deepEqual(x.w.statusCalls, ["/fixture/repo/issue-1", "/fixture/repo/issue-1"]);
+    assert.deepEqual(x.w.bounds, [], "zero content-proof and residue-listing calls on the ordinary path");
+  });
+
+  it("the ordinary boundary maps worktreeStatus exactly as base: null unreadable, non-empty dirty", async () => {
+    for (const [status, expected] of [[null, "worktree_status_unreadable"], [["?? x"], "worktree_status_dirty"]] as const) {
+      const x = world();
+      x.w.status = () => status as string[] | null;
+      const diagnostics: InventorySourceDiagnostic[] = [];
+      const result = await x.internals.withInventorySourceBoundary({
+        runId: "run-ordinary", generation: 1, barePath: "/fixture/repo.git", reportDiagnostic: d => diagnostics.push(d),
+      }, async () => assert.fail("must not release"));
+      assert.equal(result, "retained");
+      assert.deepEqual(diagnostics, [{ check: expected }]);
+      assert.deepEqual(x.requests.map(r => r.site), ["inventory_source", "inventory_source:after_runner_git"], "after-scan still runs");
+      assert.deepEqual(x.w.bounds, []);
+    }
+  });
+
+  it("a hung content proof never delays the ordinary path (it is never called)", async () => {
+    const x = world();
+    x.w.content = () => { throw new Error("content proof must not run on the ordinary path"); };
+    git.inventorySourceContentProof = (() => new Promise(() => {})) as typeof git.inventorySourceContentProof;
+    const result = await x.internals.withInventorySourceBoundary({ runId: "run-ordinary", generation: 1, barePath: "/fixture/repo.git" },
+      async prove => { assert.equal(await prove(), true); });
+    assert.equal(result, "passed");
   });
 
   it("a replaced tail records predecessor_scope_invalid, reports execution_tail_present and does nothing else", async () => {
@@ -158,7 +184,7 @@ describe("predecessor boundary: grant, tail and scope", () => {
     x.w.bounds.length = 0;
     await x.internals.withInventorySourceBoundary({ runId: "run-ordinary", generation: 1, barePath: "/fixture/repo.git" },
       async prove => { await prove(); });
-    assert.deepEqual(x.w.bounds, [undefined, undefined], "ordinary: content proof only, default bounds");
+    assert.deepEqual(x.w.bounds, [], "ordinary: no content proof or residue listing at all");
   });
 
   it("a valid token with a foreign runId is refused", async () => {
@@ -395,6 +421,7 @@ describe("predecessor boundary: content proof, scratch and ignored residue (real
     const x = world({ clones: () => [clone("issue-1")].map(c => ({ ...c, clonePath: root })) });
     git.inventorySourceContentProof = GitCache.prototype.inventorySourceContentProof.bind(git);
     git.inventoryIgnoredResidue = GitCache.prototype.inventoryIgnoredResidue.bind(git);
+    git.worktreeStatus = GitCache.prototype.worktreeStatus.bind(git);
     const predecessor = await x.enter();
     const diagnostics: InventorySourceDiagnostic[] = [];
     const ordinary = await x.internals.withInventorySourceBoundary({
@@ -450,12 +477,10 @@ describe("predecessor boundary: content proof, scratch and ignored residue (real
     ] as const) {
       const x = world();
       x.w.content = () => content;
-      const diagnostics: InventorySourceDiagnostic[] = [];
       const ordinary = await x.internals.withInventorySourceBoundary({
-        runId: "run-ordinary", generation: 1, barePath: "/fixture/repo.git", reportDiagnostic: d => diagnostics.push(d),
-      }, async () => assert.fail("must not release"));
-      assert.equal(ordinary, "retained");
-      assert.deepEqual(diagnostics, [{ check: reported }]);
+        runId: "run-ordinary", generation: 1, barePath: "/fixture/repo.git",
+      }, async prove => { assert.equal(await prove(), true); });
+      assert.equal(ordinary, "passed", "the ordinary path ignores the content proof");
       const out = await x.enter();
       assert.equal(out.result, "retained");
       assert.deepEqual(out.diagnostics, [{ check: reported }]);
@@ -513,5 +538,140 @@ describe("worktreeStatus keeps serving its other callers", () => {
       assert.deepEqual(await git.worktreeStatus(dir), [" M a.txt", "?? new.txt"]);
       assert.equal(bytesCalls, 0);
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe("ordinary FINAL equals base; the predecessor path is strict (real git)", () => {
+  const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
+  const GENV = { ...cleanEnv, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
+  function repo(t: { after(fn: () => void): void }) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pred-equiv-"));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const root = path.join(dir, "issue-1");
+    fs.mkdirSync(root);
+    const g = (...args: string[]) => execFileSync("git", ["-C", root, ...args], { env: GENV, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+    g("init", "-q", "-b", "main");
+    for (const [k, v] of [["user.name", "f"], ["user.email", "f@example.com"], ["commit.gpgsign", "false"], ["gc.auto", "0"], ["core.fsmonitor", "false"]]) g("config", k!, v!);
+    return { root, g, commit: () => { g("add", "-A"); g("commit", "-q", "-m", "c"); } };
+  }
+  async function both(root: string) {
+    const x = world({ clones: () => [{ ...clone("issue-1"), clonePath: root }] });
+    git.inventorySourceContentProof = GitCache.prototype.inventorySourceContentProof.bind(git);
+    git.inventoryIgnoredResidue = GitCache.prototype.inventoryIgnoredResidue.bind(git);
+    git.worktreeStatus = GitCache.prototype.worktreeStatus.bind(git);
+    const predecessor = await x.enter();
+    const diagnostics: InventorySourceDiagnostic[] = [];
+    const ordinary = await x.internals.withInventorySourceBoundary({
+      runId: "run-ordinary", generation: 1, barePath: "/fixture/repo.git", reportDiagnostic: d => diagnostics.push(d),
+    }, async prove => { assert.equal(await prove(), true); });
+    return { predecessor, ordinary, ordinaryDiagnostics: diagnostics, refusals: x.registration.refusals.map(r => r.check) };
+  }
+
+  for (const [name, attrs, write] of [
+    ["eol=crlf", "*.txt eol=crlf\n", (root: string) => fs.writeFileSync(path.join(root, "a.txt"), "one\r\ntwo\r\n")],
+    ["working-tree-encoding", "*.txt working-tree-encoding=UTF-16LE-BOM\n", (root: string) =>
+      fs.writeFileSync(path.join(root, "a.txt"), Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from("hello\n", "utf16le")]))],
+  ] as const) {
+    it(`a clean ${name} clone: ordinary passes, predecessor refuses as dirty`, async t => {
+      const r = repo(t);
+      fs.writeFileSync(path.join(r.root, ".gitattributes"), attrs);
+      write(r.root);
+      r.commit();
+      assert.equal(r.g("status", "--porcelain"), "", "precondition: git calls the clone clean");
+      const out = await both(r.root);
+      assert.equal(out.ordinary, "passed");
+      assert.deepEqual(out.ordinaryDiagnostics, []);
+      assert.equal(out.predecessor.result, "retained");
+      assert.deepEqual(out.refusals, ["worktree_status_dirty"]);
+    });
+  }
+
+  it("a clean ident clone: ordinary passes, predecessor refuses as dirty", async t => {
+    const r = repo(t);
+    fs.writeFileSync(path.join(r.root, ".gitattributes"), "*.txt ident\n");
+    fs.writeFileSync(path.join(r.root, "a.txt"), "$Id$\n");
+    r.commit();
+    fs.rmSync(path.join(r.root, "a.txt"));
+    r.g("checkout", "--", "a.txt");
+    assert.match(fs.readFileSync(path.join(r.root, "a.txt"), "utf8"), /\$Id: [0-9a-f]{40} \$/, "precondition: the worktree holds the expanded form");
+    assert.equal(r.g("status", "--porcelain"), "");
+    const out = await both(r.root);
+    assert.equal(out.ordinary, "passed");
+    assert.equal(out.predecessor.result, "retained");
+    assert.deepEqual(out.refusals, ["worktree_status_dirty"]);
+  });
+
+  it("a gitlink: ordinary as base (passes), predecessor unreadable", async t => {
+    const r = repo(t);
+    fs.writeFileSync(path.join(r.root, "a.txt"), "a\n");
+    r.commit();
+    const sha = r.g("rev-parse", "HEAD");
+    r.g("update-index", "--add", "--cacheinfo", `160000,${sha},sub`);
+    fs.mkdirSync(path.join(r.root, "sub"));
+    const base = await git.worktreeStatus(r.root);
+    const out = await both(r.root);
+    assert.equal(out.ordinary, base?.length === 0 ? "passed" : "retained", "ordinary follows worktreeStatus exactly");
+    assert.equal(out.predecessor.result, "retained");
+    assert.deepEqual(out.refusals, ["worktree_status_unreadable"]);
+  });
+
+  it("a path with a filter attribute: ordinary as base (passes), predecessor unreadable", async t => {
+    const r = repo(t);
+    fs.writeFileSync(path.join(r.root, ".git", "info", "attributes"), "*.f filter=ident-copy\n");
+    fs.appendFileSync(path.join(r.root, ".git", "config"), '[filter "ident-copy"]\n\tclean = cat\n\tsmudge = cat\n');
+    fs.writeFileSync(path.join(r.root, "a.f"), "payload\n");
+    r.commit();
+    assert.equal(r.g("status", "--porcelain"), "");
+    const out = await both(r.root);
+    assert.equal(out.ordinary, "passed");
+    assert.equal(out.predecessor.result, "retained");
+    assert.deepEqual(out.refusals, ["worktree_status_unreadable"]);
+  });
+
+  it("over the entry cap: ordinary passes, predecessor over_bound", async t => {
+    const r = repo(t);
+    fs.writeFileSync(path.join(r.root, "a.txt"), "a\n");
+    fs.writeFileSync(path.join(r.root, "b.txt"), "b\n");
+    r.commit();
+    const shared = INVENTORY_CONTENT_PROOF_BOUNDS as { maxEntries: number; maxContentBytes: number };
+    const saved = { ...shared };
+    try {
+      shared.maxEntries = 1;
+      const entries = await both(r.root);
+      assert.equal(entries.ordinary, "passed");
+      assert.deepEqual(entries.refusals, ["over_bound"]);
+      shared.maxEntries = saved.maxEntries;
+      shared.maxContentBytes = 1;
+      const bytes = await both(r.root);
+      assert.equal(bytes.ordinary, "passed");
+      assert.deepEqual(bytes.refusals, ["over_bound"]);
+    } finally { Object.assign(shared, saved); }
+  });
+});
+
+// Documents a RESIDUAL, it does not claim safety.
+describe("escaped-writer residual (documented, #3831-related)", () => {
+  it("residual (documented, #3831-related): an escaped writer outside the clone with no attempt marker is not detected", () => {
+    const RUNNER = 10002, SELF = 900, CLONE = "/data/runner/repo/issue-1";
+    const proc = (cwd: string, environ: string) => ({
+      listPids: () => [4242],
+      readStatus: () => `Name:\twriter\nState:\tS (sleeping)\nUid:\t${RUNNER}\t${RUNNER}\t${RUNNER}\t${RUNNER}\n`,
+      readEnviron: () => environ,
+      readCwd: () => cwd,
+      readStat: (pid: number) => `${pid} (writer) S 1 ${pid} ${pid} ${"0 ".repeat(15)}5000 0 0`,
+    });
+    const req = {
+      mode: "capture" as const, targetUid: RUNNER, targetKey: "repo/issue-1", targetPaths: [CLONE],
+      liveMarkers: [], liveRoots: [], workerNonce: "nonce",
+    };
+    const scrubbed = "PATH=/usr/bin\0HOME=/tmp\0";
+    // Controls: the scan does see a process whose cwd is inside the clone, and one carrying marker plus key.
+    const inside = scanOnce(req, proc(CLONE + "/src", scrubbed), SELF);
+    assert.equal(inside.survivors.length + inside.kill.length + inside.unverified.length, 1, "cwd inside the clone is in scope");
+    const marked = scanOnce(req, proc("/tmp/elsewhere", "UZI_RUN_ATTEMPT=run-9:attempt\0UZI_RUN_CLONE_KEY=repo/issue-1\0"), SELF);
+    assert.ok(marked.kill.length + marked.survivors.length + marked.unverified.length <= 1);
+    // The residual: cwd outside every target path and no attempt marker or clone key.
+    const escaped = scanOnce(req, proc("/tmp/elsewhere", scrubbed), SELF);
+    assert.deepEqual(escaped, { kill: [], survivors: [], unverified: [] }, "not detected: it may still write into the clone");
   });
 });
