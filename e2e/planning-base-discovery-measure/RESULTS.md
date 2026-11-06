@@ -80,7 +80,7 @@ Measured on 2026-11-06, 12:08–12:29 UTC, with `run.sh` and the harness at comm
 **Caveats:**
 - The adversarial clones are `--no-checkout`. Production would first have to check out the base.
 - Tree RSS double-counts shared pages and is sampled every 10 ms, so it can miss short peaks.
-- The parent-observed "disc" values (tree RSS and cgroup peak) were read at the parent's first 10 ms poll after the helper's boundary snapshot. The lag is up to one 10 ms poll plus parent scheduling delay, so they can include early post-discovery work such as the first capture spawn. Treat them as upper bounds for discovery. The helper maxRSS "disc" value is taken synchronously at the boundary. The container peak includes the harness parent (about 60 MiB) and page cache.
+- The parent-observed "disc" values (tree RSS and cgroup peak) were read at the parent's first 10 ms poll after the helper's boundary snapshot. The lag is up to one 10 ms poll plus parent scheduling delay, so they can include early post-discovery work such as the first capture spawn. The cgroup peak is monotonic, so it is an upper bound for discovery; the discovery tree-RSS peak is approximate and may be above the true peak (polling lag) or below it (a short peak missed by the 10 ms sampling). The helper maxRSS "disc" value is taken synchronously at the boundary. The container peak includes the harness parent (about 60 MiB) and page cache.
 - There is no UID split or sandbox.
 - Everything was measured on one host. See README.md.
 

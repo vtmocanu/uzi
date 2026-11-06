@@ -109,7 +109,10 @@ report `no`.
   discovery peak and its cgroup `memory.peak` at the boundary are taken when the parent first
   reads the helper's boundary snapshot. The lag is up to one 10 ms poll plus the parent's
   scheduling delay, which shares the CPU with the helper at 1 CPU. They can therefore include
-  early post-discovery work, such as the first capture spawn, and are upper bounds for discovery.
+  early post-discovery work, such as the first capture spawn. The cgroup `memory.peak` value is
+  monotonic, so it is an upper bound for discovery. The discovery tree-RSS peak is approximate: polling
+  lag can push it above the true discovery peak, and the 10 ms sampling can miss a short peak and leave
+  it below.
 - **tree RSS:** the sum of VmRSS over the helper and its descendants, sampled every 10 ms. It
   can miss short peaks, and it double-counts shared pages.
 - **cgroup peak:** `memory.peak` at the boundary and at the end. It is the authoritative
