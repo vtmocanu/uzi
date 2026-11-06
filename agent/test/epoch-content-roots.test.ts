@@ -597,16 +597,16 @@ it("the shared core deletes clean covered indexed content and settles its metada
   scope.assertSettled();
 });
 
-it("keeps a forbidden source include as a settled refusal and bare indirection UNKNOWN", async () => {
+it("treats a source include as UNKNOWN", async () => {
   command(clonePath, "config", "include.path", path.join(fx.dataDir, "not-followed-source-config"));
   const before = fs.readFileSync(path.join(bare, "config"));
   const result = await git.discardStoppedSource({ ...options, epochProof: git.createEpochDiscardProof(input) });
-  assert.deepEqual(result, { kind: "refused", reason: "epoch_content_unproven", consumers: [] });
-  assert.equal(scope.stopped(), false);
-  scope.assertSettled();
+  assert.equal(result.kind, "unknown");
   assert.ok(fs.existsSync(clonePath));
   assert.deepEqual(fs.readFileSync(path.join(bare, "config")), before);
-  command(clonePath, "config", "--unset", "include.path");
+});
+
+it("treats a bare include as UNKNOWN", async () => {
   command(bare, "config", "include.path", path.join(fx.dataDir, "unknown-bare-config"));
   await unknown();
 });

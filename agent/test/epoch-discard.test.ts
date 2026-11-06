@@ -198,7 +198,7 @@ describe("automatic content preservation through registered authority", () => {
       await contentRefusal();
     });
   }
-  for (const dirty of ["tracked", "untracked", "assume-unchanged", "skip-worktree", "stash", "filter", "include", "attributes", "modules"] as const) {
+  for (const dirty of ["tracked", "untracked", "assume-unchanged", "skip-worktree", "stash", "filter", "attributes", "modules"] as const) {
     it(`retains ${dirty} content without changing journal or ledger`, async () => {
       const tracked = cloneGit("ls-files").split("\n")[0]!;
       if (dirty === "tracked" || dirty === "stash" || dirty === "assume-unchanged" || dirty === "skip-worktree") {
@@ -207,10 +207,23 @@ describe("automatic content preservation through registered authority", () => {
         if (dirty === "assume-unchanged" || dirty === "skip-worktree") cloneGit("update-index", "--" + dirty, tracked);
       } else if (dirty === "untracked") fs.writeFileSync(path.join(clonePath, "private.txt"), "private work");
       else if (dirty === "filter") cloneGit("config", "filter.hostile.clean", "false");
-      else if (dirty === "include") cloneGit("config", "include.path", "/dev/null");
       else if (dirty === "attributes") fs.writeFileSync(path.join(clonePath, ".git", "info", "attributes"), "");
       else fs.mkdirSync(path.join(clonePath, ".git", "modules"));
       await contentRefusal();
+    });
+  }
+  // A clone config include can name a file holding a promisor remote that nothing classifies, so it is UNKNOWN (it
+  // stops the epoch scope), never a keep.
+  for (const section of ["[include]", '[includeIf "gitdir:/"]']) {
+    it(`treats a clone config ${section} naming a promisor remote as UNKNOWN`, async () => {
+      const target = path.join(path.dirname(clonePath), "included-promisor-config");
+      fs.writeFileSync(target, '[remote "sib"]\n\turl = /tmp/sibling\n\tpromisor = true\n');
+      fs.appendFileSync(path.join(clonePath, ".git", "config"), `${section}\n\tpath = ${target}\n`);
+      const proof = git.createEpochDiscardProof(input);
+      const result = await git.discardStoppedSource({ ...options, epochProof: proof });
+      assert.equal(result.kind, "unknown");
+      assert.ok(fs.existsSync(clonePath));
+      assert.equal(journal(), raw);
     });
   }
   for (const extra of ["head", "side", "arbitrary-remote", "blob"] as const) {

@@ -11244,11 +11244,12 @@ export class GitCache {
   /**
    * Default history and validated own-run owed roots; arbitrary refs prove no preservation.
    *
-   * THE RULE (owner answer seq 1162, 2026-11-06 (R9)). An INDIRECTION is anything that lets some OTHER source's
-   * deletion break the work this source retains: an alternate into another store, a partialclone/promisor, another
-   * ref or object format, a worktree or common-directory redirect, a symlinked or noncanonical object path or config.
-   * (A config INCLUDE is the one exception: it is a settled keep, because no Git launch reads its target before the
-   * refusal, and the refusal is ordered after every indirection input has been classified.) An indirection
+   * THE RULE (lead decision applying owner answer seq 1162, 2026-11-06 (R9): over-limit is a settled keep, indirect
+   * stores stay UNKNOWN). An INDIRECTION is anything that lets some OTHER source's deletion break the work this
+   * source retains: an alternate into another store, a partialclone/promisor, another ref or object format, a
+   * worktree or common-directory redirect, a config include, a symlinked or noncanonical object path or config.
+   * Residual: a nested `.git` inside an untracked worktree directory is refused (a settled keep) by the worktree
+   * stage, after its own bulk budgets; it is not classified as an indirection. An indirection
    * stops the whole epoch scope (UNKNOWN). A budget overflow, by contrast, is a settled keep of only this source. If
    * bulk data an attacker controls could use up a budget before an indirection input was classified, the attacker
    * would hide the indirection behind a keep. Therefore, in EVERY stage of this proof (the clone shape stage
@@ -11556,7 +11557,7 @@ export class GitCache {
         }
       };
       /** One store's config as Git lists it (`git config --file -`, the bytes on stdin, no file of the store opened). */
-      const configListing = async (root: string, configBytes: Buffer) => {
+      const configListing = async (configBytes: Buffer) => {
         let listing: string;
         try {
           const parsed = await read(() => this.execScoped("git",
@@ -11573,8 +11574,6 @@ export class GitCache {
         }
         for (const row of listing.split("\0")) {
           const [key, value] = row.split("\n");
-          if (root === source && (key?.startsWith("include.") || key?.startsWith("includeif.")))
-            throw new AutomaticContentRefusal("source config indirection is not eligible");
           if (key === "extensions.compatobjectformat" || key === "extensions.objectformat" && value !== "sha1" ||
               key === "extensions.refstorage" || key === "extensions.worktreeconfig" || key === "extensions.partialclone" ||
               key === "core.worktree" || key !== undefined && PROMISOR_KEY_RE.test(key) || key?.startsWith("include.") || key?.startsWith("includeif."))
@@ -11613,11 +11612,11 @@ export class GitCache {
         rows.set(config + ":bytes", configBytes.toString("hex"));
         if (topologyOnly) {
           // No Git here: the config bytes are classified directly (a superset of the key checks of `configListing`).
-          // A source include is a settled refusal that the shape stage reports itself, after this pass.
+          // A source include is UNKNOWN too, but the shape stage reports it itself, before any bulk charge.
           if (cloneConfigIndirection(configBytes) !== undefined ||
               root !== source && /\[\s*include/i.test(configBytes.toString("latin1")))
             unknown("object format or config indirection unsupported");
-        } else await configListing(root, configBytes);
+        } else await configListing(configBytes);
         for (const name of ["commondir", "shallow", "info/grafts", "refs/replace"]) {
           if (await stat(path.join(path.dirname(root), name), true)) unknown("unsupported object topology");
         }
@@ -12425,6 +12424,16 @@ export class GitCache {
         SHAPE_INDIRECTION_UNKNOWN.add(unknownKey);
         throw unknownKey;
       }
+      // A config include is an indirection too: its target can carry any key (a promisor remote, say) that is never
+      // classified, because Git opens every `include.path` target while it starts up in the clone, even for a read
+      // that asks for no includes (a FIFO target hangs it, a huge one is read uncharged), so the target is never read
+      // here. The scan is deliberately coarse: any `[include` section opener, in any case and spacing, anywhere in the
+      // file. UNKNOWN, before any Git launch and before anything bulk is charged.
+      if (/\[\s*include/i.test(configBytes.toString("latin1"))) {
+        const unknownInclude = new AutomaticCompletenessUnknown("object format or config indirection unsupported (.git/config names an include)");
+        SHAPE_INDIRECTION_UNKNOWN.add(unknownInclude);
+        throw unknownInclude;
+      }
       chargeMetadata(configBytes.length, ".git/config");
       // The rest of the clone's indirection inputs: `afterIndirection` (the whole proof passes the Node-only topology
       // classification here) types every entry of `.git/objects` and the special `.git` entries before any bulk input
@@ -12436,13 +12445,6 @@ export class GitCache {
           throw error;
         }
       }
-      // Git opens every `include.path` target while it starts up in the clone, even for a read that
-      // asks for no includes (a FIFO target hangs it, a huge one is read uncharged), so a config that
-      // names one is refused here, before any Git launch by this stage. The scan is deliberately
-      // coarse: any `[include` section opener, in any case and spacing, anywhere in the file. A refusal is a settled
-      // keep of this source, as before; it comes after every indirection input has been classified so that it cannot
-      // hide one.
-      if (/\[\s*include/i.test(configBytes.toString("latin1"))) throw refusal("clone config names an include");
       for (const charge of deferredCharges) charge();
 
       // Allowlist, not denylist: every top-level entry must be a known one of the right type, so
@@ -12662,7 +12664,8 @@ export class GitCache {
    *     intent-to-add, staged or odd-mode entry);
    *  1b. `.git/config` is read in Node, classified for every UNKNOWN-class key (partialclone, refstorage, the
    *     object formats, worktreeconfig, core.worktree: UNKNOWN, also when the file is past the budget) and
-   *     refused if it names an include (Git opens include targets at startup; a settled keep);
+   *     UNKNOWN if it names an include (Git opens include targets at startup, so the target is never read and could
+   *     carry any indirection key, a promisor remote included; thrown before anything bulk is charged);
    *     `.git/info/exclude` is read in Node and must hold only the worker-source
    *     baseline; `.git/objects/info` holds at most `alternates` (read and judged whole), `packs` and
    *     `commit-graph` (typed, their sizes charged after the config) and a `commit-graphs` directory (typed only);
@@ -12831,7 +12834,7 @@ export class GitCache {
           { env: { ...env, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL }, ...extra }));
 
       // Strict allowlist of the keys uzi itself writes into `.git/config`; a value Git would parse
-      // some other way (an include, a filter, a hooks path, an extension) is a keep, never something
+      // some other way (a filter, a hooks path, an extension) is a keep, never something
       // to override. `--local` lists the file alone: the launch environment's own command-line pins
       // (safe.directory, core.hooksPath, ...) are not the clone's content, and an include or
       // `config.worktree` can only matter through keys that the allowlist already refuses.

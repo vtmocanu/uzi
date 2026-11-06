@@ -574,7 +574,7 @@ it("refuses each other .git entry the proof cannot account for, before any launc
 // Config allowlist.
 
 for (const [key, value] of [
-  ["filter.x.clean", "cat"], ["core.attributesFile", "/dev/null"], ["include.path", "x"], ["includeIf.gitdir:/.path", "x"],
+  ["filter.x.clean", "cat"], ["core.attributesFile", "/dev/null"],
   ["core.hooksPath", "/tmp"], ["core.sparseCheckout", "true"],
   ["status.renames", "true"], ["diff.renames", "true"], ["core.ignoreCase", "true"],
   ["core.untrackedCache", "true"], ["core.fsmonitor", "true"], ["core.bare", "true"], ["attr.tree", "HEAD"],
@@ -586,6 +586,16 @@ for (const [key, value] of [
     const rec = recordLaunches(t);
     assert.equal(await prove(), false);
     assertNoContentRead(rec);
+  });
+}
+// A config include can carry any key, a promisor remote included, so it is indirection too: UNKNOWN, never a keep.
+for (const [key, value] of [["include.path", "x"], ["includeIf.gitdir:/.path", "x"]] as const) {
+  it(`config: ${key} is indirection, UNKNOWN before any launch`, async t => {
+    command(clonePath, "config", "--local", key, value);
+    const rec = recordLaunches(t);
+    await assert.rejects(prove(), error => (error as Error).constructor.name === "AutomaticCompletenessUnknown" &&
+      /names an include/.test((error as Error).message));
+    assertNoGit(rec);
   });
 }
 // The keys that change where objects, refs or the worktree live are indirection, not a hostile source's own state:
@@ -1453,23 +1463,25 @@ it("F3: the seeded baseline, comments and blank lines still prove", async () => 
   assert.equal(await prove(), true);
 });
 
-it("F4: an include.path naming a FIFO is refused promptly, without any Git launch", async t => {
+it("F4: an include.path naming a FIFO is UNKNOWN promptly, without any Git launch", async t => {
   const fifo = path.join(scratchDir("wt-include-"), "fifo");
   mkfifo(fifo);
   fs.appendFileSync(inClone(".git", "config"), `[include]\n\tpath = ${fifo}\n`);
   const rec = recordLaunches(t);
   const started = Date.now();
-  assert.equal(await prove(), false);
+  await assert.rejects(prove(), error => (error as Error).constructor.name === "AutomaticCompletenessUnknown" &&
+    /names an include/.test((error as Error).message));
   assert.ok(Date.now() - started < 10_000, "must not wait on the FIFO");
   assertNoGit(rec);
 });
 
-it("F4: an includeIf naming a 300 MiB file is refused without a launch, so the file is never read", async t => {
+it("F4: an includeIf naming a 300 MiB file is UNKNOWN without a launch, so the file is never read", async t => {
   const big = path.join(scratchDir("wt-include-"), "big");
   sparse(big, 300 * 1024 * 1024, "[core]\n");
   fs.appendFileSync(inClone(".git", "config"), `[includeIf "gitdir:/"]\n\tpath = ${big}\n[ INCLUDE ]\n\tpath = ${big}\n`);
   const rec = recordLaunches(t);
-  assert.equal(await prove(), false);
+  await assert.rejects(prove(), error => (error as Error).constructor.name === "AutomaticCompletenessUnknown" &&
+    /names an include/.test((error as Error).message));
   assertNoGit(rec);
 });
 
