@@ -556,6 +556,20 @@ export class FakeApi {
     return next;
   }
 
+  /** Redispatches injected by {@link redispatchRun}. */
+  redispatches = 0;
+
+  /** A TEST-INJECTED redispatch: it re-offers the run at `nextGeneration` after a confirmed park, as
+   *  a test's stand-in for any later claim. It is NOT automatic requeue accounting: a confirmed owner
+   *  hold has no automatic retry, and this does not touch {@link requeues}. */
+  redispatchRun(claim: ClaimResponse, nextGeneration: number): ClaimResponse {
+    this.redispatches++;
+    const next = { ...claim, claim_generation: nextGeneration };
+    this.setOwnershipStatus(claim.run_id, "running", nextGeneration);
+    this.enqueueClaim(next);
+    return next;
+  }
+
   enqueueClaim(claim: ClaimResponse): void {
     this.receiptGeneration.set(claim.run_id, claim.claim_generation ?? 0);
     this.claimQueue.push(claim);

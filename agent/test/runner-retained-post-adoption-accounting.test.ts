@@ -36,6 +36,8 @@ interface Rig {
   /** One entry per runner.execute(), in claim order. */
   flights: Array<{ parked: boolean; claimGeneration: number }>;
   counters: { models: number; prepares: number; captures: number; confirmedParks: number; unconfirmedParks: number; windowGets: number };
+  /** Journal snapshots around each claim, for holdCounts. */
+  steps: Array<{ generation: number; before: Snap; after: Snap }>;
   script: Fault[];
   /** Fired before the real retry wait of the post-adoption window. */
   onWait?: (flight: any) => void;
@@ -54,7 +56,7 @@ async function rig(options: { script: Fault[]; ack?: "confirm" | "status-only"; 
   client.protocolFeatures = [`recovery_cause_${CAUSE}`];
   const log = recordingLogger();
   const r = {
-    claim, bare, clone, flights: [] as Rig["flights"],
+    claim, bare, clone, flights: [] as Rig["flights"], steps: [] as Rig["steps"],
     counters: { models: 0, prepares: 0, captures: 0, confirmedParks: 0, unconfirmedParks: 0, windowGets: 0 },
     script: options.script, ack: options.ack ?? "confirm", onWait: options.onWait, log,
   } as unknown as Rig;
@@ -109,8 +111,10 @@ async function rig(options: { script: Fault[]; ack?: "confirm" | "status-only"; 
       if (!served) return;
       generation = served.claim_generation ?? generation;
       armed = false;
+      const before = snap(r);
       await r.runner.execute(served);
       armed = false;
+      r.steps.push({ generation: served.claim_generation ?? generation, before, after: snap(r) });
       between(served, ++n);
     }
   };
@@ -119,6 +123,31 @@ async function rig(options: { script: Fault[]; ack?: "confirm" | "status-only"; 
 const serve = (r: Rig, between: (claim: ClaimResponse, n: number) => void = () => {}) =>
   (r as any).serve(between) as Promise<void>;
 const journal = (r: Rig) => JSON.parse(command(r.bare, "config", `uzi-recovery.${r.clone.branch}.clone`)).recovery;
+
+// HOLD MEASUREMENT (bare journal). The journal's recovery record (config uzi-recovery.<branch>.clone)
+// is snapshotted before and after each claim is executed. A "hold" is a claim whose journal went from
+// not-blocked to stage "blocked" with blocker "adoption_failed" (blockRecoveryEpisode wrote it). A
+// "rehold" is a claim that started AND ended on that same blocked record with every field unchanged
+// (blockRecoveryEpisode returns early on an already-blocked journal, so nothing is rewritten, and
+// recovery.claimGeneration keeps the generation that first held) while a recovery_wait park report was
+// sent for that claim's own generation. So a rehold is told from a no-op by the report, and from a
+// hold by the unchanged before-record. FakeApi has no custody-hold notion for this flow (its holds are
+// the credential-switch hold, unrelated), so the journal is the only hold evidence.
+interface Snap { stage?: string; blocker?: string; attempts?: number; episode?: number; claimGeneration?: number }
+const snap = (r: Rig): Snap => {
+  const rec = journal(r) ?? {};
+  return { stage: rec.stage, blocker: rec.blocker, attempts: rec.attempts, episode: rec.episode, claimGeneration: rec.claimGeneration };
+};
+const isAdoptionBlock = (s: Snap) => s.stage === "blocked" && s.blocker === "adoption_failed";
+function holdCounts(steps: Array<{ generation: number; before: Snap; after: Snap }>) {
+  let holds = 0, reholds = 0;
+  for (const s of steps) {
+    if (!isAdoptionBlock(s.before) && isAdoptionBlock(s.after)) holds++;
+    else if (isAdoptionBlock(s.before) && JSON.stringify(s.before) === JSON.stringify(s.after) &&
+      parkReports().some(p => p.body.claim_generation === s.generation)) reholds++;
+  }
+  return { holds, reholds };
+}
 const parkReports = () => api.states.filter(s => s.body.status === "recovery_wait" && s.body.recovery_cause === CAUSE);
 const failedReports = () => api.states.filter(s => s.body.status === "failed");
 
@@ -139,21 +168,25 @@ it("accounting (a): a transient failure at gen 2 is one claim with no requeue, h
   assert.notEqual(journal(r).stage, "blocked", "no hold was added");
   assert.equal(journal(r).blocker, undefined);
   assert.equal(journal(r).attempts, 1);
+  assert.deepEqual(holdCounts(r.steps), { holds: 0, reholds: 0 });
 });
 
-it("accounting (b): an unknown failure at gen 2 is a CONFIRMED adoption_failed park; the gen-3 requeue reholds the blocked journal", async () => {
+it("accounting (b): an unknown failure at gen 2 is a CONFIRMED adoption_failed park; a test-injected gen-3 redispatch (not a requeue) reholds the blocked journal", async () => {
   const r = await rig({ script: ["enotfound"] });
   const afterFirst: Array<{ parked: boolean; confirmed: number; reports: number; captures: number; prepares: number }> = [];
   await serve(r, (claim, n) => {
     afterFirst.push({ parked: r.flights[n - 1]!.parked, confirmed: r.counters.confirmedParks,
       reports: parkReports().length, captures: r.counters.captures, prepares: r.counters.prepares });
-    if (n === 1) api.requeueRun(claim, 3);
+    // A confirmed owner hold has no automatic retry, so this is an injected redispatch, not a requeue.
+    if (n === 1) api.redispatchRun(claim, 3);
   });
   assert.deepEqual(afterFirst[0], { parked: true, confirmed: 1, reports: 1, captures: 1, prepares: 1 },
     "gen 2: the report was ACKed with status and cause, which parks the flight");
   assert.equal(parkReports()[0]!.body.claim_generation, 2);
   assert.equal(api.claimsServed, 2);
-  assert.equal(api.requeues, 1);
+  assert.equal(api.requeues, 0, "a confirmed park is not a requeue");
+  assert.equal(api.redispatches, 1);
+  assert.deepEqual(holdCounts(r.steps), { holds: 1, reholds: 1 });
   assert.equal(r.flights.length, 2);
   assert.equal(r.flights[1]!.parked, true, "gen 3: the blocked journal is reheld with a confirmed park");
   assert.equal(parkReports().length, 2);
@@ -184,7 +217,10 @@ it("accounting (c): pause now during the transient retry wait departs without an
   assert.equal(api.requeues, 1);
   // PIN (observed, not designed): the departed gen-2 successor is not resumed. The gen-3 claim
   // runs a fresh retained recovery iteration: a second capture and successor, one more attempt,
-  // and the model. The departure added no hold and no park.
+  // and the model. The departure added no hold and no park. Whether the base behaves the same is
+  // compared in the run report (a tester runs the base comparison separately), not claimed here.
+  assert.equal(api.redispatches, 0);
+  assert.deepEqual(holdCounts(r.steps), { holds: 0, reholds: 0 });
   assert.deepEqual({ gen3Parked: r.flights[1]!.parked, models: r.counters.models, prepares: r.counters.prepares,
     captures: r.counters.captures, blocker: journal(r).blocker, stage: journal(r).stage, attempts: journal(r).attempts },
   { gen3Parked: false, models: 1, prepares: 2, captures: 2, blocker: undefined, stage: "ready-for-model", attempts: 2 });
@@ -208,6 +244,8 @@ it("accounting (d): after the confirmed park an owner RESUME (a renewed grant, n
   assert.equal(parkReports().length, 1, "only the gen-2 park; the Resume parked nothing");
   assert.equal(r.counters.confirmedParks, 1);
   assert.equal(r.flights[1]!.parked, false);
+  assert.equal(api.redispatches, 0);
+  assert.deepEqual(holdCounts(r.steps), { holds: 1, reholds: 0 });
   assert.equal(r.counters.models, 1);
   assert.equal(r.counters.prepares, 2, "the renewed grant adopts a fresh successor");
   assert.equal(failedReports().length, 1, "only the fixture's model failure");
@@ -226,4 +264,5 @@ it("accounting (e): an unknown failure whose park report is never confirmed is a
   assert.equal(r.counters.models, 0);
   assert.equal(failedReports().length, 0, "nonterminal: no failed report");
   assert.equal(journal(r).blocker, "adoption_failed");
+  assert.deepEqual(holdCounts(r.steps), { holds: 1, reholds: 0 });
 });
