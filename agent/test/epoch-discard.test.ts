@@ -222,6 +222,7 @@ describe("automatic content preservation through registered authority", () => {
       const proof = git.createEpochDiscardProof(input);
       const result = await git.discardStoppedSource({ ...options, epochProof: proof });
       assert.equal(result.kind, "unknown");
+      assert.equal(scope.stopped(), true);
       assert.ok(fs.existsSync(clonePath));
       assert.equal(journal(), raw);
     });

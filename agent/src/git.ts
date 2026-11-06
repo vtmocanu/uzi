@@ -1366,8 +1366,10 @@ const EPOCH_CLONE_CONFIG_KEYS: ReadonlySet<string> = new Set([
  * The only top-level entries of a settled runner clone's `.git` that the automatic worktree proof
  * admits (verified by listing a clone made by `runnerCloneForBranch` after a commit). Anything else
  * (`sequencer/`, `rebase-merge/`, `rebase-apply/`, `MERGE_*`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`,
- * `BISECT_*`, `AUTO_MERGE`, `shallow`, `commondir`, `modules`, `worktrees`, `sharedindex.*`,
- * `reftable`, ...) is an in-progress operation or state the proof cannot account for: a keep. Each
+ * `BISECT_*`, `AUTO_MERGE`, `modules`, `worktrees`, `sharedindex.*`, `reftable`, ...) is an in-progress
+ * operation or state the proof cannot account for, and is a settled keep. In the full proof `shallow` and
+ * `commondir` are classified earlier, as UNKNOWN, and so is a reftable ref store once `extensions.refstorage`
+ * selects it; a stray `reftable` entry without it, `worktrees` and the rest stay keeps here. Each
  * admitted entry is typed by lstat (a real directory or a regular file, never a FIFO or link) before
  * Git runs; the files are charged to the metadata budget. The contents of `refs/` are not listed
  * here: the shape stage walks that tree itself (real directories, regular files of at most
@@ -2564,7 +2566,7 @@ const PROMISOR_KEY_RE = /^remote\..*\.(?:promisor|partialclonefilter)$/i;
  *  checks: a key can only start a line or follow the `]` of a header on the same line, and every line start counts,
  *  including a continuation line, so no key Git would read can be missed (a false positive only keeps the answer
  *  UNKNOWN, the safe direction). `extensions.objectformat` is admitted only as the literal `sha1`. Includes are not
- *  listed: the shape stage refuses them as a settled keep (see the comment where it does). */
+ *  listed: the shape stage reports them as UNKNOWN itself, right after this scan (see the comment where it does). */
 function cloneConfigIndirection(config: Buffer): string | undefined {
   const text = config.toString("latin1");
   const keyAt = (name: string) => new RegExp(`(?:^|\\])[ \\t\\r\\f\\v]*${name}(?![A-Za-z0-9-])`, "im");
@@ -11612,9 +11614,9 @@ export class GitCache {
         rows.set(config + ":bytes", configBytes.toString("hex"));
         if (topologyOnly) {
           // No Git here: the config bytes are classified directly (a superset of the key checks of `configListing`).
-          // A source include is UNKNOWN too, but the shape stage reports it itself, before any bulk charge.
-          if (cloneConfigIndirection(configBytes) !== undefined ||
-              root !== source && /\[\s*include/i.test(configBytes.toString("latin1")))
+          // The clone's own include was already reported UNKNOWN by the shape stage, which calls this pass only
+          // afterwards; an include in any other store's config is judged here.
+          if (cloneConfigIndirection(configBytes) !== undefined || /\[\s*include/i.test(configBytes.toString("latin1")))
             unknown("object format or config indirection unsupported");
         } else await configListing(configBytes);
         for (const name of ["commondir", "shallow", "info/grafts", "refs/replace"]) {
@@ -12695,7 +12697,7 @@ export class GitCache {
    *
    * Outcome: every failure here, an exceeded bound included, returns `false`, except that the shape
    * stage rethrows a {@link SHAPE_INDIRECTION_UNKNOWN} error for an indirection input it cannot
-   * account for (an `objects/info` entry, the config (missing, not regular, an UNKNOWN-class key or past the budget),
+   * account for (an `objects/info` entry, the config (missing, not regular, an UNKNOWN-class key, an include or past the budget),
    * an object-path entry type or name, commondir, shallow, grafts or replace refs). An exceeded bound is thrown internally as
    * {@link AutomaticBoundExceeded} and a hostile or unsupported source
    * as {@link AutomaticContentRefusal}, but this method's catch converts both to `false`, so the
