@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { AdminUsers } from "./AdminUsers";
-import { api, type SettingsResponse, type User } from "../lib/api";
+import { api, ApiError, type SettingsResponse, type User } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 
 vi.mock("../lib/api", async (importOriginal) => {
@@ -18,6 +18,8 @@ vi.mock("../lib/api", async (importOriginal) => {
       // PRD #69 M4: AdminUsers now reads judge_enforce_all to grey the per-user judge
       // control under enforced mode.
       getSettings: vi.fn(),
+      // PRD #3989: the per-row reset link action.
+      createResetLink: vi.fn(),
     },
   };
 });
@@ -227,5 +229,128 @@ describe("AdminUsers name fallback (PRD #54)", () => {
     const row = (await screen.findByText("mira@uzi.local")).closest("tr")!;
     // Cell 0 is the email, cell 1 the name column: an empty name shows "—".
     expect(within(row).getAllByRole("cell")[1].textContent).toBe("—");
+  });
+});
+
+describe("AdminUsers reset link (PRD #3989)", () => {
+  function renderPage() {
+    return render(
+      <MemoryRouter>
+        <AdminUsers />
+      </MemoryRouter>,
+    );
+  }
+  const rowOf = async (email: string) => (await screen.findByText(email)).closest("tr")!;
+
+  it("offers Reset link only on active rows that are not the signed-in admin", async () => {
+    mockApi.listUsers.mockResolvedValue({
+      users: [
+        aUser({ id: "admin1", email: "me@uzi.local", is_admin: true }),
+        aUser({ id: "u2", email: "mira@uzi.local" }),
+        aUser({ id: "u3", email: "gone@uzi.local", is_active: false }),
+      ],
+    });
+    renderPage();
+    expect(within(await rowOf("mira@uzi.local")).getByRole("button", { name: "Reset link" })).toBeTruthy();
+    // Positive control above; the self and inactive rows carry no such action.
+    expect(within(await rowOf("me@uzi.local")).queryByRole("button", { name: "Reset link" })).toBeNull();
+    expect(within(await rowOf("gone@uzi.local")).queryByRole("button", { name: "Reset link" })).toBeNull();
+    expect(screen.getAllByRole("button", { name: "Reset link" })).toHaveLength(1);
+  });
+
+  it("confirms what the reset destroys before issuing anything", async () => {
+    mockApi.listUsers.mockResolvedValue({ users: [aUser()] });
+    renderPage();
+    fireEvent.click(within(await rowOf("mira@uzi.local")).getByRole("button", { name: "Reset link" }));
+
+    const dialog = screen.getByRole("dialog");
+    const text = dialog.textContent ?? "";
+    expect(text).toMatch(/model credentials \(Anthropic and OpenAI tokens, Codex logins\) and their vault contents are\s+permanently deleted/);
+    expect(text).toMatch(/All their sessions end/);
+    expect(text).toMatch(/CLI login/);
+    expect(text).toMatch(/queued Codex runs will fail; they must start new ones/);
+    // A non-admin target gets no takeover warning.
+    expect(within(dialog).queryByRole("note")).toBeNull();
+    // Nothing is issued until the admin confirms.
+    expect(mockApi.createResetLink).not.toHaveBeenCalled();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(mockApi.createResetLink).not.toHaveBeenCalled();
+  });
+
+  it("warns that an admin target's link hands over an admin account", async () => {
+    mockApi.listUsers.mockResolvedValue({ users: [aUser({ is_admin: true })] });
+    renderPage();
+    fireEvent.click(within(await rowOf("mira@uzi.local")).getByRole("button", { name: "Reset link" }));
+    const note = within(screen.getByRole("dialog")).getByRole("note");
+    expect(note.textContent).toMatch(/takes over an admin account/);
+    expect(note.textContent).toMatch(/only with that\s+person, over a trusted channel/);
+  });
+
+  it("shows the link once, with its expiry and kind, and drops it on close", async () => {
+    mockApi.listUsers.mockResolvedValue({ users: [aUser()] });
+    const token = "tok_" + "A".repeat(39);
+    mockApi.createResetLink.mockResolvedValue({
+      token,
+      expires_at: "2026-11-06T17:00:00Z",
+      kind: "password",
+      target_is_admin: false,
+    });
+    renderPage();
+    const row = await rowOf("mira@uzi.local");
+    fireEvent.click(within(row).getByRole("button", { name: "Reset link" }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Create reset link" }));
+
+    await waitFor(() => expect(mockApi.createResetLink).toHaveBeenCalledWith("u2"));
+    const link = await screen.findByLabelText("Reset link");
+    // The token rides the fragment of the web's own origin, never a path or query.
+    expect(link.textContent).toBe(`${window.location.origin}/reset#${token}`);
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.textContent).toMatch(/only once/);
+    expect(dialog.textContent).toMatch(/cannot be retrieved\s+again/);
+    expect(dialog.textContent).toContain(new Date("2026-11-06T17:00:00Z").toLocaleString());
+    expect(dialog.textContent).toMatch(/Password and vault/);
+    expect(within(dialog).getByRole("button", { name: "Copy" })).toBeTruthy();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Done" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.body.textContent).not.toContain(token);
+
+    // Reopening starts at the confirmation again; the old link is not retrievable.
+    fireEvent.click(within(row).getByRole("button", { name: "Reset link" }));
+    expect(screen.getByRole("dialog").textContent).not.toContain(token);
+    expect(within(screen.getByRole("dialog")).getByRole("button", { name: "Create reset link" })).toBeTruthy();
+    expect(mockApi.createResetLink).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders a vault_only link and the admin snapshot from the issue response", async () => {
+    mockApi.listUsers.mockResolvedValue({ users: [aUser()] });
+    mockApi.createResetLink.mockResolvedValue({
+      token: "t",
+      expires_at: "2026-11-06T17:00:00Z",
+      kind: "vault_only",
+      target_is_admin: true,
+    });
+    renderPage();
+    fireEvent.click(within(await rowOf("mira@uzi.local")).getByRole("button", { name: "Reset link" }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Create reset link" }));
+    await screen.findByLabelText("Reset link");
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.textContent).toMatch(/Vault only \(single sign-on account\)/);
+    expect(within(dialog).getByRole("note").textContent).toMatch(/takes over an admin account/);
+  });
+
+  it("surfaces a server refusal inside the dialog", async () => {
+    mockApi.listUsers.mockResolvedValue({ users: [aUser()] });
+    mockApi.createResetLink.mockRejectedValue(new ApiError(400, "the seed admin cannot be reset with a link"));
+    renderPage();
+    fireEvent.click(within(await rowOf("mira@uzi.local")).getByRole("button", { name: "Reset link" }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Create reset link" }));
+    expect(await within(screen.getByRole("dialog")).findByRole("alert")).toHaveProperty(
+      "textContent",
+      "the seed admin cannot be reset with a link",
+    );
+    expect(screen.queryByLabelText("Reset link")).toBeNull();
   });
 });

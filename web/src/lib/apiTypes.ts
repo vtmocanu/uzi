@@ -2068,6 +2068,39 @@ export interface CliAuthRequestMeta {
   expires_at: string;
 }
 
+// ── Admin-issued account reset link (PRD #3989) ───────────────────────────────
+// kind says what redeeming does: "password" sets a new login password, "vault_only"
+// (an SSO-only account, M2) only resets the vault. Both delete every model credential.
+export type ResetLinkKind = "password" | "vault_only";
+
+// AccountResetLink is the 201 of POST /api/admin/users/{id}/reset-link. The plaintext
+// token appears here exactly once (only its hash is stored); the web composes
+// `${origin}/reset#<token>` and never sends the token anywhere but a POST body.
+export interface AccountResetLink {
+  token: string;
+  expires_at: string;
+  kind: ResetLinkKind;
+  target_is_admin: boolean;
+}
+
+// ResetLinkPreview is the 200 of POST /api/auth/reset/preview. Every invalid-link
+// cause is one generic 404 instead.
+export interface ResetLinkPreview {
+  kind: ResetLinkKind;
+  expires_at: string;
+}
+
+// Request bodies of the two unauthenticated reset endpoints. The token rides the
+// body, never a path or query. password is required for kind=password and must be
+// absent for kind=vault_only.
+export interface ResetLinkPreviewRequest {
+  token: string;
+}
+export interface ResetLinkRedeemRequest {
+  token: string;
+  password?: string;
+}
+
 // ── OAuth consent flow (PRD #1910 M2) ─────────────────────────────────────────
 // The `/connect` consent page reads a pending authorize request and approves or denies it.
 
