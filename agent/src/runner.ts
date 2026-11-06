@@ -3412,9 +3412,9 @@ export class RunRunner {
   private shutdownDeadlineAt?: number;
   /** issue #1783: the live execution attempts on this worker (see run-quiescence.ts). */
   private readonly liveAttempts: LiveAttemptRegistry;
-  /** issue #1783: the quiescence primitive (process reap + Docker teardown). */
   /** issue #2969: see {@link RunnerOptions.predecessorFinalForTests}. */
   private readonly predecessorFinalForTests: boolean;
+  /** issue #1783: the quiescence primitive (process reap + Docker teardown). */
   private readonly quiesceImpl: (req: QuiesceRunRequest) => Promise<QuiesceRunOutcome>;
   /** issue #1783: the Docker endpoint the teardown half talks to (undefined ⇒ not wired). */
   private readonly dockerHost: string | undefined;
