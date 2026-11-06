@@ -269,7 +269,7 @@ async function drive(o: Opts = {}) {
   };
   const runner = runnerWith(make, fakeGitlab().gitlab, JOURNAL_KEY, logs.logger, {
     recoveryRetryMs: 1, quiesceRun: quiesceRunAttempt, codexBoundaryDeadlineMs: CODEX_BOUNDARY_MS,
-    commandUidProof: () => "absent", // hermetic: never the host /proc; a test overrides it through runnerOpts
+    predecessorFinalForTests: true, // the pass is disabled in production (issue #2969 fallback)
     ...(o.budget ? { predecessorFinalBudgetMs: o.budget } : {}),
     ...o.runnerOpts,
   } as never);
@@ -691,28 +691,4 @@ it("after the flight the ordinary pass retires the acknowledged predecessor reco
   await r.recovery.resumePending(undefined, acked ? [acked] : []);
   const after = (await r.recovery.inspect(r.claim.run_id)).find(x => x.generation === 2);
   assert.equal(after, undefined, "the ordinary re-drive retired the acknowledged generation");
-});
-
-// ── issue #2969: a command-uid process appearing after entry ────────────────────────────────────────────────────────────
-
-it("a command-uid process appearing after the bundle is journaled and before reserve stops: no reserve or upload is sent", async () => {
-  // The frozen record already holds the journaled bundle when the pass enters. The detector answers "absent" through the
-  // entry and the first exact-hold reads, then a command-uid process appears: the next authority checkpoint refuses.
-  let world: Pre | undefined;
-  let present = false;
-  const r = await drive({
-    arrange: (_server, w) => { world = w; },
-    runnerOpts: {
-      commandUidProof: () => {
-        if (!present && (world?.server.hits.filter(h => h.generation === 2 && h.kind === "exact").length ?? 0) >= 2) present = true;
-        return present ? "present" : "absent";
-      },
-    },
-  });
-  assert.equal(present, true, "the process appeared while the pass was running");
-  assertStopped(r, /refusal:command_uid_unproven|authority_lost/);
-  assert.equal(postsOf(r, "reserve").length, 0, "no reserve was sent");
-  assert.equal(postsOf(r, "upload").length, 0, "no upload was sent");
-  assert.equal(postsOf(r, "release").length, 0, "no release was sent");
-  assert.equal((await savedRecord(r, 2)).finalAcknowledged === true, false);
 });

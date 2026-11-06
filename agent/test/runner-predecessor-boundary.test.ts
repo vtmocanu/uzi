@@ -49,7 +49,7 @@ function world(opts: { codex?: boolean; claimGeneration?: number; deadlineAt?: n
   };
   const r = runner({ run: async () => { throw new Error("unreached executor"); } }, fakeGitlab().gitlab, undefined, {
     quiesceRun: async req => { requests.push(req); await opts.quiesce?.(req); return quiescent; },
-    commandUidProof: () => "absent", // hermetic: never the host /proc
+    predecessorFinalForTests: true, // the pass is disabled in production (issue #2969 fallback)
   });
   const internals = r as unknown as Internals;
   const tail = Promise.resolve();
