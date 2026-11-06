@@ -50,8 +50,8 @@ const recoveryCauseVaultLocked = "vault_locked"
 const recoveryCauseCodexIdleStall = "codex_idle_stall"
 
 // recoveryCauseDataVolumeFull is the PRD #1809 M5 (D6) cause for a run parked because its
-// worker's data volume is (or was about to be) full. It is also the server-derived fail_origin a
-// run gets past the disk park cap (failOrigins).
+// worker's data volume is (or was about to be) full. Historical cap failures retain
+// this fail_origin for compatibility; current exhausted allowances hold for owner Resume.
 const recoveryCauseDataVolumeFull = "data_volume_full"
 
 // recoveryCauseProviderOutage is the PRD #1733 cause for a run parked because a provider error

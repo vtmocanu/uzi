@@ -2464,7 +2464,8 @@ UPDATE runs SET
                THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int)
                ELSE 0 END,
     updated_at       = now()
-WHERE runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'data_volume_full' AND recovery_retry_not_before IS NULL)
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND runs.id = @id AND worker_id = @worker_id
   -- Semantic freeze has no structural fallback when cross-check is disabled.
@@ -2894,7 +2895,8 @@ UPDATE runs SET
     -- this transition's fresh status_since; health_notified_at is preserved.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'data_volume_full' AND recovery_retry_not_before IS NULL)
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND runs.id = @id AND worker_id = @worker_id
   -- Resume can retain worker affinity while fencing the old invocation. A late
@@ -3601,6 +3603,47 @@ WHERE id = @id AND user_id = @user_id AND status = 'recovery_wait'
           - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
 RETURNING *;
 
+-- name: HoldRunDataVolumeFull :one
+-- The exhausted finite disk allowance holds for an explicit owner Resume.
+-- Preserve lifetime counts, custody, worker/session affinity and claim posture.
+-- The service holds the exact-generation run lock before this write.
+UPDATE runs SET
+    status = 'recovery_wait', status_since = now(),
+    recovery_wait_cause = 'data_volume_full', recovery_retry_not_before = NULL,
+    recovery_wait_count = recovery_wait_count + 1,
+    session_id = COALESCE(sqlc.narg('session_id'), session_id),
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE id = @id AND worker_id = @worker_id
+  AND status = 'running' AND claim_generation = @claim_generation::bigint
+  AND claim_released_at IS NULL AND COALESCE(stop_kind, '') = ''
+  AND kind NOT IN ('judge', 'job', 'cross_check')
+RETURNING *;
+
+-- name: ResumeDataVolumeFullHold :one
+-- One ordinary queued attempt, without a new allowance, grant or episode.
+-- Custody and all recovery allowances survive Resume.
+-- Preserve started_at and bank the hold only after execution started, as in ResumeWorkerRecoveryEpisode.
+UPDATE runs SET
+    status = 'queued', status_since = now(),
+    recovery_wait_cause = NULL, recovery_retry_not_before = NULL,
+    budget_paused_seconds = runs.budget_paused_seconds
+        + CASE WHEN runs.started_at IS NOT NULL
+               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int)
+               ELSE 0 END,
+    claim_released_at = now(),
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE id = @id AND user_id = @user_id AND status = 'recovery_wait'
+  AND recovery_wait_cause = 'data_volume_full' AND recovery_retry_not_before IS NULL
+  AND recovery_wait_phase IS NULL
+  AND COALESCE(stop_kind, '') = ''
+  AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL
+       OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
+          - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
+RETURNING *;
+
 -- name: ParkRunDataVolumeFull :one
 -- PRD #1809 M5 (D6): the DATA-VOLUME-FULL park writer, the typed sibling of
 -- ParkRunForgeUnreachable — same 'recovery_wait' transition, same backoff-shaping
@@ -3893,6 +3936,7 @@ WITH candidates AS MATERIALIZED (
   AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND (runs.recovery_wait_cause IS DISTINCT FROM 'codex_idle_stall' OR runs.recovery_retry_not_before IS NOT NULL)
   AND (runs.recovery_wait_cause IS DISTINCT FROM 'forge_unreachable' OR runs.recovery_retry_not_before IS NOT NULL)
+  AND (runs.recovery_wait_cause IS DISTINCT FROM 'data_volume_full' OR runs.recovery_retry_not_before IS NOT NULL)
   AND runs.recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
@@ -3953,6 +3997,7 @@ WHERE runs.id = @id AND runs.user_id = @user_id AND runs.status = 'recovery_wait
   AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND (runs.recovery_wait_cause IS DISTINCT FROM 'codex_idle_stall' OR runs.recovery_retry_not_before IS NOT NULL)
   AND (runs.recovery_wait_cause IS DISTINCT FROM 'forge_unreachable' OR runs.recovery_retry_not_before IS NOT NULL)
+  AND (runs.recovery_wait_cause IS DISTINCT FROM 'data_volume_full' OR runs.recovery_retry_not_before IS NOT NULL)
   AND runs.recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
@@ -4729,7 +4774,8 @@ UPDATE runs SET
     session_id       = COALESCE(sqlc.narg('session_id'), session_id),
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE hold_reason IS DISTINCT FROM 'codex_policy_hold'
+WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'data_volume_full' AND recovery_retry_not_before IS NULL)
+  AND hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (policy_outcome_id IS NULL OR policy_resolved_at IS NOT NULL)
   AND id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_generation > 0)
   AND NOT (status = 'paused' AND COALESCE(hold_reason = 'iteration_budget_exhausted', FALSE))
@@ -4849,7 +4895,8 @@ UPDATE runs SET
          WHERE run_user_inputs.run_id = @id AND kind = 'follow_up' AND applied_at IS NOT NULL))),
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE hold_reason IS DISTINCT FROM 'codex_policy_hold'
+WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'data_volume_full' AND recovery_retry_not_before IS NULL)
+  AND hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (policy_outcome_id IS NULL OR policy_resolved_at IS NOT NULL)
   AND id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_generation > 0)
   AND NOT (status = 'paused' AND COALESCE(hold_reason = 'iteration_budget_exhausted', FALSE))
@@ -4968,7 +5015,8 @@ UPDATE runs SET
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
-WHERE runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'data_volume_full' AND recovery_retry_not_before IS NULL)
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
   AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason = 'iteration_budget_exhausted', FALSE))
@@ -5060,7 +5108,8 @@ UPDATE runs SET
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
-WHERE hold_reason IS DISTINCT FROM 'codex_policy_hold'
+WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'data_volume_full' AND recovery_retry_not_before IS NULL)
+  AND hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (policy_outcome_id IS NULL OR policy_resolved_at IS NOT NULL)
   AND id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_generation > 0)
   AND NOT (status = 'paused' AND COALESCE(hold_reason = 'iteration_budget_exhausted', FALSE))

@@ -295,7 +295,8 @@ func TestProviderProgressDiskPolicyLiveDB(t *testing.T) {
 				}
 				assertProgressStreak(t, e.ppRun(t, id), 3, pgconv.Time(start))
 			case "cap":
-				if status != "failed" || origin.String != recoveryCauseDataVolumeFull || disk != 3 {
+				// #3969: the disk park cap holds for the owner (NULL retry stamp) instead of failing.
+				if status != "recovery_wait" || cause.String != recoveryCauseDataVolumeFull || run.RecoveryRetryNotBefore.Valid || run.FinishedAt.Valid || origin.Valid || disk != 3 {
 					t.Fatalf("cap: %+v disk=%d", run, disk)
 				}
 				assertProgressStreak(t, e.ppRun(t, id), 3, pgconv.Time(start))

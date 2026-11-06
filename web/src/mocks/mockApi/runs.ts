@@ -18,6 +18,7 @@ import { changedMilestones } from "../../lib/milestoneReset";
 import { ApiError } from "../../lib/apiError";
 import { isCredentialSwitchRefusedLane } from "../../lib/credentialOverride";
 import { credentialSwitchHold } from "../../lib/credentialSwitchHold";
+import { diskWaitMode } from "../../lib/diskRecovery";
 import { isTerminalRun } from "../../lib/runStatus";
 import {
   LIVE_RUN_ID,
@@ -807,6 +808,8 @@ export const runsApi = {
     // is lost); an unsettled hold takes the override and requeues.
     const switchHold = credentialSwitchHold(run);
     if (switchHold === "settling") throw new ApiError(409, CREDENTIAL_SWITCH_SETTLING_REFUSAL);
+    if (diskWaitMode(run) === "held")
+      throw new ApiError(409, "data_volume_full held: use Resume before switching its token");
     credentialSwitched.add(id);
     patchRun(id, {
       credential_override: overrideToRead(body),
@@ -1023,10 +1026,9 @@ export const runsApi = {
 
   // PRD #1190 (D14): resume a `paused` run via the widened /resume-now endpoint. Mirrors
   // ResumePausedRun — paused → queued (the mock has no budget clock to bank, but the
-  // transition is what un-parks it). Owner-scoped; a 409 naming the status on any run that
-  // is neither paused nor pool_wait, so the panel's inline "no longer paused" note is
-  // reachable when a second click races the refetch. Also accepts a pool_wait run, since
-  // the real endpoint dispatches on status.
+  // transition is what un-parks it). Also accepts pool_wait and the supported recovery
+  // holds; a disk hold requires explicit NULL retry timing. Owner-scoped; a second click
+  // after the run is queued gets a 409 naming its status.
   resumeRun: async (id: string) => {
     const run = getRun(id);
     if (!run) throw new ApiError(404, "run not found");
@@ -1036,10 +1038,13 @@ export const runsApi = {
       throw new ApiError(404, "run not found");
     const forgeHeld = run.status === "recovery_wait" && run.recovery_wait_cause === "forge_unreachable" && run.recovery_retry_not_before === null;
     const memoryHeld = run.status === "recovery_wait" && run.recovery_wait_cause === "worker_memory_pressure";
-    if (run.status !== "paused" && run.status !== "pool_wait" && !memoryHeld && !forgeHeld)
+    const diskHeld = diskWaitMode(run) === "held";
+    if (run.status !== "paused" && run.status !== "pool_wait" && !memoryHeld && !forgeHeld && !diskHeld)
       throw new ApiError(409, `run is ${run.status}`);
     const iterationHeld = run.status === "paused" && run.hold_reason === "iteration_budget_exhausted";
-    if (iterationHeld) {
+    const diskWallLimited = diskHeld && run.kind !== "chat" && run.kind !== "judge" &&
+      run.interactive !== true && run.started_at != null;
+    if (iterationHeld || diskWallLimited) {
       const total = run.budget_total_seconds ??
         (run.budget_wall_seconds ?? 6 * 3600) + (run.budget_extension_seconds ?? 0) + (run.budget_finalize_seconds ?? 0);
       if (run.budget_used_seconds != null && total - run.budget_used_seconds <= 0)
@@ -1062,8 +1067,10 @@ export const runsApi = {
         health_reason: "Owner resumed one bounded forge attempt; origin cooldown and other admission limits may still block execution.",
       } : {}),
       ...(memoryHeld ? { memory_hold: undefined, recovery_wait_cause: null, recovery_retry_not_before: null } : {}),
+      ...(diskHeld ? { recovery_wait_cause: null, recovery_retry_not_before: null,
+        recovery_wait_phase: null, health: "ok", health_reason: null, health_since: null } : {}),
       ...(switchHold === "unsettled" ? { hold_reason: null, status_since: new Date().toISOString() } : {}),
-      ...(run.hold_reason === "provider_unavailable" ? {
+      ...(!diskHeld && run.hold_reason === "provider_unavailable" ? {
         provider_park_count: 0, provider_park_streak_started_at: null, can_stop_at_provider_hold: false,
       } : {}),
     });
