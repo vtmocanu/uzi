@@ -131,6 +131,7 @@ import {
   type RecoverySettleResponse,
   type BaseAttestationHoldOutcome,
   BASE_ATTESTATION_HOLD_REASON,
+  REPO_AGENT_SOURCE_HOLD_REASON,
 } from "./protocol.js";
 
 export type PlanCrossCheckGateReason = "revise" | "block" | "malformed" | "model_error" | "model_timeout"
@@ -3080,6 +3081,8 @@ export class WorkerClient {
           // can recognise a SERVER-side wall park (paused + budget_exhausted) on a fenced stale ACK.
           if (fields.holdReason !== undefined)
             ack.holdReason = fields.holdReason;
+          if (fields.repoAgentSourceCommit !== undefined)
+            ack.repoAgentSourceCommit = fields.repoAgentSourceCommit;
           if (fields.budgetMaxIterations !== undefined)
             ack.budgetMaxIterations = fields.budgetMaxIterations;
           if (fields.budgetWallSeconds !== undefined)
@@ -4529,13 +4532,32 @@ export class WorkerClient {
       return { outcome: "unknown", detail: "no claim generation to fence the hold" };
     }
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/base-attestation-hold`;
+    return this.requestPreflightHold(path, { head: args.head, claim_generation: args.claimGeneration }, BASE_ATTESTATION_HOLD_REASON, signal);
+  }
+
+  async requestRepoAgentSourceHold(
+    runId: string,
+    args: { commit: string; claimGeneration: number },
+    signal?: AbortSignal,
+  ): Promise<BaseAttestationHoldOutcome> {
+    if (!Number.isSafeInteger(args.claimGeneration) || args.claimGeneration <= 0) {
+      return { outcome: "unknown", detail: "no claim generation to fence the hold" };
+    }
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/repo-agent-source-hold`;
+    return this.requestPreflightHold(path, { commit: args.commit, claim_generation: args.claimGeneration }, REPO_AGENT_SOURCE_HOLD_REASON, signal);
+  }
+
+  private async requestPreflightHold(
+    path: string,
+    body: Record<string, unknown>,
+    reason: string,
+    signal?: AbortSignal,
+  ): Promise<BaseAttestationHoldOutcome> {
     try {
-      const res = await this.fetchRaw(
-        "POST", path, { head: args.head, claim_generation: args.claimGeneration }, this.httpTimeoutMs, signal,
-      );
+      const res = await this.fetchRaw("POST", path, body, this.httpTimeoutMs, signal);
       if (res.status === 200) {
         const fields = await readRunAck(res);
-        if (fields.status === "paused" && fields.holdReason === BASE_ATTESTATION_HOLD_REASON) {
+        if (fields.status === "paused" && fields.holdReason === reason) {
           return { outcome: "held", status: fields.status };
         }
         return { outcome: "unknown", detail: `unexpected hold acknowledgement (status ${fields.status ?? "none"})` };
@@ -5659,6 +5681,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   memoryParkUndisposed?: boolean;
   status?: string;
   holdReason?: string | null;
+  repoAgentSourceCommit?: string;
   budgetMaxIterations?: number;
   budgetWallSeconds?: number;
   contractRevision?: number;
@@ -5710,6 +5733,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
         // PRD #1497 M2: the run's hold_reason on the RunDTO, read beside `status` to recognise a
         // SERVER-side wall park (paused + budget_exhausted) from a fenced stale-claim ACK.
         hold_reason?: unknown;
+        repo_agent_source_commit?: unknown;
         budget_max_iterations?: unknown;
         budget_wall_seconds?: unknown;
         // Issue #1626: the frozen completion-contract revision (RunDTO.completion_revision).
@@ -5753,6 +5777,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       memoryParkUndisposed?: boolean;
       status?: string;
       holdReason?: string | null;
+      repoAgentSourceCommit?: string;
       budgetMaxIterations?: number;
       budgetWallSeconds?: number;
       contractRevision?: number;
@@ -5813,6 +5838,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     // non-string (older server that omits it, a null hold, an unparseable value) leaves it absent,
     // which the ServerWallParkedError check reads as "no hold" (never a wall park).
     if (typeof run?.hold_reason === "string") out.holdReason = run.hold_reason;
+    if (typeof run?.repo_agent_source_commit === "string" && /^[0-9a-f]{40}$/.test(run.repo_agent_source_commit))
+      out.repoAgentSourceCommit = run.repo_agent_source_commit;
     if (typeof run?.budget_max_iterations === "number")
       out.budgetMaxIterations = run.budget_max_iterations;
     if (typeof run?.budget_wall_seconds === "number")

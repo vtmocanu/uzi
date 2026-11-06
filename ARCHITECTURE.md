@@ -2043,8 +2043,9 @@ Four independent layers, any one of which failing still leaves the others:
    projects has. The one deliberate, user-gated exception is per-run agent
    selection (PRD #37): the *worker* parses `.claude/agents/*.md` (or, issue #2085,
    `.codex/agents/*.toml`, projected onto the same shape; the harness's native
-   folder wins, never merged) itself and
-   feeds them through the same programmatic `agents` map, only when the user
+   folder wins, never merged) itself, from git objects at the default-branch
+   commit the run recorded on its first claim (issue #3913), never from the
+   working tree, and feeds them through the same programmatic `agents` map, only when the user
    picks the repo source at the plan gate. `settingSources` stays `[]`; repo
    hooks/settings/commands never load; and repo subagents are still bound by
    the `disallowedTools` list and the deny-hook above. See the Repo agents docs

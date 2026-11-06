@@ -608,6 +608,8 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 		clauses = append(clauses, credentialSwitchAction(r))
 	case holdBaseAttestation:
 		clauses = append(clauses, baseAttestationAction(r))
+	case holdRepoAgentSource:
+		clauses = append(clauses, "resume once the repository can be fetched: uzi run resume "+cellText(r.ID))
 	case holdWeeklyReserve:
 		clauses = append(clauses, weeklyReserveAction(r))
 	}
@@ -636,6 +638,8 @@ func holdReasonLabel(reason string) string {
 		return "credential switch unsettled"
 	case holdBaseAttestation:
 		return "base not attested"
+	case holdRepoAgentSource:
+		return "repo agents unreadable"
 	case holdWeeklyReserve:
 		return "weekly usage reserve"
 	default:

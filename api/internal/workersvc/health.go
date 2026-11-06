@@ -216,7 +216,8 @@ const (
 	// NON-BYPASSABLE block: ClaimRun's standalone guard clause sits outside fn_worker_can_claim,
 	// required_capabilities and the capability-aware kill-switch, so an all-old-image fleet
 	// leaves the run queued until a worker that enforces the guard comes online.
-	reasonNoCIConfigGuardCapableWorker = "no online worker enforces the CI-config push guard (ci_config_guard_v1); provision a capable worker"
+	reasonNoCIConfigGuardCapableWorker   = "no online worker enforces the CI-config push guard (ci_config_guard_v1); provision a capable worker"
+	reasonNoRepoAgentSourceCapableWorker = "no online worker reads repo agents at a recorded default-branch revision (repo_agent_source_v1); upgrade a worker"
 	// reasonNoCodexCapableWorker (PRD #1332 M5A, D3) is emitted for a CODEX-INDICATING queued run
 	// (harness='codex', or a surviving M1 binding sentinel) whose owner has NO online worker
 	// advertising the 'codex_harness_v1' protocol capability. Like reasonNoCompletionCapableWorker
@@ -1477,6 +1478,18 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 			slog.Error("health: count online workers satisfying CI-config guard", "run_id", r.ID, "error", gerr)
 		} else if g == 0 {
 			return reasonNoCIConfigGuardCapableWorker
+		}
+	}
+	if r.RepoAgentSourceRequired || r.RepoAgentSourceCommit.Valid {
+		if q, ok := s.q.(interface {
+			CountOnlineWorkersSatisfyingRepoAgentSource(context.Context, uuid.UUID) (int64, error)
+		}); ok {
+			n, err := q.CountOnlineWorkersSatisfyingRepoAgentSource(ctx, r.UserID)
+			if err != nil {
+				slog.Error("health: count repo agent source capable workers", "run_id", r.ID, "error", err)
+			} else if n == 0 {
+				return reasonNoRepoAgentSourceCapableWorker
+			}
 		}
 	}
 	if r.Kind == "prompt" && r.CiConfigGuard && r.CiArtifactsAttached {

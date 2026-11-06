@@ -264,7 +264,8 @@ type ClaimPayload struct {
 	// the feed (runs.require_base_match, PRD #209 M4 Open Question 3). Always present (the
 	// column is NOT NULL); false for every run that did not opt in, so an old worker that
 	// ignores it, and every non-seeded run, keep today's behaviour.
-	RequireBaseMatch bool `json:"require_base_match"`
+	RequireBaseMatch      bool    `json:"require_base_match"`
+	RepoAgentSourceCommit *string `json:"repo_agent_source_commit,omitempty"`
 	// AgentSelection is the run's PERSISTED subagent selection (runs.agent_source /
 	// agent_exclusions), replayed on every claim. Omitted when the run has none.
 	//

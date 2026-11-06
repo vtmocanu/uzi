@@ -21,7 +21,7 @@ import type { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
 import { GUARDED_LANE_JOIN_MS } from "./claude-command/lane.js";
 import type { CapturedMemoryContext } from "./codex/broker.js";
 import type { BaseAttestationHoldOutcome, MemoryIncarnation, MemoryParkReference, WorkerMemoryPressureResult } from "./protocol.js";
-import { BASE_ATTESTATION_HOLD_REASON, CAPABILITY_INFERENCE_EVIDENCE_FEATURE } from "./protocol.js";
+import { BASE_ATTESTATION_HOLD_REASON, CAPABILITY_INFERENCE_EVIDENCE_FEATURE, REPO_AGENT_SOURCE_FEATURE, REPO_AGENT_SOURCE_HOLD_REASON } from "./protocol.js";
 import { PublicationContextLatch, publicationContextReason } from "./publication-context.js";
 import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, HELD_PUBLICATION_FEATURE, CHECKPOINT_PUBLISH_TIMEOUT_MS, CREDENTIAL_SWITCH_HOLD_FEATURE } from "./client.js";
 import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
@@ -141,11 +141,12 @@ import {
 } from "./recovery-settlement.js";
 import {
   describeRepoAgentNote,
-  detectRepoAgents,
+  detectRepoAgentsAtRevision,
   repoAgentSummaries,
   type DetectedRepoAgents,
   type RepoAgentFolder,
   type RepoAgentHarness,
+  type RepoAgentRevisionReader,
 } from "./repoagents.js";
 import { CandidateReservationRefusedError, MessageBatcher } from "./batcher.js";
 import type { Outbox, ReportRetirementContext } from "./outbox.js";
@@ -1986,6 +1987,13 @@ export class BaseAttestationMissingError extends Error {
   }
 }
 
+export class RepoAgentSourceUnavailableError extends Error {
+  constructor(message: string, readonly commit: string, readonly beforeSeed = false) {
+    super(message);
+    this.name = "RepoAgentSourceUnavailableError";
+  }
+}
+
 /** issue #3194: everything the `--require-base` decision reads, gathered by the runner. */
 export interface RequiredBaseInput {
   plannedBase: string;
@@ -2398,6 +2406,7 @@ interface RunFlight {
   initialPlanningEligible?: boolean;
   policyReservation?: symbol;
   forgeCloneSuccess?: AbortController;
+  defaultBranchTip?: string;
   operationAdmission?: CodexOperationController;
   operationScope?: ReturnType<typeof acquireCodexOperationScope>;
   releaseOperationAdmission?: () => void;
@@ -3017,7 +3026,7 @@ export interface RunnerOptions {
   github?: ForgeClient;
   /** Injected for tests; default is the real `.claude/agents/` / `.codex/agents/` parser (PRD #37).
    *  A seam so a test can drive the detection-failure path deterministically. */
-  detectRepoAgents?: (worktreePath: string, harness: RepoAgentHarness) => Promise<DetectedRepoAgents>;
+  detectRepoAgents?: (source: RepoAgentRevisionReader, harness: RepoAgentHarness) => Promise<DetectedRepoAgents>;
   /** Injected for tests; default runs the uzi test suites as real subprocesses. A
    *  self_improve run's MR carries these results as its own evidence (PRD #46). */
   checkRunner?: CheckRunner;
@@ -3236,7 +3245,7 @@ export class RunRunner {
   /** issue #3865: the configured governor even when disabled; read only for `effectiveHardThreshold()`. */
   private readonly diskThresholdSource: DiskGovernor | undefined;
   private readonly detect: (
-    worktreePath: string,
+    source: RepoAgentRevisionReader,
     harness: RepoAgentHarness,
   ) => Promise<DetectedRepoAgents>;
   // Optional test override; production builds it per-run with the scrubbed check env
@@ -3489,7 +3498,7 @@ export class RunRunner {
       },
       log: this.log,
     });
-    this.detect = opts.detectRepoAgents ?? detectRepoAgents;
+    this.detect = opts.detectRepoAgents ?? detectRepoAgentsAtRevision;
     this.checkRunner = opts.checkRunner;
     // PRD #1391 M2: spill collaborators, threaded into each run's batcher (buildFlight).
     this.outbox = opts.outbox;
@@ -6085,6 +6094,9 @@ export class RunRunner {
         // never failed, so it reports NO terminal state and keeps its clone and custody on every
         // outcome of the hold request (enterBaseAttestationHold).
         await this.enterBaseAttestationHold(claim, flight, err, runLog);
+      } else if (err instanceof RepoAgentSourceUnavailableError && this.client.protocolFeatures.includes(REPO_AGENT_SOURCE_FEATURE)) {
+        await this.enterRepoAgentSourceHold(claim, flight, err, runLog);
+        if (err.beforeSeed && flight.parked) await this.settleUnadoptedGuardedClaim(claim, flight, runLog, true);
       } else if (codexDeferralOf(err) !== undefined) {
         // Codex credentials were deferred by a vault lock, an unknown boundary refresh,
         // or exhausted epoch-start release retries. Vault locks also arise mid-turn.
@@ -7800,14 +7812,14 @@ export class RunRunner {
    * on any doubt; this method only gates on the flight never having reached a clone. Best-effort:
    * it never throws and never changes the run's honest report.
    */
-  private async settleUnadoptedGuardedClaim(claim: ClaimResponse, flight: RunFlight, runLog: Logger): Promise<void> {
+  private async settleUnadoptedGuardedClaim(claim: ClaimResponse, flight: RunFlight, runLog: Logger, fetchedOnly = false): Promise<void> {
     if (flight.cancellationBudget && this.cancellationExpired(flight)) return;
     if (!MaintenanceBudget.current() && flight.cancellationBudget) {
-      return this.runCancellationMaintenance(flight, () => this.settleUnadoptedGuardedClaim(claim, flight, runLog)).catch(() => undefined);
+      return this.runCancellationMaintenance(flight, () => this.settleUnadoptedGuardedClaim(claim, flight, runLog, fetchedOnly)).catch(() => undefined);
     }
     if (claim.inventory_guarded !== true || !claim.claim_generation || !this.recovery.enabled ||
         !isCodePublishingKind(resolveRunKind(claim.kind)) ||
-        flight.barePath !== undefined || flight.worktreePath !== undefined || flight.runnerClone !== undefined) return;
+        (flight.barePath !== undefined && !fetchedOnly) || flight.worktreePath !== undefined || flight.runnerClone !== undefined) return;
     try {
       const outcome = await this.recovery.settleUnadoptedGuardedGeneration({
         runId: claim.run_id, generation: claim.claim_generation,
@@ -13732,6 +13744,7 @@ export class RunRunner {
     // a run's first claim and every Codex run. The worker-wide check runs on EVERY claim.
     await this.checkWorkerResidueBeforeFetch(runId, "pre_clone", runLog);
     let barePath: string;
+    const defaultBranch = this.defaultBranchCapture(claim);
     try {
       // PRD #1809 D6: a clone/fetch that fails because the data volume is full runs the D7
       // reclaim and retries once; still full → DataVolumeFullError, which executeClaim parks
@@ -13755,14 +13768,21 @@ export class RunRunner {
                 flight.forgeCloneSuccess.signal, flight.cancel.signal, this.shutdownSignal.signal,
               ]));
             },
+            defaultBranch,
           ),
       );
+      flight.defaultBranchTip = defaultBranch?.tip;
     } catch (err) {
       if (err instanceof DataVolumeFullError) throw err;
       if (classifyForgeError(err) === "transient") {
         throw new ForgeUnreachableAtCloneError(errMessage(err), err);
       }
       throw err;
+    }
+    const capturedSource = this.capturedRepoAgentSource(claim, flight.defaultBranchTip);
+    if ("unresolved" in capturedSource && !claim.repo_agent_source_commit && claim.publication_resume === undefined &&
+        this.client.protocolFeatures.includes(REPO_AGENT_SOURCE_FEATURE)) {
+      throw new RepoAgentSourceUnavailableError(capturedSource.unresolved, "", true);
     }
     // issue #1783 M2: attempt-path mode mints this attempt's id BEFORE the seed: it names the
     // fresh attempt clone path, and the journal, the ledger and the attempt marker reuse it.
@@ -14256,16 +14276,21 @@ export class RunRunner {
     }
     if (requireBase && barePath) {
       const identity = runnerClone.adoptedContentSource ?? runnerClone.adoptedSource;
-      evaluateRequiredBase({
-        plannedBase: claim.planned_base_commit!,
-        identity,
-        attestedSource: flight.checkpointClaimEvidence.attestedSource,
-        continuation: runnerClone.seededFrom === "tracking" || runnerClone.seededFrom === "checkpoint",
-        wipCherryPicked: runnerClone.wipCherryPicked === true,
-        planned: await this.git.resolveCommitUnique(barePath, claim.planned_base_commit!),
-        identityTree: await this.git.commitTreeOid(barePath, identity),
-        materializedTree: await this.git.indexTreeOid(runnerClone.path),
-      });
+      try {
+        evaluateRequiredBase({
+          plannedBase: claim.planned_base_commit!,
+          identity,
+          attestedSource: flight.checkpointClaimEvidence.attestedSource,
+          continuation: runnerClone.seededFrom === "tracking" || runnerClone.seededFrom === "checkpoint",
+          wipCherryPicked: runnerClone.wipCherryPicked === true,
+          planned: await this.git.resolveCommitUnique(barePath, claim.planned_base_commit!),
+          identityTree: await this.git.commitTreeOid(barePath, identity),
+          materializedTree: await this.git.indexTreeOid(runnerClone.path),
+        });
+      } catch (err) {
+        if (err instanceof BaseAttestationMissingError) await this.pinRepoAgentSourceBeforeHold(claim, flight);
+        throw err;
+      }
       flight.baseAccepted = true;
     }
     const staleWarning = requireBase ? undefined : evaluateBaseStaleness(
@@ -14281,30 +14306,38 @@ export class RunRunner {
       });
     }
 
-    // PRD #37: parse the checked-out repo's own agent roster and report it on
+    // PRD #37: parse the repo's own agent roster and report it on
     // this first post-checkout `running` state report. It rides the STATE report
     // rather than the gate so that an autopilot run — which never parks at
     // awaiting_approval — records what was detected just the same. The roster is
     // inert data: nothing is assembled until a selection picks the repo source.
     const detection = await this.parseRepoAgents(
-      runnerClone.path,
+      claim,
+      barePath,
+      flight.defaultBranchTip,
       claim.secrets.codex ? "codex" : "claude",
       batcher,
       runLog,
     );
     const repoAgents = detection.agents;
     const repoAgentFolder = detection.folder;
-    if (detection.ok) {
+    const pinsSource = this.client.protocolFeatures.includes(REPO_AGENT_SOURCE_FEATURE);
+    if (detection.commit !== undefined && pinsSource && !claim.repo_agent_source_commit) {
+      await this.confirmRepoAgentSourcePin(reportState, {
+        status: "running",
+        repo_agents: repoAgentSummaries(repoAgents, this.reportedRepoAgentFolder(repoAgentFolder)),
+        repo_agent_source_commit: detection.commit,
+      }, runLog);
+    } else if (detection.commit !== undefined) {
       // Non-fatal, and fire-and-forget (matching the session-id report below): an
       // INFORMATIONAL roster report must never fail a run. An older API without the
       // repo_agents field 400s DisallowUnknownFields, which the client treats as
       // permanent — awaiting the report here would turn a working run into a failed
-      // one over a field the run does not depend on. On a detection FAILURE we send
-      // no roster at all, so the column stays NULL ("not reported") rather than `[]`
-      // ("scanned, found none") — the two must stay distinguishable.
+      // one over a field the run does not depend on.
       void reportState({
         status: "running",
         repo_agents: repoAgentSummaries(repoAgents, this.reportedRepoAgentFolder(repoAgentFolder)),
+        ...(pinsSource ? { repo_agent_source_commit: detection.commit } : {}),
       }).catch((e) =>
         runLog.warn("could not report repo agent roster", {
           error: errMessage(e),
@@ -23526,6 +23559,51 @@ export class RunRunner {
     refusal: BaseAttestationMissingError,
     runLog: Logger,
   ): Promise<void> {
+    const runId = flight.runId;
+    const identity = { head: flight.runnerClone?.adoptedSource ?? "", claimGeneration: flight.claimGeneration };
+    await this.enterPreflightHold(claim, flight, runLog, {
+      reason: BASE_ATTESTATION_HOLD_REASON,
+      request: (signal) => this.client.requestBaseAttestationHold(runId, identity, signal),
+      heldText: `${refusal.message}. The agent did not start and this worker keeps the work. ` +
+        `Inspect it with \`uzi run recovery ${runId}\`, recover it with ` +
+        `\`uzi run export ${runId} --output <path>\`, or start a successor run.`,
+      unconfirmedText: "--require-base: the adopted work is not attested against the planned base, so the agent " +
+        "did not start. The hold could not be confirmed; this worker keeps the work.",
+      refusal: refusal.message,
+    });
+  }
+
+  private async enterRepoAgentSourceHold(
+    claim: ClaimResponse,
+    flight: RunFlight,
+    refusal: RepoAgentSourceUnavailableError,
+    runLog: Logger,
+  ): Promise<void> {
+    const runId = flight.runId;
+    const identity = { commit: refusal.commit, claimGeneration: flight.claimGeneration };
+    await this.enterPreflightHold(claim, flight, runLog, {
+      reason: REPO_AGENT_SOURCE_HOLD_REASON,
+      request: (signal) => this.client.requestRepoAgentSourceHold(runId, identity, signal),
+      heldText: `${refusal.message}. The agent did not start and this worker keeps the work. ` +
+        `Resume the run once the repository can be fetched again, or cancel it.`,
+      unconfirmedText: "the repo-agent source revision could not be read, so the agent did not start. " +
+        "The hold could not be confirmed; this worker keeps the work.",
+      refusal: refusal.message,
+    });
+  }
+
+  private async enterPreflightHold(
+    claim: ClaimResponse,
+    flight: RunFlight,
+    runLog: Logger,
+    hold: {
+      reason: string;
+      request: (signal: AbortSignal) => Promise<BaseAttestationHoldOutcome>;
+      heldText: string;
+      unconfirmedText: string;
+      refusal: string;
+    },
+  ): Promise<void> {
     const { batcher } = flight;
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
@@ -23534,17 +23612,16 @@ export class RunRunner {
     // ONE request identity for every attempt (this run, this generation, this captured head) and
     // ONE absolute deadline fixed here: requests, ownership reads and backoffs all spend it, and no
     // step starts a fresh timer.
-    const identity = { head: flight.runnerClone?.adoptedSource ?? "", claimGeneration: flight.claimGeneration };
     const deadline = Date.now() + this.completionHoldReconcileTimeoutMs;
     const remaining = () => deadline - Date.now();
     // The client classifies every answer and never throws; the catch keeps a defect there from
     // escaping into the dispatcher, which would skip the retain-and-stop below.
-    const request = () => this.client.requestBaseAttestationHold(runId, identity, AbortSignal.timeout(Math.max(1, remaining())))
+    const request = () => hold.request(AbortSignal.timeout(Math.max(1, remaining())))
       .catch((e: unknown): BaseAttestationHoldOutcome => ({ outcome: "unknown", detail: errMessage(e) }));
     let ack = await request();
     for (let attempt = 1; ack.outcome === "unknown" && attempt < BASE_ATTESTATION_HOLD_ATTEMPTS; attempt++) {
       if (remaining() <= 0) break;
-      const proof = await this.observeBaseAttestationHold(flight, deadline, runLog);
+      const proof = await this.observeBaseAttestationHold(flight, deadline, runLog, hold.reason);
       if (proof) {
         ack = proof;
         break;
@@ -23554,34 +23631,28 @@ export class RunRunner {
       ack = await request();
     }
     if (ack.outcome === "unknown" && remaining() > 0)
-      ack = (await this.observeBaseAttestationHold(flight, deadline, runLog)) ?? ack;
+      ack = (await this.observeBaseAttestationHold(flight, deadline, runLog, hold.reason)) ?? ack;
     if (ack.outcome === "held") {
       flight.parked = true;
       flight.holdOrWallParkConfirmed = true;
       batcher.emit({
         kind: "status",
         agent: "worker",
-        payload: {
-          text: `${refusal.message}. The agent did not start and this worker keeps the work. ` +
-            `Inspect it with \`uzi run recovery ${runId}\`, recover it with ` +
-            `\`uzi run export ${runId} --output <path>\`, or start a successor run.`,
-        },
+        payload: { text: hold.heldText },
       });
-      runLog.info("run held on base_attestation_missing; clone, HOME and custody retained", { run_id: runId });
+      runLog.info("run held before the agent started; clone, HOME and custody retained", { run_id: runId, hold_reason: hold.reason });
     } else {
       batcher.emit({
         kind: "status",
         agent: "worker",
-        payload: {
-          text: "--require-base: the adopted work is not attested against the planned base, so the agent " +
-            "did not start. The hold could not be confirmed; this worker keeps the work.",
-        },
+        payload: { text: hold.unconfirmedText },
       });
-      runLog.warn("base attestation hold not confirmed; ending the flight non-terminal with clone and custody retained", {
+      runLog.warn("preflight hold not confirmed; ending the flight non-terminal with clone and custody retained", {
         run_id: runId,
+        hold_reason: hold.reason,
         claim_generation: claim.claim_generation,
         outcome: ack.outcome,
-        refusal: refusal.message,
+        refusal: hold.refusal,
         ...(ack.outcome === "unknown" ? { detail: ack.detail } : { server_status: ack.status }),
       });
     }
@@ -23592,7 +23663,7 @@ export class RunRunner {
    *  `held` (this generation, live claim, paused on base_attestation_missing), `stale` (another
    *  generation, a released claim, a terminal run), or undefined (no proof, including a failed read). */
   private async observeBaseAttestationHold(
-    flight: RunFlight, deadline: number, runLog: Logger,
+    flight: RunFlight, deadline: number, runLog: Logger, reason: string,
   ): Promise<BaseAttestationHoldOutcome | undefined> {
     try {
       const own = await this.getObservedRunOwnership(flight, { deadline });
@@ -23602,7 +23673,7 @@ export class RunRunner {
         return { outcome: "stale", status: own.status };
       }
       if (generation === flight.claimGeneration && own.status === "paused" &&
-          own.hold_reason === BASE_ATTESTATION_HOLD_REASON) {
+          own.hold_reason === reason) {
         return { outcome: "held", status: own.status };
       }
     } catch (e) {
@@ -24361,29 +24432,70 @@ export class RunRunner {
     return this.client.protocolFeatures.includes(REPO_AGENT_FOLDER_FEATURE) ? (folder ?? undefined) : undefined;
   }
 
-  /**
-   * Parse the clone's `.claude/agents/*.md` or `.codex/agents/*.toml` (PRD #37, issue #2085), logging every skipped or
-   * clamped file to the run stream. Detection is best-effort by construction: a
-   * repo without the directory has no agents (ok: true, agents: []), and an
-   * enumeration FAILURE (e.g. an unreadable dir) is reported as a warning and a run
-   * message with ok: false — neither is ever a run failure, because a repo's
-   * optional roster must not be able to stop the run it was detected for.
-   *
-   * The `ok` flag is what keeps a detection FAILURE distinguishable from a genuinely
-   * empty roster at the API: the caller reports `repo_agents: []` only when ok, so a
-   * failure leaves the column NULL ("not reported") rather than `[]` ("found none").
-   */
+  private defaultBranchCapture(claim: ClaimResponse): { name: string; tip?: string } | undefined {
+    const name = claim.repo.default_branch?.trim();
+    return name ? { name } : undefined;
+  }
+
+  private capturedRepoAgentSource(claim: ClaimResponse, capturedTip: string | undefined): { commit: string } | { unresolved: string } {
+    const name = claim.repo.default_branch?.trim();
+    if (!name) return { unresolved: "the repository has no configured default branch to read repo agents from" };
+    if (!capturedTip) {
+      return { unresolved: `the default branch ${sanitizeForLog(name)} could not be resolved from this claim's fetch to read repo agents from` };
+    }
+    return { commit: capturedTip };
+  }
+
+  private async pinRepoAgentSourceBeforeHold(claim: ClaimResponse, flight: RunFlight): Promise<void> {
+    const tip = flight.defaultBranchTip;
+    if (!tip || claim.repo_agent_source_commit || !this.client.protocolFeatures.includes(REPO_AGENT_SOURCE_FEATURE)) return;
+    await this.confirmRepoAgentSourcePin(flight.reportState, { status: "running", repo_agent_source_commit: tip }, flight.runLog);
+  }
+
+  private async confirmRepoAgentSourcePin(
+    reportState: RunFlight["reportState"],
+    body: Parameters<RunFlight["reportState"]>[0] & { repo_agent_source_commit: string },
+    runLog: Logger,
+  ): Promise<void> {
+    const commit = body.repo_agent_source_commit;
+    let ack: Awaited<ReturnType<RunFlight["reportState"]>>;
+    try {
+      ack = await reportState(body);
+    } catch (err) {
+      if (isCheckedLifecycleControl(err) || (!(err instanceof RequestError) && !isTransient(err))) throw err;
+      runLog.warn("repo-agent source revision report failed", { commit, error: errMessage(err) });
+      throw new RepoAgentSourceUnavailableError(
+        `the repo-agent source revision ${commit.slice(0, 12)} could not be recorded`, commit);
+    }
+    if (ack.status !== undefined && ack.status !== "running") {
+      runLog.info("repo-agent source revision report answered a run that is not running; stopping before the agent starts", {
+        commit, applied: ack.applied, server_status: ack.status,
+      });
+      if (TERMINAL_RUN_STATUSES.has(ack.status)) throw new RunningAckTerminalError(ack.status);
+      throw new RetainedRecoveryStop();
+    }
+    if (ack.applied !== true || ack.status !== "running" || ack.repoAgentSourceCommit !== commit) {
+      runLog.warn("repo-agent source revision not confirmed", {
+        commit, applied: ack.applied, server_status: ack.status ?? "unknown", stored: ack.repoAgentSourceCommit ?? null,
+      });
+      throw new RepoAgentSourceUnavailableError(
+        `the api did not confirm the repo-agent source revision ${commit.slice(0, 12)}`, commit);
+    }
+  }
+
   private async parseRepoAgents(
-    worktreePath: string,
+    claim: ClaimResponse,
+    barePath: string | undefined,
+    capturedTip: string | undefined,
     harness: RepoAgentHarness,
     batcher: MessageBatcher,
     runLog: Logger,
-  ): Promise<{ agents: AgentTemplate[]; ok: boolean; folder: RepoAgentFolder | null }> {
-    let detected;
-    try {
-      detected = await this.detect(worktreePath, harness);
-    } catch (err) {
-      runLog.warn("repo agent detection failed", { error: errMessage(err) });
+  ): Promise<{ agents: AgentTemplate[]; folder: RepoAgentFolder | null; commit: string | undefined }> {
+    const pinned = claim.repo_agent_source_commit ?? undefined;
+    const failClosed = pinned !== undefined || this.client.protocolFeatures.includes(REPO_AGENT_SOURCE_FEATURE);
+    const unavailable = (message: string, commit: string) => {
+      if (failClosed) throw new RepoAgentSourceUnavailableError(message, commit);
+      runLog.warn("repo agent detection unavailable", { error: message });
       batcher.emit({
         kind: "status",
         agent: "worker",
@@ -24391,7 +24503,29 @@ export class RunRunner {
           text: "could not read the repo's .claude/agents/ or .codex/agents/; continuing with your own agent templates",
         },
       });
-      return { agents: [], ok: false, folder: null };
+      return { agents: [], folder: null, commit: undefined };
+    };
+    if (!barePath) return unavailable("the repo-agent source revision cannot be read: this run has no repository cache", pinned ?? "");
+    let commit: string;
+    if (pinned !== undefined) {
+      if (!/^[0-9a-f]{40}$/.test(pinned)) throw new RepoAgentSourceUnavailableError("the run's recorded repo-agent source revision is malformed", "");
+      const present = await this.git.ensureCommitPresent(barePath, pinned, claim.repo.clone_url, claim.secrets.forge_pat, claim.secrets.forge_username);
+      if (!present) {
+        throw new RepoAgentSourceUnavailableError(
+          `the run's repo-agent source revision ${pinned.slice(0, 12)} is not in the repository cache and could not be fetched`, pinned);
+      }
+      commit = pinned;
+    } else {
+      const source = this.capturedRepoAgentSource(claim, capturedTip);
+      if ("unresolved" in source) return unavailable(source.unresolved, "");
+      commit = source.commit;
+    }
+    let detected: DetectedRepoAgents;
+    try {
+      detected = await this.detect(this.git.revisionTreeReader(barePath, commit), harness);
+    } catch (err) {
+      runLog.warn("repo agent detection failed", { commit, error: errMessage(err) });
+      return unavailable(`the repo's .claude/agents/ or .codex/agents/ could not be read at revision ${commit.slice(0, 12)}`, commit);
     }
     for (const note of detected.notes) {
       batcher.emit({
@@ -24406,15 +24540,17 @@ export class RunRunner {
         kind: "status",
         agent: "worker",
         payload: {
-          text: `detected ${detected.agents.length} agent(s) in the repo's ${detected.folder ?? ".claude/agents"}/: ${names}`,
+          text: `detected ${detected.agents.length} agent(s) in the repo's ${detected.folder ?? ".claude/agents"}/: ${names} (revision ${commit.slice(0, 12)})`,
         },
       });
     }
     runLog.info("repo agents detected", {
       count: detected.agents.length,
       dropped: detected.notes.length,
+      commit,
+      pinned: pinned !== undefined,
     });
-    return { agents: detected.agents, ok: true, folder: detected.folder };
+    return { agents: detected.agents, folder: detected.folder, commit };
   }
 
   /**
@@ -26530,8 +26666,10 @@ export class RunRunner {
           await check();
           await this.checkWorkerResidueBeforeFetch(claim.run_id, "retained_recovery", flight.runLog);
           await check();
+          const defaultBranch = this.defaultBranchCapture(claim);
           await this.git.ensureClone(claim.repo.clone_url, claim.secrets.forge_pat, claim.secrets.forge_username,
-            flight.runKind === "task" ? flight.checkpointCoordinates?.checkpoint_key : undefined);
+            flight.runKind === "task" ? flight.checkpointCoordinates?.checkpoint_key : undefined, undefined, defaultBranch);
+          flight.defaultBranchTip = defaultBranch?.tip;
           await check();
           const captureResult = await this.runFreeCapture(claim, flight, iteration.deadline, signal, async held => {
             const check = async () => {

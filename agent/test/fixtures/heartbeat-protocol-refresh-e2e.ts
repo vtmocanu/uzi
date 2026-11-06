@@ -54,7 +54,7 @@ const heartbeats = () => requests.filter(r => r.path.endsWith("/heartbeat"));
 
 it(name, async () => {
   const registration = await client.register("m3", "base", 4, undefined,
-    ["completion_interlock_v1", "credential_switch_v1"], undefined, 2);
+    ["completion_interlock_v1", "credential_switch_v1", "repo_agent_source_v1"], undefined, 2);
   assert.match(registration.register_nonce!, /^[A-Za-z0-9_-]{43}$/);
   writeFileSync(process.env.UZI_REFRESH_STATE!, JSON.stringify({
     worker_id: registration.worker_id, register_nonce: registration.register_nonce,

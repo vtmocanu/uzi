@@ -3749,6 +3749,13 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   `uzi run recovery <id>`, recover the work with `uzi run export <id>
   --output <path>`, or start a successor run. See [Seeded
   plans](seeded-plans.md).
+  A `paused` run can also be **held because its repo agents could not be
+  read** (`hold_reason: repo_agent_source_unavailable`): the worker could not
+  resolve, record or read the default-branch revision it reads
+  `.claude/agents/` and `.codex/agents/` from, so the agent never started. `run get` prints a
+  `HOLD` row reading `repo agents unreadable`; resume the run with
+  `uzi run resume <id>` once the repository can be fetched, or cancel it. See
+  [Repo agents](repo-agents.md#which-revision-is-read).
 
 For an ordinary pause, human `run get` makes one supplemental message read
 (`tail=100`). Its pause detail reads **paused by the run's lead** for
