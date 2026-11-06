@@ -1066,6 +1066,22 @@ describe("SdkExecutor agent selection at the gate boundary (PRD #37)", () => {
     assert.deepStrictEqual(Object.keys(unset.turns[1]!.options.agents ?? {}).sort(), ["auditor", "coder"]);
   });
 
+  it("PRD #3914: an absent approval on a requested repo run keeps a saved own selection", async () => {
+    const absent: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+    const own = await runWith({ repoAgents: [repoCoder, repoAuditor], requestedAgentSource: "repo",
+      approvedSelection: { source: "own", exclusions: [] } }, absent);
+    assert.deepStrictEqual(Object.keys(own.turns[1]!.options.agents ?? {}).sort(), ["coder", "reviewer"]);
+    assert.strictEqual(own.result.agentSelection!.source, "own");
+  });
+
+  it("PRD #3914: an absent approval on a requested repo run keeps a saved repo selection's exclusions", async () => {
+    const absent: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+    const repo = await runWith({ repoAgents: [repoCoder, repoAuditor], requestedAgentSource: "repo",
+      approvedSelection: { source: "repo", exclusions: ["auditor"] } }, absent);
+    assert.deepStrictEqual(Object.keys(repo.turns[1]!.options.agents ?? {}).sort(), ["coder"]);
+    assert.strictEqual(repo.result.agentSelection!.source, "repo");
+  });
+
   for (const c of REQUESTED_SOURCE_TABLE) {
     it(`PRD #3914 shared call-site table at the gate: ${caseLabel(c)}`, async () => {
       const absent: PlanVerdict = { kind: "approve", selection: { status: "absent" } };

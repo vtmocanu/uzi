@@ -19319,6 +19319,20 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
     assert.equal(result.agentSelection?.source, "own");
   });
 
+  it("PRD #3914: an absent approval on a requested repo run keeps a saved own selection", async () => {
+    const own = await gated({ status: "absent" }, { repoAgents: [repoReviewer], requestedAgentSource: "repo",
+      approvedSelection: { source: "own", exclusions: [] } }, ["coder", "repo-reviewer"]);
+    assert.deepEqual(own.admitted, { coder: true, "repo-reviewer": false });
+    assert.equal(own.result.agentSelection?.source, "own");
+  });
+
+  it("PRD #3914: an absent approval on a requested repo run keeps a saved repo selection's exclusions", async () => {
+    const repo = await gated({ status: "absent" }, { repoAgents: [repoReviewer, repoTester], requestedAgentSource: "repo",
+      approvedSelection: { source: "repo", exclusions: ["repo-tester"] } }, ["repo-reviewer", "repo-tester"]);
+    assert.deepEqual(repo.admitted, { "repo-reviewer": true, "repo-tester": false });
+    assert.equal(repo.result.agentSelection?.source, "repo");
+  });
+
   it("PRD #3914: a pre-approved run with no selection follows the requested source", async () => {
     const own = await preApproved({ repoAgents: [repoReviewer], requestedAgentSource: "own" }, ["coder", "repo-reviewer"]);
     assert.deepEqual(own.admitted, { coder: true, "repo-reviewer": false });

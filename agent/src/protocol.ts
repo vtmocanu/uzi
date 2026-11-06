@@ -2783,6 +2783,14 @@ export function seedAgentSelection(persisted?: AgentSelection | null): AgentSele
   return persisted ? { status: "ok", selection: persisted } : { status: "absent" };
 }
 
+export function gateVerdictSelection(
+  verdict: AgentSelectionParse,
+  persisted: AgentSelection | null | undefined,
+  requested: AgentSource | null | undefined,
+): AgentSelectionParse {
+  return verdict.status === "absent" && requested && persisted ? seedAgentSelection(persisted) : verdict;
+}
+
 /** Body of POST /runs/:id/state. Fields are set per target status.
  *
  *  NOTE FOR ANYONE GREPPING THIS FILE: `plan_md` is declared on FOUR separate
