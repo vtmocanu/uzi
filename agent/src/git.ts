@@ -15251,18 +15251,29 @@ try {
   /**
    * Strict, byte-exact working-tree proof for the inventory FINAL source boundary (issue #2969). Unlike
    * {@link worktreeStatus} it never trusts the index stat cache alone and refuses anything it cannot read exactly:
-   *  1. `status --porcelain=v1 -z --untracked-files=all` with checkStat/trustctime/untrackedCache pinned (non-zero exit or any stderr: unreadable; any output: dirty);
-   *  2. `ls-files -v -z`: any tag but `H` (assume-unchanged, skip-worktree, unmerged) is unreadable;
-   *  3. `ls-files -z --format=...` (mode, id, stage, size, path): a malformed record, a non-zero stage or a gitlink is unreadable; symlinks (mode 120000)
-   *     are covered by step 1 and are not hashed;
-   *  4. a regular file whose path holds an LF, starts with `"` or ends with CR is refused (unreadable) BEFORE any
+   * Steps, in code order:
+   *  1. `ls-files -v -z`: any tag but `H` (assume-unchanged, skip-worktree, unmerged) is unreadable;
+   *  2. `ls-files -z --format=...` (mode, id, stage, declared size, path): a malformed record, a non-zero stage or a
+   *     gitlink is unreadable; symlinks (mode 120000) are covered by status and are not hashed;
+   *  3. a regular file whose path holds an LF, starts with `"` or ends with CR is refused (unreadable) BEFORE any
    *     dispatch: `hash-object --stdin-paths` reads one path per line, C-unquotes a leading quote and strips a
    *     trailing CR, so such a path would hash a different file;
-   *  5. `hash-object --no-filters --stdin-paths` over the exact path bytes (stdin only, never argv);
-   *  6. exactly one object id per path, in order, in the repository's object format (`rev-parse --show-object-format`);
-   *  7. each id must equal the index blob id, else dirty (so content that differs with an unchanged stat is dirty);
-   *  8. an entry or byte cap hit is `over_bound`, including the cumulative index size of the files to hash (maxContentBytes),
-   *     decided before any hash-object dispatch. Every call pins `--git-dir`/`--work-tree` and gets a bounded timeout.
+   *  4. the size cap (over_bound): the declared index size is only a cheap early refusal; the bound is the REAL
+   *     `lstat` `st_size` of every regular entry (64-bit, Buffer path), charged BEFORE status, check-attr or
+   *     hash-object read anything. A non-regular entry is unreadable, a missing one dirty. The entry cap and
+   *     every listing's byte cap are over_bound too;
+   *  5. `status --porcelain=v1 -z --untracked-files=all` with checkStat/trustctime/untrackedCache pinned (non-zero
+   *     exit or any stderr: unreadable; any output: dirty);
+   *  6. `check-attr filter` (defence in depth; see the comment at the call);
+   *  7. `hash-object --no-filters --stdin-paths` over the exact path bytes (stdin only, never argv), exactly one
+   *     object id per path, in order, in the repository's object format (`rev-parse --show-object-format`);
+   *  8. each id must equal the index blob id, else dirty (content that differs with an unchanged stat is dirty).
+   * Every call pins `--git-dir`/`--work-tree` and `GIT_NO_REPLACE_OBJECTS`, and draws on ONE total wall budget.
+   *
+   * The size bound assumes the runner's quiescence proof: a writer that escaped the quiescence scope (cwd outside
+   * the clone, no attempt marker) can still grow a file between the lstat and the hash. The proof then ends `dirty`
+   * or `unreadable` within the wall budget, never `clean`. That broader escaped-writer gap belongs to the separate
+   * writer-enrollment design (#3831).
    * Runs as the runner uid with GIT_OPTIONAL_LOCKS=0 and never decodes a path to a JS string.
    */
   async inventorySourceContentProof(cwd: string, bounds: InventoryContentProofBounds = INVENTORY_CONTENT_PROOF_BOUNDS):
@@ -15303,10 +15314,13 @@ try {
       // index or live ident/eol/encoding expansion all make the declared size smaller than what is read.
       if (contentBytes > maxContentBytes) return "over_bound";
       // The authoritative bound: the REAL st_size of every regular entry, charged before status, check-attr or
-      // hash-object read anything. The path stays bytes (a Buffer path), never a JS string.
+      // hash-object read anything. The path stays bytes (a Buffer path), never a JS string. TOCTOU: this bound
+      // assumes the runner's quiescence proof; an escaped writer (see the docstring, #3831) can grow a file after
+      // this lstat, which ends dirty or unreadable within the wall budget, never clean.
       const root = Buffer.from(cwd + "/");
       let realBytes = 0n;
       for (const f of files) {
+        if (pinned.expired()) return "unreadable";
         let st;
         try { st = await fs.lstat(Buffer.concat([root, f.path]), { bigint: true }); }
         catch (err) { return (err as NodeJS.ErrnoException).code === "ENOENT" ? "dirty" : "unreadable"; }
@@ -15373,7 +15387,7 @@ try {
     if (!st.isDirectory() || st.isSymbolicLink()) return undefined;
     // One budget for every call of this proof, not one per call.
     const endsAt = Math.min(Date.now() + INVENTORY_PROOF_TOTAL_BUDGET_MS, bounds.deadlineAt ?? Infinity);
-    return async (args: string[], input?: Buffer) => {
+    const call = async (args: string[], input?: Buffer) => {
       const remaining = endsAt - Date.now();
       if (remaining <= 0) return undefined;
       // GIT_NO_REPLACE_OBJECTS: a replace ref must not make the proof read a different blob than the index names.
@@ -15383,6 +15397,7 @@ try {
         timeoutMs: remaining, ...(input ? { input } : {}),
       });
     };
+    return Object.assign(call, { expired: () => Date.now() >= endsAt });
   }
 
   /**

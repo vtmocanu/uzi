@@ -369,6 +369,21 @@ describe("inventorySourceContentProof (issue #2969 D5)", () => {
     assert.equal(await f.proof({ ...bounds, maxContentBytes: 16 * 1024 * 1024 }), "dirty", "within the cap it is hashed, and the content differs from the blob");
   });
 
+  test("a budget spent before the lstat charge ends unreadable without status or hashing", async t => {
+    const f = fixture(t);
+    fs.writeFileSync(path.join(f.root, "a.txt"), "a\n");
+    f.commitAll();
+    const seam = f.git as unknown as Seam;
+    const inner = seam.runGitAsRunnerBytes;
+    seam.runGitAsRunnerBytes = async (cwd, args, opts) => {
+      const out = await inner(cwd, args, opts);
+      if (args.some(a => a.startsWith("--format"))) await new Promise(resolve => setTimeout(resolve, 80));
+      return out;
+    };
+    assert.equal(await f.proof({ maxEntries: 10, maxBytes: 1 << 20, deadlineAt: Date.now() + 40 }), "unreadable");
+    assert.equal(f.calls.filter(c => ["status", "check-attr", "hash-object"].includes(c.args[0]!)).length, 0);
+  });
+
   test("every git call pins --git-dir and --work-tree to the clone", async t => {
     const f = fixture(t);
     fs.writeFileSync(path.join(f.root, "a.txt"), "a\n");
