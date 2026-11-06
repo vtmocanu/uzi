@@ -494,13 +494,16 @@ A plan cross-check run (gated, or required with `auto_approve` cleared at a forc
 that is not auto-approved stays at `awaiting_approval` while its lead works a HUMAN revise. When
 the lead asks a clarification, the run parks at `awaiting_input`. An answer is not plan approval,
 so `SetRunRunning`'s bound-approval clause refuses an ordinary `running` settlement there, and
-the run used to fail with "clarification running settlement was not confirmed". Decisions:
+an issue run (or any run with `plan_revision_retry` negotiated) failed with "clarification
+running settlement was not confirmed"; other callers' unconfirmed `running` was refused
+silently. Decisions:
 
 - **Dedicated settlement, not a relaxed `running`.** A worker that negotiated
   `clarification_revision_settlement_v1` reports `clarification_settled` with the question,
   the pending revise input and its gate revision. A claim-fenced writer returns the run to
-  `awaiting_approval`. It requires the applied answer to the open question and the pending,
-  bound, unapplied revise consumed by this worker and claim generation. It refuses when a bound
+  `awaiting_approval`. It requires an `issue`, `prompt` or `ci_fix` run with no open
+  completion question, the applied answer to the open question, and the pending, bound,
+  unapplied, non-empty revise consumed by this worker and claim generation. It refuses when a bound
   approval was already applied. It writes only status, timestamps, the question markers and the
   banked question wait. `SetRunRunning` is unchanged, because its SET can freeze candidate
   milestones, contract and budget fields.
@@ -508,7 +511,8 @@ the run used to fail with "clarification running settlement was not confirmed". 
   lead's next presentation does, at gate revision N+1, which only a newly bound approval passes.
 - **D16 unchanged.** No checker pass and no new presentation; plan text, candidate, gate
   revision and payload are untouched.
-- **Capability matrix.** Old worker or old api: fail-closed, as before. A new worker sends the
+- **Capability matrix.** Old worker or old api: fail-closed (a new worker on an old api awaits
+  its `running` report for every caller and stops on the refusal). A new worker sends the
   settlement only after the api advertised it, never strips it or retries it as an unqualified
   `running`, and accepts only an applied `awaiting_approval` ACK carrying the
   `clarification_settled` disposition.
