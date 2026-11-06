@@ -641,6 +641,12 @@ export async function openAuthorityStore(tx: AuthorityTransaction, options: Auth
   });
 }
 
+/** Issue #3644: the authority store's derived MAC key, for sibling records (restore boundary) that share it under their own domain label. */
+export function deriveAuthorityKey(workerToken: string): Buffer {
+  if (workerToken === "") throw new AuthorityRefusal("worker token required to authenticate authority state");
+  return createHmac("sha256", workerToken).update(KEY_LABEL).digest();
+}
+
 /** The worker incarnation a store opened without an explicit `workerIncarnation` writes its slots under. */
 export function processWorkerIncarnation(): string { return PROCESS_INCARNATION; }
 

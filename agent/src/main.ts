@@ -4,6 +4,7 @@ import { loadConfig, memoryGuardTimingOf, MAX_CONCURRENT_RUNS_SOFT_CEILING, type
 import { configureGoConcurrency } from "./go-concurrency.js";
 import { acquireWorkerLifetime } from "./authority-lock.js";
 import { installWorkerLifetime, requireWorkerLifetime } from "./completion-authority.js";
+import { establishProcessBoundary } from "./restore-boundary.js";
 import { AuthorityRuntime } from "./authority-runtime.js";
 import { createLogger, type Logger } from "./log.js";
 import { startMainWatchdog } from "./main-watchdog.js";
@@ -444,6 +445,12 @@ async function mainBody(): Promise<void> {
   // descriptor is retained for the whole process; nothing here can release it.
   installWorkerLifetime(await acquireWorkerLifetime(config.dataDir, { signal: controller.signal }));
   log.info("worker lifetime lock acquired");
+  // Issue #3644 Gate B: the write-once boundary record (hostname cross-check for compose). A failure never
+  // crashes startup; it disables independent restore for this process and successors refuse at R2.
+  const boundary = await establishProcessBoundary({ dataDir: config.dataDir, workerToken: config.workerToken,
+    podUid: process.env.UZI_POD_UID, ...(process.env.UZI_POD_CONTAINER ? { container: process.env.UZI_POD_CONTAINER } : {}) });
+  if (boundary.ok) log.info("restore boundary record written", { slot: boundary.record.slot.kind });
+  else log.warn("restore boundary record not written; independent restore disabled", { reason: boundary.reason });
 
   // Issue #3153: when TMPDIR lives under the (now persistent) `<dataDir>/runner`, confirm it is a
   // real, worker-owned, writable directory BEFORE anything uses a temp path. A symlink or
