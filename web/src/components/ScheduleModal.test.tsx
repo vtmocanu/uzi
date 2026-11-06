@@ -400,7 +400,7 @@ describe('the "apply model also to agents" toggle (PRD #305)', () => {
     // Inherit (Decision 3), so it must render and never be disabled.
     const model = screen.getByLabelText("Model (optional)") as HTMLSelectElement;
     expect(model.value).toBe("inherit");
-    const toggle = screen.getByRole("switch", { name: "Apply model also to agents" });
+    const toggle = screen.getByRole("switch", { name: "Use the run's resolved model for subagents too" });
     expect(toggle.hasAttribute("disabled")).toBe(false);
     expect(toggle.getAttribute("aria-checked")).toBe("false");
   });
@@ -415,7 +415,7 @@ describe('the "apply model also to agents" toggle (PRD #305)', () => {
         />
       </MemoryRouter>,
     );
-    const toggle = screen.getByRole("switch", { name: "Apply model also to agents" });
+    const toggle = screen.getByRole("switch", { name: "Use the run's resolved model for subagents too" });
     expect(toggle.getAttribute("aria-checked")).toBe("true");
   });
 
@@ -431,7 +431,7 @@ describe('the "apply model also to agents" toggle (PRD #305)', () => {
       </MemoryRouter>,
     );
 
-    fireEvent.click(screen.getByRole("switch", { name: "Apply model also to agents" }));
+    fireEvent.click(screen.getByRole("switch", { name: "Use the run's resolved model for subagents too" }));
     fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
     await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
     expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.override_subagent_model).toBe(true);
@@ -945,7 +945,7 @@ describe("editing a catalog default (PRD #589)", () => {
 
     // The toggle is now rendered for a DEFAULT (it was previously hidden on defaults). The
     // fixture leaves the flag unset, so it starts off.
-    const toggle = screen.getByRole("switch", { name: "Apply model also to agents" });
+    const toggle = screen.getByRole("switch", { name: "Use the run's resolved model for subagents too" });
     expect(toggle.getAttribute("aria-checked")).toBe("false");
 
     // Turn it on and save — the flag flows through buildDefaultInput.
@@ -1368,7 +1368,7 @@ describe("the per-schedule credential picker (PRD #1247 M6/M7)", () => {
     expect(select.value).toBe(seededAuto.value);
 
     // Clear it back to Inherit — an EXPLICIT clear that must reach the validator.
-    const inheritOption = within(select).getByRole("option", { name: /Inherit the worker/ }) as HTMLOptionElement;
+    const inheritOption = within(select).getByRole("option", { name: /Default · worker/ }) as HTMLOptionElement;
     fireEvent.change(select, { target: { value: inheritOption.value } });
     fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
     await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
@@ -1817,5 +1817,311 @@ describe("M2 minute cadence controls", () => {
     } else {
       expect(screen.queryByLabelText("Every N minutes")).toBeNull();
     }
+  });
+});
+
+// Issue #3256: the "Where it runs" fieldset words the Default options by what the owner's
+// settings and the schedule's own pins imply, without changing any request body.
+describe("the Where it runs fieldset (issue #3256)", () => {
+  const GROUP = "Where it runs: harness, model & token";
+  const OVERFLOW_CLAUDE = "Default · Claude (your default; may overflow to Codex when it fires)";
+  const OVERFLOW_CODEX = "Default · Codex (your default; may overflow to Claude when it fires)";
+
+  function settings(over: Record<string, unknown> = {}) {
+    mockApi.getMySettings.mockResolvedValue({
+      settings: {
+        harness_overflow_enabled: false,
+        default_harness: null,
+        default_model: null,
+        default_effort: null,
+        judge_model: null,
+        summary_model: null,
+        appearance_mode: null,
+        light_theme: null,
+        dark_theme: null,
+        typeface: null,
+        theme: null,
+        ...over,
+      },
+    } as Awaited<ReturnType<typeof api.getMySettings>>);
+  }
+
+  async function open(over: Partial<Schedule> = {}) {
+    const view = render(
+      <MemoryRouter>
+        <ScheduleModal editing={schedFixture({ model: "", ...over })} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(mockApi.getMySettings).toHaveBeenCalled());
+    // Let the settings/secrets state land before reading option text.
+    await act(async () => {});
+    return view;
+  }
+
+  const harnessOpts = () =>
+    Array.from((screen.getByLabelText("Harness for this schedule") as HTMLSelectElement).options, (o) => o.text);
+  const modelDefault = () => (screen.getByLabelText("Model (optional)") as HTMLSelectElement).options[0]?.text;
+
+  it("groups the harness, model, token and subagent controls in one named fieldset", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken(), codexKey()] });
+    await open();
+    const group = screen.getByRole("group", { name: GROUP });
+    expect(within(group).getByLabelText("Harness for this schedule")).toBeTruthy();
+    expect(within(group).getByLabelText("Model (optional)")).toBeTruthy();
+    expect(within(group).getByLabelText("Anthropic token for this schedule")).toBeTruthy();
+    expect(within(group).getByRole("switch", { name: "Use the run's resolved model for subagents too" })).toBeTruthy();
+    expect(within(group).getByText(/Leave a field on Default to follow Settings\./)).toBeTruthy();
+  });
+
+  it("never claims effort is pinned by the schedule", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken(), codexKey()] });
+    await open();
+    const dialogText = document.body.textContent ?? "";
+    const efforts = (dialogText.match(/[^.]*\beffort\b[^.]*\./gi) ?? []).map((t) => t.trim());
+    expect(efforts).toEqual(["Effort is not changed."]);
+  });
+
+  it("names the token Default as the worker binding and keeps the Default wording in help", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken()] });
+    await open();
+    const token = screen.getByLabelText("Anthropic token for this schedule") as HTMLSelectElement;
+    expect(token.options[0]?.text).toBe("Default · worker's token (worker binding)");
+    expect(screen.getByText(/Leave on Default to follow the worker.s binding\./)).toBeTruthy();
+  });
+
+  describe("overflow wording", () => {
+    const both = () => mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken(), codexKey()] });
+
+    it.each(["sweep", "issue"] as const)("Claude default, %s target: may overflow to Codex, model Default is unnamed", async (target) => {
+      both();
+      settings({ harness_overflow_enabled: true, default_harness: "claude", default_claude_model: "opus" });
+      await open({ target, issue_iid: target === "issue" ? 7 : null });
+      expect(harnessOpts()[0]).toBe(OVERFLOW_CLAUDE);
+      expect(modelDefault()).toBe("Default · your worker model");
+    });
+
+    it("Codex default: may overflow to Claude, model Default never names the Codex lane, Codex models stay offered", async () => {
+      both();
+      settings({ harness_overflow_enabled: true, default_harness: "codex", default_codex_model: "gpt-6-astra" });
+      await open();
+      expect(harnessOpts()[0]).toBe(OVERFLOW_CODEX);
+      expect(modelDefault()).toBe("Default · your worker model");
+      const modelSelect = screen.getByLabelText("Model (optional)") as HTMLSelectElement;
+      expect(within(modelSelect).getByRole("option", { name: "gpt-6-astra" })).toBeTruthy();
+    });
+
+    it("overflow off: precise labels", async () => {
+      both();
+      settings({ harness_overflow_enabled: false, default_harness: "claude", default_claude_model: "opus" });
+      await open();
+      expect(harnessOpts()[0]).toBe("Default · Claude (your default)");
+      expect(modelDefault()).toBe("Default · opus (your Claude default)");
+    });
+
+    it("overflow off, Codex default: precise Codex lane label", async () => {
+      both();
+      settings({ default_harness: "codex", default_codex_model: "gpt-6-astra" });
+      await open();
+      expect(harnessOpts()[0]).toBe("Default · Codex (your default)");
+      expect(modelDefault()).toBe("Default · gpt-6-astra (your Codex default)");
+    });
+
+    it.each(["prompt", "self_improve", "ci_watch"] as const)("%s target: precise labels even with overflow on", async (target) => {
+      both();
+      settings({ harness_overflow_enabled: true, default_harness: "claude", default_claude_model: "opus" });
+      await open({ target });
+      expect(harnessOpts()[0]).toBe("Default · Claude (your default)");
+      expect(modelDefault()).toBe("Default · opus (your Claude default)");
+    });
+
+    it("no explicit default: automatic wording, neutral model Default", async () => {
+      both();
+      settings({ harness_overflow_enabled: true, default_harness: null });
+      await open();
+      expect(harnessOpts()[0]).toBe("Default · automatic (chosen when it fires)");
+      expect(modelDefault()).toBe("Default · your worker model");
+    });
+
+    it("an explicit default that is not usable falls back to automatic wording", async () => {
+      mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken(), codexKey({ is_default: false })] });
+      settings({ harness_overflow_enabled: true, default_harness: "codex" });
+      await open();
+      // Codex is not usable, so no picker: nothing to label.
+      expect(screen.queryByLabelText("Harness for this schedule")).toBeNull();
+    });
+
+    it("an explicit harness pin gives a precise model label", async () => {
+      both();
+      settings({ harness_overflow_enabled: true, default_harness: "claude", default_codex_model: "gpt-6-astra" });
+      await open({ harness: "codex" });
+      expect(modelDefault()).toBe("Default · gpt-6-astra (your Codex default)");
+      expect(harnessOpts()[0]).toBe("Default · Claude (your default)");
+    });
+
+    it("a model pin removes the overflow wording from the harness Default", async () => {
+      both();
+      settings({ harness_overflow_enabled: true, default_harness: "claude" });
+      await open({ model: "opus" });
+      expect(harnessOpts()[0]).toBe("Default · Claude (your default)");
+    });
+
+    it.each(["default", "auto"] as const)("a %s token override removes the overflow wording", async (mode) => {
+      both();
+      settings({ harness_overflow_enabled: true, default_harness: "claude" });
+      await open();
+      expect(harnessOpts()[0]).toBe(OVERFLOW_CLAUDE);
+      fireEvent.change(screen.getByLabelText("Anthropic token for this schedule"), { target: { value: `mode:${mode}` } });
+      expect(harnessOpts()[0]).toBe("Default · Claude (your default)");
+    });
+
+    it("a pinned token removes the overflow wording", async () => {
+      both();
+      settings({ harness_overflow_enabled: true, default_harness: "claude" });
+      await open();
+      fireEvent.change(screen.getByLabelText("Anthropic token for this schedule"), { target: { value: "sec-console" } });
+      expect(harnessOpts()[0]).toBe("Default · Claude (your default)");
+    });
+
+    it("picking a model in the form removes the overflow wording", async () => {
+      both();
+      settings({ harness_overflow_enabled: true, default_harness: "claude" });
+      await open();
+      fireEvent.change(screen.getByLabelText("Model (optional)"), { target: { value: "opus" } });
+      expect(harnessOpts()[0]).toBe("Default · Claude (your default)");
+    });
+
+    it("Claude-only user: no picker, model Default names the Claude lane", async () => {
+      mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken()] });
+      settings({ harness_overflow_enabled: true, default_claude_model: "opus" });
+      await open();
+      expect(screen.queryByLabelText("Harness for this schedule")).toBeNull();
+      expect(modelDefault()).toBe("Default · opus (your Claude default)");
+    });
+
+    it("Codex-only user: no picker, model Default names the Codex lane", async () => {
+      mockApi.listSecrets.mockResolvedValue({ secrets: [codexKey()] });
+      settings({ harness_overflow_enabled: true, default_codex_model: "gpt-6-astra" });
+      await open();
+      expect(screen.queryByLabelText("Harness for this schedule")).toBeNull();
+      expect(modelDefault()).toBe("Default · gpt-6-astra (your Codex default)");
+    });
+
+    it("renders a lane value as plain text, not markup", async () => {
+      mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken()] });
+      settings({ default_claude_model: "<b>x</b>" });
+      await open();
+      expect(modelDefault()).toBe("Default · <b>x</b> (your Claude default)");
+    });
+  });
+
+  describe("auto-rework Default option", () => {
+    const rework = () => (screen.getByLabelText("Auto-rework MR review comments") as HTMLSelectElement).options[0]?.text;
+
+    it.each([
+      { value: null, text: "Default · on (your setting)" },
+      { value: true, text: "Default · on (your setting)" },
+      { value: false, text: "Default · off (your setting)" },
+    ])("settings mr_rework_enabled=$value", async ({ value, text }) => {
+      settings({ mr_rework_enabled: value });
+      await open();
+      expect(rework()).toBe(text);
+    });
+
+    it("settings not loaded", async () => {
+      mockApi.getMySettings.mockRejectedValue(new Error("boom"));
+      await open();
+      expect(rework()).toBe("Default · your account setting");
+      expect((screen.getByLabelText("Auto-rework MR review comments") as HTMLSelectElement).value).toBe("inherit");
+    });
+  });
+
+  describe("request bodies are unchanged", () => {
+    it("untouched overflow-state edit sends the same body as before, without harness/credential/model keys", async () => {
+      mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken(), codexKey()] });
+      settings({ harness_overflow_enabled: true, default_harness: "claude", default_claude_model: "opus" });
+      mockApi.updateSchedule.mockResolvedValue(schedFixture());
+      await open();
+      expect(harnessOpts()[0]).toBe(OVERFLOW_CLAUDE);
+      fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+      await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+      const body = mockApi.updateSchedule.mock.calls[0]?.[1] as Record<string, unknown>;
+      // JSON round trip drops undefined keys, i.e. exactly what goes on the wire.
+      expect(JSON.parse(JSON.stringify(body))).toEqual({
+        target: "sweep",
+        labels: ["bug"],
+        max_issues: 10,
+        remove_label_on_dispatch: false,
+        capacity_limit: null,
+        capacity_room_needed: null,
+        guidance: null,
+        timing: "recurring",
+        cron_expr: "0 2 * * 1-5",
+        timezone: "UTC",
+        auto_approve: true,
+        wait_on_limit: true,
+        mr_rework_enabled: null,
+        model: null,
+        override_subagent_model: false,
+        repo_id: "repo-uzi",
+      });
+    });
+
+    it("untouched create sends the same body as before", async () => {
+      mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken(), codexKey()] });
+      settings({ harness_overflow_enabled: true, default_harness: "claude" });
+      mockApi.listRepos.mockResolvedValue({
+        repos: [{ id: "repo-uzi", path_with_namespace: "vtmocanu/uzi" }] as unknown as Awaited<
+          ReturnType<typeof api.listRepos>
+        >["repos"],
+      });
+      mockApi.createSchedule.mockResolvedValue(schedFixture());
+      renderModal();
+      await waitFor(() => expect(mockApi.listRepos).toHaveBeenCalled());
+      await act(async () => {});
+      fireEvent.change(screen.getByLabelText("Issue number"), { target: { value: "142" } });
+      const btn = screen.getByRole("button", { name: "Create schedule" });
+      await waitFor(() => expect(btn.hasAttribute("disabled")).toBe(false));
+      fireEvent.click(btn);
+      await waitFor(() => expect(mockApi.createSchedule).toHaveBeenCalled());
+      const body = mockApi.createSchedule.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect(JSON.parse(JSON.stringify(body))).toEqual({
+        target: "issue",
+        issue_iid: 142,
+        remove_label_on_dispatch: false,
+        capacity_limit: null,
+        capacity_room_needed: null,
+        guidance: null,
+        timing: "recurring",
+        cron_expr: "0 2 * * 1-5",
+        timezone: "UTC",
+        auto_approve: true,
+        wait_on_limit: true,
+        mr_rework_enabled: null,
+        model: null,
+        override_subagent_model: false,
+        enabled: true,
+      });
+    });
+
+    it.each([true, false])("subagent toggle submits override_subagent_model=%s", async (initial) => {
+      mockApi.updateSchedule.mockResolvedValue(schedFixture());
+      await open({ override_subagent_model: !initial });
+      fireEvent.click(screen.getByRole("switch", { name: "Use the run's resolved model for subagents too" }));
+      fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+      await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+      expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.override_subagent_model).toBe(initial);
+    });
+
+    it("self_improve shows the fixed-token note and sends no credential_override", async () => {
+      mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken(), codexKey()] });
+      mockApi.updateSchedule.mockResolvedValue(schedFixture({ target: "self_improve" }));
+      await open({ target: "self_improve" });
+      const group = screen.getByRole("group", { name: GROUP });
+      expect(within(group).getByText(/Self-improvement runs always use your worker.s token/)).toBeTruthy();
+      expect(screen.queryByLabelText("Anthropic token for this schedule")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+      await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+      expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.credential_override).toBeUndefined();
+    });
   });
 });

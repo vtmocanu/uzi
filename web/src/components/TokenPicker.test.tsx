@@ -153,3 +153,28 @@ describe("TokenPicker — disabled tokens (PRD #1732)", () => {
     expect(screen.getByTestId("token-picker-disabled-footer").textContent).toMatch(/“old-laptop” is disabled/);
   });
 });
+
+describe("TokenPicker — inherit option text (issue #3256)", () => {
+  it("defaults the inherit option to the worker's token wording", () => {
+    const { select } = renderPicker({ mode: "inherit" }, []);
+    expect(select.options[0]?.text).toBe("Inherit the worker's token");
+    expect(select.options[0]?.value).toBe("mode:inherit");
+  });
+
+  it("renders a caller-supplied inheritLabel without changing the emitted selection", () => {
+    const onChange = vi.fn();
+    render(
+      <TokenPicker
+        value={{ mode: "default" }}
+        onChange={onChange}
+        tokens={[]}
+        label="Anthropic token"
+        inheritLabel="Default · worker's token (worker binding)"
+      />,
+    );
+    const select = screen.getByLabelText("Anthropic token") as HTMLSelectElement;
+    expect(select.options[0]?.text).toBe("Default · worker's token (worker binding)");
+    fireEvent.change(select, { target: { value: "mode:inherit" } });
+    expect(onChange).toHaveBeenCalledWith({ mode: "inherit" });
+  });
+});
