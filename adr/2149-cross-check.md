@@ -573,8 +573,10 @@ switch-specific custody operation. A probe failure, timeout or `false` counts as
 commits nothing, so an api without the field keeps the limit above. Remaining limits: on a
 re-plan gate the worker latches the Cancel promptly, but an in-flight gate checkpoint step (the
 open item above) delays the terminal report with no fixed bound until #3980; it presents no gate
-and services no switch afterwards. Auto-stop and graceful stop stay withheld. A Cancel after a
-release still waits for the reclaim. A cancel controller already spent by a refused "now" pause
+and services no switch afterwards. Graceful stop and auto-stop rows stay withheld (the probe reads
+only `stop_kind = 'cancelled'`); auto-stop still escalates server-side on its own timer. A Cancel
+pressed during the hold that a release beats still waits for the reclaim; one pressed after the
+release applies at once. A cancel controller already spent by a refused "now" pause
 stops the SDK turn only at its next boundary.
 
 These rest on stated assumptions: request timeouts propagate through `fetch` and body reads; the
