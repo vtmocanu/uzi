@@ -48,7 +48,29 @@ function clearFragment(): void {
 // it again. Memory only: nothing persists past a reload or an unmount with no successor.
 let handoffToken = "";
 
+// Whether this instance allows password sign-in, from the public auth config (the same
+// GET /api/auth/config the login page reads). "unknown" while it loads or when the fetch
+// fails: the page then uses wording that claims neither mode. A server that omits the
+// field allows password sign-in, as on the login page.
+type PasswordLogin = "on" | "off" | "unknown";
+
+function usePasswordLogin(): PasswordLogin {
+  const [mode, setMode] = useState<PasswordLogin>("unknown");
+  useEffect(() => {
+    let live = true;
+    api
+      .authConfig()
+      .then((c) => live && setMode(c.password_login_enabled === false ? "off" : "on"))
+      .catch(() => undefined);
+    return () => {
+      live = false;
+    };
+  }, []);
+  return mode;
+}
+
 export function ResetAccount() {
+  const passwordLogin = usePasswordLogin();
   // Read once, BEFORE the effect below clears the fragment. A useState initializer
   // also survives React's dev double-mount, which keeps the instance's state.
   const [token] = useState(() => readFragmentToken() || handoffToken);
@@ -114,12 +136,13 @@ export function ResetAccount() {
             </Button>
           </div>
         ) : done ? (
-          <ResetDone kind={done} />
+          <ResetDone kind={done} passwordLogin={passwordLogin} />
         ) : (
           preview && (
             <ResetForm
               token={token}
               kind={preview.kind}
+              passwordLogin={passwordLogin}
               onDone={() => setDone(preview.kind)}
               onInvalid={() => setInvalidAtRedeem(true)}
             />
@@ -178,11 +201,13 @@ function ResetLedger() {
 function ResetForm({
   token,
   kind,
+  passwordLogin,
   onDone,
   onInvalid,
 }: {
   token: string;
   kind: ResetLinkKind;
+  passwordLogin: PasswordLogin;
   onDone: () => void;
   onInvalid: () => void;
 }) {
@@ -237,7 +262,10 @@ function ResetForm({
       <ResetLedger />
 
       <ul className="space-y-1.5 text-sm text-muted">
-        <li>Every signed-in session ends, and any CLI login waiting for approval is cancelled.</li>
+        <li>
+          Every browser session ends. A CLI login you already approved but have not finished is refused; one still
+          waiting for approval stays pending, but your old sessions can no longer approve it.
+        </li>
         <li>Runs pinned to a deleted credential use your default credential once you add a new one.</li>
         <li>Queued Codex runs will fail. Start new ones after you add a Codex login again.</li>
       </ul>
@@ -267,10 +295,18 @@ function ResetForm({
           </Field>
           <div id={hintId} className="space-y-1 text-xs text-faint">
             <p>At least {MIN_PASSWORD} characters.</p>
-            <p>
-              If your instance only allows single sign-on, the new password will not work for signing in until an
-              administrator enables password login.
-            </p>
+            {passwordLogin === "off" && (
+              <p>
+                This instance signs in with single sign-on only. After the reset, sign in with single sign-on, then
+                enable your vault in Settings using this new password.
+              </p>
+            )}
+            {passwordLogin === "unknown" && (
+              <p>
+                If your instance signs in with single sign-on only, sign in that way after the reset, then enable your
+                vault in Settings using this new password.
+              </p>
+            )}
           </div>
         </div>
       )}
@@ -296,7 +332,23 @@ function ResetForm({
   );
 }
 
-function ResetDone({ kind }: { kind: ResetLinkKind }) {
+function doneMessage(kind: ResetLinkKind, passwordLogin: PasswordLogin): string {
+  if (kind !== "password") {
+    return "Your vault is reset. Sign in with single sign-on, then create a new vault passphrase in Settings.";
+  }
+  switch (passwordLogin) {
+    case "on":
+      return "Your account is reset. Sign in with your new password; uzi creates a fresh vault when you do.";
+    case "off":
+      return "Your account is reset. Sign in with single sign-on, then enable your vault in Settings using your new password.";
+    default:
+      // Config still loading or unavailable: name both paths, claim neither.
+      return "Your account is reset. If your instance allows password sign-in, sign in with your new password. If it uses single sign-on only, sign in that way, then enable your vault in Settings using the new password.";
+  }
+}
+
+function ResetDone({ kind, passwordLogin }: { kind: ResetLinkKind; passwordLogin: PasswordLogin }) {
+  const sso = kind !== "password" || passwordLogin === "off";
   // Move focus to the outcome so a keyboard or screen-reader user lands on it once the
   // form it replaced is gone.
   const ref = useRef<HTMLDivElement>(null);
@@ -305,20 +357,13 @@ function ResetDone({ kind }: { kind: ResetLinkKind }) {
   }, []);
   return (
     <div ref={ref} tabIndex={-1} className="space-y-4 outline-hidden">
-      <Alert
-        tone="success"
-        message={
-          kind === "password"
-            ? "Your account is reset. Sign in with your new password; uzi creates a fresh vault when you do."
-            : "Your vault is reset. Sign in with single sign-on, then create a new vault passphrase in Settings."
-        }
-      />
+      <Alert tone="success" message={doneMessage(kind, passwordLogin)} />
       <p className="text-sm text-muted">Add your model credentials again in Settings once you are signed in.</p>
       <Link
         to="/login"
         className="inline-flex h-9 select-none items-center justify-center rounded-lg bg-brand px-4 text-sm font-medium text-on-brand hover:bg-brand-hover"
       >
-        {kind === "password" ? "Sign in" : "Sign in with SSO"}
+        {sso ? "Sign in with SSO" : "Sign in"}
       </Link>
     </div>
   );

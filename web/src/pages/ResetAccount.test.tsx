@@ -12,11 +12,17 @@ import { APP_ROUTES } from "../App";
 const TOKEN = "rst" + "Q9x_".repeat(10);
 const INVALID = "This link is invalid or has expired. Ask an administrator for a new one.";
 const EXPIRES = "2026-11-06T17:00:00Z";
+const CONFIG = "/api/auth/config";
+const SSO_ONLY = { registration_enabled: false, allowed_email_domains: [], oidc_enabled: true, password_login_enabled: false };
+const PASSWORD_ON = { registration_enabled: true, allowed_email_domains: [], password_login_enabled: true };
 
 type Reply = { status: number; body?: unknown };
 type Call = { url: string; method: string; body: unknown };
 
 let calls: Call[];
+// GETs of the public auth config, kept apart from `calls` so the token assertions stay
+// about the reset POSTs. With no queued reply the config fetch fails (500).
+let configCalls: number;
 let replies: Record<string, Reply[]>;
 
 // reply queues a response for the next POST to path ("/api/auth/reset/preview" etc.).
@@ -26,12 +32,14 @@ function reply(path: string, r: Reply) {
 
 beforeEach(() => {
   calls = [];
+  configCalls = 0;
   replies = {};
   vi.stubGlobal(
     "fetch",
     vi.fn(async (url: string, init?: RequestInit) => {
       const body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
-      calls.push({ url, method: init?.method ?? "GET", body });
+      if (url === CONFIG) configCalls++;
+      else calls.push({ url, method: init?.method ?? "GET", body });
       const r = replies[url]?.shift() ?? { status: 500, body: { error: `unexpected ${url}` } };
       const text = r.body === undefined ? "" : JSON.stringify(r.body);
       return { ok: r.status >= 200 && r.status < 300, status: r.status, text: async () => text } as Response;
@@ -67,7 +75,8 @@ function expectTokenNeverInUrl() {
   }
 }
 
-async function passwordForm() {
+async function passwordForm(config?: Record<string, unknown>) {
+  if (config) reply(CONFIG, { status: 200, body: config });
   reply("/api/auth/reset/preview", { status: 200, body: { kind: "password", expires_at: EXPIRES } });
   openAt(`/reset?x=1#${TOKEN}`);
   return screen.findByLabelText("New password");
@@ -174,17 +183,70 @@ describe("ResetAccount invalid links", () => {
 });
 
 describe("ResetAccount password form", () => {
-  it("warns what is deleted and shows the single sign-on hint", async () => {
-    await passwordForm();
+  it("warns what is deleted and what happens to sessions and CLI logins", async () => {
+    await passwordForm(PASSWORD_ON);
     const text = document.body.textContent ?? "";
     expect(text).toMatch(/Anthropic and OpenAI tokens/);
     expect(text).toMatch(/Codex logins/);
     expect(text).toMatch(/Everything in your vault/);
+    expect(text).toMatch(/Every browser session ends/);
+    expect(text).toMatch(/A CLI login you already approved but have not finished is refused/);
+    expect(text).toMatch(/waiting for approval stays pending, but your old sessions can no longer approve it/);
+    expect(text).not.toMatch(/cancelled/);
     expect(text).toMatch(/Runs pinned to a deleted credential use your default credential/);
     expect(text).toMatch(/Queued Codex runs will fail/);
-    expect(text).toMatch(
-      /If your instance only allows single sign-on, the new password will not work for signing in until an\s+administrator enables password login/,
-    );
+  });
+
+  it("password login enabled: no single sign-on hint, and done says sign in with the new password", async () => {
+    await passwordForm(PASSWORD_ON);
+    await waitFor(() => expect(configCalls).toBe(1));
+    expect(document.body.textContent).not.toMatch(/single sign-on/);
+    reply("/api/auth/reset/redeem", { status: 204 });
+    fill("correct horse battery", "correct horse battery");
+    fireEvent.click(ack());
+    fireEvent.click(submit());
+    expect(
+      await screen.findByText("Your account is reset. Sign in with your new password; uzi creates a fresh vault when you do."),
+    ).toBeTruthy();
+    expect(document.body.textContent).not.toMatch(/single sign-on/);
+    expect(screen.getByRole("link", { name: "Sign in" })).toBeTruthy();
+  });
+
+  it("SSO-only instance: hint and done say sign in with SSO, then enable the vault in Settings", async () => {
+    await passwordForm(SSO_ONLY);
+    expect(
+      await screen.findByText(
+        /This instance signs in with single sign-on only\. After the reset, sign in with single sign-on, then\s+enable your vault in Settings using this new password\./,
+      ),
+    ).toBeTruthy();
+    reply("/api/auth/reset/redeem", { status: 204 });
+    fill("correct horse battery", "correct horse battery");
+    fireEvent.click(ack());
+    fireEvent.click(submit());
+    expect(
+      await screen.findByText(
+        "Your account is reset. Sign in with single sign-on, then enable your vault in Settings using your new password.",
+      ),
+    ).toBeTruthy();
+    // The done state must not send them to a password sign-in that cannot work.
+    expect(document.body.textContent).not.toMatch(/Sign in with your new password/);
+    expect(screen.getByRole("link", { name: "Sign in with SSO" })).toBeTruthy();
+  });
+
+  it("config unavailable: neutral wording that claims neither mode", async () => {
+    await passwordForm(); // no config reply queued: the fetch fails
+    await waitFor(() => expect(configCalls).toBe(1));
+    const text = document.body.textContent ?? "";
+    expect(text).toMatch(/If your instance signs in with single sign-on only/);
+    expect(text).not.toMatch(/This instance signs in with single sign-on only/);
+    reply("/api/auth/reset/redeem", { status: 204 });
+    fill("correct horse battery", "correct horse battery");
+    fireEvent.click(ack());
+    fireEvent.click(submit());
+    const done = await screen.findByText(/Your account is reset\./);
+    expect(done.textContent).toMatch(/If your instance allows password sign-in, sign in with your new password\./);
+    expect(done.textContent).toMatch(/If it uses single sign-on only, sign in that way, then enable your vault in Settings/);
+    expect(done.textContent).not.toMatch(/uzi creates a fresh vault/);
   });
 
   it("keeps submit disabled until the confirmation is checked", async () => {

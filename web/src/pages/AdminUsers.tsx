@@ -349,7 +349,10 @@ function ResetLinkDialog({ user, label, onClose }: { user: User; label: string; 
                 Their model credentials (Anthropic and OpenAI tokens, Codex logins) and their vault contents are
                 permanently deleted.
               </li>
-              <li>All their sessions end, and any CLI login waiting for approval is cancelled.</li>
+              <li>
+                All their browser sessions end. A CLI login they already approved but have not finished is refused; one
+                still waiting for approval stays pending, but their old sessions can no longer approve it.
+              </li>
               <li>Their queued Codex runs will fail; they must start new ones.</li>
             </ul>
             {targetIsAdmin && <AdminTakeoverWarning />}

@@ -266,8 +266,11 @@ describe("AdminUsers reset link (PRD #3989)", () => {
     const dialog = screen.getByRole("dialog");
     const text = dialog.textContent ?? "";
     expect(text).toMatch(/model credentials \(Anthropic and OpenAI tokens, Codex logins\) and their vault contents are\s+permanently deleted/);
-    expect(text).toMatch(/All their sessions end/);
-    expect(text).toMatch(/CLI login/);
+    expect(text).toMatch(/All their browser sessions end/);
+    expect(text).toMatch(/A CLI login they already approved but have not finished is refused/);
+    expect(text).toMatch(/one\s+still waiting for approval stays pending, but their old sessions can no longer approve it/);
+    // The dialog must not promise that waiting CLI logins are cancelled: the backend keeps them pending.
+    expect(text).not.toMatch(/cancelled/);
     expect(text).toMatch(/queued Codex runs will fail; they must start new ones/);
     // A non-admin target gets no takeover warning.
     expect(within(dialog).queryByRole("note")).toBeNull();
