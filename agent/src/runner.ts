@@ -64,6 +64,7 @@ import { PlanRejectedError } from "./executor.js";
 import { acquireCodexOperationScope } from "./codex-operation-scope.js";
 import { type CodexOperationController, type CodexOperationWaitPolicy } from "./codex-operation-controller.js";
 import { CodexOperationAdmissionError } from "./client.js";
+import { transientOwnershipReadCause } from "./ownership-read-transient.js";
 import { PLAN_REVISION_RETRY_FEATURE, PlanRevisionRecovery, PlanRevisionRecoveryStoppedError, type PlanRevisionRetryPolicy } from "./plan-revision-retry.js";
 import { checkPlan, type CheckedHumanGate, type CheckedPlanDecision, type PlanCrossCheckTiming } from "./plan-cross-check-gate.js";
 import { gatedPlanPresentation } from "./checked-plan.js";
@@ -382,6 +383,10 @@ const CREDENTIAL_SWITCH_CAPTURE_ATTEMPTS = 3;
  *  not clear on its own, failing closed is the maintainer's decision, and per-attempt cgroup v2
  *  containment is the follow-up that removes the case. */
 const RECOVERY_CAPTURE_BLOCKED_ATTEMPTS = 5;
+
+/** issue #3994: backoff multipliers (of recoveryRetryMs) between the up-to-5 post-adoption
+ *  ownership reads of a retained successor; see confirmPostAdoptionOwnership. */
+const POST_ADOPTION_OWNERSHIP_RETRY_FACTORS = [1, 2, 4, 8] as const;
 
 /** PRD #1226 M4 (D5): the STATIC, content-free failure_reason a worker reports when the completion
  *  interlock cannot report completed AND cannot park the run for recovery (the restore point never
@@ -25914,6 +25919,33 @@ export class RunRunner {
     if (deadline !== undefined && Date.now() >= deadline) throw new Error("recovery deadline exhausted");
   }
 
+  /**
+   * issue #3994: the ownership re-check after a retained successor is adopted. A transient
+   * transport/gateway failure of that read (positively classified by
+   * {@link transientOwnershipReadCause}) is retried in place, within the iteration deadline,
+   * rather than failing the adoption. Anything else, an exhausted attempt budget, or a wait
+   * the deadline cannot afford rethrows the original error object unchanged.
+   */
+  private async confirmPostAdoptionOwnership(flight: RunFlight, deadline: number, signal: AbortSignal): Promise<void> {
+    const attempts = POST_ADOPTION_OWNERSHIP_RETRY_FACTORS.length + 1;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await this.requireRetainedOwnership(flight, deadline, signal);
+        return;
+      } catch (error) {
+        const token = transientOwnershipReadCause(error, flight.runId);
+        if (token === undefined || attempt >= attempts) throw error;
+        const delay = this.recoveryRetryMs * POST_ADOPTION_OWNERSHIP_RETRY_FACTORS[attempt - 1]!;
+        this.retainedLifecycleGuard(flight);
+        if (Date.now() + delay >= deadline) throw error;
+        flight.runLog.warn("retained post-adoption ownership read transient; retrying",
+          { attempt, cause_class: token, claim_generation: flight.claimGeneration });
+        try { await this.waitRecoveryRetry(flight, true, delay, signal); }
+        catch (waitError) { this.retainedLifecycleGuard(flight); throw waitError; }
+      }
+    }
+  }
+
   /** Two identical reports and at most two ownership probes, under one boundary deadline.
    * Ownership only authorizes replay: only the report ACK's exact status/cause confirms.
    * Any unresolved outcome stops this flight without terminal reporting or releasing custody. */
@@ -26873,7 +26905,7 @@ export class RunRunner {
             () => flight.executor.recordedRootPids?.() ?? [], new Date(this.now()), attemptId);
           flight.attempt = attempt;
           this.liveAttempts.add(attempt);
-          try { await check(); }
+          try { await this.confirmPostAdoptionOwnership(flight, iteration.deadline, signal); }
           catch (error) {
             try {
               if (!(error instanceof RetainedRecoveryStop) && !(error instanceof CredentialSwitchSignal) &&
@@ -26890,7 +26922,7 @@ export class RunRunner {
             blocker = "quiescence_failed";
             await flight.executor.closeAndSettlePlanSummary?.(Math.max(0, Math.min(this.codexBoundaryDeadlineMs, iteration.deadline - Date.now())));
             const disposal = await flight.executor.safety?.dispose({ boundary: "shutdown", deadlineMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, iteration.deadline - Date.now())) });
-            await check();
+            await this.confirmPostAdoptionOwnership(flight, iteration.deadline, signal);
             if (flight.executor.safety && disposal?.kind !== "disposed") throw finalize;
             flight.executor = publicationOnlyExecutor(claim, this.makeExecutor(claim.run_id, claim.secrets.codex).executor);
             this.registerEvidenceExecutor(flight);

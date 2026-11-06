@@ -1,14 +1,21 @@
-import { it } from "node:test";
+import { afterEach, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
+import type http from "node:http";
 import { execFileSync } from "node:child_process";
+import type { RunRunner } from "../src/runner.js";
 import { formatRetainedRecoveryDiagnostic, RetainedReadinessCleanupUnconfirmedError } from "../src/git.js";
 import { noProofReseed, recordingLogger } from "./helpers.js";
 import { codexRig } from "./runner-codex-sinks-fixture.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
 
-installHarness();
+// issue #3994: the post-adoption ownership read goes through this per-test transport hook, so a
+// fault is injected at the WorkerClient transport only (never by replacing a runner method).
+let transportHook: typeof fetch | undefined;
+installHarness({ fetch: (input, init) => (transportHook ?? globalThis.fetch)(input, init) });
+afterEach(() => { transportHook = undefined; });
 const warning = "retained recovery iteration failed; reserved budget retained";
 const secret = "glpat-" + "abcdefghijklmnopqrst";
 function command(cwd: string, ...args: string[]): string {
@@ -235,3 +242,347 @@ for (const mode of ["operational", "non-error", "abort", "ownership", "credentia
     assert.doesNotMatch(JSON.stringify(journal), /diagnostic_/);
   });
 }
+
+// ---- issue #3994: transient failures of the post-adoption ownership read ----------------------------
+// The window opens when the real prepareRecoverySuccessor returns (the successor is adopted) and
+// closes when the model is entered or the iteration-failure warning is logged. Every ownership GET
+// inside it is counted and optionally faulted by the transport hook above.
+type Fault = "ok" | "econnrefused" | "econnreset" | "und_err_socket" | "enotfound" | "nocause" |
+  "malformed" | "truncated" | "other-generation" | "other-status" | "not-owned" | 502 | 503 | 504 | 403;
+type Hooked = { waitRecoveryRetry: (...args: unknown[]) => Promise<void> };
+interface DriveOptions {
+  /** Fault for window GET n (1-based); "ok" beyond the list. */
+  script?: Fault[];
+  /** Iterations failed by the generic ensureClone fault before the one under test. */
+  failIterations?: number;
+  /** A Codex-like executor: its `safety` makes the runner re-check ownership a second time. */
+  safety?: boolean;
+  /** Runs inside the transport while GET n of the window is in flight (before its fault applies). */
+  onGet?: (n: number, deadline: number) => void;
+  /** Runs before / after the real retry wait of the window. */
+  onWait?: (flight: any, runner: RunRunner, n: number, deadline: number) => void;
+  afterWait?: (flight: any, runner: RunRunner, n: number, deadline: number) => void;
+}
+async function freedPort(): Promise<number> {
+  const server = net.createServer();
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as net.AddressInfo;
+  await new Promise<void>(resolve => server.close(() => resolve()));
+  return port;
+}
+const causeClass = (fault: Fault): string => typeof fault === "number" ? `http_${fault}` : fault;
+const TRANSIENT: Fault[] = ["econnrefused", "econnreset", "und_err_socket", 502, 503, 504];
+
+async function drive(options: DriveOptions = {}) {
+  const { claim, bare, clone } = await seed();
+  const runId = claim.run_id;
+  const log = recordingLogger();
+  const realFetch = globalThis.fetch;
+  const deadPort = await freedPort();
+  client.protocolFeatures = ["recovery_cause_retained_recovery_adoption_failed"];
+  // A confirmed adoption_failed park is a recovery_wait report whose ACK carries status and cause.
+  api.stateAckWire = (body, run) => body.status === "recovery_wait" && body.recovery_cause === "retained_recovery_adoption_failed"
+    ? { status: 200, body: { run: { ...run, status: "recovery_wait", recovery_wait_cause: body.recovery_cause } } }
+    : undefined;
+  const warnings = () => log.lines.filter((line: any) => line.msg === warning).length;
+  let faults = 0, models = 0, prepares = 0, reserves = 0, reservesAfterHandoff = 0;
+  let windowGets = 0, windowWaits = 0, armed = false, warnAtArm = 0, deadline = 0;
+  const modelRuns: Array<{ cwd: string }> = [];
+  let closed = false, depth = 0, armedDepth = -1;
+  const inWindow = () => armed && !closed && models === 0 && warnings() === warnAtArm;
+  const operation = git.withRecoveryOperation.bind(git);
+  git.withRecoveryOperation = (async (...args: Parameters<typeof operation>) => {
+    depth++;
+    try { return await operation(...args); }
+    finally { if (armed && depth === armedDepth) closed = true; depth--; }
+  }) as typeof git.withRecoveryOperation;
+  const realEnsure = git.ensureClone.bind(git);
+  git.ensureClone = (async (...args: Parameters<typeof realEnsure>) => {
+    if (faults < (options.failIterations ?? 0)) { faults++; throw new Error("connection reset " + secret); }
+    return realEnsure(...args);
+  }) as typeof git.ensureClone;
+  const reserve = git.reserveRecoveryIteration.bind(git);
+  git.reserveRecoveryIteration = async (...args) => {
+    reserves++;
+    if (armed) reservesAfterHandoff++;
+    const progress = await reserve(...args);
+    deadline = (progress as { deadline: number }).deadline;
+    return progress;
+  };
+  const prepare = git.prepareRecoverySuccessor.bind(git);
+  let successor: Awaited<ReturnType<typeof prepare>> | undefined;
+  git.prepareRecoverySuccessor = async (...args) => {
+    prepares++;
+    successor = await prepare(...args);
+    armed = true;
+    armedDepth = depth;
+    warnAtArm = warnings();
+    return successor;
+  };
+  const dirty = new Set<Fault>();
+  const normal = () => {
+    api.ownershipWire.delete(runId);
+    api.setOwnershipStatus(runId, "running", 2);
+  };
+  transportHook = async (input, init) => {
+    const url = String(input);
+    if ((init?.method ?? "GET") !== "GET" || !url.endsWith(`/runs/${runId}/ownership`)) return realFetch(input, init);
+    if (!inWindow()) { if (dirty.size > 0) { normal(); dirty.clear(); } return realFetch(input, init); }
+    const n = ++windowGets;
+    options.onGet?.(n, deadline);
+    const fault = options.script?.[n - 1] ?? "ok";
+    normal();
+    if (fault !== "ok") dirty.add(fault);
+    if (typeof fault === "number") api.failOwnership(runId, fault);
+    else if (fault === "econnreset") api.ownershipWire.set(runId, res => { res.socket!.resetAndDestroy(); });
+    else if (fault === "und_err_socket") api.ownershipWire.set(runId, res => { res.socket!.destroy(); });
+    else if (fault === "malformed") api.ownershipWire.set(runId, (res: http.ServerResponse) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end("{not json");
+    });
+    else if (fault === "truncated") api.ownershipWire.set(runId, (res: http.ServerResponse) => {
+      res.writeHead(200, { "Content-Type": "application/json", "Content-Length": "1000" });
+      res.flushHeaders();
+      res.write("{\"status\":");
+      setImmediate(() => res.destroy());
+    });
+    else if (fault === "other-generation") api.setOwnershipStatus(runId, "running", 3);
+    else if (fault === "other-status") api.setOwnershipStatus(runId, "paused", 2);
+    else if (fault === "not-owned") api.setOwnershipNotOwned(runId);
+    else if (fault === "econnrefused") {
+      const target = new URL(url);
+      target.port = String(deadPort);
+      return realFetch(target, init);
+    } else if (fault === "enotfound") {
+      throw new TypeError("fetch failed", { cause: Object.assign(new Error("getaddrinfo ENOTFOUND"), { code: "ENOTFOUND" }) });
+    } else if (fault === "nocause") throw new TypeError("fetch failed");
+    return realFetch(input, init);
+  };
+  const executor = () => {
+    const rig = options.safety ? codexRig() : undefined;
+    return {
+    sandboxesCommands: false,
+    ...(rig ? { settleForCredentialFreeCapture: rig.settle, withCredentialFreeCapture: rig.capture, safety: rig.safety } : {}),
+    run: async (ctx: { worktreePath: string }) => {
+      models++;
+      modelRuns.push({ cwd: ctx.worktreePath });
+      throw new Error("model reached");
+    },
+    };
+  };
+  const runner = runnerWith(() => ({ executor: executor() as never }), fakeGitlab().gitlab, undefined, log.logger,
+    { recoveryRetryMs: 1 });
+  const wait = (runner as unknown as Hooked).waitRecoveryRetry.bind(runner);
+  (runner as unknown as Hooked).waitRecoveryRetry = async (flight: any, ...rest: unknown[]) => {
+    if (!inWindow()) return wait(flight, ...rest);
+    const n = ++windowWaits;
+    options.onWait?.(flight, runner, n, deadline);
+    try { return await wait(flight, ...rest); } finally { options.afterWait?.(flight, runner, n, deadline); }
+  };
+  const journal = () => JSON.parse(command(bare, "config", `uzi-recovery.${clone.branch}.clone`));
+  await runner.execute(claim);
+  const states = (status: string) => api.states.filter(s => s.runId === runId && s.body.status === status);
+  return {
+    claim, bare, clone, runner, log, journal, states,
+    parks: () => api.states.filter(state => state.runId === runId && state.body.status === "recovery_wait"),
+    get successor() { return successor; },
+    get windowGets() { return windowGets; },
+    get windowWaits() { return windowWaits; },
+    get deadline() { return deadline; },
+    models: () => models, prepares: () => prepares, reserves: () => reserves,
+    reservesAfterHandoff: () => reservesAfterHandoff, modelRuns,
+    retryLogs: () => log.lines.filter((line: any) => line.msg === "retained post-adoption ownership read transient; retrying") as Array<Record<string, any>>,
+    warnings: () => log.lines.filter((line: any) => line.msg === warning) as Array<Record<string, any>>,
+  };
+}
+type Driven = Awaited<ReturnType<typeof drive>>;
+
+
+
+const successorDirs = (clonePath: string): string[] =>
+  fs.readdirSync(path.dirname(clonePath)).filter(name => name.startsWith(path.basename(clonePath) + ".attempt-"));
+const retriesLogOnlyClass = (r: Driven, fault: Fault) => {
+  const logs = r.retryLogs();
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0]!.attempt, 1);
+  assert.equal(logs[0]!.cause_class, causeClass(fault));
+  assert.equal(logs[0]!.claim_generation, 2);
+  assert.deepEqual(Object.keys(logs[0]!).sort(),
+    ["attempt", "cause_class", "claim_generation", "issue_iid", "level", "msg", "run_id"], "a bounded token, never error text");
+  assert.doesNotMatch(JSON.stringify(logs[0]), /fetch failed|127\.0\.0\.1/);
+};
+
+it("acceptance: a transient first post-adoption read in the third iteration retries in place and enters the model once", async () => {
+  const r = await drive({ script: ["econnrefused"], failIterations: 2 });
+  assert.equal(r.models(), 1, "the model is entered exactly once");
+  assert.equal(r.prepares(), 1, "one successor is prepared, in iteration 3");
+  assert.equal(r.reserves(), 3, "three iterations were reserved in total");
+  assert.equal(r.reservesAfterHandoff(), 0, "no iteration is reserved after the handoff");
+  assert.equal(r.windowGets, 2);
+  assert.equal(r.windowWaits, 1);
+  retriesLogOnlyClass(r, "econnrefused");
+  const journal = r.journal();
+  assert.equal(journal.recovery.attempts, 3);
+  assert.equal(journal.recovery.stage, "ready-for-model");
+  assert.equal(journal.recovery.claimGeneration, 2);
+  const successor = r.successor!;
+  assert.equal(r.modelRuns[0]!.cwd, successor.path, "the model runs at the adopted successor path");
+  assert.equal(journal.clonePath, successor.path);
+  assert.equal(journal.recovery.successor.attemptId, successor.attemptId);
+  assert.deepEqual(successorDirs(r.clone.path), [path.basename(successor.path)], "no second successor path");
+  assert.equal(r.warnings().length, 2, "only the two generic iteration failures were logged");
+  assert.ok(r.warnings().every(line => line.diagnostic_code !== "retained_successor_post_adoption_check"));
+  assert.deepEqual(r.parks(), []);
+  assert.equal(fs.readFileSync(path.join(r.clone.path, "retained.txt"), "utf8"), "local work\n");
+});
+
+for (const fault of TRANSIENT) {
+  it("control: a transient post-adoption read failure continues to the model: " + String(fault), async () => {
+    const r = await drive({ script: [fault] });
+    assert.equal(r.windowGets, 2);
+    assert.equal(r.windowWaits, 1);
+    assert.equal(r.models(), 1);
+    assert.equal(r.reserves(), 1);
+    assert.equal(r.prepares(), 1);
+    assert.equal(r.journal().recovery.attempts, 1);
+    assert.equal(r.warnings().length, 0);
+    assert.deepEqual(r.parks(), []);
+    retriesLogOnlyClass(r, fault);
+  });
+}
+
+for (const fault of ["enotfound", "nocause", 403, "malformed", "truncated"] as Fault[]) {
+  it("control: a non-transient post-adoption read failure is today's confirmed adoption_failed park: " + String(fault), async () => {
+    const r = await drive({ script: [fault] });
+    assert.equal(r.windowGets, 1, "no retry");
+    assert.equal(r.windowWaits, 0);
+    assert.equal(r.models(), 0);
+    assert.equal(r.retryLogs().length, 0);
+    assert.deepEqual(r.warnings().map(line => line.diagnostic_code), ["retained_successor_post_adoption_check"]);
+    assert.equal(r.parks().length, 1);
+    assert.equal(r.parks()[0]!.body.recovery_cause, "retained_recovery_adoption_failed");
+    assert.equal(r.states("failed").length, 0);
+    assert.equal(r.journal().recovery.stage, "blocked");
+    assert.equal(r.journal().recovery.blocker, "adoption_failed");
+  });
+}
+
+const stops: Array<[string, Fault[]]> = [
+  ["a wrong generation on the first read", ["other-generation"]],
+  ["a wrong status on the first read", ["other-status"]],
+  ["a strict 404 on the first read", ["not-owned"]],
+  ["a generation change after a transient failure", [503, "other-generation"]],
+  ["a strict 404 after a transient failure", [503, "not-owned"]],
+];
+for (const [name, script] of stops) {
+  it("control: " + name + " stops without a failure, park or model", async () => {
+    const r = await drive({ script });
+    assert.equal(r.windowGets, script.length, "exactly one further read after the transient failure, then stop");
+    assert.equal(r.windowWaits, script.length - 1);
+    assert.equal(r.models(), 0);
+    assert.equal(r.warnings().length, 0);
+    assert.deepEqual(r.parks(), []);
+    assert.equal(r.states("failed").length, 0);
+    assert.equal(r.journal().recovery.stage, "ready-for-model");
+  });
+}
+
+it("control: a wait the iteration deadline cannot afford is not started and ends as today's adoption_failed park", async t => {
+  const r = await drive({ script: [503], onGet: (n, deadline) => { if (n === 1) t.mock.method(Date, "now", () => deadline - 1); } });
+  assert.equal(r.windowWaits, 0);
+  assert.equal(r.windowGets, 1);
+  assert.equal(r.retryLogs().length, 0);
+  assert.equal(r.models(), 0);
+  assert.deepEqual(r.warnings().map(line => line.diagnostic_code), ["retained_successor_post_adoption_check"]);
+  assert.equal(r.parks().length, 1);
+  assert.equal(r.journal().recovery.blocker, "adoption_failed");
+});
+
+it("control: a deadline that expires during the read ends as budget_exhausted without another read", async t => {
+  const r = await drive({ script: [503], onGet: (n, deadline) => { if (n === 1) t.mock.method(Date, "now", () => deadline); } });
+  assert.equal(r.windowGets, 1);
+  assert.equal(r.windowWaits, 0);
+  assert.equal(r.models(), 0);
+  assert.equal(r.journal().recovery.blocker, "budget_exhausted");
+  assert.deepEqual(r.parks(), []);
+  assert.equal(r.states("failed").length, 1);
+});
+
+it("control: a deadline that expires during the wait refuses the next read before any request", async t => {
+  const r = await drive({ script: [503], afterWait: (_flight, _runner, _n, deadline) => { t.mock.method(Date, "now", () => deadline + 1); } });
+  assert.equal(r.windowWaits, 1);
+  assert.equal(r.windowGets, 1, "the next read was refused before a request was made");
+  assert.equal(r.models(), 0);
+  assert.equal(r.journal().recovery.blocker, "budget_exhausted");
+  assert.deepEqual(r.parks(), []);
+  assert.equal(r.states("failed").length, 1);
+});
+
+it("control: five transient failures exhaust the attempt cap and end as today's adoption_failed park", async () => {
+  const r = await drive({ script: Array<Fault>(5).fill("econnreset") });
+  assert.equal(r.windowGets, 5, "the sixth read (which the fixture would serve) is never made");
+  assert.equal(r.windowWaits, 4);
+  assert.equal(r.retryLogs().length, 4);
+  assert.deepEqual(r.retryLogs().map(line => line.attempt), [1, 2, 3, 4]);
+  assert.equal(r.models(), 0);
+  assert.deepEqual(r.warnings().map(line => line.diagnostic_code), ["retained_successor_post_adoption_check"]);
+  assert.equal(r.parks().length, 1);
+  assert.equal(r.journal().recovery.blocker, "adoption_failed");
+});
+
+const interruptions = ["cancel", "pause now", "pause wall", "disk", "switch", "shutdown"] as const;
+for (const kind of interruptions) {
+  it("control: " + kind + " during the retry wait ends the retry with no further read, park or model", async () => {
+    const r = await drive({
+      script: [503],
+      onWait: (flight, runner) => {
+        const route = (k: string, body?: string) => flight.steering.route(k, body, 1, false, undefined);
+        if (kind === "cancel") route("cancel");
+        else if (kind === "pause now") route("pause", "now");
+        else if (kind === "pause wall") route("pause", "wall");
+        else if (kind === "disk") flight.steering.requestDiskStop();
+        else if (kind === "switch") flight.steering.tripCredentialSwitch(2);
+        else runner.shutdown();
+      },
+    });
+    assert.equal(r.windowWaits, 1);
+    assert.equal(r.windowGets, 1, "no read after the interruption");
+    assert.equal(r.models(), 0);
+    assert.equal(r.warnings().length, 0, "runtime stop sentinels bypass operational warnings");
+    assert.deepEqual(r.parks(), []);
+    const failed = r.states("failed");
+    if (kind === "cancel") assert.deepEqual(failed.map(state => state.body.failure_reason), ["run cancelled"]);
+    else assert.equal(failed.length, 0);
+    assert.equal(r.journal().recovery.stage, "ready-for-model");
+    assert.ok(fs.existsSync(r.successor!.path), "successor custody remains");
+  });
+}
+
+it("control: a milestone pause request does not interrupt the retry", async () => {
+  const r = await drive({
+    script: [503],
+    onWait: flight => { flight.steering.route("pause", "milestone", 1, false, undefined); },
+  });
+  assert.equal(r.windowGets, 2);
+  assert.equal(r.windowWaits, 1);
+  assert.equal(r.models(), 1);
+});
+
+it("control: a Codex-like executor's second ownership re-check retries a transient failure and continues", async () => {
+  const r = await drive({ safety: true, script: ["ok", 503] });
+  assert.equal(r.windowGets, 3, "check, failed re-check, retried re-check");
+  assert.equal(r.windowWaits, 1);
+  assert.equal(r.models(), 1);
+  assert.equal(r.retryLogs().length, 1);
+  assert.deepEqual(r.parks(), []);
+});
+
+it("control: a Codex-like executor's second ownership re-check with an unknown failure is today's quiescence_failed", async () => {
+  const r = await drive({ safety: true, script: ["ok", "enotfound"] });
+  assert.equal(r.windowGets, 2);
+  assert.equal(r.windowWaits, 0);
+  assert.equal(r.models(), 0);
+  assert.equal(r.journal().recovery.blocker, "quiescence_failed");
+  assert.deepEqual(r.parks(), []);
+  assert.match(r.states("failed")[0]!.body.failure_reason ?? "", /quiescent/);
+});

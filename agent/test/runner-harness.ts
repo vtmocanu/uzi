@@ -53,7 +53,7 @@ export let homeDir: string;
  * test body reads whatever this hook most recently assigned -- which is why
  * splitting runner.test.ts needed no edits inside any test body.
  */
-export function installHarness(clientOptions: { httpTimeoutMs?: number } = {}): void {
+export function installHarness(clientOptions: { httpTimeoutMs?: number; fetch?: typeof fetch } = {}): void {
   // issue #2213: a runner flow over a planted unreadable process latches the worker-wide quarantine.
   resetResidueQuarantineAfterEach();
   beforeEach(async (t) => {
