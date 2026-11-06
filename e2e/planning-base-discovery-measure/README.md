@@ -32,14 +32,21 @@ command, and yields about every 20 ms.
 - **Default configurations:**
   - 1536 MiB / 1 CPU, the compose per-slot budget (`docker-compose.yml`), with modes `full`,
     `control` and `cancel`;
-  - 4 GiB / 2 CPU, the chart worker default, with mode `full`.
+  - 4 GiB / 2 CPU, with mode `full`. This is the compose whole-worker default
+    (`AGENT_MEM_LIMIT:-4g`, `AGENT_CPUS:-2`) and the chart's namespace LimitRange default. Hosted
+    workers use size presets instead.
+- Each container first runs a no-op warm-up start. A fresh container's first start carries a
+  node/tsx startup transient (about 140 MiB cgroup peak, against about 60 MiB later), so no
+  measurement is a first start.
 
 ```sh
 OUT=/abs/out REPO_SHA=<commit> ./e2e/planning-base-discovery-measure/run.sh   # full matrix
 OUT=/abs/out FIXTURES="fanout2-d8 chain-d64" MEM_CONFIGS="1536m:1:full" ./e2e/planning-base-discovery-measure/run.sh
 ```
 
-`OUT` is reused: fixtures already generated there are kept. The table is
+`OUT` is reused: fixtures already generated there are kept, and each job deletes its own
+earlier records before it starts. The report renders every result present in `results/`, so use a
+fresh `OUT` (or keep its fixtures and clear `results/`) for one invocation's table. The table is
 `$OUT/results/results.md`, and the raw per-job JSON sits beside it.
 
 ## Fixtures (deterministic generator)
@@ -79,7 +86,10 @@ would have to happen before any capture.
   1. abort → `settled()` ≤ 2000 ms;
   2. `survivors()` is empty;
   3. no `uzi-planning-*` remains in the helper's actual TMPDIR, the one recorded from the spawn
-     request.
+     request. That TMPDIR must also equal the job's own temp dir.
+
+  The abort must also have landed before the capture's outcome. A trigger that fires afterwards
+  is marked `after outcome` and is not `ok`, and only then is a refusal relabelled `cancelled`.
 
   Helper exit 143 only means the SIGTERM handler reached `process.exit`. That handler is
   `try { cleanup(); } finally { process.exit(143); }`, so 143 is not proof of cleanup.
@@ -97,7 +107,8 @@ report `no`.
 - **tree RSS:** the sum of VmRSS over the helper and its descendants, sampled every 10 ms. It
   can miss short peaks, and it double-counts shared pages.
 - **cgroup peak:** `memory.peak` at the boundary and at the end. It is the authoritative
-  container figure, and it includes the harness parent (about 70–90 MiB idle) and page cache.
+  container figure, and it includes the harness parent (about 60 MiB at capture start, recorded
+  per job as `cgroup.currentAtStart`) and page cache.
 
 **Termination classes:**
 - `oom` only with affirmative evidence: Docker `OOMKilled`, or an increase in `memory.events`
@@ -105,7 +116,9 @@ report `no`.
 - `killed_by_harness` when `run.sh` itself issued `docker kill` after `START_TIMEOUT`. This is
   recorded before the kill.
 - `killed_unknown` for any other exit 137.
-- `harness_error` for other failures.
+- `helper_killed_unknown` when the helper died by a signal (TickSpawner code 128) that the
+  envelope did not send, with no OOM evidence and no cancel.
+- `harness_error` for other failures of the harness process itself.
 
 For killed runs, values from the last persisted snapshot (every 100 ms) are shown as `≥` lower
 bounds. Unavailable values are `n/a`.

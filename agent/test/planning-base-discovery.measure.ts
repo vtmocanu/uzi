@@ -152,7 +152,7 @@ function generate(spec: string, dir: string, inputs: string): Manifest {
     { env: PINNED_ENV, stdio: "pipe" });
   const commit = git(clone, ["rev-parse", "HEAD"]);
   const manifest: Manifest = {
-    spec, kind: spec.replace(/[-\d].*$/, ""), description, commit, tree,
+    spec, kind: spec.replace(/-.*$/, ""), description, commit, tree,
     expectedTreeOccurrences: trees.toString(), expectedLeafOccurrences: leaves.toString(),
     checkout, generationMs: Date.now() - started,
   };
@@ -359,7 +359,7 @@ async function measure(job: MeasureJob): Promise<void> {
   let lastPersist = 0;
   const ac = new AbortController();
   // Held in an object: TypeScript does not see closure assignments to a local `let`.
-  const st: { cancel?: { trigger: string; at: number }; completion?: { code: number } | { rejected: string } } = {};
+  const st: { cancel?: { trigger: string; at: number }; completion?: { code: number } | { rejected: string }; outcomeAt?: number } = {};
   const watcher = setInterval(() => {
     live.elapsedMs = Date.now() - live.startedAt;
     if (instrumented) {
@@ -369,7 +369,7 @@ async function measure(job: MeasureJob): Promise<void> {
         boundarySeen = true;
         live.cgroupPeakAtBoundary = cgroupNumber("memory.peak");
       }
-      if (job.mode === "cancel" && !st.cancel && h) {
+      if (job.mode === "cancel" && !st.cancel && st.outcomeAt === undefined && h) {
         const n = job.cancelAfterTreeOccurrences ?? 50;
         if (!boundarySeen && (h.treeOccurrences ?? 0) >= n) st.cancel = { trigger: `mid_discovery:treeOccurrences>=${n}`, at: Date.now() };
         else if (boundarySeen && h.firstPostBoundarySpawnMs !== null && h.firstPostBoundarySpawnMs !== undefined) {
@@ -418,11 +418,15 @@ async function measure(job: MeasureJob): Promise<void> {
   try {
     const bytes = await cache.withBoundaryProcessSpawner(wrapped, ownerSignal,
       () => cache.capturePlanningDiff(clone, manifest.commit, bare));
+    st.outcomeAt = Date.now();
     outcome = { kind: "completed", patchBytes: bytes.length };
   } catch (error) {
     const message = String((error as Error)?.message ?? error);
+    st.outcomeAt = Date.now();
     const c = classifyPlanningCaptureError(message);
-    outcome = { kind: st.cancel ? "cancelled" : "refused", refusal: c.refusal, token: c.diagnostic, message: message.slice(0, 300) };
+    // `cancelled` only when the abort landed before the capture's outcome.
+    const cancelled = st.cancel !== undefined && st.cancel.at <= st.outcomeAt;
+    outcome = { kind: cancelled ? "cancelled" : "refused", refusal: c.refusal, token: c.diagnostic, message: message.slice(0, 300) };
   } finally {
     clearTimeout(scopeTimer);
     scope.abort();
@@ -437,10 +441,17 @@ async function measure(job: MeasureJob): Promise<void> {
   // A completion handler may still be pending one tick after settlement.
   await new Promise((r) => setImmediate(r));
   const helper = instrumented ? readJson<HelperMetrics>(helperPath) : undefined;
-  const leftover = fs.readdirSync(job.tmp).filter((n) => n.startsWith("uzi-planning-"));
+  // Scan the TMPDIR the helper was actually spawned with; flag any mismatch with the job's dir.
+  const scanned = live.spawnTmpdir ?? job.tmp;
+  const tmpdirMatches = live.spawnTmpdir === job.tmp;
+  const leftover = fs.readdirSync(scanned).filter((n) => n.startsWith("uzi-planning-"));
   const survivors = spawner.survivors();
   const oomDelta = (() => { const now = oomKills(); return now === null || live.oomKillsAtStart === null ? null : now - live.oomKillsAtStart; })();
   if (oomDelta !== null && oomDelta > 0) outcome = { ...outcome, kind: "oom", oomKillDelta: oomDelta };
+  // A helper signal death that no envelope signal explains (code 128 with nothing sent, no OOM
+  // evidence, no cancel) is not a refusal.
+  else if (outcome.kind === "refused" && st.completion && "code" in st.completion && st.completion.code === 128
+      && live.signals.length === 0) outcome = { ...outcome, kind: "helper_killed_unknown" };
   const result = {
     label: job.label, spec: manifest.spec, fixture: manifest, mode: job.mode,
     memLimit: process.env.MEASURE_MEM_LIMIT ?? null, cpus: process.env.MEASURE_CPUS ?? null,
@@ -463,10 +474,13 @@ async function measure(job: MeasureJob): Promise<void> {
     signals: live.signals,
     survivors,
     spawnTmpdir: live.spawnTmpdir,
+    tmpdirMatches,
     leftoverTemp: leftover,
     cancel: cancel ? {
       trigger: cancel.trigger, abortToSettledMs, graceMs: 2000,
-      cleanupOk: abortToSettledMs !== null && abortToSettledMs <= 2000 && survivors.length === 0 && leftover.length === 0,
+      landedBeforeOutcome: st.outcomeAt === undefined || cancel.at <= st.outcomeAt,
+      cleanupOk: (st.outcomeAt === undefined || cancel.at <= st.outcomeAt) && abortToSettledMs !== null
+        && abortToSettledMs <= 2000 && survivors.length === 0 && leftover.length === 0 && tmpdirMatches,
     } : null,
   };
   writeJson(resultPath, result);
@@ -494,13 +508,16 @@ function report(out: string): void {
     const term = readJson<Record<string, any>>(path.join(out, `${label}.term.json`));
     const liveRec = readJson<Record<string, any>>(path.join(out, `${label}.live.json`));
     const helperRec = readJson<Record<string, any>>(path.join(out, `${label}.helper.json`));
-    const [spec = label, mode = "?", mem = "?"] = label.split("__");
+    const [spec = label, base = "?", mem = "?", extra] = label.split("__");
+    const mode = extra ? `${base} (${extra})` : base;
     if (!r) {
       // Killed before the result was written: last persisted values are lower bounds.
       const kind = term?.oomKilled === true ? "oom" : term?.killedByHarness === true ? "killed_by_harness"
         : term?.exitCode === "137" ? "killed_unknown" : term ? "harness_error" : "missing";
       const h = helperRec ?? liveRec?.lastHelper;
-      rows.push(`| ${spec} | ${mode} | ${mem} | ${kind} (exit ${term?.exitCode ?? "?"}) | ${h?.boundaryMs != null ? "yes" : "no/unknown"} | ${h?.boundaryMs ?? "n/a"} | ≥${liveRec?.elapsedMs ?? "n/a"} | ≥${h?.treeOccurrences ?? "n/a"} | ≥${h?.treeEntries ?? "n/a"} | ≥${(h?.commitBytes ?? 0) + (h?.treeBytes ?? 0)} | ≥${h?.readSyncBytes ?? "n/a"} | ≥${KiBtoMiB(h?.boundaryMaxRssKiB)} / ≥${KiBtoMiB(h?.maxRssKiB)} | ≥${MiB(liveRec?.treeRssDiscoveryPeak)} / ≥${MiB(liveRec?.treeRssPeak)} | ${MiB(liveRec?.cgroupPeakAtBoundary)} / n/a | n/a |`);
+      const L = (v: unknown): string => (v === undefined || v === null ? "n/a" : `≥${String(v)}`);
+      const objBytes = h ? (h.commitBytes ?? 0) + (h.treeBytes ?? 0) + (h.objectCheckBytes ?? 0) + (h.sizingBytes ?? 0) : undefined;
+      rows.push(`| ${spec} | ${mode} | ${mem} | ${kind} (exit ${term?.exitCode ?? "?"}) | ${h?.boundaryMs != null ? "yes" : "no/unknown"} | ${h?.boundaryMs ?? "n/a"} | ${L(liveRec?.elapsedMs)} | ${L(h?.treeOccurrences)} / ${readJson<Manifest>(path.join(out, "..", "fixtures", spec, "manifest.json"))?.expectedTreeOccurrences ?? "?"} | ${L(h?.treeEntries)} | ${L(objBytes)} | ${L(h?.readSyncBytes)} | ${KiBtoMiB(h?.boundaryMaxRssKiB)} / ${h?.maxRssKiB != null ? "≥" + KiBtoMiB(h.maxRssKiB) : "n/a"} | ${liveRec ? "≥" + MiB(liveRec.treeRssDiscoveryPeak) : "n/a"} / ${liveRec ? "≥" + MiB(liveRec.treeRssPeak) : "n/a"} | ${MiB(liveRec?.cgroupPeakAtBoundary)} / n/a | n/a |`);
       continue;
     }
     let kind: string = r.outcome?.kind ?? "?";
@@ -511,9 +528,9 @@ function report(out: string): void {
     const exp = r.fixture?.expectedTreeOccurrences ?? "?";
     const occ = d ? `${h.treeOccurrences ?? "n/a"} / ${exp}` : `n/a / ${exp}`;
     const objBytes = d ? String((h.commitBytes ?? 0) + (h.treeBytes ?? 0) + (h.objectCheckBytes ?? 0) + (h.sizingBytes ?? 0)) : "n/a";
-    const c = r.cancel ? `${r.cancel.abortToSettledMs}, ${r.cancel.cleanupOk ? "ok" : "NOT ok"} (${r.cancel.trigger})` : "";
+    const c = r.cancel ? `${r.cancel.abortToSettledMs}, ${r.cancel.cleanupOk ? "ok" : "NOT ok"} (${r.cancel.trigger}${r.cancel.landedBeforeOutcome === false ? "; after outcome" : ""})` : "";
     // A helper that died by a signal (OOM or otherwise) left only its last snapshot: lower bounds.
-    const killed = kind === "oom" || (r.helperCompletion && "rejected" in r.helperCompletion) || r.helperCompletion?.code === 128;
+    const killed = kind === "oom" || kind === "helper_killed_unknown" || (r.helperCompletion && "rejected" in r.helperCompletion) || r.helperCompletion?.code === 128;
     const B = (v: unknown): string => {
       const text = v === undefined || v === null ? "n/a" : String(v);
       return killed && !text.startsWith("n/a") ? `≥${text}` : text;
@@ -532,7 +549,9 @@ function report(out: string): void {
 type Job =
   | { kind: "generate"; spec: string; dir: string; inputs: string }
   | MeasureJob
-  | { kind: "report"; out: string };
+  | { kind: "report"; out: string }
+  // Absorbs a container's first-start transients so no measurement is the first start.
+  | { kind: "noop" };
 
 async function main(): Promise<void> {
   const [command, arg] = process.argv.slice(2);
@@ -548,7 +567,7 @@ async function main(): Promise<void> {
   } else if (job.kind === "measure") {
     await measure(job);
     process.stdout.write(`measured ${job.label}\n`);
-  } else {
+  } else if (job.kind === "report") {
     report(job.out);
   }
 }

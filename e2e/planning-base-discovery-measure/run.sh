@@ -28,6 +28,16 @@ START_TIMEOUT="${START_TIMEOUT:-120}"
 GEN_TIMEOUT="${GEN_TIMEOUT:-1200}"
 SMOKE_INJECT="${SMOKE_INJECT:-}"
 
+for spec in $FIXTURES; do
+  # Specs are interpolated into job JSON and paths: allow only the generator's own grammar.
+  case "$spec" in
+    repo|synthetic-[0-9]*|chain-d[0-9]*|fanout2-d[0-9]*|wide-[0-9]*x[0-9]*) ;;
+    *) echo "unknown fixture spec: $spec" >&2; exit 2 ;;
+  esac
+  case "$spec" in *[!a-z0-9x-]*) echo "unsafe fixture spec: $spec" >&2; exit 2 ;; esac
+done
+[ -n "$MEM_CONFIGS" ] || { echo "MEM_CONFIGS is empty" >&2; exit 2; }
+
 mkdir -p "$OUT/inputs" "$OUT/fixtures" "$OUT/results" "$OUT/tmp" "$OUT/logs"
 
 log() { printf '### %s\n' "$*"; }
@@ -37,7 +47,7 @@ log() { printf '### %s\n' "$*"; }
 CREATED=()
 cleanup() {
   local name
-  for name in "${CREATED[@]}"; do docker rm -f "$name" >/dev/null 2>&1 || true; done
+  for name in ${CREATED[@]+"${CREATED[@]}"}; do docker rm -f "$name" >/dev/null 2>&1 || true; done
 }
 trap cleanup EXIT
 
@@ -75,15 +85,19 @@ create_container() {
 run_job() {
   local name="$1" label="$2" limit="$3" job="$4" term="$OUT/results/$2.term.json"
   printf '%s\n' "$job" > "$OUT/job.json"
-  rm -f "$term"
+  # A job that dies before writing its own records must never pair with an older invocation's.
+  rm -f "$term" "$OUT/results/$label.json" "$OUT/results/$label.live.json" "$OUT/results/$label.helper.json"
   docker start "$name" >/dev/null
-  local killed=false code
-  if ! code="$(timeout "$limit" docker wait "$name")"; then
+  local killed=false code rc=0
+  code="$(timeout "$limit" docker wait "$name")" || rc=$?
+  if [ "$rc" -eq 124 ]; then
     # Record that the harness itself killed the container BEFORE killing it.
     killed=true
     printf '{"label":"%s","killedByHarness":true}\n' "$label" > "$term"
     docker kill "$name" >/dev/null 2>&1 || true
     code="$(docker wait "$name" 2>/dev/null || echo unknown)"
+  elif [ "$rc" -ne 0 ]; then
+    code="wait_failed_rc_$rc"
   fi
   local oom
   oom="$(docker inspect -f '{{.State.OOMKilled}}' "$name")"
@@ -100,6 +114,10 @@ for config in $MEM_CONFIGS; do
   idx=$((idx + 1))
   name="pbd-measure-$$-$idx"
   create_container "$name" "$mem" "$cpus"
+  # The first start of a fresh container carries a node/tsx startup transient (about 140 MiB
+  # cgroup peak vs about 60 MiB later); absorb it so no measurement is a first start.
+  run_job "$name" "warmup__$idx" "$GEN_TIMEOUT" '{"kind":"noop"}'
+  mv "$OUT/results/warmup__$idx.term.json" "$OUT/logs/warmup__$idx.term.json"
   for spec in $FIXTURES; do
     if [ ! -f "$OUT/fixtures/$spec/manifest.json" ] && [ "${generated#* "$spec" }" = "$generated" ]; then
       run_job "$name" "gen__$spec" "$GEN_TIMEOUT" \
@@ -122,6 +140,7 @@ for config in $MEM_CONFIGS; do
 done
 
 log "rendering $OUT/results/results.md"
-run_job "${CREATED[0]}" "report" 300 '{"kind":"report","out":"/out/results"}'
 rm -f "$OUT/results/report.term.json"
+run_job "${CREATED[0]}" "report" 300 '{"kind":"report","out":"/out/results"}'
+mv "$OUT/results/report.term.json" "$OUT/logs/report.term.json"
 cat "$OUT/results/results.md"
