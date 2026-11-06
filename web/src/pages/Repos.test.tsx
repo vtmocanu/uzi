@@ -24,6 +24,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       setRepoToolProfile: vi.fn(),
       setRepoDevboxOptIn: vi.fn(),
       setRepoFoldImproveUziBacklog: vi.fn(),
+      setRepoAgentSourceDefault: vi.fn(),
       setRepoRequiredCapabilities: vi.fn(),
       setRepoIgnoredInferredCapabilities: vi.fn(),
       setRepoGuardrailOverride: vi.fn(),
@@ -419,6 +420,29 @@ describe("Repos — board list layout (issue #578)", () => {
     fireEvent.click(within(panel).getByRole("switch", { name: "Repo skills" }));
     await waitFor(() => expect(mockApi.setRepoSkillsEnabled).toHaveBeenCalledWith("repo-atlas", false));
     expect(mockApi.setRepoClaudemdEnabled).not.toHaveBeenCalled();
+  });
+
+  it("the default-agents control patches agent_source_default and shows the planning warning for repo agents", async () => {
+    mockApi.setRepoAgentSourceDefault.mockResolvedValue({
+      repo: { ...REPOS[1], agent_source_default: "repo" },
+    });
+    const panel = await openTrustPanel("vtmocanu/atlas");
+    const select = within(panel).getByLabelText("Default agents for my runs on this repo") as HTMLSelectElement;
+    expect(select.value).toBe("");
+    expect(within(panel).queryByText(/Repo agents can run shell commands while planning/)).toBeNull();
+
+    fireEvent.change(select, { target: { value: "repo" } });
+    await waitFor(() => expect(mockApi.setRepoAgentSourceDefault).toHaveBeenCalledWith("repo-atlas", "repo"));
+    expect(
+      await within(panel).findByText("Repo agents can run shell commands while planning, before you review the plan."),
+    ).toBeTruthy();
+    expect(mockApi.setRepoSkillsEnabled).not.toHaveBeenCalled();
+
+    mockApi.setRepoAgentSourceDefault.mockResolvedValue({
+      repo: { ...REPOS[1], agent_source_default: null },
+    });
+    fireEvent.change(select, { target: { value: "" } });
+    await waitFor(() => expect(mockApi.setRepoAgentSourceDefault).toHaveBeenLastCalledWith("repo-atlas", null));
   });
 
   it("the Repo instructions sub-toggle patches only repo_claudemd_enabled", async () => {

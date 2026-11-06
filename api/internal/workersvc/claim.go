@@ -289,7 +289,8 @@ type ClaimPayload struct {
 	// Nil, not an empty selection, when the run never reached a gate — the worker's
 	// absent-default is correct there and must stay reachable. Additive on the wire:
 	// an old worker ignores the key and behaves exactly as it does today.
-	AgentSelection *AgentSelection `json:"agent_selection,omitempty"`
+	AgentSelection       *AgentSelection `json:"agent_selection,omitempty"`
+	RequestedAgentSource *string         `json:"requested_agent_source,omitempty"`
 
 	// Milestones is the run's FROZEN, human-approved milestone list (PRD #122 M1),
 	// decoded from runs.milestones_frozen and replayed on every claim so a resumed

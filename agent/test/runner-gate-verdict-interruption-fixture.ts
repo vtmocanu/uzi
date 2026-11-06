@@ -108,7 +108,7 @@ interface Block { entered: Promise<void>; release: () => void }
 class Model {
   readonly turns: Turn[] = [];
   revisions = 0;
-  private readonly blocks: Record<TurnKind, Array<{ entered: () => void; released: Promise<void> }>> = {
+  private readonly blocks: Record<TurnKind, Array<{ entered: () => void; released: Promise<void>; ignoreAbort: boolean }>> = {
     plan: [],
     revise: [],
     implement: [],
@@ -117,12 +117,14 @@ class Model {
   askInNextRevise = false;
   private answerTurnPending = false;
 
-  block(kind: TurnKind): Block {
+  /** Hold the next `kind` turn mid-turn. With `ignoreAbort` the held turn does not end when its turn is
+   *  aborted: it waits for the release (a model that finishes its step after the owner already moved on). */
+  block(kind: TurnKind, opts: { ignoreAbort?: boolean } = {}): Block {
     let entered!: () => void;
     let release!: () => void;
     const e = new Promise<void>((r) => (entered = r));
     const released = new Promise<void>((r) => (release = r));
-    this.blocks[kind].push({ entered, released });
+    this.blocks[kind].push({ entered, released, ignoreAbort: opts.ignoreAbort === true });
     return { entered: e, release };
   }
 
@@ -145,7 +147,7 @@ class Model {
       const block = this.answerTurnPending ? undefined : this.blocks[kind].shift();
       if (block) {
         block.entered();
-        const aborted = await Promise.race([
+        const aborted = block.ignoreAbort ? await block.released.then(() => false) : await Promise.race([
           block.released.then(() => false),
           new Promise<boolean>((r) => {
             if (signal.aborted) return r(true);

@@ -431,6 +431,8 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		dto.AgentExclusions = excl
 	}
 	dto.AgentSource = textPtrValue(r.AgentSource.Valid, r.AgentSource.String)
+	dto.AgentSourceRequested = textPtrValue(r.AgentSourceRequested.Valid, r.AgentSourceRequested.String)
+	dto.AgentSourceRequestedBasis = textPtrValue(r.AgentSourceRequestedBasis.Valid, r.AgentSourceRequestedBasis.String)
 	// PRD #122 M1: the FROZEN milestone list. Degrades gracefully on a decode error
 	// (impossible in practice — every write is validated and the column carries a
 	// jsonb_typeof CHECK), logged and treated as "no list" rather than failing the read.

@@ -593,6 +593,9 @@ retained recovery keep same-path continuity.
 
 A confirmed `adoption_failed` blocker can instead hold at `recovery_wait` /
 `retained_recovery_adoption_failed` for owner Resume or Cancel, with no timer.
+A temporary API connection failure of the ownership check after the successor
+is verified is retried in place first; see
+[Retained recovery adoption failed](run-recovery-wait.md#retained-recovery-adoption-failed).
 A retained continuation whose `running` report the server refuses, and whose
 flight departed or showed presence without a witnessed departure, is charged
 against the requeue budget or held at `retained_continuation_unwitnessed`

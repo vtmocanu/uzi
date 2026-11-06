@@ -547,7 +547,7 @@ export function RunRow({
               )}
               {/* PRD #2602: the waiting/stalled progress flags; percentages appear in the
                   status pill. Hidden with milestones under waitingForVault. */}
-              <RunProgressCell run={run} now={now} />
+              <RunProgressCell run={run} now={now} subject={showOwner ? "owner" : "you"} />
               {/* The health flag (PRD #47) sits beside the status pill; hidden here
                   when waitingForVault already explains a locked queued run, and when
                   the progress cell's stalled flag already shows the stall. */}
