@@ -83,6 +83,8 @@ interface Opts {
   inventoryGuarded?: boolean;
   protocolFeatures?: string[];
   runnerOpts?: Record<string, unknown>;
+  /** Extra members of the (Claude-style) predecessor executor. */
+  executor?: Partial<Executor>;
 }
 
 async function drive(o: Opts = {}) {
@@ -138,7 +140,7 @@ async function drive(o: Opts = {}) {
     // The first executor is the predecessor's; a Codex predecessor is replaced by an ordinary one for the successor.
     return { homeDir: path.join(homeDir, runId), executor: rig && makeCalls++ === 0
       ? new FakeCodexExecutor(rig.safety, run, rig.settle, rig.capture)
-      : { run } };
+      : { run, ...o.executor } };
   };
   const logs = recordingLogger();
   const runner = runnerWith(make, fakeGitlab().gitlab, JOURNAL_KEY, logs.logger, {
@@ -494,6 +496,24 @@ it("an operation that settles after the scope deadline is a late settlement and 
   assertStopped(r);
   assert.match(String(logged(r, "retained predecessor FINAL pass").at(-1)?.stop_reason), /settlement_late/);
   assertNoLeakedBudget(r);
+});
+
+it("a held scope that settles incomplete without throwing stops: no operation, custody kept, no successor", async () => {
+  // Only the predecessor pass's own command settlement is unconfirmed; the earlier quiescence proof must still pass.
+  let inPass = false;
+  const r = await drive({
+    executor: { settleWorkerCommands: async () => ({ confirmed: !inPass }) },
+    observe: world => {
+      const settle = world.internals.settlePredecessorHolds.bind(world.internals);
+      world.internals.settlePredecessorHolds = async (...args) => {
+        inPass = true;
+        try { return await settle(...args); } finally { inPass = false; }
+      };
+    },
+  });
+  assert.deepEqual(operations(r), [], "the unproven scope never ran an operation");
+  assertStopped(r);
+  assert.match(String(logged(r, "retained predecessor FINAL pass").at(-1)?.stop_reason), /scope_incomplete/);
 });
 
 it("an operation that never settles keeps the flight inside the held scope, and no successor is created meanwhile", async () => {

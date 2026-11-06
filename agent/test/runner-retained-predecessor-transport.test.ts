@@ -197,10 +197,10 @@ interface Pre {
 }
 
 function kindOf(url: string): Kind | undefined {
-  if (/\/recovery-holds\?generation=/.test(url)) return "exact";
-  if (/\/recovery-holds$/.test(url)) return "holds";
-  if (/\/archives\/reserve$/.test(url)) return "reserve";
-  if (/\/archives\/release$/.test(url)) return "release";
+  if (url.includes("/recovery-holds?generation=")) return "exact";
+  if (url.endsWith("/recovery-holds")) return "holds";
+  if (url.endsWith("/archives/reserve")) return "reserve";
+  if (url.endsWith("/archives/release")) return "release";
   if (/\/archives\/[^/]+\/upload$/.test(url)) return "upload";
   if (/\/archives\/[^/]+\/reconcile$/.test(url)) return "reconcile";
   if (/\/archives\/[^/]+$/.test(url)) return "status";
@@ -468,8 +468,10 @@ it("an abort that never settles leaves the flight held with no successor; cancel
 });
 
 it("the api commits the FINAL and the response stalls: the saved request stays journaled and an ordinary replay recovers the ACK", async () => {
+  // The cap clock starts with the pass, so it must outlast the capture and upload that precede the release POST on a
+  // loaded host; the stall itself then lasts until the cap aborts the request.
   const r = await drive({
-    budget: { actionCapMs: 3_500 },
+    budget: { actionCapMs: 15_000 },
     arrange: server => {
       server.hooks.release = ctx => {
         const request = JSON.parse(ctx.body.toString("utf8"));
@@ -494,6 +496,35 @@ it("the api commits the FINAL and the response stalls: the saved request stays j
   assert.deepEqual(bodies.at(-1)!.body.final_disposition, saved!.disposition);
   const after = (await r.recovery.inspect(r.claim.run_id)).find(x => x.generation === 2);
   assert.ok(after === undefined || after.finalAcknowledged === true, "the replay's ACK was journaled (or the acknowledged record was retired)");
+});
+
+it("an integrity failure latched and then a thrown cap abort still stops: the latch survives the throw, no successor", async () => {
+  const r = await drive({
+    budget: { actionCapMs: 3_000 },
+    arrange: (_server, world) => {
+      const coordinator = world.recovery as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
+      // The capture throws before anything is produced: the coordinator latches capture_exception (the operation's own
+      // signal has not aborted yet) and falls through to markFailure.
+      // Only the predecessor operation is faulted; the flight's ordinary capture before it must keep working.
+      const inPredecessorOperation = (): boolean => world.operateSignals.length > 0;
+      const produceBundle = coordinator.produceBundle!.bind(world.recovery);
+      coordinator.produceBundle = async (...args) => {
+        if (!inPredecessorOperation()) return produceBundle(...args);
+        throw new Error("injected bundle production failure");
+      };
+      const markFailure = coordinator.markFailure!.bind(world.recovery);
+      coordinator.markFailure = async (...args) => {
+        if (!inPredecessorOperation()) return markFailure(...args);
+        const signal = world.operateSignals[0]!;
+        // Hold the failure write until the cap has aborted the operation, so the post-action budget check throws.
+        if (!signal.aborted) await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+        return markFailure(...args);
+      };
+    },
+  });
+  assert.equal(pass(r).capped, true, "the cap fired while the failure write was held");
+  assert.equal(r.operated[0]!.outcome, undefined, "the coordinator threw: the outcome that would carry the latch was lost");
+  assertStopped(r, /integrity:capture_exception/);
 });
 
 // ── integrity failures through the real coordinator ──────────────────────────────────────────────────────────────────

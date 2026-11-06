@@ -371,6 +371,10 @@ export interface PredecessorOperation {
   /** Remaining bytes this operation may upload; mutated (charged) before each upload dispatch. */
   uploadAllowance: { remaining: number };
   measurements?: PredecessorMeasurements;
+  /** Caller-owned sink for the integrity latch, written when the operation ends either way. A throw after the latch
+   *  (a post-action budget check, a capture cycle's catch) carries no {@link RecoveryOutcome}, so this is the only
+   *  channel that cannot be lost. The first latched code wins. */
+  integrity?: { failure?: string };
 }
 
 /** Thrown at an authority checkpoint once a predecessor scope's {@link PredecessorOperation.live} is false. The
@@ -3261,7 +3265,10 @@ export class RecoveryCoordinator {
     try {
       const outcome = await this.predecessorScope.run(scope, run);
       return scope.integrityFailure === undefined ? outcome : { ...outcome, predecessor: { integrityFailure: scope.integrityFailure } };
-    } finally { scope.ended = true; }
+    } finally {
+      scope.ended = true;
+      if (scope.integrityFailure !== undefined && predecessor.integrity) predecessor.integrity.failure ??= scope.integrityFailure;
+    }
   }
 
   private async frozenOperationCycle(input: CaptureInput, options: FrozenOperationOptions = {}): Promise<RecoveryOutcome> {

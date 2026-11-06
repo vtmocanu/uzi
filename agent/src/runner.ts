@@ -26918,9 +26918,11 @@ export class RunRunner {
         const watchdog = setTimeout(() => registration.markSettlementLate(), Math.max(0, scopeDeadline - Date.now()));
         watchdog.unref?.();
         const capAbort = new AbortController();
+        const capReason = new Error("predecessor action cap reached");
+        const integrity: { failure?: string } = {};
         const capTimer = setTimeout(() => {
           verdict.capped = true;
-          capAbort.abort(new Error("predecessor action cap reached"));
+          capAbort.abort(capReason);
         }, Math.max(0, capDeadline - Date.now()));
         capTimer.unref?.();
         const capSignal = AbortSignal.any([capAbort.signal, signal, this.retainedLifecycleSignal(flight),
@@ -26952,7 +26954,7 @@ export class RunRunner {
                   }, {
                     predecessor: {
                       claimGeneration: flight.claimGeneration, repoId: claim.repo.id, boundary: registration.token,
-                      live: registration.live, uploadAllowance: allowance, measurements,
+                      live: registration.live, uploadAllowance: allowance, measurements, integrity,
                     },
                   })), undefined, { closureBudget });
               }, { durationMs: Math.max(0, capDeadline - Date.now()) + 50, signal: capSignal });
@@ -26963,9 +26965,13 @@ export class RunRunner {
               // still answered: judge that outcome, never the late abort.
               if (outcome === undefined) {
                 sweepRefusals();
-                if (error instanceof PredecessorAuthorityLost) stop("authority_lost");
-                // The action cap aborts the candidate at a checkpoint: nothing was released, the hold stays as it was.
-                else if (!verdict.capped) {
+                // The coordinator may latch an integrity failure and then throw (a post-action budget check, a capture
+                // cycle's catch); the sink is the only carrier of that latch on a throw.
+                if (integrity.failure !== undefined) stop(`integrity:${integrity.failure}`);
+                else if (error instanceof PredecessorAuthorityLost) stop("authority_lost");
+                // The action cap's own abort lands at a checkpoint: nothing was released, the hold stays as it was. Any
+                // other throw, capped or not, is an operation failure.
+                else if (error !== capReason) {
                   log.warn("retained predecessor FINAL operation failed", formatRetainedRecoveryDiagnostic(error, flight.redactText));
                   stop("operation_error");
                 }
@@ -26974,13 +26980,15 @@ export class RunRunner {
             }
             if (outcome === undefined) { stop("operation_error"); break; }
             verdict.outcomes.push(`${record.generation}:${outcome.held ?? outcome.state}${outcome.reason ? "/" + outcome.reason : ""}`);
-            if (outcome.predecessor?.integrityFailure !== undefined) stop(`integrity:${outcome.predecessor.integrityFailure}`);
+            const latched = outcome.predecessor?.integrityFailure ?? integrity.failure;
+            if (latched !== undefined) stop(`integrity:${latched}`);
             sweepRefusals();
             // A residue refusal leaves every dependent (later) candidate on the same clone unsettled by design.
             if (verdict.stop || verdict.residue) break;
           }
           sweepRefusals();
-          if (registration.settlementLate) stop("settlement_late");
+          // The watchdog is a timer callback; the clock itself is authoritative if the callback has not fired yet.
+          if (registration.settlementLate || Date.now() >= scopeDeadline) stop("settlement_late");
         } finally {
           clearTimeout(watchdog);
           clearTimeout(capTimer);
