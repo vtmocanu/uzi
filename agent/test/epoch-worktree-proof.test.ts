@@ -525,13 +525,15 @@ it("P6: a FIFO at .git/info/exclude is refused before any launch", async t => {
   assertNoGit(rec);
 });
 
-it("P6: a FIFO at .git/config or .git/index is refused before any launch", async t => {
+it("P6: a FIFO at .git/config is UNKNOWN and at .git/index is a keep, both before any launch", async t => {
   for (const name of ["config", "index"]) {
     const file = inClone(".git", name), moved = file + ".moved";
     fs.renameSync(file, moved);
     mkfifo(file);
     const rec = recordLaunches(t);
-    assert.equal(await prove(), false);
+    // The config is an indirection input (a config redirect cannot be classified): UNKNOWN. The index is bulk: a keep.
+    if (name === "config") await assert.rejects(prove(), e => (e as Error).constructor.name === "AutomaticCompletenessUnknown");
+    else assert.equal(await prove(), false);
     assertNoGit(rec);
     fs.rmSync(file);
     fs.renameSync(moved, file);

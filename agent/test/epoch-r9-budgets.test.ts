@@ -233,8 +233,15 @@ const overflows: { name: string; limits: Limits; via: "stores" | "reason"; match
   { name: "maxMetadataRecords (physical object occurrences)", limits: { maxMetadataRecords: 100 }, via: "stores",
     match: /physical object occurrence limit/,
     prepare: () => {
-      for (let i = 0; i < 150; i++)
-        execFileSync("git", ["-C", bare, "hash-object", "-w", "--stdin"], { env: ENV, input: `occurrence ${i}\n` });
+      // Loose leaves share the record limit and are decided in the topology (UNKNOWN), so the occurrences are packed:
+      // two packs of 60 objects each fit the limit one by one and pass it together.
+      for (const label of ["a", "b"]) {
+        const lines: string[] = [];
+        for (let i = 0; i < 60; i++) lines.push(`blob\ndata ${`occurrence ${label} ${i}`.length}\noccurrence ${label} ${i}\n`);
+        // unpackLimit 0 keeps a small import as a pack instead of exploding it into loose objects.
+        execFileSync("git", ["-c", "fastimport.unpackLimit=0", "-C", bare, "fast-import", "--quiet"],
+          { env: ENV, input: lines.join("") });
+      }
     } },
   // Bulk metadata only: the config and `objects/info` (the indirection inputs) fit, then packed-refs does not.
   { name: "maxMetadataBytes (packed-refs, after the config and objects/info were classified)",
@@ -254,8 +261,9 @@ const overflows: { name: string; limits: Limits; via: "stores" | "reason"; match
   { name: "maxMetadataRecords (index entries)", limits: { maxMetadataRecords: 64 }, via: "reason",
     match: /^index: index entry limit$/, viaDiscard: false,
     prepare: () => {
-      // Every other record counter stays far below 64, so only the index count (100 more entries) can overflow.
-      for (let i = 0; i < 100; i++) fs.writeFileSync(path.join(clonePath, `staged-${i}`), `staged ${i}\n`);
+      // Every other record counter stays far below 64 (the files share one blob, so one loose leaf), so only the
+      // index count (100 more entries) can overflow.
+      for (let i = 0; i < 100; i++) fs.writeFileSync(path.join(clonePath, `staged-${i}`), "staged\n");
       command(clonePath, "add", "--", ...Array.from({ length: 100 }, (_, i) => `staged-${i}`));
     } },
   { name: "maxMetadataBytes (an over-budget .git/objects/info entry in the clone shape stage)",
@@ -278,7 +286,7 @@ describe("an overflow of each finite limit is a settled keep, not UNKNOWN", () =
       const reasons = reasonsOf(t);
       if (via === "stores") {
         const error = await failure(observeStores(limits));
-        assert.equal(error.name, "AutomaticBoundExceeded");
+        assert.equal(error.name, "AutomaticBoundExceeded", error.message);
         assert.match(error.message, match);
       }
       assert.equal(await observation(limits), false, "the proof returns false rather than throwing UNKNOWN");
@@ -499,12 +507,13 @@ describe("the topology is decided before content is charged", () => {
     command(bare, "init", "--bare", alt);
     fs.appendFileSync(path.join(objectDir(clonePath), "info/alternates"), path.join(alt, "objects") + "\n");
   };
-  it("a loose fan-out directory past the entry limit is UNKNOWN: its leaves cannot all be typed", async () => {
-    junk(16_400);
-    const error = await failure(observeStores());
+  it("loose leaves past the record limit are UNKNOWN: they cannot all be typed", async () => {
+    junk(150);
+    const limits = { maxMetadataRecords: 100 };
+    const error = await failure(observeStores(limits));
     assert.equal(error.name, "AutomaticCompletenessUnknown");
-    assert.equal(error.message, "object directory entry limit");
-    await assert.rejects(observation(), e => (e as Error).constructor.name === "AutomaticCompletenessUnknown");
+    assert.equal(error.message, "loose object leaf limit");
+    await assert.rejects(observation(limits), e => (e as Error).constructor.name === "AutomaticCompletenessUnknown");
   });
   // M1: a loose leaf is typed as it is listed, before it is counted and before any content is charged.
   const linkedLeaf = (dirName: string) => {
@@ -875,12 +884,97 @@ describe("the clone shape stage classifies its indirection inputs before it char
       await assert.rejects(observation({ maxMetadataBytes: 4096 }), unknownOf(new RegExp(key)));
     });
   }
-  it("a config that merely mentions those words, and objectformat = sha1, are not indirection", async t => {
+  it("a config that merely mentions those words is not indirection", async () => {
     fs.appendFileSync(cloneConfigFile(),
-      '[branch "agent/partialclone-refstorage-worktree"]\n\tremote = origin\n[extensions]\n\tobjectformat = sha1\n');
+      '[branch "agent/partialclone-refstorage-worktree-promisor"]\n\tremote = origin\n');
+    assert.equal(await observation(), true);
+  });
+  it("objectformat = sha1 is admitted by the indirection scan (the worktree allowlist still keeps the source)", async t => {
+    command(clonePath, "config", "--local", "core.repositoryformatversion", "1");
+    command(clonePath, "config", "--local", "extensions.objectformat", "sha1");
     const reasons = reasonsOf(t);
-    await observation().catch(() => undefined);
-    assert.ok(!reasons.some(reason => /partialclone|refstorage|objectformat/.test(reason)), reasons.join("|"));
+    // Not UNKNOWN (that would reject), and the one keep is the later config allowlist, not the indirection scan.
+    assert.equal(await observation(), false);
+    assert.ok(reasons.some(reason => /clone config core\.repositoryformatversion has an unadmitted value/.test(reason)),
+      reasons.join("|"));
+  });
+  it("an objectformat value split by a lone CR is UNKNOWN even behind exhausted reflogs", async () => {
+    fs.appendFileSync(cloneConfigFile(), "[extensions]\n\tobjectformat = sha1\rsha256\n");
+    bigReflogs();
+    await assert.rejects(observation({ maxMetadataBytes: 12_000 }), unknownOf(/objectformat/));
+  });
+  // A modern partial clone (`git clone --filter=blob:none`) writes remote.<name>.promisor and partialclonefilter and no
+  // extensions.partialclone, and lazily fetches missing blobs from the other repository.
+  describe("a promisor remote is UNKNOWN in every check", () => {
+    const promisorConfigs: [string, string][] = [
+      ["promisor", '[remote "origin"]\n\tpromisor = true\n'],
+      ["partialclonefilter", '[remote "origin"]\n\tpartialclonefilter = blob:none\n'],
+      ["promisor", '[Remote "Other.Name"]\n\tPromisor = true\n'],
+    ];
+    it("a real clone --filter=blob:none config has the keys and no extensions.partialclone", async () => {
+      const origin = path.join(fx.dataDir, "promisor-origin.git");
+      command(bare, "init", "--bare", origin);
+      command(bare, "push", origin, "--all");
+      const target = path.join(fx.dataDir, "promisor-clone");
+      execFileSync("git", ["-c", "protocol.file.allow=always", "clone", "--quiet", "--filter=blob:none",
+        "file://" + origin, target], { env: { ...ENV, GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "uploadpack.allowFilter",
+          GIT_CONFIG_VALUE_0: "true" }, stdio: "pipe" });
+      const config = fs.readFileSync(path.join(target, ".git", "config"), "utf8");
+      assert.match(config, /promisor = true/);
+      assert.match(config, /partialclonefilter = blob:none/);
+      assert.doesNotMatch(config, /partialclone = /);
+      // The same lines in the clone under proof are UNKNOWN.
+      fs.appendFileSync(cloneConfigFile(), config.slice(config.indexOf("[remote")));
+      await assert.rejects(observation(), unknownOf(/promisor|partialclonefilter/));
+    });
+    for (const [key, text] of promisorConfigs) {
+      it(`${JSON.stringify(text)} in the clone config is UNKNOWN in the full proof, behind an oversized packed-refs`, async () => {
+        fs.appendFileSync(cloneConfigFile(), text);
+        bigPackedRefs();
+        await assert.rejects(observation({ maxMetadataBytes: 4096 }), unknownOf(new RegExp(key, "i")));
+      });
+      it(`${JSON.stringify(text)} in the clone config is UNKNOWN through the discard core`, async () => {
+        fs.appendFileSync(cloneConfigFile(), text);
+        const result = await discard();
+        assert.equal((result as { kind: string }).kind, "unknown");
+        assert.ok(fs.existsSync(clonePath));
+      });
+      it(`${JSON.stringify(text)} in the clone config is UNKNOWN in the topology listing and the Git config checks`, async () => {
+        fs.appendFileSync(cloneConfigFile(), text);
+        await assert.rejects(observeStores(), unknownOf(/config indirection unsupported/));
+      });
+      it(`${JSON.stringify(text)} in the bare config is UNKNOWN in the topology listing and the Git config checks`, async () => {
+        fs.appendFileSync(path.join(bare, "config"), text);
+        await assert.rejects(observeStores(), unknownOf(/config indirection unsupported/));
+      });
+    }
+  });
+  // `.git/config` itself is an indirection input: a redirect or a missing file must not end the stage as a keep in front
+  // of the object-path inputs that `afterIndirection` classifies.
+  describe("a config that cannot be read as a regular file is UNKNOWN", () => {
+    const symlinkConfig = () => {
+      const moved = path.join(fx.dataDir, "elsewhere-config");
+      fs.renameSync(cloneConfigFile(), moved);
+      fs.symlinkSync(moved, cloneConfigFile());
+    };
+    it("a symlinked config", async () => {
+      symlinkConfig();
+      await assert.rejects(observation(), unknownOf(/\.git\/config/));
+    });
+    it("a symlinked config plus a symlinked loose leaf", async () => {
+      symlinkConfig();
+      linkedClone("ee");
+      await assert.rejects(observation(), unknownOf());
+    });
+    it("a config that is a directory", async () => {
+      fs.rmSync(cloneConfigFile());
+      fs.mkdirSync(cloneConfigFile());
+      await assert.rejects(observation(), unknownOf(/\.git\/config/));
+    });
+    it("a missing config", async () => {
+      fs.rmSync(cloneConfigFile());
+      await assert.rejects(observation(), unknownOf(/\.git\/config/));
+    });
   });
   it("a symlinked .git/objects is UNKNOWN even behind an oversized packed-refs", async () => {
     const moved = path.join(fx.dataDir, "clone-objects");
@@ -956,6 +1050,35 @@ describe("the clone shape stage classifies its indirection inputs before it char
     const reasons = reasonsOf(t);
     assert.equal(await observation({ maxWorktreeContentBytes: 4 }), false);
     assert.ok(reasons.some(reason => /tracked content byte limit/.test(reason)), reasons.join("|"));
+  });
+});
+
+// Loose fan-out LEAVES are objects: they count against the record limit (which also caps object occurrences), not the
+// snapshot-wide directory entry limit, so a run that committed tens of thousands of files is still observable.
+describe("loose object leaves count against the record limit", () => {
+  /** `n` distinct blobs written as loose objects into the clone. */
+  const writeLoose = (n: number) => {
+    const dir = path.join(fx.dataDir, "loose-src");
+    fs.mkdirSync(dir, { recursive: true });
+    const names: string[] = [];
+    for (let i = 0; i < n; i++) {
+      const file = path.join(dir, `f${i}`);
+      fs.writeFileSync(file, `loose ${i}\n`);
+      names.push(file);
+    }
+    execFileSync("git", ["-C", clonePath, "hash-object", "-w", "--stdin-paths"], { env: ENV, input: names.join("\n") + "\n" });
+  };
+  it("20,003 loose objects in the clone are observed, not UNKNOWN on the entry limit", async () => {
+    writeLoose(20_003);
+    // Observing this many files takes longer than the 30 second deadline of the shared fixture.
+    input = { ...input, deadline: Date.now() + 5 * 60_000 };
+    await observeStores();
+  });
+  it("loose leaves past a lowered record limit are UNKNOWN", async () => {
+    writeLoose(60);
+    const error = await failure(observeStores({ maxMetadataRecords: 40 }));
+    assert.equal(error.name, "AutomaticCompletenessUnknown");
+    assert.match(error.message, /loose object leaf limit/);
   });
 });
 
