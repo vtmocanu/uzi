@@ -4658,8 +4658,11 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		if applied && s.bcast != nil {
 			s.bcast.PublishState(runID, current.Status)
 		}
-		// clarification_settled returns the run to the gate it already announced: no new
-		// "awaiting approval" notification and no presentation (issue #3985, ADR-2149 D16).
+		// clarification_settled skips s.notify: the run returns to the gate it already
+		// announced, and notify drives Lifecycle.Notify, which acts only on terminal and queued
+		// statuses, so it is a no-op for awaiting_approval anyway. The web and Slack learn of the
+		// settlement through PublishState above; Slack dedups on the preserved gate generation
+		// (issue #3985, ADR-2149 D16: no new presentation).
 		if applied && current.Status != owned.Status && req.State != stateClarificationSettled {
 			s.notify(runID, current.Status)
 		}

@@ -2862,12 +2862,12 @@ UPDATE runs SET
     -- so a garbled worker report becomes a nil param (no change) rather than a bad value.
     size_class = COALESCE(sqlc.narg('size_class'), runs.size_class),
     session_id = COALESCE(sqlc.narg('session_id'), session_id),
-    -- 🔴 INVARIANT, carried by TWO call sites and by nothing else:
-    -- NO SETTER MAY LEAVE A RESOLVED open_question_id BEHIND. The sibling clear is in
-    -- SetRunRunning, which covers the mid-run path; this one covers M4's pre-run park,
-    -- which reaches the gate without ever executing that statement. A third
-    -- non-terminal destination added later re-opens this a third time and nothing
-    -- would catch it.
+    -- 🔴 INVARIANT, carried by THREE call sites and by nothing else:
+    -- NO SETTER MAY LEAVE A RESOLVED open_question_id BEHIND. The sibling clears are in
+    -- SetRunRunning, which covers the mid-run path, and in SettleRunClarificationToGate
+    -- (issue #3985, awaiting_input -> awaiting_approval without running); this one covers
+    -- M4's pre-run park, which reaches the gate without ever executing either. A further
+    -- non-terminal destination added later re-opens this again and nothing would catch it.
     --
     -- Why this statement needs the clear at all (PRD #88 D-AG, measured): M4 lets the
     -- lead ask BEFORE it plans, so a pre-run park goes awaiting_input →
@@ -2887,7 +2887,8 @@ UPDATE runs SET
     --
     -- Sufficient by enumeration: from awaiting_input the only non-terminal
     -- destinations are `running` (cleared in SetRunRunning) and `awaiting_approval`
-    -- (here). The terminal three never resume, so a stale id there is inert.
+    -- (cleared here, and in SettleRunClarificationToGate for the settlement path).
+    -- The terminal three never resume, so a stale id there is inert.
     --
     -- Unlike SetRunRunning's clear there is no WHERE-clause interaction to get wrong:
     -- this statement's WHERE never references open_question_id.
@@ -12092,13 +12093,33 @@ LIMIT @max_rows;
 -- approximately zero runs per tick. As a projection on ListActiveRunsForHealth it would be
 -- one such scan per active run per 15s tick and an index would become mandatory.
 --
+-- SECOND BRANCH (issue #3985): a pending human revise for the run's CURRENT gate counts
+-- regardless of its age. SettleRunClarificationToGate returns a run to awaiting_approval and
+-- stamps status_since = now() while the revise that preceded the clarification stays pending
+-- (consumed, bound to the current gate_revision, unapplied, undisposed), so that revise's
+-- created_at predates the new boundary and the first branch cannot see it; the run is still
+-- waiting on its WORKER (the lead's next presentation applies the revise), not on its owner.
+-- The branch is not age-based, so it stays monotone within an episode: it holds from the
+-- settlement until the next presentation applies the revise (applied_at set), which also
+-- re-stamps status_since through SetRunAwaitingApproval. A run that never had a revise is
+-- unaffected, and so is one whose revise was applied or superseded.
+--
 -- The EXISTS is CAST because sqlc's inference is weaker on expressions than on columns:
 -- uncast, the projection arrives in Go as interface{} rather than bool.
 SELECT (EXISTS (
     SELECT 1 FROM run_user_inputs
-    WHERE run_id = @run_id
-      AND kind IN ('approve_plan', 'reject_plan', 'cancel', 'revise_plan')
-      AND created_at >= @gate_opened_at
+    WHERE run_user_inputs.run_id = @run_id
+      AND run_user_inputs.kind IN ('approve_plan', 'reject_plan', 'cancel', 'revise_plan')
+      AND run_user_inputs.created_at >= @gate_opened_at
+) OR EXISTS (
+    SELECT 1 FROM run_user_inputs i
+    WHERE i.run_id = @run_id
+      AND i.kind = 'revise_plan'
+      AND i.applied_at IS NULL
+      AND i.disposition IS NULL
+      AND i.consumed_at IS NOT NULL
+      AND i.gate_binding = 'bound'
+      AND i.gate_revision = (SELECT runs.gate_revision FROM runs WHERE runs.id = i.run_id)
 ))::boolean AS has_verdict;
 
 -- name: SetRunWaitOnLimit :execrows

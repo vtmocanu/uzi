@@ -249,9 +249,8 @@ func TestClarificationRevisionSettlementControlsLiveDB(t *testing.T) {
 		})
 	}
 
-	t.Run("required mode reclaimed after auto_approve was cleared re-ACKs the revise under the new claim", func(t *testing.T) {
+	t.Run("required mode reclaimed with auto_approve still set is refused until it is cleared, and the revise is re-ACKed under the new claim", func(t *testing.T) {
 		id := f.crsNewGatedRun("required")
-		f.exec(`UPDATE runs SET auto_approve = false WHERE id = $1`, id)
 		revise := f.crsRevise(id, 1)
 		gen := f.reclaim(id)
 		// The claim-1 receipt does not authorize the claim-2 flight until it re-ACKs the replay.
@@ -261,8 +260,52 @@ func TestClarificationRevisionSettlementControlsLiveDB(t *testing.T) {
 		// crsAnswer re-ACKed only the answer; the revise still carries generation 1.
 		f.crsRefused(t, []uuid.UUID{id}, nil, func() (store.Run, bool, error) { return f.crsSettle(stale) })
 		f.crsAck(id, gen, revise)
+		// Everything else is now valid; only auto_approve stands in the way. The published gate's
+		// SetRunAwaitingApproval already cleared it, so a direct UPDATE re-sets it to model a run
+		// that reaches the settlement with it still true.
+		f.exec(`UPDATE runs SET auto_approve = true WHERE id = $1`, id)
+		f.crsRefused(t, []uuid.UUID{id}, nil, func() (store.Run, bool, error) { return f.crsSettle(stale) })
+		// Clearing it is a direct UPDATE standing in for SetRunAwaitingApproval's auto_approve = false.
+		f.exec(`UPDATE runs SET auto_approve = false WHERE id = $1`, id)
 		f.crsBackdate(id)
 		requireSettled(t, stale, f.crsSix(id).paused)
+	})
+
+	t.Run("run-level guards each refuse an otherwise valid settlement", func(t *testing.T) {
+		cases := []struct {
+			name, mode, sql string
+		}{
+			{"auto_approve set", "required", `UPDATE runs SET auto_approve = true WHERE id = $1`},
+			{"completion question pending", "gated", `UPDATE runs SET completion_question_at = now() WHERE id = $1`},
+			{"kind outside issue, prompt and ci_fix", "required", `UPDATE runs SET kind = 'self_improve' WHERE id = $1`},
+			{"unresolved policy outcome", "gated", `UPDATE runs SET policy_outcome_id = gen_random_uuid(), policy_continuation_mode = 'same_conversation',
+			    policy_applying_worker_id = worker_id, policy_applying_generation = 1, policy_source_generation = 1,
+			    policy_preserve_required = true WHERE id = $1`},
+		}
+		for _, c := range cases {
+			t.Run(c.name, func(t *testing.T) {
+				r := f.crsParked(c.mode)
+				f.exec(c.sql, r.id)
+				f.crsRefused(t, []uuid.UUID{r.id}, nil, func() (store.Run, bool, error) { return f.crsSettle(r) })
+			})
+		}
+		t.Run("a resolved policy outcome does not refuse", func(t *testing.T) {
+			r := f.crsParked("gated")
+			f.exec(`UPDATE runs SET policy_outcome_id = gen_random_uuid(), policy_continuation_mode = 'same_conversation',
+			    policy_applying_worker_id = worker_id, policy_applying_generation = 1, policy_source_generation = 1,
+			    policy_resolved_at = now() WHERE id = $1`, r.id)
+			f.crsBackdate(r.id)
+			requireSettled(t, r, f.crsSix(r.id).paused)
+		})
+		t.Run("codex_policy_hold cannot coexist with awaiting_input", func(t *testing.T) {
+			// runs_policy_hold_shape confines hold_reason = 'codex_policy_hold' to terminal and
+			// paused statuses, so the settlement's explicit hold_reason clause is a belt over a CHECK:
+			// the database itself rejects the state a test would need to reach it.
+			r := f.crsParked("gated")
+			if _, err := f.pool.Exec(f.ctx, `UPDATE runs SET hold_reason = 'codex_policy_hold' WHERE id = $1`, r.id); err == nil {
+				t.Fatalf("hold_reason codex_policy_hold was accepted on an awaiting_input run; add a refusal control for it")
+			}
+		})
 	})
 
 	t.Run("semantic-enrolled run settles with its semantic_planning row unchanged", func(t *testing.T) {
@@ -351,9 +394,16 @@ func TestClarificationRevisionSettlementControlsLiveDB(t *testing.T) {
 			})
 		})
 		t.Run("no pending revise at all", func(t *testing.T) {
-			r := f.crsParked("gated")
-			f.crsRefused(t, []uuid.UUID{r.id}, nil, func() (store.Run, bool, error) {
-				return f.crsSettleWith(r.id, r.gen, r.question, r.revise+1000000, 1)
+			// Parked and answered, but no revise_plan row exists for the run at all.
+			id := f.crsNewGatedRun("gated")
+			f.crsPark(id, 1, crsQuestion)
+			f.crsAnswer(id, 1, crsQuestion, true)
+			var revises int
+			if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM run_user_inputs WHERE run_id = $1 AND kind = 'revise_plan'`, id).Scan(&revises); err != nil || revises != 0 {
+				t.Fatalf("revise rows = %d, err %v, want none", revises, err)
+			}
+			f.crsRefused(t, []uuid.UUID{id}, nil, func() (store.Run, bool, error) {
+				return f.crsSettleWith(id, 1, crsQuestion, 999999999, 1)
 			})
 		})
 	})
@@ -522,7 +572,7 @@ func TestClarificationRevisionSettlementControlsLiveDB(t *testing.T) {
 		f.crsRefused(t, []uuid.UUID{r.id}, nil, func() (store.Run, bool, error) { return f.crsSettle(r) })
 	})
 
-	t.Run("a settled-then-approved run is not re-settled", func(t *testing.T) {
+	t.Run("a settled run is not settled again by a report naming another question", func(t *testing.T) {
 		r := f.crsParked("gated")
 		f.crsBackdate(r.id)
 		requireSettled(t, r, f.crsSix(r.id).paused)
