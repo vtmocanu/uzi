@@ -398,6 +398,19 @@ INSERT INTO board_columns (repo_id, label_name, position)
 VALUES ($1, $2, $3)
 ON CONFLICT (repo_id, label_name) DO NOTHING;
 
+-- name: InsertDefaultBoardColumns :exec
+-- One statement, so a repo gets every default column or none: a failure part
+-- way through rolls the whole insert back, and a retry starts from no columns
+-- instead of mistaking a partial board for a complete one. Position is the
+-- label's 0-based index in @label_names. NOT EXISTS leaves a repo that already
+-- has any column (custom columns included) untouched; DO NOTHING keeps two
+-- concurrent seeds of the same empty repo from a unique violation.
+INSERT INTO board_columns (repo_id, label_name, position)
+SELECT @repo_id::uuid, c.label_name, (c.ord - 1)::int
+FROM unnest(@label_names::text[]) WITH ORDINALITY AS c(label_name, ord)
+WHERE NOT EXISTS (SELECT 1 FROM board_columns b WHERE b.repo_id = @repo_id::uuid)
+ON CONFLICT (repo_id, label_name) DO NOTHING;
+
 -- name: ShiftBoardColumnsFrom :exec
 -- Make room to insert a column at @from_position by bumping every column at or
 -- after it up by one. The Human Review retrofit (GetBoard) uses this so the new

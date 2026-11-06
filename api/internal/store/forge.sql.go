@@ -805,6 +805,30 @@ func (q *Queries) InsertBoardColumn(ctx context.Context, arg InsertBoardColumnPa
 	return err
 }
 
+const insertDefaultBoardColumns = `-- name: InsertDefaultBoardColumns :exec
+INSERT INTO board_columns (repo_id, label_name, position)
+SELECT $1::uuid, c.label_name, (c.ord - 1)::int
+FROM unnest($2::text[]) WITH ORDINALITY AS c(label_name, ord)
+WHERE NOT EXISTS (SELECT 1 FROM board_columns b WHERE b.repo_id = $1::uuid)
+ON CONFLICT (repo_id, label_name) DO NOTHING
+`
+
+type InsertDefaultBoardColumnsParams struct {
+	RepoID     uuid.UUID `json:"repo_id"`
+	LabelNames []string  `json:"label_names"`
+}
+
+// One statement, so a repo gets every default column or none: a failure part
+// way through rolls the whole insert back, and a retry starts from no columns
+// instead of mistaking a partial board for a complete one. Position is the
+// label's 0-based index in @label_names. NOT EXISTS leaves a repo that already
+// has any column (custom columns included) untouched; DO NOTHING keeps two
+// concurrent seeds of the same empty repo from a unique violation.
+func (q *Queries) InsertDefaultBoardColumns(ctx context.Context, arg InsertDefaultBoardColumnsParams) error {
+	_, err := q.db.Exec(ctx, insertDefaultBoardColumns, arg.RepoID, arg.LabelNames)
+	return err
+}
+
 const listAllForgeConnections = `-- name: ListAllForgeConnections :many
 SELECT id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at, privilege_report, privilege_checked_at, privilege_status, human_username FROM forge_connections ORDER BY created_at ASC
 `

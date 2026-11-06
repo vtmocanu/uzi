@@ -161,9 +161,11 @@ func (s *fakeStore) DeletePendingGuardrailOverrideRequestsForRepo(context.Contex
 func (s *fakeStore) CountBoardColumns(_ context.Context, id uuid.UUID) (int64, error) {
 	return int64(s.columns[id]), nil
 }
-func (s *fakeStore) InsertBoardColumn(_ context.Context, a store.InsertBoardColumnParams) error {
+func (s *fakeStore) InsertDefaultBoardColumns(_ context.Context, a store.InsertDefaultBoardColumnsParams) error {
 	s.writes++
-	s.columns[a.RepoID]++
+	if s.columns[a.RepoID] == 0 {
+		s.columns[a.RepoID] = len(a.LabelNames)
+	}
 	return nil
 }
 
