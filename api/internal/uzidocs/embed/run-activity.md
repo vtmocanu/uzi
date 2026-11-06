@@ -839,8 +839,8 @@ most of the places that check are not the end of the run:
   step is already running, the run's final status waits for that step to
   return, with no fixed limit yet (#3980). A Cancel is still held until the
   switch is serviced when the server or worker predates this check (#3860,
-  #3974). Graceful **Stop** is held this way too, and so is auto-stop until the
-  server fails the run on its own. A Cancel pressed during the wait that the
+  #3974). Graceful **Stop** is held this way too, and so is auto-stop, unless the
+  server's 60-second escalation fails a run that is still running. A Cancel pressed during the wait that the
   switch releases before the worker sees it waits for the next claim; pressing
   Cancel again after the release takes effect at once. If an earlier
   "pause now" was refused, the agent's current turn stops at its next step
