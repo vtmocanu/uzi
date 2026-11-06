@@ -744,6 +744,43 @@ describe("issue #3953 m3: boundaries keep their dispositions; the latch is never
     await runner(exec2, fakeGitlab().gitlab, undefined, { planCrossCheckTiming: timing, recoveryRetryMs: 1,
       planApprovalTimeoutMs: 3000 }).execute(c2);
     failedWith(c.run_id, "run cancelled");
+    assert.equal(api.isApplied(c.run_id, cancelId), true, "the reclaim applied the very row that was queued during the hold");
+  });
+
+  it("an owner cancel row queued during the hold is delivered and applied after a give-up; the run ends cancelled with no approval stored", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    let cancelId = 0;
+    // The adopted approve's canonical storage is held until the queued cancel row has been ACKed, so the
+    // order "cancel before storage" is fixed rather than a race between two polls.
+    const base = client.reportPlanCrossCheckGateState.bind(client);
+    client.reportPlanCrossCheckGateState = async (id, fields, signal) => {
+      if (fields.status === "running" && fields.candidate_digest === digest)
+        await until(() => cancelId > 0 && api.isAcked(id, cancelId));
+      return base(id, fields, signal);
+    };
+    const d = await drive({ capture: "giveup", switchRounds: [1], afterSwitch: async (c) => {
+      cancelId = send(c.run_id, row("cancel"))[0]!.id;
+    } });
+    const { c } = d;
+    const ev = d.tl.events;
+    assert.ok(cancelId > 0);
+    assert.deepEqual(d.attempts, ["attempt", "gave_up"]);
+    assert.deepEqual(switchReports(c.run_id), ["credential_switch_failed"]);
+    const gaveUpAt = api.timeline.findIndex((e) => e.type === "state" && e.runId === c.run_id && e.status === "credential_switch_failed");
+    assert.ok(gaveUpAt >= 0);
+    const receipts = api.timeline.map((e, i) => ({ e, i })).filter(({ e }) => e.type !== "state" && e.runId === c.run_id && e.ids.includes(cancelId));
+    assert.ok(receipts.length > 0, "the queued row was delivered after the give-up");
+    assert.ok(receipts.every(({ i }) => i > gaveUpAt), "the row was not ACKed or receipted before the give-up report");
+    assert.ok(api.isAcked(c.run_id, cancelId), "ACKed after the give-up");
+    assert.ok(api.isApplied(c.run_id, cancelId), "applied after the give-up");
+    failedWith(c.run_id, "run cancelled");
+    assert.ok(!statuses(c.run_id).includes("completed"));
+    assert.ok(!everyState(c.run_id).some((x) => x.status === "running" && x.candidate_digest === digest),
+      "no approval is stored once the cancel is applied");
+    assert.equal(d.counter.calls, 1, "no implementation turn starts");
+    assert.equal(d.posts().length, 1);
+    assert.ok(ev.indexOf("capture") > ev.indexOf("release"), JSON.stringify(ev));
+    // A cancel ends the run: its clone is not kept for a reclaim (no release happened).
+    assert.equal(fs.existsSync(worktreeDirFor(Number(c.issue_iid))), false, "the cancelled run's clone is cleaned up");
   });
 
   it("a server terminal cancel (getInputs terminalCancelled) during a hold with a latched switch ends the flight: no switch attempt, capture, gate or storage", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
