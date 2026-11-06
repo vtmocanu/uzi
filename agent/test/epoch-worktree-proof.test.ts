@@ -101,7 +101,10 @@ afterEach(() => {
   for (const dir of cleanup.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
-type Limits = { maxMetadataRecords?: number; maxMetadataBytes?: number };
+type Limits = {
+  maxMetadataRecords?: number; maxMetadataBytes?: number; maxWorktreeContentBytes?: number;
+  maxObjectStoreBytes?: number; maxDirectoryEntries?: number;
+};
 /** The worktree stage alone, under its production native/limit scopes. */
 async function prove(limits: Limits = {}): Promise<boolean> {
   const proof = git.createEpochDiscardProof(input);
@@ -297,7 +300,7 @@ async function assertChargedBeforeAnyRead(t: TestContext, file: string | Buffer)
     return debug(message, fields as never);
   });
   const rec = recordLaunches(t);
-  assert.equal(await prove({ maxMetadataBytes: 65536 }), false);
+  assert.equal(await prove({ maxWorktreeContentBytes: 65536 }), false);
   assert.deepEqual(touched, [], "the over-budget file must never be opened");
   assert.ok(reasons.some(reason => /tracked file: tracked content byte limit/.test(reason)), `refused by the charge: ${reasons.join("|")}`);
   assertNoGit(rec);
@@ -630,7 +633,7 @@ it("charges a tracked symlink's target length to the worktree-content counter", 
   commitAll("links");
   assert.equal(await prove(), true);
   const rec = recordLaunches(t);
-  assert.equal(await prove({ maxMetadataBytes: 4096 }), false);
+  assert.equal(await prove({ maxWorktreeContentBytes: 4096 }), false);
   assertNoGit(rec);
 });
 
