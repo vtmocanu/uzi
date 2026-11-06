@@ -1,7 +1,7 @@
 // issue #2969 (owner decision): the predecessor pass is refuse-only about the command uid. The quiescence scan only sees
 // RUNNER_UID, so a COMMAND_UID process writing into a predecessor clone is invisible to it; unless the command uid is
 // provably absent from the whole PID namespace the pass skips before entry (zero predecessor effects) or, once entered,
-// stops. Part 1 drives the detector (proveNoCommandUid, a twin of Go proveNoUser) against a fake procfs; part 2 drives the
+// stops. Part 1 drives the detector (proveNoCommandUid, a port of Go proveNoUser) against a fake procfs; part 2 drives the
 // real retained re-claim exactly as runner-retained-predecessor-final.test.ts does, with the detector backed by a fake
 // procfs or a spy. The ordinary terminal FINAL must never consult the detector.
 import { afterEach, describe, it } from "node:test";
@@ -23,13 +23,15 @@ installHarness();
 // ── part 1: the detector against a fake procfs ───────────────────────────────────────────────────────────────────────────
 
 const SELF = 4242;
+/** The fake namespace's pid counter: above every pid the fake lists, as on a host that never wrapped. */
+const NS_LAST_PID = 4_194_303;
 const tmpRoots: string[] = [];
 afterEach(() => { for (const dir of tmpRoots.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 
 function uidLine(a: number, b = a, c = a, d = a): string { return `Uid:\t${a}\t${b}\t${c}\t${d}\n`; }
 function statusText(uid: string, state = "S (sleeping)"): string { return `Name:\tproc\nState:\t${state}\n${uid}Gid:\t0\t0\t0\t0\n`; }
 
-interface Fake { root: string; proc: ProcSource; add(pid: number, status: string): void; mountinfo(text: string): void }
+interface Fake { root: string; proc: ProcSource; add(pid: number, status: string): void; mountinfo(text: string): void; lastPid(text: string | number): void }
 
 function fakeProc(opts: { mountinfo?: (root: string) => string; self?: number } = {}): Fake {
   const self = opts.self ?? SELF;
@@ -44,7 +46,10 @@ function fakeProc(opts: { mountinfo?: (root: string) => string; self?: number } 
       fs.writeFileSync(path.join(root, String(pid), "status"), status);
     },
     mountinfo: text => fs.writeFileSync(path.join(root, String(self), "mountinfo"), text),
+    lastPid: text => fs.writeFileSync(path.join(root, "sys", "kernel", "ns_last_pid"), `${text}\n`),
   };
+  fs.mkdirSync(path.join(root, "sys", "kernel"), { recursive: true });
+  fake.lastPid(NS_LAST_PID);
   fake.mountinfo((opts.mountinfo ?? defaultMountinfo)(root));
   fake.add(self, statusText(uidLine(0)));
   fake.add(1, statusText(uidLine(0)));
@@ -54,7 +59,7 @@ const defaultMountinfo = (root: string): string => `36 25 0:20 / ${root} rw,nosu
 const mountWith = (perMount: string, superBlock: string) => (root: string): string =>
   `36 25 0:20 / ${root} ${perMount} - proc proc ${superBlock}\n`;
 
-describe("proveNoCommandUid (twin of Go proveNoUser)", () => {
+describe("proveNoCommandUid (Go proveNoUser plus a pid-counter bracket)", () => {
   it("only the runner uid and root: absent", () => {
     const f = fakeProc();
     f.add(100, statusText(uidLine(RUNNER_UID)));
@@ -186,6 +191,74 @@ describe("proveNoCommandUid (twin of Go proveNoUser)", () => {
     assert.equal(proveNoCommandUid({ ...f.proc, maxPids: 3 }), "absent");
   });
 
+  it("a `self` link naming this process whose pid the listing lacks is unproven", () => {
+    const f = fakeProc();
+    f.add(100, statusText(uidLine(RUNNER_UID)));
+    assert.equal(proveNoCommandUid({ ...f.proc, listing: names => names.filter(n => n !== String(SELF)) }), "unproven");
+    assert.equal(proveNoCommandUid(f.proc), "absent", "and the unfiltered listing proves");
+  });
+
+  describe("pid-counter bracket (ns_last_pid)", () => {
+    it("a wrapped counter with listed pids above it (the forged-wrap shape) is unproven on every scan", () => {
+      const f = fakeProc();
+      f.add(100, statusText(uidLine(RUNNER_UID)));
+      f.lastPid(50); // wrapped: SELF (4242) is a survivor above the counter, and a new child may sit behind the cursor
+      let scans = 0;
+      assert.equal(proveNoCommandUid({ ...f.proc, beforeScan: () => { scans++; } }), "unproven");
+      assert.equal(scans, 5);
+    });
+
+    it("a counter that goes backwards between the pre-listing and post-scan reads is unproven on every scan", () => {
+      const f = fakeProc();
+      f.add(100, statusText(uidLine(RUNNER_UID)));
+      let current = NS_LAST_PID;
+      let scans = 0;
+      const proof = proveNoCommandUid({ ...f.proc, beforeScan: () => { scans++; }, listing: names => {
+        f.lastPid(--current); // wrapped after the first read
+        return names;
+      } });
+      assert.equal(proof, "unproven");
+      assert.equal(scans, 5);
+    });
+
+    it("a pid above the counter that appears in the listing once, then a clean rescan: absent", () => {
+      const f = fakeProc();
+      let scans = 0;
+      const proof = proveNoCommandUid({ ...f.proc, beforeScan: attempt => {
+        scans++;
+        if (attempt === 0) f.add(NS_LAST_PID + 1, statusText(uidLine(RUNNER_UID)));
+        else fs.rmSync(path.join(f.root, String(NS_LAST_PID + 1)), { recursive: true, force: true });
+      } });
+      assert.equal(proof, "absent");
+      assert.equal(scans, 2);
+    });
+
+    for (const [name, write] of [
+      ["missing", (f: Fake) => fs.rmSync(path.join(f.root, "sys", "kernel", "ns_last_pid"))],
+      ["a directory", (f: Fake) => { fs.rmSync(path.join(f.root, "sys", "kernel", "ns_last_pid")); fs.mkdirSync(path.join(f.root, "sys", "kernel", "ns_last_pid")); }],
+      ["empty", (f: Fake) => f.lastPid("")],
+      ["non-numeric", (f: Fake) => f.lastPid("abc")],
+      ["negative", (f: Fake) => f.lastPid("-5")],
+      ["two numbers", (f: Fake) => f.lastPid("12 34")],
+    ] as const) {
+      it(`an ns_last_pid that is ${name}: unproven`, () => {
+        const f = fakeProc();
+        f.add(100, statusText(uidLine(RUNNER_UID)));
+        write(f);
+        assert.equal(proveNoCommandUid(f.proc), "unproven");
+      });
+    }
+
+    it("a counter that holds still and covers every listed pid: absent, and present when the uid is there", () => {
+      const f = fakeProc();
+      f.add(100, statusText(uidLine(RUNNER_UID)));
+      f.lastPid(SELF); // the highest listed pid is exactly the counter
+      assert.equal(proveNoCommandUid(f.proc), "absent");
+      f.add(101, statusText(uidLine(COMMAND_UID)));
+      assert.equal(proveNoCommandUid(f.proc), "present");
+    });
+  });
+
   it("the real /proc of the worker is readable by the default reader and never throws", () => {
     assert.ok((["absent", "present", "unproven"] as CommandUidProof[]).includes(proveNoCommandUid()));
   });
@@ -221,7 +294,6 @@ interface OperateCall { record: RecoveryRecord; input: CaptureInput; options: Fr
 interface Opts {
   generations?: number[];
   claimGeneration?: number;
-  codex?: boolean;
   /** The detector the runner is given. */
   detector?: (n: number) => CommandUidProof;
   operate?: (call: OperateCall) => Promise<RecoveryOutcome>;
@@ -369,7 +441,7 @@ function assertStopped(r: Result, reason: RegExp): void {
 }
 
 describe("pre-entry: a command uid that cannot be ruled out is a clean skip with zero predecessor effects", () => {
-  it("a command-uid process in a fake procfs (cwd inside the predecessor clone): skip command_uid_unproven", async () => {
+  it("a command-uid process in a fake procfs (the detector refuses on the uid alone, whatever its cwd): skip command_uid_unproven", async () => {
     const f = fakeProc({ self: process.pid });
     f.add(100, statusText(uidLine(COMMAND_UID)));
     let sawPresent = 0;
@@ -487,7 +559,7 @@ describe("the ordinary terminal FINAL never consults the detector", () => {
   it("a first claim (no predecessor pass) calls it zero times", async () => {
     const r = await drive({ claimGeneration: 1, generations: [], detector: () => { throw new Error("must not be called"); } });
     assert.equal(r.detectorCalls(), 0);
-    assert.ok(r.events.includes("model") || r.models() >= 0);
+    assert.equal(r.models(), 1, "the first claim reached its model");
   });
 
   it("the ordinary proveInventorySources (no grant) reads no detector even with the command uid present", async () => {

@@ -1244,6 +1244,8 @@ export interface ProcSource {
   maxPids?: number;
   /** Test seam: called with the 0-based scan number before each scan. */
   beforeScan?: (attempt: number) => void;
+  /** Test seam: sees the raw directory names of the root right after they are listed and returns the names to use. */
+  listing?: (names: string[]) => string[];
 }
 
 const COMMAND_UID_MAX_PIDS = 100_000;
@@ -1252,7 +1254,19 @@ const COMMAND_UID_MOUNTINFO_BYTES = 4 * 1024 * 1024;
 /** Scans one proof takes at most when every one saw a listed pid vanish. */
 const COMMAND_UID_MAX_SCANS = 5;
 
+/** A scan attempt that cannot be trusted and is retaken (counts toward COMMAND_UID_MAX_SCANS): a listed pid vanished
+ *  before its status was read, a listed pid exceeds the pid counter, or the pid counter went backwards. */
 class CommandUidScanVanished extends Error {}
+
+const COMMAND_UID_NS_LAST_PID_BYTES = 64;
+
+/** The pid namespace's last-allocated pid (`<root>/sys/kernel/ns_last_pid`); throws (unproven) when unreadable or malformed. */
+function readCommandUidLastPid(root: string): number {
+  const file = readCommandUidFile(path.join(root, "sys", "kernel", "ns_last_pid"), COMMAND_UID_NS_LAST_PID_BYTES);
+  const text = file.text.trim();
+  if (file.truncated || !/^[0-9]{1,10}$/.test(text)) throw new Error("ns_last_pid malformed");
+  return Number(text);
+}
 
 /** Reads at most `limit` bytes of `file` (no final-symlink follow). */
 function readCommandUidFile(file: string, limit: number): { text: string; truncated: boolean } {
@@ -1328,18 +1342,23 @@ function parseCommandUidStatus(text: string): number[] | undefined {
   return uids;
 }
 
-/** One scan: the pids that hold `uid` in any uid field, other than `selfPid`. Throws CommandUidScanVanished when a
- *  listed pid vanished before its status was read, and any other Error for an unproven scan. */
-function commandUidScan(root: string, selfPid: number, uid: number, maxPids: number): { sawSelf: boolean; present: boolean } {
+/** One scan: the pids that hold `uid` in any uid field, other than `selfPid`. Throws CommandUidScanVanished when the
+ *  attempt is to be retaken (see that class), and any other Error for an unproven scan. */
+function commandUidScan(root: string, selfPid: number, uid: number, maxPids: number,
+  listing?: (names: string[]) => string[]): { sawSelf: boolean; present: boolean } {
   const mountinfo = readCommandUidFile(path.join(root, "self", "mountinfo"), COMMAND_UID_MOUNTINFO_BYTES);
   if (mountinfo.truncated || !commandUidProcMountVisible(mountinfo.text, root)) throw new Error("proc mount unproven");
   if (fs.readlinkSync(path.join(root, "self")) !== String(selfPid)) throw new Error("proc self is not this process");
+  const before = readCommandUidLastPid(root);
   const pids: number[] = [];
-  for (const name of fs.readdirSync(root)) {
+  const names = fs.readdirSync(root);
+  for (const name of listing ? listing(names) : names) {
     if (!/^[0-9]{1,10}$/.test(name)) continue;
     const pid = Number(name);
     if (pid <= 0) continue;
     if (pids.length >= maxPids) throw new Error("proc scan bound exceeded");
+    // A listed pid above the counter is a process spawned during the scan, or a survivor from before a counter wrap.
+    if (pid > before) throw new CommandUidScanVanished();
     pids.push(pid);
   }
   let sawSelf = false, present = false;
@@ -1358,16 +1377,32 @@ function commandUidScan(root: string, selfPid: number, uid: number, maxPids: num
     if (pid === selfPid) { sawSelf = true; continue; }
     if (uids.includes(uid)) present = true;
   }
+  // The counter moving backwards means it wrapped during the scan.
+  if (readCommandUidLastPid(root) < before) throw new CommandUidScanVanished();
   return { sawSelf, present };
 }
 
 /**
  * Refuse-only proof that no process of this PID namespace holds the command uid (COMMAND_UID) in any of its
- * real/effective/saved/filesystem uids. A synchronous, read-only TypeScript twin of Go `proveNoUser`
- * (agent/codex/supervisor/procscan.go): the proc mount must show every process (no hidepid, no subset=), the `self`
- * link must name this process and the listing must contain it, a missing/repeated/malformed Uid line, an unreadable
- * status or an oversized listing is "unproven", zombies count, and a scan in which a listed pid vanished before its
- * status was read is discarded and retaken up to five times. Never throws.
+ * real/effective/saved/filesystem uids. A synchronous, read-only TypeScript port of Go `proveNoUser`
+ * (agent/codex/supervisor/procscan.go) with one addition: the proc mount must show every process (no hidepid, no
+ * subset=), the `self` link must name this process and the listing must contain it, a missing/repeated/malformed Uid
+ * line, an unreadable status or an oversized listing is "unproven", zombies count, and a scan in which a listed pid
+ * vanished before its status was read is discarded and retaken up to five times.
+ *
+ * The addition is a per-scan pid-counter bracket. The Go rescan argument is sound only if the namespace's pid counter
+ * has never wrapped, which holds at worker start but not mid-life, where a COMMAND_UID process can force a wrap and
+ * then fork a child to a low pid behind the ascending /proc listing cursor. So each attempt reads
+ * `<root>/sys/kernel/ns_last_pid` as `before` just before listing and as `after` just after the last status read, and
+ * is valid only if `after >= before` (no wrap during the scan) and every listed pid is `<= before` (no pre-existing
+ * pid above the counter, the signature of an earlier wrap). Under those conditions every pid allocated during the
+ * scan exceeds every listed pid, so it lies ahead of the listing cursor, and its parent was listed and read (or
+ * vanished, which retakes the scan). An unreadable or malformed counter is "unproven"; an invalid attempt is retaken
+ * like a vanished pid and counts toward the five-scan limit.
+ *
+ * Residual liveness cost: on a busy host (pids spawned during every scan) or after a wrap that left high-pid
+ * survivors, the proof stays "unproven", so the predecessor pass is skipped before entry (or stops once entered).
+ * Never throws.
  */
 export function proveNoCommandUid(proc: ProcSource = {}): CommandUidProof {
   const root = proc.root ?? PROC_ROOT;
@@ -1377,7 +1412,7 @@ export function proveNoCommandUid(proc: ProcSource = {}): CommandUidProof {
   for (let attempt = 0; attempt < COMMAND_UID_MAX_SCANS; attempt++) {
     try {
       proc.beforeScan?.(attempt);
-      const scan = commandUidScan(root, selfPid, uid, maxPids);
+      const scan = commandUidScan(root, selfPid, uid, maxPids, proc.listing);
       if (!scan.sawSelf) return "unproven";
       return scan.present ? "present" : "absent";
     } catch (error) {

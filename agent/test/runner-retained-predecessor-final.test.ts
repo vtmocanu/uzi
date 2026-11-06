@@ -145,6 +145,7 @@ async function drive(o: Opts = {}) {
   const logs = recordingLogger();
   const runner = runnerWith(make, fakeGitlab().gitlab, JOURNAL_KEY, logs.logger, {
     recoveryRetryMs: 1, quiesceRun, codexBoundaryDeadlineMs: CODEX_BOUNDARY_MS,
+    commandUidProof: () => "absent", // hermetic: never the host /proc; a test overrides it through runnerOpts
     ...(o.budget ? { predecessorFinalBudgetMs: o.budget } : {}),
     ...o.runnerOpts,
   } as never);
@@ -334,9 +335,9 @@ it("a capacity refusal earlier in the iteration never reaches the predecessor pa
 
 // ── Codex ───────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-// A Codex flight is gated off before entry (its production proof does not cover the command uid): the Codex
-// predecessor code (single-source proof, sibling/inventory skips, baseline drift) is unreachable in production and is
-// covered by the registerPredecessorBoundary unit tests in runner-predecessor-boundary.test.ts.
+// A Codex flight is gated off before entry (its production proof does not cover the command uid). The Codex-specific
+// grant behaviour (a capture attempt bound to its own clone path, the per-clone baseline) is only reachable through
+// registerPredecessorBoundary and is covered there, in runner-predecessor-boundary.test.ts.
 type ReadHeads = typeof git.readInventoryCloneHeads;
 const identityRead = (options: unknown): boolean => (options as { cloneIdentity?: boolean } | undefined)?.cloneIdentity === true;
 

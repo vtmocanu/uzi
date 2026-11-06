@@ -26664,7 +26664,7 @@ export class RunRunner {
           await check();
           // issue #2969: settle the lower generations' guarded holds from the predecessor source before the
           // successor replaces it. A stop keeps custody and the predecessor; a clean skip changes nothing.
-          if (await this.settlePredecessorHolds(claim, flight, bare, source, iteration, signal) === "stop") {
+          if (await this.settlePredecessorHolds(claim, flight, bare, iteration, signal) === "stop") {
             blocker = "quiescence_failed"; throw finalize;
           }
           await check();
@@ -26881,7 +26881,8 @@ export class RunRunner {
    * predecessor (blocker quiescence_failed): the held scope was incomplete or expired, authority or the grant was lost,
    * the coordinator latched an integrity failure, the scope settled late, or the grant recorded a refusal other than
    * residue (PREDECESSOR_RESIDUE_CHECKS; an unknown refusal check stops). Anything that has not been proven (an
-   * unreadable journal, an unknown Codex inventory, a sibling source, a spent time budget) skips and leaves the
+   * unreadable journal, a Codex flight, another claim in flight, a command uid that is not provably absent, a spent
+   * time budget) skips and leaves the
    * holds exactly as before, which is the pre-existing behaviour. Only RetainedRecoveryStop, CredentialSwitchSignal
    * and a lost run ownership propagate.
    *
@@ -26891,7 +26892,7 @@ export class RunRunner {
    * abandons it, so every started operation has settled before the scope closes.
    */
   private async settlePredecessorHolds(
-    claim: ClaimResponse, flight: RunFlight, bare: string, source: RecoveryJournalEntry,
+    claim: ClaimResponse, flight: RunFlight, bare: string,
     iteration: { attempts: number; deadline: number }, signal: AbortSignal,
   ): Promise<"proceed" | "stop"> {
     if (claim.inventory_guarded !== true || !this.recovery.enabled || process.platform !== "linux" ||
@@ -26922,30 +26923,12 @@ export class RunRunner {
     // Refuse-only command-uid gate, before any predecessor effect (no runFreeCapture, no RPC). The quiescence scan only
     // sees RUNNER_UID, so a COMMAND_UID process writing into a predecessor clone is invisible to it: unless the command
     // uid is provably absent from the whole PID namespace, the pass is a clean skip and the holds stay as they were.
-    // A Codex flight's production proof does not cover this (its capture attempt scans a single source), so the Codex
-    // predecessor code below is unreachable in production; it stays for the boundary unit tests.
+    // A Codex flight's production proof does not cover this (its capture attempt scans a single source), so a Codex
+    // flight never enters the pass (registerPredecessorBoundary keeps a `baseline` option for the boundary unit tests).
     if (flight.executor.withCredentialFreeCapture) return skip("command_uid_unproven");
     // Another run's claim may legitimately own command-uid processes; refusing is today's behaviour.
     if ([...this.executionTails.keys()].some(id => id !== claim.run_id)) return skip("other_claim_in_flight");
     if (this.commandUidState() !== "absent") return skip("command_uid_unproven");
-    // Codex: the capture attempt owns exactly the predecessor clone, so any other source, or an inventory that is not
-    // fully identified, cannot be proven here. The pre-entry read is also the baseline a later change is drift against.
-    let baseline: Array<{ clonePath: string; branch: string; head?: string; identity?: string }> | undefined;
-    if (flight.executor.withCredentialFreeCapture) {
-      let inventory: Awaited<ReturnType<GitCache["readInventoryCloneHeads"]>>;
-      try { inventory = await this.git.readInventoryCloneHeads(bare, claim.run_id, { cloneIdentity: true }); }
-      catch (error) {
-        this.retainedLifecycleGuard(flight);
-        if (passthrough(error)) throw error;
-        return skip("codex_inventory_unknown");
-      }
-      if (inventory.kind !== "verified") return skip("codex_inventory_unknown");
-      if (inventory.clones.length === 0 || inventory.clones.some(c => typeof c.head !== "string" || typeof c.identity !== "string"))
-        return skip("codex_inventory_incomplete");
-      const sourcePath = resolvePath(source.clonePath);
-      if (inventory.clones.some(c => resolvePath(c.clonePath) !== sourcePath)) return skip("codex_sibling_source");
-      baseline = inventory.clones;
-    }
     const measurements: PredecessorMeasurements = {
       uploadedBytes: 0, chargedBytes: 0, uploadCount: 0, retainedUnuploadedBytes: 0, reusedBytes: 0,
     };
@@ -26960,7 +26943,7 @@ export class RunRunner {
       proof = await this.runFreeCapture(claim, flight, scopeDeadline, signal, async held => {
         const defaultBranch = claim.repo.default_branch?.trim() || await this.git.defaultBranchName(bare) || "main";
         const registration = this.registerPredecessorBoundary(flight, held, {
-          generations: candidates.map(r => r.generation!), deadlineAt: scopeDeadline, ...(baseline ? { baseline } : {}),
+          generations: candidates.map(r => r.generation!), deadlineAt: scopeDeadline,
         });
         // The watchdog only records lateness; the scope itself dies at scopeDeadline (grant.live), and the pass still
         // waits for the running operation to settle.

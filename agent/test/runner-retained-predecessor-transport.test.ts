@@ -269,6 +269,7 @@ async function drive(o: Opts = {}) {
   };
   const runner = runnerWith(make, fakeGitlab().gitlab, JOURNAL_KEY, logs.logger, {
     recoveryRetryMs: 1, quiesceRun: quiesceRunAttempt, codexBoundaryDeadlineMs: CODEX_BOUNDARY_MS,
+    commandUidProof: () => "absent", // hermetic: never the host /proc; a test overrides it through runnerOpts
     ...(o.budget ? { predecessorFinalBudgetMs: o.budget } : {}),
     ...o.runnerOpts,
   } as never);
