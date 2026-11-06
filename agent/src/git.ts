@@ -913,11 +913,10 @@ export interface InventoryContentProofBounds {
   /** Bytes of any one listing's output. */
   maxBytes: number;
   /**
-   * Cheap early refusal on the cumulative `%(objectsize)` of every regular file `hash-object` would read (default
-   * {@link INVENTORY_CONTENT_PROOF_BOUNDS}). It bounds only HONESTLY reported sizes: the index size is
-   * agent-influenced, and a file grown by a multiple of 2^32 bytes with its mtime restored can keep a stale 32-bit
-   * stat size. That residual case is bounded by the aggregate wall budget below and ends as `dirty` or
-   * `unreadable`, never `clean`.
+   * Cap on the cumulative REAL `st_size` (lstat of the worktree file, 64-bit) of every regular tracked file
+   * `hash-object` would read, i.e. the bytes it actually reads (default {@link INVENTORY_CONTENT_PROOF_BOUNDS}). It is
+   * charged before status, check-attr or hash-object run; the declared `%(objectsize)` is only an extra early
+   * refusal. The total wall budget below is a second bound.
    */
   maxContentBytes?: number;
   /** Epoch ms the caller's operation ends; the proof's total budget is clipped to it. A passed deadline is unreadable. */
@@ -15273,12 +15272,6 @@ try {
       const pinned = await this.pinnedInventoryGit(cwd, bounds);
       if (!pinned) return "unreadable";
       const run = pinned;
-      const status = await run(["-c", "core.checkStat=default", "-c", "core.trustctime=true", "-c", "core.untrackedCache=false",
-        "status", "--porcelain=v1", "-z", "--untracked-files=all"]);
-      if (!status) return "unreadable";
-      if (status.exceeded) return "over_bound";
-      if (status.code !== 0 || status.stderr.length > 0) return "unreadable";
-      if (status.stdout.length > 0) return "dirty";
       const flags = await run(["ls-files", "-v", "-z"]);
       if (!flags) return "unreadable";
       if (flags.exceeded) return "over_bound";
@@ -15305,11 +15298,32 @@ try {
         contentBytes += Number(header[4]);
         files.push({ path: entryPath, oid: header[2]! });
       }
-      // Decided from the index sizes BEFORE any byte is hashed (honest sizes only; see maxContentBytes). The
-      // %(objectsize) listing reads every blob header, so a missing object makes the listing fail: unreadable.
+      // Cheap early refusal on the DECLARED sizes (the %(objectsize) listing reads every blob header, so a missing
+      // object makes the listing fail: unreadable). It is not the bound: an add-time-only filter, a hand-written
+      // index or live ident/eol/encoding expansion all make the declared size smaller than what is read.
       if (contentBytes > maxContentBytes) return "over_bound";
+      // The authoritative bound: the REAL st_size of every regular entry, charged before status, check-attr or
+      // hash-object read anything. The path stays bytes (a Buffer path), never a JS string.
+      const root = Buffer.from(cwd + "/");
+      let realBytes = 0n;
+      for (const f of files) {
+        let st;
+        try { st = await fs.lstat(Buffer.concat([root, f.path]), { bigint: true }); }
+        catch (err) { return (err as NodeJS.ErrnoException).code === "ENOENT" ? "dirty" : "unreadable"; }
+        if (!st.isFile()) return "unreadable";
+        realBytes += st.size;
+        if (realBytes > BigInt(maxContentBytes)) return "over_bound";
+      }
+      const status = await run(["-c", "core.checkStat=default", "-c", "core.trustctime=true", "-c", "core.untrackedCache=false",
+        "status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+      if (!status) return "unreadable";
+      if (status.exceeded) return "over_bound";
+      if (status.code !== 0 || status.stderr.length > 0) return "unreadable";
+      if (status.stdout.length > 0) return "dirty";
       if (files.length === 0) return "clean";
-      // A clean/smudge filter (LFS included) makes the blob small while the worktree file may be huge, with status
+      // Defence in depth only: check-attr cannot tell a literal filter=unspecified/unset from no attribute, and a
+      // filter used only at add time is invisible to it. hash-object runs with --no-filters and the lstat sum above
+      // bounds what it reads. A clean/smudge filter (LFS included) makes the blob small while the worktree file may be huge, with status
       // still clean. Any regular path with a filter attribute set is refused before a byte is hashed.
       const attrs = await run(["check-attr", "-z", "--stdin", "filter"],
         Buffer.concat(files.flatMap(f => [f.path, Buffer.from([0])])));

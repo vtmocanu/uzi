@@ -303,6 +303,72 @@ describe("inventorySourceContentProof (issue #2969 D5)", () => {
     assert.ok(timeouts[0]! <= 300);
   });
 
+  test("an add-time-only filter cannot hide a huge file: the real size is charged before any hashing", async t => {
+    const f = fixture(t);
+    fs.writeFileSync(path.join(f.root, ".git", "info", "attributes"), "*.big filter=shrink\n");
+    f.g("config", "filter.shrink.clean", "echo tiny");
+    f.g("config", "filter.shrink.required", "true");
+    const big = path.join(f.root, "data.big");
+    fs.writeFileSync(big, "");
+    fs.truncateSync(big, 64 * 1024 * 1024);
+    f.commitAll();
+    assert.equal(f.g("cat-file", "-s", "HEAD:data.big"), "5", "the index declares a tiny blob");
+    // Remove the filter and the attribute: status stays clean (size/mtime unchanged), the worktree file is 64 MiB.
+    fs.rmSync(path.join(f.root, ".git", "info", "attributes"));
+    f.g("config", "--remove-section", "filter.shrink");
+    const bounds = { maxEntries: 100, maxBytes: 1 << 20, maxContentBytes: 32 * 1024 * 1024 };
+    assert.equal(await f.proof(bounds), "over_bound");
+    assert.equal(f.hashCalls().length, 0);
+    assert.equal(f.calls.filter(c => c.args[0] === "status" || c.args[0] === "check-attr").length, 0, "refused before status and check-attr");
+  });
+
+  test("ident expansion past the cap is over_bound", async t => {
+    const f = fixture(t);
+    fs.writeFileSync(path.join(f.root, ".gitattributes"), "*.txt ident\n");
+    fs.writeFileSync(path.join(f.root, "a.txt"), "$Id$\n");
+    f.commitAll();
+    const file = path.join(f.root, "a.txt");
+    fs.writeFileSync(file, "$Id: 0123456789012345678901234567890123456789 $\n".repeat(200));
+    assert.equal(await f.proof({ maxEntries: 100, maxBytes: 1 << 20, maxContentBytes: 1024 }), "over_bound");
+    assert.equal(f.hashCalls().length, 0);
+  });
+
+  test("a symlink where the index has a regular file is unreadable", async t => {
+    const f = fixture(t);
+    fs.writeFileSync(path.join(f.root, "a.txt"), "a\n");
+    fs.writeFileSync(path.join(f.root, "target.txt"), "t\n");
+    f.commitAll();
+    fs.rmSync(path.join(f.root, "a.txt"));
+    fs.symlinkSync("target.txt", path.join(f.root, "a.txt"));
+    assert.equal(await f.proof(), "unreadable");
+    assert.equal(f.hashCalls().length, 0);
+  });
+
+  test("a missing tracked file is dirty", async t => {
+    const f = fixture(t);
+    fs.writeFileSync(path.join(f.root, "a.txt"), "a\n");
+    f.commitAll();
+    fs.rmSync(path.join(f.root, "a.txt"));
+    assert.equal(await f.proof(), "dirty");
+    assert.equal(f.hashCalls().length, 0);
+  });
+
+  test("a non-UTF-8 path is lstatted by its bytes: its real size is what trips the cap", async t => {
+    const f = fixture(t);
+    fs.writeFileSync(path.join(f.root, ".git", "info", "attributes"), "*.big filter=shrink\n");
+    f.g("config", "filter.shrink.clean", "echo tiny");
+    const raw = Buffer.concat([Buffer.from(f.root + "/odd-"), Buffer.from([0xff, 0xfe]), Buffer.from(".big")]);
+    fs.writeFileSync(raw, "");
+    fs.truncateSync(raw, 8 * 1024 * 1024);
+    f.commitAll();
+    fs.rmSync(path.join(f.root, ".git", "info", "attributes"));
+    f.g("config", "--remove-section", "filter.shrink");
+    const bounds = { maxEntries: 10, maxBytes: 1 << 20 };
+    assert.equal(await f.proof({ ...bounds, maxContentBytes: 1024 * 1024 }), "over_bound", "declared size is 5 bytes");
+    assert.equal(f.hashCalls().length, 0);
+    assert.equal(await f.proof({ ...bounds, maxContentBytes: 16 * 1024 * 1024 }), "dirty", "within the cap it is hashed, and the content differs from the blob");
+  });
+
   test("every git call pins --git-dir and --work-tree to the clone", async t => {
     const f = fixture(t);
     fs.writeFileSync(path.join(f.root, "a.txt"), "a\n");
