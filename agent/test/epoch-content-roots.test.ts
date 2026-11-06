@@ -602,6 +602,7 @@ it("treats a source include as UNKNOWN", async () => {
   const before = fs.readFileSync(path.join(bare, "config"));
   const result = await git.discardStoppedSource({ ...options, epochProof: git.createEpochDiscardProof(input) });
   assert.equal(result.kind, "unknown");
+  assert.equal(scope.stopped(), true);
   assert.ok(fs.existsSync(clonePath));
   assert.deepEqual(fs.readFileSync(path.join(bare, "config")), before);
 });

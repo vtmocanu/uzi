@@ -1003,14 +1003,21 @@ describe("the clone shape stage classifies its indirection inputs before it char
     bigReflogs();
     await assert.rejects(observation({ maxMetadataBytes: 12_000 }), unknownOf(/^noncanonical object path/));
   });
-  it("a symlinked loose leaf in the clone is UNKNOWN even behind an include, which is itself UNKNOWN", async () => {
-    linkedClone("ee");
-    fs.appendFileSync(cloneConfigFile(), "[include]\n\tpath = /nonexistent\n");
-    await assert.rejects(observation(), unknownOf(/names an include|^noncanonical object path/));
-  });
   it("control: an include alone is UNKNOWN in the shape stage", async () => {
     fs.appendFileSync(cloneConfigFile(), "[include]\n\tpath = /nonexistent\n");
     await assert.rejects(observation(), unknownOf(/names an include/));
+  });
+  // The include is judged before anything bulk is charged: a bulk input that overflows the metadata budget (which
+  // would be a settled keep once charged) cannot stand in front of it.
+  it("an include is UNKNOWN even behind an 8 KiB objects/info/commit-graph at a 4096 byte metadata budget", async () => {
+    fs.appendFileSync(cloneConfigFile(), "[include]\n\tpath = /nonexistent\n");
+    fs.writeFileSync(path.join(objectDir(clonePath), "info", "commit-graph"), Buffer.alloc(8 * 1024));
+    await assert.rejects(observation({ maxMetadataBytes: 4096 }), unknownOf(/names an include/));
+  });
+  it("an include is UNKNOWN even behind an oversized packed-refs at a 4096 byte metadata budget", async () => {
+    fs.appendFileSync(cloneConfigFile(), "[include]\n\tpath = /nonexistent\n");
+    bigPackedRefs();
+    await assert.rejects(observation({ maxMetadataBytes: 4096 }), unknownOf(/names an include/));
   });
   it("a symlinked pack member in the clone is UNKNOWN behind an oversized packed-refs", async () => {
     const name = "pack-" + "a".repeat(40);
@@ -1066,11 +1073,29 @@ describe("loose object leaves count against the record limit", () => {
     }
     execFileSync("git", ["-C", clonePath, "hash-object", "-w", "--stdin-paths"], { env: ENV, input: names.join("\n") + "\n" });
   };
-  it("20,003 loose objects in the clone are observed, not UNKNOWN on the entry limit", async () => {
-    writeLoose(20_003);
-    // Observing this many files takes longer than the 30 second deadline of the shared fixture.
-    input = { ...input, deadline: Date.now() + 5 * 60_000 };
-    await observeStores();
+  it("loose objects past a lowered directory entry limit are observed, not UNKNOWN on the entry limit", async () => {
+    // The least entry limit the untouched fixture passes; the directories are counted, the leaves must not be.
+    let low = 1, high = 512;
+    while (low < high) {
+      const mid = Math.floor((low + high) / 2);
+      try { await observeStores({ maxDirectoryEntries: mid }); high = mid; } catch { low = mid + 1; }
+    }
+    const limit = low + 20;
+    // 200 blobs whose ids share the fan-out directory "ab": one more directory, 200 leaves, far below the default
+    // record limit and well past the 20 entries of headroom.
+    const dir = path.join(fx.dataDir, "loose-src");
+    fs.mkdirSync(dir, { recursive: true });
+    const names: string[] = [];
+    for (let i = 0; names.length < 200; i++) {
+      const body = `loose ${i}\n`;
+      if (!createHash("sha1").update(`blob ${Buffer.byteLength(body)}\0${body}`).digest("hex").startsWith("ab")) continue;
+      const file = path.join(dir, `f${i}`);
+      fs.writeFileSync(file, body);
+      names.push(file);
+    }
+    execFileSync("git", ["-C", clonePath, "hash-object", "-w", "--stdin-paths"], { env: ENV, input: names.join("\n") + "\n" });
+    assert.equal(fs.readdirSync(path.join(objectDir(clonePath), "ab")).length >= 200, true);
+    await observeStores({ maxDirectoryEntries: limit });
   });
   it("loose leaves past a lowered record limit are UNKNOWN", async () => {
     writeLoose(60);
