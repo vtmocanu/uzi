@@ -1071,7 +1071,13 @@ type Store interface {
 	UpdateRunLastSeq(ctx context.Context, arg store.UpdateRunLastSeqParams) (int64, error)
 
 	// Sweeper + register-time orphan recovery.
-	SweepClaimedNeverStarted(ctx context.Context, cutoff pgtype.Timestamptz) ([]store.SweepClaimedNeverStartedRow, error)
+	// SweepClaimedNeverStartedCohort (issue #3859) runs the claimed-never-started passes in ONE
+	// transaction: charge (or park at the cap) a witnessed retained-custody departure, park an
+	// unwitnessed continuation whose witness window passed, then reset the rest uncharged.
+	SweepClaimedNeverStartedCohort(ctx context.Context, arg store.SweepClaimedNeverStartedCohortParams) (store.SweepClaimedNeverStartedCohortResult, error)
+	// RecordRunRegistrationEvidence (issue #3859) stores the worker's registration witness from
+	// its first running report. It runs BEFORE SetRunRunning and does not depend on that write.
+	RecordRunRegistrationEvidence(ctx context.Context, arg store.RecordRunRegistrationEvidenceParams) (int64, error)
 	// SweepTaskNeverDispatched terminalizes a kind='task' (handoff) run left queued with
 	// dispatched_at NULL past the dispatch grace window (issue #1367): the CLI never landed
 	// its push/dispatch, so ClaimRun never offers it and no other sweep touches it. Server-
@@ -1425,9 +1431,10 @@ type Store interface {
 	// Per-user judge model lanes (PRD #69 M2, PRD #3245): read at judge-claim assembly,
 	// keyed on the run owner. NULL ⇒ inherit the instance value for that harness.
 	GetUserJudgeModels(ctx context.Context, id uuid.UUID) (store.GetUserJudgeModelsRow, error)
-	// Per-user run-summary model override (PRD #362 M2): read at ISSUE-run claim
-	// assembly, keyed on the run owner. NULL ⇒ inherit the instance summary_model.
-	GetUserSummaryModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
+	// Per-user run-summary model overrides, Claude lane (PRD #362 M2) and Codex lane
+	// (PRD #3248): read at ISSUE-run claim assembly, keyed on the run owner. NULL ⇒
+	// inherit the instance value for that harness.
+	GetUserSummaryModels(ctx context.Context, id uuid.UUID) (store.GetUserSummaryModelsRow, error)
 	// ListClaimAgentTemplates resolves template allocations for the run owner
 	// (PRD #18 M7): only the builtin/global defaults ± the owner's overlay + the
 	// owner's own allocated user templates ride the claim, not every template.
@@ -1812,10 +1819,6 @@ type SettingsReader interface {
 	// InstanceModel is the trimmed instance-tier value of a non-secret model key
 	// ("" when unset). On an error the caller treats the tier as unset (PRD #3245).
 	InstanceModel(ctx context.Context, key string) (string, error)
-	// SummaryModel is the instance-default model the inline run-summary generator
-	// runs on (PRD #362 Decision 8), the fallback when the run owner has no per-user
-	// summary_model override. Falls back to the compiled-in default ("haiku").
-	SummaryModel(ctx context.Context) (string, error)
 	// UziLabel is the single run-eligibility label an issue must carry to be runnable
 	// (PRD #764 M1). It is read here rather than passed in by each caller because the
 	// gate is shared: the board handler, the scheduler, and the poller's autopilot must
@@ -4095,6 +4098,13 @@ func branchMovedStopReason(reason *string) string {
 // column and the M2 worker client); the Go field stays
 // `State` to avoid churn in the switch below.
 type StateRequest struct {
+	// RegistrationEvidence (issue #3859, feature run_registration_evidence_v1) is the worker's own
+	// (claim_generation, register_nonce, registration epoch) on a `running` report. It is recorded
+	// BEFORE the status write and independently of whether that write applies, so a report a
+	// SetRunRunning guard refuses still leaves the witness that lets the sweep tell a departed
+	// flight from a slow one. Valid only on `running`; httpx.DecodeJSON rejects unknown fields, so
+	// the field MUST exist here or a new worker's report 400s.
+	RegistrationEvidence       *RegistrationEvidence           `json:"registration_evidence,omitempty"`
 	SourcePublication          *SourcePublicationReport        `json:"source_publication,omitempty"`
 	RegisterNonce              string                          `json:"register_nonce,omitempty"`
 	MemoryEpisode              *int64                          `json:"memory_episode,omitempty"`
@@ -8569,6 +8579,14 @@ func (s *Service) hasLivePoller(ctx context.Context, run store.Run) (bool, error
 type SweepResult struct {
 	WorkersOffline int64
 	ClaimedReset   int64
+	// ClaimedCharged and ClaimedExhausted (issue #3859) count claimed-never-started
+	// continuations the charge pass requeued with requeue_count + 1, and parked at
+	// recovery_wait/worker_requeue_exhausted once the episode budget was spent.
+	ClaimedCharged   int64
+	ClaimedExhausted int64
+	// ClaimedUnwitnessed counts continuations parked at recovery_wait /
+	// retained_continuation_unwitnessed after their witness window passed (issue #3859).
+	ClaimedUnwitnessed int64
 	// TaskUndispatchedFailed is the number of kind='task' (handoff) runs this pass
 	// terminalized because they sat queued with dispatched_at NULL past DispatchGrace —
 	// the CLI never landed their push/dispatch (issue #1367). Normally 0: a handoff is

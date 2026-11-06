@@ -51,9 +51,9 @@ func finalInventoryEligible(hold store.RecoveryCustodyHold, workerID uuid.UUID, 
 		uuid.UUID(hold.LiveWorkerID.Bytes) != workerID {
 		return false
 	}
-	// Requeue exhaustion and memory pressure release the claim but leave custody an owner-only decision
-	// (Resume/Cancel); a worker's archive or settled proof must not end it implicitly.
-	if run.status == "recovery_wait" && run.parkCause.Valid && (run.parkCause.String == "worker_requeue_exhausted" || run.parkCause.String == "worker_memory_pressure" || run.parkCause.String == "retained_recovery_exhausted" || run.parkCause.String == "retained_recovery_adoption_failed" || (run.parkCause.String == "data_volume_full" && !run.retry.Valid)) {
+	// Owner-held recovery causes leave custody for an owner decision (Resume/Cancel),
+	// even when the claim was released; a worker's FINAL proof must not end it implicitly.
+	if run.status == "recovery_wait" && run.parkCause.Valid && (run.parkCause.String == "worker_requeue_exhausted" || run.parkCause.String == "worker_memory_pressure" || run.parkCause.String == "retained_recovery_exhausted" || run.parkCause.String == "retained_recovery_adoption_failed" || run.parkCause.String == "retained_continuation_unwitnessed" || (run.parkCause.String == "data_volume_full" && !run.retry.Valid)) {
 		return false
 	}
 	// A forge_unreachable park is a pre-clone park of a generation that may have adopted nothing:

@@ -86,11 +86,20 @@ Each TOML file becomes one subagent:
   `description`, and a non-empty string `developer_instructions`, which becomes
   the agent's prompt. The `name` and `description` rules match the Markdown
   agents.
-- **No tools, no model:** a TOML agent declares neither, so it runs with the
-  run's full default tool set, which can include `Bash`, and follows the lead's
-  model on either harness.
-  `model`, `model_reasoning_effort`,
-  `nickname_candidates`, `config_file`, `includes`, and any other key are ignored.
+- **Optional model:** a top-level `model` string can pin a Codex subagent to a
+  supported Codex role ID, including `gpt-6-luna`, using the same vocabulary as
+  Markdown Codex pins. An absent `model` or exactly `model = ""` follows the
+  resolved lead model. A whitespace-only, unsafe, unsupported, wrong-family,
+  or non-string value skips the agent with a bounded invalid-file note that
+  does not echo the model value. On Claude runs the pin is omitted, so the
+  subagent follows the resolved lead model.
+- **Model override and effort:** the schedule's "Apply model also to agents"
+  setting (`override_subagent_model`) overrides the TOML pin. Reasoning effort
+  still comes from the existing run settings; `model_reasoning_effort` is ignored.
+- **Default tools:** a TOML agent runs with the run's full default tool set,
+  which can include `Bash`, subject to the guards below.
+  `nickname_candidates`, `config_file`, `includes`, and other unrecognised keys
+  are ignored.
 - **Skipped, not run:** an otherwise valid file that declares `features`, `skills`,
   `sandbox_mode`, or `tools` (with any value) is skipped with a "declares a Codex
   restriction uzi cannot honour yet" note, rather than running without the

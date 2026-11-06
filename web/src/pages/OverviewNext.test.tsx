@@ -220,31 +220,41 @@ describe("OverviewNext for an admin", () => {
   });
 });
 
-describe("carried-over sections take the same inputs as Dashboard", () => {
-  it("feeds the custody alert the viewer's own recovery_wait count only, never the admin rows", async () => {
-    vi.mocked(useAuth).mockReturnValue(authValue(admin));
-    mockApi.listRuns.mockResolvedValue({
-      runs: [aRun({ id: "own-1", status: "recovery_wait" }), aRun({ id: "own-2", status: "recovery_wait" })],
+describe("Capacity rail", () => {
+  it("lists every owner worker on the rail, including one with no stats, and drops Worker load", async () => {
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [
+        aWorker({ id: "w1", name: "statless-worker", active_runs: 1, max_concurrent_runs: 2 }),
+        aWorker({ id: "w2", name: "gone-worker", status: "offline" }),
+        // Stats-bearing (hasStats) so WorkerLoadCard would render if it were still mounted.
+        aWorker({
+          id: "w3",
+          name: "loaded-worker",
+          stats_cpu_pct: 10,
+          stats_mem_bytes: 1024,
+          stats_source: "cgroup",
+        }),
+      ],
     });
-    mockApi.adminListRuns.mockResolvedValue({
-      runs: Array.from({ length: 5 }, (_, i) =>
-        aRun({ id: `other-${i}`, status: "recovery_wait", owner_email: "mira@uzi.local" }),
-      ),
-    });
-    mockApi.getRecoveryHolds.mockResolvedValue({
-      aggregate: { open_holds: 1, admission_counted_holds: 1, custody_hold_limit: 8, decision_needed: 1, blocked_runs: 0 },
-      holds: [],
-    });
-    await mount("dashboard");
-    const onDashboard = screen.getByRole("status", { name: "Held work" }).textContent;
-    expect(onDashboard).toContain("2 runs waiting to recover");
-    cleanup();
-    await mount("next");
-    const onPreview = screen.getByRole("status", { name: "Held work" }).textContent;
-    expect(onPreview).toContain("2 runs waiting to recover");
-    expect(onPreview).toBe(onDashboard);
+    await mount();
+    expect(screen.queryByText("Worker load")).toBeNull();
+    const rail = screen.getByRole("heading", { name: /Capacity/ }).closest("section") as HTMLElement;
+    expect(within(rail).getByText("1 of 2")).toBeTruthy();
+    expect(within(rail).getByText("statless-worker")).toBeTruthy();
+    expect(within(rail).getByText("gone-worker")).toBeTruthy();
+    expect(within(rail).getAllByText("No stats reported")).toHaveLength(2);
   });
 
+  it("keeps Worker load on /dashboard", async () => {
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [aWorker({ stats_cpu_pct: 10, stats_mem_bytes: 1024, stats_source: "cgroup" })],
+    });
+    await mount("dashboard");
+    expect(screen.getByText("Worker load")).toBeTruthy();
+  });
+});
+
+describe("carried-over sections take the same inputs as Dashboard", () => {
   it("shows a non-admin the same hosted-workers platform line as Dashboard", async () => {
     mockApi.listRuns.mockResolvedValue({ runs: [aRun({ status: "queued" })] });
     mockApi.listWorkers.mockResolvedValue({
@@ -266,6 +276,165 @@ describe("carried-over sections take the same inputs as Dashboard", () => {
     });
     await mount("next");
     expect(screen.queryByRole("status", { name: "Your hosted workers" })).toBeNull();
+  });
+});
+
+function heldAggregate(over: Partial<ReturnType<typeof noHolds>["aggregate"]>) {
+  return { ...noHolds().aggregate, ...over };
+}
+
+function decisionHold(runId: string, createdAt: string) {
+  return {
+    id: `hold-${runId}`,
+    run_id: runId,
+    generation: 1,
+    state: "open",
+    attention: "source_only",
+    worker_id: "w1",
+    inventory_guarded: false,
+    has_available_capture: false,
+    created_at: createdAt,
+    updated_at: createdAt,
+  };
+}
+
+const heldCard = () => screen.getByRole("heading", { name: /Held work/, level: 2 }).closest("section") as HTMLElement;
+
+describe("Held work card", () => {
+  it("shows the Dashboard alert's headline and the own-runs-only recovery diagnostic, with no alert copy of its own", async () => {
+    vi.mocked(useAuth).mockReturnValue(authValue(admin));
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "own-1", status: "recovery_wait" }), aRun({ id: "own-2", status: "recovery_wait" })],
+    });
+    mockApi.adminListRuns.mockResolvedValue({
+      runs: Array.from({ length: 5 }, (_, i) =>
+        aRun({ id: `other-${i}`, status: "recovery_wait", owner_email: "mira@uzi.local" }),
+      ),
+    });
+    mockApi.getRecoveryHolds.mockResolvedValue({
+      aggregate: heldAggregate({ open_holds: 1, admission_counted_holds: 1, decision_needed: 1 }),
+      holds: [],
+    });
+    await mount("dashboard");
+    const alert = screen.getByRole("status", { name: "Held work" });
+    const dashboardHeadline = within(alert).getByRole("heading").textContent;
+    expect(alert.textContent).toContain("2 runs waiting to recover");
+    cleanup();
+    mockApi.getRecoveryHolds.mockClear();
+
+    await mount("next");
+    const card = screen.getByRole("status", { name: "Held work" });
+    expect(within(card).getByRole("heading", { level: 3 }).textContent).toBe(dashboardHeadline);
+    expect(within(card).getByText("2 runs waiting to recover")).toBeTruthy();
+    // CustodyBoardAlert's own copy is not on the preview.
+    expect(screen.queryByText(/Review the holds that need a decision and choose how to preserve their work\./)).toBeNull();
+    expect(screen.getAllByRole("status", { name: "Held work" })).toHaveLength(1);
+    // One request per tick: the card takes holds from the hook, it does not fetch its own.
+    expect(mockApi.getRecoveryHolds).toHaveBeenCalledTimes(1);
+    await settle(10_000);
+    expect(mockApi.getRecoveryHolds).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows healthy holds as figures with no headline and no decision", async () => {
+    mockApi.getRecoveryHolds.mockResolvedValue({
+      aggregate: heldAggregate({ open_holds: 2, admission_counted_holds: 2 }),
+      holds: [],
+    });
+    await mount();
+    const card = heldCard();
+    expect([...card.querySelectorAll("strong")].map((e) => e.textContent)).toEqual(["2 / 8", "2", "0"]);
+    expect(within(card).getByText("open custody holds")).toBeTruthy();
+    expect(within(card).getByText("holds need a decision")).toBeTruthy();
+    expect(within(card).queryByRole("link", { name: /^Review held work/ })).toBeNull();
+    expect(screen.queryByText("Needs your decision")).toBeNull();
+    expect(sentence()).toBe("Nothing needs you right now. 1 run is executing.");
+  });
+
+  it("counts two decision holds as 2 decisions and lists one held row", async () => {
+    mockApi.getRecoveryHolds.mockResolvedValue({
+      aggregate: heldAggregate({ open_holds: 2, admission_counted_holds: 2, decision_needed: 2 }),
+      holds: [decisionHold("run-a", "2026-07-05T10:00:00Z"), decisionHold("run-b", "2026-07-05T11:00:00Z")],
+    });
+    await mount();
+    expect(sentence()).toBe("2 decisions are waiting on you. 1 run is executing.");
+    const needs = screen.getByRole("region", { name: "Needs your decision" });
+    expect(within(needs).getAllByRole("listitem")).toHaveLength(1);
+    expect(within(needs).getByText("Held work needs 2 decisions")).toBeTruthy();
+    expect(within(needs).getByText("2 decisions")).toBeTruthy();
+    expect(within(needs).getByRole("link", { name: "Review held work" }).getAttribute("href")).toBe(
+      "/workers?tab=workers#recovery-holds",
+    );
+    // The card header carries its own link, beside the row's.
+    expect(within(heldCard()).getByRole("link", { name: "Review held work →" }).getAttribute("href")).toBe(
+      "/workers?tab=workers#recovery-holds",
+    );
+    expect(screen.getAllByRole("link", { name: /^Review held work/ })).toHaveLength(2);
+  });
+
+  it("names the run of a single decision hold", async () => {
+    mockApi.getRecoveryHolds.mockResolvedValue({
+      aggregate: heldAggregate({ open_holds: 1, admission_counted_holds: 1, decision_needed: 1 }),
+      holds: [decisionHold("a83c51f0-aaaa", "2026-07-05T10:00:00Z")],
+    });
+    await mount();
+    expect(screen.getByText(/Held work from run/).textContent).toBe("Held work from run a83c51f0 needs a decision");
+    expect(sentence()).toBe("1 decision is waiting on you. 1 run is executing.");
+  });
+
+  it("keeps blocked runs a danger headline with no review link and no held row", async () => {
+    mockApi.getRecoveryHolds.mockResolvedValue({
+      aggregate: heldAggregate({ open_holds: 3, admission_counted_holds: 3, blocked_runs: 2 }),
+      holds: [],
+    });
+    await mount();
+    const card = screen.getByRole("alert", { name: "Held work" });
+    expect(within(card).getByRole("heading", { level: 3 }).textContent).toBe("Held work is blocking new runs");
+    expect(within(card).getByRole("heading", { level: 3 }).className).toContain("text-danger");
+    expect(screen.queryByRole("link", { name: /^Review held work/ })).toBeNull();
+    expect(screen.queryByText("Needs your decision")).toBeNull();
+    expect(sentence()).toBe("Nothing needs you right now. 1 run is executing.");
+  });
+
+  it("says held work is unavailable when the holds request fails, and keeps the rest of the page", async () => {
+    mockApi.getRecoveryHolds.mockRejectedValue(new Error("down"));
+    await mount();
+    expect(within(heldCard()).getByText("Held work is unavailable right now.")).toBeTruthy();
+    expect(screen.getByText("Live run row")).toBeTruthy();
+  });
+
+  it("says it is loading, not unavailable, until the first holds response", async () => {
+    mockApi.getRecoveryHolds.mockImplementation(() => new Promise(() => {}));
+    await mount();
+    expect(within(heldCard()).getByText("Loading held work…")).toBeTruthy();
+    expect(screen.queryByText(/Held work is unavailable/)).toBeNull();
+  });
+
+  it("still shows the danger headline and the held row when a first-load endpoint rejects", async () => {
+    mockApi.listRepos.mockRejectedValue(new Error("repos down"));
+    mockApi.getRecoveryHolds.mockResolvedValue({
+      aggregate: heldAggregate({ open_holds: 3, admission_counted_holds: 3, decision_needed: 1, blocked_runs: 2 }),
+      holds: [decisionHold("a83c51f0-aaaa", "2026-07-05T10:00:00Z")],
+    });
+    await mount();
+    const card = screen.getByRole("alert", { name: "Held work" });
+    expect(within(card).getByRole("heading", { level: 3 }).textContent).toBe("Held work is blocking new runs");
+    expect(within(card).getByRole("link", { name: "Review held work →" })).toBeTruthy();
+    expect(within(screen.getByRole("region", { name: "Needs your decision" })).getByText(/Held work from run/)).toBeTruthy();
+  });
+
+  it("shows the Held work card with its figures while the runs request never resolves", async () => {
+    mockApi.listRuns.mockImplementation(() => new Promise(() => {}));
+    mockApi.getRecoveryHolds.mockResolvedValue({
+      aggregate: heldAggregate({ open_holds: 2, admission_counted_holds: 2 }),
+      holds: [],
+    });
+    await mount();
+    expect([...heldCard().querySelectorAll("strong")].map((e) => e.textContent)).toEqual(["2 / 8", "2", "0"]);
+  });
+
+  it("does not fetch holds on Dashboard beyond its own alert", async () => {
+    await mount("dashboard");
+    expect(mockApi.getRecoveryHolds).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -61,7 +61,7 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusConflict, hint)
 			return
 		}
-		if !run.RecoveryWaitCause.Valid || (run.RecoveryWaitCause.String != "forge_unreachable" && run.RecoveryWaitCause.String != "data_volume_full" && run.RecoveryWaitCause.String != "worker_requeue_exhausted" && run.RecoveryWaitCause.String != "worker_memory_pressure" && run.RecoveryWaitCause.String != "retained_recovery_exhausted" && run.RecoveryWaitCause.String != "codex_idle_stall" && run.RecoveryWaitCause.String != "retained_recovery_adoption_failed") {
+		if !run.RecoveryWaitCause.Valid || (run.RecoveryWaitCause.String != "forge_unreachable" && run.RecoveryWaitCause.String != "data_volume_full" && run.RecoveryWaitCause.String != "worker_requeue_exhausted" && run.RecoveryWaitCause.String != "worker_memory_pressure" && run.RecoveryWaitCause.String != "retained_recovery_exhausted" && run.RecoveryWaitCause.String != "codex_idle_stall" && run.RecoveryWaitCause.String != "retained_recovery_adoption_failed" && run.RecoveryWaitCause.String != "retained_continuation_unwitnessed") {
 			httpx.Error(w, http.StatusConflict, fmt.Sprintf("run is %s", run.Status))
 			return
 		}

@@ -3,15 +3,17 @@
 // ordering and dedupe are the shared loader's job (repoagents.ts); this module only
 // turns the TOML text of ONE file into a template or a skip reason.
 //
-// The template is built FRESH from three validated string fields (`name`,
-// `description`, `developer_instructions`) and never spread from the parsed object:
-// no tools, no model. `model`, `model_reasoning_effort`, `nickname_candidates`,
+// The template is built FRESH from validated fields (`name`, `description`,
+// `developer_instructions`, optional `model`) and never spread from the parsed object.
+// Models must be supported Codex role pins. `model_reasoning_effort`, `nickname_candidates`,
 // `config_file`, `includes` and every other key are ignored. Only the four keys in
 // CODEX_RESTRICTION_KEYS (`features`, `skills`, `sandbox_mode`, `tools`) skip a file,
 // rather than run it without the restriction its author asked for; any other Codex
 // config key (e.g. `approval_policy`, `sandbox_workspace_write`) is ignored like the rest.
 
 import { parse } from "smol-toml";
+import { isValidModel } from "./models.js";
+import { isCodexRoleModel } from "./codex/render.js";
 import type { AgentTemplate } from "./protocol.js";
 import { isValidAgentName, isValidDescription, type ParsedAgentFile } from "./repoagents.js";
 
@@ -47,6 +49,12 @@ export function parseCodexAgentFile(raw: string, slug: string): ParsedAgentFile 
   const restrictions = CODEX_RESTRICTION_KEYS.filter((k) => Object.hasOwn(doc, k));
   if (restrictions.length > 0) return { ok: false, name, reason: "restriction_unsupported", restrictions };
 
+  // Exact empty means inherit. Never trim a pin into an accepted model.
+  const model = doc["model"];
+  if (model !== undefined && model !== "" &&
+      (typeof model !== "string" || !isValidModel(model) || !isCodexRoleModel(model))) return invalid(name);
+
   const template: AgentTemplate = { name, description, prompt_body: instructions };
+  if (typeof model === "string" && model !== "") template.model = model;
   return { ok: true, template, notes: [] };
 }

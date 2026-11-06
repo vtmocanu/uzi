@@ -1,8 +1,17 @@
 // Pure helpers shared by the two Overview pages (Dashboard and the /overview/next
 // preview, PRD #3878). Nothing here fetches or renders.
 
-import { isTerminalRun, type RunStatus, type RunSummaryItem, type Worker } from "./api";
+import {
+  isTerminalRun,
+  type RecoveryCustodyHold,
+  type RecoveryCustodyHolds,
+  type RunStatus,
+  type RunSummaryItem,
+  type Worker,
+} from "./api";
+import { custodyHoldView } from "./recovery";
 import { effectiveRunStatus, isAccountCooldownWaiting, isReserveHeldPause } from "./runBadge";
+import { stripUnsafeChars } from "./safeText";
 
 // Exhaustive over the wire status union; a new status needs an explicit bucket.
 export const activeRunBuckets: Record<RunStatus, "running" | "needsYou" | "queued" | "waiting" | null> = {
@@ -172,14 +181,29 @@ export function openPrs<T extends PrRun>(runs: ReadonlyArray<T>): T[] {
 
 export type DecisionKind = "plan" | "question" | "park" | "pr";
 
-export interface DecisionItem {
+export interface RunDecisionItem {
   kind: DecisionKind;
   run: RunSummaryItem;
   verb: "Review plan" | "Answer" | "Resume" | "Review PR";
   since: string;
 }
 
-const DECISION_VERB: Record<DecisionKind, DecisionItem["verb"]> = {
+// The aggregate's decision_needed holds, as ONE row. `count` is the server's aggregate
+// (authoritative); `runId` / `since` come from the hold list and are null when the list cannot
+// name them (several holds, or none the client classifies as a decision).
+export interface HeldDecisionItem {
+  kind: "held";
+  verb: "Review held work";
+  count: number;
+  runId: string | null;
+  since: string | null;
+  // The oldest decision hold's state label (sanitized), null when the list cannot name one.
+  label: string | null;
+}
+
+export type DecisionItem = RunDecisionItem | HeldDecisionItem;
+
+const DECISION_VERB: Record<DecisionKind, RunDecisionItem["verb"]> = {
   plan: "Review plan",
   question: "Answer",
   park: "Resume",
@@ -192,13 +216,21 @@ const DECISION_VERB: Record<DecisionKind, DecisionItem["verb"]> = {
 // park is a PARKED_STATUSES status, or an account cooldown, which parkDisposition always
 // calls "automatic" and so never lands in the owner-only park group. Callers pass ONLY the
 // viewer's own rows (listRuns), never the admin rows.
-export function overviewDecisions(ownRuns: ReadonlyArray<RunSummaryItem>): DecisionItem[] {
+//
+// `holds` (the owner's custody holds) adds exactly one held-work item, after park and before pr,
+// when the aggregate says an open hold needs a decision. The count is the aggregate's
+// decision_needed; the list only names the oldest decision hold for the row's age and, for a
+// single decision, its run.
+export function overviewDecisions(
+  ownRuns: ReadonlyArray<RunSummaryItem>,
+  holds?: RecoveryCustodyHolds | null,
+): DecisionItem[] {
   const out: DecisionItem[] = [];
   const add = (kind: DecisionKind, runs: ReadonlyArray<RunSummaryItem>, sinceOf: (r: RunSummaryItem) => string) => {
-    const items: DecisionItem[] = runs.map((run) => ({ kind, run, verb: DECISION_VERB[kind], since: sinceOf(run) }));
+    const items: RunDecisionItem[] = runs.map((run) => ({ kind, run, verb: DECISION_VERB[kind], since: sinceOf(run) }));
     // Deterministic ordering for unparseable timestamps: they sort last and keep input order
     // (the comparator below treats two of them as equal rather than subtracting Infinity).
-    const t = (i: DecisionItem) => {
+    const t = (i: RunDecisionItem) => {
       const ms = Date.parse(i.since);
       return Number.isNaN(ms) ? Number.POSITIVE_INFINITY : ms;
     };
@@ -213,8 +245,43 @@ export function overviewDecisions(ownRuns: ReadonlyArray<RunSummaryItem>): Decis
   add("plan", ownRuns.filter((r) => r.status === "awaiting_approval" && !r.is_revising), since);
   add("question", ownRuns.filter((r) => r.status === "awaiting_input" || r.status === "awaiting_followup"), since);
   add("park", ownRuns.filter((r) => isParked(r) && parkDisposition(r) === "owner"), since);
+  const held = heldDecision(holds);
+  if (held) out.push(held);
   add("pr", openPrs(ownRuns), (r) => r.finished_at ?? r.status_since ?? r.created_at);
   return out;
+}
+
+function heldDecision(holds: RecoveryCustodyHolds | null | undefined): HeldDecisionItem | null {
+  if (!holds || holds.aggregate.open_holds <= 0 || holds.aggregate.decision_needed <= 0) return null;
+  const count = holds.aggregate.decision_needed;
+  const ms = (h: RecoveryCustodyHold) => {
+    const t = Date.parse(h.created_at);
+    return Number.isNaN(t) ? Number.POSITIVE_INFINITY : t;
+  };
+  let oldest: RecoveryCustodyHold | null = null;
+  for (const h of holds.holds) {
+    if (h.state !== "open" || !custodyHoldView(h).needsDecision) continue;
+    if (oldest === null || ms(h) < ms(oldest)) oldest = h;
+  }
+  return {
+    kind: "held",
+    verb: "Review held work",
+    count,
+    runId: oldest && count === 1 ? oldest.run_id : null,
+    since: oldest ? oldest.created_at : null,
+    label: oldest ? stripUnsafeChars(custodyHoldView(oldest).stateLabel) || null : null,
+  };
+}
+
+// The number of decisions the header sentence counts: the run items other than open pull
+// requests, plus the aggregate's held-work decisions.
+export function decisionCount(items: ReadonlyArray<DecisionItem>): number {
+  let n = 0;
+  for (const i of items) {
+    if (i.kind === "held") n += i.count;
+    else if (i.kind !== "pr") n++;
+  }
+  return n;
 }
 
 function plural(n: number, one: string, many: string): string {

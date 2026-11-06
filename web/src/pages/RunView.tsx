@@ -1513,10 +1513,14 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
 }) {
   const adoptionFailed = run.recovery_wait_cause === "retained_recovery_adoption_failed";
   const idleStall = run.recovery_wait_cause === "codex_idle_stall";
-  const retained = adoptionFailed || run.recovery_wait_cause === "retained_recovery_exhausted" || idleStall;
+  // Owner-only, no timer, never an integrity refusal: the claimed continuation flight was
+  // never witnessed, so the server released the claim. Always held, even if a malformed
+  // response carries a retry stamp.
+  const unwitnessed = run.recovery_wait_cause === "retained_continuation_unwitnessed";
+  const retained = adoptionFailed || unwitnessed || run.recovery_wait_cause === "retained_recovery_exhausted" || idleStall;
   const decisionName = idleStall ? "Codex idle stall" : "Retained recovery";
-  const decisionHeld = adoptionFailed || run.recovery_retry_not_before === null;
-  const decisionRetrying = !adoptionFailed && typeof run.recovery_retry_not_before === "string" && Number.isFinite(Date.parse(run.recovery_retry_not_before));
+  const decisionHeld = adoptionFailed || unwitnessed || run.recovery_retry_not_before === null;
+  const decisionRetrying = !adoptionFailed && !unwitnessed && typeof run.recovery_retry_not_before === "string" && Number.isFinite(Date.parse(run.recovery_retry_not_before));
   const retryMs = typeof run.recovery_retry_not_before === "string" ? Date.parse(run.recovery_retry_not_before) : NaN;
   const memoryHeld = run.recovery_wait_cause === "worker_memory_pressure";
   const memory = run.memory_hold;
@@ -1524,12 +1528,13 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
   const evidence = recovery?.evidence;
   return (
     <div className="rounded-xl border border-warn/40 bg-warn/10 p-4">
-      <p className="text-sm font-semibold text-warn">{adoptionFailed ? "Retained recovery integrity check failed" : retained ? decisionHeld ? `${decisionName} needs your decision`
+      <p className="text-sm font-semibold text-warn">{adoptionFailed ? "Retained recovery integrity check failed" : unwitnessed ? "Unwitnessed continuation hold needs your decision" : retained ? decisionHeld ? `${decisionName} needs your decision`
         : decisionRetrying ? `${decisionName} retrying` : `${decisionName} timing unknown`
         : memoryHeld ? "Worker memory pressure — waiting for owner" : "Worker recovery needs your decision"}</p>
       <p className="mt-0.5 text-xs text-muted">
         {retained ? <>
           {adoptionFailed && "Integrity checks refused to adopt the retained work. Local work and its custody are preserved. "}
+          {unwitnessed && "The continuation was never confirmed to start, so the claim was released. Local work and its custody are kept. "}
           {decisionHeld
             ? "This hold has no scheduled retry. Only the run owner can Resume or Cancel."
             : decisionRetrying
@@ -1741,7 +1746,7 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
   // sibling parks) renders nothing — PoolWaitPanel owns pool_wait, LimitWaitPanel owns
   // limit_wait, and this self-hides on both so mounting all three side by side is safe.
   if (run.status !== "recovery_wait") return null;
-  if (run.recovery_wait_cause === "worker_requeue_exhausted" || run.recovery_wait_cause === "worker_memory_pressure" || (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall" || run.recovery_wait_cause === "retained_recovery_adoption_failed")) {
+  if (run.recovery_wait_cause === "worker_requeue_exhausted" || run.recovery_wait_cause === "worker_memory_pressure" || (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall" || run.recovery_wait_cause === "retained_recovery_adoption_failed" || run.recovery_wait_cause === "retained_continuation_unwitnessed")) {
     return <WorkerDecisionPanel run={run} ownerProof={ownerProof} busy={busy} onResume={onResume} onCancel={onCancel} />;
   }
 
@@ -2026,7 +2031,7 @@ export function RunView() {
   const memoryHeld = run?.status === "recovery_wait" && run.recovery_wait_cause === "worker_memory_pressure";
   // Issue #3181: the token-switch holds are owner decisions too (Resume / Cancel).
   const switchHeld = run != null && credentialSwitchHold(run) !== null;
-  const retainedRecovery = run?.status === "recovery_wait" && (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall" || run.recovery_wait_cause === "retained_recovery_adoption_failed");
+  const retainedRecovery = run?.status === "recovery_wait" && (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall" || run.recovery_wait_cause === "retained_recovery_adoption_failed" || run.recovery_wait_cause === "retained_continuation_unwitnessed");
   const policyHeld = run != null && isPolicyHeld(run);
   const policyPending = run != null && isPolicyPending(run);
   const policyBlocked = policyHeld || policyPending;
@@ -2464,7 +2469,7 @@ export function RunView() {
                       : `forge:${forgeWaitMode(run)}`
                   : run.recovery_wait_cause === "provider_outage"
                     ? "provider_outage"
-                  : (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall" || run.recovery_wait_cause === "retained_recovery_adoption_failed")
+                  : (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall" || run.recovery_wait_cause === "retained_recovery_adoption_failed" || run.recovery_wait_cause === "retained_continuation_unwitnessed")
                     ? effectiveRunStatus(run)
                   : run.recovery_wait_cause === "worker_requeue_exhausted"
                     ? "worker_requeue_exhausted"
@@ -2503,6 +2508,8 @@ export function RunView() {
           ? "The run is waiting for a pooled Anthropic token. Add a token to the pool and it resumes automatically."
           : parkKey === "retained_recovery_adoption_failed"
             ? "Integrity checks refused to adopt the retained work. Local work and its custody are preserved. Only the run owner can Resume or Cancel. There is no scheduled retry."
+          : parkKey === "retained_continuation_unwitnessed"
+            ? "The continuation was never confirmed to start, so the claim was released. Local work and its custody are kept. Only the run owner can Resume or Cancel. There is no scheduled retry."
           : parkKey === "codex_idle_stall_held"
             ? "Codex idle stall needs your decision. Only the run owner can Resume or Cancel. There is no scheduled retry. Resume starts a fresh wall and resets the idle-stall count; Cancel ends the run."
           : parkKey === "codex_idle_stall_retrying"

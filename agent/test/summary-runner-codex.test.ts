@@ -8,6 +8,9 @@ import type { CodexAdviceHarnessFactory } from "../src/codex/codex-executor.js";
 import type { AdviceRequest, AdviceResultPolicy, HarnessTerminal } from "../src/harness.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import { nullLogger } from "./helpers.js";
+import { testOwnedPassHomeRoot } from "./teardown-fixtures.js";
+import { DEFAULT_CODEX_SUMMARY_MODEL } from "../src/codex/summary-model.js";
+import { isCodexRoleModel } from "../src/codex/render.js";
 
 const base = { token: "usable-claude", model: "sonnet", issueTitle: "Add reports", issueBody: "Report results", prdText: "PRD" };
 const bindings = [
@@ -140,3 +143,124 @@ for (const pass of ["intent", "plan"] as const) {
     }
   });
 }
+
+// Issue #3248: the Codex lane model is the claim's `model` when it is a Codex role model, else the built-in fallback.
+describe("Codex summary model selection (#3248)", () => {
+  const root = testOwnedPassHomeRoot();
+  for (const pass of ["intent", "plan"] as const) {
+    for (const [label, model, want] of [
+      ["absent", "", "gpt-6-luna"],
+      ["configured member", "gpt-6-astra", "gpt-6-astra"],
+      ["Claude lane value from an older server", "haiku", "gpt-6-luna"],
+      ["unknown id", "gpt-7-unknown", "gpt-6-luna"],
+    ] as const) {
+      it(`${pass}: ${label} model resolves to ${want} at effort low, refresh deny, no Claude`, async () => {
+        const seen: { model?: string; effort?: string; refresh?: string }[] = [];
+        let claudeCalls = 0;
+        const factory = (async (params) => ({ kind: "codex", run: async (req: AdviceRequest, policy: AdviceResultPolicy) => {
+          seen.push({ model: req.model, effort: req.effort, refresh: params.refresh });
+          policy.onTerminal(success, { isError: false, latest: undefined });
+          return { text: pass === "intent" ? "Adds reports." : JSON.stringify({ summary: "Adds reports.", deltas: [] }), end: { kind: "terminal", terminal: success } };
+        } })) as CodexAdviceHarnessFactory;
+        const queryFn = (() => { claudeCalls++; throw new Error("unexpected Claude"); }) as unknown as SdkQueryFn;
+        const r = new SummaryRunner(nullLogger(), { homeRoot: root, modelTimeoutMs: 1000, queryFn, codexAdviceHarnessFactory: factory });
+        const input: IntentSummaryInput = { ...base, model, claim: { run_id: "run-summary", secrets: { codex: bindings[0] } } };
+        assert.ok(pass === "intent" ? await r.generateIntentSummary(input) : await r.generatePlanSummary({ ...input, planMd: "# Plan" }));
+        assert.deepEqual(seen, [{ model: want, effort: "low", refresh: "deny" }]);
+        assert.equal(claudeCalls, 0);
+      });
+    }
+  }
+});
+
+describe("summary fixture pin (#3248)", () => {
+  it("the Codex fallback equals the fixture built-in and is a Codex role model", async () => {
+    const fx = JSON.parse(await fs.readFile(new URL("../../fixtures/model-settings/summary.json", import.meta.url), "utf8")) as { builtins: { codex: string } };
+    assert.equal(fx.builtins.codex, DEFAULT_CODEX_SUMMARY_MODEL);
+    assert.equal(isCodexRoleModel(DEFAULT_CODEX_SUMMARY_MODEL), true);
+  });
+});
+
+// Issue #3248 M3: stub-harness cases for the skip classification that the real advice harness
+// cannot produce (an `authorization` terminal) or cannot order deterministically (deny then timeout).
+describe("Codex summary skip reasons, stub harness (#3248 M3)", () => {
+  const root = testOwnedPassHomeRoot();
+  const claim = { run_id: "run-summary", secrets: { codex: bindings[0] } };
+  const failedTerminal = (category: string): HarnessTerminal => ({
+    ...success, outcome: "failed", subtype: "error_during_execution", errors: ["provider failed"],
+    failure: { materialize: () => ({ failure: { category, message: "x" }, original: new Error("x") }) } as never,
+  });
+  type Harness = (params: { onRefreshDenied?: () => void }, req: AdviceRequest, policy: AdviceResultPolicy, ctl: AbortController) => Promise<{ text: string; end: unknown }>;
+  async function drive(pass: "intent" | "plan", harness: Harness | "missing" | "malformed", timeoutMs = 1000) {
+    const ctl = new AbortController();
+    let claude = 0;
+    let builds = 0;
+    const factory = (async (params: { onRefreshDenied?: () => void }) => {
+      builds++;
+      return { kind: "codex", run: (req: AdviceRequest, policy: AdviceResultPolicy) => (harness as Harness)(params, req, policy, ctl) };
+    }) as unknown as CodexAdviceHarnessFactory;
+    const r = new SummaryRunner(nullLogger(), {
+      homeRoot: root, modelTimeoutMs: timeoutMs,
+      queryFn: (() => { claude++; throw new Error("unexpected Claude"); }) as unknown as SdkQueryFn,
+      codexAdviceHarnessFactory: harness === "missing" ? undefined : factory,
+    });
+    const reasons: string[] = [];
+    const input: IntentSummaryInput = {
+      ...base, signal: ctl.signal, onSkip: (reason) => { reasons.push(reason); },
+      claim: { run_id: "run-summary", secrets: { codex: harness === "malformed" ? { auth_mode: "subscription" } : claim.secrets.codex } },
+    };
+    const out = pass === "intent" ? await r.generateIntentSummary(input) : await r.generatePlanSummary({ ...input, planMd: "# Plan" });
+    return { out, reasons, claude, builds };
+  }
+
+  for (const pass of ["intent", "plan"] as const) {
+    describe(pass, () => {
+      it("an authorization error terminal stays silent", async () => {
+        const r = await drive(pass, async (_p, _req, policy) => {
+          const t = failedTerminal("authorization");
+          policy.onTerminal(t, { isError: true, latest: undefined });
+          return { text: "", end: { kind: "terminal", terminal: t } };
+        });
+        assert.deepEqual({ out: r.out, reasons: r.reasons, claude: r.claude, builds: r.builds }, { out: null, reasons: [], claude: 0, builds: 1 });
+      });
+      it("an authentication error terminal reports credential_rejected through the pass policy", async () => {
+        const r = await drive(pass, async (_p, _req, policy) => {
+          const t = failedTerminal("authentication");
+          policy.onTerminal(t, { isError: true, latest: undefined });
+          return { text: "", end: { kind: "terminal", terminal: t } };
+        });
+        assert.deepEqual({ out: r.out, reasons: r.reasons, claude: r.claude }, { out: null, reasons: ["credential_rejected"], claude: 0 });
+      });
+      it("a denied refresh then a model-pass timeout stays silent", async () => {
+        const r = await drive(pass, (p, req) => {
+          p.onRefreshDenied?.();
+          return new Promise((_, reject) => setTimeout(() => reject(new Error(`summary model call exceeded ${req.timeoutMs}ms`)), req.timeoutMs));
+        }, 80);
+        assert.deepEqual({ out: r.out, reasons: r.reasons, claude: r.claude }, { out: null, reasons: [], claude: 0 });
+      });
+      it("a denied refresh then an abort stays silent", async () => {
+        const r = await drive(pass, async (p, _req, _policy, ctl) => {
+          p.onRefreshDenied?.();
+          ctl.abort();
+          throw new Error("summary model call aborted");
+        });
+        assert.deepEqual({ out: r.out, reasons: r.reasons, claude: r.claude }, { out: null, reasons: [], claude: 0 });
+      });
+      it("a denied refresh then a thrown failure reports refresh_denied", async () => {
+        const r = await drive(pass, async (p) => {
+          p.onRefreshDenied?.();
+          throw new Error("codex advice transport failed");
+        });
+        assert.deepEqual({ out: r.out, reasons: r.reasons, claude: r.claude }, { out: null, reasons: ["refresh_denied"], claude: 0 });
+      });
+      it("a missing factory stays silent", async () => {
+        const r = await drive(pass, "missing");
+        assert.deepEqual({ out: r.out, reasons: r.reasons, claude: r.claude, builds: r.builds }, { out: null, reasons: [], claude: 0, builds: 0 });
+      });
+      it("a malformed codex binding stays silent", async () => {
+        const r = await drive(pass, "malformed");
+        assert.deepEqual({ out: r.out, reasons: r.reasons, claude: r.claude, builds: r.builds }, { out: null, reasons: [], claude: 0, builds: 0 });
+      });
+    });
+  }
+});

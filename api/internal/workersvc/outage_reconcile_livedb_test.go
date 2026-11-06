@@ -842,7 +842,7 @@ func (x outageCodexFlight) provisional(t *testing.T, path string) {
 			}
 		}
 	case "claimed_never_started":
-		rows, err := x.env.q.SweepClaimedNeverStarted(x.env.ctx, cutoff)
+		rows, err := x.env.q.SweepClaimedNeverStarted(x.env.ctx, store.SweepClaimedNeverStartedParams{Cutoff: cutoff})
 		if err != nil {
 			t.Fatal(err)
 		}

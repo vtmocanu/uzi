@@ -167,6 +167,7 @@ const PARK_LABELS = {
   retained_recovery_held: "retained recovery needs decision",
   retained_recovery_adoption_failed: "retained recovery integrity hold",
   retained_recovery_unknown: "retained recovery timing unknown",
+  retained_continuation_unwitnessed: "unwitnessed continuation hold",
   worker_requeue_exhausted: "recovery needs decision",
   worker_memory_pressure: "memory pressure: owner hold",
   paused: "paused",
@@ -253,6 +254,9 @@ export function effectiveRunStatus(
   if (run.status === "paused" && run.hold_reason === "credential_disabled") return "credential_disabled";
   // Integrity refusal is always owner-held, even if a malformed DTO carries a retry stamp.
   if (run.status === "recovery_wait" && run.recovery_wait_cause === "retained_recovery_adoption_failed") return "retained_recovery_adoption_failed";
+  // Owner-only, no timer: the claimed flight was never witnessed, so the server released the
+  // claim. Always owner-held, even if a malformed DTO carries a retry stamp.
+  if (run.status === "recovery_wait" && run.recovery_wait_cause === "retained_continuation_unwitnessed") return "retained_continuation_unwitnessed";
   if (run.status === "recovery_wait" && run.recovery_wait_cause === "retained_recovery_exhausted") {
     // Only explicit null means owner-held. Omitted or invalid timing stays unknown.
     if (run.recovery_retry_not_before === null) return "retained_recovery_held";
@@ -409,7 +413,7 @@ export function runStatusTone(
   if (status === "pool_wait") return "warning";
   // Recovery holds use warning: transient recovery and worker exhaustion are
   // non-terminal, though exhaustion requires an owner decision.
-  if (status === "retained_recovery_adoption_failed" || status === "codex_idle_stall_retrying" || status === "codex_idle_stall_held" || status === "codex_idle_stall_unknown" || status === "retained_recovery_retrying" || status === "retained_recovery_held" || status === "retained_recovery_unknown" || status === "recovery_wait" || status === "worker_requeue_exhausted" || status === "worker_memory_pressure") return "warning";
+  if (status === "retained_recovery_adoption_failed" || status === "retained_continuation_unwitnessed" || status === "codex_idle_stall_retrying" || status === "codex_idle_stall_held" || status === "codex_idle_stall_unknown" || status === "retained_recovery_retrying" || status === "retained_recovery_held" || status === "retained_recovery_unknown" || status === "recovery_wait" || status === "worker_requeue_exhausted" || status === "worker_memory_pressure") return "warning";
   // PRD #1190: an ordinary paused run. INFO, not the warn the involuntary holds carry
   // (D11): a pause is a chosen hold, not something blocking the run. Kept in step with
   // RUN_STATUS_TONES.paused (the runBadge.test.ts tone-agreement loop asserts it).
@@ -896,6 +900,11 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
         kind: "badge", label: PARK_LABELS.retained_recovery_adoption_failed, tone: "warning", pulse: false,
         title: "Integrity checks refused to adopt the retained work. Local work and its custody are preserved. Only the run owner can Resume or Cancel; there is no scheduled retry.",
       };
+    case "retained_continuation_unwitnessed":
+      return {
+        kind: "badge", label: PARK_LABELS.retained_continuation_unwitnessed, tone: "warning", pulse: false,
+        title: "The continuation was never confirmed to start, so the claim was released. Local work and its custody are kept. Only the run owner can Resume or Cancel; there is no scheduled retry.",
+      };
     case "codex_idle_stall_retrying":
     case "codex_idle_stall_held":
     case "codex_idle_stall_unknown":
@@ -1210,6 +1219,7 @@ export function needsHumanAttention(status: string): boolean {
     status === "codex_idle_stall_held" ||
     status === "retained_recovery_held" ||
     status === "retained_recovery_adoption_failed" ||
+    status === "retained_continuation_unwitnessed" ||
     status === "worker_requeue_exhausted" ||
     status === "worker_memory_pressure" ||
     status === "iteration_budget_exhausted" ||

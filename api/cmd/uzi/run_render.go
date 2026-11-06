@@ -2127,7 +2127,7 @@ func steerStateWithRun(in apitypes.SteerInputDTO, runStatus string, recoveryCaus
 			}
 		}
 	}
-	if len(recoveryCause) > 0 && (recoveryCause[0] == workerRequeueExhaustedCause || recoveryCause[0] == workerMemoryPressureCause || recoveryCause[0] == retainedRecoveryAdoptionFailedCause) {
+	if len(recoveryCause) > 0 && (recoveryCause[0] == workerRequeueExhaustedCause || recoveryCause[0] == workerMemoryPressureCause || isAlwaysHeldRecoveryCause(recoveryCause[0])) {
 		recoveringSuffix = " (owner Resume/Cancel)"
 	}
 	if len(recoveryCause) > 0 && recoveryCause[0] == forgeUnreachableCause {
