@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Readable } from "node:stream";
 import { execFileSync } from "node:child_process";
-import { hermeticGitEnv, makeClaim, nullLogger, testGitCacheOptions } from "./helpers.js";
+import { hermeticGitEnv, makeClaim, nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
 import { GitCache } from "../src/git.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import type { Executor, RunContext } from "../src/executor.js";
@@ -68,13 +68,13 @@ function claimFor(h: Harness, overrides: Partial<ClaimResponse>): ClaimResponse 
   });
 }
 
-function newRunner(executor: Executor, dataDir = fx.dataDir): RunRunner {
+function newRunner(executor: Executor, dataDir = fx.dataDir, log = nullLogger()): RunRunner {
   const { gitlab } = fakeGitlab();
   return new RunRunner(
     client,
     new GitCache(dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() })),
     () => ({ executor }),
-    nullLogger(),
+    log,
     20,
     undefined,
     { pollMs: 5, planApprovalTimeoutMs: 0, gitlab },
@@ -177,6 +177,10 @@ function emptyOrigin(kind: "empty" | "unborn"): string {
     gitIn(dir, ["symbolic-ref", "HEAD", "refs/heads/main"]);
   }
   return dir;
+}
+
+function loggedMessages(lines: unknown[]): string[] {
+  return lines.map((l) => String((l as { msg?: unknown }).msg));
 }
 
 function statusTexts(runId: string): string[] {
@@ -597,6 +601,61 @@ describe("repo-agent roster pinned to the default-branch revision (issue #3913)"
       assert.deepEqual(rig.settled, []);
     });
   });
+
+  for (const [name, arrange, stop] of [
+    ["a stale claim", { runStatus: "running", disposition: "stale_claim" }, "run claim superseded server-side (stale_claim); stopping this flight"],
+    ["a server wall park", { runStatus: "paused", disposition: "stale_claim", holdReason: "budget_exhausted" },
+      "run parked server-side at its wall-clock limit; retaining clone + HOME and leaving it non-terminal for a resume"],
+  ] as const) {
+    it(`${name} answering the first pin keeps its lifecycle stop instead of a source hold`, async () => {
+      await withFeature(() => withHoldSpy(async (requests) => {
+        const h = HARNESSES[0]!;
+        commitOnOrigin({ [h.file]: h.content("Original review body") }, "ship the reviewer");
+        let ran = false;
+        const claim = claimFor(h, { issue_iid: 82, issue_title: name, claim_generation: 3 });
+        api.failStateWhen(claim.run_id, (b) => b.repo_agent_source_commit !== undefined, arrange);
+        const rec = recordingLogger();
+        await newRunner({ run: async (ctx) => { ran = true; return { branch: ctx.branch }; } }, fx.dataDir, rec.logger).execute(claim);
+        assert.ok(loggedMessages(rec.lines).includes(stop), loggedMessages(rec.lines).join("\n"));
+        assert.equal(ran, false, "the agent never started");
+        assert.deepEqual(requests, [], "no repo-agent source hold was requested");
+        const states = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
+        assert.ok(!states.some((s) => s === "completed" || s === "failed"), JSON.stringify(states));
+        assert.ok(!statusTexts(claim.run_id).some((t) => t.includes("could not be recorded")), statusTexts(claim.run_id).join("\n"));
+      }));
+    });
+  }
+
+  for (const [status, stop] of [
+    ["paused", "retained recovery stopped; source and accounting kept"],
+    ["cancelled", "run reached a terminal status before the phase clone started; stopping this flight"],
+  ] as const) {
+    it(`a declined ${status} answer naming the pinned revision stops the run before the agent starts`, async () => {
+      await withFeature(() => withHoldSpy(async (requests) => {
+        const h = HARNESSES[0]!;
+        const trusted = commitOnOrigin({ [h.file]: h.content("Original review body") }, "ship the reviewer");
+        const claim = claimFor(h, { issue_iid: 83, issue_title: `declined ${status}`, claim_generation: 3 });
+        const send = client.reportState.bind(client);
+        const pinAnswers: string[] = [];
+        client.reportState = (async (runId: string, body: Parameters<typeof client.reportState>[1], ...rest: unknown[]) => {
+          if (runId === claim.run_id && body.repo_agent_source_commit !== undefined) {
+            pinAnswers.push(body.repo_agent_source_commit);
+            return { applied: false, status, repoAgentSourceCommit: body.repo_agent_source_commit };
+          }
+          return (send as (...a: unknown[]) => ReturnType<typeof client.reportState>)(runId, body, ...rest);
+        }) as typeof client.reportState;
+        let ran = false;
+        const rec = recordingLogger();
+        await newRunner({ run: async (ctx) => { ran = true; return { branch: ctx.branch }; } }, fx.dataDir, rec.logger).execute(claim);
+        assert.ok(loggedMessages(rec.lines).includes(stop), loggedMessages(rec.lines).join("\n"));
+        assert.deepEqual(pinAnswers, [trusted], "the pin was reported");
+        assert.equal(ran, false, "the agent never started");
+        assert.deepEqual(requests, [], "no repo-agent source hold was requested");
+        const states = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
+        assert.ok(!states.some((s) => s === "completed" || s === "failed"), JSON.stringify(states));
+      }));
+    });
+  }
 
   it("without the api feature a failed roster report does not stop the run", async () => {
     const h = HARNESSES[0]!;

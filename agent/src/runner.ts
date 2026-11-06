@@ -24259,12 +24259,19 @@ export class RunRunner {
     try {
       ack = await reportState(body);
     } catch (err) {
-      if (!(err instanceof RequestError) && !isTransient(err)) throw err;
+      if (isCheckedLifecycleControl(err) || (!(err instanceof RequestError) && !isTransient(err))) throw err;
       runLog.warn("repo-agent source revision report failed", { commit, error: errMessage(err) });
       throw new RepoAgentSourceUnavailableError(
         `the repo-agent source revision ${commit.slice(0, 12)} could not be recorded`, commit);
     }
-    if (ack.repoAgentSourceCommit !== commit) {
+    if (ack.status !== undefined && ack.status !== "running") {
+      runLog.info("repo-agent source revision report answered a run that is not running; stopping before the agent starts", {
+        commit, applied: ack.applied, server_status: ack.status,
+      });
+      if (TERMINAL_RUN_STATUSES.has(ack.status)) throw new RunningAckTerminalError(ack.status);
+      throw new RetainedRecoveryStop();
+    }
+    if (ack.applied !== true || ack.status !== "running" || ack.repoAgentSourceCommit !== commit) {
       runLog.warn("repo-agent source revision not confirmed", {
         commit, applied: ack.applied, server_status: ack.status ?? "unknown", stored: ack.repoAgentSourceCommit ?? null,
       });
