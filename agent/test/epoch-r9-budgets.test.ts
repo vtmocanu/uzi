@@ -5,7 +5,10 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { execFileSync, spawn, type SpawnOptions } from "node:child_process";
 import type { TestContext } from "node:test";
-import { deflateSync } from "node:zlib";
+import { createDeflate, deflateSync } from "node:zlib";
+import { createHash } from "node:crypto";
+import { once } from "node:events";
+import { finished } from "node:stream/promises";
 import type { PodEpochReclaimScope } from "../templates/pod-epoch-init.cjs";
 import { formatAttemptId } from "../src/attempt-path.js";
 import { GitCache, type EpochDiscardProofOptions, type RetainedDiscardOptions } from "../src/git.js";
@@ -222,8 +225,24 @@ const overflows: { name: string; limits: Limits; via: "stores" | "reason"; match
     match: /object directory entry limit/ },
   { name: "maxMetadataBytes (config, index and every Git output)", limits: { maxMetadataBytes: 64 }, via: "reason",
     match: /metadata byte limit/, viaDiscard: false },
-  { name: "maxMetadataRecords (index entries)", limits: { maxMetadataRecords: 2 }, via: "reason",
-    match: /path record limit|index/, viaDiscard: false },
+  // The limit itself ("index: index entry limit"), not any other "index: ..." refusal such as a checksum mismatch.
+  { name: "maxMetadataRecords (index entries)", limits: { maxMetadataRecords: 64 }, via: "reason",
+    match: /^index: index entry limit$/, viaDiscard: false,
+    prepare: () => {
+      // Every other record counter stays far below 64, so only the index count (100 more entries) can overflow.
+      for (let i = 0; i < 100; i++) fs.writeFileSync(path.join(clonePath, `staged-${i}`), `staged ${i}\n`);
+      command(clonePath, "add", "--", ...Array.from({ length: 100 }, (_, i) => `staged-${i}`));
+    } },
+  { name: "maxMetadataBytes (an over-budget .git/objects/info entry in the clone shape stage)",
+    limits: { maxMetadataBytes: 4096 }, via: "reason", match: /^\.git\/objects\/info\/packs: metadata byte limit$/,
+    prepare: () => { fs.writeFileSync(path.join(objectDir(clonePath), "info/packs"), "P ".repeat(4096)); }, viaDiscard: false },
+  { name: "EPOCH_UNTRACKED_EXPANSION_DEPTH (an untracked tree deeper than 32 levels)", limits: {}, via: "reason",
+    match: /untracked expansion depth limit/,
+    prepare: () => {
+      const deep = path.join(clonePath, ...Array.from({ length: 36 }, (_, i) => `d${i}`));
+      fs.mkdirSync(deep, { recursive: true });
+      fs.writeFileSync(path.join(deep, "leaf"), "x");
+    } },
   { name: "maxWorktreeContentBytes (tracked content)", limits: { maxWorktreeContentBytes: 4 }, via: "reason",
     match: /tracked content byte limit/ },
 ];
@@ -271,18 +290,25 @@ describe("UNKNOWN is preserved for anything that is not a positively identified 
     looseFile(Buffer.from("this is not a zlib stream at all"));
     await assertUnknown(t);
   });
-  it("a truncated loose object, with and without a lowered budget", async t => {
-    looseFile(deflateSync(Buffer.from("blob 4\0data")).subarray(0, 6));
-    await assertUnknown(t);
-  });
-  it("a loose object whose header declares a size that fits but whose stream overruns the budget", async t => {
-    // Declares 5 bytes, then inflates past the 256 KiB budget: contradicting its own header, so corrupt.
+  for (const [label, limits] of [["the default budget", {}], ["a lowered budget", { maxObjectStoreBytes: 256 * 1024 }]] as const) {
+    it("a truncated loose object under " + label, async t => {
+      looseFile(deflateSync(Buffer.from("blob 4\0data")).subarray(0, 6));
+      await assertUnknown(t, limits, /unexpected end of file|Z_BUF_ERROR/i);
+    });
+  }
+  it("a loose object whose header declares a size that fits but whose stream overruns it", async t => {
+    // Declares 5 bytes, then inflates 1 MiB: contradicting its own header, so corrupt, not over budget.
     looseFile(deflateSync(Buffer.concat([Buffer.from("blob 5\0"), Buffer.alloc(1024 * 1024, 66)])));
-    await assertUnknown(t, { maxObjectStoreBytes: 256 * 1024 }, /ERR_BUFFER_TOO_LARGE|Cannot create a Buffer larger/i);
+    await assertUnknown(t, { maxObjectStoreBytes: 256 * 1024 }, /invalid loose object/);
   });
   it("a loose object with no readable header past the budget", async t => {
     looseFile(deflateSync(Buffer.alloc(1024 * 1024, 67)));
-    await assertUnknown(t, { maxObjectStoreBytes: 256 * 1024 }, /ERR_BUFFER_TOO_LARGE|Cannot create a Buffer larger/i);
+    await assertUnknown(t, { maxObjectStoreBytes: 256 * 1024 }, /invalid loose object/);
+  });
+  it("a loose object whose header declares past the budget but whose stream ends short of it", async t => {
+    // Declares 1 MiB (past the 256 KiB budget) and produces 5 bytes: a lie, so UNKNOWN rather than a keep.
+    looseFile(deflateSync(Buffer.concat([Buffer.from("blob 1048576\0"), Buffer.from("short")])));
+    await assertUnknown(t, { maxObjectStoreBytes: 256 * 1024 }, /invalid loose object/);
   });
   it("an unreadable object directory", async t => {
     const root = objectDir(bare);
@@ -331,5 +357,222 @@ describe("UNKNOWN is preserved for anything that is not a positively identified 
     for (let i = 0; i < 600; i++) command(bare, "config", "--local", `r9.key${i}`, "value");
     assert.equal(await observation(), true, "control: the same store is provable under the default cap");
     assert.equal(await observation({ maxMetadataBytes: 8192 }), false);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Memory: the observation streams, so peak memory is bounded by its windows, never by the 4 GiB logical budget.
+
+/** Growth of the process high-water RSS (and of a sampled peak) while `run` executes. */
+async function rssGrowth<T>(run: () => Promise<T>): Promise<{ result: T; growth: number }> {
+  const high = () => process.resourceUsage().maxRSS * 1024;
+  const base = process.memoryUsage().rss, highBase = high();
+  let peak = base;
+  const timer = setInterval(() => { peak = Math.max(peak, process.memoryUsage().rss); }, 10);
+  try {
+    const result = await run();
+    peak = Math.max(peak, process.memoryUsage().rss);
+    return { result, growth: Math.max(peak - base, high() - highBase) };
+  } finally { clearInterval(timer); }
+}
+/** zlib bytes of `size` zero bytes (after `prefix`), produced and hashed in 16 MiB steps so the test itself stays small. */
+async function zeroStream(prefix: Buffer, size: number): Promise<{ compressed: Buffer; sha1: string }> {
+  const deflate = createDeflate();
+  const parts: Buffer[] = [];
+  deflate.on("data", (part: Buffer) => parts.push(part));
+  const hash = createHash("sha1");
+  const step = Buffer.alloc(16 * 1024 * 1024);
+  const send = async (piece: Buffer) => { hash.update(piece); if (!deflate.write(piece)) await once(deflate, "drain"); };
+  await send(prefix);
+  for (let left = size; left > 0; left -= step.length) await send(step.subarray(0, Math.min(step.length, left)));
+  deflate.end();
+  await finished(deflate.resume());
+  return { compressed: Buffer.concat(parts), sha1: hash.digest("hex") };
+}
+describe("a large valid object costs windows of memory, not its size", () => {
+  const GIB = 1024 * 1024 * 1024;
+  // Inflating a gigabyte takes seconds per snapshot; the proof's own 30 second test deadline is not what is under test.
+  beforeEach(() => { input = { ...input, deadline: Date.now() + 10 * 60_000 }; });
+  it("a loose blob that inflates to 1 GiB of zeros, at the default limits", async t => {
+    const { compressed, sha1 } = await zeroStream(Buffer.from(`blob ${GIB}\0`), GIB);
+    assert.ok(compressed.length < 4 * 1024 * 1024, "zeros compress about a thousand to one");
+    const dir = path.join(objectDir(bare), sha1.slice(0, 2));
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, sha1.slice(2)), compressed, { mode: 0o444 });
+    const { result, growth } = await rssGrowth(() => observation());
+    // 1 GiB is under the 4 GiB budget, and only the bare holds it, so the clone is covered: the proof completes.
+    assert.equal(result, true);
+    t.diagnostic(`RSS grew by ${Math.round(growth / 1048576)} MiB`);
+    assert.ok(growth < 512 * 1024 * 1024, `RSS grew by ${Math.round(growth / 1048576)} MiB`);
+  });
+  it("a pack record that inflates to 1 GiB of zeros, at the default limits", async t => {
+    const size = GIB;
+    const { compressed } = await zeroStream(Buffer.alloc(0), size);
+    // Pack entry header: type 3 (blob), then the size as a little-endian base-128 varint.
+    const header: number[] = [(3 << 4) | (size & 15)];
+    for (let n = Math.floor(size / 16); n > 0; n = Math.floor(n / 128)) { header[header.length - 1]! |= 128; header.push(n % 128); }
+    const record = Buffer.concat([Buffer.from(header), compressed]);
+    const pack = Buffer.concat([Buffer.from("PACK"), Buffer.from([0, 0, 0, 2, 0, 0, 0, 1]), record]);
+    const trailer = createHash("sha1").update(pack).digest();
+    const packDir = path.join(objectDir(bare), "pack");
+    fs.mkdirSync(packDir, { recursive: true });
+    const name = path.join(packDir, "pack-" + trailer.toString("hex"));
+    fs.writeFileSync(name + ".pack", Buffer.concat([pack, trailer]));
+    // Git writes the valid index (and so computes the real object id) for the hand-built pack.
+    command(bare, "index-pack", "-o", name + ".idx", name + ".pack");
+    // The pair is only observed by the Node-side store snapshot (Git's verify-pack is not run here).
+    const { growth } = await rssGrowth(() => observeStores());
+    t.diagnostic(`RSS grew by ${Math.round(growth / 1048576)} MiB`);
+    assert.ok(growth < 512 * 1024 * 1024, `RSS grew by ${Math.round(growth / 1048576)} MiB`);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Topology first: an UNKNOWN-class indirection is decided before any content overflow can end the proof as a keep.
+
+describe("the topology is decided before content is charged", () => {
+  const junk = (n: number) => {
+    const dir = path.join(objectDir(clonePath), "00");
+    fs.mkdirSync(dir, { recursive: true });
+    for (let i = 0; i < n; i++) fs.writeFileSync(path.join(dir, i.toString(16).padStart(38, "0")), "");
+  };
+  const outside = () => {
+    const alt = path.join(fx.dataDir, "outside.git");
+    command(bare, "init", "--bare", alt);
+    fs.appendFileSync(path.join(objectDir(clonePath), "info/alternates"), path.join(alt, "objects") + "\n");
+  };
+  it("control: junk past the directory entry limit alone is a settled keep", async () => {
+    junk(16_400);
+    const error = await failure(observeStores());
+    assert.equal(error.name, "AutomaticBoundExceeded");
+    assert.match(error.message, /object directory entry limit/);
+    assert.equal(await observation(), false);
+  });
+  it("an alternate outside the managed repositories alone is UNKNOWN", async () => {
+    outside();
+    const error = await failure(observeStores());
+    assert.equal(error.name, "AutomaticCompletenessUnknown");
+    assert.match(error.message, /alternate writer exclusion unavailable/);
+  });
+  it("the same alternate stays UNKNOWN behind 16,400 junk entries, however the proof is entered", async () => {
+    outside();
+    junk(16_400);
+    const error = await failure(observeStores());
+    assert.equal(error.name, "AutomaticCompletenessUnknown");
+    assert.match(error.message, /alternate writer exclusion unavailable/);
+    await assert.rejects(observation(), e => (e as Error).constructor.name === "AutomaticCompletenessUnknown");
+  });
+  it("an outside alternate reached through a managed alternate stays UNKNOWN behind a content overflow", async () => {
+    const alt = path.join(fx.dataDir, "outside.git");
+    command(bare, "init", "--bare", alt);
+    fs.appendFileSync(path.join(objectDir(bare), "info/alternates"), path.join(alt, "objects") + "\n");
+    junk(16_400);
+    const error = await failure(observeStores());
+    assert.equal(error.name, "AutomaticCompletenessUnknown");
+    assert.match(error.message, /alternate writer exclusion unavailable/);
+  });
+  it("an illegal name in a fixed-set directory is UNKNOWN even after more entries than the limit", async () => {
+    fs.writeFileSync(path.join(objectDir(clonePath), "info/zz-not-legal"), "");
+    const error = await failure(observeStores({ maxDirectoryEntries: 1 }));
+    assert.equal(error.name, "AutomaticCompletenessUnknown");
+    assert.match(error.message, /unsupported object info entry/);
+  });
+  it("an oversized packed-refs does not hide an outside alternate in the clone shape stage", async () => {
+    outside();
+    fs.writeFileSync(path.join(clonePath, ".git", "packed-refs"), "# pack-refs with: peeled fully-peeled sorted\n".repeat(400));
+    await assert.rejects(observation({ maxMetadataBytes: 4096 }), e => (e as Error).constructor.name === "AutomaticCompletenessUnknown");
+  });
+  it("control: the same oversized packed-refs alone is a settled keep from the shape stage", async t => {
+    fs.writeFileSync(path.join(clonePath, ".git", "packed-refs"), "# pack-refs with: peeled fully-peeled sorted\n".repeat(400));
+    const reasons = reasonsOf(t);
+    assert.equal(await observation({ maxMetadataBytes: 4096 }), false);
+    assert.ok(reasons.some(reason => /packed-refs: metadata byte limit/.test(reason)), reasons.join("|"));
+  });
+  it("an illegal objects/info name in the clone is UNKNOWN in the shape stage even behind an oversized packed-refs", async () => {
+    fs.writeFileSync(path.join(objectDir(clonePath), "info/http-alternates"), "http://127.0.0.1:1/objects\n");
+    fs.writeFileSync(path.join(clonePath, ".git", "packed-refs"), "# pack-refs with: peeled fully-peeled sorted\n".repeat(400));
+    await assert.rejects(observation({ maxMetadataBytes: 4096 }), e => (e as Error).constructor.name === "AutomaticCompletenessUnknown");
+  });
+});
+
+describe("the alternate edge limit", () => {
+  const lowered = { maxMetadataRecords: 40 };
+  const own = () => path.join(bare, "objects");
+  const writeAlternates = (lines: string[]) =>
+    fs.writeFileSync(path.join(objectDir(clonePath), "info/alternates"), lines.join("\n") + "\n");
+  const valid = (n: number) => Array.from({ length: n }, () => own());
+  it("control: lines within the cap are observed", async () => {
+    writeAlternates(valid(3));
+    assert.equal(await observation(lowered), true);
+  });
+  it("more valid lines than the cap is a settled keep", async () => {
+    writeAlternates(valid(45));
+    const error = await failure(observeStores(lowered));
+    assert.equal(error.name, "AutomaticBoundExceeded");
+    assert.match(error.message, /alternate edge limit/);
+    assert.equal(await observation(lowered), false);
+  });
+  for (const [label, lines, message] of [
+    ["an invalid line before the cap", () => ["not a valid line", ...valid(44)], /unsupported alternate syntax/],
+    ["an invalid line after the cap", () => [...valid(45), "not a valid line"], /unsupported alternate syntax/],
+    ["an outside path after the cap", () => [...valid(45), "/tmp/outside/objects"], /alternate writer exclusion unavailable/],
+  ] as const) {
+    it(label + " is UNKNOWN", async () => {
+      writeAlternates(lines());
+      const error = await failure(observeStores(lowered));
+      assert.equal(error.name, "AutomaticCompletenessUnknown");
+      assert.match(error.message, message);
+      await assert.rejects(observation(lowered), e => (e as Error).constructor.name === "AutomaticCompletenessUnknown");
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Re-reads: the first instance of an observation keeps its overflow-is-keep behaviour; a limit overflow in its repeat
+// means the store changed, which is UNKNOWN.
+
+describe("an overflow while re-reading is UNKNOWN, not a settled keep", () => {
+  const overrun = () => Object.assign(new Error("git subprocess maxBuffer exceeded"), {
+    outputExceeded: true, outputStream: "stdout", code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", epochProcessJoined: true });
+  const sites = {
+    "the source inventory": ["runGitAsRunner", (args: string[]) => args.includes("--batch-all-objects")],
+    "the bare inventory": ["runGitWithEnv", (args: string[]) => args.includes("--batch-all-objects")],
+    "the clone refs": ["runGitAsRunner", (args: string[]) => args.includes("for-each-ref")],
+    "the trusted-root closure": ["runGitWithEnv", (args: string[]) => args.includes("rev-list")],
+  } as const;
+  for (const [label, [method, matches]] of Object.entries(sites)) {
+    it(label, async t => {
+      const original = (git as never as Record<string, (...a: unknown[]) => Promise<unknown>>)[method]!.bind(git);
+      let seen = 0, failAt = 1;
+      t.mock.method(git as never, method as never, (async (...args: unknown[]) => {
+        if (matches(args[1] as string[]) && ++seen === failAt) throw overrun();
+        return original(...args);
+      }) as never);
+      // First instance: a joined stdout overrun of the first read is the settled keep.
+      assert.equal(await observation(), false);
+      assert.equal(seen, 1);
+      // The repeat of the same read, after the first fit: UNKNOWN.
+      seen = 0; failAt = 2;
+      await assert.rejects(observation(), e => (e as Error).constructor.name === "AutomaticCompletenessUnknown" &&
+        /object observations changed/.test((e as Error).message));
+      assert.equal(seen, 2);
+    });
+  }
+  it("the final topology snapshot, when the store grows past the directory entry limit between the reads", async t => {
+    let limit = 0;
+    for (let n = 5; n < 400 && !limit; n++) {
+      try { await observeStores({ maxDirectoryEntries: n }); limit = n; } catch { /* below the store's own size */ }
+    }
+    assert.ok(limit > 0);
+    while (!await observation({ maxDirectoryEntries: limit })) limit++;
+    const original = git["runGitAsRunner"].bind(git);
+    let inventories = 0;
+    t.mock.method(git as unknown as { runGitAsRunner: typeof original }, "runGitAsRunner", async (...args: Parameters<typeof original>) => {
+      // An empty fan-out directory is invisible to Git and counts as two entries in the next snapshot.
+      if (args[1].includes("--batch-all-objects") && ++inventories === 2) fs.mkdirSync(path.join(objectDir(bare), "ee"));
+      return original(...args);
+    });
+    await assert.rejects(observation({ maxDirectoryEntries: limit }), e => (e as Error).constructor.name === "AutomaticCompletenessUnknown" &&
+      /object observations changed/.test((e as Error).message));
   });
 });
