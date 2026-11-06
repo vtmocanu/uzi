@@ -1836,9 +1836,16 @@ existing outcomes.
 
 **Cap and deadline.** At most 5 attempts, with delays of 1, 2, 4 and 8 times the
 recovery retry interval (about 15 s by default), always inside the iteration's
-existing deadline. A deadline still ends as `budget_exhausted`; exhausted
-attempts on a still-transient failure fall through to the existing outcome, an
-owner hold at `recovery_wait` / `retained_recovery_adoption_failed`.
+existing deadline. If the deadline actually passes, the outcome is the existing
+`budget_exhausted`. If retries are exhausted, the failure is not positively
+transient, or the next wait would not fit before the deadline, the helper gives
+up and the site's existing outcome follows. For the first check that is the
+existing `adoption_failed` path: an owner hold at `recovery_wait` /
+`retained_recovery_adoption_failed` when its existing preconditions hold (API
+feature, persisted blocker, proven quiescence), otherwise the existing generic
+failure with custody kept. For the second check in the Codex/safety branch it is
+the existing `quiescence_failed` blocker, a failure with custody kept and not an
+owner hold.
 
 **Unchanged.** No new status, no API change and no persistence: retry state is
 in-process only, so a worker restart starts the check afresh. The #3527 hold

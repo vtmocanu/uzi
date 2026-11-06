@@ -336,10 +336,13 @@ interval), inside the iteration's existing deadline, on the same claim and
 successor with no recapture and no extra recovery-attempt charge. Only a request
 that failed before any response with `ECONNREFUSED`, `ECONNRESET` or
 `UND_ERR_SOCKET`, or a 502, 503 or 504 answer, qualifies. Unknown errors,
-malformed or truncated responses and other statuses are not retried, so a
-genuine failure still holds here, and a deadline still ends as
-`budget_exhausted`. The retry state is in-process only. The hold itself still
-has no automatic retry. See the
+malformed or truncated responses and other statuses are not retried, and
+exhausted retries give the check's existing outcome: for the first check the
+`adoption_failed` path described above (this hold when its preconditions hold),
+and for the second check in the Codex/safety branch after executor disposal the
+existing `quiescence_failed` failure with custody kept, not a hold. A deadline
+that actually passes ends as `budget_exhausted`. The retry state is in-process
+only. The hold itself still has no automatic retry. See the
 [ADR-1197 #3994 amendment](../adr/1197-transient-recovery-park.md#amendment-2026-11-06-3994-transient-api-connection-failures-retry-the-ownership-check-in-place).
 
 A positively identified temporary local resource error during the read-only
