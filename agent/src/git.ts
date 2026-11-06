@@ -2534,9 +2534,6 @@ class AutomaticCompletenessUnknown extends Error {}
 class AutomaticBoundExceeded extends Error {}
 /** Errors raised by Git output or metadata limits outside this file's own comparisons. */
 const BOUND_OVERFLOW_ERRORS = new WeakSet<object>();
-/** The finished stdout an epoch metadata limit was raised on, kept so a caller can still classify the rows it holds
- *  before the limit ends the observation (an UNKNOWN-class row must not hide behind padding). */
-const BOUND_OVERFLOW_STDOUT = new WeakMap<object, string>();
 /** True for {@link AutomaticBoundExceeded}, for an epoch metadata limit raised by `checkEpochMetadata` on a Git
  *  stdout that finished, and for a joined Git child whose STDOUT overran the epoch output cap. A stderr overrun
  *  (a failing Git is noisy), an unjoined child and a bare `ERR_CHILD_PROCESS_STDIO_MAXBUFFER` without those
@@ -11508,22 +11505,23 @@ export class GitCache {
         const config = path.join(path.dirname(root), "config");
         const configBytes = await small(config);
         rows.set(config + ":bytes", configBytes.toString("hex"));
-        let listing: string | undefined;
+        let listing: string;
         try {
           const parsed = await read(() => this.execScoped("git",
             ["config", "--file", "-", "--no-includes", "--null", "--list"],
             { env: gitEnv(), input: configBytes, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER }));
           listing = parsed.stdout;
+          this.automaticCollection(listing, "\0");
         } catch (error) {
-          // A joined stdout overrun is a limit; the rest of the topology is still read, and so are the rows of a
-          // finished listing that only the record or byte limit refused.
-          if (!isBoundOverflow(error)) throw error;
-          over("object completeness output limit");
-          listing = BOUND_OVERFLOW_STDOUT.get(error as object);
+          // Lead decision: ANY overflow of a TOPOLOGY observation is UNKNOWN, because the indirection it may hold
+          // (an alternate, partialclone, a config include) cannot be observed past the limit. That covers a config
+          // listing whose stdout overran the byte cap or the record limit, an over-cap config or alternates file and
+          // any other topology read. Overflows are settled keeps only in the content stage and the worktree/shape
+          // stages, never here.
+          if (isBoundOverflow(error)) unknown("object topology listing exceeds the observation limit");
+          throw error;
         }
-        // Every row of the (maxBuffer-bounded) listing is classified before the rows are counted against the record
-        // limit, so an UNKNOWN-class key can never hide behind padding.
-        for (const row of listing === undefined ? [] : listing.split("\0")) {
+        for (const row of listing.split("\0")) {
           const [key, value] = row.split("\n");
           if (root === source && (key?.startsWith("include.") || key?.startsWith("includeif.")))
             throw new AutomaticContentRefusal("source config indirection is not eligible");
@@ -11531,12 +11529,6 @@ export class GitCache {
               key === "extensions.refstorage" || key === "extensions.worktreeconfig" || key === "extensions.partialclone" ||
               key === "core.worktree" || key?.startsWith("include.") || key?.startsWith("includeif."))
             unknown("object format or config indirection unsupported");
-        }
-        if (listing !== undefined) {
-          try { this.automaticCollection(listing, "\0"); } catch (error) {
-            if (!isBoundOverflow(error)) throw error;
-            over("object completeness output limit");
-          }
         }
         for (const name of ["commondir", "shallow", "info/grafts", "refs/replace"]) {
           if (await stat(path.join(path.dirname(root), name), true)) unknown("unsupported object topology");
@@ -11824,10 +11816,10 @@ export class GitCache {
         bareOwn: new Set(stores.get(bare)!.ids), pairs };
     };
     try {
-      // Part of the topology, so it runs before any content is charged: an overflow met here waits for the second
-      // iteration, an UNKNOWN answer does not.
+      // Part of the topology, so it runs before any content is charged. Any overflow of these listings is UNKNOWN
+      // (lead decision, see the topology config listing above): the indirection a listing may hold cannot be observed
+      // past the limit.
       const configChecks = async () => {
-        let overflow: unknown;
         for (const runner of [true, false]) {
           try {
             const args = ["config", "--local", "--no-includes", "--null", "--list"];
@@ -11842,19 +11834,14 @@ export class GitCache {
                   key === "extensions.refstorage" || key === "extensions.partialclone" ||
                   key?.startsWith("include.") || key?.startsWith("includeif.")) unknown("object format or config indirection unsupported");
             }
-            // Counted only after every row was classified, so padding cannot hide an UNKNOWN-class key.
+            // The count check runs after the classification loop only so that an UNKNOWN-class key is named as such;
+            // an overflow is UNKNOWN too, so the order changes the message, not the outcome.
             this.automaticCollection(config, "\0");
           } catch (error) {
-            // Only a positively identified overflow waits for the end of the topology; a Git failure, timeout,
-            // revocation or abort is never absorbed by a pending overflow. The Git launch wrappers drop the overflow
-            // facts but keep the original error as `cause`, which is where an epoch metadata limit is recognised.
-            if (isBoundOverflow(error)) overflow ??= error;
-            else if (isBoundOverflow((error as { cause?: unknown }).cause))
-              overflow ??= new AutomaticBoundExceeded("object completeness output limit", { cause: error });
-            else throw error;
+            if (isBoundOverflow(error)) unknown("object config listing exceeds the observation limit");
+            throw error;
           }
         }
-        if (overflow !== undefined) throw overflow;
       };
       const initial = await snapshot(configChecks);
       for (const idx of initial.pairs) {
@@ -22071,7 +22058,6 @@ try {
     const overflow = (message: string, suffix: "metadata_byte_cap" | "metadata_record_cap"): Error => {
       const error = this.retainedCause(new Error(message), suffix);
       BOUND_OVERFLOW_ERRORS.add(error);
-      BOUND_OVERFLOW_STDOUT.set(error, stdout);
       return error;
     };
     if (Buffer.byteLength(stdout) > limits.maxMetadataBytes) throw overflow("epoch metadata byte limit", "metadata_byte_cap");
@@ -22952,7 +22938,7 @@ try {
     // Preserve git's numeric exit code on the wrapped error so a caller can discriminate
     // an expected non-zero status (e.g. `config --unset-all` exit 5 = key absent) from a
     // real failure — the same `.code` idiom `tryGit` reads off the raw execFile error.
-    const failure = new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`, { cause: err });
+    const failure = new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
     const code = (err as { code?: unknown }).code;
     if (typeof code === "number") (failure as { code?: number }).code = code;
     return failure;

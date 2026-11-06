@@ -219,8 +219,6 @@ const overflows: { name: string; limits: Limits; via: "stores" | "reason"; match
       for (let i = 0; i < 150; i++)
         execFileSync("git", ["-C", bare, "hash-object", "-w", "--stdin"], { env: ENV, input: `occurrence ${i}\n` });
     } },
-  { name: "maxMetadataRecords (a Git config listing)", limits: { maxMetadataRecords: 3 }, via: "stores",
-    match: /object completeness output limit/, viaDiscard: false },
   { name: "maxDirectoryEntries (object directory entries)", limits: { maxDirectoryEntries: 1 }, via: "stores",
     match: /object directory entry limit/ },
   { name: "maxMetadataBytes (config, index and every Git output)", limits: { maxMetadataBytes: 64 }, via: "reason",
@@ -333,13 +331,19 @@ describe("UNKNOWN is preserved for anything that is not a positively identified 
       return original(...args);
     });
   }
-  it("a joined Git stdout overrun is a settled keep", async t => {
+  // Lead decision: ANY overflow of a topology observation is UNKNOWN, because its indirection cannot be observed.
+  it("a joined Git stdout overrun of the topology config listing is UNKNOWN", async t => {
     configFails(t, { outputExceeded: true, outputStream: "stdout", code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", epochProcessJoined: true });
-    const error = await failure(observeStores());
-    assert.equal(error.name, "AutomaticBoundExceeded");
-    assert.equal(await observation(), false);
-    assert.deepEqual(await discard(), { kind: "refused", reason: "epoch_content_unproven", consumers: [] });
-    assert.equal(stopped, false);
+    await assertUnknown(t, {}, /exceeds the observation limit/);
+  });
+  /** The topology snapshot alone, under lowered limits (a lowered limit may end an earlier stage first in the full proof). */
+  async function assertUnknownUnder(limits: Limits): Promise<void> {
+    const error = await failure(observeStores(limits));
+    assert.equal(error.name, "AutomaticCompletenessUnknown");
+    assert.match(error.message, /exceeds the observation limit/);
+  }
+  it("a config listing past the record limit is UNKNOWN", async () => {
+    await assertUnknownUnder({ maxMetadataRecords: 3 });
   });
   for (const [label, fields] of [
     ["a Git stderr overrun (a failing Git is noisy)", { outputExceeded: true, outputStream: "stderr", code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", epochProcessJoined: true }],
@@ -352,14 +356,27 @@ describe("UNKNOWN is preserved for anything that is not a positively identified 
       await assertUnknown(t);
     });
   }
-  it("a real Git stdout overrun of the metadata cap is a settled keep", async () => {
-    // A bare config FILE that fits the 8192 byte cap (a file past it is UNKNOWN, see the topology tests) whose Git
-    // listing is larger than the cap: a long section name makes each short line list as a long `section.key` row.
+  it("a real Git stdout overrun of the metadata cap is UNKNOWN, even behind partialclone", async () => {
+    // A bare config FILE that fits the 8192 byte cap (a file past it is UNKNOWN too) whose Git listing is larger than
+    // the cap: a long section name makes each short line list as a long `section.key` row. The listing is never read
+    // past the cap, so the partialclone it holds is unobservable: UNKNOWN, never a keep.
+    fs.appendFileSync(path.join(bare, "config"),
+      "[extensions]\n\tpartialclone = origin\n[averyveryverylongsectionnamefortheoverrun]\n" + "\tk = v\n".repeat(600));
+    assert.ok(fs.statSync(path.join(bare, "config")).size < 8192);
+    await assertUnknownUnder({ maxMetadataBytes: 8192 });
+  });
+  it("the same listing without partialclone is UNKNOWN too: the overflow itself is the unknown", async () => {
     fs.appendFileSync(path.join(bare, "config"),
       "[averyveryverylongsectionnamefortheoverrun]\n" + "\tk = v\n".repeat(600));
-    assert.ok(fs.statSync(path.join(bare, "config")).size < 8192);
     assert.equal(await observation(), true, "control: the same store is provable under the default cap");
-    assert.equal(await observation({ maxMetadataBytes: 8192 }), false);
+    await assertUnknownUnder({ maxMetadataBytes: 8192 });
+  });
+  it("a 630 KB clone config with partialclone and 90,000 rows under 250-character sections is UNKNOWN at the default caps", async t => {
+    const section = "s".repeat(250);
+    fs.appendFileSync(path.join(clonePath, ".git", "config"),
+      "[extensions]\n\tpartialclone = origin\n[" + section + "]\n" + "\tk = v\n".repeat(90_000));
+    assert.ok(fs.statSync(path.join(clonePath, ".git", "config")).size < 1024 * 1024);
+    await assertUnknown(t);
   });
 });
 
@@ -663,18 +680,18 @@ describe("a pending topology overflow never hides an UNKNOWN-class observation",
   });
 });
 
-describe("config rows are classified before they are counted", () => {
+describe("a config listing past the record limit is a topology overflow, hence UNKNOWN", () => {
   it("partialclone behind 131,100 padding rows in the clone config is UNKNOWN", async () => {
     fs.appendFileSync(path.join(clonePath, ".git", "config"),
       "[extensions]\n\tpartialclone = origin\n[pad]\n" + "\tk = v\n".repeat(131_100));
     const error = await failure(observeStores());
     assert.equal(error.name, "AutomaticCompletenessUnknown");
-    assert.match(error.message, /config indirection unsupported/);
+    assert.match(error.message, /exceeds the observation limit|config indirection unsupported/);
   });
-  it("control: the same padding alone is a settled keep", async () => {
+  it("the same padding alone is UNKNOWN as well, not a settled keep", async () => {
     fs.appendFileSync(path.join(clonePath, ".git", "config"), "[pad]\n" + "\tk = v\n".repeat(131_100));
     const error = await failure(observeStores());
-    assert.equal(error.name, "AutomaticBoundExceeded");
+    assert.equal(error.name, "AutomaticCompletenessUnknown");
   });
 });
 
@@ -714,5 +731,28 @@ describe("input is charged as zlib consumes it, never as a window is read", () =
       assert.equal(error.name, "AutomaticCompletenessUnknown");
       assert.match(error.message, /trailing loose input/);
     }
+  });
+  it("a valid stream followed by a 24 MiB tail stops reading at the first window, not at the end of the file", async t => {
+    const id = looseFile(Buffer.concat([deflateSync(Buffer.from("blob 5\0hello")), Buffer.alloc(24 * 1024 * 1024, 0x41)]));
+    const file = path.join(objectDir(clonePath), id.slice(0, 2), id.slice(2));
+    const open = fsp.open.bind(fsp);
+    let bytesRead = 0;
+    t.mock.method(fsp, "open", async (...args: Parameters<typeof fsp.open>) => {
+      const handle = await open(...args);
+      if (args[0] !== file) return handle;
+      const read = handle.read.bind(handle) as (...a: unknown[]) => Promise<{ bytesRead: number }>;
+      (handle as unknown as { read: typeof read }).read = async (...a) => {
+        const result = await read(...a);
+        bytesRead += result.bytesRead;
+        return result;
+      };
+      return handle;
+    });
+    const error = await failure(observeStores());
+    assert.equal(error.name, "AutomaticCompletenessUnknown");
+    assert.match(error.message, /trailing loose input/);
+    // One 8 MiB read window covers the stream; the stream ended inside its first piece, so the 24 MiB tail is never
+    // fetched (without the early stop the loop would pull every following window).
+    assert.ok(bytesRead > 0 && bytesRead <= 8 * 1024 * 1024, `bytes read from the loose file: ${bytesRead}`);
   });
 });
