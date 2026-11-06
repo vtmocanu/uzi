@@ -11,7 +11,10 @@ import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { isPrivateDirMode, mkdirPrivate } from "./authority-lock.js";
-import { deriveAuthorityKey, processWorkerIncarnation, type SlotSnapshot } from "./completion-authority.js";
+import { parseAttemptLedgerEntry, parseRecoveryJournal, parseRestoreJournal, parseRestoreTombstone, parseRetainedDescriptorShape, parseStoppedMarkerShape,
+  type RecoveryJournalEntry } from "./git.js";
+import { parseRestoreValue } from "./restore-journal.js";
+import { deriveAuthorityKey, processWorkerIncarnation, readRegular, type SlotSnapshot } from "./completion-authority.js";
 
 const AUTHORITY_DIR = ".uzi-authority";
 const BOUNDARIES_DIR = "boundaries";
@@ -133,14 +136,13 @@ export function realBoundaryOps(uid: number = process.getuid?.() ?? -1): Boundar
     link: (from, to) => fsp.link(from, to),
     unlink: (file) => fsp.unlink(file),
     async readFile(file) {
-      let h: fsp.FileHandle;
-      try { h = await fsp.open(file, fsc.O_RDONLY | fsc.O_NOFOLLOW); }
-      catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return null; throw e; }
+      // The record's directory must itself be a private real directory owned by the worker (a missing one means no record).
       try {
-        const st = await h.stat();
-        if (!st.isFile() || st.size > MAX_RECORD_BYTES) throw new Error("unsafe boundary record");
-        return await h.readFile("utf8");
-      } finally { await h.close(); }
+        const dir = await fsp.lstat(path.dirname(file));
+        if (!dir.isDirectory() || dir.isSymbolicLink() || dir.uid !== uid || !isPrivateDirMode(dir.mode)) throw new Error("unsafe boundaries directory");
+      } catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return null; throw e; }
+      // O_NOFOLLOW|O_NONBLOCK open, then fstat: a regular, 0600, single-link file of ours within the cap, read at most that long.
+      return readRegular(file, uid, MAX_RECORD_BYTES);
     },
   };
 }
@@ -325,8 +327,6 @@ export interface ConfigPair { key: string; value: string }
 export type CensusPaths = { ok: true; paths: string[] } | { ok: false; reason: "attribution_unverifiable" };
 
 const ATTRIBUTION_PREFIXES = ["uzi-recovery.", "uzi-restore.", "uzi-attempts.", "uzi-stopped.", "uzi-retained."];
-const ATTEMPT_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
-const STOPPED_KEYS = "at,branch,clonePath,generation,journalDigest,key,reason,runId,version";
 
 class Unverifiable extends Error {}
 const bad = (): never => { throw new Unverifiable("attribution_unverifiable"); };
@@ -335,29 +335,24 @@ function sourcePath(v: unknown): string {
   if (typeof v !== "string" || v === "" || v.includes("\0") || !path.isAbsolute(v) || path.resolve(v) !== v) return bad();
   return v;
 }
-function obj(v: unknown): Record<string, unknown> { return isObj(v) ? v : bad(); }
 
-/** Every path a recovery journal value names: clonePath, retainedSources[], recovery.source and recovery.successor. */
-function journalPaths(raw: unknown, out: Set<string>): void {
-  const j = obj(raw);
+/** Every path a decoded recovery journal names: clonePath, retainedSources[], recovery.source / successor and memoryPark.settlement.sources[]. */
+function journalPaths(j: RecoveryJournalEntry, out: Set<string>): void {
   out.add(sourcePath(j.clonePath));
-  if (j.retainedSources !== undefined) {
-    if (!Array.isArray(j.retainedSources)) bad();
-    for (const s of j.retainedSources as unknown[]) out.add(sourcePath(obj(s).clonePath));
+  for (const s of j.retainedSources ?? []) out.add(sourcePath(s.clonePath));
+  if (j.recovery) {
+    out.add(sourcePath(j.recovery.source.clonePath));
+    if (j.recovery.successor) out.add(sourcePath(j.recovery.successor.clonePath));
   }
-  if (j.recovery !== undefined) {
-    const r = obj(j.recovery);
-    out.add(sourcePath(obj(r.source).clonePath));
-    if (r.successor !== undefined) out.add(sourcePath(obj(r.successor).clonePath));
-  }
+  for (const s of j.memoryPark?.settlement?.sources ?? []) out.add(sourcePath(s.path));
 }
 
-function parseJson(value: string): unknown { try { return JSON.parse(value); } catch { return bad(); } }
-
 /**
- * Enumerate every attributed source path from the bound bare's raw config pairs. Any key under an attribution prefix
- * that is not one of the five known shapes, any malformed value, or an incomplete read is `attribution_unverifiable`.
- * A `uzi-restore.<branch>.journal` value of "" means cleared.
+ * Enumerate every attributed source path from the bound bare's raw config pairs. Each value is decoded with the SAME
+ * strict parser production uses (git.ts), so the census can never accept a value a production reader would refuse. Any
+ * key under an attribution prefix that is not one of the five known shapes, any value those parsers reject, or an
+ * incomplete read is `attribution_unverifiable`. A `uzi-restore.<branch>.journal` or `uzi-recovery.<branch>.clone`
+ * value of "" means cleared (no paths).
  */
 export function enumerateAttributedPaths(pairs: readonly ConfigPair[], complete: boolean): CensusPaths {
   if (!complete) return { ok: false, reason: "attribution_unverifiable" };
@@ -365,38 +360,34 @@ export function enumerateAttributedPaths(pairs: readonly ConfigPair[], complete:
   try {
     for (const { key, value } of pairs) {
       if (!ATTRIBUTION_PREFIXES.some(p => key.startsWith(p))) continue;
-      if (/^uzi-recovery\..+\.clone$/.test(key)) journalPaths(parseJson(value), out);
-      else if (/^uzi-restore\..+\.journal$/.test(key)) {
+      let m: RegExpExecArray | null;
+      if (/^uzi-recovery\..+\.clone$/.test(key)) {
         if (value === "") continue;
-        const j = obj(parseJson(value));
-        const stage = j.restoreStage;
-        if (stage === "retired") {
-          if (!exactKeys(j, ["restore", "restoreStage", "successor"])) bad();
-          out.add(sourcePath(obj(j.successor).clonePath));
-          out.add(sourcePath(obj(obj(j.restore).predecessor).clonePath));
-        } else if (stage === "seeding" || stage === "ready") {
-          const { restore, restoreStage: _s, ...journal } = j;
-          out.add(sourcePath(obj(obj(restore).predecessor).clonePath));
-          journalPaths(journal, out);
-        } else bad();
+        journalPaths(parseRecoveryJournal(value), out);
+      } else if (/^uzi-restore\..+\.journal$/.test(key)) {
+        if (value === "") continue;
+        if (parseRestoreValue(value).kind === "entry") {
+          const e = parseRestoreJournal(value);
+          out.add(sourcePath(e.basis.predecessor.clonePath));
+          journalPaths(e.journal, out);
+        } else {
+          const t = parseRestoreTombstone(value);
+          out.add(sourcePath(t.basis.predecessor.clonePath));
+          out.add(sourcePath(t.successor.clonePath));
+        }
       } else if (/^uzi-attempts\..+\.entry$/.test(key)) {
-        const e = obj(parseJson(value));
-        if (!ATTEMPT_ID_RE.test(String(e.attemptId)) || typeof e.runId !== "string" ||
-            !["live", "abandoned", "retired", "reclaimed"].includes(String(e.state))) bad();
-        out.add(sourcePath(e.clonePath));
-      } else if (/^uzi-stopped\..+\.entry$/.test(key)) {
-        const m = obj(parseJson(value));
-        if (Object.keys(m).sort().join(",") !== STOPPED_KEYS) bad();
-        out.add(sourcePath(m.clonePath));
-      } else if (/^uzi-retained\..+\.journal$/.test(key)) {
-        const d = obj(parseJson(value));
-        if (Object.keys(d).sort().join(",") !== "branch,journal,key,version") bad();
-        journalPaths(d.journal, out);
+        const e = parseAttemptLedgerEntry(value);
+        if (!e) bad();
+        out.add(sourcePath(e!.clonePath));
+      } else if ((m = /^uzi-stopped\.(.+)\.entry$/.exec(key))) {
+        out.add(sourcePath(parseStoppedMarkerShape(m[1]!, value).clonePath));
+      } else if ((m = /^uzi-retained\.([^.]+)\.journal$/.exec(key))) {
+        journalPaths(parseRetainedDescriptorShape(m[1]!, value).journal, out);
       } else bad();
     }
-  } catch (error) {
-    if (error instanceof Unverifiable) return { ok: false, reason: "attribution_unverifiable" };
-    throw error;
+  } catch {
+    // A rejected value (Unverifiable or any production-parser error) is the same fail-closed verdict.
+    return { ok: false, reason: "attribution_unverifiable" };
   }
   return { ok: true, paths: [...out].sort() };
 }

@@ -104,7 +104,7 @@ export function parseRestoreBasis(v: unknown): RestoreBasis {
   const predecessor = { clonePath: str(p.clonePath, "restore predecessor path"), attemptId: attempt(p.attemptId, "restore predecessor attempt"),
     generation: gen(p.generation, "restore predecessor generation") };
   if (!predecessor.clonePath.endsWith(`.attempt-${predecessor.attemptId}`)) bad("restore predecessor path");
-  // P's attempt id carries g<G> (canonical clones only); the basis generation must be exactly that G.
+  // P's attempt id must carry g<G> (a `gx` id has no generation and is refused); the basis generation must be exactly that G.
   if (attemptGeneration(predecessor.attemptId) !== predecessor.generation) bad("restore predecessor generation");
   if (typeof o.journalDigest !== "string" || !SHA256_RE.test(o.journalDigest)) bad("restore journal digest");
   const s = obj(o.slotOwner, ["worker", "epoch"], "restore slot owner");

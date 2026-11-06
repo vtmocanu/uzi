@@ -1,9 +1,13 @@
 // Issue #3644 Gate B: boundary record, compose cross-check, restore predicate, attribution census.
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
+import { restoreJournalJson } from "../src/git.js";
+import { formatAttemptId } from "../src/attempt-path.js";
+import { restoreDigest, restoreTombstoneJson, type RestoreBasis } from "../src/restore-journal.js";
 import type { PendingFootprint, SlotPublication, SlotSnapshot } from "../src/completion-authority.js";
 import {
   type BoundaryFsOps, type BoundaryRecord, type CensusResult, type LiveBoundaryIdentity, type RestoreEvalInput,
@@ -15,6 +19,7 @@ import {
 const TOKEN = "worker-token-for-boundary-tests";
 const CID = "ab".repeat(32);
 const BOOT = "11111111-2222-3333-4444-555555555555";
+const UUID = "11111111-1111-4111-8111-111111111111";
 let root: string;
 let proc: string;
 let dataDir: string;
@@ -105,6 +110,42 @@ describe("record write and read", () => {
   it("a missing file reads as missing; another incarnation is not a fallback", async () => {
     await writeBoundaryRecord(base());
     assert.deepEqual(await readBoundaryRecord({ dataDir, workerToken: TOKEN }, "inc-P"), { state: "missing" });
+  });
+  describe("the reader refuses an unsafe record file", () => {
+    const withRecord = async (): Promise<{ dir: string; file: string; raw: string }> => {
+      await writeBoundaryRecord(base());
+      const dir = path.join(dataDir, ".uzi-authority/boundaries");
+      const file = path.join(dir, boundaryFileName("inc-S"));
+      return { dir, file, raw: await fsp.readFile(file, "utf8") };
+    };
+    const read = () => readBoundaryRecord({ dataDir, workerToken: TOKEN }, "inc-S");
+    it("a FIFO at the path refuses promptly instead of blocking", async () => {
+      const { file } = await withRecord();
+      await fsp.unlink(file);
+      execFileSync("mkfifo", [file]);
+      const timer = new Promise<string>(resolve => setTimeout(() => resolve("hung"), 5000).unref());
+      assert.deepEqual(await Promise.race([read(), timer]), { state: "invalid" });
+    });
+    it("a group/world-writable record refuses", async () => {
+      const { file } = await withRecord();
+      await fsp.chmod(file, 0o666);
+      assert.deepEqual(await read(), { state: "invalid" });
+    });
+    it("a record with a second hard link refuses", async () => {
+      const { dir, file } = await withRecord();
+      await fsp.link(file, path.join(dir, "elsewhere"));
+      assert.deepEqual(await read(), { state: "invalid" });
+    });
+    it("an oversize record refuses", async () => {
+      const { file, raw } = await withRecord();
+      await fsp.writeFile(file, raw + " ".repeat(9000));
+      assert.deepEqual(await read(), { state: "invalid" });
+    });
+    it("a boundaries directory that is not private refuses", async () => {
+      const { dir } = await withRecord();
+      await fsp.chmod(dir, 0o777);
+      assert.deepEqual(await read(), { state: "invalid" });
+    });
   });
   it("rejects a tampered body, a wrong token and a record copied under another name", async () => {
     await writeBoundaryRecord(base());
@@ -278,26 +319,53 @@ describe("evaluateComposeRestore", () => {
 
 // ---- census ---------------------------------------------------------------------------------------------------------
 
+const ATT = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "0123456789abcdef");
+const P_ATT = formatAttemptId(new Date("2026-01-02T00:00:00Z"), 1, "1123456789abcdef");
+const S_ATT = formatAttemptId(new Date("2026-01-03T00:00:00Z"), 2, "2123456789abcdef");
+const SHA = "a".repeat(40);
+const rbasis = (predecessor: string): RestoreBasis => ({
+  version: 1, predecessor: { clonePath: predecessor, attemptId: P_ATT, generation: 1 }, journalDigest: restoreDigest("p"),
+  slotOwner: { worker: "worker-incarnation-1", epoch: "epoch-1" }, pin: { captureId: "capture-1", generation: 1, sourceSha: SHA, finalization: true }, restoreTip: SHA,
+});
 const j = (clonePath: string, extra: object = {}): string => JSON.stringify({ runId: "r1", clonePath, ...extra });
 const marker = (clonePath: string): string => JSON.stringify({ version: 1, runId: "r2", generation: 1, branch: "agent/issue-2", key: "k",
   clonePath, journalDigest: "a".repeat(64), reason: "stopped", at: "2026-01-01T00:00:00Z" });
-const ledger = (clonePath: string, state = "live"): string => JSON.stringify({ attemptId: "issue-1.attempt-x", runId: "r1", clonePath, state });
+const ledger = (clonePath: string, state = "live"): string => JSON.stringify({ attemptId: ATT, runId: "r1", clonePath, state });
+const progress = (source: string, successor: string, run = "r1"): object => ({ version: 1, source: { runId: run, clonePath: source }, successor: { runId: run, clonePath: successor },
+  attempts: 1, startedAt: 0, deadline: 300_000, backoffMs: 0, stage: "capturing" });
+const retainedKey = (run: string): string => `uzi-retained.${run}.journal`;
+const descriptor = (journal: object, extra: object = {}): string => JSON.stringify({ version: 1, branch: "b", key: "k", journal, ...extra });
+const PARK_EVIDENCE = { parkAck: { runId: "r1", claimGeneration: 2, workerId: "w", registerNonce: "n", memoryEpisode: 1 }, interventionIds: [], processJoin: "executor",
+  commands: "not_required", steering: "joined", auxiliaries: "none", feedback: "drained", sinkReceipts: "joined", parkReap: "not_applicable" };
+const parkRecord = (settlementPath: string): object => ({ version: 1, binding: PARK_EVIDENCE.parkAck, ack: "confirmed",
+  origin: { flightId: UUID, attemptId: null, executorIncarnation: null, authorityIncarnation: UUID, sourceEpoch: UUID },
+  settlement: { version: 1, confirmed: true, sources: [{ path: settlementPath, authorityKey: "1".padStart(64, "a"), attemptId: null, epoch: UUID, seq: 1 }], evidence: PARK_EVIDENCE } });
 
 describe("attribution census", () => {
   const P = "/data/runner/s/issue-1.attempt-x-g1";
   it("enumerates every attribution family, including nested descriptor sources", () => {
+    const pPath = `/a/5.attempt-${P_ATT}`, sPath = `/a/6.attempt-${S_ATT}`;
     const r = enumerateAttributedPaths([
-      { key: "uzi-recovery.agent/issue-1.clone", value: j("/a/1", { retainedSources: [{ runId: "r1", clonePath: "/a/2" }], recovery: { source: { clonePath: "/a/3" }, successor: { clonePath: "/a/4" } } }) },
-      { key: "uzi-restore.agent/issue-1.journal", value: JSON.stringify({ restore: { predecessor: { clonePath: "/a/5" } }, restoreStage: "ready", runId: "r1", clonePath: "/a/6" }) },
+      { key: "uzi-recovery.agent/issue-1.clone", value: j("/a/1", { retainedSources: [{ runId: "r1", clonePath: "/a/2" }, { runId: "r1", clonePath: "/a/4" }], recovery: progress("/a/3", "/a/1") }) },
+      { key: "uzi-recovery.agent/issue-9.clone", value: "" },
+      { key: "uzi-restore.agent/issue-1.journal", value: restoreJournalJson(rbasis(pPath), "ready", { runId: "r1", clonePath: sPath, attemptId: S_ATT }) },
       { key: "uzi-restore.agent/issue-9.journal", value: "" },
-      { key: "uzi-restore.agent/issue-2.journal", value: JSON.stringify({ restore: { predecessor: { clonePath: "/a/7" } }, restoreStage: "retired", successor: { runId: "r", attemptId: "a", clonePath: "/a/8" } }) },
+      { key: "uzi-restore.agent/issue-2.journal", value: restoreTombstoneJson(rbasis(`/a/7.attempt-${P_ATT}`), { runId: "r", attemptId: S_ATT, clonePath: `/a/8.attempt-${S_ATT}` }) },
       { key: "uzi-attempts.agent/issue-1.entry", value: ledger("/a/9", "retired") },
       { key: "uzi-stopped.r2.entry", value: marker("/a/10") },
-      { key: ["uzi", "retained.r3.journal"].join("-"), value: JSON.stringify({ version: 1, branch: "b", key: "k", journal: { runId: "r3", clonePath: "/a/11", retainedSources: [{ clonePath: "/a/12" }], recovery: { source: { clonePath: "/a/13" } } } }) },
+      { key: retainedKey("r3"), value: descriptor({ runId: "r3", clonePath: "/a/11", retainedSources: [{ runId: "r3", clonePath: "/a/12" }], recovery: progress("/a/13", "/a/11", "r3") }) },
       { key: "uzi-attemptmode.k.enabled", value: "true" }, { key: "core.bare", value: "true" },
     ], true);
     assert.ok(r.ok);
-    assert.deepEqual(r.paths, ["/a/1", "/a/10", "/a/11", "/a/12", "/a/13", "/a/2", "/a/3", "/a/4", "/a/5", "/a/6", "/a/7", "/a/8", "/a/9"]);
+    assert.deepEqual(r.paths, ["/a/1", "/a/10", "/a/11", "/a/12", "/a/13", "/a/2", "/a/3", "/a/4", `/a/5.attempt-${P_ATT}`, `/a/6.attempt-${S_ATT}`, `/a/7.attempt-${P_ATT}`, `/a/8.attempt-${S_ATT}`, "/a/9"]);
+  });
+  it("a cleared recovery journal (the empty string every retirement writes) is no paths, not an unverifiable value", () => {
+    assert.deepEqual(enumerateAttributedPaths([{ key: "uzi-recovery.agent/issue-1.clone", value: "" }], true), { ok: true, paths: [] });
+  });
+  it("enumerates a memory park settlement's source paths", () => {
+    const r = enumerateAttributedPaths([{ key: "uzi-recovery.b.clone", value: j("/a/1", { memoryPark: parkRecord("/a/14") }) }], true);
+    assert.deepEqual(r, { ok: true, paths: ["/a/1", "/a/14"] });
+    assert.deepEqual(enumerateAttributedPaths([{ key: "uzi-recovery.b.clone", value: j("/a/1", { memoryPark: parkRecord("rel/path") }) }], true), { ok: false, reason: "attribution_unverifiable" });
   });
   const unverifiable: Array<[string, Array<{ key: string; value: string }>, boolean?]> = [
     ["unknown key under a prefix", [{ key: "uzi-recovery.b.other", value: "{}" }]],
@@ -305,11 +373,18 @@ describe("attribution census", () => {
     ["relative path", [{ key: "uzi-recovery.b.clone", value: j("rel/path") }]],
     ["non-normalized path", [{ key: "uzi-recovery.b.clone", value: j("/a/../b") }]],
     ["bad retained source", [{ key: "uzi-recovery.b.clone", value: j("/a", { retainedSources: [{ clonePath: 5 }] }) }]],
+    ["journal with an unknown key and a non-string run id", [{ key: "uzi-recovery.b.clone", value: '{"runId":7,"clonePath":"/a","bogus":1}' }]],
+    ["journal with an unknown key only", [{ key: "uzi-recovery.b.clone", value: j("/a", { bogus: 1 }) }]],
+    ["ledger with a numeric attempt id and an empty run id", [{ key: "uzi-attempts.b.entry", value: '{"attemptId":5,"runId":"","clonePath":"/a","state":"live"}' }]],
+    ["ledger with a lax attempt id", [{ key: "uzi-attempts.b.entry", value: JSON.stringify({ attemptId: "issue-1.attempt-x", runId: "r1", clonePath: "/a", state: "live" }) }]],
+    ["stopped marker for another run", [{ key: "uzi-stopped.other.entry", value: marker("/a") }]],
+    ["descriptor whose journal names another run", [{ key: retainedKey("r9"), value: descriptor({ runId: "r3", clonePath: "/a", retainedSources: [{ runId: "r3", clonePath: "/b" }] }) }]],
     ["bad ledger state", [{ key: "uzi-attempts.b.entry", value: ledger("/a", "weird") }]],
     ["stopped marker with extra key", [{ key: "uzi-stopped.r.entry", value: JSON.stringify({ ...JSON.parse(marker("/a")), extra: 1 }) }]],
-    ["descriptor with extra key", [{ key: "uzi-retained.r.journal", value: JSON.stringify({ version: 1, branch: "b", key: "k", journal: { runId: "r", clonePath: "/a" }, x: 1 }) }]],
+    ["descriptor with extra key", [{ key: retainedKey("r"), value: descriptor({ runId: "r", clonePath: "/a", retainedSources: [{ runId: "r", clonePath: "/b" }] }, { x: 1 }) }]],
     ["unknown restore stage", [{ key: "uzi-restore.b.journal", value: JSON.stringify({ restore: { predecessor: { clonePath: "/a" } }, restoreStage: "weird" }) }]],
     ["restore without predecessor", [{ key: "uzi-restore.b.journal", value: JSON.stringify({ restore: {}, restoreStage: "ready", runId: "r", clonePath: "/a" }) }]],
+    ["restore entry with a loose remainder", [{ key: "uzi-restore.b.journal", value: JSON.stringify({ restore: rbasis(`/a/5.attempt-${P_ATT}`), restoreStage: "ready", runId: "r", clonePath: "/a/6" }) }]],
     ["incomplete read", [{ key: "uzi-recovery.b.clone", value: j("/a") }], false],
   ];
   for (const [name, pairs, complete] of unverifiable) {
@@ -327,8 +402,8 @@ describe("attribution census", () => {
       { ok: false, reason: "census_foreign_active" });
   });
   it("a nested protected-descriptor source that is foreign-active refuses", async () => {
-    const d = JSON.stringify({ version: 1, branch: "b", key: "k", journal: { runId: "r3", clonePath: "/b/outer", retainedSources: [{ clonePath: "/b/nested" }] } });
-    assert.deepEqual(await run([{ key: ["uzi", "retained.r3.journal"].join("-"), value: d }], { "/b/nested": slot({ owner: { worker: "inc-Z", executor: null } }) }),
+    const d = descriptor({ runId: "r3", clonePath: "/b/outer", retainedSources: [{ runId: "r3", clonePath: "/b/nested" }] });
+    assert.deepEqual(await run([{ key: retainedKey("r3"), value: d }], { "/b/nested": slot({ owner: { worker: "inc-Z", executor: null } }) }),
       { ok: false, reason: "census_foreign_active" });
   });
   it("a non-null pending footprint refuses even when not foreign", async () => {
@@ -349,7 +424,7 @@ describe("attribution census", () => {
   });
   it("only peeks slots: the census never touches the source trees", async () => {
     // The named paths do not exist on disk; a stat/readdir of them would be the only way to fail here.
-    const r = await run([{ key: "uzi-recovery.b.clone", value: j("/nonexistent/clone/tree", { retainedSources: [{ clonePath: "/nonexistent/other" }] }) }], {});
+    const r = await run([{ key: "uzi-recovery.b.clone", value: j("/nonexistent/clone/tree", { retainedSources: [{ runId: "r1", clonePath: "/nonexistent/other" }] }) }], {});
     assert.ok(r.ok);
   });
 });

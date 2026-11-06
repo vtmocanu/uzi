@@ -2050,7 +2050,7 @@ function memoryParkRelation(existing: MemoryParkRecord | undefined, incoming: Me
   return "write";
 }
 
-function parseRecoveryJournal(value: string): RecoveryJournalEntry {
+export function parseRecoveryJournal(value: string): RecoveryJournalEntry {
   const parsed: unknown = JSON.parse(value);
   if (typeof parsed !== "object" || parsed === null || !("runId" in parsed) || !("clonePath" in parsed)
       || typeof parsed.runId !== "string" || typeof parsed.clonePath !== "string") {
@@ -2218,7 +2218,7 @@ function attributionEntries(list: readonly string[]): BareAttributionEntry[] {
   return out;
 }
 
-function parseAttemptLedgerEntry(value: string): AttemptLedgerEntry | undefined {
+export function parseAttemptLedgerEntry(value: string): AttemptLedgerEntry | undefined {
   let parsed: unknown;
   try {
     parsed = JSON.parse(value);
@@ -2290,6 +2290,43 @@ export interface StoppedSourceMarker {
   journalDigest: string;
   reason: string;
   at: string;
+}
+
+/** The pure part of the strict stopped-marker parse (everything but the ref-format and canonical-path checks, which need
+ *  Git and the runner root). Shared with the restore census so the census can never accept what this refuses. */
+export function parseStoppedMarkerShape(runId: string, value: string): StoppedSourceMarker {
+  if (Buffer.byteLength(value, "utf8") > STOPPED_MARKER_MAX_BYTES) throw new Error("oversized stopped marker");
+  const parsed: unknown = JSON.parse(value);
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("invalid stopped marker");
+  const o = parsed as Record<string, unknown>;
+  if (Object.keys(o).sort().join(",") !== "at,branch,clonePath,generation,journalDigest,key,reason,runId,version") {
+    throw new Error("invalid stopped marker keys");
+  }
+  if (o.version !== 1 || o.runId !== runId) throw new Error("invalid stopped marker identity");
+  if (o.generation !== null && (!Number.isSafeInteger(o.generation) || (o.generation as number) < 0)) throw new Error("invalid stopped marker generation");
+  if (typeof o.branch !== "string" || o.branch === "" || o.branch.length > 256) throw new Error("invalid stopped marker branch");
+  if (typeof o.key !== "string" || o.key.length > 160 || !/^[A-Za-z0-9_-]+$/.test(o.key)) throw new Error("invalid stopped marker key");
+  if (typeof o.clonePath !== "string") throw new Error("invalid stopped marker path");
+  recoverySource({ runId, clonePath: o.clonePath });
+  if (typeof o.journalDigest !== "string" || !/^[0-9a-f]{64}$/.test(o.journalDigest)) throw new Error("invalid stopped marker digest");
+  if (typeof o.reason !== "string" || !/^[A-Za-z0-9_.:-]{1,64}$/.test(o.reason)) throw new Error("invalid stopped marker reason");
+  if (typeof o.at !== "string" || o.at.length > 40 || Number.isNaN(Date.parse(o.at))) throw new Error("invalid stopped marker time");
+  return o as unknown as StoppedSourceMarker;
+}
+
+/** The pure part of the strict protected-descriptor (`uzi-retained.<runId>.journal`) parse; the ref-format and
+ *  attribution checks stay in {@link GitCache.protectedRecoveries}. Shared with the restore census. */
+export function parseRetainedDescriptorShape(runId: string, value: string): { branch: string; key: string; journal: RecoveryJournalEntry } {
+  const record: unknown = JSON.parse(value);
+  if (!record || typeof record !== "object" || Array.isArray(record)) throw new Error("invalid protected recovery descriptor");
+  const r = record as Record<string, unknown>;
+  if (r.version !== 1 || Object.keys(r).sort().join(",") !== "branch,journal,key,version" ||
+      typeof r.branch !== "string" || !r.branch || typeof r.key !== "string" || !/^[A-Za-z0-9_-]+$/.test(r.key)) {
+    throw new Error("invalid protected recovery descriptor");
+  }
+  const journal = parseRecoveryJournal(JSON.stringify(r.journal));
+  if (journal.runId !== runId || (!journal.recovery && !journal.retainedSources?.length)) throw new Error("protected recovery run mismatch");
+  return { branch: r.branch, key: r.key, journal };
 }
 
 /** The operator-facing identity of one retained source. `attempt` is an attempt id, or `canonical`. */
@@ -7788,10 +7825,12 @@ export class GitCache {
           throw new Error("ambiguous restriction journal");
         let activeRaw = activeEntries[0]?.slice(key.length + 1) || undefined;
         let active = activeRaw === undefined ? undefined : parseRecoveryJournal(activeRaw);
-        // issue #3644: under a composite the active journal is S's entry (P is opaque and plain, a tombstone has none).
+        // issue #3644: under a composite the active journal is S's entry (P is opaque and plain). A tombstone has none, so
+        // `activeSource` stays undefined, syncJournalAndReadBack then compares that absence with P's non-empty raw and
+        // throws: restriction facts REFUSE (fail closed) under a tombstone.
         let activeSource: { runId: string; clonePath: string; attemptId?: string } | undefined;
         if (this.restoreValueIn(entries, branch) !== undefined) {
-          const composite = await this.resolveBranchJournal(barePath, branch, entries);
+          const composite = await this.resolveBranchJournalUnderLock(barePath, branch, entries);
           if (composite.kind !== "composite") throw new Error("restriction restore composite unavailable");
           const live = composite.successor.kind === "entry" && composite.stage !== "retired" ? composite.successor : undefined;
           active = live?.journal;
@@ -8243,8 +8282,8 @@ export class GitCache {
             // unaffected. An undecodable value cannot say whose it is, so it refuses the whole bare.
             if (raw === undefined || restoreKeyBranch(name) === undefined) throw new Error("malformed restore entry");
             if (raw !== "") {
-              const v = parseRestoreValue(raw);
-              const restored = v.kind === "entry" ? v.remainder.runId : v.successor.runId;
+              // Strict decode (throws on any undecodable entry or tombstone): a loose remainder must not decide the run.
+              const restored = parseRestoreValue(raw).kind === "entry" ? parseRestoreJournal(raw).journal.runId : parseRestoreTombstone(raw).successor.runId;
               if (restored === runId) throw new Error("restored source");
             }
             continue;
@@ -8406,13 +8445,8 @@ export class GitCache {
       const match = /^uzi-retained\.([^.]+)\.journal$/.exec(name);
       if (!match || seen.has(name) || nl < 0) throw new Error("invalid protected recovery descriptor");
       seen.add(name);
-      const record = JSON.parse(item.slice(nl + 1));
-      if (!record || typeof record !== "object" || Array.isArray(record) || record.version !== 1 ||
-          Object.keys(record).sort().join(",") !== "branch,journal,key,version" ||
-          typeof record.branch !== "string" || !record.branch || typeof record.key !== "string" ||
-          !/^[A-Za-z0-9_-]+$/.test(record.key)) throw new Error("invalid protected recovery descriptor");
-      const journal = parseRecoveryJournal(JSON.stringify(record.journal));
-      if (journal.runId !== match[1] || (!journal.recovery && !journal.retainedSources?.length)) throw new Error("protected recovery run mismatch");
+      const record = parseRetainedDescriptorShape(match[1]!, item.slice(nl + 1));
+      const journal = record.journal;
       await this.runGit(barePath, ["check-ref-format", "--branch", record.branch]);
       await this.attributedRecovery(barePath, record.branch, record.key, journal, journal, false, snapshot);
       const active = await this.readRecoveryCapture(barePath, record.branch, snapshot?.entries);
@@ -8861,7 +8895,7 @@ export class GitCache {
   /** issue #3644: rewrite S's `seeding`/`ready` entry with `journal` (same stage and basis); any other target refuses. */
   private async writeRestoreJournal(barePath: string, branch: string, journal: RecoveryJournalEntry,
     guard: (() => void | Promise<void>) | undefined, entries: readonly string[]): Promise<void> {
-    const r = await this.resolveBranchJournal(barePath, branch, entries);
+    const r = await this.resolveBranchJournalUnderLock(barePath, branch, entries);
     if (r.kind !== "composite") throw new RestoreCompositeError("restore entry without a composite");
     if (r.predecessor.journal.runId !== journal.runId)
       throw new RestoreCompositeBlockedError("the branch is held by another run's restore", r.predecessor.journal.runId);
@@ -10007,26 +10041,11 @@ export class GitCache {
   /** Strict parse of one stopped marker value (see {@link StoppedSourceMarker}); throws on anything
    *  that is not exactly the documented shape. Never truncates and never repairs. */
   private async parseStoppedMarker(barePath: string, runId: string, value: string): Promise<StoppedSourceMarker> {
-    if (Buffer.byteLength(value, "utf8") > STOPPED_MARKER_MAX_BYTES) throw new Error("oversized stopped marker");
-    const parsed: unknown = JSON.parse(value);
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("invalid stopped marker");
-    const o = parsed as Record<string, unknown>;
-    if (Object.keys(o).sort().join(",") !== "at,branch,clonePath,generation,journalDigest,key,reason,runId,version") {
-      throw new Error("invalid stopped marker keys");
-    }
-    if (o.version !== 1 || o.runId !== runId) throw new Error("invalid stopped marker identity");
-    if (o.generation !== null && (!Number.isSafeInteger(o.generation) || (o.generation as number) < 0)) throw new Error("invalid stopped marker generation");
-    if (typeof o.branch !== "string" || o.branch === "" || o.branch.length > 256) throw new Error("invalid stopped marker branch");
-    await this.runGit(barePath, ["check-ref-format", "--branch", o.branch]);
-    if (typeof o.key !== "string" || o.key.length > 160 || !/^[A-Za-z0-9_-]+$/.test(o.key)) throw new Error("invalid stopped marker key");
-    if (typeof o.clonePath !== "string") throw new Error("invalid stopped marker path");
-    recoverySource({ runId, clonePath: o.clonePath });
-    const shape = this.clonePathShape(o.clonePath, this.runnerClonePath(barePath, o.key));
+    const marker = parseStoppedMarkerShape(runId, value);
+    await this.runGit(barePath, ["check-ref-format", "--branch", marker.branch]);
+    const shape = this.clonePathShape(marker.clonePath, this.runnerClonePath(barePath, marker.key));
     if (!shape || shape.attemptId !== undefined) throw new Error("stopped marker path is not the key's canonical clone");
-    if (typeof o.journalDigest !== "string" || !/^[0-9a-f]{64}$/.test(o.journalDigest)) throw new Error("invalid stopped marker digest");
-    if (typeof o.reason !== "string" || !/^[A-Za-z0-9_.:-]{1,64}$/.test(o.reason)) throw new Error("invalid stopped marker reason");
-    if (typeof o.at !== "string" || o.at.length > 40 || Number.isNaN(Date.parse(o.at))) throw new Error("invalid stopped marker time");
-    return o as unknown as StoppedSourceMarker;
+    return marker;
   }
 
   /** Every stopped marker of the bare, under the caller's lock. A run with more than
@@ -11605,7 +11624,7 @@ export class GitCache {
           const restoreBranch = nl < 0 ? undefined : restoreKeyBranch(item.slice(0, nl));
           if (restoreBranch === undefined || item.slice(nl + 1) === "") continue;
           let composite: BranchJournal;
-          try { composite = await this.resolveBranchJournal(barePath, restoreBranch, entries); }
+          try { composite = await this.resolveBranchJournalUnderLock(barePath, restoreBranch, entries); }
           catch (err) { cause = "attribution_unreadable"; throw err; }
           if (composite.kind !== "composite" || composite.predecessor.journal.runId !== runId) continue;
           const b = composite.basis.predecessor;
@@ -11825,7 +11844,7 @@ export class GitCache {
       // entry stands in for the journal P's key would hold.
       const predecessors = new Map<string, RetainedPredecessor>();
       for (const restoreBranch of restoreBranches) {
-        const composite = await this.resolveBranchJournal(barePath, restoreBranch, entries);
+        const composite = await this.resolveBranchJournalUnderLock(barePath, restoreBranch, entries);
         if (composite.kind !== "composite" || composite.predecessor.journal.runId !== runId) continue;
         const b = composite.basis.predecessor;
         predecessors.set(b.clonePath, { clonePath: b.clonePath, branch: restoreBranch, runId, attemptId: b.attemptId, generation: b.generation });
@@ -11964,13 +11983,24 @@ export class GitCache {
     return (await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"])).split("\0");
   }
 
+  /** {@link resolveBranchJournalUnderLock} under the bare lock, for callers that do not already hold it. */
+  resolveBranchJournal(barePath: string, branch: string): Promise<BranchJournal> {
+    return this.withLock(barePath, () => this.resolveBranchJournalUnderLock(barePath, branch));
+  }
+
+  /** {@link advanceRestoreEntryUnderLock} under the bare lock, for callers that do not already hold it. */
+  advanceRestoreEntry(barePath: string, branch: string, to: "seeding" | "ready" | "retired" | "cleared",
+    seed?: { basis: RestoreBasis; journal: RecoveryJournalEntry }): Promise<void> {
+    return this.withLock(barePath, () => this.advanceRestoreEntryUnderLock(barePath, branch, to, seed));
+  }
+
   /**
    * Which journal keys hold what for `branch`, under the caller's bare lock (it takes none). No restore entry: P's
    * plain journal or none. A restore entry: it must pair with P's journal (same run, P's raw value hashing to the basis
    * digest, a non-empty P key) and with S's attempt ledger entry in one of the four valid pairs (seeding+live,
    * ready+live, ready+retired, retired+retired); anything else throws {@link RestoreCompositeError}. Config reads only.
    */
-  async resolveBranchJournal(barePath: string, branch: string, snapshot?: readonly string[]): Promise<BranchJournal> {
+  private async resolveBranchJournalUnderLock(barePath: string, branch: string, snapshot?: readonly string[]): Promise<BranchJournal> {
     const entries = snapshot ?? await this.configEntries(barePath);
     const pPrefix = `${recoveryCaptureKey(branch)}\n`;
     const pRaw = entries.filter(item => item.startsWith(pPrefix)).at(-1)?.slice(pPrefix.length) || undefined;
@@ -12014,7 +12044,7 @@ export class GitCache {
       const entries = await this.configEntries(barePath);
       this.assertRecoveryConfigKeys(entries.map(item => { const nl = item.indexOf("\n"); return nl < 0 ? item : item.slice(0, nl); }));
       if (this.restoreValueIn(entries, branch) !== undefined) {
-        const composite = await this.resolveBranchJournal(barePath, branch, entries);
+        const composite = await this.resolveBranchJournalUnderLock(barePath, branch, entries);
         if (composite.kind !== "composite") throw new RestoreCompositeError("restore entry without a composite");
         if (composite.predecessor.journal.runId !== runId)
           throw new RestoreCompositeBlockedError("the branch is held by another run's restore", composite.predecessor.journal.runId);
@@ -12062,7 +12092,7 @@ export class GitCache {
   /** The journal naming `expected` ((a) sites): S's entry when a composite's S matches it, else P's plain journal. */
   private async readJournalFor(barePath: string, branch: string, expected: { runId: string; clonePath: string; attemptId?: string },
     snapshot?: readonly string[]): Promise<{ journal: RecoveryJournalEntry; raw: string; composite?: true; restore?: { basis: RestoreBasis; stage: RestoreStage } } | undefined> {
-    const r = await this.resolveBranchJournal(barePath, branch, snapshot);
+    const r = await this.resolveBranchJournalUnderLock(barePath, branch, snapshot);
     if (r.kind === "none") return undefined;
     if (r.kind === "plain") return { journal: r.journal, raw: r.raw };
     if (r.successor.kind === "entry" && r.stage !== "retired" && r.successor.journal.runId === expected.runId &&
@@ -12081,11 +12111,11 @@ export class GitCache {
    *   cleared : `ready` + ledger `retired`, or a tombstone -> "" (S's guarded discard / P's guarded discard)
    * P's key is never written. Anything else throws {@link RestoreCompositeError} with nothing written.
    */
-  async advanceRestoreEntry(barePath: string, branch: string, to: "seeding" | "ready" | "retired" | "cleared",
+  private async advanceRestoreEntryUnderLock(barePath: string, branch: string, to: "seeding" | "ready" | "retired" | "cleared",
     seed?: { basis: RestoreBasis; journal: RecoveryJournalEntry }): Promise<void> {
     const entries = await this.configEntries(barePath);
     const key = restoreJournalKey(branch);
-    const current = await this.resolveBranchJournal(barePath, branch, entries);
+    const current = await this.resolveBranchJournalUnderLock(barePath, branch, entries);
     let value: string;
     let expect: (r: BranchJournal) => boolean;
     if (to === "seeding") {
@@ -12115,7 +12145,7 @@ export class GitCache {
     }
     const next = entries.filter(item => item !== key && !item.startsWith(`${key}\n`));
     if (value !== "") next.push(`${key}\n${value}`);
-    if (!expect(await this.resolveBranchJournal(barePath, branch, next))) throw new RestoreCompositeError("restore transition is not valid here");
+    if (!expect(await this.resolveBranchJournalUnderLock(barePath, branch, next))) throw new RestoreCompositeError("restore transition is not valid here");
     await this.assertRecoveryBare(barePath);
     await this.runGit(barePath, ["config", "--local", key, value]);
     if ((this.restoreValueIn(await this.configEntries(barePath), branch) ?? "") !== value) throw new Error("restore entry read-back differs");
@@ -12172,7 +12202,7 @@ export class GitCache {
         // issue #3644: a restored successor's clone path is journaled in its own key, so the retention sweep keeps it.
         const restoreBranch = restoreKeyBranch(k);
         if (restoreBranch !== undefined && item.slice(nl + 1)) {
-          const composite = await this.resolveBranchJournal(barePath, restoreBranch);
+          const composite = await this.resolveBranchJournalUnderLock(barePath, restoreBranch);
           if (composite.kind === "composite" && composite.successor.kind === "entry") out.add(composite.successor.journal.clonePath);
           continue;
         }
@@ -12228,11 +12258,8 @@ export class GitCache {
   private async compactAttemptLedger(barePath: string, branch: string): Promise<void> {
     try {
       const key = attemptLedgerKey(branch);
-      // issue #3644: compaction lstats every ledger path, a restored predecessor's included; it waits while a restore entry exists.
-      if ((await this.configEntries(barePath)).some(item => {
-        const nl = item.indexOf("\n");
-        return nl > 0 && nl < item.length - 1 && restoreKeyBranch(item.slice(0, nl)) !== undefined;
-      })) return;
+      // issue #3644: compaction lstats every ledger path, a restored predecessor's included; it waits while THIS branch has a restore entry.
+      if (this.restoreValueIn(await this.configEntries(barePath), branch) !== undefined) return;
       const raw = (await this.readAllAttemptLedgerRaw(barePath)).filter(([b]) => b === branch).map(([, v]) => v);
       const last = new Map<string, AttemptLedgerEntry>();
       for (const v of raw) {
@@ -13894,7 +13921,7 @@ export class GitCache {
         processOpen() && !await this.hasPhysicalTerminalProtection(runId) && processOpen() && residueQuarantine() === undefined;
       if (!await open()) return false;
       // issue #3644: under a composite this source is S, whose entry (or tombstone) is the journal.
-      const restoreState = await this.resolveBranchJournal(barePath, branch);
+      const restoreState = await this.resolveBranchJournalUnderLock(barePath, branch);
       const foundS = restoreState.kind === "composite" && restoreState.successor.kind === "entry" && restoreState.stage !== "retired" &&
         restoreState.successor.journal.runId === runId && restoreState.successor.journal.clonePath === clonePath &&
         restoreState.successor.journal.attemptId === attemptId;
@@ -13914,7 +13941,7 @@ export class GitCache {
       // The retired ledger proves attribution only. The caller may independently require live process exclusion.
       if (pending) {
         if (!processOpen()) return false;
-        if (foundS) await this.advanceRestoreEntry(barePath, branch, "retired"); // issue #3644: tombstone, P's key stays
+        if (foundS) await this.advanceRestoreEntryUnderLock(barePath, branch, "retired"); // issue #3644: tombstone, P's key stays
         else await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
       }
       return processOpen();
@@ -13976,7 +14003,7 @@ export class GitCache {
         await this.appendAttemptLedger(barePath, branch, { attemptId: attemptId!, runId, clonePath, state: "retired" });
         if (!processOpen()) return false;
       }
-      if (stored.restore) await this.advanceRestoreEntry(barePath, branch, "retired");
+      if (stored.restore) await this.advanceRestoreEntryUnderLock(barePath, branch, "retired");
       else await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
       return processOpen();
     });
@@ -14603,7 +14630,7 @@ export class GitCache {
           open();
           // issue #3644: S's entry becomes the tombstone (ready -> retired, after the ledger `retired` above); P's key stays.
           try {
-            if (foundNow?.restore) await this.advanceRestoreEntry(barePath, branch, "retired");
+            if (foundNow?.restore) await this.advanceRestoreEntryUnderLock(barePath, branch, "retired");
             else await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
           }
           catch (error) { return retryWrite(error); }

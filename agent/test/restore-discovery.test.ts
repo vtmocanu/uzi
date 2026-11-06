@@ -55,7 +55,8 @@ type Internals = {
   discardRetainedRecoveryUnderLock(bare: string, branch: string, key: string, expected: { runId: string; clonePath: string; attemptId?: string }): Promise<void>;
   checkedRecovery(bare: string, branch: string, key: string, expected: { runId: string; clonePath: string; attemptId?: string }): Promise<unknown>;
   journaledClonePaths(bare: string): Promise<Set<string>>;
-  gatherRetainedUnderLock(bare: string): Promise<{ records: Array<{ kind: string; runId: string; parts: Array<{ clonePath: string; presence: string }>; problems: string[] }> }>;
+  compactAttemptLedger(bare: string, branch: string): Promise<void>;
+  gatherRetainedUnderLock(bare: string): Promise<{ records: Array<{ kind: string; runId: string; digest: string; parts: Array<{ clonePath: string; presence: string }>; problems: string[] }> }>;
   withLock<T>(bare: string, fn: () => Promise<T>): Promise<T>;
   execScoped(command: string, args: string[], options: unknown): Promise<{ stdout: string; stderr: string }>;
   runGit(cwd: string | undefined, args: string[]): Promise<string>;
@@ -638,5 +639,78 @@ describe("enumerators exclude the predecessor's path", () => {
     assert.equal(p.parts[0]!.presence, "unsafe");
     assert.ok(p.problems.includes("restore_predecessor_retained"));
     assert.ok(!gathered.records.find(r => r.parts.some(part => part.clonePath === S_PATH))?.problems.includes("restore_predecessor_retained"));
+  });
+});
+
+describe("discardRetainedSource refuses a restored branch with the real gathered digest", () => {
+  it("throws RestoreCompositeError before quiescence or any delete (logged, result unknown), nothing written", async () => {
+    compose({ stage: "ready", ledger: "live" });
+    const gathered = await internals().withLock(bare, () => internals().gatherRetainedUnderLock(bare));
+    const rec = gathered.records.find(r => r.parts.some(part => part.clonePath === P_PATH))!;
+    assert.match(rec.digest, /^[0-9a-f]{64}$/);
+    const warnings: unknown[][] = [];
+    const log = nullLogger();
+    log.warn = (...args: unknown[]) => { warnings.push(args); };
+    const logged = new GitCache(fx.dataDir, log, undefined, testGitCacheOptions());
+    const before = config();
+    let quiesced = false;
+    const result = await logged.discardStoppedSource({
+      selector: { runId: RUN, generation: 1, attempt: P_ID }, confirm: rec.digest, holds: { state: "read", holds: [] },
+      isLivePath: () => false, quiesce: async () => { quiesced = true; return true; }, barePath: bare,
+    });
+    assert.equal(result.kind, "unknown");
+    assert.deepEqual(result.sources, []);
+    assert.equal(quiesced, false);
+    assert.ok(warnings.some(w => /restore composite/.test(JSON.stringify(w[1]))), JSON.stringify(warnings));
+    assert.deepEqual(config(), before);
+  });
+});
+
+describe("matchMaintenanceSourceFamily decides a restore value strictly", () => {
+  const known = () => [{ runId: RUN, clonePath: P_PATH, attemptId: P_ID }];
+  const call = (runId = RUN) => cache.matchMaintenanceSourceFamily(bare, BRANCH, KEY, runId, runId === RUN ? known() : [{ runId, clonePath: P_PATH, attemptId: P_ID }]);
+  const plainFamily = (): void => {
+    fs.mkdirSync(P_PATH, { recursive: true });
+    setKey(P_KEY, pRaw);
+    addLedger(P_ID, P_PATH, "live");
+  };
+  it("control: a plain family matches", async () => {
+    plainFamily();
+    assert.ok(await call());
+  });
+  it("a loose or undecodable restore value refuses the whole bare, whatever run it names", async () => {
+    plainFamily();
+    for (const remainder of [{}, { runId: 42 }, { runId: OTHER_RUN }, { runId: RUN }]) {
+      setKey(S_KEY, JSON.stringify({ restore: basis(), restoreStage: "ready", ...remainder }));
+      assert.equal(await call(), undefined, JSON.stringify(remainder));
+    }
+    setKey(S_KEY, JSON.stringify({ restore: basis(), restoreStage: "retired", successor: { runId: 42 } }));
+    assert.equal(await call(), undefined);
+  });
+  it("a valid entry refuses only the run it names", async () => {
+    plainFamily();
+    setKey(S_KEY, entryValue("ready"));
+    assert.equal(await call(), undefined);
+    setKey(S_KEY, restoreJournalJson(basis(), "ready", { ...sJournal(), runId: OTHER_RUN } as RecoveryJournalEntry));
+    assert.ok(await call());
+  });
+});
+
+describe("compactAttemptLedger waits only for its own branch's restore entry", () => {
+  const OTHER_BRANCH = "agent/issue-77";
+  const otherLedger = `uzi-attempts.${OTHER_BRANCH}.entry`;
+  const goneAttempt = formatAttemptId(new Date("2026-11-04T09:09:09Z"), 1, "aaaaaaaaaaaaaaaa");
+  const goneEntry = (branchKey: string) => path.join(path.dirname(P_PATH), `${branchKey}.attempt-${goneAttempt}`);
+  it("another branch's gone entry is still compacted while this branch has a restore entry; this branch's is not", async () => {
+    compose({ stage: "ready", ledger: "live" });
+    const gonePath = goneEntry("issue-77");
+    gitIn(bare, ["config", "--add", otherLedger, JSON.stringify({ attemptId: goneAttempt, runId: "run-77", clonePath: gonePath, state: "retired" })]);
+    await internals().compactAttemptLedger(bare, OTHER_BRANCH);
+    assert.ok(!(rawKey(otherLedger) ?? "").includes(goneAttempt), "the other branch's gone entry was compacted");
+    // This branch (restore entry present): compaction leaves the ledger as it was.
+    gitIn(bare, ["config", "--add", LEDGER_KEY, JSON.stringify({ attemptId: goneAttempt, runId: "run-77", clonePath: gonePath, state: "retired" })]);
+    const before = config();
+    await internals().compactAttemptLedger(bare, BRANCH);
+    assert.deepEqual(config(), before);
   });
 });

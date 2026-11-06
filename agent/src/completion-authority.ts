@@ -305,7 +305,7 @@ function unseal<T extends object>(key: Buffer, kind: string, source: string, nor
 
 // ---- file IO (async only) -------------------------------------------------------------
 
-async function readRegular(file: string, uid: number, limit: number): Promise<string | null> {
+export async function readRegular(file: string, uid: number, limit: number): Promise<string | null> {
   let handle: fsp.FileHandle;
   try { handle = await fsp.open(file, fsc.O_RDONLY | fsc.O_NOFOLLOW | fsc.O_NONBLOCK); }
   catch (error) {
@@ -586,7 +586,7 @@ export async function openAuthorityStore(tx: AuthorityTransaction, options: Auth
   if (options.workerToken === "") throw new AuthorityRefusal("worker token required to authenticate authority state");
   const ops = options.ops ?? realOps;
   // Domain-separated from the join token itself: only this derived key ever MACs state.
-  const key = createHmac("sha256", options.workerToken).update(KEY_LABEL).digest();
+  const key = deriveAuthorityKey(options.workerToken);
   if (path.resolve(ctx.dataDir) !== ctx.dataDir || await fsp.realpath(ctx.dataDir) !== ctx.dataDir) {
     throw new AuthorityRefusal("authority data root is not the canonical spelling");
   }
@@ -663,7 +663,7 @@ export async function peekAuthoritySlot(
   if (options.workerToken === "") throw new AuthorityRefusal("worker token required to authenticate authority state");
   const dataDir = options.dataDir;
   const uid = options.uid ?? process.getuid?.() ?? -1;
-  const key = createHmac("sha256", options.workerToken).update(KEY_LABEL).digest();
+  const key = deriveAuthorityKey(options.workerToken);
   if (path.resolve(dataDir) !== dataDir || await fsp.realpath(dataDir) !== dataDir) {
     throw new AuthorityRefusal("authority data root is not the canonical spelling");
   }
