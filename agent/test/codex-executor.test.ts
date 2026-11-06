@@ -137,6 +137,9 @@ import { SupervisedChildExitTimeoutError } from "../src/codex/launcher.js";
 import { CommandDeadlineError } from "../src/codex/broker.js";
 import { CODEX_M3B_LOOPBACK_PROVIDER_NAME } from "../src/codex/config.js";
 import { renderCodexRun } from "../src/codex/render.js";
+import { CodexCatalogReporter, type CodexCatalogReportClient } from "../src/codex/catalog-report.js";
+import type { LeadConfigPostOutcome } from "../src/client.js";
+import type { CodexCatalogDefaultBody } from "../src/protocol.js";
 import { MAX_LEAD_FINAL_MESSAGE_LEN, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING } from "../src/plan-missing.js";
 
 /** Issue #1718: every implement prompt now ends with the roster line; makeCtx has no agents. */
@@ -6479,6 +6482,8 @@ describe("CodexExecutor: #3247 catalog probe and effort_not_in_catalog policy", 
   async function run(opts: {
     effort?: string; model?: string; list: (c: ResponderCtx) => unknown; timeoutMs?: number;
     rejectTurn?: boolean; sessionId?: string; providerModel?: string; rejectResume?: boolean;
+    /** Issue #3251: attach a catalog reporter over this client (RunContext.codexCatalogReport). */
+    reporterClient?: CodexCatalogReportClient; onTurnStart?: () => void;
   }) {
     let emittedRef: { kind: string; payload: Record<string, unknown> }[] = [];
     const log: string[] = [];
@@ -6486,6 +6491,7 @@ describe("CodexExecutor: #3247 catalog probe and effort_not_in_catalog policy", 
       if (c.method === "model/list") { log.push("model/list"); return opts.list(c); }
       if (c.method === "turn/start") {
         log.push(`turn/start:notes=${emittedRef.filter((m) => m.payload.event === NOTE_EVENT).length}`);
+        opts.onTurnStart?.();
         return { turn: { id: "tn-1" } };
       }
       if (c.method === "thread/start") return { thread: { id: "th-1" } };
@@ -6505,6 +6511,11 @@ describe("CodexExecutor: #3247 catalog probe and effort_not_in_catalog policy", 
     const { ctx, emitted } = makeCtx({
       config: { ...(opts.effort !== undefined ? { default_effort: opts.effort as never } : {}), ...(opts.model ? { default_model: opts.model } : {}) },
       ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
+      ...(opts.reporterClient ? {
+        codexCatalogReport: new CodexCatalogReporter({
+          client: opts.reporterClient, runId: "run-1", claimGeneration: 7, catalogContext: CATALOG_CTX, logger: noopLog,
+        }),
+      } : {}),
     });
     emittedRef = emitted as never;
     const executor = makeExecutor({ ...rig, deps: { ...rig.deps, catalogProbeTimeoutMs: opts.timeoutMs ?? 10 } }, bindingOf(SUBSCRIPTION), noopLog, undefined,
@@ -6568,6 +6579,99 @@ describe("CodexExecutor: #3247 catalog probe and effort_not_in_catalog policy", 
       assert.equal(rec(turns[0]!.params).effort, input.effort);
       const listed = rig.transport.requests.filter((r) => r.method === "model/list").length;
       assert.equal(listed, input.effort === undefined ? 0 : 1);
+    });
+  }
+
+  // Issue #3251: the catalog default report.
+  const CATALOG_CTX = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+  class ReportStub implements CodexCatalogReportClient {
+    readonly posts: CodexCatalogDefaultBody[] = [];
+    outcome: LeadConfigPostOutcome | "throw" = { kind: "ok" };
+    async recordCodexCatalogDefault(_runId: string, body: CodexCatalogDefaultBody): Promise<LeadConfigPostOutcome> {
+      this.posts.push(body);
+      if (this.outcome === "throw") throw new Error("boom");
+      return this.outcome;
+    }
+  }
+  const settle = async () => { for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r)); };
+  const withDefault = (model: string, levels: string[], def: string | undefined) =>
+    ({ data: [{ id: model, model, supportedReasoningEfforts: levels.map(opt), ...(def !== undefined ? { defaultReasoningEffort: def } : {}) }] });
+
+  it("Runtime default with a reporter: the first turn/start does not wait for model/list, then one report is posted", async () => {
+    const reporterClient = new ReportStub();
+    let release!: (v: unknown) => void;
+    const reply = new Promise<unknown>((resolve) => { release = resolve; });
+    const { rig, notes, log, error } = await run({
+      reporterClient, timeoutMs: 60_000, list: () => reply,
+      onTurnStart: () => release(withDefault("gpt-6-astra", ["low", "medium"], "medium")),
+    });
+    assert.equal(error, undefined);
+    assert.deepEqual(log, ["model/list", "turn/start:notes=0"], "turn/start was sent while model/list was unanswered");
+    await settle();
+    assert.equal(notes.length, 0, "Runtime default never emits the note");
+    assert.equal(rig.transport.requests.filter((r) => r.method === "model/list").length, 1);
+    assert.equal(rec(rig.transport.requests.find((r) => r.method === "turn/start")!.params).effort, undefined);
+    assert.equal(reporterClient.posts.length, 1);
+    assert.equal(reporterClient.posts[0]!.default_effort, "medium");
+    assert.equal(reporterClient.posts[0]!.catalog_context, CATALOG_CTX);
+    assert.equal(reporterClient.posts[0]!.claim_generation, 7);
+  });
+
+  it("an explicit level absent from the catalog still emits the note and also reports the default", async () => {
+    const reporterClient = new ReportStub();
+    const { notes, log } = await run({
+      effort: "max", model: "example-model", reporterClient,
+      list: () => withDefault("example-model", ["low", "high"], "low"),
+    });
+    await settle();
+    assert.equal(notes.length, 1);
+    assert.deepEqual(log, ["model/list", "turn/start:notes=1"]);
+    assert.equal(reporterClient.posts.length, 1);
+    assert.equal(reporterClient.posts[0]!.default_effort, "low");
+    assert.equal(reporterClient.posts[0]!.model, "example-model");
+  });
+
+  it("an explicit listed level reports the default and emits no note", async () => {
+    const reporterClient = new ReportStub();
+    const { notes } = await run({ effort: "high", reporterClient, list: () => withDefault("gpt-6-astra", ["low", "high"], "high") });
+    await settle();
+    assert.equal(notes.length, 0);
+    assert.equal(reporterClient.posts.length, 1);
+    assert.equal(reporterClient.posts[0]!.default_effort, "high");
+  });
+
+  it("no reporter (no catalog context): a Runtime default claim sends no model/list and posts nothing", async () => {
+    const { rig } = await run({ list: () => { throw new Error("must not be called"); } });
+    assert.equal(rig.transport.requests.filter((r) => r.method === "model/list").length, 0);
+  });
+
+  it("a persistent default posts nothing, for both an explicit and a Runtime default claim", async () => {
+    for (const effort of [undefined, "high"]) {
+      const reporterClient = new ReportStub();
+      const { error } = await run({ effort, reporterClient, list: () => withDefault("gpt-6-astra", ["low", "high"], "persistent") });
+      await settle();
+      assert.equal(error, undefined);
+      assert.deepEqual(reporterClient.posts, []);
+    }
+  });
+
+  for (const [name, outcome] of [
+    ["404", { kind: "http", status: 404 }],
+    ["409", { kind: "http", status: 409 }],
+    ["a transport error", { kind: "transport", error: new Error("econnreset") }],
+    ["a throwing client", "throw"],
+  ] as const) {
+    it(`report outcome ${name} does not affect the run`, async () => {
+      for (const effort of [undefined, "high"]) {
+        const reporterClient = new ReportStub();
+        reporterClient.outcome = outcome;
+        const { rig, error } = await run({ effort, reporterClient, list: () => withDefault("gpt-6-astra", ["low", "high"], "low") });
+        await settle();
+        assert.equal(error, undefined);
+        assert.equal(reporterClient.posts.length, 1);
+        assert.equal(rig.transport.requests.filter((r) => r.method === "turn/start").length, 1);
+        assert.equal(rig.transport.requests.filter((r) => r.method === "model/list").length, 1);
+      }
     });
   }
 

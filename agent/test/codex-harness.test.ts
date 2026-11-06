@@ -6482,6 +6482,90 @@ describe("#3247 catalog probe", () => {
       "the worker wrote no JSON-RPC response frame for the late model/list id");
   });
 
+  // Issue #3251: the non-blocking (report-only) mode.
+  describe("blocking: false", () => {
+    function gated() {
+      let release!: (v: unknown) => void;
+      const reply = new Promise<unknown>((resolve) => { release = resolve; });
+      return { reply, release };
+    }
+
+    it("sends turn/start before the model/list reply, then delivers the entry once", async () => {
+      const { reply, release } = gated();
+      const order: string[] = [];
+      const entries: unknown[] = [];
+      const transport = new FakeTransport((method) => {
+        order.push(method);
+        return method === "model/list" ? reply : defaultResponder(method);
+      });
+      const { harness } = makeHarness({
+        transport,
+        catalogProbe: { timeoutMs: 5000, blocking: false, onEntry: (e) => { order.push("onEntry"); entries.push(e); } },
+      });
+      transport.push(turnCompletedWithError("serverOverloaded")).end();
+      try {
+        await collect(harness.startTurn(makeRequest()).events);
+        assert.ok(order.includes("turn/start"), "turn/start did not wait for the model/list reply");
+        assert.ok(order.indexOf("model/list") < order.indexOf("turn/start"));
+        assert.deepEqual(entries, [], "no entry before the reply");
+        release(listing("gpt-6-astra", [opt("low")], { defaultReasoningEffort: "low" }));
+        const deadline = Date.now() + 2000;
+        while (entries.length === 0 && Date.now() < deadline) await tick();
+        assert.deepEqual(entries, [{ defaultEffort: "low", supportedEfforts: ["low"] }]);
+      } finally { await harness.close(); }
+      assert.equal(order.filter((m) => m === "model/list").length, 1);
+    });
+
+    it("delivers undefined on a timeout, and a throwing onEntry is contained", async () => {
+      const entries: unknown[] = [];
+      const transport = new FakeTransport((m) => (m === "model/list" ? new Promise(() => undefined) : defaultResponder(m)));
+      const { harness } = makeHarness({
+        transport,
+        catalogProbe: { timeoutMs: 10, blocking: false, onEntry: (e) => { entries.push(e); throw new Error("x"); } },
+      });
+      transport.push(turnCompletedWithError("serverOverloaded")).end();
+      try {
+        await collect(harness.startTurn(makeRequest()).events);
+        const deadline = Date.now() + 2000;
+        while (entries.length === 0 && Date.now() < deadline) await tick();
+      } finally { await harness.close(); }
+      assert.deepEqual(entries, [undefined]);
+    });
+
+    it("sends nothing for a turn that is already aborted", async () => {
+      const transport = new FakeTransport();
+      const { harness } = makeHarness({
+        transport,
+        catalogProbe: { timeoutMs: 1000, blocking: false, onEntry: () => { throw new Error("no entry after a stop"); } },
+      });
+      const ac = new AbortController();
+      ac.abort();
+      try { await collect(harness.startTurn(makeRequest({ signal: ac.signal })).events); } finally { await harness.close(); }
+      assert.ok(!transport.requests.some((r) => r.method === "model/list"));
+    });
+
+    it("a stop while the reply is pending suppresses onEntry", async () => {
+      const { reply, release } = gated();
+      const entries: unknown[] = [];
+      const transport = new FakeTransport((m) => (m === "model/list" ? reply : defaultResponder(m)));
+      const { harness } = makeHarness({
+        transport,
+        catalogProbe: { timeoutMs: 60_000, blocking: false, onEntry: (e) => { entries.push(e); } },
+      });
+      const ac = new AbortController();
+      const turn = harness.startTurn(makeRequest({ signal: ac.signal }));
+      const done = collect(turn.events);
+      const deadline = Date.now() + 3000;
+      while (!transport.requests.some((r) => r.method === "turn/start") && Date.now() < deadline) await tick();
+      assert.ok(transport.requests.some((r) => r.method === "turn/start"), "turn started without the reply");
+      ac.abort();
+      try { await withTimeout(done, 2000, "abort"); } finally { await harness.close(); }
+      release(listing("gpt-6-astra", [opt("low")]));
+      for (let i = 0; i < 20; i++) await tick();
+      assert.deepEqual(entries, []);
+    });
+  });
+
   describe("parseCatalogEntry bounds", () => {
     it("accepts object and bare-string efforts and matches by model or id", async () => {
       const { parseCatalogEntry } = await import("../src/codex/catalog-probe.js");

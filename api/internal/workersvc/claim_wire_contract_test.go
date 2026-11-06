@@ -206,6 +206,8 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 			// owner-chosen effort source) so "wired" differs from "present and always builtin".
 			DefaultModelSource:  strptr("schedule_pin"),
 			DefaultEffortSource: strptr("user_default"),
+			// Issue #3251: the opaque catalog context (64 lowercase hex) a Codex lead-lane claim carries.
+			CodexCatalogContext: strptr("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
 			AttributionEnabled:  true, // issue #916: always-present bool, default true
 			SkillMaxBytes:       65536,
 			SkillsMaxPerRun:     32,
