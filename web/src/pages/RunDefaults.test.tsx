@@ -808,8 +808,63 @@ describe("Run defaults — per-user reasoning effort (PRD #617 M5)", () => {
       const claude = await screen.findByLabelText("Claude effort");
       const codex = await screen.findByLabelText("Codex effort");
       expect(optionList(claude)[1]).toEqual(["runtime", "Runtime default · value not reported"]);
-      expect(optionList(codex)[1]).toEqual(["runtime", "Runtime default · Codex decides"]);
+      // No catalog_default on the response: the unknown wording, not the retired one.
+      expect(optionList(codex)[1]).toEqual(["runtime", "Runtime default · catalog default unknown until a Codex run reports it"]);
       expect(screen.getByText(/Runtime default sends no level, so Claude Code or Codex decides; a resumed session may keep the level it last used\./)).toBeTruthy();
+    });
+
+    // Issue #3251: the Codex option text comes from the server's catalog_default.
+    const cells = (catalog_default?: unknown) => [
+      { harness: "claude", effort: null, default_effort: "medium", default_source: "builtin", resolved_effort: "medium", source: "builtin", mode: "explicit" },
+      { harness: "codex", effort: null, default_effort: "medium", default_source: "builtin", resolved_effort: "medium", source: "builtin", mode: "explicit",
+        ...(catalog_default === undefined ? {} : { catalog_default }) },
+    ] as unknown as UserSettings["effort_settings"];
+    const dto = (over: object = {}) => ({ state: "known", effort: "medium", model: "gpt-6.1-sol", runtime_version: "0.164.0", observed_at: "2026-11-05T09:30:00Z", ...over });
+    const codexOption = async (catalog_default?: unknown) => {
+      mockApi.listSecrets.mockResolvedValue({ secrets: [codexSecret] });
+      mockApi.getMySettings.mockResolvedValue({ settings: { ...base, default_effort: null, default_codex_effort: null, effort_settings: cells(catalog_default) } });
+      render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+      return optionList(await screen.findByLabelText("Codex effort"))[1];
+    };
+
+    it.each([
+      ["known", dto(), "Runtime default · catalog default: medium (gpt-6.1-sol, Codex 0.164.0)"],
+      ["none", dto({ effort: "none" }), "Runtime default · catalog default: none (no reasoning level requested) (gpt-6.1-sol, Codex 0.164.0)"],
+      ["ultra", dto({ effort: "ultra" }), "Runtime default · catalog default: ultra (Codex substitutes another level) (gpt-6.1-sol, Codex 0.164.0)"],
+      ["varies", dto({ state: "varies" }), "Runtime default · catalog default: medium (gpt-6.1-sol, Codex 0.164.0) · may differ on workers still on another version"],
+      ["unknown", dto({ state: "unknown", effort: null, model: null, runtime_version: null, observed_at: null }), "Runtime default · catalog default unknown until a Codex run reports it"],
+      ["absent", undefined, "Runtime default · catalog default unknown until a Codex run reports it"],
+    ])("labels the Codex option for a %s catalog default", async (_name, catalog_default, label) => {
+      expect(await codexOption(catalog_default)).toEqual(["runtime", label]);
+      // Claude's option is unchanged by the Codex catalog.
+      expect(optionList(screen.getByLabelText("Claude effort"))[1]).toEqual(["runtime", "Runtime default · value not reported"]);
+    });
+
+    it("renders a hostile model string as literal option text", async () => {
+      const hostile = "<img src=x onerror=alert(1)>";
+      const [, text] = await codexOption(dto({ model: hostile }));
+      expect(text).toBe(`Runtime default · catalog default: medium (${hostile}, Codex 0.164.0)`);
+      expect(document.querySelector("img[src='x']")).toBeNull();
+    });
+
+    it("refreshes the label from the PUT response after a Codex save", async () => {
+      expect((await codexOption(dto()))[1]).toContain("medium (gpt-6.1-sol, Codex 0.164.0)");
+      mockApi.putMySettings.mockResolvedValueOnce({ settings: { ...base, default_effort: null, default_codex_effort: "high",
+        effort_settings: cells(dto({ effort: "none", runtime_version: "0.165.0" })) } });
+      fireEvent.change(screen.getByLabelText("Codex effort"), { target: { value: "high" } });
+      fireEvent.click(screen.getByText("Save Codex effort"));
+      await waitFor(() => expect(optionList(screen.getByLabelText("Codex effort"))[1][1]).toBe(
+        "Runtime default · catalog default: none (no reasoning level requested) (gpt-6.1-sol, Codex 0.165.0)"));
+    });
+
+    it("refreshes the label from the PUT response after a Claude save", async () => {
+      expect((await codexOption(dto()))[1]).toContain("Codex 0.164.0");
+      mockApi.putMySettings.mockResolvedValueOnce({ settings: { ...base, default_effort: "high", default_codex_effort: null,
+        effort_settings: cells(dto({ state: "unknown", effort: null, model: null, runtime_version: null, observed_at: null })) } });
+      fireEvent.change(screen.getByLabelText("Claude effort"), { target: { value: "high" } });
+      fireEvent.click(screen.getByText("Save Claude effort"));
+      await waitFor(() => expect(optionList(screen.getByLabelText("Codex effort"))[1][1]).toBe(
+        "Runtime default · catalog default unknown until a Codex run reports it"));
     });
 
     it("saving runtime sends the token and announces Runtime default, never 'runtime'", async () => {

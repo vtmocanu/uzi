@@ -31,7 +31,7 @@ import { delay, mockScenario, oidcDemo, requireSession, users } from "./shared";
 import { agentSource, mockAllowedAgentSourceHosts } from "./agentSource";
 import { secrets } from "./secrets";
 import { checkerModelWarning, normalizeCheckerValue } from "../../lib/crossCheckSettings";
-import type { CodexAccountMode, CrossCheckPinDTO, EffortSettingCell, Harness } from "../../lib/apiTypes";
+import type { CatalogDefault, CodexAccountMode, CrossCheckPinDTO, EffortSettingCell, Harness } from "../../lib/apiTypes";
 import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../../lib/codexModels";
 import { MOCK_JUDGE_BUILTINS, mockJudgeModelCells, resolveMockJudgeModel } from "./judgeModels";
 import { MOCK_SUMMARY_BUILTINS, mockSummaryModelCells } from "./summaryModels";
@@ -560,6 +560,21 @@ function mockEffortCell(harness: Harness, stored: string | null | undefined): Ef
   return { ...base, resolved_effort: "medium", source: "builtin", mode: "explicit" };
 }
 
+// Issue #3251: the Codex cell's catalog_default as the mock serves it. The mock returns
+// STATIC samples (the server's selection rule is not reimplemented here); a demo or test
+// picks one with setMockCodexCatalogSample, and a module reload restores "known".
+const MOCK_CODEX_CATALOG_SAMPLES = {
+  known: { state: "known", effort: "medium", model: "gpt-6.1-sol", runtime_version: "0.164.0", observed_at: "2026-11-05T09:30:00Z" },
+  none: { state: "known", effort: "none", model: "gpt-6.1-sol", runtime_version: "0.164.0", observed_at: "2026-11-05T09:30:00Z" },
+  varies: { state: "varies", effort: "medium", model: "gpt-6.1-sol", runtime_version: "0.164.0", observed_at: "2026-11-05T09:30:00Z" },
+  unknown: { state: "unknown", effort: null, model: null, runtime_version: null, observed_at: null },
+} as const satisfies Record<string, CatalogDefault>;
+export type MockCodexCatalogSample = keyof typeof MOCK_CODEX_CATALOG_SAMPLES;
+let mockCodexCatalogSample: MockCodexCatalogSample = "known";
+export function setMockCodexCatalogSample(sample: MockCodexCatalogSample): void {
+  mockCodexCatalogSample = sample;
+}
+
 // mySettingsResponse projects the deprecated default_model from the effective-harness
 // lane so a stale client still reads a coherent single model, while the two explicit
 // lanes remain the stored source of truth.
@@ -592,7 +607,7 @@ function mySettingsResponse(): { settings: UserSettings } {
   );
   const effort_settings = [
     mockEffortCell("claude", userSettings.default_effort),
-    mockEffortCell("codex", userSettings.default_codex_effort),
+    { ...mockEffortCell("codex", userSettings.default_codex_effort), catalog_default: { ...MOCK_CODEX_CATALOG_SAMPLES[mockCodexCatalogSample] } },
   ];
   // PRD #3522: the reserve lives on the user row (written by setUsageReserve), and the
   // server's GET /me/settings reads it from there, so project it from the session user.

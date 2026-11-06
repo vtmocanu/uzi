@@ -19,7 +19,7 @@ import { EffortSelect } from "../components/EffortSelect";
 import { HarnessPicker } from "../components/HarnessPicker";
 import { modelFieldWarning } from "../lib/agentTemplates";
 import { CODEX_ROLE_MODELS } from "../lib/codexModels";
-import { modelSettingSourceLabel } from "../lib/modelSettings";
+import { codexRuntimeDefaultLabel, modelSettingSourceLabel } from "../lib/modelSettings";
 import { SettingsShell } from "../components/SettingsShell";
 import { hasAnthropicToken, isCodexUsable } from "../lib/hasToken";
 import {
@@ -433,6 +433,7 @@ export function RunDefaults() {
   // the Default labels and In-effect lines describe the SAVED state.
   const claudeJudgeCell = committedSettings?.judge_models?.find((c) => c.harness === "claude");
   const codexJudgeCell = committedSettings?.judge_models?.find((c) => c.harness === "codex");
+  const codexEffortCell = committedSettings?.effort_settings?.find((c) => c.harness === "codex");
   // Same validation path as the worker model (PRD #69 M2): the shared modelFieldWarning
   // gates Save, so a judge model can't be saved to a shape the server rejects. The Claude
   // lane also refuses a Codex id (the server's Claude-lane guard, PRD #3245).
@@ -562,7 +563,7 @@ export function RunDefaults() {
     setEffortBusy(true);
     try {
       const { settings } = await api.putMySettings({ default_effort: defaultEffort || null });
-      setCommittedSettings(current => current && ({ ...current, default_effort: settings.default_effort }));
+      setCommittedSettings(current => current && ({ ...current, default_effort: settings.default_effort, effort_settings: settings.effort_settings }));
       const eff = settings.default_effort ?? "";
       setDefaultEffort(eff);
       setSavedEffort(eff);
@@ -587,7 +588,7 @@ export function RunDefaults() {
     setCodexEffortBusy(true);
     try {
       const { settings } = await api.putMySettings({ default_codex_effort: defaultCodexEffort || null });
-      setCommittedSettings(current => current && ({ ...current, default_codex_effort: settings.default_codex_effort }));
+      setCommittedSettings(current => current && ({ ...current, default_codex_effort: settings.default_codex_effort, effort_settings: settings.effort_settings }));
       const eff = settings.default_codex_effort ?? "";
       setDefaultCodexEffort(eff);
       setSavedCodexEffort(eff);
@@ -1454,7 +1455,7 @@ export function RunDefaults() {
             {showCodexLane && (
               <>
                 <Field label="Codex effort" htmlFor="codex-effort">
-                  <EffortSelect id="codex-effort" value={defaultCodexEffort} onChange={setDefaultCodexEffort} defaultLabel="Default · medium (built-in)" runtimeLabel="Runtime default · Codex decides" />
+                  <EffortSelect id="codex-effort" value={defaultCodexEffort} onChange={setDefaultCodexEffort} defaultLabel="Default · medium (built-in)" runtimeLabel={codexRuntimeDefaultLabel(codexEffortCell)} />
                 </Field>
                 <Button type="button" disabled={codexEffortBusy || !codexEffortDirty} onClick={saveCodexEffort}>
                   Save Codex effort

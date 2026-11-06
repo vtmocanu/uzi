@@ -3,6 +3,8 @@
 // code stays independent of the repo-root fixtures; modelSettings.test.ts pins this
 // table to fixtures/model-settings/contract.json row for row, the same way the Go
 // CLI's modelSettingSource is pinned. Run-level lead labels are a different table (fixtures/lead-config).
+import type { EffortSettingCell } from "./apiTypes";
+
 export const MODEL_SETTING_SOURCE_LABELS: readonly { field: string; token: string; label: string }[] = [
   { field: "model", token: "user_default", label: "your choice" },
   { field: "model", token: "instance_default", label: "instance default" },
@@ -12,6 +14,30 @@ export const MODEL_SETTING_SOURCE_LABELS: readonly { field: string; token: strin
   { field: "effort", token: "runtime_default", label: "runtime default" },
   { field: "effort", token: "catalog_default", label: "catalog default" },
 ];
+
+// codexRuntimeDefaultLabel is the Codex effort select's "Runtime default" option text
+// (issue #3251): what the Codex model catalog applies when no level is sent. Mirrors the
+// CLI's codexRuntimeDefaultResolved. Anything that is not a well-formed known/varies
+// default (absent cell, unknown, unrecognised state, a non-string effort/model/version)
+// reads as unknown, so a malformed payload never renders "undefined" or "null".
+export function codexRuntimeDefaultLabel(cell: EffortSettingCell | undefined): string {
+  const runtime = modelSettingSourceLabel("effort", "runtime_default");
+  const prefix = runtime.charAt(0).toUpperCase() + runtime.slice(1);
+  const catalog = modelSettingSourceLabel("effort", "catalog_default");
+  const d = cell?.catalog_default;
+  if (
+    !d || (d.state !== "known" && d.state !== "varies") ||
+    typeof d.effort !== "string" || typeof d.model !== "string" || typeof d.runtime_version !== "string"
+  ) {
+    return `${prefix} · ${catalog} unknown until a Codex run reports it`;
+  }
+  const effort =
+    d.effort === "none" ? "none (no reasoning level requested)"
+    : d.effort === "ultra" ? "ultra (Codex substitutes another level)"
+    : d.effort;
+  const base = `${prefix} · ${catalog}: ${effort} (${d.model}, Codex ${d.runtime_version})`;
+  return d.state === "varies" ? `${base} · may differ on workers still on another version` : base;
+}
 
 // modelSettingSourceLabel renders a (field, token) provenance pair; an unfamiliar pair
 // (a newer server, another child's field) reads "unknown" rather than leaking a token.
