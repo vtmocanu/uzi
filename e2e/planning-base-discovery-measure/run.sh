@@ -67,11 +67,12 @@ mkdir -p "$OUT/inputs" "$OUT/fixtures" "$OUT/results" "$OUT/tmp" "$OUT/logs"
 log() { printf '### %s\n' "$*"; }
 
 # Containers live outside the uzi- namespace (CLAUDE.md, Destructive operations) and are
-# removed by exact name only.
+# removed by exact name only, together with their anonymous volumes: the image declares
+# VOLUME /data and /nix, and a plain `docker rm` would leave a multi-GiB /nix copy behind.
 CREATED=()
 cleanup() {
   local name
-  for name in ${CREATED[@]+"${CREATED[@]}"}; do docker rm -f "$name" >/dev/null 2>&1 || true; done
+  for name in ${CREATED[@]+"${CREATED[@]}"}; do docker rm -f -v "$name" >/dev/null 2>&1 || true; done
 }
 trap cleanup EXIT
 
@@ -167,9 +168,15 @@ for config in $MEM_CONFIGS; do
         "{\"kind\":\"measure\",\"label\":\"$label\",\"fixture\":\"/out/fixtures/$spec\",\"mode\":\"$mode\",\"out\":\"/out/results\",\"tmp\":\"/out/tmp/$label\",\"injectDeadlineAfterSizing\":$inject$limits_field}"
     done
   done
+  # Results are on the bind-mounted $OUT; free this configuration's container and volumes before
+  # the next one is created. The last one stays to render the report and goes in cleanup().
+  if [ "$idx" -lt "$#" ]; then
+    docker rm -f -v "$name" >/dev/null
+    CREATED=()
+  fi
 done
 
 log "rendering $OUT/results/results.md"
-run_job "${CREATED[0]}" "report" 300 '{"kind":"report","out":"/out/results"}'
+run_job "$name" "report" 300 '{"kind":"report","out":"/out/results"}'
 mv "$OUT/results/report.term.json" "$OUT/logs/report.term.json"
 cat "$OUT/results/results.md"
