@@ -26618,7 +26618,9 @@ export class RunRunner {
     // A delivered owner `now` pause is only recorded while recovery runs (it would otherwise abort the
     // shared lifecycle and make retainedLifecycleGuard stop the run, charging an automatic requeue);
     // phasePreflightHandoff settles it through the ordinary checkpointed pause park afterwards.
-    const releaseOwnerPauseDeferral = flight.steering.deferOwnerPauseNow();
+    // A publication-only claim never reaches phasePreflightHandoff, so it keeps the immediate-stop behaviour.
+    const releaseOwnerPauseDeferral = claim.publication_resume === undefined
+      ? flight.steering.deferOwnerPauseNow() : () => undefined;
     try {
       await this.recoverRetainedClaimBody(claim, flight, key, source);
     } finally {

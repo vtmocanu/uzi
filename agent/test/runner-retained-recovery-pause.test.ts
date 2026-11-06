@@ -45,7 +45,7 @@ function drain(stream: Readable): Promise<void> {
   });
 }
 
-type Hook = "pre" | "reserve" | "successor" | "evidence" | "none";
+type Hook = "pre" | "post" | "reserve" | "successor" | "evidence" | "none";
 interface Rig {
   models: number;
   sdkCalls: number;
@@ -109,6 +109,10 @@ async function rig(hook: Hook, deliver: (flight: any, runner: any) => void, opts
   if (hook === "pre") {
     const recover = (r as any).recoverRetainedClaim.bind(r);
     (r as any).recoverRetainedClaim = async (...args: any[]) => { once(); return recover(...args); };
+  }
+  if (hook === "post") {
+    const recover = (r as any).recoverRetainedClaim.bind(r);
+    (r as any).recoverRetainedClaim = async (...args: any[]) => { const out = await recover(...args); once(); return out; };
   }
   const reserve = git.reserveRecoveryIteration.bind(git);
   let windowRouted = false;
@@ -332,9 +336,11 @@ it("P1b: a pause_failed report that throws still yields no paused and keeps cust
 
 // D. A stronger control arriving after the window but before settlement behaves exactly as it
 // does without a deferred pause, and no pause park is synthesized.
-for (const control of ["switch", "wall", "cancel"] as const) {
+for (const control of ["switch", "wall", "cancel", "fence", "shutdown"] as const) {
   it(`differential: ${control} after the window but before settlement matches the same control without a deferred pause`, async () => {
-    const deliver = (flight: any) => {
+    const deliver = (flight: any, runner: any) => {
+      if (control === "fence") flight.steering.claimFence = () => "superseded";
+      if (control === "shutdown") runner.shuttingDownGlobal = true;
       if (control === "switch") flight.steering.tripCredentialSwitch(2);
       if (control === "wall") route(flight, "pause", "wall");
       if (control === "cancel") route(flight, "cancel");
@@ -413,4 +419,51 @@ it("a fence after the successor handoff leaves the same journal with or without 
     assert.equal(statuses(rg).includes("pause_failed" as any), false);
   }
   assert.equal(normalized(deferred), normalized(plain));
+});
+
+// H. The window is released when recovery returns: a `now` routed afterwards is today's immediate path.
+it("a now pause routed right after the recovery window is not deferred and takes the immediate path", async () => {
+  const rg = await rig("post", flight => route(flight, "pause", "now"));
+  await rg.runner.execute(rg.claim);
+  assert.equal(rg.fired, 1);
+  assert.equal(rg.flight.steering.deferredPauseNowPending(), false, "released window defers nothing");
+  assert.equal(rg.flight.steering.getPauseMode(), "now");
+  assert.equal(rg.models, 0, "stopped before the model");
+  assert.equal(rg.flight.cancel.signal.aborted, true);
+  assert.equal(rg.flight.cancel.signal.reason?.constructor?.name, "PauseNowSignal", "the immediate path aborted the lifecycle");
+  assert.equal(rg.pauseParks, 1, "the ordinary outer pause arm settled it");
+  assert.equal(pausedReports(rg), 1);
+});
+
+// I. A publication-only claim never reaches phasePreflightHandoff, so the window must stay closed for it.
+for (const publicationOnly of [true, false]) {
+  it(`recoverRetainedClaim ${publicationOnly ? "does not open" : "opens"} the owner-pause deferral window ${publicationOnly ? "for a publication-only claim" : "for an ordinary claim"}`, async () => {
+    // Building a valid publication-only retained claim is impractical here; assert at the wrapper seam.
+    const rg = await rig("none", () => undefined);
+    let opened = 0, released = 0, bodies = 0;
+    const steering = { deferOwnerPauseNow: () => { opened++; return () => { released++; }; } };
+    (rg.runner as any).recoverRetainedClaimBody = async () => { bodies++; };
+    const claim = publicationOnly ? { ...rg.claim, publication_resume: {} } : rg.claim;
+    await (rg.runner as any).recoverRetainedClaim(claim, { steering }, "key", {});
+    assert.equal(bodies, 1);
+    assert.equal(opened, publicationOnly ? 0 : 1);
+    assert.equal(released, publicationOnly ? 0 : 1);
+  });
+}
+
+// J. Adoption hold (row 4a): a deferred pause never turns the integrity hold into a pause.
+it("an adoption failure with a deferred pause pending holds at retained_recovery_adoption_failed, never paused", async () => {
+  const rg = await rig("none", () => undefined, {
+    windowPause: true, protocolFeatures: ["claim_generation_fence", "recovery_cause_retained_recovery_adoption_failed"],
+  });
+  git.prepareRecoverySuccessor = async () => { throw new Error("successor adoption refused"); };
+  await rg.runner.execute(rg.claim);
+  assert.equal(rg.flight.steering.getPauseMode(), "now", "the pause was recorded");
+  const own = api.states.filter(s => s.runId === rg.claim.run_id);
+  assert.ok(own.some(s => s.body.status === "recovery_wait" &&
+    (s.body as any).recovery_cause === "retained_recovery_adoption_failed"), "adoption hold reported");
+  assert.equal(pausedReports(rg), 0);
+  assert.equal(rg.pauseParks, 0);
+  assert.equal(rg.models, 0);
+  assert.ok(custodyKept(rg));
 });
