@@ -536,7 +536,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
         try {
           // 2. fresh lifecycle and holds with the deletion-side zero rule.
           const first = await owned(() => readAuthority(runId), hardPass, true);
-          if (!first) { refusal(); if (controller.signal.aborted) { skipped = true; break; } continue; }
+          if (!first) { assertSettled(); refusal(); if (controller.signal.aborted) { skipped = true; break; } continue; }
           // 3. entry and daemon health, then re-inspect this source: it must still be the same candidate.
           check(); entry();
           const inspected = await owned(() => options.git.inspectRetainedSources({
@@ -552,7 +552,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
               only.kind !== "attempt" || only.descriptor !== admit.descriptor || only.presence !== candidate.presence ||
               only.sources.length !== 1 || only.sources[0]!.clonePath !== clonePath || only.sources[0]!.live ||
               only.localRecords.length !== 0 || only.holds.state !== "read" || only.holds.ids.length !== 0 || !plain) {
-            refusal(); continue;
+            assertSettled(); refusal(); continue;
           }
           // 4. the raw journal must be the exact strict three-key string or the explicit `[""]` repair; a no-key
           //    attempt is an unrecoverable shape, refused before any proof exists.
