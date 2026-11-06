@@ -463,6 +463,59 @@ for (const reason of ["predecessor_observation_refused", "restrictions", "predec
   });
 }
 
+it("a decoded-budget refusal from the coordinator is a clean skip that starts no further candidate", async () => {
+  const r = await drive({
+    operate: async call => ({ state: call.record.state, captureId: call.record.captureId, reason: "predecessor_decoded_budget", held: "kept" }),
+  });
+  assert.deepEqual(operations(r), ["operate:1"], "the budget is shared: the second candidate is not started");
+  assertProceeded(r);
+  const pass = logged(r, "retained predecessor FINAL pass").at(-1)!;
+  assert.deepEqual([pass.verdict, pass.capped], ["proceed", true]);
+});
+
+it("cumulative decoded-closure exhaustion across two candidates is a clean skip and the successor proceeds", async () => {
+  const env = { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_"))),
+    GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.com", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.com" };
+  const g = (bare: string, input: string | undefined, ...args: string[]): string =>
+    execFileSync("git", ["-C", bare, ...args], { env, encoding: "utf8", ...(input === undefined ? {} : { input }) }).trim();
+  // A commit with its own blob, so two tips share no object and the verification cache cannot carry one over.
+  const tipWithOwnBlob = (bare: string, tag: string): string => {
+    const blob = g(bare, `${tag}:`.padEnd(2000, tag), "hash-object", "-w", "--stdin");
+    const tree = g(bare, `100644 blob ${blob}\tf.txt\n`, "mktree");
+    return g(bare, undefined, "commit-tree", "-m", tag, tree);
+  };
+  const decoded = (bare: string, sha: string): number => {
+    const listing = g(bare, undefined, "rev-list", "--objects", "--no-object-names", sha) + "\n";
+    return g(bare, listing, "cat-file", "--batch-check").split("\n").reduce((sum, row) => sum + Number(row.split(" ")[2]), 0);
+  };
+  const tips: string[] = [];
+  const r = await drive({
+    observe: world => {
+      tips.push(tipWithOwnBlob(world.bare, "a"), tipWithOwnBlob(world.bare, "b"));
+      const one = decoded(world.bare, tips[0]!);
+      assert.ok(decoded(world.bare, tips[1]!) >= one - 8 && one > 2000, "fixture: each tip has its own decoded bytes");
+      // One candidate's closure fits the shared account; a second does not. Only the predecessor pass is narrowed:
+      // the retained recovery's own closure verification before and after it keeps the real ceiling.
+      const ceiling = git.recoveryDecodedLimitBytes;
+      const settle = world.internals.settlePredecessorHolds.bind(world.internals);
+      world.internals.settlePredecessorHolds = async (...args) => {
+        Reflect.set(git, "recoveryDecodedLimitBytes", one + Math.floor(one / 2));
+        try { return await settle(...args); } finally { Reflect.set(git, "recoveryDecodedLimitBytes", ceiling); }
+      };
+    },
+    operate: async (call, world) => {
+      // Each candidate verifies its own closure under the budget the runner shares by identity.
+      assert.equal(await git.verifyRecoveryClosure(world.bare, tips[call.record.generation! - 1]!), true);
+      return settledBy(call, await call.prove());
+    },
+  });
+  assert.deepEqual(operations(r), ["operate:1", "operate:2"], "the second candidate started and ran out of the shared budget");
+  assertProceeded(r);
+  const pass = logged(r, "retained predecessor FINAL pass").at(-1)!;
+  assert.deepEqual([pass.verdict, pass.capped, pass.outcomes], ["proceed", true, ["1:acked"]]);
+});
+
 it("a lost predecessor authority stops with custody retained", async () => {
   const r = await drive({ operate: async () => { throw new PredecessorAuthorityLost(); } });
   assert.deepEqual(operations(r), ["operate:1"]);

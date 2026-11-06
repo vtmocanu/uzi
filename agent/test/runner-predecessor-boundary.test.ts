@@ -41,14 +41,14 @@ const clone = (name: string, head = "a".repeat(40), identity = "1:1"): Clone =>
   ({ clonePath: "/fixture/repo/" + name, branch: "task", runId: RUN, head, identity });
 
 function world(opts: { codex?: boolean; claimGeneration?: number; deadlineAt?: number; clones?: () => Clone[];
-  baseline?: Clone[]; attemptPath?: string; quiesce?: (req: QuiesceRunRequest) => void | Promise<void> } = {}) {
+  baseline?: Clone[]; attemptPath?: string; quiesce?: (req: QuiesceRunRequest) => unknown } = {}) {
   const requests: QuiesceRunRequest[] = [];
   const w: { cancelled: boolean; fence: unknown; clones: () => Clone[]; reads: unknown[][]; bounds: unknown[]; statusCalls: string[]; status: (p: string) => string[] | null; content: (p: string) => string; ignored: (p: string) => string } = {
     cancelled: false, fence: undefined, reads: [], bounds: [], statusCalls: [], status: () => [], clones: opts.clones ?? (() => [clone("issue-1")]),
     content: () => "clean", ignored: () => "clean",
   };
   const r = runner({ run: async () => { throw new Error("unreached executor"); } }, fakeGitlab().gitlab, undefined, {
-    quiesceRun: async req => { requests.push(req); await opts.quiesce?.(req); return quiescent; },
+    quiesceRun: async req => { requests.push(req); return ((await opts.quiesce?.(req)) ?? quiescent) as typeof quiescent; },
     predecessorFinalForTests: true, // the pass is disabled in production (issue #2969 fallback)
   });
   const internals = r as unknown as Internals;
@@ -507,6 +507,21 @@ describe("predecessor boundary: content proof, scratch and ignored residue (real
     x.w.content = () => "dirty";
     await x.enter();
     assert.equal(ignoredCalls, 0, "not listed once the content proof already refused");
+  });
+
+  it("a non-quiescent after-scan outranks every residue verdict (a STOP check, not a residue skip)", async () => {
+    for (const [content, ignored] of [["dirty", "clean"], ["unreadable", "clean"], ["over_bound", "clean"], ["clean", "residue"], ["clean", "over_bound"]] as const) {
+      const x = world({
+        quiesce: req => req.site === "inventory_source:after_runner_git"
+          ? { ...quiescent, process: { ...quiescent.process, state: "unverified" as const, detail: "raced" } } : undefined,
+      });
+      x.w.content = () => content;
+      x.w.ignored = () => ignored;
+      const out = await x.enter();
+      assert.equal(out.result, "retained", `${content}/${ignored}`);
+      assert.deepEqual(x.registration.refusals.map(r => r.check), ["process_not_quiescent_after_git"], `${content}/${ignored}`);
+      assert.equal(out.diagnostics[0]?.check, "process_not_quiescent_after_git");
+    }
   });
 
   it("quiescence runs before and after the proofs, and the after-scan still runs on a dirty clone", async () => {

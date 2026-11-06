@@ -41,6 +41,7 @@ import { setTimeout as retryDelay } from "node:timers/promises";
 import { RUN_KINDS, HELD_FINAL_FALLBACK_REASONS, HELD_FINAL_RETAINED_REASONS, isRecoveryPrerequisiteClosureStatus, type HeldFinalRetainedReason } from "./protocol.js";
 import { RequestError, isRunOwnershipLost, type WorkerClient } from "./client.js";
 import type { Logger } from "./log.js";
+import { RecoveryClosureLimitError } from "./recovery-closure.js";
 import { residueQuarantine } from "./residue-quarantine.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
 import type {
@@ -398,7 +399,7 @@ export const PREDECESSOR_REFUSAL_CLASSES: { readonly integrity: readonly string[
     "source_advanced", "coverage_context"],
   ordinary: ["record_or_run_state", "restrictions", "bundle", "mint_denied", "capture_state",
     "capture_status", "hold_not_open", "hold_settled", "oversized", "predecessor_observation_refused",
-    "predecessor_upload_budget"],
+    "predecessor_upload_budget", "predecessor_decoded_budget"],
 };
 
 /** Captures whose bytes a sink already counts as retained-unuploaded: counted once, released when they upload. */
@@ -3913,6 +3914,14 @@ export class RecoveryCoordinator {
     } catch (err) { MaintenanceBudget.current()?.check();
       this.rethrowPredecessorAuthority(err);
       if (err instanceof RecordGoneError) return removed(err);
+      // Under a predecessor scope the shared decoded-closure budget is an ordinary bound: a clean skip that nothing
+      // journals and nothing latches (the runner then starts no further candidate, the budget being shared).
+      if (err instanceof RecoveryClosureLimitError && this.predecessorScope.getStore()) {
+        this.log.warn("recovery: predecessor decoded-closure budget exhausted; retaining source", {
+          run_id: record.runId, capture_id: record.captureId, limit: err.limit,
+        });
+        return { state: "needs_action", captureId: record.captureId, reason: "predecessor_decoded_budget" };
+      }
       // An unexpected exception inside a predecessor capture is never read as an ordinary skip, unless the
       // operation's own abort caused it (a cap stop is a clean skip for the caller to classify).
       this.predecessorNoteUnlessAborted("capture_exception", input.signal);
@@ -3990,6 +3999,8 @@ export class RecoveryCoordinator {
         error: errText(err),
       });
       this.rethrowPredecessorAuthority(err);
+      // The pass's shared decoded-byte budget ran out: a bound, not a bundle fault. captureCycle maps it.
+      if (err instanceof RecoveryClosureLimitError && this.predecessorScope.getStore()) throw err;
       this.predecessorNoteUnlessAborted("bundle_failed", input.signal);
       await this.markFailure(record, "bundle_failed", true);
       return { kind: "needs_action", reason: "bundle_failed" };
@@ -7234,7 +7245,14 @@ export class RecoveryCoordinator {
     const dst = this.recordPath(record);
     const tmp = `${dst}.${randomUUID()}.tmp`;
     await ownedRecoveryIO(() => fs.writeFile(tmp, JSON.stringify({ ...record, mac }), { mode: 0o600 }));
-    await ownedRecoveryIO(() => fs.rename(tmp, dst));
+    // The scope can die during the awaited mkdir/write above: recheck immediately before publishing, and on loss
+    // remove the unpublished temp file (best effort) so nothing becomes visible.
+    try {
+      await ownedRecoveryIO(async () => { this.assertPredecessorAuthority(); await fs.rename(tmp, dst); });
+    } catch (error) {
+      if (error instanceof PredecessorAuthorityLost) await fs.unlink(tmp).catch(() => undefined);
+      throw error;
+    }
   }
 
   /** Standard journal representation with producer-only durability. Failure preserves evidence.

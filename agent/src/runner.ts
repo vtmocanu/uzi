@@ -4414,14 +4414,16 @@ export class RunRunner {
       const ignored = content === "clean" ? await this.git.inventoryIgnoredResidue(clone.clonePath, bounds) : "clean";
       const after = await this.quiesceImpl({ ...request, dockerHost: undefined, site: "inventory_source:after_runner_git" });
       scope();
+      // A process alive across the git reads makes every content verdict above untrustworthy, so it outranks
+      // dirty/unreadable/over_bound/residue (an integrity STOP, not a clean residue skip).
+      if (after.process?.state !== "quiescent")
+        return fail("process_not_quiescent_after_git", inventoryProcessDiagnostic("process_not_quiescent_after_git", after.process, otherClaimInFlight), clone.clonePath);
       if (content === "unreadable") return fail("worktree_status_unreadable", { check: "worktree_status_unreadable" }, clone.clonePath);
       if (content === "over_bound") return fail("over_bound", { check: "worktree_status_unreadable" }, clone.clonePath);
       if (content === "dirty") return fail("worktree_status_dirty", { check: "worktree_status_dirty" }, clone.clonePath);
       // A build directory or node_modules the successor would lose is residue, reported as dirty.
       if (ignored === "residue") return fail("ignored_residue", { check: "worktree_status_dirty" }, clone.clonePath);
       if (ignored === "over_bound") return fail("over_bound", { check: "worktree_status_unreadable" }, clone.clonePath);
-      if (after.process?.state !== "quiescent")
-        return fail("process_not_quiescent_after_git", inventoryProcessDiagnostic("process_not_quiescent_after_git", after.process, otherClaimInFlight), clone.clonePath);
     }
     scope();
     const afterGit = await read();
@@ -26987,6 +26989,8 @@ export class RunRunner {
                 // cycle's catch); the sink is the only carrier of that latch on a throw.
                 if (integrity.failure !== undefined) stop(`integrity:${integrity.failure}`);
                 else if (error instanceof PredecessorAuthorityLost) stop("authority_lost");
+                // The shared decoded-closure budget is spent: a clean skip that starts no further candidate.
+                else if (error instanceof RecoveryClosureLimitError) verdict.capped = true;
                 // The action cap's own abort lands at a checkpoint: nothing was released, the hold stays as it was. Any
                 // other throw, capped or not, is an operation failure.
                 else if (error !== capReason) {
@@ -27001,6 +27005,8 @@ export class RunRunner {
             const latched = outcome.predecessor?.integrityFailure ?? integrity.failure;
             if (latched !== undefined) stop(`integrity:${latched}`);
             sweepRefusals();
+            // The decoded-closure budget is shared by every candidate: once spent, none can finish. Clean skip.
+            if (outcome.reason === "predecessor_decoded_budget") verdict.capped = true;
             // A residue refusal leaves every dependent (later) candidate on the same clone unsettled by design.
             if (verdict.stop || verdict.residue) break;
           }

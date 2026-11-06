@@ -11,6 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { RequestError } from "../src/client.js";
+import { RecoveryClosureLimitError } from "../src/recovery-closure.js";
 import {
   PREDECESSOR_REFUSAL_CLASSES, PredecessorAuthorityLost, RecoveryCoordinator, canonicalJson, classifyPredecessorRefusal,
   type FrozenOperationOptions, type InventorySourceBoundaryContext, type PredecessorMeasurements, type PredecessorOperation,
@@ -530,6 +531,31 @@ it("strict greater-than: a thin archive mints and releases only when the current
   } finally { await above.close(); }
 });
 
+it("a bindingless record (no exactHoldBinding, no heldPolicy) mints a thin FINAL only through the fresh observation and persists no binding", async () => {
+  const refused = await harness({ thin: true, bindingless: true });
+  try {
+    assert.equal(refused.record.exactHoldBinding, undefined);
+    assert.equal(refused.record.heldPolicy, undefined);
+    refused.s.ownGeneration = 7; // observation fails: grant 1 (no observation) would have minted regardless
+    assert.equal((await refused.operate()).reason, "predecessor_observation_refused");
+    assert.deepEqual(refused.sideEffects(), NONE, "an ordinary bindingless record's grant 1 is never used");
+  } finally { await refused.close(); }
+  const h = await harness({ thin: true, bindingless: true });
+  try {
+    assert.equal(h.record.exactHoldBinding, undefined);
+    assert.equal(h.record.heldPolicy, undefined);
+    const outcome = await h.operate();
+    await assertAcked(h, outcome);
+    assert.ok(h.s.listReads >= 1 && h.s.exactReads >= 1, "the fresh grant-2 observation ran");
+    const record = await h.saved();
+    assert.equal(record.selfContained, false, "thin");
+    assert.deepEqual(record.prerequisiteShas, [H]);
+    assert.equal((h.s.releases[0]![3] as { kind: string }).kind, "archive");
+    assert.equal(record.exactHoldBinding, undefined, "no binding persisted");
+    assert.equal(record.heldPolicy, undefined, "no held policy persisted");
+  } finally { await h.close(); }
+});
+
 it("a thin archive without the closure feature is a plain mint denial: uploaded, not released, no integrity failure", async () => {
   const h = await harness({ thin: true, closureFeature: false });
   try {
@@ -769,6 +795,25 @@ it("authority lost before the release POST leaves the saved request untouched fo
     assert.equal(h.s.releases.length, 1);
     assert.deepEqual(h.s.releases[0]![3], record.finalRequest!.disposition);
   } finally { await h.close(); }
+});
+
+it("authority lost while the record temp file is being written publishes nothing and removes the temp file", async () => {
+  const h = await harness();
+  const realWrite = fs.writeFile;
+  try {
+    const dst = path.join(h.root, "journal", RUN, h.record.captureId + ".json");
+    const before = await fs.readFile(dst);
+    let armed = true;
+    (fs as { writeFile: unknown }).writeFile = async (p: unknown, ...rest: unknown[]) => {
+      const out = await (realWrite as (...a: unknown[]) => Promise<void>)(p, ...rest);
+      if (armed && typeof p === "string" && p.startsWith(dst + ".") && p.endsWith(".tmp")) { armed = false; h.s.live = false; }
+      return out;
+    };
+    await assert.rejects(h.operate(), PredecessorAuthorityLost);
+    assert.equal(armed, false, "the hook fired on the record temp write");
+    assert.deepEqual(await fs.readFile(dst), before, "the record file was never replaced");
+    assert.deepEqual((await fs.readdir(path.join(h.root, "journal", RUN))).filter(f => f.endsWith(".tmp")), [], "the unpublished temp file is gone");
+  } finally { (fs as { writeFile: unknown }).writeFile = realWrite; await h.close(); }
 });
 
 /** Unenrolled restriction facts through both seams the coordinator consults; `onRead` sees the running read count. */
@@ -1127,6 +1172,34 @@ it("a genuine bundle failure latches integrity; the same failure caused by the o
     assert.equal(outcome.reason, "bundle_failed");
     assert.equal(outcome.predecessor, undefined, "an abort-caused failure stays unrecorded for the runner to classify");
   } finally { await aborted.close(); }
+});
+
+it("an exhausted shared decoded-closure budget is an ordinary skip under the predecessor scope; only a non-limit failure latches", async () => {
+  assert.equal(classifyPredecessorRefusal("predecessor_decoded_budget"), "ordinary");
+  const budget = await harness();
+  try {
+    budget.s.produceHook = () => { throw new RecoveryClosureLimitError(1024); };
+    const outcome = await budget.operate();
+    assert.equal(outcome.reason, "predecessor_decoded_budget");
+    assert.equal(outcome.state, "needs_action");
+    assert.equal(outcome.predecessor, undefined, "no integrity failure is latched");
+    assert.equal(budget.s.reserves + budget.s.uploads + budget.s.releases.length, 0, "nothing was dispatched");
+  } finally { await budget.close(); }
+  const control = await harness();
+  try {
+    control.s.produceHook = () => { throw new Error("pack-objects crashed"); };
+    const outcome = await control.operate();
+    assert.equal(outcome.reason, "bundle_failed");
+    assert.equal(outcome.predecessor?.integrityFailure, "bundle_failed");
+  } finally { await control.close(); }
+  // Outside a predecessor scope the same error keeps its existing classification.
+  const ordinary = await harness();
+  try {
+    ordinary.s.produceHook = () => { throw new RecoveryClosureLimitError(1024); };
+    ordinary.s.executing = false;
+    const outcome = await ordinary.coordinator.operateFrozenInventory({ record: ordinary.record, barePath: ordinary.context.barePath, defaultBranch: "main" });
+    assert.notEqual(outcome.reason, "predecessor_decoded_budget");
+  } finally { await ordinary.close(); }
 });
 
 for (const [name, binding] of [
