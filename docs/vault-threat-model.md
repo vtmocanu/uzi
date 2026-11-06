@@ -173,7 +173,9 @@ restores account access, not vault contents.
   reset never rewraps or reuses a cached key, even while the vault is unlocked,
   so it cannot be used to read the user's credentials. Forge connections,
   repos, schedules, run history, settings, CLI tokens and product OAuth grants
-  are untouched.
+  are untouched apart from credential references: the sidebar's Codex account
+  list is cleared, and references to deleted credentials in judge, worker and
+  run settings become empty.
 - **Admin takeover.** An admin can take over any non-seed account, other admins
   included, by issuing a link and redeeming it themselves with a password they
   choose. The admin never learns the user's old password and cannot read the
@@ -184,13 +186,17 @@ restores account access, not vault contents.
   account are refused. A link is void if its issuer is later deactivated or
   demoted.
 - **SSO-only instances.** With password login disabled, the new password only
-  serves to enable the vault in Settings after the user signs in through SSO.
-  Reset links for users with no password (SSO-only accounts) are not yet
+  does nothing until an administrator turns password sign-in on; uzi creates
+  the fresh vault at that first password sign-in. Until then the user can sign
+  in through SSO but has no usable vault for storing model credentials. Reset
+  links for users with no password (SSO-only accounts) are not yet
   available.
 - **Running runs.** A run already executing keeps the credential its worker was
   issued until it ends; stopping or fencing active runs is out of scope. Its
   Codex refresh writes against a deleted account fail closed. Queued runs that
-  need a deleted credential fail at claim like any other deleted credential.
+  pinned to a credential or using the default credential, and Codex runs, fail
+  at claim like any other deleted credential. Claude runs on an auto-bound
+  worker wait in the credential pool (`pool_wait`) until a credential exists.
 - **Uncertain outcome.** If the commit cannot be confirmed the redeem call
   returns `503` with "the reset could not be confirmed; try signing in with the
   new password, or ask for a new link".

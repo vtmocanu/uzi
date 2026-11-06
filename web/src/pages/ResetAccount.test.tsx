@@ -216,18 +216,18 @@ describe("ResetAccount password form", () => {
     await passwordForm(SSO_ONLY);
     expect(
       await screen.findByText(
-        /This instance signs in with single sign-on only\. After the reset, sign in with single sign-on, then\s+enable your vault in Settings using this new password\./,
+        /This instance signs in with single sign-on only, so this new password works only if an administrator\s+turns password sign-in on\./,
       ),
     ).toBeTruthy();
+    expect(document.body.textContent).not.toMatch(/Settings/);
     reply("/api/auth/reset/redeem", { status: 204 });
     fill("correct horse battery", "correct horse battery");
     fireEvent.click(ack());
     fireEvent.click(submit());
-    expect(
-      await screen.findByText(
-        "Your account is reset. Sign in with single sign-on, then enable your vault in Settings using your new password.",
-      ),
-    ).toBeTruthy();
+    const doneMsg = await screen.findByText(
+      "Your account is reset. This instance uses single sign-on only, so your new password works only if an administrator turns password sign-in on; uzi creates your fresh vault at that first password sign-in. Until then you can sign in with single sign-on, but you cannot store new model credentials.",
+    );
+    expect(doneMsg.textContent).not.toMatch(/Settings/);
     // The done state must not send them to a password sign-in that cannot work.
     expect(document.body.textContent).not.toMatch(/Sign in with your new password/);
     expect(screen.getByRole("link", { name: "Sign in with SSO" })).toBeTruthy();
@@ -244,9 +244,9 @@ describe("ResetAccount password form", () => {
     fireEvent.click(ack());
     fireEvent.click(submit());
     const done = await screen.findByText(/Your account is reset\./);
-    expect(done.textContent).toMatch(/If your instance allows password sign-in, sign in with your new password\./);
-    expect(done.textContent).toMatch(/If it uses single sign-on only, sign in that way, then enable your vault in Settings/);
-    expect(done.textContent).not.toMatch(/uzi creates a fresh vault/);
+    expect(done.textContent).toMatch(/If your instance allows password sign-in, sign in with your new password;/);
+    expect(done.textContent).toMatch(/If it uses single sign-on only, your new password works only once an administrator turns password sign-in on/);
+    expect(done.textContent).not.toMatch(/Settings/);
   });
 
   it("keeps submit disabled until the confirmation is checked", async () => {

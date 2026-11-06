@@ -103,7 +103,7 @@ func (f *resetFixture) preview(token string) *httptest.ResponseRecorder {
 }
 
 func (f *resetFixture) redeem(token, password string) *httptest.ResponseRecorder {
-	body, _ := json.Marshal(apitypes.ResetLinkRedeemRequest{Token: token, Password: password})
+	body, _ := json.Marshal(apitypes.ResetLinkRedeemRequest{Token: token, Password: password}) //nolint:gosec // G117: test marshals the redeem request DTO with a fixture password
 	return cliPostJSON(f.router, "/api/auth/reset/redeem", string(body))
 }
 
