@@ -1393,9 +1393,11 @@ phaseCp.spawn = function(...args) {
 
   it("keeps a git deadline refusal classified when the deadline passes before its timer is armed", async () => {
     // The helper's command() checks the deadline before spawning Git. Jump the
-    // clock only after that check, while holding the spawned child long enough
-    // for the command timer to fire. A negative delay makes Node print a warning
-    // ahead of the trusted refusal line, hiding the git_deadline token.
+    // clock only after that check. Keep the spawned Git child waiting on stdin
+    // until the command timer fires: SIGSTOP alone did not establish that ordering,
+    // so a fast close could let the next helper check return capture_deadline.
+    // A negative delay makes Node print a warning ahead of the trusted refusal
+    // line, hiding the git_deadline token.
     const hook = `
 const timerCp = require("node:child_process"), timerFs = require("node:fs");
 const timerSpawn = timerCp.spawn, timerNow = Date.now;
@@ -1405,7 +1407,11 @@ timerCp.spawn = function(...args) {
   const p = timerSpawn.apply(this, args);
   if (!timerHeld) {
     timerHeld = true;
-    if (!p.kill("SIGSTOP")) throw Error("could not hold the git child");
+    if (!args[1].includes("cat-file") || !args[1].some(a => a.startsWith("--batch-check")))
+      throw Error("expected the first Git child to wait for batch-check input");
+    // command() calls stdin.end(input) after arming the timer. Write the input but
+    // keep stdin open, so cat-file cannot close before the zero-delay timeout.
+    p.stdin.end = input => { if (input) p.stdin.write(input); return p.stdin; };
     timerOffset = 28001;
     timerFs.writeFileSync(__DATA__ + "/timer-held", "1");
   }
