@@ -15776,6 +15776,7 @@ export class RunRunner {
       // selection whether or not this particular resume skips the gate, and the
       // executor only reads it on the path that has no verdict to supply one.
       approvedSelection: claim.agent_selection,
+      requestedAgentSource: claim.requested_agent_source ?? null,
       signal: cancel.signal,
       terminalLifecycleSignal: steering.terminalLifecycleSignal(),
       lifecycleSignal: () => steering.lifecycleSignal(),
@@ -16370,6 +16371,7 @@ export class RunRunner {
           } : undefined,
           gatedPresentation ? { ...gatedPresentation, milestones: presentedMilestones ?? [],
             claimGeneration: flight.claimGeneration } : undefined,
+          claim.requested_agent_source,
         ).catch((error) => {
           if (checkedHuman || checkedApproval) {
             if (error instanceof CredentialSwitchSignal) {
@@ -27694,6 +27696,7 @@ export class RunRunner {
     semanticPark?: SemanticPark,
     onSemanticPresented?: (ack: StateAck) => Promise<void>,
     presentedCanonical?: Extract<PlanVerdict, { approval: "cross_check" }>["canonical"],
+    requestedSource?: AgentSource | null,
   ): Promise<PlanVerdict> {
     // PRD #1795 (decision 6): nothing is confirmed until THIS gate's own applied awaiting_approval
     // ACK says which revision it published, so a verdict bound to an earlier gate cannot act on
@@ -27729,10 +27732,12 @@ export class RunRunner {
       // templates) is resolved here, persisted via the running report (the only
       // channel a no-input run has, Decision 6), and stated on the feed. The
       // executor re-resolves the SAME absent-parse to build the identical roster.
-      const selection = resolveAgentSelection(
+      const resolved = resolveAgentSelection(
         { status: "absent" },
         repoAgents.length > 0,
-      ).selection;
+        requestedSource,
+      );
+      const selection = resolved.selection;
       // Make this report self-contained (F1): carry the roster alongside the selection
       // so both validate + persist atomically, even if the fire-and-forget running
       // roster report above failed and left the column NULL. Gated on length > 0 — on
@@ -27795,6 +27800,7 @@ export class RunRunner {
             runLog.warn("plan summary hook failed", { run_id: runId, error: errMessage(error) });
           }
         }
+        if (resolved.note) batcher.emit({ kind: "status", agent: "worker", payload: { text: resolved.note } });
         batcher.emit({
           kind: "status",
           agent: "worker",
