@@ -63,16 +63,28 @@ type fakeStore struct {
 	repoIDByPath map[string]uuid.UUID
 
 	columns map[uuid.UUID][]string // board_columns label names per repo, in insert order
+	// countErr and insertErr make the board column reads and writes fail, the
+	// database errors boot must not swallow.
+	countErr  error
+	insertErr error
 }
 
 func (s *fakeStore) CountBoardColumns(_ context.Context, repoID uuid.UUID) (int64, error) {
+	if s.countErr != nil {
+		return 0, s.countErr
+	}
 	return int64(len(s.columns[repoID])), nil
 }
-func (s *fakeStore) InsertBoardColumn(_ context.Context, arg store.InsertBoardColumnParams) error {
+func (s *fakeStore) InsertDefaultBoardColumns(_ context.Context, arg store.InsertDefaultBoardColumnsParams) error {
+	if s.insertErr != nil {
+		return s.insertErr
+	}
 	if s.columns == nil {
 		s.columns = map[uuid.UUID][]string{}
 	}
-	s.columns[arg.RepoID] = append(s.columns[arg.RepoID], arg.LabelName)
+	if len(s.columns[arg.RepoID]) == 0 {
+		s.columns[arg.RepoID] = append(s.columns[arg.RepoID], arg.LabelNames...)
+	}
 	return nil
 }
 
@@ -270,5 +282,26 @@ func TestForgeConnectionColumnFailureIsNonFatal(t *testing.T) {
 	}
 	if n := len(st.columns[st.repoIDByPath["vtmocanu/uzi"]]); n != 0 {
 		t.Fatalf("no columns may be recorded when the labels failed, got %d", n)
+	}
+}
+
+// Only the forge refusing the labels is non-fatal. A database error while the
+// seed creates the board columns must stop boot, as every other seed database
+// error does (PR #3956 review, item 5).
+func TestForgeConnectionBoardColumnDatabaseErrorIsFatal(t *testing.T) {
+	for name, st := range map[string]*fakeStore{
+		"count":  {countErr: errors.New("db down on count")},
+		"insert": {insertErr: errors.New("db down on insert")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			st.user = store.User{ID: uuid.New(), Email: "admin@uzi.test"}
+			ff := &fakeForge{
+				identity: forge.BotIdentity{ForgeUserID: 42, Username: "uzi-bot"},
+				projects: []forge.Project{{ForgeProjectID: 1, PathWithNamespace: "vtmocanu/uzi"}},
+			}
+			if err := ForgeConnection(context.Background(), st, &fakeSvc{forge: ff}, baseCfg()); err == nil {
+				t.Fatal("a database error creating the board columns must be fatal (returned), got nil")
+			}
+		})
 	}
 }

@@ -8,6 +8,7 @@ package seed
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -182,10 +183,15 @@ func ForgeConnection(ctx context.Context, q Store, svc ForgeService, cfg config.
 		}
 		// A repo turned on without board columns strands its cards (no column
 		// resolves, so an automated move reads as a person's). Give it the default
-		// columns now. Forge failures stay non-fatal here, like every other seed
-		// forge call; the first board open heals it on the next try.
+		// columns now. A forge refusal of the labels stays non-fatal, like every
+		// other seed forge call; the first board open heals it on the next try. A
+		// database error is boot-fatal, like every other seed database error.
 		if err := forgesvc.EnsureBoardColumns(ctx, q, f, repo.ID, repo.ForgeProjectID); err != nil {
-			slog.Error("seed forge: creating default board columns failed; continuing",
+			var seedErr *forgesvc.LabelSeedError
+			if !errors.As(err, &seedErr) {
+				return fmt.Errorf("seed forge: board columns for repo %q: %w", path, err)
+			}
+			slog.Error("seed forge: the forge refused the default board column labels; continuing",
 				"repo", path, "error", err)
 		}
 		enabled++
