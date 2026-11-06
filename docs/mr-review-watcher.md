@@ -412,8 +412,9 @@ after the automatic cap is reached.
   retrying. If the settings can't be read it is a 409 too; other failures on
   the way (for example a queue or verdict read error) answer 500 and still
   fail closed, starting nothing. With guidance it
-  always proceeds, and your guidance is the trigger. The assessment shares the
-  automatic watcher's 30 second deadline.
+  always proceeds, and your guidance is the trigger. The assessment has a
+  5 second deadline, shorter than the automatic watcher's 30 seconds, because
+  you wait for the answer.
 - **A reviewer who just got access.** uzi stores a "not eligible" answer for
   6 hours per repository, and an automatic rework does not ask the forge
   again in that time. So when you give a reviewer access to the repository

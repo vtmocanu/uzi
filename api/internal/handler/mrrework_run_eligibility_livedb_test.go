@@ -143,11 +143,21 @@ func TestOnDemandReworkRefusesAnOutsiderOnlyThreadLiveDB(t *testing.T) {
 	if n := rig.count(t, `SELECT count(*) FROM mr_review_author_verdicts WHERE repo_id = $1 AND forge_user_id = 22`, rig.repoID); n != 1 {
 		t.Fatalf("not-eligible verdicts recorded = %d, want 1", n)
 	}
-	// The same call again costs no lookup within the verdict TTL.
+	// A repeated manual rework re-checks the cached not-eligible author with
+	// exactly one fresh lookup (#3422), and still refuses the outsider.
 	before := rig.f.lookups.Load()
-	rig.post(t, `{}`)
-	if got := rig.f.lookups.Load(); got != before {
-		t.Fatalf("a cached not-eligible verdict cost %d lookups", got-before)
+	rec = rig.post(t, `{}`)
+	if got := rig.f.lookups.Load(); got != before+1 {
+		t.Fatalf("a repeated manual rework made %d lookups for the cached not-eligible author, want 1", got-before)
+	}
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "nothing to rework") {
+		t.Fatalf("repeat: status %d body %s, want the nothing-to-rework 409", rec.Code, rec.Body.String())
+	}
+	if rig.reworkRuns(t) != 0 {
+		t.Fatal("a repeated manual rework created a run for an outsider-only comment set")
+	}
+	if n := rig.count(t, `SELECT count(*) FROM mr_review_author_verdicts WHERE repo_id = $1 AND forge_user_id = 22`, rig.repoID); n != 1 {
+		t.Fatalf("not-eligible verdicts recorded after repeat = %d, want 1", n)
 	}
 }
 
