@@ -1015,6 +1015,11 @@ type Store interface {
 	HoldCredentialSwitchUnsettled(ctx context.Context, arg store.HoldCredentialSwitchUnsettledParams) (int64, error)
 	SettleCredentialSwitchHold(ctx context.Context, arg store.SettleCredentialSwitchHoldParams) (int64, error)
 	CredentialSwitchHoldSettling(ctx context.Context, arg store.CredentialSwitchHoldSettlingParams) (bool, error)
+	// SettleRunClarificationToGate / GetClarificationGateSettlementReplay are the issue #3985
+	// clarification-during-human-revision settlement: the fenced awaiting_input ->
+	// awaiting_approval move and its read-only lost-ACK replay (clarification_settlement.go).
+	SettleRunClarificationToGate(ctx context.Context, arg store.SettleRunClarificationToGateParams) (int64, error)
+	GetClarificationGateSettlementReplay(ctx context.Context, arg store.GetClarificationGateSettlementReplayParams) (bool, error)
 	// ClearCompletionBudgetExhausted clears the served budget_exhausted steer
 	// (completion_budget_exhausted_at) on the owner's CONTINUE decision (PRD #1226 M5, D3): a
 	// new owner decision is the third of D3's clears (alongside the worker acting on it /
@@ -4116,7 +4121,13 @@ type StateRequest struct {
 	RequireRunning bool `json:"require_running,omitempty"`
 	// CompletionFinalHead is the durably delivered final SHA, negotiated separately from permits.
 	CompletionFinalHead *string `json:"completion_final_head,omitempty"`
-	State               string  `json:"status"` // running|awaiting_approval|awaiting_input|awaiting_followup|limit_wait|recovery_wait|paused|pause_failed|credential_switch|credential_switch_failed|credential_switch_held|credential_switch_hold_settled|completed|failed
+	State               string  `json:"status"` // running|awaiting_approval|awaiting_input|awaiting_followup|limit_wait|recovery_wait|paused|pause_failed|credential_switch|credential_switch_failed|credential_switch_held|credential_switch_hold_settled|clarification_settled|completed|failed
+	// ClarificationSettlement (issue #3985, feature clarification_revision_settlement_v1) names the
+	// answered question, the pending human revise and the gate revision a clarification_settled
+	// report settles back to awaiting_approval. It is valid only on, and required by,
+	// status clarification_settled; httpx.DecodeJSON rejects unknown fields, so the field MUST
+	// exist here or a new worker's report 400s.
+	ClarificationSettlement *ClarificationSettlement `json:"clarification_settlement,omitempty"`
 	// ClaimGeneration is the runs.claim_generation the worker believes it holds (PRD #1247
 	// M5, D3). A CAPABILITY worker (credential_switch_v1) stamps it on EVERY mutating report;
 	// SetState then fences the transition atomically on `claim_generation = @gen AND
@@ -4528,6 +4539,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	if err := validateRevisionRetry(req); err != nil {
 		return store.Run{}, false, err
 	}
+	if err := validateClarificationSettlementShape(req); err != nil {
+		return store.Run{}, false, err
+	}
 	if req.RequireRunning && (req.State != "awaiting_input" || req.ClaimGeneration == nil || *req.ClaimGeneration <= 0) {
 		return store.Run{}, false, fmt.Errorf("%w: require_running requires awaiting_input and positive claim_generation", ErrInvalidState)
 	}
@@ -4606,18 +4620,28 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	}
 	if s.txBeginner == nil && parentTx == nil && semanticCompletionRequiresLock(owned) &&
 		(stateUsesGenerationFence(req.State, owned) || req.State == "pause_failed" ||
+			req.State == stateClarificationSettled ||
 			((req.State == "credential_switch" || req.State == "credential_switch_failed") && req.ClaimGeneration != nil)) {
 		return owned, false, ErrSemanticCompletionAuthority
 	}
 	// Withdrawal/release helpers have their own short claim transaction; they must
 	// not nest beneath the generic state fence on another connection.
 	if s.txBeginner != nil && (req.State == "pause_failed" || req.State == "credential_switch" || req.State == "credential_switch_failed" ||
-		req.State == stateCredentialSwitchHeld || req.State == stateCredentialSwitchHoldSettled) {
+		req.State == stateCredentialSwitchHeld || req.State == stateCredentialSwitchHoldSettled ||
+		req.State == stateClarificationSettled) {
 		locked, _, tx, err := s.beginClaimMutation(ctx, wkr, runID, req.ClaimGeneration)
 		if err != nil {
 			return owned, false, err
 		}
 		defer func() { _ = tx.Rollback(ctx) }()
+		if req.State == stateClarificationSettled {
+			// beginClaimMutation holds the worker and run locks; set the publication-resume and
+			// checkpoint opt-ins now, as the generic fenced path does, so the run write is admitted
+			// identically for an enrolled run.
+			if err := optInRunFences(ctx, store.New(tx), wkr.ID, true); err != nil {
+				return owned, false, err
+			}
+		}
 		locked.bcast = nil
 		locked.lifecycle = nil
 		current, applied, err := locked.setStateWithTx(ctx, wkr, runID, req, nil, nil, tx)
@@ -4634,7 +4658,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		if applied && s.bcast != nil {
 			s.bcast.PublishState(runID, current.Status)
 		}
-		if applied && current.Status != owned.Status {
+		// clarification_settled returns the run to the gate it already announced: no new
+		// "awaiting approval" notification and no presentation (issue #3985, ADR-2149 D16).
+		if applied && current.Status != owned.Status && req.State != stateClarificationSettled {
 			s.notify(runID, current.Status)
 		}
 		return current, applied, nil
@@ -4703,6 +4729,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	}
 	if req.State == stateCredentialSwitchHoldSettled {
 		return s.settleCredentialSwitchHold(ctx, owned, wkr, req)
+	}
+	if req.State == stateClarificationSettled {
+		return s.settleClarificationToGate(ctx, owned, wkr, req)
 	}
 	// PRD #1908 D-E: a job never parks. The job runner reports only running/completed/failed, and
 	// pauseRefusalReason already refuses an owner pause, so a park report for a job is a protocol
