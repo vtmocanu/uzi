@@ -11303,25 +11303,24 @@ export class GitCache {
     const same = (a: Set<string>, b: Set<string>) => a.size === b.size && [...a].every(id => b.has(id));
     const signature = (st: import("node:fs").BigIntStats) =>
       [st.dev, st.ino, st.mode, st.nlink, st.uid, st.gid, st.size, st.mtimeNs, st.ctimeNs].join(":");
-    // One observation of every store. The TOPOLOGY comes first and overflows are deferred while it runs: every
-    // store's config, object root, `info` and `pack` names, and the whole alternate graph are read and classified
-    // before any object content is charged, so an UNKNOWN-class indirection or an illegal name can never be hidden
-    // behind a content overflow (and a name is classified as it is read, before it is counted). A deferred overflow is
-    // raised only after the topology (and `afterTopology`) found nothing UNKNOWN. Residual: corrupt bytes lying beyond
-    // the point where a budget ended the observation were never handed to zlib or parsed, so they cannot turn that
-    // overflow into UNKNOWN; every byte up to that point was inspected before it was charged.
+    // One observation of every store. The TOPOLOGY comes first: every store's config, object root, `info` and `pack`
+    // names, and the whole alternate graph are read and classified before any object content is charged, so an
+    // UNKNOWN-class indirection or an illegal name can never be hidden behind a content overflow (and a name is
+    // classified as it is read, before it is counted). ANY overflow during the topology stage, whatever its kind
+    // (byte, entry, edge, store count, config listing), is UNKNOWN: the part of the topology past the limit (an
+    // alternate line, a pack member, a config key) was never read and may hold an indirection. Overflows are settled
+    // keeps only in the content stage (and the worktree/shape budgets). Residual: a content-stage overflow in one
+    // store ends the observation, so corruption in a LATER store's content is never reached; accepted, because the
+    // source is kept either way. Likewise corrupt bytes beyond the point where a content budget ended the observation
+    // were never handed to zlib or parsed; every byte up to that point was inspected before it was charged.
     const snapshot = async (afterTopology?: () => Promise<void>) => {
       let entries = 0, bytes = 0, occurrences = 0, edges = 0;
-      let deferring = false;
-      let pending: AutomaticBoundExceeded | undefined;
+      let topologyStage = true;
       const rows = new Map<string, string>();
       type Store = { ids: Set<string>; alternates: string[]; names: string[]; pack?: string[] };
       const stores = new Map<string, Store>();
       const pairs = new Set<string>();
-      const over = (message: string): void => {
-        if (!deferring) exceeded(message);
-        pending ??= new AutomaticBoundExceeded(message);
-      };
+      const over = (message: string): never => topologyStage ? unknown(message) : exceeded(message);
       // `bytes` is local to one snapshot: the budget resets for each of the proof's snapshots. It counts bytes
       // actually inspected: metadata read and parsed, input zlib took, output it produced, content a delta instruction
       // generated. Never a size a file declares and never a read-ahead window that was not yet inspected.
@@ -11344,31 +11343,24 @@ export class GitCache {
         }
       };
       // Each name is classified (`classify` throws UNKNOWN for an illegal one) as it is read, before it is counted.
-      // `fixedSet` marks a directory whose legal names are few (`objects/`: 258, `objects/info`: 4): a deferred entry
-      // overflow keeps reading it, which is bounded because an illegal name ends the read. Other directories stop at
-      // the overflow (names past it are the unobservable residual).
-      const directory = async (p: string, classify?: (name: string) => void, fixedSet = false) => {
+      const directory = async (p: string, classify?: (name: string) => void) => {
         const st = await stat(p);
         if (!st?.isDirectory()) unknown("object directory type");
         let handle: import("node:fs").Dir | undefined;
         const names: string[] = [];
-        let cut = false;
         try {
           await read(async () => { handle = await fs.opendir(p, { bufferSize: 1 }); });
           for (;;) {
             const entry = await read(() => handle!.read());
             if (!entry) break;
             classify?.(entry.name);
-            if (++entries > limits.maxDirectoryEntries) {
-              over("object directory entry limit");
-              if (!fixedSet) { cut = true; break; }
-            }
+            if (++entries > limits.maxDirectoryEntries) over("object directory entry limit");
             MaintenanceResources.consumeIfActive("adminEntries", 1);
             charge(Buffer.byteLength(entry.name)); names.push(entry.name);
           }
         } finally { if (handle) await this.automaticPreservationClose(automatic, () => handle!.close()); }
         rows.set(p + "/", JSON.stringify(names.sort()));
-        return { names, cut };
+        return { names };
       };
       type Opened = {
         size: number;
@@ -11428,7 +11420,7 @@ export class GitCache {
         const p = path.join(root, "info");
         const { names: members } = await directory(p, member => {
           if (!["commit-graphs", "commit-graph", "packs", "alternates"].includes(member)) unknown("unsupported object info entry");
-        }, true);
+        });
         for (const member of members) {
           const full = path.join(p, member);
           if (member === "commit-graphs") {
@@ -11446,12 +11438,11 @@ export class GitCache {
             const text = data.toString("utf8");
             if (text && !text.endsWith("\n")) unknown("unterminated alternates");
             for (const line of text ? text.slice(0, -1).split("\n") : []) {
-              // Syntax and the managed-path rule come first: a line past the edge limit is still checked.
               if (!/^[!-~]+$/.test(line) || /["\\]/.test(line)) unknown("unsupported alternate syntax");
               const target = path.resolve(root, line);
               // EX covers managed stores only. Fingerprints alone do not exclude outside writers.
               if (target !== source && target !== bare && !managed(target)) unknown("alternate writer exclusion unavailable");
-              if (++edges > limits.maxMetadataRecords) { over("alternate edge limit"); continue; }
+              if (++edges > limits.maxMetadataRecords) over("alternate edge limit");
               store.alternates.push(target);
             }
           }
@@ -11467,7 +11458,6 @@ export class GitCache {
               !/^pack-[0-9a-f]{40}\.(pack|idx|keep|promisor|rev|bitmap|mtimes)$/.test(member)) unknown("unsupported pack entry");
         });
         store.pack = listing.names;
-        if (listing.cut) return;
         const present = new Set(listing.names);
         for (const member of listing.names) {
           const full = path.join(p, member);
@@ -11491,7 +11481,7 @@ export class GitCache {
       };
       const topology = async (root: string): Promise<void> => {
         if (stores.has(root)) return;
-        if (stores.size >= limits.maxMetadataRecords) { over("object store limit"); return; }
+        if (stores.size >= limits.maxMetadataRecords) over("object store limit");
         // EX covers managed stores only. Fingerprints alone do not exclude outside writers.
         const managedBare = managed(root);
         if (root !== source && root !== bare && !managedBare) unknown("alternate writer exclusion unavailable");
@@ -11513,11 +11503,9 @@ export class GitCache {
           listing = parsed.stdout;
           this.automaticCollection(listing, "\0");
         } catch (error) {
-          // Lead decision: ANY overflow of a TOPOLOGY observation is UNKNOWN, because the indirection it may hold
-          // (an alternate, partialclone, a config include) cannot be observed past the limit. That covers a config
-          // listing whose stdout overran the byte cap or the record limit, an over-cap config or alternates file and
-          // any other topology read. Overflows are settled keeps only in the content stage and the worktree/shape
-          // stages, never here.
+          // A config listing whose stdout overran the byte cap or the record limit is UNKNOWN: the indirection it may
+          // hold (an alternate, partialclone, a config include) cannot be observed past the limit. The other topology
+          // reads (entry, edge, store and byte limits) raise UNKNOWN through `over` while `topologyStage` holds.
           if (isBoundOverflow(error)) unknown("object topology listing exceeds the observation limit");
           throw error;
         }
@@ -11537,7 +11525,7 @@ export class GitCache {
         stores.set(root, store);
         store.names = (await directory(root, name => {
           if (!/^[0-9a-f]{2}$/.test(name) && name !== "pack" && name !== "info") unknown("unsupported object root entry");
-        }, true)).names;
+        })).names;
         if (store.names.includes("info")) await topologyInfo(root, store);
         if (store.names.includes("pack")) await topologyPack(root, store);
         for (const absent of ["pack", "info"]) if (!store.names.includes(absent)) await stat(path.join(root, absent), true);
@@ -11794,11 +11782,9 @@ export class GitCache {
           }
         }
       };
-      deferring = true;
       await topology(source); await topology(bare);
-      deferring = false;
       await afterTopology?.();
-      if (pending) throw pending;
+      topologyStage = false;
       for (const root of stores.keys()) await content(root);
       const expected = (root: string) => {
         const seen = new Set<string>(), ids = new Set<string>();

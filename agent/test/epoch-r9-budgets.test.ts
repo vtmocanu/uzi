@@ -200,13 +200,25 @@ describe("defaults and the test seam", () => {
   }
 });
 
-// Each finite limit, lowered through the test seam, must end the proof as a settled keep.
+// Each finite CONTENT-stage (and worktree/shape-stage) limit, lowered through the test seam, must end the proof as a
+// settled keep. An overflow while the object-store topology is read is UNKNOWN instead (see the topology describes).
 // `viaDiscard: false` marks a limit so low that the discard core's own retained inspection, which runs before the
 // content proof under the same limits, is UNKNOWN first; the content proof is still pinned through `observation`.
 const overflows: { name: string; limits: Limits; via: "stores" | "reason"; match: RegExp; prepare?: () => void;
   viaDiscard?: boolean }[] = [
-  { name: "maxObjectStoreBytes (object-store snapshot bytes)", limits: { maxObjectStoreBytes: 2048 }, via: "stores",
-    match: /object metadata byte limit/ },
+  // Content stage only: the topology fits the budget, then 600 valid loose objects overflow it.
+  { name: "maxObjectStoreBytes (object-store snapshot bytes in the content stage)", limits: { maxObjectStoreBytes: 64 * 1024 },
+    via: "stores", match: /object metadata byte limit/,
+    prepare: () => {
+      const dir = path.join(fx.dataDir, "loose-inputs");
+      fs.mkdirSync(dir, { recursive: true });
+      const files = Array.from({ length: 600 }, (_, i) => {
+        const file = path.join(dir, `f${i}`);
+        fs.writeFileSync(file, `loose ${i}\n`);
+        return file;
+      });
+      execFileSync("git", ["-C", clonePath, "hash-object", "-w", "--stdin-paths"], { env: ENV, input: files.join("\n") + "\n" });
+    } },
   { name: "maxObjectStoreBytes (a loose object whose header declares past the budget)",
     limits: { maxObjectStoreBytes: 256 * 1024 }, via: "stores", match: /loose output byte limit/,
     prepare: () => {
@@ -219,8 +231,13 @@ const overflows: { name: string; limits: Limits; via: "stores" | "reason"; match
       for (let i = 0; i < 150; i++)
         execFileSync("git", ["-C", bare, "hash-object", "-w", "--stdin"], { env: ENV, input: `occurrence ${i}\n` });
     } },
-  { name: "maxDirectoryEntries (object directory entries)", limits: { maxDirectoryEntries: 1 }, via: "stores",
-    match: /object directory entry limit/ },
+  { name: "maxDirectoryEntries (a loose fan-out directory past the default limit)", limits: {}, via: "stores",
+    match: /object directory entry limit/,
+    prepare: () => {
+      const dir = path.join(objectDir(clonePath), "00");
+      fs.mkdirSync(dir, { recursive: true });
+      for (let i = 0; i < 16_400; i++) fs.writeFileSync(path.join(dir, i.toString(16).padStart(38, "0")), "");
+    } },
   { name: "maxMetadataBytes (config, index and every Git output)", limits: { maxMetadataBytes: 64 }, via: "reason",
     match: /metadata byte limit/, viaDiscard: false },
   // The limit itself ("index: index entry limit"), not any other "index: ..." refusal such as a checksum mismatch.
@@ -371,6 +388,17 @@ describe("UNKNOWN is preserved for anything that is not a positively identified 
     assert.equal(await observation(), true, "control: the same store is provable under the default cap");
     await assertUnknownUnder({ maxMetadataBytes: 8192 });
   });
+  it("a runner-side local config listing past the record limit is UNKNOWN, while the topology read fits", async t => {
+    const original = git["execScoped"].bind(git);
+    t.mock.method(git as unknown as { execScoped: typeof original }, "execScoped", async (...args: Parameters<typeof original>) => {
+      if (args[1].includes("config") && args[1].includes("--local"))
+        return { stdout: "x.k\nv\0".repeat(131_073), stderr: "" };
+      return original(...args);
+    });
+    const error = await failure(observeStores());
+    assert.equal(error.name, "AutomaticCompletenessUnknown");
+    assert.equal(error.message, "object config listing exceeds the observation limit");
+  });
   it("a 630 KB clone config with partialclone and 90,000 rows under 250-character sections is UNKNOWN at the default caps", async t => {
     const section = "s".repeat(250);
     fs.appendFileSync(path.join(clonePath, ".git", "config"),
@@ -491,11 +519,11 @@ describe("the topology is decided before content is charged", () => {
     assert.equal(error.name, "AutomaticCompletenessUnknown");
     assert.match(error.message, /alternate writer exclusion unavailable/);
   });
-  it("an illegal name in a fixed-set directory is UNKNOWN even after more entries than the limit", async () => {
+  it("a topology directory past the entry limit is UNKNOWN, whatever it holds", async () => {
     fs.writeFileSync(path.join(objectDir(clonePath), "info/zz-not-legal"), "");
     const error = await failure(observeStores({ maxDirectoryEntries: 1 }));
     assert.equal(error.name, "AutomaticCompletenessUnknown");
-    assert.match(error.message, /unsupported object info entry/);
+    assert.match(error.message, /unsupported object info entry|object directory entry limit/);
   });
   it("an oversized packed-refs does not hide an outside alternate in the clone shape stage", async () => {
     outside();
@@ -525,17 +553,12 @@ describe("the alternate edge limit", () => {
     writeAlternates(valid(3));
     assert.equal(await observation(lowered), true);
   });
-  it("more valid lines than the cap is a settled keep", async () => {
-    writeAlternates(valid(45));
-    const error = await failure(observeStores(lowered));
-    assert.equal(error.name, "AutomaticBoundExceeded");
-    assert.match(error.message, /alternate edge limit/);
-    assert.equal(await observation(lowered), false);
-  });
+  // Lines past the cap are never traversed, so crossing it is a topology overflow: UNKNOWN, never a keep.
   for (const [label, lines, message] of [
+    ["more valid lines than the cap", () => valid(45), /alternate edge limit/],
     ["an invalid line before the cap", () => ["not a valid line", ...valid(44)], /unsupported alternate syntax/],
-    ["an invalid line after the cap", () => [...valid(45), "not a valid line"], /unsupported alternate syntax/],
-    ["an outside path after the cap", () => [...valid(45), "/tmp/outside/objects"], /alternate writer exclusion unavailable/],
+    ["an invalid line after the cap", () => [...valid(45), "not a valid line"], /alternate edge limit/],
+    ["an outside path after the cap", () => [...valid(45), "/tmp/outside/objects"], /alternate edge limit/],
   ] as const) {
     it(label + " is UNKNOWN", async () => {
       writeAlternates(lines());
@@ -548,33 +571,34 @@ describe("the alternate edge limit", () => {
 });
 
 // ---------------------------------------------------------------------------------------------------------------
-// Re-reads: the first instance of an observation keeps its overflow-is-keep behaviour; a limit overflow in its repeat
-// means the store changed, which is UNKNOWN.
+// Re-reads and Git inventories: the mocks sit under the real runGitAsRunner/runGitWithEnv wrappers (at execScoped), which
+// wrap every child failure in a plain Error, so a Git output overrun never reaches the proof as a limit overflow. Both
+// the first read and its repeat are UNKNOWN.
 
-describe("an overflow while re-reading is UNKNOWN, not a settled keep", () => {
+describe("an overflow of a Git inventory read is UNKNOWN, not a settled keep", () => {
   const overrun = () => Object.assign(new Error("git subprocess maxBuffer exceeded"), {
     outputExceeded: true, outputStream: "stdout", code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", epochProcessJoined: true });
-  const sites = {
-    "the source inventory": ["runGitAsRunner", (args: string[]) => args.includes("--batch-all-objects")],
-    "the bare inventory": ["runGitWithEnv", (args: string[]) => args.includes("--batch-all-objects")],
-    "the clone refs": ["runGitAsRunner", (args: string[]) => args.includes("for-each-ref")],
-    "the trusted-root closure": ["runGitWithEnv", (args: string[]) => args.includes("rev-list")],
-  } as const;
-  for (const [label, [method, matches]] of Object.entries(sites)) {
+  const sites: Record<string, (args: string[]) => boolean> = {
+    "the source inventory": args => args.includes("--batch-all-objects") && args.includes(clonePath),
+    "the bare inventory": args => args.includes("--batch-all-objects") && args.includes(bare),
+    "the clone refs": args => args.includes("for-each-ref") && args.includes("--format=%(objectname) %(refname) %(symref)"),
+    "the trusted-root closure": args => args.includes("rev-list"),
+  };
+  for (const [label, matches] of Object.entries(sites)) {
     it(label, async t => {
-      const original = (git as never as Record<string, (...a: unknown[]) => Promise<unknown>>)[method]!.bind(git);
+      const original = git["execScoped"].bind(git);
       let seen = 0, failAt = 1;
-      t.mock.method(git as never, method as never, (async (...args: unknown[]) => {
-        if (matches(args[1] as string[]) && ++seen === failAt) throw overrun();
+      t.mock.method(git as unknown as { execScoped: typeof original }, "execScoped", async (...args: Parameters<typeof original>) => {
+        if (matches(args[1]) && ++seen === failAt) throw overrun();
         return original(...args);
-      }) as never);
-      // First instance: a joined stdout overrun of the first read is the settled keep.
-      assert.equal(await observation(), false);
+      });
+      // First instance: the real wrapper turns the overrun into an unreadable inventory, which is UNKNOWN.
+      await assert.rejects(observation(), e => (e as Error).constructor.name === "AutomaticCompletenessUnknown" &&
+        /object coverage unavailable/.test((e as Error).message));
       assert.equal(seen, 1);
       // The repeat of the same read, after the first fit: UNKNOWN.
       seen = 0; failAt = 2;
-      await assert.rejects(observation(), e => (e as Error).constructor.name === "AutomaticCompletenessUnknown" &&
-        /object observations changed/.test((e as Error).message));
+      await assert.rejects(observation(), e => (e as Error).constructor.name === "AutomaticCompletenessUnknown");
       assert.equal(seen, 2);
     });
   }
@@ -600,7 +624,7 @@ describe("an overflow while re-reading is UNKNOWN, not a settled keep", () => {
 // ---------------------------------------------------------------------------------------------------------------
 // No pending overflow may absorb an UNKNOWN-class observation, and nothing is charged before it was inspected.
 
-describe("a pending topology overflow never hides an UNKNOWN-class observation", () => {
+describe("a topology overflow is UNKNOWN and never hides an UNKNOWN-class observation", () => {
   const packJunk = (n: number) => {
     const dir = path.join(objectDir(clonePath), "pack");
     fs.mkdirSync(dir, { recursive: true });
@@ -620,11 +644,25 @@ describe("a pending topology overflow never hides an UNKNOWN-class observation",
     assert.equal(error.name, "AutomaticCompletenessUnknown");
     if (message) assert.match(`${error.message} ${error.cause?.code ?? ""}`, message);
   }
-  it("control: 16,400 pack junk entries alone are a settled keep", async () => {
+  it("control: 16,400 pack junk entries alone are UNKNOWN, a topology overflow", async () => {
     packJunk(16_400);
-    const error = await failure(observeStores());
-    assert.equal(error.name, "AutomaticBoundExceeded");
-    assert.match(error.message, /object directory entry limit/);
+    await assertUnknownStores({}, /object directory entry limit/);
+  });
+  it("a symlinked .idx behind 16,400 pack junk entries is UNKNOWN", async () => {
+    packJunk(16_400);
+    const name = "pack-" + "a".repeat(40);
+    const dir = path.join(objectDir(clonePath), "pack");
+    fs.writeFileSync(path.join(dir, name + ".pack"), "");
+    fs.writeFileSync(path.join(fx.dataDir, "elsewhere.idx"), "");
+    fs.symlinkSync(path.join(fx.dataDir, "elsewhere.idx"), path.join(dir, name + ".idx"));
+    await assertUnknownStores({});
+    await assert.rejects(observation(), e => (e as Error).constructor.name === "AutomaticCompletenessUnknown");
+  });
+  it("an orphan .pack behind 16,400 pack junk entries is UNKNOWN", async () => {
+    packJunk(16_400);
+    fs.writeFileSync(path.join(objectDir(clonePath), "pack", "pack-" + "b".repeat(40) + ".pack"), "");
+    await assertUnknownStores({});
+    await assert.rejects(observation(), e => (e as Error).constructor.name === "AutomaticCompletenessUnknown");
   });
   it("partialclone plus an unknown extension, behind 16,400 pack junk entries, is UNKNOWN", async () => {
     cloneConfig("core.repositoryformatversion", "1");
@@ -639,13 +677,11 @@ describe("a pending topology overflow never hides an UNKNOWN-class observation",
     packJunk(16_400);
     await assertUnknownStores({});
   });
-  it("a timeout of the config launch, behind 16,400 pack junk entries, is UNKNOWN", async t => {
-    packJunk(16_400);
+  it("a timeout of the config launch is UNKNOWN", async t => {
     localConfigFails(t, () => Object.assign(new Error("git subprocess timed out"), { killed: true }));
     await assertUnknownStores({});
   });
-  it("a revocation during the config launch, behind 16,400 pack junk entries, is UNKNOWN", async t => {
-    packJunk(16_400);
+  it("a revocation during the config launch is UNKNOWN", async t => {
     const original = git["runGitAsRunner"].bind(git);
     t.mock.method(git as unknown as { runGitAsRunner: typeof original }, "runGitAsRunner", async (...args: Parameters<typeof original>) => {
       if (args[1].includes("config") && args[1].includes("--local")) live = false;

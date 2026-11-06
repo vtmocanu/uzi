@@ -91,16 +91,6 @@ async function unknown(limits: { maxMetadataRecords?: number; maxMetadataBytes?:
     (!reason || reason.test((error as Error).message)));
 }
 
-/** The object-store snapshot alone ends in a settled keep for exactly this limit. */
-async function exceeded(limits: { maxMetadataRecords?: number; maxMetadataBytes?: number }, reason: RegExp): Promise<void> {
-  const proof = git.createEpochDiscardProof(input);
-  const state = git["epochDiscardProofs"].get(proof)!;
-  await assert.rejects(git["epochRetained"].run(git["epochLimits"](limits), () => git["withEpochNativeReads"](proof, () => {
-    const automatic = { roots: [], checkLive: () => git["checkEpochDiscardLive"](state) };
-    return git["automaticObserveStores"](bare, clonePath, automatic as never);
-  })), error => (error as Error).constructor.name === "AutomaticBoundExceeded" && reason.test((error as Error).message));
-}
-
 const sourceObjects = () => path.join(clonePath, ".git", "objects");
 const bareObjects = () => path.join(bare, "objects");
 function packObjects(cwd: string, ids: string[]): string {
@@ -237,10 +227,17 @@ describe("R1 coverage spans clone, bare and a bounded alternates closure", () =>
     chain(3);
     assert.equal(await observation(limits), true, "control: a short chain is within the bound");
     chain(names.length);
-    // Past the store bound is a positively identified overflow: a settled keep, not UNKNOWN.
-    await exceeded(limits, /object store limit/);
-    assert.equal(await observation(limits), false);
+    // Past the store bound is a topology overflow: the stores beyond it were never read, so UNKNOWN, not a keep.
+    await unknown(limits, /object store limit/);
     assert.equal(journal(), raw);
+  });
+  it("partialclone in a managed alternate listed after the edge cap is UNKNOWN, not a keep", async () => {
+    const alt = alternate("edge-alt.git");
+    command(alt, "config", "extensions.partialclone", "origin");
+    const own = bareObjects();
+    // Past the cap of 40, the sibling store is never traversed: the answer must still not be a keep.
+    setAlternates([...Array.from({ length: 45 }, () => own), path.join(alt, "objects")]);
+    await unknown({ maxMetadataRecords: 40 }, /alternate edge limit/);
   });
 });
 
