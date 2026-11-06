@@ -1448,6 +1448,11 @@ export class SteeringChannel {
    *  it leads to already ends the flight; a pending owner pause is re-seeded from the claim on the
    *  resume). */
   private pauseMode: PauseMode = null;
+  /** Open deferOwnerPauseNow windows (nesting-safe counter). */
+  private ownerPauseDeferrals = 0;
+  /** An owner `now` pause was recorded (not acted on) inside a deferral window. Only a live routed
+   *  `pause` sets it; a claim-seeded pause never does. */
+  private deferredPauseNow = false;
   /** PRD #1190 rework (N2): a RE-ARMABLE interrupt the executor registers (via ctx.onPauseNow) so a
    *  `now` pause can drop the in-flight turn EVERY time — not only the first. The shared cancel
    *  AbortController fires 'abort' exactly once, so a SECOND `now` after a declined park (which
@@ -1661,6 +1666,25 @@ export class SteeringChannel {
    *  regressed — see seedPauseRequested. Also read by the M2 tests. */
   getPauseMode(): PauseMode {
     return this.pauseMode;
+  }
+
+  /** Open a window in which a routed owner `now` pause is only recorded (no cancel abort, no
+   *  lifecycle abort, no interrupt). Nesting-safe; the returned release is idempotent. Used around
+   *  retained re-claim recovery so a pause delivered mid-recovery cannot stop the run before the
+   *  runner settles it as a checkpointed pause. */
+  deferOwnerPauseNow(): () => void {
+    this.ownerPauseDeferrals++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.ownerPauseDeferrals--;
+    };
+  }
+
+  /** True when an owner `now` pause was recorded inside a deferral window and is still pending. */
+  deferredPauseNowPending(): boolean {
+    return this.deferredPauseNow && this.pauseMode === "now";
   }
 
   /**
@@ -2685,6 +2709,15 @@ export class SteeringChannel {
         // PRD #1809 D4: a worker-local disk stop already dropping this flight's turn keeps its
         // route to the disk park; the owner's pause stays pending server-side for the resume.
         if (this.pauseMode === "disk") break;
+        // Retained re-claim recovery window (deferOwnerPauseNow): an owner `now` is only RECORDED
+        // so recovery is not torn down; the runner settles it through the ordinary pause park once
+        // recovery has returned. `wall` is system-authored and keeps its immediate drop, and a
+        // pending `wall` is never overwritten by a deferred `now`.
+        if (mode === "now" && this.ownerPauseDeferrals > 0 && this.pauseMode !== "wall") {
+          this.pauseMode = mode;
+          this.deferredPauseNow = true;
+          break;
+        }
         this.pauseMode = mode;
         if (mode === "now" || mode === "wall") {
           const signal = new PauseNowSignal();
@@ -2706,7 +2739,10 @@ export class SteeringChannel {
         // columns stay set too). Only clearWallMode (a refused wall_park) or the park landing clears
         // it. A `wall` mode therefore SURVIVES a pause_cancel here.
         // PRD #1809 D4: nor can it clear a worker-local `disk` stop, which is not an owner pause.
-        if (this.pauseMode !== "wall" && this.pauseMode !== "disk") this.pauseMode = null;
+        if (this.pauseMode !== "wall" && this.pauseMode !== "disk") {
+          this.pauseMode = null;
+          this.deferredPauseNow = false;
+        }
         break;
       case "follow_up":
         // issue #559 M2: carry the input id alongside the body so a delivery (takeFollowUp)

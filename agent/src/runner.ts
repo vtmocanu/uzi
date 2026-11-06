@@ -6246,6 +6246,8 @@ export class RunRunner {
         flight.preserveSession = true;
         flight.retainedLocalCustody = true;
         flight.keepGuardedInventoryOpen = true;
+        flight.recoveryRetentionCause ??= "retained recovery stopped" +
+          (flight.steering.getPauseMode() === "now" ? " with an owner pause pending" : "");
         if (err instanceof RetainedRecoveryCancelled && !flight.active?.shuttingDown &&
             !this.shuttingDownGlobal && flight.steering.claimFence() === undefined) {
           await this.reportGenericFailure(claim, flight, new Error("run cancelled"), { keepCustody: true });
@@ -14477,6 +14479,22 @@ export class RunRunner {
     const runId = claim.run_id;
     const runnerClone = flight.runnerClone!;
     const barePath = flight.barePath;
+    // An owner `now` pause delivered while retained re-claim recovery ran was only recorded
+    // (SteeringChannel.deferOwnerPauseNow). Settle it here, before any provider or summary call, through
+    // the ordinary PauseNowSignal arm (checkpoint-first, paused-ACK confirmed) - but only when no
+    // stronger control is pending, so cancel, switch, fence, shutdown and checkpoint authority keep
+    // their own outcomes.
+    if (
+      steering.deferredPauseNowPending() &&
+      !flight.cancel.signal.aborted &&
+      !steering.lifecycleSignal().aborted &&
+      steering.pendingCredentialSwitch() === undefined &&
+      !steering.checkpointAuthoritySignal().aborted &&
+      !steering.terminalLifecycleSignal().aborted &&
+      !steering.isCancelled() &&
+      steering.claimFence() === undefined &&
+      !flight.active?.shuttingDown && !this.shuttingDownGlobal
+    ) throw new PauseNowSignal();
     // Tell the lead whenever the branch it is standing on already carries commits it did
     // not make this turn, so the honest degradation never becomes silently duplicated work.
     // PRD #218 M3 widened the condition to `priorCommits > 0` alone: it previously fired
@@ -26595,6 +26613,20 @@ export class RunRunner {
    * needs an unconsumed raw owner grant and a newer owned claim; other blockers persist.
    * Each failed capture blocks only this run; waits are bounded by the persisted episode clock. */
   private async recoverRetainedClaim(
+    claim: ClaimResponse, flight: RunFlight, key: string, source: RecoveryJournalEntry,
+  ): Promise<void> {
+    // A delivered owner `now` pause is only recorded while recovery runs (it would otherwise abort the
+    // shared lifecycle and make retainedLifecycleGuard stop the run, charging an automatic requeue);
+    // phasePreflightHandoff settles it through the ordinary checkpointed pause park afterwards.
+    const releaseOwnerPauseDeferral = flight.steering.deferOwnerPauseNow();
+    try {
+      await this.recoverRetainedClaimBody(claim, flight, key, source);
+    } finally {
+      releaseOwnerPauseDeferral();
+    }
+  }
+
+  private async recoverRetainedClaimBody(
     claim: ClaimResponse, flight: RunFlight, key: string, source: RecoveryJournalEntry,
   ): Promise<void> {
     const bare = flight.barePath!;
