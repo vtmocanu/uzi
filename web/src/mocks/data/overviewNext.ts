@@ -11,6 +11,9 @@ import { mockOtherUserRuns } from "./runHistories";
 //   - Other users' runs (owners below): one awaiting approval, one running, one in a usage-limit
 //     wait. The existing run-mira-embed and run-andrei-queued fixtures add a running and a
 //     queued one. They show up only in the admin all-users list.
+//   - More other-user runs for the issue-work line (PRD #3879): one planning, one asking, one
+//     Other work (a prompt run). With the base fixtures and the viewer's own revising,
+//     account-cooldown and ci_fix runs below, every stage of the line holds at least one run.
 //   - One of the viewer's OWN completed issue runs whose open MR shares repo_id + mr_iid with
 //     run-ci-halted, so the pull-request list has a duplicate to collapse.
 
@@ -35,6 +38,9 @@ export const overviewNextOtherRunOwners: Record<string, string> = {
   "run-ov-priya-approval": "priya@uzi.local",
   "run-ov-sam-running": "sam@uzi.local",
   "run-ov-jordan-limit": "jordan@uzi.local",
+  "run-ov-lena-planning": "lena@uzi.local",
+  "run-ov-omar-asking": "omar@uzi.local",
+  "run-ov-ines-prompt": "ines@uzi.local",
 };
 
 const otherRuns: Run[] = [
@@ -68,6 +74,84 @@ const otherRuns: Run[] = [
     claimed_at: minsAgo(70),
     started_at: minsAgo(70),
   }),
+  otherUserRun({
+    id: "run-ov-lena-planning",
+    issue_iid: 97,
+    issue_title: "Add a dry-run flag to the importer",
+    status: "running",
+    is_planning: true,
+    worker_id: "w-mira",
+    claimed_at: minsAgo(6),
+    started_at: minsAgo(6),
+  }),
+  otherUserRun({
+    id: "run-ov-omar-asking",
+    issue_iid: 99,
+    issue_title: "Decide the retention window for audit rows",
+    status: "awaiting_input",
+    updated_at: minsAgo(20),
+  }),
+  otherUserRun({
+    id: "run-ov-ines-prompt",
+    issue_iid: null,
+    issue_title: "Summarise last week's failed runs",
+    kind: "prompt",
+    branch: null,
+    status: "running",
+    worker_id: "w-mira",
+    claimed_at: minsAgo(3),
+    started_at: minsAgo(3),
+  }),
+];
+
+// The viewer's own runs for the issue-work line: one re-planning after a revise (it counts
+// under Planning, not at the gate), one holding for an account cooldown (Parked, though its
+// status is running), and one CI fix (Other work).
+const queuedBase = mockRuns.find((r) => r.id === "run-queued")!;
+
+function ownRun(over: Partial<Run> & Pick<Run, "id" | "issue_iid" | "issue_title" | "status">): Run {
+  return {
+    ...queuedBase,
+    issue_web_url: null,
+    model: null,
+    worker_id: null,
+    created_at: minsAgo(40),
+    updated_at: minsAgo(4),
+    ...over,
+  };
+}
+
+const ownLineRuns: Run[] = [
+  ownRun({
+    id: "run-ov-own-revising",
+    issue_iid: 96,
+    issue_title: "Show the cost cap on the run page",
+    status: "awaiting_approval",
+    is_revising: true,
+    worker_id: mockWorkers[0].id,
+    claimed_at: minsAgo(30),
+    started_at: minsAgo(30),
+  }),
+  ownRun({
+    id: "run-ov-own-cooldown",
+    issue_iid: 98,
+    issue_title: "Batch the webhook retries",
+    status: "running",
+    health: "waiting_account_cooldown",
+    worker_id: mockWorkers[0].id,
+    claimed_at: minsAgo(15),
+    started_at: minsAgo(15),
+  }),
+  ownRun({
+    id: "run-ov-own-cifix",
+    issue_iid: null,
+    kind: "ci_fix",
+    issue_title: "Fix the lint job on the cost-cap branch",
+    status: "running",
+    worker_id: mockWorkers[0].id,
+    claimed_at: minsAgo(5),
+    started_at: minsAgo(5),
+  }),
 ];
 
 // The viewer's own completed run for issue 22, a second run on the same MR as run-ci-halted.
@@ -80,7 +164,7 @@ const ownDuplicateMrRun: Run = {
   finished_at: minsAgo(30),
 };
 
-export const overviewNextRuns: Run[] = [...otherRuns, ownDuplicateMrRun];
+export const overviewNextRuns: Run[] = [...otherRuns, ...ownLineRuns, ownDuplicateMrRun];
 
 // The owner fleet for the Capacity rail (PRD #3880 M1): full, draining mid-roll, manually
 // cordoned, offline, with no advertised cap and with no stats. Replaces the default seeded

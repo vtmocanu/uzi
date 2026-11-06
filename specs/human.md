@@ -1759,6 +1759,13 @@ Design record: `prds/done/3880-overview-capacity-held-work.md` (epic #3873).
 - Held work always shows custody slots used of the configured limit, open holds and holds needing a decision, keeps the custody alert's headline and tone when it applies, and offers Review held work only when a decision is pending. Its holds read polls on its own, keeps the last good data and never waits on the runs load. (AI-synced 2026-11-05)
 - Needs your decision gains one held-work row when open holds need a decision; the header counts the aggregate decisions once, and the row names a run only for a single listed decision hold. (AI-synced 2026-11-05)
 
+## Feature #3879 — Overview preview, the issue-work line
+
+Design record: `prds/done/3879-overview-issue-line.md` (epic #3873).
+
+- On `/overview/next` an Issue work card under Needs your decision shows stations Queued, Planning, Plan review (a gate), Building and PR open, with bays Asking you / Questions, Parked and Other work, derived from each run's effective status and account cooldown; a revising plan counts as Planning, unknown statuses as Building, finished runs never as Other work. Scope follows the Runs list: own runs, every user's active runs for an admin; PR open counts the viewer's own deduplicated PRs, worded as last seen by uzi, never as active. (AI-synced 2026-11-06)
+- Captions never imply the viewer can act on another user's run ("Waiting on you", "Waiting on owners" or a split); Parked says whether its runs resume on their own or need action, and lists their reasons. Clicking a station or bay filters both Runs groups (pressed state announced); clicking again or Show all restores all active runs. (AI-synced 2026-11-06)
+
 ## Demo mode branding
 
 - Web demo mode shows the stock uzi factory icon and wordmark, default tab title and favicon base, and hides all instance POWERED BY branding and the optional build-time license credit. Toggling it off restores the real branding live. This is per-device presentation only; server settings and the Admin Branding live preview stay real. (AI-synced 2026-11-01)

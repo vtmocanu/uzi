@@ -3,12 +3,15 @@
 // admin, the health chip) above the app-wide banner stack. It is a preview route, linked
 // from and back to the current Overview at /dashboard.
 
+import { useState } from "react";
 import { Link } from "react-router-dom";
+import { isTerminalRun } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 import { useNow } from "../lib/useNow";
 import { useDemoMode } from "../lib/demoMode";
 import { maskName } from "../lib/demoMask";
 import { useOverviewData } from "../lib/useOverviewData";
+import { issueLineModel, type IssueStage } from "../lib/issueLine";
 import {
   decisionCount,
   mergeOverviewRows,
@@ -22,6 +25,7 @@ import {
 import { UsageCard } from "../components/UsageCards";
 import { OnboardingChecklist } from "../components/OnboardingChecklist";
 import { NeedsDecisionCard } from "../components/NeedsDecisionCard";
+import { IssueLine } from "../components/IssueLine";
 import { OverviewRunsWidget } from "../components/OverviewRunsWidget";
 import { CapacityRail } from "../components/CapacityRail";
 import { HeldWorkCard } from "../components/HeldWorkCard";
@@ -38,6 +42,8 @@ export function OverviewNext() {
     includeRecoveryHolds: true,
   });
   const now = useNow(30_000);
+  // The stage picked on the issue-work line; the Runs widget filters its groups by it.
+  const [lineStage, setLineStage] = useState<IssueStage | null>(null);
 
   if (!user) return null;
 
@@ -54,6 +60,17 @@ export function OverviewNext() {
     isAdmin && adminRuns.runs != null && !adminRuns.failed
       ? mergeOverviewRows(ownRuns, adminRuns.runs, user.email)
       : null;
+  // The issue-work line counts the Runs widget's populations: the viewer's own runs, and for
+  // an admin with a readable list every other user's active runs.
+  const lineModel = data
+    ? issueLineModel({
+        ownRuns,
+        otherRuns:
+          factoryRows != null
+            ? (adminRuns.runs ?? []).filter((r) => r.owner_email !== user.email && !isTerminalRun(r.status))
+            : [],
+      })
+    : null;
   const sentence = data
     ? statusSentence({
         decisions: decisionCount(decisions),
@@ -96,6 +113,10 @@ export function OverviewNext() {
       {/* The viewer's own items only (decisions is computed from ownRuns). */}
       <NeedsDecisionCard items={decisions} now={now} demo={demo} />
 
+      {lineModel && (
+        <IssueLine model={lineModel} selected={lineStage} onSelect={setLineStage} demo={demo} factory={factoryRows != null} />
+      )}
+
       {/* Same inputs as Dashboard: the viewer's own runs, never the admin rows. */}
       <HealthPlatformLine isAdmin={isAdmin} runs={ownRuns} workers={data?.workers ?? []} />
 
@@ -110,6 +131,8 @@ export function OverviewNext() {
             now={now}
             demo={demo}
             loading={!data}
+            stage={lineStage}
+            prRuns={lineModel?.prs}
           />
         </div>
         {/* Below xl the rail is full width: Capacity and Held work sit side by side from lg. */}
