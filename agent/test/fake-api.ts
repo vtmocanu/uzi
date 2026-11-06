@@ -273,6 +273,10 @@ export class FakeApi {
    *  entry (the default) omits the field, as an older api does. Tests serving their own
    *  {@link ownershipWire} read this map themselves. */
   readonly cancellationRequested = new Map<string, unknown>();
+  /** Issue #3974: opt in (off by default) to serving `cancellation_requested` on the default ownership
+   *  bodies the way the server derives it: the run's stop kind is `cancelled` AND a cancel row of the
+   *  run is still unapplied. An explicit {@link cancellationRequested} entry wins. */
+  deriveCancellationRequested = false;
   readonly committedHoldOwnership = new Map<string, unknown>();
   guardedQuestionStatus: string | undefined;
   workerPauseRefused = false;
@@ -937,6 +941,12 @@ export class FakeApi {
   pendingInputRows(runId: string): UserInput[] {
     const applied = this.appliedByRun.get(runId) ?? new Set<number>();
     return (this.inputsByRun.get(runId) ?? []).filter(r => !applied.has(r.id));
+  }
+
+  /** Issue #3974: the derived `cancellation_requested`: stop_kind 'cancelled' with an unapplied cancel row. */
+  private cancelStillPending(runId: string): boolean {
+    return this.stopKindByRun.get(runId) === "cancelled" &&
+      this.pendingInputRows(runId).some((row) => row.kind === "cancel");
   }
 
   isAcked(runId: string, id: number): boolean {
@@ -1646,7 +1656,12 @@ export class FakeApi {
         return send(res, 200, this.committedHoldOwnership.get(runId));
       if (this.parkRunOwnership) return send(res, 200, this.parkRunOwnership);
       const o = this.ownershipByRun.get(runId);
-      const cr = this.cancellationRequested.has(runId) ? { cancellation_requested: this.cancellationRequested.get(runId) } : {};
+      const cr = this.cancellationRequested.has(runId) ? { cancellation_requested: this.cancellationRequested.get(runId) }
+        : this.deriveCancellationRequested ? {
+          cancellation_requested: this.cancelStillPending(runId),
+          // The server names the claim the answer is about; a probe only trusts a positive one.
+          claim_generation: o?.generation ?? this.receiptGeneration.get(runId), claim_released: false,
+        } : {};
       if (this.planRevisionRetries && (!o || o.httpStatus === 200)) return send(res, 200, {
         status: o?.status ?? this.lastRecordedStatus.get(runId) ?? "running",
         claim_generation: o?.generation ?? this.receiptGeneration.get(runId),

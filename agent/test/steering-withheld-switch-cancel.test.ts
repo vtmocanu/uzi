@@ -1,15 +1,15 @@
 // issue #3974: while a credential switch is withheld (the holdCredentialSwitch hold, or the
 // revision-turn defer window) the api serves only the switch signal and withholds every input row,
-// so an owner Cancel never arrives through GET inputs. The poll loop makes ONE bounded ownership
-// probe (cancellation_requested) and commits the cancel on a positive answer, never entering the
-// switch afterwards.
+// so an owner Cancel never arrives through GET inputs. Each poll makes one bounded ownership probe
+// (cancellation_requested) and commits the cancel on a positive answer, never entering the switch
+// afterwards.
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type http from "node:http";
 import { FakeApi } from "./fake-api.js";
 import { nullLogger } from "./helpers.js";
 import { WorkerClient } from "../src/client.js";
-import { CredentialSwitchSignal, SteeringChannel } from "../src/steering.js";
+import { CredentialSwitchSignal, PauseNowSignal, SteeringChannel } from "../src/steering.js";
 import type { Logger } from "../src/log.js";
 
 const TOKEN = "worker-join-token-0123456789";
@@ -102,6 +102,9 @@ describe("withheld-switch cancel probe: when it runs", () => {
     await until(() => ch.isCancelled(), "the cancel commit");
     assert.equal(ch.cancelCommittedUnderWithheldSwitch(), true);
     assert.ok(probes() >= 1);
+    // The defer window's trip aborted shutdownStop before the window held the switch, so a probe that
+    // listened to it would have ended at once and never committed.
+    assert.equal(ch.checkpointAuthoritySignal().aborted, true, "shutdownStop was aborted by the held trip");
   });
 
   it("does not probe with no switch withheld (no hold, no defer): the switch trips instead", async () => {
@@ -190,6 +193,98 @@ describe("withheld-switch cancel probe: committing", () => {
     pendingAtCancel.push(ch.pendingCredentialSwitch());
     assert.deepEqual(pendingAtCancel, [undefined, undefined]);
     assert.equal(cancel.signal.aborted, true);
+  });
+});
+
+describe("withheld-switch cancel probe: after the defer window closes", () => {
+  // The poll loop itself stops reading inputs once a cancel is committed, so the later transport that can
+  // still carry the stamp is the state-ack one (tripCredentialSwitch).
+  it("a later state-ack switch signal trips nothing", async () => {
+    serve(good());
+    const ch = channel();
+    ch.beginCredentialSwitchDefer();
+    ch.start();
+    await until(() => ch.isCancelled(), "the cancel commit");
+    ch.endCredentialSwitchDefer();
+    ch.tripCredentialSwitch(GEN);
+    assert.equal(ch.pendingCredentialSwitch(), undefined, "no trip once the window closed");
+    ch.tripCredentialSwitch(GEN);
+    assert.equal(ch.pendingCredentialSwitch(), undefined);
+    assert.equal(cancel.signal.reason instanceof CredentialSwitchSignal, false);
+    assert.equal(onCancelCalls, 1);
+  });
+});
+
+describe("withheld-switch cancel probe: accepted statuses", () => {
+  for (const status of ["running", "claimed", "awaiting_approval", "awaiting_input"]) {
+    it(`${status} commits the cancel`, async () => {
+      serve(good({ status }));
+      const ch = channel();
+      ch.holdCredentialSwitch();
+      ch.start();
+      await until(() => ch.isCancelled(), `the cancel commit at ${status}`);
+      assert.equal(ch.cancelCommittedUnderWithheldSwitch(), true);
+      assert.equal(onCancelCalls, 1);
+    });
+  }
+});
+
+describe("withheld-switch cancel probe: the synchronous re-check", () => {
+  /** Hold the ownership answer (cancel requested), change the channel while it is in flight, then answer. */
+  async function answerAfter(change: (ch: SteeringChannel, hold: { close(o: { service: boolean }): void }) => void) {
+    let held: http.ServerResponse | undefined;
+    api.ownershipWire.set(RUN, (res) => { held = res; });
+    const ch = channel(60_000);
+    const hold = ch.holdCredentialSwitch();
+    ch.start();
+    await until(() => held !== undefined, "the probe in flight");
+    change(ch, hold);
+    held!.writeHead(200, { "Content-Type": "application/json" });
+    held!.end(JSON.stringify(good()));
+    // The loop moves on only after the probe settled, so two more polls prove it was handled.
+    await pollsMore(2);
+    return ch;
+  }
+
+  it("a switch serviced while the probe is in flight is not overridden by the late cancel answer", async () => {
+    const ch = await answerAfter((_ch, hold) => hold.close({ service: true }));
+    assert.equal(ch.pendingCredentialSwitch(), GEN);
+    assert.equal(ch.isCancelled(), false);
+    assert.equal(ch.cancelCommittedUnderWithheldSwitch(), false);
+    assert.equal(onCancelCalls, 0);
+  });
+
+  it("a hold closed without service while the probe is in flight leaves nothing withheld: the late cancel answer commits nothing", async () => {
+    const ch = await answerAfter((_ch, hold) => hold.close({ service: false }));
+    assert.equal(ch.isCancelled(), false);
+    assert.equal(ch.cancelCommittedUnderWithheldSwitch(), false);
+    assert.equal(onCancelCalls, 0);
+  });
+});
+
+describe("withheld-switch cancel probe: a PauseNow-aborted cancel signal", () => {
+  it("a PauseNow also aborts the lifecycle, so probes abort until a rearm; the probe then works and commits", async () => {
+    serve(good({ cancellation_requested: false }));
+    const ch = channel();
+    ch.holdCredentialSwitch();
+    ch.start();
+    await until(() => probes() >= 1, "a probe");
+    api.setInputs(RUN, [{ id: 91, kind: "pause", body: "now" }]);
+    await until(() => cancel.signal.aborted, "the PauseNow abort");
+    assert.ok(cancel.signal.reason instanceof PauseNowSignal);
+    assert.equal(ch.lifecycleSignal().aborted, true, "the PauseNow aborted the lifecycle too");
+    await until(() => probeWarns().length >= 1, "a probe ended by the aborted lifecycle");
+    assert.equal(ch.isCancelled(), false);
+    serve(good());
+    const before = probes();
+    await pollsMore(2);
+    assert.equal(ch.isCancelled(), false, "no commit while the lifecycle stays aborted");
+    ch.rearmLifecycle();
+    assert.equal(ch.lifecycleSignal().aborted, false);
+    await until(() => ch.isCancelled(), "the cancel commit after the rearm");
+    assert.ok(probes() > before);
+    assert.equal(ch.cancelCommittedUnderWithheldSwitch(), true);
+    assert.equal(onCancelCalls, 1);
   });
 });
 

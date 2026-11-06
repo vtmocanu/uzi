@@ -1826,15 +1826,18 @@ export class SteeringChannel {
   }
 
   /** Issue #3974: while a switch is withheld the api serves no input rows, so an owner Cancel never
-   *  arrives. Make ONE bounded, non-committing ownership probe; commit the cancel only on a
-   *  positive answer after a synchronous re-check. Any failure is "unknown": nothing committed, no
-   *  delivery/receipt failure counted. */
+   *  arrives. Each poll makes one bounded, non-committing ownership probe (one probe per poll, not a
+   *  single probe per flight); commit the cancel only on a positive answer after a synchronous
+   *  re-check. Any failure is "unknown": nothing committed, no delivery/receipt failure counted. */
   private async probeWithheldSwitchCancel(generation: number): Promise<void> {
     const reasons: AbortSignal[] = [
       AbortSignal.timeout(this.withheldSwitchCancelProbeMs),
       this.terminalLifecycle.signal, this.lifecycle.signal, this.probeStop.signal,
     ];
-    // A PauseNow abort is cooperative and must not cancel the probe; anything else ends it.
+    // A PauseNow aborts this.cancel with a PauseNowSignal AND aborts this.lifecycle (abortLifecycle
+    // with terminal=false), so the lifecycle signal above already ends probes until rearmLifecycle
+    // replaces it. Leaving the spent PauseNow cancel signal out only keeps it from ending the probes
+    // made after that rearm; any other cancel.signal abort ends the probe.
     if (!(this.cancel.signal.aborted && this.cancel.signal.reason instanceof PauseNowSignal)) {
       reasons.push(this.cancel.signal);
     }
@@ -2917,7 +2920,7 @@ export class SteeringChannel {
           // empty one). It is not an input row — it is the server's "a switch is pending for the
           // current claim" fact — and acting on it releases the claim.
           if (credentialSwitch) this.maybeTripCredentialSwitch(credentialSwitch.generation);
-          // Issue #3974: a withheld switch hides every input row, cancel included; probe once.
+          // Issue #3974: a withheld switch hides every input row, cancel included; one probe per poll.
           if (credentialSwitch && this.withheldSwitchCancelEligible(credentialSwitch.generation)) {
             await this.probeWithheldSwitchCancel(credentialSwitch.generation);
           }
