@@ -97,6 +97,19 @@ function failingCapture(): void {
 }
 
 interface Timeline { events: string[]; callsAt: Record<string, number>; counter: { calls: number } }
+/** Issue #3974: the levers a drive callback gets. */
+interface DriveControl {
+  tl: Timeline;
+  switchSeen: ReturnType<typeof watchSwitchDelivery>;
+  /** Make the switch visible to the worker and wait until the hold has latched it. */
+  requestSwitch(): Promise<void>;
+  /** Queue an owner cancel row (the fake stamps stop_kind 'cancelled'); records the "cancel-sent" event. */
+  cancel(): number;
+  /** Observe state reports without replacing the drive's own recording hook (FakeApi.onState is last-wins). */
+  onState(fn: (body: Parameters<Parameters<typeof api.onState>[1]>[0]) => void): void;
+  /** Flip the pending checker answer of `round` to `verdict`, keeping its identity. */
+  flip(round: number, verdict: "approve" | "block"): void;
+}
 /** Observe the candidate reservation (reserve/release), landed state reports and landed messages in
  *  ONE ordered list. Returns the restore function for the shared batcher prototype. */
 function observe(runId: string, tl: Timeline, opts: { prefix?: string; failAfterRelease?: boolean; healAtReserve?: boolean } = {}) {
@@ -160,25 +173,38 @@ function observe(runId: string, tl: Timeline, opts: { prefix?: string; failAfter
 function watchSwitchDelivery(generation = 1) {
   const getInputs = client.getInputs.bind(client);
   const handles: { latched(): boolean }[] = [];
-  const seen = { delivered: false, trips: 0, latched: () => handles.some((h) => h.latched()) };
+  const channels: SteeringChannel[] = [];
+  const seen = { delivered: false, trips: 0, latched: () => handles.some((h) => h.latched()),
+    /** Issue #3974: an owner cancel was committed under a withheld switch (the channel's sticky flag). */
+    cancelCommitted: () => channels.some((ch) => ch.cancelCommittedUnderWithheldSwitch()),
+    isCancelled: () => channels.some((ch) => ch.isCancelled()),
+    /** A deliberate service-close of every open hold, as the runner does at a verified release. */
+    serviceHolds: () => { for (const h of handles) (h as unknown as { close(o: { service: boolean }): void }).close({ service: true }); } };
   client.getInputs = async (runId) => {
     const result = await getInputs(runId);
     if (result.credentialSwitch?.generation === generation) seen.delivered = true;
     return result;
   };
   const proto = SteeringChannel.prototype as unknown as {
-    holdCredentialSwitch: () => { latched(): boolean }; maybeTripCredentialSwitch: (g: number) => void };
+    holdCredentialSwitch: () => { latched(): boolean }; maybeTripCredentialSwitch: (g: number) => void;
+    beginCredentialSwitchDefer: () => void };
   const hold = proto.holdCredentialSwitch;
   const trip = proto.maybeTripCredentialSwitch;
+  const defer = proto.beginCredentialSwitchDefer;
+  proto.beginCredentialSwitchDefer = function (this: unknown) {
+    channels.push(this as SteeringChannel);
+    return defer.call(this);
+  };
   proto.holdCredentialSwitch = function (this: unknown) {
     const handle = hold.call(this);
     handles.push(handle);
+    channels.push(this as SteeringChannel);
     return handle;
   };
   proto.maybeTripCredentialSwitch = function (this: unknown, g: number) {
     try { return trip.call(this, g); } finally { seen.trips++; }
   };
-  restorers.push(() => { proto.holdCredentialSwitch = hold; proto.maybeTripCredentialSwitch = trip; });
+  restorers.push(() => { proto.holdCredentialSwitch = hold; proto.maybeTripCredentialSwitch = trip; proto.beginCredentialSwitchDefer = defer; });
   return seen;
 }
 
@@ -249,19 +275,33 @@ interface DriveOpts {
   /** The checker never decides: its answer stays pending past a short deadline (a timed-out checker). */
   pending?: boolean;
   /** Run first on the pending checker request, whether or not a switch is requested. */
-  duringPending?: (c: ReturnType<typeof claim>) => Promise<void>;
+  duringPending?: (c: ReturnType<typeof claim>, x: DriveControl) => Promise<void>;
   /** Run once the switch is visible to the worker and the checker is still pending. */
-  afterSwitch?: (c: ReturnType<typeof claim>) => Promise<void>;
+  afterSwitch?: (c: ReturnType<typeof claim>, x: DriveControl) => Promise<void>;
+  /** Run inside the first transport preparation of checkPlan (a reservation is installed, no round
+   *  has been submitted yet). Settles before the preparation continues. */
+  duringPreparation?: (c: ReturnType<typeof claim>, x: DriveControl, signal: AbortSignal) => Promise<void>;
   /** Arrange the api for this claim before the run starts. */
-  setup?: (c: ReturnType<typeof claim>) => void;
+  setup?: (c: ReturnType<typeof claim>, x: DriveControl) => void;
+  /** Issue #3974: serve cancellation_requested the way the server derives it (FakeApi.deriveCancellationRequested). */
+  serveCancellation?: boolean;
+  /** Issue #3974: how long the checker's pending answer stays pending (default 40 ms). */
+  pendingDeadlineMs?: number;
+  /** A status emitted before the reservation whose delivery keeps failing, so the first preparation is
+   *  held (a forced human gate whose completePreparation owns the remaining attempts). */
+  persistentPrefix?: boolean;
+  /** Claim overrides (an mr_rework lead, ...). */
+  claimOver?: (base: ReturnType<typeof claim>) => Partial<ReturnType<typeof claim>>;
   /** Extra runner options. */
   runnerOpts?: Record<string, unknown>;
 }
 /** Run one claim to its end through the real runner + real SdkExecutor + the cross-check api fake. */
 async function drive(o: DriveOpts) {
-  const c = o.gated
+  const base = o.gated
     ? freshClaim(1, { kind: "issue", auto_approve: false, plan_cross_check_gated: true })
     : claim();
+  const c = { ...base, ...o.claimOver?.(base) };
+  if (o.serveCancellation) api.deriveCancellationRequested = true;
   const counter = { calls: 0 };
   const tl: Timeline = { events: [], callsAt: {}, counter };
   const failedPosts = { count: 0 };
@@ -278,12 +318,61 @@ async function drive(o: DriveOpts) {
   let dropped = false;
   let emit!: RunContext["emit"];
   const trace = { queriesAtRequest: [] as number[], requests: 0 };
+  const cancelIds: number[] = [];
+  const stateHooks: Parameters<DriveControl["onState"]>[0][] = [];
+  const ctl: DriveControl = {
+    tl, switchSeen,
+    onState: (fn) => { stateHooks.push(fn); },
+    requestSwitch: async () => {
+      tl.events.push("switch-requested");
+      api.requestCredentialSwitch(c.run_id, 1);
+      assert.ok(await handlerWait(() => switchSeen.delivered), "the worker polled the switch");
+      switchSeen.delivered = false;
+      assert.ok(await handlerWait(() => switchSeen.latched()), "the hold latched the switch");
+    },
+    cancel: () => {
+      const id = send(c.run_id, row("cancel"))[0]!.id;
+      cancelIds.push(id);
+      tl.events.push("cancel-sent");
+      return id;
+    },
+    flip: (round, verdict) => {
+      decided.set(round, { ...decided.get(round)!, verdict, reason_class: verdict });
+    },
+  };
+  // Issue #3974: every ownership answer for this run, in the one ordered event list.
+  const ownership = client.getRunOwnership.bind(client);
+  client.getRunOwnership = (async (...args: Parameters<typeof ownership>) => {
+    const answered = await ownership(...args);
+    if (args[0] === c.run_id) tl.events.push(`ownership:${answered.cancellation_requested === true}`);
+    return answered;
+  }) as typeof client.getRunOwnership;
+  const reserveBeforePreparation = MessageBatcher.prototype.reserveCandidateTransport;
+  if (o.persistentPrefix) {
+    const observed = MessageBatcher.prototype.reserveCandidateTransport;
+    MessageBatcher.prototype.reserveCandidateTransport = function () {
+      this.emit({ kind: "status", payload: { text: "persistent prefix" } });
+      api.failMessagesNext(100);
+      return observed.call(this);
+    };
+  }
+  if (o.duringPreparation) {
+    let first = true;
+    const reserveWrapped = MessageBatcher.prototype.reserveCandidateTransport;
+    MessageBatcher.prototype.reserveCandidateTransport = function () {
+      const reservation = reserveWrapped.call(this);
+      return { ...reservation, prepare: async (...args: Parameters<typeof reservation.prepare>) => {
+        if (first) { first = false; await o.duringPreparation!(c, ctl, args[1] ?? new AbortController().signal); }
+        return reservation.prepare(...args);
+      } };
+    };
+  }
   api.crossCheckHandler = async ({ runId, method, body }) => {
     if (method === "GET") return { status: 200, body: decided.get(lastRound) };
     const round = Number(body.round);
     lastRound = round;
     if (!decided.has(round)) {
-      await o.duringPending?.(c);
+      await o.duringPending?.(c, ctl);
       if ((o.switchRounds ?? []).includes(round)) {
         trace.requests++;
         if (o.emitHeld) {
@@ -298,13 +387,13 @@ async function drive(o: DriveOpts) {
           switchSeen.delivered = false;
           assert.ok(await handlerWait(() => switchSeen.latched()), "the hold latched the switch");
         } else api.armStateAckCredentialSwitchOnce(runId, 1, "awaiting_approval");
-        await o.afterSwitch?.(c);
+        await o.afterSwitch?.(c, ctl);
       }
       const verdict = o.pending ? "pending" : (o.verdicts ?? ["approve"])[round - 1] ?? "approve";
       const generation = Number(body.claim_generation ?? 1);
       decided.set(round, answer(runId, body, verdict, verdict === "pending" ? "" : verdict, {
         ...proof(runId, generation), candidate_generation: generation,
-        ...(o.pending ? { deadline_at: new Date(Date.now() + 40).toISOString() } : {}),
+        ...(o.pending ? { deadline_at: new Date(Date.now() + (o.pendingDeadlineMs ?? 40)).toISOString() } : {}),
         ...(o.manual ? {} : { automatic_revision_limit: 3, automatic_rounds_enabled: true }),
         ...(verdict === "revise" ? { findings: { summary: `fix round ${round}`, items: [] } } : {}),
         ...(verdict === "approve" ? canonical(body) : {}),
@@ -334,6 +423,7 @@ async function drive(o: DriveOpts) {
       gaveUp = true;
       if (o.rejectAfterGiveUp) send(c.run_id, row("reject_plan", "human after give-up"));
     }
+    for (const fn of stateHooks) fn(b);
   };
   prior(c.run_id, hook);
   const attempts: string[] = [];
@@ -364,17 +454,21 @@ async function drive(o: DriveOpts) {
     }
     return new SdkExecutor(nullLogger(), homeDir, { queryFn: scriptedQuery(o.plans ?? [PLAN], counter) }).run(ctx);
   } };
-  o.setup?.(c);
+  o.setup?.(c, ctl);
   const forge = fakeGitlab();
   const sentinel = path.join(homeDir, "SESSION");
   fs.writeFileSync(sentinel, "resumable session\n");
   try {
     await runner(exec, forge.gitlab, undefined, { planCrossCheckTiming: timing, recoveryRetryMs: 1,
       planApprovalTimeoutMs: 3000, ...o.runnerOpts }).execute(c);
-  } finally { probe.restore(); client.postMessages = realPost; client.reportPlanCrossCheckGateState = report; api.failMessagesNext(0); }
+  } finally {
+    MessageBatcher.prototype.reserveCandidateTransport = reserveBeforePreparation;
+    probe.restore(); client.postMessages = realPost; client.reportPlanCrossCheckGateState = report; api.failMessagesNext(0);
+    client.getRunOwnership = ownership;
+  }
   const heldSeqs = api.messages(c.run_id).filter((m) => (m.payload as { text?: string }).text?.startsWith("held during"))
     .map((m) => m.seq);
-  return { c, tl, counter, forge, probe, storage, attempts, sentinel, trace, gaveUp: () => gaveUp, heldSeqs, leadSeqs,
+  return { c, tl, counter, forge, probe, storage, attempts, sentinel, trace, cancelIds, gaveUp: () => gaveUp, heldSeqs, leadSeqs,
     posts: () => api.crossCheckRequests.filter((r) => r.method === "POST") };
 }
 type Driven = Awaited<ReturnType<typeof drive>>;
@@ -983,7 +1077,19 @@ describe("issue #3953 m3: boundaries keep their dispositions; the latch is never
     assert.deepEqual(d.tl.events.filter((e) => e === "capture"), [], "the latch is never serviced");
   });
 
-  it("an owner cancel row sent while a latched switch is pending is withheld until the switch is serviced; the release leaves it for the reclaim", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+  it("an owner cancel row sent while a latched switch is pending ends the run cancelled promptly; the latch is never serviced", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    // Issue #3974: the api serves cancellation_requested on the ownership read, so the worker finds the
+    // cancel the withheld inputs hide. The checker's approve is returned only once the cancel is committed.
+    const d = await drive({ capture: "release", switchRounds: [1], serveCancellation: true, afterSwitch: async (_c, x) => {
+      x.cancel();
+      assert.ok(await until(() => x.switchSeen.cancelCommitted()), "the probe committed the cancel");
+    } });
+    assertCancelledNotSwitched(d);
+    assert.equal(d.counter.calls, 1);
+    assert.equal(fs.existsSync(worktreeDirFor(Number(d.c.issue_iid))), false, "a cancelled run's clone is cleaned up");
+  });
+
+  it("an older api that serves no cancellation_requested: an owner cancel row sent while a latched switch is pending is withheld until the switch is serviced; the release leaves it for the reclaim", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
     let cancelId = 0;
     // The cancel row is only sent; nothing waits on it (the api withholds every row while a switch is pending).
     const d = await drive({ capture: "release", switchRounds: [1], afterSwitch: async (c) => {
@@ -1685,5 +1791,328 @@ describe("issue #3953 m3: semantic coverage forces a human gate after the checke
     failedWith(c.run_id, "run cancelled");
     assert.deepEqual(verdicts, [], "no verdict escapes the cancelled review");
     assert.equal(gates(c.run_id).length, 0, "no gate is presented after the cancel");
+  });
+});
+
+/** Issue #3974: while a switch is withheld the api serves no input rows, so an owner Cancel never arrives
+ *  through GET inputs; the worker's ownership probe finds it. Every case below ends the run cancelled
+ *  without servicing the switch. */
+function assertCancelledNotSwitched(d: Driven): void {
+  const { c, tl } = d;
+  const ev = tl.events;
+  failedWith(c.run_id, "run cancelled");
+  assert.deepEqual(switchReports(c.run_id), [], "no credential_switch report of any kind");
+  assert.deepEqual(ev.filter((e) => e === "capture"), [], "no capture");
+  assert.deepEqual(d.attempts, [], "the switch is never attempted");
+  assert.deepEqual(d.storage, [], "no plan is stored");
+  assert.ok(d.cancelIds.length > 0, "a cancel row was sent");
+  const sent = ev.indexOf("cancel-sent");
+  assert.ok(sent >= 0, JSON.stringify(ev));
+  assert.ok(!ev.slice(sent).includes("state:awaiting_approval"), `no gate is presented after the cancel: ${JSON.stringify(ev)}`);
+  for (const id of d.cancelIds) {
+    assert.equal(api.isAcked(c.run_id, id), false, "the old flight never ACKed the cancel row");
+    assert.equal(api.isApplied(c.run_id, id), false, "the old flight never applied the cancel row");
+    assert.deepEqual(api.timeline.filter((e) => e.type !== "state" && e.runId === c.run_id && e.ids.includes(id)), [],
+      "the cancel row was never receipted");
+  }
+  const probe = ev.indexOf("ownership:true", sent);
+  const failed = ev.indexOf("state:failed", sent);
+  assert.ok(probe > sent, `an ownership probe answered the cancel after it was sent: ${JSON.stringify(ev)}`);
+  assert.ok(failed > probe, `the terminal failed report follows the probe: ${JSON.stringify(ev)}`);
+  assert.deepEqual(ev.slice(sent, failed).filter((e) => e === "attempt" || e === "capture" || e.startsWith("state:credential_switch")), [],
+    "no switch is serviced between the cancel and the terminal report");
+  assert.ok(!statuses(c.run_id).includes("completed"));
+}
+
+describe("issue #3974: an owner cancel under a withheld credential switch ends the run cancelled", () => {
+  it("(a) a hold during checkPlan's pre-submit preparation: no round exists yet", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const d = await drive({ capture: "release", switchRounds: [], serveCancellation: true,
+      duringPreparation: async (_c, x, signal) => {
+        await x.requestSwitch();
+        x.cancel();
+        assert.ok(await until(() => signal.aborted || x.switchSeen.cancelCommitted()), "the probe committed the cancel");
+      } });
+    assertCancelledNotSwitched(d);
+    assert.equal(d.posts().length, 0, "no round was ever submitted");
+    assert.equal(d.counter.calls, 1);
+  });
+
+  it("(a2) an in-flight submit is interrupted by the lifecycle signal; a response released later is ignored", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    let submitSignal: AbortSignal | undefined;
+    const submit = client.submitPlanCrossCheck.bind(client);
+    client.submitPlanCrossCheck = async (...args: Parameters<typeof submit>) => { submitSignal = args[3]; return submit(...args); };
+    restorers.push(() => { client.submitPlanCrossCheck = submit; });
+    let interrupted = false;
+    const d = await drive({ capture: "release", switchRounds: [], serveCancellation: true,
+      duringPending: async (_c, x) => {
+        // The round is recorded; the response is held while the switch latches and the cancel is sent.
+        await x.requestSwitch();
+        x.cancel();
+        assert.ok(await until(() => submitSignal?.aborted === true), "the lifecycle abort interrupted the in-flight submit");
+        interrupted = true;
+      } });
+    assert.equal(interrupted, true);
+    assertCancelledNotSwitched(d);
+    assert.equal(d.posts().length, 1, "the submit was made once and never retried");
+  });
+
+  it("(a2) a response released as soon as the probe answered is ignored", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const d = await drive({ capture: "release", switchRounds: [], serveCancellation: true,
+      duringPending: async (_c, x) => {
+        await x.requestSwitch();
+        x.cancel();
+        assert.ok(await until(() => x.tl.events.includes("ownership:true")), "the probe answered the cancel");
+      } });
+    assertCancelledNotSwitched(d);
+    assert.equal(d.posts().length, 1);
+  });
+
+  it("(b) a pending round is interrupted before the checker deadline", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const d = await drive({ capture: "release", switchRounds: [1], pending: true, pendingDeadlineMs: 10 * 60_000,
+      serveCancellation: true, afterSwitch: async (_c, x) => { x.cancel(); } });
+    assertCancelledNotSwitched(d);
+    assert.equal(d.posts().length, 1);
+    assert.equal(d.counter.calls, 1);
+  });
+
+  it("(b) the checker approves at the same instant the probe answers: still nothing stored and no switch", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const d = await drive({ capture: "release", switchRounds: [1], pending: true, pendingDeadlineMs: 10 * 60_000,
+      serveCancellation: true, afterSwitch: async (_c, x) => {
+        x.cancel();
+        void until(() => x.tl.events.includes("ownership:true")).then(() => x.flip(1, "approve"));
+      } });
+    assertCancelledNotSwitched(d);
+    assert.equal(d.counter.calls, 1);
+  });
+});
+
+/** Hold the next gate presentation's ACK (the reservation stays installed, the hold open). Once it is
+ *  persisted the switch latches and the cancel is sent; the ACK is released when the cancel has been
+ *  committed ("committed") or as soon as the probe answered it ("answered": the commit and the ACK race). */
+const holdGateThenCancel = (release: "committed" | "answered") => (c: ReturnType<typeof claim>, x: DriveControl): void => {
+  let go!: () => void;
+  const held = new Promise<void>((r) => (go = r));
+  api.afterPersistState(c.run_id, (b) => b.status === "awaiting_approval", held);
+  x.onState((b) => {
+    if (b.status !== "awaiting_approval") return;
+    void (async () => {
+      try {
+        await x.requestSwitch();
+        x.cancel();
+        await until(() => release === "committed" ? x.switchSeen.cancelCommitted() : x.tl.events.includes("ownership:true"));
+      } finally { go(); }
+    })();
+  });
+};
+
+describe("issue #3974: an owner cancel after the checker's verdict, with the gate presented", () => {
+  const cases: [string, Omit<DriveOpts, "capture">][] = [
+    ["gated_pass", { gated: true, verdicts: ["approve"] }],
+    ["human path: checker block", { manual: true, verdicts: ["block"] }],
+    ["human path: checker timed out", { manual: true, pending: true }],
+  ];
+  for (const [name, opts] of cases) for (const release of ["committed", "answered"] as const) {
+    it(`${name}: the presentation ACK is held until the cancel is ${release}; the gate never services the switch`, { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+      const d = await drive({ capture: "release", switchRounds: [], serveCancellation: true, ...opts, setup: holdGateThenCancel(release) });
+      assertCancelledNotSwitched(d);
+      assert.equal(d.counter.calls, 1, "no implementation");
+      assert.equal(gates(d.c.run_id).length, 1, "the one presentation predates the cancel");
+    });
+  }
+  // The gate is presented and applied; completePreparation then owns the remaining preparation attempts.
+  it("forced gate during completePreparation at awaiting_approval", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const d = await drive({ capture: "release", switchRounds: [], serveCancellation: true, persistentPrefix: true,
+      runnerOpts: { planCrossCheckTiming: { ...timing, backoffMs: [600_000, 600_000] as const } },
+      setup: (_c, x) => x.onState((b) => {
+        if (b.status !== "awaiting_approval") return;
+        void (async () => { await x.requestSwitch(); x.cancel(); })();
+      }) });
+    assertCancelledNotSwitched(d);
+    assert.equal(api.crossCheckRequests.length, 0, "the failed preparation never submits");
+    assert.equal(d.probe.reservations.released, 0, "the reservation was never released, so nothing was serviced");
+  });
+
+  it("re-plan gate: the cancel latched while prepareGateCheckpoint is blocked", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    client.protocolFeatures = [...client.protocolFeatures, "milestone_reconciliation_v1"];
+    const seam = RunRunner.prototype as unknown as { prepareGateCheckpoint: (...args: unknown[]) => Promise<unknown> };
+    const prepare = seam.prepareGateCheckpoint;
+    restorers.push(() => { seam.prepareGateCheckpoint = prepare; });
+    const blocked: { entered: boolean; whileBlocked?: { cancelled: boolean; gates: number; switchReports: string[]; ownerAborted: boolean } } = { entered: false };
+    let ownerSignal: AbortSignal | undefined;
+    seam.prepareGateCheckpoint = async function (this: unknown, ...args: unknown[]) {
+      blocked.entered = true;
+      ownerSignal = args[2] as AbortSignal;
+      await seamHold(args[1] as { runId?: string } | undefined);
+      return prepare.apply(this, args);
+    };
+    let seamHold!: (flight?: { runId?: string }) => Promise<void>;
+    const d = await drive({ capture: "release", switchRounds: [], serveCancellation: true, manual: true, verdicts: ["block"],
+      claimOver: () => ({ execution_milestones: [{ id: "frozen", title: "A frozen milestone the candidate drops" }] }),
+      setup: (c, x) => {
+        seamHold = async () => {
+          await x.requestSwitch();
+          x.cancel();
+          assert.ok(await until(() => x.switchSeen.cancelCommitted()), "the probe committed the cancel");
+          blocked.whileBlocked = { cancelled: x.switchSeen.isCancelled(), gates: gates(c.run_id).length,
+            switchReports: switchReports(c.run_id), ownerAborted: ownerSignal?.aborted === true };
+        };
+      } });
+    assert.equal(blocked.entered, true, "the run reached prepareGateCheckpoint");
+    assert.deepEqual(blocked.whileBlocked, { cancelled: true, gates: 0, switchReports: [], ownerAborted: true },
+      "while blocked: cancelled, no gate presented, no switch serviced");
+    assertCancelledNotSwitched(d);
+    assert.equal(gates(d.c.run_id).length, 0, "the gate was never presented");
+  });
+});
+
+describe("issue #3974: lead kinds, ordering and the rows a withheld switch hides", () => {
+  it("(d) an mr_rework lead enrolled in the required cross-check", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const d = await drive({ capture: "release", switchRounds: [1], pending: true, pendingDeadlineMs: 10 * 60_000,
+      serveCancellation: true, claimOver: (base) => ({ kind: "mr_rework", branch: `agent/issue-${base.issue_iid}`, base_branch: "main" }), afterSwitch: async (_c, x) => { x.cancel(); } });
+    assert.equal(d.c.kind, "mr_rework");
+    assertCancelledNotSwitched(d);
+    assert.equal(api.crossCheckRequests.filter((r) => r.method === "POST").length, 1, "the mr_rework lead did submit a round");
+  });
+
+  it("(e) reverse order: the cancel row is queued before the switch stamp, both before the worker's next poll", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    // duringPending runs, then the stamp is requested with no await in between: no poll can land in between.
+    const d = await drive({ capture: "release", switchRounds: [1], pending: true, pendingDeadlineMs: 10 * 60_000,
+      serveCancellation: true, duringPending: async (_c, x) => { x.cancel(); } });
+    const ev = d.tl.events;
+    assert.ok(ev.indexOf("cancel-sent") >= 0 && ev.indexOf("cancel-sent") < ev.indexOf("switch-requested"), JSON.stringify(ev));
+    assertCancelledNotSwitched(d);
+    assert.deepEqual(ev.slice(0, ev.indexOf("cancel-sent")).filter((e) => e === "ownership:true"), [], "no probe answered before the cancel existed");
+  });
+
+  it("(f) an answer and a follow_up sent after the stamp are never ACKed or receipted by the old flight", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const others: number[] = [];
+    const d = await drive({ capture: "release", switchRounds: [1], pending: true, pendingDeadlineMs: 10 * 60_000,
+      serveCancellation: true, afterSwitch: async (c, x) => {
+        others.push(send(c.run_id, row("answer", "an answer to nothing"))[0]!.id);
+        others.push(send(c.run_id, row("follow_up", "a note after the stamp"))[0]!.id);
+        x.cancel();
+      } });
+    assertCancelledNotSwitched(d);
+    assert.equal(others.length, 2);
+    for (const id of others) {
+      assert.equal(api.isAcked(d.c.run_id, id), false, `row ${id} was never ACKed`);
+      assert.equal(api.isApplied(d.c.run_id, id), false, `row ${id} was never applied`);
+      assert.deepEqual(api.timeline.filter((e) => e.type !== "state" && e.runId === d.c.run_id && e.ids.includes(id)), [],
+        `row ${id} was never receipted`);
+    }
+  });
+});
+
+describe("issue #3974: recovery custody parity with an ordinary delivered cancel", () => {
+  /** Every custody call the run makes, in order, with the arguments that name a generation or capture. */
+  async function custodyRun(mode: "withheld" | "delivered"): Promise<{ calls: string[]; d: Driven }> {
+    const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "switch-custody-parity-"));
+    const calls: string[] = [];
+    const archive: RecoveryArchiveClient = {
+      hasFeature: (feature: string) => feature === "recovery_inventory_v1",
+      reserveRecoveryCapture: async (_id, req) => { calls.push(`reserve g${req.generation}`); return { capture_id: "custody-capture", state: "preparing" }; },
+      getRecoveryCaptureStatus: async (_id, captureId) => { calls.push("status"); return { capture_id: captureId, state: "preparing", manifest_bound: false }; },
+      uploadRecoveryBundle: async (_id, captureId, _manifest, bundle) => {
+        calls.push("upload");
+        for await (const _chunk of bundle) { /* Consume the real Git bundle. */ }
+        return { capture_id: captureId, state: "available", manifest_bound: true };
+      },
+      releaseRecoveryCustody: async (id, generation) => { calls.push(`release g${generation}`); return { run_id: id, released: true, holds_released: 1 }; },
+      listRecoveryHolds: async (id) => { calls.push("holds"); return { run_id: id, holds: [{ hold_id: "hold-g1", generation: 1,
+        inventory_guarded: true, has_available_capture: false }] }; },
+    };
+    const recovery = new RecoveryCoordinator({ client: archive, git, log: nullLogger(),
+      recoveryRoot: path.join(root, "recovery"), workerToken: "custody-parity-fixture" });
+    try {
+      const d = mode === "withheld"
+        ? await drive({ capture: "release", switchRounds: [1], pending: true, pendingDeadlineMs: 10 * 60_000, serveCancellation: true,
+          runnerOpts: { recovery }, setup: (c) => { c.inventory_guarded = true; }, afterSwitch: async (_c, x) => { x.cancel(); } })
+        : await drive({ capture: "release", switchRounds: [], runnerOpts: { recovery }, setup: (c) => { c.inventory_guarded = true; },
+          duringPending: async (c, x) => { const id = x.cancel(); await routed(c.run_id, id); } });
+      return { calls, d };
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  }
+
+  it("a cancel found under a withheld switch makes exactly the custody calls an ordinary delivered cancel makes, and none switch-specific", { skip: LINUX_CAPTURE, timeout: 120_000 }, async () => {
+    const withheld = await custodyRun("withheld");
+    const delivered = await custodyRun("delivered");
+    failedWith(withheld.d.c.run_id, "run cancelled");
+    failedWith(delivered.d.c.run_id, "run cancelled");
+    assert.deepEqual(switchReports(withheld.d.c.run_id), []);
+    // A recovery-enabled run captures its own work when it ends; the cancel through the new path must capture
+    // exactly as often as the ordinary delivered cancel does, so none of it is the switch's.
+    const captures = (d: Driven) => d.tl.events.filter((e) => e === "capture").length;
+    assert.equal(captures(withheld.d), captures(delivered.d), `captures ${captures(withheld.d)} vs ${captures(delivered.d)}`);
+    assert.deepEqual(withheld.d.attempts, []);
+    assert.deepEqual(withheld.calls, delivered.calls, "the same custody calls, in the same order");
+    // A switch's own custody work would reserve a capture for the claim's generation; neither run may.
+    assert.deepEqual(withheld.calls.filter((call) => call.startsWith("reserve") || call.startsWith("release") || call === "upload"), [],
+      `no capture is reserved or uploaded and no custody hold is released by the switch path: ${JSON.stringify(withheld.calls)}`);
+    assert.ok(withheld.calls.length > 0, "the coordinator was exercised");
+  });
+});
+
+describe("issue #3974: the runner never enters a switch once a cancel was committed under it", () => {
+  /** A plain issue run (no cross-check) whose executor opens a deferred-switch window (the revision-turn
+   *  window), sees the stamp, has the cancel committed, and then misbehaves as `after` says. */
+  async function deferredRun(after: (ctx: RunContext) => Promise<unknown>) {
+    api.deriveCancellationRequested = true;
+    const c = freshClaim(1, { kind: "issue", auto_approve: true });
+    const seen = watchSwitchDelivery();
+    const events: string[] = [];
+    api.onState(c.run_id, (b) => events.push(`state:${b.status}`));
+    const entered: string[] = [];
+    const enter = (RunRunner.prototype as unknown as { enterCredentialSwitch: (...a: unknown[]) => Promise<unknown> }).enterCredentialSwitch;
+    (RunRunner.prototype as unknown as { enterCredentialSwitch: unknown }).enterCredentialSwitch = function (this: unknown, ...a: unknown[]) {
+      entered.push("enterCredentialSwitch");
+      return enter.apply(this, a);
+    };
+    restorers.push(() => { (RunRunner.prototype as unknown as { enterCredentialSwitch: unknown }).enterCredentialSwitch = enter; });
+    healthyCapture();
+    const wip = git.worktreeStatus.bind(git);
+    git.worktreeStatus = (async (...a: Parameters<typeof wip>) => { events.push("capture"); return wip(...a); }) as typeof git.worktreeStatus;
+    let cancelId = 0;
+    const exec: Executor = { run: async (ctx) => {
+      await ctx.deferCredentialSwitch!(async () => {
+        api.requestCredentialSwitch(c.run_id, 1);
+        assert.ok(await until(() => seen.delivered), "the worker polled the switch inside the window");
+        cancelId = send(c.run_id, row("cancel"))[0]!.id;
+        assert.ok(await until(() => seen.cancelCommitted()), "the probe committed the cancel");
+        await after(ctx);
+      });
+      return { branch: ctx.branch };
+    } };
+    await runner(exec, fakeGitlab().gitlab, undefined, { recoveryRetryMs: 1 }).execute(c);
+    assert.ok(cancelId > 0);
+    failedWith(c.run_id, "run cancelled");
+    assert.deepEqual(entered, [], "no switch attempt (enterCredentialSwitch) was made");
+    assert.deepEqual(events.filter((e) => e === "capture"), [], "no capture");
+    assert.deepEqual(switchReports(c.run_id), [], "no credential_switch* report");
+    assert.equal(api.isAcked(c.run_id, cancelId), false);
+    assert.equal(api.isApplied(c.run_id, cancelId), false);
+    return { c, events, seen };
+  }
+
+  it("a CredentialSwitchSignal that escapes after the commit becomes the ordinary cancelled failure (dispatchFailure)", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    await deferredRun(async () => { throw new CredentialSwitchSignal(); });
+  });
+
+  it("an executor call of ctx.attemptCredentialSwitch after the commit is refused with the cancelled error", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    let refused: unknown;
+    await deferredRun(async (ctx) => {
+      refused = await ctx.attemptCredentialSwitch!().then(() => undefined, (e: unknown) => e);
+      throw refused;
+    });
+    assert.ok(refused instanceof Error && refused.message === "run cancelled", String(refused));
+  });
+
+  it("a deliberate hold service-close after the commit trips nothing", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const d = await drive({ capture: "release", switchRounds: [1], pending: true, pendingDeadlineMs: 10 * 60_000,
+      serveCancellation: true, afterSwitch: async (_c, x) => {
+        x.cancel();
+        assert.ok(await until(() => x.switchSeen.cancelCommitted()), "the probe committed the cancel");
+        x.switchSeen.serviceHolds();
+      } });
+    assertCancelledNotSwitched(d);
   });
 });
