@@ -1760,8 +1760,8 @@ Design record: `prds/done/3880-overview-capacity-held-work.md` (epic #3873).
 
 Design record: `prds/done/3879-overview-issue-line.md` (epic #3873).
 
-- On `/overview/next` an Issue work card under Needs your decision shows stations Queued, Planning, Plan review (a gate), Building and PR open, with bays Asking you / Questions, Parked and Other work, derived from each run's effective status; a revising plan counts as Planning, unknown statuses as Building, finished runs never as Other work. Scope follows the Runs list: own runs, every user's active runs for an admin; PR open counts the viewer's own deduplicated PRs, worded as last seen by uzi, never as active. (AI-synced 2026-11-06)
-- Captions never imply the viewer can act on another user's run ("Waiting on you", "Waiting on owners" or a split); Parked says who moves each run and why. Clicking a station or bay filters both Runs groups (pressed state announced); clicking again or Show all restores all active runs. (AI-synced 2026-11-06)
+- On `/overview/next` an Issue work card under Needs your decision shows stations Queued, Planning, Plan review (a gate), Building and PR open, with bays Asking you / Questions, Parked and Other work, derived from each run's effective status and account cooldown; a revising plan counts as Planning, unknown statuses as Building, finished runs never as Other work. Scope follows the Runs list: own runs, every user's active runs for an admin; PR open counts the viewer's own deduplicated PRs, worded as last seen by uzi, never as active. (AI-synced 2026-11-06)
+- Captions never imply the viewer can act on another user's run ("Waiting on you", "Waiting on owners" or a split); Parked says whether its runs resume on their own or need action, and lists their reasons. Clicking a station or bay filters both Runs groups (pressed state announced); clicking again or Show all restores all active runs. (AI-synced 2026-11-06)
 
 ## Demo mode branding
 
