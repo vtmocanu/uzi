@@ -4,6 +4,7 @@ import { test } from "node:test";
 import { compileFunction } from "node:vm";
 import { inspectPodEpochBootstrap } from "../src/pod-epoch-bootstrap.js";
 import { PodEpochSettlementError, runPodEpochShadow } from "../src/pod-epoch-reclaim.js";
+import { buildPodEpochDeletionDeps } from "../src/main.js";
 import type { createPodEpoch, PodEpochOwnership } from "../src/pod-epoch-lock.js";
 
 const source = fs.readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
@@ -48,6 +49,13 @@ function contract(text: string): void {
   assert.ok(at('if (verdict === "shutdown")') < shadow, "reaper refusal and shutdown precede shadow");
   assert.ok(at("startupReapVerdict(") < shadow, "startup settlement precedes shadow");
   const admission = at("await worker.run(");
+  // The runner the reservation binds to is constructed (not claiming anything) before the pass, and the pass
+  // is wired to the production authority, runner and Git cache; main never passes the test override.
+  assert.ok(at("const runner = new RunRunner(") < shadow, "the RunRunner exists before the pass");
+  assert.match(main.slice(shadow, admission),
+    /deletion: buildPodEpochDeletionDeps\(\{ authority, runner, git, dockerHost: config.dockerWiring.dockerHost \}\)/,
+    "the pass receives the production deletion dependencies");
+  assert.ok(!main.includes("enableForTest"), "main never passes the deletion test override");
   assert.ok(shadow < at("if (controller.signal.aborted) return;"), "cancellation checked after shadow");
   assert.ok(at("if (controller.signal.aborted) return;") < admission, "cancellation prevents admission");
   assert.match(main.slice(shadow, admission), /if \(result !== undefined\) log.info\("pod_epoch_reclaim", \{ \.\.\.result \}\)/);
@@ -173,6 +181,8 @@ function admissionPorts(shadow: (options: Record<string, unknown>) => Promise<un
     controller, reap: undefined, startupReapVerdict: () => "run",
     epochBootstrap: {}, epochOwnership: {}, epochConsumption: {},
     config: { dockerWiring: { dockerHost: "unix:///docker.sock" } }, git: {}, client: {},
+    authority: {}, runner: {},
+    buildPodEpochDeletionDeps: (parts: Record<string, unknown>) => ({ built: parts }),
     runPodEpochShadow: shadow,
     log: { info: (message: string, fields: unknown) => { events.push(message); assert.ok(fields); } },
     worker: { run: async (signal: AbortSignal) => { assert.equal(signal, controller.signal); events.push("run"); } },
@@ -190,6 +200,12 @@ test("main waits for shadow handover, forwards its ports and logs a defined verd
     assert.equal(options.dockerHost, "unix:///docker.sock");
     assert.equal(options.git, fixture.ports.git);
     assert.equal(options.client, fixture.ports.client);
+    assert.equal(options.log, fixture.ports.log);
+    const built = (options.deletion as { built: Record<string, unknown> }).built;
+    assert.equal(built.authority, fixture.ports.authority);
+    assert.equal(built.runner, fixture.ports.runner);
+    assert.equal(built.git, fixture.ports.git);
+    assert.equal(built.dockerHost, "unix:///docker.sock");
     assert.equal(options.signal, fixture.controller.signal);
     fixture.events.push("shadow");
     return promise;
@@ -248,4 +264,22 @@ test("startup contract rejects omitted runtime TMPDIR restoration at its named a
   assert.ok(source.includes(call), "restore mutation applies to current candidate");
   assert.throws(() => contract(source.replace(call, "")),
     /required executable symbol: restoreEpochRuntimeTmpdir/, "omit restore must redden the restoration contract");
+});
+
+test("the deletion dependencies main builds bind the runner reservation, never carry the test override and quiesce deny-only", async () => {
+  const calls: unknown[][] = [];
+  const authority = { withTransaction: () => assert.fail("not used"), active: () => undefined, endSourceUse: () => assert.fail("not used") };
+  const git = {};
+  const runner = {
+    withSourceReservation: async (...args: unknown[]) => { calls.push(args); return "reserved"; },
+  };
+  const deps = buildPodEpochDeletionDeps({ authority: authority as never, runner: runner as never, git: git as never, dockerHost: undefined });
+  assert.deepEqual(Object.keys(deps).sort(), ["authority", "git", "quiesce", "reserve"], "no enableForTest key");
+  assert.equal(deps.authority, authority);
+  assert.equal(deps.git, git);
+  const action = async () => 1;
+  assert.equal(await deps.reserve("run-x", action), "reserved");
+  assert.deepEqual(calls, [["run-x", action]]);
+  // Without a recorded maintenance bootstrap the proof is a denial; it never reaches Docker or retains a source.
+  assert.equal(await deps.quiesce(["/tree/0"]), false);
 });

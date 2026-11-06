@@ -58,7 +58,7 @@ import type { CommandSandboxMode } from "./config.js";
 import { ensureRunnerTmpdir } from "./runner-tmpdir.js";
 import { createPodEpoch, restoreEpochRuntimeTmpdir } from "./pod-epoch-lock.js";
 import { inspectPodEpochBootstrap } from "./pod-epoch-bootstrap.js";
-import { PodEpochSettlementError, runPodEpochShadow } from "./pod-epoch-reclaim.js";
+import { PodEpochSettlementError, runPodEpochShadow, type PodEpochDeletionDeps } from "./pod-epoch-reclaim.js";
 
 export function buildWorkerGitCache(
   config: Pick<Config, "dataDir" | "recoveryDecodedLimitBytes">,
@@ -89,6 +89,25 @@ export function buildAfterPublicationEnrolled(
         run_id: runId, claim_generation: claimGeneration,
       });
     });
+  };
+}
+
+/**
+ * The production dependencies of the pod-epoch deletion phase. The phase stays inert while
+ * EPOCH_RECLAIM_DELETION_ENABLED is false; this only binds what it will use. It carries no activation override.
+ * `quiesce` is the deny-only capture-mode proof: it never tears down Docker or retains a source boundary.
+ */
+export function buildPodEpochDeletionDeps(parts: {
+  authority: Pick<AuthorityRuntime, "withTransaction" | "active" | "endSourceUse">;
+  runner: Pick<RunRunner, "withSourceReservation">;
+  git: PodEpochDeletionDeps["git"];
+  dockerHost: string | undefined;
+}): PodEpochDeletionDeps {
+  return {
+    authority: parts.authority,
+    reserve: (runId, action) => parts.runner.withSourceReservation(runId, action),
+    quiesce: () => terminalMaintenanceProof(3, parts.dockerHost),
+    git: parts.git,
   };
 }
 
@@ -1090,7 +1109,8 @@ async function mainBody(): Promise<void> {
   if (epochBootstrap && epochOwnership && epochConsumption) {
     const result = await runPodEpochShadow({
       bootstrap: epochBootstrap, ownership: epochOwnership, consumption: epochConsumption,
-      dockerHost: config.dockerWiring.dockerHost, git, client, signal: controller.signal,
+      dockerHost: config.dockerWiring.dockerHost, git, client, signal: controller.signal, log,
+      deletion: buildPodEpochDeletionDeps({ authority, runner, git, dockerHost: config.dockerWiring.dockerHost }),
     });
     if (result !== undefined) log.info("pod_epoch_reclaim", { ...result });
   }

@@ -12,6 +12,7 @@ import type { PodEpochOwnership } from "../src/pod-epoch-lock.js";
 import { daemon, ENABLE_DELETION_FOR_TEST } from "./pod-epoch-reclaim-support.js";
 import { AuthorityRuntime } from "../src/authority-runtime.js";
 import { RunRunner } from "../src/runner.js";
+import { buildPodEpochDeletionDeps, buildWorkerGitCache } from "../src/main.js";
 import { testLockOptions } from "./authority-test-support.js";
 import { formatAttemptId } from "../src/attempt-path.js";
 import { GitCache, type EpochDiscardProofOptions, type RetainedDiscardOptions } from "../src/git.js";
@@ -516,12 +517,16 @@ let lifetime: WorkerLifetime;
 interface Stack {
   authority: AuthorityRuntime; git: GitCache; scope: PodEpochReclaimScope;
   state: { pending: number; stopped: boolean; finished: number };
+  /** Built through main's production wiring (buildWorkerGitCache and buildPodEpochDeletionDeps). */
+  production: boolean;
 }
 /** A FRESH GitCache plus a FRESH AuthorityRuntime (new incarnation, same worker lifetime) and a fresh native scope. */
-function stack(ops?: AuthorityFsOps): Stack {
+function stack(ops?: AuthorityFsOps, production = false): Stack {
   const authority = new AuthorityRuntime({ lifetime, workerToken: TOKEN, workerIncarnation: randomUUID(), timeoutMs: 5000,
     ...(ops ? { ops } : {}) });
-  const g = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ authority: authority.hooks }));
+  const g = production
+    ? buildWorkerGitCache({ dataDir: fx.dataDir, recoveryDecodedLimitBytes: 8 * 1024 * 1024 }, nullLogger(), async () => false, authority)
+    : new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ authority: authority.hooks }));
   const state = { pending: 0, stopped: false, finished: 0 };
   const scope: PodEpochReclaimScope = {
     assertExclusive() { if (state.stopped) throw new Error("stopped"); },
@@ -535,7 +540,7 @@ function stack(ops?: AuthorityFsOps): Stack {
     assertSettled() { if (state.stopped || state.pending) throw new Error("unsettled"); },
     finish() { this.assertSettled(); state.finished++; },
   };
-  return { authority, git: g, scope, state };
+  return { authority, git: g, scope, state, production };
 }
 async function slotOf(rt: AuthorityRuntime, p: string): Promise<SlotSnapshot | null> {
   return rt.withTransaction(async tx => {
@@ -559,12 +564,12 @@ async function epoch(s: Stack, tune?: (o: Parameters<typeof runPodEpochShadow>[0
     consume: async () => { throw new Error("consume already performed"); },
     matchesEntry: () => true, reacquireShared: async () => { handovers++; }, close: () => {},
   };
-  const deps: PodEpochDeletionDeps = {
-    enableForTest: ENABLE_DELETION_FOR_TEST, authority: s.authority,
-    reserve: ((runId: string, action: (eligible: () => boolean) => Promise<unknown>) =>
-      RunRunner.prototype.withSourceReservation.call(lane as unknown as RunRunner, runId, action)) as PodEpochDeletionDeps["reserve"],
-    quiesce: async () => true, git: s.git,
-  };
+  const reserve = ((runId: string, action: (eligible: () => boolean) => Promise<unknown>) =>
+    RunRunner.prototype.withSourceReservation.call(lane as unknown as RunRunner, runId, action)) as PodEpochDeletionDeps["reserve"];
+  // A production stack uses main's own deps builder (no enableForTest); the test injects the sentinel through `tune`.
+  const deps: PodEpochDeletionDeps = s.production
+    ? buildPodEpochDeletionDeps({ authority: s.authority, runner: { withSourceReservation: reserve as never }, git: s.git, dockerHost: d.host })
+    : { enableForTest: ENABLE_DELETION_FOR_TEST, authority: s.authority, reserve, quiesce: async () => true, git: s.git };
   const options: Parameters<typeof runPodEpochShadow>[0] = {
     bootstrap: { podUid: evidenceDoc.successor, runtime: evidenceDoc.runtime, evidenceFile: "/etc/uzi/pod-epoch/evidence", firstMode: "exclusive" },
     ownership, consumption: { result: "fresh", mayEvaluate: true }, signal: new AbortController().signal,
@@ -826,6 +831,41 @@ it("with the production flag value a real eligible attested pass mutates nothing
   assert.ok(fs.existsSync(clonePath)); assert.deepEqual(fs.readFileSync(path.join(bare, "config")), before);
   assert.equal(await slotOf(stack().authority, clonePath), null);
   assert.equal(s.state.finished, 0);
+});
+it("main's production wiring: with the production flag an eligible attested pass mutates nothing", async () => {
+  const s = stack(undefined, true);
+  const before = fs.readFileSync(path.join(bare, "config"));
+  const out = await epoch(s, o => { assert.equal("enableForTest" in o.deletion!, false); });
+  assert.equal(out.error, undefined);
+  assert.equal(out.result!.would_delete, 1); assert.equal(out.result!.deleted, 0);
+  assert.equal(out.result!.verdict, "eligible"); assert.equal(out.result!.reason, "shadow_complete");
+  assert.equal(out.result!.reclaim_bytes_state, "unknown");
+  assert.ok(fs.existsSync(clonePath)); assert.deepEqual(fs.readFileSync(path.join(bare, "config")), before);
+  assert.equal(await slotOf(stack().authority, clonePath), null);
+  assert.equal(s.state.finished, 0); assert.equal(out.handovers, 1);
+});
+it("main's production wiring: with the test sentinel injected in the test only the same wiring deletes end to end", async () => {
+  const s = stack(undefined, true);
+  // Only the activation sentinel and the deny-only process proof (which needs a recorded maintenance bootstrap and a
+  // process scan) are replaced; authority, reservation and Git are main's production bindings.
+  const out = await epoch(s, (_o, deps) => { deps.enableForTest = ENABLE_DELETION_FOR_TEST; deps.quiesce = async () => true; });
+  assert.equal(out.error, undefined);
+  assert.equal(out.result!.deleted, 1); assert.equal(out.result!.verdict, "eligible"); assert.equal(out.result!.reason, "reclaim_complete");
+  assert.equal(fs.existsSync(clonePath), false); assert.equal(journal(), "");
+  assert.equal(out.result!.source_use_not_ended, 0);
+  assert.equal(s.state.finished, 1); assert.equal(out.handovers, 1);
+  assert.equal((await slotOf(stack().authority, clonePath))?.state, "retired", "read through a fresh AuthorityRuntime");
+});
+it("an unsettled runner delete recorded by Git is fatal: EX stays held and no handover happens", async t => {
+  const s = stack(undefined, true);
+  // Git's unsettled-delete record (a runner-uid rm that may still be running) turns a failed delete into an
+  // unproven outcome instead of a settled residue.
+  (s.git as unknown as { unsettledDeletes: Map<string, number> }).unsettledDeletes.set(path.resolve(clonePath), 1);
+  t.mock.method(fs.promises, "rm", async () => { throw Object.assign(new Error("denied"), { code: "EACCES" }); });
+  const out = await epoch(s, (_o, deps) => { deps.enableForTest = ENABLE_DELETION_FOR_TEST; deps.quiesce = async () => true; });
+  assert.ok(out.error instanceof PodEpochSettlementError, String(out.error));
+  assert.equal(out.handovers, 0); assert.equal(s.state.finished, 0);
+  assert.ok(fs.existsSync(clonePath));
 });
 it("a no-key attempt is an unrecoverable shape: the shadow counts it, the coordinator refuses it before any proof", async () => {
   const entry = { ...JSON.parse(ledger()[0]!), state: "abandoned" };
