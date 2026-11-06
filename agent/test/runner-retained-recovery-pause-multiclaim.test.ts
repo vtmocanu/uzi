@@ -38,6 +38,24 @@ class ServerModel {
   requeues = 0;
   exhausted = false;
   claimsOffered = 1;
+  // The agreed Wr prerequisites, each modeled explicitly (all true/false at their requeue-allowing value).
+  /** The row's worker is still the one whose flight ended. */
+  workerOwned = true;
+  /** The departing flight's snapshot identity and claim generation match the row's. */
+  snapshotMatches = true;
+  /** When the row entered its current status, against the modeled stale-status cutoff. */
+  statusSince = 0;
+  readonly statusCutoff = 1;
+  /** An active row exists at this claim generation (a live flight, so this one is not missing). */
+  activeRowAtGeneration = false;
+  /** A terminal report is pending for this run. */
+  terminalPending = false;
+  /** The worker is over its overflow bound. */
+  workerOverflow = false;
+  /** The run is past its wall-clock limit. */
+  pastWall = false;
+  /** A policy hold covers the run. */
+  policyHold = false;
   readonly reports: string[] = [];
 
   constructor(readonly runId: string, readonly iid: number, firstGeneration: number) {
@@ -89,6 +107,17 @@ class ServerModel {
     return false;
   }
 
+  /** The owner withdrew the pause request (its columns are cleared server-side). */
+  withdrawPause(): void { this.clearPause(); }
+  /** The owner cancelled the run: terminal, pause columns cleared. */
+  ownerCancel(): void { this.status = "cancelled"; this.clearPause(); }
+
+  /** Every Wr prerequisite except the requeue cap. */
+  get requeueEligible(): boolean {
+    return this.departed && this.workerOwned && this.snapshotMatches && this.statusSince < this.statusCutoff &&
+      !this.activeRowAtGeneration && !this.terminalPending && !this.workerOverflow && !this.pastWall && !this.policyHold;
+  }
+
   /** Nonterminal departure without a confirmed park: the flight ended with the row still running. */
   get departed(): boolean {
     return (this.status === "running" || this.status.startsWith("awaiting_")) && !this.claimReleased;
@@ -96,7 +125,7 @@ class ServerModel {
 
   /** After a flight ended: Wr (requeue and re-offer), Wf (cap reached) or nothing. */
   afterFlight(offer: (generation: number, pause: boolean, mode: string | undefined) => any): any {
-    if (!this.departed) return undefined;
+    if (!this.requeueEligible) return undefined;
     if (this.requeueCount - this.baseline >= REQUEUE_CAP) {
       this.status = "recovery_wait";
       this.recoveryCause = "worker_requeue_exhausted";
@@ -351,4 +380,128 @@ it("characterization (c): a confirmed adoption hold is never requeued; only an e
   assert.equal(run.claims.length, 2);
   assert.equal(next.claim_generation, 3);
   assert.equal(next.pause_pending, true);
+});
+
+// The Wr prerequisites, one exclusion at a time: no flight runs, afterFlight is called on the model directly.
+const EXCLUSIONS: Array<[string, (m: ServerModel) => void]> = [
+  ["another worker owns the row", m => { m.workerOwned = false; }],
+  ["the snapshot identity or generation does not match", m => { m.snapshotMatches = false; }],
+  ["the status is newer than the cutoff", m => { m.statusSince = m.statusCutoff; }],
+  ["an active row exists at this generation", m => { m.activeRowAtGeneration = true; }],
+  ["a terminal report is pending", m => { m.terminalPending = true; }],
+  ["the worker is over its overflow bound", m => { m.workerOverflow = true; }],
+  ["the run is past its wall", m => { m.pastWall = true; }],
+  ["a policy hold covers the run", m => { m.policyHold = true; }],
+  ["the row is not departed (a confirmed park)", m => { m.status = "paused"; }],
+];
+it("the requeue model offers a claim when every prerequisite holds", () => {
+  const model = new ServerModel("run", 1, 2);
+  const claim = model.afterFlight(generation => ({ generation }));
+  assert.deepEqual(claim, { generation: 3 });
+  assert.equal(model.requeues, 1);
+});
+for (const [name, exclude] of EXCLUSIONS) {
+  it(`the requeue model offers no claim when ${name}`, () => {
+    const model = new ServerModel("run", 1, 2);
+    exclude(model);
+    assert.equal(model.afterFlight(generation => ({ generation })), undefined);
+    assert.equal(model.requeues, 0);
+    assert.equal(model.claimGeneration, 2);
+    assert.equal(model.exhausted, false, "an excluded run is not the cap outcome");
+  });
+}
+it("the requeue model parks at worker_requeue_exhausted instead of requeueing at the cap", () => {
+  const model = new ServerModel("run", 1, 2);
+  model.requestPause("now");
+  model.requeueCount = REQUEUE_CAP;
+  assert.equal(model.afterFlight(generation => ({ generation })), undefined);
+  assert.equal(model.exhausted, true);
+  assert.equal(model.status, "recovery_wait");
+  assert.equal(model.recoveryCause, "worker_requeue_exhausted");
+  assert.equal(model.pausePending, false, "the cap park clears the pause columns");
+});
+
+// Further outcomes of a deferred pause's settlement against the server model.
+it("P1b: a pause_failed report that itself fails leaves the pause columns, so the requeue seeds the pause again", async () => {
+  installServerModel();
+  const run = await setup({
+    iid: 3995, pause: true, failPublish: true,
+    report: async (body, original) => {
+      if (body.status === "pause_failed") throw new Error("report transport failed");
+      return original();
+    },
+  });
+  await drive(run);
+  assert.equal(run.model.pauseFailedApplied, 0, "the clearing report never reached the server");
+  assert.equal(run.model.pausedApplied, 0);
+  assert.equal(run.model.requeues >= 1, true, "the departure is requeued");
+  assert.equal(run.claims[1].pause_pending, true, "the surviving columns seed the next claim");
+  assert.equal(run.claims[1].pause_mode, "now");
+});
+
+it("P2 applied, ACK lost: the server is paused, nothing is requeued, and no second pause report is sent", async () => {
+  installServerModel();
+  const run = await setup({
+    iid: 3995, pause: true,
+    report: async (body, original) => {
+      const ack = await original(); // the server applied the report ...
+      if (body.status === "paused") throw new Error("ack lost in transit"); // ... but the worker never saw it
+      return ack;
+    },
+  });
+  await drive(run);
+  assert.equal(run.model.status, "paused");
+  assert.equal(run.model.pausedApplied, 1);
+  assert.equal(run.model.requeues, 0, "a paused row is not a missing flight");
+  assert.equal(run.claims.length, 1);
+  assert.equal(run.model.reports.filter(x => x === "paused").length, 1, "exactly one paused report");
+  assert.equal(run.model.reports.includes("pause_failed"), false);
+  assert.equal(run.models, 0);
+});
+
+it("P3 running: a paused ACK answering running (the pause was withdrawn) departs and requeues with no pause seeded", async () => {
+  installServerModel();
+  let withdrawn = false;
+  const run = await setup({
+    iid: 3995, pause: true,
+    report: async (body, original) => {
+      if (body.status === "paused" && !withdrawn) { withdrawn = true; run.model.withdrawPause(); }
+      return original();
+    },
+  });
+  await drive(run);
+  assert.equal(run.model.pausedApplied, 0);
+  assert.equal(run.model.requeues, 1, "the running row is a missing flight");
+  assert.equal(run.claims[1].pause_pending, undefined, "the withdrawn pause is not re-seeded");
+});
+
+it("P3 terminal: a paused ACK answering cancelled ends the run with no requeue", async () => {
+  installServerModel();
+  let cancelled = false;
+  const run = await setup({
+    iid: 3995, pause: true,
+    report: async (body, original) => {
+      if (body.status === "paused" && !cancelled) { cancelled = true; run.model.ownerCancel(); }
+      return original();
+    },
+  });
+  await drive(run);
+  assert.equal(run.model.status, "cancelled");
+  assert.equal(run.model.pausedApplied, 0);
+  assert.equal(run.model.requeues, 0);
+  assert.equal(run.claims.length, 1);
+});
+
+it("cap exhaustion: a refused park at the requeue cap parks at worker_requeue_exhausted with the pause cleared and no further claim", async () => {
+  installServerModel();
+  const run = await setup({ iid: 3995, pause: true, failPublish: true });
+  run.model.requeueCount = REQUEUE_CAP;
+  await drive(run);
+  assert.equal(run.model.exhausted, true);
+  assert.equal(run.model.status, "recovery_wait");
+  assert.equal(run.model.recoveryCause, "worker_requeue_exhausted");
+  assert.equal(run.model.pausePending, false);
+  assert.equal(run.model.requeues, 0);
+  assert.equal(run.claims.length, 1, "no further claim is offered");
+  assert.equal(run.models, 0);
 });

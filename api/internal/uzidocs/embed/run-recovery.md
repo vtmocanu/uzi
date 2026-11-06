@@ -608,7 +608,9 @@ and the [ADR-1197 #3527 amendment](../adr/1197-transient-recovery-park.md#amendm
 
 An owner **Pause now** delivered while a retained re-claim is recovering
 (`recoverRetainedClaim`, before any model turn) is only recorded, like a pause
-pending at claim time; it no longer stops recovery or spends a requeue. When
+pending at claim time; it no longer stops recovery. A successful park spends
+no requeue; a refused park (`pause_failed`) still leaves the run for the normal
+requeue path. When
 recovery returns and no stronger control (cancel, credential switch, wall,
 fence, worker shutdown) is pending, the run parks through the ordinary
 checkpoint-first owner pause, before any planning turn or provider call. If

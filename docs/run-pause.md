@@ -52,7 +52,9 @@ From the run view's **‖ Pause ▾** menu (beside **Stop run**), or
   a checkpoint before the run starts new work. A recovery failure or
   `recovery_wait` hold wins over the waiting pause, and a hold leaves the
   request pending. The park can still be refused (`pause_failed`); the run is
-  then not paused and follows the normal requeue path.
+  then not paused and is left for the normal requeue path. If the worker never
+  hears the reply to its `paused` report, check the run page: the server may
+  already show it paused.
 
 A pending request is a flag on the still-running run, not a state of its
 own — withdraw it any time before the boundary with **Cancel pause** (CLI:

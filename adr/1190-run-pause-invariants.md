@@ -140,9 +140,12 @@ requeue budget. It now behaves like a pause pending at claim time.
 
 - **Window.** `recoverRetainedClaim` opens `SteeringChannel.deferOwnerPauseNow`
   for the recovery body and releases it in a `finally`. Inside it a routed
-  owner `now` is only recorded (no cancel or lifecycle abort, no interrupt). A
-  pending `wall` is never overwritten and keeps its immediate drop; `pause_cancel`
-  clears the record. A publication-only retained claim
+  owner `now` is only recorded (no cancel or lifecycle abort, no interrupt).
+  A `wall` keeps its immediate drop. A `now` routed while a `wall` is already
+  pending is not deferred: it takes the existing immediate path (which, as
+  before the window existed, also records `now` as the mode), and the wall's
+  earlier lifecycle abort has already stopped recovery. The server refuses an
+  owner `now` while a wall request is pending. `pause_cancel` clears the record. A publication-only retained claim
   (`publication_resume`) opens no window and keeps the immediate stop.
 - **Settlement.** At the start of `phasePreflightHandoff`, after recovery
   returns and before the executor, the runner throws the ordinary
@@ -152,8 +155,12 @@ requeue budget. It now behaves like a pause pending at claim time.
   call precedes it.
 - **I4 and I6 preserved.** The run is paused only through `handlePausePark`:
   checkpoint first, then a confirmed `paused` reply. A refused park
-  (`pause_failed`) or uncertain reply leaves the run unpaused and on the
-  existing requeue path; an unconfirmed reply is never reported as paused. A
+  (`pause_failed`) leaves the run unpaused and, with no further executor
+  iteration, on the existing requeue path when its prerequisites hold. A lost
+  or uncertain reply is different: the worker does not count the run as paused,
+  but `SetRunPaused` may already have committed, in which case the server row is
+  `paused` and excluded from automatic requeue. A missing worker ACK establishes
+  neither an unpaused row nor requeue eligibility. A
   `recovery_wait` hold leaves the pause request pending server-side (I4).
 - **Precedence.** Recovery failure, budget exhaustion and adoption-failed holds
   win over the waiting pause; wall, disk, cancel, fence, switch and shutdown
