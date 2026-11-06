@@ -540,6 +540,36 @@ export class FakeApi {
     );
   }
 
+  /** Claims served on POST /runs/claim (200 responses only). */
+  claimsServed = 0;
+  /** Requeues modelled by {@link requeueRun}. */
+  requeues = 0;
+
+  /** A MODEL of the server's requeue of a run whose flight is missing: it re-offers the run at
+   *  `nextGeneration` (the next claim) and counts one requeue. It does not reproduce the server's
+   *  detection or timing; a test calls it when it decides the server would have requeued. */
+  requeueRun(claim: ClaimResponse, nextGeneration: number): ClaimResponse {
+    this.requeues++;
+    const next = { ...claim, claim_generation: nextGeneration };
+    this.setOwnershipStatus(claim.run_id, "running", nextGeneration);
+    this.enqueueClaim(next);
+    return next;
+  }
+
+  /** Redispatches injected by {@link redispatchRun}. */
+  redispatches = 0;
+
+  /** A TEST-INJECTED redispatch: it re-offers the run at `nextGeneration` after a confirmed park, as
+   *  a test's stand-in for any later claim. It is NOT automatic requeue accounting: a confirmed owner
+   *  hold has no automatic retry, and this does not touch {@link requeues}. */
+  redispatchRun(claim: ClaimResponse, nextGeneration: number): ClaimResponse {
+    this.redispatches++;
+    const next = { ...claim, claim_generation: nextGeneration };
+    this.setOwnershipStatus(claim.run_id, "running", nextGeneration);
+    this.enqueueClaim(next);
+    return next;
+  }
+
   enqueueClaim(claim: ClaimResponse): void {
     this.receiptGeneration.set(claim.run_id, claim.claim_generation ?? 0);
     this.claimQueue.push(claim);
@@ -1265,6 +1295,7 @@ export class FakeApi {
     if (req.method === "POST" && p === "/api/worker/runs/claim") {
       const claim = this.claimQueue.shift();
       if (!claim) return sendEmpty(res, 204);
+      this.claimsServed++;
       return send(res, 200, claim);
     }
 
