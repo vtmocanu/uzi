@@ -58,29 +58,33 @@ class ServerModel {
     if (TERMINAL.has(this.status) || this.status === "paused" || this.status === "recovery_wait") return false;
     const status = String(body.status);
     if (status === "paused") {
-      // SetRunPaused: only a running row with pause columns set (or a wall park) is paused.
-      if (this.status !== "running" || !(this.pausePending || body.hold_reason)) return false;
+      // SetRunPaused: status='running' AND pause_requested_at IS NOT NULL AND pause_mode IN (milestone, now, reserve).
+      if (this.status !== "running" || !this.pausePending ||
+          !["milestone", "now", "reserve"].includes(this.pauseMode ?? "")) return false;
       this.status = "paused";
       this.clearPause();
       this.pausedApplied++;
       return true;
     }
     if (status === "pause_failed") {
-      // ClearPauseRequest: the columns go, the row stays running.
+      // ClearPauseRequest: fenced on the live claim and generation; the columns go, the row stays running.
+      if (this.claimReleased || (body.claim_generation !== undefined && body.claim_generation !== this.claimGeneration)) return false;
       this.clearPause();
       this.pauseFailedApplied++;
       return true;
     }
     if (status === "recovery_wait") {
       // ParkRunRetainedRecovery: the park releases the claim and leaves the pause columns alone.
-      if (typeof body.recovery_cause !== "string") return false;
+      if (typeof body.recovery_cause !== "string" || this.status !== "running" || this.claimReleased ||
+          (body.claim_generation !== undefined && body.claim_generation !== this.claimGeneration)) return false;
       this.status = "recovery_wait";
       this.recoveryCause = body.recovery_cause;
       this.claimReleased = true;
       return true;
     }
     if (RECOVERY_PARKS.has(status)) { this.status = status; return true; }
-    if (TERMINAL.has(status)) { this.status = status; return true; }
+    // Terminal transitions also clear the pause columns.
+    if (TERMINAL.has(status)) { this.status = status; this.clearPause(); return true; }
     if (status === "running" || status.startsWith("awaiting_")) { this.status = status; return true; }
     return false;
   }
@@ -129,9 +133,9 @@ function installServerModel(): void {
     const [runId, body] = args as [string, any];
     const model = models.get(runId);
     if (!model) return (report as any)(...args);
-    // A report that throws never reaches the server: the model records nothing.
-    const wouldApply = model.apply(body);
+    // The model applies only after the underlying report resolves, so a transport throw records nothing.
     const ack = await (report as any)(...args);
+    const wouldApply = model.apply(body);
     if (!wouldApply && body.status === "paused") return { ...ack, status: model.status };
     return ack;
   }) as typeof client.reportState;
