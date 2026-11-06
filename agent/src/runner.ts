@@ -15693,23 +15693,33 @@ export class RunRunner {
         let semanticSources: Awaited<ReturnType<typeof captureSemanticSources>> | undefined;
         let semanticDiff: Awaited<ReturnType<RunRunner["captureCheckedPlanningDiff"]>> | undefined;
         if (semanticGate) {
-          if (!barePath) throw new Error("semantic candidate: bare source unavailable");
-          semanticDiff = await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, barePath, steering.lifecycleSignal(), runLog);
-          if ("refusal" in semanticDiff) throw new Error(`semantic candidate: planning diff unavailable (${semanticDiff.refusal}: ${semanticDiff.diagnostic})`);
-          semanticSources = await captureSemanticSources(this.git, {
-            barePath, repo: claim.repo.id, headSha: runnerClone.baseCommit,
-            issue: { id: "issue:" + claim.issue_iid, bytes: Buffer.from(claim.issue_description) },
-            planBytes: Buffer.from(planMd), timeoutMs: 3000, signal: steering.lifecycleSignal(),
-          });
-          semanticCompiled = await semanticGate.compile({
-            plan_md: planMd, milestones: milestones ?? [],
-            required_capabilities: toolchainDetection?.required_capabilities ?? [],
-            required_tools: toolchainDetection?.required_tools ?? [],
-            size_class: toolchainDetection?.size_class ?? "s", base_commit: runnerClone.baseCommit,
-            planning_diff: semanticDiff.diff,
-          }, semanticSubmission, semanticSources.sources);
-          flight.semanticDrift = { barePath, headSha: runnerClone.baseCommit,
-            sources: semanticCompiled.candidate.sources.map(({ id, kind, hash, completeness }) => ({ id, kind, hash, completeness })) };
+          try {
+            if (!barePath) throw new Error("semantic candidate: bare source unavailable");
+            semanticDiff = await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, barePath, steering.lifecycleSignal(), runLog);
+            if ("refusal" in semanticDiff) throw new Error(`semantic candidate: planning diff unavailable (${semanticDiff.refusal}: ${semanticDiff.diagnostic})`);
+            semanticSources = await captureSemanticSources(this.git, {
+              barePath, repo: claim.repo.id, headSha: runnerClone.baseCommit,
+              issue: { id: "issue:" + claim.issue_iid, bytes: Buffer.from(claim.issue_description) },
+              planBytes: Buffer.from(planMd), timeoutMs: 3000, signal: steering.lifecycleSignal(),
+            });
+            semanticCompiled = await semanticGate.compile({
+              plan_md: planMd, milestones: milestones ?? [],
+              required_capabilities: toolchainDetection?.required_capabilities ?? [],
+              required_tools: toolchainDetection?.required_tools ?? [],
+              size_class: toolchainDetection?.size_class ?? "s", base_commit: runnerClone.baseCommit,
+              planning_diff: semanticDiff.diff,
+            }, semanticSubmission, semanticSources.sources);
+            flight.semanticDrift = { barePath, headSha: runnerClone.baseCommit,
+              sources: semanticCompiled.candidate.sources.map(({ id, kind, hash, completeness }) => ({ id, kind, hash, completeness })) };
+          } catch (error) {
+            // The stash is consumed at the adoption point below, after this pre-adoption work. Only the
+            // switch control exit keeps it for the next give-up re-run; any other failure drops it.
+            if (!(error instanceof CredentialSwitchSignal)) {
+              pendingCheckedApproval = undefined;
+              pendingCheckedRevise = undefined;
+            }
+            throw error;
+          }
         }
         // Issue #3149: a resume whose earlier owner follow-ups could not be restored needs a human
         // approval, even on autopilot (no cross-check, no auto-approve), for the whole claim.

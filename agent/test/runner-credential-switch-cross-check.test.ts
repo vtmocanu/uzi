@@ -99,7 +99,7 @@ function failingCapture(): void {
 interface Timeline { events: string[]; callsAt: Record<string, number>; counter: { calls: number } }
 /** Observe the candidate reservation (reserve/release), landed state reports and landed messages in
  *  ONE ordered list. Returns the restore function for the shared batcher prototype. */
-function observe(runId: string, tl: Timeline, opts: { prefix?: string; failAfterRelease?: boolean } = {}) {
+function observe(runId: string, tl: Timeline, opts: { prefix?: string; failAfterRelease?: boolean; healAtReserve?: boolean } = {}) {
   const reserve = MessageBatcher.prototype.reserveCandidateTransport;
   const reservations = { installed: 0, released: 0 };
   const noteRelease = (): void => {
@@ -112,6 +112,8 @@ function observe(runId: string, tl: Timeline, opts: { prefix?: string; failAfter
       this.emit({ kind: "status", payload: { text: opts.prefix } });
       api.failMessagesNext(1);
     }
+    // Deliveries failed until now (the owed assigned replay); the reservation's prepare can land them.
+    if (opts.healAtReserve) api.failMessagesNext(0);
     const reservation = reserve.call(this);
     reservations.installed++;
     tl.events.push("reserve");
@@ -218,7 +220,7 @@ function scriptedQuery(plans: string[], counter: { calls: number }): SdkQueryFn 
 }
 
 const PLAN2 = "# PLAN\n- revised proposal";
-type Verdict = "approve" | "revise" | "block";
+type Verdict = "approve" | "revise" | "block" | "pending";
 interface DriveOpts {
   gated?: boolean;
   verdicts?: Verdict[];
@@ -230,6 +232,11 @@ interface DriveOpts {
   plans?: string[];
   emitHeld?: boolean;
   failAfterRelease?: boolean;
+  /** An assigned replay: a status emitted when the reservation installs whose first delivery fails. */
+  prefix?: string;
+  /** An owed assigned replay: a status emitted (and so seq-assigned) during planning whose delivery keeps
+   *  failing until the reservation installs, whose prepare then delivers it before the candidate is submitted. */
+  owed?: string;
   dropFirstPost?: boolean;
   /** Reject the human gate once the give-up is confirmed (a gate left presented by the old claim). */
   rejectAfterGiveUp?: boolean;
@@ -239,6 +246,8 @@ interface DriveOpts {
   gateMilestones?: (n: number, milestones: Parameters<NonNullable<RunContext["gatePlan"]>>[1]) => Parameters<NonNullable<RunContext["gatePlan"]>>[1];
   /** A forced human gate for the checker's revise/block instead of an automatic revision. */
   manual?: boolean;
+  /** The checker never decides: its answer stays pending past a short deadline (a timed-out checker). */
+  pending?: boolean;
   /** Run first on the pending checker request, whether or not a switch is requested. */
   duringPending?: (c: ReturnType<typeof claim>) => Promise<void>;
   /** Run once the switch is visible to the worker and the checker is still pending. */
@@ -255,9 +264,16 @@ async function drive(o: DriveOpts) {
     : claim();
   const counter = { calls: 0 };
   const tl: Timeline = { events: [], callsAt: {}, counter };
-  const probe = observe(c.run_id, tl, { failAfterRelease: o.failAfterRelease });
+  const failedPosts = { count: 0 };
+  const realPost = client.postMessages;
+  if (o.owed) client.postMessages = async (...args: Parameters<typeof realPost>) => {
+    try { return await realPost.apply(client, args); }
+    catch (error) { if (args[0] === c.run_id) failedPosts.count++; throw error; }
+  };
+  const probe = observe(c.run_id, tl, { failAfterRelease: o.failAfterRelease, prefix: o.prefix, healAtReserve: o.owed !== undefined });
   const switchSeen = watchSwitchDelivery();
   const decided = new Map<number, ReturnType<typeof answer>>();
+  const leadSeqs: number[] = [];
   let lastRound = 0;
   let dropped = false;
   let emit!: RunContext["emit"];
@@ -284,14 +300,16 @@ async function drive(o: DriveOpts) {
         } else api.armStateAckCredentialSwitchOnce(runId, 1, "awaiting_approval");
         await o.afterSwitch?.(c);
       }
-      const verdict = (o.verdicts ?? ["approve"])[round - 1] ?? "approve";
+      const verdict = o.pending ? "pending" : (o.verdicts ?? ["approve"])[round - 1] ?? "approve";
       const generation = Number(body.claim_generation ?? 1);
-      decided.set(round, answer(runId, body, verdict, verdict, {
+      decided.set(round, answer(runId, body, verdict, verdict === "pending" ? "" : verdict, {
         ...proof(runId, generation), candidate_generation: generation,
+        ...(o.pending ? { deadline_at: new Date(Date.now() + 40).toISOString() } : {}),
         ...(o.manual ? {} : { automatic_revision_limit: 3, automatic_rounds_enabled: true }),
         ...(verdict === "revise" ? { findings: { summary: `fix round ${round}`, items: [] } } : {}),
         ...(verdict === "approve" ? canonical(body) : {}),
       }));
+      leadSeqs.push(decided.get(round)!.lead_last_seq);
     }
     const first = !dropped && (o.dropFirstPost ?? false);
     if (first) dropped = true;
@@ -322,6 +340,11 @@ async function drive(o: DriveOpts) {
   let gateCalls = 0;
   const exec: Executor = { run: async (ctx) => {
     emit = ctx.emit;
+    if (o.owed) {
+      api.failMessagesNext(1000);
+      ctx.emit({ kind: "status", payload: { text: o.owed } });
+      assert.ok(await until(() => failedPosts.count > 0), "the assigned replay's first delivery failed");
+    }
     if (o.capture === "release") healthyCapture(); else failingCapture();
     const wip = git.worktreeStatus.bind(git);
     git.worktreeStatus = (async (...a: Parameters<typeof wip>) => { tl.events.push("capture"); return wip(...a); }) as typeof git.worktreeStatus;
@@ -348,10 +371,10 @@ async function drive(o: DriveOpts) {
   try {
     await runner(exec, forge.gitlab, undefined, { planCrossCheckTiming: timing, recoveryRetryMs: 1,
       planApprovalTimeoutMs: 3000, ...o.runnerOpts }).execute(c);
-  } finally { probe.restore(); client.reportPlanCrossCheckGateState = report; }
+  } finally { probe.restore(); client.postMessages = realPost; client.reportPlanCrossCheckGateState = report; api.failMessagesNext(0); }
   const heldSeqs = api.messages(c.run_id).filter((m) => (m.payload as { text?: string }).text?.startsWith("held during"))
     .map((m) => m.seq);
-  return { c, tl, counter, forge, probe, storage, attempts, sentinel, trace, gaveUp: () => gaveUp, heldSeqs,
+  return { c, tl, counter, forge, probe, storage, attempts, sentinel, trace, gaveUp: () => gaveUp, heldSeqs, leadSeqs,
     posts: () => api.crossCheckRequests.filter((r) => r.method === "POST") };
 }
 type Driven = Awaited<ReturnType<typeof drive>>;
@@ -552,6 +575,42 @@ describe("issue #3953 m3: S3 applied human gate", () => {
       await reclaimAndExpectRepresent(c, verdict === "block" ? "block" : "approve", reason, gated);
     });
   }
+
+  it("forced human gate (checker timed out): give-up keeps the presented gate, its binding and its verdict path with no republish", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const d = await drive({ capture: "giveup", pending: true, switchRounds: [1], rejectAfterGiveUp: true });
+    const { c, tl } = d;
+    assertServicedAfterRelease(d);
+    assert.deepEqual(d.attempts, ["attempt", "gave_up"]);
+    assert.deepEqual(switchReports(c.run_id), ["credential_switch_failed"]);
+    assert.ok(tl.events.indexOf("state:awaiting_approval") < tl.events.indexOf("release"),
+      "service only after the applied forced gate released the reservation");
+    const presented = gates(c.run_id) as PlanCrossCheckStateRequest[];
+    assert.equal(presented.length, 1, "no republish after the give-up");
+    assert.equal(presented[0]!.plan_cross_check_gate_reason, "timed_out");
+    assert.ok(presented[0]!.presentation_id, "the presentation identity is intact");
+    const rejects = api.inputRows(c.run_id).filter((r) => r.kind === "reject_plan");
+    assert.equal(rejects.length, 1);
+    assert.ok(api.isApplied(c.run_id, rejects[0]!.id), "the human verdict bound to the original gate revision applied");
+    assert.ok(everyState(c.run_id).some((s) => s.status === "failed" && s.failure_reason?.includes("human after give-up")),
+      JSON.stringify(everyState(c.run_id).map((s) => [s.status, s.failure_reason])));
+    assert.equal(d.posts().length, 1, "no second candidate");
+    assert.deepEqual(d.storage, []);
+    assertSeqsUnique(c.run_id);
+  });
+
+  it("forced human gate (checker timed out): release lets the next claim re-present", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const d = await drive({ capture: "release", pending: true, switchRounds: [1], emitHeld: true });
+    const { c } = d;
+    assertServicedAfterRelease(d);
+    assert.deepEqual(d.attempts, ["attempt", "released"]);
+    assert.deepEqual(switchReports(c.run_id), ["credential_switch"]);
+    const presented = gates(c.run_id) as PlanCrossCheckStateRequest[];
+    assert.equal(presented.length, 1);
+    assert.equal(presented[0]!.plan_cross_check_gate_reason, "timed_out");
+    for (const text of ["held during reservation 1A", "held during reservation 1B"])
+      assert.equal(texts(c.run_id).filter((t) => t === text).length, 1, `${text} delivered once`);
+    await reclaimAndExpectRepresent(c, "timed_out", "timed_out", false);
+  });
 
   for (const capture of ["giveup", "release"] as const) {
     it(`retryable preparation (held human gate): a switch visible while the forced gate ACK is held is serviced after the release (${capture})`, { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
@@ -756,6 +815,155 @@ describe("issue #3953 m3: stash lifetime, ambiguous submit and pre-reserve switc
       }
     });
   }
+});
+
+/** Assigned replay (`prefix`: seq-assigned, first delivery failed, owed to the checker's proof) plus held
+ *  unassigned events emitted while the reservation was installed: the checker's proof covers the replay and
+ *  nothing else, the held events are assigned only by the release, after it, and every message lands once. */
+function assertReplayThenHeld(d: Driven, prefix: string): void {
+  const { c } = d;
+  const log = api.messages(c.run_id);
+  const seqOf = (text: string): number[] => log.filter((m) => (m.payload as { text?: string }).text === text).map((m) => m.seq);
+  const [replaySeq, ...extra] = seqOf(prefix);
+  assert.ok(replaySeq !== undefined && extra.length === 0, `assigned replay delivered exactly once: ${JSON.stringify(seqOf(prefix))}`);
+  const held = ["held during reservation 1A", "held during reservation 1B"].map((t) => {
+    const seqs = seqOf(t);
+    assert.equal(seqs.length, 1, `${t} delivered exactly once: ${JSON.stringify(seqs)}`);
+    return seqs[0]!;
+  });
+  assert.ok(replaySeq < held[0]! && held[0]! < held[1]!, `replay then held, in order: ${JSON.stringify([replaySeq, ...held])}`);
+  assert.deepEqual(d.heldSeqs, held);
+  const ev = d.tl.events;
+  assert.ok(ev.indexOf("reserve") >= 0 && ev.indexOf("msg:assigned replay") > ev.indexOf("reserve"),
+    `the replay was still owed when the reservation installed, and its prepare delivered it: ${JSON.stringify(ev)}`);
+  // Reconciliation: the checker's proof (lead_last_seq) covers the assigned replay and none of the held events.
+  assert.equal(d.leadSeqs.length, 1);
+  assert.ok(d.leadSeqs[0]! >= replaySeq && d.leadSeqs[0]! < held[0]!,
+    `lead_last_seq ${d.leadSeqs[0]} covers the replay (${replaySeq}) and precedes the held events (${held[0]})`);
+  assertSeqsUnique(c.run_id);
+}
+
+describe("issue #3953 m3: an assigned replay and held unassigned events together", () => {
+  const combined: Omit<DriveOpts, "capture"> = { switchRounds: [1], emitHeld: true, owed: "assigned replay", failAfterRelease: true };
+
+  it("S1 release: replay then held events are delivered once before the release report; the next claim continues the seqs", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const d = await drive({ capture: "release", ...combined });
+    const { c, tl } = d;
+    assertServicedAfterRelease(d);
+    assert.deepEqual(d.attempts, ["attempt", "released"]);
+    assertReplayThenHeld(d, "assigned replay");
+    for (const text of ["assigned replay", "held during reservation 1A", "held during reservation 1B"])
+      assert.ok(tl.events.indexOf(`msg:${text}`) >= 0 && tl.events.indexOf(`msg:${text}`) < tl.events.indexOf("state:credential_switch"),
+        `${text} landed before the release report: ${JSON.stringify(tl.events)}`);
+    assert.equal(tl.events.filter((e) => e === "msg:assigned replay").length, 1, "the replay is posted successfully once");
+    assert.deepEqual(d.storage, []);
+    const before = api.messages(c.run_id).map((m) => m.seq);
+    // The next claim re-presents a human gate and its messages continue after every earlier seq.
+    const c2 = reclaim(c);
+    api.crossCheckLatestHandler = () => ({ status: 200, body: {
+      result: "latest", round: 1, candidate_generation: 1, automatic_revision_limit: 2,
+      automatic_rounds_enabled: true, next_round: null, next_round_eligible: false, fallback_reason: "approve" } });
+    api.onState(c.run_id, (b) => { if (b.status === "awaiting_approval") send(c.run_id, row("reject_plan", "next claim human")); });
+    await runner({ run: async (ctx) => new SdkExecutor(nullLogger(), homeDir, { queryFn: scriptedQuery([PLAN], { calls: 0 }) }).run(ctx) },
+      fakeGitlab().gitlab, undefined, { planCrossCheckTiming: timing, recoveryRetryMs: 1, planApprovalTimeoutMs: 3000 }).execute(c2);
+    assert.equal((gates(c.run_id) as PlanCrossCheckStateRequest[]).length, 1, "the next claim re-presents a human gate");
+    assert.equal(d.posts().length, 1, "no second submit");
+    const all = api.messages(c.run_id).map((m) => m.seq);
+    assert.deepEqual(all.slice(0, before.length), before, "earlier events are intact");
+    assert.ok(all.length > before.length, "the next claim delivered its own events");
+    assert.ok(all.slice(before.length).every((seq) => seq > Math.max(...before)), "the next claim's seqs follow the released claim's");
+    for (const text of ["assigned replay", "held during reservation 1A", "held during reservation 1B"])
+      assert.equal(texts(c.run_id).filter((t) => t === text).length, 1, `${text} is not redelivered by the next claim`);
+  });
+
+  it("S1 give-up: replay then held events are delivered once and the adopted approve continues the run", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const d = await drive({ capture: "giveup", ...combined });
+    assertServicedAfterRelease(d);
+    assert.deepEqual(d.attempts, ["attempt", "gave_up"]);
+    assertReplayThenHeld(d, "assigned replay");
+    assert.equal(d.posts().length, 1, "the adopted decision is never resubmitted");
+    assert.equal(d.storage.length, 1);
+    assert.equal(d.storage[0]!.candidate_digest, digest);
+    assert.ok(statuses(d.c.run_id).includes("completed"), JSON.stringify(statuses(d.c.run_id)));
+  });
+
+  for (const capture of ["giveup", "release"] as const) {
+    it(`ambiguous submit (accepted, response lost): replay then held events, status recovery and no second submit (${capture})`, { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+      const d = await drive({ capture, dropFirstPost: true, ...combined });
+      assertServicedAfterRelease(d);
+      assert.equal(api.crossCheckReplies.filter((r) => r.acceptedCandidate && r.dropped).length, 1);
+      assert.deepEqual(api.crossCheckRequests.map((r) => r.method), ["POST", "GET"], "status recovery, never a second submit");
+      assertReplayThenHeld(d, "assigned replay");
+      if (capture === "giveup") {
+        assert.deepEqual(d.attempts, ["attempt", "gave_up"]);
+        assert.equal(d.storage.length, 1);
+        assert.ok(statuses(d.c.run_id).includes("completed"));
+      } else {
+        assert.deepEqual(d.attempts, ["attempt", "released"]);
+        assert.deepEqual(d.storage, []);
+        assert.deepEqual(switchReports(d.c.run_id), ["credential_switch"]);
+      }
+    });
+  }
+});
+
+describe("issue #3953 m3: recovery custody across a held switch's release", () => {
+  it("S1 release (guarded inventory): the released generation's hold and source binding stay open and untouched; the next claim binds only its own generation", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "switch-custody-"));
+    const generation = { current: 1 };
+    const reserved: { generation?: number }[] = [];
+    const releasedGenerations: (number | undefined)[] = [];
+    const archive: RecoveryArchiveClient = {
+      hasFeature: (feature: string) => feature === "recovery_inventory_v1",
+      reserveRecoveryCapture: async (_id, req) => { reserved.push({ generation: req.generation }); return { capture_id: "custody-capture", state: "preparing" }; },
+      getRecoveryCaptureStatus: async (_id, captureId) => ({ capture_id: captureId, state: "preparing", manifest_bound: false }),
+      uploadRecoveryBundle: async (_id, captureId, _manifest, bundle) => {
+        for await (const _chunk of bundle) { /* Consume the real Git bundle. */ }
+        return { capture_id: captureId, state: "available", manifest_bound: true };
+      },
+      releaseRecoveryCustody: async (id, releasedGeneration) => { releasedGenerations.push(releasedGeneration); return { run_id: id, released: true, holds_released: 1 }; },
+      // The server's open guarded hold of the generation being executed.
+      listRecoveryHolds: async (id) => ({ run_id: id, holds: [{ hold_id: `hold-g${generation.current}`,
+        generation: generation.current, inventory_guarded: true, has_available_capture: false }] }),
+    };
+    const recovery = new RecoveryCoordinator({ client: archive, git, log: nullLogger(),
+      recoveryRoot: path.join(root, "recovery"), workerToken: "custody-worker-fixture" });
+    try {
+      const d = await drive({ capture: "release", switchRounds: [1], runnerOpts: { recovery },
+        setup: (c) => { c.inventory_guarded = true; } });
+      const { c } = d;
+      assert.deepEqual(d.attempts, ["attempt", "released"]);
+      assert.deepEqual(switchReports(c.run_id), ["credential_switch"]);
+      // The release keeps the claim's custody exactly as it was pinned: generation and source binding.
+      const afterRelease = await recovery.inspect(c.run_id);
+      assert.equal(afterRelease.length, 1, JSON.stringify(afterRelease));
+      const [held] = afterRelease;
+      assert.equal(held!.generation, 1);
+      assert.equal(held!.inventoryGuarded, true);
+      assert.equal(held!.state, "pinned", "the hold is neither captured nor retired by the release");
+      assert.match(held!.sourceSha, /^[0-9a-f]{40}$/);
+      assert.equal(held!.branch, `agent/issue-${c.issue_iid}`);
+      assert.equal(reserved.length, 0, "no capture was reserved for the released generation");
+      assert.equal(releasedGenerations.length, 0, "the released generation's custody hold is not released");
+
+      // The next claim (generation 2) binds its own generation and leaves generation 1 alone.
+      generation.current = 2;
+      const c2 = { ...reclaim(c), inventory_guarded: true };
+      api.crossCheckLatestHandler = () => ({ status: 200, body: {
+        result: "latest", round: 1, candidate_generation: 1, automatic_revision_limit: 2,
+        automatic_rounds_enabled: true, next_round: null, next_round_eligible: false, fallback_reason: "approve" } });
+      api.onState(c.run_id, (b) => { if (b.status === "awaiting_approval") send(c.run_id, row("reject_plan", "next claim human")); });
+      await runner({ run: async (ctx) => new SdkExecutor(nullLogger(), homeDir, { queryFn: scriptedQuery([PLAN], { calls: 0 }) }).run(ctx) },
+        fakeGitlab().gitlab, undefined, { planCrossCheckTiming: timing, recoveryRetryMs: 1, planApprovalTimeoutMs: 3000, recovery }).execute(c2);
+      const records = await recovery.inspect(c.run_id);
+      assert.deepEqual(records.filter((r) => r.generation === 1), [held], "generation 1's record is byte-identical after the next claim");
+      assert.ok(records.some((r) => r.generation === 2 && r.inventoryGuarded === true), "the next claim pinned its own generation");
+      assert.ok(records.every((r) => r.generation === 1 || r.generation === 2), JSON.stringify(records.map((r) => r.generation)));
+      assert.ok(reserved.length > 0 && reserved.every((r) => r.generation === 2),
+        `the next claim's capture is bound to generation 2 only: ${JSON.stringify(reserved)}`);
+      assert.ok(releasedGenerations.every((g) => g === 2), `no release names generation 1: ${JSON.stringify(releasedGenerations)}`);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
 });
 
 describe("issue #3953 m3: boundaries keep their dispositions; the latch is never serviced", () => {
@@ -971,6 +1179,131 @@ describe("issue #3953 m3: every trip entry reaches neither guard (the state-ack 
       assert.deepEqual(d.attempts, ["attempt", "gave_up"], "serviced once, through the ordinary hook");
       assert.deepEqual(switchReports(d.c.run_id), ["credential_switch_failed"]);
       assert.deepEqual(d.probe.refused, []);
+    });
+  }
+
+  /** Count the APPLIED receipts a pending switch refused, and any waiter rejection with the switch signal
+   *  while a hold is open (the hold must prevent both: a rejection would abort the live reservation). */
+  function watchTripPaths() {
+    const seen = { refused: 0, rejectedUnderHold: [] as string[] };
+    const apply = client.applyInputs;
+    client.applyInputs = async (...args: Parameters<typeof apply>) => {
+      try { return await apply.apply(client, args); }
+      catch (error) {
+        if (String((error as { body?: unknown }).body ?? error).includes("switch_pending")) seen.refused++;
+        throw error;
+      }
+    };
+    const proto = SteeringChannel.prototype as unknown as { rejectParkedWaiters: (err: Error) => void; credentialSwitchHoldOpen: () => boolean };
+    const reject = proto.rejectParkedWaiters;
+    proto.rejectParkedWaiters = function (this: typeof proto, err: Error) {
+      if (err instanceof CredentialSwitchSignal && this.credentialSwitchHoldOpen()) seen.rejectedUnderHold.push(err.name);
+      return reject.call(this, err);
+    };
+    restorers.push(() => { client.applyInputs = apply; proto.rejectParkedWaiters = reject; });
+    return seen;
+  }
+
+  for (const [name, opts] of entries) {
+    it(`${name}: no waiter is rejected with the switch signal while the hold is open`, { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+      const watched = watchTripPaths();
+      const d = await drive({ ...opts, switchRounds: [1] });
+      noInvariant(d.c.run_id);
+      assert.deepEqual(d.attempts, ["attempt", "gave_up"]);
+      assert.deepEqual(watched.rejectedUnderHold, [], "rejectParkedWaiters never ran with the switch signal under an open hold");
+    });
+  }
+
+  // Only the APPLIED refusal reveals the switch here: pendSwitchAfterNextAck without a signal generation
+  // keeps the switch off every inputs poll and ACK, so the latch below can only come from the refusal.
+  for (const [shape, base] of [
+    ["S1 approve", { verdicts: ["approve"] }],
+    ["S3 forced gate, whose presentation waits on the held batch's receipts", { verdicts: ["block"] }],
+  ] as [string, Partial<DriveOpts>][]) for (const capture of ["giveup", "release"] as const) {
+    it(`held lane (${shape}): an operator input ACKed while the reservation is installed has its APPLIED refused switch_pending; the refusal latches and the switch is serviced after the release (${capture})`, { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+      const watched = watchTripPaths();
+      const delivery = watchSwitchDelivery();
+      let rowId = 0;
+      const forced = base.verdicts?.[0] === "block";
+      const d = await drive({ ...base, capture, switchRounds: [], rejectAfterGiveUp: forced && capture === "giveup", duringPending: async (c) => {
+        if (forced) {
+          // Hold the APPLIED request back (the fake api refuses a pending switch's APPLIED before it applies
+          // any reply delay), so the forced gate's presentation is already waiting on the receipt.
+          const apply = client.applyInputs;
+          client.applyInputs = async (...args: Parameters<typeof apply>) => {
+            await new Promise((resolve) => setTimeout(resolve, 150));
+            return apply.apply(client, args);
+          };
+          restorers.push(() => { client.applyInputs = apply; });
+        }
+        api.pendSwitchAfterNextAck(c.run_id);
+        rowId = send(c.run_id, row("follow_up", "operator note while the checker is pending"))[0]!.id;
+        if (forced) {
+          // The decision is returned while the batch's APPLIED is still in flight (delayed): the forced gate's
+          // presentation report then waits on that receipt, and the refusal arrives during that wait.
+          assert.ok(await handlerWait(() => api.isAcked(c.run_id, rowId)), "the operator input was ACKed");
+          return;
+        }
+        assert.ok(await handlerWait(() => watched.refused > 0), "the held batch's APPLIED was refused switch_pending");
+        assert.ok(await handlerWait(() => delivery.latched()), "the refusal latched under the hold");
+      } });
+      assert.ok(watched.refused > 0, "the held batch's APPLIED was refused switch_pending");
+      noInvariant(d.c.run_id);
+      assertServicedAfterRelease(d);
+      assert.deepEqual(watched.rejectedUnderHold, []);
+      assert.ok(rowId > 0);
+      assert.equal(delivery.delivered, false, "the switch never rode an inputs poll: the refusal was its only transport");
+      if (forced) {
+        const presented = gates(d.c.run_id) as PlanCrossCheckStateRequest[];
+        assert.equal(presented.length, 1, "one presentation, never republished");
+        assert.equal(presented[0]!.plan_cross_check_gate_reason, "block");
+      }
+      if (capture === "giveup") {
+        assert.deepEqual(d.attempts, ["attempt", "gave_up"]);
+        assert.deepEqual(switchReports(d.c.run_id), ["credential_switch_failed"]);
+        assert.ok(api.isApplied(d.c.run_id, rowId), "the give-up returns the refused input to the ready lane and its APPLIED lands");
+        if (!forced) {
+          assert.ok(statuses(d.c.run_id).includes("completed"), JSON.stringify(statuses(d.c.run_id)));
+          assert.equal(d.storage.length, 1, "the stashed approve is adopted");
+        }
+      } else {
+        assert.deepEqual(d.attempts, ["attempt", "released"]);
+        assert.deepEqual(switchReports(d.c.run_id), ["credential_switch"]);
+        assert.equal(api.isApplied(d.c.run_id, rowId), false, "the refused input stays unapplied for the next claim");
+        assert.deepEqual(d.storage, []);
+      }
+      assert.equal(d.posts().length, 1);
+    });
+  }
+
+  for (const capture of ["giveup", "release"] as const) {
+    it(`ready lane: a gate input disposed while the reservation is installed has its APPLIED refused switch_pending; the refusal latches and the switch is serviced after the applied gate (${capture})`, { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+      const watched = watchTripPaths();
+      const delivery = watchSwitchDelivery();
+      let rowId = 0;
+      const d = await drive({ gated: true, capture, verdicts: ["approve"], switchRounds: [], rejectAfterGiveUp: capture === "giveup",
+        duringPending: async (c) => {
+          api.pendSwitchAfterNextAck(c.run_id);
+          // An unreadable gate binding on a human-gated claim is disposed of on arrival: final, so it goes to the ready lane.
+          rowId = send(c.run_id, row("reject_plan", "unreadable binding", { gate_binding: "garbage" }))[0]!.id;
+          assert.ok(await handlerWait(() => watched.refused > 0), "the ready lane's APPLIED was refused switch_pending");
+          assert.ok(await handlerWait(() => delivery.latched()), "the refusal latched under the hold");
+        } });
+      noInvariant(d.c.run_id);
+      assertServicedAfterRelease(d);
+      assert.deepEqual(watched.rejectedUnderHold, []);
+      assert.ok(rowId > 0);
+      assert.equal(delivery.delivered, false, "the switch never rode an inputs poll: the refusal was its only transport");
+      assert.equal((gates(d.c.run_id) as PlanCrossCheckStateRequest[]).length, 1, "one presentation, never republished");
+      if (capture === "giveup") {
+        assert.deepEqual(d.attempts, ["attempt", "gave_up"]);
+        assert.deepEqual(switchReports(d.c.run_id), ["credential_switch_failed"]);
+        assert.ok(api.isApplied(d.c.run_id, rowId), "the give-up re-arms the parked input and its APPLIED lands");
+      } else {
+        assert.deepEqual(d.attempts, ["attempt", "released"]);
+        assert.deepEqual(switchReports(d.c.run_id), ["credential_switch"]);
+        assert.equal(api.isApplied(d.c.run_id, rowId), false, "the parked input stays unapplied for the next claim");
+      }
     });
   }
 
@@ -1238,6 +1571,86 @@ describe("issue #3953 m3: semantic coverage forces a human gate after the checke
     assert.equal(api.crossCheckRequests.filter((r) => r.method === "POST").length, 1);
     assert.equal(events.filter((e) => e === "invoke").length, 0, "no coverage review runs on a mismatched adoption");
     assert.equal(gates(c.run_id).length, 0);
+  });
+
+  it("a non-switch failure in the re-run's pre-adoption work clears the stashed approve: a later entry never adopts or trips over the stale decision", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    // The stash (an S1 approve decided under a held switch) is consumed at gatePlan's adoption point, which
+    // follows the semantic compile (planning-diff capture). A non-switch error raised there leaves the stash
+    // pending in the closure; a later gatePlan entry of the same flight must not meet it. SdkExecutor ends
+    // the run on such an error (runThroughSwitch rethrows a non-switch error), so the later entry is driven
+    // here by the executor double: the point is that nothing stale survives the failure.
+    const c = semanticClaim();
+    const events: string[] = [];
+    const server = semanticRig(c, events);
+    server.force("incomplete");
+    const transport = await boundedTransport("claude", server.report, events);
+    api.onState(c.run_id, (b) => { events.push(`state:${b.status}`); if (b.status === "awaiting_approval") send(c.run_id, row("approve_plan")); });
+    let captures = 0;
+    git.capturePlanningDiff = async () => {
+      captures++;
+      if (captures === 2) throw new Error("planning diff capture failed after the give-up");
+      return Buffer.from("");
+    };
+    const outcome: { rerunError?: unknown; later?: { kind: string } } = {};
+    const exec: Executor = { run: async (ctx) => {
+      failingCapture();
+      const call = (md = "Implement A") => ctx.gatePlan!(md, milestones, undefined, undefined, submitted(c.issue_iid));
+      try { await call(); assert.fail("the held switch should have been serviced"); }
+      catch (error) {
+        assert.ok(error instanceof CredentialSwitchSignal, String(error));
+        assert.equal(await ctx.attemptCredentialSwitch!(), "gave_up");
+        // The give-up re-run fails in its pre-adoption work with a non-switch error.
+        outcome.rerunError = await ctx.continueExistingPlanGate!(() => call()).then(() => undefined, (e: unknown) => e);
+      }
+      // A later entry of the same flight presents a different candidate.
+      outcome.later = await call("Implement A, as revised after the failure");
+      return { branch: ctx.branch };
+    } };
+    await runner(exec, fakeGitlab().gitlab, undefined, { semanticCoverageTestTransport: transport,
+      planCrossCheckTiming: timing, recoveryRetryMs: 1, planApprovalTimeoutMs: 4000 }).execute(c);
+    assert.ok(outcome.rerunError instanceof Error && !(outcome.rerunError instanceof CredentialSwitchSignal) &&
+      outcome.rerunError.message.includes("planning diff"), `the re-run failed outside the switch path: ${String(outcome.rerunError)}`);
+    assert.ok(!everyState(c.run_id).some((s) => s.failure_reason?.includes("stashed decision")),
+      "the stale stash was never consulted by the later entry");
+    assert.equal(outcome.later?.kind, "approve", `the later entry presented its own gate: ${JSON.stringify(everyState(c.run_id).map((s) => [s.status, s.failure_reason]))}`);
+    assert.equal(api.crossCheckRequests.filter((r) => r.method === "POST").length, 1, "the checked decision is never resubmitted or replayed");
+    assert.equal(events.filter((e) => e === "invoke").length, 1, "one coverage review: the later entry's");
+  });
+
+  it("a second switch in the re-run's pre-adoption work keeps the stashed approve: the next re-run still meets it", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const c = semanticClaim();
+    const events: string[] = [];
+    const server = semanticRig(c, events);
+    server.force("incomplete");
+    const transport = await boundedTransport("claude", server.report, events);
+    const compile = client.submitSemanticCandidate.bind(client);
+    let compiles = 0;
+    client.submitSemanticCandidate = async (...args) => {
+      if (++compiles === 2) throw new CredentialSwitchSignal();
+      return compile(...args);
+    };
+    const outcome: { second?: unknown; third?: unknown } = {};
+    const exec: Executor = { run: async (ctx) => {
+      failingCapture();
+      const call = (md = "Implement A") => ctx.gatePlan!(md, milestones, undefined, undefined, submitted(c.issue_iid));
+      try { await call(); assert.fail("the held switch should have been serviced"); }
+      catch (error) {
+        assert.ok(error instanceof CredentialSwitchSignal, String(error));
+        assert.equal(await ctx.attemptCredentialSwitch!(), "gave_up");
+        // A second switch interrupts the re-run's pre-adoption work; its service is not repeated here.
+        outcome.second = await ctx.continueExistingPlanGate!(() => call()).then(() => undefined, (e: unknown) => e);
+        // The stash survived that switch exit: a re-run presenting a different candidate meets it and fails closed.
+        outcome.third = await ctx.continueExistingPlanGate!(() => call("Implement A, changed")).then(() => undefined, (e: unknown) => e);
+      }
+      return { branch: ctx.branch };
+    } };
+    await runner(exec, fakeGitlab().gitlab, undefined, { semanticCoverageTestTransport: transport,
+      planCrossCheckTiming: timing, recoveryRetryMs: 1, planApprovalTimeoutMs: 4000 }).execute(c);
+    assert.ok(outcome.second instanceof CredentialSwitchSignal, String(outcome.second));
+    assert.ok(outcome.third instanceof Error && outcome.third.message.includes("stashed decision does not match the re-presented candidate"),
+      `the stash was kept across the switch exit: ${String(outcome.third)}`);
+    assert.equal(api.crossCheckRequests.filter((r) => r.method === "POST").length, 1, "never resubmitted");
+    assert.equal(events.filter((e) => e === "invoke").length, 0, "no coverage review runs on a mismatched adoption");
   });
 
   it("an owner cancel during the re-run's coverage review still aborts it", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
