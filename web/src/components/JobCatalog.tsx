@@ -9,6 +9,7 @@
 import type { CatalogEntry, Repo, Schedule, ScheduleCatalog } from "../lib/api";
 import { humanizeCron } from "../lib/schedulePresets";
 import { jobEnablement } from "../lib/scheduleList";
+import { modelChipText } from "../lib/modelChip";
 import { EnableJobDialog, type EnableResult } from "./EnableJobDialog";
 import { Badge } from "./ui";
 import { LockIcon } from "./icons";
@@ -143,7 +144,7 @@ function JobCard({
       </p>
 
       <div className="mb-3 mt-2 flex flex-wrap gap-1">
-        {entry.model ? <Chip>model {entry.model}</Chip> : <Chip>default model</Chip>}
+        <Chip>{modelChipText(entry.model)}</Chip>
         {entry.target === "sweep" && assigned && <Chip>assigned to uzi</Chip>}
         {entry.target === "sweep" && !assigned && entry.labels?.map((l) => <Chip key={l}>label {l}</Chip>)}
         {entry.target === "sweep" && entry.max_issues > 0 && <Chip>max {entry.max_issues}{entry.capacity_limit != null ? " at a time" : ""}</Chip>}

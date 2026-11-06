@@ -946,11 +946,11 @@ describe("Schedules — default rows on the unified list (PRD #1645 D4)", () => 
     const row = name.closest("tr")!;
     expect(within(row).getByText("30 7 * * 1-5")).toBeTruthy();
     expect(within(row).getByText(/Europe\/Bucharest/)).toBeTruthy();
-    expect(within(row).getByText("model claude-sonnet-4-5")).toBeTruthy();
+    expect(within(row).getByText("model: claude-sonnet-4-5 · pinned")).toBeTruthy();
     // The catalog's values (0 2 * * *, UTC, default model) appear nowhere on the row.
     expect(within(row).queryByText("0 2 * * *")).toBeNull();
     expect(within(row).queryByText(/UTC/)).toBeNull();
-    expect(within(row).queryByText("default model")).toBeNull();
+    expect(within(row).queryByText("model: default")).toBeNull();
     // Sealed labels and the max-issues cap are chips from the row too.
     expect(within(row).getByText("label bug")).toBeTruthy();
     expect(within(row).getByText("3 at a time")).toBeTruthy();
