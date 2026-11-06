@@ -227,7 +227,8 @@ describe("R1 coverage spans clone, bare and a bounded alternates closure", () =>
     chain(3);
     assert.equal(await observation(limits), true, "control: a short chain is within the bound");
     chain(names.length);
-    await unknown(limits, /object store limit|unsupported alternate syntax/);
+    // Past the store bound is a positively identified overflow: a settled keep, not UNKNOWN.
+    assert.equal(await observation(limits), false);
     assert.equal(journal(), raw);
   });
 });

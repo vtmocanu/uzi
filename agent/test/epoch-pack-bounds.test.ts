@@ -83,7 +83,7 @@ afterEach(() => fx?.cleanup());
 
 // Invoke the registered automatic proof under its production native/limit scopes.
 // The discard core intentionally refuses owed consumers before reaching this proof.
-async function observation(limits: { maxMetadataRecords?: number; maxMetadataBytes?: number } = {}): Promise<boolean> {
+async function observation(limits: { maxMetadataRecords?: number; maxMetadataBytes?: number; maxObjectStoreBytes?: number } = {}): Promise<boolean> {
   const proof = git.createEpochDiscardProof(input);
   const state = git["epochDiscardProofs"].get(proof)!;
   return git["epochRetained"].run(git["epochLimits"](limits), () =>
@@ -163,7 +163,11 @@ for (const format of ["OFS", "REF", "forwardREF"] as const) {
     assert.ok(attempts() > 0);
   });
 }
-// Each damage case must be refused by the check it names, not by an earlier one.
+// Each damage case must be refused by the check it names, not by an earlier one. A damage case that is a
+// finite-limit OVERFLOW is a settled keep (owner answer seq 1162, 2026-11-06 (R9)): the proof returns false and
+// the discard keeps the source with `epoch_content_unproven`. Every other case is a corrupt or incomplete store
+// and stays UNKNOWN: it must never be laundered into a settled keep.
+const OVERFLOWS = new Set(["compressed-bomb", "result-bomb", "physical-bomb", "reconstructed-bomb"]);
 const REASONS = {
   "compressed-bomb": /pack entry size limit/,
   "lying-inflated-bomb": /ERR_BUFFER_TOO_LARGE|Cannot create a Buffer larger/i,
@@ -231,15 +235,28 @@ for (const damage of Object.keys(REASONS) as (keyof typeof REASONS)[]) {
     const config = fs.readFileSync(path.join(bare, "config"));
     const ledger = await git["readAllAttemptLedgerRaw"](bare);
     const attempts = verifierSpy(t);
-    await assert.rejects(observation({ maxMetadataBytes: 65536 }), error => {
-      assert.equal((error as Error).constructor.name, "AutomaticCompletenessUnknown");
-      const e = error as Error & { cause?: { code?: string; message?: string } };
-      assert.match(`${e.message} ${e.cause?.code ?? ""} ${e.cause?.message ?? ""}`, REASONS[damage]);
-      return true;
-    });
-    assert.equal(attempts(), 0);
-    const result = await git.discardStoppedSource({ ...options, epochProof: git.createEpochDiscardProof(input) });
-    assert.equal(result.kind, "unknown"); assert.equal(stopped, true);
+    if (OVERFLOWS.has(damage)) {
+      assert.equal(await observation({ maxObjectStoreBytes: 65536 }), false, "a positively identified overflow is a settled keep");
+      assert.equal(attempts(), 0);
+      assert.equal(journal(), raw);
+      // The discard core has no limit argument: lower the same seam for its own epoch scope.
+      const limitsOf = git["epochLimits"].bind(git);
+      t.mock.method(git as unknown as { epochLimits: typeof limitsOf }, "epochLimits",
+        (limits?: Parameters<typeof limitsOf>[0]) => limitsOf({ ...limits, maxObjectStoreBytes: 65536 }));
+      const result = await git.discardStoppedSource({ ...options, epochProof: git.createEpochDiscardProof(input) });
+      assert.deepEqual(result, { kind: "refused", reason: "epoch_content_unproven", consumers: [] });
+      assert.equal(stopped, false, "a settled keep does not stop the epoch scope");
+    } else {
+      await assert.rejects(observation({ maxObjectStoreBytes: 65536 }), error => {
+        assert.equal((error as Error).constructor.name, "AutomaticCompletenessUnknown");
+        const e = error as Error & { cause?: { code?: string; message?: string } };
+        assert.match(`${e.message} ${e.cause?.code ?? ""} ${e.cause?.message ?? ""}`, REASONS[damage]);
+        return true;
+      });
+      assert.equal(attempts(), 0);
+      const result = await git.discardStoppedSource({ ...options, epochProof: git.createEpochDiscardProof(input) });
+      assert.equal(result.kind, "unknown"); assert.equal(stopped, true);
+    }
     assert.ok(fs.existsSync(clonePath)); assert.ok(fs.existsSync(packed + ".pack"));
     assert.deepEqual(fs.readFileSync(path.join(bare, "config")), config);
     assert.deepEqual(await git["readAllAttemptLedgerRaw"](bare), ledger);
@@ -286,7 +303,7 @@ it("charges aggregate inflation across stores before verifying an earlier pair",
   pair([{ id: oid("source"), data: entry(3, Buffer.alloc(150000, 65)) }]);
   pair([{ id: oid("bare"), data: entry(3, Buffer.alloc(150000, 66)) }], bare);
   const attempts = verifierSpy(t);
-  await assert.rejects(observation({ maxMetadataBytes: 256 * 1024 }), error => (error as Error).constructor.name === "AutomaticCompletenessUnknown");
+  assert.equal(await observation({ maxObjectStoreBytes: 256 * 1024 }), false, "aggregate overflow is a settled keep");
   assert.equal(attempts(), 0); assert.equal(journal(), raw);
 });
 it("charges instruction-generated delta content globally before any verifier", async t => {
@@ -298,8 +315,7 @@ it("charges instruction-generated delta content globally before any verifier", a
     { id: oid("expanded"), data: entry(7, instructions, Buffer.from(oid(base), "hex")) },
   ], cwd);
   const attempts = verifierSpy(t);
-  await assert.rejects(observation({ maxMetadataBytes: 256 * 1024 }),
-    error => (error as Error).constructor.name === "AutomaticCompletenessUnknown");
+  assert.equal(await observation({ maxObjectStoreBytes: 256 * 1024 }), false, "generated-byte overflow is a settled keep");
   assert.equal(attempts(), 0); assert.equal(journal(), raw);
 });
 
@@ -338,7 +354,8 @@ it("accepts a multi-byte OFS carry after a real published base", async t => {
 it("bounds actual zlib output allocation when a small pack header lies", async t => {
   pair([{ id: oid("lying allocation"), data: entry(3, Buffer.alloc(16 * 1024 * 1024, 65), Buffer.alloc(0), 8) }]);
   const attempts = verifierSpy(t);
-  await assert.rejects(observation({ maxMetadataBytes: 65536 }), error => {
+  // The header declares 8 bytes, which fits: the overrun contradicts it, so the pack is corrupt (UNKNOWN), not over budget.
+  await assert.rejects(observation({ maxObjectStoreBytes: 65536 }), error => {
     assert.equal((error as Error).constructor.name, "AutomaticCompletenessUnknown");
     assert.equal((error as Error & { cause?: NodeJS.ErrnoException }).cause?.code, "ERR_BUFFER_TOO_LARGE",
       "the inflater must stop before producing the oversized buffer, rather than charge it afterward");
