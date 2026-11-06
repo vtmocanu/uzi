@@ -188,6 +188,37 @@ func (q *Queries) LockOwnerRunsForReset(ctx context.Context, userID uuid.UUID) (
 	return items, nil
 }
 
+const lockOwnerSecretsForReset = `-- name: LockOwnerSecretsForReset :many
+SELECT id FROM user_secrets
+WHERE user_id = $1
+ORDER BY id
+FOR UPDATE
+`
+
+// Run creation share-locks the pinned user_secrets row and then needs KEY SHARE on
+// users (runs_user_id_fkey) for its INSERT. Reset locks users FOR UPDATE, so it
+// must hold the secret rows first (after runs, before users): otherwise its secret
+// DELETE waits on the creator's share lock while the creator waits on users.
+func (q *Queries) LockOwnerSecretsForReset(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, lockOwnerSecretsForReset, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockOwnerWorkersForReset = `-- name: LockOwnerWorkersForReset :many
 SELECT id FROM workers
 WHERE user_id = $1 AND anthropic_secret_id IS NOT NULL
@@ -247,11 +278,16 @@ type LockResetLinkForRedeemRow struct {
 	IssuerIsAdmin     bool               `json:"issuer_is_admin"`
 }
 
-// Same columns as GetResetLinkState, locking only the link row. The target and
-// issuer rows are read unlocked on purpose: every change to either (deactivation,
-// demotion) supersedes the live links through this link row's lock, so a redeem
-// holding the link lock is serialized against it. Locking the issuer row here
-// would deadlock with PatchUser demoting the issuer, which locks users first.
+// Same columns as GetResetLinkState, locking only the link row. The joined target
+// and issuer columns are unlocked reads and may be stale. Callers must check
+// redeemed_at and superseded_at on the returned locked row: every issuer or target
+// deactivation or demotion supersedes the live links through this link row
+// (SupersedeLiveResetLinksForUser, called after the users-row update in the same
+// transaction; the caller that writes is_admin or is_active wires that), so a
+// redeem holding the link lock is serialized against it. Inside vault.Reset the
+// target users row is already locked FOR UPDATE (LockVaultAuthState, owner ==
+// target); only the issuer row is unlocked. Locking the issuer row here would
+// invert the users-then-link order of a demoting writer.
 func (q *Queries) LockResetLinkForRedeem(ctx context.Context, tokenHash []byte) (LockResetLinkForRedeemRow, error) {
 	row := q.db.QueryRow(ctx, lockResetLinkForRedeem, tokenHash)
 	var i LockResetLinkForRedeemRow

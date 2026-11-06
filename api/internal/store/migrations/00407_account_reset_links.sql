@@ -27,7 +27,7 @@
 CREATE TABLE account_reset_links (
     id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id         uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    token_hash      bytea NOT NULL UNIQUE,
+    token_hash      bytea NOT NULL UNIQUE CHECK (octet_length(token_hash) = 32),
     kind            text NOT NULL CHECK (kind IN ('password', 'vault_only')),
     target_is_admin boolean NOT NULL,
     issued_by       uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,

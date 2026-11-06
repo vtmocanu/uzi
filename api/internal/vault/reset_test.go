@@ -58,7 +58,7 @@ func TestResetOrdersCallbackBeforeDeletesBeforeEpochAdvance(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{
-		"LockSecretMutation", "LockOwnerWorkersForReset", "LockOwnerRunsForReset", "LockVaultAuthState",
+		"LockSecretMutation", "LockOwnerWorkersForReset", "LockOwnerRunsForReset", "LockOwnerSecretsForReset", "LockVaultAuthState",
 		"fn",
 		"DeleteAllUserSecretsForOwner", "DeleteAllCodexProviderAccountsForOwner", "DeleteUserVault", "ClearSidebarCodexAccounts",
 		"AdvanceUserVaultMode",

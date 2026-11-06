@@ -185,6 +185,10 @@ func (f *fakeVaultStore) LockOwnerRunsForReset(ctx context.Context, _ uuid.UUID)
 	f.record("LockOwnerRunsForReset")
 	return nil, ctx.Err()
 }
+func (f *fakeVaultStore) LockOwnerSecretsForReset(ctx context.Context, _ uuid.UUID) ([]uuid.UUID, error) {
+	f.record("LockOwnerSecretsForReset")
+	return nil, ctx.Err()
+}
 func (f *fakeVaultStore) DeleteAllUserSecretsForOwner(_ context.Context, id uuid.UUID) (int64, error) {
 	f.record("DeleteAllUserSecretsForOwner")
 	f.mu.Lock()

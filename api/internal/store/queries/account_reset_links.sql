@@ -40,11 +40,16 @@ JOIN users i ON i.id = l.issued_by
 WHERE l.token_hash = @token_hash;
 
 -- name: LockResetLinkForRedeem :one
--- Same columns as GetResetLinkState, locking only the link row. The target and
--- issuer rows are read unlocked on purpose: every change to either (deactivation,
--- demotion) supersedes the live links through this link row's lock, so a redeem
--- holding the link lock is serialized against it. Locking the issuer row here
--- would deadlock with PatchUser demoting the issuer, which locks users first.
+-- Same columns as GetResetLinkState, locking only the link row. The joined target
+-- and issuer columns are unlocked reads and may be stale. Callers must check
+-- redeemed_at and superseded_at on the returned locked row: every issuer or target
+-- deactivation or demotion supersedes the live links through this link row
+-- (SupersedeLiveResetLinksForUser, called after the users-row update in the same
+-- transaction; the caller that writes is_admin or is_active wires that), so a
+-- redeem holding the link lock is serialized against it. Inside vault.Reset the
+-- target users row is already locked FOR UPDATE (LockVaultAuthState, owner ==
+-- target); only the issuer row is unlocked. Locking the issuer row here would
+-- invert the users-then-link order of a demoting writer.
 SELECT l.id, l.user_id, l.kind, l.target_is_admin, l.issued_by, l.created_at, l.expires_at,
        l.redeemed_at, l.superseded_at,
        t.is_active AS target_is_active,
@@ -93,6 +98,16 @@ SELECT id FROM runs
 WHERE user_id = @user_id
   AND (anthropic_secret_id IS NOT NULL OR codex_secret_id IS NOT NULL
        OR limit_dead_secret_id IS NOT NULL OR credential_override_secret_id IS NOT NULL)
+ORDER BY id
+FOR UPDATE;
+
+-- name: LockOwnerSecretsForReset :many
+-- Run creation share-locks the pinned user_secrets row and then needs KEY SHARE on
+-- users (runs_user_id_fkey) for its INSERT. Reset locks users FOR UPDATE, so it
+-- must hold the secret rows first (after runs, before users): otherwise its secret
+-- DELETE waits on the creator's share lock while the creator waits on users.
+SELECT id FROM user_secrets
+WHERE user_id = @user_id
 ORDER BY id
 FOR UPDATE;
 

@@ -21,6 +21,7 @@ const sqlStateDeadlockDetected = "40P01"
 type resetStore interface {
 	LockOwnerWorkersForReset(context.Context, uuid.UUID) ([]uuid.UUID, error)
 	LockOwnerRunsForReset(context.Context, uuid.UUID) ([]uuid.UUID, error)
+	LockOwnerSecretsForReset(context.Context, uuid.UUID) ([]uuid.UUID, error)
 	DeleteAllUserSecretsForOwner(context.Context, uuid.UUID) (int64, error)
 	DeleteAllCodexProviderAccountsForOwner(context.Context, uuid.UUID) (int64, error)
 	ClearSidebarCodexAccounts(context.Context, uuid.UUID) error
@@ -39,7 +40,8 @@ var _ resetStore = (*store.Queries)(nil)
 // changes, CLI-request denial) commit or roll back together with the deletion. fn
 // may run twice: a deadlock-detected failure (SQLSTATE 40P01) rolls the whole
 // transaction back and Reset retries it exactly once, so fn must be a pure
-// function of the transaction it is given.
+// function of the transaction it is given. The single retry exists because a
+// binding acquired after the up-front row locks can still meet the cascade.
 //
 // Atomicity: one PostgreSQL transaction. A failure or crash before commit rolls
 // everything back. An ambiguous commit acknowledgment is never retried and is
@@ -49,10 +51,14 @@ var _ resetStore = (*store.Queries)(nil)
 // configured with.
 //
 // Lock order: the per-owner lifecycle mutex, the owner's advisory secret-mutation
-// guard, the owner's worker rows, the owner's run rows, then the users row and
-// the wrapper. Worker, run, then users matches setRecoveryWaitLocked in
-// workersvc, so the credential-binding SET NULL cascades of the deletes cannot
-// invert that order against a parking run.
+// guard, the owner's worker rows, the owner's run rows, the owner's user_secrets
+// rows, then the users row and the wrapper. Worker, run, then users matches
+// setRecoveryWaitLocked in workersvc, so the credential-binding SET NULL cascades
+// of the deletes cannot invert that order against a parking run. Secrets before
+// users matches run creation with a pinned override, which share-locks the secret
+// and then needs KEY SHARE on users for the runs INSERT. Codex provider accounts
+// are not locked: their share locks are NOWAIT, taken under a run row lock Reset
+// already holds, and are not followed by a users-referencing insert.
 //
 // Reset owns its transaction and must never be called from inside a
 // caller-opened one (PRD #3989 D14): every lifecycle operation takes the in-process
@@ -89,9 +95,15 @@ func resetTx(ctx context.Context, q Store, owner uuid.UUID, fn func(context.Cont
 	if _, err := rq.LockOwnerRunsForReset(ctx, owner); err != nil {
 		return err
 	}
+	if _, err := rq.LockOwnerSecretsForReset(ctx, owner); err != nil {
+		return err
+	}
 	state, _, _, err := lockVaultRows(ctx, q, owner)
 	if err != nil {
 		return err
+	}
+	if state.VaultEpoch == math.MaxInt64 {
+		return ErrEpochExhausted
 	}
 	if err := fn(ctx, bq); err != nil {
 		return err
@@ -107,9 +119,6 @@ func resetTx(ctx context.Context, q Store, owner uuid.UUID, fn func(context.Cont
 	}
 	if err := rq.ClearSidebarCodexAccounts(ctx, owner); err != nil {
 		return err
-	}
-	if state.VaultEpoch == math.MaxInt64 {
-		return ErrEpochExhausted
 	}
 	// The users-row trigger bumps the browser-slot generation with the epoch.
 	return advanceMode(ctx, q, owner, store.VaultModeProtected, state.VaultEpoch+1)

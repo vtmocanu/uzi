@@ -131,6 +131,17 @@ func TestVaultResetLiveDB(t *testing.T) {
 	if n := vrCount(t, pool, "SELECT count(*) FROM vault_browser_slots WHERE user_id=$1", f.owner); n != 1 {
 		t.Fatalf("fixture browser slots = %d", n)
 	}
+	// Further rows the secret and account deletes must null or cascade.
+	vlExec(t, pool, "UPDATE users SET judge_anthropic_secret_id=$2 WHERE id=$1", f.owner, ids.anthropicSecret)
+	vlExec(t, pool, "INSERT INTO anthropic_rate_limits (user_secret_id,user_id,synced_at) VALUES ($1,$2,now())", ids.anthropicSecret, f.owner)
+	conn, repo, schedule, epochRun := uuid.New(), uuid.New(), uuid.New(), ids.runCodex
+	vlExec(t, pool, "INSERT INTO forge_connections (id,user_id,forge_type,base_url,bot_username,bot_forge_user_id,token_ciphertext) VALUES ($1,$2,'gitlab','https://forge.test','bot',1,$3)", conn, f.owner, []byte{1})
+	vlExec(t, pool, "INSERT INTO repos (id,connection_id,forge_project_id,path_with_namespace,web_url,default_branch) VALUES ($1,$2,1,'g/r','https://forge.test/g/r','main')", repo, conn)
+	vlExec(t, pool, `INSERT INTO run_schedules (id,user_id,repo_id,target,issue_iid,timing,run_at,next_fire_at,timezone,auto_approve,wait_on_limit,enabled,status,origin,harness,credential_override_secret_id)
+		VALUES ($1,$2,$3,'issue',1,'once',now(),now(),'UTC',true,false,false,'active','user','claude',$4)`, schedule, f.owner, repo, ids.overrideSecret)
+	vlExec(t, pool, "INSERT INTO run_credential_epochs (run_id,claim_generation,secret_id) VALUES ($1,1,$2)", epochRun, ids.anthropicSecret)
+	vlExec(t, pool, "INSERT INTO codex_account_rate_limits (user_id,provider_account_id) VALUES ($1,$2)", f.owner, ids.accounts[0])
+	vlExec(t, pool, "INSERT INTO codex_refresh_intent (operation_id,user_id,provider_account_id,from_generation,state) VALUES ($1,$2,$3,0,'rotating')", uuid.New(), f.owner, ids.accounts[0])
 
 	if err := v.Reset(ctx, f.owner, vrNoop); err != nil {
 		t.Fatalf("Reset: %v", err)
@@ -152,6 +163,23 @@ func TestVaultResetLiveDB(t *testing.T) {
 	}
 	if n := vrCount(t, pool, "SELECT count(*) FROM users WHERE id=$1 AND sidebar_codex_account_ids IS NULL", f.owner); n != 1 {
 		t.Error("sidebar codex account ids not cleared")
+	}
+	if n := vrCount(t, pool, "SELECT count(*) FROM users WHERE id=$1 AND judge_anthropic_secret_id IS NULL", f.owner); n != 1 {
+		t.Error("judge anthropic secret binding not nulled")
+	}
+	if n := vrCount(t, pool, "SELECT count(*) FROM anthropic_rate_limits WHERE user_id=$1", f.owner); n != 0 {
+		t.Errorf("anthropic_rate_limits rows after reset = %d, want 0", n)
+	}
+	if n := vrCount(t, pool, "SELECT count(*) FROM run_schedules WHERE id=$1 AND credential_override_secret_id IS NULL", schedule); n != 1 {
+		t.Error("schedule credential override not nulled (row must be kept)")
+	}
+	if n := vrCount(t, pool, "SELECT count(*) FROM run_credential_epochs WHERE run_id=$1 AND secret_id IS NULL", epochRun); n != 1 {
+		t.Error("run credential epoch secret_id not nulled (row must be kept)")
+	}
+	for _, table := range []string{"codex_account_rate_limits", "codex_refresh_intent"} {
+		if n := vrCount(t, pool, "SELECT count(*) FROM "+table+" WHERE user_id=$1", f.owner); n != 0 {
+			t.Errorf("%s rows after reset = %d, want 0", table, n)
+		}
 	}
 	after, err := v.State(ctx, f.owner)
 	if err != nil || after.VaultMode != store.VaultModeProtected || after.VaultEpoch != before.VaultEpoch+1 {
@@ -272,22 +300,11 @@ func TestVaultResetAtomicLiveDB(t *testing.T) {
 	}
 }
 
-// TestVaultResetLockOrderLiveDB: a session that locks worker, run, then users
-// (the setRecoveryWaitLocked order) runs concurrently with Reset. Reset locks in
-// the same order, so neither is a deadlock victim and Reset needs no retry.
-func TestVaultResetLockOrderLiveDB(t *testing.T) {
-	pool := vlIsolatedPool(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	f := vlSeed(t, pool, true, true)
-	base := vault.NewPostgres(f.master, pool)
-	if err := base.Unlock(ctx, f.owner, vlLoginPhrase); err != nil {
-		t.Fatal(err)
-	}
-	vrBind(t, f, base)
-
+// vrCountingVault returns a vault over pool whose transactions are counted, so a
+// test can tell a deadlock-victim retry (attempts > 1) from a clean first attempt.
+func vrCountingVault(f vlFixture, pool *pgxpool.Pool) (*vault.Vault, *atomic.Int32) {
 	var attempts atomic.Int32
-	counting := vault.New(f.master, store.New(pool), func(ctx context.Context, fn func(context.Context, vault.Store) error) error {
+	v := vault.New(f.master, store.New(pool), func(ctx context.Context, fn func(context.Context, vault.Store) error) error {
 		attempts.Add(1)
 		tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 		if err != nil {
@@ -303,6 +320,79 @@ func TestVaultResetLockOrderLiveDB(t *testing.T) {
 		}
 		return nil
 	})
+	return v, &attempts
+}
+
+// TestVaultResetPinnedRunCreationLiveDB: run creation with a pinned credential
+// override share-locks the user_secrets row and then its runs INSERT takes KEY
+// SHARE on users. Reset must hold the secret rows before it locks users, or its
+// secret DELETE waits on the creator while the creator waits on users (40P01).
+func TestVaultResetPinnedRunCreationLiveDB(t *testing.T) {
+	pool := vlIsolatedPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	f := vlSeed(t, pool, true, true)
+	base := vault.NewPostgres(f.master, pool)
+	if err := base.Unlock(ctx, f.owner, vlLoginPhrase); err != nil {
+		t.Fatal(err)
+	}
+	ids := vrBind(t, f, base)
+	counting, attempts := vrCountingVault(f, pool)
+
+	creator, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = creator.Rollback(context.Background()) }()
+	var locked uuid.UUID
+	if err := creator.QueryRow(ctx, "SELECT id FROM user_secrets WHERE id=$1 FOR SHARE", ids.anthropicSecret).Scan(&locked); err != nil {
+		t.Fatal(err)
+	}
+
+	resetErr := make(chan error, 1)
+	go func() { resetErr <- counting.Reset(ctx, f.owner, vrNoop) }()
+	deadline := time.Now().Add(15 * time.Second)
+	for vrCount(t, pool, "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock'") == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("Reset never blocked on the creator's secret share lock")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// The creator now inserts its run (KEY SHARE on users via runs_user_id_fkey).
+	_, insErr := creator.Exec(ctx, "INSERT INTO runs (id,user_id,kind,status,issue_title,issue_description,credential_override_secret_id) VALUES ($1,$2,'chat','completed','t','d',$3)",
+		uuid.New(), f.owner, ids.anthropicSecret)
+	if insErr == nil {
+		insErr = creator.Commit(ctx)
+	}
+	if insErr != nil {
+		t.Fatalf("run creation was aborted by Reset (deadlock?): %v", insErr)
+	}
+	if err := <-resetErr; err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("Reset transaction attempts = %d, want 1 (a retry means it was a deadlock victim)", got)
+	}
+	if n := vrCount(t, pool, "SELECT count(*) FROM runs WHERE user_id=$1 AND credential_override_secret_id IS NOT NULL", f.owner); n != 0 {
+		t.Fatalf("%d runs still pin a deleted secret", n)
+	}
+}
+
+// TestVaultResetLockOrderLiveDB: a session that locks worker, run, then users
+// (the setRecoveryWaitLocked order) runs concurrently with Reset. Reset locks in
+// the same order, so neither is a deadlock victim and Reset needs no retry.
+func TestVaultResetLockOrderLiveDB(t *testing.T) {
+	pool := vlIsolatedPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	f := vlSeed(t, pool, true, true)
+	base := vault.NewPostgres(f.master, pool)
+	if err := base.Unlock(ctx, f.owner, vlLoginPhrase); err != nil {
+		t.Fatal(err)
+	}
+	vrBind(t, f, base)
+
+	counting, attempts := vrCountingVault(f, pool)
 
 	parkTx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
