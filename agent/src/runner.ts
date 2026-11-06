@@ -8352,7 +8352,9 @@ export class RunRunner {
    * adopted nothing: a park that then fails (400, unrecognised ack) or turns into a stop leaves no
    * work behind the released hold. Before the clone the failed path has no settle of its own to run
    * (reapRecoveryProviderForSettle returns false while `flight.barePath` is unset), so this release
-   * is the only one an unguarded generation gets. An unsuccessful guarded path keeps its hold.
+   * is the only one an unguarded generation gets. Guarded claims keep custody on a disk park;
+   * an authoritative terminal outcome may still use the existing empty-inventory FINAL
+   * settlement.
    *
    * N2: every such park is pre-clone by construction. The release is guarded on it: a
    * DataVolumeFullError that arrives with a clone in place (`flight.barePath` set) releases nothing
