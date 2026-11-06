@@ -487,3 +487,28 @@ answers and revise feedback for the checker. Decisions:
   Because issue and lead-authored text could carry a lookalike `owner_steering` block, the plan
   prompt opens with a worker-authored line naming the two genuine fence suffixes, and the brief
   says only those blocks are supplied steering.
+
+## Amendment 2026-11-06 — #3985: clarification during a human revision
+
+A plan cross-check run (gated, or required with `auto_approve` cleared at a forced human gate)
+that is not auto-approved stays at `awaiting_approval` while its lead works a HUMAN revise. When
+the lead asks a clarification, the run parks at `awaiting_input`. An answer is not plan approval,
+so `SetRunRunning`'s bound-approval clause refuses an ordinary `running` settlement there, and
+the run used to fail with "clarification running settlement was not confirmed". Decisions:
+
+- **Dedicated settlement, not a relaxed `running`.** A worker that negotiated
+  `clarification_revision_settlement_v1` reports `clarification_settled` with the question,
+  the pending revise input and its gate revision. A claim-fenced writer returns the run to
+  `awaiting_approval`. It requires the applied answer to the open question and the pending,
+  bound, unapplied revise consumed by this worker and claim generation. It refuses when a bound
+  approval was already applied. It writes only status, timestamps, the question markers and the
+  banked question wait. `SetRunRunning` is unchanged, because its SET can freeze candidate
+  milestones, contract and budget fields.
+- **The revise stays pending.** The settlement neither applies nor supersedes the revise; the
+  lead's next presentation does, at gate revision N+1, which only a newly bound approval passes.
+- **D16 unchanged.** No checker pass and no new presentation; plan text, candidate, gate
+  revision and payload are untouched.
+- **Capability matrix.** Old worker or old api: fail-closed, as before. A new worker sends the
+  settlement only after the api advertised it, never strips it or retries it as an unqualified
+  `running`, and accepts only an applied `awaiting_approval` ACK carrying the
+  `clarification_settled` disposition.

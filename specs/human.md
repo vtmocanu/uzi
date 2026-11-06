@@ -848,6 +848,7 @@ Tracked as GitLab issue vtmocanu/uzi#88; PRD at `prds/done/88-ask-user-clarifica
 - An agent can ask the user a clarifying question and wait for the answer, before
   and during a run. [user, the originating ask on #88]
 - One PRD owns the whole mechanism — pre-run and mid-run both. [user 2026-07-19]
+- On a non-auto-approved plan cross-check run, an answer to a clarification asked while the lead revises after a human revise returns the run to the plan gate (`awaiting_approval`) with the revise still pending; it never approves the plan or starts implementation. See [ADR-2149](../adr/2149-cross-check.md#amendment-2026-11-06--3985-clarification-during-a-human-revision). (AI-synced 2026-11-06, #3985)
 - PRD #84 only *emits* pre-run spec questions into this mechanism; it does not build
   the surface. [user 2026-07-19]
 
