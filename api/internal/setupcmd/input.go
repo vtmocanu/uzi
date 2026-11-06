@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"syscall"
 	"unicode"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
@@ -144,16 +145,15 @@ func parseRepos(raw string) ([]string, error) {
 
 // readToken reads the forge token from the file named by path, or from stdin
 // for "-". It reads at most MaxTokenBytes+1 bytes and returns an error without
-// echoing any of the content. A cancelled ctx interrupts a blocked read.
+// echoing any of the content. A cancelled ctx interrupts a blocked stdin read.
 func readToken(ctx context.Context, path string, stdin io.Reader) (string, error) {
-	var src io.Reader = stdin
+	src := stdin
 	if path != "-" {
-		f, err := os.Open(path) //nolint:gosec // G304: the operator names the token file on purpose
+		f, err := openRegularFile(path)
 		if err != nil {
-			return "", fmt.Errorf("cannot open the token file: %w", errors.Unwrap(err))
+			return "", err
 		}
-		// Closing the file also unblocks a read on a FIFO when ctx ends.
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		src = f
 	}
 	raw, err := readBounded(ctx, src, MaxTokenBytes)
@@ -170,6 +170,24 @@ func readToken(ctx context.Context, path string, stdin io.Reader) (string, error
 		}
 	}
 	return token, nil
+}
+
+// openRegularFile opens the token file without blocking and refuses anything
+// that is not a regular file. A plain open of a FIFO with no writer blocks in
+// the kernel before any context-aware read can start, so the open is
+// non-blocking (O_NONBLOCK has no effect on a regular file) and the type is
+// checked on the opened descriptor, which a path swap cannot change.
+func openRegularFile(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0) //nolint:gosec // G304: the operator names the token file on purpose
+	if err != nil {
+		return nil, fmt.Errorf("cannot open the token file: %w", errors.Unwrap(err))
+	}
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, errors.New("the token file must be a regular file; use - to read the token from stdin")
+	}
+	return f, nil
 }
 
 // readBounded reads from r until EOF or limit+1 bytes, whichever comes first,
