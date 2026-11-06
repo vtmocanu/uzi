@@ -502,9 +502,9 @@ export function CompletionStatePanel({ run }: { run: Run }) {
   if (run.status === "paused" && (run.hold_reason === "provider_unavailable" || run.hold_reason === "iteration_budget_exhausted")) return null;
   const phase = run.completion_phase ?? "";
   // PRD #1732: a credential_disabled hold is not a completion state; its own panel covers it.
-  // Issue #3181/#3194: token-switch and base-attestation holds have their own panels.
+  // Token-switch, base-attestation and repo-agent source holds have their own panels.
   const held = run.hold_reason != null && run.hold_reason !== "credential_disabled" && run.hold_reason !== "provider_unavailable" &&
-    run.hold_reason !== "base_attestation_missing" && credentialSwitchHold(run) === null;
+    run.hold_reason !== "base_attestation_missing" && run.hold_reason !== "repo_agent_source_unavailable" && credentialSwitchHold(run) === null;
   if (phase === "" && !held) return null;
   const unmet = run.completion_unmet ?? [];
   const attempts = run.completion_attempts ?? 0;
@@ -987,7 +987,8 @@ export function PausedPanel({
     run.hold_reason === "iteration_budget_exhausted" ||
     // Issue #3181: the token-switch holds have their own panel and Resume gating.
     credentialSwitchHold(run) !== null ||
-    run.hold_reason === "base_attestation_missing"
+    run.hold_reason === "base_attestation_missing" ||
+    run.hold_reason === "repo_agent_source_unavailable"
   )
     return null;
 
@@ -1639,6 +1640,21 @@ function ProviderHoldPanel({ run, ownerProof, busy, onResume, onStop, onCancel }
       <Button size="sm" disabled={busy || unavailable !== null} onClick={onStop}>Stop completed work</Button>
       <Button size="sm" variant="danger" disabled={busy} onClick={onCancel}>Cancel</Button>
     </div> : <p className="mt-2 text-xs text-muted">Only the confirmed run owner can Resume, Stop or Cancel.</p>}
+  </Card>;
+}
+
+function RepoAgentSourceHoldPanel({ run, ownerProof, busy, onResume, onCancel }: {
+  run: Run; ownerProof: boolean; busy: boolean; onResume: () => void; onCancel: () => void;
+}) {
+  if (run.status !== "paused" || run.hold_reason !== "repo_agent_source_unavailable") return null;
+  return <Card className="p-4">
+    <h2 className="text-sm font-semibold text-warn">Repo agents unreadable: waiting for owner</h2>
+    <p className="mt-1 text-xs text-muted">The worker could not read the repository's agent definitions at the required revision. The agent was not started.</p>
+    <p className="mt-1 text-xs text-muted">Check repository access and its default branch, then Resume when the revision is available, or Cancel. This run does not resume automatically.</p>
+    {ownerProof ? <div className="mt-3 flex gap-2">
+      <Button size="sm" disabled={busy} onClick={onResume}>Resume</Button>
+      <Button size="sm" variant="danger" disabled={busy} onClick={onCancel}>Cancel</Button>
+    </div> : <p className="mt-2 text-xs text-muted">Only the run owner can Resume or Cancel this hold.</p>}
   </Card>;
 }
 
@@ -2488,6 +2504,8 @@ export function RunView() {
               ? "credential_switch_unsettled"
             : run?.status === "paused" && run.hold_reason === "base_attestation_missing"
               ? "base_attestation_missing"
+            : run?.status === "paused" && run.hold_reason === "repo_agent_source_unavailable"
+              ? "repo_agent_source_unavailable"
             : run?.status === "paused"
               ? "paused"
             : "";
@@ -2548,6 +2566,8 @@ export function RunView() {
               ? "The run is waiting because a credential it needs is disabled. Enable it and the run resumes automatically."
             : parkKey === "base_attestation_missing"
               ? "The run is held because its retained work is not attested to the planned base commit. The agent was not started. Recover the work or start a successor run."
+            : parkKey === "repo_agent_source_unavailable"
+              ? "The repository's agent definitions could not be read. The agent was not started. Only the run owner can Resume when the revision is available, or Cancel. There is no automatic retry."
             : parkKey === "iteration_budget_exhausted:spent"
               ? "Iteration limit reached. The remaining wall budget is spent. Extend time, then explicitly Resume, or Cancel. Extend leaves the run paused."
             : parkKey === "iteration_budget_exhausted"
@@ -2755,6 +2775,7 @@ export function RunView() {
                 credentialSwitchHold(run) === null &&
                 // Issue #3194: Resume is refused by the server for a base-attestation hold.
                 run.hold_reason !== "base_attestation_missing" &&
+                run.hold_reason !== "repo_agent_source_unavailable" &&
                 (canSteer ? (
                   <Button
                     size="sm"
@@ -3155,6 +3176,12 @@ export function RunView() {
         onCancel={() => cancelRun()}
       />
       <BaseAttestationHoldPanel run={run} ownerProof={canSteer && run.id === id} busy={busy} onCancel={() => cancelRun()} />
+      <RepoAgentSourceHoldPanel run={run} ownerProof={canSteer && run.id === id} busy={busy}
+        onResume={() => { void act(async (isCurrent) => {
+          await api.resumeRun(run.id);
+          if (isCurrent()) await refreshRun();
+        }); }}
+        onCancel={() => { void cancelRun(); }} />
       <PausedPanel
         run={run}
         origin={pauseOrigin(run, messages, pauseOriginReady)}

@@ -2027,9 +2027,10 @@ describe("RunView — paused header: Resume + pending-pause chip (PRD #1190)", (
     } as unknown as ReturnType<typeof useRunStream>);
     mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
     const utils = render(
-      <MemoryRouter initialEntries={["/runs/r1"]}>
-        <RunView />
-      </MemoryRouter>,
+      <RouterProvider router={createMemoryRouter(
+        [{ path: "/runs/:id", element: <RunView /> }],
+        { initialEntries: ["/runs/r1"] },
+      )} />,
     );
     return { ...utils, refreshRun, submit };
   }
@@ -2058,6 +2059,35 @@ describe("RunView — paused header: Resume + pending-pause chip (PRD #1190)", (
     renderPage({ ...PAUSED, hold_reason: "completion_blocked" }, true);
     await screen.findByText("Add rate limiting");
     expect(screen.queryByRole("button", { name: /resume/i })).toBeNull();
+  });
+
+  it("a repo-agent source hold offers owner Resume and Cancel without claiming a checkpoint", async () => {
+    const { refreshRun, submit } = renderPage({ ...PAUSED, hold_reason: "repo_agent_source_unavailable",
+      checkpoint_tip_at: null, checkpoint_contains_latest: false, repo_agent_source_commit: null }, true);
+    const heading = await screen.findByRole("heading", { name: "Repo agents unreadable: waiting for owner" });
+    const panel = within(heading.parentElement!);
+    expect(panel.getByText(/the agent was not started/i)).toBeTruthy();
+    expect(panel.getByText(/does not resume automatically/i)).toBeTruthy();
+    expect(screen.queryByText(/the last checkpoint is pushed/i)).toBeNull();
+    expect(screen.queryByText(/the branch is recovered from the checkpoint/i)).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Completion state" })).toBeNull();
+    expect(screen.getAllByRole("button", { name: /resume/i })).toHaveLength(1);
+    await act(async () => { fireEvent.click(panel.getByRole("button", { name: "Resume" })); });
+    await waitFor(() => expect(mockApi.resumeRun).toHaveBeenCalledWith("r1"));
+    await waitFor(() => expect(refreshRun).toHaveBeenCalled());
+    await act(async () => { fireEvent.click(panel.getByRole("button", { name: "Cancel" })); });
+    await waitFor(() => expect(submit).toHaveBeenCalledWith("cancel", "", undefined, undefined, false));
+  });
+
+  it("a repo-agent source hold gives non-owners no Resume or Cancel controls", async () => {
+    renderPage({ ...PAUSED, hold_reason: "repo_agent_source_unavailable" }, false);
+    const heading = await screen.findByRole("heading", { name: "Repo agents unreadable: waiting for owner" });
+    const panel = within(heading.parentElement!);
+    expect(panel.getByText("Only the run owner can Resume or Cancel this hold.")).toBeTruthy();
+    expect(panel.queryByRole("button")).toBeNull();
+    expect(screen.queryByRole("button", { name: /resume/i })).toBeNull();
+    expect(screen.queryByText(/the last checkpoint is pushed/i)).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Completion state" })).toBeNull();
   });
 
   it("clicking Resume calls api.resumeRun(id) then refreshRun", async () => {
