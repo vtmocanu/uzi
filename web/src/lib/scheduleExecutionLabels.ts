@@ -69,7 +69,10 @@ export function automaticMayApply(i: ExecutionLabelInput): boolean {
 }
 
 /** Text of the harness picker's inherit option. */
-export function harnessInheritLabel(i: ExecutionLabelInput): string {
+export function harnessInheritLabel(input: ExecutionLabelInput): string {
+  // The option describes the form with Default chosen, so a harness the form currently
+  // pins must not hide overflow or automatic choice.
+  const i: ExecutionLabelInput = { ...input, harnessSel: "inherit" };
   if (ownerDefaultUsable(i) && i.ownerDefaultHarness) {
     const name = i.ownerDefaultHarness === "claude" ? "Claude" : "Codex";
     if (overflowMayApply(i)) {

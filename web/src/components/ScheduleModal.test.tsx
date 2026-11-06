@@ -1963,7 +1963,8 @@ describe("the Where it runs fieldset (issue #3256)", () => {
       settings({ harness_overflow_enabled: true, default_harness: "claude", default_codex_model: "gpt-6-astra" });
       await open({ harness: "codex" });
       expect(modelDefault()).toBe("Default · gpt-6-astra (your Codex default)");
-      expect(harnessOpts()[0]).toBe("Default · Claude (your default)");
+      // The harness Default option describes choosing Default, where overflow may apply.
+      expect(harnessOpts()[0]).toBe("Default · Claude (your default; may overflow to Codex when it fires)");
     });
 
     it("a model pin removes the overflow wording from the harness Default", async () => {

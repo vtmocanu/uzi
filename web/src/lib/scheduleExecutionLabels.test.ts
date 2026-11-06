@@ -130,3 +130,16 @@ describe("automaticMayApply (#3256 review: automatic needs an eligible issue-run
     );
   });
 });
+
+describe("harness Default option describes Default chosen, not the current pin", () => {
+  it("a Codex pin with a usable Claude default still shows the overflow wording", () => {
+    expect(harnessInheritLabel(input({ harnessSel: "codex" }))).toBe(
+      "Default · Claude (your default; may overflow to Codex when it fires)",
+    );
+  });
+  it("a harness pin with no saved default still shows automatic for an issue fire", () => {
+    expect(harnessInheritLabel(input({ harnessSel: "claude", ownerDefaultHarness: null }))).toBe(
+      "Default · automatic (chosen when it fires)",
+    );
+  });
+});
