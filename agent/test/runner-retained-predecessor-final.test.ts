@@ -334,66 +334,33 @@ it("a capacity refusal earlier in the iteration never reaches the predecessor pa
 
 // ── Codex ───────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-it("Codex single source: the production chain proves the capture attempt's own clone path and passes", async () => {
-  const r = await drive({ codex: true });
-  assert.deepEqual(ordered(r), ["operate:1", "operate:2", "prepare"]);
-  assertProceeded(r);
-  assert.equal(r.counts.registrations, 1);
-  assert.deepEqual(r.proofs.map(p => [p.generation, p.result, p.proves, p.diagnostics]),
-    [[1, "passed", [true], []], [2, "passed", [true], []]], "no live_attempt_path or codex_attempt_mismatch refusal");
-  const sourceRequests = r.quiesceRequests.filter(q => q.site === "inventory_source");
-  assert.ok(sourceRequests.length >= 2, "the boundary quiesced the source for each proof");
-  const resolved = path.resolve(r.clone.path);
-  for (const req of sourceRequests) {
-    assert.ok(req.attempt, "a Codex proof carries the bound capture attempt");
-    assert.equal(req.attempt.clonePath, resolved, "the bound attempt's clone path is the resolved predecessor clone");
-    assert.deepEqual(req.targetPaths, [resolved]);
-    assert.equal(req.registry.isLivePath(resolved), false, "the capture attempt is not registered as live");
-  }
-});
-
+// A Codex flight is gated off before entry (its production proof does not cover the command uid): the Codex
+// predecessor code (single-source proof, sibling/inventory skips, baseline drift) is unreachable in production and is
+// covered by the registerPredecessorBoundary unit tests in runner-predecessor-boundary.test.ts.
 type ReadHeads = typeof git.readInventoryCloneHeads;
 const identityRead = (options: unknown): boolean => (options as { cloneIdentity?: boolean } | undefined)?.cloneIdentity === true;
-for (const [name, skip, inventory] of [
-  ["a sibling source", "codex_sibling_source", (real: ReadHeads): ReadHeads =>
-    (async (bare: string, runId: string, options?: never) => {
-      const inventory = await real(bare, runId, options);
-      if (inventory.kind !== "verified" || !identityRead(options)) return inventory;
-      return { ...inventory, clones: [...inventory.clones,
-        { clonePath: "/fixture/sibling", branch: "task", runId, head: "b".repeat(40), identity: "1:2" }] };
-    }) as ReadHeads],
-  ["an unverified inventory", "codex_inventory_unknown", (real: ReadHeads): ReadHeads =>
-    (async (bare: string, runId: string, options?: never) =>
-      identityRead(options) ? { kind: "unknown", cause: "other" } : real(bare, runId, options)) as ReadHeads],
-  ["a clone without a head identity", "codex_inventory_incomplete", (real: ReadHeads): ReadHeads =>
-    (async (bare: string, runId: string, options?: never) => {
-      const inventory = await real(bare, runId, options);
-      if (inventory.kind !== "verified" || !identityRead(options)) return inventory;
-      return { ...inventory, clones: inventory.clones.map(({ identity: _identity, ...clone }) => clone) };
-    }) as ReadHeads],
-] as const) {
-  it(`Codex skips before entry on ${name}, and the successor proceeds`, async () => {
-    const r = await drive({ codex: true, inventory });
-    assert.deepEqual(skipReasons(r), [skip]);
-    assert.equal(r.counts.registrations, 0, "no held scope was entered for the predecessor");
-    assert.deepEqual(operations(r), [], "no coordinator operation");
-    assertProceeded(r);
-  });
-}
 
-it("Codex: a change to the source after entry is baseline drift and stops with custody retained", async () => {
+it("Codex single source: gated off before entry with command_uid_unproven, zero predecessor effects, successor proceeds", async () => {
+  const r = await drive({ codex: true });
+  assert.deepEqual(skipReasons(r), ["command_uid_unproven"]);
+  assert.equal(r.counts.registrations, 0, "no held scope was entered for the predecessor");
+  assert.deepEqual(operations(r), [], "no coordinator operation");
+  assert.deepEqual(r.quiesceRequests.filter(q => q.site === "inventory_source"), [], "no predecessor quiescence proof");
+  assertProceeded(r);
+});
+
+it("Codex is gated off before its inventory is even read", async () => {
+  let identityReads = 0;
   const r = await drive({
     codex: true,
-    operate: async (call, world) => {
-      // The pre-entry read is the baseline; a new commit in the clone makes the first proof's read differ.
-      driftCommit(world.clone.path);
-      return settledBy(call, await call.prove());
-    },
+    inventory: (real: ReadHeads): ReadHeads => (async (bare: string, runId: string, options?: never) => {
+      if (identityRead(options)) identityReads++;
+      return real(bare, runId, options);
+    }) as ReadHeads,
   });
-  assert.deepEqual(r.proofs.map(p => [p.generation, p.result]), [[1, "retained"]]);
-  assert.deepEqual(operations(r), ["operate:1"], "no later candidate is started after a stop");
-  assertStopped(r);
-  assert.match(String(logged(r, "retained predecessor FINAL pass").at(-1)?.stop_reason), /baseline_drift/);
+  assert.deepEqual(skipReasons(r), ["command_uid_unproven"]);
+  assert.equal(identityReads, 0, "the Codex baseline read sits behind the gate");
+  assertProceeded(r);
 });
 
 // ── stop and skip classification ─────────────────────────────────────────────────────────────────────────────────────

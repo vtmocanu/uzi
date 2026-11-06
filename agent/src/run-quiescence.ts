@@ -250,7 +250,7 @@ import { fileURLToPath } from "node:url";
 import { maintenanceEsbuildExecutable } from "./maintenance-bootstrap-executable.js";
 import { ATTEMPT_ID_RE, cloneKeyOf, formatAttemptId, isWithinPath } from "./attempt-path.js";
 import { parseDockerTarget } from "./docker-wiring.js";
-import { RUNNER_UID, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
+import { COMMAND_UID, RUNNER_UID, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import type { SdkAttemptEnv } from "./sdk-env.js";
 import {
   RUN_ATTEMPT_ENV,
@@ -1231,6 +1231,161 @@ export function procMountShowsAllProcesses(mountinfo: string): boolean {
   if (options === undefined) return false;
   return options.split(",").every(option => !option.startsWith("hidepid=") ||
     option === "hidepid=0" || option === "hidepid=off");
+}
+
+/** Result of {@link proveNoCommandUid}: only "absent" is a proof; "unproven" is never read as absent. */
+export type CommandUidProof = "absent" | "present" | "unproven";
+
+/** Where {@link proveNoCommandUid} reads: a proc root, the pid its `self` link must name, and the uid looked for. */
+export interface ProcSource {
+  root?: string;
+  selfPid?: number;
+  uid?: number;
+  maxPids?: number;
+  /** Test seam: called with the 0-based scan number before each scan. */
+  beforeScan?: (attempt: number) => void;
+}
+
+const COMMAND_UID_MAX_PIDS = 100_000;
+const COMMAND_UID_STATUS_BYTES = 64 * 1024;
+const COMMAND_UID_MOUNTINFO_BYTES = 4 * 1024 * 1024;
+/** Scans one proof takes at most when every one saw a listed pid vanish. */
+const COMMAND_UID_MAX_SCANS = 5;
+
+class CommandUidScanVanished extends Error {}
+
+/** Reads at most `limit` bytes of `file` (no final-symlink follow). */
+function readCommandUidFile(file: string, limit: number): { text: string; truncated: boolean } {
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for (;;) {
+      const chunk = Buffer.allocUnsafe(4096);
+      const n = fs.readSync(fd, chunk, 0, chunk.length, null);
+      if (n <= 0) return { text: Buffer.concat(chunks).toString("utf8"), truncated: false };
+      if (total + n > limit) {
+        chunks.push(chunk.subarray(0, limit - total));
+        return { text: Buffer.concat(chunks).toString("utf8"), truncated: true };
+      }
+      chunks.push(chunk.subarray(0, n));
+      total += n;
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function commandUidErrno(error: unknown): string | undefined {
+  return typeof error === "object" && error !== null && typeof (error as { code?: unknown }).code === "string"
+    ? (error as { code: string }).code : undefined;
+}
+
+function unescapeMountField(value: string): string {
+  return value.replace(/\\([0-7]{3})/g, (whole, octal: string) => {
+    const code = parseInt(octal, 8);
+    return code <= 255 ? String.fromCharCode(code) : whole;
+  });
+}
+
+/** Twin of Go checkProcMount (agent/codex/supervisor/procscan.go): at least one mount at `root`, each a proc mount
+ *  with no hidepid other than 0/off and no subset=, in either its per-mount or its super-block options. */
+function commandUidProcMountVisible(mountinfo: string, root: string): boolean {
+  let found = false;
+  for (const line of mountinfo.split("\n")) {
+    if (line === "") continue;
+    const split = line.indexOf(" - ");
+    if (split < 0) return false;
+    const left = line.slice(0, split).split(/\s+/).filter(Boolean);
+    const right = line.slice(split + 3).split(/\s+/).filter(Boolean);
+    if (left.length < 6 || right.length < 3) return false;
+    if (unescapeMountField(left[4]!) !== root) continue;
+    found = true;
+    if (right[0] !== "proc") return false;
+    for (const options of [left[5]!, right[2]!]) {
+      for (const option of options.split(",")) {
+        const eq = option.indexOf("=");
+        const key = eq < 0 ? option : option.slice(0, eq);
+        const value = eq < 0 ? "" : option.slice(eq + 1);
+        if (key === "hidepid" && value !== "0" && value !== "off") return false;
+        if (key === "subset") return false;
+      }
+    }
+  }
+  return found;
+}
+
+/** The four uids of a status file's single `Uid:` line, or undefined when it is missing, repeated or malformed. */
+function parseCommandUidStatus(text: string): number[] | undefined {
+  let uids: number[] | undefined;
+  for (const line of text.split("\n")) {
+    const colon = line.indexOf(":");
+    if (colon < 0 || line.slice(0, colon) !== "Uid") continue;
+    const fields = line.slice(colon + 1).split(/\s+/).filter(Boolean);
+    if (uids !== undefined || fields.length !== 4 || !fields.every(f => /^[0-9]{1,10}$/.test(f))) return undefined;
+    uids = fields.map(Number);
+  }
+  return uids;
+}
+
+/** One scan: the pids that hold `uid` in any uid field, other than `selfPid`. Throws CommandUidScanVanished when a
+ *  listed pid vanished before its status was read, and any other Error for an unproven scan. */
+function commandUidScan(root: string, selfPid: number, uid: number, maxPids: number): { sawSelf: boolean; present: boolean } {
+  const mountinfo = readCommandUidFile(path.join(root, "self", "mountinfo"), COMMAND_UID_MOUNTINFO_BYTES);
+  if (mountinfo.truncated || !commandUidProcMountVisible(mountinfo.text, root)) throw new Error("proc mount unproven");
+  if (fs.readlinkSync(path.join(root, "self")) !== String(selfPid)) throw new Error("proc self is not this process");
+  const pids: number[] = [];
+  for (const name of fs.readdirSync(root)) {
+    if (!/^[0-9]{1,10}$/.test(name)) continue;
+    const pid = Number(name);
+    if (pid <= 0) continue;
+    if (pids.length >= maxPids) throw new Error("proc scan bound exceeded");
+    pids.push(pid);
+  }
+  let sawSelf = false, present = false;
+  for (const pid of pids) {
+    let status: { text: string; truncated: boolean };
+    try { status = readCommandUidFile(path.join(root, String(pid), "status"), COMMAND_UID_STATUS_BYTES); }
+    catch (error) {
+      const code = commandUidErrno(error);
+      if (code === "ENOENT" || code === "ESRCH") throw new CommandUidScanVanished();
+      throw error;
+    }
+    let text = status.text;
+    if (status.truncated) text = text.slice(0, text.lastIndexOf("\n") + 1);
+    const uids = parseCommandUidStatus(text);
+    if (uids === undefined) throw new Error("malformed status");
+    if (pid === selfPid) { sawSelf = true; continue; }
+    if (uids.includes(uid)) present = true;
+  }
+  return { sawSelf, present };
+}
+
+/**
+ * Refuse-only proof that no process of this PID namespace holds the command uid (COMMAND_UID) in any of its
+ * real/effective/saved/filesystem uids. A synchronous, read-only TypeScript twin of Go `proveNoUser`
+ * (agent/codex/supervisor/procscan.go): the proc mount must show every process (no hidepid, no subset=), the `self`
+ * link must name this process and the listing must contain it, a missing/repeated/malformed Uid line, an unreadable
+ * status or an oversized listing is "unproven", zombies count, and a scan in which a listed pid vanished before its
+ * status was read is discarded and retaken up to five times. Never throws.
+ */
+export function proveNoCommandUid(proc: ProcSource = {}): CommandUidProof {
+  const root = proc.root ?? PROC_ROOT;
+  const selfPid = proc.selfPid ?? process.pid;
+  const uid = proc.uid ?? COMMAND_UID;
+  const maxPids = proc.maxPids !== undefined && proc.maxPids > 0 ? proc.maxPids : COMMAND_UID_MAX_PIDS;
+  for (let attempt = 0; attempt < COMMAND_UID_MAX_SCANS; attempt++) {
+    try {
+      proc.beforeScan?.(attempt);
+      const scan = commandUidScan(root, selfPid, uid, maxPids);
+      if (!scan.sawSelf) return "unproven";
+      return scan.present ? "present" : "absent";
+    } catch (error) {
+      if (error instanceof CommandUidScanVanished) continue;
+      return "unproven";
+    }
+  }
+  return "unproven";
 }
 
 /** Read-only exclusion proof for the new producer, independent of run attribution.

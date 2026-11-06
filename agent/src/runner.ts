@@ -86,11 +86,13 @@ import {
   describeRootContext,
   mintAttemptId,
   newRunAttempt,
+  proveNoCommandUid,
   quiesceRunAttempt,
   sanitizeForLog,
   unverifiedOnlyByUnattributedUnreadable,
   type QuiesceMode,
   type QuiesceRunOutcome,
+  type CommandUidProof,
   type QuiesceRunRequest,
   type RunAttempt,
 } from "./run-quiescence.js";
@@ -683,7 +685,8 @@ class FreeCaptureScopeExpired extends TrustedExecutionRefusal {}
 
 /** A refusal a predecessor boundary recorded in its grant: every closed coordinator check, plus the runner-only codes. */
 type PredecessorRefusalCheck = InventorySourceDiagnostic["check"] |
-  "ignored_residue" | "over_bound" | "predecessor_scope_invalid" | "codex_attempt_mismatch" | "baseline_drift";
+  "ignored_residue" | "over_bound" | "predecessor_scope_invalid" | "codex_attempt_mismatch" | "baseline_drift" |
+  "command_uid_unproven";
 
 /** The runner-private authority behind a predecessor `PredecessorOperation.boundary` token (issue #2969). */
 interface PredecessorBoundaryGrant {
@@ -701,6 +704,8 @@ interface PredecessorBoundaryGrant {
   baseline: string | undefined;
   readonly refusals: Array<{ check: PredecessorRefusalCheck; clonePath?: string }>;
   settlementLate: boolean;
+  /** Sticky: the command-uid proof stopped being "absent" after entry (see registerPredecessorBoundary). */
+  commandUidLost: boolean;
   readonly live: () => boolean;
 }
 
@@ -3040,6 +3045,9 @@ export interface RunnerOptions {
   dockerHost?: string;
   /** issue #1783: injected for tests; default is the real process reaper + Docker teardown. */
   quiesceRun?: (req: QuiesceRunRequest) => Promise<QuiesceRunOutcome>;
+  /** issue #2969: the predecessor pass's refuse-only command-uid proof (default: the real proc reader,
+   *  proveNoCommandUid); injected for tests. Never consulted by the ordinary terminal FINAL. */
+  commandUidProof?: () => CommandUidProof;
   /** issue #1783: the worker's live-attempt set; injected for tests (default: one per runner). */
   liveAttempts?: LiveAttemptRegistry;
   /** issue #1786: called (fire-and-forget; a throw is swallowed) after a stopped flight retained its
@@ -3410,6 +3418,8 @@ export class RunRunner {
   private readonly liveAttempts: LiveAttemptRegistry;
   /** issue #1783: the quiescence primitive (process reap + Docker teardown). */
   private readonly quiesceImpl: (req: QuiesceRunRequest) => Promise<QuiesceRunOutcome>;
+  /** issue #2969: see {@link RunnerOptions.commandUidProof}. */
+  private readonly commandUidProofImpl: () => CommandUidProof;
   /** issue #1783: the Docker endpoint the teardown half talks to (undefined ⇒ not wired). */
   private readonly dockerHost: string | undefined;
   /** issue #1786: see {@link RunnerOptions.onSourceRetained}. */
@@ -3447,6 +3457,7 @@ export class RunRunner {
     this.pollMs = opts.pollMs ?? 3_000;
     this.liveAttempts = opts.liveAttempts ?? new LiveAttemptRegistry();
     this.quiesceImpl = opts.quiesceRun ?? ((req) => quiesceRunAttempt(req));
+    this.commandUidProofImpl = opts.commandUidProof ?? (() => proveNoCommandUid());
     this.dockerHost = opts.dockerHost;
     this.onSourceRetained = opts.onSourceRetained;
     this.attemptPaths = !!opts.dockerHost;
@@ -4262,13 +4273,23 @@ export class RunRunner {
       codex: flight.executor.withCredentialFreeCapture !== undefined,
       captureAttempt: flight.executor.withCredentialFreeCapture ? flight.activeCaptureAttempt : undefined,
       deadlineAt: Math.min(opts.deadlineAt, held.deadlineAt), baseline, refusals: [], settlementLate: false,
+      commandUidLost: false,
       live: () => live(),
     };
     const heldValid = (): boolean => { try { this.assertHeldFreeCapture(flight, held); return true; } catch { return false; } };
+    // Refuse-only command-uid proof, checked synchronously before every authorised effect (the coordinator calls live()
+    // ahead of each reserve/upload/bundle/publish/release checkpoint). Once lost it stays lost, and is recorded once.
+    const commandUidHeld = (): boolean => {
+      if (grant.commandUidLost) return false;
+      if (this.commandUidState() === "absent") return true;
+      grant.commandUidLost = true;
+      grant.refusals.push({ check: "command_uid_unproven" });
+      return false;
+    };
     const live = (): boolean => this.predecessorBoundaryGrants.get(token) === grant &&
       this.executionTails.get(flight.runId) === tail && flight.executionTail === tail &&
       Date.now() < grant.deadlineAt && heldValid() &&
-      !flight.steering.isCancelled() && flight.steering.claimFence() === undefined;
+      !flight.steering.isCancelled() && flight.steering.claimFence() === undefined && commandUidHeld();
     this.predecessorBoundaryGrants.set(token, grant);
     return {
       token, live,
@@ -4277,6 +4298,11 @@ export class RunRunner {
       markSettlementLate: () => { grant.settlementLate = true; },
       dispose: () => { this.predecessorBoundaryGrants.delete(token); },
     };
+  }
+
+  /** issue #2969: the predecessor pass's command-uid proof; a throwing detector reads as "unproven". */
+  private commandUidState(): CommandUidProof {
+    try { return this.commandUidProofImpl(); } catch { return "unproven"; }
   }
 
   /**
@@ -4346,6 +4372,15 @@ export class RunRunner {
         throw new FreeCaptureScopeExpired("predecessor boundary scope is no longer live");
       }
     };
+    // Predecessor path only (the ordinary caller passes no grant and never reads the proc table here): a command-uid
+    // process that cannot be ruled out refuses. Recorded as a STOP refusal (not residue) and reported to the
+    // coordinator as an existing process diagnostic, so no new persisted code appears.
+    const commandUidUnproven = (): boolean => {
+      if (!grant) return false;
+      if (!grant.commandUidLost && this.commandUidState() === "absent") return false;
+      grant.commandUidLost = true;
+      return true;
+    };
     scope();
     const inventory = await read();
     if (inventory.kind !== "verified")
@@ -4364,6 +4399,8 @@ export class RunRunner {
     if (baselineDrift(inventory.clones)) return fail("baseline_drift", { check: "source_identity_changed" });
     for (const clone of inventory.clones) {
       if (process.platform !== "linux") return fail("non_linux_host", { check: "non_linux_host" });
+      if (commandUidUnproven())
+        return fail("command_uid_unproven", { check: "process_not_quiescent_before_git" }, clone.clonePath);
       scope();
       let request: QuiesceRunRequest;
       const otherClaimInFlight = [...this.executionTails.keys()].some(id => id !== runId);
@@ -4405,6 +4442,8 @@ export class RunRunner {
       const content = await this.git.inventorySourceContentProof(clone.clonePath, bounds);
       const ignored = content === "clean" ? await this.git.inventoryIgnoredResidue(clone.clonePath, bounds) : "clean";
       const after = await this.quiesceImpl({ ...request, dockerHost: undefined, site: "inventory_source:after_runner_git" });
+      if (commandUidUnproven())
+        return fail("command_uid_unproven", { check: "process_not_quiescent_after_git" }, clone.clonePath);
       scope();
       if (content === "unreadable") return fail("worktree_status_unreadable", { check: "worktree_status_unreadable" }, clone.clonePath);
       if (content === "over_bound") return fail("over_bound", { check: "worktree_status_unreadable" }, clone.clonePath);
@@ -4421,6 +4460,7 @@ export class RunRunner {
       return fail("inventory_read_not_verified", { check: "inventory_read_not_verified", cause: inventoryReadCause(afterGit) });
     if (JSON.stringify({ heads: afterGit.heads, clones: afterGit.clones }) !== state.sourceIdentity)
       return fail("source_identity_changed", { check: "source_identity_changed" });
+    if (commandUidUnproven()) return fail("command_uid_unproven", { check: "process_not_quiescent_after_git" });
     return true;
   }
 
@@ -26879,6 +26919,15 @@ export class RunRunner {
       return skip("records_unreadable");
     }
     if (candidates.length === 0) return "proceed";
+    // Refuse-only command-uid gate, before any predecessor effect (no runFreeCapture, no RPC). The quiescence scan only
+    // sees RUNNER_UID, so a COMMAND_UID process writing into a predecessor clone is invisible to it: unless the command
+    // uid is provably absent from the whole PID namespace, the pass is a clean skip and the holds stay as they were.
+    // A Codex flight's production proof does not cover this (its capture attempt scans a single source), so the Codex
+    // predecessor code below is unreachable in production; it stays for the boundary unit tests.
+    if (flight.executor.withCredentialFreeCapture) return skip("command_uid_unproven");
+    // Another run's claim may legitimately own command-uid processes; refusing is today's behaviour.
+    if ([...this.executionTails.keys()].some(id => id !== claim.run_id)) return skip("other_claim_in_flight");
+    if (this.commandUidState() !== "absent") return skip("command_uid_unproven");
     // Codex: the capture attempt owns exactly the predecessor clone, so any other source, or an inventory that is not
     // fully identified, cannot be proven here. The pre-entry read is also the baseline a later change is drift against.
     let baseline: Array<{ clonePath: string; branch: string; head?: string; identity?: string }> | undefined;
