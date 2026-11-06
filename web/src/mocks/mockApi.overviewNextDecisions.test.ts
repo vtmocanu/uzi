@@ -11,10 +11,14 @@ describe("overview-next mock scenario decisions", () => {
     localStorage.setItem("uzi_mock_scenario", "overview-next");
     const { mockApi } = await import("./mockApi");
     const runs = (await mockApi.listRuns({ view: "summary" })).runs;
-    const items = overviewDecisions(runs);
+    const items = overviewDecisions(runs, await mockApi.getRecoveryHolds());
     const kinds = new Set(items.map((i) => i.kind));
-    expect(kinds).toEqual(new Set(["plan", "question", "park", "pr"]));
-    const prs = items.filter((i) => i.kind === "pr").map((i) => i.run);
+    expect(kinds).toEqual(new Set(["plan", "question", "park", "held", "pr"]));
+    // The two decision holds collapse into exactly one held-work row.
+    const held = items.filter((i) => i.kind === "held");
+    expect(held).toHaveLength(1);
+    expect(held[0]).toMatchObject({ count: 2, runId: null });
+    const prs = items.flatMap((i) => (i.kind === "pr" ? [i.run] : []));
     expect(new Set(prs.map((r) => `${r.repo_id}:${r.mr_iid}`)).size).toBe(prs.length);
     // run-ci-halted and its retry share one MR: exactly one of them is listed.
     expect(prs.filter((r) => r.id === "run-ci-halted" || r.id === "run-ov-ci-halted-retry")).toHaveLength(1);

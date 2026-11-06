@@ -36,17 +36,34 @@ import {
 // component, so it is one stable <option> identity rather than a new string per render.
 const AUTO_OPTION = "\u0000auto";
 
-// The judge model cells' labels (PRD #3245): "Default · <model> (<source>)" for the
-// select's reset option and "In effect: <model> · <source>" beneath it. Both read the
-// server's judge_models cell; an older server without cells gets a neutral label.
-function judgeDefaultLabel(cell: ModelSettingCell | undefined): string {
+// The model cells' labels (PRD #3245 judge, PRD #3248 summary): "Default · <model>
+// (<source>)" for the select's reset option and "In effect: <model> · <source>" beneath
+// it. Both read the server's judge_models / summary_models cell; an older server without
+// cells gets a neutral label.
+function modelDefaultLabel(cell: ModelSettingCell | undefined): string {
   return cell
     ? `Default \u00b7 ${cell.default_model} (${modelSettingSourceLabel("model", cell.default_source)})`
     : "Default";
 }
 
-function judgeInEffect(cell: ModelSettingCell): string {
+function modelInEffect(cell: ModelSettingCell): string {
   return `In effect: ${cell.resolved_model} \u00b7 ${modelSettingSourceLabel("model", cell.source)}`;
+}
+
+// The two summary lanes save independently, so a response may carry a stale sibling cell
+// when saves land out of order. Take only the saved lane's cell from the response and keep
+// the rest of the committed cells; a response without that cell (older server) leaves them be.
+function mergeSummaryCell(
+  current: ModelSettingCell[] | undefined,
+  fromResponse: ModelSettingCell[] | undefined,
+  harness: ModelSettingCell["harness"],
+): ModelSettingCell[] | undefined {
+  const saved = fromResponse?.find((c) => c.harness === harness);
+  if (!saved) return current;
+  if (!current) return fromResponse;
+  return current.some((c) => c.harness === harness)
+    ? current.map((c) => (c.harness === harness ? saved : c))
+    : [...current, saved];
 }
 
 const CUSTOM_EMPTY_MESSAGE = "Enter a model ID, or choose Default.";
@@ -332,7 +349,12 @@ export function RunDefaults() {
   // write the same /me/settings endpoint but each sends only its own field.
   const [summaryModel, setSummaryModel] = useState("");
   const [savedSummaryModel, setSavedSummaryModel] = useState("");
+  const [summaryModelCustom, setSummaryModelCustom] = useState(false);
   const [summaryModelBusy, setSummaryModelBusy] = useState(false);
+  // PRD #3248: the Codex lane, a closed Codex-role list with its own saved/busy pair.
+  const [codexSummaryModel, setCodexSummaryModel] = useState("");
+  const [savedCodexSummaryModel, setSavedCodexSummaryModel] = useState("");
+  const [codexSummaryModelBusy, setCodexSummaryModelBusy] = useState(false);
 
   // Per-user default reasoning effort (PRD #617 M5): "" = inherit (a NULL/inherit value
   // resolves to the uzi default `medium` at claim assembly, issue #1157). Its own saved/busy pair,
@@ -375,6 +397,9 @@ export function RunDefaults() {
       const sm = settings.summary_model ?? "";
       setSummaryModel(sm);
       setSavedSummaryModel(sm);
+      const csm = settings.codex_summary_model ?? "";
+      setCodexSummaryModel(csm);
+      setSavedCodexSummaryModel(csm);
       const codexEff = settings.default_codex_effort ?? "";
       setDefaultCodexEffort(codexEff);
       setSavedCodexEffort(codexEff);
@@ -458,29 +483,71 @@ export function RunDefaults() {
 
   // Same validation path as the judge and worker models (PRD #362 M2): the shared
   // modelFieldWarning gates Save, so a per-user summary model can't be saved to a
-  // shape the server rejects.
-  const summaryModelWarning = modelFieldWarning(summaryModel);
-  const summaryModelDirty = summaryModel.trim() !== savedSummaryModel;
+  // shape the server rejects. The Claude lane also refuses a Codex id (the server's
+  // Claude-lane guard, PRD #3248), mirroring the Claude judge lane above.
+  const claudeSummaryCell = committedSettings?.summary_models?.find((c) => c.harness === "claude");
+  const codexSummaryCell = committedSettings?.summary_models?.find((c) => c.harness === "codex");
+  const claudeSummaryTrimmed = summaryModel.trim();
+  const summaryModelWarning =
+    modelFieldWarning(summaryModel) ||
+    (CODEX_ROLE_MODELS.includes(claudeSummaryTrimmed)
+      ? `Not a Claude model: ${claudeSummaryTrimmed} is a Codex model, so Claude summaries skip it. Choose Default to clear it.`
+      : "");
+  const summaryModelDirty = claudeSummaryTrimmed !== savedSummaryModel;
+  const summaryCustomEmpty = summaryModelCustom && claudeSummaryTrimmed === "";
+  const codexSummaryModelDirty = codexSummaryModel.trim() !== savedCodexSummaryModel;
 
+  // One Save per lane, each sending only its own field (null = Default); the response's
+  // resolved summary_models cells replace the committed ones so In-effect follows the save.
   const saveSummaryModel = async () => {
     setError("");
     setNotice("");
     setSummaryModelBusy(true);
     try {
-      const { settings } = await api.putMySettings({ summary_model: summaryModel.trim() || null });
-      setCommittedSettings(current => current && ({ ...current, summary_model: settings.summary_model }));
+      const { settings } = await api.putMySettings({ summary_model: claudeSummaryTrimmed || null });
+      setCommittedSettings(current => current && ({
+        ...current,
+        summary_model: settings.summary_model,
+        summary_models: mergeSummaryCell(current.summary_models, settings.summary_models, "claude"),
+      }));
       const model = settings.summary_model ?? "";
       setSummaryModel(model);
       setSavedSummaryModel(model);
       setNotice(
         model === ""
-          ? "Summary model cleared. Your run summaries use the instance default model."
-          : `Summary model set to ${model}. It applies to your next run's summaries.`,
+          ? "Claude summary model cleared. Your Claude run summaries use the default."
+          : `Claude summary model set to ${model}. It applies to your next run's summaries.`,
       );
     } catch (err) {
-      setError(errorMessage(err, "Failed to save summary model"));
+      setError(errorMessage(err, "Failed to save Claude summary model"));
     } finally {
       setSummaryModelBusy(false);
+    }
+  };
+
+  const saveCodexSummaryModel = async () => {
+    setError("");
+    setNotice("");
+    setCodexSummaryModelBusy(true);
+    try {
+      const { settings } = await api.putMySettings({ codex_summary_model: codexSummaryModel.trim() || null });
+      setCommittedSettings(current => current && ({
+        ...current,
+        codex_summary_model: settings.codex_summary_model,
+        summary_models: mergeSummaryCell(current.summary_models, settings.summary_models, "codex"),
+      }));
+      const model = settings.codex_summary_model ?? "";
+      setCodexSummaryModel(model);
+      setSavedCodexSummaryModel(model);
+      setNotice(
+        model === ""
+          ? "Codex summary model cleared. Your Codex run summaries use the default."
+          : `Codex summary model set to ${model}. It applies to your next run's summaries.`,
+      );
+    } catch (err) {
+      setError(errorMessage(err, "Failed to save Codex summary model"));
+    } finally {
+      setCodexSummaryModelBusy(false);
     }
   };
 
@@ -923,14 +990,14 @@ export function RunDefaults() {
                     value={judgeModel}
                     onChange={setJudgeModel}
                     onCustomModeChange={setJudgeModelCustom}
-                    defaultLabel={judgeDefaultLabel(claudeJudgeCell)}
+                    defaultLabel={modelDefaultLabel(claudeJudgeCell)}
                     customAriaLabel="Custom Claude judge model ID"
                     ariaDescribedBy={claudeJudgeCell ? "judge-model-effect" : undefined}
                   />
                 </Field>
                 {claudeJudgeCell && (
                   <p id="judge-model-effect" className="text-xs text-faint">
-                    {judgeInEffect(claudeJudgeCell)}
+                    {modelInEffect(claudeJudgeCell)}
                   </p>
                 )}
                 {judgeCustomEmpty && (
@@ -951,14 +1018,14 @@ export function RunDefaults() {
                     value={codexJudgeModel}
                     onChange={setCodexJudgeModel}
                     onCustomModeChange={setCodexJudgeModelCustom}
-                    defaultLabel={judgeDefaultLabel(codexJudgeCell)}
+                    defaultLabel={modelDefaultLabel(codexJudgeCell)}
                     customAriaLabel="Custom Codex judge model ID"
                     ariaDescribedBy={codexJudgeCell ? "codex-judge-model-effect" : undefined}
                   />
                 </Field>
                 {codexJudgeCell && (
                   <p id="codex-judge-model-effect" className="text-xs text-faint">
-                    {judgeInEffect(codexJudgeCell)}
+                    {modelInEffect(codexJudgeCell)}
                   </p>
                 )}
                 {codexJudgeCustomEmpty && (
@@ -991,39 +1058,99 @@ export function RunDefaults() {
         </div>
       </Card>
 
-      {/* Per-user run-summary model (PRD #362 M2). Each run generates short
-          plain-English summaries on the run owner's own token; leave this on Default
-          to use the instance summary model the admin picked, or pin one here to
-          override it for YOUR runs only. Same picker + validation as the judge and
-          worker models, so a bad model blocks Save rather than failing on the next run. */}
+      {/* Per-user run-summary models (PRD #362 M2, PRD #3248), one per harness. Each run
+          generates short plain-English summaries on the harness it runs on; leave a lane
+          on Default to follow the instance setting, or pin one here to override it for
+          YOUR runs only. Lanes are shown by the same rule as the worker-model lanes
+          (showClaudeLane / showCodexLane); a bad model blocks Save rather than failing on
+          the next run. */}
       <Card className="space-y-4">
         <div>
           <SectionTitle>Run summaries</SectionTitle>
           <p className="mt-2 text-sm text-muted">
             Each of your runs generates two short plain-English summaries — what it will implement, and
-            what the proposed plan will do — on <strong className="text-fg">your own Anthropic token</strong>.
-            Pinning a model here overrides the instance default for your own runs; other users are
-            unaffected. Summaries are advisory and never block a run.
+            what the proposed plan will do — on the same harness the run uses, with your own credential
+            for that harness. Pinning a model here overrides the default for your own runs; other users
+            are unaffected. Summaries are advisory and never block a run.
           </p>
         </div>
 
         <div className="space-y-3">
-          <Field label="Summary model" htmlFor="summary-model">
-            <ModelSelect id="summary-model" value={summaryModel} onChange={setSummaryModel} defaultLabel="Default · instance default" />
-          </Field>
+          <div className={`grid gap-4${showClaudeLane && showCodexLane ? " sm:grid-cols-2" : ""}`}>
+            {showClaudeLane && (
+              <div className="space-y-1.5">
+                <Field label="Claude summary model" htmlFor="summary-model">
+                  <ModelSelect
+                    id="summary-model"
+                    harness="claude"
+                    value={summaryModel}
+                    onChange={setSummaryModel}
+                    onCustomModeChange={setSummaryModelCustom}
+                    defaultLabel={modelDefaultLabel(claudeSummaryCell)}
+                    customAriaLabel="Custom Claude summary model ID"
+                    ariaDescribedBy={claudeSummaryCell ? "summary-model-effect" : undefined}
+                  />
+                </Field>
+                {claudeSummaryCell && (
+                  <p id="summary-model-effect" className="text-xs text-faint">
+                    {modelInEffect(claudeSummaryCell)}
+                  </p>
+                )}
+                <p className="text-xs text-faint">
+                  Used for the intent summary, the plan summary and the pull request description on
+                  Claude runs.
+                </p>
+                {summaryCustomEmpty && (
+                  <p className="text-xs text-danger" role="alert">
+                    {CUSTOM_EMPTY_MESSAGE}
+                  </p>
+                )}
+                {summaryModelWarning && <Alert message={summaryModelWarning} tone="warning" />}
+                <Button
+                  type="button"
+                  disabled={summaryModelBusy || !summaryModelDirty || summaryModelWarning !== "" || summaryCustomEmpty}
+                  onClick={saveSummaryModel}
+                >
+                  Save Claude summary model
+                </Button>
+              </div>
+            )}
+            {showCodexLane && (
+              <div className="space-y-1.5">
+                <Field label="Codex summary model" htmlFor="codex-summary-model">
+                  <ModelSelect
+                    id="codex-summary-model"
+                    harness="codex"
+                    models={CODEX_ROLE_MODELS}
+                    value={codexSummaryModel}
+                    onChange={setCodexSummaryModel}
+                    defaultLabel={modelDefaultLabel(codexSummaryCell)}
+                    ariaDescribedBy={codexSummaryCell ? "codex-summary-model-effect" : undefined}
+                  />
+                </Field>
+                {codexSummaryCell && (
+                  <p id="codex-summary-model-effect" className="text-xs text-faint">
+                    {modelInEffect(codexSummaryCell)}
+                  </p>
+                )}
+                <p className="text-xs text-faint">
+                  Used for the intent summary and the plan summary on Codex runs. Codex pull request
+                  descriptions use their own model.
+                </p>
+                <Button
+                  type="button"
+                  disabled={codexSummaryModelBusy || !codexSummaryModelDirty}
+                  onClick={saveCodexSummaryModel}
+                >
+                  Save Codex summary model
+                </Button>
+              </div>
+            )}
+          </div>
           <p className="text-xs text-faint">
-            The Claude model your run summaries are generated on. <em>Default</em> uses the instance
-            setting; pin another alias to trade cost for depth. This setting applies to Claude runs
-            only (Codex summaries use a fixed model).
+            Neither setting changes the one-line Now status. Leave a lane on Default to follow your
+            instance&rsquo;s choice.
           </p>
-          {summaryModelWarning && <Alert message={summaryModelWarning} tone="warning" />}
-          <Button
-            type="button"
-            disabled={summaryModelBusy || !summaryModelDirty || summaryModelWarning !== ""}
-            onClick={saveSummaryModel}
-          >
-            Save summary model
-          </Button>
         </div>
 
         <div className="space-y-2">

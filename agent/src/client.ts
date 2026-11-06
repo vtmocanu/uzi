@@ -26,6 +26,7 @@ import type { UsageWireRequest } from "./usage-recorder.js";
 import {
   WORKER_API_PREFIX,
   CAPABILITY_INFERENCE_EVIDENCE_FEATURE,
+  RUN_REGISTRATION_EVIDENCE_FEATURE,
   type MemoryBinding,
   type MemoryPolicy,
   type MemoryOutcome,
@@ -79,6 +80,7 @@ import {
   type RegisterRequest,
   type RegisterResponse,
   type StateAck,
+  type RunRegistrationEvidence,
   type CompletedPublicationReceipt,
   type CompletedPublicationReason,
   type PlanCrossCheckReconciliation,
@@ -129,6 +131,7 @@ import {
   type RecoverySettleResponse,
   type BaseAttestationHoldOutcome,
   BASE_ATTESTATION_HOLD_REASON,
+  REPO_AGENT_SOURCE_HOLD_REASON,
 } from "./protocol.js";
 
 export type PlanCrossCheckGateReason = "revise" | "block" | "malformed" | "model_error" | "model_timeout"
@@ -1561,6 +1564,10 @@ export class WorkerClient {
    * optimistic so the next request self-recovers once the api rolls forward).
    */
   private hasCredentialSwitchCapability = false;
+  /** Issue #3859: set when this registration's api proved (strict-decode 400) it cannot decode
+   *  `registration_evidence`. Sticky until the next register(); a heartbeat feature refresh does
+   *  not reopen it, which is why it is not simply dropFeature(). */
+  private registrationEvidenceDropped = false;
 
   /**
    * The per-registration nonce the api minted on the last successful register (PRD #1390
@@ -1840,6 +1847,7 @@ export class WorkerClient {
     this.hasBindinglessHoldCapability = false;
     this.latestDindMaintenanceValue = undefined;
     this.registerNonce = undefined;
+    this.registrationEvidenceDropped = false;
     this.registrationReport = undefined;
     const originalCapabilities = Array.isArray(protocolCapabilities) ? [...protocolCapabilities] : undefined;
     const body: RegisterRequest = { name, version: this.version };
@@ -2630,7 +2638,7 @@ export class WorkerClient {
    * fail on real runs.
    */
   async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal,
-    options?: { iterationCancellation?: true }): Promise<StateAck> {
+    options?: { iterationCancellation?: true; registrationEpoch?: number }): Promise<StateAck> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
     if (options?.iterationCancellation) {
       // Snapshot before any asynchronous work; only the iteration sink cancellation
@@ -2777,6 +2785,13 @@ export class WorkerClient {
     if (!this.hasFeature("recovery_completed_publication_v1")) delete outbound.completion_final_head;
     const included = this.includeClaimGeneration(body.claim_generation);
     if (!included) delete outbound.provider_progress_turns;
+    // Issue #3859: the registration witness. Only this generic path can carry it: a `running`
+    // report never takes the credential-switch, memory-park, publication, retained-recovery,
+    // require_running or revision-source early returns above (those are other statuses or
+    // fields), and a caller-supplied copy is discarded so the client alone chooses presence.
+    delete outbound.registration_evidence;
+    const witness = this.registrationEvidenceFor(body, included, options?.registrationEpoch);
+    if (witness) outbound.registration_evidence = witness;
     // PRD #1795 M3: the api refuses an id-bearing awaiting_approval report without
     // claim_generation (400 claim_generation_required), and the strict-decode fallback exists for
     // an api that rolled back past the fields. So whenever claim_generation is NOT on the wire, the
@@ -2798,7 +2813,36 @@ export class WorkerClient {
         b.claim_generation,
       );
     try {
-      if (outbound.capability_inference_evidence !== undefined && this.hasFeature(CAPABILITY_INFERENCE_EVIDENCE_FEATURE)) {
+      if (outbound.registration_evidence !== undefined) {
+        // Issue #3859. Ordering with the older claim_generation fallback: the evidence strip comes
+        // FIRST (it is the newer field). Attempt 1 carries evidence and claim_generation; on the
+        // exact strict-decode 400 attempt 2 is the identical body with ONLY registration_evidence
+        // removed (claim_generation and every other field intact). If attempt 2 itself gets the
+        // strict-decode 400 (a stale advertised feature set against an api that decodes neither
+        // field), the evidence-free body continues into the pre-existing claim_generation
+        // fallback exactly as before this feature: one more send with claim_generation stripped.
+        // Evidence is never re-attached and there is no second evidence-stripping resend, so the
+        // worst case is three sends. A transient failure is retried inside reportStateVariant
+        // with the SAME variant, never with evidence stripped.
+        try {
+          ack = await sendWith(outbound)(true);
+        } catch (err) {
+          // The exact one-key decoder refusal only (StateDecodeRefusalError), narrower than the
+          // loose generation-fallback regex: prose that merely mentions the phrase is not a rollback.
+          if (!isStrictDecodeError(err) || !(err instanceof StateDecodeRefusalError)) throw err;
+          const stripped = { ...outbound };
+          delete stripped.registration_evidence;
+          this.registrationEvidenceDropped = true;
+          this.log.warn("registration evidence rejected by an api that cannot decode it; re-sent without it and stopped sending it for this registration", { run_id: runId });
+          try {
+            ack = await sendWith(stripped)(true);
+          } catch (err2) {
+            if (!isStrictDecodeError(err2)) throw err2;
+            if (!this.hasCredentialSwitchCapability) this.clearFeatures();
+            ack = await sendWith(stripped)(false);
+          }
+        }
+      } else if (outbound.capability_inference_evidence !== undefined && this.hasFeature(CAPABILITY_INFERENCE_EVIDENCE_FEATURE)) {
         // Advisory rollback is resolved before the legacy generation fallback.
         // A refusal of its stripped variant must never select an unfenced third body.
         ack = await sendWith(outbound)(included);
@@ -2841,6 +2885,20 @@ export class WorkerClient {
     }
     if (body.completion_final_head !== undefined && !this.hasFeature("recovery_completed_publication_v1")) ack.completedPublicationReason = "unsupported_feature";
     return ack;
+  }
+
+  /** Issue #3859: the registration witness for a `running` report, or undefined. Every guard is
+   *  required: negotiated and not dropped for this registration, a known register nonce, a
+   *  supplied epoch (non-negative safe integer), and a claim generation that is a safe integer
+   *  >= 1 which `included` says is really on the wire (the witness must name the same generation
+   *  the report is fenced on). Never for a non-running report. */
+  private registrationEvidenceFor(body: StateRequest, included: boolean, epoch: number | undefined): RunRegistrationEvidence | undefined {
+    const generation = body.claim_generation;
+    if (body.status !== "running" || !included || this.registrationEvidenceDropped ||
+        !this.hasFeature(RUN_REGISTRATION_EVIDENCE_FEATURE) || !this.registerNonce ||
+        epoch === undefined || !Number.isSafeInteger(epoch) || epoch < 0 ||
+        generation === undefined || !Number.isSafeInteger(generation) || generation < 1) return undefined;
+    return { register_nonce: this.registerNonce, claim_generation: generation, registration_epoch: epoch };
   }
 
   /** Validate proof only at the authenticated state-report seam. This does not settle local custody. */
@@ -3023,6 +3081,8 @@ export class WorkerClient {
           // can recognise a SERVER-side wall park (paused + budget_exhausted) on a fenced stale ACK.
           if (fields.holdReason !== undefined)
             ack.holdReason = fields.holdReason;
+          if (fields.repoAgentSourceCommit !== undefined)
+            ack.repoAgentSourceCommit = fields.repoAgentSourceCommit;
           if (fields.budgetMaxIterations !== undefined)
             ack.budgetMaxIterations = fields.budgetMaxIterations;
           if (fields.budgetWallSeconds !== undefined)
@@ -3083,6 +3143,10 @@ export class WorkerClient {
           if (ack.applied && fields.reconciliation !== undefined &&
               fields.reconciliation.claimGeneration === body.claim_generation)
             ack.reconciliation = fields.reconciliation;
+          if (body.registration_evidence !== undefined && fields.registrationEvidence !== undefined) {
+            ack.registrationEvidence = fields.registrationEvidence;
+            this.log.info("registration evidence answered", { run_id: runId, registration_evidence: fields.registrationEvidence });
+          }
           if (!ack.applied) {
             this.log.info("state report not applied server-side", {
               run_id: runId,
@@ -4468,13 +4532,32 @@ export class WorkerClient {
       return { outcome: "unknown", detail: "no claim generation to fence the hold" };
     }
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/base-attestation-hold`;
+    return this.requestPreflightHold(path, { head: args.head, claim_generation: args.claimGeneration }, BASE_ATTESTATION_HOLD_REASON, signal);
+  }
+
+  async requestRepoAgentSourceHold(
+    runId: string,
+    args: { commit: string; claimGeneration: number },
+    signal?: AbortSignal,
+  ): Promise<BaseAttestationHoldOutcome> {
+    if (!Number.isSafeInteger(args.claimGeneration) || args.claimGeneration <= 0) {
+      return { outcome: "unknown", detail: "no claim generation to fence the hold" };
+    }
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/repo-agent-source-hold`;
+    return this.requestPreflightHold(path, { commit: args.commit, claim_generation: args.claimGeneration }, REPO_AGENT_SOURCE_HOLD_REASON, signal);
+  }
+
+  private async requestPreflightHold(
+    path: string,
+    body: Record<string, unknown>,
+    reason: string,
+    signal?: AbortSignal,
+  ): Promise<BaseAttestationHoldOutcome> {
     try {
-      const res = await this.fetchRaw(
-        "POST", path, { head: args.head, claim_generation: args.claimGeneration }, this.httpTimeoutMs, signal,
-      );
+      const res = await this.fetchRaw("POST", path, body, this.httpTimeoutMs, signal);
       if (res.status === 200) {
         const fields = await readRunAck(res);
-        if (fields.status === "paused" && fields.holdReason === BASE_ATTESTATION_HOLD_REASON) {
+        if (fields.status === "paused" && fields.holdReason === reason) {
           return { outcome: "held", status: fields.status };
         }
         return { outcome: "unknown", detail: `unexpected hold acknowledgement (status ${fields.status ?? "none"})` };
@@ -5598,6 +5681,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   memoryParkUndisposed?: boolean;
   status?: string;
   holdReason?: string | null;
+  repoAgentSourceCommit?: string;
   budgetMaxIterations?: number;
   budgetWallSeconds?: number;
   contractRevision?: number;
@@ -5622,6 +5706,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   supersededRevisionInputIds?: number[];
   staleRevisionSource?: boolean;
   reconciliation?: PlanCrossCheckReconciliation;
+  registrationEvidence?: "recorded" | "refused";
 }> {
   const pendingMarker = res.headers.get(COMPLETION_PENDING_HEADER);
   const ackCap = maxAckBytes === undefined ? undefined
@@ -5648,6 +5733,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
         // PRD #1497 M2: the run's hold_reason on the RunDTO, read beside `status` to recognise a
         // SERVER-side wall park (paused + budget_exhausted) from a fenced stale-claim ACK.
         hold_reason?: unknown;
+        repo_agent_source_commit?: unknown;
         budget_max_iterations?: unknown;
         budget_wall_seconds?: unknown;
         // Issue #1626: the frozen completion-contract revision (RunDTO.completion_revision).
@@ -5672,6 +5758,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       gate_revision?: unknown;
       revision_input_id?: unknown;
       superseded_revision_input_ids?: unknown;
+      // Issue #3859: top-level answer to a report that carried registration_evidence.
+      registration_evidence?: unknown;
     };
     const run = parsed?.run;
     const out: {
@@ -5689,6 +5777,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       memoryParkUndisposed?: boolean;
       status?: string;
       holdReason?: string | null;
+      repoAgentSourceCommit?: string;
       budgetMaxIterations?: number;
       budgetWallSeconds?: number;
       contractRevision?: number;
@@ -5713,6 +5802,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       supersededRevisionInputIds?: number[];
       staleRevisionSource?: boolean;
       reconciliation?: PlanCrossCheckReconciliation;
+      registrationEvidence?: "recorded" | "refused";
     } = {};
     if (isRecord(parsed) && (Object.hasOwn(parsed, "semantic_presentation") || Object.hasOwn(parsed, "semantic_approval"))) {
       try {
@@ -5748,6 +5838,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     // non-string (older server that omits it, a null hold, an unparseable value) leaves it absent,
     // which the ServerWallParkedError check reads as "no hold" (never a wall park).
     if (typeof run?.hold_reason === "string") out.holdReason = run.hold_reason;
+    if (typeof run?.repo_agent_source_commit === "string" && /^[0-9a-f]{40}$/.test(run.repo_agent_source_commit))
+      out.repoAgentSourceCommit = run.repo_agent_source_commit;
     if (typeof run?.budget_max_iterations === "number")
       out.budgetMaxIterations = run.budget_max_iterations;
     if (typeof run?.budget_wall_seconds === "number")
@@ -5855,6 +5947,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       out.revisionInputId = revisionId;
       out.supersededRevisionInputIds = superseded;
     }
+    if (parsed?.registration_evidence === "recorded" || parsed?.registration_evidence === "refused")
+      out.registrationEvidence = parsed.registration_evidence;
     const gateRev = parsed?.gate_revision;
     if (typeof gateRev === "number" && Number.isSafeInteger(gateRev) && gateRev >= 1) out.gateRevision = gateRev;
     const reconciliation = readPlanCrossCheckReconciliation(parsed);

@@ -240,6 +240,41 @@ describe("the Codex advice path: bounded settle and usage", () => {
   });
 });
 
+// Issue #3248 M3: the Now line shares the run credential with refresh denied. A denied refresh must
+// reach its caller as the same error message as before the typed classification existed.
+describe("a Now pass with a denied refresh keeps its failure text (#3248 M3)", () => {
+  const denied = (run: (policy: { onTerminal(t: unknown, c: { isError: boolean; latest: undefined }): void }) => Promise<{ text: string }>) =>
+    ({
+      runId: "r",
+      binding: {} as never,
+      refresh: "deny",
+      buildHarness: async (params: { onRefreshDenied?: () => void }) => ({
+        kind: "codex",
+        run: async (_req: unknown, policy: { onTerminal(t: unknown, c: { isError: boolean; latest: undefined }): void }) => {
+          params.onRefreshDenied?.();
+          return run(policy);
+        },
+      }),
+    }) as unknown as NonNullable<ReadOnlyModelPassOpts["codex"]>;
+  const failed = { outcome: "failed", subtype: "error_during_execution", errors: [], metrics: { cost: { kind: "unreported" } } };
+
+  it("an error terminal after a denied refresh rejects with the unchanged generic message", async () => {
+    await assert.rejects(
+      runReadOnlyModelPass(baseOpts({ token: undefined, codex: denied(async (policy) => { policy.onTerminal(failed, { isError: true, latest: undefined }); return { text: "" }; }) })),
+      (e: Error) => e.message === "now model call returned an error result",
+    );
+  });
+  it("a thrown failure after a denied refresh rejects with the unchanged message", async () => {
+    await assert.rejects(
+      runReadOnlyModelPass(baseOpts({ token: undefined, codex: denied(async () => { throw new Error("codex advice refresh is denied for this call"); }) })),
+      (e: Error) => e.message === "codex advice refresh is denied for this call",
+    );
+  });
+  it("a denied refresh the call survives still returns the text", async () => {
+    assert.equal(await runReadOnlyModelPass(baseOpts({ token: undefined, codex: denied(async () => ({ text: "line" })) })), "line");
+  });
+});
+
 describe("caller option policy", () => {
   it("SummaryRunner keeps output-cap and thinking defaults", async () => {
     const seen: { options?: SdkOptions } = {};

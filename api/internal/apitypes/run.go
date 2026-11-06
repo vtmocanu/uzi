@@ -752,9 +752,10 @@ type RunDTO struct {
 	// The names and descriptions here are REPO-SUPPLIED text. The gate panel
 	// renders them as plain JSX, never through <Markdown>: an attacker-authored
 	// description must not put a clickable link inside an approval dialog.
-	RepoAgents      []RepoAgent `json:"repo_agents"`
-	AgentSource     *string     `json:"agent_source"`
-	AgentExclusions []string    `json:"agent_exclusions"`
+	RepoAgents            []RepoAgent `json:"repo_agents"`
+	RepoAgentSourceCommit *string     `json:"repo_agent_source_commit"`
+	AgentSource           *string     `json:"agent_source"`
+	AgentExclusions       []string    `json:"agent_exclusions"`
 	// OwnAgents is the OWN-source subagent roster (name + description) the run's
 	// owner would run: exactly what ListClaimAgentTemplates delivers to a claim,
 	// minus the lead. It is the single source of truth the plan-gate "My agent
@@ -912,12 +913,15 @@ type RunDTO struct {
 	// "codex_account_unavailable" (PRD #1590, held on its Codex account) and "vault_locked"
 	// (issue #1766, the owner's vault is locked; the run resumes at its next retry once the
 	// vault is unlocked) and "data_volume_full" (PRD #1809 M5, the worker's data volume was full
-	// or about to fill; the run resumes at its next retry, see DiskParkCount);
+	// or about to fill; timed retries become owner holds with NULL retry at the cap, see DiskParkCount);
 	// "provider_outage" is active: a typed provider-transient retry park (PRD #1733).
 	// "worker_requeue_exhausted" and "worker_memory_pressure" require owner action.
 	// "retained_recovery_exhausted" can be timed or owner-held; see RecoveryRetryNotBefore.
 	// "retained_recovery_adoption_failed" is an integrity refusal: retained local work and
 	// custody are preserved, and only the owner can Resume or Cancel, without automatic retry.
+	// "retained_continuation_unwitnessed" is a claimed-never-started park whose retained custody
+	// continuation was never witnessed starting: the claim is released, retained work and custody
+	// are preserved, and only the owner can Resume or Cancel, without automatic retry.
 	// "empty_turn" remains reserved. Clients render an unrecognised value
 	// honestly (a newer server may ship a cause this client has not heard of), the same rule
 	// as RateLimitType.
@@ -975,8 +979,9 @@ type RunDTO struct {
 	// RecoveryRetryNotBefore is the earliest scheduled recovery promotion time, not
 	// a promise of immediate execution. It is separate from the usage-limit RetryNotBefore.
 	// Null means no scheduled recovery retry, including an owner-held codex_idle_stall
-	// or retained_recovery_exhausted park. An omitted key in a partial client read means
+	// or retained_recovery_exhausted or capped data_volume_full park. An omitted key in a partial client read means
 	// timing is unknown; consult RecoveryRetryNotBeforePresent before inferring a hold.
+	// retained_continuation_unwitnessed is likewise always owner-held.
 	// retained_recovery_adoption_failed is always owner-held, even if a malformed
 	// response supplies a retry timestamp; the cause never schedules a timer.
 	RecoveryRetryNotBefore *time.Time `json:"recovery_retry_not_before"`
@@ -998,6 +1003,7 @@ type RunDTO struct {
 	// lifetime (PRD #1809 M5, D6), the DISK-ONLY counter the UZI_RUN_DISK_PARK_MAX cap decides
 	// on — distinct from ForgeParkCount and from the backoff-shaping recovery_wait_count. A
 	// preventive disk park (the worker stopped the run before its volume filled) does not count.
+	// Exhaustion holds for owner Resume with NULL retry time; the count stays saturated.
 	// 0 for a run that has never taken a counted disk park.
 	DiskParkCount int `json:"disk_park_count"`
 	// ProviderParkCount is how many typed 'provider_outage' recovery parks are in this run's open
@@ -1804,12 +1810,15 @@ type RunSummaryItemDTO struct {
 	// "codex_account_unavailable" (PRD #1590, held on its Codex account) and "vault_locked"
 	// (issue #1766, the owner's vault is locked; the run resumes at its next retry once the
 	// vault is unlocked) and "data_volume_full" (PRD #1809 M5, the worker's data volume was full
-	// or about to fill; the run resumes at its next retry, see DiskParkCount);
+	// or about to fill; timed retries become owner holds with NULL retry at the cap, see DiskParkCount);
 	// "provider_outage" is active: a typed provider-transient retry park (PRD #1733).
 	// "worker_requeue_exhausted" and "worker_memory_pressure" require owner action.
 	// "retained_recovery_exhausted" can be timed or owner-held; see RecoveryRetryNotBefore.
 	// "retained_recovery_adoption_failed" is an integrity refusal: retained local work and
 	// custody are preserved, and only the owner can Resume or Cancel, without automatic retry.
+	// "retained_continuation_unwitnessed" is a claimed-never-started park whose retained custody
+	// continuation was never witnessed starting: the claim is released, retained work and custody
+	// are preserved, and only the owner can Resume or Cancel, without automatic retry.
 	// "empty_turn" remains reserved. Clients render an unrecognised value
 	// honestly (a newer server may ship a cause this client has not heard of), the same rule
 	// as RateLimitType.
@@ -1867,8 +1876,9 @@ type RunSummaryItemDTO struct {
 	// RecoveryRetryNotBefore is the earliest scheduled recovery promotion time, not
 	// a promise of immediate execution. It is separate from the usage-limit RetryNotBefore.
 	// Null means no scheduled recovery retry, including an owner-held codex_idle_stall
-	// or retained_recovery_exhausted park. An omitted key in a partial client read means
+	// or retained_recovery_exhausted or capped data_volume_full park. An omitted key in a partial client read means
 	// timing is unknown; consult RecoveryRetryNotBeforePresent before inferring a hold.
+	// retained_continuation_unwitnessed is likewise always owner-held.
 	// retained_recovery_adoption_failed is always owner-held, even if a malformed
 	// response supplies a retry timestamp; the cause never schedules a timer.
 	RecoveryRetryNotBefore *time.Time `json:"recovery_retry_not_before"`
@@ -1890,6 +1900,7 @@ type RunSummaryItemDTO struct {
 	// lifetime (PRD #1809 M5, D6), the DISK-ONLY counter the UZI_RUN_DISK_PARK_MAX cap decides
 	// on — distinct from ForgeParkCount and from the backoff-shaping recovery_wait_count. A
 	// preventive disk park (the worker stopped the run before its volume filled) does not count.
+	// Exhaustion holds for owner Resume with NULL retry time; the count stays saturated.
 	// 0 for a run that has never taken a counted disk park.
 	DiskParkCount int `json:"disk_park_count"`
 	// ProviderParkCount is how many typed 'provider_outage' recovery parks are in this run's open

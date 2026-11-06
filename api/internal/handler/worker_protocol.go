@@ -454,6 +454,12 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		// the cause or the flag, because an older api 400s both.
 		{"recovery_cause_codex_idle_stall_v1"},
 		{"recovery_cause_retained_recovery_exhausted"},
+		// Issue #3859: this api accepts the nested registration_evidence object on a `running`
+		// report ({register_nonce, claim_generation, registration_epoch}) and answers
+		// registration_evidence "recorded" | "refused" on the ACK, whether or not the status write
+		// applied. Advertised UNCONDITIONALLY: a worker sends the object ONLY after seeing this
+		// token, because an older api's strict decoder 400s the unknown field.
+		{"run_registration_evidence_v1"},
 		{"recovery_cause_retained_recovery_adoption_failed"},
 		{"recovery_cause_data_volume_full"},
 		// PRD #1733: this api accepts {status:"recovery_wait", recovery_cause:"provider_outage"}
@@ -476,6 +482,7 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		// the roster. Advertised UNCONDITIONALLY: an older api's strict decoder 400s the
 		// unknown field, so a worker sends it only after seeing this token.
 		{"repo_agent_folder"},
+		{workersvc.RepoAgentSourceFeature},
 		{"terminal_rejection_report"}, // Issue #1974 M1; independent of active snapshots.
 		// Issue #3181: this api accepts {status:"credential_switch_held"} and
 		// {status:"credential_switch_hold_settled"} (each with claim_generation AND the reporting worker's
@@ -1465,6 +1472,10 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			httpx.ErrorReason(w, http.StatusBadRequest, "presentation_id and adopt_gate_revision require claim_generation", "claim_generation_required")
 			return
 		}
+		if errors.Is(err, workersvc.ErrRepoAgentSourceConflict) {
+			httpx.ErrorReason(w, http.StatusConflict, err.Error(), "repo_agent_source_conflict")
+			return
+		}
 		// PRD #1392 M1: the two forge-park precedence refusals are 409 with a {run, reason}
 		// body — the worker dispatches on `reason` (stale_claim stops silently; custody_unsettled
 		// falls to today's failed path). recovery_retry_not_before rides on the run (RunDTO), not
@@ -1505,10 +1516,14 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			// further reports. The 409 status is shared with an ordinary not-applied ack (an old
 			// worker that ignores the extra field still treats it as "changed nothing"); the
 			// disposition is what distinguishes a stale claim from a benign no-op.
-			httpx.JSON(w, http.StatusConflict, map[string]any{
+			stale := map[string]any{
 				"run":         h.workerRunDTO(r.Context(), run),
 				"disposition": "stale_claim",
-			})
+			}
+			if result.RegistrationEvidence != "" {
+				stale["registration_evidence"] = result.RegistrationEvidence
+			}
+			httpx.JSON(w, http.StatusConflict, stale)
 		case errors.Is(err, workersvc.ErrRunNotOwned):
 			// Issue #2950: a machine-readable reason so the worker can BLOCK (not retire) its
 			// write-ahead terminal journal instead of retrying a 404 forever. Body is exactly
@@ -1529,7 +1544,12 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			}
 			ack["applied"] = false
 			ack["reason"] = "wall_expired"
+			if result.RegistrationEvidence != "" {
+				ack["registration_evidence"] = result.RegistrationEvidence
+			}
 			httpx.JSON(w, http.StatusConflict, ack)
+		case errors.Is(err, workersvc.ErrInvalidRegistrationEvidence):
+			httpx.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, workersvc.ErrJobNeverParks):
 			// The service error text already reads "invalid run state: a job run never parks (<state>)".
 			httpx.Error(w, http.StatusBadRequest, err.Error())
@@ -1571,6 +1591,9 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 				ack["reason"] = "wall_pending"
 			}
 		}
+		if result.RegistrationEvidence != "" {
+			ack["registration_evidence"] = result.RegistrationEvidence
+		}
 		httpx.JSON(w, http.StatusConflict, ack)
 		return
 	}
@@ -1578,6 +1601,9 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 	if ackErr != nil {
 		httpx.Error(w, http.StatusInternalServerError, "semantic completion authority unavailable")
 		return
+	}
+	if result.RegistrationEvidence != "" {
+		ack["registration_evidence"] = result.RegistrationEvidence
 	}
 	if result.RevisionInputID != nil {
 		ack["revision_input_id"] = *result.RevisionInputID

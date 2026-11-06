@@ -553,8 +553,8 @@ type Config struct {
 	// failed disk-full (after its reclaim and one retry) parks the run in 'recovery_wait' with
 	// recovery_wait_cause='data_volume_full'; disk_park_count is its DISK-ONLY lifetime counter
 	// (distinct from recovery_wait_count and forge_park_count), and this is the cap the
-	// park-or-fail decision consults inside SetState. Past the cap the run fails with
-	// fail_origin='data_volume_full'. A PREVENTIVE park (the worker stopped the run before the
+	// park-or-hold decision consults inside SetState. Past the cap the run holds for
+	// owner Resume with no automatic retry time. A PREVENTIVE park (the worker stopped the run before the
 	// volume filled) is neither counted nor capped. 0 = unlimited; the default (3) lives in Load.
 	RunDiskParkMax int
 	// Provider-transient park bound (PRD #1733, RUN_PROVIDER_PARK_MAX_DURATION). An unbroken

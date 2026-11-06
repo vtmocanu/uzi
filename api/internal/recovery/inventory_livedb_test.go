@@ -35,6 +35,17 @@ type inventoryEnv struct {
 
 func newInventoryEnv(t *testing.T) *inventoryEnv {
 	t.Helper()
+	return newInventoryEnvWithGuard(t, true)
+}
+
+// inventory_guarded is immutable: legacy fixtures must INSERT the legacy posture.
+func newLegacyInventoryEnv(t *testing.T) *inventoryEnv {
+	t.Helper()
+	return newInventoryEnvWithGuard(t, false)
+}
+
+func newInventoryEnvWithGuard(t *testing.T, guarded bool) *inventoryEnv {
+	t.Helper()
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("UZI_TEST_DATABASE_URL unset; run ./e2e/run-store-it.sh")
@@ -56,7 +67,11 @@ func newInventoryEnv(t *testing.T) *inventoryEnv {
 	e.exec("INSERT INTO forge_connections(id,user_id,forge_type,base_url,bot_username,bot_forge_user_id,token_ciphertext) VALUES($1,$2,'github','https://example.com','bot',1,$3)", conn, e.w.UserID, []byte{1})
 	e.exec("INSERT INTO repos(id,connection_id,forge_project_id,path_with_namespace,web_url,default_branch,enabled) VALUES($1,$2,1,'g/r','https://example.com/g/r','main',true)", repo, conn)
 	e.exec("INSERT INTO runs(id,user_id,repo_id,issue_iid,kind,issue_title,issue_description,status,worker_id,claim_generation) VALUES($1,$2,$4,1,'issue','t','d','running',$3,1)", e.run, e.w.UserID, e.w.ID, repo)
-	e.exec("INSERT INTO recovery_custody_holds(id,user_id,run_id,generation,original_worker_id,original_worker_identity,live_worker_id,live_run_id,inventory_guarded,state,repo_id) VALUES($1,$2,$3,1,$4,$5,$4,$3,true,'open',$6)", e.hold, e.w.UserID, e.run, e.w.ID, e.w.Name, repo)
+	e.exec("INSERT INTO recovery_custody_holds(id,user_id,run_id,generation,original_worker_id,original_worker_identity,live_worker_id,live_run_id,inventory_guarded,state,repo_id) VALUES($1,$2,$3,1,$4,$5,$4,$3,$7,'open',$6)", e.hold, e.w.UserID, e.run, e.w.ID, e.w.Name, repo, guarded)
+	var actualGuard bool
+	if err := pool.QueryRow(ctx, "SELECT inventory_guarded FROM recovery_custody_holds WHERE id=$1", e.hold).Scan(&actualGuard); err != nil || actualGuard != guarded {
+		t.Fatalf("fixture guard=%v want %v err=%v", actualGuard, guarded, err)
+	}
 	box, err := secretbox.New([]byte("0123456789abcdef0123456789abcdef"))
 	if err != nil {
 		t.Fatal(err)
@@ -348,7 +363,10 @@ func TestRecoveryInventoryWorkerDeleteLockAllLiveDB(t *testing.T) {
 		_ = tx.Rollback(cleanupCtx)
 		if !deleteJoined {
 			select {
-			case <-result:
+			case err := <-result:
+				if err != nil {
+					t.Logf("worker DELETE ended during cancelled cleanup: %v", err)
+				}
 			case <-cleanupCtx.Done():
 				t.Error("worker DELETE goroutine did not return during cleanup")
 			}

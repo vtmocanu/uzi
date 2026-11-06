@@ -106,6 +106,9 @@ func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 			"Resume requests one ordinary bounded attempt; counters, cooldown, custody and grants are preserved. " +
 			"Admission can still block, including limit 1 or saturation. Timed retries remain automatic; omitted retry timing is unknown. " +
 			"Cancel is terminal. Resume does not change source authority or verify source/archive availability or latest local edits.\n\n" +
+			"For disk space (data_volume_full) with an explicit NULL retry time, automatic disk retries are exhausted. " +
+			"Owner Resume requests one further ordinary attempt; counters persist and admission may refuse. Cancel is terminal. " +
+			"Local unpublished work is not guaranteed on worker loss. Finite retry timing remains automatic; omitted or invalid timing is unknown.\n\n" +
 			"For retained recovery exhausted (recovery_wait), Resume now requests another attempt; success is not assured. " +
 			"A finite retry stamp means timed retry, even after it is due; NULL means owner-held with no automatic resume. " +
 			"Cancel is terminal. Resume does not reset the retained recovery cap or promise a fresh archive or latest edits.\n\n" +

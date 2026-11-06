@@ -487,3 +487,79 @@ answers and revise feedback for the checker. Decisions:
   Because issue and lead-authored text could carry a lookalike `owner_steering` block, the plan
   prompt opens with a worker-authored line naming the two genuine fence suffixes, and the brief
   says only those blocks are supplied steering.
+
+## Amendment 2026-11-06 — #3953: credential switch during a candidate reservation
+
+A credential switch that arrives while an automatic plan cross-check holds its candidate
+transport reservation (`checkPlan` reserves the batcher before submit) used to abort the
+reservation and fail the run. The worker now defers it; the dispositions above are unchanged.
+
+- **Hold.** The runner opens `SteeringChannel.holdCredentialSwitch()` immediately before
+  `checkPlan`. While held, a switch (from the poll, a state ACK or a `switch_pending` input
+  receipt) is latched: nothing is aborted, `shutdownStop` included, and no waiter is rejected.
+  Cancel, claim fence, receipt failure, worker shutdown and disk stop are not held.
+- **Service points.** The latch is serviced synchronously only once the reservation is released
+  and verified, before any other checker round, storage, plan execution or model call: S1 after
+  an APPROVE returns (before the semantic review or any emit), S2 after an automatic REVISE
+  (before the revision turn), S3 in each checked human gate's `onApplied` after
+  `releaseAppliedGate`. A give-up of a human gate resumes the presented gate (same presentation,
+  revision and verdict binding, no republish). No other exit ever services the latch: the hold
+  is closed without service when the reservation was released, and otherwise stays open with the
+  unreleased reservation for the rest of the flight, which that failure ends. A failure therefore
+  keeps its existing disposition and is never turned into a switch. No timer cancels a live
+  reservation.
+- **Decision stashes.** At S1/S2, when a switch is in play, the checker decision is kept for the
+  give-up re-run. Both stashes are bound to the claim generation, round, plan text and
+  milestones; the approve stash also carries the candidate digest, compared on semantic runs
+  (elsewhere the server owns the hash). It survives only the
+  `CredentialSwitchSignal` control exit, is adopted once at the first same-generation
+  continuation, and is cleared on mismatch (fail closed), any other failure, the next plan-gate
+  entry, a release and flight end. On a release the next claim re-discovers; the round-1 findings
+  text is not carried.
+- **Invariant guards.** If a reservation is ever installed when the in-place switch hook (G1) or
+  the outer `CredentialSwitchSignal` arm (G2) runs, the run fails terminally as an invariant
+  violation (`CandidateTransportInvariantError`): no switch report, the batcher is closed, and
+  the held-event loss is logged. Tests drive the poll, state-ACK and `switch_pending` receipt
+  trip entries (the state-ACK and receipt entries pin ordering) and show none reaches either
+  guard during a reservation.
+- **Residual window.** A `switch_pending` input receipt can arrive after the human gate's
+  presentation; a ready input is parked and a held batch is left unapplied for the next claim,
+  so no input is lost.
+
+### Deferral bound (audited at 3fc80e34; gate checkpoint re-audited at ad711991)
+
+The switch can wait only as long as the reservation lives. Bounds are read from code with the
+production defaults (request 3 s, preparation ≤3 s, poll ≤15 s, HTTP 30 s, server deadline
+`PLAN_CROSS_CHECK_TIMEOUT` default 30 m, worker-side cap 2 h in `checkPlan`):
+
+| Path | Components | Default deadline | Worst case (2 h deadline) |
+|---|---|---|---|
+| APPROVE / automatic REVISE | prepare ≤3 s, submit stage ≤30 s, poll window to the deadline, final transport check ≤3 s | ≈31 min | ≈2 h 1 min (7,236 s) |
+| Checked human gate (timed out, block, gated pass), first gate | the above + 3 s, semantic review ≤60 s, resumed-delivery wait ≤153 s (failure path), `planChangedFiles` ≤600 s, receipt settlement ≤60 s, presentation report ≤422 s, preparation ≤9 s | ≈53 min (rounded up) | ≈2 h 23 min (8,543 s, rounded up) |
+
+**Open: the gate checkpoint on a re-plan gate.** `prepareGateCheckpoint` runs only when the
+claim carries frozen execution milestones and the candidate's milestones differ from them, so a
+first plan gate never reaches it (the table above). On such a re-plan gate it runs with the
+reservation still installed, and on Claude its 60 s signal does not bound it: the runner-uid git
+commands in the capture take only the 600 s git timeout, and the bare-repository lock waits and
+the attributed-process reap joins it can reach have no timer at all (a single hung git command
+alone takes it well past 600 s; Codex's capture scope does cap it near 60 s). Under the approved plan an
+unbounded component is a stop condition, so this step has no stated bound here and awaits an
+owner design decision; no timer was added and no reservation is cancelled. The owner accepted
+it as documented, with a follow-up to bound the step.
+
+**Accepted limit: an owner Cancel during the hold.** While the switch stamp is pending, the
+server's input consume returns only the switch signal and withholds every input row, and with a
+live poller an owner Cancel is queued as such a row rather than applied server-side. So a Cancel
+pressed during the hold takes effect only after the reservation settles and the switch is
+serviced: on a give-up the held flight applies it; after a release it waits for the next claim.
+Its bound is the hold's own: the audited bounds in the table above for the listed paths; on a
+re-plan gate (the open item above) it has no fixed bound until that follow-up lands. Meanwhile the checker child may keep running until
+its verdict or deadline. A server-side terminal cancel still ends the held flight at once, and a
+second Cancel after the release applies at once. The owner accepted this limit for #3953; prompt
+Cancel during the hold is #3974.
+
+These rest on stated assumptions: request timeouts propagate through `fetch` and body reads; the
+poll compares against the worker clock; executor-sequenced sink callbacks do not run during the
+plan gate; and the resumed-delivery wait, which predates this change, is bounded by its failure
+and stall counters rather than a wall-clock timer.

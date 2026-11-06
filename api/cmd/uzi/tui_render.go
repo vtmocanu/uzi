@@ -298,7 +298,7 @@ func stateGlyphWord(status, health string, isPlanning, isRevising bool, landingS
 		// two apart at a glance.
 		return "~", "pool wait"
 	case statusRecoveryWait:
-		if len(cause) > 0 && cause[0] == retainedRecoveryAdoptionFailedCause {
+		if len(cause) > 0 && isAlwaysHeldRecoveryCause(cause[0]) {
 			return "!", "recovery held"
 		}
 		if len(cause) > 0 && cause[0] == workerMemoryPressureCause {
@@ -443,6 +443,9 @@ func tuiRejectedRun(r apitypes.RunDTO) bool {
 // runStateToken gives typed provider, Codex relogin and credential holds their
 // own tokens; other runs use stateToken. Provider markers require matching status.
 func (p palette) runStateToken(r apitypes.RunDTO, isRevising bool) runToken {
+	if isDiskOwnerHold(r) {
+		return runToken{glyph: "!", word: "disk held", color: p.amber}
+	}
 	if isIterationHold(r) {
 		return runToken{glyph: "⊘", word: "iter limit", color: p.amber}
 	}

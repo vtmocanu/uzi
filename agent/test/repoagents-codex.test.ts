@@ -59,13 +59,13 @@ describe("Codex TOML projection", { skip: repoAgentReadSkip("TOML projection") }
     assert.deepEqual(Object.keys(r.agents[0]!).sort(), ["description", "name", "prompt_body"]);
   });
 
-  it("ignores model, effort, nicknames, config_file, includes and unknown keys", async () => {
+  it("honours model while ignoring effort, nicknames, config_file, includes and unknown keys", async () => {
     toml(
       "coder.toml",
       TOML_OK(
         "coder",
         [
-          'model = "gpt-5"',
+          'model = "gpt-6-luna"',
           'model_reasoning_effort = "high"',
           'nickname_candidates = ["a", "b"]',
           'config_file = "other.toml"',
@@ -79,8 +79,8 @@ describe("Codex TOML projection", { skip: repoAgentReadSkip("TOML projection") }
     const r = await detectRepoAgents(clone, "codex");
     assert.deepEqual(r.notes, []);
     const t = r.agents[0]!;
-    assert.deepEqual(Object.keys(t).sort(), ["description", "name", "prompt_body"]);
-    assert.equal(t.model, undefined);
+    assert.deepEqual(Object.keys(t).sort(), ["description", "model", "name", "prompt_body"]);
+    assert.equal(t.model, "gpt-6-luna");
     assert.equal(t.tools, undefined);
   });
 
@@ -172,6 +172,34 @@ describe("Codex TOML projection", { skip: repoAgentReadSkip("TOML projection") }
     assert.deepEqual(repoAgentSummaries(r.agents, r.folder!), [
       { name: "coder", description: "Does coder things.", folder: ".codex/agents" },
     ]);
+  });
+});
+
+describe("TOML model loader delivery", { skip: repoAgentReadSkip("model delivery") }, () => {
+  it("keeps a valid Codex pin and filters it on Claude fallback", async () => {
+    toml("coder.toml", TOML_OK("coder", 'model = "gpt-6-luna"'));
+    const codex = await detectRepoAgents(clone, "codex");
+    assert.equal(codex.agents[0]!.model, "gpt-6-luna");
+    const claude = await detectRepoAgents(clone, "claude");
+    assert.equal(claude.folder, ".codex/agents");
+    assert.deepEqual(claude.notes, []);
+    assert.equal(Object.hasOwn(claude.agents[0]!, "model"), false);
+  });
+
+  it("invalid preferred model is final even with a valid Markdown fallback", async () => {
+    toml("coder.toml", TOML_OK("coder", 'model = "claude-opus-4-8"'));
+    md("other.md", MD_OK("other"));
+    const detected = await detectRepoAgents(clone, "codex");
+    assert.equal(detected.folder, ".codex/agents");
+    assert.deepEqual(detected.agents, []);
+    assert.deepEqual(detected.notes, [{ name: "coder", reason: "invalid" }]);
+  });
+
+  it("invalid fallback model is skipped on Claude too", async () => {
+    toml("coder.toml", TOML_OK("coder", 'model = 12'));
+    const detected = await detectRepoAgents(clone, "claude");
+    assert.deepEqual(detected.agents, []);
+    assert.deepEqual(detected.notes, [{ name: "coder", reason: "invalid" }]);
   });
 });
 

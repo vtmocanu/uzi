@@ -38,6 +38,33 @@ func judgeModelCell(harness string, user *string, instance string) apitypes.Mode
 	}
 }
 
+// summaryModelCells builds the run-summary setting's cells (PRD #3248), always ordered
+// claude then codex, mirroring judgeModelCells: userClaude/userCodex are the stored
+// user lanes (nil = Default) and instance maps the instance model keys to their
+// InstanceModels values from the caller's single snapshot.
+func summaryModelCells(userClaude, userCodex *string, instance map[string]string) []apitypes.ModelSettingCellDTO {
+	return []apitypes.ModelSettingCellDTO{
+		summaryModelCell("claude", userClaude, instance[settings.KeySummaryModel]),
+		summaryModelCell("codex", userCodex, instance[settings.KeyCodexSummaryModel]),
+	}
+}
+
+func summaryModelCell(harness string, user *string, instance string) apitypes.ModelSettingCellDTO {
+	stored := ""
+	if user != nil {
+		stored = *user
+	}
+	r := agenttmpl.ResolveSummaryModel(harness, stored, instance)
+	return apitypes.ModelSettingCellDTO{
+		Harness:       harness,
+		Model:         user,
+		DefaultModel:  r.DefaultModel,
+		DefaultSource: r.DefaultSource,
+		ResolvedModel: r.Model,
+		Source:        r.Source,
+	}
+}
+
 // effortSettingCells builds the ordinary effort setting's cells (PRD #3247), always
 // ordered claude then codex, from the stored preference tokens of one row read.
 func effortSettingCells(claude, codex *string) []apitypes.EffortSettingCellDTO {
@@ -96,6 +123,26 @@ func validateClaudeJudgeModel(raw *string) (pgtype.Text, error) {
 	}
 	if m == "" {
 		return pgtype.Text{}, nil
+	}
+	return pgtype.Text{String: m, Valid: true}, nil
+}
+
+// validateCodexSummaryModel validates a user Codex summary lane value: nil or blank
+// clears to NULL; anything else must be a Codex role id after trimming, and is stored
+// trimmed.
+func validateCodexSummaryModel(raw *string) (pgtype.Text, error) {
+	if raw == nil {
+		return pgtype.Text{}, nil
+	}
+	m, err := agenttmpl.ValidateModel(*raw)
+	if err != nil {
+		return pgtype.Text{}, err
+	}
+	if m == "" {
+		return pgtype.Text{}, nil
+	}
+	if !agenttmpl.CodexRoleModels[m] {
+		return pgtype.Text{}, fmt.Errorf("%q is not a supported Codex model", m)
 	}
 	return pgtype.Text{String: m, Valid: true}, nil
 }

@@ -1223,6 +1223,30 @@ describe("AgentRosterSummary (read-only, post-approval)", () => {
   });
 });
 
+describe("AgentRosterSummary — roster revision (issue #3913)", () => {
+  it("shows the default-branch revision the repo agents were read at", () => {
+    const commit = "0123456789abcdef0123456789abcdef01234567";
+    render(
+      <AgentRosterSummary
+        run={run({
+          status: "running",
+          agent_source: "repo",
+          repo_agents: [{ name: "reviewer", description: "rev" }],
+          repo_agent_source_commit: commit,
+        })}
+      />,
+    );
+    expect(screen.getByText(/read at default-branch revision/i)).toBeTruthy();
+    expect(screen.getByText("0123456789ab").getAttribute("title")).toBe(commit);
+  });
+
+  it("shows no revision line when none was recorded", () => {
+    render(<AgentRosterSummary run={run({ status: "running", agent_source: "repo", repo_agents: [] })} />);
+    expect(screen.getByText(/This run used the repository's own agents/i)).toBeTruthy();
+    expect(screen.queryByText(/read at default-branch revision/i)).toBeNull();
+  });
+});
+
 describe("AgentRosterSummary — repo agent folder", () => {
   it("names .codex/agents/ for a repo-source run whose roster was read from it", () => {
     render(
@@ -2003,9 +2027,10 @@ describe("RunView — paused header: Resume + pending-pause chip (PRD #1190)", (
     } as unknown as ReturnType<typeof useRunStream>);
     mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
     const utils = render(
-      <MemoryRouter initialEntries={["/runs/r1"]}>
-        <RunView />
-      </MemoryRouter>,
+      <RouterProvider router={createMemoryRouter(
+        [{ path: "/runs/:id", element: <RunView /> }],
+        { initialEntries: ["/runs/r1"] },
+      )} />,
     );
     return { ...utils, refreshRun, submit };
   }
@@ -2034,6 +2059,35 @@ describe("RunView — paused header: Resume + pending-pause chip (PRD #1190)", (
     renderPage({ ...PAUSED, hold_reason: "completion_blocked" }, true);
     await screen.findByText("Add rate limiting");
     expect(screen.queryByRole("button", { name: /resume/i })).toBeNull();
+  });
+
+  it("a repo-agent source hold offers owner Resume and Cancel without claiming a checkpoint", async () => {
+    const { refreshRun, submit } = renderPage({ ...PAUSED, hold_reason: "repo_agent_source_unavailable",
+      checkpoint_tip_at: null, checkpoint_contains_latest: false, repo_agent_source_commit: null }, true);
+    const heading = await screen.findByRole("heading", { name: "Repo agents unreadable: waiting for owner" });
+    const panel = within(heading.parentElement!);
+    expect(panel.getByText(/the agent was not started/i)).toBeTruthy();
+    expect(panel.getByText(/does not resume automatically/i)).toBeTruthy();
+    expect(screen.queryByText(/the last checkpoint is pushed/i)).toBeNull();
+    expect(screen.queryByText(/the branch is recovered from the checkpoint/i)).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Completion state" })).toBeNull();
+    expect(screen.getAllByRole("button", { name: /resume/i })).toHaveLength(1);
+    await act(async () => { fireEvent.click(panel.getByRole("button", { name: "Resume" })); });
+    await waitFor(() => expect(mockApi.resumeRun).toHaveBeenCalledWith("r1"));
+    await waitFor(() => expect(refreshRun).toHaveBeenCalled());
+    await act(async () => { fireEvent.click(panel.getByRole("button", { name: "Cancel" })); });
+    await waitFor(() => expect(submit).toHaveBeenCalledWith("cancel", "", undefined, undefined, false));
+  });
+
+  it("a repo-agent source hold gives non-owners no Resume or Cancel controls", async () => {
+    renderPage({ ...PAUSED, hold_reason: "repo_agent_source_unavailable" }, false);
+    const heading = await screen.findByRole("heading", { name: "Repo agents unreadable: waiting for owner" });
+    const panel = within(heading.parentElement!);
+    expect(panel.getByText("Only the run owner can Resume or Cancel this hold.")).toBeTruthy();
+    expect(panel.queryByRole("button")).toBeNull();
+    expect(screen.queryByRole("button", { name: /resume/i })).toBeNull();
+    expect(screen.queryByText(/the last checkpoint is pushed/i)).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Completion state" })).toBeNull();
   });
 
   it("clicking Resume calls api.resumeRun(id) then refreshRun", async () => {
@@ -5756,10 +5810,10 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
     const { container } = render(<RecoveryWaitPanel run={diskPark()} />);
     expect(container.querySelector('[role="status"]')?.textContent).toContain("Waiting for disk space");
     expect(container.textContent).toContain(
-      `The worker's disk is full or nearly full. uzi frees space on the worker and the run resumes at its next retry (${hhmm("2026-01-01T09:30:00Z")}). No action is needed.`,
+      `Retry at ${hhmm("2026-01-01T09:30:00Z")}.`,
     );
     expect(container.textContent).toContain(
-      "Counted disk parks so far: 2. If the disk stays full, the run can fail after repeated counted parks.",
+      "Counted disk parks so far: 2. Resume does not reset this count.",
     );
     expect(container.textContent).not.toContain("uzi freed");
     expect(container.textContent).not.toContain("transient interruption");
@@ -5769,12 +5823,12 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
     expect(container.querySelector("button")).toBeNull();
   });
 
-  it("data_volume_full with no retry stamp or count drops the time and reads 0 parks", () => {
+  it("data_volume_full with explicit null is an owner hold and reads 0 parks", () => {
     const { container } = render(
       <RecoveryWaitPanel run={diskPark({ recovery_retry_not_before: null, disk_park_count: undefined })} />,
     );
-    expect(container.textContent).toContain("the run resumes at its next retry. No action is needed.");
-    expect(container.textContent).not.toMatch(/retry \(/);
+    expect(container.textContent).toContain("Automatic disk recovery has stopped.");
+    expect(container.textContent).not.toContain("Retry at");
     expect(container.textContent).toContain("Counted disk parks so far: 0.");
   });
 
@@ -6187,14 +6241,14 @@ describe("RunView park announcement — recovery_wait (issue #1197, a11y)", () =
   // PRD #1809 M5: a data_volume_full park announces the disk space it waits on, not the
   // generic transient interruption.
   it("announces a data_volume_full park as waiting for disk space", async () => {
-    renderPage({ status: "recovery_wait", recovery_wait_cause: "data_volume_full" });
+    renderPage({ status: "recovery_wait", recovery_wait_cause: "data_volume_full", recovery_retry_not_before: "2026-01-01T09:30:00Z" });
     const region = await waitFor(() => {
       const el = document.querySelector('div.sr-only[role="status"]') as HTMLElement | null;
       if (!el || el.textContent === "") throw new Error("not announced yet");
       return el;
     });
     expect(region.textContent).toBe(
-      "This run is waiting for disk space. The worker's disk is full or nearly full; uzi frees space on the worker and the run resumes at its next retry.",
+      "The worker's disk is full or nearly full. uzi frees space on the worker and the run retries automatically after its scheduled time, including when already due. Admission may still refuse execution.",
     );
     expect(region.textContent).not.toContain("transient interruption");
   });

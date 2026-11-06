@@ -16,8 +16,12 @@ import {
 import type { CodexProviderConfig } from "../src/codex/codex-harness.js";
 import type { AdviceRequest, AdviceResultPolicy } from "../src/harness.js";
 import type { CodexNotification, CodexTransport } from "../src/codex/transport.js";
+import type { CodexAdviceHarnessFactory } from "../src/codex/codex-executor.js";
 import type { Logger } from "../src/log.js";
 import { runReadOnlyModelPass } from "../src/model-pass.js";
+import { RequestError } from "../src/client.js";
+import { SummaryRunner, type IntentSummaryInput } from "../src/summary-runner.js";
+import { testOwnedPassHomeRoot } from "./teardown-fixtures.js";
 import { CodexAdviceCredentialBridge, CODEX_PRODUCTION_PROVIDER, makeCodexAdviceHarness, makeProductionCodexAdviceHarnessFactory } from "../src/codex/codex-executor.js";
 import { selectCodexBinding } from "../src/codex/select.js";
 import type { AdviceUsageSnapshot } from "../src/harness.js";
@@ -1801,5 +1805,121 @@ it("M3 advice inventory names every worker send sink and model-pass caller", asy
   const inventory = await fs.readFile(new URL("codex-operation-scope.ts", src), "utf8");
   for (const family of ["JudgeRunner", "ReviewRunner", "SummaryRunner", "NowSummaryController", "CrossCheckRunner", "coverage", "replay", "evaluator", "compaction", "continuations", "retries"]) {
     assert.ok(inventory.includes(family), `inventory omits ${family}`);
+  }
+});
+
+// Issue #3248 M3: the summary-skip classification, driven end to end through the real advice
+// harness (fake transport) and the production factory, at the SummaryRunner seam.
+describe("Codex summary skip reasons (#3248 M3)", () => {
+  const root = testOwnedPassHomeRoot();
+  const SUB = { auth_mode: "subscription", access_token: "claim-tok", capability: "run-cap", generation: 3, chatgpt_account_id: "verified-account", chatgpt_plan_type: null };
+  const refreshFrame = (): CodexNotification => ({
+    kind: "activity", method: "account/chatgptAuthTokens/refresh", requestId: 44,
+    params: { reason: "unauthorized", previousAccountId: null },
+  });
+  const conflict = (reason: string) => new RequestError("POST", "/api/worker/runs/run-skip/codex/release", 409, JSON.stringify({ reason }));
+
+  interface Drive {
+    release?: (ctl: AbortController) => Promise<never>;
+    feed?: (t: FakeTransport) => void;
+    timeoutMs?: number;
+  }
+  async function drive(pass: "intent" | "plan", d: Drive) {
+    const selection = selectCodexBinding({ codex: SUB });
+    assert.equal(selection.kind, "codex");
+    const ctl = new AbortController();
+    let releases = 0;
+    let refreshCalls = 0;
+    let builds = 0;
+    let claude = 0;
+    const client = {
+      releaseCodex: async () => {
+        releases++;
+        if (d.release) return d.release(ctl);
+        return { auth_mode: "subscription", access_token: "released-tok", generation: 3, chatgpt_account_id: "verified-account" };
+      },
+      refreshCodex: async () => {
+        refreshCalls++;
+        return { access_token: "refreshed-tok", generation: 4, chatgpt_account_id: "verified-account", outcome: "advanced" };
+      },
+    } as unknown as import("../src/client.js").WorkerClient;
+    const transport = new FakeTransport(authResponder);
+    d.feed?.(transport);
+    const inner = makeProductionCodexAdviceHarnessFactory(client, noopLog, root, {
+      launchRoot: async () => ({ transport, cwd: root, dispose: async () => {} }),
+    });
+    const factory: CodexAdviceHarnessFactory = (params) => { builds++; return inner(params); };
+    const runner = new SummaryRunner(noopLog, {
+      homeRoot: root,
+      modelTimeoutMs: d.timeoutMs ?? 5000,
+      queryFn: (() => { claude++; throw new Error("unexpected Claude"); }) as never,
+      codexAdviceHarnessFactory: factory,
+    });
+    const reasons: string[] = [];
+    const input: IntentSummaryInput = {
+      token: "", model: "", issueTitle: "t", issueBody: "b", signal: ctl.signal,
+      claim: { run_id: "run-skip", secrets: { codex: SUB } },
+      onSkip: (reason) => { reasons.push(reason); },
+    };
+    const out = pass === "intent" ? await runner.generateIntentSummary(input) : await runner.generatePlanSummary({ ...input, planMd: "# plan" });
+    return { out, reasons, builds, releases, refreshCalls, claude };
+  }
+  const settled = (r: Awaited<ReturnType<typeof drive>>, reasons: string[]) => {
+    assert.equal(r.out, null);
+    assert.deepEqual(r.reasons, reasons);
+    assert.equal(r.claude, 0, "no Claude call");
+    assert.equal(r.refreshCalls, 0, "no refresh, so the credential generation never advances");
+    assert.equal(r.builds, 1, "one factory build, no second attempt");
+  };
+
+  for (const pass of ["intent", "plan"] as const) {
+    describe(pass, () => {
+      it("a denied refresh reports refresh_denied", async () => {
+        settled(await drive(pass, { feed: (t) => t.push(threadStarted()).push(refreshFrame()).push(turnCompleted("failed")).end() }), ["refresh_denied"]);
+      });
+      it("a denied refresh the call survives writes the summary and no note", async () => {
+        const r = await drive(pass, { feed: (t) => t.push(threadStarted()).push(refreshFrame()).push(agentMessage(pass === "intent" ? "ok" : JSON.stringify({ summary: "ok", deltas: [] }))).push(turnCompleted("completed")).end() });
+        assert.notEqual(r.out, null);
+        assert.deepEqual(r.reasons, []);
+        assert.equal(r.refreshCalls, 0);
+      });
+      it("a typed 409 vault_locked release reports vault_locked", async () => {
+        const r = await drive(pass, { release: () => Promise.reject(conflict("vault_locked")) });
+        settled(r, ["vault_locked"]);
+        assert.equal(r.releases, 1);
+      });
+      it("a typed 409 vault_locked release reports vault_locked even when the timeout is inside the deadline slack", async () => {
+        const r = await drive(pass, { timeoutMs: 20, release: () => Promise.reject(conflict("vault_locked")) });
+        settled(r, ["vault_locked"]);
+      });
+      it("a typed 409 codex_account_unavailable release reports account_unavailable", async () => {
+        settled(await drive(pass, { release: () => Promise.reject(conflict("codex_account_unavailable")) }), ["account_unavailable"]);
+      });
+      it("an authentication error terminal reports credential_rejected", async () => {
+        settled(await drive(pass, { feed: (t) => t.push(threadStarted()).push(codexError("unauthorized")).push(turnCompleted("failed")).end() }), ["credential_rejected"]);
+      });
+      it("a denied refresh followed by an authentication terminal reports refresh_denied exactly once", async () => {
+        settled(await drive(pass, {
+          feed: (t) => t.push(threadStarted()).push(refreshFrame()).push(codexError("unauthorized")).push(turnCompleted("failed")).end(),
+        }), ["refresh_denied"]);
+      });
+
+      const silent: [string, Drive][] = [
+        ["a transport TypeError on release", { release: () => Promise.reject(new TypeError("fetch failed")) }],
+        ["a 5xx release error", { release: () => Promise.reject(new RequestError("POST", "/release", 503, "{}")) }],
+        ["a 409 with an unknown reason", { release: () => Promise.reject(conflict("something_else")) }],
+        ["an abort during release", { release: (ctl) => { ctl.abort(); return Promise.reject(new DOMException("aborted", "AbortError")); } }],
+        ["an abort during release even with a typed deferral body", { release: (ctl) => { ctl.abort(); return Promise.reject(conflict("vault_locked")); } }],
+        ["a provider policy refusal terminal", { feed: (t) => t.push(threadStarted()).push(codexError("cyberPolicy")).push(turnCompleted("failed")).end() }],
+        ["a model error terminal", { feed: (t) => t.push(threadStarted()).push(codexError("contextWindowExceeded")).push(turnCompleted("failed")).end() }],
+        ["empty output", { feed: (t) => t.push(threadStarted()).push(agentMessage(" ")).push(turnCompleted("completed")).end() }],
+        ["a wall-clock timeout", { timeoutMs: 100, feed: (t) => t.push(threadStarted()) }],
+      ];
+      for (const [name, d] of silent) {
+        it(`${name} stays silent`, async () => {
+          settled(await drive(pass, d), []);
+        });
+      }
+    });
   }
 });

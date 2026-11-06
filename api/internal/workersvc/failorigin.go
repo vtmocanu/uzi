@@ -106,13 +106,9 @@ var failOrigins = []string{
 	// Excluded from the judge (neverJudgeFailOrigins): a refusal is a protocol state, not an
 	// agent defect.
 	"gate_presentation_refused",
-	// PRD #1809 M5 (D6): a run whose worker's data volume stayed full across more than
-	// UZI_RUN_DISK_PARK_MAX counted 'data_volume_full' parks. SERVER-DERIVED, NOT
-	// worker-reportable (stamped directly inside SetState's disk-park transaction,
-	// parkDataVolumeFull, so it is deliberately absent from workerReportableFailOrigins — a
-	// worker reporting it is a forgery CoerceFailOrigin drops). Excluded from the judge
-	// (neverJudgeFailOrigins, judge_enqueue.go) REGARDLESS of iteration_count: a full worker
-	// volume is the environment's failure, not an agent defect, and it lands mid-run.
+	// Historical server-derived disk cap failure. Current disk cap exhaustion holds
+	// for owner Resume; retain the CHECK-compatible vocabulary and never-judge
+	// classification for stored failures. Workers cannot report this fail_origin.
 	"data_volume_full",
 	// issue #1888: a run with selected skills whose Claude SDK skills plugin failed to load at
 	// session start (the SDK reported plugin load errors, or an error report the worker could not

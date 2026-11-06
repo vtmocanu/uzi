@@ -1,6 +1,7 @@
 // Per-worker resource load (PRD #49): a compact "cpu · mem" line per worker that has
 // reported a sample, so the factory floor shows live pressure at a glance. Hidden until at
-// least one worker reports (no empty card churn). Shared by both Overview pages.
+// least one worker reports (no empty card churn). Used by Dashboard only; the /overview/next
+// preview shows per-worker load inside its Capacity rail instead.
 
 import { Link } from "react-router-dom";
 import type { Worker } from "../lib/api";

@@ -14,6 +14,7 @@ import type {
   StopKind,
 } from "./apiTypes";
 import { forgeWaitLabel, forgeWaitMode, forgeWaitPhase } from "./forgeCooldown";
+import { diskWaitLabel, diskWaitMode, diskWaitDescription } from "./diskRecovery";
 import { isTerminalRun } from "./runStatus";
 import { credentialSwitchHold } from "./credentialSwitchHold";
 import { forgeNounSentence, forgeNounLower, forgePlatform } from "./forgeNoun";
@@ -166,6 +167,7 @@ const PARK_LABELS = {
   retained_recovery_held: "retained recovery needs decision",
   retained_recovery_adoption_failed: "retained recovery integrity hold",
   retained_recovery_unknown: "retained recovery timing unknown",
+  retained_continuation_unwitnessed: "unwitnessed continuation hold",
   worker_requeue_exhausted: "recovery needs decision",
   worker_memory_pressure: "memory pressure: owner hold",
   paused: "paused",
@@ -174,6 +176,7 @@ const PARK_LABELS = {
   provider_unavailable: "provider unavailable: owner hold",
   codex_policy_hold: "Codex policy hold",
   base_attestation_missing: "base unverified: owner hold",
+  repo_agent_source_unavailable: "repo agents unreadable: owner hold",
   provider_outage: "waiting for provider",
   completion_blocked: "Completion blocked",
   credential_switch_settling: "settling: token switch",
@@ -185,6 +188,8 @@ const PARK_LABELS = {
 // completion hold (raw status "paused") and an exhausted recovery read as they do on the
 // status pill. An unlisted status falls back to its de-underscored enum, never "".
 export function parkLabel(run: Parameters<typeof effectiveRunStatus>[0]): string {
+  const disk = diskWaitLabel(run);
+  if (disk) return disk;
   const forge = forgeWaitLabel(run);
   if (forge) return forge;
   const eff = effectiveRunStatus(run);
@@ -222,6 +227,7 @@ export function effectiveRunStatus(
   // Issue #3194: a --require-base run whose adopted work no checkpoint attests to the planned
   // base. Server-held (raw status "paused"), so overlaid like the other holds.
   if (run.status === "paused" && run.hold_reason === "base_attestation_missing") return "base_attestation_missing";
+  if (run.status === "paused" && run.hold_reason === "repo_agent_source_unavailable") return "repo_agent_source_unavailable";
   if (run.status === "recovery_wait" && run.recovery_wait_cause === "provider_outage") return "provider_outage";
   if (isPlanningRun(run)) return "planning";
   if (isRevisingRun(run)) return "revising";
@@ -250,6 +256,9 @@ export function effectiveRunStatus(
   if (run.status === "paused" && run.hold_reason === "credential_disabled") return "credential_disabled";
   // Integrity refusal is always owner-held, even if a malformed DTO carries a retry stamp.
   if (run.status === "recovery_wait" && run.recovery_wait_cause === "retained_recovery_adoption_failed") return "retained_recovery_adoption_failed";
+  // Owner-only, no timer: the claimed flight was never witnessed, so the server released the
+  // claim. Always owner-held, even if a malformed DTO carries a retry stamp.
+  if (run.status === "recovery_wait" && run.recovery_wait_cause === "retained_continuation_unwitnessed") return "retained_continuation_unwitnessed";
   if (run.status === "recovery_wait" && run.recovery_wait_cause === "retained_recovery_exhausted") {
     // Only explicit null means owner-held. Omitted or invalid timing stays unknown.
     if (run.recovery_retry_not_before === null) return "retained_recovery_held";
@@ -388,7 +397,7 @@ export function runStatusTone(
   if (status === "completion_blocked") return "warning";
   // PRD #1732: held on a disabled credential. Warn like the other involuntary holds.
   if (status === "iteration_budget_exhausted") return "warning";
-  if (status === "credential_disabled" || status === "provider_unavailable" || status === "codex_policy_hold" || status === "base_attestation_missing" || status === "provider_outage") return "warning";
+  if (status === "credential_disabled" || status === "provider_unavailable" || status === "codex_policy_hold" || status === "base_attestation_missing" || status === "repo_agent_source_unavailable" || status === "provider_outage") return "warning";
   // Issue #3181: both token-switch holds wait on something outside the run; warn, never danger.
   if (status === "credential_switch_settling" || status === "credential_switch_unsettled") return "warning";
   if (status === "awaiting_approval" || status === "awaiting_input")
@@ -406,7 +415,7 @@ export function runStatusTone(
   if (status === "pool_wait") return "warning";
   // Recovery holds use warning: transient recovery and worker exhaustion are
   // non-terminal, though exhaustion requires an owner decision.
-  if (status === "retained_recovery_adoption_failed" || status === "codex_idle_stall_retrying" || status === "codex_idle_stall_held" || status === "codex_idle_stall_unknown" || status === "retained_recovery_retrying" || status === "retained_recovery_held" || status === "retained_recovery_unknown" || status === "recovery_wait" || status === "worker_requeue_exhausted" || status === "worker_memory_pressure") return "warning";
+  if (status === "retained_recovery_adoption_failed" || status === "retained_continuation_unwitnessed" || status === "codex_idle_stall_retrying" || status === "codex_idle_stall_held" || status === "codex_idle_stall_unknown" || status === "retained_recovery_retrying" || status === "retained_recovery_held" || status === "retained_recovery_unknown" || status === "recovery_wait" || status === "worker_requeue_exhausted" || status === "worker_memory_pressure") return "warning";
   // PRD #1190: an ordinary paused run. INFO, not the warn the involuntary holds carry
   // (D11): a pause is a chosen hold, not something blocking the run. Kept in step with
   // RUN_STATUS_TONES.paused (the runBadge.test.ts tone-agreement loop asserts it).
@@ -704,6 +713,9 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
   if (isRejectedRun(run.status, run.fail_origin)) {
     return { kind: "badge", label: "rejected", tone: "neutral", pulse: false };
   }
+  const diskMode = diskWaitMode(run);
+  if (diskMode) return { kind: "badge", label: diskWaitLabel(run)!, tone: "warning", pulse: false,
+    title: diskWaitDescription(diskMode) };
   const forgeMode = forgeWaitMode(run);
   if (forgeMode) {
     if (forgeWaitPhase(run) === "publication") {
@@ -804,6 +816,9 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
     case "base_attestation_missing":
       return { kind: "badge", label: PARK_LABELS.base_attestation_missing, tone: "warning", pulse: false,
         title: "The retained work is not attested to the planned base commit, so the agent was not started. Open the run to recover the work or start a successor." };
+    case "repo_agent_source_unavailable":
+      return { kind: "badge", label: PARK_LABELS.repo_agent_source_unavailable, tone: "warning", pulse: false,
+        title: "The repo agents could not be read at the run's recorded default-branch revision, so the agent was not started. Open the run to Resume once the repository can be fetched, or Cancel." };
     case "provider_outage":
       return { kind: "badge", label: PARK_LABELS.provider_outage, tone: "warning", pulse: false,
         title: "Provider outage. Open the run for park count, streak start and next retry." };
@@ -889,6 +904,11 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
       return {
         kind: "badge", label: PARK_LABELS.retained_recovery_adoption_failed, tone: "warning", pulse: false,
         title: "Integrity checks refused to adopt the retained work. Local work and its custody are preserved. Only the run owner can Resume or Cancel; there is no scheduled retry.",
+      };
+    case "retained_continuation_unwitnessed":
+      return {
+        kind: "badge", label: PARK_LABELS.retained_continuation_unwitnessed, tone: "warning", pulse: false,
+        title: "The continuation was never confirmed to start, so the claim was released. Local work and its custody are kept. Only the run owner can Resume or Cancel; there is no scheduled retry.",
       };
     case "codex_idle_stall_retrying":
     case "codex_idle_stall_held":
@@ -1204,6 +1224,7 @@ export function needsHumanAttention(status: string): boolean {
     status === "codex_idle_stall_held" ||
     status === "retained_recovery_held" ||
     status === "retained_recovery_adoption_failed" ||
+    status === "retained_continuation_unwitnessed" ||
     status === "worker_requeue_exhausted" ||
     status === "worker_memory_pressure" ||
     status === "iteration_budget_exhausted" ||
@@ -1211,6 +1232,7 @@ export function needsHumanAttention(status: string): boolean {
     status === "codex_policy_hold" ||
     status === "credential_switch_settling" ||
     status === "credential_switch_unsettled" ||
-    status === "base_attestation_missing"
+    status === "base_attestation_missing" ||
+    status === "repo_agent_source_unavailable"
   );
 }

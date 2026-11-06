@@ -244,6 +244,8 @@ Measured 2026-10-30 from the committed test, 3 runs. Environment: Intel Xeon Gol
 
 At the 30 s production interval a run triggers at most about two measurements per minute per generation, so the per-measurement spawn cost is amortised. This frequency argument is arithmetic, not a measurement.
 
-### Not yet done
+### Hosted observation accepted; calibration limits remain
 
-Hosted observation of a long Go-heavy run after release is pending (owner, #3675 m5). The 4 GiB default, the walk bounds and the hosted effect on node ephemeral storage are unvalidated until then.
+#3675 M5 was accepted on 2026-11-05 in the [hosted observation report](https://github.com/vtmocanu/uzi/issues/3675#issuecomment-6666594930): 55 observed rotations retired with `state=removed`, and one pending generation was removed at terminal settlement. The same report records unresolved-helper warnings and three retained terminal caches. It verifies rotation and removal in that observed workload, not universal cleanup or a strict byte ceiling.
+
+The M0 calibration above remains incomplete. This observation does not establish optimality of the 4 GiB default, complete the cold/concurrency calibration matrix, or fill #1598's separate private-command-tmp and download-measurement acceptance.

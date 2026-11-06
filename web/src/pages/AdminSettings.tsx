@@ -527,7 +527,7 @@ export function AdminSettings() {
 
       {!loading && saved && (
         <section id="run-summaries" className="scroll-mt-6">
-          <SummarySettingsCard settings={saved} onSaved={applyResponse} />
+          <SummarySettingsCard settings={saved} sources={sources} defaults={defaults} onSaved={applyResponse} />
         </section>
       )}
 

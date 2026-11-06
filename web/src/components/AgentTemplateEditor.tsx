@@ -259,7 +259,7 @@ export const AgentTemplateEditor = forwardRef<
           </div>
         </div>
         <p id="template-model-help" className="text-xs text-muted">
-          Leave a harness on Default so this subagent uses whatever the lead runs on. A schedule with “Apply model also to agents” on overrides these pins.
+          Leave a harness on Default so this subagent uses whatever the lead runs on. A schedule with “Use the run's resolved model for subagents too” on overrides these pins.
         </p>
         {isLeadTemplateName(name) && (
           <p className="text-xs text-muted">

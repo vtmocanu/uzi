@@ -480,7 +480,7 @@ describe("Run defaults — judge model per harness (PRD #3245)", () => {
     expect(codexEffect?.textContent).toBe("In effect: gpt-6-sol \u00b7 your choice");
   });
 
-  it("harness help says Default · automatic (not 'Use my default') and summary help is Claude-only (#3255)", async () => {
+  it("harness help says Default · automatic (not 'Use my default') and summary help is per-lane (#3255, #3248)", async () => {
     mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
     mockApi.getMySettings.mockResolvedValue(judgeSettings());
     renderPage();
@@ -490,7 +490,7 @@ describe("Run defaults — judge model per harness (PRD #3245)", () => {
     expect(harnessHelp).not.toContain("Use my default");
     const harnessOptions = Array.from((screen.getByLabelText("Default harness") as HTMLSelectElement).options).map((o) => o.text);
     expect(harnessOptions.some((t) => t.includes("Use my default"))).toBe(false);
-    expect(screen.getByText(/This setting applies to Claude runs/).textContent).toContain("Codex summaries use a fixed model");
+    expect(screen.getByText(/Used for the intent summary and the plan summary on Codex runs/).textContent).toContain("Codex pull request descriptions use their own model");
   });
 
   it("saves only the dirty lane, and adopts the response's In-effect cell", async () => {
@@ -597,7 +597,7 @@ describe("Run defaults — per-user summary model (PRD #362 M2)", () => {
       </MemoryRouter>,
     );
     await screen.findByText("Run summaries");
-    expect(screen.getByLabelText("Summary model")).toBeTruthy();
+    expect(screen.getByLabelText("Claude summary model")).toBeTruthy();
   });
 
   it("saves the per-user summary model through PUT /me/settings", async () => {
@@ -614,10 +614,137 @@ describe("Run defaults — per-user summary model (PRD #362 M2)", () => {
     );
     await screen.findByText("Run summaries");
     // The summary-model picker offers a "haiku" option; selecting it dirties Save.
-    const select = screen.getByLabelText("Summary model") as HTMLSelectElement;
+    const select = screen.getByLabelText("Claude summary model") as HTMLSelectElement;
     fireEvent.change(select, { target: { value: "haiku" } });
-    fireEvent.click(screen.getByText("Save summary model"));
+    fireEvent.click(screen.getByText("Save Claude summary model"));
     await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ summary_model: "haiku" }));
+  });
+});
+
+describe("Run defaults — summary model per harness (PRD #3248)", () => {
+  const key = (kind: string) => ({
+    id: kind, kind, label: kind, is_default: true, enabled: true, disabled_at: null, auto_eligible: false,
+    created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
+  });
+  const cells = (): ModelSettingCell[] => [
+    { harness: "claude", model: null, default_model: "haiku", default_source: "builtin", resolved_model: "haiku", source: "builtin" },
+    { harness: "codex", model: "gpt-6-astra", default_model: "gpt-6.1-sol", default_source: "instance_default", resolved_model: "gpt-6-astra", source: "user_default" },
+  ];
+  const summarySettings = (over: Partial<UserSettings> = {}): { settings: UserSettings } => ({
+    settings: {
+      default_harness: null, harness_overflow_enabled: false, default_model: null, default_effort: null, judge_model: null,
+      appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null,
+      summary_model: null, codex_summary_model: "gpt-6-astra", summary_models: cells(),
+      ...over,
+    },
+  });
+  const optionValues = (select: HTMLSelectElement) => Array.from(select.options).map((o) => o.value);
+  const renderPage = () => render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+
+  it("Codex-only: the Codex summary select offers exactly the Codex role models, and no Claude lane", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("openai_api_key")] });
+    mockApi.getMySettings.mockResolvedValue(summarySettings());
+    renderPage();
+    const codex = (await screen.findByLabelText("Codex summary model")) as HTMLSelectElement;
+    expect(optionValues(codex)).toEqual(["inherit", ...CODEX_ROLE_MODELS]);
+    expect(optionValues(codex)).not.toContain("custom");
+    expect(optionValues(codex)).not.toContain("opus");
+    expect(codex.value).toBe("gpt-6-astra");
+    expect(screen.queryByLabelText("Claude summary model")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Save Claude summary model" })).toBeNull();
+  });
+
+  it("both usable: both lanes show, with Default and In-effect lines from summary_models", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
+    mockApi.getMySettings.mockResolvedValue(summarySettings());
+    renderPage();
+    const claude = (await screen.findByLabelText("Claude summary model")) as HTMLSelectElement;
+    const codex = screen.getByLabelText("Codex summary model") as HTMLSelectElement;
+    expect(optionValues(claude)).toEqual(["inherit", "opus", "sonnet", "haiku", "fable", "custom"]);
+    expect(claude.options[0].textContent).toBe("Default \u00b7 haiku (built-in)");
+    expect(codex.options[0].textContent).toBe("Default \u00b7 gpt-6.1-sol (instance default)");
+    expect(document.getElementById(claude.getAttribute("aria-describedby") ?? "")?.textContent).toBe("In effect: haiku \u00b7 built-in");
+    expect(document.getElementById(codex.getAttribute("aria-describedby") ?? "")?.textContent).toBe("In effect: gpt-6-astra \u00b7 your choice");
+  });
+
+  it("the card copy is harness-neutral", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
+    mockApi.getMySettings.mockResolvedValue(summarySettings());
+    renderPage();
+    await screen.findByLabelText("Claude summary model");
+    const card = screen.getByText("Run summaries").closest("div")!;
+    expect(card.textContent).toMatch(/on the same harness the run uses, with your own credential\s+for that harness/);
+    expect(screen.queryByText(/your own Anthropic token(?!s)/)).toBeNull();
+  });
+
+  it("Codex Save sends only the Codex field; blank means null", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
+    mockApi.getMySettings.mockResolvedValue(summarySettings());
+    const saved = cells();
+    saved[1] = { ...saved[1], model: null, resolved_model: "gpt-6.1-sol", source: "instance_default" };
+    mockApi.putMySettings.mockResolvedValue(summarySettings({ codex_summary_model: null, summary_models: saved }));
+    renderPage();
+    const codex = (await screen.findByLabelText("Codex summary model")) as HTMLSelectElement;
+    const save = screen.getByRole("button", { name: "Save Codex summary model" }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    fireEvent.change(codex, { target: { value: "inherit" } });
+    fireEvent.click(save);
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ codex_summary_model: null }));
+    await waitFor(() =>
+      expect(document.getElementById("codex-summary-model-effect")?.textContent).toBe("In effect: gpt-6.1-sol \u00b7 instance default"),
+    );
+  });
+
+  it("Claude Save sends only the Claude field", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
+    mockApi.getMySettings.mockResolvedValue(summarySettings());
+    mockApi.putMySettings.mockResolvedValue(summarySettings({ summary_model: "sonnet" }));
+    renderPage();
+    fireEvent.change(await screen.findByLabelText("Claude summary model"), { target: { value: "sonnet" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save Claude summary model" }));
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ summary_model: "sonnet" }));
+  });
+
+  it("out-of-order lane saves keep each lane's own cell: a late Claude response cannot restore a stale Codex cell", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
+    mockApi.getMySettings.mockResolvedValue(summarySettings());
+    const codexSaved = cells();
+    codexSaved[1] = { ...codexSaved[1], model: "gpt-6-luna", resolved_model: "gpt-6-luna" };
+    const claudeSaved = cells();
+    claudeSaved[0] = { ...claudeSaved[0], model: "sonnet", resolved_model: "sonnet", source: "user_default" };
+    let resolveClaude: (v: { settings: UserSettings }) => void = () => {};
+    let resolveCodex: (v: { settings: UserSettings }) => void = () => {};
+    mockApi.putMySettings.mockImplementation((patch: object) =>
+      new Promise((resolve) => {
+        if ("summary_model" in patch) resolveClaude = resolve as typeof resolveClaude;
+        else resolveCodex = resolve as typeof resolveCodex;
+      }));
+    renderPage();
+    fireEvent.change(await screen.findByLabelText("Codex summary model"), { target: { value: "gpt-6-luna" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save Codex summary model" }));
+    fireEvent.change(screen.getByLabelText("Claude summary model"), { target: { value: "sonnet" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save Claude summary model" }));
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledTimes(2));
+    resolveCodex(summarySettings({ codex_summary_model: "gpt-6-luna", summary_models: codexSaved }));
+    await waitFor(() =>
+      expect(document.getElementById("codex-summary-model-effect")?.textContent).toBe("In effect: gpt-6-luna · your choice"),
+    );
+    // The Claude save was issued before the Codex one landed, so its response carries the OLD Codex cell.
+    resolveClaude(summarySettings({ summary_model: "sonnet", summary_models: claudeSaved }));
+    await waitFor(() =>
+      expect(document.getElementById("summary-model-effect")?.textContent).toBe("In effect: sonnet · your choice"),
+    );
+    expect(document.getElementById("codex-summary-model-effect")?.textContent).toBe("In effect: gpt-6-luna · your choice");
+  });
+
+  it.each(["gpt-6-astra", "gpt-6-luna"])("flags a stored Codex id (%s) in the Claude lane and blocks its Save", async (id) => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token")] });
+    mockApi.getMySettings.mockResolvedValue(summarySettings({ summary_model: id }));
+    renderPage();
+    const claude = (await screen.findByLabelText("Claude summary model")) as HTMLSelectElement;
+    await waitFor(() => expect(claude.value).toBe("custom"));
+    expect(screen.getByText(/Not a Claude model/)).toBeTruthy();
+    expect((screen.getByRole("button", { name: "Save Claude summary model" }) as HTMLButtonElement).disabled).toBe(true);
   });
 });
 
@@ -1444,7 +1571,7 @@ describe("Run defaults — harness and worker models card (PRD #1551 M3)", () =>
     expect(optionTexts(claude)[0]).toBe("Default · lead template");
     expect(optionTexts(claude).join("|")).not.toMatch(/Default[^|]*sonnet/);
     expect(optionTexts(screen.getByLabelText("Codex model"))[0]).toBe("Default · gpt-6.1-sol (built-in)");
-    expect(optionTexts(screen.getByLabelText("Summary model"))[0]).toBe("Default · instance default");
+    expect(optionTexts(screen.getByLabelText("Claude summary model"))[0]).toBe("Default");
     expect(optionTexts(screen.getByLabelText("Claude effort"))[0]).toBe("Default · medium (built-in)");
     expect(optionTexts(screen.getByLabelText("Codex effort"))[0]).toBe("Default · medium (built-in)");
     expect(optionTexts(screen.getByLabelText("Default harness"))[0]).toBe("Default · automatic");
@@ -1930,7 +2057,7 @@ describe("B1 independent settings responses", () => {
         expect(currentSettings()).toEqual(initial);
         if (sibling === "grid") start("Claude checker model", "sonnet", "Save cross-check defaults");
         if (sibling === "judge") start("Claude judge model", "sonnet", "Save judge models");
-        if (sibling === "summary") start("Summary model", "sonnet", "Save summary model");
+        if (sibling === "summary") start("Claude summary model", "sonnet", "Save Claude summary model");
         if (sibling === "MR") fireEvent.click(screen.getByLabelText("Auto-rework MR review comments on my runs"));
         start(worker.label, worker.value, worker.button);
         expect(mockApi.putMySettings).toHaveBeenLastCalledWith(worker.patch);
@@ -1939,7 +2066,7 @@ describe("B1 independent settings responses", () => {
         const finishSibling = async () => {
           replies[0]({ settings: siblingSettings });
           if (sibling === "MR") await waitFor(() => expect((screen.getByLabelText("Auto-rework MR review comments on my runs") as HTMLInputElement).disabled).toBe(false));
-          else await waitFor(() => expect((screen.getByRole("button", { name: sibling === "grid" ? "Save cross-check defaults" : sibling === "judge" ? "Save judge models" : "Save summary model" }) as HTMLButtonElement).disabled).toBe(true));
+          else await waitFor(() => expect((screen.getByRole("button", { name: sibling === "grid" ? "Save cross-check defaults" : sibling === "judge" ? "Save judge models" : "Save Claude summary model" }) as HTMLButtonElement).disabled).toBe(true));
         };
         if (workerFirst) {
           await finish(replies[1], worker.button === "Save defaults" ? modelResponse(worker.response) : { ...initial, ...worker.response }, worker.button);
@@ -1956,7 +2083,7 @@ describe("B1 independent settings responses", () => {
         expect(mockApi.getTemplateAllocations).not.toHaveBeenCalled();
         if (sibling === "grid") expect((screen.getByLabelText("Claude checker model") as HTMLSelectElement).value).toBe("sonnet");
         if (sibling === "judge") expect((screen.getByLabelText("Claude judge model") as HTMLSelectElement).value).toBe("sonnet");
-        if (sibling === "summary") expect((screen.getByLabelText("Summary model") as HTMLSelectElement).value).toBe("sonnet");
+        if (sibling === "summary") expect((screen.getByLabelText("Claude summary model") as HTMLSelectElement).value).toBe("sonnet");
       });
     }
   }

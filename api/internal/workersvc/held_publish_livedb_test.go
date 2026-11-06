@@ -118,6 +118,10 @@ type heldFix struct {
 func newHeldFix(t *testing.T) *heldFix {
 	t.Helper()
 	e := setupInterlockLiveDB(t)
+	// Registered after setupInterlockLiveDB, so it runs before the pool closes, and on a failed
+	// assertion too: a fixture row left in a cleanup lane would be counted by a later fixture's
+	// global sweep (#3883).
+	t.Cleanup(func() { neutraliseHeldRows(t, e) })
 	box := newBox(t)
 	// Assembled at runtime: no token-shaped literal in tracked source.
 	pat := strings.Join([]string{"bot", "pat", "held", uuid.NewString()}, "-")
@@ -147,6 +151,49 @@ func newHeldFix(t *testing.T) *heldFix {
 		VALUES ($1,$2,$3,$4,1,'open',$5,'held-ident',$5,$4,true)`, f.hold, e.userID, e.repoID, f.run, wid)
 	e.exec(t, `UPDATE runs SET status='failed', fail_origin='agent_failure', claim_generation=1 WHERE id=$1`, f.run)
 	return f
+}
+
+// heldLaneStates are the publication states some cleanup lane can select (reconcile, expiry,
+// orphan); prepared and the terminal states are in none.
+var heldLaneStates = []string{"invoked", "create_unknown", "created", "acknowledged", "delete_unknown"}
+
+// neutraliseHeldRows moves every lane-eligible publication row of the fixture's own user (unique
+// per fixture, so every run it seeded) into an inert terminal state. A DELETE cannot do it:
+// held_publication_delete_guard silently skips a live row and a released hold pins an
+// acknowledged one through its RESTRICT FK. The transitions are the ones held_publication_guard
+// allows, so every constraint and trigger stays in force; the guard refuses silently, which is
+// why the count afterwards is checked.
+func neutraliseHeldRows(t *testing.T, e interlockLiveDB) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for _, q := range []string{
+		`UPDATE run_held_publications SET state='deleted', live_run_id=NULL, deleted_at=COALESCE(deleted_at, now()),
+			next_attempt_at=NULL, updated_at=now()
+		 WHERE user_id=$1 AND state IN ('created','acknowledged','delete_unknown')`,
+		`UPDATE run_held_publications SET state='refused', live_run_id=NULL, refusal_reason='create_refused',
+			next_attempt_at=NULL, updated_at=now()
+		 WHERE user_id=$1 AND state IN ('invoked','create_unknown')`,
+	} {
+		if _, err := e.pool.Exec(ctx, q, e.userID); err != nil {
+			t.Errorf("neutralise fixture publications: %v", err)
+			return
+		}
+	}
+	if n := liveHeldRows(ctx, t, e, e.userID); n != 0 {
+		t.Errorf("%d publication rows of this fixture are still in a cleanup lane after neutralising", n)
+	}
+}
+
+// liveHeldRows counts a user's publication rows in a cleanup-lane state.
+func liveHeldRows(ctx context.Context, t *testing.T, e interlockLiveDB, user uuid.UUID) int {
+	t.Helper()
+	var n int
+	if err := e.pool.QueryRow(ctx, `SELECT count(*) FROM run_held_publications WHERE user_id=$1 AND state = ANY($2::text[])`,
+		user, heldLaneStates).Scan(&n); err != nil {
+		t.Errorf("count lane rows: %v", err)
+	}
+	return n
 }
 
 // rawHold runs an UPDATE on the hold with recovery_inventory_hold_guard disabled, to build a hold

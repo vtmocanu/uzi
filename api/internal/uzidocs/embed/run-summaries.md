@@ -50,6 +50,19 @@ prevent approval or implementation. A summary still in flight at the first
 implementation checkpoint or at run end is not kept for the result, as for
 autopilot.
 
+On a Codex run, one failure is not silent. When the intent or plan summary is
+skipped because the run's Codex credential could not be used, the run's
+activity feed shows a single status line, for example "Plan summary skipped:
+the run's Codex account is unavailable. The run continues." The same line
+appears in `uzi run logs` and the terminal UI. It names one of four reasons:
+the credential needed a refresh that summaries may not do, the run owner's
+vault is locked, the run's Codex account is unavailable, or the provider
+rejected the credential. Only these four typed cases produce a line; a timeout,
+a network error, a refusal or an empty answer is still skipped silently; a
+network error or refusal after the call was refused a credential refresh reports
+that refresh instead. The line is informational: no summary is written, the run's outcome does not
+change, and the summary is not retried.
+
 Planning and seeded or pre-approved runs of all three kinds are eligible for
 an intent summary on both harnesses, unless an intent summary already exists.
 Intent generation runs alongside planning or implementation without delaying it.
@@ -76,10 +89,10 @@ from the intent and plan summaries above:
   the run moves, at most once every 5 minutes, and disappears when the run
   waits, parks or ends.
 - **It runs on the run's own harness credential.** Claude runs use `haiku`;
-  Codex runs use `gpt-6-luna`. It does not follow the **Summary model**
-  setting and does not use the delivery-summary model.
+  Codex runs use `gpt-6-luna`. It does not follow the summary model
+  settings and does not use the delivery-summary model.
 - **It is on by default, with its own switches**: a per-user setting and an
-  admin kill switch, separate from the Summary model setting.
+  admin kill switch, separate from the summary model settings.
 - **Its spend counts toward the run's usage.**
 
 It is advisory like the others: a failed, refused or slow call is skipped and
@@ -94,16 +107,44 @@ across devices.
 
 ## Which model it runs on
 
-For **Claude** intent and plan summaries, the instance default is **haiku**.
-From **Settings → Run defaults → Run summaries**, the **Summary model** picker
-lets you override that for your own Claude runs; leave it on **Default · instance default** to
-use the instance default. See
-[Admin settings](./admin-settings.md#run-summaries) for the instance-wide setting.
+The intent and plan summaries have **two model settings, one per harness**:
+the Claude lane (`summary_model`) and the Codex lane (`codex_summary_model`),
+each settable per user and per instance. A run reads only the lane of **its own
+harness**, resolving in this order:
 
-**Codex** intent and plan summaries use **gpt-6-luna** with **low** effort.
-They do not follow the Summary model setting and have no fallback model.
+1. your own value for that lane,
+2. the instance value for that lane (set by an admin),
+3. the built-in default: **`haiku`** for Claude, **`gpt-6-luna`** for Codex.
+
+A blank or whitespace-only value counts as unset at every step. A value that
+is not valid for the run's harness is skipped and resolution falls through to
+the next step. The Claude lane rejects the Codex role models, and the Codex lane
+accepts only the Codex role models, so a Claude run is never handed a Codex
+role model and a Codex run never gets a Claude model. If a Codex run's resolved model is somehow not a Codex role
+model, the agent uses the built-in **`gpt-6-luna`** instead.
+
+Codex intent and plan summaries run at **low** effort. From **Settings → Run
+defaults → Run summaries**, the **Claude summary model** picker sets your own
+Claude value and the **Codex summary model** picker your own Codex value. The
+Codex picker shows only when you can run Codex, and the Claude picker shows
+unless Codex is the only harness you can use. Leave a picker on its **Default**
+option (it names the model and where it comes from, for example
+`Default · haiku (built-in)`) to inherit; the line under it shows the model in
+effect. [`uzi settings get`](./cli.md#plan-cross-check-settings) prints both
+lanes as `summary` rows. See
+[Admin settings](./admin-settings.md#run-summaries) for the instance-wide
+defaults of both lanes (the **Run summaries** card has a Claude and a Codex
+picker, each with a **Default** option that follows the built-in).
+
+**The Claude value also drives Claude PR descriptions.** A Claude run's PR
+description is written on the same resolved model (falling back to `haiku` when
+that value is not a valid Claude model). Codex PR descriptions do not follow
+either lane: they use a fixed Codex model.
+
 Codex summary calls use the existing run credential and are denied credential
-refresh; an expired credential makes the summary fail.
+refresh. If the credential needs a refresh, or cannot be used for one of the
+reasons listed under [It's advisory](#its-advisory--failures-dont-stop-your-run),
+the summary is skipped and the run feed says so.
 The Now summary keeps its separate scheduler, switches and model selection.
 
 ## From the CLI

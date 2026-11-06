@@ -25,7 +25,11 @@ a manual reload.
   (GitLab's built-in list can't be renamed).
 - One column per configured label, seeded on first open in this order:
   `Planned`, `In Progress`, `Human Review`, `Later`. Reconfigure any time
-  from the board's column settings.
+  from the board's column settings. The web page sends that first open.
+  An install that uses only the API must read the board once
+  (`GET /api/repos/<id>/board`) after it enables the repo: with no columns,
+  an issue stays on `In Progress` after its run opens a merge request, and
+  `uzi run rework` answers "the merge request is not open".
 - **Closed** (implicit): the issue's open/closed state on the forge, not a
   label. Cards here are draggable too: drag a card in to close the issue,
   drag one out to reopen it — see [Move a card](#move-a-card).

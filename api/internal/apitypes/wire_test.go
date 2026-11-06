@@ -220,7 +220,7 @@ var runDTOKeys = []string{
 	"claim_generation",
 	"finished_at", "created_at", "updated_at",
 	// issue #1727: when the run entered its current status; null only defensively.
-	"status_since", "repo_agents", "agent_source",
+	"status_since", "repo_agents", "repo_agent_source_commit", "agent_source",
 	"agent_exclusions", "own_agents",
 	// PRD #111 M1: which Anthropic credential the claim spent. The label is a
 	// snapshot and outlives the id, so both keys are always on the wire.
@@ -1186,6 +1186,8 @@ func TestUserSettingsDTOTags(t *testing.T) {
 		"now_summary_enabled",
 		// PRD #3245: the Codex judge lane and the read-only resolved judge cells.
 		"codex_judge_model", "judge_models",
+		// PRD #3248: the Codex summary lane and the read-only resolved summary cells.
+		"codex_summary_model", "summary_models",
 		// PRD #3247: the read-only resolved ordinary effort cells.
 		"effort_settings",
 		// PRD #3522: the weekly usage reserve (null threshold ⇒ off).

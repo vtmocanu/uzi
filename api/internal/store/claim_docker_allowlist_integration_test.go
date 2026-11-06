@@ -114,6 +114,7 @@ func TestClaimRunDockerRepoAllowlistLiveDB(t *testing.T) {
 			AffinityCutoff:      pgtype.Timestamptz{Time: time.Now().Add(-2 * time.Minute), Valid: true},
 			IsDockerWorker:      isDocker,
 			DockerRepoAllowlist: allow,
+			WorkerProtocolCaps:  []string{"repo_agent_source_v1"},
 		}
 	}
 

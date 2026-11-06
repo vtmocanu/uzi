@@ -424,6 +424,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 	} else {
 		dto.RepoAgents = agents
 	}
+	dto.RepoAgentSourceCommit = textPtrValue(r.RepoAgentSourceCommit.Valid, r.RepoAgentSourceCommit.String)
 	if excl, err := workersvc.DecodeExclusions(r.AgentExclusions); err != nil {
 		slog.Error("decode run agent exclusions", "run_id", r.ID, "error", err)
 	} else {
@@ -830,7 +831,7 @@ func runJobDTO(d *workersvc.JobRunDetail) *apitypes.RunJobDTO {
 // Evidence is historical; it never asserts latest work or current forge availability.
 func workerRecoveryDTO(r store.Run, limit int) *apitypes.WorkerRecoveryDTO {
 	if r.WorkerRecoveryEpisode == 0 && len(r.WorkerRecoveryEvidence) == 0 &&
-		(!r.RecoveryWaitCause.Valid || (r.RecoveryWaitCause.String != "worker_requeue_exhausted" && r.RecoveryWaitCause.String != "retained_recovery_exhausted" && r.RecoveryWaitCause.String != "retained_recovery_adoption_failed")) {
+		(!r.RecoveryWaitCause.Valid || (r.RecoveryWaitCause.String != "worker_requeue_exhausted" && r.RecoveryWaitCause.String != "retained_recovery_exhausted" && r.RecoveryWaitCause.String != "retained_recovery_adoption_failed" && r.RecoveryWaitCause.String != "retained_continuation_unwitnessed")) {
 		return nil
 	}
 	used := r.RequeueCount - r.RequeueEpisodeBaseline
