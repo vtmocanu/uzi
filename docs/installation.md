@@ -99,19 +99,25 @@ With `--worker-name`, setup creates a self-hosted worker for the seed admin and 
 The join token appears once, in the `join_token` field of the `worker` entry of the stdout document, and nowhere else: not on stderr, not in a log. Capture stdout, extract the field and write it into `UZI_WORKER_TOKEN` in `.env`. If the document is lost, the token is lost; delete the worker in Settings → Workers and create a new one.
 
 ```sh
+install -m 600 /dev/null setup.json   # private before it holds the join token
+rc=0
 printf '%s' "$PAT" | docker compose exec -T api /server setup \
   --forge-type github --forge-base-url https://github.com \
-  --forge-token-file - --repos acme/app,acme/lib --worker-name vps-1 > setup.json
+  --forge-token-file - --repos acme/app,acme/lib --worker-name vps-1 > setup.json || rc=$?
 token=$(jq -r '.worker.join_token // empty' setup.json)
-printf 'UZI_WORKER_TOKEN=%s\n' "$token" >> .env
-docker compose --profile agent up -d
+if [ "$rc" -eq 0 ] && [ -n "$token" ]; then
+  printf 'UZI_WORKER_TOKEN=%s\n' "$token" >> .env
+  docker compose --profile agent up -d
+else
+  echo "setup exited $rc and issued no join token; .env is unchanged" >&2
+fi
 ```
 
-`setup.json` holds the token; protect it and delete it after you copy the token. See [configuration.md](configuration.md) for `UZI_WORKER_TOKEN` and `UZI_WORKER_TOKEN_FILE`.
+The example writes `UZI_WORKER_TOKEN` only when setup exits `0` and the report carries a token. On exit `3` (a worker already exists) there is no token, and an empty `UZI_WORKER_TOKEN=` line would override the existing worker's token. `setup.json` holds the join token; delete it after you copy the token. See [configuration.md](configuration.md) for `UZI_WORKER_TOKEN` and `UZI_WORKER_TOKEN_FILE`.
 
 On Kubernetes the primary worker path is hosted workers, which the controller creates; see [openshift.md](openshift.md) and the `workers.*` chart values. Setup creates join-token workers only, so on a hosted-worker install omit `--worker-name`: the step reports `not_requested` and exit codes work as before. Use `--worker-name` on Kubernetes only to start a self-hosted worker outside the cluster.
 
-Setup writes one JSON document to stdout and progress notes to stderr. Neither carries the token. The document has `schema_version`, an overall `status`, and one entry per step (`forge`, `discovery`, each repo in `repos`, `worker`). Step statuses:
+Setup writes one JSON document to stdout and progress notes and log lines to stderr. Neither stream carries the forge token: setup replaces it in every report field, note and log line. The one secret on stdout is the worker join token, printed once on purpose. A database connection error prints a fixed message, not the raw error, which can hold the password. The document has `schema_version`, an overall `status`, and one entry per step (`forge`, `discovery`, each repo in `repos`, `worker`). Step statuses:
 
 | Status | Meaning |
 |---|---|

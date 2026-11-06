@@ -31,8 +31,12 @@ Rules the implementation keeps:
   admin password in the environment. `config.Load` is unchanged.
 - The one secret, the forge token, comes only from `--forge-token-file`
   (`-` = stdin). Never from a flag value or an environment variable. The token
-  is read with a 16 KiB bound, and every message is scrubbed of it before it
-  reaches stdout or stderr.
+  is read with a 16 KiB bound and must be a regular file or stdin; setup
+  refuses a FIFO or a device without blocking. Every string in the stdout
+  report (the intended `join_token` aside), every stderr diagnostic, and every
+  `slog` line the shared services write while setup runs pass the same scrubber,
+  which replaces the token. A database open error is replaced by a fixed
+  message, since the raw error can carry the password.
 - Inputs are bounded (200 repo paths, 64 KiB of repo input), the pool holds at
   most two connections, and a five-minute deadline covers input acquisition and
   everything after it; cancellation interrupts a blocked stdin read.
