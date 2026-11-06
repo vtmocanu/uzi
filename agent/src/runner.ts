@@ -5607,6 +5607,13 @@ export class RunRunner {
         else if (authority.aborted) err = authority.reason;
         else err = new RetainedRecoveryStop({ cause: err });
       }
+      // Issue #3974: an owner cancel was committed while a credential switch was withheld, and the
+      // switch signal then escaped. Never enter the switch: take the ordinary cancelled route, the
+      // same "run cancelled" failure a cancel input produces, so no capture or credential_switch*
+      // report happens for this flight.
+      if (err instanceof CredentialSwitchSignal && flight.steering?.cancelCommittedUnderWithheldSwitch()) {
+        err = new Error("run cancelled");
+      }
       // PRD #35: a usage-limit death is not an ordinary failure. Handled before the
       // generic path below because that path is terminal in both senses — it reports
       // `failed` and it lets the finally erase the session this run wants to resume from.
@@ -15846,6 +15853,10 @@ export class RunRunner {
       // issue #1597 M2: gated end to end — from the wip marker captureRecoveryRestorePoint commits to
       // the give-up's undoWipMarker — so a mid-turn tick can never publish that throwaway marker.
       attemptCredentialSwitch: async () => {
+        // Issue #3974: an owner cancel was committed while the switch was withheld. Do not enter the
+        // switch (no capture, no credential_switch* report): throw the ordinary cancel error so the
+        // executor lets it reach executeClaim's dispatchFailure, which reports "run cancelled".
+        if (steering.cancelCommittedUnderWithheldSwitch()) throw new Error("run cancelled");
         if (batcher.hasCandidateReservation()) {
           // Invariant guard: no capture, report, clear or continuation. Not a checked lifecycle
           // control, so it reaches dispatchFailure's generic branch (reportGenericFailure closes
