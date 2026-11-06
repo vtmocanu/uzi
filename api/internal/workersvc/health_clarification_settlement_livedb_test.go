@@ -70,6 +70,33 @@ func TestClarificationSettlementHealthWaitingWorkerLiveDB(t *testing.T) {
 		}
 	})
 
+	t.Run("control: a revise consumed only by an earlier, reclaimed claim does not count", func(t *testing.T) {
+		// The #1604 dropped-revise shape: claim 1 consumed the revise, the run was reclaimed and
+		// the claim-2 flight sits at the gate without re-ACKing it. The owner must be nudged.
+		id := f.crsNewGatedRun("gated")
+		f.crsRevise(id, 1)
+		f.reclaim(id)
+		f.crsAgeGate(id)
+		flag, reason := f.crsHealthTarget(id)
+		if flag != healthApprovalIdle || reason != reasonApprovalIdle {
+			t.Fatalf("health = (%q, %q), want (%q, %q)", flag, reason, healthApprovalIdle, reasonApprovalIdle)
+		}
+	})
+
+	t.Run("control: a whitespace-only pending revise does not count", func(t *testing.T) {
+		r := f.crsParked("gated")
+		f.crsBackdate(r.id)
+		if _, applied, err := f.crsSettle(r); err != nil || !applied {
+			t.Fatalf("settle = (applied %v, err %v)", applied, err)
+		}
+		f.exec(`UPDATE run_user_inputs SET body = E' \n\t' WHERE id = $1`, r.revise)
+		f.crsAgeGate(r.id)
+		flag, reason := f.crsHealthTarget(r.id)
+		if flag != healthApprovalIdle || reason != reasonApprovalIdle {
+			t.Fatalf("health = (%q, %q), want (%q, %q)", flag, reason, healthApprovalIdle, reasonApprovalIdle)
+		}
+	})
+
 	t.Run("control: a pending revise bound to an older gate revision does not count", func(t *testing.T) {
 		r := f.crsParked("gated")
 		f.crsBackdate(r.id)

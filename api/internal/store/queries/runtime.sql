@@ -12102,7 +12102,11 @@ LIMIT @max_rows;
 -- The branch is not age-based, so it stays monotone within an episode: it holds from the
 -- settlement until the next presentation applies the revise (applied_at set), which also
 -- re-stamps status_since through SetRunAwaitingApproval. A run that never had a revise is
--- unaffected, and so is one whose revise was applied or superseded.
+-- unaffected, and so is one whose revise was applied or superseded. The branch carries the
+-- SAME pending-revise predicate SettleRunClarificationToGate requires (non-empty body, consumed
+-- by the run's CURRENT worker and claim generation): a revise consumed only by an earlier,
+-- reclaimed claim that the current flight never re-ACKed (the #1604 dropped-revise shape) does
+-- not count, so that run still reads approval_idle and nudges its owner.
 --
 -- The EXISTS is CAST because sqlc's inference is weaker on expressions than on columns:
 -- uncast, the projection arrives in Go as interface{} rather than bool.
@@ -12113,13 +12117,17 @@ SELECT (EXISTS (
       AND run_user_inputs.created_at >= @gate_opened_at
 ) OR EXISTS (
     SELECT 1 FROM run_user_inputs i
+    JOIN runs r ON r.id = i.run_id
     WHERE i.run_id = @run_id
       AND i.kind = 'revise_plan'
+      AND btrim(i.body, E' \t\n\r\f\013\u0085\u00A0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF') <> ''
       AND i.applied_at IS NULL
       AND i.disposition IS NULL
       AND i.consumed_at IS NOT NULL
+      AND i.consumed_worker_id = r.worker_id
+      AND i.consumed_claim_generation = r.claim_generation
       AND i.gate_binding = 'bound'
-      AND i.gate_revision = (SELECT runs.gate_revision FROM runs WHERE runs.id = i.run_id)
+      AND i.gate_revision = r.gate_revision
 ))::boolean AS has_verdict;
 
 -- name: SetRunWaitOnLimit :execrows
