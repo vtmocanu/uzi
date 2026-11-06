@@ -5395,8 +5395,10 @@ function maintenanceSignal(timeoutMs: number): AbortSignal {
 // Rejections of the transport (fetch) promise itself, as opposed to budget checks or body reads.
 const fetchRejections = new WeakSet<object>();
 
-function markTransportRejection<T>(p: Promise<T>): Promise<T> {
+function markTransportRejection<T>(p: Promise<T>, signal?: AbortSignal | null): Promise<T> {
   return p.catch((error: unknown) => {
+    // undici rejects with `signal.reason` itself on abort; that is an abort, not a transport failure.
+    if (signal?.aborted && error === signal.reason) throw error;
     if ((typeof error === "object" || typeof error === "function") && error !== null) fetchRejections.add(error);
     throw error;
   });
@@ -5412,11 +5414,11 @@ async function maintenanceFetch(transport: typeof fetch, url: string, init: Requ
   const resourceSignal = MaintenanceResources.signalIfActive();
   if (resourceSignal) init = { ...init, signal: AbortSignal.any([resourceSignal, ...(init.signal ? [init.signal] : [])]) };
   const budget = MaintenanceBudget.current();
-  if (!budget && !resourceSignal && !MaintenanceBudget.ownedSignal()) return markTransportRejection(transport(url, init));
-  if (!budget ||MaintenanceBudget.ownedSignal()) {
+  if (!budget && !resourceSignal && !MaintenanceBudget.ownedSignal()) return markTransportRejection(transport(url, init), init.signal);
+  if (!budget || MaintenanceBudget.ownedSignal()) {
     budget?.check();
     init.signal?.throwIfAborted();
-    const res = await markTransportRejection(transport(url, init));
+    const res = await markTransportRejection(transport(url, init), init.signal);
     if (init.signal) responseSignals.set(res, init.signal);
     ownResponse(res, init.signal);
     if (MaintenanceBudget.ownedSignal()) {
@@ -5427,7 +5429,7 @@ async function maintenanceFetch(transport: typeof fetch, url: string, init: Requ
   }
   budget.check();
   const signal = AbortSignal.any([budget.signal, ...(init.signal ? [init.signal] : [])]);
-  const res = await budget.raceIO(() => markTransportRejection(transport(url, { ...init, signal })), late => {
+  const res = await budget.raceIO(() => markTransportRejection(transport(url, { ...init, signal }), signal), late => {
     // One detached cancellation attempt; an uncooperative body cannot block the caller.
     void late.body?.cancel().catch(() => undefined);
   }, signal);

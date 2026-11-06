@@ -2,8 +2,8 @@
  * Positive classification of a transient failure of the run-ownership probe
  * (`WorkerClient.getRunOwnership`), e.g. while the API restarts.
  *
- * `isTransient` in client.ts is not used here: it is true for any non-HTTP failure, which
- * would also retry deadline, abort and decode failures. This classifier answers only when
+ * `isTransient` in client.ts is not used here: it is true for almost every non-HTTP failure
+ * (transport, abort and decode alike), which would also retry deadline, abort and decode failures. This classifier answers only when
  * there is positive evidence, and returns a bounded token (never message text).
  *
  * The transport-phase marker (`isFetchRejection`) is required because a truncated 200 body

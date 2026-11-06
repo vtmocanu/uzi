@@ -85,6 +85,14 @@ describe("transientOwnershipReadCause: real transport failures", () => {
     });
   });
 
+  it("classifies a transport rejection inside MaintenanceBudget.runOwned", async () => {
+    await withServer((req) => { req.socket.destroy(); }, async (url) => {
+      const client = makeClient(url);
+      const error = await caught(() => MaintenanceBudget.runOwned(new AbortController().signal, () => client.getRunOwnership(RUN)));
+      assert.equal(classify(error), "und_err_socket");
+    });
+  });
+
   it("classifies a transport rejection inside a maintenance budget", async () => {
     await withServer((req) => { req.socket.destroy(); }, async (url) => {
       const client = makeClient(url);
@@ -180,6 +188,48 @@ describe("transientOwnershipReadCause: failures after the transport settled", ()
     const error = await caught(() => client.getRunOwnership(RUN, AbortSignal.abort()));
     assert.equal(isFetchRejection(error), false);
     assert.equal(classify(error), undefined);
+  });
+
+  const hang: Handler = () => {};
+  const resetReason = () => new TypeError("x", { cause: { code: "ECONNRESET" } });
+
+  it("does not classify a caller abort whose reason looks like a transport failure (real fetch)", async () => {
+    let onRequest: () => void = () => {};
+    const requested = new Promise<void>(resolve => { onRequest = resolve; });
+    await withServer((_req, _res) => { onRequest(); }, async (url) => {
+      const ac = new AbortController();
+      const client = makeClient(url);
+      const result = caught(() => client.getRunOwnership(RUN, ac.signal));
+      await requested;
+      const reason = resetReason();
+      ac.abort(reason);
+      const error = await result;
+      assert.equal(error, reason);
+      assert.equal(isFetchRejection(error), false);
+      assert.equal(classify(error), undefined);
+    });
+  });
+
+  it("does not classify an already-aborted signal reused for a second read (real fetch)", async () => {
+    await withServer(hang, async (url) => {
+      const ac = new AbortController();
+      ac.abort(resetReason());
+      const client = makeClient(url);
+      for (let i = 0; i < 2; i++) {
+        const error = await caught(() => client.getRunOwnership(RUN, ac.signal));
+        assert.equal(isFetchRejection(error), false);
+        assert.equal(classify(error), undefined);
+      }
+    });
+  });
+
+  it("does not classify when the budget wins the race against a real fetch", async () => {
+    await withServer(hang, async (url) => {
+      const client = makeClient(url);
+      const error = await caught(() => MaintenanceBudget.run(new MaintenanceBudget(50), () => client.getRunOwnership(RUN)));
+      assert.equal(isFetchRejection(error), false);
+      assert.equal(classify(error), undefined);
+    });
   });
 
   it("does not classify when the budget aborts the race", async () => {
