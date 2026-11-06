@@ -18,7 +18,7 @@ export const MODEL_SETTING_SOURCE_LABELS: readonly { field: string; token: strin
 // codexRuntimeDefaultLabel is the Codex effort select's "Runtime default" option text
 // (issue #3251): what the Codex model catalog applies when no level is sent. Mirrors the
 // CLI's codexRuntimeDefaultResolved. Anything that is not a well-formed known/varies
-// default (absent cell, unknown, unrecognised state, a non-string effort/model/version)
+// default (absent cell, unknown, unrecognised state, a non-string or empty effort/model/version)
 // reads as unknown, so a malformed payload never renders "undefined" or "null".
 export function codexRuntimeDefaultLabel(cell: EffortSettingCell | undefined): string {
   const runtime = modelSettingSourceLabel("effort", "runtime_default");
@@ -27,7 +27,8 @@ export function codexRuntimeDefaultLabel(cell: EffortSettingCell | undefined): s
   const d = cell?.catalog_default;
   if (
     !d || (d.state !== "known" && d.state !== "varies") ||
-    typeof d.effort !== "string" || typeof d.model !== "string" || typeof d.runtime_version !== "string"
+    typeof d.effort !== "string" || typeof d.model !== "string" || typeof d.runtime_version !== "string" ||
+    d.effort === "" || d.model === "" || d.runtime_version === ""
   ) {
     return `${prefix} · ${catalog} unknown until a Codex run reports it`;
   }

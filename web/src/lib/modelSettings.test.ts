@@ -39,6 +39,7 @@ describe("codexRuntimeDefaultLabel", () => {
       for (const field of ["effort", "model", "runtime_version"] as const) {
         expect(codexRuntimeDefaultLabel(cellWith(known({ state, [field]: null }))), `${state}/${field} null`).toBe(UNKNOWN);
         expect(codexRuntimeDefaultLabel(cellWith({ ...known({ state }), [field]: 7 })), `${state}/${field} number`).toBe(UNKNOWN);
+        expect(codexRuntimeDefaultLabel(cellWith(known({ state, [field]: "" }))), `${state}/${field} empty`).toBe(UNKNOWN);
       }
     }
     expect(codexRuntimeDefaultLabel(cellWith("known"))).toBe(UNKNOWN);

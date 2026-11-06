@@ -93,7 +93,20 @@ explicit levels that reject `runtime`. See
 
 With Runtime default uzi sends Codex no level, so Codex (pinned 0.164.0) uses
 its model catalog's default level for the model. This was verified in the Codex
-source at commit `6aaac694` (`codex-rs/core/src/client.rs:957-966`).
+source at commit `6aaac694803004a63c6f393d153c96d22521a6b9` (paths under
+`codex-rs/`):
+
+- Request fallback, `core/src/client.rs:957-966` (`build_reasoning`):
+  `.or_else(|| model_info.default_reasoning_level.clone())` then
+  `.map(|effort| model_info.resolve_reasoning_effort(effort))`.
+- Absent default reads `none`, `protocol/src/openai_models.rs:967-969`:
+  `default_reasoning_effort: info.default_reasoning_level.unwrap_or(ReasoningEffort::None)`.
+- `model/list` copies that preset value, `app-server/src/models.rs:39`:
+  `default_reasoning_effort: preset.default_reasoning_effort,` (sent as
+  `defaultReasoningEffort`).
+- Only `Ultra` and `Persistent` are remapped before sending,
+  `protocol/src/openai_models/reasoning_effort.rs:10-39`
+  (`resolve_reasoning_effort`).
 
 - `none` means no reasoning level is requested: either the catalog has no
   default for the model, or its default is `none`.
