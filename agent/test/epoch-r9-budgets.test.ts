@@ -353,8 +353,11 @@ describe("UNKNOWN is preserved for anything that is not a positively identified 
     });
   }
   it("a real Git stdout overrun of the metadata cap is a settled keep", async () => {
-    // A bare config whose listing is larger than the cap, while every earlier stage still fits.
-    for (let i = 0; i < 600; i++) command(bare, "config", "--local", `r9.key${i}`, "value");
+    // A bare config FILE that fits the 8192 byte cap (a file past it is UNKNOWN, see the topology tests) whose Git
+    // listing is larger than the cap: a long section name makes each short line list as a long `section.key` row.
+    fs.appendFileSync(path.join(bare, "config"),
+      "[averyveryverylongsectionnamefortheoverrun]\n" + "\tk = v\n".repeat(600));
+    assert.ok(fs.statSync(path.join(bare, "config")).size < 8192);
     assert.equal(await observation(), true, "control: the same store is provable under the default cap");
     assert.equal(await observation({ maxMetadataBytes: 8192 }), false);
   });
@@ -574,5 +577,142 @@ describe("an overflow while re-reading is UNKNOWN, not a settled keep", () => {
     });
     await assert.rejects(observation({ maxDirectoryEntries: limit }), e => (e as Error).constructor.name === "AutomaticCompletenessUnknown" &&
       /object observations changed/.test((e as Error).message));
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// No pending overflow may absorb an UNKNOWN-class observation, and nothing is charged before it was inspected.
+
+describe("a pending topology overflow never hides an UNKNOWN-class observation", () => {
+  const packJunk = (n: number) => {
+    const dir = path.join(objectDir(clonePath), "pack");
+    fs.mkdirSync(dir, { recursive: true });
+    for (let i = 0; i < n; i++) fs.writeFileSync(path.join(dir, `pack-${i.toString(16).padStart(40, "0")}.keep`), "");
+  };
+  const cloneConfig = (...args: string[]) => command(clonePath, "config", "--local", ...args);
+  /** The snapshot's config launches (`git config --local ...`) made to fail the way an unresolved Git execution fails. */
+  function localConfigFails(t: TestContext, make: () => Error): void {
+    const original = git["runGitAsRunner"].bind(git);
+    t.mock.method(git as unknown as { runGitAsRunner: typeof original }, "runGitAsRunner", async (...args: Parameters<typeof original>) => {
+      if (args[1].includes("config") && args[1].includes("--local")) throw make();
+      return original(...args);
+    });
+  }
+  async function assertUnknownStores(limits: Limits, message?: RegExp): Promise<void> {
+    const error = await failure(observeStores(limits));
+    assert.equal(error.name, "AutomaticCompletenessUnknown");
+    if (message) assert.match(`${error.message} ${error.cause?.code ?? ""}`, message);
+  }
+  it("control: 16,400 pack junk entries alone are a settled keep", async () => {
+    packJunk(16_400);
+    const error = await failure(observeStores());
+    assert.equal(error.name, "AutomaticBoundExceeded");
+    assert.match(error.message, /object directory entry limit/);
+  });
+  it("partialclone plus an unknown extension, behind 16,400 pack junk entries, is UNKNOWN", async () => {
+    cloneConfig("core.repositoryformatversion", "1");
+    cloneConfig("extensions.partialclone", "origin");
+    cloneConfig("extensions.zzunknown", "true");
+    packJunk(16_400);
+    await assertUnknownStores({});
+  });
+  it("an unknown extension alone, behind 16,400 pack junk entries, is UNKNOWN", async () => {
+    cloneConfig("core.repositoryformatversion", "1");
+    cloneConfig("extensions.zzunknown", "true");
+    packJunk(16_400);
+    await assertUnknownStores({});
+  });
+  it("a timeout of the config launch, behind 16,400 pack junk entries, is UNKNOWN", async t => {
+    packJunk(16_400);
+    localConfigFails(t, () => Object.assign(new Error("git subprocess timed out"), { killed: true }));
+    await assertUnknownStores({});
+  });
+  it("a revocation during the config launch, behind 16,400 pack junk entries, is UNKNOWN", async t => {
+    packJunk(16_400);
+    const original = git["runGitAsRunner"].bind(git);
+    t.mock.method(git as unknown as { runGitAsRunner: typeof original }, "runGitAsRunner", async (...args: Parameters<typeof original>) => {
+      if (args[1].includes("config") && args[1].includes("--local")) live = false;
+      return original(...args);
+    });
+    await assertUnknownStores({}, /reservation expired|revoked|stopped|unavailable/i);
+  });
+  // The content stage must not run before the topology (and its config checks) decided: with a 4096 byte object-store
+  // budget the content stage would otherwise end the proof as a keep first.
+  it("partialclone in the clone config stays UNKNOWN under a 4096 byte object-store budget", async () => {
+    cloneConfig("extensions.partialclone", "origin");
+    await assertUnknownStores({ maxObjectStoreBytes: 4096 });
+  });
+  it("a failing config launch stays UNKNOWN under a 4096 byte object-store budget", async t => {
+    localConfigFails(t, () => Object.assign(new Error("git subprocess timed out"), { killed: true }));
+    await assertUnknownStores({ maxObjectStoreBytes: 4096 });
+  });
+  it("an illegal loose object name is UNKNOWN even when counting it would overflow the entry limit", async () => {
+    // The empty fan-out directory is part of the topology and is the LAST directory the content stage lists (the
+    // bare is read after the clone, and `ff` sorts after its other fan-outs); the limit is the least one that still
+    // lets the store through, so the one name added below passes the limit in the content stage only.
+    const dir = path.join(objectDir(bare), "ff");
+    fs.mkdirSync(dir, { recursive: true });
+    let low = 1, high = 512;
+    while (low < high) {
+      const mid = Math.floor((low + high) / 2);
+      try { await observeStores({ maxDirectoryEntries: mid }); high = mid; } catch { low = mid + 1; }
+    }
+    await observeStores({ maxDirectoryEntries: low });
+    fs.writeFileSync(path.join(dir, "zz"), "");
+    await assertUnknownStores({ maxDirectoryEntries: low }, /unsupported loose object/);
+  });
+});
+
+describe("config rows are classified before they are counted", () => {
+  it("partialclone behind 131,100 padding rows in the clone config is UNKNOWN", async () => {
+    fs.appendFileSync(path.join(clonePath, ".git", "config"),
+      "[extensions]\n\tpartialclone = origin\n[pad]\n" + "\tk = v\n".repeat(131_100));
+    const error = await failure(observeStores());
+    assert.equal(error.name, "AutomaticCompletenessUnknown");
+    assert.match(error.message, /config indirection unsupported/);
+  });
+  it("control: the same padding alone is a settled keep", async () => {
+    fs.appendFileSync(path.join(clonePath, ".git", "config"), "[pad]\n" + "\tk = v\n".repeat(131_100));
+    const error = await failure(observeStores());
+    assert.equal(error.name, "AutomaticBoundExceeded");
+  });
+});
+
+describe("a topology file past the metadata byte limit is UNKNOWN, never a keep", () => {
+  it("a bare config padded past the limit", async () => {
+    fs.appendFileSync(path.join(bare, "config"), "# padding\n".repeat(1000));
+    const error = await failure(observeStores({ maxMetadataBytes: 4096 }));
+    assert.equal(error.name, "AutomaticCompletenessUnknown");
+    assert.match(error.message, /object metadata read byte limit/);
+  });
+  it("an alternates file past the limit that names an outside store", async () => {
+    const alt = path.join(fx.dataDir, "outside.git");
+    command(bare, "init", "--bare", alt);
+    const own = path.join(bare, "objects");
+    fs.appendFileSync(path.join(objectDir(clonePath), "info/alternates"),
+      (own + "\n").repeat(60) + path.join(alt, "objects") + "\n");
+    const error = await failure(observeStores({ maxMetadataBytes: 2048 }));
+    assert.equal(error.name, "AutomaticCompletenessUnknown");
+    assert.match(error.message, /object metadata read byte limit/);
+  });
+});
+
+describe("input is charged as zlib consumes it, never as a window is read", () => {
+  const lowered = { maxObjectStoreBytes: 512 * 1024 };
+  it("a 1 MiB loose file that is not a zlib stream is UNKNOWN at a lowered budget, as at the default", async () => {
+    looseFile(Buffer.alloc(1024 * 1024, 0x41));
+    for (const limits of [{}, lowered]) {
+      const error = await failure(observeStores(limits));
+      assert.equal(error.name, "AutomaticCompletenessUnknown");
+      assert.match(`${error.message} ${error.cause?.code ?? ""}`, /incorrect header check|Z_DATA_ERROR/i);
+    }
+  });
+  it("a valid stream followed by 1 MiB of trailing garbage is UNKNOWN at a lowered budget, as at the default", async () => {
+    looseFile(Buffer.concat([deflateSync(Buffer.from("blob 5\0hello")), Buffer.alloc(1024 * 1024, 0x41)]));
+    for (const limits of [{}, lowered]) {
+      const error = await failure(observeStores(limits));
+      assert.equal(error.name, "AutomaticCompletenessUnknown");
+      assert.match(error.message, /trailing loose input/);
+    }
   });
 });

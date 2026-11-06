@@ -2534,6 +2534,9 @@ class AutomaticCompletenessUnknown extends Error {}
 class AutomaticBoundExceeded extends Error {}
 /** Errors raised by Git output or metadata limits outside this file's own comparisons. */
 const BOUND_OVERFLOW_ERRORS = new WeakSet<object>();
+/** The finished stdout an epoch metadata limit was raised on, kept so a caller can still classify the rows it holds
+ *  before the limit ends the observation (an UNKNOWN-class row must not hide behind padding). */
+const BOUND_OVERFLOW_STDOUT = new WeakMap<object, string>();
 /** True for {@link AutomaticBoundExceeded}, for an epoch metadata limit raised by `checkEpochMetadata` on a Git
  *  stdout that finished, and for a joined Git child whose STDOUT overran the epoch output cap. A stderr overrun
  *  (a failing Git is noisy), an unjoined child and a bare `ERR_CHILD_PROCESS_STDIO_MAXBUFFER` without those
@@ -2583,9 +2586,12 @@ function inflateSmall(span: Buffer, cap: number): { buffer: Buffer; consumed: nu
  * Incremental zlib inflate of `pieces`: every output buffer (at most {@link OBSERVE_INFLATE_WINDOW}) goes to `sink`
  * as it is produced, and a throw from `sink` stops the inflater at once. Returns how many input bytes the engine
  * consumed (a stream that ends early leaves the rest unconsumed). A corrupt or truncated stream rejects with the
- * zlib error. The caller must not touch the pieces' memory until the returned promise settles.
+ * zlib error. `consumed` is told, after each write, how many input bytes the engine took from it; the inflater is
+ * not fed again once it has ended inside a piece. The caller must not touch the pieces' memory until the returned
+ * promise settles.
  */
-async function inflateStream(pieces: AsyncIterable<Buffer>, sink: (out: Buffer) => void): Promise<number> {
+async function inflateStream(pieces: AsyncIterable<Buffer>, sink: (out: Buffer) => void,
+  consumed: (n: number) => void): Promise<number> {
   const inflate = createInflate({ chunkSize: OBSERVE_INFLATE_WINDOW });
   let failure: unknown;
   const failed = new Promise<never>((_, reject) => inflate.once("error", reject));
@@ -2597,9 +2603,14 @@ async function inflateStream(pieces: AsyncIterable<Buffer>, sink: (out: Buffer) 
   inflate.on("error", error => { failure ??= error; });
   try {
     for await (const piece of pieces) {
+      const before = inflate.bytesWritten;
       await Promise.race([new Promise<void>((resolve, reject) =>
         inflate.write(piece, error => error ? reject(error) : resolve())), failed]);
       if (failure !== undefined) break;
+      const took = inflate.bytesWritten - before;
+      consumed(took);
+      // zlib takes all of a piece unless the stream ended inside it: what follows is never fed or charged.
+      if (took < piece.length) break;
     }
     if (failure === undefined) { inflate.end(); await Promise.race([finished(inflate), failed]); }
   } catch (error) { failure ??= error; }
@@ -2636,11 +2647,13 @@ class ObservedWindow {
   view(position: number, length: number): Buffer {
     return this.buf.subarray(position - this.from, position - this.from + Math.min(length, this.to - position));
   }
-  /** The compressed input `[position, position + length)` in pieces; each stays valid until the next is requested. */
-  async *pieces(position: number, length: number): AsyncGenerator<Buffer> {
+  /** The compressed input `[position, position + length)` in pieces; each stays valid until the next is requested.
+   *  A piece never passes `room()` (the budget still unspent, at least one byte), so an unread tail past the budget is
+   *  only ever charged for the bytes zlib actually takes from it. */
+  async *pieces(position: number, length: number, room: () => number): AsyncGenerator<Buffer> {
     for (let at = position; at < position + length;) {
       await this.ensure(at, 1);
-      const piece = this.view(at, Math.min(OBSERVE_INPUT_PIECE, position + length - at));
+      const piece = this.view(at, Math.min(OBSERVE_INPUT_PIECE, position + length - at, Math.max(1, room())));
       yield piece; at += piece.length;
     }
   }
@@ -11298,8 +11311,9 @@ export class GitCache {
     // before any object content is charged, so an UNKNOWN-class indirection or an illegal name can never be hidden
     // behind a content overflow (and a name is classified as it is read, before it is counted). A deferred overflow is
     // raised only after the topology (and `afterTopology`) found nothing UNKNOWN. Residual: corrupt bytes lying beyond
-    // a budget that the observation had to stop at cannot be observed, so they never turn an overflow into UNKNOWN.
-    const snapshot = async (afterTopology?: (overflowKnown: boolean) => Promise<void>) => {
+    // the point where a budget ended the observation were never handed to zlib or parsed, so they cannot turn that
+    // overflow into UNKNOWN; every byte up to that point was inspected before it was charged.
+    const snapshot = async (afterTopology?: () => Promise<void>) => {
       let entries = 0, bytes = 0, occurrences = 0, edges = 0;
       let deferring = false;
       let pending: AutomaticBoundExceeded | undefined;
@@ -11312,7 +11326,8 @@ export class GitCache {
         pending ??= new AutomaticBoundExceeded(message);
       };
       // `bytes` is local to one snapshot: the budget resets for each of the proof's snapshots. It counts bytes
-      // actually read from disk or produced by inflation or by a delta instruction, never a size a file declares.
+      // actually inspected: metadata read and parsed, input zlib took, output it produced, content a delta instruction
+      // generated. Never a size a file declares and never a read-ahead window that was not yet inspected.
       const charge = (n: number) => { if ((bytes += n) > limits.maxObjectStoreBytes) over("object metadata byte limit"); };
       const contentCharge = (n: number) => {
         charge(n); MaintenanceResources.consumeIfActive("metadataBytes", n);
@@ -11360,7 +11375,8 @@ export class GitCache {
       };
       type Opened = {
         size: number;
-        /** One positioned read of at most `length` bytes; returns the bytes read and charges them as consumed. */
+        /** One positioned read of at most `length` bytes; returns the bytes read. Nothing is charged to the object-store
+         *  budget: the caller charges what it actually inspects (a read-ahead window is not inspected yet). */
         fill(into: Buffer, intoOffset: number, position: number, length: number): Promise<number>;
         readInto(into: Buffer, intoOffset: number, position: number, length: number): Promise<void>;
       };
@@ -11379,14 +11395,14 @@ export class GitCache {
           const fill: Opened["fill"] = async (into, intoOffset, position, length) => {
             const result = await read(() => handle!.read(into, intoOffset, length, position));
             MaintenanceResources.consumeIfActive("metadataBytes", result.bytesRead);
-            charge(result.bytesRead);
             return result.bytesRead;
           };
-          // At most `length` nonempty reads; EOF before `length` is incomplete.
+          // At most `length` nonempty reads; EOF before `length` is incomplete. The exact bytes read are parsed.
           const readInto: Opened["readInto"] = async (into, intoOffset, position, length) => {
             for (let done = 0; done < length;) {
               const got = await fill(into, intoOffset + done, position + done, length - done);
               if (!got) unknown("short object metadata");
+              charge(got);
               done += got;
             }
           };
@@ -11395,9 +11411,11 @@ export class GitCache {
           return result;
         } finally { if (handle) await this.automaticPreservationClose(automatic, () => handle!.close()); }
       };
-      // Config and alternates are read whole, bounded by the existing metadata byte limit.
+      // Config and alternates are read whole, bounded by the existing metadata byte limit. They are topology: a file
+      // past the limit is never read, so the indirection it may hold (an alternate, an extension) cannot be observed
+      // and the answer is UNKNOWN, never a keep.
       const small = (p: string): Promise<Buffer> => withFile(p, async f => {
-        if (f.size > limits.maxMetadataBytes) { over("object metadata read byte limit"); return Buffer.alloc(0); }
+        if (f.size > limits.maxMetadataBytes) unknown("object metadata read byte limit");
         const out = Buffer.alloc(f.size);
         await f.readInto(out, 0, 0, f.size);
         return out;
@@ -11495,21 +11513,30 @@ export class GitCache {
           const parsed = await read(() => this.execScoped("git",
             ["config", "--file", "-", "--no-includes", "--null", "--list"],
             { env: gitEnv(), input: configBytes, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER }));
-          this.automaticCollection(parsed.stdout, "\0");
           listing = parsed.stdout;
         } catch (error) {
-          // A joined stdout overrun is a limit; the rest of the topology is still read.
+          // A joined stdout overrun is a limit; the rest of the topology is still read, and so are the rows of a
+          // finished listing that only the record or byte limit refused.
           if (!isBoundOverflow(error)) throw error;
           over("object completeness output limit");
+          listing = BOUND_OVERFLOW_STDOUT.get(error as object);
         }
+        // Every row of the (maxBuffer-bounded) listing is classified before the rows are counted against the record
+        // limit, so an UNKNOWN-class key can never hide behind padding.
         for (const row of listing === undefined ? [] : listing.split("\0")) {
           const [key, value] = row.split("\n");
           if (root === source && (key?.startsWith("include.") || key?.startsWith("includeif.")))
             throw new AutomaticContentRefusal("source config indirection is not eligible");
           if (key === "extensions.compatobjectformat" || key === "extensions.objectformat" && value !== "sha1" ||
-              key === "extensions.refstorage" || key === "extensions.worktreeconfig" ||
+              key === "extensions.refstorage" || key === "extensions.worktreeconfig" || key === "extensions.partialclone" ||
               key === "core.worktree" || key?.startsWith("include.") || key?.startsWith("includeif."))
             unknown("object format or config indirection unsupported");
+        }
+        if (listing !== undefined) {
+          try { this.automaticCollection(listing, "\0"); } catch (error) {
+            if (!isBoundOverflow(error)) throw error;
+            over("object completeness output limit");
+          }
         }
         for (const name of ["commondir", "shallow", "info/grafts", "refs/replace"]) {
           if (await stat(path.join(path.dirname(root), name), true)) unknown("unsupported object topology");
@@ -11534,9 +11561,10 @@ export class GitCache {
           tick();
           const small = inflateSmall(win.view(position, length),
             Math.max(1, Math.min(OBSERVE_SYNC_OUTPUT, limits.maxObjectStoreBytes - bytes)));
-          if (small) { sink(small.buffer); return small.consumed; }
+          // The output is judged first (a contradiction is UNKNOWN), then the input zlib actually took is charged.
+          if (small) { sink(small.buffer); charge(small.consumed); return small.consumed; }
         }
-        return inflateStream(win.pieces(position, length), sink);
+        return inflateStream(win.pieces(position, length, () => limits.maxObjectStoreBytes - bytes), sink, charge);
       };
       // Overflow rule for a loose object: the output is charged as it is produced, and it is an overflow only when
       // the object's own header declares at least what was produced (a stream that outgrows its declared size, or
@@ -11574,7 +11602,15 @@ export class GitCache {
         add(store.ids, id);
       });
       type PackRecord = { logical: number; baseLength?: number; base?: number; state: number };
-      const packIndex = (idxPath: string, store: Store) => withFile(idxPath, async f => {
+      /** The pack's 12-byte header must name this idx's object count: a mismatch is a corrupt pair (UNKNOWN). */
+      const packHeader = (packPath: string, count: number) => withFile(packPath, async f => {
+        if (f.size < 32) unknown("pack header mismatch");
+        const header = Buffer.alloc(12);
+        await f.readInto(header, 0, 0, 12);
+        if (header.toString("ascii", 0, 4) !== "PACK" || ![2, 3].includes(header.readUInt32BE(4)) ||
+            header.readUInt32BE(8) !== count) unknown("pack header mismatch");
+      });
+      const packIndex = (idxPath: string, packPath: string, store: Store) => withFile(idxPath, async f => {
         const size = f.size;
         const headLength = Math.min(size, 8 + 1024);
         const head = Buffer.alloc(headLength);
@@ -11605,6 +11641,8 @@ export class GitCache {
             }
             if (size !== floor + 8 * large) unknown("pack index size");
           }
+          // Only a pair whose pack agrees with the idx count is an overflow; a pack that does not is corrupt.
+          await packHeader(packPath, count);
           exceeded("pack index object count limit");
         }
         // Here the idx is at most about 36 bytes per object of a count within the limit: read it whole.
@@ -11652,6 +11690,7 @@ export class GitCache {
         const header = win.view(0, 12);
         if (header.toString("ascii", 0, 4) !== "PACK" || ![2, 3].includes(header.readUInt32BE(4)) ||
             header.readUInt32BE(8) !== count) unknown("pack header mismatch");
+        charge(12);
         const starts = [...offsets.values()].sort((a, b) => a - b);
         if (new Set(starts).size !== count || (count ? starts[0] !== 12 : size !== 32) ||
             starts.some(start => start < 12 || start >= size - 20)) unknown("invalid pack offsets");
@@ -11687,6 +11726,7 @@ export class GitCache {
             baseOffset = offsets.get(bytesOfHeader.subarray(pos - start, pos - start + 20).toString("hex")); pos += 20;
             if (baseOffset === undefined) unknown("missing same-pack REF base");
           }
+          charge(pos - start);
           // The declared size is never compared with the budget: only the bytes actually produced are, and a
           // stream that disagrees with its declared size is corrupt (UNKNOWN), however large either is.
           const record: PackRecord = { logical: declared, base: baseOffset, state: 0 };
@@ -11754,8 +11794,9 @@ export class GitCache {
               const match = /^(pack-[0-9a-f]{40})\.idx$/.exec(member);
               if (!match) continue;
               const full = path.join(p, member);
-              const { count, offsets } = await packIndex(full, store);
-              await packRecords(path.join(p, match[1] + ".pack"), count, offsets);
+              const packPath = path.join(p, match[1] + ".pack");
+              const { count, offsets } = await packIndex(full, packPath, store);
+              await packRecords(packPath, count, offsets);
               pairs.add(full);
             }
           }
@@ -11764,7 +11805,7 @@ export class GitCache {
       deferring = true;
       await topology(source); await topology(bare);
       deferring = false;
-      await afterTopology?.(pending !== undefined);
+      await afterTopology?.();
       if (pending) throw pending;
       for (const root of stores.keys()) await content(root);
       const expected = (root: string) => {
@@ -11785,7 +11826,7 @@ export class GitCache {
     try {
       // Part of the topology, so it runs before any content is charged: an overflow met here waits for the second
       // iteration, an UNKNOWN answer does not.
-      const configChecks = async (overflowKnown: boolean) => {
+      const configChecks = async () => {
         let overflow: unknown;
         for (const runner of [true, false]) {
           try {
@@ -11793,7 +11834,6 @@ export class GitCache {
             const config = await read(() => runner ? this.runGitAsRunner(cwd, args,
               { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } })
               : this.runGitWithEnv(barePath, args, NO_REPLACE_ENV));
-            this.automaticCollection(config, "\0");
             for (const row of config.split("\0")) {
               const [key, value] = row.split("\n");
               // refstorage (reftable) and partialclone (promisor objects fetched lazily) change where refs
@@ -11802,12 +11842,16 @@ export class GitCache {
                   key === "extensions.refstorage" || key === "extensions.partialclone" ||
                   key?.startsWith("include.") || key?.startsWith("includeif.")) unknown("object format or config indirection unsupported");
             }
+            // Counted only after every row was classified, so padding cannot hide an UNKNOWN-class key.
+            this.automaticCollection(config, "\0");
           } catch (error) {
-            if (error instanceof AutomaticCompletenessUnknown) throw error;
-            // The wrapper around a Git launch drops the overrun facts, so once the topology has identified an
-            // overflow of these same files, a Git failure here is that overflow seen again, not a new unknown.
+            // Only a positively identified overflow waits for the end of the topology; a Git failure, timeout,
+            // revocation or abort is never absorbed by a pending overflow. The Git launch wrappers drop the overflow
+            // facts but keep the original error as `cause`, which is where an epoch metadata limit is recognised.
             if (isBoundOverflow(error)) overflow ??= error;
-            else if (!overflowKnown) throw error;
+            else if (isBoundOverflow((error as { cause?: unknown }).cause))
+              overflow ??= new AutomaticBoundExceeded("object completeness output limit", { cause: error });
+            else throw error;
           }
         }
         if (overflow !== undefined) throw overflow;
@@ -22027,6 +22071,7 @@ try {
     const overflow = (message: string, suffix: "metadata_byte_cap" | "metadata_record_cap"): Error => {
       const error = this.retainedCause(new Error(message), suffix);
       BOUND_OVERFLOW_ERRORS.add(error);
+      BOUND_OVERFLOW_STDOUT.set(error, stdout);
       return error;
     };
     if (Buffer.byteLength(stdout) > limits.maxMetadataBytes) throw overflow("epoch metadata byte limit", "metadata_byte_cap");
@@ -22907,7 +22952,7 @@ try {
     // Preserve git's numeric exit code on the wrapped error so a caller can discriminate
     // an expected non-zero status (e.g. `config --unset-all` exit 5 = key absent) from a
     // real failure — the same `.code` idiom `tryGit` reads off the raw execFile error.
-    const failure = new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
+    const failure = new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`, { cause: err });
     const code = (err as { code?: unknown }).code;
     if (typeof code === "number") (failure as { code?: number }).code = code;
     return failure;

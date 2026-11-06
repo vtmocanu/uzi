@@ -457,4 +457,66 @@ describe("pack index fanout", () => {
     fs.appendFileSync(packed + ".idx", Buffer.alloc(8 * 200 + 8));
     await refusedBy(lowered, "AutomaticCompletenessUnknown", /pack index size/);
   });
+  it("a layout-consistent count above the limit is UNKNOWN when the pack header does not name that count", async () => {
+    const packed = pair(manyBlobs(200));
+    // The idx alone is consistent; the pack is garbage of a plausible size.
+    fs.writeFileSync(packed + ".pack", Buffer.alloc(64, 0x41));
+    await refusedBy(lowered, "AutomaticCompletenessUnknown", /pack header mismatch/);
+    await refusedBy({}, "AutomaticCompletenessUnknown", /pack header mismatch/);
+  });
+  it("a pack header with the wrong object count is UNKNOWN above the limit", async () => {
+    const packed = pair(manyBlobs(200));
+    const pack = fs.readFileSync(packed + ".pack");
+    pack.writeUInt32BE(199, 8);
+    fs.writeFileSync(packed + ".pack", pack);
+    await refusedBy(lowered, "AutomaticCompletenessUnknown", /pack header mismatch/);
+  });
+});
+
+// ---- delta copy bounds, inflate-chunk straddling and window refills ----
+describe("delta programs and windows that cross internal boundaries", () => {
+  // Base "abcdefgh" (8 bytes); copy `length` bytes from `offset` (opcode 0x91: one offset byte, one length byte).
+  const copy = (offset: number, length: number) => Buffer.concat([integer(8), integer(length), Buffer.from([0x91, offset, length])]);
+  const delta = (instructions: Buffer) => [
+    { id: oid(base), data: entry(3, Buffer.from(base)) },
+    { id: oid("derived " + instructions.length), data: entry(7, instructions, Buffer.from(oid(base), "hex")) },
+  ];
+  // Git computes the real ids and checksums, so the pair also passes the native verifier that follows the Node pass.
+  const reindexed = (packed: string) => command(clonePath, "index-pack", "-o", packed + ".idx", packed + ".pack");
+  it("a copy that ends exactly at the end of the base is accepted", async () => {
+    reindexed(pair(delta(copy(4, 4))));
+    await observeStores();
+  });
+  it("a copy that ends one byte past the end of the base is UNKNOWN", async () => {
+    pair(delta(copy(4, 5)));
+    await refusedBy({}, "AutomaticCompletenessUnknown", /delta copy outside base/);
+  });
+  it("an insert that straddles a 256 KiB inflate output chunk of a delta program is valid", async () => {
+    const inserts = 2100;
+    const payload = randomBytes(inserts * 127);
+    const parts: Buffer[] = [integer(8), integer(payload.length)];
+    for (let i = 0; i < inserts; i++) parts.push(Buffer.from([127]), payload.subarray(i * 127, (i + 1) * 127));
+    const program = Buffer.concat(parts);
+    assert.ok(program.length > 256 * 1024);
+    // Incompressible, so the record's compressed span is past the one-shot size and takes the streaming inflater.
+    const record = delta(program)[1]!;
+    assert.ok(record.data.length > 256 * 1024);
+    reindexed(pair([delta(program)[0]!, record]));
+    await observeStores();
+  });
+  it("a record header that straddles the end of the 8 MiB read window is valid", async () => {
+    // The second record starts 30 bytes before the end of the first window, so reading its 64 byte header refills the
+    // window while keeping those 30 bytes. The first record's length is tuned until that holds exactly.
+    const WINDOW = 8 * 1024 * 1024, keep = 30, source = randomBytes(WINDOW);
+    let n = WINDOW - keep - 12, first = entry(3, source.subarray(0, n));
+    for (let tries = 0; first.length !== WINDOW - keep - 12 && tries < 8; tries++) {
+      n += WINDOW - keep - 12 - first.length;
+      first = entry(3, source.subarray(0, n));
+    }
+    assert.equal(12 + first.length, WINDOW - keep);
+    const packed = pair([{ id: oid("window one"), data: first }, { id: oid("window two"), data: entry(3, randomBytes(200_000)) }]);
+    assert.ok(fs.statSync(packed + ".pack").size > WINDOW);
+    reindexed(packed);
+    await observeStores();
+  });
 });
