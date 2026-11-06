@@ -1677,8 +1677,8 @@ type Params struct {
 	// default lives in config.go where the env is read.
 	RunForgeUnreachableMaxParks int
 	// RunDiskParkMax (PRD #1809 M5, D6), mirrored from config (UZI_RUN_DISK_PARK_MAX). The
-	// DATA-VOLUME-FULL park's lifetime cap: parkDataVolumeFull fails the run with the
-	// server-derived fail_origin='data_volume_full' instead of parking when a COUNTED park would
+	// DATA-VOLUME-FULL park's lifetime cap: parkDataVolumeFull holds the run in
+	// owner-resumed recovery_wait with NULL retry time when a COUNTED park would
 	// take disk_park_count past it. A preventive park is neither counted nor capped. 0 = unlimited.
 	RunDiskParkMax              int
 	RunRetainedRecoveryMaxParks int
@@ -3103,7 +3103,7 @@ var checkpointDurabilityParks = map[string]bool{"limit_wait": true, "recovery_wa
 // recordCheckpointDurability stores a park report's checkpoint_contains_latest (PRD #1809 M6,
 // D8) after the park transition applied. The write is guarded on the run still being this
 // worker's in the status the report asked for, so a park the transaction turned into something
-// else (a stamped forge cancellation or a disk park past its failure cap) or a run that already
+// else (a stamped cancellation) or a run that already
 // moved on records nothing.
 //
 // Each park overwrites the value with what it carried, so the flag describes the LATEST park: a
@@ -4590,6 +4590,12 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	if err != nil {
 		return store.Run{}, false, err
 	}
+	if diskHoldRefusesReport(owned, req) {
+		if req.ClaimGeneration != nil && (owned.ClaimGeneration != *req.ClaimGeneration || owned.ClaimReleasedAt.Valid) {
+			return owned, false, ErrStaleClaim
+		}
+		return owned, false, nil
+	}
 	// Compact policy episodes have no generic continuation authority. Cancel remains
 	// the ordinary terminal action; the dedicated report reconciles its own replay.
 	if activePolicyHold(owned) && req.State != "cancelled" {
@@ -4863,6 +4869,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 			// stale_claim disposition. The deferred Rollback releases the lock.
 			return locked, false, ErrStaleClaim
 		}
+		if diskHoldRefusesReport(locked, req) {
+			return locked, false, nil
+		}
 		if locked.Status == "paused" && locked.HoldReason.String == IterationBudgetExhausted {
 			return locked, false, nil
 		}
@@ -4918,6 +4927,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		if err := validateSourcePublicationLive(locked, wkr, req); err != nil {
 			return locked, false, err
 		}
+		if diskHoldRefusesReport(locked, req) {
+			return locked, false, nil
+		}
 		owned = locked
 		q = qtx
 	}
@@ -4957,6 +4969,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		}
 		if err := recheckPublicationEnrollment(ctx, qtx, runID, workerLocked); err != nil {
 			return store.Run{}, false, err
+		}
+		if diskHoldRefusesReport(locked, req) {
+			return locked, false, nil
 		}
 		owned = locked
 		q = qtx
@@ -5571,8 +5586,8 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		}
 		// PRD #1809 M5 (D6): the DATA-VOLUME-FULL park is its own locked transaction too — the
 		// forge park's claim-generation fencing, a disk-only lifetime counter (bumped unless the
-		// park is preventive) and a cap past which the run fails with fail_origin
-		// 'data_volume_full'. It settles no custody hold (the park keeps custody) and, like the
+		// park is preventive) and a cap past which the run holds for owner Resume
+		// with a NULL retry deadline. It settles no custody hold (the park keeps custody) and, like the
 		// forge park, falls through to the shared post-switch fan-out. A stale claim returns
 		// early carrying the locked run for the handler's generic stale_claim 409.
 		if req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseDataVolumeFull {

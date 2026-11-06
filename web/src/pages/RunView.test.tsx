@@ -5780,10 +5780,10 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
     const { container } = render(<RecoveryWaitPanel run={diskPark()} />);
     expect(container.querySelector('[role="status"]')?.textContent).toContain("Waiting for disk space");
     expect(container.textContent).toContain(
-      `The worker's disk is full or nearly full. uzi frees space on the worker and the run resumes at its next retry (${hhmm("2026-01-01T09:30:00Z")}). No action is needed.`,
+      `Retry at ${hhmm("2026-01-01T09:30:00Z")}.`,
     );
     expect(container.textContent).toContain(
-      "Counted disk parks so far: 2. If the disk stays full, the run can fail after repeated counted parks.",
+      "Counted disk parks so far: 2. Resume does not reset this count.",
     );
     expect(container.textContent).not.toContain("uzi freed");
     expect(container.textContent).not.toContain("transient interruption");
@@ -5793,12 +5793,12 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
     expect(container.querySelector("button")).toBeNull();
   });
 
-  it("data_volume_full with no retry stamp or count drops the time and reads 0 parks", () => {
+  it("data_volume_full with explicit null is an owner hold and reads 0 parks", () => {
     const { container } = render(
       <RecoveryWaitPanel run={diskPark({ recovery_retry_not_before: null, disk_park_count: undefined })} />,
     );
-    expect(container.textContent).toContain("the run resumes at its next retry. No action is needed.");
-    expect(container.textContent).not.toMatch(/retry \(/);
+    expect(container.textContent).toContain("Automatic disk recovery has stopped.");
+    expect(container.textContent).not.toContain("Retry at");
     expect(container.textContent).toContain("Counted disk parks so far: 0.");
   });
 
@@ -6211,14 +6211,14 @@ describe("RunView park announcement — recovery_wait (issue #1197, a11y)", () =
   // PRD #1809 M5: a data_volume_full park announces the disk space it waits on, not the
   // generic transient interruption.
   it("announces a data_volume_full park as waiting for disk space", async () => {
-    renderPage({ status: "recovery_wait", recovery_wait_cause: "data_volume_full" });
+    renderPage({ status: "recovery_wait", recovery_wait_cause: "data_volume_full", recovery_retry_not_before: "2026-01-01T09:30:00Z" });
     const region = await waitFor(() => {
       const el = document.querySelector('div.sr-only[role="status"]') as HTMLElement | null;
       if (!el || el.textContent === "") throw new Error("not announced yet");
       return el;
     });
     expect(region.textContent).toBe(
-      "This run is waiting for disk space. The worker's disk is full or nearly full; uzi frees space on the worker and the run resumes at its next retry.",
+      "The worker's disk is full or nearly full. uzi frees space on the worker and the run retries automatically after its scheduled time, including when already due. Admission may still refuse execution.",
     );
     expect(region.textContent).not.toContain("transient interruption");
   });

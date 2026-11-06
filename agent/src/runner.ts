@@ -7889,10 +7889,10 @@ export class RunRunner {
   }
 
   /**
-   * PRD #1392 M2 (D7) / PRD #1809 D6 — release THIS claim generation's custody hold before a
-   * pre-clone park, and report whether the release is POSITIVELY proven to have settled exactly
+   * PRD #1392 M2 (D7) / PRD #1809 D6 — release an UNGUARDED claim generation's custody hold
+   * before a pre-clone park, and report whether the release is POSITIVELY proven to have settled exactly
    * that generation (released && generation===gen && holds_released===1 && !retained). ClaimRun
-   * opens a hold for every custody-capable claim, and a pre-clone generation adopted no source,
+   * opens a hold for every custody-capable claim, and an unguarded pre-clone generation adopted no source,
    * so nothing else would ever release it: a park that leaves it open keeps the worker
    * custody-held forever (recycle skipped, DeleteWorker refused). NO release_evidence: the
    * worker's release endpoint allowlists only publication/forge_no_output, and an older api need
@@ -8345,28 +8345,28 @@ export class RunRunner {
 
   /**
    * PRD #1809 D6 — park a run whose data-volume write stayed disk-full. Every such park happens
-   * BEFORE the clone/fetch (the preflight, or the retry around ensureClone), so it is a pre-clone
-   * park and takes the forge pre-clone park's release-then-park sequence (ADR-1392 D3/D7):
+   * BEFORE the clone/fetch (the preflight, or the retry around ensureClone). An unguarded claim
+   * takes the forge pre-clone park's release-then-park sequence (ADR-1392 D3/D7):
    *
-   *   1. release THIS generation's custody hold and require positive proof of an exact release
-   *      ({@link releasePreCloneHoldWithProof}). The api's data_volume_full park settles no hold
-   *      (a mid-run disk park must keep custody), and no later path releases a pre-clone
-   *      generation's hold, so without this the hold stays open forever and the worker counts as
-   *      custody-held. Needs `recovery_release_exact_echo` (every api that has the typed cause
-   *      advertises it); without it, or without proof, the run takes today's failed path.
+   *   1. release THIS generation's unguarded custody hold and require positive proof of an exact
+   *      release ({@link releasePreCloneHoldWithProof}). The api's data_volume_full park settles no
+   *      hold (a mid-run disk park must keep custody). Needs `recovery_release_exact_echo`;
+   *      without it, or without proof, the unguarded run takes today's failed path. An inventory-
+   *      guarded claim cannot use that legacy release. With the typed cause it parks while keeping
+   *      guarded custody intact; without the typed cause it takes the failed path.
    *   2. report the park through the shared claim-fenced report and ack dispatch (D10): the TYPED
    *      `{recovery_wait, recovery_cause: data_volume_full}` when the api advertises
    *      `recovery_cause_data_volume_full` (a counted park; `disk_park_preventive` is M4's and is
    *      never sent here), else the untyped `{recovery_wait}`. The reportState closure stamps
    *      claim_generation.
    *
-   * The release is not atomic with the park; that is safe because the released generation adopted
-   * nothing: a park that then fails (400, unrecognised ack) or turns into a stop leaves no work
-   * behind the released hold. Before the clone the failed path has no settle of its own to run
+   * The unguarded release is not atomic with the park; that is safe because the released generation
+   * adopted nothing: a park that then fails (400, unrecognised ack) or turns into a stop leaves no
+   * work behind the released hold. Before the clone the failed path has no settle of its own to run
    * (reapRecoveryProviderForSettle returns false while `flight.barePath` is unset), so this release
-   * is the only one the generation gets. The arms that return "fail" BEFORE the release (no claim
-   * generation, no exact-release echo, no positive proof) therefore leave the pre-clone hold open,
-   * as every other pre-clone failure does today.
+   * is the only one an unguarded generation gets. Guarded claims keep custody on a disk park;
+   * an authoritative terminal outcome may still use the existing empty-inventory FINAL
+   * settlement.
    *
    * N2: every such park is pre-clone by construction. The release is guarded on it: a
    * DataVolumeFullError that arrives with a clone in place (`flight.barePath` set) releases nothing
@@ -8398,7 +8398,17 @@ export class RunRunner {
       return "fail";
     }
     const features = this.client.protocolFeatures;
-    if (!features.includes("recovery_release_exact_echo")) {
+    const guarded = claim.inventory_guarded === true;
+    const typed = features.includes(DATA_VOLUME_FULL_FEATURE);
+    if (guarded && !typed) {
+      runLog.warn("data volume full, but this guarded claim cannot use a legacy untyped park; taking today's failed path", {
+        run_id: flight.runId,
+        operation: err.operation,
+        cause: "data_volume_full",
+      });
+      return "fail";
+    }
+    if (!guarded && !features.includes("recovery_release_exact_echo")) {
       runLog.warn("data volume full, but the api cannot prove an exact custody release; taking today's failed path", {
         run_id: flight.runId,
         operation: err.operation,
@@ -8407,15 +8417,17 @@ export class RunRunner {
       });
       return "fail";
     }
-    const typed = features.includes(DATA_VOLUME_FULL_FEATURE);
-    runLog.warn("data volume full after a reclaim and a retry; releasing this generation's custody and parking the run", {
+    runLog.warn(guarded
+      ? "data volume full after a reclaim and a retry; retaining guarded custody and parking the run"
+      : "data volume full after a reclaim and a retry; releasing this generation's custody and parking the run", {
       run_id: flight.runId,
       operation: err.operation,
       cause: "data_volume_full",
       typed,
+      guarded,
       detail: err.message,
     });
-    if (!(await this.releasePreCloneHoldWithProof(flight, claim.claim_generation, runLog, DATA_VOLUME_PARK_COPY))) {
+    if (!guarded && !(await this.releasePreCloneHoldWithProof(flight, claim.claim_generation, runLog, DATA_VOLUME_PARK_COPY))) {
       return "fail";
     }
     const body: StateRequest = typed
@@ -8519,7 +8531,7 @@ export class RunRunner {
       return "parked";
     }
     if (ack.status && TERMINAL_RUN_STATUSES.has(ack.status)) {
-      // cancelled, or failed when the cap branch committed the terminal state, or any other
+      // cancelled, failed by a legacy server or another terminal cause, or any other
       // authoritative terminal status: close the still-open batcher, no park event, no second
       // report. A guarded pre-clone hold still needs positive empty-inventory evidence
       // after this confirmed terminal outcome; the finally does ordinary cleanup.
@@ -8582,8 +8594,8 @@ export class RunRunner {
     copy: PreCloneParkCopy = FORGE_PARK_COPY,
   ): Promise<void> {
     const { batcher } = flight;
-    const when = retryAt === null && copy === FORGE_PARK_COPY
-      ? "automatic forge retries exhausted; waiting for owner Resume or Cancel"
+    const when = retryAt === null && (copy === FORGE_PARK_COPY || copy === DATA_VOLUME_PARK_COPY)
+      ? `automatic ${copy === DATA_VOLUME_PARK_COPY ? "disk" : "forge"} retries exhausted; waiting for owner Resume or Cancel`
       : retryAt ? `retry at ${retryAt}` : "retry after backoff";
     batcher.emit({
       kind: "status",
@@ -22037,10 +22049,13 @@ export class RunRunner {
             return true;
           }
           if (ack.status === "recovery_wait" && !credentialDeferred && disk) {
-            runLog.info("run parked mid-run for its data volume; its caches are dropped and it resumes automatically", {
+            const held = ack.recoveryRetryNotBefore === null;
+            const continuation = held ? "it waits for owner Resume or Cancel" : "it resumes automatically";
+            runLog.info(`run parked mid-run for its data volume; ${continuation}`, {
               run_id: flight.runId,
               cause: "data_volume_full",
               preventive: disk.preventive,
+              retry_not_before: ack.recoveryRetryNotBefore,
               typed: parkBody.recovery_cause !== undefined,
               published: capture.published,
             });
@@ -22049,10 +22064,10 @@ export class RunRunner {
               agent: "worker",
               payload: {
                 text: degraded
-                  ? "paused for a full data volume; the unverified work and session are retained on this worker only until capture succeeds"
+                  ? `paused for a full data volume; the unverified work and session are retained on this worker only until capture succeeds${held ? "; the run waits for owner Resume or Cancel" : ""}`
                   : disk.preventive
-                  ? "paused because this run's build caches stayed over their size cap; the caches are dropped and it resumes automatically"
-                  : "paused because the worker's data volume is nearly full; this run's build caches are dropped and it resumes automatically",
+                  ? `paused because this run's build caches stayed over their size cap; the caches are dropped and ${continuation}`
+                  : `paused because the worker's data volume is nearly full; this run's build caches are dropped and ${continuation}`,
               },
             });
             // No reapThenSettleRecoveryGeneration: the custody hold is kept (see `disk` above).

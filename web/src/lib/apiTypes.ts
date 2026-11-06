@@ -3772,7 +3772,8 @@ export interface Run {
    *  credential refresh or release found the run owner's vault locked; the run resumes at its
    *  next retry, `recovery_retry_not_before`, once the vault is unlocked, and waits `queued`
    *  while it stays locked), and "data_volume_full" (PRD #1809 M5: the worker's data volume
-   *  was full or about to fill; the run resumes at its next retry, see disk_park_count);
+   *  was full or about to fill; explicit null retry timing holds for the owner,
+   *  a finite timestamp schedules a retry, see disk_park_count);
    *  "provider_outage" is a counted provider interruption with a scheduled retry;
    *  "retained_recovery_exhausted" can be timed or owner-held (see recovery_retry_not_before);
    *  "retained_recovery_adoption_failed" means integrity checks refused adoption of retained

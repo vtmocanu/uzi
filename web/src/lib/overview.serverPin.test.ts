@@ -35,7 +35,7 @@ const EXPECTED_TAG_CASE =
   "(CASE WHEN (r.status = 'awaiting_approval' AND NOT r.auto_approve) " +
   "OR r.status IN ('awaiting_input', 'paused') " +
   "OR (r.status = 'recovery_wait' AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')) " +
-  "OR (r.status = 'recovery_wait' AND r.recovery_wait_cause IN ('retained_recovery_exhausted', 'codex_idle_stall') AND r.recovery_retry_not_before IS NULL) " +
+  "OR (r.status = 'recovery_wait' AND r.recovery_wait_cause IN ('retained_recovery_exhausted', 'codex_idle_stall', 'data_volume_full') AND r.recovery_retry_not_before IS NULL) " +
   "THEN 'needs_owner' ELSE 'progressing' END)";
 
 const matchesPinnedCase = (block: string) => tagCase(block) === EXPECTED_TAG_CASE;
@@ -52,7 +52,7 @@ function serverShape(block: string) {
     /r\.recovery_wait_cause IN (\('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed'\))/,
   );
   const stamped = block.match(
-    /r\.recovery_wait_cause IN (\('retained_recovery_exhausted', 'codex_idle_stall'\)) AND r\.recovery_retry_not_before IS NULL/,
+    /r\.recovery_wait_cause IN (\('retained_recovery_exhausted', 'codex_idle_stall', 'data_volume_full'\)) AND r\.recovery_retry_not_before IS NULL/,
   );
   return {
     statusOwner: status != null,
@@ -104,6 +104,13 @@ const DIVERGENCES = [
     server: "automatic",
     here: "owner",
   },
+  {
+    name: "data_volume_full with an omitted stamp",
+    reason: "Same as retained_recovery_exhausted: only an explicit NULL stamp is an owner hold on the server; unknown timing is owner here.",
+    run: recoveryRun("data_volume_full"),
+    server: "automatic",
+    here: "owner",
+  },
 ] as const;
 
 describe("parkDisposition against ListMaintenanceHeldRuns", () => {
@@ -114,7 +121,7 @@ describe("parkDisposition against ListMaintenanceHeldRuns", () => {
     expect(shape.alwaysOwnerCauses).toEqual(
       new Set(["worker_requeue_exhausted", "worker_memory_pressure", "retained_recovery_adoption_failed", "retained_continuation_unwitnessed"]),
     );
-    expect(shape.nullStampOwnerCauses).toEqual(new Set(["retained_recovery_exhausted", "codex_idle_stall"]));
+    expect(shape.nullStampOwnerCauses).toEqual(new Set(["retained_recovery_exhausted", "codex_idle_stall", "data_volume_full"]));
   });
 
   it("agrees on the always-owner recovery causes, whatever the stamp", () => {
@@ -140,12 +147,12 @@ describe("parkDisposition against ListMaintenanceHeldRuns", () => {
   it("requires the null-stamp cause list to be followed directly by the NULL-stamp predicate", () => {
     const block = heldRunsBlock(sql);
     expect(block).toMatch(
-      /\('retained_recovery_exhausted', 'codex_idle_stall'\) AND r\.recovery_retry_not_before IS NULL/,
+      /\('retained_recovery_exhausted', 'codex_idle_stall', 'data_volume_full'\) AND r\.recovery_retry_not_before IS NULL/,
     );
     // The check has teeth: the same regex rejects a predicate that dropped the stamp condition.
     const mutated = block.replace(" AND r.recovery_retry_not_before IS NULL", "");
     expect(mutated).not.toMatch(
-      /\('retained_recovery_exhausted', 'codex_idle_stall'\) AND r\.recovery_retry_not_before IS NULL/,
+      /\('retained_recovery_exhausted', 'codex_idle_stall', 'data_volume_full'\) AND r\.recovery_retry_not_before IS NULL/,
     );
     expect(serverShape(mutated).nullStampOwnerCauses).toBeNull();
   });

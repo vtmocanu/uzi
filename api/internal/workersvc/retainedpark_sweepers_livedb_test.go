@@ -11,7 +11,7 @@ import (
 )
 
 func TestRetainedParkSweepersPreserveHeldRowLiveDB(t *testing.T) {
-	for _, cause := range []string{"retained_recovery_exhausted", "retained_recovery_adoption_failed"} {
+	for _, cause := range []string{"retained_recovery_exhausted", "retained_recovery_adoption_failed", "data_volume_full"} {
 		t.Run(cause, func(t *testing.T) {
 			testRetainedParkSweepersPreserveHeldRowLiveDB(t, cause)
 		})
@@ -43,14 +43,20 @@ func testRetainedParkSweepersPreserveHeldRowLiveDB(t *testing.T, cause string) {
 			env.exec("INSERT INTO recovery_captures(id,hold_id,run_id,user_id,original_worker_identity,source_sha,idempotency_key,state,expires_at) VALUES($1,$2,$3,$4,'retained-sweep','aaaa1111','retained-sweep','available',now()+interval '1 hour')", capture, hold, held, user)
 			svc := snapshotSvc(env, testParams())
 			svc.p.RunRetainedRecoveryMaxParks = 0
-			if _, applied, err := svc.SetState(env.ctx, store.Worker{ID: worker}, held, retainedReportCause(2, cause)); err != nil || !applied {
+			report := retainedReportCause(2, cause)
+			if cause == "data_volume_full" {
+				svc.p.RunDiskParkMax = 1
+				env.exec("UPDATE runs SET disk_park_count=1 WHERE id=$1", held)
+				report = dataVolumeFullReport(2, nil)
+			}
+			if _, applied, err := svc.SetState(env.ctx, store.Worker{ID: worker}, held, report); err != nil || !applied {
 				t.Fatalf("park applied=%v err=%v", applied, err)
 			}
 			// The held row has both an expired wall and a stale worker. Snapshot-based
 			// writers additionally see no active-run evidence for its generation.
 			env.exec("UPDATE workers SET last_heartbeat_at=now()-interval '1 hour' WHERE id=$1", worker)
 			before := exhaustionRun(t, env, held)
-			if before.Status != "recovery_wait" || before.RecoveryWaitCause.String != cause || before.RecoveryRetryNotBefore.Valid || !before.ClaimReleasedAt.Valid {
+			if before.Status != "recovery_wait" || before.RecoveryWaitCause.String != cause || before.RecoveryRetryNotBefore.Valid || before.ClaimReleasedAt.Valid != (cause != "data_volume_full") {
 				t.Fatalf("not a fenced NULL-stamp retained hold: %+v", before)
 			}
 			custody := func() string {

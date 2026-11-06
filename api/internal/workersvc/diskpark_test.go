@@ -90,8 +90,8 @@ func TestSetStateDataVolumeFullNeverTakesOrdinaryPark(t *testing.T) {
 }
 
 // TestDataVolumeFullVocabulary: data_volume_full is a WORKER-reportable recovery cause and a
-// SERVER-only fail_origin (the cap stamps it; a worker naming it on `failed` is coerced away),
-// and the cap-fail is never judged.
+// historical SERVER-only fail_origin (a worker naming it on `failed` is coerced away),
+// and historical cap failures are never judged. Current cap exhaustion holds.
 func TestDataVolumeFullVocabulary(t *testing.T) {
 	if !recoveryWaitCauses[recoveryCauseDataVolumeFull] || serverRecoveryWaitCauses[recoveryCauseDataVolumeFull] {
 		t.Fatal("data_volume_full must be a worker-reportable recovery cause")

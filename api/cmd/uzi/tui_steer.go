@@ -178,7 +178,7 @@ func atPlanGate(run apitypes.RunDTO) bool {
 func (m tuiModel) renderSteerBar() string {
 	s := &m.detail.steer
 	if s.access != steerAllowed {
-		return m.pal.faint.Render(steerSuppressedReason(s.access))
+		return clampVisual(m.pal.faint.Render(steerSuppressedReason(s.access)), m.width)
 	}
 
 	var sb strings.Builder

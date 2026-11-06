@@ -143,8 +143,9 @@ const PARK_TABLE: Record<string, "automatic" | "owner"> = {
 // ListMaintenanceHeldRuns (pinned by overview.serverPin.test.ts):
 //   - A plain recovery_wait or provider_outage with no parseable retry stamp is "owner" here
 //     (nothing is scheduled, so waiting for it is not safe); the server tags it progressing.
-//   - retained_recovery_exhausted / codex_idle_stall with an omitted or invalid stamp
-//     (*_unknown) is "owner" here, fail-closed; the server only treats a NULL stamp as owner.
+//   - retained_recovery_exhausted / codex_idle_stall / data_volume_full with an omitted or
+//     invalid stamp (*_unknown, or disk "unknown") is "owner" here, fail-closed; the server
+//     only treats a NULL stamp as owner.
 //   - A weekly-reserve pause is "automatic" here (it releases itself); the server tags every
 //     paused run needs_owner.
 export function parkDisposition(run: ParkRun): "automatic" | "owner" {
