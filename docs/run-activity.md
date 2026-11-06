@@ -820,7 +820,8 @@ most of the places that check are not the end of the run:
   credential, an approved plan is kept and not re-checked, an automatic revise
   runs its revision turn, and a checked human gate stays presented with no
   republish. If the switch releases the run to another claim, that claim
-  re-presents the plan for human approval. A cancel or other failure during the wait keeps its
+  re-presents the plan for human approval after an approve or a human gate,
+  and continues with the next checker round after an automatic revise. A cancel or other failure during the wait keeps its
   normal outcome ([ADR-2149](../adr/2149-cross-check.md)).
 - A Claude recovery capture that cannot prove the clone stopped is retried a
   bounded number of times; if proof still fails, the run fails the same way

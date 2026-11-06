@@ -505,7 +505,7 @@ reservation and fail the run. The worker now defers it; the dispositions above a
   `releaseAppliedGate`. A give-up of a human gate resumes the presented gate (same presentation,
   revision and verdict binding, no republish). No other exit ever services the latch: the hold
   is closed without service when the reservation was released, and otherwise stays open with the
-  failed reservation for the rest of the flight, which that failure ends. A failure therefore
+  unreleased reservation for the rest of the flight, which that failure ends. A failure therefore
   keeps its existing disposition and is never turned into a switch. No timer cancels a live
   reservation.
 - **Decision stashes.** At S1/S2, when a switch is in play, the checker decision is kept for the
