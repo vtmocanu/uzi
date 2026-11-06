@@ -4375,7 +4375,6 @@ export class RunRunner {
       return fail("inventory_read_not_verified", { check: "inventory_read_not_verified", cause: inventoryReadCause(afterGit) });
     if (JSON.stringify({ heads: afterGit.heads, clones: afterGit.clones }) !== state.sourceIdentity)
       return fail("source_identity_changed", { check: "source_identity_changed" });
-    if (baselineDrift(afterGit.clones)) return fail("baseline_drift", { check: "source_identity_changed" });
     return true;
   }
 

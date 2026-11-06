@@ -150,6 +150,33 @@ describe("predecessor boundary: grant, tail and scope", () => {
     assert.deepEqual(out.diagnostics, [{ check: "boundary_exception" }]);
   });
 
+  it("a valid token with a foreign runId is refused", async () => {
+    const x = world();
+    const diagnostics: InventorySourceDiagnostic[] = [];
+    const result = await x.internals.withInventorySourceBoundary({
+      runId: "someone-else", generation: 1, barePath: "/fixture/repo.git", predecessor: x.registration.token,
+      reportDiagnostic: d => diagnostics.push(d),
+    }, async () => assert.fail("must not release"));
+    assert.equal(result, "retained");
+    assert.deepEqual(diagnostics, [{ check: "execution_tail_present" }]);
+    assert.deepEqual(x.registration.refusals, [{ check: "predecessor_scope_invalid" }]);
+    assert.equal(x.w.reads.length, 0);
+  });
+
+  it("a scope that dies after clone 1 stops the proof before clone 2's content proof", async () => {
+    let contentCalls = 0;
+    const x = world({
+      clones: () => [clone("issue-1"), clone("issue-2")],
+      quiesce: req => { if (req.site === "inventory_source:after_runner_git") x.w.cancelled = true; },
+    });
+    x.w.content = () => { contentCalls++; return "clean"; };
+    const out = await x.enter();
+    assert.equal(out.result, "retained");
+    assert.equal(contentCalls, 1, "clone 2 was never proven");
+    assert.equal(x.requests.length, 2);
+    assert.ok(x.registration.refusals.some(r => r.check === "predecessor_scope_invalid"));
+  });
+
   it("an unregistered, foreign or disposed token is dead", async () => {
     const x = world();
     for (const token of [{}, Object.freeze({})]) {

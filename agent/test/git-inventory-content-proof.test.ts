@@ -15,9 +15,11 @@ const GIT_ENV = { ...cleanEnv, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM
 
 type BytesResult = { code: number; stdout: Buffer; stderr: Buffer; exceeded?: true };
 interface Seam {
-  runGitAsRunnerBytes(cwd: string, args: string[], opts?: { input?: Buffer }): Promise<BytesResult>;
+  runGitAsRunnerBytes(cwd: string, args: string[], opts?: { input?: Buffer; timeoutMs?: number }): Promise<BytesResult>;
 }
-interface Call { args: string[]; input?: Buffer }
+// `args` is the subcommand argv with the leading --git-dir/--work-tree pins split off into `pins`.
+interface Call { args: string[]; pins: string[]; input?: Buffer; timeoutMs?: number }
+const isPin = (a: string): boolean => a.startsWith("--git-dir=") || a.startsWith("--work-tree=");
 
 function fixture(t: test.TestContext) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "content-proof-"));
@@ -35,8 +37,10 @@ function fixture(t: test.TestContext) {
   const calls: Call[] = [];
   let override: ((args: string[], real: () => Promise<BytesResult>) => Promise<BytesResult> | undefined) | undefined;
   seam.runGitAsRunnerBytes = async (cwd, args, opts) => {
-    calls.push({ args, ...(opts?.input ? { input: opts.input } : {}) });
-    return override?.(args, () => real(cwd, args, opts)) ?? real(cwd, args, opts);
+    const bare = args.filter(a => !isPin(a));
+    calls.push({ args: bare, pins: args.filter(isPin), ...(opts?.input ? { input: opts.input } : {}),
+      ...(opts?.timeoutMs === undefined ? {} : { timeoutMs: opts.timeoutMs }) });
+    return override?.(bare, () => real(cwd, args, opts)) ?? real(cwd, args, opts);
   };
   const commitAll = () => { g("add", "-A"); g("commit", "-q", "-m", "base"); };
   return {
@@ -101,7 +105,7 @@ describe("inventorySourceContentProof (issue #2969 D5)", () => {
   });
 
   test("an unreadable tracked file is unreadable", {
-    skip: process.getuid?.() === 0 && "root reads every file; the unreadable case needs the real UID lane (M4)",
+    skip: process.getuid?.() === 0 && "root reads every file; this case needs a non-root run (the real UID lane)",
   }, async t => {
     const f = fixture(t);
     f.g("config", "core.trustctime", "false");
@@ -220,7 +224,96 @@ describe("inventorySourceContentProof (issue #2969 D5)", () => {
     }
   });
 
+  test("every git call pins --git-dir and --work-tree to the clone", async t => {
+    const f = fixture(t);
+    fs.writeFileSync(path.join(f.root, "a.txt"), "a\n");
+    f.commitAll();
+    await f.proof();
+    await f.git.inventoryIgnoredResidue(f.root);
+    assert.ok(f.calls.length >= 6);
+    for (const c of f.calls) assert.deepEqual(c.pins, [`--git-dir=${f.root}/.git`, `--work-tree=${f.root}`]);
+  });
+
+  test("core.worktree in the agent-writable config cannot redirect status or the listings", async t => {
+    const f = fixture(t);
+    fs.writeFileSync(path.join(f.root, "a.txt"), "a\n");
+    f.commitAll();
+    fs.appendFileSync(path.join(f.root, ".git", "info", "exclude"), "build/\n");
+    const elsewhere = path.join(f.dir, "elsewhere");
+    fs.mkdirSync(elsewhere);
+    fs.writeFileSync(path.join(elsewhere, "a.txt"), "a\n");
+    // Fixture data: the config an agent could write.
+    fs.appendFileSync(path.join(f.root, ".git", "config"), `[core]\n\tworktree = ${elsewhere}\n`);
+    assert.equal(await f.proof(), "clean");
+    assert.equal(await f.git.inventoryIgnoredResidue(f.root), "clean");
+    fs.writeFileSync(path.join(f.root, "untracked.txt"), "u\n");
+    assert.equal(await f.proof(), "dirty", "untracked files in the clone are still seen");
+    fs.rmSync(path.join(f.root, "untracked.txt"));
+    fs.mkdirSync(path.join(f.root, "build"));
+    fs.writeFileSync(path.join(f.root, "build", "o.log"), "o\n");
+    assert.equal(await f.git.inventoryIgnoredResidue(f.root), "residue", "ignored files in the clone are still seen");
+  });
+
+  test("a .git that is a gitfile or a symlink is unreadable", async t => {
+    const f = fixture(t);
+    fs.writeFileSync(path.join(f.root, "a.txt"), "a\n");
+    f.commitAll();
+    const real = path.join(f.dir, "real-git");
+    fs.renameSync(path.join(f.root, ".git"), real);
+    fs.writeFileSync(path.join(f.root, ".git"), `gitdir: ${real}\n`);
+    assert.equal(await f.proof(), "unreadable");
+    assert.equal(await f.git.inventoryIgnoredResidue(f.root), "residue");
+    fs.rmSync(path.join(f.root, ".git"));
+    fs.symlinkSync(real, path.join(f.root, ".git"));
+    assert.equal(await f.proof(), "unreadable");
+    assert.equal(await f.git.inventoryIgnoredResidue(f.root), "residue");
+    assert.equal(f.calls.length, 0, "no git ran against a redirectable .git");
+  });
+
+  test("a passed deadline is unreadable and every call timeout is clipped to it", async t => {
+    const f = fixture(t);
+    fs.writeFileSync(path.join(f.root, "a.txt"), "a\n");
+    f.commitAll();
+    assert.equal(await f.proof({ maxEntries: 10, maxBytes: 1 << 20, deadlineAt: Date.now() - 1 }), "unreadable");
+    assert.equal(f.calls.length, 0);
+    assert.equal(await f.proof({ maxEntries: 10, maxBytes: 1 << 20, deadlineAt: Date.now() + 5_000 }), "clean");
+    assert.ok(f.calls.length > 0 && f.calls.every(c => c.timeoutMs !== undefined && c.timeoutMs <= 5_000 && c.timeoutMs > 0));
+    f.calls.length = 0;
+    assert.equal(await f.proof(), "clean");
+    assert.ok(f.calls.every(c => c.timeoutMs === 60_000), "an explicit per-call timeout without a deadline");
+  });
+
   describe("caps", () => {
+    test("a sparse large tracked file over maxContentBytes is over_bound with zero hash-object dispatch", async t => {
+      const f = fixture(t);
+      const big = path.join(f.root, "sparse.bin");
+      fs.writeFileSync(big, "");
+      fs.truncateSync(big, 64 * 1024 * 1024);
+      fs.writeFileSync(path.join(f.root, "small.txt"), "s\n");
+      f.commitAll();
+      assert.equal(await f.proof({ maxEntries: 100, maxBytes: 1 << 20, maxContentBytes: 32 * 1024 * 1024 }), "over_bound");
+      assert.equal(f.hashCalls().length, 0);
+      assert.equal(await f.proof({ maxEntries: 100, maxBytes: 1 << 20, maxContentBytes: 128 * 1024 * 1024 }), "clean");
+      assert.equal(f.hashCalls().length, 1);
+    });
+    test("many files whose sizes sum over maxContentBytes are over_bound before hashing", async t => {
+      const f = fixture(t);
+      for (let i = 0; i < 3; i++) fs.writeFileSync(path.join(f.root, `f${i}.txt`), `${i}`.repeat(600));
+      f.commitAll();
+      assert.equal(await f.proof({ maxEntries: 100, maxBytes: 1 << 20, maxContentBytes: 1000 }), "over_bound");
+      assert.equal(f.hashCalls().length, 0);
+      assert.equal(await f.proof({ maxEntries: 100, maxBytes: 1 << 20, maxContentBytes: 1800 }), "clean");
+    });
+    for (const [name, match] of [["status", (a: string[]) => a[0] === "status"], ["ls-files -v", (a: string[]) => a.includes("-v")],
+      ["ls-files staged listing", (a: string[]) => a.some(x => x.startsWith("--format"))], ["hash-object", (a: string[]) => a[0] === "hash-object"]] as const) {
+      test(`${name} output past its cap is over_bound`, async t => {
+        const f = fixture(t);
+        fs.writeFileSync(path.join(f.root, "a.txt"), "a\n");
+        f.commitAll();
+        f.inject((args, real) => match(args) ? real().then(r => ({ ...r, code: -1, exceeded: true as const })) : undefined);
+        assert.equal(await f.proof(), "over_bound");
+      });
+    }
     test("more entries than maxEntries is over_bound", async t => {
       const f = fixture(t);
       for (const n of ["a", "b", "c"]) fs.writeFileSync(path.join(f.root, n), n);
@@ -277,6 +370,21 @@ describe("inventoryIgnoredResidue (issue #2969 D6, predecessor only)", () => {
     assert.equal(await f.git.inventoryIgnoredResidue(f.root), "clean", ".uzi/ holding only scratch is clean");
     fs.writeFileSync(path.join(f.root, ".uzi", "cache.bin"), "c\n");
     assert.equal(await f.git.inventoryIgnoredResidue(f.root), "residue");
+  });
+  test("a nested repository at .uzi hides nothing: it is residue", async t => {
+    const f = setup(t, [".uzi/"]);
+    fs.mkdirSync(path.join(f.root, ".uzi", "build"), { recursive: true });
+    fs.writeFileSync(path.join(f.root, ".uzi", "build", "out.o"), "o\n");
+    execFileSync("git", ["init", "-q", path.join(f.root, ".uzi")], { env: GIT_ENV, stdio: "ignore" });
+    assert.equal(await f.git.inventoryIgnoredResidue(f.root), "residue");
+    fs.rmSync(path.join(f.root, ".uzi", ".git"), { recursive: true });
+    fs.writeFileSync(path.join(f.root, ".uzi", ".git"), "gitdir: /nowhere\n");
+    assert.equal(await f.git.inventoryIgnoredResidue(f.root), "residue", "a .git of any type");
+  });
+  test("an empty ignored directory is not residue", async t => {
+    const f = setup(t, [".uzi/scratch/", "emptydir/"]);
+    fs.mkdirSync(path.join(f.root, "emptydir"));
+    assert.equal(await f.git.inventoryIgnoredResidue(f.root), "clean");
   });
   test("stderr on exit 0, a non-zero exit and an exception are all residue", async t => {
     const f = setup(t, [".uzi/scratch/"]);

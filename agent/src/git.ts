@@ -908,8 +908,18 @@ const SCRATCH_IGNORE_CHECK_TIMEOUT_MS = 15_000;
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
 /** Caps for {@link GitCache.inventorySourceContentProof} and {@link GitCache.inventoryIgnoredResidue}: tracked entries
  *  examined, and bytes of any one command's output or of the hashed-path stdin. A hit is `over_bound`. */
-export interface InventoryContentProofBounds { maxEntries: number; maxBytes: number }
-export const INVENTORY_CONTENT_PROOF_BOUNDS: InventoryContentProofBounds = { maxEntries: 50_000, maxBytes: 8 * 1024 * 1024 };
+export interface InventoryContentProofBounds {
+  maxEntries: number;
+  /** Bytes of any one listing's output. */
+  maxBytes: number;
+  /** Cumulative index-recorded size of every regular file `hash-object` would read (default {@link INVENTORY_CONTENT_PROOF_BOUNDS}). */
+  maxContentBytes?: number;
+  /** Epoch ms the caller's operation ends; each git call's timeout is clipped to it and a passed deadline is unreadable. */
+  deadlineAt?: number;
+}
+export const INVENTORY_CONTENT_PROOF_BOUNDS = { maxEntries: 50_000, maxBytes: 8 * 1024 * 1024, maxContentBytes: 256 * 1024 * 1024 } as const;
+/** Ceiling for any single git call of the content proof or the residue listing. */
+const INVENTORY_PROOF_CALL_TIMEOUT_MS = 60_000;
 
 /** The one `ls-files --directory` entry that is not residue: `.uzi/` collapsed because it is ignored as a whole. */
 const UZI_DIR_ENTRY = Buffer.from(".uzi/");
@@ -15237,7 +15247,7 @@ try {
    * {@link worktreeStatus} it never trusts the index stat cache alone and refuses anything it cannot read exactly:
    *  1. `status --porcelain=v1 -z --untracked-files=all` (non-zero exit or any stderr: unreadable; any output: dirty);
    *  2. `ls-files -v -z`: any tag but `H` (assume-unchanged, skip-worktree, unmerged) is unreadable;
-   *  3. `ls-files -s -z`: a malformed record, a non-zero stage or a gitlink is unreadable; symlinks (mode 120000)
+   *  3. `ls-files -z --format=...` (mode, id, stage, size, path): a malformed record, a non-zero stage or a gitlink is unreadable; symlinks (mode 120000)
    *     are covered by step 1 and are not hashed;
    *  4. a regular file whose path holds an LF, starts with `"` or ends with CR is refused (unreadable) BEFORE any
    *     dispatch: `hash-object --stdin-paths` reads one path per line, C-unquotes a leading quote and strips a
@@ -15245,23 +15255,28 @@ try {
    *  5. `hash-object --no-filters --stdin-paths` over the exact path bytes (stdin only, never argv);
    *  6. exactly one object id per path, in order, in the repository's object format (`rev-parse --show-object-format`);
    *  7. each id must equal the index blob id, else dirty (so content that differs with an unchanged stat is dirty);
-   *  8. an entry or byte cap hit is `over_bound`.
+   *  8. an entry or byte cap hit is `over_bound`, including the cumulative index size of the files to hash (maxContentBytes),
+   *     decided before any hash-object dispatch. Every call pins `--git-dir`/`--work-tree` and gets a bounded timeout.
    * Runs as the runner uid with GIT_OPTIONAL_LOCKS=0 and never decodes a path to a JS string.
    */
   async inventorySourceContentProof(cwd: string, bounds: InventoryContentProofBounds = INVENTORY_CONTENT_PROOF_BOUNDS):
     Promise<"clean" | "dirty" | "unreadable" | "over_bound"> {
-    const env = { GIT_OPTIONAL_LOCKS: "0" };
-    const run = (args: string[], input?: Buffer) => this.runGitAsRunnerBytes(cwd, args,
-      { env, maxBuffer: bounds.maxBytes, ...(input ? { input } : {}) });
+    const maxContentBytes = bounds.maxContentBytes ?? INVENTORY_CONTENT_PROOF_BOUNDS.maxContentBytes;
     try {
+      const pinned = await this.pinnedInventoryGit(cwd, bounds);
+      if (!pinned) return "unreadable";
+      const run = pinned;
       const status = await run(["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+      if (!status) return "unreadable";
       if (status.exceeded) return "over_bound";
       if (status.code !== 0 || status.stderr.length > 0) return "unreadable";
       if (status.stdout.length > 0) return "dirty";
       const flags = await run(["ls-files", "-v", "-z"]);
+      if (!flags) return "unreadable";
       if (flags.exceeded) return "over_bound";
       if (flags.code !== 0 || flags.stderr.length > 0) return "unreadable";
-      const staged = await run(["ls-files", "-s", "-z"]);
+      const staged = await run(["ls-files", "-z", "--format=%(objectmode) %(objectname) %(stage) %(objectsize)%x09%(path)"]);
+      if (!staged) return "unreadable";
       if (staged.exceeded) return "over_bound";
       if (staged.code !== 0 || staged.stderr.length > 0) return "unreadable";
       const tagged = splitNulRecords(flags.stdout), records = splitNulRecords(staged.stdout);
@@ -15269,24 +15284,30 @@ try {
       if (records.length > bounds.maxEntries) return "over_bound";
       if (tagged.some(r => r.length < 3 || r[0] !== 0x48 || r[1] !== 0x20)) return "unreadable";
       const files: Array<{ path: Buffer; oid: string }> = [];
+      let contentBytes = 0;
       for (const record of records) {
         const tab = record.indexOf(0x09);
-        const header = /^(\d{6}) ([0-9a-f]{40}|[0-9a-f]{64}) (\d)$/.exec(tab < 0 ? "" : record.subarray(0, tab).toString("latin1"));
+        const header = /^(\d{6}) ([0-9a-f]{40}|[0-9a-f]{64}) (\d) (\d{1,15}|-)$/.exec(tab < 0 ? "" : record.subarray(0, tab).toString("latin1"));
         const entryPath = tab < 0 ? undefined : record.subarray(tab + 1);
         if (!header || !entryPath || entryPath.length === 0 || header[3] !== "0") return "unreadable";
         if (header[1] === "120000") continue;
         if (header[1] !== "100644" && header[1] !== "100755") return "unreadable";
+        if (header[4] === "-") return "unreadable";
         if (entryPath.includes(0x0a) || entryPath[0] === 0x22 || entryPath[entryPath.length - 1] === 0x0d) return "unreadable";
+        contentBytes += Number(header[4]);
         files.push({ path: entryPath, oid: header[2]! });
       }
+      // Decided from the index sizes BEFORE any byte is hashed. A worktree size that differs from the index is dirty via status.
+      if (contentBytes > maxContentBytes) return "over_bound";
       if (files.length === 0) return "clean";
       const format = await run(["rev-parse", "--show-object-format"]);
-      if (format.code !== 0 || format.stderr.length > 0) return "unreadable";
+      if (!format || format.code !== 0 || format.stderr.length > 0) return "unreadable";
       const idLength = { sha1: 40, sha256: 64 }[format.stdout.toString("latin1").trim() as "sha1" | "sha256"];
       if (idLength === undefined || files.some(f => f.oid.length !== idLength)) return "unreadable";
-      // Bounded by construction: the path bytes are a subset of the `ls-files -s` output already held to maxBytes.
+      // The path bytes are a subset of the `ls-files` output already held to maxBytes.
       const input = Buffer.concat(files.flatMap(f => [f.path, Buffer.from("\n")]));
       const hashed = await run(["hash-object", "--no-filters", "--stdin-paths"], input);
+      if (!hashed) return "unreadable";
       if (hashed.exceeded) return "over_bound";
       if (hashed.code !== 0 || hashed.stderr.length > 0) return "unreadable";
       const text = hashed.stdout.toString("latin1");
@@ -15304,24 +15325,55 @@ try {
   }
 
   /**
+   * One git call of the inventory proofs, or undefined when it must not run: `<cwd>/.git` is not a real directory
+   * (a gitfile or symlink could redirect the repository), or the caller's deadline has passed. Every call names
+   * `--git-dir` and `--work-tree` explicitly, so an agent-writable `core.worktree` cannot redirect status or the
+   * listings, and gets a timeout clipped to the caller's deadline.
+   */
+  private async pinnedInventoryGit(cwd: string, bounds: InventoryContentProofBounds) {
+    const gitDir = path.join(cwd, ".git");
+    const st = await fs.lstat(gitDir);
+    if (!st.isDirectory() || st.isSymbolicLink()) return undefined;
+    return async (args: string[], input?: Buffer) => {
+      const remaining = bounds.deadlineAt === undefined ? Infinity : bounds.deadlineAt - Date.now();
+      if (remaining <= 0) return undefined;
+      return this.runGitAsRunnerBytes(cwd, [`--git-dir=${gitDir}`, `--work-tree=${cwd}`, ...args], {
+        env: { GIT_OPTIONAL_LOCKS: "0" }, maxBuffer: bounds.maxBytes,
+        timeoutMs: Math.min(INVENTORY_PROOF_CALL_TIMEOUT_MS, remaining), ...(input ? { input } : {}),
+      });
+    };
+  }
+
+  /**
    * Predecessor-only loss boundary (issue #2969 D6): whether the clone holds ignored files outside `.uzi/scratch/`
    * (a build directory, `node_modules`, a log). A `:(exclude)` pathspec does not remove a collapsed `--directory`
    * entry (verified on git 2.54: `.uzi/scratch/` and an ignored `.uzi/` are still listed), so two listings run: the
-   * first lists everything outside `.uzi` collapsed to directories, where the single collapsed entry `.uzi/` (the
-   * directory is ignored as a whole) is not itself residue; the second lists `.uzi` file by file without
-   * `.uzi/scratch`. Any other entry, any stderr or a non-zero exit is `residue`; a cap hit is `over_bound`. No allowlist.
+   * first lists everything outside `.uzi` collapsed to directories, where only the single collapsed entry `.uzi/`
+   * (the directory is ignored as a whole) is not residue; the second lists `.uzi` file by file without
+   * `.uzi/scratch` and accepts nothing. An existing `.uzi/.git` (a nested repository hides its content from both)
+   * is residue. Any other entry, any stderr or a non-zero exit is `residue`; a cap hit is `over_bound`. No allowlist.
    */
   async inventoryIgnoredResidue(cwd: string, bounds: InventoryContentProofBounds = INVENTORY_CONTENT_PROOF_BOUNDS):
     Promise<"clean" | "residue" | "over_bound"> {
     const listing = ["ls-files", "-z", "--others", "--ignored", "--exclude-standard"];
     try {
-      for (const pathspec of [["--directory", "--", ".", ":(exclude).uzi"], ["--", ".uzi", ":(exclude).uzi/scratch"]]) {
-        const out = await this.runGitAsRunnerBytes(cwd, [...listing, ...pathspec],
-          { env: { GIT_OPTIONAL_LOCKS: "0" }, maxBuffer: bounds.maxBytes });
+      const run = await this.pinnedInventoryGit(cwd, bounds);
+      if (!run) return "residue";
+      if (await fs.lstat(path.join(cwd, ".uzi", ".git")).then(() => true, (err: NodeJS.ErrnoException) => {
+        if (err.code === "ENOENT" || err.code === "ENOTDIR") return false;
+        throw err;
+      })) return "residue";
+      const passes: Array<{ pathspec: string[]; allowed: boolean }> = [
+        { pathspec: ["--directory", "--no-empty-directory", "--", ".", ":(exclude).uzi"], allowed: true },
+        { pathspec: ["--", ".uzi", ":(exclude).uzi/scratch"], allowed: false },
+      ];
+      for (const { pathspec, allowed } of passes) {
+        const out = await run([...listing, ...pathspec]);
+        if (!out) return "residue";
         if (out.exceeded) return "over_bound";
         if (out.code !== 0 || out.stderr.length > 0) return "residue";
         const entries = splitNulRecords(out.stdout);
-        if (!entries || entries.some(entry => !entry.equals(UZI_DIR_ENTRY))) return "residue";
+        if (!entries || entries.some(entry => !(allowed && entry.equals(UZI_DIR_ENTRY)))) return "residue";
       }
       return "clean";
     } catch (err) {
@@ -20051,7 +20103,7 @@ try {
       if (e.outputExceeded === true || e.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER")
         return { code: -1, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), exceeded: true };
       if (typeof e.code === "number" && e.code !== 0)
-        return { code: e.code, stdout: Buffer.alloc(0), stderr: Buffer.from(typeof e.stderr === "string" ? e.stderr : "") };
+        return { code: e.code, stdout: Buffer.alloc(0), stderr: Buffer.isBuffer(e.stderr) ? e.stderr : Buffer.from(typeof e.stderr === "string" ? e.stderr : "") };
       throw this.runnerGitFailure(err, args);
     }
   }
@@ -23563,11 +23615,14 @@ const RUNNER_GIT_MARKED_SUBCOMMANDS: ReadonlySet<string> = new Set([
 const RUNNER_GIT_NO_PROTOCOL = "none";
 
 /** The argv index of a git subcommand: the first index past any leading `-c key=value` pairs
- *  (which may be `args.length`, i.e. past the end, when nothing follows them). */
+ *  and the `--git-dir=`/`--work-tree=` pins (which may be `args.length`, i.e. past the end, when nothing follows them). */
 function firstRunnerGitSubcommandIndex(args: readonly string[]): number {
   let i = 0;
-  while (args[i] === "-c" && i + 1 < args.length) i += 2;
-  return i;
+  for (;;) {
+    if (args[i] === "-c" && i + 1 < args.length) i += 2;
+    else if (args[i]?.startsWith("--git-dir=") || args[i]?.startsWith("--work-tree=")) i += 1;
+    else return i;
+  }
 }
 
 /** The subcommand of a git argv (leading `-c key=value` pairs skipped), or undefined. */
