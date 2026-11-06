@@ -262,6 +262,8 @@ interface DriveOptions {
   /** Runs before / after the real retry wait of the window. */
   onWait?: (flight: any, runner: RunRunner, n: number, deadline: number) => void;
   afterWait?: (flight: any, runner: RunRunner, n: number, deadline: number) => void;
+  /** The runner's recoveryRetryMs (default 1). */
+  recoveryRetryMs?: number;
 }
 async function freedPort(): Promise<number> {
   const server = net.createServer();
@@ -288,6 +290,7 @@ async function drive(options: DriveOptions = {}) {
   let faults = 0, models = 0, prepares = 0, reserves = 0, reservesAfterHandoff = 0;
   let windowGets = 0, windowWaits = 0, armed = false, warnAtArm = 0, deadline = 0;
   const modelRuns: Array<{ cwd: string }> = [];
+  const windowWaitMs: unknown[] = [];
   let closed = false, depth = 0, armedDepth = -1;
   const inWindow = () => armed && !closed && models === 0 && warnings() === warnAtArm;
   const operation = git.withRecoveryOperation.bind(git);
@@ -371,11 +374,12 @@ async function drive(options: DriveOptions = {}) {
     };
   };
   const runner = runnerWith(() => ({ executor: executor() as never }), fakeGitlab().gitlab, undefined, log.logger,
-    { recoveryRetryMs: 1 });
+    { recoveryRetryMs: options.recoveryRetryMs ?? 1 });
   const wait = (runner as unknown as Hooked).waitRecoveryRetry.bind(runner);
   (runner as unknown as Hooked).waitRecoveryRetry = async (flight: any, ...rest: unknown[]) => {
     if (!inWindow()) return wait(flight, ...rest);
     const n = ++windowWaits;
+    windowWaitMs.push(rest[1]);
     options.onWait?.(flight, runner, n, deadline);
     try { return await wait(flight, ...rest); } finally { options.afterWait?.(flight, runner, n, deadline); }
   };
@@ -388,6 +392,7 @@ async function drive(options: DriveOptions = {}) {
     get successor() { return successor; },
     get windowGets() { return windowGets; },
     get windowWaits() { return windowWaits; },
+    get windowWaitMs() { return windowWaitMs; },
     get deadline() { return deadline; },
     models: () => models, prepares: () => prepares, reserves: () => reserves,
     reservesAfterHandoff: () => reservesAfterHandoff, modelRuns,
@@ -519,9 +524,10 @@ it("control: a deadline that expires during the wait refuses the next read befor
 });
 
 it("control: five transient failures exhaust the attempt cap and end as today's adoption_failed park", async () => {
-  const r = await drive({ script: Array<Fault>(5).fill("econnreset") });
-  assert.equal(r.windowGets, 5, "the sixth read (which the fixture would serve) is never made");
+  const r = await drive({ script: Array<Fault>(5).fill("econnreset"), recoveryRetryMs: 3 });
+  assert.equal(r.windowGets, 5, "no sixth ownership read inside the post-adoption retry window");
   assert.equal(r.windowWaits, 4);
+  assert.deepEqual(r.windowWaitMs, [1, 2, 4, 8].map(f => f * 3), "the backoff doubles from recoveryRetryMs");
   assert.equal(r.retryLogs().length, 4);
   assert.deepEqual(r.retryLogs().map(line => line.attempt), [1, 2, 3, 4]);
   assert.equal(r.models(), 0);
