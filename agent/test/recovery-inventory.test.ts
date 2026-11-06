@@ -1,4 +1,4 @@
-import { CredentialSwitchSignal } from "../src/steering.js";
+import { CredentialSwitchSignal, SteeringChannel } from "../src/steering.js";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { Readable } from "node:stream";
@@ -7,7 +7,7 @@ import { it } from "node:test";
 import type { ProcessQuiescence, QuiesceRunRequest, QuiesceRunOutcome } from "../src/run-quiescence.js";
 import { RunRunner } from "../src/runner.js";
 import { prepareFrozenHeld, type HeldGit } from "../src/frozen-held.js";
-import { RequestError } from "../src/client.js";
+import { RequestError, type WorkerClient } from "../src/client.js";
 import type { RecoveryExactHold, RecoveryFinalDisposition, RecoveryReserveRequest } from "../src/protocol.js";
 import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
@@ -5901,8 +5901,9 @@ async function issue3561RunnerCase(route: "terminal settlement" | "retained capt
       inventoryArchiveNotices: new Set(), ciConfigGuardGlobs: [], publishedRealTips: [],
       runLog: f.log, executor: { sandboxesCommands: false }, cancel: new AbortController(),
       cancellationBudget: budget, preserveRecoveryClone: true, preserveSession: true,
-      steering: { lifecycleSignal: () => signal, terminalLifecycleSignal: () => signal, claimFence: () => undefined,
-        isCancelled: () => false, pendingCredentialSwitch: () => undefined },
+      steering: Object.assign(new SteeringChannel({} as WorkerClient, f.context.runId, 1, nullLogger(), new AbortController()), {
+        lifecycleSignal: () => signal, terminalLifecycleSignal: () => signal, claimFence: () => undefined,
+        isCancelled: () => false, pendingCredentialSwitch: () => undefined }),
       batcher: { emit() {} },
     };
     await fs.mkdir(flight.worktreePath); await fs.writeFile(path.join(flight.worktreePath, "source.txt"), "kept source");

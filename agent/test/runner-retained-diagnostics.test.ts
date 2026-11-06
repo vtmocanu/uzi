@@ -538,7 +538,10 @@ it("control: five transient failures exhaust the attempt cap and end as today's 
 
 const interruptions = ["cancel", "pause now", "pause wall", "disk", "switch", "shutdown"] as const;
 for (const kind of interruptions) {
-  it("control: " + kind + " during the retry wait ends the retry with no further read, park or model", async () => {
+  const outcome = kind === "pause now"
+    ? "completes ownership confirmation before pause settlement"
+    : "ends the retry with no further read, park or model";
+  it("control: " + kind + " during the retry wait " + outcome, async () => {
     const r = await drive({
       script: [503],
       onWait: (flight, runner) => {
@@ -552,7 +555,8 @@ for (const kind of interruptions) {
       },
     });
     assert.equal(r.windowWaits, 1);
-    assert.equal(r.windowGets, 1, "no read after the interruption");
+    // #3995 defers owner-now during retained recovery; the transient ownership read completes.
+    assert.equal(r.windowGets, kind === "pause now" ? 2 : 1, "only the deferred owner pause allows the retry");
     assert.equal(r.models(), 0);
     assert.equal(r.warnings().length, 0, "runtime stop sentinels bypass operational warnings");
     assert.deepEqual(r.parks(), []);
