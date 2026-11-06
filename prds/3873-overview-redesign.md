@@ -9,7 +9,7 @@
 | PRD | Outcome | Blocked by |
 |---|---|---|
 | #3878 (`prds/done/3878-overview-preview-decisions.md`) | The new Overview at `/overview/next`: header with status sentence and health chip, banners under the header, Needs your decision, runs grouped Yours / Other users (admin) | none |
-| #3879 (`prds/3879-overview-issue-line.md`) | The issue-work line, filtering the runs widget | #3878 |
+| #3879 (`prds/done/3879-overview-issue-line.md`) | The issue-work line, filtering the runs widget | #3878 |
 | #3880 (`prds/done/3880-overview-capacity-held-work.md`) | Capacity rail and Held work; retires the worker-load card and custody banner on the preview | #3878 |
 | #3881 (`prds/3881-overview-usage-by-user.md`) | Usage card with the You / Factory toggle and the admin by-user table | #3878 |
 | #3875 (`prds/3875-command-menu.md`) | The Cmd K command menu | #3878, #3880 |

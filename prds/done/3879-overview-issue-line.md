@@ -1,6 +1,6 @@
 # PRD #3879: Overview preview, the issue-work line
 
-**Status**: Ready for dispatch. Child of epic #3873. Its blocker #3878 (the preview page, its data hook and the Runs widget) landed in PR #3952; #3880 (capacity rail and held work) landed in PR #3971.
+**Status**: Done (2026-11-06). Child of epic #3873. Built on #3878 (PR #3952) and #3880 (PR #3971). Both milestones delivered; screenshots in `prds/mockups/3879/`.
 
 **Design brief**: `prds/3873-overview-redesign.md` (model-fidelity rules, data readiness, reuse map, constraints, mock contract). This PRD wins where it is more specific.
 
@@ -80,3 +80,8 @@ Acceptance: filter tests; keyboard operable; mock parity for the pressed state.
 - **Unknown non-terminal statuses fall back to Building**: a new status must never hide a run. Rejected: dropping unknown runs.
 - **Tones reuse `RUN_STATUS_TONES`**, so all five themes work without new tokens.
 - **Pickup refresh (2026-11-06)**: anchors rechecked on `main` after #3878 and #3880 landed; `parkDisposition` and `openPrs` live in `web/src/lib/overview.ts`; the cooldown helper moved to `runBadge.ts:537`. No scope change.
+- **Parked bay shows disposition and reason, not a countdown** (2026-11-06, mock deviation): park causes have no single reliable reset time, and the brief asks for the reason; the reason is `parkLabel`, the wording the run pill already uses, so no second reason table exists.
+- **PR open carries "PR state as last seen by uzi"** (2026-11-06, mock deviation; brief Run populations): `mr_state` is a cached hint, so the station says so above "Not counted as active".
+- **Badges cap at 12 plus "+N"** (2026-11-06, mock deviation): an owner with dozens of open PRs would otherwise grow the station without bound. Badges show only the issue number, so runs on different repos can share a number.
+- **Asking bay and Runs scope label read "Questions" when another user's question is counted** (2026-11-06): the whose-wait rule applies to the bay title as well as its caption.
+- **A filtered Runs list ignores the last good admin rows after a failed admin read** (2026-11-06): the line has no other users' runs in that state, so the widget must not either; the unavailable notice still shows.
