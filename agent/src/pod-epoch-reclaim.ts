@@ -6,11 +6,38 @@ import { basename } from "node:path";
 import { MaintenanceBudget } from "./maintenance-budget.js";
 import type { inspectPodEpochBootstrap } from "./pod-epoch-bootstrap.js";
 import type { PodEpochOwnership } from "./pod-epoch-lock.js";
+import type { PodEpochReclaimScope } from "../templates/pod-epoch-init.cjs";
+import type { AuthorityRuntime } from "./authority-runtime.js";
+import { isRunOwnershipLost } from "./client.js";
 import { parsePodEpochEvidence, assertPodEpochEvidenceBinding } from "./pod-epoch-evidence.js";
 import { openPodEpochDaemonBarrier, PodEpochDaemonError, type PodEpochDaemonGuard } from "./pod-epoch-daemon.js";
-import type { GitCache, RetainedHoldsSnapshot, RetainedLifecycleSnapshot } from "./git.js";
+import type { GitCache, RetainedDiscardResult, RetainedHoldsSnapshot, RetainedLifecycleSnapshot, RetainedSourceSelector } from "./git.js";
 import type { RecoveryHoldsResponse, RunOwnershipResponse } from "./protocol.js";
 
+/**
+ * Activation gate for the M1b deletion phase. While it is false, production startup is shadow-only: no proof is
+ * created and nothing is mutated, whatever deletion dependencies the caller supplies. Flipping it needs the R9
+ * owner co-sign recorded in PRD #3431.
+ *
+ * Test-only override: the deletion phase also runs when `deletion.enableForTest` is exactly the sentinel
+ * below, which agent/test/pod-epoch-reclaim-support.ts exports as `ENABLE_DELETION_FOR_TEST`. Nothing under
+ * agent/src passes `enableForTest` (a test asserts it), so production can only run deletion through this flag.
+ */
+export const EPOCH_RECLAIM_DELETION_ENABLED: boolean = false;
+const TEST_ENABLE_DELETION = Symbol.for("uzi.test.pod-epoch-reclaim.enable-deletion");
+
+/** What the deletion phase needs; absent means the pass stays shadow-only whatever the gate says. */
+export interface PodEpochDeletionDeps {
+  /** The worker's authority runtime: one transaction A per source, ended with endSourceUse after a takeover. */
+  authority: Pick<AuthorityRuntime, "withTransaction" | "active" | "endSourceUse">;
+  /** Bound to RunRunner.withSourceReservation; resolves undefined when the reservation is refused. */
+  reserve<T>(runId: string, action: (eligible: () => boolean) => Promise<T>): Promise<T | undefined>;
+  /** Deny-only capture-mode quiescence over the source paths (bound to terminalMaintenanceProof). */
+  quiesce: (paths: string[]) => Promise<boolean>;
+  git: Pick<GitCache, "createEpochDiscardProof" | "discardStoppedSource" | "readEpochJournalVector">;
+  /** Test override sentinel only; see {@link EPOCH_RECLAIM_DELETION_ENABLED}. */
+  enableForTest?: symbol;
+}
 type Schedule = (callback: () => void, milliseconds: number) => () => void;
 interface Options {
   bootstrap: ReturnType<typeof inspectPodEpochBootstrap>;
@@ -29,9 +56,17 @@ interface Options {
   readEvidence?: (path: string, signal: AbortSignal) => Promise<Uint8Array | string>;
   /** Kernel release observation; defaults to the OS release. Read once, on the v2 path only. */
   kernelRelease?: () => string;
+  /** M1b deletion dependencies; used only while the activation gate is open. */
+  deletion?: PodEpochDeletionDeps;
 }
 type Basis = "discard" | "strict_plain";
 interface Candidate { run_id: string; path: string; bytes: number; presence: "present" | "missing"; basis: Basis }
+/** Private per-candidate evidence the deletion phase re-verifies; never logged. */
+interface Admit {
+  clonePath: string; barePath: string; selector: RetainedSourceSelector; branch: string;
+  kind: "attempt" | "canonical" | "protected"; descriptor: string; presence: "present" | "missing";
+  protectedDiscard: boolean; parts: number; groupSize: number; bytes: number;
+}
 // Exact crio-crun kernel releases covered by the PRD #3430 audit. Any other release defers
 // with kernel_unaudited; refreshing this list needs a reviewed PRD #3430 audit addendum.
 const AUDITED_CRIO_KERNELS: readonly string[] = ["6.12.0-243.el10.x86_64", "6.12.0-243.el10.aarch64"];
@@ -63,6 +98,22 @@ interface Verdict {
   evidence_wait_ms: number;
   pass_ms: number;
   settlement_reserve_ms: number;
+  /** M1b deletion counters (all zero while the phase does not run). Sources positively removed, and their
+   *  shadow-measured allocated bytes. */
+  deleted: number;
+  deleted_bytes: number;
+  /** Missing sources settled by metadata only (no bytes). */
+  settled: number;
+  /** A source kept before any effect: a coordinator refusal, a failed fresh recheck or a refused reservation. */
+  kept_after_refusal: number;
+  /** A settled delete failure (residue): the slot stays retiring + settled_failed for the next epoch. */
+  kept_residue: number;
+  /** Structural keeps, which never downgrade the verdict. */
+  kept_protected: number;
+  kept_unrecoverable_shape: number;
+  /** "measured" once the phase ran (deleted_bytes sums measured shadow bytes of sources positively removed);
+   *  "unknown" when it did not run. */
+  reclaim_bytes_state: "measured" | "unknown";
 }
 /** Fatal startup refusal. The caller must exit without admitting a worker or releasing EX. */
 export class PodEpochSettlementError extends Error {
@@ -107,6 +158,33 @@ function holdsSnapshot(response: RecoveryHoldsResponse, runId: string): Retained
 // Use the operator channel's run-ID alphabet and length bound, with an explicit
 // end-of-input assertion before metadata can become an HTTP path component.
 const RUN_ID_RE = /^[A-Za-z0-9_-]{1,160}(?![\s\S])/;
+/** Deletion-side zero-hold rule: an empty `holds` list AND a matching run-wide count of exactly zero. An absent,
+ *  mismatched or non-zero `run_open_holds` is unknown for deletion. The shadow keeps {@link holdsSnapshot}.
+ *  Consequence: the api reads the PREDECESSOR pod's stored worker capabilities and this pass runs before the
+ *  successor registers, so the first roll onto an image that advertises recovery_run_open_holds_v1 gets no
+ *  count and keeps every source. */
+function deletionZeroHolds(response: RecoveryHoldsResponse, runId: string): boolean {
+  const open = response?.run_open_holds;
+  return holdsSnapshot(response, runId).state === "read" && response.holds.length === 0 &&
+    !!open && typeof open === "object" && open.run_id === runId && open.count === 0;
+}
+/** The exact strict journal the epoch proof accepts, or the explicit empty-journal repair; anything else
+ *  (no key, a valueless key, duplicates, extra fields) is an unrecoverable shape. */
+function journalShape(vector: ReadonlyArray<string | null>, selector: RetainedSourceSelector, clonePath: string):
+    string | readonly string[] | undefined {
+  if (vector.length !== 1) return undefined;
+  const raw = vector[0];
+  if (raw === "") return [""];
+  if (typeof raw !== "string") return undefined;
+  try {
+    const journal = JSON.parse(raw) as Record<string, unknown> | null;
+    if (!journal || typeof journal !== "object" || Array.isArray(journal)) return undefined;
+    if (JSON.stringify(Object.keys(journal).sort()) !== JSON.stringify(["attemptId", "clonePath", "runId"]) ||
+        journal.runId !== selector.runId || journal.clonePath !== clonePath ||
+        journal.attemptId !== selector.attempt || JSON.stringify(journal) !== raw) return undefined;
+    return raw;
+  } catch { return undefined; }
+}
 const safe = (value: string) => value.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 160);
 
 /** Read-only, first-process shadow pass. Durable consumption is performed by main.
@@ -131,7 +209,19 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
     authority: { result: "unproven", reason: "not_evaluated" }, evidence_version: null,
     list: [], list_overflow: 0, inventory_overflow: 0, inventory_overflow_exact: false,
     inventory_complete: false, bytes_state: "unknown", evidence_wait_ms: 0, pass_ms: 0,
-    settlement_reserve_ms: 5000,
+    settlement_reserve_ms: 5000, deleted: 0, deleted_bytes: 0, settled: 0, kept_after_refusal: 0, kept_residue: 0,
+    kept_protected: 0, kept_unrecoverable_shape: 0, reclaim_bytes_state: "unknown",
+  };
+  // Set once the deletion phase opened its reclaim scope; settled and finished before native handover.
+  let reclaimScope: PodEpochReclaimScope | undefined;
+  const finishReclaimScope = () => {
+    const scope = reclaimScope;
+    if (!scope) return;
+    try {
+      if (scope.stopped() || scope.pendingMutations > 0) throw new Error("reclaim unsettled");
+      scope.finish();
+      reclaimScope = undefined;
+    } catch { fatal = true; throw new PodEpochSettlementError(); }
   };
   let decided = false;
   const decide = (outcome: Verdict["authority"]["result"], reason: string) => {
@@ -141,6 +231,8 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
   // inspected source in which it is not a candidate, or by a group refused for its run ID, is
   // demoted to kept and cannot be re-added.
   const candidates = new Map<string, Candidate>();
+  // The deletion phase's private evidence for each candidate path; kept in lockstep with `candidates`.
+  const admits = new Map<string, Admit>();
   const refused = new Set<string>();
   // Paths whose source was a marker-less canonical plain journal carrying extra fields (report-only).
   const extraFieldPaths = new Set<string>();
@@ -298,7 +390,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
       if (typeof group.selector.runId !== "string" || !RUN_ID_RE.test(group.selector.runId)) {
         countPartialCause(result.partial_causes, "selector_refused");
         partial = true;
-        for (const path of group.paths) { candidates.delete(path); refused.add(path); }
+        for (const path of group.paths) { candidates.delete(path); admits.delete(path); refused.add(path); }
         continue;
       }
       let holds: RetainedHoldsSnapshot = { state: "unknown" };
@@ -315,7 +407,15 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
         readStage = "holds";
         holds = holdsSnapshot(await owned(() => MaintenanceBudget.runOwned(controller.signal,
           () => options.client.listRecoveryHolds(group.selector.runId, controller.signal)), hardPass), group.selector.runId);
-      } catch (error) { if (fatal || controller.signal.aborted) throw error; countPartialCause(result.partial_causes, readFailureCause(readStage, error)); partial = true; }
+      } catch (error) {
+        if (fatal || controller.signal.aborted) throw error;
+        // A DEFINITIVE exact ownership 404 for this run keeps only this group's sources (lifecycle and holds
+        // stay unknown, so none is a candidate): no holds read, no authority, not counted as partial. Every
+        // other failure, including a 404 with any other body, still makes the whole pass partial.
+        if (!(readStage === "ownership" && isRunOwnershipLost(error, group.selector.runId))) {
+          countPartialCause(result.partial_causes, readFailureCause(readStage, error)); partial = true;
+        }
+      }
       const expected = new Set(group.paths);
       const inspected = await owned(() => options.git.inspectRetainedSources({
         epoch: true, maxDescriptors: 200, maxPhysicalPaths: expected.size,
@@ -358,8 +458,14 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
           const previous = candidates.get(part.clonePath);
           if (!candidate || refused.has(part.clonePath) || (previous && (previous.presence !== candidate.presence || previous.run_id !== candidate.run_id ||
               previous.basis !== candidate.basis || previous.bytes !== candidate.bytes))) {
-            candidates.delete(part.clonePath); refused.add(part.clonePath);
-          } else candidates.set(part.clonePath, candidate);
+            candidates.delete(part.clonePath); admits.delete(part.clonePath); refused.add(part.clonePath);
+          } else {
+            candidates.set(part.clonePath, candidate);
+            admits.set(part.clonePath, { clonePath: part.clonePath, barePath: group.barePath, selector: group.selector,
+              branch: source.branch, kind: source.kind, descriptor: source.descriptor, presence: candidate.presence,
+              protectedDiscard: source.disposition?.kind === "local_protected_discard",
+              parts: source.sources.length, groupSize: group.paths.length, bytes: candidate.bytes });
+          }
         }
       }
     }
@@ -369,6 +475,129 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
     result.reason = partial ? "inventory_partial" : "shadow_complete";
     result.bytes_state = measured.size === examined.size && !partial ? "measured" :
       measured.size ? "partial" : "unknown";
+
+    // ---- M1b deletion phase. Shadow counters and the verdict above are final; this only reclaims. ----
+    // Runs only when ALL hold: the activation gate (or the test override), a shadow verdict of "eligible" with
+    // attested authority, an intact pass (not invalidated, aborted or soft-stopped), a native reclaim scope on
+    // the ownership, and the deletion dependencies. Anything less stays shadow-only and mutates nothing.
+    const deps = options.deletion;
+    if (deps && (EPOCH_RECLAIM_DELETION_ENABLED || deps.enableForTest === TEST_ENABLE_DELETION) &&
+        result.verdict === "eligible" && result.authority.result === "attested" &&
+        !invalid && !controller.signal.aborted && typeof ownership.beginReclaim === "function" && admits.size > 0) {
+      const scope = ownership.beginReclaim();
+      reclaimScope = scope;
+      // Pending children or a stop latch are never settled by a later step: fail closed with EX kept.
+      const assertSettled = () => {
+        if (scope.stopped() || scope.pendingMutations > 0) { fatal = true; throw new PodEpochSettlementError(); }
+      };
+      const deadlineAt = () => Date.now() + Math.max(0, hardPass - 5000 - now());
+      // Fresh lifecycle then holds; undefined keeps the source. Never throws: a failed, aborted or
+      // non-definitive read is a keep (bounded by the pass signal and deadline).
+      const readAuthority = async (runId: string) => {
+        try {
+          const row = await MaintenanceBudget.runOwned(controller.signal, () => options.client.getRunOwnership(runId, {
+            signal: controller.signal, deadline: hardPass - 5000 }));
+          if (!row || !(row.status === "completed" || row.status === "failed" || row.status === "cancelled")) return undefined;
+          const response = await MaintenanceBudget.runOwned(controller.signal,
+            () => options.client.listRecoveryHolds(runId, controller.signal));
+          if (!deletionZeroHolds(response, runId)) return undefined;
+          return { lifecycle: { state: "terminal", status: row.status } as RetainedLifecycleSnapshot,
+            holds: { state: "read", holds: [] } as RetainedHoldsSnapshot };
+        } catch { return undefined; }
+      };
+      let downgraded = false, skipped = false;
+      const refusal = () => { result.kept_after_refusal++; downgraded = true; };
+      // Admitted candidates are processed serially, each to a settled outcome before the next starts.
+      for (const [clonePath, admit] of admits) {
+        const candidate = candidates.get(clonePath);
+        if (!candidate) continue;
+        // No new source after shutdown or the soft stop.
+        if (controller.signal.aborted) { skipped = true; break; }
+        // Structural keeps are refused before any authority read or proof, and never downgrade the verdict.
+        if (admit.protectedDiscard) { result.kept_protected++; continue; }
+        if (admit.kind !== "attempt" || admit.parts !== 1 || admit.groupSize !== 1) { result.kept_unrecoverable_shape++; continue; }
+        const runId = admit.selector.runId;
+        let step: { result: RetainedDiscardResult } | "keep" | "shape" | undefined;
+        let effects = false;
+        try {
+          // 2. fresh lifecycle and holds with the deletion-side zero rule.
+          const first = await owned(() => readAuthority(runId), hardPass, true);
+          if (!first) { refusal(); if (controller.signal.aborted) { skipped = true; break; } continue; }
+          // 3. entry and daemon health, then re-inspect this source: it must still be the same candidate.
+          check(); entry();
+          const inspected = await owned(() => options.git.inspectRetainedSources({
+            epoch: true, maxDescriptors: 200, maxPhysicalPaths: admit.groupSize, barePath: admit.barePath,
+            selector: admit.selector, holds: first.holds, lifecycle: first.lifecycle, isLivePath: () => false,
+            signal: controller.signal, deadline: hardPass - 5000, budgetMs: Math.max(0, hardPass - 5000 - now()), now,
+            beforeTree: path => { check(); entry(); if (path !== admit.clonePath) throw new Refusal("path_set_changed"); },
+          }), hardPass, true);
+          check(); entry();
+          const only = inspected.sources.length === 1 ? inspected.sources[0]! : undefined;
+          const plain = only?.disposition?.kind === "local_discard" || only?.epochSettlement?.disposition.kind === "local_discard";
+          if (!only || inspected.partial || inspected.unreadable !== 0 || only.runId !== runId || only.barePath !== admit.barePath ||
+              only.kind !== "attempt" || only.descriptor !== admit.descriptor || only.presence !== admit.presence ||
+              only.sources.length !== 1 || only.sources[0]!.clonePath !== clonePath || only.sources[0]!.live ||
+              only.localRecords.length !== 0 || only.holds.state !== "read" || only.holds.ids.length !== 0 || !plain) {
+            refusal(); continue;
+          }
+          // 4. the raw journal must be the exact strict three-key string or the explicit `[""]` repair; a no-key
+          //    attempt is an unrecoverable shape, refused before any proof exists.
+          const raw = journalShape(await owned(() => deps.git.readEpochJournalVector(admit.barePath, admit.branch),
+            hardPass, true), admit.selector, clonePath);
+          if (raw === undefined) { step = "shape"; }
+          else {
+            // 5. one authority transaction A, the run's source reservation S inside it, B only inside the discard.
+            step = await owned(() => deps.authority.withTransaction(tx => deps.reserve(runId, async eligible => {
+              if (!eligible() || controller.signal.aborted) return "keep" as const;
+              // Fresh authority reads inside the reservation: the proof's lifecycle and holds come from here.
+              const fresh = await readAuthority(runId);
+              if (!fresh) return "keep" as const;
+              check(); entry();
+              const live = () => {
+                if (!eligible() || deps.authority.active() !== tx) throw new Error("reservation or transaction lost");
+                check();
+              };
+              const proof = deps.git.createEpochDiscardProof({
+                decision: { eligible: true, attested: true }, scope, selector: admit.selector, barePath: admit.barePath,
+                paths: [clonePath], confirm: only.descriptor, expectedRawJournal: raw, checkLive: live,
+                beforeEffect: async () => { check(); entry(); }, signal: controller.signal, deadline: deadlineAt(),
+              });
+              effects = true;
+              const discarded = await deps.git.discardStoppedSource({
+                selector: admit.selector, confirm: only.descriptor, holds: fresh.holds, lifecycle: fresh.lifecycle,
+                isLivePath: () => false, quiesce: deps.quiesce, barePath: admit.barePath, epochProof: proof,
+              });
+              if (discarded.tookOver) await deps.authority.endSourceUse([clonePath], { skipFlightOwned: true });
+              return { result: discarded };
+            })), hardPass, true);
+          }
+        } catch (error) {
+          if (error instanceof PodEpochSettlementError) throw error;
+          // After a discard began, a thrown error leaves the outcome unproven: EX is kept.
+          if (effects) { fatal = true; throw new PodEpochSettlementError(); }
+          step = "keep";
+        }
+        // 6. classify only AFTER the reservation and the transaction are released.
+        assertSettled();
+        if (step === "shape") { result.kept_unrecoverable_shape++; continue; }
+        if (step === undefined || step === "keep") { refusal(); if (controller.signal.aborted) { skipped = true; break; } continue; }
+        const outcome = step.result;
+        if (outcome.kind === "done") {
+          const removed = outcome.sources.length === 1 ? outcome.sources[0]!.outcome : undefined;
+          if (removed === "removed") { result.deleted++; result.deleted_bytes += admit.bytes; }
+          else if (removed === "missing") result.settled++;
+          else { fatal = true; throw new PodEpochSettlementError(); }
+        } else if (outcome.kind === "refused") refusal();
+        else if (outcome.kind === "incomplete") { result.kept_residue++; downgraded = true; }
+        else { fatal = true; throw new PodEpochSettlementError(); }
+      }
+      result.reclaim_bytes_state = "measured";
+      if (skipped) {
+        result.verdict = "partial";
+        result.reason = controller.signal.reason instanceof Refusal ? controller.signal.reason.reason : "pass_aborted";
+      } else if (downgraded) { result.verdict = "partial"; result.reason = "reclaim_partial"; }
+      else result.reason = "reclaim_complete";
+    }
   } catch (error) {
     if (error instanceof PodEpochSettlementError) { fatal = true; throw error; }
     result.verdict = controller.signal.aborted ? "partial" : "deferred";
@@ -396,6 +625,9 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
       cancelPass();
       // EX is closed inside native handover. Its bounded 120s SH wait, not owned(),
       // determines success or failure; the caller must not admit until it succeeds.
+      // A reclaim scope must be settled and finished before native handover; a pending child, a stop latch
+      // or a finish() failure keeps EX and refuses admission.
+      if (!fatal) finishReclaimScope();
       if (!fatal && !parent.aborted && ownership.mode === "exclusive")
         await ownership.reacquireShared();
     } finally {

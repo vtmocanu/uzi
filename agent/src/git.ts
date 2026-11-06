@@ -2798,14 +2798,19 @@ export interface RetainedDiscardOptions {
 export type RetainedSourceOutcome = "removed" | "retained" | "missing" | "unknown";
 
 export type RetainedDiscardResult =
-  | { kind: "refused"; reason: string; consumers: string[]; disposition?: RetainedDisposition }
+  | { kind: "refused"; reason: string; consumers: string[]; disposition?: RetainedDisposition; tookOver?: true }
   | {
       /** done: every path is gone and the metadata retired; incomplete: something remains;
        *  unknown: an error or the deadline interrupted the operation (everything not proven gone stays). */
       kind: "done" | "incomplete" | "unknown";
       sources: Array<{ clonePath: string; outcome: RetainedSourceOutcome }>;
       metadata: "retired" | "kept";
+      /** Epoch discards only: see the `refused` member. */
+      tookOver?: true;
     };
+// `tookOver` is set on an epoch discard only, for ANY result kind, once admitSource(..., "discard") succeeded for
+// a source: the discard took over that source's authority slot, so the caller that opened the authority
+// transaction owes the matching endSourceUse. It is never set by an operator discard, and absent means no takeover.
 
 /** The inspect budget (ms), the descriptor cap and the destructive operation deadline (ms). */
 const RETAINED_INSPECT_BUDGET_MS = 5_000;
@@ -13896,6 +13901,7 @@ export class GitCache {
     }
     const outcomes: Array<{ clonePath: string; outcome: RetainedSourceOutcome }> = [];
     let metadata: "retired" | "kept" = "kept";
+    let tookOver = false;
     let epochWork: ReturnType<PodEpochReclaimScope["beginMutation"]> | undefined;
     const wantKinds = mode === "protected" ? ["protected"] : ["attempt", "canonical"];
     // An exact empty-journal proof may name a metadata repair. If its binding
@@ -14016,7 +14022,7 @@ export class GitCache {
               // above (protected-source checks, quiescence, latch) and immediately before the first delete. A refused
               // discard therefore rewrites no durable authority, and a crashed worker's foreign `active` epoch keeps
               // guarding a source this discard never touched. A refusal here (a running pending record, ...) deletes nothing.
-              try { for (const p of rec.parts) await this.admitSource(p.clonePath, "discard"); }
+              try { for (const p of rec.parts) { await this.admitSource(p.clonePath, "discard"); tookOver = true; } }
               catch { return refused("source_use_refused", ["authority"]); }
               if (epoch) {
                 this.checkEpochDiscardLive(epoch);
@@ -14159,7 +14165,19 @@ export class GitCache {
       }
     };
     if (!epoch) return execute();
-    return this.epochRetained.run(this.epochLimits(), () => this.withEpochNativeReads(proof!, execute));
+    return this.epochRetained.run(this.epochLimits(), () => this.withEpochNativeReads(proof!, async () => {
+      const result = await execute();
+      return tookOver ? { ...result, tookOver: true as const } : result;
+    }));
+  }
+
+  /**
+   * Worker epoch reclaim only: the exact valued/valueless raw journal vector for `branch`, read WITHOUT the bare
+   * lock (the discard re-verifies it under the lock, so this is a pre-proof observation, never an authority). A
+   * no-key journal is `[]`, a valueless key is `[null]`, an emptied journal is `[""]`.
+   */
+  readEpochJournalVector(bare: string, branch: string): Promise<Array<string | null>> {
+    return this.epochJournalVector(bare, branch);
   }
 
   /** Exact valued/valueless journal vector; unlike readRecoveryCaptureRaw this preserves empty keys. */
