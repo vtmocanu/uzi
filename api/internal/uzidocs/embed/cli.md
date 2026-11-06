@@ -2931,7 +2931,7 @@ something to say:
 |---|---|---|
 | `HOME` | the server has a fresh worker report of the run's size | the run's HOME and cache size, e.g. `4.2 GiB (cache 3.0 GiB)`; `at least` leads when the size walk was truncated (both numbers are then lower bounds) |
 | `CHECKPOINT` | the run is parked (`limit_wait`, `recovery_wait`, or `paused`) and the worker reported it | whether the checkpoint published for this park contains the run's latest committed work: `contains the latest work`, or `does NOT contain the latest committed work (the worker keeps it)` |
-| `DISK` | the run is parked with cause `data_volume_full` | the [waiting-for-disk-space sentence](run-recovery-wait.md#worker-data-volume-full), the next retry time, and the run's lifetime count of counted disk parks |
+| `DISK` | the run is parked with cause `data_volume_full` | the [waiting-for-disk-space sentence](run-recovery-wait.md#worker-data-volume-full), the timed retry or owner Resume/Cancel guidance (unknown timing labeled separately), and the run's lifetime count of counted disk parks |
 | `EST. TAIL` | a Claude run has usage no result frame covered (an interrupted session) | the [estimated tail](run-cost.md#estimated-tail-of-an-interrupted-session), kept apart from `COST`: `~$1.23 estimated (price-table version) · 1.2M in/34k out · partial: <reasons>`, `<$0.01 estimated` under half a cent, or `cost unknown (unpriced)`; hidden for the all-zero, complete tail |
 
 `CHECKPOINT` shows while the run is actually parked (`limit_wait`,
@@ -2939,16 +2939,35 @@ something to say:
 claim and every `running` report, so a resumed run reports "not reported"
 until its next park, rather than carrying a stale value forward. `uzi run
 list` / `uzi admin runs` append `(waiting for disk space)` to the STATUS
-cell for a `data_volume_full` park, the same pattern as `(waiting for
-vault unlock)`.
+cell for a timed `data_volume_full` park; held parks show `(disk held;
+owner Resume/Cancel)` with no countdown. The CLI, TUI and web distinguish owner-held,
+timed and unknown timing; owner controls require confirmed ownership.
+Default `uzi run wait` and `uzi run logs --follow` stop at a disk owner hold;
+explicit `run wait --until` retains its requested status targets. Timed and
+unknown waits continue following.
 
-A run that **fails** because its worker's data volume stayed full past the
-disk-park cap gets a `FAIL_ORIGIN` row reading `data_volume_full (the
-worker's data volume stayed full after N counted disk parks)` instead of
-the bare enum — see [Worker data volume
-full](run-recovery-wait.md#worker-data-volume-full) for the full park and
-failure behavior, and [`UZI_RUN_DISK_PARK_MAX`](configuration.md#server-api)
-for the cap.
+At the default disk-park allowance, three counted parks are timed and the next
+counted park holds for owner Resume/Cancel (#3969). `0` means unlimited timed
+parks, and preventive parks stay uncounted and timed. Owner Resume queues one
+ordinary attempt without resetting counts or unrelated budgets; admission may
+refuse it and a subsequent counted park reholds. Clients send one bodyless
+`POST /api/runs/{id}/resume` per owner action, without automatic retry. Duplicate
+requests are idempotent for the current hold only: the bodyless request has no
+durable binding to the observed hold, so a delayed duplicate crossing a later
+claim/execution/counted park is not durably fenced. No concrete single-action
+replay has been found. See [Resuming a disk hold](run-recovery-wait.md#resuming-a-disk-hold)
+for wall accounting, rollout and custody boundaries.
+
+An explicit `recovery_retry_not_before: null` identifies the hold; an omitted
+key means unknown timing. The Go DTO already uses
+`RecoveryRetryNotBeforePresent` to distinguish these, with no new wire field;
+malformed non-null JSON timestamps are rejected, and finite timestamps remain
+timed even when due. See [Retry timing contract](run-recovery-wait.md#retry-timing-contract).
+
+Historical failed rows retain the `FAIL_ORIGIN` rendering `data_volume_full (the
+worker's data volume stayed full after N counted disk parks)`. That stored
+origin is historical read compatibility, not the current cap outcome. See
+[`UZI_RUN_DISK_PARK_MAX`](configuration.md#server-api) for configuration.
 
 `set-token` takes a **label** (the name from `token list`), not an id, and
 takes effect on that worker's next claim — no restart and no re-minted join
@@ -3638,7 +3657,10 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   token](anthropic-token.md#letting-uzi-pick-the-token-auto-selection);
 - `recovery_wait` — parked to recover from a resumed turn that came back empty
   (no model activity) or hit a transient provider error; the sweep auto-resumes
-  it on a capped backoff. Empty-turn and resumed-gate recovery have no lifetime cap;
+  those interruptions on a capped backoff. Disk parks (`data_volume_full`) have
+  three timed counted retries by default, then hold for owner Resume/Cancel;
+  preventive parks stay uncounted and timed. See [Worker data volume full](run-recovery-wait.md#worker-data-volume-full).
+  Empty-turn and resumed-gate recovery have no lifetime cap;
   negotiated `codex_idle_stall` parks instead have three timed retries by default,
   then require owner Resume/Cancel. See [Codex idle stalls](#codex-idle-stalls).
   Typed `provider_outage` parks use the elapsed streak bound and can become
@@ -3748,21 +3770,16 @@ hold presentation and remedies are unchanged. See
 
 `limit_wait` and timed `recovery_wait` causes auto-resume on a timer.
 `worker_requeue_exhausted` instead requires owner Resume or Cancel; the Codex
-account hold waits for its account. `codex_idle_stall` and
-`retained_recovery_exhausted` retry when
-their timestamp is finite (even if due); NULL instead needs owner Resume/Cancel,
-and omitted timing is unknown. `pool_wait` instead clears only when a token is
-
-account hold waits for its account. `retained_recovery_exhausted` retries when
-its timestamp is finite (even if due); NULL instead needs owner Resume/Cancel,
-and omitted timing is unknown. `retained_recovery_adoption_failed` requires
+account hold waits for its account. `codex_idle_stall`, `data_volume_full` and
+`retained_recovery_exhausted` retry when their timestamp is finite (even if due);
+explicit NULL instead needs owner Resume/Cancel, and omitted timing is unknown. `retained_recovery_adoption_failed` requires
 owner Resume/Cancel regardless of retry timing. `pool_wait` instead clears only when a token is
 opted into the pool (or on demand with `uzi run resume-now`), so waiting alone
 does not resume it.
 
 So to wait for a plan gate or a clarification, use **`uzi run wait <id>`** (next
-section) — leaning on `--follow` there blocks until the run truly finishes, which
-may be never while it waits on a human. If you see a `status` outside this list, the server is newer
+section). `--follow` can keep waiting at human gates; it stops at a disk owner
+hold with Resume/Cancel guidance. If you see a `status` outside this list, the server is newer
 than this binary — upgrade rather than trusting it to mean "active". (The live
 `/api/ws` stream and `uzi tui` rewrite an unrecognised status to `unknown`; plain
 `run get`/`run list --json` pass it through as-is.)

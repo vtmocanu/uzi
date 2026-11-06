@@ -3130,8 +3130,8 @@ export interface StateRequest {
   provider_progress_turns?: number;
   /** PRD #1809 D6: qualifies a `recovery_cause: "data_volume_full"` park. `true` parks WITHOUT
    *  counting toward the api's lifetime cap (UZI_RUN_DISK_PARK_MAX), for M4's soft cache-cap park;
-   *  absent or false is a counted park, and past the cap the api fails the run itself (fail_origin
-   *  data_volume_full). The api 400s it with any other cause, and only accepts it once it
+   *  absent or false is a counted park, and past the finite cap the api holds the run for owner
+   *  Resume with a NULL retry time and unchanged count. The api 400s it with any other cause, and only accepts it once it
    *  advertises `recovery_cause_data_volume_full`. The disk-full handling (M5) never sends it. */
   disk_park_preventive?: boolean;
   /** PRD #1809 D8: on a process-ending park report that published a checkpoint (the usage-limit

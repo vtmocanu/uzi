@@ -135,7 +135,7 @@ func TestRenderRunDetailDiskRow(t *testing.T) {
 }
 
 // TestRenderRunDetailFailOrigin: `uzi run get` prints FAIL_ORIGIN for a failed run that carries
-// one, with the plain disk explanation and park count for data_volume_full, the raw enum for
+// one, with the plain disk explanation and park count for historical data_volume_full failures, the raw enum for
 // any other origin, and no row when the origin is null. Reddening mutation: drop the
 // FAIL_ORIGIN row, or the data_volume_full arm in failOriginCell.
 func TestRenderRunDetailFailOrigin(t *testing.T) {

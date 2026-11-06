@@ -257,8 +257,13 @@ and switches are unchanged. Five mechanisms:
    later write is not added to this classification or retry. The separate
    executor-failure deferral below can also produce a counted park. The
    claim/resume and clone/fetch park shares the lifetime cap
-   (`UZI_RUN_DISK_PARK_MAX`, shared with the hard-stop park); past it, the
-   run fails with `fail_origin=data_volume_full`. See [Worker data volume
+   (`UZI_RUN_DISK_PARK_MAX`, shared with the hard-stop park). At the default,
+   three counted parks are timed; the next counted park holds for owner
+   Resume/Cancel with a NULL retry time (#3969). The hold preserves the count,
+   custody, worker/session affinity and other budgets. Resume queues one ordinary
+   attempt, subject to admission; another counted park reholds. `0` means
+   unlimited timed counted parks; preventive parks remain uncounted and timed.
+   See [Worker data volume
    full](run-recovery-wait.md#worker-data-volume-full) for exactly what an
    owner sees and how counted parks differ from preventive ones.
 
@@ -287,11 +292,22 @@ and switches are unchanged. Five mechanisms:
    Capture retries are bounded; a safely quiescent run can park with an
    unverified capture while retaining its original clone, HOME, session,
    journal and custody. That degraded recovery requires this worker and can
-   lose newer work on another worker. The cap bounds repetition, not
-   misclassification; an unlimited configured cap remains unlimited. See
+   lose newer work on another worker. The cap bounds automatic counted retries,
+   not misclassification; an unlimited configured cap remains unlimited. See
    [Worker data volume full](run-recovery-wait.md#worker-data-volume-full)
    for recovery limits and [ADR-1809](../adr/1809-per-run-cache-bounds.md#full-volume-terminal-failure-deferral-1829)
    for the policy boundary.
+
+The disk hold adds no capacity-based auto-resume, cleanup or reclaim authority.
+Existing stop/quiesce and safe rebuildable-cache drops bound the park's resource
+activity; the held run runs no executor capacity-polling loop. Open source
+custody stays protected, including when the forge has no output; archives remain
+exportable and expire independently. Worker-local unpublished work is not
+guaranteed to survive worker or storage loss, and parking promises no power-loss
+durability. Finish the serving-API rollout before relying on owner holds: older
+APIs retain generic promotion behavior. The distinct #3865/#3882 successor-refusal
+path, #3330 recovery budgets and #3329 genuine-idle reclaim/no busy-pressure policy
+remain unchanged. See [Worker data volume full](run-recovery-wait.md#worker-data-volume-full).
 
 **Go build scratch** (#3870). A Claude run's Go temporary build tree
 (`$WORK`) lives in a per-run, per-claim directory under the run HOME,

@@ -6,7 +6,7 @@ audience: user
 
 # Recovering from a transient interruption
 
-`recovery_wait` also includes owner-only [worker recovery exhaustion](#worker-recovery-exhausted), which has no timer or automatic resume. [Codex idle stalls](#codex-idle-stalls) and retained-source exhaustion can also become owner-held. The transient-interruption retries below do not describe those holds.
+`recovery_wait` also includes owner-only [worker recovery exhaustion](#worker-recovery-exhausted), which has no timer or automatic resume. [Codex idle stalls](#codex-idle-stalls), [worker data volume full](#worker-data-volume-full) and retained-source exhaustion can also become owner-held. The transient-interruption retries below do not describe those holds.
 
 Uzi retries in place and, if the trouble persists, parks the run in
 `recovery_wait` on these transient interruptions:
@@ -883,16 +883,18 @@ resumes.
 
 A `recovery_wait` park can also come from the worker's own storage: its
 data volume filled up, or came close enough that uzi decided not to wait
-for it to. This cause has a lifetime cap by default and can **fail** the run
-after enough counted parks; operators can configure that cap as unlimited.
+for it to. After three timed counted parks by default, the next counted park
+waits for owner Resume/Cancel, without terminal failure (#3969). Operators can
+configure unlimited timed counted parks.
 
 Two kinds of park share the cause `data_volume_full`, and only one of them
-counts toward the failure cap:
+counts toward the timed retry allowance:
 
 - A **preventive**, uncounted park: the soft, per-run cache cap. At a turn
   boundary, a run whose own caches stay over their per-run cap across a
   few turn boundaries in a row is parked before it can fill the volume. A
-  run that keeps triggering this park alone cannot be failed by it.
+  run that keeps triggering this park alone keeps timed retries and does not
+  consume the counted allowance.
 - A **counted** park: everything else that reaches this park, including
   the hard, per-tick pressure stop — a background check on every stats
   tick that finds the volume at or over a hard threshold and stops
@@ -907,9 +909,11 @@ counts toward the failure cap:
   or a claim/resume preflight whose re-sampled statfs is still below the
   floor after a reclaim pass — note this last case counts a park with no
   failed write at all. Every counted case counts toward the run's lifetime disk-park cap,
-  `UZI_RUN_DISK_PARK_MAX` (default 3; `0` means unlimited). Past the cap,
-  the next counted disk-full park fails the run instead, with
-  `fail_origin = data_volume_full`.
+  `UZI_RUN_DISK_PARK_MAX` (default 3; `0` means unlimited timed parks). After
+  that allowance is consumed, the next counted park stays in `recovery_wait`
+  with cause `data_volume_full` and an explicit NULL retry time. It preserves
+  `disk_park_count` at the consumed allowance, custody, worker/session affinity
+  and unrelated budgets; the lifetime `recovery_wait_count` still increments.
 
 A counted park can also defer an issue run's otherwise-untyped executor
 failure when its worktree and HOME are on the data-volume device and a fresh,
@@ -944,8 +948,9 @@ allow a degraded park retaining the original clone, HOME, session, journal
 and custody, without claiming a verified checkpoint or published latest work.
 ACK reconciliation does not restart capture retries and has no fixed wall-time
 promise. A same-worker resume captures dirty work before fresh execution;
-newer worker-local work can be lost on another worker. Normal terminal,
-cancellation, stale-claim and disk-cap cleanup still applies. See the
+newer worker-local work can be lost on another worker. Existing terminal,
+cancellation and stale-claim dispositions still apply; cap exhaustion is a
+nonterminal hold and grants no cleanup authority. See the
 [operator policy](../adr/1809-per-run-cache-bounds.md#full-volume-terminal-failure-deferral-1829)
 for the exact proof requirements.
 
@@ -961,13 +966,57 @@ precedence; a pending owner or wall-clock pause does not interrupt the proof
 and stays pending for resume. A preventive degraded park stays uncounted, so
 later preventive parks of the same run can recur; each is bounded on its own,
 with no cross-park cap on uncounted parks. `UZI_RUN_DISK_PARK_MAX` bounds
-repetition of counted parks only when finite (`0` is unlimited). One residual
+automatic counted retries when finite (`0` is unlimited); owner Resume does not
+renew that allowance. One residual
 remains: reconciling an owed head after a disk-park publish still waits on the
 pause and is skipped until the next claim; it does not block the park.
 
-Both kinds park and resume on the same capped exponential backoff as an
-empty-turn park (`RUN_RECOVERY_PARK_BASE` up to `RUN_RECOVERY_MAX_PARK`);
-there is no separate timer for this cause.
+Preventive parks and counted parks within the allowance use the same capped
+exponential backoff as an empty-turn park (`RUN_RECOVERY_PARK_BASE` up to
+`RUN_RECOVERY_MAX_PARK`). An exhausted counted allowance has no retry timer.
+
+### Resuming a disk hold
+
+The authenticated run owner can **Resume** (`uzi run resume <id>` or bodyless
+`POST /api/runs/{id}/resume`) or **Cancel**. Resume queues one ordinary attempt;
+it does not reset the disk count, custody, worker/session affinity, recovery
+episodes or other budgets. Admission may still refuse execution because of disk
+pressure, cooldown, cordon, custody or capacity. A later counted disk park reholds;
+a preventive park remains uncounted and timed. Resume credits held time after
+execution has started, retaining `started_at` and the remaining wall budget;
+an exhausted wall budget can require an extension. Cancel wins over a disk park
+or Resume race once its stop verdict is recorded.
+
+Idempotence is limited to the current hold: concurrent/duplicate requests cannot
+queue that same hold twice. The bodyless request has no durable identity binding
+to the hold the owner observed. A delayed duplicate crossing a later hold is not
+durably fenced. That later hold requires a new claim, execution and counted park;
+clients send one POST per owner action and do not automatically retry it. No
+concrete single-action replay has been found; this is not a durable replay fence.
+
+On compatible serving APIs, timer, credential and generic promotion cannot wake
+a NULL disk hold. Capacity returning is not an auto-resume trigger. Mixed older
+API versions retain generic promotion behavior: finish the serving-API rollout
+before relying on holds. This is application policy, not a database guarantee.
+
+The hold adds no cleanup or reclaim authority. Existing park stop/quiesce and
+safe rebuildable-cache drops bound resource activity, with no executor capacity
+polling loop while held and no promise of power-loss durability. Open source
+custody stays protected; there is no `forge_no_output` release exception.
+Archives remain exportable and expire independently of the hold. Unpublished
+worker-local work is not guaranteed across worker or storage loss. The distinct
+#3865/#3882 successor-refusal path, #3330 recovery budgets and #3329 genuine-idle
+reclaim/no busy-pressure policy remain unchanged.
+
+### Retry timing contract
+
+For `recovery_wait` / `data_volume_full`, an explicit
+`"recovery_retry_not_before": null` means owner-held. A finite timestamp means a
+timed retry, even if already due; an omitted key means unknown timing, not a hold
+or a promised retry. The existing Go DTO's `RecoveryRetryNotBeforePresent`
+records JSON key presence alongside its time pointer; this adds no wire field.
+Malformed non-null JSON timestamps are rejected by the Go decoder rather than
+interpreted as a hold. Surfaces with unknown timing show that uncertainty.
 
 **Custody differs by when the park happens.** Every data-volume-full park
 that lands **before your repo has been cloned**, with no retained source
@@ -987,10 +1036,10 @@ remove that work before it is recovered.
 
 - The run page's park panel reads **waiting for disk space**: the
   worker's data volume is full or nearly full, uzi frees space (including
-  this run's own build caches), and the run resumes at its next retry. No
-  action is needed. The board and run list show only a generic recovery
-  wait status; see the STATUS-cell and `uzi tui` rows below for where the
-  disk-specific wording does appear.
+  this run's own build caches), and the run retries after its scheduled time,
+  subject to admission. A held park instead reads **Disk recovery needs your
+  decision**, offering owner Resume/Cancel with no countdown or promised retry.
+  Unknown timing is labeled separately.
 - `uzi run get <id>` — a `DISK` row with that sentence and the run's
   lifetime count of **counted** disk parks (`counted disk parks: N`); a
   preventive park never moves this number, so it can read 0 across several
@@ -998,12 +1047,15 @@ remove that work before it is recovered.
   rows](cli.md#disk-usage-and-checkpoint-durability) for the related `HOME`
   and `CHECKPOINT` rows every parked run can show.
 - `uzi run list` / `uzi admin runs` — the STATUS cell appends `(waiting for
-  disk space)`.
-- `uzi tui` — this park stays in ON THE FLOOR, like any other
-  self-resolving recovery park.
-- If the volume stays full past the park cap, the run fails instead: `uzi
-  run get`'s `FAIL_ORIGIN` row reads `data_volume_full (the worker's data
-  volume stayed full after N counted disk parks)`.
+  disk space)` for timed parks; held parks say `(disk held; owner Resume/Cancel)`.
+- `uzi tui` — timed parks stay in ON THE FLOOR; held parks need the owner and
+  show Resume/Cancel without a countdown.
+- Default `uzi run wait` and `uzi run logs --follow` stop at the owner hold;
+  an explicit `run wait --until` keeps its requested status targets. Timed and
+  unknown disk waits continue following.
+- Historical failed rows remain readable: `uzi run get`'s `FAIL_ORIGIN` row
+  can read `data_volume_full (the worker's data volume stayed full after N
+  counted disk parks)`. This is historical compatibility, not current cap policy.
 
 ## Worker recovery exhausted
 
