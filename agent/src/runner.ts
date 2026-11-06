@@ -23,7 +23,8 @@ import type { CapturedMemoryContext } from "./codex/broker.js";
 import type { BaseAttestationHoldOutcome, MemoryIncarnation, MemoryParkReference, WorkerMemoryPressureResult } from "./protocol.js";
 import { BASE_ATTESTATION_HOLD_REASON, CAPABILITY_INFERENCE_EVIDENCE_FEATURE } from "./protocol.js";
 import { PublicationContextLatch, publicationContextReason } from "./publication-context.js";
-import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, HELD_PUBLICATION_FEATURE, CHECKPOINT_PUBLISH_TIMEOUT_MS, CREDENTIAL_SWITCH_HOLD_FEATURE } from "./client.js";
+import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, HELD_PUBLICATION_FEATURE, CHECKPOINT_PUBLISH_TIMEOUT_MS, CREDENTIAL_SWITCH_HOLD_FEATURE, CLARIFICATION_REVISION_SETTLEMENT_FEATURE } from "./client.js";
+import type { ClarificationSettlement } from "./protocol.js";
 import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
 import { MaintenanceBudget, RetainedSwitchSettlement } from "./maintenance-budget.js";
 import { MaintenanceResources } from "./recovery-maintenance.js";
@@ -2380,6 +2381,14 @@ interface RunFlight {
   policyHold?: { readonly outcomeId: string; body?: Readonly<import("./protocol.js").PolicyHoldRequest> };
   policyAdmission?: boolean;
   initialPlanningEligible?: boolean;
+  /** Issue #3985: computed once from the claim. A plan cross-check run with auto-approve cleared
+   *  whose kind has a plan gate can settle a post-revise clarification to awaiting_approval. */
+  clarificationRevisionEligible?: boolean;
+  /** Issue #3985: the latest pending HUMAN revise verdict's own identity (never derived from
+   *  PlanRevisionRecovery, which exists only when plan_revision_retry was negotiated). */
+  pendingHumanRevision?: { inputId: number; gateRevision: number };
+  /** Issue #3985: counts status reports so a late settlement ACK can tell a newer report moved on. */
+  stateReportOrdinal?: number;
   policyReservation?: symbol;
   forgeCloneSuccess?: AbortController;
   operationAdmission?: CodexOperationController;
@@ -12645,6 +12654,10 @@ export class RunRunner {
       runKind: resolveRunKind(claim.kind),
       initialPlanningEligible: claim.resume_phase !== "awaiting_approval" &&
         !(claim.plan_md && claim.plan_approved !== true),
+      clarificationRevisionEligible: (claim.plan_cross_check_gated === true || claim.plan_cross_check_required === true) &&
+        claim.auto_approve !== true &&
+        ["issue", "prompt", "ci_fix"].includes(resolveRunKind(claim.kind)) &&
+        Number.isSafeInteger(claim.claim_generation) && (claim.claim_generation ?? 0) > 0,
       observedSessionId: undefined,
       latestContractRevision: undefined,
       reportState: async (body, signal, checked = false) => {
@@ -12656,12 +12669,17 @@ export class RunRunner {
         if (steering.claimFence() !== undefined) throw new StaleClaimError();
         const memory = flight.workerMemory;
         const memorySequence = memory && body.status !== undefined ? ++memory.stateSequence : undefined;
+        const reportOrdinal = body.status !== undefined ? (flight.stateReportOrdinal = (flight.stateReportOrdinal ?? 0) + 1) : undefined;
+        // Issue #3985: a clarification settlement keeps the awaiting_input hold until its ACK is
+        // authoritative; capture the token it may release (the hold taken at the question park).
+        const settling = body.status === "clarification_settled";
+        const settleToken = settling ? memory?.phaseToken : undefined;
         // Issue #3240: pause_failed is a diagnostic of a flight that keeps running (Decision 8), not a
         // lifecycle change. It leaves the memory state as it is: no retire (the Codex broker keeps
         // the context it captured), no hold, and on a running ACK no change to `running`. Any other
         // ACK takes the ordinary path below.
         const continuing = body.status === "pause_failed";
-        if (memory && body.status !== undefined && body.status !== "running" && !continuing) {
+        if (memory && body.status !== undefined && body.status !== "running" && !continuing && !settling) {
           memory.running = false;
           memory.resumeReady = false;
           memory.epochReady = false;
@@ -12706,7 +12724,8 @@ export class RunRunner {
         // registry never shows an awaiting_* phase for a report that is not sent; after the
         // awaitReceiptSettlement above, with no await between this check, statusRequested and the send.
         if (
-          (body.status === "awaiting_approval" || body.status === "awaiting_input" || body.status === "awaiting_followup") &&
+          (body.status === "awaiting_approval" || body.status === "awaiting_input" || body.status === "awaiting_followup" ||
+            body.status === "clarification_settled") &&
           steering.getPauseMode() === "disk"
         ) {
           throw new DiskParkSignal(false);
@@ -12793,6 +12812,7 @@ export class RunRunner {
         // above: the flight stops running and its context is retired, so no shell authority survives.
         // Like every local memory change here, only while no newer report has moved the phase on.
         const continued = continuing && ack.status === "running" && ack.applied !== false;
+        const settled = settling && ack.applied === true && ack.status === "awaiting_approval" && ack.clarificationSettled === true;
         if (memorySequence !== undefined && memory?.stateSequence === memorySequence && !continued) {
           if (continuing) {
             memory.resumeReady = false;
@@ -12805,9 +12825,20 @@ export class RunRunner {
           if (memory.running && memoryPhaseToken && this.memoryRuntime!.commands.releasePhase(memoryPhaseToken)) {
             if (memory.phaseToken === memoryPhaseToken) memory.phaseToken = undefined;
           }
+          // Issue #3985: only an authoritative settlement ACK ends the question hold. Every other
+          // answer (refused, applied false, wrong status or disposition) retains it unchanged.
+          if (settling && settled && settleToken && this.memoryRuntime!.commands.releasePhase(settleToken)) {
+            if (memory.phaseToken === settleToken) memory.phaseToken = undefined;
+            memory.revisionContext = memory.context;
+          }
           if (ack.status !== undefined && !["running", "awaiting_approval", "awaiting_input", "awaiting_followup"].includes(ack.status))
             this.retireWorkerMemory(flight);
         }
+        if (settling && settled && flight.stateReportOrdinal === reportOrdinal) this.snapshotRegistry?.setPhase(runId, "awaiting_approval");
+        // Issue #3985: a new presentation at a later gate revision supersedes the pending revise.
+        if (body.status === "awaiting_approval" && ack.applied === true && ack.status === "awaiting_approval" &&
+            flight.pendingHumanRevision && (ack.gateRevision ?? 0) > flight.pendingHumanRevision.gateRevision)
+          flight.pendingHumanRevision = undefined;
         // Issue #1626: remember the frozen completion-contract revision this (non-stale) ACK
         // carries, so the interlocked finalize can bind its permit to a contract that froze after
         // the claim was issued. Every report goes through here. MONOTONE: only ever raised, so a
@@ -15135,6 +15166,18 @@ export class RunRunner {
       flight.attempt = attempt;
       this.liveAttempts.add(attempt);
     }
+    // Issue #3985: the pending human revise a question may settle against. PlanRevisionRecovery
+    // swallows a replacement verdict (it calls its own accept() and throws PlanRevisionReplacedError
+    // past the runner's callbacks), so a replacement for the SAME gate revision is read back from
+    // its public, read-only dispatchSource() and the newer input id wins.
+    const revisionSettlement = (): { inputId: number; gateRevision: number } | undefined => {
+      const pending = flight.pendingHumanRevision;
+      if (!pending) return undefined;
+      const source = revisionRecovery?.dispatchSource();
+      if (source && source.gate_revision === pending.gateRevision && source.revision_input_id > pending.inputId)
+        flight.pendingHumanRevision = { inputId: source.revision_input_id, gateRevision: pending.gateRevision };
+      return flight.pendingHumanRevision;
+    };
     const revisionRecovery = flight.planRevisionRetryNegotiated === true &&
       Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0
       ? new PlanRevisionRecovery({
@@ -15564,6 +15607,7 @@ export class RunRunner {
           const verdict = await this.takeResumedGateEvent(runId, steering, batcher, runLog, signal);
           if (verdict?.kind === "revise") flight.initialPlanningEligible = false;
           if (verdict) revisionRecovery?.accept(verdict);
+          if (verdict) this.trackRevisionVerdict(flight, verdict);
           return verdict;
         } }
         : {}),
@@ -15944,15 +15988,17 @@ export class RunRunner {
           }
         }
         revisionRecovery?.accept(verdict);
+        this.trackRevisionVerdict(flight, verdict);
         return verdict;
       },
       ...((claim.auto_approve && claim.plan_cross_check_required || !claim.auto_approve && claim.plan_cross_check_gated) && !seeded ? {
         continueExistingPlanGate: async (otherwise: () => Promise<PlanVerdict>) => {
-          if (continueCheckedStorage) return continueCheckedStorage();
-          if (!checkedHuman) return otherwise();
+          const tracked = (verdict: PlanVerdict): PlanVerdict => { this.trackRevisionVerdict(flight, verdict); return verdict; };
+          if (continueCheckedStorage) return tracked(await continueCheckedStorage());
+          if (!checkedHuman) return tracked(await otherwise());
           if (!checkedHuman.continueWait || checkedHuman.phase === "terminal" || checkedHuman.phase === "revisionplanning")
             return checkedFailure(new Error("plan cross-check: existing human wait unavailable"));
-          try { return await checkedHuman.continueWait(); }
+          try { return tracked(await checkedHuman.continueWait()); }
           catch (error) { return checkedFailure(error); }
         },
       } : {}),
@@ -15970,7 +16016,8 @@ export class RunRunner {
           claim.auto_approve ?? false,
           claim.config ?? null,
           { confirmRunning: (resolveRunKind(claim.kind) === "issue" && !claim.interactive) ||
-            revisionRecovery?.hasActiveRevision === true },
+            revisionRecovery?.hasActiveRevision === true,
+            revisionSettlement },
         ),
       // Issue #1593: the worker-authored fallback park for a planning turn that stayed
       // prose-only after a nudge. Fixed question, no model text; autopilot never parks.
@@ -15983,7 +16030,7 @@ export class RunRunner {
           runLog,
           claim.auto_approve ?? false,
           claim.config ?? null,
-          { confirmRunning: revisionRecovery?.hasActiveRevision === true },
+          { confirmRunning: revisionRecovery?.hasActiveRevision === true, revisionSettlement },
         ),
       pullFollowUps: (remainingRunes, batchEmpty) => steering.pullFollowUps(remainingRunes, batchEmpty),
       // Issue #1800: the executor reports a pulled follow-up once the turn carrying it reached the model.
@@ -26703,6 +26750,26 @@ export class RunRunner {
   }
 
   /**
+   * Issue #3985: follow the latest HUMAN revise verdict on an eligible flight, so a clarification
+   * asked while planning that revise can settle back to the plan gate. A human revise carrying
+   * both its input id and the gate revision it is bound to sets the pending revise; approve,
+   * reject, cancel (or a human revise lacking an identity, which still supersedes the old one)
+   * clear it; an automatic cross-check revise leaves it untouched.
+   */
+  private trackRevisionVerdict(flight: RunFlight, verdict: PlanVerdict): void {
+    if (flight.clarificationRevisionEligible !== true) return;
+    if (verdict.kind === "revise") {
+      if (verdict.automatic === true) return;
+      const { inputId, sourceGateRevision } = verdict;
+      flight.pendingHumanRevision = Number.isSafeInteger(inputId) && (inputId ?? 0) > 0 &&
+        Number.isSafeInteger(sourceGateRevision) && (sourceGateRevision ?? 0) > 0
+        ? { inputId: inputId!, gateRevision: sourceGateRevision! } : undefined;
+      return;
+    }
+    flight.pendingHumanRevision = undefined;
+  }
+
+  /**
    * Issue #1604 (D3): a resumed, unapproved claim with a persisted plan reads the inputs sent
    * before the claim was released BEFORE it offers any plan, then takes the gate event to act on:
    * a sticky cancel, else a current-epoch revise, else a buffered current-epoch reject (an approve
@@ -27293,7 +27360,7 @@ export class RunRunner {
     runLog: Logger,
     autoApprove: boolean,
     config: ClaimConfig | null,
-    options: { confirmRunning?: boolean } = {},
+    options: { confirmRunning?: boolean; revisionSettlement?: () => { inputId: number; gateRevision: number } | undefined } = {},
   ): Promise<AnswerVerdict> {
     if (autoApprove) {
       // Autopilot is "no human in the loop" (PRD #19), so a park would wedge the run
@@ -27337,7 +27404,9 @@ export class RunRunner {
    * message reaches the owner only on the executor's status card, as untrusted data.
    *
    * Shares askUser's park body and per-run parked-time budget (REASON_QUESTION_TIMEOUT),
-   * including its optional confirmed `running` settlement. It does not count
+   * including its optional confirmed `running` settlement. After a human revise on a plan
+   * cross-check run the answer settles through `clarification_settled` instead (see parkQuestion);
+   * that settlement does not depend on `confirmRunning` or on a PlanRevisionRecovery. It does not count
    * against question_max; that cap lives in the executors. An autopilot run never parks: it
    * returns `unattended` WITHOUT reporting awaiting_input, and the executor fails the run.
    */
@@ -27349,7 +27418,7 @@ export class RunRunner {
     runLog: Logger,
     autoApprove: boolean,
     config: ClaimConfig | null,
-    options: { confirmRunning?: boolean } = {},
+    options: { confirmRunning?: boolean; revisionSettlement?: () => { inputId: number; gateRevision: number } | undefined } = {},
   ): Promise<{ kind: "answer"; answers: string[] } | { kind: "cancel" } | { kind: "unattended" }> {
     if (autoApprove) {
       runLog.info("plan missing: not parked (autopilot)", { run_id: runId });
@@ -27404,7 +27473,8 @@ export class RunRunner {
     reportState: (body: StateRequest) => Promise<unknown>,
     runLog: Logger,
     config: ClaimConfig | null,
-    options: { confirmRunning?: boolean; requireRunning?: boolean } = {},
+    options: { confirmRunning?: boolean; requireRunning?: boolean;
+      revisionSettlement?: () => { inputId: number; gateRevision: number } | undefined } = {},
   ): Promise<AnswerVerdict> {
     const ordinal = (this.questionCounts.get(runId) ?? 0) + 1;
     this.questionCounts.set(runId, ordinal);
@@ -27416,6 +27486,17 @@ export class RunRunner {
       questionId = randomUUID();
       this.openQuestionIds.set(runId, questionId);
     }
+
+    // Issue #3985: freeze how this question settles BEFORE the awaiting_input report, so a later
+    // change to the revise tracker or the negotiated features cannot change the settlement.
+    const revisionContext = options.revisionSettlement?.();
+    const settlement: { kind: "ordinary" } | { kind: "revision_unsupported" } |
+      { kind: "revision"; value: Readonly<ClarificationSettlement> } =
+      revisionContext === undefined ? { kind: "ordinary" }
+        : this.client.hasFeature(CLARIFICATION_REVISION_SETTLEMENT_FEATURE)
+          ? { kind: "revision", value: Object.freeze({ question_id: questionId,
+            revision_input_id: revisionContext.inputId, gate_revision: revisionContext.gateRevision }) }
+          : { kind: "revision_unsupported" };
 
     const emitQuestion = () => batcher.emit({
       kind: "question",
@@ -27513,19 +27594,40 @@ export class RunRunner {
       this.closeParkCharge(runId);
       this.openQuestionIds.delete(runId);
       if (v.kind === "answer") {
+        if (settlement.kind === "revision") {
+          // Issue #3985: an answer to a question asked while planning a HUMAN revise is never plan
+          // approval, so the server refuses `running` here; it settles back to awaiting_approval with
+          // the revise still pending. Support lost during the park stops the flight without sending
+          // anything (never a generic `running`), and only the authoritative ACK confirms. Always
+          // awaited, whatever the caller's confirmRunning, so no answer is returned unsettled.
+          if (!this.client.hasFeature(CLARIFICATION_REVISION_SETTLEMENT_FEATURE)) throw new RetainedRecoveryStop();
+          const settled = await reportState({ status: "clarification_settled",
+            clarification_settlement: { ...settlement.value } }) as StateAck;
+          if (!(settled.applied === true && settled.status === "awaiting_approval" && settled.clarificationSettled === true)) {
+            if (settled.status === "paused" && settled.holdReason === "budget_exhausted") throw new ServerWallParkedError();
+            if (settled.status === "paused" && !settled.holdReason) throw new OrdinaryOwnerPaused();
+            throw new TrustedExecutionRefusal("clarification revision settlement was not confirmed");
+          }
+          return v;
+        }
         // PRD #307: a plan-phase clarification resumes into more PLANNING turns, so
         // neither onSessionId (latched once per run) nor reportIteration (implement
         // loop only) fires again — the run would stay stuck at awaiting_input. Emit a
         // `running` report on the answer so the server runs SetRunRunning, which is the
         // one existing transition that clears open_question_id (its consumed-answer
-        // guard already passes: ConsumeRunInputs stamps consumed_at in the same
-        // RETURNING statement that handed us this answer). Shared by the implement-phase
+        // guard needs the answer input applied: a modern worker takes it through
+        // ListReplayRunInputs and its ACK/APPLIED receipt, and the state reporter waits for
+        // receipt settlement (steering.awaitReceiptSettlement) before this report goes out; a
+        // missing answer feed event is therefore not proof that the input was lost). Shared by the implement-phase
         // park too: there this same awaiting_input -> running is the one the loop's next
         // reportIteration would otherwise perform, so it is harmless (and equally relies
         // on the consumed-answer guard — it is NOT a running -> running no-op, because the
         // awaiting_input park report is awaited and persisted before settle runs). NOT
         // emitted on cancel/timeout (timeout throws before settle; cancel is guarded out).
-        if (options.confirmRunning) {
+        // revision_unsupported: the revise context exists but the server never negotiated the
+        // settlement. An old server refuses this `running` (an answer is not plan approval), so it
+        // must be awaited whatever the caller said; fire-and-forget would swallow the refusal.
+        if (options.confirmRunning || settlement.kind === "revision_unsupported") {
           const running = await reportState({ status: "running" }) as StateAck;
           if (running.status !== "running") {
             if (running.status === "paused" && running.holdReason === "budget_exhausted") throw new ServerWallParkedError();
