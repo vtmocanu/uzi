@@ -86,6 +86,20 @@ checker stays `high` (source `cross-check default`), and checker pins are
 explicit levels that reject `runtime`. See
 [Configuration](./configuration.md#plan-cross-check-model-and-effort-pins).
 
+### What the Codex catalog default means
+
+With Runtime default uzi sends Codex no level, so Codex (pinned 0.164.0) uses
+its model catalog's default level for the model. This was verified in the Codex
+source at commit `6aaac694` (`codex-rs/core/src/client.rs:957-966`).
+
+- `none` means no reasoning level is requested: either the catalog has no
+  default for the model, or its default is `none`.
+- A catalog default of `ultra` is not sent as-is; Codex substitutes a supported
+  level.
+- Repository `.codex/config.toml` files are not loaded (uzi marks the checkout
+  untrusted), so they cannot change the default.
+- A resumed session may keep the level it last used.
+
 ### Effort reporting
 
 `GET` and `PUT /api/me/settings` return a read-only `effort_settings` with two
