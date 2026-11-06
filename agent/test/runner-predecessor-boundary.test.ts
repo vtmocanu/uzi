@@ -9,7 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import type { InventorySourceBoundaryContext, InventorySourceDiagnostic } from "../src/recovery.js";
-import { newRunAttempt, scanOnce, type QuiesceRunRequest, type RunAttempt } from "../src/run-quiescence.js";
+import { mintAttemptId, newRunAttempt, scanOnce, type QuiesceRunRequest, type RunAttempt } from "../src/run-quiescence.js";
 import { GitCache, INVENTORY_CONTENT_PROOF_BOUNDS } from "../src/git.js";
 import { fakeGitlab, git, installHarness, runner } from "./runner-harness.js";
 installHarness();
@@ -684,8 +684,9 @@ describe("escaped-writer residual (documented, #3831-related)", () => {
     // Controls: the scan does see a process whose cwd is inside the clone, and one carrying marker plus key.
     const inside = scanOnce(req, proc(CLONE + "/src", scrubbed), SELF);
     assert.equal(inside.survivors.length + inside.kill.length + inside.unverified.length, 1, "cwd inside the clone is in scope");
-    const marked = scanOnce(req, proc("/tmp/elsewhere", "UZI_RUN_ATTEMPT=run-9:attempt\0UZI_RUN_CLONE_KEY=repo/issue-1\0"), SELF);
-    assert.ok(marked.kill.length + marked.survivors.length + marked.unverified.length <= 1);
+    const marker = `run-9:${mintAttemptId(1)}`;
+    const marked = scanOnce(req, proc("/tmp/elsewhere", `UZI_RUN_ATTEMPT=${marker}\0UZI_RUN_CLONE_KEY=repo/issue-1\0`), SELF);
+    assert.equal(marked.kill.length + marked.survivors.length + marked.unverified.length, 1, "marker plus clone key is in scope");
     // The residual: cwd outside every target path and no attempt marker or clone key.
     const escaped = scanOnce(req, proc("/tmp/elsewhere", scrubbed), SELF);
     assert.deepEqual(escaped, { kill: [], survivors: [], unverified: [] }, "not detected: it may still write into the clone");

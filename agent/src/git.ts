@@ -15381,7 +15381,9 @@ try {
    * One git call of the inventory proofs, or undefined when it must not run: `<cwd>/.git` is not a real directory
    * (a gitfile or symlink could redirect the repository), or the caller's deadline has passed. Every call names
    * `--git-dir` and `--work-tree` explicitly, so an agent-writable `core.worktree` cannot redirect status or the
-   * listings, and gets a timeout clipped to the caller's deadline.
+   * listings, pins `core.fileMode=true`, `core.ignoreCase=false` and `core.excludesFile=/dev/null` as
+   * {@link worktreeCleanHardened} does (a runner-written `core.fileMode=false` would hide an exec-bit flip from
+   * status, a planted excludes file would move files out of status), and gets a timeout clipped to the caller's deadline.
    */
   private async pinnedInventoryGit(cwd: string, bounds: InventoryContentProofBounds) {
     const gitDir = path.join(cwd, ".git");
@@ -15393,7 +15395,8 @@ try {
       const remaining = endsAt - Date.now();
       if (remaining <= 0) return undefined;
       // GIT_NO_REPLACE_OBJECTS: a replace ref must not make the proof read a different blob than the index names.
-      const pins = [`--git-dir=${gitDir}`, `--work-tree=${cwd}`];
+      const pins = [`--git-dir=${gitDir}`, `--work-tree=${cwd}`,
+        "-c", "core.fileMode=true", "-c", "core.ignoreCase=false", "-c", "core.excludesFile=/dev/null"];
       return this.runGitAsRunnerBytes(cwd, [...pins, ...args], {
         env: { ...NO_REPLACE_ENV, GIT_OPTIONAL_LOCKS: "0" }, maxBuffer: bounds.maxBytes,
         timeoutMs: remaining, ...(input ? { input } : {}),

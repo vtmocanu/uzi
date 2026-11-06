@@ -397,6 +397,26 @@ describe("inventorySourceContentProof (issue #2969 D5)", () => {
     for (const c of f.calls) assert.deepEqual(c.pins, [`--git-dir=${f.root}/.git`, `--work-tree=${f.root}`]);
   });
 
+  test("runner-written core.fileMode=false cannot hide an exec-bit flip, nor core.excludesFile an untracked file", async t => {
+    const f = fixture(t);
+    const script = path.join(f.root, "run.sh");
+    fs.writeFileSync(script, "echo hi\n");
+    fs.chmodSync(script, 0o644);
+    f.commitAll();
+    f.g("config", "core.fileMode", "false");
+    fs.chmodSync(script, 0o755);
+    assert.equal(await f.proof(), "dirty", "a mode-only change is dirty despite core.fileMode=false in the clone config");
+    fs.chmodSync(script, 0o644);
+    assert.equal(await f.proof(), "clean");
+    const planted = path.join(f.dir, "planted-excludes");
+    fs.writeFileSync(planted, "hidden.txt\n");
+    f.g("config", "core.excludesFile", planted);
+    fs.writeFileSync(path.join(f.root, "hidden.txt"), "h\n");
+    assert.equal(await f.proof(), "dirty", "a planted excludes file cannot move an untracked file out of status");
+    for (const c of f.calls) for (const pin of ["core.fileMode=true", "core.ignoreCase=false", "core.excludesFile=/dev/null"])
+      assert.ok(c.config.includes(pin), `${c.args[0]} pins ${pin}`);
+  });
+
   test("core.worktree in the agent-writable config cannot redirect status or the listings", async t => {
     const f = fixture(t);
     fs.writeFileSync(path.join(f.root, "a.txt"), "a\n");
