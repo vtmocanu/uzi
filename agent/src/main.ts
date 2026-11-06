@@ -95,7 +95,7 @@ export function buildAfterPublicationEnrolled(
 /**
  * The production dependencies of the pod-epoch deletion phase. The phase stays inert while
  * EPOCH_RECLAIM_DELETION_ENABLED is false; this only binds what it will use. It carries no activation override.
- * `quiesce` is the deny-only capture-mode proof: it never tears down Docker or retains a source boundary.
+ * `quiesce` is the worker-wide deny-only capture-mode proof: it never tears down Docker or retains a source boundary.
  */
 export function buildPodEpochDeletionDeps(parts: {
   authority: Pick<AuthorityRuntime, "withTransaction" | "active" | "endSourceUse">;

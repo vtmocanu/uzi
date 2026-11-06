@@ -1435,6 +1435,35 @@ test("the coordinator itself is fatal for a pending child or stop latch after a 
     } finally { for (const cancel of timers) cancel(); await d.close(); }
   }
 });
+// A stop latched during a REFUSED re-inspect (the descriptor changed, so the source is kept) must still be fatal
+// at once: the refusal path may not skip the settlement check.
+async function refusedReinspectWithLatch(count: number) {
+  const w = deletionWorld(count, world => {
+    const seen = new Map<number, number>();
+    world.mutateSource = (s, i) => {
+      const n = (seen.get(i) ?? 0) + 1; seen.set(i, n);
+      if (i === 0 && n === 2) { world.stopped = true; s.descriptor = "1".repeat(64); }
+    };
+  });
+  const d = await daemon(); w.options.dockerHost = d.host;
+  const timers: Array<() => void> = [];
+  w.options.schedule = (callback, ms) => { const t = setTimeout(callback, ms); const c = () => clearTimeout(t); timers.push(c); return c; };
+  try {
+    await assert.rejects(runPodEpochShadow(w.options), PodEpochSettlementError);
+    assert.equal(w.spies.finishes, 0, "finish is never reached");
+    assert.equal(w.calls.handovers, 0); assert.ok(!w.events.includes("handover"));
+    return w;
+  } finally { for (const cancel of timers) cancel(); await d.close(); }
+}
+test("a stop latched during a refused re-inspect is fatal, with no finish and no handover", async () => {
+  const w = await refusedReinspectWithLatch(1);
+  noMutation(w);
+});
+test("after a refusal latches a stop, the next source is never reserved, proved or discarded", async () => {
+  const w = await refusedReinspectWithLatch(2);
+  noMutation(w);
+  assert.deepEqual(w.spies.reserved, []);
+});
 test("shutdown mid-pass starts no new source and leaves the handover to the process exit", async () => {
   const reads: string[] = [];
   await withDeletion(3, w => {
@@ -1539,6 +1568,9 @@ test("a daemon error from a guard that has not aborted still ends the pass with 
 test("a path observed in two groups with a different bare path or selector is demoted and never deleted", async () => {
   const variants: Array<[string, { barePath: string; attempt: string; runId?: string; generation?: number }]> = [
     ["bare path", { barePath: "/bare2", attempt: "attempt" }], ["selector", { barePath: "/bare", attempt: "other" }],
+    // A source's run id must equal its group's selector run id to be eligible, so the run id is never the ONLY
+    // demoter: the `priorAdmit.selector.runId` clause is defence in depth behind that eligibility rule and the
+    // `previous.run_id` comparison, and no input isolates it.
     ["run id only", { barePath: "/bare", attempt: "attempt", runId: "run1" }],
     ["generation only", { barePath: "/bare", attempt: "attempt", generation: 2 }],
   ];
