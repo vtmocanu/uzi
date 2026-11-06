@@ -7,7 +7,8 @@
 // Job kinds: `generate` builds one deterministic fixture, `measure` runs one capture through the
 // production GitCache.capturePlanningDiff path, `report` renders the results table, `model`
 // prints the analytic entry/path-byte charge totals for a spec without docker or the opt-in env
-// (`node --import tsx test/planning-base-discovery.measure.ts '{"kind":"model","spec":"chain-d64"}'`). The
+// (`node --import tsx test/planning-base-discovery.measure.ts '{"kind":"model","spec":"chain-d64"}'`;
+// `"at":[3000,2999]` also prints Em/Pm per index and the 7f probe cap pairs). The
 // measured helper is the unchanged PLANNING_CAPTURE_HELPER; instrumented modes only PREPEND a
 // metering preamble to its `-e` program (the technique git-planning-diff.test.ts's meter uses).
 // Nothing here changes a production bound. See the README beside run.sh for metric definitions.
@@ -54,6 +55,10 @@ interface Manifest {
   expectedEntryOccurrences: string;
   expectedPathBytes: string;
   maxChargedPathBytes: string;
+  // distinct-* only: F*W distinct blobs (the sizing batch size). distinct-*, fatchain-*: the
+  // largest tree object in bytes (the helper caps one object at 2 MiB).
+  distinctBlobs?: string;
+  maxTreeObjectBytes?: number;
   checkout: boolean;
   generationMs: number;
 }
@@ -233,8 +238,68 @@ function lpName(letter: string, index: number, p: Longpath): string {
   return (letter + String(index).padStart(p.digits, "0")).padEnd(p.namelen, "x");
 }
 
+// distinct-<F>x<W>n<L>: the root holds F directories (`d000000`...), each pointing at its OWN leaf
+// tree of W regular files whose names are exactly L bytes (`f`, the zero-padded index, then x
+// fill) and whose blobs are all distinct across the fixture: F*W distinct blobs (contents are the
+// global index and a newline), so the helper's sizing batch is maximal. Leaf trees are distinct
+// objects too (distinct blob ids). Built with git fast-import.
+interface Distinct { fan: number; width: number; namelen: number; digits: number }
+const DISTINCT_DIR_NAME_LEN = 7;
+function parseDistinct(spec: string): Distinct | undefined {
+  const m = /^distinct-(\d{1,9})x(\d{1,9})n(\d{1,9})$/.exec(spec);
+  if (!m) return undefined;
+  const [fan, width, namelen] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  if (fan < 1 || fan > 1_000_000) throw new Error(`${spec}: F must be 1..1000000 (directory names are d + 6 digits)`);
+  if (width < 1) throw new Error(`${spec}: W must be >= 1`);
+  const digits = String(width - 1).length;
+  if (namelen < 1 + digits) throw new Error(`${spec}: L must be >= ${1 + digits} to hold the letter and a ${digits}-digit index`);
+  if (namelen > 255) throw new Error(`${spec}: L must be <= 255 (a single path component)`);
+  // Tree objects: "40000 " + name + NUL + 20 per directory entry, "100644 " + ... per file.
+  const rootBytes = fan * (DISTINCT_DIR_NAME_LEN + 27), leafBytes = width * (namelen + 28);
+  for (const [label, bytes] of [["root", rootBytes], ["leaf", leafBytes]] as const) {
+    if (bytes > OBJECT_CAP_BYTES) throw new Error(`${spec}: ${label} tree object would be ${bytes} bytes, over the 2 MiB per-object cap`);
+  }
+  return { fan, width, namelen, digits };
+}
+function distinctFileName(i: number, d: Distinct): string {
+  return ("f" + String(i).padStart(d.digits, "0")).padEnd(d.namelen, "x");
+}
+
+// fatchain-d<depth>: a chain of `depth` nested directories (root = helper depth 0, deepest tree at
+// depth `depth`, 1..64). Every tree holds FATCHAIN_FILLER regular files (one shared blob, names
+// `f` + 5 digits, 6 bytes) and, except the deepest, a first-sorting directory entry named "0"
+// pointing at the next tree. Each tree object is 28 + 34*FATCHAIN_FILLER bytes, just under 2 MiB.
+// The helper descends at the first entry, so every ancestor's tree buffer is live at the deepest
+// point while only depth entries have been charged.
+const FATCHAIN_FILLER = 60000, FATCHAIN_NAME_LEN = 6, FATCHAIN_DIR_NAME = "0";
+function parseFatchain(spec: string): { depth: number; treeBytes: number } | undefined {
+  const m = /^fatchain-d(\d{1,9})$/.exec(spec);
+  if (!m) return undefined;
+  const depth = Number(m[1]);
+  if (depth < 1 || depth > 64) throw new Error(`${spec}: depth must be 1..64 (root is depth 0; helper refuses depth > 64)`);
+  const treeBytes = FATCHAIN_DIR_NAME.length + 27 + FATCHAIN_FILLER * (FATCHAIN_NAME_LEN + 28);
+  if (treeBytes > OBJECT_CAP_BYTES) throw new Error(`${spec}: tree object would be ${treeBytes} bytes, over the 2 MiB per-object cap`);
+  return { depth, treeBytes };
+}
+function fatchainFiller(): string[] {
+  return Array.from({ length: FATCHAIN_FILLER }, (_, i) => "f" + String(i).padStart(FATCHAIN_NAME_LEN - 1, "0"));
+}
+
 // The shared-DAG fixtures' charge model, built from the spec alone.
 function sharedModel(spec: string): ChargeModel | undefined {
+  const dist = parseDistinct(spec);
+  if (dist) {
+    const leaf: ModelNode = { entries: Array.from({ length: dist.width }, () => ({ nameLen: dist.namelen })) };
+    return dagModel({ entries: Array.from({ length: dist.fan }, () => ({ nameLen: DISTINCT_DIR_NAME_LEN, child: leaf })) });
+  }
+  const fat = parseFatchain(spec);
+  if (fat) {
+    // The filler entry objects are shared by every tree (the model only reads them).
+    const filler = Array.from({ length: FATCHAIN_FILLER }, () => ({ nameLen: FATCHAIN_NAME_LEN }));
+    let t: ModelNode = { entries: filler };
+    for (let level = fat.depth - 1; level >= 0; level--) t = { entries: [{ nameLen: FATCHAIN_DIR_NAME.length, child: t }, ...filler] };
+    return dagModel(t);
+  }
   let m = /^fanout2-d(\d+)$/.exec(spec);
   if (m) {
     let t: ModelNode = { entries: [{ nameLen: 1 }] };
@@ -274,6 +339,7 @@ function fixtureModel(spec: string, bare?: string, tree?: string): ChargeModel {
 }
 
 const BASE_ENTRY_CAP = "baseDiscoveryEntryCap", BASE_PATH_BYTE_CAP = "baseDiscoveryPathByteCap";
+const MAX_PROBE_CAP = 999_999_999_999_999n;
 const DERIVED_BASIS = "derived-from-refusal (unverified until 7f probe)";
 
 interface DerivedCharge { basis: string; token: string; entries: string; pathBytes: string; entryCap: string | null; pathByteCap: string | null }
@@ -308,7 +374,77 @@ function deriveRefusal(model: ChargeModel, token: string | undefined,
   return { derived: null, reason: "not a base-discovery cap refusal" };
 }
 
-function sharedDag(bare: string, spec: string): { tree: string; trees: bigint; leaves: bigint; description: string } {
+interface SharedDag { tree: string; trees: bigint; leaves: bigint; description: string; distinctBlobs?: bigint; maxTreeObjectBytes?: number }
+
+// Stream F*W distinct blobs and the F leaf trees through one `git fast-import` commit (fast-import
+// builds the trees); the root tree is that commit's tree. The stream goes through a file so no
+// 250 MB string is ever held.
+function distinctDag(bare: string, spec: string, d: Distinct): SharedDag {
+  const streamPath = path.join(path.dirname(bare), "distinct.fi");
+  const fd = fs.openSync(streamPath, "w");
+  const parts: string[] = [];
+  let pending = 0;
+  const flush = (): void => { fs.writeSync(fd, parts.join("")); parts.length = 0; pending = 0; };
+  const push = (s: string): void => { parts.push(s); pending += s.length; if (pending >= 8 * 1024 * 1024) flush(); };
+  try {
+    const msg = "base\n";
+    push(`commit refs/heads/distinct-fi\ncommitter Fixture <fixture@example.invalid> 1767225600 +0000\ndata ${msg.length}\n${msg}`);
+    let global = 0;
+    for (let f = 0; f < d.fan; f++) {
+      const dir = `d${String(f).padStart(6, "0")}`;
+      for (let w = 0; w < d.width; w++, global++) {
+        const content = `${global}\n`;
+        push(`M 100644 inline ${dir}/${distinctFileName(w, d)}\ndata ${content.length}\n${content}`);
+      }
+    }
+    push("\n");
+    flush();
+  } finally { fs.closeSync(fd); }
+  const input = fs.openSync(streamPath, "r");
+  try {
+    execFileSync("git", ["-C", bare, "fast-import", "--quiet", "--force"], { env: PINNED_ENV, stdio: [input, "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024 });
+  } finally { fs.closeSync(input); }
+  fs.rmSync(streamPath, { force: true });
+  const tree = git(bare, ["rev-parse", "refs/heads/distinct-fi^{tree}"]);
+  git(bare, ["update-ref", "-d", "refs/heads/distinct-fi"]);
+  const rootSize = Number(git(bare, ["cat-file", "-s", tree]));
+  if (rootSize > OBJECT_CAP_BYTES) throw new Error(`${spec}: root tree is ${rootSize} bytes, over the 2 MiB per-object cap`);
+  // Every leaf tree has the same size; check the first and the last one.
+  let maxTree = rootSize;
+  for (const f of [0, d.fan - 1]) {
+    const size = Number(git(bare, ["cat-file", "-s", `${tree}:d${String(f).padStart(6, "0")}`]));
+    if (size > OBJECT_CAP_BYTES) throw new Error(`${spec}: leaf tree ${f} is ${size} bytes, over the 2 MiB per-object cap`);
+    maxTree = Math.max(maxTree, size);
+  }
+  const n = BigInt(d.fan) * BigInt(d.width);
+  return { tree, trees: 1n + BigInt(d.fan), leaves: n, distinctBlobs: n, maxTreeObjectBytes: maxTree,
+    description: `EXTRA (beyond spec): ${d.fan} root directories, each its own leaf tree of ${d.width} files with ${d.namelen}-byte names; ` +
+      `${n} distinct blobs (maximal sizing batch)` };
+}
+
+function fatchainDag(bare: string, spec: string, fat: { depth: number; treeBytes: number }): SharedDag {
+  const blob = git(bare, ["hash-object", "-w", "--stdin"], "leaf\n");
+  const fillerLines = fatchainFiller().map((n) => `100644 blob ${blob}\t${n}`);
+  let t = mktree(bare, fillerLines);
+  let maxTree = Number(git(bare, ["cat-file", "-s", t]));
+  for (let level = fat.depth - 1; level >= 0; level--) {
+    t = mktree(bare, [`040000 tree ${t}\t${FATCHAIN_DIR_NAME}`, ...fillerLines]);
+    maxTree = Math.max(maxTree, Number(git(bare, ["cat-file", "-s", t])));
+  }
+  if (maxTree > OBJECT_CAP_BYTES) throw new Error(`${spec}: a tree is ${maxTree} bytes, over the 2 MiB per-object cap`);
+  // The dir entry must be first in canonical order: assert it from git's own listing.
+  const first = git(bare, ["ls-tree", "--name-only", t]).split("\n")[0];
+  if (first !== FATCHAIN_DIR_NAME) throw new Error(`${spec}: first root entry is ${JSON.stringify(first)}, expected ${FATCHAIN_DIR_NAME}`);
+  return { tree: t, trees: BigInt(fat.depth + 1), leaves: BigInt(fat.depth + 1) * BigInt(FATCHAIN_FILLER), maxTreeObjectBytes: maxTree,
+    description: `EXTRA (beyond spec): chain of ${fat.depth} nested directories ("${FATCHAIN_DIR_NAME}" sorts first), every tree ` +
+      `${FATCHAIN_FILLER} filler files (largest tree ${maxTree} bytes, cap ${OBJECT_CAP_BYTES}); ancestor tree buffers all live at the descent` };
+}
+
+function sharedDag(bare: string, spec: string): SharedDag {
+  const dist = parseDistinct(spec);
+  if (dist) return distinctDag(bare, spec, dist);
+  const fat = parseFatchain(spec);
+  if (fat) return fatchainDag(bare, spec, fat);
   const blob = git(bare, ["hash-object", "-w", "--stdin"], "leaf\n");
   const lp = parseLongpath(spec);
   if (lp) {
@@ -367,6 +503,7 @@ function generate(spec: string, dir: string, inputs: string): Manifest {
   fs.mkdirSync(path.dirname(clone), { recursive: true });
   fs.mkdirSync(path.dirname(bare), { recursive: true });
   let tree: string, trees: bigint, leaves: bigint, description: string, checkout: boolean;
+  let extra: Pick<SharedDag, "distinctBlobs" | "maxTreeObjectBytes"> = {};
   if (spec === "repo" || /^synthetic-\d+$/.test(spec)) {
     const seed = path.join(dir, "seed");
     fs.mkdirSync(seed);
@@ -402,7 +539,9 @@ function generate(spec: string, dir: string, inputs: string): Manifest {
     checkout = true;
   } else {
     git(path.dirname(bare), ["init", "--quiet", "--bare", "--template=", bare]);
-    ({ tree, trees, leaves, description } = sharedDag(bare, spec));
+    const dag = sharedDag(bare, spec);
+    ({ tree, trees, leaves, description } = dag);
+    extra = { distinctBlobs: dag.distinctBlobs, maxTreeObjectBytes: dag.maxTreeObjectBytes };
     const commit = git(bare, ["commit-tree", "-m", "base", tree]);
     git(bare, ["update-ref", "refs/heads/main", commit]);
     git(bare, ["symbolic-ref", "HEAD", "refs/heads/main"]);
@@ -420,6 +559,8 @@ function generate(spec: string, dir: string, inputs: string): Manifest {
     expectedTreeOccurrences: trees.toString(), expectedLeafOccurrences: leaves.toString(),
     expectedEntryOccurrences: model.totalEntries.toString(), expectedPathBytes: model.totalPathBytes.toString(),
     maxChargedPathBytes: model.maxEntryBytes.toString(),
+    ...(extra.distinctBlobs !== undefined ? { distinctBlobs: extra.distinctBlobs.toString() } : {}),
+    ...(extra.maxTreeObjectBytes !== undefined ? { maxTreeObjectBytes: extra.maxTreeObjectBytes } : {}),
     checkout, generationMs: Date.now() - started,
   };
   fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify(manifest, null, 2));
@@ -582,8 +723,8 @@ interface MeasureJob {
   limits?: Record<string, number>;
 }
 
-// Positive safe integers only; any key must be a limit the cache already carries, except the two
-// base-discovery caps, which may be injected before they exist in the helper's defaults.
+// Positive safe integers only; any key must be a limit the cache already carries (the two
+// base-discovery caps are in the helper's PLANNING_LIMITS defaults).
 function validateLimits(limits: unknown, known: Record<string, number>): Record<string, number> {
   if (typeof limits !== "object" || limits === null || Array.isArray(limits) || Object.keys(limits).length === 0) {
     throw new Error("limits must be a non-empty JSON object");
@@ -591,7 +732,7 @@ function validateLimits(limits: unknown, known: Record<string, number>): Record<
   const out: Record<string, number> = {};
   for (const [key, value] of Object.entries(limits)) {
     if (!/^[A-Za-z][A-Za-z0-9]*$/.test(key)) throw new Error(`limits key ${JSON.stringify(key)} is not an identifier`);
-    if (!(key in known) && key !== BASE_ENTRY_CAP && key !== BASE_PATH_BYTE_CAP) throw new Error(`unknown planning limit ${key}`);
+    if (!(key in known)) throw new Error(`unknown planning limit ${key}`);
     if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) throw new Error(`limits.${key} must be a positive safe integer`);
     out[key] = value;
   }
@@ -909,8 +1050,10 @@ type Job =
   | { kind: "report"; out: string }
   // Pure description of the analytic charges for one spec (no helper run, no docker). `fixture`
   // (a generated fixture dir) is required for repo and synthetic-N, whose model reads their tree.
-  // Caps and `at` are positive integers or decimal strings.
-  | { kind: "model"; spec: string; fixture?: string; entryCap?: number | string; pathByteCap?: number | string; at?: number | string }
+  // Caps and `at` are positive integers or decimal strings; `at` may also be an array of them.
+  // A scalar `at` prints `prefixAt`; an array prints `prefixAts` (Em/Pm per index). Either also
+  // prints `probes`: the 7f cap pairs for each index i (see describeModel).
+  | { kind: "model"; spec: string; fixture?: string; entryCap?: number | string; pathByteCap?: number | string; at?: number | string | (number | string)[] }
   // Absorbs a container's first-start transients so no measurement is the first start.
   | { kind: "noop" };
 
@@ -926,13 +1069,39 @@ function describeModel(job: Extract<Job, { kind: "model" }>): Record<string, unk
     tree = readJson<Manifest>(path.join(job.fixture, "manifest.json"))?.tree;
   }
   const model = fixtureModel(job.spec, bare, tree);
-  const entryCap = big(job.entryCap, "entryCap"), pathByteCap = big(job.pathByteCap, "pathByteCap"), at = big(job.at, "at");
+  const entryCap = big(job.entryCap, "entryCap"), pathByteCap = big(job.pathByteCap, "pathByteCap");
+  const ats = (Array.isArray(job.at) ? job.at : job.at === undefined ? [] : [job.at]).map((v) => big(v, "at") as bigint);
   const out: Record<string, unknown> = {
     spec: job.spec, basis: "analytic",
     expectedEntryOccurrences: model.totalEntries.toString(), expectedPathBytes: model.totalPathBytes.toString(),
     maxChargedPathBytes: model.maxEntryBytes.toString(),
   };
-  if (at !== undefined) out.prefixAt = { i: at.toString(), pathBytes: model.prefixAt(at)?.toString() ?? null };
+  const point = (i: bigint): { i: string; em: string; pm: string | null } => ({ i: i.toString(), em: i.toString(), pm: model.prefixAt(i)?.toString() ?? null });
+  if (ats.length > 0 && !Array.isArray(job.at)) {
+    const p = point(ats[0] as bigint);
+    out.prefixAt = { i: p.i, pathBytes: p.pm };
+  }
+  if (ats.length > 0 && Array.isArray(job.at)) out.prefixAts = ats.map(point);
+  if (ats.length > 0) {
+    // 7f probe pair for index i: (entryCap=i, pathByteCap=Pm(i)-1) must refuse with the path token
+    // (entry i is the first whose cumulative path bytes exceed the cap, and it is checked after
+    // the entry cap's check of occurrence i passes); (entryCap=i, pathByteCap=Pm(i)) must refuse
+    // with the entry token (occurrence i+1 trips the entry cap before it is charged). Null when
+    // the walk is too short or the cap would not be a positive integer.
+    out.probes = ats.map((i) => {
+      const pm = model.prefixAt(i);
+      const pair = (cap: bigint): { limits: Record<string, number>; limitsJson: string } => {
+        const limits = { [BASE_ENTRY_CAP]: Number(i), [BASE_PATH_BYTE_CAP]: Number(cap) };
+        return { limits, limitsJson: JSON.stringify(limits) };
+      };
+      return {
+        i: i.toString(), pm: pm?.toString() ?? null,
+        // Caps must fit run.sh's LIMITS_JSON bound of 15 digits.
+        refusePathToken: pm !== null && pm > 1n && pm <= MAX_PROBE_CAP ? { token: "base_discovery_path_byte_cap", ...pair(pm - 1n) } : null,
+        refuseEntryToken: pm !== null && i < model.totalEntries && pm <= MAX_PROBE_CAP ? { token: "base_discovery_entry_cap", ...pair(pm) } : null,
+      };
+    });
+  }
   if (entryCap !== undefined) out.atEntryCap = { entryCap: entryCap.toString(), ...deriveRefusal(model, "base_discovery_entry_cap", entryCap, pathByteCap) };
   if (pathByteCap !== undefined) out.atPathByteCap = { pathByteCap: pathByteCap.toString(), ...deriveRefusal(model, "base_discovery_path_byte_cap", entryCap, pathByteCap) };
   return out;

@@ -18,6 +18,8 @@
 #   LIMITS_JSON    validation rows only: one-line JSON object of positive integers merged over the
 #                  helper's default planning limits, e.g. '{"baseDiscoveryEntryCap":1000}'
 #                  (label __validation; unset = production defaults; not combinable with SMOKE_INJECT)
+#   LIMITS_TAG     optional, with LIMITS_JSON only: [a-z0-9-]{1,40}, label becomes __validation-<tag>
+#                  so two LIMITS_JSON invocations into one OUT do not overwrite each other
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -34,7 +36,7 @@ SMOKE_INJECT="${SMOKE_INJECT:-}"
 for spec in $FIXTURES; do
   # Specs are interpolated into job JSON and paths: allow only the generator's own grammar.
   case "$spec" in
-    repo|synthetic-[0-9]*|chain-d[0-9]*|fanout2-d[0-9]*|wide-[0-9]*x[0-9]*|longpath-d[0-9]*n[0-9]*w[0-9]*f[0-9]*) ;;
+    repo|synthetic-[0-9]*|chain-d[0-9]*|fanout2-d[0-9]*|wide-[0-9]*x[0-9]*|longpath-d[0-9]*n[0-9]*w[0-9]*f[0-9]*|distinct-[0-9]*x[0-9]*n[0-9]*|fatchain-d[0-9]*) ;;
     *) echo "unknown fixture spec: $spec" >&2; exit 2 ;;
   esac
   case "$spec" in *[!a-z0-9-]*) echo "unsafe fixture spec: $spec" >&2; exit 2 ;; esac
@@ -51,6 +53,13 @@ if [ -n "$LIMITS_JSON" ]; then
   limits_re="^\\{${limit_pair}(,${limit_pair})*\\}\$"
   [[ "$LIMITS_JSON" =~ $limits_re ]] || { echo "LIMITS_JSON must be a one-line JSON object of positive integers (max 15 digits): $LIMITS_JSON" >&2; exit 2; }
   [ -z "$SMOKE_INJECT" ] || { echo "LIMITS_JSON and SMOKE_INJECT cannot be combined" >&2; exit 2; }
+fi
+LIMITS_TAG="${LIMITS_TAG:-}"
+validation_suffix="__validation"
+if [ -n "$LIMITS_TAG" ]; then
+  [ -n "$LIMITS_JSON" ] || { echo "LIMITS_TAG requires LIMITS_JSON" >&2; exit 2; }
+  [[ "$LIMITS_TAG" =~ ^[a-z0-9-]{1,40}$ ]] || { echo "LIMITS_TAG must match [a-z0-9-]{1,40}: $LIMITS_TAG" >&2; exit 2; }
+  validation_suffix="__validation-$LIMITS_TAG"
 fi
 
 # shellcheck disable=SC2086 # deliberate word split: count the configurations.
@@ -163,7 +172,7 @@ for config in $MEM_CONFIGS; do
       inject=false
       if [ "$SMOKE_INJECT" = "1" ]; then label="${label}__inject"; inject=true; fi
       limits_field=""
-      if [ -n "$LIMITS_JSON" ]; then label="${label}__validation"; limits_field=",\"limits\":$LIMITS_JSON"; fi
+      if [ -n "$LIMITS_JSON" ]; then label="${label}${validation_suffix}"; limits_field=",\"limits\":$LIMITS_JSON"; fi
       run_job "$name" "$label" "$START_TIMEOUT" \
         "{\"kind\":\"measure\",\"label\":\"$label\",\"fixture\":\"/out/fixtures/$spec\",\"mode\":\"$mode\",\"out\":\"/out/results\",\"tmp\":\"/out/tmp/$label\",\"injectDeadlineAfterSizing\":$inject$limits_field}"
     done

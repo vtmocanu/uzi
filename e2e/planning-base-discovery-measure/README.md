@@ -63,6 +63,8 @@ entry and path-byte counts (decimal strings; see the charge model below).
 | `fanout2-dD` | binary DAG of D+1 distinct trees whose traversal visits 2^(D+1)-1 tree and 2^D leaf occurrences |
 | `wide-FxW` | **extra, beyond the issue's spec**: one W-entry leaf tree referenced F times |
 | `longpath-dDnNwWfF` | **extra**: long-name chain, see below |
+| `distinct-FxWnL` | **extra**: F directories, each its own W-file leaf tree, L-byte names, all F*W blobs distinct (maximal sizing batch), see below |
+| `fatchain-dD` | **extra**: D nested directories, every tree near 2 MiB (peak-memory worst case), see below |
 
 `repo` and `synthetic-*` clones are checked out. The adversarial bases are cloned with
 `--no-checkout`, because their exploded working tree cannot exist. Discovery reads only `.git`
@@ -86,6 +88,31 @@ refuse a spec outside the grammar, a `namelen` too short for its index digits, a
 object over the helper's 2 MiB per-object cap (checked analytically, then again with
 `git cat-file -s`). Occurrences: `1 + fan*depth` trees, `fan*width` files. Example:
 `longpath-d60n200w100f2`.
+
+### `distinct-<F>x<W>n<L>`
+
+The root holds F directories (`d000000`..., fixed width, so F <= 1,000,000). Each references its
+OWN leaf tree of W regular files named exactly L bytes (`f`, the zero-padded index, then `x`
+fill; `L >= 1 + digits(W-1)`, `L <= 255`). Every blob is distinct across the whole fixture
+(content is the global index and a newline), so there are F*W distinct blobs and the helper's
+sizing batch (`cat-file --batch-check` over all distinct blob ids) is maximal after discovery
+completes. Generated with one `git fast-import` stream (inline blobs, fast-import builds the
+trees; the root tree is the commit's tree), so F*W near 1.2 million is practical. The generator
+and model refuse any tree object over the helper's 2 MiB per-object cap (checked analytically,
+then with `git cat-file -s` on the root and the first and last leaf tree). The manifest adds
+`distinctBlobs` and `maxTreeObjectBytes`. Occurrences: `1 + F` trees, `F*W` files. Example:
+`distinct-1171x1024n75` (1,199,104 files).
+
+### `fatchain-d<depth>`
+
+A chain of `depth` (1..64) nested directories; the root is helper depth 0. Every tree holds
+60,000 filler regular files (one shared blob, names `f` + 5 digits) and, except the deepest, a
+directory entry `0` that sorts first in canonical order (`0/` before `f...`; the generator asserts
+it from `git ls-tree`). Each tree object is 2,040,028 bytes (1.95 MiB), under the 2 MiB cap. The
+helper descends at the first entry, so every ancestor's tree buffer is live at the deepest point
+while only `depth` entries are charged: up to `depth + 1` near-2-MiB buffers at once. Total filler
+(`(depth+1) * 60000` entries) exceeds the planned entry cap, so during unwinding the row refuses
+with `base_discovery_entry_cap` after the peak. The manifest adds `maxTreeObjectBytes`.
 
 ## Charge model and basis labels
 
@@ -111,6 +138,13 @@ cd agent && node --import tsx test/planning-base-discovery.measure.ts \
   '{"kind":"model","spec":"longpath-d60n200w100f2","entryCap":100,"pathByteCap":50000}'
 ```
 
+`at` may be one index or an array (`"at":[3000,2999]`). One index prints `prefixAt`; an array
+prints `prefixAts` (`em` = i and `pm` = Pm(i) per index). Both also print `probes`: for each index
+`i`, the 7f probe pair as ready-to-paste `limits` objects and `limitsJson` strings.
+`(entryCap=i, pathByteCap=Pm(i)-1)` must refuse with `base_discovery_path_byte_cap`, and
+`(entryCap=i, pathByteCap=Pm(i))` with `base_discovery_entry_cap`. A pair is `null` when the walk
+is too short, the cap would be 0, or it exceeds `run.sh`'s 15-digit bound.
+
 Every charge in a record or table carries one basis label:
 
 | label | meaning |
@@ -122,15 +156,15 @@ Every charge in a record or table carries one basis label:
 
 The caps come from the limits the helper actually receives. `GitCache` keeps its defaults in a
 private field (`PLANNING_LIMITS` is not exported), which the harness reads, so a production row
-uses whatever caps the helper ships with and records them under `limits`. Before the helper
-defines the base-discovery caps, `entryCap`/`pathByteCap` are `null` and a cap refusal is
-recorded as `derived.charge: null` with a reason.
+uses whatever caps the helper ships with and records them under `limits`. A cap refusal whose
+cap value the harness cannot read is recorded as `derived.charge: null` with a reason and the
+`CAP_UNKNOWN` failure flag.
 
 ## Validation jobs (injected limits)
 
 A measure job may carry `"limits": {...}`: positive safe integers merged over the helper's
 defaults and injected with `GitCache.setPlanningLimitsForTest`. Keys must be existing planning
-limits, or `baseDiscoveryEntryCap` / `baseDiscoveryPathByteCap`. The record sets
+limits (the two base-discovery caps are among them). The record sets
 `validation: true` and the report labels the row `validation`. In `run.sh`:
 
 ```sh
@@ -141,6 +175,10 @@ LIMITS_JSON='{"baseDiscoveryEntryCap":1000}' OUT=/abs/out FIXTURES="fanout2-d8" 
 15 digits; `run.sh` refuses anything else before starting a container, and the label gets a
 `__validation` suffix. Without it every row runs on the production defaults. It cannot be
 combined with `SMOKE_INJECT`, and one invocation's rows are all validation or all production.
+
+Rows of two `LIMITS_JSON` invocations into the same `OUT` overwrite each other unless their
+labels differ. Set `LIMITS_TAG` (`[a-z0-9-]{1,40}`, requires `LIMITS_JSON`) to append it to the
+label as `__validation-<tag>`, e.g. `LIMITS_TAG=probe3000-path`.
 
 ## Modes and metrics
 
