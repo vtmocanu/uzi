@@ -1,10 +1,15 @@
-import { afterEach, beforeEach, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { randomBytes, randomUUID } from "node:crypto";
 import type { PodEpochReclaimScope } from "../templates/pod-epoch-init.cjs";
-import { acquireWorkerLifetime } from "../src/authority-lock.js";
+import { acquireWorkerLifetime, type WorkerLifetime } from "../src/authority-lock.js";
+import { openAuthorityStore, type AuthorityFsOps, type SlotSnapshot } from "../src/completion-authority.js";
+import { runPodEpochShadow, PodEpochSettlementError, type PodEpochDeletionDeps } from "../src/pod-epoch-reclaim.js";
+import type { PodEpochOwnership } from "../src/pod-epoch-lock.js";
+import { daemon, ENABLE_DELETION_FOR_TEST } from "./pod-epoch-reclaim-support.js";
 import { AuthorityRuntime } from "../src/authority-runtime.js";
 import { RunRunner } from "../src/runner.js";
 import { testLockOptions } from "./authority-test-support.js";
@@ -497,4 +502,347 @@ for (const point of ["clear:before-rawverify", "clear:after"]) it(`keeps replace
   assert.equal((await discard()).kind, "unknown");
   assert.equal(scope.stopped(), true); assert.ok(scope.pendingMutations > 0);
   assert.equal(journal(), "");
+});
+
+
+// The worker lifetime lock is per process and per data dir, so only this block acquires it (the caller-owns-end
+// test above acquires its own).
+describe("M1b epoch reclaim over real Git and authority", () => {
+// ---- M1b: the coordinator over a REAL GitCache and AuthorityRuntime, crash recovery through fresh instances ----
+const evidenceBytes = fs.readFileSync(new URL("../../fixtures/pod-epoch/v2/positive.json", import.meta.url));
+const evidenceDoc = JSON.parse(evidenceBytes.toString());
+const TOKEN = "epoch-reclaim-" + randomBytes(12).toString("hex");
+let lifetime: WorkerLifetime;
+interface Stack {
+  authority: AuthorityRuntime; git: GitCache; scope: PodEpochReclaimScope;
+  state: { pending: number; stopped: boolean; finished: number };
+}
+/** A FRESH GitCache plus a FRESH AuthorityRuntime (new incarnation, same worker lifetime) and a fresh native scope. */
+function stack(ops?: AuthorityFsOps): Stack {
+  const authority = new AuthorityRuntime({ lifetime, workerToken: TOKEN, workerIncarnation: randomUUID(), timeoutMs: 5000,
+    ...(ops ? { ops } : {}) });
+  const g = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ authority: authority.hooks }));
+  const state = { pending: 0, stopped: false, finished: 0 };
+  const scope: PodEpochReclaimScope = {
+    assertExclusive() { if (state.stopped) throw new Error("stopped"); },
+    get pendingMutations() { return state.pending; },
+    beginMutation() {
+      state.pending++; let settled = false;
+      return { settle() { if (!settled) { settled = true; state.pending--; } } };
+    },
+    inheritStdio(stdio = ["pipe", "pipe", "pipe"]) { return [...stdio]; },
+    stop() { state.stopped = true; }, stopped: () => state.stopped,
+    assertSettled() { if (state.stopped || state.pending) throw new Error("unsettled"); },
+    finish() { this.assertSettled(); state.finished++; },
+  };
+  return { authority, git: g, scope, state };
+}
+async function slotOf(rt: AuthorityRuntime, p: string): Promise<SlotSnapshot | null> {
+  return rt.withTransaction(async tx => {
+    const store = await openAuthorityStore(tx, { workerToken: TOKEN });
+    return store.readSlot(tx, await store.slotKey(tx, p));
+  });
+}
+function faultAt(s: Stack, step: string, action: () => Promise<void>) {
+  (s.git as unknown as { epochSettlementFault: (name: string) => Promise<void> }).epochSettlementFault = async name => {
+    if (name === step) await action();
+  };
+}
+type Outcome = { result?: NonNullable<Awaited<ReturnType<typeof runPodEpochShadow>>>; error?: unknown; handovers: number };
+async function epoch(s: Stack, tune?: (o: Parameters<typeof runPodEpochShadow>[0], deps: PodEpochDeletionDeps) => void): Promise<Outcome> {
+  const d = await daemon();
+  const timers: Array<() => void> = [];
+  const lane = { executionTails: new Map(), inventoryReservations: new Map(), activeRuns: new Map() };
+  let handovers = 0;
+  const ownership: PodEpochOwnership = {
+    mode: "exclusive", beginReclaim: () => s.scope,
+    consume: async () => { throw new Error("consume already performed"); },
+    matchesEntry: () => true, reacquireShared: async () => { handovers++; }, close: () => {},
+  };
+  const deps: PodEpochDeletionDeps = {
+    enableForTest: ENABLE_DELETION_FOR_TEST, authority: s.authority,
+    reserve: ((runId: string, action: (eligible: () => boolean) => Promise<unknown>) =>
+      RunRunner.prototype.withSourceReservation.call(lane as unknown as RunRunner, runId, action)) as PodEpochDeletionDeps["reserve"],
+    quiesce: async () => true, git: s.git,
+  };
+  const options: Parameters<typeof runPodEpochShadow>[0] = {
+    bootstrap: { podUid: evidenceDoc.successor, runtime: evidenceDoc.runtime, evidenceFile: "/etc/uzi/pod-epoch/evidence", firstMode: "exclusive" },
+    ownership, consumption: { result: "fresh", mayEvaluate: true }, signal: new AbortController().signal,
+    dockerHost: d.host, readEvidence: async () => evidenceBytes, kernelRelease: () => "6.1.0-test",
+    client: {
+      listRecoveryHolds: async run_id => ({ run_id, holds: [], run_open_holds: { run_id, count: 0 } }),
+      getRunOwnership: async () => ({ status: "completed" }),
+    },
+    git: s.git, deletion: deps,
+    schedule: (callback, ms) => { const t = setTimeout(callback, ms); const c = () => clearTimeout(t); timers.push(c); return c; },
+  };
+  tune?.(options, deps);
+  try { return { result: (await runPodEpochShadow(options))!, handovers }; }
+  catch (error) { return { error, handovers }; }
+  finally { for (const cancel of timers) cancel(); await d.close(); }
+}
+beforeEach(async () => { lifetime = await acquireWorkerLifetime(fs.realpathSync(fx.dataDir), testLockOptions()); });
+
+it("M1b: an eligible attested pass physically reclaims a clean epoch source through the real coordinator", async () => {
+  const s = stack();
+  const out = await epoch(s);
+  assert.equal(out.error, undefined);
+  assert.equal(out.result!.would_delete, 1);
+  assert.equal(out.result!.deleted, 1); assert.equal(out.result!.verdict, "eligible"); assert.equal(out.result!.reason, "reclaim_complete");
+  assert.equal(fs.existsSync(clonePath), false); assert.equal(journal(), "");
+  assert.equal(JSON.parse(ledger().at(-1)!).state, "retired");
+  assert.equal(s.state.finished, 1); assert.equal(out.handovers, 1);
+  assert.equal((await slotOf(stack().authority, clonePath))?.state, "retired");
+});
+
+/** A process-death emulation for the authority store: the Nth slot or head rename fails and every later one too. */
+function crashOps() {
+  const control = { dead: false, failSlot: 0, failHead: 0, slot: 0, head: 0 };
+  const ops: AuthorityFsOps = {
+    syncFile: h => h.sync(), syncDir: h => h.sync(),
+    rename: async (a, b) => {
+      if (control.dead) throw new Error("process dead");
+      const kind = path.basename(path.dirname(b)) === "heads" ? "head" : "slot";
+      const n = ++control[kind];
+      if (n === (kind === "slot" ? control.failSlot : control.failHead)) { control.dead = true; throw new Error("injected crash"); }
+      fs.renameSync(a, b);
+    },
+  };
+  return { control, ops };
+}
+async function crashed(arm: (control: ReturnType<typeof crashOps>["control"], s: Stack) => void) {
+  const { control, ops } = crashOps();
+  const s = stack(ops);
+  await slotOf(s.authority, clonePath); // open the store first, so only the discard's saves are counted
+  control.slot = 0; control.head = 0;
+  arm(control, s);
+  const out = await epoch(s);
+  return { out, s, control };
+}
+/** What a restarted worker sees: a FRESH GitCache, a FRESH AuthorityRuntime and a fresh native scope. */
+async function afterRestart() {
+  const fresh = stack();
+  return { fresh, slot: await slotOf(fresh.authority, clonePath) };
+}
+const crashRows: Array<{
+  name: string; arm: (control: ReturnType<typeof crashOps>["control"], s: Stack) => void;
+  first: "refused" | "fatal"; slot: (slot: SlotSnapshot | null) => void; next: "retaken" | "settled" | "kept";
+}> = [
+  { name: "before the takeover save", arm: c => { c.failSlot = 1; }, first: "refused",
+    slot: slot => assert.equal(slot, null), next: "retaken" },
+  { name: "inside the takeover save (slot renamed, head stale)", arm: c => { c.failHead = 1; }, first: "refused",
+    slot: slot => { assert.equal(slot?.state, "retiring"); assert.equal(slot?.pending ?? null, null); }, next: "retaken" },
+  { name: "after the takeover, before beginDestructive", arm: c => { c.failSlot = 2; }, first: "fatal",
+    slot: slot => { assert.equal(slot?.state, "retiring"); assert.equal(slot?.pending ?? null, null); }, next: "retaken" },
+  { name: "inside the beginDestructive save", arm: c => { c.failHead = 2; }, first: "fatal",
+    slot: slot => { assert.equal(slot?.state, "retiring"); assert.equal(slot?.pending?.status, "running"); }, next: "kept" },
+  { name: "after the beginDestructive save, before its settle", arm: c => { c.failSlot = 3; }, first: "fatal",
+    slot: slot => { assert.equal(slot?.state, "retiring"); assert.equal(slot?.pending?.status, "running"); }, next: "kept" },
+];
+for (const row of crashRows) it(`crash table: ${row.name}`, async () => {
+  const { out, s } = await crashed(row.arm);
+  if (row.first === "fatal") assert.ok(out.error instanceof PodEpochSettlementError, String(out.error));
+  else { assert.equal(out.error, undefined); assert.equal(out.result!.kept_after_refusal, 1); assert.equal(out.result!.verdict, "partial"); }
+  assert.equal(out.handovers, row.first === "refused" ? 1 : 0, "a fatal row never reaches the shared handover");
+  assert.equal(s.state.stopped || s.state.pending > 0, row.first === "fatal");
+  const { fresh, slot } = await afterRestart();
+  row.slot(slot);
+  const next = await epoch(fresh);
+  assert.equal(next.error, undefined);
+  if (row.next === "kept") {
+    assert.equal(next.result!.would_delete + next.result!.would_settle, 1, "still discoverable");
+    assert.equal(next.result!.kept_after_refusal, 1); assert.equal(next.result!.deleted + next.result!.settled, 0);
+    assert.equal(next.result!.verdict, "partial"); assert.equal(next.result!.reason, "reclaim_partial");
+    assert.equal((await slotOf(stack().authority, clonePath))?.pending?.status, "running");
+  } else {
+    assert.equal(next.result!.reason, "reclaim_complete");
+    assert.equal(next.result!.deleted + next.result!.settled, 1);
+    assert.equal(fs.existsSync(clonePath), false); assert.equal(journal(), "");
+    assert.equal((await slotOf(stack().authority, clonePath))?.state, "retired");
+  }
+});
+
+// Rows driven by a Git-side settlement fault: the fault IS the crash, so the authority store dies with it.
+for (const row of [
+  { name: "after settle ok, before the retired append", step: "before-retiredappend", ledgerAfter: 1 },
+  { name: "after the retired append, before the clear (shape c)", step: "before-clear", ledgerAfter: 2 },
+]) it(`crash table: ${row.name}`, async () => {
+  const { control, ops } = crashOps();
+  const s = stack(ops);
+  await slotOf(s.authority, clonePath);
+  faultAt(s, row.step, async () => { control.dead = true; throw new Error("process died"); });
+  const out = await epoch(s);
+  assert.ok(out.error instanceof PodEpochSettlementError); assert.equal(out.handovers, 0);
+  assert.equal(fs.existsSync(clonePath), false); assert.equal(ledger().length, row.ledgerAfter); assert.equal(journal(), raw);
+  const { fresh, slot } = await afterRestart();
+  assert.equal(slot?.state, "retiring"); assert.equal(slot?.pending ?? null, null);
+  const next = await epoch(fresh);
+  assert.equal(next.error, undefined);
+  // The footprint is already gone: metadata settlement only, and the retired append is never duplicated.
+  assert.equal(next.result!.settled, 1); assert.equal(next.result!.deleted, 0);
+  assert.equal(next.result!.verdict, "eligible"); assert.equal(next.result!.reason, "reclaim_complete");
+  assert.equal(ledger().length, 2); assert.equal(JSON.parse(ledger()[1]!).state, "retired"); assert.equal(journal(), "");
+  assert.equal((await slotOf(stack().authority, clonePath))?.state, "retired");
+});
+it("crash table: after settle failed the slot stays retiring + settled_failed, is ordinarily refused, then retaken and completed", async () => {
+  const original = fs.promises.rm;
+  fs.promises.rm = async () => { throw Object.assign(new Error("denied"), { code: "EACCES" }); };
+  let first: Outcome;
+  const s = stack();
+  try { first = await epoch(s); } finally { fs.promises.rm = original; }
+  assert.equal(first.error, undefined);
+  assert.equal(first.result!.kept_residue, 1); assert.equal(first.result!.deleted, 0);
+  assert.equal(first.result!.verdict, "partial"); assert.equal(first.result!.reason, "reclaim_partial");
+  assert.equal(first.handovers, 1); assert.equal(s.state.finished, 1);
+  assert.ok(fs.existsSync(clonePath)); assert.equal(journal(), raw); assert.equal(ledger().length, 1);
+  const { fresh, slot } = await afterRestart();
+  assert.equal(slot?.state, "retiring"); assert.equal(slot?.pending?.status, "settled_failed");
+  // Ordinary admission is refused while the retirement is unfinished.
+  await assert.rejects(fresh.authority.withTransaction(() => fresh.authority.hooks.admitSourceUse(clonePath, "seed-attempt")),
+    /unresolved pending footprint/);
+  const next = await epoch(fresh);
+  assert.equal(next.error, undefined);
+  assert.equal(next.result!.deleted, 1); assert.equal(next.result!.reason, "reclaim_complete");
+  assert.equal(fs.existsSync(clonePath), false); assert.equal(journal(), "");
+  assert.equal((await slotOf(stack().authority, clonePath))?.state, "retired");
+});
+it("crash table: after the clear but before the end save (shape b) the next epoch runs the barriers only and tombstones", async t => {
+  const { control, ops } = crashOps();
+  const s = stack(ops);
+  await slotOf(s.authority, clonePath);
+  control.failSlot = 4; // the end-of-use save; saves 1-3 are the takeover, beginDestructive and its settle
+  const out = await epoch(s);
+  assert.equal(out.error, undefined);
+  assert.equal(fs.existsSync(clonePath), false); assert.equal(journal(), ""); assert.equal(ledger().length, 2);
+  const { fresh, slot } = await afterRestart();
+  assert.equal(slot?.state, "retiring");
+  t.mock.method(fs.promises, "rm", async () => { assert.fail("shape b is metadata barriers only"); });
+  const before = ledger();
+  const next = await epoch(fresh);
+  assert.equal(next.error, undefined);
+  assert.equal(next.result!.settled, 1); assert.equal(next.result!.deleted, 0); assert.equal(next.result!.reason, "reclaim_complete");
+  assert.deepEqual(ledger(), before, "no duplicate append");
+  assert.equal((await slotOf(stack().authority, clonePath))?.state, "retired");
+});
+it("crash table: after the end save the tombstone is idempotent, unlike a settled keep", async t => {
+  const first = await epoch(stack());
+  assert.equal(first.result!.deleted, 1);
+  assert.equal((await slotOf(stack().authority, clonePath))?.state, "retired");
+  t.mock.method(fs.promises, "rm", async () => { assert.fail("nothing is left to delete"); });
+  const again = await epoch(stack());
+  assert.equal(again.error, undefined); assert.equal(again.result!.deleted, 0);
+  assert.equal(again.result!.verdict, "eligible");
+  assert.equal((await slotOf(stack().authority, clonePath))?.state, "retired");
+  assert.equal(journal(), ""); assert.equal(ledger().length, 2);
+});
+it("a head-write failure after the takeover slot rename is completed by the next epoch; a read-only classification refuses it", async () => {
+  const { control, ops } = crashOps();
+  const s = stack(ops);
+  await slotOf(s.authority, clonePath);
+  control.failHead = 1;
+  const out = await epoch(s);
+  assert.equal(out.error, undefined);
+  assert.equal(out.result!.kept_after_refusal, 1); assert.equal(out.result!.verdict, "partial");
+  assert.ok(fs.existsSync(clonePath), "the source is kept");
+  // A read-only classification never completes the slot that is one ahead of its head: it answers `other`.
+  const fresh = stack();
+  assert.equal((await fresh.authority.classifySourceAdmission(clonePath, undefined)).kind, "other");
+  const next = await epoch(fresh);
+  assert.equal(next.result!.deleted, 1); assert.equal(fs.existsSync(clonePath), false);
+});
+it("a successor journal installed during the pass is never cleared, even by the next epoch", async () => {
+  const successor = JSON.stringify({ ...JSON.parse(raw), runId: "successor" });
+  const { control, ops } = crashOps();
+  const s = stack(ops);
+  await slotOf(s.authority, clonePath);
+  faultAt(s, "before-clear", async () => { setJournal(successor); control.dead = true; });
+  const out = await epoch(s);
+  assert.ok(out.error instanceof PodEpochSettlementError);
+  assert.equal(journal(), successor);
+  const next = await epoch(stack());
+  assert.equal(journal(), successor);
+  assert.equal(next.result?.deleted ?? 0, 0);
+});
+
+async function plantSecond() {
+  const run = "run-epoch-discard-2", branch = "agent/issue-3432";
+  const attempt = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "0000000000000002");
+  const clone = await git.runnerCloneForBranch(bare, branch, "issue-3432", noProofReseed, run, false, undefined,
+    { attemptId: attempt, isLive: () => false, beforeSeed: async () => {} });
+  await git.markRecoveryCapture(bare, clone.path, branch, run, attempt);
+  return { path: clone.path, run, branch };
+}
+it("mixed pass: a deleted source and a pre-effect refusal; the refused slot is restored and usable", async () => {
+  const second = await plantSecond();
+  const s = stack();
+  const out = await epoch(s, (_o, deps) => { deps.quiesce = async paths => !paths.includes(second.path); });
+  assert.equal(out.error, undefined);
+  assert.equal(out.result!.would_delete, 2);
+  assert.equal(out.result!.deleted, 1); assert.equal(out.result!.kept_after_refusal, 1);
+  assert.equal(out.result!.verdict, "partial"); assert.equal(out.result!.reason, "reclaim_partial");
+  assert.equal(fs.existsSync(clonePath), false); assert.ok(fs.existsSync(second.path));
+  assert.equal(out.handovers, 1); assert.equal(s.state.finished, 1);
+  const fresh = stack();
+  assert.equal((await slotOf(fresh.authority, clonePath))?.state, "retired");
+  assert.equal(await slotOf(fresh.authority, second.path), null, "the refused source was never taken over");
+  // The refused slot is usable: an ordinary admission succeeds and a retry of the epoch reclaims it.
+  await fresh.authority.withTransaction(() => fresh.authority.hooks.admitSourceUse(second.path, "seed-attempt"));
+  assert.equal((await slotOf(fresh.authority, second.path))?.state, "active");
+  const next = await epoch(fresh);
+  assert.equal(next.error, undefined); assert.equal(next.result!.deleted, 1);
+  assert.equal(fs.existsSync(second.path), false);
+});
+it("mixed pass: a deleted source and a residue failure; the residue slot is retaken and completed by the next epoch", async () => {
+  const second = await plantSecond();
+  const original = fs.promises.rm;
+  const guarded = ((target: string, ...rest: unknown[]) => String(target).startsWith(second.path) ?
+    Promise.reject(Object.assign(new Error("denied"), { code: "EACCES" })) :
+    (original as (...a: unknown[]) => Promise<void>)(target, ...rest)) as typeof fs.promises.rm;
+  fs.promises.rm = guarded;
+  let out: Outcome;
+  try { out = await epoch(stack()); } finally { fs.promises.rm = original; }
+  assert.equal(out.error, undefined);
+  assert.equal(out.result!.deleted, 1); assert.equal(out.result!.kept_residue, 1);
+  assert.equal(out.result!.verdict, "partial"); assert.equal(out.result!.reason, "reclaim_partial");
+  assert.equal(fs.existsSync(clonePath), false); assert.ok(fs.existsSync(second.path));
+  const fresh = stack();
+  assert.equal((await slotOf(fresh.authority, clonePath))?.state, "retired");
+  const slot = await slotOf(fresh.authority, second.path);
+  assert.equal(slot?.state, "retiring"); assert.equal(slot?.pending?.status, "settled_failed");
+  await assert.rejects(fresh.authority.withTransaction(() => fresh.authority.hooks.admitSourceUse(second.path, "seed-attempt")),
+    /unresolved pending footprint/);
+  const next = await epoch(fresh);
+  assert.equal(next.error, undefined); assert.equal(next.result!.reason, "reclaim_complete");
+  assert.equal(fs.existsSync(second.path), false);
+  assert.equal((await slotOf(stack().authority, second.path))?.state, "retired");
+});
+it("with the production flag value a real eligible attested pass mutates nothing", async () => {
+  const s = stack();
+  const before = fs.readFileSync(path.join(bare, "config"));
+  const out = await epoch(s, (o) => { delete o.deletion!.enableForTest; });
+  assert.equal(out.error, undefined);
+  assert.equal(out.result!.would_delete, 1); assert.equal(out.result!.deleted, 0);
+  assert.equal(out.result!.verdict, "eligible"); assert.equal(out.result!.reason, "shadow_complete");
+  assert.ok(fs.existsSync(clonePath)); assert.deepEqual(fs.readFileSync(path.join(bare, "config")), before);
+  assert.equal(await slotOf(stack().authority, clonePath), null);
+  assert.equal(s.state.finished, 0);
+});
+it("a no-key attempt is an unrecoverable shape: the shadow counts it, the coordinator refuses it before any proof", async () => {
+  const entry = { ...JSON.parse(ledger()[0]!), state: "abandoned" };
+  gitIn(["config", "--local", "--add", `uzi-attempts.${BRANCH}.entry`, JSON.stringify(entry)]);
+  gitIn(["config", "--local", "--unset-all", `uzi-recovery.${BRANCH}.clone`]);
+  const before = fs.readFileSync(path.join(bare, "config"));
+  let proofs = 0;
+  const s = stack();
+  const create = s.git.createEpochDiscardProof.bind(s.git);
+  s.git.createEpochDiscardProof = input => { proofs++; return create(input); };
+  const out = await epoch(s);
+  assert.equal(out.error, undefined);
+  assert.equal(out.result!.would_delete, 1);
+  assert.equal(out.result!.kept_unrecoverable_shape, 1); assert.equal(out.result!.deleted, 0);
+  assert.equal(out.result!.verdict, "eligible"); assert.equal(out.result!.reason, "reclaim_complete");
+  assert.equal(proofs, 0); assert.ok(fs.existsSync(clonePath));
+  assert.deepEqual(fs.readFileSync(path.join(bare, "config")), before);
+  assert.equal(await slotOf(stack().authority, clonePath), null);
+});
 });
