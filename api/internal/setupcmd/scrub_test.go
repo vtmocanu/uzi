@@ -62,7 +62,7 @@ func TestRunScrubsTheTokenFromServiceLogLines(t *testing.T) {
 // strings only best-effort), so setup prints a fixed message instead of the raw
 // error on both streams (PR #3956 review, item 8).
 func TestRunDatabaseOpenErrorPrintsAFixedMessage(t *testing.T) {
-	const password = "s3cretDbPassw0rd"
+	const password = "s3cretDbPassw0rd" //gitleaks:allow fixture password for the database-error redaction test, not a credential
 	h := newHarness()
 	h.openErr = errors.New("cannot parse `postgres://uzi:" + password + "@db/uzi`: failed")
 	if code := h.run(context.Background(), baseArgs("--repos", "acme/app")...); code != ExitUsage {
