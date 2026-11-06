@@ -105,9 +105,9 @@ source at commit `6aaac694` (`codex-rs/core/src/client.rs:957-966`).
 - A resume that reattaches to a still-running Codex thread keeps that thread's
   level.
 
-Workers report the catalog default when an issue or lead-lane Codex run starts
-(from its `model/list` probe; cross-check, review and judge runs do not
-report), once per claim and without retry. The
+Workers report the catalog default when an issue or other lead Codex run starts
+(from its `model/list` probe; cross-check, review, judge, chat, job and
+isolated-lane runs do not report), once per claim and without retry. The
 server stores it per user and per Codex credential (and, for a subscription,
 account). Settings show the report for the credential a new run of yours would
 use, if it is at most 30 days old. The Codex **Runtime default** option reads:

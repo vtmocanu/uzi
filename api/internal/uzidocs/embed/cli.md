@@ -3126,7 +3126,7 @@ effort  claude  runtime default  medium  runtime default (value not reported)  y
 ```
 
 When the preference is Runtime default, the Codex row's `RESOLVED` shows the
-catalog default last reported for your credential by issue and lead-lane Codex
+catalog default last reported for your credential by issue and other lead Codex
 runs ([details](./worker-effort.md#what-the-codex-catalog-default-means)):
 
 | `RESOLVED` | Meaning |
