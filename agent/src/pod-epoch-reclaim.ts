@@ -32,7 +32,10 @@ export interface PodEpochDeletionDeps {
   authority: Pick<AuthorityRuntime, "withTransaction" | "active" | "endSourceUse">;
   /** Bound to RunRunner.withSourceReservation; resolves undefined when the reservation is refused. */
   reserve<T>(runId: string, action: (eligible: () => boolean) => Promise<T>): Promise<T | undefined>;
-  /** Deny-only capture-mode quiescence over the source paths (bound to terminalMaintenanceProof). */
+  /**
+   * Worker-wide exclusive-idle proof (bound to terminalMaintenanceProof). The paths argument is accepted for
+   * the discard API's shape but is not used to scope the proof.
+   */
   quiesce: (paths: string[]) => Promise<boolean>;
   git: Pick<GitCache, "createEpochDiscardProof" | "discardStoppedSource" | "readEpochJournalVector">;
   /** Test override sentinel only; see {@link EPOCH_RECLAIM_DELETION_ENABLED}. */
@@ -58,6 +61,8 @@ interface Options {
   kernelRelease?: () => string;
   /** M1b deletion dependencies; used only while the activation gate is open. */
   deletion?: PodEpochDeletionDeps;
+  /** Daemon barrier opener; defaults to the real one. A seam for tests only, never passed by main.ts. */
+  openDaemonGuard?: typeof openPodEpochDaemonBarrier;
   /** Operator log for the deletion phase; every field is a fixed token or a count, never controller text. */
   log?: { warn(message: string, fields?: Record<string, unknown>): void };
 }
@@ -356,7 +361,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
     entry();
     decide("attested", "observations_consistent");
     guard = await owned(async () => {
-      const opened = await openPodEpochDaemonBarrier({ dockerHost: options.dockerHost ?? "", signal: controller.signal,
+      const opened = await (options.openDaemonGuard ?? openPodEpochDaemonBarrier)({ dockerHost: options.dockerHost ?? "", signal: controller.signal,
         deadline: hardPass - 5000, now, schedule });
       // If opening outlives fatal refusal, only cleanup may continue, with EX retained.
       if (fatal) { await opened.close(); throw new PodEpochSettlementError(); }
