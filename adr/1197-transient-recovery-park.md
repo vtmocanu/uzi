@@ -1814,8 +1814,15 @@ Accepted residuals: a thin FINAL stays stuck and is retried while the pin or the
 
 Decision record (AI-synced 2026-11-06). This qualifies the #3527 owner hold
 ([amendment](#amendment-2026-10-27-3527-owner-held-retained-adoption-retry)) for
-one cause: an API restart during a rollout made a verified, journaled retained
-successor owner-hold as `adoption_failed` although no integrity check failed.
+one observed failure: during a release rollout, the worker's post-adoption
+ownership check failed (logged `fetch failed`, then
+`retained_successor_post_adoption_check`) for a verified, journaled retained
+successor. The rollout timing is consistent with temporary API unavailability,
+but the evidence does not identify the exception of the ownership request, and
+the adoption-failure owner hold in that generation was not confirmed. Before
+this change, any failure of that check that was not a stop followed the
+`adoption_failed` path, including a short connection outage in which no
+integrity check had failed.
 
 **Decision.** After `prepareRecoverySuccessor` has verified and journaled the
 successor, the worker's read-only ownership check (and the second check in the
