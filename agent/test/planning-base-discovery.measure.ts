@@ -5,7 +5,9 @@
 //   UZI_PLANNING_DISCOVERY_MEASURE=1 node --import tsx test/planning-base-discovery.measure.ts job <job.json>
 //
 // Job kinds: `generate` builds one deterministic fixture, `measure` runs one capture through the
-// production GitCache.capturePlanningDiff path, `report` renders the results table. The
+// production GitCache.capturePlanningDiff path, `report` renders the results table, `model`
+// prints the analytic entry/path-byte charge totals for a spec without docker or the opt-in env
+// (`node --import tsx test/planning-base-discovery.measure.ts '{"kind":"model","spec":"chain-d64"}'`). The
 // measured helper is the unchanged PLANNING_CAPTURE_HELPER; instrumented modes only PREPEND a
 // metering preamble to its `-e` program (the technique git-planning-diff.test.ts's meter uses).
 // Nothing here changes a production bound. See the README beside run.sh for metric definitions.
@@ -19,10 +21,8 @@ import type { BoundaryProcessHandle, BoundaryProcessRequest } from "../src/harne
 import type { Logger } from "../src/log.js";
 import { TickSpawner } from "../src/tick-spawner.js";
 
-if (process.env.UZI_PLANNING_DISCOVERY_MEASURE !== "1") {
-  console.error("refusing to run: set UZI_PLANNING_DISCOVERY_MEASURE=1 (opt-in measurement harness, issue #3543)");
-  process.exit(2);
-}
+// The opt-in gate (UZI_PLANNING_DISCOVERY_MEASURE=1) is enforced in main() for every job kind
+// except the pure, read-only `model` kind.
 
 // ---------------------------------------------------------------------------------------------
 // Fixture generation (deterministic: pinned identities and dates, plumbing-built objects).
@@ -48,6 +48,12 @@ interface Manifest {
   // Decimal strings: 2^65 - 1 overflows a JS number.
   expectedTreeOccurrences: string;
   expectedLeafOccurrences: string;
+  // Analytic base-discovery charges (decimal strings), from the charge model below: every tree
+  // entry (leaf or directory, the root's included) per walk occurrence, and the summed full
+  // relative-path bytes of those entries. maxChargedPathBytes is the longest single entry's path.
+  expectedEntryOccurrences: string;
+  expectedPathBytes: string;
+  maxChargedPathBytes: string;
   checkout: boolean;
   generationMs: number;
 }
@@ -59,11 +65,268 @@ function layout(dir: string): { root: string; clone: string; bare: string } {
 
 // Build a tree DAG directly in `bare` from the bottom up and return its root tree id.
 function mktree(bare: string, lines: string[]): string {
-  return git(bare, ["mktree"], lines.join("\n") + "\n");
+  // No lines is the empty tree; a lone blank line is a git mktree format error.
+  return git(bare, ["mktree"], lines.length > 0 ? lines.join("\n") + "\n" : "");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Analytic charge model (never runs the helper). It enumerates tree entries in the helper's walk
+// order: the root's entries in canonical git tree order (names sorted bytewise, a directory
+// compared as name + "/"), descending into a directory as soon as its entry is met. Entry i
+// (1-based) is charged
+//   Em(i) = i                                  entry occurrences, and
+//   Pm(i) = sum over entries 1..i of (bytes of its ancestors' "name/" prefix + its own name bytes),
+// the planned base-discovery entry cap and path-byte cap charges (the entry cap is checked before
+// the path charge of the same entry). A shared directory is charged once per occurrence.
+
+interface ModelNode { entries: { nameLen: number; child?: ModelNode }[] }
+// e: entry occurrences below (and in) the node. b: path bytes of that subtree at prefix length 0;
+// at prefix length p the subtree charges e*p + b. m: longest single-entry path at prefix 0.
+interface NodeStats { e: bigint; b: bigint; m: bigint }
+const statsCache = new WeakMap<ModelNode, NodeStats>();
+function nodeStats(n: ModelNode): NodeStats {
+  const hit = statsCache.get(n);
+  if (hit) return hit;
+  let e = 0n, b = 0n, m = 0n;
+  for (const en of n.entries) {
+    const len = BigInt(en.nameLen);
+    e += 1n; b += len; if (len > m) m = len;
+    if (en.child) {
+      const c = nodeStats(en.child);
+      e += c.e; b += c.e * (len + 1n) + c.b;
+      // An empty subtree (the w0 empty tree) has no entry whose path runs through the directory.
+      if (c.e > 0n && len + 1n + c.m > m) m = len + 1n + c.m;
+    }
+  }
+  const stats = { e, b, m };
+  statsCache.set(n, stats);
+  return stats;
+}
+
+interface ChargeModel {
+  totalEntries: bigint;
+  totalPathBytes: bigint;
+  maxEntryBytes: bigint;
+  // Pm(i), or null when the walk has fewer than i entries. Skips whole subtrees in closed form.
+  prefixAt(i: bigint): bigint | null;
+  // First k with Pm(k) > cap and Pm(k), or null when the total never exceeds cap.
+  firstExceeding(cap: bigint): { k: bigint; p: bigint } | null;
+  // Lazy (i, Pm(i)) stream in walk order; break out of the loop to stop early.
+  stream(): Generator<{ i: bigint; p: bigint }>;
+}
+
+function dagModel(root: ModelNode): ChargeModel {
+  const s = nodeStats(root);
+  return {
+    totalEntries: s.e, totalPathBytes: s.b, maxEntryBytes: s.m,
+    prefixAt(i) {
+      if (i > s.e) return null;
+      let E = 0n, P = 0n;
+      const visit = (n: ModelNode, p: bigint): boolean => {
+        for (const en of n.entries) {
+          if (E >= i) return true;
+          const len = BigInt(en.nameLen);
+          E += 1n; P += p + len;
+          if (en.child) {
+            const c = nodeStats(en.child), cp = p + len + 1n;
+            if (E + c.e <= i) { E += c.e; P += c.e * cp + c.b; }
+            else if (visit(en.child, cp)) return true;
+          }
+        }
+        return E >= i;
+      };
+      visit(root, 0n);
+      return P;
+    },
+    firstExceeding(cap) {
+      let E = 0n, P = 0n;
+      const visit = (n: ModelNode, p: bigint): { k: bigint; p: bigint } | null => {
+        for (const en of n.entries) {
+          const len = BigInt(en.nameLen);
+          E += 1n;
+          if (P + p + len > cap) return { k: E, p: P + p + len };
+          P += p + len;
+          if (en.child) {
+            const c = nodeStats(en.child), cp = p + len + 1n;
+            if (P + c.e * cp + c.b <= cap) { E += c.e; P += c.e * cp + c.b; }
+            else { const r = visit(en.child, cp); if (r) return r; }
+          }
+        }
+        return null;
+      };
+      return visit(root, 0n);
+    },
+    *stream() {
+      let E = 0n, P = 0n;
+      function* walk(n: ModelNode, p: bigint): Generator<{ i: bigint; p: bigint }> {
+        for (const en of n.entries) {
+          const len = BigInt(en.nameLen);
+          E += 1n; P += p + len;
+          yield { i: E, p: P };
+          if (en.child) yield* walk(en.child, p + len + 1n);
+        }
+      }
+      yield* walk(root, 0n);
+    },
+  };
+}
+
+// A real tree (repo, synthetic-N): `ls-tree -r -t` already lists entries in walk order, each with
+// its full path, so the charge of entry i is simply that path's byte length.
+function listingModel(pathBytes: number[]): ChargeModel {
+  const n = pathBytes.length;
+  const cum = Array.from({ length: n + 1 }, () => 0);
+  let max = 0;
+  for (let i = 0; i < n; i++) { cum[i + 1] = (cum[i] ?? 0) + (pathBytes[i] ?? 0); max = Math.max(max, pathBytes[i] ?? 0); }
+  return {
+    totalEntries: BigInt(n), totalPathBytes: BigInt(cum[n] ?? 0), maxEntryBytes: BigInt(max),
+    prefixAt: (i) => (i > BigInt(n) ? null : BigInt(cum[Number(i)] ?? 0)),
+    firstExceeding(cap) {
+      for (let k = 1; k <= n; k++) if (BigInt(cum[k] ?? 0) > cap) return { k: BigInt(k), p: BigInt(cum[k] ?? 0) };
+      return null;
+    },
+    *stream() { for (let i = 1; i <= n; i++) yield { i: BigInt(i), p: BigInt(cum[i] ?? 0) }; },
+  };
+}
+
+function bareListingModel(bare: string, tree: string): ChargeModel {
+  // Raw bytes: git() trims, and -z keeps unusual names unquoted.
+  const out = execFileSync("git", ["-C", bare, "ls-tree", "-r", "-t", "-z", "--name-only", tree],
+    { env: PINNED_ENV, maxBuffer: 1024 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
+  const lens: number[] = [];
+  let at = 0;
+  while (at < out.length) {
+    const end = out.indexOf(0, at);
+    if (end < 0) throw new Error("ls-tree -z output is not NUL terminated");
+    lens.push(end - at);
+    at = end + 1;
+  }
+  return listingModel(lens);
+}
+
+const OBJECT_CAP_BYTES = 2 * 1024 * 1024; // the helper's per-object METADATA_LIMIT
+
+// longpath-d<depth>n<namelen>w<width>f<fan>. Depth convention: the root tree is helper depth 0
+// (the helper refuses depth > 64 with directory_cap). The root holds `fan` directory entries, all
+// naming one shared chain; the chain's deepest tree sits at helper depth `depth`. Along any path
+// that is `depth` directories (the fan name, then depth-1 chain names), so 1 <= depth <= 64 and a
+// deepest file path has depth+1 components (the helper allows 65). The deepest tree holds `width`
+// regular files (`w0`: the empty tree). Every directory and file name is exactly `namelen` bytes:
+// a letter (d fan, c chain, f file), the zero-padded index, then x fill.
+interface Longpath { depth: number; namelen: number; width: number; fan: number; digits: number }
+function parseLongpath(spec: string): Longpath | undefined {
+  const m = /^longpath-d(\d{1,9})n(\d{1,9})w(\d{1,9})f(\d{1,9})$/.exec(spec);
+  if (!m) return undefined;
+  const [depth, namelen, width, fan] = [Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4])];
+  if (depth < 1 || depth > 64) throw new Error(`${spec}: depth must be 1..64 (root is depth 0; helper refuses depth > 64)`);
+  if (fan < 1) throw new Error(`${spec}: fan must be >= 1`);
+  const digits = String(Math.max(width, fan, depth) - 1).length;
+  if (namelen < 1 + digits) throw new Error(`${spec}: namelen must be >= ${1 + digits} to hold a letter and a ${digits}-digit index`);
+  // Tree objects: "40000 " + name + NUL + 20 per directory entry, "100644 " + ... per file.
+  const rootBytes = fan * (namelen + 27), leafBytes = width * (namelen + 28), chainBytes = namelen + 27;
+  for (const [label, bytes] of [["root", rootBytes], ["deepest", leafBytes], ["chain", chainBytes]] as const) {
+    if (bytes > OBJECT_CAP_BYTES) throw new Error(`${spec}: ${label} tree object would be ${bytes} bytes, over the 2 MiB per-object cap`);
+  }
+  return { depth, namelen, width, fan, digits };
+}
+function lpName(letter: string, index: number, p: Longpath): string {
+  return (letter + String(index).padStart(p.digits, "0")).padEnd(p.namelen, "x");
+}
+
+// The shared-DAG fixtures' charge model, built from the spec alone.
+function sharedModel(spec: string): ChargeModel | undefined {
+  let m = /^fanout2-d(\d+)$/.exec(spec);
+  if (m) {
+    let t: ModelNode = { entries: [{ nameLen: 1 }] };
+    for (let k = Number(m[1]) - 1; k >= 0; k--) t = { entries: [{ nameLen: 1, child: t }, { nameLen: 1, child: t }] };
+    return dagModel(t);
+  }
+  m = /^chain-d(\d+)$/.exec(spec);
+  if (m) {
+    let t: ModelNode = { entries: [{ nameLen: 1 }] };
+    for (let k = Number(m[1]) - 1; k >= 0; k--) t = { entries: [{ nameLen: 1, child: t }] };
+    return dagModel(t);
+  }
+  m = /^wide-(\d+)x(\d+)$/.exec(spec);
+  if (m) {
+    const fan = Number(m[1]), width = Number(m[2]);
+    const leaf: ModelNode = { entries: Array.from({ length: width }, () => ({ nameLen: 7 })) };
+    return dagModel({ entries: Array.from({ length: fan }, () => ({ nameLen: 7, child: leaf })) });
+  }
+  const lp = parseLongpath(spec);
+  if (lp) {
+    let t: ModelNode = { entries: Array.from({ length: lp.width }, () => ({ nameLen: lp.namelen })) };
+    for (let level = lp.depth - 1; level >= 1; level--) t = { entries: [{ nameLen: lp.namelen, child: t }] };
+    const top = t;
+    return dagModel({ entries: Array.from({ length: lp.fan }, () => ({ nameLen: lp.namelen, child: top })) });
+  }
+  return undefined;
+}
+
+function fixtureModel(spec: string, bare?: string, tree?: string): ChargeModel {
+  const shared = sharedModel(spec);
+  if (shared) return shared;
+  if (spec === "repo" || /^synthetic-\d+$/.test(spec)) {
+    if (!bare || !tree) throw new Error(`${spec}: the charge model reads the generated tree; pass a fixture dir`);
+    return bareListingModel(bare, tree);
+  }
+  throw new Error(`unknown fixture spec ${spec}`);
+}
+
+const BASE_ENTRY_CAP = "baseDiscoveryEntryCap", BASE_PATH_BYTE_CAP = "baseDiscoveryPathByteCap";
+const DERIVED_BASIS = "derived-from-refusal (unverified until 7f probe)";
+
+interface DerivedCharge { basis: string; token: string; entries: string; pathBytes: string; entryCap: string | null; pathByteCap: string | null }
+
+// A cap refusal reveals which entry tripped it, so the charge at the refusal follows from the
+// model: entry cap: E = cap+1 (refused before that entry's path charge), P = Pm(cap); path-byte
+// cap: k = first i with Pm(i) > cap, E = k, P = Pm(k), and k must not exceed the entry cap.
+function deriveRefusal(model: ChargeModel, token: string | undefined,
+    entryCap: bigint | undefined, pathByteCap: bigint | undefined):
+    { derived: DerivedCharge | null; reason?: string; assertionFailed?: boolean } {
+  const caps = { entryCap: entryCap?.toString() ?? null, pathByteCap: pathByteCap?.toString() ?? null };
+  if (token === "base_discovery_entry_cap") {
+    if (entryCap === undefined) return { derived: null, reason: "entry cap value unknown for this job" };
+    const p = model.prefixAt(entryCap);
+    if (p === null || entryCap + 1n > model.totalEntries) {
+      return { derived: null, reason: `fixture has ${model.totalEntries} entries, fewer than entry cap + 1`, assertionFailed: true };
+    }
+    if (pathByteCap !== undefined && p > pathByteCap) {
+      return { derived: null, reason: `Pm(entryCap)=${p} already exceeds the path-byte cap, which would have refused first`, assertionFailed: true };
+    }
+    return { derived: { basis: DERIVED_BASIS, token, entries: (entryCap + 1n).toString(), pathBytes: p.toString(), ...caps } };
+  }
+  if (token === "base_discovery_path_byte_cap") {
+    if (pathByteCap === undefined) return { derived: null, reason: "path-byte cap value unknown for this job" };
+    const r = model.firstExceeding(pathByteCap);
+    if (r === null) return { derived: null, reason: "fixture never exceeds the path-byte cap", assertionFailed: true };
+    if (entryCap !== undefined && r.k > entryCap) {
+      return { derived: null, reason: `k=${r.k} exceeds the entry cap ${entryCap}, which would have refused first`, assertionFailed: true };
+    }
+    return { derived: { basis: DERIVED_BASIS, token, entries: r.k.toString(), pathBytes: r.p.toString(), ...caps } };
+  }
+  return { derived: null, reason: "not a base-discovery cap refusal" };
 }
 
 function sharedDag(bare: string, spec: string): { tree: string; trees: bigint; leaves: bigint; description: string } {
   const blob = git(bare, ["hash-object", "-w", "--stdin"], "leaf\n");
+  const lp = parseLongpath(spec);
+  if (lp) {
+    const checkSize = (oid: string, label: string): void => {
+      const size = Number(git(bare, ["cat-file", "-s", oid]));
+      if (size > OBJECT_CAP_BYTES) throw new Error(`${spec}: ${label} tree is ${size} bytes, over the 2 MiB per-object cap`);
+    };
+    let t = mktree(bare, Array.from({ length: lp.width }, (_, i) => `100644 blob ${blob}\t${lpName("f", i, lp)}`));
+    checkSize(t, "deepest");
+    for (let level = lp.depth - 1; level >= 1; level--) {
+      t = mktree(bare, [`040000 tree ${t}\t${lpName("c", level, lp)}`]);
+    }
+    const root = mktree(bare, Array.from({ length: lp.fan }, (_, j) => `040000 tree ${t}\t${lpName("d", j, lp)}`));
+    checkSize(root, "root");
+    return { tree: root, trees: 1n + BigInt(lp.fan) * BigInt(lp.depth), leaves: BigInt(lp.fan) * BigInt(lp.width),
+      description: `EXTRA (beyond spec): ${lp.fan} root directories share one chain, deepest tree at helper depth ${lp.depth} ` +
+        `holding ${lp.width} files; every name ${lp.namelen} bytes` };
+  }
   let m = /^fanout2-d(\d+)$/.exec(spec);
   if (m) {
     const depth = Number(m[1]);
@@ -151,9 +414,12 @@ function generate(spec: string, dir: string, inputs: string): Manifest {
   execFileSync("git", ["clone", "--quiet", "--no-local", ...(checkout ? [] : ["--no-checkout"]), bare, clone],
     { env: PINNED_ENV, stdio: "pipe" });
   const commit = git(clone, ["rev-parse", "HEAD"]);
+  const model = fixtureModel(spec, bare, tree);
   const manifest: Manifest = {
     spec, kind: spec.replace(/-.*$/, ""), description, commit, tree,
     expectedTreeOccurrences: trees.toString(), expectedLeafOccurrences: leaves.toString(),
+    expectedEntryOccurrences: model.totalEntries.toString(), expectedPathBytes: model.totalPathBytes.toString(),
+    maxChargedPathBytes: model.maxEntryBytes.toString(),
     checkout, generationMs: Date.now() - started,
   };
   fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify(manifest, null, 2));
@@ -311,6 +577,25 @@ interface MeasureJob {
   tmp: string;
   injectDeadlineAfterSizing?: boolean;
   cancelAfterTreeOccurrences?: number;
+  // Validation jobs only: planning limits merged over the helper's defaults and injected with
+  // GitCache.setPlanningLimitsForTest. Absent means production defaults, always for production rows.
+  limits?: Record<string, number>;
+}
+
+// Positive safe integers only; any key must be a limit the cache already carries, except the two
+// base-discovery caps, which may be injected before they exist in the helper's defaults.
+function validateLimits(limits: unknown, known: Record<string, number>): Record<string, number> {
+  if (typeof limits !== "object" || limits === null || Array.isArray(limits) || Object.keys(limits).length === 0) {
+    throw new Error("limits must be a non-empty JSON object");
+  }
+  const out: Record<string, number> = {};
+  for (const [key, value] of Object.entries(limits)) {
+    if (!/^[A-Za-z][A-Za-z0-9]*$/.test(key)) throw new Error(`limits key ${JSON.stringify(key)} is not an identifier`);
+    if (!(key in known) && key !== BASE_ENTRY_CAP && key !== BASE_PATH_BYTE_CAP) throw new Error(`unknown planning limit ${key}`);
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) throw new Error(`limits.${key} must be a positive safe integer`);
+    out[key] = value;
+  }
+  return out;
 }
 
 type HelperMetrics = Record<string, unknown> & {
@@ -325,7 +610,8 @@ function writeJson(p: string, value: unknown): void {
   fs.renameSync(p + ".tmp", p);
 }
 
-async function measure(job: MeasureJob): Promise<void> {
+// Resolves to the job's failure flags (empty when the record is sound).
+async function measure(job: MeasureJob): Promise<string[]> {
   const manifest = readJson<Manifest>(path.join(job.fixture, "manifest.json"));
   if (!manifest) throw new Error(`fixture ${job.fixture} has no manifest`);
   const { root, clone, bare } = layout(job.fixture);
@@ -412,6 +698,20 @@ async function measure(job: MeasureJob): Promise<void> {
     return handle;
   };
   const cache = new GitCache(root, nullLog);
+  // GitCache keeps its default limits in the private `planningLimits` field (PLANNING_LIMITS is
+  // not exported); reading it records the limits the helper really receives, so production rows
+  // carry whatever caps the helper ships with and a validation row replaces only what it names.
+  const limitsHolder = cache as unknown as { planningLimits: Record<string, number> };
+  const validation = job.limits !== undefined;
+  if (job.limits !== undefined) {
+    cache.setPlanningLimitsForTest({ ...limitsHolder.planningLimits, ...validateLimits(job.limits, limitsHolder.planningLimits) });
+  }
+  const effectiveLimits: Record<string, number> = { ...limitsHolder.planningLimits };
+  const capOf = (key: string): bigint | undefined => {
+    const v = effectiveLimits[key];
+    return typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? BigInt(v) : undefined;
+  };
+  const entryCap = capOf(BASE_ENTRY_CAP), pathByteCap = capOf(BASE_PATH_BYTE_CAP);
   let outcome: Record<string, unknown>;
   let abortToSettledMs: number | null = null;
   const started = Date.now();
@@ -452,8 +752,40 @@ async function measure(job: MeasureJob): Promise<void> {
   // evidence, no cancel) is not a refusal.
   else if (outcome.kind === "refused" && st.completion && "code" in st.completion && st.completion.code === 128
       && live.signals.length === 0) outcome = { ...outcome, kind: "helper_killed_unknown" };
+  // Charges (7b/7c/7d). The meter's tree-entry total (`treeEntries`) counts entries of FETCHED
+  // trees. It equals the charged entry occurrences only when discovery completed; otherwise it is
+  // reported as an upper bound (treeEntriesFetched), never as a charge.
+  const model = fixtureModel(manifest.spec, bare, manifest.tree);
+  const failures: string[] = [];
+  const discoveryCompleted = instrumented && helper?.boundaryMs !== null && helper?.boundaryMs !== undefined;
+  const fetched = typeof helper?.treeEntries === "number" ? helper.treeEntries : null;
+  let charged: Record<string, unknown> | null = null;
+  let derived: DerivedCharge | null = null;
+  let derivedReason: string | null = null;
+  if (discoveryCompleted) {
+    const meterMatch = fetched === null ? null : BigInt(fetched) === model.totalEntries;
+    charged = { basis: "analytic", entries: model.totalEntries.toString(), pathBytes: model.totalPathBytes.toString(),
+      maxEntryPathBytes: model.maxEntryBytes.toString(), meterEntries: fetched, meterMatch };
+    if (meterMatch !== true) failures.push(`METER_MISMATCH: meter fetched ${fetched} tree entries, analytic model ${model.totalEntries}`);
+  } else if (outcome.kind === "refused" && typeof outcome.token === "string"
+      && (outcome.token === "base_discovery_entry_cap" || outcome.token === "base_discovery_path_byte_cap")) {
+    const d = deriveRefusal(model, outcome.token, entryCap, pathByteCap);
+    derived = d.derived;
+    derivedReason = d.reason ?? null;
+    if (d.assertionFailed) failures.push(`DERIVATION_ASSERTION: ${d.reason}`);
+  }
+  if (failures.length > 0) outcome = { ...outcome, flag: failures.join("; ") };
   const result = {
     label: job.label, spec: manifest.spec, fixture: manifest, mode: job.mode,
+    validation,
+    limits: { source: validation ? "job-limits-over-helper-defaults" : "helper-defaults", effective: effectiveLimits,
+      entryCap: entryCap?.toString() ?? null, pathByteCap: pathByteCap?.toString() ?? null },
+    failed: failures.length > 0, failures,
+    treeEntriesFetched: instrumented ? { value: fetched, meaning: discoveryCompleted ? "exact (discovery completed)" : "upper bound on charged entries (discovery incomplete); not a charge" } : null,
+    charged,
+    // Non-null only for a base-discovery cap refusal; `charge` is null (with the reason) when the
+    // cap values are unknown for the job or the model contradicts the token.
+    derived: derived !== null || derivedReason !== null ? { charge: derived, reason: derivedReason } : null,
     memLimit: process.env.MEASURE_MEM_LIMIT ?? null, cpus: process.env.MEASURE_CPUS ?? null,
     node: process.version, gitVersion: (() => { try { return execFileSync("git", ["--version"], { encoding: "utf8" }).trim(); } catch { return null; } })(),
     captureMs, outcome,
@@ -485,6 +817,7 @@ async function measure(job: MeasureJob): Promise<void> {
   };
   writeJson(resultPath, result);
   fs.rmSync(job.tmp, { recursive: true, force: true });
+  return failures;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -500,8 +833,8 @@ function report(out: string): void {
     if (m?.[1] && !f.endsWith(".tmp")) labels.add(m[1]);
   }
   const rows: string[] = [
-    "| fixture | mode | mem/cpus | outcome | discovery done | discovery ms | capture ms | tree occ (obs / expected) | tree entries | discovery object bytes | readSync bytes | helper maxRSS MiB (disc / final) | tree RSS peak MiB (disc / all) | cgroup peak MiB (disc / end) | cancel: settle ms, cleanup |",
-    "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+    "| fixture | mode | mem/cpus | outcome | discovery done | discovery ms | capture ms | tree occ (obs / expected) | treeEntriesFetched (meter; upper bound unless discovery done) | charged entries / path bytes (basis) | discovery object bytes | readSync bytes | helper maxRSS MiB (disc / final) | tree RSS peak MiB (disc / all) | cgroup peak MiB (disc / end) | cancel: settle ms, cleanup |",
+    "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
   ];
   for (const label of [...labels].sort()) {
     const r = readJson<Record<string, any>>(path.join(out, `${label}.json`));
@@ -517,12 +850,27 @@ function report(out: string): void {
       const h = helperRec ?? liveRec?.lastHelper;
       const L = (v: unknown): string => (v === undefined || v === null ? "n/a" : `≥${String(v)}`);
       const objBytes = h ? (h.commitBytes ?? 0) + (h.treeBytes ?? 0) + (h.objectCheckBytes ?? 0) + (h.sizingBytes ?? 0) : undefined;
-      rows.push(`| ${spec} | ${mode} | ${mem} | ${kind} (exit ${term?.exitCode ?? "?"}) | ${h?.boundaryMs != null ? "yes" : "no/unknown"} | ${h?.boundaryMs ?? "n/a"} | ${L(liveRec?.elapsedMs)} | ${L(h?.treeOccurrences)} / ${readJson<Manifest>(path.join(out, "..", "fixtures", spec, "manifest.json"))?.expectedTreeOccurrences ?? "?"} | ${L(h?.treeEntries)} | ${L(objBytes)} | ${L(h?.readSyncBytes)} | ${KiBtoMiB(h?.boundaryMaxRssKiB)} / ${h?.maxRssKiB != null ? "≥" + KiBtoMiB(h.maxRssKiB) : "n/a"} | ${liveRec ? "≥" + MiB(liveRec.treeRssDiscoveryPeak) : "n/a"} / ${liveRec ? "≥" + MiB(liveRec.treeRssPeak) : "n/a"} | ${MiB(liveRec?.cgroupPeakAtBoundary)} / n/a | n/a |`);
+      rows.push(`| ${spec} | ${mode} | ${mem} | ${kind} (exit ${term?.exitCode ?? "?"}) | ${h?.boundaryMs != null ? "yes" : "no/unknown"} | ${h?.boundaryMs ?? "n/a"} | ${L(liveRec?.elapsedMs)} | ${L(h?.treeOccurrences)} / ${readJson<Manifest>(path.join(out, "..", "fixtures", spec, "manifest.json"))?.expectedTreeOccurrences ?? "?"} | fetched ${L(h?.treeEntries)} (not charged) | n/a (no result record) | ${L(objBytes)} | ${L(h?.readSyncBytes)} | ${KiBtoMiB(h?.boundaryMaxRssKiB)} / ${h?.maxRssKiB != null ? "≥" + KiBtoMiB(h.maxRssKiB) : "n/a"} | ${liveRec ? "≥" + MiB(liveRec.treeRssDiscoveryPeak) : "n/a"} / ${liveRec ? "≥" + MiB(liveRec.treeRssPeak) : "n/a"} | ${MiB(liveRec?.cgroupPeakAtBoundary)} / n/a | n/a |`);
       continue;
     }
     let kind: string = r.outcome?.kind ?? "?";
     if (term?.oomKilled === true) kind = "oom";
-    const token = r.outcome?.token ? ` \`${r.outcome.token}\`` : "";
+    const token = (r.outcome?.token ? ` \`${r.outcome.token}\`` : "") + (r.outcome?.flag ? ` **FAIL ${r.outcome.flag}**` : "");
+    const mode2 = r.validation === true && !mode.includes("validation") ? `${mode} (validation)` : mode;
+    const entriesCell = ((): string => {
+      const f = r.treeEntriesFetched;
+      if (!f) return "n/a";
+      return r.discovery?.completed ? `fetched ${f.value ?? "n/a"} (exact)` : `fetched ${f.value ?? "n/a"} (upper bound, not charged)`;
+    })();
+    const chargedCell = ((): string => {
+      if (r.charged) {
+        const meter = r.charged.meterMatch === true ? "meter match" : r.charged.meterMatch === false ? "**METER MISMATCH**" : "meter n/a";
+        return `${r.charged.entries} / ${r.charged.pathBytes} (analytic; ${meter})`;
+      }
+      if (r.derived?.charge) return `${r.derived.charge.entries} / ${r.derived.charge.pathBytes} (${r.derived.charge.basis})`;
+      if (r.derived) return `n/a (derived: null; ${r.derived.reason ?? "unknown"})`;
+      return "n/a";
+    })();
     const d = r.discovery;
     const h = r.helper ?? {};
     const exp = r.fixture?.expectedTreeOccurrences ?? "?";
@@ -537,7 +885,7 @@ function report(out: string): void {
     };
     const cgEnd = kind === "oom" ? `OOM at limit ${r.memLimit ?? mem}` : MiB(r.cgroup?.peakAtEnd);
     const helperRss = r.helperMaxRssKiB ? `${KiBtoMiB(r.helperMaxRssKiB.discovery)} / ${B(KiBtoMiB(r.helperMaxRssKiB.final))}` : "n/a";
-    rows.push(`| ${spec} | ${mode} | ${r.memLimit ?? mem}/${r.cpus ?? "?"} | ${kind}${token} | ${d ? (d.completed ? "yes" : "no") : "n/a"} | ${d?.ms ?? "n/a"} | ${r.captureMs} | ${d ? `${B(h.treeOccurrences)} / ${exp}` : occ} | ${d ? B(h.treeEntries) : "n/a"} | ${d ? B(objBytes) : "n/a"} | ${d ? B(h.readSyncBytes) : "n/a"} | ${helperRss} | ${B(MiB(r.treeRss?.discoveryPeakBytes))} / ${B(MiB(r.treeRss?.peakBytes))} | ${MiB(r.cgroup?.peakAtBoundary)} / ${cgEnd} | ${c} |`);
+    rows.push(`| ${spec} | ${mode2} | ${r.memLimit ?? mem}/${r.cpus ?? "?"} | ${kind}${token} | ${d ? (d.completed ? "yes" : "no") : "n/a"} | ${d?.ms ?? "n/a"} | ${r.captureMs} | ${d ? `${B(h.treeOccurrences)} / ${exp}` : occ} | ${entriesCell} | ${chargedCell} | ${d ? B(objBytes) : "n/a"} | ${d ? B(h.readSyncBytes) : "n/a"} | ${helperRss} | ${B(MiB(r.treeRss?.discoveryPeakBytes))} / ${B(MiB(r.treeRss?.peakBytes))} | ${MiB(r.cgroup?.peakAtBoundary)} / ${cgEnd} | ${c} |`);
   }
   const table = rows.join("\n") + "\n";
   fs.writeFileSync(path.join(out, "results.md"), table);
@@ -550,23 +898,67 @@ type Job =
   | { kind: "generate"; spec: string; dir: string; inputs: string }
   | MeasureJob
   | { kind: "report"; out: string }
+  // Pure description of the analytic charges for one spec (no helper run, no docker). `fixture`
+  // (a generated fixture dir) is required for repo and synthetic-N, whose model reads their tree.
+  // Caps and `at` are positive integers or decimal strings.
+  | { kind: "model"; spec: string; fixture?: string; entryCap?: number | string; pathByteCap?: number | string; at?: number | string }
   // Absorbs a container's first-start transients so no measurement is the first start.
   | { kind: "noop" };
 
+function describeModel(job: Extract<Job, { kind: "model" }>): Record<string, unknown> {
+  const big = (v: number | string | undefined, name: string): bigint | undefined => {
+    if (v === undefined) return undefined;
+    if (!/^[1-9][0-9]*$/.test(String(v))) throw new Error(`${name} must be a positive integer`);
+    return BigInt(String(v));
+  };
+  let bare: string | undefined, tree: string | undefined;
+  if (job.fixture !== undefined) {
+    bare = layout(job.fixture).bare;
+    tree = readJson<Manifest>(path.join(job.fixture, "manifest.json"))?.tree;
+  }
+  const model = fixtureModel(job.spec, bare, tree);
+  const entryCap = big(job.entryCap, "entryCap"), pathByteCap = big(job.pathByteCap, "pathByteCap"), at = big(job.at, "at");
+  const out: Record<string, unknown> = {
+    spec: job.spec, basis: "analytic",
+    expectedEntryOccurrences: model.totalEntries.toString(), expectedPathBytes: model.totalPathBytes.toString(),
+    maxChargedPathBytes: model.maxEntryBytes.toString(),
+  };
+  if (at !== undefined) out.prefixAt = { i: at.toString(), pathBytes: model.prefixAt(at)?.toString() ?? null };
+  if (entryCap !== undefined) out.atEntryCap = { entryCap: entryCap.toString(), ...deriveRefusal(model, "base_discovery_entry_cap", entryCap, pathByteCap) };
+  if (pathByteCap !== undefined) out.atPathByteCap = { pathByteCap: pathByteCap.toString(), ...deriveRefusal(model, "base_discovery_path_byte_cap", entryCap, pathByteCap) };
+  return out;
+}
+
 async function main(): Promise<void> {
   const [command, arg] = process.argv.slice(2);
-  if (command !== "job" || !arg) {
-    console.error("usage: planning-base-discovery.measure.ts job <job.json>");
+  // `<inline job json>` is accepted for the pure model kind: no job file or opt-in env needed.
+  const inline = command !== undefined && command.startsWith("{") ? command : undefined;
+  if (inline === undefined && (command !== "job" || !arg)) {
+    console.error("usage: planning-base-discovery.measure.ts job <job.json> | '<model job json>'");
     process.exit(2);
   }
-  const job = JSON.parse(fs.readFileSync(arg, "utf8")) as Job;
+  const job = JSON.parse(inline ?? fs.readFileSync(arg as string, "utf8")) as Job;
+  if (job.kind === "model") {
+    process.stdout.write(JSON.stringify(describeModel(job), null, 2) + "\n");
+    return;
+  }
+  if (inline !== undefined || process.env.UZI_PLANNING_DISCOVERY_MEASURE !== "1") {
+    console.error("refusing to run: set UZI_PLANNING_DISCOVERY_MEASURE=1 and pass `job <job.json>` (opt-in measurement harness, issue #3543)");
+    process.exit(2);
+  }
   if (job.kind === "generate") {
     const m = generate(job.spec, job.dir, job.inputs);
     process.stdout.write(`generated ${m.spec}: tree ${m.tree} trees=${m.expectedTreeOccurrences} leaves=${m.expectedLeafOccurrences} ` +
+      `entries=${m.expectedEntryOccurrences} pathBytes=${m.expectedPathBytes} maxPath=${m.maxChargedPathBytes} ` +
       `in ${m.generationMs} ms (sha256 manifest ${createHash("sha256").update(JSON.stringify({ ...m, generationMs: 0 })).digest("hex").slice(0, 12)})\n`);
   } else if (job.kind === "measure") {
-    await measure(job);
+    const failures = await measure(job);
     process.stdout.write(`measured ${job.label}\n`);
+    if (failures.length > 0) {
+      // Visible failure: nonzero exit (run.sh logs it in the job's term record) and the flag in the record.
+      console.error(`FAILED ${job.label}: ${failures.join("; ")}`);
+      process.exitCode = 1;
+    }
   } else if (job.kind === "report") {
     report(job.out);
   } else if (job.kind === "noop") {

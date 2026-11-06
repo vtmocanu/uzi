@@ -52,8 +52,8 @@ fresh `OUT` (or keep its fixtures and clear `results/`) for one invocation's tab
 ## Fixtures (deterministic generator)
 
 The generator uses pinned author/committer identities and dates, and plumbing-built objects.
-Each fixture writes a `manifest.json` with its commit, its tree, and the analytic tree and leaf
-occurrence counts (decimal strings).
+Each fixture writes a `manifest.json` with its commit, its tree, and the analytic tree, leaf,
+entry and path-byte counts (decimal strings; see the charge model below).
 
 | spec | shape |
 |---|---|
@@ -62,12 +62,85 @@ occurrence counts (decimal strings).
 | `chain-dD` | linear chain, deepest tree at depth D (root is depth 0). `chain-d64` is the deepest accepted; `chain-d65` must refuse `directory_cap` |
 | `fanout2-dD` | binary DAG of D+1 distinct trees whose traversal visits 2^(D+1)-1 tree and 2^D leaf occurrences |
 | `wide-FxW` | **extra, beyond the issue's spec**: one W-entry leaf tree referenced F times |
+| `longpath-dDnNwWfF` | **extra**: long-name chain, see below |
 
 `repo` and `synthetic-*` clones are checked out. The adversarial bases are cloned with
 `--no-checkout`, because their exploded working tree cannot exist. Discovery reads only `.git`
 and the bare's objects, so the discovery numbers are unaffected. The post-discovery capture
 does differ: every base path becomes a deletion. In production, a checkout of such a base
 would have to happen before any capture.
+
+### `longpath-d<depth>n<namelen>w<width>f<fan>`
+
+The root holds `fan` (>= 1) directory entries that all reference one shared chain of trees. The
+chain's deepest tree holds `width` regular files (`w0`: the deepest tree is the empty tree, made
+with `git mktree` on empty input). Every directory and file name is exactly `namelen` bytes: a
+letter (`d` fan entry, `c` chain level, `f` file), the zero-padded index, then `x` fill. Names
+within a tree are therefore distinct and already in canonical order.
+
+**Depth convention.** The root tree is helper depth 0, and the helper refuses depth > 64 with
+`directory_cap`. The deepest tree sits at helper depth `depth`, so `1 <= depth <= 64`. Any path
+runs through `depth` directories (the fan name, then `depth - 1` chain names), and the deepest
+file path has `depth + 1` components (the helper accepts up to 65). The generator and the model
+refuse a spec outside the grammar, a `namelen` too short for its index digits, and any tree
+object over the helper's 2 MiB per-object cap (checked analytically, then again with
+`git cat-file -s`). Occurrences: `1 + fan*depth` trees, `fan*width` files. Example:
+`longpath-d60n200w100f2`.
+
+## Charge model and basis labels
+
+The harness carries an analytic model of what the planned base-discovery caps charge. It never
+runs the helper. It walks the tree in the helper's order (root entries in canonical git order,
+descending into a directory the moment its entry is met) and charges entry `i`:
+
+- **entry occurrences** `Em(i) = i`: every tree entry, leaf or directory, the root's included,
+  once per walk occurrence (a shared subtree is charged each time it is reached);
+- **path bytes** `Pm(i)`: the sum over entries `1..i` of the entry's full relative path bytes
+  (its ancestors' `name/` prefixes plus its own name).
+
+Shared-DAG specs use closed-form subtree totals, so huge fixtures (`fanout2-d64`,
+`wide-16384x16384`) need no enumeration. `repo` and `synthetic-N` read `git ls-tree -r -t` of
+the generated bare. The manifest records `expectedEntryOccurrences`, `expectedPathBytes` and
+`maxChargedPathBytes` (the longest single entry path), all decimal strings.
+
+Print the model for a spec without docker or the opt-in environment (`repo`/`synthetic-N` also
+need `"fixture":"<generated fixture dir>"`; `entryCap`, `pathByteCap` and `at` are optional):
+
+```sh
+cd agent && node --import tsx test/planning-base-discovery.measure.ts \
+  '{"kind":"model","spec":"longpath-d60n200w100f2","entryCap":100,"pathByteCap":50000}'
+```
+
+Every charge in a record or table carries one basis label:
+
+| label | meaning |
+|---|---|
+| `analytic` | from the model. For a completed discovery the meter's fetched tree-entry total must equal it: `meterMatch` is `true`, or the record carries a `FAIL METER_MISMATCH` flag, the row shows it, and the job exits non-zero |
+| `derived-from-refusal (unverified until 7f probe)` | for a `base_discovery_entry_cap` refusal: E = entryCap + 1, P = Pm(entryCap). For `base_discovery_path_byte_cap`: k = first i with Pm(i) > pathByteCap, E = k, P = Pm(k), and k must not exceed the entry cap. A contradiction (or caps unknown for the job) gives `derived.charge: null` with a reason; a contradiction also sets the `FAIL` flag |
+| `treeEntriesFetched` | the meter's count of entries in the trees the helper fetched. It is exact only when discovery completed. Otherwise it is an upper bound on what was charged and is never shown as a charge (`killed` rows show `fetched ≥N (not charged)`) |
+| `validation` | the row ran with injected limits (below), never on production defaults |
+
+The caps come from the limits the helper actually receives. `GitCache` keeps its defaults in a
+private field (`PLANNING_LIMITS` is not exported), which the harness reads, so a production row
+uses whatever caps the helper ships with and records them under `limits`. Before the helper
+defines the base-discovery caps, `entryCap`/`pathByteCap` are `null` and a cap refusal is
+recorded as `derived.charge: null` with a reason.
+
+## Validation jobs (injected limits)
+
+A measure job may carry `"limits": {...}`: positive safe integers merged over the helper's
+defaults and injected with `GitCache.setPlanningLimitsForTest`. Keys must be existing planning
+limits, or `baseDiscoveryEntryCap` / `baseDiscoveryPathByteCap`. The record sets
+`validation: true` and the report labels the row `validation`. In `run.sh`:
+
+```sh
+LIMITS_JSON='{"baseDiscoveryEntryCap":1000}' OUT=/abs/out FIXTURES="fanout2-d8" ./e2e/planning-base-discovery-measure/run.sh
+```
+
+`LIMITS_JSON` must be a one-line JSON object of identifier keys to positive integers of at most
+15 digits; `run.sh` refuses anything else before starting a container, and the label gets a
+`__validation` suffix. Without it every row runs on the production defaults. It cannot be
+combined with `SMOKE_INJECT`, and one invocation's rows are all validation or all production.
 
 ## Modes and metrics
 

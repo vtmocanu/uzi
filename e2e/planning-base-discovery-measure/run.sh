@@ -15,6 +15,9 @@
 #   START_TIMEOUT  seconds per measurement start         (default: 120)
 #   GEN_TIMEOUT    seconds per fixture generation        (default: 1200)
 #   SMOKE_INJECT   1 = add the smoke-only deadline fault after the sizing batch (label __inject)
+#   LIMITS_JSON    validation rows only: one-line JSON object of positive integers merged over the
+#                  helper's default planning limits, e.g. '{"baseDiscoveryEntryCap":1000}'
+#                  (label __validation; unset = production defaults; not combinable with SMOKE_INJECT)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -31,11 +34,25 @@ SMOKE_INJECT="${SMOKE_INJECT:-}"
 for spec in $FIXTURES; do
   # Specs are interpolated into job JSON and paths: allow only the generator's own grammar.
   case "$spec" in
-    repo|synthetic-[0-9]*|chain-d[0-9]*|fanout2-d[0-9]*|wide-[0-9]*x[0-9]*) ;;
+    repo|synthetic-[0-9]*|chain-d[0-9]*|fanout2-d[0-9]*|wide-[0-9]*x[0-9]*|longpath-d[0-9]*n[0-9]*w[0-9]*f[0-9]*) ;;
     *) echo "unknown fixture spec: $spec" >&2; exit 2 ;;
   esac
   case "$spec" in *[!a-z0-9-]*) echo "unsafe fixture spec: $spec" >&2; exit 2 ;; esac
 done
+
+# LIMITS_JSON marks every measurement of this invocation as a VALIDATION row: the harness merges
+# these planning limits over the helper's defaults (GitCache.setPlanningLimitsForTest) and the
+# row label gets a __validation suffix. Production rows never set it and always run on defaults.
+# Accepted shape: a non-empty one-line JSON object of identifier keys to positive integers of at
+# most 15 digits (so always a safe integer); anything else is refused before any container starts.
+LIMITS_JSON="${LIMITS_JSON:-}"
+if [ -n "$LIMITS_JSON" ]; then
+  limit_pair='"[A-Za-z][A-Za-z0-9]*":[1-9][0-9]{0,14}'
+  limits_re="^\\{${limit_pair}(,${limit_pair})*\\}\$"
+  [[ "$LIMITS_JSON" =~ $limits_re ]] || { echo "LIMITS_JSON must be a one-line JSON object of positive integers (max 15 digits): $LIMITS_JSON" >&2; exit 2; }
+  [ -z "$SMOKE_INJECT" ] || { echo "LIMITS_JSON and SMOKE_INJECT cannot be combined" >&2; exit 2; }
+fi
+
 # shellcheck disable=SC2086 # deliberate word split: count the configurations.
 set -- $MEM_CONFIGS
 [ "$#" -gt 0 ] || { echo "MEM_CONFIGS has no configurations" >&2; exit 2; }
@@ -144,8 +161,10 @@ for config in $MEM_CONFIGS; do
       label="${spec}__${mode}__${mem}-${cpus}cpu"
       inject=false
       if [ "$SMOKE_INJECT" = "1" ]; then label="${label}__inject"; inject=true; fi
+      limits_field=""
+      if [ -n "$LIMITS_JSON" ]; then label="${label}__validation"; limits_field=",\"limits\":$LIMITS_JSON"; fi
       run_job "$name" "$label" "$START_TIMEOUT" \
-        "{\"kind\":\"measure\",\"label\":\"$label\",\"fixture\":\"/out/fixtures/$spec\",\"mode\":\"$mode\",\"out\":\"/out/results\",\"tmp\":\"/out/tmp/$label\",\"injectDeadlineAfterSizing\":$inject}"
+        "{\"kind\":\"measure\",\"label\":\"$label\",\"fixture\":\"/out/fixtures/$spec\",\"mode\":\"$mode\",\"out\":\"/out/results\",\"tmp\":\"/out/tmp/$label\",\"injectDeadlineAfterSizing\":$inject$limits_field}"
     done
   done
 done
