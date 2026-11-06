@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   harnessInheritLabel,
   modelDefaultLabel,
+  automaticMayApply,
   modelLabelHarness,
   mrReworkInheritLabel,
   overflowMayApply,
@@ -97,5 +98,35 @@ describe("labels", () => {
     expect(mrReworkInheritLabel(true, false)).toBe("Default · off (your setting)");
     expect(mrReworkInheritLabel(true, null)).toBe("Default · on (your setting)");
     expect(mrReworkInheritLabel(true, undefined)).toBe("Default · on (your setting)");
+  });
+});
+
+describe("automaticMayApply (#3256 review: automatic needs an eligible issue-run fire)", () => {
+  const none = { ownerDefaultHarness: null } as const;
+  it("is true only for an unpinned issue or sweep fire with both usable and no usable default", () => {
+    expect(automaticMayApply(input(none))).toBe(true);
+    expect(automaticMayApply(input({ ...none, target: "sweep" }))).toBe(true);
+    expect(automaticMayApply(input())).toBe(false);
+    expect(automaticMayApply(input({ ...none, codexUsable: false }))).toBe(false);
+  });
+  it.each(["prompt", "self_improve", "ci_watch"] as const)("%s target is never automatic", (target) => {
+    expect(automaticMayApply(input({ ...none, target }))).toBe(false);
+    expect(harnessInheritLabel(input({ ...none, target }))).toBe("Default · Claude (no usable default set)");
+    expect(modelLabelHarness(input({ ...none, target }))).toBe("claude");
+  });
+  it("a model or token pin makes an issue fire ineligible for automatic choice", () => {
+    for (const over of [{ model: "opus" }, { credentialMode: "default" as const }, { credentialMode: "auto" as const }]) {
+      expect(automaticMayApply(input({ ...none, ...over }))).toBe(false);
+      expect(harnessInheritLabel(input({ ...none, ...over }))).toBe("Default · Claude (no usable default set)");
+    }
+    expect(modelDefaultLabel(input({ ...none, credentialMode: "default", defaultClaudeModel: "opus" }))).toBe(
+      "Default · opus (your Claude default)",
+    );
+  });
+  it("an unusable explicit default behaves like no default", () => {
+    expect(automaticMayApply(input({ ownerDefaultHarness: "codex", codexUsable: true, claudeUsable: true }))).toBe(false);
+    expect(harnessInheritLabel(input({ ownerDefaultHarness: "codex", target: "prompt", codexUsable: true }))).toBe(
+      "Default · Codex (your default)",
+    );
   });
 });

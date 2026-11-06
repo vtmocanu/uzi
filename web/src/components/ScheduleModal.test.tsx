@@ -1942,6 +1942,14 @@ describe("the Where it runs fieldset (issue #3256)", () => {
       expect(modelDefault()).toBe("Default · your worker model");
     });
 
+    it.each(["prompt", "self_improve", "ci_watch"] as const)("no explicit default, %s target: Claude, not automatic", async (target) => {
+      both();
+      settings({ harness_overflow_enabled: true, default_harness: null, default_claude_model: "opus" });
+      await open({ target });
+      expect(harnessOpts()[0]).toBe("Default · Claude (no usable default set)");
+      expect(modelDefault()).toBe("Default · opus (your Claude default)");
+    });
+
     it("an explicit default that is not usable falls back to automatic wording", async () => {
       mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken(), codexKey({ is_default: false })] });
       settings({ harness_overflow_enabled: true, default_harness: "codex" });

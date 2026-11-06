@@ -376,7 +376,13 @@ than guessing:
   Code cross-check is on or the issue carries a `harness::` label; see
   [Overflow to the other harness](./worker-model.md#overflow-to-the-other-harness).
 - `Default · automatic (chosen when it fires)` when you have no usable
-  default.
+  default, both credentials are usable, and the schedule is an issue or sweep
+  schedule with no harness, model or token pin: the server may then pick the
+  harness by weekly limits (it still uses Claude when Plan or Code
+  cross-check is on, which the modal cannot see).
+- `Default · Claude (no usable default set)` when you have no usable default
+  but the fire cannot choose automatically (a prompt, self-improve or CI-watch
+  schedule, or a model or token pin): both usable resolves to Claude.
 
 The Anthropic token's default option reads `Default · worker's token (worker
 binding)`, and the auto-rework inherit option reads `Default · on (your
