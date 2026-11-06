@@ -469,7 +469,7 @@ describe("repo-agent roster pinned to the default-branch revision (issue #3913)"
         }
         assert.equal(seen.length, 2, "the resumed claim reached the executor");
         assert.equal(reviewerBody(seen[1]), "Original review body");
-        assert.ok(reportedCommits(first.run_id).every((c) => c === trusted), JSON.stringify(reportedCommits(first.run_id)));
+        assert.deepEqual([...new Set(reportedCommits(first.run_id))], [trusted]);
       });
     });
   }
