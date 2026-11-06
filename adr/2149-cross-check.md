@@ -545,7 +545,19 @@ commands in the capture take only the 600 s git timeout, and the bare-repository
 the attributed-process reap joins it can reach have no timer at all (a single hung git command
 alone takes it well past 600 s; Codex's capture scope does cap it near 60 s). Under the approved plan an
 unbounded component is a stop condition, so this step has no stated bound here and awaits an
-owner design decision; no timer was added and no reservation is cancelled.
+owner design decision; no timer was added and no reservation is cancelled. The owner accepted
+it as documented, with a follow-up to bound the step.
+
+**Accepted limit: an owner Cancel during the hold.** While the switch stamp is pending, the
+server's input consume returns only the switch signal and withholds every input row, and with a
+live poller an owner Cancel is queued as such a row rather than applied server-side. So a Cancel
+pressed during the hold takes effect only after the reservation settles and the switch is
+serviced: on a give-up the held flight applies it; after a release it waits for the next claim.
+Its bound is the hold's own: the audited bounds in the table above for the listed paths; on a
+re-plan gate (the open item above) it has no fixed bound until that follow-up lands. Meanwhile the checker child may keep running until
+its verdict or deadline. A server-side terminal cancel still ends the held flight at once, and a
+second Cancel after the release applies at once. The owner accepted this limit for #3953; prompt
+Cancel during the hold is #3974.
 
 These rest on stated assumptions: request timeouts propagate through `fetch` and body reads; the
 poll compares against the worker clock; executor-sequenced sink callbacks do not run during the

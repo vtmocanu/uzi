@@ -825,6 +825,14 @@ most of the places that check are not the end of the run:
   re-presents the plan for human approval after an approve or a human gate,
   and continues with the next checker round after an automatic revise. A cancel or other failure during the wait keeps its
   normal outcome ([ADR-2149](../adr/2149-cross-check.md)).
+  **Known limit:** while the switch is pending, the server holds back an owner
+  **Cancel** pressed during this wait. It takes effect only once the check has
+  settled and the switch is released or given up (after a release, at the
+  next claim), so within the same bounds as the wait above, and with no fixed
+  limit on a re-plan gate after an approval whose milestones changed. Until then the
+  plan checker may keep running to its verdict or deadline. Pressing Cancel
+  again after the switch releases the run takes effect at once. Prompt
+  Cancel here is tracked in #3974.
 - A Claude recovery capture that cannot prove the clone stopped is retried a
   bounded number of times; if proof still fails, the run fails the same way
   finalize does (see below), with the clone kept. Codex ordinary recovery can
