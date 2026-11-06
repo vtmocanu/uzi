@@ -16,8 +16,12 @@ import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
 
 // The R9 finite budgets of the epoch automatic content proof (owner answer seq 1162, 2026-11-06 (R9)):
-// a positively identified overflow is a settled keep (`epoch_content_unproven`), while a corrupt, unreadable
-// or indirect store, an unresolved execution and a Git stderr overrun stay UNKNOWN.
+// a positively identified overflow of BULK data is a settled keep (`epoch_content_unproven`), while a corrupt,
+// unreadable or indirect store, an unresolved execution and a Git stderr overrun stay UNKNOWN. THE RULE: in every
+// stage every indirection-bearing input (configs, `objects/info/*`, the name and TYPE of every object-path entry) is
+// read and classified before any bulk input charges a budget it shares, and an overflow while reading such an input
+// is UNKNOWN, never a keep. The describes below pin each stage: bulk-only overflows keep; the same overflow in front
+// of, or in, an indirection input is UNKNOWN.
 
 const RUN = "run-r9";
 const BRANCH = "agent/issue-3431";
@@ -206,8 +210,9 @@ describe("defaults and the test seam", () => {
 // content proof under the same limits, is UNKNOWN first; the content proof is still pinned through `observation`.
 const overflows: { name: string; limits: Limits; via: "stores" | "reason"; match: RegExp; prepare?: () => void;
   viaDiscard?: boolean }[] = [
-  // Content stage only: the topology fits the budget, then 600 valid loose objects overflow it.
-  { name: "maxObjectStoreBytes (object-store snapshot bytes in the content stage)", limits: { maxObjectStoreBytes: 64 * 1024 },
+  // Content stage only: the topology (which types each of the 600 loose leaves) fits the budget, then reading the
+  // objects overflows it (measured: the topology needs about 320 KiB, the whole observation about 580 KiB).
+  { name: "maxObjectStoreBytes (object-store snapshot bytes in the content stage)", limits: { maxObjectStoreBytes: 448 * 1024 },
     via: "stores", match: /object metadata byte limit/,
     prepare: () => {
       const dir = path.join(fx.dataDir, "loose-inputs");
@@ -231,15 +236,20 @@ const overflows: { name: string; limits: Limits; via: "stores" | "reason"; match
       for (let i = 0; i < 150; i++)
         execFileSync("git", ["-C", bare, "hash-object", "-w", "--stdin"], { env: ENV, input: `occurrence ${i}\n` });
     } },
-  { name: "maxDirectoryEntries (a loose fan-out directory past the default limit)", limits: {}, via: "stores",
-    match: /object directory entry limit/,
+  // Bulk metadata only: the config and `objects/info` (the indirection inputs) fit, then packed-refs does not.
+  { name: "maxMetadataBytes (packed-refs, after the config and objects/info were classified)",
+    limits: { maxMetadataBytes: 4096 }, via: "reason", match: /^\.git\/packed-refs: metadata byte limit$/, viaDiscard: false,
     prepare: () => {
-      const dir = path.join(objectDir(clonePath), "00");
-      fs.mkdirSync(dir, { recursive: true });
-      for (let i = 0; i < 16_400; i++) fs.writeFileSync(path.join(dir, i.toString(16).padStart(38, "0")), "");
+      fs.writeFileSync(path.join(clonePath, ".git", "packed-refs"), "# pack-refs with: peeled fully-peeled sorted\n".repeat(400));
     } },
-  { name: "maxMetadataBytes (config, index and every Git output)", limits: { maxMetadataBytes: 64 }, via: "reason",
-    match: /metadata byte limit/, viaDiscard: false },
+  // At the production default, through the discard core: a sparse 17 MiB packed-refs is past the 16 MiB budget.
+  { name: "maxMetadataBytes (a 17 MiB packed-refs at the default budget)", limits: {}, via: "reason",
+    match: /^\.git\/packed-refs: metadata byte limit$/,
+    prepare: () => {
+      const file = path.join(clonePath, ".git", "packed-refs");
+      fs.writeFileSync(file, "# pack-refs with: peeled fully-peeled sorted\n");
+      fs.truncateSync(file, 17 * 1024 * 1024);
+    } },
   // The limit itself ("index: index entry limit"), not any other "index: ..." refusal such as a checksum mismatch.
   { name: "maxMetadataRecords (index entries)", limits: { maxMetadataRecords: 64 }, via: "reason",
     match: /^index: index entry limit$/, viaDiscard: false,
@@ -489,12 +499,48 @@ describe("the topology is decided before content is charged", () => {
     command(bare, "init", "--bare", alt);
     fs.appendFileSync(path.join(objectDir(clonePath), "info/alternates"), path.join(alt, "objects") + "\n");
   };
-  it("control: junk past the directory entry limit alone is a settled keep", async () => {
+  it("a loose fan-out directory past the entry limit is UNKNOWN: its leaves cannot all be typed", async () => {
     junk(16_400);
     const error = await failure(observeStores());
-    assert.equal(error.name, "AutomaticBoundExceeded");
-    assert.match(error.message, /object directory entry limit/);
-    assert.equal(await observation(), false);
+    assert.equal(error.name, "AutomaticCompletenessUnknown");
+    assert.equal(error.message, "object directory entry limit");
+    await assert.rejects(observation(), e => (e as Error).constructor.name === "AutomaticCompletenessUnknown");
+  });
+  // M1: a loose leaf is typed as it is listed, before it is counted and before any content is charged.
+  const linkedLeaf = (dirName: string) => {
+    const target = path.join(fx.dataDir, "elsewhere-object");
+    fs.writeFileSync(target, "");
+    const dir = path.join(objectDir(clonePath), dirName);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.symlinkSync(target, path.join(dir, "f".repeat(38)));
+  };
+  it("a symlinked loose leaf alone is UNKNOWN", async () => {
+    linkedLeaf("ee");
+    const error = await failure(observeStores());
+    assert.equal(error.name, "AutomaticCompletenessUnknown");
+    assert.equal(error.message, "noncanonical object path");
+  });
+  it("a symlinked loose leaf in a later fan-out directory is UNKNOWN behind a content overflow in an earlier one", async () => {
+    // The 1 MiB blob overflows the 256 KiB content budget; its fan-out directory sorts before the linked one.
+    const blob = execFileSync("git", ["-C", clonePath, "hash-object", "-w", "--stdin"],
+      { env: ENV, input: Buffer.alloc(1024 * 1024, 65), encoding: "utf8" }).trim();
+    linkedLeaf(blob.startsWith("ff") ? "fe" : "ff");
+    const limits = { maxObjectStoreBytes: 256 * 1024 };
+    const error = await failure(observeStores(limits));
+    assert.equal(error.name, "AutomaticCompletenessUnknown");
+    assert.equal(error.message, "noncanonical object path");
+    await assert.rejects(observation(limits), e => (e as Error).constructor.name === "AutomaticCompletenessUnknown");
+  });
+  it("a symlinked loose leaf behind 16,400 empty legal leaves in the same directory is UNKNOWN", async () => {
+    junk(16_400);
+    const target = path.join(fx.dataDir, "elsewhere-object");
+    fs.writeFileSync(target, "");
+    fs.symlinkSync(target, path.join(objectDir(clonePath), "00", "f".repeat(38)));
+    // Whichever of the two the listing reaches first, the leaves are never counted past the entry limit as a keep.
+    const error = await failure(observeStores());
+    assert.equal(error.name, "AutomaticCompletenessUnknown");
+    assert.ok(["noncanonical object path", "object directory entry limit"].includes(error.message), error.message);
+    await assert.rejects(observation(), e => (e as Error).constructor.name === "AutomaticCompletenessUnknown");
   });
   it("an alternate outside the managed repositories alone is UNKNOWN", async () => {
     outside();
@@ -519,11 +565,24 @@ describe("the topology is decided before content is charged", () => {
     assert.equal(error.name, "AutomaticCompletenessUnknown");
     assert.match(error.message, /alternate writer exclusion unavailable/);
   });
-  it("a topology directory past the entry limit is UNKNOWN, whatever it holds", async () => {
+  it("a name is classified before it is counted: an illegal info entry is named, not reported as an overflow", async () => {
+    // The least entry limit that lets the store through; one more entry (the illegal name) then crosses it only at
+    // the very last entry read, so a count-first order would report the limit, and classify-first reports the name.
+    let low = 1, high = 512;
+    while (low < high) {
+      const mid = Math.floor((low + high) / 2);
+      try { await observeStores({ maxDirectoryEntries: mid }); high = mid; } catch { low = mid + 1; }
+    }
+    await observeStores({ maxDirectoryEntries: low });
     fs.writeFileSync(path.join(objectDir(clonePath), "info/zz-not-legal"), "");
+    const error = await failure(observeStores({ maxDirectoryEntries: low }));
+    assert.equal(error.name, "AutomaticCompletenessUnknown");
+    assert.equal(error.message, "unsupported object info entry");
+  });
+  it("an entry limit that the info directory itself crosses is UNKNOWN too", async () => {
     const error = await failure(observeStores({ maxDirectoryEntries: 1 }));
     assert.equal(error.name, "AutomaticCompletenessUnknown");
-    assert.match(error.message, /unsupported object info entry|object directory entry limit/);
+    assert.equal(error.message, "object directory entry limit");
   });
   it("an oversized packed-refs does not hide an outside alternate in the clone shape stage", async () => {
     outside();
@@ -616,13 +675,15 @@ describe("an overflow of a Git inventory read is UNKNOWN, not a settled keep", (
       if (args[1].includes("--batch-all-objects") && ++inventories === 2) fs.mkdirSync(path.join(objectDir(bare), "ee"));
       return original(...args);
     });
+    // The repeat is a topology read like the first: past the limit it is UNKNOWN by the same rule.
     await assert.rejects(observation({ maxDirectoryEntries: limit }), e => (e as Error).constructor.name === "AutomaticCompletenessUnknown" &&
-      /object observations changed/.test((e as Error).message));
+      (e as Error).message === "object directory entry limit");
   });
 });
 
 // ---------------------------------------------------------------------------------------------------------------
-// No pending overflow may absorb an UNKNOWN-class observation, and nothing is charged before it was inspected.
+// Object-store topology: every overflow while reading an indirection-bearing input is UNKNOWN, and the content stage
+// only starts once all of them are classified. Nothing is charged before it was inspected.
 
 describe("a topology overflow is UNKNOWN and never hides an UNKNOWN-class observation", () => {
   const packJunk = (n: number) => {
@@ -648,20 +709,23 @@ describe("a topology overflow is UNKNOWN and never hides an UNKNOWN-class observ
     packJunk(16_400);
     await assertUnknownStores({}, /object directory entry limit/);
   });
-  it("a symlinked .idx behind 16,400 pack junk entries is UNKNOWN", async () => {
-    packJunk(16_400);
+  // The pack directory's entries are typed as the topology reads them; each fixture is reached on its own, so the
+  // message names the cause (a junk-padded fixture would be decided by the overflow alone).
+  it("a symlinked .idx is UNKNOWN as a noncanonical object path", async () => {
     const name = "pack-" + "a".repeat(40);
     const dir = path.join(objectDir(clonePath), "pack");
+    fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, name + ".pack"), "");
     fs.writeFileSync(path.join(fx.dataDir, "elsewhere.idx"), "");
     fs.symlinkSync(path.join(fx.dataDir, "elsewhere.idx"), path.join(dir, name + ".idx"));
-    await assertUnknownStores({});
+    await assertUnknownStores({}, /^noncanonical object path\s*$/);
     await assert.rejects(observation(), e => (e as Error).constructor.name === "AutomaticCompletenessUnknown");
   });
-  it("an orphan .pack behind 16,400 pack junk entries is UNKNOWN", async () => {
-    packJunk(16_400);
-    fs.writeFileSync(path.join(objectDir(clonePath), "pack", "pack-" + "b".repeat(40) + ".pack"), "");
-    await assertUnknownStores({});
+  it("an orphan .pack is UNKNOWN as an incomplete pair", async () => {
+    const dir = path.join(objectDir(clonePath), "pack");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "pack-" + "b".repeat(40) + ".pack"), "");
+    await assertUnknownStores({}, /^incomplete pack pair\s*$/);
     await assert.rejects(observation(), e => (e as Error).constructor.name === "AutomaticCompletenessUnknown");
   });
   it("partialclone plus an unknown extension, behind 16,400 pack junk entries, is UNKNOWN", async () => {
@@ -700,9 +764,10 @@ describe("a topology overflow is UNKNOWN and never hides an UNKNOWN-class observ
     await assertUnknownStores({ maxObjectStoreBytes: 4096 });
   });
   it("an illegal loose object name is UNKNOWN even when counting it would overflow the entry limit", async () => {
-    // The empty fan-out directory is part of the topology and is the LAST directory the content stage lists (the
-    // bare is read after the clone, and `ff` sorts after its other fan-outs); the limit is the least one that still
-    // lets the store through, so the one name added below passes the limit in the content stage only.
+    // The empty fan-out directory is the LAST directory the topology lists (the loose directories come after the
+    // alternate graph, the bare is read after the clone, and `ff` sorts after its other fan-outs); the limit is the
+    // least one that still lets the store through, so the one name added below is the entry that crosses it, and
+    // classifying it first reports the name instead of the limit.
     const dir = path.join(objectDir(bare), "ff");
     fs.mkdirSync(dir, { recursive: true });
     let low = 1, high = 512;
@@ -747,6 +812,150 @@ describe("a topology file past the metadata byte limit is UNKNOWN, never a keep"
     const error = await failure(observeStores({ maxMetadataBytes: 2048 }));
     assert.equal(error.name, "AutomaticCompletenessUnknown");
     assert.match(error.message, /object metadata read byte limit/);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Clone shape stage: its indirection inputs (`.git/objects`, `objects/info`, `.git/config`) are read and classified
+// before any bulk input (packed-refs, refs, reflogs, the index) charges the shared metadata budget.
+
+describe("the clone shape stage classifies its indirection inputs before it charges bulk data", () => {
+  const cloneConfigFile = () => path.join(clonePath, ".git", "config");
+  const unknownOf = (pattern?: RegExp) => (e: unknown) => (e as Error).constructor.name === "AutomaticCompletenessUnknown" &&
+    (pattern === undefined || pattern.test((e as Error).message));
+  const bigPackedRefs = () => fs.writeFileSync(path.join(clonePath, ".git", "packed-refs"),
+    "# pack-refs with: peeled fully-peeled sorted\n".repeat(400));
+  /** Two valid reflogs of about 9 KiB each: together they use up a 12,000 byte metadata budget. */
+  const bigReflogs = () => {
+    const dir = path.join(clonePath, ".git", "logs", "refs", "heads");
+    fs.mkdirSync(dir, { recursive: true });
+    const line = `${"0".repeat(40)} ${"0".repeat(40)} x\n`;
+    for (const name of ["zz1", "zz2"]) fs.writeFileSync(path.join(dir, name), line.repeat(110));
+  };
+  it("M2: a 17 MiB alternates file whose last line names an outside store is UNKNOWN, not a keep", async () => {
+    const alt = path.join(fx.dataDir, "outside.git");
+    command(bare, "init", "--bare", alt);
+    const line = path.join(bare, "objects") + "\n";
+    fs.appendFileSync(path.join(objectDir(clonePath), "info/alternates"),
+      line.repeat(Math.ceil(17 * 1024 * 1024 / line.length)) + path.join(alt, "objects") + "\n");
+    assert.ok(fs.statSync(path.join(objectDir(clonePath), "info/alternates")).size > 16 * 1024 * 1024);
+    await assert.rejects(observation(), unknownOf(/\.git\/objects\/info\/alternates/));
+    const result = await discard();
+    assert.equal((result as { kind: string }).kind, "unknown");
+    assert.equal(stopped, true);
+    assert.ok(fs.existsSync(clonePath));
+  });
+  it("M3: partialclone in the clone config is UNKNOWN when reflogs use up the metadata budget first", async () => {
+    command(clonePath, "config", "--local", "extensions.partialclone", "origin");
+    bigReflogs();
+    await assert.rejects(observation({ maxMetadataBytes: 12_000 }), unknownOf(/partialclone/));
+  });
+  it("M3: a control, the same reflogs without partialclone are a settled keep", async t => {
+    bigReflogs();
+    const reasons = reasonsOf(t);
+    assert.equal(await observation({ maxMetadataBytes: 12_000 }), false);
+    assert.ok(reasons.some(reason => /reflog file/.test(reason)), reasons.join("|"));
+  });
+  it("M3: a clone config padded past the metadata budget is UNKNOWN, not a keep", async () => {
+    fs.appendFileSync(cloneConfigFile(), "# padding\n".repeat(1000) + "[extensions]\n\tpartialclone = origin\n");
+    await assert.rejects(observation({ maxMetadataBytes: 8192 }), unknownOf(/^\.git\/config: file byte limit$/));
+  });
+  for (const [key, text] of [
+    ["partialclone", "[extensions]\n\tpartialClone = origin\n"],
+    ["refstorage", "[core]\n\trepositoryformatversion = 1\n[extensions]\n\trefStorage = reftable\n"],
+    ["objectformat", "[extensions]\n\tobjectformat = sha256\n"],
+    ["compatobjectformat", "[extensions]\n\tcompatObjectFormat = sha256\n"],
+    ["worktreeconfig", "[extensions]\n\tworktreeConfig = true\n"],
+    ["worktree", "[core]\n\tworktree = /elsewhere\n"],
+    ["partialclone", "[extensions] partialclone = origin\n"],
+  ] as const) {
+    it(`${key} in the clone config is UNKNOWN even behind an oversized packed-refs`, async () => {
+      fs.appendFileSync(cloneConfigFile(), text);
+      bigPackedRefs();
+      await assert.rejects(observation({ maxMetadataBytes: 4096 }), unknownOf(new RegExp(key)));
+    });
+  }
+  it("a config that merely mentions those words, and objectformat = sha1, are not indirection", async t => {
+    fs.appendFileSync(cloneConfigFile(),
+      '[branch "agent/partialclone-refstorage-worktree"]\n\tremote = origin\n[extensions]\n\tobjectformat = sha1\n');
+    const reasons = reasonsOf(t);
+    await observation().catch(() => undefined);
+    assert.ok(!reasons.some(reason => /partialclone|refstorage|objectformat/.test(reason)), reasons.join("|"));
+  });
+  it("a symlinked .git/objects is UNKNOWN even behind an oversized packed-refs", async () => {
+    const moved = path.join(fx.dataDir, "clone-objects");
+    fs.renameSync(objectDir(clonePath), moved);
+    fs.symlinkSync(moved, objectDir(clonePath));
+    bigPackedRefs();
+    await assert.rejects(observation({ maxMetadataBytes: 4096 }), unknownOf(/\.git\/objects is not a real directory/));
+  });
+  it("an illegal objects/info name stays UNKNOWN behind oversized reflogs", async () => {
+    fs.writeFileSync(path.join(objectDir(clonePath), "info/http-alternates"), "http://127.0.0.1:1/objects\n");
+    bigReflogs();
+    await assert.rejects(observation({ maxMetadataBytes: 12_000 }), unknownOf(/unsupported object info entry/));
+  });
+  // The rest of the clone's indirection inputs (every entry of `.git/objects` and the special `.git` entries) are
+  // classified by a Node-only topology pass the shape stage runs before it charges any bulk input, so a bulk keep of
+  // the shape stage cannot stand in front of them.
+  const linkedClone = (dirName: string) => {
+    const target = path.join(fx.dataDir, "elsewhere-object");
+    fs.writeFileSync(target, "");
+    const dir = path.join(objectDir(clonePath), dirName);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.symlinkSync(target, path.join(dir, "f".repeat(38)));
+  };
+  it("a symlinked loose leaf in the clone is UNKNOWN behind oversized reflogs", async () => {
+    linkedClone("ee");
+    bigReflogs();
+    await assert.rejects(observation({ maxMetadataBytes: 12_000 }), unknownOf(/^noncanonical object path/));
+  });
+  it("a symlinked loose leaf in the clone is UNKNOWN behind an include, which is otherwise a settled keep", async () => {
+    linkedClone("ee");
+    fs.appendFileSync(cloneConfigFile(), "[include]\n\tpath = /nonexistent\n");
+    await assert.rejects(observation(), unknownOf(/^noncanonical object path/));
+  });
+  it("control: an include alone is a settled keep of the shape stage", async t => {
+    fs.appendFileSync(cloneConfigFile(), "[include]\n\tpath = /nonexistent\n");
+    const reasons = reasonsOf(t);
+    assert.equal(await observation(), false);
+    assert.ok(reasons.some(reason => /clone config names an include/.test(reason)), reasons.join("|"));
+  });
+  it("a symlinked pack member in the clone is UNKNOWN behind an oversized packed-refs", async () => {
+    const name = "pack-" + "a".repeat(40);
+    const dir = path.join(objectDir(clonePath), "pack");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, name + ".pack"), "");
+    fs.writeFileSync(path.join(fx.dataDir, "elsewhere.idx"), "");
+    fs.symlinkSync(path.join(fx.dataDir, "elsewhere.idx"), path.join(dir, name + ".idx"));
+    bigPackedRefs();
+    await assert.rejects(observation({ maxMetadataBytes: 4096 }), unknownOf(/^noncanonical object path/));
+  });
+  it("an illegal entry of .git/objects is UNKNOWN behind an oversized packed-refs", async () => {
+    fs.mkdirSync(path.join(objectDir(clonePath), "zz"));
+    bigPackedRefs();
+    await assert.rejects(observation({ maxMetadataBytes: 4096 }), unknownOf(/^unsupported object root entry/));
+  });
+  for (const [label, plant] of [
+    ["a .git/shallow file", () => fs.writeFileSync(path.join(clonePath, ".git", "shallow"), "")],
+    ["a .git/info/grafts file", () => fs.writeFileSync(path.join(clonePath, ".git", "info", "grafts"), "")],
+    ["a .git/refs/replace directory", () => fs.mkdirSync(path.join(clonePath, ".git", "refs", "replace"))],
+  ] as const) {
+    it(`${label} is UNKNOWN behind an oversized packed-refs`, async () => {
+      plant();
+      bigPackedRefs();
+      await assert.rejects(observation({ maxMetadataBytes: 4096 }), unknownOf(/^unsupported object topology/));
+    });
+  }
+  // The worktree stage: a tracked-content overflow cannot stand in front of an indirection input either, because
+  // every input that could be one was classified by the shape stage that precedes it.
+  it("partialclone is UNKNOWN even when the worktree stage would overflow its content budget", async () => {
+    command(clonePath, "config", "--local", "extensions.partialclone", "origin");
+    await assert.rejects(observation({ maxWorktreeContentBytes: 4 }), unknownOf(/partialclone/));
+  });
+  it("control: the same worktree content overflow alone is a settled keep", async t => {
+    const reasons = reasonsOf(t);
+    assert.equal(await observation({ maxWorktreeContentBytes: 4 }), false);
+    assert.ok(reasons.some(reason => /tracked content byte limit/.test(reason)), reasons.join("|"));
   });
 });
 
