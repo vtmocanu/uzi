@@ -657,6 +657,23 @@ describe("repo-agent roster pinned to the default-branch revision (issue #3913)"
     });
   }
 
+  it("a requested repo source on a later claim implements with the roster at the recorded revision", async () => {
+    await withFeature(async () => {
+      const h = HARNESSES[0]!;
+      const trusted = commitOnOrigin({ [h.file]: h.content("Original review body") }, "ship the reviewer");
+      commitOnOrigin({ [h.file]: h.content("A newer default body") }, "main moves on");
+      let seen: RunContext | undefined;
+      const claim = claimFor(h, {
+        issue_iid: 84, issue_title: "requested repo source", claim_generation: 2, auto_approve: true,
+        requested_agent_source: "repo", repo_agent_source_commit: trusted,
+      });
+      await newRunner({ run: async (ctx) => { seen = ctx; return { branch: ctx.branch }; } }).execute(claim);
+      assert.equal(seen?.requestedAgentSource, "repo");
+      assert.equal(reviewerBody(seen), "Original review body");
+      assert.ok(reportedCommits(claim.run_id).every((c) => c === trusted), JSON.stringify(reportedCommits(claim.run_id)));
+    });
+  });
+
   it("without the api feature a failed roster report does not stop the run", async () => {
     const h = HARNESSES[0]!;
     commitOnOrigin({ [h.file]: h.content("Original review body") }, "ship the reviewer");
