@@ -128,6 +128,9 @@ async function fixture(options: {
     if (options.baseTree) {
       const seedGit = async (args: string[], input: string): Promise<string> => {
         const pending = exec("git", ["-C", seed, ...args], { env: planningGitEnv(), timeout: options.gitTimeoutMs ?? 60000 });
+        // A git that exits before reading its input surfaces through the awaited exit status
+        // (with its stderr), not as an unhandled EPIPE on the stdin socket.
+        pending.child.stdin?.on("error", () => {});
         pending.child.stdin?.end(input);
         return (await pending).stdout.trim();
       };
@@ -2112,8 +2115,15 @@ describe("Base discovery aggregate caps (#3543)", { skip: process.platform !== "
   const DEPTH = 60, NAME = 250;
 
   it("pins the production caps and the token mapping", () => {
-    assert.equal(defaultLimits.baseDiscoveryEntryCap, PRODUCTION_ENTRY_CAP);
-    assert.equal(defaultLimits.baseDiscoveryPathByteCap, PRODUCTION_PATH_BYTE_CAP);
+    // The shipped values live in GitCache's private planningLimits field (PLANNING_LIMITS is not
+    // exported); read them from a real instance so a change in agent/src/git.ts fails this test.
+    const shipped = (new GitCache(os.tmpdir(), nullLogger()) as unknown as { planningLimits: unknown }).planningLimits;
+    assert.ok(typeof shipped === "object" && shipped !== null, "GitCache.planningLimits must be an object");
+    const limits = shipped as Record<string, number>;
+    assert.equal(limits.baseDiscoveryEntryCap, 1_200_000);
+    assert.equal(limits.baseDiscoveryPathByteCap, 100_663_296);
+    assert.equal(defaultLimits.baseDiscoveryEntryCap, limits.baseDiscoveryEntryCap);
+    assert.equal(defaultLimits.baseDiscoveryPathByteCap, limits.baseDiscoveryPathByteCap);
     for (const token of ["base_discovery_entry_cap", "base_discovery_path_byte_cap"]) {
       assert.equal(PLANNING_REFUSAL_TOKENS[token], "diff_too_large", token);
       assert.deepEqual(classifyPlanningCaptureError("bounded runner process failed: UZI-PLANNING-REFUSAL " + token + "\n"),
@@ -2244,22 +2254,30 @@ describe("Base discovery aggregate caps (#3543)", { skip: process.platform !== "
   it("captures this repository at production defaults", { timeout: 100_000 }, async t => {
     if (uidSplitActive()) { t.skip("the runner identity cannot read the repository checkout"); return; }
     const repoRoot = path.resolve(import.meta.dirname, "..", "..");
-    const started = Date.now();
+    let seeded = 0;
     const f = await fixture({ gitTimeoutMs: 90000, seed: async seed => {
+      // Fail loudly when repoRoot is not a git work tree rather than archiving some other repository.
+      assert.equal((await exec("git", ["-C", repoRoot, "rev-parse", "--is-inside-work-tree"], { timeout: 30000 })).stdout.trim(), "true");
       const archive = path.join(path.dirname(seed), "repo.tar");
       await exec("git", ["-C", repoRoot, "archive", "--format=tar", "-o", archive, "HEAD"], { timeout: 90000 });
       await exec("tar", ["-xf", archive, "-C", seed], { timeout: 90000 });
       await fs.rm(archive);
+      seeded = (await exec("git", ["-C", repoRoot, "ls-tree", "-r", "--name-only", "HEAD"], { timeout: 30000, maxBuffer: 64 * 1024 * 1024 }))
+        .stdout.split("\n").filter(Boolean).length;
     } });
     try {
+      assert.ok(seeded >= 5000, "the archive must hold the repository's files: " + seeded);
+      const started = Date.now();
       assert.equal((await f.capture()).length, 0);
-      t.diagnostic("repository capture took " + (Date.now() - started) + " ms");
+      t.diagnostic("repository capture (" + seeded + " files) took " + (Date.now() - started) + " ms");
     } finally { await f.dispose(); }
   });
 
-  it("captures a 50k-file synthetic tree at production defaults", { timeout: 110_000 }, async t => {
-    const started = Date.now();
-    const f = await fixture({ gitTimeoutMs: 100000, seed: async seed => {
+  // 50,000 files in 500 directories (50,500 entries), each file a few bytes so the capture time is
+  // dominated by base discovery rather than reading and hashing file content.
+  it("captures a 50k-file synthetic tree at production defaults", { timeout: 90_000 }, async t => {
+    const setupStarted = Date.now();
+    const f = await fixture({ gitTimeoutMs: 80000, seed: async seed => {
       // Written by a runner-identity child: 50k IPC file writes would be far slower.
       const script = `
 const fs = require("node:fs"), path = require("node:path");
@@ -2267,14 +2285,16 @@ const seed = process.argv[1];
 for (let i = 0; i < 50000; i++) {
   const dir = path.join(seed, "d" + String(Math.floor(i / 100)).padStart(5, "0"));
   if (i % 100 === 0) fs.mkdirSync(dir);
-  const size = Number((BigInt(i) * 2654435761n) % 4096n), unit = i + "\\n";
-  fs.writeFileSync(path.join(dir, "f" + String(i % 100).padStart(2, "0")), unit.repeat(Math.ceil(size / unit.length) || 0).slice(0, size));
+  fs.writeFileSync(path.join(dir, "f" + String(i % 100).padStart(2, "0")), i + "\\n");
 }`;
-      await exec(process.execPath, ["-e", script, seed], { timeout: 100000 });
+      await exec(process.execPath, ["-e", script, seed], { timeout: 80000 });
     } });
+    t.diagnostic("synthetic 50k fixture setup took " + (Date.now() - setupStarted) + " ms");
     try {
-      assert.equal((await f.capture()).length, 0);
-      t.diagnostic("synthetic 50k capture took " + (Date.now() - started) + " ms");
+      const started = Date.now();
+      const captured = await f.capture();
+      t.diagnostic("synthetic 50k capture alone took " + (Date.now() - started) + " ms");
+      assert.equal(captured.length, 0);
     } finally { await f.dispose(); }
   });
 });
