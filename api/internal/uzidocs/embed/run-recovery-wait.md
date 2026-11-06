@@ -1077,15 +1077,14 @@ records JSON key presence alongside its time pointer; this adds no wire field.
 Malformed non-null JSON timestamps are rejected by the Go decoder rather than
 interpreted as a hold. Surfaces with unknown timing show that uncertainty.
 
-**Custody differs by when the park happens.** Every data-volume-full park
-that lands **before your repo has been cloned**, with no retained source
-found by discovery, first releases this run's
-recovery-custody hold — the same release-then-park sequence a
-[forge-unreachable park](#forge-unreachable-at-clone) uses, and for the
-same reason: nothing has been cloned yet, so there is nothing for this
-worker to hold custody over, and the release must be positively confirmed
-before the park is allowed to proceed (an unconfirmed release takes the
-plain failed path instead of risking a leaked hold). A park that lands
+**Custody differs by when the park happens and whether the claim is inventory-guarded.**
+An unguarded data-volume-full park that lands **before your repo has been cloned**,
+with no retained source found by discovery, first releases this run's
+recovery-custody hold. It uses the same release-then-park sequence as a
+[forge-unreachable park](#forge-unreachable-at-clone): the release must be positively
+confirmed before parking. An inventory-guarded pre-clone claim cannot use that
+legacy release; a typed disk park keeps its custody hold intact, including on a
+timed retry. A park that lands
 **mid-run**, once your repo is cloned and work is underway, keeps the run's
 custody hold instead: only this worker holds the committed work the park
 is protecting, so releasing it could let another worker, or a recycle,

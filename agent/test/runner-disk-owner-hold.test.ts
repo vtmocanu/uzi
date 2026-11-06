@@ -57,6 +57,39 @@ function preCloneFixture() {
 }
 
 describe("disk parks wait for their owner after the counted budget", () => {
+  for (const retry of [null, RETRY] as const) {
+    it(`guarded pre-clone ${retry === null ? "owner hold" : "timed park"} reaches the typed disk report without releasing custody`, async () => {
+      const guard = new DataVolumeGuard({
+        dataDir: fx.dataDir, statfs: () => FULL, stat: async () => ({ dev: 7 }),
+        reclaim: async () => {},
+      });
+      const f = fixture({
+        features: ["recovery_cause_data_volume_full", "claim_generation_fence", "recovery_release_exact_echo", "recovery_inventory_v1"],
+        runner: { dataVolume: guard },
+      });
+      f.claim.inventory_guarded = true;
+      api.enqueueClaim(f.claim);
+      const admitted = await client.claimRun();
+      assert.equal(admitted?.inventory_guarded, true, "real WorkerClient records the guarded claim");
+      const report = client.reportState.bind(client);
+      client.reportState = async (id, body, signal) => {
+        if (body.status !== "recovery_wait") return report(id, body, signal);
+        assert.equal(body.recovery_cause, "data_volume_full");
+        assert.equal(body.claim_generation, f.claim.claim_generation);
+        await report(id, body, signal);
+        return { applied: true, status: "recovery_wait", recoveryRetryNotBefore: retry };
+      };
+      try {
+        await f.runner.execute(admitted!);
+        assert.equal(f.calls(), 0, "preflight never starts the executor");
+        assert.equal(api.states.filter(s => s.body.status === "recovery_wait").length, 1);
+        assert.equal(api.states.some(s => s.body.status === "failed"), false);
+        assert.ok(feed(f.claim.run_id).some(text => text.includes(retry === null
+          ? "waiting for owner Resume or Cancel" : `retry at ${RETRY}`)));
+      } finally { client.reportState = report; }
+    });
+  }
+
   for (const retry of [null, undefined, RETRY] as const) {
     it(`pre-clone disk ACK keeps explicit retry semantics: ${String(retry)}`, async () => {
       const f = preCloneFixture();
