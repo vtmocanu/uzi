@@ -118,9 +118,9 @@ func newSeededPlanFixture(ctx context.Context, t *testing.T) seededPlanFixture {
 	// from a fresh uuid rather than a fixed constant that would collide across fixtures.
 	wkrID := uuid.New()
 	tokenHash := uuid.New()
-	mustExecT(ctx, t, pool, `INSERT INTO workers (id, user_id, name, token_hash, status) VALUES ($1, $2, 'seed-worker', $3, 'online')`,
+	mustExecT(ctx, t, pool, `INSERT INTO workers (id, user_id, name, token_hash, status, protocol_capabilities) VALUES ($1, $2, 'seed-worker', $3, 'online', '{repo_agent_source_v1}')`,
 		wkrID, f.owner, tokenHash[:])
-	f.wkr = store.Worker{ID: wkrID, UserID: f.owner}
+	f.wkr = store.Worker{ID: wkrID, UserID: f.owner, ProtocolCapabilities: []string{"repo_agent_source_v1"}}
 	return f
 }
 

@@ -358,6 +358,7 @@ export const gitlabClaim = (iid: number, overrides = {}) =>
       id: "r1",
       url: "https://gitlab.example.test/org/repo",
       clone_url: fx.originPath,
+      default_branch: "main",
     },
     last_seq: 0,
     secrets: {

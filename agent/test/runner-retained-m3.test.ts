@@ -8,6 +8,7 @@ import { deflateSync } from "node:zlib";
 import type { ExecutorFactory } from "../src/runner.js";
 import type { RecoveryCoordinator } from "../src/recovery.js";
 import { DataVolumeGuard } from "../src/disk-full.js";
+import { REPO_AGENT_SOURCE_FEATURE } from "../src/protocol.js";
 import { noProofReseed, nullLogger } from "./helpers.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 
@@ -155,10 +156,7 @@ it("M3 failing retained capture ends one successor hold instead of parking and r
   assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "only local dirty work\n");
 });
 
-it("M3 real full-to-thin fallback adopts through executor.run with unknown remote ACKs and intact custody", async () => {
-  const { claim, bare, clone } = await seed(true);
-  const remote = guarded(claim);
-  let models = 0, releases = 0, publications = 0;
+function thinBundles() {
   const bundles: Array<{ fullBytes: number; thinBytes: number; prerequisites: string[]; tip: string; bundle: string }> = [];
   const produce = git.produceRecoveryBundle.bind(git);
   git.produceRecoveryBundle = async (p, opts) => {
@@ -182,6 +180,14 @@ it("M3 real full-to-thin fallback adopts through executor.run with unknown remot
     fs.rmSync(full.bundlePath);
     return thin;
   };
+  return bundles;
+}
+
+it("M3 real full-to-thin fallback adopts through executor.run with unknown remote ACKs and intact custody", async () => {
+  const { claim, bare, clone } = await seed(true);
+  const remote = guarded(claim);
+  let models = 0, releases = 0, publications = 0;
+  const bundles = thinBundles();
   client.publishCheckpoint = async (_run, _tip, stream) => {
     publications++;
     for await (const _chunk of stream) { /* consume actual pack */ }
@@ -220,6 +226,34 @@ it("M3 real full-to-thin fallback adopts through executor.run with unknown remot
   assert.ok(descriptor, "durable thin descriptor survives unknown upload ACK");
   assert.ok(fs.existsSync(descriptor.bundlePath!));
   assert.deepEqual(descriptor.prerequisiteShas, bundles[0]!.prerequisites);
+});
+
+it("M3 retained recovery reads repo agents at the default-branch tip of its own fetch", async () => {
+  const { claim } = await seed(true);
+  guarded(claim);
+  client.protocolFeatures = ["claim_generation_fence", REPO_AGENT_SOURCE_FEATURE];
+  const holds: string[] = [];
+  client.requestRepoAgentSourceHold = async (_run, args) => {
+    holds.push(args.commit);
+    return { outcome: "held", status: "paused" };
+  };
+  thinBundles();
+  client.publishCheckpoint = async (_run, _tip, stream) => {
+    for await (const chunk of stream) assert.ok(chunk.length > 0);
+    throw new Error("checkpoint publication unknown");
+  };
+  client.releaseRecoveryCustody = async () => { throw new Error("must keep custody"); };
+  let models = 0;
+  const r = runnerWith(factory(async () => {
+    models++;
+    throw new Error("model interrupted before settled completion");
+  }), fakeGitlab().gitlab, "fixture-journal-key", nullLogger(), { recoveryRetryMs: 1 });
+  await r.execute(claim);
+  assert.deepEqual(holds, [], "the retained claim is not held for its repo-agent source");
+  assert.equal(models, 1, "the retained claim reached executor.run");
+  const tip = command(fx.originPath, "rev-parse", "HEAD");
+  const reported = api.states.filter(s => s.runId === claim.run_id).map(s => s.body.repo_agent_source_commit).filter(c => c !== undefined);
+  assert.deepEqual([...new Set(reported)], [tip]);
 });
 
 // #3727 M3 (r4): the retained-claim caller evaluates only the missing-metadata and feature-snapshot grants.

@@ -241,7 +241,7 @@ WHERE ledger.repo_id = @repo_id::uuid
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
     pipeline_ref, mr_iid, target_run_id, review_comments, auto_approve, wait_on_limit, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, harness, plan_cross_check_required
-, code_cross_check_required, ci_config_guard, ci_config_paths)
+, code_cross_check_required, ci_config_guard, ci_config_paths, repo_agent_source_required)
 SELECT
     @user_id, @repo_id::uuid, 'mr_rework', @issue_title, @issue_description,
     @pipeline_ref, @mr_iid, @target_run_id, sqlc.narg('review_comments')::jsonb, true, @wait_on_limit,
@@ -257,7 +257,7 @@ SELECT
     (SELECT array_agg(DISTINCT x.p ORDER BY x.p) FROM (
         SELECT unnest(g.ci_config_paths) AS p FROM runs g WHERE g.repo_id = @repo_id::uuid AND g.ci_config_guard
           AND (g.id = @target_run_id OR g.branch = @pipeline_ref OR 'uzi/prompt-' || g.id::text = @pipeline_ref)
-    ) x)
+    ) x), true
 WHERE NOT EXISTS (
     SELECT 1 FROM runs
     WHERE repo_id = @repo_id::uuid
@@ -312,7 +312,7 @@ WITH led AS (
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
     pipeline_ref, mr_iid, target_run_id, review_comments, auto_approve, wait_on_limit, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, harness, plan_cross_check_required
-, code_cross_check_required, ci_config_guard, ci_config_paths)
+, code_cross_check_required, ci_config_guard, ci_config_paths, repo_agent_source_required)
 SELECT
     @user_id, @repo_id::uuid, 'mr_rework', @issue_title, @issue_description,
     @pipeline_ref, @mr_iid, @target_run_id, sqlc.narg('review_comments')::jsonb, true, @wait_on_limit,
@@ -330,7 +330,7 @@ SELECT
     (SELECT array_agg(DISTINCT x.p ORDER BY x.p) FROM (
         SELECT unnest(g.ci_config_paths) AS p FROM runs g WHERE g.repo_id = @repo_id::uuid AND g.ci_config_guard
           AND (g.id = @target_run_id OR g.branch = @pipeline_ref OR 'uzi/prompt-' || g.id::text = @pipeline_ref)
-    ) x)
+    ) x), true
 WHERE NOT EXISTS (
     SELECT 1 FROM runs
     WHERE repo_id = @repo_id::uuid

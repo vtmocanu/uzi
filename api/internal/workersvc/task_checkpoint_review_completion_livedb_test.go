@@ -15,7 +15,7 @@ func TestTaskCheckpointReviewCompletionLiveDB(t *testing.T) {
 	for _, enrolled := range []bool{true, false} {
 		t.Run(fmt.Sprintf("enrolled_%v", enrolled), func(t *testing.T) {
 			f := newCustodyContinuationFixture(t, setupCodexLiveDB(t))
-			caps := []string{capability.RecoveryArchiveV1, capability.AdviceClaimFenceV1}
+			caps := []string{capability.RecoveryArchiveV1, capability.AdviceClaimFenceV1, capability.RepoAgentSourceV1}
 			if enrolled {
 				caps = append(caps, capability.TaskCheckpointCoordinatesV1)
 			}

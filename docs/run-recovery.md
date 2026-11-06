@@ -1540,6 +1540,11 @@ locally (no journal record for the generation, no retained pin or clone of
 the run); on any doubt the hold stays open. The API accepts that release for
 a parked run only for a `forge_unreachable` park and only for the settled
 `forge_no_output` class. A parked run that adopted source keeps its hold.
+The same release closes the hold of a generation held as **repo agents
+unreadable** (`repo_agent_source_unavailable`) right after its fetch, before
+any clone was seeded, because its default branch had no resolvable commit. The
+run stays paused for its owner. The API accepts it only for that hold on a run
+with no recorded repo-agent revision.
 
 A dirty or unverified source, or an unproven process boundary, retains the
 clone and hold, reports **Needs action**, and uses bounded retries. Boot

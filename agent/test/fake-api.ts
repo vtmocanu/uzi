@@ -324,6 +324,8 @@ export class FakeApi {
   unauthorized = 0;
   stateAttempts = 0;
   readonly states: Array<{ runId: string; body: StateRequest }> = [];
+  readonly repoAgentSourceByRun = new Map<string, string>();
+  repoAgentSourceAckDelayMs = 0;
   /** Issue #3859: every /state body as it arrived on the wire, including reports the fake then
    *  refuses (which `states` omits because the real server persists nothing for a refusal). */
   readonly stateWire: Array<{ runId: string; body: StateRequest }> = [];
@@ -2125,6 +2127,14 @@ export class FakeApi {
         body: JSON.stringify(body), revision: gateRevision, inputId: body.revision_input_id, superseded: [...superseded],
       });
     }
+    if (body.repo_agent_source_commit !== undefined) {
+      if (this.repoAgentSourceAckDelayMs > 0) await new Promise((r) => setTimeout(r, this.repoAgentSourceAckDelayMs));
+      const stored = this.repoAgentSourceByRun.get(runId);
+      if (stored !== undefined && stored !== body.repo_agent_source_commit) {
+        return send(res, 409, { error: "the run already records a different repo-agent source revision", reason: "repo_agent_source_conflict" });
+      }
+      this.repoAgentSourceByRun.set(runId, body.repo_agent_source_commit);
+    }
     if (this.checkedTransport && body.status === "awaiting_approval") this.checkedFencedRuns.add(runId);
     this.states.push({ runId, body });
     this.requestLog.push(`state:${body.status}`);
@@ -2186,6 +2196,7 @@ export class FakeApi {
       run: {
         id: runId,
         worker_id: this.registeredWorkerId,
+        ...(this.repoAgentSourceByRun.has(runId) ? { repo_agent_source_commit: this.repoAgentSourceByRun.get(runId) } : {}),
         ...(body.recovery_cause === "worker_memory_pressure" && this.memoryWorkerId &&
             body.register_nonce === this.memoryRegisterNonce ? {
           worker_id: this.memoryWorkerId, recovery_wait_cause: body.recovery_cause,

@@ -65,7 +65,7 @@ func TestCIArtifactsSchedulerClaimFencedDownloadLiveDB(t *testing.T) {
 			t.Fatalf("refused claim mutated run: state=%s owned=%v", state, owner.Valid)
 		}
 	}
-	w := worker(capability.CIConfigGuardV1, capability.CIArtifactsV1)
+	w := worker(capability.CIConfigGuardV1, capability.CIArtifactsV1, capability.RepoAgentSourceV1)
 	p, err := svc.Claim(l.ctx, w, nil)
 	if err != nil || p == nil {
 		t.Fatalf("capable claim: %+v %v", p, err)

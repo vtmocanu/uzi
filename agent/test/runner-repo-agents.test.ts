@@ -5,13 +5,9 @@ import { makeClaim, nullLogger, testGitCacheOptions } from "./helpers.js";
 import { GitCache } from "../src/git.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import { StubExecutor, type Executor } from "../src/executor.js";
-import { detectRepoAgents } from "../src/repoagents.js";
+import { detectRepoAgentsAtRevision } from "../src/repoagents.js";
 import { RunRunner } from "../src/runner.js";
-import { realProcfsSkip } from "./real-procfs.js";
-
-const HAS_PROCFS = process.platform === "linux";
-const repoAgentReadSkip = (label: string): string | false =>
-  !HAS_PROCFS ? "reads procfs (Linux only)" : realProcfsSkip(`runner repoagents: ${label}`);
+import { REPO_AGENT_SOURCE_FEATURE, type BaseAttestationHoldOutcome } from "../src/protocol.js";
 import {
   api,
   client,
@@ -38,6 +34,7 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
           id: "r1",
           url: "https://gitlab.example.test/org/repo",
           clone_url: repoFx.originPath,
+          default_branch: "main",
         },
         last_seq: 0,
         secrets: {
@@ -73,7 +70,7 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
     }
   }
 
-  it("reports the parsed roster on a running report, noting every drop", { skip: repoAgentReadSkip("parsed roster") }, async () => {
+  it("reports the parsed roster on a running report, noting every drop", async () => {
     const { states, texts } = await runAgainst({
       ".claude/agents/coder.md":
         "---\nname: coder\ndescription: Implements changes.\nmodel: opus\n---\n\nImplement it.\n",
@@ -128,10 +125,7 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
     );
   });
 
-  it("keeps a detection FAILURE distinguishable from an empty roster (no repo_agents reported)", async () => {
-    // A detection throw (e.g. an unreadable dir) must NOT be reported as `[]` (which
-    // means "scanned, found none"). The worker sends no repo_agents at all, so the
-    // column stays NULL, and it says so on the feed. The run still completes.
+  it("without the pin feature a detection FAILURE reports no roster and the run still completes", async () => {
     const repoFx = makeFixture({});
     try {
       const { gitlab } = fakeGitlab();
@@ -142,6 +136,7 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
           id: "r1",
           url: "https://gitlab.example.test/org/repo",
           clone_url: repoFx.originPath,
+          default_branch: "main",
         },
         last_seq: 0,
         secrets: {
@@ -174,27 +169,24 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
         .messages(claim.run_id)
         .filter((m) => m.kind === "status")
         .map((m) => String(m.payload.text));
-      // NO report carries repo_agents — not even `[]`. The column stays "not reported".
       assert.ok(
         !states.some((s) => s.repo_agents !== undefined),
         "a detection failure reports no roster",
       );
       assert.ok(
-        texts.some((t) =>
-          t.includes("could not read the repo's .claude/agents/"),
-        ),
+        texts.some((t) => t.includes("could not read the repo's .claude/agents/")),
         texts.join("\n"),
       );
       assert.ok(
         states.some((s) => s.status === "completed"),
-        "the run still completes",
+        JSON.stringify(states.map((s) => s.status)),
       );
     } finally {
       repoFx.cleanup();
     }
   });
 
-  it("autopilot resolves + reports the repo-agent default selection with a feed note (PRD #37)", { skip: repoAgentReadSkip("autopilot repo selection") }, async () => {
+  it("autopilot resolves + reports the repo-agent default selection with a feed note (PRD #37)", async () => {
     // A repo shipping agents + an autopilot claim: the self-approve path resolves
     // the default to the repo source, reports it on a running report (the only
     // channel a no-input run has), and states it on the feed — never parking at the
@@ -214,6 +206,7 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
           id: "r1",
           url: "https://gitlab.example.test/org/repo",
           clone_url: repoFx.originPath,
+          default_branch: "main",
         },
         last_seq: 0,
         secrets: {
@@ -291,6 +284,7 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
             id: "r1",
             url: "https://gitlab.example.test/org/repo",
             clone_url: repoFx.originPath,
+            default_branch: "main",
           },
           last_seq: 0,
           secrets: {
@@ -347,7 +341,7 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
     );
   });
 
-  describe("second source: .codex/agents (issue #2085)", { skip: repoAgentReadSkip("second source") }, () => {
+  describe("second source: .codex/agents (issue #2085)", () => {
     const CODER_MD = "---\nname: claude-coder\ndescription: From claude.\n---\n\nbody\n";
     const CODER_TOML =
       'name = "codex-coder"\ndescription = "From codex."\ndeveloper_instructions = "Do it."\n';
@@ -375,7 +369,7 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
         const claim = makeClaim({
           issue_iid: 41,
           issue_title: "roster source",
-          repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: repoFx.originPath },
+          repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: repoFx.originPath, default_branch: "main" },
           last_seq: 0,
           secrets: o.codex
             ? CODEX_SECRETS
@@ -473,7 +467,7 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
         { ".codex/agents/c.toml": CODER_TOML },
         {
           detect: async (p, h) => {
-            const r = await detectRepoAgents(p, h);
+            const r = await detectRepoAgentsAtRevision(p, h);
             // Record completion, after a delay, so a runner that did not await
             // detection would enter the executor's run first.
             await new Promise((resolve) => setTimeout(resolve, 25));
@@ -491,16 +485,33 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
       assert.deepStrictEqual(order, ["detect", "run"]);
     });
 
-    it("the failure line names both folders", async () => {
-      const { texts } = await runWith({}, {
-        detect: async () => {
-          throw new Error("boom");
-        },
-      });
-      assert.ok(
-        texts.some((t) => t.includes("could not read the repo's .claude/agents/ or .codex/agents/; continuing with your own agent templates")),
-        texts.join("\n"),
-      );
+    it("with the pin feature a detection failure holds the run, naming both folders and the revision", async () => {
+      const holds: { commit: string }[] = [];
+      const orig = client.requestRepoAgentSourceHold.bind(client);
+      (client as unknown as { requestRepoAgentSourceHold: unknown }).requestRepoAgentSourceHold = async (
+        _runId: string, args: { commit: string },
+      ): Promise<BaseAttestationHoldOutcome> => {
+        holds.push({ commit: args.commit });
+        return { outcome: "held", status: "paused" };
+      };
+      try {
+        const { states, texts } = await runWith({}, {
+          features: [REPO_AGENT_SOURCE_FEATURE],
+          detect: async () => {
+            throw new Error("boom");
+          },
+        });
+        assert.equal(holds.length, 1);
+        assert.match(holds[0]!.commit, /^[0-9a-f]{40}$/);
+        assert.ok(!states.some((s) => s.status === "failed" || s.status === "completed"), JSON.stringify(states.map((s) => s.status)));
+        assert.ok(
+          texts.some((t) => /the repo's \.claude\/agents\/ or \.codex\/agents\/ could not be read at revision [0-9a-f]{12}/.test(t) &&
+            t.includes("The agent did not start")),
+          texts.join("\n"),
+        );
+      } finally {
+        (client as unknown as { requestRepoAgentSourceHold: unknown }).requestRepoAgentSourceHold = orig;
+      }
     });
   });
 

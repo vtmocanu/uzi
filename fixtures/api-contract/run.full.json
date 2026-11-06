@@ -696,6 +696,7 @@
       "folder": "x"
     }
   ],
+  "repo_agent_source_commit": "x",
   "agent_source": "x",
   "agent_exclusions": [
     "x"

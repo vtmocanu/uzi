@@ -1282,6 +1282,8 @@ type Run struct {
 	SnapshotDepartedGeneration     pgtype.Int8        `json:"snapshot_departed_generation"`
 	SnapshotDepartedNonce          pgtype.Text        `json:"snapshot_departed_nonce"`
 	SnapshotDepartedEpoch          pgtype.Int8        `json:"snapshot_departed_epoch"`
+	RepoAgentSourceCommit          pgtype.Text        `json:"repo_agent_source_commit"`
+	RepoAgentSourceRequired        bool               `json:"repo_agent_source_required"`
 }
 
 type RunCompletionAttempt struct {
