@@ -804,6 +804,7 @@ func (h *Handler) SetRepoEnabled(w http.ResponseWriter, r *http.Request) {
 			writeProvisionError(w, err)
 			return
 		}
+		h.importAfterEnable(r.Context(), user.ID, id)
 	} else {
 		var err error
 		repo, err = h.q.SetRepoEnabledForUser(r.Context(), store.SetRepoEnabledForUserParams{ID: id, Enabled: false, UserID: user.ID})
@@ -823,6 +824,30 @@ func (h *Handler) SetRepoEnabled(w http.ResponseWriter, r *http.Request) {
 	}
 
 	httpx.JSON(w, http.StatusOK, map[string]any{"repo": repoToDTO(repo)})
+}
+
+// importAfterEnable imports the issues of a repo that was just enabled. The
+// enable creates the board columns, so GetBoard's first-open seed, which used
+// to run this import, no longer fires; without it a new board stays empty
+// until the poller's first tick. Best effort: the enable already succeeded,
+// and the poller or Refresh retries a failed import.
+func (h *Handler) importAfterEnable(ctx context.Context, userID, repoID uuid.UUID) {
+	if h.svc == nil {
+		return
+	}
+	row, err := h.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID})
+	if err != nil {
+		slog.Warn("import after enable: read repo", "error", err)
+		return
+	}
+	f, err := h.svc.ForgeForConnection(row.ForgeType, row.BaseUrl, row.TokenCiphertext)
+	if err != nil {
+		slog.Warn("import after enable: build forge", "error", err)
+		return
+	}
+	if _, err := h.svc.FullSync(ctx, row.ID, row.ForgeProjectID, f); err != nil {
+		slog.Warn("import after enable failed; the poller retries", "repo", row.PathWithNamespace, "error", err)
+	}
 }
 
 // DeleteRepo removes a single repo row (PRD #357), cascading its derived data

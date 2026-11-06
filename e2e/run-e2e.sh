@@ -271,12 +271,12 @@ REPO_ID="$(apiget /api/repos | jq -r '.repos[0].id // empty')"
 [ -n "$REPO_ID" ] || fail "no enabled repo after seed (expected group/repo)"
 pass "admin logged in; repo $REPO_ID enabled"
 
-# Open the board once up front so its columns are seeded (as labels on the fake).
-# An unopened board has no columns, which would let the run-lifecycle's
-# single-column moves leave a card carrying two column labels; seeding first keeps
-# the column state clean for the run-lifecycle path and the PRD #24 MR-close phase.
+# The startup seed enabled the repo and created its board columns (PRD #3760),
+# so the run-lifecycle's single-column moves never leave a card carrying two
+# column labels. Open the board once up front to confirm the columns exist
+# before the run-lifecycle path and the PRD #24 MR-close phase rely on them.
 apiget "/api/repos/$REPO_ID/board" >/dev/null
-pass "board columns seeded"
+pass "board columns present"
 
 # =============================================================================
 

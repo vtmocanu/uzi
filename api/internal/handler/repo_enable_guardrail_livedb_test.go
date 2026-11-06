@@ -92,6 +92,12 @@ func newFakeGuardForge(t *testing.T) *fakeGuardForge {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte("[]"))
 			return
+		case strings.HasSuffix(path, "/issues") && r.Method == http.MethodGet:
+			// One open uzi issue, so an import after the enable has a card to
+			// cache. Every list fetch of the full sync gets the same issue.
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[{"id":9001,"iid":5,"title":"First card","state":"opened","labels":["uzi"],"web_url":"https://forge.e2e/g/r/-/issues/5","updated_at":"2026-11-01T00:00:00Z"}]`))
+			return
 		case strings.Contains(path, "/members/all/"):
 			// The bot is exactly a Developer (30, the compliant write role): a clean
 			// role, so the only findings under test come from branch protection.
@@ -298,6 +304,28 @@ func TestSetRepoEnableGuardAllowsCleanLiveDB(t *testing.T) {
 	// the run lifecycle can resolve a card's column without a board read first.
 	if got := f.boardColumns(ctx, t, repoID); got != 4 {
 		t.Errorf("board_columns after enable = %d, want 4", got)
+	}
+}
+
+// Enabling a repo creates its columns, so the first board open no longer runs
+// the seed that imported issues. The enable itself imports them, best effort,
+// so a newly enabled repo shows its cards without waiting for the poller
+// (PR #3956 review, item 6).
+func TestSetRepoEnableImportsIssuesLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newEnableGuardFixture(ctx, t)
+	repoID := f.seedRepo(ctx, t, 108, false, protClean)
+
+	w := f.setEnabled(t, repoID, true)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", w.Code, w.Body.String())
+	}
+	var n int
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM issues WHERE repo_id = $1`, repoID).Scan(&n); err != nil {
+		t.Fatalf("count issues: %v", err)
+	}
+	if n == 0 {
+		t.Errorf("no issues cached after the enable; the first board open would show an empty board")
 	}
 }
 
