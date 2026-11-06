@@ -21,6 +21,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/auth"
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
+	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/workersize"
@@ -361,7 +362,11 @@ type Config struct {
 	// startup. Empty SeedForgePAT disables it. Requires SeedEmail; the base URL
 	// must be allowlisted. Validated at boot (see loadSeedForge). SeedForgeBaseURL
 	// is stored normalized to match how a connection's base_url is stored.
+	// SeedForgeType is the forge driver the seed builds and stores
+	// (UZI_SEED_FORGE_TYPE, default gitlab); it is the seed's one forge-type
+	// site, read by the presence check, the client build and the stored row.
 	SeedForgePAT     string
+	SeedForgeType    forge.Type
 	SeedForgeBaseURL string
 	SeedForgeRepos   []string
 
@@ -1921,7 +1926,8 @@ func loadSeedAdmin(cfg *Config) error {
 // FORGE_ALLOWED_BASE_URLS allowlist, or boot fails — a set-but-invalid seed is a
 // loud misconfiguration, consistent with the other static boot guards.
 // UZI_SEED_FORGE_BASE_URL defaults to the first allowlisted entry and is stored
-// normalized so it matches how a connection's base_url is stored. Runtime forge
+// normalized so it matches how a connection's base_url is stored.
+// UZI_SEED_FORGE_TYPE defaults to gitlab; an unknown value refuses boot. Runtime forge
 // failures at seed time are handled non-fatally by the seeder, not here.
 func loadSeedForge(cfg *Config) error {
 	pat := strings.TrimSpace(os.Getenv("UZI_SEED_FORGE_PAT"))
@@ -1942,7 +1948,19 @@ func loadSeedForge(cfg *Config) error {
 	if err != nil {
 		return fmt.Errorf("UZI_SEED_FORGE_BASE_URL: %w", err)
 	}
+	// The forge is configured, never detected from the URL or the token: the
+	// driver must be chosen before the token can be verified (PRD #65 D11).
+	// Unset keeps the pre-#3785 behaviour, GitLab.
+	forgeType := forge.TypeGitLab
+	if raw := strings.TrimSpace(os.Getenv("UZI_SEED_FORGE_TYPE")); raw != "" {
+		t, ok := forge.ParseType(raw)
+		if !ok {
+			return fmt.Errorf("UZI_SEED_FORGE_TYPE %q is not a supported forge type; supported values: %s", raw, forge.SupportedTypesList())
+		}
+		forgeType = t
+	}
 	cfg.SeedForgePAT = pat
+	cfg.SeedForgeType = forgeType
 	cfg.SeedForgeBaseURL = norm
 	cfg.SeedForgeRepos = parseCommaList(os.Getenv("UZI_SEED_FORGE_REPOS"))
 	return nil

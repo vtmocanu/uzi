@@ -19,30 +19,6 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// seedForgeType is the forge the startup seed provisions. It is the seed's ONE
-// forge-type site: the presence check, the client build, and the persisted row
-// below must all name the same forge, and before this constant they were three
-// independent literals that merely happened to agree. Disagreement between them
-// is not a compile error — it is a seed that verifies one forge, stores another,
-// and re-seeds on every boot because its own presence check never matches the row
-// it wrote. One name makes that class of bug unrepresentable.
-//
-// Pinned to GitLab, and NOT read from config, deliberately (PRD #65 M6a). The
-// migration alongside this widens the forge_type CHECK to admit 'forgejo' (and,
-// since PRD #238 M5, 'github' too), but that widening is only safe while nothing
-// can write such a row: handler/forge.go still refuses those types (:158), so the
-// API cannot create one. The seed bypasses
-// that handler entirely — it calls UpsertForgeConnection directly — so an
-// operator-settable seed type would be a second, ungated door to the exact row
-// the gate exists to prevent, and PRD #65's dark-landing property ("no forgejo row
-// can exist while the handler rejects the type") would be false the moment it
-// landed.
-//
-// Making the seed genuinely forge-aware therefore belongs with the gate flip
-// (M6b), not here, and needs a UZI_SEED_FORGE_TYPE in config that does not exist
-// yet. When that lands, this constant is what it replaces.
-const seedForgeType = forge.TypeGitLab
-
 // Store is the subset of *store.Queries the forge seed needs. Narrowing to an
 // interface lets the seed logic be unit-tested against a fake store (and a
 // mocked Forge) without a live database, mirroring forgesvc's IssueStore.
@@ -86,6 +62,15 @@ func ForgeConnection(ctx context.Context, q Store, svc ForgeService, cfg config.
 		// here is a real DB/ordering fault, not an expected "absent" case.
 		return fmt.Errorf("seed forge: look up seed admin %q: %w", cfg.SeedEmail, err)
 	}
+
+	// seedForgeType is the seed's ONE forge-type site: the presence check, the
+	// client build and the persisted row below must all name the same forge.
+	// Disagreement between them is not a compile error — it is a seed that
+	// verifies one forge, stores another, and re-seeds on every boot because its
+	// own presence check never matches the row it wrote. One name makes that class
+	// of bug unrepresentable. It comes from UZI_SEED_FORGE_TYPE (default gitlab),
+	// validated at config.Load, so it is always a supported driver here.
+	seedForgeType := cfg.SeedForgeType
 
 	// Never touch an existing connection: if the seed user already has one for
 	// (seedForgeType, base_url), do nothing — no re-verify, no overwrite —

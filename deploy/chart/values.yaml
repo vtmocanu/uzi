@@ -247,6 +247,8 @@ api:
   # under simple/cnpg the chart renders it from the database storage size and setting it here too fails the render (duplicate key).
   config:
     API_ADDR: ":8080"
+    # Optional startup forge seed type: gitlab (default), forgejo, or github.
+    # UZI_SEED_FORGE_TYPE: gitlab
     # OIDC group-based roles/access (PRD #55) — all NON-secret ConfigMap values
     # (group names are not secrets, so they live here, not in secretEnv). Require
     # OIDC configured (issuer/client-id in api.config per-cluster + the client secret
