@@ -305,9 +305,10 @@ upgrading workers; mixed API replicas and API rollback are unsupported.
 ### Retained recovery adoption failed
 
 `recovery_wait` / `retained_recovery_adoption_failed` means adoption of the
-retained work did not complete: an integrity check refused it, or the ownership
-check right after adoption failed for a reason other than a short connection
-outage. Local work and custody are preserved. This is an owner hold
+retained work did not complete: an integrity check refused it, or another
+adoption step could not be verified, including an ownership check right after
+adoption that failed other than through a connection failure the worker retries
+(connection refused or reset, a dropped socket, or a 502/503/504 answer). Local work and custody are preserved. This is an owner hold
 with **no automatic retry**, regardless of any displayed retry timestamp.
 
 1. Read `uzi run recovery <id>` and export an available archive before deciding;

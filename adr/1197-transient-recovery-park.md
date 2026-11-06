@@ -1813,13 +1813,15 @@ Accepted residuals: a thin FINAL stays stuck and is retried while the pin or the
 ## Amendment 2026-11-06, #3994: transient API connection failures retry the ownership check in place
 
 Decision record (AI-synced 2026-11-06). This qualifies the #3527 owner hold
-([amendment](#amendment-2026-10-27-3527-owner-held-retained-adoption-retry)) for
-one observed failure: during a release rollout, the worker's post-adoption
+([amendment](#amendment-2026-10-27-3527-owner-held-retained-adoption-retry)) for a class of
+failures, motivated by one observed failure: during a release rollout, the worker's post-adoption
 ownership check failed (logged `fetch failed`, then
 `retained_successor_post_adoption_check`) for a verified, journaled retained
 successor. The rollout timing is consistent with temporary API unavailability,
-but the evidence does not identify the exception of the ownership request, and
-the adoption-failure owner hold in that generation was not confirmed. Before
+but the evidence does not identify the error (cause code) of the ownership
+request, and the adoption-failure owner hold in that generation was not
+confirmed. If that error was not one of the codes retried below (for example a
+DNS failure or a timeout), this change would not have avoided the hold. Before
 this change, any failure of that check that was not a stop followed the
 `adoption_failed` path, including a short connection outage in which no
 integrity check had failed.
