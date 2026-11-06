@@ -1,9 +1,9 @@
 # ADR-2149: Server-enforced plan cross-check
 
-**Status**: Accepted (implementation); hosted acceptance pending
+**Status**: Accepted (implementation); hosted acceptance closed by maintainer decision on #2152 (2026-10-23)
 **Date**: 2026-10-06
 **Issue**: [vtmocanu/uzi#2149](https://github.com/vtmocanu/uzi/issues/2149)
-**Extends**: [PRD #2149](../prds/2149-plan-cross-check.md), especially D1, D4–D7 and D16. The PRD remains in `prds/` until maintainer-owned hosted acceptance is complete.
+**Extends**: [PRD #2149](../prds/done/2149-plan-cross-check.md), especially D1, D4–D7 and D16. Its hosted acceptance was closed by maintainer decision on #2152 (2026-10-23).
 
 ## Context
 

@@ -857,8 +857,8 @@ escaping sibling/symlink reads are denied. This does not prove network
 isolation. Web and CLI show bounded findings and recorded child metadata,
 with current gate reason separate from historical candidate evidence; Slack
 shows the reason without findings. See [ADR-2149](adr/2149-cross-check.md) for
-confinement/proof limits and [PRD #2149](prds/2149-plan-cross-check.md) for
-rationale, validation provenance and pending hosted acceptance. The Codex-lead
+confinement/proof limits and [PRD #2149](prds/done/2149-plan-cross-check.md) for
+rationale, validation provenance and its closed hosted acceptance (#2152). The Codex-lead
 direction is [PRD #2460](prds/done/2460-codex-lead-plan-cross-check.md) and the
 [ADR-2149 addendum](adr/2149-cross-check.md#2460-addendum-codex-lead-claude-checker). Automatic rounds extend the original #2149
 scope through [PRD #2150](prds/done/2150-plan-cross-check-auto-revise.md) and
