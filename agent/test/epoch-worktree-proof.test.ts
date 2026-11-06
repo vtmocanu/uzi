@@ -573,18 +573,30 @@ it("refuses each other .git entry the proof cannot account for, before any launc
 
 for (const [key, value] of [
   ["filter.x.clean", "cat"], ["core.attributesFile", "/dev/null"], ["include.path", "x"], ["includeIf.gitdir:/.path", "x"],
-  ["core.hooksPath", "/tmp"], ["extensions.worktreeConfig", "true"], ["core.sparseCheckout", "true"],
-  ["status.renames", "true"], ["diff.renames", "true"], ["core.worktree", "/tmp"], ["core.ignoreCase", "true"],
+  ["core.hooksPath", "/tmp"], ["core.sparseCheckout", "true"],
+  ["status.renames", "true"], ["diff.renames", "true"], ["core.ignoreCase", "true"],
   ["core.untrackedCache", "true"], ["core.fsmonitor", "true"], ["core.bare", "true"], ["attr.tree", "HEAD"],
   ["core.repositoryformatversion", "1"], ["index.sparse", "true"], ["core.splitIndex", "true"],
-  ["core.autocrlf", "true"], ["safe.directory", "*"], ["extensions.refstorage", "reftable"],
-  ["extensions.partialclone", "origin"],
+  ["core.autocrlf", "true"], ["safe.directory", "*"],
 ] as const) {
   it(`config: ${key} is not an admitted clone key`, async t => {
     command(clonePath, "config", "--local", key, value);
     const rec = recordLaunches(t);
     assert.equal(await prove(), false);
     assertNoContentRead(rec);
+  });
+}
+// The keys that change where objects, refs or the worktree live are indirection, not a hostile source's own state:
+// the shape stage classifies them first, and they are UNKNOWN (they stop the epoch scope), never a keep.
+for (const [key, value] of [
+  ["extensions.worktreeConfig", "true"], ["core.worktree", "/tmp"], ["extensions.refstorage", "reftable"],
+  ["extensions.partialclone", "origin"], ["extensions.compatobjectformat", "sha256"], ["extensions.objectformat", "sha256"],
+] as const) {
+  it(`config: ${key} is indirection, UNKNOWN before any launch`, async t => {
+    command(clonePath, "config", "--local", key, value);
+    const rec = recordLaunches(t);
+    await proveUnknown();
+    assertNoGit(rec);
   });
 }
 it("config: the keys uzi writes are admitted, and any branch tracking key", async () => {
