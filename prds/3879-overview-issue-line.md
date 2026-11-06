@@ -1,6 +1,6 @@
 # PRD #3879: Overview preview, the issue-work line
 
-**Status**: Draft, parked (`Later`). Child of epic #3873. Blocked by: #3878 (the preview page, its data hook and the Runs widget).
+**Status**: Ready for dispatch. Child of epic #3873. Its blocker #3878 (the preview page, its data hook and the Runs widget) landed in PR #3952; #3880 (capacity rail and held work) landed in PR #3971.
 
 **Design brief**: `prds/3873-overview-redesign.md` (model-fidelity rules, data readiness, reuse map, constraints, mock contract). This PRD wins where it is more specific.
 
@@ -34,14 +34,14 @@ Capacity and held work (#3880), usage (#3881), the command menu (#3875). No new 
 ## Modules and seams
 
 - **`issueLineStage(run)`** (pure, `web/src/lib`): one of `queued`, `planning`, `review`, `building`, `asking`, `parked`, `other`, `pr` or `none`. Rules, in order:
-  - terminal (`completed`, `failed`, `cancelled`): `pr` when #3878's `openPrs` includes it (the viewer's own completed issue run with an open PR); otherwise `none`. This comes first, so finished jobs, tasks and self-improve runs never inflate Other work.
+  - terminal (`completed`, `failed`, `cancelled`): `pr` when #3878's `openPrs` (`web/src/lib/overview.ts:167`) includes it (the viewer's own completed issue run with an open PR); otherwise `none`. This comes first, so finished jobs, tasks and self-improve runs never inflate Other work.
   - `kind` other than `issue` → `other` (only the listed kinds reach here, brief Run populations; this includes `ci_fix` and `mr_rework`, brief D21).
-  - an account cooldown (`isAccountCooldownWaiting`, `web/src/lib/runBadge.ts:533`) → `parked`. It comes before the rules below because a cooldown run can be `claimed`, `running` or `awaiting_approval`; today's Overview also counts it as waiting, not executing.
+  - an account cooldown (`isAccountCooldownWaiting`, `web/src/lib/runBadge.ts:537`) → `parked`. It comes before the rules below because a cooldown run can be `claimed`, `running` or `awaiting_approval`; today's Overview also counts it as waiting, not executing.
   - `queued`, `claimed` → `queued`.
   - effective planning (`is_planning`), or `awaiting_approval` with `is_revising` → `planning`.
   - `awaiting_approval` → `review`.
   - `awaiting_input`, `awaiting_followup` → `asking`.
-  - `limit_wait`, `pool_wait`, `recovery_wait`, `paused` → `parked`. For every parked run, #3878's `parkDisposition` decides automatic or owner; no second rule lives here.
+  - `limit_wait`, `pool_wait`, `recovery_wait`, `paused` → `parked`. For every parked run, #3878's `parkDisposition` (`web/src/lib/overview.ts:150`) decides automatic or owner; no second rule lives here.
   - `running`, including an empty `progress.phase` or `progress.state` `stalled` → `building`.
   - Any non-terminal status this list does not name → `building`, so a run never drops off the line.
 - **`IssueLine`** component and the bays; the selected stage is page state on the preview page, shared with the Runs widget.
@@ -50,7 +50,10 @@ Capacity and held work (#3880), usage (#3881), the command menu (#3875). No new 
 
 - Unit tests for `issueLineStage`, one per rule above, including terminal runs of every kind (never Other work), the unknown-status fallback and the `ci_fix` / `mr_rework` placement; caption tests for own, others' and mixed waits.
 - Component tests for counts, badges, the owner tooltip (asserting the `title` attribute, masked in demo mode), filtering and `aria-pressed`, in the style of `web/src/pages/Dashboard.test.tsx`.
-- Extend #3878's mock-mode scenario with one run per stage; screenshots against the mock at desktop and 400 px (the line turns vertical), Ember and Dawn, plus one Shadow screenshot for `data-live`.
+- Extend #3878's mock-mode scenario (`web/src/mocks/data/overviewNext.ts`) with one run per stage; screenshots against the mock at desktop and 400 px (the line turns vertical), Ember and Dawn, plus one Shadow screenshot for `data-live`.
+
+- **In-run checks** follow the brief's Gates line (the AGENTS.md API/web/repo in-run boundary): `task check:web`, touched and directly affected Vitest files, browser cases for the changed UI, `check:changelog-entry`, `cd web && npm run build`, `task scan:secrets` and `task sast:semgrep` (the line renders untrusted issue and owner fields). Implementation and validation make no `.github/workflows/**` edits. Full `test:web`, `test:web-browser` and `gate:repo` are landing obligations (exact-head PR CI), not milestones.
+- Keep #3880's rail and Held work sections and #3878's decisions card unchanged; the Issue work card is additive on `/overview/next`.
 
 ## Milestones
 
@@ -76,3 +79,4 @@ Acceptance: filter tests; keyboard operable; mock parity for the pressed state.
 - **PR open counts PRs from completed runs and stays out of active totals**: completed runs are not active work, and one PR can have several runs.
 - **Unknown non-terminal statuses fall back to Building**: a new status must never hide a run. Rejected: dropping unknown runs.
 - **Tones reuse `RUN_STATUS_TONES`**, so all five themes work without new tokens.
+- **Pickup refresh (2026-11-06)**: anchors rechecked on `main` after #3878 and #3880 landed; `parkDisposition` and `openPrs` live in `web/src/lib/overview.ts`; the cooldown helper moved to `runBadge.ts:537`. No scope change.
