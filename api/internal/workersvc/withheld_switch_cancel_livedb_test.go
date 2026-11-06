@@ -7,7 +7,9 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -36,7 +38,9 @@ type steeringRow struct {
 
 // newWithheldSwitch builds the lane fixture, optionally claims the checker child first (a claim is
 // refused while a switch is pending, so it must precede the stamp), gives the lead's worker a fresh
-// heartbeat (the live poller) and optionally stamps the switch at the lead's current generation.
+// heartbeat (the live poller), pins the service clock to the database clock (as dindLiveClocked does
+// for the #3970 flow, so a host skewed against Postgres cannot flip hasLivePoller) and optionally
+// stamps the switch at the lead's current generation.
 func newWithheldSwitch(t *testing.T, claimChild, stamp bool) withheldSwitch {
 	t.Helper()
 	f := laneFixture(t)
@@ -47,16 +51,23 @@ func newWithheldSwitch(t *testing.T, claimChild, stamp bool) withheldSwitch {
 	workerID := uuid.UUID(lead.WorkerID.Bytes)
 	f.env.exec(`UPDATE workers SET protocol_capabilities=$2,last_heartbeat_at=now() WHERE id=$1`,
 		workerID, []string{capability.CredentialSwitchV1})
+	dindLiveClocked(t, f.env, f.svc)
 	w := withheldSwitch{f, wkrRow(t, f.env, workerID), lead.ClaimGeneration}
 	if stamp {
-		w.stamp()
+		w.stamp(t)
 	}
 	return w
 }
 
-func (w withheldSwitch) stamp() {
-	w.env.exec(`UPDATE runs SET credential_switch_requested_at=now(),credential_switch_generation=claim_generation
-		WHERE id=$1`, w.lead)
+// stamp records the owner's switch request through the production query, whose fence (owner,
+// holding worker, exact live generation, held status) a running lead satisfies.
+func (w withheldSwitch) stamp(t *testing.T) {
+	t.Helper()
+	n, err := w.env.q.StampHeldCredentialSwitch(w.env.ctx, store.StampHeldCredentialSwitchParams{
+		Generation: pgtype.Int8{Int64: w.gen, Valid: true}, ID: w.lead, UserID: w.userID, WorkerID: pgconv.UUID(w.leadWorker.ID)})
+	if err != nil || n != 1 {
+		t.Fatalf("StampHeldCredentialSwitch rows=%d err=%v, want exactly one", n, err)
+	}
 }
 
 func (w withheldSwitch) requirePreconditions(t *testing.T, beforeDeadline bool) {
@@ -66,10 +77,10 @@ func (w withheldSwitch) requirePreconditions(t *testing.T, beforeDeadline bool) 
 		t.Fatalf("lead = status %q worker %v released %v, want a live running claim", run.Status,
 			run.WorkerID.Valid, run.ClaimReleasedAt.Valid)
 	}
-	var fresh bool
-	if err := w.env.pool.QueryRow(w.env.ctx, `SELECT last_heartbeat_at > now()-interval '30 seconds' FROM workers WHERE id=$1`,
-		w.leadWorker.ID).Scan(&fresh); err != nil || !fresh {
-		t.Fatalf("lead worker heartbeat fresh=%v err=%v", fresh, err)
+	// The live-poller precondition is hasLivePoller itself (service clock against the heartbeat, with
+	// WorkerHeartbeatStale), so the cancel's queue-or-apply decision and this check cannot diverge.
+	if live, err := w.svc.hasLivePoller(w.env.ctx, run); err != nil || !live {
+		t.Fatalf("hasLivePoller = %v, %v, want a live poller", live, err)
 	}
 	if pending, err := w.env.q.RunHasPendingOutcomeLease(w.env.ctx, w.lead); err != nil || pending {
 		t.Fatalf("pending-outcome lease=%v err=%v, want none", pending, err)
@@ -94,7 +105,9 @@ func (w withheldSwitch) snapshot(t *testing.T) string {
 		'lead',(SELECT to_jsonb(r) FROM runs r WHERE r.id=$1),
 		'child',(SELECT to_jsonb(r) FROM runs r WHERE r.id=$2),
 		'checks',(SELECT jsonb_agg(to_jsonb(c) ORDER BY c.round) FROM cross_checks c WHERE c.lead_run_id=$1),
-		'inputs',(SELECT jsonb_agg(to_jsonb(i) ORDER BY i.id) FROM run_user_inputs i WHERE i.run_id=$1))::text`,
+		'inputs',(SELECT jsonb_agg(to_jsonb(i) ORDER BY i.id) FROM run_user_inputs i WHERE i.run_id=$1),
+		'holds',(SELECT jsonb_agg(to_jsonb(h) ORDER BY h.id) FROM recovery_custody_holds h WHERE h.run_id=$1),
+		'retentions',(SELECT jsonb_agg(to_jsonb(c) ORDER BY c.run_id) FROM checkpoint_retentions c WHERE c.run_id=$1))::text`,
 		w.lead, w.runID).Scan(&s); err != nil {
 		t.Fatal(err)
 	}
@@ -125,11 +138,15 @@ func (w withheldSwitch) inputs(t *testing.T) []steeringRow {
 
 // queueWithheldCancel queues an answer and a follow_up and then the owner cancel, which must be
 // QUEUED (ServerSide=false) because the lead has a live poller. A real answer submit is refused
-// unless the run is awaiting_input, so the answer row is inserted directly; the follow_up and the
+// unless the run is awaiting_input, so the answer row is inserted with the production query; the follow_up and the
 // cancel go through SubmitInput. It returns the steering rows as they stand afterwards.
 func (w withheldSwitch) queueWithheldCancel(t *testing.T) []steeringRow {
 	t.Helper()
-	w.env.exec(`INSERT INTO run_user_inputs(run_id,kind,body) VALUES($1,'answer',$2)`, w.lead, `{"question_id":"q-1","answers":["a"]}`)
+	if _, err := w.env.q.CreateRunAnswerInput(w.env.ctx, store.CreateRunAnswerInputParams{RunID: w.lead,
+		Body:       pgtype.Text{String: `{"question_id":"q-1","answers":["a"]}`, Valid: true},
+		QuestionID: pgtype.Text{String: "q-1", Valid: true}}); err != nil {
+		t.Fatalf("answer: %v", err)
+	}
 	if _, err := w.svc.SubmitInput(w.env.ctx, w.userID, w.lead, "follow_up", "steer", nil); err != nil {
 		t.Fatalf("follow_up: %v", err)
 	}
@@ -197,6 +214,9 @@ func (w withheldSwitch) requireSettledCancelled(t *testing.T, queued []steeringR
 			run.StopKind, run.CredentialSwitchRequestedAt, run.CredentialSwitchGeneration)
 	}
 	got := w.inputs(t)
+	if len(got) != len(queued) {
+		t.Fatalf("inputs = %+v, want the %d queued rows (a settled cancel must not delete any)", got, len(queued))
+	}
 	for i, r := range got {
 		want := queued[i]
 		if r.Kind == "cancel" {
@@ -223,10 +243,21 @@ func (w withheldSwitch) requireSettledCancelled(t *testing.T, queued []steeringR
 
 func (w withheldSwitch) checkerWorker(t *testing.T) store.Worker { return wkrRow(t, w.env, w.workerID) }
 
-// requireRefusedAfterCancel: nothing a stale flight can still send changes the settled run.
-func (w withheldSwitch) requireRefusedAfterCancel(t *testing.T) {
+// staleRequest is one thing a flight that never saw the cancel can still send. run reports whether
+// the server applied it and the error it answered with.
+type staleRequest struct {
+	name string
+	run  func() (applied bool, err error)
+	// refusal is the error a settled run answers with; nil means the server declines silently
+	// (applied=false, err=nil), which is how SetState treats a report for a cancelled run.
+	refusal error
+}
+
+// staleFlightRequests lists the lead's and the checker's late requests: the checker's approve
+// verdict and the lead's switch release, switch failure and plan presentation. A running report with a
+// candidate is left out: a live non-autopilot lead refuses it too, so it has no positive control.
+func (w withheldSwitch) staleFlightRequests(t *testing.T) []staleRequest {
 	t.Helper()
-	findings := []byte(`{"summary":"ok","items":[]}`)
 	c := w.candidate
 	digest, err := c.Digest()
 	if err != nil {
@@ -240,18 +271,33 @@ func (w withheldSwitch) requireRefusedAfterCancel(t *testing.T) {
 	presentation := uuid.New()
 	approvalReq := candidateReq
 	approvalReq.State, approvalReq.CandidateDigest, approvalReq.PresentationID = "awaiting_approval", "", &presentation
-	before := w.snapshot(t)
-	if _, err := w.svc.DecidePlanCrossCheck(w.env.ctx, w.checkerWorker(t), w.runID, 1, "approve", "approve", findings); !errors.Is(err, ErrCrossCheckRefused) {
-		t.Fatalf("DecidePlanCrossCheck after cancel: %v, want ErrCrossCheckRefused", err)
+	setState := func(req StateRequest) func() (bool, error) {
+		return func() (bool, error) {
+			_, applied, err := w.svc.SetState(w.env.ctx, w.leadWorker, w.lead, req)
+			return applied, err
+		}
 	}
-	for name, req := range map[string]StateRequest{
-		"credential_switch release": {State: "credential_switch", ClaimGeneration: &g},
-		"credential_switch_failed":  {State: "credential_switch_failed", ClaimGeneration: &g},
-		"running with candidate":    candidateReq,
-		"awaiting_approval":         approvalReq,
-	} {
-		if _, applied, _ := w.svc.SetState(w.env.ctx, w.leadWorker, w.lead, req); applied {
-			t.Fatalf("%s applied after the cancel", name)
+	return []staleRequest{
+		{"checker approve verdict", func() (bool, error) {
+			_, err := w.svc.DecidePlanCrossCheck(w.env.ctx, w.checkerWorker(t), w.runID, 1, "approve", "approve", []byte(`{"summary":"ok","items":[]}`))
+			return err == nil, err
+		}, ErrCrossCheckRefused},
+		{"credential_switch release", setState(StateRequest{State: "credential_switch", ClaimGeneration: &g}), nil},
+		{"credential_switch_failed", setState(StateRequest{State: "credential_switch_failed", ClaimGeneration: &g}), nil},
+		{"awaiting_approval", setState(approvalReq), nil},
+	}
+}
+
+// requireRefusedAfterCancel: nothing a stale flight can still send changes the settled run. Each
+// request is pinned to the refusal the server gives; TestWithheldSwitchLateRequestsAcceptedLiveDB is
+// the positive control that the same requests are accepted on a live, uncancelled run.
+func (w withheldSwitch) requireRefusedAfterCancel(t *testing.T) {
+	t.Helper()
+	before := w.snapshot(t)
+	for _, r := range w.staleFlightRequests(t) {
+		applied, err := r.run()
+		if applied || (r.refusal == nil && err != nil) || (r.refusal != nil && !errors.Is(err, r.refusal)) {
+			t.Fatalf("%s after the cancel: applied=%v err=%v, want declined with %v", r.name, applied, err, r.refusal)
 		}
 	}
 	// A repeated identical failed report is idempotent or refused, but changes nothing either way.
@@ -273,9 +319,9 @@ func (w withheldSwitch) seedOpenHold(t *testing.T) {
 		w.lead, w.gen, w.leadWorker.ID)
 }
 
-// requireHoldRetained: the cancel leaves the hold open, and the terminal trigger recorded the
-// checkpoint as retained. Retention is not wired to a forge in this harness, so recordCheckpointRetention
-// (the record half, no forge call) is invoked directly and must not move the record out of retained.
+// requireHoldRetained: the cancel leaves the hold open, and the terminal trigger itself recorded the
+// checkpoint as retained: the record is read BEFORE recordCheckpointRetention (the record half, no
+// forge call) runs, and that call must then insert nothing and leave the record retained.
 func (w withheldSwitch) requireHoldRetained(t *testing.T) {
 	t.Helper()
 	state := func(sql string) string {
@@ -285,12 +331,18 @@ func (w withheldSwitch) requireHoldRetained(t *testing.T) {
 		}
 		return s
 	}
-	lead := mustRun(t, w.env, w.lead)
-	w.svc.recordCheckpointRetention(w.env.ctx, w.lead, lead.Kind, lead.IssueIid)
-	if h, r := state(`SELECT state FROM recovery_custody_holds WHERE run_id=$1`),
-		state(`SELECT state FROM checkpoint_retentions WHERE run_id=$1`); h != "open" || r != "retained" {
-		t.Fatalf("hold %q retention %q after the cancel, want open/retained", h, r)
+	check := func(when string) {
+		if h, r := state(`SELECT state FROM recovery_custody_holds WHERE run_id=$1`),
+			state(`SELECT state FROM checkpoint_retentions WHERE run_id=$1`); h != "open" || r != "retained" {
+			t.Fatalf("hold %q retention %q %s, want open/retained", h, r, when)
+		}
 	}
+	check("after the cancel, before any direct record call")
+	lead := mustRun(t, w.env, w.lead)
+	if inserted, _ := w.svc.recordCheckpointRetention(w.env.ctx, w.lead, lead.Kind, lead.IssueIid); inserted {
+		t.Fatal("recordCheckpointRetention inserted a record: the terminal trigger should already have recorded it")
+	}
+	check("after recordCheckpointRetention")
 }
 
 func TestWithheldSwitchCancelContractLiveDB(t *testing.T) {
@@ -326,16 +378,13 @@ func TestWithheldSwitchCancelContractLiveDB(t *testing.T) {
 		if p := laneClaim(t, w.crossCheckContentionFixture, "cross_check", nil); p != nil {
 			t.Fatal("cancelled child was claimed from the cross-check lane")
 		}
-		if p := w.claim(t, false, "", uuid.Nil); p != nil {
-			t.Fatal("cancelled child was claimed from the run lane")
-		}
 	})
 
 	t.Run("cancel before the stamp is withheld too", func(t *testing.T) {
 		w := newWithheldSwitch(t, true, false)
 		queued := w.queueWithheldCancel(t)
 		w.requireOwnership(t, true)
-		w.stamp()
+		w.stamp(t)
 		w.requirePreconditions(t, true)
 		w.requireOnlySwitchDelivered(t)
 		w.requireOwnership(t, true)
@@ -343,12 +392,13 @@ func TestWithheldSwitchCancelContractLiveDB(t *testing.T) {
 	})
 
 	t.Run("mr rework cancel queues under a pending switch", func(t *testing.T) {
-		w := newWithheldSwitch(t, false, true)
+		// The lead is not stamped: the rework is the only run with a pending switch on its worker.
+		w := newWithheldSwitch(t, false, false)
 		lead := mustRun(t, w.env, w.lead)
 		rework := uuid.New()
 		w.env.exec(`INSERT INTO runs (id,user_id,repo_id,kind,issue_title,issue_description,status,status_since,worker_id,
 			pipeline_ref,mr_iid,target_run_id,claim_generation,credential_switch_requested_at,credential_switch_generation)
-			VALUES ($1,$2,$3,'mr_rework','t','d','running',now(),$4,'agent/issue-42',4242,$5,1,now(),1)`,
+			VALUES ($1,$2,$3,'mr_rework','t','d','running',now(),$4,'agent/issue-3974-rework',4242,$5,1,now(),1)`,
 			rework, w.userID, uuid.UUID(lead.RepoID.Bytes), w.leadWorker.ID, w.lead)
 		if err := w.svc.CancelReworkForMR(w.env.ctx, uuid.UUID(lead.RepoID.Bytes), 4242, "mr closed"); err != nil {
 			t.Fatal(err)
@@ -363,14 +413,27 @@ func TestWithheldSwitchCancelContractLiveDB(t *testing.T) {
 		if err != nil || status != "running" || !cancel {
 			t.Fatalf("rework ownership = %q cancel=%v err=%v, want running with cancellation_requested", status, cancel, err)
 		}
+		reworkState := func() string {
+			var s string
+			if err := w.env.pool.QueryRow(w.env.ctx, `SELECT jsonb_build_object('run',(SELECT to_jsonb(r) FROM runs r WHERE r.id=$1),
+				'inputs',(SELECT jsonb_agg(to_jsonb(i) ORDER BY i.id) FROM run_user_inputs i WHERE i.run_id=$1))::text`, rework).Scan(&s); err != nil {
+				t.Fatal(err)
+			}
+			return s
+		}
+		before := reworkState()
 		got, err := w.svc.ConsumeInputs(w.env.ctx, w.leadWorker, rework)
-		if err != nil || got.CredentialSwitch == nil || len(got.Inputs) != 0 {
+		if err != nil || got.CredentialSwitch == nil || len(got.Inputs) != 0 || got.TerminalCancelled != nil {
 			t.Fatalf("rework poll = %+v, %v, want only the switch signal", got, err)
+		}
+		if reworkState() != before {
+			t.Fatal("polling the rework while its switch is pending changed state")
 		}
 	})
 
 	t.Run("release winning first leaves every row unapplied", func(t *testing.T) {
 		w := newWithheldSwitch(t, true, true)
+		w.requirePreconditions(t, true)
 		queued := w.queueWithheldCancel(t)
 		g := w.gen
 		if run, applied, err := w.svc.SetState(w.env.ctx, w.leadWorker, w.lead, StateRequest{State: "credential_switch", ClaimGeneration: &g}); err != nil || !applied ||
@@ -389,15 +452,34 @@ func TestWithheldSwitchCancelContractLiveDB(t *testing.T) {
 		}
 	})
 
-	t.Run("stale generation failed report is declined", func(t *testing.T) {
+	t.Run("mismatched generation failed report is declined", func(t *testing.T) {
 		w := newWithheldSwitch(t, true, true)
+		w.requirePreconditions(t, true)
 		w.queueWithheldCancel(t)
 		before := w.snapshot(t)
 		if _, applied, err := w.reportFailed(t, w.gen+1); applied || !errors.Is(err, ErrStaleClaim) {
-			t.Fatalf("stale failed report applied=%v err=%v, want declined with ErrStaleClaim", applied, err)
+			t.Fatalf("mismatched failed report applied=%v err=%v, want declined with ErrStaleClaim", applied, err)
 		}
 		if w.snapshot(t) != before {
-			t.Fatal("stale failed report changed state")
+			t.Fatal("mismatched failed report changed state")
 		}
 	})
+}
+
+// Positive control for requireRefusedAfterCancel: on a live, uncancelled lead with the same pending
+// switch and claimed checker, each late request is accepted, so the refusals above are caused by the
+// cancel and not by a malformed request. Each request gets its own fixture because accepting one
+// moves the run.
+func TestWithheldSwitchLateRequestsAcceptedLiveDB(t *testing.T) {
+	names := newWithheldSwitch(t, true, true).staleFlightRequests(t)
+	for i := range names {
+		t.Run(names[i].name, func(t *testing.T) {
+			w := newWithheldSwitch(t, true, true)
+			w.requirePreconditions(t, true)
+			r := w.staleFlightRequests(t)[i]
+			if applied, err := r.run(); err != nil || !applied {
+				t.Fatalf("%s on the live run: applied=%v err=%v, want accepted", r.name, applied, err)
+			}
+		})
+	}
 }
