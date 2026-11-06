@@ -97,7 +97,7 @@ func codexRuntimeDefaultResolved(cd *apitypes.CatalogDefaultDTO) string {
 	}
 	out := label + " (" + catalog + ": " + effort + ", " + crossCheckPlain(*cd.Model) + ", Codex " + crossCheckPlain(*cd.RuntimeVersion) + ")"
 	if cd.State == "varies" {
-		out += " · may differ on workers on another version"
+		out += " · may differ on workers still on another version"
 	}
 	return out
 }

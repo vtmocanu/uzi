@@ -195,7 +195,7 @@ func TestEffortSettingRowsCodexCatalogDefault(t *testing.T) {
 	}{
 		{"known", known("known", "low"), "runtime default (catalog default: low, gpt-6.1-sol, Codex 0.164.0)"},
 		{"none", known("known", "none"), "runtime default (catalog default: none, no reasoning level requested, gpt-6.1-sol, Codex 0.164.0)"},
-		{"varies", known("varies", "medium"), "runtime default (catalog default: medium, gpt-6.1-sol, Codex 0.164.0) · may differ on workers on another version"},
+		{"varies", known("varies", "medium"), "runtime default (catalog default: medium, gpt-6.1-sol, Codex 0.164.0) · may differ on workers still on another version"},
 		{"unknown", &apitypes.CatalogDefaultDTO{State: "unknown"}, "runtime default (catalog default unknown)"},
 		{"absent", nil, "runtime default (catalog default unknown)"},
 		{"known without values", &apitypes.CatalogDefaultDTO{State: "known"}, "runtime default (catalog default unknown)"},
@@ -237,7 +237,7 @@ func TestDemoCatalogDefaultSamplesPerState(t *testing.T) {
 	now := time.Now()
 	for state, want := range map[string]string{
 		"known":   "runtime default (catalog default: low, gpt-6.1-sol, Codex 0.164.0)",
-		"varies":  "runtime default (catalog default: low, gpt-6.1-sol, Codex 0.164.0) · may differ on workers on another version",
+		"varies":  "runtime default (catalog default: low, gpt-6.1-sol, Codex 0.164.0) · may differ on workers still on another version",
 		"unknown": "runtime default (catalog default unknown)",
 	} {
 		if got := codexRuntimeDefaultResolved(demoCatalogDefault(state, now)); got != want {

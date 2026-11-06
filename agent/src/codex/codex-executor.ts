@@ -5478,9 +5478,11 @@ export class CodexExecutor implements Executor {
         emitClaimInit: epochIndex === 0,
         // Issue #1583: projected tool frames are scrubbed of runtime-released Codex tokens.
         scrubProjected,
-        // PRD #3247 M2: advisory catalog probe, only on the claim's first root epoch and only for an
-        // explicit level (Runtime default carries none). The note is emitted from onEntry, which the
-        // harness calls before the first turn/start; the level itself is always sent unchanged.
+        // Advisory catalog probe, only on the claim's first root epoch. PRD #3247 M2: an explicit
+        // level gets the awaiting probe; its note is emitted from onEntry, which the harness calls
+        // before the first turn/start, and the level itself is always sent unchanged. Issue #3251:
+        // a Runtime default claim (no level) with a catalog reporter gets the report-only probe,
+        // which does not delay turn/start.
         ...(epochIndex === 0 && level !== undefined ? { catalogProbe: this.catalogProbeFor(ctx, level) }
           : epochIndex === 0 && ctx.codexCatalogReport !== undefined ? { catalogProbe: this.catalogReportProbeFor(ctx) } : {}),
       });

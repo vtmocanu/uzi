@@ -661,9 +661,10 @@ export class CodexHarness implements RunHarness {
       } catch {
         return;
       }
-      // Residual (same exposure as the blocking path's timeout): an app-server EOF while this
-      // request is pending surfaces from the transport as `protocol: stream closed mid-request`
-      // (transport.ts), failing the turn the same way it would have with the awaited probe.
+      // Residual, accepted: transport.onEof (transport.ts) classifies an EOF as
+      // `protocol: stream closed mid-request` only while a request is pending. Runtime default
+      // claims sent no model/list before #3251, so this opens a small new exposure window (until
+      // the reply or the probe timeout, 2s by default) in which an EOF fails the turn that way.
       call.catch(() => undefined);
       void this.finishCatalogProbe(probe, call, model, abort, signal);
       return;

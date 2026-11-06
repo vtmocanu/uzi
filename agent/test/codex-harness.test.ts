@@ -6532,16 +6532,20 @@ describe("#3247 catalog probe", () => {
       assert.deepEqual(entries, [undefined]);
     });
 
-    it("sends nothing for a turn that is already aborted", async () => {
-      const transport = new FakeTransport();
+    it("sends no model/list when the abort lands during thread setup, after the turn's early checks", async () => {
+      const ac = new AbortController();
+      const transport = new FakeTransport((method) => {
+        if (method === "thread/start") ac.abort();
+        return defaultResponder(method);
+      });
       const { harness } = makeHarness({
         transport,
         catalogProbe: { timeoutMs: 1000, blocking: false, onEntry: () => { throw new Error("no entry after a stop"); } },
       });
-      const ac = new AbortController();
-      ac.abort();
       try { await collect(harness.startTurn(makeRequest({ signal: ac.signal })).events); } finally { await harness.close(); }
+      assert.ok(transport.requests.some((r) => r.method === "thread/start"), "the abort landed after thread/start was sent");
       assert.ok(!transport.requests.some((r) => r.method === "model/list"));
+      assert.ok(!transport.requests.some((r) => r.method === "turn/start"));
     });
 
     it("a stop while the reply is pending suppresses onEntry", async () => {
