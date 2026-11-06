@@ -38,8 +38,8 @@ const (
 
 const (
 	codexCatalogCtxDomain = "uzi-codex-catalog-ctx-v1"
-	// codexCatalogMaxRows and codexCatalogMaxAge are the retention bound; the SQL carries the same
-	// numbers (queries/codex_catalog_defaults.sql), pinned by the LiveDB retention tests.
+	// codexCatalogMaxAge mirrors the 30-day half of the retention bound; the SQL carries both halves
+	// (32 rows, 30 days: queries/codex_catalog_defaults.sql), pinned by the LiveDB retention tests.
 	codexCatalogMaxAge        = 30 * 24 * time.Hour
 	maxCodexCatalogModelBytes = 100
 	maxCodexCatalogVersion    = 32

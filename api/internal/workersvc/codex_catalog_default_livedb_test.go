@@ -682,6 +682,9 @@ func runCatalogRetentionBarriers(t *testing.T, e catalogEnv, n int, mode retenti
 			<-releaseA
 		},
 		beforeCommit: func() {
+			// Leave the in-flight count here, still under the catalog lock: decrementing after the
+			// call returns would run after COMMIT, when the next writer may already hold the lock.
+			inFlight.Add(-1)
 			if mode == retentionLockFree {
 				arrivedB <- struct{}{}
 				<-releaseB
@@ -695,9 +698,7 @@ func runCatalogRetentionBarriers(t *testing.T, e catalogEnv, n int, mode retenti
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			err := svc.recordCodexCatalogRowTx(e.ctx, catalogRowFor(e.userID, catalogModel(i)))
-			inFlight.Add(-1)
-			errs <- err
+			errs <- svc.recordCodexCatalogRowTx(e.ctx, catalogRowFor(e.userID, catalogModel(i)))
 		}()
 	}
 	go func() { wg.Wait(); close(done) }()
