@@ -179,7 +179,7 @@ func (s *Service) finalClosureRead(ctx context.Context, wkr store.Worker, runID 
 		}
 		return v, nil, err
 	}
-	if !finalInventoryEligible(v.hold, wkr.ID, finalRunFacts{run.Status, run.ClaimGeneration, run.ClaimReleasedAt, run.RecoveryWaitCause}, generation, false) {
+	if !finalInventoryEligible(v.hold, wkr.ID, finalRunFacts{run.Status, run.ClaimGeneration, run.ClaimReleasedAt, run.RecoveryWaitCause, run.HoldReason, run.RepoAgentSourceCommit}, generation, false) {
 		return v, nil, ErrNotAuthorized
 	}
 	err = finalStmt(ctx, func(c context.Context) (err error) {

@@ -954,6 +954,9 @@ WHERE h.id = @id AND h.run_id = @run_id AND h.user_id = @user_id
         -- A publication-phase park holds unpublished source and never settles custody.
         OR (r.status = 'recovery_wait' AND r.recovery_wait_cause = 'forge_unreachable'
           AND r.recovery_wait_phase IS NULL
+          AND @final_disposition::text = 'settled' AND @release_evidence::text = 'forge_no_output')
+        OR (r.status = 'paused' AND r.hold_reason = 'repo_agent_source_unavailable'
+          AND r.repo_agent_source_commit IS NULL
           AND @final_disposition::text = 'settled' AND @release_evidence::text = 'forge_no_output')))))
   AND (
     (@final_disposition::text = 'archive' AND @release_evidence::text = 'archive'
