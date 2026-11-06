@@ -170,7 +170,7 @@ These extend the core table above; `UZI_SECRET_KEY` (which also encrypts forge b
 
 ### Default column labels are created on the forge
 
-The first time a repo's board is opened, uzi ensures four labels exist on that GitLab project: `Planned`, `In Progress`, `Human Review`, `Later` (`forgesvc.DefaultColumns`), creating any that are missing via the forge's label-create API. They are seeded in that order, which is the order the board renders them in, after the implicit `Backlog` lane. This is a deliberate, visible side effect: those labels then show up in GitLab's own label list and board for that project, not just inside uzi. Board columns are reconfigurable afterward to any of the project's labels; the default set is only what's seeded on first open.
+When a repo is turned on (for a repo turned on before this behaviour, the first time its board is opened), uzi ensures four labels exist on that GitLab project: `Planned`, `In Progress`, `Human Review`, `Later` (`forgesvc.DefaultColumns`), creating any that are missing via the forge's label-create API. They are seeded in that order, which is the order the board renders them in, after the implicit `Backlog` lane. This is a deliberate, visible side effect: those labels then show up in GitLab's own label list and board for that project, not just inside uzi. Board columns are reconfigurable afterward to any of the project's labels; the default set is only what's created when the repo is turned on. A repo that already has columns is left as it is.
 
 ### Renaming a board column on an existing board
 

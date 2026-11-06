@@ -8,6 +8,7 @@ package seed
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -15,6 +16,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -52,6 +54,7 @@ type Store interface {
 	UpsertForgeConnection(ctx context.Context, arg store.UpsertForgeConnectionParams) (store.ForgeConnection, error)
 	UpsertRepo(ctx context.Context, arg store.UpsertRepoParams) (store.Repo, error)
 	SetRepoEnabledForUser(ctx context.Context, arg store.SetRepoEnabledForUserParams) (store.Repo, error)
+	forgesvc.BoardColumnStore
 }
 
 // ForgeService is the subset of *forgesvc.Service the seed needs: it builds a
@@ -177,6 +180,19 @@ func ForgeConnection(ctx context.Context, q Store, svc ForgeService, cfg config.
 			UserID:  user.ID,
 		}); err != nil {
 			return fmt.Errorf("seed forge: enable repo %q: %w", path, err)
+		}
+		// A repo turned on without board columns strands its cards (no column
+		// resolves, so an automated move reads as a person's). Give it the default
+		// columns now. A forge refusal of the labels stays non-fatal, like every
+		// other seed forge call; the first board open heals it on the next try. A
+		// database error is boot-fatal, like every other seed database error.
+		if err := forgesvc.EnsureBoardColumns(ctx, q, f, repo.ID, repo.ForgeProjectID); err != nil {
+			var seedErr *forgesvc.LabelSeedError
+			if !errors.As(err, &seedErr) {
+				return fmt.Errorf("seed forge: board columns for repo %q: %w", path, err)
+			}
+			slog.Error("seed forge: the forge refused the default board column labels; continuing",
+				"repo", path, "error", err)
 		}
 		enabled++
 	}
