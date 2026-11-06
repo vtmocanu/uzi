@@ -1,11 +1,13 @@
 # Results: issue #3543 base-discovery measurement
 
-Measured on 2026-11-06 with `run.sh` at this branch's harness.
+Measured on 2026-11-06, 12:08–12:29 UTC, with `run.sh` and the harness at commit `58d4d79f`. Each configuration ran once; there are no repeats.
 
 **Environment:**
 - **Fixtures:** `REPO_SHA=5ef702b2`.
 - **Commands:**
-  1. 1536m: two invocations, splitting `FIXTURES` in half, with `MEM_CONFIGS="1536m:1:full,control,cancel"`.
+  1. 1536m: two invocations with `MEM_CONFIGS="1536m:1:full,control,cancel"`:
+     - `FIXTURES="repo synthetic-10000 synthetic-50000 chain-d64 chain-d65 fanout2-d8 fanout2-d12"`;
+     - `FIXTURES="fanout2-d16 fanout2-d20 fanout2-d24 fanout2-d64 wide-1024x1024 wide-4096x4096 wide-16384x16384"`.
   2. 4g: one invocation, with `MEM_CONFIGS="4g:2:full"`.
 - **Records:** 56 measurement records in one `OUT`:
   - 14 fixtures × `full` / `control` / `cancel` at 1536m;
@@ -14,14 +16,14 @@ Measured on 2026-11-06 with `run.sh` at this branch's harness.
 
 | item | value |
 |---|---|
-| image | `uzi-agent-home-split:base` (`sha256:d7518ec4b5fc…`, built 2026-11-03 from `agent/templates/base/Dockerfile`): node v26.12.1, git 2.54.0, tini as PID 1 |
-| limits | 1536 MiB / 1 CPU (compose per-slot budget) and 4 GiB / 2 CPU (compose whole-worker default), memory-swap = memory, network none |
-| production bounds | unchanged: 2 MiB per commit/tree object, depth 64, helper deadline 28 s inside the 30 s outer timeout, 5 s per git command, 20 ms yields, 2000 ms kill grace, default `PLANNING_LIMITS` |
-| host | one shared worker host: kernel 6.12, cgroup v2, Docker-in-Docker daemon (8 CPUs and 64 GiB visible), other runs active. Absolute times are host-specific |
+| image | `uzi-agent-home-split:base`, `sha256:d7518ec4b5fc5c6de0fbc6ea19a8885b0d7b2e2a75d98020b414c5f7b5f98092`, built locally 2026-11-03 (image revision label `2528ee77`): node v26.12.1, git 2.54.0. `run.sh` sets `/sbin/tini` as the entrypoint (PID 1) |
+| limits | 1536 MiB / 1 CPU (compose per-slot budget) and 4 GiB / 2 CPU (compose whole-worker default), memory-swap = memory, network none. Compose itself enforces only the shared whole-worker limit: 1536 MiB is a per-run budget, not a per-run cgroup, and one OOM there kills every run in the container |
+| production bounds | unchanged: 2 MiB per commit/tree object, depth 64, helper deadline 28 s inside the 30 s outer timeout, 5 s per git command, 20 ms yields, 2000 ms kill grace, default `PLANNING_LIMITS`. Those allowances are added on top of the base's own discovered totals (`agent/src/git.ts`, the `ENTRY_LIMIT = E + 1 + entryAllowance` family), so none of them bounds discovery itself |
+| host | one shared worker host: kernel 6.12, cgroup v2, a Docker-in-Docker daemon reporting 8 CPUs and 67,420,241,920 bytes (62.8 GiB), possibly with other runs active. Absolute times are host-specific |
 
 ## Observations (measurement only; no recommendation)
 
-1. **Representative bases complete well inside the bounds.**
+1. **Representative bases complete inside the bounds.**
    - This repository at `5ef702b2` (333 trees, 8953 leaves):
      - discovery 3.3 s at 1 CPU and 2.4 s at 2 CPU;
      - whole capture 8.5 s and 5.9 s;
@@ -30,8 +32,9 @@ Measured on 2026-11-06 with `run.sh` at this branch's harness.
      - discovery 6.2 s and 4.8 s;
      - capture 18.4 s and 13.0 s;
      - peak 175 MiB and 220 MiB.
-2. **Discovery throughput is git-spawn-bound.**
-   - Each tree occurrence costs two git processes. That is about 7–9 ms per occurrence at 1 CPU (fanout2-d8: 511 occurrences in 4.3 s; fanout2-d16: 3,104 in 28.1 s) and about 7 ms at 2 CPU.
+     - The 1 CPU capture used 18.4 s of the 28 s helper deadline (66%).
+2. **Each tree occurrence costs two git spawns.**
+   - Counted: two git processes per tree occurrence (for example 7,989 spawns for 3,992 occurrences). On the binary DAGs this came to 7.1–9.1 ms per occurrence at 1 CPU and 7.1–8.0 ms at 2 CPU. The cost was not profiled, so attributing it to the spawns themselves is an inference. Per occurrence, repo took about 10 ms and synthetic-50000 about 12 ms.
    - About 3,100–4,000 tree occurrences fit before the 28 s helper deadline, wherever the DAG shape allows.
 3. **Exponential shared DAGs (binary, depth 12 to 64) never finish discovery.**
    - Every run stops at about 28.1 s with the helper deadline (`git_deadline`), after 3,100–4,000 of 8,191 to about 3.7×10^19 expected occurrences.
@@ -40,21 +43,32 @@ Measured on 2026-11-06 with `run.sh` at this branch's harness.
 4. **Wide shared trees (extra, beyond the spec) show the memory dimension.**
    - One leaf tree with W entries, referenced F times, adds W path entries per occurrence. Memory then grows with the work done before the deadline:
 
-   | fixture | leaf entries before stop (1 CPU / 2 CPU) | container peak (1 CPU / 2 CPU) | outcome |
-   |---|---|---|---|
-   | wide-16384x16384 | 2.3M / 2.9M | 648 MiB / 782 MiB | `capture_deadline` |
-   | wide-4096x4096 | 2.0M / 2.4M | 482 MiB / 742 MiB | `git_deadline` |
-   | wide-1024x1024 | all 1.05M | 362 MiB / 452 MiB | `git_deadline` after discovery |
+   | fixture | tree entries before stop, `full` (1 CPU / 2 CPU) | container peak, `full` (1 CPU / 2 CPU) | uninstrumented `control` at 1 CPU | outcome, `full` |
+   |---|---|---|---|---|
+   | wide-16384x16384 | 2.3M / 2.9M | 648 MiB / 782 MiB | 663 MiB, `capture_deadline`, 28.2 s | `capture_deadline` |
+   | wide-4096x4096 | 2.0M / 2.4M | 482 MiB / 742 MiB | **610 MiB, `capture_deadline`, 29.5 s** | `git_deadline` |
+   | wide-1024x1024 | all 1.05M | 362 MiB / 452 MiB | 367 MiB, `git_deadline`, 28.1 s | `git_deadline` after discovery |
 
-   - wide-1024x1024 *completed* discovery, at 20.8 s and 22.5 s, then refused on the post-discovery capture.
-   - None ran out of memory at either limit.
-   - The peak is set by the deadline times this host's throughput. It is not a structural bound: the faster configuration reached more entries and a higher peak.
-5. **Cancellation and cleanup stayed inside the grace.** All 14 cancel runs settled 13–128 ms after the abort, with no surviving process group and no leftover `uzi-planning-*` temp tree. The aborts landed mid-discovery after ≥50 tree occurrences, against the 2000 ms grace.
+   - "Tree entries" is the helper's total tree-entry count, which includes the root's entries.
+   - The uninstrumented `control` run, which is the production code path, reached at least the `full` peak on every wide fixture. On wide-4096x4096 it was 27% higher (610 vs 482 MiB) and stopped on a different deadline. The `full` columns therefore understate the production-path peak.
+   - wide-1024x1024 *completed* discovery, at 20.8 s and 22.5 s. Its later refusal comes from the post-discovery capture, which in these `--no-checkout` fixtures is shaped by every base path becoming a deletion (a harness artifact).
+   - None of the 56 runs ran out of memory at either limit. Note that 1536 MiB is a budget, not an enforced per-run limit, under compose (see the limits row).
+   - Memory grew with the work done before the deadline stopped it. Discovery has no aggregate ceiling, so the peak is not bounded structurally (the helper comment reads "no aggregate base ceiling or cache; the shared deadline bounds discovery"). The 4 GiB / 2 CPU configuration changed memory and CPU together, so its higher peaks cannot be attributed to CPU alone. On wide-1024x1024 it did the same work more slowly and still peaked higher.
+   - **The deadline is soft.** The helper deadline is checked only at `check()` points and per git command. Measured from spawn, so including helper startup, captures took up to 29.5 s (wide-4096x4096 `control`) and 28.9 s (wide-16384x16384 `full`) against the 28 s helper deadline, with memory still growing. That is 0.5 s short of the 30 s outer timeout.
+5. **Cancellation and cleanup stayed inside the grace.** All 14 cancel runs settled 13–128 ms after the abort, with no surviving process group and no leftover `uzi-planning-*` temp tree, against the 2000 ms grace.
+   - What was exercised: only the mid-discovery trigger (the abort landed after ≥50 tree occurrences). The post-discovery trigger did not fire in this matrix.
+   - In every run the helper exited 143 on SIGTERM, and TickSpawner sent its group SIGKILL 12–125 ms later. The grace itself was never consumed.
+   - The cancel rows read `cancelled unclassified` because the abort message ("permit-held git output collection aborted: boundary deadline exceeded") carries no refusal token. That is expected, not a classifier failure.
 6. **The depth bound behaves as specified.** `chain-d64` completes, and `chain-d65` is refused with `directory_cap`.
-7. **Instrumentation overhead is within run-to-run noise.** `control` and `full` are close, for example:
+7. **Instrumentation overhead: `control` and `full` are close on most rows, but not all.** Run-to-run noise was not measured (one run each). Close rows include:
    - repo: 8.9 s vs 8.5 s;
    - fanout2-d8: 9.1 s vs 8.4 s;
    - wide-16384x16384 container peak: 663 MiB vs 648 MiB.
+
+   They are not close on:
+   - wide-4096x4096 (see 4): `control` reached 610 MiB and `capture_deadline`, against 482 MiB and `git_deadline` for `full`;
+   - synthetic-10000: `full` took 3.9 s against 3.5 s for `control` (+11.5%);
+   - synthetic-50000: 18.4 s against 17.2 s.
 
    The preamble's effect on the helper's own maxRSS is not separately quantified.
 8. **Six rows read `refused unclassified`.** They are fanout2-d12 / d16 / wide-1024x1024 at 4g and fanout2-d20 / d24 / d64 `control`. All are `git_deadline` refusals whose token was hidden by the classifier:
@@ -64,11 +78,23 @@ Measured on 2026-11-06 with `run.sh` at this branch's harness.
 
 **Caveats:**
 - The adversarial clones are `--no-checkout`. Production would first have to check out the base.
-- tree RSS double-counts shared pages. The container peak includes the harness parent (about 60 MiB) and page cache.
+- Tree RSS double-counts shared pages and is sampled every 10 ms, so it can miss short peaks. The container peak includes the harness parent (about 60 MiB) and page cache.
 - There is no UID split or sandbox.
 - Everything was measured on one host. See README.md.
 
 ## Table (verbatim `results/results.md`)
+
+Legend:
+- Outcomes:
+  - `completed`;
+  - `refused <token>`, a deadline or bound refusal whose token names the bound;
+  - `cancelled`;
+  - `oom`;
+  - kill classes, as defined in README.md.
+- `control` rows are uninstrumented, so their occurrence, byte and helper-RSS cells are `n/a`.
+- `≥` marks a lower bound.
+- Discovery is "done" only when the helper opened the clone index.
+- Rows sort by fixture name as strings.
 
 | fixture | mode | mem/cpus | outcome | discovery done | discovery ms | capture ms | tree occ (obs / expected) | tree entries | discovery object bytes | readSync bytes | helper maxRSS MiB (disc / final) | tree RSS peak MiB (disc / all) | cgroup peak MiB (disc / end) | cancel: settle ms, cleanup |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
