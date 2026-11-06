@@ -131,6 +131,44 @@ of entering the question wait. Ambiguous transport or lost ownership uses
 the existing retained-recovery/stale-claim fences rather than assuming
 authority to ask or resume.
 
+## Amendment 2026-11-06 — #3995: owner pause during retained recovery
+
+An owner `now` pause delivered while a retained re-claim runs
+`recoverRetainedClaim` (before any model) used to abort the shared lifecycle and
+stop recovery, leaving the run to an automatic requeue charged against the
+requeue budget. It now behaves like a pause pending at claim time.
+
+- **Window.** `recoverRetainedClaim` opens `SteeringChannel.deferOwnerPauseNow`
+  for the recovery body and releases it in a `finally`. Inside it a routed
+  owner `now` is only recorded (no cancel or lifecycle abort, no interrupt). A
+  pending `wall` is never overwritten and keeps its immediate drop; `pause_cancel`
+  clears the record. A publication-only retained claim
+  (`publication_resume`) opens no window and keeps the immediate stop.
+- **Settlement.** At the start of `phasePreflightHandoff`, after recovery
+  returns and before the executor, the runner throws the ordinary
+  `PauseNowSignal` only when a deferred pause is pending and no stronger control
+  is: cancel, credential switch, wall, fence, worker shutdown, or a
+  lifecycle or checkpoint-authority abort. No planning turn, summary or provider
+  call precedes it.
+- **I4 and I6 preserved.** The run is paused only through `handlePausePark`:
+  checkpoint first, then a confirmed `paused` reply. A refused park
+  (`pause_failed`) or uncertain reply leaves the run unpaused and on the
+  existing requeue path; an unconfirmed reply is never reported as paused. A
+  `recovery_wait` hold leaves the pause request pending server-side (I4).
+- **Precedence.** Recovery failure, budget exhaustion and adoption-failed holds
+  win over the waiting pause; wall, disk, cancel, fence, switch and shutdown
+  during recovery keep their immediate outcomes. Milestone pauses and pauses
+  pending at claim time are unchanged.
+- **Boundaries.** A `now` arriving during retained discovery (before recovery
+  starts) or after recovery returns keeps its previous handling. The pause waits
+  for recovery, which is bounded by the recovery episode clock, not by anything
+  new. No API, wire, status or budget change.
+- **Diagnostics.** The HOME-preservation log for a retained recovery stop now
+  reads "retained recovery stopped" (naming a pending owner pause).
+- **Outstanding acceptance.** A combined regression with #3994's post-adoption
+  ownership-read retry (PR #4004) has not run. It is assigned to whichever of the
+  two lands second; #3995 stays open until it is green.
+
 ## Consequences
 
 - A future ninth or tenth status added to this codebase gets its own audit against these six lists (I2) and three guards (I3) the same way `paused` got audited against `pool_wait`'s own PRD (#754) — this ADR is where that checklist should be extended, not re-derived.
