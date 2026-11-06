@@ -368,11 +368,15 @@ than guessing:
 - `Default · Claude (your default)` or `Default · Codex (your default)` when
   your default harness is usable.
 - `Default · Claude (your default; may overflow to Codex when it fires)` (or
-  the mirror) when harness overflow may apply: the overflow setting is on,
-  both harnesses are usable, the schedule is an issue or sweep schedule, and
-  it carries no harness, model or token pin. The Model default is then
-  neutral (`Default · your worker model`).
-- `Default · automatic (chosen when it fires)` when you have no default.
+  the mirror) when the modal shows that overflow may apply: the overflow
+  setting is on, your default harness and both credentials are usable, the
+  schedule is an issue or sweep schedule, and it carries no harness, model or
+  token pin. The Model default is then neutral (`Default · your worker
+  model`). The server can still decline to overflow, for example when Plan or
+  Code cross-check is on or the issue carries a `harness::` label; see
+  [Overflow to the other harness](./worker-model.md#overflow-to-the-other-harness).
+- `Default · automatic (chosen when it fires)` when you have no usable
+  default.
 
 The Anthropic token's default option reads `Default · worker's token (worker
 binding)`, and the auto-rework inherit option reads `Default · on (your

@@ -36,8 +36,9 @@ cross-check; other runs keep the usual resolution: an explicit harness, else
 Claude). It picks the harness whose weekly allowance
 resets soonest, falling back to Claude when usage is unknown; see [How the
 automatic default picks a harness](./rate-limits.md#how-the-automatic-default-picks-a-harness).
-Schedules and the start-run form still say **Use my default** for
-the harness.
+The start-run form still says **Use my default** for the harness; the
+schedule modal names the source instead (see [Which harness a schedule runs
+on](./scheduling.md#which-harness-a-schedule-runs-on)).
 
 Switching the default harness never clears either model. Each lane is its
 own retained preference, so alternating between Claude and Codex keeps both
