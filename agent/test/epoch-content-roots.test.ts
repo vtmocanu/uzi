@@ -377,10 +377,22 @@ it("refuses unpublished local refs and objects hidden by a common-directory redi
   assert.equal(fs.existsSync(path.join(gitdir, objectPath)), true);
   const before = fs.readFileSync(path.join(bare, "config"));
   assert.equal(await covered(), false, "automatic coverage must refuse hidden local metadata");
-  assert.equal((await git.discardStoppedSource({ ...options, epochProof: git.createEpochDiscardProof(input) })).kind, "refused");
+  // A common-directory redirect shares another store: an indirection, so UNKNOWN, never a settled keep.
+  assert.equal((await git.discardStoppedSource({ ...options, epochProof: git.createEpochDiscardProof(input) })).kind, "unknown");
   assert.deepEqual(fs.readFileSync(path.join(bare, "config")), before);
   assert.equal(fs.existsSync(path.join(gitdir, objectPath)), true);
 });
+
+for (const shape of ["gitfile", "symlink"] as const) {
+  it(`a redirected .git (${shape}) is UNKNOWN, never a settled keep`, async () => {
+    const real = path.join(clonePath, ".git"), moved = path.join(clonePath, ".git-real");
+    fs.renameSync(real, moved);
+    if (shape === "gitfile") fs.writeFileSync(real, `gitdir: ${moved}\n`);
+    else fs.symlinkSync(moved, real);
+    assert.equal((await git.discardStoppedSource({ ...options, epochProof: git.createEpochDiscardProof(input) })).kind, "unknown");
+    assert.equal(fs.existsSync(moved), true);
+  });
+}
 
 function packObjects(cwd: string, ids: string[]): string {
   const dir = path.join(cwd, cwd === bare ? "objects" : ".git/objects", "pack");
