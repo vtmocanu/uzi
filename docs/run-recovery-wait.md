@@ -329,6 +329,19 @@ fresh claim opens another counted custody hold and repeated failures can leave
 retained successor paths. Keep the original worker storage: a peer after worker
 loss or affinity expiry may use a published checkpoint behind the retained work.
 
+A temporary API connection problem during the worker's read-only ownership
+check, after the successor was verified and journaled, is retried in place
+before any hold: at most 5 attempts (about 15 s at the default recovery retry
+interval), inside the iteration's existing deadline, on the same claim and
+successor with no recapture and no extra recovery-attempt charge. Only a request
+that failed before any response with `ECONNREFUSED`, `ECONNRESET` or
+`UND_ERR_SOCKET`, or a 502, 503 or 504 answer, qualifies. Unknown errors,
+malformed or truncated responses and other statuses are not retried, so a
+genuine failure still holds here, and a deadline still ends as
+`budget_exhausted`. The retry state is in-process only. The hold itself still
+has no automatic retry. See the
+[ADR-1197 #3994 amendment](../adr/1197-transient-recovery-park.md#amendment-2026-11-06-3994-transient-api-connection-failures-retry-the-ownership-check-in-place).
+
 A positively identified temporary local resource error during the read-only
 renewal check stops the claim without consuming its owner grant or creating a
 new owner hold. The existing bounded claim-recovery policy may retry it.

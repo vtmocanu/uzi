@@ -1809,3 +1809,38 @@ Mixed-version limits, all fail closed:
 - C1b binary against the C2 schema: it never writes the new `prerequisite_closure` evidence or `final_closure_id`.
 
 Accepted residuals: a thin FINAL stays stuck and is retried while the pin or the feature is unavailable; available-pin audits run at about 24 hours, so an external deletion can go unnoticed for up to a day before release-time listing records the absence and refuses; an external writer deleting or rewriting the pin after release defeats restore (the external-writer residual above is unchanged). A closure-released hold remains not history-safe for forge placement (`fn_forge_source_history_safe` is unchanged).
+
+## Amendment 2026-11-06, #3994: transient API connection failures retry the ownership check in place
+
+Decision record (AI-synced 2026-11-06). This qualifies the #3527 owner hold
+([amendment](#amendment-2026-10-27-3527-owner-held-retained-adoption-retry)) for
+one cause: an API restart during a rollout made a verified, journaled retained
+successor owner-hold as `adoption_failed` although no integrity check failed.
+
+**Decision.** After `prepareRecoverySuccessor` has verified and journaled the
+successor, the worker's read-only ownership check (and the second check in the
+Codex/safety branch after executor disposal) retries in place when, and only
+when, the failure is positively classified as a temporary API connection
+problem. It runs on the same claim and successor: no recapture, no second
+successor and no extra recovery-attempt charge.
+
+**Classifier.** Qualifying: a request that failed before any response whose
+cause code is `ECONNREFUSED`, `ECONNRESET` or `UND_ERR_SOCKET`, or an ownership
+route answer of 502, 503 or 504. The transport case requires a marker recorded
+on the rejection of the fetch promise itself, so a failure while reading a
+response body (a truncated 200 surfaces with the same `UND_ERR_SOCKET` shape)
+never qualifies. The marker is by object identity, and abort reasons are not
+marked. Unknown errors, malformed responses, other statuses, deadline expiry,
+ownership or claim loss, and cancel, pause, stop or credential switch keep their
+existing outcomes.
+
+**Cap and deadline.** At most 5 attempts, with delays of 1, 2, 4 and 8 times the
+recovery retry interval (about 15 s by default), always inside the iteration's
+existing deadline. A deadline still ends as `budget_exhausted`; exhausted
+attempts on a still-transient failure fall through to the existing outcome, an
+owner hold at `recovery_wait` / `retained_recovery_adoption_failed`.
+
+**Unchanged.** No new status, no API change and no persistence: retry state is
+in-process only, so a worker restart starts the check afresh. The #3527 hold
+keeps no automatic retry, and a genuine adoption failure still holds. This makes
+no durability claim beyond the bounded in-process window.
