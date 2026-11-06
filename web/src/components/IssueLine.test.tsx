@@ -67,24 +67,34 @@ describe("IssueLine", () => {
       aRun({ id: "g", status: "awaiting_approval", issue_iid: 31 }),
     ]);
     const queued = station(/^Queued/);
-    expect(queued.textContent).toContain("1");
+    expect(queued.getAttribute("data-count")).toBe("1");
     expect(queued.textContent).toContain("Claiming a slot");
     expect(within(queued).getByText("#11")).toBeTruthy();
     const building = station(/^Building/);
-    expect(building.textContent).toContain("2");
+    expect(building.getAttribute("data-count")).toBe("2");
     expect(building.textContent).toContain("Implement, review, validate");
     expect(within(building).getAllByText(/^#2\d$/)).toHaveLength(2);
     const gate = station(/^Plan review/);
+    expect(gate.getAttribute("data-count")).toBe("1");
     expect(gate.textContent).toContain("Waiting on you");
     expect(within(gate).getByText("#31")).toBeTruthy();
     expect(station(/^Planning/).textContent).toContain("Nothing planning");
   });
 
-  it("falls back to the kind label for a run with no issue reference", () => {
+  it("counts a job with no issue reference under Other work, badged with its kind label", () => {
     mount([aRun({ id: "j", kind: "job", status: "running", issue_iid: null })]);
     const other = screen.getByRole("button", { name: /Other work/ });
-    expect(other.textContent).toContain("1");
+    expect(other.getAttribute("data-count")).toBe("1");
+    expect(station(/^Building/).getAttribute("data-count")).toBe("0");
     expect(station(/^Building/).textContent).toContain("Nothing building");
+  });
+
+  it("strips a bidi override from the owner shown in another user's badge tooltip", () => {
+    const other = theirs(aRun({ id: "x", status: "queued", issue_iid: 2 }), "\u202Eevil@x.example");
+    mount([], [other], { factory: true });
+    const title = within(station(/^Queued/)).getByText("#2").getAttribute("title");
+    expect(title).toBe("evil@x.example");
+    expect(title).not.toContain("\u202E");
   });
 
   it("names the owner in the tooltip of another user's badge only, masked in demo mode", () => {
@@ -123,6 +133,7 @@ describe("IssueLine", () => {
     expect(node(/^Plan review/).className).toContain("border-warn");
     const gateCount = within(station(/^Plan review/)).getByText("1");
     expect(gateCount.className).toContain("text-warn");
+    expect(gateCount.className).not.toContain("text-fg");
     expect(node(/^Queued/).className).toContain("border-faint");
     expect(node(/^Planning/).className).toContain("border-plan");
     expect(node(/^Building/).className).toContain("border-info");
@@ -132,6 +143,24 @@ describe("IssueLine", () => {
     expect(within(station(/^Building/)).getByText("#7").className).toContain("text-info");
     expect(within(station(/^Plan review/)).getByText("#7").className).toContain("text-warn");
     expect(within(station(/^PR open/)).getByText("#7").className).toContain("text-ok");
+  });
+
+  it("draws the gate count in plain text at zero and in the warn tone above zero", () => {
+    mount([aRun({ id: "b" })]);
+    const zero = within(station(/^Plan review/)).getByText("0");
+    expect(zero.className).toContain("text-fg");
+    expect(zero.className).not.toContain("text-warn");
+    cleanup();
+    mount([aRun({ id: "g", status: "awaiting_approval" })]);
+    expect(within(station(/^Plan review/)).getByText("1").className).toContain("text-warn");
+  });
+
+  it("hides the connecting segments below md and shows them from md up", () => {
+    mount([aRun({ id: "b" })]);
+    for (const seg of Array.from(document.querySelectorAll<HTMLElement>("[data-segment]"))) {
+      expect(seg.className).toMatch(/(^| )hidden( |$)/);
+      expect(seg.className).toContain("md:block");
+    }
   });
 
   it("flows only into Planning and Building while they hold live work", () => {

@@ -1,10 +1,17 @@
 // PRD #3879 M1: where each run stands on the issue-work line, and the counts and captions
 // the card prints.
 import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { aRun } from "../pages/overviewFixtures";
-import { issueLineModel, issueLineStage, type IssueStage } from "./issueLine";
+import { issueLineModel, issueLineStage, runRef, type IssueStage } from "./issueLine";
 import { parkLabel } from "./runBadge";
+import { runKindLabel } from "./runKind";
+
+// parkLabel delegates to the real one; the sanitising test below swaps its answer.
+vi.mock("./runBadge", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./runBadge")>();
+  return { ...actual, parkLabel: vi.fn(actual.parkLabel) };
+});
 
 const none: ReadonlySet<string> = new Set();
 const stage = (over: Parameters<typeof aRun>[0], pr: ReadonlySet<string> = none): IssueStage =>
@@ -251,5 +258,29 @@ describe("issueLineModel parked captions", () => {
       parked({ id: "e", status: "running", health: "waiting_account_cooldown" }),
     );
     expect(more.parkedReason).toBe("limit wait, waiting for pool, paused, +2 more");
+  });
+});
+
+describe("runRef", () => {
+  it("is the issue number, or the kind label when the run has no issue", () => {
+    expect(runRef({ kind: "issue", issue_iid: 12 })).toBe("#12");
+    expect(runRef({ kind: "job", issue_iid: null })).toBe(runKindLabel("job"));
+    expect(runRef({ kind: "job", issue_iid: null })).not.toMatch(/^#/);
+  });
+});
+
+describe("issueLineModel untrusted text", () => {
+  it("strips control and bidi characters from the parked reason line", async () => {
+    const real = await vi.importActual<typeof import("./runBadge")>("./runBadge");
+    vi.mocked(parkLabel).mockImplementation(() => "evil\u202E reason\u0007");
+    try {
+      const run = aRun({ id: "p", status: "limit_wait", issue_iid: 94 });
+      const one = issueLineModel({ ownRuns: [run], otherRuns: [] }).captions.parkedReason;
+      expect(one).toBe("#94 evil reason");
+      const two = issueLineModel({ ownRuns: [run, { ...run, id: "q" }], otherRuns: [] }).captions.parkedReason;
+      expect(two).toBe("evil reason");
+    } finally {
+      vi.mocked(parkLabel).mockImplementation(real.parkLabel);
+    }
   });
 });

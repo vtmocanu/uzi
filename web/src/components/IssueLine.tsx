@@ -118,13 +118,14 @@ function StationButton({
       onClick={onSelect}
       className="relative mx-0.5 flex min-w-0 flex-col items-start gap-0.5 rounded-xl border border-transparent py-3 pl-11 pr-2.5 text-left hover:bg-raised/55 aria-pressed:border-edge aria-pressed:bg-raised md:px-2.5 md:pb-3 md:pt-11"
     >
-      {/* Into this station: horizontal from md up, vertical below. It flows only while the
-          station holds live work; the flow is stopped under prefers-reduced-motion. */}
+      {/* Into this station, horizontal from md up; below md the vertical rail alone carries
+          the line. It flows only while the station holds live work; the flow is stopped
+          under prefers-reduced-motion. */}
       {!first && (
         <span
           aria-hidden="true"
           data-segment={live ? "flow" : "static"}
-          className={`absolute left-6 top-0 h-[23px] w-0.5 md:left-[calc(25px-100%)] md:top-[25px] md:h-0.5 md:w-[calc(100%+4px)] ${
+          className={`absolute hidden md:left-[calc(25px-100%)] md:top-[25px] md:block md:h-0.5 md:w-[calc(100%+4px)] ${
             live ? `issue-line-flow ${tone.flow}` : "bg-edge-strong"
           }`}
         />
@@ -144,7 +145,7 @@ function StationButton({
       />
       <span className="text-xs font-medium uppercase tracking-wider text-faint">{station.label}</span>
       <span
-        className={`text-3xl font-semibold leading-tight tabular-nums ${station.gate ? "text-warn" : "text-fg"}`}
+        className={`text-3xl font-semibold leading-tight tabular-nums ${station.gate && count > 0 ? "text-warn" : "text-fg"}`}
       >
         {count}
         {station.stage === "pr" && (

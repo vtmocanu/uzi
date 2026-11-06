@@ -446,25 +446,18 @@ body {
 
 /* The flowing segment into a live station of the Overview preview's issue-work line
    (PRD #3879): a dashed run in the station's tone (--tone, set per station) drifting
-   toward it. Vertical below md, where the line stacks; horizontal from md up. The
+   toward it. Segments show only from md up, where the line is horizontal. The
    reduced-motion block above stops it. */
 @keyframes issue-line-flow {
   to {
-    background-position: 12px 12px;
+    background-position: 12px 0;
   }
 }
 .issue-line-flow {
-  background-image: linear-gradient(180deg, rgb(var(--tone)) 0 55%, transparent 55% 100%);
-  background-size: 2px 12px;
-  background-repeat: repeat-y;
+  background-image: linear-gradient(90deg, rgb(var(--tone)) 0 55%, transparent 55% 100%);
+  background-size: 12px 2px;
+  background-repeat: repeat-x;
   animation: issue-line-flow 1.1s linear infinite;
-}
-@media (min-width: 48rem) {
-  .issue-line-flow {
-    background-image: linear-gradient(90deg, rgb(var(--tone)) 0 55%, transparent 55% 100%);
-    background-size: 12px 2px;
-    background-repeat: repeat-x;
-  }
 }
 
 /* Typography for rendered docs markdown (DocMarkdown). Hand-rolled prose rules

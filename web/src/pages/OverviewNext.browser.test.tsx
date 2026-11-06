@@ -1,6 +1,6 @@
 import "../index.css";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { page } from "vitest/browser";
+import { page, userEvent } from "vitest/browser";
 import { cleanup, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { OverviewNext } from "./OverviewNext";
@@ -223,6 +223,40 @@ describe("OverviewNext issue work line", () => {
       walk(rules, false);
     }
     expect(found.length).toBeGreaterThan(0);
+  });
+
+  it("hides the connecting segments when the line stacks, keeping the vertical rail", async () => {
+    await page.viewport(400, 900);
+    mountLine();
+    const card = await screen.findByRole("region", { name: "Issue work" });
+    const segments = Array.from(card.querySelectorAll<HTMLElement>("[data-segment]"));
+    expect(segments.length).toBeGreaterThan(0);
+    for (const seg of segments) expect(getComputedStyle(seg).display).toBe("none");
+    // The rail piece under each station but the last stays drawn.
+    const rails = Array.from(card.querySelectorAll<HTMLElement>('[data-stage="queued"] > span[aria-hidden="true"]'));
+    expect(rails.some((el) => getComputedStyle(el).display !== "none" && el.getBoundingClientRect().height > 0)).toBe(true);
+  });
+
+  it("filters the Runs card from the keyboard: Tab to a station, Enter picks it, Space lets go", async () => {
+    await page.viewport(1280, 900);
+    mountLine();
+    const card = await screen.findByRole("region", { name: "Issue work" });
+    const at = (stage: string) => card.querySelector(`[data-stage="${stage}"]`) as HTMLElement;
+    const yours = () => screen.getByRole("list", { name: "Your runs" }).querySelectorAll("li").length;
+    const all = yours();
+    expect(all).toBeGreaterThan(1);
+    at("queued").focus();
+    await userEvent.tab();
+    await userEvent.tab();
+    expect(document.activeElement).toBe(at("review"));
+    await userEvent.keyboard("{Enter}");
+    expect(at("review").getAttribute("aria-pressed")).toBe("true");
+    expect(card.querySelectorAll('[aria-pressed="true"]')).toHaveLength(1);
+    expect(yours()).toBe(1);
+    expect(screen.getByRole("link", { name: /All runs/ }).previousElementSibling?.textContent).toBe("Plan review");
+    await userEvent.keyboard(" ");
+    expect(at("review").getAttribute("aria-pressed")).toBe("false");
+    expect(yours()).toBe(all);
   });
 
   it("animates a live segment and leaves a static one still", async () => {

@@ -42,7 +42,7 @@ export function OverviewNext() {
     includeRecoveryHolds: true,
   });
   const now = useNow(30_000);
-  // The stage picked on the issue-work line. The Runs widget does not read it yet.
+  // The stage picked on the issue-work line; the Runs widget filters its groups by it.
   const [lineStage, setLineStage] = useState<IssueStage | null>(null);
 
   if (!user) return null;
@@ -131,6 +131,8 @@ export function OverviewNext() {
             now={now}
             demo={demo}
             loading={!data}
+            stage={lineStage}
+            prRuns={lineModel?.prs}
           />
         </div>
         {/* Below xl the rail is full width: Capacity and Held work sit side by side from lg. */}

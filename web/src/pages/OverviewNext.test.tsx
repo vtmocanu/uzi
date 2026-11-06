@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 // PRD #3878 M1: the /overview/next preview page.
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { act, cleanup, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { OverviewNext } from "./OverviewNext";
 import { Dashboard } from "./Dashboard";
@@ -566,5 +566,116 @@ describe("Issue work line", () => {
     expect(widgetRows()).toBe(8 + 4);
     expect(activeStages.reduce((n, s) => n + countOf(s), 0)).toBe(widgetRows());
     expect(countOf("pr")).toBe(1);
+  });
+
+  it("does not count an admin's own run that only the admin list carries as another user's", async () => {
+    vi.mocked(useAuth).mockReturnValue(authValue(admin));
+    mockApi.listRuns.mockResolvedValue({ runs: [aRun({ id: "own-1", status: "running" })] });
+    mockApi.adminListRuns.mockResolvedValue({
+      runs: [
+        aRun({ id: "own-1", status: "running", owner_email: admin.email }),
+        aRun({ id: "own-lag", status: "queued", owner_email: admin.email }),
+        aRun({ id: "x-1", status: "queued", owner_email: "mira@uzi.local" }),
+      ],
+    });
+    await mount();
+    expect(countOf("queued")).toBe(1);
+    expect(countOf("building")).toBe(1);
+    expect(activeStages.reduce((n, s) => n + countOf(s), 0)).toBe(widgetRows());
+    expect(widgetRows()).toBe(2);
+  });
+
+  describe("filtering the Runs widget by a stage", () => {
+    const click = (stage: string) =>
+      act(() => {
+        fireEvent.click(stationOf(stage));
+      });
+    const rows = (name: string) => {
+      const list = screen.queryByRole("list", { name });
+      return list ? within(list).getAllByRole("listitem").map((li) => li.textContent ?? "") : [];
+    };
+    const pressed = () =>
+      Array.from(line().querySelectorAll('[aria-pressed="true"]')).map((b) => b.getAttribute("data-stage"));
+    const adminMixed = () => {
+      vi.mocked(useAuth).mockReturnValue(authValue(admin));
+      mockApi.listRuns.mockResolvedValue({
+        runs: [
+          aRun({ id: "o-plan", status: "awaiting_approval", issue_title: "Own plan" }),
+          aRun({ id: "o-build", status: "running", issue_title: "Own build" }),
+        ],
+      });
+      mockApi.adminListRuns.mockResolvedValue({
+        runs: [
+          aRun({ id: "x-plan", status: "awaiting_approval", issue_title: "Their plan", owner_email: "mira@uzi.local" }),
+          aRun({ id: "x-build", status: "running", issue_title: "Their build", owner_email: "mira@uzi.local" }),
+        ],
+      });
+    };
+
+    it("shows only plan-review runs in both groups, and restores all on a second click", async () => {
+      adminMixed();
+      await mount();
+      expect(rows("Your runs")).toHaveLength(2);
+      expect(rows("Other users' runs")).toHaveLength(2);
+      await click("review");
+      expect(rows("Your runs")).toEqual([expect.stringContaining("Own plan")]);
+      expect(rows("Other users' runs")).toEqual([expect.stringContaining("Their plan")]);
+      expect(pressed()).toEqual(["review"]);
+      await click("review");
+      expect(pressed()).toEqual([]);
+      expect(rows("Your runs")).toHaveLength(2);
+      expect(rows("Other users' runs")).toHaveLength(2);
+    });
+
+    it("moves the pressed state with the selection, and Show all clears it", async () => {
+      adminMixed();
+      await mount();
+      await click("building");
+      expect(pressed()).toEqual(["building"]);
+      await click("review");
+      expect(pressed()).toEqual(["review"]);
+      expect(rows("Your runs")).toEqual([expect.stringContaining("Own plan")]);
+      await act(async () => {
+        fireEvent.click(within(line()).getByRole("button", { name: "Show all" }));
+      });
+      expect(pressed()).toEqual([]);
+      expect(rows("Your runs")).toHaveLength(2);
+    });
+
+    it("lists a pull request once when two runs share it, and counts the same", async () => {
+      const pr = { status: "completed" as const, repo_id: "repo-1", mr_iid: 5, mr_state: "opened" as const };
+      mockApi.listRuns.mockResolvedValue({
+        runs: [
+          aRun({ ...pr, id: "pr-old", issue_title: "PR older", finished_at: "2026-07-05T10:00:00Z" }),
+          aRun({ ...pr, id: "pr-new", issue_title: "PR newer", finished_at: "2026-07-05T12:00:00Z" }),
+        ],
+      });
+      await mount();
+      expect(countOf("pr")).toBe(1);
+      await click("pr");
+      expect(rows("Your runs")).toEqual([expect.stringContaining("PR newer")]);
+      expect(screen.getByRole("link", { name: /All runs/ }).previousElementSibling?.textContent).toBe("Open pull requests");
+    });
+
+    it("hides an empty group, says so when both are empty, and keeps the unavailable notice", async () => {
+      adminMixed();
+      await mount();
+      await click("queued");
+      expect(screen.getByText("No runs at this stage.")).toBeTruthy();
+      expect(screen.queryByText("Yours")).toBeNull();
+      expect(screen.queryByText("Other users (admin)")).toBeNull();
+      await click("review");
+      expect(screen.queryByText("No runs at this stage.")).toBeNull();
+      cleanup();
+      mockApi.adminListRuns.mockRejectedValue(new Error("down"));
+      await mount();
+      await click("review");
+      expect(rows("Your runs")).toHaveLength(1);
+      expect(screen.getByRole("status").textContent).toBe("Other users' runs are unavailable");
+      await click("review");
+      await click("queued");
+      expect(screen.getByRole("status").textContent).toBe("Other users' runs are unavailable");
+      expect(screen.getByText("No runs at this stage.")).toBeTruthy();
+    });
   });
 });
