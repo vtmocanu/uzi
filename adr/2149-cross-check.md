@@ -487,3 +487,52 @@ answers and revise feedback for the checker. Decisions:
   Because issue and lead-authored text could carry a lookalike `owner_steering` block, the plan
   prompt opens with a worker-authored line naming the two genuine fence suffixes, and the brief
   says only those blocks are supplied steering.
+
+## Amendment 2026-11-06 — #3953: credential switch during a candidate reservation
+
+A credential switch that arrives while an automatic plan cross-check holds its candidate
+transport reservation (`checkPlan` reserves the batcher before submit) used to abort the
+reservation and fail the run. The worker now defers it; the dispositions above are unchanged.
+
+- **Hold.** The runner opens `SteeringChannel.holdCredentialSwitch()` immediately before
+  `checkPlan`. While held, a switch (from the poll, a state ACK or a `switch_pending` input
+  receipt) is latched: nothing is aborted, `shutdownStop` included, and no waiter is rejected.
+  Cancel, claim fence, receipt failure, worker shutdown and disk stop are not held.
+- **Service points.** The latch is serviced synchronously only once the reservation is released
+  and verified, before any other checker round, storage, plan execution or model call: S1 after
+  an APPROVE returns (before the semantic review or any emit), S2 after an automatic REVISE
+  (before the revision turn), S3 in each checked human gate's `onApplied` after
+  `releaseAppliedGate`. A give-up of a human gate resumes the presented gate (same presentation,
+  revision and verdict binding, no republish). Every other exit closes the hold without service,
+  so a failure keeps its existing disposition and is never turned into a switch. No timer cancels
+  a live reservation.
+- **Decision stashes.** At S1/S2, when a switch is in play, the checker decision is kept for the
+  give-up re-run, bound to the claim generation, round, candidate digest (compared on semantic
+  runs; elsewhere the server owns the hash), plan text and milestones. It survives only the
+  `CredentialSwitchSignal` control exit, is adopted once at the first same-generation
+  continuation, and is cleared on mismatch (fail closed), any other failure, the next plan-gate
+  entry, a release and flight end. On a release the next claim re-discovers; the round-1 findings
+  text is not carried.
+- **Invariant guards.** If a reservation is ever installed when the in-place switch hook (G1) or
+  the outer `CredentialSwitchSignal` arm (G2) runs, the run fails terminally as an invariant
+  violation (`CandidateTransportInvariantError`): no switch report, the batcher is closed, and
+  the held-event loss is logged. Tests enumerate every trip entry and show none reaches either
+  guard during a reservation.
+- **Residual window.** A `switch_pending` input receipt can arrive after the human gate's
+  presentation; the input is parked, never lost.
+
+### Deferral bound (audited at 3fc80e34)
+
+The switch can wait only as long as the reservation lives. Bounds are read from code with the
+production defaults (request 3 s, preparation ≤3 s, poll ≤15 s, HTTP 30 s, server deadline
+`PLAN_CROSS_CHECK_TIMEOUT` default 30 m, worker-side cap 2 h in `checkPlan`):
+
+| Path | Components | Default deadline | Worst case (2 h deadline) |
+|---|---|---|---|
+| APPROVE / automatic REVISE | prepare ≤3 s, submit stage ≤30 s, poll window to the deadline, final transport check ≤3 s | ≈31 min | ≈2 h 1 min (7,240 s) |
+| Checked human gate (timed out, block, gated pass) | the above + 3 s, semantic review ≤60 s, resumed-delivery wait ≤153 s (failure path), `planChangedFiles` ≤600 s, gate checkpoint ≤160 s (sink-gate wait behind a preempted tick ≤125 s and a memory preservation ≤30 s), receipt settlement ≤60 s, presentation report ≤422 s, preparation ≤9 s | ≈56 min | ≈2 h 26 min (8,750 s) |
+
+These rest on stated assumptions: request timeouts propagate through `fetch` and body reads; the
+poll compares against the worker clock; executor-sequenced sink callbacks do not run during the
+plan gate; and the resumed-delivery wait, which predates this change, is bounded by its failure
+and stall counters rather than a wall-clock timer.
