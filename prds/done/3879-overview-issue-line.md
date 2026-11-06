@@ -85,3 +85,4 @@ Acceptance: filter tests; keyboard operable; mock parity for the pressed state.
 - **Badges cap at 12 plus "+N"** (2026-11-06, mock deviation): an owner with dozens of open PRs would otherwise grow the station without bound. Badges show only the issue number, so runs on different repos can share a number.
 - **Asking bay and Runs scope label read "Questions" when another user's question is counted** (2026-11-06): the whose-wait rule applies to the bay title as well as its caption.
 - **A filtered Runs list ignores the last good admin rows after a failed admin read** (2026-11-06): the line has no other users' runs in that state, so the widget must not either; the unavailable notice still shows.
+- **A usage-limit park reads "limit wait", not "usage limit"** (2026-11-06): the reason reuses `parkLabel`, so the bay matches the run pill word for word; the plan's "usage limit" example yielded to its own rule that every reason equals `parkLabel`.

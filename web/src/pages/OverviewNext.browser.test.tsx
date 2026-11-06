@@ -1,6 +1,7 @@
+/// <reference types="@vitest/browser-playwright" />
 import "../index.css";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { page, userEvent } from "vitest/browser";
+import { cdp, page, userEvent } from "vitest/browser";
 import { cleanup, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { OverviewNext } from "./OverviewNext";
@@ -197,7 +198,7 @@ describe("OverviewNext issue work line", () => {
     });
   }
 
-  it("stops the flowing segments under prefers-reduced-motion", () => {
+  it("stops the flowing segments under prefers-reduced-motion", async () => {
     // The stylesheet is the contract: a media rule for reduced motion must set animation
     // none on .issue-line-flow. (Walks every sheet; a cross-origin sheet cannot be read.)
     const found: string[] = [];
@@ -223,6 +224,24 @@ describe("OverviewNext issue work line", () => {
       walk(rules, false);
     }
     expect(found.length).toBeGreaterThan(0);
+
+    // Source order decides which same-specificity rule wins, so also check the computed
+    // style under real reduced-motion emulation.
+    await page.viewport(1280, 900);
+    mountLine();
+    const card = await screen.findByRole("region", { name: "Issue work" });
+    const live = card.querySelector('[data-segment="flow"]') as HTMLElement;
+    expect(live).not.toBeNull();
+    expect(getComputedStyle(live).animationName, "animates without the preference").toBe("issue-line-flow");
+    const session = cdp();
+    try {
+      await session.send("Emulation.setEmulatedMedia", {
+        features: [{ name: "prefers-reduced-motion", value: "reduce" }],
+      });
+      expect(getComputedStyle(live).animationName).toBe("none");
+    } finally {
+      await session.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "" }] });
+    }
   });
 
   it("hides the connecting segments when the line stacks, keeping the vertical rail", async () => {
@@ -270,6 +289,27 @@ describe("OverviewNext issue work line", () => {
     expect(screen.getByRole("link", { name: /All runs/ }).previousElementSibling?.textContent).toBe("Plan review");
     await userEvent.keyboard(" ");
     expect(at("review").getAttribute("aria-pressed")).toBe("false");
+    expect(yours()).toBe(all);
+  });
+
+  it("filters the Runs card from the keyboard on a bay: Enter picks Parked, Space lets go", async () => {
+    await page.viewport(1280, 900);
+    mountLine();
+    const card = await screen.findByRole("region", { name: "Issue work" });
+    const bay = card.querySelector('[data-stage="parked"]') as HTMLElement;
+    const yours = () => screen.getByRole("list", { name: "Your runs" }).querySelectorAll("li").length;
+    const all = yours();
+    expect(all).toBeGreaterThan(1);
+    bay.focus();
+    expect(document.activeElement).toBe(bay);
+    await userEvent.keyboard("{Enter}");
+    expect(bay.getAttribute("aria-pressed")).toBe("true");
+    expect(card.querySelectorAll('[aria-pressed="true"]')).toHaveLength(1);
+    expect(yours()).toBeGreaterThan(0);
+    expect(yours()).toBeLessThan(all);
+    expect(screen.getByRole("link", { name: /All runs/ }).previousElementSibling?.textContent).toBe("Parked");
+    await userEvent.keyboard(" ");
+    expect(bay.getAttribute("aria-pressed")).toBe("false");
     expect(yours()).toBe(all);
   });
 
