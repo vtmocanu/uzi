@@ -559,6 +559,24 @@ its verdict or deadline. A server-side terminal cancel still ends the held fligh
 second Cancel after the release applies at once. The owner accepted this limit for #3953; prompt
 Cancel during the hold is #3974.
 
+**Amendment (#3974): an owner Cancel during the hold is observed promptly.** The server still
+withholds the cancel row. While the switch is withheld, by this hold or by the M5b revision-turn
+defer, each worker poll that sees the current-generation switch signal makes one bounded,
+read-only ownership probe for `cancellation_requested` (the #3860 field). A positive answer,
+re-checked synchronously, commits the cancel exactly as a delivered cancel input would. A sticky
+flag then makes every later switch trip a no-op, and the runner's switch entry points take the
+ordinary "run cancelled" route instead: no switch capture, no `credential_switch*` report, no
+plan storage or gate presentation. The worker's `failed` report then settles the lead, the stamp,
+the cancel row, and, through the exit trigger, the pending round and the checker child in one
+transaction. Custody is the ordinary owner-cancel disposition; observing the Cancel starts no
+switch-specific custody operation. A probe failure, timeout or `false` counts as unknown and
+commits nothing, so an api without the field keeps the limit above. Remaining limits: on a
+re-plan gate the worker latches the Cancel promptly, but an in-flight gate checkpoint step (the
+open item above) delays the terminal report with no fixed bound until #3980; it presents no gate
+and services no switch afterwards. Auto-stop and graceful stop stay withheld. A Cancel after a
+release still waits for the reclaim. A cancel controller already spent by a refused "now" pause
+stops the SDK turn only at its next boundary.
+
 These rest on stated assumptions: request timeouts propagate through `fetch` and body reads; the
 poll compares against the worker clock; executor-sequenced sink callbacks do not run during the
 plan gate; and the resumed-delivery wait, which predates this change, is bounded by its failure
