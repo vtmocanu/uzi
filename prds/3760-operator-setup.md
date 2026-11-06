@@ -27,7 +27,7 @@ A one-shot command in the API image, `/server setup`, run on the deployment thro
 Acceptance examples:
 
 1. **Fresh Compose install, GitHub.** After `docker compose up -d`, the operator runs
-   `printf '%s' "$PAT" | docker compose exec -T api /server setup --forge-type github --forge-base-url https://api.github.com --forge-token-file - --repos acme/app,acme/lib --worker-name vps-1`.
+   `printf '%s' "$PAT" | docker compose exec -T api /server setup --forge-type github --forge-base-url https://github.com --forge-token-file - --repos acme/app,acme/lib --worker-name vps-1`.
    It prints one JSON report on stdout: forge `connected`, both repos `enabled` with their board columns created, worker `created` with its join token, and exits 0. The operator writes the token into `UZI_WORKER_TOKEN` and starts the `agent` profile.
 2. **Unprotected default branch.** Same command, but `acme/lib` lets the bot push to `main`. The report shows `acme/app` `enabled`, `acme/lib` `refused` with the same reasons the web UI shows, and the worker `skipped_dependency` with no join token minted; the command exits 1. The forge connection and `acme/app` stay in place; nothing is rolled back.
 3. **Re-run after success.** The same command again reports forge `present`, repos `enabled` (re-checked, unchanged), worker `exists` with no token, and exits 3, telling the script that a worker already exists and its token cannot be recovered.
