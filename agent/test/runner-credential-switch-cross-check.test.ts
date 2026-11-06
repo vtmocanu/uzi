@@ -235,6 +235,8 @@ interface DriveOpts {
   rejectAfterGiveUp?: boolean;
   /** Rewrite the plan markdown of the n-th (1-based) ctx.gatePlan call. */
   gateMd?: (n: number, md: string) => string;
+  /** Rewrite the milestones of the n-th (1-based) ctx.gatePlan call. */
+  gateMilestones?: (n: number, milestones: Parameters<NonNullable<RunContext["gatePlan"]>>[1]) => Parameters<NonNullable<RunContext["gatePlan"]>>[1];
   /** A forced human gate for the checker's revise/block instead of an automatic revision. */
   manual?: boolean;
   /** Run first on the pending checker request, whether or not a switch is requested. */
@@ -330,9 +332,12 @@ async function drive(o: DriveOpts) {
       attempts.push(outcome);
       return outcome;
     };
-    if (o.gateMd) {
+    if (o.gateMd || o.gateMilestones) {
       const gate = ctx.gatePlan!;
-      ctx.gatePlan = (md, ...rest) => gate(o.gateMd!(++gateCalls, md), ...rest);
+      ctx.gatePlan = (md, ms, ...rest) => {
+        const n = ++gateCalls;
+        return gate(o.gateMd ? o.gateMd(n, md) : md, o.gateMilestones ? o.gateMilestones(n, ms) : ms, ...rest);
+      };
     }
     return new SdkExecutor(nullLogger(), homeDir, { queryFn: scriptedQuery(o.plans ?? [PLAN], counter) }).run(ctx);
   } };
@@ -665,7 +670,7 @@ describe("issue #3953 m3: stash lifetime, ambiguous submit and pre-reserve switc
     });
   }
 
-  it("an ordinary automatic revise with no switch leaves no stash: one revision turn, each round submitted once, no adoption", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+  it("an ordinary automatic revise with no switch adopts no stash and replays nothing: one revision turn, each round submitted once", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
     const d = await drive({ capture: "giveup", verdicts: ["revise", "approve"], plans: [PLAN, PLAN2], switchRounds: [] });
     const { c } = d;
     assert.deepEqual(d.attempts, [], "no switch was ever serviced");
@@ -709,6 +714,18 @@ describe("issue #3953 m3: stash lifetime, ambiguous submit and pre-reserve switc
 
   it("a stashed approval that does not match the re-presented candidate fails closed",{ skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
     const d = await drive({ capture: "giveup", switchRounds: [1], gateMd: (n, md) => n === 1 ? md : `${md}\n- changed after the give-up` });
+    const { c } = d;
+    failedWith(c.run_id, "stashed decision does not match the re-presented candidate");
+    assert.deepEqual(d.storage, [], "the stale approval authorizes nothing");
+    assert.equal(d.posts().length, 1);
+    assert.ok(!statuses(c.run_id).includes("completed"));
+    assert.equal(d.counter.calls, 1, "no implementation");
+    assert.equal(gates(c.run_id).length, 0);
+  });
+
+  it("a stashed approval whose milestones differ from the re-presented candidate fails closed", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const d = await drive({ capture: "giveup", switchRounds: [1],
+      gateMilestones: (n, ms) => n === 1 ? ms : [...(ms ?? []), { id: "m-extra", title: "added after the give-up" }] });
     const { c } = d;
     failedWith(c.run_id, "stashed decision does not match the re-presented candidate");
     assert.deepEqual(d.storage, [], "the stale approval authorizes nothing");
@@ -1161,9 +1178,27 @@ describe("issue #3953 m3: semantic coverage forces a human gate after the checke
     server.force("incomplete");
     const transport = await boundedTransport("claude", server.report, events);
     api.onState(c.run_id, (b) => { events.push(`state:${b.status}`); if (b.status === "awaiting_approval") send(c.run_id, row("approve_plan")); });
+    // The real client honours its signal; the fake transport does not, so make every semantic call
+    // throw on an aborted signal. A gate holding the lifecycle signal of the released (aborted)
+    // lifecycle instead of the rearmed one then fails its calls on the re-run.
+    const original = {
+      submit: client.submitSemanticCandidate, status: client.semanticCoverageStatus, reserve: client.reserveSemanticCoverage,
+      settle: client.settleSemanticCoverage, publish: client.publishSemanticCoverage,
+    };
+    client.submitSemanticCandidate = async (...a: Parameters<typeof original.submit>) => { a[5]?.throwIfAborted(); return original.submit.apply(client, a); };
+    client.semanticCoverageStatus = async (...a: Parameters<typeof original.status>) => { a[2]?.throwIfAborted(); return original.status.apply(client, a); };
+    client.reserveSemanticCoverage = async (...a: Parameters<typeof original.reserve>) => { a[3]?.throwIfAborted(); return original.reserve.apply(client, a); };
+    client.settleSemanticCoverage = async (...a: Parameters<typeof original.settle>) => { a[3]?.throwIfAborted(); return original.settle.apply(client, a); };
+    client.publishSemanticCoverage = async (...a: Parameters<typeof original.publish>) => { a[3]?.throwIfAborted(); return original.publish.apply(client, a); };
     const verdicts: unknown[] = [];
-    await runner(semanticExec(c, verdicts), fakeGitlab().gitlab, undefined, { semanticCoverageTestTransport: transport,
-      planCrossCheckTiming: timing, recoveryRetryMs: 1, planApprovalTimeoutMs: 4000 }).execute(c);
+    try {
+      await runner(semanticExec(c, verdicts), fakeGitlab().gitlab, undefined, { semanticCoverageTestTransport: transport,
+        planCrossCheckTiming: timing, recoveryRetryMs: 1, planApprovalTimeoutMs: 4000 }).execute(c);
+    } finally {
+      client.submitSemanticCandidate = original.submit; client.semanticCoverageStatus = original.status;
+      client.reserveSemanticCoverage = original.reserve; client.settleSemanticCoverage = original.settle;
+      client.publishSemanticCoverage = original.publish;
+    }
     assert.equal(api.crossCheckRequests.filter((r) => r.method === "POST").length, 1, "the checked decision is adopted, never resubmitted");
     const gave = events.indexOf("state:credential_switch_failed");
     assert.ok(gave > events.indexOf("switch-requested"), JSON.stringify(events));

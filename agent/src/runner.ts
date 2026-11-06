@@ -15208,11 +15208,17 @@ export class RunRunner {
     // checkedFailure for any other exit, and by the attemptCredentialSwitch hook on a release. The
     // closures die with this flight, which ends them.
     let pendingCheckedApproval: {
-      claimGeneration: number; planMd: string; milestones: string;
+      claimGeneration: number; round: number; candidate_digest: string; planMd: string; milestones: string;
       response: Extract<Awaited<ReturnType<typeof checkPlan>>, { kind: "approve" }>["response"];
       releaseStateBarrier: (() => void) | undefined; failStateBarrier: ((error: unknown) => void) | undefined;
     } | undefined;
-    let pendingCheckedRevise: { claimGeneration: number; nextRound: number; verdict: PlanVerdict } | undefined;
+    // The revise stash is bound to the candidate the checker read (planMd and the milestones JSON)
+    // and to the round it decided; presentedCandidate records the candidate each gatePlan entry
+    // presents, which continueExistingPlanGate compares it with.
+    let pendingCheckedRevise: {
+      claimGeneration: number; round: number; nextRound: number; planMd: string; milestones: string; verdict: PlanVerdict;
+    } | undefined;
+    let presentedCandidate: { planMd: string; milestones: string } | undefined;
     // PRD #1230 M4 (D3/D4): the one-way, flight-scoped human-gate latch of a semantic run. Once
     // coverage was not complete, a maintainer criterion exists, or the required checker did not
     // APPROVE, this execution never auto-approves again, including a later (e.g. human-revised)
@@ -15761,6 +15767,7 @@ export class RunRunner {
         const stashApproval = (): void => {
           if (!checkedApproval || continueCheckedStorage) return;
           pendingCheckedApproval = { claimGeneration: flight.claimGeneration, planMd,
+            round: checkedApproval.round, candidate_digest: checkedApproval.candidate_digest,
             milestones: JSON.stringify(milestones ?? []), response: checkedApproval,
             releaseStateBarrier, failStateBarrier };
         };
@@ -15768,10 +15775,14 @@ export class RunRunner {
         const adopted = pendingCheckedApproval;
         pendingCheckedApproval = undefined;
         pendingCheckedRevise = undefined;
+        presentedCandidate = { planMd, milestones: JSON.stringify(milestones ?? []) };
+        // The digest is comparable only on a semantic run (semanticCompiled carries the canonical
+        // candidate digest); a non-semantic run has no re-presented digest, and the server owns that
+        // hash, so planMd, milestones, generation and round are the binding there.
         if (adopted) {
           if (!eligible || adopted.claimGeneration !== flight.claimGeneration || adopted.planMd !== planMd ||
-              adopted.milestones !== JSON.stringify(milestones ?? []) ||
-              (semanticCompiled && adopted.response.candidate_digest !== semanticCompiled.candidate.digest)) {
+              adopted.milestones !== JSON.stringify(milestones ?? []) || adopted.round !== crossCheckRound ||
+              (semanticCompiled && adopted.candidate_digest !== semanticCompiled.candidate.digest)) {
             const mismatch = new Error("plan cross-check: stashed decision does not match the re-presented candidate");
             adopted.failStateBarrier?.(mismatch);
             return checkedFailure(mismatch);
@@ -15899,7 +15910,8 @@ export class RunRunner {
                     ...(decision.response.findings ? { items: decision.response.findings.items } : {}) };
                   if (switchInPlay()) {
                     stashed = true;
-                    pendingCheckedRevise = { claimGeneration: flight.claimGeneration, nextRound: crossCheckRound,
+                    pendingCheckedRevise = { claimGeneration: flight.claimGeneration, round: decision.response.round,
+                      nextRound: crossCheckRound, planMd, milestones: JSON.stringify(milestones ?? []),
                       verdict: reviseVerdict };
                   }
                   serviceHold();
@@ -16093,8 +16105,13 @@ export class RunRunner {
           // clears it.
           const revise = pendingCheckedRevise;
           pendingCheckedRevise = undefined;
-          if (revise && revise.claimGeneration === flight.claimGeneration && crossCheckRound === revise.nextRound)
+          if (revise) {
+            if (revise.claimGeneration !== flight.claimGeneration || crossCheckRound !== revise.nextRound ||
+                revise.round + 1 !== revise.nextRound || !presentedCandidate ||
+                revise.planMd !== presentedCandidate.planMd || revise.milestones !== presentedCandidate.milestones)
+              return checkedFailure(new Error("plan cross-check: stashed decision does not match the re-presented candidate"));
             return revise.verdict;
+          }
           if (continueCheckedStorage) return continueCheckedStorage();
           if (!checkedHuman) return otherwise();
           if (!checkedHuman.continueWait || checkedHuman.phase === "terminal" || checkedHuman.phase === "revisionplanning")
