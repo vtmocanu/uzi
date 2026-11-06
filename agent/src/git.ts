@@ -2029,7 +2029,11 @@ function unionPeeledMarkers(...lists: Array<readonly string[] | undefined>): str
 // `reclaimed` when the terminal-orphan reclaim released a FOREIGN owner's attempt in place WITHOUT
 // capturing it: the clone may be the only copy of that run's work, so it is retained FOREVER (the
 // attempt-path twin of the unwired worker's foreign quarantine, `discard:false`) — never counted
-// toward the abandoned cap and never deleted. Each seed compacts the key to its last value per
+// toward the abandoned cap and never deleted by any AUTOMATIC path. That includes the verified-epoch
+// disposal (PRD #3431, gated off in production): its settlement admits only a `live` attempt with an
+// exact strict-plain journal, or a `retired` entry for the exact retired/empty-journal repair
+// (see exactPlainAttemptJournal). Only an operator discard (#1786) disposes of a `reclaimed` tree.
+// Each seed compacts the key to its last value per
 // attemptId (see compactAttemptLedger).
 // The watcher's backup script (.agents/skills/uzi-watcher/scripts/backup-runs.sh) reads exactly
 // this key and these field names: keep them byte-for-byte. It reads `state` in three places: an
@@ -2301,7 +2305,9 @@ function attemptLedgerValue(entry: AttemptLedgerEntry): string {
 // ─── issue #1786 — retained stopped sources ────────────────────────────────────────────────
 //
 // A stopped generation's clone is kept, not discarded, until an operator
-// explicitly disposes of it. An ATTEMPT clone is retained through the ledger's never-deleted
+// explicitly disposes of it (the one automatic exception is the verified-epoch disposal of PRD #3431,
+// off in production, which admits only a strict-plain `live` attempt or the exact `retired` repair, never
+// `reclaimed`). An ATTEMPT clone is retained through the ledger's never-deleted
 // `reclaimed` state (see attemptLedgerKey); a CANONICAL clone, which has no ledger identity, through
 // the bounded multi-valued bare-config marker `uzi-stopped.<runId>.entry` below. The marker grants
 // no capture, adoption or release authority: it only refuses reuse of the path it names.
@@ -10954,7 +10960,8 @@ export class GitCache {
 
   /**
    * issue #1786 — retain a stopped ATTEMPT clone (Docker-wired or recovery-enabled) under the ledger's
-   * never-deleted `reclaimed` state, in ONE bare-lock section with no nested lock. Validates that
+   * `reclaimed` state (never deleted automatically, including by the verified-epoch disposal, which does not
+   * admit this state; only an operator discard disposes of it), in ONE bare-lock section with no nested lock. Validates that
    * the source is this run's `live` (or already `reclaimed`) attempt at exactly this path, a real
    * directory with a real `.git`; appends ledger `reclaimed` (even when the active journal now names
    * another source, so an unjournaled `live` entry never becomes a sweep candidate); then clears
@@ -13840,7 +13847,8 @@ export class GitCache {
   }
 
   /**
-   * issue #1786 — operator discard of a PLAIN retained source: an attempt in ledger state `reclaimed`
+   * issue #1786 — operator discard of a PLAIN retained source (also the entry the gated verified-epoch
+   * deletion calls, with an epoch proof; see {@link discardRetainedSource}): an attempt in ledger state `reclaimed`
    * or `abandoned` that no journal names, or a canonical source whose marker is bound to its plain journal or detached
    * (no active journal names it; a successor's journal is never cleared), or a marker-less canonical
    * source left under its plain journal (the journal is cleared with the clone), or a `gx` attempt (confirmed with generation `none`). See
@@ -13871,6 +13879,15 @@ export class GitCache {
    * for attempts, the journal and marker for a canonical source) before releasing the lock. A
    * partial failure keeps the descriptor and every path not proven gone. One deadline covers the
    * whole operation; exhausting it keeps whatever is not yet proven gone and reports `unknown`.
+   *
+   * With `opts.epochProof` (a worker-issued {@link EpochDiscardProof} from createEpochDiscardProof, mode `plain`
+   * only) this is also the single disposal core of the verified-epoch reclaim (PRD #3431). The proof admits an
+   * exact strict three-key journal with the ledger `live`, the same journal with the ledger `retired` and the
+   * footprint missing, or the explicit `[""]` empty-journal repair; the canonical selector and an absent
+   * (`[]`) journal are refused at construction. It additionally requires a positively terminal lifecycle,
+   * a read zero-hold response, the clean content proof ({@link automaticContentPreserved}; a settled
+   * over-limit keeps the source as `epoch_content_unproven`) and a GET-only epoch observation before any
+   * effect. Production deletion stays off (`EPOCH_RECLAIM_DELETION_ENABLED` in pod-epoch-reclaim.ts).
    *
    * The pre-lock hold-read invariant belongs to the caller, not to this method: the holds snapshot
    * is only as current as the caller's proof that nothing can open a new hold on the run between the
@@ -14865,7 +14882,8 @@ export class GitCache {
    * retireRunnerClone after a VERIFIED capture (`state` `abandoned`: its work is in the tracking ref,
    * and automatic retention keeps it), and for a terminal FOREIGN owner's attempt in
    * the orphan reclaim, which captures nothing (`state` `reclaimed`: retained forever, never
-   * disposable — see attemptLedgerKey). Under the bare lock it re-validates that the journal still
+   * disposed of by an automatic path, the verified-epoch disposal included; only an operator discard
+   * (#1786) can — see attemptLedgerKey). Under the bare lock it re-validates that the journal still
    * names this exact (runId, clonePath) and refuses otherwise (nothing written), appends the ledger
    * state, and only THEN clears the journal (the caller calls this only once any capture is
    * verified — the #1197 rule). The ledger goes first so the journal never stops protecting a path

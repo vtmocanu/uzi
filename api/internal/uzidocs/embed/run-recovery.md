@@ -313,7 +313,9 @@ durable authority and is otherwise retained, for both harnesses (see
 [Completed sources after a worker restart](#completed-sources-after-a-worker-restart)).
 Registered-root capture exclusion does not exclude daemon or sibling writers,
 accepted-but-invisible creates (#1860), or Claude terminal residuals; per-attempt
-cgroup proof (#1862) remains unshipped. Automatic reclaim remains disabled (#1858),
+cgroup proof (#1862) remains unshipped. Automatic reclaim remains disabled (#1858;
+the one gated exception, verified-epoch deletion under PRD #3431, is off in
+production, see [Verified-epoch reclaim](#verified-epoch-reclaim-prd-3431)),
 and custody SETTLE and physical CLEANUP remain separate (#2746).
 Failed or uncertain capture keeps local source custody; there is no archive or
 latest-work guarantee, and loss of that worker's retained storage can lose
@@ -1372,7 +1374,9 @@ disk parks can compound retained storage (#2013/#225). The retention-only,
 non-closing #1858 change disables unsafe automatic retention reclaim on every
 worker, including abandoned attempts and crash-window live orphans, shared
 own-key residue from canonical and attempt entries, and orphaned skills.
-There is no automatic reclaim escape from that accumulation.
+There is no automatic reclaim escape from that accumulation in production: the
+verified-epoch deletion code exists but is switched off (see
+[Verified-epoch reclaim](#verified-epoch-reclaim-prd-3431)).
 
 **Slice A contract (Refs #2852) (AI-synced 2026-10-22):** credential-free capture, including owner pause,
 keeps execution closed without changing these retention rules. With proven cleanup,
@@ -2237,7 +2241,9 @@ show or discard it. The worker exposes a small operator channel for exactly this
 a read-only **inspect** and a guarded **discard**, run on the worker itself.
 
 Automatic retention reclaim is disabled on every worker (Refs #1858,
-retention-only and non-closing). Attributed attempts and their paired skills may
+retention-only and non-closing); the gated verified-epoch deletion of PRD #3431
+is the one coded exception and is off in production (see
+[Verified-epoch reclaim](#verified-epoch-reclaim-prd-3431)). Attributed attempts and their paired skills may
 use this existing retained-source discard route, subject to all its checks.
 Shared residue (`.uzi-residue-*`) and orphaned skills have **no supported generic
 reclaim route**. API custody discard alone is not local writer-exclusion proof.
@@ -2450,6 +2456,57 @@ remains.
 > namespace from `UZI_WORKER_NS` (which lists namespaces, not pods) unless you have verified
 > that namespace holds no source a tracked run needs: excluding it hides those sources from
 > the search, so their work is no longer backed up and the backup could read green without it.
+
+#### Verified-epoch reclaim (PRD #3431)
+
+On a hosted Docker worker, a fresh pod can evaluate retained attempt trees at a
+verified pod epoch, under the exclusive epoch lock and before it admits runs
+(see [Pod-epoch shadow reclaim](./worker-docker.md#pod-epoch-shadow-reclaim)).
+The evaluation is reported in the `pod_epoch_reclaim` log line. The worker image
+also contains a deletion phase that reclaims through the same discard core as the
+operator channel above. **That phase is gated off: `EPOCH_RECLAIM_DELETION_ENABLED`
+is `false`, so a production worker deletes nothing and settles no records.**
+Enabling it needs a separate owner decision on the re-measured numbers in
+[PRD #3431](../prds/3431-pod-epoch-reclaim.md); this guide does not describe it as
+available. Hosted deletion acceptance, the later idle-gated roll (#3329) and the
+Compose and plain lanes (#3709, #3710) are not shipped.
+
+If the phase is enabled, it runs only for an `eligible` and `attested` pass, one
+source at a time, and keeps everything else:
+
+- It needs a fresh positive terminal lifecycle and a recovery-holds response with
+  a run-wide `run_open_holds` count of 0 for the exact run. A worker advertises
+  `recovery_run_open_holds_v1` for this; an absent, mismatched or non-zero count
+  keeps the source. The server reads the predecessor's capabilities, so the first
+  roll onto an image that advertises it keeps every tree. A definitive ownership
+  404 keeps only that run's sources.
+- Only an attempt with the exact strict three-key journal (`runId`, `clonePath`,
+  `attemptId`) is admitted: with the ledger live, with the ledger `retired` and
+  the footprint missing, or through the explicit empty-journal repair. A
+  canonical source, a source with no journal keys and a protected source are
+  kept (`kept_unrecoverable_shape`, `kept_protected`). The ledger `reclaimed`
+  state is not admitted; only an operator discard disposes of it.
+- Automatic content proof has finite budgets (metadata 16 MiB, worktree content
+  512 MiB, 4 GiB per object-store snapshot, 131,072 metadata records, 16,384
+  directory entries). A positively observed overflow keeps only that source
+  (`epoch_content_unproven`). An unreadable or indirect store (an alternate, a
+  promisor remote, a config include, a redirected `.git`) stops the epoch scope
+  as unknown instead.
+- The `pod_epoch_reclaim` verdict adds `deleted`, `deleted_bytes`, `settled`,
+  `kept_after_refusal`, `kept_residue`, `kept_protected`,
+  `kept_unrecoverable_shape`, `source_use_not_ended` and `reclaim_bytes_state`,
+  and the reasons `reclaim_complete` and `reclaim_partial`. `deleted_bytes` sums
+  only trees positively removed; a missing tree is counted in `settled` with no
+  bytes.
+- An unknown outcome, a pending child, the stop latch, an unsettled delete or a
+  throwing finish keeps the epoch lock and exits non-zero rather than admitting.
+
+Crash scope is process crashes only; no storage or power-loss durability is
+claimed. A residue failure leaves the slot `retiring` with a `settled_failed`
+pending record, which the next epoch retakes. A crash inside or after the
+destructive-record save and before its settle leaves the slot `retiring` with a
+`running` pending record. That source is kept and not recovered automatically:
+this is a stated residual, and no automatic path clears it.
 
 #### Resolving guarded local records
 

@@ -355,11 +355,29 @@ No raw errors, URLs, paths or IDs appear in this object, and eligibility and
 authority are unchanged. See the
 [full #3775 diagnostic contract](../prds/3431-pod-epoch-reclaim.md#3775-partial-shadow-diagnostic-contract).
 
-**This is shadow reporting:** the pass deletes no attempt trees, settles no
-records, releases no recovery holds and removes no stopped containers. Existing
-startup reapers and DinD maintenance retain their separate behavior. Compose and
-non-Docker workers are unchanged. Deletion and settlement are later work under
-[PRD #3431](../prds/3431-pod-epoch-reclaim.md) (M1b).
+**Production deletion is off.** The worker image contains a gated deletion
+phase (`EPOCH_RECLAIM_DELETION_ENABLED` is `false`), so a production pass still
+deletes no attempt trees, settles no records, releases no recovery holds and
+removes no stopped containers. Enabling it needs a separate owner decision under
+[PRD #3431](../prds/3431-pod-epoch-reclaim.md); hosted deletion acceptance and
+the later idle-gated roll (#3329) are not shipped. Existing startup reapers and
+DinD maintenance retain their separate behavior. Compose and non-Docker workers
+are unchanged.
+
+When the phase is enabled it runs only for an `eligible`, `attested` pass and
+adds these fields to the `pod_epoch_reclaim` line: `deleted` and `deleted_bytes`
+(trees positively removed and their measured bytes), `settled` (missing trees
+settled by metadata only, no bytes), `kept_after_refusal`, `kept_residue` (a
+settled delete failure; the next epoch retakes it), `kept_protected` and
+`kept_unrecoverable_shape` (structural keeps), `source_use_not_ended` and
+`reclaim_bytes_state` (`measured` once the phase ran, otherwise `unknown`). The
+reasons `reclaim_complete` and `reclaim_partial` join the existing ones; the
+shadow fields are unchanged. With the gate off these counters stay `0` and
+`reclaim_bytes_state` stays `unknown`. Deletion also needs a run-wide
+`run_open_holds` count of 0 from the server (the worker advertises
+`recovery_run_open_holds_v1`), so the first roll onto an image carrying it keeps
+every tree. See [Verified-epoch reclaim](./run-recovery.md#verified-epoch-reclaim-prd-3431)
+for the admitted shapes, budgets and crash residuals.
 
 The administrator's `workers.docker.podEpochReclaim.runtime` defaults to unset.
 A fresh default-off pod logs `deferred` / `runtime_not_declared` immediately
