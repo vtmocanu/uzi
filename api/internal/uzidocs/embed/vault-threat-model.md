@@ -152,12 +152,48 @@ Unattended continuity is outside this feature's scope.
 Losing a password/passphrase does not imply immediate loss while usable key
 material remains (for example a cached DEK or usable browser grant). Losing
 both the password/passphrase and remaining usable key material makes protected
-contents unrecoverable; this feature adds no password-reset, passphrase-change
-or recovery workflow.
+contents unrecoverable; this feature adds no passphrase-change or recovery
+workflow. The only way back is the destructive
+[admin-issued account reset](#admin-issued-account-reset) below.
 
 This threat-model review records the bearer capability and accepted residuals.
 Executed checks and independent security review evidence belong in the
 implementation PR; this analysis does not certify those checks.
+
+## Admin-issued account reset
+
+An admin can issue a one-time reset link for another active, non-seed user
+(PRD #3989; flow in [Auth design](./auth-design.md#accepted-limitations)). It
+restores account access, not vault contents.
+
+- **What redemption deletes.** Every `user_secrets` row of every kind and every
+  Codex account (live and recovery slots), whatever their sealing marker, plus
+  the vault wrapper and all browser re-unlock grants. The account becomes
+  protected with no wrapper; the next password login creates a fresh vault. The
+  reset never rewraps or reuses a cached key, even while the vault is unlocked,
+  so it cannot be used to read the user's credentials. Forge connections,
+  repos, schedules, run history, settings, CLI tokens and product OAuth grants
+  are untouched.
+- **Admin takeover.** An admin can take over any non-seed account, other admins
+  included, by issuing a link and redeeming it themselves with a password they
+  choose. The admin never learns the user's old password and cannot read the
+  deleted credentials, but then controls the account's non-vault data. Issuing
+  needs no admin re-authentication. Issue and redeem are logged
+  (`reset link issued`, `reset link redeemed`, with user ids and whether the
+  target is an admin, never the token). The seed admin and the issuer's own
+  account are refused. A link is void if its issuer is later deactivated or
+  demoted.
+- **SSO-only instances.** With password login disabled, the new password only
+  serves to enable the vault in Settings after the user signs in through SSO.
+  Reset links for users with no password (SSO-only accounts) are not yet
+  available.
+- **Running runs.** A run already executing keeps the credential its worker was
+  issued until it ends; stopping or fencing active runs is out of scope. Its
+  Codex refresh writes against a deleted account fail closed. Queued runs that
+  need a deleted credential fail at claim like any other deleted credential.
+- **Uncertain outcome.** If the commit cannot be confirmed the redeem call
+  returns `503` with "the reset could not be confirmed; try signing in with the
+  new password, or ask for a new link".
 
 ## CLI unlock: authenticated guessing and key custody
 

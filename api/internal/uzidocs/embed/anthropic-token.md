@@ -530,7 +530,8 @@ whether personal credentials use password protection. The same choice covers
   eligible foreground browser request can re-unlock with a live browser
   grant; otherwise unlock with your password or vault passphrase. Losing
   both that secret and remaining usable key material makes protected
-  contents unrecoverable; there is no recovery workflow.
+  contents unrecoverable; the only way back is an
+  [admin reset link](#forgotten-password-admin-reset-link), which deletes them.
 - **Off (unprotected)** still encrypts credentials at rest, using the server
   key like forge bot tokens. Theft of both the database and server key exposes
   them. There is no vault wrapper, unlock step or lock notice; runs and usage
@@ -538,7 +539,8 @@ whether personal credentials use password protection. The same choice covers
 
 To turn On, verify your login password. If you use SSO without a password,
 create and confirm a dedicated vault passphrase of **12–1024 UTF-8 bytes**;
-this is create-only, with no passphrase change or recovery flow. Linking SSO
+this is create-only, with no passphrase change or recovery flow (reset links for
+SSO-only accounts are not yet available). Linking SSO
 to a password account retains its mode and password-based vault semantics.
 To turn Off, first unlock your protected vault; your administrator must allow
 optional protection. Login, seed startup and ordinary unlock do not turn
@@ -577,9 +579,33 @@ revokes sessions and grants but leaves an already cached vault key available
 to runs. Turning off automatic re-unlock revokes grants without locking an
 already unlocked vault. Password changes, turning protection Off, vault
 recreation and account deactivation also revoke grants. A usable browser grant
-or cached key can preserve access after a forgotten password, but this adds
-no password-reset or passphrase-recovery feature. See the
+or cached key can preserve access after a forgotten password, but that is not
+a recovery feature. See the
 [threat model](./vault-threat-model.md#browser-re-unlock) for cookie-theft risks.
+
+### Forgotten password: admin reset link
+
+If you forget your password, an administrator can issue you a one-time reset
+link (Admin → Users → **Reset link**; valid for 1 hour). Opening it and choosing
+a new password:
+
+- **Deletes** all your Anthropic, OpenAI and Codex credentials, your Codex
+  logins and the vault. They cannot be recovered; add them again afterwards.
+- Ends all your browser sessions. It does not log you in. CLI tokens and OAuth
+  grants are kept.
+- Leaves you **protected** with no vault; your next password login creates a
+  fresh one, even if you had turned protection Off.
+- Does not stop runs that are already executing; they keep the credential their
+  worker was issued until they end. Queued runs that need a deleted credential
+  fail at claim, as for any deleted credential, until you add a new one.
+
+On an SSO-only instance (password login disabled) the new password only serves
+to enable the vault in Settings after you sign in through SSO. The seed admin
+cannot be reset with a link, and an admin cannot issue one for their own
+account. An admin can take over any other account, admins included, by issuing a
+link; see the [threat model](./vault-threat-model.md#admin-issued-account-reset).
+If the page reports that the reset could not be confirmed, try signing in with
+the new password, or ask for a new link.
 
 ### Enrollment and conversion
 
