@@ -867,6 +867,17 @@ describe("Run defaults — per-user reasoning effort (PRD #617 M5)", () => {
         "Runtime default · catalog default unknown until a Codex run reports it"));
     });
 
+    it("refreshes the label from the PUT response after a Codex model save", async () => {
+      expect((await codexOption(dto()))[1]).toContain("(gpt-6.1-sol, Codex 0.164.0)");
+      mockApi.putMySettings.mockResolvedValueOnce({ settings: { ...base, default_effort: null, default_codex_effort: null,
+        default_codex_model: "gpt-6-sol", effort_settings: cells(dto({ state: "unknown", effort: null, model: null, runtime_version: null, observed_at: null })) } });
+      fireEvent.change(screen.getByLabelText("Codex model"), { target: { value: "gpt-6-sol" } });
+      fireEvent.click(screen.getByRole("button", { name: "Save defaults" }));
+      await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith(expect.objectContaining({ default_codex_model: "gpt-6-sol" })));
+      await waitFor(() => expect(optionList(screen.getByLabelText("Codex effort"))[1][1]).toBe(
+        "Runtime default · catalog default unknown until a Codex run reports it"));
+    });
+
     it("saving runtime sends the token and announces Runtime default, never 'runtime'", async () => {
       mockApi.listSecrets.mockResolvedValue({ secrets: [codexSecret] });
       mockApi.getMySettings.mockResolvedValue({ settings: { ...base, default_effort: null, default_codex_effort: null } });

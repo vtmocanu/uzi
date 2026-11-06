@@ -681,12 +681,14 @@ export function RunDefaults() {
         default_codex_model: codexModel.trim() || null,
       };
       const { settings } = await api.putMySettings(patch);
-      // Model saves refresh counterfactual metadata; retain current pins and all other hints.
+      // Model saves refresh counterfactual metadata (cross-check worker defaults and the
+      // Codex catalog default, both computed for the saved model); retain current pins and other hints.
       setCommittedSettings(current => current && ({
         ...current,
         default_harness: settings.default_harness,
         default_claude_model: settings.default_claude_model,
         default_codex_model: settings.default_codex_model,
+        effort_settings: settings.effort_settings,
         cross_check_pins: current.cross_check_pins?.map(cell => {
           const delivered = settings.cross_check_pins?.find(p => p.stage === cell.stage && p.harness === cell.harness);
           return delivered ? { ...cell, worker_default_model: delivered.worker_default_model } : cell;

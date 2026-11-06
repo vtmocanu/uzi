@@ -561,7 +561,7 @@ function mockEffortCell(harness: Harness, stored: string | null | undefined): Ef
 }
 
 // Issue #3251: the Codex cell's catalog_default as the mock serves it. The mock returns
-// STATIC samples (the server's selection rule is not reimplemented here); a demo or test
+// STATIC samples (the server's selection rule is not reimplemented here); a test
 // picks one with setMockCodexCatalogSample, and a module reload restores "known".
 const MOCK_CODEX_CATALOG_SAMPLES = {
   known: { state: "known", effort: "medium", model: "gpt-6.1-sol", runtime_version: "0.164.0", observed_at: "2026-11-05T09:30:00Z" },
