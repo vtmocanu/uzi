@@ -95,16 +95,22 @@ func (b *Box) OpenWithAAD(sealed, aad []byte) ([]byte, error) {
 // base64, or does not decode to exactly KeySize bytes, and returns ErrWeakKey
 // for a placeholder key whose bytes are all identical.
 func LoadKey(envVar string) ([]byte, error) {
-	encoded := os.Getenv(envVar)
+	return DecodeKey(envVar, os.Getenv(envVar))
+}
+
+// DecodeKey validates an already-read base64 master key with LoadKey's rules.
+// name labels the key's source in errors (an environment variable, or the
+// _FILE variable that pointed at it), so a bad key names where it came from.
+func DecodeKey(name, encoded string) ([]byte, error) {
 	if encoded == "" {
-		return nil, fmt.Errorf("secretbox: environment variable %s is empty or unset", envVar)
+		return nil, fmt.Errorf("secretbox: %s is empty or unset", name)
 	}
 	key, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
-		return nil, fmt.Errorf("secretbox: %s could not be base64-decoded: %w", envVar, err)
+		return nil, fmt.Errorf("secretbox: %s could not be base64-decoded: %w", name, err)
 	}
 	if len(key) != KeySize {
-		return nil, fmt.Errorf("secretbox: %s decoded to %d bytes, want %d", envVar, len(key), KeySize)
+		return nil, fmt.Errorf("secretbox: %s decoded to %d bytes, want %d", name, len(key), KeySize)
 	}
 	if isUniformBytes(key) {
 		return nil, ErrWeakKey

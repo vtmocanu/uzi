@@ -919,7 +919,6 @@ func Load() (Config, error) {
 	cfg := Config{
 		Addr:            getenv("API_ADDR", ":8080"),
 		TLSAddr:         getenv("API_TLS_ADDR", ":8443"),
-		DatabaseURL:     os.Getenv("DATABASE_URL"),
 		FrontendOrigin:  getenv("FRONTEND_ORIGIN", "http://127.0.0.1:8080"),
 		AuthTokenTTL:    parseDuration("AUTH_TOKEN_TTL", 168*time.Hour),
 		RateLimitMax:    parseInt("RATE_LIMIT_MAX", 10),
@@ -927,11 +926,22 @@ func Load() (Config, error) {
 		TrustedProxies:  parseTrustedProxies(os.Getenv("TRUSTED_PROXIES")),
 	}
 
+	// The three boot secrets each come from the plain variable or from a
+	// <NAME>_FILE path (a mounted Docker/Kubernetes secret), never both.
+	dbURL, dbSource, err := resolveSecret("DATABASE_URL")
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.DatabaseURL = dbURL
 	if strings.TrimSpace(cfg.DatabaseURL) == "" {
-		return Config{}, fmt.Errorf("DATABASE_URL is required")
+		return Config{}, fmt.Errorf("%s is required", dbSource)
 	}
 
-	secret, err := validateSecret(os.Getenv("JWT_SECRET"))
+	jwtRaw, jwtSource, err := resolveSecret("JWT_SECRET")
+	if err != nil {
+		return Config{}, err
+	}
+	secret, err := validateSecret(jwtSource, jwtRaw)
 	if err != nil {
 		return Config{}, err
 	}
@@ -951,7 +961,11 @@ func Load() (Config, error) {
 	// Boot guard for the at-rest encryption key, same stance as JWT_SECRET: a
 	// missing/short/mis-encoded UZI_SECRET_KEY aborts start rather than running
 	// with unencryptable or guessable-keyed token storage.
-	key, err := secretbox.LoadKey("UZI_SECRET_KEY")
+	keyRaw, keySource, err := resolveSecret("UZI_SECRET_KEY")
+	if err != nil {
+		return Config{}, err
+	}
+	key, err := secretbox.DecodeKey(keySource, keyRaw)
 	if err != nil {
 		return Config{}, fmt.Errorf("%w; generate one with: openssl rand -base64 32", err)
 	}
@@ -2202,18 +2216,43 @@ func (c Config) AgentSourceBaseURLAllowed(raw string) bool {
 
 // validateSecret enforces the boot guard: reject missing, empty, placeholder,
 // or too-short secrets.
-func validateSecret(raw string) ([]byte, error) {
+func validateSecret(name, raw string) ([]byte, error) {
 	s := strings.TrimSpace(raw)
 	if s == "" {
-		return nil, fmt.Errorf("JWT_SECRET is required and must not be empty; generate one with: openssl rand -hex 64")
+		return nil, fmt.Errorf("%s is required and must not be empty; generate one with: openssl rand -hex 64", name)
 	}
 	if _, bad := placeholderSecrets[strings.ToLower(s)]; bad {
-		return nil, fmt.Errorf("JWT_SECRET is set to a well-known placeholder value; generate a real one with: openssl rand -hex 64")
+		return nil, fmt.Errorf("%s is set to a well-known placeholder value; generate a real one with: openssl rand -hex 64", name)
 	}
 	if len(s) < minSecretLen {
-		return nil, fmt.Errorf("JWT_SECRET is too short (%d chars, need >= %d); generate one with: openssl rand -hex 64", len(s), minSecretLen)
+		return nil, fmt.Errorf("%s is too short (%d chars, need >= %d); generate one with: openssl rand -hex 64", name, len(s), minSecretLen)
 	}
 	return []byte(s), nil
+}
+
+// resolveSecret reads a boot secret from the variable name or from the file
+// that name+"_FILE" points at (issue #3938). A variable counts as set when it
+// is non-empty after trimming spaces, so a deployment that renders an empty
+// NAME beside NAME_FILE still boots. Both set is a refusal, not a precedence
+// rule: the operator must say which one is meant. File content loses exactly
+// one trailing newline (what `echo` and most editors add) and nothing else.
+// source names where the value came from, so later validation errors point
+// the operator at the right variable.
+func resolveSecret(name string) (value, source string, err error) {
+	fileVar := name + "_FILE"
+	direct := os.Getenv(name)
+	path := strings.TrimSpace(os.Getenv(fileVar))
+	if strings.TrimSpace(direct) != "" && path != "" {
+		return "", "", fmt.Errorf("%s and %s are both set; set only one of them", name, fileVar)
+	}
+	if path == "" {
+		return direct, name, nil
+	}
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: operator config naming the mounted secret file.
+	if err != nil {
+		return "", "", fmt.Errorf("%s: read %s: %w", fileVar, path, err)
+	}
+	return strings.TrimSuffix(string(raw), "\n"), fileVar, nil
 }
 
 // originIsHTTPS reports whether the given origin uses the https scheme, which
