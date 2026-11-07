@@ -233,14 +233,14 @@ Measured on 2026-11-06/07 with the capped helper (`baseDiscoveryEntryCap` = 1,20
 | longpath-d60n250w2000f3 (93,237,810 path bytes) | path-byte cap, just under | discovery completed, then `errno:ENAMETOOLONG` (see the M1 section) | 226.1 | same | 226.3 |
 | longpath-d60n250w2000f4 (124,317,080 path bytes) | path-byte cap, just over | **`base_discovery_path_byte_cap`** (3.7 s) | 229.9 | **`base_discovery_path_byte_cap`** | 230.7 |
 | distinct-1170x1024n75 (1,199,250 entries, 1,198,080 distinct blobs, 99,448,830 path bytes) | both caps nearly reached, maximal sizing batch | `capture_deadline` before discovery finished | 449.3 | `git_deadline` (974,994 entries fetched) | 448.5 |
-| fatchain-d64 (65 nested 1.95 MiB trees) | pinned in-flight tree buffers | **`base_discovery_path_byte_cap`** (13.1 s) | **502.4** | **`base_discovery_path_byte_cap`** | **575.5** |
+| fatchain-d64 (65 nested trees of up to 1.95 MiB, 60,000 filler files each) | pinned in-flight tree buffers | **`base_discovery_path_byte_cap`** (13.1 s) | **502.4** | **`base_discovery_path_byte_cap`** | **575.5** |
 
 - **Charged work at the cap refusals**, labelled `derived-from-refusal` (7c) and confirmed by the probes below where noted:
   - wide-1171x1024 at 1536m/1: E = 1,200,001, P = 17,990,632. The P figure is not probe-confirmed at that index (see the probes).
   - longpath-d60n250w2000f4: E = 6,696, P = 100,678,440.
   - fatchain-d64: E = 830,983, P = 100,663,348. The fat chain's filler file names, charged under a 64-level prefix, reach the path-byte cap before the entry cap.
-- **Discovery speed binds before the entry cap on this host.** No near-cap wide or distinct base finished discovery within the 28 s helper deadline at either configuration. The entry cap fired only on wide-1171x1024 at 1 CPU (25.7 s). On this host the deadline therefore stops most near-cap bases first. The caps bound memory on any host, however fast.
-- **The synthetic-50000 `capture_deadline` at 4g/2** happened in the first production run, with a host load average of about 10 from other runs. Its discovery had completed (5,964 ms, 50,500 entries, `meterMatch`). The deadline fired in the post-discovery file walk, at 28.2 s, against 13.0–13.9 s in every other 4g/2 run of this fixture (#3991, M1, the rerun here). It is 24× below the entry cap and 200× below the path-byte cap, so the caps cannot cause it. The rerun completed at both configurations.
+- **Discovery speed binds before the entry cap on this host.** No near-cap wide or distinct base finished discovery within the 28 s helper deadline at either configuration. The entry cap fired only on wide-1171x1024 at 1 CPU (`control` 25.7 s, `full` 24.9 s). On this host the deadline therefore stops most near-cap bases first. The caps bound memory on any host, however fast.
+- **The synthetic-50000 `capture_deadline` at 4g/2** happened in the first production run, with a host load average of about 10 from other runs. Its discovery had completed (5,964 ms, 50,500 entries, `meterMatch`). The deadline fired in the post-discovery file walk, at 28.2 s, against 13.0–14.6 s in every other 4g/2 run of this fixture (#3991 13.0 s, M1 14.6 s, the rerun here 13.9 s). It is 24× below the entry cap and 200× below the path-byte cap, so the caps cannot cause it. The rerun completed at both configurations.
 
 ## Sizing-batch worst case (distinct blobs)
 
@@ -254,7 +254,7 @@ The auditor of M2 noted that every M1 fixture shared one blob, so the post-disco
 - **Extrapolated to the entry cap** (1,199,250 entries, all distinct). This is an extrapolation, not a measurement, because no such base completes discovery inside the deadline on this host.
   - Linear in the `control` rows: 301.2 MiB + 936,850 × 968 B ≈ **1,166 MiB**.
   - Linear in the `full` 4g/2 rows: ≈ 810 MiB.
-  - Both include the post-discovery work these `--no-checkout` fixtures add (every base path diffs as a deletion until `git_deadline`), so they are conservative for discovery alone.
+  - Both rows include post-discovery work these `--no-checkout` fixtures add (every base path diffs as a deletion until `git_deadline`), whose share is bounded by time rather than size, so a two-point linear fit is an estimate, not a bound. No measured row reached both caps together.
 
 ## Validation probes (7f, injected limits, 4g/2)
 
@@ -274,8 +274,8 @@ For each index i, the pair `(entryCap = i, pathByteCap = Pm(i) − 1)` must refu
 
 ## Decision (M3 rule)
 
-1. **Memory:** the largest measured whole-capture container peak with the caps in force is 575.5 MiB (fatchain-d64, 4g/2), and 502.4 MiB on the 1536 MiB / 1 CPU slot. The extrapolated sizing-batch worst case is about 1,166 MiB. All fit the 1536 MiB per-slot budget.
-2. **Clean controls:** this repository and synthetic-50000 capture at the caps in the M2 tests (`git-planning-diff.test.ts`, "Base discovery aggregate caps (#3543)") and in the harness rerun at both configurations. The one 4g/2 `capture_deadline` above is a post-discovery deadline under host load, not a cap.
+1. **Memory:** the largest measured whole-capture container peak with the caps in force is 575.5 MiB (fatchain-d64, 4g/2). On the 1536 MiB / 1 CPU slot it is 543.4 MiB (distinct-512x1024n75, `control`), and 502.4 MiB among the cap-refusal rows (fatchain-d64). The extrapolated sizing-batch worst case is about 1,166 MiB. All fit the 1536 MiB per-slot budget.
+2. **Clean controls:** this repository and synthetic-50000 capture at the caps in the M2 tests (`git-planning-diff.test.ts`, "Base discovery aggregate caps (#3543)") and in the harness rerun at both configurations. The first production run's synthetic-50000 4g/2 row did not pass: it is a post-discovery `capture_deadline` under host load, not a cap (its discovery completed 24× below the entry cap). This acceptance counts the disclosed rerun; under a strict reading in which every M3 row must pass, that row is the exception.
 3. **Realistic margin (rule 5a):** the caps stay at 2.13× (entries) and 2.36× (path bytes) Chromium's tree, as in the M1 section.
 
 **Accepted:** `baseDiscoveryEntryCap` = 1,200,000 and `baseDiscoveryPathByteCap` = 100,663,296 (96 MiB). No lowering iteration was needed.

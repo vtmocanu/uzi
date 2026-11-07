@@ -101,18 +101,22 @@ trees; the root tree is the commit's tree), so F*W near 1.2 million is practical
 and model refuse any tree object over the helper's 2 MiB per-object cap (checked analytically,
 then with `git cat-file -s` on the root and the first and last leaf tree). The manifest adds
 `distinctBlobs` and `maxTreeObjectBytes`. Occurrences: `1 + F` trees, `F*W` files. Example:
-`distinct-1171x1024n75` (1,199,104 files).
+`distinct-1170x1024n75` (1,198,080 files, 1,199,250 entries, just under the 1,200,000 entry cap,
+so the sizing batch runs if discovery completes in time; 1171 would refuse at the entry cap first).
 
 ### `fatchain-d<depth>`
 
 A chain of `depth` (1..64) nested directories; the root is helper depth 0. Every tree holds
 60,000 filler regular files (one shared blob, names `f` + 5 digits) and, except the deepest, a
 directory entry `0` that sorts first in canonical order (`0/` before `f...`; the generator asserts
-it from `git ls-tree`). Each tree object is 2,040,028 bytes (1.95 MiB), under the 2 MiB cap. The
+it from `git ls-tree`). Each tree object is 2,040,028 bytes (1.95 MiB; the deepest, without `0`,
+2,040,000), under the 2 MiB cap. The
 helper descends at the first entry, so every ancestor's tree buffer is live at the deepest point
-while only `depth` entries are charged: up to `depth + 1` near-2-MiB buffers at once. Total filler
-(`(depth+1) * 60000` entries) exceeds the planned entry cap, so during unwinding the row refuses
-with `base_discovery_entry_cap` after the peak. The manifest adds `maxTreeObjectBytes`.
+while only `depth` entries are charged: up to `depth + 1` near-2-MiB buffers at once. Filler entries
+are charged only while unwinding, after that peak. Which cap then refuses depends on depth: at
+d64 the path-byte cap fires first (E = 830,983, P = 100,663,348), at roughly d19-d32 the entry cap,
+and below d19 (`(depth+1) * 60000` entries under 1,200,000) neither does. Ask the `model` job for a
+given depth. The manifest adds `maxTreeObjectBytes`.
 
 ## Charge model and basis labels
 

@@ -403,8 +403,10 @@ function distinctDag(bare: string, spec: string, d: Distinct): SharedDag {
   const input = fs.openSync(streamPath, "r");
   try {
     execFileSync("git", ["-C", bare, "fast-import", "--quiet", "--force"], { env: PINNED_ENV, stdio: [input, "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024 });
-  } finally { fs.closeSync(input); }
-  fs.rmSync(streamPath, { force: true });
+  } finally {
+    fs.closeSync(input);
+    fs.rmSync(streamPath, { force: true });
+  }
   const tree = git(bare, ["rev-parse", "refs/heads/distinct-fi^{tree}"]);
   git(bare, ["update-ref", "-d", "refs/heads/distinct-fi"]);
   const rootSize = Number(git(bare, ["cat-file", "-s", tree]));
