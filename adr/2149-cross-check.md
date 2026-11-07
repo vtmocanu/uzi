@@ -674,7 +674,6 @@ fixed separately (#3996), before the M3 measurements.
 
 Measurement and harness: [RESULTS.md](../e2e/planning-base-discovery-measure/RESULTS.md) and its
 [README](../e2e/planning-base-discovery-measure/README.md).
-||||||| a2324b175
 
 ## Amendment 2026-11-06 — #3985: clarification during a human revision
 
