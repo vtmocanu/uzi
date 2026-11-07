@@ -398,19 +398,23 @@ async function mainBody(): Promise<void> {
       else process.stderr.write(JSON.stringify({ level: "warn", msg: message, ...fields }) + "\n");
     },
   };
+  // Idempotent: the first call fixes the deadline and arms the one observer; a later call (a repeated signal, or the
+  // barrier after a signal) changes nothing.
+  const armShutdownObserver = (): number => {
+    const deadlineAt = (shutdownDeadlineAt ??= Date.now() + SHUTDOWN_RESULT_DEADLINE_MS);
+    armShutdownResultDeadline({
+      deadlineAt, log: shutdownLog,
+      snapshot: () => shutdownAuthority?.snapshot({
+        unsettled_delete: shutdownGit?.unsettledDeleteCount() ?? 0,
+        pin_continuation: shutdownGit?.pendingArchivedPinContinuations() ?? 0,
+      }),
+    });
+    return deadlineAt;
+  };
   for (const sig of ["SIGINT", "SIGTERM"] as const) {
     process.on(sig, () => {
       shutdownSignal = sig;
-      if (shutdownDeadlineAt === undefined && !shutdownBarrierStarted) {
-        shutdownDeadlineAt = Date.now() + SHUTDOWN_RESULT_DEADLINE_MS;
-        armShutdownResultDeadline({
-          deadlineAt: shutdownDeadlineAt, log: shutdownLog,
-          snapshot: () => shutdownAuthority?.snapshot({
-            unsettled_delete: shutdownGit?.unsettledDeleteCount() ?? 0,
-            pin_continuation: shutdownGit?.pendingArchivedPinContinuations() ?? 0,
-          }),
-        });
-      }
+      if (!shutdownBarrierStarted) armShutdownObserver();
       fatalLog?.info("shutting down", { signal: sig, phase: lifecyclePhase, cause: "signal" });
       try { shutdownRuntime?.(); } finally { controller.abort(); }
     });
@@ -593,9 +597,10 @@ async function mainBody(): Promise<void> {
   shutdownGit = git;
   // issue #4066: every graceful exit below runs this barrier before its stop log (join, seal, drain, one decision).
   const finishShutdown = async (): Promise<ShutdownGate> => {
+    // Every barrier entry is observed, including worker_returned with no signal.
+    const deadlineAt = shutdownBarrierStarted ? (shutdownDeadlineAt as number) : armShutdownObserver();
     shutdownBarrierStarted = true;
-    shutdownDeadlineAt ??= Date.now() + SHUTDOWN_RESULT_DEADLINE_MS;
-    return finishWorkerShutdown({ authority, git, deadlineAt: shutdownDeadlineAt, log });
+    return finishWorkerShutdown({ authority, git, deadlineAt, log });
   };
 
   // PRD #1809 D6: the data-volume guard. It classifies a failed write as data-volume disk-full

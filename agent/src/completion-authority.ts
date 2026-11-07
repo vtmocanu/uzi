@@ -429,6 +429,12 @@ async function readHead(init: StoreIdentity, shard: string): Promise<Map<string,
   return new Map(Object.entries(head.slots));
 }
 
+/**
+ * A refusal raised AFTER a durable write already renamed a file into place (a read-back that differs). Unlike a
+ * pre-write refusal it may leave a partly landed admission, so the runtime counts it as uncertain enrollment.
+ */
+export class AuthorityPostWriteRefusal extends AuthorityRefusal {}
+
 async function writeHead(
   ops: AuthorityFsOps, init: StoreIdentity, shard: string, heads: ReadonlyMap<string, number>,
 ): Promise<void> {
@@ -436,7 +442,7 @@ async function writeHead(
   const dir = path.join(init.dir, HEADS_DIR);
   await writeDurable(ops, dir, init.uid, `${shard}.json`, content);
   if (await readRegular(path.join(dir, `${shard}.json`), init.uid, init.maxHeadBytes) !== content) {
-    throw new AuthorityRefusal("authority head did not read back");
+    throw new AuthorityPostWriteRefusal("authority head did not read back");
   }
 }
 
@@ -955,7 +961,7 @@ export class AuthorityStore {
     sealHead(this.#identityOf(), shard, head);
     await writeDurable(this.#init.ops, dir, this.#init.uid, `${body.key}.json`, content);
     const back = await readRegular(path.join(dir, `${body.key}.json`), this.#init.uid, MAX_SLOT_BYTES);
-    if (back !== content) throw new AuthorityRefusal("authority slot did not read back");
+    if (back !== content) throw new AuthorityPostWriteRefusal("authority slot did not read back");
     this.#highWater.set(body.key, body.seq);
     await writeHead(this.#init.ops, this.#identityOf(), shard, head);
   }

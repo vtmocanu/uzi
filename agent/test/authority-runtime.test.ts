@@ -1010,6 +1010,8 @@ interface FaultControl {
   renames: number;
   failWhen: ((nth: number) => boolean) | undefined;
   pause: { hit: () => void; release: Promise<void> } | undefined;
+  /** Runs after the real rename of the nth counted rename (to mutate what landed). */
+  afterRename?: ((nth: number, to: string) => Promise<void>) | undefined;
 }
 
 interface FaultRig extends Rig {
@@ -1035,6 +1037,7 @@ async function faultRig(t: TestContext, extra: Partial<AuthorityRuntimeOptions> 
         await pause.release;
       }
       await fsp.rename(from, to);
+      await ctl.afterRename?.(ctl.renames, to);
     },
   };
   const warns: string[] = [];
@@ -1334,6 +1337,18 @@ describe("issue #4066: what keeps a shutdown from being drained", () => {
     assert.deepEqual(await incompleteReasons(f), ["enrollment_uncertain"]);
   });
 
+  it("an admission whose head did not read back after its durable write is enrollment_uncertain", async (t) => {
+    const f = await faultRig(t);
+    await f.warm();
+    f.ctl.renames = 0;
+    f.ctl.afterRename = async (nth, to) => {
+      if (nth === 2) await fsp.appendFile(to, " "); // the head landed, then differs on read-back
+    };
+    await assert.rejects(f.rt.withTransaction(() => f.rt.hooks.admitSourceUse(f.clone + "-b", "seed-attempt")), /authority head did not read back/);
+    f.ctl.afterRename = undefined;
+    assert.deepEqual(await incompleteReasons(f), ["enrollment_uncertain"]);
+  });
+
   it("a clean refusal is not counted as an uncertain enrollment", async (t) => {
     const f = await faultRig(t);
     await f.warm();
@@ -1429,6 +1444,10 @@ describe("issue #4066: finishWorkerShutdown", () => {
     assert.deepEqual(decision[0]!.fields.operations, [slot!.pending!.operation]);
     assert.equal(decision[0]!.level, "warn");
     assert.ok(!JSON.stringify(decision[0]!.fields).includes(f.root), "no path in the decision");
+    // Fail closed across the restart: the record is still running and a successor incarnation refuses the footprint.
+    assert.equal((await peek(f, f.clone))?.pending?.status, "running");
+    const successor = successorOf(f);
+    await assert.rejects(successor.withTransaction(() => successor.hooks.admitSourceUse(f.clone, "seed-canonical")), AuthorityRefusal);
   });
 
   it("the deadline observer reports once while a prerequisite is pending, sets exit 1 and the barrier then logs nothing more", async (t) => {
@@ -1454,6 +1473,42 @@ describe("issue #4066: finishWorkerShutdown", () => {
     assert.equal(logs.filter((l) => l.message === "worker_shutdown_result").length, 1, "decided once");
     observer.clear();
     second.clear();
+  });
+
+  it("the observer stays live through the final drain: an apply paused inside it past the deadline is reported once at the deadline (exit 1) and the later drain logs nothing more", async (t) => {
+    preserveExitCode(t);
+    const f = await faultRig(t, { lateWaitMs: 100 });
+    await f.warm();
+    let settlement!: AuthoritySettlement;
+    await f.rt.withTransaction(async () => { settlement = await f.rt.hooks.beginDestructive([f.clone], "runner-uid-delete"); });
+    const holder = await holdA(f.lifetime);
+    await settlement.settle({ ok: true }); // queued; the idle drain cannot take A and gives up
+    const written = gate();
+    const release = gate();
+    const { log, logs } = collect();
+    const deadlineAt = Date.now() + 600;
+    const observer = armShutdownResultDeadline({ deadlineAt, log });
+    const finishing = finishWorkerShutdown({ authority: f.rt, deadlineAt, log, testHooks: { onShutdownPhase: (phase: ShutdownPhase) => {
+      if (phase !== "final_drain_started") return;
+      // Only the FINAL drain can reach the write: A is freed now and the next rename pauses.
+      f.ctl.pause = { hit: () => written.resolve(), release: release.promise };
+      holder.release();
+    } } });
+    await written.promise;
+    const decisions = (): typeof logs => logs.filter((l) => l.message === "worker_shutdown_result");
+    assert.equal(decisions().length, 0, "nothing decided before the deadline");
+    await until(() => decisions().length === 1);
+    assert.equal(decisions()[0]!.fields.result, "incomplete");
+    assert.ok((decisions()[0]!.fields.reasons as string[]).includes("deadline"));
+    assert.equal(process.exitCode, 1);
+    assert.equal(await settle(finishing, 100), "pending", "the write is not cancelled");
+    release.resolve();
+    assert.deepEqual(await finishing, { result: "incomplete", exitCode: 1 });
+    assert.equal(decisions().length, 1, "no second result");
+    assert.equal(process.exitCode, 1);
+    assert.equal((await peek(f, f.clone))?.pending, null, "the paused write completed after release");
+    observer.clear();
+    await holder.done;
   });
 
   it("is idempotent per runtime: a second call returns the first call's result", async (t) => {

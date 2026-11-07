@@ -90,7 +90,7 @@ interface Observer {
   timer: NodeJS.Timeout | undefined;
   /** Set once a decision was logged (by the deadline or by the barrier). */
   decided: boolean;
-  /** The barrier reached its final drain: it is bounded by the same deadline and reports the reasons itself. */
+  /** The barrier reached its final drain: the prerequisites are joined, so the observer no longer reports prerequisite_pending. It stays live (first decision wins). */
   finalDrainStarted: boolean;
 }
 
@@ -126,13 +126,13 @@ export function armShutdownResultDeadline(options: ShutdownResultDeadlineOptions
     };
     armed.timer = setTimeout(() => {
       armed.timer = undefined;
-      if (armed.decided || armed.finalDrainStarted) return;
+      if (armed.decided) return;
       armed.decided = true;
       let snapshot: ShutdownSnapshot | undefined;
       try { snapshot = (armed.snapshot ?? boundSnapshot)?.(); } catch { snapshot = undefined; }
       const decision: ShutdownResult = {
         result: "incomplete",
-        reasons: orderedReasons(["deadline", "prerequisite_pending", ...(snapshot?.reasons ?? [])]),
+        reasons: orderedReasons(["deadline", ...(armed.finalDrainStarted ? [] : ["prerequisite_pending" as const]), ...(snapshot?.reasons ?? [])]),
         counts: snapshot?.counts ?? {},
         operations: (snapshot?.operations ?? []).slice(0, MAX_OPERATIONS),
         elapsed_ms: Date.now() - armed.armedAt,
@@ -167,7 +167,8 @@ export interface FinishWorkerShutdownOptions {
  *     abandoned pin continuations, each through its authority settle), every outermost transaction and every inline
  *     apply - with no timeout (the observer reports past the deadline, nothing is cancelled);
  *  3. seal (a new outermost transaction is refused with AuthorityShutdownRefusal);
- *  4. drain what is queued, bounded by the deadline;
+ *  4. drain what is queued (the wait is bounded by the deadline; an apply already running is not, so the observer
+ *     stays live through this step and reports at the deadline if the drain has not decided);
  *  5. log the decision once (unless the observer already did), incomplete => process.exitCode = 1;
  *  6. join whatever is still running without starting anything.
  * Never throws; a second call for the same runtime returns the first call's result.
@@ -207,7 +208,7 @@ async function runBarrier(options: FinishWorkerShutdownOptions): Promise<Shutdow
     // 3. Seal.
     authority.sealForShutdown();
     await phase("sealed");
-    // 4. The final drain, bounded by the deadline. The observer leaves the decision to us from here on.
+    // 4. The final drain. The observer stays live: whichever of the drain and the observer decides first logs once.
     if (watching !== undefined) watching.finalDrainStarted = true;
     await phase("final_drain_started");
     const drained = await authority.drainForShutdown({ deadlineAt, external });

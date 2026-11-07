@@ -7,7 +7,7 @@ import {
   type AuthorityTransaction, type WorkerLifetime,
 } from "./authority-lock.js";
 import {
-  leaseEpoch, leaseHarness, openAuthorityStore, peekAuthoritySlot, processWorkerIncarnation,
+  AuthorityPostWriteRefusal, leaseEpoch, leaseHarness, openAuthorityStore, peekAuthoritySlot, processWorkerIncarnation,
   type AuthorityFsOps, type AuthorityStore, type EndedSlotReceipt, type SlotCohort, type SlotSnapshot, type SourceUseLease,
 } from "./completion-authority.js";
 import {
@@ -589,7 +589,8 @@ export class AuthorityRuntime implements AuthorityScope {
 
   /**
    * The final drain, after {@link sealForShutdown}: apply every queued settlement and source-use end, then wait
-   * (bounded by `deadlineAt`) for every other obligation in the ledger to discharge. `drained` only when the
+   * (the WAIT is bounded by `deadlineAt`; an apply already running is not cancelled, so the caller's deadline observer
+   * in shutdown-barrier.ts is what reports a result past the deadline) for every other obligation in the ledger to discharge. `drained` only when the
    * ledger and the GitCache counters in `external` are all empty. It never opens the store or takes A when nothing is
    * queued, never takes A beneath another lock, and never touches another epoch. A pass waits for A at most
    * min(LATE_WAIT_MS, budget left) and failed passes back off 1s, 2s, 4s ... (ref'd timers, cleared before it returns);
@@ -629,7 +630,7 @@ export class AuthorityRuntime implements AuthorityScope {
       }
     } catch (error) {
       // Defensive: the barrier never throws. An unexpected failure is reported as an incomplete shutdown.
-      this.#options.log?.warn("the final authority drain failed unexpectedly", { error: error instanceof Error ? error.message : String(error) });
+      this.#options.log?.warn("the final authority drain failed unexpectedly", { error: error instanceof Error ? error.name : "non-error" });
       outcome = { result: "incomplete", ...evaluate() };
     }
     this.markShutdownDecided();
@@ -1249,13 +1250,13 @@ export class AuthorityRuntime implements AuthorityScope {
   }
 
   /**
-   * An admission or pending-record write that rejects with anything but a clean AuthorityRefusal may have partly
+   * An admission or pending-record write that rejects with anything but a clean pre-write AuthorityRefusal (a post-write read-back refusal is not clean) may have partly
    * landed (a slot renamed whose head was not written): it is counted so the shutdown result is not "drained".
    */
   async #enrolling<T>(write: Promise<T>): Promise<T> {
     try { return await write; }
     catch (error) {
-      if (!(error instanceof AuthorityRefusal)) { this.#uncertainEnrollment += 1; this.#notify(); }
+      if (!(error instanceof AuthorityRefusal) || error instanceof AuthorityPostWriteRefusal) { this.#uncertainEnrollment += 1; this.#notify(); }
       throw error;
     }
   }

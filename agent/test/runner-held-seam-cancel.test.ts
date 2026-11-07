@@ -7,7 +7,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { ExecutorResult, RunContext } from "../src/executor.js";
 import { GitCache, type AttemptSeedOptions } from "../src/git.js";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
-import { acquireWorkerLifetime, SourceUseHeldRefusal } from "../src/authority-lock.js";
+import { acquireWorkerLifetime, AuthorityShutdownRefusal, SourceUseHeldRefusal } from "../src/authority-lock.js";
 import { AuthorityRuntime } from "../src/authority-runtime.js";
 import { Outbox } from "../src/outbox.js";
 import { RecoveryCoordinator } from "../src/recovery.js";
@@ -540,6 +540,30 @@ describe("issue #3860: owner cancel at a held-predecessor refusal", { skip: !HAS
     assert.equal(api.ownershipRequests.includes(freshRunId), false, "no ownership cancel read for the fresh claim");
     assert.equal(api.states.some(s => s.runId === freshRunId && s.body.status === "failed"), false, "no failed report");
     assert.ok(r.lines.some(l => String((l as { msg?: string }).msg).includes("clone path held by an earlier flight")),
+      "the claim stopped through stopOnHeldSource");
+  });
+
+  it("issue #4066: a shutdown refusal at the retained predecessor admission is a nonterminal stop, never preservation_failed", async t => {
+    const r = await rig(t, { site: "B", iid: 4066, outbox: "ok" });
+    t.mock.method(r.runner as Priv, "admitPredecessorSource", async () => { throw new AuthorityShutdownRefusal(); });
+    await r.run();
+    assert.equal(r.started(), 0, "no executor");
+    assert.equal(r.failed().length, 0, "no failed report (preservation_failed would be one)");
+    assert.equal(r.seamCalls(), 0, "it is not the held-source seam");
+    assert.ok(r.lines.some(l => String((l as { msg?: string }).msg).includes("the worker is shutting down; stopping claim for retry")),
+      "the claim stopped through the shutdown branch");
+    assert.equal(treeHash(r.pred.clonePath), r.before, "custody and clone untouched");
+  });
+
+  it("issue #4066: a shutdown refusal on a fresh claim's seed stops through stopOnHeldSource", async t => {
+    const r = await rig(t, { site: "B", iid: 4067, outbox: "ok" });
+    const freshRunId = randomUUID();
+    t.mock.method(r.runner as Priv, "runnerCloneForClaim", async () => { throw new AuthorityShutdownRefusal(); });
+    api.setOwnershipStatus(freshRunId, "running", 2);
+    await r.runner.execute(gitlabClaim(4068, { run_id: freshRunId, claim_generation: 2 }));
+    assert.equal(r.started(), 0);
+    assert.equal(api.states.some(s => s.runId === freshRunId && s.body.status === "failed"), false, "no failed report");
+    assert.ok(r.lines.some(l => String((l as { msg?: string }).msg).includes("authority sealed for worker shutdown; stopping claim for retry")),
       "the claim stopped through stopOnHeldSource");
   });
 

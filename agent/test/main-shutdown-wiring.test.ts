@@ -49,8 +49,8 @@ describe("issue #4066: main.ts runs the shutdown barrier", () => {
     const wrapper = afterAuthority.slice(afterAuthority.indexOf("const finishShutdown"));
     const body = blockAt(wrapper, 0);
     assert.equal([...body.matchAll(/finishWorkerShutdown\(/g)].length, 1);
-    assert.match(body, /finishWorkerShutdown\(\{ authority, git, deadlineAt: shutdownDeadlineAt, log \}\)/);
-    assert.match(body, /shutdownDeadlineAt \?\?= Date\.now\(\) \+ SHUTDOWN_RESULT_DEADLINE_MS/, "no signal: the deadline starts at the barrier");
+    assert.match(body, /finishWorkerShutdown\(\{ authority, git, deadlineAt, log \}\)/);
+    assert.match(body, /armShutdownObserver\(\)/, "no signal: the deadline starts (and is observed) at the barrier");
   });
 
   it("has no bare return after the authority runtime exists that skips the barrier", () => {
@@ -62,11 +62,18 @@ describe("issue #4066: main.ts runs the shutdown barrier", () => {
 
   it("arms the deadline observer on the first signal and a repeated signal resets nothing", () => {
     const handler = blockAt(mainBody, mainBody.indexOf("process.on(sig"));
-    assert.match(handler, /shutdownDeadlineAt === undefined && !shutdownBarrierStarted/);
-    assert.match(handler, /shutdownDeadlineAt = Date\.now\(\) \+ SHUTDOWN_RESULT_DEADLINE_MS/);
-    assert.match(handler, /armShutdownResultDeadline\(/);
-    assert.ok(handler.indexOf("armShutdownResultDeadline(") < handler.indexOf("shutdownRuntime?.()"), "armed before the runtime is told to shut down");
+    assert.match(handler, /!shutdownBarrierStarted\) armShutdownObserver\(\)/);
+    assert.ok(handler.indexOf("armShutdownObserver(") < handler.indexOf("shutdownRuntime?.()"), "armed before the runtime is told to shut down");
+    const arm = blockAt(mainBody, mainBody.indexOf("const armShutdownObserver"));
+    assert.match(arm, /shutdownDeadlineAt \?\?= Date\.now\(\) \+ SHUTDOWN_RESULT_DEADLINE_MS/);
+    assert.match(arm, /armShutdownResultDeadline\(/);
     assert.match(source, /const SHUTDOWN_RESULT_DEADLINE_MS = 35_000;/);
+  });
+
+  it("arms the observer inside finishShutdown so every barrier entry (worker_returned included) is observed", () => {
+    const finish = blockAt(mainBody, mainBody.indexOf("const finishShutdown"));
+    assert.match(finish, /armShutdownObserver\(\)/);
+    assert.ok(finish.indexOf("armShutdownObserver(") < finish.indexOf("finishWorkerShutdown("), "armed before the barrier runs");
   });
 
   it("tells the authority runtime the budget when the runtime shuts down", () => {

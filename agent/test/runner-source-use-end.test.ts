@@ -15,7 +15,8 @@ import { portableTeardownTestDeps } from "./teardown-fixtures.js";
 import { followSuccessfulPush } from "./publication-fixture.js";
 import { testLockOptions } from "./authority-test-support.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
-import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
+import { noProofReseed, nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
+import type { Logger } from "../src/log.js";
 import {
   api, client, fakeGitlab as rawFakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith,
 } from "./runner-harness.js";
@@ -72,11 +73,11 @@ function stopAfterSeed(onRun: () => void = () => {}): (runId: string) => { homeD
 }
 
 /** A runner whose GitCache (carrying the authority hooks, required) is passed through the constructor. */
-function runnerOnHookedGit(r: Rig, makeExecutor: (runId: string) => { homeDir: string; executor: Executor }): RunRunner {
+function runnerOnHookedGit(r: Rig, makeExecutor: (runId: string) => { homeDir: string; executor: Executor }, logger: Logger = nullLogger()): RunRunner {
   const hooked = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({
     authority: r.rt.hooks, authorityRequired: true, gitleaksBin: defaultGitleaksShim(),
   }));
-  return new RunRunner(client, hooked, makeExecutor, nullLogger(), 20, undefined, {
+  return new RunRunner(client, hooked, makeExecutor, logger, 20, undefined, {
     pollMs: 5,
     planApprovalTimeoutMs: 0,
     questionTimeoutMs: 600,
@@ -428,6 +429,53 @@ describe("sink retirement and ownership at a flight's teardown", () => {
     assert.equal(slot?.state, "active", "the earlier flight's epoch is untouched");
     assert.equal(slot?.epoch, epoch);
     assert.equal(r.rt.heldByOtherSink(canonical, new Set()), true, "the earlier flight still owns the key");
+  });
+
+  it("issue #4066: a seed refused because the authority is sealed for shutdown stops quietly (stopOnHeldSource)", async () => {
+    const r = await rig();
+    const iid = 406601;
+    const bare = await git.ensureClone(fx.originPath);
+    fs.mkdirSync(path.dirname(git.runnerClonePath(bare, `issue-${iid}`)), { recursive: true });
+    let started = 0;
+    const claim = gitlabClaim(iid, { run_id: randomUUID() });
+    const runner = runnerOnHookedGit(r, stopAfterSeed(() => { started++; }));
+    r.rt.sealForShutdown();
+    await runner.execute(claim);
+    assert.equal(started, 0, "no model work");
+    assert.equal(failed(claim.run_id), false, "a shutdown refusal is never a failed report");
+  });
+
+  it("issue #4066: a re-seed after a reclaimed terminal orphan refused by a sealed authority stops quietly", async (t) => {
+    const r = await rig();
+    const iid = 406602;
+    const bare = await git.ensureClone(fx.originPath);
+    const canonical = git.runnerClonePath(bare, `issue-${iid}`);
+    fs.mkdirSync(path.dirname(canonical), { recursive: true });
+    const claim = gitlabClaim(iid, { run_id: randomUUID() });
+    const branch = `agent/issue-${iid}`;
+    let started = 0;
+    const { logger, lines } = recordingLogger();
+    const runner = runnerOnHookedGit(r, stopAfterSeed(() => { started++; }), logger);
+    // The reclaim itself is stubbed as succeeded, so the re-seed runs in reseedAfterReclaim (not the loop's retry).
+    t.mock.method(runner as unknown as { reclaimTerminalOrphan(): Promise<void> }, "reclaimTerminalOrphan", async () => undefined);
+    const internals = runner as unknown as { runnerCloneForClaim(...args: unknown[]): Promise<unknown> };
+    const real = internals.runnerCloneForClaim.bind(runner);
+    let calls = 0;
+    internals.runnerCloneForClaim = async (...args) => {
+      if (++calls === 1) throw new ForeignCaptureBlockedError(canonical, branch, randomUUID());
+      r.rt.sealForShutdown(); // the worker begins leaving between the reclaim and the re-seed
+      return real(...args);
+    };
+    let tornDown: { retainedLocalCustody?: boolean } | undefined;
+    const sealed = runner as unknown as { endFlightSourceUse(flight: object, log: unknown): Promise<void> };
+    const endFlight = sealed.endFlightSourceUse.bind(runner);
+    sealed.endFlightSourceUse = async (flight, log) => { tornDown = flight; return endFlight(flight, log); };
+    await runner.execute(claim);
+    assert.equal(calls, 2, "the re-seed after the reclaim was attempted");
+    assert.equal(tornDown?.retainedLocalCustody, true, "stopped through stopOnHeldSource: custody retained");
+    assert.ok((lines as Array<{ msg?: string }>).some((l) => l.msg === "authority sealed for worker shutdown; stopping claim for retry"));
+    assert.equal(started, 0, "no model work");
+    assert.equal(failed(claim.run_id), false, "no failed report");
   });
 });
 
