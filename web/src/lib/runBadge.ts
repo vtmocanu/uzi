@@ -172,6 +172,7 @@ const PARK_LABELS = {
   worker_memory_pressure: "memory pressure: owner hold",
   paused: "paused",
   credential_disabled: "waiting: credential disabled",
+  credentials_reset: "waiting: credentials were reset",
   iteration_budget_exhausted: "Iteration limit reached",
   provider_unavailable: "provider unavailable: owner hold",
   codex_policy_hold: "Codex policy hold",
@@ -254,6 +255,8 @@ export function effectiveRunStatus(
   // and the board card's LatestRun (the server's board projection sends hold_reason on every
   // card, so runBadge meets this key too).
   if (run.status === "paused" && run.hold_reason === "credential_disabled") return "credential_disabled";
+  // PRD #3989 M3: parked because an admin reset the owner's account deleted every credential.
+  if (run.status === "paused" && run.hold_reason === "credentials_reset") return "credentials_reset";
   // Integrity refusal is always owner-held, even if a malformed DTO carries a retry stamp.
   if (run.status === "recovery_wait" && run.recovery_wait_cause === "retained_recovery_adoption_failed") return "retained_recovery_adoption_failed";
   // Owner-only, no timer: the claimed flight was never witnessed, so the server released the
@@ -397,7 +400,7 @@ export function runStatusTone(
   if (status === "completion_blocked") return "warning";
   // PRD #1732: held on a disabled credential. Warn like the other involuntary holds.
   if (status === "iteration_budget_exhausted") return "warning";
-  if (status === "credential_disabled" || status === "provider_unavailable" || status === "codex_policy_hold" || status === "base_attestation_missing" || status === "repo_agent_source_unavailable" || status === "provider_outage") return "warning";
+  if (status === "credential_disabled" || status === "credentials_reset" || status === "provider_unavailable" || status === "codex_policy_hold" || status === "base_attestation_missing" || status === "repo_agent_source_unavailable" || status === "provider_outage") return "warning";
   // Issue #3181: both token-switch holds wait on something outside the run; warn, never danger.
   if (status === "credential_switch_settling" || status === "credential_switch_unsettled") return "warning";
   if (status === "awaiting_approval" || status === "awaiting_input")
@@ -829,6 +832,14 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
         tone: "warning",
         pulse: false,
         title: "A credential this run needs is disabled. It resumes by itself when you enable it.",
+      };
+    case "credentials_reset":
+      return {
+        kind: "badge",
+        label: PARK_LABELS.credentials_reset,
+        tone: "warning",
+        pulse: false,
+        title: "An admin reset this account and its credentials were deleted. The run resumes by itself once you add a credential in Settings.",
       };
     case "running":
       // The running elapsed moved OUT of the badge to the uniform per-card duration

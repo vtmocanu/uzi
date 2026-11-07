@@ -2,7 +2,12 @@ import { describe, expect, it } from "vitest";
 import type { RecoveryCustodyHold, RecoveryCustodyHolds, RunStatus, RunSummaryItem } from "./api";
 import {
   decisionCount,
+  decisionRows,
+  GROUP_BUTTON,
+  GROUP_PREVIEW,
+  groupTitle,
   mergeOverviewRows,
+  planDetail,
   openPrs,
   overviewCounts,
   overviewDecisions,
@@ -176,6 +181,7 @@ describe("parkDisposition", () => {
     ["provider_unavailable", { status: "paused", hold_reason: "provider_unavailable" }, "owner"],
     ["base_attestation_missing", { status: "paused", hold_reason: "base_attestation_missing" }, "owner"],
     ["credential_disabled", { status: "paused", hold_reason: "credential_disabled" }, "owner"],
+    ["credentials_reset", { status: "paused", hold_reason: "credentials_reset" }, "owner"],
     ["completion_blocked", { status: "paused", completion_phase: "blocked" }, "owner"],
     ["worker_requeue_exhausted", { status: "recovery_wait", recovery_wait_cause: "worker_requeue_exhausted" }, "owner"],
     ["worker_memory_pressure", { status: "recovery_wait", recovery_wait_cause: "worker_memory_pressure" }, "owner"],
@@ -281,6 +287,18 @@ describe("overviewDecisions", () => {
       ["park", "Resume", at(3)],
       ["pr", "Review PR", at(2)],
     ]);
+  });
+
+  it("puts held work first and open PRs last, oldest first inside a kind (#4041)", () => {
+    const got = overviewDecisions(
+      [
+        run({ id: "pr-new", status: "completed", kind: "issue", mr_iid: 2, mr_state: "opened", repo_id: "r", created_at: at(1), finished_at: at(7) }),
+        run({ id: "pr-old", status: "completed", kind: "issue", mr_iid: 1, mr_state: "opened", repo_id: "r", created_at: at(1), finished_at: at(2) }),
+        run({ id: "plan", status: "awaiting_approval", status_since: at(3) }),
+      ],
+      heldHolds({ open_holds: 1, decision_needed: 1 }, [decisionHold("h", at(0))]),
+    );
+    expect(got.map((d) => (d.kind === "held" ? "held" : runOf(d).id))).toEqual(["held", "plan", "pr-old", "pr-new"]);
   });
 
   it("orders unparseable timestamps deterministically: last, in input order", () => {
@@ -414,7 +432,7 @@ describe("overviewDecisions held work", () => {
     expect(got).toMatchObject([{ since: T2 }]);
   });
 
-  it("places the held row after park and before pr", () => {
+  it("places the held row first, before plan, park and pr", () => {
     const got = overviewDecisions(
       [
         run({ id: "pr", status: "completed", kind: "issue", mr_iid: 1, mr_state: "opened", created_at: T1, finished_at: T1 }),
@@ -423,7 +441,127 @@ describe("overviewDecisions held work", () => {
       ],
       heldHolds({ open_holds: 1, decision_needed: 1 }, [decisionHold("h", T1)]),
     );
-    expect(got.map((d) => d.kind)).toEqual(["plan", "park", "held", "pr"]);
+    expect(got.map((d) => d.kind)).toEqual(["held", "plan", "park", "pr"]);
+  });
+});
+
+describe("decisionRows", () => {
+  const T = "2026-07-05T10:00:00Z";
+  const prRun = (id: string, iid: number) =>
+    run({ id, status: "completed", kind: "issue", mr_iid: iid, mr_state: "opened", repo_id: "r", created_at: T });
+  const holds = heldHolds({ open_holds: 1, decision_needed: 1 }, [decisionHold("h", T)]);
+  const rowsOf = (runs: RunSummaryItem[], h?: RecoveryCustodyHolds) => decisionRows(overviewDecisions(runs, h));
+
+  it("keeps a lone plan, question or park as a single row", () => {
+    for (const r of [
+      run({ status: "awaiting_approval" }),
+      run({ status: "awaiting_input" }),
+      run({ status: "paused" }),
+    ]) {
+      const rows = rowsOf([r]);
+      expect(rows).toHaveLength(1);
+      expect(rows[0].type).toBe("single");
+    }
+  });
+
+  it("groups two plans", () => {
+    const rows = rowsOf([run({ id: "a", status: "awaiting_approval" }), run({ id: "b", status: "awaiting_approval" })]);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ type: "group", kind: "plan" });
+    expect(rows[0].type === "group" && rows[0].items).toHaveLength(2);
+  });
+
+  it("groups awaiting_input and awaiting_followup into one question group, both verbed Answer", () => {
+    const rows = rowsOf([run({ id: "a", status: "awaiting_input" }), run({ id: "b", status: "awaiting_followup" })]);
+    expect(rows).toHaveLength(1);
+    const row = rows[0];
+    if (row.type !== "group") throw new Error("expected a group");
+    expect(row.kind).toBe("question");
+    expect(row.items.map((i) => i.verb)).toEqual(["Answer", "Answer"]);
+  });
+
+  it("always groups open PRs, even a single one", () => {
+    const rows = rowsOf([prRun("a", 1)]);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ type: "group", kind: "pr" });
+  });
+
+  it("turns held work into a held row", () => {
+    const rows = rowsOf([], holds);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].type).toBe("held");
+  });
+
+  it("orders rows held, plan, question, park, pr", () => {
+    const rows = rowsOf(
+      [
+        prRun("pr", 1),
+        run({ id: "park", status: "paused" }),
+        run({ id: "q", status: "awaiting_input" }),
+        run({ id: "plan", status: "awaiting_approval" }),
+      ],
+      holds,
+    );
+    expect(rows.map((r) => (r.type === "group" ? `group:${r.kind}` : r.type === "single" ? r.item.kind : r.type))).toEqual([
+      "held",
+      "plan",
+      "question",
+      "park",
+      "group:pr",
+    ]);
+  });
+
+  it("does not change decisionCount: it counts items, not rows", () => {
+    const items = overviewDecisions([
+      run({ status: "awaiting_approval" }),
+      run({ status: "awaiting_approval" }),
+      run({ status: "awaiting_input" }),
+      prRun("pr", 1),
+    ]);
+    expect(decisionRows(items)).toHaveLength(3);
+    expect(decisionCount(items)).toBe(3);
+  });
+});
+
+describe("groupTitle and GROUP_BUTTON", () => {
+  it("reads singular for one and plural otherwise, per kind", () => {
+    expect(groupTitle("plan", 1)).toBe("1 plan is ready for review");
+    expect(groupTitle("plan", 3)).toBe("3 plans are ready for review");
+    expect(groupTitle("question", 1)).toBe("1 run needs your input");
+    expect(groupTitle("question", 2)).toBe("2 runs need your input");
+    expect(groupTitle("park", 1)).toBe("1 run waits on you");
+    expect(groupTitle("park", 4)).toBe("4 runs wait on you");
+    expect(groupTitle("pr", 1)).toBe("1 pull request is open for your review");
+    expect(groupTitle("pr", 5)).toBe("5 pull requests are open for your review");
+  });
+
+  it("names the group buttons and the preview size", () => {
+    expect(GROUP_BUTTON).toEqual({ plan: "Review plans", question: "Open runs", park: "Resume runs", pr: "Review PRs" });
+    expect(GROUP_PREVIEW).toBe(3);
+  });
+});
+
+describe("planDetail", () => {
+  const ms = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `M${i + 1}`, title: `m${i + 1}` }));
+  const detail = (over: Record<string, unknown>) => planDetail(over as Parameters<typeof planDetail>[0]);
+
+  it("prefers the candidate milestones", () => {
+    expect(detail({ milestones: ms(2), milestones_candidate: ms(4) })).toBe("Plan ready, 4 milestones");
+  });
+
+  it("falls back to the frozen milestones when the candidate is null or absent", () => {
+    expect(detail({ milestones: ms(2), milestones_candidate: null })).toBe("Plan ready, 2 milestones");
+    expect(detail({ milestones: ms(2) })).toBe("Plan ready, 2 milestones");
+  });
+
+  it("says just Plan ready with no milestones, and an empty candidate does not fall back", () => {
+    expect(detail({ milestones: null, milestones_candidate: null })).toBe("Plan ready");
+    expect(detail({})).toBe("Plan ready");
+    expect(detail({ milestones: ms(2), milestones_candidate: [] })).toBe("Plan ready");
+  });
+
+  it("is singular for one milestone", () => {
+    expect(detail({ milestones: null, milestones_candidate: ms(1) })).toBe("Plan ready, 1 milestone");
   });
 });
 

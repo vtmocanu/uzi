@@ -107,6 +107,8 @@ func (h *Handler) writeSetRunCredentialError(w http.ResponseWriter, err error) {
 		httpx.Error(w, http.StatusConflict, workersvc.ErrRunHoldSettling.Error())
 	case errors.Is(err, workersvc.ErrBaseAttestationHeld):
 		httpx.Error(w, http.StatusConflict, err.Error())
+	case errors.Is(err, workersvc.ErrCredentialsResetHeld):
+		httpx.Error(w, http.StatusConflict, workersvc.ErrCredentialsResetHeld.Error())
 	case errors.Is(err, workersvc.ErrDataVolumeFullHeld):
 		httpx.Error(w, http.StatusConflict, workersvc.ErrDataVolumeFullHeld.Error())
 	case errors.Is(err, workersvc.ErrForgeUnreachableHeld):

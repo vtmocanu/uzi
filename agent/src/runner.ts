@@ -26,7 +26,7 @@ import type { CapturedMemoryContext } from "./codex/broker.js";
 import type { BaseAttestationHoldOutcome, MemoryIncarnation, MemoryParkReference, WorkerMemoryPressureResult } from "./protocol.js";
 import { BASE_ATTESTATION_HOLD_REASON, CAPABILITY_INFERENCE_EVIDENCE_FEATURE, REPO_AGENT_SOURCE_FEATURE, REPO_AGENT_SOURCE_HOLD_REASON } from "./protocol.js";
 import { PublicationContextLatch, publicationContextReason } from "./publication-context.js";
-import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, HELD_PUBLICATION_FEATURE, CHECKPOINT_PUBLISH_TIMEOUT_MS, CREDENTIAL_SWITCH_HOLD_FEATURE, CLARIFICATION_REVISION_SETTLEMENT_FEATURE } from "./client.js";
+import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, isTransientStatus, HELD_PUBLICATION_FEATURE, CHECKPOINT_PUBLISH_TIMEOUT_MS, CREDENTIAL_SWITCH_HOLD_FEATURE, CLARIFICATION_REVISION_SETTLEMENT_FEATURE } from "./client.js";
 import type { ClarificationSettlement } from "./protocol.js";
 import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
 import { MaintenanceBudget, RetainedSwitchSettlement } from "./maintenance-budget.js";
@@ -39,6 +39,8 @@ import type { CheckpointPublicationContext, PushPublicationContext, RemediationR
 import {
   CheckpointSoftDeadlineError,
   RecoveryChargeInterruptedError,
+  RecoveryBudgetExhaustedError,
+  RecoveryDeadlineExhaustedError,
   RetainedReadinessCleanupUnconfirmedError,
   formatRetainedRecoveryDiagnostic,
   annotateRetainedSuccessorError,
@@ -1372,6 +1374,8 @@ class RetainedSeedCapacityShortfall extends Error {
 }
 
 const RETAINED_EXHAUSTED_FEATURE = "recovery_cause_retained_recovery_exhausted";
+/** Issue #4046: the api holds a capacity-only exhaustion park for the owner instead of retrying it on a timer. */
+const RETAINED_CAPACITY_HOLD_FEATURE = "retained_recovery_capacity_hold_v1";
 
 /* issue #2969: the time budget of the predecessor FINAL pass a retained re-claim runs before it prepares its successor
  * (disabled in production; see settlePredecessorHolds).
@@ -8828,7 +8832,10 @@ export class RunRunner {
   /**
    * PRD #1392 M2 — send the forge park report ONCE and dispatch on the ack (D10). A generic 400
    * (an api that rejects the fields) → today's failed path, never park. A transport failure AFTER
-   * the send is an UNKNOWN outcome, never a failure: reconcile via the ownership probe.
+   * the send is an UNKNOWN outcome, never a failure: reconcile via the ownership probe. Inside that
+   * reconcile a probe 404 is a stale owner (stop, HOME cleaned); any other definitive 4xx (not
+   * 408/429) on the probe, or any definitive 4xx other than 400 on a resend exception, is a conservative stop (no park, no terminal report, no custody
+   * settle; a 401/403 is not proof ownership ended); 408/429/5xx/transport failures retry with backoff.
    */
   private async reportForgeParkAndDispatch(
     body: StateRequest,
@@ -9011,7 +9018,10 @@ export class RunRunner {
    * → the transaction did not land, resend the SAME (idempotent) report and dispatch its ack; an
    * authoritative terminal → today's cleanup (no park); a 404 (stale_claim / not owned / reclaimed)
    * → stop. A transport failure ON the probe is itself unknown, so retain the (possibly parked)
-   * session and retry — NEVER clean it — until the outcome is known.
+   * session and retry — NEVER clean it — until the outcome is known. Any OTHER definitive 4xx
+   * (not 408/429) on the probe, or on the resend (other than the 400 failed path), is a permanent
+   * refusal that no retry will change: stopForgeParkReconcileConservatively keeps the possibly parked
+   * session, source, records and custody, reports nothing, and leaves the run to the server or owner.
    */
   private async reconcileForgeParkByProbe(
     body: StateRequest,
@@ -9049,6 +9059,9 @@ export class RunRunner {
           });
           await batcher.close().catch(() => undefined);
           return "stop";
+        }
+        if (this.isDefinitiveApiRefusal(probeErr)) {
+          return await this.stopForgeParkReconcileConservatively(body, claim, flight, runLog, runHome, copy, "probe", probeErr);
         }
         runLog.warn(`${copy.log} reconcile: ownership probe failed transport; retrying`, {
           run_id: flight.runId,
@@ -9090,6 +9103,9 @@ export class RunRunner {
             });
             return "fail";
           }
+          if (this.isDefinitiveApiRefusal(reportErr)) {
+            return await this.stopForgeParkReconcileConservatively(body, claim, flight, runLog, runHome, copy, "resend", reportErr);
+          }
           runLog.warn(`${copy.log} reconcile: resend failed transport; re-probing`, {
             run_id: flight.runId,
             error: errMessage(reportErr),
@@ -9103,6 +9119,44 @@ export class RunRunner {
       // cancelStopsWait=false so a sticky cancel cannot turn this into a backoff-free retry storm.
       await this.waitRecoveryRetry(flight, false);
     }
+  }
+
+  /**
+   * A 4xx the api will answer the same way every time: a RequestError with a 4xx status that is not
+   * 408/429. The error's cause chain is deliberately not unwrapped, so the client's wrapped
+   * "publication park outcome uncertain" error stays retryable.
+   */
+  private isDefinitiveApiRefusal(err: unknown): err is RequestError {
+    return err instanceof RequestError && err.status >= 400 && err.status < 500 && !isTransientStatus(err.status);
+  }
+
+  /**
+   * A permanent 4xx on the park reconcile's probe or resend: ownership is unknown (a 401/403 does not
+   * prove it ended), so retain the possibly parked run without reporting a park or a terminal state, and
+   * without settling custody, retiring records or discarding the source. The resumable session is kept by
+   * the same D4 rule as a confirmed park; a publication-phase park also keeps its source and records.
+   */
+  private async stopForgeParkReconcileConservatively(
+    body: StateRequest,
+    claim: ClaimResponse,
+    flight: RunFlight,
+    runLog: Logger,
+    runHome: string | undefined,
+    copy: PreCloneParkCopy,
+    phase: "probe" | "resend",
+    err: RequestError,
+  ): Promise<"stop"> {
+    runLog.warn(`${copy.log} reconcile: ${phase} refused ${err.status} (permanent); ownership unknown, retaining without a park or terminal report`, {
+      run_id: flight.runId,
+      status: err.status,
+      error: errMessage(err),
+    });
+    await this.preserveForgeParkSessionIfResolvable(claim, flight, runLog, runHome);
+    if (body.recovery_phase === "publication") {
+      this.retainForPublicationReconciliation(flight, "ownership_refused");
+    }
+    await flight.batcher.close().catch(() => undefined);
+    return "stop";
   }
 
   /** Test seam: bounds and sleeps of the idempotent publication-intent retries. */
@@ -26421,9 +26475,9 @@ export class RunRunner {
 
   private async requireRetainedOwnership(flight: RunFlight, deadline = Date.now() + this.codexBoundaryDeadlineMs, signal = this.retainedLifecycleSignal(flight)): Promise<void> {
     this.retainedLifecycleGuard(flight);
-    if (deadline !== undefined && Date.now() >= deadline) throw new Error("recovery deadline exhausted");
+    if (deadline !== undefined && Date.now() >= deadline) throw new RecoveryDeadlineExhaustedError();
     const timeout = new AbortController();
-    const timer = setTimeout(() => timeout.abort(new Error("recovery deadline exhausted")), Math.max(0, deadline - Date.now()));
+    const timer = setTimeout(() => timeout.abort(new RecoveryDeadlineExhaustedError()), Math.max(0, deadline - Date.now()));
     const boundedSignal = AbortSignal.any([signal, timeout.signal]);
     let own;
     try {
@@ -26439,7 +26493,7 @@ export class RunRunner {
     if (own?.status !== "running" || own.claim_generation !== flight.claimGeneration) {
       throw new RetainedRecoveryStop();
     }
-    if (deadline !== undefined && Date.now() >= deadline) throw new Error("recovery deadline exhausted");
+    if (deadline !== undefined && Date.now() >= deadline) throw new RecoveryDeadlineExhaustedError();
   }
 
   /**
@@ -26469,11 +26523,17 @@ export class RunRunner {
     }
   }
 
-  /** Two identical reports and at most two ownership probes, under one boundary deadline.
+  /** Per pass, two identical reports and at most two ownership probes; a capacity-only (marked) pass that
+   * the api answers 400 is followed by at most one unmarked pass. All passes share one boundary deadline.
+   * In the caller's capacity-only witness comparison, the r.* === w.* checks duplicate the
+   * blockRecoveryEpisode fence and its readback on purpose (defence in depth, issue #4046), and
+   * observed === w.attempts and r.attempts === w.attempts together withhold the marker if any reservation
+   * in the window went unwitnessed.
    * Ownership only authorizes replay: only the report ACK's exact status/cause confirms.
    * Any unresolved outcome stops this flight without terminal reporting or releasing custody. */
   private async parkRetainedRecoveryExhausted(flight: RunFlight,
     cause: "retained_recovery_exhausted" | "retained_recovery_adoption_failed" = "retained_recovery_exhausted",
+    opts?: { capacityOnly?: boolean },
   ): Promise<boolean> {
     const deadline = Date.now() + this.codexBoundaryDeadlineMs;
     const timeout = new AbortController();
@@ -26482,12 +26542,20 @@ export class RunRunner {
     const signal = AbortSignal.any([this.retainedLifecycleSignal(flight), timeout.signal]);
     const body: StateRequest = { status: "recovery_wait", recovery_cause: cause,
       claim_generation: flight.claimGeneration };
-    try {
+    // Issue #4046: only the exhaustion cause can carry the capacity-only marker, and only to an api
+    // that advertised the hold. One body object serves both attempts so a replay is byte-identical.
+    const marked = opts?.capacityOnly === true && cause === "retained_recovery_exhausted" &&
+      this.client.hasFeature(RETAINED_CAPACITY_HOLD_FEATURE);
+    // One pass of the two-report loop. A 400 under `rejectToFallback` leaves the pass (the api may not
+    // understand the marker) and reports whether any earlier report in the pass was left unresolved.
+    const pass = async (reqBody: StateRequest, rejectToFallback: boolean, priorUncertain: boolean):
+      Promise<"confirmed" | "unmarked_bad_request" | { fallback: true; uncertain: boolean }> => {
+      let uncertain = priorUncertain;
       for (let attempt = 0; attempt < 2; attempt++) {
         this.retainedLifecycleGuard(flight);
         signal.throwIfAborted();
         try {
-          const ack = await flight.reportState(body, signal);
+          const ack = await flight.reportState(reqBody, signal);
           this.retainedLifecycleGuard(flight);
           if (ack.staleClaim || ack.reason === "stale_claim" || ack.credentialSwitch ||
               (ack.status !== undefined && ack.status !== "running" && ack.status !== "recovery_wait"))
@@ -26497,16 +26565,30 @@ export class RunRunner {
             throw new RetainedRecoveryStop();
           if (ack.status === "recovery_wait" && ack.recoveryCause === cause) {
             flight.parked = true;
-            return true;
+            return "confirmed";
           }
+          uncertain = true;
         } catch (error) {
           this.retainedLifecycleGuard(flight);
           if (error instanceof RetainedRecoveryStop || error instanceof CredentialSwitchSignal ||
               error instanceof StaleClaimError || isRunOwnershipLost(error, flight.runId)) throw error;
           if (error instanceof RequestError && error.status === 400) {
-            if (attempt === 0) return false;
-            throw new RetainedRecoveryStop();
+            if (rejectToFallback) return { fallback: true, uncertain };
+            // After an unresolved marked report the park may already have landed: never fail the run.
+            if (priorUncertain || attempt > 0) throw new RetainedRecoveryStop();
+            return "unmarked_bad_request";
           }
+          // The client wraps a 400 that followed an ambiguous attempt of the same call (one it retried)
+          // as an Error whose cause is that RequestError: the earlier send may have landed, but the
+          // api still refused the body it saw last, so the marked pass hands over to the unmarked pass as uncertain.
+          if (rejectToFallback && !(error instanceof RequestError) &&
+              error instanceof Error && error.cause instanceof RequestError && error.cause.status === 400) {
+            flight.runLog.warn("retained exhaustion park report unconfirmed; marked body refused after an ambiguous attempt", {
+              attempt, ...formatRetainedRecoveryDiagnostic(error, flight.redactText),
+            });
+            return { fallback: true, uncertain: true };
+          }
+          uncertain = true;
           flight.runLog.warn("retained exhaustion park report unconfirmed", {
             attempt, ...formatRetainedRecoveryDiagnostic(error, flight.redactText),
           });
@@ -26519,6 +26601,22 @@ export class RunRunner {
             (own.status !== "running" && own.status !== "recovery_wait")) throw new RetainedRecoveryStop();
       }
       throw new RetainedRecoveryStop();
+    };
+    try {
+      let uncertain = false;
+      if (marked) {
+        const outcome = await pass({ ...body, retained_capacity_only: true }, true, false);
+        if (outcome === "confirmed") {
+          flight.batcher.emit({ kind: "status", agent: "worker", payload: {
+            text: "retained recovery held for owner: every recovery attempt in this window was refused for data volume capacity; " +
+              "owner Resume required; predecessor work and custody retained",
+          } });
+          return true;
+        }
+        if (typeof outcome === "object") uncertain = outcome.uncertain;
+      }
+      const outcome = await pass(body, false, uncertain);
+      return outcome === "confirmed";
     } catch (error) {
       // In this reconciliation even cancellation must not enter the legacy dispatcher's
       // RetainedRecoveryCancelled terminal fallback. Other cancellation sites retain it.
@@ -26969,6 +27067,13 @@ export class RunRunner {
     let expectedSource = source;
     let episode = source.recovery;
     const finalize = new Error("retained recovery requires finalization");
+    // Issue #4046: in-memory tally of the reservations THIS flight positively witnessed in the window.
+    // A park may carry the capacity-only marker only when every consumed reservation ended in a data
+    // volume capacity refusal and the window began here (see the authorization in fail()).
+    let startedHere: boolean | undefined;
+    let lastWitnessed: Pick<import("./recovery-progress.js").RecoveryProgress, "startedAt" | "deadline" | "attempts" | "episode" | "claimGeneration"> | undefined;
+    let observed = 0;
+    let allCapacity = true;
     const fail = async (): Promise<never> => {
       this.retainedLifecycleGuard(flight);
       // Deadline expiry can reclassify a failed iteration, but only persisted readback
@@ -27077,7 +27182,14 @@ export class RunRunner {
       if (persistence === "" && persisted?.recovery?.stage === "blocked" && persisted.recovery.blocker === "budget_exhausted" &&
           Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0 &&
           this.client?.protocolFeatures?.includes(RETAINED_EXHAUSTED_FEATURE)) {
-        if (await this.parkRetainedRecoveryExhausted(flight)) throw new RetainedRecoveryStop();
+        const w = lastWitnessed;
+        const r = persisted.recovery;
+        const capacityOnly = blocker === "budget_exhausted" && startedHere === true && allCapacity &&
+          w !== undefined && observed >= 1 && observed === w.attempts &&
+          r.attempts === w.attempts && r.deadline === w.deadline && r.startedAt === w.startedAt &&
+          r.episode === w.episode && r.claimGeneration === w.claimGeneration;
+        if (await this.parkRetainedRecoveryExhausted(flight, "retained_recovery_exhausted", { capacityOnly }))
+          throw new RetainedRecoveryStop();
       }
       await this.reportGenericFailure(claim, flight,
         blocker === "quiescence_failed" ? new RunResidueBlockedError(reason) : new Error(reason),
@@ -27159,6 +27271,9 @@ export class RunRunner {
         this.retainedLifecycleGuard(flight);
         if (error instanceof RetainedRecoveryStop || error instanceof CredentialSwitchSignal) throw error;
         if (error instanceof RecoveryChargeInterruptedError) throw new RetainedRecoveryStop({ cause: error });
+        // A spent window or clock is not evidence against a capacity-only history; any other reservation
+        // failure is, because the journal may hold a reservation this flight never witnessed.
+        if (!(error instanceof RecoveryBudgetExhaustedError || error instanceof RecoveryDeadlineExhaustedError)) allCapacity = false;
         const message = errMessage(error);
         blocker = message.includes("clock") ? "clock_invalid" : message.includes("budget") || message.includes("blocked") ? "budget_exhausted" : "preservation_failed";
         flight.runLog.warn("retained recovery reservation failed", { ...formatRetainedRecoveryDiagnostic(error, flight.redactText), blocker });
@@ -27166,6 +27281,9 @@ export class RunRunner {
       }
       const iteration = reservation!;
       episode = iteration;
+      startedHere ??= iteration.attempts === 1;
+      lastWitnessed = { startedAt: iteration.startedAt, deadline: iteration.deadline, attempts: iteration.attempts,
+        episode: iteration.episode, claimGeneration: iteration.claimGeneration };
       try {
         await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), iteration.deadline, async signal => {
           const check = () => this.requireRetainedOwnership(flight, iteration.deadline, signal);
@@ -27499,6 +27617,8 @@ export class RunRunner {
       } catch (error) {
         this.retainedLifecycleGuard(flight);
         if (error instanceof RetainedRecoveryStop || error instanceof CredentialSwitchSignal) throw error;
+        observed++;
+        if (!(error instanceof RetainedSeedCapacityShortfall)) allCapacity = false;
         flight.runLog.warn("retained recovery iteration failed; reserved budget retained", {
           iteration: iteration.attempts, ...formatRetainedRecoveryDiagnostic(error, flight.redactText),
         });

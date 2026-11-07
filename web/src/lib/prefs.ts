@@ -132,3 +132,20 @@ export const judgeScope = {
     prefs.set<"mine" | "all">(JUDGE_SCOPE_KEY, scope);
   },
 };
+
+// #4052: the admin's remembered scope ("you" | "all") on the Overview preview's cards, one
+// key per card (Issue work, Usage). Same shape as judgeScope: a browser preference only,
+// never authoritative for access. Only an exact "all" reads as "all"; unset, unknown or
+// unreadable storage reads as "you" (prefs.get guards window and storage errors).
+export const ISSUE_WORK_SCOPE_KEY = "uzi.overviewIssueWorkScope";
+export const USAGE_SCOPE_KEY = "uzi.overviewUsageScope";
+
+export const overviewScope = {
+  get(key: string): "you" | "all" {
+    return prefs.get<"you" | "all">(key, "you") === "all" ? "all" : "you";
+  },
+  // set records the chosen scope; called only on a user's click.
+  set(key: string, scope: "you" | "all"): void {
+    prefs.set<"you" | "all">(key, scope);
+  },
+};

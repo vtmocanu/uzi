@@ -3276,6 +3276,12 @@ export interface StateRequest {
    *  Resume with a NULL retry time and unchanged count. The api 400s it with any other cause, and only accepts it once it
    *  advertises `recovery_cause_data_volume_full`. The disk-full handling (M5) never sends it. */
   disk_park_preventive?: boolean;
+  /** Issue #4046: qualifies a `recovery_cause: "retained_recovery_exhausted"` park. `true` says every
+   *  recovery reservation this flight positively witnessed in the window ended in a data volume capacity
+   *  refusal, so the api holds the run for the owner (uncounted, NULL retry time) instead of retrying on
+   *  a timer. Sent only when the api advertised `retained_recovery_capacity_hold_v1` at register; absent
+   *  is today's counted park. */
+  retained_capacity_only?: boolean;
   /** PRD #1809 D8: on a process-ending park report that published a checkpoint (the usage-limit
    *  park, the owner pause park, a recovery park including the mid-run `data_volume_full` one),
    *  whether that published checkpoint contains the run's latest committed work. `false` when the

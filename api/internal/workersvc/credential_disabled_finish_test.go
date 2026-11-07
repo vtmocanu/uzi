@@ -34,7 +34,7 @@ func TestFinishRunClaimCredentialDisabledParks(t *testing.T) {
 		if payload != nil || err != nil {
 			t.Fatalf("%v: finishRunClaim = (%v, %v), want an idle claim", assemblyErr, payload, err)
 		}
-		want := store.ParkCredentialDisabledRunParams{ID: run.ID, WorkerID: pgconv.UUID(id.workerID), ClaimGeneration: run.ClaimGeneration}
+		want := store.ParkCredentialDisabledRunParams{ID: run.ID, WorkerID: pgconv.UUID(id.workerID), ClaimGeneration: run.ClaimGeneration, HoldReason: "credential_disabled"}
 		if fs.claimCredParked == nil || *fs.claimCredParked != want {
 			t.Fatalf("%v: credential park = %+v, want %+v", assemblyErr, fs.claimCredParked, want)
 		}

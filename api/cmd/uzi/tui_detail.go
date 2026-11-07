@@ -1049,7 +1049,7 @@ func (m tuiModel) renderDetail() string {
 	} else if line := credentialSwitchHoldLine(d.run); line != "" {
 		// Issue #3181: a credential-switch hold is a server park, not an owner pause.
 		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 120)), m.width) + "\n")
-	} else if line := credentialDisabledLine(d.run); line != "" {
+	} else if line := credentialHoldLine(d.run); line != "" {
 		// PRD #1732 D14: a credential_disabled hold is a server park, not an owner pause, so it
 		// must not read "paused by you". Same slot and colour; clampVisual keeps it one row.
 		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 120)), m.width) + "\n")

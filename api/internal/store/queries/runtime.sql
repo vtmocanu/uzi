@@ -4254,6 +4254,8 @@ WITH candidates AS MATERIALIZED (
     WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.status = 'paused'
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
+  -- PRD #3989: a credentials_reset hold is released only by the credential promoter.
+  AND runs.hold_reason IS DISTINCT FROM 'credentials_reset'
   -- #3607 M2a: refuse ONLY an unresolved policy episode (its own owner resume is ResumePolicyHold).
   -- A resolved preserving run still resumes ordinary holds and keeps its constraint: this writer
   -- touches no policy column.
@@ -4348,6 +4350,8 @@ UPDATE runs SET
 WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.status = 'paused'
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
+  -- PRD #3989: a credentials_reset hold is released only by the credential promoter.
+  AND runs.hold_reason IS DISTINCT FROM 'credentials_reset'
   -- #3607 M2a: refuse ONLY an unresolved policy episode (its own owner resume is ResumePolicyHold).
   -- A resolved preserving run still resumes ordinary holds and keeps its constraint: this writer
   -- touches no policy column.
