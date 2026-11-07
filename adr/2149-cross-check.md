@@ -570,7 +570,8 @@ The security-audit rule grades as High any read of externally controlled input w
 size or item cap; a timeout alone is insufficient. This ADR said base discovery had only
 per-object, depth and deadline bounds, with no aggregate base cap or cache. Measurement (#3991)
 showed wide shared trees growing memory with work before the deadline: up to 663 MiB on the
-production path at 1 CPU and 782 MiB at 2 CPU, and a 256 MiB container was OOM-killed.
+production path (uninstrumented, 1536 MiB / 1 CPU) and 782 MiB in an instrumented run at
+4 GiB / 2 CPU. A deliberately undersized 256 MiB harness check of the same shape was OOM-killed.
 
 - **Decision (2026-11-06, delegated by the maintainer to the evaluating sessions).** Add an
   aggregate bound, rather than amend the audit rule, which would have left memory bounded only
@@ -599,14 +600,17 @@ production path at 1 CPU and 782 MiB at 2 CPU, and a 256 MiB container was OOM-k
 
 - E <= entryCap. D <= E + 1 <= entryCap + 1, where D counts the root (not an entry) plus each
   descended directory entry. N <= E.
-- Cumulative charged path bytes <= pathByteCap. This covers retained leaf paths, recursion-stack
-  prefixes and the ignore-query byte counter (Q).
-- In-flight tree objects are at most 65 frames (depth 0 to 64) x 2 MiB. Each may be held twice
-  transiently (the command output chunks and their concatenated copy), so up to about
-  2 x 65 x 2 MiB.
+- Cumulative charged path bytes P <= pathByteCap. P includes every retained leaf path and every
+  recursion-stack prefix. The ignore-query byte counter adds one or two bytes per entry on top:
+  Q = P + E + (D - 1) <= pathByteCap + 2 x entryCap.
+- In-flight tree objects are at most 65 frames (depth 0 to 64) x 2 MiB, plus the 2 MiB base
+  commit object. The object being fetched is briefly held twice (the command output chunks and
+  their concatenated copy), so a loose upper bound is about 2 x 65 x 2 MiB.
 
 **Post-discovery structures** are bounded by the existing derived limits plus allowances, not by
-the caps alone:
+the caps alone. The caps bound N, D, E, P and Q, not B: the summed base blob sizes, and so the
+source budget B + C + 128 MiB, still have no absolute ceiling (blob contents are read later, per
+file, within the per-file and source budgets).
 
 - tracked paths <= PATH_LIMIT = N + pathAllowance, which includes index paths; index bytes <=
   INDEX_LIMIT = I + indexAllowance.
@@ -627,10 +631,11 @@ estimates, not proofs.
 - Clean controls (this repository, a 50k-file tree) capture. One 50k-file 4 GiB / 2 CPU row hit
   the post-discovery deadline under host load and passed on rerun, disclosed in RESULTS.md.
 - On the measuring host, discovery speed usually reaches the 28 s deadline before the entry cap
-  on near-cap trees. The caps bound memory regardless of host speed.
+  on near-cap trees. The caps bound discovery's per-entry memory regardless of host speed.
 
 **Residuals.** Compose enforces memory per worker, not per run. The measurements are single-run.
-The soft-deadline overrun and the negative-timer misclassification (#3993) are out of scope.
+The soft-deadline overrun is out of scope. The negative-timer misclassification (#3993) was
+fixed separately (#3996), before the M3 measurements.
 
 Measurement and harness: [RESULTS.md](../e2e/planning-base-discovery-measure/RESULTS.md) and its
 [README](../e2e/planning-base-discovery-measure/README.md).

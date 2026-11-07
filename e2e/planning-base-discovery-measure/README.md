@@ -112,8 +112,9 @@ directory entry `0` that sorts first in canonical order (`0/` before `f...`; the
 it from `git ls-tree`). Each tree object is 2,040,028 bytes (1.95 MiB; the deepest, without `0`,
 2,040,000), under the 2 MiB cap. The
 helper descends at the first entry, so every ancestor's tree buffer is live at the deepest point
-while only `depth` entries are charged: up to `depth + 1` near-2-MiB buffers at once. Filler entries
-are charged only while unwinding, after that peak. Which cap then refuses depends on depth: d19-d48
+while only `depth` entries are charged: up to `depth + 1` near-2-MiB buffers at once. The deepest
+tree's filler is charged at the bottom, with every buffer still live; the ancestors' filler is
+charged while unwinding. Which cap then refuses depends on depth: d19-d48
 the entry cap; d49-d64 the path-byte cap (d64: E = 830,983, P = 100,663,348); below d19 neither
 (filler plus directory entries stay under 1,200,000). Ask the `model` job for a
 given depth. The manifest adds `maxTreeObjectBytes`.
