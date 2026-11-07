@@ -28,7 +28,7 @@ func newRunCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 			if issue <= 0 {
 				return uzicli.Exitf(uzicli.ExitUsage, "--issue must be a positive issue IID")
 			}
-			seed, err := seededPlanFlag(env, cmd)
+			seed, agentSource, err := seededPlanFlag(env, cmd)
 			if err != nil {
 				return err
 			}
@@ -45,7 +45,7 @@ func newRunCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 				return err
 			}
 			force, _ := cmd.Flags().GetBool("force")
-			run, err := c.CreateRun(cmd.Context(), repoID, issue, waitOnLimitFlag(cmd), mrReworkFlag(cmd), force, seed, credOverride, harness)
+			run, err := c.CreateRun(cmd.Context(), repoID, issue, waitOnLimitFlag(cmd), mrReworkFlag(cmd), force, seed, agentSource, credOverride, harness)
 			if err != nil {
 				return err
 			}
@@ -63,13 +63,12 @@ func newRunCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 	create.Flags().Bool("force", false,
 		"re-run even if the issue already has an open MR from a completed run "+
 			"(bypasses only the open-MR guard; a run already in progress is never bypassed)")
-	// PRD #209 seeded plan. --agent-source/--exclude-agents reuse the plan gate's flag
-	// names and validation (approveSelection); both are meaningful only alongside a plan.
 	create.Flags().String("plan-file", "",
 		"seed the run with a pre-written plan from this file (or '-' for stdin), skipping "+
 			"the planning turn and the approval gate (PRD #209)")
 	create.Flags().String("agent-source", "",
-		"which subagent roster the seeded run uses: own|repo (requires --plan-file)")
+		"which subagent roster this run uses: own|repo; overrides your repo default "+
+			"(with --plan-file, the seeded run's roster)")
 	create.Flags().StringSlice("exclude-agents", nil,
 		"subagents to drop from the chosen source (requires --agent-source and --plan-file)")
 	// PRD #209 M4 staleness guard. --planned-commit records the commit the plan was

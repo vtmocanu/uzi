@@ -22,7 +22,7 @@ import {
   statusSentence,
   workerJoined,
 } from "../lib/overview";
-import { UsageCard } from "../components/UsageCards";
+import { OverviewUsageCard } from "../components/OverviewUsageCard";
 import { OnboardingChecklist } from "../components/OnboardingChecklist";
 import { NeedsDecisionCard } from "../components/NeedsDecisionCard";
 import { IssueLine } from "../components/IssueLine";
@@ -145,7 +145,13 @@ export function OverviewNext() {
 
       {/* Factory usage is rendered only from the admin-gated response. */}
       {data?.selfUsage && (
-        <UsageCard self={data.selfUsage} admin={data.adminUsage ?? undefined} window={usageWindow} onWindowChange={changeUsageWindow} />
+        <OverviewUsageCard
+          self={data.selfUsage}
+          admin={data.adminUsage ?? undefined}
+          window={usageWindow}
+          onWindowChange={changeUsageWindow}
+          viewerId={user.id}
+        />
       )}
     </div>
   );

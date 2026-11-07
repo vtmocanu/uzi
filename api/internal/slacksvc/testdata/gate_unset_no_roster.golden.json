@@ -1,0 +1,80 @@
+[
+  {
+    "type": "section",
+    "text": {
+      "type": "mrkdwn",
+      "text": "*Plan ready for review.* Approve to let the run continue, or reject to send it back. The plan is in uzi."
+    }
+  },
+  {
+    "type": "actions",
+    "block_id": "slack_gate",
+    "elements": [
+      {
+        "type": "button",
+        "text": {
+          "type": "plain_text",
+          "text": "Approve",
+          "emoji": false
+        },
+        "action_id": "slack_gate_approve",
+        "value": "11111111-2222-4333-8444-555555555555",
+        "confirm": {
+          "title": {
+            "type": "plain_text",
+            "text": "Approve this plan?",
+            "emoji": false
+          },
+          "text": {
+            "type": "plain_text",
+            "text": "The run will continue and implement the plan.",
+            "emoji": false
+          },
+          "confirm": {
+            "type": "plain_text",
+            "text": "Approve",
+            "emoji": false
+          },
+          "deny": {
+            "type": "plain_text",
+            "text": "Cancel",
+            "emoji": false
+          }
+        },
+        "style": "primary"
+      },
+      {
+        "type": "button",
+        "text": {
+          "type": "plain_text",
+          "text": "Request changes",
+          "emoji": false
+        },
+        "action_id": "slack_gate_request_changes",
+        "value": "11111111-2222-4333-8444-555555555555"
+      },
+      {
+        "type": "button",
+        "text": {
+          "type": "plain_text",
+          "text": "Reject",
+          "emoji": false
+        },
+        "action_id": "slack_gate_reject",
+        "value": "11111111-2222-4333-8444-555555555555",
+        "style": "danger"
+      },
+      {
+        "type": "button",
+        "text": {
+          "type": "plain_text",
+          "text": "Open in uzi",
+          "emoji": false
+        },
+        "action_id": "slack_gate_open",
+        "url": "https://uzi.example/runs/11111111-2222-4333-8444-555555555555",
+        "value": "11111111-2222-4333-8444-555555555555"
+      }
+    ]
+  }
+]

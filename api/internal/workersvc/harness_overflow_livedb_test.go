@@ -57,7 +57,7 @@ func (fx *overflowFix) nextIssue() int64 {
 
 func (fx *overflowFix) issue() (store.Run, error) {
 	fx.t.Helper()
-	return fx.svc.CreateRun(fx.env.ctx, fx.userID, fx.repoID, fx.nextIssue(), "overflow", nil, nil, false, nil, nil, nil)
+	return fx.svc.CreateRun(fx.env.ctx, fx.userID, fx.repoID, fx.nextIssue(), "overflow", nil, nil, false, nil, nil, nil, nil)
 }
 
 func TestHarnessOverflowIssueFreezeAndExplanationLiveDB(t *testing.T) {
@@ -441,7 +441,7 @@ func TestHarnessOverflowCreationOverrideInheritanceLiveDB(t *testing.T) {
 	for _, mode := range []string{CredentialOverrideModeInherit, CredentialOverrideModeAuto, CredentialOverrideModeDefault} {
 		t.Run(mode, func(t *testing.T) {
 			fx := newOverflowFix(t)
-			run, err := fx.svc.CreateRun(fx.env.ctx, fx.userID, fx.repoID, fx.nextIssue(), "override", nil, nil, false, nil, nil, &RawCredentialOverride{Mode: mode})
+			run, err := fx.svc.CreateRun(fx.env.ctx, fx.userID, fx.repoID, fx.nextIssue(), "override", nil, nil, false, nil, nil, nil, &RawCredentialOverride{Mode: mode})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -471,7 +471,7 @@ func TestHarnessOverflowInheritRefusalCompatibilityLiveDB(t *testing.T) {
 				setDefaultHarness(t, fx.env, fx.userID, "codex")
 			}
 			_, err := fx.svc.CreateRun(fx.env.ctx, fx.userID, fx.repoID, fx.nextIssue(),
-				"inherit", nil, nil, false, nil, explicit, &RawCredentialOverride{Mode: CredentialOverrideModeInherit})
+				"inherit", nil, nil, false, nil, nil, explicit, &RawCredentialOverride{Mode: CredentialOverrideModeInherit})
 			if !errors.Is(err, ErrCredentialOverrideHarnessUnsupported) {
 				t.Fatalf("legacy refusal changed: %v", err)
 			}

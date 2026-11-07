@@ -131,7 +131,7 @@ After discovery, independent clone counters start at zero except source reads, w
 | Ignore/exclude reads, outside the source counter | G + 128 MiB. |
 | Cumulative ignore-query input / output | Q + 2 MiB each, independently. |
 
-Base discovery has per-object, depth and deadline bounds, with no aggregate base cap or cache. No additional absolute ceiling is imposed on the base-relative totals. The sizing query does not extend the deadlines. Current regular files are read completely through pinned descriptors with `O_NOFOLLOW`; a clean-looking index stat is no shortcut. Per-file reads remain capped at 4 MiB, commit/tree objects at 2 MiB each, depth at 64, each ignore/exclude read at 64 KiB, patch/output at 512 KiB, and non-ignored untracked files at 200. The helper retains its 28 s deadline, the outer capture its 30 s deadline, and individual Git commands at most 5 s within the helper deadline. Discovery, walks, comparisons and chunked reads yield on a roughly 20 ms clock so cancellation can run cleanup within the production 2 s SIGTERM kill grace.
+Base discovery has per-object, depth and deadline bounds plus two absolute aggregate caps (tree-entry occurrences and cumulative path bytes; see the #3543 amendment below), and still no cache. The sizing query does not extend the deadlines. Current regular files are read completely through pinned descriptors with `O_NOFOLLOW`; a clean-looking index stat is no shortcut. Per-file reads remain capped at 4 MiB, commit/tree objects at 2 MiB each, depth at 64, each ignore/exclude read at 64 KiB, patch/output at 512 KiB, and non-ignored untracked files at 200. The helper retains its 28 s deadline, the outer capture its 30 s deadline, and individual Git commands at most 5 s within the helper deadline. Discovery, walks, comparisons and chunked reads yield on a roughly 20 ms clock so cancellation can run cleanup within the production 2 s SIGTERM kill grace.
 
 There is no object-store snapshot or snapshot budget. The `snapshot_cap` refusal token remains for persisted compatibility, not as an active budget. The #2410 timing at 24f28b1d was a single historical snapshot-implementation sample, not a benchmark of this implementation. Existing `selfContained` switches remain in place. Under split UIDs the helper can read the bare but cannot write it; single-UID operation retains the accepted lack of OS write isolation. This adds no provider-command or model grants.
 
@@ -583,3 +583,134 @@ These rest on stated assumptions: request timeouts propagate through `fetch` and
 poll compares against the worker clock; executor-sequenced sink callbacks do not run during the
 plan gate; and the resumed-delivery wait, which predates this change, is bounded by its failure
 and stall counters rather than a wall-clock timer.
+
+## Amendment 2026-11-06 — #3543: aggregate base-discovery bound
+
+The security-audit rule grades as High any read of externally controlled input with no declared
+size or item cap; a timeout alone is insufficient. This ADR said base discovery had only
+per-object, depth and deadline bounds, with no aggregate base cap or cache. Measurement (#3991)
+showed wide shared trees growing memory with work before the deadline: up to 663 MiB on the
+production path (uninstrumented, 1536 MiB / 1 CPU) and 782 MiB in an instrumented run at
+4 GiB / 2 CPU. A deliberately undersized 256 MiB harness check of the same shape was OOM-killed.
+
+- **Decision (2026-11-06, delegated by the maintainer to the evaluating sessions).** Add an
+  aggregate bound, rather than amend the audit rule, which would have left memory bounded only
+  by elapsed time. The audit rule is now satisfied, not excepted.
+- **`baseDiscoveryEntryCap` = 1,200,000.** Charged once per tree entry (leaf or directory, the
+  root's entries included) on every walk occurrence. A shared subtree is charged each time it
+  is walked, because there is no cache. It is checked immediately after the entry is counted,
+  before the entry is parsed, recursed into or retained.
+- **`baseDiscoveryPathByteCap` = 100,663,296 (96 MiB).** Charged for every entry, directory and
+  leaf, as the byte length of its full relative path, after the entry check and before the path
+  string is built. Directories are charged because each recursion frame keeps its path prefix
+  alive and a name's length is otherwise bounded only by the 2 MiB per-object cap: a 64-deep
+  chain of near-2 MiB names with no leaves would pass leaf-only charging.
+- **Refusals.** `base_discovery_entry_cap` and `base_discovery_path_byte_cap` fail closed and
+  map to `diff_too_large`. Like `base_source_cap`, they bound how much of the base the capture
+  processes; the gate treats `diff_too_large` and `diff_failed` the same, so there is no API or
+  schema change. The per-object (2 MiB), depth (64) and deadline (28 s helper, 30 s outer, 5 s
+  per command) bounds are unchanged. Both keys are absolute caps, not allowances, and are
+  validated with the helper's sentinel convention.
+- **Thresholds.** Each is at least 2x the largest realistic trees counted on 2026-11-06 from the
+  default branches with `git ls-tree -r -t`: Linux 103,697 entries and 4,018,329 path bytes;
+  the Chromium GitHub mirror 563,282 entries and 42,616,138 path bytes. The caps are 2.13x and
+  2.36x Chromium.
+
+**Structural claims**, for discovery that completes without a cap refusal:
+
+- E <= entryCap. D <= E + 1 <= entryCap + 1, where D counts the root (not an entry) plus each
+  descended directory entry. N <= E.
+- Cumulative charged path bytes P <= pathByteCap. P includes every retained leaf path and every
+  recursion-stack prefix. The ignore-query byte counter adds one or two bytes per entry on top:
+  Q = P + E + (D - 1) <= pathByteCap + 2 x entryCap.
+- In-flight tree objects are at most 65 frames (depth 0 to 64) x 2 MiB, plus the 2 MiB base
+  commit object. The object being fetched is briefly held twice (the command output chunks and
+  their concatenated copy), so a loose upper bound is about 2 x 65 x 2 MiB.
+
+**Post-discovery structures** are bounded by the existing derived limits plus allowances, not by
+the caps alone. The caps bound N, D, E, P and Q, not B: the summed base blob sizes, and so the
+source budget B + C + 128 MiB, still have no absolute ceiling (blob contents are read later, per
+file, within the per-file and source budgets).
+
+- tracked paths <= PATH_LIMIT = N + pathAllowance, which includes index paths; index bytes <=
+  INDEX_LIMIT = I + indexAllowance.
+- DIR_LIMIT = D + directoryAllowance <= entryCap + 1 + directoryAllowance.
+- `trackedParents` holds ancestor prefixes (up to depth x tracked paths); candidates are at most
+  the tracked paths plus 200 untracked; the blob sizing batch (ids, seenIds, sizes, input) is at
+  most N.
+
+**Measured memory** is empirical: one host, one image, one run per configuration. These are
+estimates, not proofs.
+
+- M1 per-unit coefficients, for base discovery only: about 240 B per entry occurrence with an
+  intercept of about 134 MiB, and about 1.1 to 1.9 B per path byte.
+- M3, with the caps in force: the largest measured whole-capture container peak at production
+  timing is 575.5 MiB (4 GiB / 2 CPU) and 543.4 MiB on the 1536 MiB / 1 CPU slot. A base at
+  99.94 % of the entry cap and 99.98 % of the path-byte cap, with the maximal distinct-blob
+  sizing batch, was measured with the helper's wall-clock bounds lifted for validation
+  (validation, deadline lifted; the harness rewrites the spawned helper source, no production
+  flag): the 1536 MiB / 1 CPU row (unmetered) peaked at 985.1 MiB and the 4 GiB / 2 CPU row
+  (metered) at 1,111.9 MiB, both below 1536 MiB. For the metered 4 GiB / 2 CPU row, discovery completed and the sizing
+  batch was recorded (sizingBytes 57,507,840 = 48 x 1,198,080 ids); for the unmetered 1536 MiB / 1
+  CPU row, which has no discovery record, completion is inferred from phase evidence. The capture then ended on the `--no-checkout` fixture's post-discovery `git_pipe_cap`. The
+  rows are not production timing and not an unchanged production-path control. An earlier ×4
+  deadline row (767.5 MiB, partial) and a sizing-batch extrapolation (about 1,166 MiB) are
+  superseded context. Both over-cap fixtures refuse on their own cap at both configurations.
+- Clean controls (this repository, a 50k-file tree) capture. One 50k-file 4 GiB / 2 CPU row hit
+  the post-discovery deadline under host load and passed on rerun, disclosed in RESULTS.md.
+- On the measuring host, discovery speed usually reaches the 28 s deadline before the entry cap
+  on near-cap trees. The caps bound discovery's per-entry memory regardless of host speed.
+
+**Residuals.** Compose enforces memory per worker, not per run. The measurements are single-run.
+The Compose sizing formula (`docker-compose.yml`: `mem_limit = (WORKER_MAX_CONCURRENT_RUNS +
+WORKER_CHAT_SESSIONS) x per-slot budget + headroom`) does not count cross-check lane slots
+(`WORKER_CROSS_CHECK_SLOTS`, default 1), so a cross-check lane child can run beside a run slot's
+capture and the chat slots, sharing the one worker cgroup. The 985.1 and 1,111.9 MiB figures are
+for a capture alone; they are not additive-safe against a full set of other slots. They cover
+discovery and the sizing batch only: the post-discovery phase on a real checkout was not measured.
+The lifted rows do not show that a base this size finishes inside the production 28 s deadline.
+The soft-deadline overrun is out of scope. The negative-timer misclassification (#3993) was
+fixed separately (#3996), before the M3 measurements.
+
+Measurement and harness: [RESULTS.md](../e2e/planning-base-discovery-measure/RESULTS.md) and its
+[README](../e2e/planning-base-discovery-measure/README.md).
+
+## Amendment 2026-11-06 — #3985: clarification during a human revision
+
+A plan cross-check run (gated, or required on a claim issued after a forced human gate cleared
+`auto_approve`) that is not auto-approved stays at `awaiting_approval` while its lead works a
+HUMAN revise. When the lead asks a clarification, the run parks at `awaiting_input`. (In the
+same flight that hit the forced gate the claim still carries `auto_approve`, so the lead's
+question resolves through the autopilot sentinel without parking; that pre-existing behaviour
+is unchanged here, and in required mode only a reclaimed claim reaches this settlement; a gated
+claim never carries `auto_approve`, so its first flight does.) An answer is not plan approval,
+so `SetRunRunning`'s bound-approval clause refuses an ordinary `running` settlement there, and
+an issue run (or any run with `plan_revision_retry` negotiated) failed with "clarification
+running settlement was not confirmed"; other callers' unconfirmed `running` was refused
+silently. Decisions:
+
+- **Dedicated settlement, not a relaxed `running`.** A worker that negotiated
+  `clarification_revision_settlement_v1` reports `clarification_settled` with the question,
+  the pending revise input and its gate revision. A claim-fenced writer returns the run to
+  `awaiting_approval`. It requires an `issue`, `prompt` or `ci_fix` run with no open
+  completion question, the applied answer to the open question, and the pending, bound,
+  unapplied, non-empty revise consumed by this worker and claim generation. It refuses when a bound
+  approval was already applied. It writes only status, timestamps, the question markers and the
+  banked question wait. `SetRunRunning` is unchanged, because its SET can freeze candidate
+  milestones, contract and budget fields.
+- **The revise stays pending.** The settlement neither applies nor supersedes the revise; the
+  lead's next presentation does, at gate revision N+1, which only a newly bound approval passes.
+- **D16 unchanged.** No checker pass and no new presentation; plan text, candidate, gate
+  revision and payload are untouched.
+- **Capability matrix.** Old worker or old api: fail-closed (a new worker on an old api awaits
+  its `running` report for every caller and stops on the refusal). A new worker sends the
+  settlement only after the api advertised it, never strips it or retries it as an unqualified
+  `running`, and accepts only an applied `awaiting_approval` ACK carrying the
+  `clarification_settled` disposition.
+- **Known limit: a switch stamped before the answer.** A human revision turn runs with the
+  credential switch deferred, so a clarification asked inside it parks while the switch waits.
+  If a switch is stamped before the owner answers, the api withholds every input, the answer
+  included, so the run waits for the question timeout or a Cancel (which #3974 probes while the
+  switch is withheld, at `awaiting_input` and `awaiting_approval` alike; a committed Cancel ends
+  the answer wait before any settlement is sent). A switch stamped after the answer applied does
+  not block the settlement. This limit predates #3985 and is not changed by it.

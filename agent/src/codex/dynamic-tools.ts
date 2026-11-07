@@ -5,7 +5,7 @@
 import { z } from "zod";
 import { semanticProposalSchema } from "../semantic-plan.js";
 import { CODE_DISPOSITIONS_TOOL } from "../code-cross-check-tools.js";
-import { GET_ISSUE_HELP } from "../forge-tool-help.js";
+import { GET_ISSUE_HELP, SIGNAL_DONE_SUMMARY_DESCRIPTION } from "../forge-tool-help.js";
 import { CODEX_DELEGATE_TOOLS, codexDynamicToolWireName, type RunGrants } from "./broker.js";
 
 export interface CodexDynamicToolSpec {
@@ -140,7 +140,7 @@ function definition(name: string, grants: RunGrants): Omit<CodexDynamicToolSpec,
               reason: { type: "string", description: "1–500 Unicode code points after trimming; no scope selectors." },
             }, ["reason"], false),
           } : {}),
-          summary: STRING,
+          summary: { type: "string", description: SIGNAL_DONE_SUMMARY_DESCRIPTION },
           report_only: {
             type: "boolean",
             description: "Issue runs only: set true ONLY when the run's deliverable is a report, command output, or a verification result with NO code change to land, so the worker records the findings and opens no merge request. Omit it (or set false) when a code change was committed. It does not leave the issue open; to leave the issue open use `non_closing`. If committed work was already published to a checkpoint, the committed branch is delivered as a non-closing merge request instead. Omit on other run kinds.",

@@ -28,6 +28,14 @@ run** section with two cards:
 2. **My agent templates** — your uzi templates. This is the default (and the
    repo card is inert) when the repo has no agent folder uzi reads.
 
+A run that carries a [default for your runs on the
+repo](#set-a-default-for-your-runs-on-a-repo), or a source chosen when the run
+was created, pre-selects that source instead:
+**uzi templates** selects **My agent templates** even when the repo ships agents,
+and **repo agents** selects **Repo agents** when a roster is detected (with no
+roster, **My agent templates** stays selected). The pre-selected card carries the
+**default** badge.
+
 Pick one source, then click any agent chip to exclude it from the run. At least
 one subagent must remain. The choice locks in when you approve; the run view then
 shows which roster ran. Autopilot runs and CI-fix runs (which have no human gate)
@@ -37,7 +45,10 @@ and record what they used.
 Approving from a [Slack](./slack.md) DM offers the source choice too: when a repo
 roster is detected the message shows two approve buttons — **Approve · repo agents**
 and **Approve · my templates** — so you pick the source without leaving Slack.
-Per-agent exclusions are a web-only refinement; use "Open in uzi" for those.
+**Approve · repo agents** comes first and is the primary button, unless the run's
+default for the repo is **uzi templates**: then **Approve · my templates** comes
+first and is the primary button. Per-agent exclusions are a web-only refinement;
+use "Open in uzi" for those.
 
 ## Set a default for your runs on a repo
 
@@ -68,10 +79,23 @@ A frozen default decides the implementation agents when nothing else does:
   from an earlier approval, that choice and its exclusions are kept instead;
 - an autopilot run implements with the default;
 - an explicit choice at the plan gate (web, Slack, or `--agent-source`) still
-  wins, and the run page then shows it as "changed at approval".
+  wins, and the run page then shows it as "changed at approval". The web and
+  Slack gates pre-select the default, so approving without changing the
+  selection keeps it.
+
+To choose for a single run instead, pass `--agent-source own|repo` to
+`uzi run create` (or `"agent_selection": {"source": "own"|"repo"}` in the API
+create request). The choice overrides your default for that run only, is frozen
+the same way, and shows as "(this run)". It decides the implementation agents
+exactly as a default does; a create-time choice of **repo agents** does not
+change planning. Exclusions are not part of a create-time choice: exclude
+agents at the plan gate, or seed a plan with `--plan-file` and `--exclude-agents`.
+Board, chat, schedule and autopilot runs carry no create-time choice, so they
+follow your default.
 
 Planning is not yet affected: the plan turn still uses your own templates. A
-run that carries a default is claimed only by a worker new enough to honour it;
+run that carries a default or a create-time choice is claimed only by a worker
+new enough to honour it;
 while every online worker is older, the run stays queued and its health reason
 names the missing worker version (`agent_source_request_v1`). A run that
 also reads repo agents needs one worker reporting both capabilities; when they

@@ -22,7 +22,7 @@ func TestCreateRunAndTaskRunDecodeNotice(t *testing.T) {
 				_, _ = io.WriteString(w, tc.body)
 			}))
 			defer srv.Close()
-			run, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, nil, false, nil, nil, "")
+			run, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, nil, false, nil, "", nil, "")
 			if err != nil || run.ID != "run-1" || run.Notice != tc.want {
 				t.Fatalf("CreateRun = %+v, %v; want notice %q", run, err, tc.want)
 			}

@@ -95,7 +95,7 @@ func TestInteractiveStartRunAssessment(t *testing.T) {
 				f := &interactiveForge{m2Forge: m2Forge{comments: []forge.IssueComment{{AuthorForgeUserID: 4, Body: "UNKNOWN_RAW"}}}, t: t, start: start, want: want, mode: mode, cancel: cancel}
 				svc := New(fs, newBox(t), testParams())
 				svc.SetForges(m2Builder{f})
-				_, err := svc.StartRunForUser(parent, uuid.New(), uuid.New(), 4, nil, nil, false, nil, nil, nil)
+				_, err := svc.StartRunForUser(parent, uuid.New(), uuid.New(), 4, nil, nil, false, nil, nil, nil, nil)
 				failed := mode == "failed_raw" || mode == "late_raw" || mode == "parent_cancel" || mode == "earlier_parent"
 				if failed {
 					if err == nil || !errors.Is(err, ErrForgeIssueRead) || fs.createRunParams != nil {
@@ -153,7 +153,7 @@ func TestBackgroundCreateRunAssessmentDefault(t *testing.T) {
 				var err error
 				switch origin {
 				case "manual":
-					_, err = svc.CreateRun(parent, user, repo, 4, "d", nil, nil, false, nil, nil, nil)
+					_, err = svc.CreateRun(parent, user, repo, 4, "d", nil, nil, false, nil, nil, nil, nil)
 				case "autopilot":
 					_, err = svc.CreateAutopilotRun(parent, user, repo, 4, "d", nil)
 				case "schedule_manual":
