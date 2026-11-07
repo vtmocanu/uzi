@@ -149,9 +149,12 @@ it("pass shutdown reaps real bundle child before releasing the bare lock", linux
   const sha = childProcess.execFileSync("/usr/bin/git", ["-c", "user.name=fixture", "-c", "user.email=fixture@example.com",
     "--git-dir", bare, "commit-tree", tree], { input: "fixture\n", encoding: "utf8" }).trim();
   const bin = path.join(f.root, "bin"), artifact = path.join(f.root, "child.pid");
+  const pendingArtifact = path.join(f.root, "child.pid.pending");
   await fs.mkdir(bin);
-  await fs.writeFile(path.join(bin, "git"), "#!/bin/sh\ncase \"$*\" in *'bundle create'*) echo $$ > '" + artifact +
-    "'; exec /bin/sleep 60;; esac\nexec /usr/bin/git \"$@\"\n", { mode: 0o700 });
+  // Publish the PID only after the write is complete. fs.watch can report the creation caused by
+  // shell redirection before echo writes a byte; a rename in this directory makes child.pid ready.
+  await fs.writeFile(path.join(bin, "git"), "#!/bin/sh\ncase \"$*\" in *'bundle create'*) echo $$ > '" + pendingArtifact +
+    "'; mv '" + pendingArtifact + "' '" + artifact + "'; exec /bin/sleep 60;; esac\nexec /usr/bin/git \"$@\"\n", { mode: 0o700 });
   const started = deferred(), closed = deferred();
   const watcher = watch(f.root, (_event, name) => { if (name === "child.pid") started.resolve(); });
   t.after(() => watcher.close());
