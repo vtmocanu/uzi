@@ -818,7 +818,7 @@ most of the places that check are not the end of the run:
   ends at a first human gate; with the 2-hour maximum, about 2 h 1 min and
   2 h 23 min. A human gate on a re-plan after an approval whose milestones
   changed adds a checkpoint step of at most about 76 seconds (usually about a
-  minute), so about 55 minutes by default and about 2 h 24 min at the maximum.
+  minute), so about 54 minutes by default and about 2 h 24 min at the maximum.
   If the switch cannot complete and the run continues on its current
   credential, an approved plan is kept and not re-checked, an automatic revise
   runs its revision turn, and a checked human gate stays presented with no
