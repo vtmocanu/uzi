@@ -1405,10 +1405,10 @@ let timerOffset = 0, timerHeld = false;
 Date.now = () => timerNow() + timerOffset;
 timerCp.spawn = function(...args) {
   const p = timerSpawn.apply(this, args);
-  if (!timerHeld) {
+  // The helper first runs git init and check-attr. Let those finish; hold its
+  // first object() batch-check only after command() has passed check().
+  if (!timerHeld && args[1].includes("cat-file") && args[1].some(a => a.startsWith("--batch-check"))) {
     timerHeld = true;
-    if (!args[1].includes("cat-file") || !args[1].some(a => a.startsWith("--batch-check")))
-      throw Error("expected the first Git child to wait for batch-check input");
     // command() calls stdin.end(input) after arming the timer. Write the input but
     // keep stdin open, so cat-file cannot close before the zero-delay timeout.
     p.stdin.end = input => { if (input) p.stdin.write(input); return p.stdin; };
