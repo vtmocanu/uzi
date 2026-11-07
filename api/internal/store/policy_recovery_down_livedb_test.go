@@ -27,7 +27,6 @@ type downFx struct {
 	q                   *store.Queries
 	owner, worker, repo uuid.UUID
 	iid                 int64
-	pending             []string // names of the columns migration 413 adds
 }
 
 var recoveryColumns = []string{"policy_required_head", "policy_recovery_verified_generation", "policy_recovery_verified_head", "policy_hold_cause"}
