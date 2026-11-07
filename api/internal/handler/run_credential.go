@@ -63,8 +63,8 @@ func (h *Handler) SetRunCredential(w http.ResponseWriter, r *http.Request) {
 		// continuation that does apply, so the owner is not left at a dead end (issue #3607).
 		if errors.Is(err, workersvc.ErrCredentialOverrideHarnessUnsupported) {
 			if held, rerr := h.q.GetRunByIDForUser(r.Context(), store.GetRunByIDForUserParams{ID: runID, UserID: user.ID}); rerr == nil && workersvc.UnresolvedPolicyEpisode(held) {
-				httpx.Error(w, http.StatusUnprocessableEntity, "a credential override is not supported on the codex harness"+
-					" Resume this policy hold with POST /api/runs/{id}/resume-now and an explicit mode.")
+				httpx.Error(w, http.StatusUnprocessableEntity, "a credential override is not supported on the codex harness."+
+					" Resume this policy hold with POST /api/runs/"+runID.String()+"/resume-now and an explicit mode.")
 				return
 			}
 		}

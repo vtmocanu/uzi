@@ -1,4 +1,5 @@
 -- +goose Up
+SET LOCAL lock_timeout = '5s';
 -- Required-recovery identity for the compact policy hold (issue #3607 M2a). The columns are
 -- additive and deliberately carry no cross-column coupling, so an older API writing the
 -- earlier policy-hold shape during a rolling deploy stays valid.
@@ -15,11 +16,13 @@ ALTER TABLE runs ADD CONSTRAINT runs_policy_required_recovery_shape CHECK (
         'provider_resume_rejected','pending_conversion','fresh_start_uncertain'))
 );
 -- +goose Down
+SET LOCAL lock_timeout = '30s';
 -- Goose runs this migration transactionally. Lock before inspecting or converting so no writer can
 -- change a row between the check and the drop. A nonterminal row is ACTIVE when it still carries a
--- required recovery head, or a preserving constraint with a recorded verification. Only the head and
--- verification columns decide that: policy_hold_cause alone is history, so a resolved attempt-path row
--- that merely retains its cause is neither active nor converted. The older API has no notion of the
+-- required recovery head or a recorded verification, or when it is resolved and still preserving (a
+-- headless hold the owner resumed with preserve: the older API never writes policy_resolved_at, so it
+-- cannot run such a row). policy_hold_cause alone is history, so a resolved attempt-path row that
+-- merely retains its cause (preserve false) is neither active nor converted. The older API has no notion of the
 -- requirement, so an active row must not outlive its enforcement. Refuse before any mutation when an
 -- active row is not paused or queued (live claimed/running/awaiting_* rows must be drained first) or
 -- when a nonterminal row has an orphaned or malformed identity; then end the paused/queued active rows
@@ -31,19 +34,20 @@ DO $$
 BEGIN
     IF EXISTS (
         SELECT 1 FROM runs WHERE status NOT IN ('completed','failed','cancelled')
-          AND (policy_required_head IS NOT NULL
-               OR (policy_preserve_required AND (policy_recovery_verified_generation IS NOT NULL OR policy_recovery_verified_head IS NOT NULL)))
-          AND status NOT IN ('paused','queued')
-    ) THEN
-        RAISE EXCEPTION 'policy required-recovery rollback refused: a live run still carries a required recovery head';
-    END IF;
-    IF EXISTS (
-        SELECT 1 FROM runs WHERE status NOT IN ('completed','failed','cancelled')
           AND ((policy_required_head IS NULL AND (policy_recovery_verified_generation IS NOT NULL OR policy_recovery_verified_head IS NOT NULL))
                OR (policy_required_head IS NOT NULL AND policy_required_head !~ '^([0-9a-f]{40}|[0-9a-f]{64})$')
                OR (policy_recovery_verified_head IS NOT NULL AND policy_recovery_verified_head !~ '^([0-9a-f]{40}|[0-9a-f]{64})$'))
     ) THEN
         RAISE EXCEPTION 'policy required-recovery rollback refused: orphaned or malformed recovery identity';
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM runs WHERE status NOT IN ('completed','failed','cancelled')
+          AND (policy_required_head IS NOT NULL
+               OR policy_recovery_verified_generation IS NOT NULL OR policy_recovery_verified_head IS NOT NULL
+               OR (policy_preserve_required AND policy_resolved_at IS NOT NULL))
+          AND status NOT IN ('paused','queued')
+    ) THEN
+        RAISE EXCEPTION 'policy required-recovery rollback refused: a live run still carries a required recovery head';
     END IF;
 END $$;
 -- +goose StatementEnd
@@ -57,7 +61,8 @@ UPDATE runs SET plan_cross_check_gate_reason=NULL,status='failed',status_since=n
     codex_cap_hash=NULL,codex_claim_epoch=codex_claim_epoch+1
 WHERE status IN ('paused','queued')
     AND (policy_required_head IS NOT NULL
-         OR (policy_preserve_required AND (policy_recovery_verified_generation IS NOT NULL OR policy_recovery_verified_head IS NOT NULL)));
+         OR policy_recovery_verified_generation IS NOT NULL OR policy_recovery_verified_head IS NOT NULL
+         OR (policy_preserve_required AND policy_resolved_at IS NOT NULL));
 ALTER TABLE runs DROP CONSTRAINT runs_policy_required_recovery_shape;
 ALTER TABLE runs
     DROP COLUMN policy_required_head,

@@ -132,13 +132,13 @@ export function decodePolicyRecoveryVerifiedReply(value: unknown): PolicyRecover
   return value as unknown as PolicyRecoveryVerifiedReply;
 }
 
-/** Normalizes the preserve-only claim fields in place. An invalid `policy_preserve_only` is dropped
- *  (absent). `policy_expected_head` is kept only when it is a lowercase 40/64-hex id; a PRESENT but
+/** Normalizes the preserve-only claim fields in place. A present but non-boolean `policy_preserve_only`
+ *  is treated as true (fail closed: the claim may only continue the earlier conversation). `policy_expected_head` is kept only when it is a lowercase 40/64-hex id; a PRESENT but
  *  invalid head is replaced by "" so a preserve-only claim reads it as missing saved work rather than
  *  as a degraded capture that carries no requirement. */
 export function normalizePolicyPreserveClaim(claim: Record<string, unknown>): void {
   if (claim.policy_preserve_only !== undefined && typeof claim.policy_preserve_only !== "boolean")
-    delete claim.policy_preserve_only;
+    claim.policy_preserve_only = true;
   if (claim.policy_expected_head !== undefined && !isPolicyHeadId(claim.policy_expected_head))
     claim.policy_expected_head = "";
   if (claim.policy_saved_work_head !== undefined && !isPolicyHeadId(claim.policy_saved_work_head))

@@ -137,8 +137,12 @@ func TestPolicyOrdinaryReportsKeepRequiredHeadLiveDB(t *testing.T) {
 	id := p.settledPreserving(t, 2, func() *int64 { v := int64(2); return &v }(), a)
 	before := facts(p.run(t, id))
 	gen, sid := int64(2), "same-session"
-	if _, _, err := p.svc.SetState(p.e.ctx, p.worker, id, StateRequest{State: "running", ClaimGeneration: &gen, SessionID: &sid}); err != nil {
+	_, applied, err := p.svc.SetState(p.e.ctx, p.worker, id, StateRequest{State: "running", ClaimGeneration: &gen, SessionID: &sid})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !applied {
+		t.Fatal("running SetState was not applied, so the unchanged-R assertion below would be vacuous")
 	}
 	if after := facts(p.run(t, id)); after != before {
 		t.Fatalf("ordinary running report changed the recovery identity:\n%s\n%s", before, after)

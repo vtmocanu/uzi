@@ -350,6 +350,50 @@ func TestPolicyRecoveryDownRefusesLiveRowsWithoutPartialConversionLiveDB(t *test
 	}
 }
 
+// headlessPreserving is a hold reported with no head and resumed with preserve: queued, preserving,
+// resolved, and carrying no required head, as the real queries produce it.
+func (f *downFx) headlessPreserving() uuid.UUID {
+	f.t.Helper()
+	id := f.running()
+	f.resume(id, "preserve", f.hold(id, 1, "same_conversation", ""))
+	var preserve, resolved bool
+	var head *string
+	if err := f.pool.QueryRow(f.ctx, "SELECT policy_preserve_required,policy_resolved_at IS NOT NULL,policy_required_head FROM runs WHERE id=$1", id).Scan(&preserve, &resolved, &head); err != nil || !preserve || !resolved || head != nil {
+		f.t.Fatalf("fixture must be preserving, resolved and headless: %v %v %v %v", preserve, resolved, head, err)
+	}
+	return id
+}
+
+func TestPolicyRecoveryDownConvertsHeadlessResolvedPreservingLiveDB(t *testing.T) {
+	f := newDownFx(t)
+	queued := f.headlessPreserving()
+	paused := f.headlessPreserving()
+	mustExec(f.ctx, t, f.pool, "UPDATE runs SET status='paused',hold_reason='credential_disabled' WHERE id=$1", paused)
+	if err := store.MigrateDownTo(f.ctx, f.dsn, 412); err != nil {
+		t.Fatalf("Down: %v", err)
+	}
+	for _, id := range []uuid.UUID{queued, paused} {
+		if got := f.row(id)["status"]; got != "failed" {
+			t.Fatalf("headless preserving run %s status = %v, want failed", id, got)
+		}
+	}
+}
+
+func TestPolicyRecoveryDownRefusesLiveHeadlessResolvedPreservingLiveDB(t *testing.T) {
+	for _, live := range []string{"claimed", "running"} {
+		t.Run(live, func(t *testing.T) {
+			f := newDownFx(t)
+			convertible := f.pausedPreserving(strings.Repeat("a", 40))
+			active := f.headlessPreserving()
+			f.claimAt(active, 2, live)
+			f.refused("a live run still carries a required recovery head")
+			if got := f.row(convertible)["status"]; got != "paused" {
+				t.Fatalf("convertible row status = %v after refusal", got)
+			}
+		})
+	}
+}
+
 func TestPolicyRecoveryDownRefusesOrphansLiveDB(t *testing.T) {
 	t.Run("verification without a required head", func(t *testing.T) {
 		f := newDownFx(t)

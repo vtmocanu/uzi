@@ -400,7 +400,7 @@ func TestSetTokenOnPolicyHeldCodexRunLiveDB(t *testing.T) {
 	fx := newCompactPolicyFx(t)
 	run := fx.seedRun()
 	fx.hold(run, 1, "same_conversation", false, strings.Repeat("a", 40))
-	const hint = " Resume this policy hold with POST /api/runs/{id}/resume-now and an explicit mode."
+	hint := ". Resume this policy hold with POST /api/runs/" + run.String() + "/resume-now and an explicit mode."
 	const base = "a credential override is not supported on the codex harness"
 	overrides := `SELECT concat_ws('|',credential_override_mode,credential_override_secret_id::text) FROM runs WHERE id=$1`
 	before, overridesBefore := fx.state(run), fx.query(overrides, run)

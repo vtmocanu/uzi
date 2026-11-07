@@ -64,7 +64,11 @@ func TestPolicyRecoveryIdentityMigrationLiveDB(t *testing.T) {
 	}
 	mustExec(ctx, t, pool, "UPDATE runs SET policy_hold_cause=NULL WHERE id=$1", run)
 	if err := store.MigrateDownTo(ctx, dsn, 412); err != nil {
-		t.Fatalf("Down must not refuse live rows: %v", err)
+		t.Fatalf("Down must convert the paused R-bearing row, not refuse it: %v", err)
+	}
+	var status string
+	if err := pool.QueryRow(ctx, "SELECT status FROM runs WHERE id=$1", run).Scan(&status); err != nil || status != "failed" {
+		t.Fatalf("paused R-bearing row status = %q (%v), want failed", status, err)
 	}
 	var present, kept int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE column_name IN ('policy_required_head','policy_recovery_verified_generation','policy_recovery_verified_head','policy_hold_cause')),

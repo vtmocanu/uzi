@@ -26,6 +26,13 @@ describe("preserve-only claim fields on the production claim path", () => {
     }
   });
 
+  it("a present but non-boolean preserve-only flag fails closed as true", async () => {
+    for (const bad of ["true", 1, null, {}]) {
+      const claim = await claimWith({ policy_preserve_only: bad });
+      assert.equal(claim.policy_preserve_only, true, `${JSON.stringify(bad)} must not drop the preserve-only restriction`);
+    }
+  });
+
   it("an ordinary claim carries neither field", async () => {
     const claim = await claimWith({});
     assert.equal(claim.policy_preserve_only, undefined);
@@ -52,13 +59,6 @@ describe("preserve-only claim fields on the production claim path", () => {
       const claim = await claimWith({ policy_saved_work_head: bad });
       assert.equal(claim.policy_preserve_only, undefined);
       assert.equal(claim.policy_saved_work_head, "", JSON.stringify(bad));
-    }
-  });
-
-  it("a non-boolean flag is dropped as absent", async () => {
-    for (const bad of ["true", 1, null, {}]) {
-      const claim = await claimWith({ policy_preserve_only: bad });
-      assert.equal(claim.policy_preserve_only, undefined, JSON.stringify(bad));
     }
   });
 

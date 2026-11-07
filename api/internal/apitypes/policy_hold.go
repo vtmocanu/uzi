@@ -26,7 +26,8 @@ type PolicyHoldDTO struct {
 	CapturedHead *string `json:"captured_head"`
 	// HoldCause is the closed reason the latest episode was held (refused, attempt_path,
 	// saved_work_missing, session_missing, transcript_unknown, provider_resume_rejected,
-	// pending_conversion, fresh_start_uncertain); null for an episode recorded before the field.
+	// pending_conversion); fresh_start_uncertain is in the closed set but reserved, not currently
+	// emitted; null for an episode recorded before the field.
 	HoldCause *string `json:"hold_cause"`
 	// ResumeModes lists the owner resume modes this exact episode accepts right now. Empty (never
 	// null) unless the run is paused on an unresolved codex_policy_hold.
