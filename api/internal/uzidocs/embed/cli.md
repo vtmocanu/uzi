@@ -3184,6 +3184,45 @@ your own switch for the model-written [Now summary](./run-activity.md#now-summar
 instance). `--json` carries it as `now_summary_enabled` (`null` when unset). Change it in
 **Settings → Run defaults → Run summaries**; there is no CLI write verb for it.
 
+### Effective settings
+
+`uzi settings get` also reads the read-only [effective-settings
+view](./configuration.md#effective-settings) (`GET /api/me/effective-settings`)
+and, when the server has it, builds the **Model settings** table from it, so each
+setting prints once. The rows, in order:
+
+| `SETTING` | Rows | Notes |
+| --- | --- | --- |
+| `start (default)`, `start (claude)`, `start (codex)` | One each | `HARNESS`, `STORED` and `DEFAULT` show `-`. `RESOLVED` is the predicted harness, `claude or codex` when the harness is chosen when the run is created, or `refused: <token>` / `refused: <token> (<detail>)`. `SOURCE` is the harness source label (`your choice for this run`, `your default harness`, `automatic` or `chosen when the run is created`) plus its notes. |
+| `worker model` | `claude`, `codex` | `RESOLVED` and `DEFAULT` show `SDK/account default` when the runtime decides. |
+| `worker effort` | `claude`, `codex` | As the existing effort rows. |
+| `judge`, `summary` | `claude`, `codex` | Unchanged; printed from the settings read. |
+| `task review model` | `claude`, `codex` | Built-in; Codex notes `not configurable`, Claude `the SDK decides`. |
+| `task review effort` | `claude`, `codex` | `not sent` for both. |
+
+`SOURCE` appends each cell's notes after a `·`, for example `built-in · not sent`.
+When a start choice is chosen at creation, the table is followed by one block per
+such choice:
+
+```text
+start (default) is chosen when the run is created; it can run on:
+  claude: chosen when the run starts
+  codex: refused: no_usable_credential
+```
+
+Each line is a harness's credential source label, or `refused:` and its token
+(with the detail in parentheses). The CLI shows the `GET` only; it does not call
+the start-preview, and schedule preview (`--schedule`) is not built yet.
+
+`--json` carries every key of the settings read plus an `effective` key holding
+the view's body: `version`, `harnesses`, `start`, `models`, `efforts` and
+`cross_check` (fields in [Configuration](./configuration.md#effective-settings)).
+`effective` is `null` when the server does not have the view or the read failed.
+In that case the human output falls back to the previous Model settings rows, a
+line goes to stderr (`Effective settings: not available on this server` for an
+older server, otherwise `Effective settings: unavailable (<error>)`), and the
+exit code stays 0.
+
 ### Weekly usage reserve
 
 ```sh
