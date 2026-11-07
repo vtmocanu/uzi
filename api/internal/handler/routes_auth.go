@@ -26,6 +26,12 @@ func (h *Handler) mountAuthRoutes(r chi.Router, authLimiter, cliPollLimiter *mw.
 		r.With(authLimiter.Middleware).Get("/oidc/login", h.OIDCLogin)
 		r.With(authLimiter.Middleware).Get("/oidc/callback", h.OIDCCallback)
 
+		// Admin-issued account reset link (PRD #3989): unauthenticated by design (the
+		// holder has no working credential), per-IP limited like login. Both answer one
+		// generic 404 for every invalid-link cause.
+		r.With(authLimiter.Middleware).Post("/reset/preview", h.PreviewResetLink)
+		r.With(authLimiter.Middleware).Post("/reset/redeem", h.RedeemResetLink)
+
 		// Browser-brokered CLI login (PRD #64 M5). start/poll are UNAUTH — the CLI
 		// has no credential yet, which is the whole point — and rate-limited.
 		// request/approve/deny are the BROWSER side, RequireAuth (this is where the

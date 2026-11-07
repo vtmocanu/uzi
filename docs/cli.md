@@ -3758,6 +3758,14 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   Settings, or `uzi run set-token` where the run accepts a token switch),
   `run list` shows `paused (credential disabled)`, and the TUI draws it as
   `⊘ cred disabled` in NEEDS YOU.
+  A `paused` run can also be **waiting because your credentials were reset**
+  (`hold_reason: credentials_reset`): a Claude or chat run created before an
+  admin-issued [account reset](auth-design.md) found no model credential at
+  claim. `run get` prints a `HOLD` row reading `credentials were reset` with
+  the action "add a credential in Settings; the run resumes automatically",
+  and the web badge reads "waiting: credentials were reset". It resumes on its
+  own once you add a credential; `run resume` and `run set-token` are refused
+  with a 409 until then.
   A `paused` run can also be held after an owner token switch on a run with
   retained recovery work (`hold_reason: credential_switch_settling`, then
   `credential_switch_unsettled`). `run get` prints a `HOLD` row reading

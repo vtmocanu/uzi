@@ -130,6 +130,7 @@ const PARK_TABLE: Record<string, "automatic" | "owner"> = {
   base_attestation_missing: "owner",
   completion_blocked: "owner",
   credential_disabled: "owner",
+  credentials_reset: "owner",
   retained_recovery_adoption_failed: "owner",
   retained_recovery_held: "owner",
   retained_recovery_unknown: "owner",

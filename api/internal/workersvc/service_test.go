@@ -833,6 +833,9 @@ func (f *fakeStore) ClaimChatRun(_ context.Context, arg store.ClaimChatRunParams
 func (f *fakeStore) ParkCredentialDisabledChatRun(context.Context, store.ParkCredentialDisabledChatRunParams) (int64, error) {
 	return 1, nil
 }
+func (f *fakeStore) GetUserCredentialsResetAt(context.Context, uuid.UUID) (pgtype.Timestamptz, error) {
+	return pgtype.Timestamptz{}, nil
+}
 func (f *fakeStore) GetChatRunClaimContext(context.Context, uuid.UUID) (pgtype.Text, error) {
 	return f.resumeSession, nil
 }

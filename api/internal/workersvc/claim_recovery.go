@@ -60,6 +60,7 @@ type claimFinishQueries interface {
 	ParkRunCodexAccountUnavailable(ctx context.Context, arg store.ParkRunCodexAccountUnavailableParams) (store.Run, error)
 	LockSecretEnablementForShareNowait(ctx context.Context, arg store.LockSecretEnablementForShareNowaitParams) (bool, error)
 	ParkCredentialDisabledRun(ctx context.Context, arg store.ParkCredentialDisabledRunParams) (int64, error)
+	GetUserCredentialsResetAt(ctx context.Context, id uuid.UUID) (pgtype.Timestamptz, error)
 	RequeueClaimAssemblyExact(ctx context.Context, arg store.RequeueClaimAssemblyExactParams) (int64, error)
 	FailClaimAssemblyExact(ctx context.Context, arg store.FailClaimAssemblyExactParams) (int64, error)
 }
@@ -390,6 +391,25 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		assemblyErr = fmt.Errorf("%w: %s", errCredentialUnavailable, detail)
 		origin = "credential_unavailable"
 	}
+	// PRD #3989 M3: a run created before its owner's account reset that finds the owner holding no
+	// Anthropic token parks on credentials_reset through the same exact-claim park as a disabled
+	// credential, and the promoter releases it once a credential exists. Only errNoModelCredential
+	// qualifies, never errCredentialUnavailable as a whole (forge-origin refusal, repo-owner mismatch
+	// and an undecryptable token stay terminal). Job, judge and cross_check runs are unchanged and
+	// keep their terminal failure (a Claude checker child was already mapped to
+	// errCheckerPinUnavailable above). A user with no marker, or a run created after it, keeps
+	// today's terminal failure.
+	parkReason := holdCredentialDisabled
+	if !credDisabled && errors.Is(assemblyErr, errNoModelCredential) &&
+		run.Kind != runkind.Job && run.Kind != runkind.Judge && run.Kind != runkind.CrossCheck {
+		reset, err := claimCredentialsReset(ctx, q, locked)
+		if err != nil {
+			return nil, "", err
+		}
+		if reset {
+			credDisabled, parkReason = true, holdCredentialsReset
+		}
+	}
 	// Only credential authority faults may park, and only on a custody-holding kind: a judge
 	// stays terminal. Guardrail and provisioning failures remain terminal even if an account
 	// changes concurrently.
@@ -524,6 +544,7 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		// park and leaking the hold.
 		n, err = q.ParkCredentialDisabledRun(ctx, store.ParkCredentialDisabledRunParams{
 			ID: run.ID, WorkerID: pgconv.UUID(identity.workerID), ClaimGeneration: run.ClaimGeneration,
+			HoldReason: parkReason,
 		})
 	case holdClass:
 		_, err = q.ParkRunCodexAccountUnavailable(ctx, store.ParkRunCodexAccountUnavailableParams{
@@ -545,6 +566,22 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		if checkerStage == "code" && errors.Is(decision, errCheckerPinUnavailable) {
 			failureReason = "code cross-check: checker unavailable" +
 				strings.TrimPrefix(failureReason, errCheckerPinUnavailable.Error())
+		}
+		// PRD #3989 D16: a Codex run is never parked (its PRD #1147 binding is write-once), so a run
+		// created before the reset whose frozen alias the reset deleted ends terminally with a reason
+		// that names the cause. Classified on the FINAL decision, which already carries the lock-time
+		// authority rewrite, and on the locked row, so a reset that commits between a successful
+		// assembly and this lock reads the same as one that preceded the claim. fail_origin stays
+		// credential_unavailable.
+		if origin == "credential_unavailable" && errors.Is(decision, ErrCodexRunNotBound) &&
+			locked.Harness == harnessCodex && locked.CodexMaterialRevision.Valid && !locked.CodexSecretID.Valid {
+			reset, err := claimCredentialsReset(ctx, q, locked)
+			if err != nil {
+				return nil, "", err
+			}
+			if reset {
+				failureReason = codexResetFailureReason
+			}
 		}
 		n, err = q.FailClaimAssemblyExact(ctx, store.FailClaimAssemblyExactParams{
 			ID: run.ID, WorkerID: pgconv.UUID(identity.workerID), ClaimGeneration: run.ClaimGeneration,
@@ -575,6 +612,30 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		return nil, "failed", nil
 	}
 	return nil, "", nil
+}
+
+// The hold reasons the exact-claim park writes (ParkCredentialDisabledRun, and the chat twin).
+const (
+	holdCredentialDisabled = "credential_disabled" //nolint:gosec // G101: a run hold-reason VOCABULARY value (the server enum), not a credential.
+	holdCredentialsReset   = "credentials_reset"   //nolint:gosec // G101: a run hold-reason VOCABULARY value (the server enum), not a credential.
+)
+
+// codexResetFailureReason is the stored failure_reason of a Codex run whose frozen alias an
+// account reset deleted (PRD #3989 D16).
+const codexResetFailureReason = "the bound Codex login is unavailable after your account reset; start a new run"
+
+// claimCredentialsReset reports whether the run's owner redeemed an account reset link after the
+// run was created (PRD #3989). It is a plain read: it takes no users row lock, so it adds no edge to
+// the run-then-users lock order. A missing marker or user is "no".
+func claimCredentialsReset(ctx context.Context, q claimFinishQueries, locked store.Run) (bool, error) {
+	marker, err := q.GetUserCredentialsResetAt(ctx, locked.UserID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return marker.Valid && locked.CreatedAt.Valid && marker.Time.After(locked.CreatedAt.Time), nil
 }
 
 // claimCredentialDisabled is finishRunClaimTx's in-transaction re-check of the credential a

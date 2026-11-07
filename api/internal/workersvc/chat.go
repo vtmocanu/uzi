@@ -185,7 +185,18 @@ func (s *Service) ClaimChat(ctx context.Context, wkr store.Worker) (*ChatClaimPa
 	}
 	payload, err := s.assembleChatClaim(ctx, run)
 	if errors.Is(err, errCredentialDisabled) {
-		return nil, s.parkChatCredentialDisabled(ctx, wkr, run)
+		return nil, s.parkChatCredentialDisabled(ctx, wkr, run, holdCredentialDisabled)
+	}
+	if errors.Is(err, errNoModelCredential) {
+		// PRD #3989 M3: a chat created before its owner's account reset waits for a credential
+		// instead of failing; a never-reset owner keeps today's terminal failure below.
+		reset, rerr := s.chatCreatedBeforeReset(ctx, run)
+		if rerr != nil {
+			return nil, rerr
+		}
+		if reset {
+			return nil, s.parkChatCredentialDisabled(ctx, wkr, run, holdCredentialsReset)
+		}
 	}
 	if err != nil {
 		return nil, s.recoverClaimAssembly(ctx, run, err)
@@ -277,7 +288,7 @@ func (s *Service) finishChatClaimTx(ctx context.Context, wkr store.Worker, run s
 			return chatFinishIdle, err
 		case disabled:
 			n, err := q.ParkCredentialDisabledChatRun(ctx, store.ParkCredentialDisabledChatRunParams{
-				ID: run.ID, WorkerID: pgconv.UUID(wkr.ID),
+				ID: run.ID, WorkerID: pgconv.UUID(wkr.ID), HoldReason: holdCredentialDisabled,
 			})
 			if err != nil {
 				return chatFinishIdle, fmt.Errorf("park chat on credential_disabled: %w", err)
@@ -297,16 +308,32 @@ func (s *Service) finishChatClaimTx(ctx context.Context, wkr store.Worker, run s
 	return chatFinishDeliver, nil
 }
 
+// chatCreatedBeforeReset reports whether the chat's owner redeemed an account reset link after the
+// chat was created (PRD #3989 M3). The claimed row is the one ClaimChatRun just returned.
+func (s *Service) chatCreatedBeforeReset(ctx context.Context, run store.Run) (bool, error) {
+	marker, err := s.q.GetUserCredentialsResetAt(ctx, run.UserID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("chat credentials reset marker: %w", err)
+	}
+	return marker.Valid && run.CreatedAt.Valid && marker.Time.After(run.CreatedAt.Time), nil
+}
+
 // parkChatCredentialDisabled holds an undelivered chat claim on credential_disabled (PRD #1732
 // D2/D14) instead of failing it or spending another token: chat is not bindable and takes no
 // per-run override (D16), so it waits for the owner to enable a token (the promoter then
 // queues it again). The claim is idle either way; a 0-row park means another transition won.
-func (s *Service) parkChatCredentialDisabled(ctx context.Context, wkr store.Worker, run store.Run) error {
+//
+// holdReason is credential_disabled, or credentials_reset for a chat created before its owner's
+// account reset (PRD #3989 M3).
+func (s *Service) parkChatCredentialDisabled(ctx context.Context, wkr store.Worker, run store.Run, holdReason string) error {
 	n, err := s.q.ParkCredentialDisabledChatRun(ctx, store.ParkCredentialDisabledChatRunParams{
-		ID: run.ID, WorkerID: pgconv.UUID(wkr.ID),
+		ID: run.ID, WorkerID: pgconv.UUID(wkr.ID), HoldReason: holdReason,
 	})
 	if err != nil {
-		return fmt.Errorf("park chat on credential_disabled: %w", err)
+		return fmt.Errorf("park chat on %s: %w", holdReason, err)
 	}
 	if n == 1 {
 		s.publishSwept(run.ID, "paused")
@@ -346,7 +373,9 @@ func (s *Service) assembleChatClaim(ctx context.Context, run store.Run) (*ChatCl
 	// bound worker's chat runs still spend the owner's default token.
 	// PRD #1732 D2: openAnthropic refuses a disabled row (errCredentialDisabled), and a slot
 	// whose tokens are all disabled has no default: both hold the chat on credential_disabled
-	// (ClaimChat) rather than failing it; a token-less owner keeps today's failure.
+	// (ClaimChat) rather than failing it. A token-less owner's chat fails, unless the owner
+	// redeemed an account reset after the chat was created: that chat parks on credentials_reset
+	// (PRD #3989).
 	cred, err := s.openAnthropic(ctx, run.UserID, nil)
 	if err != nil {
 		if perr := s.parkIfDefaultSlotDisabled(ctx, run.UserID, err); perr != nil {

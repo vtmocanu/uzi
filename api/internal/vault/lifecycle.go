@@ -64,19 +64,27 @@ func lockLifecycleState(ctx context.Context, q Store, id uuid.UUID, admission bo
 	if err := q.LockSecretMutation(ctx, id); err != nil {
 		return state, wrapper, false, policy, err
 	}
-	var err error
-	state, err = q.LockVaultAuthState(ctx, id)
+	state, wrapper, exists, err := lockVaultRows(ctx, q, id)
+	return state, wrapper, exists, policy, err
+}
+
+// lockVaultRows takes the users row and the wrapper row, in that order, after the
+// owner's advisory guard is already held. Reset calls it directly because it must
+// lock the owner's worker and run rows between the guard and the users row.
+func lockVaultRows(ctx context.Context, q Store, id uuid.UUID) (store.LockVaultAuthStateRow, store.UserVault, bool, error) {
+	var wrapper store.UserVault
+	state, err := q.LockVaultAuthState(ctx, id)
 	if err != nil {
-		return state, wrapper, false, policy, err
+		return state, wrapper, false, err
 	}
 	if !validState(state.VaultMode, state.VaultEpoch) {
-		return state, wrapper, false, policy, ErrInvalidState
+		return state, wrapper, false, ErrInvalidState
 	}
 	wrapper, err = q.LockUserVault(ctx, id)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return state, wrapper, false, policy, nil
+		return state, wrapper, false, nil
 	}
-	return state, wrapper, err == nil, policy, err
+	return state, wrapper, err == nil, err
 }
 
 // finishLifecycle is called while the per-user mutex is held. Reconciliation
