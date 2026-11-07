@@ -31,7 +31,8 @@ import { delay, mockScenario, oidcDemo, requireSession, users } from "./shared";
 import { agentSource, mockAllowedAgentSourceHosts } from "./agentSource";
 import { secrets } from "./secrets";
 import { checkerModelWarning, normalizeCheckerValue } from "../../lib/crossCheckSettings";
-import type { CatalogDefault, CodexAccountMode, CrossCheckPinDTO, EffortSettingCell, Harness } from "../../lib/apiTypes";
+import type { CatalogDefault, CodexAccountMode, CrossCheckPinDTO, EffectiveSettings, EffortSettingCell, Harness, StartPreview, StartPreviewRequest } from "../../lib/apiTypes";
+import { RECORDED_EFFECTIVE_SCENARIOS, type RecordedEffectiveScenario } from "../data/effectiveSettings";
 import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../../lib/codexModels";
 import { MOCK_JUDGE_BUILTINS, mockJudgeModelCells, resolveMockJudgeModel } from "./judgeModels";
 import { MOCK_SUMMARY_BUILTINS, mockSummaryModelCells } from "./summaryModels";
@@ -771,6 +772,19 @@ export function sessionBody() {
   };
 }
 
+function recordedEffectiveScenario(): RecordedEffectiveScenario {
+  const name = ({ "codex-only": "codexOnly", "overflow-codex-default": "overflowCodexDefault" } as Record<string, string>)[mockScenario()] ?? "default";
+  const found = RECORDED_EFFECTIVE_SCENARIOS.find(s => s.name === name);
+  if (!found) throw new Error(`no recorded effective-settings scenario ${name}`);
+  return found;
+}
+
+// Absent and null request members mean the same choice, so key on the normalized triple.
+function previewRequestKey(r: StartPreviewRequest): string {
+  const o = r.credential_override;
+  return JSON.stringify([r.harness ?? null, o?.mode ?? null, o?.secret_id ?? null]);
+}
+
 export const settingsApi = {
   vaultStatus: async () => delay(mockVaultStatus(), 40),
   vaultDisable: async (): Promise<VaultDisableResponse> => {
@@ -1416,6 +1430,20 @@ export const settingsApi = {
     userSettings = { ...userSettings, codex_account_mode: mode };
     persistSettings();
     return delay({ codex_account_mode: mode });
+  },
+  // PRD #3254 M2: the recorded server behavior for the active demo scenario, not a second
+  // resolver. "codex-only" serves the codexOnly recording and "overflow-codex-default" the
+  // overflowCodexDefault one (the recorded refused-alternative case); anything else the default.
+  getEffectiveSettings: async (): Promise<EffectiveSettings> => {
+    requireSession();
+    return delay(structuredClone(recordedEffectiveScenario().get), 60);
+  },
+  previewStartSettings: async (body: StartPreviewRequest): Promise<StartPreview> => {
+    requireSession();
+    const key = previewRequestKey(body);
+    const hit = recordedEffectiveScenario().start_previews.find(p => previewRequestKey(p.request) === key);
+    if (!hit) throw new ApiError(400, "the demo has no recorded start preview for this request");
+    return delay(structuredClone(hit.response), 60);
   },
   putMySettings: async (patch: UserSettingsPatch) => {
     // PATCH-like: apply only the fields present in the body, mirroring the real

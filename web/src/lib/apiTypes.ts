@@ -244,6 +244,105 @@ export interface CatalogDefault {
   observed_at: string | null;
 }
 
+/** PRD #3254: a supplied value that does not apply (a schedule's model pin on the other harness). */
+export interface EffectiveIgnored {
+  value: string;
+  source: string;
+}
+
+/** PRD #3254: one harness's model cell of a setting (the shared ModelSettingCell, flattened)
+ *  plus which setting it is and when the value is fixed. `resolved_model` "" means the runtime
+ *  decides (note `sdk_default`). `fixed_at` is create or claim. */
+export interface EffectiveModelCell extends ModelSettingCell {
+  setting: string;
+  fixed_at: string;
+  ignored: EffectiveIgnored | null;
+  notes: string[];
+}
+
+/** PRD #3254: one harness's effort cell (the shared EffortSettingCell, flattened). */
+export interface EffectiveEffortCell extends EffortSettingCell {
+  setting: string;
+  fixed_at: string;
+  notes: string[];
+}
+
+/** PRD #3254: which credential a run would use and when that is fixed, never which one.
+ *  `kind` is anthropic or codex; `auth_mode` (codex only) is subscription or api_key. */
+export interface Credential {
+  kind: string;
+  source: string;
+  fixed_at: string;
+  auth_mode: string | null;
+}
+
+/** PRD #3254: a predicted harness. `value` is null with source chosen_at_create when a
+ *  creation-time policy (a note: automatic_weekly_reset or overflow) picks it at creation. */
+export interface HarnessValue {
+  value: string | null;
+  source: string;
+  fixed_at: string;
+  notes: string[];
+}
+
+export interface EffectiveHarness {
+  harness: Harness;
+  usable: boolean;
+  refusal: string | null;
+  refusal_detail: string | null;
+  credential: Credential | null;
+}
+
+export interface EffectiveStartChoice {
+  choice: string;
+  harness: HarnessValue | null;
+  refusal: string | null;
+  refusal_detail: string | null;
+  anthropic_override_allowed: boolean;
+}
+
+/** GET /api/me/effective-settings (PRD #3254). */
+export interface EffectiveSettings {
+  version: number;
+  harnesses: EffectiveHarness[];
+  start: EffectiveStartChoice[];
+  models: EffectiveModelCell[];
+  efforts: EffectiveEffortCell[];
+  cross_check: { models: EffectiveModelCell[]; efforts: EffectiveEffortCell[] };
+}
+
+export interface StartPreviewCredentialOverride {
+  mode: string;
+  secret_id?: string;
+}
+
+/** POST /api/me/effective-settings/start-preview body. */
+export interface StartPreviewRequest {
+  harness: string | null;
+  credential_override: StartPreviewCredentialOverride | null;
+}
+
+/** One harness a creation-time policy might choose, computed as if it were chosen. A refused
+ *  branch has a null credential and its own refusal; both are null on a valid branch. */
+export interface StartPreviewAlternative {
+  harness: string;
+  credential: Credential | null;
+  refusal: string | null;
+  refusal_detail: string | null;
+}
+
+/** The start-preview response. When the harness is chosen at creation, `credential` is null and
+ *  `alternatives` lists Claude then Codex. A top-level `refusal` is set only for a failure before
+ *  a harness is decided, or when every alternative is refused for the same reason. */
+export interface StartPreview {
+  version: number;
+  harness: HarnessValue | null;
+  refusal: string | null;
+  refusal_detail: string | null;
+  credential: Credential | null;
+  alternatives?: StartPreviewAlternative[];
+}
+
 export interface UserSettings {
   vault_auto_reunlock?: boolean;
   cross_check_pins?: CrossCheckPinDTO[];
