@@ -26,6 +26,12 @@ if ! type _psql_strip_tags >/dev/null 2>&1; then
   exit 1
 fi
 
+# The real capture_agent_logs (#4060), defined up front: phase code extracted by later cases now contains
+# capture lines, and with no RUNROOT/COMPOSE here the helper only reports to stderr and returns 0.
+eval "$(awk '/^capture_agent_logs\(\) \{/,/^\}/' "$LIB")"
+CAL_DEFINED=yes
+type capture_agent_logs >/dev/null 2>&1 || CAL_DEFINED=no
+
 cases=0
 passed=0
 # check NAME INPUT EXPECT — INPUT is a printf %b format (so \n and \r are real), piped through the
@@ -1530,8 +1536,26 @@ handoff_timing_scope() {
   say() { :; }
   fail() { echo "$*" >&2; exit 1; }
   handoff_compose() {
-    HANDOFF_TEST_COMPOSE_CALLS=$((HANDOFF_TEST_COMPOSE_CALLS + 1))
+    # capture_agent_logs reads the agent with ps/logs (#4060): answer them without touching the
+    # lifecycle numbering, which counts only `up ... --force-recreate agent` calls by argv. ps runs in
+    # a command substitution, so a counter bumped there would be lost anyway.
+    case "$*" in
+      *"ps -a -q agent") echo handoff-container-id; return 0 ;;
+      *"logs --no-color agent") echo handoff-outgoing-process; return 0 ;;
+    esac
     printf 'compose:%s:%s:%s\n' "${UZI_E2E_RECOVERY_FAST_REDRIVE+x}" "$(printenv UZI_E2E_RECOVERY_FAST_REDRIVE || :)" "$*" >> "$SEQ_DIR/handoff-timing"
+    case "$*" in
+      *" up "*"--force-recreate agent"*) ;;
+      *) return 0 ;;
+    esac
+    HANDOFF_TEST_COMPOSE_CALLS=$((HANDOFF_TEST_COMPOSE_CALLS + 1))
+    # Evidence order: by the time the Nth recreate runs, at least N agent-log snapshots must exist.
+    if [ "$(find "$SEQ_DIR/artifacts/agent-logs" -name '*.log' 2>/dev/null | wc -l | tr -d ' ')" -ge "$HANDOFF_TEST_COMPOSE_CALLS" ] \
+        && grep -qs handoff-outgoing-process "$SEQ_DIR"/artifacts/agent-logs/*.log; then
+      echo yes >> "$SEQ_DIR/handoff-snap"
+    else
+      echo no >> "$SEQ_DIR/handoff-snap"
+    fi
     [ "$HANDOFF_TEST_MODE" != activation ] || [ "$HANDOFF_TEST_COMPOSE_CALLS" -ne 1 ] || return 1
     case "$HANDOFF_TEST_MODE:$HANDOFF_TEST_COMPOSE_CALLS" in restore:2|receipt-restore:2) return 1;; esac
   }
@@ -1550,6 +1574,8 @@ for spec in 'success:stub:unset' 'success:stub:0' 'success:stub:empty' 'success:
   cases=$((cases + 1))
   IFS=: read -r mode executor prior <<< "$spec"
   : > "$SEQ_DIR/handoff-timing"
+  : > "$SEQ_DIR/handoff-snap"
+  rm -rf "$SEQ_DIR/artifacts/agent-logs"
   if output="$(handoff_timing_scope "$mode" "$executor" "$prior" 2>&1)"; then got=pass; else got=fail; fi
   events="$(cat "$SEQ_DIR/handoff-timing")"
   if [ "$prior" = unset ]; then restored=':'; elif [ "$prior" = empty ]; then restored='x:'; else restored="x:$prior"; fi
@@ -1569,11 +1595,15 @@ for spec in 'success:stub:unset' 'success:stub:0' 'success:stub:empty' 'success:
         [[ "$events" == *body:x:1* ]] || valid=false
       fi
       case "$mode" in restore|receipt-restore) [[ "$output" == *'handoff timing restore failed'* ]] || valid=false;; esac
+      # Every recreate (activation and the EXIT-trap restore) saw a fresh snapshot of the outgoing agent.
+      recreates="$(grep -c -- ' up .*--force-recreate agent' "$SEQ_DIR/handoff-timing" || true)"
+      snaps="$(grep -c '^yes$' "$SEQ_DIR/handoff-snap" || true)"
+      [ "$recreates" -ge 1 ] && [ "$snaps" = "$recreates" ] && ! grep -q '^no$' "$SEQ_DIR/handoff-snap" || valid=false
     fi
   fi
   if [ "$valid" = true ]; then
     passed=$((passed + 1)); echo "PASS: handoff timing scope $spec"
-  else echo "FAIL: handoff timing scope $spec: result=$got events=[$events] output=[$output]"; fi
+  else echo "FAIL: handoff timing scope $spec: result=$got events=[$events] snaps=[$(cat "$SEQ_DIR/handoff-snap")] output=[$output]"; fi
 done
 
 # Drive the shipped phase-18 continuation/EXIT scope with mocked API/CLI
@@ -1947,9 +1977,6 @@ done
 # --- capture_agent_logs (#4060): snapshot agent logs before a lifecycle op discards them ------------
 # Real helper extracted from lib.sh; stateful fake compose; every case in a subshell with its own
 # RUNROOT/COMPOSE so nothing global changes for later code.
-eval "$(awk '/^capture_agent_logs\(\) \{/,/^\}/' "$LIB")"
-CAL_DEFINED=yes
-type capture_agent_logs >/dev/null 2>&1 || CAL_DEFINED=no
 CAL_DIR="$(mktemp -d "$SEQ_DIR/cal-fixture.XXXXXX")" # removed with SEQ_DIR by the file's EXIT trap
 
 # State files under $CAL_STATE: current.log (live log), mode (ok|logs-fail|logs-empty|ps-fail|ps-empty),
@@ -2097,6 +2124,9 @@ cal_run "capture_agent_logs absent agent is expected only with absent-ok" cal_ab
 cal_bare_ok() {
   cal_setup ok some-payload
   cal_bare_errexit
+  # The child really took the success path: a snapshot exists and nothing was reported missing.
+  ls "$RUNROOT"/artifacts/agent-logs/*-42-x-lbl2.log >/dev/null 2>&1 || echo "bare run wrote no 42-x-lbl2 snapshot"
+  if grep -q MISSING-EVIDENCE "$CAL_STATE/bare.out"; then echo "bare run reported MISSING-EVIDENCE: $(cat "$CAL_STATE/bare.out")"; fi
 }
 cal_run "capture_agent_logs success path is safe as a bare statement under errexit" cal_bare_ok
 
@@ -2112,9 +2142,111 @@ cal_slot_parse() {
 }
 cal_run "capture_agent_logs numbers past .slot-0009 in decimal and skips non-numeric slots" cal_slot_parse
 
+# --- call-site guard (#4060 case 8): every agent lifecycle command is preceded by a capture --------
+# Static scan of the real phases and lib.sh. awk (not grep) so backslash continuations join into one
+# logical command and the "previous command" is the nearest non-blank, non-comment logical line.
+# Emits HIT rows (file:line, ok|BAD, context before the capture, command) and ABSENT rows (the
+# capture line carrying absent-ok, plus the command that follows it).
+cal_scan() {
+  awk '
+    function emit_absent(next_line) {
+      if (pend != "") { print "ABSENT\t" pend "\t" next_line; pend = "" }
+    }
+    function proc(t, ln,    idx, rest, n, toks, i, verb, hasagent, isCap, marker) {
+      marker = "\"${COMPOSE[@]}\""
+      if (t ~ /^[[:space:]]*$/ || t ~ /^[[:space:]]*#/) return
+      if (t ~ /^capture_agent_logs\(\) \{/) inhelper = 1
+      if (inhelper) { if (t ~ /^\}/) inhelper = 0; return }
+      emit_absent(t)
+      isCap = (t ~ /capture_agent_logs/)
+      if (isCap && t ~ /absent-ok/) pend = FILENAME ":" ln
+      idx = index(t, marker)
+      if (idx > 0) {
+        rest = substr(t, idx + length(marker))
+        sub(/[>|&;].*/, "", rest)
+        n = split(rest, toks, /[[:space:]]+/)
+        verb = ""; hasagent = 0
+        for (i = 1; i <= n; i++) {
+          if (toks[i] == "") continue
+          if (verb == "") verb = toks[i]; else if (toks[i] == "agent") hasagent = 1
+        }
+        if (verb == "down" || (hasagent && verb ~ /^(kill|stop|restart|start|rm|up)$/)) {
+          gsub(/^[[:space:]]+/, "", t)
+          print "HIT\t" FILENAME ":" ln "\t" (prev ~ /capture_agent_logs/ ? "ok" : "BAD") "\t" ctx "\t" t
+        }
+      }
+      prev = t
+      if (!isCap) ctx = t
+    }
+    FNR == 1 { emit_absent(""); prev = ""; ctx = ""; acc = ""; inhelper = 0 }
+    {
+      line = $0
+      if (acc == "") accln = FNR
+      if (line ~ /\\$/) { acc = acc substr(line, 1, length(line) - 1) " "; next }
+      proc(acc line, accln); acc = ""
+    }
+    END { emit_absent("") }
+  ' "$ROOT"/e2e/phases/*.sh "$LIB"
+}
+CAL_SCAN_OUT="$(cal_scan)"
+
+cal_guard_offenders() {
+  local bad
+  bad="$(printf '%s\n' "$CAL_SCAN_OUT" | awk -F'\t' '$1 == "HIT" && $3 == "BAD" { print "  " $2 ": " $5 }')"
+  [ -z "$bad" ] || printf 'agent lifecycle command without a preceding capture_agent_logs:\n%s\n' "$bad"
+}
+cal_run "every agent kill/stop/restart/start/rm/up/down in phases and lib.sh is preceded by capture_agent_logs" cal_guard_offenders
+
+cal_guard_nonvacuous() {
+  local hits
+  hits="$(printf '%s\n' "$CAL_SCAN_OUT" | awk -F'\t' '$1 == "HIT"')"
+  [ "$(printf '%s\n' "$hits" | grep -c .)" -ge 23 ] || echo "scan found only $(printf '%s\n' "$hits" | grep -c .) lifecycle commands, want >= 23"
+  has() { printf '%s\n' "$hits" | awk -F'\t' -v f="$1" -v c="$2" -v t="$3" 'index($2, f) > 0 && $4 ~ c && index($5, t) > 0 { found = 1 } END { exit !found }'; }
+  has phases/42-api-outage-readoption.sh '^export UZI_E2E_MAX_CONCURRENT_RUNS=2' '--force-recreate agent' || echo "scan missed phase 42 first recreate"
+  has phases/42-api-outage-readoption.sh '^RA_RESTORE_AT=' '--force-recreate agent' || echo "scan missed phase 42 RESTORE recreate"
+  has phases/70-handoff.sh '' 'if ! "${COMPOSE[@]}" up' || echo "scan missed phase 70 EXIT-trap recreate"
+  has phases/52-api-outage-outbox.sh '' 'stop agent >/dev/null || return 1' || echo "scan missed phase 52 stop_outbox_agent stop"
+  has phases/52-api-outage-outbox.sh '' 'agent recreation failed' || echo "scan missed phase 52 recreate_outbox_agent up"
+  has e2e/lib.sh '' 'down -v --remove-orphans' || echo "scan missed lib.sh teardown down -v"
+}
+cal_run "lifecycle call-site scan is non-vacuous (finds the incident, restore, trap, helper and teardown sites)" cal_guard_nonvacuous
+
+cal_guard_absent_ok() {
+  local rows n
+  rows="$(printf '%s\n' "$CAL_SCAN_OUT" | awk -F'\t' '$1 == "ABSENT"')"
+  n="$(printf '%s\n' "$rows" | grep -c . || true)"
+  [ "$n" = 4 ] || echo "absent-ok used at $n sites, want exactly 4 (05, 13, 15 post-down up, lib.sh teardown): $rows"
+  printf '%s\n' "$rows" | awk -F'\t' '
+    $2 ~ /phases\/05-lane-forgejo\.sh:/ && $3 ~ /up -d --wait agent/ { a = 1 }
+    $2 ~ /phases\/13-worker-join-online\.sh:/ && $3 ~ /up -d --wait agent/ { b = 1 }
+    $2 ~ /phases\/15-happy-path-restart\.sh:/ && $3 ~ /up -d --wait agent/ { c = 1 }
+    $2 ~ /e2e\/lib\.sh:/ && $3 ~ /down -v/ { d = 1 }
+    END { if (!a) print "absent-ok missing at 05 initial up"
+          if (!b) print "absent-ok missing at 13 initial up"
+          if (!c) print "absent-ok missing at 15 post-down up"
+          if (!d) print "absent-ok missing at lib.sh teardown down" }'
+}
+cal_run "absent-ok appears only at the initial starts, the post-down restart and teardown" cal_guard_absent_ok
+
+# Phase 42 (#4060 case 9): run the REAL block from the cap-2 export through its first force-recreate
+# against the lifecycle fake. The fake records whether a snapshot holding the outgoing log existed
+# when the recreate ran, so deleting the wired capture line turns this red on behaviour.
+cal_phase42_first_recreate() {
+  cal_setup ok outgoing-process
+  local block
+  block="$(awk '/^export UZI_E2E_MAX_CONCURRENT_RUNS=2/ {a=1} a {print} a && /--force-recreate agent/ {exit}' "$ROOT/e2e/phases/42-api-outage-readoption.sh")"
+  [ -n "$block" ] || { echo "could not extract the phase 42 first-recreate block"; return 0; }
+  case "$block" in *'--force-recreate agent'*) ;; *) echo "extracted block lacks the recreate"; return 0 ;; esac
+  eval "$block"
+  grep -qx 'snapshot-present=yes' "$CAL_STATE/recorded" 2>/dev/null || { echo "phase 42 recreated the agent with no outgoing-log snapshot on disk"; return 0; }
+  grep -q outgoing-process "$(cal_files log | head -1)" 2>/dev/null || echo "phase 42 snapshot lacks outgoing-process"
+  [ ! -s "$CAL_STATE/bad-argv" ] || echo "unexpected argv: $(cat "$CAL_STATE/bad-argv")"
+}
+cal_run "phase 42 snapshots the outgoing agent log before its first force-recreate" cal_phase42_first_recreate
+
 node --test "$ROOT/e2e/settlement-diagnostic.test.mjs"
 node --test "$ROOT/e2e/recovery-record-projection.test.mjs"
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has at least 212 cases green (including the
+# Tally guard (the driver.test.sh idiom): a real run has at least 216 cases green (including the
 # capture_agent_logs cal_* cases); a zero-case or partially-red run must exit nonzero.
-[ "$cases" -ge 212 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -ge 216 ] && [ "$cases" -eq "$passed" ]

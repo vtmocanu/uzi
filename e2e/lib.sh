@@ -230,6 +230,7 @@ cleanup() {
     exit $code
   fi
   say "tearing down (down -v)"
+  capture_agent_logs teardown before-down absent-ok
   "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
   # --- rundir retention on a RED run (PRD #966 M3, D5) ------------------------
   # A red run KEEPS its scratch dir so the per-phase artifacts/ the driver captured

@@ -116,6 +116,7 @@ say "issue a worker join token and bring the worker online"
 WTOKEN="$(apipost /api/workers '{"name":"e2e-worker-fj"}' | jq -r '.token')"
 { [ -n "$WTOKEN" ] && [ "$WTOKEN" != null ]; } || fail "no worker token minted"
 export UZI_WORKER_TOKEN="$WTOKEN"
+capture_agent_logs 05-lane-forgejo initial-up absent-ok
 "${COMPOSE[@]}" up -d --wait agent
 wait_worker_online
 pass "worker registered and is online"
