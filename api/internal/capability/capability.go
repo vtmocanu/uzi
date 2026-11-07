@@ -340,7 +340,11 @@ const RecoveryPrerequisiteClosureV1 = "recovery_prerequisite_closure_v1"
 // RecoveryBindinglessClosedV1 negotiates exact historical custody observations independently of publication writes.
 const RecoveryBindinglessClosedV1 = "recovery_bindingless_closed_v1"
 
+// RecoveryRunOpenHoldsV1 negotiates the run-wide open-hold count on the worker recovery-holds read.
+const RecoveryRunOpenHoldsV1 = "recovery_run_open_holds_v1"
+
 var protocolVocabulary = map[string]struct{}{
+	RecoveryRunOpenHoldsV1:          {},
 	RecoveryBindinglessClosedV1:     {},
 	ProviderPolicyHoldV1:            {},
 	PendingOutcomeScopedClaimV1:     {},
