@@ -18,7 +18,7 @@ import (
 
 // credentialsResetResumeRefusal is the 409 body of an owner Resume on a credentials_reset hold
 // (PRD #3989 M3). Only the credential promoter releases that hold.
-const credentialsResetResumeRefusal = "credentials were reset; add a credential in Settings and the run resumes automatically"
+var credentialsResetResumeRefusal = workersvc.ErrCredentialsResetHeld.Error()
 
 // ResumeRunNow resumes an owner-held pool_wait or paused run, or starts a new
 // worker-recovery episode for recovery_wait/worker_requeue_exhausted. The owner-scoped

@@ -395,12 +395,13 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	// Anthropic token parks on credentials_reset through the same exact-claim park as a disabled
 	// credential, and the promoter releases it once a credential exists. Only errNoModelCredential
 	// qualifies, never errCredentialUnavailable as a whole (forge-origin refusal, repo-owner mismatch
-	// and an undecryptable token stay terminal). A job never parks and a Claude checker child was
-	// already mapped to errCheckerPinUnavailable above, so neither matches. A user with no marker, or
-	// a run created after it, keeps today's terminal failure.
+	// and an undecryptable token stay terminal). Job, judge and cross_check runs are unchanged and
+	// keep their terminal failure (a Claude checker child was already mapped to
+	// errCheckerPinUnavailable above). A user with no marker, or a run created after it, keeps
+	// today's terminal failure.
 	parkReason := holdCredentialDisabled
 	if !credDisabled && errors.Is(assemblyErr, errNoModelCredential) &&
-		run.Kind != runkind.Job && run.Kind != runkind.CrossCheck {
+		run.Kind != runkind.Job && run.Kind != runkind.Judge && run.Kind != runkind.CrossCheck {
 		reset, err := claimCredentialsReset(ctx, q, locked)
 		if err != nil {
 			return nil, "", err

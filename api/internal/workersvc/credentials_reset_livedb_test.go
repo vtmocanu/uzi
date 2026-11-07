@@ -155,6 +155,67 @@ func TestClaimNeverResetUserStillFailsLiveDB(t *testing.T) {
 	}
 }
 
+// TestSetRunCredentialRefusesCredentialsResetHoldLiveDB: set-token on a run held on
+// credentials_reset is refused up front with the named error and writes no override (a resume
+// would be refused after the write otherwise).
+//
+// MUTATION: remove the credentials_reset arm in SetRunCredential's paused case; the override is
+// written and the error becomes ErrCredentialSwitchRaced.
+func TestSetRunCredentialRefusesCredentialsResetHoldLiveDB(t *testing.T) {
+	fx := newCDFix(t)
+	runID := fx.queuedRun(t, "issue")
+	fx.env.exec(`UPDATE runs SET status = 'paused', hold_reason = 'credentials_reset',
+	    status_since = now() - interval '10 minutes', claim_released_at = now() - interval '10 minutes' WHERE id = $1`, runID)
+	before := mustRun(t, fx.env, runID)
+	_, err := fx.svc.SetRunCredential(fx.env.ctx, fx.userID, runID, CredentialOverrideModePinned, &fx.otherTok)
+	if !errors.Is(err, ErrCredentialsResetHeld) {
+		t.Fatalf("SetRunCredential err = %v, want ErrCredentialsResetHeld", err)
+	}
+	assertOverrideUnchanged(t, fx.env, before)
+	assertHeldOn(t, fx.env, runID, "credentials_reset")
+}
+
+// TestClaimCredentialsResetJudgeAndJobStayTerminalLiveDB: judge and job runs are unchanged by the
+// reset park; created before the marker and token-less, they still fail with the old text.
+//
+// MUTATION: drop runkind.Judge or runkind.Job from the guard in finishRunClaimTx; that case parks.
+func TestClaimCredentialsResetJudgeAndJobStayTerminalLiveDB(t *testing.T) {
+	for _, kind := range []string{"judge", "job"} {
+		t.Run(kind, func(t *testing.T) {
+			fx := newCDFix(t)
+			var runID uuid.UUID
+			if kind == "judge" {
+				runID = fx.judgeRun(t)
+			} else {
+				runID = fx.queuedRun(t, "issue")
+			}
+			resetAccountCredentials(fx.env, fx.userID, "now()")
+			// Both kinds reach the finisher with the assembly error a token-less owner produces.
+			run, err := fx.env.q.ClaimRun(fx.env.ctx, claimRunParamsFor(fx.worker(t)))
+			if err != nil || run.ID != runID {
+				t.Fatalf("ClaimRun = (%v, %v), want run %s", run.ID, err, runID)
+			}
+			if kind == "job" {
+				// The run lane does not hand a job to this fixture worker, so claim an issue run and
+				// reshape the claimed row into a repo-less job before the finisher sees it.
+				// A job opens no custody hold, so drop the one the issue claim opened.
+				fx.env.exec(`DELETE FROM recovery_custody_holds WHERE run_id=$1`, runID)
+				fx.env.exec(`UPDATE runs SET kind='job', repo_id=NULL, issue_iid=NULL, branch=NULL, job_type='research' WHERE id=$1`, runID)
+				run = mustRun(t, fx.env, runID)
+			}
+			payload, err := fx.svc.finishRunClaim(fx.env.ctx, run, nil, errNoModelCredential,
+				claimRecoveryIdentity{workerID: fx.workerID, recoveryCapable: true})
+			if payload != nil || err != nil {
+				t.Fatalf("finishRunClaim = (%v, %v), want an idle failure", payload != nil, err)
+			}
+			r := assertFailedCredentialUnavailable(t, fx.env, runID)
+			if r.HoldReason.Valid || r.FailureReason.String != "credential unavailable: no Anthropic token configured for this user" {
+				t.Fatalf("hold=%v failure_reason=%q, want the unchanged token-less text", r.HoldReason, r.FailureReason.String)
+			}
+		})
+	}
+}
+
 // TestClaimCredentialsResetOtherRefusalsStayTerminalLiveDB: errCredentialUnavailable also covers
 // forge-origin refusal, repo-owner mismatch and an undecryptable PAT; only errNoModelCredential
 // parks, so a user with a reset marker still fails these terminally with their own reason.
@@ -187,6 +248,25 @@ func TestClaimCredentialsResetOtherRefusalsStayTerminalLiveDB(t *testing.T) {
 				t.Fatalf("failure_reason = %q, want %q", r.FailureReason.String, assembly.Error())
 			}
 		})
+	}
+}
+
+// TestClaimCredentialsResetUndecryptableTokenStaysTerminalLiveDB: a reset marker with an Anthropic
+// token the vault cannot open is not "no credential": the run fails with the undecryptable reason.
+//
+// MUTATION: classify on errCredentialUnavailable instead of errNoModelCredential; this run parks.
+func TestClaimCredentialsResetUndecryptableTokenStaysTerminalLiveDB(t *testing.T) {
+	fx := newCDFix(t)
+	runID := fx.queuedRun(t, "issue")
+	fx.env.exec(`UPDATE user_secrets SET ciphertext = '\x6e6f742d7365616c65642d62792d746869732d626f78'::bytea
+	    WHERE user_id = $1 AND kind = 'anthropic_token'`, fx.userID)
+	fx.env.exec(`UPDATE users SET credentials_reset_at = now() WHERE id = $1`, fx.userID)
+	if payload, err := fx.svc.Claim(fx.env.ctx, fx.worker(t), nil); err != nil || payload != nil {
+		t.Fatalf("Claim = (%v, %v), want an idle failure", payload != nil, err)
+	}
+	r := assertFailedCredentialUnavailable(t, fx.env, runID)
+	if r.HoldReason.Valid || !strings.Contains(r.FailureReason.String, "could not be decrypted") {
+		t.Fatalf("hold=%v failure_reason=%q, want the undecryptable reason", r.HoldReason, r.FailureReason.String)
 	}
 }
 

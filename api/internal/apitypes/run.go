@@ -464,6 +464,7 @@ type RunDTO struct {
 	// for a completion hold (PRD #1226), 'budget_exhausted' for a wall-clock park (PRD #1497),
 	// 'iteration_budget_exhausted' for an iteration park (Resume/Cancel; Extend adds time only),
 	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14),
+	// 'credentials_reset' while a run created before an account reset waits for a new credential (PRD #3989),
 	// 'credential_switch_settling' while the worker is still finishing its own operations on a run whose
 	// token switch could not be proven settled (Resume is refused until it finishes; Cancel works),
 	// 'credential_switch_unsettled' once it finished them, processes not proven stopped (Resume is open) (issue
@@ -1389,6 +1390,7 @@ type RunSummaryItemDTO struct {
 	// for a completion hold (PRD #1226), 'budget_exhausted' for a wall-clock park (PRD #1497),
 	// 'iteration_budget_exhausted' for an iteration park (Resume/Cancel; Extend adds time only),
 	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14),
+	// 'credentials_reset' while a run created before an account reset waits for a new credential (PRD #3989),
 	// 'credential_switch_settling' while the worker is still finishing its own operations on a run whose
 	// token switch could not be proven settled (Resume is refused until it finishes; Cancel works),
 	// 'credential_switch_unsettled' once it finished them, processes not proven stopped (Resume is open) (issue

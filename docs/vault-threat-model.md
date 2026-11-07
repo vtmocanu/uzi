@@ -209,7 +209,9 @@ and a `vault_only` link grants no access.
   password gets a `password` link. The seed admin, the issuer's own account and
   deactivated targets are still refused.
 - **Running runs.** A run already executing keeps the credential its worker was
-  issued until it ends; stopping or fencing active runs is out of scope. Its
+  issued until it ends; stopping or fencing active runs is out of scope. The
+  same holds for a Claude claim whose credential was already opened when the
+  reset committed: it is delivered on that credential. A running run's
   Codex refresh writes against a deleted account fail closed. Queued runs are
   not claimed until the new vault exists and is unlocked. After that, a
   Claude-harness or chat run created before the reset that finds no model

@@ -3995,7 +3995,9 @@ export interface Run {
    *
    *  `hold_reason` names why a `paused` run is server-held, else null: 'completion_blocked' for
    *  a completion hold, 'credential_disabled' for a run waiting on a disabled credential
-   *  (PRD #1732 D14; resumes on Enable, never on a plain Resume), 'budget_exhausted' for a
+   *  (PRD #1732 D14; resumes on Enable, never on a plain Resume), 'credentials_reset' for a run
+   *  created before an account reset that waits for a new credential (PRD #3989; resumes
+   *  automatically once one exists), 'budget_exhausted' for a
    *  wall-clock park (PRD #1497), and 'provider_unavailable' for a provider outage bound
    *  reached (PRD #1733; owner Resume, scoped Stop when permitted, or Cancel).
    *  Issue #3181: 'credential_switch_settling' when an owner token switch on a retained-recovery
