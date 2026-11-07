@@ -105,7 +105,7 @@ func (f *lifecycleFixture) createRun(t *testing.T) *lifecycleRun {
 	iid := f.nextIID
 	f.nextIID++
 	seedEligibleIssue(t, f.env, f.repoID, iid)
-	run, err := f.svc.CreateRun(f.env.ctx, f.userID, f.repoID, iid, "desc", nil, nil, false, nil, nil, nil)
+	run, err := f.svc.CreateRun(f.env.ctx, f.userID, f.repoID, iid, "desc", nil, nil, false, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}

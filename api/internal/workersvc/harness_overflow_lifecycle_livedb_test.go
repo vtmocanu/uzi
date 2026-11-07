@@ -46,7 +46,7 @@ func TestHarnessOverflowClaimParkPromoteReclaimFrozenLiveDB(t *testing.T) {
 	w := wkrRow(t, env, workerID)
 	wait := true
 	run, err := svc.CreateRun(env.ctx, fx.userID, fx.repoID, fx.nextIssue(),
-		"overflow lifecycle", &wait, nil, false, nil, nil, nil)
+		"overflow lifecycle", &wait, nil, false, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

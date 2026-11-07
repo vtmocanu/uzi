@@ -22872,6 +22872,10 @@ const PLANNING_LIMITS = {
   sourceAllowance: 128 * 1024 * 1024, indexAllowance: 2 * 1024 * 1024,
   pathAllowance: 20000, entryAllowance: 30000, directoryAllowance: 2048,
   ignoreAllowance: 128 * 1024 * 1024, ignorePipeAllowance: 2 * 1024 * 1024,
+  // Absolute caps on base discovery, chosen in #3543 from measurement
+  // (e2e/planning-base-discovery-measure/RESULTS.md): at least 2x Chromium's
+  // 563,282 entries / 42,616,138 path bytes.
+  baseDiscoveryEntryCap: 1_200_000, baseDiscoveryPathByteCap: 96 * 1024 * 1024,
 };
 
 /**
@@ -22882,6 +22886,7 @@ export const PLANNING_REFUSAL_TOKENS: Readonly<Record<string, PlanCrossCheckDiff
   untracked_path_cap: "too_many_untracked",
   patch_cap: "diff_too_large", source_cap: "diff_too_large", total_source_cap: "diff_too_large",
   base_source_cap: "diff_too_large", snapshot_cap: "diff_too_large",
+  base_discovery_entry_cap: "diff_too_large", base_discovery_path_byte_cap: "diff_too_large",
   base_object_type_mismatch: "base_unavailable", base_object_integrity: "base_unavailable",
   invalid_base_commit_tree: "base_unavailable", "errno:ENOENT": "base_unavailable",
   unsupported_symlink: "unsupported_entry", unsupported_gitlink: "unsupported_entry",
@@ -22945,8 +22950,12 @@ export function classifyPlanningCaptureError(message: string): {
  * Clone counters start independently at zero except source, which starts at C.
  * Limits add worker allowances to those baselines; no clone metadata grants credit.
  * Reads consume remaining credit plus one sentinel. Each counter names its fixed
- * refusal token below. Commit/tree objects have a per-object 2 MiB cap, depth 64,
- * with no aggregate base ceiling or cache; the shared deadline bounds discovery.
+ * refusal token below. Commit/tree objects have a per-object 2 MiB cap and depth 64.
+ * Discovery is also bounded by two absolute aggregate caps: tree-entry occurrences
+ * (every entry, each walk of a shared subtree charged again) and cumulative
+ * relative-path bytes of every entry (charged before the path string is built),
+ * refusing base_discovery_entry_cap / base_discovery_path_byte_cap. There is still
+ * no cache; the shared deadline remains.
  * Tracked symlinks (mode 120000) are accepted only when unchanged: the link is
  * read with readlink through the still-open pinned parent descriptor and its
  * target hash must equal the base blob id; the target is never opened or
@@ -23246,9 +23255,10 @@ async function indexEntries(bytes) {
   let limits;
   try { limits = JSON.parse(limitsJson ?? "null"); } catch { refuse("invalid_limits"); }
   const keys = limits && typeof limits === "object" && !Array.isArray(limits) ? Object.keys(limits).sort() : [];
-  if (keys.join() !== "directoryAllowance,entryAllowance,ignoreAllowance,ignorePipeAllowance,indexAllowance,pathAllowance,sourceAllowance"
+  if (keys.join() !== "baseDiscoveryEntryCap,baseDiscoveryPathByteCap,directoryAllowance,entryAllowance,ignoreAllowance,ignorePipeAllowance,indexAllowance,pathAllowance,sourceAllowance"
       || keys.some(k => !Number.isSafeInteger(limits[k]) || limits[k] <= 0)) refuse("invalid_limits");
   for (const key of keys) add(limits[key], 0);
+  add(limits.baseDiscoveryEntryCap, 1); add(limits.baseDiscoveryPathByteCap, 1);
   const root = absoluteDirectory(clone);
   const gd = directory(root, ".git");
   // Only the explicit worker authority supplies objects. Never inspect clone objects.
@@ -23295,7 +23305,7 @@ async function indexEntries(bytes) {
   const treeHeader = /^tree ([0-9a-f]{40})\n/.exec(commit.subarray(0, 46).toString("ascii"));
   if (!treeHeader || !commit.subarray(0, 46).equals(Buffer.from(treeHeader[0]))) refuse("invalid_base_commit_tree");
   const old = new Map();
-  let B = 0, N = 0, D = 0, E = 0, I = 32, G = 0, Q = 0;
+  let B = 0, N = 0, D = 0, E = 0, I = 32, G = 0, Q = 0, P = 0;
   async function tree(oid, prefix, depth) {
     await maybeYield();
     if (depth > DEPTH_LIMIT) refuse("directory_cap");
@@ -23306,6 +23316,7 @@ async function indexEntries(bytes) {
     while (at < bytes.length) {
       await maybeYield();
       E = add(E, 1);
+      if (E > limits.baseDiscoveryEntryCap) refuse("base_discovery_entry_cap");
       const space = bytes.indexOf(32, at), end = bytes.indexOf(0, at);
       if (space < at || end <= space || end + 21 > bytes.length) refuse("invalid_base_tree");
       const mode = bytes.toString("ascii", at, space);
@@ -23321,6 +23332,8 @@ async function indexEntries(bytes) {
       prior = key;
       const childOid = bytes.subarray(end + 1, end + 21).toString("hex");
       at = end + 21;
+      P = add(P, add(Buffer.byteLength(prefix), raw.length));
+      if (P > limits.baseDiscoveryPathByteCap) refuse("base_discovery_path_byte_cap");
       const rel = prefix + name; components(rel);
       Q = add(Q, add(Buffer.byteLength(rel), mode === "40000" ? 2 : 1));
       if (mode === "40000") await tree(childOid, rel + "/", depth + 1);

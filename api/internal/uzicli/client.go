@@ -368,7 +368,7 @@ type Client interface {
 	// sends no meaningful selection (byte-identical to a pre-#1429 create; the server
 	// resolves the effective harness itself, D11), "claude"/"codex" (validated CLIENT-SIDE
 	// before this call) rides as an explicit pin.
-	CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, credOverride *CreateRunCredentialOverride, harness string) (CreatedRunResult, error)
+	CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, agentSource string, credOverride *CreateRunCredentialOverride, harness string) (CreatedRunResult, error)
 	// CreateTaskRun queues a handoff/task run on a repo (PRD #400 M3). A nil
 	// continuedIssueIID omits the optional existing-issue link:
 	// POST /api/repos/{id}/task-runs {context, base_branch?, open_mr}. The server
