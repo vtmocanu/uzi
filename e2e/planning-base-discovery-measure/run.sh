@@ -52,7 +52,7 @@
 # Disk preflight (require_free): before any work, before each fixture generation and before each
 # container creation, the host filesystems of /data and of $OUT and the docker store (read with a
 # zero-write probe container pbd-dfprobe-<pid>, created once, `df -Pk /` of the image) must each have
-# >= MIN_FREE_GIB GiB free. A store below the floor, or one that cannot be read, prints
+# >= MIN_FREE_GIB GiB free (the docker store: MIN_FREE_GIB_DOCKER). A store below the floor, or one that cannot be read, prints
 # `BLOCKED: disk preflight (<what>): <store> has <n> KiB free, need >= <floor>` and exits 3 without
 # creating anything further.
 #
@@ -80,6 +80,8 @@ GEN_TIMEOUT="${GEN_TIMEOUT:-1200}"
 [[ "$START_TIMEOUT" =~ ^[1-9][0-9]{0,5}$ ]] || { echo "START_TIMEOUT must be a positive integer of seconds: $START_TIMEOUT" >&2; exit 2; }
 [[ "$GEN_TIMEOUT" =~ ^[1-9][0-9]{0,5}$ ]] || { echo "GEN_TIMEOUT must be a positive integer of seconds: $GEN_TIMEOUT" >&2; exit 2; }
 SMOKE_INJECT="${SMOKE_INJECT:-}"
+# The gate's block exit; never read from the environment (only GATE_SELFTEST sets it, to 6).
+GATE_BLOCK_EXIT=4
 MIN_FREE_GIB="${MIN_FREE_GIB:-5}"
 # Bounded digits keep the arithmetic below inside bash integers; a leading zero is read as decimal.
 [[ "$MIN_FREE_GIB" =~ ^[0-9]{1,6}$ ]] && [ "$((10#$MIN_FREE_GIB))" -ge 5 ] \
@@ -243,8 +245,12 @@ confirm_readable() {
     return 0
   fi
   preserve_container "$name" "$failing"
-  echo "BLOCKED: unreadable results preserved in container $PRESERVED_ID" >&2
-  exit 4
+  if [ "$GATE_BLOCK_EXIT" = 6 ]; then
+    echo "GATE_SELFTEST passed: the gate preserved container $PRESERVED_ID ($name)" >&2
+  else
+    echo "BLOCKED: unreadable results preserved in container $PRESERVED_ID" >&2
+  fi
+  exit "$GATE_BLOCK_EXIT"
 }
 
 cleanup() {
@@ -267,7 +273,7 @@ trap cleanup EXIT
 df_avail_kib() {
   df -Pk "$1" 2>/dev/null | awk 'NR == 2 && $4 ~ /^[0-9]+$/ { print $4 }'
 }
-# require_free <what>: exit 3 unless /data, $OUT and the docker store each have >= MIN_FREE_GIB GiB.
+# require_free <what>: exit 3 unless /data and $OUT have >= MIN_FREE_GIB GiB and the docker store >= MIN_FREE_GIB_DOCKER.
 # The docker store is read through a zero-write probe container (read-only rootfs, tmpfs volumes,
 # no network), created once after the first host check and started with -a on every later call.
 require_free() {
@@ -377,21 +383,15 @@ for config in $MEM_CONFIGS; do
   mv "$OUT/results/warmup__$idx.term.json" "$OUT/logs/warmup__$idx.term.json"
   if [ -n "$GATE_SELFTEST" ]; then
     # Prove the readability gate: a measurement-style label whose result file is empty must keep
-    # the container. The gate exits 4 on success of the proof; reaching the line after it is a failure.
+    # the container. The real gate (confirm_readable) runs with its block exit set to 6, so it exits
+    # 6 when it preserves; returning from it means it removed the container, which is a failure.
     run_job "$name" "selftest__gate" "$job_timeout" '{"kind":"noop"}'
-    printf '{"selftest":true}\n' > "$OUT/results/selftest__gate.json"
     : > "$OUT/results/selftest__gate.json"
     log "GATE_SELFTEST: result file truncated to empty; the gate must preserve $name"
-    failing="$(unreadable_all "${CUR_LABELS[@]}")"
-    if [ -z "$failing" ]; then
-      docker rm -f -v "$name" >/dev/null 2>&1 || true
-      CREATED=()
-      echo "GATE_SELFTEST FAILED: the gate accepted an empty result file and removed $name" >&2
-      exit 5
-    fi
-    preserve_container "$name" "$failing"
-    echo "GATE_SELFTEST passed: the gate preserved container $PRESERVED_ID ($name)" >&2
-    exit 6
+    GATE_BLOCK_EXIT=6
+    confirm_readable "$name" "${CUR_LABELS[@]}"
+    echo "GATE_SELFTEST FAILED: the gate accepted an empty result file and removed $name" >&2
+    exit 5
   fi
   for spec in $FIXTURES; do
     if [ ! -f "$OUT/fixtures/$spec/manifest.json" ] && [ "${generated#* "$spec" }" = "$generated" ]; then
