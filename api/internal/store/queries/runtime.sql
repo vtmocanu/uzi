@@ -844,6 +844,22 @@ WHERE run_id = ANY(@run_ids::uuid[])
   AND kind = 'tool_use'
 ORDER BY run_id, seq DESC;
 
+-- name: PendingQuestionsForRuns :many
+-- The newest `question` message per run for a page of awaiting_input runs (PRD #4040,
+-- pending_question). The inner query picks the newest row per run FIRST, the outer one
+-- then bounds it: an oversized newest payload (over 64 KiB as text) comes back NULL, so
+-- it yields no excerpt and never falls back to an older question. A run with no question
+-- message returns no row. Served by the partial index idx_run_messages_question_seq
+-- (migration 00400).
+SELECT run_id, (CASE WHEN octet_length(payload::text) <= 65536 THEN payload ELSE NULL END)::jsonb AS payload
+FROM (
+  SELECT DISTINCT ON (run_id) run_id, payload
+  FROM run_messages
+  WHERE run_id = ANY(@run_ids::uuid[])
+    AND kind = 'question'
+  ORDER BY run_id, seq DESC
+) newest;
+
 -- name: LiveLaneFramesForRun :many
 -- PRD #1353: newest tool_use frame per live subagent instance for a run (DISTINCT ON
 -- agent_instance, greatest seq). milestonelanes.Derive folds each into a lane and back-joins

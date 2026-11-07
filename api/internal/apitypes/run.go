@@ -2022,6 +2022,8 @@ type RunSummaryItemDTO struct {
 	JudgeVerdict   *string `json:"judge_verdict"`
 	JudgeTodoCount int     `json:"judge_todo_count"`
 	IsRevising     bool    `json:"is_revising"`
+	// PendingQuestion mirrors RunListItemDTO.PendingQuestion (PRD #4040).
+	PendingQuestion string `json:"pending_question,omitempty"`
 }
 
 // RunSummaryOf projects a decorated list row onto the compact summary view (issue #2661). The
@@ -2206,6 +2208,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		JudgeVerdict:                  item.JudgeVerdict,
 		JudgeTodoCount:                item.JudgeTodoCount,
 		IsRevising:                    item.IsRevising,
+		PendingQuestion:               item.PendingQuestion,
 		CodeCrossCheckRequired:        item.CodeCrossCheckRequired,
 		CodeCrossCheckSummary:         item.CodeCrossCheckSummary,
 		AccountCooldownClass:          item.AccountCooldownClass,
@@ -2396,11 +2399,12 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			AccountCooldownClass:          s.AccountCooldownClass,
 			AccountCooldownEligibleAt:     s.AccountCooldownEligibleAt,
 		},
-		RepoPath:       s.RepoPath,
-		WorkerName:     s.WorkerName,
-		OwnerEmail:     s.OwnerEmail,
-		JudgeVerdict:   s.JudgeVerdict,
-		JudgeTodoCount: s.JudgeTodoCount,
+		RepoPath:        s.RepoPath,
+		WorkerName:      s.WorkerName,
+		OwnerEmail:      s.OwnerEmail,
+		JudgeVerdict:    s.JudgeVerdict,
+		JudgeTodoCount:  s.JudgeTodoCount,
+		PendingQuestion: s.PendingQuestion,
 	}
 }
 
@@ -2432,6 +2436,10 @@ type RunListItemDTO struct {
 	// bucketed in Go. See queries/runtime.sql for why the count cannot ride the join.
 	JudgeVerdict   *string `json:"judge_verdict"`
 	JudgeTodoCount int     `json:"judge_todo_count"`
+	// PendingQuestion is the one-line excerpt of the run's newest pending question (PRD
+	// #4040), runquestion.Excerpt of the question message. Owner-only: ListRuns sets it for
+	// awaiting_input rows; the admin list never carries it. Omitted when absent.
+	PendingQuestion string `json:"pending_question,omitempty"`
 }
 
 // MessageDTO is one persisted run message (the replay source a reconnecting
@@ -2669,17 +2677,19 @@ func (r *RunListItemDTO) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	var context struct {
-		RepoPath       string  `json:"repo_path"`
-		WorkerName     *string `json:"worker_name"`
-		OwnerEmail     *string `json:"owner_email"`
-		JudgeVerdict   *string `json:"judge_verdict"`
-		JudgeTodoCount int     `json:"judge_todo_count"`
+		RepoPath        string  `json:"repo_path"`
+		WorkerName      *string `json:"worker_name"`
+		OwnerEmail      *string `json:"owner_email"`
+		JudgeVerdict    *string `json:"judge_verdict"`
+		JudgeTodoCount  int     `json:"judge_todo_count"`
+		PendingQuestion string  `json:"pending_question"`
 	}
 	if err := json.Unmarshal(data, &context); err != nil {
 		return err
 	}
 	*r = RunListItemDTO{RunDTO: run, RepoPath: context.RepoPath, WorkerName: context.WorkerName,
-		OwnerEmail: context.OwnerEmail, JudgeVerdict: context.JudgeVerdict, JudgeTodoCount: context.JudgeTodoCount}
+		OwnerEmail: context.OwnerEmail, JudgeVerdict: context.JudgeVerdict, JudgeTodoCount: context.JudgeTodoCount,
+		PendingQuestion: context.PendingQuestion}
 	return nil
 }
 
