@@ -101,6 +101,25 @@ func TestWorkerRepoAgentSourceRevisionLiveDB(t *testing.T) {
 		return fmt.Sprintf(`{"status":"running","repo_agents":[{"name":%q,"description":"d"}],"repo_agent_source_commit":%q}`, agent, commit)
 	}
 
+	t.Run("the plan agent source is stored, shown on the ack and overwritten on a replan", func(t *testing.T) {
+		id := seed(t)
+		path := "/api/worker/runs/" + id.String() + "/state"
+		for _, source := range []string{"repo", "own"} {
+			out := post(t, path, fmt.Sprintf(`{"status":"running","plan_agent_source":%q}`, source), http.StatusOK)
+			if run, _ := out["run"].(map[string]any); run["plan_agent_source"] != source {
+				t.Fatalf("ack run.plan_agent_source = %v, want %s", run["plan_agent_source"], source)
+			}
+		}
+		post(t, path, `{"status":"running","plan_agent_source":"both"}`, http.StatusBadRequest)
+		run, err := q.GetRunByID(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if run.PlanAgentSource.String != "own" {
+			t.Fatalf("stored plan_agent_source = %v, want own", run.PlanAgentSource)
+		}
+	})
+
 	t.Run("the first revision is stored and a different one is refused", func(t *testing.T) {
 		id := seed(t)
 		path := "/api/worker/runs/" + id.String() + "/state"

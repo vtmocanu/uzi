@@ -2323,6 +2323,7 @@ UPDATE runs SET
     repo_agent_source_commit = COALESCE(repo_agent_source_commit, sqlc.narg('repo_agent_source_commit')::text),
     agent_source     = COALESCE(sqlc.narg('agent_source'), agent_source),
     agent_exclusions = COALESCE(sqlc.narg('agent_exclusions')::jsonb, agent_exclusions),
+    plan_agent_source = COALESCE(sqlc.narg('plan_agent_source')::text, plan_agent_source),
     -- PRD #84 M4: persist the plan-time INFERRED requirement set an AUTOPILOT run emits
     -- on this self-contained `running` report. An autopilot run auto-approves its own
     -- plan and never reports awaiting_approval, so SetRunAwaitingApproval's identical

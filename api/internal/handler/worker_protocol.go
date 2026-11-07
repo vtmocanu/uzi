@@ -483,6 +483,7 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		// unknown field, so a worker sends it only after seeing this token.
 		{"repo_agent_folder"},
 		{workersvc.RepoAgentSourceFeature},
+		{workersvc.PlanAgentSourceFeature},
 		{"terminal_rejection_report"}, // Issue #1974 M1; independent of active snapshots.
 		// Issue #3181: this api accepts {status:"credential_switch_held"} and
 		// {status:"credential_switch_hold_settled"} (each with claim_generation AND the reporting worker's

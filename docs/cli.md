@@ -376,12 +376,15 @@ A few worth knowing:
   empty or invalid. See [Repo agents](repo-agents.md#which-folder-is-read).
   `run create --plan-file` takes the same two flags, for the seeded run's
   roster.
-- **`run get` shows the requested and implemented agents.** A run that carries
-  a frozen agent-source request shows `AGENTS_REQUESTED` (for example
-  `repo agents (repo default)`, or `(this run)` for a seeded plan's source), and
-  once a selection is recorded `IMPLEMENTED_WITH` shows the roster used, with
+- **`run get` shows the requested, planning and implemented agents.** A run that
+  carries a frozen agent-source request shows `AGENTS_REQUESTED` (for example
+  `repo agents (repo default)`, or `(this run)` for a seeded plan's source) and
+  `PLANNED_WITH`, the agents its plan turn used (with the request's basis when
+  they match it, or `—` when no plan turn was recorded, as on a seeded run).
+  Once a selection is recorded `IMPLEMENTED_WITH` shows the roster used, with
   `(as requested)` or `(changed at approval)` when a request exists. `--json`
-  carries `agent_source_requested` and `agent_source_requested_basis`.
+  carries `agent_source_requested`, `agent_source_requested_basis` and
+  `plan_agent_source`.
 - **`repo list` shows each repo's default agents.** The `DEFAULT_AGENTS` column
   reads `own`, `repo` or `unset`; `--json` carries `agent_source_default`
   (`"own"`, `"repo"` or `null`). The setting is changed on the Repos page; the
