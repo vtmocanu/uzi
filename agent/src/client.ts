@@ -8,7 +8,7 @@ import { decodeCodeCoverage, type CodeCoverage } from "./code-cross-check-covera
 import { decodePublicationContext, validatePublicationContextRequest } from "./publication-context.js";
 import type { PublicationContextRequest, PublicationContextResponse } from "./protocol.js";
 import type { PublicationIntentRequest, PublicationIntentResult } from "./publication-intent.js";
-import type { LeadConfigReportBody } from "./protocol.js";
+import type { CodexCatalogDefaultBody, LeadConfigReportBody } from "./protocol.js";
 import { decodeCompletionPending, type CompletionPending } from "./completion-pending.js";
 import { SEMANTIC_GATE_ACK_MAX_BYTES, semanticGateAckSchema } from "./semantic-gate-wire.js";
 import { decodeInterruptedCalls, interruptedRegistration, type InterruptedRegistration, type InterruptedCalls } from "./interrupted-calls.js";
@@ -4894,6 +4894,24 @@ export class WorkerClient {
     }
   }
 
+  // ── Codex catalog default report (issue #3251) ─────────────────────────────
+  /** POST /worker/runs/:id/codex-catalog-default (204, no body). One attempt, never throws: a
+   *  refusal (404 from an older API, 409 stale claim/context, 400) is `http`, a network failure or
+   *  timeout is `transport`. */
+  async recordCodexCatalogDefault(
+    runId: string,
+    body: CodexCatalogDefaultBody,
+    timeoutMs = 5_000,
+  ): Promise<LeadConfigPostOutcome> {
+    try {
+      await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/codex-catalog-default`, body, timeoutMs);
+      return { kind: "ok" };
+    } catch (err) {
+      if (err instanceof RequestError) return { kind: "http", status: err.status };
+      return { kind: "transport", error: err };
+    }
+  }
+
   // ── Forge read surface (PRD #158) ──────────────────────────────────────────
   // Six worker-mediated, run-scoped forge READ endpoints the run-lane forge MCP
   // server calls. The agent holds NO credential — the API reads the forge on the
@@ -5392,16 +5410,33 @@ function maintenanceSignal(timeoutMs: number): AbortSignal {
   return AbortSignal.any([budget.signal, AbortSignal.timeout(duration), ...(pending ? [pending] : [])]);
 }
 
+// Rejections of the transport (fetch) promise itself, as opposed to budget checks or body reads.
+const fetchRejections = new WeakSet<object>();
+
+function markTransportRejection<T>(p: Promise<T>, signal?: AbortSignal | null): Promise<T> {
+  return p.catch((error: unknown) => {
+    // undici rejects with `signal.reason` itself on abort; that is an abort, not a transport failure.
+    if (signal?.aborted && error === signal.reason) throw error;
+    if ((typeof error === "object" || typeof error === "function") && error !== null) fetchRejections.add(error);
+    throw error;
+  });
+}
+
+/** True only for an error object that the transport promise rejected with (identity-preserved). */
+export function isFetchRejection(error: unknown): boolean {
+  return (typeof error === "object" || typeof error === "function") && error !== null && fetchRejections.has(error);
+}
+
 async function maintenanceFetch(transport: typeof fetch, url: string, init: RequestInit): Promise<Response> {
   MaintenanceResources.consumeIfActive("rpcAttempts", 1);
   const resourceSignal = MaintenanceResources.signalIfActive();
   if (resourceSignal) init = { ...init, signal: AbortSignal.any([resourceSignal, ...(init.signal ? [init.signal] : [])]) };
   const budget = MaintenanceBudget.current();
-  if (!budget && !resourceSignal && !MaintenanceBudget.ownedSignal()) return transport(url, init);
+  if (!budget && !resourceSignal && !MaintenanceBudget.ownedSignal()) return markTransportRejection(transport(url, init), init.signal);
   if (!budget || MaintenanceBudget.ownedSignal()) {
     budget?.check();
     init.signal?.throwIfAborted();
-    const res = await transport(url, init);
+    const res = await markTransportRejection(transport(url, init), init.signal);
     if (init.signal) responseSignals.set(res, init.signal);
     ownResponse(res, init.signal);
     if (MaintenanceBudget.ownedSignal()) {
@@ -5412,7 +5447,7 @@ async function maintenanceFetch(transport: typeof fetch, url: string, init: Requ
   }
   budget.check();
   const signal = AbortSignal.any([budget.signal, ...(init.signal ? [init.signal] : [])]);
-  const res = await budget.raceIO(() => transport(url, { ...init, signal }), late => {
+  const res = await budget.raceIO(() => markTransportRejection(transport(url, { ...init, signal }), signal), late => {
     // One detached cancellation attempt; an uncooperative body cannot block the caller.
     void late.body?.cancel().catch(() => undefined);
   }, signal);

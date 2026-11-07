@@ -299,6 +299,19 @@ const StoredFilesLockClass int32 = 0x757A7366 // "uzsf"
 // runs' usage writes for a moment.
 const RunUsageLockClass int32 = 0x757A7573 // "uzus"
 
+// CodexCatalogLockClass is the class half of the two-int advisory lock that serializes every
+// writer of ONE user's codex_catalog_defaults rows (issue #3251): the report's upsert and its
+// prune to at most 32 rows and 30 days run under it, so each prune sees every previously
+// committed row and the bound holds under concurrent reports. Taken in SQL by
+// LockCodexCatalogDefaults (queries/codex_catalog_defaults.sql), which carries this value as the
+// literal 1970955108 with the objid derived there from the user id;
+// TestCodexCatalogLockClassMatchesSQL fails if the two disagree and
+// TestProductTokenMintLockClassMatchesSQL's source enumeration fails on any collision with another
+// *LockClass. Lock order: the shared secret mutation lock first, then this lock, then the run row
+// (RecordCodexCatalogDefault); nothing holding a run row lock takes it. XACT-scoped. An objid
+// collision only serializes two unrelated users' reports for a moment.
+const CodexCatalogLockClass int32 = 0x757A6364 // "uzcd"
+
 // Migrate runs all pending goose migrations against the database at dsn. It
 // retries the initial connection so the API can start slightly ahead of
 // Postgres becoming ready.

@@ -56,6 +56,7 @@ import type {
   AdminUsage,
   SelfUsage,
   UserSettings,
+  CatalogDefault,
   CrossCheckPinDTO,
   CatalogEntry,
   AdminCliToken,
@@ -879,6 +880,19 @@ void _releaseCheckStatusFull;
   const absent: CrossCheckPinDTO = { stage: "plan", harness: "claude", model: null, effort: null, resolved_model: null, resolved_effort: "medium", model_source: "worker default", effort_source: "worker default", active: false };
   void missing; void extra; void nullable; void absent;
 }
+// Issue #3251: the Codex effort cell's catalog_default matches the Go recorder member for member.
+{
+  type RecordedCatalog = Extract<typeof userSettingsFull.effort_settings[number], { catalog_default: unknown }>["catalog_default"];
+  const missing: never = null as unknown as Exclude<keyof CatalogDefault, keyof RecordedCatalog>;
+  const extra: never = null as unknown as Exclude<keyof RecordedCatalog, keyof CatalogDefault>;
+  void missing; void extra;
+}
+it("recorded full effort cell carries the catalog_default object", () => {
+  for (const fixture of [userSettingsFull, settingsUserSettingsFull]) {
+    expect(Object.keys(fixture.effort_settings[0].catalog_default).sort()).toEqual(
+      ["effort", "model", "observed_at", "runtime_version", "state"]);
+  }
+});
 it("recorded nested checker metadata always has the nullable member", () => {
   expect(metadataCorpus.some(c => c.get_cross_check_pins.some(p => p.worker_default_model === null))).toBe(true);
   for (const fixture of [userSettingsFull, settingsUserSettingsFull, ...metadataCorpus.map(c => ({ cross_check_pins: c.get_cross_check_pins }))]) {

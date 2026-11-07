@@ -533,6 +533,43 @@ describe("RunsList — waiting for vault unlock (PRD #32)", () => {
     expect(screen.getByText("queued")).toBeTruthy();
   });
 
+  // #3954: a factory row is another user's run, so its wait badge names the owner,
+  // while the viewer's own waiting run above keeps "waits on you".
+  it("admin factory list badges another user's waiting run as waiting on its owner", async () => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: true, email: "me@uzi.test" },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+    const waiting: Partial<RunListItem> = {
+      status: "awaiting_approval",
+      status_since: "2026-11-05T10:00:00Z",
+      progress: { state: "waiting", pct: null, milestone_done: 0, milestone_total: 0, active_milestone_id: "", phase: "" },
+    };
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "mine", issue_title: "My waiting run", owner_email: "me@uzi.test", ...waiting })],
+    });
+    mockApi.adminListWorkers.mockResolvedValue({ workers: [] });
+    mockApi.adminListRuns.mockResolvedValue({
+      runs: [aRun({ id: "theirs", issue_title: "Their waiting run", owner_email: "other@uzi.test", ...waiting })],
+    });
+
+    renderRuns();
+
+    const theirs = await screen.findByText("Their waiting run");
+    const card = screen.getByText("Factory status (admin)").parentElement!;
+    expect(card.contains(theirs)).toBe(true);
+    const ownerBadge = within(card).getByText(/waits on owner/);
+    expect(ownerBadge.closest("[title]")!.getAttribute("title")).toMatch(/^Waiting for the owner's plan approval/);
+    expect(within(card).queryByText(/waits on you/)).toBeNull();
+
+    // The viewer's own waiting run, outside the card, still waits on the viewer.
+    const mine = screen.getByText("My waiting run");
+    expect(card.contains(mine)).toBe(false);
+    const youBadges = screen.getAllByText(/waits on you/);
+    expect(youBadges).toHaveLength(1);
+    expect(youBadges[0].closest("[title]")!.getAttribute("title")).toMatch(/^Waiting for your plan approval/);
+  });
+
   it("off users with an uncached vault get the ordinary queued state", async () => {
     vi.mocked(useAuth).mockReturnValue({ user: { is_admin: false }, vaultUnlocked: false, vaultMode: "unprotected" } as unknown as ReturnType<typeof useAuth>);
     mockApi.listRuns.mockResolvedValue({ runs: [aRun({ id: "q", issue_title: "Off queued run", status: "queued" })] });

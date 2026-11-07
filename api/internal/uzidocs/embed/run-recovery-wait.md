@@ -304,8 +304,11 @@ upgrading workers; mixed API replicas and API rollback are unsupported.
 
 ### Retained recovery adoption failed
 
-`recovery_wait` / `retained_recovery_adoption_failed` means an integrity check
-refused adoption. Local work and custody are preserved. This is an owner hold
+`recovery_wait` / `retained_recovery_adoption_failed` means adoption of the
+retained work did not complete: an integrity check refused it, or another
+adoption step could not be verified, including an ownership check right after
+adoption that failed other than through a connection failure the worker retries
+(connection refused or reset, a dropped socket, or a 502/503/504 answer). Local work and custody are preserved. This is an owner hold
 with **no automatic retry**, regardless of any displayed retry timestamp.
 
 1. Read `uzi run recovery <id>` and export an available archive before deciding;
@@ -328,6 +331,22 @@ its status set. Retained sources can block image rolls and occupy storage; each
 fresh claim opens another counted custody hold and repeated failures can leave
 retained successor paths. Keep the original worker storage: a peer after worker
 loss or affinity expiry may use a published checkpoint behind the retained work.
+
+A temporary API connection problem during the worker's read-only ownership
+check, after the successor was verified and journaled, is retried in place
+before any hold: at most 5 attempts (about 15 s at the default recovery retry
+interval), inside the iteration's existing deadline, on the same claim and
+successor with no recapture and no extra recovery-attempt charge. Only a request
+that failed before any response with `ECONNREFUSED`, `ECONNRESET` or
+`UND_ERR_SOCKET`, or a 502, 503 or 504 answer, qualifies. Unknown errors,
+malformed or truncated responses and other statuses are not retried, and
+exhausted retries give the check's existing outcome: for the first check the
+`adoption_failed` path described above (this hold when its preconditions hold),
+and for the second check in the Codex/safety branch after executor disposal the
+existing `quiescence_failed` failure with custody kept, not a hold. A deadline
+that actually passes ends as `budget_exhausted`. The retry state is in-process
+only. The hold itself still has no automatic retry. See the
+[ADR-1197 #3994 amendment](../adr/1197-transient-recovery-park.md#amendment-2026-11-06-3994-transient-api-connection-failures-retry-the-ownership-check-in-place).
 
 A positively identified temporary local resource error during the read-only
 renewal check stops the claim without consuming its owner grant or creating a

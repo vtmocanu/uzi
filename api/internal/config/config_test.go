@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 )
@@ -23,7 +24,7 @@ func TestValidateSecretRejectsUnsafe(t *testing.T) {
 		"short",
 	}
 	for _, s := range bad {
-		if _, err := validateSecret(s); err == nil {
+		if _, err := validateSecret("JWT_SECRET", s); err == nil {
 			t.Errorf("validateSecret(%q) = nil error, want rejection", s)
 		}
 	}
@@ -31,7 +32,7 @@ func TestValidateSecretRejectsUnsafe(t *testing.T) {
 
 func TestValidateSecretAcceptsGood(t *testing.T) {
 	good := "0f9a1c3e5b7d9f1a3c5e7b9d1f3a5c7e" // 32 hex chars
-	if _, err := validateSecret(good); err != nil {
+	if _, err := validateSecret("JWT_SECRET", good); err != nil {
 		t.Errorf("validateSecret rejected a good secret: %v", err)
 	}
 }
@@ -529,6 +530,56 @@ func TestLoadSeedForge(t *testing.T) {
 		}
 		if c.SeedForgeBaseURL != base {
 			t.Fatalf("base URL = %q, want default %q", c.SeedForgeBaseURL, base)
+		}
+	})
+
+	t.Run("forge type defaults to gitlab", func(t *testing.T) {
+		t.Setenv("UZI_SEED_FORGE_PAT", "glpat-xxx")
+		t.Setenv("UZI_SEED_FORGE_TYPE", "")
+		c := withAllowlist()
+		if err := loadSeedForge(c); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if c.SeedForgeType != forge.TypeGitLab {
+			t.Fatalf("forge type = %q, want default gitlab", c.SeedForgeType)
+		}
+	})
+
+	for _, ft := range []forge.Type{forge.TypeGitLab, forge.TypeForgejo, forge.TypeGitHub} {
+		t.Run("forge type "+string(ft)+" is accepted", func(t *testing.T) {
+			t.Setenv("UZI_SEED_FORGE_PAT", "glpat-xxx")
+			t.Setenv("UZI_SEED_FORGE_TYPE", " "+string(ft)+" ")
+			c := withAllowlist()
+			if err := loadSeedForge(c); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if c.SeedForgeType != ft {
+				t.Fatalf("forge type = %q, want %q", c.SeedForgeType, ft)
+			}
+		})
+	}
+
+	t.Run("unknown forge type refuses boot and names the supported values", func(t *testing.T) {
+		t.Setenv("UZI_SEED_FORGE_PAT", "glpat-xxx")
+		t.Setenv("UZI_SEED_FORGE_TYPE", "bitbucket")
+		err := loadSeedForge(withAllowlist())
+		if err == nil {
+			t.Fatal("expected boot-fatal error for an unknown UZI_SEED_FORGE_TYPE")
+		}
+		if !strings.Contains(err.Error(), "gitlab, forgejo, github") {
+			t.Fatalf("error must name the supported values: %v", err)
+		}
+	})
+
+	t.Run("forge type is ignored when the seed is off", func(t *testing.T) {
+		t.Setenv("UZI_SEED_FORGE_PAT", "")
+		t.Setenv("UZI_SEED_FORGE_TYPE", "bitbucket")
+		c := withAllowlist()
+		if err := loadSeedForge(c); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if c.SeedForgeType != "" {
+			t.Fatalf("forge type should stay unset, got %q", c.SeedForgeType)
 		}
 	})
 

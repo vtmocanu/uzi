@@ -263,6 +263,11 @@ export interface CodexHarnessOptions {
    *  stopped or aborted during the probe, and it never throws into the turn. */
   readonly catalogProbe?: {
     readonly timeoutMs: number;
+    /** Issue #3251: default true (the shipped awaited probe). False starts the same single request
+     *  without awaiting it: the first `turn/start` does not wait, and the parse and `onEntry` run in a
+     *  detached continuation bounded by `timeoutMs`; nothing is sent for a turn already stopped, and
+     *  a stop before the reply suppresses `onEntry`. */
+    readonly blocking?: boolean;
     readonly onEntry: (entry: CodexCatalogEntry | undefined, model: string) => void;
   };
 }
@@ -640,14 +645,34 @@ export class CodexHarness implements RunHarness {
 
   /** PRD #3247 M2: one bounded `model/list` call; the result (or undefined) goes to `onEntry`.
    *  Consumed on first use so a recreated turn or a resume fallback never probes twice. */
-  private async runCatalogProbe(abort: Promise<"aborted">): Promise<void> {
+  private async runCatalogProbe(abort: Promise<"aborted">, signal: AbortSignal): Promise<void> {
     const probe = this.catalogProbe;
     if (!probe) return;
     this.catalogProbe = undefined;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let entry: CodexCatalogEntry | undefined;
     // The exact model thread/start sends (currentModel is set in runTurn before this runs).
     const model = this.currentModel ?? this.provider.model;
+    if (probe.blocking === false) {
+      // Issue #3251: report-only probe. Send nothing for a turn already stopped; otherwise send the
+      // same single request and let the first turn/start go without waiting for the reply.
+      if (signal.aborted || this.stopRequested) return;
+      let call: Promise<unknown>;
+      try {
+        call = this.requestOnTransport<unknown>("model/list", { limit: CATALOG_PROBE_LIMIT, includeHidden: true });
+      } catch {
+        return;
+      }
+      // Residual, accepted: transport.onEof (transport.ts) classifies an EOF as
+      // `protocol: stream closed mid-request` only while a request is pending. The request has
+      // no deadline or signal (see the blocking path below), so the pending entry stays until
+      // Codex answers model/list (the app-server normally answers promptly), not until the probe
+      // timeout, which only ends the wait. While it is unanswered an EOF is classified
+      // `protocol` rather than a clean close; accepted for the same reason as the blocking path.
+      call.catch(() => undefined);
+      void this.finishCatalogProbe(probe, call, model, abort, signal);
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let entry: CodexCatalogEntry | undefined;
     try {
       // No transport signal/deadline: either deletes the pending entry, so a late reply would
       // surface as an unmatched response id and the root loop would answer an id the server never
@@ -674,6 +699,37 @@ export class CodexHarness implements RunHarness {
       probe.onEntry(entry, model);
     } catch {
       /* the note is advisory; a callback fault never reaches the turn */
+    }
+  }
+
+  /** The detached half of a non-blocking probe: parse + onEntry raced against the probe timeout.
+   *  Never rejects; a stop/abort before the reply suppresses onEntry. */
+  private async finishCatalogProbe(
+    probe: NonNullable<CodexHarnessOptions["catalogProbe"]>,
+    call: Promise<unknown>,
+    model: string,
+    abort: Promise<"aborted">,
+    signal: AbortSignal,
+  ): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let entry: CodexCatalogEntry | undefined;
+    try {
+      const timeout = new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), probe.timeoutMs);
+      });
+      const result = await Promise.race([call, timeout, abort]);
+      if (result === "aborted") return;
+      entry = parseCatalogEntry(result, model);
+    } catch {
+      entry = undefined;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    if (signal.aborted || this.stopRequested) return;
+    try {
+      probe.onEntry(entry, model);
+    } catch {
+      /* advisory; a callback fault never reaches the turn */
     }
   }
   // Resolves the current turn's abort race (see runTurn). The owner-aborted signal
@@ -1287,7 +1343,7 @@ export class CodexHarness implements RunHarness {
       }
 
       // PRD #3247 M2: advisory catalog probe, before the abort check so a stop during it is honoured.
-      await this.runCatalogProbe(abortPromise);
+      await this.runCatalogProbe(abortPromise, request.signal);
 
       // 3. Stop before sending model work if cancellation arrived during thread setup.
       if (request.signal.aborted || this.stopRequested) {

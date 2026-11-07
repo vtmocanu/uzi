@@ -193,6 +193,9 @@ export interface RunContext {
   /** PRD #3244: the claim's single lead-config reporter, constructed by the runner only. Executors
    *  call `enterPhase` before a lead turn; absent for stub/test executors and non-lead lanes. */
   leadConfig?: import("./lead-config-report.js").LeadConfigReporter;
+  /** Issue #3251: the claim's single Codex catalog default reporter, built by the runner only when
+   *  the claim carries a well-formed `codex_catalog_context`. Absent otherwise. */
+  codexCatalogReport?: import("./codex/catalog-report.js").CodexCatalogReporter;
   /** Negotiated before execution/capture; remains binding if registration features shrink. */
   codexIdleStallRecovery?: boolean;
   /** Claim support assertion; absent means false. The runner separately gates root and phase. */
