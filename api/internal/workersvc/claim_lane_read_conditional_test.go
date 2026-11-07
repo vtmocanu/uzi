@@ -30,12 +30,11 @@ func (f checkerPinFake) GetCrossCheckPinSnapshot(context.Context, store.GetCross
 	return f.row, nil
 }
 
-// TestCheckerClaimDoesNotReadTheOwnerLane pins the conditional lane read in claim assembly: a
-// checker child resolves its model from the cross-check pin snapshot, so a failing
-// GetUserHarnessModelDefaults must not fail its claim (it does fail a lead claim, see
-// TestClaimFailsOnDefaultModelLookupError). A Codex review claim skips the same read by the
-// harness != codex || !isReviewRun condition; that branch needs a bound Codex credential and is
-// covered on the real path by per_harness_model_assembly_livedb_test.go.
+// TestCheckerClaimDoesNotReadTheOwnerLane pins the checker half of the conditional lane read in
+// claim assembly: the lane is not read for a checker claim and the claim does not fail on it (a
+// lead claim does, see TestClaimFailsOnDefaultModelLookupError). The Codex review half needs a
+// bound Codex credential and is pinned by
+// TestAssembleCodexReviewClaimDoesNotReadOwnerLaneLiveDB.
 func TestCheckerClaimDoesNotReadTheOwnerLane(t *testing.T) {
 	w := worker()
 	fs := leadClaimFake(t, runkind.CrossCheck, func(r *store.Run) {
