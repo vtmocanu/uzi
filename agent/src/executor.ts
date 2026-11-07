@@ -183,6 +183,9 @@ export interface RunContext {
   prepareCIEvidence?: () => Promise<import("./ci-evidence.js").PreparedCIEvidence>;
   ciEvidence?: import("./ci-evidence.js").PreparedCIEvidence;
   runId: string;
+  /** issue #3644: the per-attempt directory key (`<runId>` or `<runId>.g<N>`) the run's provision dir is named by. Absent = the
+   *  run id (today's exact path). */
+  dirKey?: string;
   /** Current server claim fence; required to consume a checked plan approval. */
   claimGeneration?: number;
   /** Issue #3870, Claude run flight only (the runner sets it; Codex never does): the managed Go

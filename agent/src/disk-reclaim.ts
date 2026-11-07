@@ -9,7 +9,8 @@ import { isLiveModelPassHome } from "./model-pass.js";
 import { HELPER_SLACK_MS, scanRunProcesses } from "./run-procs.js";
 import { DEFAULT_RECLAIM_MAX_CONSECUTIVE_FAILURES, TERMINAL_RUN_STATUSES, type RunStatusLookup } from "./home-reclaim.js";
 import type { RunDiskLocks } from "./run-disk-locks.js";
-import { errMessage, RUN_ID_RE, sleep } from "./util.js";
+import { hasRetainedHomeMarker } from "./retained-homes.js";
+import { errMessage, parseRunDirName, sleep } from "./util.js";
 
 /**
  * PRD #1809 D7: the running, non-destructive disk reclaim. The startup sweep
@@ -132,6 +133,13 @@ export interface DiskReclaimDeps {
    * {@link CachesDroppedMemo}); absent, nothing is remembered.
    */
   cachesDropped?: CachesDroppedMemo;
+  /**
+   * issue #3644: whether `runId` has a retained-home marker (retained-homes.ts), which keeps the run's LEGACY `agent-home/<runId>`
+   * and `provision/<runId>` out of every reclaim. A throw counts as present. Default: the real marker under the data dir (the
+   * parent of `homeRoot`). The `<runId>.g<N>` directories of an independent restore's successor are not covered by it: they
+   * follow their run's status like any other.
+   */
+  hasRetainedHomeMarker?: (runId: string) => Promise<boolean>;
   /** Seams, injected by tests. */
   removeTree?: (parent: string, name: string, deadline: number) => Promise<unknown>;
   dropCaches?: (home: string, log: Logger, opts: DropRunCachesOptions) => Promise<RunCacheDropResult>;
@@ -186,6 +194,8 @@ export interface DiskReclaimSummary {
    * entrypoint re-owned to `runner`, or a planted one): never removed, see the pass.
    */
   provisionDirsNotOwned: number;
+  /** A run whose legacy HOME and provision dir were left alone because it has a retained-home marker (issue #3644). */
+  skippedRetainedHome: number;
   /** A parked run whose drop freed at least one cache subtree. */
   cachesDropped: number;
   /** A parked run whose caches were already gone (remembered from an earlier pass, or a no-op drop). */
@@ -492,6 +502,7 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
     terminalHomesRemoved: 0,
     provisionDirsRemoved: 0,
     provisionDirsNotOwned: 0,
+    skippedRetainedHome: 0,
     cachesDropped: 0,
     cachesAlreadyClear: 0,
     cachesKeptLiveProcesses: 0,
@@ -533,7 +544,12 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
   const removedFrom = new Map<string, number>();
   const noteRemoved = (root: string) => removedFrom.set(root, (removedFrom.get(root) ?? 0) + 1);
 
-  const isRunId = (name: string) => RUN_ID_RE.test(name);
+  // `<runId>` and `<runId>.g<N>` directories are both run directories; each follows its run's status and liveness.
+  const isRunId = (name: string) => parseRunDirName(name) !== undefined;
+  const markerOf = deps.hasRetainedHomeMarker ?? ((runId: string) => hasRetainedHomeMarker(path.dirname(deps.homeRoot), runId));
+  const hasMarker = async (runId: string): Promise<boolean> => {
+    try { return await markerOf(runId); } catch { return true; }
+  };
   const passDeadline = startedAt + deadlineMs;
   const readBudget = maxDirReads * PASS_READ_BUDGET_FACTOR;
   const homeSkip = cursors.get(deps.homeRoot) ?? 0;
@@ -591,7 +607,10 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
   // Forget runs whose HOME is gone, so the memo stays bounded by what is on the volume. Only
   // from a whole listing: a HOME outside a capped, resumed (or failed) listing's window is not
   // known to be gone.
-  if (homeList.whole) memo?.retainOnly((id) => homes.has(id));
+  if (homeList.whole) {
+    const homeRunIds = new Set([...homes.keys()].map((name) => parseRunDirName(name)?.runId));
+    memo?.retainOnly((id) => homeRunIds.has(id));
+  }
 
   let consecutiveFailures = 0;
   let firstExamined: string | undefined;
@@ -600,12 +619,15 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
   // This pass reached a run the rotation already covered: every run of the held window has
   // now been visited. The covered runs sit at the end of `order`, so all the rest came first.
   let wrapped = false;
-  for (const [runId, listed] of runs) {
+  for (const [dirName, listed] of runs) {
+    const parsed = parseRunDirName(dirName);
+    if (parsed === undefined) continue;
+    const runId = parsed.runId;
     if (now() - startedAt >= deadlineMs) {
       summary.stoppedEarly = "deadline";
       break;
     }
-    if (!wrapped && covered(runId)) wrapped = true;
+    if (!wrapped && covered(dirName)) wrapped = true;
     // Ownership first, before the run budget and any status lookup: the pass acts only on
     // directories the worker owns, the same check rmTreePinned makes on the leaf (it refuses
     // any other owner with EPERM). A run is admitted by either of its dirs being the
@@ -623,14 +645,21 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
     if (homeOwned) dirs.home = listed.home;
     if (provisionOwned) dirs.provision = listed.provision;
     else if (listed.provision) summary.provisionDirsNotOwned += 1;
+    // issue #3644: a run with a retained-home marker keeps its LEGACY directories (the restored predecessor's HOME and provision
+    // dir, whose bytes the restore must not lose) out of every reclaim, whatever the run's status; only its P discard removes the
+    // marker. Checked before the run budget and any status lookup. The successor's `.g<N>` directories are not protected.
+    if (parsed.generation === undefined && (await hasMarker(runId))) {
+      summary.skippedRetainedHome += 1;
+      continue;
+    }
     if (summary.runsExamined >= maxEntries) {
       summary.stoppedEarly = "budget";
       runBudgetStop = true;
       break;
     }
     summary.runsExamined += 1;
-    firstExamined ??= runId;
-    lastExamined = runId;
+    firstExamined ??= dirName;
+    lastExamined = dirName;
     if (deps.isRunLive(runId)) {
       memo?.forget(runId); // executing again: its caches may be refilled by the next park
       summary.skippedLive += 1;
@@ -716,7 +745,7 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
       ] as const) {
         if (!dir) continue;
         try {
-          await removeTree(root, runId, passDeadline);
+          await removeTree(root, dirName, passDeadline);
           summary[key] += 1;
           noteRemoved(root);
         } catch (err) {
@@ -727,7 +756,7 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
       if (failed) summary.failed += 1;
     });
   }
-  summary.unexamined = runs.size - summary.runsExamined - summary.skippedNotOwned;
+  summary.unexamined = runs.size - summary.runsExamined - summary.skippedNotOwned - summary.skippedRetainedHome;
 
   // (c) model-pass HOMEs. No lock: a pass always creates a fresh mkdtemp name, so nothing
   // ever resumes into an old one; the registry and the age bound are the whole guard.
@@ -807,6 +836,7 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
     go_scratch_retained: summary.goScratchRetained,
     skipped_live: summary.skippedLive,
     skipped_not_owned: summary.skippedNotOwned,
+    skipped_retained_home: summary.skippedRetainedHome,
     skipped_status_unknown: summary.skippedStatusUnknown,
     skipped_not_eligible: summary.skippedNotEligible,
     failed: summary.failed,

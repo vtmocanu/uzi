@@ -534,6 +534,9 @@ export interface SdkExecutorOptions {
   /** Root for per-run tool-provisioning dirs (PRD #18 M3), OUTSIDE any clone.
    *  Default: a `provision/` sibling of the provisioning HOME on the data volume. */
   provisionRoot?: string;
+  /** issue #3644: the per-attempt provision directory name under `provisionRoot` (`<runId>.g<N>` for a restore's successor);
+   *  absent = `<runId>`. */
+  dirKey?: string;
   /**
    * SHARED (worker-lifetime) HOME for the tool-provisioning subprocess — the nix
    * single-user profile + devbox state that warm-start relies on (PRD #18; PRD #42
@@ -920,6 +923,7 @@ export class SdkExecutor implements Executor {
   private runWorktree: string | undefined;
   private readonly secretPaths: readonly string[];
   private readonly provisionRoot: string;
+  private readonly dirKey: string | undefined;
   private readonly provisionHomeDir: string;
   private readonly provision: typeof provisionTools;
   private readonly installDeps: typeof installJsDeps;
@@ -1061,6 +1065,7 @@ export class SdkExecutor implements Executor {
       opts.provisionRoot ??
       path.join(path.dirname(this.provisionHomeDir), "provision");
     this.provision = opts.provision ?? provisionTools;
+    this.dirKey = opts.dirKey;
     this.installDeps = opts.installDeps ?? installJsDeps;
     // Docker wiring (PRD #83 M1): derive the two consumer facts ONCE. `dockerHost` set
     // ⇒ a sidecar daemon is reachable, so the guardrail allows docker and DOCKER_HOST is
@@ -1558,6 +1563,7 @@ export class SdkExecutor implements Executor {
       homeDir: this.provisionHomeDir,
       log: this.log,
       provision: this.provision,
+      ...(this.dirKey === undefined ? {} : { dirKey: this.dirKey }),
     });
 
     // issue #1783 (R2): the runner's attempt marker rides the CLI env, so every process the

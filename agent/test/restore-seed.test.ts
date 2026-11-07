@@ -798,6 +798,16 @@ describe("review rework (#3644 m2b): resumable P exit, disposition guards, pin r
     assert.ok(before.length > 0);
   });
 
+  it("the marker evidence is asked for with this bare and P's attempt id, and a marker bound elsewhere keeps P an ordinary source", async () => {
+    addLedger(S_ID, S_PATH, "retired");
+    const asked: unknown[] = [];
+    const r = await discardP({ hasRetainedHomeMarker: async (_run: string, binding?: { barePath: string; attemptId: string }) => { asked.push(binding); return false; } });
+    assert.deepEqual(asked, [{ barePath: bare, attemptId: P_ID }]);
+    assert.equal(r.kind, "refused", JSON.stringify(r));
+    assert.equal(fs.existsSync(path.join(P_PATH, "later.txt")), true, "P's unsaved bytes are untouched");
+    assert.equal(rawKey(P_KEY), pRaw);
+  });
+
   it("no restore evidence (no retained-home marker, or no later generation): an ordinary newer same-run entry never makes P restore-exitable", async () => {
     // An ordinary newer retired entry of the same run, path absent: not a restore.
     addLedger(S_ID, S_PATH, "retired");

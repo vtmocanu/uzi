@@ -148,8 +148,10 @@ export interface DiskGovernorOptions {
 
 /** A running Claude run the governor watches. */
 export interface GovernedRun {
-  /** The run's private HOME, where its caches live. */
-  home: string;
+  /** The run's private HOME, where its caches live. A function, read at every use, because the HOME is bound late (issue #3644:
+   *  a restore's successor runs under `<runId>.g<N>`): it returns undefined while the run is unbound, and an unbound run is
+   *  skipped by the measurement, the boundary and the hard layer's selection. A plain string is a permanently bound HOME. */
+  home: string | (() => string | undefined);
   /** Stop the run's current turn through the steering channel's `disk` pause mode. */
   requestStop: () => void;
   /** Issue #1830: drop the run's rebuildable caches where it stands, for a run that cannot be
@@ -157,7 +159,9 @@ export interface GovernedRun {
   reclaimInPlace: () => Promise<RunCacheDropResult | undefined>;
 }
 
-interface RunState extends GovernedRun {
+interface RunState extends Omit<GovernedRun, "home"> {
+  /** {@link GovernedRun.home}, normalised to its function form. */
+  home: () => string | undefined;
   /** Latest measured cache bytes (a boundary's or the hard layer's), if any. */
   cacheBytes?: number;
   /** Consecutive turn boundaries that ended over the cap. */
@@ -230,7 +234,8 @@ export class DiskGovernor {
 
   /** Watch a running Claude run. Idempotent per run id (a later call replaces the entry). */
   register(runId: string, run: GovernedRun): void {
-    this.runs.set(runId, { ...run, overStreak: 0, inExecutor: false, sentSeq: 0, lastNonRunningSentSeq: 0, runningAckedSeq: 0, lastNonRunningAckedSeq: 0, ackedStatusSeq: 0, stopRequested: false, inPlaceSkipped: false });
+    const { home } = run;
+    this.runs.set(runId, { ...run, home: typeof home === "string" ? () => home : home, overStreak: 0, inExecutor: false, sentSeq: 0, lastNonRunningSentSeq: 0, runningAckedSeq: 0, lastNonRunningAckedSeq: 0, ackedStatusSeq: 0, stopRequested: false, inPlaceSkipped: false });
   }
 
   /** Issue #1830: `executor.run` is about to start; the run may now take a stop (see {@link parkable}). */
@@ -347,6 +352,8 @@ export class DiskGovernor {
     if (!run) return "continue";
     // A hard stop is already on its way to this run: its pending turn drop parks it.
     if (!this.opts.config.capEnabled || run.stopRequested) return "continue";
+    // An unbound run has no HOME to measure or trim: the soft layer starts after the binding.
+    if (run.home() === undefined) return "continue";
     const cap = this.capBytes();
     if (cap === undefined) return "continue";
     const measured = await this.measureRun(run);
@@ -369,7 +376,9 @@ export class DiskGovernor {
       const lowWater = Math.floor(cap * this.opts.config.lowWater);
       let result: TrimResult | undefined;
       try {
-        result = await this.trim(run.home, { totalBytes: measured, capBytes: cap, lowWaterBytes: lowWater }, this.opts.log);
+        const home = run.home();
+        if (home === undefined) throw new Error("the run has no bound HOME");
+        result = await this.trim(home, { totalBytes: measured, capBytes: cap, lowWaterBytes: lowWater }, this.opts.log);
       } catch (e) {
         this.opts.log.warn("run cache trim failed", { ...fields, error: errMessage(e) });
       }
@@ -453,7 +462,7 @@ export class DiskGovernor {
     }
     if (this.stopping !== undefined || this.selecting || this.reclaiming !== undefined) return;
     if (this.now() - this.lastSelectionAt < SELECT_INTERVAL_MS) return;
-    const candidates = [...this.runs.entries()].filter(([, r]) => !r.stopRequested && !r.inPlaceSkipped);
+    const candidates = [...this.runs.entries()].filter(([, r]) => !r.stopRequested && !r.inPlaceSkipped && r.home() !== undefined);
     if (candidates.length === 0) {
       // A registered run that is stopping or was already reclaimed this stretch is not "nothing".
       if (this.runs.size === 0 && !this.warnedNothingToStop) {
@@ -479,6 +488,7 @@ export class DiskGovernor {
     let pick: [string, RunState] | undefined;
     for (const entry of candidates) {
       const [, run] = entry;
+      if (run.home() === undefined) continue;
       if (this.now() < deadline) await this.measureRun(run, deadline);
       if ((run.cacheBytes ?? 0) > (pick?.[1].cacheBytes ?? 0)) pick = entry;
     }
@@ -550,12 +560,14 @@ export class DiskGovernor {
 
   /** Measure one run's caches, recording the reading; undefined when it failed. */
   private async measureRun(run: RunState, deadline = this.now() + MEASURE_DEADLINE_MS): Promise<number | undefined> {
+    const home = run.home();
+    if (home === undefined) return undefined;
     try {
-      const m = await this.measure(run.home, { deadline });
+      const m = await this.measure(home, { deadline });
       run.cacheBytes = m.cacheBytes;
       return m.cacheBytes;
     } catch (e) {
-      this.opts.log.warn("run cache measurement failed", { run_home: run.home, error: errMessage(e) });
+      this.opts.log.warn("run cache measurement failed", { run_home: home, error: errMessage(e) });
       return undefined;
     }
   }

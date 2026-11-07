@@ -2545,6 +2545,9 @@ export interface RetainedInspectResult {
   sampledAt: string;
 }
 
+/** issue #3644: what a retained-home marker must record for a restore exit to treat it as evidence about THIS bare. */
+export interface RetainedHomeBinding { barePath: string; attemptId: string }
+
 export interface RetainedDiscardOptions {
   selector: RetainedSourceSelector;
   /** The descriptor digest inspect reported; the exact value, or nothing is deleted. */
@@ -2560,8 +2563,10 @@ export interface RetainedDiscardOptions {
   removeRetainedHomeMarker?: (runId: string) => Promise<void>;
   /** issue #3644: whether the retained-home marker of `runId` exists. A plain predecessor with no restore entry is treated as a
    *  restore's leftover (window 2, or after the successor's own discard) only when this returns true; the default (absent) is
-   *  false, so the ordinary rules apply. A throw keeps everything. */
-  hasRetainedHomeMarker?: (runId: string) => Promise<boolean>;
+   *  false, so the ordinary rules apply. A throw keeps everything. The discard passes `binding` (this bare and the predecessor attempt
+   *  the selector names) whenever it uses the marker as evidence; the hook must then return true only for a marker that records
+   *  exactly that bare path and predecessor attempt id, so a marker of another bare or attempt never counts. */
+  hasRetainedHomeMarker?: (runId: string, binding?: RetainedHomeBinding) => Promise<boolean>;
   barePath?: string;
   signal?: AbortSignal;
   /** The single operation deadline (default {@link RETAINED_OP_DEADLINE_MS}). */
@@ -11714,7 +11719,7 @@ export class GitCache {
    * exists, a foreign path of the branch, an unreadable composite, and {@link RestoreCompositeBlockedError} for another run's restore.
    */
   private async planRestoreExit(
-    g: GatheredBare, rec: GatheredRecord, mode: "plain" | "protected", hasMarker?: (runId: string) => Promise<boolean>,
+    g: GatheredBare, rec: GatheredRecord, mode: "plain" | "protected", hasMarker?: (runId: string, binding?: RetainedHomeBinding) => Promise<boolean>,
   ): Promise<
     { kind: "none" } |
     { kind: "successor"; composite: Extract<BranchJournal, { kind: "composite" }> | ReleasedComposite; sAttemptId: string; sGeneration: number; pGeneration: number } |
@@ -11737,8 +11742,9 @@ export class GitCache {
           this.clonePathShape(s2.clonePath, this.runnerClonePath(g.barePath, rec.key))?.attemptId !== s2.attemptId ||
           await this.pathPresent(s2.clonePath)) return { kind: "none" };
       // A newer same-run ledger entry alone is ordinary history, not restore evidence: the restore's retained-home marker must
-      // corroborate it (the generation order was checked above).
-      if ((await hasMarker?.(rec.runId)) !== true) return { kind: "none" };
+      // corroborate it (the generation order was checked above), and it must record THIS bare and P's attempt: a marker written
+      // for another bare or attempt of the run is not evidence about this one.
+      if ((await hasMarker?.(rec.runId, { barePath: g.barePath, attemptId: part.attemptId })) !== true) return { kind: "none" };
       return { kind: "predecessor", ...(s2.state === "live" ? { window2: s2 } : {}), pGeneration: part.generation };
     }
     if (holder.runId !== rec.runId) throw new RestoreCompositeBlockedError("the branch is held by another run's restore", holder.runId);
@@ -11857,9 +11863,10 @@ export class GitCache {
 
   /**
    * The retry of a P exit whose config rewrite already landed (the record is gone) but whose marker removal did not complete:
-   * re-sync the bare config and its directory, then remove the retained-home marker of `runId`. It runs only on positive proof
-   * that THIS bare was the restore bare of the run and the exit completed here: the holds were read and are empty, the run is
-   * terminal, THIS bare's attempt ledger carries a `retired` value for exactly the selector's attempt id naming the run (the
+   * re-sync the bare config and its directory, then remove the retained-home marker of `runId`. It runs only when the exit is
+   * proven to have completed here and the marker is bound to this bare: the holds were read and are empty, the run is
+   * terminal, the marker records THIS bare's path and the selector's attempt id as its predecessor (the `hasRetainedHomeMarker`
+   * binding; an ordinary retired attempt of the same run in an unrelated bare has no such marker), THIS bare's attempt ledger carries a `retired` value for exactly the selector's attempt id naming the run (the
    * value the exit's single config rewrite appends; `confirm` cannot be digest-checked against a record that no longer exists,
    * so that ledger entry is the binding, and the attempt id's generation must equal the selector's), and the bare carries no
    * other attribution of the run (no record, no non-retired ledger value, no restore entry, no `uzi-retained.<R>.journal`, no
@@ -11896,7 +11903,7 @@ export class GitCache {
       // An emptied value is a cleared entry; an unreadable one (no run id) or this run's own still attributes the run.
       if (holder !== undefined && (holder.runId === undefined || holder.runId === runId)) return false;
     }
-    if ((await hasRetainedHomeMarker(runId)) !== true) return false;
+    if ((await hasRetainedHomeMarker(runId, { barePath: g.barePath, attemptId: sel.attempt })) !== true) return false;
     await this.syncRestoreWrite(g.barePath);
     await removeRetainedHomeMarker(runId);
     return true;
