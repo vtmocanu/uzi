@@ -29,6 +29,11 @@
       "field": "effort",
       "token": "runtime_default",
       "label": "runtime default"
+    },
+    {
+      "field": "effort",
+      "token": "catalog_default",
+      "label": "catalog default"
     }
   ]
 }

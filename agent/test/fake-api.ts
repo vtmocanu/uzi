@@ -486,6 +486,11 @@ export class FakeApi {
   } = { queue: [], fallback: { status: 204 } };
   readonly leadConfigPosts: Array<{ runId: string; body: Record<string, unknown> }> = [];
 
+  /** Issue #3251: the codex-catalog-default route. Every POST body is recorded; the answer is
+   *  `codexCatalogDefault.status` (default 204 = stored). */
+  codexCatalogDefault: { status: number } = { status: 204 };
+  readonly codexCatalogDefaultPosts: Array<{ runId: string; body: Record<string, unknown> }> = [];
+
   constructor(private readonly token: string) {
     this.server = http.createServer((req, res) => {
       this.handle(req, res).catch((err) => {
@@ -1786,6 +1791,14 @@ export class FakeApi {
       const answer = this.leadConfig.queue.shift() ?? this.leadConfig.fallback;
       if (answer.status === 204) return sendEmpty(res, 204);
       return send(res, answer.status, answer.reason ? { error: "fake lead-config refusal", reason: answer.reason } : {});
+    }
+
+    // Issue #3251: the Codex catalog default route.
+    const catalogDefaultMatch = /^\/api\/worker\/runs\/([^/]+)\/codex-catalog-default$/.exec(p);
+    if (catalogDefaultMatch && req.method === "POST") {
+      this.codexCatalogDefaultPosts.push({ runId: catalogDefaultMatch[1] as string, body: json as Record<string, unknown> });
+      if (this.codexCatalogDefault.status === 204) return sendEmpty(res, 204);
+      return send(res, this.codexCatalogDefault.status, { error: "fake codex-catalog-default refusal" });
     }
 
     // PRD #1798 M6: the pr-description routes, answered by an in-memory model when a test installs

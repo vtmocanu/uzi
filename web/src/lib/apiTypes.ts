@@ -228,6 +228,20 @@ export interface EffortSettingCell {
   resolved_effort: string | null;
   source: string;
   mode: "explicit" | "runtime_default";
+  /** Codex cell only (issue #3251): the effort the Codex model catalog applies when no
+   *  level is sent. Absent on the Claude cell and on an older server. */
+  catalog_default?: CatalogDefault;
+}
+
+/** What a Codex run's catalog reported as its default effort (issue #3251). `state` is
+ *  known, unknown (nothing reported yet; effort/model/runtime_version are null) or
+ *  varies (workers disagree). effort "none" means the catalog requests no level. */
+export interface CatalogDefault {
+  state: "known" | "unknown" | "varies";
+  effort: string | null;
+  model: string | null;
+  runtime_version: string | null;
+  observed_at: string | null;
 }
 
 export interface UserSettings {
