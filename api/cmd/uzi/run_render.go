@@ -2910,6 +2910,14 @@ func agentSourceRows(r apitypes.RunDTO) [][]string {
 			basis = "repo default"
 		}
 		rows = append(rows, []string{"AGENTS_REQUESTED", agentSourceLabel(requested) + " (" + basis + ")"})
+		planned := "—"
+		if source := strOr(r.PlanAgentSource, ""); source != "" {
+			planned = agentSourceLabel(source)
+			if source == requested {
+				planned += " (" + basis + ")"
+			}
+		}
+		rows = append(rows, []string{"PLANNED_WITH", planned})
 	}
 	if implemented := strOr(r.AgentSource, ""); implemented != "" {
 		cell := agentSourceLabel(implemented)

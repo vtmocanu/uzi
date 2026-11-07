@@ -82,6 +82,7 @@ type stateRequestMinusGateRevision struct {
 	MilestonesAgents            *[]apitypes.MilestoneAgent         `json:"milestones_agents"`
 	SeededFromDefault           *bool                              `json:"seeded_from_default"`
 	AgentSelection              *workersvc.AgentSelection          `json:"agent_selection"`
+	PlanAgentSource             *string                            `json:"plan_agent_source"`
 	OpenQuestionID              *string                            `json:"open_question_id"`
 	CompletionQuestion          bool                               `json:"completion_question"`
 	OpenFollowupID              *int64                             `json:"open_followup_id"`
