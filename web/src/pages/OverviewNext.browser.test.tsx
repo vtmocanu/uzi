@@ -644,3 +644,115 @@ function expectRailSummariesFit(railCard: HTMLElement) {
     document.documentElement.clientWidth,
   );
 }
+
+// #4041: the decision card's rows sit in two columns on wide screens only while there are 2 to
+// 4 of them, always stack on a phone, and an expanded PR group never pushes the page sideways.
+describe("OverviewNext decision card layout", () => {
+  const prs = (n: number) =>
+    Array.from({ length: n }, (_, i) =>
+      aRun({
+        id: `pr-${i}`,
+        status: "completed",
+        mr_iid: 100 + i,
+        mr_state: "opened",
+        mr_web_url: `https://github.com/o/r/pull/${100 + i}`,
+        forge_type: "github",
+        repo_path: "an-organisation/a-repository-with-a-long-name",
+        issue_title: LONG_TITLE,
+        finished_at: `2026-07-05T1${i}:00:00Z`,
+      }),
+    );
+
+  async function mountCard(runs: ReturnType<typeof aRun>[]) {
+    mockApi.listRuns.mockResolvedValue({ runs });
+    render(
+      <MemoryRouter initialEntries={["/overview/next"]}>
+        <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+          <OverviewNext />
+        </main>
+      </MemoryRouter>,
+    );
+    const card = await screen.findByRole("region", { name: "Needs your decision" });
+    await document.fonts.ready;
+    const rows = () => Array.from((card.querySelector("[data-decision-rows]") as HTMLElement).children) as HTMLElement[];
+    const lefts = () => new Set(rows().map((r) => Math.round(r.getBoundingClientRect().left)));
+    return { card, rows, lefts };
+  }
+
+  const threeRows = () => [
+    aRun({ id: "plan", status: "awaiting_approval", issue_title: LONG_TITLE }),
+    aRun({ id: "ask", status: "awaiting_input", issue_title: LONG_TITLE }),
+    ...prs(2),
+  ];
+
+  it("puts three rows in two columns at 1280px", async () => {
+    await page.viewport(1280, 900);
+    const { rows, lefts } = await mountCard(threeRows());
+    expect(rows()).toHaveLength(3);
+    expect(lefts().size).toBe(2);
+  });
+
+  it("stacks three rows in one column at 400px", async () => {
+    await page.viewport(400, 900);
+    const { rows, lefts } = await mountCard(threeRows());
+    expect(rows()).toHaveLength(3);
+    expect(lefts().size).toBe(1);
+    expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(window.innerWidth);
+  });
+
+  // Kinds group, so five rows (held, plan, question, park, PRs) is the most the card can show;
+  // five is the "more than four" case.
+  it("keeps five rows in one column at 1280px", async () => {
+    mockApi.getRecoveryHolds.mockResolvedValue({
+      aggregate: { open_holds: 1, admission_counted_holds: 1, custody_hold_limit: 8, decision_needed: 1, blocked_runs: 0 },
+      holds: [
+        {
+          id: "hold-h",
+          run_id: "held-run",
+          generation: 1,
+          state: "open",
+          attention: "source_only",
+          worker_id: "w1",
+          inventory_guarded: false,
+          has_available_capture: false,
+          created_at: "2026-07-05T10:00:00Z",
+          updated_at: "2026-07-05T10:00:00Z",
+        } as never,
+      ],
+    });
+    await page.viewport(1280, 900);
+    const { rows, lefts } = await mountCard([
+      aRun({ id: "plan", status: "awaiting_approval", issue_title: LONG_TITLE }),
+      aRun({ id: "ask", status: "awaiting_input", issue_title: LONG_TITLE }),
+      aRun({ id: "park", status: "paused", issue_title: LONG_TITLE }),
+      ...prs(3),
+    ]);
+    // The held row joins once the holds response lands.
+    await expect.poll(() => rows().length).toBe(5);
+    expect(lefts().size).toBe(1);
+  });
+
+  it("expands the PR group from the keyboard at 400px without horizontal overflow", async () => {
+    await page.viewport(400, 900);
+    const { card } = await mountCard([aRun({ id: "plan", status: "awaiting_approval", issue_title: LONG_TITLE }), ...prs(8)]);
+    const button = within(card).getByRole("button", { name: "Review PRs" });
+    const list = document.getElementById(button.getAttribute("aria-controls") ?? "") as HTMLElement;
+    expect(list).not.toBeNull();
+    // Tab from the last previewed PR link reaches the group's button.
+    const refs = within(list).getAllByRole("link");
+    refs[refs.length - 1].focus();
+    await userEvent.tab();
+    expect(document.activeElement).toBe(button);
+    await userEvent.keyboard("{Enter}");
+    expect(button.getAttribute("aria-expanded")).toBe("true");
+    expect(within(list).getAllByRole("link", { name: "Review PR" })).toHaveLength(8);
+    expect(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(window.innerWidth);
+    const cardRight = card.getBoundingClientRect().right;
+    for (const el of list.querySelectorAll<HTMLElement>("li")) {
+      expect.soft(el.getBoundingClientRect().right, el.textContent?.slice(0, 30)).toBeLessThanOrEqual(cardRight + 1);
+    }
+    await userEvent.keyboard(" ");
+    expect(button.getAttribute("aria-expanded")).toBe("false");
+    expect(button.textContent).toBe("Review PRs");
+  });
+});
