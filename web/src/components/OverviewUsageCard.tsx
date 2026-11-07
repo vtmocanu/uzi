@@ -7,11 +7,11 @@ import { maskEmail } from "../lib/demoMask";
 import { stripUnsafeChars } from "../lib/safeText";
 import { useNow } from "../lib/useNow";
 import { breakdown, perUserRows } from "../lib/usageByUser";
-import { Card, SectionTitle, cx } from "./ui";
+import { Card, SectionTitle } from "./ui";
 import type { UsageWindow } from "./UsageCards";
 import {
   failRate, failRateDelta, formatSince, summaryCost, perPrText, failureAgo,
-  FailedRunsBlock, TopCauses, SinceLastFailedRun, SegmentedToggle, WindowToggle,
+  FailedRunsBlock, TopCauses, SinceLastFailedRun, SegmentedToggle, WindowToggle, Th, Td,
 } from "./usageParts";
 
 // PRD #3881: the Overview preview's one Usage card. A You / Factory scope toggle (admins
@@ -38,32 +38,9 @@ function Kpi({ label, value, valueClass = "", sub }: { label: string; value: Rea
 const LAST_FAILURE_TITLE =
   "All time: the API serves the last failure time for all time only, so this column is the same in both windows";
 
-function Th({ children, left, title }: { children: ReactNode; left?: boolean; title?: string }) {
-  return (
-    <th
-      scope="col"
-      title={title}
-      className={cx("whitespace-nowrap border-b border-edge px-2.5 py-2 text-[11px] font-medium uppercase tracking-[0.04em] text-faint", left ? "text-left" : "text-right")}
-    >
-      {children}
-    </th>
-  );
-}
-
-function Td({ children, left, total, title }: { children?: ReactNode; left?: boolean; total?: boolean; title?: string }) {
-  const cls = cx(
-    "whitespace-nowrap px-2.5 py-2 align-top tabular-nums",
-    left ? "text-left" : "text-right",
-    total ? "border-t-2 border-edge-strong font-semibold text-fg" : "border-b border-edge/50 text-fg",
-  );
-  // The first column names its row.
-  if (left) return <th scope="row" title={title} className={cx(cls, !total && "font-normal")}>{children}</th>;
-  return <td title={title} className={cls}>{children}</td>;
-}
-
 function FailRateCell({ outcomes, total }: { outcomes: RunOutcomes; total?: boolean }) {
   return (
-    <Td total={total} title={`${outcomes.failed} of ${outcomes.finished} finished runs`}>
+    <Td variant="preview" total={total} title={`${outcomes.failed} of ${outcomes.finished} finished runs`}>
       {failRate(outcomes)}
       <span className="block text-[11px] font-normal text-faint">of {outcomes.finished.toLocaleString("en-US")} finished</span>
     </Td>
@@ -72,7 +49,7 @@ function FailRateCell({ outcomes, total }: { outcomes: RunOutcomes; total?: bool
 
 function CostCell({ cost, disclosure, total }: { cost: number; disclosure: ReturnType<typeof aggregateDisclosure>; total?: boolean }) {
   return (
-    <Td total={total}>
+    <Td variant="preview" total={total}>
       <span className="font-mono">{summaryCost(cost)}</span>
       {disclosure.incomplete && <span className="ml-auto block max-w-[16ch] whitespace-normal lg:max-w-none lg:whitespace-nowrap text-[11px] font-normal text-faint" title={disclosure.title}>{disclosure.text}</span>}
     </Td>
@@ -103,39 +80,39 @@ function ByUserTable({ admin, window, viewerId }: { admin: AdminUsage; window: U
           <table aria-label="By user" className="w-full min-w-[640px] border-collapse text-[13px]">
             <thead>
               <tr>
-                <Th left>User</Th>
-                <Th title="Runs with recorded usage in the period">Runs</Th>
-                <Th>PRs</Th>
-                <Th>Failed</Th>
-                <Th title="Failed of finished runs in the period">Fail rate</Th>
-                <Th title={LAST_FAILURE_TITLE}>Last failure</Th>
-                <Th>Cost</Th>
+                <Th variant="preview" left>User</Th>
+                <Th variant="preview" title="Runs with recorded usage in the period">Runs</Th>
+                <Th variant="preview">PRs</Th>
+                <Th variant="preview">Failed</Th>
+                <Th variant="preview" title="Failed of finished runs in the period">Fail rate</Th>
+                <Th variant="preview" title={LAST_FAILURE_TITLE}>Last failure</Th>
+                <Th variant="preview">Cost</Th>
               </tr>
             </thead>
             <tbody>
               {rows.map((u) => (
                 <tr key={u.user_id}>
-                  <Td left>
+                  <Td variant="preview" left>
                     {stripUnsafeChars(maskEmail(u.email, demo))}
                     {u.user_id === viewerId && <span className="font-normal text-faint"> (you)</span>}
                   </Td>
-                  <Td>{u.selectedRuns.toLocaleString("en-US")}</Td>
-                  <Td>{u.selectedPRs == null ? "—" : u.selectedPRs.toLocaleString("en-US")}</Td>
-                  <Td>{u.selectedOutcomes.failed.toLocaleString("en-US")}</Td>
+                  <Td variant="preview">{u.selectedRuns.toLocaleString("en-US")}</Td>
+                  <Td variant="preview">{u.selectedPRs == null ? "—" : u.selectedPRs.toLocaleString("en-US")}</Td>
+                  <Td variant="preview">{u.selectedOutcomes.failed.toLocaleString("en-US")}</Td>
                   <FailRateCell outcomes={u.selectedOutcomes} />
-                  <Td>{failureAgo(u.outcomes, now)}</Td>
+                  <Td variant="preview">{failureAgo(u.outcomes, now)}</Td>
                   <CostCell cost={u.b.cost} disclosure={aggregateDisclosure(u.subscription, u.unreported)} />
                 </tr>
               ))}
             </tbody>
             <tfoot>
               <tr>
-                <Td left total>Factory</Td>
-                <Td total>{factoryRuns.toLocaleString("en-US")}</Td>
-                <Td total>{factoryPRs == null ? "—" : factoryPRs.toLocaleString("en-US")}</Td>
-                <Td total>{factoryOutcomes.failed.toLocaleString("en-US")}</Td>
+                <Td variant="preview" left total>Factory</Td>
+                <Td variant="preview" total>{factoryRuns.toLocaleString("en-US")}</Td>
+                <Td variant="preview" total>{factoryPRs == null ? "—" : factoryPRs.toLocaleString("en-US")}</Td>
+                <Td variant="preview" total>{factoryOutcomes.failed.toLocaleString("en-US")}</Td>
                 <FailRateCell outcomes={factoryOutcomes} total />
-                <Td total>{failureAgo(admin.factory.outcomes.lifetime, now)}</Td>
+                <Td variant="preview" total>{failureAgo(admin.factory.outcomes.lifetime, now)}</Td>
                 <CostCell cost={factory.cost} disclosure={factoryDisclosure} total />
               </tr>
             </tfoot>

@@ -9,7 +9,7 @@ import { maskEmail } from "../lib/demoMask";
 import { Card, SectionTitle, cx } from "./ui";
 import {
   failRate, failRateDelta, formatSince, summaryCost, perPrText,
-  FailedRunsBlock, TopCauses, SinceLastFailedRun, WindowToggle,
+  FailedRunsBlock, TopCauses, SinceLastFailedRun, WindowToggle, Th, Td,
 } from "./usageParts";
 import { breakdown, perUserRows } from "../lib/usageByUser";
 
@@ -140,44 +140,6 @@ export function UsageCard({ self, admin, window, onWindowChange }: {
         </section>
       )}
     </Card>
-  );
-}
-
-function Th({ children, left, title }: { children: ReactNode; left?: boolean; title?: string }) {
-  return (
-    <th
-      title={title}
-      className={
-        "border-b border-edge px-2.5 py-1.5 text-[10.5px] font-semibold uppercase tracking-[0.06em] text-faint " +
-        (left ? "text-left" : "text-right")
-      }
-    >
-      {children}
-    </th>
-  );
-}
-
-function Td({
-  children,
-  left,
-  total,
-  cost,
-  title,
-}: {
-  children?: ReactNode;
-  left?: boolean;
-  total?: boolean;
-  cost?: boolean;
-  title?: string;
-}) {
-  const cls = ["px-2.5 py-1.5"];
-  cls.push(left ? "text-left font-sans" : "text-right font-mono tabular-nums");
-  if (total) cls.push("font-semibold text-fg");
-  else cls.push(cost ? "text-brand" : left ? "text-fg" : "text-muted", "border-b border-edge/50");
-  return (
-    <td className={cls.join(" ")} title={title}>
-      {children}
-    </td>
   );
 }
 

@@ -220,3 +220,68 @@ const WINDOW_OPTIONS = [
 export function WindowToggle({ value, onChange, className }: { value: UsageWindow; onChange: (window: UsageWindow) => void; className?: string }) {
   return <SegmentedToggle label="Usage reporting period" options={WINDOW_OPTIONS} value={value} onChange={onChange} className={className} />;
 }
+
+// Table cells for both per-user tables. "current" is the current Overview's PerUserUsageTable
+// (unchanged markup); "preview" is the Overview preview's By user table (PRD #3881), whose
+// first column names its row.
+type TableVariant = "current" | "preview";
+
+export function Th({ children, left, title, variant = "current" }: { children: ReactNode; left?: boolean; title?: string; variant?: TableVariant }) {
+  if (variant === "preview") {
+    return (
+      <th
+        scope="col"
+        title={title}
+        className={cx("whitespace-nowrap border-b border-edge px-2.5 py-2 text-[11px] font-medium uppercase tracking-[0.04em] text-faint", left ? "text-left" : "text-right")}
+      >
+        {children}
+      </th>
+    );
+  }
+  return (
+    <th
+      title={title}
+      className={
+        "border-b border-edge px-2.5 py-1.5 text-[10.5px] font-semibold uppercase tracking-[0.06em] text-faint " +
+        (left ? "text-left" : "text-right")
+      }
+    >
+      {children}
+    </th>
+  );
+}
+
+export function Td({
+  children,
+  left,
+  total,
+  cost,
+  title,
+  variant = "current",
+}: {
+  children?: ReactNode;
+  left?: boolean;
+  total?: boolean;
+  cost?: boolean;
+  title?: string;
+  variant?: TableVariant;
+}) {
+  if (variant === "preview") {
+    const cls = cx(
+      "whitespace-nowrap px-2.5 py-2 align-top tabular-nums",
+      left ? "text-left" : "text-right",
+      total ? "border-t-2 border-edge-strong font-semibold text-fg" : "border-b border-edge/50 text-fg",
+    );
+    if (left) return <th scope="row" title={title} className={cx(cls, !total && "font-normal")}>{children}</th>;
+    return <td title={title} className={cls}>{children}</td>;
+  }
+  const cls = ["px-2.5 py-1.5"];
+  cls.push(left ? "text-left font-sans" : "text-right font-mono tabular-nums");
+  if (total) cls.push("font-semibold text-fg");
+  else cls.push(cost ? "text-brand" : left ? "text-fg" : "text-muted", "border-b border-edge/50");
+  return (
+    <td className={cls.join(" ")} title={title}>
+      {children}
+    </td>
+  );
+}

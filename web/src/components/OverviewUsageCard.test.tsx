@@ -205,6 +205,21 @@ describe("OverviewUsageCard (#3881 M1)", () => {
     expect(view.queryByText(/runs with token usage/)).toBeNull();
     expect(view.getAllByRole("region", { name: /^(Your|Factory) usage$/ })).toHaveLength(1);
   });
+
+  it("renders no chart: no canvas or svg, and the outcome bar is the only image", () => {
+    const { self, admin } = fixture();
+    const view = mount({ self, admin });
+    const noChart = () => {
+      expect(view.container.querySelector("canvas, svg")).toBeNull();
+      expect(view.getAllByRole("img").map((i) => i.getAttribute("aria-label")))
+        .toEqual([expect.stringMatching(/^Finished runs: /)]);
+    };
+    noChart();
+    fireEvent.click(view.getByRole("button", { name: "Factory · all users" }));
+    noChart();
+    fireEvent.click(view.getByRole("button", { name: "All time" }));
+    noChart();
+  });
   it("shows the recoverable-work note from needs_landing", () => {
     const view = mount({ self: fixture().self });
     expect(view.getByText("4 failed runs with recoverable work. May include work already landed.")).toBeTruthy();

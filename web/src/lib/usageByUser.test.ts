@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 // PRD #3881 M2: the per-user rows and factory total shared by both Overview usage cards.
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createElement } from "react";
 import { cleanup, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -9,7 +9,7 @@ import { failureAgo } from "../components/usageParts";
 import { UsageCard } from "../components/UsageCards";
 import type { AdminUsage, AdminUsageUser, RunOutcomes, RunUsage, SelfUsage } from "./api";
 
-afterEach(cleanup);
+afterEach(() => { cleanup(); vi.useRealTimers(); });
 
 const bundle = (cost: number, tokens = 100): RunUsage => ({
   input_tokens: tokens, cache_read_tokens: 0, cache_creation_tokens: 0,
@@ -167,6 +167,8 @@ describe("the current Overview's UsageCard", () => {
       self: admin.factory, admin, window: "lifetime", onWindowChange: () => {},
     })));
 
+  const TOTAL_CELLS = ["uzi total", "35", "4", "14.8%", "3h", "300", "0", "$50.00", " "];
+
   it("keeps its window toggle right-aligned", () => {
     mount(fixture().admin);
     expect(screen.getByRole("group", { name: "Usage reporting period" }).className).toContain("ml-auto");
@@ -175,6 +177,8 @@ describe("the current Overview's UsageCard", () => {
   it("hides the PRs header and the total's PR cell when a row lacks its count", () => {
     const { admin } = fixture();
     delete admin.users[0].pr_count;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-07T09:00:00Z"));
     mount(admin);
     const users = within(screen.getByRole("region", { name: "Per-user usage, all time" }));
     const headers = users.getAllByRole("columnheader").map((h) => h.textContent);
@@ -182,6 +186,8 @@ describe("the current Overview's UsageCard", () => {
     expect(headers).toHaveLength(9);
     const rows = users.getAllByRole("row");
     const total = rows[rows.length - 1];
-    expect(within(total).getAllByRole("cell")).toHaveLength(9);
+    // The total row's remaining cells keep their values and order: label, Runs, Failed, Fail
+    // rate, Since last failure, Tokens, Out, Cost, Cost share (blank).
+    expect(within(total).getAllByRole("cell").map((c) => c.textContent)).toEqual(TOTAL_CELLS);
   });
 });
