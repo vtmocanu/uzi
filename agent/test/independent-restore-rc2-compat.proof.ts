@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
-  GitCache, type IndependentSeedInput, type PositiveOwedCandidateContext, type RecoveryJournalEntry,
+  GitCache, RestoreCompositeError, type IndependentSeedInput, type PositiveOwedCandidateContext, type RecoveryJournalEntry,
 } from "../src/git.js";
 import { restoreDigest, restoreJournalKey } from "../src/restore-journal.js";
 import { attemptClonePath, formatAttemptId } from "../src/attempt-path.js";
@@ -33,6 +33,11 @@ import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
 // RunRunner.reclaimTerminalOrphan -> GitCache.releaseAttemptInPlace(P, "reclaimed") (attempt-path flights) or
 // GitCache.retireRunnerClone(P, discard:false) (others) -> reseedAfterReclaim. reclaimTerminalOrphan is the archived method on an
 // instance of the archived class; the classification endpoint and the process-quiescence proof are the only stubs.
+//
+// Amendment 14 (the owner's "recognise the rc.2-released predecessor"): the last describe below runs the actual rc.2 sequence (S
+// terminal on this build, roll back to rc.2, another claim of the branch, markRecoveryCapture of the other run), then rolls forward
+// with the current GitCache on the same disk and drives S's discard and P's discard to `done` with no hand edits. Cancel is
+// runner-level (m4) and is not modelled here. The CI-gated twin, from a byte fixture of the same end state, is restore-released.test.ts.
 
 const root = path.resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const scratch = path.join(root, ".uzi", "scratch");
@@ -196,6 +201,42 @@ function assertSame(before: Snap, after: Snap, allowedConfigKeys: string[], what
   }
 }
 
+// The other-run claim path of rc.2's REAL RunRunner. The class is the archived one (not a copy): an instance is made from its
+// prototype with only the collaborators `reclaimTerminalOrphan` reads, and its own method runs. The caller chain it models is
+// runner.ts phaseClone: runnerCloneForClaim -> ForeignCaptureBlockedError(P) -> `reclaimTerminalOrphan` -> `releaseAttemptInPlace(P,
+// "reclaimed")` (git.ts) -> `reseedAfterReclaim` -> runnerCloneForClaim -> GitCache.runnerCloneForBranch. The collaborators stubbed
+// here are the classification endpoint (a terminal owner of this repo) and the process quiescence proof (no survivors).
+async function reclaimAsOtherRun(e: Env, attemptPaths: boolean): Promise<{ reclaimError?: unknown; diagnostics: string[] }> {
+  const OTHER = "another-run";
+  const attempt = (id: string) => ({ attemptId: id, isLive: () => false, beforeSeed: async () => {} });
+  const reseed = { beforeFree: async () => {}, isLive: () => false };
+  const otherId = formatAttemptId(new Date("2026-11-05T12:00:00Z"), 3, "aaaaaaaaaaaaaaaa");
+  let blocked: unknown;
+  try { await e.rc2.runnerCloneForBranch(e.bare, BRANCH, KEY, reseed, OTHER, false, undefined, attempt(otherId) as never); }
+  catch (err) { blocked = err; }
+  assert.ok(blocked instanceof rc2Git.ForeignCaptureBlockedError, "the other run's claim is blocked by P's journal");
+  const Runner = rc2Runner.RunRunner as unknown as { prototype: object };
+  const diagnostics: string[] = [];
+  const runner = Object.assign(Object.create(Runner.prototype) as Record<string, unknown>, {
+    git: e.rc2, attemptPaths,
+    log: { info: (m: string) => diagnostics.push(m), warn: (m: string) => diagnostics.push(m), error: (m: string) => diagnostics.push(m), debug: () => {} },
+    shutdownSignal: new AbortController(),
+    client: { getRunOrphanClassification: async () => ({ status: "completed", repo_id: "repo-1", kind: "issue", issue_iid: 3644, branch: BRANCH, pipeline_id: null, pipeline_ref: null }) },
+    quiesceRun: async () => ({ outcome: { kind: "verified" }, blocked: false }),
+  });
+  const controller = new AbortController();
+  const flight = { cancel: controller, steering: { lifecycleSignal: () => controller.signal, terminalLifecycleSignal: () => controller.signal, claimFence: () => undefined, isCancelled: () => false },
+    effectiveAttemptPaths: attemptPaths, executor: undefined };
+  const claim = { run_id: OTHER, repo: { id: "repo-1", default_branch: "main" } };
+  const error = blocked as InstanceType<Rc2Git["ForeignCaptureBlockedError"]>;
+  let reclaimError: unknown;
+  try {
+    await (runner as unknown as { reclaimTerminalOrphan(...a: unknown[]): Promise<void> })
+      .reclaimTerminalOrphan(e.bare, claim, flight, error.clonePath, error.branch, error.ownerRunId, error);
+  } catch (err) { reclaimError = err; }
+  return { reclaimError, diagnostics };
+}
+
 describe("rc.2 against a restore written by this build", () => {
   it("the released source is the tagged source, ignores the restore prefix, and loads (git, home reclaim, runner)", () => {
     const src = path.join(suite, "reader-rc2", "agent", "src");
@@ -293,42 +334,6 @@ describe("rc.2 against a restore written by this build", () => {
     } finally { e.fx.cleanup(); }
   });
 
-  // The other-run claim path of rc.2's REAL RunRunner. The class is the archived one (not a copy): an instance is made from its
-  // prototype with only the collaborators `reclaimTerminalOrphan` reads, and its own method runs. The caller chain it models is
-  // runner.ts phaseClone: runnerCloneForClaim -> ForeignCaptureBlockedError(P) -> `reclaimTerminalOrphan` -> `releaseAttemptInPlace(P,
-  // "reclaimed")` (git.ts) -> `reseedAfterReclaim` -> runnerCloneForClaim -> GitCache.runnerCloneForBranch. The collaborators stubbed
-  // here are the classification endpoint (a terminal owner of this repo) and the process quiescence proof (no survivors).
-  async function reclaimAsOtherRun(e: Env, attemptPaths: boolean): Promise<{ reclaimError?: unknown; diagnostics: string[] }> {
-    const OTHER = "another-run";
-    const attempt = (id: string) => ({ attemptId: id, isLive: () => false, beforeSeed: async () => {} });
-    const reseed = { beforeFree: async () => {}, isLive: () => false };
-    const otherId = formatAttemptId(new Date("2026-11-05T12:00:00Z"), 3, "aaaaaaaaaaaaaaaa");
-    let blocked: unknown;
-    try { await e.rc2.runnerCloneForBranch(e.bare, BRANCH, KEY, reseed, OTHER, false, undefined, attempt(otherId) as never); }
-    catch (err) { blocked = err; }
-    assert.ok(blocked instanceof rc2Git.ForeignCaptureBlockedError, "the other run's claim is blocked by P's journal");
-    const Runner = rc2Runner.RunRunner as unknown as { prototype: object };
-    const diagnostics: string[] = [];
-    const runner = Object.assign(Object.create(Runner.prototype) as Record<string, unknown>, {
-      git: e.rc2, attemptPaths,
-      log: { info: (m: string) => diagnostics.push(m), warn: (m: string) => diagnostics.push(m), error: (m: string) => diagnostics.push(m), debug: () => {} },
-      shutdownSignal: new AbortController(),
-      client: { getRunOrphanClassification: async () => ({ status: "completed", repo_id: "repo-1", kind: "issue", issue_iid: 3644, branch: BRANCH, pipeline_id: null, pipeline_ref: null }) },
-      quiesceRun: async () => ({ outcome: { kind: "verified" }, blocked: false }),
-    });
-    const controller = new AbortController();
-    const flight = { cancel: controller, steering: { lifecycleSignal: () => controller.signal, terminalLifecycleSignal: () => controller.signal, claimFence: () => undefined, isCancelled: () => false },
-      effectiveAttemptPaths: attemptPaths, executor: undefined };
-    const claim = { run_id: OTHER, repo: { id: "repo-1", default_branch: "main" } };
-    const error = blocked as InstanceType<Rc2Git["ForeignCaptureBlockedError"]>;
-    let reclaimError: unknown;
-    try {
-      await (runner as unknown as { reclaimTerminalOrphan(...a: unknown[]): Promise<void> })
-        .reclaimTerminalOrphan(e.bare, claim, flight, error.clonePath, error.branch, error.ownerRunId, error);
-    } catch (err) { reclaimError = err; }
-    return { reclaimError, diagnostics };
-  }
-
   it("OWNER REVIEW PENDING (plan 3.11): rc.2's real reclaimTerminalOrphan (the other-run claim path) clears P's journal and appends ledger reclaimed; P's bytes and S are untouched", async () => {
     const e = await build();
     try {
@@ -410,5 +415,183 @@ describe("rc.2 against a restore written by this build", () => {
         assert.ok(configEntries(safe.bare).get(S_KEY)?.[0]);
       } finally { safe.fx.cleanup(); }
     } finally { e.fx.cleanup(); }
+  });
+});
+
+// ---- amendment 14: roll forward from the rc.2-released predecessor -----------------------------------------------------------------
+
+const OTHER = "another-run";
+
+describe("amendment 14: roll forward from the state rc.2 leaves after another claim of the branch", () => {
+  const holdingRoot = (e: Env): string => path.join(e.dataDir, "runner-quarantine");
+  const quiet = { isLivePath: () => false, quiesce: async () => true };
+
+  /** The rc.2 claim by the other run, whole: its real reclaimTerminalOrphan, its reseed (attempt path in mode A, canonical in mode H) and
+   *  its markRecoveryCapture, which writes O's journal into P's own key. */
+  async function rc2ClaimsBranch(e: Env, attemptPaths: boolean): Promise<{ oPath: string }> {
+    const { reclaimError, diagnostics } = await reclaimAsOtherRun(e, attemptPaths);
+    assert.equal(reclaimError, undefined, `reclaim failed: ${String(reclaimError)} ${diagnostics.join("|")}`);
+    const otherId = formatAttemptId(new Date("2026-11-05T12:00:00Z"), 3, "bbbbbbbbbbbbbbbb");
+    const reseed = { beforeFree: async () => {}, isLive: () => false };
+    const clone = await e.rc2.runnerCloneForBranch(e.bare, BRANCH, KEY, reseed, OTHER, false, undefined,
+      (attemptPaths ? { attemptId: otherId, isLive: () => false, beforeSeed: async () => {} } : undefined) as never);
+    await e.rc2.markRecoveryCapture(e.bare, clone.path, BRANCH, OTHER, attemptPaths ? otherId : undefined);
+    assert.equal(JSON.parse(configEntries(e.bare).get(P_KEY)![0]!).runId, OTHER, "rc.2 wrote O's journal into P's key");
+    return { oPath: clone.path };
+  }
+
+  /** One of the owner's own discards on the rolled-forward build: inspect for the confirm digest, then discard. */
+  async function discardOn(e: Env, runId: string, attempt: string, generation: number, over: Record<string, unknown> = {}) {
+    const selector = { runId, generation, attempt };
+    const holds = { state: "read" as const, holds: [] };
+    const lifecycle = { state: "terminal" as const, status: "failed" as const };
+    const inspected = await e.current.inspectRetainedSources({ selector, holds, lifecycle, isLivePath: () => false, barePath: e.bare });
+    const confirm = inspected.sources[0]?.descriptor ?? "no-record";
+    return e.current.discardStoppedSource({ selector, confirm, holds, lifecycle, barePath: e.bare, ...quiet,
+      hasRetainedHomeMarker: async () => true, removeRetainedHomeMarker: async () => {}, ...over } as never);
+  }
+
+  async function rollForwardBothDiscards(e: Env, attemptPaths: boolean, sFirstTerminalTombstone: boolean): Promise<void> {
+    const { oPath } = await rc2ClaimsBranch(e, attemptPaths);
+    const holdingBefore = tree(holdingRoot(e));
+    const pBefore = tree(e.pPath);
+    const oBefore = tree(oPath);
+    const pKeyBefore = configEntries(e.bare).get(P_KEY);
+    // (i) the rolled-forward strict resolver and every other consumer refuse, writing nothing.
+    const before = snap(e);
+    await assert.rejects(() => e.current.resolveBranchJournal(e.bare, BRANCH), /predecessor released or missing/);
+    await assert.rejects(() => e.current.discoverOpaque(e.bare, BRANCH, OTHER), RestoreCompositeError);
+    await assert.rejects(() => e.current.discoverOpaque(e.bare, BRANCH, RUN), RestoreCompositeError);
+    assertSame(before, snap(e), [], "refusals");
+    assert.deepEqual(configEntries(e.bare), before.config, "refusals leave the config byte-identical");
+    assert.deepEqual(tree(holdingRoot(e)), holdingBefore);
+    // (ii) S's discard: tombstone, no hand edit.
+    if (!sFirstTerminalTombstone) {
+      const s = await discardOn(e, RUN, S_ID, 2);
+      assert.equal(s.kind, "done", JSON.stringify(s));
+      assert.equal(fs.existsSync(e.sPath), false);
+      assert.ok(configEntries(e.bare).get(S_KEY)?.[0]?.includes('"restoreStage":"retired"'), "the basis survives as the tombstone");
+    }
+    assert.deepEqual(configEntries(e.bare).get(P_KEY), pKeyBefore, "S's exit never writes P's key (it holds O's journal)");
+    assert.deepEqual(tree(e.pPath), pBefore, "P's bytes are untouched by S's exit");
+    assert.deepEqual(tree(oPath), oBefore, "O's clone is untouched");
+    // (iii) P's discard.
+    const removed: string[] = [];
+    const p = await discardOn(e, RUN, P_ID, 1, { removeRetainedHomeMarker: async (run: string) => { removed.push(run); } });
+    assert.equal(p.kind, "done", JSON.stringify(p));
+    assert.deepEqual(removed, [RUN], "the marker hook runs once");
+    assert.deepEqual(configEntries(e.bare).get(P_KEY), pKeyBefore, "P's key is byte-identical after P's exit");
+    assert.equal(configEntries(e.bare).get(S_KEY)?.[0] ?? "", "", "the restore entry is gone");
+    const states = (configEntries(e.bare).get(LEDGER_KEY) ?? []).map(v => JSON.parse(v) as { attemptId: string; state: string });
+    assert.equal(states.filter(x => x.attemptId === P_ID).at(-1)?.state, "retired");
+    assert.deepEqual(tree(oPath), oBefore, "O's clone is still untouched");
+    assert.deepEqual(tree(holdingRoot(e)), holdingBefore, "the holding root is byte-identical: P's exit never touches it");
+    if (attemptPaths) assert.equal(fs.existsSync(e.pPath), false, "the owner's authorised discard removed P's directory");
+    else {
+      assert.equal(p.kind === "done" && typeof p.holding === "string" && fs.existsSync(path.join(holdingRoot(e), p.holding)), true, "the holding directory is reported and intact");
+      assert.equal(fs.readFileSync(path.join(holdingRoot(e), (p as { holding: string }).holding, "later.txt"), "utf8"), "later bytes that were never saved");
+    }
+    // (iv) O's own branch is O's again: its journal is an ordinary plain journal of O.
+    assert.equal((await e.current.discoverOpaque(e.bare, BRANCH, OTHER)).kind, "sameRun");
+  }
+
+  it("mode A (attempt-path flight): rc.2 reclaim as O + reseed + markRecoveryCapture, roll forward: discard S then discard P reach done, P's key byte-identical", async () => {
+    const e = await build();
+    try { await rollForwardBothDiscards(e, true, false); } finally { e.fx.cleanup(); }
+  });
+
+  it("mode H (holding root): the same sequence on a flight that is not on attempt paths; the holding copy is reported and never touched", async () => {
+    const e = await build();
+    try { await rollForwardBothDiscards(e, false, false); } finally { e.fx.cleanup(); }
+  });
+
+  /** S discarded and its tombstone written on this build BEFORE the rollback. */
+  async function tombstoneBeforeRollback(e: Env): Promise<void> {
+    fs.rmSync(e.sPath, { recursive: true, force: true });
+    git(e.bare, "config", "--add", LEDGER_KEY, JSON.stringify({ attemptId: S_ID, runId: RUN, clonePath: e.sPath, state: "retired" }));
+    await e.current.advanceRestoreEntry(e.bare, BRANCH, "retired");
+  }
+
+  it("S terminal and its tombstone written BEFORE the rollback (mode H): only P's discard is needed and it reaches done", async () => {
+    const e = await build();
+    try { await tombstoneBeforeRollback(e); await rollForwardBothDiscards(e, false, true); } finally { e.fx.cleanup(); }
+  });
+
+  it("S terminal and its tombstone written BEFORE the rollback (mode A): rc.2's attempt seed compacts away S's retired ledger value, so the roll-forward REFUSES fail-closed (disclosed residual, same mechanism as B2)", async () => {
+    const e = await build();
+    try {
+      await tombstoneBeforeRollback(e);
+      const { oPath } = await rc2ClaimsBranch(e, true);
+      const states = (configEntries(e.bare).get(LEDGER_KEY) ?? []).map(v => JSON.parse(v) as { attemptId: string; state: string });
+      assert.equal(states.some(x => x.attemptId === S_ID), false, "rc.2's compactAttemptLedger dropped S's gone, unjournaled, retired entry");
+      assert.equal(states.filter(x => x.attemptId === P_ID).at(-1)?.state, "reclaimed", "P's reclaimed entry is never compacted");
+      const before = snap(e);
+      const oBefore = tree(oPath);
+      await assert.rejects(() => e.current.resolveBranchJournal(e.bare, BRANCH), RestoreCompositeError);
+      const p = await discardOn(e, RUN, P_ID, 1);
+      assert.notEqual(p.kind, "done", JSON.stringify(p));
+      assertSame(before, snap(e), [], "dropped evidence");
+      assert.deepEqual(configEntries(e.bare), before.config, "nothing was written");
+      assert.deepEqual(tree(oPath), oBefore);
+      assert.equal(fs.readFileSync(path.join(e.pPath, "later.txt"), "utf8"), "later bytes that were never saved", "P's bytes are intact");
+    } finally { e.fx.cleanup(); }
+  });
+
+  it("B2 (disclosed residual): a SECOND rollback after S's discard, then an rc.2 attempt seed (whose ledger compaction runs once P's key holds no journal), drops the evidence; roll forward refuses fail-closed with P's bytes intact", async () => {
+    const e = await build();
+    try {
+      // First rollback: rc.2 reclaims P (mode H: moved to the holding root, key cleared, ledger `live`). No reseed yet.
+      const { reclaimError, diagnostics } = await reclaimAsOtherRun(e, false);
+      assert.equal(reclaimError, undefined, `reclaim failed: ${String(reclaimError)} ${diagnostics.join("|")}`);
+      // Roll forward: the recognised state lets S's own discard finish (the tombstone keeps the basis).
+      assert.equal((await discardOn(e, RUN, S_ID, 2)).kind, "done");
+      const heldBefore = tree(holdingRoot(e));
+      // Second rollback: an rc.2 attempt seed on the branch (an attempt flight of the other run). Its seed-time compaction drops
+      // a gone, unjournaled, non-reclaimed ledger entry unless the run has terminal protection.
+      const third = formatAttemptId(new Date("2026-11-06T09:00:00Z"), 4, "cccccccccccccccc");
+      const reseed = { beforeFree: async () => {}, isLive: () => false };
+      await e.rc2.runnerCloneForBranch(e.bare, BRANCH, KEY, reseed, OTHER, false, undefined, { attemptId: third, isLive: () => false, beforeSeed: async () => {} } as never);
+      const ledger = (configEntries(e.bare).get(LEDGER_KEY) ?? []).map(v => JSON.parse(v) as { attemptId: string; state: string });
+      const dropped = [P_ID, S_ID].filter(id => !ledger.some(x => x.attemptId === id));
+      assert.deepEqual(dropped, [P_ID, S_ID], "rc.2's compaction dropped P's live and S's retired entries (their paths are gone and nothing journals them)");
+      const before = snap(e);
+      await assert.rejects(() => e.current.resolveBranchJournal(e.bare, BRANCH), RestoreCompositeError);
+      const p = await discardOn(e, RUN, P_ID, 1);
+      assert.notEqual(p.kind, "done", `dropped evidence must refuse: ${JSON.stringify(p)}`);
+      assert.equal(p.kind, "refused", "P has no ledger record left to select, so there is nothing to confirm");
+      assert.deepEqual(configEntries(e.bare), before.config, "nothing was written");
+      assert.deepEqual(tree(holdingRoot(e)), heldBefore, "P's bytes (the holding copy) are intact");
+      assertSame(before, snap(e), [], "second rollback");
+    } finally { e.fx.cleanup(); }
+  });
+
+  it("N1 control: rc.2 retainStoppedAttempt on a plain P writes the mode-A shape too, but is unreachable after an episode reservation, which it never clears", async () => {
+    // (a) With the episode journal rc.2 reserves before it ever runs in P, retainStoppedAttempt appends `reclaimed` and does NOT clear
+    //     the key: P's key still holds a journal of the run, which is not the released shape. Both exits stay refused, nothing written.
+    const e = await build();
+    try {
+      const expected = { runId: RUN, clonePath: e.pPath, attemptId: P_ID };
+      await e.rc2.reserveRecoveryIteration(e.bare, BRANCH, KEY, expected, 1000, 2);
+      assert.equal(await e.rc2.retainStoppedAttempt(e.bare, BRANCH, expected), "retained");
+      const key = JSON.parse(configEntries(e.bare).get(P_KEY)![0]!) as { runId: string; recovery?: unknown };
+      assert.equal(key.runId, RUN);
+      assert.ok(key.recovery, "the episode journal is not cleared");
+      const before = snap(e);
+      await assert.rejects(() => e.current.resolveBranchJournal(e.bare, BRANCH), /predecessor journal changed/);
+      const s = await discardOn(e, RUN, S_ID, 2);
+      assert.notEqual(s.kind, "done");
+      assertSame(before, snap(e), [], "episode + reclaimed");
+      assert.deepEqual(configEntries(e.bare), before.config);
+    } finally { e.fx.cleanup(); }
+    // (b) On a plain P (no episode) the same call yields exactly the mode-A end state, and the roll-forward recognises it like any other
+    //     mode-A state: recognition grants the guarded discards and nothing more.
+    const f = await build();
+    try {
+      assert.equal(await f.rc2.retainStoppedAttempt(f.bare, BRANCH, { runId: RUN, clonePath: f.pPath, attemptId: P_ID }), "retained");
+      assert.equal(configEntries(f.bare).get(P_KEY)?.[0] ?? "", "");
+      await assert.rejects(() => f.current.resolveBranchJournal(f.bare, BRANCH), /predecessor released or missing/);
+      assert.equal((await discardOn(f, RUN, S_ID, 2)).kind, "done");
+      assert.equal((await discardOn(f, RUN, P_ID, 1)).kind, "done");
+    } finally { f.fx.cleanup(); }
   });
 });

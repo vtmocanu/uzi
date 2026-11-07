@@ -162,6 +162,31 @@ export function restoreTombstoneJson(basis: RestoreBasis, succ: RestoreSuccessor
     successor: { runId: s.runId, attemptId: s.attemptId, clonePath: s.clonePath } });
 }
 
+// ---- the rc.2 holding-root grammar and the attempt-id clock (issue #3644 amendment 14) -----------------------------
+
+const HOLDING_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+/** The name prefix of the worker-only holding directories rc.2's `retireRunnerClone(discard:false)` creates for `runId`:
+ *  the run id with every character outside `[A-Za-z0-9_-]` replaced by `_`, then `-`. Pure; no filesystem access. */
+export function holdingNamePrefix(runId: string): string {
+  return `${runId.replace(/[^A-Za-z0-9_-]/g, "_")}-`;
+}
+
+/** True when `name` is exactly `<holdingNamePrefix(runId)><uuid v4>`, the spelling rc.2 gives a holding directory. */
+export function isHoldingName(name: string, runId: string): boolean {
+  const prefix = holdingNamePrefix(runId);
+  return name.startsWith(prefix) && HOLDING_UUID_RE.test(name.slice(prefix.length));
+}
+
+/** The UTC instant (ms) an attempt id encodes (`yyyymmddThhmmssZ-...`), or undefined for anything else. */
+export function attemptIdStartMs(attemptId: string): number | undefined {
+  const m = /^([0-9]{4})([0-9]{2})([0-9]{2})T([0-9]{2})([0-9]{2})([0-9]{2})Z-/.exec(attemptId);
+  if (!m) return undefined;
+  const [y, mo, d, h, mi, s] = m.slice(1).map(Number) as [number, number, number, number, number, number];
+  const ms = Date.UTC(y, mo - 1, d, h, mi, s);
+  return Number.isFinite(ms) ? ms : undefined;
+}
+
 // ---- the crash windows of the seed (plan 3.9) --------------------------------------------------------------------
 
 /**

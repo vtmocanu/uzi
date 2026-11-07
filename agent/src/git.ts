@@ -45,8 +45,8 @@ import {
 import { InvalidRecoveryClonePathError, recoveryProgress, recoverySource, sameRecoverySource, type RecoveryBlocker, type RecoveryProgress, type RecoverySource } from "./recovery-progress.js";
 import { parseSourceFence, serializeSourceFence, type CompletionSourceFence } from "./completion-source.js";
 import {
-  RestoreCompositeBlockedError, RestoreCompositeError, RestoreSeedError, parseRestoreValue, restoreDigest, restoreEnvelopeJson, restoreJournalKey,
-  restoreKeyBranch, restoreProtects, restoreRefProtection, restoreTombstoneJson, type RestoreBasis, type RestoreRefProtection, type RestoreStage,
+  RestoreCompositeBlockedError, RestoreCompositeError, RestoreSeedError, attemptIdStartMs, holdingNamePrefix, isHoldingName, parseRestoreValue,
+  restoreDigest, restoreEnvelopeJson, restoreJournalKey, restoreKeyBranch, restoreProtects, restoreRefProtection, restoreTombstoneJson, type RestoreBasis, type RestoreRefProtection, type RestoreStage,
   type RestoreSuccessor, type RestoreWindow,
 } from "./restore-journal.js";
 import type { GitAuthorityHooks, AuthoritySettlement } from "./git-authority-hooks.js";
@@ -2197,6 +2197,22 @@ export type BranchJournal =
     ledger: AttemptLedgerEntry;
   };
 
+/**
+ * issue #3644 amendment 14: the restore composite as the RESTORE-AWARE EXIT sees it when the predecessor P was released by
+ * v0.87.0-rc.2 (a rollback ran another claim of the branch). Never returned by {@link GitCache.resolveBranchJournal} or any
+ * other consumer: it carries no P journal, so nothing that receives it can adopt, restore from or write P. `mode` is where P's
+ * bytes are: `in_place` (rc.2 `releaseAttemptInPlace`, P's ledger entry `reclaimed`) or `holding` (rc.2 `retireRunnerClone`
+ * moved P to a worker-only holding directory, P's ledger entry still `live`; `holding` names that directory).
+ */
+type ReleasedComposite = Omit<Extract<BranchJournal, { kind: "composite" }>, "kind" | "predecessor"> & {
+  kind: "released";
+  mode: "in_place" | "holding";
+  holding?: string;
+  pLedger: AttemptLedgerEntry;
+  /** The exact `key\nvalue` entries of P's journal key, which a released exit must leave byte-identical (it may hold another run's journal). */
+  pKeyEntries: string[];
+};
+
 /** The result of {@link GitCache.discoverOpaque}: bare config only, never a path under the runner root. */
 export type OpaqueDiscovery =
   | { kind: "sameRun"; journal: RecoveryJournalEntry; raw: string; source: "active" | "descriptor" }
@@ -2562,6 +2578,8 @@ export type RetainedDiscardResult =
       kind: "done" | "incomplete" | "unknown";
       sources: Array<{ clonePath: string; outcome: RetainedSourceOutcome }>;
       metadata: "retired" | "kept";
+      /** Amendment 14: the name of the rc.2 holding directory that still holds a released predecessor's bytes (never touched). */
+      holding?: string;
     };
 
 /** The inspect budget (ms), the descriptor cap and the destructive operation deadline (ms). */
@@ -11579,6 +11597,13 @@ export class GitCache {
             // remaining sources and every record: nothing further is deleted or retired.
             const stopped = (): RetainedDiscardResult => ({ kind: "unknown", sources: outcomes, metadata });
             if (residueQuarantine() !== undefined) return stopped();
+            // Amendment 14: a released predecessor is re-proven under this lock after the caller's quiescence and before any
+            // authority is taken or byte deleted; a changed holding directory or P's path having reappeared refuses here.
+            const releasedPlan = restoreExit?.composite?.kind === "released" ? restoreExit.composite : undefined;
+            if (releasedPlan) {
+              const again = await this.resolveExitJournal(bare, rec.branch).catch(() => undefined);
+              if (!again || !this.sameReleased(again, releasedPlan)) return refused("restore_state_changed", ["restore_state_changed"]);
+            }
             // issue #3404 M2 U5: the operator-discard takeover of the authority slots comes LAST, after every refusal
             // above (protected-source checks, quiescence, latch) and immediately before the first delete. A refused
             // discard therefore rewrites no durable authority, and a crashed worker's foreign `active` epoch keeps
@@ -11667,7 +11692,7 @@ export class GitCache {
               });
             }
             metadata = "retired";
-            return { kind: "done", sources: outcomes, metadata };
+            return { kind: "done", sources: outcomes, metadata, ...(restoreExit?.kind === "predecessor" && releasedPlan?.holding !== undefined ? { holding: releasedPlan.holding } : {}) };
           });
         });
     } catch (err) {
@@ -11692,8 +11717,8 @@ export class GitCache {
     g: GatheredBare, rec: GatheredRecord, mode: "plain" | "protected", hasMarker?: (runId: string) => Promise<boolean>,
   ): Promise<
     { kind: "none" } |
-    { kind: "successor"; composite: Extract<BranchJournal, { kind: "composite" }>; sAttemptId: string; sGeneration: number; pGeneration: number } |
-    { kind: "predecessor"; composite?: Extract<BranchJournal, { kind: "composite" }>; window2?: AttemptLedgerEntry; pGeneration: number }
+    { kind: "successor"; composite: Extract<BranchJournal, { kind: "composite" }> | ReleasedComposite; sAttemptId: string; sGeneration: number; pGeneration: number } |
+    { kind: "predecessor"; composite?: Extract<BranchJournal, { kind: "composite" }> | ReleasedComposite; window2?: AttemptLedgerEntry; pGeneration: number }
   > {
     const entries = await this.configEntries(g.barePath);
     const part = rec.parts[0]!;
@@ -11718,8 +11743,9 @@ export class GitCache {
     }
     if (holder.runId !== rec.runId) throw new RestoreCompositeBlockedError("the branch is held by another run's restore", holder.runId);
     if (mode !== "plain" || rec.kind !== "attempt") throw new RestoreCompositeError("a restore entry exists for this branch");
-    const composite = await this.resolveBranchJournalUnderLock(g.barePath, rec.branch, entries);
-    if (composite.kind !== "composite") throw new RestoreCompositeError("restore entry without a composite");
+    // The exit alone may see a predecessor rc.2 released (amendment 14): it is then P's guarded discard that closes the restore.
+    const composite = await this.resolveExitJournal(g.barePath, rec.branch, entries);
+    if (composite.kind !== "composite" && composite.kind !== "released") throw new RestoreCompositeError("restore entry without a composite");
     const pGeneration = composite.basis.predecessor.generation;
     const sPath = composite.successor.kind === "entry" ? composite.successor.journal.clonePath : composite.successor.successor.clonePath;
     if (part.clonePath === sPath) {
@@ -11782,12 +11808,15 @@ export class GitCache {
     const p = rec.parts[0]!;
     const retired = (e: { attemptId: string; clonePath: string }): string =>
       attemptLedgerValue({ attemptId: e.attemptId, runId: rec.runId, clonePath: e.clonePath, state: "retired" });
+    const released = plan.composite?.kind === "released" ? plan.composite : undefined;
     if (plan.kind === "successor") {
       // A `seeding` entry pairs only with a live ledger entry, so step it to `ready` first; then S's ledger `retired` (pair
-      // ready+retired), then the single write that clears S's key. P's key and P's path are never touched.
-      if (plan.composite.stage === "seeding") await this.advanceRestoreEntryUnderLock(bare, rec.branch, "ready");
+      // ready+retired), then the single write that clears S's key. P's key and P's path are never touched. Under a released
+      // predecessor (amendment 14) S's key becomes the TOMBSTONE instead: the basis (the pin, the ref protection and the only
+      // record binding P's triple) must outlive S until P's own guarded discard.
+      if (plan.composite.stage === "seeding") await this.advanceRestoreEntryUnderLock(bare, rec.branch, "ready", undefined, true);
       await this.appendAttemptLedger(bare, rec.branch, { attemptId: plan.sAttemptId, runId: rec.runId, clonePath: p.clonePath, state: "retired" });
-      await this.advanceRestoreEntryUnderLock(bare, rec.branch, "cleared");
+      await this.advanceRestoreEntryUnderLock(bare, rec.branch, released ? "retired" : "cleared", undefined, true);
       onRetired();
       return;
     }
@@ -11795,23 +11824,32 @@ export class GitCache {
     // then the retained-home marker. Before the rename nothing changed, so the same call retries whole (P's bytes may already be
     // gone; the marker and ledger evidence still select the exit); after it only the sync and the marker are owed, which the
     // retry finishes through finishOrphanRestoreMarker. There is no state with P's key cleared and its ledger entry still live.
+    // Under a released predecessor P's key is NOT in the edit: it may hold another run's journal, which stays byte for byte.
     const pKey = recoveryCaptureKey(rec.branch);
     const ledgerKey = attemptLedgerKey(rec.branch);
     if (plan.composite) {
-      const raw = (await this.resolveBranchJournalUnderLock(bare, rec.branch));
-      if (raw.kind !== "composite" || raw.ledger.state !== "retired") throw new RestoreCompositeError("restore entry's attempt is not retired");
+      const raw = await this.resolveExitJournal(bare, rec.branch);
+      if ((raw.kind !== "composite" && raw.kind !== "released") || raw.ledger.state !== "retired") throw new RestoreCompositeError("restore entry's attempt is not retired");
+      if (released ? !this.sameReleased(raw, released) : raw.kind !== "composite") throw new RestoreCompositeError("the restore state changed under the exit");
     }
     await this.rewriteConfigAtomically(bare, "the restore exit", async tmp => {
       // Under a tombstone, clearing P's key alone would break the composite and clearing the tombstone first would orphan P's
       // journal: both go in the same rename.
-      await this.runGit(bare, ["config", "--file", tmp, pKey, ""]);
+      if (!released) await this.runGit(bare, ["config", "--file", tmp, pKey, ""]);
       if (plan.composite) await this.runGit(bare, ["config", "--file", tmp, restoreJournalKey(rec.branch), ""]);
       else if (plan.window2) await this.runGit(bare, ["config", "--file", tmp, "--add", ledgerKey, retired(plan.window2)]);
       await this.runGit(bare, ["config", "--file", tmp, "--add", ledgerKey, retired({ attemptId: p.attemptId!, clonePath: p.clonePath })]);
     });
     await this.syncRestoreWrite(bare);
     onRetired();
-    if (plan.composite && (await this.resolveBranchJournalUnderLock(bare, rec.branch)).kind !== "none") throw new Error("restore exit read-back differs");
+    if (released) {
+      const after = await this.configEntries(bare);
+      if (this.restoreValueIn(after, rec.branch) !== undefined ||
+          after.filter(item => item === pKey || item.startsWith(`${pKey}\n`)).join("\0") !== released.pKeyEntries.join("\0")) throw new Error("restore exit read-back differs");
+      if (released.holding !== undefined) {
+        this.log.info("restore exit: the released predecessor is retired; its holding copy is retained untouched and still needs an owner", { holding: released.holding });
+      }
+    } else if (plan.composite && (await this.resolveBranchJournalUnderLock(bare, rec.branch)).kind !== "none") throw new Error("restore exit read-back differs");
     // The marker goes LAST: the no-entry predecessor plan needs it as evidence, so a failure at any earlier point retries whole,
     // and a failure here is finished by {@link finishOrphanRestoreMarker} on the retry.
     await removeMarker?.(rec.runId);
@@ -12293,7 +12331,7 @@ export class GitCache {
     const pRaw = entries.filter(item => item.startsWith(pPrefix)).at(-1)?.slice(pPrefix.length) || undefined;
     const sRaw = this.restoreValueIn(entries, branch);
     if (sRaw === undefined) return pRaw === undefined ? { kind: "none" } : { kind: "plain", journal: parseRecoveryJournal(pRaw), raw: pRaw };
-    if (pRaw === undefined) throw new RestoreCompositeError("predecessor journal is empty");
+    if (pRaw === undefined) return this.compositeRefusal(barePath, branch, entries, "predecessor journal is empty");
     let predecessor: RecoveryJournalEntry;
     try { predecessor = parseRecoveryJournal(pRaw); }
     catch { throw new RestoreCompositeError("predecessor journal is unreadable"); }
@@ -12305,7 +12343,7 @@ export class GitCache {
     const sAttempt = successor.kind === "entry" ? successor.journal.attemptId : successor.successor.attemptId;
     const sPath = successor.kind === "entry" ? successor.journal.clonePath : successor.successor.clonePath;
     const basis = value.basis;
-    if (sRun !== predecessor.runId) throw new RestoreCompositeError("restore entry names another run");
+    if (sRun !== predecessor.runId) return this.compositeRefusal(barePath, branch, entries, "restore entry names another run");
     if (restoreDigest(pRaw) !== basis.journalDigest) throw new RestoreCompositeError("predecessor journal changed");
     if (predecessor.clonePath !== basis.predecessor.clonePath || predecessor.attemptId !== basis.predecessor.attemptId ||
         sAttempt === predecessor.attemptId || sPath === predecessor.clonePath) throw new RestoreCompositeError("restore basis does not match the predecessor");
@@ -12316,6 +12354,142 @@ export class GitCache {
       (stage === "retired" && ledger.state === "retired");
     if (!valid) throw new RestoreCompositeError(`restore state ${stage} with ledger ${ledger.state}`);
     return { kind: "composite", basis, stage, predecessor: { journal: predecessor, raw: pRaw }, successor, ledger };
+  }
+
+  /** The strict resolver's refusal for P's key not naming P. Config-only: when the bare's config alone shows the shape rc.2 leaves
+   *  after releasing P (see {@link releasedConfigFacts}) the message says so, and nothing else changes. Always throws. */
+  private async compositeRefusal(barePath: string, branch: string, entries: readonly string[], reason: string): Promise<never> {
+    const facts = await this.releasedConfigFacts(barePath, branch, entries);
+    throw new RestoreCompositeError(facts ? `${reason} (predecessor released or missing)` : reason);
+  }
+
+  /**
+   * issue #3644 amendment 14, conjuncts 1-5 of the released-predecessor predicate, from the bare's CONFIG ALONE (no path is
+   * inspected): the restore value decodes and its S identity pairs with S's ledger entry; P's key is absent, empty or exactly one
+   * journal of ANOTHER run that names neither P, S nor a holding directory; nothing else attributes R (no protected descriptor, no
+   * stopped marker, no other ledger entry naming P's or S's path, no other non-retired attempt of R at or above P's generation);
+   * and P's ledger value binds (R, P's path): `reclaimed` is mode `in_place`, `live` is mode `holding` (the filesystem half of
+   * which {@link resolveExitJournal} proves). Returns undefined for anything else, a decode failure included.
+   */
+  private async releasedConfigFacts(barePath: string, branch: string, entries: readonly string[]): Promise<Omit<ReleasedComposite, "holding"> | undefined> {
+    try {
+      const sRaw = this.restoreValueIn(entries, branch);
+      if (sRaw === undefined) return undefined;
+      const value = parseRestoreValue(sRaw);
+      const successor = value.kind === "entry"
+        ? { kind: "entry" as const, journal: parseRestoreJournal(sRaw).journal, raw: sRaw }
+        : { kind: "tombstone" as const, successor: value.successor, raw: sRaw };
+      const runId = successor.kind === "entry" ? successor.journal.runId : successor.successor.runId;
+      const sAttempt = successor.kind === "entry" ? successor.journal.attemptId : successor.successor.attemptId;
+      const sPath = successor.kind === "entry" ? successor.journal.clonePath : successor.successor.clonePath;
+      const basis = value.basis;
+      const p = basis.predecessor;
+      if (sAttempt === p.attemptId || sPath === p.clonePath) return undefined;
+      // 1-2: S's identity, exactly as the strict resolver pairs it.
+      const all = new Map<string, { branch: string; entry: AttemptLedgerEntry }>();
+      for (const [b, e] of await this.readAllAttemptLedgerValues(barePath, entries)) all.set(e.attemptId, { branch: b, entry: e });
+      const sLedger = all.get(sAttempt);
+      if (!sLedger || sLedger.branch !== branch || sLedger.entry.runId !== runId || sLedger.entry.clonePath !== sPath) return undefined;
+      const stage: RestoreStage | "retired" = value.kind === "entry" ? value.stage : "retired";
+      const state = sLedger.entry.state;
+      if (!((stage === "seeding" && state === "live") || (stage === "ready" && (state === "live" || state === "retired")) || (stage === "retired" && state === "retired"))) return undefined;
+      // 3: P's key does not name P.
+      const pKey = recoveryCaptureKey(branch);
+      const pKeyEntries = entries.filter(item => item === pKey || item.startsWith(`${pKey}\n`));
+      if (pKeyEntries.length > 1 || pKeyEntries[0] === pKey) return undefined;
+      const pRaw = pKeyEntries[0]?.slice(pKey.length + 1);
+      if (pRaw) {
+        const other = parseRecoveryJournal(pRaw);
+        if (other.runId === runId) return undefined;
+        for (const source of this.recoverySources(other)) {
+          if (source.clonePath === p.clonePath || source.clonePath === sPath || isWithinPath(source.clonePath, this.runnerHoldingRoot)) return undefined;
+        }
+      }
+      // 4: no other attribution of R, P or S.
+      for (const item of entries) {
+        const nl = item.indexOf("\n");
+        const k = nl < 0 ? item : item.slice(0, nl);
+        if (k === `uzi-retained.${runId}.journal` || k === stoppedMarkerKey(runId)) return undefined;
+      }
+      for (const { branch: b, entry } of all.values()) {
+        if (entry.attemptId === p.attemptId || entry.attemptId === sAttempt) continue;
+        if (entry.clonePath === p.clonePath || entry.clonePath === sPath) return undefined;
+        const generation = attemptGeneration(entry.attemptId);
+        if (b === branch && entry.runId === runId && entry.state !== "retired" && (generation === undefined || generation >= p.generation)) return undefined;
+      }
+      // 5: P's ledger value binds the triple and picks the mode.
+      const pLedger = all.get(p.attemptId);
+      if (!pLedger || pLedger.branch !== branch || pLedger.entry.runId !== runId || pLedger.entry.clonePath !== p.clonePath) return undefined;
+      const mode = pLedger.entry.state === "reclaimed" ? "in_place" : pLedger.entry.state === "live" ? "holding" : undefined;
+      if (mode === undefined) return undefined;
+      return { kind: "released", mode, basis, stage, successor, ledger: sLedger.entry, pLedger: pLedger.entry, pKeyEntries };
+    } catch {
+      this.checkRecoveryInterruption();
+      return undefined;
+    }
+  }
+
+  /**
+   * Mode `holding`'s filesystem half (amendment 14 (b)/(N3)): P's path is absent, `runner-quarantine` is a real 0700 directory
+   * owned by this worker's uid with at most 4096 entries, and EXACTLY ONE entry starts with R's holding prefix: a real directory
+   * named `<R sanitised>-<uuid v4>` whose ctime is not before the instant S's attempt id encodes. The ctime is the anchor because
+   * the restore entry carries no write time; S's id is minted before S exists, so a holding directory rc.2 made for P after the
+   * restore cannot predate it. Only names are listed and only the matching entry is lstat'd; no content is ever read. Returns the
+   * directory name, or undefined for anything else.
+   */
+  private async holdingEvidence(runId: string, sAttemptId: string, pPath: string): Promise<string | undefined> {
+    try {
+      const startMs = attemptIdStartMs(sAttemptId);
+      if (startMs === undefined) return undefined;
+      try { await fs.lstat(pPath); return undefined; }
+      catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") return undefined; }
+      const root = await fs.lstat(this.runnerHoldingRoot);
+      if (!root.isDirectory() || root.isSymbolicLink() || (root.mode & 0o777) !== 0o700 ||
+          (typeof process.getuid === "function" && root.uid !== process.getuid())) return undefined;
+      const prefix = holdingNamePrefix(runId);
+      const named: string[] = [];
+      let seen = 0;
+      for await (const entry of await fs.opendir(this.runnerHoldingRoot)) {
+        if (++seen > 4096) return undefined;
+        if (entry.name.startsWith(prefix)) named.push(entry.name);
+      }
+      if (named.length !== 1 || !isHoldingName(named[0]!, runId)) return undefined;
+      const held = await fs.lstat(path.join(this.runnerHoldingRoot, named[0]!));
+      if (!held.isDirectory() || held.isSymbolicLink() || held.ctimeMs < startMs) return undefined;
+      return named[0];
+    } catch {
+      this.checkRecoveryInterruption();
+      return undefined;
+    }
+  }
+
+  /**
+   * The resolver of the restore-aware exit ONLY (planRestoreExit, finishRestoreExit and the exit transitions of
+   * {@link advanceRestoreEntryUnderLock}): {@link resolveBranchJournalUnderLock}, and where that refuses with a
+   * {@link RestoreCompositeError} because P's key no longer names P, the {@link ReleasedComposite} when the amendment 14
+   * predicate holds. Recognition grants no adoption, restore, FINAL, release or cleanup authority: it only lets the guarded
+   * discards run. Anything else rethrows the strict refusal. Under the caller's bare lock.
+   */
+  private async resolveExitJournal(barePath: string, branch: string, snapshot?: readonly string[]): Promise<BranchJournal | ReleasedComposite> {
+    const entries = snapshot ?? await this.configEntries(barePath);
+    try {
+      return await this.resolveBranchJournalUnderLock(barePath, branch, entries);
+    } catch (err) {
+      if (!(err instanceof RestoreCompositeError) || err instanceof RestoreCompositeBlockedError) throw err;
+      const facts = await this.releasedConfigFacts(barePath, branch, entries);
+      if (!facts) throw err;
+      if (facts.mode === "in_place") return facts;
+      const holding = await this.holdingEvidence(facts.pLedger.runId, facts.ledger.attemptId, facts.basis.predecessor.clonePath);
+      if (holding === undefined) throw err;
+      return { ...facts, holding };
+    }
+  }
+
+  /** Two released resolutions describe the same released state (what the exit re-proves under the lock before it deletes or writes). */
+  private sameReleased(a: BranchJournal | ReleasedComposite, b: ReleasedComposite): boolean {
+    return a.kind === "released" && a.mode === b.mode && a.holding === b.holding && a.pLedger.state === b.pLedger.state &&
+      a.pKeyEntries.join("\0") === b.pKeyEntries.join("\0") && a.basis.predecessor.attemptId === b.basis.predecessor.attemptId &&
+      a.ledger.attemptId === b.ledger.attemptId;
   }
 
   /**
@@ -12399,23 +12573,27 @@ export class GitCache {
    * P's key is never written. Anything else throws {@link RestoreCompositeError} with nothing written.
    */
   private async advanceRestoreEntryUnderLock(barePath: string, branch: string, to: "seeding" | "ready" | "retired" | "cleared",
-    seed?: { basis: RestoreBasis; journal: RecoveryJournalEntry }): Promise<void> {
+    seed?: { basis: RestoreBasis; journal: RecoveryJournalEntry }, exit = false): Promise<void> {
     const entries = await this.configEntries(barePath);
     const key = restoreJournalKey(branch);
-    const current = await this.resolveBranchJournalUnderLock(barePath, branch, entries);
+    // `exit` is the restore-aware exit's own call: it alone may see the released predecessor (amendment 14), and under it `cleared` is refused.
+    const resolve = (snapshot: readonly string[]): Promise<BranchJournal | ReleasedComposite> =>
+      exit ? this.resolveExitJournal(barePath, branch, snapshot) : this.resolveBranchJournalUnderLock(barePath, branch, snapshot);
+    const current = await resolve(entries);
+    const stageOf = (r: BranchJournal | ReleasedComposite): string | undefined => r.kind === "composite" || r.kind === "released" ? r.stage : undefined;
     let value: string;
-    let expect: (r: BranchJournal) => boolean;
+    let expect: (r: BranchJournal | ReleasedComposite) => boolean;
     if (to === "seeding") {
       if (current.kind !== "plain" || !seed) throw new RestoreCompositeError("restore entry cannot be created here");
       value = restoreJournalJson(seed.basis, "seeding", seed.journal);
       parseRestoreJournal(value);
-      expect = r => r.kind === "composite" && r.stage === "seeding";
+      expect = r => stageOf(r) === "seeding";
     } else {
-      if (current.kind !== "composite") throw new RestoreCompositeError("no restore entry to advance");
+      if (current.kind !== "composite" && current.kind !== "released") throw new RestoreCompositeError("no restore entry to advance");
       if (to === "ready") {
         if (current.stage !== "seeding" || current.successor.kind !== "entry") throw new RestoreCompositeError("restore entry is not seeding");
         value = restoreJournalJson(current.basis, "ready", current.successor.journal);
-        expect = r => r.kind === "composite" && r.stage === "ready";
+        expect = r => stageOf(r) === "ready";
       } else if (to === "retired") {
         if (current.stage === "retired") return;
         if (current.stage !== "ready" || current.successor.kind !== "entry" || current.ledger.state !== "retired")
@@ -12423,8 +12601,9 @@ export class GitCache {
         const j = current.successor.journal;
         value = restoreTombstoneJson(current.basis, { runId: j.runId, attemptId: j.attemptId, clonePath: j.clonePath });
         parseRestoreTombstone(value);
-        expect = r => r.kind === "composite" && r.stage === "retired";
+        expect = r => stageOf(r) === "retired";
       } else {
+        if (current.kind === "released") throw new RestoreCompositeError("a released predecessor keeps the restore entry until its own exit");
         if (current.ledger.state !== "retired") throw new RestoreCompositeError("restore entry's attempt is not retired");
         value = "";
         expect = r => r.kind === "plain";
@@ -12432,7 +12611,7 @@ export class GitCache {
     }
     const next = entries.filter(item => item !== key && !item.startsWith(`${key}\n`));
     if (value !== "") next.push(`${key}\n${value}`);
-    if (!expect(await this.resolveBranchJournalUnderLock(barePath, branch, next))) throw new RestoreCompositeError("restore transition is not valid here");
+    if (!expect(await resolve(next))) throw new RestoreCompositeError("restore transition is not valid here");
     await this.assertRecoveryBare(barePath);
     await this.runGit(barePath, ["config", "--local", key, value]);
     await this.syncRestoreWrite(barePath);
