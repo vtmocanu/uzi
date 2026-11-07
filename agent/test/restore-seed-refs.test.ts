@@ -195,6 +195,16 @@ describe("the deleters keep the restored predecessor's refs", () => {
     assert.deepEqual(released.removedShas, [pinSha]);
   });
 
+  it("a valueless restore key is undecodable for every deleter, cleanupArchivedRecoveryPin included", async () => {
+    fs.appendFileSync(path.join(bare, "config"), `[uzi-restore "${BRANCH}"]\n\tjournal\n`);
+    assert.equal(gitIn(bare, ["config", "--local", "--null", "--list"]).split("\0").some(i => i === S_KEY), true, "the key has no value");
+    assert.equal(await cache.restoreKeepsRecoveryRef(bare, "other-run", { generation: 9 }), true);
+    gitIn(bare, ["update-ref", `refs/uzi-recovery-pin/other-run/1`, pinSha]);
+    const result = await cache.cleanupArchivedRecoveryPin({ runId: "other-run", generation: 1, sourceSha: pinSha, recoveryPinBareDir: path.basename(bare), isEligible: () => true });
+    assert.deepEqual(result, { state: "retained", reason: "ineligible" });
+    assert.equal(refSha(`refs/uzi-recovery-pin/other-run/1`), pinSha);
+  });
+
   it("an unreadable restore value keeps refs of every run", async () => {
     gitIn(bare, ["config", S_KEY, "not a restore value"]);
     const kept = await cache.reconcileOwedCandidates(bare, RUN, childSha);

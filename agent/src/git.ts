@@ -2542,6 +2542,10 @@ export interface RetainedDiscardOptions {
   /** issue #3644: removes the retained-home marker of `runId` (the marker that protects the restored predecessor's HOME and
    *  provision directory). Called by the guarded discard of the predecessor only; a throw keeps every record. Default: none. */
   removeRetainedHomeMarker?: (runId: string) => Promise<void>;
+  /** issue #3644: whether the retained-home marker of `runId` exists. A plain predecessor with no restore entry is treated as a
+   *  restore's leftover (window 2, or after the successor's own discard) only when this returns true; the default (absent) is
+   *  false, so the ordinary rules apply. A throw keeps everything. */
+  hasRetainedHomeMarker?: (runId: string) => Promise<boolean>;
   barePath?: string;
   signal?: AbortSignal;
   /** The single operation deadline (default {@link RETAINED_OP_DEADLINE_MS}). */
@@ -7380,14 +7384,15 @@ export class GitCache {
           if (!input.isEligible()) refuse("ineligible");
           check();
           // issue #3644: the pin of a restored predecessor's generation is kept for as long as its restore entry or tombstone exists.
-          // Read through the transaction's own bounded probe (names first; values only for a restore key), under its deadline.
-          const keyNames = (await probe(chosen.bare, ["config", "--local", "--no-includes", "--name-only", "--list"])).split("\n");
-          const restoreKeys = [...new Set(keyNames.filter(n => restoreKeyBranch(n) !== undefined))];
+          // Read through the transaction's own bounded probe, under its deadline. `--null --list` prints `key\nvalue` for a valued key
+          // and the bare `key` for a valueless one, which `--get-all` cannot tell from an empty (cleared) value: a valueless
+          // restore key is undecodable and protects everything, exactly as restoreProtection reads it.
           const restoreValues: string[] = [];
-          for (const k of restoreKeys) {
-            const out = (await probe(chosen.bare, ["config", "--local", "--no-includes", "--null", "--get-all", k])).split("\0");
-            out.pop();
-            restoreValues.push(...(out.length === 0 ? ["\0"] : out));
+          const listing = (await probe(chosen.bare, ["config", "--local", "--no-includes", "--null", "--list"])).split("\0");
+          for (const item of listing) {
+            const nl = item.indexOf("\n");
+            if (item === "" || restoreKeyBranch(nl < 0 ? item : item.slice(0, nl)) === undefined) continue;
+            restoreValues.push(nl < 0 ? "\0" : item.slice(nl + 1));
           }
           if (restoreProtects(restoreRefProtection(restoreValues), input.runId, { generation: input.generation })) refuse("ineligible");
           // Git's old-SHA comparison can resolve a symbolic ref even with no-deref.
@@ -11524,7 +11529,7 @@ export class GitCache {
             const rec = candidates[0]!;
             // issue #3644: a restore entry on this branch keeps P and S until the restore-aware exit (plan 3.5), which is S's own
             // guarded discard and then P's; anything else the entry holds is refused here before quiescence or any delete.
-            const plan = await this.planRestoreExit(g, rec, mode);
+            const plan = await this.planRestoreExit(g, rec, mode, opts.hasRetainedHomeMarker);
             const restoreExit = plan.kind === "none" ? undefined : plan;
             if (!wantKinds.includes(rec.kind)) return refused("wrong_discard_kind", [rec.kind]);
             if (rec.digest !== opts.confirm) return refused("descriptor_changed");
@@ -11609,7 +11614,7 @@ export class GitCache {
             if (residueQuarantine() !== undefined) return stopped();
             // Every path is gone; retire the metadata inside the same critical section.
             if (restoreExit) {
-              await this.finishRestoreExit(bare, rec, restoreExit, opts.removeRetainedHomeMarker);
+              await this.finishRestoreExit(bare, rec, restoreExit, opts.removeRetainedHomeMarker, () => { metadata = "retired"; });
             } else if (rec.kind === "protected") {
               const journal = rec.journal!;
               await this.discardRetainedRecoveryUnderLock(bare, rec.branch, rec.key,
@@ -11678,7 +11683,9 @@ export class GitCache {
    * It throws {@link RestoreCompositeError} (the discard then reports `unknown`, nothing deleted) for P while a live S entry
    * exists, a foreign path of the branch, an unreadable composite, and {@link RestoreCompositeBlockedError} for another run's restore.
    */
-  private async planRestoreExit(g: GatheredBare, rec: GatheredRecord, mode: "plain" | "protected"): Promise<
+  private async planRestoreExit(
+    g: GatheredBare, rec: GatheredRecord, mode: "plain" | "protected", hasMarker?: (runId: string) => Promise<boolean>,
+  ): Promise<
     { kind: "none" } |
     { kind: "successor"; composite: Extract<BranchJournal, { kind: "composite" }>; sAttemptId: string; sGeneration: number; pGeneration: number } |
     { kind: "predecessor"; composite?: Extract<BranchJournal, { kind: "composite" }>; window2?: AttemptLedgerEntry; pGeneration: number }
@@ -11699,6 +11706,9 @@ export class GitCache {
       if (!s2 || (attemptGeneration(s2.attemptId) ?? 0) <= part.generation ||
           this.clonePathShape(s2.clonePath, this.runnerClonePath(g.barePath, rec.key))?.attemptId !== s2.attemptId ||
           await this.pathPresent(s2.clonePath)) return { kind: "none" };
+      // A newer same-run ledger entry alone is ordinary history, not restore evidence: the restore's retained-home marker must
+      // corroborate it (the generation order was checked above).
+      if ((await hasMarker?.(rec.runId)) !== true) return { kind: "none" };
       return { kind: "predecessor", ...(s2.state === "live" ? { window2: s2 } : {}), pGeneration: part.generation };
     }
     if (holder.runId !== rec.runId) throw new RestoreCompositeBlockedError("the branch is held by another run's restore", holder.runId);
@@ -11742,8 +11752,14 @@ export class GitCache {
       discount.add("restore_predecessor_retained");
       discount.add(`unsafe_path:${path.basename(rec.parts[0]!.clonePath)}`);
     }
-    const soft = (b: string): boolean => b.startsWith("shared_") || b.startsWith("named_by_") || b === "run_state_not_terminal" || b === "run_state_unknown";
-    const hard = ev.blockers.filter(b => !discount.has(b) && !soft(b));
+    // Only what the restore itself creates is discounted: the branch journal naming this source (P's journal, or S's restore
+    // entry) and the restore's ledger entry. Any other namer, a shared owed pin or a shared ledger path still refuses.
+    const own = `active:${rec.branch}:${rec.runId}`;
+    const foreign = (rec.namers.get(rec.parts[0]!.clonePath) ?? []).filter(w => w !== own);
+    const blockers = ev.blockers.filter(b => !b.startsWith("named_by_"));
+    if (foreign.length > 0) blockers.push(`named_by_journal:${foreign.map(w => sanitizeForLog(w, 64)).join("+")}`);
+    const soft = (b: string): boolean => b === "run_state_not_terminal" || b === "run_state_unknown";
+    const hard = blockers.filter(b => !discount.has(b) && !soft(b));
     if (hard.length > 0) return refused("refused", hard, { kind: "refused", consumers: hard });
     if (open.length > 0) return refused("owner_hold_discard", [], { kind: "owner_hold_discard", holdIds: open.map(h => h.id).sort() });
     const records = ev.localRecords.filter(r => r.generation === null || r.generation > plan.pGeneration);
@@ -11752,42 +11768,45 @@ export class GitCache {
   }
 
   /** The metadata half of a restore-aware discard, after every path of `rec` is proven gone. Order is chosen so a crash anywhere
-   *  leaves a state the same discard (or the plan 3.9 table) resumes from; see the inline notes. */
+   *  leaves a state the same discard (or the plan 3.9 table) resumes from; see the inline notes. `onRetired` runs the moment the
+   *  durable metadata write that retires the source has landed, so a later failure still reports the metadata as retired. */
   private async finishRestoreExit(
     bare: string, rec: GatheredRecord, plan: Exclude<Awaited<ReturnType<GitCache["planRestoreExit"]>>, { kind: "none" }>,
-    removeMarker: ((runId: string) => Promise<void>) | undefined,
+    removeMarker: ((runId: string) => Promise<void>) | undefined, onRetired: () => void,
   ): Promise<void> {
     const p = rec.parts[0]!;
-    const retire = (e: { attemptId: string; clonePath: string }) =>
-      this.appendAttemptLedger(bare, rec.branch, { attemptId: e.attemptId, runId: rec.runId, clonePath: e.clonePath, state: "retired" });
+    const retired = (e: { attemptId: string; clonePath: string }): string =>
+      attemptLedgerValue({ attemptId: e.attemptId, runId: rec.runId, clonePath: e.clonePath, state: "retired" });
     if (plan.kind === "successor") {
       // A `seeding` entry pairs only with a live ledger entry, so step it to `ready` first; then S's ledger `retired` (pair
       // ready+retired), then the single write that clears S's key. P's key and P's path are never touched.
       if (plan.composite.stage === "seeding") await this.advanceRestoreEntryUnderLock(bare, rec.branch, "ready");
-      await retire({ attemptId: plan.sAttemptId, clonePath: p.clonePath });
+      await this.appendAttemptLedger(bare, rec.branch, { attemptId: plan.sAttemptId, runId: rec.runId, clonePath: p.clonePath, state: "retired" });
       await this.advanceRestoreEntryUnderLock(bare, rec.branch, "cleared");
+      onRetired();
       return;
     }
-    // P's discard: the retained-home marker first (a failure keeps everything and is retried), then the keys, then the ledger.
+    // P's discard: the retained-home marker first (a failure keeps everything and is retried), then ONE rename of the config that
+    // clears the keys AND appends the `retired` ledger values. Before the rename nothing changed, so the same call retries
+    // whole; after it nothing is owed. There is no state with P's key cleared and its ledger entry still live.
     await removeMarker?.(rec.runId);
     const pKey = recoveryCaptureKey(rec.branch);
+    const ledgerKey = attemptLedgerKey(rec.branch);
     if (plan.composite) {
       const raw = (await this.resolveBranchJournalUnderLock(bare, rec.branch));
       if (raw.kind !== "composite" || raw.ledger.state !== "retired") throw new RestoreCompositeError("restore entry's attempt is not retired");
-      // Clearing P's key under a tombstone would break the composite and clearing the tombstone first would orphan P's journal:
-      // both go in ONE rename of the config.
-      await this.rewriteConfigAtomically(bare, async tmp => {
-        await this.runGit(bare, ["config", "--file", tmp, pKey, ""]);
-        await this.runGit(bare, ["config", "--file", tmp, restoreJournalKey(rec.branch), ""]);
-      });
-      await this.syncRestoreWrite(bare);
-      if ((await this.resolveBranchJournalUnderLock(bare, rec.branch)).kind !== "none") throw new Error("restore exit read-back differs");
-    } else {
-      await this.runGit(bare, ["config", "--local", pKey, ""]);
-      await this.syncRestoreWrite(bare);
-      if (plan.window2) await retire(plan.window2);
     }
-    await retire({ attemptId: p.attemptId!, clonePath: p.clonePath });
+    await this.rewriteConfigAtomically(bare, async tmp => {
+      // Under a tombstone, clearing P's key alone would break the composite and clearing the tombstone first would orphan P's
+      // journal: both go in the same rename.
+      await this.runGit(bare, ["config", "--file", tmp, pKey, ""]);
+      if (plan.composite) await this.runGit(bare, ["config", "--file", tmp, restoreJournalKey(rec.branch), ""]);
+      else if (plan.window2) await this.runGit(bare, ["config", "--file", tmp, "--add", ledgerKey, retired(plan.window2)]);
+      await this.runGit(bare, ["config", "--file", tmp, "--add", ledgerKey, retired({ attemptId: p.attemptId!, clonePath: p.clonePath })]);
+    });
+    onRetired();
+    await this.syncRestoreWrite(bare);
+    if (plan.composite && (await this.resolveBranchJournalUnderLock(bare, rec.branch)).kind !== "none") throw new Error("restore exit read-back differs");
   }
 
   /** Read only worker-journaled/ledger-owned heads. Ref files are size-bounded;
@@ -12570,10 +12589,11 @@ export class GitCache {
       if (!unchanged) return refuse("predecessor_classification_changed");
       if (input.checkpointTip !== undefined && !(SHA40_RE.test(input.checkpointTip) && await this.isAncestor(barePath, input.checkpointTip, pin.sourceSha)))
         return refuse("checkpoint_not_ancestor");
-      const verdict = await this.verifyRestorePinRefsUnderLock(barePath, {
+      const pinSpec = {
         runId, generation: pin.generation, sourceSha: pin.sourceSha, finalization: pin.finalization, branch,
         ...(input.defaultBranch === undefined ? {} : { defaultBranch: input.defaultBranch }),
-      });
+      };
+      const verdict = await this.verifyRestorePinRefsUnderLock(barePath, pinSpec);
       if (!verdict.ok) return refuse(verdict.reason);
       await this.assertBareClear(barePath, "seed-attempt").catch((err: unknown) => refuse("authority_refused", err));
 
@@ -12607,6 +12627,12 @@ export class GitCache {
       step = "before_seed";
       const targets = await this.restoreSeedSweepPaths(canonical, ledger, input.isLive, opaque);
       await input.beforeSeed(targets, canonical, [`${runId}:${p.attemptId}`]).catch((err: unknown) => refuse("before_seed_refused", err));
+
+      // The census and beforeSeed callbacks ran with the pin only checked before them (plan 3.7): re-verify it now that the
+      // `seeding` entry is durable, so a pin deleted from inside a callback refuses here instead of seeding a `ready` entry.
+      step = "pin_recheck";
+      const recheck = await this.verifyRestorePinRefsUnderLock(barePath, pinSpec);
+      if (!recheck.ok) return refuse(recheck.reason);
 
       step = "seed";
       const seeded = await this.seedRunnerClone(barePath, branch, sPath, runId, true, undefined, {

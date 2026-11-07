@@ -496,7 +496,7 @@ select_clone(){
   local LC_ALL=C listing journal ledger protected_ledger="" protected="" protected_ok="" ledger_rows ledger_ok ledger_live journal_ok="" journal_current="" retained="" path br name aid
   local attributed="" primary=""
   local best="" best_aid="" have_best=0 tab=$'\t' bare="$REPOS_BASE/$REPO_SLUG.git"
-  local stopped="" marker_path="" marker_verdict="" restore="" restore_ok=""
+  local stopped="" marker_path="" marker_verdict="" restore="" restore_ok="" restore_cfg="" restore_count="" cfg_rc=0
   [ -n "$branch" ] || return 1
   local rc=0
   # rc 3: listed, but some candidate's .git could not be read; keep the readable ones.
@@ -814,6 +814,15 @@ select_clone(){
     restore="$(kexec_probe "$ns" "$pod" \
       git --git-dir="$bare" config --local --no-includes --get-all "uzi-restore.$branch.journal")" || rc=$?
     case "$rc" in 0|1) ;; *) probe_inconclusive "reading the restore entry on pod $ns/$pod failed"; return 1 ;; esac
+    # The key is single-valued, and a cleared value is "" (one occurrence). --get-all hides a repeated "" and cannot tell a
+    # valueless key from a cleared one, so count the raw occurrences in the listing (what restoreValueIn in git.ts does):
+    # more than one, or a valueless one, is ambiguous evidence.
+    cfg_rc=0
+    restore_cfg="$(kexec_probe "$ns" "$pod" git --git-dir="$bare" config --local --no-includes --list)" || cfg_rc=$?
+    [ "$cfg_rc" -eq 0 ] || { probe_inconclusive "listing the restore entry on pod $ns/$pod failed"; return 1; }
+    restore_count="$(printf '%s\n' "$restore_cfg" | awk -v k="uzi-restore.$branch.journal" \
+      'index($0, k "=") == 1 { n++ } $0 == k { n += 2 } END { print n + 0 }')"
+    if [ "$restore_count" -gt 1 ]; then probe_inconclusive "invalid restore entry on pod $ns/$pod (ambiguous: repeated or valueless)"; return 1; fi
     if [ "$rc" -eq 0 ] && [ -n "$restore" ]; then
       restore_ok=""
       # shellcheck disable=SC2016

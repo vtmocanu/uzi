@@ -27,6 +27,12 @@ import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
 // What rc.2 may do to a restored branch (plan 3.11, owner item 9): write a reservation and a `preservation_failed` blocker into
 // P's journal, and delete P's legacy HOME and provision directories once the run is terminal. It must keep S's ledger entry,
 // restore entry and clone, and P's clone bytes, owed refs and pins. Anything else is a finding for owner review.
+//
+// Tests titled "OWNER REVIEW PENDING (plan 3.11)" assert what rc.2 was OBSERVED to do; they are not an acceptance of it. The other-run
+// claim chain they exercise is rc.2's runner.ts phaseClone: runnerCloneForClaim -> ForeignCaptureBlockedError(P) ->
+// RunRunner.reclaimTerminalOrphan -> GitCache.releaseAttemptInPlace(P, "reclaimed") (attempt-path flights) or
+// GitCache.retireRunnerClone(P, discard:false) (others) -> reseedAfterReclaim. reclaimTerminalOrphan is the archived method on an
+// instance of the archived class; the classification endpoint and the process-quiescence proof are the only stubs.
 
 const root = path.resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const scratch = path.join(root, ".uzi", "scratch");
@@ -229,7 +235,7 @@ describe("rc.2 against a restore written by this build", () => {
     } finally { e.fx.cleanup(); }
   });
 
-  it("item 9, first allowance: a reservation and a preservation_failed blocker change P's journal and nothing else", async () => {
+  it("OWNER REVIEW PENDING (plan 3.11): item 9, first allowance (a reservation and a preservation_failed blocker in P's journal) plus an observed THIRD write, uzi-attemptmode.<key>.enabled", async () => {
     const e = await build();
     try {
       const before = snap(e);
@@ -244,7 +250,10 @@ describe("rc.2 against a restore written by this build", () => {
       assert.equal(JSON.stringify(rest), e.pRaw, "P's original journal fields are unchanged");
       assert.equal(recovery.stage, "blocked");
       assert.equal(recovery.blocker, "preservation_failed");
-      // The only other bare-config write is rc.2's own attempt-mode flag for the key; S's trace is untouched.
+      // The third write is not one of item 9's two allowances: rc.2 also records its attempt-mode flag for the key
+      // (`uzi-attemptmode.<key>.enabled`). Observed and listed here explicitly; S's trace is untouched.
+      assert.ok(after.config.has(`uzi-attemptmode.${KEY}.enabled`), "the extra write exists");
+      assert.equal(before.config.has(`uzi-attemptmode.${KEY}.enabled`), false, "and was not there before");
       const changed = [...new Set([...before.config.keys(), ...after.config.keys()])].filter(k => JSON.stringify(before.config.get(k)) !== JSON.stringify(after.config.get(k))).sort();
       assert.deepEqual(changed, [P_KEY, `uzi-attemptmode.${KEY}.enabled`].sort());
       assertSame(before, after, [P_KEY, `uzi-attemptmode.${KEY}.enabled`], "reservation and blocker");
@@ -284,20 +293,104 @@ describe("rc.2 against a restore written by this build", () => {
     } finally { e.fx.cleanup(); }
   });
 
-  it("KNOWN RESIDUAL (not an item-9 allowance): rc.2's reclaim of a terminal owner's attempt releases P in place, clearing P's journal", async () => {
+  // The other-run claim path of rc.2's REAL RunRunner. The class is the archived one (not a copy): an instance is made from its
+  // prototype with only the collaborators `reclaimTerminalOrphan` reads, and its own method runs. The caller chain it models is
+  // runner.ts phaseClone: runnerCloneForClaim -> ForeignCaptureBlockedError(P) -> `reclaimTerminalOrphan` -> `releaseAttemptInPlace(P,
+  // "reclaimed")` (git.ts) -> `reseedAfterReclaim` -> runnerCloneForClaim -> GitCache.runnerCloneForBranch. The collaborators stubbed
+  // here are the classification endpoint (a terminal owner of this repo) and the process quiescence proof (no survivors).
+  async function reclaimAsOtherRun(e: Env, attemptPaths: boolean): Promise<{ reclaimError?: unknown; diagnostics: string[] }> {
+    const OTHER = "another-run";
+    const attempt = (id: string) => ({ attemptId: id, isLive: () => false, beforeSeed: async () => {} });
+    const reseed = { beforeFree: async () => {}, isLive: () => false };
+    const otherId = formatAttemptId(new Date("2026-11-05T12:00:00Z"), 3, "aaaaaaaaaaaaaaaa");
+    let blocked: unknown;
+    try { await e.rc2.runnerCloneForBranch(e.bare, BRANCH, KEY, reseed, OTHER, false, undefined, attempt(otherId) as never); }
+    catch (err) { blocked = err; }
+    assert.ok(blocked instanceof rc2Git.ForeignCaptureBlockedError, "the other run's claim is blocked by P's journal");
+    const Runner = rc2Runner.RunRunner as unknown as { prototype: object };
+    const diagnostics: string[] = [];
+    const runner = Object.assign(Object.create(Runner.prototype) as Record<string, unknown>, {
+      git: e.rc2, attemptPaths,
+      log: { info: (m: string) => diagnostics.push(m), warn: (m: string) => diagnostics.push(m), error: (m: string) => diagnostics.push(m), debug: () => {} },
+      shutdownSignal: new AbortController(),
+      client: { getRunOrphanClassification: async () => ({ status: "completed", repo_id: "repo-1", kind: "issue", issue_iid: 3644, branch: BRANCH, pipeline_id: null, pipeline_ref: null }) },
+      quiesceRun: async () => ({ outcome: { kind: "verified" }, blocked: false }),
+    });
+    const controller = new AbortController();
+    const flight = { cancel: controller, steering: { lifecycleSignal: () => controller.signal, terminalLifecycleSignal: () => controller.signal, claimFence: () => undefined, isCancelled: () => false },
+      effectiveAttemptPaths: attemptPaths, executor: undefined };
+    const claim = { run_id: OTHER, repo: { id: "repo-1", default_branch: "main" } };
+    const error = blocked as InstanceType<Rc2Git["ForeignCaptureBlockedError"]>;
+    let reclaimError: unknown;
+    try {
+      await (runner as unknown as { reclaimTerminalOrphan(...a: unknown[]): Promise<void> })
+        .reclaimTerminalOrphan(e.bare, claim, flight, error.clonePath, error.branch, error.ownerRunId, error);
+    } catch (err) { reclaimError = err; }
+    return { reclaimError, diagnostics };
+  }
+
+  it("OWNER REVIEW PENDING (plan 3.11): rc.2's real reclaimTerminalOrphan (the other-run claim path) clears P's journal and appends ledger reclaimed; P's bytes and S are untouched", async () => {
     const e = await build();
     try {
       const before = snap(e);
-      await e.rc2.releaseAttemptInPlace(e.bare, e.pPath, BRANCH, RUN, "reclaimed");
+      const { reclaimError, diagnostics } = await reclaimAsOtherRun(e, true);
+      assert.equal(reclaimError, undefined, `reclaim failed: ${String(reclaimError)} ${diagnostics.join("|")}`);
       const after = snap(e);
-      // Observed and recorded: this is the one rc.2 path that rewrites P's journal beyond item 9's allowances. P's bytes, S and the
-      // pins are untouched; a roll-forward reads P's empty key against S's entry and refuses fail-closed. Plan 3.11 / #3981.
+      // Observed, not accepted: this is the one rc.2 path that rewrites P's journal beyond item 9's allowances.
       assert.equal(after.config.get(P_KEY)?.[0] ?? "", "", "P's journal is cleared");
-      assert.deepEqual(after.p, before.p);
+      const states = (after.config.get(LEDGER_KEY) ?? []).map(v => JSON.parse(v) as { attemptId: string; state: string });
+      assert.equal(states.filter(x => x.attemptId === P_ID).at(-1)?.state, "reclaimed", "P's ledger entry is now reclaimed");
+      assert.deepEqual(states.filter(x => x.attemptId === S_ID), (before.config.get(LEDGER_KEY) ?? []).map(v => JSON.parse(v) as { attemptId: string; state: string }).filter(x => x.attemptId === S_ID));
+      assert.deepEqual(after.p, before.p, "P's directory bytes and metadata are unchanged by the reclaim");
       assert.deepEqual(after.s, before.s);
       assert.equal(after.config.get(S_KEY)?.[0], before.config.get(S_KEY)?.[0]);
       assert.equal(after.refs, before.refs);
+      // And this build's reader then refuses fail-closed on the state rc.2 left.
       await assert.rejects(() => e.current.resolveBranchJournal(e.bare, BRANCH), /predecessor journal is empty/);
+    } finally { e.fx.cleanup(); }
+  });
+
+  it("OWNER REVIEW PENDING (plan 3.11): after that reclaim, rc.2's reseed for the other run seeds a NEW attempt path and does not read, move or delete P's directory", async () => {
+    const e = await build();
+    try {
+      const { reclaimError } = await reclaimAsOtherRun(e, true);
+      assert.equal(reclaimError, undefined);
+      const before = snap(e);
+      const otherId = formatAttemptId(new Date("2026-11-05T12:00:00Z"), 3, "bbbbbbbbbbbbbbbb");
+      const reseed = { beforeFree: async () => {}, isLive: () => false };
+      const clone = await e.rc2.runnerCloneForBranch(e.bare, BRANCH, KEY, reseed, "another-run", false, undefined,
+        { attemptId: otherId, isLive: () => false, beforeSeed: async () => {} } as never);
+      assert.equal(clone.path, attemptClonePath(e.current.runnerClonePath(e.bare, KEY), otherId), "a new attempt path, never P's");
+      const after = snap(e);
+      assert.deepEqual(after.p, before.p, "P's unsaved bytes are preserved exactly");
+      assert.equal(fs.readFileSync(path.join(e.pPath, "later.txt"), "utf8"), "later bytes that were never saved");
+      assert.deepEqual(after.s, before.s);
+      const states = (after.config.get(LEDGER_KEY) ?? []).map(v => JSON.parse(v) as { attemptId: string; state: string });
+      assert.equal(states.filter(x => x.attemptId === P_ID).at(-1)?.state, "reclaimed", "P stays reclaimed (retained forever)");
+    } finally { e.fx.cleanup(); }
+  });
+
+  it("OWNER REVIEW PENDING (plan 3.11): a flight NOT on attempt paths takes retireRunnerClone(discard:false): P's directory is MOVED, bytes intact, to a worker-only holding root, and P's journal is cleared", async () => {
+    const e = await build();
+    try {
+      const before = snap(e);
+      const { reclaimError, diagnostics } = await reclaimAsOtherRun(e, false);
+      assert.equal(reclaimError, undefined, `reclaim failed: ${String(reclaimError)} ${diagnostics.join("|")}`);
+      assert.equal(fs.existsSync(e.pPath), false, "P's directory is no longer at its path");
+      const holders: string[] = [];
+      const walk = (dir: string): void => {
+        for (const name of fs.readdirSync(dir)) {
+          const p = path.join(dir, name);
+          const st = fs.lstatSync(p);
+          if (st.isDirectory()) walk(p); else if (name === "later.txt" && p !== path.join(e.sPath, name)) holders.push(p);
+        }
+      };
+      walk(e.dataDir);
+      assert.equal(holders.length, 1, `exactly one retained copy of P's unsaved file exists: ${JSON.stringify(holders)}`);
+      assert.equal(fs.readFileSync(holders[0]!, "utf8"), "later bytes that were never saved");
+      assert.ok(!holders[0]!.startsWith(path.dirname(e.pPath) + path.sep), "the copy is outside the runner repo directory");
+      assert.equal(snap(e).config.get(P_KEY)?.[0] ?? "", "", "P's journal is cleared");
+      assert.deepEqual(snap(e).s, before.s, "S is untouched");
     } finally { e.fx.cleanup(); }
   });
 

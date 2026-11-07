@@ -1813,6 +1813,20 @@ restore_bad tombstone-extra "$(jq -cn --arg rs "$RS" --arg a "$A2" --arg pp "$RP
    pin:{captureId:"cap-1",generation:1,sourceSha:$sha,finalization:true},restoreTip:$sha},restoreStage:"retired",
    successor:{runId:"run-4242",attemptId:$a,clonePath:$rs},fence:1}')"
 restore_bad repeated-key "$GOOD" "$GOOD"
+# A repeated key whose other value is "" passes `jq -s length` as one value; the raw count catches it. So does a valueless key.
+restore_layout
+git --git-dir="$BARE" config "$RKEY" ""
+git --git-dir="$BARE" config --add "$RKEY" "$GOOD"
+d="$WORK/out.restore-bad.empty-plus-value"
+rc="$(backup_rc "$d" run-4242)"
+[ "$rc" -ne 0 ] || fail "restore-bad empty-plus-value: a repeated key with a cleared value was accepted"
+grep -q 'invalid restore entry' "$d/latest-attempt/backup.log" || fail "restore-bad empty-plus-value: log lacks the reason"
+restore_layout
+printf '[uzi-restore "agent/issue-4242"]\n\tjournal\n' >> "$BARE/config"
+d="$WORK/out.restore-bad.valueless"
+rc="$(backup_rc "$d" run-4242)"
+[ "$rc" -ne 0 ] || fail "restore-bad valueless: a valueless key was accepted"
+grep -q 'invalid restore entry' "$d/latest-attempt/backup.log" || fail "restore-bad valueless: log lacks the reason"
 echo "PASS restore: malformed or repeated restore entries are inconclusive and attribute nothing"
 # A completed run ignores the key like the plain journal (S's live ledger entry still attributes it).
 restore_layout

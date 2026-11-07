@@ -531,7 +531,7 @@ describe("seedIndependentAttempt: failure windows (plan 3.9), each read back by 
 });
 
 describe("the exits after each window", () => {
-  const live = { isLivePath: () => false, quiesce: async () => true };
+  const live = { isLivePath: () => false, quiesce: async () => true, hasRetainedHomeMarker: async () => true };
   async function digestOf(clonePath: string): Promise<string> {
     const g = await internals().withLock(bare, () => internals().gatherRetainedUnderLock(bare));
     return g.records.find(r => r.parts.some(p => p.clonePath === clonePath))!.digest;
@@ -656,6 +656,132 @@ describe("the exits after each window", () => {
     const unknown = await discard(S_PATH, S_ID, 2, { lifecycle: undefined });
     assert.equal(unknown.kind, "refused");
     assert.equal(unknown.kind === "refused" && unknown.reason, "run_state_not_terminal");
+  });
+});
+
+describe("review rework (#3644 m2b): resumable P exit, disposition guards, pin recheck", () => {
+  const live = { isLivePath: () => false, quiesce: async () => true, hasRetainedHomeMarker: async () => true };
+  async function digestOf(clonePath: string): Promise<string> {
+    const g = await internals().withLock(bare, () => internals().gatherRetainedUnderLock(bare));
+    return g.records.find(r => r.parts.some(p => p.clonePath === clonePath))!.digest;
+  }
+  async function discardP(over: Record<string, unknown> = {}) {
+    return cache.discardStoppedSource({
+      selector: { runId: RUN, generation: 1, attempt: P_ID }, confirm: (over.confirm as string | undefined) ?? await digestOf(P_PATH), holds: { state: "read", holds: [] },
+      lifecycle: { state: "terminal", status: "failed" }, barePath: bare, ...live, removeRetainedHomeMarker: async () => {}, ...over,
+    } as never);
+  }
+  const ledgerStates = (): Map<string, string> =>
+    new Map(ledgerValues().map(v => JSON.parse(v)).map((e: { attemptId: string; state: string }) => [e.attemptId, e.state]));
+  /** After the retry no ledger entry of P or S is live and neither journal key holds a value. */
+  function assertSettled(): void {
+    assert.ok(!rawKey(P_KEY));
+    assert.equal(rawKey(S_KEY) ?? "", "");
+    assert.equal(ledgerStates().get(P_ID), "retired");
+    assert.notEqual(ledgerStates().get(S_ID), "live");
+  }
+
+  it("window 2: a throw after the config rewrite reports metadata retired and the retry completes", async () => {
+    failSync = n => n === 1;
+    await refusal(seedInput({ steps: [] }));
+    failSync = () => true; // every durability sync after the rewrite throws
+    const confirm = await digestOf(P_PATH);
+    const first = await discardP({ confirm });
+    assert.equal(first.kind, "unknown");
+    assert.equal(first.kind === "unknown" && first.metadata, "retired", "the cleared metadata is reported truthfully");
+    assert.ok(!rawKey(P_KEY), "P's key was cleared by the same rename that retired the ledger");
+    assert.equal(ledgerStates().get(P_ID), "retired");
+    assert.equal(ledgerStates().get(S_ID), "retired");
+    failSync = undefined;
+    const again = await discardP({ confirm });
+    assert.ok(again.kind !== "refused" || (again.reason === "not_found" && !again.consumers.includes("ledger_live")), JSON.stringify(again));
+    assertSettled();
+  });
+
+  it("window 2: a failure inside the rewrite changes nothing and the same call completes", async () => {
+    failSync = n => n === 1;
+    await refusal(seedInput({ steps: [] }));
+    const before = config();
+    const i = cache as unknown as { rewriteConfigAtomically(...a: unknown[]): Promise<void> };
+    const original = i.rewriteConfigAtomically;
+    i.rewriteConfigAtomically = async () => { throw new Error("injected rewrite failure"); };
+    const first = await discardP();
+    i.rewriteConfigAtomically = original;
+    assert.notEqual(first.kind, "done");
+    assert.equal(first.kind === "unknown" && first.metadata, "kept");
+    assert.deepEqual(config(), before);
+    const again = await discardP();
+    assert.equal(again.kind, "done", JSON.stringify(again));
+    assertSettled();
+  });
+
+  it("tombstone: a throw after the rewrite reports metadata retired and the retry is not refused", async () => {
+    await cache.seedIndependentAttempt(seedInput({ steps: [] }));
+    fs.rmSync(S_PATH, { recursive: true, force: true });
+    addLedger(S_ID, S_PATH, "retired");
+    await cache.advanceRestoreEntry(bare, BRANCH, "retired");
+    failSync = () => true;
+    const confirm = await digestOf(P_PATH);
+    const first = await discardP({ confirm });
+    assert.equal(first.kind, "unknown");
+    assert.equal(first.kind === "unknown" && first.metadata, "retired");
+    failSync = undefined;
+    const again = await discardP({ confirm });
+    assert.ok(again.kind !== "refused" || (again.reason === "not_found" && !again.consumers.includes("ledger_live")), JSON.stringify(again));
+    assertSettled();
+    assert.equal((await cache.resolveBranchJournal(bare, BRANCH)).kind, "none");
+  });
+
+  it("a shared owed pin or a foreign journal naming the source still refuses the restore exit", async () => {
+    failSync = n => n === 1;
+    await refusal(seedInput({ steps: [] }));
+    const before = config();
+    gitIn(bare, ["update-ref", `refs/uzi-owed/other-run/${pinSha}`, pinSha]);
+    const shared = await discardP();
+    assert.equal(shared.kind, "refused", JSON.stringify(shared));
+    assert.ok(shared.kind === "refused" && shared.consumers.includes("shared_owed_pin"), JSON.stringify(shared));
+    gitIn(bare, ["update-ref", "-d", `refs/uzi-owed/other-run/${pinSha}`]);
+    setKey("uzi-recovery.agent/other.clone", JSON.stringify({ runId: "other-run", clonePath: P_PATH, attemptId: P_ID }));
+    const named = await discardP();
+    assert.notEqual(named.kind, "done", JSON.stringify(named));
+    assert.ok(named.kind !== "refused" || named.consumers.some(c => c.startsWith("named_by_journal:") && c.includes("agent/other")), JSON.stringify(named));
+    assert.equal(fs.existsSync(path.join(P_PATH, "later.txt")), true, "P's bytes survive both refusals");
+    gitIn(bare, ["config", "--unset-all", "uzi-recovery.agent/other.clone"]);
+    assert.equal(rawKey(P_KEY), pRaw);
+    assert.ok(before.length > 0);
+  });
+
+  it("no restore evidence (no retained-home marker, or no later generation): an ordinary newer same-run entry never makes P restore-exitable", async () => {
+    // An ordinary newer retired entry of the same run, path absent: not a restore.
+    addLedger(S_ID, S_PATH, "retired");
+    const noMarker = await discardP({ hasRetainedHomeMarker: undefined });
+    assert.equal(noMarker.kind, "refused", JSON.stringify(noMarker));
+    const markerFalse = await discardP({ hasRetainedHomeMarker: async () => false });
+    assert.equal(markerFalse.kind, "refused", JSON.stringify(markerFalse));
+    assert.equal(fs.existsSync(path.join(P_PATH, "later.txt")), true, "P's unsaved bytes are untouched");
+    assert.equal(rawKey(P_KEY), pRaw);
+    // A marker without a later generation is not evidence either (same generation, later timestamp).
+    const sameGen = formatAttemptId(new Date("2026-11-05T12:12:12Z"), 1, "aaaaaaaaaaaaaaaa");
+    const sameGenPath = attemptClonePath(cache.runnerClonePath(bare, KEY), sameGen);
+    gitIn(bare, ["config", "--unset-all", LEDGER_KEY]);
+    addLedger(P_ID, P_PATH, "live");
+    addLedger(sameGen, sameGenPath, "live");
+    const equal = await discardP();
+    assert.equal(equal.kind, "refused", JSON.stringify(equal));
+    assert.equal(fs.existsSync(path.join(P_PATH, "later.txt")), true);
+  });
+
+  it("a pin deleted from inside the census callback refuses at window seeding and the pin stays protected", async () => {
+    const error = await refusal(seedInput({ steps: [] }, {
+      census: async () => { gitIn(bare, ["update-ref", "-d", `refs/uzi-owed/${RUN}/${pinSha}`]); return { ok: true }; },
+    }));
+    assert.equal(error.reason, "pin_unbound");
+    assert.equal(error.window, "seeding");
+    assert.equal(fs.existsSync(S_PATH), false, "no clone is seeded");
+    const r = await cache.resolveBranchJournal(bare, BRANCH);
+    assert.equal(r.kind, "composite");
+    assert.equal(r.kind === "composite" && r.stage, "seeding", "never ready");
+    assert.equal(await cache.restoreKeepsRecoveryRef(bare, RUN, { sha: pinSha }), true);
   });
 });
 
