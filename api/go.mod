@@ -8,7 +8,7 @@ go 1.26.4
 toolchain go1.27.3
 
 require (
-	charm.land/bubbletea/v2 v2.1.0
+	charm.land/bubbletea/v2 v2.1.1
 	charm.land/glamour/v2 v2.0.1
 	charm.land/lipgloss/v2 v2.0.6
 	code.gitea.io/sdk/gitea v0.25.1
@@ -24,15 +24,15 @@ require (
 	github.com/google/go-github/v92 v92.0.0
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/go-retryablehttp v0.7.8
-	github.com/jackc/pgx/v5 v5.11.0
+	github.com/jackc/pgx/v5 v5.12.0
 	github.com/klauspost/compress v1.20.3
 	github.com/pressly/goose/v3 v3.29.0
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/sergi/go-diff v1.4.0
-	github.com/slack-go/slack v0.30.1
+	github.com/slack-go/slack v0.33.0
 	github.com/spf13/cobra v1.10.2
-	github.com/yuin/goldmark v1.8.6
-	gitlab.com/gitlab-org/api/client-go/v3 v3.33.0
+	github.com/yuin/goldmark v1.8.7
+	gitlab.com/gitlab-org/api/client-go/v3 v3.40.0
 	golang.org/x/crypto v0.58.0
 	golang.org/x/mod v0.42.0
 	golang.org/x/net v0.62.0
