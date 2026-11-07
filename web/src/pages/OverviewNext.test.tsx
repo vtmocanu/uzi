@@ -90,6 +90,8 @@ describe("OverviewNext for a non-admin", () => {
     expect(sentence()).toBe("Nothing needs you right now. 1 run is executing.");
     expect(screen.getByText("Live run row")).toBeTruthy();
     for (const call of adminEndpoints()) expect(call).not.toHaveBeenCalled();
+    expect(screen.queryByRole("group", { name: "Usage scope" })).toBeNull();
+    expect(screen.queryByRole("region", { name: "By user" })).toBeNull();
     expect(screen.queryByText(/Other users/)).toBeNull();
     // The health chip is admin-only.
     expect(screen.queryByRole("link", { name: /System health/ })).toBeNull();

@@ -8,9 +8,10 @@ import { useDemoMode } from "../lib/demoMode";
 import { maskEmail } from "../lib/demoMask";
 import { Card, SectionTitle, cx } from "./ui";
 import {
-  breakdown, failRate, failRateDelta, formatSince, summaryCost, perPrText,
+  failRate, failRateDelta, formatSince, summaryCost, perPrText,
   FailedRunsBlock, TopCauses, SinceLastFailedRun, WindowToggle,
 } from "./usageParts";
+import { breakdown, perUserRows } from "../lib/usageByUser";
 
 // PRD #40: one usage summary, with personal figures for everyone and factory
 // figures plus the selected-window per-user section only from the admin-gated response.
@@ -183,38 +184,14 @@ function Td({
 function PerUserUsageTable({ admin, window }: { admin: AdminUsage; window: UsageWindow }) {
   const now = useNow(30_000);
   const demo = useDemoMode();
-  const recent = window === "last_7_days";
-  const available = admin.users.every((u) =>
-    u.last_7_days != null && u.last7_run_count != null && u.last7_outcomes != null &&
-    u.last7_subscription_run_count != null && u.last7_unreported_run_count != null,
-  );
-  if (recent && !available) {
+  const { available, rows, showPRs, factoryRuns, factoryPRs, factoryOutcomes, factory, factoryDisclosure } = perUserRows(admin, window);
+  if (window === "last_7_days" && !available) {
     return <p className="mt-2 text-sm text-muted">Seven-day per-user usage is unavailable. Upgrade the API to view this period.</p>;
   }
-  const factory = breakdown(admin.factory[window]);
-  const factoryOutcomes = admin.factory.outcomes[window];
-  const rows = admin.users.map((u) => ({
-    ...u,
-    b: breakdown(recent ? u.last_7_days! : u.usage),
-    selectedRuns: recent ? u.last7_run_count! : u.run_count,
-    selectedOutcomes: recent ? u.last7_outcomes! : u.outcomes,
-    subscription: recent ? u.last7_subscription_run_count! : u.subscription_run_count,
-    unreported: recent ? u.last7_unreported_run_count! : u.unreported_run_count,
-    selectedPRs: recent ? u.last7_pr_count : u.pr_count,
-  })).sort((a, b) => b.b.cost - a.b.cost || b.b.total - a.b.total || b.b.out - a.b.out ||
-    (a.user_id < b.user_id ? -1 : a.user_id > b.user_id ? 1 : 0));
-  // Issue #3686: render the PRs column only when every row reports the selected window's count.
-  const showPRs = rows.every((r) => r.selectedPRs != null);
-  const factoryPRs = rows.reduce((sum, r) => sum + (r.selectedPRs ?? 0), 0);
   const factoryMicroUSD = Math.round(factory.cost * 1e6);
   const shares = factoryMicroUSD > 0
     ? costShares(rows.map((r) => Math.round(r.b.cost * 1e6)), factoryMicroUSD)
     : undefined;
-  const factoryRuns = recent ? rows.reduce((sum, u) => sum + u.selectedRuns, 0) : admin.factory.run_count;
-  const factoryDisclosure = aggregateDisclosure(
-    recent ? admin.factory.last7_subscription_run_count : admin.factory.lifetime_subscription_run_count,
-    recent ? admin.factory.last7_unreported_run_count : admin.factory.lifetime_unreported_run_count,
-  );
   return (
     <>
       {rows.length === 0 ? (

@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import { failureRecency } from "../lib/failureRecency";
 import { useNow } from "../lib/useNow";
 import { stripUnsafeChars } from "../lib/safeText";
-import type { RunUsage, RunOutcomes } from "../lib/api";
+import type { RunOutcomes } from "../lib/api";
 import { failOriginLabel } from "../lib/failOriginLabel";
 import type { aggregateDisclosure } from "../lib/costStatus";
 import { cx } from "./ui";
@@ -12,13 +12,11 @@ import type { UsageWindow } from "./UsageCards";
 // Presentation pieces shared by the current Overview's UsageCard (UsageCards.tsx) and the
 // Overview preview's OverviewUsageCard, so the two cannot drift before PRD #3877.
 
-// A RunUsage bundle split the way the run view splits it: fresh = fresh input +
-// cache creation, cached = cache reads, out = output; total = all three.
-export function breakdown(u: RunUsage): { fresh: number; cached: number; out: number; total: number; cost: number } {
-  const fresh = u.input_tokens + u.cache_creation_tokens;
-  const cached = u.cache_read_tokens;
-  const out = u.output_tokens;
-  return { fresh, cached, out, total: fresh + cached + out, cost: u.cost_usd };
+// failureRecency for a cell that reads "<value> ago": only a duration gets " ago"; the
+// "Unavailable", "–" and "no failures" words stand alone.
+export function failureAgo(outcomes: RunOutcomes, now: number): string {
+  const value = failureRecency(outcomes, now);
+  return /^(<1m|\d+[mhd])$/.test(value) ? `${value} ago` : value;
 }
 
 // PRD #1293 D6: the failed-run rate as failed / finished, one decimal, "—" when the scope

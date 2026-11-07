@@ -1,19 +1,22 @@
 import { useState, type ReactNode } from "react";
-import type { SelfUsage, AdminUsage } from "../lib/api";
+import type { SelfUsage, AdminUsage, RunOutcomes } from "../lib/api";
 import { formatTokens } from "../lib/formatTokens";
 import { aggregateDisclosure } from "../lib/costStatus";
 import { useDemoMode } from "../lib/demoMode";
 import { maskEmail } from "../lib/demoMask";
-import { Card, SectionTitle } from "./ui";
+import { stripUnsafeChars } from "../lib/safeText";
+import { useNow } from "../lib/useNow";
+import { breakdown, perUserRows } from "../lib/usageByUser";
+import { Card, SectionTitle, cx } from "./ui";
 import type { UsageWindow } from "./UsageCards";
 import {
-  breakdown, failRate, failRateDelta, formatSince, summaryCost, perPrText,
+  failRate, failRateDelta, formatSince, summaryCost, perPrText, failureAgo,
   FailedRunsBlock, TopCauses, SinceLastFailedRun, SegmentedToggle, WindowToggle,
 } from "./usageParts";
 
-// PRD #3881 M1: the Overview preview's one Usage card. A You / Factory scope toggle (admins
+// PRD #3881: the Overview preview's one Usage card. A You / Factory scope toggle (admins
 // only) and the window toggle switch one set of figures, instead of the current Overview's
-// side-by-side columns. The by-user table is M2.
+// side-by-side columns; the Factory scope adds a By user table below.
 
 type Scope = "you" | "factory";
 
@@ -32,8 +35,120 @@ function Kpi({ label, value, valueClass = "", sub }: { label: string; value: Rea
   );
 }
 
-// viewerId is accepted for M2's "(you)" marker in the by-user table.
-export function OverviewUsageCard({ self, admin, window, onWindowChange }: {
+const LAST_FAILURE_TITLE =
+  "All time: the API serves the last failure time for all time only, so this column is the same in both windows";
+
+function Th({ children, left, title }: { children: ReactNode; left?: boolean; title?: string }) {
+  return (
+    <th
+      scope="col"
+      title={title}
+      className={cx("whitespace-nowrap border-b border-edge px-2.5 py-2 text-[11px] font-medium uppercase tracking-[0.04em] text-faint", left ? "text-left" : "text-right")}
+    >
+      {children}
+    </th>
+  );
+}
+
+function Td({ children, left, total, title }: { children?: ReactNode; left?: boolean; total?: boolean; title?: string }) {
+  return (
+    <td
+      title={title}
+      className={cx(
+        "whitespace-nowrap px-2.5 py-2 align-top tabular-nums",
+        left ? "text-left" : "text-right",
+        total ? "border-t-2 border-edge-strong font-semibold text-fg" : "border-b border-edge/50 text-fg",
+      )}
+    >
+      {children}
+    </td>
+  );
+}
+
+function FailRateCell({ outcomes, total }: { outcomes: RunOutcomes; total?: boolean }) {
+  return (
+    <Td total={total} title={`${outcomes.failed} of ${outcomes.finished} finished runs`}>
+      {failRate(outcomes)}
+      <span className="block text-[11px] font-normal text-faint">of {outcomes.finished.toLocaleString("en-US")} finished</span>
+    </Td>
+  );
+}
+
+function CostCell({ cost, disclosure, total }: { cost: number; disclosure: ReturnType<typeof aggregateDisclosure>; total?: boolean }) {
+  return (
+    <Td total={total}>
+      <span className="font-mono">{summaryCost(cost)}</span>
+      {disclosure.incomplete && <span className="block text-[11px] font-normal text-faint" title={disclosure.title}>{disclosure.text}</span>}
+    </Td>
+  );
+}
+
+// PRD #3881 M2: the Factory scope's per-user table. Columns are fixed on every API version;
+// a PR count the API does not report reads "—", never 0.
+function ByUserTable({ admin, window, viewerId }: { admin: AdminUsage; window: UsageWindow; viewerId: string }) {
+  const now = useNow(30_000);
+  const demo = useDemoMode();
+  const { available, rows, factoryRuns, factoryPRs, factoryOutcomes, factory, factoryDisclosure } = perUserRows(admin, window);
+  const recent = window === "last_7_days";
+  return (
+    <section aria-label="By user" className="mt-5 border-t border-edge pt-4">
+      <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+        <h3 className="text-sm font-semibold text-fg">By user</h3>
+        <span className="text-xs text-faint">{recent ? "last 7 days" : "all time"}, by cost</span>
+      </div>
+      {recent && !available ? (
+        <p className="mt-2 text-sm text-muted">Seven-day per-user usage is unavailable. Upgrade the API to view this period.</p>
+      ) : rows.length === 0 ? (
+        <p className="mt-2 text-sm text-faint">No usage across the factory yet.</p>
+      ) : (
+        <div data-testid="by-user-scroll" className="mt-2 overflow-x-auto">
+          <table className="w-full min-w-[640px] border-collapse text-[13px]">
+            <thead>
+              <tr>
+                <Th left>User</Th>
+                <Th title="Runs with recorded usage in the period">Runs</Th>
+                <Th>PRs</Th>
+                <Th>Failed</Th>
+                <Th title="Failed of finished runs in the period">Fail rate</Th>
+                <Th title={LAST_FAILURE_TITLE}>Last failure</Th>
+                <Th>Cost</Th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((u) => (
+                <tr key={u.user_id}>
+                  <Td left>
+                    {stripUnsafeChars(maskEmail(u.email, demo))}
+                    {u.user_id === viewerId && <span className="font-normal text-faint"> (you)</span>}
+                  </Td>
+                  <Td>{u.selectedRuns.toLocaleString("en-US")}</Td>
+                  <Td>{u.selectedPRs == null ? "—" : u.selectedPRs.toLocaleString("en-US")}</Td>
+                  <Td>{u.selectedOutcomes.failed.toLocaleString("en-US")}</Td>
+                  <FailRateCell outcomes={u.selectedOutcomes} />
+                  <Td>{failureAgo(u.outcomes, now)}</Td>
+                  <CostCell cost={u.b.cost} disclosure={aggregateDisclosure(u.subscription, u.unreported)} />
+                </tr>
+              ))}
+            </tbody>
+            <tfoot>
+              <tr>
+                <Td left total>Factory</Td>
+                <Td total>{factoryRuns.toLocaleString("en-US")}</Td>
+                <Td total>{factoryPRs == null ? "—" : factoryPRs.toLocaleString("en-US")}</Td>
+                <Td total>{factoryOutcomes.failed.toLocaleString("en-US")}</Td>
+                <FailRateCell outcomes={factoryOutcomes} total />
+                <Td total>{failureAgo(admin.factory.outcomes.lifetime, now)}</Td>
+                <CostCell cost={factory.cost} disclosure={factoryDisclosure} total />
+              </tr>
+            </tfoot>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
+export function OverviewUsageCard({ self, admin, window, onWindowChange, viewerId }: {
   self: SelfUsage;
   admin?: AdminUsage;
   window: UsageWindow;
@@ -109,6 +224,7 @@ export function OverviewUsageCard({ self, admin, window, onWindowChange }: {
           </div>
         </div>
       </section>
+      {scope === "factory" && admin && <ByUserTable admin={admin} window={window} viewerId={viewerId} />}
     </Card>
   );
 }

@@ -69,7 +69,7 @@ function Harness({ self, admin, initial = "lifetime", onChange }: {
   );
 }
 const mount = (props: Parameters<typeof Harness>[0]) => render(<MemoryRouter><Harness {...props} /></MemoryRouter>);
-afterEach(() => { cleanup(); vi.restoreAllMocks(); setDemoMode(false); });
+afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); setDemoMode(false); });
 
 describe("OverviewUsageCard (#3881 M1)", () => {
   it("shows the four figures for All time with the cost disclosure and 'at least' per-PR cost sharing its title", () => {
@@ -261,11 +261,182 @@ describe("OverviewUsageCard (#3881 M1)", () => {
     expect(within(row).queryByRole("link")).toBeNull();
   });
 
+  it("says the latest failure is unavailable when its time cannot be parsed", () => {
+    const { self } = fixture();
+    self.outcomes.lifetime = outcomes({ last_failed_at: "not-a-date", failed: 10 });
+    const view = mount({ self });
+    expect(view.getByText("Latest failure (all time): unavailable")).toBeTruthy();
+  });
+
   it("drops the Factory all-time sub-line when earliest_run is null", () => {
     const { self, admin } = fixture();
     admin.earliest_run = null;
     const view = mount({ self, admin });
     fireEvent.click(view.getByRole("button", { name: "Factory · all users" }));
     expect(view.queryByText(/across every user/)).toBeNull();
+  });
+});
+
+describe("OverviewUsageCard by-user table (#3881 M2)", () => {
+  const HEADERS = ["User", "Runs", "PRs", "Failed", "Fail rate", "Last failure", "Cost"];
+  const withPRs = (admin: AdminUsage) => {
+    admin.users.forEach((u, i) => { u.pr_count = 10 + i; u.last7_pr_count = 1 + i; });
+  };
+  const factoryView = (props: Parameters<typeof Harness>[0]) => {
+    const view = mount(props);
+    fireEvent.click(view.getByRole("button", { name: "Factory · all users" }));
+    return view;
+  };
+  const section = (view: ReturnType<typeof mount>) => within(view.getByRole("region", { name: "By user" }));
+  const headers = (view: ReturnType<typeof mount>) => section(view).getAllByRole("columnheader").map((h) => h.textContent);
+  const cells = (row: HTMLElement) => within(row).getAllByRole("cell").map((c) => c.textContent);
+  const rowOf = (view: ReturnType<typeof mount>, name: RegExp | string) =>
+    section(view).getAllByRole("row").find((r) => {
+      const first = within(r).queryAllByRole("cell")[0]?.textContent ?? "";
+      return typeof name === "string" ? first === name : name.test(first);
+    })!;
+  const PRS = 2;
+
+  it("appears only in the Factory scope", () => {
+    const { self, admin } = fixture();
+    const view = mount({ self, admin });
+    expect(view.queryByRole("region", { name: "By user" })).toBeNull();
+    fireEvent.click(view.getByRole("button", { name: "Factory · all users" }));
+    expect(view.getByRole("region", { name: "By user" })).toBeTruthy();
+    fireEvent.click(view.getByRole("button", { name: "You" }));
+    expect(view.queryByRole("region", { name: "By user" })).toBeNull();
+    cleanup();
+    expect(mount({ self }).queryByRole("region", { name: "By user" })).toBeNull();
+  });
+
+  it("titles the section and notes the window", () => {
+    const { self, admin } = fixture();
+    const view = factoryView({ self, admin });
+    expect(section(view).getByRole("heading", { name: "By user" })).toBeTruthy();
+    expect(section(view).getByText("all time, by cost")).toBeTruthy();
+    fireEvent.click(view.getByRole("button", { name: "Last 7 days" }));
+    expect(section(view).getByText("last 7 days, by cost")).toBeTruthy();
+  });
+
+  it("has exactly the same seven headers with and without PR counts, in both windows", () => {
+    const { self, admin } = fixture();
+    withPRs(admin);
+    const view = factoryView({ self, admin });
+    expect(headers(view)).toEqual(HEADERS);
+    fireEvent.click(view.getByRole("button", { name: "Last 7 days" }));
+    expect(headers(view)).toEqual(HEADERS);
+    cleanup();
+    const bare = fixture();
+    const second = factoryView({ self: bare.self, admin: bare.admin });
+    expect(headers(second)).toEqual(HEADERS);
+    fireEvent.click(second.getByRole("button", { name: "Last 7 days" }));
+    expect(headers(second)).toEqual(HEADERS);
+    expect(second.queryByRole("columnheader", { name: /Tokens|Out|Cost share/ })).toBeNull();
+  });
+
+  it("titles the headers and scopes them to their columns", () => {
+    const { self, admin } = fixture();
+    const view = factoryView({ self, admin });
+    const th = (name: string) => section(view).getByRole("columnheader", { name });
+    expect(th("Last failure").getAttribute("title")).toBe(
+      "All time: the API serves the last failure time for all time only, so this column is the same in both windows",
+    );
+    expect(th("Runs").getAttribute("title")).toBe("Runs with recorded usage in the period");
+    expect(th("Fail rate").getAttribute("title")).toBe("Failed of finished runs in the period");
+    for (const h of section(view).getAllByRole("columnheader")) expect(h.getAttribute("scope")).toBe("col");
+  });
+
+  it("reads a dash, never 0, for a PR count the API does not report", () => {
+    const { self, admin } = fixture();
+    const view = factoryView({ self, admin });
+    for (const r of section(view).getAllByRole("row").slice(1)) expect(cells(r)[PRS]).toBe("—");
+    expect(cells(rowOf(view, "Factory"))[PRS]).toBe("—");
+    expect(section(view).queryByText("0", { selector: "td" })).toBeNull();
+  });
+
+  it("shows a reported count, a dash for a row without one, and a dash for the Factory total", () => {
+    const { self, admin } = fixture();
+    admin.users[0].pr_count = 7;
+    const view = factoryView({ self, admin });
+    expect(cells(rowOf(view, /^owner\./))[PRS]).toBe("7");
+    expect(cells(rowOf(view, /^other\./))[PRS]).toBe("—");
+    expect(cells(rowOf(view, "Factory"))[PRS]).toBe("—");
+    cleanup();
+    const full = fixture();
+    withPRs(full.admin);
+    const second = factoryView({ self: full.self, admin: full.admin });
+    expect(cells(rowOf(second, "Factory"))[PRS]).toBe("21");
+  });
+
+  it("marks only the viewer's row with (you)", () => {
+    const { self, admin } = fixture();
+    const view = factoryView({ self, admin });
+    expect(section(view).getAllByText(/\(you\)/)).toHaveLength(1);
+    expect(cells(rowOf(view, /^owner\./))[0]).toBe("owner.person@example.com (you)");
+    expect(cells(rowOf(view, /^other\./))[0]).toBe("other.person@example.com");
+  });
+
+  it("shows the same Last failure text in both windows, for user rows and the Factory row", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-07T10:00:00Z"));
+    const { self, admin } = fixture();
+    admin.factory.outcomes.lifetime = { ...admin.factory.outcomes.lifetime, last_failed_at: "2026-10-07T06:30:00Z" };
+    const view = factoryView({ self, admin });
+    const LAST = 5;
+    const read = () => [cells(rowOf(view, /^owner\./))[LAST], cells(rowOf(view, /^other\./))[LAST], cells(rowOf(view, "Factory"))[LAST]];
+    expect(read()).toEqual(["4h ago", "4h ago", "3h ago"]);
+    fireEvent.click(view.getByRole("button", { name: "Last 7 days" }));
+    expect(read()).toEqual(["4h ago", "4h ago", "3h ago"]);
+  });
+
+  it("strips control and bidi characters from an email", () => {
+    const { self, admin } = fixture();
+    admin.users[0].email = "ev‮i\u0007l@example.com";
+    const view = factoryView({ self, admin });
+    expect(cells(rowOf(view, /^evil@/))[0]).toBe("evil@example.com (you)");
+  });
+
+  it("masks the email in demo mode", () => {
+    const { self, admin } = fixture();
+    const view = factoryView({ self, admin });
+    act(() => setDemoMode(true));
+    expect(section(view).queryByText(/owner\.person@example\.com/)).toBeNull();
+  });
+
+  it("explains an unavailable seven-day period instead of a table", () => {
+    const { self, admin } = fixture();
+    delete admin.users[0].last7_run_count;
+    const view = factoryView({ self, admin, initial: "last_7_days" });
+    expect(section(view).getByText("Seven-day per-user usage is unavailable. Upgrade the API to view this period.")).toBeTruthy();
+    expect(section(view).queryByRole("table")).toBeNull();
+    fireEvent.click(view.getByRole("button", { name: "All time" }));
+    expect(section(view).getByRole("table")).toBeTruthy();
+  });
+
+  it("says so when the factory has no users yet", () => {
+    const { self, admin } = fixture();
+    admin.users = [];
+    const view = factoryView({ self, admin });
+    expect(section(view).getByText("No usage across the factory yet.")).toBeTruthy();
+  });
+
+  it("shows the Factory row's Runs as the lifetime count, or the seven-day sum", () => {
+    const { self, admin } = fixture();
+    const view = factoryView({ self, admin });
+    expect(cells(rowOf(view, "Factory"))[1]).toBe("46");
+    fireEvent.click(view.getByRole("button", { name: "Last 7 days" }));
+    expect(cells(rowOf(view, "Factory"))[1]).toBe("6");
+    expect(cells(rowOf(view, /^owner\./))[1]).toBe("3");
+  });
+
+  it("states the fail rate over finished runs, and the cost with its disclosure", () => {
+    const { self, admin } = fixture();
+    const view = factoryView({ self, admin });
+    const row = cells(rowOf(view, /^owner\./));
+    expect(row[3]).toBe("10");
+    expect(row[4]).toBe("10.0%of 100 finished");
+    expect(row[6]).toMatch(/^\$1,235.+/);
+    expect(within(rowOf(view, /^owner\./)).getByTitle("10 of 100 finished runs")).toBeTruthy();
+    expect(cells(rowOf(view, "Factory"))[4]).toBe("10.0%of 200 finished");
   });
 });
