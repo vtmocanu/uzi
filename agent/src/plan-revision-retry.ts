@@ -72,7 +72,8 @@ export class PlanRevisionRecovery {
       this.source = { request: structuredClone(request), revision, report };
   }
 
-  /** A question answer must reach running before this revision's next ownership probe. */
+  /** A question answer must reach running before this revision's next ownership probe. The
+   * cross-check clarification settlement (`clarification_settled`) does not depend on this. */
   get hasActiveRevision(): boolean {
     return this.active !== undefined;
   }

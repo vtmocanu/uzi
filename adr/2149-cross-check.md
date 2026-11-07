@@ -583,3 +583,43 @@ These rest on stated assumptions: request timeouts propagate through `fetch` and
 poll compares against the worker clock; executor-sequenced sink callbacks do not run during the
 plan gate; and the resumed-delivery wait, which predates this change, is bounded by its failure
 and stall counters rather than a wall-clock timer.
+
+## Amendment 2026-11-06 — #3985: clarification during a human revision
+
+A plan cross-check run (gated, or required on a claim issued after a forced human gate cleared
+`auto_approve`) that is not auto-approved stays at `awaiting_approval` while its lead works a
+HUMAN revise. When the lead asks a clarification, the run parks at `awaiting_input`. (In the
+same flight that hit the forced gate the claim still carries `auto_approve`, so the lead's
+question resolves through the autopilot sentinel without parking; that pre-existing behaviour
+is unchanged here, and in required mode only a reclaimed claim reaches this settlement; a gated
+claim never carries `auto_approve`, so its first flight does.) An answer is not plan approval,
+so `SetRunRunning`'s bound-approval clause refuses an ordinary `running` settlement there, and
+an issue run (or any run with `plan_revision_retry` negotiated) failed with "clarification
+running settlement was not confirmed"; other callers' unconfirmed `running` was refused
+silently. Decisions:
+
+- **Dedicated settlement, not a relaxed `running`.** A worker that negotiated
+  `clarification_revision_settlement_v1` reports `clarification_settled` with the question,
+  the pending revise input and its gate revision. A claim-fenced writer returns the run to
+  `awaiting_approval`. It requires an `issue`, `prompt` or `ci_fix` run with no open
+  completion question, the applied answer to the open question, and the pending, bound,
+  unapplied, non-empty revise consumed by this worker and claim generation. It refuses when a bound
+  approval was already applied. It writes only status, timestamps, the question markers and the
+  banked question wait. `SetRunRunning` is unchanged, because its SET can freeze candidate
+  milestones, contract and budget fields.
+- **The revise stays pending.** The settlement neither applies nor supersedes the revise; the
+  lead's next presentation does, at gate revision N+1, which only a newly bound approval passes.
+- **D16 unchanged.** No checker pass and no new presentation; plan text, candidate, gate
+  revision and payload are untouched.
+- **Capability matrix.** Old worker or old api: fail-closed (a new worker on an old api awaits
+  its `running` report for every caller and stops on the refusal). A new worker sends the
+  settlement only after the api advertised it, never strips it or retries it as an unqualified
+  `running`, and accepts only an applied `awaiting_approval` ACK carrying the
+  `clarification_settled` disposition.
+- **Known limit: a switch stamped before the answer.** A human revision turn runs with the
+  credential switch deferred, so a clarification asked inside it parks while the switch waits.
+  If a switch is stamped before the owner answers, the api withholds every input, the answer
+  included, so the run waits for the question timeout or a Cancel (which #3974 probes while the
+  switch is withheld, at `awaiting_input` and `awaiting_approval` alike; a committed Cancel ends
+  the answer wait before any settlement is sent). A switch stamped after the answer applied does
+  not block the settlement. This limit predates #3985 and is not changed by it.
