@@ -235,7 +235,7 @@ export class AuthorityRuntime implements AuthorityScope {
   readonly #inlineAll = new Set<Promise<void>>();
   /** Operation ids of the inline applies in {@link #inlineAll}, for the bare-refusal diagnostic only. */
   readonly #inlineOps = new Set<string>();
-  /** Operation ids the bare-refusal diagnostic already logged (bounded: at most MAX_LOGGED_REFUSALS). */
+  /** Operation ids the bare-refusal diagnostic already logged (bounded: at most refusalLogLimit, default MAX_LOGGED_REFUSALS). */
   readonly #refusalLogged = new Set<string>();
   /** Transactions whose inline join finished: a settle that still finds one active queues instead of applying. */
   readonly #closing = new WeakSet<AuthorityTransaction>();

@@ -1724,6 +1724,7 @@ describe("issue #4066: the bare_slot_refusal diagnostic", () => {
     f.ctl.failWhen = () => true;
     await assert.rejects(f.rt.withTransaction(() => settlement.settle({ ok: true })), /injected authority rename failure/);
     f.ctl.failWhen = undefined;
+    assert.equal(f.rt.inlineLedgerSize(), 0, "a rejected inline apply leaves nothing on the ledger");
     await assert.rejects(f.rt.hooks.assertBareClear(f.bare, "owed-pin"), AuthorityRefusal);
     assert.equal(c.refusals()[0]?.fields?.local_settlement, "failed");
   });
