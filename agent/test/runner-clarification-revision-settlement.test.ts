@@ -192,7 +192,8 @@ describe("#3985 clarification settlement selection", () => {
     const o = await drive(t, { revise: false });
     assert.equal(o.answer?.kind, "answer");
     assert.equal(settlements(o).length, 0);
-    await until(() => api.states.some(s => s.body.status === "running" && api.states.some(q => q.body.status === "awaiting_input")), 2_000);
+    assert.ok(await until(() => api.states.some(s => s.body.status === "running" && api.states.some(q => q.body.status === "awaiting_input")), 2_000),
+      "the ordinary running report was sent");
   });
 
   it("a second clarification in the same revision settles again", async t => {
@@ -233,6 +234,12 @@ describe("#3985 clarification settlement selection", () => {
       });
       assert.equal(o.error, undefined, errorName(o.error));
       assert.equal(api.states.filter(s => s.body.status === "clarification_settled").length, 1);
+      // The second question was not a revise clarification, so it reports running after it parked.
+      const statuses = api.states.map(s => s.body.status);
+      const secondQuestion = statuses.lastIndexOf("awaiting_input");
+      assert.ok(secondQuestion > statuses.indexOf("awaiting_input"), statuses.join(","));
+      assert.ok(await until(() => api.states.slice(secondQuestion).some(s => s.body.status === "running"), 4_000),
+        `a running report follows the second question: ${api.states.map(s => s.body.status).join(",")}`);
     });
   }
 
@@ -255,9 +262,14 @@ describe("#3985 clarification settlement selection", () => {
       after: async ctx => {
         // Plan B is presented (a later gate revision); the verdict never arrives while the next
         // question is asked, so the pending revise must already be gone.
-        const gateB = ctx.gatePlan!("# Plan B", undefined, undefined, undefined);
+        // Wait on the worker-side effect: onPlanPersisted runs only after the worker processed the
+        // applied ACK of the new presentation, which is where the pending revise is cleared. The fake
+        // api's request log is written before it replies, so it would race that processing.
+        let persisted!: () => void;
+        const processed = new Promise<void>(resolve => { persisted = resolve; });
+        const gateB = ctx.gatePlan!("# Plan B", undefined, async () => { persisted(); }, undefined);
         gateB.catch(() => undefined);
-        await until(() => api.states.filter(s => s.body.status === "awaiting_approval").length >= 2, 4_000);
+        await Promise.race([processed, new Promise<never>((_, reject) => setTimeout(() => reject(new Error("plan B ACK was not processed")), 8_000))]);
         const second = await ctx.askUser!([{ question: "After plan B?", header: "Plan" }]);
         assert.equal(second.kind, "answer");
       },
@@ -300,7 +312,7 @@ describe("#3985 clarification settlement selection", () => {
     };
     const done = runner(executor, fakeGitlab().gitlab).execute(claim);
     t.after(async () => { send(id, row("cancel")); await done.catch(() => undefined); });
-    await until(() => answered || failure !== undefined, 8_000);
+    assert.ok(await until(() => answered || failure !== undefined, 8_000), "the reclaimed fixture finished");
     assert.equal(failure, undefined, errorName(failure));
     assert.equal(api.states.filter(s => s.body.status === "clarification_settled").length, 1);
     const statuses = api.states.map(s => s.body.status);
@@ -541,7 +553,7 @@ describe("#3985 clarification settlement and the worker-memory phase hold", () =
     const done = runner(executor, fakeGitlab().gitlab, undefined, { memoryRuntime: memory, activeRuns: registry,
       codexBoundaryDeadlineMs: 1000 }).execute(claim);
     t.after(async () => { send(id, row("cancel")); await done.catch(() => undefined); await memory.stop(); });
-    await until(() => finished, 10_000);
+    assert.ok(await until(() => finished, 10_000), "the memory fixture finished");
     return outcome;
   }
 
@@ -576,7 +588,7 @@ describe("#3985 clarification settlement and the worker-memory phase hold", () =
     const o = await memoryDrive(t, "applied", async (ctx, mem, outcome) => {
       api.afterPersistState(api.states[0]!.runId, b => b.status === "clarification_settled", release.promise);
       const asking = ctx.askUser!([{ question: "Continue planning?", header: "Plan" }]).then(() => undefined, (e: unknown) => { outcome.error = e; });
-      await until(() => api.states.some(s => s.body.status === "clarification_settled"), 8_000);
+      assert.ok(await until(() => api.states.some(s => s.body.status === "clarification_settled"), 8_000), "the settlement was sent");
       await ctx.reportIteration!(1);
       release.resolve();
       await asking;
@@ -596,7 +608,7 @@ describe("#3985 clarification settlement and the worker-memory phase hold", () =
     const o = await memoryDrive(t, "applied", async (ctx, mem, outcome) => {
       api.afterPersistState(api.states[0]!.runId, b => b.status === "clarification_settled", release.promise);
       const asking = ctx.askUser!([{ question: "Continue planning?", header: "Plan" }]).then(() => undefined, (e: unknown) => { outcome.error = e; });
-      await until(() => api.states.some(s => s.body.status === "clarification_settled"), 8_000);
+      assert.ok(await until(() => api.states.some(s => s.body.status === "clarification_settled"), 8_000), "the settlement was sent");
       (mem.flight as unknown as MemoryProof).workerMemory!.phaseToken = other;
       release.resolve();
       await asking;

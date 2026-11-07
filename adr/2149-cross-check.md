@@ -586,9 +586,12 @@ and stall counters rather than a wall-clock timer.
 
 ## Amendment 2026-11-06 — #3985: clarification during a human revision
 
-A plan cross-check run (gated, or required with `auto_approve` cleared at a forced human gate)
-that is not auto-approved stays at `awaiting_approval` while its lead works a HUMAN revise. When
-the lead asks a clarification, the run parks at `awaiting_input`. An answer is not plan approval,
+A plan cross-check run (gated, or required on a claim issued after a forced human gate cleared
+`auto_approve`) that is not auto-approved stays at `awaiting_approval` while its lead works a
+HUMAN revise. When the lead asks a clarification, the run parks at `awaiting_input`. (In the
+same flight that hit the forced gate the claim still carries `auto_approve`, so the lead's
+question resolves through the autopilot sentinel without parking; that pre-existing behaviour
+is unchanged here, and only a reclaimed claim reaches this settlement.) An answer is not plan approval,
 so `SetRunRunning`'s bound-approval clause refuses an ordinary `running` settlement there, and
 an issue run (or any run with `plan_revision_retry` negotiated) failed with "clarification
 running settlement was not confirmed"; other callers' unconfirmed `running` was refused
