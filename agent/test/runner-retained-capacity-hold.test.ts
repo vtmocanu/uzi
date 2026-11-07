@@ -71,6 +71,9 @@ interface Ctx {
   clone: { path: string; branch: string };
   deadline: () => number;
   set: (used: number) => void;
+  runner?: unknown;
+  /** The runner's real shutdown (worker loss). */
+  shutdown: () => void;
 }
 interface Opts {
   used: number;
@@ -90,6 +93,10 @@ interface Opts {
   /** Reuse an already seeded fixture (a second execute on the same journal). */
   prior?: Awaited<ReturnType<typeof seed>>;
   runner?: any;
+  /** Send exhausted-park reports through the REAL client and HTTP (r.parks stays empty; use api.stateWire). */
+  real?: boolean;
+  /** Arms the fake API before the run starts. */
+  beforeRun?: (ctx: Ctx) => void;
 }
 
 const confirmed = (runId: string, body: StateRequest): Ack => {
@@ -118,6 +125,7 @@ async function drive(o: Opts) {
     claim, bare, clone,
     deadline: () => journal(bare, clone.branch).recovery.deadline as number,
     set: used => { state.used = used; },
+    shutdown: () => (ctx.runner as { shutdown(): void }).shutdown(),
   };
   const guard = new DataVolumeGuard({
     dataDir: fx.dataDir,
@@ -131,11 +139,19 @@ async function drive(o: Opts) {
   client.releaseRecoveryCustody = async () => { r.releases++; throw new Error("must retain custody"); };
   const report = client.reportState.bind(client);
   client.reportState = async (runId, body, signal) => {
-    if (body.status === "recovery_wait" && body.recovery_cause === "retained_recovery_exhausted") {
+    if (!o.real && body.status === "recovery_wait" && body.recovery_cause === "retained_recovery_exhausted") {
       r.parks.push(body);
       return o.respond ? o.respond(body, r.parks.length, runId) : confirmed(runId, body);
     }
-    return report(runId, body, signal);
+    const ack = await report(runId, body, signal);
+    // The fake api does not echo run.recovery_wait_cause for this park; a real api does. Everything up to this
+    // point (the client's retries, the wire, the 400 handling) is the real client.
+    if (o.real && body.recovery_cause === "retained_recovery_exhausted" && ack.status === "recovery_wait" &&
+        ack.recoveryCause === undefined) {
+      api.setOwnershipStatus(runId, "recovery_wait", body.claim_generation as number);
+      return { ...ack, recoveryCause: "retained_recovery_exhausted" } as Ack;
+    }
+    return ack;
   };
   const reserve = git.reserveRecoveryIteration.bind(git);
   git.reserveRecoveryIteration = async (...args) => {
@@ -153,6 +169,7 @@ async function drive(o: Opts) {
   });
   const runner = o.runner ?? runnerWith(factory, fakeGitlab().gitlab, undefined, nullLogger(),
     { recoveryRetryMs: 1, dataVolume: guard, diskGovernor });
+  ctx.runner = runner;
   let waits = 0;
   const wait = (runner as any).awaitDataVolumeReclaim.bind(runner);
   (runner as any).awaitDataVolumeReclaim = (g: unknown, flight: any, op: string, signal?: AbortSignal) => {
@@ -164,6 +181,7 @@ async function drive(o: Opts) {
     await backoff(...args);
     o.afterBackoff?.(++r.backoffs, ctx);
   };
+  o.beforeRun?.(ctx);
   await runner.execute(claim);
   return { ...r, claim, bare, clone, state, runner, ctx, prior: { claim, bare, clone } };
 }
@@ -382,6 +400,65 @@ it("an unresolved marked report followed by a marked 400 gets one unmarked attem
   assert.deepEqual(r.parks, [MARKED, MARKED, UNMARKED]);
   assert.deepEqual(failedReports(), [], "an uncertain park is never turned into a failure");
   assert.equal(feed(r).includes(HELD_TEXT), false);
+});
+
+// Through the REAL client: its internal retry of a dropped connection followed by a 400 reaches the runner as one
+// wrapped "outcome uncertain" error, not as a bare 400.
+const isMarked = (b: StateRequest) => b.recovery_cause === "retained_recovery_exhausted" && b.retained_capacity_only === true;
+const isUnmarked = (b: StateRequest) => b.recovery_cause === "retained_recovery_exhausted" && b.retained_capacity_only === undefined;
+function armDropThen400(c: Ctx, unmarkedAlso400: boolean): void {
+  const runId = c.claim.run_id;
+  let dropped = false;
+  api.dropStatesWhen(runId, b => {
+    if (!isMarked(b) || dropped) return false;
+    dropped = true;
+    return true;
+  });
+  api.failStateWhen(runId, b => {
+    if (!isMarked(b)) return false;
+    // The marked retry is refused; optionally refuse the unmarked report too.
+    if (unmarkedAlso400) api.failStateWhen(runId, isUnmarked, { httpStatus: 400 });
+    return true;
+  }, { httpStatus: 400 });
+}
+const wireBodies = (r: Result) => api.stateWire.filter(s => s.runId === r.claim.run_id).map(s => s.body)
+  .filter(b => b.recovery_cause === "retained_recovery_exhausted");
+
+it("a transport failure then a 400 inside one client call falls back to exactly one unmarked report, which parks", async () => {
+  const r = await drive({ used: 0.89, real: true, beforeRun: c => armDropThen400(c, false) });
+  const wire = wireBodies(r);
+  assert.ok(wire.filter(isMarked).length >= 2, JSON.stringify(wire));
+  assert.equal(wire.filter(isUnmarked).length, 1, JSON.stringify(wire));
+  assert.ok(isUnmarked(wire.at(-1)!), "the unmarked report is the last one sent");
+  assert.deepEqual(failedReports(), []);
+  assert.equal(api.states.filter(s => s.runId === r.claim.run_id && isUnmarked(s.body)).length, 1, "the unmarked park was recorded");
+  assert.equal(feed(r).includes(HELD_TEXT), false, "a fallback to the unmarked park never claims an owner hold");
+  assert.equal(r.releases, 0);
+  assert.equal(r.models, 0);
+});
+
+it("the same wrapped refusal followed by a 400 on the unmarked report stops the flight without a failure", async () => {
+  const r = await drive({ used: 0.89, real: true, beforeRun: c => armDropThen400(c, true) });
+  const wire = wireBodies(r);
+  assert.equal(wire.filter(isUnmarked).length, 1, JSON.stringify(wire));
+  assert.deepEqual(failedReports(), [], "an uncertain park is never turned into a failure");
+  assert.equal(api.states.filter(s => s.runId === r.claim.run_id && isUnmarked(s.body)).length, 0, "the refused unmarked park was not recorded");
+  assert.equal(r.releases, 0, "custody retained");
+  assert.equal(feed(r).includes(HELD_TEXT), false);
+});
+
+it("a worker shutdown after one witnessed capacity refusal parks nothing, seeds nothing and releases nothing", async () => {
+  const r = await drive({ used: 0.89, onReclaim: (n, c) => { if (n === 1) c.shutdown(); } });
+  assert.deepEqual(r.parks, [], "no park of any kind");
+  assert.equal(wireBodies(r).length, 0);
+  assert.equal(r.prepares, 0);
+  assert.equal(r.models, 0);
+  assert.equal(r.releases, 0, "custody not released");
+  assert.deepEqual(failedReports(), []);
+  assert.equal(feed(r).includes(HELD_TEXT), false);
+  const j = journal(r.bare, r.clone.branch);
+  assert.equal(j.clonePath, r.clone.path, "the journal still names the predecessor");
+  assert.equal(fs.readFileSync(path.join(r.clone.path, "retained.txt"), "utf8"), "only local dirty work\n");
 });
 
 it("a 400 on both the marked and the unmarked report (no uncertainty) is today's generic failure", async () => {
