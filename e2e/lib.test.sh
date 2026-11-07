@@ -2122,6 +2122,20 @@ cal_absent() {
 }
 cal_run "capture_agent_logs absent agent is expected only with absent-ok" cal_absent
 
+# A failed .absent marker write (after slot reservation) is missing evidence, not expected absence.
+cal_absent_write_fail() {
+  cal_setup ps-empty x
+  mkdir -p "$RUNROOT/artifacts/agent-logs/0001-05-x-cleanup.absent"   # a directory where the marker goes
+  local err rc=0
+  err="$(capture_agent_logs 05-x cleanup absent-ok 2>&1)" || rc=$?
+  [ "$rc" = 0 ] || { echo "rc=$rc"; return 0; }
+  case "$err" in *"MISSING-EVIDENCE: agent logs 05-x/cleanup: write failure (absent marker)"*) ;; *) echo "stderr lacks MISSING-EVIDENCE write failure: $err" ;; esac
+  case "$err" in *"absent (expected); no snapshot"*) echo "reported expected absence despite write failure: $err" ;; esac
+  [ -n "$(cal_files missing)" ] || echo "no .missing written"
+  [ -z "$(cal_files log)" ] || echo ".log written"
+}
+cal_run "capture_agent_logs failed .absent marker write is missing evidence" cal_absent_write_fail
+
 cal_bare_ok() {
   cal_setup ok some-payload
   cal_bare_errexit
@@ -2248,6 +2262,6 @@ cal_run "phase 42 snapshots the outgoing agent log before its first force-recrea
 node --test "$ROOT/e2e/settlement-diagnostic.test.mjs"
 node --test "$ROOT/e2e/recovery-record-projection.test.mjs"
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has at least 216 cases green (including the
+# Tally guard (the driver.test.sh idiom): a real run has at least 217 cases green (including the
 # capture_agent_logs cal_* cases); a zero-case or partially-red run must exit nonzero.
-[ "$cases" -ge 216 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -ge 217 ] && [ "$cases" -eq "$passed" ]

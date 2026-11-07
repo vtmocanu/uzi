@@ -114,11 +114,14 @@ capture_agent_logs() {
     reason="read failure: compose ps exit $rc"
   elif [ -z "$out" ]; then
     if [ "$mode" = absent-ok ]; then
-      printf 'agent container absent (expected)\n' > "$dir/$stem.absent" 2>/dev/null || true
-      echo "agent logs $phase/$label: agent container absent (expected); no snapshot" >&2
-      return 0
+      if { printf 'agent container absent (expected)\n' > "$dir/$stem.absent"; } 2>/dev/null; then
+        echo "agent logs $phase/$label: agent container absent (expected); no snapshot" >&2
+        return 0
+      fi
+      reason="write failure (absent marker)"
+    else
+      reason="agent container absent"
     fi
-    reason="agent container absent"
   elif ! ( : > "$part" ) 2>/dev/null; then
     reason="write failure"
   else
