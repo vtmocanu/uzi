@@ -31,10 +31,13 @@ async function within<T>(pending: Promise<T>, ms = 5000): Promise<T> {
     })]);
   } finally { clearTimeout(timer); }
 }
-// Shell fragment that makes `artifact` appear only with its full content: the content goes to a
-// same-directory tmp file, then a rename. Visibility only; no durability is claimed.
-function publishPid(artifact: string, hold = "") {
-  return "{ " + hold + " echo $$; } > '" + artifact + ".tmp' && mv '" + artifact + ".tmp' '" + artifact + "'";
+// The fake git both tests run: `bundle create` publishes its PID to `artifact`, then sleeps; any
+// other command delegates to /usr/bin/git. The PID appears only with its full content: it goes to
+// a same-directory tmp file, then a rename. Visibility only; no durability is claimed. `hold` runs
+// inside the tmp-file redirect, before the PID is written.
+function fakeGitScript(artifact: string, hold = "") {
+  return "#!/bin/sh\ncase \"$*\" in *'bundle create'*) { " + hold + " echo $$; } > '" + artifact + ".tmp' && mv '" +
+    artifact + ".tmp' '" + artifact + "'; exec /bin/sleep 60;; esac\nexec /usr/bin/git \"$@\"\n";
 }
 // One fs.watch on `dir`; seen(name) settles on the first event named exactly `name`, including one already delivered.
 function watchNames(dir: string) {
@@ -166,8 +169,7 @@ it("pass shutdown reaps real bundle child before releasing the bare lock", linux
     "--git-dir", bare, "commit-tree", tree], { input: "fixture\n", encoding: "utf8" }).trim();
   const bin = path.join(f.root, "bin"), artifact = path.join(f.root, "child.pid");
   await fs.mkdir(bin);
-  await fs.writeFile(path.join(bin, "git"), "#!/bin/sh\ncase \"$*\" in *'bundle create'*) " + publishPid(artifact) +
-    "; exec /bin/sleep 60;; esac\nexec /usr/bin/git \"$@\"\n", { mode: 0o700 });
+  await fs.writeFile(path.join(bin, "git"), fakeGitScript(artifact), { mode: 0o700 });
   const closed = deferred();
   const watcher = watchNames(f.root);
   t.after(() => watcher.close());
@@ -214,8 +216,8 @@ it("fake git publishes child.pid only with complete content", linux, async t => 
   const artifact = path.join(root, "child.pid"), readyFifo = path.join(root, "ready"), releaseFifo = path.join(root, "release");
   childProcess.execFileSync("mkfifo", [readyFifo, releaseFifo]);
   const script = path.join(root, "git");
-  await fs.writeFile(script, "#!/bin/sh\n" + publishPid(artifact, "echo ready > '" + readyFifo + "'; read _ < '" + releaseFifo + "';") +
-    "; exec /bin/sleep 60\n", { mode: 0o700 });
+  await fs.writeFile(script, fakeGitScript(artifact, "echo ready > '" + readyFifo + "'; read _ < '" + releaseFifo + "';"),
+    { mode: 0o700 });
   const watcher = watchNames(root);
   const published = watcher.seen("child.pid");
   let publishedSettled = false;
