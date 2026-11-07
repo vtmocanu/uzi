@@ -161,6 +161,8 @@ func (h *Handler) IssueResetLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slog.Info("reset link issued", "issuer", actor.ID, "target", target, "target_is_admin", tRow.IsAdmin)
+	// The response carries a one-time reset URL; never let a cache keep it.
+	w.Header().Set("Cache-Control", "no-store")
 	httpx.JSON(w, http.StatusCreated, apitypes.AccountResetLinkDTO{
 		Token:         token,
 		ExpiresAt:     link.ExpiresAt.Time,

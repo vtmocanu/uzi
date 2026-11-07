@@ -369,6 +369,23 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 			return nil, "", err
 		}
 	}
+	// PRD #3989 review rework: an account reset deletes the owner's secrets in the same
+	// transaction that stamps credentials_reset_at, under the run lock held here, and the FK
+	// clears runs.anthropic_secret_id. Every Anthropic lane records that id before it puts a
+	// token in the payload, so a payload token with a NULL recorded secret means a reset
+	// committed after assembly: deliver nothing and decide as the no-credential case below.
+	// Without a marker (a plain secret delete) the token is delivered as before.
+	resetSeen := false
+	if !credDisabled && assemblyErr == nil && payload != nil && locked.Harness != harnessCodex &&
+		payload.Secrets.AnthropicOAuthToken != "" && !locked.AnthropicSecretID.Valid {
+		if resetSeen, err = claimCredentialsReset(ctx, q, locked); err != nil {
+			return nil, "", err
+		}
+		if resetSeen {
+			payload = nil
+			assemblyErr = claudeCheckerClaimError(run, errNoModelCredential)
+		}
+	}
 	if credDisabled && isClaudeCheckerChild(run) {
 		// The Claude checker's credential was disabled after assembly opened it: decide the
 		// check unavailable under the lead lock already held and deliver no payload.
@@ -402,9 +419,11 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	parkReason := holdCredentialDisabled
 	if !credDisabled && errors.Is(assemblyErr, errNoModelCredential) &&
 		run.Kind != runkind.Job && run.Kind != runkind.Judge && run.Kind != runkind.CrossCheck {
-		reset, err := claimCredentialsReset(ctx, q, locked)
-		if err != nil {
-			return nil, "", err
+		reset := resetSeen
+		if !reset {
+			if reset, err = claimCredentialsReset(ctx, q, locked); err != nil {
+				return nil, "", err
+			}
 		}
 		if reset {
 			credDisabled, parkReason = true, holdCredentialsReset
@@ -645,7 +664,9 @@ func claimCredentialsReset(ctx context.Context, q claimFinishQueries, locked sto
 // and takes the credential row FOR SHARE NOWAIT: a concurrent disable either committed first
 // (seen here, the claim parks) or waits for this decision (the claim was issued first and
 // finishes, D3). A held row is 55P03, which rolls the transaction back for the bounded
-// retry instead of blocking under the run lock. A missing row is not this classification.
+// retry instead of blocking under the run lock. A missing row is not this classification, and a
+// NULL recorded id returns false here: finishRunClaimTx separately treats a payload token with a
+// NULL id plus a newer reset marker as an account reset (PRD #3989 review rework).
 func claimCredentialDisabled(ctx context.Context, q claimFinishQueries, locked store.Run, payload *ClaimPayload) (bool, error) {
 	var secretID pgtype.UUID
 	switch {

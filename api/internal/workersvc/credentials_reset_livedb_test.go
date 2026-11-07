@@ -32,6 +32,32 @@ func resetAccountCredentials(env codexTestEnv, userID uuid.UUID, marker string) 
 	env.exec(`UPDATE users SET credentials_reset_at = `+marker+` WHERE id = $1`, userID)
 }
 
+// resetAccountCredentialsTx is resetAccountCredentials as vault.Reset commits it: the marker stamp
+// and both credential deletes in ONE transaction, so a claim sees the reset either entirely or not
+// at all.
+func resetAccountCredentialsTx(t *testing.T, env codexTestEnv, userID uuid.UUID) {
+	t.Helper()
+	tx, err := env.pool.Begin(env.ctx)
+	if err != nil {
+		t.Errorf("begin reset: %v", err)
+		return
+	}
+	defer func() { _ = tx.Rollback(env.ctx) }()
+	for _, stmt := range []string{
+		`UPDATE users SET credentials_reset_at = now() WHERE id = $1`,
+		`DELETE FROM user_secrets WHERE user_id = $1`,
+		`DELETE FROM codex_provider_account WHERE user_id = $1`,
+	} {
+		if _, err := tx.Exec(env.ctx, stmt, userID); err != nil {
+			t.Errorf("reset %q: %v", stmt, err)
+			return
+		}
+	}
+	if err := tx.Commit(env.ctx); err != nil {
+		t.Errorf("commit reset: %v", err)
+	}
+}
+
 func assertHeldOn(t *testing.T, env codexTestEnv, runID uuid.UUID, reason string) store.Run {
 	t.Helper()
 	r := mustRun(t, env, runID)
@@ -416,4 +442,137 @@ func TestClaimCredentialsResetCodexFailsWithNamedReasonLiveDB(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestClaimCredentialsResetAfterAssemblyParksLiveDB (PRD #3989 review rework): an account reset
+// commits (marker, secret deletes and the FK nulling of runs.anthropic_secret_id in one
+// transaction) after assembly resolved a token and before finishRunClaimTx's run lock. The token
+// must not be delivered: a Claude run parks on credentials_reset, a judge or job fails terminally.
+// Without a marker a plain secret delete keeps delivering as before.
+//
+// MUTATION: remove the resetSeen branch in finishRunClaimTx; the issue case delivers the payload
+// with the deleted account's token and the judge and job cases are delivered instead of failing.
+func TestClaimCredentialsResetAfterAssemblyParksLiveDB(t *testing.T) {
+	t.Run("issue run parks", func(t *testing.T) {
+		fx := newCDFix(t)
+		runID := fx.queuedRun(t, "issue")
+		fired := 0
+		fx.svc.claimHooks = &claimTestHooks{afterAssembly: func(_ context.Context, _ store.Run, p *ClaimPayload, err error) {
+			fired++
+			if err != nil || p == nil || p.Secrets.AnthropicOAuthToken == "" {
+				t.Errorf("assembly = (%v, %v), want a payload carrying a token before the reset", p != nil, err)
+			}
+			resetAccountCredentialsTx(t, fx.env, fx.userID)
+		}}
+		payload, err := fx.svc.Claim(fx.env.ctx, fx.worker(t), nil)
+		if err != nil || payload != nil {
+			t.Fatalf("Claim = (%v, %v), want an idle park with no token delivered", payload != nil, err)
+		}
+		if fired != 1 {
+			t.Fatalf("afterAssembly fired %d times, want 1", fired)
+		}
+		r := assertHeldOn(t, fx.env, runID, "credentials_reset")
+		if r.AnthropicSecretID.Valid || r.FailOrigin.Valid || r.FailureReason.Valid {
+			t.Fatalf("parked run: credential=%v origin=%v reason=%v", r.AnthropicSecretID, r.FailOrigin, r.FailureReason)
+		}
+		if n := openCustodyHolds(t, fx.env, runID); n != 0 {
+			t.Fatalf("open custody holds = %d, want 0", n)
+		}
+	})
+	for _, kind := range []string{"judge", "job"} {
+		t.Run(kind+" fails terminally", func(t *testing.T) {
+			fx := newCDFix(t)
+			var runID uuid.UUID
+			if kind == "judge" {
+				runID = fx.judgeRun(t)
+			} else {
+				runID = fx.queuedRun(t, "issue")
+			}
+			run, err := fx.env.q.ClaimRun(fx.env.ctx, claimRunParamsFor(fx.worker(t)))
+			if err != nil || run.ID != runID {
+				t.Fatalf("ClaimRun = (%v, %v), want run %s", run.ID, err, runID)
+			}
+			if kind == "job" {
+				fx.env.exec(`DELETE FROM recovery_custody_holds WHERE run_id=$1`, runID)
+				fx.env.exec(`UPDATE runs SET kind='job', repo_id=NULL, issue_iid=NULL, branch=NULL, job_type='research' WHERE id=$1`, runID)
+			}
+			// Assembly recorded the credential it resolved; the reset then deletes it.
+			fx.env.exec(`UPDATE runs SET anthropic_secret_id = $2 WHERE id = $1`, runID, fx.defTok)
+			resetAccountCredentialsTx(t, fx.env, fx.userID)
+			run = mustRun(t, fx.env, runID)
+			if run.AnthropicSecretID.Valid {
+				t.Fatalf("anthropic_secret_id = %v, want NULL after the reset", run.AnthropicSecretID)
+			}
+			payload := &ClaimPayload{RunID: runID.String(), Secrets: ClaimSecrets{
+				AnthropicOAuthToken: strings.Join([]string{"fixture", uuid.NewString(), "not", "real"}, "-"),
+			}}
+			got, err := fx.svc.finishRunClaim(fx.env.ctx, run, payload, nil,
+				claimRecoveryIdentity{workerID: fx.workerID, recoveryCapable: true})
+			if got != nil || err != nil {
+				t.Fatalf("finishRunClaim = (%v, %v), want an idle failure with no token delivered", got != nil, err)
+			}
+			assertFailedCredentialUnavailable(t, fx.env, runID)
+		})
+	}
+	t.Run("no marker delivers", func(t *testing.T) {
+		fx := newCDFix(t)
+		runID := fx.queuedRun(t, "issue")
+		fx.svc.claimHooks = &claimTestHooks{afterAssembly: func(context.Context, store.Run, *ClaimPayload, error) {
+			fx.env.exec(`DELETE FROM user_secrets WHERE user_id = $1`, fx.userID)
+		}}
+		payload, err := fx.svc.Claim(fx.env.ctx, fx.worker(t), nil)
+		if err != nil || payload == nil || payload.RunID != runID.String() || payload.Secrets.AnthropicOAuthToken == "" {
+			t.Fatalf("Claim = (%v, %v), want the payload with its token (no reset marker)", payload != nil, err)
+		}
+	})
+}
+
+// TestChatCredentialsResetAfterAssemblyParksLiveDB: the chat twin. A reset committing between chat
+// assembly and finishChatClaimTx parks the chat instead of delivering the deleted account's token;
+// a secret delete without a marker still delivers.
+//
+// MUTATION: remove the else branch in finishChatClaimTx; the chat is delivered with its token.
+func TestChatCredentialsResetAfterAssemblyParksLiveDB(t *testing.T) {
+	newChat := func(t *testing.T, fx *cdFix) uuid.UUID {
+		t.Helper()
+		id := uuid.New()
+		if _, err := fx.env.q.CreateChatRun(fx.env.ctx, store.CreateChatRunParams{
+			RunID: id, UserID: fx.userID, IssueTitle: "chat", IssueDescription: "hello",
+			Title: pgtype.Text{String: "chat", Valid: true},
+		}); err != nil {
+			t.Fatalf("CreateChatRun: %v", err)
+		}
+		return id
+	}
+	t.Run("reset parks", func(t *testing.T) {
+		fx := newCDFix(t)
+		rec := newReadmitRecorder()
+		fx.svc.SetBroadcaster(rec)
+		chatID := newChat(t, fx)
+		fx.svc.claimHooks = &claimTestHooks{afterChatAssembly: func(context.Context, store.Run) {
+			resetAccountCredentialsTx(t, fx.env, fx.userID)
+		}}
+		payload, err := fx.svc.ClaimChat(fx.env.ctx, fx.worker(t))
+		if err != nil || payload != nil {
+			t.Fatalf("ClaimChat = (%v, %v), want an idle park with no token delivered", payload != nil, err)
+		}
+		r := assertHeldOn(t, fx.env, chatID, "credentials_reset")
+		if r.AnthropicSecretID.Valid {
+			t.Fatalf("anthropic_secret_id = %v, want NULL", r.AnthropicSecretID)
+		}
+		if _, states := rec.published(chatID); len(states) != 1 || states[0] != "paused" {
+			t.Fatalf("published states = %v, want [paused]", states)
+		}
+	})
+	t.Run("no marker delivers", func(t *testing.T) {
+		fx := newCDFix(t)
+		chatID := newChat(t, fx)
+		fx.svc.claimHooks = &claimTestHooks{afterChatAssembly: func(context.Context, store.Run) {
+			fx.env.exec(`DELETE FROM user_secrets WHERE user_id = $1`, fx.userID)
+		}}
+		payload, err := fx.svc.ClaimChat(fx.env.ctx, fx.worker(t))
+		if err != nil || payload == nil || payload.RunID != chatID.String() {
+			t.Fatalf("ClaimChat = (%v, %v), want the chat payload (no reset marker)", payload != nil, err)
+		}
+	})
 }

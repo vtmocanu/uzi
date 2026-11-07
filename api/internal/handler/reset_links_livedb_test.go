@@ -100,6 +100,9 @@ func (f *resetFixture) mustIssueAs(t *testing.T, jwt string, target uuid.UUID) s
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("issue = %d, want 201\nbody: %s", rec.Code, rec.Body.String())
 	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store on a response carrying the one-time token", got)
+	}
 	var dto apitypes.AccountResetLinkDTO
 	if err := json.Unmarshal(rec.Body.Bytes(), &dto); err != nil {
 		t.Fatal(err)
@@ -214,6 +217,21 @@ func captureSlog(t *testing.T) *syncBuffer {
 	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 	return buf
+}
+
+// TestResetLinkIssueIsNoStoreLiveDB: the issue response carries the one-time token, so it must
+// be marked no-store.
+//
+// MUTATION: remove the Cache-Control header in the issue handler; this test fails.
+func TestResetLinkIssueIsNoStoreLiveDB(t *testing.T) {
+	f := newResetFixture(t)
+	rec := f.issueAs(t, f.adminJWT, f.target(t))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("issue = %d, want 201\nbody: %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
 }
 
 func TestResetLinkIssueGuardsLiveDB(t *testing.T) {

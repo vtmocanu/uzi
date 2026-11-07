@@ -258,7 +258,8 @@ func (s *Service) finishChatClaim(ctx context.Context, wkr store.Worker, run sto
 // secret mutation lock (which a disable holds before the credential row), so it never waits on
 // that writer while holding the run row. A concurrent disable either committed first (seen
 // here: the chat parks) or waits for this decision (the claim was issued first and finishes,
-// D3). A missing credential row is not this classification.
+// D3). A missing credential row is not this classification. A NULL recorded credential with an
+// account-reset marker newer than the chat parks it on credentials_reset (PRD #3989 review rework).
 func (s *Service) finishChatClaimTx(ctx context.Context, wkr store.Worker, run store.Run) (chatFinishOutcome, error) {
 	tx, err := s.txBeginner.Begin(ctx)
 	if err != nil {
@@ -292,6 +293,31 @@ func (s *Service) finishChatClaimTx(ctx context.Context, wkr store.Worker, run s
 			})
 			if err != nil {
 				return chatFinishIdle, fmt.Errorf("park chat on credential_disabled: %w", err)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return chatFinishIdle, err
+			}
+			if n != 1 {
+				return chatFinishIdle, nil
+			}
+			return chatFinishParked, nil
+		}
+	} else {
+		// PRD #3989 review rework: a chat payload always carries a token and the recorded
+		// secret id is set before assembly returns, so a NULL id under the run lock means the
+		// secret was deleted after assembly. With a reset marker newer than the chat that is an
+		// account reset committing in between (it deletes secrets in the same transaction that
+		// stamps the marker): park instead of delivering the token. Without a marker deliver.
+		reset, err := claimCredentialsReset(ctx, q, locked)
+		if err != nil {
+			return chatFinishIdle, err
+		}
+		if reset {
+			n, err := q.ParkCredentialDisabledChatRun(ctx, store.ParkCredentialDisabledChatRunParams{
+				ID: run.ID, WorkerID: pgconv.UUID(wkr.ID), HoldReason: holdCredentialsReset,
+			})
+			if err != nil {
+				return chatFinishIdle, fmt.Errorf("park chat on credentials_reset: %w", err)
 			}
 			if err := tx.Commit(ctx); err != nil {
 				return chatFinishIdle, err
