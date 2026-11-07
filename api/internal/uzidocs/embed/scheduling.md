@@ -525,10 +525,12 @@ order once the harness is known:
 3. Any Anthropic override on a Codex run is refused `codex_override_conflict`
    by the run-create step.
 
-A **one-time** schedule runs check 2 before the fire, so a one-time prompt
-or issue schedule that lands on Codex with a disabled stored pinned token is
-held as `credential_disabled` and the preview answers that, not
-`codex_override_conflict`. The preview knows the timing only of a saved
+A **one-time** schedule runs check 2 before the fire, so a one-time schedule
+that lands on Codex with a disabled stored pinned token is held as
+`credential_disabled` and the preview answers that, not
+`codex_override_conflict`. For a CI watch, `codex_override_conflict` applies
+when a repair would fire. This hold order is the scheduled tick's: a manual
+Run now skips that pre-check. The preview knows the timing only of a saved
 schedule (`schedule_id`); a draft has none and is treated as recurring.
 
 A pinned token that was **deleted** has no id left. On Claude the fire
@@ -537,8 +539,10 @@ would choose (source `claim_selection`). On Codex the override still
 conflicts.
 
 `no_credential_for_harness` is a hard refusal of a fire that names a harness
-with no usable credential, not a skip reason: a real fire retries rather than
-recording a skip.
+with no usable credential, and is not recorded as a skip under that name: a
+real fire retries rather than recording a skip. The exception is a sweep
+candidate whose harness was selected by an issue label: there the same
+refusal is recorded as a `no_usable_credential` skip.
 
 #### What each target shows
 

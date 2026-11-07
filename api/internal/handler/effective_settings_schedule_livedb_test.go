@@ -717,6 +717,28 @@ func codexOnlyWithDisabledPin(f *effFix) uuid.UUID {
 	return pin
 }
 
+// ownScheduleStore runs the real ClaimDueSchedules and hands the scheduler only the fixture's
+// schedule, because other tests leave due schedules in the shared database (same approach as
+// schedsvc's capacityLiveStore).
+type ownScheduleStore struct {
+	*store.Queries
+	scheduleID uuid.UUID
+}
+
+func (s *ownScheduleStore) ClaimDueSchedules(ctx context.Context) ([]store.RunSchedule, error) {
+	rows, err := s.Queries.ClaimDueSchedules(ctx)
+	if err != nil {
+		return nil, err
+	}
+	owned := make([]store.RunSchedule, 0, 1)
+	for _, row := range rows {
+		if row.ID == s.scheduleID {
+			owned = append(owned, row)
+		}
+	}
+	return owned, nil
+}
+
 func TestSchedulePreviewUnpinnedCodexWithDisabledPinLiveDB(t *testing.T) {
 	t.Run("a ci_watch schedule has the scheduler's codex_override_conflict pre-check", func(t *testing.T) {
 		f := newEffFix(t, nil)
@@ -760,7 +782,7 @@ func TestSchedulePreviewUnpinnedCodexWithDisabledPinLiveDB(t *testing.T) {
 				t.Fatalf("preview = %s, want credential_disabled", body)
 			}
 			// The real tick: the once schedule is held, not advanced, with the skip recorded.
-			sched := schedsvc.New(f.h.q, f.h.wsvc, sweepGateBuilder{f: &sweepGateForge{}}, sweepGateSettings{}, nil, nil, time.Minute, nil)
+			sched := schedsvc.New(&ownScheduleStore{Queries: f.h.q, scheduleID: uuid.MustParse(id)}, f.h.wsvc, sweepGateBuilder{f: &sweepGateForge{}}, sweepGateSettings{}, nil, nil, time.Minute, nil)
 			sched.Boot(f.ctx)
 			var lastFire, status string
 			var due bool
