@@ -113,9 +113,9 @@ it from `git ls-tree`). Each tree object is 2,040,028 bytes (1.95 MiB; the deepe
 2,040,000), under the 2 MiB cap. The
 helper descends at the first entry, so every ancestor's tree buffer is live at the deepest point
 while only `depth` entries are charged: up to `depth + 1` near-2-MiB buffers at once. Filler entries
-are charged only while unwinding, after that peak. Which cap then refuses depends on depth: at
-d64 the path-byte cap fires first (E = 830,983, P = 100,663,348), at roughly d19-d32 the entry cap,
-and below d19 (`(depth+1) * 60000` entries under 1,200,000) neither does. Ask the `model` job for a
+are charged only while unwinding, after that peak. Which cap then refuses depends on depth: d19-d48
+the entry cap; d49-d64 the path-byte cap (d64: E = 830,983, P = 100,663,348); below d19 neither
+(filler plus directory entries stay under 1,200,000). Ask the `model` job for a
 given depth. The manifest adds `maxTreeObjectBytes`.
 
 ## Charge model and basis labels
