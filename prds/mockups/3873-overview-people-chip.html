@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Overview People Indicator</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: the Overview page head as the preview renders it, with an admin-only People chip beside Health; two placements and the definitions below. */
+:root {
+  --bg: #f2f3f6; --surface: #ffffff; --edge: #dfe2e8; --fg: #1d2129; --muted: #626a78; --faint: #8a91a0;
+  --ok: #2f6b4f; --ok-tile: #edf6f0; --wait: #9a5b13; --wait-tile: #fbf3e8; --idle: #a3a9b4;
+  --btn: #eef0f3; --btn-edge: #d5d9e0; --tag: #e7ecf7; --tag-fg: #34508a; --pop-shadow: 0 10px 30px rgba(20,24,33,.12);
+  --a1: #5b7fb9; --a2: #b9775b; --a3: #6f9a6a; --a4: #8a6bb0; --a5: #b0a05a;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #15171c; --surface: #1d2027; --edge: #2e333d; --fg: #e8eaee; --muted: #a2a9b6; --faint: #7f8796;
+  --ok: #7cc7a0; --ok-tile: #18271f; --wait: #e2a75e; --wait-tile: #2b2219; --idle: #5f6673;
+  --btn: #262a33; --btn-edge: #3a404c; --tag: #222b3d; --tag-fg: #a9bfee; --pop-shadow: 0 10px 30px rgba(0,0,0,.45);
+  --a1: #7e9fd6; --a2: #d39577; --a3: #8fbb89; --a4: #a98bcf; --a5: #cbbb75; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #15171c; --surface: #1d2027; --edge: #2e333d; --fg: #e8eaee; --muted: #a2a9b6; --faint: #7f8796;
+  --ok: #7cc7a0; --ok-tile: #18271f; --wait: #e2a75e; --wait-tile: #2b2219; --idle: #5f6673;
+  --btn: #262a33; --btn-edge: #3a404c; --tag: #222b3d; --tag-fg: #a9bfee; --pop-shadow: 0 10px 30px rgba(0,0,0,.45);
+  --a1: #7e9fd6; --a2: #d39577; --a3: #8fbb89; --a4: #a98bcf; --a5: #cbbb75; color-scheme: dark }
+body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--sans); font-size: 14px; line-height: 1.45; }
+.page { max-width: 1060px; margin: 0 auto; padding-block: 28px 64px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); display: grid; gap: 30px; }
+.intro h1 { font-size: 20px; margin: 0; font-weight: 600; }
+.intro p { margin: 6px 0 0; color: var(--muted); max-width: 72ch; }
+.label { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .07em; margin: 0 0 8px; }
+.frame { background: var(--surface); border: 1px solid var(--edge); border-radius: 14px; padding: 22px 26px; min-width: 0; }
+.ph { display: flex; justify-content: space-between; gap: 18px 24px; flex-wrap: wrap; align-items: flex-start; }
+.ph h2 { margin: 0; font-size: 26px; font-weight: 600; letter-spacing: -.01em; }
+.ph .lede { margin: 6px 0 0; color: var(--muted); max-width: 62ch; }
+.ph .lede b { color: var(--fg); font-weight: 600; }
+.actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.chip { display: inline-flex; align-items: center; gap: 8px; font: inherit; font-size: 13px; color: var(--fg); background: var(--btn); border: 1px solid var(--btn-edge); border-radius: 999px; padding: 4px 12px 4px 6px; cursor: pointer; white-space: nowrap; text-decoration: none; }
+.chip:focus-visible { outline: 2px solid var(--tag-fg); outline-offset: 2px; }
+.chip .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); margin-left: 6px; }
+.chip.health { padding-left: 10px; }
+.stack { display: inline-flex; }
+.av { width: 22px; height: 22px; border-radius: 50%; display: inline-grid; place-items: center; font-size: 10px; font-weight: 600; color: #fff; border: 2px solid var(--btn); margin-left: -6px; }
+.stack .av:first-child { margin-left: 0; }
+.av.more { background: var(--faint); }
+.chip b { font-weight: 600; }
+.chip .of { color: var(--muted); }
+.wrap { position: relative; }
+.pop { position: absolute; right: 0; top: calc(100% + 8px); width: min(360px, calc(100vw - 32px)); background: var(--surface); border: 1px solid var(--edge); border-radius: 12px; box-shadow: var(--pop-shadow); padding: 14px 16px 10px; z-index: 5; }
+.pop h3 { margin: 0 0 8px; font-size: 13px; font-weight: 600; }
+.pop .grp { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .07em; color: var(--faint); margin: 10px 0 4px; }
+.person { display: grid; grid-template-columns: 26px minmax(0,1fr) auto; gap: 10px; align-items: center; padding: 5px 0; }
+.person .av { width: 26px; height: 26px; margin: 0; border: 0; font-size: 11px; }
+.person .nm { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.person .st { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.pill { font-size: 11.5px; padding: 1px 8px; border-radius: 999px; white-space: nowrap; }
+.pill.run { background: var(--ok-tile); color: var(--ok); }
+.pill.wait { background: var(--wait-tile); color: var(--wait); }
+.pop .foot { display: flex; justify-content: space-between; border-top: 1px solid var(--edge); margin-top: 10px; padding-top: 8px; font-size: 12.5px; color: var(--muted); }
+.pop .foot a { color: var(--tag-fg); text-decoration: none; }
+.spacer { height: 330px; }
+.rail { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 12px; }
+.tile { border: 1px solid var(--edge); border-radius: 12px; padding: 12px 14px; background: var(--surface); min-width: 0; }
+.tile .k { font-size: 12px; color: var(--muted); }
+.tile .v { font-family: var(--mono); font-size: 24px; font-weight: 500; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.tile .s { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.tile.people .v small { font-size: 14px; color: var(--muted); }
+.defs { margin: 0; padding-left: 18px; color: var(--muted); display: grid; gap: 6px; max-width: 80ch; font-size: 13.5px; }
+.defs b { color: var(--fg); font-weight: 600; }
+.tag { font-family: var(--mono); font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--tag); color: var(--tag-fg); }
+.phone { width: 380px; max-width: 100%; }
+@media (max-width: 760px) { .rail { grid-template-columns: repeat(2, minmax(0,1fr)); } .frame { padding: 18px 16px; } .spacer { height: 360px; } }
+</style>
+</head>
+<body>
+<main class="page">
+  <section class="intro">
+    <h1>How many people are using uzi right now</h1>
+    <p>Proposal for the Overview preview, admins only. A <b>People</b> chip in the page header answers "how many now" at a glance; clicking it lists who and what they are doing. Example data. The recommended version is A; B shows the alternative in the capacity rail.</p>
+  </section>
+
+  <section>
+    <p class="label">A · Recommended: People chip in the page header (open)</p>
+    <div class="frame">
+      <div class="ph">
+        <div>
+          <h2>Welcome, Vlad</h2>
+          <p class="lede"><b>3 decisions</b> and <b>8 pull requests</b> are waiting on you. 6 runs are executing across the factory for <b>4 people</b>, 1 is queued.</p>
+        </div>
+        <div class="actions">
+          <a class="chip health" href="#"><span class="dot" aria-hidden="true"></span>23 of 23 checks passing</a>
+          <div class="wrap">
+            <button class="chip" id="people-btn" type="button" aria-expanded="true" aria-controls="people-pop">
+              <span class="stack" aria-hidden="true"><span class="av" style="background:var(--a1)">VM</span><span class="av" style="background:var(--a2)">RS</span><span class="av" style="background:var(--a3)">GD</span><span class="av more">+1</span></span>
+              <span><b>4 active now</b> <span class="of">of 9</span></span>
+            </button>
+            <div class="pop" id="people-pop" role="dialog" aria-label="People using uzi">
+              <h3>4 of 9 people active now</h3>
+              <p class="grp">Active now</p>
+              <div class="person"><span class="av" style="background:var(--a1)">VM</span><span class="nm">Vlad M. <span class="st">(you)</span></span><span class="pill run">3 running</span></div>
+              <div class="person"><span class="av" style="background:var(--a2)">RS</span><span class="nm">Radu S.</span><span class="pill run">1 running</span></div>
+              <div class="person"><span class="av" style="background:var(--a3)">GD</span><span class="nm">Gabi D.</span><span class="pill wait">1 waits on them</span></div>
+              <div class="person"><span class="av" style="background:var(--a4)">AT</span><span class="nm">Ana T.</span><span class="pill run">1 running · 1 queued</span></div>
+              <p class="grp">Signed in today, no runs</p>
+              <div class="person"><span class="av" style="background:var(--a5)">MP</span><span class="nm">Mihai P.</span><span class="st">2h ago</span></div>
+              <p class="grp">Idle</p>
+              <div class="person"><span class="av" style="background:var(--idle)">+4</span><span class="nm st">4 people, last seen 2 to 19 days ago</span><span></span></div>
+              <div class="foot"><span>This week: 7 people ran work</span><a href="#">Usage by user →</a></div>
+            </div>
+          </div>
+          <button class="chip" type="button" style="padding-left:12px">Search <span class="of">⌘K</span></button>
+        </div>
+      </div>
+      <div class="spacer" aria-hidden="true"></div>
+    </div>
+  </section>
+
+  <section>
+    <p class="label">A at phone width (closed)</p>
+    <div class="frame phone">
+      <div class="ph">
+        <div><h2 style="font-size:22px">Welcome, Vlad</h2><p class="lede"><b>3 decisions</b> and <b>8 pull requests</b> are waiting on you. 6 runs executing for <b>4 people</b>.</p></div>
+        <div class="actions">
+          <a class="chip health" href="#"><span class="dot" aria-hidden="true"></span>23 of 23 OK</a>
+          <button class="chip" type="button"><span class="stack" aria-hidden="true"><span class="av" style="background:var(--a1)">VM</span><span class="av" style="background:var(--a2)">RS</span><span class="av more">+2</span></span><span><b>4 active</b> <span class="of">of 9</span></span></button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="label">B · Alternative: a People tile in the capacity rail</p>
+    <div class="rail">
+      <div class="tile"><div class="k">Workers</div><div class="v">5</div><div class="s">1 draining</div></div>
+      <div class="tile"><div class="k">Run slots</div><div class="v">7/9</div><div class="s">2 free</div></div>
+      <div class="tile"><div class="k">Held work</div><div class="v">8/8</div><div class="s">at the cap</div></div>
+      <div class="tile people"><div class="k">People active</div><div class="v">4 <small>of 9</small></div><div class="s">7 ran work this week</div></div>
+    </div>
+    <p style="color:var(--muted);font-size:13px;margin:8px 0 0">Good for a glanceable number, but it sits lower on the page and cannot list who without its own popover. A answers the question where the eye lands first.</p>
+  </section>
+
+  <section>
+    <p class="label">What the numbers mean</p>
+    <ul class="defs">
+      <li><b>Active now</b>: owns at least one run that is not finished (running, queued, parked, or waiting on them). It comes from the admin run list the preview already loads, so it needs <b>no new API</b>.</li>
+      <li><b>Of 9</b>: all enabled accounts, from the admin user list.</li>
+      <li><b>Signed in today</b>: from each account's last sign-in time, which the server already stores. uzi does not track who has a browser tab open, so "online" is not claimed.</li>
+      <li><b>This week</b>: people with at least one run in the last 7 days, from the admin usage data the page already loads.</li>
+      <li>Non-admins see no chip: they only see their own work. The status sentence gains "for N people" for admins only.</li>
+    </ul>
+  </section>
+</main>
+<script>
+(() => {
+  const b = document.getElementById("people-btn"), p = document.getElementById("people-pop");
+  b.addEventListener("click", () => { const open = p.hidden; p.hidden = !open; b.setAttribute("aria-expanded", String(open)); });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !p.hidden) { p.hidden = true; b.setAttribute("aria-expanded", "false"); b.focus(); } });
+})();
+</script>
+</body>
+</html>

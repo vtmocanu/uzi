@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<!-- Target design for the Overview preview "Needs your decision" card after #4041 (grouped PRs, order, icons, plan details, two-column rule) and #4040 (inline question text). Example data only. Open this file directly in a browser. -->
+<!-- Target design for the Overview preview "Needs your decision" card after #4041 (grouping by kind, order, icons, plan details, two-column rule) and #4040 (inline question text). Example data only. Open this file directly in a browser. -->
 <title>Needs Your Decision, After</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
@@ -157,18 +157,11 @@ h1 { font-size: 22px; font-weight: 600; margin: 0; text-wrap: balance; }
   </section>
 
   <section class="scenario" aria-labelledby="s3">
-    <h2 id="s3">3 · More than 4 rows: one column</h2>
-    <p class="why">With many decisions a two-column grid scatters the reading order, so the card falls back to one column.</p>
+    <h2 id="s3">3 · Several of a kind: grouped like PRs, then one column</h2>
+    <p class="why">Two or more decisions of the same kind become one row, like PR reviews: up to 3 listed, "+N more", and the button expands the full list in place with each item's own action. A single item stays a normal row. Here 5 rows remain, so the card uses one column.</p>
     <div class="card">
-      <div class="card-head"><h3 class="stitle">Needs your decision</h3><span class="count">5 decisions, 3 PR reviews</span></div>
-      <ul class="list">
-        <li class="row"><span class="tile" aria-hidden="true"><svg><use href="#i-plan"/></svg></span><div class="body"><p class="title"><span class="ref">#4041</span>Group PR reviews in Needs your decision</p><p class="meta"><span>Plan ready, 1 milestone</span><span class="age">waiting 2h</span></p></div><a class="btn" href="#">Review plan</a></li>
-        <li class="row"><span class="tile" aria-hidden="true"><svg><use href="#i-plan"/></svg></span><div class="body"><p class="title"><span class="ref">#4040</span>Show the pending question inline</p><p class="meta"><span>Plan ready, 1 milestone</span><span class="age">waiting 40m</span></p></div><a class="btn" href="#">Review plan</a></li>
-        <li class="row"><span class="tile" aria-hidden="true"><svg><use href="#i-q"/></svg></span><div class="body"><p class="title"><span class="ref">#3876</span>Per-user Claude / Codex split in admin usage</p><p class="quote">“Should subscription runs count toward the Codex column when their cost is not reported?”</p><p class="meta"><span class="age">Asked 1h ago</span></p></div><a class="btn" href="#">Answer</a></li>
-        <li class="row"><span class="tile" aria-hidden="true"><svg><use href="#i-q"/></svg></span><div class="body"><p class="title"><span class="ref">#3875</span>Command menu for navigation and your decisions</p><p class="meta"><span>Follow-up</span><span class="age">waiting 12m</span></p></div><a class="btn" href="#">Answer</a></li>
-        <li class="row"><span class="tile" aria-hidden="true"><svg><use href="#i-shield"/></svg></span><div class="body"><p class="title"><span class="ref">#3431</span>Delete settled attempt trees at a verified pod epoch</p><p class="meta"><span>Paused, wall-clock budget used</span><span class="age">waiting 5h</span></p></div><a class="btn" href="#">Resume</a></li>
-        <li class="row"><span class="tile pr" aria-hidden="true"><svg><use href="#i-pr"/></svg></span><div class="body"><p class="title">3 pull requests are open for your review</p><ul class="prs"><li><a href="#">vtmocanu/uzi #4013</a> <span class="t">Test fixture race: recovery-pass shutdown-join…</span></li><li><a href="#">vtmocanu/uzi #3988</a> <span class="t">Schedule modal says "Anthropic" for Codex schedules</span></li><li><a href="#">vtmocanu/uzi #3987</a> <span class="t">Mock admin run list shows judge and cross-check runs</span></li></ul><p class="note">PR state as last seen by uzi</p></div><a class="btn" href="#">Review PRs</a></li>
-      </ul>
+      <div class="card-head"><h3 class="stitle">Needs your decision</h3><span class="count">7 decisions, 3 PR reviews</span></div>
+      <ul class="list" id="grouped"></ul>
     </div>
   </section>
 
@@ -180,6 +173,7 @@ h1 { font-size: 22px; font-weight: 600; margin: 0; text-wrap: balance; }
       <li>Kind icons: shield for held work and owner parks, plan, question, PR.</li>
       <li>Plan rows add "Plan ready, N milestones" from data the page already loads (the cross-check outcome needs a server change and is left out).</li>
       <li>Question rows quote the pending question in one line, full text on hover, from a sanitized 280-character server excerpt (#4040).</li>
+      <li>Two or more decisions of the same kind (plans, questions, runs waiting on you) group into one row like PRs; the button expands them in place, each with its own action (try scenario 3).</li>
       <li>Two columns only at 4 rows or fewer on wide screens; one column otherwise and always at phone width.</li>
     </ul>
   </section>
@@ -216,6 +210,59 @@ h1 { font-size: 22px; font-weight: 600; margin: 0; text-wrap: balance; }
   }
   btn.addEventListener("click", () => { open = !open; render(); });
   render();
+})();
+
+(() => {
+  const groups = [
+    { kind: "held", icon: "i-shield", single: { title: "Held work needs 2 decisions", meta: ["Custody"], age: "waiting 3h", action: "Review held work" } },
+    { kind: "plan", icon: "i-plan", noun: ["plan is ready for review", "plans are ready for review"], btn: "Review plans", each: "Review plan", items: [
+      { ref: "#4041", title: "Group PR reviews in Needs your decision", detail: "Plan ready, 1 milestone", age: "waiting 2h" },
+      { ref: "#4040", title: "Show the pending question inline", detail: "Plan ready, 1 milestone", age: "waiting 40m" },
+      { ref: "#3876", title: "Per-user Claude / Codex split in admin usage", detail: "Plan ready, 2 milestones", age: "waiting 25m" },
+      { ref: "#3875", title: "Command menu for navigation and your decisions", detail: "Plan ready, 2 milestones", age: "waiting 10m" } ] },
+    { kind: "question", icon: "i-q", noun: ["run asked you a question", "runs asked you a question"], btn: "Answer questions", each: "Answer", items: [
+      { ref: "#3543", title: "Cross-check base discovery aggregate bound", quote: "Lower the caps to the 2× Chromium floor, or keep them and record the measurement as not obtained?", age: "asked 25m ago" },
+      { ref: "#3877", title: "Promote the new Overview and retire the old one", quote: "Keep the old Overview behind a per-user setting, or delete it?", age: "asked 1h ago" } ] },
+    { kind: "park", icon: "i-shield", noun: ["run waits on you", "runs wait on you"], btn: "Resume runs", each: "Resume", items: [
+      { ref: "#3431", title: "Delete settled attempt trees at a verified pod epoch", detail: "Paused, wall-clock budget used", age: "waiting 5h" } ] },
+    { kind: "pr", icon: "i-pr", pr: true, noun: ["pull request is open for your review", "pull requests are open for your review"], btn: "Review PRs", each: "Review PR", note: "PR state as last seen by uzi", items: [
+      { ref: "vtmocanu/uzi #4013", title: "Test fixture race: recovery-pass shutdown-join…", age: "1h" },
+      { ref: "vtmocanu/uzi #3988", title: "Schedule modal says \"Anthropic\" for Codex schedules", age: "5h" },
+      { ref: "vtmocanu/uzi #3987", title: "Mock admin run list shows judge and cross-check runs", age: "6h" } ] },
+  ];
+  const ul = document.getElementById("grouped");
+  const el = (t, c, txt) => { const e = document.createElement(t); if (c) e.className = c; if (txt != null) e.textContent = txt; return e; };
+  const tile = (g) => { const s = el("span", "tile" + (g.pr ? " pr" : "")); s.setAttribute("aria-hidden", "true"); s.innerHTML = '<svg><use href="#' + g.icon + '"/></svg>'; return s; };
+  groups.forEach((g, gi) => {
+    const li = el("li", "row"); li.append(tile(g));
+    const body = el("div", "body");
+    if (g.single || g.items.length === 1) {
+      const it = g.single || g.items[0];
+      const t = el("p", "title"); if (it.ref && !g.pr) t.append(el("span", "ref", it.ref)); t.append(it.title); body.append(t);
+      if (it.quote) body.append(el("p", "quote", "\u201c" + it.quote + "\u201d"));
+      const m = el("p", "meta"); (it.meta || (it.detail ? [it.detail] : [])).forEach((x) => m.append(el("span", null, x))); m.append(el("span", "age", it.age)); body.append(m);
+      const a = el("a", "btn", it.action || g.each); a.href = "#"; li.append(body, a); ul.append(li); return;
+    }
+    const n = g.items.length;
+    body.append(el("p", "title", n + " " + g.noun[1]));
+    const list = el("ul", "prs"); list.id = "grp-" + gi; body.append(list);
+    if (g.note) body.append(el("p", "note", g.note));
+    const btn = el("button", "btn", g.btn); btn.type = "button"; btn.setAttribute("aria-controls", list.id);
+    let open = false;
+    const render = () => {
+      list.textContent = "";
+      (open ? g.items : g.items.slice(0, 3)).forEach((it) => {
+        const row = el("li");
+        const a = el("a", null, it.ref); a.href = "#"; row.append(a, el("span", "t", " " + (it.quote ? "\u201c" + it.quote + "\u201d" : it.title)));
+        if (open) { row.append(el("span", "t", " · " + it.age + " · ")); const act = el("a", null, it.quote ? "Answer" : g.each); act.href = "#"; row.append(act); }
+        list.append(row);
+      });
+      if (!open && n > 3) list.append(el("li", "t", "+" + (n - 3) + " more"));
+      btn.textContent = open ? "Show fewer" : g.btn; btn.setAttribute("aria-expanded", String(open));
+    };
+    btn.addEventListener("click", () => { open = !open; render(); });
+    render(); li.append(body, btn); ul.append(li);
+  });
 })();
 </script>
 </body>
