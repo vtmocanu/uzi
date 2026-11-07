@@ -759,6 +759,9 @@ walked; there is no cache) and 96 MiB of cumulative relative-path bytes
 (directories included). Exceeding either refuses the capture as
 `diff_too_large`; the caps are at least 2x the largest realistic trees
 measured. See the [dated ADR amendment](../adr/2149-cross-check.md#amendment-2026-11-06--3543-aggregate-base-discovery-bound).
+A base just under both caps, measured with the deadline lifted for validation (not production
+timing), peaked at about 985 MiB in a 1536 MiB / 1 CPU container; see the
+[measurement](../e2e/planning-base-discovery-measure/RESULTS.md).
 Other limits remain: 4 MiB per file, 2 MiB per commit/tree object, depth 64,
 64 KiB per ignore/exclude read, 512 KiB patch/output and 200 non-ignored
 untracked files. The helper has 28 s and the outer capture 30 s; yielding

@@ -624,20 +624,29 @@ estimates, not proofs.
 
 - M1 per-unit coefficients, for base discovery only: about 240 B per entry occurrence with an
   intercept of about 134 MiB, and about 1.1 to 1.9 B per path byte.
-- M3, with the caps in force: the largest measured whole-capture container peak is 575.5 MiB
-  (4 GiB / 2 CPU) and 543.4 MiB on the 1536 MiB / 1 CPU slot. A validation row with the helper
-  clock slowed x4 (caps unchanged) peaks at 767.5 MiB on the 1536 MiB / 1 CPU slot for a base
-  at 99.9 % of the entry cap and 98.8 % of the path-byte cap, measured through discovery and
-  under half of the distinct-blob sizing batch, so a partial lower bound. A completed sizing batch
-  at the entry cap extrapolates to about 1,166 MiB; that is an estimate, not reached on the
-  measuring host. No capture with both caps reached completed there. All of these fit the
-  1536 MiB per-slot budget.
+- M3, with the caps in force: the largest measured whole-capture container peak at production
+  timing is 575.5 MiB (4 GiB / 2 CPU) and 543.4 MiB on the 1536 MiB / 1 CPU slot. A base at
+  99.94 % of the entry cap and 99.98 % of the path-byte cap, with the maximal distinct-blob
+  sizing batch, was measured with the helper's wall-clock bounds lifted for validation
+  (validation, deadline lifted; the harness rewrites the spawned helper source, no production
+  flag): the 1536 MiB / 1 CPU row (unmetered) peaked at 985.1 MiB and the 4 GiB / 2 CPU row
+  (metered) at 1,111.9 MiB, both below 1536 MiB. Discovery and the full sizing batch completed;
+  the capture then ended on the `--no-checkout` fixture's post-discovery `git_pipe_cap`. The
+  rows are not production timing and not an unchanged production-path control. An earlier ×4
+  deadline row (767.5 MiB, partial) and a sizing-batch extrapolation (about 1,166 MiB) are
+  superseded context. Both over-cap fixtures refuse on their own cap at both configurations.
 - Clean controls (this repository, a 50k-file tree) capture. One 50k-file 4 GiB / 2 CPU row hit
   the post-discovery deadline under host load and passed on rerun, disclosed in RESULTS.md.
 - On the measuring host, discovery speed usually reaches the 28 s deadline before the entry cap
   on near-cap trees. The caps bound discovery's per-entry memory regardless of host speed.
 
 **Residuals.** Compose enforces memory per worker, not per run. The measurements are single-run.
+The Compose sizing formula (`docker-compose.yml`: `mem_limit = (WORKER_MAX_CONCURRENT_RUNS +
+WORKER_CHAT_SESSIONS) x per-slot budget + headroom`) does not count cross-check lane slots
+(`WORKER_CROSS_CHECK_SLOTS`, default 1), so a checker capture can run beside run and chat slots in
+the same worker container, sharing one cgroup. The 985.1 and 1,111.9 MiB figures are for a
+capture alone; they are not additive-safe against a full set of other slots. The lifted rows do
+not show that a base this size finishes inside the production 28 s deadline.
 The soft-deadline overrun is out of scope. The negative-timer misclassification (#3993) was
 fixed separately (#3996), before the M3 measurements.
 

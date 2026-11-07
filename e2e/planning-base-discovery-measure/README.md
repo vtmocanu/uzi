@@ -9,7 +9,7 @@ resolutions in #3543. No Task target, gate or CI job runs it.
 `run.sh` drives `agent/test/planning-base-discovery.measure.ts` inside the worker image. The image
 is `MEASURE_IMAGE`, by default the locally built `uzi-agent-home-split:base`. Build an equivalent
 with `docker build -f agent/templates/base/Dockerfile -t <tag> .`. The harness never edits the
-helper: it calls the production `GitCache.capturePlanningDiff` path with the production envelope
+helper (except in the validation-only deadline lift, below): it calls the production `GitCache.capturePlanningDiff` path with the production envelope
 of `Runner.captureCheckedPlanningDiff` (`agent/src/runner.ts`):
 
 - a 60 s scope timer and a combined abort signal;
@@ -218,6 +218,114 @@ DEADLINE_SCALE=4 OUT=/abs/out FIXTURES="distinct-60x19998n75" ./e2e/planning-bas
 `__validation-dl<N>` (with `LIMITS_TAG`: `__validation-<tag>-dl<N>`). It cannot be combined with
 `SMOKE_INJECT`.
 
+### Deadline lift (validation only: the wall-clock bounds are lifted)
+
+`DEADLINE_LIFT=1` (the only accepted value) lets a base just under both production caps run its
+whole capture, sizing batch included, on a host too slow for the 28 s deadline. It is
+harness-only: no production flag or hook exists and `agent/src` is untouched. The harness
+rewrites the helper source text it hands to its spawner
+(`agent/test/planning-deadline-lift.ts`) and nothing else:
+
+- the helper deadline `Date.now() + 28000` becomes 1,800,000 ms;
+- the per-git-command timer ceiling `Math.min(5000, ...)` becomes 1,800,000 ms. It is lifted too
+  because the helper's deadline clamps it, and an earlier ×4 row stopped on that timer at under
+  half the sizing batch;
+- the outer 30 s capture timeout becomes 1,830 s, the harness scope timer 1,860 s and `run.sh`'s
+  per-job wait 1,900 s.
+
+The rewrite fails closed: each marker must occur exactly once, the source must carry the
+`base_discovery_entry_cap` token, and undoing the two replacements must reproduce the input byte
+for byte; otherwise the job errors. Every cap and memory bound keeps its production value.
+
+- **Labels:** `__validation-lift`; the record carries `validation: true` and a `deadlineLift`
+  object with the four lifted values. Name these rows "validation, deadline lifted, unmetered"
+  (`control`) or "validation, deadline lifted, metered" (`full`); they are never an unchanged
+  production-path control, and they measure memory and charges at the caps, not production timing.
+- **Allowed modes:** `full` and `control` only. `cancel` is refused.
+- **Exclusions:** refused with `DEADLINE_SCALE`, `SMOKE_INJECT`, `LIMITS_JSON` and `LIMITS_TAG`
+  (exit 2), and in a measure job with `injectDeadlineAfterSizing`.
+
+```sh
+DEADLINE_LIFT=1 OUT=/abs/out FIXTURES="distinct-1170x1024n76" MEM_CONFIGS="1536m:1:control 4g:2:full" ./e2e/planning-base-discovery-measure/run.sh
+```
+
+`control` rows carry no preamble, so they have no helper-side timing. A parent-side phase
+observer fills that in (next section).
+
+### Phase observer and phase evidence (lift rows)
+
+The 10 ms sampler of a lift row reads `/proc` for the helper and its descendants. It records, in
+ms from the job start, in `phases` (null when never seen):
+
+- `sizingSeenMs` / `sizingGoneMs`: the sizing `git cat-file --batch-check` was running / had ended;
+- `postSizingSpawnSeenMs`: a later git spawn other than `cat-file`;
+- `indexOpenSeenMs`: the clone index was opened (best-effort; a short open can be missed);
+- `sizingPid`.
+
+`phaseEvidence` is `completed` when the capture completed. It is `post_sizing_observed` when the
+capture was refused after the sizing batch was seen and gone, a later spawn or index open was seen
+at or after that time, and every time is no later than the outcome. Anything else is null: the
+row proves nothing about the post-sizing window. On a `full` row the metering preamble can only
+contradict the observer (`PHASE_OBSERVER_MISMATCH`, a failure flag); a phase the observer missed
+is never a mismatch. The helper itself is not instrumented by the observer.
+
+### Row verification (`verify` job)
+
+`verify` re-reads each row's `<label>.json` and `<label>.term.json` under the results directory,
+writes `verify.json` there and exits non-zero unless every row is valid. It needs no docker and
+the harness does not require the opt-in variable for it, so it runs on the host:
+
+```sh
+cd agent && UZI_PLANNING_DISCOVERY_MEASURE=1 node --import tsx test/planning-base-discovery.measure.ts job <jobfile>
+```
+
+with a job file of
+
+```json
+{"kind":"verify","out":"<results dir>","rows":[{"label":"...","expect":"completed|phase-evidence|<token>"}]}
+```
+
+A row is valid only with container exit code 0, no OOM, no harness kill, matching labels, no
+failures, an outcome matching `expect` and, on a lift row, the exact lifted values.
+`expect` is `completed`, `phase-evidence` (a recorded `phaseEvidence` consistent with the outcome)
+or a refusal token such as `base_discovery_entry_cap` (which also needs a derived charge). Cite a
+lift row only after it verifies.
+
+## Disk preflight and readability gate
+
+**Disk preflight.** Before any work, before each fixture generation and before each container
+creation, the host filesystems of `/data` and of `$OUT` and the Docker store must each have at
+least `MIN_FREE_GIB` GiB free. The Docker store is read with a zero-write probe container
+`pbd-dfprobe-<pid>` (created once; `df -Pk /` of the image). A store below its floor, or one that
+cannot be read, prints `BLOCKED: disk preflight (<what>): <store> has <n> KiB free, need >= <floor>`
+and exits 3 without creating anything further.
+
+- `MIN_FREE_GIB`: integer >= 5 (default 5); lower or non-numeric exits 2.
+- `MIN_FREE_GIB_DOCKER`: floor for the Docker store only (default `MIN_FREE_GIB`); an integer not
+  below `MIN_FREE_GIB`, else exit 2. It can only raise that one floor.
+
+**Preserving readability gate.** A container is removed (`docker rm -f -v`) only after every
+result it produced is confirmed readable: the label's result `.json`, its term record and a
+non-empty log must each exist and be non-empty, and the JSON files must parse. There is no
+exception: a missing result is unreadable whatever the term record says. Otherwise the container
+is not removed: it is stopped (`docker kill`, `docker wait`; never `rm`, never `-v`), its id, name
+and the failing files are appended to `$OUT/logs/PRESERVED.txt`, `BLOCKED: unreadable results
+preserved in container <id>` is printed and the script exits 4. The exit trap applies the same
+check to a container still standing.
+
+An OOM-killed, non-zero-exit or harness-killed job normally has no readable result, so it also
+preserves its container and stops the invocation. That is intended. The caller recovers the
+results from the preserved container, then removes it by its exact name (from `PRESERVED.txt`);
+never by pattern.
+
+**Gate self-test.** `GATE_SELFTEST=1` proves the gate and nothing else: it creates the first
+`MEM_CONFIGS` container, runs the warm-up and one no-op under the label `selftest__gate`,
+truncates that result file to empty and runs the gate. The gate must preserve the container, and
+the script then prints `GATE_SELFTEST passed: ...` and exits 6, distinct from a real block (exit 4)
+and from a failed self-test (exit 5: the gate accepted the empty file). The caller removes the
+container by the printed name and id. It cannot be combined with any other mode variable, and no
+fixture is exported or generated.
+
 ## Modes and metrics
 
 - **`full`** prepends a metering preamble to the helper's `-e` program, using the technique of
@@ -278,6 +386,11 @@ report `no`.
   envelope did not send, with no OOM evidence and no cancel.
 - `harness_error` for other failures without a result: the harness process itself, or a failed
   `docker wait` (`wait_failed_rc_N`, after which `run.sh` stops the container).
+
+A job whose result, term record or log is missing, empty or unparseable (these classes, an OOM
+kill and a harness kill included) fails the readability gate: the container is preserved and the
+whole invocation stops with exit 4 (see "Disk preflight and readability gate"). The caller recovers
+the results, removes the container by its exact name and reruns the remaining configurations.
 
 For killed runs, values from the last persisted snapshot (every 100 ms) are shown as `≥` lower
 bounds. Unavailable values are `n/a`.
