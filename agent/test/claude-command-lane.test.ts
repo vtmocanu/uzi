@@ -1064,6 +1064,45 @@ test("the server description states the lane's limits and the transport timeout 
   assert.equal(server.name, "uzi_cmd");
 });
 
+// Agents sometimes send `timeout` as a decimal string; the server converts it instead of refusing
+// the call, while every other value still fails the same integer check, and the schema the model
+// sees stays an integer.
+test("the server accepts a decimal-string timeout and still refuses every other non-integer", { timeout: 10000 }, async () => {
+  const h = harness();
+  h.script.current = (root) => { root.stdout.write("partial-output\n"); };
+  const handlers = (buildGuardedCommandServer(h.lane) as unknown as {
+    instance: { server: { _requestHandlers: Map<string, (request: unknown, extra: unknown) => Promise<unknown>> } };
+  }).instance.server._requestHandlers;
+  const callTool = async (args: Record<string, unknown>) => {
+    const id = `toolu_${String(++seq)}`;
+    assert.deepEqual(await h.lane.hook(hookInput(GUARDED_COMMAND_TOOL, String(args.command), id), id, hookOpts()), {});
+    const extra = { _meta: { [META]: id }, signal: new AbortController().signal, requestId: id,
+      sendNotification: async () => {}, sendRequest: async () => {} };
+    return await handlers.get("tools/call")!({ method: "tools/call", params: { name: "bash", arguments: args } }, extra) as
+      { isError?: boolean; content: { type: string; text?: string }[] };
+  };
+
+  for (const timeout of ["100", " 100 "]) {
+    const r = await callTool({ command: "sleep 100", timeout });
+    assert.match(text(r), /Command timed out after 100 ms; it and all its descendants were stopped\./, JSON.stringify(timeout));
+  }
+  assert.equal(h.specs.length, 2);
+
+  for (const timeout of ["5e3", "abc", "", "-1", "1.5", "0x10", "0", "3600001", "9".repeat(400), 1.5, null]) {
+    const r = await callTool({ command: "echo hi", timeout });
+    assert.equal(r.isError, true, JSON.stringify(timeout));
+    assert.match(text(r), /Input validation error/, JSON.stringify(timeout));
+  }
+  assert.equal(h.specs.length, 2, "a refused timeout never launches a command");
+
+  const listed = await handlers.get("tools/list")!({ method: "tools/list", params: {} }, {}) as
+    { tools: { name: string; inputSchema: { properties: Record<string, unknown>; required?: string[] } }[] };
+  const bash = listed.tools.find((t) => t.name === "bash");
+  assert.ok(bash, "bash stays listed");
+  assert.deepEqual(bash.inputSchema.properties.timeout, { type: "integer", minimum: 1, maximum: MAX_COMMAND_TIMEOUT_MS });
+  assert.deepEqual(bash.inputSchema.required, ["command"]);
+});
+
 // Issue #3722: the guarded bash tool must declare no annotations. The CLI derives an MCP tool's
 // isConcurrencySafe() from readOnlyHint, so guarded calls run one at a time; readOnlyHint: true
 // would also tell the CLI a shell cannot write (write coordination, plan mode, permissions) and
