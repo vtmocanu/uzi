@@ -284,7 +284,7 @@ describe("OverviewNext issue work line", () => {
     expect(document.activeElement).toBe(at("review"));
     await userEvent.keyboard("{Enter}");
     expect(at("review").getAttribute("aria-pressed")).toBe("true");
-    expect(card.querySelectorAll('[aria-pressed="true"]')).toHaveLength(1);
+    expect(card.querySelectorAll('[data-stage][aria-pressed="true"]')).toHaveLength(1);
     expect(yours()).toBe(1);
     expect(screen.getByRole("link", { name: /All runs/ }).previousElementSibling?.textContent).toBe("Plan review");
     await userEvent.keyboard(" ");
@@ -304,7 +304,7 @@ describe("OverviewNext issue work line", () => {
     expect(document.activeElement).toBe(bay);
     await userEvent.keyboard("{Enter}");
     expect(bay.getAttribute("aria-pressed")).toBe("true");
-    expect(card.querySelectorAll('[aria-pressed="true"]')).toHaveLength(1);
+    expect(card.querySelectorAll('[data-stage][aria-pressed="true"]')).toHaveLength(1);
     expect(yours()).toBeGreaterThan(0);
     expect(yours()).toBeLessThan(all);
     expect(screen.getByRole("link", { name: /All runs/ }).previousElementSibling?.textContent).toBe("Parked");

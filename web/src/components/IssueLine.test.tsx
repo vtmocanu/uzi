@@ -3,18 +3,19 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { IssueLine } from "./IssueLine";
-import { issueLineModel, type IssueStage } from "../lib/issueLine";
+import { issueLineModel, type IssueStage, type IssueWorkScope } from "../lib/issueLine";
 import { maskEmail } from "../lib/demoMask";
 import { aRun } from "../pages/overviewFixtures";
 
 afterEach(cleanup);
 
 type Run = ReturnType<typeof aRun>;
+type ScopeToggle = { value: IssueWorkScope; onChange: (s: IssueWorkScope) => void; allDisabled: boolean };
 
 function mount(
   ownRuns: Run[],
   otherRuns: Run[] = [],
-  props: { selected?: IssueStage | null; onSelect?: (s: IssueStage | null) => void; demo?: boolean; factory?: boolean } = {},
+  props: { selected?: IssueStage | null; onSelect?: (s: IssueStage | null) => void; demo?: boolean; scope?: IssueWorkScope; scopeToggle?: ScopeToggle } = {},
 ) {
   const onSelect = props.onSelect ?? vi.fn();
   const view = render(
@@ -23,7 +24,8 @@ function mount(
       selected={props.selected ?? null}
       onSelect={onSelect}
       demo={props.demo ?? false}
-      factory={props.factory ?? false}
+      scope={props.scope ?? "you"}
+      scopeToggle={props.scopeToggle}
     />,
   );
   return { ...view, onSelect };
@@ -46,7 +48,6 @@ describe("IssueLine", () => {
       "pr",
     ]);
     expect(within(region).getAllByRole("button").map((b) => b.getAttribute("data-stage"))).toEqual([
-      null,
       "queued",
       "planning",
       "review",
@@ -56,7 +57,7 @@ describe("IssueLine", () => {
       "parked",
       "other",
     ]);
-    expect(within(region).getByRole("button", { name: "Show all" })).toBeTruthy();
+    expect(within(region).queryByRole("button", { name: "Show all" })).toBeNull();
   });
 
   it("shows each station's count, its caption and one badge per run", () => {
@@ -91,7 +92,7 @@ describe("IssueLine", () => {
 
   it("strips a bidi override from the owner shown in another user's badge tooltip", () => {
     const other = theirs(aRun({ id: "x", status: "queued", issue_iid: 2 }), "\u202Eevil@x.example");
-    mount([], [other], { factory: true });
+    mount([], [other], { scope: "all" });
     const title = within(station(/^Queued/)).getByText("#2").getAttribute("title");
     expect(title).toBe("evil@x.example");
     expect(title).not.toContain("\u202E");
@@ -100,12 +101,12 @@ describe("IssueLine", () => {
   it("names the owner in the tooltip of another user's badge only, masked in demo mode", () => {
     const own = aRun({ id: "mine", status: "queued", issue_iid: 1 });
     const other = theirs(aRun({ id: "x", status: "queued", issue_iid: 2 }), "mira.kovacs@uzi.local");
-    mount([own], [other], { factory: true });
+    mount([own], [other], { scope: "all" });
     const queued = station(/^Queued/);
     expect(within(queued).getByText("#1").getAttribute("title")).toBeNull();
     expect(within(queued).getByText("#2").getAttribute("title")).toBe("mira.kovacs@uzi.local");
     cleanup();
-    mount([own], [other], { factory: true, demo: true });
+    mount([own], [other], { scope: "all", demo: true });
     const masked = maskEmail("mira.kovacs@uzi.local", true);
     expect(masked).not.toContain("@");
     expect(within(station(/^Queued/)).getByText("#2").getAttribute("title")).toBe(masked);
@@ -180,7 +181,10 @@ describe("IssueLine", () => {
   it("is pressed only on the selected stage, and toggles through onSelect", () => {
     const { onSelect, rerender } = mount([aRun({ id: "g", status: "awaiting_approval" })]);
     const pressed = () =>
-      screen.getAllByRole("button").filter((b) => b.getAttribute("aria-pressed") === "true").map((b) => b.getAttribute("data-stage"));
+      screen
+        .getAllByRole("button")
+        .filter((b) => b.hasAttribute("data-stage") && b.getAttribute("aria-pressed") === "true")
+        .map((b) => b.getAttribute("data-stage"));
     expect(pressed()).toEqual([]);
     for (const b of screen.getAllByRole("button")) {
       if (b.getAttribute("data-stage")) expect(b.getAttribute("aria-pressed")).toBe("false");
@@ -194,7 +198,7 @@ describe("IssueLine", () => {
         selected="review"
         onSelect={onSelect}
         demo={false}
-        factory={false}
+        scope="you"
       />,
     );
     expect(pressed()).toEqual(["review"]);
@@ -208,10 +212,53 @@ describe("IssueLine", () => {
     expect(onSelect).toHaveBeenLastCalledWith("asking");
   });
 
-  it("returns to all runs with Show all", () => {
+  it("clears the selection by pressing the pressed stage again, and has no Show all button", () => {
     const { onSelect } = mount([aRun()], [], { selected: "building" });
-    fireEvent.click(screen.getByRole("button", { name: "Show all" }));
+    expect(station(/^Building/).getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(station(/^Building/));
     expect(onSelect).toHaveBeenCalledWith(null);
+    expect(screen.queryByRole("button", { name: "Show all" })).toBeNull();
+  });
+
+  describe("scope toggle", () => {
+    it("renders only when scopeToggle is given", () => {
+      mount([aRun()]);
+      expect(screen.queryByRole("group", { name: "Issue work scope" })).toBeNull();
+      cleanup();
+      mount([aRun()], [], { scopeToggle: { value: "you", onChange: vi.fn(), allDisabled: false } });
+      const group = screen.getByRole("group", { name: "Issue work scope" });
+      expect(within(group).getAllByRole("button").map((b) => b.textContent)).toEqual(["You", "All users"]);
+      expect(within(group).getByRole("button", { name: "You" }).getAttribute("aria-pressed")).toBe("true");
+      expect(within(group).getByRole("button", { name: "All users" }).getAttribute("aria-pressed")).toBe("false");
+    });
+
+    it("disables All users when allDisabled, and leaves it enabled otherwise", () => {
+      mount([aRun()], [], { scopeToggle: { value: "you", onChange: vi.fn(), allDisabled: true } });
+      expect((screen.getByRole("button", { name: "All users" }) as HTMLButtonElement).disabled).toBe(true);
+      expect((screen.getByRole("button", { name: "You" }) as HTMLButtonElement).disabled).toBe(false);
+      cleanup();
+      mount([aRun()], [], { scopeToggle: { value: "you", onChange: vi.fn(), allDisabled: false } });
+      expect((screen.getByRole("button", { name: "All users" }) as HTMLButtonElement).disabled).toBe(false);
+    });
+
+    it("calls onChange with the clicked option", () => {
+      const onChange = vi.fn();
+      mount([aRun()], [], { scopeToggle: { value: "you", onChange, allDisabled: false } });
+      fireEvent.click(screen.getByRole("button", { name: "All users" }));
+      expect(onChange).toHaveBeenLastCalledWith("all");
+      fireEvent.click(screen.getByRole("button", { name: "You" }));
+      expect(onChange).toHaveBeenLastCalledWith("you");
+    });
+
+    it("puts the toggle last in the header, after the title and the note", () => {
+      mount([aRun()], [], { scopeToggle: { value: "you", onChange: vi.fn(), allDisabled: false } });
+      const header = screen.getByRole("heading", { name: "Issue work" }).parentElement as HTMLElement;
+      const children = Array.from(header.children);
+      expect(children[0].tagName).toBe("H2");
+      expect(children[1].textContent).toContain("on the line");
+      expect(children[2].getAttribute("aria-label")).toBe("Issue work scope");
+      expect(children).toHaveLength(3);
+    });
   });
 
   it("describes the PR station as a count of PRs that is not active, never merged, with no action", () => {
@@ -231,12 +278,12 @@ describe("IssueLine", () => {
     expect(station(/^PR open/).textContent).not.toContain("1PRs");
   });
 
-  it("writes the header note, adding all users for the admin's factory scope", () => {
+  it("writes the header note, adding all users for the all scope only", () => {
     const runs = [aRun({ id: "a", status: "queued" }), aRun({ id: "b", kind: "ci_fix" })];
     mount(runs);
     expect(screen.getByText("1 run on the line, 1 other")).toBeTruthy();
     cleanup();
-    mount(runs, [theirs(aRun({ id: "x", status: "queued" }))], { factory: true });
+    mount(runs, [theirs(aRun({ id: "x", status: "queued" }))], { scope: "all" });
     expect(screen.getByText("2 runs on the line, 1 other, all users")).toBeTruthy();
   });
 
@@ -258,7 +305,7 @@ describe("IssueLine", () => {
 
   it("never implies the viewer can act on another user's question or plan", () => {
     mount([], [theirs(aRun({ id: "x", status: "awaiting_input" })), theirs(aRun({ id: "y", status: "awaiting_approval" }))], {
-      factory: true,
+      scope: "all",
     });
     expect(screen.getByRole("button", { name: /Questions/ }).textContent).toContain("Waiting on owners");
     expect(screen.queryByRole("button", { name: /Asking you/ })).toBeNull();

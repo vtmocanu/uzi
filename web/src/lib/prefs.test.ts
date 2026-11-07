@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { prefs, selectedForge, summaryCollapse } from "./prefs";
+import { overviewScope, prefs, selectedForge, summaryCollapse } from "./prefs";
 
 // This jsdom build does not expose window.localStorage (Node warns "localStorage
 // is not available because --localstorage-file was not provided"), so back it with
@@ -152,5 +152,42 @@ describe("selectedForge (issue #578)", () => {
     window.localStorage.setItem("uzi.selectedForge", "{not json");
     expect(() => selectedForge.get()).not.toThrow();
     expect(selectedForge.get()).toBeNull();
+  });
+});
+
+// #4052: the remembered You / All users scope of the Overview preview's cards.
+describe("overviewScope", () => {
+  const KEY = "uzi.overviewIssueWorkScope";
+
+  it("defaults to you when nothing is stored", () => {
+    expect(overviewScope.get(KEY)).toBe("you");
+  });
+
+  it("round-trips all and you per key", () => {
+    overviewScope.set(KEY, "all");
+    expect(overviewScope.get(KEY)).toBe("all");
+    expect(overviewScope.get("uzi.overviewUsageScope")).toBe("you");
+    overviewScope.set(KEY, "you");
+    expect(overviewScope.get(KEY)).toBe("you");
+  });
+
+  it("reads an unknown stored value as you", () => {
+    window.localStorage.setItem(KEY, JSON.stringify("factory"));
+    expect(overviewScope.get(KEY)).toBe("you");
+    window.localStorage.setItem(KEY, JSON.stringify(42));
+    expect(overviewScope.get(KEY)).toBe("you");
+    window.localStorage.setItem(KEY, "{not json");
+    expect(overviewScope.get(KEY)).toBe("you");
+  });
+
+  it("reads as you when storage cannot be read, and does not throw when it cannot be written", () => {
+    vi.spyOn(window.localStorage, "getItem").mockImplementation(() => {
+      throw new Error("access denied");
+    });
+    expect(overviewScope.get(KEY)).toBe("you");
+    vi.spyOn(window.localStorage, "setItem").mockImplementation(() => {
+      throw new Error("quota exceeded");
+    });
+    expect(() => overviewScope.set(KEY, "all")).not.toThrow();
   });
 });
