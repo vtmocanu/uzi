@@ -70,8 +70,19 @@ A frozen default decides the implementation agents when nothing else does:
 - an explicit choice at the plan gate (web, Slack, or `--agent-source`) still
   wins, and the run page then shows it as "changed at approval".
 
+To choose for a single run instead, pass `--agent-source own|repo` to
+`uzi run create` (or `"agent_selection": {"source": "own"|"repo"}` in the API
+create request). The choice overrides your default for that run only, is frozen
+the same way, and shows as "(this run)". It decides the implementation agents
+exactly as a default does; a create-time choice of **repo agents** does not
+change planning. Exclusions are not part of a create-time choice: exclude
+agents at the plan gate, or seed a plan with `--plan-file` and `--exclude-agents`.
+Board, chat, schedule and autopilot runs carry no create-time choice, so they
+follow your default.
+
 Planning is not yet affected: the plan turn still uses your own templates. A
-run that carries a default is claimed only by a worker new enough to honour it;
+run that carries a default or a create-time choice is claimed only by a worker
+new enough to honour it;
 while every online worker is older, the run stays queued and its health reason
 names the missing worker version (`agent_source_request_v1`).
 

@@ -324,8 +324,9 @@ var (
 	// ErrInvalidSelection covers both PRD #37 payloads: a worker-reported repo
 	// agent roster that breaks a cap, and a browser-submitted agent selection that
 	// names an agent the run does not have. Both map to 400.
-	ErrInvalidSelection        = errors.New("invalid agent selection")
-	ErrRepoAgentSourceConflict = errors.New("the run already records a different repo-agent source revision")
+	ErrInvalidSelection         = errors.New("invalid agent selection")
+	ErrCreateExclusionsNeedPlan = errors.New("exclusions require a plan file or an approval")
+	ErrRepoAgentSourceConflict  = errors.New("the run already records a different repo-agent source revision")
 	// ErrCapabilityUnmet is the sentinel for the PRD #84 M4 4c approval gate: a plan being
 	// approved requires capabilities its OWNING worker cannot satisfy, so the approve is
 	// blocked → 409. It is carried by a *CapabilityUnmetError, which names the unmet set for
@@ -7684,7 +7685,7 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 // PRD #1429 M2: explicit is the manual request's optional harness (D2), nil ⇒ implicit D11;
 // rawOverride is the raw #1247 credential override validated against the resolved harness inside
 // the create transaction (D5). The old pre-transaction createRunEffectiveHarness guesser is gone.
-func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *SeededPlan, explicit *Harness, rawOverride *RawCredentialOverride) (store.Run, error) {
+func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *SeededPlan, requested *AgentSelection, explicit *Harness, rawOverride *RawCredentialOverride) (store.Run, error) {
 	// waitOnLimit nil ⇒ inherit the owner's default. It is a *bool rather than a bool
 	// because "the caller said false" and "the caller said nothing" are different
 	// requests, and collapsing them would make every API client that omits the field
@@ -7705,7 +7706,7 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// credOverride nil ⇒ inherit the worker binding (PRD #1247 M1); the create-time
 	// user choice is wired in M2. Threaded through the signature now so M2 does not
 	// reopen this seam (the freeze).
-	return s.createRun(ctx, userID, repoID, issueIID, "manual", description, false, waitOnLimit, mrReworkEnabled, nil, false, force, seed, nil /*credOverride: manual uses rawOverride*/, explicit, rawOverride)
+	return s.createRun(ctx, userID, repoID, issueIID, "manual", description, false, waitOnLimit, mrReworkEnabled, nil, false, force, seed, requested, nil /*credOverride: manual uses rawOverride*/, explicit, rawOverride)
 }
 
 // CreateScheduledRun queues a NON-auto-approve scheduled issue run (PRD #241: a timer
@@ -7716,7 +7717,7 @@ func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UU
 	// false force (issue #856): a scheduled run never bypasses the open-MR dedup.
 	// credOverride: the schedule's stored (pre-validated) override, written as-is. explicit: the
 	// schedule's pin or fresh issue-label selection (nil ⇒ implicit D11 at fire time).
-	return s.createRun(ctx, userID, repoID, issueIID, "schedule", description, false, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false, seed, credOverride, explicit, nil /*rawOverride*/)
+	return s.createRun(ctx, userID, repoID, issueIID, "schedule", description, false, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false, seed, nil, credOverride, explicit, nil /*rawOverride*/)
 }
 
 // CreateAutopilotRun queues a run the poller's autopilot detection started on a
@@ -7745,7 +7746,7 @@ func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UU
 	// choice, so it inherits the worker binding exactly as before.
 	// explicit is the fresh issue-label selection; nil keeps implicit D11 resolution.
 	// No raw credential override is supplied by the poller.
-	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true, nil, nil, nil, false, false, nil, nil /*credOverride*/, explicit, nil /*rawOverride*/)
+	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true, nil, nil, nil, false, false, nil, nil, nil /*credOverride*/, explicit, nil /*rawOverride*/)
 }
 
 // CreateScheduledAutopilotRun queues an auto-approve scheduled issue run. It carries
@@ -7755,7 +7756,7 @@ func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoI
 	// false force (issue #856): a scheduled autopilot run never bypasses the open-MR dedup.
 	// credOverride: the schedule's stored override; explicit: the schedule's pinned harness
 	// or fresh issue-label selection (nil ⇒ implicit D11 at fire time).
-	return s.createRun(context.WithValue(ctx, scheduleApprovalKey{}, true), userID, repoID, issueIID, "autopilot", description, true /*autoApprove*/, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false /*force*/, nil /*seed*/, credOverride, explicit, nil /*rawOverride*/)
+	return s.createRun(context.WithValue(ctx, scheduleApprovalKey{}, true), userID, repoID, issueIID, "autopilot", description, true /*autoApprove*/, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false /*force*/, nil /*seed*/, nil, credOverride, explicit, nil /*rawOverride*/)
 }
 
 // SeededPlan carries a create-time externally-authored plan and its optional agent
@@ -7792,7 +7793,7 @@ type SeededPlan struct {
 // stored choice), written to the columns as-is; rawOverride is an UNVALIDATED request override
 // (manual/chat-start) validated against the D11-resolved harness INSIDE the create transaction
 // (D5). At most one of credOverride/rawOverride is non-nil.
-func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, triggerSource string, description string, autoApprove bool, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, force bool, seed *SeededPlan, credOverride *CredentialOverride, explicit *Harness, rawOverride *RawCredentialOverride) (store.Run, error) {
+func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, triggerSource string, description string, autoApprove bool, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, force bool, seed *SeededPlan, requested *AgentSelection, credOverride *CredentialOverride, explicit *Harness, rawOverride *RawCredentialOverride) (store.Run, error) {
 	// The description cap is enforced HERE, once, so the manual (handler → 422) and
 	// autopilot (poller → too-large comment) paths cannot drift (PRD #19 M5). Checked
 	// first: it is pure input validation, independent of the repo/issue gates below.
@@ -7870,6 +7871,19 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			plannedBaseCommit = pgconv.TextOrNull(pc)
 		}
 		requireBaseMatch = seed.RequireBase
+	}
+	agentSourceRequested := agentSource
+	if requested != nil {
+		if seed != nil {
+			return store.Run{}, fmt.Errorf("%w: a seeded plan carries its own selection", ErrInvalidSelection)
+		}
+		if len(requested.Exclusions) > 0 {
+			return store.Run{}, ErrCreateExclusionsNeedPlan
+		}
+		if err := validateSelectionShape(*requested); err != nil {
+			return store.Run{}, err
+		}
+		agentSourceRequested = pgconv.TextOrNull(requested.Source)
 	}
 	row, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID})
 	if err != nil {
@@ -8150,7 +8164,7 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			PlanSource:           planSource,
 			AgentSource:          agentSource,
 			AgentExclusions:      agentExclusions,
-			AgentSourceRequested: agentSource,
+			AgentSourceRequested: agentSourceRequested,
 			PlannedBaseCommit:    plannedBaseCommit,
 			RequireBaseMatch:     requireBaseMatch,
 			// PRD #300: the per-schedule model override, frozen onto the run at fire time.

@@ -389,9 +389,10 @@ Tracked as GitLab issue vtmocanu/uzi#37; PRD at `prds/done/37-run-agent-selectio
 PRD at `prds/3914-repo-agent-source-default.md`.
 
 - Each user may set, per repo connection, a default agent source for their own runs: `own`, `repo`, or unset (today's behaviour). Only the owner may choose `repo`; an admin may clear it or set `own`. A teammate's runs on the same project follow only their own setting. (AI-synced 2026-11-04)
-- The default is frozen onto each issue run at creation (manual, CLI, chat, schedules, autopilot), recorded as requested source plus basis (`repo_default`, or `explicit` for a seeded plan's source); a later settings change never alters an existing run, and other run kinds are unaffected. (AI-synced 2026-11-04)
+- The default is frozen onto each issue run at creation (manual, CLI, chat, schedules, autopilot), recorded as requested source plus basis (`repo_default`, or `explicit` for a seeded plan's source or a create-time choice); a later settings change never alters an existing run, and other run kinds are unaffected. (AI-synced 2026-11-04)
 - An approval with no agent choice implements with the requested source and records it; `repo` without a detected roster falls back to the user's templates with the existing note. Autopilot implements with the requested source. An explicit gate choice still wins and shows as "changed at approval". (AI-synced 2026-11-04)
-- A run carrying a request is claimable only by a worker reporting `agent_source_request_v1`, with no owner or admin bypass; while none is online the queued run's health reason names it. Unset runs behave exactly as before. Planning with the requested source, web/Slack pre-selection and a per-run create choice are later milestones. (AI-synced 2026-11-04)
+- A run carrying a request is claimable only by a worker reporting `agent_source_request_v1`, with no owner or admin bypass; while none is online the queued run's health reason names it. Unset runs behave exactly as before. Planning with the requested source and web/Slack pre-selection are later milestones. (AI-synced 2026-11-04)
+- `uzi run create --agent-source` and the API's `agent_selection` work without a plan file and override the default for that run (basis `explicit`); exclusions without a plan file are refused. Chat, schedules and autopilot pass no create-time choice and keep the default. (AI-synced 2026-11-07)
 
 ## Feature #41 — Plan revision at the approval gate
 
