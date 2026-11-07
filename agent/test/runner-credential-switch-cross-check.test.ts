@@ -14,6 +14,7 @@ import { RecoveryCoordinator, type RecoveryArchiveClient } from "../src/recovery
 import { CredentialSwitchSignal } from "../src/steering.js";
 import { createHash } from "node:crypto";
 import type { Executor, RunContext } from "../src/executor.js";
+import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { SdkExecutor, TransientRecoveryError, type SdkExecutorOptions, type SdkQueryFn } from "../src/sdk-executor.js";
 import { MessageBatcher } from "../src/batcher.js";
 import { CandidateTransportInvariantError, RunRunner } from "../src/runner.js";
@@ -2146,7 +2147,7 @@ interface GateFlightView { runId: string; worktreePath?: string; barePath?: stri
 interface Custody { preserveRecoveryClone: boolean; gates: number; switchReports: string[];
   reservations: { installed: number; released: number }; tree?: TreeView; indexLock?: boolean }
 interface GateRec { entered: boolean; startedAt: number; settledAt: number; error: unknown; watchdogFired: boolean;
-  before?: Custody; after?: Custody; flight?: GateFlightView; log: string[] }
+  before?: Custody; after?: Custody; flight?: GateFlightView }
 
 const runGitSync = (cwd: string, ...args: string[]): string =>
   execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" } });
@@ -2162,15 +2163,15 @@ async function gateCheckpointRun(o: {
   hang: (flight: GateFlightView, x: DriveControl, rec: GateRec) => Promise<{ release: () => void; entered: () => boolean }>;
   dirty?: boolean; forward?: Partial<SdkExecutorOptions>; tailMs?: number; deadlineMs?: number;
   runnerOpts?: Record<string, unknown>;
-  /** Runs right after the step settles (before its custody is read). */
-  onSettled?: () => void;
+  /** Abort the lifecycle (owner) signal handed to the step this many ms after it starts, with this reason. */
+  ownerAbort?: { afterMs: number; reason: Error };
 }) {
   const deadlineMs = o.deadlineMs ?? GATE_MS;
   client.protocolFeatures = [...client.protocolFeatures, "milestone_reconciliation_v1"];
   const seam = RunRunner.prototype as unknown as { prepareGateCheckpoint: (...args: unknown[]) => Promise<unknown> };
   const prepare = seam.prepareGateCheckpoint;
   restorers.push(() => { seam.prepareGateCheckpoint = prepare; });
-  const rec: GateRec = { entered: false, startedAt: 0, settledAt: 0, error: undefined, watchdogFired: false, log: [] };
+  const rec: GateRec = { entered: false, startedAt: 0, settledAt: 0, error: undefined, watchdogFired: false };
   let release = (): void => {};
   let hangEntered = (): boolean => false;
   let ctl!: DriveControl;
@@ -2203,15 +2204,21 @@ async function gateCheckpointRun(o: {
     // fails the settle-time assertion rather than the node test timeout.
     const watchdog = setTimeout(() => { rec.watchdogFired = true; release(); }, deadlineMs + (o.tailMs ?? GATE_TAIL_MS) + 2000);
     rec.startedAt = Date.now();
+    let ownerTimer: NodeJS.Timeout | undefined;
+    if (o.ownerAbort) {
+      const owner = new AbortController();
+      args[2] = AbortSignal.any([args[2] as AbortSignal, owner.signal]);
+      ownerTimer = setTimeout(() => owner.abort(o.ownerAbort!.reason), o.ownerAbort.afterMs);
+    }
     try { return await prepare.apply(this, args); }
     catch (error) { rec.error = error; throw error; }
     finally {
       rec.settledAt = Date.now();
-        clearTimeout(watchdog);
+      clearTimeout(watchdog);
+      clearTimeout(ownerTimer);
       rec.after = custody(flight, { run_id: claimId });
       if (treeBefore && flight.worktreePath) {
         const after = viewTree(flight.worktreePath, trackedPath, untrackedPath);
-        rec.log.push(JSON.stringify({ sameTracked: after.tracked === treeBefore.tracked, sameUntracked: after.untracked === treeBefore.untracked }));
         rec.after!.tree = after;
       }
       // The run's own teardown needs what the injected hang held (the bare lock, the sink gate).
@@ -2250,7 +2257,7 @@ function assertCustodyIntact(r: Awaited<ReturnType<typeof gateCheckpointRun>>): 
 }
 
 describe("issue #3980: the Claude gate checkpoint is bounded", () => {
-  it("(1) a hung clone-side git child (a planted clean filter whose descendant holds the pipes) cannot hold the step past its deadline", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+  it("(1) a hung clone-side git child (a planted clean filter) is killed and joined by the deadline; the filter's descendants may outlive the step and are reaped by later quiesce", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
     const marker = path.join(homeDir, "filter-entered");
     const orphans = (): number[] => (fs.existsSync(marker) ? fs.readFileSync(marker, "utf8").split("\n").map(Number).filter((n) => n > 0) : []);
     const killOrphans = (): void => { for (const pid of orphans()) { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } } };
@@ -2281,7 +2288,7 @@ describe("issue #3980: the Claude gate checkpoint is bounded", () => {
     } finally { killOrphans(); }
   });
 
-  it("(2) a bare lock held by another operation cannot hold the capture's lock wait past its deadline", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+  it("(2) a hung bare-lock wait ends at the deadline and fails closed", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
     let releaseLock = (): void => {};
     let queued = 0;
     const r = await gateCheckpointRun({
@@ -2377,6 +2384,47 @@ describe("issue #3980: the Claude gate checkpoint is bounded", () => {
     assert.equal(inStep[0]!.docker, "deadline exhausted", "and no Docker request was admitted");
   });
 
+  it("(7) an owner abort during a hung sink-gate wait surfaces the owner's reason, not TransientRecoveryError", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const reason = new Error("owner cancelled the run (3980 test)");
+    let releaseGate = (): void => {};
+    let queued = 0;
+    const r = await gateCheckpointRun({
+      dirty: true, ownerAbort: { afterMs: 600, reason },
+      hang: async (flight) => {
+        const gate = flight.sinkGate as unknown as { run: (fn: () => Promise<unknown>, stop?: unknown) => Promise<unknown> };
+        const original = gate.run.bind(gate);
+        let held = false;
+        gate.run = ((fn: () => Promise<unknown>, stop?: unknown) => { if (held) queued++; return original(fn, stop); }) as typeof gate.run;
+        void original(() => new Promise<void>((resolve) => { held = true; releaseGate = resolve; })).catch(() => undefined);
+        assert.ok(await until(() => held), "the test-owned holder took the sink gate");
+        return { release: () => releaseGate(), entered: () => queued > 0 };
+      },
+    });
+    assert.equal(r.entered, true, "the injected hang was entered");
+    assert.equal(r.rec.watchdogFired, false, "the step settled by itself");
+    assert.ok(!(r.rec.error instanceof TransientRecoveryError), `not remapped to TransientRecoveryError: ${String(r.rec.error)}`);
+    assert.equal(r.rec.error, reason, "the owner's own reason is what the step rejects with");
+    assert.equal(r.rec.after!.preserveRecoveryClone, true, "the recovery clone stays preserved");
+    assert.equal(r.rec.after!.gates, 0, "no gate presented");
+  });
+
+  it("(8) a non-deadline failure from the capture inside the bound is not remapped to TransientRecoveryError", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const refusal = new TrustedExecutionRefusal("codex harness is closed");
+    const proto = RunRunner.prototype as unknown as { captureRecoveryRestorePoint: (...args: unknown[]) => Promise<unknown> };
+    const original = proto.captureRecoveryRestorePoint;
+    let calls = 0;
+    restorers.push(() => { proto.captureRecoveryRestorePoint = original; });
+    const r = await gateCheckpointRun({
+      dirty: true,
+      hang: async () => {
+        proto.captureRecoveryRestorePoint = async function () { calls++; throw refusal; };
+        return { release: () => undefined, entered: () => calls > 0 };
+      },
+    });
+    assert.equal(r.entered, true, "the stubbed capture ran inside the bound");
+    assert.equal(r.rec.error, refusal, "the refusal passes through unchanged");
+  });
+
   /** A tick process group that never goes, observed through the runner's tick-spawn hooks (no real signal). */
   function survivorHooks() {
     const seen = { alive: true, probes: 0, signals: [] as { sig: string; at: number }[] };
@@ -2389,7 +2437,7 @@ describe("issue #3980: the Claude gate checkpoint is bounded", () => {
   it("(6a) tick survivors with the sink admitted just before the deadline: the wait is capped, no SIGKILL is sent after expiry and no second wait starts", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
     const { seen, opts } = survivorHooks();
     const r = await gateCheckpointRun({
-      dirty: true, runnerOpts: opts, onSettled: () => { seen.alive = false; },
+      dirty: true, runnerOpts: opts,
       hang: async (flight) => {
         flight.survivingTickGroups.push({ pgid: 424242, identity: "command", killConfirmed: false });
         const gate = flight.sinkGate as unknown as { run: (fn: () => Promise<unknown>) => Promise<unknown> };
@@ -2412,7 +2460,7 @@ describe("issue #3980: the Claude gate checkpoint is bounded", () => {
   it("(6b) expiry during the second survivor wait: one SIGKILL before the deadline, none after, and the step still settles at the deadline", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
     const { seen, opts } = survivorHooks();
     const r = await gateCheckpointRun({
-      dirty: true, deadlineMs: 2500, tailMs: 700, runnerOpts: opts, onSettled: () => { seen.alive = false; },
+      dirty: true, deadlineMs: 2500, tailMs: 700, runnerOpts: opts,
       hang: async (flight) => {
         flight.survivingTickGroups.push({ pgid: 424243, identity: "command", killConfirmed: false });
         return { release: () => { seen.alive = false; }, entered: () => seen.probes > 0 };
