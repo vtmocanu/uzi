@@ -468,7 +468,10 @@ comparison, not a bill. See [run cost](./run-cost.md#metered-subscription-and-un
 After a human revision,
 **Earlier-plan evidence** does not certify the current plan. Approve, request
 changes or reject the plan shown at the current gate; the original check stays
-as history, without an automatic new checker round.
+as history, without an automatic new checker round. If the lead asks you a
+question while working your requested changes, your answer returns the run to
+the plan gate; it never approves the plan, and the revised plan is shown at
+the next gate.
 
 [CLI](./cli.md#plan-cross-check-evidence) shows the reason and findings;
 [Slack](./slack.md#using-it) shows the reason without findings.

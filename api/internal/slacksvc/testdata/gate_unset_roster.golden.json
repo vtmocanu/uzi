@@ -1,0 +1,112 @@
+[
+  {
+    "type": "section",
+    "text": {
+      "type": "mrkdwn",
+      "text": "*Plan ready for review.* This repo defines its own agents in `.claude/agents/`. Approve with the repo's agents, or with your own uzi templates.\nRepo agents: `coder`, `tester`"
+    }
+  },
+  {
+    "type": "actions",
+    "block_id": "slack_gate",
+    "elements": [
+      {
+        "type": "button",
+        "text": {
+          "type": "plain_text",
+          "text": "Approve · repo agents (2)",
+          "emoji": false
+        },
+        "action_id": "slack_gate_approve_repo",
+        "value": "11111111-2222-4333-8444-555555555555",
+        "confirm": {
+          "title": {
+            "type": "plain_text",
+            "text": "Use the repo's agents?",
+            "emoji": false
+          },
+          "text": {
+            "type": "plain_text",
+            "text": "The run will implement the plan using the 2 agent(s) the repository defines in .claude/agents/ — not your uzi templates. They are authored by the repo, so their review is not uzi's own.",
+            "emoji": false
+          },
+          "confirm": {
+            "type": "plain_text",
+            "text": "Approve",
+            "emoji": false
+          },
+          "deny": {
+            "type": "plain_text",
+            "text": "Cancel",
+            "emoji": false
+          }
+        },
+        "style": "primary"
+      },
+      {
+        "type": "button",
+        "text": {
+          "type": "plain_text",
+          "text": "Approve · my templates",
+          "emoji": false
+        },
+        "action_id": "slack_gate_approve_own",
+        "value": "11111111-2222-4333-8444-555555555555",
+        "confirm": {
+          "title": {
+            "type": "plain_text",
+            "text": "Use your agent templates?",
+            "emoji": false
+          },
+          "text": {
+            "type": "plain_text",
+            "text": "The run will implement the plan using your uzi agent templates.",
+            "emoji": false
+          },
+          "confirm": {
+            "type": "plain_text",
+            "text": "Approve",
+            "emoji": false
+          },
+          "deny": {
+            "type": "plain_text",
+            "text": "Cancel",
+            "emoji": false
+          }
+        }
+      },
+      {
+        "type": "button",
+        "text": {
+          "type": "plain_text",
+          "text": "Request changes",
+          "emoji": false
+        },
+        "action_id": "slack_gate_request_changes",
+        "value": "11111111-2222-4333-8444-555555555555"
+      },
+      {
+        "type": "button",
+        "text": {
+          "type": "plain_text",
+          "text": "Reject",
+          "emoji": false
+        },
+        "action_id": "slack_gate_reject",
+        "value": "11111111-2222-4333-8444-555555555555",
+        "style": "danger"
+      },
+      {
+        "type": "button",
+        "text": {
+          "type": "plain_text",
+          "text": "Open in uzi",
+          "emoji": false
+        },
+        "action_id": "slack_gate_open",
+        "url": "https://uzi.example/runs/11111111-2222-4333-8444-555555555555",
+        "value": "11111111-2222-4333-8444-555555555555"
+      }
+    ]
+  }
+]

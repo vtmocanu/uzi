@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { RunRunner } from "../src/runner.js";
-import { RequestError } from "../src/client.js";
+import { RequestError, type WorkerClient } from "../src/client.js";
 import { RecoveryChargeInterruptedError } from "../src/recovery-owner.js";
-import { CredentialSwitchSignal } from "../src/steering.js";
+import { CredentialSwitchSignal, SteeringChannel } from "../src/steering.js";
 import { ownerFixture } from "./recovery-owner-fixture.js";
 import { nullLogger } from "./helpers.js";
 
@@ -20,6 +20,7 @@ async function fixture(options: {
   const reports: unknown[] = [];
   const flight: any = { barePath: f.bare, runId: f.source.runId, claimGeneration: 2,
     executor: {}, runLog: nullLogger(), parked: false,
+    steering: new SteeringChannel({} as WorkerClient, f.source.runId, 1, nullLogger(), new AbortController()),
     reportState: async (body: unknown) => {
       reports.push(body);
       if (options.ack === "unknown") return {};
