@@ -31,6 +31,22 @@ function autoReasonText(decision: HarnessDecision): string | null {
   }
 }
 
+/**
+ * Reasons recorded before any usage reading: every reading would show as unknown/no, so
+ * the component says what happened instead. The stored reason does not say which
+ * exclusion applied, so the text stays generic (docs/cli.md lists the causes).
+ */
+function unmeasuredText(reason: string): string | null {
+  switch (reason) {
+    case "off":
+      return "Overflow is off in your settings, so no usage was compared";
+    case "excluded":
+      return "Overflow was not considered for this run, so no usage was compared";
+    default:
+      return null;
+  }
+}
+
 /** Weekly reset as a UTC date-time, "unknown" when absent (null, or rows created before resets were recorded). */
 function resetText(value: string | null | undefined): string {
   if (!value) return "unknown";
@@ -47,7 +63,8 @@ export function RunHarnessDecision({ run }: { run: Pick<Run, "harness_decision">
   }
   const score = (value: number | null) => value === null ? "unknown" : `${value}%`;
   const auto = decision.reason.startsWith("auto_");
-  const explanation = autoReasonText(decision);
+  const unmeasured = unmeasuredText(decision.reason);
+  const explanation = autoReasonText(decision) ?? unmeasured;
   const preferredLabel = auto ? "Claude" : "Preferred";
   const otherLabel = auto ? "Codex" : "Other harness";
   return (
@@ -56,9 +73,11 @@ export function RunHarnessDecision({ run }: { run: Pick<Run, "harness_decision">
         ? <p>Harness decision at creation time: automatic (Default · automatic), chosen {stripDisplayCell(decision.chosen)}. Reason: {stripDisplayCell(decision.reason)}.</p>
         : <p>Harness decision at creation time: preferred {stripDisplayCell(decision.preferred)}, chosen {stripDisplayCell(decision.chosen)}. Reason: {stripDisplayCell(decision.reason)}.</p>}
       {explanation && <p>{explanation}.</p>}
-      <p>{preferredLabel} comparison score: {score(decision.preferred_score)}; measured headroom: {score(decision.preferred_measured)}; capacity hold: {decision.preferred_held ? "yes" : "no"}; weekly reset: {resetText(decision.preferred_weekly_reset_at)}.</p>
-      <p>{otherLabel} comparison score: {score(decision.other_score)}; measured headroom: {score(decision.other_measured)}; capacity hold: {decision.other_held ? "yes" : "no"}; weekly reset: {resetText(decision.other_weekly_reset_at)}.</p>
-      <p>Stored when this run was created, not live usage. A capacity hold can reduce a comparison score without a measured limit reading.</p>
+      {!unmeasured && <>
+        <p>{preferredLabel} comparison score: {score(decision.preferred_score)}; measured headroom: {score(decision.preferred_measured)}; capacity hold: {decision.preferred_held ? "yes" : "no"}; weekly reset: {resetText(decision.preferred_weekly_reset_at)}.</p>
+        <p>{otherLabel} comparison score: {score(decision.other_score)}; measured headroom: {score(decision.other_measured)}; capacity hold: {decision.other_held ? "yes" : "no"}; weekly reset: {resetText(decision.other_weekly_reset_at)}.</p>
+        <p>Stored when this run was created, not live usage. A capacity hold can reduce a comparison score without a measured limit reading.</p>
+      </>}
     </section>
   );
 }

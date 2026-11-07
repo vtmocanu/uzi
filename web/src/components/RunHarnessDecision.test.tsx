@@ -37,6 +37,21 @@ describe("stored harness decision", () => {
     expect(screen.getByText(/Preferred comparison score/).textContent).toContain("unknown; measured headroom: unknown; capacity hold: no");
     expect(screen.getByText(/Other harness comparison score/).textContent).toContain("unknown; measured headroom: unknown; capacity hold: no");
   });
+  it.each([
+    ["off", "Overflow is off in your settings, so no usage was compared."],
+    ["excluded", "Overflow was not considered for this run, so no usage was compared."],
+  ])("collapses a %s decision, which never read usage, to what happened", (reason, text) => {
+    render(<RunHarnessDecision run={{ harness_decision: {
+      ...decision, chosen: "claude", reason, preferred_score: null, other_score: null,
+      preferred_measured: null, other_measured: null, preferred_held: false,
+    } }} />);
+    const region = screen.getByRole("region", { name: "Harness decision at creation time" }).textContent ?? "";
+    expect(region).toContain(`preferred claude, chosen claude. Reason: ${reason}.`);
+    expect(region).toContain(text);
+    for (const gone of ["comparison score", "measured headroom", "capacity hold", "weekly reset", "Stored when this run was created"]) {
+      expect(region).not.toContain(gone);
+    }
+  });
   it("shows a hold without claiming a measured reading", () => {
     render(<RunHarnessDecision run={{ harness_decision: { ...decision, preferred_measured: null } }} />);
     expect(screen.getByText(/Preferred comparison score/).textContent).toContain("0%; measured headroom: unknown; capacity hold: yes");
