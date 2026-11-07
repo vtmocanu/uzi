@@ -919,9 +919,11 @@ describe("forge-park reconcile — a permanent probe refusal (#3856)", () => {
         assert.equal(client.ownershipCalls, 1, "a permanent refusal is not retried");
         assert.equal(clone.calls(), 1, "ensureClone ran once; the reconcile never re-cloned");
         assert.deepEqual(parkedTexts(claim.run_id), [], "no park is announced on an unknown outcome");
-        assert.ok(!reportedStatuses(client).includes("failed"), "an unknown outcome is never a failure");
-        assert.equal(parkReports(client).length, 1, "exactly the one attempted park report");
-        assert.deepEqual(client.releaseCalls, [], "custody is not settled");
+        assert.deepEqual(reportedStatuses(client), ["running", "recovery_wait"],
+          "exactly the one attempted park report: no failed or other terminal report");
+        // Custody on a guarded claim is pinned in runner-unadopted-guarded-settle.test.ts; this claim
+        // is unguarded, so releaseCalls only shows no older-api release was attempted.
+        assert.deepEqual(client.releaseCalls, [], "no release call");
         assert.equal(fs.existsSync(runHome()), true, "the possibly parked, resumable session is kept");
       } finally {
         fs.rmSync(homeRoot, { recursive: true, force: true });
@@ -991,16 +993,45 @@ describe("forge-park reconcile — a permanent resend refusal (#3856)", () => {
 
         assert.equal(client.ownershipCalls, 1, "a permanent resend refusal does not re-probe");
         assert.equal(clone.calls(), 1);
-        assert.equal(parkReports(client).length, 2, "the attempted report and the one resend");
+        assert.deepEqual(reportedStatuses(client), ["running", "recovery_wait", "recovery_wait"],
+          "the attempted report and the one resend: no failed or other terminal report");
         assert.deepEqual(parkedTexts(claim.run_id), []);
-        assert.ok(!reportedStatuses(client).includes("failed"));
-        assert.deepEqual(client.releaseCalls, []);
+        assert.deepEqual(client.releaseCalls, [], "no release call (unguarded claim)");
         assert.equal(fs.existsSync(runHome()), true);
       } finally {
         fs.rmSync(homeRoot, { recursive: true, force: true });
       }
     });
   }
+
+  it("control: resend 404 re-probes, and the probe's 404 stays a stale-owner stop that cleans HOME", async () => {
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-parkrefuse-resend404-"));
+    try {
+      const client = new ForgeParkClient(["recovery_park_cause"], {
+        onParkReport: (_b, n) => {
+          if (n === 1) throw new Error("socket hang up");
+          if (n === 2) throw refuse(404, "/state");
+          return { applied: true, status: "recovery_wait" };
+        },
+        onOwnership: (n) => {
+          if (n === 1) return { status: "running" };
+          if (n === 2) throw refuse(404);
+          return { status: "recovery_wait" };
+        },
+      });
+      const { factory, runHome } = parkFactory(homeRoot, { sessionId: SESSION_ID });
+      const clone = stubClone();
+      const claim = gitlabClaim(3856_25, { claim_generation: 9, session_id: SESSION_ID });
+      await makeRunner(client, factory).execute(claim);
+      assert.equal(client.ownershipCalls, 2, "a resend 404 re-probes; the probe 404 then stops");
+      assert.equal(clone.calls(), 1);
+      assert.deepEqual(reportedStatuses(client), ["running", "recovery_wait", "recovery_wait"]);
+      assert.deepEqual(parkedTexts(claim.run_id), []);
+      assert.equal(fs.existsSync(runHome()), false, "a stale owner cleans HOME even with a transcript");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("forge-park reconcile — unchanged controls (#3856)", () => {
