@@ -547,7 +547,8 @@ entry, threaded explicitly through each seam: the sink-gate queue wait and tick-
 lock wait (a recovery operation: timeout capped, child killed and joined), the attributed-process
 reap joins (capped; expiry is an unconfirmed reap, nothing aborted) and reap passes (not admitted
 after the deadline), the quiescence helper setup, run and cleanup, procfs scans, and Docker
-teardown (skipped after the deadline). Expiry fails closed exactly like a failed checkpoint: a
+teardown (skipped after the deadline). Expiry fails closed like a failed checkpoint (for the error
+shapes listed below; the Limits name the exceptions): a
 `TransientRecoveryError`, the source clone kept as the authoritative copy, and the candidate
 reservation neither released nor cancelled by the step. An owner Cancel or shutdown keeps its own
 reason. The measured post-deadline tail is about 1 s without the runner/agent uid split (git
@@ -564,12 +565,18 @@ process-group probe and kill (`processGroupAlive`, `signalProcessGroup` and `kil
 `spawnSync`, under the uid split) carry no timer of their own, as elsewhere in the worker. Codex deadline mechanics are unchanged (their
 capture scope already bounds the step near 60 s). An owner Cancel or shutdown reason now survives
 when the capture lane returns incomplete, instead of being remapped to the transient failure
-(issue #3980); a recovery deadline or timeout that git wraps is mapped to the transient failure.
+(issue #3980); a recovery deadline or timeout that git wraps is mapped to the transient failure,
+as is an abortable wait the step's own deadline stops, such as the attempt-path source-authority
+lock retry (an `AbortError` whose `cause` is, by identity, that deadline signal's reason).
 This does not cover every capture-lane abort: an owner Cancel or shutdown landing during a git
-child is still rethrown as a git error (the `git … failed` wrapper, or a permit-held git abort for
-a child the abort stops) rather than its own reason (this predates the change), and a git child whose
+child, or during that authority-lock retry, is still rethrown as a git error (the `git … failed`
+wrapper, or a permit-held git abort for a child the abort stops) or as the raw `AbortError`
+rather than its own reason (this predates the change), and a git child whose
 own timeout kills it a few ms before the deadline can still fail as a plain git error rather than
-the transient failure. Rationale: an explicit deadline per seam rather
+the transient failure. Likewise the authority-lock wait is clamped to the same deadline, so its own
+expiry can surface as `AuthorityLockBusy` just before the step's deadline fires, and contention that
+outlasts the shorter boundary wait earlier in the step is a genuine `AuthorityLockBusy`; both stay
+generic errors (mapping them would need an elapsed-time check). Rationale: an explicit deadline per seam rather
 than an ambient `MaintenanceBudget` (the #3181 precedent is for a no-custody settlement, and an
 ambient budget would be adopted as a cancellation budget) or `reportBudget` (which forces a
 single reap pass).

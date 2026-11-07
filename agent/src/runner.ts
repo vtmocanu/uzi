@@ -1430,6 +1430,13 @@ function isGateDeadlineFailure(error: unknown): boolean {
     (error.cause.message === RETAINED_DEADLINE_TEXT || error.cause.name === "TimeoutError") &&
     error.message.endsWith(` failed: ${error.cause.message}`);
 }
+/** issue #3980: an abortable wait (e.g. the authority-lock flock retry's timer) that the gate's OWN
+ *  deadline stopped rejects with an AbortError whose `cause` is that deadline signal's reason, by
+ *  identity. An AbortError caused by anything else (an owner or shutdown abort, an unrelated timeout)
+ *  does not match. */
+function isOwnDeadlineAbort(error: unknown, deadline: AbortSignal): boolean {
+  return deadline.aborted && isAbortLikeError(error) && (error as Error).cause === deadline.reason;
+}
 const RETAINED_RETRYABLE_ERRNO = new Set(["EAGAIN", "EMFILE", "ENFILE", "ENOMEM"]);
 const RETAINED_CORRUPTION_MARKERS = [
   "invalid retained recovery clone journal", "invalid recovery", "unsafe recovery", "does not belong", "ledger",
@@ -23447,7 +23454,8 @@ export class RunRunner {
           m.id === candidate[i]!.id && m.title === candidate[i]!.title))) return undefined;
     const budgetMs = this.gateCheckpointDeadlineMs;
     const deadlineAt = Date.now() + budgetMs;
-    const signal = AbortSignal.any([ownerSignal, this.shutdownSignal.signal, AbortSignal.timeout(budgetMs)]);
+    const deadlineSignal = AbortSignal.timeout(budgetMs);
+    const signal = AbortSignal.any([ownerSignal, this.shutdownSignal.signal, deadlineSignal]);
     const priorPreserve = flight.preserveRecoveryClone;
     flight.preserveRecoveryClone = true;
     // issue #3980: a Claude executor (no callback-held capture lane) has no other enforcement of this
@@ -23481,7 +23489,7 @@ export class RunRunner {
       // Only the deadline family becomes the transient failure, and only while neither the owner nor
       // the worker asked to stop: those aborts keep their own reason. Residue, unsafe-cleanup, trusted
       // execution and run-residue refusals keep their own types. The reservation is never touched here.
-      if (isGateDeadlineFailure(error)) {
+      if (isGateDeadlineFailure(error) || isOwnDeadlineAbort(error, deadlineSignal)) {
         if (ownerSignal.aborted) throw ownerSignal.reason;
         if (this.shutdownSignal.signal.aborted) throw this.shutdownSignal.signal.reason;
         throw new TransientRecoveryError("plan gate checkpoint could not be published and proven recoverable");
