@@ -731,6 +731,39 @@ describe("repo-agent roster pinned to the default-branch revision (issue #3913)"
     }
   });
 
+  it("PRD #3914 M3: a run cancelled while its plan source report stalls starts no provider turn", async () => {
+    client.protocolFeatures = [REPO_AGENT_SOURCE_FEATURE, PLAN_AGENT_SOURCE_FEATURE];
+    let release!: () => void;
+    api.planAgentSourceAckHold = new Promise<void>((resolve) => { release = resolve; });
+    try {
+      const h = HARNESSES[0]!;
+      commitOnOrigin({ [h.file]: h.content("Original review body") }, "ship the reviewer");
+      let providerTurns = 0;
+      const claim = claimFor(h, { issue_iid: 88, issue_title: "stalled plan source", claim_generation: 1, requested_agent_source: "repo" });
+      const execution = newRunner({
+        run: async (ctx) => { await ctx.reportPlanAgentSource!("repo"); providerTurns++; return { branch: ctx.branch }; },
+      }).execute(claim);
+      const stalledAt = Date.now();
+      while (!api.stateWire.some((s) => s.runId === claim.run_id && s.body.plan_agent_source !== undefined)) {
+        assert.ok(Date.now() - stalledAt < 10_000, "the plan source report never reached the api");
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
+      const settled = await Promise.race([
+        execution.then(() => "settled" as const),
+        new Promise<"stalled">((r) => setTimeout(() => r("stalled"), 5_000)),
+      ]);
+      release();
+      await execution;
+      assert.equal(settled, "settled", "execute() waited out the stalled report after the cancel");
+      assert.equal(providerTurns, 0, "no provider turn started after the cancel");
+    } finally {
+      release();
+      api.planAgentSourceAckHold = undefined;
+      client.protocolFeatures = [];
+    }
+  });
+
   it("without the api feature a failed roster report does not stop the run", async () => {
     const h = HARNESSES[0]!;
     commitOnOrigin({ [h.file]: h.content("Original review body") }, "ship the reviewer");
