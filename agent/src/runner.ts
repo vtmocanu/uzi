@@ -3649,7 +3649,7 @@ export class RunRunner {
     this.gateCheckpointDeadlineMs =
       typeof opts.gateCheckpointDeadlineMs === "number" && Number.isFinite(opts.gateCheckpointDeadlineMs) &&
       opts.gateCheckpointDeadlineMs > 0 ? opts.gateCheckpointDeadlineMs : 60_000;
-    const predecessorBudget =(value: number | undefined, fallback: number): number =>
+    const predecessorBudget = (value: number | undefined, fallback: number): number =>
       typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
     this.predecessorFinalBudget = {
       successorPrepAllowanceMs: predecessorBudget(opts.predecessorFinalBudgetMs?.successorPrepAllowanceMs, PREDECESSOR_SUCCESSOR_PREP_ALLOWANCE_MS),
