@@ -164,12 +164,14 @@ implementation PR; this analysis does not certify those checks.
 
 An admin can issue a one-time reset link for another active, non-seed user
 (PRD #3989; flow in [Auth design](./auth-design.md#accepted-limitations)). It
-restores account access, not vault contents.
+never restores vault contents; a `password` link also restores password access,
+and a `vault_only` link grants no access.
 
 - **What redemption deletes.** Every `user_secrets` row of every kind and every
   Codex account (live and recovery slots), whatever their sealing marker, plus
   the vault wrapper and all browser re-unlock grants. The account becomes
-  protected with no wrapper; the next password login creates a fresh vault. The
+  protected with no wrapper; after a `password` link the next password login
+  creates a fresh vault (after a `vault_only` link, see below). The
   reset never rewraps or reuses a cached key, even while the vault is unlocked,
   so it cannot be used to read the user's credentials. Forge connections,
   repos, schedules, run history, settings, CLI tokens and product OAuth grants
@@ -177,9 +179,12 @@ restores account access, not vault contents.
   list is cleared, references to deleted credentials in judge, worker, run and
   schedule settings and in run credential history become empty, and per-credential
   rate-limit and Codex account state is deleted with its credential.
-- **Admin takeover.** An admin can take over any non-seed account, other admins
-  included, by issuing a link and redeeming it themselves with a password they
-  choose. The admin never learns the user's old password and cannot read the
+- **Admin takeover.** An admin can take over any non-seed account that has a
+  password, other admins included, by issuing a `password` link and redeeming it
+  themselves with a password they choose. A `vault_only` link cannot do this: it
+  sets no password and signs no one in, so its holder can delete the user's
+  credentials, vault and sessions without proving identity but cannot take the
+  account over. The admin never learns the user's old password and cannot read the
   deleted credentials, but then controls the account's non-vault data. Issuing
   needs no admin re-authentication. Issue and redeem are logged
   (`reset link issued`, `reset link redeemed`, with user ids and whether the
@@ -212,7 +217,8 @@ restores account access, not vault contents.
   wait in the credential pool (`pool_wait`) until a credential exists.
 - **Uncertain outcome.** If the commit cannot be confirmed the redeem call
   returns `503` with "the reset could not be confirmed; try signing in with the
-  new password, or ask for a new link".
+  new password, or ask for a new link" for a `password` link, or "...try signing
+  in with single sign-on, or ask for a new link" for a `vault_only` link.
 
 ## CLI unlock: authenticated guessing and key custody
 

@@ -707,21 +707,41 @@ func TestResetLinkRedeemOnSSOOnlyInstanceThenVaultEnableLiveDB(t *testing.T) {
 }
 
 func TestResetLinkRedeemUncertainOutcomeIs503LiveDB(t *testing.T) {
-	f := newResetFixture(t)
-	logs := captureSlog(t)
-	target := f.target(t)
-	token := f.mustIssue(t, target)
-	f.h.vault = vault.New(f.h.box, store.New(f.pool), func(context.Context, func(context.Context, vault.Store) error) error {
-		return &vault.CommitError{Err: errors.New("commit acknowledgment lost")}
-	})
-	rec := f.redeem(token, resetNewPassword)
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("redeem = %d, want 503\n%s", rec.Code, rec.Body.String())
+	for _, tc := range []struct {
+		name      string
+		vaultOnly bool
+		password  string
+		want      string
+	}{
+		{"password", false, resetNewPassword, "the reset could not be confirmed; try signing in with the new password, or ask for a new link"},
+		{"vault_only", true, "", "the reset could not be confirmed; try signing in with single sign-on, or ask for a new link"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newResetFixture(t)
+			logs := captureSlog(t)
+			var token string
+			if tc.vaultOnly {
+				token = f.issueDTO(t, f.vaultOnlyTarget(t)).Token
+			} else {
+				token = f.mustIssue(t, f.target(t))
+			}
+			f.h.vault = vault.New(f.h.box, store.New(f.pool), func(context.Context, func(context.Context, vault.Store) error) error {
+				return &vault.CommitError{Err: errors.New("commit acknowledgment lost")}
+			})
+			rec := f.redeem(token, tc.password)
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("redeem = %d, want 503\n%s", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), tc.want) {
+				t.Fatalf("body = %s, want %q", rec.Body.String(), tc.want)
+			}
+			assertUncertainLogs(t, logs.String())
+		})
 	}
-	if !strings.Contains(rec.Body.String(), "the reset could not be confirmed; try signing in with the new password, or ask for a new link") {
-		t.Fatalf("body = %s", rec.Body.String())
-	}
-	out := logs.String()
+}
+
+func assertUncertainLogs(t *testing.T, out string) {
+	t.Helper()
 	if !strings.Contains(out, "reset link redeem outcome uncertain") {
 		t.Fatalf("no uncertain-outcome warning in logs:\n%s", out)
 	}

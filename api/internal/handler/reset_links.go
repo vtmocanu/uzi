@@ -268,7 +268,12 @@ func (h *Handler) RedeemResetLink(w http.ResponseWriter, r *http.Request) {
 		return
 	case errors.Is(err, vault.ErrUncertainOutcome):
 		slog.Warn("reset link redeem outcome uncertain", "user", owner)
-		httpx.Error(w, http.StatusServiceUnavailable, "the reset could not be confirmed; try signing in with the new password, or ask for a new link")
+		msg := "the reset could not be confirmed; try signing in with the new password, or ask for a new link"
+		if state.Kind != resetKindPassword {
+			// A vault_only link sets no password, so there is no new password to try.
+			msg = "the reset could not be confirmed; try signing in with single sign-on, or ask for a new link"
+		}
+		httpx.Error(w, http.StatusServiceUnavailable, msg)
 		return
 	default:
 		slog.Error("reset link redeem failed", "user", owner, "error", err)

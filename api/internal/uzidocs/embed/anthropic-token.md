@@ -612,16 +612,22 @@ to set a new vault passphrase (12–1024 UTF-8 bytes), after which you add your
 credentials again. An account linked to both SSO and a password gets the normal
 password link instead.
 
-On an SSO-only instance (password login disabled) the web app offers no way to
-create the fresh vault: it is created at your first password sign-in once an
-administrator turns password sign-in on, or through `POST /api/vault/enable`
-with the new password from your SSO session. Until then you can sign in through
-SSO but cannot store model credentials. The seed admin cannot be reset with
-a link, and an admin cannot issue one for their own account. An admin can take
-over any other active account except the seed admin, admins included, by
-issuing a link, including for accounts that sign in only through SSO; see the [threat model](./vault-threat-model.md#admin-issued-account-reset).
+A vault-only link does not prove who holds it: whoever has it can delete your
+credentials, Codex logins and vault and end your sessions, but it grants no
+access to the account.
+
+For a `password` link on an SSO-only instance (password login disabled) the web
+app offers no way to create the fresh vault: it is created at your first
+password sign-in once an administrator turns password sign-in on, or through
+`POST /api/vault/enable` with the new password from your SSO session. Until
+then you can sign in through SSO but cannot store model credentials. The seed
+admin cannot be reset with a link, and an admin cannot issue one for their own
+account. An admin can take over any other active account that has a password,
+except the seed admin and admins included, by issuing a password link and
+redeeming it with a password they choose; see the [threat model](./vault-threat-model.md#admin-issued-account-reset).
 If the page reports that the reset could not be confirmed, try signing in with
-the new password, or ask for a new link.
+the new password (password link) or through SSO (vault-only link), or ask for a
+new link.
 
 ### Enrollment and conversion
 

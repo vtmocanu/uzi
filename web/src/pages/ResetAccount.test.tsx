@@ -210,6 +210,8 @@ describe("ResetAccount password form", () => {
     ).toBeTruthy();
     expect(document.body.textContent).not.toMatch(/single sign-on/);
     expect(screen.getByRole("link", { name: "Sign in" })).toBeTruthy();
+    // Password login on: the credentials reminder is shown.
+    expect(document.body.textContent).toMatch(/Add your model credentials again in Settings once you are signed in\./);
   });
 
   it("SSO-only instance: hint and done say sign in with SSO, then enable the vault in Settings", async () => {
@@ -228,6 +230,8 @@ describe("ResetAccount password form", () => {
       "Your account is reset. This instance uses single sign-on only, so the web app cannot create your fresh vault yet; uzi creates it at your first password sign-in, once an administrator turns password sign-in on. Until then you can sign in with single sign-on, but you cannot store new model credentials.",
     );
     expect(doneMsg.textContent).not.toMatch(/Settings/);
+    // Password login off: no credentials reminder, since credentials cannot be stored yet.
+    expect(document.body.textContent).not.toMatch(/Add your model credentials again in Settings/);
     // The done state must not send them to a password sign-in that cannot work.
     expect(document.body.textContent).not.toMatch(/Sign in with your new password/);
     expect(screen.getByRole("link", { name: "Sign in with SSO" })).toBeTruthy();
@@ -303,6 +307,18 @@ describe("ResetAccount password form", () => {
 });
 
 describe("ResetAccount vault_only variant", () => {
+  it("shows the server's kind-specific 503 message as is and keeps the form", async () => {
+    reply("/api/auth/reset/preview", { status: 200, body: { kind: "vault_only", expires_at: EXPIRES } });
+    openAt(`/reset#${TOKEN}`);
+    const button = await screen.findByRole("button", { name: "Reset" });
+    const msg = "the reset could not be confirmed; try signing in with single sign-on, or ask for a new link";
+    reply("/api/auth/reset/redeem", { status: 503, body: { error: msg } });
+    fireEvent.click(ack());
+    fireEvent.click(button);
+    expect(await screen.findByRole("alert")).toHaveProperty("textContent", msg);
+    expect(screen.getByRole("button", { name: "Reset" })).toBeTruthy();
+  });
+
   it("asks for no password and redeems without one", async () => {
     reply("/api/auth/reset/preview", { status: 200, body: { kind: "vault_only", expires_at: EXPIRES } });
     openAt(`/reset#${TOKEN}`);

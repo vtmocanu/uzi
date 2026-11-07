@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -107,6 +108,21 @@ func TestResetLinkVaultOnlyIssuePreviewRedeemLiveDB(t *testing.T) {
 		t.Fatal("rejected redeem consumed the link")
 	}
 
+	// Seed one row of each kind of per-user state the reset must clear: an approved,
+	// unconsumed CLI login request, a Codex provider account and a browser re-unlock slot.
+	verifier := "verifier-" + uuid.NewString()
+	reqApproved, code := cliStart(t, f.router, s256Challenge(verifier), "approved before reset")
+	if rec := cookieReq(t, f.router, http.MethodPost, "/api/auth/cli/approve", oldJWT,
+		fmt.Sprintf(`{"request_id":%q,"user_code":%q}`, reqApproved, code)); rec.Code != http.StatusOK {
+		t.Fatalf("approve = %d\n%s", rec.Code, rec.Body.String())
+	}
+	account := uuid.New()
+	cliMustExec(t, f.pool, `INSERT INTO codex_provider_account (id,user_id,provider_user_id,workspace_account_id,sealed_login,sealed_with)
+		VALUES ($1,$2,$3,$3,$4,'master')`, account, target, account.String(), []byte("fixture"))
+	cliMustExec(t, f.pool, `INSERT INTO vault_browser_slots (id,user_id,browser_id,wrapped_dek,created_at,expires_at,token_version,vault_epoch,generation)
+		SELECT $1,$2,$3,'\x01',now(),now()+interval '1 hour',0,vault_epoch,0 FROM users WHERE id=$2`,
+		uuid.New(), target, uuid.New())
+
 	// No password: 204, sessions ended, vault and secrets wiped, link spent.
 	rec := f.redeem(token, "")
 	if rec.Code != http.StatusNoContent {
@@ -123,6 +139,23 @@ func TestResetLinkVaultOnlyIssuePreviewRedeemLiveDB(t *testing.T) {
 	}
 	if w, s, mode, marker := f.vaultCounts(t, target); w != 0 || s != 0 || mode != store.VaultModeProtected || !marker {
 		t.Fatalf("after redeem wrappers=%d secrets=%d mode=%q marker=%v, want 0, 0, protected, true", w, s, mode, marker)
+	}
+	poll := cliPostJSON(f.router, "/api/auth/cli/poll", fmt.Sprintf(`{"request_id":%q,"verifier":%q}`, reqApproved, verifier))
+	if poll.Code == http.StatusOK {
+		t.Fatalf("poll of a request approved before the reset minted a token: %s", poll.Body.String())
+	}
+	var status string
+	if err := f.pool.QueryRow(context.Background(), `SELECT status FROM cli_auth_requests WHERE id=$1`, reqApproved).Scan(&status); err != nil || status != "denied" {
+		t.Fatalf("approved request status = %q (%v), want denied", status, err)
+	}
+	var accounts, slots int
+	if err := f.pool.QueryRow(context.Background(), `SELECT
+		(SELECT count(*) FROM codex_provider_account WHERE user_id=$1),
+		(SELECT count(*) FROM vault_browser_slots WHERE user_id=$1)`, target).Scan(&accounts, &slots); err != nil {
+		t.Fatal(err)
+	}
+	if accounts != 0 || slots != 0 {
+		t.Fatalf("after redeem codex accounts=%d browser slots=%d, want 0 and 0", accounts, slots)
 	}
 	var redeemed int
 	if err := f.pool.QueryRow(context.Background(),
@@ -166,6 +199,10 @@ func TestResetLinkVaultOnlyThenPassphraseEnrollsVaultLiveDB(t *testing.T) {
 		fmt.Sprintf(`{"passphrase":%q}`, "another-passphrase-123456"))
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("second passphrase = %d, want 409\n%s", rec.Code, rec.Body.String())
+	}
+	// vaultToggleError has several 409 causes; this must be the existing-vault one.
+	if !strings.Contains(rec.Body.String(), "a vault already exists") {
+		t.Fatalf("second passphrase body = %s, want it to say a vault already exists", rec.Body.String())
 	}
 	if w, _, _, _ := f.vaultCounts(t, target); w != 1 {
 		t.Fatalf("second passphrase left %d wrappers, want 1", w)

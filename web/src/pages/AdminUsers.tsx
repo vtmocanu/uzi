@@ -340,7 +340,7 @@ function ResetLinkDialog({ user, label, onClose }: { user: User; label: string; 
                 This account has no password. The user signs in with single sign-on, then sets a new vault passphrase.
               </p>
             )}
-            {targetIsAdmin && <AdminTakeoverWarning />}
+            {targetIsAdmin && <AdminResetWarning kind={issued.kind} />}
           </div>
         ) : (
           <div className="space-y-4 px-5 py-5">
@@ -360,7 +360,7 @@ function ResetLinkDialog({ user, label, onClose }: { user: User; label: string; 
               </li>
               <li>Their queued Codex runs will fail; they must start new ones.</li>
             </ul>
-            {targetIsAdmin && <AdminTakeoverWarning />}
+            {targetIsAdmin && <AdminResetWarning kind={null} />}
           </div>
         )}
 
@@ -385,11 +385,31 @@ function ResetLinkDialog({ user, label, onClose }: { user: User; label: string; 
   );
 }
 
-function AdminTakeoverWarning() {
+// AdminResetWarning words the admin caveat for what is known at that point. Before the link
+// exists its kind is unknown (the row carries no has-password flag), so the pre-issue text
+// holds for both kinds; the issued result knows the kind and states only what is true for it.
+function AdminResetWarning({ kind }: { kind: AccountResetLink["kind"] | null }) {
   return (
     <div role="note" className="rounded-md border border-warn/40 bg-warn/10 p-3 text-sm text-warn">
-      This is an admin account. Whoever holds the link takes over an admin account: share it only with that
-      person, over a trusted channel.
+      {kind === "password" && (
+        <>
+          This is an admin account. Whoever holds the link takes over an admin account: share it only with that
+          person, over a trusted channel.
+        </>
+      )}
+      {kind === "vault_only" && (
+        <>
+          This is an admin account. The link sets no password and gives no access to the account, but whoever holds
+          it can delete the admin&apos;s credentials, vault and sessions: share it only with that person.
+        </>
+      )}
+      {kind === null && (
+        <>
+          This is an admin account. If it has a password, whoever holds the link can set a new one and take the
+          account over. Either way the link deletes the admin&apos;s credentials and vault: share it only with that
+          person, over a trusted channel.
+        </>
+      )}
     </div>
   );
 }

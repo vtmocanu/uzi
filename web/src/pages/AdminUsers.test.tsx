@@ -282,13 +282,31 @@ describe("AdminUsers reset link (PRD #3989)", () => {
     expect(mockApi.createResetLink).not.toHaveBeenCalled();
   });
 
-  it("warns that an admin target's link hands over an admin account", async () => {
+  it("words the pre-issue admin warning to hold for both link kinds", async () => {
     mockApi.listUsers.mockResolvedValue({ users: [aUser({ is_admin: true })] });
     renderPage();
     fireEvent.click(within(await rowOf("mira@uzi.local")).getByRole("button", { name: "Reset link" }));
     const note = within(screen.getByRole("dialog")).getByRole("note");
-    expect(note.textContent).toMatch(/takes over an admin account/);
+    expect(note.textContent).toMatch(/If it has a password, whoever holds the link can set a new one and take the\s+account over/);
+    expect(note.textContent).toMatch(/deletes the admin's credentials and vault/);
     expect(note.textContent).toMatch(/only with that\s+person, over a trusted channel/);
+  });
+
+  it("an issued password link for an admin keeps the takeover warning", async () => {
+    mockApi.listUsers.mockResolvedValue({ users: [aUser({ is_admin: true })] });
+    mockApi.createResetLink.mockResolvedValue({
+      token: "t",
+      expires_at: "2026-11-06T17:00:00Z",
+      kind: "password",
+      target_is_admin: true,
+    });
+    renderPage();
+    fireEvent.click(within(await rowOf("mira@uzi.local")).getByRole("button", { name: "Reset link" }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Create reset link" }));
+    await screen.findByLabelText("Reset link");
+    expect(within(screen.getByRole("dialog")).getByRole("note").textContent).toMatch(
+      /takes over an admin account/,
+    );
   });
 
   it("shows the link once, with its expiry and kind, and drops it on close", async () => {
@@ -343,7 +361,11 @@ describe("AdminUsers reset link (PRD #3989)", () => {
     expect(dialog.textContent).toMatch(/Vault only \(single sign-on account\)/);
     expect(dialog.textContent).toMatch(/signs in with single sign-on, then sets a new vault passphrase/);
     expect(dialog.textContent).not.toMatch(/password and vault|set a password/i);
-    expect(within(dialog).getByRole("note").textContent).toMatch(/takes over an admin account/);
+    // A vault_only link sets no password and grants no sign-in: no takeover claim.
+    const note = within(dialog).getByRole("note").textContent ?? "";
+    expect(note).not.toMatch(/takes over|take the\s+account over/);
+    expect(note).toMatch(/gives no access to the account/);
+    expect(note).toMatch(/delete the admin's credentials, vault and sessions/);
   });
 
   it("surfaces a server refusal inside the dialog", async () => {

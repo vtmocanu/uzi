@@ -30,7 +30,7 @@ Forge connections, repos, schedules, run history, settings, CLI tokens and produ
 Acceptance examples:
 
 1. **Password user.** Admin opens Admin → Users, chooses "Reset link" on user A, copies the link shown once. User A opens it within the hour, reads the warning (what is deleted; that a run pinned to a deleted credential will use the default credential once new ones exist), types and confirms a new password, submits. User A's old browser sessions now return 401; logging in with the new password succeeds and enrolls a new protected vault; Settings shows no Anthropic, OpenAI or Codex credentials. User A's queued issue run, once claimed, shows paused with "credentials were reset"; after user A adds an Anthropic token it returns to queued on its own.
-2. **OIDC-only user.** Same flow; the redemption page asks for no password. User B signs in through SSO, creates a new vault passphrase in Settings (the create-only endpoint now accepts it), and re-adds credentials.
+2. **OIDC-only user.** Same flow; the redemption page asks for no password. User B signs in through SSO, creates a new vault passphrase from the app-wide banner shown after SSO sign-in (the create-only endpoint now accepts it), and re-adds credentials.
 3. **Misuse.** Reusing a link, an expired link, a link superseded by a newer one, a link whose target or issuer has since been deactivated, or whose issuer is no longer an admin, all show one generic "this link is invalid or expired" page and change nothing. An admin cannot issue a link for themselves or for the seed admin.
 
 ## Out of scope
@@ -140,6 +140,7 @@ Acceptance examples:
 - **D14. `vault.Reset` owns the transaction.** Every lifecycle operation takes the in-process mutex before its transaction; a caller-opened transaction would invert that order and could deadlock with `Unlock`.
 - **D15. Issuer authority re-checked at redeem; admin deactivation or demotion supersedes links.** A demoted admin must not keep pre-issued takeover links.
 - **D16. Codex runs are not parked (owner decision 2026-11-06).** The PRD #1147 write-once binding freeze (`FreezeRunCodexBinding`) stays. A Codex run created before the reset whose frozen alias is gone fails terminally with "the bound Codex login is unavailable after your account reset; start a new run". Rejected: relaxing the freeze, and holds that could never be released.
+- **D17. M2: the passphrase is set from the app-wide banner, not Settings; a `vault_only` link grants no access, so takeover warnings are scoped to `password` links.**
 - **Correction 1 (module 3, schema).** `runs.hold_reason` has no CHECK constraint: `00215_completion_hold.sql` adds it as plain text and `00328_provider_park_streak.sql` notes "free text, so no CHECK". The CHECK in `00391_publication_resume.sql` belongs to `run_publication_resume`. So there is no CHECK change; only the promoter index is widened.
 - **Correction 2 (module 3, sentinel).** The Codex "no alias" refusal is `ErrCodexRunNotBound` (`codexauthz.go`), also raised at lock time by `classifyLockedCodexClaim` in `claim_recovery.go`.
 - **Correction 3 (module 2, revocation).** Demotion happens only via `oidcSyncAdmin` -> `SetUserAdmin`, not `PatchUser`. Supersession is attached to the activation and admin writes themselves, as a separate statement after the users update in the same transaction.
