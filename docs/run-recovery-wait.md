@@ -571,6 +571,13 @@ not itself recover publication. A forge outage met later, while the run is
 publishing finished work, is a different park with its own bound; see
 [Forge unreachable while publishing](#forge-unreachable-while-publishing).
 
+If the park report is sent but its reply is lost, uzi asks the server whether
+the run is parked. When that check is permanently refused (anything other
+than not found, a timeout or rate limiting), the worker stops retrying. It
+keeps the possibly parked session, source, records and custody, reports
+nothing, and leaves the run to the server or its owner. A refusal is not
+treated as proof that the run ended.
+
 ## Forge unreachable while publishing
 
 A run whose work is finished can meet the same kind of forge outage at

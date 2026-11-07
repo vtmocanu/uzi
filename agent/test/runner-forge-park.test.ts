@@ -1,10 +1,12 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
-import { WorkerClient } from "../src/client.js";
+import { RequestError, WorkerClient } from "../src/client.js";
+import { Outbox } from "../src/outbox.js";
 import type {
   RecoveryReleaseResponse,
   RunOwnershipResponse,
@@ -18,6 +20,7 @@ import {
   api,
   baseUrl,
   fakeGitlab,
+  fx,
   git,
   gitlabClaim,
   installHarness,
@@ -118,7 +121,7 @@ function parkFactory(
   return { factory, runHome: () => runHome };
 }
 
-function makeRunner(client: WorkerClient, factory: ExecutorFactory): RunRunner {
+function makeRunner(client: WorkerClient, factory: ExecutorFactory, extra: Record<string, unknown> = {}): RunRunner {
   const { gitlab } = fakeGitlab();
   // No join token ⇒ the RecoveryCoordinator is disabled, matching a pre-clone park's "nothing to
   // capture" (fact 4). recoveryRetryMs is tiny so the probe-reconcile loop never stalls a test.
@@ -129,6 +132,7 @@ function makeRunner(client: WorkerClient, factory: ExecutorFactory): RunRunner {
     questionTimeoutMs: 600,
     gitlab,
     recoveryRetryMs: 5,
+    ...extra,
   });
 }
 
@@ -870,6 +874,338 @@ describe("RunRunner — pre-clone forge-unreachable park (PRD #1392 M2)", () => 
     } finally {
       fs.rmSync(homeRootA, { recursive: true, force: true });
       fs.rmSync(homeRootB, { recursive: true, force: true });
+    }
+  });
+});
+
+// Issue #3856 — the forge-park reconcile (reconcileForgeParkByProbe) after a LOST park report. A
+// definitive 4xx other than 404 on the ownership probe, or on a resend exception, used to retry forever.
+// It now stops conservatively: no park, no terminal report, no custody settle, no record or source
+// discard. 404 (stale owner), 400 on a resend (failed path) and 408/429/5xx/transport (retry) keep
+// their behaviour. Every refusal case gives the probe a SECOND answer (recovery_wait) so an unfixed
+// build parks instead of hanging; the first assertion is always the probe count.
+
+const ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
+const gitIn = (dir: string, args: string[]) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", env: ENV }).trim();
+const parkedTexts = (runId: string): string[] => statusTexts(runId).filter((t) => /parked/.test(t));
+const parkReports = (c: ForgeParkClient): StateRequest[] => c.reported.filter((b) => b.status === "recovery_wait");
+const refuse = (status: number, path = "/ownership"): RequestError => new RequestError("GET", path, status, "refused");
+
+/** Count and fail every clone: the reconcile must never reach the clone, the executor or the model. */
+function stubClone(): { calls: () => number } {
+  let n = 0;
+  git.ensureClone = async () => { n++; throw A_TRANSIENT(); };
+  return { calls: () => n };
+}
+
+const REPO_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+const REFUSALS = [400, 401, 403, 405, 409, 410, 422];
+
+describe("forge-park reconcile — a permanent probe refusal (#3856)", () => {
+  for (const status of REFUSALS) {
+    it(`probe ${status}: stops conservatively, no park, no terminal, HOME kept`, async () => {
+      const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-parkrefuse-probe-"));
+      try {
+        const client = new ForgeParkClient(["recovery_park_cause"], {
+          onParkReport: () => { throw new Error("socket hang up"); },
+          onOwnership: (n) => { if (n === 1) throw refuse(status); return { status: "recovery_wait" }; },
+        });
+        const { factory, runHome } = parkFactory(homeRoot, { sessionId: SESSION_ID });
+        const clone = stubClone();
+        const claim = gitlabClaim(3856_00 + status % 100, { claim_generation: 9, session_id: SESSION_ID });
+        await makeRunner(client, factory).execute(claim);
+
+        assert.equal(client.ownershipCalls, 1, "a permanent refusal is not retried");
+        assert.equal(clone.calls(), 1, "ensureClone ran once; the reconcile never re-cloned");
+        assert.deepEqual(parkedTexts(claim.run_id), [], "no park is announced on an unknown outcome");
+        assert.ok(!reportedStatuses(client).includes("failed"), "an unknown outcome is never a failure");
+        assert.equal(parkReports(client).length, 1, "exactly the one attempted park report");
+        assert.deepEqual(client.releaseCalls, [], "custody is not settled");
+        assert.equal(fs.existsSync(runHome()), true, "the possibly parked, resumable session is kept");
+      } finally {
+        fs.rmSync(homeRoot, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("probe 401 with no resolvable transcript: HOME is cleaned (D4 rule)", async () => {
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-parkrefuse-notx-"));
+    try {
+      const client = new ForgeParkClient(["recovery_park_cause"], {
+        onParkReport: () => { throw new Error("socket hang up"); },
+        onOwnership: (n) => { if (n === 1) throw refuse(401); return { status: "recovery_wait" }; },
+      });
+      const { factory, runHome } = parkFactory(homeRoot);
+      const clone = stubClone();
+      const claim = gitlabClaim(3856_10, { claim_generation: 9, session_id: SESSION_ID });
+      await makeRunner(client, factory).execute(claim);
+      assert.equal(client.ownershipCalls, 1);
+      assert.equal(clone.calls(), 1);
+      assert.deepEqual(parkedTexts(claim.run_id), []);
+      assert.equal(fs.existsSync(runHome()), false, "nothing resolvable to resume, so HOME is cleaned");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("control: probe 404 stays a stale-owner stop and cleans HOME even with a transcript", async () => {
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-parkrefuse-404-"));
+    try {
+      const client = new ForgeParkClient(["recovery_park_cause"], {
+        onParkReport: () => { throw new Error("socket hang up"); },
+        onOwnership: (n) => { if (n === 1) throw refuse(404); return { status: "recovery_wait" }; },
+      });
+      const { factory, runHome } = parkFactory(homeRoot, { sessionId: SESSION_ID });
+      const clone = stubClone();
+      const claim = gitlabClaim(3856_11, { claim_generation: 9, session_id: SESSION_ID });
+      await makeRunner(client, factory).execute(claim);
+      assert.equal(client.ownershipCalls, 1);
+      assert.equal(clone.calls(), 1);
+      assert.deepEqual(parkedTexts(claim.run_id), []);
+      assert.ok(!reportedStatuses(client).includes("failed"));
+      assert.equal(fs.existsSync(runHome()), false, "a stale owner cleans HOME");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("forge-park reconcile — a permanent resend refusal (#3856)", () => {
+  for (const status of [401, 403, 422]) {
+    it(`resend ${status}: stops conservatively, no park, no terminal, HOME kept`, async () => {
+      const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-parkrefuse-resend-"));
+      try {
+        const client = new ForgeParkClient(["recovery_park_cause"], {
+          onParkReport: (_b, n) => {
+            if (n === 1) throw new Error("socket hang up");
+            if (n === 2) throw refuse(status, "/state");
+            return { applied: true, status: "recovery_wait" };
+          },
+          onOwnership: (n) => (n === 1 ? { status: "running" } : { status: "recovery_wait" }),
+        });
+        const { factory, runHome } = parkFactory(homeRoot, { sessionId: SESSION_ID });
+        const clone = stubClone();
+        const claim = gitlabClaim(3856_20 + status % 100, { claim_generation: 9, session_id: SESSION_ID });
+        await makeRunner(client, factory).execute(claim);
+
+        assert.equal(client.ownershipCalls, 1, "a permanent resend refusal does not re-probe");
+        assert.equal(clone.calls(), 1);
+        assert.equal(parkReports(client).length, 2, "the attempted report and the one resend");
+        assert.deepEqual(parkedTexts(claim.run_id), []);
+        assert.ok(!reportedStatuses(client).includes("failed"));
+        assert.deepEqual(client.releaseCalls, []);
+        assert.equal(fs.existsSync(runHome()), true);
+      } finally {
+        fs.rmSync(homeRoot, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+describe("forge-park reconcile — unchanged controls (#3856)", () => {
+  for (const status of [408, 429, 503]) {
+    it(`probe ${status} is retried with backoff, then the park lands`, async () => {
+      const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-parkrefuse-transient-"));
+      try {
+        const client = new ForgeParkClient(["recovery_park_cause"], {
+          onParkReport: () => { throw new Error("socket hang up"); },
+          onOwnership: (n) => { if (n === 1) throw refuse(status); return { status: "recovery_wait" }; },
+        });
+        const { factory } = parkFactory(homeRoot);
+        stubClone();
+        const claim = gitlabClaim(3856_30 + status % 100, { claim_generation: 9 });
+        await makeRunner(client, factory).execute(claim);
+        assert.equal(client.ownershipCalls, 2);
+        assert.equal(parkedTexts(claim.run_id).length, 1);
+        assert.ok(!reportedStatuses(client).includes("failed"));
+      } finally {
+        fs.rmSync(homeRoot, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("resend 503 re-probes, then the park lands", async () => {
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-parkrefuse-resend503-"));
+    try {
+      const client = new ForgeParkClient(["recovery_park_cause"], {
+        onParkReport: (_b, n) => {
+          if (n === 1) throw new Error("socket hang up");
+          if (n === 2) throw refuse(503, "/state");
+          return { applied: true, status: "recovery_wait" };
+        },
+        onOwnership: (n) => (n === 1 ? { status: "running" } : { status: "recovery_wait" }),
+      });
+      const { factory } = parkFactory(homeRoot);
+      stubClone();
+      const claim = gitlabClaim(3856_40, { claim_generation: 9 });
+      await makeRunner(client, factory).execute(claim);
+      assert.equal(client.ownershipCalls, 2);
+      assert.equal(parkedTexts(claim.run_id).length, 1);
+      assert.ok(!reportedStatuses(client).includes("failed"));
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("resend 400 takes the failed path", async () => {
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-parkrefuse-resend400-"));
+    try {
+      const client = new ForgeParkClient(["recovery_park_cause"], {
+        onParkReport: (_b, n) => {
+          if (n === 1) throw new Error("socket hang up");
+          throw refuse(400, "/state");
+        },
+        onOwnership: () => ({ status: "running" }),
+      });
+      const { factory } = parkFactory(homeRoot);
+      stubClone();
+      const claim = gitlabClaim(3856_41, { claim_generation: 9 });
+      await makeRunner(client, factory).execute(claim);
+      assert.ok(reportedStatuses(client).includes("failed"));
+      assert.deepEqual(parkedTexts(claim.run_id), []);
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("resend answered with a custody_unsettled ack takes the failed path", async () => {
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-parkrefuse-resendcu-"));
+    try {
+      const client = new ForgeParkClient(["recovery_park_cause"], {
+        onParkReport: (_b, n) => {
+          if (n === 1) throw new Error("socket hang up");
+          return { applied: false, status: "running", reason: "custody_unsettled" };
+        },
+        onOwnership: () => ({ status: "running" }),
+      });
+      const { factory } = parkFactory(homeRoot);
+      stubClone();
+      const claim = gitlabClaim(3856_42, { claim_generation: 9 });
+      await makeRunner(client, factory).execute(claim);
+      assert.ok(reportedStatuses(client).includes("failed"));
+      assert.deepEqual(parkedTexts(claim.run_id), []);
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("resend answered with a stale_claim ack stops silently", async () => {
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-parkrefuse-resendstale-"));
+    try {
+      const client = new ForgeParkClient(["recovery_park_cause"], {
+        onParkReport: (_b, n) => {
+          if (n === 1) throw new Error("socket hang up");
+          return { applied: false, status: "queued", reason: "stale_claim" };
+        },
+        onOwnership: () => ({ status: "running" }),
+      });
+      const { factory } = parkFactory(homeRoot);
+      stubClone();
+      const claim = gitlabClaim(3856_43, { claim_generation: 9 });
+      await makeRunner(client, factory).execute(claim);
+      assert.ok(!reportedStatuses(client).includes("failed"));
+      assert.deepEqual(parkedTexts(claim.run_id), []);
+      assert.equal(parkReports(client).length, 2);
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("forge-park reconcile — a refusal keeps records and source (#3856)", () => {
+  it("publication park: probe 403 retains the publication record and finalize record, and keeps HOME without a transcript", async () => {
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-parkrefuse-pub-"));
+    const outboxRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-parkrefuse-outbox-"));
+    try {
+      const outbox = new Outbox({
+        root: path.join(outboxRoot, "outbox"), log: nullLogger(), runMaxBytes: 64 * 1024 * 1024, maxBytes: 512 * 1024 * 1024,
+        retentionMs: 7 * 86_400_000,
+      });
+      await outbox.init();
+      const GEN = 9;
+      const claim = gitlabClaim(3856_50, {
+        claim_generation: GEN,
+        repo: { id: REPO_ID, url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+        publication_resume: { enrollment_seq: 1, candidate_seq: 1, intent: {} },
+      });
+      const head = "1".repeat(40);
+      const saved = await outbox.savePublicationRecord({
+        owner_kind: "issue",
+        v: 1, run_id: claim.run_id, repo_id: REPO_ID, branch: "agent/issue-3856", claim_generation: GEN,
+        original_head: head, floor: { kind: "absent" }, candidate: head,
+        source: { pin_generation: GEN, checkpoint_key: null },
+        mr: { title: "t", summary: "", closing: [], contract_revision: 0 },
+        guard: {
+          frozen_held: { version: 1, blocked: false, everKnown: false, flaggedCommits: [], ciGlobs: null, extraFloors: [] },
+          secret_remediation: { attempts: 0, known: [], flagged_commits: [], flagged_findings: [], blocked: [], ever_known: false, withhold_paths: false, overflow: false },
+          published_real_tips: [], landed_checkpoint: false, ci_fix_human_approved: false, ci_config_guard_globs: null,
+        },
+      });
+      assert.ok(saved.ok, JSON.stringify(saved));
+      assert.equal((await outbox.replacePublicationRecord({ ...saved.record, enrollment_seq: 1, candidate_seq: 1 }, {})).ok, true);
+      assert.equal((await outbox.journalFinalize(claim.run_id, GEN)).written, true);
+      const before = await outbox.loadPublicationRecord(claim.run_id, GEN);
+      assert.equal(before.kind, "ok", "the publication record is seeded");
+      assert.ok(outbox.listPendingFinalizes().some((f) => f.run_id === claim.run_id), "the finalize record is seeded");
+
+      const client = new ForgeParkClient(["publication_resume_v1", "recovery_park_cause"], {
+        onParkReport: () => { throw new Error("socket hang up"); },
+        onOwnership: (n) => { if (n === 1) throw refuse(403); return { status: "recovery_wait" }; },
+      });
+      const { factory, runHome } = parkFactory(homeRoot); // no transcript planted
+      const clone = stubClone();
+      await makeRunner(client, factory, { outbox }).execute(claim);
+
+      assert.equal(client.ownershipCalls, 1);
+      assert.equal(clone.calls(), 1);
+      const parks = parkReports(client);
+      assert.equal(parks.length, 1, "exactly one attempted park report, no later report");
+      assert.equal(parks[0]!.recovery_phase, "publication");
+      assert.deepEqual(parkedTexts(claim.run_id), []);
+      assert.ok(!reportedStatuses(client).includes("failed"));
+      const after = await outbox.loadPublicationRecord(claim.run_id, GEN);
+      assert.equal(after.kind, "ok", "the publication record survives");
+      if (after.kind === "ok" && before.kind === "ok") {
+        assert.deepEqual([after.record.enrollment_seq, after.record.candidate_seq], [before.record.enrollment_seq, before.record.candidate_seq]);
+      }
+      assert.ok(outbox.listPendingFinalizes().some((f) => f.run_id === claim.run_id), "the finalize record survives");
+      assert.equal(fs.existsSync(runHome()), true, "a publication retention keeps HOME even without a transcript");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+      fs.rmSync(outboxRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("source and pins: probe 401 leaves the bare and its recovery-pin and settle refs untouched", async () => {
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-parkrefuse-src-"));
+    try {
+      const claim = gitlabClaim(3856_60, { claim_generation: 9 });
+      const bare = git.barePathFor(claim.repo.clone_url);
+      fs.mkdirSync(path.dirname(bare), { recursive: true });
+      execFileSync("git", ["clone", "--bare", "-q", fx.originPath, bare], { env: ENV });
+      const sha = gitIn(bare, ["rev-parse", "HEAD"]);
+      const pin = `refs/uzi-recovery-pin/${claim.run_id}/9`;
+      const settle = `refs/uzi-settle/${claim.run_id}/hold/source`;
+      execFileSync("git", ["--git-dir", bare, ...IDENT, "update-ref", pin, sha], { env: ENV });
+      execFileSync("git", ["--git-dir", bare, ...IDENT, "update-ref", settle, sha], { env: ENV });
+      const seeded = (): string[] => [pin, settle].map((r) => execFileSync("git", ["--git-dir", bare, "rev-parse", "--verify", r], { encoding: "utf8", env: ENV }).trim());
+      assert.deepEqual(seeded(), [sha, sha], "refs are seeded");
+
+      const client = new ForgeParkClient(["recovery_park_cause"], {
+        onParkReport: () => { throw new Error("socket hang up"); },
+        onOwnership: (n) => { if (n === 1) throw refuse(401); return { status: "recovery_wait" }; },
+      });
+      const { factory } = parkFactory(homeRoot);
+      const clone = stubClone();
+      await makeRunner(client, factory).execute(claim);
+
+      assert.equal(client.ownershipCalls, 1);
+      assert.equal(clone.calls(), 1);
+      assert.ok(fs.existsSync(bare), "the bare survives");
+      assert.deepEqual(seeded(), [sha, sha], "pin and settle refs survive with the same commits");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
     }
   });
 });
