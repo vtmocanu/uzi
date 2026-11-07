@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Target design for the Overview preview "Issue work" scope toggle (epic #3873 follow-up): an admin-only You | All users toggle pinned to the far right of the card header, matching the usage card (#3881); no "Show all" button. Example data only. Open this file directly in a browser. -->
+<title>Issue Work Scope</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root {
+  --bg: #eef0f4; --surface: #ffffff; --raised: #f2f4f7; --edge: #dde1e8; --edge-strong: #c4cad4;
+  --fg: #171b22; --muted: #5d6573; --faint: #8a91a0;
+  --queue: #8a91a0; --plan: #6366f1; --warn: #b7791f; --info: #0e86b8; --ok: #13865a;
+  --tag: #e7ecf7; --tag-fg: #34508a; --sel: #ffffff; --seg: #e6e9ef;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0b0e14; --surface: #121620; --raised: #1a1f2b; --edge: #262c38; --edge-strong: #3a4150;
+  --fg: #e8eaee; --muted: #a2a9b6; --faint: #7f8796;
+  --queue: #8a91a0; --plan: #8b8ff8; --warn: #f2b33d; --info: #38bdf8; --ok: #34d399;
+  --tag: #1d2638; --tag-fg: #a9bfee; --sel: #2a3140; --seg: #0d1118; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #0b0e14; --surface: #121620; --raised: #1a1f2b; --edge: #262c38; --edge-strong: #3a4150;
+  --fg: #e8eaee; --muted: #a2a9b6; --faint: #7f8796;
+  --queue: #8a91a0; --plan: #8b8ff8; --warn: #f2b33d; --info: #38bdf8; --ok: #34d399;
+  --tag: #1d2638; --tag-fg: #a9bfee; --sel: #2a3140; --seg: #0d1118; color-scheme: dark }
+
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--sans); font-size: 14px; line-height: 1.45; }
+.page { max-width: 1180px; margin: 0 auto; padding: 28px 16px 64px; display: grid; gap: 28px; }
+h1 { font-size: 22px; font-weight: 600; margin: 0; }
+.lede { color: var(--muted); margin: 6px 0 0; max-width: 78ch; }
+.controls { display: flex; flex-wrap: wrap; gap: 10px 22px; align-items: center; margin-top: 14px; font-size: 13px; color: var(--muted); }
+.controls label { display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
+.controls fieldset { border: 0; padding: 0; margin: 0; display: inline-flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.controls legend { float: left; margin-right: 8px; font-weight: 600; color: var(--fg); }
+.scenario { display: grid; gap: 10px; }
+.scenario h2 { font-size: 13px; font-weight: 600; margin: 0; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+.scenario p.why { margin: 0; color: var(--muted); font-size: 13px; max-width: 80ch; }
+.tag { font-family: var(--mono); font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--tag); color: var(--tag-fg); }
+
+/* The card */
+.card { background: var(--surface); border: 1px solid var(--edge); border-radius: 14px; padding: 20px 22px; min-width: 0; }
+/* Toggle pinned to the far right so it never moves when the note's length changes. */
+.head { display: grid; grid-template-columns: auto minmax(0,1fr) auto; grid-template-areas: "title meta seg"; align-items: center; gap: 8px 12px; }
+.stitle { grid-area: title; margin: 0; font-size: 12px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase; color: var(--faint); }
+.head-meta { grid-area: meta; justify-self: end; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; font-size: 12px; color: var(--faint); min-width: 0; }
+.head .seg { grid-area: seg; }
+.phone .head { grid-template-columns: minmax(0,1fr) auto; grid-template-areas: "title seg" "meta meta"; }
+.phone .head-meta { justify-self: start; }
+@media (max-width: 760px) {
+  .head { grid-template-columns: minmax(0,1fr) auto; grid-template-areas: "title seg" "meta meta"; }
+  .head-meta { justify-self: start; }
+}
+.ghost { font: inherit; font-size: 12.5px; font-weight: 500; color: var(--fg); background: transparent; border: 0; border-radius: 8px; padding: 4px 8px; cursor: pointer; }
+.ghost:hover { background: var(--raised); }
+.new { outline: 2px dashed var(--tag-fg); outline-offset: 3px; border-radius: 10px; }
+
+/* Segmented toggle, same shape as the usage card's */
+.seg { display: inline-flex; padding: 2px; border-radius: 9px; background: var(--seg); border: 1px solid var(--edge); }
+.seg button { font: inherit; font-size: 12.5px; font-weight: 500; color: var(--muted); background: transparent; border: 0; border-radius: 7px; padding: 4px 11px; cursor: pointer; white-space: nowrap; }
+.seg button[aria-pressed="true"] { background: var(--sel); color: var(--fg); box-shadow: 0 1px 2px rgb(0 0 0 / .18); }
+.seg button:disabled { cursor: not-allowed; opacity: .5; }
+.seg button:focus-visible, .ghost:focus-visible, .station:focus-visible, .bay:focus-visible { outline: 2px solid var(--tag-fg); outline-offset: 2px; }
+
+.line { position: relative; display: grid; grid-template-columns: repeat(5, minmax(0,1fr)); margin-top: 10px; }
+.rail { position: absolute; left: 26px; right: calc(20% - 26px); top: 25px; height: 2px; background: var(--edge-strong); }
+.station { position: relative; display: flex; flex-direction: column; align-items: flex-start; gap: 2px; text-align: left; padding: 44px 10px 12px; margin: 0 2px; border: 1px solid transparent; border-radius: 11px; background: transparent; color: inherit; font: inherit; cursor: pointer; min-width: 0; }
+.station:hover { background: var(--raised); }
+.station[aria-pressed="true"] { background: var(--raised); border-color: var(--edge); }
+.node { position: absolute; top: 16px; left: 18px; width: 16px; height: 16px; border-radius: 50%; border: 2px solid var(--c); background: var(--surface); }
+.node.fill { background: var(--c); box-shadow: 0 0 0 5px color-mix(in srgb, var(--c) 22%, transparent); }
+.node.gate { border-radius: 2px; transform: rotate(45deg); width: 14px; height: 14px; left: 19px; top: 17px; }
+.st-name { font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--faint); }
+.st-count { font-size: 26px; font-weight: 600; line-height: 1.1; }
+.st-count small { font-size: 12px; font-weight: 500; color: var(--muted); margin-left: 3px; }
+.gate-st .st-count { color: var(--warn); }
+.st-cap { font-size: 12.5px; color: var(--muted); }
+.st-note { font-size: 12px; color: var(--faint); }
+.badges { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.badge { font-family: var(--mono); font-size: 11.5px; padding: 1px 7px; border-radius: 7px; border: 1px solid color-mix(in srgb, var(--c) 55%, transparent); background: color-mix(in srgb, var(--c) 14%, transparent); color: var(--fg); }
+.badge.other { border-style: dashed; opacity: .8; }
+.bays { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 12px; margin-top: 12px; }
+.bay { display: flex; gap: 12px; align-items: center; text-align: left; padding: 12px 14px; border-radius: 11px; border: 1px dashed var(--edge-strong); background: transparent; color: inherit; font: inherit; cursor: pointer; min-width: 0; }
+.bay:hover { background: var(--raised); }
+.bay-ico { flex: none; width: 30px; height: 30px; border-radius: 8px; display: grid; place-items: center; border: 1px solid var(--edge-strong); color: var(--muted); }
+.bay-ico.ask { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 60%, transparent); }
+.bay-ico svg { width: 16px; height: 16px; }
+.bay b { font-weight: 600; }
+.bay .sub { display: block; font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bay > span:last-child { min-width: 0; }
+.unavail { margin-top: 8px; font-size: 12px; color: var(--warn); }
+
+/* Phone frame */
+.phone { width: 400px; max-width: 100%; }
+.phone .line { grid-template-columns: 1fr; }
+.phone .rail { display: none; }
+.phone .station { padding: 10px 10px 10px 52px; }
+.phone .node { top: 14px; }
+.phone .bays { grid-template-columns: 1fr; }
+@media (max-width: 760px) {
+  .line { grid-template-columns: 1fr; } .rail { display: none; }
+  .station { padding: 10px 10px 10px 52px; } .node { top: 14px; }
+  .bays { grid-template-columns: 1fr; }
+}
+.notes { margin: 0; padding-left: 18px; color: var(--muted); font-size: 13px; display: grid; gap: 4px; max-width: 86ch; }
+</style>
+</head>
+<body>
+<main class="page">
+  <header>
+    <h1>Issue work: a You | All users scope toggle for admins</h1>
+    <p class="lede">The same segmented toggle as the usage card (#3881), pinned to the far right of the Issue work header, like the usage card's toggles, so it never shifts when the note's length changes (dashed outline marks what is new). Admins only; non-admins see today's card with no toggle. Click the toggle and the stations; press a pressed station again to clear the filter. Example data.</p>
+    <div class="controls">
+      <fieldset><legend>Theme</legend>
+        <label><input type="radio" name="th" value=""> System</label>
+        <label><input type="radio" name="th" value="dark"> Ember</label>
+        <label><input type="radio" name="th" value="light"> Dawn</label>
+      </fieldset>
+    </div>
+  </header>
+
+  <section class="scenario">
+    <h2>0 · Consistency: the usage card header (#3881) with the same label</h2>
+    <p class="why">The usage card's scope option is renamed from "Factory · all users" to "All users", and both cards remember their scope per browser (default You).</p>
+    <div class="card"><div class="head"><h3 class="stitle">Usage</h3><div class="head-meta"></div>
+      <span style="grid-area: seg; display: inline-flex; gap: 8px; flex-wrap: wrap; justify-content: end">
+        <span class="seg new" role="group" aria-label="Usage scope"><button type="button" aria-pressed="true">You</button><button type="button" aria-pressed="false">All users</button></span>
+        <span class="seg" role="group" aria-label="Usage reporting period"><button type="button" aria-pressed="false">Last 7 days</button><button type="button" aria-pressed="true">All time</button></span>
+      </span></div></div>
+  </section>
+
+  <section class="scenario">
+    <h2>1 · Desktop, default scope: You</h2>
+    <p class="why">Counts, badges, captions and bays use only your runs. The Runs widget below would filter to your runs when a station is pressed.</p>
+    <div class="card" data-card data-scope="you"></div>
+  </section>
+
+  <section class="scenario">
+    <h2>2 · Desktop, All users (today's behaviour)</h2>
+    <p class="why">Other users' runs join the stations (dashed badges, owner on hover). Gate and question captions split "on you / on others". The PR station stays yours only and says so.</p>
+    <div class="card" data-card data-scope="all"></div>
+  </section>
+
+  <section class="scenario">
+    <h2>3 · Admin run list unavailable</h2>
+    <p class="why">The All users option is disabled and the card falls back to You with a note, as the Runs widget already does.</p>
+    <div class="card" data-card data-scope="you" data-unavailable></div>
+  </section>
+
+  <section class="scenario">
+    <h2>4 · Phone, 400 px</h2>
+    <p class="why">The toggle stays top-right beside the title; the note wraps to the row below; the line stacks vertically.</p>
+    <div class="card phone" data-card data-scope="you"></div>
+  </section>
+
+  <section class="scenario">
+    <h2>Decisions</h2>
+    <ul class="notes">
+      <li>Decided: default scope <b>You</b>; the choice is remembered per browser (localStorage, guarded so a blocked store falls back to You).</li>
+      <li>Decided: toggle pinned to the far right of the header.</li>
+      <li>Decided: no "Show all" button; press the pressed station or bay again to clear the filter.</li>
+      <li>Label: You | All users on both cards.</li>
+      <li>Per-card toggles, not one page-level scope.</li>
+      <li>Under You, a pressed stage filters the Runs widget to the viewer's runs only; unfiltered, the Runs widget is unchanged.</li>
+      <li>The PR station stays the viewer's own PRs in both scopes.</li>
+    </ul>
+  </section>
+</main>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-q" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16v11H9l-5 4z"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></symbol>
+  <symbol id="i-act" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3-7 4 14 3-7h4"/></symbol>
+</svg>
+
+<script>
+// Example data. own: the viewer's run. stage: queued|planning|review|building|question|parked|other.
+const RUNS = [
+  { n: 4041, stage: "queued", own: true }, { n: 412, stage: "queued", own: false, who: "user B" }, { n: 418, stage: "queued", own: false, who: "user C" },
+  { n: 4040, stage: "planning", own: true }, { n: 237, stage: "planning", own: false, who: "user B" },
+  { n: 3881, stage: "review", own: true }, { n: 96, stage: "review", own: false, who: "user C" }, { n: 97, stage: "review", own: false, who: "user D" },
+  { n: 3543, stage: "building", own: true }, { n: 3251, stage: "building", own: true }, { n: 24, stage: "building", own: false, who: "user B" },
+  { n: 34, stage: "building", own: false, who: "user C" }, { n: 99, stage: "building", own: false, who: "user D" }, { n: 38, stage: "building", own: false, who: "user D" },
+  { n: 3989, stage: "question", own: true }, { n: 61, stage: "question", own: false, who: "user B" },
+  { n: 3607, stage: "parked", own: true, auto: true }, { n: 77, stage: "parked", own: false, who: "user C", auto: false },
+  { n: 88, stage: "parked", own: false, who: "user D", auto: true },
+  { n: 0, stage: "other", own: true }, { n: 0, stage: "other", own: false, who: "user B" }, { n: 0, stage: "other", own: false, who: "user C" },
+];
+const OWN_PRS = [4033, 4049, 4035, 4006];
+
+const STATIONS = [
+  { stage: "queued", name: "Queued", c: "--queue", cap: () => "Claiming a slot" },
+  { stage: "planning", name: "Planning", c: "--plan", fill: true, cap: () => "Lead drafting a plan" },
+  { stage: "review", name: "Plan review", c: "--warn", gate: true },
+  { stage: "building", name: "Building", c: "--info", fill: true, cap: () => "Implement, review, validate" },
+  { stage: "pr", name: "PR open", c: "--ok" },
+];
+const LABEL = "All users";
+
+function split(list) {
+  const own = list.filter(r => r.own).length;
+  if (own === list.length) return "Waiting on you";
+  if (own === 0) return "Waiting on owners";
+  return `${own} on you, ${list.length - own} on others`;
+}
+const esc = s => String(s).replace(/[&<>"]/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch]));
+
+function render(card) {
+  const unavailable = card.hasAttribute("data-unavailable");
+  let scope = card.dataset.scope;
+  if (unavailable) scope = "you";
+  const sel = card.dataset.sel || "";
+  const runs = RUNS.filter(r => scope === "all" || r.own);
+  const at = s => runs.filter(r => r.stage === s);
+  const onLine = runs.filter(r => ["queued", "planning", "review", "building"].includes(r.stage)).length;
+  const other = at("other").length;
+  const note = `${onLine} runs on the line, ${other} other${scope === "all" ? ", all users" : ""}`;
+
+  const stations = STATIONS.map(st => {
+    const isPr = st.stage === "pr";
+    const list = isPr ? OWN_PRS.map(n => ({ n, own: true })) : at(st.stage);
+    const cap = isPr ? "PR state as last seen by uzi" : st.gate ? (list.length ? split(list) : "Nothing to review") : st.cap();
+    const prNote = isPr ? (scope === "all" ? "Yours only, not counted as active" : "Not counted as active") : "";
+    const badges = list.map(r => `<span class="badge${r.own ? "" : " other"}"${r.who ? ` title="${esc(r.who)}"` : ""}>#${r.n}</span>`).join("");
+    const node = `<span class="node${st.fill ? " fill" : ""}${st.gate ? " gate" : ""}" aria-hidden="true"></span>`;
+    return `<button type="button" class="station${st.gate ? " gate-st" : ""}" style="--c: var(${st.c})" data-stage="${st.stage}" aria-pressed="${sel === st.stage}">
+      ${node}<span class="st-name">${st.name}</span>
+      <span class="st-count">${list.length}${isPr ? "<small>PRs</small>" : ""}</span>
+      <span class="st-cap">${cap}</span>${prNote ? `<span class="st-note">${prNote}</span>` : ""}
+      <span class="badges">${badges}</span></button>`;
+  }).join("");
+
+  const q = at("question"), pk = at("parked");
+  const qOwn = q.filter(r => r.own).length;
+  const qTitle = qOwn === q.length ? "Asking you" : "Questions";
+  const qSub = qOwn === q.length ? q.map(r => `#${r.n} paused on a question`).join(", ") : qOwn === 0 ? "Waiting on owners" : `${qOwn} on you, ${q.length - qOwn} on others`;
+  const autoN = pk.filter(r => r.auto).length;
+  const pkSub = `${autoN} resume on their own, ${pk.length - autoN} need action`;
+
+  const allDisabled = unavailable ? " disabled" : "";
+  card.innerHTML = `
+    <div class="head">
+      <h3 class="stitle">Issue work</h3>
+      <div class="head-meta">
+        <span>${note}</span>
+      </div>
+      <span class="seg new" role="group" aria-label="Issue work scope">
+        <button type="button" data-scope="you" aria-pressed="${scope === "you"}">You</button>
+        <button type="button" data-scope="all" aria-pressed="${scope === "all"}"${allDisabled} title="Every user's active runs">${esc(LABEL)}</button>
+      </span>
+    </div>
+    ${unavailable ? `<p class="unavail">Other users' runs are unavailable (last read 2 min ago). Showing yours.</p>` : ""}
+    <div class="line" role="group" aria-label="Filter runs by stage"><span class="rail" aria-hidden="true"></span>${stations}</div>
+    <div class="bays">
+      <button type="button" class="bay" data-stage="question" aria-pressed="${sel === "question"}"><span class="bay-ico ask"><svg><use href="#i-q"/></svg></span><span><b>${q.length}</b> ${qTitle}<span class="sub">${esc(qSub)}</span></span></button>
+      <button type="button" class="bay" data-stage="parked" aria-pressed="${sel === "parked"}"><span class="bay-ico"><svg><use href="#i-clock"/></svg></span><span><b>${pk.length}</b> Parked<span class="sub">${pkSub}</span></span></button>
+      <button type="button" class="bay" data-stage="other" aria-pressed="${sel === "other"}"><span class="bay-ico"><svg><use href="#i-act"/></svg></span><span><b>${other}</b> Other work<span class="sub">Jobs, self-improve, CI fixes, reworks</span></span></button>
+    </div>`;
+}
+
+document.querySelectorAll("[data-card]").forEach(card => {
+  render(card);
+  card.addEventListener("click", e => {
+    const b = e.target.closest("button");
+    if (!b || b.disabled) return;
+    if (b.closest(".seg")) { card.dataset.scope = b.dataset.scope; render(card); return; }
+    if (b.dataset.stage) { card.dataset.sel = card.dataset.sel === b.dataset.stage ? "" : b.dataset.stage; render(card); }
+  });
+});
+document.querySelectorAll('input[name="th"]').forEach(i => i.addEventListener("change", () => {
+  if (i.value) document.documentElement.dataset.theme = i.value; else delete document.documentElement.dataset.theme;
+}));
+</script>
+</body>
+</html>

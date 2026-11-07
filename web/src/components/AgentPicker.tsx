@@ -33,20 +33,27 @@ export function selectionLabel(source: AgentSource, activeCount: number): string
     : `${activeCount} of your templates`;
 }
 
+export function gateDefaultSource(requested: AgentSource | null | undefined, repoDetected: boolean): AgentSource {
+  if (requested === "own") return "own";
+  return repoDetected ? "repo" : "own";
+}
+
 export function AgentPicker({
   repoAgents,
   ownTemplates,
+  requested,
   onChange,
 }: {
   repoAgents: RepoAgent[];
   ownTemplates: OwnTemplate[];
+  requested?: AgentSource | null;
   /** Called with the resolved selection on mount and on every change. MUST be
    *  stable (wrap in useCallback) — it drives an effect. */
   onChange: (selection: AgentSelectionInput) => void;
 }) {
   const repoDetected = repoAgents.length > 0;
   const repoFolder = repoAgentFolder(repoAgents);
-  const defaultSource: AgentSource = repoDetected ? "repo" : "own";
+  const defaultSource = gateDefaultSource(requested, repoDetected);
   const [source, setSource] = useState<AgentSource>(defaultSource);
   // Exclusions are tracked per source so switching cards preserves each card's
   // choices (the mock's per-card chips).
