@@ -311,6 +311,12 @@ describe("ResetAccount vault_only variant", () => {
     expect(screen.queryByText(/If your instance only allows single sign-on/)).toBeNull();
     expect(document.body.textContent).toMatch(/Everything in your vault/);
     expect(button).toHaveProperty("disabled", true);
+    expect(document.querySelector('input[type="password"]')).toBeNull();
+    // Pre-redeem copy: no password to set, and the next SSO sign-in asks for a passphrase.
+    const pre = document.body.textContent ?? "";
+    expect(pre).toMatch(/this link asks for none/);
+    expect(pre).toMatch(/Your next single sign-on sign-in asks you to set a new vault passphrase/);
+    expect(pre).not.toMatch(/set a (new )?password/i);
 
     reply("/api/auth/reset/redeem", { status: 204 });
     fireEvent.click(ack());
@@ -322,6 +328,15 @@ describe("ResetAccount vault_only variant", () => {
     await waitFor(() => expect(calls).toHaveLength(2));
     // vault_only redemption sends no password key at all.
     expect(calls[1].body).toEqual({ token: TOKEN });
+    expect(Object.keys(calls[1].body as object)).toEqual(["token"]);
+    const done = document.body.textContent ?? "";
+    expect(done).toMatch(/vault passphrase/);
+    expect(done).toMatch(/uzi then asks you to set a new vault passphrase/);
+    expect(done).not.toMatch(/Settings.*passphrase/);
+    expect(done).not.toMatch(/passphrase in Settings/);
+    expect(done).toMatch(/Once it is set, add your model credentials again in Settings/);
+    // The generic password-kind line must not repeat.
+    expect(done).not.toMatch(/Settings once you are signed in/);
     expectTokenNeverInUrl();
   });
 });

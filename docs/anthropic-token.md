@@ -539,8 +539,9 @@ whether personal credentials use password protection. The same choice covers
 
 To turn On, verify your login password. If you use SSO without a password,
 create and confirm a dedicated vault passphrase of **12–1024 UTF-8 bytes**;
-this is create-only, with no passphrase change or recovery flow (reset links for
-SSO-only accounts are not yet available). Linking SSO
+this is create-only, with no passphrase change or recovery flow (an
+administrator's [reset link](#forgotten-password-admin-reset-link) deletes the
+vault so you can create a new passphrase). Linking SSO
 to a password account retains its mode and password-based vault semantics.
 To turn Off, first unlock your protected vault; your administrator must allow
 optional protection. Login, seed startup and ordinary unlock do not turn
@@ -602,6 +603,15 @@ a new password:
   Claude runs that resolve to an auto-bound worker wait in the credential pool
   (`pool_wait`) until a credential exists.
 
+**If you sign in only through SSO** (your account has no password), the link is
+a vault-only reset and asks for no password. Opening it ends your browser
+sessions, refuses your approved CLI login requests and deletes the same
+credentials, Codex logins and vault as above. It leaves you protected with no
+vault and does not log you in. Sign in through SSO; uzi's banner then asks you
+to set a new vault passphrase (12–1024 UTF-8 bytes), after which you add your
+credentials again. An account linked to both SSO and a password gets the normal
+password link instead.
+
 On an SSO-only instance (password login disabled) the web app offers no way to
 create the fresh vault: it is created at your first password sign-in once an
 administrator turns password sign-in on, or through `POST /api/vault/enable`
@@ -609,7 +619,7 @@ with the new password from your SSO session. Until then you can sign in through
 SSO but cannot store model credentials. The seed admin cannot be reset with
 a link, and an admin cannot issue one for their own account. An admin can take
 over any other active account except the seed admin, admins included, by
-issuing a link (in this release, not for SSO-only accounts); see the [threat model](./vault-threat-model.md#admin-issued-account-reset).
+issuing a link, including for accounts that sign in only through SSO; see the [threat model](./vault-threat-model.md#admin-issued-account-reset).
 If the page reports that the reset could not be confirmed, try signing in with
 the new password, or ask for a new link.
 

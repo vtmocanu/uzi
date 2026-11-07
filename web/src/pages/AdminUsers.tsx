@@ -335,6 +335,11 @@ function ResetLinkDialog({ user, label, onClose }: { user: User; label: string; 
                 </dd>
               </div>
             </dl>
+            {issued.kind === "vault_only" && (
+              <p className="text-sm text-muted">
+                This account has no password. The user signs in with single sign-on, then sets a new vault passphrase.
+              </p>
+            )}
             {targetIsAdmin && <AdminTakeoverWarning />}
           </div>
         ) : (

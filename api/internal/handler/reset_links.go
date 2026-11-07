@@ -42,10 +42,6 @@ func resetKindFor(hasPassword bool) string {
 	return resetKindVaultOnly
 }
 
-// resetLinkIssuableKind reports whether this milestone issues links of the given
-// kind. M1 refuses vault_only; M2 relaxes this one check.
-func resetLinkIssuableKind(kind string) bool { return kind == resetKindPassword }
-
 // resetLinkState is the shared view of a link and its target and issuer rows.
 type resetLinkState = store.GetResetLinkStateRow
 
@@ -139,10 +135,6 @@ func (h *Handler) IssueResetLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	kind := resetKindFor(tRow.HasPassword)
-	if !resetLinkIssuableKind(kind) {
-		httpx.Error(w, http.StatusBadRequest, "this account has no password; reset links for SSO-only accounts are not available yet")
-		return
-	}
 
 	if _, err := q.SupersedeLiveResetLinksForTarget(ctx, target); err != nil {
 		slog.Error("reset link: supersede", "error", err)

@@ -268,6 +268,12 @@ function ResetForm({
         </li>
         <li>Runs pinned to a deleted credential use your default credential once you add a new one.</li>
         <li>Queued Codex runs will fail. Start new ones after you add a Codex login again.</li>
+        {!needsPassword && (
+          <li>
+            Your account has no password, so this link asks for none. Your next single sign-on sign-in asks you to set a
+            new vault passphrase.
+          </li>
+        )}
       </ul>
 
       {needsPassword && (
@@ -336,7 +342,7 @@ function ResetForm({
 
 function doneMessage(kind: ResetLinkKind, passwordLogin: PasswordLogin): string {
   if (kind !== "password") {
-    return "Your vault is reset. Sign in with single sign-on, then create a new vault passphrase in Settings.";
+    return "Your vault is reset. Sign in with single sign-on; uzi then asks you to set a new vault passphrase. Once it is set, add your model credentials again in Settings.";
   }
   switch (passwordLogin) {
     case "on":
@@ -360,7 +366,9 @@ function ResetDone({ kind, passwordLogin }: { kind: ResetLinkKind; passwordLogin
   return (
     <div ref={ref} tabIndex={-1} className="space-y-4 outline-hidden">
       <Alert tone="success" message={doneMessage(kind, passwordLogin)} />
-      <p className="text-sm text-muted">Add your model credentials again in Settings once you are signed in.</p>
+      {kind === "password" && passwordLogin !== "off" && (
+        <p className="text-sm text-muted">Add your model credentials again in Settings once you are signed in.</p>
+      )}
       <Link
         to="/login"
         className="inline-flex h-9 select-none items-center justify-center rounded-lg bg-brand px-4 text-sm font-medium text-on-brand hover:bg-brand-hover"

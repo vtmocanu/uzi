@@ -43,8 +43,8 @@ verifies the current login password or creates an OIDC-only passphrase
 an existing protected wrapper. Disabling requires an unlocked protected
 vault and Optional policy. Password + OIDC linking retains the user's mode
 and password semantics. Passphrase change and recovery remain deferred. The
-account-access half of recovery is now an admin-issued reset link (PRD #3989)
-that deletes the user's credentials and vault rather than recovering them.
+account-access half of recovery is now an admin-issued reset link (PRD #3989), for password and SSO-only users alike, that
+deletes the user's credentials and vault rather than recovering them.
 
 User help targets [Vault choice](../docs/anthropic-token.md#vault-choice)
 (`/docs/anthropic-token#vault-choice`), with a Codex credentials crosslink;

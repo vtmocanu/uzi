@@ -85,7 +85,8 @@ export const usersApi = {
     const token = mockResetToken();
     const link: MockResetLink = {
       userId: id,
-      kind: "password",
+      // Passwordless (SSO-only) scenarios issue the no-password variant, as the server does.
+      kind: oidcDemo().passwordless ? "vault_only" : "password",
       expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
     };
     resetLinks.set(token, link);

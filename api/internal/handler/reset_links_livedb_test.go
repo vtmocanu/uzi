@@ -64,6 +64,16 @@ func (f *resetFixture) target(t *testing.T) uuid.UUID {
 	return id
 }
 
+// passwordless seeds an active non-admin OIDC-only user: no password hash and an
+// IdP identity. Callers add whatever vault state they assert on.
+func (f *resetFixture) passwordless(t *testing.T) uuid.UUID {
+	t.Helper()
+	id := cliSeedUser(t, f.pool, false)
+	cliMustExec(t, f.pool, `UPDATE users SET password_hash=NULL, oidc_issuer=$2, oidc_subject=$3 WHERE id=$1`,
+		id, "https://idp.example", "sub-"+id.String())
+	return id
+}
+
 func (f *resetFixture) email(t *testing.T, id uuid.UUID) string {
 	t.Helper()
 	var email string
@@ -267,14 +277,21 @@ func TestResetLinkIssueGuardsLiveDB(t *testing.T) {
 			t.Fatalf("inactive = %d, want 400", rec.Code)
 		}
 	})
-	t.Run("passwordless target is 400 in M1", func(t *testing.T) {
-		target := f.target(t)
-		cliMustExec(t, f.pool, `UPDATE users SET password_hash=NULL WHERE id=$1`, target)
-		if rec := f.issueAs(t, f.adminJWT, target); rec.Code != http.StatusBadRequest {
-			t.Fatalf("passwordless = %d, want 400", rec.Code)
+	t.Run("passwordless target gets a vault_only link", func(t *testing.T) {
+		target := f.passwordless(t)
+		rec := f.issueAs(t, f.adminJWT, target)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("passwordless = %d, want 201\n%s", rec.Code, rec.Body.String())
 		}
-		if f.liveLinks(t, target) != 0 {
-			t.Fatal("passwordless link created")
+		var dto apitypes.AccountResetLinkDTO
+		if err := json.Unmarshal(rec.Body.Bytes(), &dto); err != nil {
+			t.Fatal(err)
+		}
+		if dto.Kind != "vault_only" {
+			t.Fatalf("kind = %q, want vault_only", dto.Kind)
+		}
+		if f.liveLinks(t, target) != 1 {
+			t.Fatal("passwordless issue did not leave exactly one live link")
 		}
 	})
 	t.Run("unknown target is 404", func(t *testing.T) {
@@ -554,8 +571,8 @@ func TestResetLinkFailuresAreByteIdenticalLiveDB(t *testing.T) {
 		{"redeem expired", f.redeem(expired, resetNewPassword)},
 		{"redeem password link without a password", f.redeem(valid, "")},
 	}
-	// Kind mismatch: a vault_only link row (as M2 will issue) redeemed with a password, and the
-	// stored kind disagreeing with the users row.
+	// Kind mismatch: a link row whose stored kind (vault_only) disagrees with the target's
+	// current row (has a password), which is unusable for preview and redeem alike.
 	mismatchTarget := f.target(t)
 	mismatch := f.mustIssue(t, mismatchTarget)
 	cliMustExec(t, f.pool, `UPDATE account_reset_links SET kind='vault_only' WHERE user_id=$1`, mismatchTarget)

@@ -341,6 +341,8 @@ describe("AdminUsers reset link (PRD #3989)", () => {
     await screen.findByLabelText("Reset link");
     const dialog = screen.getByRole("dialog");
     expect(dialog.textContent).toMatch(/Vault only \(single sign-on account\)/);
+    expect(dialog.textContent).toMatch(/signs in with single sign-on, then sets a new vault passphrase/);
+    expect(dialog.textContent).not.toMatch(/password and vault|set a password/i);
     expect(within(dialog).getByRole("note").textContent).toMatch(/takes over an admin account/);
   });
 

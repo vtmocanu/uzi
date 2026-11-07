@@ -190,9 +190,19 @@ restores account access, not vault contents.
   way to create the fresh vault: it is created at the first password sign-in
   once an administrator turns password sign-in on, or through
   `POST /api/vault/enable` with the new password from an SSO session. Until
-  then the user can sign in through SSO but cannot store model credentials. Reset
-  links for users with no password (SSO-only accounts) are not yet
-  available.
+  then the user can sign in through SSO but cannot store model credentials. This
+  applies to a `password` link redeemed on such an instance. A user with no
+  password (SSO-only account) gets a `vault_only` link instead (below).
+- **Vault-only reset (users with no password).** An admin can issue a
+  `kind=vault_only` link for an account that has no password. Redeeming it asks
+  for no password, ends the user's browser sessions (`token_version` bump) and
+  denies approved CLI login requests. It deletes the same credentials, Codex
+  logins and vault as a password reset and leaves the account protected with no
+  vault. The user signs in through SSO, the app-wide banner asks for a new vault
+  passphrase through the existing create path (`POST /api/vault/passphrase`),
+  and they add their credentials again. An account linked to both SSO and a
+  password gets a `password` link. The seed admin, the issuer's own account and
+  deactivated targets are still refused.
 - **Running runs.** A run already executing keeps the credential its worker was
   issued until it ends; stopping or fencing active runs is out of scope. Its
   Codex refresh writes against a deleted account fail closed. Queued runs are
