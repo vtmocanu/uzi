@@ -155,7 +155,7 @@ export function TopCauses({ outcomes, personal, variant = "inline" }: { outcomes
   );
 }
 
-export function SinceLastFailedRun({ outcomes, owner, label = "Latest failure" }: { outcomes: RunOutcomes; owner?: string; label?: string }) {
+export function SinceLastFailedRun({ outcomes, owner, label = "Latest failure", wrap = false }: { outcomes: RunOutcomes; owner?: string; label?: string; wrap?: boolean }) {
   const now = useNow(30_000);
   const value = failureRecency(outcomes, now);
   const hasFailure = outcomes.last_failed_at != null && value !== "Unavailable";
@@ -166,10 +166,10 @@ export function SinceLastFailedRun({ outcomes, owner, label = "Latest failure" }
       {hasFailure ? (
         <p className="flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-1">
           <span className="shrink-0 text-fg">{label} <span className="font-mono tabular-nums">{value}</span> ago</span>
-          <span className="flex min-w-0 flex-1 basis-[120px] items-baseline gap-x-3">
-            <span className="min-w-0 truncate" title={originLabel}>{originLabel}</span>
-            {/* Owner shrinks to an ellipsis before the cause loses its space. */}
-            {ownerLabel && <span className="min-w-0 max-w-max grow shrink-0 basis-[1em] truncate" title={ownerLabel}>{ownerLabel}</span>}
+          <span className={cx("flex min-w-0 flex-1 basis-[120px] items-baseline gap-x-3", wrap && "flex-wrap gap-y-1")}>
+            <span className={wrap ? "min-w-0 break-words" : "min-w-0 truncate"} title={originLabel}>{originLabel}</span>
+            {/* Owner shrinks to an ellipsis before the cause loses its space (wrap: breaks onto its own line instead). */}
+            {ownerLabel && <span className={wrap ? "min-w-0 break-all" : "min-w-0 max-w-max grow shrink-0 basis-[1em] truncate"} title={ownerLabel}>{ownerLabel}</span>}
           </span>
           <span className="shrink-0">{outcomes.completed_since_last_failure ?? 0} completed since</span>
           {outcomes.last_failed_run_id && (
@@ -177,7 +177,7 @@ export function SinceLastFailedRun({ outcomes, owner, label = "Latest failure" }
           )}
         </p>
       ) : value === "Unavailable" ? (
-        <p>Latest failure: unavailable</p>
+        <p>{label}: unavailable</p>
       ) : (
         <p className={outcomes.finished > 0 ? "text-ok" : "text-muted"}>
           {outcomes.finished === 0 ? "No finished runs yet" : `No recorded failures · ${outcomes.completed} completed runs, none failed`}
@@ -219,6 +219,6 @@ const WINDOW_OPTIONS = [
   { value: "last_7_days", label: "Last 7 days" },
 ] as const;
 
-export function WindowToggle({ value, onChange }: { value: UsageWindow; onChange: (window: UsageWindow) => void }) {
-  return <SegmentedToggle label="Usage reporting period" options={WINDOW_OPTIONS} value={value} onChange={onChange} />;
+export function WindowToggle({ value, onChange, className }: { value: UsageWindow; onChange: (window: UsageWindow) => void; className?: string }) {
+  return <SegmentedToggle label="Usage reporting period" options={WINDOW_OPTIONS} value={value} onChange={onChange} className={className} />;
 }

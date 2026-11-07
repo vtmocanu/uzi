@@ -72,7 +72,7 @@ export function OverviewUsageCard({ self, admin, window, onWindowChange }: {
         <SectionTitle>Usage</SectionTitle>
         <div className="flex flex-wrap items-center gap-2">
           {admin && <SegmentedToggle label="Usage scope" options={SCOPE_OPTIONS} value={scope} onChange={setScope} className="" />}
-          <WindowToggle value={window} onChange={onWindowChange} />
+          <WindowToggle value={window} onChange={onWindowChange} className="" />
         </div>
       </div>
       <section aria-label={personal ? "Your usage" : "Factory usage"} className="min-w-0">
@@ -105,7 +105,7 @@ export function OverviewUsageCard({ self, admin, window, onWindowChange }: {
           </div>
           <div className="min-w-0 space-y-3">
             <TopCauses outcomes={outcomes} personal={personal} variant="list" />
-            <SinceLastFailedRun outcomes={lifetime} owner={owner} label="Latest failure (all time)" />
+            <SinceLastFailedRun outcomes={lifetime} owner={owner} label="Latest failure (all time)" wrap />
           </div>
         </div>
       </section>

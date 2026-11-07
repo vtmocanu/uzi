@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { useState } from "react";
 import { OverviewUsageCard } from "./OverviewUsageCard";
@@ -204,5 +204,68 @@ describe("OverviewUsageCard (#3881 M1)", () => {
     fireEvent.click(view.getByRole("button", { name: "Factory · all users" }));
     expect(view.queryByText(/runs with token usage/)).toBeNull();
     expect(view.getAllByRole("region", { name: /^(Your|Factory) usage$/ })).toHaveLength(1);
+  });
+  it("shows the recoverable-work note from needs_landing", () => {
+    const view = mount({ self: fixture().self });
+    expect(view.getByText("4 failed runs with recoverable work. May include work already landed.")).toBeTruthy();
+    cleanup();
+    const none = fixture().self;
+    none.outcomes.lifetime = outcomes({ needs_landing: 0 });
+    expect(mount({ self: none }).queryByText(/recoverable work/)).toBeNull();
+  });
+
+  it("masks the failure owner's email in demo mode in the Factory scope", () => {
+    const { self, admin } = fixture();
+    const view = mount({ self, admin });
+    fireEvent.click(view.getByRole("button", { name: "Factory · all users" }));
+    const region = within(view.getByRole("region", { name: "Factory usage" }));
+    expect(region.getByTitle("owner.person@example.com")).toBeTruthy();
+    act(() => setDemoMode(true));
+    expect(region.queryByText(/owner\.person@example\.com/)).toBeNull();
+    expect(region.queryByTitle("owner.person@example.com")).toBeNull();
+    expect(region.getByTitle("Owner").textContent).toBe("Owner");
+  });
+
+  it("signs the 7-day change against all time in both scopes", () => {
+    const { self, admin } = fixture();
+    self.outcomes.last_7_days = { ...self.outcomes.last_7_days, finished: 20, failed: 1 };
+    admin.factory.outcomes.last_7_days = { ...admin.factory.outcomes.last_7_days, finished: 40, failed: 2 };
+    const view = mount({ self, admin, initial: "last_7_days" });
+    expect(view.getByText("−5.0 pp vs all-time 10.0%")).toBeTruthy();
+    fireEvent.click(view.getByRole("button", { name: "Factory · all users" }));
+    expect(view.getByText("−5.0 pp vs all-time 10.0%")).toBeTruthy();
+    cleanup();
+    const worse = fixture().self;
+    worse.outcomes.last_7_days = { ...worse.outcomes.last_7_days, finished: 20, failed: 4 };
+    expect(mount({ self: worse, initial: "last_7_days" }).getByText("+10.0 pp vs all-time 10.0%")).toBeTruthy();
+  });
+
+  it("shows a muted empty state in the causes list when nothing failed", () => {
+    const { self } = fixture();
+    self.outcomes.lifetime = outcomes({ failed: 0, fail_origins: {} });
+    const view = mount({ self });
+    expect(view.getByRole("heading", { name: "Top causes" })).toBeTruthy();
+    expect(view.getByText("No failures in this period.")).toBeTruthy();
+  });
+
+  it("renders 'other causes' as plain text in the Factory scope", () => {
+    const { self, admin } = fixture();
+    admin.factory.outcomes.lifetime = {
+      ...admin.factory.outcomes.lifetime,
+      fail_origins: { agent_failure: 8, run_timeout: 5, workflow_scope_missing: 3, push_secret_blocked: 2, unknown: 2 },
+    };
+    const view = mount({ self, admin });
+    fireEvent.click(view.getByRole("button", { name: "Factory · all users" }));
+    const row = view.getByText("other causes").closest("li")!;
+    expect(row.textContent).toBe("other causes4");
+    expect(within(row).queryByRole("link")).toBeNull();
+  });
+
+  it("drops the Factory all-time sub-line when earliest_run is null", () => {
+    const { self, admin } = fixture();
+    admin.earliest_run = null;
+    const view = mount({ self, admin });
+    fireEvent.click(view.getByRole("button", { name: "Factory · all users" }));
+    expect(view.queryByText(/across every user/)).toBeNull();
   });
 });
