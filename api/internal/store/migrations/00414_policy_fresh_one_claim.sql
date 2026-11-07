@@ -7,8 +7,10 @@ SET LOCAL lock_timeout = '5s';
 ALTER TABLE runs
     ADD COLUMN policy_fresh_consumed_generation bigint,
     ADD COLUMN policy_fresh_confirmed_generation bigint;
--- NOT VALID: the columns are new and every existing row is NULL, so there is nothing to validate
--- and no separate validation migration is needed; new and updated rows are checked immediately.
+-- NOT VALID: new and updated rows are checked immediately; migration 415 validates it, per the
+-- repo's paired NOT VALID / VALIDATE convention. The pending-with-consumed and consumed-without-
+-- preserving invariants are deliberately not encoded here (an older API writing during a rolling
+-- deploy does not know these columns); the writers and this migration's Down enforce them.
 ALTER TABLE runs ADD CONSTRAINT runs_policy_fresh_generation_shape CHECK (
     (policy_fresh_consumed_generation IS NULL OR (policy_fresh_consumed_generation > 0 AND policy_fresh_consumed_generation <= 9007199254740991))
     AND (policy_fresh_confirmed_generation IS NULL

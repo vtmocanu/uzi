@@ -6483,7 +6483,7 @@ WITH candidates AS MATERIALIZED (
     INSERT INTO run_user_inputs (run_id, kind, body)
     SELECT r.id, 'resume', '{"policy_fresh":"restored","generation":' || r.claim_generation::text || '}'
     FROM runs r
-    WHERE r.id IN (SELECT run_id FROM eligible_candidates) AND r.worker_id = @worker_id AND r.claim_generation = @claim_generation
+    WHERE r.id = @id AND r.id IN (SELECT run_id FROM eligible_candidates) AND r.worker_id = @worker_id AND r.claim_generation = @claim_generation
       AND r.status = 'claimed'
       AND r.policy_fresh_consumed_generation = @claim_generation::bigint
       AND r.policy_fresh_confirmed_generation IS NULL AND r.policy_preserve_required

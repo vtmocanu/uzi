@@ -88,6 +88,44 @@ func TestPolicyFreshOneClaimMigrationLiveDB(t *testing.T) {
 	}
 }
 
+// Migration 415 validates the 414 shape check; its Down restores the NOT VALID check, which still
+// guards new writes, and the 414 Down then proceeds as before.
+func TestPolicyFreshOneClaimValidateMigrationLiveDB(t *testing.T) {
+	f := newDownFx(t)
+	id := f.consumedFresh(2, true)
+	validated := func() bool {
+		var v bool
+		if err := f.pool.QueryRow(f.ctx, "SELECT convalidated FROM pg_constraint WHERE conname=$1", freshShapeConstraint).Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	if err := store.MigrateTo(f.ctx, f.dsn, 415); err != nil {
+		t.Fatalf("Up to 415: %v", err)
+	}
+	if f.version() != 415 || !validated() {
+		t.Fatalf("415 left version %d, validated=%v", f.version(), validated())
+	}
+	if _, err := f.pool.Exec(f.ctx, "UPDATE runs SET policy_fresh_confirmed_generation=3 WHERE id=$1", id); err == nil {
+		t.Fatal("validated shape check accepted confirmed != consumed")
+	}
+	if err := store.MigrateDownTo(f.ctx, f.dsn, 414); err != nil {
+		t.Fatalf("Down to 414: %v", err)
+	}
+	if f.version() != 414 || validated() || f.columns(freshColumns...) != 2 {
+		t.Fatalf("415 Down left version %d, validated=%v, %d fresh columns", f.version(), validated(), f.columns(freshColumns...))
+	}
+	if _, err := f.pool.Exec(f.ctx, "UPDATE runs SET policy_fresh_consumed_generation=NULL WHERE id=$1", id); err == nil {
+		t.Fatal("restored NOT VALID shape check accepted confirmed without consumed")
+	}
+	if err := store.MigrateDownTo(f.ctx, f.dsn, 413); err != nil {
+		t.Fatalf("414 Down after 415 Down: %v", err)
+	}
+	if f.version() != 413 || f.columns(freshColumns...) != 0 {
+		t.Fatalf("chain left version %d and %d fresh columns", f.version(), f.columns(freshColumns...))
+	}
+}
+
 // Down converts a paused or queued row still carrying a pending or unconfirmed one-claim Fresh
 // authorization, leaves confirmed and retired history alone, keeps every migration 413 column and
 // value, and the Down to 412 still works afterwards.
@@ -221,7 +259,7 @@ func TestPolicyFreshOneClaimDownRefusesOrphansLiveDB(t *testing.T) {
 		dropShape(f)
 		done := f.running()
 		mustExec(f.ctx, t, f.pool, "UPDATE runs SET status='failed',finished_at=now(),policy_fresh_confirmed_generation=3 WHERE id=$1", done)
-		// Restore the constraint (NOT VALID, as shipped) so Down finds what it drops.
+		// Re-add a constraint of that name (NOT VALID, so the orphan row is accepted) so Down finds what it drops.
 		mustExec(f.ctx, t, f.pool, `ALTER TABLE runs ADD CONSTRAINT `+freshShapeConstraint+` CHECK (policy_fresh_confirmed_generation IS NULL OR policy_fresh_consumed_generation IS NOT NULL) NOT VALID`)
 		if err := store.MigrateDownTo(f.ctx, f.dsn, 413); err != nil {
 			t.Fatalf("terminal row blocked Down: %v", err)
