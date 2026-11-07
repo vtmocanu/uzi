@@ -468,7 +468,7 @@ async function drive(o: DriveOpts) {
       };
     }
     return (sdk ?? new SdkExecutor(nullLogger(), homeDir, { queryFn: scriptedQuery(o.plans ?? [PLAN], counter, o.planMilestones) })).run(ctx);
-  }, ...(sdk ? { reapAttributedProcesses: (opts?: { deadlineAt?: number }) => sdk.reapAttributedProcesses(opts) } : {}) };
+  }, ...(sdk ? { closeAndSettlePlanSummary: (ms?: number) => sdk.closeAndSettlePlanSummary(ms), reapAttributedProcesses: (opts?: { deadlineAt?: number }) => sdk.reapAttributedProcesses(opts) } : {}) };
   o.setup?.(c, ctl);
   const forge = fakeGitlab();
   const sentinel = path.join(homeDir, "SESSION");
@@ -2378,7 +2378,12 @@ describe("issue #3980: the Claude gate checkpoint is bounded", () => {
           reap: async (_home, _worktree, _pids, opts) => {
             reaps.push({ deadlineAt: opts?.deadlineAt, at: Date.now() });
             entered = true;
-            await Promise.race([held, ...(opts?.deadlineAt === undefined ? [] : [new Promise((resolve) => setTimeout(resolve, Math.max(0, opts.deadlineAt! - Date.now())))])]);
+            await Promise.race([held, ...(opts?.deadlineAt === undefined ? [] : [(async () => {
+              await new Promise((resolve) => setTimeout(resolve, Math.max(0, opts.deadlineAt! - Date.now())));
+              // A timer can fire ~1 ms before Date.now() reaches the deadline: wait it out, plus a margin.
+              while (Date.now() < opts.deadlineAt!) await new Promise((resolve) => setTimeout(resolve, 1));
+              await new Promise((resolve) => setTimeout(resolve, 10));
+            })()])]);
             return { killed: [], left: [], complete: true };
           },
         },
@@ -2396,6 +2401,43 @@ describe("issue #3980: the Claude gate checkpoint is bounded", () => {
     assert.ok(Number.isFinite(reaps[0]!.deadlineAt), "the reap carried the gate deadline");
     const inStep = quiesces.filter((q) => q.at >= r.rec.startedAt && q.at <= r.rec.settledAt);
     assert.deepEqual(inStep, [], `no proof, helper pass or Docker request is admitted once the reap consumed the deadline: ${JSON.stringify(inStep)}`);
+  });
+
+  it("(5b) a plan-summary settle that honours its cap and expires the deadline leaves no attributed reap or proof admitted", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const settles: { deadlineMs: number | undefined; at: number }[] = [];
+    const reaps: number[] = [];
+    const quiesces: number[] = [];
+    let freeSettle = (): void => {};
+    const held = new Promise<void>((resolve) => { freeSettle = resolve; });
+    const r = await gateCheckpointRun({
+      dirty: true, forward: {},
+      runnerOpts: { quiesceRun: async (req: QuiesceRunRequest) => { quiesces.push(Date.now()); return quiesceRunAttempt(req); } },
+      hang: async (_flight, x) => {
+        const sdk = x.sdk!;
+        // Honours its deadlineMs argument; with none (an uncapped settle) it stays pending until released.
+        sdk.closeAndSettlePlanSummary = (async (deadlineMs?: number) => {
+          settles.push({ deadlineMs, at: Date.now() });
+          // The first settle is runFreeCapture's own; quiesceRun's settle is the one burning the deadline.
+          if (settles.length === 1) return;
+          if (deadlineMs === undefined) { await held; return; }
+          const end = Date.now() + deadlineMs;
+          await new Promise((resolve) => setTimeout(resolve, deadlineMs));
+          while (Date.now() < end) await new Promise((resolve) => setTimeout(resolve, 1));
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }) as typeof sdk.closeAndSettlePlanSummary;
+        const reap = sdk.reapAttributedProcesses.bind(sdk);
+        sdk.reapAttributedProcesses = ((opts?: { deadlineAt?: number }) => { reaps.push(Date.now()); return reap(opts); }) as typeof sdk.reapAttributedProcesses;
+        return { release: () => freeSettle(), entered: () => settles.length > 1 };
+      },
+    });
+    assertGateFailedClosed(r);
+    assertCustodyIntact(r);
+    const deadlineAt = r.rec.startedAt + r.deadlineMs;
+    const capped = settles.slice(1).filter((s) => s.at < deadlineAt); // later calls are the run's own teardown
+    assert.ok(capped.length > 0 && capped.every((s) => s.deadlineMs !== undefined), `quiesceRun's settle was capped: ${JSON.stringify(settles)}`);
+    for (const s of capped) assert.ok(s.at + s.deadlineMs! <= deadlineAt + 50, `settle cap ${s.deadlineMs} at ${s.at - r.rec.startedAt} ms outlives the gate deadline`);
+    assert.deepEqual(reaps.filter((t) => t >= deadlineAt), [], "no attributed reap starts after expiry");
+    assert.deepEqual(quiesces.filter((t) => t >= deadlineAt), [], "no proof is admitted after expiry");
   });
 
   it("(7) an owner abort during a hung sink-gate wait surfaces the owner's reason, not TransientRecoveryError", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {

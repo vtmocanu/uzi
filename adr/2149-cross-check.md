@@ -560,7 +560,7 @@ exited" holds for direct children, so a descendant spawned by an agent-planted g
 outlive the step and is left to a later quiesce; a single kernel-blocked procfs read cannot be
 interrupted; a killed child that never closes is still joined; and the worker-owned synchronous
 process-group probe and kill (`processGroupAlive`, `signalProcessGroup` and `killRunnerGroup` via
-`spawnSync`, under the uid split) carry no timer of their own, as on every other path. Codex paths are unchanged (their
+`spawnSync`, under the uid split) carry no timer of their own, as elsewhere in the worker. Codex paths are unchanged (their
 capture scope already bounds the step near 60 s). Rationale: an explicit deadline per seam rather
 than an ambient `MaintenanceBudget` (the #3181 precedent is for a no-custody settlement, and an
 ambient budget would be adopted as a cancellation budget) or `reportBudget` (which forces a

@@ -17592,7 +17592,8 @@ export class RunRunner {
         ? MaintenanceBudget.current()?.remainingMs()
         : Math.max(0, Math.min(MaintenanceBudget.current()?.remainingMs() ?? Infinity, opts.deadlineAt - Date.now())));
       // killAgentTree only signals the agent's own tree (no new long work), so it runs even when
-      // the deadline expired during the settle; the attributed reap and quiesceImpl below do not.
+      // the deadline expired during the settle; once expired, the attributed reap and quiesceImpl
+      // below are not started (an already-run reap is only folded into the blocked outcome).
       executor.killAgentTree?.();
       if (deadlineExpired()) return deadlineBlocked();
       // issue #1783 M2: a flight capturing a PREDECESSOR attempt's clone never quiesces it as its
@@ -17651,6 +17652,8 @@ export class RunRunner {
       let outcome: QuiesceRunOutcome;
       try {
         MaintenanceBudget.current()?.check();
+        // The common tail (#2213 latch, sourceJoinFailed, warn) is skipped on purpose: the blocked,
+        // unverified outcome already fails the step closed as residueBlocked.
         if (deadlineExpired()) return deadlineBlocked(attributedReap);
         outcome = await this.quiesceImpl({
           mode,
