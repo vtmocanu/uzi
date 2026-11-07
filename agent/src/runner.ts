@@ -235,6 +235,7 @@ import { errMessage, RUN_ID_RE, sleep } from "./util.js";
 import {
   AttemptReleaseError,
   CloneRetainedByQuarantineError,
+  RemediationRecoveryRetainedError,
   emitOrphanDiagnostic,
   type OrphanDiagnostics,
   type OrphanStage,
@@ -1400,6 +1401,20 @@ class OrphanHandoffReadmit extends Error {
 
 /** The re-admissions one claimant's clone phase takes after a handoff before it stops retained. */
 const ORPHAN_HANDOFF_MAX_READMITS = 2;
+
+/** issue #4058: thrown by {@link RunRunner.reclaimTerminalOrphan} when the terminal owner's journal carries an active
+ *  remediation recovery record bound to this branch. Nothing was written, moved, detached or released. phaseClone maps
+ *  it to {@link RunRunner.holdForPredecessorRemediation}; it never reaches the dispatcher. */
+class OrphanRemediationHold extends Error {
+  constructor(readonly diagnostics: OrphanDiagnostics, readonly journaledPath: string, readonly ownerRunId: string) {
+    super("terminal owner source is held under secret-scan remediation");
+  }
+}
+
+/** issue #4058: the bound on confirming the predecessor-remediation guidance before the hold is reported. */
+const GUIDANCE_FLUSH_MS = 10_000;
+
+const RETAINED_ADOPTION_FAILED_FEATURE = "recovery_cause_retained_recovery_adoption_failed";
 
 class RetainedRecoveryMissingJournalError extends Error {
   constructor() { super("Retained recovery blocked: required journal is missing; local work and custody retained"); }
@@ -2645,6 +2660,9 @@ interface RunFlight {
   inventoryArchiveNotices: Set<string>;
   /** Credential deferral/switch leaves this generation's guarded inventory open for resume. */
   keepGuardedInventoryOpen: boolean;
+  /** issue #4058: this claim holds a terminal predecessor's source under secret-scan remediation. The batcher's
+   *  permanent-failure report must not turn a lost guidance or park report into a terminal `failed`. */
+  orphanRemediationHold?: boolean;
   /** issue #1786: a stopped (fenced or stale) flight kept its worker-local source and latched
    *  {@link RunFlight.preserveRecoveryClone}; no later teardown path may dispose of it. */
   stoppedSourceKept: boolean;
@@ -6811,6 +6829,8 @@ export class RunRunner {
               runLog.warn(
                 e instanceof AttemptReleaseError
                   ? `predecessor attempt release failed at the ${e.stage === "ledger" ? "ledger append" : "journal clear"}; journal kept`
+                  : e instanceof RemediationRecoveryRetainedError
+                    ? "predecessor attempt release refused: active remediation record retained (remediation_retained); nothing released, journal kept"
                   : e instanceof CloneRetainedByQuarantineError
                     ? "predecessor attempt release skipped: worker residue quarantine latched; nothing released, journal kept"
                     : e instanceof CapturePathMismatchError
@@ -7749,6 +7769,9 @@ export class RunRunner {
    * the terminal is not stranded until boot (N4).
    */
   private async handlePermanentFailure(claim: ClaimResponse, flight: RunFlight, reason: string): Promise<void> {
+    // issue #4058: a predecessor-remediation hold reports no terminal state and aborts nothing; the flight stops
+    // retained through holdForPredecessorRemediation.
+    if (flight.orphanRemediationHold) return;
     if (flight.policyHold || flight.iterationParkState !== "none") return;
     if (flight.workerMemory?.hold) {
       this.retainWorkerMemoryCustody(flight);
@@ -13315,7 +13338,10 @@ export class RunRunner {
    *  retired through RecoveryCoordinator.retireCompletedSourceForHandoff (a retired owner, or a journal that changed
    *  under us, throws {@link OrphanHandoffReadmit}; a pending or uncertain retirement is a retained stop; a positively
    *  invalid or unsupported one refuses with `original`); a retained one is only classified, and only a positive
-   *  `not_completion` falls through to the unchanged detach. */
+   *  `not_completion` falls through to the unchanged detach.
+   *
+   *  issue #4058: an owner journal carrying an active remediation record bound to this branch is never reclaimed,
+   *  retired or detached (retained, fenced or plain): {@link OrphanRemediationHold} is thrown before any effect. */
   private async reclaimTerminalOrphan(
     barePath: string,
     claim: ClaimResponse,
@@ -13439,15 +13465,40 @@ export class RunRunner {
       refuse("completion_handoff", "completion_retirement_refused", undefined, undefined, subreason);
     // The effect branches below refuse on a changed pair or a fence; a journal retired or replaced under us is a
     // re-admission, not a terminal refusal. One re-read decides.
+    // issue #4058: the owner's journal carries an active remediation record bound to this branch. Nothing is written;
+    // phaseClone holds the claim for the owner (holdForPredecessorRemediation).
+    const holdRemediation = (): never => {
+      this.retainedLifecycleGuard(flight);
+      emitOrphanDiagnostic(diagnostics, journaledPath, "orphan_reclaim_refused", "completion_handoff",
+        "completion_retirement_pending", undefined, undefined, "remediation_retained");
+      throw new OrphanRemediationHold(diagnostics, journaledPath, ownerRunId);
+    };
     const refuseAfterReread = async (stage: OrphanStage, reason: OrphanReason, error: unknown): Promise<never> => {
       const again = await rereadFence();
       if (again?.state === "changed") return readmit();
+      if (error instanceof RemediationRecoveryRetainedError) {
+        // A record enrolled after the classification refused the effect. Decide on the journal as it is now.
+        if (again === undefined) {
+          // Unreadable or expired re-read: nothing can be proven either way, so stop retained (no hold reported).
+          this.retainedLifecycleGuard(flight);
+          emitOrphanDiagnostic(diagnostics, journaledPath, "orphan_reclaim_refused", "retirement", reason, error,
+            undefined, "remediation_retained");
+          throw new RetainedRecoveryStop({ cause: error });
+        }
+        if (again.remediation === "exact") return holdRemediation();
+        if (again.remediation === "mismatch") return refuse("path", "path_error", error);
+        return readmit();
+      }
       return refuse(stage, reason, error, undefined,
         isCompletionSourceFenceError(error) ? "fenced_source" : error instanceof CapturePathMismatchError ? "pair_changed" : "unknown");
     };
 
     const fenceState = await readFence();
-    if (fenceState.state === "changed") readmit();
+    if (fenceState.state === "changed") return readmit();
+    // issue #4058: classified before the fenced branch, the snapshot, quiescence and every effect, for retained, fenced and
+    // plain journals alike. A record naming another branch is a path error, never a hold.
+    if (fenceState.remediation === "mismatch") refuse("path", "path_error");
+    if (fenceState.remediation === "exact") holdRemediation();
     if (fenceState.state === "fenced") {
       // The one bound of the claimant's wait for the authority transaction A, shared by both fenced branches (the
       // unfenced baseline never waits for A here, so it computes none).
@@ -14154,6 +14205,8 @@ export class RunRunner {
         await reclaim();
         return false;
       } catch (error) {
+        // issue #4058: an active remediation record on the terminal owner's journal holds this claim for the owner.
+        if (error instanceof OrphanRemediationHold) return this.holdForPredecessorRemediation(flight, error);
         if (!(error instanceof OrphanHandoffReadmit)) throw error;
         lastReadmit = error;
         if (++handoffReadmits > ORPHAN_HANDOFF_MAX_READMITS) {
@@ -26286,6 +26339,50 @@ export class RunRunner {
         catch (waitError) { this.retainedLifecycleGuard(flight); throw waitError; }
       }
     }
+  }
+
+  /**
+   * issue #4058 - hold a claim whose terminal predecessor's source is under secret-scan remediation. Nothing local is
+   * written or released. It marks the flight retained, emits one guidance status naming only the predecessor run id,
+   * confirms its delivery within GUIDANCE_FLUSH_MS (unconfirmed delivery is logged and the hold is still reported), then
+   * parks the run at `recovery_wait` / `retained_recovery_adoption_failed` when the api advertises that cause. It always
+   * ends in a nonterminal {@link RetainedRecoveryStop}: no terminal report, settlement, capture or model turn. A pending
+   * owner Cancel surfaces from the lifecycle guard as {@link RetainedRecoveryCancelled}.
+   */
+  private async holdForPredecessorRemediation(flight: RunFlight, hold: OrphanRemediationHold): Promise<never> {
+    this.retainedLifecycleGuard(flight);
+    flight.orphanRemediationHold = true;
+    flight.keepGuardedInventoryOpen = true;
+    flight.preserveSession = true;
+    flight.retainedLocalCustody = true;
+    const predecessor = RUN_ID_RE.test(hold.ownerRunId) ? hold.ownerRunId : "unknown";
+    flight.batcher.emit({
+      kind: "status",
+      agent: "worker",
+      payload: {
+        text: `The agent did not start. The source of predecessor run ${predecessor} on this worker is held under secret-scan ` +
+          "remediation and requires review. Resume on this worker will hold again unchanged and adds at least one " +
+          "admission-counted custody hold; lost reports, crashes or worker re-registration can add more, up to this run's " +
+          "custody admission limit, unless that remediation has been resolved through a separately authorized route. " +
+          `Cancel ends this run. \`uzi run recovery ${predecessor}\` inspects the predecessor.`,
+      },
+    });
+    let delivered = false;
+    try {
+      delivered = await flight.batcher.flushOwned(
+        AbortSignal.any([this.retainedLifecycleSignal(flight), AbortSignal.timeout(GUIDANCE_FLUSH_MS)]));
+    } catch (error) {
+      this.retainedLifecycleGuard(flight);
+      flight.runLog.warn("guidance_unconfirmed", { reason: "flush_error", ...formatRetainedRecoveryDiagnostic(error, flight.redactText) });
+    }
+    this.retainedLifecycleGuard(flight);
+    if (!delivered) flight.runLog.warn("guidance_unconfirmed", { reason: "not_confirmed" });
+    this.retainedLifecycleGuard(flight);
+    if (this.client?.protocolFeatures?.includes(RETAINED_ADOPTION_FAILED_FEATURE) &&
+        Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0) {
+      await this.parkRetainedRecoveryExhausted(flight, "retained_recovery_adoption_failed");
+    }
+    throw new RetainedRecoveryStop({ cause: hold });
   }
 
   /** Per pass, two identical reports and at most two ownership probes; a capacity-only (marked) pass that
