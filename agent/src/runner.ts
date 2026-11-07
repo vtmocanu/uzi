@@ -15867,11 +15867,16 @@ export class RunRunner {
       requestedAgentSource: claim.requested_agent_source ?? null,
       ...(this.client.protocolFeatures.includes(PLAN_AGENT_SOURCE_FEATURE) ? {
         reportPlanAgentSource: async (source: AgentSource) => {
+          const signal = AbortSignal.any([
+            steering.lifecycleSignal(),
+            steering.terminalLifecycleSignal(),
+            this.shutdownSignal.signal,
+          ]);
           try {
-            await reportState({ status: "running", plan_agent_source: source }, cancel.signal);
+            await reportState({ status: "running", plan_agent_source: source }, signal);
           } catch (error) {
             if (isCheckedLifecycleControl(error) || error instanceof RetainedRecoveryStop) throw error;
-            cancel.signal.throwIfAborted();
+            signal.throwIfAborted();
             runLog.warn("could not record the plan agent source", { plan_agent_source: source, error: errMessage(error) });
           }
         },

@@ -10,6 +10,7 @@ import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import type { Executor, RunContext } from "../src/executor.js";
 import { RunRunner } from "../src/runner.js";
 import { RecoveryCoordinator } from "../src/recovery.js";
+import { CredentialSwitchSignal } from "../src/steering.js";
 import type { BaseAttestationHoldOutcome, ClaimResponse } from "../src/protocol.js";
 import { PLAN_AGENT_SOURCE_FEATURE, REPO_AGENT_SOURCE_FEATURE } from "../src/protocol.js";
 import { api, client, fakeGitlab, fx, installHarness } from "./runner-harness.js";
@@ -760,6 +761,53 @@ describe("repo-agent roster pinned to the default-branch revision (issue #3913)"
     } finally {
       release();
       api.planAgentSourceAckHold = undefined;
+      client.protocolFeatures = [];
+    }
+  });
+
+  it("PRD #3914 M3: after a confirmed credential switch give-up the plan source report still lands", async () => {
+    client.protocolFeatures = [REPO_AGENT_SOURCE_FEATURE, PLAN_AGENT_SOURCE_FEATURE];
+    try {
+      const h = HARNESSES[0]!;
+      commitOnOrigin({ [h.file]: h.content("Original review body") }, "ship the reviewer");
+      const claim = claimFor(h, { issue_iid: 89, issue_title: "plan source after switch give-up", claim_generation: 1, requested_agent_source: "repo" });
+      const git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
+      const realStatus = git.worktreeStatus.bind(git);
+      const realWip = git.commitWipMarker.bind(git);
+      const outcomes: string[] = [];
+      let spentSwitch = false;
+      let proceeded = false;
+      const rec = recordingLogger();
+      const { gitlab } = fakeGitlab();
+      const runner = new RunRunner(client, git, () => ({
+        executor: {
+          run: async (ctx) => {
+            git.worktreeStatus = (async () => ["M src/impl.ts"]) as typeof git.worktreeStatus;
+            git.commitWipMarker = (async () => false) as typeof git.commitWipMarker;
+            api.requestCredentialSwitch(claim.run_id, 1);
+            const since = Date.now();
+            while (!ctx.signal?.aborted) {
+              assert.ok(Date.now() - since < 10_000, "the credential switch never tripped");
+              await new Promise((r) => setTimeout(r, 5));
+            }
+            outcomes.push(await ctx.attemptCredentialSwitch!());
+            git.worktreeStatus = realStatus;
+            git.commitWipMarker = realWip;
+            spentSwitch = ctx.signal?.aborted === true && ctx.signal.reason instanceof CredentialSwitchSignal;
+            await ctx.reportPlanAgentSource!("repo");
+            proceeded = true;
+            return { branch: ctx.branch };
+          },
+        },
+      }), rec.logger, 20, undefined, { pollMs: 5, planApprovalTimeoutMs: 0, recoveryRetryMs: 1, gitlab });
+      await runner.execute(claim);
+      assert.deepEqual(outcomes, ["gave_up"], "the switch gave up and the run continued on the same claim");
+      assert.equal(spentSwitch, true, "the shared cancel signal still carries the spent switch");
+      assert.equal(proceeded, true, "the executor continued past the plan source report");
+      assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.plan_agent_source === "repo"),
+        JSON.stringify(api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body)));
+      assert.ok(!loggedMessages(rec.lines).includes("could not record the plan agent source"), loggedMessages(rec.lines).join("\n"));
+    } finally {
       client.protocolFeatures = [];
     }
   });
