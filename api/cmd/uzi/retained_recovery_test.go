@@ -396,7 +396,7 @@ func TestRetainedAdoptionCLI(t *testing.T) {
 				t.Fatalf("exit %d mutation %v: %s", code, mutation, errout)
 			}
 			copy := out + errout
-			requireWorkerCopy(t, copy, "adoption failed", "integrity check refused adoption",
+			requireWorkerCopy(t, copy, "integrity hold", "remediation record refused source use",
 				"local work and custody preserved", "owner-held", "no automatic resume",
 				"uzi run resume r1", "uzi run cancel r1", "availability")
 			for _, bad := range []string{"timed retry", "2099-", "fresh allowance", "contains the latest work"} {
@@ -467,8 +467,8 @@ func TestRetainedAdoptionWaitAndFollow(t *testing.T) {
 			if code != 0 || polls != tc.polls || mutation {
 				t.Fatalf("exit %d polls %d want %d mutation %v: %s", code, polls, tc.polls, mutation, errout)
 			}
-			requireWorkerCopy(t, errout, "owner-held", "adoption failed")
-			if strings.Count(errout, "adoption failed") != 1 || strings.Contains(errout, "timed retry") {
+			requireWorkerCopy(t, errout, "owner-held", "integrity hold")
+			if strings.Count(errout, "integrity hold") != 1 || strings.Contains(errout, "timed retry") {
 				t.Fatalf("wrong notices: %s", errout)
 			}
 		})
@@ -496,7 +496,7 @@ func TestRetainedAdoptionTUI(t *testing.T) {
 			m = step(m, tea.ColorProfileMsg{Profile: colorprofile.Ascii})
 			m = step(m, tea.WindowSizeMsg{Width: 60, Height: 36})
 			out := stripANSI(m.View().Content)
-			requireWorkerCopy(t, out, "adoption failed", "Integrity check refused adoption",
+			requireWorkerCopy(t, out, "Integrity hold", "remediation record refused source use",
 				"Local work and custody preserved", "no automatic resume", "owner Resume/Cancel",
 				"uzi run resume r1", "uzi run cancel r1", "availability and latest edits unverified")
 			for _, line := range strings.Split(out, "\n") {
@@ -520,7 +520,7 @@ func TestRetainedAdoptionTUI(t *testing.T) {
 		r.Status = status
 		row := apitypes.RunListItemDTO{RunDTO: r}
 		out, errout, code := runCLI(t, fakeEnv(&uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": r}}), "run", "get", "r1")
-		if code != 0 || strings.Contains(out+errout, "adoption failed") || runBandOf(row) == bandNeedsYou || strings.Contains(runStateWord(row), "recovery") {
+		if code != 0 || strings.Contains(out+errout, "integrity hold") || runBandOf(row) == bandNeedsYou || strings.Contains(runStateWord(row), "recovery") {
 			t.Fatalf("stale hold: %d %s %s", code, out, errout)
 		}
 	}

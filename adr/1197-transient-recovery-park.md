@@ -1943,3 +1943,83 @@ API first; an older API omits the feature and the worker sends no marker.
 this base, see the [ADR-1296 #2969 amendment](1296-durable-run-recovery.md#amendment-2969-predecessor-guarded-hold-settlement-is-built-and-disabled-in-production)),
 #4001 and #4003 are related retained-recovery work; this amendment changes none
 of them.
+
+## Amendment 2026-11-07, #4058: a successor holds for its owner when a terminal predecessor's source is under remediation
+
+Decision record (AI-synced 2026-11-07). This extends the admission in the #3527 owner hold
+([amendment](#amendment-2026-10-27-3527-owner-held-retained-adoption-retry)) to one exact
+owner-journal classification, made before any effect, and qualifies the #3527 wording that the
+`retained_recovery_adoption_failed` cause means persisted `adoption_failed`, proven quiescence and
+preserved local work. For this classification the cause means only that the worker did not start the
+agent because the predecessor's source is held under secret-scan remediation. Nothing was adopted and
+no quiescence was proven.
+
+**The case.** A successor run reclaims an orphaned attempt whose predecessor is terminal (for example
+cancelled). The predecessor's recovery journal carries an active secret-scan `remediationRecovery`
+record bound to the same run, clone path and branch. Before this change the release or retire refused
+with an untyped error (subreason `unknown`) and the successor failed terminally; a retained journal was
+instead detached and the successor proceeded.
+
+**Decision.**
+
+- **Classification.** `readOrphanJournalFence` reports `remediation: "exact"` only when the record's
+  branch equals the classifier's branch. A schema-valid cross-branch record is `mismatch`, which keeps
+  the existing path_error refusal. The three refusal sites (release, retire and the new guard in
+  `detachTerminalRetained`) throw a typed `RemediationRecoveryRetainedError`. The closed subreason is
+  `remediation_retained`.
+- **Before any effect.** An exact classification emits `orphan_reclaim_refused` (stage
+  `completion_handoff`, reason `completion_retirement_pending`, subreason `remediation_retained`)
+  before the fenced handoff, retained detach, quiescence, release or retire. The worker then touches
+  nothing of the predecessor: journal, ledger, descriptors, source and custody hold are left as they
+  are.
+- **No quiescence proof.** The #3527 hold requires fresh quiescence because it reports on a source the
+  worker adopted. Here nothing is touched or adopted, so there is nothing to prove quiescent.
+- **Guidance and park.** The worker sends a status message naming only the predecessor run id. It says
+  the agent did not start, the source is held under secret-scan remediation and requires review, Resume
+  on this worker holds again and adds at least one admission-counted custody hold, Cancel ends the run,
+  and `uzi run recovery <predecessor>` inspects it. It confirms delivery (10 s) and parks even if
+  delivery is unconfirmed. It parks through the existing writer at `recovery_wait` /
+  `retained_recovery_adoption_failed`, then stops nonterminal. There is no new cause, wire field or
+  schema change. A 400 refusal of the park is logged and followed by a corrected status.
+- **Races.** A remediation record that appears after classification hits the typed refusal, and a
+  re-read then holds (exact), refuses (mismatch), readmits (changed or absent) or stops nonterminal
+  (unreadable).
+- **No new authority.** Nothing here retires, rebinds or discards remediation. Resume grants no
+  remediation authority: the next claim classifies the same journal and holds again.
+  The ADR-1296 enrolled-retirement refusal is unchanged (see its amendment note).
+
+**Accounting (measured by LiveDB in `remediation_hold_accounting_livedb_test.go`; the writers are unchanged).**
+
+- A positively ACKed immediate park ends that claim: retry NULL, `requeue_count` and
+  `retained_park_count` unchanged, claim released, affinity kept. The positively confirmed claim adds
+  one hold. Earlier unconfirmed claims in the same episode remain counted, so this is not one claim
+  per episode.
+- Charged paths consume `RUN_MAX_REQUEUES` per episode and end at `recovery_wait` /
+  `worker_requeue_exhausted`, never `failed`: running omissions
+  (`RequeueRunsMissingFromSnapshot`, `failRunsMissingFromSnapshotLocked`), genuine departure stamps
+  (`LockClaimedNeverStartedContinuations`) and a worker re-register. Register's orphan recovery
+  (`RequeueWorkerRuns`) charges `requeue_count`, and over the cap `failWorkerRunsOverCapLocked` parks
+  the run (measured: 4 claims and 4 holds at `RUN_MAX_REQUEUES=3`). A worker restart is therefore a
+  charged path.
+- A claim lost before any running report, listing or registration evidence, with no restart, is reset
+  uncharged by `SweepClaimedNeverStarted`, repeatedly, including after Resume. It is bounded only by
+  the run's own open holds reaching `custody_hold_limit` L (default 8): then `ClaimRun` refuses and the
+  run stays queued with the custody-capacity reason. That queued state is not an owner park. Measured: 8
+  at L=8, 3 at L=3, 7 more after a park plus Resume.
+- A worker that is online with current presence parks as `recovery_wait` /
+  `retained_continuation_unwitnessed`, uncharged.
+- Run-lifetime bound: this run's own open holds stay at or below L, on the premise that none is
+  released. This does not claim that owner aggregate custody is a transactional ceiling, or that the
+  owner's other runs are always blocked.
+- Disclosed: while held or queued, the run's holds are admission-counted and can reduce the owner's
+  capacity. While held it blocks the worker's upgrade or drain, like any owner-held cause. Owner Cancel
+  of a held successor is terminal and leaves its open hold or holds open (measured 1 to 1) for owner
+  discard; cleanup uses the existing owner discard after normal inspection.
+
+**Fallback.** If the api lacks the retained-recovery feature, the worker does not park, and the guidance
+says so. The same charged and uncharged arms above apply, with no owner hold.
+
+**Observed, not authorized.** `agent/test/git-orphan-remediation.test.ts` pins that the existing
+protected `discardProtectedSource` removes the source and clears the journal, remediation record
+included. That is observed behaviour of the existing owner discard, which requires review. It is not an
+authorized disposal route for remediation, and this amendment names none.

@@ -242,13 +242,13 @@ function adoptionFailed(stamp: string | null = null): Run {
 }
 it.each([null, "2099-01-01T00:00:00Z", "2020-01-01T00:00:00Z", "invalid"])("adoption integrity refusal ignores retry timestamp %s and uses owner actions", async (stamp) => {
   const { container } = render(view(adoptionFailed(stamp), true));
-  expect(screen.getByText("Retained recovery integrity check failed")).toBeTruthy();
-  expect(screen.getByText(/Integrity checks refused to adopt the retained work/, { selector: "p" })).toBeTruthy();
+  expect(screen.getByText("Integrity hold needs your decision")).toBeTruthy();
+  expect(screen.getByText(/remediation record refused source use, so the agent did not start/, { selector: "p" })).toBeTruthy();
   expect(screen.getByText(/Local work and its custody are preserved/, { selector: "p" })).toBeTruthy();
   expect(screen.getByText(/This hold has no scheduled retry. Only the run owner can Resume or Cancel/)).toBeTruthy();
   expect(container.textContent).not.toMatch(/retry automatically|retrying in|retry in|Automatic retry is due|Retry timing is unavailable/i);
   const notice = container.querySelector('div.sr-only[role="status"]')!;
-  await waitFor(() => expect(notice.textContent).toMatch(/Integrity checks refused/));
+  await waitFor(() => expect(notice.textContent).toMatch(/Integrity hold/));
   expect(notice.textContent).toMatch(/no scheduled retry/);
   expect(api.getRunArchives).toHaveBeenCalledWith("held");
   fireEvent.click(screen.getByRole("button", { name: /^Resume$/ }));

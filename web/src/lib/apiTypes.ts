@@ -3827,8 +3827,8 @@ export interface Run {
    *  a finite timestamp schedules a retry, see disk_park_count);
    *  "provider_outage" is a counted provider interruption with a scheduled retry;
    *  "retained_recovery_exhausted" can be timed or owner-held (see recovery_retry_not_before);
-   *  "retained_recovery_adoption_failed" means integrity checks refused adoption of retained
-   *  work: always owner-held with local work and custody preserved, no automatic retry.
+   *  "retained_recovery_adoption_failed" is an integrity hold: retained adoption or a predecessor
+   *  remediation record refused source use (the agent did not start): always owner-held with local work and custody preserved, no automatic retry.
    *  Only the owner can Resume or Cancel, through the existing owner authorization.
    *  "retained_continuation_unwitnessed" (issue #3859) means a retained-custody continuation's
    *  claimed worker flight was never witnessed starting or departing within a bounded window;

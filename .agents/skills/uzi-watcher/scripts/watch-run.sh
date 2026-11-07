@@ -75,7 +75,8 @@
 # STOP=recovery_wait:worker_memory_pressure, RESULT=stop:recovery_wait, exit 0. Back up available
 # work first, then ask the owner to Resume or Cancel.
 # A retained_recovery_adoption_failed park always stops as an owner decision regardless of retry stamp:
-# integrity checks refused adoption; local work and custody are preserved, with no automatic retry.
+# integrity hold: retained adoption or a predecessor remediation record refused source use (the agent
+# did not start); local work and custody are preserved, with no automatic retry.
 # A retained_continuation_unwitnessed park (server-only; a claimed flight never witnessed starting)
 # also always stops as an owner decision regardless of retry stamp: the claim was released, local
 # work and custody are preserved, and there is no automatic retry (not an integrity refusal).
@@ -191,7 +192,7 @@ while [ "$i" -lt "$MAX" ]; do
     fi
     if [ "$rc_cause" = retained_recovery_adoption_failed ]; then
       printf 'STOP=recovery_wait:retained_recovery_adoption_failed\n'
-      printf 'NOTE owner decision: integrity check refused adoption; local work and custody preserved; no automatic retry; owner uzi run resume or cancel; source/archive availability unverified\n'
+      printf 'NOTE owner decision: integrity hold, retained adoption or a remediation record refused source use; local work and custody preserved; no automatic retry; owner uzi run resume or cancel; source/archive availability unverified\n'
       printf 'RESULT=stop:recovery_wait\n'
       exit 0
     fi
