@@ -714,3 +714,61 @@ fs.openSync = function (p, ...rest) {
     assert.strictEqual(helperRejectionReason("not an error"), "helper_failed");
   });
 });
+
+describe("run process passes with a gate deadline (issue #3980)", () => {
+  /** A fake helper that prints `out` and exits 0, counting how many times it was wrapped (admitted). */
+  const countingHelper = (name: string, out: string, seen: { args: string[][] }): CommandWrapper => {
+    const script = path.join(root, name);
+    fs.writeFileSync(script, `process.stdout.write(${JSON.stringify(out)});\n`);
+    return (_command, args) => { seen.args.push([...args]); return { command: process.execPath, args: [script] }; };
+  };
+  const summary = `H\t${JSON.stringify({ scanned: 1, truncated: false, unresolved: 0, procMount: "ok", why: [] })}\n`;
+  /** The pass duration the worker passed the helper: argv after `-e <script>` is mode, proc root, home, worktree, pids, duration. */
+  const durationOf = (args: string[]): number => Number(args[2 + 5]);
+
+  it("a pass is admitted only while time is left: past the deadline no helper is wrapped and the scan is unknown", async () => {
+    const seen = { args: [] as string[][] };
+    const r = await scan({ wrappers: [countingHelper("late-a.cjs", summary, seen)], deadlineAt: Date.now() - 1 });
+    assert.deepStrictEqual(seen.args, []);
+    assert.strictEqual(r.complete, false);
+    assert.deepStrictEqual(r.incompleteReasons, ["time_budget"]);
+    const reaped = await reapRunProcesses(runHome, worktree, [], { procRoot, workerPid: 1, wrappers: [countingHelper("late-b.cjs", summary, seen)], deadlineAt: Date.now() - 1 });
+    assert.deepStrictEqual(seen.args, []);
+    assert.strictEqual(reaped.complete, false);
+  });
+
+  it("a pass's budget is the time left, not its own 10 s / 20 s default", async () => {
+    const seen = { args: [] as string[][] };
+    const deadlineAt = Date.now() + 700;
+    const r = await scan({ wrappers: [countingHelper("cap.cjs", summary, seen)], deadlineAt });
+    assert.strictEqual(r.complete, true);
+    assert.strictEqual(seen.args.length, 1);
+    assert.ok(durationOf(seen.args[0]!) <= 700 && durationOf(seen.args[0]!) > 0, `duration ${durationOf(seen.args[0]!)}`);
+    const plain = { args: [] as string[][] };
+    await scan({ wrappers: [countingHelper("nocap.cjs", summary, plain)] });
+    assert.strictEqual(durationOf(plain.args[0]!), 10_000, "without a deadline the default budget is unchanged");
+  });
+
+  it("a hung first pass is killed at the deadline, joined, and the second uid's pass is not admitted", async () => {
+    const hang = path.join(root, "hang.cjs");
+    fs.writeFileSync(hang, "setInterval(() => {}, 1000);\n");
+    const hanging: CommandWrapper = () => ({ command: process.execPath, args: [hang] });
+    const seen = { args: [] as string[][] };
+    const started = Date.now();
+    const r = await scan({ wrappers: [hanging, countingHelper("second.cjs", summary, seen)], deadlineAt: started + 400 });
+    const took = Date.now() - started;
+    assert.strictEqual(r.complete, false);
+    assert.deepStrictEqual(r.incompleteReasons, ["time_budget", "helper_timeout"].filter((x) => r.incompleteReasons?.includes(x as never)));
+    assert.ok(r.incompleteReasons?.includes("helper_timeout"));
+    assert.deepStrictEqual(seen.args, [], "the later pass was not admitted after the deadline");
+    assert.ok(took >= 350 && took < 4000, `bounded by the deadline, not the helper's 15 s: ${took} ms`);
+  });
+
+  it("with time left every pass runs as before", async () => {
+    fake(4701, { cwd: path.join(worktree, "src") });
+    const a = await scan();
+    const b = await scan({ deadlineAt: Date.now() + 60_000 });
+    assert.deepStrictEqual(b.pids, a.pids);
+    assert.strictEqual(b.complete, a.complete);
+  });
+});

@@ -1684,8 +1684,13 @@ export async function runAgentHelper(
   args: readonly string[],
   timeout: number,
   input = "",
+  /** issue #3980: `joinOnTimeout` records a timeout or a spawn error as the failure, SIGKILLs the
+   *  helper and settles only once it has closed (as the ambient-budget branch does), so a caller with
+   *  an absolute deadline never returns while its helper may still be running. Default: unchanged. */
+  opts: { joinOnTimeout?: boolean } = {},
 ): Promise<{ code: number; stdout: string }> {
   const budget = MaintenanceBudget.current();
+  const join = opts.joinOnTimeout === true;
   budget?.check();
   const remaining = budget?.cap(timeout);
   const wrapped = wrap(process.execPath, ["-e", script, ...args]);
@@ -1721,6 +1726,7 @@ export async function runAgentHelper(
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
       if (budget) failure = new Error("maintenance helper timed out");
+      else if (join) failure = helperFailure({ name: "Error", message: "", killed: true, signal: "SIGKILL" });
       else settle(() => reject(helperFailure({ name: "Error", message: "", killed: true, signal: "SIGKILL" })));
     }, duration);
     budget?.signal.addEventListener("abort", cancel, { once: true });
@@ -1732,6 +1738,7 @@ export async function runAgentHelper(
     });
     child.on("error", (e) => {
       if (budget) { failure = e; child.kill("SIGKILL"); }
+      else if (join) { failure = helperFailure(e as HelperExecError); child.kill("SIGKILL"); }
       else settle(() => reject(helperFailure(e as HelperExecError)));
     });
     child.on("close", (code, signal) =>
