@@ -277,6 +277,7 @@ export function IssueLine({
             value={scopeToggle.value}
             onChange={scopeToggle.onChange}
             className="ml-auto md:ml-0"
+            steadyWidth
           />
         )}
       </div>
