@@ -111,7 +111,15 @@ class Owned {
     assert.equal(response.error, undefined, response.error);
     return response.result;
   }
+  killed = false;
+  // The root proof process holds no CAP_KILL, so the owner SIGKILLs itself on request.
+  async killSelf() {
+    this.killed = true;
+    this.child.stdin.write('{"op":"selfkill"}\n');
+    assert.equal(await deadline(this.ended, "owner SIGKILL join"), null, "owner died by signal: " + this.stderr);
+  }
   async stop() {
+    if (this.killed) return;
     if (this.child.exitCode === null) this.child.stdin.end();
     assert.equal(await deadline(this.ended, "join owned child"), 0, this.stderr);
   }
@@ -163,8 +171,84 @@ test("pod epoch real Node fd survives flock helper exit, excludes peers and rele
     await ex.exit();
     assert.equal(flock(f.root, "-s"), 0, "positive control after EX owner exits");
     assert.equal(flock(f.root, "-x"), 0);
+    await descendantKeepsDescriptor(f);
+    await parentSigkillWhileMutating(f);
+    await directCloseReleases(f);
+    await ordinarySpawnsDoNotInherit(f);
   } finally { await f.close(); }
 });
+
+type Fixture = ReturnType<typeof fixture>;
+async function until(label: string, ready: () => boolean, ms = 5000) {
+  const end = performance.now() + ms;
+  while (!ready()) {
+    assert.ok(performance.now() < end, label);
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+}
+// The holder self-reports and exits when its release file appears: the root proof process
+// cannot read another uid's /proc/<pid>/fd or signal it.
+function release(f: Fixture, name: string) { fs.writeFileSync(path.join(f.root, name), ""); }
+
+async function descendantKeepsDescriptor(f: Fixture) {
+  const owner = await f.child();
+  assert.equal(await owner.ask({ op: "acquire", mode: "exclusive" }), "exclusive");
+  const grand = await owner.ask({ op: "mutator", shape: "grandchild", release: path.join(f.root, "release-grand"), finish: true });
+  assert.deepEqual(grand.holds, ["3"], "mutating grandchild holds the lock inode on the inherited descriptor");
+  await owner.ask({ op: "close" });
+  assert.equal(flock(f.root, "-x"), 200, "descendant keeps EX after the owner closed its own copy");
+  assert.equal(flock(f.root, "-s"), 200, "descendant keeps excluding SH after the owner closed");
+  await owner.exit();
+  assert.equal(flock(f.root, "-x"), 200, "descendant keeps EX after the owner exited and the middle process is gone");
+  release(f, "release-grand");
+  await until("descendant exit releases the lock", () => flock(f.root, "-x") === 0);
+}
+
+async function parentSigkillWhileMutating(f: Fixture) {
+  const control = await f.child();
+  await control.ask({ op: "acquire", mode: "exclusive" });
+  await control.killSelf();
+  assert.equal(flock(f.root, "-x"), 0, "positive control: SIGKILL of a lone owner releases the lock");
+  const owner = await f.child();
+  await owner.ask({ op: "acquire", mode: "exclusive" });
+  const holder = await owner.ask({ op: "mutator", shape: "direct", release: path.join(f.root, "release-direct"), finish: false });
+  assert.deepEqual(holder.holds, ["3"], "mutating child holds the lock inode on the inherited descriptor");
+  await owner.killSelf();
+  assert.equal(flock(f.root, "-x"), 200, "SIGKILLed parent cannot release EX while its mutating child lives");
+  assert.equal(flock(f.root, "-s"), 200, "SH is excluded until the mutating child exits");
+  release(f, "release-direct");
+  await until("mutating child exit releases the lock", () => flock(f.root, "-x") === 0);
+}
+
+async function directCloseReleases(f: Fixture) {
+  const owner = await f.child();
+  await owner.ask({ op: "acquire", mode: "exclusive" });
+  assert.equal(flock(f.root, "-x"), 200, "owner holds EX before close");
+  assert.equal(await owner.ask({ op: "close" }), "closed");
+  assert.equal(flock(f.root, "-x"), 0, "direct close releases with no inheritor, while the process lives");
+  const peer = await f.child();
+  assert.equal(await peer.ask({ op: "acquire", mode: "exclusive" }), "exclusive", "peer takes EX after the close");
+  assert.equal(flock(f.root, "-s"), 200);
+  await peer.exit();
+  const shared = await f.child();
+  assert.equal(await shared.ask({ op: "acquire", mode: "shared" }), "shared");
+  assert.equal(await shared.ask({ op: "close" }), "closed");
+  assert.equal(flock(f.root, "-x"), 0, "direct close releases SH too");
+  await owner.exit(); await shared.exit();
+}
+
+async function ordinarySpawnsDoNotInherit(f: Fixture) {
+  const owner = await f.child();
+  await owner.ask({ op: "acquire", mode: "exclusive" });
+  const spawns = await owner.ask({ op: "ordinary" });
+  for (const kind of ["default", "inheritedStdio", "execFile", "shell", "asynchronous"]) {
+    assert.deepEqual(spawns[kind], [], kind + " spawn inherits no lock descriptor");
+  }
+  assert.deepEqual(spawns.viaScope, ["3"], "positive control: the detector sees the descriptor when the scope passes it");
+  assert.equal(flock(f.root, "-x"), 200, "owner still holds EX after the spawns");
+  await owner.exit();
+  assert.equal(flock(f.root, "-x"), 0, "no spawned process kept the lock");
+}
 
 test("pod epoch real concurrent consumers preserve S to T to S history and the full immutable ledger bound", { timeout: 60000 }, async () => {
   const f = fixture();
