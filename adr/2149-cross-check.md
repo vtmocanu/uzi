@@ -536,7 +536,7 @@ production defaults (request 3 s, preparation ≤3 s, poll ≤15 s, HTTP 30 s, s
 |---|---|---|---|
 | APPROVE / automatic REVISE | prepare ≤3 s, submit stage ≤30 s, poll window to the deadline, final transport check ≤3 s | ≈31 min | ≈2 h 1 min (7,236 s) |
 | Checked human gate (timed out, block, gated pass), first gate | the above + 3 s, semantic review ≤60 s, resumed-delivery wait ≤153 s (failure path), `planChangedFiles` ≤600 s, receipt settlement ≤60 s, presentation report ≤422 s, preparation ≤9 s | ≈53 min (rounded up) | ≈2 h 23 min (8,543 s, rounded up) |
-| Checked human gate on a re-plan gate (frozen milestones changed) | the first-gate row + gate checkpoint ≤60 s + post-deadline tail ≤≈16 s (≈1 s child kill and join, ≤10 s private temp-dir cleanup, ≤5 s helper overrun) = ≈76 s worst case | ≈54 min (3,143 s + 76 s = 3,219 s, rounded up) | ≈2 h 24 min (8,543 s + 76 s = 8,619 s, rounded up) |
+| Checked human gate on a re-plan gate (frozen milestones changed) | the first-gate row + gate checkpoint ≤60 s + post-deadline tail ≤≈16 s (≈1 s child kill and join, ≤10 s private temp-dir cleanup, ≤5 s helper overrun) = ≈76 s when those operations return (see Limits above) | ≈54 min (3,143 s + 76 s = 3,219 s, rounded up; when those operations return) | ≈2 h 24 min (8,543 s + 76 s = 8,619 s, rounded up; when those operations return) |
 
 **Gate checkpoint on a re-plan gate (#3980).** `prepareGateCheckpoint` runs only when the
 claim carries frozen execution milestones and the candidate's milestones differ from them, so a
@@ -553,8 +553,9 @@ reservation neither released nor cancelled by the step. An owner Cancel or shutd
 reason. The measured post-deadline tail is about 1 s without the runner/agent uid split (git
 child SIGTERM, SIGKILL after 1 s, join) and up to about 10 s more with it (awaited private
 temp-dir cleanup, `HELPER_TMP_REMOVE_TIMEOUT_MS` = 10 s), plus a quiescence or reap helper
-overrun of at most `HELPER_SLACK_MS` 5 s. The bound is therefore at most about 76 s worst case
-(60 s + 5 s + 10 s + about 1 s), typically about 61 s. Limits: the guarantee covers a live
+overrun of at most `HELPER_SLACK_MS` 5 s. The bound is therefore about 76 s
+(60 s + 5 s + 10 s + about 1 s), typically about 61 s, provided the untimed operations listed under
+Limits return; it is not unconditional. Limits: the guarantee covers a live
 worker process (no crash, storage or power-loss claim); "every child the step started has
 exited" holds for direct children, so a descendant spawned by an agent-planted git filter can
 outlive the step and is left to a later quiesce; a single kernel-blocked procfs read cannot be
@@ -572,7 +573,7 @@ live poller an owner Cancel is queued as such a row rather than applied server-s
 pressed during the hold takes effect only after the reservation settles and the switch is
 serviced: on a give-up the held flight applies it; after a release it waits for the next claim.
 Its bound is the hold's own: the audited bounds in the table above for the listed paths; on a
-re-plan gate it is that row plus the gate checkpoint's bound of at most about 76 s (#3980, above). Meanwhile the checker child may keep running until
+re-plan gate it is that row plus the gate checkpoint's bound of about 76 s when its untimed operations return (#3980, above). Meanwhile the checker child may keep running until
 its verdict or deadline. A server-side terminal cancel still ends the held flight at once, and a
 second Cancel after the release applies at once. The owner accepted this limit for #3953; prompt
 Cancel during the hold is #3974.
@@ -590,7 +591,7 @@ transaction. Custody is the ordinary owner-cancel disposition; observing the Can
 switch-specific custody operation. A probe failure, timeout or `false` counts as unknown and
 commits nothing, so an api without the field keeps the limit above. Remaining limits: on a
 re-plan gate the worker latches the Cancel promptly, but an in-flight gate checkpoint step delays
-the terminal report by at most about 16 s past the step's 60 s deadline (about 76 s from step entry; #3980, above); it presents no gate
+the terminal report by about 16 s past the step's 60 s deadline (about 76 s from step entry, when the untimed operations return; #3980, above); it presents no gate
 and services no switch afterwards. Graceful stop and auto-stop rows stay withheld (the probe reads
 only `stop_kind = 'cancelled'`); auto-stop still escalates server-side on its own timer. A Cancel
 pressed during the hold that a release beats still waits for the reclaim; one pressed after the
