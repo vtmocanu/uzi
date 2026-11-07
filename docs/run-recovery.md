@@ -2492,9 +2492,10 @@ source at a time, and keeps everything else:
 - Automatic content proof has finite budgets (metadata 16 MiB, worktree content
   512 MiB, 4 GiB per object-store snapshot, 131,072 metadata records, 16,384
   directory entries). A positively observed overflow keeps only that source
-  (`epoch_content_unproven`). An unreadable or indirect store (an alternate, a
-  promisor remote, a config include, a redirected `.git`) stops the epoch scope
-  as unknown instead.
+  (`epoch_content_unproven`). An unreadable store, an alternate outside the
+  clone's own or managed bare object stores, a promisor remote, a config include,
+  or a redirected `.git` stops the epoch scope as unknown instead. The managed
+  bare alternate used by a shared clone is admitted.
 - The `pod_epoch_reclaim` verdict adds `deleted`, `deleted_bytes`, `settled`,
   `kept_after_refusal`, `kept_residue`, `kept_protected`,
   `kept_unrecoverable_shape`, `source_use_not_ended` and `reclaim_bytes_state`,
