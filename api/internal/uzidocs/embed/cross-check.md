@@ -482,7 +482,11 @@ the next gate.
 
 The Claude checker has only the `Read`, `Grep` and `Glob` tools: no shell, web,
 nested-agent or write tools, and no repository settings, plugins, skills or MCP
-servers. It runs with an isolated environment holding only your Anthropic token
+servers. It also has the SDK's end-turn `StructuredOutput` tool, which returns
+only its final verdict and touches no files or network; it lets the SDK re-ask
+for a verdict that does not match the expected shape within the same session
+(up to five attempts, same turn limit, deadline and usage). If those retries are
+exhausted the check still fails as malformed. It runs with an isolated environment holding only your Anthropic token
 (a Codex checker holds only Codex credentials), as the worker's runner user.
 Direct reads are limited to its own checkout, plus its own SDK spill files for
 oversized tool output. Glob and Grep patterns that are absolute, home-relative

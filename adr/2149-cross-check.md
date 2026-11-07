@@ -714,3 +714,19 @@ silently. Decisions:
   switch is withheld, at `awaiting_input` and `awaiting_approval` alike; a committed Cancel ends
   the answer wait before any settlement is sent). A switch stamped after the answer applied does
   not block the settlement. This limit predates #3985 and is not changed by it.
+
+## Amendment 2026-11-07 — #4038: structured-output verdict carrier
+
+**Context.** A Claude check (Plan or Code) whose final message failed JSON verdict validation ended `malformed` after a full paid review, with no chance to correct the shape.
+
+**Decision.** The Claude checker requests its verdict through the Agent SDK's structured output (`outputFormat` of type `json_schema`, using the verdict schemas in `agent/src/codex/cross-check.ts`). The SDK then re-asks the model within the same session, up to 5 attempts, under the same turn limit, deadline and usage.
+
+- The SDK's end-turn `StructuredOutput` tool carries only the final verdict and touches no files. It is admitted by exact name, only when the check requests structured output, in the isolated tool gate, the init check and the Code tool budget (it does not consume the Read/Grep/Glob budget). This qualifies the confinement list above: the SDK `tools` option stays `Read`, `Grep` and `Glob`; `settingSources`, the disallowed tools and the path and pattern guards are unchanged.
+- The verdict is taken from the result's `structured_output` and still passes the unchanged validators, which remain authoritative. Structured output is a retry aid, not a trust boundary.
+- The Code schema leaves coverage unconstrained, because the validator accepts any coverage and the normalizer degrades it.
+- If the SDK exhausts its retries the check fails `malformed` with log subreason `structured_output_retries` and a fixed message.
+- The Codex checker is unchanged.
+
+**Evidence.** `agent/test/fixtures/claude-structured-output-0.3.310.json` was captured from the pinned SDK with scripted model turns. Replay tests in `agent/test/claude-structured-output-replay.test.ts` and `agent/test/claude-structured-output.test.ts` exercise it.
+
+**Rejected alternative.** A manual follow-up turn asking the model to re-emit only the JSON would add a resume path and separate usage accounting; the SDK retry stays inside one session.
