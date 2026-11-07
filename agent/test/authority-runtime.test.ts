@@ -1349,6 +1349,38 @@ describe("issue #4066: what keeps a shutdown from being drained", () => {
     assert.deepEqual(await incompleteReasons(f), ["enrollment_uncertain"]);
   });
 
+  it("a plain refusal raised after the slot landed (heads directory made unsafe) is enrollment_uncertain and incomplete", async (t) => {
+    const f = await faultRig(t);
+    await f.warm();
+    f.ctl.renames = 0;
+    const headsDir = path.join(f.root, ".uzi-authority", "heads");
+    const mode = fs.statSync(headsDir).mode & 0o777;
+    f.ctl.afterRename = async (nth) => {
+      if (nth === 1) await fsp.chmod(headsDir, 0o755); // the slot landed; the head write now meets an unsafe directory
+    };
+    await assert.rejects(
+      f.rt.withTransaction(() => f.rt.hooks.admitSourceUse(f.clone + "-b", "seed-attempt")),
+      (error: unknown) => error instanceof AuthorityRefusal && /unsafe authority directory/.test(error.message),
+    );
+    f.ctl.afterRename = undefined;
+    await fsp.chmod(headsDir, mode);
+    assert.equal(f.rt.snapshot().counts.enrollment_uncertain, 1);
+    assert.deepEqual(await incompleteReasons(f), ["enrollment_uncertain"]);
+  });
+
+  it("a slot that does not read back after its rename is enrollment_uncertain", async (t) => {
+    const f = await faultRig(t);
+    await f.warm();
+    f.ctl.renames = 0;
+    f.ctl.afterRename = async (nth, to) => {
+      if (nth === 1) await fsp.appendFile(to, " "); // the slot landed, then differs on read-back
+    };
+    await assert.rejects(f.rt.withTransaction(() => f.rt.hooks.admitSourceUse(f.clone + "-b", "seed-attempt")), /authority slot did not read back/);
+    f.ctl.afterRename = undefined;
+    assert.equal(f.rt.snapshot().counts.enrollment_uncertain, 1);
+    assert.deepEqual(await incompleteReasons(f), ["enrollment_uncertain"]);
+  });
+
   it("a clean refusal is not counted as an uncertain enrollment", async (t) => {
     const f = await faultRig(t);
     await f.warm();
@@ -1447,7 +1479,7 @@ describe("issue #4066: finishWorkerShutdown", () => {
     // Fail closed across the restart: the record is still running and a successor incarnation refuses the footprint.
     assert.equal((await peek(f, f.clone))?.pending?.status, "running");
     const successor = successorOf(f);
-    await assert.rejects(successor.withTransaction(() => successor.hooks.admitSourceUse(f.clone, "seed-canonical")), AuthorityRefusal);
+    await assert.rejects(successor.withTransaction(() => successor.hooks.admitSourceUse(f.clone, "seed-canonical")), /unresolved pending footprint/);
   });
 
   it("the deadline observer reports once while a prerequisite is pending, sets exit 1 and the barrier then logs nothing more", async (t) => {

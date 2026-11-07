@@ -113,9 +113,10 @@ function logDecision(log: ShutdownLog, decision: ShutdownResult): void {
 }
 
 /**
- * Armed at the first SIGTERM/SIGINT (idempotent: a repeated signal changes nothing). One ref'd timer: if the
- * barrier has not decided by `deadlineAt` it logs `worker_shutdown_result` incomplete (the prerequisites are still
- * pending, plus what the ledger shows), sets process.exitCode = 1 and marks the decision. It never cancels a join:
+ * Armed by the caller at the first SIGTERM/SIGINT, or at barrier entry when no signal came (idempotent: a later
+ * call changes nothing). One ref'd timer: if the barrier has not decided by `deadlineAt` it logs
+ * `worker_shutdown_result` incomplete (with `prerequisite_pending` unless the final drain had already started, plus
+ * what the ledger shows), sets process.exitCode = 1 and marks the decision. It never cancels a join:
  * the barrier keeps joining and the process still exits only when it is done.
  */
 export function armShutdownResultDeadline(options: ShutdownResultDeadlineOptions): ShutdownResultDeadlineHandle {

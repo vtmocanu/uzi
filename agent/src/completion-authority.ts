@@ -375,7 +375,9 @@ async function withDirGuard<T>(
   }
 }
 
-async function writeDurable(ops: AuthorityFsOps, dir: string, uid: number, name: string, content: string): Promise<void> {
+async function writeDurable(
+  ops: AuthorityFsOps, dir: string, uid: number, name: string, content: string, onRenamed?: () => void,
+): Promise<void> {
   await withDirGuard(dir, uid, async (dirHandle, check) => {
     const tmp = path.join(dir, `.${name}.${randomUUID()}.tmp`);
     try {
@@ -388,6 +390,7 @@ async function writeDurable(ops: AuthorityFsOps, dir: string, uid: number, name:
       } finally { await handle.close(); }
       await check(); // before anything is renamed into the store
       await ops.rename(tmp, path.join(dir, name));
+      onRenamed?.();
     } catch (error) {
       // Unlink through the held handle: after a directory swap the name resolves elsewhere.
       await fsp.unlink(path.join(`/proc/self/fd/${dirHandle.fd}`, path.basename(tmp)))
@@ -959,11 +962,23 @@ export class AuthorityStore {
     if (body.seq !== (head.get(body.key) ?? 0) + 1) throw new AuthorityRefusal("authority slot is not the next head sequence");
     head.set(body.key, body.seq);
     sealHead(this.#identityOf(), shard, head);
-    await writeDurable(this.#init.ops, dir, this.#init.uid, `${body.key}.json`, content);
-    const back = await readRegular(path.join(dir, `${body.key}.json`), this.#init.uid, MAX_SLOT_BYTES);
-    if (back !== content) throw new AuthorityPostWriteRefusal("authority slot did not read back");
-    this.#highWater.set(body.key, body.seq);
-    await writeHead(this.#init.ops, this.#identityOf(), shard, head);
+    let landed = false;
+    try {
+      await writeDurable(this.#init.ops, dir, this.#init.uid, `${body.key}.json`, content, () => { landed = true; });
+      const back = await readRegular(path.join(dir, `${body.key}.json`), this.#init.uid, MAX_SLOT_BYTES);
+      if (back !== content) throw new AuthorityPostWriteRefusal("authority slot did not read back");
+      this.#highWater.set(body.key, body.seq);
+      await writeHead(this.#init.ops, this.#identityOf(), shard, head);
+    } catch (error) {
+      // Once the slot is renamed into place any refusal (post-rename directory checks, the slot read-back,
+      // the head write) leaves a possibly landed admission: re-raise it as a post-write refusal, same message and kind.
+      if (landed && error instanceof AuthorityRefusal && !(error instanceof AuthorityPostWriteRefusal)) {
+        const converted = new AuthorityPostWriteRefusal(error.message, error.kind);
+        converted.cause = error;
+        throw converted;
+      }
+      throw error;
+    }
   }
 
   /** Current verified slot, or null when never admitted. A malformed slot refuses. */

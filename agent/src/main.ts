@@ -190,7 +190,7 @@ export function startupReapVerdict(result: ReapOrphansResult | undefined, aborte
 let fatalLog: Logger | undefined;
 let lifecyclePhase: "config" | "startup" | "reap" | "worker" | "stopped" = "config";
 let shutdownSignal: "SIGINT" | "SIGTERM" | undefined;
-/** issue #4066: how long after the first signal the worker has to report its shutdown result (k8s grace is longer). */
+/** issue #4066: how long after the first signal (or barrier entry, when no signal came) the worker has to report its shutdown result (k8s grace is longer). */
 const SHUTDOWN_RESULT_DEADLINE_MS = 35_000;
 
 /** Dependencies {@link buildRunExecutor} needs, factored out of `main()`'s closure so
@@ -382,7 +382,8 @@ async function mainBody(): Promise<void> {
   // protected startup access. Runtime shutdown hooks are installed once built.
   const controller = new AbortController();
   let shutdownRuntime: (() => void) | undefined;
-  // issue #4066: the shutdown budget starts at the FIRST signal; a repeated signal resets nothing. The observer is
+  // issue #4066: the shutdown budget starts at the FIRST signal, or at barrier entry when no signal came; a repeated
+  // signal resets nothing. The observer is
   // armed with a lazily bound snapshot: the authority runtime (and the git cache) may not exist yet at an early signal.
   let shutdownDeadlineAt: number | undefined;
   let shutdownBarrierStarted = false;
