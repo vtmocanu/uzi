@@ -13983,12 +13983,25 @@ export class GitCache {
                   if (emptyJournalProof) pairMismatch("epoch pair journal changed");
                   return refused("epoch_journal_changed");
                 }
+                // Only the three admitted epoch shapes may proceed: (a) ledger live with the strict journal,
+                // (c) ledger retired with the strict journal and a missing footprint, (b) ledger retired with
+                // the explicit `[""]` repair and an absent footprint (metadata only). Any other ledger state
+                // (reclaimed, abandoned) is refused before any effect, whatever the journal says.
+                const only = rec.parts[0]!;
+                const state = only.ledgerState;
+                if (rec.kind !== "attempt" || rec.parts.length !== 1 || only.attemptId === undefined) return refused("epoch_source_refused");
+                if (emptyJournalProof) {
+                  if (state !== "retired") return refused("epoch_source_refused");
+                  if (!rec.epochRetiredEmptyJournal || only.presence !== "missing") pairMismatch("epoch pair binding changed");
+                } else if (!(state === "live" || state === "retired" && only.presence === "missing")) {
+                  return refused("epoch_source_refused");
+                }
               }
               const ev = await this.evaluateRetained(g, rec, {
                 holds: opts.holds, ...(opts.lifecycle ? { lifecycle: opts.lifecycle } : {}), isLivePath: opts.isLivePath,
               });
               const want = mode === "protected" ? "local_protected_discard" : "local_discard";
-              const disposition = epoch ? ev.epochSettlement?.disposition ?? ev.disposition : ev.disposition;
+              const disposition = epoch ? ev.epochSettlement?.disposition : ev.disposition;
               if (disposition?.kind !== want) {
                 return refused(epoch ? "epoch_source_refused" : ev.disposition?.kind ?? "refused",
                   ev.disposition?.kind === "refused" ? ev.disposition.consumers : ev.blockers, ev.disposition);
