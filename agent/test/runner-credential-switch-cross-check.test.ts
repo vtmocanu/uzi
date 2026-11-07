@@ -2575,6 +2575,12 @@ describe("issue #3980: the Claude gate checkpoint is bounded", () => {
     ["a plain git failure", () => new Error("git status failed: fatal: bad object")],
     // The wrapper text of a deadline stop, but with no cause: nothing proves it was this gate's deadline.
     ["the wrapper text of a deadline stop with no cause", () => new Error("git x failed: recovery deadline exhausted")],
+    // A deadline-shaped cause under a message that does not end with it (the shape of a mid-child abort
+    // wrapped as "permit-held git operation aborted"): the suffix check keeps it out of the deadline family.
+    ["an unrelated message carrying a TimeoutError cause", () => new Error("permit-held git operation aborted",
+      { cause: new DOMException("The operation was aborted due to timeout", "TimeoutError") })],
+    ["an unrelated git failure carrying a deadline cause", () => new Error("git x failed: fatal: bad object",
+      { cause: new Error("recovery deadline exhausted") })],
   ] as const) {
     it(`(8b) ${label} from the capture passes through unchanged, not remapped to TransientRecoveryError`, { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
       const proto = RunRunner.prototype as unknown as { captureRecoveryRestorePoint: (...args: unknown[]) => Promise<unknown> };

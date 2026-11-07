@@ -566,7 +566,8 @@ capture scope already bounds the step near 60 s). An owner Cancel or shutdown re
 when the capture lane returns incomplete, instead of being remapped to the transient failure
 (issue #3980); a recovery deadline or timeout that git wraps is mapped to the transient failure.
 This does not cover every capture-lane abort: an owner Cancel or shutdown landing during a git
-child is still rethrown as the git wrapper error (this predates the change), and a git child whose
+child is still rethrown as a git error (the `git … failed` wrapper, or a permit-held git abort for
+a child the abort stops) rather than its own reason (this predates the change), and a git child whose
 own timeout kills it a few ms before the deadline can still fail as a plain git error rather than
 the transient failure. Rationale: an explicit deadline per seam rather
 than an ambient `MaintenanceBudget` (the #3181 precedent is for a no-custody settlement, and an

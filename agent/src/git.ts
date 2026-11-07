@@ -24001,7 +24001,8 @@ function isOutputOverflow(err: unknown): boolean {
 
 /** issue #3980: the Error options for a `git ... failed: ...` wrapper. Keeps the raw cause ONLY when the
  *  failure is this process's own recovery-deadline stop (the bare "recovery deadline exhausted" Error that
- *  recoveryRemaining throws, with no git stderr, or a TimeoutError raised by an abort signal), so the runner's
+ *  recoveryRemaining throws, with no git stderr, or the TimeoutError of an abort signal that had already fired
+ *  before the child started; an abort during a child arrives as an AbortError that boundaryAbortError takes first), so the runner's
  *  gate classifier can recognise a deadline stop that the wrapper's message alone cannot distinguish from a
  *  git failure. Every other failure keeps no cause. */
 function recoveryDeadlineCause(err: unknown): { cause: Error } | undefined {
