@@ -214,7 +214,7 @@ function hasContent(msg: Record<string, unknown>): boolean {
 
 /** Hook reservations and assistant tool_use blocks share IDs, so each call counts once.
  * Root and nested frames both count; the latch refuses every call after exhaustion. */
-class CodeToolBudget {
+export class CodeToolBudget {
   private readonly ids = new Set<string>();
   private readonly executed = new Set<string>();
   private readonly observed = new Set<string>();

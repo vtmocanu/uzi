@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import type { HookInput, HookJSONOutput, Options as SdkOptions } from "@anthropic-ai/claude-agent-sdk";
-import { buildClaudeCrossCheckOptions, checkerSurface, ClaudeCrossCheck } from "../src/claude-cross-check.js";
+import { buildClaudeCrossCheckOptions, checkerSurface, ClaudeCrossCheck, CodeToolBudget } from "../src/claude-cross-check.js";
 import { CODE_VERDICT_SCHEMA, PLAN_VERDICT_SCHEMA, validateCodeVerdict, validateVerdict } from "../src/codex/cross-check.js";
 import {
  buildIsolatedPreToolUse, checkIsolatedInit, ISOLATED_TOOLS, STRUCTURED_OUTPUT_CARRIER,
@@ -313,5 +313,17 @@ describe("the StructuredOutput carrier and the code tool budget", () => {
    yield success;
   })());
   assert.equal(text, '{"findings":[]}');
+ });
+ it("a budget with no carrier configured treats a StructuredOutput tool_use as unallowed and counts its hook call", async () => {
+  const frame = { type: "assistant", message: { content: [{ type: "tool_use", id: "so-1", name: STRUCTURED_OUTPUT_CARRIER, input: {} }] } };
+  assert.throws(() => new CodeToolBudget(new AbortController()).observe(frame), /unallowed tool/);
+  // The configured budget skips the same frame.
+  new CodeToolBudget(new AbortController(), STRUCTURED_OUTPUT_CARRIER).observe(frame);
+  // Unconfigured, the hook admits the carrier only as an ordinary counted call: after 200 ids it is denied.
+  const plain = new CodeToolBudget(new AbortController());
+  const input = (id: string, tool_name: string) => ({ hook_event_name: "PreToolUse", tool_use_id: id, tool_name, tool_input: {},
+   session_id: "s", transcript_path: "/unused", cwd: "/checkout" }) as HookInput;
+  for (let i = 0; i < 200; i++) assert.deepEqual(await plain.hook(input(`r${i}`, "Read")), {});
+  assert.match(JSON.stringify(await plain.hook(input("so-2", STRUCTURED_OUTPUT_CARRIER))), /tool budget exceeded/);
  });
 });
