@@ -273,8 +273,9 @@ or another counted park. Resume does not reset that cap. The one exception to
 
 **Capacity-only window (owner hold below the cap).** When a retained-recovery
 window ends with every reservation the worker witnessed refused for
-data-volume capacity (including a window that then ended by recovery deadline
-or budget after at least one such refusal), the worker sends its
+data-volume capacity (including a window whose next reservation then found the
+recovery deadline or budget spent after at least one such refusal; a deadline
+hit inside a consumed attempt makes the window mixed), the worker sends its
 `retained_recovery_exhausted` park with the request-only field
 `retained_capacity_only: true`, and only if the API advertises
 `retained_recovery_capacity_hold_v1`. The API then holds the run for the
@@ -287,9 +288,11 @@ recovery held for owner: every recovery attempt in this window was refused for
 data volume capacity; owner Resume required; predecessor work and custody
 retained". Owner Resume gives one more window; a further all-capacity window
 holds again. Mixed windows (any non-capacity failure), deadline-only windows
-and every other case keep the counted, timed park above. A 400 to the marked
-report (an older API) falls back to one unmarked report, which parks as
-counted and timed.
+and every other case keep the ordinary park rules above (counted and timed
+below the cap, held at it). An older API never advertises the feature, so it
+never receives the marker; if a rolled-back API answers the marked report with
+400, the worker falls back to one unmarked pass, which follows the ordinary
+park rules above.
 
 Trade-offs: freeing headroom alone no longer auto-resumes such a run, because
 owner Resume is required. The hold keeps `worker_id`, so it can delay that

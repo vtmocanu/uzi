@@ -582,7 +582,7 @@ reservation count. Owner Resume of `worker_requeue_exhausted` and bounded
 higher derived episode charge one of three reservations in a new five-minute
 window and clear only `budget_exhausted`. The default three timed parks are
 followed by an owner hold; Resume preserves that count. A window refused
-only for data-volume capacity is held for the owner without consuming a park.
+only for data-volume capacity is held for the owner without consuming a counted retained park.
 Timer promotion resets
 the run wall, while manual Resume preserves remaining wall budget and may need
 an owner extension. Other requeues, disk retries, memory-pressure Resume or a

@@ -26292,7 +26292,7 @@ export class RunRunner {
    * the api answers 400 is followed by at most one unmarked pass. All passes share one boundary deadline.
    * In the caller's capacity-only witness comparison, the r.* === w.* checks duplicate the
    * blockRecoveryEpisode fence and its readback on purpose (defence in depth, issue #4046), and
-   * observed === w.attempts relies on one flight per run (no other writer reserves in between).
+   * observed === w.attempts withholds the marker if any reservation in the window went unwitnessed.
    * Ownership only authorizes replay: only the report ACK's exact status/cause confirms.
    * Any unresolved outcome stops this flight without terminal reporting or releasing custody. */
   private async parkRetainedRecoveryExhausted(flight: RunFlight,
