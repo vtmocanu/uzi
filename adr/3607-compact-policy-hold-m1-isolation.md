@@ -398,3 +398,83 @@ track that predecessor and the new policy version. Earlier 00386/00388 reference
 describe historical numbers. Local targeted validation passed as inventoried in
 the PRD. Published-head review and complete exact-head CI remain required;
 no worker-provisioning, full-suite or LiveDB result follows from a local merge.
+
+## Consent and continuity (M2/M3)
+
+M2/M3 deliver the owner Resume path for a `codex_policy_hold`. The user-facing
+behaviour is in [Held on a Codex policy refusal](../docs/run-pause.md#held-on-a-codex-policy-refusal)
+and [Codex policy hold](../docs/cli.md#codex-policy-hold). This section records the
+decisions and what was rejected. The M1 deferral of Resume above is superseded for
+the modes below; Policy Stop and revise-turn admission at `awaiting_approval`
+remain approved omissions.
+
+### Episode-bound consent, not grant arithmetic
+
+Resume names its mode and the exact episode (`expected_episode_id`). The server
+compares that episode with the current hold; an exact replay returns 200 with
+`replay: true`, different guidance for the same episode is a 409 and is not
+recorded, and consent for an older episode cannot resolve a newer one. `set-token`
+cannot consent. Rejected: `ClaimRun` grant arithmetic and generation-wide grants
+(the latter deferred to a named follow-up). Binding every action to
+`expected_episode_id` is what stops a replay from authorizing a later refusal;
+later ordinary pickups are the chosen baseline behaviour, not reuse of old
+consent. Only the optional compatible-lane one-claim Fresh uses a pending intent,
+below.
+
+### R/VG/VH continuity: the required head moves only on verified publication
+
+A recorded required saved-work head is superseded only by a published report whose
+checkpoint contains the latest head, at the same claim generation the worker
+verified. Before any provider work the worker proves the recovered clone contains
+the required head; otherwise it re-holds `saved_work_missing` with nothing started.
+After `fresh_from_saved_work` the requirement persists until the claiming worker
+verifies it at the current claim generation. Residual: clearing relies on the
+claiming worker's local proof, not on publication.
+
+### One-claim Fresh is consumed in ClaimRun
+
+`fresh_one_claim` is consumed inside the `ClaimRun` transaction and restored only
+on server-known non-delivery. A start that is never confirmed re-holds as
+`fresh_start_uncertain` and is never repeated, because a provider conversation may
+already exist. A released worker image that advertises
+`provider_policy_hold_v1` but predates this support would consume the grant and
+re-hold as `session_missing` without starting a conversation, so the API rolls
+first and capable workers follow.
+
+### Guarded Downs (migrations 00413 to 00415, "Shape A")
+
+00413 adds the recorded hold cause and the required-head and recovery-verification
+columns, 00414 the one-claim Fresh generation columns and a `NOT VALID` shape check, and 00415 validates it. The
+Downs are guarded and run one version at a time from 00415: 00414 and 00413 refuse
+live or orphan rows and convert paused or queued active rows to failed, and refuse
+rows parked in wait states. Each is one transaction, so a `RAISE` rolls back fully;
+each holds `ACCESS EXCLUSIVE` on `runs`. 00413's Down is destructive for the hold
+cause and recovery identity columns of every row. Rollback is drain-only; the
+operator procedure is in
+[Rolling back](../docs/run-pause.md#rolling-back). Rejected: quiescing workers
+alone, which leaves an old API able to resume rows it does not understand.
+
+### Mcv not added
+
+A separate validation migration for the 00413 check (an "Mcv") was not added. The
+dba judged it optional: the API is a single Recreate-strategy instance, and the
+check cannot fail on the new all-NULL columns.
+
+### Residuals
+
+- Server enforcement covers applied refusals; local pending evidence protects only
+  its surviving worker.
+- An absent worker or journal beyond the existing pending lease, or the
+  wall-release race before delivery, can leave another claim unconstrained.
+- Retained custody still counts toward the per-owner custody admission limit
+  (default 8); no force-clear or capacity exception exists.
+- Held assigned workers can defer idle-only rolls indefinitely (#3103).
+- Policy journals survive a worker process crash, not storage or power loss.
+
+### #3153 map cell
+
+The runner-shared PVC subPath mount (controller render test
+`TestDockerWorkerSharesTheRunWorkdirWithDindButNotSecrets`) and the agent
+replacement test (`agent/test/runner-policy-saved-work.test.ts`) cover this cell: a
+replacement worker over the same data volume recovers present saved work and
+re-holds when it is absent.

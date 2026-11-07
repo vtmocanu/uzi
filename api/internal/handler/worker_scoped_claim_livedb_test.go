@@ -53,7 +53,7 @@ func TestWorkerScopedClaimWireLiveDB(t *testing.T) {
 				if err := json.Unmarshal(rec.Body.Bytes(), &reply); err != nil {
 					t.Fatal(err)
 				}
-				if !slices.Contains(reply.Features, "pending_outcome_scoped_claim_v1") || slices.Contains(reply.Features, "provider_policy_hold_v1") {
+				if !slices.Contains(reply.Features, "pending_outcome_scoped_claim_v1") || !slices.Contains(reply.Features, "provider_policy_hold_v1") {
 					t.Fatalf("feature readiness=%v", reply.Features)
 				}
 				return reply.Nonce

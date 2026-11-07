@@ -504,6 +504,14 @@ describe("preserve-only claim admission in phaseResume", () => {
       assert.equal(states.some(s => s.status === "failed"), false);
     });
 
+    it("fresh_start_uncertain from the executor (beforeModelWork=false) re-holds the same way, with no fabricated head", async () => {
+      await runner({}, async () => { throw new PolicyContinuationRejected("fresh_start_uncertain", false); }).execute(claimFor());
+      assert.equal(holds.length, 1);
+      reholdShape(holds[0], "fresh_start_uncertain");
+      assert.equal(holds[0]!.head, undefined, "no head is invented for a rejection that reached no model work");
+      assert.equal(states.some(s => s.status === "failed"), false, "never an ordinary terminal failure");
+    });
+
     it("refused: a real provider refusal keeps its metadata and the refused cause", async () => {
       const claim = claimFor({ session_id: null, policy_preserve_only: undefined });
       await runner({}, async () => {

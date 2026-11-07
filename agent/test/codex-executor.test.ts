@@ -7,7 +7,7 @@ import { m3Calls } from "./m3-recovery-fixture.js";
 import { PARK_RUN_CONTINUATION } from "../src/park-run.js";
 import { SummaryRunner, type IntentSummaryInput, type PlanSummaryInput } from "../src/summary-runner.js";
 import { overflowClock, drain, NATIVE_LIMIT, REPRO_DELAY } from "./overflow-clock.js";
-import { describe, it, mock, type TestContext } from "node:test";
+import { afterEach, beforeEach, describe, it, mock, type TestContext } from "node:test";
 import { dependencyWaitQuestion, dependencyWaitAnswer, dependencyWaitProgress, scriptedDependencyWait, dependencyWaitCallbacks, observeDependencyWait, expectDependencyWaitPaused } from "./dependency-wait-fixture.js";
 import assert from "node:assert/strict";
 import { commitDependencySlice, exerciseDependencyWaitRunner, exerciseExpiredWallRunner } from "./dependency-wait-runner-fixture.js";
@@ -29670,5 +29670,260 @@ describe("CodexExecutor: the one-claim Fresh allowance starts at most one provid
     assert.deepEqual(routes(rig.epochs[0]!.transport).map((r) => r.method), ["thread/start"], "the claim's one new conversation");
     assert.deepEqual(routes(rig.epochs[1]!.transport).map((r) => r.method), ["thread/resume"], "the recreated root never started another");
     assert.equal(allowance.remaining, 0);
+  });
+});
+
+// Issue #3607 m4: the compact policy-hold fake-provider matrix. Every case drives the REAL RunRunner
+// (admission, Outbox, hold reporting), the REAL CodexExecutor and CodexHarness, and a fake Codex
+// app-server transport. Nothing here stubs the executor, so the thread/start and thread/resume counts
+// are the harness's own. Each case that reaches the provider ends in a renewed provider refusal, which
+// the runner reports as a compact hold (the same end state a real continuation would reach).
+describe("compact policy hold: fake-provider continuation matrix (production runner, outbox and harness)", () => {
+  m2Runner.installHarness();
+  const realInspect = CodexSessionStore.inspectSession;
+  let transcript: "present" | "absent" | "unknown" = "present";
+  let nextIid = 36070;
+  const PLAN = "# reviewed plan\n- ship it";
+  const GUIDANCE = "OWNER-GUIDANCE-3607-use-the-saved-approach";
+  const GUIDANCE_ID = 31;
+  const EARLIER = [{ id: 21, body: "EARLIER-OWNER-FOLLOWUP-3607-A" }, { id: 25, body: "EARLIER-OWNER-FOLLOWUP-3607-B" }];
+  const rpcRejection = () => new CodexTransportError({ category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)" });
+
+  beforeEach(() => { transcript = "present"; });
+  afterEach(() => { CodexSessionStore.inspectSession = realInspect; });
+
+  interface Drive {
+    claim: (head: string) => Record<string, unknown>;
+    rejectResume?: boolean;
+    dockerHost?: string;
+    guidance?: boolean;
+    earlier?: readonly { id: number; body: string }[];
+  }
+
+  async function drive(o: Drive) {
+    const { api, client, fx } = m2Runner;
+    CodexSessionStore.inspectSession = (async () => transcript) as typeof CodexSessionStore.inspectSession;
+    api.setRegisterProtocolFeatures(["provider_policy_hold_v1", "claim_generation_fence"]);
+    await client.register("policy-matrix", "base", 1, [], ["provider_policy_hold_v1"], undefined, 0);
+    const head = spawnSync("git", ["-C", fx.originPath, "rev-parse", "HEAD"], { env: gitEnv(), encoding: "utf8" }).stdout.trim();
+    assert.match(head, /^[0-9a-f]{40}$/);
+    const runId = randomUUID();
+    const claim = m2Runner.gitlabClaim(nextIid++, {
+      run_id: runId, claim_generation: 3, plan_approved: true, plan_source: "agent", plan_md: PLAN, auto_approve: true,
+      secrets: { forge_pat: "fixture-forge-pat-000000", codex: { auth_mode: "api_key", capability: "fixture-capability", access_token: "fixture-access" } },
+      ...o.claim(head),
+    }) as ClaimResponse;
+    if (o.earlier) api.overrideFollowUps(runId, 200, { inputs: o.earlier.map(e => ({ id: e.id, kind: "follow_up", body: e.body })) });
+    if (o.guidance) api.setInputs(runId, [{ id: GUIDANCE_ID, kind: "follow_up", body: GUIDANCE }]);
+
+    const events: string[] = [];
+    const holds: PolicyHoldRequest[] = [];
+    const verifies: { claim_generation: number; required_head: string }[] = [];
+    const states: { status?: string }[] = [];
+    const reportState = client.reportState.bind(client);
+    client.reportState = async (...args) => { states.push({ status: args[1].status }); return reportState(...args); };
+    client.reportPolicyHold = async (_id, body) => {
+      holds.push(structuredClone(body));
+      events.push(`hold:${body.cause}`);
+      return { disposition: "applied", outcome_id: body.outcome_id, source_generation: body.source_generation,
+        observed_status: "paused", observed_generation: body.claim_generation, hold_reason: "codex_policy_hold" };
+    };
+    client.reportPolicyRecoveryVerified = async (_id, body) => {
+      verifies.push(structuredClone(body));
+      events.push("verify");
+      return { disposition: "recorded" };
+    };
+
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start" || c.method === "thread/resume" || c.method === "turn/start") events.push(`provider:${c.method}`);
+      if (c.method === "thread/start") return { thread: { id: "th-new" } };
+      if (c.method === "thread/resume") return { thread: { id: "saved-session" } };
+      if (c.method === "turn/start") {
+        const th = String(rec(c.params).threadId);
+        c.transport.push({ ...turnCompleted("failed", th), params: { threadId: th, turn: { id: "tn-1", status: "failed",
+          error: { codexErrorInfo: "cyberPolicy", message: "PRIVATE-PROVIDER-TEXT" } } } });
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    if (o.rejectResume) rig.transport.requestOverride = c => c.method === "thread/resume" ? Promise.reject(rpcRejection()) : undefined;
+    const launch = rig.deps.launchEffectRoot!;
+    rig.deps = { ...rig.deps, deferRegistryTeardown: true,
+      launchEffectRoot: async (spec, deadline) => forwardCredentialFreeGitRoot(spec, deadline, await launch(spec, deadline)) };
+    const runHome = path.join(m2Runner.homeDir, runId);
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, runHome);
+    const seen: RunContext[] = [];
+    const run = executor.run.bind(executor);
+    executor.run = async ctx => {
+      seen.push(ctx);
+      await fs.writeFile(path.join(ctx.worktreePath, "POLICY-WORK.txt"), "retained work\n");
+      if (o.guidance) await waitFor(() => ctx.isLiveFollowUpId?.(GUIDANCE_ID) === true, "owner guidance routed live");
+      return run(ctx);
+    };
+    const outbox = new Outbox({ root: path.join(fx.dataDir, "policy-matrix-outbox"), log: noopLog,
+      runMaxBytes: 64 * 1024 * 1024, maxBytes: 128 * 1024 * 1024, retentionMs: 86400000 });
+    await outbox.init();
+    const runner = m2Runner.runnerWith(() => ({ executor, homeDir: runHome }), m2Runner.fakeGitlab().gitlab, undefined, noopLog, {
+      outbox, activeRuns: new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 10),
+      quiesceRun: async () => ({ process: { state: "quiescent", processes: [], killed: [], detail: "fixture proof" },
+        docker: { state: "not_wired", removed: [], detail: "not wired" } }),
+      ...(o.dockerHost ? { dockerHost: o.dockerHost } : {}),
+    });
+    await withTimeout(runner.execute(claim), 30000, "matrix run");
+    const requests = rig.transport.requests;
+    return {
+      claim, runId, holds, verifies, states, events, seen, rig, head,
+      routes: requests.filter(r => r.method === "thread/start" || r.method === "thread/resume").map(r => r.method),
+      prompts: requests.filter(r => r.method === "turn/start").map(r => String((rec(r.params).input as { text?: string }[])[0]?.text)),
+      notices: api.messages(runId).map(m => String(rec(m.payload).event)),
+    };
+  }
+  type Result = Awaited<ReturnType<typeof drive>>;
+
+  const preserving = (extra: Record<string, unknown> = {}) => (head: string) =>
+    ({ session_id: "saved-session", policy_preserve_only: true, policy_expected_head: head, ...extra });
+  /** The proof is recorded before the first provider request of the claim. */
+  const verifiedBeforeProvider = (r: Result): void => {
+    const verify = r.events.indexOf("verify");
+    const provider = r.events.findIndex(e => e.startsWith("provider:"));
+    assert.ok(verify >= 0 && provider > verify, "head proof precedes provider work: " + JSON.stringify(r.events));
+    assert.deepEqual(r.verifies, [{ claim_generation: 3, required_head: r.head }]);
+  };
+  const refusedHold = (r: Result): void => {
+    assert.equal(r.holds.length, 1);
+    assert.equal(r.holds[0]!.cause, "refused");
+    assert.equal(r.holds[0]!.detail, "refused");
+    assert.equal(r.holds[0]!.tag, "cyberPolicy");
+    assert.equal(r.states.some(s => s.status === "failed" || s.status === "completed"), false, "a hold, never a terminal state");
+    assert.ok(!JSON.stringify(r.holds).includes("PRIVATE-PROVIDER-TEXT"));
+  };
+  const rehold = (r: Result, cause: PolicyHoldRequest["cause"], mode: string): void => {
+    assert.equal(r.holds.length, 1);
+    assert.equal(r.holds[0]!.cause, cause);
+    assert.equal(r.holds[0]!.detail, "resume_rejected");
+    assert.equal(r.holds[0]!.continuation_mode, mode);
+    assert.equal(r.holds[0]!.published, false);
+    assert.equal(r.states.some(s => s.status === "failed" || s.status === "completed"), false, "a hold, never a terminal state");
+  };
+  /** The first turn of a fresh conversation: approval framing, the approved plan, every earlier owner
+   *  follow-up in order, and the live guidance. */
+  const freshFirstTurn = (r: Result): void => {
+    const t = r.prompts[0]!;
+    assert.ok(t.includes(REVIEWED_RESUME_APPROVAL_GUIDANCE), "approval framing");
+    assert.ok(t.includes(`<approved_plan>\n${PLAN}\n</approved_plan>`), "selected plan");
+    const fenced = [...t.matchAll(/<owner_history_([0-9a-f]{16})>\n([\s\S]*?)\n<\/owner_history_\1>/g)].map(m => m[2]);
+    assert.deepEqual(fenced, EARLIER.map(e => e.body), "earlier owner follow-ups, oldest first");
+    assert.ok(t.includes(GUIDANCE), "the live owner guidance");
+    assert.ok(t.lastIndexOf(EARLIER[1]!.body) < t.indexOf(GUIDANCE), "history precedes the live guidance");
+  };
+
+  it("(i) a preserving continuation resumes the saved session and its turn carries the owner guidance", async () => {
+    const r = await drive({ claim: preserving(), guidance: true });
+    assert.deepEqual(r.routes, ["thread/resume"], "one resume, no thread/start");
+    assert.equal(rec(r.rig.transport.requests.find(q => q.method === "thread/resume")?.params).threadId, "saved-session");
+    assert.equal(r.prompts.length, 1);
+    assert.ok(r.prompts[0]!.includes(GUIDANCE), "the resumed turn includes the owner guidance");
+    assert.equal(r.seen[0]?.preserveConversation, true);
+    assert.equal(r.seen[0]?.policyFreshAllowance, undefined);
+    verifiedBeforeProvider(r);
+  });
+
+  it("(ii) a renewed refusal on the preserving continuation re-holds on the same conversation", async () => {
+    const r = await drive({ claim: preserving() });
+    assert.deepEqual(r.routes, ["thread/resume"]);
+    refusedHold(r);
+    assert.equal(r.holds[0]!.continuation_mode, "same_conversation");
+    assert.equal(r.holds[0]!.session_id, "saved-session");
+  });
+
+  it("(iii) a missing session id sends no provider request and re-holds session_missing", async () => {
+    const r = await drive({ claim: preserving({ session_id: null }) });
+    assert.equal(r.rig.providerLaunches(), 0, "no provider root was launched");
+    assert.deepEqual(r.routes, []);
+    rehold(r, "session_missing", "same_conversation");
+  });
+
+  it("(iii) an absent or unknown transcript sends no provider request and re-holds transcript_unknown", async () => {
+    for (const state of ["absent", "unknown"] as const) {
+      transcript = state;
+      const r = await drive({ claim: preserving() });
+      assert.equal(r.rig.providerLaunches(), 0, state);
+      assert.deepEqual(r.routes, [], state);
+      rehold(r, "transcript_unknown", "same_conversation");
+    }
+  });
+
+  it("(iii) a resume the provider rejects re-holds provider_resume_rejected: no thread/start, no lineage break", async () => {
+    const r = await drive({ claim: preserving(), rejectResume: true });
+    assert.deepEqual(r.routes, ["thread/resume"], "the rejected resume is the only thread request");
+    assert.equal(r.prompts.length, 0, "no turn was sent");
+    rehold(r, "provider_resume_rejected", "same_conversation");
+    assert.equal(r.notices.includes("resume_lineage_break"), false);
+  });
+
+  for (const lane of ["Docker-wired", "retained-recovery (not Docker-wired)"] as const) {
+    it(`(iv) an attempt-path claim on a ${lane} lane re-holds attempt_path with no provider work`, async t => {
+      // Docker-wired: the runner's dockerHost. Retained recovery: the persisted recovery mode that enables attempt paths.
+      if (lane !== "Docker-wired") t.mock.method(m2Runner.git, "recoveryAttemptMode", async () => true);
+      const r = await drive({ claim: preserving(), ...(lane === "Docker-wired" ? { dockerHost: "unix:///fixture" } : {}) });
+      assert.equal(r.rig.providerLaunches(), 0);
+      assert.deepEqual(r.routes, []);
+      assert.equal(r.verifies.length, 0, "the attempt-path rule precedes head verification");
+      rehold(r, "attempt_path", "fresh_from_saved_work");
+    });
+  }
+
+  it("(v-a) a confirmed fresh_from_saved_work makes exactly one thread/start; its first turn carries guidance, history and approval framing", async () => {
+    const r = await drive({ claim: () => ({ session_id: null }), guidance: true, earlier: EARLIER });
+    assert.deepEqual(r.routes, ["thread/start"]);
+    assert.equal(r.prompts.length, 1);
+    freshFirstTurn(r);
+    assert.equal(r.verifies.length, 0, "no saved-work head was required");
+    assert.equal(r.seen[0]?.preserveConversation, undefined, "an unconstrained fresh start");
+    refusedHold(r);
+  });
+
+  it("(v-b) the same with the saved-work head verified first (policy_saved_work_head)", async () => {
+    const r = await drive({ claim: head => ({ session_id: null, policy_saved_work_head: head }), guidance: true, earlier: EARLIER });
+    verifiedBeforeProvider(r);
+    assert.deepEqual(r.routes, ["thread/start"]);
+    freshFirstTurn(r);
+    assert.equal(r.seen[0]?.preserveConversation, undefined);
+    refusedHold(r);
+  });
+
+  it("(v-b) a saved-work head the clone does not hold re-holds saved_work_missing before any provider request", async () => {
+    const r = await drive({ claim: () => ({ session_id: null, policy_saved_work_head: "ab".repeat(20) }), earlier: EARLIER });
+    assert.equal(r.rig.providerLaunches(), 0);
+    assert.deepEqual(r.routes, []);
+    assert.equal(r.verifies.length, 0);
+    rehold(r, "saved_work_missing", "same_conversation");
+  });
+
+  it("(vi) fresh_one_claim makes exactly one thread/start, spends its allowance, and its first turn carries guidance, history and framing", async () => {
+    const r = await drive({ claim: preserving({ session_id: null, policy_fresh_session: true }), guidance: true, earlier: EARLIER });
+    verifiedBeforeProvider(r);
+    assert.deepEqual(r.routes, ["thread/start"], "exactly one new conversation");
+    freshFirstTurn(r);
+    assert.equal(r.seen[0]?.preserveConversation, true);
+    assert.deepEqual(r.seen[0]?.policyFreshAllowance, { remaining: 0 }, "the single start spent the allowance");
+    refusedHold(r);
+  });
+
+  it("(vii) an ordinary claim with no policy fields starts one thread with no policy admission", async () => {
+    const r = await drive({ claim: () => ({ session_id: null }) });
+    assert.deepEqual(r.routes, ["thread/start"]);
+    assert.equal(r.verifies.length, 0);
+    assert.equal(r.seen[0]?.preserveConversation, undefined);
+    assert.equal(r.seen[0]?.policyFreshAllowance, undefined);
+    assert.equal(r.claim.policy_preserve_only, undefined);
+    assert.equal(r.claim.policy_saved_work_head, undefined);
+  });
+
+  it("(vii) an ordinary claim whose resume the provider rejects still falls back to a fresh thread", async () => {
+    const r = await drive({ claim: () => ({ session_id: "saved-session" }), rejectResume: true });
+    assert.deepEqual(r.routes, ["thread/resume", "thread/start"], "unchanged: resume, then the lineage-break fresh start");
+    assert.equal(r.notices.includes("resume_lineage_break"), true);
+    assert.equal(r.verifies.length, 0);
   });
 });

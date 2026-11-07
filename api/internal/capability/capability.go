@@ -26,7 +26,7 @@ const (
 )
 
 // ProviderPolicyHoldV1 identifies workers implementing the complete compact hold protocol.
-// Vocabulary only during M1; server readiness is withheld until M2.
+// The api advertises it (handler protocolFeatures) and a worker negotiates it by registering it.
 const ProviderPolicyHoldV1 = "provider_policy_hold_v1"
 
 // PendingOutcomeScopedClaimV1 negotiates bounded pending-source accounting for claims.

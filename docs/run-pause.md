@@ -240,6 +240,95 @@ The reserve is best effort, not a cap; see [what it does not
 guarantee](rate-limits.md#it-is-best-effort). Slack pause notices for a reserve
 pause name the weekly usage reserve rather than an owner pause.
 
+## Held on a Codex policy refusal
+
+When the Codex provider refuses a root request under its usage policy, an
+eligible run pauses instead of failing: `status: paused` with
+`hold_reason: codex_policy_hold`. Eligible runs are non-interactive issue, task,
+prompt and self-improve runs. The run's work and recovery custody are kept, and
+**Cancel** stays available. Policy **Stop** and revising a turn at
+`awaiting_approval` are not available for this hold.
+
+The run DTO carries a `policy_hold` object (`hold_cause`, `resume_modes`,
+`pending_fresh`, `outcome_id`); the web run page and `uzi run get` show the same
+fields. **Resume** is an owner action that names one mode from
+`policy_hold.resume_modes` and the exact episode (`expected_episode_id`, the
+hold's `outcome_id`). The CLI form is in
+[Codex policy hold](cli.md#codex-policy-hold).
+
+| Mode | Offered on | What it does |
+|---|---|---|
+| `fresh_from_saved_work` | attempt-path lanes | Starts a fresh conversation from the saved work and resolves that refusal. Later pickups behave as ordinary pickups, with no repeated hold for that old refusal; a new refusal needs new consent. It also ends any earlier requirement to preserve the old conversation for the rest of the run, until a new refusal. |
+| `preserve` | compatible lanes | Continues the same conversation with your guidance. If the conversation is missing or rejected, the run is held again and never starts a new conversation. |
+| `fresh_one_claim` | compatible lanes | Exactly the next pickup may start one new conversation. Later pickups preserve again. A one-claim start that is never confirmed is held again as `fresh_start_uncertain` and is not repeated. |
+
+Either fresh mode sent for the other continuation kind is refused without
+changing the run.
+
+- **Consent is bound to the episode.** An exact replay (same mode, episode and
+  guidance) returns 200 with `replay: true`. The same request with different
+  guidance is a 409 and the new guidance is not recorded. Consent for an old
+  episode cannot resolve a newer one. A credential switch (`set-token`) cannot
+  consent.
+- **Causes.** The hold shows why it was held: `refused` (the provider refused a
+  request), `attempt_path` (this pickup cannot continue the old conversation on
+  this lane), `saved_work_missing`, `session_missing`, `transcript_unknown`,
+  `provider_resume_rejected`, `pending_conversion` (an earlier refusal recorded
+  on the worker was converted into this hold) and `fresh_start_uncertain`. A
+  historical hold with no recorded cause reads "held (cause not recorded)".
+  The exact owner-facing wording is in `fixtures/policy-hold/wording.json`.
+- **Saved-work check.** When the hold records a required saved-work head, the
+  worker proves the recovered clone contains it before any provider work.
+  Otherwise the run is held again as `saved_work_missing` with nothing started.
+  After `fresh_from_saved_work` the requirement persists until the claiming
+  worker verifies it at the current claim generation.
+
+### Limits
+
+- Server enforcement covers applied refusals. Local pending evidence protects
+  only its surviving worker.
+- An absent worker or journal beyond the existing pending lease, or the
+  documented wall-release race before delivery, can leave another claim
+  unconstrained.
+- Retained custody still counts toward the per-owner custody admission limit
+  (`custody_hold_limit`, default 8). There is no force-clear or capacity
+  exception.
+- A held, assigned worker can defer idle-only image rolls indefinitely (#3103).
+- Policy journals survive a worker process crash, not storage or power loss.
+- Clearing the saved-work requirement after `fresh_from_saved_work` relies on
+  the claiming worker's local proof, not on publication.
+- Roll the API first, then capable workers. A released worker image that
+  advertises `provider_policy_hold_v1` but predates `fresh_one_claim` support
+  would consume a one-claim grant and hold again as `session_missing` without
+  starting a conversation.
+
+### Rolling back
+
+Rollback is drain-only. Stop owner policy traffic, drain or cordon workers, and
+wait until no `codex_policy_hold_pending` outcome, no live consumed-unconfirmed
+Fresh grant and no claimed or running row carrying a required saved-work head
+remains. Otherwise stay on the new version and keep undrained worker volumes.
+Then stop all API replicas and run goose down exactly one version at a time
+from 00415:
+
+1. 00415 restores the Fresh shape check as `NOT VALID`.
+2. 00414 is guarded: it refuses live or orphan rows and converts paused or
+   queued active rows to failed.
+3. 00413 is guarded the same way.
+
+Never go below 00412. After any step or crash, rediscover the version with
+`SELECT max(version_id) FROM goose_db_version WHERE is_applied`. Start the
+earlier API image only at 00412; at an intermediate version either run the next
+Down or roll forward by restarting the new image.
+
+The Downs are destructive. 00413's Down permanently drops the recorded hold
+cause and recovery identity columns for all rows, so take a backup or `COPY`
+first. They refuse runs parked in wait states (`recovery_wait`, `limit_wait`,
+`pool_wait`, `awaiting_*`): drain or cancel those first. Each Down is one
+transaction, so a `RAISE` rolls it back fully, and holds `ACCESS EXCLUSIVE` on
+`runs` while it runs. Design rationale:
+[ADR-3607](../adr/3607-compact-policy-hold-m1-isolation.md#consent-and-continuity-m2m3).
+
 ## Not the same as a completion hold
 
 A `paused` run is not always a pause **you** asked for. A run with the
