@@ -6,10 +6,12 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -384,12 +386,40 @@ func TestPolicyFreshRestoreLiveDB(t *testing.T) {
 			t.Fatalf("codex-account park: %s restored=%d", freshStamps(got), p.freshAuditCount(t, id, "restored"))
 		}
 	})
-	t.Run("a missing-from-snapshot style release never restores", func(t *testing.T) {
-		p, id, _ := seed(t)
-		p.e.exec(t, "UPDATE runs SET status='queued',worker_id=NULL,claim_released_at=now() WHERE id=$1", id)
-		if got := p.run(t, id); got.PolicyPendingFresh || got.PolicyFreshConsumedGeneration.Int64 != 2 {
-			t.Fatalf("release restored: %s", freshStamps(got))
+	// The crash/loss requeue writers release the claim without knowing whether the payload reached
+	// the worker, so they must keep the consumption: only the exact-claim non-delivery writers restore.
+	notRestored := func(t *testing.T, p policyLive, id uuid.UUID, writer string) {
+		t.Helper()
+		got := p.run(t, id)
+		if got.Status != "queued" {
+			t.Fatalf("%s did not requeue the run (status %s): the writer was not exercised", writer, got.Status)
 		}
+		if got.PolicyPendingFresh || got.PolicyFreshConsumedGeneration.Int64 != 2 || got.PolicyFreshConfirmedGeneration.Valid || p.freshAuditCount(t, id, "restored") != 0 {
+			t.Fatalf("%s restored the grant: %s", writer, freshStamps(got))
+		}
+	}
+	t.Run("the claimed-never-started sweep never restores", func(t *testing.T) {
+		p, id, _ := seed(t)
+		p.e.exec(t, "UPDATE runs SET claimed_at=now()-interval '1 hour' WHERE id=$1", id)
+		if _, err := p.e.q.SweepClaimedNeverStarted(p.e.ctx, store.SweepClaimedNeverStartedParams{Cutoff: pgconv.Time(time.Now().Add(-5 * time.Minute))}); err != nil {
+			t.Fatal(err)
+		}
+		notRestored(t, p, id, "SweepClaimedNeverStarted")
+	})
+	t.Run("the missing-from-snapshot requeue never restores", func(t *testing.T) {
+		p, id, _ := seed(t)
+		// The worker started the run, then dropped it from its snapshot.
+		p.e.exec(t, "UPDATE runs SET status='running',status_since=now()-interval '1 hour' WHERE id=$1", id)
+		if _, err := p.e.q.RequeueRunsMissingFromSnapshot(p.e.ctx, store.RequeueRunsMissingFromSnapshotParams{
+			WorkerID:             pgtype.UUID{Bytes: p.wid, Valid: true},
+			MissingCutoff:        pgconv.Time(time.Now().Add(-60 * time.Second)),
+			MaxRequeues:          5,
+			Now:                  pgconv.Time(time.Now()),
+			GlobalTimeoutSeconds: int32(testParams().RunTimeout.Seconds()),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		notRestored(t, p, id, "RequeueRunsMissingFromSnapshot")
 	})
 }
 
