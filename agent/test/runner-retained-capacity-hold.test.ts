@@ -448,8 +448,11 @@ it("the same wrapped refusal followed by a 400 on the unmarked report stops the 
 });
 
 it("a worker shutdown after one witnessed capacity refusal parks nothing, seeds nothing and releases nothing", async () => {
-  const r = await drive({ used: 0.89, onReclaim: (n, c) => { if (n === 1) c.shutdown(); } });
+  // Headroom returns right after the shutdown, so a loop that kept going would seed a successor.
+  const r = await drive({ used: 0.89, onReclaim: (n, c) => { if (n === 1) { c.shutdown(); c.set(0.1); } } });
   assert.deepEqual(r.parks, [], "no park of any kind");
+  assert.equal(r.reserves, 1, "no reservation after the shutdown");
+  assert.equal(r.reclaims, 1);
   assert.equal(wireBodies(r).length, 0);
   assert.equal(r.prepares, 0);
   assert.equal(r.models, 0);

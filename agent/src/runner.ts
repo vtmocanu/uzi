@@ -26343,12 +26343,16 @@ export class RunRunner {
             if (priorUncertain || attempt > 0) throw new RetainedRecoveryStop();
             return "unmarked_bad_request";
           }
-          // The client wraps a 400 that followed an ambiguous send of the same call (a transport failure it
-          // retried) as an Error whose cause is that RequestError: the earlier send may have landed, but the
+          // The client wraps a 400 that followed an ambiguous attempt of the same call (one it retried)
+          // as an Error whose cause is that RequestError: the earlier send may have landed, but the
           // api still refused the body it saw last, so the marked pass hands over to the unmarked pass as uncertain.
           if (rejectToFallback && !(error instanceof RequestError) &&
-              error instanceof Error && error.cause instanceof RequestError && error.cause.status === 400)
+              error instanceof Error && error.cause instanceof RequestError && error.cause.status === 400) {
+            flight.runLog.warn("retained exhaustion park report unconfirmed; marked body refused after an ambiguous attempt", {
+              attempt, ...formatRetainedRecoveryDiagnostic(error, flight.redactText),
+            });
             return { fallback: true, uncertain: true };
+          }
           uncertain = true;
           flight.runLog.warn("retained exhaustion park report unconfirmed", {
             attempt, ...formatRetainedRecoveryDiagnostic(error, flight.redactText),
