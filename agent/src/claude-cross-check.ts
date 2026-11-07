@@ -4,9 +4,9 @@
 //
 // Confinement is the isolated lane's, not a weaker copy (isolated-executor.ts):
 //   1. `tools` (not `allowedTools`, which does not restrict under bypassPermissions) is exactly
-//      Read, Grep, Glob, plus, only when the check requests structured output, the SDK's end-turn
-//      `StructuredOutput` carrier, admitted by exact name in the gate, init check and budget;
-//      `disallowedTools` names every shell, web, nested-agent and write tool.
+//      Read, Grep, Glob; when the check requests structured output, the SDK's own end-turn
+//      `StructuredOutput` carrier is additionally admitted by exact name in the gate, init check
+//      and tool budget; `disallowedTools` names every shell, web, nested-agent and write tool.
 //   2. A matcher-less PreToolUse gate denies any tool outside that set and EVERY tool until the
 //      SDK's `system/init` frame has passed checkIsolatedInit (a latch that defaults to refuse).
 //   3. The init check itself: tools, MCP servers, plugins, agents and skills must be exactly the
@@ -54,7 +54,7 @@ export function checkerSurface(structured: boolean): IsolationSurface {
   return structured ? { ...CHECKER_SURFACE, structuredOutputCarrier: STRUCTURED_OUTPUT_CARRIER } : CHECKER_SURFACE;
 }
 
-/** The verdict is the final result text; anything larger is malformed. */
+/** The verdict is the result frame's structured_output (serialized) when present, else the final result text; anything larger is malformed. */
 const MAX_VERDICT_BYTES = 64 * 1024;
 /** A bounded turn budget: a check is a handful of reads, never an open-ended session. */
 const DEFAULT_MAX_TURNS = 60;
@@ -414,7 +414,7 @@ const ASSISTANT_ERRORS = new Set<string>([
   "server_error", "unknown", "max_output_tokens", "cloud_credential_error",
 ]);
 const ERROR_RESULTS = new Set<string>([
-  "error_during_execution", "error_max_turns", "error_max_budget_usd", "error_max_structured_output_retries",
+  "error_during_execution", "error_max_turns", "error_max_budget_usd",
 ]);
 
 export class ClaudeCrossCheck {
@@ -533,7 +533,8 @@ export class ClaudeCrossCheck {
         if (em.payload["event"] === "result") { resultPosted = true; await postUsage({ ...em.payload, is_error: isErrorResult(resultFrame) }); }
       }
       if (resultFrame["subtype"] === "error_max_structured_output_retries" && typeof resultFrame["is_error"] === "boolean") {
-        // A fixed message: the SDK's errors[] text echoes model output and never reaches the diagnostic.
+        // The thrown error carries a fixed message and only the fixed subreason; the SDK's errors[]
+        // text (schema-validation messages) is not copied into the error or the malformed diagnostic.
         throw new CrossCheckMalformedError("cross-check structured output retries exhausted", "structured_output_retries");
       }
       if (isErrorResult(resultFrame)) {

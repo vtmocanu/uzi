@@ -13,6 +13,7 @@ import { CODE_VERDICT_SCHEMA, CrossCheckMalformedError, PLAN_VERDICT_SCHEMA, val
 import type { ClaimResponse } from "../src/protocol.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import { nullLogger } from "./helpers.js";
+import { check } from "./json-schema-subset.js";
 
 interface Session { stage: "plan" | "code"; threw: string | null; frames: Array<Record<string, unknown>>; hook_inputs: Array<Record<string, unknown>> }
 const fixture = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "fixtures", "claude-structured-output-0.3.310.json"), "utf8")) as
@@ -179,9 +180,11 @@ const codeAccepted: Array<[string, unknown]> = [
 
 describe("schema-accepted but validator-rejected structured output", () => {
   for (const [name, v] of planRejected) it(`plan rejects: ${name}`, async () => {
+    assert.equal(check(PLAN_VERDICT_SCHEMA, v), true, "case must satisfy the plan schema");
     await assert.rejects(initOnlyResult("plan", v), CrossCheckMalformedError);
   });
   for (const [name, v] of codeRejected) it(`code rejects: ${name}`, async () => {
+    assert.equal(check(CODE_VERDICT_SCHEMA, v), true, "case must satisfy the code schema");
     await assert.rejects(initOnlyResult("code", v), CrossCheckMalformedError);
   });
 });

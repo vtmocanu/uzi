@@ -14,51 +14,7 @@ import type { ClaimResponse } from "../src/protocol.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import { nullLogger } from "./helpers.js";
 
-// A deliberately small JSON Schema checker. It supports exactly SUPPORTED_KEYWORDS, and a test
-// below proves both verdict schemas use nothing else, so a true result here is faithful.
-const SUPPORTED_KEYWORDS = new Set([
- "type", "enum", "required", "properties", "additionalProperties", "items",
- "maxItems", "maxLength", "pattern", "minimum", "maximum", "description",
-]);
-
-type Schema = { readonly [key: string]: unknown };
-
-function isRecord(v: unknown): v is Record<string, unknown> {
- return v !== null && typeof v === "object" && !Array.isArray(v);
-}
-
-function check(schema: Schema, value: unknown): boolean {
- const type = schema["type"];
- if (type === "object" && !isRecord(value)) return false;
- if (type === "array" && !Array.isArray(value)) return false;
- if (type === "string" && typeof value !== "string") return false;
- if (type === "integer" && !(typeof value === "number" && Number.isInteger(value))) return false;
- const enumValues = schema["enum"];
- if (Array.isArray(enumValues) && !enumValues.includes(value)) return false;
- if (isRecord(value)) {
-  const properties = (schema["properties"] ?? {}) as Record<string, Schema>;
-  for (const key of (schema["required"] ?? []) as string[]) if (!Object.hasOwn(value, key)) return false;
-  for (const [key, child] of Object.entries(value)) {
-   if (Object.hasOwn(properties, key)) {
-    if (!check(properties[key] as Schema, child)) return false;
-   } else if (schema["additionalProperties"] === false) return false;
-  }
- }
- if (Array.isArray(value)) {
-  if (typeof schema["maxItems"] === "number" && value.length > schema["maxItems"]) return false;
-  const items = schema["items"];
-  if (isRecord(items) && !value.every((v) => check(items, v))) return false;
- }
- if (typeof value === "string") {
-  if (typeof schema["maxLength"] === "number" && [...value].length > schema["maxLength"]) return false;
-  if (typeof schema["pattern"] === "string" && !new RegExp(schema["pattern"]).test(value)) return false;
- }
- if (typeof value === "number") {
-  if (typeof schema["minimum"] === "number" && value < schema["minimum"]) return false;
-  if (typeof schema["maximum"] === "number" && value > schema["maximum"]) return false;
- }
- return true;
-}
+import { check, isRecord, SUPPORTED_KEYWORDS } from "./json-schema-subset.js";
 
 function keywordsUsed(schema: unknown, out: Set<string> = new Set()): Set<string> {
  if (Array.isArray(schema)) for (const v of schema) keywordsUsed(v, out);
