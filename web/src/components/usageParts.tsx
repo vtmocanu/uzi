@@ -222,8 +222,8 @@ const WINDOW_OPTIONS = [
   { value: "last_7_days", label: "Last 7 days" },
 ] as const;
 
-export function WindowToggle({ value, onChange, className }: { value: UsageWindow; onChange: (window: UsageWindow) => void; className?: string }) {
-  return <SegmentedToggle label="Usage reporting period" options={WINDOW_OPTIONS} value={value} onChange={onChange} className={className} />;
+export function WindowToggle({ value, onChange, className, steadyWidth }: { value: UsageWindow; onChange: (window: UsageWindow) => void; className?: string; steadyWidth?: boolean }) {
+  return <SegmentedToggle label="Usage reporting period" options={WINDOW_OPTIONS} value={value} onChange={onChange} className={className} steadyWidth={steadyWidth} />;
 }
 
 // Table cells for both per-user tables. "current" is the current Overview's PerUserUsageTable
