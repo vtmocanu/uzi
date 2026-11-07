@@ -717,7 +717,9 @@ scenarios are mutually exclusive by construction. Known values:
   cordoned, offline, no advertised slot cap and no stats), and four open
   custody holds feed the Held work card, two of them needing a decision, so
   Needs your decision carries one held-work row. Nothing is seeded outside the
-  scenario. (PRD #3878, PRD #3880.)
+  scenario. With no scope saved in the browser, the Issue work card opens on
+  You, so its counts include the seeded other users' runs only under All users
+  (the Runs card still lists them). (PRD #3878, PRD #3880, #4052.)
 - `overview-calm` — `/overview/next?mock=overview-calm`: you have active runs
   but nothing waiting on a decision (no plan review, question, owner-action
   park, open pull request or custody hold), so the decision card stays hidden.

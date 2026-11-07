@@ -8,10 +8,11 @@
 import { useId, type ReactNode } from "react";
 import type { RunSummaryItem } from "../lib/api";
 import { maskEmail } from "../lib/demoMask";
-import { runRef, type IssueLineModel, type IssueStage, type LineEntry } from "../lib/issueLine";
+import { runRef, type IssueLineModel, type IssueStage, type IssueWorkScope, type LineEntry } from "../lib/issueLine";
 import { stripUnsafeChars } from "../lib/safeText";
 import { ActivityIcon, ChatIcon, ClockIcon } from "./icons";
-import { Badge, Button, RUN_STATUS_TONES, type BadgeTone } from "./ui";
+import { Badge, RUN_STATUS_TONES, type BadgeTone } from "./ui";
+import { SegmentedToggle } from "./usageParts";
 
 // At most this many badges per station; the rest collapse into one "+N" badge.
 const MAX_BADGES = 12;
@@ -231,35 +232,54 @@ export function IssueLine({
   selected,
   onSelect,
   demo,
-  factory,
+  scope,
+  scopeToggle,
 }: {
   model: IssueLineModel;
   selected: IssueStage | null;
   onSelect: (stage: IssueStage | null) => void;
   demo: boolean;
-  // The admin's factory-wide scope: the note says the counts cover every user.
-  factory: boolean;
+  // "all" is the admin's every-user scope: the note says the counts cover every user.
+  scope: IssueWorkScope;
+  // The admin's You / All users switch (#4052); absent for a non-admin, who gets no switch.
+  scopeToggle?: { value: IssueWorkScope; onChange: (scope: IssueWorkScope) => void; allDisabled: boolean };
 }) {
   const titleId = useId();
   const { entries, captions } = model;
   // Pressing the pressed stage again lets go of it.
   const toggle = (stage: IssueStage) => () => onSelect(selected === stage ? null : stage);
-  const note = `${plural(model.onLine, "run", "runs")} on the line, ${entries.other.length} other${factory ? ", all users" : ""}`;
+  const note = `${plural(model.onLine, "run", "runs")} on the line, ${entries.other.length} other${scope === "all" ? ", all users" : ""}`;
   const prEntries: LineEntry[] = model.prs.map((run) => ({ run, own: true }));
   // Card (components/ui) has no attribute passthrough, so this repeats its classes to carry
   // data-live, which only the Shadow theme styles.
   return (
     <section aria-labelledby={titleId} data-live="" className="rounded-xl border border-edge bg-surface p-5">
-      <div className="flex flex-wrap items-center justify-between gap-2">
+      {/* Title, note, then the admin's scope switch last, at the far right. Below md the note
+          drops to its own full-width row so the switch stays on the title row. */}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
         <h2 id={titleId} className="text-xs font-semibold uppercase tracking-wider text-faint">
           Issue work
         </h2>
-        <span className="flex items-center gap-2 text-xs text-faint">
-          <span>{note}</span>
-          <Button variant="ghost" size="sm" onClick={() => onSelect(null)}>
-            Show all
-          </Button>
+        <span
+          className={`min-w-0 text-xs text-faint md:flex-1 md:text-right ${
+            scopeToggle ? "order-last basis-full md:order-none" : "ml-auto"
+          } md:ml-0`}
+        >
+          {note}
         </span>
+        {scopeToggle && (
+          <SegmentedToggle
+            label="Issue work scope"
+            options={[
+              { value: "you", label: "You" },
+              { value: "all", label: "All users", disabled: scopeToggle.allDisabled },
+            ]}
+            value={scopeToggle.value}
+            onChange={scopeToggle.onChange}
+            className="ml-auto md:ml-0"
+            steadyWidth
+          />
+        )}
       </div>
       <div role="group" aria-label="Filter runs by stage" className="relative mt-2 grid grid-cols-1 md:grid-cols-5">
         <span aria-hidden="true" className="absolute left-[26px] right-[calc(20%-26px)] top-[25px] hidden h-0.5 bg-edge-strong md:block" />

@@ -29,7 +29,7 @@ it("scrolls the by-user table inside its wrapper at 400px without overflowing th
   });
   admin.factory.lifetime_subscription_run_count = 0; admin.factory.lifetime_unreported_run_count = 0;
   render(<div className="p-4"><MemoryRouter><Harness self={self} admin={admin} /></MemoryRouter></div>);
-  fireEvent.click(screen.getByRole("button", { name: "Factory · all users" }));
+  fireEvent.click(screen.getByRole("button", { name: "All users" }));
   const scroll = screen.getByTestId("by-user-scroll");
   expect(getComputedStyle(scroll).overflowX).toBe("auto");
   expect(scroll.querySelector("table")!.getBoundingClientRect().width).toBeCloseTo(640, 0);
