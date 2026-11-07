@@ -13117,7 +13117,7 @@ export class RunRunner {
         // Issue #3240: only an applied running ACK confirms pause_failed's continuing flight. Any other
         // answer (declined, or a non-running status) gets the ordinary non-running handling it skipped
         // above: the flight stops running and its context is retired, so no shell authority survives.
-        // Like every local memory change here, only while no newer report has moved the phase on.
+        // Ordinary phase bookkeeping stays sequence-fenced; settlement releases its captured hold below.
         const continued = continuing && ack.status === "running" && ack.applied !== false;
         const settled = settling && ack.applied === true && ack.status === "awaiting_approval" && ack.clarificationSettled === true;
         if (memorySequence !== undefined && memory?.stateSequence === memorySequence && !continued) {
@@ -13132,14 +13132,17 @@ export class RunRunner {
           if (memory.running && memoryPhaseToken && this.memoryRuntime!.commands.releasePhase(memoryPhaseToken)) {
             if (memory.phaseToken === memoryPhaseToken) memory.phaseToken = undefined;
           }
-          // Issue #3985: only an authoritative settlement ACK ends the question hold. Every other
-          // answer (refused, applied false, wrong status or disposition) retains it unchanged.
-          if (settling && settled && settleToken && this.memoryRuntime!.commands.releasePhase(settleToken)) {
-            if (memory.phaseToken === settleToken) memory.phaseToken = undefined;
-            memory.revisionContext = memory.context;
-          }
           if (ack.status !== undefined && !["running", "awaiting_approval", "awaiting_input", "awaiting_followup"].includes(ack.status))
             this.retireWorkerMemory(flight);
+        }
+        // Issue #3985: informational progress can advance stateSequence without replacing the
+        // question hold. Release by captured identity on the authoritative settlement ACK;
+        // releasePhase refuses a token replaced by a newer phase or retired context.
+        if (memory && settled && settleToken && this.memoryRuntime!.commands.releasePhase(settleToken)) {
+          if (memory.phaseToken === settleToken && memory.context === settleToken.context) {
+            memory.phaseToken = undefined;
+            memory.revisionContext = memory.context;
+          }
         }
         if (settling && settled && flight.stateReportOrdinal === reportOrdinal) this.snapshotRegistry?.setPhase(runId, "awaiting_approval");
         // Issue #3985: a new presentation at a later gate revision supersedes the pending revise.

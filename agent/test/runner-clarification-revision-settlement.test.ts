@@ -630,7 +630,7 @@ describe("#3985 clarification settlement and the worker-memory phase hold", () =
     });
   }
 
-  it("an intervening report that advances the state sequence before the ACK blocks the release and the context", async t => {
+  it("an informational iteration report does not keep the settled question hold", async t => {
     const release = (() => { let resolve!: () => void; const promise = new Promise<void>(r => { resolve = r; }); return { promise, resolve }; })();
     const o = await memoryDrive(t, "applied", async (ctx, mem, outcome) => {
       api.afterPersistState(api.states[0]!.runId, b => b.status === "clarification_settled", release.promise);
@@ -645,8 +645,42 @@ describe("#3985 clarification settlement and the worker-memory phase hold", () =
         running: proof.workerMemory?.running };
     });
     const after = o.afterAnswer!;
-    assert.equal(after.revisionContext, undefined, "a newer report moved the phase on");
+    assert.equal(after.admits, true, "the iteration report did not replace the question hold");
+    assert.equal(after.token, undefined);
+    assert.equal(after.revisionContext, after.context);
     assert.equal(o.phases.includes("awaiting_approval") && o.phases.at(-1) === "awaiting_approval", false, o.phases.join(","));
+  });
+
+  it("queued progress during a pending settlement ACK releases only the captured question hold", async t => {
+    const release = (() => { let resolve!: () => void; const promise = new Promise<void>(r => { resolve = r; }); return { promise, resolve }; })();
+    const o = await memoryDrive(t, "applied", async (ctx, mem, outcome) => {
+      const id = api.states[0]!.runId;
+      api.afterPersistState(id, b => b.status === "clarification_settled", release.promise);
+      const asking = ctx.askUser!([{ question: "Continue planning?", header: "Plan" }])
+        .then(() => undefined, (error: unknown) => { outcome.error = error; });
+      try {
+        assert.ok(await until(() => api.states.some(s => s.body.status === "clarification_settled"), 8_000));
+        const proof = mem.flight as unknown as MemoryProof;
+        const questionToken = proof.workerMemory!.phaseToken;
+        const wire = api.stateAckWire!;
+        api.stateAckWire = (body, run) => body.status === "running" && body.milestones_completed !== undefined
+          ? { status: 409, body: { run: { ...run, status: "awaiting_approval" } } }
+          : wire(body, run);
+        await ctx.reportProgress!({ completed: [], in_progress: [] });
+        assert.equal(proof.workerMemory!.phaseToken, questionToken, "the progress report keeps the same question hold");
+        assert.equal(mem.commands.phaseAdmits(mem.context), false, "the pending ACK still holds commands");
+      } finally { release.resolve(); }
+      await asking;
+      const proof = mem.flight as unknown as MemoryProof;
+      outcome.afterAnswer = { admits: mem.commands.phaseAdmits(mem.context), token: proof.workerMemory?.phaseToken,
+        revisionContext: proof.workerMemory?.revisionContext, context: mem.context, ended: proof.workerMemory?.ended,
+        running: proof.workerMemory?.running };
+    });
+    assert.equal(o.error, undefined, errorName(o.error));
+    assert.equal(o.afterAnswer!.admits, true, "the confirmed ACK releases the captured question hold despite queued progress");
+    assert.equal(o.afterAnswer!.token, undefined);
+    assert.equal(o.afterAnswer!.revisionContext, o.afterAnswer!.context);
+    assert.equal(o.afterAnswer!.running, false, "settlement grants planning context, not running authority");
   });
 
   it("a different phase token installed before the ACK is not cleared by the captured token's release", async t => {
@@ -667,5 +701,31 @@ describe("#3985 clarification settlement and the worker-memory phase hold", () =
     assert.equal(o.error, undefined, errorName(o.error));
     assert.equal(o.afterAnswer!.admits, true, "the captured token was released");
     assert.equal(o.afterAnswer!.token, other, "the newer phase token survives");
+  });
+
+  it("a real newer phase hold survives queued progress and the old question's settlement ACK", async t => {
+    const release = (() => { let resolve!: () => void; const promise = new Promise<void>(r => { resolve = r; }); return { promise, resolve }; })();
+    let newer: unknown;
+    const o = await memoryDrive(t, "applied", async (ctx, mem, outcome) => {
+      api.afterPersistState(api.states[0]!.runId, b => b.status === "clarification_settled", release.promise);
+      const asking = ctx.askUser!([{ question: "Continue planning?", header: "Plan" }])
+        .then(() => undefined, (error: unknown) => { outcome.error = error; });
+      try {
+        assert.ok(await until(() => api.states.some(s => s.body.status === "clarification_settled"), 8_000));
+        newer = mem.commands.holdPhase(mem.context);
+        assert.ok(newer);
+        (mem.flight as unknown as MemoryProof).workerMemory!.phaseToken = newer;
+        await ctx.reportProgress!({ completed: [], in_progress: [] });
+      } finally { release.resolve(); }
+      await asking;
+      const proof = mem.flight as unknown as MemoryProof;
+      outcome.afterAnswer = { admits: mem.commands.phaseAdmits(mem.context), token: proof.workerMemory?.phaseToken,
+        revisionContext: proof.workerMemory?.revisionContext, context: mem.context, ended: proof.workerMemory?.ended,
+        running: proof.workerMemory?.running };
+    });
+    assert.equal(o.error, undefined, errorName(o.error));
+    assert.equal(o.afterAnswer!.admits, false, "the new phase still denies commands");
+    assert.equal(o.afterAnswer!.token, newer);
+    assert.equal(o.afterAnswer!.revisionContext, undefined, "the old ACK cannot grant the new phase revision context");
   });
 });
