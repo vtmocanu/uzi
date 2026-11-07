@@ -462,7 +462,8 @@ bounds, periodic reclaim, admission stop and the bounded `data_volume_full`
 park, and [Run recovery](./run-recovery.md) for supported inspect/discard
 procedures; pressure does not authorize deleting protected sources.
 [PRD #3431](../prds/3431-pod-epoch-reclaim.md) M1b settlement/deletion is
-implemented behind an off-by-default gate, so production still deletes nothing, and #3329's genuine-idle reclaim roll is deferred. This policy adds
+implemented behind an off-by-default gate, so production still deletes
+nothing, and #3329's genuine-idle reclaim roll is deferred. This policy adds
 no reclaim authority.
 
 ### Docker workers: run directory on the data volume
