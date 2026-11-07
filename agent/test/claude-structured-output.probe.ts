@@ -2,14 +2,18 @@
 // SDK frames for the structured-output carrier (the StructuredOutput tool). The model turns are
 // scripted by a loopback Anthropic Messages stub, so no Anthropic credential is needed.
 //   node --import tsx test/claude-structured-output.probe.ts capture <absolute CLI path> [out path]
+//   node --import tsx test/claude-structured-output.probe.ts verify <absolute CLI path>
+// `verify` runs the PRODUCTION ClaudeCrossCheck (builder, hooks, init check, budget, result handling)
+// against the same scripted stub and the real SDK; it writes nothing.
 // Run from agent/. Use the CLI that matches the pinned SDK, and repeat it when either is bumped.
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
-import { buildClaudeCrossCheckOptions } from "../src/claude-cross-check.js";
-import { codeCrossCheckBrief, crossCheckBrief, CODE_VERDICT_SCHEMA, PLAN_VERDICT_SCHEMA } from "../src/codex/cross-check.js";
+import { buildClaudeCrossCheckOptions, ClaudeCrossCheck } from "../src/claude-cross-check.js";
+import { codeCrossCheckBrief, crossCheckBrief, CODE_VERDICT_SCHEMA, CrossCheckMalformedError, PLAN_VERDICT_SCHEMA, validateCodeVerdict, validateVerdict } from "../src/codex/cross-check.js";
+import type { ClaimResponse } from "../src/protocol.js";
 import { checkIsolatedInit } from "../src/isolated-executor.js";
 import { promptStream } from "../src/sdk-messages.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
@@ -258,7 +262,68 @@ async function capture(cli: string, outPath: string): Promise<void> {
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 }
 
+function verifyClaim(stage: Stage): ClaimResponse {
+  const base = {
+    kind: "cross_check", run_id: "probe", claim_generation: 1, last_seq: 0, agents: [], issue_iid: null, issue_title: "Issue", issue_description: "Issue DATA",
+    repo: { id: "repo", full_name: "owner/repo", url: "https://example.test/repo", clone_url: "https://example.test/repo.git", default_branch: "main" },
+    config: { default_model: MODEL, default_effort: "high" },
+    secrets: { forge_pat: "", anthropic_oauth_token: "dummy-offline-credential" },
+  };
+  const cross = stage === "code"
+    ? { stage: "code", lead_run_id: "lead", round: 1, candidate_digest: "c".repeat(64), base_commit: "a".repeat(40), head_commit: "b".repeat(40),
+      plan_md: "Approved plan DATA", guidance_snapshot: "", milestones: [], required_capabilities: [], required_tools: [], size_class: "small",
+      code_context: { task: "context DATA" }, code_diff: "diff DATA", deadline_at: "2099-01-01T00:00:00Z" }
+    : { stage: "plan", lead_run_id: "lead", round: 1, candidate_digest: "digest", deadline_at: "2099-01-01T00:00:00Z", plan_md: "Plan",
+      milestones: [], required_capabilities: [], required_tools: [], size_class: "small", base_commit: "a".repeat(40), planning_diff: "diff" };
+  return { ...base, cross_check: cross } as unknown as ClaimResponse;
+}
+
+async function verify(cli: string): Promise<void> {
+  const sdk = await import("@anthropic-ai/claude-agent-sdk") as unknown as { query: SdkQueryFn };
+  const repoRoot = path.resolve(import.meta.dirname, "../..");
+  const scratch = path.join(repoRoot, ".uzi/scratch");
+  await fs.mkdir(scratch, { recursive: true });
+  const root = await fs.mkdtemp(path.join(scratch, "so-verify-"));
+  try {
+    for (const spec of SESSIONS) {
+      const checkout = await fs.realpath(await fs.mkdir(path.join(root, spec.name, "checkout"), { recursive: true }).then(() => path.join(root, spec.name, "checkout")));
+      const home = path.join(root, spec.name, "home");
+      await fs.mkdir(home, { recursive: true });
+      await fs.writeFile(path.join(checkout, "a.ts"), "export const answer = 42;\n");
+      const turns = spec.turns(checkout);
+      const stub = await startStub((n) => {
+        if (n <= turns.length) return turns[n - 1] as Turn;
+        return spec.exhaust ? carrier(`toolu_so_invalid_${n - turns.length}`, { verdict: "maybe" }) : text("done");
+      });
+      try {
+        // Only the stub URL and the CLI path change; every other option is the production builder's.
+        const queryFn = ((p: Parameters<SdkQueryFn>[0]) => sdk.query({ ...p, options: {
+          ...p.options, env: { ...p.options.env, ANTHROPIC_BASE_URL: stub.url }, pathToClaudeCodeExecutable: cli,
+        } })) as SdkQueryFn;
+        const checker = new ClaudeCrossCheck(nullLogger(), { secretPaths: [path.join(checkout, "worker-secret")], queryFn });
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 90000);
+        let outcome: string;
+        try {
+          const verdict = await checker.run(verifyClaim(spec.stage), checkout, home, controller.signal, async () => {});
+          assert.notEqual(spec.exhaust, true, `${spec.name} must reject`);
+          if (spec.stage === "code") validateCodeVerdict(verdict); else validateVerdict(verdict);
+          outcome = `verdict ${verdict}`;
+        } catch (err) {
+          if (err instanceof assert.AssertionError) throw err;
+          assert.ok(spec.exhaust === true, `${spec.name} rejected unexpectedly: ${String(err)}`);
+          assert.ok(err instanceof CrossCheckMalformedError && err.subreason === "structured_output_retries", `${spec.name} rejected with ${String(err)}`);
+          outcome = `rejected CrossCheckMalformedError/${err.subreason} (${err.message})`;
+        } finally { clearTimeout(timer); }
+        console.log(`${spec.name}: ${outcome}; stub requests ${stub.requests()}`);
+      } finally { await stub.close(); }
+    }
+    console.log("verify ok");
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+}
+
 const [mode, cli, out] = process.argv.slice(2);
-if (mode !== "capture") throw new Error("usage: claude-structured-output.probe.ts capture <absolute CLI path> [out path]");
+if (mode !== "capture" && mode !== "verify") throw new Error("usage: claude-structured-output.probe.ts capture|verify <absolute CLI path> [out path]");
 if (!cli || !path.isAbsolute(cli)) throw new Error("an explicit absolute native CLI path is required");
-await capture(cli, out ? path.resolve(out) : path.resolve(import.meta.dirname, "fixtures/claude-structured-output-0.3.310.json"));
+if (mode === "verify") await verify(cli);
+else await capture(cli, out ? path.resolve(out) : path.resolve(import.meta.dirname, "fixtures/claude-structured-output-0.3.310.json"));

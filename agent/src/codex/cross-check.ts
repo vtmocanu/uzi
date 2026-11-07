@@ -25,7 +25,7 @@ import { launchCodexRoot, launchCodexEffectRoot, CODEX_BIN, SUPERVISOR_BIN, PROV
 import { prepareCodexRunHome, buildAppServerRefreshBridge } from "./codex-executor.js";
 
 type CrossCheckMalformedSubreason = "invalid_json" | "verdict_schema" | "finding_schema" | "findings_cap" | "code_findings" | "result_cap" | "unknown"
- | "foreign_item" | "delta_after_completion" | "invalid_item_identity" | "stream_cap" | "completion_invalid" | "stream_mismatch" | "invalid_phase";
+ | "foreign_item" | "delta_after_completion" | "invalid_item_identity" | "stream_cap" | "completion_invalid" | "stream_mismatch" | "invalid_phase" | "structured_output_retries";
 
 export class CrossCheckMalformedError extends Error {
  constructor(message: string, readonly subreason?: CrossCheckMalformedSubreason) {

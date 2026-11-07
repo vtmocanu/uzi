@@ -4,7 +4,9 @@
 //
 // Confinement is the isolated lane's, not a weaker copy (isolated-executor.ts):
 //   1. `tools` (not `allowedTools`, which does not restrict under bypassPermissions) is exactly
-//      Read, Grep, Glob; `disallowedTools` names every shell, web, nested-agent and write tool.
+//      Read, Grep, Glob, plus, only when the check requests structured output, the SDK's end-turn
+//      `StructuredOutput` carrier, admitted by exact name in the gate, init check and budget;
+//      `disallowedTools` names every shell, web, nested-agent and write tool.
 //   2. A matcher-less PreToolUse gate denies any tool outside that set and EVERY tool until the
 //      SDK's `system/init` frame has passed checkIsolatedInit (a latch that defaults to refuse).
 //   3. The init check itself: tools, MCP servers, plugins, agents and skills must be exactly the
@@ -24,7 +26,7 @@ import type { EffortLevel, HookInput, HookJSONOutput, Options as SdkOptions, Spa
 import type { ClaimResponse } from "./protocol.js";
 import type { Logger } from "./log.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
-import { codeCrossCheckBrief, codeCrossCheckBriefWithGuidance, codeGuidanceOf, crossCheckBrief, crossCheckPrompt, CrossCheckMalformedError, validateCodeFindings, validateVerdict } from "./codex/cross-check.js";
+import { CODE_VERDICT_SCHEMA, PLAN_VERDICT_SCHEMA, codeCrossCheckBrief, codeCrossCheckBriefWithGuidance, codeGuidanceOf, crossCheckBrief, crossCheckPrompt, CrossCheckMalformedError, validateCodeFindings, validateVerdict } from "./codex/cross-check.js";
 import { CrossCheckCheckerUnavailableError } from "./codex/model-rejection.js";
 import {
   BUILTIN_PLUGINS_DISABLED,
@@ -33,6 +35,7 @@ import {
   guardIsolatedFrameRefusal,
   isolateSdkEnv,
   isolatedDisallowedTools,
+  STRUCTURED_OUTPUT_CARRIER,
   type InitGate,
   type IsolationSurface,
 } from "./isolated-executor.js";
@@ -45,6 +48,11 @@ import { assertResidueQuarantineOpen } from "./residue-quarantine.js";
 
 /** The checker's whole tool surface: read-only, no MCP, no plugin, no skill. */
 const CHECKER_SURFACE: IsolationSurface = { tools: ["Read", "Grep", "Glob"], mcpServers: [], plugins: [], skills: [] };
+
+/** The checker surface, with the structured-output carrier admitted only when the check sets `outputFormat`. */
+export function checkerSurface(structured: boolean): IsolationSurface {
+  return structured ? { ...CHECKER_SURFACE, structuredOutputCarrier: STRUCTURED_OUTPUT_CARRIER } : CHECKER_SURFACE;
+}
 
 /** The verdict is the final result text; anything larger is malformed. */
 const MAX_VERDICT_BYTES = 64 * 1024;
@@ -148,7 +156,10 @@ export function buildClaudeCrossCheckOptions(input: {
   effort?: EffortLevel;
   spawn?: (opts: SpawnOptions) => SpawnedProcess;
   toolBudgetHook?: (input: HookInput) => Promise<HookJSONOutput>;
+  /** JSON Schema of the final verdict; when set the session ends through the SDK's StructuredOutput carrier. */
+  outputSchema?: Record<string, unknown>;
 }): SdkOptions {
+  const surface = checkerSurface(input.outputSchema !== undefined);
   const options: SdkOptions = {
     cwd: input.cwd,
     // A full replacement: only these keys reach the SDK child (sdk-env.ts).
@@ -160,8 +171,8 @@ export function buildClaudeCrossCheckOptions(input: {
     // mentions and dispatches a leading slash command before any PreToolUse hook runs.
     verbatimPrompts: true,
     settings: { enabledPlugins: BUILTIN_PLUGINS_DISABLED },
-    tools: [...CHECKER_SURFACE.tools],
-    disallowedTools: isolatedDisallowedTools(CHECKER_SURFACE),
+    tools: [...surface.tools],
+    disallowedTools: isolatedDisallowedTools(surface),
     mcpServers: {},
     strictMcpConfig: true,
     plugins: [],
@@ -175,7 +186,7 @@ export function buildClaudeCrossCheckOptions(input: {
       PreToolUse: [
         // The isolated lane's gate, ONE path guard (with this session's spill Read) and write guard.
         ...buildIsolatedPreToolUse({
-          surface: CHECKER_SURFACE, gate: input.gate, cwd: input.cwd, log: input.log,
+          surface, gate: input.gate, cwd: input.cwd, log: input.log,
           secretPaths: input.secretPaths, sdkHomeDir: input.homeDir,
         }),
         { matcher: "Glob|Grep", hooks: [buildCheckerPatternGuard(input.log)] },
@@ -187,6 +198,7 @@ export function buildClaudeCrossCheckOptions(input: {
   };
   if (input.model) options.model = input.model;
   if (input.effort) options.effort = input.effort;
+  if (input.outputSchema !== undefined) options.outputFormat = { type: "json_schema", schema: input.outputSchema };
   return options;
 }
 
@@ -208,7 +220,7 @@ class CodeToolBudget {
   private readonly observed = new Set<string>();
   private readonly denied = new Set<string>();
   private exceeded = false;
-  constructor(private readonly abort: AbortController) {}
+  constructor(private readonly abort: AbortController, private readonly carrier?: string) {}
   /** Whether the budget hook refused this tool call (read-only; activity evidence maps it to `limit`). */
   wasDenied(id: string): boolean { return this.denied.has(id); }
   private admit(id: unknown): boolean {
@@ -224,6 +236,9 @@ class CodeToolBudget {
   readonly hook = async (input: HookInput): Promise<HookJSONOutput> => {
     if (input.hook_event_name !== "PreToolUse") return {};
     const id = input.tool_use_id;
+    // The carrier ends the turn and is neither a read nor an effect: it is not counted, but an
+    // already exceeded budget still refuses it (falls through to the deny path below).
+    if (!this.exceeded && this.carrier !== undefined && input.tool_name === this.carrier) return {};
     if (!this.executed.has(id) && this.admit(id)) { this.executed.add(id); return {}; }
     this.exceeded = true;
     if (typeof id === "string") this.denied.add(id);
@@ -238,6 +253,7 @@ class CodeToolBudget {
       const block = asRecord(raw);
       if (block?.["type"] === "tool_use") {
         const id = block["id"];
+        if (this.carrier !== undefined && block["name"] === this.carrier) continue;
         if (!CHECKER_SURFACE.tools.includes(String(block["name"]))) throw new CrossCheckConfinementError("tool_unallowed");
         if (typeof id === "string" && this.observed.has(id)) throw new CrossCheckConfinementError("tool_repeated");
         if (this.admit(id)) this.observed.add(id as string);
@@ -444,7 +460,9 @@ export class ClaudeCrossCheck {
     let iterator: AsyncIterator<unknown> | undefined;
     let readersStopped = false;
     let queryStarted = false;
-    const budget = code ? new CodeToolBudget(abort) : undefined;
+    const schema = code ? CODE_VERDICT_SCHEMA : PLAN_VERDICT_SCHEMA;
+    const surface = checkerSurface(true);
+    const budget = code ? new CodeToolBudget(abort, STRUCTURED_OUTPUT_CARRIER) : undefined;
     const mapper = activity ? new ActivityMapper(activity, checkout, budget) : undefined;
     let usageInit = false;
     let resultPosted = false;
@@ -456,6 +474,7 @@ export class ClaudeCrossCheck {
       const options = buildClaudeCrossCheckOptions({
         cwd: checkout, homeDir: home, oauthToken: token, log: this.log, secretPaths: this.opts.secretPaths, gate,
         brief: code ? codeCrossCheckBriefWithGuidance("Read, Grep and Glob", codeGuidanceOf(claim)) : crossCheckBrief("Read, Grep and Glob"), maxTurns: this.opts.maxTurns,
+        outputSchema: schema,
         ...(budget ? { toolBudgetHook: budget.hook } : {}),
         ...(model ? { model } : {}), ...(effort ? { effort } : {}),
         spawn: (spawnOpts) => {
@@ -481,7 +500,7 @@ export class ClaudeCrossCheck {
         // Before the budget latch can throw: a hook-denied call's tool_result must still settle as `limit`.
         mapper?.observe(asRecord(msg));
         budget?.assertWithinBudget();
-        const refusal = guardIsolatedFrameRefusal(msg, gate, CHECKER_SURFACE);
+        const refusal = guardIsolatedFrameRefusal(msg, gate, surface);
         if (refusal) throw new CrossCheckConfinementError(refusal.code);
         const frame = asRecord(msg);
         budget?.observe(frame);
@@ -513,12 +532,17 @@ export class ClaudeCrossCheck {
       for (const em of mapSdkMessage(resultFrame)) {
         if (em.payload["event"] === "result") { resultPosted = true; await postUsage({ ...em.payload, is_error: isErrorResult(resultFrame) }); }
       }
+      if (resultFrame["subtype"] === "error_max_structured_output_retries" && typeof resultFrame["is_error"] === "boolean") {
+        // A fixed message: the SDK's errors[] text echoes model output and never reaches the diagnostic.
+        throw new CrossCheckMalformedError("cross-check structured output retries exhausted", "structured_output_retries");
+      }
       if (isErrorResult(resultFrame)) {
         if (typeof resultFrame["is_error"] === "boolean" && typeof resultFrame["subtype"] === "string"
           && ERROR_RESULTS.has(resultFrame["subtype"])) throw crossCheckExecutionError("checker_error_result");
         throw new Error("cross-check model error");
       }
-      const text = resultFrame["result"];
+      const structured = resultFrame["structured_output"];
+      const text = structured !== undefined ? JSON.stringify(structured) : resultFrame["result"];
       if (typeof text !== "string" || Buffer.byteLength(text) > (code ? CODE_COVERAGE_LIMITS.verdictBytes : MAX_VERDICT_BYTES)) {
         throw new CrossCheckMalformedError("cross-check requires one bounded complete verdict", "result_cap");
       }
