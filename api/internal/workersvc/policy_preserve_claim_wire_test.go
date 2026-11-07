@@ -1,14 +1,49 @@
 package workersvc
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"reflect"
 	"testing"
 
+	"github.com/google/uuid"
+
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
+
+func TestPolicyResumeInputsClaimWire(t *testing.T) {
+	for _, pending := range []bool{false, true} {
+		f := newClaimFixture(t)
+		f.fs.claimCtx.PolicyResumeInputsPending = pending
+		payload, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner}, nil)
+		if err != nil || payload == nil {
+			t.Fatalf("claim: %v, %v", payload, err)
+		}
+		wire, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(wire, &got); err != nil {
+			t.Fatal(err)
+		}
+		if !pending {
+			if _, present := got["policy_resume_inputs_pending"]; present {
+				t.Fatal("ordinary/delivered claim must omit the input barrier marker")
+			}
+			continue
+		}
+		want := readClaimFixture(t, "policy-resume-inputs-claim.json")
+		if got["policy_resume_inputs_pending"] != want["policy_resume_inputs_pending"] {
+			t.Fatalf("pending guidance claim %s, fixture %v", wire, want)
+		}
+		if payload.PolicyPreserveOnly || payload.PolicyFreshSession || payload.PolicySavedWorkHead != nil {
+			t.Fatal("the input marker must grant no preserving, Fresh or recovery-head authority")
+		}
+	}
+}
 
 // The agent reads the same file (fixtures/claims/policy-preserve-claim.json), so the two sides
 // cannot drift on the claim keys that carry the preserving constraint.

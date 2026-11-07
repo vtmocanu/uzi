@@ -7403,6 +7403,17 @@ func (q *Queries) GetRunByIDForUser(ctx context.Context, arg GetRunByIDForUserPa
 
 const getRunClaimContext = `-- name: GetRunClaimContext :one
 SELECT r.checkpoint_tip,
+       -- #3607: a headless fresh_from_saved_work continuation has no preserving/head flags.
+       -- Wait for unapplied Resume guidance since this episode's resolution. Applied rows retire
+       -- the marker; modern consumed-but-unincluded history is requeued before steering starts. This
+       -- is input ordering only, never session or Fresh-start authority.
+       (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NOT NULL AND EXISTS (
+           SELECT 1 FROM run_user_inputs i
+           WHERE i.run_id = r.id AND i.kind = 'follow_up'
+             AND i.created_at >= r.policy_resolved_at
+             AND i.disposition IS DISTINCT FROM 'superseded'
+             AND i.applied_at IS NULL
+       ))::boolean AS policy_resume_inputs_pending,
        rp.web_url             AS repo_web_url,
        rp.path_with_namespace AS repo_path,
        rp.forge_project_id,
@@ -7454,21 +7465,22 @@ WHERE r.id = $1
 `
 
 type GetRunClaimContextRow struct {
-	CheckpointTip           pgtype.Text `json:"checkpoint_tip"`
-	RepoWebUrl              string      `json:"repo_web_url"`
-	RepoPath                string      `json:"repo_path"`
-	ForgeProjectID          int64       `json:"forge_project_id"`
-	DefaultBranch           pgtype.Text `json:"default_branch"`
-	RepoSkillsEnabled       bool        `json:"repo_skills_enabled"`
-	RepoClaudemdEnabled     bool        `json:"repo_claudemd_enabled"`
-	RepoDevboxOptIn         bool        `json:"repo_devbox_opt_in"`
-	FoldImproveUziBacklog   bool        `json:"fold_improve_uzi_backlog"`
-	GuardrailOverrideReason pgtype.Text `json:"guardrail_override_reason"`
-	ForgeType               string      `json:"forge_type"`
-	BaseUrl                 string      `json:"base_url"`
-	BotUsername             string      `json:"bot_username"`
-	TokenCiphertext         []byte      `json:"token_ciphertext"`
-	HumanPlanApproved       bool        `json:"human_plan_approved"`
+	CheckpointTip             pgtype.Text `json:"checkpoint_tip"`
+	PolicyResumeInputsPending bool        `json:"policy_resume_inputs_pending"`
+	RepoWebUrl                string      `json:"repo_web_url"`
+	RepoPath                  string      `json:"repo_path"`
+	ForgeProjectID            int64       `json:"forge_project_id"`
+	DefaultBranch             pgtype.Text `json:"default_branch"`
+	RepoSkillsEnabled         bool        `json:"repo_skills_enabled"`
+	RepoClaudemdEnabled       bool        `json:"repo_claudemd_enabled"`
+	RepoDevboxOptIn           bool        `json:"repo_devbox_opt_in"`
+	FoldImproveUziBacklog     bool        `json:"fold_improve_uzi_backlog"`
+	GuardrailOverrideReason   pgtype.Text `json:"guardrail_override_reason"`
+	ForgeType                 string      `json:"forge_type"`
+	BaseUrl                   string      `json:"base_url"`
+	BotUsername               string      `json:"bot_username"`
+	TokenCiphertext           []byte      `json:"token_ciphertext"`
+	HumanPlanApproved         bool        `json:"human_plan_approved"`
 }
 
 // The repo + connection facts the claim payload needs, alongside the run. The
@@ -7507,6 +7519,7 @@ func (q *Queries) GetRunClaimContext(ctx context.Context, runID uuid.UUID) (GetR
 	var i GetRunClaimContextRow
 	err := row.Scan(
 		&i.CheckpointTip,
+		&i.PolicyResumeInputsPending,
 		&i.RepoWebUrl,
 		&i.RepoPath,
 		&i.ForgeProjectID,

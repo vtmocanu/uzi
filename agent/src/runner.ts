@@ -14504,8 +14504,9 @@ export class RunRunner {
   }
 
   /** Records, with a small bounded retry, that this claim's clone contains `requiredHead`. The record only
-   *  enables a later server-side supersede and never clears the requirement, so a lost or refused reply is
-   *  logged and tolerated: the claim carries on and a later generation re-verifies. */
+   *  enables a later server-side supersede while preserving. For a non-preserving saved-work claim the
+   *  server instead clears the verified requirement. A lost or refused reply is logged and tolerated:
+   *  local proof still permits this claim to proceed, and any later claim re-verifies a remaining head. */
   private async recordPolicyRecoveryVerified(claim: ClaimResponse, flight: RunFlight, requiredHead: string): Promise<void> {
     const client = this.client;
     const generation = claim.claim_generation;
@@ -17470,7 +17471,8 @@ export class RunRunner {
         // shares the gate path's recovery handling (transient read failure parks, definitive fails).
         // An owner policy continuation (preserve-only, owner Fresh, or fresh_from_saved_work) records its
         // guidance as a follow_up input, so the first provider turn must also wait for that first read.
-        const policyContinuation = claim.policy_preserve_only === true || claim.policy_fresh_session === true ||
+        const policyContinuation = claim.policy_resume_inputs_pending === true ||
+          claim.policy_preserve_only === true || claim.policy_fresh_session === true ||
           (typeof claim.policy_saved_work_head === "string" && claim.policy_saved_work_head !== "");
         if ((m4ResumeReviewedPlan && priorOwnerHistory.status === "complete" && priorOwnerHistory.entries.length > 0) ||
             policyContinuation) {

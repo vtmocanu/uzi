@@ -137,6 +137,9 @@ export function decodePolicyRecoveryVerifiedReply(value: unknown): PolicyRecover
  *  invalid head is replaced by "" so a preserve-only claim reads it as missing saved work rather than
  *  as a degraded capture that carries no requirement. */
 export function normalizePolicyPreserveClaim(claim: Record<string, unknown>): void {
+  // This marker grants no execution authority. A malformed present value keeps the input barrier.
+  if (claim.policy_resume_inputs_pending !== undefined && typeof claim.policy_resume_inputs_pending !== "boolean")
+    claim.policy_resume_inputs_pending = true;
   if (claim.policy_preserve_only !== undefined && typeof claim.policy_preserve_only !== "boolean")
     claim.policy_preserve_only = true;
   // The one-claim Fresh grant fails closed: anything but the literal boolean true is dropped, so a
@@ -1725,6 +1728,10 @@ export interface ClaimResponse extends ClaimMemoryState {
   /** Compact policy hold: this claim may only continue the earlier conversation. The worker re-holds
    *  instead of starting a fresh one. Normalized by normalizePolicyPreserveClaim. */
   policy_preserve_only?: boolean;
+  /** A resolved policy episode has Resume guidance still owed. Selects the initial input-delivery
+   *  barrier even for a headless fresh_from_saved_work continuation; grants no Fresh/session authority.
+   *  Absent on ordinary claims and after delivery. Old APIs omit it and keep the earlier behavior. */
+  policy_resume_inputs_pending?: boolean;
   /** The head the held work must still contain (lowercase 40/64 hex). "" means the server sent a
    *  malformed value; absent means the hold captured no head (degraded capture). */
   policy_expected_head?: string;

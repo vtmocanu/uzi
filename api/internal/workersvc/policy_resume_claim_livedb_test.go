@@ -29,7 +29,7 @@ func TestPolicyResumeClaimPayloadLiveDB(t *testing.T) {
 	if dsn == "" {
 		t.Skip("UZI_TEST_DATABASE_URL not set; run via ./e2e/run-store-it.sh for live-DB coverage")
 	}
-	for _, lane := range []string{"fresh_from_saved_work", "same_conversation"} {
+	for _, lane := range []string{"fresh_from_saved_work", "fresh_from_saved_work_headless", "same_conversation"} {
 		t.Run(lane, func(t *testing.T) {
 			ctx := context.Background()
 			if err := store.Migrate(ctx, dsn); err != nil {
@@ -76,7 +76,13 @@ func TestPolicyResumeClaimPayloadLiveDB(t *testing.T) {
 				t.Fatal(err)
 			}
 			head := hexHead("e")
-			fresh := lane == "fresh_from_saved_work"
+			fresh := lane != "same_conversation"
+			continuationMode := lane
+			var requiredHead any = head
+			if lane == "fresh_from_saved_work_headless" {
+				continuationMode = "fresh_from_saved_work"
+				requiredHead = nil
+			}
 			outcome := uuid.New()
 			// An unapproved agent plan at the gate with a saved session, then held by a policy refusal.
 			exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, worker_id,
@@ -84,7 +90,13 @@ func TestPolicyResumeClaimPayloadLiveDB(t *testing.T) {
 			        policy_outcome_id, policy_continuation_mode, policy_applying_worker_id, policy_applying_generation, policy_source_generation,
 			        policy_preserve_required, policy_required_head)
 			      VALUES ($1, $2, $3, 'issue', 3607, 't', 'd', 'paused', $4, 1, false, 'agent', '# Plan awaiting approval', 'saved-session', 'codex_policy_hold', now(),
-			        $5, $6, $4, 1, 1, true, $7)`, runID, userID, repoID, wkrID, outcome, lane, head)
+			        $5, $6, $4, 1, 1, true, $7)`, runID, userID, repoID, wkrID, outcome, continuationMode, requiredHead)
+			// Older pending inputs and an unresolved episode do not select the new marker.
+			exec(`INSERT INTO run_user_inputs (run_id, kind, body, created_at) VALUES ($1, 'follow_up', 'older guidance', now() - interval '1 hour')`, runID)
+			before, err := q.GetRunClaimContext(ctx, runID)
+			if err != nil || before.PolicyResumeInputsPending {
+				t.Fatalf("unresolved episode: pending=%v, error=%v", before.PolicyResumeInputsPending, err)
+			}
 			mode := PolicyResumePreserve
 			if fresh {
 				mode = PolicyResumeFreshFromSavedWork
@@ -103,6 +115,17 @@ func TestPolicyResumeClaimPayloadLiveDB(t *testing.T) {
 			var claim map[string]any
 			if err := json.Unmarshal(wire, &claim); err != nil {
 				t.Fatal(err)
+			}
+			if claim["policy_resume_inputs_pending"] != true {
+				t.Fatalf("Resume guidance must select the input barrier even without a head: %s", wire)
+			}
+			// Delivery retires the marker, even though the resolved episode remains on the run.
+			// Leave the older input pending to prove the resolution-time bound is real.
+			exec(`UPDATE run_user_inputs SET consumed_at=now(), applied_at=now()
+			      WHERE run_id=$1 AND kind='follow_up' AND created_at >= (SELECT policy_resolved_at FROM runs WHERE id=$1)`, runID)
+			after, err := q.GetRunClaimContext(ctx, runID)
+			if err != nil || after.PolicyResumeInputsPending {
+				t.Fatalf("delivered guidance: pending=%v, error=%v", after.PolicyResumeInputsPending, err)
 			}
 			var autoApprove bool
 			var planSource string

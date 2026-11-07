@@ -151,7 +151,9 @@ func TestPolicyHoldLifecycleLiveDB(t *testing.T) {
 	if claim["claim_generation"] != float64(2) {
 		t.Fatalf("claim generation = %v", claim["claim_generation"])
 	}
-	if got, want := policyClaimKeys(claim), readClaimFixture(t, "policy-preserve-claim.json"); !reflect.DeepEqual(got, want) {
+	wantPreserve := readClaimFixture(t, "policy-preserve-claim.json")
+	wantPreserve["policy_resume_inputs_pending"] = true
+	if got, want := policyClaimKeys(claim), wantPreserve; !reflect.DeepEqual(got, want) {
 		t.Fatalf("preserve claim policy keys %v, fixture %v", got, want)
 	}
 
@@ -211,13 +213,13 @@ func TestPolicyHoldLifecycleLiveDB(t *testing.T) {
 		t.Fatalf("queued, unclaimed: %s", fx.rowFacts(run))
 	}
 
-	// 7. The next pickup is ordinary except for the saved-work verification.
+	// 7. The next pickup verifies saved work and waits for the owner's still-pending guidance.
 	claim = fx.realClaim(run)
 	if claim["claim_generation"] != float64(3) {
 		t.Fatalf("claim generation = %v", claim["claim_generation"])
 	}
-	if got := policyClaimKeys(claim); !reflect.DeepEqual(got, map[string]any{"policy_saved_work_head": savedWork}) {
-		t.Fatalf("saved-work claim policy keys %v, want only policy_saved_work_head=%s", got, savedWork)
+	if got := policyClaimKeys(claim); !reflect.DeepEqual(got, map[string]any{"policy_saved_work_head": savedWork, "policy_resume_inputs_pending": true}) {
+		t.Fatalf("saved-work claim policy keys %v, want policy_saved_work_head=%s and pending guidance", got, savedWork)
 	}
 	if _, present := claim["policy_preserve_only"]; present {
 		t.Fatal("the saved-work claim is preserve-only")
@@ -232,8 +234,8 @@ func TestPolicyHoldLifecycleLiveDB(t *testing.T) {
 		t.Fatalf("verification left the required head: %s", fx.rowFacts(run))
 	}
 
-	// 8. Later ordinary claims are unconstrained. The fixture has one worker capability set, so a
-	// worker without attempt paths is not distinguished here.
+	// 8. Later claims have no conversation or saved-work constraint. This fixture has not delivered
+	// the Resume guidance, so the input-only barrier is still owed across the requeue.
 	n, err := fx.h.q.RequeueClaimAssemblyExact(ctx, store.RequeueClaimAssemblyExactParams{
 		ID: run, WorkerID: pgconv.UUID(fx.workerID), ClaimGeneration: 3,
 	})
@@ -244,8 +246,8 @@ func TestPolicyHoldLifecycleLiveDB(t *testing.T) {
 	if claim["claim_generation"] != float64(4) {
 		t.Fatalf("claim generation = %v", claim["claim_generation"])
 	}
-	if got := policyClaimKeys(claim); len(got) != 0 {
-		t.Fatalf("ordinary claim carries policy constraints: %v", got)
+	if got := policyClaimKeys(claim); !reflect.DeepEqual(got, map[string]any{"policy_resume_inputs_pending": true}) {
+		t.Fatalf("later claim must carry only its still-pending input barrier: %v", got)
 	}
 
 	// 9. A new refusal holds again, as a new unresolved episode.

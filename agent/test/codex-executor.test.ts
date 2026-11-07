@@ -29701,6 +29701,9 @@ describe("compact policy hold: fake-provider continuation matrix (production run
     /** Hold the steering's FIRST GET /inputs for a short delay and do NOT wait for live routing in the
      *  executor, so only the runner's own initial-delivery wait can put the guidance in the first turn. */
     holdFirstInputGet?: boolean;
+    /** Observe the real delivery wait and release the held GET on entry, without a timer or
+     *  an executor-side wait. If execution overtakes the barrier, release only for cleanup. */
+    inputBarrierTest?: TestContext;
   }
 
   async function drive(o: Drive) {
@@ -29719,7 +29722,16 @@ describe("compact policy hold: fake-provider continuation matrix (production run
     if (o.earlier) api.overrideFollowUps(runId, 200, { inputs: o.earlier.map(e => ({ id: e.id, kind: "follow_up", body: e.body })) });
     if (o.guidance) api.setInputs(runId, [{ id: GUIDANCE_ID, kind: "follow_up", body: GUIDANCE }]);
     const inputHold = o.holdFirstInputGet ? api.holdNextInputGet(runId) : undefined;
-    const inputHoldReleased = inputHold
+    let inputBarrierObserved = false;
+    const awaitDelivery = SteeringChannel.prototype.awaitInitialDelivery;
+    const inputBarrier = inputHold && o.inputBarrierTest?.mock.method(SteeringChannel.prototype, "awaitInitialDelivery",
+      function(this: SteeringChannel, signal?: AbortSignal) {
+        inputBarrierObserved = true;
+        const delivered = awaitDelivery.call(this, signal);
+        void inputHold.entered.then(() => inputHold.release());
+        return delivered;
+      });
+    const inputHoldReleased = inputHold && !o.inputBarrierTest
       ? inputHold.entered.then(() => new Promise<void>(r => setTimeout(r, 2000))).then(() => inputHold.release())
       : undefined;
 
@@ -29763,6 +29775,7 @@ describe("compact policy hold: fake-provider continuation matrix (production run
     const run = executor.run.bind(executor);
     executor.run = async ctx => {
       seen.push(ctx);
+      if (inputHold && o.inputBarrierTest && !inputBarrierObserved) inputHold.release();
       await fs.writeFile(path.join(ctx.worktreePath, "POLICY-WORK.txt"), "retained work\n");
       if (o.guidance && !o.holdFirstInputGet) await waitFor(() => ctx.isLiveFollowUpId?.(GUIDANCE_ID) === true, "owner guidance routed live");
       return run(ctx);
@@ -29776,11 +29789,16 @@ describe("compact policy hold: fake-provider continuation matrix (production run
         docker: { state: "not_wired", removed: [], detail: "not wired" } }),
       ...(o.dockerHost ? { dockerHost: o.dockerHost } : {}),
     });
-    await withTimeout(runner.execute(claim), 30000, "matrix run");
+    try {
+      await withTimeout(runner.execute(claim), 30000, "matrix run");
+    } finally {
+      inputHold?.release();
+      inputBarrier?.mock.restore();
+    }
     const requests = rig.transport.requests;
     if (inputHoldReleased) await inputHoldReleased;
     return {
-      inputGetHeld: inputHold !== undefined, claim, runId, holds, verifies, states, events, seen, rig, head,
+      inputGetHeld: inputHold !== undefined, inputBarrierObserved, claim, runId, holds, verifies, states, events, seen, rig, head,
       routes: requests.filter(r => r.method === "thread/start" || r.method === "thread/resume").map(r => r.method),
       prompts: requests.filter(r => r.method === "turn/start").map(r => String((rec(r.params).input as { text?: string }[])[0]?.text)),
       notices: api.messages(runId).map(m => String(rec(m.payload).event)),
@@ -29892,6 +29910,26 @@ describe("compact policy hold: fake-provider continuation matrix (production run
       rehold(r, "attempt_path", "fresh_from_saved_work");
     });
   }
+
+  for (const planSource of ["agent", "seeded"] as const) {
+    it(`headless policy Fresh (${planSource} plan) waits for Resume guidance without prior history`, async t => {
+      const r = await drive({ claim: () => ({ session_id: null, plan_source: planSource,
+        policy_resume_inputs_pending: true }), guidance: true, holdFirstInputGet: true, inputBarrierTest: t });
+      assert.equal(r.inputBarrierObserved, true, "the runner waits before handing the claim to the executor");
+      assert.deepEqual(r.routes, ["thread/start"]);
+      assert.equal(r.prompts.length, 1);
+      assert.ok(r.prompts[0]!.includes(GUIDANCE), "headless Fresh first turn must include owner guidance");
+      assert.equal(r.seen[0]?.preserveConversation, undefined, "input ordering grants no conversation restriction");
+      assert.equal(r.seen[0]?.policyFreshAllowance, undefined, "input ordering grants no Fresh allowance");
+    });
+  }
+
+  it("ordinary headless claim keeps its existing initial-delivery behavior", async t => {
+    const r = await drive({ claim: () => ({ session_id: null }), holdFirstInputGet: true, inputBarrierTest: t });
+    assert.equal(r.inputBarrierObserved, false, "an ordinary claim gains no policy input barrier");
+    assert.deepEqual(r.routes, ["thread/start"]);
+    assert.equal(r.prompts.length, 1);
+  });
 
   it("(v-a) a confirmed fresh_from_saved_work makes exactly one thread/start; its first turn carries guidance, history and approval framing", async () => {
     const r = await drive({ claim: () => ({ session_id: null }), guidance: true, earlier: EARLIER });

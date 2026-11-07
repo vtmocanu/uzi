@@ -2029,6 +2029,17 @@ SELECT
 -- structural reason the other two are: it is true only while plan_md is the reviewed
 -- (here: create-time-supplied) text.
 SELECT r.checkpoint_tip,
+       -- #3607: a headless fresh_from_saved_work continuation has no preserving/head flags.
+       -- Wait for unapplied Resume guidance since this episode's resolution. Applied rows retire
+       -- the marker; modern consumed-but-unincluded history is requeued before steering starts. This
+       -- is input ordering only, never session or Fresh-start authority.
+       (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NOT NULL AND EXISTS (
+           SELECT 1 FROM run_user_inputs i
+           WHERE i.run_id = r.id AND i.kind = 'follow_up'
+             AND i.created_at >= r.policy_resolved_at
+             AND i.disposition IS DISTINCT FROM 'superseded'
+             AND i.applied_at IS NULL
+       ))::boolean AS policy_resume_inputs_pending,
        rp.web_url             AS repo_web_url,
        rp.path_with_namespace AS repo_path,
        rp.forge_project_id,

@@ -37,6 +37,21 @@ describe("preserve-only claim fields on the production claim path", () => {
     const claim = await claimWith({});
     assert.equal(claim.policy_preserve_only, undefined);
     assert.equal(claim.policy_expected_head, undefined);
+    assert.equal(claim.policy_resume_inputs_pending, undefined);
+  });
+
+  it("pending policy Resume inputs select only an input barrier, including on a headless claim", async () => {
+    const raw = JSON.parse(await fs.readFile(new URL("../../fixtures/claims/policy-resume-inputs-claim.json", import.meta.url), "utf8")) as Record<string, unknown>;
+    const claim = await claimWith(raw);
+    assert.equal(claim.policy_resume_inputs_pending, true);
+    assert.equal(claim.policy_preserve_only, undefined);
+    assert.equal(claim.policy_fresh_session, undefined, "the marker grants no Fresh start");
+    assert.equal(claim.policy_saved_work_head, undefined);
+    assert.equal((await claimWith({ policy_resume_inputs_pending: false })).policy_resume_inputs_pending, false);
+    for (const bad of ["false", 0, null, {}]) {
+      assert.equal((await claimWith({ policy_resume_inputs_pending: bad })).policy_resume_inputs_pending, true,
+        "a malformed present marker must not bypass input delivery");
+    }
   });
 
   it("a preserve-only claim without a head stays distinguishable from one with a malformed head", async () => {
