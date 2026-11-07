@@ -333,7 +333,8 @@ function mockAdminListRuns(params?: {
   view?: "summary";
 }): Promise<{ runs: RunListItem[] | RunSummaryItem[] }> {
   const items = listRunsFor()
-    .filter((r) => r.kind !== "chat")
+    // Like the real ListActiveRunsAll: no chat, judge or cross-check runs (#3987).
+    .filter((r) => !["chat", "judge", "cross_check"].includes(r.kind))
     .filter((r) => !["completed", "failed", "cancelled"].includes(r.status))
     // Owner attribution: the mock's owner column is mockOtherRunOwners; every
     // other run belongs to the session admin. Before this map existed, EVERY
