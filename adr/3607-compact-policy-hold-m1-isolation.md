@@ -7,7 +7,7 @@ continuity below); Policy Stop remains omitted. Final merged validation,
 integration review and exact-head CI are pending.
 **Date:** 2026-10-31
 **Issue:** [#3607](https://github.com/vtmocanu/uzi/issues/3607)
-**PRD:** [Compact policy-refusal hold](../prds/3607-compact-policy-refusal-hold.md#decision-log)
+**PRD:** [Compact policy-refusal hold](../prds/done/3607-compact-policy-refusal-hold.md#decision-log)
 
 ## Context and authority
 
