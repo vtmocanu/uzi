@@ -573,10 +573,13 @@ publishing finished work, is a different park with its own bound; see
 
 If a park report is sent but its reply is lost, the worker asks uzi whether
 the run is parked, resending the report if it is not. When that check is
-permanently refused (anything other than not found, a timeout or rate
-limiting), or the resend is (anything other than a timeout or rate limiting;
-a resend rejected as a bad request still fails the run, as before), the
-worker stops retrying and reports nothing. It keeps the session when it can
+refused with an HTTP 4xx status other than 404, 408 or 429, or the resend is
+refused with a 4xx status other than 400, 408 or 429 (a resend rejected as a
+bad request still fails the run, as before), the worker stops retrying and
+reports nothing. A 404 on the check still means the run is no longer owned by
+this worker, and the worker cleans up as before. A 404 on the resend stops
+without a second check and keeps the session. Timeouts, 429, 5xx responses and
+transport failures are retried with backoff. The worker keeps the session when it can
 be resumed on that worker, keeps any publication record and source, leaves
 custody unsettled, and leaves the run to the server or its owner. A refusal
 is not treated as proof that the run ended. The same applies to the
