@@ -3352,6 +3352,26 @@ func (q *Queries) CountOnlineWorkersSatisfyingRepoAgentSource(ctx context.Contex
 	return count, err
 }
 
+const countOnlineWorkersSatisfyingRepoAgentSourceAndRequest = `-- name: CountOnlineWorkersSatisfyingRepoAgentSourceAndRequest :one
+SELECT count(*) FROM workers w
+WHERE w.user_id = $1
+  AND w.status = 'online'
+  AND fn_worker_accepts_new_intake(w)
+  AND NOT w.ephemeral
+  AND NOT w.isolated_lane
+  AND 'repo_agent_source_v1' = ANY(w.protocol_capabilities)
+  AND 'agent_source_request_v1' = ANY(w.protocol_capabilities)
+`
+
+// Issue #4005: the static intersection of the two counts above. ClaimRun applies both clauses
+// to one worker, so a run needing both is unplaceable on a fleet that splits them.
+func (q *Queries) CountOnlineWorkersSatisfyingRepoAgentSourceAndRequest(ctx context.Context, userID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingRepoAgentSourceAndRequest, userID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countOnlineWorkersWithFreeSlotForUser = `-- name: CountOnlineWorkersWithFreeSlotForUser :one
 SELECT count(*) FROM workers w
 WHERE w.user_id = $1

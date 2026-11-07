@@ -11180,6 +11180,18 @@ WHERE w.user_id = @user_id
   AND NOT w.isolated_lane
   AND 'agent_source_request_v1' = ANY(w.protocol_capabilities);
 
+-- name: CountOnlineWorkersSatisfyingRepoAgentSourceAndRequest :one
+-- Issue #4005: the static intersection of the two counts above. ClaimRun applies both clauses
+-- to one worker, so a run needing both is unplaceable on a fleet that splits them.
+SELECT count(*) FROM workers w
+WHERE w.user_id = @user_id
+  AND w.status = 'online'
+  AND fn_worker_accepts_new_intake(w)
+  AND NOT w.ephemeral
+  AND NOT w.isolated_lane
+  AND 'repo_agent_source_v1' = ANY(w.protocol_capabilities)
+  AND 'agent_source_request_v1' = ANY(w.protocol_capabilities);
+
 -- name: CountOnlineWorkersSatisfyingCodexHarness :one
 -- PRD #1332 M5A (D3): how many of a user's ONLINE, non-draining, non-ephemeral workers self-report
 -- the 'codex_harness_v1' PROTOCOL capability (workers.protocol_capabilities). This is the
