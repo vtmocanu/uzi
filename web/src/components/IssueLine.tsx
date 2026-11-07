@@ -262,7 +262,7 @@ export function IssueLine({
         </h2>
         <span
           className={`min-w-0 text-xs text-faint md:flex-1 md:text-right ${
-            scopeToggle ? "order-last basis-full md:order-none md:basis-auto" : "ml-auto"
+            scopeToggle ? "order-last basis-full md:order-none" : "ml-auto"
           } md:ml-0`}
         >
           {note}

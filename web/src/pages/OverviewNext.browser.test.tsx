@@ -2,7 +2,7 @@
 import "../index.css";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cdp, page, userEvent } from "vitest/browser";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { OverviewNext } from "./OverviewNext";
 import { api } from "../lib/api";
@@ -323,6 +323,137 @@ describe("OverviewNext issue work line", () => {
     const still = card.querySelector('[data-segment="static"]') as HTMLElement;
     expect(getComputedStyle(still).animationName).toBe("none");
   });
+});
+
+// #4052: the admin's You / All users switch is the Issue work header's right-most item and
+// holds still while the scope or a pressed station changes the rest of the card.
+describe("OverviewNext issue work scope switch", () => {
+  beforeEach(() => localStorage.clear());
+
+  function mountAdminLine() {
+    // The viewer's own runs on several stations; the admin list (beforeEach) adds two other
+    // users' runs, so All users is enabled and changes the counts.
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({ id: "q", status: "queued", issue_iid: 1 }),
+        aRun({ id: "g", status: "awaiting_approval", issue_iid: 3 }),
+        aRun({ id: "b", status: "running", issue_iid: 4 }),
+        aRun({ id: "k", status: "limit_wait", issue_iid: 6 }),
+      ],
+    });
+    render(
+      <MemoryRouter initialEntries={["/overview/next"]}>
+        <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+          <OverviewNext />
+        </main>
+      </MemoryRouter>,
+    );
+  }
+
+  async function header() {
+    const card = await screen.findByRole("region", { name: "Issue work" });
+    const toggle = screen.getByRole("group", { name: "Issue work scope" });
+    // The admin list has loaded once All users can be picked.
+    // (The usage card has its own All users option, so the button is looked up in the switch.)
+    await expect.poll(() => (within(toggle).getByRole("button", { name: "All users" }) as HTMLButtonElement).disabled).toBe(false);
+    await document.fonts.ready;
+    const title = screen.getByRole("heading", { name: "Issue work", level: 2 });
+    const note = title.parentElement!.children[1] as HTMLElement;
+    expect(note.textContent).toMatch(/on the line/);
+    return { card, toggle, title, note };
+  }
+
+  const centreY = (r: DOMRect) => r.top + r.height / 2;
+
+  for (const width of [1280, 400]) {
+    it(`puts the switch at the header's far right, inside the card, at ${width}px`, async () => {
+      await page.viewport(width, 900);
+      mountAdminLine();
+      const { card, toggle, title, note } = await header();
+      expect(window.innerWidth).toBe(width);
+      const t = toggle.getBoundingClientRect();
+      const c = card.getBoundingClientRect();
+      expect.soft(t.right, "right of the title").toBeGreaterThanOrEqual(title.getBoundingClientRect().right);
+      expect.soft(t.right, "right of the note").toBeGreaterThanOrEqual(note.getBoundingClientRect().right - 0.5);
+      expect.soft(t.left, "inside the card (left)").toBeGreaterThanOrEqual(c.left);
+      expect.soft(t.right, "inside the card (right)").toBeLessThanOrEqual(c.right);
+      expect(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(
+        window.innerWidth,
+      );
+    });
+  }
+
+  it("keeps title, note and switch on one row at 1280px", async () => {
+    await page.viewport(1280, 900);
+    mountAdminLine();
+    const { toggle, title, note } = await header();
+    const t = toggle.getBoundingClientRect();
+    const h = title.getBoundingClientRect();
+    const n = note.getBoundingClientRect();
+    // One row: each item's vertical centre lies inside the others' boxes.
+    for (const [name, r] of [["title", h], ["note", n]] as const) {
+      expect.soft(centreY(r), `${name} centre within the switch row`).toBeGreaterThanOrEqual(t.top);
+      expect.soft(centreY(r), `${name} centre within the switch row`).toBeLessThanOrEqual(t.bottom);
+    }
+    expect.soft(centreY(t), "switch centre on the title row").toBeGreaterThanOrEqual(h.top);
+    expect.soft(centreY(t), "switch centre on the title row").toBeLessThanOrEqual(h.bottom);
+    expect(n.left, "note between title and switch").toBeGreaterThanOrEqual(h.right);
+    expect(n.right).toBeLessThanOrEqual(t.left + 0.5);
+  });
+
+  it("keeps the switch on the title row and wraps the note below at 400px", async () => {
+    await page.viewport(400, 900);
+    mountAdminLine();
+    const { toggle, title, note } = await header();
+    const t = toggle.getBoundingClientRect();
+    const h = title.getBoundingClientRect();
+    const n = note.getBoundingClientRect();
+    expect.soft(centreY(t), "switch centre on the title row").toBeGreaterThanOrEqual(h.top);
+    expect.soft(centreY(t), "switch centre on the title row").toBeLessThanOrEqual(h.bottom);
+    expect.soft(centreY(h), "title centre within the switch row").toBeGreaterThanOrEqual(t.top);
+    expect.soft(centreY(h), "title centre within the switch row").toBeLessThanOrEqual(t.bottom);
+    expect.soft(n.top, "note below the title").toBeGreaterThanOrEqual(h.bottom);
+    expect.soft(n.top, "note below the switch").toBeGreaterThanOrEqual(t.bottom);
+    expect(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(
+      window.innerWidth,
+    );
+  });
+
+  for (const width of [1280, 400]) {
+    it(`holds the switch still across You, All users and a pressed station at ${width}px`, async () => {
+      await page.viewport(width, 900);
+      mountAdminLine();
+      const { card, toggle, note } = await header();
+      // Page coordinates: pressing a station can scroll it into view on a phone, which moves
+      // every viewport rect without moving the switch on the page.
+      const rect = () => {
+        const r = toggle.getBoundingClientRect();
+        return { left: r.left + window.scrollX, top: r.top + window.scrollY, width: r.width, height: r.height };
+      };
+      const you = rect();
+      const youNote = note.textContent;
+
+      const allUsers = within(toggle).getByRole("button", { name: "All users" });
+      await userEvent.click(allUsers);
+      expect(allUsers.getAttribute("aria-pressed")).toBe("true");
+      expect(note.textContent, "the note follows the scope").not.toBe(youNote);
+      const all = rect();
+
+      const building = card.querySelector('[data-stage="building"]') as HTMLElement;
+      await userEvent.click(building);
+      expect(building.getAttribute("aria-pressed")).toBe("true");
+      const pressed = rect();
+
+      for (const [name, r] of [["All users", all], ["station pressed", pressed]] as const) {
+        for (const k of ["left", "top", "width", "height"] as const) {
+          expect.soft(r[k], `${name} ${k}`).toBeCloseTo(you[k], 1);
+        }
+      }
+      expect(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(
+        window.innerWidth,
+      );
+    });
+  }
 });
 
 describe("OverviewNext capacity rail", () => {
