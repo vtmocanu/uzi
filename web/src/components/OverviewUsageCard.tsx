@@ -74,7 +74,7 @@ function CostCell({ cost, disclosure, total }: { cost: number; disclosure: Retur
   return (
     <Td total={total}>
       <span className="font-mono">{summaryCost(cost)}</span>
-      {disclosure.incomplete && <span className="ml-auto block max-w-[16ch] whitespace-normal text-[11px] font-normal text-faint" title={disclosure.title}>{disclosure.text}</span>}
+      {disclosure.incomplete && <span className="ml-auto block max-w-[16ch] whitespace-normal lg:max-w-none lg:whitespace-nowrap text-[11px] font-normal text-faint" title={disclosure.title}>{disclosure.text}</span>}
     </Td>
   );
 }
@@ -92,13 +92,15 @@ function ByUserTable({ admin, window, viewerId }: { admin: AdminUsage; window: U
         <h3 className="text-sm font-semibold text-fg">By user</h3>
         <span className="text-xs text-faint">{recent ? "last 7 days" : "all time"}, by cost</span>
       </div>
+      {/* The scroller follows RunUsage.tsx: a named region without an unconditional tabIndex, since
+          Chrome already focuses an overflowing scroller and a permanent stop would sit empty at desktop widths. */}
       {recent && !available ? (
         <p className="mt-2 text-sm text-muted">Seven-day per-user usage is unavailable. Upgrade the API to view this period.</p>
       ) : rows.length === 0 ? (
         <p className="mt-2 text-sm text-faint">No usage across the factory yet.</p>
       ) : (
-        <div data-testid="by-user-scroll" role="region" aria-label="By user table" tabIndex={0} className="mt-2 overflow-x-auto focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">
-          <table className="w-full min-w-[640px] border-collapse text-[13px]">
+        <div data-testid="by-user-scroll" role="region" aria-label="By user, scrollable" className="mt-2 overflow-x-auto">
+          <table aria-label="By user" className="w-full min-w-[640px] border-collapse text-[13px]">
             <thead>
               <tr>
                 <Th left>User</Th>

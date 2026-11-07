@@ -32,7 +32,7 @@ it("scrolls the by-user table inside its wrapper at 400px without overflowing th
   fireEvent.click(screen.getByRole("button", { name: "Factory · all users" }));
   const scroll = screen.getByTestId("by-user-scroll");
   expect(getComputedStyle(scroll).overflowX).toBe("auto");
-  expect(scroll.querySelector("table")!.getBoundingClientRect().width).toBeGreaterThanOrEqual(640);
+  expect(scroll.querySelector("table")!.getBoundingClientRect().width).toBeCloseTo(640, 0);
   expect(scroll.scrollWidth).toBeGreaterThan(scroll.clientWidth);
   expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(document.documentElement.clientWidth);
 });

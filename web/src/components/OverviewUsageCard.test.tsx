@@ -466,11 +466,12 @@ describe("OverviewUsageCard by-user table (#3881 M2)", () => {
     expect(note().textContent).toBe("+ 2 runs without a cost estimate and 1 unreported run");
   });
 
-  it("names the scroll wrapper as a focusable region and each row's first cell as a row header", () => {
+  it("names the scroll wrapper as a region and each row's first cell as a row header", () => {
     const { self, admin } = fixture();
     const view = factoryView({ self, admin });
-    const scroll = view.getByRole("region", { name: "By user table" });
-    expect(scroll.getAttribute("tabindex")).toBe("0");
+    const scroll = view.getByRole("region", { name: "By user, scrollable" });
+    expect(scroll.hasAttribute("tabindex")).toBe(false);
+    expect(view.getByRole("table", { name: "By user" })).toBeTruthy();
     expect(scroll.getAttribute("data-testid")).toBe("by-user-scroll");
     expect(section(view).getAllByRole("rowheader").map((h) => h.textContent)).toEqual([
       "other.person@example.com", "owner.person@example.com (you)", "Factory",
