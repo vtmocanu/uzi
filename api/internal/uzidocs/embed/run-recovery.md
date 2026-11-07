@@ -2480,12 +2480,15 @@ source at a time, and keeps everything else:
   keeps the source. The server reads the predecessor's capabilities, so the first
   roll onto an image that advertises it keeps every tree. A definitive ownership
   404 keeps only that run's sources.
-- Only an attempt with the exact strict three-key journal (`runId`, `clonePath`,
-  `attemptId`) is admitted: with the ledger live, with the ledger `retired` and
-  the footprint missing, or through the explicit empty-journal repair. A
-  canonical source, a source with no journal keys and a protected source are
-  kept (`kept_unrecoverable_shape`, `kept_protected`). The ledger `reclaimed`
-  state is not admitted; only an operator discard disposes of it.
+- Only an attempt source is admitted, in one of three shapes: the exact strict
+  three-key journal (`runId`, `clonePath`, `attemptId`) with the ledger live;
+  the same journal with the ledger `retired` and the footprint missing; or the
+  explicitly valued empty journal (`[""]`) with the ledger `retired` and the
+  footprint missing (the exact repair, metadata only). A canonical source, a
+  source with no journal keys and a protected source are kept
+  (`kept_unrecoverable_shape`, `kept_protected`). The ledger `reclaimed` and
+  `abandoned` states are not admitted; only an operator discard disposes of
+  them.
 - Automatic content proof has finite budgets (metadata 16 MiB, worktree content
   512 MiB, 4 GiB per object-store snapshot, 131,072 metadata records, 16,384
   directory entries). A positively observed overflow keeps only that source

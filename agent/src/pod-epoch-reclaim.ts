@@ -527,7 +527,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
         if (!candidate) continue;
         // No new source after shutdown or the soft stop.
         if (controller.signal.aborted) { skipped = true; break; }
-        // Structural keeps are refused before any authority read or proof, and never downgrade the verdict.
+        // Structural keeps are refused before any deletion-phase authority read or proof, and never downgrade the verdict.
         if (admit.protectedDiscard) { result.kept_protected++; continue; }
         if (admit.kind !== "attempt" || admit.parts !== 1 || admit.groupSize !== 1) { result.kept_unrecoverable_shape++; continue; }
         const runId = admit.selector.runId;
