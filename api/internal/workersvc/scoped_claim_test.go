@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -72,6 +73,11 @@ func (r scopedClaimRow) Scan(dest ...any) error {
 		return r.err
 	}
 	v := reflect.ValueOf(r.value)
+	if len(dest) == 1 && v.Type().AssignableTo(reflect.TypeOf(dest[0]).Elem()) {
+		// A single-column scan of a struct-typed value (e.g. pgtype.Timestamptz).
+		reflect.ValueOf(dest[0]).Elem().Set(v)
+		return nil
+	}
 	if v.Kind() != reflect.Struct {
 		if len(dest) != 1 {
 			return fmt.Errorf("scalar scan width %d", len(dest))
@@ -112,6 +118,9 @@ func (tx *scopedClaimTx) QueryRow(_ context.Context, sql string, args ...any) pg
 		return scopedClaimRow{err: pgx.ErrNoRows}
 	case "LockSecretEnablementForShareNowait":
 		return scopedClaimRow{value: false}
+	case "GetUserCredentialsResetAt":
+		// Scoped-claim fixture users have never redeemed a reset link (NULL marker).
+		return scopedClaimRow{value: pgtype.Timestamptz{}}
 	default:
 		return scopedClaimRow{err: fmt.Errorf("unexpected query %s", strings.Fields(sql)[2])}
 	}
