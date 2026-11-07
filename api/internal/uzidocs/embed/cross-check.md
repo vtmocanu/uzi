@@ -753,8 +753,13 @@ index, path, walk and ignore budgets also scale from the verified base;
 see the [counter definitions and bounds](../adr/2149-cross-check.md#planning-diff-capture-symlinks-gitlinks-and-budgets-2026-10-07-2410).
 
 There is no object-store snapshot copy or snapshot budget. Base discovery
-has per-object, depth and deadline bounds, with no aggregate base cap or
-cache. No additional absolute ceiling applies to the relative totals. Limits remain: 4 MiB per file, 2 MiB per commit/tree object, depth 64,
+has per-object, depth and deadline bounds plus two absolute aggregate caps:
+1,200,000 tree-entry occurrences (a shared subtree counts each time it is
+walked; there is no cache) and 96 MiB of cumulative relative-path bytes
+(directories included). Exceeding either refuses the capture as
+`diff_too_large`; the caps are at least 2x the largest realistic trees
+measured. See the [dated ADR amendment](../adr/2149-cross-check.md#amendment-2026-11-06--3543-aggregate-base-discovery-bound).
+Other limits remain: 4 MiB per file, 2 MiB per commit/tree object, depth 64,
 64 KiB per ignore/exclude read, 512 KiB patch/output and 200 non-ignored
 untracked files. The helper has 28 s and the outer capture 30 s; yielding
 during discovery and reads allows cancellation cleanup within the production
