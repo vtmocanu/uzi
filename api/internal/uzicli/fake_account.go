@@ -115,6 +115,18 @@ func (f *FakeClient) GetEffectiveSettings(context.Context) (apitypes.EffectiveSe
 	return *f.Effective, nil
 }
 
+// PreviewScheduleSettings serves SchedulePreview and records the id; unset it answers 404.
+func (f *FakeClient) PreviewScheduleSettings(_ context.Context, scheduleID string) (apitypes.ScheduleSettingsPreviewDTO, error) {
+	f.SchedulePreviewIDs = append(f.SchedulePreviewIDs, scheduleID)
+	if f.SchedulePreviewErr != nil {
+		return apitypes.ScheduleSettingsPreviewDTO{}, f.SchedulePreviewErr
+	}
+	if f.SchedulePreview == nil {
+		return apitypes.ScheduleSettingsPreviewDTO{}, Exitf(ExitNotFound, "not found")
+	}
+	return *f.SchedulePreview, nil
+}
+
 func (f *FakeClient) SetUsageReserve(_ context.Context, thresholdPct *int, pauseRunning bool) (apitypes.UserDTO, error) {
 	f.ReserveCalls++
 	f.LastReservePct = thresholdPct

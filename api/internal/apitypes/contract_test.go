@@ -108,6 +108,11 @@ func contractCases() []contractCase {
 		newContractCase[EffectiveSettingsDTO]("effective_settings"),
 		newContractCase[StartPreviewRequest]("effective_settings_start_preview_request"),
 		newContractCase[StartPreviewDTO]("effective_settings_start_preview"),
+		// PRD #3254 M3: the schedule preview. Its request keeps presence for harness, model and
+		// credential_override (omitted is as stored, null clears), so the full request fixture is the
+		// all-present shape; the full response carries a refused alternative.
+		newContractCase[ScheduleSettingsPreviewRequest]("effective_settings_schedule_preview_request"),
+		newContractCase[ScheduleSettingsPreviewDTO]("effective_settings_schedule_preview"),
 		newContractCase[CatalogEntryDTO]("catalog_entry"),
 		newContractCase[AdminCLITokenDTO]("cli_token"),
 		// PRD #1183 M3: the first fixture pair for the Findings backlog row, so its Go/TS

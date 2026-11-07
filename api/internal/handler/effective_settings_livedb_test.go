@@ -951,10 +951,17 @@ type effCorpusPreview struct {
 	Response apitypes.StartPreviewDTO     `json:"response"`
 }
 
+type effCorpusSchedulePreview struct {
+	Name     string                                  `json:"name"`
+	Request  apitypes.ScheduleSettingsPreviewRequest `json:"request"`
+	Response apitypes.ScheduleSettingsPreviewDTO     `json:"response"`
+}
+
 type effCorpusScenario struct {
-	Name          string                        `json:"name"`
-	Get           apitypes.EffectiveSettingsDTO `json:"get"`
-	StartPreviews []effCorpusPreview            `json:"start_previews"`
+	Name             string                        `json:"name"`
+	Get              apitypes.EffectiveSettingsDTO `json:"get"`
+	StartPreviews    []effCorpusPreview            `json:"start_previews"`
+	SchedulePreviews []effCorpusSchedulePreview    `json:"schedule_previews,omitempty"`
 }
 
 type effCorpus struct {
@@ -970,7 +977,9 @@ const (
 // TestEffectiveSettingsCorpusLiveDB records the responses the web mock serves
 // (fixtures/api-contract/effective_settings.behavior.json): the default scenario (both harnesses
 // usable), codexOnly, and a Codex-default user with overflow on, whose inherit preview carries a
-// refused alternative. The corpus is recorded from the live routes, not authored.
+// refused alternative. Each scenario also records schedule-preview drafts (PRD #3254 M3); no
+// recorded schedule-preview has a refused alternative, because real data cannot produce one (see
+// TestScheduleAlternativesTopLevelRefusal). The corpus is recorded from the live routes, not authored.
 func TestEffectiveSettingsCorpusLiveDB(t *testing.T) {
 	previews := func(f *effFix, specs ...[2]string) []effCorpusPreview {
 		var out []effCorpusPreview
@@ -979,6 +988,16 @@ func TestEffectiveSettingsCorpusLiveDB(t *testing.T) {
 			var req apitypes.StartPreviewRequest
 			strictDecode(t, []byte(s[1]), &req)
 			out = append(out, effCorpusPreview{Name: s[0], Request: req, Response: dto})
+		}
+		return out
+	}
+	schedules := func(f *effFix, specs ...[2]string) []effCorpusSchedulePreview {
+		var out []effCorpusSchedulePreview
+		for _, s := range specs {
+			dto, _ := f.schedulePreview(s[1])
+			var req apitypes.ScheduleSettingsPreviewRequest
+			strictDecode(t, []byte(s[1]), &req)
+			out = append(out, effCorpusSchedulePreview{Name: s[0], Request: req, Response: dto})
 		}
 		return out
 	}
@@ -1006,6 +1025,20 @@ func TestEffectiveSettingsCorpusLiveDB(t *testing.T) {
 		[2]string{"disabled pinned token", `{"harness":null,"credential_override":{"mode":"pinned","secret_id":"` + corpusDisabledToken + `"}}`},
 		[2]string{"missing pinned token", `{"harness":null,"credential_override":{"mode":"pinned","secret_id":"` + corpusMissingToken + `"}}`},
 		[2]string{"pinned without a token", `{"harness":null,"credential_override":{"mode":"pinned"}}`},
+	), SchedulePreviews: schedules(f,
+		[2]string{"unpinned sweep", `{"target":"sweep"}`},
+		[2]string{"sweep pinned to codex with a claude model pin", `{"target":"sweep","harness":"codex","model":"sonnet","override_subagent_model":true}`},
+		[2]string{"sweep pinned to claude with subagents following the lead", `{"target":"sweep","harness":"claude","override_subagent_model":true}`},
+		[2]string{"sweep pinned to claude with subagents on their own pins", `{"target":"sweep","harness":"claude"}`},
+		[2]string{"sweep with a model pin and no harness", `{"target":"sweep","model":"sonnet"}`},
+		[2]string{"prompt with an explicit inherit", `{"target":"prompt","credential_override":null}`},
+		[2]string{"unpinned sweep with an auto token", `{"target":"sweep","credential_override":{"mode":"auto"}}`},
+		[2]string{"self improve", `{"target":"self_improve"}`},
+		[2]string{"enabled pinned token", `{"target":"sweep","credential_override":{"mode":"pinned","secret_id":"` + corpusEnabledToken + `"}}`},
+		[2]string{"disabled pinned token", `{"target":"sweep","credential_override":{"mode":"pinned","secret_id":"` + corpusDisabledToken + `"}}`},
+		[2]string{"missing pinned token", `{"target":"sweep","credential_override":{"mode":"pinned","secret_id":"` + corpusMissingToken + `"}}`},
+		[2]string{"invalid model", `{"target":"sweep","model":"two words"}`},
+		[2]string{"token on a self improve lane", `{"target":"self_improve","credential_override":{"mode":"auto"}}`},
 	)})
 
 	f = newEffFix(t, nil)
@@ -1016,6 +1049,11 @@ func TestEffectiveSettingsCorpusLiveDB(t *testing.T) {
 		[2]string{"default start", `{"harness":null,"credential_override":null}`},
 		[2]string{"claude", `{"harness":"claude","credential_override":null}`},
 		[2]string{"codex", `{"harness":"codex","credential_override":null}`},
+	), SchedulePreviews: schedules(f,
+		[2]string{"unpinned sweep", `{"target":"sweep"}`},
+		[2]string{"sweep with a claude model pin", `{"target":"sweep","model":"sonnet","override_subagent_model":true}`},
+		[2]string{"auto token on an unpinned sweep", `{"target":"sweep","credential_override":{"mode":"auto"}}`},
+		[2]string{"sweep pinned to claude", `{"target":"sweep","harness":"claude"}`},
 	)})
 
 	f = newEffFix(t, nil)
@@ -1025,6 +1063,9 @@ func TestEffectiveSettingsCorpusLiveDB(t *testing.T) {
 	corpus.Scenarios = append(corpus.Scenarios, effCorpusScenario{Name: "overflowCodexDefault", Get: dto, StartPreviews: previews(f,
 		[2]string{"default start", `{"harness":null,"credential_override":null}`},
 		[2]string{"inherit", `{"harness":null,"credential_override":{"mode":"inherit"}}`},
+	), SchedulePreviews: schedules(f,
+		[2]string{"unpinned sweep", `{"target":"sweep"}`},
+		[2]string{"unpinned sweep with an explicit inherit", `{"target":"sweep","credential_override":null}`},
 	)})
 
 	var buf bytes.Buffer

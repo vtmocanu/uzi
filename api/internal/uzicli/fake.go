@@ -369,6 +369,12 @@ type FakeClient struct {
 	Effective    *apitypes.EffectiveSettingsDTO
 	EffectiveErr error
 
+	// SchedulePreview and SchedulePreviewErr drive PreviewScheduleSettings; with both unset the
+	// fake answers 404 like a foreign schedule. SchedulePreviewIDs records the ids asked for.
+	SchedulePreview    *apitypes.ScheduleSettingsPreviewDTO
+	SchedulePreviewErr error
+	SchedulePreviewIDs []string
+
 	// SetUsageReserve capture (PRD #3522): how many times it was called and the threshold
 	// (nil = off) and pause flag the command sent.
 	ReserveCalls     int

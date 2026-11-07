@@ -749,6 +749,8 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/me/cli-tokens/revoke-all", noLimiter},
 	// PRD #3254: start-preview is a read that takes a token choice in a body; it writes nothing.
 	{"POST", "/api/me/effective-settings/start-preview", noLimiter},
+	// PRD #3254 M3: schedule-preview is the same kind of read (a draft or a schedule id in the body).
+	{"POST", "/api/me/effective-settings/schedule-preview", noLimiter},
 	// PRD #1907 M5: the product-token MINT rides the credential-surface limiter per user
 	// (a (pattern, user) bucket), on top of the handler's per-product cap (D15).
 	{"POST", "/api/me/product-tokens/", limAuth},

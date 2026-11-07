@@ -1,0 +1,11 @@
+{
+  "version": 0,
+  "harness": null,
+  "refusal": null,
+  "refusal_detail": null,
+  "worker_model": null,
+  "worker_effort": null,
+  "credential": null,
+  "subagents": null,
+  "notes": null
+}

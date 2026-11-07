@@ -17,8 +17,9 @@ func newSettingsCmd(env Env, gf *globalFlags) *cobra.Command {
 		Use: "settings", Short: "Read account settings; set usage reserve, Codex account mode and harness overflow", Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error { return cmd.Help() },
 	}
-	cmd.AddCommand(&cobra.Command{
-		Use: "get", Short: "Show account settings, cross-check pins and model settings", Args: cobra.NoArgs,
+	var scheduleID string
+	get := &cobra.Command{
+		Use: "get", Short: "Show account settings, cross-check pins and model settings; --schedule previews a schedule's fire", Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			c, err := env.client(gf)
 			if err != nil {
@@ -28,10 +29,18 @@ func newSettingsCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// A schedule the caller asked about must exist: a 404 (foreign, missing or an older
+			// server) fails the command before anything is printed.
+			var schedule *apitypes.ScheduleSettingsPreviewDTO
+			if scheduleID != "" {
+				if schedule, err = readSchedulePreview(cmd.Context(), c, scheduleID, env.Stderr); err != nil {
+					return err
+				}
+			}
 			p := env.printer(gf)
 			effective := readEffectiveSettings(cmd.Context(), c, env.Stderr)
 			if p.Format == uzicli.FormatJSON {
-				return p.JSON(settingsGetJSON{UserSettingsDTO: settings, Effective: effective})
+				return p.JSON(settingsGetJSON{UserSettingsDTO: settings, Effective: effective, SchedulePreview: schedule})
 			}
 			if err := p.Table([]string{"STAGE", "HARNESS", "STATUS", "STORED MODEL", "WORKER DEFAULT MODEL",
 				"RESOLVED MODEL", "MODEL SOURCE", "STORED EFFORT", "RESOLVED EFFORT", "EFFORT SOURCE"},
@@ -56,6 +65,15 @@ func newSettingsCmd(env Env, gf *globalFlags) *cobra.Command {
 					p.Println(line)
 				}
 			}
+			if schedule != nil {
+				p.Println("If fired and claimed now (schedule " + crossCheckPlain(scheduleID) + ")")
+				if err := p.Table(settingsModelColumns, settingRowsTable(schedulePreviewRows(schedule))); err != nil {
+					return err
+				}
+				for _, line := range schedulePreviewLines(schedule) {
+					p.Println(line)
+				}
+			}
 			// PRD #2603: nil means the per-user switch was never set, which reads as on.
 			p.Println(settingsNowSummaryLine(settings))
 			// PRD #3522: the weekly usage reserve, off when no threshold is set.
@@ -66,7 +84,9 @@ func newSettingsCmd(env Env, gf *globalFlags) *cobra.Command {
 			p.Println(harnessOverflowLine(settings.HarnessOverflowEnabled, settings.DefaultHarness))
 			return nil
 		},
-	})
+	}
+	get.Flags().StringVar(&scheduleID, "schedule", "", "preview what firing this saved schedule now would use (schedule id)")
+	cmd.AddCommand(get)
 	cmd.AddCommand(newSettingsReserveCmd(env, gf))
 	cmd.AddCommand(newSettingsCodexModeCmd(env, gf))
 	cmd.AddCommand(newSettingsHarnessOverflowCmd(env, gf))

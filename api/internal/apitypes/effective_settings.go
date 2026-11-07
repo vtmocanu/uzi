@@ -1,5 +1,10 @@
 package apitypes
 
+import (
+	"bytes"
+	"encoding/json"
+)
+
 // The effective-settings wire (PRD #3254): what model, effort and harness a run would use.
 // Tokens only on the wire; the labels live in fixtures/model-settings/contract.json. No
 // credential id, label or value appears in any of these types.
@@ -128,4 +133,140 @@ type StartPreviewDTO struct {
 	RefusalDetail *string                      `json:"refusal_detail"`
 	Credential    *CredentialDTO               `json:"credential"`
 	Alternatives  []StartPreviewAlternativeDTO `json:"alternatives,omitempty"`
+}
+
+// OptionalText distinguishes an omitted string field from an explicit null and a value, like
+// OptionalHarness: a plain *string collapses omitted and null.
+//
+//   - key absent         -> Present=false (as stored)
+//   - "model": null      -> Present=true, Value=nil (clear)
+//   - "model": "sonnet"  -> Present=true, Value=&"sonnet"
+type OptionalText struct {
+	Present bool
+	Value   *string
+}
+
+// UnmarshalJSON records that the key was present (even for an explicit null).
+func (o *OptionalText) UnmarshalJSON(b []byte) error {
+	o.Present = true
+	if string(b) == "null" {
+		o.Value = nil
+		return nil
+	}
+	var v string
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	o.Value = &v
+	return nil
+}
+
+// MarshalJSON emits the value, or null when Present without one. A Present=false wrapper is
+// omitted by IsZero and the omitzero tag.
+func (o OptionalText) MarshalJSON() ([]byte, error) {
+	if o.Value == nil {
+		return []byte("null"), nil
+	}
+	return json.Marshal(*o.Value)
+}
+
+// IsZero drives the omitzero tag: an omitted wrapper is dropped from the encoded body.
+func (o OptionalText) IsZero() bool { return !o.Present }
+
+// OptionalPreviewCredentialOverride keeps presence for a preview's credential_override like
+// OptionalCredentialOverride (omitted is as stored, null is inherit), and decodes the object
+// strictly, so an unknown member is rejected as it is in the rest of the preview body.
+type OptionalPreviewCredentialOverride struct {
+	Present bool
+	Value   *PreviewCredentialOverrideRequest
+}
+
+// UnmarshalJSON records that the key was present and decodes a non-null object strictly.
+func (o *OptionalPreviewCredentialOverride) UnmarshalJSON(b []byte) error {
+	o.Present = true
+	if string(b) == "null" {
+		o.Value = nil
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	var v PreviewCredentialOverrideRequest
+	if err := dec.Decode(&v); err != nil {
+		return err
+	}
+	o.Value = &v
+	return nil
+}
+
+// MarshalJSON emits the object, or null when Present without one.
+func (o OptionalPreviewCredentialOverride) MarshalJSON() ([]byte, error) {
+	if o.Value == nil {
+		return []byte("null"), nil
+	}
+	return json.Marshal(o.Value)
+}
+
+// IsZero drives the omitzero tag: an omitted wrapper is dropped from the encoded body.
+func (o OptionalPreviewCredentialOverride) IsZero() bool { return !o.Present }
+
+// ScheduleSettingsPreviewRequest is the body of POST /api/me/effective-settings/schedule-preview.
+// Without schedule_id it is a draft and target is required; with schedule_id it supplies fields
+// that replace the stored ones (an absent field means as stored). harness, model and
+// credential_override keep presence: omitted is as stored, null clears.
+type ScheduleSettingsPreviewRequest struct {
+	ScheduleID            *string                           `json:"schedule_id,omitempty"`
+	Target                *string                           `json:"target,omitempty"`
+	Harness               OptionalHarness                   `json:"harness,omitzero"`
+	Model                 OptionalText                      `json:"model,omitzero"`
+	OverrideSubagentModel *bool                             `json:"override_subagent_model,omitempty"`
+	CredentialOverride    OptionalPreviewCredentialOverride `json:"credential_override,omitzero"`
+}
+
+// EffectiveSubagentPinDTO is one own subagent whose template pins a model for the harness.
+type EffectiveSubagentPinDTO struct {
+	Name  string `json:"name"`
+	Model string `json:"model"`
+}
+
+// EffectiveSubagentsDTO says how a run's subagents pick a model. mode is follow_lead (every
+// subagent runs the lead's model) or own_pins (each pinned subagent keeps its pin; the rest
+// follow the lead). lead_value "" means the SDK decides. pinned lists at most 32 subagents sorted
+// by name; pinned_truncated says there were more.
+type EffectiveSubagentsDTO struct {
+	Mode            string                    `json:"mode"`
+	LeadValue       string                    `json:"lead_value"`
+	Pinned          []EffectiveSubagentPinDTO `json:"pinned"`
+	PinnedTruncated bool                      `json:"pinned_truncated"`
+}
+
+// ScheduleAlternativeDTO is one harness a creation-time policy might choose for a schedule fire,
+// computed as if that harness were chosen. A refused branch carries its own refusal and
+// refusal_detail, and worker_model, worker_effort, credential and subagents are all null.
+type ScheduleAlternativeDTO struct {
+	Harness       string                  `json:"harness"`
+	WorkerModel   *EffectiveModelCellDTO  `json:"worker_model"`
+	WorkerEffort  *EffectiveEffortCellDTO `json:"worker_effort"`
+	Credential    *CredentialDTO          `json:"credential"`
+	Subagents     *EffectiveSubagentsDTO  `json:"subagents"`
+	Refusal       *string                 `json:"refusal"`
+	RefusalDetail *string                 `json:"refusal_detail"`
+}
+
+// ScheduleSettingsPreviewDTO is the body of POST /api/me/effective-settings/schedule-preview:
+// what firing the schedule now and claiming the run would use. Refusal is set for a save-step
+// failure, a failure before the harness is decided, a fire-rule refusal on a known harness, or
+// when every alternative is refused for the same reason. When the harness is chosen at creation,
+// harness.value is null, the four harness-dependent fields are null and Alternatives lists
+// Claude then Codex, neither marked as chosen.
+type ScheduleSettingsPreviewDTO struct {
+	Version       int                      `json:"version"`
+	Harness       *HarnessValueDTO         `json:"harness"`
+	Refusal       *string                  `json:"refusal"`
+	RefusalDetail *string                  `json:"refusal_detail"`
+	WorkerModel   *EffectiveModelCellDTO   `json:"worker_model"`
+	WorkerEffort  *EffectiveEffortCellDTO  `json:"worker_effort"`
+	Credential    *CredentialDTO           `json:"credential"`
+	Subagents     *EffectiveSubagentsDTO   `json:"subagents"`
+	Notes         []string                 `json:"notes"`
+	Alternatives  []ScheduleAlternativeDTO `json:"alternatives,omitempty"`
 }

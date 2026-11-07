@@ -1,9 +1,14 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"io"
+	"strings"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
 // settingsGetJSON is the `uzi settings get --json` body: every key the settings read carries
@@ -12,6 +17,8 @@ import (
 type settingsGetJSON struct {
 	apitypes.UserSettingsDTO
 	Effective *apitypes.EffectiveSettingsDTO `json:"effective"`
+	// SchedulePreview is present only with --schedule.
+	SchedulePreview *apitypes.ScheduleSettingsPreviewDTO `json:"schedule_preview,omitempty"`
 }
 
 // effectiveModelLabels and effectiveEffortLabels name the effective-settings cells the "Model settings" table shows
@@ -124,6 +131,136 @@ func effectiveAlternativeLines(e *apitypes.EffectiveSettingsDTO) []string {
 			}
 			lines = append(lines, "  "+crossCheckPlain(fmt.Sprintf("%s: %s", h.Harness, text)))
 		}
+	}
+	return lines
+}
+
+// readSchedulePreview reads the schedule preview for `uzi settings get --schedule`. The caller named
+// the schedule, so any answer that is not a server or network failure ends the command with its exit
+// code: a 404 means the schedule does not exist for this account (or the server predates the
+// route). A 5xx or network failure leaves the preview nil with a note on stderr, as the effective
+// view degrades, because the settings read itself succeeded.
+func readSchedulePreview(ctx context.Context, c uzicli.Client, id string, stderr io.Writer) (*apitypes.ScheduleSettingsPreviewDTO, error) {
+	dto, err := c.PreviewScheduleSettings(ctx, id)
+	if err == nil {
+		return &dto, nil
+	}
+	var ee *uzicli.ExitError
+	if errors.As(err, &ee) && ee.Code != uzicli.ExitUnreachable {
+		return nil, err
+	}
+	fmt.Fprintf(stderr, "Schedule preview: unavailable (%s)\n", crossCheckPlain(err.Error()))
+	return nil, nil
+}
+
+// schedulePreviewRows renders the schedule preview in the model-settings table: the harness (or the
+// refusal), then the worker model, worker effort, credential and subagent rows, once for an exact
+// harness and once per harness when the harness is chosen when the run is created. At most two
+// alternatives are read.
+func schedulePreviewRows(d *apitypes.ScheduleSettingsPreviewDTO) []settingRow {
+	row := settingRow{Setting: "schedule harness", Harness: "-", StoredText: "-", Default: "-", Notes: d.Notes}
+	switch {
+	case d.Harness == nil:
+		row.Resolved = "refused: " + refusalText(d.Refusal, d.RefusalDetail)
+		row.Notes = nil
+	case d.Harness.Value == nil:
+		row.Resolved = "claude or codex"
+		row.Field, row.Source = "harness", d.Harness.Source
+		row.Notes = append(append([]string{}, d.Harness.Notes...), d.Notes...)
+		if d.Refusal != nil {
+			row.Resolved = "refused: " + refusalText(d.Refusal, d.RefusalDetail)
+		}
+	default:
+		row.Resolved = *d.Harness.Value
+		row.Field, row.Source = "harness", d.Harness.Source
+		row.Notes = append(append([]string{}, d.Harness.Notes...), d.Notes...)
+		if d.Refusal != nil {
+			row.Resolved += ", refused: " + refusalText(d.Refusal, d.RefusalDetail)
+		}
+	}
+	rows := []settingRow{row}
+	if d.Harness != nil && d.Harness.Value != nil && d.Refusal == nil {
+		rows = append(rows, scheduleBranchRows(*d.Harness.Value, d.WorkerModel, d.WorkerEffort, d.Credential, d.Subagents, nil, nil)...)
+	}
+	for _, a := range d.Alternatives[:min(len(d.Alternatives), 2)] {
+		rows = append(rows, scheduleBranchRows(a.Harness, a.WorkerModel, a.WorkerEffort, a.Credential, a.Subagents, a.Refusal, a.RefusalDetail)...)
+	}
+	return rows
+}
+
+// scheduleBranchRows are the rows of one harness: its fire refusal, or the worker model, worker
+// effort, credential and subagent rows.
+func scheduleBranchRows(harness string, model *apitypes.EffectiveModelCellDTO, effort *apitypes.EffectiveEffortCellDTO,
+	cred *apitypes.CredentialDTO, subs *apitypes.EffectiveSubagentsDTO, refusal, detail *string) []settingRow {
+	if refusal != nil {
+		return []settingRow{{Setting: "fire", Harness: harness, StoredText: "-", Default: "-", Resolved: "refused: " + refusalText(refusal, detail)}}
+	}
+	var rows []settingRow
+	if model != nil {
+		rows = append(rows, settingRow{
+			Setting: "worker model", Harness: harness, Stored: model.Model,
+			Default: orSDKDefault(model.DefaultModel), Resolved: orSDKDefault(model.ResolvedModel),
+			Field: "model", Source: model.Source, Notes: model.Notes,
+		})
+	}
+	if effort != nil {
+		r := effortRow("worker effort", effort.EffortSettingCellDTO)
+		r.Harness, r.Notes = harness, effort.Notes
+		rows = append(rows, r)
+	}
+	if cred != nil {
+		resolved := cred.Kind + " credential"
+		if cred.AuthMode != nil {
+			resolved += " (" + *cred.AuthMode + ")"
+		}
+		rows = append(rows, settingRow{Setting: "credential", Harness: harness, StoredText: "-", Default: "-", Resolved: resolved, Field: "credential", Source: cred.Source})
+	}
+	if subs != nil {
+		rows = append(rows, settingRow{Setting: "subagents", Harness: harness, StoredText: "-", Default: "-", Resolved: subagentsText(subs)})
+	}
+	return rows
+}
+
+// subagentsText says how the subagents pick a model. At most eight pins are named.
+func subagentsText(s *apitypes.EffectiveSubagentsDTO) string {
+	lead := "the lead's model: " + orSDKDefault(s.LeadValue)
+	if s.Mode != "own_pins" {
+		return "all follow " + lead
+	}
+	if len(s.Pinned) == 0 {
+		return "own pins (none set); all follow " + lead
+	}
+	var parts []string
+	for _, p := range s.Pinned[:min(len(s.Pinned), 8)] {
+		parts = append(parts, p.Name+"="+p.Model)
+	}
+	out := "own pins: " + strings.Join(parts, ", ")
+	if more := len(s.Pinned) - 8; more > 0 {
+		out += fmt.Sprintf(" (+%d more)", more)
+	} else if s.PinnedTruncated {
+		out += " (more not listed)"
+	}
+	return out + "; the rest follow " + lead
+}
+
+// schedulePreviewLines are the lines after the table: a model pin the harness cannot run, and the
+// note that a chosen-when-created harness has no single answer.
+func schedulePreviewLines(d *apitypes.ScheduleSettingsPreviewDTO) []string {
+	var lines []string
+	ignored := func(harness string, m *apitypes.EffectiveModelCellDTO) {
+		if m != nil && m.Ignored != nil {
+			lines = append(lines, crossCheckPlain(fmt.Sprintf("%s: the model %s from the %s does not run on this harness; the default applies",
+				harness, m.Ignored.Value, modelSettingSource("model", m.Ignored.Source))))
+		}
+	}
+	if d.Harness != nil && d.Harness.Value != nil {
+		ignored(*d.Harness.Value, d.WorkerModel)
+	}
+	for _, a := range d.Alternatives[:min(len(d.Alternatives), 2)] {
+		ignored(a.Harness, a.WorkerModel)
+	}
+	if len(d.Alternatives) > 0 {
+		lines = append(lines, "The harness is chosen when the run is created; the rows above show each harness it can land on.")
 	}
 	return lines
 }

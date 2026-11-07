@@ -594,9 +594,10 @@ func TestCLIReachesSettingsOverBearerLiveDB(t *testing.T) {
 	}
 }
 
-// TestCLIReachesEffectiveSettingsOverBearerLiveDB pins the PRD #3254 mounts: both effective-settings
-// routes are RequireUser (a uzc_ Bearer reaches them) and neither is public (401 without
-// credentials). The start-preview write verb is a read, so a CLI token may call it.
+// TestCLIReachesEffectiveSettingsOverBearerLiveDB pins the PRD #3254 mounts: the effective-settings
+// routes are RequireUser (a uzc_ Bearer reaches them) and none is public (401 without
+// credentials). The start-preview and schedule-preview write verbs are reads, so a CLI token may
+// call them; a schedule id that is not the caller's is a 404 over Bearer too.
 func TestCLIReachesEffectiveSettingsOverBearerLiveDB(t *testing.T) {
 	_, router, pool := cliLiveDB(t)
 	user := cliSeedUser(t, pool, false)
@@ -613,11 +614,22 @@ func TestCLIReachesEffectiveSettingsOverBearerLiveDB(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("POST start-preview over Bearer = %d, want 200\nbody: %s", rec.Code, rec.Body.String())
 	}
+	rec = bearerReqBody(router, http.MethodPost, "/api/me/effective-settings/schedule-preview", uzc, `{"target":"sweep"}`)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"notes"`) {
+		t.Fatalf("POST schedule-preview over Bearer = %d, want 200\nbody: %s", rec.Code, rec.Body.String())
+	}
+	rec = bearerReqBody(router, http.MethodPost, "/api/me/effective-settings/schedule-preview", uzc, `{"schedule_id":"`+uuid.NewString()+`"}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("POST schedule-preview for a schedule the caller does not own = %d, want 404\nbody: %s", rec.Code, rec.Body.String())
+	}
 	if rec := bearerReq(router, http.MethodGet, "/api/me/effective-settings", ""); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated GET /api/me/effective-settings = %d, want 401", rec.Code)
 	}
 	if rec := bearerReqBody(router, http.MethodPost, "/api/me/effective-settings/start-preview", "", `{}`); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated POST start-preview = %d, want 401", rec.Code)
+	}
+	if rec := bearerReqBody(router, http.MethodPost, "/api/me/effective-settings/schedule-preview", "", `{"target":"sweep"}`); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated POST schedule-preview = %d, want 401", rec.Code)
 	}
 }
 

@@ -573,20 +573,29 @@ func (h *Handler) buildStartPreview(ctx context.Context, userID uuid.UUID, expli
 	return dto, nil
 }
 
-// commonAlternativeRefusal is the top-level refusal of a chosen-at-create response: set only when
-// every alternative is refused for the same reason. With differing reasons, or any valid branch,
-// no harness is decided and nothing is promoted, so the per-alternative reasons stand alone.
+// commonAlternativeRefusal is the top-level refusal of a chosen-at-create start-preview response
+// (see commonRefusal).
 func commonAlternativeRefusal(alts []apitypes.StartPreviewAlternativeDTO) refusal {
-	var common refusal
+	rs := make([]refusal, len(alts))
 	for i, a := range alts {
-		if a.Refusal == nil {
-			return refusal{}
+		if a.Refusal != nil {
+			rs[i] = refusal{Token: *a.Refusal}
+			if a.RefusalDetail != nil {
+				rs[i].Detail = *a.RefusalDetail
+			}
 		}
-		r := refusal{Token: *a.Refusal}
-		if a.RefusalDetail != nil {
-			r.Detail = *a.RefusalDetail
-		}
-		if i > 0 && r != common {
+	}
+	return commonRefusal(rs)
+}
+
+// commonRefusal is the top-level refusal of a chosen-at-create response, given each branch's
+// refusal (a zero refusal is a valid branch): set only when every branch is refused for the same
+// reason, token and detail. With differing reasons, or any valid branch, no harness is decided and
+// nothing is promoted, so the per-branch reasons stand alone.
+func commonRefusal(rs []refusal) refusal {
+	var common refusal
+	for i, r := range rs {
+		if r.Token == "" || (i > 0 && r != common) {
 			return refusal{}
 		}
 		common = r
@@ -612,8 +621,19 @@ func (h *Handler) previewCredential(ctx context.Context, userID uuid.UUID, hn wo
 	if resolved == nil {
 		return credentialDTO(base), refusal{}, nil
 	}
+	c, err := overrideCredential(resolved.Mode)
+	if err != nil {
+		return nil, refusal{}, err
+	}
+	return credentialDTO(c), refusal{}, nil
+}
+
+// overrideCredential is the Anthropic credential a validated override mode selects: auto ranks the
+// tokens at claim, default uses the owner default at claim, and a pinned token is fixed when the
+// run is created.
+func overrideCredential(mode string) (*workersvc.CredentialPrediction, error) {
 	c := workersvc.CredentialPrediction{Kind: workersvc.CredentialKindAnthropic, FixedAt: workersvc.FixedAtClaim}
-	switch resolved.Mode {
+	switch mode {
 	case workersvc.CredentialOverrideModeAuto:
 		c.Source = workersvc.CredentialSourceAutoSelection
 	case workersvc.CredentialOverrideModeDefault:
@@ -621,7 +641,7 @@ func (h *Handler) previewCredential(ctx context.Context, userID uuid.UUID, hn wo
 	case workersvc.CredentialOverrideModePinned:
 		c.Source, c.FixedAt = workersvc.CredentialSourceTokenOverride, workersvc.FixedAtCreate
 	default:
-		return nil, refusal{}, fmt.Errorf("credential override mode %q has no credential source", resolved.Mode)
+		return nil, fmt.Errorf("credential override mode %q has no credential source", mode)
 	}
-	return credentialDTO(&c), refusal{}, nil
+	return &c, nil
 }
