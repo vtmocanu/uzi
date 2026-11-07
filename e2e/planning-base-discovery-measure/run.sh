@@ -25,7 +25,7 @@
 #                  timeout, the harness 60 s scope timer and this script's per-job wait by N. Every
 #                  cap and bound stays at its production value. Label __validation-dl<N> (with
 #                  LIMITS_TAG: __validation-<tag>-dl<N>); usable with or without LIMITS_JSON; not
-#                  combinable with SMOKE_INJECT. Measures memory and charges at the caps, not timing.
+#                  combinable with SMOKE_INJECT; every MEM_CONFIGS entry must use mode full only. Measures memory and charges at the caps, not timing.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -89,6 +89,10 @@ for config in "$@"; do
   case "$config" in
     *[!a-z0-9:,]*) echo "unsafe MEM_CONFIGS entry: $config" >&2; exit 2 ;;
   esac
+  # The stretched clock lives in the metering preamble, which only `full` prepends.
+  if [ -n "$DEADLINE_SCALE" ] && [ "${config##*:}" != "full" ]; then
+    echo "DEADLINE_SCALE requires every MEM_CONFIGS entry to use mode full only: $config" >&2; exit 2
+  fi
 done
 
 mkdir -p "$OUT/inputs" "$OUT/fixtures" "$OUT/results" "$OUT/tmp" "$OUT/logs"

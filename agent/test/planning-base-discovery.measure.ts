@@ -734,7 +734,7 @@ interface MeasureJob {
   limits?: Record<string, number>;
   // Validation only, integer 2..8: slow the helper's clock (and stretch the outer capture and
   // harness timeouts) by this factor so a near-cap base can finish under every production cap.
-  // Not combinable with injectDeadlineAfterSizing.
+  // Mode full only; not combinable with injectDeadlineAfterSizing.
   deadlineScale?: number;
 }
 
@@ -743,6 +743,9 @@ function validateDeadlineScale(job: MeasureJob): number {
   const s = job.deadlineScale;
   if (typeof s !== "number" || !Number.isInteger(s) || s < 2 || s > 8) throw new Error("deadlineScale must be an integer 2..8");
   if (job.injectDeadlineAfterSizing === true) throw new Error("deadlineScale and injectDeadlineAfterSizing are mutually exclusive");
+  // The clock is slowed by the metering preamble, which control does not prepend (its row would
+  // run at the production deadline under a stretched label); cancel measures cancellation only.
+  if (job.mode !== "full") throw new Error("deadlineScale requires mode full");
   return s;
 }
 

@@ -219,7 +219,7 @@ Measured on 2026-11-06/07 with the capped helper (`baseDiscoveryEntryCap` = 1,20
   1. production rows, 1127 s: `REPO_SHA=455673e7 FIXTURES="repo synthetic-50000 wide-1170x1024 wide-1171x1024 longpath-d60n250w2000f3 longpath-d60n250w2000f4 distinct-1170x1024n75 fatchain-d64" MEM_CONFIGS="1536m:1:full,control 4g:2:full"`;
   2. rerun and sizing-batch rows: the same with `FIXTURES="repo synthetic-50000 distinct-256x1024n75 distinct-512x1024n75"`;
   3. twelve validation probes, 1641 s: one invocation each with `MEM_CONFIGS="4g:2:full"`, `LIMITS_JSON` and `LIMITS_TAG` (below).
-- **Raw records:** `results-2026-11-06-bound-m3.jsonl` beside this file. It holds 48 records, each tagged with its `run` (`m3-production`, `m3-rerun`, `m3-probes`).
+- **Raw records:** `results-2026-11-06-bound-m3.jsonl` beside this file. It holds 50 records, each tagged with its `run` (`m3-production`, `m3-rerun`, `m3-probes`, `m3-deadline-scaled`).
 - **Disk:** each configuration's container and its anonymous volumes were removed with `docker rm -v` as soon as its results were on the mounted output directory. No measurement container remained after any invocation.
 
 ## Production rows (default limits)
@@ -256,6 +256,18 @@ The auditor of M2 noted that every M1 fixture shared one blob, so the post-disco
   - Linear in the `full` 4g/2 rows: ≈ 810 MiB.
   - Both rows include post-discovery work these `--no-checkout` fixtures add (every base path diffs as a deletion until `git_deadline`), whose share is bounded by time rather than size, so a two-point linear fit is an estimate, not a bound. No measured row reached both caps together.
 
+## Near-both-caps peak (validation, deadline ×4, 1536m/1)
+
+Measured on 2026-11-07 with the harness's `DEADLINE_SCALE` mode (README, "Deadline scale") at the shipped caps, so that a near-cap base can get past the 28 s helper deadline on this host. Only the helper's clock, the outer capture timeout and the harness timers are stretched ×4; every cap and every other bound, including each git command's own 5 s timer (real time), stays at its production value. These rows measure memory at the caps, not production timing. Command: `DEADLINE_SCALE=4 MEASURE_IMAGE=pbd-measure:1fca12dd FIXTURES="distinct-1170x1024n75 wide-1170x1024" MEM_CONFIGS="1536m:1:full"` (harness and helper as committed with this section). Every job exited 0, with no OOM and no harness kill.
+
+| fixture | outcome | discovery | container peak MiB (cgroup, end) | real capture ms |
+|---|---|---|---|---|
+| distinct-1170x1024n75 (1,199,250 entries = 99.94 % of the entry cap; 99,448,830 path bytes = 98.8 % of the path-byte cap; 1,198,080 distinct blobs) | `git_deadline` in the sizing batch (that `cat-file --batch-check` exceeded its own 5 s real-time timer) | all 1,199,250 entries fetched (meter); the sizing batch was partly read | **767.5** | 39,815 |
+| wide-1170x1024 (1,199,250 entries; 17,979,390 path bytes) | discovery completed (charged 1,199,250 / 17,979,390, `analytic; meter match`), then a post-discovery `git_pipe_cap` from this `--no-checkout` fixture's all-deleted diff | completed, 28.8 s real (7.2 s helper clock) | 499.9 | 103,451 |
+
+- The distinct row is the closest this host gets to both caps reached: discovery of every entry plus part of the maximal sizing batch (26,550,384 bytes of `--batch-check` output read for 1,198,080 ids at 48 or more bytes per line, so under half the batch), in `full` (instrumented) mode, which adds metering overhead. Its 767.5 MiB peak replaces the earlier two-point extrapolation (about 1,166 MiB, in the sizing-batch section above) as the measured figure and fits the 1536 MiB budget with about 2× headroom. It is still not a completed whole capture: the sizing batch's per-command timer, which this mode deliberately does not stretch, fired first.
+- The same invocation's first attempt also asked for `control` rows. `control` runs the unmodified helper without the metering preamble that slows the clock, so those rows ran at the production deadline under a stretched label; they were discarded (not in the jsonl), and the harness and `run.sh` now refuse `DEADLINE_SCALE` for any mode other than `full`.
+
 ## Validation probes (7f, injected limits, 4g/2)
 
 For each index i, the pair `(entryCap = i, pathByteCap = Pm(i) − 1)` must refuse with `base_discovery_path_byte_cap` (actual A(i) ≥ Pm(i)), and `(entryCap = i, pathByteCap = Pm(i))` must refuse with `base_discovery_entry_cap` (A(i) ≤ Pm(i)). Pm comes from the harness's analytic model.
@@ -274,7 +286,7 @@ For each index i, the pair `(entryCap = i, pathByteCap = Pm(i) − 1)` must refu
 
 ## Decision (M3 rule)
 
-1. **Memory:** the largest measured whole-capture container peak with the caps in force is 575.5 MiB (fatchain-d64, 4g/2). On the 1536 MiB / 1 CPU slot it is 543.4 MiB (distinct-512x1024n75, `control`), and 502.4 MiB among the cap-refusal rows (fatchain-d64). The extrapolated sizing-batch worst case is about 1,166 MiB. All fit the 1536 MiB per-slot budget.
+1. **Memory:** the largest measured whole-capture container peak with the caps in force at production timing is 575.5 MiB (fatchain-d64, 4g/2). On the 1536 MiB / 1 CPU slot it is 543.4 MiB (distinct-512x1024n75, `control`), and 502.4 MiB among the cap-refusal rows (fatchain-d64). With the deadline stretched ×4 (validation), the near-both-caps distinct-1170x1024n75 row peaks at 767.5 MiB on the 1536 MiB / 1 CPU slot. The earlier two-point extrapolation of the sizing batch was about 1,166 MiB. All fit the 1536 MiB per-slot budget.
 2. **Clean controls:** this repository and synthetic-50000 capture at the caps in the M2 tests (`git-planning-diff.test.ts`, "Base discovery aggregate caps (#3543)") and in the harness rerun at both configurations. The first production run's synthetic-50000 4g/2 row did not pass: it is a post-discovery `capture_deadline` under host load, not a cap (its discovery completed 24× below the entry cap). This acceptance counts the disclosed rerun; under a strict reading in which every M3 row must pass, that row is the exception.
 3. **Realistic margin (rule 5a):** the caps stay at 2.13× (entries) and 2.36× (path bytes) Chromium's tree, as in the M1 section.
 
@@ -282,5 +294,5 @@ For each index i, the pair `(entryCap = i, pathByteCap = Pm(i) − 1)` must refu
 
 **Residual, not measured:**
 - Compose enforces memory per worker, not per run, so concurrent runs in one worker share the 1536 MiB-per-slot arithmetic.
-- The extrapolated 1,166 MiB case was not reached on this host.
+- No capture with both caps reached completed on this host, even with the deadline stretched: the near-both-caps peak (767.5 MiB) was measured up to the sizing batch's per-command timer.
 - Each configuration ran once.

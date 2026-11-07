@@ -197,7 +197,9 @@ helper process with `pbdT0 + floor((real - pbdT0) / N)`, so the helper's 28 s de
 scope timer and `run.sh`'s per-job wait are multiplied by the same N. Every cap, every other
 production bound and the per-git-command 5 s timer (a real timer) stay at their production
 values; the preamble's own timing keeps the real clock. The job is rejected when combined with
-`injectDeadlineAfterSizing`.
+`injectDeadlineAfterSizing`, and for any mode other than `full`: `control` runs without the
+preamble, so its helper would keep the production deadline under a stretched label, and `cancel`
+measures cancellation, not memory at the caps.
 
 The record sets `validation: true` and `deadlineScale: N` (null on production rows); `captureMs`
 and `discovery.ms` stay real elapsed milliseconds, and `helper.clockScale` /
