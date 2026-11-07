@@ -130,12 +130,13 @@ same agents as the first plan turn.
 
 A repo-sourced plan turn keeps these safeguards:
 
-- **No file writes.** On Claude runs each planning subagent loses `Edit`,
+- **No file-write tools.** On Claude runs each planning subagent loses `Edit`,
   `Write`, `MultiEdit` and `NotebookEdit`, and a repo agent whose declared tools
   are only write tools does not take part in planning. On Codex runs the worker
-  refuses every file write a planning agent attempts. The shell stays available,
-  so planning is not a read-only sandbox: a repo agent that declares `Bash` can
-  still run commands.
+  refuses the file-write requests a planning agent makes. The shell stays
+  available on both harnesses, so planning is not a read-only sandbox: a repo
+  agent with a shell can still run commands, and those commands can change
+  files.
 - **The usual repo-agent limits.** A repo agent cannot spawn nested agents or
   schedule deferred work, and on a memory-guarded Claude run its shell goes
   through the same supervised command tool as your templates.
