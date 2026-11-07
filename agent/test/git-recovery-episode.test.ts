@@ -2107,3 +2107,25 @@ test("issue #3194 coverage: a legacy journal without restoreSource refuses befor
   assert.ok(git(bare, ["for-each-ref", "--format=%(refname) %(objectname)"]) === pins, "capture pins remain");
   assert.deepEqual(fs.readdirSync(path.dirname(source.clonePath)).sort(), siblings);
 });
+
+// issue #3980: the git wrapper keeps the raw cause only for its own recovery-deadline stop, so the runner's
+// gate classifier can tell that stop from a genuine git failure.
+test("#3980: runGit keeps no cause for an ordinary git failure and the raw deadline Error for an expired recovery operation", async () => {
+  const runGit = (args: string[]): Promise<string> =>
+    (cache as unknown as { runGit(cwd: string, args: string[]): Promise<string> }).runGit(bare, args);
+  const ordinary = await runGit(["rev-parse", "--verify", "refs/heads/does-not-exist"]).then(() => undefined, (e: unknown) => e);
+  assert.ok(ordinary instanceof Error);
+  assert.match(ordinary.message, /^git rev-parse --verify refs\/heads\/does-not-exist failed: /);
+  assert.equal(ordinary.cause, undefined, "an ordinary git failure carries no cause");
+
+  const deadline = Date.now() + 50;
+  const expired = await cache.withRecoveryOperation(new AbortController().signal, deadline, async () => {
+    // Synchronous spin: no timer fires, so execScoped reaches recoveryRemaining's own raw throw.
+    while (Date.now() <= deadline) { /* spin past the deadline */ }
+    return runGit(["rev-parse", "HEAD"]);
+  }).then(() => undefined, (e: unknown) => e);
+  assert.ok(expired instanceof Error);
+  assert.equal(expired.message, "git rev-parse HEAD failed: recovery deadline exhausted");
+  assert.ok(expired.cause instanceof Error);
+  assert.equal((expired.cause as Error).message, "recovery deadline exhausted");
+});

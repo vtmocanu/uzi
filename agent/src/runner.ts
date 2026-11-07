@@ -1419,11 +1419,16 @@ class RetainedDiscoveryExhaustedError extends Error {
 const RETAINED_LOCK_WAIT_ABORT_MESSAGE = "permit-held git lock wait aborted: boundary deadline exceeded";
 const RETAINED_DEADLINE_TEXT = "recovery deadline exhausted";
 /** issue #3980: the rejections a bounded gate checkpoint raises when ITS deadline stops it (a queued
- *  lock wait, an expired recovery operation or capture scope, a soft stop, a timeout signal). */
+ *  lock wait, an expired recovery operation or capture scope, a soft stop, a timeout signal), raw or
+ *  wrapped by git.ts as `git ... failed: <cause message>` with the raw deadline error as its `cause`
+ *  (the wrapper's message must end with the cause's, so an unrelated cause never matches). */
 function isGateDeadlineFailure(error: unknown): boolean {
-  return error instanceof CheckpointSoftDeadlineError || error instanceof FreeCaptureScopeExpired ||
+  if (error instanceof CheckpointSoftDeadlineError || error instanceof FreeCaptureScopeExpired ||
     (error instanceof GitBoundaryAbortError && error.message === RETAINED_LOCK_WAIT_ABORT_MESSAGE) ||
-    (error instanceof Error && (error.message === RETAINED_DEADLINE_TEXT || error.name === "TimeoutError"));
+    (error instanceof Error && (error.message === RETAINED_DEADLINE_TEXT || error.name === "TimeoutError"))) return true;
+  return error instanceof Error && error.cause instanceof Error &&
+    (error.cause.message === RETAINED_DEADLINE_TEXT || error.cause.name === "TimeoutError") &&
+    error.message.endsWith(` failed: ${error.cause.message}`);
 }
 const RETAINED_RETRYABLE_ERRNO = new Set(["EAGAIN", "EMFILE", "ENFILE", "ENOMEM"]);
 const RETAINED_CORRUPTION_MARKERS = [

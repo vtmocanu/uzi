@@ -2571,6 +2571,122 @@ describe("issue #3980: the Claude gate checkpoint is bounded", () => {
     assertCustodyIntact(r);
   });
 
+  for (const [label, makeFailure] of [
+    ["a plain git failure", () => new Error("git status failed: fatal: bad object")],
+    // The wrapper text of a deadline stop, but with no cause: nothing proves it was this gate's deadline.
+    ["the wrapper text of a deadline stop with no cause", () => new Error("git x failed: recovery deadline exhausted")],
+  ] as const) {
+    it(`(8b) ${label} from the capture passes through unchanged, not remapped to TransientRecoveryError`, { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+      const proto = RunRunner.prototype as unknown as { captureRecoveryRestorePoint: (...args: unknown[]) => Promise<unknown> };
+      const original = proto.captureRecoveryRestorePoint;
+      restorers.push(() => { proto.captureRecoveryRestorePoint = original; });
+      const failure = makeFailure();
+      let calls = 0;
+      const r = await gateCheckpointRun({
+        dirty: true,
+        hang: async () => {
+          proto.captureRecoveryRestorePoint = async function () { calls++; throw failure; };
+          return { release: () => undefined, entered: () => calls > 0 };
+        },
+      });
+      assert.equal(r.entered, true, "the stubbed capture ran inside the bound");
+      assert.equal(r.rec.error, failure, `${failure.message} passes through by identity`);
+      assert.ok(!(r.rec.error instanceof TransientRecoveryError), "not remapped to TransientRecoveryError");
+      assertCustodyIntact(r);
+    });
+  }
+
+  /** Hooks the capture's owed-context object check (`git --no-replace-objects cat-file -t`, GitCache.requireOwedCommit),
+   *  a runGit call made outside any bare lock, so the wrapped error is what reaches the step (a call made under
+   *  withLock has its failure replaced by the lock's own raw recovery-interruption error). It records what runGit
+   *  rejects it with. "spin": waits until just before the gate deadline, then blocks the event loop past it so no
+   *  timer fires and the original execScoped throws recoveryRemaining's raw deadline Error. "timeout": throws the
+   *  DOMException a fired AbortSignal.timeout raises. "owner": aborts the owner signal, then throws the raw
+   *  deadline Error (the deadline stop that raced the owner's Cancel). */
+  function hookCaptureGit(mode: "spin" | "timeout" | "owner", rec: GateRec, deadlineMs: number, abort: GateAborts, ownerReason: Error) {
+    const internals = git as unknown as {
+      execScoped: (cmd: string, args: string[], ...rest: unknown[]) => Promise<unknown>;
+      runGit: (...args: unknown[]) => Promise<unknown>;
+    };
+    const originalExec = internals.execScoped;
+    const originalRunGit = internals.runGit;
+    const isFetch = (args: unknown): boolean =>
+      Array.isArray(args) && args.includes("cat-file") && args.includes("--no-replace-objects");
+    let hits = 0;
+    const rejections: unknown[] = [];
+    internals.execScoped = async function (this: unknown, cmd, args, ...rest) {
+      if (!isFetch(args)) return originalExec.call(this, cmd, args, ...rest);
+      hits++;
+      if (mode === "timeout") throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+      if (mode === "owner") {
+        abort.abortOwner(ownerReason);
+        throw new Error("recovery deadline exhausted");
+      }
+      const deadline = rec.startedAt + deadlineMs;
+      while (Date.now() < deadline - 30) await new Promise((resolve) => setTimeout(resolve, 5));
+      // No await from here to the call: the deadline timers cannot fire, so the raw recoveryRemaining throw is what surfaces.
+      while (Date.now() <= deadline + 100) { /* spin past the deadline */ }
+      return originalExec.call(this, cmd, args, ...rest);
+    } as typeof internals.execScoped;
+    internals.runGit = async function (this: unknown, ...args: unknown[]) {
+      try { return await originalRunGit.apply(this, args); }
+      catch (error) { if (isFetch(args[1])) rejections.push(error); throw error; }
+    } as typeof internals.runGit;
+    return { rejections, entered: () => hits > 0, release: () => { internals.execScoped = originalExec; internals.runGit = originalRunGit; } };
+  }
+  const NEVER_OWNER = new Error("unused owner reason");
+
+  it("(9) a recovery deadline that stops the capture's owed-context git check, wrapped by the git wrapper, fails closed as TransientRecoveryError", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    let hook!: ReturnType<typeof hookCaptureGit>;
+    const r = await gateCheckpointRun({
+      dirty: true,
+      hang: async (_flight, _x, rec, abort) => {
+        hook = hookCaptureGit("spin", rec, GATE_MS, abort, NEVER_OWNER);
+        return { release: () => hook.release(), entered: hook.entered };
+      },
+    });
+    assert.equal(hook.rejections.length, 1, "runGit rejected the hooked call once");
+    const wrapped = hook.rejections[0];
+    assert.ok(wrapped instanceof Error);
+    assert.match(wrapped.message, /^git --no-replace-objects cat-file -t [0-9a-f]+ failed: recovery deadline exhausted$/, "the raw deadline was wrapped by runGit");
+    assertGateFailedClosed(r);
+    assertCustodyIntact(r);
+  });
+
+  it("(9b) a fired timeout signal at the capture's owed-context git check, wrapped by the git wrapper, fails closed as TransientRecoveryError", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    let hook!: ReturnType<typeof hookCaptureGit>;
+    const r = await gateCheckpointRun({
+      dirty: true,
+      hang: async (_flight, _x, rec, abort) => {
+        hook = hookCaptureGit("timeout", rec, GATE_MS, abort, NEVER_OWNER);
+        return { release: () => hook.release(), entered: hook.entered };
+      },
+    });
+    assert.equal(hook.rejections.length, 1, "runGit rejected the hooked call once");
+    const wrapped = hook.rejections[0];
+    assert.ok(wrapped instanceof Error);
+    assert.match(wrapped.message, /^git --no-replace-objects cat-file -t [0-9a-f]+ failed: The operation was aborted due to timeout$/);
+    assertGateFailedClosed(r);
+    assertCustodyIntact(r);
+  });
+
+  it("(9c) an owner abort that races the wrapped deadline at the git check surfaces the owner's reason, not TransientRecoveryError", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const reason = new Error("owner cancelled at the capture git check (3980 test)");
+    let hook!: ReturnType<typeof hookCaptureGit>;
+    const r = await gateCheckpointRun({
+      dirty: true,
+      hang: async (_flight, _x, rec, abort) => {
+        hook = hookCaptureGit("owner", rec, GATE_MS, abort, reason);
+        return { release: () => hook.release(), entered: hook.entered };
+      },
+    });
+    assert.equal(r.entered, true, "the git hook was entered");
+    assert.equal(hook.rejections.length, 1, "runGit rejected the hooked call once");
+    assert.ok(!(r.rec.error instanceof TransientRecoveryError), `not remapped to TransientRecoveryError: ${String(r.rec.error)}`);
+    assert.equal(r.rec.error, reason, "the owner's own reason is what the step rejects with");
+    assertCustodyIntact(r);
+  });
+
   /** A REAL test-owned process group (`sleep 60`, detached: its pid is its pgid) that never goes. The
    *  runner's own production probe (processGroupAlive) decides its aliveness; the hook only counts probes
    *  and records signals WITHOUT delivering them, so the group survives until `stop()`. */
