@@ -1750,10 +1750,6 @@ export class SdkExecutor implements Executor {
     }
     const planUnavailable: UnavailableRole[] = planShaped ? planShaped.unavailable : [];
     const planSubagentNames = Object.keys(planAgents);
-    // PRD #266 M1: each roster name's write capability, derived from the PRE-STRIP
-    // `assembled.subagents` (NOT `planTurn.subagents`, which subtracts the write
-    // tools and would falsely mark `coder` read-only). Built once and threaded into
-    // every plan prompt AND the implement prompt, looked up by roster name.
     const subagentCanWrite = subagentWriteCapabilities(planPool);
     if (planTurn.dropped.length > 0) {
       // Visible rather than silent: an agent missing from the plan wave is a
