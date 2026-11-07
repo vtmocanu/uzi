@@ -210,8 +210,11 @@ and a `vault_only` link grants no access.
   deactivated targets are still refused.
 - **Running runs.** A run already executing keeps the credential its worker was
   issued until it ends; stopping or fencing active runs is out of scope. The
-  same holds for a Claude claim whose credential was already opened when the
-  reset committed: it is delivered on that credential. A running run's
+  same holds for a claim whose delivery committed before the reset (the reset
+  waits for it). A Claude or chat claim assembled but not yet delivered when
+  the reset commits delivers nothing: it parks on `credentials_reset` like
+  any run created before the reset (a job, judge or cross_check claim fails
+  instead). A running run's
   Codex refresh writes against a deleted account fail closed. Queued runs are
   not claimed until the new vault exists and is unlocked. After that, a
   Claude-harness or chat run created before the reset that finds no model
