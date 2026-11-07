@@ -279,7 +279,13 @@ describe("#3153 runner-shared replacement: preserve-only claim over the producti
     fs.rmSync(clone, { recursive: true, force: true });
     const bare = await workerA.ensureClone(fx.originPath);
     assert.throws(() => gitIn(bare, ["cat-file", "-e", `${r}^{commit}`]), "R is in no object store of the volume");
+    const refsBefore = gitIn(bare, ["for-each-ref", "--format=%(refname) %(objectname)"]);
     await replacement().execute(claimFor(iid, runId, r));
+    // Source identity and custody are retained: the shared cache's refs are untouched, and the re-hold
+    // reports no terminal state (which would release custody) and no fabricated work.
+    assert.equal(gitIn(bare, ["for-each-ref", "--format=%(refname) %(objectname)"]), refsBefore, "the bare cache's refs are unchanged");
+    const terminal = api.stateWire.filter((s) => s.runId === runId && ["completed", "failed", "cancelled"].includes(s.body.status));
+    assert.deepEqual(terminal, [], "no terminal report releases custody");
     assert.deepEqual(events, ["hold:saved_work_missing"]);
     assert.equal(holds[0]!.published, false);
     assert.equal(holds[0]!.head, undefined, "no head is fabricated");
