@@ -395,7 +395,8 @@ func subagentsDTO(p *workersvc.SubagentPrediction) *apitypes.EffectiveSubagentsD
 	if p == nil {
 		return nil
 	}
-	out := &apitypes.EffectiveSubagentsDTO{Mode: p.Mode, LeadValue: p.LeadValue, Pinned: []apitypes.EffectiveSubagentPinDTO{}, PinnedTruncated: p.PinnedTruncated}
+	out := &apitypes.EffectiveSubagentsDTO{Mode: p.Mode, LeadValue: p.LeadValue, Pinned: []apitypes.EffectiveSubagentPinDTO{}, PinnedTruncated: p.PinnedTruncated,
+		Notes: []string{"repo_agents_not_predicted"}}
 	for _, pin := range p.Pinned {
 		out.Pinned = append(out.Pinned, apitypes.EffectiveSubagentPinDTO{Name: pin.Name, Model: pin.Model})
 	}

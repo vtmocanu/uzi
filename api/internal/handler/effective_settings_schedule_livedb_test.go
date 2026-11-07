@@ -147,8 +147,9 @@ func wantSubagents(t *testing.T, s *apitypes.EffectiveSubagentsDTO, mode, lead s
 	for _, p := range s.Pinned {
 		got = append(got, p.Name+"="+p.Model)
 	}
-	if s.Mode != mode || s.LeadValue != lead || strings.Join(got, ",") != strings.Join(pinned, ",") || s.Pinned == nil {
-		t.Fatalf("subagents = %+v, want %s lead %q pins %v", s, mode, lead, pinned)
+	if s.Mode != mode || s.LeadValue != lead || strings.Join(got, ",") != strings.Join(pinned, ",") || s.Pinned == nil ||
+		strings.Join(s.Notes, ",") != "repo_agents_not_predicted" {
+		t.Fatalf("subagents = %+v, want %s lead %q pins %v and the repo_agents_not_predicted note", s, mode, lead, pinned)
 	}
 }
 

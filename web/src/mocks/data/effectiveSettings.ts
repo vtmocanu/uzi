@@ -708,7 +708,10 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
                 "mode": "own_pins",
                 "lead_value": "opus",
                 "pinned": [],
-                "pinned_truncated": false
+                "pinned_truncated": false,
+                "notes": [
+                  "repo_agents_not_predicted"
+                ]
               },
               "refusal": null,
               "refusal_detail": null
@@ -756,7 +759,10 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
                 "mode": "own_pins",
                 "lead_value": "gpt-6-sol",
                 "pinned": [],
-                "pinned_truncated": false
+                "pinned_truncated": false,
+                "notes": [
+                  "repo_agents_not_predicted"
+                ]
               },
               "refusal": null,
               "refusal_detail": null
@@ -828,7 +834,10 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
             "mode": "follow_lead",
             "lead_value": "gpt-6-sol",
             "pinned": [],
-            "pinned_truncated": false
+            "pinned_truncated": false,
+            "notes": [
+              "repo_agents_not_predicted"
+            ]
           },
           "notes": [
             "issue_labels_may_select_harness"
@@ -886,7 +895,10 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
             "mode": "follow_lead",
             "lead_value": "opus",
             "pinned": [],
-            "pinned_truncated": false
+            "pinned_truncated": false,
+            "notes": [
+              "repo_agents_not_predicted"
+            ]
           },
           "notes": [
             "issue_labels_may_select_harness"
@@ -943,7 +955,10 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
             "mode": "own_pins",
             "lead_value": "opus",
             "pinned": [],
-            "pinned_truncated": false
+            "pinned_truncated": false,
+            "notes": [
+              "repo_agents_not_predicted"
+            ]
           },
           "notes": [
             "issue_labels_may_select_harness"
@@ -1000,7 +1015,10 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
             "mode": "own_pins",
             "lead_value": "sonnet",
             "pinned": [],
-            "pinned_truncated": false
+            "pinned_truncated": false,
+            "notes": [
+              "repo_agents_not_predicted"
+            ]
           },
           "notes": [
             "issue_labels_may_select_harness"
@@ -1057,7 +1075,10 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
             "mode": "own_pins",
             "lead_value": "opus",
             "pinned": [],
-            "pinned_truncated": false
+            "pinned_truncated": false,
+            "notes": [
+              "repo_agents_not_predicted"
+            ]
           },
           "notes": []
         }
@@ -1114,7 +1135,10 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
             "mode": "own_pins",
             "lead_value": "opus",
             "pinned": [],
-            "pinned_truncated": false
+            "pinned_truncated": false,
+            "notes": [
+              "repo_agents_not_predicted"
+            ]
           },
           "notes": [
             "issue_labels_may_select_harness"
@@ -1170,7 +1194,10 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
             "mode": "own_pins",
             "lead_value": "opus",
             "pinned": [],
-            "pinned_truncated": false
+            "pinned_truncated": false,
+            "notes": [
+              "repo_agents_not_predicted"
+            ]
           },
           "notes": [
             "token_fixed"
@@ -1230,7 +1257,10 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
             "mode": "own_pins",
             "lead_value": "opus",
             "pinned": [],
-            "pinned_truncated": false
+            "pinned_truncated": false,
+            "notes": [
+              "repo_agents_not_predicted"
+            ]
           },
           "notes": [
             "issue_labels_may_select_harness"
@@ -1783,7 +1813,10 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
             "mode": "own_pins",
             "lead_value": "gpt-6.1-sol",
             "pinned": [],
-            "pinned_truncated": false
+            "pinned_truncated": false,
+            "notes": [
+              "repo_agents_not_predicted"
+            ]
           },
           "notes": [
             "issue_labels_may_select_harness"
@@ -1853,7 +1886,10 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
             "mode": "follow_lead",
             "lead_value": "gpt-6.1-sol",
             "pinned": [],
-            "pinned_truncated": false
+            "pinned_truncated": false,
+            "notes": [
+              "repo_agents_not_predicted"
+            ]
           },
           "notes": [
             "issue_labels_may_select_harness"
@@ -2398,7 +2434,10 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
                 "mode": "own_pins",
                 "lead_value": "opus",
                 "pinned": [],
-                "pinned_truncated": false
+                "pinned_truncated": false,
+                "notes": [
+                  "repo_agents_not_predicted"
+                ]
               },
               "refusal": null,
               "refusal_detail": null
@@ -2446,7 +2485,10 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
                 "mode": "own_pins",
                 "lead_value": "gpt-6-sol",
                 "pinned": [],
-                "pinned_truncated": false
+                "pinned_truncated": false,
+                "notes": [
+                  "repo_agents_not_predicted"
+                ]
               },
               "refusal": null,
               "refusal_detail": null

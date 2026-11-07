@@ -16,6 +16,20 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
+// TestSubagentsDTOAlwaysCarriesTheRepoAgentsNote: repository-defined agents in a cloned repo are
+// not predicted, so every predicted subagents block says so.
+func TestSubagentsDTOAlwaysCarriesTheRepoAgentsNote(t *testing.T) {
+	if subagentsDTO(nil) != nil {
+		t.Fatal("a nil prediction must stay null")
+	}
+	for _, p := range []*workersvc.SubagentPrediction{{Mode: "follow_lead"}, {Mode: "own_pins", PinnedTruncated: true}} {
+		got := subagentsDTO(p)
+		if strings.Join(got.Notes, ",") != "repo_agents_not_predicted" {
+			t.Errorf("notes for %+v = %v, want [repo_agents_not_predicted]", p, got.Notes)
+		}
+	}
+}
+
 // TestScheduleAlternativesTopLevelRefusal is the helper-level differing-reasons case for
 // schedule-preview. Real data cannot reach a refused branch: a chosen-at-create harness needs both
 // harnesses usable, and a stored credential override (the only input that makes a Codex branch

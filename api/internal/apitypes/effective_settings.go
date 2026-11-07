@@ -237,6 +237,9 @@ type EffectiveSubagentsDTO struct {
 	LeadValue       string                    `json:"lead_value"`
 	Pinned          []EffectiveSubagentPinDTO `json:"pinned"`
 	PinnedTruncated bool                      `json:"pinned_truncated"`
+	// Notes are labels: repo_agents_not_predicted always, since agents a cloned repository
+	// defines are not predicted.
+	Notes []string `json:"notes"`
 }
 
 // ScheduleAlternativeDTO is one harness a creation-time policy might choose for a schedule fire,

@@ -30,7 +30,7 @@ func schedulePreviewFixture() *apitypes.ScheduleSettingsPreviewDTO {
 			return &e
 		}(),
 		Credential: claimCred("codex", "codex_default_credential", "create"),
-		Subagents:  &apitypes.EffectiveSubagentsDTO{Mode: "follow_lead", LeadValue: "gpt-6-sol", Pinned: []apitypes.EffectiveSubagentPinDTO{}},
+		Subagents:  &apitypes.EffectiveSubagentsDTO{Mode: "follow_lead", LeadValue: "gpt-6-sol", Pinned: []apitypes.EffectiveSubagentPinDTO{}, Notes: []string{"repo_agents_not_predicted"}},
 		Notes:      []string{"issue_labels_may_select_harness"},
 	}
 }
@@ -53,7 +53,7 @@ func TestSettingsGetSchedulePreviewRows(t *testing.T) {
 		"worker model codex Default gpt-6-sol gpt-6-sol built-in · the schedule's model pin does not apply to this harness",
 		"worker effort codex Default medium medium built-in",
 		"credential codex - - codex credential your default Codex credential",
-		"subagents codex - - all follow the lead's model: gpt-6-sol -",
+		"subagents codex - - all follow the lead's model: gpt-6-sol (repository agents are not predicted) -",
 		"codex: the model sonnet from the schedule pin does not run on this harness; the default applies",
 	} {
 		if !strings.Contains(joined, want) {

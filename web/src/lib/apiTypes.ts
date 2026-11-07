@@ -396,6 +396,8 @@ export interface EffectiveSubagents {
   lead_value: string;
   pinned: EffectiveSubagentPin[];
   pinned_truncated: boolean;
+  /** Labels; `repo_agents_not_predicted` is always present. */
+  notes: string[];
 }
 
 /** One harness a creation-time policy might choose for a schedule fire, computed as if it were

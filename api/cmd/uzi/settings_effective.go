@@ -223,6 +223,14 @@ func scheduleBranchRows(harness string, model *apitypes.EffectiveModelCellDTO, e
 
 // subagentsText says how the subagents pick a model. At most eight pins are named.
 func subagentsText(s *apitypes.EffectiveSubagentsDTO) string {
+	out := subagentsBase(s)
+	for _, n := range s.Notes[:min(len(s.Notes), 4)] {
+		out += " (" + modelSettingSource("note", n) + ")"
+	}
+	return out
+}
+
+func subagentsBase(s *apitypes.EffectiveSubagentsDTO) string {
 	lead := "the lead's model: " + orSDKDefault(s.LeadValue)
 	if s.Mode != "own_pins" {
 		return "all follow " + lead

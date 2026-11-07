@@ -63,7 +63,10 @@
         "model": "x"
       }
     ],
-    "pinned_truncated": true
+    "pinned_truncated": true,
+    "notes": [
+      "x"
+    ]
   },
   "notes": [
     "x"
@@ -124,7 +127,10 @@
             "model": "x"
           }
         ],
-        "pinned_truncated": true
+        "pinned_truncated": true,
+        "notes": [
+          "x"
+        ]
       },
       "refusal": "x",
       "refusal_detail": "x"
