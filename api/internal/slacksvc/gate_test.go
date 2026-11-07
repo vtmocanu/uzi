@@ -1,6 +1,9 @@
 package slacksvc
 
 import (
+	"bytes"
+	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 
@@ -16,7 +19,7 @@ func gateSummary(blocks []slack.Block) ([]string, string) {
 
 func TestGateBlocksCrossCheckReason(t *testing.T) {
 	for _, reason := range []string{"revise", "model timeout", "checker unavailable", "codex lead unsupported"} {
-		_, section := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", nil, "", reason))
+		_, section := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", nil, "", "", reason))
 		if !strings.Contains(section, "Plan cross-check: "+reason) {
 			t.Fatalf("gate card omitted reason %q: %q", reason, section)
 		}
@@ -24,7 +27,7 @@ func TestGateBlocksCrossCheckReason(t *testing.T) {
 			t.Fatalf("gate card included findings: %q", section)
 		}
 	}
-	_, ordinary := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", nil, ""))
+	_, ordinary := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", nil, "", ""))
 	if strings.Contains(ordinary, "Plan cross-check:") {
 		t.Fatalf("ordinary gate gained cross-check reason: %q", ordinary)
 	}
@@ -33,26 +36,26 @@ func TestGateBlocksCrossCheckReason(t *testing.T) {
 func TestGateBlocksCrossCheckReasonScrubsBeforeBound(t *testing.T) {
 	token := "glpat-" + strings.Repeat("a", 20)
 	reason := strings.Repeat("x", 189) + " " + token[:12] + "\u202e" + token[12:]
-	_, section := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", nil, "", reason))
+	_, section := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", nil, "", "", reason))
 	if strings.Contains(section, "glpat-") {
 		t.Fatalf("bound leaked token prefix: %q", section)
 	}
 }
 
 func TestGateBlocksCrossCheckReasonSanitizedAndBounded(t *testing.T) {
-	_, section := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", nil, "",
+	_, section := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", nil, "", "",
 		"future_reason\u202e\x1b\n<!channel>"))
 	if !strings.Contains(section, "Plan cross-check: future reason&lt;!channel&gt;") ||
 		strings.ContainsAny(section, "\x1b\u202e") || strings.Contains(section, "<!channel>") {
 		t.Fatalf("unsafe reason: %q", section)
 	}
-	_, bounded := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", nil, "",
+	_, bounded := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", nil, "", "",
 		strings.Repeat("x", 10000)))
 	if !strings.Contains(bounded, "Plan cross-check: stored reason exceeds display limit") ||
 		strings.Contains(bounded, strings.Repeat("x", 200)) {
 		t.Fatalf("unbounded reason: %q", bounded)
 	}
-	_, cleared := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", nil, "", "\u202e\n"))
+	_, cleared := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", nil, "", "", "\u202e\n"))
 	if strings.Contains(cleared, "Plan cross-check:") {
 		t.Fatalf("empty sanitized reason rendered: %q", cleared)
 	}
@@ -62,7 +65,7 @@ func TestGateBlocksCrossCheckReasonSanitizedAndBounded(t *testing.T) {
 // own), byte-identical to the pre-M7 shape.
 func TestGateBlocksNoRosterSingleApprove(t *testing.T) {
 	for _, names := range [][]string{nil, {}} {
-		ids, section := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", names, ""))
+		ids, section := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", names, "", ""))
 		want := []string{ActionGateApprove, ActionGateRequestChanges, ActionGateReject, ActionGateOpen}
 		if len(ids) != len(want) {
 			t.Fatalf("names=%v: buttons = %v, want %v", names, ids, want)
@@ -82,7 +85,7 @@ func TestGateBlocksNoRosterSingleApprove(t *testing.T) {
 // listed in the body — and NEVER any description text.
 func TestGateBlocksRosterTwoApproves(t *testing.T) {
 	names := []string{"coder", "reviewer", "tester", "auditor"}
-	blocks := gateBlocks(uuid.New(), "https://uzi.example", names, "")
+	blocks := gateBlocks(uuid.New(), "https://uzi.example", names, "", "")
 	ids, section := gateSummary(blocks)
 
 	want := []string{ActionGateApproveRepo, ActionGateApproveOwn, ActionGateRequestChanges, ActionGateReject, ActionGateOpen}
@@ -120,7 +123,7 @@ func TestGateBlocksRosterTruncates(t *testing.T) {
 	for i := range names {
 		names[i] = "agent-" + string(rune('a'+i))
 	}
-	_, section := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", names, ""))
+	_, section := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", names, "", ""))
 	if !strings.Contains(section, "+4 more") {
 		t.Fatalf("expected a '+4 more' tail past the cap of %d: %q", maxGateAgentNames, section)
 	}
@@ -140,7 +143,7 @@ func TestGateBlocksRepoAgentFolder(t *testing.T) {
 		{"unexpected", "<https://evil.example|agents>", ".claude/agents/"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			blocks := gateBlocks(uuid.New(), "https://uzi.example", []string{"tester", "coder"}, tc.folder)
+			blocks := gateBlocks(uuid.New(), "https://uzi.example", []string{"tester", "coder"}, tc.folder, "")
 			_, body := gateSummary(blocks)
 			if !strings.Contains(body, "`"+tc.want+"`") {
 				t.Fatalf("gate body = %q, want folder %q", body, tc.want)
@@ -166,7 +169,7 @@ func TestGateBlocksRepoAgentFolder(t *testing.T) {
 				t.Fatalf("unexpected folder leaked: %q", body)
 			}
 			for _, names := range [][]string{nil, {}} {
-				empty := gateBlocks(uuid.New(), "https://uzi.example", names, tc.folder)
+				empty := gateBlocks(uuid.New(), "https://uzi.example", names, tc.folder, "")
 				_, emptyBody := gateSummary(empty)
 				if emptyBody != "*Plan ready for review.* Approve to let the run continue, or reject to send it back. The plan is in uzi." {
 					t.Fatalf("no-roster body changed: %q", emptyBody)
@@ -326,6 +329,121 @@ func TestGateNoticeCopyHasNoEmDash(t *testing.T) {
 	for _, s := range []string{gateSupersededText, gateNoLongerOpenText, gateRecardSupersededText} {
 		if strings.ContainsRune(s, '—') {
 			t.Errorf("gate notice %q contains an em dash", s)
+		}
+	}
+}
+
+func gateGoldenID() uuid.UUID {
+	return uuid.MustParse("11111111-2222-4333-8444-555555555555")
+}
+
+func TestGateBlocksUnsetRequestMatchesGolden(t *testing.T) {
+	for _, tc := range []struct {
+		name, golden string
+		names        []string
+		folder       string
+	}{
+		{"roster", "testdata/gate_unset_roster.golden.json", []string{"coder", "tester"}, ".claude/agents"},
+		{"no roster", "testdata/gate_unset_no_roster.golden.json", nil, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want, err := os.ReadFile(tc.golden)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, requested := range []string{"", "unknown"} {
+				got, err := json.MarshalIndent(gateBlocks(gateGoldenID(), "https://uzi.example", tc.names, tc.folder, requested), "", "  ")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(append(got, '\n'), want) {
+					t.Fatalf("requested=%q: gate blocks differ from %s:\n%s", requested, tc.golden, got)
+				}
+			}
+		})
+	}
+}
+
+func TestGateBlocksRequestedSourceOrdersApproveButtons(t *testing.T) {
+	names := []string{"coder", "reviewer"}
+	for _, tc := range []struct {
+		requested string
+		want      []string
+		primary   string
+	}{
+		{"", []string{ActionGateApproveRepo, ActionGateApproveOwn, ActionGateRequestChanges, ActionGateReject, ActionGateOpen}, ActionGateApproveRepo},
+		{"repo", []string{ActionGateApproveRepo, ActionGateApproveOwn, ActionGateRequestChanges, ActionGateReject, ActionGateOpen}, ActionGateApproveRepo},
+		{"own", []string{ActionGateApproveOwn, ActionGateApproveRepo, ActionGateRequestChanges, ActionGateReject, ActionGateOpen}, ActionGateApproveOwn},
+	} {
+		t.Run("requested="+tc.requested, func(t *testing.T) {
+			blocks := gateBlocks(uuid.New(), "https://uzi.example", names, ".claude/agents", tc.requested)
+			ids, _ := gateSummary(blocks)
+			if strings.Join(ids, ",") != strings.Join(tc.want, ",") {
+				t.Fatalf("buttons = %v, want %v", ids, tc.want)
+			}
+			for _, id := range []string{ActionGateApproveRepo, ActionGateApproveOwn} {
+				btn := firstButton(blocks, id)
+				if btn == nil || btn.Confirm == nil {
+					t.Fatalf("%s missing or without confirm", id)
+				}
+				wantStyle := slack.Style("")
+				if id == tc.primary {
+					wantStyle = slack.StylePrimary
+				}
+				if btn.Style != wantStyle {
+					t.Fatalf("%s style = %q, want %q", id, btn.Style, wantStyle)
+				}
+			}
+			if got := firstButton(blocks, ActionGateApproveOwn).Text.Text; got != "Approve · my templates" {
+				t.Fatalf("own label = %q", got)
+			}
+			if got := firstButton(blocks, ActionGateApproveRepo).Text.Text; got != "Approve · repo agents (2)" {
+				t.Fatalf("repo label = %q", got)
+			}
+		})
+	}
+}
+
+func TestGateBlocksRequestedSourceWithoutRosterKeepsSingleApprove(t *testing.T) {
+	want, err := os.ReadFile("testdata/gate_unset_no_roster.golden.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, requested := range []string{"own", "repo"} {
+		for _, names := range [][]string{nil, {}} {
+			got, err := json.MarshalIndent(gateBlocks(gateGoldenID(), "https://uzi.example", names, "", requested), "", "  ")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(append(got, '\n'), want) {
+				t.Fatalf("requested=%q names=%v: no-roster gate changed:\n%s", requested, names, got)
+			}
+		}
+	}
+}
+
+func TestGateActionIDsArePinned(t *testing.T) {
+	for id, want := range map[string]string{
+		ActionGateApprove:        "slack_gate_approve",
+		ActionGateApproveRepo:    "slack_gate_approve_repo",
+		ActionGateApproveOwn:     "slack_gate_approve_own",
+		ActionGateReject:         "slack_gate_reject",
+		ActionGateRejectNoReason: "slack_gate_reject_noreason",
+		ActionGateRequestChanges: "slack_gate_request_changes",
+		ActionGateOpen:           "slack_gate_open",
+	} {
+		if id != want {
+			t.Errorf("action id = %q, want %q", id, want)
+		}
+	}
+	for _, requested := range []string{"", "own", "repo"} {
+		for _, names := range [][]string{nil, {"coder"}} {
+			ids, _ := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", names, "", requested))
+			for _, id := range ids {
+				if id != ActionGateOpen && !isGateAction(id) {
+					t.Fatalf("requested=%q: unknown gate action id %q", requested, id)
+				}
+			}
 		}
 	}
 }

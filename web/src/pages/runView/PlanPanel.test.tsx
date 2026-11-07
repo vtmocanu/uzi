@@ -1048,3 +1048,48 @@ describe("PlanPanel — repo capability hint and Docker allowlist (#3391)", () =
     expect(screen.queryByText(MEMBER)).toBeNull();
   });
 });
+
+describe("PlanPanel — requested agent source pre-selection (#3914 M2)", () => {
+  const roster = [
+    { name: "site-plan-check", description: "Checks plans." },
+    { name: "coder", description: "Writes code." },
+  ];
+  const own = [{ name: "reviewer", description: "Reviews." }];
+
+  it.each([
+    { requested: null, repo_agents: null, want: "own" },
+    { requested: null, repo_agents: [], want: "own" },
+    { requested: null, repo_agents: roster, want: "repo" },
+    { requested: "own", repo_agents: roster, want: "own" },
+    { requested: "own", repo_agents: null, want: "own" },
+    { requested: "repo", repo_agents: roster, want: "repo" },
+    { requested: "repo", repo_agents: null, want: "own" },
+    { requested: "repo", repo_agents: [], want: "own" },
+  ] as const)(
+    "requested $requested with roster $repo_agents pre-selects $want",
+    async ({ requested, repo_agents, want }) => {
+      mockApi.listSecrets.mockResolvedValue({ secrets: [] });
+      const { onApprove } = renderPanel({
+        agent_source_requested: requested,
+        agent_source_requested_basis: requested === null ? null : "repo_default",
+        repo_agents: repo_agents === null ? null : [...repo_agents],
+        own_agents: own,
+      });
+      const radio = (name: RegExp) => screen.getByRole("radio", { name }) as HTMLInputElement;
+      expect(radio(/repo agents/i).checked).toBe(want === "repo");
+      expect(radio(/my agent templates/i).checked).toBe(want === "own");
+      fireEvent.click(screen.getByRole("button", { name: /Approve plan/ }));
+      await waitFor(() => expect(onApprove).toHaveBeenCalledTimes(1));
+      expect(onApprove).toHaveBeenCalledWith({ source: want, exclusions: [] });
+    },
+  );
+
+  it("marks the requested own source as the default card when the repo ships agents", () => {
+    renderPanel({ agent_source_requested: "own", agent_source_requested_basis: "repo_default", repo_agents: [...roster], own_agents: own });
+    const ownCard = screen.getByRole("radio", { name: /my agent templates/i }).closest("label")!;
+    const repoCard = screen.getByRole("radio", { name: /repo agents/i }).closest("label")!;
+    expect(within(ownCard).queryByText("default")).toBeTruthy();
+    expect(within(repoCard).queryByText("default")).toBeNull();
+    expect(screen.getByRole("button", { name: "Approve plan · 1 of your templates" })).toBeTruthy();
+  });
+});
