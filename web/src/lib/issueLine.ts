@@ -6,6 +6,7 @@
 
 import { isTerminalRun, type RunSummaryItem } from "./api";
 import { openPrs, parkDisposition } from "./overview";
+import type { AdminRunsState } from "./useOverviewData";
 import { isAccountCooldownWaiting, isPlanningRun, isRevisingRun, parkLabel } from "./runBadge";
 import { runKindLabel } from "./runKind";
 import { stripUnsafeChars } from "./safeText";
@@ -143,6 +144,31 @@ function parkedCaptions(list: LineEntry[]): { sub: string; reason: string | null
   const distinct = [...new Set(list.map((e) => parkedReason(e.run)))];
   const shown = distinct.slice(0, 3).join(", ");
   return { sub, reason: distinct.length > 3 ? `${shown}, +${distinct.length - 3} more` : shown };
+}
+
+// The scope the Issue work card draws with (#4052). "all" only for an admin whose list of
+// every user's runs is readable and who chose it; otherwise the viewer's own runs.
+export type IssueWorkScope = "you" | "all";
+
+export function issueWorkScope(input: {
+  isAdmin: boolean;
+  adminRuns: Pick<AdminRunsState, "runs" | "failed">;
+  chosen: IssueWorkScope;
+}): IssueWorkScope {
+  const { isAdmin, adminRuns, chosen } = input;
+  return isAdmin && adminRuns.runs != null && !adminRuns.failed && chosen === "all" ? "all" : "you";
+}
+
+// Other users' active runs on the line: none under "you"; under "all" the Runs widget's
+// "Other users" population (not the viewer's, not terminal).
+export function issueLineOtherRuns(input: {
+  scope: IssueWorkScope;
+  adminRuns: Pick<AdminRunsState, "runs">;
+  viewerEmail: string;
+}): RunSummaryItem[] {
+  const { scope, adminRuns, viewerEmail } = input;
+  if (scope !== "all") return [];
+  return (adminRuns.runs ?? []).filter((r) => r.owner_email !== viewerEmail && !isTerminalRun(r.status));
 }
 
 // `ownRuns` is the viewer's full own list (terminal rows included, for the PR station).
