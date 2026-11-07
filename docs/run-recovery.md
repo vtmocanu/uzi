@@ -609,6 +609,21 @@ execution remain required, including an exact `ready-for-model` handoff. See
 [Retained recovery adoption failed](./run-recovery-wait.md#retained-recovery-adoption-failed)
 and the [ADR-1197 #3527 amendment](../adr/1197-transient-recovery-park.md#amendment-2026-10-27-3527-owner-held-retained-adoption-retry).
 
+An owner **Pause now** delivered while a retained re-claim is recovering
+(`recoverRetainedClaim`, before any model turn) is only recorded, like a pause
+pending at claim time; it no longer stops recovery. A successful park spends
+no requeue; a refused park (`pause_failed`) still leaves the run for the normal
+requeue path. When
+recovery returns and no stronger control (cancel, credential switch, wall,
+fence, worker shutdown) is pending, the run parks through the ordinary
+checkpoint-first owner pause, before any planning turn or provider call. If
+recovery fails or holds first, that outcome wins and a `recovery_wait` hold
+leaves the request pending. A publication-only retained claim keeps its
+immediate stop. When recovery is stopped, the worker's HOME-preservation log
+says "retained recovery stopped" (naming a pending owner pause) instead of
+"run interrupted by worker shutdown". See the
+[ADR-1190 #3995 amendment](../adr/1190-run-pause-invariants.md#amendment-2026-11-06--3995-owner-pause-during-retained-recovery).
+
 Other permanent blockers, or exhaustion without both durable journal confirmation
 and API support, end the run **failed** with custody kept,
 without automatic reclaim or failed-run Resume. The reason names the
