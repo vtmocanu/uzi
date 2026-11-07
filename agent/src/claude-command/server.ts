@@ -16,6 +16,9 @@ import { INLINE_CAP_CHARS } from "./bounded-output.js";
 /** Transport headroom over the longest command: not a command deadline. */
 export const GUARDED_SERVER_TIMEOUT_MS = MAX_COMMAND_TIMEOUT_MS + 60_000;
 
+/** A `timeout` string the server converts to a number: ASCII digits, optional surrounding whitespace. */
+const DECIMAL_DIGITS = /^\s*[0-9]+\s*$/;
+
 export const GUARDED_COMMAND_DESCRIPTION = [
   "Run a shell command in the foreground and return its exit code and output.",
   "Foreground only: run_in_background is refused and there is no long-running mode or extension.",
@@ -45,7 +48,12 @@ export function buildGuardedCommandServer(lane: ClaudeCommandLane): McpSdkServer
           const bytes = Buffer.byteLength(value);
           return bytes >= 1 && bytes <= MAX_COMMAND_BYTES;
         }, { message: `command must be 1 to ${String(MAX_COMMAND_BYTES)} bytes` }),
-        timeout: z.number().int().min(1).max(MAX_COMMAND_TIMEOUT_MS).optional(),
+        // Models sometimes send `"300000"`; accept a plain decimal string, and refuse every
+        // other value with the unchanged number check. The advertised schema stays an integer.
+        timeout: z.preprocess(
+          (value) => (typeof value === "string" && DECIMAL_DIGITS.test(value) ? Number(value.trim()) : value),
+          z.number().int().min(1).max(MAX_COMMAND_TIMEOUT_MS),
+        ).optional(),
         description: z.string().max(1000).optional(),
         run_in_background: z.boolean().optional(),
       }, (args, extra) => lane.handle(args, extra)),
