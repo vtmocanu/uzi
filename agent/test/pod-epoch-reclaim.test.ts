@@ -69,10 +69,10 @@ function clock(options: Options, initial = 0) {
 function source(path: string, runId: string, protectedSource = false): RetainedSourceEvidence {
   return {
     barePath: "/bare", runId, branch: "branch", key: "key", kind: "attempt", generation: 1,
-    attempt: "attempt", ledgerState: "abandoned", journalState: "none", markerState: "none",
+    attempt: "attempt", ledgerState: "live", journalState: "none", markerState: "none",
     presence: "present", descriptor: "fresh", allocatedBytes: 4096, bytesState: "measured",
     sources: [{ clonePath: path, attempt: "attempt", generation: 1, presence: "present",
-      ledgerState: "abandoned", live: false, allocatedBytes: 4096 }],
+      ledgerState: "live", live: false, allocatedBytes: 4096 }],
     consumers: [], localRecords: [], holds: { state: "read", ids: [] },
     disposition: { kind: protectedSource ? "local_protected_discard" : "local_discard" },
   };
@@ -1356,6 +1356,7 @@ test("a settled residue failure keeps the source as kept_residue; a settled inco
   });
 });
 test("structural keeps never reach the authority path and do not downgrade the verdict", async () => {
+  const reads = { ownership: 0, holds: 0 };
   await withDeletion(4, w => {
     w.groups[3]!.paths = ["/tree/3", "/tree/3b"];
     w.mutateSource = (s, i) => {
@@ -1363,7 +1364,13 @@ test("structural keeps never reach the authority path and do not downgrade the v
       if (i === 1) s.kind = "canonical";
     };
     w.journal = (_branch, path, runId) => _branch === "b2" ? [] : [JSON.stringify({ attemptId: "attempt", clonePath: path, runId })];
+    // Count the api reads; the shadow phase makes exactly one of each per group (4 groups).
+    const ownership = w.options.client.getRunOwnership, holds = w.options.client.listRecoveryHolds;
+    w.options.client.getRunOwnership = async (...args: Parameters<typeof ownership>) => { reads.ownership++; return ownership(...args); };
+    w.options.client.listRecoveryHolds = async (...args: Parameters<typeof holds>) => { reads.holds++; return holds(...args); };
   }, (w, result) => {
+    assert.equal(reads.ownership, 4, "no deletion-phase ownership read for a structural keep");
+    assert.equal(reads.holds, 4, "no deletion-phase holds read for a structural keep");
     assert.equal(result.would_delete, 5, "the shadow counts every candidate path");
     assert.equal(result.kept_protected, 1);
     assert.equal(result.kept_unrecoverable_shape, 4, "canonical, a no-key attempt and both parts of a two-part source");
@@ -1374,21 +1381,62 @@ test("structural keeps never reach the authority path and do not downgrade the v
 });
 test("journal shapes other than the exact strict string or [\"\"] are refused before any proof", async () => {
   const raw = (path: string, runId: string, extra: object = {}) => JSON.stringify({ attemptId: "attempt", clonePath: path, runId, ...extra });
-  const shapes: Array<[string, (b: string, p: string, r: string) => Array<string | null>, boolean]> = [
+  type Tune = (s: RetainedSourceEvidence) => void;
+  const ledger = (state: string, missing = false): Tune => s => {
+    s.ledgerState = state as never; s.sources[0]!.ledgerState = state as never;
+    if (missing) { s.presence = "missing"; s.sources[0]!.presence = "missing"; s.sources[0]!.allocatedBytes = null; }
+  };
+  const strict = (_b: string, p: string, r: string) => [raw(p, r)];
+  const empty = () => [""];
+  const shapes: Array<[string, (b: string, p: string, r: string) => Array<string | null>, boolean, Tune?]> = [
     ["no key", () => [], false], ["valueless", () => [null], false], ["duplicate", (_b, p, r) => [raw(p, r), raw(p, r)], false],
     ["extra field", (_b, p, r) => [raw(p, r, { restoreTip: "x" })], false], ["wrong run", (_b, p) => [raw(p, "other")], false],
     ["wrong path", (_b, _p, r) => [raw("/elsewhere", r)], false], ["non-canonical json", (_b, p, r) => [raw(p, r) + " "], false],
     ["not json", () => ["{"], false], ["array", () => ["[]"], false],
-    ["strict string", (_b, p, r) => [raw(p, r)], true], ["explicit empty", () => [""], true],
+    // (a) live + strict, present or missing
+    ["strict string, ledger live", strict, true], ["strict string, live, missing", strict, true, ledger("live", true)],
+    // (c) retired + strict + missing footprint; (b) retired + [""] + missing footprint
+    ["strict, retired, missing", strict, true, ledger("retired", true)],
+    ["explicit empty, retired, missing", empty, true, ledger("retired", true)],
+    // every other ledger/footprint combination is an unrecoverable shape
+    ["strict, retired, present", strict, false, ledger("retired")],
+    ["explicit empty, retired, present", empty, false, ledger("retired")],
+    ["explicit empty, ledger live", empty, false], ["explicit empty, live, missing", empty, false, ledger("live", true)],
+    ["explicit empty, reclaimed", empty, false, ledger("reclaimed")], ["explicit empty, reclaimed, missing", empty, false, ledger("reclaimed", true)],
+    ["explicit empty, abandoned", empty, false, ledger("abandoned")],
+    ["strict, reclaimed", strict, false, ledger("reclaimed")], ["strict, abandoned", strict, false, ledger("abandoned")],
+    ["strict, ledger none", strict, false, ledger("none")],
   ];
-  for (const [label, journal, proceeds] of shapes) {
-    await withDeletion(1, w => { w.journal = journal; }, (w, result) => {
+  for (const [label, journal, proceeds, tune] of shapes) {
+    await withDeletion(1, w => { w.journal = journal; if (tune) w.mutateSource = s => tune(s); }, (w, result) => {
+      if (!proceeds) assert.equal(w.spies.reserved.length, 0, label + ": no reservation for a structural keep");
       assert.equal(w.spies.proofs.length, proceeds ? 1 : 0, label);
       assert.equal(result.kept_unrecoverable_shape, proceeds ? 0 : 1, label);
       assert.equal(result.deleted, proceeds ? 1 : 0, label);
       assert.equal(result.verdict, "eligible", label); assert.equal(result.reason, "reclaim_complete", label);
     });
   }
+});
+test("a no-key attempt on a first roll (no run_open_holds) is a structural keep before any authority read and never downgrades", async () => {
+  const reads = { ownership: 0, holds: 0 };
+  await withDeletion(1, w => {
+    w.journal = () => [];
+    // The api reads the predecessor's capabilities on the first roll, so there is no run_open_holds count.
+    w.holds = run_id => ({ run_id, holds: [] });
+    const ownership = w.options.client.getRunOwnership, holds = w.options.client.listRecoveryHolds;
+    w.options.client.getRunOwnership = async (...args: Parameters<typeof ownership>) => { reads.ownership++; return ownership(...args); };
+    w.options.client.listRecoveryHolds = async (...args: Parameters<typeof holds>) => { reads.holds++; return holds(...args); };
+  }, (w, result) => {
+    assert.equal(result.kept_unrecoverable_shape, 1); assert.equal(result.kept_after_refusal, 0);
+    assert.equal(reads.ownership, 1, "only the shadow read"); assert.equal(reads.holds, 1, "only the shadow read");
+    assert.equal(w.spies.proofs.length, 0); assert.equal(w.spies.reserved.length, 0); assert.equal(w.spies.discards.length, 0);
+    assert.equal(result.verdict, "eligible"); assert.equal(result.reason, "reclaim_complete");
+  });
+  // A strict attempt on the same first roll is still an authority refusal (not a shape keep) and downgrades.
+  await withDeletion(1, w => { w.holds = run_id => ({ run_id, holds: [] }); }, (w, result) => {
+    assert.equal(result.kept_unrecoverable_shape, 0); assert.equal(result.kept_after_refusal, 1);
+    assert.equal(result.verdict, "partial"); assert.equal(w.spies.proofs.length, 0);
+  });
 });
 test("fatal outcomes throw PodEpochSettlementError, keep EX and never reach the shared handover", async () => {
   const sources = (path: string) => [{ clonePath: path, outcome: "unknown" as const }];

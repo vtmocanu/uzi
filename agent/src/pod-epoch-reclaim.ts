@@ -72,7 +72,7 @@ interface Candidate { run_id: string; path: string; bytes: number; presence: "pr
 interface Admit {
   clonePath: string; barePath: string; selector: RetainedSourceSelector; branch: string;
   kind: "attempt" | "canonical" | "protected"; descriptor: string;
-  protectedDiscard: boolean; parts: number; groupSize: number;
+  protectedDiscard: boolean; parts: number; groupSize: number; ledgerState: string;
 }
 // Exact crio-crun kernel releases covered by the PRD #3430 audit. Any other release defers
 // with kernel_unaudited; refreshing this list needs a reviewed PRD #3430 audit addendum.
@@ -476,7 +476,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
             admits.set(part.clonePath, { clonePath: part.clonePath, barePath: group.barePath, selector: group.selector,
               branch: source.branch, kind: source.kind, descriptor: source.descriptor,
               protectedDiscard: source.disposition?.kind === "local_protected_discard",
-              parts: source.sources.length, groupSize: group.paths.length });
+              parts: source.sources.length, groupSize: group.paths.length, ledgerState: source.ledgerState });
           }
         }
       }
@@ -531,7 +531,28 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
         if (admit.protectedDiscard) { result.kept_protected++; continue; }
         if (admit.kind !== "attempt" || admit.parts !== 1 || admit.groupSize !== 1) { result.kept_unrecoverable_shape++; continue; }
         const runId = admit.selector.runId;
-        let step: { result: RetainedDiscardResult } | "keep" | "shape" | undefined;
+        // Journal shape and ledger state are structural keeps too: classified BEFORE any authority read or
+        // proof, counted without an authority read, and never downgrading the verdict. Admitted shapes only:
+        // (a) ledger live + strict journal, (c) ledger retired + strict journal + missing footprint,
+        // (b) ledger retired + `[""]` journal + missing footprint. Anything else (reclaimed, abandoned,
+        // a no-key journal) is an unrecoverable shape.
+        let raw: string | readonly string[] | undefined;
+        try {
+          raw = journalShape(await owned(() => deps.git.readEpochJournalVector(admit.barePath, admit.branch),
+            hardPass, true), admit.selector, clonePath);
+        } catch (error) {
+          if (error instanceof PodEpochSettlementError) throw error;
+          if (error instanceof PodEpochDaemonError || invalid) throw error;
+          refusal(); if (controller.signal.aborted) { skipped = true; break; } continue;
+        }
+        const missing = candidate.presence === "missing";
+        const emptyRepair = Array.isArray(raw) && raw.length === 1 && raw[0] === "";
+        const shapeAdmitted = raw !== undefined && (emptyRepair
+          ? admit.ledgerState === "retired" && missing
+          : admit.ledgerState === "live" || admit.ledgerState === "retired" && missing);
+        if (!shapeAdmitted || raw === undefined) { result.kept_unrecoverable_shape++; continue; }
+        const admittedJournal: string | readonly string[] = raw;
+        let step: { result: RetainedDiscardResult } | "keep" | undefined;
         let effects = false, notEnded = false;
         try {
           // 2. fresh lifecycle and holds with the deletion-side zero rule.
@@ -554,12 +575,12 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
               only.localRecords.length !== 0 || only.holds.state !== "read" || only.holds.ids.length !== 0 || !plain) {
             assertSettled(); refusal(); continue;
           }
-          // 4. the raw journal must be the exact strict three-key string or the explicit `[""]` repair; a no-key
-          //    attempt is an unrecoverable shape, refused before any proof exists.
-          const raw = journalShape(await owned(() => deps.git.readEpochJournalVector(admit.barePath, admit.branch),
+          // 4. the raw journal must still be exactly what the structural pre-check admitted; a change is a
+          //    refusal (not a shape keep).
+          const again = journalShape(await owned(() => deps.git.readEpochJournalVector(admit.barePath, admit.branch),
             hardPass, true), admit.selector, clonePath);
-          if (raw === undefined) { step = "shape"; }
-          else {
+          if (JSON.stringify(again) !== JSON.stringify(admittedJournal)) { assertSettled(); refusal(); continue; }
+          {
             // 5. one authority transaction A, the run's source reservation S inside it, B only inside the discard.
             step = await owned(() => deps.authority.withTransaction(tx => deps.reserve(runId, async eligible => {
               if (!eligible() || controller.signal.aborted) return "keep" as const;
@@ -573,7 +594,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
               };
               const proof = deps.git.createEpochDiscardProof({
                 decision: { eligible: true, attested: true }, scope: scope!, selector: admit.selector, barePath: admit.barePath,
-                paths: [clonePath], confirm: only.descriptor, expectedRawJournal: raw, checkLive: live,
+                paths: [clonePath], confirm: only.descriptor, expectedRawJournal: admittedJournal, checkLive: live,
                 beforeEffect: async () => { check(); entry(); }, signal: controller.signal, deadline: deadlineAt(),
               });
               effects = true;
@@ -602,7 +623,6 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
         }
         // 6. classify only AFTER the reservation and the transaction are released.
         assertSettled();
-        if (step === "shape") { result.kept_unrecoverable_shape++; continue; }
         if (step === undefined || step === "keep") { refusal(); if (controller.signal.aborted) { skipped = true; break; } continue; }
         const outcome = step.result;
         if (outcome.kind === "done") {
