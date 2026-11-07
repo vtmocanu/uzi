@@ -18,14 +18,16 @@
 #   LIMITS_JSON    validation rows only: one-line JSON object of positive integers merged over the
 #                  helper's default planning limits, e.g. '{"baseDiscoveryEntryCap":1000}'
 #                  (label __validation; unset = production defaults; not combinable with SMOKE_INJECT)
-#   LIMITS_TAG     optional, with LIMITS_JSON only: [a-z0-9-]{1,40}, label becomes __validation-<tag>
-#                  so two LIMITS_JSON invocations into one OUT do not overwrite each other
+#   LIMITS_TAG     optional, with LIMITS_JSON or DEADLINE_SCALE: [a-z0-9-]{1,40}, label becomes
+#                  __validation-<tag>, so two validation invocations into one OUT do not overwrite each other
 #   DEADLINE_SCALE validation rows only: integer 2..8. Slows ONLY the helper's clock by that factor
 #                  (its 28 s deadline lasts 28 s x N of real time) and stretches the outer 30 s capture
 #                  timeout, the harness 60 s scope timer and this script's per-job wait by N. Every
-#                  cap and bound stays at its production value. Label __validation-dl<N> (with
-#                  LIMITS_TAG: __validation-<tag>-dl<N>); usable with or without LIMITS_JSON; not
-#                  combinable with SMOKE_INJECT; every MEM_CONFIGS entry must use mode full only. Measures memory and charges at the caps, not timing.
+#                  cap and memory bound stays at its production value; per-command git timers are
+#                  clamped to the slowed deadline (README, "Deadline scale"). Label __validation-dl<N>
+#                  (with LIMITS_TAG: __validation-<tag>-dl<N>); usable with or without LIMITS_JSON;
+#                  not combinable with SMOKE_INJECT; every MEM_CONFIGS entry must use mode full only.
+#                  Measures memory and charges at the caps, not timing.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
