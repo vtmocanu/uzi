@@ -1149,7 +1149,8 @@ func (h *Handler) codexCatalogDefaultCell(ctx context.Context, userID uuid.UUID,
 	default:
 		return catalogDefaultDTO(workersvc.CatalogDefault{State: workersvc.CatalogStateUnknown})
 	}
-	model := workersvc.CodexWorkerDefaultModel(laneModel, leadCodexPin)
+	model, _ := agenttmpl.ResolveWorkerDefaultModel("codex",
+		textPtrValue(laneModel.Valid, laneModel.String), nil, textPtrValue(leadCodexPin.Valid, leadCodexPin.String))
 	got, err := reader.CodexCatalogDefault(ctx, userID, model)
 	if err != nil {
 		slog.Error("read codex catalog default", "error", err)
