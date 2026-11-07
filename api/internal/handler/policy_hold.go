@@ -10,8 +10,9 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
-// WorkerRunPolicyHold is intentionally absent from protocolFeatures until the
-// complete M2 continuation contract is implemented.
+// WorkerRunPolicyHold accepts the compact provider policy hold report. The api advertises
+// provider_policy_hold_v1 (worker_protocol.go); the service still requires the worker's own
+// registered capability and its current, unreleased claim.
 func (h *Handler) WorkerRunPolicyHold(w http.ResponseWriter, r *http.Request) {
 	worker, ok := mw.WorkerFromContext(r.Context())
 	if !ok {

@@ -306,8 +306,9 @@ changing the run.
 
 Rollback is drain-only. Stop owner policy traffic, drain or cordon workers, and
 wait until no `codex_policy_hold_pending` outcome, no live consumed-unconfirmed
-Fresh grant and no claimed or running row carrying a required saved-work head
-remains. Otherwise stay on the new version and keep undrained worker volumes.
+Fresh grant, no claimed or running row carrying a required saved-work head,
+and no claimed, running or waiting run still preserving after an owner Resume
+(preserve or fresh_one_claim) remains. Otherwise stay on the new version and keep undrained worker volumes.
 Then stop all API replicas and run goose down exactly one version at a time
 from 00415:
 
@@ -323,8 +324,10 @@ Down or roll forward by restarting the new image.
 
 The Downs are destructive. 00413's Down permanently drops the recorded hold
 cause and recovery identity columns for all rows, so take a backup or `COPY`
-first. They refuse runs parked in wait states (`recovery_wait`, `limit_wait`,
-`pool_wait`, `awaiting_*`): drain or cancel those first. Each Down is one
+first. They refuse a run in any other live state (claimed, running, `recovery_wait`,
+`limit_wait`, `pool_wait`, `awaiting_*`) that still carries an active policy
+requirement; drain or cancel those first. Runs in those states without policy
+state do not block. Each Down is one
 transaction, so a `RAISE` rolls it back fully, and holds `ACCESS EXCLUSIVE` on
 `runs` while it runs. Design rationale:
 [ADR-3607](../adr/3607-compact-policy-hold-m1-isolation.md#consent-and-continuity-m2m3).

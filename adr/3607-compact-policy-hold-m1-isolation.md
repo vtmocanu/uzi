@@ -2,7 +2,9 @@
 
 **Status:** Accepted narrow M1 repair contract; partial checkpoint through
 d7b03dae276ebc2c54681a47a5205c2903654140. Initial R1/R2 reviewed; R3 INCOMPLETE.
-Final merged validation, integration review and exact-head CI are pending.
+Superseded in part (2026-11-07): M2/M3 deliver owner Resume (see Consent and
+continuity below); Policy Stop remains omitted. Final merged validation,
+integration review and exact-head CI are pending.
 **Date:** 2026-10-31
 **Issue:** [#3607](https://github.com/vtmocanu/uzi/issues/3607)
 **PRD:** [Compact policy-refusal hold](../prds/3607-compact-policy-refusal-hold.md#decision-log)
@@ -29,6 +31,9 @@ validation. The owner consented to this acceptance on 2026-10-31, conditional on
 buddy agreement, which was given. It is independent of the single unreleased
 policy contract
 `provider_policy_hold_v1`, which remains unadvertised by the API.
+
+*Note (2026-11-07): since #3607 M2/M3 the API advertises
+`provider_policy_hold_v1`; the sentence above records the M1 decision.*
 
 A worker-only relaxation cannot supply the server's scoped overflow exception;
 reusing policy readiness would couple generic pending-source protection to a
@@ -316,8 +321,8 @@ or custody disposal.
 [ADR-2009](2009-pending-outcome-identities.md) receive scoped amendments for this
 claim-only exception. Their earlier decisions remain historical records.
 
-M2/M3/I1 remain deferred under the formal owner partial decision. Policy Resume
-and Stop are unavailable. F5's eventual flag clearing belongs to M2: clear solely
+M2/M3/I1 were deferred under the formal owner partial decision at M1; M2/M3 have
+since delivered Policy Resume (2026-11-07), and Policy Stop remains omitted. F5's eventual flag clearing belongs to M2: clear solely
 successful policy-admission retention while preserving independent vetoes, including
 `retainedEpisode` and `predecessorCapture`. Optional m3 historic-head hardening stays
 deferred: current report-path 40/64-hex validation and React escaping do not validate
@@ -341,7 +346,7 @@ then use task migration:renumber above the fetched live head and fix reported
 references. Changed runtime, API, SQL and package inputs require renewed validation;
 no history rewrite, manual dependency installation or object reconstruction is allowed.
 
-The [PRD validation record](../prds/3607-compact-policy-refusal-hold.md#deferred-scope-and-final-validation)
+The [PRD validation record](../prds/3607-compact-policy-refusal-hold.md#delivery-status-recovery-continuation-2026-11-07)
 records the successful current-branch strict agent, Codex M4 and complete seven-package
 LiveDB gates at 5b8a14f8, including the shared claim-route fixture. The API component
 inputs remain unchanged from its recorded successful gate. The expanded 125-file
@@ -415,7 +420,7 @@ compares that episode with the current hold; an exact replay returns 200 with
 `replay: true`, different guidance for the same episode is a 409 and is not
 recorded, and consent for an older episode cannot resolve a newer one. `set-token`
 cannot consent. Rejected: `ClaimRun` grant arithmetic and generation-wide grants
-(the latter deferred to a named follow-up). Binding every action to
+(the latter deferred to a follow-up). Binding every action to
 `expected_episode_id` is what stops a replay from authorizing a later refusal;
 later ordinary pickups are the chosen baseline behaviour, not reuse of old
 consent. Only the optional compatible-lane one-claim Fresh uses a pending intent,
@@ -441,13 +446,17 @@ already exist. A released worker image that advertises
 re-hold as `session_missing` without starting a conversation, so the API rolls
 first and capable workers follow.
 
-### Guarded Downs (migrations 00413 to 00415, "Shape A")
+### Guarded Downs (migrations 00414 and 00413, "Shape A")
 
 00413 adds the recorded hold cause and the required-head and recovery-verification
 columns, 00414 the one-claim Fresh generation columns and a `NOT VALID` shape check, and 00415 validates it. The
 Downs are guarded and run one version at a time from 00415: 00414 and 00413 refuse
 live or orphan rows and convert paused or queued active rows to failed, and refuse
-rows parked in wait states. Each is one transaction, so a `RAISE` rolls back fully;
+any other live row (claimed, running, `recovery_wait`, `limit_wait`, `pool_wait`,
+`awaiting_*`) that still carries an active policy requirement; live rows without
+policy state do not block. 00413 also refuses any live row where
+`policy_preserve_required AND policy_resolved_at IS NOT NULL`, even with no head
+(the normal state after a `preserve` or `fresh_one_claim` resume). Each is one transaction, so a `RAISE` rolls back fully;
 each holds `ACCESS EXCLUSIVE` on `runs`. 00413's Down is destructive for the hold
 cause and recovery identity columns of every row. Rollback is drain-only; the
 operator procedure is in
