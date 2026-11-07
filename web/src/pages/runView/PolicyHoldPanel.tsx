@@ -78,7 +78,11 @@ export function PolicyHoldPanel({ run, canSteer, refreshRun }: {
     if (notice && activeKey === "") noticeRef.current?.focus();
   }, [notice, activeKey, held]);
 
-  if (!held && !notice) return null;
+  // After a fresh_one_claim resume the hold is resolved but the one-pickup fresh start is
+  // still pending; say so quietly until the server clears it.
+  const freshPending = !held && hold?.pending_fresh === true
+    && run.status !== "completed" && run.status !== "failed" && run.status !== "cancelled";
+  if (!held && !notice && !freshPending) return null;
 
   const draftsNow = drafts.episode === episode ? drafts.byMode : {};
   const guidance = active ? (draftsNow[active.mode] ?? "") : "";
@@ -148,7 +152,14 @@ export function PolicyHoldPanel({ run, canSteer, refreshRun }: {
     </div>
   );
 
-  if (!held) return <Card className="p-4">{noticeBlock}</Card>;
+  if (!held) {
+    return <Card className="p-4">
+      {freshPending && (
+        <p className="text-xs text-muted">One-pickup fresh start pending: the next pickup may start one new conversation from the saved work.</p>
+      )}
+      {noticeBlock}
+    </Card>;
+  }
 
   const head = hold?.captured_head;
   const preservation = head

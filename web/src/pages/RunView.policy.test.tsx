@@ -334,3 +334,13 @@ it("states a pending one-pickup fresh start and recovery verification", () => {
   expect(screen.getByText(/next pickup may start one new conversation/)).toBeTruthy();
   expect(screen.getByText(/required recovery checkpoint is recorded; the current pickup has not verified it/)).toBeTruthy();
 });
+
+it.each([
+  [true, 1],
+  [false, 0],
+])("resolved hold: pending_fresh=%s shows the fresh-start notice %s time(s), without actions", (pending_fresh, count) => {
+  render(view(held({ status: "queued", hold_reason: null, policy_hold: { ...hold, pending_fresh } })));
+  expect(screen.queryAllByText(/One-pickup fresh start pending: the next pickup may start one new conversation from the saved work\./)).toHaveLength(count);
+  expect(screen.queryByRole("heading", { name: "Codex policy hold" })).toBeNull();
+  expect(screen.queryByRole("group", { name: "Continue this run" })).toBeNull();
+});

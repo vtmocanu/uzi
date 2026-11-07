@@ -257,6 +257,20 @@ describe("#3153 runner-shared replacement: preserve-only claim over the producti
     if (track) await fixtureFetchTracking(workerA, bare, seed.path, branch, runId);
     return { r, clone: seed.path };
   }
+  /** Records every custody-release or source-deletion request this client sends: the typed release call and
+   *  any POST whose path names archives, recovery, discard or dispose. */
+  function watchRetention(): string[] {
+    const sent: string[] = [];
+    const c = client as unknown as Record<string, unknown>;
+    const release = client.releaseRecoveryCustody.bind(client);
+    client.releaseRecoveryCustody = async (...args) => { sent.push("releaseRecoveryCustody"); return release(...args); };
+    const post = (c.postJSON as (...a: unknown[]) => Promise<unknown>).bind(client);
+    c.postJSON = async (...a: unknown[]) => {
+      if (typeof a[0] === "string" && /\/(archives|recovery|discard|dispose)/.test(a[0])) sent.push(a[0]);
+      return post(...a);
+    };
+    return sent;
+  }
   const claimFor = (iid: number, runId: string, head: string): ClaimResponse =>
     gitlabClaim(iid, { run_id: runId, claim_generation: 3, session_id: "saved-session", plan_approved: true,
       plan_md: "approved", policy_preserve_only: true, policy_expected_head: head, secrets: CODEX }) as ClaimResponse;
@@ -264,8 +278,13 @@ describe("#3153 runner-shared replacement: preserve-only claim over the producti
   it("bytes present on the shared volume: the replacement recovers R, verifies it and continues", async () => {
     const iid = 6101;
     const runId = randomUUID();
-    const { r } = await heldRun(iid, runId, true);
+    const { r, clone } = await heldRun(iid, runId, true);
+    const retention = watchRetention();
     await replacement().execute(claimFor(iid, runId, r));
+    assert.deepEqual(retention, [], "no custody release or source deletion reached the API");
+    assert.ok(fs.existsSync(clone), "the held clone directory still exists at the same path");
+    assert.doesNotThrow(() => gitIn(clone, ["cat-file", "-e", `${r}^{commit}`]), "R is still a commit object in the held clone");
+    assert.doesNotThrow(() => gitIn(clone, ["merge-base", "--is-ancestor", r, "HEAD"]), "the held clone's HEAD still contains R");
     assert.deepEqual(verifies, [{ claim_generation: 3, required_head: r }]);
     assert.equal(holds.length, 0);
     assert.equal(contexts.length, 1, "continues to the harness");
@@ -280,7 +299,9 @@ describe("#3153 runner-shared replacement: preserve-only claim over the producti
     const bare = await workerA.ensureClone(fx.originPath);
     assert.throws(() => gitIn(bare, ["cat-file", "-e", `${r}^{commit}`]), "R is in no object store of the volume");
     const refsBefore = gitIn(bare, ["for-each-ref", "--format=%(refname) %(objectname)"]);
+    const retention = watchRetention();
     await replacement().execute(claimFor(iid, runId, r));
+    assert.deepEqual(retention, [], "no custody release or source deletion reached the API");
     // Source identity and custody are retained: the shared cache's refs are untouched, and the re-hold
     // reports no terminal state (which would release custody) and no fabricated work.
     assert.equal(gitIn(bare, ["for-each-ref", "--format=%(refname) %(objectname)"]), refsBefore, "the bare cache's refs are unchanged");

@@ -17388,7 +17388,12 @@ export class RunRunner {
         // reviewed path). Wait for that first read here, immediately before the executor owns the
         // run, so the live set is complete before any implement turn composes its prompt. The wait
         // shares the gate path's recovery handling (transient read failure parks, definitive fails).
-        if (m4ResumeReviewedPlan && priorOwnerHistory.status === "complete" && priorOwnerHistory.entries.length > 0) {
+        // An owner policy continuation (preserve-only, owner Fresh, or fresh_from_saved_work) records its
+        // guidance as a follow_up input, so the first provider turn must also wait for that first read.
+        const policyContinuation = claim.policy_preserve_only === true || claim.policy_fresh_session === true ||
+          (typeof claim.policy_saved_work_head === "string" && claim.policy_saved_work_head !== "");
+        if ((m4ResumeReviewedPlan && priorOwnerHistory.status === "complete" && priorOwnerHistory.entries.length > 0) ||
+            policyContinuation) {
           await this.awaitResumedDelivery(runId, steering, batcher, runLog, cancel.signal);
         }
         // A prior quiescence/command receipt cannot settle newly admitted model work.

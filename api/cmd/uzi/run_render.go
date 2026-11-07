@@ -374,6 +374,9 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 	if row := policyPendingRow(r); row != nil {
 		rows = append(rows, row)
 	}
+	if row := policyFreshPendingRow(r); row != nil {
+		rows = append(rows, row)
+	}
 	if r.BudgetMaxIterations != nil {
 		rows = append(rows, []string{"BUDGET_ITERATIONS", itoa(*r.BudgetMaxIterations)})
 	}

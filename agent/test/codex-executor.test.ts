@@ -29698,6 +29698,9 @@ describe("compact policy hold: fake-provider continuation matrix (production run
     dockerHost?: string;
     guidance?: boolean;
     earlier?: readonly { id: number; body: string }[];
+    /** Hold the steering's FIRST GET /inputs for a short delay and do NOT wait for live routing in the
+     *  executor, so only the runner's own initial-delivery wait can put the guidance in the first turn. */
+    holdFirstInputGet?: boolean;
   }
 
   async function drive(o: Drive) {
@@ -29715,6 +29718,10 @@ describe("compact policy hold: fake-provider continuation matrix (production run
     }) as ClaimResponse;
     if (o.earlier) api.overrideFollowUps(runId, 200, { inputs: o.earlier.map(e => ({ id: e.id, kind: "follow_up", body: e.body })) });
     if (o.guidance) api.setInputs(runId, [{ id: GUIDANCE_ID, kind: "follow_up", body: GUIDANCE }]);
+    const inputHold = o.holdFirstInputGet ? api.holdNextInputGet(runId) : undefined;
+    const inputHoldReleased = inputHold
+      ? inputHold.entered.then(() => new Promise<void>(r => setTimeout(r, 2000))).then(() => inputHold.release())
+      : undefined;
 
     const events: string[] = [];
     const holds: PolicyHoldRequest[] = [];
@@ -29757,7 +29764,7 @@ describe("compact policy hold: fake-provider continuation matrix (production run
     executor.run = async ctx => {
       seen.push(ctx);
       await fs.writeFile(path.join(ctx.worktreePath, "POLICY-WORK.txt"), "retained work\n");
-      if (o.guidance) await waitFor(() => ctx.isLiveFollowUpId?.(GUIDANCE_ID) === true, "owner guidance routed live");
+      if (o.guidance && !o.holdFirstInputGet) await waitFor(() => ctx.isLiveFollowUpId?.(GUIDANCE_ID) === true, "owner guidance routed live");
       return run(ctx);
     };
     const outbox = new Outbox({ root: path.join(fx.dataDir, "policy-matrix-outbox"), log: noopLog,
@@ -29771,8 +29778,9 @@ describe("compact policy hold: fake-provider continuation matrix (production run
     });
     await withTimeout(runner.execute(claim), 30000, "matrix run");
     const requests = rig.transport.requests;
+    if (inputHoldReleased) await inputHoldReleased;
     return {
-      claim, runId, holds, verifies, states, events, seen, rig, head,
+      inputGetHeld: inputHold !== undefined, claim, runId, holds, verifies, states, events, seen, rig, head,
       routes: requests.filter(r => r.method === "thread/start" || r.method === "thread/resume").map(r => r.method),
       prompts: requests.filter(r => r.method === "turn/start").map(r => String((rec(r.params).input as { text?: string }[])[0]?.text)),
       notices: api.messages(runId).map(m => String(rec(m.payload).event)),
@@ -29827,6 +29835,18 @@ describe("compact policy hold: fake-provider continuation matrix (production run
     assert.equal(r.seen[0]?.policyFreshAllowance, undefined);
     verifiedBeforeProvider(r);
   });
+
+  for (const [name, claimFor] of [
+    ["a preserving continuation", preserving()],
+    ["an owner Fresh start", preserving({ session_id: null, policy_fresh_session: true })],
+    ["a fresh_from_saved_work claim carrying the saved-work head", (head: string) => ({ session_id: null, policy_saved_work_head: head })],
+  ] as const) {
+    it(`(i-b) ${name} awaits the first GET /inputs delivery: the first provider turn carries the guidance`, async () => {
+      const r = await drive({ claim: claimFor, guidance: true, holdFirstInputGet: true });
+      assert.ok(r.prompts.length >= 1, "a provider turn ran");
+      assert.ok(r.prompts[0]!.includes(GUIDANCE), "the first provider turn includes the owner guidance");
+    });
+  }
 
   it("(ii) a renewed refusal on the preserving continuation re-holds on the same conversation", async () => {
     const r = await drive({ claim: preserving() });
@@ -29891,6 +29911,21 @@ describe("compact policy hold: fake-provider continuation matrix (production run
     assert.equal(r.seen[0]?.preserveConversation, undefined);
     refusedHold(r);
   });
+
+  for (const lane of ["Docker-wired", "retained-recovery (not Docker-wired)"] as const) {
+    it(`(v-c) a confirmed fresh_from_saved_work on a ${lane} attempt-path lane makes one thread/start with guidance, history and framing`, async t => {
+      if (lane !== "Docker-wired") t.mock.method(m2Runner.git, "recoveryAttemptMode", async () => true);
+      const r = await drive({ claim: head => ({ session_id: null, policy_saved_work_head: head }), guidance: true, earlier: EARLIER,
+        ...(lane === "Docker-wired" ? { dockerHost: "unix:///fixture" } : {}) });
+      assert.match(r.seen[0]!.worktreePath, /\.attempt-/, "the run executed on an attempt-path clone");
+      verifiedBeforeProvider(r);
+      assert.deepEqual(r.routes, ["thread/start"]);
+      assert.equal(r.prompts.length, 1);
+      freshFirstTurn(r);
+      assert.equal(r.seen[0]?.preserveConversation, undefined);
+      refusedHold(r);
+    });
+  }
 
   it("(v-b) a saved-work head the clone does not hold re-holds saved_work_missing before any provider request", async () => {
     const r = await drive({ claim: () => ({ session_id: null, policy_saved_work_head: "ab".repeat(20) }), earlier: EARLIER });

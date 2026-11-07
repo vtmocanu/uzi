@@ -172,6 +172,25 @@ func TestResumeNowWithoutPolicyFlagsStaysBodyless(t *testing.T) {
 	}
 }
 
+func TestPolicyFreshPendingRenderedForQueuedRunOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		pending bool
+		want    bool
+	}{{"pending", true, true}, {"not pending", false, false}} {
+		run := apitypes.RunDTO{ID: "r1", Status: "queued", Kind: "issue",
+			PolicyHold: &apitypes.PolicyHoldDTO{OutcomeID: policyEpisode, PendingFresh: tc.pending}}
+		fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": run}}
+		out, e, code := runCLI(t, fakeEnv(fc), "run", "get", "r1")
+		if code != 0 {
+			t.Fatalf("%s: exit %d: %s", tc.name, code, e)
+		}
+		if got := strings.Contains(out, "One-pickup fresh start pending"); got != tc.want {
+			t.Errorf("%s: notice present=%v, want %v: %s", tc.name, got, tc.want, out)
+		}
+	}
+}
+
 func TestPolicyHoldRenderCauseModesAndPending(t *testing.T) {
 	run := heldRun("r1", "codex_policy_hold", time.Now())
 	run.PolicyHold = &apitypes.PolicyHoldDTO{

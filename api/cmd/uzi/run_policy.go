@@ -72,6 +72,15 @@ func policyHoldDetailClauses(r apitypes.RunDTO) []string {
 	return clauses
 }
 
+// policyFreshPendingRow reports a resolved hold whose one-pickup fresh start is still pending:
+// the run is no longer held, so policyHoldDetailClauses is not rendered for it.
+func policyFreshPendingRow(r apitypes.RunDTO) []string {
+	if terminalRunStatuses[r.Status] || isCodexPolicyHold(r) || r.PolicyHold == nil || !r.PolicyHold.PendingFresh {
+		return nil
+	}
+	return []string{"POLICY_FRESH", "One-pickup fresh start pending: the next pickup may start one new conversation from the saved work."}
+}
+
 // policyPendingRow is delivery telemetry, not proof that the server applied a hold.
 // A confirmed hold takes precedence over telemetry left over from its delivery.
 func policyPendingRow(r apitypes.RunDTO) []string {
