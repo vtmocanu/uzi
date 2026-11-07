@@ -26288,7 +26288,10 @@ export class RunRunner {
     }
   }
 
-  /** Two identical reports and at most two ownership probes, under one boundary deadline.
+  /** Per pass, two identical reports and at most two ownership probes; a capacity-only (marked) pass that
+   * the api answers 400 is followed by at most one unmarked pass. All passes share one boundary deadline.
+   * The capacity-only witness comparison in the caller duplicates the blockRecoveryEpisode fence and its
+   * readback on purpose (defence in depth, issue #4046).
    * Ownership only authorizes replay: only the report ACK's exact status/cause confirms.
    * Any unresolved outcome stops this flight without terminal reporting or releasing custody. */
   private async parkRetainedRecoveryExhausted(flight: RunFlight,

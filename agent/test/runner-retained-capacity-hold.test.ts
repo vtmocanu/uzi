@@ -263,11 +263,12 @@ it("a deadline abort inside a consumed iteration (the reclaim wait) is not capac
     used: 0.89,
     reserveWrap: async (n, orig) => {
       const reservation = await orig();
-      // The third iteration runs against a clock pinned just before its deadline: its own timer aborts the wait.
-      if (n === 3) clock.pin(reservation.deadline - 250);
+      // The third iteration runs against a clock pinned 2s before its deadline (slack for a loaded host to reach
+      // the reclaim wait): its own timer aborts the wait.
+      if (n === 3) clock.pin(reservation.deadline - 2_000);
       return reservation;
     },
-    onReclaim: async (n: number) => { if (n === 3) await sleep(1500); },
+    onReclaim: async (n: number) => { if (n === 3) await sleep(6_000); },
   });
   assert.equal(r.reclaims, 3, "the third iteration reached its reclaim wait");
   assert.equal(r.waitErrors.length, 1);
@@ -311,6 +312,24 @@ it("a deadline with no capacity refusal at all is not capacity-only", async t =>
     onMeasure: c => clock.pin(c.deadline() + 1),
   });
   assertUnmarkedPark(r);
+});
+
+it("an untyped reservation failure past the deadline after a capacity refusal is not capacity-only", async t => {
+  const clock = clockOf(t);
+  const r = await drive({
+    used: 0.89,
+    reserveWrap: async (n, orig, c) => {
+      if (n === 1) return orig();
+      // Writes nothing, so the episode fence and readback still match the witnessed reservation;
+      // only the untyped error itself may withhold the marker.
+      clock.pin(c.deadline() + 1);
+      throw new Error("io");
+    },
+  });
+  assertUnmarkedPark(r);
+  assert.equal(r.reserveErrors.length, 1);
+  assert.ok(!(r.reserveErrors[0] instanceof RecoveryDeadlineExhaustedError || r.reserveErrors[0] instanceof RecoveryBudgetExhaustedError));
+  assert.equal(journal(r.bare, r.clone.branch).recovery.attempts, 1);
 });
 
 it("a window already charged by an earlier flight of the same claim generation is never capacity-only", async () => {
