@@ -185,12 +185,15 @@ export function SinceLastFailedRun({ outcomes, owner, label = "Latest failure", 
   );
 }
 
-export function SegmentedToggle<T extends string>({ label, options, value, onChange, className = "ml-auto" }: {
+export function SegmentedToggle<T extends string>({ label, options, value, onChange, className = "ml-auto", steadyWidth = false }: {
   label: string;
-  options: readonly { value: T; label: string }[];
+  options: readonly { value: T; label: string; disabled?: boolean }[];
   value: T;
   onChange: (value: T) => void;
   className?: string;
+  // One weight for both states (#4052): a bolder selected label changes its advance, so the
+  // switch changes width and a right-aligned one shifts on every pick.
+  steadyWidth?: boolean;
 }) {
   return (
     <div role="group" aria-label={label} className={cx(className, "inline-flex shrink-0 rounded-full border border-edge bg-raised p-0.5")}>
@@ -199,10 +202,12 @@ export function SegmentedToggle<T extends string>({ label, options, value, onCha
           key={option.value}
           type="button"
           aria-pressed={value === option.value}
+          disabled={option.disabled}
           onClick={() => onChange(option.value)}
           className={cx(
-            "min-h-11 rounded-full border px-2.5 text-xs focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring sm:min-h-8",
-            value === option.value ? "border-edge-strong bg-surface font-semibold text-fg shadow-sm" : "border-transparent font-normal text-muted hover:text-fg",
+            "min-h-11 rounded-full border px-2.5 text-xs focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:text-muted sm:min-h-8",
+            value === option.value ? "border-edge-strong bg-surface text-fg shadow-sm" : "border-transparent text-muted hover:text-fg",
+            steadyWidth ? "font-medium" : value === option.value ? "font-semibold" : "font-normal",
           )}
         >
           {option.label}
@@ -217,8 +222,8 @@ const WINDOW_OPTIONS = [
   { value: "last_7_days", label: "Last 7 days" },
 ] as const;
 
-export function WindowToggle({ value, onChange, className }: { value: UsageWindow; onChange: (window: UsageWindow) => void; className?: string }) {
-  return <SegmentedToggle label="Usage reporting period" options={WINDOW_OPTIONS} value={value} onChange={onChange} className={className} />;
+export function WindowToggle({ value, onChange, className, steadyWidth }: { value: UsageWindow; onChange: (window: UsageWindow) => void; className?: string; steadyWidth?: boolean }) {
+  return <SegmentedToggle label="Usage reporting period" options={WINDOW_OPTIONS} value={value} onChange={onChange} className={className} steadyWidth={steadyWidth} />;
 }
 
 // Table cells for both per-user tables. "current" is the current Overview's PerUserUsageTable

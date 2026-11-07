@@ -92,6 +92,7 @@ import {
   SwitchTokenAction,
 } from "../components/RunCredentialOverride";
 import { CredentialDisabledPanel, isCredentialDisabledHold } from "../components/CredentialDisabledPanel";
+import { CredentialsResetPanel, isCredentialsResetHold } from "../components/CredentialsResetPanel";
 import { CredentialSwitchHoldPanel } from "../components/CredentialSwitchHoldPanel";
 import { RunPriorityBadge } from "../components/RunPriorityBadge";
 import { formatDuration } from "../components/RunEvent";
@@ -504,7 +505,7 @@ export function CompletionStatePanel({ run }: { run: Run }) {
   const phase = run.completion_phase ?? "";
   // PRD #1732: a credential_disabled hold is not a completion state; its own panel covers it.
   // Token-switch, base-attestation and repo-agent source holds have their own panels.
-  const held = run.hold_reason != null && run.hold_reason !== "credential_disabled" && run.hold_reason !== "provider_unavailable" &&
+  const held = run.hold_reason != null && run.hold_reason !== "credential_disabled" && run.hold_reason !== "credentials_reset" && run.hold_reason !== "provider_unavailable" &&
     run.hold_reason !== "base_attestation_missing" && run.hold_reason !== "repo_agent_source_unavailable" && credentialSwitchHold(run) === null;
   if (phase === "" && !held) return null;
   const unmet = run.completion_unmet ?? [];
@@ -984,6 +985,7 @@ export function PausedPanel({
     policyBlocksContinuation(run) ||
     run.hold_reason === "completion_blocked" ||
     run.hold_reason === "credential_disabled" ||
+    run.hold_reason === "credentials_reset" ||
     run.hold_reason === "provider_unavailable" ||
     run.hold_reason === "iteration_budget_exhausted" ||
     // Issue #3181: the token-switch holds have their own panel and Resume gating.
@@ -2499,6 +2501,8 @@ export function RunView() {
               ? "provider_unavailable"
             : run?.status === "paused" && run.hold_reason === "credential_disabled"
               ? "credential_disabled"
+            : run?.status === "paused" && run.hold_reason === "credentials_reset"
+              ? "credentials_reset"
             : run?.status === "paused" && run.hold_reason === "credential_switch_settling"
               ? "credential_switch_settling"
             : run?.status === "paused" && run.hold_reason === "credential_switch_unsettled"
@@ -2565,6 +2569,8 @@ export function RunView() {
               ? codexHoldCopy(parkKey.slice("codex:".length) || null, "").announce
             : parkKey === "credential_disabled"
               ? "The run is waiting because a credential it needs is disabled. Enable it and the run resumes automatically."
+            : parkKey === "credentials_reset"
+              ? "The run is waiting because your account's credentials were reset. Add a credential in Settings and the run resumes automatically."
             : parkKey === "base_attestation_missing"
               ? "The run is held because its retained work is not attested to the planned base commit. The agent was not started. Recover the work or start a successor run."
             : parkKey === "repo_agent_source_unavailable"
@@ -2648,7 +2654,7 @@ export function RunView() {
         actionsBesideTitle
         actions={<div className="relative flex flex-wrap items-center gap-2">
           <RunSettingsDisclosure>
-            {!policyBlocked && !isCredentialDisabledHold(run) && !(run.status === "awaiting_approval" && changedMilestones(run)) && (
+            {!policyBlocked && !isCredentialDisabledHold(run) && !isCredentialsResetHold(run) && !(run.status === "awaiting_approval" && changedMilestones(run)) && (
               <SwitchTokenAction run={run} canSteer={canSteer} onSwitched={refreshRun} />
             )}
             <CredentialEpochList epochs={run.credential_epochs} />
@@ -2769,6 +2775,9 @@ export function RunView() {
                 // PRD #1732: a credential_disabled hold resumes on Enable (its panel), and a
                 // plain Resume would only park it again.
                 run.hold_reason !== "credential_disabled" &&
+                // PRD #3989 M3: the server refuses Resume (409) for a credentials_reset hold; it
+                // resumes on its own once a credential is added.
+                run.hold_reason !== "credentials_reset" &&
                 run.hold_reason !== "provider_unavailable" &&
                 run.hold_reason !== "iteration_budget_exhausted" &&
                 // Issue #3181: the token-switch holds offer Resume in their own panel, which
@@ -3108,6 +3117,8 @@ export function RunView() {
           statusRef.current?.focus();
         }}
       />
+
+      <CredentialsResetPanel run={run} canSteer={canSteer} />
 
       <IterationHoldPanel run={run} ownerProof={canSteer && run.id === id} busy={busy}
         onResume={() => act(async (isCurrent) => {

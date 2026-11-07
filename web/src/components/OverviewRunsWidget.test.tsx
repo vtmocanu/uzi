@@ -247,4 +247,32 @@ describe("OverviewRunsWidget", () => {
       expect(scope()).toBe("Asking you");
     });
   });
+
+  describe("scope you under a stage filter (#4052)", () => {
+    const own = run({ id: "o-q", status: "awaiting_input", issue_title: "Own question" });
+    const other = theirs({ id: "x-q", status: "awaiting_input", issue_title: "Their question" });
+
+    it("drops other users' runs, labels the group by Yours only, and says so when Yours is empty", () => {
+      mount({ isAdmin: true, ownRuns: [own], adminRuns: good([other]), stage: "asking", scope: "you" });
+      expect(screen.getByText("Own question")).toBeTruthy();
+      expect(screen.queryByText("Their question")).toBeNull();
+      expect(screen.queryByText("Other users (admin)")).toBeNull();
+      expect(screen.getByRole("link", { name: /All runs/ }).previousElementSibling?.textContent).toBe("Asking you");
+      cleanup();
+      mount({ isAdmin: true, ownRuns: [], adminRuns: good([other]), stage: "asking", scope: "you" });
+      expect(screen.getByText("No runs at this stage.")).toBeTruthy();
+    });
+
+    it("keeps the unavailable notice, and leaves the unfiltered view and the all scope unchanged", () => {
+      mount({ isAdmin: true, ownRuns: [own], adminRuns: { runs: [other], failed: true, lastOkAt: NOW }, stage: "asking", scope: "you" });
+      expect(screen.getByRole("status").textContent).toBe("Other users' runs are unavailable");
+      cleanup();
+      mount({ isAdmin: true, ownRuns: [own], adminRuns: good([other]), scope: "you" });
+      expect(screen.getByText("Their question")).toBeTruthy();
+      cleanup();
+      mount({ isAdmin: true, ownRuns: [own], adminRuns: good([other]), stage: "asking", scope: "all" });
+      expect(screen.getByText("Their question")).toBeTruthy();
+      expect(screen.getByRole("link", { name: /All runs/ }).previousElementSibling?.textContent).toBe("Questions");
+    });
+  });
 });

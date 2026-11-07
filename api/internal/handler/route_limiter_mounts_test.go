@@ -302,6 +302,8 @@ var wantRouteMounts = []routeMount{
 	// writes cookie-only; every one a local DB statement with no forge call → noLimiter.
 	{"GET", "/api/admin/egress-profiles", noLimiter},
 	{"GET", "/api/admin/egress-profiles/{name}", noLimiter},
+	// PRD #3989: admin-issued reset link, a cookie-only admin DB write with no per-user limiter.
+	{"POST", "/api/admin/users/{id}/reset-link", noLimiter},
 	{"POST", "/api/admin/egress-profiles", noLimiter},
 	{"PUT", "/api/admin/egress-profiles/{name}", noLimiter},
 	{"DELETE", "/api/admin/egress-profiles/{name}", noLimiter},
@@ -688,6 +690,10 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/auth/login", noLimiter},
 	{"POST", "/api/auth/logout", noLimiter},
 	{"POST", "/api/auth/register", noLimiter},
+	// PRD #3989: the public account-reset routes ride the PER-IP auth limiter, so they read
+	// as noLimiter here; TestResetLinkRoutesAreBehindThePerIPAuthLimiter pins the mount.
+	{"POST", "/api/auth/reset/preview", noLimiter},
+	{"POST", "/api/auth/reset/redeem", noLimiter},
 	{"POST", "/api/chats/", limChat},
 	// PRD #322 M1: cancel from a chat card is an emergency stop with no forge call, so it
 	// carries NO per-user limiter (mounted like /{id}/end), NOT the forge budget the
@@ -1375,6 +1381,38 @@ func TestOAuthAuthorizeIsBehindThePerIPAuthLimiter(t *testing.T) {
 	}
 	if rec := get("192.0.2.11:4000"); rec.Code != http.StatusBadRequest {
 		t.Fatalf("first request from another address = %d, want 400: the budget is per IP", rec.Code)
+	}
+}
+
+// TestResetLinkRoutesAreBehindThePerIPAuthLimiter pins PRD #3989: the unauthenticated POST
+// /api/auth/reset/preview and /redeem are fronted by authLimiter's per-IP Middleware. The
+// probe budget is one request per address, and a malformed body dies in the handler before any
+// store (this Handler has none), so the first request is the handler's 400 and the second from
+// the same address is the limiter's 429.
+func TestResetLinkRoutesAreBehindThePerIPAuthLimiter(t *testing.T) {
+	for _, path := range []string{"/api/auth/reset/preview", "/api/auth/reset/redeem"} {
+		t.Run(path, func(t *testing.T) {
+			limiters := newProbeLimiters()
+			h := &Handler{cfg: config.Config{}}
+			router := h.Routes(limiters[0], limiters[1], limiters[2], limiters[3],
+				limiters[4], limiters[5], limiters[6], limiters[7], limiters[8], limiters[9], limiters[10])
+			post := func(remote string) *httptest.ResponseRecorder {
+				req := httptest.NewRequest(http.MethodPost, path, strings.NewReader("{"))
+				req.RemoteAddr = remote
+				rec := httptest.NewRecorder()
+				router.ServeHTTP(rec, req)
+				return rec
+			}
+			if rec := post("192.0.2.20:4000"); rec.Code != http.StatusBadRequest {
+				t.Fatalf("first request = %d, want the handler's 400", rec.Code)
+			}
+			if rec := post("192.0.2.20:4001"); rec.Code != http.StatusTooManyRequests {
+				t.Fatalf("second request from the same address = %d, want 429 from authLimiter", rec.Code)
+			}
+			if rec := post("192.0.2.21:4000"); rec.Code != http.StatusBadRequest {
+				t.Fatalf("first request from another address = %d, want 400: the budget is per IP", rec.Code)
+			}
+		})
 	}
 }
 

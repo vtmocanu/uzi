@@ -126,6 +126,9 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 			if isCredentialSwitchHold(run) {
 				_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", cellText(runID), pausedHoldNotice(run))
 			}
+			if isCredentialsResetHold(run) {
+				_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", cellText(runID), pausedHoldNotice(run))
+			}
 			if isCredentialDisabledHold(run) {
 				_, _ = fmt.Fprintf(env.Stderr,
 					"run %s: held, a credential it needs is disabled; %s\n", runID, credentialDisabledAction(run))

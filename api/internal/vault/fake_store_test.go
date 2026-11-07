@@ -30,14 +30,37 @@ func (f *fakeVaultStore) state(id uuid.UUID) store.LockVaultAuthStateRow {
 	}
 	return s
 }
-func (f *fakeVaultStore) LockSettingsAdmission(ctx context.Context) error           { return ctx.Err() }
-func (f *fakeVaultStore) LockSecretMutation(ctx context.Context, _ uuid.UUID) error { return ctx.Err() }
+func (f *fakeVaultStore) LockSettingsAdmission(ctx context.Context) error { return ctx.Err() }
+func (f *fakeVaultStore) LockSecretMutation(ctx context.Context, _ uuid.UUID) error {
+	f.record("LockSecretMutation")
+	return ctx.Err()
+}
+
+// record appends to the ordered call log reset_test.go asserts on.
+func (f *fakeVaultStore) record(name string) {
+	f.logMu.Lock()
+	defer f.logMu.Unlock()
+	f.calls = append(f.calls, name)
+}
+
+func (f *fakeVaultStore) resetCalls() {
+	f.logMu.Lock()
+	defer f.logMu.Unlock()
+	f.calls = nil
+}
+
+func (f *fakeVaultStore) callLog() []string {
+	f.logMu.Lock()
+	defer f.logMu.Unlock()
+	return append([]string(nil), f.calls...)
+}
 func (f *fakeVaultStore) GetVaultPolicy(_ context.Context) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.policy, nil
 }
 func (f *fakeVaultStore) LockVaultAuthState(_ context.Context, id uuid.UUID) (store.LockVaultAuthStateRow, error) {
+	f.record("LockVaultAuthState")
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.state(id), nil
@@ -52,6 +75,7 @@ func (f *fakeVaultStore) LockUserVault(ctx context.Context, id uuid.UUID) (store
 	return f.GetUserVault(ctx, id)
 }
 func (f *fakeVaultStore) DeleteUserVault(_ context.Context, id uuid.UUID) (int64, error) {
+	f.record("DeleteUserVault")
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.vaults[id]; !ok {
@@ -61,6 +85,7 @@ func (f *fakeVaultStore) DeleteUserVault(_ context.Context, id uuid.UUID) (int64
 	return 1, nil
 }
 func (f *fakeVaultStore) AdvanceUserVaultMode(_ context.Context, arg store.AdvanceUserVaultModeParams) (store.AdvanceUserVaultModeRow, error) {
+	f.record("AdvanceUserVaultMode")
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	s := f.state(arg.ID)
@@ -150,4 +175,86 @@ func (f *fakeVaultStore) RevokeVaultBrowserSlots(ctx context.Context, id uuid.UU
 	return s.VaultSlotGeneration, ctx.Err()
 }
 
-var _ Store = (*fakeVaultStore)(nil)
+// resetStore surface. The fixture has no rollback model, so tests assert that a
+// failing callback never reaches the Delete* methods rather than undoing them.
+func (f *fakeVaultStore) LockOwnerWorkersForReset(ctx context.Context, _ uuid.UUID) ([]uuid.UUID, error) {
+	f.record("LockOwnerWorkersForReset")
+	return nil, ctx.Err()
+}
+func (f *fakeVaultStore) LockOwnerRunsForReset(ctx context.Context, _ uuid.UUID) ([]uuid.UUID, error) {
+	f.record("LockOwnerRunsForReset")
+	return nil, ctx.Err()
+}
+func (f *fakeVaultStore) LockOwnerSecretsForReset(ctx context.Context, _ uuid.UUID) ([]uuid.UUID, error) {
+	f.record("LockOwnerSecretsForReset")
+	return nil, ctx.Err()
+}
+func (f *fakeVaultStore) DeleteAllUserSecretsForOwner(_ context.Context, id uuid.UUID) (int64, error) {
+	f.record("DeleteAllUserSecretsForOwner")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var kept []*fakeSecret
+	var n int64
+	for _, s := range f.secrets {
+		if s.userID == id {
+			n++
+			continue
+		}
+		kept = append(kept, s)
+	}
+	f.secrets = kept
+	return n, nil
+}
+func (f *fakeVaultStore) DeleteAllCodexProviderAccountsForOwner(_ context.Context, id uuid.UUID) (int64, error) {
+	f.record("DeleteAllCodexProviderAccountsForOwner")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := int64(f.codexAccounts[id])
+	delete(f.codexAccounts, id)
+	return n, nil
+}
+func (f *fakeVaultStore) ClearSidebarCodexAccounts(context.Context, uuid.UUID) error {
+	f.record("ClearSidebarCodexAccounts")
+	return nil
+}
+
+// BrowserStore surface: reset hands its callback a BrowserStore. The reset tests
+// never exercise these; they exist so the fixture satisfies the interface.
+var errFakeBrowser = errors.New("fake: browser store method unsupported")
+
+func (f *fakeVaultStore) GetVaultReunlockDays(context.Context) (string, error) {
+	return "", errFakeBrowser
+}
+func (f *fakeVaultStore) GetVaultBrowserSlot(context.Context, store.GetVaultBrowserSlotParams) (store.VaultBrowserSlot, error) {
+	return store.VaultBrowserSlot{}, errFakeBrowser
+}
+func (f *fakeVaultStore) PrepareVaultBrowserSlot(context.Context, store.PrepareVaultBrowserSlotParams) error {
+	return errFakeBrowser
+}
+func (f *fakeVaultStore) TrimVaultBrowserSlots(context.Context, uuid.UUID) error {
+	return errFakeBrowser
+}
+func (f *fakeVaultStore) InsertVaultBrowserSlot(context.Context, store.InsertVaultBrowserSlotParams) error {
+	return errFakeBrowser
+}
+func (f *fakeVaultStore) SetVaultAutoReunlock(context.Context, store.SetVaultAutoReunlockParams) error {
+	return errFakeBrowser
+}
+func (f *fakeVaultStore) BumpTokenVersion(context.Context, uuid.UUID) (int32, error) {
+	return 0, errFakeBrowser
+}
+func (f *fakeVaultStore) UpdatePassword(context.Context, store.UpdatePasswordParams) error {
+	return errFakeBrowser
+}
+func (f *fakeVaultStore) SetUserActive(context.Context, store.SetUserActiveParams) (store.User, error) {
+	return store.User{}, errFakeBrowser
+}
+func (f *fakeVaultStore) SupersedeLiveResetLinksForUser(context.Context, store.SupersedeLiveResetLinksForUserParams) (int64, error) {
+	return 0, errFakeBrowser
+}
+
+var (
+	_ Store        = (*fakeVaultStore)(nil)
+	_ BrowserStore = (*fakeVaultStore)(nil)
+	_ resetStore   = (*fakeVaultStore)(nil)
+)

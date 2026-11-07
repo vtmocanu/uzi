@@ -607,7 +607,7 @@ func providerBoardLine(r apitypes.RunDTO) string {
 func (m tuiModel) boardShowSecondLine(r apitypes.RunListItemDTO) bool {
 	return isIterationHold(r.RunDTO) || isForgePark(r.RunDTO) || r.ForgeOriginCooldown != nil || (r.CurrentActivity != nil && !terminalRunStatuses[r.Status]) ||
 		codexAccountActionLine(r.RunDTO) != "" || vaultParkLine(r.RunDTO) != "" ||
-		diskParkLine(r.RunDTO) != "" || credentialDisabledLine(r.RunDTO) != "" || credentialSwitchHoldLine(r.RunDTO) != "" || isOwnerRequiredWorkerHold(r.RunDTO) || isRecoveryDecisionPark(r.RunDTO) ||
+		diskParkLine(r.RunDTO) != "" || credentialHoldLine(r.RunDTO) != "" || credentialSwitchHoldLine(r.RunDTO) != "" || isOwnerRequiredWorkerHold(r.RunDTO) || isRecoveryDecisionPark(r.RunDTO) ||
 		isProviderUnavailableHold(r.RunDTO) || providerParkLine(r.RunDTO) != ""
 }
 
@@ -683,7 +683,7 @@ func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
 	if line == "" {
 		// PRD #1732 D14: a run held on credential_disabled has no live activity either; its
 		// second line is what the owner can do about it.
-		line = credentialDisabledLine(r.RunDTO)
+		line = credentialHoldLine(r.RunDTO)
 	}
 	if line == "" {
 		line = credentialSwitchHoldLine(r.RunDTO)
