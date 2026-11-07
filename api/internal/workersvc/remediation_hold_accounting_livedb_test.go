@@ -237,14 +237,6 @@ func TestRemediationHoldImmediateParkLiveDB(t *testing.T) {
 		t.Logf("(a) immediate park: claims=1 own_open_holds=1 requeue_count=%d retained_park_count=%d retry=%v released=%v worker_kept=%v",
 			r.RequeueCount, r.RetainedParkCount, r.RecoveryRetryNotBefore.Valid, r.ClaimReleasedAt.Valid, r.WorkerID.Valid)
 
-		// A sweep and a worker restart neither move nor re-claim the held run.
-		f.rhReregister(t)
-		f.sweep(t)
-		f.rhAssertImmediatePark(t, run, before.RequeueCount, before.RetainedParkCount, "after sweep and re-register")
-		if got, _ := f.claim(t); got != uuid.Nil {
-			t.Fatalf("claimed %s while held, want idle", got)
-		}
-
 		// Lost park ACK: the worker replays the same-generation report; the claim is already
 		// released, so it is stale, writes nothing and counts nothing twice.
 		frozen := f.rowJSON(t, run)
@@ -255,6 +247,14 @@ func TestRemediationHoldImmediateParkLiveDB(t *testing.T) {
 		if got := f.ownOpenHolds(t, run); got != 1 {
 			t.Fatalf("own open holds = %d after the duplicate, want 1", got)
 		}
+
+		// A sweep and a worker restart neither move nor re-claim the held run.
+		f.rhReregister(t)
+		f.sweep(t)
+		f.rhAssertImmediatePark(t, run, before.RequeueCount, before.RetainedParkCount, "after sweep and re-register")
+		if got, _ := f.claim(t); got != uuid.Nil {
+			t.Fatalf("claimed %s while held, want idle", got)
+		}
 	})
 
 	t.Run("a delayed report from an earlier generation is stale after a re-claim", func(t *testing.T) {
@@ -264,11 +264,10 @@ func TestRemediationHoldImmediateParkLiveDB(t *testing.T) {
 		f.rhRunning(t, run, 1)
 		f.heartbeat(t, f.next(), f.nonce, ActiveRunEntry{RunID: run.String(), ClaimGeneration: 1, Phase: "running"})
 		f.rhReregister(t)
-		f.env.exec(`UPDATE runs SET status_since = now() - interval '2 hours' WHERE id = $1`, run)
-		f.omit(t)
-		if r := f.run(t, run); r.Status != "queued" {
-			t.Fatalf("after re-register and an omitting snapshot status=%s requeue_count=%d, want the run requeued", r.Status, r.RequeueCount)
+		if r := f.run(t, run); r.Status != "queued" || r.RequeueCount != 1 {
+			t.Fatalf("after re-register status=%s requeue_count=%d, want the run requeued with count 1", r.Status, r.RequeueCount)
 		}
+		f.omit(t) // a snapshot heartbeat makes the re-registered worker claimable again
 		f.claimRun(t, run, 2)
 		frozen := f.rowJSON(t, run)
 		holds := f.rhHoldRows(t, run)
@@ -381,6 +380,66 @@ func TestRemediationHoldUnchargedResetsBoundedByLimitLiveDB(t *testing.T) {
 	})
 }
 
+// TestRemediationHoldRepeatedResumeLiveDB: repeated confirmed parks, each followed by an owner
+// Resume. Resume renews the requeue episode (worker_recovery_episode + 1, requeue_episode_baseline
+// = requeue_count) but neither charges nor refunds requeue_count and releases no custody, so the
+// run's own open holds grow by one per successful claim until custody_hold_limit refuses the next
+// claim, which leaves a plain queued run.
+func TestRemediationHoldRepeatedResumeLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	const max = 3
+	const limit = int32(4)
+	f := newRHFixture(t, env, max, limit)
+	pred, _ := f.rhPredecessor(t)
+	predRows := f.rhHoldRows(t, pred)
+	run := f.seedRun("queued", 0)
+
+	prev := f.run(t, run)
+	for gen := int64(1); gen <= int64(limit); gen++ {
+		f.claimRun(t, run, gen)
+		f.rhRunning(t, run, gen)
+		if res, err := f.rhPark(t, run, gen); err != nil || !res.Applied {
+			t.Fatalf("gen %d: park applied=%v err=%v", gen, res.Applied, err)
+		}
+		parked := f.rhAssertImmediatePark(t, run, prev.RequeueCount, prev.RetainedParkCount, "parked")
+		f.rhAssertAllGuarded(t, run)
+		if own := f.ownOpenHolds(t, run); own != gen {
+			t.Fatalf("gen %d: own open holds = %d after the park, want %d (one more per successful claim)", gen, own, gen)
+		}
+
+		row, err := f.env.q.ResumeWorkerRecoveryEpisode(f.env.ctx, store.ResumeWorkerRecoveryEpisodeParams{ID: run, UserID: f.userID, GlobalTimeoutSeconds: 3600})
+		if err != nil || row.Status != "queued" {
+			t.Fatalf("gen %d: Resume status=%q err=%v, want queued", gen, row.Status, err)
+		}
+		r := f.run(t, run)
+		if r.Status != "queued" || r.RecoveryWaitCause.Valid || r.FailOrigin.Valid || r.RecoveryRetryNotBefore.Valid || r.WorkerID != pgconv.UUID(f.workerID) {
+			t.Fatalf("gen %d: after Resume status=%s cause=%v fail_origin=%v retry=%v worker=%v, want queued, cause cleared, NULL retry, affinity kept",
+				gen, r.Status, r.RecoveryWaitCause, r.FailOrigin, r.RecoveryRetryNotBefore, r.WorkerID)
+		}
+		if r.WorkerRecoveryEpisode != parked.WorkerRecoveryEpisode+1 || r.RequeueEpisodeBaseline != r.RequeueCount {
+			t.Fatalf("gen %d: episode %d -> %d baseline=%d requeue_count=%d, want episode+1 and baseline = requeue_count",
+				gen, parked.WorkerRecoveryEpisode, r.WorkerRecoveryEpisode, r.RequeueEpisodeBaseline, r.RequeueCount)
+		}
+		if r.RequeueCount != prev.RequeueCount || r.RetainedParkCount != prev.RetainedParkCount {
+			t.Fatalf("gen %d: requeue_count=%d retained_park_count=%d after Resume, want unchanged %d/%d",
+				gen, r.RequeueCount, r.RetainedParkCount, prev.RequeueCount, prev.RetainedParkCount)
+		}
+		f.rhAssertAllGuarded(t, run)
+		if own := f.ownOpenHolds(t, run); own != gen {
+			t.Fatalf("gen %d: Resume changed own open holds to %d, want %d", gen, own, gen)
+		}
+		if got := f.rhHoldRows(t, pred); got != predRows {
+			t.Fatalf("gen %d: the predecessor's custody rows changed", gen)
+		}
+		t.Logf("resume cycle: gen=%d own_open_holds=%d requeue_count=%d retained_park_count=%d worker_recovery_episode=%d requeue_episode_baseline=%d",
+			gen, f.ownOpenHolds(t, run), r.RequeueCount, r.RetainedParkCount, r.WorkerRecoveryEpisode, r.RequeueEpisodeBaseline)
+		prev = r
+	}
+	f.rhAssertRefusedQueued(t, run, limit, prev.RequeueCount, predRows, pred)
+	f.rhAssertAllGuarded(t, run)
+	t.Logf("repeated Resume: limit=%d RUN_MAX_REQUEUES=%d claims=%d own_open_holds=%d requeue_count=%d final=queued", limit, max, limit, f.ownOpenHolds(t, run), prev.RequeueCount)
+}
+
 // TestRemediationHoldRestartLossChargedLiveDB measures the restart-driven loss: a real ClaimRun
 // whose flight never reports running or is listed, then a real Register with a new nonce. Register
 // charges the run (requeue_count + 1) and, over RUN_MAX_REQUEUES, must park it for its owner at
@@ -446,6 +505,7 @@ func TestRemediationHoldWitnessedExhaustionLiveDB(t *testing.T) {
 		for gen := int64(1); gen <= max+1; gen++ {
 			f.claimRun(t, run, gen)
 			f.rhRunning(t, run, gen)
+			f.rhAssertAllGuarded(t, run)
 			if own := f.ownOpenHolds(t, run); own != gen {
 				t.Fatalf("gen %d: own open holds = %d, want %d", gen, own, gen)
 			}
@@ -494,6 +554,7 @@ func TestRemediationHoldWitnessedExhaustionLiveDB(t *testing.T) {
 				}
 				t.Logf("(b) witnessed departures: RUN_MAX_REQUEUES=%d claims=%d own_open_holds=%d requeue_count=%d final=%s/%s", max, gen, f.ownOpenHolds(t, run), r.RequeueCount, r.Status, r.RecoveryWaitCause.String)
 			}
+			f.rhAssertAllGuarded(t, run)
 			if got := f.ownOpenHolds(t, run); got != gen {
 				t.Fatalf("gen %d: own open holds = %d, want %d", gen, got, gen)
 			}
@@ -519,6 +580,7 @@ func TestRemediationHoldUnwitnessedParkControlLiveDB(t *testing.T) {
 		t.Fatalf("sweep = %+v, want one unwitnessed park and no charge", sw)
 	}
 	f.assertUnwitnessedPark(t, run, 0, "presence control")
+	f.rhAssertAllGuarded(t, run)
 	if got := f.ownOpenHolds(t, run); got != holds {
 		t.Fatalf("own open holds = %d after the park, want %d", got, holds)
 	}

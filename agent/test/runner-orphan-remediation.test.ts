@@ -28,6 +28,7 @@ function snapshot(s: Scene) {
 function assertHeld(s: Scene, before: ReturnType<typeof snapshot>, parks = 1, claim = s.claim): void {
   assert.equal(s.entered.value, false, "no model turn");
   assert.equal(s.parks(claim), parks, "exactly the expected typed park reports");
+  assert.equal(s.flight?.parked, true, "the flight records the confirmed park");
   assert.deepEqual(terminal(s, claim), [], "no terminal report");
   assert.deepEqual(snapshot(s), before, "journal, ledger, attempt markers, descriptors and the owner path are byte-identical");
   assert.ok(fs.existsSync(s.clone), "the predecessor path is still present");
@@ -102,7 +103,10 @@ describe("a remediation-enrolled orphan holds the successor", linux, () => {
     assertHeld(s, before);
   });
 
-  it("a live process on the predecessor path still holds, with no quiescence attempt", async t => {
+  // The agent's source-use registry lives in the git authority (flight.sourceUsePaths, recordAdmissions); the scene's
+  // authority is a no-op stub, so a real live registration is not cheap here. This proves only that the hold never
+  // reaches quiescence, even when a quiescence proof would report survivors.
+  it("the hold never attempts quiescence, even when a proof would report survivors", async t => {
     confirmParks(t);
     const s = await scene(t, { entry: "B", attemptPaths: true });
     s.quiesceBlocked.value = true;
@@ -162,18 +166,20 @@ describe("a remediation-enrolled orphan holds the successor", linux, () => {
 });
 
 describe("the park acknowledgement", linux, () => {
-  it("a lost ACK resolved by an ownership read confirms through the replay", async t => {
+  it("a park report lost before reaching the server is confirmed by the replay, the first applied report", async t => {
     const s = await scene(t, { entry: "A", attemptPaths: true });
     const before = snapshot(s);
     let reports = 0;
     confirmParks(t, async (body, original) => {
-      const ack = await original();
-      if (body.status === "recovery_wait" && ++reports === 1) throw new Error("connection reset after the server applied the park");
-      return ack;
+      // The real server releases the claim on an applied park, so only a report that never arrived can be replayed.
+      if (body.status === "recovery_wait" && ++reports === 1) throw new Error("connection reset before the server saw the park");
+      return original();
     });
-    api.setOwnershipStatus(s.claim.run_id, "recovery_wait", 5);
+    api.setOwnershipStatus(s.claim.run_id, "running", 5);
     await s.run();
     assert.equal(reports, 2, "the park was replayed once");
+    assert.equal(s.parks(), 1, "only the replay is on the server");
+    assert.equal(s.flight?.parked, true);
     assert.deepEqual(terminal(s), []);
     assert.deepEqual(snapshot(s), before);
   });
@@ -193,6 +199,7 @@ describe("the park acknowledgement", linux, () => {
     api.setOwnershipStatus(s.claim.run_id, "running", 5);
     await s.run();
     assert.equal(s.parks(), 1, "only the first (applied) report is on the server");
+    assert.notEqual(s.flight?.parked, true, "the park is not confirmed");
     assert.deepEqual(terminal(s), []);
     assert.deepEqual(snapshot(s), before);
     assert.equal(s.entered.value, false);
@@ -203,6 +210,7 @@ describe("the park acknowledgement", linux, () => {
     const s = await scene(t, { entry: "A", attemptPaths: true });
     const before = snapshot(s);
     await s.run();
+    assert.notEqual(s.flight?.parked, true, "the park is not confirmed");
     assert.deepEqual(terminal(s), []);
     assert.deepEqual(snapshot(s), before);
     assert.equal(s.entered.value, false);
@@ -214,6 +222,7 @@ describe("the park acknowledgement", linux, () => {
     const before = snapshot(s);
     await s.run();
     assert.equal(s.parks(), 0);
+    assert.notEqual(s.flight?.parked, true, "nothing is parked");
     assert.deepEqual(terminal(s), []);
     assert.equal(s.guidance().length >= 1, true);
     const joined = s.guidance().join("\n");
@@ -233,6 +242,7 @@ describe("the park acknowledgement", linux, () => {
     const before = snapshot(s);
     await s.run();
     assert.equal(s.parks(), 0);
+    assert.notEqual(s.flight?.parked, true, "nothing is parked");
     assert.deepEqual(terminal(s), []);
     assert.ok(s.lines.some(l => l.msg === "remediation hold park refused"), s.lines.map(l => String(l.msg)).join(" | "));
     const g = s.guidance();
@@ -307,6 +317,7 @@ describe("the guidance is confirmed before the park, whatever the message transp
     await s.run();
     if (delivered) assert.equal(guidanceAtPark, true, "the guidance text reached the server before the park report");
     assert.equal(s.parks(), 1, "the confirmed park ACK");
+    assert.equal(s.flight?.parked, true, "the flight records the confirmed park");
     assert.deepEqual(terminal(s), [], "no failed report");
     assert.deepEqual(snapshot(s), before);
     assert.equal(s.entered.value, false);

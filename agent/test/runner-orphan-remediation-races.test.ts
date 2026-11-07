@@ -133,6 +133,31 @@ describe("a record enrolled between the classification and the retained snapshot
   }
 });
 
+describe("a record enrolled while the completion handoff runs", linux, () => {
+  const outcomes: Array<[string, { kind: "invalid"; why: "unverified" } | { kind: "pending"; why: "authority_busy" }]> = [
+    ["invalid", { kind: "invalid", why: "unverified" }],
+    ["pending", { kind: "pending", why: "authority_busy" }],
+  ];
+  for (const [name, outcome] of outcomes) {
+    it(`the re-read decides before a ${name} handoff outcome: one confirmed park, no terminal report`, async t => {
+      confirmParks(t);
+      const s = await scene(t, { entry: "A", attemptPaths: true, authority: true, fenced: true, enroll: false });
+      let enrolled: string | undefined;
+      ((s.runner as unknown as { recovery: unknown }).recovery as { retireCompletedSourceForHandoff: unknown }).retireCompletedSourceForHandoff =
+        async () => { await s.enroll(); enrolled = snapshot(s).journal; return outcome; };
+      await s.run();
+      assert.ok(enrolled, "the handoff stub ran and enrolled the record");
+      assert.equal(s.parks(), 1, "one confirmed park");
+      assert.deepEqual(terminal(s), [], "no terminal report");
+      assert.equal(s.entered.value, false, "no model turn");
+      assert.equal(snapshot(s).journal, enrolled, "the journal is unchanged after the enrolment");
+      assert.ok(JSON.parse(s.journalRaw()).remediationRecovery, "the record is still there");
+      assert.ok(fs.existsSync(s.clone));
+      assert.ok(subreasons(s).includes("completion_handoff/completion_retirement_pending/remediation_retained"));
+    });
+  }
+});
+
 describe("negative controls keep their existing terminal refusals", linux, () => {
   const rewrite = (s: Scene, edit: (j: Record<string, any>) => void) => {
     const j = JSON.parse(s.journalRaw());
@@ -202,6 +227,20 @@ describe("negative controls keep their existing terminal refusals", linux, () =>
     rewrite(s, j => { j.remediationRecovery.branch = "agent/issue-9999"; });
     await refused(s);
     assert.ok(s.lines.some(l => l.stage === "path" && l.reason === "path_error"));
+  });
+
+  it("a cold reader (fresh runner and cache) refuses a schema-valid cross-branch record as path_error, never held", async t => {
+    confirmParks(t);
+    const s = await scene(t, { entry: "A", attemptPaths: true });
+    rewrite(s, j => { j.remediationRecovery.branch = "agent/issue-9999"; });
+    const before = snapshot(s);
+    await s.run(s.claim, s.coldRunner());
+    assert.equal(s.parks(), 0, "never held");
+    assert.deepEqual(s.guidance(), []);
+    assert.equal(failures(s).length, 1, "the existing terminal refusal");
+    assert.ok(s.lines.some(l => l.stage === "path" && l.reason === "path_error"));
+    assert.equal(s.entered.value, false);
+    assert.deepEqual(snapshot(s), before, "nothing changed");
   });
 
   it("a hand-written canonical-path remediation journal is rejected as a corrupt journal before reclaim and never held", async t => {

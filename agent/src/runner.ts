@@ -13529,7 +13529,10 @@ export class RunRunner {
       // An unreadable or expired reread only withholds the "changed" proof, so each outcome below keeps its own
       // disposition. Lifecycle stops always propagate instead of becoming a terminal orphan refusal.
       const reread = await rereadFence();
-      if (reread?.state === "changed") readmit();
+      if (reread?.state === "changed") return readmit();
+      // issue #4058: a record enrolled while the handoff ran decides before the handoff outcome does, whatever it was.
+      if (reread?.remediation === "mismatch") refuse("path", "path_error");
+      if (reread?.remediation === "exact") holdRemediation();
       if (retainedSource) {
         // A found published source is never detached. Only a positive "no record, no slot" answer falls through,
         // and it proceeds only when the re-read succeeded and did not report a change (a failed re-read is

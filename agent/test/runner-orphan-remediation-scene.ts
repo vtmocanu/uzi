@@ -69,7 +69,7 @@ export interface Scene {
   /** Every error the claimant's reclaim was entered with. */
   entries: Error[];
   /** The live flight of the latest reclaim entry. */
-  flight: { steering: { markCancelled(): void }; cancel: AbortController; batcher: { emit(m: unknown): void; flush(): Promise<void> } } | undefined;
+  flight: { parked?: boolean; steering:{ markCancelled(): void }; cancel: AbortController; batcher: { emit(m: unknown): void; flush(): Promise<void> } } | undefined;
   /** Runs synchronously when a reclaim is entered, with the live flight (before the owner is classified). */
   beforeReclaim: ((flight: NonNullable<Scene["flight"]>) => void) | undefined;
   /** Call counts of the effects and proofs a hold must never reach. */

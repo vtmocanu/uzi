@@ -2224,7 +2224,9 @@ authority, and this page names no route that disposes of the remediation. While 
 run's holds count toward your [custody admission limit](admin-settings.md) (`custody_hold_limit`), and a
 held run blocks its worker's upgrade or drain. If the api does not support the park, the worker does not
 park and the message says so; the run is then handled by the ordinary requeue paths. A worker restart
-consumes a requeue, so repeated restarts end at `recovery_wait` / `worker_requeue_exhausted`.
+consumes a requeue, so repeated restarts end at `recovery_wait` / `worker_requeue_exhausted`,
+unless the run's own open holds reach the custody admission limit first; it then stays queued for
+capacity (not an owner park) before it can be claimed again.
 
 ### Retained sources with no open hold (worker-local inspect and discard)
 
