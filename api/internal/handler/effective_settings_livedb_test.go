@@ -501,6 +501,17 @@ func TestEffectiveSettingsHarnessChoicesLiveDB(t *testing.T) {
 		f.policy("codex", true)
 		dto, _ := f.get()
 		wantHarness(t, f.choice(dto, "default").Harness, "", "chosen_at_create", "overflow")
+		// Codex is preferred, so an Anthropic override is not accepted: creation stays on exact Codex.
+		if f.choice(dto, "default").AnthropicOverrideAllowed {
+			t.Errorf("anthropic_override_allowed = true for an overflow with codex preferred, want false")
+		}
+		pv, body := f.preview(`{"harness":null,"credential_override":{"mode":"auto"}}`)
+		if strs(pv.Refusal) != "credential_override_harness_unsupported" {
+			t.Fatalf("auto override preview = %s, want credential_override_harness_unsupported", body)
+		}
+		if _, err := f.create(nil, &workersvc.RawCredentialOverride{Mode: "auto"}); !errors.Is(err, workersvc.ErrCredentialOverrideHarnessUnsupported) {
+			t.Fatalf("create with an auto override = %v, want ErrCredentialOverrideHarnessUnsupported", err)
+		}
 	})
 	t.Run("default codex unusable falls back with the note", func(t *testing.T) {
 		f := newEffFix(t, nil)
@@ -769,6 +780,9 @@ func TestStartPreviewAlternativesLiveDB(t *testing.T) {
 		}
 		requireValidAlt(t, altOf(t, dto, "claude"), "claim_selection")
 		requireValidAlt(t, altOf(t, dto, "codex"), "codex_default_credential")
+		if g, _ := f.get(); !f.choice(g, "default").AnthropicOverrideAllowed {
+			t.Errorf("anthropic_override_allowed = false for an overflow with claude preferred, want true")
+		}
 		if run, err := f.create(nil, raw); err != nil || run.Harness != "codex" {
 			t.Fatalf("create landing on codex = %q %v (overflow normalises the inherit)", run.Harness, err)
 		}

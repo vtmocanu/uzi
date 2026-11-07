@@ -52,7 +52,6 @@ const (
 	refusalOverrideUnsupported    = "credential_override_harness_unsupported"
 	refusalOverrideInvalid        = "credential_override_invalid"
 	detailCredentialDisabled      = "credential_disabled"
-	detailCodexPoolUnavailable    = "codex_pool_unavailable"
 )
 
 // refusal is a refusal token with its optional detail ("" = none).
@@ -82,7 +81,7 @@ func startRefusal(err error) (refusal, bool) {
 	case errors.Is(err, workersvc.ErrHarnessCredentialDisabled):
 		return refusal{refusalNoCredentialForHarness, detailCredentialDisabled}, true
 	case errors.Is(err, workersvc.ErrCodexPoolUnavailable):
-		return refusal{refusalNoCredentialForHarness, detailCodexPoolUnavailable}, true
+		return refusal{refusalNoCredentialForHarness, codexPoolUnavailableCode}, true
 	case errors.Is(err, workersvc.ErrNoCredentialForHarness):
 		return refusal{Token: refusalNoCredentialForHarness}, true
 	case errors.Is(err, workersvc.ErrNoUsableCredential):
@@ -280,7 +279,10 @@ func effectiveHarness(hn workersvc.Harness, o startOutcome) apitypes.EffectiveHa
 }
 
 // effectiveStartChoice maps one start choice. An Anthropic override is accepted by a choice that
-// resolves to Claude or may be chosen at creation; the GET itself decides only "no override".
+// resolves to Claude, or by a chosen-at-create choice whose preferred harness is Claude (the
+// automatic policy). An overflow with Codex preferred is not: any non-inherit override makes the
+// creation origin ineligible, so creation stays on exact Codex and refuses the override. The GET
+// itself decides only "no override".
 func effectiveStartChoice(choice string, o startOutcome) apitypes.EffectiveStartChoiceDTO {
 	out := apitypes.EffectiveStartChoiceDTO{Choice: choice}
 	if o.refused.Token != "" {
@@ -288,7 +290,8 @@ func effectiveStartChoice(choice string, o startOutcome) apitypes.EffectiveStart
 		return out
 	}
 	out.Harness = harnessValue(o.pred, harnessSourceRunOverride)
-	out.AnthropicOverrideAllowed = o.pred.ChosenAtCreate || o.pred.Harness == workersvc.HarnessClaude
+	out.AnthropicOverrideAllowed = o.pred.Harness == workersvc.HarnessClaude ||
+		(o.pred.ChosenAtCreate && o.pred.Preferred == workersvc.HarnessClaude)
 	return out
 }
 

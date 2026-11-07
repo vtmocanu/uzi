@@ -1441,8 +1441,9 @@ export const settingsApi = {
   previewStartSettings: async (body: StartPreviewRequest): Promise<StartPreview> => {
     requireSession();
     const key = previewRequestKey(body);
-    const hit = recordedEffectiveScenario().start_previews.find(p => previewRequestKey(p.request) === key);
-    if (!hit) throw new ApiError(400, "the demo has no recorded start preview for this request");
+    const previews = recordedEffectiveScenario().start_previews;
+    // An unrecorded request gets the scenario's default case: the recorded no-harness, no-override start.
+    const hit = previews.find(p => previewRequestKey(p.request) === key) ?? previews.find(p => previewRequestKey(p.request) === previewRequestKey({ harness: null, credential_override: null })) ?? previews[0];
     return delay(structuredClone(hit.response), 60);
   },
   putMySettings: async (patch: UserSettingsPatch) => {

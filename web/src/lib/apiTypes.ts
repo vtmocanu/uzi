@@ -244,6 +244,24 @@ export interface CatalogDefault {
   observed_at: string | null;
 }
 
+/** PRD #3254: the closed provenance vocabularies of the effective-settings view, mirroring the
+ *  Go constants (handler/effective_settings.go, workersvc/effective_settings.go) and the
+ *  source_labels of fixtures/model-settings/contract.json. */
+type EffectiveModelSource =
+  | "user_default" | "instance_default" | "builtin" | "schedule_pin" | "template"
+  | "cross_check_pin" | "cross_check_worker_default";
+type EffectiveEffortSource =
+  | "user_default" | "builtin" | "runtime_default" | "catalog_default" | "cross_check_pin" | "cross_check_default";
+type EffectiveHarnessSource = "run_override" | "schedule_pin" | "user_default" | "automatic" | "chosen_at_create";
+type EffectiveCredentialSource =
+  | "claim_selection" | "codex_default_credential" | "chosen_at_create" | "auto_selection" | "owner_default" | "token_override";
+type EffectiveRefusal =
+  | "no_credential_for_harness" | "no_usable_credential" | "credential_disabled" | "credential_not_found"
+  | "credential_override_harness_unsupported" | "credential_override_invalid";
+type EffectiveRefusalDetail = "credential_disabled" | "codex_pool_unavailable";
+type EffectiveModelSetting = "worker_model" | "judge_model" | "summary_model" | "task_review_model" | "cross_check_plan" | "cross_check_code";
+type EffectiveEffortSetting = "worker_effort" | "task_review_effort" | "cross_check_plan" | "cross_check_code";
+
 /** PRD #3254: a supplied value that does not apply (a schedule's model pin on the other harness). */
 export interface EffectiveIgnored {
   value: string;
@@ -254,7 +272,8 @@ export interface EffectiveIgnored {
  *  plus which setting it is and when the value is fixed. `resolved_model` "" means the runtime
  *  decides (note `sdk_default`). `fixed_at` is create or claim. */
 export interface EffectiveModelCell extends ModelSettingCell {
-  setting: string;
+  source: EffectiveModelSource;
+  setting: EffectiveModelSetting;
   fixed_at: string;
   ignored: EffectiveIgnored | null;
   notes: string[];
@@ -262,7 +281,8 @@ export interface EffectiveModelCell extends ModelSettingCell {
 
 /** PRD #3254: one harness's effort cell (the shared EffortSettingCell, flattened). */
 export interface EffectiveEffortCell extends EffortSettingCell {
-  setting: string;
+  source: EffectiveEffortSource;
+  setting: EffectiveEffortSetting;
   fixed_at: string;
   notes: string[];
 }
@@ -271,7 +291,7 @@ export interface EffectiveEffortCell extends EffortSettingCell {
  *  `kind` is anthropic or codex; `auth_mode` (codex only) is subscription or api_key. */
 export interface Credential {
   kind: string;
-  source: string;
+  source: EffectiveCredentialSource;
   fixed_at: string;
   auth_mode: string | null;
 }
@@ -280,7 +300,7 @@ export interface Credential {
  *  creation-time policy (a note: automatic_weekly_reset or overflow) picks it at creation. */
 export interface HarnessValue {
   value: string | null;
-  source: string;
+  source: EffectiveHarnessSource;
   fixed_at: string;
   notes: string[];
 }
@@ -288,16 +308,16 @@ export interface HarnessValue {
 export interface EffectiveHarness {
   harness: Harness;
   usable: boolean;
-  refusal: string | null;
-  refusal_detail: string | null;
+  refusal: EffectiveRefusal | null;
+  refusal_detail: EffectiveRefusalDetail | null;
   credential: Credential | null;
 }
 
 export interface EffectiveStartChoice {
   choice: string;
   harness: HarnessValue | null;
-  refusal: string | null;
-  refusal_detail: string | null;
+  refusal: EffectiveRefusal | null;
+  refusal_detail: EffectiveRefusalDetail | null;
   anthropic_override_allowed: boolean;
 }
 
@@ -327,8 +347,8 @@ export interface StartPreviewRequest {
 export interface StartPreviewAlternative {
   harness: string;
   credential: Credential | null;
-  refusal: string | null;
-  refusal_detail: string | null;
+  refusal: EffectiveRefusal | null;
+  refusal_detail: EffectiveRefusalDetail | null;
 }
 
 /** The start-preview response. When the harness is chosen at creation, `credential` is null and
@@ -337,8 +357,8 @@ export interface StartPreviewAlternative {
 export interface StartPreview {
   version: number;
   harness: HarnessValue | null;
-  refusal: string | null;
-  refusal_detail: string | null;
+  refusal: EffectiveRefusal | null;
+  refusal_detail: EffectiveRefusalDetail | null;
   credential: Credential | null;
   alternatives?: StartPreviewAlternative[];
 }

@@ -3207,12 +3207,18 @@ such choice:
 ```text
 start (default) is chosen when the run is created; it can run on:
   claude: chosen when the run starts
-  codex: refused: no_usable_credential
+  codex: your default Codex credential
 ```
 
-Each line is a harness's credential source label, or `refused:` and its token
-(with the detail in parentheses). The CLI shows the `GET` only; it does not call
-the start-preview, and schedule preview (`--schedule`) is not built yet.
+Each line is a harness's credential source label (a Codex account picked by
+headroom reads `chosen when the run is created`), or `refused:` and its token
+(with the detail in parentheses) for a harness that is not usable. A start
+choice is chosen at creation only when both harnesses are usable, so in practice
+both lines show credential labels. A harness that is not usable shows up in the
+`start (claude)` / `start (codex)` rows as `refused: no_credential_for_harness`,
+and `start (default)` shows `refused: no_usable_credential` when neither is
+usable. The CLI shows the `GET` only; it does not call the start-preview, and
+schedule preview (`--schedule`) is not built yet.
 
 `--json` carries every key of the settings read plus an `effective` key holding
 the view's body: `version`, `harnesses`, `start`, `models`, `efforts` and

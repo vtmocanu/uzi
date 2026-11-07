@@ -358,6 +358,24 @@ Subagent pins and repository-defined agents are not part of this view.
 
 Two creation-time policies can choose the harness only when the run is created, from live usage that this read-only view does not consult: the **automatic** default harness (the soonest weekly reset) and the optional [overflow](./worker-model.md#overflow-to-the-other-harness). When one applies, the harness `value` is null, its `source` is `chosen_at_create`, and the cell carries the policy as note `automatic_weekly_reset` or `overflow`. The view then promises no harness and no harness-specific credential.
 
+### What can change before the claim
+
+The view is a prediction made now. Between the read and the claim, these can still move:
+
+- **Settings, credentials and templates, until the claim.** Anything fixed at `claim` (models, efforts, the Anthropic token) reads your stored choices, the credentials and the `lead` template again when a worker claims the run, so an edit made after the read applies. Only the `create`-fixed values (the harness and a Codex credential) are frozen at creation.
+- **The Anthropic token.** A Claude run's token is `claim_selection`: it is selected when a worker claims the run, so the view names no token, only that the claim chooses it.
+- **The worker image during a roll.** The view is computed by the API; the claim is served by whichever worker takes the run. While a new worker image rolls out the fleet can mix versions, so a claim can be handled by a worker that behaves differently from what the API predicted.
+- **The SDK default.** A cell noted `sdk_default` sends no model, so the Claude SDK or your account decides at run time; the view cannot name that model.
+
+### Cache semantics
+
+The judge and run-summary instance defaults come from the per-process instance settings cache (`SETTINGS_CACHE_TTL`, default `5s`, see [Admin settings](./admin-settings.md)). A replica that serves an admin write drops its cache, so its next read sees the change; other replicas see it within one TTL. If a refresh fails:
+
+- A **warm** cache (a snapshot still held from an earlier successful read) serves that last map, so the view stays correct to within the TTL.
+- A **cold** cache (nothing read yet, for example right after a restart), or a read **right after an admin write** (the write dropped the snapshot), has nothing to fall back on and fails. The view then does not fail: the built-in applies to the instance tier and the affected judge and summary cells carry note `instance_settings_unavailable`.
+
+A store error while reading the Codex [catalog default](./worker-effort.md#what-the-codex-catalog-default-means) for an effort cell also does not fail the view: that cell's `catalog_default` degrades to unknown. Any other store error fails the whole request with a 500 rather than returning a partial body.
+
 ### `POST /api/me/effective-settings/start-preview`
 
 Predicts a manual issue start with a given harness and token choice, validated by the same code creation runs, without creating a run. Request body (strict, at most 1 KiB; unknown fields are rejected):

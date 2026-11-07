@@ -113,7 +113,8 @@ describe("previewStartSettings", () => {
     expect(got.harness).toMatchObject({ value: "claude", source: "run_override" });
   });
 
-  it("rejects a request the corpus does not record instead of inventing an answer", async () => {
-    await expect(mockApi.previewStartSettings({ harness: "codex", credential_override: { mode: "default" } })).rejects.toMatchObject({ status: 400 });
+  it("serves the scenario's default case for a request the corpus does not record", async () => {
+    const got = await mockApi.previewStartSettings({ harness: "codex", credential_override: { mode: "default" } });
+    expect(got).toEqual(behavior.scenarios[0].start_previews[0].response);
   });
 });

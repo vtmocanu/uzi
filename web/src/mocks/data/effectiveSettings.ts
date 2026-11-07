@@ -1086,7 +1086,7 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
           },
           "refusal": null,
           "refusal_detail": null,
-          "anthropic_override_allowed": true
+          "anthropic_override_allowed": false
         },
         {
           "choice": "claude",
