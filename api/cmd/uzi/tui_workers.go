@@ -812,9 +812,11 @@ func (m tuiModel) workerFleetTitleLines(title string, hideIdleCrossChecks bool) 
 }
 
 const (
-	workerCPUWidth       = 5  // includes the stale prefix in ~100%
-	workerDiskWidth      = 19 // stale prefix, eight-cell label, four-cell bar, 100%
-	workerMemoryMinWidth = 9  // includes ~12.0/16G
+	workerCPUWidth          = 5  // includes the stale prefix in ~100%
+	workerDiskWidth         = 19 // stale prefix, eight-cell label, four-cell bar, 100%
+	workerMemoryMinWidth    = 9  // includes ~12.0/16G
+	workerUptimeWidth       = 6  // 23h59m / 99d23h, the detail header's format
+	workerAttentionMinWidth = 16 // "✕ outbox blocked"
 )
 
 func workerMemoryText(w apitypes.WorkerDTO) string {
@@ -830,7 +832,7 @@ func workerMemoryText(w apitypes.WorkerDTO) string {
 
 type workerTableWidths struct {
 	memory, version, kind, intake int
-	dense                         bool
+	dense, uptime                 bool
 }
 
 // Measure the filtered fleet once; the header and every row share these widths.
@@ -861,6 +863,13 @@ func (m tuiModel) workerTableWidths(rows []workerRow, width int) workerTableWidt
 	}
 	if columns.intake > 0 {
 		fixed += columns.intake + 1
+	}
+	// UP is the first dense column to go: it shows only when VERSION keeps its natural
+	// width and ATTENTION keeps room for its longest short label.
+	natural := min(columns.version, 18)
+	if columns.dense && width-fixed-natural-(workerUptimeWidth+1) >= workerAttentionMinWidth {
+		columns.uptime = true
+		fixed += workerUptimeWidth + 1
 	}
 	columns.version = max(1, min(columns.version, 18, max(1, width-fixed-4)))
 	return columns
@@ -921,6 +930,9 @@ func (m tuiModel) workerRowLine(r workerRow, selected bool, width int, columns w
 		}
 		ver := clampVisual(m.renderer.Plain(t.workerVersion, versionWidth), max(0, versionWidth-visualWidth(marker))) + marker
 		fields = append(fields, cell(cpu, workerCPUWidth, cpuC), cell(mem, columns.memory, memC), cell(disk, workerDiskWidth, diskC), cell(ver, versionWidth, verC), cell(workerAge(r.w.LastHeartbeatAt, now), 3, m.pal.faintC))
+		if columns.uptime {
+			fields = append(fields, cell(workerUptimeCell(r.w, now), workerUptimeWidth, m.pal.faintC))
+		}
 	}
 	if columns.intake > 0 {
 		fields = append(fields, cell(m.renderer.Plain(workerIntakeLabel(r.w), columns.intake), columns.intake, m.pal.faintC))
@@ -1004,6 +1016,9 @@ func (m tuiModel) renderWorkersBody(height int, full bool) string {
 	cols = append(cols, padVisual("STATE", 10), padVisual("KIND", columns.kind), padVisual("RUNS", 5), padVisual("CHECKS", 6))
 	if columns.dense {
 		cols = append(cols, padVisual("CPU", workerCPUWidth), padVisual("MEM", columns.memory), padVisual("DISK (worst)", workerDiskWidth), padVisual("VERSION", columns.version), padVisual("HB", 3))
+		if columns.uptime {
+			cols = append(cols, padVisual("UP", workerUptimeWidth))
+		}
 	}
 	if columns.intake > 0 {
 		cols = append(cols, padVisual("INTAKE", columns.intake))
@@ -1062,4 +1077,13 @@ func (m tuiModel) workerOwnerCell(r workerRow) string {
 	owner := m.renderer.Plain(r.workerOwner, 200)
 	local, _, _ := strings.Cut(owner, "@")
 	return clampVisual(local, 7)
+}
+
+// workerUptimeCell is the list's UP cell: the detail header's "up" value, shown
+// only while the worker is online (offline or unknown since reads "—").
+func workerUptimeCell(w apitypes.WorkerDTO, now time.Time) string {
+	if w.Status != "online" || w.OnlineSince == nil {
+		return "—"
+	}
+	return workerUptime(w.OnlineSince, now)
 }

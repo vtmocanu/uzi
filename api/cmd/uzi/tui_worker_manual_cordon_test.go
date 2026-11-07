@@ -309,7 +309,7 @@ func TestTUIWorkerManualIntakeColumns(t *testing.T) {
 						return visualWidth(line[:i])
 					}
 					if column(header, "ATTENTION") != column(warning, "✕ outbox") ||
-						column(header, "ATTENTION") != column(ordinary, "—") {
+						column(header, "ATTENTION") != visualWidth(ordinary[:strings.LastIndex(ordinary, "—")]) {
 						t.Fatalf("attention columns differ:\n%s\n%s\n%s", header, warning, ordinary)
 					}
 					dense := width >= 120 && (intake == "none" || width >= 160)
