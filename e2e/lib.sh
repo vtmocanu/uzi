@@ -72,6 +72,76 @@ storage_diagnostic_snapshot() {
   return 0
 }
 
+# Point-in-time agent log snapshot, taken just before a lifecycle op (kill/stop/recreate) discards the
+# container. Logs emitted between the snapshot and the op are not guaranteed captured; this is not a
+# continuous collector. Files in $RUNROOT/artifacts/agent-logs/ (not artifacts/<NN-slug>/, whose
+# existence makes the driver skip its FAIL dump): NNNN-<phase>-<label>.log = captured logs (the only
+# success), .missing = capture failed (contents = reason), .absent = no agent container, expected
+# (absent-ok). Always returns 0 and guards every command, so it is safe bare under set -e and in traps.
+capture_agent_logs() {
+  local phase="${1:-}" label="${2:-}" mode="${3:-}" dir stem slot part log out k n=0 tries=0 rc reason=""
+  if [ -z "${RUNROOT:-}" ] || ! declare -p COMPOSE >/dev/null 2>&1; then
+    echo "MISSING-EVIDENCE: agent logs $phase/$label: no compose session" >&2
+    return 0
+  fi
+  dir="$RUNROOT/artifacts/agent-logs"
+  if ! mkdir -p "$dir" 2>/dev/null; then
+    echo "MISSING-EVIDENCE: agent logs $phase/$label: write failure (cannot create $dir)" >&2
+    return 0
+  fi
+  for slot in "$dir"/.slot-*; do
+    [ -e "$slot" ] || continue
+    k="${slot##*.slot-}"
+    case "$k" in '' | *[!0-9]*) continue ;; esac
+    if [ "$((10#$k))" -gt "$n" ]; then n=$((10#$k)); fi
+  done
+  while :; do
+    n=$((n + 1))
+    tries=$((tries + 1))
+    slot="$(printf '%s/.slot-%04d' "$dir" "$n")"
+    if ( set -C; : > "$slot" ) 2>/dev/null; then break; fi
+    if [ "$tries" -ge 1000 ]; then
+      echo "MISSING-EVIDENCE: agent logs $phase/$label: write failure (no free snapshot slot)" >&2
+      return 0
+    fi
+  done
+  stem="$(printf '%04d-%s-%s' "$n" "$phase" "$label")"
+  part="$dir/$stem.log.part"
+  log="$dir/$stem.log"
+  rc=0
+  out="$("${COMPOSE[@]}" ps -a -q agent 2>/dev/null)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    reason="read failure: compose ps exit $rc"
+  elif [ -z "$out" ]; then
+    if [ "$mode" = absent-ok ]; then
+      if { printf 'agent container absent (expected)\n' > "$dir/$stem.absent"; } 2>/dev/null; then
+        echo "agent logs $phase/$label: agent container absent (expected); no snapshot" >&2
+        return 0
+      fi
+      reason="write failure (absent marker)"
+    else
+      reason="agent container absent"
+    fi
+  elif ! ( : > "$part" ) 2>/dev/null; then
+    reason="write failure"
+  else
+    "${COMPOSE[@]}" logs --no-color agent > "$part" 2>/dev/null || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      reason="read failure: compose logs exit $rc"
+    elif [ ! -s "$part" ]; then
+      reason="empty log output"
+    else
+      mv -n "$part" "$log" 2>/dev/null || true
+      if [ ! -f "$log" ] || [ -e "$part" ]; then reason="write failure"; fi
+    fi
+  fi
+  [ -z "$reason" ] && return 0
+  rm -f "$part" 2>/dev/null || true
+  printf '%s\n' "$reason" > "$dir/$stem.missing" 2>/dev/null || true
+  echo "MISSING-EVIDENCE: agent logs $phase/$label: $reason" >&2
+  return 0
+}
+
 # Retain complete build output; show only a bounded failure tail in the terminal.
 compose_build_logged() {
   local status
@@ -163,6 +233,7 @@ cleanup() {
     exit $code
   fi
   say "tearing down (down -v)"
+  capture_agent_logs teardown before-down absent-ok
   "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
   # --- rundir retention on a RED run (PRD #966 M3, D5) ------------------------
   # A red run KEEPS its scratch dir so the per-phase artifacts/ the driver captured

@@ -196,6 +196,25 @@ func TestCrossCheckHistoryMapper(t *testing.T) {
 	}
 }
 
+// A Plan verdict recorded before custody loss reaches the mapper as passed (#4037):
+// execution comes from the completed child, historical and interrupted_at survive.
+func TestCrossCheckHistoryMapperDecidedBeforeInterruption(t *testing.T) {
+	interrupted := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
+	row := store.CrossCheckHistoryAttemptsRow{
+		Stage: "plan", Result: "approve", Category: "passed", ReasonClass: "approve", Historical: true,
+		ChildID: pgtype.UUID{Bytes: uuid.New(), Valid: true}, ChildStatus: pgtype.Text{String: "completed", Valid: true},
+		DecidedAt:     pgtype.Timestamptz{Time: interrupted.Add(-11 * time.Minute), Valid: true},
+		InterruptedAt: pgtype.Timestamptz{Time: interrupted, Valid: true},
+	}
+	got := crossCheckHistoryAttempt(row)
+	if got.Execution != "finished" || got.Review != "approved" || !got.Historical {
+		t.Fatalf("execution=%s review=%s historical=%t", got.Execution, got.Review, got.Historical)
+	}
+	if got.InterruptedAt == nil || !got.InterruptedAt.Equal(interrupted) {
+		t.Fatalf("interrupted_at not echoed: %v", got.InterruptedAt)
+	}
+}
+
 func TestCrossCheckHistorySanitizationAndEnvelope(t *testing.T) {
 	token := "glpat-" + strings.Repeat("a", 20)
 	in := "hello\n\t\u202e\u200d\x1b" + token + " world"

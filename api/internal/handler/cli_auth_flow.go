@@ -241,6 +241,19 @@ func (h *Handler) CLIAuthPoll(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op after a successful Commit; the roll-back-on-mismatch path relies on it
 	qtx := h.q.WithTx(tx)
 
+	// Lock the request's user row BEFORE the claim: users -> cli_auth_requests, the same
+	// order as an account-reset redeem (users FOR UPDATE, then deny the user's approved
+	// requests). Claiming first would hold the request row while CreateCLIToken's FK
+	// check waits on users, deadlocking (40P01) against the redeem. A pending or unknown
+	// request has no user to lock (ErrNoRows) and falls through to the claim as before.
+	lockedUser, err := qtx.LockCLIAuthRequestUserKeyShare(ctx, id)
+	locked := err == nil
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		slog.Error("cli auth poll: lock user", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
 	claimed, err := qtx.ClaimCLIAuthRequest(ctx, id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// No approved-and-unexpired row: report the poll status (pending → keep polling,
@@ -276,6 +289,21 @@ func (h *Handler) CLIAuthPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := uuid.UUID(claimed.UserID.Bytes)
+	if !locked {
+		// Approved between the lock read (no user yet) and the claim: this tx holds the
+		// request row without the users row, the deadlock-prone order. Roll the claim back
+		// (the row returns to 'approved') and report pending; the next poll locks first.
+		_ = tx.Rollback(ctx)
+		h.writeCLIPollStatus(w, ctx, id)
+		return
+	}
+	if userID != lockedUser {
+		// user_id never changes once approved, so this cannot happen; refuse rather than
+		// mint for a user whose row this tx did not lock.
+		slog.Error("cli auth poll: claimed user differs from locked user", "request_id", id)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
 	user, err := qtx.GetUserByID(ctx, userID)
 	if err != nil {
 		slog.Error("cli auth poll: load user", "error", err)
@@ -472,11 +500,15 @@ func (h *Handler) CLIAuthApprove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	n, err := h.q.ApproveCLIAuthRequest(ctx, store.ApproveCLIAuthRequestParams{
+	n, err := h.approveCLIAuthFenced(ctx, user, store.ApproveCLIAuthRequestParams{
 		ID:     id,
 		UserID: pgtype.UUID{Bytes: user.ID, Valid: true},
 		Scope:  scope,
 	})
+	if errors.Is(err, errCLIApproveSessionChanged) {
+		httpx.Error(w, http.StatusUnauthorized, "session revoked")
+		return
+	}
 	if err != nil {
 		slog.Error("cli auth approve", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -488,6 +520,42 @@ func (h *Handler) CLIAuthApprove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"status": "approved"})
+}
+
+// errCLIApproveSessionChanged means the approving user's token_version no longer
+// matches the session that is approving.
+var errCLIApproveSessionChanged = errors.New("cli auth approve: session changed")
+
+// approveCLIAuthFenced approves in one transaction that first share-locks the
+// approving user's row and re-checks the session's token_version against it
+// (PRD #3989). An account reset redemption holds that row FOR UPDATE and bumps the
+// token_version, so an approve racing it either waits and is refused, or wins and
+// is then denied by the redemption's own DenyApprovedCLIAuthRequestsForUser.
+func (h *Handler) approveCLIAuthFenced(ctx context.Context, user store.User, arg store.ApproveCLIAuthRequestParams) (int64, error) {
+	tx, err := h.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after a successful Commit
+	qtx := h.q.WithTx(tx)
+	version, err := qtx.LockUserTokenVersionForShare(ctx, user.ID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, errCLIApproveSessionChanged
+	}
+	if err != nil {
+		return 0, err
+	}
+	if version != user.TokenVersion {
+		return 0, errCLIApproveSessionChanged
+	}
+	n, err := qtx.ApproveCLIAuthRequest(ctx, arg)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // CLIAuthDeny marks a pending request denied (POST /api/auth/cli/deny, RequireAuth +

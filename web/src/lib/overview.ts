@@ -130,6 +130,7 @@ const PARK_TABLE: Record<string, "automatic" | "owner"> = {
   base_attestation_missing: "owner",
   completion_blocked: "owner",
   credential_disabled: "owner",
+  credentials_reset: "owner",
   retained_recovery_adoption_failed: "owner",
   retained_recovery_held: "owner",
   retained_recovery_unknown: "owner",
@@ -211,14 +212,15 @@ const DECISION_VERB: Record<DecisionKind, RunDecisionItem["verb"]> = {
   pr: "Review PR",
 };
 
-// The viewer's decision items, grouped plan, question, park, pr and oldest first inside a
+// The viewer's decision items, grouped held, plan, question, park, pr (#4041: held work and
+// plans lead, open PRs come last) and oldest first inside a
 // group. The groups are disjoint by raw status, so no run-level guard is needed: plan is
 // awaiting_approval, question is awaiting_input / awaiting_followup, pr is completed, and
 // park is a PARKED_STATUSES status, or an account cooldown, which parkDisposition always
 // calls "automatic" and so never lands in the owner-only park group. Callers pass ONLY the
 // viewer's own rows (listRuns), never the admin rows.
 //
-// `holds` (the owner's custody holds) adds exactly one held-work item, after park and before pr,
+// `holds` (the owner's custody holds) adds exactly one held-work item, first of all,
 // when the aggregate says an open hold needs a decision. The count is the aggregate's
 // decision_needed; the list only names the oldest decision hold for the row's age and, for a
 // single decision, its run.
@@ -243,13 +245,81 @@ export function overviewDecisions(
     out.push(...items);
   };
   const since = (r: RunSummaryItem) => r.status_since ?? r.created_at;
+  const held = heldDecision(holds);
+  if (held) out.push(held);
   add("plan", ownRuns.filter((r) => r.status === "awaiting_approval" && !r.is_revising), since);
   add("question", ownRuns.filter((r) => r.status === "awaiting_input" || r.status === "awaiting_followup"), since);
   add("park", ownRuns.filter((r) => isParked(r) && parkDisposition(r) === "owner"), since);
-  const held = heldDecision(holds);
-  if (held) out.push(held);
   add("pr", openPrs(ownRuns), (r) => r.finished_at ?? r.status_since ?? r.created_at);
   return out;
+}
+
+// One rendered row of the Needs-your-decision card (#4041): the held-work item, a lone run
+// item, or several run items of one kind collapsed into a group.
+export type DecisionRow =
+  | { type: "held"; item: HeldDecisionItem }
+  | { type: "single"; item: RunDecisionItem }
+  | { type: "group"; kind: DecisionKind; items: RunDecisionItem[] };
+
+// Groups run items by kind in first-appearance order, keeping item order inside a kind.
+// Open PRs always group (even one); plan, question and park group from two items up.
+export function decisionRows(items: ReadonlyArray<DecisionItem>): DecisionRow[] {
+  const rows: DecisionRow[] = [];
+  const groups = new Map<DecisionKind, RunDecisionItem[]>();
+  for (const item of items) {
+    if (item.kind === "held") {
+      rows.push({ type: "held", item });
+      continue;
+    }
+    const existing = groups.get(item.kind);
+    if (existing) {
+      existing.push(item);
+    } else {
+      const list = [item];
+      groups.set(item.kind, list);
+      // Placeholder resolved below once the kind's final size is known.
+      rows.push({ type: "group", kind: item.kind, items: list });
+    }
+  }
+  return rows.map((row) => {
+    if (row.type === "group" && row.kind !== "pr" && row.items.length === 1) {
+      return { type: "single", item: row.items[0] };
+    }
+    return row;
+  });
+}
+
+// Group headline copy (#4041), singular for one item.
+export function groupTitle(kind: DecisionKind, n: number): string {
+  const one = n === 1;
+  switch (kind) {
+    case "plan":
+      return one ? "1 plan is ready for review" : `${n} plans are ready for review`;
+    case "question":
+      return one ? "1 run needs your input" : `${n} runs need your input`;
+    case "park":
+      return one ? "1 run waits on you" : `${n} runs wait on you`;
+    case "pr":
+      return one ? "1 pull request is open for your review" : `${n} pull requests are open for your review`;
+  }
+}
+
+export const GROUP_BUTTON: Record<DecisionKind, string> = {
+  plan: "Review plans",
+  question: "Open runs",
+  park: "Resume runs",
+  pr: "Review PRs",
+};
+
+// How many items a collapsed group previews (#4041).
+export const GROUP_PREVIEW = 3;
+
+// The plan row's detail line (#4041). A candidate list (even an empty one) wins over the
+// frozen milestones; only a null or absent candidate falls back.
+export function planDetail(run: Pick<RunSummaryItem, "milestones" | "milestones_candidate">): string {
+  const chosen = Array.isArray(run.milestones_candidate) ? run.milestones_candidate : run.milestones;
+  if (!Array.isArray(chosen) || chosen.length === 0) return "Plan ready";
+  return `Plan ready, ${plural(chosen.length, "milestone", "milestones")}`;
 }
 
 function heldDecision(holds: RecoveryCustodyHolds | null | undefined): HeldDecisionItem | null {

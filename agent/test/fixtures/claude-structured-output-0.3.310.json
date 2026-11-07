@@ -1,0 +1,1676 @@
+{
+  "_provenance": "real frames from @anthropic-ai/claude-agent-sdk 0.3.310 / native CLI 2.1.310, recorded 2026-11-07 by test/claude-structured-output.probe.ts capture; model turns scripted by a loopback Anthropic Messages stub because no Anthropic credential is available in the worker; production buildClaudeCrossCheckOptions (model passed through its own argument; the code session also passes an allow-all recording toolBudgetHook) with probe-local outputFormat (PLAN/CODE_VERDICT_SCHEMA), probe-local abortController with a 60 s timeout, probe-local replacement of only the matcher-less tool gate (allows exactly StructuredOutput, delegates the rest), probe-local init latch opening after a carrier-aware init check, env changed only by ANTHROPIC_BASE_URL (+ auth used) and HOME, pathToClaudeCodeExecutable set; auth: the production CLAUDE_CODE_OAUTH_TOKEN placeholder was accepted against the stub; spawnClaudeCodeProcess left as built; ids/timestamps/paths normalized; repeat with: node --import tsx test/claude-structured-output.probe.ts capture <absolute CLI path>",
+  "sessions": {
+    "plan_retry": {
+      "stage": "plan",
+      "threw": null,
+      "frames": [
+        {
+          "type": "system",
+          "subtype": "init",
+          "cwd": "<checkout>",
+          "session_id": "<uuid>",
+          "tools": [
+            "Glob",
+            "Grep",
+            "Read",
+            "StructuredOutput"
+          ],
+          "mcp_servers": [],
+          "model": "claude-test",
+          "permissionMode": "bypassPermissions",
+          "slash_commands": [
+            "doctor",
+            "agents",
+            "auto-mode-setup",
+            "autocompact",
+            "clear",
+            "color",
+            "compact",
+            "config",
+            "output-style",
+            "context",
+            "effort",
+            "fast",
+            "focus",
+            "heapdump",
+            "init",
+            "mcp",
+            "model",
+            "__remote-workflow",
+            "workflow-launch-exec",
+            "reload-plugins",
+            "reload-skills",
+            "rename",
+            "security-review",
+            "usage",
+            "insights",
+            "recap",
+            "goal",
+            "list-agents",
+            "team-onboarding"
+          ],
+          "terminal_slash_commands": [
+            "doctor",
+            "color",
+            "focus",
+            "reload-plugins"
+          ],
+          "apiKeySource": "none",
+          "claude_code_version": "2.1.310",
+          "output_style": "default",
+          "agents": [
+            "claude",
+            "general-purpose",
+            "statusline-setup"
+          ],
+          "skills": [
+            "doctor"
+          ],
+          "plugins": [],
+          "capabilities": [
+            "interrupt_receipt_v1",
+            "interrupt_cancel_queued_v1",
+            "interrupt_send_now_v1",
+            "interrupt_requeue_taken_v1",
+            "msg_lifecycle_v1",
+            "request_marker_lists_v1",
+            "lifecycle_wakeup_source_v1",
+            "sdk_mcp_tools_list_changed",
+            "sdk_mcp_manifests",
+            "mcp_read_resource_v1",
+            "mcp_tool_ui_meta_v1",
+            "ui_surface_v1",
+            "mcp_call_result_not_for_model_v1"
+          ],
+          "analytics_disabled": true,
+          "product_feedback_disabled": true,
+          "uuid": "<uuid>",
+          "memory_paths": {
+            "auto": "<home>/.claude/projects/<repo>/memory/"
+          },
+          "original_cwd": "<checkout>",
+          "additional_directories": [],
+          "messaging_socket_path": "<socket>",
+          "fast_mode_state": "off",
+          "fast_mode_disabled_reason": "sdk_opt_in_required",
+          "per_turn_effort_active": false,
+          "view_mode": "default"
+        },
+        {
+          "type": "assistant",
+          "message": {
+            "id": "msg_stub_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_read_1",
+                "name": "Read",
+                "input": {
+                  "file_path": "<checkout>/a.ts"
+                }
+              }
+            ],
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 10,
+              "output_tokens": 1
+            },
+            "context_management": null
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>"
+        },
+        {
+          "type": "rate_limit_event",
+          "rate_limit_info": {
+            "status": "allowed",
+            "isUsingOverage": false
+          },
+          "uuid": "<uuid>",
+          "session_id": "<uuid>"
+        },
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "tool_use_id": "toolu_read_1",
+                "type": "tool_result",
+                "content": "1\texport const answer = 42;\n2\t"
+              }
+            ]
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>",
+          "tool_use_result": {
+            "type": "text",
+            "file": {
+              "filePath": "<checkout>/a.ts",
+              "content": "export const answer = 42;\n",
+              "numLines": 2,
+              "startLine": 1,
+              "totalLines": 2
+            }
+          },
+          "tool_result_meta": [
+            {
+              "id": "toolu_read_1",
+              "permission_decision": {
+                "decision": "accept",
+                "source": "config",
+                "reason_type": "mode"
+              }
+            }
+          ]
+        },
+        {
+          "type": "assistant",
+          "message": {
+            "id": "msg_stub_2",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [
+              {
+                "type": "text",
+                "text": "Verdict: approve"
+              }
+            ],
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 10,
+              "output_tokens": 1
+            },
+            "context_management": null
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>"
+        },
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "[structured-output-enforce] You MUST call the StructuredOutput tool to complete this request. Call this tool now."
+              }
+            ]
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>",
+          "isSynthetic": true
+        },
+        {
+          "type": "assistant",
+          "message": {
+            "id": "msg_stub_3",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_so_invalid_1",
+                "name": "StructuredOutput",
+                "input": {
+                  "verdict": "maybe"
+                }
+              }
+            ],
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 10,
+              "output_tokens": 1
+            },
+            "context_management": null
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>"
+        },
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "content": "Output does not match required schema: root: must have required property 'summary', root: must have required property 'items', /verdict: must be equal to one of the allowed values: [\"approve\",\"revise\",\"block\"]",
+                "is_error": true,
+                "tool_use_id": "toolu_so_invalid_1"
+              }
+            ]
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>",
+          "tool_use_result": "Error: Output does not match required schema: root: must have required property 'summary', root: must have required property 'items', /verdict: must be equal to one of the allowed values: [\"approve\",\"revise\",\"block\"]",
+          "tool_result_meta": [
+            {
+              "id": "toolu_so_invalid_1",
+              "permission_decision": {
+                "decision": "accept",
+                "source": "config",
+                "reason_type": "mode"
+              }
+            }
+          ]
+        },
+        {
+          "type": "assistant",
+          "message": {
+            "id": "msg_stub_4",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_so_valid_1",
+                "name": "StructuredOutput",
+                "input": {
+                  "verdict": "approve",
+                  "summary": "The plan matches the checked files.",
+                  "items": [
+                    {
+                      "file": "a.ts",
+                      "severity": "info",
+                      "summary": "Anchor confirmed",
+                      "rationale": "Read a.ts"
+                    }
+                  ]
+                }
+              }
+            ],
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 10,
+              "output_tokens": 1
+            },
+            "context_management": null
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>"
+        },
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "tool_use_id": "toolu_so_valid_1",
+                "type": "tool_result",
+                "content": "Structured output provided successfully"
+              }
+            ]
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>",
+          "tool_use_result": "Structured output provided successfully",
+          "tool_result_meta": [
+            {
+              "id": "toolu_so_valid_1",
+              "permission_decision": {
+                "decision": "accept",
+                "source": "config",
+                "reason_type": "mode"
+              }
+            }
+          ]
+        },
+        {
+          "duration_api_ms": 0,
+          "stop_reason": "tool_use",
+          "session_id": "<uuid>",
+          "total_cost_usd": 0.00028000000000000003,
+          "usage": {
+            "input_tokens": 40,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "output_tokens": 20,
+            "output_tokens_details": {
+              "thinking_tokens": 0
+            },
+            "server_tool_use": {
+              "web_search_requests": 0,
+              "web_fetch_requests": 0
+            },
+            "service_tier": "standard",
+            "cache_creation": {
+              "ephemeral_1h_input_tokens": 0,
+              "ephemeral_5m_input_tokens": 0
+            },
+            "inference_geo": "",
+            "iterations": [],
+            "speed": "standard",
+            "fallback_credit": null
+          },
+          "modelUsage": {
+            "claude-test": {
+              "inputTokens": 40,
+              "outputTokens": 20,
+              "cacheReadInputTokens": 0,
+              "cacheCreationInputTokens": 0,
+              "webSearchRequests": 0,
+              "costUSD": 0.00028000000000000003,
+              "contextWindow": 200000,
+              "maxOutputTokens": 32000,
+              "thinkingTokens": 0,
+              "canonicalModel": "claude-test",
+              "provider": "firstParty",
+              "costBasis": "unknown"
+            }
+          },
+          "permission_denials": [],
+          "terminal_reason": "completed",
+          "fast_mode_state": "off",
+          "fast_mode_disabled_reason": "sdk_opt_in_required",
+          "subagent_stats": {
+            "spawned": 0,
+            "requested": {
+              "background": 0,
+              "foreground": 0,
+              "unset": 0
+            },
+            "started_in_background": 0,
+            "max_depth": 0,
+            "spawned_by_subagents": 0,
+            "completed": 0,
+            "failed": 0,
+            "killed": {
+              "parent": 0,
+              "user": 0,
+              "system": 0
+            },
+            "refused": {
+              "depth_limit": 0,
+              "concurrency_limit": 0,
+              "budget": 0
+            },
+            "by_type": {}
+          },
+          "safety_stops": 0,
+          "is_error": false,
+          "num_turns": 5,
+          "subtype": "success",
+          "api_error_status": null,
+          "result": "{\"verdict\":\"approve\",\"summary\":\"The plan matches the checked files.\",\"items\":[{\"file\":\"a.ts\",\"severity\":\"info\",\"summary\":\"Anchor confirmed\",\"rationale\":\"Read a.ts\"}]}",
+          "structured_output": {
+            "verdict": "approve",
+            "summary": "The plan matches the checked files.",
+            "items": [
+              {
+                "file": "a.ts",
+                "severity": "info",
+                "summary": "Anchor confirmed",
+                "rationale": "Read a.ts"
+              }
+            ]
+          },
+          "ttft_ms": 0,
+          "type": "result",
+          "duration_ms": 0,
+          "uuid": "<uuid>",
+          "ttft_stream_ms": 0,
+          "time_to_request_ms": 0,
+          "first_content_frame_ms": 0,
+          "queued_turn_count": 0,
+          "result_index": 0,
+          "model_usage_since_last_result": {
+            "claude-test": {
+              "inputTokens": 40,
+              "outputTokens": 20,
+              "cacheReadInputTokens": 0,
+              "cacheCreationInputTokens": 0,
+              "webSearchRequests": 0,
+              "costUSD": 0.00028000000000000003,
+              "contextWindow": 200000,
+              "maxOutputTokens": 32000,
+              "thinkingTokens": 0,
+              "canonicalModel": "claude-test",
+              "provider": "firstParty",
+              "costBasis": "unknown"
+            }
+          }
+        }
+      ],
+      "hook_inputs": [
+        {
+          "hook_event_name": "PreToolUse",
+          "tool_name": "Read",
+          "tool_input": {
+            "file_path": "<checkout>/a.ts"
+          },
+          "tool_use_id": "toolu_read_1"
+        },
+        {
+          "hook_event_name": "PreToolUse",
+          "tool_name": "StructuredOutput",
+          "tool_input": {
+            "verdict": "maybe"
+          },
+          "tool_use_id": "toolu_so_invalid_1"
+        },
+        {
+          "hook_event_name": "PreToolUse",
+          "tool_name": "StructuredOutput",
+          "tool_input": {
+            "verdict": "approve",
+            "summary": "The plan matches the checked files.",
+            "items": [
+              {
+                "file": "a.ts",
+                "severity": "info",
+                "summary": "Anchor confirmed",
+                "rationale": "Read a.ts"
+              }
+            ]
+          },
+          "tool_use_id": "toolu_so_valid_1"
+        }
+      ]
+    },
+    "code_retry": {
+      "stage": "code",
+      "threw": null,
+      "frames": [
+        {
+          "type": "system",
+          "subtype": "init",
+          "cwd": "<checkout>",
+          "session_id": "<uuid>",
+          "tools": [
+            "Glob",
+            "Grep",
+            "Read",
+            "StructuredOutput"
+          ],
+          "mcp_servers": [],
+          "model": "claude-test",
+          "permissionMode": "bypassPermissions",
+          "slash_commands": [
+            "doctor",
+            "agents",
+            "auto-mode-setup",
+            "autocompact",
+            "clear",
+            "color",
+            "compact",
+            "config",
+            "output-style",
+            "context",
+            "effort",
+            "fast",
+            "focus",
+            "heapdump",
+            "init",
+            "mcp",
+            "model",
+            "__remote-workflow",
+            "workflow-launch-exec",
+            "reload-plugins",
+            "reload-skills",
+            "rename",
+            "security-review",
+            "usage",
+            "insights",
+            "recap",
+            "goal",
+            "list-agents",
+            "team-onboarding"
+          ],
+          "terminal_slash_commands": [
+            "doctor",
+            "color",
+            "focus",
+            "reload-plugins"
+          ],
+          "apiKeySource": "none",
+          "claude_code_version": "2.1.310",
+          "output_style": "default",
+          "agents": [
+            "claude",
+            "general-purpose",
+            "statusline-setup"
+          ],
+          "skills": [
+            "doctor"
+          ],
+          "plugins": [],
+          "capabilities": [
+            "interrupt_receipt_v1",
+            "interrupt_cancel_queued_v1",
+            "interrupt_send_now_v1",
+            "interrupt_requeue_taken_v1",
+            "msg_lifecycle_v1",
+            "request_marker_lists_v1",
+            "lifecycle_wakeup_source_v1",
+            "sdk_mcp_tools_list_changed",
+            "sdk_mcp_manifests",
+            "mcp_read_resource_v1",
+            "mcp_tool_ui_meta_v1",
+            "ui_surface_v1",
+            "mcp_call_result_not_for_model_v1"
+          ],
+          "analytics_disabled": true,
+          "product_feedback_disabled": true,
+          "uuid": "<uuid>",
+          "memory_paths": {
+            "auto": "<home>/.claude/projects/<repo>/memory/"
+          },
+          "original_cwd": "<checkout>",
+          "additional_directories": [],
+          "messaging_socket_path": "<socket>",
+          "fast_mode_state": "off",
+          "fast_mode_disabled_reason": "sdk_opt_in_required",
+          "per_turn_effort_active": false,
+          "view_mode": "default"
+        },
+        {
+          "type": "assistant",
+          "message": {
+            "id": "msg_stub_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_glob_1",
+                "name": "Glob",
+                "input": {
+                  "pattern": "*.ts",
+                  "path": "<checkout>"
+                }
+              }
+            ],
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 10,
+              "output_tokens": 1
+            },
+            "context_management": null
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>"
+        },
+        {
+          "type": "rate_limit_event",
+          "rate_limit_info": {
+            "status": "allowed",
+            "isUsingOverage": false
+          },
+          "uuid": "<uuid>",
+          "session_id": "<uuid>"
+        },
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "tool_use_id": "toolu_glob_1",
+                "type": "tool_result",
+                "content": "a.ts"
+              }
+            ]
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>",
+          "tool_use_result": {
+            "filenames": [
+              "a.ts"
+            ],
+            "durationMs": 0,
+            "numFiles": 1,
+            "truncated": false,
+            "totalMatches": 1,
+            "countIsComplete": true
+          },
+          "tool_result_meta": [
+            {
+              "id": "toolu_glob_1",
+              "permission_decision": {
+                "decision": "accept",
+                "source": "config",
+                "reason_type": "mode"
+              }
+            }
+          ]
+        },
+        {
+          "type": "assistant",
+          "message": {
+            "id": "msg_stub_2",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [
+              {
+                "type": "text",
+                "text": "No defects found."
+              }
+            ],
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 10,
+              "output_tokens": 1
+            },
+            "context_management": null
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>"
+        },
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "[structured-output-enforce] You MUST call the StructuredOutput tool to complete this request. Call this tool now."
+              }
+            ]
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>",
+          "isSynthetic": true
+        },
+        {
+          "type": "assistant",
+          "message": {
+            "id": "msg_stub_3",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_so_invalid_1",
+                "name": "StructuredOutput",
+                "input": {
+                  "findings": "none"
+                }
+              }
+            ],
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 10,
+              "output_tokens": 1
+            },
+            "context_management": null
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>"
+        },
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "content": "Output does not match required schema: /findings: must be array",
+                "is_error": true,
+                "tool_use_id": "toolu_so_invalid_1"
+              }
+            ]
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>",
+          "tool_use_result": "Error: Output does not match required schema: /findings: must be array",
+          "tool_result_meta": [
+            {
+              "id": "toolu_so_invalid_1",
+              "permission_decision": {
+                "decision": "accept",
+                "source": "config",
+                "reason_type": "mode"
+              }
+            }
+          ]
+        },
+        {
+          "type": "assistant",
+          "message": {
+            "id": "msg_stub_4",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_so_valid_1",
+                "name": "StructuredOutput",
+                "input": {
+                  "findings": [
+                    {
+                      "id": "F1",
+                      "severity": "minor",
+                      "path": "a.ts",
+                      "line": 1,
+                      "title": "Nit",
+                      "detail": "Cosmetic only"
+                    }
+                  ],
+                  "coverage": [
+                    {
+                      "path": "a.ts",
+                      "status": "examined",
+                      "reason": "read"
+                    }
+                  ]
+                }
+              }
+            ],
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 10,
+              "output_tokens": 1
+            },
+            "context_management": null
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>"
+        },
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "tool_use_id": "toolu_so_valid_1",
+                "type": "tool_result",
+                "content": "Structured output provided successfully"
+              }
+            ]
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>",
+          "tool_use_result": "Structured output provided successfully",
+          "tool_result_meta": [
+            {
+              "id": "toolu_so_valid_1",
+              "permission_decision": {
+                "decision": "accept",
+                "source": "config",
+                "reason_type": "mode"
+              }
+            }
+          ]
+        },
+        {
+          "duration_api_ms": 0,
+          "stop_reason": "tool_use",
+          "session_id": "<uuid>",
+          "total_cost_usd": 0.00028000000000000003,
+          "usage": {
+            "input_tokens": 40,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "output_tokens": 20,
+            "output_tokens_details": {
+              "thinking_tokens": 0
+            },
+            "server_tool_use": {
+              "web_search_requests": 0,
+              "web_fetch_requests": 0
+            },
+            "service_tier": "standard",
+            "cache_creation": {
+              "ephemeral_1h_input_tokens": 0,
+              "ephemeral_5m_input_tokens": 0
+            },
+            "inference_geo": "",
+            "iterations": [],
+            "speed": "standard",
+            "fallback_credit": null
+          },
+          "modelUsage": {
+            "claude-test": {
+              "inputTokens": 40,
+              "outputTokens": 20,
+              "cacheReadInputTokens": 0,
+              "cacheCreationInputTokens": 0,
+              "webSearchRequests": 0,
+              "costUSD": 0.00028000000000000003,
+              "contextWindow": 200000,
+              "maxOutputTokens": 32000,
+              "thinkingTokens": 0,
+              "canonicalModel": "claude-test",
+              "provider": "firstParty",
+              "costBasis": "unknown"
+            }
+          },
+          "permission_denials": [],
+          "terminal_reason": "completed",
+          "fast_mode_state": "off",
+          "fast_mode_disabled_reason": "sdk_opt_in_required",
+          "subagent_stats": {
+            "spawned": 0,
+            "requested": {
+              "background": 0,
+              "foreground": 0,
+              "unset": 0
+            },
+            "started_in_background": 0,
+            "max_depth": 0,
+            "spawned_by_subagents": 0,
+            "completed": 0,
+            "failed": 0,
+            "killed": {
+              "parent": 0,
+              "user": 0,
+              "system": 0
+            },
+            "refused": {
+              "depth_limit": 0,
+              "concurrency_limit": 0,
+              "budget": 0
+            },
+            "by_type": {}
+          },
+          "safety_stops": 0,
+          "is_error": false,
+          "num_turns": 5,
+          "subtype": "success",
+          "api_error_status": null,
+          "result": "{\"findings\":[{\"id\":\"F1\",\"severity\":\"minor\",\"path\":\"a.ts\",\"line\":1,\"title\":\"Nit\",\"detail\":\"Cosmetic only\"}],\"coverage\":[{\"path\":\"a.ts\",\"status\":\"examined\",\"reason\":\"read\"}]}",
+          "structured_output": {
+            "findings": [
+              {
+                "id": "F1",
+                "severity": "minor",
+                "path": "a.ts",
+                "line": 1,
+                "title": "Nit",
+                "detail": "Cosmetic only"
+              }
+            ],
+            "coverage": [
+              {
+                "path": "a.ts",
+                "status": "examined",
+                "reason": "read"
+              }
+            ]
+          },
+          "ttft_ms": 0,
+          "type": "result",
+          "duration_ms": 0,
+          "uuid": "<uuid>",
+          "ttft_stream_ms": 0,
+          "time_to_request_ms": 0,
+          "first_content_frame_ms": 0,
+          "queued_turn_count": 0,
+          "result_index": 0,
+          "model_usage_since_last_result": {
+            "claude-test": {
+              "inputTokens": 40,
+              "outputTokens": 20,
+              "cacheReadInputTokens": 0,
+              "cacheCreationInputTokens": 0,
+              "webSearchRequests": 0,
+              "costUSD": 0.00028000000000000003,
+              "contextWindow": 200000,
+              "maxOutputTokens": 32000,
+              "thinkingTokens": 0,
+              "canonicalModel": "claude-test",
+              "provider": "firstParty",
+              "costBasis": "unknown"
+            }
+          }
+        }
+      ],
+      "hook_inputs": [
+        {
+          "hook_event_name": "PreToolUse",
+          "tool_name": "Glob",
+          "tool_input": {
+            "pattern": "*.ts",
+            "path": "<checkout>"
+          },
+          "tool_use_id": "toolu_glob_1"
+        },
+        {
+          "hook_event_name": "PreToolUse",
+          "tool_name": "StructuredOutput",
+          "tool_input": {
+            "findings": "none"
+          },
+          "tool_use_id": "toolu_so_invalid_1"
+        },
+        {
+          "hook_event_name": "PreToolUse",
+          "tool_name": "StructuredOutput",
+          "tool_input": {
+            "findings": [
+              {
+                "id": "F1",
+                "severity": "minor",
+                "path": "a.ts",
+                "line": 1,
+                "title": "Nit",
+                "detail": "Cosmetic only"
+              }
+            ],
+            "coverage": [
+              {
+                "path": "a.ts",
+                "status": "examined",
+                "reason": "read"
+              }
+            ]
+          },
+          "tool_use_id": "toolu_so_valid_1"
+        }
+      ]
+    },
+    "exhausted": {
+      "stage": "plan",
+      "threw": null,
+      "frames": [
+        {
+          "type": "system",
+          "subtype": "init",
+          "cwd": "<checkout>",
+          "session_id": "<uuid>",
+          "tools": [
+            "Glob",
+            "Grep",
+            "Read",
+            "StructuredOutput"
+          ],
+          "mcp_servers": [],
+          "model": "claude-test",
+          "permissionMode": "bypassPermissions",
+          "slash_commands": [
+            "doctor",
+            "agents",
+            "auto-mode-setup",
+            "autocompact",
+            "clear",
+            "color",
+            "compact",
+            "config",
+            "output-style",
+            "context",
+            "effort",
+            "fast",
+            "focus",
+            "heapdump",
+            "init",
+            "mcp",
+            "model",
+            "__remote-workflow",
+            "workflow-launch-exec",
+            "reload-plugins",
+            "reload-skills",
+            "rename",
+            "security-review",
+            "usage",
+            "insights",
+            "recap",
+            "goal",
+            "list-agents",
+            "team-onboarding"
+          ],
+          "terminal_slash_commands": [
+            "doctor",
+            "color",
+            "focus",
+            "reload-plugins"
+          ],
+          "apiKeySource": "none",
+          "claude_code_version": "2.1.310",
+          "output_style": "default",
+          "agents": [
+            "claude",
+            "general-purpose",
+            "statusline-setup"
+          ],
+          "skills": [
+            "doctor"
+          ],
+          "plugins": [],
+          "capabilities": [
+            "interrupt_receipt_v1",
+            "interrupt_cancel_queued_v1",
+            "interrupt_send_now_v1",
+            "interrupt_requeue_taken_v1",
+            "msg_lifecycle_v1",
+            "request_marker_lists_v1",
+            "lifecycle_wakeup_source_v1",
+            "sdk_mcp_tools_list_changed",
+            "sdk_mcp_manifests",
+            "mcp_read_resource_v1",
+            "mcp_tool_ui_meta_v1",
+            "ui_surface_v1",
+            "mcp_call_result_not_for_model_v1"
+          ],
+          "analytics_disabled": true,
+          "product_feedback_disabled": true,
+          "uuid": "<uuid>",
+          "memory_paths": {
+            "auto": "<home>/.claude/projects/<repo>/memory/"
+          },
+          "original_cwd": "<checkout>",
+          "additional_directories": [],
+          "messaging_socket_path": "<socket>",
+          "fast_mode_state": "off",
+          "fast_mode_disabled_reason": "sdk_opt_in_required",
+          "per_turn_effort_active": false,
+          "view_mode": "default"
+        },
+        {
+          "type": "assistant",
+          "message": {
+            "id": "msg_stub_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_read_1",
+                "name": "Read",
+                "input": {
+                  "file_path": "<checkout>/a.ts"
+                }
+              }
+            ],
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 10,
+              "output_tokens": 1
+            },
+            "context_management": null
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>"
+        },
+        {
+          "type": "rate_limit_event",
+          "rate_limit_info": {
+            "status": "allowed",
+            "isUsingOverage": false
+          },
+          "uuid": "<uuid>",
+          "session_id": "<uuid>"
+        },
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "tool_use_id": "toolu_read_1",
+                "type": "tool_result",
+                "content": "1\texport const answer = 42;\n2\t"
+              }
+            ]
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>",
+          "tool_use_result": {
+            "type": "text",
+            "file": {
+              "filePath": "<checkout>/a.ts",
+              "content": "export const answer = 42;\n",
+              "numLines": 2,
+              "startLine": 1,
+              "totalLines": 2
+            }
+          },
+          "tool_result_meta": [
+            {
+              "id": "toolu_read_1",
+              "permission_decision": {
+                "decision": "accept",
+                "source": "config",
+                "reason_type": "mode"
+              }
+            }
+          ]
+        },
+        {
+          "type": "assistant",
+          "message": {
+            "id": "msg_stub_2",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [
+              {
+                "type": "text",
+                "text": "Verdict: approve"
+              }
+            ],
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 10,
+              "output_tokens": 1
+            },
+            "context_management": null
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>"
+        },
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "[structured-output-enforce] You MUST call the StructuredOutput tool to complete this request. Call this tool now."
+              }
+            ]
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>",
+          "isSynthetic": true
+        },
+        {
+          "type": "assistant",
+          "message": {
+            "id": "msg_stub_3",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_so_invalid_1",
+                "name": "StructuredOutput",
+                "input": {
+                  "verdict": "maybe"
+                }
+              }
+            ],
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 10,
+              "output_tokens": 1
+            },
+            "context_management": null
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>"
+        },
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "content": "Output does not match required schema: root: must have required property 'summary', root: must have required property 'items', /verdict: must be equal to one of the allowed values: [\"approve\",\"revise\",\"block\"]",
+                "is_error": true,
+                "tool_use_id": "toolu_so_invalid_1"
+              }
+            ]
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>",
+          "tool_use_result": "Error: Output does not match required schema: root: must have required property 'summary', root: must have required property 'items', /verdict: must be equal to one of the allowed values: [\"approve\",\"revise\",\"block\"]",
+          "tool_result_meta": [
+            {
+              "id": "toolu_so_invalid_1",
+              "permission_decision": {
+                "decision": "accept",
+                "source": "config",
+                "reason_type": "mode"
+              }
+            }
+          ]
+        },
+        {
+          "type": "assistant",
+          "message": {
+            "id": "msg_stub_4",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_so_invalid_2",
+                "name": "StructuredOutput",
+                "input": {
+                  "verdict": "maybe"
+                }
+              }
+            ],
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 10,
+              "output_tokens": 1
+            },
+            "context_management": null
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>"
+        },
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "content": "Output does not match required schema: root: must have required property 'summary', root: must have required property 'items', /verdict: must be equal to one of the allowed values: [\"approve\",\"revise\",\"block\"]",
+                "is_error": true,
+                "tool_use_id": "toolu_so_invalid_2"
+              }
+            ]
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>",
+          "tool_use_result": "Error: Output does not match required schema: root: must have required property 'summary', root: must have required property 'items', /verdict: must be equal to one of the allowed values: [\"approve\",\"revise\",\"block\"]",
+          "tool_result_meta": [
+            {
+              "id": "toolu_so_invalid_2",
+              "permission_decision": {
+                "decision": "accept",
+                "source": "config",
+                "reason_type": "mode"
+              }
+            }
+          ]
+        },
+        {
+          "type": "assistant",
+          "message": {
+            "id": "msg_stub_5",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_so_invalid_3",
+                "name": "StructuredOutput",
+                "input": {
+                  "verdict": "maybe"
+                }
+              }
+            ],
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 10,
+              "output_tokens": 1
+            },
+            "context_management": null
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>"
+        },
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "content": "Output does not match required schema: root: must have required property 'summary', root: must have required property 'items', /verdict: must be equal to one of the allowed values: [\"approve\",\"revise\",\"block\"]",
+                "is_error": true,
+                "tool_use_id": "toolu_so_invalid_3"
+              }
+            ]
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>",
+          "tool_use_result": "Error: Output does not match required schema: root: must have required property 'summary', root: must have required property 'items', /verdict: must be equal to one of the allowed values: [\"approve\",\"revise\",\"block\"]",
+          "tool_result_meta": [
+            {
+              "id": "toolu_so_invalid_3",
+              "permission_decision": {
+                "decision": "accept",
+                "source": "config",
+                "reason_type": "mode"
+              }
+            }
+          ]
+        },
+        {
+          "type": "assistant",
+          "message": {
+            "id": "msg_stub_6",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_so_invalid_4",
+                "name": "StructuredOutput",
+                "input": {
+                  "verdict": "maybe"
+                }
+              }
+            ],
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 10,
+              "output_tokens": 1
+            },
+            "context_management": null
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>"
+        },
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "content": "Output does not match required schema: root: must have required property 'summary', root: must have required property 'items', /verdict: must be equal to one of the allowed values: [\"approve\",\"revise\",\"block\"]",
+                "is_error": true,
+                "tool_use_id": "toolu_so_invalid_4"
+              }
+            ]
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>",
+          "tool_use_result": "Error: Output does not match required schema: root: must have required property 'summary', root: must have required property 'items', /verdict: must be equal to one of the allowed values: [\"approve\",\"revise\",\"block\"]",
+          "tool_result_meta": [
+            {
+              "id": "toolu_so_invalid_4",
+              "permission_decision": {
+                "decision": "accept",
+                "source": "config",
+                "reason_type": "mode"
+              }
+            }
+          ]
+        },
+        {
+          "type": "assistant",
+          "message": {
+            "id": "msg_stub_7",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_so_invalid_5",
+                "name": "StructuredOutput",
+                "input": {
+                  "verdict": "maybe"
+                }
+              }
+            ],
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 10,
+              "output_tokens": 1
+            },
+            "context_management": null
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>"
+        },
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "content": "Output does not match required schema: root: must have required property 'summary', root: must have required property 'items', /verdict: must be equal to one of the allowed values: [\"approve\",\"revise\",\"block\"]",
+                "is_error": true,
+                "tool_use_id": "toolu_so_invalid_5"
+              }
+            ]
+          },
+          "parent_tool_use_id": null,
+          "session_id": "<uuid>",
+          "uuid": "<uuid>",
+          "timestamp": "<timestamp>",
+          "tool_use_result": "Error: Output does not match required schema: root: must have required property 'summary', root: must have required property 'items', /verdict: must be equal to one of the allowed values: [\"approve\",\"revise\",\"block\"]",
+          "tool_result_meta": [
+            {
+              "id": "toolu_so_invalid_5",
+              "permission_decision": {
+                "decision": "accept",
+                "source": "config",
+                "reason_type": "mode"
+              }
+            }
+          ]
+        },
+        {
+          "is_error": true,
+          "duration_api_ms": 0,
+          "num_turns": 8,
+          "stop_reason": "tool_use",
+          "session_id": "<uuid>",
+          "total_cost_usd": 0.0004900000000000001,
+          "usage": {
+            "input_tokens": 70,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "output_tokens": 35,
+            "output_tokens_details": {
+              "thinking_tokens": 0
+            },
+            "server_tool_use": {
+              "web_search_requests": 0,
+              "web_fetch_requests": 0
+            },
+            "service_tier": "standard",
+            "cache_creation": {
+              "ephemeral_1h_input_tokens": 0,
+              "ephemeral_5m_input_tokens": 0
+            },
+            "inference_geo": "",
+            "iterations": [],
+            "speed": "standard",
+            "fallback_credit": null
+          },
+          "modelUsage": {
+            "claude-test": {
+              "inputTokens": 70,
+              "outputTokens": 35,
+              "cacheReadInputTokens": 0,
+              "cacheCreationInputTokens": 0,
+              "webSearchRequests": 0,
+              "costUSD": 0.0004900000000000001,
+              "contextWindow": 200000,
+              "maxOutputTokens": 32000,
+              "thinkingTokens": 0,
+              "canonicalModel": "claude-test",
+              "provider": "firstParty",
+              "costBasis": "unknown"
+            }
+          },
+          "permission_denials": [],
+          "terminal_reason": "structured_output_retry_exhausted",
+          "fast_mode_state": "off",
+          "fast_mode_disabled_reason": "sdk_opt_in_required",
+          "subagent_stats": {
+            "spawned": 0,
+            "requested": {
+              "background": 0,
+              "foreground": 0,
+              "unset": 0
+            },
+            "started_in_background": 0,
+            "max_depth": 0,
+            "spawned_by_subagents": 0,
+            "completed": 0,
+            "failed": 0,
+            "killed": {
+              "parent": 0,
+              "user": 0,
+              "system": 0
+            },
+            "refused": {
+              "depth_limit": 0,
+              "concurrency_limit": 0,
+              "budget": 0
+            },
+            "by_type": {}
+          },
+          "safety_stops": 0,
+          "subtype": "error_max_structured_output_retries",
+          "errors": [
+            "Failed to provide valid structured output after 5 attempts — last StructuredOutput error: Output does not match required schema: root: must have required property 'summary', root: must have required property 'items', /verdict: must be equal to one of the allowed values: [\"approve\",\"revise\",\"block\"]"
+          ],
+          "type": "result",
+          "duration_ms": 0,
+          "uuid": "<uuid>",
+          "queued_turn_count": 0,
+          "result_index": 0,
+          "model_usage_since_last_result": {
+            "claude-test": {
+              "inputTokens": 70,
+              "outputTokens": 35,
+              "cacheReadInputTokens": 0,
+              "cacheCreationInputTokens": 0,
+              "webSearchRequests": 0,
+              "costUSD": 0.0004900000000000001,
+              "contextWindow": 200000,
+              "maxOutputTokens": 32000,
+              "thinkingTokens": 0,
+              "canonicalModel": "claude-test",
+              "provider": "firstParty",
+              "costBasis": "unknown"
+            }
+          }
+        }
+      ],
+      "hook_inputs": [
+        {
+          "hook_event_name": "PreToolUse",
+          "tool_name": "Read",
+          "tool_input": {
+            "file_path": "<checkout>/a.ts"
+          },
+          "tool_use_id": "toolu_read_1"
+        },
+        {
+          "hook_event_name": "PreToolUse",
+          "tool_name": "StructuredOutput",
+          "tool_input": {
+            "verdict": "maybe"
+          },
+          "tool_use_id": "toolu_so_invalid_1"
+        },
+        {
+          "hook_event_name": "PreToolUse",
+          "tool_name": "StructuredOutput",
+          "tool_input": {
+            "verdict": "maybe"
+          },
+          "tool_use_id": "toolu_so_invalid_2"
+        },
+        {
+          "hook_event_name": "PreToolUse",
+          "tool_name": "StructuredOutput",
+          "tool_input": {
+            "verdict": "maybe"
+          },
+          "tool_use_id": "toolu_so_invalid_3"
+        },
+        {
+          "hook_event_name": "PreToolUse",
+          "tool_name": "StructuredOutput",
+          "tool_input": {
+            "verdict": "maybe"
+          },
+          "tool_use_id": "toolu_so_invalid_4"
+        },
+        {
+          "hook_event_name": "PreToolUse",
+          "tool_name": "StructuredOutput",
+          "tool_input": {
+            "verdict": "maybe"
+          },
+          "tool_use_id": "toolu_so_invalid_5"
+        }
+      ]
+    }
+  }
+}

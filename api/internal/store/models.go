@@ -11,6 +11,19 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type AccountResetLink struct {
+	ID            uuid.UUID          `json:"id"`
+	UserID        uuid.UUID          `json:"user_id"`
+	TokenHash     []byte             `json:"token_hash"`
+	Kind          string             `json:"kind"`
+	TargetIsAdmin bool               `json:"target_is_admin"`
+	IssuedBy      uuid.UUID          `json:"issued_by"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	ExpiresAt     pgtype.Timestamptz `json:"expires_at"`
+	RedeemedAt    pgtype.Timestamptz `json:"redeemed_at"`
+	SupersededAt  pgtype.Timestamptz `json:"superseded_at"`
+}
+
 type AgentMemory struct {
 	ID        uuid.UUID          `json:"id"`
 	UserID    uuid.UUID          `json:"user_id"`
@@ -1805,6 +1818,7 @@ type User struct {
 	CodexAccountMode          string             `json:"codex_account_mode"`
 	HarnessOverflowEnabled    bool               `json:"harness_overflow_enabled"`
 	CodexSummaryModel         pgtype.Text        `json:"codex_summary_model"`
+	CredentialsResetAt        pgtype.Timestamptz `json:"credentials_reset_at"`
 }
 
 type UserCrossCheckPin struct {

@@ -16,6 +16,10 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
+// credentialsResetResumeRefusal is the 409 body of an owner Resume on a credentials_reset hold
+// (PRD #3989 M3). Only the credential promoter releases that hold.
+var credentialsResetResumeRefusal = workersvc.ErrCredentialsResetHeld.Error()
+
 // ResumeRunNow resumes an owner-held pool_wait or paused run, or starts a new
 // worker-recovery episode for recovery_wait/worker_requeue_exhausted. The owner-scoped
 // read returns 404 for foreign/absent runs. Each status-scoped write refuses races
@@ -213,6 +217,12 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 				// (hold_reason IS DISTINCT FROM 'credential_disabled'), so name the fix, not the race text.
 				if run.HoldReason.Valid && run.HoldReason.String == "credential_disabled" {
 					httpx.Error(w, http.StatusConflict, workersvc.ErrCredentialDisabled.Error())
+					return
+				}
+				// PRD #3989 M3: ResumePausedRun likewise refuses a credentials_reset hold; only the
+				// credential promoter releases it, once the owner adds a credential.
+				if run.HoldReason.Valid && run.HoldReason.String == "credentials_reset" {
+					httpx.Error(w, http.StatusConflict, credentialsResetResumeRefusal)
 					return
 				}
 				httpx.Error(w, http.StatusConflict, "run is no longer paused")

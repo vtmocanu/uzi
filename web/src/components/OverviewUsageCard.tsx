@@ -4,6 +4,7 @@ import { formatTokens } from "../lib/formatTokens";
 import { aggregateDisclosure } from "../lib/costStatus";
 import { useDemoMode } from "../lib/demoMode";
 import { maskEmail } from "../lib/demoMask";
+import { overviewScope, USAGE_SCOPE_KEY } from "../lib/prefs";
 import { stripUnsafeChars } from "../lib/safeText";
 import { useNow } from "../lib/useNow";
 import { breakdown, perUserRows } from "../lib/usageByUser";
@@ -14,15 +15,16 @@ import {
   FailedRunsBlock, TopCauses, SinceLastFailedRun, SegmentedToggle, WindowToggle, Th, Td,
 } from "./usageParts";
 
-// PRD #3881: the Overview preview's one Usage card. A You / Factory scope toggle (admins
+// PRD #3881: the Overview preview's one Usage card. A You / All users scope toggle (admins
 // only) and the window toggle switch one set of figures, instead of the current Overview's
-// side-by-side columns; the Factory scope adds a By user table below.
+// side-by-side columns; the All users scope adds a By user table below. The admin's scope
+// choice is remembered per browser (#4052).
 
-type Scope = "you" | "factory";
+type Scope = "you" | "all";
 
 const SCOPE_OPTIONS = [
   { value: "you", label: "You" },
-  { value: "factory", label: "Factory · all users" },
+  { value: "all", label: "All users" },
 ] as const;
 
 function Kpi({ label, value, valueClass = "", sub }: { label: string; value: ReactNode; valueClass?: string; sub?: ReactNode }) {
@@ -131,10 +133,14 @@ export function OverviewUsageCard({ self, admin, window, onWindowChange, viewerI
   viewerId: string;
 }) {
   const demo = useDemoMode();
-  const [chosen, setScope] = useState<Scope>("you");
+  const [chosen, setChosen] = useState<Scope>(() => overviewScope.get(USAGE_SCOPE_KEY));
+  const setScope = (s: Scope) => {
+    setChosen(s);
+    overviewScope.set(USAGE_SCOPE_KEY, s);
+  };
   const scope: Scope = admin ? chosen : "you";
   const personal = scope === "you";
-  const usage = scope === "factory" && admin ? admin.factory : self;
+  const usage = scope === "all" && admin ? admin.factory : self;
 
   const selected = breakdown(usage[window]);
   const outcomes = usage.outcomes[window];
@@ -161,8 +167,9 @@ export function OverviewUsageCard({ self, admin, window, onWindowChange, viewerI
       <div className="flex flex-wrap items-center justify-between gap-2">
         <SectionTitle>Usage</SectionTitle>
         <div className="flex flex-wrap items-center gap-2">
-          {admin && <SegmentedToggle label="Usage scope" options={SCOPE_OPTIONS} value={scope} onChange={setScope} className="" />}
-          <WindowToggle value={window} onChange={onWindowChange} className="" />
+          {/* steadyWidth: the same toggle look as Issue work's, and no shift on a pick (#4052). */}
+          {admin && <SegmentedToggle label="Usage scope" options={SCOPE_OPTIONS} value={scope} onChange={setScope} className="" steadyWidth />}
+          <WindowToggle value={window} onChange={onWindowChange} className="" steadyWidth />
         </div>
       </div>
       <section aria-label={personal ? "Your usage" : "Factory usage"} className="min-w-0">
@@ -199,7 +206,7 @@ export function OverviewUsageCard({ self, admin, window, onWindowChange, viewerI
           </div>
         </div>
       </section>
-      {scope === "factory" && admin && <ByUserTable admin={admin} window={window} viewerId={viewerId} />}
+      {scope === "all" && admin && <ByUserTable admin={admin} window={window} viewerId={viewerId} />}
     </Card>
   );
 }

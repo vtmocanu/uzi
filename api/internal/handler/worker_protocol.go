@@ -454,6 +454,10 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		// the cause or the flag, because an older api 400s both.
 		{"recovery_cause_codex_idle_stall_v1"},
 		{"recovery_cause_retained_recovery_exhausted"},
+		// Issue #4046: this api accepts retained_capacity_only on a retained_recovery_exhausted
+		// park and holds it owner-side without counting it. A worker sends the marker ONLY after
+		// seeing this token, because an older api's strict decoder 400s the unknown field.
+		{workersvc.RetainedCapacityHoldFeature},
 		// Issue #3859: this api accepts the nested registration_evidence object on a `running`
 		// report ({register_nonce, claim_generation, registration_epoch}) and answers
 		// registration_evidence "recorded" | "refused" on the ACK, whether or not the status write

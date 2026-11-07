@@ -64,7 +64,7 @@ func (h *Handler) PatchUser(w http.ResponseWriter, r *http.Request) {
 	if h.vault != nil {
 		user, err = h.vault.SetUserActive(r.Context(), arg)
 	} else {
-		user, err = h.q.SetUserActive(r.Context(), arg)
+		user, err = h.setUserActiveSuperseding(r.Context(), arg)
 	}
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

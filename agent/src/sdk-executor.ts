@@ -1241,27 +1241,37 @@ export class SdkExecutor implements Executor {
    * spawns every Bash command detached (its own session and process group), so a backgrounded
    * build survives the group kill. Never throws.
    */
-  async reapAttributedProcesses(): Promise<RunProcessReap> {
+  async reapAttributedProcesses(opts: { deadlineAt?: number } = {}): Promise<RunProcessReap> {
+    // issue #3980: with an absolute `deadlineAt` (the bounded Claude gate checkpoint) every join below
+    // also stops waiting at that deadline, nothing new is admitted once it has passed, and the pending
+    // operations keep running (an unconfirmed reap, never an abort). Without it: unchanged.
+    const { deadlineAt } = opts;
+    const expired = (): boolean => deadlineAt !== undefined && Date.now() >= deadlineAt;
     // issue #3181: inside the retained credential switch's settlement (the RetainedSwitchSettlement
     // marker, not merely any MaintenanceBudget: cancellation and terminal maintenance install one
     // too) the joins below are WAITS on operations this executor already runs, so they stop waiting
     // when the budget is spent; nothing new is started and the operations keep running. Every other
     // caller joins without bound, as before.
     const budget = RetainedSwitchSettlement.active() ? MaintenanceBudget.current() : undefined;
-    const joined = await this.waitWithin(this.closeAndSettlePlanSummary(), budget);
+    if (expired()) return unconfirmedJoinReap();
+    const joined = await this.waitWithin(this.closeAndSettlePlanSummary(), budget, deadlineAt);
     // Issue #2471: join the lane disposal killAgentTree started, so the attributed reap sees
     // the model commands already stopped (it never rejects).
-    if (!joined || !await this.waitWithin(this.laneDisposal, budget)) return unconfirmedJoinReap();
+    if (!joined || !await this.waitWithin(this.laneDisposal, budget, deadlineAt)) return unconfirmedJoinReap();
     // The background deps install carries the run's HOME, so the HOME-attributed reap would count
     // it as a survivor and kill npm's children. Tear it down first. A switch that gives up and
     // continues in place loses it: best-effort by design (the agent installs the dependencies itself).
     const deps = this.activeDeps;
     if (deps && !this.depsJoined) {
+      if (expired()) return unconfirmedJoinReap();
       deps.abort.abort();
-      if (!await this.waitWithin(deps.install, budget)) return unconfirmedJoinReap();
+      if (!await this.waitWithin(deps.install, budget, deadlineAt)) return unconfirmedJoinReap();
       this.depsJoined = true;
     }
-    const r = await this.runProcesses.reap(this.homeDir, this.runWorktree, [...this.spawnedPids]).catch(
+    if (expired()) return unconfirmedJoinReap();
+    const r = await (deadlineAt === undefined
+      ? this.runProcesses.reap(this.homeDir, this.runWorktree, [...this.spawnedPids])
+      : this.runProcesses.reap(this.homeDir, this.runWorktree, [...this.spawnedPids], { deadlineAt })).catch(
       (): RunProcessReap => ({ killed: [], left: [], complete: false }),
     );
     if (r.killed.length > 0 || r.left.length > 0 || !r.complete) {
@@ -1281,11 +1291,12 @@ export class SdkExecutor implements Executor {
    * time left. A promise that already settled reads true even with no time left. The timer is
    * always cleared and the awaited operation is never cancelled by the give-up.
    */
-  private async waitWithin(pending: Promise<unknown> | undefined, budget: MaintenanceBudget | undefined): Promise<boolean> {
+  private async waitWithin(pending: Promise<unknown> | undefined, budget: MaintenanceBudget | undefined, deadlineAt?: number): Promise<boolean> {
     if (!pending) return true;
-    if (!budget) { await pending; return true; }
+    if (!budget && deadlineAt === undefined) { await pending; return true; }
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const expired = new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), Math.min(budget.remainingMs(), 2_147_483_647)); });
+    const limit = Math.min(budget?.remainingMs() ?? Infinity, deadlineAt === undefined ? Infinity : deadlineAt - Date.now());
+    const expired = new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), Math.min(limit, 2_147_483_647)); });
     try { return await Promise.race([pending.then(() => true as const, () => true as const), expired]); }
     finally { clearTimeout(timer); }
   }

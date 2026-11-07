@@ -115,3 +115,19 @@ it("filters stages and outcomes while preserving active context and safe Code co
   expect(replaced.groups).toHaveLength(25);
   expect(replaced.groups.map(g => identities(g.attempts))).toEqual(Array.from({ length: 25 }, () => ["plan:3"]));
 });
+
+it("classifies a Plan verdict recorded before custody loss by its verdict, not as replaced", async () => {
+  const replaced = await crossChecksApi.listCrossCheckHistory({ lifecycle: "past", stage: "plan", outcome: "replaced" });
+  expect(replaced.groups).toHaveLength(25);
+  expect(replaced.groups.map(g => identities(g.attempts))).toEqual(Array.from({ length: 25 }, () => ["plan:3"]));
+  expect(replaced.groups[0].attempts[0]).toMatchObject({ review: "approved", execution: "replaced", historical: true });
+  const passed = await crossChecksApi.listCrossCheckHistory({ lifecycle: "past", stage: "plan", outcome: "passed" });
+  expect(passed.groups).toHaveLength(25);
+  for (const g of passed.groups) {
+    expect(identities(g.attempts)).toEqual(["plan:4"]);
+    expect(g.attempts[0]).toMatchObject({
+      review: "approved", execution: "finished", historical: true,
+      decided_at: "2026-10-30T10:30:00Z", interrupted_at: "2026-10-30T10:45:00Z",
+    });
+  }
+});

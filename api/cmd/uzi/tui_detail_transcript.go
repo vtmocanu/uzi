@@ -467,7 +467,7 @@ func (m tuiModel) transcriptBudgetWithoutDiskGuidance() int {
 		// so together they add at most one physical row that renderDetail must be charged for.
 		// The width-shed fitNearTimeoutLine draws the same single row; presence is width-free.
 	}
-	if credentialDisabledLine(m.detail.run) != "" ||
+	if credentialHoldLine(m.detail.run) != "" ||
 		(!providerHold && !isIterationHold(m.detail.run) && (m.detail.run.Status == statusPaused || m.detail.run.PauseRequestedAt != nil)) {
 		chrome++ // the pause row-2 slot (PRD #1190 M4 paused / pause-requested, PRD #1732 credential
 		// hold): its own row in renderDetail, independent of the park slot above, so a parked run

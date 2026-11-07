@@ -75,5 +75,6 @@ Acceptance: sum and fail-rate tests; admin gate; mock parity for the Factory sco
 - **Columns: Runs, PRs, Failed, Fail rate, Last failure, Cost** (maintainer calls D13 and later): volume, then quality, then spend.
 - **No chart** (maintainer call D12), which also removes the only usage time-series dependency.
 - **Share the presentation pieces with the current Overview** so the two cannot drift before #3877.
+- **Superseded 2026-11-07 by #4052**: the "Factory · all users" scope label is now "All users", and the scope is remembered per browser (default You) instead of resetting.
 - **The preview By user table always shows its seven columns** (owner call at the plan gate, 2026-11-07): a PR count an older API does not report reads "—", never 0, and the Factory total reads "—" unless every row reports one; the current Overview keeps its conditional PRs column.
 - **User cells show the email (masked in demo mode), not a name**, because `AdminUsageUser` carries no display name.
