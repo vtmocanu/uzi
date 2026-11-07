@@ -125,6 +125,8 @@ export interface AuthorityRuntimeOptions {
   lateWaitMs?: number;
   /** Tests only: replaces SHUTDOWN_BACKOFF_MS, the first retry delay of the final shutdown drain. */
   shutdownBackoffMs?: number;
+  /** Tests only: replaces MAX_LOGGED_REFUSALS, the bound on distinct operations the bare-refusal diagnostic logs. */
+  refusalLogLimit?: number;
   /** Tests only: production-inert pause points. Production never passes them. */
   testHooks?: {
     /** Awaited by #applyLate right after it took the queued settlements out of the queue and before it applies any. */
@@ -1407,7 +1409,7 @@ export class AuthorityRuntime implements AuthorityScope {
     try {
       const pending = slot.pending;
       if (!pending || this.#refusalLogged.has(pending.operation)) return;
-      if (this.#refusalLogged.size >= MAX_LOGGED_REFUSALS) return;
+      if (this.#refusalLogged.size >= (this.#options.refusalLogLimit ?? MAX_LOGGED_REFUSALS)) return;
       this.#refusalLogged.add(pending.operation);
       const op = pending.operation;
       const parsed = classifyBareFootprint(pending.footprint);
@@ -1436,6 +1438,11 @@ export class AuthorityRuntime implements AuthorityScope {
       }
       this.#options.log?.warn("bare_slot_refusal", fields);
     } catch { /* diagnostics never change the refusal */ }
+  }
+
+  /** Tests only: how many operations the inline-apply ledger still holds (it must be empty once applies settle). */
+  inlineLedgerSize(): number {
+    return this.#inlineOps.size;
   }
 
   async #beginDestructive(paths: readonly string[], op: string): Promise<AuthoritySettlement> {

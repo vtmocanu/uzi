@@ -1634,6 +1634,38 @@ describe("issue #4066: the bare_slot_refusal diagnostic", () => {
     assert.equal(c.refusals().length, 1);
   });
 
+  it("bounds the dedupe set: only the first N distinct operations are logged", async (t) => {
+    const c = capture();
+    const f = await faultRig(t, { log: c.log, refusalLogLimit: 2 });
+    const seen: string[] = [];
+    for (let i = 0; i < 3; i += 1) {
+      const { settlement, operation } = await begin(f);
+      seen.push(operation);
+      await assert.rejects(f.rt.hooks.assertBareClear(f.bare, "owed-pin"), (error: unknown) =>
+        error instanceof AuthorityRefusal && error.message === message(operation));
+      await f.rt.withTransaction(() => settlement.settle({ ok: true }));
+    }
+    assert.equal(new Set(seen).size, 3, "three distinct operations were refused");
+    assert.deepEqual(c.refusals().map((l) => l.fields?.operation), seen.slice(0, 2));
+  });
+
+  it("clears the inline ledger once the inline apply settled", async (t) => {
+    const f = await faultRig(t);
+    const written = gate();
+    const release = gate();
+    await f.rt.withTransaction(async () => {
+      const settlement = await f.rt.hooks.beginBareMutation(f.bare, CLEANUP, [PIN_REF]);
+      f.ctl.pause = { hit: () => written.resolve(), release: release.promise };
+      const applying = settlement.settle({ ok: true });
+      await written.promise;
+      assert.equal(f.rt.inlineLedgerSize(), 1, "the in-flight inline apply is on the ledger");
+      release.resolve();
+      await applying;
+    });
+    assert.equal(f.rt.inlineLedgerSize(), 0, "a settled inline apply leaves nothing on the ledger");
+    await f.rt.hooks.assertBareClear(f.bare, "owed-pin");
+  });
+
   it("reports a queued settlement", async (t) => {
     const c = capture();
     const f = await faultRig(t, { log: c.log, lateWaitMs: 100 });

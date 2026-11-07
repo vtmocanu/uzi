@@ -67,7 +67,7 @@ func TestComposeAgentStopGracePeriod(t *testing.T) {
 		"../../../deploy/compose/compose.yaml": "40s",
 		"../../../e2e/docker-compose.e2e.yml":  "",
 	} {
-		raw, err := os.ReadFile(path)
+		raw, err := os.ReadFile(path) //nolint:gosec // G304: paths are the three fixed repository compose files listed above.
 		if err != nil {
 			t.Fatal(err)
 		}
