@@ -396,7 +396,9 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    `watch-pr.sh --reviewer none`, which scopes Greptile's comments to its last verdict);
    when unsure, decide with the buddy (*Buddy*). Say which in the merge note. Greptile does not
    re-review on its own; re-comment if you want its second pass.
-5. **Base hygiene, when needed, unprompted.** `BEHIND` alone is fine under an admin merge.
+5. **Base hygiene, when needed, unprompted.** `BEHIND` alone is fine under an admin merge
+   only when main moved independently of the PR (references/merge-mechanics.md, *Merging
+   behind main*); otherwise update the branch and wait for fresh exact-head CI.
    Prepare lazily: run `land-prep.sh` only on a PR that is next in the merge order, after
    its blocker has merged. Defer base-only preparation of a held PR: its push would only be
    redone after the blocker lands, at a full CI run per push.

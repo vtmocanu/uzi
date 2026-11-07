@@ -44,10 +44,32 @@ stop rather than forcing.
   **Never route around a classifier denial by other means** — retry, or hand the exact
   command to the user to run via a `!`-prefixed shell line, or ask them to add a
   `gh pr merge` allow rule.
-- **`BEHIND` after an earlier merge** is expected (main moved). `--admin` bypasses the
-  strict check; otherwise `gh pr update-branch` the PR and re-wait for CI. A BEHIND PR that
-  also carries a migration-number collision or a conflict needs `scripts/land-prep.sh`
+- **`BEHIND` after an earlier merge** is expected (main moved). A BEHIND PR that also
+  carries a migration-number collision or a conflict needs `scripts/land-prep.sh`
   (rebase or merge + renumber + lease push) first.
+- **Merging behind main.** `--admin` may land a BEHIND PR on its existing exact-head CI,
+  with no fresh run on a head containing current main, only when every condition below
+  holds, rechecked immediately before `merge.sh`. Otherwise, or when unsure, update the
+  branch, get the rebase-lane buddy review and wait for fresh exact-head CI.
+  - Required CI is green on the exact head, and that run finished within the last 24 hours.
+  - Current `main`'s required CI is green on its tip.
+  - The buddy's `APPROVE` is pinned to the head, and the merge is clean (no conflict).
+  - The main delta (`merge-base..origin/main`) and the PR are independent. Use the whole
+    component as the unit: `api/` (with `docs/`, which `api` embeds), `controller/`,
+    `web/`, `agent/`, `deploy/`. Separate Go directories in one module are not independent.
+    Paths no build reads (`prds/`, `adr/`, `changelog.d/`, `specs/`) never overlap.
+  - Neither the PR nor the main delta touches a migration, a generated or shared contract
+    (sqlc output and `queries/`, `api/openapi/`, `fixtures/`, run-kind or protocol lists), or
+    build and test infrastructure (`Taskfile.yml`, `.github/workflows/`, `scripts/`,
+    `go.mod`/`go.sum`, `package.json`, lockfiles, `tsconfig*`, `.golangci.yml`, vite/vitest
+    config).
+  - Neither side is trust-boundary, auth, untrusted-input or security work.
+
+  Examples: a `web/`-only PR with a main delta of `api/` and `prds/` merges on its green
+  head; an `agent/test` PR after main changed `agent/src` needs fresh CI; any PR after main
+  touched `Taskfile.yml` needs fresh CI. Post-merge main CI detects a residual integration
+  failure; it does not prevent one. A user's per-queue rule (stricter or looser) overrides
+  this default for that queue.
 - Merging is **outward-facing**: unless the user pre-authorized it (they chose Auto mode,
   or said "merge as admin"), surface the MR + your review and get their OK first.
 - **Merge each PR the moment it is review-clean and CI-green — do NOT hold the whole
