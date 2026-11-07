@@ -73,6 +73,23 @@ beforeEach(() => { localStorage.clear(); });
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); setDemoMode(false); });
 
 describe("OverviewUsageCard (#3881 M1)", () => {
+  it("draws both usage toggles at one weight, like Issue work's, so a pick never shifts them (#4052)", () => {
+    const { self, admin } = fixture();
+    const view = mount({ self, admin });
+    const weights = () =>
+      ["Usage scope", "Usage reporting period"].flatMap((name) =>
+        within(view.getByRole("group", { name })).getAllByRole("button").map((b) => ({
+          medium: b.classList.contains("font-medium"),
+          semibold: b.classList.contains("font-semibold"),
+        })),
+      );
+    const steady = Array(4).fill({ medium: true, semibold: false });
+    expect(weights()).toEqual(steady);
+    fireEvent.click(view.getByRole("button", { name: "All users" }));
+    fireEvent.click(view.getByRole("button", { name: "Last 7 days" }));
+    expect(weights()).toEqual(steady);
+  });
+
   it("shows the four figures for All time with the cost disclosure and 'at least' per-PR cost sharing its title", () => {
     const { self } = fixture();
     const view = mount({ self });

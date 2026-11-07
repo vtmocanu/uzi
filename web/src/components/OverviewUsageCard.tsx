@@ -167,8 +167,9 @@ export function OverviewUsageCard({ self, admin, window, onWindowChange, viewerI
       <div className="flex flex-wrap items-center justify-between gap-2">
         <SectionTitle>Usage</SectionTitle>
         <div className="flex flex-wrap items-center gap-2">
-          {admin && <SegmentedToggle label="Usage scope" options={SCOPE_OPTIONS} value={scope} onChange={setScope} className="" />}
-          <WindowToggle value={window} onChange={onWindowChange} className="" />
+          {/* steadyWidth: the same toggle look as Issue work's, and no shift on a pick (#4052). */}
+          {admin && <SegmentedToggle label="Usage scope" options={SCOPE_OPTIONS} value={scope} onChange={setScope} className="" steadyWidth />}
+          <WindowToggle value={window} onChange={onWindowChange} className="" steadyWidth />
         </div>
       </div>
       <section aria-label={personal ? "Your usage" : "Factory usage"} className="min-w-0">
