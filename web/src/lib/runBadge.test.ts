@@ -61,7 +61,8 @@ it.each(["", "checking", "reworking", "blocked"] as const)("policy hold override
   expect(runStatusTone("codex_policy_hold", null)).toBe("warning");
   expect(needsHumanAttention("codex_policy_hold")).toBe(true);
   const badge = runBadge(r, 0);
-  expect(badge.kind === "badge" && badge.title).toContain("Resume and policy-specific Stop are unavailable");
+  expect(badge.kind === "badge" && badge.title).toContain("choose how to continue, or Cancel. Stop is not available for a policy hold");
+  expect(badge.kind === "badge" && badge.title).not.toMatch(/retr|automatic/i);
 });
 it.each(["queued", "running", "completed", "failed", "cancelled"] as const)("old policy marker does not overlay %s", status => {
   expect(effectiveRunStatus(run({ status, hold_reason: "codex_policy_hold" }))).toBe(status);

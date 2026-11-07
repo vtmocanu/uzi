@@ -1,6 +1,10 @@
 package main
 
-import "github.com/vtmocanu/uzi/api/internal/apitypes"
+import (
+	"strings"
+
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
+)
 
 const holdCodexPolicy = "codex_policy_hold"
 
@@ -28,8 +32,44 @@ func policyCaptureClause(r apitypes.RunDTO) string {
 	return "unverified preservation"
 }
 
+// policyHoldAction names the owner's next step. Without a resume mode the episode accepts, Resume
+// is unavailable; with one, it points at `run resume-now --policy-mode`. Stop is never offered.
 func policyHoldAction(r apitypes.RunDTO) string {
-	return "Resume and Stop unavailable; Cancel: uzi run cancel " + cellText(r.ID)
+	id := cellText(r.ID)
+	if p := r.PolicyHold; p != nil && len(p.ResumeModes) > 0 && isCodexPolicyHold(r) {
+		return "Resume: uzi run resume-now " + id + " --policy-mode <mode> --episode " + cellText(p.OutcomeID) +
+			" (Stop unavailable); Cancel: uzi run cancel " + id
+	}
+	return "Resume and Stop unavailable; Cancel: uzi run cancel " + id
+}
+
+// policyHoldDetailClauses are the cause, the accepted resume modes, a pending one-claim fresh start
+// and unverified recovery for a confirmed hold; nil when the DTO carries no policy hold. Every
+// server-supplied string goes through cellText; known causes and modes use the shared wording table.
+func policyHoldDetailClauses(r apitypes.RunDTO) []string {
+	p := r.PolicyHold
+	if p == nil {
+		return nil
+	}
+	clauses := []string{"cause: " + apitypes.PolicyHoldCauseText(p.HoldCause)}
+	if len(p.ResumeModes) > 0 {
+		modes := make([]string, 0, len(p.ResumeModes))
+		for _, m := range p.ResumeModes {
+			label := apitypes.PolicyResumeModeLabel(m)
+			if label == "" {
+				label = "unrecognised mode"
+			}
+			modes = append(modes, cellText(m)+" ("+label+")")
+		}
+		clauses = append(clauses, "resume modes: "+strings.Join(modes, ", "))
+	}
+	if p.PendingFresh {
+		clauses = append(clauses, "one-claim fresh start pending, not yet confirmed")
+	}
+	if p.RecoveryRequired && !p.RecoveryVerifiedThisClaim {
+		clauses = append(clauses, "recovery head required, not yet verified by this claim")
+	}
+	return clauses
 }
 
 // policyPendingRow is delivery telemetry, not proof that the server applied a hold.

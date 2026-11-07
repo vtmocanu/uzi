@@ -137,6 +137,9 @@ type Client interface {
 	// /api/runs/{id}/resume-now, RequireUser so a CLI token can reach it. A non-held run
 	// is a 409 → ExitConflict (5); a foreign/absent run is 404 → 4. No request body.
 	ResumeRunNow(ctx context.Context, id string) (apitypes.RunDTO, error)
+	// ResumePolicyHold resumes a Codex policy hold (issue #3607): POST /api/runs/{id}/resume-now
+	// {mode, expected_episode_id, guidance}. replay reports an already-applied identical request.
+	ResumePolicyHold(ctx context.Context, id, mode, episodeID, guidance string) (apitypes.RunDTO, bool, error)
 	// SetRunCredential is the `uzi run set-token` verb (PRD #1247 M4, D4/D12): POST
 	// /api/runs/{id}/credential {mode, secret_id?}, RequireUser so a uzc_ CLI Bearer reaches
 	// it. It re-points which Anthropic token a queued or parked run spends (promoting a

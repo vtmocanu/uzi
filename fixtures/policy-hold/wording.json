@@ -1,0 +1,28 @@
+{
+  "_comment": "Issue #3607: the one owner-facing wording table for a Codex policy hold. The Go CLI (apitypes) and the web (web/src/lib) each carry a copy pinned to this file by a test; the DTO's hold_cause and resume_modes are the keys.",
+  "causes": {
+    "refused": "The provider refused a request under its usage policy.",
+    "attempt_path": "This pickup cannot continue the old conversation on this lane; continuing needs a fresh conversation from the saved work.",
+    "saved_work_missing": "The required saved work was not found where this pickup ran; nothing was started.",
+    "session_missing": "The saved conversation is not available where this pickup ran; nothing was started.",
+    "transcript_unknown": "The saved conversation's transcript could not be confirmed where this pickup ran; nothing was started.",
+    "provider_resume_rejected": "The provider rejected resuming the saved conversation.",
+    "pending_conversion": "An earlier refusal recorded on the worker was converted into this hold.",
+    "fresh_start_uncertain": "A one-claim fresh start was used but never confirmed; a provider conversation may already exist."
+  },
+  "unknown_cause": "held (cause not recorded)",
+  "modes": {
+    "preserve": {
+      "label": "Resume the preserved conversation",
+      "consequence": "Continues the same conversation with your guidance. If the conversation is missing or rejected, the run is held again; it never starts a new conversation."
+    },
+    "fresh_from_saved_work": {
+      "label": "Fresh conversation from the saved work",
+      "consequence": "Starts a fresh conversation from the saved work and resolves this refusal. Any earlier requirement to preserve the old conversation ends for the rest of the run, until a new refusal."
+    },
+    "fresh_one_claim": {
+      "label": "Fresh conversation for one pickup",
+      "consequence": "Lets exactly the next pickup start one new conversation from the saved work. Later pickups preserve that new conversation again; a fresh start that is never confirmed is held, not repeated."
+    }
+  }
+}

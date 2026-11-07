@@ -598,7 +598,9 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 	case holdIterationExhausted:
 		clauses = append(clauses, iterationHoldAction(r))
 	case holdCodexPolicy:
-		clauses = append(clauses, policyCaptureClause(r), policyHoldAction(r))
+		clauses = append(clauses, policyCaptureClause(r))
+		clauses = append(clauses, policyHoldDetailClauses(r)...)
+		clauses = append(clauses, policyHoldAction(r))
 	case holdBudgetExhausted:
 		clauses = append(clauses, "extend: uzi run extend "+r.ID+" --by 2h")
 	case holdCredentialDisabled:
@@ -722,7 +724,8 @@ func pausedHoldNotice(r apitypes.RunDTO, origin ...string) string {
 		if !isCodexPolicyHold(r) {
 			return ""
 		}
-		return holdReasonLabel(reason) + "; " + policyCaptureClause(r) + "; " + policyHoldAction(r)
+		parts := append([]string{holdReasonLabel(reason), policyCaptureClause(r)}, policyHoldDetailClauses(r)...)
+		return strings.Join(append(parts, policyHoldAction(r)), "; ")
 	case "":
 		return pauseOriginLabel(r, false, origin...) + "; resume with uzi run resume " + id
 	case holdBudgetExhausted:

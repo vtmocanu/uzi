@@ -163,6 +163,8 @@ uzi run extend <id> --by <duration>
 uzi run pause <id> [--now|--cancel]
 uzi run resume <id>
 uzi run resume-now <id>
+uzi run resume-now <id> --policy-mode <preserve|fresh_from_saved_work|fresh_one_claim> --episode <uuid>
+                [--guidance <text> | --guidance-file <path>] [--yes]
 uzi run decide <id> (--continue [--guidance <text>] | --partial <ids> --reason <text> | --accept <ids> --reason <text>)
 uzi run follow-up <id> [--message <text>]
 uzi run answer <id> [--message <text> ...]
@@ -3982,6 +3984,43 @@ or renew this hold.
 A default `uzi run wait <id>` stops on this cause; an explicit `--until`
 retains exactly its selected status set, including when it is the default
 set written explicitly. Ordinary recovery waits continue as before.
+
+### Codex policy hold
+
+A run paused on a confirmed `codex_policy_hold` shows, in `uzi run get`, the
+cause, the resume modes this episode accepts, a pending one-claim fresh start
+and whether the required recovery head is verified. Cancel is the only other
+action; there is no Stop. `--json` carries the same fields under `policy_hold`
+(`hold_cause`, `resume_modes`, `pending_fresh`, `outcome_id`).
+
+Resume it with the existing verb plus the policy flags:
+
+```
+uzi run resume-now <id> --policy-mode <mode> --episode <outcome_id> \
+    [--guidance <text> | --guidance-file <path>] [--yes]
+```
+
+- `--policy-mode` is one of `preserve`, `fresh_from_saved_work`,
+  `fresh_one_claim`; any other value is refused before a request is sent.
+- `--episode` is required and must be the hold's `policy_hold.outcome_id` (a
+  UUID). If the hold changed since you read it, the server answers 409
+  "policy hold changed or does not match this mode; refresh the run and choose
+  again"; run `uzi run get` again and choose again.
+- `--guidance` and `--guidance-file` are mutually exclusive, optional, at most
+  16000 bytes of UTF-8 with no NUL byte. Resending the same request after it was
+  applied prints "already resumed (this request was applied earlier)"; the same
+  request with different guidance is a 409 and the new guidance is not recorded.
+- The mode's label and consequence are printed to stderr, then you confirm on a
+  terminal. `--yes` skips the prompt; without a terminal and without `--yes`
+  the command refuses and sends nothing.
+
+| Mode | Label | Consequence |
+|---|---|---|
+| `preserve` | Resume the preserved conversation | Continues the same conversation with your guidance. If the conversation is missing or rejected, the run is held again; it never starts a new conversation. |
+| `fresh_from_saved_work` | Fresh conversation from the saved work | Starts a fresh conversation from the saved work and resolves this refusal. Any earlier requirement to preserve the old conversation ends for the rest of the run, until a new refusal. |
+| `fresh_one_claim` | Fresh conversation for one pickup | Lets exactly the next pickup start one new conversation from the saved work. Later pickups preserve that new conversation again; a fresh start that is never confirmed is held, not repeated. |
+
+Without `--policy-mode`, `uzi run resume-now <id>` is unchanged.
 `uzi run logs <id> --follow` reports a change to this cause even when the
 status stays `recovery_wait`. The TUI puts this hold in NEEDS YOU with
 owner actions, counts and historical evidence, without a self-retry countdown.
