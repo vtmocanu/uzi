@@ -23,7 +23,7 @@ import type { CapturedMemoryContext } from "./codex/broker.js";
 import type { BaseAttestationHoldOutcome, MemoryIncarnation, MemoryParkReference, WorkerMemoryPressureResult } from "./protocol.js";
 import { BASE_ATTESTATION_HOLD_REASON, CAPABILITY_INFERENCE_EVIDENCE_FEATURE, REPO_AGENT_SOURCE_FEATURE, REPO_AGENT_SOURCE_HOLD_REASON } from "./protocol.js";
 import { PublicationContextLatch, publicationContextReason } from "./publication-context.js";
-import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, HELD_PUBLICATION_FEATURE, CHECKPOINT_PUBLISH_TIMEOUT_MS, CREDENTIAL_SWITCH_HOLD_FEATURE, CLARIFICATION_REVISION_SETTLEMENT_FEATURE } from "./client.js";
+import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, isTransientStatus, HELD_PUBLICATION_FEATURE, CHECKPOINT_PUBLISH_TIMEOUT_MS, CREDENTIAL_SWITCH_HOLD_FEATURE, CLARIFICATION_REVISION_SETTLEMENT_FEATURE } from "./client.js";
 import type { ClarificationSettlement } from "./protocol.js";
 import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
 import { MaintenanceBudget, RetainedSwitchSettlement } from "./maintenance-budget.js";
@@ -8750,7 +8750,10 @@ export class RunRunner {
   /**
    * PRD #1392 M2 — send the forge park report ONCE and dispatch on the ack (D10). A generic 400
    * (an api that rejects the fields) → today's failed path, never park. A transport failure AFTER
-   * the send is an UNKNOWN outcome, never a failure: reconcile via the ownership probe.
+   * the send is an UNKNOWN outcome, never a failure: reconcile via the ownership probe. Inside that
+   * reconcile a probe 404 is a stale owner (stop, HOME cleaned); any other definitive 4xx (not
+   * 408/429) on the probe, or any definitive 4xx other than 400 on a resend exception, is a conservative stop (no park, no terminal report, no custody
+   * settle; a 401/403 is not proof ownership ended); 408/429/5xx/transport failures retry with backoff.
    */
   private async reportForgeParkAndDispatch(
     body: StateRequest,
@@ -8933,7 +8936,10 @@ export class RunRunner {
    * → the transaction did not land, resend the SAME (idempotent) report and dispatch its ack; an
    * authoritative terminal → today's cleanup (no park); a 404 (stale_claim / not owned / reclaimed)
    * → stop. A transport failure ON the probe is itself unknown, so retain the (possibly parked)
-   * session and retry — NEVER clean it — until the outcome is known.
+   * session and retry — NEVER clean it — until the outcome is known. Any OTHER definitive 4xx
+   * (not 408/429) on the probe, or on the resend (other than the 400 failed path), is a permanent
+   * refusal that no retry will change: stopForgeParkReconcileConservatively keeps the possibly parked
+   * session, source, records and custody, reports nothing, and leaves the run to the server or owner.
    */
   private async reconcileForgeParkByProbe(
     body: StateRequest,
@@ -8971,6 +8977,9 @@ export class RunRunner {
           });
           await batcher.close().catch(() => undefined);
           return "stop";
+        }
+        if (this.isDefinitiveApiRefusal(probeErr)) {
+          return await this.stopForgeParkReconcileConservatively(body, claim, flight, runLog, runHome, copy, "probe", probeErr);
         }
         runLog.warn(`${copy.log} reconcile: ownership probe failed transport; retrying`, {
           run_id: flight.runId,
@@ -9012,6 +9021,9 @@ export class RunRunner {
             });
             return "fail";
           }
+          if (this.isDefinitiveApiRefusal(reportErr)) {
+            return await this.stopForgeParkReconcileConservatively(body, claim, flight, runLog, runHome, copy, "resend", reportErr);
+          }
           runLog.warn(`${copy.log} reconcile: resend failed transport; re-probing`, {
             run_id: flight.runId,
             error: errMessage(reportErr),
@@ -9025,6 +9037,44 @@ export class RunRunner {
       // cancelStopsWait=false so a sticky cancel cannot turn this into a backoff-free retry storm.
       await this.waitRecoveryRetry(flight, false);
     }
+  }
+
+  /**
+   * A 4xx the api will answer the same way every time: a RequestError with a 4xx status that is not
+   * 408/429. The error's cause chain is deliberately not unwrapped, so the client's wrapped
+   * "publication park outcome uncertain" error stays retryable.
+   */
+  private isDefinitiveApiRefusal(err: unknown): err is RequestError {
+    return err instanceof RequestError && err.status >= 400 && err.status < 500 && !isTransientStatus(err.status);
+  }
+
+  /**
+   * A permanent 4xx on the park reconcile's probe or resend: ownership is unknown (a 401/403 does not
+   * prove it ended), so retain the possibly parked run without reporting a park or a terminal state, and
+   * without settling custody, retiring records or discarding the source. The resumable session is kept by
+   * the same D4 rule as a confirmed park; a publication-phase park also keeps its source and records.
+   */
+  private async stopForgeParkReconcileConservatively(
+    body: StateRequest,
+    claim: ClaimResponse,
+    flight: RunFlight,
+    runLog: Logger,
+    runHome: string | undefined,
+    copy: PreCloneParkCopy,
+    phase: "probe" | "resend",
+    err: RequestError,
+  ): Promise<"stop"> {
+    runLog.warn(`${copy.log} reconcile: ${phase} refused ${err.status} (permanent); ownership unknown, retaining without a park or terminal report`, {
+      run_id: flight.runId,
+      status: err.status,
+      error: errMessage(err),
+    });
+    await this.preserveForgeParkSessionIfResolvable(claim, flight, runLog, runHome);
+    if (body.recovery_phase === "publication") {
+      this.retainForPublicationReconciliation(flight, "ownership_refused");
+    }
+    await flight.batcher.close().catch(() => undefined);
+    return "stop";
   }
 
   /** Test seam: bounds and sleeps of the idempotent publication-intent retries. */
