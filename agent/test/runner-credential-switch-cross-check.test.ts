@@ -2159,10 +2159,13 @@ function viewTree(wt: string, trackedPath: string, untrackedPath: string): TreeV
     tracked: fs.readFileSync(path.join(wt, trackedPath), "utf8"), untracked: fs.readFileSync(path.join(wt, untrackedPath), "utf8") };
 }
 
+/** Synchronous aborts a hang may fire: the owner (lifecycle) signal handed to the step, or the runner's shutdown signal. */
+interface GateAborts { abortOwner: (reason: unknown) => void; abortShutdown: (reason: unknown) => void }
+
 /** Run one claim whose human re-plan gate reaches prepareGateCheckpoint on the real Claude path, with the
  *  switch held. `hang` injects the failure and returns its release; `entered` must come true on its own. */
 async function gateCheckpointRun(o: {
-  hang: (flight: GateFlightView, x: DriveControl, rec: GateRec) => Promise<{ release: () => void; entered: () => boolean }>;
+  hang: (flight: GateFlightView, x: DriveControl, rec: GateRec, abort: GateAborts) => Promise<{ release: () => void; entered: () => boolean }>;
   dirty?: boolean; forward?: Partial<SdkExecutorOptions>; tailMs?: number; deadlineMs?: number;
   runnerOpts?: Record<string, unknown>;
   /** Abort the lifecycle (owner) signal handed to the step this many ms after it starts, with this reason. */
@@ -2199,7 +2202,14 @@ async function gateCheckpointRun(o: {
       fs.writeFileSync(path.join(wt, untrackedPath), "untracked work\n");
       treeBefore = viewTree(wt, trackedPath, untrackedPath);
     }
-    const injected = await o.hang(flight, ctl, rec);
+    // The owner signal is merged in before `hang` runs, so a hang can abort it synchronously.
+    const owner = new AbortController();
+    args[2] = AbortSignal.any([args[2] as AbortSignal, owner.signal]);
+    const abort: GateAborts = {
+      abortOwner: (reason) => owner.abort(reason),
+      abortShutdown: (reason) => (this as unknown as { shutdownSignal: AbortController }).shutdownSignal.abort(reason),
+    };
+    const injected = await o.hang(flight, ctl, rec, abort);
     release = injected.release;
     hangEntered = injected.entered;
     rec.before = custody(flight, { run_id: claimId });
@@ -2209,8 +2219,6 @@ async function gateCheckpointRun(o: {
     rec.startedAt = Date.now();
     let ownerTimer: NodeJS.Timeout | undefined;
     if (o.ownerAbort) {
-      const owner = new AbortController();
-      args[2] = AbortSignal.any([args[2] as AbortSignal, owner.signal]);
       ownerTimer = setTimeout(() => owner.abort(o.ownerAbort!.reason), o.ownerAbort.afterMs);
     }
     try { return await prepare.apply(this, args); }
@@ -2465,6 +2473,86 @@ describe("issue #3980: the Claude gate checkpoint is bounded", () => {
     assert.equal(r.rec.after!.gates, 0, "no gate presented");
   });
 
+  /** Codex path (`bound` undefined): the executor has a credential-free capture lane. A stub lane aborts via the given
+   *  abort and reports `incomplete` without entering the action, so runFreeCapture returns `incomplete` and only the
+   *  explicit rethrow after it can keep the abort's reason. The stub is removed on release. */
+  async function abortInCodexLane(which: "abortOwner" | "abortShutdown", reason: Error) {
+    let calls = 0;
+    return gateCheckpointRun({
+      dirty: true,
+      hang: async (flight, _x, _rec, abort) => {
+        const executor = (flight as unknown as { executor: Record<string, unknown> }).executor;
+        const had = Object.prototype.hasOwnProperty.call(executor, "withCredentialFreeCapture");
+        const prior = executor.withCredentialFreeCapture;
+        executor.withCredentialFreeCapture = async () => { calls++; abort[which](reason); return { kind: "incomplete" }; };
+        const release = (): void => { if (had) executor.withCredentialFreeCapture = prior; else delete executor.withCredentialFreeCapture; };
+        return { release, entered: () => calls > 0 };
+      },
+    });
+  }
+
+  it("(7d) an owner abort while a Codex-path capture lane reports incomplete surfaces the owner's reason, not TransientRecoveryError", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const reason = new Error("owner cancelled in the codex lane (3980 test)");
+    const r = await abortInCodexLane("abortOwner", reason);
+    assert.equal(r.rec.entered, true, "the run reached prepareGateCheckpoint");
+    assert.equal(r.entered, true, "the stub capture lane was entered");
+    assert.equal(r.rec.watchdogFired, false, "the step settled by itself");
+    assert.ok(!(r.rec.error instanceof TransientRecoveryError), `not remapped to TransientRecoveryError: ${String(r.rec.error)}`);
+    assert.equal(r.rec.error, reason, "the owner's own reason is what the step rejects with");
+  });
+
+  it("(7e) a shutdown abort while a Codex-path capture lane reports incomplete surfaces the shutdown reason, not TransientRecoveryError", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const reason = new Error("worker shutting down in the codex lane (3980 test)");
+    const r = await abortInCodexLane("abortShutdown", reason);
+    assert.equal(r.rec.entered, true, "the run reached prepareGateCheckpoint");
+    assert.equal(r.entered, true, "the stub capture lane was entered");
+    assert.equal(r.rec.watchdogFired, false, "the step settled by itself");
+    assert.ok(!(r.rec.error instanceof TransientRecoveryError), `not remapped to TransientRecoveryError: ${String(r.rec.error)}`);
+    assert.equal(r.rec.error, reason, "the shutdown reason is what the step rejects with");
+  });
+
+  /** Claude path: abort during runFreeCapture's own (first) settle, via the given abort; the step must keep that reason. */
+  async function abortDuringSettle(which: "abortOwner" | "abortShutdown", reason: Error) {
+    let settles = 0;
+    return gateCheckpointRun({
+      dirty: true, forward: {},
+      hang: async (_flight, x, _rec, abort) => {
+        const sdk = x.sdk!;
+        const original = sdk.closeAndSettlePlanSummary.bind(sdk);
+        sdk.closeAndSettlePlanSummary = (async (deadlineMs?: number) => {
+          settles++;
+          if (settles === 1) { abort[which](reason); return; }
+          return original(deadlineMs);
+        }) as typeof sdk.closeAndSettlePlanSummary;
+        return { release: () => undefined, entered: () => settles > 0 };
+      },
+    });
+  }
+
+  it("(7b) Claude path pin: an owner abort during the plan-summary settle keeps the owner's reason via the existing deadline-family mapping", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const reason = new Error("owner cancelled during the settle (3980 test)");
+    const r = await abortDuringSettle("abortOwner", reason);
+    assert.equal(r.rec.entered, true, "the run reached prepareGateCheckpoint");
+    assert.equal(r.entered, true, "the settle was entered");
+    assert.equal(r.rec.watchdogFired, false, "the step settled by itself");
+    assert.ok(!(r.rec.error instanceof TransientRecoveryError), `not remapped to TransientRecoveryError: ${String(r.rec.error)}`);
+    assert.equal(r.rec.error, reason, "the owner's own reason is what the step rejects with");
+    assertCustodyIntact(r);
+    assert.equal(r.rec.after!.gates, 0, "no gate presented");
+  });
+
+  it("(7c) Claude path pin: a shutdown abort during the plan-summary settle keeps the shutdown reason via the existing deadline-family mapping", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const reason = new Error("worker shutting down during the settle (3980 test)");
+    const r = await abortDuringSettle("abortShutdown", reason);
+    assert.equal(r.rec.entered, true, "the run reached prepareGateCheckpoint");
+    assert.equal(r.entered, true, "the settle was entered");
+    assert.equal(r.rec.watchdogFired, false, "the step settled by itself");
+    assert.ok(!(r.rec.error instanceof TransientRecoveryError), `not remapped to TransientRecoveryError: ${String(r.rec.error)}`);
+    assert.equal(r.rec.error, reason, "the shutdown reason is what the step rejects with");
+    assertCustodyIntact(r);
+    assert.equal(r.rec.after!.gates, 0, "no gate presented");
+  });
+
   it("(8) a non-deadline failure from the capture inside the bound is not remapped to TransientRecoveryError", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
     const refusal = new TrustedExecutionRefusal("codex harness is closed");
     const proto = RunRunner.prototype as unknown as { captureRecoveryRestorePoint: (...args: unknown[]) => Promise<unknown> };
@@ -2563,23 +2651,30 @@ describe("issue #3980: awaitTickSurvivorsGone with a gate deadline", () => {
       runLog: { ...nullLogger(), warn: (m: string) => { warns.push(m); } } });
     return { runner, flight, warns };
   }
-  const block = (ms: number): void => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
 
-  it("a deadline that expires between two groups' SIGKILLs sends no later signal and starts no second wait", async () => {
+  it("a deadline that expires between two groups' SIGKILLs sends no later signal and starts no second wait", async (t) => {
+    // Mock Date and setTimeout so the 2 s wait and the "slow" signal are exact, not wall-clock dependent.
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
     const signals: number[] = [];
     let probesAfterSignal = 0;
     const { runner, flight, warns } = survivorRunner({
       alive: () => { if (signals.length > 0) probesAfterSignal++; return true; },
-      signal: (pgid) => { signals.push(pgid); block(150); return true; },
+      // The first signal takes 150 ms of (mock) time, which carries the clock past the deadline.
+      signal: (pgid) => { signals.push(pgid); t.mock.timers.tick(150); return true; },
     });
     const started = Date.now();
     // The first full wait is 2 s, so the deadline must outlast it; the first signal then outlasts the deadline.
-    const verdict = await runner.awaitTickSurvivorsGone(flight([101, 102]), started + 2000 + 100);
+    let settled = false;
+    const pending = runner.awaitTickSurvivorsGone(flight([101, 102]), started + 2000 + 100).finally(() => { settled = true; });
+    for (let i = 0; !settled && i < 1000; i++) {
+      await new Promise((resolve) => setImmediate(resolve));
+      if (!settled) t.mock.timers.tick(25);
+    }
+    const verdict = await pending;
     assert.equal(verdict, "unconfirmed");
     assert.deepEqual(signals, [101], "the second group was not signalled after the deadline passed");
     assert.equal(probesAfterSignal, 0, "no second wait began");
     assert.deepEqual(warns, ["tick survivors unresolved at the gate checkpoint deadline"]);
-    assert.ok(Date.now() - started < 3000);
   });
 
   it("an expiry during the first wait sends no signal at all", async () => {
