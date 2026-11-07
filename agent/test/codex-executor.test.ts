@@ -29630,6 +29630,24 @@ describe("CodexExecutor: the one-claim Fresh allowance starts at most one provid
     }
   });
 
+  it("a failed thread/start still spends the allowance: the same claim's retried root sends no second thread/start", async () => {
+    const allowance = { remaining: 1 };
+    const first = makeRig();
+    first.transport.requestOverride = (c) => c.method === "thread/start" ? Promise.reject(rpcRejection()) : undefined;
+    first.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    // The outcome of the failed root is not under test; only that it attempted the start once.
+    await withTimeout(makeExecutor(first, bindingOf(SUBSCRIPTION)).run(makeCtx({ preserveConversation: true, policyFreshAllowance: allowance }).ctx), 3000, "failing first root")
+      .then(() => undefined, () => undefined);
+    assert.deepEqual(routes(first.transport).map((r) => r.method), ["thread/start"], "exactly one start was attempted");
+    assert.equal(allowance.remaining, 0, "the allowance was spent before the start was sent, so its failure cannot refund it");
+    // The same claim retries a root with the same allowance object: it re-holds instead of starting again.
+    const retry = makeRig();
+    retry.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    await assert.rejects(withTimeout(makeExecutor(retry, bindingOf(SUBSCRIPTION)).run(makeCtx({ preserveConversation: true, policyFreshAllowance: allowance }).ctx), 3000, "retried root"),
+      rejectsWith("session_missing"));
+    assert.deepEqual(routes(retry.transport), [], "no second thread/start after the failed one");
+  });
+
   it("forced epoch recreation in the same claim never sends a second thread/start and re-holds", async () => {
     const rig = makeMultiEpochRig([
       epochResponder("th-1", "tn-1", (t, th, tn) => {

@@ -198,6 +198,16 @@ func TestPolicyFreshConfirmationLiveDB(t *testing.T) {
 			t.Fatalf("generation 3 confirmed: %s", freshStamps(got))
 		}
 	})
+	t.Run("a report at the consuming generation cannot confirm once the claim moved on", func(t *testing.T) {
+		p, id := seed(t)
+		if moved := p.releaseAndReclaim(t, id); moved.ClaimGeneration != 3 {
+			t.Fatalf("setup: want generation 3, got %s", freshStamps(moved))
+		}
+		confirmWith(t, p, id, &g2, &sid) // consumed == 2 == report, but claim_generation == 3
+		if got := p.run(t, id); got.PolicyFreshConfirmedGeneration.Valid {
+			t.Fatalf("generation 2 confirmed on a generation 3 claim: %s", freshStamps(got))
+		}
+	})
 	t.Run("a legacy report without a generation cannot confirm", func(t *testing.T) {
 		p, id := seed(t)
 		confirmWith(t, p, id, nil, &sid)

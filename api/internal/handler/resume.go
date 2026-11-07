@@ -57,7 +57,7 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 	}
 	// Only an unresolved episode blocks the ordinary resume; a resolved preserving run keeps its
 	// constraint and resumes ordinary holds normally.
-	if workersvc.UnresolvedPolicyEpisode(run) {
+	if blocksOrdinaryResume(run) {
 		httpx.Error(w, http.StatusConflict, "policy hold continuation is unavailable without an explicit mode; resume it with mode and expected_episode_id")
 		return
 	}
@@ -254,6 +254,21 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.writeResumedRun(w, r, user.ID, runID, false)
+}
+
+// blocksOrdinaryResume reports whether an empty-body resume must be refused for an open policy
+// episode. A pending Fresh authorization on an already-resolved episode (restored by a claim
+// release/park) does not block: the mode-bearing resume refuses a resolved episode, so refusing the
+// ordinary one too would be a dead end, and the authorization is consumed at the next claim.
+func blocksOrdinaryResume(run store.Run) bool {
+	if !workersvc.UnresolvedPolicyEpisode(run) {
+		return false
+	}
+	heldForPolicy := run.HoldReason.Valid && run.HoldReason.String == "codex_policy_hold"
+	if !heldForPolicy && run.PolicyPendingFresh && run.PolicyResolvedAt.Valid {
+		return false
+	}
+	return true
 }
 
 // writeResumedRun re-reads the run owner-scoped so the DTO shows the resumed (queued) status.

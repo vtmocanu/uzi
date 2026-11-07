@@ -3,6 +3,7 @@
 ALTER TABLE runs VALIDATE CONSTRAINT runs_policy_fresh_generation_shape;
 
 -- +goose Down
+SET LOCAL lock_timeout = '30s';
 ALTER TABLE runs DROP CONSTRAINT runs_policy_fresh_generation_shape;
 ALTER TABLE runs ADD CONSTRAINT runs_policy_fresh_generation_shape CHECK (
     (policy_fresh_consumed_generation IS NULL OR (policy_fresh_consumed_generation > 0 AND policy_fresh_consumed_generation <= 9007199254740991))
