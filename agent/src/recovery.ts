@@ -7730,7 +7730,8 @@ export function validCompletionSource(value: unknown): value is CompletionSource
  * (discardRetained*, which carries its own authority) and detachTerminalRetained. The last copies the journal,
  * fence included, into the protected `uzi-retained.<run>.journal` descriptor before it clears the active key;
  * the captured base parser rejects that descriptor's journal for the unknown fence key (pinned by
- * test/git-completion-fence.test.ts), so a worker built before the fence still refuses it. Every other journal
+ * test/git-completion-fence.test.ts), so a worker built before the fence still refuses it. Detach refuses a
+ * journal carrying an active remediation record (#4058). Every other journal
  * rewrite spreads the existing journal and so carries the fence along.
  *
  * Wider boundary (issue #3638): the cooperative memory-park record is a second strict journal key, `memoryPark`.

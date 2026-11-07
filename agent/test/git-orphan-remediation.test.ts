@@ -9,6 +9,7 @@ import type { AuthoritySettlement, GitAuthorityHooks } from "../src/git-authorit
 import type { CompletionSourceFence } from "../src/completion-source.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, noProofReseed, testGitCacheOptions } from "./helpers.js";
+import { legacyProtectedDetach } from "./legacy-protected-detach.js";
 
 // issue #4058 M1: the git-layer classification of a terminal owner's journal that carries an active
 // remediation recovery record, and the typed refusal of every release, retirement or detach of it.
@@ -157,6 +158,20 @@ describe("typed refusal of every release, retirement and detach", () => {
     await enroll();
     const before = configBytes();
     const err = await cache.detachTerminalRetained(bare, BRANCH, KEY, stale).then(() => undefined, (e: unknown) => e);
+    assert.ok(err instanceof RemediationRecoveryRetainedError);
+    assert.equal((err as Error).message, "remediation recovery detach requires proof");
+    assert.deepEqual(configBytes(), before);
+  });
+
+  test("detachTerminalRetained refuses on the expected record alone when a prior descriptor exists and the journal is cleared", async () => {
+    await enroll();
+    await cache.reserveRecoveryIteration(bare, BRANCH, KEY, source());
+    const expected = journal() as unknown as RecoveryJournalEntry;
+    // Legacy (pre-#4058) protected descriptor carrying the record; the active journal is then cleared.
+    await legacyProtectedDetach(cache, bare, BRANCH, KEY, expected);
+    assert.equal(rawJournal(), "");
+    const before = configBytes();
+    const err = await cache.detachTerminalRetained(bare, BRANCH, KEY, expected).then(() => undefined, (e: unknown) => e);
     assert.ok(err instanceof RemediationRecoveryRetainedError);
     assert.equal((err as Error).message, "remediation recovery detach requires proof");
     assert.deepEqual(configBytes(), before);
