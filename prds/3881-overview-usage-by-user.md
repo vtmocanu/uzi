@@ -1,6 +1,6 @@
 # PRD #3881: Overview preview, usage with a by-user table
 
-**Status**: Draft, parked (`Later`). Child of epic #3873. Blocked by: #3878 (the preview page and its data hook).
+**Status**: Ready for dispatch (refreshed 2026-11-07 against main; #3878, #3879 and #3880 merged). Child of epic #3873. The preview page is `web/src/pages/OverviewNext.tsx`, which renders the carried-over `UsageCard` from the admin-gated `useOverviewData` hook (`web/src/lib/useOverviewData.ts`).
 
 **Design brief**: `prds/3873-overview-redesign.md` (model-fidelity rules, data readiness, reuse map, constraints, mock contract). This PRD wins where it is more specific.
 
@@ -16,17 +16,20 @@ On `/overview/next`, one **Usage** card replacing the usage card the preview car
 
 - **Scope toggle** You / Factory · all users (admins only) and the existing window toggle All time / Last 7 days, remembered in the existing `uzi.usageWindow` preference.
 - **Figures**: Cost (API-equivalent) with today's incomplete-data disclosure; Pull requests opened with cost per PR ("at least" when cost is incomplete); Failed runs rate (failed of finished, with the change against all time); Tokens with in, cached and out.
-- **Outcomes**: today's finished-run bar (completed, cancelled, rejected, failed), where rejected is plan rejections plus base divergence, as today; today's descriptive recoverable-work note, not a segment (issue #1418 removed the needs-landing hatch, `web/src/components/UsageCards.tsx:96`); "No finished runs in this period." when nothing finished; top failure causes; and "Latest failure (all time)" with the run link.
-- **By user** (Factory scope, admins only): User, Runs, PRs, Failed, Fail rate, Last failure, Cost, sorted by cost, with a Factory total row, following the window toggle. Runs is `run_count` / `last7_run_count` (runs with recorded usage). The Factory row's lifetime Runs is the factory `run_count`; its 7-day Runs is the sum of the user rows' `last7_run_count`, because `SelfUsage` has no 7-day run count; Fail rate divides failed by finished runs; Last failure is lifetime-only (`last_failed_at`, `web/src/lib/apiTypes.ts:4306`), shown as "3h ago" in both windows, with a header tooltip saying so; today's table already shows the lifetime value in both windows under the title "Since last failure" (`UsageCards.tsx:370`), which this column renames. The viewer's own row is marked "(you)".
+- **Outcomes**: today's finished-run bar (completed, cancelled, rejected, failed), where rejected is plan rejections plus base divergence, as today; today's descriptive recoverable-work note, not a segment (issue #1418 removed the needs-landing hatch; see the comment above `FailedRunsBlock` in `web/src/components/UsageCards.tsx`); "No finished runs in this period." when nothing finished; top failure causes; and "Latest failure (all time)" with the run link.
+- **By user** (Factory scope, admins only): User, Runs, PRs, Failed, Fail rate, Last failure, Cost, sorted by cost, with a Factory total row, following the window toggle. Runs is `run_count` / `last7_run_count` (runs with recorded usage). The Factory row's lifetime Runs is the factory `run_count`; its 7-day Runs is the sum of the user rows' `last7_run_count`, because `SelfUsage` has no 7-day run count; Fail rate divides failed by finished runs; Last failure is lifetime-only (`last_failed_at`, `web/src/lib/apiTypes.ts:4354`), shown as "3h ago" in both windows, with a header tooltip saying so; today's table already shows the lifetime value in both windows under the title "Since last failure" (`UsageCards.tsx:370`), which this column renames. The viewer's own row is marked "(you)".
 - No cost-over-time chart (brief D12).
 
 Acceptance examples:
 
-- An admin switches to Factory: the By user table appears and its rows sum to the Factory row for Runs, PRs, Failed and Cost; a non-admin sees no scope toggle and no table, and sends no admin request.
+- An admin switches to Factory: the By user table appears and, on a stable fixture, its rows sum to the Factory row for Runs, PRs, Failed and Cost (the API reads factory totals and per-user rows in separate queries, `api/internal/handler/usage.go`, so live data may differ transiently during concurrent updates); a non-admin sees no scope toggle and no table, and sends no admin request.
 - In Last 7 days, the Last failure column shows the same values as in All time, and its tooltip says the value is all time.
 - With incomplete cost data, the cost per PR reads "at least $X per PR", as today.
 
 ## Out of scope
+
+Owner-accepted omissions against today's card (2026-11-07): the preview shows no side-by-side You and Factory columns, no per-user Tokens, Out or Cost share columns, and no You-scope run-count line. Tests assert the intended figures and the exact by-user columns, so these do not come back by accident.
+
 
 The per-user Claude / Codex split (#3876). Today's Tokens, Out and Cost share columns are not on the preview; the current Overview keeps them until #3877 decides.
 
@@ -38,9 +41,15 @@ The per-user Claude / Codex split (#3876). Today's Tokens, Out and Cost share co
 
 ## Testing decisions
 
-- Unit tests for the by-user rows: the sums equal the factory totals per window; the fail rate uses finished runs, not Runs; Last failure is the same in both windows.
-- Component tests for the toggles, the admin gate, the "(you)" marker and the incomplete-cost disclosure, following `web/src/components/UsageCards.test.tsx` if present, else `Dashboard.test.tsx`.
+- Unit tests for the by-user rows: on a stable fixture the sums equal the factory totals per window; the fail rate uses finished runs, not Runs; Last failure is the same in both windows.
+- Component tests for the toggles, the admin gate, the "(you)" marker and the incomplete-cost disclosure, following `web/src/components/UsageCards.test.tsx`.
 - Screenshots against the mock (You and Factory, both windows, desktop and 400 px with the table scrolling inside its container, Ember and Dawn).
+
+## Run boundary
+
+- In-run: `task check:web`, the touched Vitest files and the affected browser cases (including the 400 px table scroll), `cd web && npm run build`, `task docs:sync` and `task check-docs:web` if docs change, `task check:changelog-entry`, and `task scan:secrets` plus `task sast:semgrep` because the table renders user-supplied names.
+- Landing obligations (exact-head PR CI): full `test:web`, `test:web-browser` and `gate:repo`.
+- No migration, and no `.github/workflows/**` writes in implementation or validation.
 
 ## Milestones
 
