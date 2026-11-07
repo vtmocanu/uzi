@@ -271,14 +271,17 @@ function createRuntime(options = {}) {
         if (finished) throw new Error('epoch reclaim finished');
         stickyStop = true;
       };
+      const verifyExclusive = () => {
+        if (mode !== 'exclusive' || fd === undefined) throw new Error('exclusive epoch ownership required');
+        verify(fd, names.epoch, 0o600, heldIdentity);
+      };
       const assertExclusive = () => {
         requireLive();
         if (finished) throw new Error('epoch reclaim finished');
         if (stickyStop) throw new Error('epoch reclaim stopped');
         try {
           aborted(signal);
-          if (mode !== 'exclusive' || fd === undefined) throw new Error('exclusive epoch ownership required');
-          verify(fd, names.epoch, 0o600, heldIdentity);
+          verifyExclusive();
         } catch (error) { stop(); throw error; }
       };
       const assertSettled = () => {
@@ -314,7 +317,13 @@ function createRuntime(options = {}) {
         stopped() { return stickyStop; },
         assertSettled,
         finish() {
-          assertSettled();
+          // Shutdown stops new work, but a fully joined scope can still finish.
+          // Recheck the held inode; never clear a sticky stop or pending mutation.
+          requireLive();
+          if (finished) throw new Error('epoch reclaim finished');
+          if (stickyStop) throw new Error('epoch reclaim stopped');
+          try { verifyExclusive(); } catch (error) { stop(); throw error; }
+          if (mutations) throw new Error('epoch mutations pending');
           finished = true;
           activeScope = undefined;
         },

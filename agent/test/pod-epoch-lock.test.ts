@@ -382,6 +382,30 @@ test("abort during active reclaim permanently stops proof and release after tick
   await assert.rejects(held.reacquireShared(), /stopped/);
 });
 
+test("shutdown finishes a settled reclaim scope but keeps an unsettled one exclusive", async (t) => {
+  for (const settled of [true, false]) {
+    const f = fixture(t);
+    await f.runtime.seed(S);
+    const abort = new AbortController();
+    const held = await f.runtime.acquire({ firstMode: "exclusive", signal: abort.signal });
+    const scope = held.beginReclaim!();
+    const ticket = scope.beginMutation();
+    if (settled) ticket.settle();
+    abort.abort(new Error("shutdown"));
+
+    if (settled) {
+      assert.doesNotThrow(() => scope.finish(), "settled work can finish after shutdown");
+      assert.equal(scope.stopped(), false);
+      held.close();
+    } else {
+      assert.throws(() => scope.finish(), /pending/, "pending work cannot finish after shutdown");
+      assert.throws(() => held.close(), /active/, "exclusive ownership stays held");
+      scope.stop();
+      assert.throws(() => held.close(), /stopped/);
+    }
+  }
+});
+
 test("trusted stdio decoration copies pipes and appends the acquired open description only", async (t) => {
   const f = fixture(t);
   await f.runtime.seed(S);
