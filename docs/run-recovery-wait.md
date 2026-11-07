@@ -273,9 +273,10 @@ or another counted park. Resume does not reset that cap. The one exception to
 
 **Capacity-only window (owner hold below the cap).** When a retained-recovery
 window ends with every reservation the worker witnessed refused for
-data-volume capacity (including a window whose next reservation then found the
-recovery deadline or budget spent after at least one such refusal; a deadline
-hit inside a consumed attempt makes the window mixed), the worker sends its
+data-volume capacity (including a window that reaches its recovery deadline
+or budget after at least one such refusal; a deadline that aborts a consumed
+attempt, rather than a capacity refusal ending it, makes the window mixed), the
+worker sends its
 `retained_recovery_exhausted` park with the request-only field
 `retained_capacity_only: true`, and only if the API advertises
 `retained_recovery_capacity_hold_v1`. The API then holds the run for the
