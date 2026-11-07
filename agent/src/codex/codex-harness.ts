@@ -1337,7 +1337,9 @@ export class CodexHarness implements RunHarness {
           // Only the claim's one-claim Fresh allowance may start a conversation, exactly once: it is spent
           // BEFORE thread/start, so a failure after the send can never admit a second new conversation.
           const allowance = request.policyFreshAllowance;
-          if (allowance === undefined || allowance.remaining !== 1) throw new PolicyContinuationRejected("session_missing");
+          if (allowance === undefined) throw new PolicyContinuationRejected("session_missing");
+          // A spent allowance means a thread/start may already have been sent: do not assert none started.
+          if (allowance.remaining !== 1) throw new PolicyContinuationRejected("fresh_start_uncertain");
           allowance.remaining = 0;
         }
         const resumed = request.resumeSessionId !== undefined;

@@ -29616,7 +29616,7 @@ describe("CodexExecutor: the one-claim Fresh allowance starts at most one provid
     const second = makeRig();
     second.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
     await assert.rejects(withTimeout(makeExecutor(second, bindingOf(SUBSCRIPTION)).run(makeCtx({ preserveConversation: true, policyFreshAllowance: allowance }).ctx), 3000, "second root"),
-      rejectsWith("session_missing"));
+      rejectsWith("fresh_start_uncertain"));
     assert.deepEqual(routes(second.transport), [], "no second conversation was started");
   });
 
@@ -29625,7 +29625,7 @@ describe("CodexExecutor: the one-claim Fresh allowance starts at most one provid
       const rig = makeRig();
       rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
       const { ctx } = makeCtx({ preserveConversation: true, policyFreshAllowance: { remaining } });
-      await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, `allowance ${remaining}`), rejectsWith("session_missing"));
+      await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, `allowance ${remaining}`), rejectsWith("fresh_start_uncertain"));
       assert.deepEqual(routes(rig.transport), []);
     }
   });
@@ -29644,7 +29644,7 @@ describe("CodexExecutor: the one-claim Fresh allowance starts at most one provid
     const retry = makeRig();
     retry.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
     await assert.rejects(withTimeout(makeExecutor(retry, bindingOf(SUBSCRIPTION)).run(makeCtx({ preserveConversation: true, policyFreshAllowance: allowance }).ctx), 3000, "retried root"),
-      rejectsWith("session_missing"));
+      rejectsWith("fresh_start_uncertain"));
     assert.deepEqual(routes(retry.transport), [], "no second thread/start after the failed one");
   });
 

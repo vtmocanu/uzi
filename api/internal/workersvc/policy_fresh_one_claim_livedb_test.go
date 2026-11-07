@@ -400,8 +400,11 @@ func TestPolicyFreshRestoreLiveDB(t *testing.T) {
 	}
 	t.Run("the claimed-never-started sweep never restores", func(t *testing.T) {
 		p, id, _ := seed(t)
-		p.e.exec(t, "UPDATE runs SET claimed_at=now()-interval '1 hour' WHERE id=$1", id)
-		if _, err := p.e.q.SweepClaimedNeverStarted(p.e.ctx, store.SweepClaimedNeverStartedParams{Cutoff: pgconv.Time(time.Now().Add(-5 * time.Minute))}); err != nil {
+		// The sweep is global over a shared database: age only this claim far past any other row and sweep
+		// with a cutoff between them, so no other test's claimed run is requeued.
+		p.e.exec(t, "UPDATE runs SET claimed_at=now()-interval '5000 days' WHERE id=$1", id)
+		cutoff := pgconv.Time(time.Now().Add(-1000 * 24 * time.Hour))
+		if _, err := p.e.q.SweepClaimedNeverStarted(p.e.ctx, store.SweepClaimedNeverStartedParams{Cutoff: cutoff, WitnessCutoff: cutoff}); err != nil {
 			t.Fatal(err)
 		}
 		notRestored(t, p, id, "SweepClaimedNeverStarted")
