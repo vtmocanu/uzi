@@ -2254,7 +2254,9 @@ UPDATE runs SET
     -- intervening `running` report, so this statement is never executed on it (D-AG).
     -- Deleting either clear as redundant re-opens the defect on the path the other
     -- one does not cover, and a third non-terminal destination added later needs its
-    -- own. The full argument lives at SetRunAwaitingApproval; this pointer exists so
+    -- own: SettleRunClarificationToGate (issue #3985) is that third writer, an
+    -- awaiting_input -> awaiting_approval move that never passes through running.
+    -- The full argument lives at SetRunAwaitingApproval; this pointer exists so
     -- the invariant is discoverable from EITHER end, which is the only version that
     -- works — a reader who opens only this statement would otherwise learn it is the
     -- sole clear.
@@ -2870,12 +2872,12 @@ UPDATE runs SET
     -- so a garbled worker report becomes a nil param (no change) rather than a bad value.
     size_class = COALESCE(sqlc.narg('size_class'), runs.size_class),
     session_id = COALESCE(sqlc.narg('session_id'), session_id),
-    -- 🔴 INVARIANT, carried by TWO call sites and by nothing else:
-    -- NO SETTER MAY LEAVE A RESOLVED open_question_id BEHIND. The sibling clear is in
-    -- SetRunRunning, which covers the mid-run path; this one covers M4's pre-run park,
-    -- which reaches the gate without ever executing that statement. A third
-    -- non-terminal destination added later re-opens this a third time and nothing
-    -- would catch it.
+    -- 🔴 INVARIANT, carried by THREE call sites and by nothing else:
+    -- NO SETTER MAY LEAVE A RESOLVED open_question_id BEHIND. The sibling clears are in
+    -- SetRunRunning, which covers the mid-run path, and in SettleRunClarificationToGate
+    -- (issue #3985, awaiting_input -> awaiting_approval without running); this one covers
+    -- M4's pre-run park, which reaches the gate without ever executing either. A further
+    -- non-terminal destination added later re-opens this again and nothing would catch it.
     --
     -- Why this statement needs the clear at all (PRD #88 D-AG, measured): M4 lets the
     -- lead ask BEFORE it plans, so a pre-run park goes awaiting_input →
@@ -2895,7 +2897,8 @@ UPDATE runs SET
     --
     -- Sufficient by enumeration: from awaiting_input the only non-terminal
     -- destinations are `running` (cleared in SetRunRunning) and `awaiting_approval`
-    -- (here). The terminal three never resume, so a stale id there is inert.
+    -- (cleared here, and in SettleRunClarificationToGate for the settlement path).
+    -- The terminal three never resume, so a stale id there is inert.
     --
     -- Unlike SetRunRunning's clear there is no WHERE-clause interaction to get wrong:
     -- this statement's WHERE never references open_question_id.
@@ -4801,6 +4804,123 @@ WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM
   AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('credential_switch_settling', 'credential_switch_unsettled'), FALSE))
   -- issue #3194: nor may one leave the base-attestation hold, which keeps this claim.
   AND NOT (status = 'paused' AND COALESCE(hold_reason = 'base_attestation_missing', FALSE));
+
+-- name: SettleRunClarificationToGate :execrows
+-- Issue #3985: the clarification-during-human-revision settlement. On a plan cross-check run
+-- (gated, or required with auto_approve cleared by the server) a non-witness human revise leaves the
+-- run at awaiting_approval; the lead then asks a clarification and SetRunAwaitingInput parks it at
+-- awaiting_input. After the owner's answer is applied, the worker reports clarification_settled and
+-- this statement returns the run to awaiting_approval WITHOUT passing through running. It does NOT
+-- relax SetRunRunning, whose bound-approval clause correctly refuses a running report here.
+--
+-- Contract:
+--   * An answer never implies approval: the statement refuses when an applied bound approve_plan
+--     exists for the current gate revision.
+--   * It does not settle the revise. The pending revise row (consumed by THIS worker and claim
+--     generation, bound to the current gate revision, not applied, not superseded, non-empty) stays
+--     pending, so the lead's next presentation applies it and allocates the next gate revision.
+--   * It adds no presentation and no checker pass (ADR-2149 D16): plan_md, the gate payload,
+--     gate_revision and the candidate columns are not written.
+--
+-- Exactly six columns are written. open_question_id is cleared here as the THIRD non-terminal
+-- destination the SetRunRunning comment names (the other two clears are SetRunRunning and
+-- SetRunAwaitingApproval): NO SETTER MAY LEAVE A RESOLVED open_question_id BEHIND.
+-- completion_question_at is cleared with it, and the awaiting_input gap is banked into
+-- budget_paused_seconds exactly as SetRunRunning banks a park->running transition. Postgres
+-- evaluates every SET right-hand side against the OLD row, so status_since is the park entry.
+--
+-- Every run_user_inputs subquery binds i.run_id = runs.id: the other runs of the same worker may
+-- share a claim generation and gate revision, and a receipt of another run must never satisfy
+-- this run's predicate.
+UPDATE runs SET
+    status                = 'awaiting_approval',
+    status_since          = now(),
+    updated_at            = now(),
+    open_question_id      = NULL,
+    completion_question_at = NULL,
+    budget_paused_seconds = budget_paused_seconds
+        + GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int)
+WHERE runs.id = @id
+  AND runs.worker_id = @worker_id
+  AND runs.claim_generation = @claim_generation
+  AND runs.claim_released_at IS NULL
+  AND runs.kind IN ('issue', 'prompt', 'ci_fix')
+  AND runs.status = 'awaiting_input'
+  AND runs.open_question_id = sqlc.arg('question_id')::text
+  AND runs.completion_question_at IS NULL
+  AND (runs.plan_cross_check_required OR runs.plan_cross_check_gated)
+  AND NOT runs.auto_approve
+  AND runs.plan_md IS NOT NULL
+  AND runs.gate_revision = sqlc.arg('gate_revision')::bigint
+  AND runs.gate_revision > 0
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
+  AND EXISTS (
+      SELECT 1 FROM run_user_inputs i
+      WHERE i.run_id = runs.id AND i.kind = 'answer'
+        AND i.question_id = sqlc.arg('question_id')::text
+        AND i.applied_at IS NOT NULL
+        AND i.disposition IS DISTINCT FROM 'superseded')
+  AND EXISTS (
+      SELECT 1 FROM run_user_inputs i
+      WHERE i.run_id = runs.id AND i.id = sqlc.arg('revision_input_id')::bigint
+        AND i.kind = 'revise_plan'
+        AND btrim(i.body, E' \t\n\r\f\013\u0085\u00A0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF') <> ''
+        AND i.consumed_at IS NOT NULL
+        AND i.consumed_worker_id = runs.worker_id
+        AND i.consumed_claim_generation = runs.claim_generation
+        AND i.applied_at IS NULL
+        AND i.disposition IS NULL
+        AND i.gate_binding = 'bound'
+        AND i.gate_revision = runs.gate_revision)
+  AND NOT EXISTS (
+      SELECT 1 FROM run_user_inputs i
+      WHERE i.run_id = runs.id AND i.kind = 'approve_plan'
+        AND i.gate_binding = 'bound'
+        AND i.gate_revision = runs.gate_revision
+        AND i.applied_at IS NOT NULL
+        AND i.disposition IS DISTINCT FROM 'superseded');
+
+-- name: GetClarificationGateSettlementReplay :one
+-- Issue #3985: read-only idempotent replay for SettleRunClarificationToGate after a lost ACK. True
+-- only when the run is already at awaiting_approval on the SAME claim and gate revision with no open
+-- question, the same applied answer and the same still-pending revise exist, and no applied bound
+-- approval exists. It writes nothing. Every run_user_inputs subquery binds i.run_id = runs.id.
+SELECT EXISTS (
+    SELECT 1 FROM runs
+    WHERE runs.id = @id
+      AND runs.worker_id = @worker_id
+      AND runs.claim_generation = @claim_generation
+      AND runs.claim_released_at IS NULL
+      AND runs.status = 'awaiting_approval'
+      AND runs.open_question_id IS NULL
+      AND runs.gate_revision = sqlc.arg('gate_revision')::bigint
+      AND EXISTS (
+          SELECT 1 FROM run_user_inputs i
+          WHERE i.run_id = runs.id AND i.kind = 'answer'
+            AND i.question_id = sqlc.arg('question_id')::text
+            AND i.applied_at IS NOT NULL
+            AND i.disposition IS DISTINCT FROM 'superseded')
+      AND EXISTS (
+          SELECT 1 FROM run_user_inputs i
+          WHERE i.run_id = runs.id AND i.id = sqlc.arg('revision_input_id')::bigint
+            AND i.kind = 'revise_plan'
+            AND btrim(i.body, E' \t\n\r\f\013\u0085\u00A0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF') <> ''
+            AND i.consumed_at IS NOT NULL
+            AND i.consumed_worker_id = runs.worker_id
+            AND i.consumed_claim_generation = runs.claim_generation
+            AND i.applied_at IS NULL
+            AND i.disposition IS NULL
+            AND i.gate_binding = 'bound'
+            AND i.gate_revision = runs.gate_revision)
+      AND NOT EXISTS (
+          SELECT 1 FROM run_user_inputs i
+          WHERE i.run_id = runs.id AND i.kind = 'approve_plan'
+            AND i.gate_binding = 'bound'
+            AND i.gate_revision = runs.gate_revision
+            AND i.applied_at IS NOT NULL
+            AND i.disposition IS DISTINCT FROM 'superseded')
+)::boolean;
 
 -- name: ClearRunMilestonesCompleted :execrows
 -- PRD #628 M4: the ONLY non-union writer of milestones_completed. milestones_completed
@@ -12009,13 +12129,41 @@ LIMIT @max_rows;
 -- approximately zero runs per tick. As a projection on ListActiveRunsForHealth it would be
 -- one such scan per active run per 15s tick and an index would become mandatory.
 --
+-- SECOND BRANCH (issue #3985): a pending human revise for the run's CURRENT gate counts
+-- regardless of its age. SettleRunClarificationToGate returns a run to awaiting_approval and
+-- stamps status_since = now() while the revise that preceded the clarification stays pending
+-- (consumed, bound to the current gate_revision, unapplied, undisposed), so that revise's
+-- created_at predates the new boundary and the first branch cannot see it; the run is still
+-- waiting on its WORKER (the lead's next presentation applies the revise), not on its owner.
+-- The branch is not age-based, so it stays monotone within an episode: it holds from the
+-- settlement until the next presentation applies the revise (applied_at set), which also
+-- re-stamps status_since through SetRunAwaitingApproval. A run that never had a revise is
+-- unaffected, and so is one whose revise was applied or superseded. The branch carries the
+-- SAME pending-revise predicate SettleRunClarificationToGate requires (non-empty body, consumed
+-- by the run's CURRENT worker and claim generation): a revise consumed only by an earlier,
+-- reclaimed claim that the current flight never re-ACKed (the #1604 dropped-revise shape) does
+-- not count, so that run still reads approval_idle and nudges its owner.
+--
 -- The EXISTS is CAST because sqlc's inference is weaker on expressions than on columns:
 -- uncast, the projection arrives in Go as interface{} rather than bool.
 SELECT (EXISTS (
     SELECT 1 FROM run_user_inputs
-    WHERE run_id = @run_id
-      AND kind IN ('approve_plan', 'reject_plan', 'cancel', 'revise_plan')
-      AND created_at >= @gate_opened_at
+    WHERE run_user_inputs.run_id = @run_id
+      AND run_user_inputs.kind IN ('approve_plan', 'reject_plan', 'cancel', 'revise_plan')
+      AND run_user_inputs.created_at >= @gate_opened_at
+) OR EXISTS (
+    SELECT 1 FROM run_user_inputs i
+    JOIN runs r ON r.id = i.run_id
+    WHERE i.run_id = @run_id
+      AND i.kind = 'revise_plan'
+      AND btrim(i.body, E' \t\n\r\f\013\u0085\u00A0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF') <> ''
+      AND i.applied_at IS NULL
+      AND i.disposition IS NULL
+      AND i.consumed_at IS NOT NULL
+      AND i.consumed_worker_id = r.worker_id
+      AND i.consumed_claim_generation = r.claim_generation
+      AND i.gate_binding = 'bound'
+      AND i.gate_revision = r.gate_revision
 ))::boolean AS has_verdict;
 
 -- name: SetRunWaitOnLimit :execrows

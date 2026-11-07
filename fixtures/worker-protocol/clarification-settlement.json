@@ -1,0 +1,9 @@
+{
+  "status": "clarification_settled",
+  "claim_generation": 1,
+  "clarification_settlement": {
+    "question_id": "question-1",
+    "revision_input_id": 1,
+    "gate_revision": 1
+  }
+}

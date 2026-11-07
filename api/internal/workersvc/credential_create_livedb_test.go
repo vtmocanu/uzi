@@ -47,7 +47,7 @@ func TestCreateRunOverrideFirstClaimSpendsPinnedTokenLiveDB(t *testing.T) {
 	// and passes; here we call the service method directly to prove createRun threads it).
 	waitFalse := false
 	pinnedB := &RawCredentialOverride{Mode: CredentialOverrideModePinned, SecretID: &tokenB}
-	run, err := svc.CreateRun(env.ctx, userID, repoID, iid, "desc", &waitFalse, nil, false /*force*/, nil /*seed*/, nil /*explicit*/, pinnedB)
+	run, err := svc.CreateRun(env.ctx, userID, repoID, iid, "desc", &waitFalse, nil, false /*force*/, nil /*seed*/, nil, nil /*explicit*/, pinnedB)
 	if err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}

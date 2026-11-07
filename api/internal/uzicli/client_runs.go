@@ -402,12 +402,6 @@ func (c *HTTPClient) AcceptCompletionDecision(ctx context.Context, id string, cr
 	return env.Run, nil
 }
 
-// CreateRunSeed is PRD #209's optional seeded plan for CreateRun: an
-// externally-authored plan and the run's subagent roster. Nil ⇒ an ordinary run
-// planned from the issue. It mirrors the server's workersvc.SeededPlan and keeps the
-// coupling STRUCTURAL — a Selection cannot ride without a plan, which is the server's
-// own rule ("agent_selection requires plan_md"): a nil-vs-set seed carries the choice,
-// so no CreateRun caller can express the rejected combination in the first place.
 type CreateRunSeed struct {
 	// PlanMD is the plan text, forwarded verbatim. Empty is a valid value to SEND —
 	// the server returns 422 on an empty/whitespace plan, and letting it decide keeps
@@ -469,7 +463,7 @@ func (r *CreatedRunResult) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, credOverride *CreateRunCredentialOverride, harness string) (CreatedRunResult, error) {
+func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, agentSource string, credOverride *CreateRunCredentialOverride, harness string) (CreatedRunResult, error) {
 	var env struct {
 		Run    apitypes.RunDTO `json:"run"`
 		Notice string          `json:"notice"`
@@ -530,6 +524,8 @@ func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int6
 			reqBody.PlannedCommit = &seed.PlannedCommit
 		}
 		reqBody.RequireBase = seed.RequireBase
+	} else if agentSource != "" {
+		reqBody.Selection = &apitypes.AgentSelection{Source: agentSource, Exclusions: []string{}}
 	}
 	if credOverride != nil {
 		ov := &createRunCredentialOverride{Mode: credOverride.Mode}

@@ -491,6 +491,13 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		// with disposition "held" / "hold_settled". Advertised UNCONDITIONALLY: a worker sends
 		// the two reports ONLY after seeing this token, because an older api 400s the unknown states.
 		{"credential_switch_hold"},
+		// Issue #3985: this api accepts {status:"clarification_settled", claim_generation,
+		// clarification_settlement:{question_id, revision_input_id, gate_revision}} and answers it
+		// with disposition "clarification_settled". It returns a plan cross-check run parked at
+		// awaiting_input, after a clarification asked during a human revision was answered, to its
+		// awaiting_approval gate. Advertised UNCONDITIONALLY: a worker sends the report ONLY after
+		// seeing this token, because an older api 400s the unknown state and field.
+		{"clarification_revision_settlement_v1"},
 	}
 	if publicationResumeEnabled {
 		// Issue #1324: this api accepts NEW publication intents. Omitted when
@@ -1555,7 +1562,7 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			// The service error text already reads "invalid run state: a job run never parks (<state>)".
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, workersvc.ErrInvalidState):
-			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, credential_switch_held, credential_switch_hold_settled, completed, failed")
+			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, credential_switch_held, credential_switch_hold_settled, clarification_settled, completed, failed")
 		default:
 			slog.Error("worker run state", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -1637,6 +1644,10 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		// Issue #3181: the settlement acknowledgement applied (or replayed): the hold is now
 		// credential_switch_unsettled and the owner's Resume is open.
 		ack["disposition"] = "hold_settled"
+	case "clarification_settled":
+		// Issue #3985: the settlement applied (or replayed): the run is back at awaiting_approval
+		// with the human revise still pending. The worker keys on this.
+		ack["disposition"] = "clarification_settled"
 	}
 	if req.State == "awaiting_approval" && gateRevision > 0 {
 		// PRD #1795 M1 (decision 5): the revision this report was answered with, allocated or

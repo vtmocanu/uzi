@@ -182,6 +182,11 @@ export type RunState =
   /** issue #3181: the worker's acknowledgement that the held flight's owned operations have
    *  joined (hold_reason credential_switch_unsettled). Same fences as the hold report. */
   | "credential_switch_hold_settled"
+  /** Issue #3985: a plan cross-check run whose lead asked a clarification after a HUMAN
+   *  revise_plan verdict has the owner's answer; the run returns to awaiting_approval with the
+   *  revise still pending (an answer is never plan approval). Carries `clarification_settlement`
+   *  and `claim_generation`; requires the `clarification_revision_settlement_v1` feature. */
+  | "clarification_settled"
   | "completed"
   | "failed";
 
@@ -2881,7 +2886,16 @@ export interface RunRegistrationEvidence {
   registration_epoch: number;
 }
 
+/** Issue #3985: the identities a `clarification_settled` report binds. */
+export interface ClarificationSettlement {
+  question_id: string;
+  revision_input_id: number;
+  gate_revision: number;
+}
+
 export interface StateRequest {
+  /** Issue #3985: present only on a `clarification_settled` report. */
+  clarification_settlement?: ClarificationSettlement;
   /** Issue #3859: set by the client alone, never by a caller. */
   registration_evidence?: RunRegistrationEvidence;
   /** Memory-pressure park fence, bound to the current registration. */
@@ -3425,6 +3439,8 @@ export interface StateAck {
   credentialSwitchHeld?: boolean;
   /** issue #3181: true when the 200 ack carried `disposition: "hold_settled"`. */
   credentialSwitchHoldSettled?: boolean;
+  /** Issue #3985: true when the 200 ack carried `disposition: "clarification_settled"`. */
+  clarificationSettled?: boolean;
   /** PRD #1795 M1 (decision 5): the TOP-LEVEL `gate_revision` of an `awaiting_approval` ACK — the
    *  revision the report was answered with, allocated or returned inside the report's transaction.
    *  The gate confirms THIS revision for bound-verdict matching. A positive integer only; absent
