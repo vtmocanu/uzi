@@ -455,6 +455,8 @@ func TestClaimCredentialsResetCodexFailsWithNamedReasonLiveDB(t *testing.T) {
 func TestClaimCredentialsResetAfterAssemblyParksLiveDB(t *testing.T) {
 	t.Run("issue run parks", func(t *testing.T) {
 		fx := newCDFix(t)
+		rec := newReadmitRecorder()
+		fx.svc.SetBroadcaster(rec)
 		runID := fx.queuedRun(t, "issue")
 		fired := 0
 		fx.svc.claimHooks = &claimTestHooks{afterAssembly: func(_ context.Context, _ store.Run, p *ClaimPayload, err error) {
@@ -477,6 +479,35 @@ func TestClaimCredentialsResetAfterAssemblyParksLiveDB(t *testing.T) {
 		}
 		if n := openCustodyHolds(t, fx.env, runID); n != 0 {
 			t.Fatalf("open custody holds = %d, want 0", n)
+		}
+		if _, states := rec.published(runID); len(states) != 1 || states[0] != "paused" {
+			t.Fatalf("published states = %v, want [paused]", states)
+		}
+	})
+	// A Claude cross_check checker child is never parked: the reset decides the check
+	// unavailable (failed / checker_unavailable) and fails the child with the bare checker reason,
+	// not the generic credential-unavailable one.
+	//
+	// MUTATION: replace claudeCheckerClaimError(run, errNoModelCredential) in the resetSeen block
+	// of finishRunClaimTx with plain errNoModelCredential; the check is then not decided
+	// checker_unavailable and this subtest fails.
+	t.Run("claude checker child is decided unavailable", func(t *testing.T) {
+		fx := newClaudeCheckerFix(t, BindModePinned)
+		fired := 0
+		fx.svc.claimHooks = &claimTestHooks{afterAssembly: func(_ context.Context, _ store.Run, p *ClaimPayload, err error) {
+			fired++
+			if err != nil || p == nil || p.Secrets.AnthropicOAuthToken == "" {
+				t.Errorf("assembly = (%v, %v), want a payload carrying a token before the reset", p != nil, err)
+			}
+			resetAccountCredentialsTx(t, fx.env, fx.userID)
+		}}
+		p := fx.claim(t)
+		if fired != 1 {
+			t.Fatalf("afterAssembly fired %d times, want 1", fired)
+		}
+		fx.assertCheckerUnavailable(t, p, false)
+		if child := mustRun(t, fx.env, fx.kid); child.HoldReason.Valid {
+			t.Fatalf("a checker child must never park: hold=%v", child.HoldReason)
 		}
 	})
 	for _, kind := range []string{"judge", "job"} {
