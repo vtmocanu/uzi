@@ -107,13 +107,11 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 			awaitingIDs = append(awaitingIDs, row.Run.ID)
 		}
 	}
-	var pendingQuestions map[uuid.UUID]string
-	if len(awaitingIDs) > 0 {
-		pendingQuestions, err = h.wsvc.PendingQuestionsForRuns(r.Context(), awaitingIDs)
-		if err != nil {
-			slog.Error("pending questions", "error", err)
-			pendingQuestions = nil
-		}
+	// An empty id list reads nothing: PendingQuestionsForRuns returns before the store.
+	pendingQuestions, err := h.wsvc.PendingQuestionsForRuns(r.Context(), awaitingIDs)
+	if err != nil {
+		slog.Error("pending questions", "error", err)
+		pendingQuestions = nil
 	}
 
 	// PRD #1189: read the extension cap and the clock ONCE per list response so every row's

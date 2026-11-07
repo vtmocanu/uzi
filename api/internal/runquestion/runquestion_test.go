@@ -53,8 +53,8 @@ func TestExcerpt(t *testing.T) {
 		{"newline collapses before strip", payloadJSON(t, "q", Item{Question: "a\nb"}), "a b"},
 		{"tab collapses before strip", payloadJSON(t, "q", Item{Question: "a\tb"}), "a b"},
 		{"whitespace run", payloadJSON(t, "q", Item{Question: "a \n\t  b"}), "a b"},
-		{"bidi override removed", payloadJSON(t, "q", Item{Question: "Should ‮we go?"}), "Should we go?"},
-		{"zero-width removed", payloadJSON(t, "q", Item{Question: "ab​cd"}), "abcd"},
+		{"bidi override removed", payloadJSON(t, "q", Item{Question: "Should \u202ewe go?"}), "Should we go?"},
+		{"zero-width removed", payloadJSON(t, "q", Item{Question: "ab\u200bcd"}), "abcd"},
 		{"exactly 280 unchanged", payloadJSON(t, "q", Item{Question: long(280)}), long(280)},
 		{"281 capped to 280 with ellipsis", payloadJSON(t, "q", Item{Question: long(281)}), long(279) + "…"},
 		{"trailing space before ellipsis trimmed", payloadJSON(t, "q", Item{Question: long(278) + " " + long(10)}), long(278) + "…"},
@@ -81,7 +81,7 @@ func TestExcerptRejects(t *testing.T) {
 		"missing question id": payloadJSON(t, "", Item{Question: "what?"}),
 		"no text":             payloadJSON(t, "q", Item{Question: "  "}),
 		"no questions":        payloadJSON(t, "q"),
-		"sanitizes to empty":  payloadJSON(t, "q", Item{Question: "‮​\u0007"}),
+		"sanitizes to empty":  payloadJSON(t, "q", Item{Question: "\u202e\u200b\u0007"}),
 	}
 	for name, raw := range cases {
 		t.Run(name, func(t *testing.T) {

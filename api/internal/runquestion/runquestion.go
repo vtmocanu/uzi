@@ -52,14 +52,14 @@ type Option struct {
 	Description string `json:"description"`
 }
 
-// Parse decodes a `question` run-message payload, reporting false for anything the
-// notifier must not post: unparseable JSON, a missing identity (nothing to dedupe on
-// and nothing an answer could name), or no question carrying text.
+// Parse decodes a `question` run-message payload, reporting false for anything no
+// surface may show: unparseable JSON, a missing identity (nothing to dedupe on and
+// nothing an answer could name), or no question carrying text.
 //
 // Defensive in the same register as the worker's own parseQuestions: a malformed
-// payload yields "no question", never a partial post and never a panic. The strings
+// payload yields "no question", never a partial render and never a panic. The strings
 // are already clamped worker-side (2000/60/200 runes), so the caps are not re-applied
-// here — only the total blob is bounded, at the Slack section limit.
+// here; each surface bounds its own output (Slack its section limit, Excerpt its cap).
 func Parse(raw []byte) (Payload, bool) {
 	var p Payload
 	if len(raw) == 0 || json.Unmarshal(raw, &p) != nil {

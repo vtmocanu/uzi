@@ -817,6 +817,7 @@ type Store interface {
 	// /runs + board + run-view current_activity (PRD #1064 M2): the newest tool_use frame
 	// per run for a page, folded into the "now" line in Go by runactivity.FromFrame.
 	LatestToolUseForRuns(ctx context.Context, runIds []uuid.UUID) ([]store.LatestToolUseForRunsRow, error)
+	// PRD #4040: the newest question payload per run, NULL when over 64 KiB (owner-scoped ids only).
 	PendingQuestionsForRuns(ctx context.Context, runIds []uuid.UUID) ([]store.PendingQuestionsForRunsRow, error)
 	// PRD #1353 run-view milestones_live: the three runtime reads milestonelanes.Derive folds
 	// into per-in-progress-milestone live lanes — the newest tool_use frame per live subagent

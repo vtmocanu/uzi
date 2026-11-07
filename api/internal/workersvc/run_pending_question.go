@@ -13,7 +13,9 @@ import (
 // (PendingQuestionsForRuns) that yields the newest question message per run, already
 // bounded in SQL; a NULL (oversized) payload or one runquestion.Excerpt rejects is
 // absent from the map, so the caller omits the field. Callers pass only the page's
-// awaiting_input ids, and an empty slice issues no query.
+// awaiting_input ids, and an empty slice issues no query. The query has no owner
+// predicate: callers must pass only ids the viewer owns (ListRuns' owner-scoped rows),
+// never an admin or cross-user page.
 func (s *Service) PendingQuestionsForRuns(ctx context.Context, runIDs []uuid.UUID) (map[uuid.UUID]string, error) {
 	if len(runIDs) == 0 {
 		return map[uuid.UUID]string{}, nil
@@ -24,9 +26,6 @@ func (s *Service) PendingQuestionsForRuns(ctx context.Context, runIDs []uuid.UUI
 	}
 	out := make(map[uuid.UUID]string, len(rows))
 	for _, r := range rows {
-		if r.Payload == nil {
-			continue
-		}
 		if ex, ok := runquestion.Excerpt(r.Payload); ok {
 			out[r.RunID] = ex
 		}
