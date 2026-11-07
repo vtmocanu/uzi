@@ -572,13 +572,16 @@ publishing finished work, is a different park with its own bound; see
 [Forge unreachable while publishing](#forge-unreachable-while-publishing).
 
 If a park report is sent but its reply is lost, the worker asks uzi whether
-the run is parked, resending the report if it is not. When that check or the
-resend is permanently refused (anything other than not found, a timeout or
-rate limiting), the worker stops retrying and reports nothing. It keeps the
-session when it can be resumed on that worker, keeps any publication record
-and source, leaves custody unsettled, and leaves the run to the server or its
-owner. A refusal is not treated as proof that the run ended. The same applies
-to the data-volume park and to a park while publishing.
+the run is parked, resending the report if it is not. When that check is
+permanently refused (anything other than not found, a timeout or rate
+limiting), or the resend is (anything other than a timeout or rate limiting;
+a resend rejected as a bad request still fails the run, as before), the
+worker stops retrying and reports nothing. It keeps the session when it can
+be resumed on that worker, keeps any publication record and source, leaves
+custody unsettled, and leaves the run to the server or its owner. A refusal
+is not treated as proof that the run ended. The same applies to the
+data-volume park and to a claim already enrolled for publication whose clone
+fails; the later publishing park below is a separate path.
 
 ## Forge unreachable while publishing
 

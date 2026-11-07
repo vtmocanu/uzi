@@ -8747,8 +8747,8 @@ export class RunRunner {
    * PRD #1392 M2 — send the forge park report ONCE and dispatch on the ack (D10). A generic 400
    * (an api that rejects the fields) → today's failed path, never park. A transport failure AFTER
    * the send is an UNKNOWN outcome, never a failure: reconcile via the ownership probe. Inside that
-   * reconcile a 404 is a stale owner (stop, HOME cleaned; a resend 404 re-probes first); any other
-   * definitive 4xx (not 408/429) on the probe or on a resend exception is a conservative stop (no park, no terminal report, no custody
+   * reconcile a probe 404 is a stale owner (stop, HOME cleaned); any other definitive 4xx (not
+   * 408/429) on the probe, or any definitive 4xx other than 400 on a resend exception, is a conservative stop (no park, no terminal report, no custody
    * settle; a 401/403 is not proof ownership ended); 408/429/5xx/transport failures retry with backoff.
    */
   private async reportForgeParkAndDispatch(
@@ -8933,8 +8933,7 @@ export class RunRunner {
    * authoritative terminal → today's cleanup (no park); a 404 (stale_claim / not owned / reclaimed)
    * → stop. A transport failure ON the probe is itself unknown, so retain the (possibly parked)
    * session and retry — NEVER clean it — until the outcome is known. Any OTHER definitive 4xx
-   * (not 408/429) on the probe, or on the resend (other than the 400 failed path and a 404, which
-   * re-probes), is a permanent
+   * (not 408/429) on the probe, or on the resend (other than the 400 failed path), is a permanent
    * refusal that no retry will change: stopForgeParkReconcileConservatively keeps the possibly parked
    * session, source, records and custody, reports nothing, and leaves the run to the server or owner.
    */
@@ -9018,8 +9017,7 @@ export class RunRunner {
             });
             return "fail";
           }
-          // A resend 404 still re-probes, so the probe's 404 arm keeps deciding the stale-owner stop.
-          if (this.isDefinitiveApiRefusal(reportErr) && reportErr.status !== 404) {
+          if (this.isDefinitiveApiRefusal(reportErr)) {
             return await this.stopForgeParkReconcileConservatively(body, claim, flight, runLog, runHome, copy, "resend", reportErr);
           }
           runLog.warn(`${copy.log} reconcile: resend failed transport; re-probing`, {

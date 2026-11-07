@@ -1004,7 +1004,7 @@ describe("forge-park reconcile — a permanent resend refusal (#3856)", () => {
     });
   }
 
-  it("control: resend 404 re-probes, and the probe's 404 stays a stale-owner stop that cleans HOME", async () => {
+  it("resend 404: a permanent resend refusal also stops conservatively (only a PROBE 404 is the stale owner)", async () => {
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-parkrefuse-resend404-"));
     try {
       const client = new ForgeParkClient(["recovery_park_cause"], {
@@ -1013,21 +1013,18 @@ describe("forge-park reconcile — a permanent resend refusal (#3856)", () => {
           if (n === 2) throw refuse(404, "/state");
           return { applied: true, status: "recovery_wait" };
         },
-        onOwnership: (n) => {
-          if (n === 1) return { status: "running" };
-          if (n === 2) throw refuse(404);
-          return { status: "recovery_wait" };
-        },
+        // Every later probe answers running: an unfixed build resends forever, so bound it with a park.
+        onOwnership: (n) => (n === 1 ? { status: "running" } : { status: "recovery_wait" }),
       });
       const { factory, runHome } = parkFactory(homeRoot, { sessionId: SESSION_ID });
       const clone = stubClone();
       const claim = gitlabClaim(3856_25, { claim_generation: 9, session_id: SESSION_ID });
       await makeRunner(client, factory).execute(claim);
-      assert.equal(client.ownershipCalls, 2, "a resend 404 re-probes; the probe 404 then stops");
+      assert.equal(client.ownershipCalls, 1, "a permanent resend 404 does not re-probe");
       assert.equal(clone.calls(), 1);
       assert.deepEqual(reportedStatuses(client), ["running", "recovery_wait", "recovery_wait"]);
       assert.deepEqual(parkedTexts(claim.run_id), []);
-      assert.equal(fs.existsSync(runHome()), false, "a stale owner cleans HOME even with a transcript");
+      assert.equal(fs.existsSync(runHome()), true, "the resumable session is kept; a resend 404 is not a stale-owner proof");
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
@@ -1074,6 +1071,49 @@ describe("forge-park reconcile — unchanged controls (#3856)", () => {
       assert.equal(client.ownershipCalls, 2);
       assert.equal(parkedTexts(claim.run_id).length, 1);
       assert.ok(!reportedStatuses(client).includes("failed"));
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("resend transport failure re-probes, then the park lands", async () => {
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-parkrefuse-resendnet-"));
+    try {
+      const client = new ForgeParkClient(["recovery_park_cause"], {
+        onParkReport: (_b, n) => {
+          if (n <= 2) throw new Error("socket hang up");
+          return { applied: true, status: "recovery_wait" };
+        },
+        onOwnership: (n) => (n === 1 ? { status: "running" } : { status: "recovery_wait" }),
+      });
+      const { factory } = parkFactory(homeRoot);
+      const clone = stubClone();
+      const claim = gitlabClaim(3856_44, { claim_generation: 9 });
+      await makeRunner(client, factory).execute(claim);
+      assert.equal(client.ownershipCalls, 2, "a transport resend failure re-probes");
+      assert.equal(clone.calls(), 1);
+      assert.deepEqual(reportedStatuses(client), ["running", "recovery_wait", "recovery_wait"]);
+      assert.equal(parkedTexts(claim.run_id).length, 1, "the re-probe's recovery_wait parks");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("a cancelled ownership probe after a lost reply cleans up without a park or a terminal re-report", async () => {
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-parkrefuse-cancelled-"));
+    try {
+      const client = new ForgeParkClient(["recovery_park_cause"], {
+        onParkReport: () => { throw new Error("socket hang up"); },
+        onOwnership: (n) => (n === 1 ? { status: "cancelled", claim_generation: 9 } : { status: "recovery_wait" }),
+      });
+      const { factory } = parkFactory(homeRoot);
+      const clone = stubClone();
+      const claim = gitlabClaim(3856_45, { claim_generation: 9 });
+      await makeRunner(client, factory).execute(claim);
+      assert.equal(client.ownershipCalls, 1, "an authoritative cancelled status resolves the reconcile");
+      assert.equal(clone.calls(), 1);
+      assert.deepEqual(reportedStatuses(client), ["running", "recovery_wait"], "no failed or other re-report");
+      assert.deepEqual(parkedTexts(claim.run_id), []);
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
