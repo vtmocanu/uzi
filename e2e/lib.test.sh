@@ -27,7 +27,8 @@ if ! type _psql_strip_tags >/dev/null 2>&1; then
 fi
 
 # The real capture_agent_logs (#4060), defined up front: phase code extracted by later cases now contains
-# capture lines, and with no RUNROOT/COMPOSE here the helper only reports to stderr and returns 0.
+# capture lines. Later cases provide RUNROOT/COMPOSE; the handoff fixture relies on the exported
+# RUNROOT=$SEQ_DIR to find its snapshots. Without them the helper only reports to stderr and returns 0.
 eval "$(awk '/^capture_agent_logs\(\) \{/,/^\}/' "$LIB")"
 CAL_DEFINED=yes
 type capture_agent_logs >/dev/null 2>&1 || CAL_DEFINED=no
@@ -2158,7 +2159,7 @@ cal_scan() {
       if (t ~ /^capture_agent_logs\(\) \{/) inhelper = 1
       if (inhelper) { if (t ~ /^\}/) inhelper = 0; return }
       emit_absent(t)
-      isCap = (t ~ /capture_agent_logs/)
+      isCap = (t ~ /^[[:space:]]*capture_agent_logs[[:space:]]/)
       if (isCap && t ~ /absent-ok/) pend = FILENAME ":" ln
       idx = index(t, marker)
       if (idx > 0) {
@@ -2172,7 +2173,7 @@ cal_scan() {
         }
         if (verb == "down" || (hasagent && verb ~ /^(kill|stop|restart|start|rm|up)$/)) {
           gsub(/^[[:space:]]+/, "", t)
-          print "HIT\t" FILENAME ":" ln "\t" (prev ~ /capture_agent_logs/ ? "ok" : "BAD") "\t" ctx "\t" t
+          print "HIT\t" FILENAME ":" ln "\t" (prev ~ /^[[:space:]]*capture_agent_logs[[:space:]]/ ? "ok" : "BAD") "\t" ctx "\t" t
         }
       }
       prev = t
