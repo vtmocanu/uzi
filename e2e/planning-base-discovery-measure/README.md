@@ -182,9 +182,8 @@ LIMITS_JSON='{"baseDiscoveryEntryCap":1000}' OUT=/abs/out FIXTURES="fanout2-d8" 
 combined with `SMOKE_INJECT`, and one invocation's rows are all validation or all production.
 
 Rows of two `LIMITS_JSON` invocations into the same `OUT` overwrite each other unless their
-labels differ. Set `LIMITS_TAG` (`[a-z0-9-]{1,40}`, requires `LIMITS_JSON`) to append it to the
-label as `__validation-<tag>`, e.g. `LIMITS_TAG=probe3000-path` (also allowed with
-`DEADLINE_SCALE` alone).
+labels differ. Set `LIMITS_TAG` (`[a-z0-9-]{1,40}`, requires `LIMITS_JSON` or `DEADLINE_SCALE`)
+to append it to the label as `__validation-<tag>`, e.g. `LIMITS_TAG=probe3000-path`.
 
 ### Deadline scale (validation only: the deadline is stretched)
 
@@ -194,9 +193,12 @@ worker. It changes only the helper's clock: the metering preamble replaces `Date
 helper process with `pbdT0 + floor((real - pbdT0) / N)`, so the helper's 28 s deadline lasts
 28 s x N of real time. The outer 30 s capture timeout (the `timeoutMs` argument of
 `readBoundedPlanningOutput`, which `GitCache` also hands to the spawner), the harness's own 60 s
-scope timer and `run.sh`'s per-job wait are multiplied by the same N. Every cap, every other
-production bound and the per-git-command 5 s timer (a real timer) stay at their production
-values; the preamble's own timing keeps the real clock. The job is rejected when combined with
+scope timer and `run.sh`'s per-job wait are multiplied by the same N. Every cap and memory bound
+stays at its production value; the preamble's own timing keeps the real clock. Every other
+`Date.now` reader in the helper runs on the slowed clock: each git command's timer is 5 s of real
+time but is clamped to the deadline's remaining helper milliseconds, so a command started in the
+last 5 helper-seconds (the last 5 x N real seconds) gets 1/N of the stretched time left, and the
+helper's 20 ms event-loop yield cadence becomes 20 x N real ms. The job is rejected when combined with
 `injectDeadlineAfterSizing`, and for any mode other than `full`: `control` runs without the
 preamble, so its helper would keep the production deadline under a stretched label, and `cancel`
 measures cancellation, not memory at the caps.

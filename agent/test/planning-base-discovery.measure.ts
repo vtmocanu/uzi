@@ -577,8 +577,11 @@ function generate(spec: string, dir: string, inputs: string): Manifest {
 
 // deadlineScale > 1 (validation only) slows the helper's own clock by that factor: Date.now()
 // then advances 1/scale as fast as real time, so the helper's 28 s deadline (and its check()
-// calls) last 28 s x scale of real time. Everything else (caps, per-command 5 s timers, memory)
-// is untouched. The preamble's own timing keeps the real clock (pbdNow).
+// calls) last 28 s x scale of real time. Caps and memory bounds are untouched. Every other
+// Date.now reader in the helper runs on the slowed clock too: each git command's 5 s timer is
+// real time but is clamped to the deadline's remaining helper-ms (so under the last 5 helper-s
+// it gets 1/scale of the stretched remainder), and maybeYield's 20 ms cadence becomes 20 x scale
+// real ms. The preamble's own timing keeps the real clock (pbdNow).
 function preamble(metricsPath: string, injectDeadlineAfterSizing: boolean, deadlineScale: number): string {
   const scaled = deadlineScale > 1;
   return `

@@ -37,6 +37,9 @@ FIXTURES="${FIXTURES:-repo synthetic-10000 synthetic-50000 chain-d64 chain-d65 f
 MEM_CONFIGS="${MEM_CONFIGS:-1536m:1:full,control,cancel 4g:2:full}"
 START_TIMEOUT="${START_TIMEOUT:-120}"
 GEN_TIMEOUT="${GEN_TIMEOUT:-1200}"
+# Both reach `timeout` and START_TIMEOUT also bash arithmetic, which would evaluate a non-number.
+[[ "$START_TIMEOUT" =~ ^[1-9][0-9]{0,5}$ ]] || { echo "START_TIMEOUT must be a positive integer of seconds: $START_TIMEOUT" >&2; exit 2; }
+[[ "$GEN_TIMEOUT" =~ ^[1-9][0-9]{0,5}$ ]] || { echo "GEN_TIMEOUT must be a positive integer of seconds: $GEN_TIMEOUT" >&2; exit 2; }
 SMOKE_INJECT="${SMOKE_INJECT:-}"
 
 for spec in $FIXTURES; do

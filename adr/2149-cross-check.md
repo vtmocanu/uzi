@@ -626,10 +626,12 @@ estimates, not proofs.
   intercept of about 134 MiB, and about 1.1 to 1.9 B per path byte.
 - M3, with the caps in force: the largest measured whole-capture container peak is 575.5 MiB
   (4 GiB / 2 CPU) and 543.4 MiB on the 1536 MiB / 1 CPU slot. A validation row with the helper
-  deadline stretched x4 (caps and per-command timers unchanged) peaks at 767.5 MiB on the
-  1536 MiB / 1 CPU slot for a base at 99.9 % of the entry cap and 98.8 % of the path-byte cap,
-  measured through discovery and part of the distinct-blob sizing batch; no capture with both
-  caps reached completed on the measuring host. All of these fit the 1536 MiB per-slot budget.
+  clock slowed x4 (caps unchanged) peaks at 767.5 MiB on the 1536 MiB / 1 CPU slot for a base
+  at 99.9 % of the entry cap and 98.8 % of the path-byte cap, measured through discovery and
+  under half of the distinct-blob sizing batch, so a partial lower bound. A completed sizing batch
+  at the entry cap extrapolates to about 1,166 MiB; that is an estimate, not reached on the
+  measuring host. No capture with both caps reached completed there. All of these fit the
+  1536 MiB per-slot budget.
 - Clean controls (this repository, a 50k-file tree) capture. One 50k-file 4 GiB / 2 CPU row hit
   the post-discovery deadline under host load and passed on rerun, disclosed in RESULTS.md.
 - On the measuring host, discovery speed usually reaches the 28 s deadline before the entry cap
