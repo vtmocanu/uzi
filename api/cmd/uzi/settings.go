@@ -1,6 +1,11 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+
 	"github.com/spf13/cobra"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -24,8 +29,9 @@ func newSettingsCmd(env Env, gf *globalFlags) *cobra.Command {
 				return err
 			}
 			p := env.printer(gf)
+			effective := readEffectiveSettings(cmd.Context(), c, env.Stderr)
 			if p.Format == uzicli.FormatJSON {
-				return p.JSON(settings)
+				return p.JSON(settingsGetJSON{UserSettingsDTO: settings, Effective: effective})
 			}
 			if err := p.Table([]string{"STAGE", "HARNESS", "STATUS", "STORED MODEL", "WORKER DEFAULT MODEL",
 				"RESOLVED MODEL", "MODEL SOURCE", "STORED EFFORT", "RESOLVED EFFORT", "EFFORT SOURCE"},
@@ -33,10 +39,21 @@ func newSettingsCmd(env Env, gf *globalFlags) *cobra.Command {
 				return err
 			}
 			// PRD #3245: one table for every model setting, after the cross-check table.
-			if rows := settingsModelRows(settings); len(rows) > 0 {
+			rows := settingsModelRows(settings)
+			if effective != nil {
+				// PRD #3254: the effective view carries the worker, task-review and start rows;
+				// each setting prints once.
+				rows = effectiveSettingsRows(settings, effective)
+			}
+			if len(rows) > 0 {
 				p.Println("Model settings")
 				if err := p.Table(settingsModelColumns, settingRowsTable(rows)); err != nil {
 					return err
+				}
+			}
+			if effective != nil {
+				for _, line := range effectiveAlternativeLines(effective) {
+					p.Println(line)
 				}
 			}
 			// PRD #2603: nil means the per-user switch was never set, which reads as on.
@@ -111,4 +128,22 @@ func settingsStoredPin(pin *string) string {
 		return "Default"
 	}
 	return crossCheckPlain("Pin · " + *pin)
+}
+
+// readEffectiveSettings reads the effective-settings view without letting it fail the command:
+// `settings get` is the settings read, which already succeeded. A 404 means an older server and
+// any other failure (5xx, network) is reported on stderr; either way the view is nil and the exit
+// code stays 0. Server text on stderr passes crossCheckPlain.
+func readEffectiveSettings(ctx context.Context, c uzicli.Client, stderr io.Writer) *apitypes.EffectiveSettingsDTO {
+	e, err := c.GetEffectiveSettings(ctx)
+	if err == nil {
+		return &e
+	}
+	var ee *uzicli.ExitError
+	if errors.As(err, &ee) && ee.Code == uzicli.ExitNotFound {
+		fmt.Fprintln(stderr, "Effective settings: not available on this server")
+		return nil
+	}
+	fmt.Fprintf(stderr, "Effective settings: unavailable (%s)\n", crossCheckPlain(err.Error()))
+	return nil
 }

@@ -282,4 +282,11 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 		r.With(h.requireUser()).Get("/", h.GetMySettings)
 		r.With(h.requireAuth()).Put("/", h.PutMySettings)
 	})
+
+	// Effective settings (PRD #3254): what model, effort and harness a run would use. Owner-scoped
+	// reads of the caller's own state, so RequireUser (reachable from a uzc_ CLI token, like GET
+	// /me/settings), no limiter, no forge or provider call. start-preview is a POST only because
+	// it carries a token choice; it writes nothing.
+	r.With(h.requireUser()).Get("/me/effective-settings", h.GetEffectiveSettings)
+	r.With(h.requireUser()).Post("/me/effective-settings/start-preview", h.PreviewStartSettings)
 }

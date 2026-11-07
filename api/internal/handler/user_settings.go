@@ -1140,6 +1140,15 @@ var _ codexCatalogReader = (*workersvc.Service)(nil)
 // model. It never fails the settings read: a nil service, or a read error (logged as an
 // error value), degrades to unknown.
 func (h *Handler) codexCatalogDefaultCell(ctx context.Context, userID uuid.UUID, laneModel, leadCodexPin pgtype.Text) *apitypes.CatalogDefaultDTO {
+	model, _ := agenttmpl.ResolveWorkerDefaultModel("codex",
+		textPtrValue(laneModel.Valid, laneModel.String), nil, textPtrValue(leadCodexPin.Valid, leadCodexPin.String))
+	return h.codexCatalogDefaultForModel(ctx, userID, model)
+}
+
+// codexCatalogDefaultForModel is codexCatalogDefaultCell's model-keyed read, for a caller that
+// already knows the Codex model the run would use (the effective-settings view passes the
+// predicted worker model, including a schedule pin).
+func (h *Handler) codexCatalogDefaultForModel(ctx context.Context, userID uuid.UUID, model string) *apitypes.CatalogDefaultDTO {
 	var reader codexCatalogReader
 	switch {
 	case h.catalogDefaults != nil:
@@ -1149,8 +1158,6 @@ func (h *Handler) codexCatalogDefaultCell(ctx context.Context, userID uuid.UUID,
 	default:
 		return catalogDefaultDTO(workersvc.CatalogDefault{State: workersvc.CatalogStateUnknown})
 	}
-	model, _ := agenttmpl.ResolveWorkerDefaultModel("codex",
-		textPtrValue(laneModel.Valid, laneModel.String), nil, textPtrValue(leadCodexPin.Valid, leadCodexPin.String))
 	got, err := reader.CodexCatalogDefault(ctx, userID, model)
 	if err != nil {
 		slog.Error("read codex catalog default", "error", err)

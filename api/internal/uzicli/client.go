@@ -209,6 +209,10 @@ type Client interface {
 	// sidebar_token_ids: GET /api/me/settings. RequireUser (the GET was split out
 	// from the cookie-only /me/settings group so a uzc_ can read it).
 	GetMySettings(ctx context.Context) (apitypes.UserSettingsDTO, error)
+	// GetEffectiveSettings returns what model, effort and harness a run would use for the
+	// caller (PRD #3254): GET /api/me/effective-settings. RequireUser, read-only, owner-scoped;
+	// no credential id, label or value is in the body. An older server answers 404.
+	GetEffectiveSettings(ctx context.Context) (apitypes.EffectiveSettingsDTO, error)
 	// SetUsageReserve sets the caller's weekly usage reserve (PRD #3522):
 	// PUT /api/me/usage-reserve. thresholdPct nil turns the reserve off, else it is the
 	// 7-day utilization percent (1..100) at which uzi stops spending the caller's

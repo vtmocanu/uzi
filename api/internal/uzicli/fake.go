@@ -364,6 +364,11 @@ type FakeClient struct {
 	// Settings drives GetMySettings: the caller's own non-secret settings.
 	Settings apitypes.UserSettingsDTO
 
+	// Effective and EffectiveErr drive GetEffectiveSettings (PRD #3254); with both unset the fake
+	// behaves like a server that predates the route (404).
+	Effective    *apitypes.EffectiveSettingsDTO
+	EffectiveErr error
+
 	// SetUsageReserve capture (PRD #3522): how many times it was called and the threshold
 	// (nil = off) and pause flag the command sent.
 	ReserveCalls     int

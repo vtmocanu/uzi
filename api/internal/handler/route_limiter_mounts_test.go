@@ -494,6 +494,9 @@ var wantRouteMounts = []routeMount{
 	// PRD #1209 M3: the caller's own per-account Codex rate-limit read — an owner-scoped
 	// store read, RequireUser, no limiter, like /me/rate-limits beside it.
 	{"GET", "/api/me/codex-rate-limits", noLimiter},
+	// PRD #3254: the effective-settings view. Owner-scoped reads of the caller's own state, no
+	// forge or provider call, no token spend → noLimiter, like /me/settings.
+	{"GET", "/api/me/effective-settings", noLimiter},
 	{"GET", "/api/me/secrets/", noLimiter},
 	{"GET", "/api/me/secrets/{kind}/{id}/dependents", noLimiter},
 	{"GET", "/api/me/settings/", noLimiter},
@@ -744,6 +747,8 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/forge/connections/{id}/verify", limForge},
 	{"POST", "/api/me/cli-tokens/", noLimiter},
 	{"POST", "/api/me/cli-tokens/revoke-all", noLimiter},
+	// PRD #3254: start-preview is a read that takes a token choice in a body; it writes nothing.
+	{"POST", "/api/me/effective-settings/start-preview", noLimiter},
 	// PRD #1907 M5: the product-token MINT rides the credential-surface limiter per user
 	// (a (pattern, user) bucket), on top of the handler's per-product cap (D15).
 	{"POST", "/api/me/product-tokens/", limAuth},

@@ -104,6 +104,17 @@ func (f *FakeClient) GetMySettings(context.Context) (apitypes.UserSettingsDTO, e
 	return f.Settings, nil
 }
 
+// GetEffectiveSettings serves Effective; unset it answers 404 like a server that predates the route.
+func (f *FakeClient) GetEffectiveSettings(context.Context) (apitypes.EffectiveSettingsDTO, error) {
+	if f.EffectiveErr != nil {
+		return apitypes.EffectiveSettingsDTO{}, f.EffectiveErr
+	}
+	if f.Effective == nil {
+		return apitypes.EffectiveSettingsDTO{}, Exitf(ExitNotFound, "not found")
+	}
+	return *f.Effective, nil
+}
+
 func (f *FakeClient) SetUsageReserve(_ context.Context, thresholdPct *int, pauseRunning bool) (apitypes.UserDTO, error) {
 	f.ReserveCalls++
 	f.LastReservePct = thresholdPct

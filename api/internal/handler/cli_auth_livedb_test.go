@@ -594,6 +594,33 @@ func TestCLIReachesSettingsOverBearerLiveDB(t *testing.T) {
 	}
 }
 
+// TestCLIReachesEffectiveSettingsOverBearerLiveDB pins the PRD #3254 mounts: both effective-settings
+// routes are RequireUser (a uzc_ Bearer reaches them) and neither is public (401 without
+// credentials). The start-preview write verb is a read, so a CLI token may call it.
+func TestCLIReachesEffectiveSettingsOverBearerLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	user := cliSeedUser(t, pool, false)
+	uzc := cliMintToken(t, pool, user, clitoken.ScopeUser)
+
+	rec := bearerReq(router, http.MethodGet, "/api/me/effective-settings", uzc)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/me/effective-settings over Bearer = %d, want 200\nbody: %s", rec.Code, rec.Body.String())
+	}
+	if body := rec.Body.String(); !strings.Contains(body, `"start"`) {
+		t.Fatalf("response carries no start choices: %s", body)
+	}
+	rec = bearerReqBody(router, http.MethodPost, "/api/me/effective-settings/start-preview", uzc, `{"harness":null,"credential_override":null}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST start-preview over Bearer = %d, want 200\nbody: %s", rec.Code, rec.Body.String())
+	}
+	if rec := bearerReq(router, http.MethodGet, "/api/me/effective-settings", ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated GET /api/me/effective-settings = %d, want 401", rec.Code)
+	}
+	if rec := bearerReqBody(router, http.MethodPost, "/api/me/effective-settings/start-preview", "", `{}`); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated POST start-preview = %d, want 401", rec.Code)
+	}
+}
+
 // TestCLIReachesMrReworkOverBearerLiveDB proves the PRD #841 M2 per-run mr-rework route
 // is mounted in the RequireUser group (a uzc_ Bearer reaches it, NOT 401) and is
 // owner-scoped, diverging deliberately from wait-on-limit's cookie-only mount (D3): this

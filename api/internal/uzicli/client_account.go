@@ -161,6 +161,14 @@ func (c *HTTPClient) GetMySettings(ctx context.Context) (apitypes.UserSettingsDT
 	return env.Settings, nil
 }
 
+func (c *HTTPClient) GetEffectiveSettings(ctx context.Context) (apitypes.EffectiveSettingsDTO, error) {
+	var out apitypes.EffectiveSettingsDTO
+	if err := c.get(ctx, "/api/me/effective-settings", &out); err != nil {
+		return apitypes.EffectiveSettingsDTO{}, err
+	}
+	return out, nil
+}
+
 func (c *HTTPClient) SetUsageReserve(ctx context.Context, thresholdPct *int, pauseRunning bool) (apitypes.UserDTO, error) {
 	// threshold_pct is always present (null = off): the server rejects an absent field.
 	body := struct {

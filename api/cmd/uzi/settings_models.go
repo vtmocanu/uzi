@@ -12,6 +12,12 @@ type settingRow struct {
 	Default          string
 	Resolved         string
 	Field, Source    string
+	// Notes are the note codes of an effective-settings cell, rendered after the source. A row
+	// with no Field (a refusal) renders no source.
+	Notes []string
+	// StoredText replaces the STORED cell for a row whose setting has no stored value (a start
+	// choice is made per run, not saved).
+	StoredText string
 }
 
 var settingsModelColumns = []string{"SETTING", "HARNESS", "STORED", "DEFAULT", "RESOLVED", "SOURCE"}
@@ -82,29 +88,34 @@ func modelSettingRows(setting string, cells []apitypes.ModelSettingCellDTO) []se
 }
 
 // effortSettingRows adapts the ordinary effort cells (PRD #3247, field "effort") into
-// settingRows. At most two cells are read. A runtime-default cell has no resolved level:
-// Claude reports no value at all, so its RESOLVED says so.
+// settingRows. At most two cells are read.
 func effortSettingRows(cells []apitypes.EffortSettingCellDTO) []settingRow {
 	var rows []settingRow
 	for _, c := range cells[:min(len(cells), 2)] {
-		resolved := ""
-		switch {
-		case c.Mode == "runtime_default" && c.Harness == "claude":
-			resolved = "runtime default (value not reported)"
-		case c.Mode == "runtime_default":
-			resolved = codexRuntimeDefaultResolved(c.CatalogDefault)
-		case c.ResolvedEffort != nil:
-			resolved = *c.ResolvedEffort
-		default:
-			resolved = "unknown"
-		}
-		rows = append(rows, settingRow{
-			Setting: "effort", Harness: c.Harness, Stored: c.Effort,
-			Default: c.DefaultEffort, Resolved: resolved,
-			Field: "effort", Source: c.Source,
-		})
+		rows = append(rows, effortRow("effort", c))
 	}
 	return rows
+}
+
+// effortRow adapts one effort cell. A runtime-default cell has no resolved level: Claude reports
+// no value at all, so its RESOLVED says so, and Codex shows the catalog default.
+func effortRow(setting string, c apitypes.EffortSettingCellDTO) settingRow {
+	resolved := ""
+	switch {
+	case c.Mode == "runtime_default" && c.Harness == "claude":
+		resolved = "runtime default (value not reported)"
+	case c.Mode == "runtime_default":
+		resolved = codexRuntimeDefaultResolved(c.CatalogDefault)
+	case c.ResolvedEffort != nil:
+		resolved = *c.ResolvedEffort
+	default:
+		resolved = "unknown"
+	}
+	return settingRow{
+		Setting: setting, Harness: c.Harness, Stored: c.Effort,
+		Default: c.DefaultEffort, Resolved: resolved,
+		Field: "effort", Source: c.Source,
+	}
 }
 
 // codexRuntimeDefaultResolved renders the codex Runtime default RESOLVED text (issue
@@ -139,10 +150,26 @@ func codexRuntimeDefaultResolved(cd *apitypes.CatalogDefaultDTO) string {
 // Runtime default token shows it as the label; every other row, including a model pin
 // that happens to be named runtime, keeps the Pin formatting.
 func settingRowStored(r settingRow) string {
+	if r.StoredText != "" {
+		return r.StoredText
+	}
 	if r.Field == "effort" && r.Stored != nil && *r.Stored == "runtime" {
 		return modelSettingSource("effort", "runtime_default")
 	}
 	return settingsStoredPin(r.Stored)
+}
+
+// settingRowSource renders the SOURCE column: the (field, token) label, then the labelled notes
+// (at most four). A row with no field has no provenance and shows a dash.
+func settingRowSource(r settingRow) string {
+	if r.Field == "" {
+		return "-"
+	}
+	out := modelSettingSource(r.Field, r.Source)
+	for _, n := range r.Notes[:min(len(r.Notes), 4)] {
+		out += " · " + modelSettingSource("note", n)
+	}
+	return crossCheckPlain(out)
 }
 
 // settingRowsTable renders neutral rows; every cell passes through crossCheckPlain.
@@ -151,8 +178,7 @@ func settingRowsTable(rows []settingRow) [][]string {
 	for _, r := range rows {
 		out = append(out, []string{
 			crossCheckPlain(r.Setting), crossCheckPlain(r.Harness), settingRowStored(r),
-			crossCheckPlain(r.Default), crossCheckPlain(r.Resolved),
-			crossCheckPlain(modelSettingSource(r.Field, r.Source)),
+			crossCheckPlain(r.Default), crossCheckPlain(r.Resolved), settingRowSource(r),
 		})
 	}
 	return out

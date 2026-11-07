@@ -27,7 +27,7 @@ const (
 //   - otherwise the built-in: DefaultCodexModel for Codex, "" (the SDK default) for Claude.
 //
 // The returned source is one of the WorkerDefaultSource* tokens. lane is the owner's lane for the
-// harness, claudePin/codexPin are the lead template's per-harness pins; any may be nil.
+// harness, templateClaude/templateCodex are the lead template's per-harness pins; any may be nil.
 func ResolveWorkerDefaultModel(harness string, lane, templateClaude, templateCodex *string) (model, source string) {
 	if lane != nil {
 		switch {
