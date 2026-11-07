@@ -183,7 +183,36 @@ combined with `SMOKE_INJECT`, and one invocation's rows are all validation or al
 
 Rows of two `LIMITS_JSON` invocations into the same `OUT` overwrite each other unless their
 labels differ. Set `LIMITS_TAG` (`[a-z0-9-]{1,40}`, requires `LIMITS_JSON`) to append it to the
-label as `__validation-<tag>`, e.g. `LIMITS_TAG=probe3000-path`.
+label as `__validation-<tag>`, e.g. `LIMITS_TAG=probe3000-path` (also allowed with
+`DEADLINE_SCALE` alone).
+
+### Deadline scale (validation only: the deadline is stretched)
+
+A measure job may carry `"deadlineScale": N` (integer 2..8; absent means production). It lets a
+near-cap base finish under the production caps when this container is slower than a production
+worker. It changes only the helper's clock: the metering preamble replaces `Date.now` in the
+helper process with `pbdT0 + floor((real - pbdT0) / N)`, so the helper's 28 s deadline lasts
+28 s x N of real time. The outer 30 s capture timeout (the `timeoutMs` argument of
+`readBoundedPlanningOutput`, which `GitCache` also hands to the spawner), the harness's own 60 s
+scope timer and `run.sh`'s per-job wait are multiplied by the same N. Every cap, every other
+production bound and the per-git-command 5 s timer (a real timer) stay at their production
+values; the preamble's own timing keeps the real clock. The job is rejected when combined with
+`injectDeadlineAfterSizing`.
+
+The record sets `validation: true` and `deadlineScale: N` (null on production rows); `captureMs`
+and `discovery.ms` stay real elapsed milliseconds, and `helper.clockScale` /
+`helper.helperClockElapsedMs` give the helper's slowed clock for comparison with
+`helper.snapshotMs` (real). The report shows `validation (deadline ×N; real <ms> ms)`. Such rows
+measure memory and charges at the caps, not production timing, and must be reported as
+deadline-stretched.
+
+```sh
+DEADLINE_SCALE=4 OUT=/abs/out FIXTURES="distinct-60x19998n75" ./e2e/planning-base-discovery-measure/run.sh
+```
+
+`DEADLINE_SCALE` (`^[2-8]$`) works with or without `LIMITS_JSON`; the label gets
+`__validation-dl<N>` (with `LIMITS_TAG`: `__validation-<tag>-dl<N>`). It cannot be combined with
+`SMOKE_INJECT`.
 
 ## Modes and metrics
 

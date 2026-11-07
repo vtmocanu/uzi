@@ -93,6 +93,8 @@ async function fixture(options: {
   noCheckout?: boolean;
   // Timeout for each fixture git command (default 5 s); heavy fixtures raise it.
   gitTimeoutMs?: number;
+  // Stage the seed with `git add -f` so files matching the seed's own .gitignore are committed.
+  forceAdd?: boolean;
 } = {}): Promise<{
   cache: GitCache; clone: string; bare: string; protectedRoot: string; base: string; data: string; tmp: string;
   git: (...args: string[]) => Promise<string>;
@@ -123,7 +125,8 @@ async function fixture(options: {
     await fs.writeFile(path.join(seed, "deleted"), "delete me\n");
     await fs.writeFile(path.join(seed, ".gitignore"), "ignored\nignored-dir/\n");
     await options.seed?.(seed);
-    await run(seed, "add", ".");
+    // forceAdd keeps tracked files that the seed's own .gitignore rules would drop.
+    await run(seed, "add", ...(options.forceAdd ? ["-f"] : []), ".");
     await run(seed, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "base");
     if (options.baseTree) {
       const seedGit = async (args: string[], input: string): Promise<string> => {
@@ -2255,17 +2258,22 @@ describe("Base discovery aggregate caps (#3543)", { skip: process.platform !== "
     if (uidSplitActive()) { t.skip("the runner identity cannot read the repository checkout"); return; }
     const repoRoot = path.resolve(import.meta.dirname, "..", "..");
     let seeded = 0;
-    const f = await fixture({ gitTimeoutMs: 90000, seed: async seed => {
+    const f = await fixture({ gitTimeoutMs: 90000, forceAdd: true, seed: async seed => {
       // Fail loudly when repoRoot is not a git work tree rather than archiving some other repository.
       assert.equal((await exec("git", ["-C", repoRoot, "rev-parse", "--is-inside-work-tree"], { timeout: 30000 })).stdout.trim(), "true");
       const archive = path.join(path.dirname(seed), "repo.tar");
       await exec("git", ["-C", repoRoot, "archive", "--format=tar", "-o", archive, "HEAD"], { timeout: 90000 });
+      // Drop the builder's own placeholder files so the base holds exactly the repository's files.
+      await fs.rm(path.join(seed, "tracked"));
+      await fs.rm(path.join(seed, "deleted"));
       await exec("tar", ["-xf", archive, "-C", seed], { timeout: 90000 });
       await fs.rm(archive);
       seeded = (await exec("git", ["-C", repoRoot, "ls-tree", "-r", "--name-only", "HEAD"], { timeout: 30000, maxBuffer: 64 * 1024 * 1024 }))
         .stdout.split("\n").filter(Boolean).length;
     } });
     try {
+      const committed = (await f.git("ls-tree", "-r", "--name-only", f.base)).split("\n").filter(Boolean).length;
+      assert.equal(committed, seeded, "the fixture base must hold every tracked file of the repository");
       assert.ok(seeded >= 5000, "the archive must hold the repository's files: " + seeded);
       const started = Date.now();
       assert.equal((await f.capture()).length, 0);

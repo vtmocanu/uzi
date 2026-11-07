@@ -575,12 +575,19 @@ function generate(spec: string, dir: string, inputs: string): Manifest {
 // stderr line), swallow its own write failures, and unref its timer (the helper's success path
 // exits only when its event loop drains).
 
-function preamble(metricsPath: string, injectDeadlineAfterSizing: boolean): string {
+// deadlineScale > 1 (validation only) slows the helper's own clock by that factor: Date.now()
+// then advances 1/scale as fast as real time, so the helper's 28 s deadline (and its check()
+// calls) last 28 s x scale of real time. Everything else (caps, per-command 5 s timers, memory)
+// is untouched. The preamble's own timing keeps the real clock (pbdNow).
+function preamble(metricsPath: string, injectDeadlineAfterSizing: boolean, deadlineScale: number): string {
+  const scaled = deadlineScale > 1;
   return `
 const pbdFs = require("node:fs");
 const pbdCp = require("node:child_process");
 const pbdNow = Date.now;
 const pbdT0 = pbdNow();
+${scaled ? `const pbdScale = ${deadlineScale};
+Date.now = () => pbdT0 + Math.floor((pbdNow() - pbdT0) / pbdScale);` : ""}
 const pbdPath = ${JSON.stringify(metricsPath)};
 const pbdM = { t0: pbdT0, treeOccurrences: 0, treeEntries: 0, commitBytes: 0, treeBytes: 0,
   objectCheckBytes: 0, sizingBytes: 0, gitSpawns: 0, readSyncBytes: 0, discoveryGitLastCloseMs: null,
@@ -593,6 +600,8 @@ function pbdSnap() {
   try {
     pbdM.maxRssKiB = process.resourceUsage().maxRSS;
     pbdM.snapshotMs = pbdNow() - pbdT0;
+    ${scaled ? `pbdM.clockScale = pbdScale;
+    pbdM.helperClockElapsedMs = Date.now() - pbdT0;` : ""}
     pbdFs.writeFileSync(pbdPath + ".tmp", JSON.stringify(pbdM));
     pbdFs.renameSync(pbdPath + ".tmp", pbdPath);
   } catch {} finally { pbdWriting = false; }
@@ -723,6 +732,18 @@ interface MeasureJob {
   // Validation jobs only: planning limits merged over the helper's defaults and injected with
   // GitCache.setPlanningLimitsForTest. Absent means production defaults, always for production rows.
   limits?: Record<string, number>;
+  // Validation only, integer 2..8: slow the helper's clock (and stretch the outer capture and
+  // harness timeouts) by this factor so a near-cap base can finish under every production cap.
+  // Not combinable with injectDeadlineAfterSizing.
+  deadlineScale?: number;
+}
+
+function validateDeadlineScale(job: MeasureJob): number {
+  if (job.deadlineScale === undefined) return 1;
+  const s = job.deadlineScale;
+  if (typeof s !== "number" || !Number.isInteger(s) || s < 2 || s > 8) throw new Error("deadlineScale must be an integer 2..8");
+  if (job.injectDeadlineAfterSizing === true) throw new Error("deadlineScale and injectDeadlineAfterSizing are mutually exclusive");
+  return s;
 }
 
 // Positive safe integers only; any key must be a limit the cache already carries (the two
@@ -755,6 +776,7 @@ function writeJson(p: string, value: unknown): void {
 
 // Resolves to the job's failure flags (empty when the record is sound).
 async function measure(job: MeasureJob): Promise<string[]> {
+  const deadlineScale = validateDeadlineScale(job);
   const manifest = readJson<Manifest>(path.join(job.fixture, "manifest.json"));
   if (!manifest) throw new Error(`fixture ${job.fixture} has no manifest`);
   const { root, clone, bare } = layout(job.fixture);
@@ -815,9 +837,10 @@ async function measure(job: MeasureJob): Promise<string[]> {
 
   // Production envelope (runner.ts captureCheckedPlanningDiff): 60 s scope, combined signal,
   // default-grace TickSpawner, scope.abort() in finally, then settled()/survivors().
+  // A deadline-scaled validation row stretches the scope timer by the same factor.
   const scope = new AbortController();
   const ownerSignal = AbortSignal.any([ac.signal, scope.signal]);
-  const scopeTimer = setTimeout(() => scope.abort(), 60_000);
+  const scopeTimer = setTimeout(() => scope.abort(), 60_000 * deadlineScale);
   const spawner = new TickSpawner({
     signal: ownerSignal, log: nullLog,
     // Observation only: record the pid and delivered signals; returning undefined keeps real delivery.
@@ -832,7 +855,7 @@ async function measure(job: MeasureJob): Promise<string[]> {
     if (instrumented) {
       const argv = [...request.argv];
       if (argv[1] !== "-e" || typeof argv[2] !== "string") throw new Error("unexpected planning helper argv");
-      argv[2] = preamble(helperPath, job.injectDeadlineAfterSizing === true) + argv[2];
+      argv[2] = preamble(helperPath, job.injectDeadlineAfterSizing === true, deadlineScale) + argv[2];
       req = { ...request, argv };
     }
     const handle = await spawner.spawn(req);
@@ -848,7 +871,17 @@ async function measure(job: MeasureJob): Promise<string[]> {
   if (typeof limitsHolder.planningLimits !== "object" || limitsHolder.planningLimits === null) {
     throw new Error("GitCache.planningLimits is not an object: the harness cannot read the helper's defaults");
   }
-  const validation = job.limits !== undefined;
+  const validation = job.limits !== undefined || deadlineScale > 1;
+  if (deadlineScale > 1) {
+    // The outer capture timeout (30 s in capturePlanningDiff) is an argument of the transport
+    // method; multiply it by the scale and otherwise delegate unchanged (same argv, same cwd).
+    const holder = cache as unknown as {
+      readBoundedPlanningOutput: (cwd: string, argv: readonly string[], timeoutMs?: number) => Promise<Buffer>;
+    };
+    const original = holder.readBoundedPlanningOutput.bind(cache);
+    holder.readBoundedPlanningOutput = (cwd, argv, timeoutMs) =>
+      original(cwd, argv, timeoutMs === undefined ? undefined : timeoutMs * deadlineScale);
+  }
   if (job.limits !== undefined) {
     cache.setPlanningLimitsForTest({ ...limitsHolder.planningLimits, ...validateLimits(job.limits, limitsHolder.planningLimits) });
   }
@@ -930,7 +963,10 @@ async function measure(job: MeasureJob): Promise<string[]> {
   const result = {
     label: job.label, spec: manifest.spec, fixture: manifest, mode: job.mode,
     validation,
-    limits: { source: validation ? "job-limits-over-helper-defaults" : "helper-defaults", effective: effectiveLimits,
+    // null for production rows; otherwise the helper clock, outer capture timeout and harness
+    // scope timer were all stretched by this factor (every cap and bound stays at its value).
+    deadlineScale: deadlineScale > 1 ? deadlineScale : null,
+    limits: { source: job.limits !== undefined ? "job-limits-over-helper-defaults" : "helper-defaults", effective: effectiveLimits,
       entryCap: entryCap?.toString() ?? null, pathByteCap: pathByteCap?.toString() ?? null },
     failed: failures.length > 0, failures,
     treeEntriesFetched: instrumented ? { value: fetched, meaning: discoveryCompleted ? "exact (discovery completed)" : "upper bound on charged entries (discovery incomplete); not a charge" } : null,
@@ -1008,7 +1044,9 @@ function report(out: string): void {
     let kind: string = r.outcome?.kind ?? "?";
     if (term?.oomKilled === true) kind = "oom";
     const token = (r.outcome?.token ? ` \`${r.outcome.token}\`` : "") + (r.outcome?.flag ? ` **FAIL ${r.outcome.flag}**` : "");
-    const mode2 = r.validation === true && !mode.includes("validation") ? `${mode} (validation)` : mode;
+    const stretched = typeof r.deadlineScale === "number" ? `validation (deadline ×${r.deadlineScale}; real ${r.captureMs} ms)` : "validation";
+    const mode2 = r.validation === true && !mode.includes("validation") ? `${mode} (${stretched})`
+      : r.validation === true && typeof r.deadlineScale === "number" ? `${mode} [${stretched}]` : mode;
     const entriesCell = ((): string => {
       const f = r.treeEntriesFetched;
       if (!f) return "n/a";

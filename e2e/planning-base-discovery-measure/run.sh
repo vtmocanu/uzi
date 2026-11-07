@@ -20,6 +20,12 @@
 #                  (label __validation; unset = production defaults; not combinable with SMOKE_INJECT)
 #   LIMITS_TAG     optional, with LIMITS_JSON only: [a-z0-9-]{1,40}, label becomes __validation-<tag>
 #                  so two LIMITS_JSON invocations into one OUT do not overwrite each other
+#   DEADLINE_SCALE validation rows only: integer 2..8. Slows ONLY the helper's clock by that factor
+#                  (its 28 s deadline lasts 28 s x N of real time) and stretches the outer 30 s capture
+#                  timeout, the harness 60 s scope timer and this script's per-job wait by N. Every
+#                  cap and bound stays at its production value. Label __validation-dl<N> (with
+#                  LIMITS_TAG: __validation-<tag>-dl<N>); usable with or without LIMITS_JSON; not
+#                  combinable with SMOKE_INJECT. Measures memory and charges at the caps, not timing.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -54,12 +60,26 @@ if [ -n "$LIMITS_JSON" ]; then
   [[ "$LIMITS_JSON" =~ $limits_re ]] || { echo "LIMITS_JSON must be a one-line JSON object of positive integers (max 15 digits): $LIMITS_JSON" >&2; exit 2; }
   [ -z "$SMOKE_INJECT" ] || { echo "LIMITS_JSON and SMOKE_INJECT cannot be combined" >&2; exit 2; }
 fi
+DEADLINE_SCALE="${DEADLINE_SCALE:-}"
+if [ -n "$DEADLINE_SCALE" ]; then
+  [[ "$DEADLINE_SCALE" =~ ^[2-8]$ ]] || { echo "DEADLINE_SCALE must be an integer 2..8: $DEADLINE_SCALE" >&2; exit 2; }
+  [ -z "$SMOKE_INJECT" ] || { echo "DEADLINE_SCALE and SMOKE_INJECT cannot be combined" >&2; exit 2; }
+fi
 LIMITS_TAG="${LIMITS_TAG:-}"
 validation_suffix="__validation"
 if [ -n "$LIMITS_TAG" ]; then
-  [ -n "$LIMITS_JSON" ] || { echo "LIMITS_TAG requires LIMITS_JSON" >&2; exit 2; }
+  [ -n "$LIMITS_JSON" ] || [ -n "$DEADLINE_SCALE" ] || { echo "LIMITS_TAG requires LIMITS_JSON or DEADLINE_SCALE" >&2; exit 2; }
   [[ "$LIMITS_TAG" =~ ^[a-z0-9-]{1,40}$ ]] || { echo "LIMITS_TAG must match [a-z0-9-]{1,40}: $LIMITS_TAG" >&2; exit 2; }
   validation_suffix="__validation-$LIMITS_TAG"
+fi
+# DEADLINE_SCALE alone (production limits) is still a validation row: label ...__validation-dl<N>
+# (with LIMITS_TAG: __validation-<tag>-dl<N>). It also stretches this script's per-job wait.
+deadline_field=""
+job_timeout="$START_TIMEOUT"
+if [ -n "$DEADLINE_SCALE" ]; then
+  validation_suffix="${validation_suffix}-dl${DEADLINE_SCALE}"
+  deadline_field=",\"deadlineScale\":$DEADLINE_SCALE"
+  job_timeout=$((START_TIMEOUT * DEADLINE_SCALE))
 fi
 
 # shellcheck disable=SC2086 # deliberate word split: count the configurations.
@@ -172,9 +192,10 @@ for config in $MEM_CONFIGS; do
       inject=false
       if [ "$SMOKE_INJECT" = "1" ]; then label="${label}__inject"; inject=true; fi
       limits_field=""
-      if [ -n "$LIMITS_JSON" ]; then label="${label}${validation_suffix}"; limits_field=",\"limits\":$LIMITS_JSON"; fi
-      run_job "$name" "$label" "$START_TIMEOUT" \
-        "{\"kind\":\"measure\",\"label\":\"$label\",\"fixture\":\"/out/fixtures/$spec\",\"mode\":\"$mode\",\"out\":\"/out/results\",\"tmp\":\"/out/tmp/$label\",\"injectDeadlineAfterSizing\":$inject$limits_field}"
+      if [ -n "$LIMITS_JSON" ]; then limits_field=",\"limits\":$LIMITS_JSON"; fi
+      if [ -n "$LIMITS_JSON" ] || [ -n "$DEADLINE_SCALE" ]; then label="${label}${validation_suffix}"; fi
+      run_job "$name" "$label" "$job_timeout" \
+        "{\"kind\":\"measure\",\"label\":\"$label\",\"fixture\":\"/out/fixtures/$spec\",\"mode\":\"$mode\",\"out\":\"/out/results\",\"tmp\":\"/out/tmp/$label\",\"injectDeadlineAfterSizing\":$inject$limits_field$deadline_field}"
     done
   done
   # Results are on the bind-mounted $OUT; free this configuration's container and volumes before
