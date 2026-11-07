@@ -2226,7 +2226,7 @@ held run blocks its worker's upgrade or drain. If the api does not support the p
 park and the message says so; the run is then handled by the ordinary requeue paths. A worker restart
 consumes a requeue, so repeated restarts end at `recovery_wait` / `worker_requeue_exhausted`,
 unless the run's own open holds reach the custody admission limit first; it then stays queued for
-capacity (not an owner park) before it can be claimed again.
+capacity (not an owner park) until it can be claimed again.
 
 ### Retained sources with no open hold (worker-local inspect and discard)
 

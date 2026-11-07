@@ -155,6 +155,28 @@ describe("a record enrolled while the completion handoff runs", linux, () => {
       assert.ok(fs.existsSync(s.clone));
       assert.ok(subreasons(s).includes("completion_handoff/completion_retirement_pending/remediation_retained"));
     });
+
+    it(`a cross-branch record enrolled during a ${name} handoff outcome is a path_error, never held`, async t => {
+      confirmParks(t);
+      const s = await scene(t, { entry: "A", attemptPaths: true, authority: true, fenced: true, enroll: false });
+      let enrolled: string | undefined;
+      ((s.runner as unknown as { recovery: unknown }).recovery as { retireCompletedSourceForHandoff: unknown }).retireCompletedSourceForHandoff =
+        async () => {
+          await s.enroll();
+          const j = JSON.parse(s.journalRaw());
+          j.remediationRecovery.branch = "agent/issue-9999";
+          gitIn(s.bare, "config", "--local", `uzi-recovery.${s.branch}.clone`, JSON.stringify(j));
+          enrolled = snapshot(s).journal;
+          return outcome;
+        };
+      await s.run();
+      assert.ok(enrolled, "the handoff stub ran and enrolled the record");
+      assert.equal(s.parks(), 0, "never held");
+      assert.deepEqual(s.guidance(), []);
+      assert.ok(s.lines.some(l => l.stage === "path" && l.reason === "path_error"), "the path_error refusal");
+      assert.equal(s.entered.value, false, "no model turn");
+      assert.equal(snapshot(s).journal, enrolled, "the journal is unchanged after the enrolment");
+    });
   }
 });
 

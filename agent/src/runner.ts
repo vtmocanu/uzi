@@ -13530,7 +13530,9 @@ export class RunRunner {
       // disposition. Lifecycle stops always propagate instead of becoming a terminal orphan refusal.
       const reread = await rereadFence();
       if (reread?.state === "changed") return readmit();
-      // issue #4058: a record enrolled while the handoff ran decides before the handoff outcome does, whatever it was.
+      // issue #4058: when the re-read succeeds, a record enrolled while the handoff ran decides before the handoff
+      // outcome does. An expired or unreadable re-read sees no record, so the outcome's own disposition stands (an
+      // accepted race: never a hold without exact evidence, and nothing of the predecessor is touched).
       if (reread?.remediation === "mismatch") refuse("path", "path_error");
       if (reread?.remediation === "exact") holdRemediation();
       if (retainedSource) {

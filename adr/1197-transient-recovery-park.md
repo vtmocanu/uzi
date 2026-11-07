@@ -2000,9 +2000,12 @@ instead detached and the successor proceeded.
   (`LockClaimedNeverStartedContinuations`) and a worker re-register. Register's orphan recovery
   (`RequeueWorkerRuns`) charges `requeue_count`, and over the cap `failWorkerRunsOverCapLocked` parks
   the run (measured: 4 claims and 4 holds at `RUN_MAX_REQUEUES=3`). A worker restart is therefore a
-  charged path. When `custody_hold_limit` is at or below the claims that path needs (for example L=3 with
-  `RUN_MAX_REQUEUES=3`), admission refuses the next claim first and the run stays queued for capacity
-  rather than reaching the exhaustion park.
+  charged path. When `custody_hold_limit` is below the claims that path needs (L ≤ `RUN_MAX_REQUEUES`, for example L=3
+  with `RUN_MAX_REQUEUES=3`), admission refuses the next claim first and the run stays queued for capacity
+  rather than reaching the exhaustion park (derived from the admission rule `own holds >= L`, not measured
+  on the restart path). After a fenced completion handoff, an expired or unreadable re-read sees no record,
+  so a record enrolled during the handoff leaves the handoff outcome's own disposition in place (an
+  accepted race; never a hold without exact evidence).
 - A claim lost before any running report, listing or registration evidence, with no restart, is reset
   uncharged by `SweepClaimedNeverStarted`, repeatedly, including after Resume. It is bounded only by
   the run's own open holds reaching `custody_hold_limit` L (default 8): then `ClaimRun` refuses and the
