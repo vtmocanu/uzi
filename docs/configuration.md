@@ -369,9 +369,9 @@ The view is a prediction made now. Between the read and the claim, these can sti
 
 ### Cache semantics
 
-The judge and run-summary instance defaults come from the per-process instance settings cache (`SETTINGS_CACHE_TTL`, default `5s`, see [Admin settings](./admin-settings.md)). A replica that serves an admin write drops its cache, so its next read sees the change; other replicas see it within one TTL. If a refresh fails:
+The judge and run-summary instance defaults come from the per-process instance settings cache (`SETTINGS_CACHE_TTL`, default `5s`, see [Admin settings](./admin-settings.md)). A replica that serves an admin write drops its cache, so its next read sees the change; other replicas see it at their first successful refresh after one TTL. If a refresh fails:
 
-- A **warm** cache (a snapshot still held from an earlier successful read) serves that last map, so the view stays correct to within the TTL.
+- A **warm** cache (a snapshot still held from an earlier successful read) keeps serving that last map until a refresh succeeds, so during a database outage the view can be older than one TTL.
 - A **cold** cache (nothing read yet, for example right after a restart), or a read **right after an admin write** (the write dropped the snapshot), has nothing to fall back on and fails. The view then does not fail: the built-in applies to the instance tier and the affected judge and summary cells carry note `instance_settings_unavailable`.
 
 A store error while reading the Codex [catalog default](./worker-effort.md#what-the-codex-catalog-default-means) for an effort cell also does not fail the view: that cell's `catalog_default` degrades to unknown. Any other store error fails the whole request with a 500 rather than returning a partial body.

@@ -251,7 +251,7 @@ type EffectiveModelSource =
   | "user_default" | "instance_default" | "builtin" | "schedule_pin" | "template"
   | "cross_check_pin" | "cross_check_worker_default";
 type EffectiveEffortSource =
-  | "user_default" | "builtin" | "runtime_default" | "catalog_default" | "cross_check_pin" | "cross_check_default";
+  | "user_default" | "builtin" | "cross_check_pin" | "cross_check_default";
 type EffectiveHarnessSource = "run_override" | "schedule_pin" | "user_default" | "automatic" | "chosen_at_create";
 type EffectiveCredentialSource =
   | "claim_selection" | "codex_default_credential" | "chosen_at_create" | "auto_selection" | "owner_default" | "token_override";
