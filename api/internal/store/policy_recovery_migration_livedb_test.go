@@ -8,12 +8,12 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// TestPolicyRecoveryIdentityMigrationLiveDB pins migration 404: the four columns are additive and
+// TestPolicyRecoveryIdentityMigrationLiveDB pins migration 413: the four columns are additive and
 // uncoupled (a row in the earlier compact-hold shape stays valid), the checks are closed, and Down
 // drops exactly these four columns.
 func TestPolicyRecoveryIdentityMigrationLiveDB(t *testing.T) {
 	ctx, dsn := standIsolatedDB(t, "policy_recovery_identity_")
-	if err := store.MigrateTo(ctx, dsn, 403); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 412); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := store.OpenPool(ctx, dsn)
@@ -30,7 +30,7 @@ func TestPolicyRecoveryIdentityMigrationLiveDB(t *testing.T) {
 	mustExec(ctx, t, pool, `INSERT INTO runs(id,user_id,repo_id,issue_iid,issue_title,issue_description,status,harness,worker_id,claim_generation,session_id,
 		policy_outcome_id,policy_continuation_mode,policy_applying_worker_id,policy_applying_generation,policy_source_generation,policy_preserve_required)
 		VALUES($1,$2,$3,3607,'t','d','paused','codex',$4,1,'s',$5,'same_conversation',$4,1,1,true)`, run, owner, repo, worker, uuid.New())
-	if err := store.MigrateTo(ctx, dsn, 404); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 413); err != nil {
 		t.Fatal(err)
 	}
 	var nulls bool
@@ -63,7 +63,7 @@ func TestPolicyRecoveryIdentityMigrationLiveDB(t *testing.T) {
 		}
 	}
 	mustExec(ctx, t, pool, "UPDATE runs SET policy_hold_cause=NULL WHERE id=$1", run)
-	if err := store.MigrateDownTo(ctx, dsn, 403); err != nil {
+	if err := store.MigrateDownTo(ctx, dsn, 412); err != nil {
 		t.Fatalf("Down must not refuse live rows: %v", err)
 	}
 	var present, kept int
