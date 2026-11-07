@@ -26345,9 +26345,11 @@ export class RunRunner {
    * issue #4058 - hold a claim whose terminal predecessor's source is under secret-scan remediation. Nothing local is
    * written or released. It marks the flight retained, emits one guidance status naming only the predecessor run id,
    * confirms its delivery within GUIDANCE_FLUSH_MS (unconfirmed delivery is logged and the hold is still reported), then
-   * parks the run at `recovery_wait` / `retained_recovery_adoption_failed` when the api advertises that cause. It always
+   * parks the run at `recovery_wait` / `retained_recovery_adoption_failed` when the api advertises that cause (a
+   * first-attempt 400 refusal is logged and corrected by a second status). It always
    * ends in a nonterminal {@link RetainedRecoveryStop}: no terminal report, settlement, capture or model turn. A pending
-   * owner Cancel surfaces from the lifecycle guard as {@link RetainedRecoveryCancelled}.
+   * owner Cancel surfaces from the lifecycle guard as {@link RetainedRecoveryCancelled}, and a credential switch during the
+   * park as the existing {@link CredentialSwitchSignal}.
    */
   private async holdForPredecessorRemediation(flight: RunFlight, hold: OrphanRemediationHold): Promise<never> {
     this.retainedLifecycleGuard(flight);
@@ -26358,13 +26360,14 @@ export class RunRunner {
     const predecessor = RUN_ID_RE.test(hold.ownerRunId) ? hold.ownerRunId : "unknown";
     const willPark = this.client?.protocolFeatures?.includes(RETAINED_ADOPTION_FAILED_FEATURE) === true &&
       Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0;
+    const notHeld = "This run was not placed on an owner hold: each automatic retry on this worker will stop the same way " +
+      "and adds at least one admission-counted custody hold, up to this run's custody admission limit, unless that " +
+      "remediation has been resolved through a separately authorized route. ";
     const consequence = willPark
       ? "Resume on this worker will hold again unchanged and adds at least one admission-counted custody hold; lost " +
         "reports, crashes or worker re-registration can add more, up to this run's custody admission limit, unless " +
         "that remediation has been resolved through a separately authorized route. "
-      : "This run was not placed on an owner hold: each automatic retry on this worker will stop the same way and adds " +
-        "at least one admission-counted custody hold, up to this run's custody admission limit, unless that " +
-        "remediation has been resolved through a separately authorized route. ";
+      : notHeld;
     flight.batcher.emit({
       kind: "status",
       agent: "worker",
@@ -26378,14 +26381,25 @@ export class RunRunner {
     try {
       delivered = await flight.batcher.flushOwned(
         AbortSignal.any([this.retainedLifecycleSignal(flight), AbortSignal.timeout(GUIDANCE_FLUSH_MS)]));
-      if (!delivered) flight.runLog.warn("guidance_unconfirmed", { reason: "not_confirmed" });
+      if (!delivered) {
+        this.retainedLifecycleGuard(flight);
+        flight.runLog.warn("guidance_unconfirmed", { reason: "not_confirmed" });
+      }
     } catch (error) {
       this.retainedLifecycleGuard(flight);
       flight.runLog.warn("guidance_unconfirmed", { reason: "flush_error", ...formatRetainedRecoveryDiagnostic(error, flight.redactText) });
     }
     this.retainedLifecycleGuard(flight);
-    if (willPark) {
-      await this.parkRetainedRecoveryExhausted(flight, "retained_recovery_adoption_failed");
+    if (willPark && !await this.parkRetainedRecoveryExhausted(flight, "retained_recovery_adoption_failed")) {
+      // The api refused the cause outright (first-attempt 400): correct the guidance, which promised a hold.
+      flight.runLog.warn("remediation hold park refused", { cause: "retained_recovery_adoption_failed" });
+      flight.batcher.emit({ kind: "status", agent: "worker", payload: { text: `The api refused the owner hold for the secret-scan remediation of predecessor run ` +
+        `${predecessor}. ${notHeld}` +
+        `Cancel ends this run. \`uzi run recovery ${predecessor}\` inspects the predecessor.` } });
+      try {
+        await flight.batcher.flushOwned(
+          AbortSignal.any([this.retainedLifecycleSignal(flight), AbortSignal.timeout(GUIDANCE_FLUSH_MS)]));
+      } catch { /* best effort: the stop below is nonterminal either way */ }
     }
     throw new RetainedRecoveryStop({ cause: hold });
   }

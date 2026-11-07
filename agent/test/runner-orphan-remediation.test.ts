@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { describe, it, type TestContext } from "node:test";
+import { RequestError } from "../src/client.js";
 import { api, client, git, installHarness } from "./runner-harness.js";
 import {
   FEATURE, OWNER_FILE, confirmParks, scene, terminal, type Scene, type SceneOptions,
@@ -221,6 +222,27 @@ describe("the park acknowledgement", linux, () => {
     assert.ok(!joined.includes("Resume on this worker"), "no Resume promise when nothing is parked");
     assert.deepEqual(snapshot(s), before);
     assert.equal(client.protocolFeatures?.includes(FEATURE), false);
+  });
+
+  it("an api refusal of the park (first-attempt 400) is logged and the guidance is corrected, nonterminal", async t => {
+    confirmParks(t, async (body, original) => {
+      if (body.status === "recovery_wait") throw new RequestError("POST", "/state", 400, "unsupported recovery_cause");
+      return original();
+    });
+    const s = await scene(t, { entry: "A", attemptPaths: true });
+    const before = snapshot(s);
+    await s.run();
+    assert.equal(s.parks(), 0);
+    assert.deepEqual(terminal(s), []);
+    assert.ok(s.lines.some(l => l.msg === "remediation hold park refused"), s.lines.map(l => String(l.msg)).join(" | "));
+    const g = s.guidance();
+    assert.equal(g.length, 2, "the guidance plus one correction");
+    const [first = "", second = ""] = g;
+    assert.ok(first.includes("Resume on this worker will hold again unchanged"));
+    assert.ok(second.includes(`The api refused the owner hold for the secret-scan remediation of predecessor run ${s.ownerRun}. This run was not placed on an owner hold`));
+    assert.ok(!second.includes(s.clone) && !second.includes(s.bare) && !/Error/.test(second));
+    assert.equal(s.entered.value, false);
+    assert.deepEqual(snapshot(s), before);
   });
 });
 
