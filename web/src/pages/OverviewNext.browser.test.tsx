@@ -368,6 +368,11 @@ describe("OverviewNext issue work scope switch", () => {
     // (The usage card has its own All users option, so the button is looked up in the switch.)
     await expect.poll(() => (within(toggle).getByRole("button", { name: "All users" }) as HTMLButtonElement).disabled).toBe(false);
     await document.fonts.ready;
+    // fonts.ready also resolves after a failed load; without Plex the steady-width check is moot.
+    // (document.fonts.check is true when no face matches at all, so look the faces up.)
+    const loaded = (weight: string) =>
+      [...document.fonts].some((f) => f.family.includes("IBM Plex Sans") && f.weight === weight && f.status === "loaded");
+    for (const weight of ["400", "500", "600"]) expect(loaded(weight), `IBM Plex Sans ${weight} loaded`).toBe(true);
     const title = screen.getByRole("heading", { name: "Issue work", level: 2 });
     const note = title.parentElement!.children[1] as HTMLElement;
     expect(note.textContent).toMatch(/on the line/);
