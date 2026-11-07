@@ -217,7 +217,9 @@ describe("OverviewUsageCard (#3881 M1)", () => {
     noChart();
     fireEvent.click(view.getByRole("button", { name: "Factory · all users" }));
     noChart();
-    fireEvent.click(view.getByRole("button", { name: "All time" }));
+    fireEvent.click(view.getByRole("button", { name: "Last 7 days" }));
+    noChart();
+    fireEvent.click(view.getByRole("button", { name: "You" }));
     noChart();
   });
   it("shows the recoverable-work note from needs_landing", () => {
@@ -414,8 +416,10 @@ describe("OverviewUsageCard by-user table (#3881 M2)", () => {
   it("masks the email in demo mode", () => {
     const { self, admin } = fixture();
     const view = factoryView({ self, admin });
+    expect(cells(rowOf(view, /^owner\.person@/))[0]).toBe("owner.person@example.com (you)");
     act(() => setDemoMode(true));
     expect(section(view).queryByText(/owner\.person@example\.com/)).toBeNull();
+    expect(cells(rowOf(view, /^Owner/))[0]).toBe("Owner (you)");
   });
 
   it("explains an unavailable seven-day period instead of a table", () => {

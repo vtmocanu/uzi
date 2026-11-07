@@ -90,6 +90,7 @@ describe("OverviewNext for a non-admin", () => {
     expect(sentence()).toBe("Nothing needs you right now. 1 run is executing.");
     expect(screen.getByText("Live run row")).toBeTruthy();
     for (const call of adminEndpoints()) expect(call).not.toHaveBeenCalled();
+    expect(screen.getByRole("region", { name: "Your usage" })).toBeTruthy();
     expect(screen.queryByRole("group", { name: "Usage scope" })).toBeNull();
     expect(screen.queryByRole("region", { name: "By user" })).toBeNull();
     expect(screen.queryByText(/Other users/)).toBeNull();
@@ -152,6 +153,7 @@ describe("OverviewNext for an admin", () => {
     expect(mockApi.adminListRuns).toHaveBeenCalledWith({ view: "summary" });
     expect(mockApi.adminListRuns).toHaveBeenCalledTimes(1);
     expect(sentence()).toBe("Nothing needs you right now. 2 runs are executing across the factory and 1 queued.");
+    expect(screen.getByRole("group", { name: "Usage scope" })).toBeTruthy();
     // The admin's own row is shown once, under Yours; the other users' rows under Other users.
     expect(within(screen.getByRole("list", { name: "Your runs" })).getAllByText("Live run row")).toHaveLength(1);
     expect(within(screen.getByRole("list", { name: "Other users' runs" })).getAllByText("Live run row")).toHaveLength(2);
