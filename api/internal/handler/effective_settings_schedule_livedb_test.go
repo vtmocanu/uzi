@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +17,8 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/forge/forgetest"
 	"github.com/vtmocanu/uzi/api/internal/schedsvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -653,11 +656,130 @@ func TestSchedulePreviewSizeBoundsAndNoCredentialMaterialLiveDB(t *testing.T) {
 	_, stored := f.schedulePreview(fmt.Sprintf(`{"schedule_id":%q}`, id))
 	_, supplied := f.schedulePreview(fmt.Sprintf(`{"target":"sweep","credential_override":{"mode":"pinned","secret_id":%q}}`, pin))
 	_, refused := f.schedulePreview(`{"target":"sweep","credential_override":{"mode":"pinned"}}`)
+	// The scan must have material to look for, or it passes vacuously: the pinned token's id and
+	// label are among it.
+	if len(f.secretsToScan) == 0 || !slices.Contains(f.secretsToScan, pin.String()) {
+		t.Fatalf("the credential-material scan list = %v, want it non-empty and holding the pinned token id", f.secretsToScan)
+	}
 	for name, b := range map[string][]byte{"alternatives": body, "stored pin": stored, "supplied pin": supplied, "refusal": refused} {
 		for _, secret := range f.secretsToScan {
 			if secret != "" && bytes.Contains(b, []byte(secret)) {
 				t.Errorf("%s response carries credential material %q", name, secret)
 			}
 		}
+	}
+}
+
+// ---- a stored pinned token disabled since the save, on a user who resolves to Codex ----
+
+// ciRedForge reports one failed default-branch workflow execution, enough for a ci_watch fire to
+// reach the point where it starts a repair run.
+type ciRedForge struct{ forgetest.BaseFake }
+
+func (*ciRedForge) ListWorkflowRuns(context.Context, int64, forge.ListWorkflowRunsOptions) ([]forge.WorkflowRun, error) {
+	now := time.Now()
+	return []forge.WorkflowRun{{
+		ID: 7001, WorkflowKey: "wf-eff", Name: "ci", Event: "push", Branch: "main", SHA: "deadbeef",
+		Status: "completed", Conclusion: "failure", WebURL: "https://forge.e2e/runs/7001", CreatedAt: now, UpdatedAt: now,
+	}}, nil
+}
+
+// insertPinned stores an unpinned-harness schedule of the given target and timing whose stored
+// override is a pinned token, for states a save cannot produce. A once schedule is already due.
+func (f *effFix) insertPinned(target, timing string, secret uuid.UUID) string {
+	f.t.Helper()
+	id := uuid.New()
+	var prompt, issueIID any
+	switch target {
+	case "issue":
+		f.iid++
+		issueIID = f.iid
+	default:
+		prompt = "eff prompt"
+	}
+	cron, runAt, next := any("0 * * * *"), any(nil), "now() + interval '1 hour'"
+	if timing == "once" {
+		cron, runAt, next = nil, time.Now().Add(-time.Hour), "now() - interval '1 minute'"
+	}
+	f.exec(`INSERT INTO run_schedules (id, user_id, repo_id, target, issue_iid, prompt, timing, cron_expr, run_at, timezone, next_fire_at, auto_approve, status, enabled,
+			credential_override_mode, credential_override_secret_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'UTC', `+next+`, true, 'active', true, 'pinned', $10)`,
+		id, f.user, f.repo, target, issueIID, prompt, timing, cron, runAt, secret)
+	return id.String()
+}
+
+// codexOnlyWithDisabledPin is a user whose only usable harness is Codex and whose schedule's stored
+// pinned token was disabled after the save.
+func codexOnlyWithDisabledPin(f *effFix) uuid.UUID {
+	f.t.Helper()
+	f.codexDefault()
+	pin := f.addToken(uuid.New(), "eff-codex-pin-"+uuid.NewString()[:8], false)
+	return pin
+}
+
+func TestSchedulePreviewUnpinnedCodexWithDisabledPinLiveDB(t *testing.T) {
+	t.Run("a ci_watch schedule has the scheduler's codex_override_conflict pre-check", func(t *testing.T) {
+		f := newEffFix(t, nil)
+		pin := codexOnlyWithDisabledPin(f)
+		id := f.insertPinned("ci_watch", "recurring", pin)
+		f.exec(`UPDATE user_secrets SET disabled_at = now() WHERE id = $1`, pin)
+		dto, body := f.schedulePreview(fmt.Sprintf(`{"schedule_id":%q}`, id))
+		wantHarness(t, dto.Harness, "codex", "automatic")
+		if strs(dto.Refusal) != "codex_override_conflict" || dto.WorkerModel != nil || dto.Credential != nil || dto.Subagents != nil {
+			t.Fatalf("preview = %s, want codex_override_conflict", body)
+		}
+		sched := schedsvc.New(f.h.q, f.h.wsvc, sweepGateBuilder{f: &ciRedForge{}}, sweepGateSettings{}, nil, nil, time.Minute, nil)
+		row, err := f.h.q.GetRunSchedule(f.ctx, uuid.MustParse(id))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := sched.RunNow(f.ctx, row)
+		if err != nil {
+			t.Fatalf("fire: %v", err)
+		}
+		var skips []string
+		for _, s := range out.Skips {
+			skips = append(skips, string(s.Reason))
+		}
+		if len(out.Started) != 0 || strings.Join(skips, ",") != "codex_override_conflict" {
+			t.Fatalf("fire = started %v skips %v, want only the codex_override_conflict skip", out.Started, skips)
+		}
+	})
+
+	// A one-time schedule runs the credential_disabled pre-check before the fire, so the tick holds
+	// it as credential_disabled and never reaches the codex_override_conflict gate.
+	for _, target := range []string{"prompt", "issue"} {
+		t.Run("a once "+target+" schedule is held as credential_disabled by the tick", func(t *testing.T) {
+			f := newEffFix(t, nil)
+			pin := codexOnlyWithDisabledPin(f)
+			id := f.insertPinned(target, "once", pin)
+			f.exec(`UPDATE user_secrets SET disabled_at = now() WHERE id = $1`, pin)
+			dto, body := f.schedulePreview(fmt.Sprintf(`{"schedule_id":%q}`, id))
+			wantHarness(t, dto.Harness, "codex", "automatic")
+			if strs(dto.Refusal) != "credential_disabled" || dto.WorkerModel != nil || dto.Credential != nil || dto.Subagents != nil {
+				t.Fatalf("preview = %s, want credential_disabled", body)
+			}
+			// The real tick: the once schedule is held, not advanced, with the skip recorded.
+			sched := schedsvc.New(f.h.q, f.h.wsvc, sweepGateBuilder{f: &sweepGateForge{}}, sweepGateSettings{}, nil, nil, time.Minute, nil)
+			sched.Boot(f.ctx)
+			var lastFire, status string
+			var due bool
+			if err := f.pool.QueryRow(f.ctx, `SELECT COALESCE(last_fire::text, ''), status, next_fire_at IS NOT NULL FROM run_schedules WHERE id = $1`, id).Scan(&lastFire, &status, &due); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(lastFire, `"credential_disabled"`) || strings.Contains(lastFire, "codex_override_conflict") || status != "active" || !due {
+				t.Fatalf("after the tick: last_fire %s status %s due %v, want the credential_disabled hold", lastFire, status, due)
+			}
+			var runs int
+			if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM runs WHERE user_id = $1`, f.user).Scan(&runs); err != nil || runs != 0 {
+				t.Fatalf("the held schedule created %d runs (err %v)", runs, err)
+			}
+			// The same stored shape recurring is not held: it reaches the conflict gate.
+			rec := f.insertPinned(target, "recurring", pin)
+			dto, body = f.schedulePreview(fmt.Sprintf(`{"schedule_id":%q}`, rec))
+			if strs(dto.Refusal) != "codex_override_conflict" {
+				t.Fatalf("recurring preview = %s, want codex_override_conflict", body)
+			}
+		})
 	}
 }

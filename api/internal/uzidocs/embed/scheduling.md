@@ -486,8 +486,9 @@ omitted from `null`: omitted keeps the stored value, an explicit `null`
 clears it. An explicit `"credential_override": null` is inherit and is
 validated as a save would validate it; omitted means not set, so a fire
 threads the stored override as stored. A `self_improve` schedule ignores a
-stored override (it follows its own credential ladder) but honours one you
-supply.
+stored override (it follows its own credential ladder) and refuses any
+override you supply, `inherit` and `null` included, with
+`credential_override_lane_not_switchable`.
 
 #### Order of the checks
 
@@ -512,21 +513,32 @@ Refusals are closed tokens, with an optional `refusal_detail`:
 | Save | `invalid_model`, `credential_not_found`, `credential_disabled`, `credential_override_lane_not_switchable`, `credential_override_harness_unsupported`, `credential_override_invalid` |
 | Fire | `no_credential_for_harness`, `no_usable_credential`, `credential_disabled`, `codex_pool_unavailable`, `codex_override_conflict` |
 
-The fire tokens are the schedule [skip reasons](#fire-outcomes) a real fire
-would record. For an override that a fire threads, the checks run in this
+The fire tokens other than `no_credential_for_harness` are the schedule
+[skip reasons](#fire-outcomes) a real fire would record. For an override that a fire threads, the checks run in this
 order once the harness is known:
 
-1. An **unpinned** schedule (other than a CI watch) that lands on Codex with
-   any override is refused `codex_override_conflict`: the scheduler fails
-   closed before creating the run.
+1. An **unpinned** schedule that lands on Codex with any override is refused
+   `codex_override_conflict`: the scheduler fails closed before creating the
+   run. Every target has this check, a CI watch included.
 2. A **stored pinned token** that has been disabled since the save is
    refused `credential_disabled`.
 3. Any Anthropic override on a Codex run is refused `codex_override_conflict`
    by the run-create step.
 
-A pinned token that was **deleted** has no id left, so the fire inherits and
-refuses nothing; the preview shows the credential the claim would choose
-(source `claim_selection`).
+A **one-time** schedule runs check 2 before the fire, so a one-time prompt
+or issue schedule that lands on Codex with a disabled stored pinned token is
+held as `credential_disabled` and the preview answers that, not
+`codex_override_conflict`. The preview knows the timing only of a saved
+schedule (`schedule_id`); a draft has none and is treated as recurring.
+
+A pinned token that was **deleted** has no id left. On Claude the fire
+inherits and refuses nothing, and the preview shows the credential the claim
+would choose (source `claim_selection`). On Codex the override still
+conflicts.
+
+`no_credential_for_harness` is a hard refusal of a fire that names a harness
+with no usable credential, not a skip reason: a real fire retries rather than
+recording a skip.
 
 #### What each target shows
 

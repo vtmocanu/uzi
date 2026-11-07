@@ -54,6 +54,9 @@ type scheduleDraft struct {
 	model            *string
 	overrideSubagent bool
 	override         *workersvc.CredentialOverride
+	// once is set for a saved one-time schedule. The request carries no timing, so a draft without
+	// schedule_id is never once.
+	once bool
 }
 
 // draftOutcome is the result of the request-to-draft step: a draft, a save-step refusal, or the
@@ -168,7 +171,7 @@ func (h *Handler) scheduleDraftFromRequest(ctx context.Context, userID uuid.UUID
 		sched = &s
 	}
 
-	d := scheduleDraft{userID: userID}
+	d := scheduleDraft{userID: userID, once: sched != nil && sched.Timing == "once"}
 	switch {
 	case req.Target != nil:
 		d.target = strings.TrimSpace(*req.Target)
@@ -250,8 +253,11 @@ func (h *Handler) scheduleDraftFromRequest(ctx context.Context, userID uuid.UUID
 	case sched != nil:
 		d.override = storedScheduleOverride(*sched)
 	}
-	if d.target == "self_improve" && !req.CredentialOverride.Present {
-		d.override = nil // a self_improve run follows its own ladder and never carries one
+	if d.target == "self_improve" {
+		// A self_improve run follows its own ladder and never carries one. A supplied override
+		// (even inherit or null) was refused above as credential_override_lane_not_switchable, so
+		// only the stored one reaches here and is dropped.
+		d.override = nil
 	}
 	return draftOutcome{draft: d}, nil
 }
@@ -313,16 +319,18 @@ func (h *Handler) predictFire(ctx context.Context, d scheduleDraft, explicit *wo
 
 // scheduleOverrideRefusal applies the fire-time rules for the override a fire threads, once the
 // harness is hn. An unpinned schedule that meets Codex fails closed first (the scheduler's
-// pre-check, which a CI watch does not have); then a stored pinned token disabled since refuses;
-// then any Anthropic override on a Codex run is refused by the create seam. All three are the
-// schedule skip reasons. A deleted pinned token has no id left, so it inherits and refuses nothing.
+// codexOverrideConflict pre-check, which every target runs, a CI watch included); then a stored
+// pinned token disabled since refuses; then any Anthropic override on a Codex run is refused by the
+// create seam. All three are the schedule skip reasons. A one-time schedule runs the disabled-token
+// check before the fire, so for it the disabled token comes first. A deleted pinned token has no
+// id left, so it inherits on Claude; on Codex the override still conflicts.
 func (h *Handler) scheduleOverrideRefusal(ctx context.Context, d scheduleDraft, hn workersvc.Harness) (refusal, error) {
 	if d.override == nil {
 		return refusal{}, nil
 	}
 	conflict := refusal{Token: refusalCodexOverrideConflict}
 	onCodex := hn == workersvc.HarnessCodex
-	if onCodex && d.pin == nil && d.target != "ci_watch" {
+	if onCodex && d.pin == nil && !d.once {
 		return conflict, nil
 	}
 	if err := h.wsvc.CheckStoredCredentialOverrideEnabled(ctx, d.userID, d.override); err != nil {
