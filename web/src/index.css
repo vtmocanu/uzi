@@ -427,6 +427,25 @@ body {
   animation: issue-line-flow 1.1s linear infinite;
 }
 
+/* Auto-change highlight for the connect-form base-URL ⇄ forge-type sync
+   (PRD #337 D9): when a sync handler moves the *other* field, this brief tint
+   flash makes the coupling legible. Purely cosmetic and cleared on animationend
+   (no setTimeout). Declared above the reduced-motion block below on purpose:
+   both are unlayered with equal specificity, so the later reduced-motion
+   override wins (#3986). */
+@keyframes forge-flash {
+  from {
+    background-color: rgb(var(--ring) / 0.25);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+.forge-flash {
+  animation: forge-flash 0.6s ease-out;
+  border-radius: 0.5rem;
+}
+
 /* Respect prefers-reduced-motion (PRD #38 M4): neutralize the two Tailwind
    keyframe utilities the run feed animates — the running-tool spinner
    (animate-spin) and the active-agent pulsing dot (animate-pulse). This block is
@@ -442,23 +461,6 @@ body {
   .issue-line-flow {
     animation: none;
   }
-}
-
-/* Auto-change highlight for the connect-form base-URL ⇄ forge-type sync
-   (PRD #337 D9): when a sync handler moves the *other* field, this brief tint
-   flash makes the coupling legible. Purely cosmetic and cleared on animationend
-   (no setTimeout); neutralized under prefers-reduced-motion above. */
-@keyframes forge-flash {
-  from {
-    background-color: rgb(var(--ring) / 0.25);
-  }
-  to {
-    background-color: transparent;
-  }
-}
-.forge-flash {
-  animation: forge-flash 0.6s ease-out;
-  border-radius: 0.5rem;
 }
 
 /* Typography for rendered docs markdown (DocMarkdown). Hand-rolled prose rules
