@@ -71,6 +71,11 @@ WHERE id = @id AND redeemed_at IS NULL AND superseded_at IS NULL;
 -- name: SetUserCredentialsResetAt :exec
 UPDATE users SET credentials_reset_at = now() WHERE id = @id;
 
+-- name: GetUserCredentialsResetAt :one
+-- PRD #3989 M3: the claim finisher's reset marker. A plain read (no row lock), so it adds no
+-- edge to the run-then-users lock order. NULL means the user never redeemed a reset link.
+SELECT credentials_reset_at FROM users WHERE id = @id;
+
 -- name: DeleteAllUserSecretsForOwner :execrows
 -- Every user_secrets row of every kind and sealing marker. FKs null the run,
 -- worker and judge bindings and cascade the rate-limit and Codex state rows.

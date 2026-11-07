@@ -252,6 +252,11 @@ A few things are specific to Codex:
   credential disabled**, and resumes when you enable that login again. It
   is never moved to another login or to Claude, and Codex runs have no
   per-run token switch.
+- **An account reset ends Codex runs created before it.** An admin-issued
+  [account reset](auth-design.md) deletes your Codex logins. A Codex run
+  created before the reset keeps its fixed login, which is now gone, so it
+  fails with "the bound Codex login is unavailable after your account reset;
+  start a new run". Add a Codex login again and start a new run.
 - **The default is shared.** Your Codex logins and OpenAI API key share one
   default. Disabling the default asks you to pick an enabled replacement;
   disabling the last enabled one leaves you with no Codex default, and a

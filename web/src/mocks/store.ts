@@ -151,6 +151,7 @@ function seed(): MockState {
   // hold carries no feed rows of its own, and an empty log opens the run view.
   messages.set("run-cred-disabled", []);
   messages.set("run-cred-disabled-codex", []);
+  messages.set("run-cred-reset", []);
   // Issue #3181: the token-switch holds, empty logs for the same reason.
   messages.set("run-cred-switch-settling", []);
   messages.set("run-cred-switch-unsettled", []);

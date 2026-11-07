@@ -211,10 +211,19 @@ and a `vault_only` link grants no access.
 - **Running runs.** A run already executing keeps the credential its worker was
   issued until it ends; stopping or fencing active runs is out of scope. Its
   Codex refresh writes against a deleted account fail closed. Queued runs are
-  not claimed until the new vault exists and is unlocked. After that, runs that
-  fall back to the default credential, and Codex runs, fail at claim like any
-  other deleted credential; Claude runs that resolve to an auto-bound worker
-  wait in the credential pool (`pool_wait`) until a credential exists.
+  not claimed until the new vault exists and is unlocked. After that, a
+  Claude-harness or chat run created before the reset that finds no model
+  credential at claim parks (`paused`, `hold_reason` `credentials_reset`)
+  instead of failing. It resumes automatically when the owner adds a credential
+  (promoted on secret create, vault unlock and the periodic sweep), parks again
+  if the credential vanishes before the claim, and refuses manual resume with
+  409. Judge, job and cross_check runs are unchanged, and runs created after the
+  reset fail without a credential. A Codex run created before the reset has its
+  Codex login binding frozen and its bound login deleted, so it fails terminally
+  ("the bound Codex login is unavailable after your account reset; start a new
+  run", `fail_origin` `credential_unavailable`). Claude runs that resolve to an
+  auto-bound worker wait in the credential pool (`pool_wait`) until a credential
+  exists.
 - **Uncertain outcome.** If the commit cannot be confirmed the redeem call
   returns `503` with "the reset could not be confirmed; try signing in with the
   new password, or ask for a new link" for a `password` link, or "...try signing

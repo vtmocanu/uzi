@@ -1339,6 +1339,9 @@ type Store interface {
 	ClaimChatRun(ctx context.Context, arg store.ClaimChatRunParams) (store.Run, error)
 	// ParkCredentialDisabledChatRun holds a claimed chat on credential_disabled (PRD #1732 D2).
 	ParkCredentialDisabledChatRun(ctx context.Context, arg store.ParkCredentialDisabledChatRunParams) (int64, error)
+	// GetUserCredentialsResetAt is the PRD #3989 reset marker the chat lane reads to park a chat on
+	// credentials_reset; NULL means the owner never redeemed an account reset link.
+	GetUserCredentialsResetAt(ctx context.Context, id uuid.UUID) (pgtype.Timestamptz, error)
 	GetChatRunClaimContext(ctx context.Context, runID uuid.UUID) (pgtype.Text, error)
 	CountChatFollowUps(ctx context.Context, runID uuid.UUID) (int64, error)
 	SweepIdleChatRuns(ctx context.Context, cutoff pgtype.Timestamptz) ([]store.SweepIdleChatRunsRow, error)
@@ -3794,6 +3797,13 @@ func (s *Service) recoverClaimAssembly(ctx context.Context, run store.Run, err e
 // secret is absent or cannot be decrypted. Its message is safe to store as a
 // run failure reason (it never includes secret bytes).
 var errCredentialUnavailable = errors.New("credential unavailable")
+
+// errNoModelCredential is the narrow errCredentialUnavailable case "the owner holds no Anthropic
+// token for this claim" (PRD #3989 M3). It wraps errCredentialUnavailable, so its text and every
+// existing errors.Is(err, errCredentialUnavailable) consumer are unchanged. finishRunClaimTx keys
+// the credentials_reset park on it, never on errCredentialUnavailable, which also covers
+// forge-origin refusal, repo-owner mismatch and an undecryptable token or PAT.
+var errNoModelCredential = fmt.Errorf("%w: no Anthropic token configured for this user", errCredentialUnavailable)
 
 // errRunVanished marks a claim whose run disappeared before its payload could be
 // assembled (a cascading delete of the forge connection).

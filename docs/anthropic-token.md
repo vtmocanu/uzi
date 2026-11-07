@@ -598,9 +598,16 @@ a new password:
   fresh one, even if you had turned protection Off.
 - Does not stop runs that are already executing; they keep the credential their
   worker was issued until they end. Queued runs are not claimed until your new
-  vault exists and is unlocked. After that, runs that fall back to the default
-  credential, and Codex runs, fail at claim, as for any deleted credential.
-  Claude runs that resolve to an auto-bound worker wait in the credential pool
+  vault exists and is unlocked. After that, a Claude or chat run created before
+  the reset that can no longer get a model credential does not fail: it pauses
+  and shows "waiting: credentials were reset" (`credentials_reset`). It resumes
+  on its own once you add a credential, and pauses again if that credential
+  disappears before the run is claimed. Resuming it by hand is refused until you
+  add one. Judge, job and cross-check runs are unchanged, and runs created after
+  the reset fail if there is no credential. A Codex run created before the reset
+  fails, because its Codex login was fixed when the run was created and the
+  reset deleted it (see [Codex credentials](codex-credentials.md)). Claude runs
+  that resolve to an auto-bound worker wait in the credential pool
   (`pool_wait`) until a credential exists.
 
 **If you sign in only through SSO** (your account has no password), the link is

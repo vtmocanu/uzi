@@ -119,6 +119,19 @@ func (q *Queries) GetResetLinkState(ctx context.Context, tokenHash []byte) (GetR
 	return i, err
 }
 
+const getUserCredentialsResetAt = `-- name: GetUserCredentialsResetAt :one
+SELECT credentials_reset_at FROM users WHERE id = $1
+`
+
+// PRD #3989 M3: the claim finisher's reset marker. A plain read (no row lock), so it adds no
+// edge to the run-then-users lock order. NULL means the user never redeemed a reset link.
+func (q *Queries) GetUserCredentialsResetAt(ctx context.Context, id uuid.UUID) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, getUserCredentialsResetAt, id)
+	var credentials_reset_at pgtype.Timestamptz
+	err := row.Scan(&credentials_reset_at)
+	return credentials_reset_at, err
+}
+
 const insertResetLink = `-- name: InsertResetLink :one
 INSERT INTO account_reset_links (user_id, token_hash, kind, target_is_admin, issued_by, expires_at)
 VALUES ($1, $2, $3, $4, $5, $6)

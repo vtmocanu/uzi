@@ -176,6 +176,7 @@ describe("parkDisposition", () => {
     ["provider_unavailable", { status: "paused", hold_reason: "provider_unavailable" }, "owner"],
     ["base_attestation_missing", { status: "paused", hold_reason: "base_attestation_missing" }, "owner"],
     ["credential_disabled", { status: "paused", hold_reason: "credential_disabled" }, "owner"],
+    ["credentials_reset", { status: "paused", hold_reason: "credentials_reset" }, "owner"],
     ["completion_blocked", { status: "paused", completion_phase: "blocked" }, "owner"],
     ["worker_requeue_exhausted", { status: "recovery_wait", recovery_wait_cause: "worker_requeue_exhausted" }, "owner"],
     ["worker_memory_pressure", { status: "recovery_wait", recovery_wait_cause: "worker_memory_pressure" }, "owner"],

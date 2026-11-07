@@ -21564,6 +21564,8 @@ WITH candidates AS MATERIALIZED (
     WHERE runs.id = $6 AND runs.user_id = $7
   AND runs.status = 'paused'
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
+  -- PRD #3989: a credentials_reset hold is released only by the credential promoter.
+  AND runs.hold_reason IS DISTINCT FROM 'credentials_reset'
   AND NOT runs.policy_preserve_required AND NOT runs.policy_pending_fresh
   AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
@@ -21656,6 +21658,8 @@ UPDATE runs SET
 WHERE runs.id = $6 AND runs.user_id = $7
   AND runs.status = 'paused'
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
+  -- PRD #3989: a credentials_reset hold is released only by the credential promoter.
+  AND runs.hold_reason IS DISTINCT FROM 'credentials_reset'
   AND NOT runs.policy_preserve_required AND NOT runs.policy_pending_fresh
   AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
