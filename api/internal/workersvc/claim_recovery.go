@@ -616,8 +616,8 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 
 // The hold reasons the exact-claim park writes (ParkCredentialDisabledRun, and the chat twin).
 const (
-	holdCredentialDisabled = "credential_disabled"
-	holdCredentialsReset   = "credentials_reset"
+	holdCredentialDisabled = "credential_disabled" //nolint:gosec // G101: a run hold-reason VOCABULARY value (the server enum), not a credential.
+	holdCredentialsReset   = "credentials_reset"   //nolint:gosec // G101: a run hold-reason VOCABULARY value (the server enum), not a credential.
 )
 
 // codexResetFailureReason is the stored failure_reason of a Codex run whose frozen alias an

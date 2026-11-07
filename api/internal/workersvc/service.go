@@ -1337,7 +1337,8 @@ type Store interface {
 	ListChatRunsForUser(ctx context.Context, userID uuid.UUID) ([]store.ListChatRunsForUserRow, error)
 	GetLiveChatForUser(ctx context.Context, userID uuid.UUID) (store.Run, error)
 	ClaimChatRun(ctx context.Context, arg store.ClaimChatRunParams) (store.Run, error)
-	// ParkCredentialDisabledChatRun holds a claimed chat on credential_disabled (PRD #1732 D2).
+	// ParkCredentialDisabledChatRun holds a claimed chat on credential_disabled (PRD #1732 D2)
+	// or credentials_reset (PRD #3989), per its HoldReason.
 	ParkCredentialDisabledChatRun(ctx context.Context, arg store.ParkCredentialDisabledChatRunParams) (int64, error)
 	// GetUserCredentialsResetAt is the PRD #3989 reset marker the chat lane reads to park a chat on
 	// credentials_reset; NULL means the owner never redeemed an account reset link.

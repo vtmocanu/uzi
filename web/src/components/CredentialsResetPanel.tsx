@@ -20,7 +20,7 @@ export function CredentialsResetPanel({ run, canSteer }: { run: Run; canSteer: b
       <p className="mt-1 text-sm text-fg">
         This account was reset by an admin, which deleted its credentials, so this run has no
         credential to use. It resumes by itself once the owner adds a credential in Settings.
-        Resuming it by hand would not help.
+        Resume is not available for this hold.
       </p>
       {canSteer ? (
         <div className="mt-3 flex flex-wrap items-start gap-2">

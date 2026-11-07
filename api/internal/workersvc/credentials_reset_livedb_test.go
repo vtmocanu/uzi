@@ -338,6 +338,15 @@ func TestChatCredentialsResetLiveDB(t *testing.T) {
 		}
 		assertFailedCredentialUnavailable(t, fx.env, chatID)
 	})
+	t.Run("chat created after the reset still fails", func(t *testing.T) {
+		fx := newCDFix(t)
+		chatID := newChat(t, fx)
+		resetAccountCredentials(fx.env, fx.userID, "now() - interval '1 hour'")
+		if payload, err := fx.svc.ClaimChat(fx.env.ctx, fx.worker(t)); err != nil || payload != nil {
+			t.Fatalf("ClaimChat = (%v, %v), want an idle failure", payload != nil, err)
+		}
+		assertFailedCredentialUnavailable(t, fx.env, chatID)
+	})
 }
 
 // TestClaimCredentialsResetCodexFailsWithNamedReasonLiveDB (D16): a Codex run is never parked. A

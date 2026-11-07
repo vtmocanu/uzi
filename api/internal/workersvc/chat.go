@@ -373,7 +373,9 @@ func (s *Service) assembleChatClaim(ctx context.Context, run store.Run) (*ChatCl
 	// bound worker's chat runs still spend the owner's default token.
 	// PRD #1732 D2: openAnthropic refuses a disabled row (errCredentialDisabled), and a slot
 	// whose tokens are all disabled has no default: both hold the chat on credential_disabled
-	// (ClaimChat) rather than failing it; a token-less owner keeps today's failure.
+	// (ClaimChat) rather than failing it. A token-less owner's chat fails, unless the owner
+	// redeemed an account reset after the chat was created: that chat parks on credentials_reset
+	// (PRD #3989).
 	cred, err := s.openAnthropic(ctx, run.UserID, nil)
 	if err != nil {
 		if perr := s.parkIfDefaultSlotDisabled(ctx, run.UserID, err); perr != nil {
