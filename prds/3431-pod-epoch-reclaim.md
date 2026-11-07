@@ -159,7 +159,7 @@ This is a PARTIAL delivery. Verified against the branch source (symbol anchors, 
 
 ### R9 measurement detail (per class)
 
-Measured 2026-11-06 at the candidate limits on `027d6c89` plus the then-uncommitted R9 limit change, before the streaming, topology-first and loose-leaf changes. The counters were cross-checked exactly against `git ls-files`, `ls-tree -r -l`, `count-objects -v` and `verify-pack -v`. Peak RSS in this table predates streaming; the re-measurement above supersedes it. The large and self-contained rows were not re-run after the overflow semantics changed: their limit hits would now be a content-stage keep (pack-index object count) and an object-store-budget keep respectively. The harness, raw results and generator were kept in the run's scratch directory and are not committed.
+Measured 2026-11-06 at the candidate limits on `027d6c89` plus the then-uncommitted R9 limit change, before the streaming, topology-first and loose-leaf changes. The counters were cross-checked exactly against `git ls-files`, `ls-tree -r -l`, `count-objects -v` and `verify-pack -v`. The pre-streaming peak RSS (not shown) is superseded by the re-measurement above. The large, loose and self-contained rows were not re-run after the overflow and loose-leaf semantics changed: the large row's limit hit would now be a content-stage keep (pack-index object count), and the self-contained rows would be an object-store-budget keep only for the fixture whose leftover `.git/info/refs` was removed; an as-created self-contained clone is kept earlier by the shape stage. The harness, raw results and generator were kept in the run's scratch directory and are not committed.
 
 | class | tracked files / bytes | index bytes | metadata MiB (16) | path records idx/dir/untracked (131,072 each) | worktree content MiB (512) | largest Git stdout |
 |---|---|---|---|---|---|---|
@@ -168,7 +168,7 @@ Measured 2026-11-06 at the candidate limits on `027d6c89` plus the then-uncommit
 | large (demand, caps raised) | 50,001 / 525.9 MB | 4,032,152 | 11.1 | 50,001 / 54,637 / 304 | 501.6 | 7,555,316 B (cat-file) |
 | real (this repository) | 8,692 / 153.9 MB | 969,253 | 2.67 | 8,692 / 10,025 / 3 | 146.7 | 2,264,471 B |
 
-Object store per snapshot, in MiB (budget 4,096); the figures were identical across the three snapshots:
+Object store per snapshot, in MiB (budget 4,096); within one run every snapshot was identical (demand runs took two snapshots; ranges in the self-contained row span the all-branches and main-only variants). The total also includes the per-path stat and directory-name charge, which has no column (12.2 MiB for the loose row):
 
 | class | packs / loose | pack span (compressed) | loose compressed | inflated | delta-generated | idx | total | OFS/REF graph: objects / deltas / max chain | occurrences (131,072) |
 |---|---|---|---|---|---|---|---|---|---|
@@ -181,7 +181,7 @@ Object store per snapshot, in MiB (budget 4,096); the figures were identical acr
 | real | 1 / 0 | 99.9 | 0 | 247.1 | 2,403.9 | 1.5 | 2,752.4 | 55,231 / 39,864 / 49 | 55,231 |
 | real, self-contained (demand) | 2 / 0 | 199.4 | 0 | 493-494 | 4,751-4,808 | 2.9 | 5,447-5,505 (over) | twice the real pack | 109,948-110,462 |
 
-Admitted alternates: the default attempt clone is `clone --shared`, so its own store is empty and its `objects/info/alternates` names the bare. Every class above therefore measures one alternate edge to the managed bare; no fixture used a second alternate. Wall time (real): about 50 s in total. The `verify-pack` child takes 26 s of that, the three snapshot walks 4-5 s each, and worktree hashing 5.5 s. A loose bare is about 4x slower per snapshot.
+Admitted alternates: the default attempt clone is `clone --shared`, so its own store is empty and its `objects/info/alternates` names the bare. Every shared-clone class above measures one alternate edge to the managed bare. The self-contained rows have none, because their clone was materialized and its alternates removed; the bare is still observed directly. No fixture used a second alternate. Wall time (real): about 50 s in total. The `verify-pack` child takes 26 s of that, the three snapshot walks 4-5 s each, and the worktree phase 5.5 s. A loose bare is about 4x slower over the whole proof (42 s against 10 s for the same mid fixture packed), and each of its snapshots is about 16x slower.
 
 ## #3775 partial-shadow diagnostic contract
 
