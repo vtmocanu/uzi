@@ -11,7 +11,7 @@
 | #3878 (`prds/done/3878-overview-preview-decisions.md`) | The new Overview at `/overview/next`: header with status sentence and health chip, banners under the header, Needs your decision, runs grouped Yours / Other users (admin) | none |
 | #3879 (`prds/done/3879-overview-issue-line.md`) | The issue-work line, filtering the runs widget | #3878 |
 | #3880 (`prds/done/3880-overview-capacity-held-work.md`) | Capacity rail and Held work; retires the worker-load card and custody banner on the preview | #3878 |
-| #3881 (`prds/3881-overview-usage-by-user.md`) | Usage card with the You / Factory toggle and the admin by-user table | #3878 |
+| #3881 (`prds/done/3881-overview-usage-by-user.md`) | Usage card with the You / Factory toggle and the admin by-user table | #3878 |
 | #3875 (`prds/3875-command-menu.md`) | The Cmd K command menu | #3878, #3880 |
 | #3876 (`prds/3876-usage-harness-split.md`) | Per-user Claude / Codex split in admin usage (API, CLI, table column) | #3881 |
 | #3877 (`prds/3877-overview-promote.md`) | Promote the new Overview to `/dashboard` and retire the old one | #3878, #3879, #3880, #3881, and the maintainer's trial verdict |

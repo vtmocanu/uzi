@@ -1,6 +1,6 @@
 # PRD #3881: Overview preview, usage with a by-user table
 
-**Status**: Ready for dispatch (refreshed 2026-11-07 against main; #3878, #3879 and #3880 merged). Child of epic #3873. The preview page is `web/src/pages/OverviewNext.tsx`, which renders the carried-over `UsageCard` from the admin-gated `useOverviewData` hook (`web/src/lib/useOverviewData.ts`).
+**Status**: Done (2026-11-07). M1 and M2 delivered on branch `agent/issue-3881`: `web/src/components/OverviewUsageCard.tsx` renders the Usage card on `/overview/next`, sharing `web/src/components/usageParts.tsx` and `web/src/lib/usageByUser.ts` with the current Overview's `UsageCard`. Screenshots beside the mock (You and Factory, both windows, desktop and 400 px, Ember and Dawn) are in `prds/mockups/3881/`. Child of epic #3873.
 
 **Design brief**: `prds/3873-overview-redesign.md` (model-fidelity rules, data readiness, reuse map, constraints, mock contract). This PRD wins where it is more specific.
 
@@ -75,3 +75,5 @@ Acceptance: sum and fail-rate tests; admin gate; mock parity for the Factory sco
 - **Columns: Runs, PRs, Failed, Fail rate, Last failure, Cost** (maintainer calls D13 and later): volume, then quality, then spend.
 - **No chart** (maintainer call D12), which also removes the only usage time-series dependency.
 - **Share the presentation pieces with the current Overview** so the two cannot drift before #3877.
+- **The preview By user table always shows its seven columns** (owner call at the plan gate, 2026-11-07): a PR count an older API does not report reads "—", never 0, and the Factory total reads "—" unless every row reports one; the current Overview keeps its conditional PRs column.
+- **User cells show the masked email** because `AdminUsageUser` carries no display name.
