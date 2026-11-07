@@ -123,6 +123,10 @@ when the scheduler reports a verified CPU/memory shortage. Capacity blockage
 requires waiting, a smaller worker, or added capacity; Pending claims alone do
 not establish storage health. See [Worker versions and upgrades](worker-upgrades.md).
 
+## Pod shutdown grace
+
+Worker pods render `terminationGracePeriodSeconds: 40`. On a stop, the worker joins its own already-authorized authority settlements and logs one `worker_shutdown_result` line within 35 s of the first signal; the extra 5 s is margin (the result is described in [Configuration](./configuration.md)). The field is part of the pod spec, so upgrading the controller changes the pod spec hash once and every hosted worker rolls once through the existing paced roll ([ADR-1470](../adr/1470-paced-hosted-worker-rolls.md)). After an `incomplete` shutdown (exit 1) the pod can still exist with a terminated container, and the roll health view may briefly show that container with exit 1 as the blocking one. The unresolved record stays refused for a successor, which is the fail-closed outcome. Hosted end-to-end acceptance is pending.
+
 ## Draining and cordoned
 
 Persistent hosted workers roll one canary first in each owner's placement and

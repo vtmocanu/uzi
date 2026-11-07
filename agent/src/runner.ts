@@ -5917,9 +5917,10 @@ export class RunRunner {
           //      recovers the committed tree instead of cold-starting from the default branch.
           //
           // BUDGET (issue #1030 M4 / PRD #1030): this whole best-effort sequence runs inside
-          // the k8s termination grace. No terminationGracePeriodSeconds is set on the worker
-          // pod (confirmed in controller/internal/kube/materializer.go), so the default 30s
-          // applies: after SIGTERM the process must exit before SIGKILL at 30s. The local git
+          // the termination grace. Issue #4066 set the worker pod's terminationGracePeriodSeconds
+          // (controller/internal/kube/render.go) and the compose agent's stop_grace_period to 40s,
+          // covering the worker's 35s shutdown result deadline (shutdown-barrier.ts); this
+          // publication budget is unchanged and gets no share of the extra time. The local git
           // steps (marker, fetch-back) are sub-second; the ONLY step that can hang is the
           // publish RPC to the api, and the server-side maxPublishDuration is 60s — longer
           // than the entire grace — so the CLIENT must not simply await it. We cap the whole
