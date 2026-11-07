@@ -526,7 +526,7 @@ reservation and fail the run. The worker now defers it; the dispositions above a
   presentation; a ready input is parked and a held batch is left unapplied for the next claim,
   so no input is lost.
 
-### Deferral bound (audited at 3fc80e34; gate checkpoint re-audited at ad711991)
+### Deferral bound (audited at 3fc80e34; gate checkpoint bounded and re-audited at 8ac83f39, #3980)
 
 The switch can wait only as long as the reservation lives. Bounds are read from code with the
 production defaults (request 3 s, preparation ≤3 s, poll ≤15 s, HTTP 30 s, server deadline
@@ -536,17 +536,54 @@ production defaults (request 3 s, preparation ≤3 s, poll ≤15 s, HTTP 30 s, s
 |---|---|---|---|
 | APPROVE / automatic REVISE | prepare ≤3 s, submit stage ≤30 s, poll window to the deadline, final transport check ≤3 s | ≈31 min | ≈2 h 1 min (7,236 s) |
 | Checked human gate (timed out, block, gated pass), first gate | the above + 3 s, semantic review ≤60 s, resumed-delivery wait ≤153 s (failure path), `planChangedFiles` ≤600 s, receipt settlement ≤60 s, presentation report ≤422 s, preparation ≤9 s | ≈53 min (rounded up) | ≈2 h 23 min (8,543 s, rounded up) |
+| Checked human gate on a re-plan gate (frozen milestones changed) | the first-gate row + gate checkpoint ≤60 s + post-deadline tail ≤≈16 s (≈1 s child kill and join, ≤10 s private temp-dir cleanup, ≤5 s helper overrun) = ≈76 s when those operations return (see Limits below) | ≈54 min (3,143 s + 76 s = 3,219 s, rounded up; when those operations return) | ≈2 h 24 min (8,543 s + 76 s = 8,619 s, rounded up; when those operations return) |
 
-**Open: the gate checkpoint on a re-plan gate.** `prepareGateCheckpoint` runs only when the
+**Gate checkpoint on a re-plan gate (#3980).** `prepareGateCheckpoint` runs only when the
 claim carries frozen execution milestones and the candidate's milestones differ from them, so a
-first plan gate never reaches it (the table above). On such a re-plan gate it runs with the
-reservation still installed, and on Claude its 60 s signal does not bound it: the runner-uid git
-commands in the capture take only the 600 s git timeout, and the bare-repository lock waits and
-the attributed-process reap joins it can reach have no timer at all (a single hung git command
-alone takes it well past 600 s; Codex's capture scope does cap it near 60 s). Under the approved plan an
-unbounded component is a stop condition, so this step has no stated bound here and awaits an
-owner design decision; no timer was added and no reservation is cancelled. The owner accepted
-it as documented, with a follow-up to bound the step.
+first plan gate never reaches it (the first-gate row). On such a re-plan gate it runs with the
+reservation still installed. On Claude the step now has an enforced 60 s deadline from step
+entry, threaded explicitly through each seam: the sink-gate queue wait and tick-survivor prelude
+(no signal or second wait after the deadline), every GitCache git command and bare-repository
+lock wait (a recovery operation: timeout capped, child killed and joined), the attributed-process
+reap joins (capped; expiry is an unconfirmed reap, nothing aborted) and reap passes (not admitted
+after the deadline), the quiescence helper setup, run and cleanup, procfs scans, and Docker
+teardown (skipped after the deadline). Expiry fails closed like a failed checkpoint (for the error
+shapes listed below; the sentences after the Limits name the exceptions): a
+`TransientRecoveryError`, the source clone kept as the authoritative copy, and the candidate
+reservation neither released nor cancelled by the step. An owner Cancel or shutdown keeps its own
+reason. The measured post-deadline tail is about 1 s without the runner/agent uid split (git
+child SIGTERM, SIGKILL after 1 s, join) and up to about 10 s more with it (awaited private
+temp-dir cleanup, `HELPER_TMP_REMOVE_TIMEOUT_MS` = 10 s), plus a quiescence or reap helper
+overrun of at most `HELPER_SLACK_MS` 5 s. The bound is therefore about 76 s
+(60 s + 5 s + 10 s + about 1 s), typically about 61 s, provided the untimed operations listed under
+Limits return; it is not unconditional. Limits: the guarantee covers a live
+worker process (no crash, storage or power-loss claim); "every child the step started has
+exited" holds for direct children, so a descendant spawned by an agent-planted git filter can
+outlive the step and is left to a later quiesce; a single kernel-blocked procfs read cannot be
+interrupted; a killed child that never closes is still joined; and the worker-owned synchronous
+process-group probe and kill (`processGroupAlive`, `signalProcessGroup` and `killRunnerGroup` via
+`spawnSync`, under the uid split) carry no timer of their own, as elsewhere in the worker. Under the
+split a run-process scan or reap pass helper runs as `runner`, which the worker cannot signal
+(EPERM), so a helper that outlives its deadline-capped timer is killed as that uid
+(`killRunnerGroup`) before it is joined; if that same-uid kill fails too, the helper is still
+joined (fail-closed) and the bound does not hold for that pass. Codex deadline mechanics are unchanged (their
+capture scope already bounds the step near 60 s). An owner Cancel or shutdown reason now survives
+when the capture lane returns incomplete, instead of being remapped to the transient failure
+(issue #3980); a recovery deadline or timeout that git wraps is mapped to the transient failure,
+as is an abortable wait the step's own deadline stops, such as the attempt-path source-authority
+lock retry (an `AbortError` whose `cause` is, by identity, that deadline signal's reason).
+This does not cover every capture-lane abort: an owner Cancel or shutdown landing during a git
+child, or during that authority-lock retry, is still rethrown as a git error (the `git … failed`
+wrapper, or a permit-held git abort for a child the abort stops) or as the raw `AbortError`
+rather than its own reason (this predates the change), and a git child whose
+own timeout kills it a few ms before the deadline can still fail as a plain git error rather than
+the transient failure. Likewise the authority-lock wait is clamped to the same deadline, so its own
+expiry can surface as `AuthorityLockBusy` just before the step's deadline fires, and contention that
+outlasts the shorter boundary wait earlier in the step is a genuine `AuthorityLockBusy`; both stay
+generic errors (mapping them would need an elapsed-time check). Rationale: an explicit deadline per seam rather
+than an ambient `MaintenanceBudget` (the #3181 precedent is for a no-custody settlement, and an
+ambient budget would be adopted as a cancellation budget) or `reportBudget` (which forces a
+single reap pass).
 
 **Accepted limit: an owner Cancel during the hold.** While the switch stamp is pending, the
 server's input consume returns only the switch signal and withholds every input row, and with a
@@ -554,7 +591,7 @@ live poller an owner Cancel is queued as such a row rather than applied server-s
 pressed during the hold takes effect only after the reservation settles and the switch is
 serviced: on a give-up the held flight applies it; after a release it waits for the next claim.
 Its bound is the hold's own: the audited bounds in the table above for the listed paths; on a
-re-plan gate (the open item above) it has no fixed bound until that follow-up lands. Meanwhile the checker child may keep running until
+re-plan gate it is that row plus the gate checkpoint's bound of about 76 s when its untimed operations return (#3980, above). Meanwhile the checker child may keep running until
 its verdict or deadline. A server-side terminal cancel still ends the held flight at once, and a
 second Cancel after the release applies at once. The owner accepted this limit for #3953; prompt
 Cancel during the hold is #3974.
@@ -571,8 +608,8 @@ the cancel row, and, through the exit trigger, the pending round and the checker
 transaction. Custody is the ordinary owner-cancel disposition; observing the Cancel starts no
 switch-specific custody operation. A probe failure, timeout or `false` counts as unknown and
 commits nothing, so an api without the field keeps the limit above. Remaining limits: on a
-re-plan gate the worker latches the Cancel promptly, but an in-flight gate checkpoint step (the
-open item above) delays the terminal report with no fixed bound until #3980; it presents no gate
+re-plan gate the worker latches the Cancel promptly, but an in-flight gate checkpoint step delays
+the terminal report by about 16 s past the step's 60 s deadline (about 76 s from step entry, when the untimed operations return; #3980, above); it presents no gate
 and services no switch afterwards. Graceful stop and auto-stop rows stay withheld (the probe reads
 only `stop_kind = 'cancelled'`); auto-stop still escalates server-side on its own timer. A Cancel
 pressed during the hold that a release beats still waits for the reclaim; one pressed after the
