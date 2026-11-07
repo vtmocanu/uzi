@@ -4431,6 +4431,15 @@ type StateRequest struct {
 	// (validateDiskParkPreventive). httpx.DecodeJSON rejects unknown fields, so a worker sends it
 	// only once the api advertises the recovery_cause_data_volume_full feature.
 	DiskParkPreventive *bool `json:"disk_park_preventive"`
+	// RetainedCapacityOnly qualifies a recovery_cause "retained_recovery_exhausted" park (issue
+	// #4046): true means every recovery attempt in the worker's window was refused for disk
+	// capacity, so the park takes the at-cap branch (no retained_park_count increment, NULL retry
+	// deadline, an owner-held recovery_wait). Request-only; nothing is persisted. SetState rejects
+	// it with any other state or cause, a false value, or a missing or non-positive
+	// claim_generation as ErrInvalidState (400) before any SQL (validateRetainedCapacityOnly).
+	// httpx.DecodeJSON rejects unknown fields, so a worker sends it only once the api advertises
+	// the retained_recovery_capacity_hold_v1 feature.
+	RetainedCapacityOnly *bool `json:"retained_capacity_only,omitempty"`
 	// ProductiveTurns qualifies a recovery_cause "provider_outage" park (PRD #1733): the number
 	// of model turns the PARKING FLIGHT completed without error since its claim. A positive value
 	// is progress and starts a new provider-park streak at this park; zero or absent continues
@@ -4575,6 +4584,10 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	}
 	if req.RecoveryCause != nil && !recoveryWaitCauses[*req.RecoveryCause] {
 		return store.Run{}, false, fmt.Errorf("%w: unknown recovery_cause %q", ErrInvalidState, *req.RecoveryCause)
+	}
+	// Issue #4046: before the memory-pressure early return so no marker bypasses validation.
+	if err := validateRetainedCapacityOnly(req); err != nil {
+		return store.Run{}, false, err
 	}
 	if err := validateReportOnlyShape(req); err != nil {
 		return store.Run{}, false, err
