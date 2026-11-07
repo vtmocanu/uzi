@@ -38,7 +38,7 @@ import (
 // SetUserJudgeBinding) and the per-run reassignment of a HELD run (SetRunCredential's
 // credential_disabled branch) take (1) first, so each promotion decision is serialized against
 // them. Other requirement writers do not take (1): the override of a run in any other state (a
-// credentials_reset hold is refused by SetRunCredential before any write), and
+// credentials_reset hold SetRunCredential observes is refused before any write), and
 // the held-state credential switch (StampHeldCredentialSwitch / ReleaseCredentialSwitch), touch
 // runs that are not parked here and never race this hold. The promotion UPDATE is additionally
 // guarded on the requirement columns it evaluated, so a writer outside (1) that does reach a held

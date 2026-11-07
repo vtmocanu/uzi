@@ -1,6 +1,6 @@
 # PRD #3989: Admin-issued account reset link for a forgotten password or vault passphrase
 
-**Status**: Ready
+**Status**: Done
 **Priority**: Normal
 **Area**: security
 
@@ -141,6 +141,7 @@ Acceptance examples:
 - **D15. Issuer authority re-checked at redeem; admin deactivation or demotion supersedes links.** A demoted admin must not keep pre-issued takeover links.
 - **D16. Codex runs are not parked (owner decision 2026-11-06).** The PRD #1147 write-once binding freeze (`FreezeRunCodexBinding`) stays. A Codex run created before the reset whose frozen alias is gone fails terminally with "the bound Codex login is unavailable after your account reset; start a new run". Rejected: relaxing the freeze, and holds that could never be released.
 - **D17. M2: the passphrase is set from the app-wide banner, not Settings; a `vault_only` link grants no access, so takeover warnings are scoped to `password` links.**
+- **D18. M3 as built.** The `credentials_reset` park keys on the narrow `errNoModelCredential` sentinel (no Anthropic token), never on `errCredentialUnavailable` as a whole, so forge-origin refusal, repo-owner mismatch and an undecryptable token stay terminal. Judge, job and cross_check runs are excluded explicitly. The promoter releases the hold when the harness resolver finds an enabled credential for the run's harness, not through `credentialRequirementMet` (every binding is NULL after a reset, so that rule would promote and re-park every pass). Owner Resume and `run set-token` on the hold are refused with 409 before any write. Accepted residual (with D6): a Claude claim whose token was already opened when the reset committed is delivered on that token. Deferred: stamping the marker with `clock_timestamp()` at the end of the reset transaction (a run created during the reset window fails as today instead of parking).
 - **Correction 1 (module 3, schema).** `runs.hold_reason` has no CHECK constraint: `00215_completion_hold.sql` adds it as plain text and `00328_provider_park_streak.sql` notes "free text, so no CHECK". The CHECK in `00391_publication_resume.sql` belongs to `run_publication_resume`. So there is no CHECK change; only the promoter index is widened.
 - **Correction 2 (module 3, sentinel).** The Codex "no alias" refusal is `ErrCodexRunNotBound` (`codexauthz.go`), also raised at lock time by `classifyLockedCodexClaim` in `claim_recovery.go`.
 - **Correction 3 (module 2, revocation).** Demotion happens only via `oidcSyncAdmin` -> `SetUserAdmin`, not `PatchUser`. Supersession is attached to the activation and admin writes themselves, as a separate statement after the users update in the same transaction.
