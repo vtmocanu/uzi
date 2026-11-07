@@ -2,6 +2,8 @@ package workersvc
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,11 +23,14 @@ import (
 
 // Owner resume modes for an unresolved compact policy hold.
 const (
-	PolicyResumePreserve            = "preserve"
-	PolicyResumeFreshFromSavedWork  = "fresh_from_saved_work"
-	PolicyResumeFreshOneClaim       = "fresh_one_claim"
-	policyResumeGuidanceMaxBytes    = 16000
-	policyResumeAuditPrefixTemplate = `{"policy_mode":%q,"episode_id":%q`
+	PolicyResumePreserve           = "preserve"
+	PolicyResumeFreshFromSavedWork = "fresh_from_saved_work"
+	PolicyResumeFreshOneClaim      = "fresh_one_claim"
+	policyResumeGuidanceMaxBytes   = 16000
+	// The prefix identifies the exact request: mode, episode and the sha256 of the guidance.
+	policyResumeAuditPrefixTemplate = `{"policy_mode":%q,"episode_id":%q,"guidance_sha256":%q`
+	// The episode prefix matches any request that already resolved this mode and episode.
+	policyResumeAuditEpisodePrefixTemplate = `{"policy_mode":%q,"episode_id":%q,`
 )
 
 var (
@@ -33,7 +38,10 @@ var (
 	// otherwise ineligible requests change nothing.
 	ErrPolicyResumeConflict = errors.New("policy hold resume conflict")
 	// ErrPolicyFreshUnavailable reports that the optional one-claim Fresh action is not shipped.
-	ErrPolicyFreshUnavailable = errors.New("fresh_one_claim is unavailable on this server")
+	// ErrPolicyResumeGuidanceMismatch reports a repeat of an already-resolved episode with guidance
+	// that differs from the recorded request; nothing is recorded.
+	ErrPolicyResumeGuidanceMismatch = errors.New("policy hold already resumed with different guidance")
+	ErrPolicyFreshUnavailable       = errors.New("fresh_one_claim is unavailable on this server")
 )
 
 // PolicyResumeRequest is the decoded owner request. ExpectedEpisodeID is the outcome id of the
@@ -63,6 +71,7 @@ func (r PolicyResumeRequest) Validate() error {
 type policyResumeAudit struct {
 	PolicyMode     string  `json:"policy_mode"`
 	EpisodeID      string  `json:"episode_id"`
+	GuidanceSHA256 string  `json:"guidance_sha256"`
 	PriorSessionID *string `json:"prior_session_id"`
 }
 
@@ -87,6 +96,8 @@ func (s *Service) ResumePolicyHold(ctx context.Context, userID, runID uuid.UUID,
 	if s.txBeginner == nil {
 		return PolicyResumeResult{}, fmt.Errorf("policy resume requires transaction support")
 	}
+	sum := sha256.Sum256([]byte(req.Guidance))
+	guidanceHash := hex.EncodeToString(sum[:])
 	tx, err := s.beginReadCommitted(ctx)
 	if err != nil {
 		return PolicyResumeResult{}, err
@@ -109,13 +120,22 @@ func (s *Service) ResumePolicyHold(ctx context.Context, userID, runID uuid.UUID,
 	if errors.Is(err, pgx.ErrNoRows) {
 		if prior.PolicyOutcomeID.Valid && uuid.UUID(prior.PolicyOutcomeID.Bytes) == req.ExpectedEpisodeID && prior.PolicyResolvedAt.Valid {
 			seen, aerr := q.PolicyResumeAuditExists(ctx, store.PolicyResumeAuditExistsParams{
-				RunID: runID, BodyPrefix: fmt.Sprintf(policyResumeAuditPrefixTemplate, req.Mode, req.ExpectedEpisodeID.String()),
+				RunID: runID, BodyPrefix: fmt.Sprintf(policyResumeAuditPrefixTemplate, req.Mode, req.ExpectedEpisodeID.String(), guidanceHash),
 			})
 			if aerr != nil {
 				return PolicyResumeResult{}, aerr
 			}
 			if seen {
 				return PolicyResumeResult{Run: prior, Replay: true}, nil
+			}
+			resolved, aerr := q.PolicyResumeAuditExists(ctx, store.PolicyResumeAuditExistsParams{
+				RunID: runID, BodyPrefix: fmt.Sprintf(policyResumeAuditEpisodePrefixTemplate, req.Mode, req.ExpectedEpisodeID.String()),
+			})
+			if aerr != nil {
+				return PolicyResumeResult{}, aerr
+			}
+			if resolved {
+				return PolicyResumeResult{}, ErrPolicyResumeGuidanceMismatch
 			}
 		}
 		return PolicyResumeResult{}, ErrPolicyResumeConflict
@@ -130,7 +150,7 @@ func (s *Service) ResumePolicyHold(ctx context.Context, userID, runID uuid.UUID,
 			return PolicyResumeResult{}, err
 		}
 	}
-	audit := policyResumeAudit{PolicyMode: req.Mode, EpisodeID: req.ExpectedEpisodeID.String()}
+	audit := policyResumeAudit{PolicyMode: req.Mode, EpisodeID: req.ExpectedEpisodeID.String(), GuidanceSHA256: guidanceHash}
 	if prior.SessionID.Valid && prior.SessionID.String != "" {
 		sid := prior.SessionID.String
 		audit.PriorSessionID = &sid
@@ -182,8 +202,10 @@ type PolicyRecoveryVerifiedReply struct {
 }
 
 // RecordPolicyRecoveryVerified stores the verification record under the worker then run locks.
-// It never touches policy_required_head: only a later same-generation published report can
-// supersede it, and a lost reply that still committed changes nothing about that rule.
+// While the run is preserve_required it never touches policy_required_head: only a later
+// same-generation published report can supersede it, and a lost reply that still committed
+// changes nothing about that rule. After a fresh_from_saved_work resolution (not preserving, head
+// still required) the verification clears the head and the verification pair instead.
 func (s *Service) RecordPolicyRecoveryVerified(ctx context.Context, worker store.Worker, runID uuid.UUID, req PolicyRecoveryVerifiedRequest) (PolicyRecoveryVerifiedReply, error) {
 	if err := req.Validate(); err != nil {
 		return PolicyRecoveryVerifiedReply{}, err
@@ -233,20 +255,28 @@ func (s *Service) RecordPolicyRecoveryVerified(ctx context.Context, worker store
 	if r.Status != "claimed" && r.Status != "running" {
 		return pending("ineligible_status")
 	}
-	if !r.PolicyPreserveRequired {
-		return refused("not_preserving")
-	}
 	if !r.PolicyRequiredHead.Valid || r.PolicyRequiredHead.String != req.RequiredHead {
 		return refused("head_mismatch")
 	}
-	if _, err := q.RecordPolicyRecoveryVerified(ctx, store.RecordPolicyRecoveryVerifiedParams{
-		ID: runID, UserID: worker.UserID, WorkerID: pgconv.UUID(worker.ID),
-		ClaimGeneration: pgconv.Int8Ptr(&req.ClaimGeneration), RequiredHead: pgconv.TextPtr(&req.RequiredHead),
-	}); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+	var recErr error
+	if r.PolicyPreserveRequired {
+		_, recErr = q.RecordPolicyRecoveryVerified(ctx, store.RecordPolicyRecoveryVerifiedParams{
+			ID: runID, UserID: worker.UserID, WorkerID: pgconv.UUID(worker.ID),
+			ClaimGeneration: pgconv.Int8Ptr(&req.ClaimGeneration), RequiredHead: pgconv.TextPtr(&req.RequiredHead),
+		})
+	} else {
+		// Saved-work arm: the episode was resolved fresh_from_saved_work, so the verified head
+		// satisfies the requirement and it is cleared together with the verification pair.
+		_, recErr = q.ClearPolicySavedWorkHead(ctx, store.ClearPolicySavedWorkHeadParams{
+			ID: runID, UserID: worker.UserID, WorkerID: pgconv.UUID(worker.ID),
+			ClaimGeneration: req.ClaimGeneration, RequiredHead: pgconv.TextPtr(&req.RequiredHead),
+		})
+	}
+	if recErr != nil {
+		if errors.Is(recErr, pgx.ErrNoRows) {
 			return pending("transition_refused")
 		}
-		return PolicyRecoveryVerifiedReply{}, err
+		return PolicyRecoveryVerifiedReply{}, recErr
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return PolicyRecoveryVerifiedReply{}, err

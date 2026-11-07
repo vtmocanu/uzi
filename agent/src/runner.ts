@@ -14346,6 +14346,17 @@ export class RunRunner {
       throw new PolicyContinuationRejected("transcript_unknown", true);
   }
 
+  /** Admission for a claim that is NOT preserve-only but carries `policy_saved_work_head`: an owner
+   *  fresh_from_saved_work Resume while a required head remains. The saved work must be provably present
+   *  (same rules as {@link policyHeadRecovered}); otherwise the run re-holds with saved_work_missing before
+   *  any model turn. Present: the proof is recorded and ordinary unconstrained behaviour proceeds. */
+  private async admitPolicySavedWork(claim: ClaimResponse, flight: RunFlight, runnerClone: RunnerClone): Promise<void> {
+    const required = claim.policy_saved_work_head;
+    if (required === undefined) return;
+    if (!await this.policyHeadRecovered(runnerClone, required)) throw new PolicyContinuationRejected("saved_work_missing", true);
+    await this.recordPolicyRecoveryVerified(claim, flight, required);
+  }
+
   /** True only when the recovered clone provably contains the held head `required`: it is reachable from
    *  the clone's HEAD, or it is (or lies beneath) the WIP marker the seed restored. A malformed head or any
    *  git error is "not recovered". */
@@ -14394,6 +14405,7 @@ export class RunRunner {
     // notice, the seeded_from_default report, session handling, follow-up consumption or model turn, so a
     // re-hold-only claim changes nothing the owner or the next claim could observe.
     if (claim.policy_preserve_only === true) await this.admitPolicyPreserveOnly(claim, flight, runnerClone);
+    else await this.admitPolicySavedWork(claim, flight, runnerClone);
     // PRD #218 M3 / #759 M5: say what a resume recovered, in a WORKER status rather than by
     // the lead noticing the tree changed under it. Two axes cross here — WHAT kind of work
     // was recovered, committed vs. uncommitted, and each is honest about a distinct outcome:

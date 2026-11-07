@@ -66,3 +66,43 @@ func TestPolicyExpectedHeadOnlyWhilePreserving(t *testing.T) {
 		}
 	}
 }
+
+// The agent reads fixtures/claims/policy-saved-work-claim.json too: a run resolved
+// fresh_from_saved_work carries only policy_saved_work_head, never the preserve keys.
+func TestPolicySavedWorkClaimSharedWire(t *testing.T) {
+	raw, err := os.ReadFile("../../../fixtures/claims/policy-saved-work-claim.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want map[string]any
+	if err := json.Unmarshal(raw, &want); err != nil {
+		t.Fatal(err)
+	}
+	head, _ := want["policy_saved_work_head"].(string)
+	if len(want) != 1 || !policyRecoveryHead.MatchString(head) {
+		t.Fatalf("fixture must carry exactly one lowercase 40/64-hex policy_saved_work_head: %s", raw)
+	}
+	run := store.Run{PolicyRequiredHead: pgconv.Text(head)}
+	b, err := json.Marshal(ClaimPayload{PolicyPreserveOnly: run.PolicyPreserveRequired, PolicyExpectedHead: policyExpectedHead(run), PolicySavedWorkHead: policySavedWorkHead(run)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	picked := map[string]any{}
+	for k := range got {
+		if len(k) > 7 && k[:7] == "policy_" {
+			picked[k] = got[k]
+		}
+	}
+	if !reflect.DeepEqual(picked, want) {
+		t.Fatalf("policy claim keys %v, fixture %v", picked, want)
+	}
+	// A preserving run never carries the saved-work key.
+	run.PolicyPreserveRequired = true
+	if policySavedWorkHead(run) != nil {
+		t.Fatal("preserving run must not project policy_saved_work_head")
+	}
+}

@@ -253,17 +253,22 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("write resume audit row", "run", runID, "error", err)
 	}
 
-	h.writeResumedRun(w, r, user.ID, runID)
+	h.writeResumedRun(w, r, user.ID, runID, false)
 }
 
 // writeResumedRun re-reads the run owner-scoped so the DTO shows the resumed (queued) status.
-func (h *Handler) writeResumedRun(w http.ResponseWriter, r *http.Request, userID, runID uuid.UUID) {
+func (h *Handler) writeResumedRun(w http.ResponseWriter, r *http.Request, userID, runID uuid.UUID, replay bool) {
 	run, err := h.q.GetRunByIDForUser(r.Context(), store.GetRunByIDForUserParams{ID: runID, UserID: userID})
 	if err != nil {
 		httpx.Error(w, http.StatusNotFound, "run not found")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)})
+	out := map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)}
+	if replay {
+		// A repeated identical policy resume (lost response): nothing changed, say so.
+		out["replay"] = true
+	}
+	httpx.JSON(w, http.StatusOK, out)
 }
 
 // policyResumeBodyLimit bounds the optional resume body: 16,000 bytes of guidance can
@@ -291,16 +296,18 @@ func (h *Handler) resumePolicyHold(w http.ResponseWriter, r *http.Request, userI
 		httpx.Error(w, http.StatusBadRequest, "expected_episode_id must be a canonical UUID")
 		return
 	}
-	_, err = h.wsvc.ResumePolicyHold(r.Context(), userID, runID, workersvc.PolicyResumeRequest{
+	res, err := h.wsvc.ResumePolicyHold(r.Context(), userID, runID, workersvc.PolicyResumeRequest{
 		Mode: body.Mode, ExpectedEpisodeID: episode, Guidance: body.Guidance,
 	})
 	switch {
 	case err == nil:
-		h.writeResumedRun(w, r, userID, runID)
+		h.writeResumedRun(w, r, userID, runID, res.Replay)
 	case errors.Is(err, workersvc.ErrInvalidState):
 		httpx.Error(w, http.StatusBadRequest, "invalid policy resume request")
 	case errors.Is(err, workersvc.ErrPolicyFreshUnavailable):
 		httpx.Error(w, http.StatusConflict, workersvc.ErrPolicyFreshUnavailable.Error())
+	case errors.Is(err, workersvc.ErrPolicyResumeGuidanceMismatch):
+		httpx.Error(w, http.StatusConflict, "already resumed with different guidance; the new guidance was not recorded")
 	case errors.Is(err, workersvc.ErrPolicyResumeConflict):
 		httpx.Error(w, http.StatusConflict, "policy hold changed or does not match this mode; refresh the run and choose again")
 	case errors.Is(err, workersvc.ErrRunNotFound):

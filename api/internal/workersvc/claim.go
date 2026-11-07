@@ -78,7 +78,11 @@ type ClaimPayload struct {
 	// are omitted otherwise, so an unconstrained claim stays byte-identical to today's wire.
 	PolicyPreserveOnly bool    `json:"policy_preserve_only,omitempty"`
 	PolicyExpectedHead *string `json:"policy_expected_head,omitempty"`
-	CheckpointTip      *string `json:"checkpoint_tip,omitempty"` // resume: own-checkpoint anchor (owner-anchor guard)
+	// PolicySavedWorkHead is the required recovery head of a run that is NOT preserving (its
+	// episode was resolved fresh_from_saved_work) but whose saved work must still be proven to
+	// contain it. Lowercase 40/64-hex; omitted otherwise. Mutually exclusive with PolicyExpectedHead.
+	PolicySavedWorkHead *string `json:"policy_saved_work_head,omitempty"`
+	CheckpointTip       *string `json:"checkpoint_tip,omitempty"` // resume: own-checkpoint anchor (owner-anchor guard)
 	// CheckpointAttestedSource (issue #3194) is the source OID a flight of THIS run published
 	// after its --require-base guard strictly accepted (runs.checkpoint_attested_source, set-only).
 	// A continuation may adopt exactly this source. nil (omitted) for legacy, unattested and

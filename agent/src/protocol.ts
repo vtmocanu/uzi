@@ -141,6 +141,8 @@ export function normalizePolicyPreserveClaim(claim: Record<string, unknown>): vo
     delete claim.policy_preserve_only;
   if (claim.policy_expected_head !== undefined && !isPolicyHeadId(claim.policy_expected_head))
     claim.policy_expected_head = "";
+  if (claim.policy_saved_work_head !== undefined && !isPolicyHeadId(claim.policy_saved_work_head))
+    claim.policy_saved_work_head = "";
 }
 
 /** Compile-time two-way tie between the SDK's EffortLevel and HARNESS_EFFORTS: this line fails
@@ -1715,6 +1717,10 @@ export interface ClaimResponse extends ClaimMemoryState {
   /** The head the held work must still contain (lowercase 40/64 hex). "" means the server sent a
    *  malformed value; absent means the hold captured no head (degraded capture). */
   policy_expected_head?: string;
+  /** Set only on a claim that is NOT preserve-only, after an owner fresh_from_saved_work Resume while a
+   *  required head remains (lowercase 40/64 hex). "" means a malformed value (missing saved work);
+   *  absent means no requirement. Normalized by normalizePolicyPreserveClaim. */
+  policy_saved_work_head?: string;
   cross_check?: ClaimPlanCrossCheck | ClaimCodeCrossCheck;
   /** Frozen owner steering for a plan cross-check (issue #3841); decoded by decodeOwnerSteering. */
   cross_check_owner_steering?: ClaimOwnerSteering;

@@ -1,6 +1,9 @@
 package workersvc
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strconv"
@@ -8,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -44,6 +48,12 @@ func facts(r store.Run) string {
 
 func hexHead(c string) string { return strings.Repeat(c, 40) }
 
+// guidanceHash is the audit's request identity, spelled out here rather than reusing production code.
+func guidanceHash(g string) string {
+	sum := sha256.Sum256([]byte(g))
+	return hex.EncodeToString(sum[:])
+}
+
 // running seeds a Codex run running at generation gen with a saved session.
 func (p policyLive) running(t *testing.T, gen int64) uuid.UUID {
 	t.Helper()
@@ -60,6 +70,7 @@ type holdSpec struct {
 	rehold    string // non-empty: a resume_rejected re-hold with this cause
 	source    int64  // default: claim generation
 	claim     int64
+	as        *store.Worker // report as this worker instead of the claim holder
 }
 
 // report sends one policy-hold report for run id at generation spec.claim.
@@ -88,7 +99,11 @@ func (p policyLive) report(t *testing.T, id uuid.UUID, spec holdSpec) (PolicyHol
 			req.CheckpointContainsLatest = &v
 		}
 	}
-	got, err := p.svc.ReportPolicyHold(p.e.ctx, p.worker, id, req)
+	reporter := p.worker
+	if spec.as != nil {
+		reporter = *spec.as
+	}
+	got, err := p.svc.ReportPolicyHold(p.e.ctx, reporter, id, req)
 	if err != nil {
 		t.Fatalf("policy hold report: %v", err)
 	}
@@ -171,15 +186,15 @@ func TestPolicyResumeHoldLiveDB(t *testing.T) {
 		}
 		got := p.run(t, id)
 		if got.Status != "queued" || got.HoldReason.Valid || got.SessionID.Valid || got.PolicyPreserveRequired || got.PolicyPendingFresh ||
-			!got.PolicyResolvedAt.Valid || got.PolicyRequiredHead.Valid || got.PolicyRecoveryVerifiedGeneration.Valid || got.PolicyRecoveryVerifiedHead.Valid {
-			t.Fatalf("fresh resume left constraint facts: %s", facts(got))
+			!got.PolicyResolvedAt.Valid || got.PolicyRequiredHead.String != hexHead("a") || got.PolicyRecoveryVerifiedGeneration.Valid || got.PolicyRecoveryVerifiedHead.Valid {
+			t.Fatalf("fresh resume must keep the required head and clear the verification pair: %s", facts(got))
 		}
 		if uuid.UUID(got.PolicyOutcomeID.Bytes).String() != req.OutcomeID || got.PolicyContinuationMode.String != "fresh_from_saved_work" ||
 			!got.PolicyApplyingWorkerID.Valid || got.PolicyApplyingGeneration.Int64 != 1 || got.PolicyRefusalCount != 1 || got.ClaimReleasedAt.Valid || !got.WorkerID.Valid {
 			t.Fatalf("fresh resume erased reconciliation facts: %s", facts(got))
 		}
 		in := p.inputs(t, id)
-		wantAudit := `resume:{"policy_mode":"fresh_from_saved_work","episode_id":"` + req.OutcomeID + `","prior_session_id":"original-session"}`
+		wantAudit := `resume:{"policy_mode":"fresh_from_saved_work","episode_id":"` + req.OutcomeID + `","guidance_sha256":"` + guidanceHash("narrow the scope") + `","prior_session_id":"original-session"}`
 		if len(in) != 2 || in[0] != "follow_up:narrow the scope" || in[1] != wantAudit {
 			t.Fatalf("inputs %q, want guidance follow_up then %s", in, wantAudit)
 		}
@@ -302,11 +317,21 @@ func TestPolicyResumeHoldLiveDB(t *testing.T) {
 				t.Fatalf("retry: replay=%v %v", res.Replay, err)
 			}
 		})
+		const mismatchMsg = "different guidance"
 		p.untouched(t, id, "retry with different guidance", func() {
-			if res, err := p.resume(id, PolicyResumeFreshFromSavedWork, req.OutcomeID, "twice"); err != nil || !res.Replay {
+			res, err := p.resume(id, PolicyResumeFreshFromSavedWork, req.OutcomeID, "twice")
+			if !errors.Is(err, ErrPolicyResumeGuidanceMismatch) || res.Replay || !strings.Contains(err.Error(), mismatchMsg) {
 				t.Fatalf("retry guidance: replay=%v %v", res.Replay, err)
 			}
 		})
+		p.untouched(t, id, "retry with empty guidance after non-empty", func() {
+			if _, err := p.resume(id, PolicyResumeFreshFromSavedWork, req.OutcomeID, ""); !errors.Is(err, ErrPolicyResumeGuidanceMismatch) {
+				t.Fatalf("empty vs non-empty: %v", err)
+			}
+		})
+		if in := p.inputs(t, id); len(in) != 2 || in[0] != "follow_up:once" {
+			t.Fatalf("exactly one follow_up with the original text expected: %q", in)
+		}
 		// A mode that was never recorded for the resolved episode is a safe conflict, not a replay.
 		p.untouched(t, id, "different mode after resolution", func() {
 			if _, err := p.resume(id, PolicyResumePreserve, req.OutcomeID, ""); !errors.Is(err, ErrPolicyResumeConflict) {
@@ -452,9 +477,7 @@ func TestPolicyRecoveryVerifiedRefusalsLiveDB(t *testing.T) {
 	}
 	p.e.exec(t, "UPDATE runs SET claim_released_at=now() WHERE id=$1", id)
 	expect("released claim", ask(p.worker, 2, a), "pending", "claim_released")
-	p.e.exec(t, "UPDATE runs SET claim_released_at=NULL,policy_preserve_required=false WHERE id=$1", id)
-	expect("not preserving", ask(p.worker, 2, a), "refused", "not_preserving")
-	p.e.exec(t, "UPDATE runs SET policy_preserve_required=true,status='paused' WHERE id=$1", id)
+	p.e.exec(t, "UPDATE runs SET claim_released_at=NULL,status='paused' WHERE id=$1", id)
 	expect("ineligible status", ask(p.worker, 2, a), "pending", "ineligible_status")
 	p.e.exec(t, "UPDATE runs SET status='running' WHERE id=$1", id)
 	if got := ask(p.worker, 2, a); got.Disposition != "recorded" {
@@ -538,4 +561,105 @@ func TestPolicyParkWritersSupersedeOnlyWithVerifiedEvidenceLiveDB(t *testing.T) 
 			})
 		}
 	}
+}
+
+// savedWorkRun drives a real hold -> fresh_from_saved_work resume and returns the run, queued, with the
+// required head kept and not preserving.
+func (p policyLive) savedWorkRun(t *testing.T, head string) uuid.UUID {
+	t.Helper()
+	id := p.running(t, 1)
+	req := p.mustHold(t, id, holdSpec{claim: 1, mode: "fresh_from_saved_work", head: head, published: true, latest: true})
+	if _, err := p.resume(id, PolicyResumeFreshFromSavedWork, req.OutcomeID, ""); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func TestPolicySavedWorkHeadLiveDB(t *testing.T) {
+	a := hexHead("a")
+	verify := func(p policyLive, w store.Worker, id uuid.UUID, gen int64, head string) PolicyRecoveryVerifiedReply {
+		t.Helper()
+		got, err := p.svc.RecordPolicyRecoveryVerified(p.e.ctx, w, id, PolicyRecoveryVerifiedRequest{ClaimGeneration: gen, RequiredHead: head})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	t.Run("claim carries the saved-work head until verification at the current generation clears it", func(t *testing.T) {
+		p := newPolicyLive(t)
+		id := p.savedWorkRun(t, a)
+		claimed := p.reclaim(t, id)
+		if got := policySavedWorkHead(claimed); got == nil || *got != a || policyExpectedHead(claimed) != nil || claimed.PolicyPreserveRequired {
+			t.Fatalf("claim must carry only the saved-work head: %s", facts(claimed))
+		}
+		payload, _ := json.Marshal(ClaimPayload{PolicyPreserveOnly: claimed.PolicyPreserveRequired, PolicyExpectedHead: policyExpectedHead(claimed), PolicySavedWorkHead: policySavedWorkHead(claimed)})
+		if !strings.Contains(string(payload), `"policy_saved_work_head":"`+a+`"`) {
+			t.Fatalf("payload %s", payload)
+		}
+		if strings.Contains(string(payload), "policy_preserve_only") || strings.Contains(string(payload), "policy_expected_head") {
+			t.Fatalf("saved-work claim leaked preserve keys: %s", payload)
+		}
+		// An ordinary running report never clears the requirement.
+		if _, err := p.e.q.SetRunRunning(p.e.ctx, store.SetRunRunningParams{ID: id, WorkerID: pgconv.UUID(p.wid)}); err != nil {
+			t.Fatalf("running report: %v", err)
+		}
+		if row := p.run(t, id); row.PolicyRequiredHead.String != a {
+			t.Fatalf("ordinary running report cleared the saved-work head: %s", facts(row))
+		}
+		if got := verify(p, p.worker, id, 2, a); got.Disposition != "recorded" {
+			t.Fatalf("verification: %+v", got)
+		}
+		row := p.run(t, id)
+		if row.PolicyRequiredHead.Valid || row.PolicyRecoveryVerifiedGeneration.Valid || row.PolicyRecoveryVerifiedHead.Valid || row.PolicyPreserveRequired || !row.PolicyResolvedAt.Valid {
+			t.Fatalf("verification must clear head and pair only: %s", facts(row))
+		}
+		// Idempotent after clearing: the head is gone, so a replayed record is a head mismatch.
+		if got := verify(p, p.worker, id, 2, a); got.Disposition != "refused" || got.Reason != "head_mismatch" {
+			t.Fatalf("replay after clear: %+v", got)
+		}
+		// A later claim (after a new hold/resume) carries nothing.
+		req := p.mustHold(t, id, holdSpec{claim: 2, mode: "fresh_from_saved_work"})
+		if _, err := p.resume(id, PolicyResumeFreshFromSavedWork, req.OutcomeID, ""); err != nil {
+			t.Fatal(err)
+		}
+		if next := p.reclaim(t, id); policySavedWorkHead(next) != nil || policyExpectedHead(next) != nil {
+			t.Fatalf("next claim must carry no head: %s", facts(next))
+		}
+	})
+	t.Run("refusals leave the head in place", func(t *testing.T) {
+		p := newPolicyLive(t)
+		id := p.savedWorkRun(t, a)
+		p.reclaim(t, id) // generation 2
+		foreign := p.e.seedWorker(t, p.caps)
+		foreignWorker, _ := p.e.q.GetWorkerByID(p.e.ctx, foreign)
+		keep := func(what string, got PolicyRecoveryVerifiedReply, disposition, reason string) {
+			t.Helper()
+			if got.Disposition != disposition || got.Reason != reason {
+				t.Fatalf("%s: %+v", what, got)
+			}
+			if row := p.run(t, id); row.PolicyRequiredHead.String != a {
+				t.Fatalf("%s cleared the head: %s", what, facts(row))
+			}
+		}
+		keep("stale generation", verify(p, p.worker, id, 1, a), "pending", "stale_claim")
+		keep("wrong head", verify(p, p.worker, id, 2, hexHead("f")), "refused", "head_mismatch")
+		keep("foreign worker", verify(p, foreignWorker, id, 2, a), "pending", "ownership_unconfirmed")
+		p.e.exec(t, "UPDATE runs SET claim_released_at=now() WHERE id=$1", id)
+		keep("released claim", verify(p, p.worker, id, 2, a), "pending", "claim_released")
+		p.e.exec(t, "UPDATE runs SET claim_released_at=NULL,status='queued' WHERE id=$1", id)
+		keep("ineligible status", verify(p, p.worker, id, 2, a), "pending", "ineligible_status")
+	})
+	t.Run("only a policy-capable worker claims a saved-work row", func(t *testing.T) {
+		p := newPolicyLive(t)
+		id := p.savedWorkRun(t, a)
+		plain := p.e.seedWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2})
+		if run, err := p.e.q.ClaimRun(p.e.ctx, p.e.claimParams(plain, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}, false)); err == nil {
+			t.Fatalf("incapable worker claimed saved-work run %s", run.ID)
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatal(err)
+		}
+		if run := p.reclaim(t, id); run.ID != id {
+			t.Fatal("capable worker must claim")
+		}
+	})
 }

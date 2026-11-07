@@ -774,8 +774,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		CheckpointTip:  textPtr(run.CheckpointTip),
 		// Compact policy hold (#3607 M2a): the preserving fact and the required recovery head,
 		// read off the claimed row. Only a still-preserving run carries either.
-		PolicyPreserveOnly: run.PolicyPreserveRequired,
-		PolicyExpectedHead: policyExpectedHead(run),
+		PolicyPreserveOnly:  run.PolicyPreserveRequired,
+		PolicyExpectedHead:  policyExpectedHead(run),
+		PolicySavedWorkHead: policySavedWorkHead(run),
 		// Issue #3194: read off the claimed run row, never derived from ownership or the tip.
 		CheckpointAttestedSource: textPtr(run.CheckpointAttestedSource),
 		// PRD #1247 M9 (task c): the last_seq recordRunCredential actually landed — bumped past any
@@ -1364,6 +1365,16 @@ func planCrossCheckCodexLeadSupported(run store.Run) bool {
 // the preserving constraint.
 func policyExpectedHead(run store.Run) *string {
 	if !run.PolicyPreserveRequired || !run.PolicyRequiredHead.Valid || run.PolicyRequiredHead.String == "" {
+		return nil
+	}
+	return textPtr(run.PolicyRequiredHead)
+}
+
+// policySavedWorkHead projects policy_required_head onto the claim for a run whose episode was
+// resolved fresh_from_saved_work: not preserving, but the saved work must still contain the head.
+// policy_expected_head stays preserve-only.
+func policySavedWorkHead(run store.Run) *string {
+	if run.PolicyPreserveRequired || !run.PolicyRequiredHead.Valid || run.PolicyRequiredHead.String == "" {
 		return nil
 	}
 	return textPtr(run.PolicyRequiredHead)

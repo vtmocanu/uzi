@@ -1283,14 +1283,14 @@ type Run struct {
 	SnapshotDepartedGeneration       pgtype.Int8        `json:"snapshot_departed_generation"`
 	SnapshotDepartedNonce            pgtype.Text        `json:"snapshot_departed_nonce"`
 	SnapshotDepartedEpoch            pgtype.Int8        `json:"snapshot_departed_epoch"`
-	PolicyRequiredHead               pgtype.Text        `json:"policy_required_head"`
-	PolicyRecoveryVerifiedGeneration pgtype.Int8        `json:"policy_recovery_verified_generation"`
-	PolicyRecoveryVerifiedHead       pgtype.Text        `json:"policy_recovery_verified_head"`
-	PolicyHoldCause                  pgtype.Text        `json:"policy_hold_cause"`
 	RepoAgentSourceCommit            pgtype.Text        `json:"repo_agent_source_commit"`
 	RepoAgentSourceRequired          bool               `json:"repo_agent_source_required"`
 	AgentSourceRequested             pgtype.Text        `json:"agent_source_requested"`
 	AgentSourceRequestedBasis        pgtype.Text        `json:"agent_source_requested_basis"`
+	PolicyRequiredHead               pgtype.Text        `json:"policy_required_head"`
+	PolicyRecoveryVerifiedGeneration pgtype.Int8        `json:"policy_recovery_verified_generation"`
+	PolicyRecoveryVerifiedHead       pgtype.Text        `json:"policy_recovery_verified_head"`
+	PolicyHoldCause                  pgtype.Text        `json:"policy_hold_cause"`
 }
 
 type RunCompletionAttempt struct {

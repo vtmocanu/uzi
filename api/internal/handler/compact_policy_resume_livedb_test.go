@@ -2,6 +2,8 @@ package handler
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -154,6 +156,11 @@ func (fx *compactPolicyFx) state(run uuid.UUID) string {
 	return fx.query(`SELECT jsonb_build_object('run',to_jsonb(r),'inputs',(SELECT COALESCE(jsonb_agg(to_jsonb(i) ORDER BY i.id),'[]'::jsonb) FROM run_user_inputs i WHERE i.run_id=r.id))::text FROM runs r WHERE r.id=$1`, run)
 }
 
+func guidanceSHA(g string) string {
+	sum := sha256.Sum256([]byte(g))
+	return hex.EncodeToString(sum[:])
+}
+
 func resumeBody(mode, episode, guidance string) string {
 	b, _ := json.Marshal(map[string]string{"mode": mode, "expected_episode_id": episode, "guidance": guidance})
 	return string(b)
@@ -239,14 +246,14 @@ func TestCompactPolicyResumeAuthMountLiveDB(t *testing.T) {
 			_ = json.Unmarshal([]byte(row), &got)
 			wantSession, wantPreserve, wantRequired := any("original-session"), any(true), any(head)
 			if lane.mode == "fresh_from_saved_work" {
-				wantSession, wantPreserve, wantRequired = nil, false, nil
+				wantSession, wantPreserve = nil, false // R is kept until the saved work is verified
 			}
 			if got["status"] != "queued" || got["hold"] != nil || got["session"] != wantSession || got["preserve"] != wantPreserve ||
 				got["resolved"] != true || got["required"] != wantRequired || got["outcome"] != episode {
 				t.Fatalf("resumed row = %s", row)
 			}
 			inputs := fx.query("SELECT string_agg(kind||'='||COALESCE(body,''),'|' ORDER BY id) FROM run_user_inputs WHERE run_id=$1", run)
-			wantInputs := `follow_up=narrow the scope|resume={"policy_mode":"` + lane.mode + `","episode_id":"` + episode + `","prior_session_id":"original-session"}`
+			wantInputs := `follow_up=narrow the scope|resume={"policy_mode":"` + lane.mode + `","episode_id":"` + episode + `","guidance_sha256":"` + guidanceSHA("narrow the scope") + `","prior_session_id":"original-session"}`
 			if inputs != wantInputs {
 				t.Fatalf("inputs = %q, want %q", inputs, wantInputs)
 			}
@@ -254,12 +261,32 @@ func TestCompactPolicyResumeAuthMountLiveDB(t *testing.T) {
 			// A lost owner response retried on either credential kind is idempotent: 200, no new rows.
 			settled := fx.state(run)
 			for _, client := range []string{lane.client, lane.otherClient} {
-				if retry := fx.resumeAs(client, run, resumeBody(lane.mode, episode, "narrow the scope")); retry.Code != http.StatusOK {
-					t.Fatalf("lost-response retry via %s = %d %s", client, retry.Code, retry.Body.String())
+				retry := fx.resumeAs(client, run, resumeBody(lane.mode, episode, "narrow the scope"))
+				var replayed struct {
+					Replay bool `json:"replay"`
+					Run    struct {
+						Status string `json:"status"`
+					} `json:"run"`
+				}
+				if retry.Code != http.StatusOK || json.Unmarshal(retry.Body.Bytes(), &replayed) != nil || !replayed.Replay || replayed.Run.Status != "queued" {
+					t.Fatalf("lost-response retry via %s = %d %s, want 200 with replay=true", client, retry.Code, retry.Body.String())
 				}
 			}
 			if fx.state(run) != settled {
 				t.Fatal("retry mutated the resumed run or duplicated guidance or audit")
+			}
+			// Different guidance, or none, for the same resolved mode+episode is a 409 that records nothing.
+			for _, g := range []string{"something else", ""} {
+				diff := fx.resumeAs(lane.client, run, resumeBody(lane.mode, episode, g))
+				if diff.Code != http.StatusConflict || !strings.Contains(diff.Body.String(), "already resumed with different guidance; the new guidance was not recorded") {
+					t.Fatalf("different guidance %q = %d %s", g, diff.Code, diff.Body.String())
+				}
+				if fx.state(run) != settled {
+					t.Fatalf("different guidance %q mutated the run", g)
+				}
+			}
+			if n := fx.query("SELECT count(*) FROM run_user_inputs WHERE run_id=$1 AND kind='follow_up'", run); n != "1" {
+				t.Fatalf("follow_up rows = %s, want exactly the original", n)
 			}
 			if wrong := fx.resumeAs(lane.client, run, resumeBody(lane.wrongMode, episode, "")); wrong.Code != http.StatusConflict || fx.state(run) != settled {
 				t.Fatalf("unrecorded mode after resolution = %d", wrong.Code)
@@ -281,8 +308,8 @@ func TestCompactPolicyResumeAuthMountLiveDB(t *testing.T) {
 				if !claimed.PolicyRequiredHead.Valid || claimed.PolicyRequiredHead.String != head {
 					t.Fatalf("preserving claim lost the required head: %+v", claimed.PolicyRequiredHead)
 				}
-			} else if claimed.PolicyRequiredHead.Valid || claimed.SessionID.Valid {
-				t.Fatalf("attempt-path claim carries constraint facts: head=%v session=%v", claimed.PolicyRequiredHead, claimed.SessionID)
+			} else if claimed.SessionID.Valid || !claimed.PolicyRequiredHead.Valid || claimed.PolicyRequiredHead.String != head {
+				t.Fatalf("attempt-path claim must keep the saved-work head and no session: head=%v session=%v", claimed.PolicyRequiredHead, claimed.SessionID)
 			}
 
 			// A new actual refusal re-holds; the old episode can no longer be replayed or resumed.

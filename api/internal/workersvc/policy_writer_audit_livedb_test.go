@@ -23,6 +23,9 @@ const (
 	episodeUnresolved    = "unresolved"
 	episodeAttemptDone   = "attempt-path resolved"
 	episodePreservedDone = "preserving resolved"
+	// episodeSavedWork is a resolved fresh_from_saved_work episode that still owes the saved-work
+	// requirement: preserve_required=false, policy_required_head kept, verification pair cleared.
+	episodeSavedWork = "saved-work head pending"
 )
 
 func (p policyLive) seedEpisode(t *testing.T, id uuid.UUID, shape string, gen int64) {
@@ -42,6 +45,10 @@ func (p policyLive) seedEpisode(t *testing.T, id uuid.UUID, shape string, gen in
 			policy_applying_generation=$4,policy_source_generation=$4,policy_preserve_required=true,policy_resolved_at=now(),
 			policy_required_head=$5,policy_recovery_verified_generation=$4,policy_recovery_verified_head=$5,
 			policy_hold_cause='refused' WHERE id=$1`, id, uuid.New(), p.wid, gen, head)
+	case episodeSavedWork:
+		p.e.exec(t, `UPDATE runs SET policy_outcome_id=$2,policy_continuation_mode='fresh_from_saved_work',policy_applying_worker_id=$3,
+			policy_applying_generation=$4,policy_source_generation=$4,policy_preserve_required=false,policy_resolved_at=now(),
+			policy_required_head=$5,policy_hold_cause='attempt_path' WHERE id=$1`, id, uuid.New(), p.wid, gen, head)
 	default:
 		t.Fatalf("unknown episode shape %q", shape)
 	}
@@ -227,13 +234,35 @@ func TestPolicyWriterAuditLiveDB(t *testing.T) {
 					}
 				}
 			})
+			// (iv) a resolved fresh_from_saved_work episode that still owes its saved-work head: the head
+			// survives every non-terminal writer, terminal writers clear it, and only the worker's
+			// verification (current generation, owning worker) clears it without a terminal state.
+			t.Run(episodeSavedWork, func(t *testing.T) {
+				p := newPolicyLive(t)
+				id := p.running(t, 3)
+				p.seedEpisode(t, id, episodeSavedWork, 3)
+				if !w.apply(t, p, id, p.wid, 3) {
+					t.Fatal("writer was blocked by a saved-work requirement")
+				}
+				row := p.run(t, id)
+				if row.PolicyPreserveRequired || row.PolicyRecoveryVerifiedGeneration.Valid || row.PolicyRecoveryVerifiedHead.Valid {
+					t.Fatalf("writer disturbed the constraint or pair: %s", facts(row))
+				}
+				wantHead := hexHead("a")
+				if w.terminal || w.name == "policy recovery verification" {
+					wantHead = ""
+				}
+				if row.PolicyRequiredHead.String != wantHead {
+					t.Fatalf("saved-work head after %s = %q, want %q", w.name, row.PolicyRequiredHead.String, wantHead)
+				}
+			})
 		})
 	}
 }
 
 // ClaimRun, ResumePausedRun and ResumePolicyHold read the episode from queued/paused rows.
 func TestPolicyClaimAndResumeWritersAuditLiveDB(t *testing.T) {
-	for _, shape := range []string{episodeUnresolved, episodeAttemptDone, episodePreservedDone} {
+	for _, shape := range []string{episodeUnresolved, episodeAttemptDone, episodePreservedDone, episodeSavedWork} {
 		t.Run("ResumePausedRun/"+shape, func(t *testing.T) {
 			p := newPolicyLive(t)
 			id := p.running(t, 3)
@@ -287,6 +316,7 @@ func TestPolicyClaimAndResumeWritersAuditLiveDB(t *testing.T) {
 			p.e.exec(t, "UPDATE runs SET status='queued',status_since=now() WHERE id=$1", id)
 			policyBefore := p.policyColumns(t, id, false)
 			if shape != episodeAttemptDone {
+				// (the saved-work shape is protected by policy_required_head, not by preserve_required)
 				// A worker without the policy capability can never claim a constrained run.
 				bare := []string{p.caps[1], p.caps[2]}
 				bareWorker := p.e.seedWorker(t, bare)
@@ -306,8 +336,13 @@ func TestPolicyClaimAndResumeWritersAuditLiveDB(t *testing.T) {
 			if shape == episodePreservedDone && (head == nil || *head != hexHead("a") || !run.PolicyPreserveRequired) {
 				t.Fatalf("preserving claim lost its constraint facts: %+v", run)
 			}
-			if shape == episodeAttemptDone && (head != nil || run.PolicyPreserveRequired) {
+			if shape == episodeAttemptDone && (head != nil || run.PolicyPreserveRequired || policySavedWorkHead(run) != nil) {
 				t.Fatalf("attempt-path claim carries a constraint: %+v", run)
+			}
+			if shape == episodeSavedWork {
+				if saved := policySavedWorkHead(run); head != nil || run.PolicyPreserveRequired || saved == nil || *saved != hexHead("a") {
+					t.Fatalf("saved-work claim facts: %s", facts(run))
+				}
 			}
 		})
 	}

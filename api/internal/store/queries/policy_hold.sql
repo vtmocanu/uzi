@@ -67,9 +67,12 @@ SELECT * FROM held;
 -- matches zero rows. Parked-time and queue accounting mirror ResumePausedRun (gate-park
 -- accounting: started_at kept, parked wall time banked, affinity and generation kept, codex
 -- capability revoked, health reset).
--- fresh_from_saved_work clears the active session and ends the preserving constraint for this
--- episode (the old session id survives in the caller's audit row); preserve keeps the session,
--- preserve_required and the required head. Outcome, applying and source facts stay in both.
+-- fresh_from_saved_work clears the active session, ends the preserving constraint for this
+-- episode (the old session id survives in the caller's audit row) and the recorded verification
+-- pair, but KEEPS policy_required_head: the next claim must still prove the saved work contains it
+-- (policy_saved_work_head on the claim) before the head is cleared by RecordPolicyRecoveryVerified's
+-- non-preserving arm. preserve keeps the session, preserve_required, the required head and the
+-- verification pair. Outcome, applying and source facts stay in both.
 UPDATE runs SET
     status = 'queued',
     status_since = now(),
@@ -80,7 +83,6 @@ UPDATE runs SET
     session_id = CASE WHEN @mode::text = 'fresh_from_saved_work' THEN NULL ELSE runs.session_id END,
     policy_preserve_required = CASE WHEN @mode::text = 'fresh_from_saved_work' THEN false ELSE runs.policy_preserve_required END,
     policy_pending_fresh = false,
-    policy_required_head = CASE WHEN @mode::text = 'fresh_from_saved_work' THEN NULL ELSE runs.policy_required_head END,
     policy_recovery_verified_generation = CASE WHEN @mode::text = 'fresh_from_saved_work' THEN NULL ELSE runs.policy_recovery_verified_generation END,
     policy_recovery_verified_head = CASE WHEN @mode::text = 'fresh_from_saved_work' THEN NULL ELSE runs.policy_recovery_verified_head END,
     policy_resolved_at = now(),
@@ -110,6 +112,25 @@ WHERE runs.id = @id AND runs.user_id = @user_id AND runs.worker_id = @worker_id
   AND runs.claim_generation = @claim_generation
   AND runs.status IN ('claimed','running')
   AND runs.policy_preserve_required
+  AND runs.policy_required_head = @required_head
+RETURNING runs.id;
+
+-- name: ClearPolicySavedWorkHead :one
+-- Non-preserving arm of the worker's verification of the required recovery head (#3607). A run whose
+-- episode was resolved with fresh_from_saved_work is no longer preserve_required but still carries
+-- policy_required_head; once the worker holding the exact current claim has verified locally that the
+-- saved work contains that head, the requirement and the verification pair are cleared in one locked
+-- UPDATE. The caller holds the worker then run locks; every fence is repeated here.
+UPDATE runs SET
+    policy_required_head = NULL,
+    policy_recovery_verified_generation = NULL,
+    policy_recovery_verified_head = NULL,
+    updated_at = now()
+WHERE runs.id = @id AND runs.user_id = @user_id AND runs.worker_id = @worker_id
+  AND runs.claim_released_at IS NULL
+  AND runs.claim_generation = @claim_generation
+  AND runs.status IN ('claimed','running')
+  AND NOT runs.policy_preserve_required
   AND runs.policy_required_head = @required_head
 RETURNING runs.id;
 

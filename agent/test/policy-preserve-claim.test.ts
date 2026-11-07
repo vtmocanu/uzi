@@ -43,6 +43,18 @@ describe("preserve-only claim fields on the production claim path", () => {
     }
   });
 
+  it("policy_saved_work_head: valid 40/64-hex kept, absent stays absent, present-but-invalid reads as empty", async () => {
+    for (const head of [HEAD40, HEAD64]) {
+      assert.equal((await claimWith({ policy_saved_work_head: head })).policy_saved_work_head, head);
+    }
+    assert.equal((await claimWith({})).policy_saved_work_head, undefined);
+    for (const bad of ["", "ABCDEF" + "0".repeat(34), "a".repeat(39), "g".repeat(40), 7, null, {}]) {
+      const claim = await claimWith({ policy_saved_work_head: bad });
+      assert.equal(claim.policy_preserve_only, undefined);
+      assert.equal(claim.policy_saved_work_head, "", JSON.stringify(bad));
+    }
+  });
+
   it("a non-boolean flag is dropped as absent", async () => {
     for (const bad of ["true", 1, null, {}]) {
       const claim = await claimWith({ policy_preserve_only: bad });
