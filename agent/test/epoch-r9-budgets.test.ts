@@ -346,7 +346,10 @@ describe("a revocation that lands right after an open still closes the handle", 
     assert.equal(await observation(), true);
   });
   const sites: Array<[string, "opendir" | "open", () => (target: string) => boolean]> = [
-    ["listDirectory (an object-store directory)", "opendir", () => target => target === objectDir(bare)],
+    // The topology snapshot's own `directory` helper reads the bare object directory first; it does not use listDirectory.
+    ["the topology directory helper (the bare object directory)", "opendir", () => target => target === objectDir(bare)],
+    // The clone shape stage lists `.git` through listDirectory after the topology snapshot.
+    ["listDirectory (the clone .git directory)", "opendir", () => target => target === path.join(clonePath, ".git")],
     ["the untracked-directory expansion", "opendir", () => target => target === path.join(clonePath, ".uzi")],
     ["hashRegularFile (a tracked file)", "open", () => target => target.startsWith(clonePath + path.sep) &&
       !target.startsWith(path.join(clonePath, ".git") + path.sep)],
@@ -476,8 +479,10 @@ describe("UNKNOWN is preserved for anything that is not a positively identified 
   });
   // `for-each-ref` exits 0 with a stderr warning for a ref it ignores (a broken name); the clone refs read treats ANY
   // stderr as UNKNOWN. A record-cap overflow of the same listing must not win over that signal and become a keep.
-  // A real fixture cannot isolate it (the shape stage counts the same refs first), so the Git child is faked below
-  // the real scoped wrapper: 131,073 ordinary lines plus Git's own warning text, with the real record-cap check.
+  // The first test fakes the Git child below the real scoped wrapper (131,073 ordinary lines plus Git's own warning
+  // text, with the real record-cap check). The real-fixture test after it reaches the same cap: the shape stage
+  // charges packed-refs by bytes only, so 132,000 packed refs pass it and a loose ref with a broken name makes the
+  // clone refs listing warn on stderr.
   it("a refs listing past the record cap that also warned on stderr is UNKNOWN, not a keep", async t => {
     const head = command(clonePath, "rev-parse", "HEAD");
     const original = git["execEpochNative"].bind(git);
@@ -505,6 +510,45 @@ describe("UNKNOWN is preserved for anything that is not a positively identified 
     });
     assert.equal(await observation(), false);
   });
+  it("a real refs listing past the record cap with a broken loose ref name is UNKNOWN at the default limits", async () => {
+    const head = command(clonePath, "rev-parse", "HEAD");
+    const lines = ["# pack-refs with: peeled fully-peeled sorted"];
+    for (let i = 0; i < 132_000; i++) lines.push(`${head} refs/tags/t${String(i).padStart(6, "0")}`);
+    fs.writeFileSync(path.join(clonePath, ".git", "packed-refs"), lines.join("\n") + "\n");
+    fs.writeFileSync(path.join(clonePath, ".git", "refs", "heads", "bad..name"), head + "\n");
+    const error = await failure(observation());
+    assert.equal(error.name, "AutomaticCompletenessUnknown", error.message);
+    assert.equal(stopped, false);
+  });
+  // The byte-cap twins: a joined stdout overrun that also carried stderr is not a settled limit, whichever wrapper
+  // (runGitAsRunner for the clone, runGitWithEnv for the bare) sees it.
+  const overrun = (stderr: string) => Object.assign(new Error("git subprocess maxBuffer exceeded"), {
+    outputExceeded: true, outputStream: "stdout", code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", epochProcessJoined: true, stderr });
+  const WARNING = "warning: ignoring ref with broken name refs/heads/bad..name\n";
+  for (const [label, wrapper, matches] of [
+    ["the clone refs listing (runGitAsRunner)", "runGitAsRunner",
+      (args: string[]) => args.includes("for-each-ref") && args.includes("--format=%(objectname) %(refname) %(symref)")],
+    ["the bare object inventory (runGitWithEnv)", "runGitWithEnv",
+      (args: string[]) => args.includes("--batch-all-objects") && args.includes(bare)],
+  ] as const) {
+    for (const [stderr, outcome] of [[WARNING, "UNKNOWN"], ["", "a settled keep"]] as const) {
+      it(`a stdout byte-cap overrun of ${label} ${stderr ? "that also warned on stderr is UNKNOWN, not a keep" : "without stderr is a settled keep"}`, async t => {
+        const original = git["execEpochNative"].bind(git);
+        let reached = 0;
+        t.mock.method(git as unknown as { execEpochNative: typeof original }, "execEpochNative", async (...args: Parameters<typeof original>) => {
+          if (matches(args[1])) { reached++; throw overrun(stderr); }
+          return original(...args);
+        });
+        if (outcome === "UNKNOWN") {
+          const error = await failure(observation());
+          assert.equal(error.name, "AutomaticCompletenessUnknown", error.message);
+        } else {
+          assert.equal(await observation(), false);
+        }
+        assert.ok(reached > 0, `${wrapper} was reached`);
+      });
+    }
+  }
   it("a quiet verify-pack whose joined stdout overruns the cap is UNKNOWN, not a keep", async t => {
     const original = git["execScoped"].bind(git);
     let verified = 0;
