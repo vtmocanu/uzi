@@ -1088,7 +1088,7 @@ test("the server accepts a decimal-string timeout and still refuses every other 
   }
   assert.equal(h.specs.length, 2);
 
-  for (const timeout of ["5e3", "abc", "", "-1", "1.5", "0x10", "0", "3600001", "9".repeat(400), 1.5, null]) {
+  for (const timeout of ["5e3", "1e2", "abc", "", "-1", "+100", "1.5", "1.0", "100ms", "0x10", "0", "3600001", "9".repeat(400), 1.5, null]) {
     const r = await callTool({ command: "echo hi", timeout });
     assert.equal(r.isError, true, JSON.stringify(timeout));
     assert.match(text(r), /Input validation error/, JSON.stringify(timeout));
