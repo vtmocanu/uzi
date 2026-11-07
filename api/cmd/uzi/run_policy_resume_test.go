@@ -116,6 +116,7 @@ func TestPolicyResumeValidation(t *testing.T) {
 		{"unknown mode", []string{"--policy-mode", "bogus", "--episode", policyEpisode, "--yes"}, "preserve, fresh_from_saved_work, fresh_one_claim"},
 		{"missing episode", []string{"--policy-mode", "preserve", "--yes"}, "--episode is required"},
 		{"bad episode", []string{"--policy-mode", "preserve", "--episode", "nope", "--yes"}, "must be a UUID"},
+		{"uppercase episode", []string{"--policy-mode", "preserve", "--episode", strings.ToUpper(policyEpisode), "--yes"}, "must be a UUID"},
 		{"episode without mode", []string{"--episode", policyEpisode}, "only with --policy-mode"},
 		{"both guidance", []string{"--policy-mode", "preserve", "--episode", policyEpisode, "--guidance", "a", "--guidance-file", path, "--yes"}, "mutually exclusive"},
 		{"too long", []string{"--policy-mode", "preserve", "--episode", policyEpisode, "--guidance", big, "--yes"}, "limit is 16000 bytes"},

@@ -297,6 +297,18 @@ it("Escape and Back close the confirm and return focus to the action", async () 
   expect(api.resumePolicyHold).not.toHaveBeenCalled();
 });
 
+it("keeps typed guidance when Escape closes the confirm and the same mode is reopened", () => {
+  render(view(held({ policy_hold: sameConversation })));
+  const label = wording.modes.preserve.label;
+  fireEvent.click(screen.getByRole("button", { name: label }));
+  const box = screen.getByLabelText("Guidance for the agent (optional)") as HTMLTextAreaElement;
+  fireEvent.change(box, { target: { value: "Keep the patch minimal." } });
+  fireEvent.keyDown(box, { key: "Escape" });
+  expect(screen.queryByRole("group", { name: label })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: label }));
+  expect((screen.getByLabelText("Guidance for the agent (optional)") as HTMLTextAreaElement).value).toBe("Keep the patch minimal.");
+});
+
 it("closes the confirm when the episode changes under it", () => {
   const rendered = render(view(held({ policy_hold: sameConversation })));
   fireEvent.click(screen.getByRole("button", { name: wording.modes.preserve.label }));

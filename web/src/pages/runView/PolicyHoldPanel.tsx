@@ -36,7 +36,9 @@ export function PolicyHoldPanel({ run, canSteer, refreshRun }: {
   const episode = hold?.outcome_id ?? "";
   const modes = held ? (hold?.resume_modes ?? []).filter(isPolicyHoldResumeMode) : [];
   const [choice, setChoice] = useState<{ mode: PolicyHoldResumeMode; episode: string } | null>(null);
-  const [guidance, setGuidance] = useState("");
+  // Typed guidance is kept per mode and per held episode: closing the confirm (Escape, Back)
+  // keeps it; a successful resume, a new episode or a different run drops it.
+  const [drafts, setDrafts] = useState<{ episode: string; byMode: Partial<Record<PolicyHoldResumeMode, string>> }>({ episode: "", byMode: {} });
   const [busy, setBusy] = useState(false);
   const [rawNotice, setNotice] = useState<Notice | null>(null);
   // A result belongs to the episode it was made for; a new held episode makes it stale.
@@ -50,7 +52,7 @@ export function PolicyHoldPanel({ run, canSteer, refreshRun }: {
   // A different run is a different panel: drop any choice, notice and in-flight result.
   useEffect(() => {
     setChoice(null);
-    setGuidance("");
+    setDrafts({ episode: "", byMode: {} });
     setNotice(null);
     setBusy(false);
     request.current = null;
@@ -78,6 +80,11 @@ export function PolicyHoldPanel({ run, canSteer, refreshRun }: {
 
   if (!held && !notice) return null;
 
+  const draftsNow = drafts.episode === episode ? drafts.byMode : {};
+  const guidance = active ? (draftsNow[active.mode] ?? "") : "";
+  const setGuidance = (text: string) => {
+    if (active) setDrafts({ episode: active.episode, byMode: { ...draftsNow, [active.mode]: text } });
+  };
   const bytes = encoder.encode(guidance).length;
   const overCap = bytes > GUIDANCE_MAX_BYTES;
   const hasNul = guidance.includes("\u0000");
@@ -85,7 +92,6 @@ export function PolicyHoldPanel({ run, canSteer, refreshRun }: {
 
   const open = (mode: PolicyHoldResumeMode) => {
     setNotice(null);
-    setGuidance("");
     setChoice({ mode, episode });
   };
   const back = () => {
@@ -108,6 +114,7 @@ export function PolicyHoldPanel({ run, canSteer, refreshRun }: {
       });
       if (request.current !== token) return;
       setChoice(null);
+      setDrafts({ episode: "", byMode: {} });
       setNotice(res.replay
         ? { tone: "status", text: "Already resumed (this request was applied earlier).", refresh: false, episode: active.episode }
         : { tone: "status", text: `${POLICY_HOLD_WORDING.modes[active.mode].label}: resumed. The run is queued for its next pickup.`, refresh: false, episode: active.episode });

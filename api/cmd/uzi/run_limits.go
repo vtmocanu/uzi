@@ -97,7 +97,7 @@ func newRunResumeNowCmd(env Env, gf *globalFlags) *cobra.Command {
 // maxPolicyGuidanceBytes is the server's limit on resume guidance (UTF-8 bytes).
 const maxPolicyGuidanceBytes = 16000
 
-var policyEpisodeRE = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+var policyEpisodeRE = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 // policyFlagsUsed reports whether any policy-hold flag was passed, so that an otherwise
 // bare `resume-now` stays on the unchanged body-less path.

@@ -3984,6 +3984,9 @@ or renew this hold.
 A default `uzi run wait <id>` stops on this cause; an explicit `--until`
 retains exactly its selected status set, including when it is the default
 set written explicitly. Ordinary recovery waits continue as before.
+`uzi run logs <id> --follow` reports a change to this cause even when the
+status stays `recovery_wait`. The TUI puts this hold in NEEDS YOU with
+owner actions, counts and historical evidence, without a self-retry countdown.
 
 ### Codex policy hold
 
@@ -4021,9 +4024,6 @@ uzi run resume-now <id> --policy-mode <mode> --episode <outcome_id> \
 | `fresh_one_claim` | Fresh conversation for one pickup | Lets exactly the next pickup start one new conversation from the saved work. Later pickups preserve that new conversation again; a fresh start that is never confirmed is held, not repeated. |
 
 Without `--policy-mode`, `uzi run resume-now <id>` is unchanged.
-`uzi run logs <id> --follow` reports a change to this cause even when the
-status stays `recovery_wait`. The TUI puts this hold in NEEDS YOU with
-owner actions, counts and historical evidence, without a self-retry countdown.
 
 ### Codex idle stalls
 
