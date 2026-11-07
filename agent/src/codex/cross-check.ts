@@ -136,6 +136,42 @@ export function codeCrossCheckBriefWithGuidance(tools: string, guidance: string)
  return `${locked}\n\n${OWNER_GUIDANCE_LABEL}\n<owner_guidance_${nonce}>\n${guidance}\n</owner_guidance_${nonce}>`;
 }
 
+/**
+ * JSON Schema for the Claude checker's structured code verdict. It mirrors validateCodeVerdict
+ * and decodeCodeFindings as a model retry aid only and is never stricter than them: a character
+ * maxLength is at most the validators' byte caps, and the 32 KiB byte totals, unique ids and the
+ * coverage caps stay validator-only. Coverage is deliberately unconstrained because the validator
+ * accepts any coverage value and normalizeCodeCoverage degrades a bad one. The intended shape is
+ * an array of {path, status: examined|excluded|unassessed, reason}.
+ */
+export const CODE_VERDICT_SCHEMA = {
+ type: "object",
+ additionalProperties: false,
+ required: ["findings"],
+ properties: {
+  findings: {
+   type: "array",
+   maxItems: 20,
+   items: {
+    type: "object",
+    additionalProperties: false,
+    required: ["id", "severity", "path", "line", "title", "detail"],
+    properties: {
+     id: { type: "string", pattern: "^[A-Za-z0-9_-]{1,64}$" },
+     severity: { type: "string", enum: ["critical", "major", "minor"] },
+     path: { type: "string", maxLength: 2048 },
+     line: { type: "integer", minimum: 0, maximum: 2147483647 },
+     title: { type: "string", maxLength: 2048 },
+     detail: { type: "string", maxLength: 2048 },
+    },
+   },
+  },
+  coverage: {
+   description: "Optional coverage report: an array of {path, status: examined|excluded|unassessed, reason}.",
+  },
+ },
+} as const;
+
 /** Parse the complete bounded code output, shared by both native checker families. */
 export function validateCodeVerdict(text: string): { findings: ReturnType<typeof decodeCodeFindings>; coverage: unknown } {
  try {
@@ -641,6 +677,36 @@ function hasOutput(usage: CodexThreadTokenUsage): boolean {
  return usage.total.outputTokens > 0 || usage.total.reasoningOutputTokens > 0
   || usage.last.outputTokens > 0 || usage.last.reasoningOutputTokens > 0;
 }
+
+/**
+ * JSON Schema for the Claude checker's structured plan verdict. It mirrors validateVerdict as a
+ * model retry aid only and is never stricter than it: a character maxLength is at most the
+ * validator's byte caps, and the per-item and total byte caps stay validator-only.
+ */
+export const PLAN_VERDICT_SCHEMA = {
+ type: "object",
+ additionalProperties: false,
+ required: ["verdict", "summary", "items"],
+ properties: {
+  verdict: { type: "string", enum: ["approve", "revise", "block"] },
+  summary: { type: "string", maxLength: 4096 },
+  items: {
+   type: "array",
+   maxItems: 20,
+   items: {
+    type: "object",
+    additionalProperties: false,
+    required: ["file", "severity", "summary", "rationale"],
+    properties: {
+     file: { type: "string", maxLength: 2048 },
+     severity: { type: "string", enum: ["info", "warning", "error"] },
+     summary: { type: "string", maxLength: 2048 },
+     rationale: { type: "string", maxLength: 2048 },
+    },
+   },
+  },
+ },
+} as const;
 
 // Parse the entire assistant item; the ordinary lead tail parser is intentionally
 // absent here. The server repeats its validation before storing a verdict.
