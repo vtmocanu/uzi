@@ -320,6 +320,18 @@ describe("per-key ownership", () => {
     await bindIn(r.rt, new Set(), r.clone);
   });
 
+  it("epoch census sees completion only after the authenticated discard tombstone", async (t) => {
+    const r = await rig(t);
+    assert.equal(await r.rt.hooks.isRetiredSource?.(r.clone), false, "no slot is not completion");
+    await r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "discard"));
+    assert.equal(await r.rt.hooks.isRetiredSource?.(r.clone), false, "retiring is not completion");
+    fs.rmSync(r.clone, { recursive: true });
+    const ended = await r.rt.endSourceUse([r.clone], { skipFlightOwned: true });
+    assert.deepEqual(ended.ended, [r.clone]);
+    assert.equal((await slotOf(r.rt, r.clone))?.state, "retired");
+    assert.equal(await r.rt.hooks.isRetiredSource?.(r.clone), true);
+  });
+
   it("issue #3638 skipFlightOwned keeps a flight-owned key active and owned, but still ends the discard's own lease", async (t) => {
     const r = await rig(t);
     const a = new Set<string>();

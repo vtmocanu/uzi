@@ -201,6 +201,7 @@ export class AuthorityRuntime implements AuthorityScope {
   constructor(options: AuthorityRuntimeOptions) {
     this.#options = options;
     this.hooks = {
+      isRetiredSource: (clonePath) => this.#isRetiredSource(clonePath),
       admitSourceUse: (clonePath, op) => this.#admit(clonePath, op),
       beginBareMutation: (bare, op, footprint) => this.#beginBare(bare, op, footprint),
       assertBareClear: (bare, op) => this.#assertBareClear(bare, op),
@@ -211,6 +212,18 @@ export class AuthorityRuntime implements AuthorityScope {
       slotExists: (clonePath) => this.#slotExists(clonePath),
       enter: (view, manifest) => this.#enterRetirement(view, manifest),
     };
+  }
+
+  /** A completed discard writes this authenticated tombstone only after its Git metadata
+   *  barriers and endSourceUse. Read without taking A beneath the census's bare lock B;
+   *  a missing, ambiguous or unreadable slot is never completion evidence. */
+  async #isRetiredSource(clonePath: string): Promise<boolean> {
+    try {
+      const slot = await peekAuthoritySlot({ dataDir: this.#options.lifetime.dataDir,
+        workerToken: this.#options.workerToken }, path.resolve(clonePath));
+      return slot?.state === "retired" && slot.pending === null && slot.retiring === null &&
+        slot.publication === null;
+    } catch { return false; }
   }
 
   /**
