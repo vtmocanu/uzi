@@ -462,6 +462,9 @@ describe("Needs your decision", () => {
     mockApi.listRuns.mockResolvedValue({ runs: [aRun({ id: "plan-1", status: "awaiting_approval" }), prRun()] });
     await mount();
     expect(screen.getByText(/^1 decision and 1 pull request are waiting on you\./)).toBeTruthy();
+    // The PR sits in its group: its ref links to the forge, and so does its action once expanded.
+    expect(screen.getByRole("link", { name: "vtmocanu/uzi #4" }).getAttribute("href")).toBe("https://github.com/o/r/pull/4");
+    fireEvent.click(screen.getByRole("button", { name: "Review PRs" }));
     expect(screen.getByRole("link", { name: "Review PR" }).getAttribute("href")).toBe("https://github.com/o/r/pull/4");
   });
 
