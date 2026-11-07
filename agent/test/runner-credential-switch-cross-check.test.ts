@@ -352,7 +352,9 @@ interface AuthorityHarness {
   disarm: () => void;
 }
 
-/** A non-blocking flock helper call against the real util-linux binary, for a host whose default is not it. */
+/** Stands in for authority-lock.ts's private `runFlock` on a util-linux host (where `testLockOptions()`
+ *  supplies no `run`): spawns the real binary. Simplified: it ignores the abort signal, and a helper
+ *  timeout resolves code 2 rather than rejecting `FlockHelperTimeout`. */
 function spawnFlock(args: string[], fd: number | undefined, _signal: AbortSignal | undefined, timeoutMs: number): Promise<FlockResult> {
   return new Promise((resolve, reject) => {
     const child = spawn("/usr/bin/flock", args, {

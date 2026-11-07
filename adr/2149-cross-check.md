@@ -548,7 +548,7 @@ lock wait (a recovery operation: timeout capped, child killed and joined), the a
 reap joins (capped; expiry is an unconfirmed reap, nothing aborted) and reap passes (not admitted
 after the deadline), the quiescence helper setup, run and cleanup, procfs scans, and Docker
 teardown (skipped after the deadline). Expiry fails closed like a failed checkpoint (for the error
-shapes listed below; the Limits name the exceptions): a
+shapes listed below; the sentences after the Limits name the exceptions): a
 `TransientRecoveryError`, the source clone kept as the authoritative copy, and the candidate
 reservation neither released nor cancelled by the step. An owner Cancel or shutdown keeps its own
 reason. The measured post-deadline tail is about 1 s without the runner/agent uid split (git
