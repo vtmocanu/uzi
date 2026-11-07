@@ -798,7 +798,7 @@ Tracked as GitHub issue vtmocanu/uzi#1190; PRD at `prds/done/1190-run-pause-resu
 
 - A run's owner can pause it (after the current milestone, or at once) and resume it later; the run parks on a pushed checkpoint, spends nothing while paused, and its budget clock stops. [user, #1190]
 - #2852 slice A contract: Codex continuation after a possibly drained failed/withdrawn pause requires proven cleanup before saved-session epoch recreation under Feature #1783. Accepted B1 instead stops nonterminally on unproven cleanup for the exact refused/unacknowledged owner-pause safety facade, retaining clone/session/journal/custody without a new in-run epoch or failed terminal report. Subsequent execution depends on existing in-budget requeue or owner Resume/hold policy; retained-source recovery uses a fresh attempt path/model session, not the old model thread. (AI-synced 2026-10-22)
-- A Pause now sent while a resumed run is recovering kept work waits for recovery to finish, then parks with a checkpoint; a recovery failure or hold takes precedence, and a refused park leaves the run unpaused. [user, #3995] (AI-synced 2026-11-06)
+- A delivered Pause now during retained recovery waits for recovery and required-base validation, then parks with a checkpoint. Withdrawal clears it; publication-only claims retain their immediate stop; stronger controls and recovery failures or holds take precedence. A refused park leaves the run unpaused. [user, #3995] (AI-synced 2026-11-07)
 
 ## Feature #218 — A park or shutdown must not lose the agent's committed work
 

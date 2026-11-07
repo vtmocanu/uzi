@@ -658,6 +658,34 @@ it("production SdkExecutor: a pre-approved claim parks on the deferred pause wit
   assert.equal(rg.summaryCalls, 0);
 });
 
+it("required-base validation holds an unattested retained successor before a deferred pause can publish", async t => {
+  const planned = gitOut(fx.originPath, "rev-parse", "HEAD");
+  const rg = await rig("reserve", flight => route(flight, "pause", "now"), {
+    production: true,
+    claim: { plan_md: "# Plan\n- preserve the planned base", plan_approved: true, plan_source: "seeded",
+      planned_base_commit: planned, require_base_match: true },
+  });
+  let holds = 0;
+  client.requestBaseAttestationHold = async () => { holds++; return { outcome: "held", status: "paused" }; };
+  let publishesBeforeHandoff: number | undefined;
+  const handoff = (rg.runner as any).phasePreflightHandoff.bind(rg.runner);
+  (rg.runner as any).phasePreflightHandoff = async (...args: any[]) => {
+    publishesBeforeHandoff = rg.publishes;
+    return handoff(...args);
+  };
+  await rg.runner.execute(rg.claim);
+  t.diagnostic(JSON.stringify({ holds, publishesBeforeHandoff, checkpointPublishes: rg.publishes, ownerPauseReports: pausedReports(rg) }));
+  assert.equal(holds, 1, "required-base recovery hold must precede owner-pause publication");
+  assert.equal(typeof publishesBeforeHandoff, "number", "the retained successor reached the production preflight handoff");
+  assert.equal(rg.publishes, publishesBeforeHandoff, "the deferred pause must not publish another checkpoint before base validation");
+  assert.equal(pausedReports(rg), 0, "the owner-pause writer must not replace the required-base hold");
+  assert.equal(rg.pauseParks, 0);
+  assert.equal(rg.flight.parked, true);
+  assert.equal(rg.flight.preserveRecoveryClone, true);
+  assert.equal(rg.sdkCalls, 0);
+  assert.equal(rg.summaryCalls, 0);
+});
+
 // N. Integrity: the server applied `paused` but the ACK was lost on the way back.
 it("P2 applied-ACK-lost: the server is paused, the worker is not parked, and no second pause report is sent", async () => {
   const rg = await rig("reserve", flight => route(flight, "pause", "now"), {

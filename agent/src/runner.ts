@@ -14491,22 +14491,6 @@ export class RunRunner {
     const runId = claim.run_id;
     const runnerClone = flight.runnerClone!;
     const barePath = flight.barePath;
-    // An owner `now` pause delivered while retained re-claim recovery ran was only recorded
-    // (SteeringChannel.deferOwnerPauseNow). Settle it here, before any provider or summary call, through
-    // the ordinary PauseNowSignal arm (checkpoint-first, paused-ACK confirmed) - but only when no
-    // stronger control is pending, so cancel, switch, fence, shutdown and checkpoint authority keep
-    // their own outcomes.
-    if (
-      steering.deferredPauseNowPending() &&
-      !flight.cancel.signal.aborted &&
-      !steering.lifecycleSignal().aborted &&
-      steering.pendingCredentialSwitch() === undefined &&
-      !steering.checkpointAuthoritySignal().aborted &&
-      !steering.terminalLifecycleSignal().aborted &&
-      !steering.isCancelled() &&
-      steering.claimFence() === undefined &&
-      !flight.active?.shuttingDown && !this.shuttingDownGlobal
-    ) throw new PauseNowSignal();
     // Tell the lead whenever the branch it is standing on already carries commits it did
     // not make this turn, so the honest degradation never becomes silently duplicated work.
     // PRD #218 M3 widened the condition to `priorCommits > 0` alone: it previously fired
@@ -14568,6 +14552,21 @@ export class RunRunner {
       }
       flight.baseAccepted = true;
     }
+    // #3995: recovery records an owner `now` without aborting the flight. Validate --require-base
+    // before settling that pause: its checkpoint must not publish an unattested retained source
+    // instead of entering the required-base recovery hold. Keep stronger controls' own outcomes,
+    // and settle before any provider or summary call.
+    if (
+      steering.deferredPauseNowPending() &&
+      !flight.cancel.signal.aborted &&
+      !steering.lifecycleSignal().aborted &&
+      steering.pendingCredentialSwitch() === undefined &&
+      !steering.checkpointAuthoritySignal().aborted &&
+      !steering.terminalLifecycleSignal().aborted &&
+      !steering.isCancelled() &&
+      steering.claimFence() === undefined &&
+      !flight.active?.shuttingDown && !this.shuttingDownGlobal
+    ) throw new PauseNowSignal();
     const staleWarning = requireBase ? undefined : evaluateBaseStaleness(
       claim.planned_base_commit ?? undefined,
       runnerClone.baseCommit,
