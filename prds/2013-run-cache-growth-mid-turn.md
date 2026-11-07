@@ -1,6 +1,6 @@
 # PRD #2013: Bound a Claude run's Go cache growth inside a long implement turn
 
-**Status**: Proposed (design run complete; renewed design review and gated planning authorized 2026-11-07; runtime work awaits the F1/D13 proof and an accepted plan)
+**Status**: Proposed (design run complete; plan gate concluded negatively 2026-11-07; mid-turn eviction not implemented; boundary-only trim unchanged; see D20)
 **Issue**: #2013
 **Related**: #1809, #1829, #1783, #1830/#2072, #2206, #2471, #2964, #3076/#3675, #2969, #3329, #3431, #3885, #3969/#3973; epic #2026
 **Priority**: High for the cache-growth subcase (architecture review pending); delivery order revised by D19
@@ -284,3 +284,52 @@ Hosted acceptance, carried verbatim from the issue:
 - **D17 (2026-11-06, owner re-scope): Guard coverage is confirmed for the observed deployment.** The deployment that produced the 2026-11-05 runs had the guard enabled and two ordinary run slots (owner-reported, 2026-11-05/06); the [November 5 comment](https://github.com/vtmocanu/uzi/issues/2013#issuecomment-6667660390) records guard binding for both runs. The chart default remains off. These inputs do not establish guard coverage across the hosted fleet; this PRD adds no default or enrollment change.
 - **D18 (2026-11-06, owner re-scope): Keep F0 as an attribution and dispatch gate, not a runtime milestone.** The November 5 cache component split, other-volume breakdown and historical guard bindings were not measured. A later natural run may fill those gaps; absent one, report uncertainty. This prevents F1-F4 work from being presented as the primary fix for below-cap disk parks while retaining the November 4 cache-growth design for a justified later dispatch.
 - **D19 (2026-11-07, renewed owner direction):** reopen design review and gated planning for the cache-growth remedy before the primary capacity tracks finish. The November 4 growth observation and November 7 large-cache occupancy justify reconsidering the mechanism now. This supersedes D16/F0's dispatch sequencing prerequisite, not the facts or safety requirements: no post-remedy recurrence rate, November 7 guard binding, per-turn growth, working set or safely evictable fraction is claimed. Keep F0's missing measurements explicit and carry them into the implementation/hosted acceptance evidence; unknown attribution remains unknown. Runtime work still requires the reviewed concrete F1/D13 design and accepted gated plan. No other safety or hosted acceptance criterion is waived.
+- **D20 (2026-11-07, gated planning run): the plan gate concluded negatively; no D13 barrier could be justified, so nothing was implemented.** F1-F4 were not started, no runtime, test, ADR or user-doc change was made, and workers keep today's boundary-only trim. The issue's rule applied: state the missing contract and the smallest further proposals, implement nothing, and do not move the proof into a milestone.
+  - **Barrier evaluated.** Four review rounds (two by a reviewer subagent, two by an automated cross-check) examined the strongest candidate found:
+    - a search-permission fence (mode `0o000`) on the cache roots themselves, `.cache/go-build` and `.npm/_cacache`;
+    - a single runner-uid session helper that lists and evicts through descriptors pinned to the roots' immediate children before the fence;
+    - a post-fence `/proc` scan of every agent-uid process, closed over pid allocation.
+
+    The parents `.cache` and `.npm` are excluded because the live Claude CLI appends its own MCP logs under `.cache` on every guarded call. That design closes:
+    - every new path resolution, symlink aliases included;
+    - cwds, descriptors and mappings in readable processes;
+    - fork-and-exit hand-offs, by re-examining each pid allocated since the pass began (`ns_last_pid` ranges);
+    - hard-linked units, which are never evicted while their references still count;
+    - helper interference, through one per-run lock over every cache-subtree helper. The pinned removal helper's `openOwned` would otherwise reopen a fenced root.
+  - **What it cannot close with mechanisms this worker has.**
+    1. *In-flight kernel path lookups.* Removing search permission does not revoke a lookup that already passed the root before the chmod. That open can complete after the scan read the thread's descriptors, with no new pid, leaving a handle inside the tree during eviction. A `/proc` scan cannot prove no such lookup is outstanding: per-thread `syscall` needs ptrace-attach access, which Yama commonly denies for non-descendants, and a thread shown running cannot be classified. The descriptor pinning in `agent/src/rmtree.ts` synchronizes only the helper's own walk.
+    2. *Private per-thread descriptor tables* (`unshare(CLONE_FILES)`, `close_range(CLOSE_RANGE_UNSHARE)`). They are inspectable per task, but a complete picture would need case 1 closed as well.
+    3. *No freeze primitive.* The worker only reads cgroups (`agent/src/worker-memory-reader.ts`, `agent/src/stats.ts`): it has no `cgroup.freeze` or `cgroup.procs` writes and no delegation. It therefore cannot stop every task able to name the cache at a syscall boundary.
+  - **Missing contract.** For the whole listing-and-eviction interval:
+    - (a) no task that can name a HOME cache path (any agent uid, any thread) is inside a path lookup or holds a handle into the cache when listing begins;
+    - (b) no such task can begin one before eviction ends;
+    - (c) this holds when processes clear their environment, change directory or detach.
+  - **Obligations any future design must also meet** (surfaced in review, not solved here):
+    - Hard-stop eligibility must hold even when the cache-heavy run's measurement or deletion is blocked by an unsettled helper (the selection in `agent/src/cache-cap.ts`).
+    - A deferred park drop must be ordered against a same-HOME resume; PRD #1809 D2 (`prds/1809-worker-disk-safety.md`) allows park drops for process-ended runs only.
+    - Define a restore-failure path, and remove a still-fenced subtree at park.
+    - Verify the crash model on the real launch chain (`agent/templates/base/Dockerfile`: tini, npm, tsx), scoped to process crashes; storage or power loss is out of scope.
+    - Define and recover the cache state after an interrupted eviction: the removal helper empties directory units before `rmdir`, and a failed trim step leaves what it did not remove.
+  - **Smallest further proposals** (for reviewed re-planning; none implemented):
+    1. *Freeze-based quiet point.* Delegate to the worker a cgroup v2 subtree holding every agent-uid task, the CLI included. Freeze it (write `cgroup.freeze`, wait for `frozen 1` in `cgroup.events`, which leaves no task inside a kernel path walk). Then run the fence and scan, trim stages (a) and (b), restore after the destructive helper's confirmed exit, and thaw. This is a new privilege and infrastructure change across chart, compose and worker; it needs its own design review and an owner decision.
+    2. *Worker-mediated Go cache (`GOCACHEPROG`) with per-session leases.* Go asks the program for every get and put, and an entry is evicted only when no live `go` session holds a lease on it. That removes the filesystem race for cooperative builds. It needs a decision on escaped builds that bypass it, and it covers Go only, so npm stage (b) would drop out. This is the "optional to evaluate (unverified)" item under Rejected.
+    3. *Cache-specific, file-only eviction under each cache's documented concurrency contract. UNVERIFIED; to be evaluated before any re-plan.* The question is whether a narrower subset of Go build-cache data files or npm content files could be evicted safely without quiescence. This candidate never deletes directories or index or lock files.
+       - Known counterevidence, recorded and not resolved:
+         - Go's own Trim does not show that arbitrary concurrent deletion is safe. cmd/go/internal/cache/cache.go requires an OutputFile that was successfully obtained or stored to stay present until the Go process closes, and Trim deliberately skips recently used entries.
+         - A file missing before lookup can be a cache miss, but deletion after a successful lookup can break a later path-based consumer (compiler, linker or other reader). The 2026-10-14 go1.27.2 reproduction on the issue showed `could not import ... no such file or directory`.
+         - Never deleting directories or index or lock files does not by itself close that race.
+         - `agent/src/run-caches.ts` already records that a cacache index entry whose content is missing can error a request.
+       - Evidence required, from the pinned tool versions and their actual callers:
+         - Go Get, Put and Trim, and the consumers after a hit;
+         - replacement and writer races;
+         - cached executable artifacts;
+         - npm/pacote recovery when content is removed before lookup, after an index hit, and during extraction.
+
+         The evaluation must distinguish integrity protection (no corruption) from successful command retry (the command still succeeds).
+       - If only sufficiently old entries qualify, measure whether enough such bytes exist to address the observed recent cache growth. An age check alone does not prove safety.
+       - Only if that evidence establishes a useful safe subset could a smaller design skip the fence, scan or freeze for that subset. Adopting it would amend D13 and needs reviewed re-planning plus an owner decision. This entry records an option and its counterevidence, not a conclusion.
+  - **Owner answers carried forward to any re-plan** (given 2026-11-07 during this gate):
+    - Docker-wired runs without positive cache-file exclusion keep boundary-only trim, with a test. This covers chart DinD, an arbitrary `DOCKER_HOST`, and any run whose wiring cannot be positively identified, including a configured endpoint whose readiness probe failed. Do not invent a compose/chart heuristic. Chart DinD is not proven because the worker mounts the whole data PVC at `/data`, so a hard link from a run HOME into the dind-shared `runner-shared` directory can reach a cache inode; record that as the reason.
+    - Hosted acceptance may use a guard-bound run that is not docker-wired. If none is practical, acceptance stays pending without widening eligibility.
+    - A future mid-turn switch beside `UZI_RUN_CACHE_CAP_ENABLED` defaults on.
+  - **Still open.** F0's missing attribution and the issue's hosted mid-turn acceptance remain open and unmet; the issue stays open for reviewed re-planning. Overlapping work (#4050, #3384, #3638/#3639) must be reviewed before a re-plan edits its seams.
