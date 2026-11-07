@@ -125,3 +125,44 @@ func TestPolicyFreshOneClaimChainLiveDB(t *testing.T) {
 		t.Fatalf("consumption audit rows = %s, want 1", n)
 	}
 }
+
+// A one-claim Fresh restored by a non-delivered claim (here the empty-pool requeue) sits on an
+// already-resolved episode. The owner's routes must not dead-end it: the empty-body resume-now
+// promotes the pool_wait hold (the mode-bearing resume refuses a resolved episode), the restored
+// grant survives for the next claim, and set-token's refusal carries no pointer to that refused
+// mode-bearing resume.
+func TestPolicyFreshRestoredOrdinaryResumeLiveDB(t *testing.T) {
+	fx := newCompactPolicyFx(t)
+	run := fx.seedRun()
+	episode := fx.hold(run, 1, "same_conversation", false, strings.Repeat("a", 40))
+	if resp := fx.resumeAs("bearer", run, resumeBody("fresh_one_claim", episode, "start over")); resp.Code != http.StatusOK {
+		t.Fatalf("owner fresh_one_claim = %d %s", resp.Code, resp.Body.String())
+	}
+	claimed := fx.claim(run)
+	n, err := fx.h.q.RequeueClaimAssemblyExact(context.Background(), store.RequeueClaimAssemblyExactParams{
+		PoolWait: true, ID: run, WorkerID: pgconv.UUID(fx.workerID), ClaimGeneration: claimed.ClaimGeneration,
+	})
+	if err != nil || n != 1 {
+		t.Fatalf("empty-pool requeue = %d %v", n, err)
+	}
+	restored := "SELECT status||'/'||policy_pending_fresh::text||'/'||COALESCE(policy_fresh_consumed_generation::text,'-')||'/'||(policy_resolved_at IS NOT NULL)::text FROM runs WHERE id=$1"
+	if got := fx.query(restored, run); got != "pool_wait/true/-/true" {
+		t.Fatalf("after the restore = %s, want pool_wait/true/-/true", got)
+	}
+
+	rec := bearerReqBody(fx.router, http.MethodPost, "/api/runs/"+run.String()+"/credential", fx.ownerUzc, `{"mode":"auto"}`)
+	var msg struct {
+		Error string `json:"error"`
+	}
+	if rec.Code != http.StatusUnprocessableEntity || json.Unmarshal(rec.Body.Bytes(), &msg) != nil ||
+		msg.Error != "a credential override is not supported on the codex harness" {
+		t.Fatalf("set-token on the restored run = %d %s", rec.Code, rec.Body.String())
+	}
+
+	if resp := fx.resumeAs("bearer", run, ""); resp.Code != http.StatusOK {
+		t.Fatalf("empty-body resume-now on the restored run = %d %s", resp.Code, resp.Body.String())
+	}
+	if got := fx.query(restored, run); got != "queued/true/-/true" {
+		t.Fatalf("after resume-now = %s, want queued/true/-/true (the restored grant is kept)", got)
+	}
+}

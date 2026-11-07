@@ -260,6 +260,7 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 // episode. A pending Fresh authorization on an already-resolved episode (restored by a claim
 // release/park) does not block: the mode-bearing resume refuses a resolved episode, so refusing the
 // ordinary one too would be a dead end, and the authorization is consumed at the next claim.
+// Set-token's continuation hint uses the same predicate, so it never points at that dead end either.
 func blocksOrdinaryResume(run store.Run) bool {
 	if !workersvc.UnresolvedPolicyEpisode(run) {
 		return false
