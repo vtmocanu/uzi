@@ -838,7 +838,11 @@ existing gate path; original checker findings remain historical evidence.
 
 The Claude checker (for a Codex lead) is confined in layers: the SDK `tools`
 list is `Read`, `Grep` and `Glob` only, with every other tool disallowed and
-`settingSources` empty; its environment is isolated and holds only the
+`settingSources` empty. When the check requests structured output, the SDK's
+end-turn `StructuredOutput` carrier (final verdict only, no file access) is
+additionally admitted by exact name in the tool gate, the init check and the
+Code tool budget (issue #4038). Its
+environment is isolated and holds only the
 Anthropic token; it runs as the runner uid through `spawnDetached`; one path
 guard allows reads only inside the checkout plus its own SDK spill files under
 its home; and a Glob/Grep pattern guard denies absolute, home-relative and

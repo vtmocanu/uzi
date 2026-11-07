@@ -19705,7 +19705,8 @@ try {
       if (err instanceof RunResidueBlockedError) throw err;
       const abort = this.boundaryAbortError(err);
       if (abort) throw abort;
-      const failure = this.transferRetainedCause(err, new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`));
+      const failure = this.transferRetainedCause(err,
+        new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`, recoveryDeadlineCause(err)));
       const stderr = (err as { stderr?: unknown })?.stderr;
       retainedGitDiagnostics.set(failure, {
         stderr: typeof stderr === "string" ? stderr : "",
@@ -19744,7 +19745,7 @@ try {
       if (err instanceof RunResidueBlockedError) throw err;
       const abort = this.boundaryAbortError(err);
       if (abort) throw abort;
-      const failure = new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
+      const failure = new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`, recoveryDeadlineCause(err));
       const stderr = (err as { stderr?: unknown })?.stderr;
       retainedGitDiagnostics.set(failure, {
         stderr: typeof stderr === "string" ? stderr : "",
@@ -19814,7 +19815,7 @@ try {
       if (err instanceof RunResidueBlockedError) throw err;
       const abort = this.boundaryAbortError(err);
       if (abort) throw abort;
-      throw new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
+      throw new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`, recoveryDeadlineCause(err));
     }
   }
 
@@ -24024,6 +24025,21 @@ function addedLinesOfDiff(diff: string): string {
 function isOutputOverflow(err: unknown): boolean {
   const e = err as { code?: unknown; message?: unknown };
   return e.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" || /output exceeded|maxBuffer/i.test(String(e.message ?? ""));
+}
+
+/** issue #3980: the Error options for a `git ... failed: ...` wrapper. Keeps the raw cause ONLY when the
+ *  failure is this process's own recovery-deadline stop (the bare "recovery deadline exhausted" Error that
+ *  recoveryRemaining throws, with no git stderr, or the TimeoutError of an abort signal that had already fired
+ *  before the child started; an abort during a child arrives as an AbortError that boundaryAbortError takes first), so the runner's
+ *  gate classifier can recognise a deadline stop that the wrapper's message alone cannot distinguish from a
+ *  git failure. Every other failure keeps no cause. */
+function recoveryDeadlineCause(err: unknown): { cause: Error } | undefined {
+  if (!(err instanceof Error)) return undefined;
+  const stderr = (err as { stderr?: unknown }).stderr;
+  if (err.name === "TimeoutError" || (err.message === "recovery deadline exhausted" && typeof stderr !== "string")) {
+    return { cause: err };
+  }
+  return undefined;
 }
 
 function gitErrorMessage(err: unknown): string {
