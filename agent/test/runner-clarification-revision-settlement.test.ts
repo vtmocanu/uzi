@@ -6,6 +6,8 @@
 // answer is scripted (api.stateAckWire), because the fake does not model that transition.
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import fsAsync from "node:fs/promises";
+import path from "node:path";
 import { describe, it } from "node:test";
 import type { Executor, RunContext } from "../src/executor.js";
 import type { ClaimResponse, StateRequest } from "../src/protocol.js";
@@ -13,10 +15,19 @@ import { performance } from "node:perf_hooks";
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import { WorkerMemoryRuntime } from "../src/worker-memory-runtime.js";
 import { nullLogger } from "./helpers.js";
-import { api, client, fakeGitlab, installHarness, runner } from "./runner-harness.js";
+import { api, client, fakeGitlab, fx, installHarness, runner } from "./runner-harness.js";
 import { freshClaim, newApi, row, send, until } from "./gate-revision-harness.js";
 
-installHarness();
+const pendingCleanups = new Set<() => Promise<void>>();
+installHarness({}, async () => { await Promise.all([...pendingCleanups].map(join => join())); });
+
+/** Join before the shared harness removes paths; t.after remains an idempotent fallback. */
+function beforeFixtureCleanup(t: { after: (fn: () => Promise<void>) => void }, cleanup: () => Promise<void>): void {
+  let joined: Promise<void> | undefined;
+  const join = (): Promise<void> => joined ??= cleanup().finally(() => { pendingCleanups.delete(join); });
+  pendingCleanups.add(join);
+  t.after(join);
+}
 
 const FEATURE = "clarification_revision_settlement_v1";
 const WIRE = JSON.parse(fs.readFileSync(
@@ -52,6 +63,8 @@ interface Outcome {
   afterAnswer: boolean;
   /** The executor body (including `after`) ran to completion or failed. */
   settled: boolean;
+  /** The whole flight, including retirement, has finished (later than the executor callback). */
+  flightFinished?: boolean;
 }
 
 interface Options {
@@ -137,8 +150,8 @@ async function drive(t: { after: (fn: () => Promise<void>) => void }, opts: Opti
       throw new Error("fixture reached its end");
     },
   };
-  const done = runner(executor, fakeGitlab().gitlab).execute(claim);
-  t.after(async () => {
+  const done = runner(executor, fakeGitlab().gitlab).execute(claim).finally(() => { outcome.flightFinished = true; });
+  beforeFixtureCleanup(t, async () => {
     send(id, row("cancel"));
     await done.catch(() => undefined);
   });
@@ -148,6 +161,40 @@ async function drive(t: { after: (fn: () => Promise<void>) => void }, opts: Opti
 
 const settlements = (o: Outcome) => o.sent.filter(s => s.status === "clarification_settled");
 const runnings = (o: Outcome) => o.sent.filter(s => s.status === "running");
+
+it("joins a refused clarification flight's delayed quarantine write before removing its fixture", async t => {
+  const root = path.dirname(fx.dataDir);
+  const quarantine = path.join(fx.dataDir, "runner-quarantine");
+  let release!: () => void;
+  const released = new Promise<void>(resolve => { release = resolve; });
+  // Release at the join boundary. On the old harness this runs only in t.after, after removal.
+  beforeFixtureCleanup(t, async () => { release(); });
+  let entered = false;
+  const existedAtWrite: boolean[] = [];
+  const mkdir = fsAsync.mkdir.bind(fsAsync);
+  t.mock.method(fsAsync, "mkdir", (async (...args: Parameters<typeof mkdir>) => {
+    if (String(args[0]) === quarantine) {
+      entered = true;
+      await released;
+      existedAtWrite.push(fs.existsSync(root));
+    }
+    return mkdir(...args);
+  }) as typeof fsAsync.mkdir);
+
+  const o = await drive(t, { ack: "no_disposition", claim: { kind: "ci_fix" } });
+  assert.match(errorName(o.error), /clarification revision settlement was not confirmed/);
+  assert.ok(await until(() => entered, 10_000), "the real retirement path reached the quarantine write");
+  assert.notEqual(o.flightFinished, true, "execute still owns the blocked retirement write");
+  t.after(() => {
+    try {
+      assert.equal(o.flightFinished, true, "the full flight joined before fixture removal");
+      assert.deepEqual(existedAtWrite, [true], "the owned flight must write before fixture removal");
+      assert.equal(fs.existsSync(root), false, "no fixture directory may be recreated after cleanup");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true }); // also clean the intentionally broken mutation
+    }
+  });
+});
 
 describe("#3985 clarification settlement selection", () => {
   for (const scenario of [
@@ -311,7 +358,7 @@ describe("#3985 clarification settlement selection", () => {
       },
     };
     const done = runner(executor, fakeGitlab().gitlab).execute(claim);
-    t.after(async () => { send(id, row("cancel")); await done.catch(() => undefined); });
+    beforeFixtureCleanup(t, async () => { send(id, row("cancel")); await done.catch(() => undefined); });
     assert.ok(await until(() => answered || failure !== undefined, 8_000), "the reclaimed fixture finished");
     assert.equal(failure, undefined, errorName(failure));
     assert.equal(api.states.filter(s => s.body.status === "clarification_settled").length, 1);
@@ -436,7 +483,7 @@ describe("#3985 ci_fix and prompt kinds, every ask path", () => {
           assert.match(errorName(o.error), /clarification revision settlement was not confirmed/);
           assert.equal(settlements(o).length, 1);
           assert.equal(runnings(o).length, 0, "a refusal never falls back to running");
-          await new Promise(r => setTimeout(r, 50));
+          assert.ok(await until(() => o.flightFinished === true, 10_000), "the full refused flight settled");
           const parked = api.states.findIndex(q => q.body.status === "awaiting_input");
           assert.equal(api.states.slice(parked).filter(s => s.body.status === "running").length, 0,
             "no unqualified running is reported later either");
@@ -552,7 +599,7 @@ describe("#3985 clarification settlement and the worker-memory phase hold", () =
     };
     const done = runner(executor, fakeGitlab().gitlab, undefined, { memoryRuntime: memory, activeRuns: registry,
       codexBoundaryDeadlineMs: 1000 }).execute(claim);
-    t.after(async () => { send(id, row("cancel")); await done.catch(() => undefined); await memory.stop(); });
+    beforeFixtureCleanup(t, async () => { send(id, row("cancel")); await done.catch(() => undefined); await memory.stop(); });
     assert.ok(await until(() => finished, 10_000), "the memory fixture finished");
     return outcome;
   }
