@@ -919,6 +919,8 @@ async function measure(job: MeasureJob): Promise<string[]> {
       signalGroup: (_pgid, sig) => { live.signals.push(`${sig}@${Date.now() - live.startedAt}ms`); return undefined; },
     },
   });
+  // Set when a lift guard throws; the row then fails with DEADLINE_LIFT_REFUSED.
+  let liftGuardError: string | null = null;
   const wrapped = async (request: BoundaryProcessRequest): Promise<BoundaryProcessHandle> => {
     live.spawnTmpdir = request.env.TMPDIR ?? null;
     let req = request;
@@ -926,7 +928,12 @@ async function measure(job: MeasureJob): Promise<string[]> {
       const argv = [...request.argv];
       if (argv[1] !== "-e" || typeof argv[2] !== "string") throw new Error("unexpected planning helper argv");
       // Lift first, so the lift sees the pristine helper source and never the preamble.
-      if (deadlineLift) argv[2] = liftPlanningHelperDeadline(argv[2]);
+      if (deadlineLift) {
+        try { argv[2] = liftPlanningHelperDeadline(argv[2]); } catch (e) {
+          liftGuardError ??= String((e as Error)?.message ?? e);
+          throw e;
+        }
+      }
       if (instrumented) argv[2] = preamble(helperPath, job.injectDeadlineAfterSizing === true, deadlineScale) + argv[2];
       req = { ...request, argv };
     }
@@ -955,7 +962,11 @@ async function measure(job: MeasureJob): Promise<string[]> {
     holder.readBoundedPlanningOutput = (cwd, argv, timeoutMs) => {
       if (deadlineLift) {
         // Fail closed: only the production 30 s outer timeout is replaced.
-        if (timeoutMs !== PRODUCTION_OUTER_TIMEOUT_MS) throw new Error(`deadlineLift: unexpected outer capture timeout ${String(timeoutMs)}`);
+        if (timeoutMs !== PRODUCTION_OUTER_TIMEOUT_MS) {
+          const msg = `deadlineLift: unexpected outer capture timeout ${String(timeoutMs)}`;
+          liftGuardError ??= msg;
+          throw new Error(msg);
+        }
         return original(cwd, argv, LIFTED_OUTER_TIMEOUT_MS);
       }
       return original(cwd, argv, timeoutMs === undefined ? undefined : timeoutMs * deadlineScale);
@@ -1040,6 +1051,7 @@ async function measure(job: MeasureJob): Promise<string[]> {
   }
   // Lift rows: the parent-side phase observer decides the evidence; for a metered row the
   // preamble only ever contradicts it (a phase the observer missed is never a mismatch).
+  if (liftGuardError !== null) failures.push(`DEADLINE_LIFT_REFUSED: ${liftGuardError}`);
   const phases = deadlineLift ? { ...live.phases } : null;
   const outcomeMs = st.outcomeAt === undefined ? null : st.outcomeAt - live.startedAt;
   const phaseEvidence = deadlineLift ? phaseEvidenceOf(outcome.kind, phases, outcomeMs) : null;

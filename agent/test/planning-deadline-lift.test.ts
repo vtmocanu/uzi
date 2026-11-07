@@ -76,6 +76,12 @@ describe("phase evidence", () => {
     assert.equal(phaseEvidenceOf("refused", { ...seen, indexOpenSeenMs: 150 }, 100), null);
     assert.equal(phaseEvidenceOf("oom", { ...seen, indexOpenSeenMs: 50 }, 100), null);
   });
+  it("requires the ordering seen <= gone <= index open / post-sizing spawn", () => {
+    assert.equal(phaseEvidenceOf("refused", { ...seen, indexOpenSeenMs: 30 }, 100), null);
+    assert.equal(phaseEvidenceOf("refused", { ...seen, postSizingSpawnSeenMs: 30 }, 100), null);
+    assert.equal(phaseEvidenceOf("refused", { ...seen, indexOpenSeenMs: 40 }, 100), "post_sizing_observed");
+    assert.equal(phaseEvidenceOf("refused", { ...seen, sizingSeenMs: 50, indexOpenSeenMs: 60 }, 100), null);
+  });
   it("flags only contradictions with the preamble, never a missed observation", () => {
     const helper = { t0: 1000, sizingBytes: 5, sizingCloseMs: 40, boundaryMs: 60 };
     assert.deepEqual(phaseObserverMismatches(emptyPhases(), 1000, helper), []);
@@ -118,6 +124,12 @@ describe("verifyRow", () => {
     const none = verifyRow(result(liftLabel), term(liftLabel), liftLabel, "phase-evidence");
     assert.equal(none.valid, false);
     assert.ok(none.reasons.some((r) => r.startsWith("PHASE_UNPROVEN")));
+    const completedEv = result(liftLabel, { phaseEvidence: "completed" });
+    assert.equal(verifyRow(completedEv, term(liftLabel), liftLabel, "phase-evidence").valid, true);
+    const refusedAsCompleted = result(liftLabel, { phaseEvidence: "completed", outcome: { kind: "refused", token: "capture_deadline" } });
+    assert.equal(verifyRow(refusedAsCompleted, term(liftLabel), liftLabel, "phase-evidence").valid, false);
+    const completedAsRefused = result(liftLabel, { phaseEvidence: "post_sizing_observed" });
+    assert.equal(verifyRow(completedAsRefused, term(liftLabel), liftLabel, "phase-evidence").valid, false);
     assert.equal(verifyRow(result(liftLabel), term(liftLabel, { exitCode: "1" }), liftLabel, "completed").valid, false);
     assert.equal(verifyRow(result(liftLabel), term(liftLabel, { oomKilled: true }), liftLabel, "completed").valid, false);
     assert.equal(verifyRow(result(liftLabel), term(liftLabel, { killedByHarness: true }), liftLabel, "completed").valid, false);

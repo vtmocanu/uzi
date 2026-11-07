@@ -77,17 +77,18 @@ export function isGitArgv(argv: readonly string[]): boolean {
 }
 
 /**
- * Completed capture, or a refusal observed AFTER the sizing batch ended and after the index open
- * or a later non-cat-file git spawn, all no later than the outcome. Anything else is null: the
- * row proves nothing about the post-sizing window.
+ * Completed capture, or a refusal observed AFTER the sizing batch ended: the batch was seen before
+ * it was gone, the index open or a later non-cat-file git spawn was seen at or after it was gone,
+ * and every time is no later than the outcome. Anything else is null: the row proves nothing
+ * about the post-sizing window.
  */
 export function phaseEvidenceOf(outcomeKind: unknown, phases: Phases | null, outcomeMs: number | null): PhaseEvidence | null {
   if (outcomeKind === "completed") return "completed";
   if (outcomeKind !== "refused" || phases === null || outcomeMs === null) return null;
   const { sizingSeenMs, sizingGoneMs, indexOpenSeenMs, postSizingSpawnSeenMs } = phases;
-  if (sizingSeenMs === null || sizingGoneMs === null) return null;
+  if (sizingSeenMs === null || sizingGoneMs === null || sizingSeenMs > sizingGoneMs) return null;
   const after = [indexOpenSeenMs, postSizingSpawnSeenMs].filter((v): v is number => v !== null);
-  if (after.length === 0) return null;
+  if (after.length === 0 || after.some((v) => v < sizingGoneMs)) return null;
   return [sizingSeenMs, sizingGoneMs, ...after].every((v) => v <= outcomeMs) ? "post_sizing_observed" : null;
 }
 
@@ -177,8 +178,13 @@ export function verifyRow(result: unknown, term: unknown, label: string, expect:
   if (expect === "completed") {
     if (outcome?.kind !== "completed") reasons.push(`outcome kind ${JSON.stringify(outcome?.kind)} is not completed`);
   } else if (expect === "phase-evidence") {
-    if (result.phaseEvidence !== "completed" && result.phaseEvidence !== "post_sizing_observed") {
+    const pe = result.phaseEvidence;
+    if (pe !== "completed" && pe !== "post_sizing_observed") {
       reasons.push("PHASE_UNPROVEN: no phase evidence recorded for this row");
+    } else if (pe === "completed" && outcome?.kind !== "completed") {
+      reasons.push(`PHASE_UNPROVEN: phaseEvidence completed but outcome kind is ${JSON.stringify(outcome?.kind)}`);
+    } else if (pe === "post_sizing_observed" && outcome?.kind !== "refused") {
+      reasons.push(`PHASE_UNPROVEN: phaseEvidence post_sizing_observed but outcome kind is ${JSON.stringify(outcome?.kind)}`);
     }
   } else {
     if (outcome?.kind !== "refused" || outcome.token !== expect) {

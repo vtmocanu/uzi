@@ -37,11 +37,16 @@
 #                  with DEADLINE_SCALE, SMOKE_INJECT, LIMITS_JSON, LIMITS_TAG or a MEM_CONFIGS mode
 #                  other than full/control (so `cancel` is refused).
 #   MIN_FREE_GIB   disk preflight floor in GiB: integer >= 5 (default 5; lower or non-numeric exits 2).
+#   MIN_FREE_GIB_DOCKER  floor in GiB for the Docker store only (default MIN_FREE_GIB; integer, must be
+#                  >= MIN_FREE_GIB, else exit 2). It can only raise that one floor, so the Docker-store
+#                  refusal branch can be exercised while the host stores still pass.
 #   GATE_SELFTEST  1 = prove the readability gate and nothing else: create the first MEM_CONFIGS
 #                  container, run the warmup and one noop under the measurement-style label
 #                  selftest__gate, truncate that label's result file to empty, then run the gate. The
-#                  gate must preserve the container (exit 4, PRESERVED.txt); the script never removes it
-#                  (the caller removes it by the name and id printed). Not combinable with any other
+#                  gate must preserve the container (stopped, never removed; PRESERVED.txt) and the
+#                  script exits 6 ("selftest passed: container preserved"), distinct from a real block
+#                  (exit 4) and from a selftest failure (exit 5, the gate accepted the empty file). The
+#                  caller removes the container by the name and id printed. Not combinable with any other
 #                  mode variable; no fixtures are exported or generated.
 #
 # Disk preflight (require_free): before any work, before each fixture generation and before each
@@ -52,12 +57,14 @@
 # creating anything further.
 #
 # Readability gate (confirm_readable): a container is removed (docker rm -f -v) only after every
-# result it produced is confirmed readable: the label's result .json (except for a job whose term
-# record shows a nonzero exit, OOM or harness kill, which legitimately has none; if present it must
-# parse), its term record, and a non-empty log. Otherwise it is NOT removed: its id, name and the
-# failing files are appended to $OUT/logs/PRESERVED.txt, `BLOCKED: unreadable results preserved in
-# container <id>` is printed and the script exits 4. The exit trap applies the same check to a
-# container still standing (a failure or interrupt mid-configuration).
+# result it produced is confirmed readable: the label's result .json, its term record and a
+# non-empty log must each exist, be non-empty and (the JSON files) parse. There is no exception: a
+# missing result is unreadable whatever the term record says, so an OOM-killed, nonzero-exit or
+# harness-killed job also stops the invocation and preserves its container (that is intended).
+# Otherwise the container is NOT removed: it is stopped (docker kill, docker wait; never rm, never
+# -v), its id, name and the failing files are appended to $OUT/logs/PRESERVED.txt, `BLOCKED:
+# unreadable results preserved in container <id>` is printed and the script exits 4. The exit trap
+# applies the same check to a container still standing (a failure or interrupt mid-configuration).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -78,6 +85,10 @@ MIN_FREE_GIB="${MIN_FREE_GIB:-5}"
 [[ "$MIN_FREE_GIB" =~ ^[0-9]{1,6}$ ]] && [ "$((10#$MIN_FREE_GIB))" -ge 5 ] \
   || { echo "MIN_FREE_GIB must be an integer >= 5: $MIN_FREE_GIB" >&2; exit 2; }
 MIN_FREE_KIB=$((10#$MIN_FREE_GIB * 1048576))
+MIN_FREE_GIB_DOCKER="${MIN_FREE_GIB_DOCKER:-$MIN_FREE_GIB}"
+[[ "$MIN_FREE_GIB_DOCKER" =~ ^[0-9]{1,6}$ ]] && [ "$((10#$MIN_FREE_GIB_DOCKER))" -ge "$((10#$MIN_FREE_GIB))" ] \
+  || { echo "MIN_FREE_GIB_DOCKER must be an integer >= MIN_FREE_GIB ($MIN_FREE_GIB): $MIN_FREE_GIB_DOCKER" >&2; exit 2; }
+MIN_FREE_KIB_DOCKER=$((10#$MIN_FREE_GIB_DOCKER * 1048576))
 
 for spec in $FIXTURES; do
   # Specs are interpolated into job JSON and paths: allow only the generator's own grammar.
@@ -184,10 +195,6 @@ PROBE_MADE=0
 json_ok() {
   [ -s "$1" ] && node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$1" >/dev/null 2>&1
 }
-# term_failed <term.json>: exit 0 when the container exited nonzero, was OOM killed or harness killed.
-term_failed() {
-  node -e 'const t = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); process.exit(t.exitCode !== "0" || t.oomKilled !== false || t.killedByHarness !== false ? 0 : 1)' "$1" >/dev/null 2>&1
-}
 # unreadable_files <label>: prints the failing files (each preceded by a space), nothing when readable.
 unreadable_files() {
   local label="$1" bad=""
@@ -200,10 +207,8 @@ unreadable_files() {
     *)
       json_ok "$OUT/results/$label.term.json" || bad="$bad results/$label.term.json"
       [ -s "$OUT/logs/$label.log" ] || bad="$bad logs/$label.log"
-      # A job killed or failed before writing its record has no result; its term record and log are the evidence.
-      if [ -e "$OUT/results/$label.json" ] || ! term_failed "$OUT/results/$label.term.json"; then
-        json_ok "$OUT/results/$label.json" || bad="$bad results/$label.json"
-      fi
+      # No exception: a missing, empty or unparseable result always counts, whatever the term record says.
+      json_ok "$OUT/results/$label.json" || bad="$bad results/$label.json"
       ;;
   esac
   printf '%s' "$bad"
@@ -217,6 +222,9 @@ unreadable_all() {
 # preserve_container <name> <failing files>: keep the container, record it, and drop it from CREATED.
 preserve_container() {
   local name="$1" failing="$2" id
+  # Stop it first so nothing keeps writing; never rm, never -v.
+  docker kill "$name" >/dev/null 2>&1 || true
+  docker wait "$name" >/dev/null 2>&1 || true
   id="$(docker inspect -f '{{.Id}}' "$name" 2>/dev/null || echo unknown)"
   mkdir -p "$OUT/logs"
   printf '%s %s%s\n' "$id" "$name" "$failing" >> "$OUT/logs/PRESERVED.txt" || true
@@ -284,8 +292,8 @@ require_free() {
     fi
   fi
   avail="$(docker start -a "$PROBE" 2>/dev/null | awk '$NF == "/" && $4 ~ /^[0-9]+$/ { print $4; exit }' || true)"
-  if [ -z "$avail" ] || [ "$avail" -lt "$MIN_FREE_KIB" ]; then
-    echo "BLOCKED: disk preflight ($what): docker store has ${avail:-unreadable} KiB free, need >= $MIN_FREE_KIB" >&2
+  if [ -z "$avail" ] || [ "$avail" -lt "$MIN_FREE_KIB_DOCKER" ]; then
+    echo "BLOCKED: disk preflight ($what): docker store has ${avail:-unreadable} KiB free, need >= $MIN_FREE_KIB_DOCKER" >&2
     failed=1
   fi
   if [ "$failed" -eq 1 ]; then exit 3; fi
@@ -374,9 +382,16 @@ for config in $MEM_CONFIGS; do
     printf '{"selftest":true}\n' > "$OUT/results/selftest__gate.json"
     : > "$OUT/results/selftest__gate.json"
     log "GATE_SELFTEST: result file truncated to empty; the gate must preserve $name"
-    confirm_readable "$name" "${CUR_LABELS[@]}"
-    echo "GATE_SELFTEST FAILED: the gate accepted an empty result file and removed $name" >&2
-    exit 5
+    failing="$(unreadable_all "${CUR_LABELS[@]}")"
+    if [ -z "$failing" ]; then
+      docker rm -f -v "$name" >/dev/null 2>&1 || true
+      CREATED=()
+      echo "GATE_SELFTEST FAILED: the gate accepted an empty result file and removed $name" >&2
+      exit 5
+    fi
+    preserve_container "$name" "$failing"
+    echo "GATE_SELFTEST passed: the gate preserved container $PRESERVED_ID ($name)" >&2
+    exit 6
   fi
   for spec in $FIXTURES; do
     if [ ! -f "$OUT/fixtures/$spec/manifest.json" ] && [ "${generated#* "$spec" }" = "$generated" ]; then
