@@ -396,8 +396,8 @@ and keeps its local work and custody. Export/recover the retained work rather th
 expecting Resume alone to rebind changed storage. Reholding does
 not rebind the owner record or consume the pending execution grant.
 
-This path requires API feature support, exact persisted `adoption_failed`
-evidence, current ownership and proven quiescence. Missing support or unconfirmed
+The adoption path (not the issue #4058 remediation hold) requires API feature
+support, exact persisted `adoption_failed` evidence, current ownership and proven quiescence. Missing support or unconfirmed
 persistence fails closed with custody kept. An uncertain park response uses
 bounded reconciliation and a nonterminal stop; it does not confirm the hold.
 Deploy the API fully before workers; API rollback remains unsupported. See the

@@ -1983,7 +1983,7 @@ instead detached and the successor proceeded.
   schema change. A 400 refusal of the park is logged and followed by a corrected status.
 - **Races.** A remediation record that appears after classification hits the typed refusal, and a
   re-read then holds (exact), refuses (mismatch), readmits (changed or absent) or stops nonterminal
-  (unreadable).
+  (unreadable or expired).
 - **No new authority.** Nothing here retires, rebinds or discards remediation. Resume grants no
   remediation authority: the next claim classifies the same journal and holds again.
   The ADR-1296 enrolled-retirement refusal is unchanged (see its amendment note).
@@ -2007,7 +2007,9 @@ instead detached and the successor proceeded.
   run stays queued with the custody-capacity reason. That queued state is not an owner park. Measured: 8
   at L=8, 3 at L=3, 7 more after a park plus Resume.
 - A worker that is online with current presence parks as `recovery_wait` /
-  `retained_continuation_unwitnessed`, uncharged.
+  `retained_continuation_unwitnessed`, uncharged (measured for a continuation claim whose running
+  report never landed). The successor reports `running` before the orphan reclaim, so this arm and the
+  uncharged reset above apply only when that first running report is lost or refused.
 - Run-lifetime bound: this run's own open holds stay at or below L, on the premise that none is
   released. This does not claim that owner aggregate custody is a transactional ceiling, or that the
   owner's other runs are always blocked.
