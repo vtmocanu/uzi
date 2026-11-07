@@ -217,6 +217,22 @@ type Step = <T>(action: () => Promise<T>) => Promise<T>;
 const direct: Step = action => action();
 
 /**
+ * Open a descriptor or directory handle through `step`, run `use` on it and always close it. The handle is
+ * captured INSIDE the stepped action, so a `step` that throws after the open completed (a liveness check in
+ * its finally) still leaves the acquired handle to be closed here.
+ */
+export async function withClosingHandle<H extends { close(): Promise<void> }, T>(step: Step,
+  open: () => Promise<H>, use: (handle: H) => Promise<T>): Promise<T> {
+  const held: { handle?: H } = {};
+  try {
+    const handle = await step(async () => (held.handle = await open()));
+    return await use(handle);
+  } finally {
+    await held.handle?.close();
+  }
+}
+
+/**
  * lstat a regular file, refuse it above `maxBytes`, read exactly its size through one descriptor
  * (opened non-blocking and without following links, so a swapped-in FIFO or link cannot hang or
  * redirect the read), verify the descriptor still names the lstat'd file and that nothing was
@@ -229,8 +245,7 @@ export async function readBoundedIndex(file: string,
   if (!before.isFile()) refused("index is not a regular file");
   if (before.size > BigInt(Math.max(0, options.maxBytes))) limit("index byte limit");
   const size = Number(before.size);
-  const handle = await step(() => fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK));
-  try {
+  return withClosingHandle(step, () => fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK), async handle => {
     const opened = await step(() => handle.stat({ bigint: true }));
     if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino || opened.size !== before.size)
       refused("index changed while opening");
@@ -245,9 +260,7 @@ export async function readBoundedIndex(file: string,
     const after = await step(() => handle.stat({ bigint: true }));
     if (statSignature(after) !== statSignature(opened)) refused("index changed while reading");
     return { ...parseGitIndex(buf, options), signature: statSignature(before), size, bytes: buf };
-  } finally {
-    await handle.close();
-  }
+  });
 }
 
 /**
@@ -261,8 +274,7 @@ export async function readSmallRegularFile(file: string, maxBytes: number,
   if (!before.isFile()) refused("not a regular file");
   if (before.size > BigInt(Math.max(0, maxBytes))) limit("file byte limit");
   const size = Number(before.size);
-  const handle = await step(() => fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK));
-  try {
+  return withClosingHandle(step, () => fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK), async handle => {
     const opened = await step(() => handle.stat({ bigint: true }));
     if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino || opened.size !== before.size)
       refused("file changed while opening");
@@ -276,9 +288,7 @@ export async function readSmallRegularFile(file: string, maxBytes: number,
     if ((await step(() => handle.read(Buffer.alloc(1), 0, 1, size))).bytesRead !== 0) refused("file grew while reading");
     if (statSignature(await step(() => handle.stat({ bigint: true }))) !== statSignature(opened)) refused("file changed while reading");
     return { bytes, signature: statSignature(before) };
-  } finally {
-    await handle.close();
-  }
+  });
 }
 
 /**
