@@ -11,7 +11,12 @@
 // `"at":[3000,2999]` also prints Em/Pm per index and the 7f probe cap pairs). The
 // measured helper is the unchanged PLANNING_CAPTURE_HELPER; instrumented modes only PREPEND a
 // metering preamble to its `-e` program (the technique git-planning-diff.test.ts's meter uses).
-// Nothing here changes a production bound. See the README beside run.sh for metric definitions.
+// `verify` (`{"kind":"verify","out":"/abs/results","rows":[{"label":"...","expect":"completed|phase-evidence|<refusal token>"}]}`,
+// runnable on the host or in a container) re-reads each row's result and term records, writes
+// verify.json and exits nonzero unless every row is valid. `deadlineLift` (validation only, modes
+// full and control) lifts the helper's wall-clock bounds in the spawned helper source; see
+// planning-deadline-lift.ts. Nothing here changes a production bound. See the README beside
+// run.sh for metric definitions.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -21,6 +26,11 @@ import { GitCache, classifyPlanningCaptureError, gitEnv } from "../src/git.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "../src/harness.js";
 import type { Logger } from "../src/log.js";
 import { TickSpawner } from "../src/tick-spawner.js";
+import {
+  LIFTED_COMMAND_TIMER_MS, LIFTED_HELPER_DEADLINE_MS, LIFTED_OUTER_TIMEOUT_MS, LIFTED_SCOPE_TIMEOUT_MS, PRODUCTION_OUTER_TIMEOUT_MS,
+  emptyPhases, isGitArgv, isSizingArgv, liftPlanningHelperDeadline, phaseEvidenceOf, phaseObserverMismatches, verifyRow,
+} from "./planning-deadline-lift.js";
+import type { Phases } from "./planning-deadline-lift.js";
 
 // The opt-in gate (UZI_PLANNING_DISCOVERY_MEASURE=1) is enforced in main() for every job kind
 // except the pure, read-only `model` kind.
@@ -693,10 +703,11 @@ function oomKills(): number | null {
   const m = v === undefined ? null : /^oom_kill (\d+)$/m.exec(v);
   return m ? Number(m[1]) : null;
 }
-function treeRssBytes(rootPid: number): number {
+// Summed VmRSS of rootPid and all its descendants, plus the descendants' pids (root excluded).
+function treeScan(rootPid: number): { rss: number; descendants: number[] } {
   const parent = new Map<number, number>(), rss = new Map<number, number>();
   let entries: string[] = [];
-  try { entries = fs.readdirSync("/proc"); } catch { return 0; }
+  try { entries = fs.readdirSync("/proc"); } catch { return { rss: 0, descendants: [] }; }
   for (const e of entries) {
     if (!/^\d+$/.test(e)) continue;
     const stat = readText(`/proc/${e}/stat`);
@@ -707,16 +718,50 @@ function treeRssBytes(rootPid: number): number {
     const m = /^VmRSS:\s+(\d+) kB$/m.exec(status);
     rss.set(Number(e), m ? Number(m[1]) * 1024 : 0);
   }
-  if (!rss.has(rootPid)) return 0;
+  if (!rss.has(rootPid)) return { rss: 0, descendants: [] };
   let total = 0;
+  const descendants: number[] = [];
   for (const pid of rss.keys()) {
     let p: number | undefined = pid;
     for (let hops = 0; p !== undefined && p > 0 && hops < 64; hops++) {
-      if (p === rootPid) { total += rss.get(pid) ?? 0; break; }
+      if (p === rootPid) { total += rss.get(pid) ?? 0; if (pid !== rootPid) descendants.push(pid); break; }
       p = parent.get(p);
     }
   }
-  return total;
+  return { rss: total, descendants };
+}
+
+function readCmdline(pid: number): string[] {
+  const raw = readText(`/proc/${pid}/cmdline`);
+  return raw === undefined || raw === "" ? [] : raw.split("\0").filter((a, i, all) => a !== "" || i < all.length - 1);
+}
+
+// Cheap parent-side phase observer for lift rows: called from the 10 ms sampler with the helper's
+// current descendants. A missed observation stays null; it is never guessed.
+function observePhases(phases: Phases, helperPid: number, descendants: number[], startedAt: number): void {
+  const t = Date.now() - startedAt;
+  const argvs = new Map<number, string[]>();
+  for (const pid of descendants) argvs.set(pid, readCmdline(pid));
+  if (phases.sizingPid === null) {
+    for (const [pid, argv] of argvs) if (isSizingArgv(argv)) { phases.sizingPid = pid; phases.sizingSeenMs = t; break; }
+  } else if (phases.sizingGoneMs === null) {
+    const argv = argvs.get(phases.sizingPid);
+    if (argv === undefined || !isSizingArgv(argv)) phases.sizingGoneMs = t;
+  }
+  if (phases.sizingGoneMs !== null && phases.postSizingSpawnSeenMs === null) {
+    for (const [pid, argv] of argvs) {
+      if (pid !== phases.sizingPid && isGitArgv(argv) && !argv.includes("cat-file")) { phases.postSizingSpawnSeenMs = t; break; }
+    }
+  }
+  if (phases.indexOpenSeenMs === null) {
+    try {
+      for (const fd of fs.readdirSync(`/proc/${helperPid}/fd`)) {
+        let target: string;
+        try { target = fs.readlinkSync(`/proc/${helperPid}/fd/${fd}`); } catch { continue; }
+        if (target.endsWith("/index")) { phases.indexOpenSeenMs = t; break; }
+      }
+    } catch { /* the helper is gone or its fd table is unreadable */ }
+  }
 }
 
 const nullLog: Logger = {
@@ -739,6 +784,21 @@ interface MeasureJob {
   // harness timeouts) by this factor so a near-cap base can finish under every production cap.
   // Mode full only; not combinable with injectDeadlineAfterSizing.
   deadlineScale?: number;
+  // Validation only, `true`: lift the helper's 28 s deadline and 5 s per-command timer (and the
+  // outer 30 s capture and 60 s scope timers) to ~30 min by rewriting the helper source passed to
+  // the spawner. Modes full (metered) and control (unmetered); not combinable with deadlineScale,
+  // injectDeadlineAfterSizing or limits.
+  deadlineLift?: boolean;
+}
+
+function validateDeadlineLift(job: MeasureJob): boolean {
+  if (job.deadlineLift === undefined) return false;
+  if (job.deadlineLift !== true) throw new Error("deadlineLift must be true when present");
+  if (job.mode !== "full" && job.mode !== "control") throw new Error("deadlineLift requires mode full or control");
+  if (job.deadlineScale !== undefined) throw new Error("deadlineLift and deadlineScale are mutually exclusive");
+  if (job.injectDeadlineAfterSizing === true) throw new Error("deadlineLift and injectDeadlineAfterSizing are mutually exclusive");
+  if (job.limits !== undefined) throw new Error("deadlineLift and limits are mutually exclusive");
+  return true;
 }
 
 function validateDeadlineScale(job: MeasureJob): number {
@@ -783,6 +843,7 @@ function writeJson(p: string, value: unknown): void {
 // Resolves to the job's failure flags (empty when the record is sound).
 async function measure(job: MeasureJob): Promise<string[]> {
   const deadlineScale = validateDeadlineScale(job);
+  const deadlineLift = validateDeadlineLift(job);
   const manifest = readJson<Manifest>(path.join(job.fixture, "manifest.json"));
   if (!manifest) throw new Error(`fixture ${job.fixture} has no manifest`);
   const { root, clone, bare } = layout(job.fixture);
@@ -803,11 +864,14 @@ async function measure(job: MeasureJob): Promise<string[]> {
     oomKillsAtStart: oomKills(), helperPid: null as number | null, treeRssPeak: 0, treeRssDiscoveryPeak: 0,
     cgroupPeakAtBoundary: null as number | null, lastHelper: undefined as HelperMetrics | undefined,
     spawnTmpdir: null as string | null, signals: [] as string[], elapsedMs: 0,
+    phases: emptyPhases(),
   };
   let boundarySeen = false;
   const sample = (): void => {
     if (live.helperPid !== null) {
-      const rss = treeRssBytes(live.helperPid);
+      const scan = treeScan(live.helperPid);
+      const rss = scan.rss;
+      if (deadlineLift) observePhases(live.phases, live.helperPid, scan.descendants, live.startedAt);
       live.treeRssPeak = Math.max(live.treeRssPeak, rss);
       if (!boundarySeen) live.treeRssDiscoveryPeak = Math.max(live.treeRssDiscoveryPeak, rss);
     }
@@ -846,7 +910,7 @@ async function measure(job: MeasureJob): Promise<string[]> {
   // A deadline-scaled validation row stretches the scope timer by the same factor.
   const scope = new AbortController();
   const ownerSignal = AbortSignal.any([ac.signal, scope.signal]);
-  const scopeTimer = setTimeout(() => scope.abort(), 60_000 * deadlineScale);
+  const scopeTimer = setTimeout(() => scope.abort(), deadlineLift ? LIFTED_SCOPE_TIMEOUT_MS : 60_000 * deadlineScale);
   const spawner = new TickSpawner({
     signal: ownerSignal, log: nullLog,
     // Observation only: record the pid and delivered signals; returning undefined keeps real delivery.
@@ -858,10 +922,12 @@ async function measure(job: MeasureJob): Promise<string[]> {
   const wrapped = async (request: BoundaryProcessRequest): Promise<BoundaryProcessHandle> => {
     live.spawnTmpdir = request.env.TMPDIR ?? null;
     let req = request;
-    if (instrumented) {
+    if (instrumented || deadlineLift) {
       const argv = [...request.argv];
       if (argv[1] !== "-e" || typeof argv[2] !== "string") throw new Error("unexpected planning helper argv");
-      argv[2] = preamble(helperPath, job.injectDeadlineAfterSizing === true, deadlineScale) + argv[2];
+      // Lift first, so the lift sees the pristine helper source and never the preamble.
+      if (deadlineLift) argv[2] = liftPlanningHelperDeadline(argv[2]);
+      if (instrumented) argv[2] = preamble(helperPath, job.injectDeadlineAfterSizing === true, deadlineScale) + argv[2];
       req = { ...request, argv };
     }
     const handle = await spawner.spawn(req);
@@ -877,16 +943,23 @@ async function measure(job: MeasureJob): Promise<string[]> {
   if (typeof limitsHolder.planningLimits !== "object" || limitsHolder.planningLimits === null) {
     throw new Error("GitCache.planningLimits is not an object: the harness cannot read the helper's defaults");
   }
-  const validation = job.limits !== undefined || deadlineScale > 1;
-  if (deadlineScale > 1) {
+  const validation = job.limits !== undefined || deadlineScale > 1 || deadlineLift;
+  if (deadlineScale > 1 || deadlineLift) {
     // The outer capture timeout (30 s in capturePlanningDiff) is an argument of the transport
-    // method; multiply it by the scale and otherwise delegate unchanged (same argv, same cwd).
+    // method; multiply it by the scale (or replace it for a lift row) and otherwise delegate
+    // unchanged (same argv, same cwd).
     const holder = cache as unknown as {
       readBoundedPlanningOutput: (cwd: string, argv: readonly string[], timeoutMs?: number) => Promise<Buffer>;
     };
     const original = holder.readBoundedPlanningOutput.bind(cache);
-    holder.readBoundedPlanningOutput = (cwd, argv, timeoutMs) =>
-      original(cwd, argv, timeoutMs === undefined ? undefined : timeoutMs * deadlineScale);
+    holder.readBoundedPlanningOutput = (cwd, argv, timeoutMs) => {
+      if (deadlineLift) {
+        // Fail closed: only the production 30 s outer timeout is replaced.
+        if (timeoutMs !== PRODUCTION_OUTER_TIMEOUT_MS) throw new Error(`deadlineLift: unexpected outer capture timeout ${String(timeoutMs)}`);
+        return original(cwd, argv, LIFTED_OUTER_TIMEOUT_MS);
+      }
+      return original(cwd, argv, timeoutMs === undefined ? undefined : timeoutMs * deadlineScale);
+    };
   }
   if (job.limits !== undefined) {
     cache.setPlanningLimitsForTest({ ...limitsHolder.planningLimits, ...validateLimits(job.limits, limitsHolder.planningLimits) });
@@ -965,6 +1038,12 @@ async function measure(job: MeasureJob): Promise<string[]> {
   if (validation && outcome.kind === "refused" && outcome.token === "invalid_limits") {
     failures.push("VALIDATION_LIMITS_REJECTED: the helper refused the injected limits (invalid_limits)");
   }
+  // Lift rows: the parent-side phase observer decides the evidence; for a metered row the
+  // preamble only ever contradicts it (a phase the observer missed is never a mismatch).
+  const phases = deadlineLift ? { ...live.phases } : null;
+  const outcomeMs = st.outcomeAt === undefined ? null : st.outcomeAt - live.startedAt;
+  const phaseEvidence = deadlineLift ? phaseEvidenceOf(outcome.kind, phases, outcomeMs) : null;
+  if (deadlineLift && instrumented && phases !== null) failures.push(...phaseObserverMismatches(phases, live.startedAt, helper));
   if (failures.length > 0) outcome = { ...outcome, flag: failures.join("; ") };
   const result = {
     label: job.label, spec: manifest.spec, fixture: manifest, mode: job.mode,
@@ -972,6 +1051,11 @@ async function measure(job: MeasureJob): Promise<string[]> {
     // null for production rows; otherwise the helper clock, outer capture timeout and harness
     // scope timer were all stretched by this factor (every cap and bound stays at its value).
     deadlineScale: deadlineScale > 1 ? deadlineScale : null,
+    // null for every row but a lift row, whose helper deadline, per-command timer, outer capture
+    // timeout and harness scope timer were lifted to these values (caps and memory bounds untouched).
+    deadlineLift: deadlineLift ? { helperDeadlineMs: LIFTED_HELPER_DEADLINE_MS, commandTimerMs: LIFTED_COMMAND_TIMER_MS,
+      outerTimeoutMs: LIFTED_OUTER_TIMEOUT_MS, scopeTimeoutMs: LIFTED_SCOPE_TIMEOUT_MS } : null,
+    phases, phaseEvidence,
     limits: { source: job.limits !== undefined ? "job-limits-over-helper-defaults" : "helper-defaults", effective: effectiveLimits,
       entryCap: entryCap?.toString() ?? null, pathByteCap: pathByteCap?.toString() ?? null },
     failed: failures.length > 0, failures,
@@ -1051,7 +1135,8 @@ function report(out: string): void {
     if (term?.oomKilled === true) kind = "oom";
     const token = (r.outcome?.token ? ` \`${r.outcome.token}\`` : "") + (r.outcome?.flag ? ` **FAIL ${r.outcome.flag}**` : "");
     const stretched = typeof r.deadlineScale === "number" ? `validation (deadline ×${r.deadlineScale}; real ${r.captureMs} ms)` : "validation";
-    const mode2 = r.validation === true && !mode.includes("validation") ? `${mode} (${stretched})`
+    const mode2 = r.deadlineLift ? `${base} (validation, deadline lifted, ${r.mode === "control" ? "unmetered" : "metered"})`
+      : r.validation === true && !mode.includes("validation") ? `${mode} (${stretched})`
       : r.validation === true && typeof r.deadlineScale === "number" ? `${mode} [${stretched}]` : mode;
     const entriesCell = ((): string => {
       const f = r.treeEntriesFetched;
@@ -1094,6 +1179,9 @@ type Job =
   | { kind: "generate"; spec: string; dir: string; inputs: string }
   | MeasureJob
   | { kind: "report"; out: string }
+  // Row-validity check over `<out>/<label>.json` + `<label>.term.json` (see verifyRow). Read-only
+  // except verify.json; needs no opt-in env and no docker, so it also runs on the host.
+  | { kind: "verify"; out: string; rows: { label: string; expect: string }[] }
   // Pure description of the analytic charges for one spec (no helper run, no docker). `fixture`
   // (a generated fixture dir) is required for repo and synthetic-N, whose model reads their tree.
   // Caps and `at` are positive integers or decimal strings; `at` may also be an array of them.
@@ -1153,6 +1241,26 @@ function describeModel(job: Extract<Job, { kind: "model" }>): Record<string, unk
   return out;
 }
 
+// Returns whether every row is valid. A missing or unparseable file is an invalid row, never a throw.
+function verify(job: Extract<Job, { kind: "verify" }>): boolean {
+  if (typeof job.out !== "string" || !path.isAbsolute(job.out) || !Array.isArray(job.rows) || job.rows.length === 0) {
+    throw new Error("verify needs an absolute out dir and a non-empty rows array");
+  }
+  const verdicts = job.rows.map((row) => {
+    if (typeof row?.label !== "string" || !/^[A-Za-z0-9._-]+$/.test(row.label) || typeof row.expect !== "string" || row.expect === "") {
+      return { label: String(row?.label), expect: String(row?.expect), valid: false, reasons: ["malformed row spec"] };
+    }
+    const v = verifyRow(readJson<unknown>(path.join(job.out, `${row.label}.json`)),
+      readJson<unknown>(path.join(job.out, `${row.label}.term.json`)), row.label, row.expect);
+    return { label: row.label, expect: row.expect, ...v };
+  });
+  const allValid = verdicts.every((v) => v.valid);
+  writeJson(path.join(job.out, "verify.json"), { allValid, rows: verdicts });
+  const lines = verdicts.map((v) => `${v.valid ? "VALID  " : "INVALID"} ${v.label} [${v.expect}]${v.valid ? "" : ` ${v.reasons.join(" | ")}`}`);
+  process.stdout.write(lines.join("\n") + `\nverify: ${allValid ? "all rows valid" : "INVALID rows present"}\n`);
+  return allValid;
+}
+
 async function main(): Promise<void> {
   const [command, arg] = process.argv.slice(2);
   // `<inline job json>` is accepted for the pure model kind: no job file or opt-in env needed.
@@ -1164,6 +1272,10 @@ async function main(): Promise<void> {
   const job = JSON.parse(inline ?? fs.readFileSync(arg as string, "utf8")) as Job;
   if (job.kind === "model") {
     process.stdout.write(JSON.stringify(describeModel(job), null, 2) + "\n");
+    return;
+  }
+  if (job.kind === "verify") {
+    if (!verify(job)) process.exitCode = 1;
     return;
   }
   if (inline !== undefined || process.env.UZI_PLANNING_DISCOVERY_MEASURE !== "1") {
