@@ -1997,6 +1997,23 @@ cal_run() { # NAME FUNCTION — run a case body in a subshell, capturing its det
 
 cal_files() { ls "$RUNROOT/artifacts/agent-logs"/*."$1" 2>/dev/null || true; }
 
+# cal_bare_errexit — run a bare `capture_agent_logs` under live errexit in a fresh bash process (a
+# subshell inside `||`/`$( )` would silently ignore set -e). Prints a detail line on failure.
+cal_bare_errexit() {
+  local script="$CAL_STATE/bare.sh" out="$CAL_STATE/bare.out" rc=0
+  {
+    echo '#!/usr/bin/env bash'
+    declare -f capture_agent_logs fake_lifecycle_compose
+    echo 'set -euo pipefail'
+    printf 'RUNROOT=%q\nCAL_STATE=%q\nCOMPOSE=(fake_lifecycle_compose)\n' "$RUNROOT" "$CAL_STATE"
+    echo 'capture_agent_logs 42-x lbl2'
+    echo 'echo SENTINEL'
+  } > "$script"
+  bash "$script" > "$out" 2>&1 || rc=$?
+  [ "$rc" = 0 ] || echo "bare errexit run exited $rc"
+  grep -qx SENTINEL "$out" || echo "errexit aborted caller (no SENTINEL)"
+}
+
 cal_before_discard() {
   cal_setup ok outgoing-process
   local rc=0 err
@@ -2018,7 +2035,7 @@ cal_repeat() {
   capture_agent_logs 42-x same
   local files n1 n2
   files="$(cal_files log)"
-  [ "$(printf '%s\n' "$files" | wc -l)" = 2 ] || { echo "expected 2 distinct logs, got: $files"; return 0; }
+  [ "$(printf '%s\n' "$files" | wc -l | tr -d ' ')" -eq 2 ] || { echo "expected 2 distinct logs, got: $files"; return 0; }
   n1="$(basename "$(printf '%s\n' "$files" | sed -n 1p)")"; n2="$(basename "$(printf '%s\n' "$files" | sed -n 2p)")"
   [ "$((10#${n1%%-*}))" -lt "$((10#${n2%%-*}))" ] || echo "NNNN not strictly increasing: $n1 $n2"
   grep -q payload-one "$RUNROOT/artifacts/agent-logs/$n1" || echo "first payload lost"
@@ -2038,9 +2055,7 @@ cal_missing_body() {
   [ -z "$(cal_files log)" ] || echo ".log written on failure"
   [ -z "$(cal_files absent)" ] || echo ".absent written on failure"
   [ -z "$(cal_files log.part)" ] || echo ".part left behind"
-  # bare statement under errexit, outside any if/||/$( ) context
-  ( set -euo pipefail; capture_agent_logs 42-x lbl2; echo SENTINEL ) > "$CAL_STATE/sentinel.out" 2>/dev/null || true
-  grep -qx SENTINEL "$CAL_STATE/sentinel.out" || echo "errexit aborted caller (no SENTINEL)"
+  cal_bare_errexit
 }
 cal_logs_fail() { cal_missing_body logs-fail "read failure: compose logs"; }
 cal_logs_empty() { cal_missing_body logs-empty "empty log output"; }
@@ -2059,8 +2074,7 @@ cal_write_fail() {
   case "$err" in *"MISSING-EVIDENCE: agent logs 42-x/lbl: "*) ;; *) echo "stderr lacks MISSING-EVIDENCE: $err" ;; esac
   case "$err" in *PASS* | *'FAIL '*) echo "message contains PASS/FAIL token" ;; esac
   [ -z "$(find "$RUNROOT" -name '*.log' 2>/dev/null)" ] || echo ".log written despite write failure"
-  ( set -euo pipefail; capture_agent_logs 42-x lbl2; echo SENTINEL ) > "$CAL_STATE/sentinel.out" 2>/dev/null || true
-  grep -qx SENTINEL "$CAL_STATE/sentinel.out" || echo "errexit aborted caller (no SENTINEL)"
+  cal_bare_errexit
 }
 cal_run "capture_agent_logs write failure is reported and returns 0" cal_write_fail
 
@@ -2080,9 +2094,27 @@ cal_absent() {
 }
 cal_run "capture_agent_logs absent agent is expected only with absent-ok" cal_absent
 
+cal_bare_ok() {
+  cal_setup ok some-payload
+  cal_bare_errexit
+}
+cal_run "capture_agent_logs success path is safe as a bare statement under errexit" cal_bare_ok
+
+cal_slot_parse() {
+  cal_setup ok slot-payload
+  local d="$RUNROOT/artifacts/agent-logs" got
+  mkdir -p "$d"
+  : > "$d/.slot-0009"
+  : > "$d/.slot-x"
+  capture_agent_logs 42-x lbl
+  got="$(basename "$(cal_files log)")"
+  [ "$got" = "0010-42-x-lbl.log" ] || echo "expected 0010-42-x-lbl.log, got: $got"
+}
+cal_run "capture_agent_logs numbers past .slot-0009 in decimal and skips non-numeric slots" cal_slot_parse
+
 node --test "$ROOT/e2e/settlement-diagnostic.test.mjs"
 node --test "$ROOT/e2e/recovery-record-projection.test.mjs"
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has at least 203 cases green; a zero-case or
-# partially-red run must exit nonzero.
-[ "$cases" -ge 210 ] && [ "$cases" -eq "$passed" ]
+# Tally guard (the driver.test.sh idiom): a real run has at least 212 cases green (including the
+# capture_agent_logs cal_* cases); a zero-case or partially-red run must exit nonzero.
+[ "$cases" -ge 212 ] && [ "$cases" -eq "$passed" ]

@@ -79,7 +79,7 @@ storage_diagnostic_snapshot() {
 # success), .missing = capture failed (contents = reason), .absent = no agent container, expected
 # (absent-ok). Always returns 0 and guards every command, so it is safe bare under set -e and in traps.
 capture_agent_logs() {
-  local phase="${1:-}" label="${2:-}" mode="${3:-}" dir base slot part log out k n=0 tries=0 rc reason=""
+  local phase="${1:-}" label="${2:-}" mode="${3:-}" dir stem slot part log out k n=0 tries=0 rc reason=""
   if [ -z "${RUNROOT:-}" ] || ! declare -p COMPOSE >/dev/null 2>&1; then
     echo "MISSING-EVIDENCE: agent logs $phase/$label: no compose session" >&2
     return 0
@@ -105,16 +105,16 @@ capture_agent_logs() {
       return 0
     fi
   done
-  base="$(printf '%04d-%s-%s' "$n" "$phase" "$label")"
-  part="$dir/$base.log.part"
-  log="$dir/$base.log"
+  stem="$(printf '%04d-%s-%s' "$n" "$phase" "$label")"
+  part="$dir/$stem.log.part"
+  log="$dir/$stem.log"
   rc=0
   out="$("${COMPOSE[@]}" ps -a -q agent 2>/dev/null)" || rc=$?
   if [ "$rc" -ne 0 ]; then
     reason="read failure: compose ps exit $rc"
   elif [ -z "$out" ]; then
     if [ "$mode" = absent-ok ]; then
-      printf 'agent container absent (expected)\n' > "$dir/$base.absent" 2>/dev/null || true
+      printf 'agent container absent (expected)\n' > "$dir/$stem.absent" 2>/dev/null || true
       echo "agent logs $phase/$label: agent container absent (expected); no snapshot" >&2
       return 0
     fi
@@ -134,7 +134,7 @@ capture_agent_logs() {
   fi
   [ -z "$reason" ] && return 0
   rm -f "$part" 2>/dev/null || true
-  printf '%s\n' "$reason" > "$dir/$base.missing" 2>/dev/null || true
+  printf '%s\n' "$reason" > "$dir/$stem.missing" 2>/dev/null || true
   echo "MISSING-EVIDENCE: agent logs $phase/$label: $reason" >&2
   return 0
 }
