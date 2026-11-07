@@ -14,6 +14,7 @@ import {
   sourceCoreDigest, sourceFenceOf, verifyCertifiedSource, verifyPublishedSource,
   type CompletionSourceFence, type CompletionSourceV2,
 } from "./completion-source.js";
+import { classifyBareFootprint } from "./bare-refusal-diagnostic.js";
 import type { AuthoritySettlement, GitAuthorityHooks } from "./git-authority-hooks.js";
 import type { ShutdownReason } from "./shutdown-barrier.js";
 
@@ -155,6 +156,8 @@ const RECORD_ITEM = "record:";
 /** The ops that create the path they admit: GitCache creates its parent directory right after admission. */
 const SEED_OPS: ReadonlySet<string> = new Set(["seed-canonical", "seed-attempt", "replace"]);
 const MAX_FOOTPRINT = 1024;
+/** Operations whose bare-refusal diagnostic is remembered (and so logged) per process. */
+const MAX_LOGGED_REFUSALS = 256;
 const MAX_ITEM = 512;
 const MAX_RESIDUE = 64;
 
@@ -228,6 +231,10 @@ export class AuthorityRuntime implements AuthorityScope {
   /** Inline settlement applies per owning transaction, and runtime-wide: the owner joins them before A is released. */
   readonly #inline = new Map<AuthorityTransaction, Set<Promise<void>>>();
   readonly #inlineAll = new Set<Promise<void>>();
+  /** Operation ids of the inline applies in {@link #inlineAll}, for the bare-refusal diagnostic only. */
+  readonly #inlineOps = new Set<string>();
+  /** Operation ids the bare-refusal diagnostic already logged (bounded: at most MAX_LOGGED_REFUSALS). */
+  readonly #refusalLogged = new Set<string>();
   /** Transactions whose inline join finished: a settle that still finds one active queues instead of applying. */
   readonly #closing = new WeakSet<AuthorityTransaction>();
   /** The drain transaction in flight (idle or final), if any. */
@@ -1386,8 +1393,49 @@ export class AuthorityRuntime implements AuthorityScope {
       : await peekAuthoritySlot(
         { dataDir: this.#options.lifetime.dataDir, workerToken: this.#options.workerToken }, path.resolve(bare));
     if (slot?.pending?.status === "running") {
+      this.#logBareRefusal(slot, tx !== undefined);
       throw new AuthorityRefusal(`${op}: an unresolved ${slot.pending.kind} (${slot.pending.operation}) covers this bare`);
     }
+  }
+
+  /**
+   * issue #4066 M4: one `bare_slot_refusal` warning per operation per process. Best effort: a failure here (a
+   * throwing logger included) is swallowed and never changes the refusal. It logs no footprint text, path, key or
+   * incarnation: only the classified fields, a digest when the footprint did not parse, and the local ledger state.
+   */
+  #logBareRefusal(slot: SlotSnapshot, inTransaction: boolean): void {
+    try {
+      const pending = slot.pending;
+      if (!pending || this.#refusalLogged.has(pending.operation)) return;
+      if (this.#refusalLogged.size >= MAX_LOGGED_REFUSALS) return;
+      this.#refusalLogged.add(pending.operation);
+      const op = pending.operation;
+      const parsed = classifyBareFootprint(pending.footprint);
+      const incarnation = (inTransaction ? this.#store?.workerIncarnation : undefined)
+        ?? this.authorityIncarnation() ?? processWorkerIncarnation();
+      let local: "queued" | "applying" | "inline" | "open" | "failed" | "none" = "none";
+      if (this.#failed.has(op) || this.#exhausted.has(op)) local = "failed";
+      else if (this.#applying.has(op)) local = "applying";
+      else if (this.#inlineOps.has(op)) local = "inline";
+      else if (this.#late.some((entry) => entry.ops.includes(op))) local = "queued";
+      else if ([...this.#open].some((open) => open.ops.includes(op))) local = "open";
+      const fields: Record<string, unknown> = {
+        operation: op,
+        deletion_class: parsed.deletionClass,
+        subject_run: parsed.subjectRun,
+        generation: parsed.generation,
+        slot_epoch: slot.epoch,
+        pending_status: pending.status,
+        pending_kind: pending.kind,
+        self_owned: slot.owner.worker === incarnation,
+        local_settlement: local,
+        actor: "unknown",
+      };
+      if (parsed.deletionClass === "unparsed") {
+        fields.footprint_digest = createHash("sha256").update(pending.footprint).digest("hex");
+      }
+      this.#options.log?.warn("bare_slot_refusal", fields);
+    } catch { /* diagnostics never change the refusal */ }
   }
 
   async #beginDestructive(paths: readonly string[], op: string): Promise<AuthoritySettlement> {
@@ -1462,11 +1510,15 @@ export class AuthorityRuntime implements AuthorityScope {
         if (tx && !this.#closing.has(tx)) {
           // The ledger is updated inside the tracked promise itself, so the owner's join never observes a settled
           // apply whose obligation is still open.
+          for (const op of record.ops) this.#inlineOps.add(op);
           const applying = apply(tx, outcome).then(
-            () => { this.#open.delete(record); },
+            () => {
+              this.#open.delete(record);
+              for (const op of record.ops) this.#inlineOps.delete(op);
+            },
             (error: unknown) => {
               this.#open.delete(record);
-              for (const op of record.ops) this.#failed.set(op, "settlement_failed");
+              for (const op of record.ops) { this.#inlineOps.delete(op); this.#failed.set(op, "settlement_failed"); }
               throw error;
             });
           this.#trackInline(tx, applying);

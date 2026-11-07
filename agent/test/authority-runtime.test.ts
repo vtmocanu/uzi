@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { describe, it, type TestContext } from "node:test";
@@ -1553,5 +1553,196 @@ describe("issue #4066: finishWorkerShutdown", () => {
     assert.equal(first, again);
     await first;
     assert.equal(logs.filter((l) => l.message === "worker_shutdown_result").length, 1);
+  });
+});
+
+// ---- issue #4066 M4: the bare_slot_refusal diagnostic ---------------------------------------------------------------
+
+describe("issue #4066: the bare_slot_refusal diagnostic", () => {
+  interface Logged { message: string; fields: Record<string, unknown> | undefined }
+  const PIN_REF = "refs/uzi-recovery-pin/run1/4";
+  const CLEANUP = "recovery-cleanup-delete-ref";
+
+  function capture(): { logged: Logged[]; log: { warn(message: string, fields?: Record<string, unknown>): void }; refusals(): Logged[] } {
+    const logged: Logged[] = [];
+    return {
+      logged,
+      log: { warn: (message, fields) => { logged.push({ message, fields }); } },
+      refusals: () => logged.filter((l) => l.message === "bare_slot_refusal"),
+    };
+  }
+
+  async function begin(f: FaultRig, ref = PIN_REF, op = CLEANUP): Promise<{ settlement: AuthoritySettlement; operation: string }> {
+    let settlement!: AuthoritySettlement;
+    await f.rt.withTransaction(async () => { settlement = await f.rt.hooks.beginBareMutation(f.bare, op, [ref]); });
+    const operation = (await peek(f, f.bare))?.pending?.operation;
+    assert.ok(operation);
+    return { settlement, operation };
+  }
+
+  const message = (operation: string): string => `owed-pin: an unresolved bare_mutation (${operation}) covers this bare`;
+
+  it("keeps the refusal message byte for byte and logs the classified fields for the owning worker", async (t) => {
+    const c = capture();
+    const f = await faultRig(t, { log: c.log });
+    const { operation } = await begin(f);
+    await assert.rejects(f.rt.hooks.assertBareClear(f.bare, "owed-pin"), (error: unknown) => {
+      assert.ok(error instanceof AuthorityRefusal);
+      assert.equal(error.message, message(operation));
+      return true;
+    });
+    const [entry] = c.refusals();
+    assert.ok(entry?.fields);
+    const slot = await peek(f, f.bare);
+    assert.deepEqual(entry.fields, {
+      operation, deletion_class: CLEANUP, subject_run: "run1", generation: 4, slot_epoch: slot?.epoch,
+      pending_status: "running", pending_kind: "bare_mutation", self_owned: true, local_settlement: "open", actor: "unknown",
+    });
+    assert.ok(!JSON.stringify(entry.fields).includes(slot!.owner.worker), "the incarnation is never logged");
+    assert.ok(!JSON.stringify(entry.fields).includes(f.bare), "no path is logged");
+  });
+
+  it("reports a foreign owner and no local ledger entry from another worker's runtime", async (t) => {
+    const f = await faultRig(t);
+    const { operation } = await begin(f);
+    const c = capture();
+    const foreign = new AuthorityRuntime({ lifetime: f.lifetime, workerToken: TOKEN, workerIncarnation: randomUUID(), timeoutMs: 5000, log: c.log });
+    await assert.rejects(foreign.hooks.assertBareClear(f.bare, "owed-pin"), (error: unknown) => (error as Error).message === message(operation));
+    const [entry] = c.refusals();
+    assert.equal(entry?.fields?.self_owned, false);
+    assert.equal(entry?.fields?.local_settlement, "none");
+    // Inside a transaction the same record is read through the transactional load.
+    const c2 = capture();
+    const foreign2 = new AuthorityRuntime({ lifetime: f.lifetime, workerToken: TOKEN, workerIncarnation: randomUUID(), timeoutMs: 5000, log: c2.log });
+    await assert.rejects(foreign2.withTransaction(() => foreign2.hooks.assertBareClear(f.bare, "owed-pin")), AuthorityRefusal);
+    assert.equal(c2.refusals()[0]?.fields?.self_owned, false);
+  });
+
+  it("marks self ownership from inside a transaction too", async (t) => {
+    const c = capture();
+    const f = await faultRig(t, { log: c.log });
+    await begin(f);
+    await assert.rejects(f.rt.withTransaction(() => f.rt.hooks.assertBareClear(f.bare, "owed-pin")), AuthorityRefusal);
+    assert.equal(c.refusals()[0]?.fields?.self_owned, true);
+  });
+
+  it("logs once per operation", async (t) => {
+    const c = capture();
+    const f = await faultRig(t, { log: c.log });
+    await begin(f);
+    for (let i = 0; i < 3; i += 1) await assert.rejects(f.rt.hooks.assertBareClear(f.bare, "owed-pin"), AuthorityRefusal);
+    assert.equal(c.refusals().length, 1);
+  });
+
+  it("reports a queued settlement", async (t) => {
+    const c = capture();
+    const f = await faultRig(t, { log: c.log, lateWaitMs: 100 });
+    const { settlement } = await begin(f);
+    const holder = await holdA(f.lifetime);
+    await settlement.settle({ ok: true });
+    await assert.rejects(f.rt.hooks.assertBareClear(f.bare, "owed-pin"), AuthorityRefusal);
+    assert.equal(c.refusals()[0]?.fields?.local_settlement, "queued");
+    holder.release();
+    await holder.done;
+    assert.equal((await f.rt.drainForShutdown({ deadlineAt: Date.now() + 5000 })).result, "drained");
+  });
+
+  it("reports a settlement a drain is applying", async (t) => {
+    const hold = gate();
+    const spliced = gate();
+    const c = capture();
+    const f = await faultRig(t, { log: c.log, lateWaitMs: 5_000, testHooks: { afterLateSplice: async () => { spliced.resolve(); await hold.promise; } } });
+    const { settlement } = await begin(f);
+    await settlement.settle({ ok: true });
+    await spliced.promise;
+    await assert.rejects(f.rt.hooks.assertBareClear(f.bare, "owed-pin"), AuthorityRefusal);
+    assert.equal(c.refusals()[0]?.fields?.local_settlement, "applying");
+    hold.resolve();
+    assert.equal((await f.rt.drainForShutdown({ deadlineAt: Date.now() + 5000 })).result, "drained");
+  });
+
+  it("reports an inline apply paused on its durable write", async (t) => {
+    const c = capture();
+    const f = await faultRig(t, { log: c.log });
+    const written = gate();
+    const release = gate();
+    const callbackReturned = gate();
+    let detached: Promise<void> | undefined;
+    const done = f.rt.withTransaction(async () => {
+      const settlement = await f.rt.hooks.beginBareMutation(f.bare, CLEANUP, [PIN_REF]);
+      f.ctl.pause = { hit: () => written.resolve(), release: release.promise };
+      detached = Promise.resolve().then(() => settlement.settle({ ok: true }));
+      await written.promise;
+      callbackReturned.resolve();
+    });
+    await callbackReturned.promise;
+    await tick();
+    await assert.rejects(f.rt.hooks.assertBareClear(f.bare, "owed-pin"), AuthorityRefusal);
+    assert.equal(c.refusals()[0]?.fields?.local_settlement, "inline");
+    release.resolve();
+    await done;
+    await detached;
+    await f.rt.hooks.assertBareClear(f.bare, "owed-pin");
+  });
+
+  it("reports a settlement whose inline apply was rejected", async (t) => {
+    const c = capture();
+    const f = await faultRig(t, { log: c.log });
+    const { settlement } = await begin(f);
+    f.ctl.failWhen = () => true;
+    await assert.rejects(f.rt.withTransaction(() => settlement.settle({ ok: true })), /injected authority rename failure/);
+    f.ctl.failWhen = undefined;
+    await assert.rejects(f.rt.hooks.assertBareClear(f.bare, "owed-pin"), AuthorityRefusal);
+    assert.equal(c.refusals()[0]?.fields?.local_settlement, "failed");
+  });
+
+  it("digests an unparsed footprint and never logs its text", async (t) => {
+    const c = capture();
+    const f = await faultRig(t, { log: c.log });
+    await begin(f, "refs/x/secret-ish", "recovery-cleanup-delete-ref");
+    await assert.rejects(f.rt.hooks.assertBareClear(f.bare, "owed-pin"), AuthorityRefusal);
+    const fields = c.refusals()[0]?.fields;
+    assert.equal(fields?.deletion_class, "unparsed");
+    assert.equal(fields?.subject_run, "unknown");
+    assert.equal(fields?.generation, "unknown");
+    assert.equal(fields?.footprint_digest, createHash("sha256").update("recovery-cleanup-delete-ref: refs/x/secret-ish").digest("hex"));
+    assert.ok(!JSON.stringify(fields).includes("secret-ish"));
+  });
+
+  it("omits the digest and the generation for a parsed owed ref", async (t) => {
+    const c = capture();
+    const f = await faultRig(t, { log: c.log });
+    await begin(f, `refs/uzi-owed/run9/${"a".repeat(40)}`, "owed-reconcile-delete-ref");
+    await assert.rejects(f.rt.hooks.assertBareClear(f.bare, "owed-pin"), AuthorityRefusal);
+    const fields = c.refusals()[0]?.fields;
+    assert.equal(fields?.deletion_class, "owed-reconcile-delete-ref");
+    assert.equal(fields?.subject_run, "run9");
+    assert.equal(fields?.generation, "unknown");
+    assert.ok(!("footprint_digest" in fields!));
+  });
+
+  it("a logger that throws never changes the refusal", async (t) => {
+    const f = await faultRig(t, { log: { warn: () => { throw new Error("logger down"); } } });
+    const { operation } = await begin(f);
+    await assert.rejects(f.rt.hooks.assertBareClear(f.bare, "owed-pin"), (error: unknown) =>
+      error instanceof AuthorityRefusal && error.message === message(operation));
+  });
+
+  it("an unreadable slot keeps today's error and logs no diagnostic", async (t) => {
+    const c = capture();
+    const f = await faultRig(t, { log: c.log });
+    await begin(f);
+    const slots = path.join(f.root, ".uzi-authority", "slots");
+    const [file] = fs.readdirSync(slots).filter((n) => n.endsWith(".json"));
+    fs.writeFileSync(path.join(slots, file!), "{}\n", { mode: 0o600 });
+    await assert.rejects(f.rt.hooks.assertBareClear(f.bare, "owed-pin"), AuthorityRefusal);
+    assert.equal(c.refusals().length, 0);
+  });
+
+  it("logs nothing when the bare is clear", async (t) => {
+    const c = capture();
+    const f = await faultRig(t, { log: c.log });
+    await f.rt.hooks.assertBareClear(f.bare, "owed-pin");
+    assert.equal(c.logged.length, 0);
   });
 });
