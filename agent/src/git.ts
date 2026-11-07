@@ -11525,6 +11525,11 @@ export class GitCache {
             const bare = lockedBare;
             const g = await this.gatherRetainedUnderLock(bare);
             const candidates = g.records.filter((r) => this.matchesRetainedSelector(r, sel));
+            if (candidates.length === 0 && mode === "plain" && sel.attempt !== "canonical" &&
+                await this.finishOrphanRestoreMarker(g, sel.runId, opts)) {
+              // A completed P exit whose marker removal was interrupted: the retry has now made the metadata durable and removed it.
+              return { kind: "done", sources: [], metadata: "retired" };
+            }
             if (candidates.length !== 1) return refused(candidates.length === 0 ? "not_found" : "ambiguous");
             const rec = candidates[0]!;
             // issue #3644: a restore entry on this branch keeps P and S until the restore-aware exit (plan 3.5), which is S's own
@@ -11768,8 +11773,8 @@ export class GitCache {
   }
 
   /** The metadata half of a restore-aware discard, after every path of `rec` is proven gone. Order is chosen so a crash anywhere
-   *  leaves a state the same discard (or the plan 3.9 table) resumes from; see the inline notes. `onRetired` runs the moment the
-   *  durable metadata write that retires the source has landed, so a later failure still reports the metadata as retired. */
+   *  leaves a state the same discard (or the plan 3.9 table) resumes from; see the inline notes. `onRetired` runs only after the
+   *  durable sync of the metadata write that retires the source, so a later failure (the marker) still reports it as retired. */
   private async finishRestoreExit(
     bare: string, rec: GatheredRecord, plan: Exclude<Awaited<ReturnType<GitCache["planRestoreExit"]>>, { kind: "none" }>,
     removeMarker: ((runId: string) => Promise<void>) | undefined, onRetired: () => void,
@@ -11786,17 +11791,17 @@ export class GitCache {
       onRetired();
       return;
     }
-    // P's discard: the retained-home marker first (a failure keeps everything and is retried), then ONE rename of the config that
-    // clears the keys AND appends the `retired` ledger values. Before the rename nothing changed, so the same call retries
-    // whole; after it nothing is owed. There is no state with P's key cleared and its ledger entry still live.
-    await removeMarker?.(rec.runId);
+    // P's discard: ONE rename of the config that clears the keys AND appends the `retired` ledger values, made durable, and only
+    // then the retained-home marker. Before the rename nothing changed, so the same call retries whole (P's bytes may already be
+    // gone; the marker and ledger evidence still select the exit); after it only the sync and the marker are owed, which the
+    // retry finishes through finishOrphanRestoreMarker. There is no state with P's key cleared and its ledger entry still live.
     const pKey = recoveryCaptureKey(rec.branch);
     const ledgerKey = attemptLedgerKey(rec.branch);
     if (plan.composite) {
       const raw = (await this.resolveBranchJournalUnderLock(bare, rec.branch));
       if (raw.kind !== "composite" || raw.ledger.state !== "retired") throw new RestoreCompositeError("restore entry's attempt is not retired");
     }
-    await this.rewriteConfigAtomically(bare, async tmp => {
+    await this.rewriteConfigAtomically(bare, "the restore exit", async tmp => {
       // Under a tombstone, clearing P's key alone would break the composite and clearing the tombstone first would orphan P's
       // journal: both go in the same rename.
       await this.runGit(bare, ["config", "--file", tmp, pKey, ""]);
@@ -11804,9 +11809,37 @@ export class GitCache {
       else if (plan.window2) await this.runGit(bare, ["config", "--file", tmp, "--add", ledgerKey, retired(plan.window2)]);
       await this.runGit(bare, ["config", "--file", tmp, "--add", ledgerKey, retired({ attemptId: p.attemptId!, clonePath: p.clonePath })]);
     });
-    onRetired();
     await this.syncRestoreWrite(bare);
+    onRetired();
     if (plan.composite && (await this.resolveBranchJournalUnderLock(bare, rec.branch)).kind !== "none") throw new Error("restore exit read-back differs");
+    // The marker goes LAST: the no-entry predecessor plan needs it as evidence, so a failure at any earlier point retries whole,
+    // and a failure here is finished by {@link finishOrphanRestoreMarker} on the retry.
+    await removeMarker?.(rec.runId);
+  }
+
+  /**
+   * The retry of a P exit whose config rewrite already landed (the record is gone) but whose marker removal did not complete:
+   * re-sync the bare config and its directory, then remove the retained-home marker of `runId` once the bare carries no
+   * attribution of the run (no journal or restore entry naming it, no non-retired ledger entry). Returns true only when it
+   * removed the marker; false leaves everything as found. Under the bare lock.
+   */
+  private async finishOrphanRestoreMarker(g: GatheredBare, runId: string, opts: RetainedDiscardOptions): Promise<boolean> {
+    const { hasRetainedHomeMarker, removeRetainedHomeMarker } = opts;
+    if (!hasRetainedHomeMarker || !removeRetainedHomeMarker || opts.lifecycle?.state !== "terminal") return false;
+    if (g.records.some(r => r.runId === runId)) return false;
+    if ([...g.ledger.values()].some(e => e.runId === runId && e.state !== "retired")) return false;
+    for (const item of await this.configEntries(g.barePath)) {
+      const key = item.split("\n", 1)[0]!;
+      const branch = restoreKeyBranch(key);
+      if (branch === undefined) continue;
+      const holder = this.restoreHolder([item], branch);
+      // An emptied value is a cleared entry; an unreadable one (no run id) or this run's own still attributes the run.
+      if (holder !== undefined && (holder.runId === undefined || holder.runId === runId)) return false;
+    }
+    if ((await hasRetainedHomeMarker(runId)) !== true) return false;
+    await this.syncRestoreWrite(g.barePath);
+    await removeRetainedHomeMarker(runId);
+    return true;
   }
 
   /** Read only worker-journaled/ledger-owned heads. Ref files are size-bounded;
@@ -12807,7 +12840,7 @@ export class GitCache {
    * `config.lock` (the same window git's own config writes have), never a partial ledger.
    */
   private async rewriteLedgerAtomically(barePath: string, key: string, values: string[]): Promise<void> {
-    await this.rewriteConfigAtomically(barePath, async tmp => {
+    await this.rewriteConfigAtomically(barePath, "ledger compaction", async tmp => {
       if (values.length === 0) {
         await this.runGit(barePath, ["config", "--file", tmp, "--unset-all", key]);
       } else {
@@ -12819,7 +12852,7 @@ export class GitCache {
 
   /** The lockfile protocol of {@link rewriteLedgerAtomically} for any edit: `edit` changes a private copy of the config, which then
    *  replaces the config in ONE rename (or nothing changes). issue #3644 also uses it to clear two restore-related keys together. */
-  private async rewriteConfigAtomically(barePath: string, edit: (tmpConfig: string) => Promise<void>): Promise<void> {
+  private async rewriteConfigAtomically(barePath: string, label: string, edit: (tmpConfig: string) => Promise<void>): Promise<void> {
     const cfgPath = path.join(barePath, "config");
     const lockPath = `${cfgPath}.lock`;
     // A temp file left by a crashed compaction is inert (never read by git); clear it. Only this
@@ -12834,9 +12867,11 @@ export class GitCache {
       await fs.writeFile(tmp, snapshot, { flag: "wx", mode });
       await edit(tmp);
       await fs.chmod(tmp, mode);
+      const handle = await fs.open(tmp, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      try { await handle.sync(); } finally { await handle.close(); }
       await fs.link(tmp, lockPath);
       try {
-        if (!(await fs.readFile(cfgPath)).equals(snapshot)) throw new Error("the bare config changed during ledger compaction");
+        if (!(await fs.readFile(cfgPath)).equals(snapshot)) throw new Error(`the bare config changed during ${label}`);
         await fs.rename(lockPath, cfgPath);
       } catch (err) {
         await fs.rm(lockPath, { force: true });

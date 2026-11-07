@@ -538,7 +538,7 @@ describe("the exits after each window", () => {
   }
   async function discard(clonePath: string, attempt: string, generation: number, over: Record<string, unknown> = {}) {
     return cache.discardStoppedSource({
-      selector: { runId: RUN, generation, attempt }, confirm: await digestOf(clonePath), holds: { state: "read", holds: [] },
+      selector: { runId: RUN, generation, attempt }, confirm: (over.confirm as string | undefined) ?? await digestOf(clonePath), holds: { state: "read", holds: [] },
       lifecycle: { state: "terminal", status: "failed" }, barePath: bare, ...live, ...over,
     } as never);
   }
@@ -638,17 +638,20 @@ describe("the exits after each window", () => {
     assert.equal((await cache.resolveBranchJournal(bare, BRANCH)).kind, "none");
   });
 
-  it("a failing marker hook keeps every record (incomplete), and the discard resumes", async () => {
+  it("a failing marker hook runs after the metadata is retired and durable, and the retry removes the marker", async () => {
     await cache.seedIndependentAttempt(seedInput({ steps: [] }));
     fs.rmSync(S_PATH, { recursive: true, force: true });
     addLedger(S_ID, S_PATH, "retired");
     await cache.advanceRestoreEntry(bare, BRANCH, "retired");
-    const before = config();
-    const failed = await discard(P_PATH, P_ID, 1, { removeRetainedHomeMarker: async () => { throw new Error("marker busy"); } });
-    assert.notEqual(failed.kind, "done");
-    assert.deepEqual(config(), before, "the tombstone, P's journal and the ledger are all still there");
-    const again = await discard(P_PATH, P_ID, 1, { removeRetainedHomeMarker: async () => {} });
+    const confirm = await digestOf(P_PATH);
+    const failed = await discard(P_PATH, P_ID, 1, { confirm, removeRetainedHomeMarker: async () => { throw new Error("marker busy"); } });
+    assert.equal(failed.kind, "unknown");
+    assert.equal(failed.kind === "unknown" && failed.metadata, "retired");
+    assert.equal((await cache.resolveBranchJournal(bare, BRANCH)).kind, "none", "the tombstone and P's journal went in the one rename");
+    const removed: string[] = [];
+    const again = await discard(P_PATH, P_ID, 1, { confirm, removeRetainedHomeMarker: async (run: string) => { removed.push(run); } });
     assert.equal(again.kind, "done", JSON.stringify(again));
+    assert.deepEqual(removed, [RUN]);
   });
 
   it("another run's discard on the restored branch is blocked, and the restore-aware exit needs a terminal lifecycle", async () => {
@@ -681,53 +684,97 @@ describe("review rework (#3644 m2b): resumable P exit, disposition guards, pin r
     assert.notEqual(ledgerStates().get(S_ID), "live");
   }
 
-  it("window 2: a throw after the config rewrite reports metadata retired and the retry completes", async () => {
+  /** A marker that behaves like the real one: present until removed, so the retry's evidence is what a worker would see. */
+  function statefulMarker(removeFails?: () => boolean) {
+    const m = { present: true, removals: 0 };
+    return {
+      m,
+      over: {
+        hasRetainedHomeMarker: async () => m.present,
+        removeRetainedHomeMarker: async () => { if (removeFails?.()) throw new Error("marker busy"); m.present = false; m.removals++; },
+      },
+    };
+  }
+
+  it("window 2: a failure after the rename and before its sync keeps the marker; the retry syncs, removes it and completes", async () => {
     failSync = n => n === 1;
     await refusal(seedInput({ steps: [] }));
+    const { m, over } = statefulMarker();
     failSync = () => true; // every durability sync after the rewrite throws
     const confirm = await digestOf(P_PATH);
-    const first = await discardP({ confirm });
+    const first = await discardP({ confirm, ...over });
     assert.equal(first.kind, "unknown");
-    assert.equal(first.kind === "unknown" && first.metadata, "retired", "the cleared metadata is reported truthfully");
+    assert.equal(first.kind === "unknown" && first.metadata, "kept", "the retirement is not reported until it is durable");
+    assert.equal(m.present, true, "the marker outlives a rewrite that is not proven durable");
     assert.ok(!rawKey(P_KEY), "P's key was cleared by the same rename that retired the ledger");
     assert.equal(ledgerStates().get(P_ID), "retired");
     assert.equal(ledgerStates().get(S_ID), "retired");
     failSync = undefined;
-    const again = await discardP({ confirm });
-    assert.ok(again.kind !== "refused" || (again.reason === "not_found" && !again.consumers.includes("ledger_live")), JSON.stringify(again));
+    const again = await discardP({ confirm, ...over });
+    assert.equal(again.kind, "done", JSON.stringify(again));
+    assert.equal(again.kind === "done" && again.metadata, "retired");
+    assert.equal(m.present, false);
     assertSettled();
   });
 
-  it("window 2: a failure inside the rewrite changes nothing and the same call completes", async () => {
+  it("window 2: a failure after the sync and before the marker removal reports retired; the retry removes the marker", async () => {
+    failSync = n => n === 1;
+    await refusal(seedInput({ steps: [] }));
+    let fail = true;
+    const { m, over } = statefulMarker(() => fail);
+    const confirm = await digestOf(P_PATH);
+    const first = await discardP({ confirm, ...over });
+    assert.equal(first.kind, "unknown");
+    assert.equal(first.kind === "unknown" && first.metadata, "retired");
+    assert.equal(m.present, true);
+    assert.equal(ledgerStates().get(P_ID), "retired");
+    fail = false;
+    const again = await discardP({ confirm, ...over });
+    assert.equal(again.kind, "done", JSON.stringify(again));
+    assert.equal(m.present, false);
+    assertSettled();
+    const third = await discardP({ confirm, ...over });
+    assert.equal(third.kind === "refused" && third.reason, "not_found", "a finished exit is not found, and removes nothing more");
+    assert.equal(m.removals, 1);
+  });
+
+  it("window 2: a failure inside the rewrite changes nothing, keeps the marker and the same call completes", async () => {
     failSync = n => n === 1;
     await refusal(seedInput({ steps: [] }));
     const before = config();
+    const { m, over } = statefulMarker();
     const i = cache as unknown as { rewriteConfigAtomically(...a: unknown[]): Promise<void> };
     const original = i.rewriteConfigAtomically;
     i.rewriteConfigAtomically = async () => { throw new Error("injected rewrite failure"); };
-    const first = await discardP();
+    const first = await discardP(over);
     i.rewriteConfigAtomically = original;
     assert.notEqual(first.kind, "done");
     assert.equal(first.kind === "unknown" && first.metadata, "kept");
     assert.deepEqual(config(), before);
-    const again = await discardP();
+    assert.equal(m.present, true, "the marker is not removed before the rewrite");
+    assert.equal(fs.existsSync(P_PATH), false, "P's bytes are already gone: the retry still completes on marker and ledger evidence");
+    const again = await discardP(over);
     assert.equal(again.kind, "done", JSON.stringify(again));
+    assert.equal(m.present, false);
     assertSettled();
   });
 
-  it("tombstone: a throw after the rewrite reports metadata retired and the retry is not refused", async () => {
+  it("tombstone: a failure after the rename and before its sync keeps the marker and the retry completes", async () => {
     await cache.seedIndependentAttempt(seedInput({ steps: [] }));
     fs.rmSync(S_PATH, { recursive: true, force: true });
     addLedger(S_ID, S_PATH, "retired");
     await cache.advanceRestoreEntry(bare, BRANCH, "retired");
+    const { m, over } = statefulMarker();
     failSync = () => true;
     const confirm = await digestOf(P_PATH);
-    const first = await discardP({ confirm });
+    const first = await discardP({ confirm, ...over });
     assert.equal(first.kind, "unknown");
-    assert.equal(first.kind === "unknown" && first.metadata, "retired");
+    assert.equal(first.kind === "unknown" && first.metadata, "kept");
+    assert.equal(m.present, true);
     failSync = undefined;
-    const again = await discardP({ confirm });
-    assert.ok(again.kind !== "refused" || (again.reason === "not_found" && !again.consumers.includes("ledger_live")), JSON.stringify(again));
+    const again = await discardP({ confirm, ...over });
+    assert.equal(again.kind, "done", JSON.stringify(again));
+    assert.equal(m.present, false);
     assertSettled();
     assert.equal((await cache.resolveBranchJournal(bare, BRANCH)).kind, "none");
   });
@@ -771,6 +818,15 @@ describe("review rework (#3644 m2b): resumable P exit, disposition guards, pin r
     assert.equal(fs.existsSync(path.join(P_PATH, "later.txt")), true);
   });
 
+  it("a pin deleted from inside beforeSeed refuses at the pin recheck and the pin stays protected", async () => {
+    const error = await refusal(seedInput({ steps: [] }, {
+      beforeSeed: async () => { gitIn(bare, ["update-ref", "-d", `refs/uzi-owed/${RUN}/${pinSha}`]); },
+    }));
+    assert.equal(error.reason, "pin_unbound");
+    assert.equal(fs.existsSync(S_PATH), false, "no clone is seeded");
+    assert.equal(await cache.restoreKeepsRecoveryRef(bare, RUN, { sha: pinSha }), true);
+  });
+
   it("a pin deleted from inside the census callback refuses at window seeding and the pin stays protected", async () => {
     const error = await refusal(seedInput({ steps: [] }, {
       census: async () => { gitIn(bare, ["update-ref", "-d", `refs/uzi-owed/${RUN}/${pinSha}`]); return { ok: true }; },
@@ -810,12 +866,13 @@ describe("the ordinary discard dispositions never reach P or S (#3431 negative)"
     assert.equal(p.parts[0]!.presence, "unsafe");
   });
 
-  it("a discard of S or P through the exit never deletes the other, and an interrupted P exit is resumed by the same call", async () => {
+  it("a discard of S or P through the exit never deletes the other, and an interrupted P exit (P's bytes already gone) is resumed by the same call", async () => {
     await cache.seedIndependentAttempt(seedInput({ steps: [] }));
     fs.rmSync(S_PATH, { recursive: true, force: true });
     addLedger(S_ID, S_PATH, "retired");
     await cache.advanceRestoreEntry(bare, BRANCH, "retired");
-    // The first attempt dies at the marker hook after P's directory was already removed by an earlier, interrupted run.
+    // An earlier, interrupted run already removed P's directory; the first attempt here dies at the marker hook, which now
+    // runs after the metadata write, so the retry finds the record gone and finishes the marker.
     fs.rmSync(P_PATH, { recursive: true, force: true });
     const g = await internals().withLock(bare, () => internals().gatherRetainedUnderLock(bare));
     const confirm = g.records.find(r => r.parts.some(part => part.clonePath === P_PATH))!.digest;
@@ -823,8 +880,8 @@ describe("the ordinary discard dispositions never reach P or S (#3431 negative)"
       lifecycle: { state: "terminal", status: "failed" }, isLivePath: () => false, quiesce: async () => true, barePath: bare } as const;
     const first = await cache.discardStoppedSource({ ...base, removeRetainedHomeMarker: async () => { throw new Error("interrupted"); } } as never);
     assert.notEqual(first.kind, "done");
-    assert.equal((await cache.resolveBranchJournal(bare, BRANCH)).kind, "composite", "nothing was cleared");
-    const second = await cache.discardStoppedSource({ ...base, removeRetainedHomeMarker: async () => {} } as never);
+    assert.equal(first.kind === "unknown" && first.metadata, "retired");
+    const second = await cache.discardStoppedSource({ ...base, hasRetainedHomeMarker: async () => true, removeRetainedHomeMarker: async () => {} } as never);
     assert.equal(second.kind, "done", JSON.stringify(second));
     assert.equal((await cache.resolveBranchJournal(bare, BRANCH)).kind, "none");
   });
