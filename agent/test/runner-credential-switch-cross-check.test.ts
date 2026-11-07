@@ -3071,6 +3071,7 @@ describe("issue #3980: SdkExecutor.reapAttributedProcesses with a gate deadline"
     const started = Date.now();
     const r = await sdk.reapAttributedProcesses({ deadlineAt: started + 300 });
     assert.equal(r.complete, false);
+    assert.equal(abort.signal.aborted, true, "the install abort was requested");
     assert.deepEqual(reaps, []);
     assert.equal(internals.depsJoined, false, "the install was not reported joined");
     assert.ok(Date.now() - started < 2000);
