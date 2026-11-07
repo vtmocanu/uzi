@@ -44,7 +44,7 @@
 #                  container, run the warmup and one noop under the measurement-style label
 #                  selftest__gate, truncate that label's result file to empty, then run the gate. The
 #                  gate must preserve the container (stopped, never removed; PRESERVED.txt) and the
-#                  script exits 6 ("selftest passed: container preserved"), distinct from a real block
+#                  script exits 6 (it prints "GATE_SELFTEST passed: the gate preserved container <id> (<name>)"), distinct from a real block
 #                  (exit 4) and from a selftest failure (exit 5, the gate accepted the empty file). The
 #                  caller removes the container by the name and id printed. Not combinable with any other
 #                  mode variable; no fixtures are exported or generated.

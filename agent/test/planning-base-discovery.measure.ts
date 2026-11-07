@@ -1120,7 +1120,8 @@ function report(out: string): void {
   const labels = new Set<string>();
   for (const f of fs.readdirSync(out)) {
     const m = /^(.+?)\.(json|live\.json|helper\.json|term\.json)$/.exec(f);
-    if (m?.[1] && !f.endsWith(".tmp")) labels.add(m[1]);
+    // verify.json is the verify job's own output, not a measurement record.
+    if (m?.[1] && !f.endsWith(".tmp") && f !== "verify.json") labels.add(m[1]);
   }
   const rows: string[] = [
     "| fixture | mode | mem/cpus | outcome | discovery done | discovery ms | capture ms | tree occ (obs / expected) | treeEntriesFetched (meter; upper bound unless discovery done) | charged entries / path bytes (basis) | discovery object bytes | readSync bytes | helper maxRSS MiB (disc / final) | tree RSS peak MiB (disc / all) | cgroup peak MiB (disc / end) | cancel: settle ms, cleanup |",
