@@ -899,7 +899,7 @@ func TestHTTPClientOnlyReturnsExitError(t *testing.T) {
 		{"start-cli-auth", func(c *HTTPClient) error { _, e := c.StartCLIAuth(context.Background(), "ch", "desc"); return e }},
 		{"poll-cli-auth", func(c *HTTPClient) error { _, e := c.PollCLIAuth(context.Background(), "req", "ver"); return e }},
 		{"create-run", func(c *HTTPClient) error {
-			_, e := c.CreateRun(context.Background(), "p1", 7, nil, nil, false, nil, nil, "")
+			_, e := c.CreateRun(context.Background(), "p1", 7, nil, nil, false, nil, "", nil, "")
 			return e
 		}},
 		{"submit-run-input", func(c *HTTPClient) error {
@@ -1052,7 +1052,7 @@ func TestCreateRunWireBodyOmitsAbsentWaitOnLimit(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, tc.in, nil, false, nil, nil, ""); err != nil {
+			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, tc.in, nil, false, nil, "", nil, ""); err != nil {
 				t.Fatalf("CreateRun: %v", err)
 			}
 			if !strings.Contains(body, `"issue_iid":42`) {
@@ -1100,7 +1100,7 @@ func TestCreateRunWireBodyMrRework(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, tc.in, false, nil, nil, ""); err != nil {
+			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, tc.in, false, nil, "", nil, ""); err != nil {
 				t.Fatalf("CreateRun: %v", err)
 			}
 			if got := strings.Contains(body, "mr_rework_enabled"); got != tc.wantPresent {
@@ -1148,7 +1148,7 @@ func TestCreateRunWireBodyCredentialOverride(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, nil, false, nil, tc.in, ""); err != nil {
+			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, nil, false, nil, "", tc.in, ""); err != nil {
 				t.Fatalf("CreateRun: %v", err)
 			}
 			if got := strings.Contains(body, "credential_override"); got == tc.wantAbsent {
@@ -1252,7 +1252,7 @@ func TestCreateRunWireBodyForce(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, nil, tc.in, nil, nil, ""); err != nil {
+			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, nil, tc.in, nil, "", nil, ""); err != nil {
 				t.Fatalf("CreateRun: %v", err)
 			}
 			if got := strings.Contains(body, "force"); got != tc.wantPresent {
@@ -1483,6 +1483,7 @@ func TestCreateRunWireBodySeededPlan(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		seed         *CreateRunSeed
+		agentSource  string
 		wantContains []string
 		wantAbsent   []string
 	}{
@@ -1527,6 +1528,12 @@ func TestCreateRunWireBodySeededPlan(t *testing.T) {
 			wantContains: []string{`"planned_commit":"abc123def456"`},
 			wantAbsent:   []string{"require_base"},
 		},
+		{
+			name:         "source only: agent_selection without plan_md",
+			agentSource:  "repo",
+			wantContains: []string{`"agent_selection":{"source":"repo","exclusions":[]}`},
+			wantAbsent:   []string{"plan_md", "planned_commit", "require_base"},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var body string
@@ -1539,7 +1546,7 @@ func TestCreateRunWireBodySeededPlan(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, nil, false, tc.seed, nil, ""); err != nil {
+			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, nil, false, tc.seed, tc.agentSource, nil, ""); err != nil {
 				t.Fatalf("CreateRun: %v", err)
 			}
 			for _, want := range tc.wantContains {

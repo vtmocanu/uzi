@@ -82,7 +82,7 @@ func TestManualIssueCreationIgnoresHarnessLabels(t *testing.T) {
 		createRunResult: store.Run{ID: uuid.New()},
 	}
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "body", nil, nil, false, nil, nil, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "body", nil, nil, false, nil, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if fs.createRunParams == nil || fs.createRunParams.Harness != string(HarnessClaude) {

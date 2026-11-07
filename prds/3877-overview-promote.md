@@ -1,6 +1,6 @@
 # PRD #3877: Promote the new Overview and retire the old one
 
-**Status**: Draft, parked (`Later`). Child of epic #3873. Blocked by: #3878, #3879, #3880, #3881 and **the maintainer's trial verdict** (brief open decision 1). #3875 and #3876 are not blockers. Not dispatchable until the verdict is recorded on #3873.
+**Status**: Draft, parked (`Later`). Child of epic #3873. Blocked by: #3878, #3879, #3880, #3881, the preview follow-ups #4052, #4041, #4040 and #4042 (they target `/overview/next`), and **the maintainer's trial verdict** (brief open decision 1). #3875 and #3876 are not blockers. Not dispatchable until the verdict is recorded on #3873.
 
 **Design brief**: `prds/3873-overview-redesign.md`. **Design mock**: `prds/mockups/3873-overview-redesign-mock.html`; the promoted page must still match it (brief mock contract).
 
@@ -50,7 +50,7 @@ New Overview features; the per-user Tokens, Out and Cost share columns (dropped 
 
 ### M1: promote and retire
 
-**Blocked by**: #3878, #3879, #3880, #3881 and the recorded verdict.
+**Blocked by**: #3878, #3879, #3880, #3881, #4052, #4041, #4040, #4042 and the recorded verdict.
 
 The route swap, the redirect, deletions, docs, the moved banner exception, tests.
 
