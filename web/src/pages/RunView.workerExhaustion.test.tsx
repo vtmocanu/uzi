@@ -55,6 +55,7 @@ it.each([0, 3])("renders limit %s and historical evidence even after captures di
   expect(screen.getByText("Worker recovery needs your decision")).toBeTruthy();
   expect(screen.getByText(`Automatic recovery limit: ${limit}. Used: ${limit}. Remaining: 0.`)).toBeTruthy();
   expect(screen.getByText("Lifetime automatic requeues: 8.")).toBeTruthy();
+  expect(screen.queryByText(/Resume starts another recovery episode/)).toBeNull();
   expect(screen.getByText("The server recorded checkpoint abc123 before this hold. Current availability and the latest local edits are not verified.")).toBeTruthy();
   expect(screen.getByText("A recovery capture was recorded as available at 2026-10-07T04:00:00Z. It may later expire or be discarded; it may not contain the latest local edits.")).toBeTruthy();
   expect(screen.getByText(/Publication is pending or uncertain/)).toBeTruthy();
@@ -246,6 +247,7 @@ it.each([null, "2099-01-01T00:00:00Z", "2020-01-01T00:00:00Z", "invalid"])("adop
   expect(screen.getByText(/remediation record refused source use, so the agent did not start/, { selector: "p" })).toBeTruthy();
   expect(screen.getByText(/Local work and its custody are preserved/, { selector: "p" })).toBeTruthy();
   expect(screen.getByText(/This hold has no scheduled retry. Only the run owner can Resume or Cancel/)).toBeTruthy();
+  expect(screen.getByText("Resume starts another recovery episode. If the underlying block persists, the run can hold again. Each new claim adds a custody hold. Resolve the cause before resuming.")).toBeTruthy();
   expect(container.textContent).not.toMatch(/retry automatically|retrying in|retry in|Automatic retry is due|Retry timing is unavailable/i);
   const notice = container.querySelector('div.sr-only[role="status"]')!;
   await waitFor(() => expect(notice.textContent).toMatch(/Integrity hold/));

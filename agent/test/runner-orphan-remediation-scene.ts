@@ -175,10 +175,11 @@ export async function scene(t: TestContext, o: SceneOptions): Promise<Scene> {
   };
   const runner = mk();
   const entries: Error[] = [];
-  const release = t.mock.method(git, "releaseAttemptInPlace");
-  const retire = t.mock.method(git, "retireRunnerClone");
-  const detach = t.mock.method(git, "detachTerminalRetained");
-  const handoff = t.mock.method((runner as unknown as { recovery: RecoveryCoordinator }).recovery, "retireCompletedSourceForHandoff");
+  // Aggregate effects across the original and cold caches/coordinators, so restart assertions watch both.
+  const release = [t.mock.method(git, "releaseAttemptInPlace")];
+  const retire = [t.mock.method(git, "retireRunnerClone")];
+  const detach = [t.mock.method(git, "detachTerminalRetained")];
+  const handoff = [t.mock.method((runner as unknown as { recovery: RecoveryCoordinator }).recovery, "retireCompletedSourceForHandoff")];
   const watch = (r: RunRunner): void => {
     const real = (r as unknown as { reclaimTerminalOrphan: (...a: unknown[]) => Promise<void> }).reclaimTerminalOrphan.bind(r);
     (r as unknown as { reclaimTerminalOrphan: unknown }).reclaimTerminalOrphan = (...a: unknown[]) => {
@@ -212,14 +213,20 @@ export async function scene(t: TestContext, o: SceneOptions): Promise<Scene> {
       checkpointTestHooks: { retryBackoffMs: [0, 0] },
     });
     Object.assign(r, { attemptPaths: o.attemptPaths });
+    release.push(t.mock.method(cold, "releaseAttemptInPlace"));
+    retire.push(t.mock.method(cold, "retireRunnerClone"));
+    detach.push(t.mock.method(cold, "detachTerminalRetained"));
+    handoff.push(t.mock.method((r as unknown as { recovery: RecoveryCoordinator }).recovery, "retireCompletedSourceForHandoff"));
     watch(r);
     return r;
   };
   const s: Scene = {
     iid, branch, key, bare, ownerRun, clone, attemptId, tip: flagged, claim, runner, lines: recorded.lines as Array<Record<string, unknown>>,
     entered, entries, flight: undefined, beforeReclaim: undefined, forwardFix, coldRunner, quiesceBlocked,
-    calls: { release: () => release.mock.callCount(), retire: () => retire.mock.callCount(), detach: () => detach.mock.callCount(),
-      handoff: () => handoff.mock.callCount(), quiesce: quiesceCalls },
+    calls: { release: () => release.reduce((n, spy) => n + spy.mock.callCount(), 0),
+      retire: () => retire.reduce((n, spy) => n + spy.mock.callCount(), 0),
+      detach: () => detach.reduce((n, spy) => n + spy.mock.callCount(), 0),
+      handoff: () => handoff.reduce((n, spy) => n + spy.mock.callCount(), 0), quiesce: quiesceCalls },
     durable: () => execFileSync("git", ["-C", bare, "config", "--local", "--get-regexp", "^uzi-"], { env: ENV, encoding: "utf8" }),
     journalRaw: rawJournal,
     source,

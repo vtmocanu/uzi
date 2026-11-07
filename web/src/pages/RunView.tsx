@@ -1552,6 +1552,9 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
         {memoryHeld && " Only the run owner can resume or cancel this run."}{" "}
         This hold has no scheduled retry. Credential changes, messages and capture expiry do not release it.</>}
       </p>
+      {adoptionFailed && <p className="mt-1.5 text-xs text-warn">
+        Resume starts another recovery episode. If the underlying block persists, the run can hold again. Each new claim adds a custody hold. Resolve the cause before resuming.
+      </p>}
       {idleStall && <p className="mt-1.5 text-xs text-muted">Resume starts a fresh wall and resets the idle-stall count. Cancel ends this run. Resume requests an attempt; success is not assured.</p>}
       {!retained && <p className="mt-1.5 text-xs text-muted">
         {memoryHeld

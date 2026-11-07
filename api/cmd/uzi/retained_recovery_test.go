@@ -398,6 +398,7 @@ func TestRetainedAdoptionCLI(t *testing.T) {
 			copy := out + errout
 			requireWorkerCopy(t, copy, "integrity hold", "remediation record refused source use",
 				"local work and custody preserved", "owner-held", "no automatic resume",
+				"another recovery episode", "can hold again", "new claim adds a custody hold", "Resolve the cause before resuming",
 				"uzi run resume r1", "uzi run cancel r1", "availability")
 			for _, bad := range []string{"timed retry", "2099-", "fresh allowance", "contains the latest work"} {
 				if strings.Contains(copy, bad) {
@@ -498,6 +499,7 @@ func TestRetainedAdoptionTUI(t *testing.T) {
 			out := stripANSI(m.View().Content)
 			requireWorkerCopy(t, out, "Integrity hold", "remediation record refused source use",
 				"Local work and custody preserved", "no automatic resume", "owner Resume/Cancel",
+				"another recovery episode", "can hold again", "new claim adds a custody hold", "Resolve the cause before resuming",
 				"uzi run resume r1", "uzi run cancel r1", "availability and latest edits unverified")
 			for _, line := range strings.Split(out, "\n") {
 				if visualWidth(line) > 60 {

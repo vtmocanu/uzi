@@ -118,7 +118,7 @@ describe("readOrphanJournalFence remediation classification", () => {
     assert.deepEqual(await cache.readOrphanJournalFence(bare, BRANCH, RUN, clone + "-x"), { state: "changed" });
     const j = journal() as { remediationRecovery: Record<string, unknown> };
     writeJournal({ ...j, remediationRecovery: { ...j.remediationRecovery, attemptId: "other" } });
-    await assert.rejects(cache.readOrphanJournalFence(bare, BRANCH, RUN, clone));
+    await assert.rejects(cache.readOrphanJournalFence(bare, BRANCH, RUN, clone), /^Error: invalid remediation recovery$/);
     writeJournal({ ...j, remediationRecovery: { ...j.remediationRecovery, unexpected: 1 } });
     await assert.rejects(cache.readOrphanJournalFence(bare, BRANCH, RUN, clone), /remediation/);
   });

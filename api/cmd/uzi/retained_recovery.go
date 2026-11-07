@@ -51,6 +51,9 @@ func recoveryDecisionLine(r apitypes.RunDTO) string {
 		state = recoveryDecisionName(r) + " · timed retry not before " + r.RecoveryRetryNotBefore.UTC().Format(time.RFC3339) + "; retry may still be pending"
 	}
 	guidance := idleStallResumeGuidance(r)
+	if strOr(r.RecoveryWaitCause, "") == retainedRecoveryAdoptionFailedCause {
+		guidance = "Resume starts another recovery episode. If the block persists, the run can hold again. Each new claim adds a custody hold. Resolve the cause before resuming."
+	}
 	if guidance != "" {
 		guidance = " · " + guidance
 	}
@@ -66,6 +69,10 @@ func recoveryDecisionTUILines(r apitypes.RunDTO) []string {
 			"Adoption or a remediation record refused source use.",
 			"Local work and custody preserved.",
 			"Owner-held · no automatic resume.",
+			"Resume starts another recovery episode.",
+			"If the block persists, the run can hold again.",
+			"Each new claim adds a custody hold.",
+			"Resolve the cause before resuming.",
 			"Owner Resume or Cancel:",
 			"Resume: uzi run resume " + cellText(r.ID),
 			"Cancel: uzi run cancel " + cellText(r.ID) + " (terminal)",
