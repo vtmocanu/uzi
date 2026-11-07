@@ -377,6 +377,9 @@ describe("OverviewNext issue work scope switch", () => {
       expect.soft(t.right, "right of the note").toBeGreaterThanOrEqual(note.getBoundingClientRect().right - 0.5);
       expect.soft(t.left, "inside the card (left)").toBeGreaterThanOrEqual(c.left);
       expect.soft(t.right, "inside the card (right)").toBeLessThanOrEqual(c.right);
+      // Far right: flush with the card's content box (its right edge minus the padding).
+      const contentRight = c.right - parseFloat(getComputedStyle(card).paddingRight) - parseFloat(getComputedStyle(card).borderRightWidth);
+      expect.soft(Math.abs(t.right - contentRight), "flush with the card's content edge").toBeLessThanOrEqual(1);
       expect(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(
         window.innerWidth,
       );
