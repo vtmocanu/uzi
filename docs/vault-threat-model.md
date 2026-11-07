@@ -216,7 +216,8 @@ and a `vault_only` link grants no access.
   it parks on `credentials_reset` (a job, judge or cross_check claim fails
   instead). A run created while the reset transaction is still open is not
   covered by this check, since the reset marker carries the transaction's
-  start time. A running run's
+  start time: if its claim opened the old credential before the reset
+  committed, it is delivered on that credential. A running run's
   Codex refresh writes against a deleted account fail closed. Queued runs are
   not claimed until the new vault exists and is unlocked. After that, a
   Claude-harness or chat run created before the reset that finds no model
