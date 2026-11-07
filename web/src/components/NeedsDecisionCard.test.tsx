@@ -135,12 +135,15 @@ describe("NeedsDecisionCard", () => {
 
     it("masks the repo name in demo mode and shows it otherwise", () => {
       const over = { repo_path: "acme-corp/secret-repo", forge_type: "github" };
-      mount([prItem(over)], true);
+      const { container } = mount([prItem(over)], true);
       expect(screen.getByRole("link", { name: "demo/secret-repo #12" })).toBeTruthy();
       expect(screen.queryByText(/acme-corp/)).toBeNull();
+      // The hover title is a render sink textContent cannot see.
+      expect(container.querySelector("[data-pr-repo]")?.getAttribute("title")).toBe("demo/secret-repo");
       cleanup();
-      mount([prItem(over)], false);
+      const shown = mount([prItem(over)], false);
       expect(screen.getByRole("link", { name: "acme-corp/secret-repo #12" })).toBeTruthy();
+      expect(shown.container.querySelector("[data-pr-repo]")?.getAttribute("title")).toBe("acme-corp/secret-repo");
     });
 
     it("omits the repo part when the run has no repo path", () => {
@@ -160,8 +163,10 @@ describe("NeedsDecisionCard", () => {
         const { container } = mount([prItem({ repo_path: path, forge_type: "github" })], demo);
         const name = demo ? "demo/repo #12" : "acme/repo #12";
         expect(screen.getByRole("link", { name }).textContent).toBe(name);
+        expect(container.querySelector("[data-pr-repo]")?.getAttribute("title")).toBe(demo ? "demo/repo" : "acme/repo");
         fireEvent.click(screen.getByRole("button", { name: "Review PRs" }));
         expect(container.textContent).not.toContain(RLO);
+        for (const el of container.querySelectorAll("[title]")) expect(el.getAttribute("title")).not.toContain(RLO);
       });
 
       it(`strips it from a single row's repo text (demo=${demo})`, () => {
