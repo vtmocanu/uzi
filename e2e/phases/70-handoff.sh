@@ -57,6 +57,7 @@ if [ "$EXECUTOR" = stub ]; then
     else
       unset UZI_E2E_RECOVERY_FAST_REDRIVE
     fi
+    capture_agent_logs 70-handoff before-restore-recreate
     if ! "${COMPOSE[@]}" up -d --wait --no-deps --force-recreate agent >/dev/null || ! wait_worker_online; then
       echo 'handoff timing restore failed: worker recreation or registration failed' >&2
       status=1
@@ -65,6 +66,7 @@ if [ "$EXECUTOR" = stub ]; then
   }
   trap restore_handoff_recovery_timing EXIT
   export UZI_E2E_RECOVERY_FAST_REDRIVE=1
+  capture_agent_logs 70-handoff before-fast-redrive-recreate
   "${COMPOSE[@]}" up -d --wait --no-deps --force-recreate agent >/dev/null || fail "handoff: fast recovery worker recreation failed"
   wait_worker_online || fail "handoff: fast recovery worker registration failed"
 fi

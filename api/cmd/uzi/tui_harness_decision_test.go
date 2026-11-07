@@ -32,6 +32,15 @@ func harnessDecisionAutoScene(dark bool, now time.Time) tuiModel {
 		HarnessDecision: autoSoonestResetDecision()}, nil)
 }
 
+// harnessDecisionExcludedScene shows the collapsed form: no usage was read.
+func harnessDecisionExcludedScene(dark bool, now time.Time) tuiModel {
+	m := uxModel(&uzicli.FakeClient{}, detailRunID, dark)
+	m.height = 50
+	return applyDetail(m, apitypes.RunDTO{ID: detailRunID, Kind: "issue", Harness: "claude", Status: "completed", Health: "ok",
+		IssueTitle: "Overflow not considered at creation", StartedAt: tp(now.Add(-time.Minute)),
+		HarnessDecision: &apitypes.HarnessDecisionDTO{Preferred: "claude", Chosen: "claude", Reason: "excluded"}}, nil)
+}
+
 func autoSoonestResetDecision() *apitypes.HarnessDecisionDTO {
 	cs, xs, cm, xm := 80.0, 90.0, 80.0, 90.0
 	claudeReset := time.Date(2026, 11, 9, 4, 0, 0, 0, time.UTC)
@@ -103,6 +112,17 @@ func TestRailHarnessDecisionSnapshotAndBudget(t *testing.T) {
 	m.detail.run.HarnessDecision = &apitypes.HarnessDecisionDTO{Preferred: "claude", Chosen: "claude", Reason: "preferred"}
 	if got := stripANSI(m.railHarnessDecision(0)); !strings.Contains(got, "preferred score: unknown\nother score: unknown") || !strings.Contains(got, "pref measured: unknown") {
 		t.Fatalf("unknown collapsed to zero: %q", got)
+	}
+	// off and excluded never read usage: the rail says so instead of eight empty readings.
+	for reason, note := range map[string]string{"excluded": "overflow not considered", "off": "overflow off in settings"} {
+		m.detail.run.HarnessDecision = &apitypes.HarnessDecisionDTO{Preferred: "claude", Chosen: "claude", Reason: reason}
+		want := "HARNESS at creation\npreferred: claude\nchosen: claude\nreason: " + reason + "\n" + note
+		if got := stripANSI(m.railHarnessDecision(0)); got != want {
+			t.Fatalf("%s: got %q want %q", reason, got, want)
+		}
+		if visualWidth(note) > 26 {
+			t.Fatalf("%s note wider than the rail: %q", reason, note)
+		}
 	}
 }
 

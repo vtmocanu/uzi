@@ -142,6 +142,37 @@ func TestSettingsGetHarnessOverflow(t *testing.T) {
 	}
 }
 
+func TestRunGetHarnessDecisionUnmeasured(t *testing.T) {
+	readings := []string{"score:", "measured:", "held:", "reset:"}
+	for reason, note := range map[string]string{"excluded": "overflow not considered", "off": "overflow off in settings", "unknown_usage": ""} {
+		t.Run(reason, func(t *testing.T) {
+			r := apitypes.RunDTO{ID: "snapshot", Harness: "claude", Status: "completed",
+				HarnessDecision: &apitypes.HarnessDecisionDTO{Preferred: "claude", Chosen: "claude", Reason: reason}}
+			fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"snapshot": r}}
+			out, _, code := runCLI(t, fakeEnv(fc), "run", "get", "snapshot")
+			if code != 0 {
+				t.Fatalf("code=%d out=%s", code, out)
+			}
+			if !strings.Contains(out, "at creation: reason: "+reason) {
+				t.Fatalf("reason row missing: %s", out)
+			}
+			// unknown_usage attempted the reads, so its unknowns are the finding and stay.
+			measured := note == ""
+			if measured {
+				note = "preferred score: unknown"
+			}
+			if !strings.Contains(out, "at creation: "+note) {
+				t.Errorf("missing %q in %s", note, out)
+			}
+			for _, row := range readings {
+				if strings.Contains(out, row) != measured {
+					t.Errorf("reading %q shown=%t, want %t:\n%s", row, !measured, measured, out)
+				}
+			}
+		})
+	}
+}
+
 func TestRunGetHarnessDecision(t *testing.T) {
 	zero, hundred, measured := 0.0, 100.0, 37.5
 	resetA := time.Date(2026, 11, 9, 4, 0, 0, 0, time.UTC)

@@ -102,6 +102,7 @@ $(printf '%s' "$tc_out" | tail -n 15)"
   # keystone bounded-wait bridges any residual daemon-vs-worker start race.
   say "PRD #83 M2 (3): the worker self-detects the sidecar and reports the capability"
   printf 'UZI_DIND_SOCKET=/run/dind/docker.sock\n' >> "$ENVFILE"
+  capture_agent_logs 49-docker-sidecar before-recreate-dind
   "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null 2>&1 \
     || fail "could not recreate the agent with UZI_DIND_SOCKET set"
   # Wait for the recreated worker to boot, probe (with the readiness wait), and log its wiring.

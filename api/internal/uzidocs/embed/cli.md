@@ -3327,8 +3327,13 @@ never changes an existing run or resume. See
 [rate limits](./rate-limits.md#how-overflow-compares-headroom) for selected
 accounts, Claude aggregation and capacity holds.
 
-`uzi run get <id>` shows `HARNESS_PICK` rows headed `at creation:`. The last
-two rows are the weekly resets, `pref reset:` and `other reset:`, or
+`uzi run get <id>` shows `HARNESS_PICK` rows headed `at creation:`. An `off`
+or `excluded` decision was recorded before any usage was read, so it shows
+only `preferred:`, `chosen:`, `reason:` and one line saying overflow was off
+(`overflow off in settings`) or not considered (`overflow not considered`);
+the stored reason does not say which exclusion applied, and `--json` still
+carries every field. For every other
+reason the last two rows are the weekly resets, `pref reset:` and `other reset:`, or
 `claude reset:` and `codex reset:` for an `auto_*` reason (whose score,
 measured and held rows are likewise labelled `claude` and `codex` instead of
 `preferred`/`pref` and `other`). A reset reads as an RFC3339 UTC timestamp, or `unknown`. The TUI detail rail has **HARNESS at creation**, fitted as a whole block
