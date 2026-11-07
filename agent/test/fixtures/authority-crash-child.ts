@@ -46,7 +46,7 @@ export interface ChildConfig {
   // issue #4066 shutdown-barrier scenarios (late-queue, late-close-inline, pin-cleanup). The SIGTERM handler mirrors
   // main.ts: arm the result observer, abort, join the scenario producer, await finishWorkerShutdown, report.
   /** late-queue: which late path the scenario exercises. */
-  lateMode?: "plain" | "a1" | "a2" | "a3" | "b2";
+  lateMode?: "plain" | "a1" | "a2" | "a3" | "a4" | "b2";
   /** The second runner-uid delete's barrier (late-queue a1) and its clone. */
   barrier2?: Barrier;
   branch2?: string;
@@ -108,12 +108,13 @@ function rmSpawner(rigs: Barrier[]): (command: string, args: string[]) => Return
  */
 async function runShutdownScenario(cfg: ChildConfig): Promise<void> {
   const lifetime = await acquireWorkerLifetime(cfg.dataDir, testLockOptions());
-  const writeGate = { armed: false, faultRename: false, reached: undefined as (() => void) | undefined };
+  const writeGate = { armed: false, faultRename: false, faultAlways: false, reached: undefined as (() => void) | undefined };
   const realRename = (from: string, to: string): Promise<void> => fsp.rename(from, to);
   const ops: AuthorityFsOps = {
     syncFile: (handle) => handle.sync(),
     syncDir: (handle) => handle.sync(),
     rename: async (from, to) => {
+      if (writeGate.faultAlways) throw new Error("injected permanent authority rename failure");
       if (writeGate.faultRename) { writeGate.faultRename = false; throw new Error("injected authority rename failure"); }
       if (writeGate.armed) {
         writeGate.armed = false;
@@ -179,6 +180,8 @@ async function runShutdownScenario(cfg: ChildConfig): Promise<void> {
     signalled = true;
     say("SIGTERM-HANDLER");
     const deadlineAt = Date.now() + (cfg.shutdownBudgetMs ?? 1_500);
+    // Mirrors main.ts shutdownRuntime: the budget is fixed at the signal, before the producer is joined.
+    rt.beginShutdown(deadlineAt);
     const observer = armShutdownResultDeadline({ deadlineAt, log: shutdownLog, snapshot: () => rt.snapshot() });
     abort.abort();
     void (async () => {
@@ -211,6 +214,7 @@ async function runShutdownScenario(cfg: ChildConfig): Promise<void> {
     if (mode === "a1") await deleteClone(cfg.branch2!, cfg.key2!, cfg.runId2!);
     if (mode === "a1") spliceHook = true;
     if (mode === "a3") writeGate.faultRename = true;
+    if (mode === "a4") writeGate.faultAlways = true;
     if (mode === "a2") {
       // A holder of A that is NOT runtime.withTransaction: the late settlement can only queue behind it.
       let holding!: () => void;

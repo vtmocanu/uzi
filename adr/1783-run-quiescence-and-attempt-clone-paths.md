@@ -1586,8 +1586,10 @@ that sync the rename is either lost (the previous `running` slot survives) or ke
 
 The #3404 and #3645 residuals stand. An unresolved record is refused indefinitely
 and there is still no generic force-clear; the guarded operator discard is the only
-takeover. An `incomplete` shutdown leaves the record `running`, and a successor
-refusing the footprint is the intended fail-closed answer. A bounded
+takeover. An `incomplete` result never certifies anything: any unresolved record
+keeps its protections (a successor still refuses it, the intended fail-closed
+answer), while a write already started may still complete after the diagnostic;
+`incomplete` can also occur with no enrolled operation. A bounded
 `bare_slot_refusal` warning (once per operation per process, no paths or footprint
 text) now says which kind of record a refusal met.
 

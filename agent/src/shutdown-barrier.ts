@@ -9,8 +9,9 @@ import type { Logger } from "./log.js";
 // not finished, applied inline by code detached from the transaction that owned it, or owed by a child or a pin
 // continuation the caller's deadline abandoned. The barrier joins all of that for real, seals new authority
 // transactions, drains what is queued and reports ONE decision (`worker_shutdown_result`): drained, or incomplete
-// with fixed reasons. It never cancels a join and never throws. An incomplete shutdown leaves the durable record
-// `running` (fail closed): a successor refuses the footprint, which is the only safe answer.
+// with fixed reasons. It never cancels a join and never throws. An incomplete result never certifies anything: any
+// unresolved record keeps its protections (a successor still refuses it), while a write already started may still
+// complete after the diagnostic; incomplete can also occur with no enrolled operation.
 //
 // Failure model. A settlement is durable once its slot was written with writeDurable and the directory sync
 // returned. The proofs are process-crash proofs; a power loss before that sync can lose the rename (the previous

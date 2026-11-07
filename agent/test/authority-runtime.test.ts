@@ -1279,6 +1279,58 @@ describe("issue #4066: the shutdown budget", () => {
   });
 });
 
+describe("issue #4066: retry timing and closing transactions", () => {
+  it("a retry armed after beginShutdown is cut to the budget left, not the configured retryMs", async (t) => {
+    const RETRY_MS = 60_000;
+    const BUDGET_MS = 2_000;
+    const f = await faultRig(t, { retryMs: RETRY_MS, lateWaitMs: 50 });
+    await f.warm();
+    let settlement!: AuthoritySettlement;
+    await f.rt.withTransaction(async () => { settlement = await f.rt.hooks.beginDestructive([f.clone], "runner-uid-delete"); });
+    f.rt.beginShutdown(Date.now() + BUDGET_MS);
+    const delays: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = ((handler: () => void, ms?: number, ...args: unknown[]) => {
+      if (typeof ms === "number") delays.push(ms);
+      return (realSetTimeout as unknown as (...a: unknown[]) => NodeJS.Timeout)(handler, ms, ...args);
+    }) as typeof setTimeout;
+    const holder = await holdA(f.lifetime);
+    try {
+      await settlement.settle({ ok: true }); // queues; the idle drain fails to get A within lateWaitMs and arms the retry
+      await until(() => f.warns.some((w) => w.includes("stays queued until the next transaction")));
+      for (let i = 0; i < 5; i += 1) await tick();
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+      holder.release();
+      await holder.done;
+      f.rt.markShutdownDecided(); // clears the armed retry timer
+    }
+    assert.ok(!delays.includes(RETRY_MS), `a timer used retryMs: ${delays.join(",")}`);
+    assert.ok(delays.some((ms) => ms > BUDGET_MS - 500 && ms <= BUDGET_MS), `no timer was cut to the remaining budget: ${delays.join(",")}`);
+  });
+
+  it("a settle inside a transaction that is already closing is queued, not applied inline", async (t) => {
+    let armedHook = false;
+    let settlement!: AuthoritySettlement;
+    let observed: { queued: number; inline: number } | undefined;
+    const f: FaultRig = await faultRig(t, { testHooks: { onInlineClosing: () => {
+      if (!armedHook) return;
+      armedHook = false;
+      void settlement.settle({ ok: true }); // synchronous part: still inside the closing transaction
+      const counts = f.rt.snapshot().counts;
+      observed = { queued: counts.queued_settlements!, inline: counts.inline_applies! };
+    } } });
+    await f.warm();
+    await f.rt.withTransaction(async () => { settlement = await f.rt.hooks.beginDestructive([f.clone], "runner-uid-delete"); });
+    armedHook = true;
+    await f.rt.withTransaction(async () => undefined);
+    assert.deepEqual(observed, { queued: 1, inline: 0 }, "queued for the idle drain, not applied under the closing transaction");
+    const outcome = await f.rt.drainForShutdown({ deadlineAt: Date.now() + 5_000 });
+    assert.equal(outcome.result, "drained", outcome.reasons.join());
+    assert.equal((await peek(f, f.clone))?.pending, null, "the queued settlement was applied later");
+  });
+});
+
 describe("issue #4066: what keeps a shutdown from being drained", () => {
   const incompleteReasons = async (f: FaultRig): Promise<string[]> =>
     (await f.rt.drainForShutdown({ deadlineAt: Date.now() + 250 })).reasons;

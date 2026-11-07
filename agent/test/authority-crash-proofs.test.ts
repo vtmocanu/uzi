@@ -674,6 +674,7 @@ test("issue #4066 (b): a held recovery-pin continuation is joined before the sea
   assert.equal(exit.code, 0);
   const slot = await persistedSlot(dataDir, bare);
   assert.notEqual(slot?.pending?.status, "running", "the pin continuation settled its record");
+  assert.equal(gitIn(bare, ["rev-parse", `refs/uzi-recovery-pin/${runId}/1`]), sourceSha, "the aborted delete left the recovery pin on its source");
 });
 
 test("issue #4066 (b): a held unsettled runner-uid delete is joined before the seal; its late close is applied by the final drain", { timeout: 120_000 }, async (t) => {
@@ -807,6 +808,63 @@ test("issue #4066 deadline, pin continuation pending: the result is logged while
   assert.equal(decisions(worker).length, 1);
   assert.deepEqual(worker.seen.filter((l) => l.startsWith("PHASE:")), ["PHASE:prerequisites_joined", "PHASE:sealed", "PHASE:final_drain_started"]);
   assert.equal((await persistedSlot(dataDir, bare))?.pending?.status, "running", "the continuation's settle stayed queued past the deadline");
+  assert.equal(gitIn(bare, ["rev-parse", `refs/uzi-recovery-pin/${runId}/1`]), sourceSha, "the aborted delete left the recovery pin on its source");
+});
+
+test("issue #4066 unjoined git child: a pin-cleanup child killed by a signal never settles; incomplete with open_settlement, exit 1, the successor still refuses", { timeout: 120_000 }, async (t) => {
+  const fx = makeFixture();
+  t.after(() => fx.cleanup());
+  const dataDir = fs.realpathSync(fx.dataDir);
+  const plain = new GitCache(dataDir, nullLogger(), undefined);
+  const bare = await plain.ensureClone(fx.originPath);
+  fs.chmodSync(path.dirname(bare), 0o700);
+  fs.chmodSync(bare, 0o700);
+  const sourceSha = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
+  const runId = "40664066-9999-aaaa-bbbb-cccccccccccc";
+  assert.equal(await plain.anchorRecoveryHead(bare, runId, 1, sourceSha), true);
+  const rig = makeBarrier(t);
+  reapHelper(t, rig);
+  const worker = spawnChild(t, { scenario: "pin-cleanup", dataDir, token: TOKEN, bare, barrier: rig, shutdownBudgetMs: 2_000,
+    wrapDir: makeTmp(t, "m4066-wrap-"), pin: { runId, generation: 1, sourceSha, deadlineMs: 3_000 } });
+  t.after(() => t.diagnostic(`worker output:\n${worker.seen.join("\n")}`));
+  const childPid = await armed(rig, worker); // the real `git update-ref --stdin` child, held before Git runs
+  await until(worker, (line) => line === "DEADLINE-PASSED");
+  await sigterm(worker);
+  process.kill(childPid, "SIGKILL"); // killed by a signal: no real exit status, so the continuation cannot settle
+  const exit = await worker.exited;
+
+  assert.equal(exit.code, 1);
+  const decision = decisions(worker);
+  assert.equal(decision.length, 1, "decided once");
+  assert.equal(decision[0]!.fields.result, "incomplete");
+  assert.ok(decision[0]!.fields.reasons.includes("open_settlement"), `reasons: ${decision[0]!.fields.reasons.join(",")}`);
+  assert.deepEqual(resultOf(worker), { result: "incomplete", exitCode: 1 });
+  assert.equal(gitIn(bare, ["rev-parse", `refs/uzi-recovery-pin/${runId}/1`]), sourceSha, "the pin still names the original source");
+  const { rt, git } = await persistedSuccessor(dataDir);
+  assert.equal((await slotOf(rt, bare))?.pending?.status, "running", "the unjoined child's record was never settled");
+  assert.equal(await git.anchorRecoveryHead(bare, runId, 7, sourceSha), false, "a successor still refuses the bare");
+  assert.equal(gitIn(bare, ["for-each-ref", `refs/uzi-recovery-pin/${runId}/7`]), "", "the refused anchor created no ref");
+  assert.equal(gitIn(bare, ["rev-parse", `refs/uzi-recovery-pin/${runId}/1`]), sourceSha);
+});
+
+test("issue #4066 permanent durable-write failure: every settlement rename fails; incomplete with apply_exhausted, never drained, exit 1, the successor refuses", { timeout: 120_000 }, async (t) => {
+  const { dataDir, bare, a, worker, rig1 } = await lateWorker(t, { lateMode: "a4" });
+  await armed(rig1, worker);
+  assert.equal(await release(rig1), "0");
+  await until(worker, (line) => line === "REQUEUED"); // the idle drain's apply failed and was queued again
+  await sigterm(worker);
+  const exit = await worker.exited;
+
+  assert.equal(exit.code, 1);
+  const decision = decisions(worker);
+  assert.equal(decision.length, 1, "decided once");
+  assert.equal(decision[0]!.fields.result, "incomplete");
+  assert.ok(decision[0]!.fields.reasons.includes("apply_exhausted"), `reasons: ${decision[0]!.fields.reasons.join(",")}`);
+  assert.deepEqual(resultOf(worker), { result: "incomplete", exitCode: 1 });
+  assert.ok(!worker.seen.some((line) => line.startsWith("LOG:") && line.includes('"result":"drained"')), "never reported drained");
+  const { rt, git } = await persistedSuccessor(dataDir);
+  assert.equal((await slotOf(rt, a))?.pending?.status, "running", "no settlement ever became durable");
+  await assert.rejects(rt.withTransaction(() => reseedA(git, bare)), /unresolved pending footprint/);
 });
 
 test("issue #4066 repeated SIGTERM: the second signal changes nothing and the shutdown reports once", { timeout: 120_000 }, async (t) => {

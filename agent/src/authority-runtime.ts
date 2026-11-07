@@ -131,6 +131,8 @@ export interface AuthorityRuntimeOptions {
   testHooks?: {
     /** Awaited by #applyLate right after it took the queued settlements out of the queue and before it applies any. */
     afterLateSplice?: () => Promise<void>;
+    /** Called synchronously by #closeInline right after it marked the transaction closing, still inside that transaction. */
+    onInlineClosing?: () => void;
   };
 }
 
@@ -364,6 +366,7 @@ export class AuthorityRuntime implements AuthorityScope {
     while (set !== undefined && set.size > 0) await Promise.allSettled(set);
     this.#closing.add(tx);
     this.#inline.delete(tx);
+    this.#options.testHooks?.onInlineClosing?.();
   }
 
   /** Register an inline apply under its owning transaction and runtime-wide; it removes itself once settled. */

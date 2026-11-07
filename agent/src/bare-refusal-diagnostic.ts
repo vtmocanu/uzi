@@ -24,7 +24,7 @@ const UNPARSED: BareFootprintClass = { deletionClass: "unparsed", subjectRun: "u
 
 const RUN_ID = "[A-Za-z0-9_-]{1,128}";
 const PIN = new RegExp(`^refs/uzi-recovery-pin/(${RUN_ID})/([0-9]+)$`);
-const COVERAGE = new RegExp(`^refs/uzi-coverage/(${RUN_ID})/([0-9]+)/[^/\\s,]+$`);
+const COVERAGE = new RegExp(`^refs/uzi-coverage/(${RUN_ID})/([0-9]+)/[0-9a-f]{64}$`);
 const OWED = new RegExp(`^refs/uzi-owed/(${RUN_ID})/[0-9a-f]{40}$`);
 
 const NAMESPACES: Record<BareDeleteOp, readonly RegExp[]> = {

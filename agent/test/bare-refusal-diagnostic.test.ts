@@ -8,6 +8,7 @@ import { BARE_DELETE_OPS, classifyBareFootprint } from "../src/bare-refusal-diag
 // issue #4066 M4: the footprint classifier behind the `bare_slot_refusal` diagnostic.
 
 const SHA = "0123456789abcdef0123456789abcdef01234567";
+const FP = "0123456789abcdef".repeat(4);
 const unparsed = { deletionClass: "unparsed", subjectRun: "unknown", generation: "unknown" };
 
 describe("classifyBareFootprint", () => {
@@ -19,7 +20,7 @@ describe("classifyBareFootprint", () => {
   });
 
   it("accepts a coverage ref only for the cleanup op", () => {
-    const ref = "refs/uzi-coverage/run1/3/abc123def";
+    const ref = `refs/uzi-coverage/run1/3/${FP}`;
     assert.deepEqual(classifyBareFootprint(`recovery-cleanup-delete-ref: ${ref}`),
       { deletionClass: "recovery-cleanup-delete-ref", subjectRun: "run1", generation: 3 });
     for (const op of ["recovery-pin-delete-ref", "recovery-pin-archive-delete-ref", "owed-reconcile-delete-ref"]) {
@@ -53,7 +54,11 @@ describe("classifyBareFootprint", () => {
       `${op}: refs/uzi-recovery-pin/run.1/1`,
       `${op}: refs/uzi-recovery-pin/${"a".repeat(129)}/1`,
       `${op}: refs/uzi-coverage/run1/1/a/b`,
-      `${op}: refs/uzi-coverage/run1/x/fp`,
+      `${op}: refs/uzi-coverage/run1/x/${FP}`,
+      `${op}: refs/uzi-coverage/run1/1/abc123def`,
+      `${op}: refs/uzi-coverage/run1/1/${FP.toUpperCase()}`,
+      `${op}: refs/uzi-coverage/run1/1/${FP.slice(1)}`,
+      `${op}: refs/uzi-coverage/run1/1/${FP}0`,
       `${op}: refs/uzi-owed/run1/${SHA.slice(1)}`,
       `${op}: refs/uzi-owed/run1/${SHA.toUpperCase()}`,
       `${op}: refs/heads/main`,
