@@ -38,7 +38,7 @@ func policyKeys(t *testing.T, run store.Run) map[string]any {
 
 func readClaimFixture(t *testing.T, name string) map[string]any {
 	t.Helper()
-	raw, err := os.ReadFile("../../../fixtures/claims/" + name)
+	raw, err := os.ReadFile("../../../fixtures/claims/" + name) //nolint:gosec // G304: test reads a fixed fixtures/claims file named by the test itself
 	if err != nil {
 		t.Fatal(err)
 	}
