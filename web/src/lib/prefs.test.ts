@@ -181,6 +181,9 @@ describe("overviewScope", () => {
   });
 
   it("reads as you when storage cannot be read, and does not throw when it cannot be written", () => {
+    // A saved "all" first, so only a handled read error can yield "you".
+    overviewScope.set(KEY, "all");
+    expect(overviewScope.get(KEY)).toBe("all");
     vi.spyOn(window.localStorage, "getItem").mockImplementation(() => {
       throw new Error("access denied");
     });

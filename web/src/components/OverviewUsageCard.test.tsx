@@ -236,6 +236,8 @@ describe("OverviewUsageCard (#3881 M1)", () => {
 
   it("reads as You when storage throws", () => {
     const { self, admin } = fixture();
+    // A saved "all" first, so only a handled read error can yield You.
+    localStorage.setItem("uzi.overviewUsageScope", JSON.stringify("all"));
     vi.spyOn(localStorage, "getItem").mockImplementation(() => { throw new Error("denied"); });
     expect(mount({ self, admin }).getByRole("region", { name: "Your usage" })).toBeTruthy();
   });
@@ -248,6 +250,11 @@ describe("OverviewUsageCard (#3881 M1)", () => {
     expect(view.getByRole("region", { name: "Your usage" })).toBeTruthy();
     fireEvent.click(view.getByRole("button", { name: "Last 7 days" }));
     expect(setItem).not.toHaveBeenCalledWith("uzi.overviewUsageScope", expect.anything());
+    // Positive control: the same spy sees an admin's write, so the negative above is not vacuous.
+    cleanup();
+    const admin = mount({ self, admin: fixture().admin });
+    fireEvent.click(admin.getByRole("button", { name: "All users" }));
+    expect(setItem).toHaveBeenCalledWith("uzi.overviewUsageScope", JSON.stringify("all"));
   });
 
   it("does not render the dropped side-by-side or run-count pieces", () => {
