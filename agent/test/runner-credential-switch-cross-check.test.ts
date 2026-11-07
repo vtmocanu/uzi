@@ -8,7 +8,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { processGroupAlive } from "../src/tick-spawner.js";
 import { Outbox } from "../src/outbox.js";
 import { RecoveryCoordinator, type RecoveryArchiveClient } from "../src/recovery.js";
 import { CredentialSwitchSignal } from "../src/steering.js";
@@ -2142,9 +2143,10 @@ const GATE_MS = 1500;
 /** Scheduling margin: the longest tail past the deadline (children are aborted, then joined). */
 const GATE_TAIL_MS = 3000;
 
-interface GateFlightView { runId: string; worktreePath?: string; barePath?: string; preserveRecoveryClone: boolean;
+interface TickGroupView { pgid: number; identity: string; killConfirmed: boolean }
+interface GateFlightView { runId: string; worktreePath?: string; barePath?: string; preserveRecoveryClone: boolean; preserveSession: boolean;
   sinkGate: { run<T>(fn: () => Promise<T>): Promise<T> }; survivingTickGroups: unknown[]; runLog: Logger }
-interface Custody { preserveRecoveryClone: boolean; gates: number; switchReports: string[];
+interface Custody { preserveRecoveryClone: boolean; preserveSession: boolean; groups: TickGroupView[]; gates: number; switchReports: string[];
   reservations: { installed: number; released: number }; tree?: TreeView; indexLock?: boolean }
 interface GateRec { entered: boolean; startedAt: number; settledAt: number; error: unknown; watchdogFired: boolean;
   before?: Custody; after?: Custody; flight?: GateFlightView }
@@ -2179,7 +2181,8 @@ async function gateCheckpointRun(o: {
   let trackedPath = "";
   const untrackedPath = "untracked-by-test.txt";
   const custody = (flight: GateFlightView, c: { run_id: string }): Custody => ({
-    preserveRecoveryClone: flight.preserveRecoveryClone, gates: gates(c.run_id).length, switchReports: switchReports(c.run_id),
+    preserveRecoveryClone: flight.preserveRecoveryClone, preserveSession: flight.preserveSession,
+    groups: (flight.survivingTickGroups as TickGroupView[]).map((g) => ({ ...g })), gates: gates(c.run_id).length, switchReports: switchReports(c.run_id),
     reservations: { ...ctl.reservations },
     ...(flight.worktreePath ? { indexLock: fs.existsSync(path.join(flight.worktreePath, ".git", "index.lock")) } : {}),
   });
@@ -2254,6 +2257,15 @@ function assertCustodyIntact(r: Awaited<ReturnType<typeof gateCheckpointRun>>): 
   const before = r.treeBefore!, after = r.rec.after!.tree!;
   assert.equal(after.tracked, before.tracked, "tracked edit byte-identical");
   assert.equal(after.untracked, before.untracked, "untracked file byte-identical");
+  // HEAD is either untouched or a direct child of the recorded HEAD that holds both pieces of work verbatim.
+  if (after.head !== before.head) {
+    const wt = r.rec.flight!.worktreePath!;
+    assert.equal(runGitSync(wt, "rev-parse", `${after.head}^`).trim(), before.head, "a new HEAD is a direct child of the recorded HEAD");
+    assert.equal(runGitSync(wt, "show", `${after.head}:${before.trackedPath}`), before.tracked, "the new HEAD holds the tracked edit byte-identically");
+    assert.equal(runGitSync(wt, "show", `${after.head}:${before.untrackedPath}`), before.untracked, "and the untracked file byte-identically");
+  }
+  // The step itself never sets preserveSession on this path: it must not be reset relative to before.
+  if (r.rec.before!.preserveSession) assert.equal(r.rec.after!.preserveSession, true, "preserveSession is not reset");
 }
 
 describe("issue #3980: the Claude gate checkpoint is bounded", () => {
@@ -2354,15 +2366,19 @@ describe("issue #3980: the Claude gate checkpoint is bounded", () => {
     const reaps: { deadlineAt?: number; at: number }[] = [];
     const quiesces: { deadlineAt?: number; at: number; process?: string; docker?: string; dockerHost?: string }[] = [];
     let entered = false;
+    let freeReap = (): void => {};
+    const held = new Promise<void>((resolve) => { freeReap = resolve; });
     const r = await gateCheckpointRun({
       dirty: true,
       forward: {
         runProcesses: {
           scan: async () => ({ pids: [], complete: true }),
+          // Honours a deadline when handed one; otherwise stays pending until the watchdog releases it, so
+          // an unbounded step outlives the allowed settle bound rather than finishing early by itself.
           reap: async (_home, _worktree, _pids, opts) => {
             reaps.push({ deadlineAt: opts?.deadlineAt, at: Date.now() });
             entered = true;
-            await new Promise((resolve) => setTimeout(resolve, Math.max(0, (opts?.deadlineAt ?? Date.now() + GATE_MS) - Date.now()) + 100));
+            await Promise.race([held, ...(opts?.deadlineAt === undefined ? [] : [new Promise((resolve) => setTimeout(resolve, Math.max(0, opts.deadlineAt! - Date.now())))])]);
             return { killed: [], left: [], complete: true };
           },
         },
@@ -2372,16 +2388,14 @@ describe("issue #3980: the Claude gate checkpoint is bounded", () => {
         quiesces.push({ deadlineAt: req.deadlineAt, at: Date.now(), process: outcome.process?.state, docker: outcome.docker.detail, dockerHost: req.dockerHost });
         return outcome;
       } },
-      hang: async () => ({ release: () => undefined, entered: () => entered }),
+      hang: async () => ({ release: () => freeReap(), entered: () => entered }),
     });
     assertGateFailedClosed(r);
+    assertCustodyIntact(r);
     assert.equal(reaps.length, 1, `exactly one attributed reap: ${JSON.stringify(reaps)}`);
     assert.ok(Number.isFinite(reaps[0]!.deadlineAt), "the reap carried the gate deadline");
     const inStep = quiesces.filter((q) => q.at >= r.rec.startedAt && q.at <= r.rec.settledAt);
-    assert.equal(inStep.length, 1, `the re-proof is not admitted after the first proof consumed the deadline: ${JSON.stringify(inStep)}`);
-    assert.ok(Number.isFinite(inStep[0]!.deadlineAt), "the proof carried the gate deadline");
-    assert.equal(inStep[0]!.process, "unverified", "an expired proof is unverified");
-    assert.equal(inStep[0]!.docker, "deadline exhausted", "and no Docker request was admitted");
+    assert.deepEqual(inStep, [], `no proof, helper pass or Docker request is admitted once the reap consumed the deadline: ${JSON.stringify(inStep)}`);
   });
 
   it("(7) an owner abort during a hung sink-gate wait surfaces the owner's reason, not TransientRecoveryError", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
@@ -2404,6 +2418,7 @@ describe("issue #3980: the Claude gate checkpoint is bounded", () => {
     assert.equal(r.rec.watchdogFired, false, "the step settled by itself");
     assert.ok(!(r.rec.error instanceof TransientRecoveryError), `not remapped to TransientRecoveryError: ${String(r.rec.error)}`);
     assert.equal(r.rec.error, reason, "the owner's own reason is what the step rejects with");
+    assertCustodyIntact(r);
     assert.equal(r.rec.after!.preserveRecoveryClone, true, "the recovery clone stays preserved");
     assert.equal(r.rec.after!.gates, 0, "no gate presented");
   });
@@ -2423,57 +2438,75 @@ describe("issue #3980: the Claude gate checkpoint is bounded", () => {
     });
     assert.equal(r.entered, true, "the stubbed capture ran inside the bound");
     assert.equal(r.rec.error, refusal, "the refusal passes through unchanged");
+    assertCustodyIntact(r);
   });
 
-  /** A tick process group that never goes, observed through the runner's tick-spawn hooks (no real signal). */
+  /** A REAL test-owned process group (`sleep 60`, detached: its pid is its pgid) that never goes. The
+   *  runner's own production probe (processGroupAlive) decides its aliveness; the hook only counts probes
+   *  and records signals WITHOUT delivering them, so the group survives until `stop()`. */
   function survivorHooks() {
-    const seen = { alive: true, probes: 0, signals: [] as { sig: string; at: number }[] };
-    return { seen, opts: { checkpointTestHooks: { tickSpawn: {
-      groupAlive: () => { seen.probes++; return seen.alive; },
+    const child = spawn("sleep", ["60"], { detached: true, stdio: "ignore" });
+    child.unref();
+    const pgid = child.pid!;
+    const seen = { probes: 0, signals: [] as { sig: string; at: number }[] };
+    const stop = (): void => { try { process.kill(-pgid, "SIGKILL"); } catch { /* already gone */ } };
+    return { seen, pgid, stop, opts: { checkpointTestHooks: { tickSpawn: {
+      groupAlive: (g: number) => { seen.probes++; return processGroupAlive(g, "command"); },
       signalGroup: (_pgid: number, sig: string) => { seen.signals.push({ sig, at: Date.now() }); return true; },
     } } } };
   }
+  /** After expiry the real group is still tracked, and killConfirmed is what the prelude left it as. */
+  function assertSurvivorKept(r: Awaited<ReturnType<typeof gateCheckpointRun>>, pgid: number, killConfirmed: boolean): void {
+    assert.deepEqual(r.rec.before!.groups, [{ pgid, identity: "command", killConfirmed: false }], "the group is tracked when the step starts");
+    assert.deepEqual(r.rec.after!.groups, [{ pgid, identity: "command", killConfirmed }], "still tracked after expiry, killConfirmed as the prelude left it");
+  }
 
   it("(6a) tick survivors with the sink admitted just before the deadline: the wait is capped, no SIGKILL is sent after expiry and no second wait starts", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
-    const { seen, opts } = survivorHooks();
-    const r = await gateCheckpointRun({
-      dirty: true, runnerOpts: opts,
-      hang: async (flight) => {
-        flight.survivingTickGroups.push({ pgid: 424242, identity: "command", killConfirmed: false });
-        const gate = flight.sinkGate as unknown as { run: (fn: () => Promise<unknown>) => Promise<unknown> };
-        let releaseGate = (): void => {};
-        let held = false;
-        void gate.run(() => new Promise<void>((resolve) => { held = true; releaseGate = resolve; })).catch(() => undefined);
-        assert.ok(await until(() => held), "the injected sink holder is admitted");
-        // Freed ~100 ms before the deadline, so the first survivor wait can only start just before expiry.
-        const timer = setTimeout(() => releaseGate(), GATE_MS - 100);
-        return { release: () => { clearTimeout(timer); seen.alive = false; releaseGate(); }, entered: () => seen.probes > 0 };
-      },
-    });
-    assertGateFailedClosed(r);
-    assertCustodyIntact(r);
-    const deadlineAt = r.rec.startedAt + r.deadlineMs;
-    assert.deepEqual(seen.signals.filter((x) => x.at >= deadlineAt - 20), [], "no signal at or after expiry");
-    assert.deepEqual(seen.signals, [], "the first wait was capped by the deadline, so there was no SIGKILL to send");
+    const { seen, pgid, stop, opts } = survivorHooks();
+    try {
+      const r = await gateCheckpointRun({
+        dirty: true, runnerOpts: opts,
+        hang: async (flight) => {
+          flight.survivingTickGroups.push({ pgid, identity: "command", killConfirmed: false });
+          const gate = flight.sinkGate as unknown as { run: (fn: () => Promise<unknown>) => Promise<unknown> };
+          let releaseGate = (): void => {};
+          let held = false;
+          void gate.run(() => new Promise<void>((resolve) => { held = true; releaseGate = resolve; })).catch(() => undefined);
+          assert.ok(await until(() => held), "the injected sink holder is admitted");
+          // Freed ~100 ms before the deadline, so the first survivor wait can only start just before expiry.
+          const timer = setTimeout(() => releaseGate(), GATE_MS - 100);
+          return { release: () => { clearTimeout(timer); stop(); releaseGate(); }, entered: () => seen.probes > 0 };
+        },
+      });
+      assertGateFailedClosed(r);
+      assertCustodyIntact(r);
+      const deadlineAt = r.rec.startedAt + r.deadlineMs;
+      assert.deepEqual(seen.signals.filter((x) => x.at >= deadlineAt - 20), [], "no signal at or after expiry");
+      assert.deepEqual(seen.signals, [], "the first wait was capped by the deadline, so there was no SIGKILL to send");
+      assertSurvivorKept(r, pgid, false);
+    } finally { stop(); }
   });
 
   it("(6b) expiry during the second survivor wait: one SIGKILL before the deadline, none after, and the step still settles at the deadline", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
-    const { seen, opts } = survivorHooks();
-    const r = await gateCheckpointRun({
-      dirty: true, deadlineMs: 2500, tailMs: 700, runnerOpts: opts,
-      hang: async (flight) => {
-        flight.survivingTickGroups.push({ pgid: 424243, identity: "command", killConfirmed: false });
-        return { release: () => { seen.alive = false; }, entered: () => seen.probes > 0 };
-      },
-    });
-    // The second wait is capped by the deadline: uncapped it would run a further 2 s past it.
-    assertGateFailedClosed(r, 700);
-    assertCustodyIntact(r);
-    const deadlineAt = r.rec.startedAt + r.deadlineMs;
-    assert.equal(seen.signals.length, 1, `exactly one SIGKILL: ${JSON.stringify(seen.signals)}`);
-    assert.equal(seen.signals[0]!.sig, "SIGKILL");
-    assert.ok(seen.signals[0]!.at < deadlineAt, "sent before the deadline");
-    assert.ok(seen.signals[0]!.at >= r.rec.startedAt + 1900, "after the first full wait");
+    const { seen, pgid, stop, opts } = survivorHooks();
+    try {
+      const r = await gateCheckpointRun({
+        dirty: true, deadlineMs: 2500, tailMs: 700, runnerOpts: opts,
+        hang: async (flight) => {
+          flight.survivingTickGroups.push({ pgid, identity: "command", killConfirmed: false });
+          return { release: () => stop(), entered: () => seen.probes > 0 };
+        },
+      });
+      // The second wait is capped by the deadline: uncapped it would run a further 2 s past it.
+      assertGateFailedClosed(r, 700);
+      assertCustodyIntact(r);
+      const deadlineAt = r.rec.startedAt + r.deadlineMs;
+      assert.equal(seen.signals.length, 1, `exactly one SIGKILL: ${JSON.stringify(seen.signals)}`);
+      assert.equal(seen.signals[0]!.sig, "SIGKILL");
+      assert.ok(seen.signals[0]!.at < deadlineAt, "sent before the deadline");
+      assert.ok(seen.signals[0]!.at >= r.rec.startedAt + 1900, "after the first full wait");
+      assertSurvivorKept(r, pgid, true); // the recording hook reports the one SIGKILL as delivered
+    } finally { stop(); }
   });
 });
 

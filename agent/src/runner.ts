@@ -17519,20 +17519,28 @@ export class RunRunner {
     }
     try { return await flight.sinkGate.run(async () => {
       MaintenanceBudget.current()?.check();
-      if (opts.deadlineAt !== undefined && Date.now() >= opts.deadlineAt) {
+      const deadlineExpired = (): boolean => opts.deadlineAt !== undefined && Date.now() >= opts.deadlineAt;
+      const deadlineBlocked = (reap?: RunProcessReap | { failure: string }): { outcome: QuiesceRunOutcome; blocked: boolean } => {
         flight.runLog.warn("run quiescence not attempted: the gate checkpoint deadline is exhausted", { site: opts.site });
         if (!executor.safety) flight.evidenceJoinFailed = true;
-        return { outcome: {
+        const base: QuiesceRunOutcome = {
           process: { state: "unverified", processes: [], killed: [], detail: "gate checkpoint deadline exhausted" },
           docker: { state: "not_wired", removed: [], detail: "gate checkpoint deadline exhausted" },
-        }, blocked: true };
-      }
-      await executor.closeAndSettlePlanSummary?.(MaintenanceBudget.current()?.remainingMs());
+        };
+        return { outcome: reap ? foldAttributedReap(base, reap) : base, blocked: true };
+      };
+      if (deadlineExpired()) return deadlineBlocked();
+      await executor.closeAndSettlePlanSummary?.(opts.deadlineAt === undefined
+        ? MaintenanceBudget.current()?.remainingMs()
+        : Math.max(0, Math.min(MaintenanceBudget.current()?.remainingMs() ?? Infinity, opts.deadlineAt - Date.now())));
       MaintenanceBudget.current()?.check();
       await this.settleGuardedCommands(executor, opts.deadlineAt === undefined
         ? MaintenanceBudget.current()?.remainingMs()
         : Math.max(0, Math.min(MaintenanceBudget.current()?.remainingMs() ?? Infinity, opts.deadlineAt - Date.now())));
+      // killAgentTree only signals the agent's own tree (no new long work), so it runs even when
+      // the deadline expired during the settle; the attributed reap and quiesceImpl below do not.
       executor.killAgentTree?.();
+      if (deadlineExpired()) return deadlineBlocked();
       // issue #1783 M2: a flight capturing a PREDECESSOR attempt's clone never quiesces it as its
       // own: every proof there (the capture, its re-proofs, the pre-settle reap) is a
       // capture-mode scan scoped to the predecessor path alone.
@@ -17589,6 +17597,7 @@ export class RunRunner {
       let outcome: QuiesceRunOutcome;
       try {
         MaintenanceBudget.current()?.check();
+        if (deadlineExpired()) return deadlineBlocked(attributedReap);
         outcome = await this.quiesceImpl({
           mode,
           attempt: flight.activeCaptureAttempt ?? flight.attempt,
