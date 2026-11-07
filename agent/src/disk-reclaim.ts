@@ -252,20 +252,23 @@ export interface DiskReclaimSummary {
 export class CachesDroppedMemo {
   private readonly ids = new Set<string>();
 
-  has(runId: string): boolean {
-    return this.ids.has(runId);
+  // Keyed by run directory name (`<runId>` or `<runId>.g<N>`): one run can park with several HOMEs, each dropped once.
+  has(dirName: string): boolean {
+    return this.ids.has(dirName);
   }
 
-  add(runId: string): void {
-    this.ids.add(runId);
+  add(dirName: string): void {
+    this.ids.add(dirName);
   }
 
-  forget(runId: string): void {
-    this.ids.delete(runId);
+  /** Forget every directory of the run `name` (a run id or one of its directory names) belongs to. */
+  forget(name: string): void {
+    const runId = parseRunDirName(name)?.runId ?? name;
+    for (const id of this.ids) if ((parseRunDirName(id)?.runId ?? id) === runId) this.ids.delete(id);
   }
 
-  /** Forget every run `keep` rejects. */
-  retainOnly(keep: (runId: string) => boolean): void {
+  /** Forget every directory name `keep` rejects. */
+  retainOnly(keep: (dirName: string) => boolean): void {
     for (const id of this.ids) if (!keep(id)) this.ids.delete(id);
   }
 }
@@ -608,8 +611,7 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
   // from a whole listing: a HOME outside a capped, resumed (or failed) listing's window is not
   // known to be gone.
   if (homeList.whole) {
-    const homeRunIds = new Set([...homes.keys()].map((name) => parseRunDirName(name)?.runId));
-    memo?.retainOnly((id) => homeRunIds.has(id));
+    memo?.retainOnly((name) => homes.has(name));
   }
 
   let consecutiveFailures = 0;
@@ -692,7 +694,7 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
       summary.skippedNotEligible += 1;
       continue;
     }
-    if (parked && memo?.has(runId)) {
+    if (parked && memo?.has(dirName)) {
       summary.cachesAlreadyClear += 1;
       continue;
     }
@@ -734,7 +736,7 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
           if (g.removed.length > 0) summary.goScratchRemoved += 1;
         }
         if (!scratchClean) summary.goScratchRetained += 1;
-        if (cachesClean && scratchClean) memo?.add(runId);
+        if (cachesClean && scratchClean) memo?.add(dirName);
         return;
       }
       memo?.forget(runId);

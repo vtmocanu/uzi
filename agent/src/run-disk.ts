@@ -160,6 +160,7 @@ export class RunDiskSampler {
     }
     // HOME directories this sample decided (measured, or dropped as gone/foreign/terminal/unknown).
     const reached = new Set<string>();
+    const statusOfRun = new Map<string, { status: string | undefined } | "failed">();
     let measured = 0;
     let statusFailures = 0;
     let lookupFailures = 0;
@@ -196,15 +197,23 @@ export class RunDiskSampler {
           lookupFailures += 1;
           continue;
         }
-        let status: string | undefined;
-        try {
-          status = await o.statusOf(runId);
-          statusFailures = 0;
-        } catch {
-          statusFailures += 1;
+        // One lookup per run, whichever of its HOME directories is visited first (a failure is remembered too).
+        let looked = statusOfRun.get(runId);
+        if (looked === undefined) {
+          try {
+            looked = { status: await o.statusOf(runId) };
+            statusFailures = 0;
+          } catch {
+            looked = "failed";
+            statusFailures += 1;
+          }
+          statusOfRun.set(runId, looked);
+        }
+        if (looked === "failed") {
           lookupFailures += 1;
           continue;
         }
+        const status = looked.status;
         if (status === undefined || TERMINAL_RUN_STATUSES.has(status)) {
           reached.add(dirName);
           continue;
@@ -246,10 +255,13 @@ export class RunDiskSampler {
     // worker-owned directory. A run that is gone from the listing of a complete sample fails that
     // check and drops out.
     let carried = 0;
+    const previous = new Set<string>();
     for (const prev of this.latest ?? []) {
-      // A run's entry is replaced when this sample measured it and kept only when it reached none of its HOMEs.
+      previous.add(prev.run_id);
+      // A run's entry is replaced only when this sample decided EVERY HOME of the run; otherwise (a HOME was not reached, or
+      // not measured) the previous full reading is kept in place of a partial sum.
       const dirsOfRun = namesOfRun.get(prev.run_id) ?? [prev.run_id];
-      if (fresh.some((f) => f.run_id === prev.run_id) || dirsOfRun.some((n) => reached.has(n))) continue;
+      if (dirsOfRun.every((n) => reached.has(n))) continue;
       let owned = false;
       for (const n of dirsOfRun) {
         try {
@@ -257,8 +269,15 @@ export class RunDiskSampler {
         } catch { /* gone */ }
       }
       if (!owned) continue;
+      const at = entries.findIndex((e) => e.run_id === prev.run_id);
+      if (at >= 0) entries.splice(at, 1);
       entries.push(prev);
       carried += 1;
+    }
+    // A partial sum of a run with no previous reading to fall back on is reported, marked truncated (a lower bound).
+    for (const e of entries) {
+      if (e.truncated || previous.has(e.run_id) || !fresh.some((f) => f.run_id === e.run_id)) continue;
+      if ((namesOfRun.get(e.run_id) ?? []).some((n) => !reached.has(n))) e.truncated = true;
     }
 
     const partial = stoppedEarly !== undefined || listingTruncated || lookupFailures > 0 || measureFailures > 0;

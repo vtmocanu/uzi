@@ -184,10 +184,11 @@ describe("removeRetainedHomeMarker", () => {
     fs.rmSync(path.dirname(file), { recursive: true });
     await removeRetainedHomeMarker(dataDir, RUN);
   });
-  it("a failing unlink or directory sync throws and the marker is as found", async () => {
+  it("a failing unlink throws with the marker still present; a failing directory sync throws after the marker is already gone", async () => {
     await writeRetainedHomeMarker(dataDir, marker());
     await assert.rejects(removeRetainedHomeMarker(dataDir, RUN, spyFs({ step: "unlink" }).fs), /injected/);
     assert.equal(await hasRetainedHomeMarker(dataDir, RUN), true);
     await assert.rejects(removeRetainedHomeMarker(dataDir, RUN, spyFs({ step: "syncDir" }).fs), /injected/);
+    assert.equal(await hasRetainedHomeMarker(dataDir, RUN), false, "the unlink had succeeded; only its durability is unproven");
   });
 });

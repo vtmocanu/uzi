@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { runDiskReclaimPass, type DiskReclaimDeps } from "../src/disk-reclaim.js";
+import { CachesDroppedMemo, runDiskReclaimPass, type DiskReclaimDeps } from "../src/disk-reclaim.js";
 import { reclaimStrandedRunHomes } from "../src/home-reclaim.js";
 import { RunDiskSampler } from "../src/run-disk.js";
 import { RunDiskLocks } from "../src/run-disk-locks.js";
@@ -140,7 +140,21 @@ describe("runDiskReclaimPass: markers and .g<N> directories", () => {
     assert.equal(fs.existsSync(t.sHome), false, "terminal run");
   });
 
-  it("a .g<N>-looking name that is not a run directory is never listed", { skip: LINUX_ONLY }, async () => {
+  it("a parked run with a legacy and a .g2 HOME has each HOME's caches dropped once across two passes", { skip: LINUX_ONLY }, async () => {
+    const t = seedBoth();
+    const dropped: string[] = [];
+    const memo = new CachesDroppedMemo();
+    const over = {
+      statusOf: async () => "limit_wait", cachesDropped: memo,
+      dropCaches: async (dir: string) => { dropped.push(path.basename(dir)); return { dropped: ["x"], failed: [], skipped: [] }; },
+      dropGoScratch: async () => ({ parent: "absent", removed: [], failed: [], skipped: [] }),
+    } as unknown as Partial<DiskReclaimDeps>;
+    await runDiskReclaimPass(passDeps(over));
+    await runDiskReclaimPass(passDeps(over));
+    assert.deepEqual(dropped.sort(), [path.basename(t.pHome), path.basename(t.sHome)].sort());
+  });
+
+  it("a .g<N>-looking name that is not a run directory is never listed",{ skip: LINUX_ONLY }, async () => {
     for (const bad of [`${run}.g0`, `${run}.g01`, `${run}.gx`]) seed(path.join(home, bad));
     const lookups: string[] = [];
     await runDiskReclaimPass(passDeps({ statusOf: async (id) => { lookups.push(id); return "failed"; } }));
@@ -194,6 +208,25 @@ describe("RunDiskSampler: .g<N> HOMEs follow their run and report one entry per 
     seedBoth();
     const entries = await sampler().sample();
     assert.deepEqual(entries.map(({ sampled_at: _a, ...e }) => e), [{ run_id: run, home_bytes: 140, cache_bytes: 14 }]);
+  });
+  it("a measure failure on one HOME keeps the previous full reading; the status is asked once per run", async () => {
+    seedBoth();
+    const asked: string[] = [];
+    let failG2 = false;
+    const s = sampler({
+      statusOf: async (id) => { asked.push(id); return "limit_wait"; },
+      measure: async (dir) => {
+        if (failG2 && dir.endsWith(".g2")) throw new Error("EIO");
+        return { homeBytes: dir.endsWith(".g2") ? 40 : 100, cacheBytes: 0, entries: 1, truncated: false };
+      },
+    });
+    const first = await s.sample();
+    assert.equal(first[0]?.home_bytes, 140);
+    assert.deepEqual(asked, [run], "one status lookup for the run's two HOMEs");
+    failG2 = true;
+    (s as unknown as { latest: unknown }).latest = first;
+    const second = await s.sample();
+    assert.deepEqual(second.map((e) => [e.run_id, e.home_bytes]), [[run, 140]], "the partial 100 does not replace the full 140");
   });
   it("a terminal run's .g2 HOME is not measured", async () => {
     seedBoth();

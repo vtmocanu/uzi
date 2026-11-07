@@ -659,7 +659,9 @@ async function mainBody(): Promise<void> {
   // Codex/SdkExecutor wiring) lives in the top-level `buildRunExecutor` above,
   // factored out so a test can call it directly. This closure only binds it to
   // this process's live config/log/client/sdkHomeRoot.
-  const makeExecutor: ExecutorFactory = (runId, codex, addr?: RunExecutorAddress) => makeRunExecutorFactory({
+  // Built once, on first use: `codexAdviceHarnessFactory` below is declared after this closure.
+  let runExecutorFactory: ExecutorFactory | undefined;
+  const makeExecutor: ExecutorFactory = (runId, codex, addr?: RunExecutorAddress) => (runExecutorFactory ??= makeRunExecutorFactory({
     log,
     client,
     sdkHomeRoot,
@@ -671,7 +673,7 @@ async function mainBody(): Promise<void> {
     codexCommandSandbox: config.codexCommandSandbox,
     codexSandboxDegraded: config.codexHarness.degraded,
     codexCommandCacheRunBytes: config.codexCommandCacheRunBytes,
-  })(runId, codex, addr);
+  }))(runId, codex, addr);
   // PRD #1429 M3: the Codex advice-harness factory judge/review thread into
   // runReadOnlyModelPass (model-pass.ts) so a Codex judge/review claim (secrets.codex
   // present) gets a REAL Codex advice pass instead of the missing-token fallback. PRD #1798 M5

@@ -82,3 +82,59 @@ describe("the orphan marker finisher requires the marker to name this bare and t
     assert.equal(await hasRetainedHomeMarker(dataDir, RUN), false);
   });
 });
+
+// The restore-aware exit of a plain P record: a newer same-run ledger entry in this bare is ordinary history unless the run's
+// marker records THIS bare and P's attempt (planRestoreExit's binding).
+describe("planRestoreExit: a newer same-run ledger entry plus a marker of another bare or attempt is not restore evidence", () => {
+  const S2_ID = formatAttemptId(new Date("2026-11-05T12:12:12Z"), 2, "cccccccccccccccc");
+  let pPath: string;
+  const ledger = (): Array<{ attemptId: string; state: string }> =>
+    execFileSync("git", ["-C", bare2, "config", "--get-all", `uzi-attempts.${BRANCH}.entry`], { env: ENV, encoding: "utf8" })
+      .split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  beforeEach(() => {
+    const canonical = cache.runnerClonePath(bare2, "issue-3644");
+    pPath = attemptClonePath(canonical, X_ID);
+    const git = (...a: string[]) => execFileSync("git", ["-C", bare2, ...a], { env: ENV });
+    git("config", `uzi-recovery.${BRANCH}.clone`, JSON.stringify({ runId: RUN, clonePath: pPath, attemptId: X_ID }));
+    git("config", "--add", `uzi-attempts.${BRANCH}.entry`, JSON.stringify({ attemptId: X_ID, runId: RUN, clonePath: pPath, state: "live" }));
+    git("config", "--add", `uzi-attempts.${BRANCH}.entry`,
+      JSON.stringify({ attemptId: S2_ID, runId: RUN, clonePath: attemptClonePath(canonical, S2_ID), state: "live" }));
+    fs.mkdirSync(path.join(pPath, ".git"), { recursive: true });
+  });
+  const exit = async (): Promise<{ result: Awaited<ReturnType<typeof retry>>; removed: string[] }> => {
+    const internals = cache as unknown as {
+      withLock<T>(b: string, fn: () => Promise<T>): Promise<T>;
+      gatherRetainedUnderLock(b: string): Promise<{ records: Array<{ digest: string; parts: Array<{ clonePath: string }> }> }>;
+    };
+    const g = await internals.withLock(bare2, () => internals.gatherRetainedUnderLock(bare2));
+    const confirm = g.records.find((r) => r.parts.some((p) => p.clonePath === pPath))!.digest;
+    const removed: string[] = [];
+    const result = await cache.discardStoppedSource({
+      selector: { runId: RUN, generation: 1, attempt: X_ID }, confirm, holds: { state: "read", holds: [] },
+      lifecycle: { state: "terminal", status: "failed" }, isLivePath: () => false, quiesce: async () => true, barePath: bare2,
+      hasRetainedHomeMarker: (runId, binding) => hasRetainedHomeMarker(dataDir, runId, binding),
+      removeRetainedHomeMarker: async (runId) => { removed.push(runId); await removeRetainedHomeMarker(dataDir, runId); },
+    });
+    return { result, removed };
+  };
+  for (const [name, written] of [
+    ["another bare", () => marker("/somewhere/else/bare.git", X_ID)],
+    ["another attempt id", () => marker(bare2, OTHER_ID)],
+  ] as const) {
+    it(`a marker recording ${name}: the marker survives and the restore exit retires nothing`, async () => {
+      await writeRetainedHomeMarker(dataDir, written());
+      const { result, removed } = await exit();
+      assert.ok(result.kind === "done" || result.kind === "refused", `ordinary path or refusal: ${JSON.stringify(result)}`);
+      assert.deepEqual(removed, [], "the marker is never removed");
+      assert.equal(await hasRetainedHomeMarker(dataDir, RUN), true);
+      assert.ok(!ledger().some((e) => e.attemptId === S2_ID && e.state === "retired"), "the newer entry is not retired by a restore exit");
+    });
+  }
+  it("control: the marker recording this bare and P's attempt makes it the restore exit, which removes the marker", async () => {
+    await writeRetainedHomeMarker(dataDir, marker(bare2, X_ID));
+    const { result, removed } = await exit();
+    assert.equal(result.kind, "done", JSON.stringify(result));
+    assert.deepEqual(removed, [RUN]);
+    assert.ok(ledger().some((e) => e.attemptId === S2_ID && e.state === "retired"));
+  });
+});
