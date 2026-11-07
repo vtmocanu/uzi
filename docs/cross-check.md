@@ -60,7 +60,9 @@ replaced or interrupted evidence; a recorded review can survive missing child
 metadata without proving that execution finished. Missing or unrecognized
 values remain unknown or not recorded. An absent valid child has no checker
 link. A historical approval concerns an earlier plan candidate and does not
-certify a later candidate or human revision. Cause, next action and effect
+certify a later candidate or human revision. A Plan verdict recorded before the
+lead lost custody shows as that verdict (passed or raised issues) rather than
+as interrupted, keeps its interruption time, and stays historical. Cause, next action and effect
 can be unrecorded; the history view grants no new approval or policy effect.
 
 ### Page sizes and continuation

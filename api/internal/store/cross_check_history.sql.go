@@ -45,7 +45,11 @@ WITH evidence AS (
  WHERE lead.user_id = $2::uuid AND lead.kind <> 'cross_check'
 ), classified AS (
  SELECT lead_run_id, stage, round, created_at, decided_at, deadline_at, issue_title, parent_status, stage_rank, result, reason_class, interrupted_at, child_id, child_status, model, effort, findings_count, active, historical, CASE
-  WHEN interrupted_at IS NOT NULL OR reason_class IN ('superseded','approved_not_stored') THEN 'replaced'
+  -- A Plan verdict recorded before the lead lost custody keeps its verdict (#4037).
+  -- IS NOT TRUE keeps any NULL term (e.g. a missing reason_class) replaced.
+  WHEN reason_class IN ('superseded','approved_not_stored')
+   OR (interrupted_at IS NOT NULL AND (stage='plan' AND decided_at IS NOT NULL AND decided_at <= interrupted_at
+    AND result IN ('approve','revise','block') AND reason_class = result) IS NOT TRUE) THEN 'replaced'
   WHEN result='failed' THEN 'didnt_finish'
   WHEN stage='plan' AND result IN ('revise','block') AND reason_class=result THEN 'raised_issues'
   WHEN stage='plan' AND result='approve' AND reason_class='approve' THEN 'passed'
@@ -195,7 +199,11 @@ WITH evidence AS (
  WHERE lead.user_id = $6::uuid AND lead.kind <> 'cross_check'
 ), classified AS (
  SELECT lead_run_id, stage, round, created_at, decided_at, deadline_at, issue_title, parent_status, stage_rank, result, reason_class, interrupted_at, child_id, child_status, model, effort, findings_count, active, historical, CASE
-  WHEN interrupted_at IS NOT NULL OR reason_class IN ('superseded','approved_not_stored') THEN 'replaced'
+  -- A Plan verdict recorded before the lead lost custody keeps its verdict (#4037).
+  -- IS NOT TRUE keeps any NULL term (e.g. a missing reason_class) replaced.
+  WHEN reason_class IN ('superseded','approved_not_stored')
+   OR (interrupted_at IS NOT NULL AND (stage='plan' AND decided_at IS NOT NULL AND decided_at <= interrupted_at
+    AND result IN ('approve','revise','block') AND reason_class = result) IS NOT TRUE) THEN 'replaced'
   WHEN result='failed' THEN 'didnt_finish'
   WHEN stage='plan' AND result IN ('revise','block') AND reason_class=result THEN 'raised_issues'
   WHEN stage='plan' AND result='approve' AND reason_class='approve' THEN 'passed'
