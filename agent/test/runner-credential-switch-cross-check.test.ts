@@ -8,14 +8,16 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { execFileSync } from "node:child_process";
 import { Outbox } from "../src/outbox.js";
 import { RecoveryCoordinator, type RecoveryArchiveClient } from "../src/recovery.js";
 import { CredentialSwitchSignal } from "../src/steering.js";
 import { createHash } from "node:crypto";
 import type { Executor, RunContext } from "../src/executor.js";
-import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
+import { SdkExecutor, TransientRecoveryError, type SdkExecutorOptions, type SdkQueryFn } from "../src/sdk-executor.js";
 import { MessageBatcher } from "../src/batcher.js";
 import { CandidateTransportInvariantError, RunRunner } from "../src/runner.js";
+import { quiesceRunAttempt, type QuiesceRunRequest } from "../src/run-quiescence.js";
 import { SteeringChannel } from "../src/steering.js";
 import type { PlanCrossCheckStateRequest } from "../src/client.js";
 import type { OutgoingMessage } from "../src/protocol.js";
@@ -109,6 +111,10 @@ interface DriveControl {
   onState(fn: (body: Parameters<Parameters<typeof api.onState>[1]>[0]) => void): void;
   /** Flip the pending checker answer of `round` to `verdict`, keeping its identity. */
   flip(round: number, verdict: "approve" | "block"): void;
+  /** Issue #3980: the candidate reservation's live counters. */
+  reservations: { installed: number; released: number };
+  /** Issue #3980: the one long-lived real SdkExecutor the run uses when `DriveOpts.forward` is set. */
+  sdk?: SdkExecutor;
 }
 /** Observe the candidate reservation (reserve/release), landed state reports and landed messages in
  *  ONE ordered list. Returns the restore function for the shared batcher prototype. */
@@ -228,14 +234,14 @@ function reclaim(c: ReturnType<typeof claim>, generation = 2) {
 }
 
 /** A scripted SDK: turn n submits plans[n] when present, else finishes. */
-function scriptedQuery(plans: string[], counter: { calls: number }): SdkQueryFn {
+function scriptedQuery(plans: string[], counter: { calls: number }, milestones: { id: string; title: string }[] = []): SdkQueryFn {
   return (params) => {
     const turn = counter.calls++;
     return (async function* () {
       for await (const _ of params.prompt) { /* drain */ }
       const plan = plans[turn];
       if (plan !== undefined) {
-        yield assistant([{ type: "tool_use", id: `p${turn}`, name: "mcp__uzi__submit_plan", input: { plan_md: plan, milestones: [] } }]);
+        yield assistant([{ type: "tool_use", id: `p${turn}`, name: "mcp__uzi__submit_plan", input: { plan_md: plan, milestones } }]);
       } else {
         yield assistant([{ type: "text", text: "done implementing" },
           { type: "tool_use", id: `d${turn}`, name: "mcp__uzi__signal_done", input: {} }]);
@@ -254,8 +260,14 @@ interface DriveOpts {
   switchRounds?: number[];
   /** poll: the inputs poll carries the switch. ack: the awaiting_approval state ACK carries it. */
   entry?: "poll" | "ack";
-  capture: "release" | "giveup";
+  /** "real" (issue #3980) installs neither capture double: the runner captures through the real GitCache. */
+  capture: "release" | "giveup" | "real";
+  /** Issue #3980: run through ONE real SdkExecutor built with these options, and forward the Executor
+   *  hooks the runner's quiescence uses (reapAttributedProcesses, with its options) to it. */
+  forward?: Partial<SdkExecutorOptions>;
   plans?: string[];
+  /** The milestones every scripted submit_plan carries (default none). */
+  planMilestones?: { id: string; title: string }[];
   emitHeld?: boolean;
   failAfterRelease?: boolean;
   /** An assigned replay: a status emitted when the reservation installs whose first delivery fails. */
@@ -320,8 +332,9 @@ async function drive(o: DriveOpts) {
   const trace = { queriesAtRequest: [] as number[], requests: 0 };
   const cancelIds: number[] = [];
   const stateHooks: Parameters<DriveControl["onState"]>[0][] = [];
+  const sdk = o.forward ? new SdkExecutor(nullLogger(), homeDir, { queryFn: scriptedQuery(o.plans ?? [PLAN], counter, o.planMilestones), ...o.forward }) : undefined;
   const ctl: DriveControl = {
-    tl, switchSeen,
+    tl, switchSeen, reservations: probe.reservations, sdk,
     onState: (fn) => { stateHooks.push(fn); },
     requestSwitch: async () => {
       tl.events.push("switch-requested");
@@ -435,7 +448,7 @@ async function drive(o: DriveOpts) {
       ctx.emit({ kind: "status", payload: { text: o.owed } });
       assert.ok(await until(() => failedPosts.count > 0), "the assigned replay's first delivery failed");
     }
-    if (o.capture === "release") healthyCapture(); else failingCapture();
+    if (o.capture === "release") healthyCapture(); else if (o.capture === "giveup") failingCapture();
     const wip = git.worktreeStatus.bind(git);
     git.worktreeStatus = (async (...a: Parameters<typeof wip>) => { tl.events.push("capture"); return wip(...a); }) as typeof git.worktreeStatus;
     const attempt = ctx.attemptCredentialSwitch!;
@@ -452,8 +465,8 @@ async function drive(o: DriveOpts) {
         return gate(o.gateMd ? o.gateMd(n, md) : md, o.gateMilestones ? o.gateMilestones(n, ms) : ms, ...rest);
       };
     }
-    return new SdkExecutor(nullLogger(), homeDir, { queryFn: scriptedQuery(o.plans ?? [PLAN], counter) }).run(ctx);
-  } };
+    return (sdk ?? new SdkExecutor(nullLogger(), homeDir, { queryFn: scriptedQuery(o.plans ?? [PLAN], counter, o.planMilestones) })).run(ctx);
+  }, ...(sdk ? { reapAttributedProcesses: (opts?: { deadlineAt?: number }) => sdk.reapAttributedProcesses(opts) } : {}) };
   o.setup?.(c, ctl);
   const forge = fakeGitlab();
   const sentinel = path.join(homeDir, "SESSION");
@@ -2114,5 +2127,435 @@ describe("issue #3974: the runner never enters a switch once a cancel was commit
         x.switchSeen.serviceHolds();
       } });
     assertCancelledNotSwitched(d);
+  });
+});
+
+// ─── Issue #3980: the changed-plan gate checkpoint on a Claude executor is bounded ───────────────────
+// prepareGateCheckpoint used to enforce its 60 s deadline only through the Codex capture lane. A Claude
+// executor has none, so one hung clone-side git child, a held bare lock, an unsettled executor join or a
+// sink gate that never frees could hold the plan gate (and the held credential switch behind it) forever.
+// These drive the real runner with a real GitCache capture (capture: "real"), the switch held, and a
+// shortened deadline; each regression observes the hang it injected first, then requires the step to
+// settle (fail closed, TransientRecoveryError, custody intact) BEFORE a watchdog that would release it.
+const GATE_MS = 1500;
+/** Scheduling margin: the longest tail past the deadline (children are aborted, then joined). */
+const GATE_TAIL_MS = 3000;
+
+interface GateFlightView { runId: string; worktreePath?: string; barePath?: string; preserveRecoveryClone: boolean;
+  sinkGate: { run<T>(fn: () => Promise<T>): Promise<T> }; survivingTickGroups: unknown[]; runLog: Logger }
+interface Custody { preserveRecoveryClone: boolean; gates: number; switchReports: string[];
+  reservations: { installed: number; released: number }; tree?: TreeView; indexLock?: boolean }
+interface GateRec { entered: boolean; startedAt: number; settledAt: number; error: unknown; watchdogFired: boolean;
+  before?: Custody; after?: Custody; flight?: GateFlightView; log: string[] }
+
+const runGitSync = (cwd: string, ...args: string[]): string =>
+  execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" } });
+interface TreeView { head: string; tracked: string; untracked: string; trackedPath: string; untrackedPath: string }
+function viewTree(wt: string, trackedPath: string, untrackedPath: string): TreeView {
+  return { head: runGitSync(wt, "rev-parse", "HEAD").trim(), trackedPath, untrackedPath,
+    tracked: fs.readFileSync(path.join(wt, trackedPath), "utf8"), untracked: fs.readFileSync(path.join(wt, untrackedPath), "utf8") };
+}
+
+/** Run one claim whose human re-plan gate reaches prepareGateCheckpoint on the real Claude path, with the
+ *  switch held. `hang` injects the failure and returns its release; `entered` must come true on its own. */
+async function gateCheckpointRun(o: {
+  hang: (flight: GateFlightView, x: DriveControl, rec: GateRec) => Promise<{ release: () => void; entered: () => boolean }>;
+  dirty?: boolean; forward?: Partial<SdkExecutorOptions>; tailMs?: number; deadlineMs?: number;
+  runnerOpts?: Record<string, unknown>;
+  /** Runs right after the step settles (before its custody is read). */
+  onSettled?: () => void;
+}) {
+  const deadlineMs = o.deadlineMs ?? GATE_MS;
+  client.protocolFeatures = [...client.protocolFeatures, "milestone_reconciliation_v1"];
+  const seam = RunRunner.prototype as unknown as { prepareGateCheckpoint: (...args: unknown[]) => Promise<unknown> };
+  const prepare = seam.prepareGateCheckpoint;
+  restorers.push(() => { seam.prepareGateCheckpoint = prepare; });
+  const rec: GateRec = { entered: false, startedAt: 0, settledAt: 0, error: undefined, watchdogFired: false, log: [] };
+  let release = (): void => {};
+  let hangEntered = (): boolean => false;
+  let ctl!: DriveControl;
+  let treeBefore: TreeView | undefined;
+  let trackedPath = "";
+  const untrackedPath = "untracked-by-test.txt";
+  const custody = (flight: GateFlightView, c: { run_id: string }): Custody => ({
+    preserveRecoveryClone: flight.preserveRecoveryClone, gates: gates(c.run_id).length, switchReports: switchReports(c.run_id),
+    reservations: { ...ctl.reservations },
+    ...(flight.worktreePath ? { indexLock: fs.existsSync(path.join(flight.worktreePath, ".git", "index.lock")) } : {}),
+  });
+  let claimId = "";
+  seam.prepareGateCheckpoint = async function (this: unknown, ...args: unknown[]) {
+    const flight = args[1] as GateFlightView;
+    rec.entered = true;
+    rec.flight = flight;
+    await ctl.requestSwitch();
+    if (o.dirty && flight.worktreePath) {
+      const wt = flight.worktreePath;
+      trackedPath = runGitSync(wt, "ls-files").split("\n").filter(Boolean)[0]!;
+      fs.appendFileSync(path.join(wt, trackedPath), "\nedited by the gate checkpoint test\n");
+      fs.writeFileSync(path.join(wt, untrackedPath), "untracked work\n");
+      treeBefore = viewTree(wt, trackedPath, untrackedPath);
+    }
+    const injected = await o.hang(flight, ctl, rec);
+    release = injected.release;
+    hangEntered = injected.entered;
+    rec.before = custody(flight, { run_id: claimId });
+    // The watchdog frees the hang only after the allowed tail, so a step that never bounds itself
+    // fails the settle-time assertion rather than the node test timeout.
+    const watchdog = setTimeout(() => { rec.watchdogFired = true; release(); }, deadlineMs + (o.tailMs ?? GATE_TAIL_MS) + 2000);
+    rec.startedAt = Date.now();
+    try { return await prepare.apply(this, args); }
+    catch (error) { rec.error = error; throw error; }
+    finally {
+      rec.settledAt = Date.now();
+        clearTimeout(watchdog);
+      rec.after = custody(flight, { run_id: claimId });
+      if (treeBefore && flight.worktreePath) {
+        const after = viewTree(flight.worktreePath, trackedPath, untrackedPath);
+        rec.log.push(JSON.stringify({ sameTracked: after.tracked === treeBefore.tracked, sameUntracked: after.untracked === treeBefore.untracked }));
+        rec.after!.tree = after;
+      }
+      // The run's own teardown needs what the injected hang held (the bare lock, the sink gate).
+      release();
+    }
+  };
+  const d = await drive({ capture: "real", switchRounds: [], serveCancellation: true, manual: true, verdicts: ["block"],
+    ...(o.forward ? { forward: o.forward } : {}),
+    planMilestones: [{ id: "changed", title: "A milestone the human has not approved" }],
+    claimOver: () => ({ execution_milestones: [{ id: "frozen", title: "A frozen milestone the candidate drops" }] }),
+    runnerOpts: { gateCheckpointDeadlineMs: deadlineMs, ...o.runnerOpts },
+    setup: (c, x) => { ctl = x; claimId = c.run_id; } });
+  release();
+  return { rec, d, entered: hangEntered(), treeBefore, trackedPath, untrackedPath, deadlineMs };
+}
+
+function assertGateFailedClosed(r: Awaited<ReturnType<typeof gateCheckpointRun>>, tailMs = GATE_TAIL_MS): void {
+  const deadlineMs = r.deadlineMs;
+  const { rec } = r;
+  assert.equal(rec.entered, true, "the run reached prepareGateCheckpoint");
+  assert.equal(r.entered, true, "the injected hang was entered");
+  assert.equal(rec.watchdogFired, false, `the step settled by itself (took ${rec.settledAt - rec.startedAt} ms): ${String(rec.error)}`);
+  assert.ok(rec.settledAt - rec.startedAt <= deadlineMs + tailMs,
+    `settled ${rec.settledAt - rec.startedAt} ms after entry; allowed ${deadlineMs + tailMs}`);
+  assert.ok(rec.error instanceof TransientRecoveryError, `TransientRecoveryError, got ${String(rec.error)}`);
+  assert.equal(rec.after!.preserveRecoveryClone, true, "the recovery clone stays preserved");
+  assert.equal(rec.after!.gates, 0, "no gate presented");
+  assert.deepEqual(rec.after!.switchReports, [], "no switch serviced");
+  assert.deepEqual(rec.after!.reservations, rec.before!.reservations, "the step left the reservation untouched");
+  assert.notEqual(rec.after!.indexLock, true, "no .git/index.lock left behind");
+}
+function assertCustodyIntact(r: Awaited<ReturnType<typeof gateCheckpointRun>>): void {
+  const before = r.treeBefore!, after = r.rec.after!.tree!;
+  assert.equal(after.tracked, before.tracked, "tracked edit byte-identical");
+  assert.equal(after.untracked, before.untracked, "untracked file byte-identical");
+}
+
+describe("issue #3980: the Claude gate checkpoint is bounded", () => {
+  it("(1) a hung clone-side git child (a planted clean filter whose descendant holds the pipes) cannot hold the step past its deadline", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const marker = path.join(homeDir, "filter-entered");
+    const orphans = (): number[] => (fs.existsSync(marker) ? fs.readFileSync(marker, "utf8").split("\n").map(Number).filter((n) => n > 0) : []);
+    const killOrphans = (): void => { for (const pid of orphans()) { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } } };
+    try {
+      const r = await gateCheckpointRun({
+        dirty: true,
+        hang: async (flight) => {
+          const wt = flight.worktreePath!;
+          const script = path.join(homeDir, "hang-filter.sh");
+          fs.writeFileSync(script, `#!/bin/sh\necho $$ >> '${marker}'\nsleep 300 &\necho $! >> '${marker}'\nexec sleep 300\n`, { mode: 0o755 });
+          runGitSync(wt, "config", "filter.hang.clean", script);
+          fs.writeFileSync(path.join(wt, ".gitattributes"), "* filter=hang\n");
+          // Releasing also unplants the filter, so a run that never bounded itself is not re-hung by its
+          // later git calls and fails by assertion rather than by the node timeout.
+          const release = (): void => {
+            try { runGitSync(wt, "config", "--unset", "filter.hang.clean"); } catch { /* already unset */ }
+            killOrphans();
+            // A git that already loaded the filter starts a new instance per file: keep killing for a while.
+            const sweep = setInterval(killOrphans, 100);
+            setTimeout(() => clearInterval(sweep), 3000).unref();
+            sweep.unref();
+          };
+          return { release, entered: () => fs.existsSync(marker) };
+        },
+      });
+      assertGateFailedClosed(r);
+      assertCustodyIntact(r);
+    } finally { killOrphans(); }
+  });
+
+  it("(2) a bare lock held by another operation cannot hold the capture's lock wait past its deadline", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    let releaseLock = (): void => {};
+    let queued = 0;
+    const r = await gateCheckpointRun({
+      dirty: true,
+      hang: async (flight) => {
+        const bare = flight.barePath!;
+        const internals = git as unknown as { withLock: (key: string, fn: () => Promise<unknown>, signal?: AbortSignal) => Promise<unknown> };
+        const original = internals.withLock;
+        let held = false;
+        internals.withLock = function (this: unknown, key, fn, signal) {
+          if (held && key === bare) queued++;
+          return original.call(this, key, fn, signal);
+        };
+        void original.call(git, bare, () => new Promise<void>((resolve) => { held = true; releaseLock = resolve; })).catch(() => undefined);
+        assert.ok(await until(() => held), "the test-owned holder took the bare lock");
+        return { release: () => releaseLock(), entered: () => queued > 0 };
+      },
+    });
+    assertGateFailedClosed(r);
+    assertCustodyIntact(r);
+  });
+
+  it("(3) an executor join (the guarded-lane disposal) that never settles cannot hold the attributed reap past the deadline", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    let unblock = (): void => {};
+    const reapOptions: unknown[] = [];
+    const r = await gateCheckpointRun({
+      dirty: true, forward: {},
+      hang: async (_flight, x) => {
+        const sdk = x.sdk!;
+        (sdk as unknown as { laneDisposal?: Promise<void> }).laneDisposal = new Promise<void>((resolve) => { unblock = resolve; });
+        const reap = sdk.reapAttributedProcesses.bind(sdk);
+        sdk.reapAttributedProcesses = ((opts?: { deadlineAt?: number }) => { reapOptions.push(opts); return reap(opts); }) as typeof sdk.reapAttributedProcesses;
+        return { release: () => unblock(), entered: () => reapOptions.length > 0 };
+      },
+    });
+    assertGateFailedClosed(r);
+    assertCustodyIntact(r);
+    const first = reapOptions[0] as { deadlineAt?: number } | undefined;
+    assert.ok(first && Number.isFinite(first.deadlineAt), `the reap carried the gate deadline: ${JSON.stringify(first)}`);
+    assert.ok(first!.deadlineAt! <= r.rec.startedAt + r.deadlineMs + 50, "and it is this step's deadline");
+  });
+
+  it("(4) a sink gate held by another gated operation cannot hold the capture's admission past its deadline", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    let releaseGate = (): void => {};
+    let queued = 0;
+    const r = await gateCheckpointRun({
+      dirty: true,
+      hang: async (flight) => {
+        const gate = flight.sinkGate as unknown as { run: (fn: () => Promise<unknown>, stop?: unknown) => Promise<unknown> };
+        const original = gate.run.bind(gate);
+        let held = false;
+        gate.run = ((fn: () => Promise<unknown>, stop?: unknown) => { if (held) queued++; return original(fn, stop); }) as typeof gate.run;
+        void original(() => new Promise<void>((resolve) => { held = true; releaseGate = resolve; })).catch(() => undefined);
+        assert.ok(await until(() => held), "the test-owned holder took the sink gate");
+        return { release: () => releaseGate(), entered: () => queued > 0 };
+      },
+    });
+    assertGateFailedClosed(r);
+    assertCustodyIntact(r);
+  });
+
+  it("(5) a reap that consumes the deadline leaves no further proof, helper pass or Docker request admitted", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const reaps: { deadlineAt?: number; at: number }[] = [];
+    const quiesces: { deadlineAt?: number; at: number; process?: string; docker?: string; dockerHost?: string }[] = [];
+    let entered = false;
+    const r = await gateCheckpointRun({
+      dirty: true,
+      forward: {
+        runProcesses: {
+          scan: async () => ({ pids: [], complete: true }),
+          reap: async (_home, _worktree, _pids, opts) => {
+            reaps.push({ deadlineAt: opts?.deadlineAt, at: Date.now() });
+            entered = true;
+            await new Promise((resolve) => setTimeout(resolve, Math.max(0, (opts?.deadlineAt ?? Date.now() + GATE_MS) - Date.now()) + 100));
+            return { killed: [], left: [], complete: true };
+          },
+        },
+      },
+      runnerOpts: { quiesceRun: async (req: QuiesceRunRequest) => {
+        const outcome = await quiesceRunAttempt(req);
+        quiesces.push({ deadlineAt: req.deadlineAt, at: Date.now(), process: outcome.process?.state, docker: outcome.docker.detail, dockerHost: req.dockerHost });
+        return outcome;
+      } },
+      hang: async () => ({ release: () => undefined, entered: () => entered }),
+    });
+    assertGateFailedClosed(r);
+    assert.equal(reaps.length, 1, `exactly one attributed reap: ${JSON.stringify(reaps)}`);
+    assert.ok(Number.isFinite(reaps[0]!.deadlineAt), "the reap carried the gate deadline");
+    const inStep = quiesces.filter((q) => q.at >= r.rec.startedAt && q.at <= r.rec.settledAt);
+    assert.equal(inStep.length, 1, `the re-proof is not admitted after the first proof consumed the deadline: ${JSON.stringify(inStep)}`);
+    assert.ok(Number.isFinite(inStep[0]!.deadlineAt), "the proof carried the gate deadline");
+    assert.equal(inStep[0]!.process, "unverified", "an expired proof is unverified");
+    assert.equal(inStep[0]!.docker, "deadline exhausted", "and no Docker request was admitted");
+  });
+
+  /** A tick process group that never goes, observed through the runner's tick-spawn hooks (no real signal). */
+  function survivorHooks() {
+    const seen = { alive: true, probes: 0, signals: [] as { sig: string; at: number }[] };
+    return { seen, opts: { checkpointTestHooks: { tickSpawn: {
+      groupAlive: () => { seen.probes++; return seen.alive; },
+      signalGroup: (_pgid: number, sig: string) => { seen.signals.push({ sig, at: Date.now() }); return true; },
+    } } } };
+  }
+
+  it("(6a) tick survivors with the sink admitted just before the deadline: the wait is capped, no SIGKILL is sent after expiry and no second wait starts", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const { seen, opts } = survivorHooks();
+    const r = await gateCheckpointRun({
+      dirty: true, runnerOpts: opts, onSettled: () => { seen.alive = false; },
+      hang: async (flight) => {
+        flight.survivingTickGroups.push({ pgid: 424242, identity: "command", killConfirmed: false });
+        const gate = flight.sinkGate as unknown as { run: (fn: () => Promise<unknown>) => Promise<unknown> };
+        let releaseGate = (): void => {};
+        let held = false;
+        void gate.run(() => new Promise<void>((resolve) => { held = true; releaseGate = resolve; })).catch(() => undefined);
+        assert.ok(await until(() => held), "the injected sink holder is admitted");
+        // Freed ~100 ms before the deadline, so the first survivor wait can only start just before expiry.
+        const timer = setTimeout(() => releaseGate(), GATE_MS - 100);
+        return { release: () => { clearTimeout(timer); seen.alive = false; releaseGate(); }, entered: () => seen.probes > 0 };
+      },
+    });
+    assertGateFailedClosed(r);
+    assertCustodyIntact(r);
+    const deadlineAt = r.rec.startedAt + r.deadlineMs;
+    assert.deepEqual(seen.signals.filter((x) => x.at >= deadlineAt - 20), [], "no signal at or after expiry");
+    assert.deepEqual(seen.signals, [], "the first wait was capped by the deadline, so there was no SIGKILL to send");
+  });
+
+  it("(6b) expiry during the second survivor wait: one SIGKILL before the deadline, none after, and the step still settles at the deadline", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const { seen, opts } = survivorHooks();
+    const r = await gateCheckpointRun({
+      dirty: true, deadlineMs: 2500, tailMs: 700, runnerOpts: opts, onSettled: () => { seen.alive = false; },
+      hang: async (flight) => {
+        flight.survivingTickGroups.push({ pgid: 424243, identity: "command", killConfirmed: false });
+        return { release: () => { seen.alive = false; }, entered: () => seen.probes > 0 };
+      },
+    });
+    // The second wait is capped by the deadline: uncapped it would run a further 2 s past it.
+    assertGateFailedClosed(r, 700);
+    assertCustodyIntact(r);
+    const deadlineAt = r.rec.startedAt + r.deadlineMs;
+    assert.equal(seen.signals.length, 1, `exactly one SIGKILL: ${JSON.stringify(seen.signals)}`);
+    assert.equal(seen.signals[0]!.sig, "SIGKILL");
+    assert.ok(seen.signals[0]!.at < deadlineAt, "sent before the deadline");
+    assert.ok(seen.signals[0]!.at >= r.rec.startedAt + 1900, "after the first full wait");
+  });
+});
+
+describe("issue #3980: awaitTickSurvivorsGone with a gate deadline", () => {
+  /** A RunRunner whose survivor probe and signal are the test's hooks; no real process is touched. */
+  function survivorRunner(hooks: { alive: (pgid: number) => boolean; signal: (pgid: number, sig: string) => boolean }) {
+    const warns: string[] = [];
+    const runner = Object.create(RunRunner.prototype) as { checkpointTestHooks: unknown;
+      awaitTickSurvivorsGone(flight: unknown, deadlineAt?: number): Promise<string> };
+    runner.checkpointTestHooks = { tickSpawn: { groupAlive: hooks.alive, signalGroup: hooks.signal } };
+    const flight = (pgids: number[]) => ({ runId: "run-x", survivingTickGroups: pgids.map((pgid) => ({ pgid, identity: "command", killConfirmed: false })),
+      runLog: { ...nullLogger(), warn: (m: string) => { warns.push(m); } } });
+    return { runner, flight, warns };
+  }
+  const block = (ms: number): void => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
+
+  it("a deadline that expires between two groups' SIGKILLs sends no later signal and starts no second wait", async () => {
+    const signals: number[] = [];
+    let probesAfterSignal = 0;
+    const { runner, flight, warns } = survivorRunner({
+      alive: () => { if (signals.length > 0) probesAfterSignal++; return true; },
+      signal: (pgid) => { signals.push(pgid); block(150); return true; },
+    });
+    const started = Date.now();
+    // The first full wait is 2 s, so the deadline must outlast it; the first signal then outlasts the deadline.
+    const verdict = await runner.awaitTickSurvivorsGone(flight([101, 102]), started + 2000 + 100);
+    assert.equal(verdict, "unconfirmed");
+    assert.deepEqual(signals, [101], "the second group was not signalled after the deadline passed");
+    assert.equal(probesAfterSignal, 0, "no second wait began");
+    assert.deepEqual(warns, ["tick survivors unresolved at the gate checkpoint deadline"]);
+    assert.ok(Date.now() - started < 3000);
+  });
+
+  it("an expiry during the first wait sends no signal at all", async () => {
+    const signals: number[] = [];
+    const { runner, flight, warns } = survivorRunner({ alive: () => true, signal: (pgid) => { signals.push(pgid); return true; } });
+    const started = Date.now();
+    assert.equal(await runner.awaitTickSurvivorsGone(flight([201]), started + 200), "unconfirmed");
+    assert.deepEqual(signals, []);
+    assert.equal(warns.length, 1);
+    assert.ok(Date.now() - started < 1000, "the 2 s wait was capped at the deadline");
+  });
+
+  it("a deadline already passed returns at once, unconfirmed, without signalling", async () => {
+    const signals: number[] = [];
+    const { runner, flight } = survivorRunner({ alive: () => true, signal: (pgid) => { signals.push(pgid); return true; } });
+    const started = Date.now();
+    assert.equal(await runner.awaitTickSurvivorsGone(flight([301]), started - 1), "unconfirmed");
+    assert.deepEqual(signals, []);
+    assert.ok(Date.now() - started < 500);
+  });
+
+  it("no survivors is gone immediately, with or without a deadline", async () => {
+    const { runner, flight } = survivorRunner({ alive: () => false, signal: () => true });
+    assert.equal(await runner.awaitTickSurvivorsGone(flight([401]), Date.now() - 1), "gone");
+    assert.equal(await runner.awaitTickSurvivorsGone(flight([401])), "gone");
+  });
+
+  it("with time left the wait/SIGKILL/wait sequence is the unbounded one: a group that dies after its SIGKILL reads gone", async () => {
+    let dead = false;
+    const signals: string[] = [];
+    const { runner, flight } = survivorRunner({ alive: () => !dead, signal: (_pgid, sig) => { signals.push(sig); dead = true; return true; } });
+    assert.equal(await runner.awaitTickSurvivorsGone(flight([501]), Date.now() + 60_000), "gone");
+    assert.deepEqual(signals, ["SIGKILL"]);
+  });
+
+  it("without a deadline the first wait is the full 2 s and expiry never short-circuits", async () => {
+    const signals: string[] = [];
+    let dead = false;
+    const { runner, flight } = survivorRunner({ alive: () => !dead, signal: (_pgid, sig) => { signals.push(sig); dead = true; return true; } });
+    const started = Date.now();
+    assert.equal(await runner.awaitTickSurvivorsGone(flight([601])), "gone");
+    assert.ok(Date.now() - started >= 1900, "waited the unbounded first wait before signalling");
+    assert.deepEqual(signals, ["SIGKILL"]);
+  });
+});
+
+describe("issue #3980: SdkExecutor.reapAttributedProcesses with a gate deadline", () => {
+  function executor() {
+    const reaps: unknown[][] = [];
+    const sdk = new SdkExecutor(nullLogger(), homeDir, {
+      runProcesses: { scan: async () => ({ pids: [], complete: true }),
+        reap: async (...args: unknown[]) => { reaps.push(args.slice(3)); return { killed: [], left: [], complete: true }; } },
+    });
+    const internals = sdk as unknown as { laneDisposal?: Promise<void>; activeDeps?: { abort: AbortController; install: Promise<unknown> }; depsJoined: boolean };
+    return { sdk, reaps, internals };
+  }
+  const never = (): Promise<void> => new Promise<void>(() => undefined);
+
+  it("a lane disposal that never settles reads as an unconfirmed reap at the deadline, and nothing is reaped", async () => {
+    const { sdk, reaps, internals } = executor();
+    internals.laneDisposal = never();
+    const started = Date.now();
+    const r = await sdk.reapAttributedProcesses({ deadlineAt: started + 300 });
+    assert.deepEqual(r, { killed: [], left: [], complete: false });
+    assert.ok(Date.now() - started >= 250 && Date.now() - started < 2000);
+    assert.deepEqual(reaps, []);
+  });
+
+  it("a deps install that never settles likewise; the abort was requested before the wait, and the install is not cancelled further", async () => {
+    const { sdk, reaps, internals } = executor();
+    const abort = new AbortController();
+    internals.activeDeps = { abort, install: never() };
+    internals.depsJoined = false;
+    const started = Date.now();
+    const r = await sdk.reapAttributedProcesses({ deadlineAt: started + 300 });
+    assert.equal(r.complete, false);
+    assert.deepEqual(reaps, []);
+    assert.equal(internals.depsJoined, false, "the install was not reported joined");
+    assert.ok(Date.now() - started < 2000);
+  });
+
+  it("past the deadline nothing is admitted: no deps abort, no reap", async () => {
+    const { sdk, reaps, internals } = executor();
+    const abort = new AbortController();
+    internals.activeDeps = { abort, install: Promise.resolve() };
+    internals.depsJoined = false;
+    const r = await sdk.reapAttributedProcesses({ deadlineAt: Date.now() - 1 });
+    assert.equal(r.complete, false);
+    assert.equal(abort.signal.aborted, false);
+    assert.deepEqual(reaps, []);
+  });
+
+  it("with time left the reap runs and carries the deadline; without one it is called exactly as before", async () => {
+    const withDeadline = executor();
+    const deadlineAt = Date.now() + 60_000;
+    assert.equal((await withDeadline.sdk.reapAttributedProcesses({ deadlineAt })).complete, true);
+    assert.deepEqual(withDeadline.reaps, [[{ deadlineAt }]]);
+    const plain = executor();
+    assert.equal((await plain.sdk.reapAttributedProcesses()).complete, true);
+    assert.deepEqual(plain.reaps, [[]], "no options argument is passed when none was given");
   });
 });
