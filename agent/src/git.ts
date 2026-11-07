@@ -44,7 +44,7 @@ import {
   parseAttemptPath,
   parseRetainedArtifactName,
 } from "./attempt-path.js";
-import { GitIndexError, indexUnchanged, readBoundedIndex, readSmallRegularFile, statSignature, type BoundedIndex } from "./git-index.js";
+import { GitIndexError, indexUnchanged, readBoundedIndex, readSmallRegularFile, statSignature, withClosingHandle, type BoundedIndex } from "./git-index.js";
 import { InvalidRecoveryClonePathError, recoveryProgress, recoverySource, sameRecoverySource, type RecoveryBlocker, type RecoveryProgress, type RecoverySource } from "./recovery-progress.js";
 import { parseSourceFence, serializeSourceFence, type CompletionSourceFence } from "./completion-source.js";
 import type { GitAuthorityHooks, AuthoritySettlement } from "./git-authority-hooks.js";
@@ -3909,6 +3909,12 @@ export class GitCache {
     }
     state.scope.assertSettled();
     if (state.scope.pendingMutations !== 0) throw new Error("epoch discard has pending mutations");
+  }
+
+  /** Throws while any runner delete in this process is unsettled (its child has not closed). The epoch
+   *  reclaim pass calls it so an unresolved delete, wherever it began, is fatal rather than a handover. */
+  assertNoUnsettledDeletes(): void {
+    if (this.unsettledDeletes.size > 0) throw new Error("unsettled runner delete outstanding");
   }
 
   private epochLimits(limits: EpochRetainedLimits = {}): Required<EpochRetainedLimits> {
@@ -12275,15 +12281,14 @@ export class GitCache {
     const lstatPath = (p: string | Buffer) => read(() => fs.lstat(p, { bigint: true }));
     // Entry names stay raw bytes (`encoding: "buffer"`); every entry is charged before it is visited.
     const listDirectory = async (dir: string | Buffer, visit?: (name: Buffer) => void, charged = true): Promise<void> => {
-      const handle = await read(() => fs.opendir(dir, { encoding: "buffer" as BufferEncoding }));
-      try {
+      await withClosingHandle(read, () => fs.opendir(dir, { encoding: "buffer" as BufferEncoding }), async handle => {
         for (;;) {
           const entry = await read(() => handle.read());
           if (entry === null) break;
           if (charged) chargeRecords("directory", 1, "directory entry");
           visit?.(entry.name as unknown as Buffer);
         }
-      } finally { await handle.close(); }
+      });
     };
     return { read, limits, refusal, unknown, exceeded, counters, chargeMetadata, chargeContent, chargeRecords, fixed, remember,
       lstatPath, listDirectory };
@@ -12758,8 +12763,7 @@ export class GitCache {
       // read through one descriptor (no link followed, no blocking open) whose identity and size
       // must match the lstat just charged, at most that many bytes, and must be unchanged afterwards.
       const hashRegularFile = async (file: Buffer, st: import("node:fs").BigIntStats): Promise<string> => {
-        const handle = await read(() => fs.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK));
-        try {
+        return withClosingHandle(read, () => fs.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK), async handle => {
           const opened = await read(() => handle.stat({ bigint: true }));
           if (!opened.isFile() || opened.dev !== st.dev || opened.ino !== st.ino || opened.size !== st.size)
             throw refusal("tracked file changed while opening");
@@ -12776,7 +12780,7 @@ export class GitCache {
           if (statSignature(await read(() => handle.stat({ bigint: true }))) !== statSignature(opened))
             throw refusal("tracked file changed while reading");
           return hash.digest("hex");
-        } finally { await handle.close(); }
+        });
       };
       const gitlinks: Buffer[] = [];
       for (const entry of index.entries) {
@@ -12929,8 +12933,7 @@ export class GitCache {
           const before = await lstatPath(absolute(dir));
           if (!before.isDirectory()) throw refusal("untracked directory changed type");
           remember("u:" + name, absolute(dir), before);
-          const handle = await read(() => fs.opendir(absolute(dir), { encoding: "buffer" as BufferEncoding }));
-          try {
+          await withClosingHandle(read, () => fs.opendir(absolute(dir), { encoding: "buffer" as BufferEncoding }), async handle => {
             for (;;) {
               const entry = await read(() => handle.read());
               if (entry === null) break;
@@ -12939,7 +12942,7 @@ export class GitCache {
               const st = await lstatPath(absolute(child));
               next.push({ name: child.toString("latin1"), directory: st.isDirectory() });
             }
-          } finally { await handle.close(); }
+          });
         }
         frontier = next;
       }
@@ -22663,7 +22666,10 @@ try {
       if (err instanceof RunResidueBlockedError) throw err;
       const abort = this.boundaryAbortError(err);
       if (abort) throw abort;
-      throw new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`, recoveryDeadlineCause(err));
+      const failure = new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`, recoveryDeadlineCause(err));
+      // The wrapper drops the overflow facts; carry a positively identified stdout overflow to isBoundOverflow.
+      if (isBoundOverflow(err)) BOUND_OVERFLOW_ERRORS.add(failure);
+      throw failure;
     }
   }
 
@@ -23135,6 +23141,7 @@ try {
     // an expected non-zero status (e.g. `config --unset-all` exit 5 = key absent) from a
     // real failure — the same `.code` idiom `tryGit` reads off the raw execFile error.
     const failure = new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
+    if (isBoundOverflow(err)) BOUND_OVERFLOW_ERRORS.add(failure);
     const code = (err as { code?: unknown }).code;
     if (typeof code === "number") (failure as { code?: number }).code = code;
     return failure;

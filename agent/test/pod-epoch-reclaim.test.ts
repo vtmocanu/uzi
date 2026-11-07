@@ -1038,6 +1038,8 @@ function makeWorld(count: number, tune?: (w: any) => void) {
     options, calls, parent, events, spies, groups: [] as Array<{ barePath: string; selector: { runId: string; generation: number; attempt: string }; paths: string[] }>,
     pending: 0, stopped: false, eligible: true, activeTx: undefined as object | undefined,
     reserveRefused: false, finishThrows: false, proofThrows: false,
+    /** Mirrors GitCache's process-wide unsettled-delete map being non-empty. */
+    unsettled: false,
     holds: (run_id: string): RecoveryHoldsResponse => ({ run_id, holds: [], run_open_holds: { run_id, count: 0 } }),
     ownership: (): { status: string } => ({ status: "completed" }),
     journal: (_branch: string, path: string, runId: string): Array<string | null> =>
@@ -1092,6 +1094,7 @@ function makeWorld(count: number, tune?: (w: any) => void) {
     }) as never,
     quiesce: async () => true,
     git: {
+      assertNoUnsettledDeletes: () => { if (world.unsettled) throw new Error("unsettled runner delete outstanding"); },
       readEpochJournalVector: async (_bare: string, branch: string) => {
         spies.journalReads.push(branch);
         const i = Number(branch.slice(1));
@@ -1503,6 +1506,39 @@ async function refusedReinspectWithLatch(count: number) {
     return w;
   } finally { for (const cancel of timers) cancel(); await d.close(); }
 }
+// A Git delete left unsettled by a startup sweep (GitCache's process-wide unsettled map) is fatal for the pass even
+// when every candidate is only refused or settled by metadata, which never consult that map themselves.
+test("an unsettled Git delete is fatal: EX kept, no finish, no handover", async () => {
+  const missing = (s: RetainedSourceEvidence) => {
+    s.ledgerState = "retired" as never; s.sources[0]!.ledgerState = "retired" as never;
+    s.presence = "missing"; s.sources[0]!.presence = "missing"; s.sources[0]!.allocatedBytes = null;
+  };
+  const cases: Array<[string, (w: ReturnType<typeof makeWorld>) => void]> = [
+    ["outstanding before a pre-effect refusal", w => { w.unsettled = true; w.ownership = (() => { let n = 0; return () => ({ status: ++n === 1 ? "completed" : "running" }); })(); }],
+    ["outstanding before a metadata-only repair", w => {
+      w.unsettled = true; w.journal = () => [""]; w.mutateSource = missing;
+      w.discard = (_o, path) => ({ kind: "done", sources: [{ clonePath: path, outcome: "missing" }], metadata: "retired" });
+    }],
+    ["raised during a refusal, found at finish", w => {
+      w.discard = () => { w.unsettled = true; return { kind: "refused", reason: "x", consumers: [] }; };
+    }],
+    ["raised during a metadata-only repair, found at finish", w => {
+      w.journal = () => [""]; w.mutateSource = missing;
+      w.discard = (_o, path) => { w.unsettled = true; return { kind: "done", sources: [{ clonePath: path, outcome: "missing" }], metadata: "retired" }; };
+    }],
+  ];
+  for (const [label, tune] of cases) {
+    const d = await daemon();
+    const timers: Array<() => void> = [];
+    try {
+      const w = deletionWorld(1, tune); w.options.dockerHost = d.host;
+      w.options.schedule = (callback, ms) => { const t = setTimeout(callback, ms); const c = () => clearTimeout(t); timers.push(c); return c; };
+      await assert.rejects(runPodEpochShadow(w.options), PodEpochSettlementError, label);
+      assert.equal(w.spies.finishes, 0, label + ": finish is never reached");
+      assert.equal(w.calls.handovers, 0, label); assert.ok(!w.events.includes("handover"), label);
+    } finally { for (const cancel of timers) cancel(); await d.close(); }
+  }
+});
 test("a stop latched during a refused re-inspect is fatal, with no finish and no handover", async () => {
   const w = await refusedReinspectWithLatch(1);
   noMutation(w);

@@ -303,6 +303,24 @@ describe("an overflow of each finite limit is a settled keep, not UNKNOWN", () =
   it("controls: the same fixture is provable under the default budgets", async () => {
     assert.equal(await observation(), true);
   });
+  // The shape stage charges each loose ref component once, but `for-each-ref` repeats the whole name on every
+  // line: the clone refs listing overruns its stdout cap although every earlier stage fits. That is a bulk
+  // content overflow, so the real runGitAsRunner wrapper must not launder it into UNKNOWN.
+  it("a clone refs listing whose stdout overruns the cap behind a long shared prefix", async t => {
+    const prefix = `refs/a${"x".repeat(200)}/b${"y".repeat(200)}`;
+    const names = Array.from({ length: 100 }, (_, i) => `${prefix}/r${i}`);
+    execFileSync("git", ["-C", clonePath, "update-ref", "--stdin"], { env: ENV,
+      input: names.map(name => `create ${name} HEAD\n`).join("") });
+    const limits = { maxMetadataBytes: 16 * 1024 };
+    assert.equal(await observation(), true, "control: provable under the default budgets");
+    assert.equal(await observation(limits), false);
+    lowerDiscardLimits(t, limits);
+    assert.deepEqual(await discard(), { kind: "refused", reason: "epoch_content_unproven", consumers: [] });
+    assert.equal(stopped, false, "a settled keep does not stop the epoch scope");
+    scope.assertSettled();
+    assert.ok(fs.existsSync(clonePath));
+    assert.equal(journal(), raw);
+  });
 });
 
 // A corrupt, unreadable or indirect store, and an unresolved Git execution, are never a settled keep.
@@ -640,10 +658,10 @@ describe("the alternate edge limit", () => {
 
 // ---------------------------------------------------------------------------------------------------------------
 // Re-reads and Git inventories: the mocks sit under the real runGitAsRunner/runGitWithEnv wrappers (at execScoped), which
-// wrap every child failure in a plain Error, so a Git output overrun never reaches the proof as a limit overflow. Both
-// the first read and its repeat are UNKNOWN.
+// wrap every child failure in a fresh Error that keeps a positively identified stdout overrun marked, so the FIRST read
+// of a content-stage inventory is a settled keep; its repeat (a changed observation) stays UNKNOWN.
 
-describe("an overflow of a Git inventory read is UNKNOWN, not a settled keep", () => {
+describe("a FIRST-read Git inventory stdout overflow is a settled keep; its repeat is UNKNOWN", () => {
   const overrun = () => Object.assign(new Error("git subprocess maxBuffer exceeded"), {
     outputExceeded: true, outputStream: "stdout", code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", epochProcessJoined: true });
   const sites: Record<string, (args: string[]) => boolean> = {
@@ -660,9 +678,9 @@ describe("an overflow of a Git inventory read is UNKNOWN, not a settled keep", (
         if (matches(args[1]) && ++seen === failAt) throw overrun();
         return original(...args);
       });
-      // First instance: the real wrapper turns the overrun into an unreadable inventory, which is UNKNOWN.
-      await assert.rejects(observation(), e => (e as Error).constructor.name === "AutomaticCompletenessUnknown" &&
-        /object coverage unavailable/.test((e as Error).message));
+      // First instance: the real wrapper keeps the positively identified stdout overflow, so the content proof
+      // ends as a settled keep, not UNKNOWN.
+      assert.equal(await observation(), false);
       assert.equal(seen, 1);
       // The repeat of the same read, after the first fit: UNKNOWN.
       seen = 0; failAt = 2;

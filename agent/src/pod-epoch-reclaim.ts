@@ -37,7 +37,7 @@ export interface PodEpochDeletionDeps {
    * the discard API's shape but is not used to scope the proof.
    */
   quiesce: (paths: string[]) => Promise<boolean>;
-  git: Pick<GitCache, "createEpochDiscardProof" | "discardStoppedSource" | "readEpochJournalVector">;
+  git: Pick<GitCache, "createEpochDiscardProof" | "discardStoppedSource" | "readEpochJournalVector" | "assertNoUnsettledDeletes">;
   /** Test override sentinel only; see {@link EPOCH_RECLAIM_DELETION_ENABLED}. */
   enableForTest?: symbol;
 }
@@ -223,10 +223,13 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
   };
   // Set once the deletion phase opened its reclaim scope; settled and finished before native handover.
   let reclaimScope: PodEpochReclaimScope | undefined;
+  // Set with the scope: the git handle whose process-wide unsettled-delete map the finish must consult.
+  let deletionGit: PodEpochDeletionDeps["git"] | undefined;
   const finishReclaimScope = () => {
     const scope = reclaimScope;
     if (!scope) return;
     try {
+      deletionGit?.assertNoUnsettledDeletes();
       if (scope.stopped() || scope.pendingMutations > 0) throw new Error("reclaim unsettled");
       scope.finish();
       reclaimScope = undefined;
@@ -498,8 +501,12 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
         !invalid && !controller.signal.aborted && typeof ownership.beginReclaim === "function") {
       // With no admitted candidate nothing can be mutated, so no native scope is opened or finished; the pass
       // still reports reclaim_complete. Every loop body below runs only when admits is non-empty.
+      // An unsettled runner delete anywhere in this process (including startup sweeps) is fatal before any
+      // scope opens: EX is kept and no handover happens.
+      try { deps.git.assertNoUnsettledDeletes(); } catch { fatal = true; throw new PodEpochSettlementError(); }
       const scope = admits.size > 0 ? ownership.beginReclaim() : undefined;
       reclaimScope = scope;
+      deletionGit = deps.git;
       // Pending children or a stop latch are never settled by a later step: fail closed with EX kept.
       const assertSettled = () => {
         if (scope && (scope.stopped() || scope.pendingMutations > 0)) { fatal = true; throw new PodEpochSettlementError(); }
