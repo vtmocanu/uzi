@@ -297,16 +297,16 @@ function ResetForm({
             <p>At least {MIN_PASSWORD} characters.</p>
             {passwordLogin === "off" && (
               <p>
-                This instance signs in with single sign-on only, so this new password works only if an administrator
-                turns password sign-in on. uzi creates your fresh vault at that first password sign-in. Until then you
-                can still sign in with single sign-on, but you cannot store new model credentials.
+                This instance signs in with single sign-on only, so the web app cannot create your fresh vault yet. uzi
+                creates it at your first password sign-in, once an administrator turns password sign-in on. Until then
+                you can still sign in with single sign-on, but you cannot store new model credentials.
               </p>
             )}
             {passwordLogin === "unknown" && (
               <p>
-                If your instance signs in with single sign-on only, this new password works only once an administrator
-                turns password sign-in on, and uzi creates your fresh vault at that first password sign-in. Until then
-                you can sign in with single sign-on, but you cannot store new model credentials.
+                If your instance signs in with single sign-on only, the web app cannot create your fresh vault until an
+                administrator turns password sign-in on; uzi creates it at that first password sign-in. Until then you
+                can sign in with single sign-on, but you cannot store new model credentials.
               </p>
             )}
           </div>
@@ -342,10 +342,10 @@ function doneMessage(kind: ResetLinkKind, passwordLogin: PasswordLogin): string 
     case "on":
       return "Your account is reset. Sign in with your new password; uzi creates a fresh vault when you do.";
     case "off":
-      return "Your account is reset. This instance uses single sign-on only, so your new password works only if an administrator turns password sign-in on; uzi creates your fresh vault at that first password sign-in. Until then you can sign in with single sign-on, but you cannot store new model credentials.";
+      return "Your account is reset. This instance uses single sign-on only, so the web app cannot create your fresh vault yet; uzi creates it at your first password sign-in, once an administrator turns password sign-in on. Until then you can sign in with single sign-on, but you cannot store new model credentials.";
     default:
       // Config still loading or unavailable: name both paths, claim neither.
-      return "Your account is reset. If your instance allows password sign-in, sign in with your new password; uzi creates your fresh vault then. If it uses single sign-on only, your new password works only once an administrator turns password sign-in on. Until then you can sign in with single sign-on, but you cannot store new model credentials.";
+      return "Your account is reset. If your instance allows password sign-in, sign in with your new password; uzi creates your fresh vault then. If it uses single sign-on only, the web app cannot create your fresh vault until an administrator turns password sign-in on. Until then you can sign in with single sign-on, but you cannot store new model credentials.";
   }
 }
 

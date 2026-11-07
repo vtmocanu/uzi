@@ -216,7 +216,7 @@ describe("ResetAccount password form", () => {
     await passwordForm(SSO_ONLY);
     expect(
       await screen.findByText(
-        /This instance signs in with single sign-on only, so this new password works only if an administrator\s+turns password sign-in on\./,
+        /This instance signs in with single sign-on only, so the web app cannot create your fresh vault yet\.\s+uzi\s+creates it at your first password sign-in, once an administrator turns password sign-in on\./,
       ),
     ).toBeTruthy();
     expect(document.body.textContent).not.toMatch(/Settings/);
@@ -225,7 +225,7 @@ describe("ResetAccount password form", () => {
     fireEvent.click(ack());
     fireEvent.click(submit());
     const doneMsg = await screen.findByText(
-      "Your account is reset. This instance uses single sign-on only, so your new password works only if an administrator turns password sign-in on; uzi creates your fresh vault at that first password sign-in. Until then you can sign in with single sign-on, but you cannot store new model credentials.",
+      "Your account is reset. This instance uses single sign-on only, so the web app cannot create your fresh vault yet; uzi creates it at your first password sign-in, once an administrator turns password sign-in on. Until then you can sign in with single sign-on, but you cannot store new model credentials.",
     );
     expect(doneMsg.textContent).not.toMatch(/Settings/);
     // The done state must not send them to a password sign-in that cannot work.
@@ -245,7 +245,7 @@ describe("ResetAccount password form", () => {
     fireEvent.click(submit());
     const done = await screen.findByText(/Your account is reset\./);
     expect(done.textContent).toMatch(/If your instance allows password sign-in, sign in with your new password;/);
-    expect(done.textContent).toMatch(/If it uses single sign-on only, your new password works only once an administrator turns password sign-in on/);
+    expect(done.textContent).toMatch(/If it uses single sign-on only, the web app cannot create your fresh vault until an administrator turns password sign-in on/);
     expect(done.textContent).not.toMatch(/Settings/);
   });
 

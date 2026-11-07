@@ -174,8 +174,9 @@ restores account access, not vault contents.
   so it cannot be used to read the user's credentials. Forge connections,
   repos, schedules, run history, settings, CLI tokens and product OAuth grants
   are untouched apart from credential references: the sidebar's Codex account
-  list is cleared, and references to deleted credentials in judge, worker and
-  run settings become empty.
+  list is cleared, references to deleted credentials in judge, worker, run and
+  schedule settings and in run credential history become empty, and per-credential
+  rate-limit and Codex account state is deleted with its credential.
 - **Admin takeover.** An admin can take over any non-seed account, other admins
   included, by issuing a link and redeeming it themselves with a password they
   choose. The admin never learns the user's old password and cannot read the
@@ -185,18 +186,20 @@ restores account access, not vault contents.
   target is an admin, never the token). The seed admin and the issuer's own
   account are refused. A link is void if its issuer is later deactivated or
   demoted.
-- **SSO-only instances.** With password login disabled, the new password only
-  does nothing until an administrator turns password sign-in on; uzi creates
-  the fresh vault at that first password sign-in. Until then the user can sign
-  in through SSO but has no usable vault for storing model credentials. Reset
+- **SSO-only instances.** With password login disabled, the web app offers no
+  way to create the fresh vault: it is created at the first password sign-in
+  once an administrator turns password sign-in on, or through
+  `POST /api/vault/enable` with the new password from an SSO session. Until
+  then the user can sign in through SSO but cannot store model credentials. Reset
   links for users with no password (SSO-only accounts) are not yet
   available.
 - **Running runs.** A run already executing keeps the credential its worker was
   issued until it ends; stopping or fencing active runs is out of scope. Its
-  Codex refresh writes against a deleted account fail closed. Queued runs that
-  pinned to a credential or using the default credential, and Codex runs, fail
-  at claim like any other deleted credential. Claude runs on an auto-bound
-  worker wait in the credential pool (`pool_wait`) until a credential exists.
+  Codex refresh writes against a deleted account fail closed. Queued runs are
+  not claimed until the new vault exists and is unlocked. After that, runs that
+  fall back to the default credential, and Codex runs, fail at claim like any
+  other deleted credential; Claude runs that resolve to an auto-bound worker
+  wait in the credential pool (`pool_wait`) until a credential exists.
 - **Uncertain outcome.** If the commit cannot be confirmed the redeem call
   returns `503` with "the reset could not be confirmed; try signing in with the
   new password, or ask for a new link".

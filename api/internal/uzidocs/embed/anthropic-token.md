@@ -596,18 +596,20 @@ a new password:
 - Leaves you **protected** with no vault; your next password login creates a
   fresh one, even if you had turned protection Off.
 - Does not stop runs that are already executing; they keep the credential their
-  worker was issued until they end. Queued runs pinned to a credential or using
-  the default credential, and Codex runs, fail at claim, as for any deleted
-  credential, until you add a new one. Claude runs on an auto-bound worker wait
-  in the credential pool (`pool_wait`) until a credential exists.
+  worker was issued until they end. Queued runs are not claimed until your new
+  vault exists and is unlocked. After that, runs that fall back to the default
+  credential, and Codex runs, fail at claim, as for any deleted credential.
+  Claude runs that resolve to an auto-bound worker wait in the credential pool
+  (`pool_wait`) until a credential exists.
 
-On an SSO-only instance (password login disabled) the new password does nothing
-until an administrator turns password sign-in on. uzi creates the fresh vault at
-that first password sign-in. Until then you can sign in through SSO but have no
-usable vault for storing model credentials. The seed admin cannot be reset with
+On an SSO-only instance (password login disabled) the web app offers no way to
+create the fresh vault: it is created at your first password sign-in once an
+administrator turns password sign-in on, or through `POST /api/vault/enable`
+with the new password from your SSO session. Until then you can sign in through
+SSO but cannot store model credentials. The seed admin cannot be reset with
 a link, and an admin cannot issue one for their own account. An admin can take
-over any other account except the seed admin, admins included, by issuing a
-link (in this release, not for SSO-only accounts); see the [threat model](./vault-threat-model.md#admin-issued-account-reset).
+over any other active account except the seed admin, admins included, by
+issuing a link (in this release, not for SSO-only accounts); see the [threat model](./vault-threat-model.md#admin-issued-account-reset).
 If the page reports that the reset could not be confirmed, try signing in with
 the new password, or ask for a new link.
 
