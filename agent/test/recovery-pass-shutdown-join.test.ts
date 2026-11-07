@@ -31,6 +31,25 @@ async function within<T>(pending: Promise<T>, ms = 5000): Promise<T> {
     })]);
   } finally { clearTimeout(timer); }
 }
+// The fake git both tests run: `bundle create` publishes its PID to `artifact`, then sleeps; any
+// other command delegates to /usr/bin/git. The PID appears only with its full content: it goes to
+// a same-directory tmp file, then a rename. Visibility only; no durability is claimed. `hold` runs
+// inside the tmp-file redirect, before the PID is written.
+function fakeGitScript(artifact: string, hold = "") {
+  return "#!/bin/sh\ncase \"$*\" in *'bundle create'*) { " + hold + " echo $$; } > '" + artifact + ".tmp' && mv '" +
+    artifact + ".tmp' '" + artifact + "'; exec /bin/sleep 60;; esac\nexec /usr/bin/git \"$@\"\n";
+}
+// One fs.watch on `dir`; seen(name) settles on the first event named exactly `name`, including one already delivered.
+function watchNames(dir: string) {
+  const waiting = new Map<string, ReturnType<typeof deferred>>();
+  const entry = (name: string) => {
+    let d = waiting.get(name);
+    if (!d) waiting.set(name, d = deferred());
+    return d;
+  };
+  const watcher = watch(dir, (_event, name) => { if (name) entry(name).resolve(); });
+  return { seen: (name: string) => entry(name).promise, close: () => watcher.close() };
+}
 async function fixture(t: TestContext) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "uzi-pass-join-"));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
@@ -150,11 +169,11 @@ it("pass shutdown reaps real bundle child before releasing the bare lock", linux
     "--git-dir", bare, "commit-tree", tree], { input: "fixture\n", encoding: "utf8" }).trim();
   const bin = path.join(f.root, "bin"), artifact = path.join(f.root, "child.pid");
   await fs.mkdir(bin);
-  await fs.writeFile(path.join(bin, "git"), "#!/bin/sh\ncase \"$*\" in *'bundle create'*) echo $$ > '" + artifact +
-    "'; exec /bin/sleep 60;; esac\nexec /usr/bin/git \"$@\"\n", { mode: 0o700 });
-  const started = deferred(), closed = deferred();
-  const watcher = watch(f.root, (_event, name) => { if (name === "child.pid") started.resolve(); });
+  await fs.writeFile(path.join(bin, "git"), fakeGitScript(artifact), { mode: 0o700 });
+  const closed = deferred();
+  const watcher = watchNames(f.root);
   t.after(() => watcher.close());
+  const started = watcher.seen("child.pid");
   const spawn = childProcess.spawn;
   let owned: ReturnType<typeof childProcess.spawn> | undefined;
   t.after(async () => {
@@ -178,7 +197,7 @@ it("pass shutdown reaps real bundle child before releasing the bare lock", linux
     finalizationPin: true, bareDir: "repo.git", defaultBranch: "main" });
   const c = coordinator(f, client, git);
   const pass = c.resumePending();
-  await within(started.promise);
+  await within(started);
   assert.equal(Number(await fs.readFile(artifact, "utf8")), owned!.pid);
   let reaped = false;
   void closed.promise.then(() => { reaped = true; });
@@ -190,6 +209,41 @@ it("pass shutdown reaps real bundle child before releasing the bare lock", linux
   if (failure) throw failure;
   assert.ok(performance.now() - start < 5000);
   assert.equal((await c.inspect(record.runId))[0]?.state, "pinned");
+});
+
+it("fake git publishes child.pid only with complete content", linux, async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "uzi-pass-join-pid-"));
+  const artifact = path.join(root, "child.pid"), readyFifo = path.join(root, "ready"), releaseFifo = path.join(root, "release");
+  childProcess.execFileSync("mkfifo", [readyFifo, releaseFifo]);
+  const script = path.join(root, "git");
+  await fs.writeFile(script, fakeGitScript(artifact, "echo ready > '" + readyFifo + "'; read _ < '" + releaseFifo + "';"),
+    { mode: 0o700 });
+  const watcher = watchNames(root);
+  const published = watcher.seen("child.pid");
+  let publishedSettled = false;
+  void published.then(() => { publishedSettled = true; });
+  const child = childProcess.spawn(script, ["bundle", "create"], { stdio: "ignore" });
+  const closed = new Promise<void>(r => child.once("close", () => r()));
+  t.after(async () => {
+    watcher.close();
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await closed;
+    // Free any libuv thread still blocked opening a FIFO after an early failure.
+    for (const [fifo, flags] of [[readyFifo, fs.constants.O_WRONLY], [releaseFifo, fs.constants.O_RDWR]] as const) {
+      try { await (await fs.open(fifo, flags | fs.constants.O_NONBLOCK)).close(); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENXIO") throw e; }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
+  await within(fs.readFile(readyFifo, "utf8"));
+  await assert.rejects(fs.lstat(artifact), { code: "ENOENT" });
+  await fs.writeFile(path.join(root, "sentinel"), "sentinel");
+  await within(watcher.seen("sentinel"));
+  assert.equal(publishedSettled, false, "child.pid must not be visible before its content is written");
+  await within(fs.writeFile(releaseFifo, "go\n"));
+  await within(published);
+  const content = await fs.readFile(artifact, "utf8");
+  assert.equal(content, `${child.pid}\n`);
+  assert.equal(Number(content), child.pid);
 });
 
 it("foreground terminal preservation keeps caller grace while the background pass aborts", linux, async t => {
