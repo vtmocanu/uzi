@@ -14331,7 +14331,10 @@ export class RunRunner {
    *  1. an attempt-path flight cannot reuse the cwd-keyed session (fresh_from_saved_work needs the owner);
    *  2. when the claim names the held head R, the recovered clone must provably contain R (see
    *     {@link policyHeadRecovered}); on success the proof is recorded server-side before any model turn;
-   *  3. the saved session id must exist and its Codex transcript must be present on this worker.
+   *  3. an earlier claim's one-claim Fresh grant that was never confirmed re-holds as
+   *     fresh_start_uncertain (a provider thread may already exist);
+   *  4. a claim carrying the owner's one-claim Fresh grant arms a single-use allowance and skips rule 5;
+   *  5. otherwise the saved session id must exist and its Codex transcript must be present on this worker.
    * Without R (a degraded capture) rule 2 is skipped. Nothing is deleted on a rejection.
    */
   private async admitPolicyPreserveOnly(claim: ClaimResponse, flight: RunFlight, runnerClone: RunnerClone): Promise<void> {
