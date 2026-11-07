@@ -310,19 +310,19 @@ Fresh grant, no claimed, running or waiting row carrying a required saved-work h
 and no claimed, running or waiting run still preserving after an owner Resume
 (preserve or fresh_one_claim) remains. Otherwise stay on the new version and keep undrained worker volumes.
 Then stop all API replicas and run goose down exactly one version at a time
-from 00415:
+from 00417:
 
-1. 00415 restores the Fresh shape check as `NOT VALID`.
-2. 00414 is guarded: it refuses live or orphan rows and converts paused or
+1. 00417 restores the Fresh shape check as `NOT VALID`.
+2. 00416 is guarded: it refuses live or orphan rows and converts paused or
    queued active rows to failed.
-3. 00413 is guarded the same way.
+3. 00415 is guarded the same way.
 
-Never go below 00412. After any step or crash, rediscover the version with
+Never go below 00414. After any step or crash, rediscover the version with
 `SELECT max(version_id) FROM goose_db_version WHERE is_applied`. Start the
-earlier API image only at 00412; at an intermediate version either run the next
+earlier API image only at 00414; at an intermediate version either run the next
 Down or roll forward by restarting the new image.
 
-The Downs are destructive. 00413's Down permanently drops the recorded hold
+The Downs are destructive. 00415's Down permanently drops the recorded hold
 cause and recovery identity columns for all rows, so take a backup or `COPY`
 first. They refuse a run in any other live state (claimed, running, `recovery_wait`,
 `limit_wait`, `pool_wait`, `awaiting_*`) that still carries an active policy
