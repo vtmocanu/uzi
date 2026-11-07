@@ -1,5 +1,8 @@
 /// <reference types="@vitest/browser-playwright" />
 import "../index.css";
+import "@fontsource/ibm-plex-sans/latin-400.css";
+import "@fontsource/ibm-plex-sans/latin-500.css";
+import "@fontsource/ibm-plex-sans/latin-600.css";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cdp, page, userEvent } from "vitest/browser";
 import { cleanup, render, screen, within } from "@testing-library/react";
@@ -328,7 +331,15 @@ describe("OverviewNext issue work line", () => {
 // #4052: the admin's You / All users switch is the Issue work header's right-most item and
 // holds still while the scope or a pressed station changes the rest of the card.
 describe("OverviewNext issue work scope switch", () => {
-  beforeEach(() => localStorage.clear());
+  // IBM Plex has real 400/500/600 faces with different advances, so a weight change between
+  // the selected and unselected option would move the switch; the system fallback may not.
+  beforeEach(() => {
+    localStorage.clear();
+    document.documentElement.dataset.font = "plex";
+  });
+  afterEach(() => {
+    delete document.documentElement.dataset.font;
+  });
 
   function mountAdminLine() {
     // The viewer's own runs on several stations; the admin list (beforeEach) adds two other
