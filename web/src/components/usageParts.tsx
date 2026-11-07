@@ -187,7 +187,7 @@ export function SinceLastFailedRun({ outcomes, owner, label = "Latest failure", 
 
 export function SegmentedToggle<T extends string>({ label, options, value, onChange, className = "ml-auto" }: {
   label: string;
-  options: readonly { value: T; label: string }[];
+  options: readonly { value: T; label: string; disabled?: boolean }[];
   value: T;
   onChange: (value: T) => void;
   className?: string;
@@ -199,9 +199,10 @@ export function SegmentedToggle<T extends string>({ label, options, value, onCha
           key={option.value}
           type="button"
           aria-pressed={value === option.value}
+          disabled={option.disabled}
           onClick={() => onChange(option.value)}
           className={cx(
-            "min-h-11 rounded-full border px-2.5 text-xs focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring sm:min-h-8",
+            "min-h-11 rounded-full border px-2.5 text-xs focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:text-muted sm:min-h-8",
             value === option.value ? "border-edge-strong bg-surface font-semibold text-fg shadow-sm" : "border-transparent font-normal text-muted hover:text-fg",
           )}
         >
