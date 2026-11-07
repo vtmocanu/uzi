@@ -98,7 +98,7 @@ it("cached marker becomes neutral after failed reconnect catchup", async () => {
   await act(async () => Socket.last.onopen?.());
   expect(screen.getByText(/Paused at/)).toBeTruthy();
 });
-it.each(["completion_blocked", "credential_disabled", "provider_unavailable"])("keeps %s hold out of the ordinary paused panel", async hold_reason => {
+it.each(["completion_blocked", "credential_disabled", "credentials_reset", "provider_unavailable"])("keeps %s hold out of the ordinary paused panel", async hold_reason => {
   vi.mocked(api.getRun).mockResolvedValue({ run: { ...paused, hold_reason } });
   vi.mocked(api.getRunMessages).mockResolvedValue({ messages: [marker("owner")] });
   mount();

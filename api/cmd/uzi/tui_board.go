@@ -234,7 +234,7 @@ func runBand(status string, isRevising bool) int {
 // holds also require the owner to Resume, Stop or Cancel. Both are NEEDS YOU. Every band decision on the board
 // (the ordering, the eyebrow counts, the row's title ink) goes through here so they agree.
 func runBandOf(r apitypes.RunListItemDTO) int {
-	if isDiskOwnerHold(r.RunDTO) || isIterationHold(r.RunDTO) || isForgeOwnerHold(r.RunDTO) || codexReloginHold(r.RunDTO) || isCredentialDisabledHold(r.RunDTO) || isOwnerRequiredWorkerHold(r.RunDTO) || isProviderUnavailableHold(r.RunDTO) || isCredentialSwitchHold(r.RunDTO) {
+	if isDiskOwnerHold(r.RunDTO) || isIterationHold(r.RunDTO) || isForgeOwnerHold(r.RunDTO) || codexReloginHold(r.RunDTO) || isCredentialDisabledHold(r.RunDTO) || isCredentialsResetHold(r.RunDTO) || isOwnerRequiredWorkerHold(r.RunDTO) || isProviderUnavailableHold(r.RunDTO) || isCredentialSwitchHold(r.RunDTO) {
 		return bandNeedsYou
 	}
 	return runBand(r.Status, r.IsRevising)
@@ -272,6 +272,9 @@ func runStateWord(r apitypes.RunListItemDTO) string {
 	}
 	if isCredentialDisabledHold(r.RunDTO) {
 		return credDisabledWord
+	}
+	if isCredentialsResetHold(r.RunDTO) {
+		return credsResetWord
 	}
 	if isCredentialSwitchSettlingHold(r.RunDTO) {
 		return credSwitchSettlingWord
@@ -1281,7 +1284,7 @@ func (m tuiModel) boardSummary() string {
 		if codexReloginHold(r.RunDTO) {
 			relogins++
 		}
-		if isIterationHold(r.RunDTO) || isCredentialDisabledHold(r.RunDTO) || isProviderUnavailableHold(r.RunDTO) || isCredentialSwitchHold(r.RunDTO) {
+		if isIterationHold(r.RunDTO) || isCredentialDisabledHold(r.RunDTO) || isCredentialsResetHold(r.RunDTO) || isProviderUnavailableHold(r.RunDTO) || isCredentialSwitchHold(r.RunDTO) {
 			ownerHolds++
 		}
 		switch r.Status {

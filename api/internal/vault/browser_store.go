@@ -19,6 +19,7 @@ type BrowserStore interface {
 	BumpTokenVersion(context.Context, uuid.UUID) (int32, error)
 	UpdatePassword(context.Context, store.UpdatePasswordParams) error
 	SetUserActive(context.Context, store.SetUserActiveParams) (store.User, error)
+	SupersedeLiveResetLinksForUser(context.Context, store.SupersedeLiveResetLinksForUserParams) (int64, error)
 }
 
 var _ BrowserStore = (*store.Queries)(nil)

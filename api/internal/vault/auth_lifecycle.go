@@ -52,10 +52,19 @@ func (v *Vault) SetUserActive(ctx context.Context, arg store.SetUserActiveParams
 	err := v.authMutation(ctx, arg.ID, func(ctx context.Context, q BrowserStore, _ store.LockVaultAuthStateRow) error {
 		var err error
 		user, err = q.SetUserActive(ctx, arg)
-		if err == nil && !arg.IsActive {
+		if err != nil {
+			return err
+		}
+		if !arg.IsActive {
+			// A separate statement after the users-row update, in the same transaction
+			// (PRD #3989 D15): the deactivated user's issued and targeting reset links die
+			// with the deactivation, and a redeem holding a link lock is serialized on it.
+			if _, err := q.SupersedeLiveResetLinksForUser(ctx, store.SupersedeLiveResetLinksForUserParams{ID: arg.ID, AsTarget: true}); err != nil {
+				return err
+			}
 			v.evict(arg.ID)
 		}
-		return err
+		return nil
 	})
 	if err != nil {
 		return store.User{}, err

@@ -42,6 +42,7 @@ pass "health_stall_seconds tightened to 60s for the scenario"
 # the #47 legs finish (below) so the cap-3 window is scoped to this phase; no phase after
 # #47 asserts cap==2, but the unset keeps a future one inserted here from inheriting cap 3.
 export UZI_E2E_MAX_CONCURRENT_RUNS=3
+capture_agent_logs 46-run-health before-recreate-cap3
 "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null
 # Wait for the recreated worker to actually ADVERTISE cap 3, not merely `online`: the
 # reused join token means the old cap-2 row can still read online for a beat before the

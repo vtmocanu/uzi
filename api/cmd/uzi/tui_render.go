@@ -429,6 +429,9 @@ const (
 const (
 	credDisabledGlyph = "⊘"
 	credDisabledWord  = "cred disabled"
+	// credsResetWord is the word of a credentials_reset hold (PRD #3989): same glyph and amber
+	// NEEDS YOU treatment, since the owner must add a credential. 11 runes, within boardStatusWordWidth.
+	credsResetWord = "creds reset"
 )
 
 const (
@@ -478,6 +481,9 @@ func (p palette) runStateToken(r apitypes.RunDTO, isRevising bool) runToken {
 	}
 	if isCredentialDisabledHold(r) {
 		return runToken{glyph: credDisabledGlyph, word: credDisabledWord, color: p.amber}
+	}
+	if isCredentialsResetHold(r) {
+		return runToken{glyph: credDisabledGlyph, word: credsResetWord, color: p.amber}
 	}
 	if isCredentialSwitchSettlingHold(r) {
 		return runToken{glyph: credSwitchGlyph, word: credSwitchSettlingWord, color: p.amber}

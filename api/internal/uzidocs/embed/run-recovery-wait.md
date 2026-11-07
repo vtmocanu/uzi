@@ -268,7 +268,37 @@ plus jitter. This cause has its own `retained_park_count`, separate from the
 lifetime recovery-wait count and worker-death requeue allowance.
 `RUN_RETAINED_RECOVERY_MAX_PARKS` sets the cap; **0 holds immediately**.
 The fourth exhaustion at defaults stays held for the owner, without a timer
-or another counted park. Resume does not reset that cap.
+or another counted park. Resume does not reset that cap. The one exception to
+"below the cap is counted" is a capacity-only window, described next.
+
+**Capacity-only window (owner hold below the cap).** When a retained-recovery
+window ends with every reservation the worker witnessed refused for
+data-volume capacity (including a window that reaches its recovery deadline
+or budget after at least one such refusal; a deadline that aborts a consumed
+attempt, rather than a capacity refusal ending it, makes the window mixed), the
+worker sends its
+`retained_recovery_exhausted` park with the request-only field
+`retained_capacity_only: true`, and only if the API advertises
+`retained_recovery_capacity_hold_v1`. The API then holds the run for the
+owner: `retained_park_count` is not incremented, there is no retry time
+(`recovery_retry_not_before` stays NULL), and `worker_id` and source custody
+are kept. It is not a disk park and does not reset the budget. Nothing new is
+stored, so the CLI and web show the same owner-held state as an at-cap hold
+(CLI text is unchanged). The worker posts one run-feed status: "retained
+recovery held for owner: every recovery attempt in this window was refused for
+data volume capacity; owner Resume required; predecessor work and custody
+retained". Owner Resume gives one more window; a further all-capacity window
+holds again. Mixed windows (any non-capacity failure), deadline-only windows
+and every other case keep the ordinary park rules above (counted and timed
+below the cap, held at it). An older API never advertises the feature, so it
+never receives the marker; if a rolled-back API answers the marked report with
+400, the worker falls back to one unmarked pass, which follows the ordinary
+park rules above.
+
+Trade-offs: freeing headroom alone no longer auto-resumes such a run, because
+owner Resume is required. The hold keeps `worker_id`, so it can delay that
+worker's image roll. The later non-claim after Resume is the separate
+capability and image-roll cycle tracked in #4047, not part of this hold.
 
 A fresh claim with a higher derived recovery episode charges one of three
 reservations in a new five-minute window and must prove quiescence again.
@@ -1230,7 +1260,7 @@ historical-evidence rules above remain in force.
   `worker_requeue_exhausted` is an owner-only exhaustion hold: explicit
   Resume starts a new episode; Cancel ends the run. It has no automatic retry.
   `retained_recovery_exhausted` has bounded timed retries followed by an owner
-  hold; see [Retained recovery exhausted](#retained-recovery-exhausted).
+  hold (a capacity-only window is held for the owner below the cap); see [Retained recovery exhausted](#retained-recovery-exhausted).
   `retained_recovery_adoption_failed` instead requires owner Resume or Cancel,
   with no automatic retry; see [Retained recovery adoption failed](#retained-recovery-adoption-failed).
   `retained_continuation_unwitnessed` is likewise owner Resume or Cancel with no
