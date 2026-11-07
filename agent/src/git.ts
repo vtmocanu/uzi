@@ -4019,6 +4019,12 @@ export class GitCache {
                   const g = await this.gatherRetainedUnderLock(bare);
                   for (const rec of g.records) {
                     this.checkRecoveryInterruption();
+                    // The append-only retired ledger and empty journal also describe a clear whose
+                    // durability barrier was interrupted. Skip a completed pair before the path cap
+                    // only when its exact path has the authenticated retired authority tombstone,
+                    // written after the barriers and source-use end. Unknown stays counted for repair.
+                    if (rec.epochRetiredEmptyJournal && this.authority?.isRetiredSource &&
+                        await this.retainedIO(() => this.authority!.isRetiredSource!(rec.parts[0]!.clonePath))) continue;
                     const paths = [...new Set(rec.parts.map(p => p.clonePath))];
                     const fresh = paths.filter(p => !seen.has(p));
                     if (seen.size + fresh.length > limits.maxSeenPaths) {

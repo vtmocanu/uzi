@@ -723,7 +723,7 @@ async function reclaimHolder(t: { after(fn: () => void): void }, mode: "inherit"
     alive: () => { try { process.kill(pid!, 0); return true; } catch { return false; } } };
 }
 
-test("reclaim-scope descendant keeps EX after the parent releases its own descriptor, until it exits", { timeout: 60000 }, async (t) => {
+test("reclaim-scope descendant keeps EX after the parent releases its own descriptor, until it exits", { skip: process.platform !== "linux", timeout: 60000 }, async (t) => {
   const h = await reclaimHolder(t, "inherit");
   assert.deepEqual(h.ready.lockFds, ["3"], "descendant holds the epoch lock file as fd 3");
   assert.equal(peerProbe(h.f.root), 200, "parent and descendant hold EX");
@@ -736,7 +736,7 @@ test("reclaim-scope descendant keeps EX after the parent releases its own descri
   await h.closed;
 });
 
-test("parent SIGKILL leaves the lock with the mutating descendant until it exits", { timeout: 60000 }, async (t) => {
+test("parent SIGKILL leaves the lock with the mutating descendant until it exits", { skip: process.platform !== "linux", timeout: 60000 }, async (t) => {
   const h = await reclaimHolder(t, "inherit");
   assert.deepEqual(h.ready.lockFds, ["3"], "descendant holds the epoch lock file as fd 3");
   assert.equal(peerProbe(h.f.root), 200);
@@ -751,7 +751,7 @@ test("parent SIGKILL leaves the lock with the mutating descendant until it exits
   await eventually(h.f.root, 0, "descendant exit releases after parent death");
 });
 
-test("closing the descriptor releases only when no holder remains", { timeout: 60000 }, async (t) => {
+test("closing the descriptor releases only when no holder remains", { skip: process.platform !== "linux", timeout: 60000 }, async (t) => {
   const h = await reclaimHolder(t, "inherit");
   assert.deepEqual(h.ready.lockFds, ["3"], "descendant holds the epoch lock file as fd 3");
   h.descendant("SIGUSR2"); // descendant closes its own fd 3 while the parent holds
@@ -766,7 +766,7 @@ test("closing the descriptor releases only when no holder remains", { timeout: 6
   await h.closed;
 });
 
-test("an ordinary spawn without inheritStdio never holds the lock", { timeout: 60000 }, async (t) => {
+test("an ordinary spawn without inheritStdio never holds the lock", { skip: process.platform !== "linux", timeout: 60000 }, async (t) => {
   const h = await reclaimHolder(t, "ordinary");
   assert.deepEqual(h.ready.lockFds, [], "default-stdio child holds no epoch lock descriptor");
   assert.equal(peerProbe(h.f.root), 200, "parent alone holds EX");
