@@ -38,6 +38,14 @@ type fakeVaultStore struct {
 	// when set, forces the clear to fail — proving the unlock still succeeds anyway.
 	clearNoticeCalls []uuid.UUID
 	clearNoticeErr   error
+
+	// calls is an ordered log of the lock, delete and advance queries a reset
+	// issues (see reset_test.go); logMu guards it independently of mu so a
+	// recording call can sit before a mu-holding body. codexAccounts counts the
+	// owner's codex_provider_account rows.
+	logMu         sync.Mutex
+	calls         []string
+	codexAccounts map[uuid.UUID]int
 }
 
 func newFakeVaultStore() *fakeVaultStore {

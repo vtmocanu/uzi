@@ -32,7 +32,7 @@ func (q *Queries) HasEnabledAnthropicForJudgeAuto(ctx context.Context, userID uu
 
 const listCredentialDisabledRuns = `-- name: ListCredentialDisabledRuns :many
 SELECT id, user_id, status_since FROM runs
-WHERE user_id = $1 AND status = 'paused' AND hold_reason = 'credential_disabled'
+WHERE user_id = $1 AND status = 'paused' AND hold_reason IN ('credential_disabled', 'credentials_reset')
   AND ($2::timestamptz IS NULL
        OR (status_since, id) > ($2::timestamptz,
                                 $3::uuid))
@@ -82,7 +82,7 @@ func (q *Queries) ListCredentialDisabledRuns(ctx context.Context, arg ListCreden
 
 const listCredentialDisabledUsers = `-- name: ListCredentialDisabledUsers :many
 SELECT DISTINCT user_id FROM runs
-WHERE status = 'paused' AND hold_reason = 'credential_disabled'
+WHERE status = 'paused' AND hold_reason IN ('credential_disabled', 'credentials_reset')
   AND ($1::uuid IS NULL OR user_id > $1::uuid)
 ORDER BY user_id
 LIMIT $2::int
@@ -343,17 +343,19 @@ const parkCredentialDisabledChatRun = `-- name: ParkCredentialDisabledChatRun :e
 UPDATE runs SET
     status = 'paused',
     status_since = now(),
-    hold_reason = 'credential_disabled',
+    hold_reason = $1::text,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE runs.id = $1 AND runs.worker_id = $2
+WHERE runs.id = $2 AND runs.worker_id = $3
+  AND $1::text IN ('credential_disabled', 'credentials_reset')
   AND runs.kind = 'chat'
   AND runs.status = 'claimed'
 `
 
 type ParkCredentialDisabledChatRunParams struct {
-	ID       uuid.UUID   `json:"id"`
-	WorkerID pgtype.UUID `json:"worker_id"`
+	HoldReason string      `json:"hold_reason"`
+	ID         uuid.UUID   `json:"id"`
+	WorkerID   pgtype.UUID `json:"worker_id"`
 }
 
 // The chat lane's twin of ParkCredentialDisabledRun (PRD #1732 D2/D14). ClaimChatRun has no
@@ -362,7 +364,7 @@ type ParkCredentialDisabledChatRunParams struct {
 // a disabled row or every Anthropic token is disabled (no default), and the promoter queues it
 // again once the slot has an enabled default. worker_id is kept as resume affinity.
 func (q *Queries) ParkCredentialDisabledChatRun(ctx context.Context, arg ParkCredentialDisabledChatRunParams) (int64, error) {
-	result, err := q.db.Exec(ctx, parkCredentialDisabledChatRun, arg.ID, arg.WorkerID)
+	result, err := q.db.Exec(ctx, parkCredentialDisabledChatRun, arg.HoldReason, arg.ID, arg.WorkerID)
 	if err != nil {
 		return 0, err
 	}
@@ -373,24 +375,31 @@ const parkCredentialDisabledRun = `-- name: ParkCredentialDisabledRun :execrows
 UPDATE runs SET
     status = 'paused',
     status_since = now(),
-    hold_reason = 'credential_disabled',
+    hold_reason = $1::text,
     claim_released_at = now(),
     codex_cap_hash = NULL,
     codex_claim_epoch = codex_claim_epoch + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE runs.id = $1 AND runs.worker_id = $2
-  AND runs.claim_generation = $3
+WHERE runs.id = $2 AND runs.worker_id = $3
+  AND $1::text IN ('credential_disabled', 'credentials_reset')
+  AND runs.claim_generation = $4
   AND runs.claim_released_at IS NULL
   AND runs.status = 'claimed'
 `
 
 type ParkCredentialDisabledRunParams struct {
+	HoldReason      string      `json:"hold_reason"`
 	ID              uuid.UUID   `json:"id"`
 	WorkerID        pgtype.UUID `json:"worker_id"`
 	ClaimGeneration int64       `json:"claim_generation"`
 }
 
+// PRD #3989 M3: the park writers take the hold reason (credential_disabled, or credentials_reset
+// for a run claimed after its owner's account reset), guarded to those two values. The promoter,
+// list, lock and settle queries below read both reasons; the two reassign queries stay on
+// credential_disabled (a credentials_reset hold has no credential to re-point).
+//
 // Credential disablement parks an UNDELIVERED claim (status 'claimed', exact worker and
 // generation) without consuming any pending owner pause or changing its session, phase,
 // custody, or recovery state. A running flight is never parked (D3): its claim finishes.
@@ -411,7 +420,12 @@ type ParkCredentialDisabledRunParams struct {
 // hold_reason IS NULL instead would match 0 rows after the custody release, roll the
 // finisher back and leak this claim's custody hold on every ClaimGrace requeue.
 func (q *Queries) ParkCredentialDisabledRun(ctx context.Context, arg ParkCredentialDisabledRunParams) (int64, error) {
-	result, err := q.db.Exec(ctx, parkCredentialDisabledRun, arg.ID, arg.WorkerID, arg.ClaimGeneration)
+	result, err := q.db.Exec(ctx, parkCredentialDisabledRun,
+		arg.HoldReason,
+		arg.ID,
+		arg.WorkerID,
+		arg.ClaimGeneration,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -422,7 +436,7 @@ const promoteCredentialDisabledRun = `-- name: PromoteCredentialDisabledRun :one
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.id = $1 AND runs.user_id = $2
-  AND runs.status = 'paused' AND runs.hold_reason = 'credential_disabled'
+  AND runs.status = 'paused' AND runs.hold_reason IN ('credential_disabled', 'credentials_reset')
   AND runs.pause_requested_at IS NULL
   AND runs.credential_override_mode IS NOT DISTINCT FROM $3::text
   AND runs.credential_override_secret_id IS NOT DISTINCT FROM $4::uuid
@@ -484,7 +498,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE runs.id = $1 AND runs.user_id = $2
-  AND runs.status = 'paused' AND runs.hold_reason = 'credential_disabled'
+  AND runs.status = 'paused' AND runs.hold_reason IN ('credential_disabled', 'credentials_reset')
   AND runs.pause_requested_at IS NULL
   -- The requirement the promoter evaluated must still be the run's requirement: a
   -- concurrent reassignment or rebind that is not serialized by the caller's locks
@@ -695,7 +709,7 @@ WITH settled_inputs AS (
     UPDATE run_user_inputs u SET consumed_at = COALESCE(u.consumed_at, now()), applied_at = now()
     WHERE u.run_id = $1 AND u.kind = 'pause' AND u.applied_at IS NULL
       AND EXISTS (SELECT 1 FROM runs r WHERE r.id = $1 AND r.user_id = $2
-                  AND r.status = 'paused' AND r.hold_reason = 'credential_disabled'
+                  AND r.status = 'paused' AND r.hold_reason IN ('credential_disabled', 'credentials_reset')
                   AND r.pause_requested_at IS NOT NULL)
 )
 UPDATE runs SET
@@ -708,7 +722,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE runs.id = $1 AND runs.user_id = $2
-  AND runs.status = 'paused' AND runs.hold_reason = 'credential_disabled'
+  AND runs.status = 'paused' AND runs.hold_reason IN ('credential_disabled', 'credentials_reset')
   AND runs.pause_requested_at IS NOT NULL
   AND runs.credential_override_mode IS NOT DISTINCT FROM $3::text
   AND runs.credential_override_secret_id IS NOT DISTINCT FROM $4::uuid
@@ -778,7 +792,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = $1 AND user_id = $2
-  AND status = 'paused' AND hold_reason = 'credential_disabled'
+  AND status = 'paused' AND hold_reason IN ('credential_disabled', 'credentials_reset')
   AND pause_requested_at IS NULL
   AND credential_override_mode IS NOT DISTINCT FROM $3::text
   AND credential_override_secret_id IS NOT DISTINCT FROM $4::uuid

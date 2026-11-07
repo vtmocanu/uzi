@@ -3,7 +3,14 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { aRun } from "../pages/overviewFixtures";
-import { issueLineModel, issueLineStage, runRef, type IssueStage } from "./issueLine";
+import {
+  issueLineModel,
+  issueLineOtherRuns,
+  issueLineStage,
+  issueWorkScope,
+  runRef,
+  type IssueStage,
+} from "./issueLine";
 import { parkLabel } from "./runBadge";
 import { runKindLabel } from "./runKind";
 
@@ -152,6 +159,50 @@ describe("issueLineModel counts", () => {
       "Lead drafting a plan",
       "Implement, review, validate",
     ]);
+  });
+});
+
+describe("issue work scope (#4052)", () => {
+  const rows = [aRun({ id: "x" })];
+  const ok = { runs: rows, failed: false };
+
+  it("is all only for an admin with a readable list who chose all", () => {
+    expect(issueWorkScope({ isAdmin: true, adminRuns: ok, chosen: "all" })).toBe("all");
+    expect(issueWorkScope({ isAdmin: true, adminRuns: ok, chosen: "you" })).toBe("you");
+    expect(issueWorkScope({ isAdmin: false, adminRuns: ok, chosen: "all" })).toBe("you");
+    expect(issueWorkScope({ isAdmin: true, adminRuns: { runs: rows, failed: true }, chosen: "all" })).toBe("you");
+    expect(issueWorkScope({ isAdmin: true, adminRuns: { runs: null, failed: false }, chosen: "all" })).toBe("you");
+  });
+
+  const me = "admin@uzi.local";
+  const mira = "mira@uzi.local";
+  const own = [
+    aRun({ id: "mine-plan", status: "awaiting_approval", owner_email: me }),
+    aRun({ id: "mine-build", owner_email: me }),
+  ];
+  const admin = {
+    runs: [
+      ...own,
+      aRun({ id: "x-plan", status: "awaiting_approval", owner_email: mira }),
+      aRun({ id: "x-done", status: "completed", owner_email: mira }),
+    ],
+  };
+
+  it("drops other users' runs under you, and keeps only their active ones under all", () => {
+    expect(issueLineOtherRuns({ scope: "you", adminRuns: admin, viewerEmail: me })).toEqual([]);
+    expect(issueLineOtherRuns({ scope: "all", adminRuns: admin, viewerEmail: me }).map((r) => r.id)).toEqual(["x-plan"]);
+    expect(issueLineOtherRuns({ scope: "all", adminRuns: { runs: null }, viewerEmail: me })).toEqual([]);
+  });
+
+  it("counts own runs only under you, and splits the wait under all", () => {
+    const you = issueLineModel({ ownRuns: own, otherRuns: issueLineOtherRuns({ scope: "you", adminRuns: admin, viewerEmail: me }) });
+    expect(you.onLine).toBe(2);
+    expect(you.entries.review).toHaveLength(1);
+    expect(you.captions.review).toBe("Waiting on you");
+    const all = issueLineModel({ ownRuns: own, otherRuns: issueLineOtherRuns({ scope: "all", adminRuns: admin, viewerEmail: me }) });
+    expect(all.onLine).toBe(3);
+    expect(all.entries.review).toHaveLength(2);
+    expect(all.captions.review).toBe("1 on you, 1 on others");
   });
 });
 

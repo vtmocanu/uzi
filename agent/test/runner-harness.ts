@@ -53,7 +53,10 @@ export let homeDir: string;
  * test body reads whatever this hook most recently assigned -- which is why
  * splitting runner.test.ts needed no edits inside any test body.
  */
-export function installHarness(clientOptions: { httpTimeoutMs?: number; fetch?: typeof fetch } = {}): void {
+export function installHarness(
+  clientOptions: { httpTimeoutMs?: number; fetch?: typeof fetch } = {},
+  beforeCleanup?: () => Promise<void>,
+): void {
   // issue #2213: a runner flow over a planted unreadable process latches the worker-wide quarantine.
   resetResidueQuarantineAfterEach();
   beforeEach(async (t) => {
@@ -70,14 +73,19 @@ export function installHarness(clientOptions: { httpTimeoutMs?: number; fetch?: 
   });
 
   afterEach(async () => {
-    // try/finally (issue #2020): a throwing close must not skip the temp-dir cleanup.
+    // Node runs afterEach before t.after. Join test-owned flights while their API and paths
+    // still exist; a t.after join alone can otherwise recreate a fixture after its removal.
     try {
-      await api.close();
+      if (beforeCleanup) await beforeCleanup();
     } finally {
       try {
-        fx.cleanup();
+        await api.close();
       } finally {
-        fs.rmSync(homeDir, { recursive: true, force: true });
+        try {
+          fx.cleanup();
+        } finally {
+          fs.rmSync(homeDir, { recursive: true, force: true });
+        }
       }
     }
   });

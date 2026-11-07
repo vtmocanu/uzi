@@ -363,7 +363,7 @@ func (h *Handler) oidcSyncAdmin(ctx context.Context, user store.User, identity o
 		slog.Info("oidc login: seed admin exempt from group demotion", "user", user.ID)
 		return user, ""
 	}
-	updated, err := h.q.SetUserAdmin(ctx, store.SetUserAdminParams{ID: user.ID, IsAdmin: desired})
+	updated, err := h.setUserAdminSuperseding(ctx, store.SetUserAdminParams{ID: user.ID, IsAdmin: desired})
 	if err != nil {
 		slog.Error("oidc login: sync is_admin from group membership", "user", user.ID, "error", err)
 		return store.User{}, oidcErrInternal

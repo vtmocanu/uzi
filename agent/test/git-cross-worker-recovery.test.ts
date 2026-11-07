@@ -298,6 +298,7 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
       sourceAllowance: 5, indexAllowance: 2 * 1024 * 1024,
       pathAllowance: 20000, entryAllowance: 30000, directoryAllowance: 2048,
       ignoreAllowance: 128 * 1024 * 1024, ignorePipeAllowance: 2 * 1024 * 1024,
+      baseDiscoveryEntryCap: 1_200_000, baseDiscoveryPathByteCap: 96 * 1024 * 1024,
     });
     assert.equal(await captureRecovered(gitB, rc, bareB), "");
     // The recovered M1/M2 and default files exceed five bytes; only new source consumes the allowance.

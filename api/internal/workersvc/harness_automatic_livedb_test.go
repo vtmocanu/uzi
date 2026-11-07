@@ -302,7 +302,7 @@ func TestHarnessAutomaticSharedLockLiveDB(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		run, err := fx.svc.CreateRun(ctx, fx.userID, fx.repoID, iid, "locked", nil, nil, false, nil, nil, nil)
+		run, err := fx.svc.CreateRun(ctx, fx.userID, fx.repoID, iid, "locked", nil, nil, false, nil, nil, nil, nil)
 		done <- result{run, err}
 	}()
 	fx.waitBlocked(1)
@@ -339,7 +339,7 @@ func TestHarnessAutomaticInheritOverrideLiveDB(t *testing.T) {
 		fx := newAutoFix(t, false)
 		fx.claudeWeekly(fx.token, 20, "72 hours")
 		fx.codexWeekly(fx.codex, 20, 86400)
-		run, err := fx.svc.CreateRun(fx.env.ctx, fx.userID, fx.repoID, fx.nextIssue(), "inherit", nil, nil, false, nil, nil, &RawCredentialOverride{Mode: CredentialOverrideModeInherit})
+		run, err := fx.svc.CreateRun(fx.env.ctx, fx.userID, fx.repoID, fx.nextIssue(), "inherit", nil, nil, false, nil, nil, nil, &RawCredentialOverride{Mode: CredentialOverrideModeInherit})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -352,7 +352,7 @@ func TestHarnessAutomaticInheritOverrideLiveDB(t *testing.T) {
 	t.Run("explicit codex keeps the refusal", func(t *testing.T) {
 		fx := newAutoFix(t, false)
 		codex := HarnessCodex
-		_, err := fx.svc.CreateRun(fx.env.ctx, fx.userID, fx.repoID, fx.nextIssue(), "inherit", nil, nil, false, nil, &codex, &RawCredentialOverride{Mode: CredentialOverrideModeInherit})
+		_, err := fx.svc.CreateRun(fx.env.ctx, fx.userID, fx.repoID, fx.nextIssue(), "inherit", nil, nil, false, nil, nil, &codex, &RawCredentialOverride{Mode: CredentialOverrideModeInherit})
 		if !errors.Is(err, ErrCredentialOverrideHarnessUnsupported) {
 			t.Fatalf("error=%v", err)
 		}

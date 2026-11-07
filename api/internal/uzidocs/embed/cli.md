@@ -338,10 +338,23 @@ A few worth knowing:
   [Seeding a plan](./seeded-plans.md) for the full walkthrough, including the
   constraint that matters most: the plan must stand on its own, since a
   seeded run starts with no session and no memory of how it was written.
-  `--agent-source`/`--exclude-agents` (below) and `--planned-commit`/
-  `--require-base` (the base-commit staleness guard) are all optional and all
-  require `--plan-file`; an empty or oversized plan is rejected at create
-  time. A run created with no `--plan-file` is unchanged.
+  `--exclude-agents` (below) and `--planned-commit`/`--require-base` (the
+  base-commit staleness guard) are all optional and all require
+  `--plan-file`; `--agent-source` sets the seeded run's roster here and also
+  works without a plan file (below). An empty or oversized plan is rejected at
+  create time. A run created with no `--plan-file` is unchanged.
+- **`run create --agent-source own|repo` chooses this run's agents.** Without
+  `--plan-file` the choice is frozen onto the run as its agent-source request,
+  overriding your [per-repo default](repo-agents.md#set-a-default-for-your-runs-on-a-repo)
+  for this run only; `run get` shows it as `AGENTS_REQUESTED ... (this run)`.
+  It applies to implementation the same way a default does: an approval with
+  no agent choice and an autopilot run implement with it, and an explicit choice
+  at the plan gate still wins. Planning is not affected: the plan turn uses your
+  own templates. `--exclude-agents` without `--plan-file` is a usage error
+  (exit 2); exclude agents at the plan gate instead. Over the API, the same
+  choice is `"agent_selection": {"source": "own"|"repo"}` on
+  `POST /api/repos/{id}/runs` without `plan_md`; non-empty `exclusions`
+  without `plan_md` returns 400 `exclusions require a plan file or an approval`.
 - **`run create --force` re-runs an issue that already has an open MR.** By
   default, creating a run for an issue whose last completed run still owns an
   open MR is refused (a 409, exit 5) — re-running would spend budget building
@@ -374,11 +387,11 @@ A few worth knowing:
   `--agent-source`. Detection reads one folder, never merges rosters, and prefers
   the run harness's native folder; a present preferred folder is final even if
   empty or invalid. See [Repo agents](repo-agents.md#which-folder-is-read).
-  `run create --plan-file` takes the same two flags, for the seeded run's
-  roster.
+  `run create` takes the same two flags (see `run create --agent-source`
+  above).
 - **`run get` shows the requested and implemented agents.** A run that carries
   a frozen agent-source request shows `AGENTS_REQUESTED` (for example
-  `repo agents (repo default)`, or `(this run)` for a seeded plan's source), and
+  `repo agents (repo default)`, or `(this run)` for a source chosen at create), and
   once a selection is recorded `IMPLEMENTED_WITH` shows the roster used, with
   `(as requested)` or `(changed at approval)` when a request exists. `--json`
   carries `agent_source_requested` and `agent_source_requested_basis`.
@@ -3314,8 +3327,13 @@ never changes an existing run or resume. See
 [rate limits](./rate-limits.md#how-overflow-compares-headroom) for selected
 accounts, Claude aggregation and capacity holds.
 
-`uzi run get <id>` shows `HARNESS_PICK` rows headed `at creation:`. The last
-two rows are the weekly resets, `pref reset:` and `other reset:`, or
+`uzi run get <id>` shows `HARNESS_PICK` rows headed `at creation:`. An `off`
+or `excluded` decision was recorded before any usage was read, so it shows
+only `preferred:`, `chosen:`, `reason:` and one line saying overflow was off
+(`overflow off in settings`) or not considered (`overflow not considered`);
+the stored reason does not say which exclusion applied, and `--json` still
+carries every field. For every other
+reason the last two rows are the weekly resets, `pref reset:` and `other reset:`, or
 `claude reset:` and `codex reset:` for an `auto_*` reason (whose score,
 measured and held rows are likewise labelled `claude` and `codex` instead of
 `preferred`/`pref` and `other`). A reset reads as an RFC3339 UTC timestamp, or `unknown`. The TUI detail rail has **HARNESS at creation**, fitted as a whole block
@@ -3758,6 +3776,14 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   Settings, or `uzi run set-token` where the run accepts a token switch),
   `run list` shows `paused (credential disabled)`, and the TUI draws it as
   `⊘ cred disabled` in NEEDS YOU.
+  A `paused` run can also be **waiting because your credentials were reset**
+  (`hold_reason: credentials_reset`): a Claude or chat run created before an
+  admin-issued [account reset](auth-design.md) found no model credential at
+  claim. `run get` prints a `HOLD` row reading `credentials were reset` with
+  the action "add a credential in Settings; the run resumes automatically",
+  and the web badge reads "waiting: credentials were reset". It resumes on its
+  own once you add a credential; `run resume` and `run set-token` are refused
+  with a 409 until then.
   A `paused` run can also be held after an owner token switch on a run with
   retained recovery work (`hold_reason: credential_switch_settling`, then
   `credential_switch_unsettled`). `run get` prints a `HOLD` row reading

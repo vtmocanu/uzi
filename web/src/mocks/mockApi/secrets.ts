@@ -73,7 +73,9 @@ export function visibleTokenMeters(tokens: TokenRateLimits[], own = false): Toke
 // for work that spends the default (it names none), once its slot has a default again.
 function promoteCredentialDisabledRuns(): void {
   for (const r of state.runs.values()) {
-    if (r.status !== "paused" || r.hold_reason !== "credential_disabled") continue;
+    if (r.status !== "paused") continue;
+    // credentials_reset (PRD #3989) is released by the same promoter once a credential exists.
+    if (r.hold_reason !== "credential_disabled" && r.hold_reason !== "credentials_reset") continue;
     const pinnedLabel = r.credential_override?.mode === "pinned" ? r.credential_override.label : null;
     const needed =
       r.harness === "codex"

@@ -272,6 +272,82 @@ func TestWorkersApprovedDetailHeader(t *testing.T) {
 	}
 }
 
+func TestWorkersListUptimeColumn(t *testing.T) {
+	m := workerRenderModel(true)
+	up := m.workers.rows[0]
+	up.w.ID, up.w.Name, up.w.Status = "up", "up-row", "online"
+	up.w.OnlineSince = tp(time.Now().Add(-50 * time.Hour))
+	up.w.LastHeartbeatAt = tp(time.Now().Add(-3 * time.Second))
+	unknown := up
+	unknown.w.ID, unknown.w.Name, unknown.w.OnlineSince = "unknown", "unknown-row", nil
+	down := up
+	down.w.ID, down.w.Name, down.w.Status = "down", "down-row", "offline"
+	m.workers.rows = []workerRow{up, unknown, down}
+	m.workers.selectedID = "none"
+	for _, width := range []int{160, 200} {
+		m.width = width
+		lines := strings.Split(stripANSI(m.renderWorkersBody(20, false)), "\n")
+		find := func(needle string) string {
+			t.Helper()
+			for _, line := range lines {
+				if strings.Contains(line, needle) {
+					return line
+				}
+			}
+			t.Fatalf("width %d: no line with %q in %q", width, needle, lines)
+			return ""
+		}
+		header := find("NAME")
+		col := strings.Index(header, " HB ")
+		if col < 0 || !strings.Contains(header[col:], " HB  UP ") {
+			t.Fatalf("width %d: UP must follow HB: %q", width, header)
+		}
+		at := visualWidth(header[:strings.Index(header, " UP ")+1])
+		for name, want := range map[string]string{"up-row": "2d2h", "unknown-row": "—", "down-row": "—"} {
+			line := find(name)
+			cells := []rune(line)
+			if at+len([]rune(want)) > len(cells) || string(cells[at:at+len([]rune(want))]) != want {
+				t.Errorf("width %d: %s UP cell, want %q at %d: %q", width, name, want, at, line)
+			}
+			if visualWidth(line) > width {
+				t.Errorf("width %d overflow: %q", width, line)
+			}
+		}
+	}
+	m.width = 119
+	if strings.Contains(stripANSI(m.renderWorkersBody(20, false)), " UP ") {
+		t.Fatal("UP shown outside the dense layout")
+	}
+	// Crowded dense row (factory OWNER column, natural-width VERSION): ATTENTION
+	// outranks UP, so UP is dropped and the outbox warning keeps its cells.
+	m.board.admin, m.workers.admin = true, true
+	m.workers.rows[0].w.Version = sp("0.85.1+gba846d7")
+	m.workers.rows[0].w.OutboxBlocked = sp("blocked")
+	for _, tc := range []struct {
+		width int
+		up    bool
+		warn  string
+	}{{120, false, "✕ outbox"}, {200, true, "✕ outbox blocked"}} {
+		m.width = tc.width
+		out := stripANSI(m.renderWorkersBody(20, false))
+		if strings.Contains(out, " UP ") != tc.up {
+			t.Errorf("width %d: UP shown=%t, want %t:\n%s", tc.width, !tc.up, tc.up, out)
+		}
+		row := ""
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, "up-row") {
+				row = line
+			}
+			if visualWidth(line) > tc.width {
+				t.Errorf("width %d overflow: %q", tc.width, line)
+			}
+		}
+		if !strings.Contains(row, tc.warn) {
+			t.Errorf("width %d: outbox warning lost: %q", tc.width, row)
+		}
+	}
+}
+
 func TestWorkersStaleResourceCells(t *testing.T) {
 	for _, tc := range []struct {
 		status string
