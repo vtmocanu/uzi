@@ -329,7 +329,7 @@ func TestPolicyRecoveryDownRefusesLiveRowsWithoutPartialConversionLiveDB(t *test
 			queued := f.queuedSavedWork(a)
 			active := f.queuedPreserving(a)
 			f.claimAt(active, 2, live)
-			f.refused("a live run still carries a required recovery head")
+			f.refused("a live run still carries a required recovery head or preserving constraint")
 			for _, id := range []uuid.UUID{convertible, queued} {
 				var status string
 				if err := f.pool.QueryRow(f.ctx, "SELECT status FROM runs WHERE id=$1", id).Scan(&status); err != nil || status == "failed" {
@@ -386,7 +386,7 @@ func TestPolicyRecoveryDownRefusesLiveHeadlessResolvedPreservingLiveDB(t *testin
 			convertible := f.pausedPreserving(strings.Repeat("a", 40))
 			active := f.headlessPreserving()
 			f.claimAt(active, 2, live)
-			f.refused("a live run still carries a required recovery head")
+			f.refused("a live run still carries a required recovery head or preserving constraint")
 			if got := f.row(convertible)["status"]; got != "paused" {
 				t.Fatalf("convertible row status = %v after refusal", got)
 			}
@@ -470,7 +470,7 @@ func TestPolicyRecoveryDownWaitsForInFlightWriterLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = <-done
-	if err == nil || !strings.Contains(err.Error(), "a live run still carries a required recovery head") {
+	if err == nil || !strings.Contains(err.Error(), "a live run still carries a required recovery head or preserving constraint") {
 		t.Fatalf("Down after the writer committed a live status = %v", err)
 	}
 	if f.row(other)["status"] != "paused" || f.row(target)["status"] != "claimed" || f.version() != 413 || f.columns(recoveryColumns...) != 4 {

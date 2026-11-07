@@ -21,7 +21,7 @@ SET LOCAL lock_timeout = '30s';
 -- change a row between the check and the drop. A nonterminal row is ACTIVE when it still carries a
 -- required recovery head or a recorded verification, or when it is resolved and still preserving (a
 -- headless hold the owner resumed with preserve: the older API never writes policy_resolved_at, so it
--- cannot run such a row). policy_hold_cause alone is history, so a resolved attempt-path row that
+-- would claim such a row without enforcing preserve-only). policy_hold_cause alone is history, so a resolved attempt-path row that
 -- merely retains its cause (preserve false) is neither active nor converted. The older API has no notion of the
 -- requirement, so an active row must not outlive its enforcement. Refuse before any mutation when an
 -- active row is not paused or queued (live claimed/running/awaiting_* rows must be drained first) or
@@ -47,7 +47,7 @@ BEGIN
                OR (policy_preserve_required AND policy_resolved_at IS NOT NULL))
           AND status NOT IN ('paused','queued')
     ) THEN
-        RAISE EXCEPTION 'policy required-recovery rollback refused: a live run still carries a required recovery head';
+        RAISE EXCEPTION 'policy required-recovery rollback refused: a live run still carries a required recovery head or preserving constraint';
     END IF;
 END $$;
 -- +goose StatementEnd
