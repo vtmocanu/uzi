@@ -599,8 +599,9 @@ The one exception is on the Claude run lane: `Read` may open a file directly
 inside that run's own SDK tool-result spill directory (the "Output too large ...
 Full output saved to" file); Write, Edit, Glob, Grep and the other lanes keep the
 worktree-only rule (see [ADR 2332](../adr/2332-sdk-spill-read-allowance.md)).
-The read-only Plan cross-check Claude checker (for a Codex lead) is stricter:
-`Read`, `Grep` and `Glob` only, with one path guard that confines them to its
+The read-only Claude Plan and Code cross-checker (for a Codex lead) is stricter:
+`Read`, `Grep` and `Glob` only (plus the SDK's end-turn `StructuredOutput`
+tool, which carries only its final verdict and touches no files), with one path guard that confines them to its
 own checkout, apart from its own SDK spill files under its home. It also denies
 absolute, home-relative and `..` Glob/Grep patterns as defense in depth; the
 runner uid it runs as is the boundary, not that pattern check. See
