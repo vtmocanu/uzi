@@ -31,7 +31,7 @@ import { delay, mockScenario, oidcDemo, requireSession, users } from "./shared";
 import { agentSource, mockAllowedAgentSourceHosts } from "./agentSource";
 import { secrets } from "./secrets";
 import { checkerModelWarning, normalizeCheckerValue } from "../../lib/crossCheckSettings";
-import type { CatalogDefault, CodexAccountMode, CrossCheckPinDTO, EffectiveSettings, EffortSettingCell, Harness, StartPreview, StartPreviewRequest } from "../../lib/apiTypes";
+import type { CatalogDefault, CodexAccountMode, CrossCheckPinDTO, EffectiveSettings, EffortSettingCell, Harness, ScheduleSettingsPreview, ScheduleSettingsPreviewRequest, StartPreview, StartPreviewRequest } from "../../lib/apiTypes";
 import { RECORDED_EFFECTIVE_SCENARIOS, type RecordedEffectiveScenario } from "../data/effectiveSettings";
 import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../../lib/codexModels";
 import { MOCK_JUDGE_BUILTINS, mockJudgeModelCells, resolveMockJudgeModel } from "./judgeModels";
@@ -785,6 +785,16 @@ function previewRequestKey(r: StartPreviewRequest): string {
   return JSON.stringify([r.harness ?? null, o?.mode ?? null, o?.secret_id ?? null]);
 }
 
+// A draft's absent and null harness and model mean the same choice, but an absent
+// credential_override (as stored) and an explicit null (inherit, which a fire threads as an
+// override) do not: the corpus records different answers for them, so the key keeps them apart.
+// A saved schedule (schedule_id) is never recorded, so it falls through to the scenario's default case.
+function scheduleRequestKey(r: ScheduleSettingsPreviewRequest): string {
+  const o = r.credential_override;
+  const override = o === undefined ? "absent" : o === null ? "null" : [o.mode, o.secret_id ?? null];
+  return JSON.stringify([r.target ?? null, r.harness ?? null, r.model ?? null, r.override_subagent_model ?? false, override]);
+}
+
 export const settingsApi = {
   vaultStatus: async () => delay(mockVaultStatus(), 40),
   vaultDisable: async (): Promise<VaultDisableResponse> => {
@@ -1444,6 +1454,18 @@ export const settingsApi = {
     const previews = recordedEffectiveScenario().start_previews;
     // An unrecorded request gets the scenario's default case: the recorded no-harness, no-override start.
     const hit = previews.find(p => previewRequestKey(p.request) === key) ?? previews.find(p => previewRequestKey(p.request) === previewRequestKey({ harness: null, credential_override: null })) ?? previews[0];
+    return delay(structuredClone(hit.response), 60);
+  },
+  // PRD #3254 M3: the recorded schedule-preview behavior for the active demo scenario. The corpus
+  // records no refused schedule alternative (none is reachable with real data), so the mock serves
+  // none. An unrecorded request gets the scenario's plain case for the same target, else its first.
+  previewScheduleSettings: async (body: ScheduleSettingsPreviewRequest): Promise<ScheduleSettingsPreview> => {
+    requireSession();
+    const key = scheduleRequestKey(body);
+    const previews = recordedEffectiveScenario().schedule_previews;
+    const hit = previews.find(p => scheduleRequestKey(p.request) === key)
+      ?? previews.find(p => scheduleRequestKey(p.request) === scheduleRequestKey({ target: body.target }))
+      ?? previews[0];
     return delay(structuredClone(hit.response), 60);
   },
   putMySettings: async (patch: UserSettingsPatch) => {

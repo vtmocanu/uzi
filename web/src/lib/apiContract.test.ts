@@ -100,6 +100,9 @@ import type {
   EffectiveEffortCell,
   Credential,
   HarnessValue,
+  ScheduleAlternative,
+  ScheduleSettingsPreview,
+  ScheduleSettingsPreviewRequest,
   StartPreview,
   StartPreviewAlternative,
   StartPreviewRequest,
@@ -175,6 +178,10 @@ import effectiveSettingsZero from "../../../fixtures/api-contract/effective_sett
 import effectiveSettingsFull from "../../../fixtures/api-contract/effective_settings.full.json";
 import startPreviewZero from "../../../fixtures/api-contract/effective_settings_start_preview.zero.json";
 import startPreviewFull from "../../../fixtures/api-contract/effective_settings_start_preview.full.json";
+import schedulePreviewZero from "../../../fixtures/api-contract/effective_settings_schedule_preview.zero.json";
+import schedulePreviewFull from "../../../fixtures/api-contract/effective_settings_schedule_preview.full.json";
+import schedulePreviewRequestZero from "../../../fixtures/api-contract/effective_settings_schedule_preview_request.zero.json";
+import schedulePreviewRequestFull from "../../../fixtures/api-contract/effective_settings_schedule_preview_request.full.json";
 import startPreviewRequestZero from "../../../fixtures/api-contract/effective_settings_start_preview_request.zero.json";
 import startPreviewRequestFull from "../../../fixtures/api-contract/effective_settings_start_preview_request.full.json";
 import settingsUserSettingsFull from "../../../fixtures/api-contract/settings_user_settings.full.json";
@@ -923,11 +930,42 @@ void _releaseCheckStatusFull;
   const requestFull: Widen<StartPreviewRequest> = startPreviewRequestFull;
   void [zero, full, checks, previewZero, previewFull, previewChecks, requestZero, requestFull];
 }
+// PRD #3254 M3: the schedule preview. Its zero fixture has a null `notes` (a Go nil slice that
+// the handler always fills) and omits `alternatives` (omitempty). The request has no zero-null
+// member: every field is omitted when unset, so its zero is `{}`. The refused-branch shape (null
+// worker_model, worker_effort, credential and subagents plus a refusal) is covered by the
+// `ScheduleAlternative` assignment below, since the full fixture's alternative is the valid shape.
+{
+  const scheduleZero: ZeroOf<ScheduleSettingsPreview, "notes"> = schedulePreviewZero;
+  const scheduleFull: Widen<ScheduleSettingsPreview> = schedulePreviewFull;
+  const keysOf = <A, B>(_same: [Exclude<keyof A, keyof B> | Exclude<keyof B, keyof A>] extends [never] ? true : false): true => true;
+  type Full = typeof schedulePreviewFull;
+  const scheduleChecks = [
+    keysOf<ScheduleSettingsPreview, Full>(true),
+    keysOf<ScheduleAlternative, Full["alternatives"][number]>(true),
+    keysOf<NonNullable<ScheduleSettingsPreview["subagents"]>, Full["subagents"]>(true),
+    keysOf<NonNullable<ScheduleSettingsPreview["subagents"]>["pinned"][number], Full["subagents"]["pinned"][number]>(true),
+    keysOf<EffectiveModelCell, Full["worker_model"]>(true),
+    keysOf<EffectiveEffortCell, Full["worker_effort"]>(true),
+    keysOf<ScheduleSettingsPreviewRequest, typeof schedulePreviewRequestFull>(true),
+    keysOf<NonNullable<ScheduleSettingsPreviewRequest["credential_override"]>, typeof schedulePreviewRequestFull.credential_override>(true),
+  ];
+  const scheduleRequestFull: Widen<ScheduleSettingsPreviewRequest> = schedulePreviewRequestFull;
+  const scheduleRequestZero: ScheduleSettingsPreviewRequest = schedulePreviewRequestZero;
+  const refusedBranch: ScheduleAlternative = {
+    harness: "codex", worker_model: null, worker_effort: null, credential: null, subagents: null,
+    refusal: "codex_override_conflict", refusal_detail: null,
+  };
+  void [scheduleZero, scheduleFull, scheduleChecks, scheduleRequestFull, scheduleRequestZero, refusedBranch];
+}
 it("effective-settings zero fixtures carry null slices and the alternatives omission", () => {
   expect(effectiveSettingsZero.harnesses).toBeNull();
   expect(effectiveSettingsZero.cross_check.models).toBeNull();
   expect(startPreviewZero).not.toHaveProperty("alternatives");
   expect(startPreviewFull.alternatives[0].refusal).toBe("x");
+  expect(schedulePreviewZero.notes).toBeNull();
+  expect(schedulePreviewZero).not.toHaveProperty("alternatives");
+  expect(schedulePreviewRequestZero).toEqual({});
 });
 
 // Nested members must match the Go recorder, including required nullable metadata.
@@ -1781,6 +1819,9 @@ const dtos: { stem: string; nullable: boolean }[] = [
   { stem: "effective_settings", nullable: true },
   { stem: "effective_settings_start_preview", nullable: true },
   { stem: "effective_settings_start_preview_request", nullable: true },
+  // PRD #3254 M3: the schedule preview's zero carries nulls; its request zero is `{}` (all omitempty).
+  { stem: "effective_settings_schedule_preview", nullable: true },
+  { stem: "effective_settings_schedule_preview_request", nullable: false },
   { stem: "catalog_entry", nullable: true },
   { stem: "cli_token", nullable: true },
   // M3 — the handler-package hot set.

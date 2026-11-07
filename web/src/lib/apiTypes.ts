@@ -363,6 +363,72 @@ export interface StartPreview {
   alternatives?: StartPreviewAlternative[];
 }
 
+/** PRD #3254 M3: the schedule preview's refusals, the start-preview set plus the save-step
+ *  (invalid_model, credential_override_lane_not_switchable) and fire-step (codex_override_conflict,
+ *  codex_pool_unavailable) ones, mirroring handler/effective_settings_schedule.go and the
+ *  scheduler's skip reasons it maps. */
+type ScheduleRefusal =
+  | EffectiveRefusal | "invalid_model" | "credential_override_lane_not_switchable"
+  | "codex_override_conflict" | "codex_pool_unavailable";
+
+/** POST /api/me/effective-settings/schedule-preview body. Without `schedule_id` it is a draft and
+ *  `target` is required; with it, supplied fields replace the stored ones. `harness`, `model` and
+ *  `credential_override` distinguish omitted (as stored) from null (clear). */
+export interface ScheduleSettingsPreviewRequest {
+  schedule_id?: string;
+  target?: string;
+  harness?: string | null;
+  model?: string | null;
+  override_subagent_model?: boolean;
+  credential_override?: StartPreviewCredentialOverride | null;
+}
+
+/** One own subagent whose template pins a model for the harness. */
+export interface EffectiveSubagentPin {
+  name: string;
+  model: string;
+}
+
+/** How a run's subagents pick a model. `lead_value` "" means the SDK decides. `pinned` lists at
+ *  most 32 subagents sorted by name; `pinned_truncated` says there were more. */
+export interface EffectiveSubagents {
+  mode: "follow_lead" | "own_pins";
+  lead_value: string;
+  pinned: EffectiveSubagentPin[];
+  pinned_truncated: boolean;
+}
+
+/** One harness a creation-time policy might choose for a schedule fire, computed as if it were
+ *  chosen. A refused branch has null worker_model, worker_effort, credential and subagents and
+ *  carries its own refusal; both refusal fields are null on a valid branch. */
+export interface ScheduleAlternative {
+  harness: string;
+  worker_model: EffectiveModelCell | null;
+  worker_effort: EffectiveEffortCell | null;
+  credential: Credential | null;
+  subagents: EffectiveSubagents | null;
+  refusal: ScheduleRefusal | null;
+  refusal_detail: EffectiveRefusalDetail | null;
+}
+
+/** The schedule-preview response: what firing the schedule now and claiming the run would use.
+ *  When the harness is chosen at creation, `harness.value` is null, the four harness-dependent
+ *  fields are null and `alternatives` lists Claude then Codex. A top-level `refusal` is set for a
+ *  save-step failure, a failure before the harness is decided, a fire-rule refusal on a known
+ *  harness, or when every alternative is refused for the same reason. */
+export interface ScheduleSettingsPreview {
+  version: number;
+  harness: HarnessValue | null;
+  refusal: ScheduleRefusal | null;
+  refusal_detail: EffectiveRefusalDetail | null;
+  worker_model: EffectiveModelCell | null;
+  worker_effort: EffectiveEffortCell | null;
+  credential: Credential | null;
+  subagents: EffectiveSubagents | null;
+  notes: string[];
+  alternatives?: ScheduleAlternative[];
+}
+
 export interface UserSettings {
   vault_auto_reunlock?: boolean;
   cross_check_pins?: CrossCheckPinDTO[];

@@ -57,6 +57,8 @@ import type {
   AdminOAuthConnection,
   OAuthRedirect,
   EffectiveSettings,
+  ScheduleSettingsPreview,
+  ScheduleSettingsPreviewRequest,
   StartPreview,
   StartPreviewRequest,
   CliToken,
@@ -829,6 +831,8 @@ const realApi = {
   getEffectiveSettings: () => request<EffectiveSettings>("GET", "/me/effective-settings"),
   previewStartSettings: (body: StartPreviewRequest) =>
     request<StartPreview>("POST", "/me/effective-settings/start-preview", body),
+  previewScheduleSettings: (body: ScheduleSettingsPreviewRequest) =>
+    request<ScheduleSettingsPreview>("POST", "/me/effective-settings/schedule-preview", body),
   setHarnessOverflow: (enabled: boolean) =>
     request<{ harness_overflow_enabled: boolean }>("PUT", "/me/harness-overflow", {
       harness_overflow_enabled: enabled,

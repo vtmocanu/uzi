@@ -118,3 +118,49 @@ describe("previewStartSettings", () => {
     expect(got).toEqual(behavior.scenarios[0].start_previews[0].response);
   });
 });
+
+describe("previewScheduleSettings", () => {
+  const scenarios: Record<string, string> = { default: "", codexOnly: "codex-only", overflowCodexDefault: "overflow-codex-default" };
+
+  it("answers every recorded request with its recorded response, in each scenario", async () => {
+    for (const s of behavior.scenarios) {
+      setScenario(scenarios[s.name]);
+      for (const p of s.schedule_previews) {
+        expect(await mockApi.previewScheduleSettings(p.request), `${s.name}: ${p.name}`).toEqual(p.response);
+      }
+    }
+  });
+
+  it("serves the recorded schedule pin on the other harness as ignored", async () => {
+    const got = await mockApi.previewScheduleSettings({ target: "sweep", harness: "codex", model: "sonnet", override_subagent_model: true });
+    expect(got.harness).toMatchObject({ value: "codex", source: "schedule_pin" });
+    expect(got.worker_model?.ignored).toMatchObject({ value: "sonnet", source: "schedule_pin" });
+    expect(got.worker_model?.notes).toContain("schedule_pin_ignored");
+    expect(got.notes).toContain("issue_labels_may_select_harness");
+  });
+
+  it("serves the recorded save-step refusal with no harness-dependent fields", async () => {
+    const got = await mockApi.previewScheduleSettings({ target: "sweep", model: "two words" });
+    expect(got).toMatchObject({ refusal: "invalid_model", worker_model: null, worker_effort: null, credential: null, subagents: null });
+  });
+
+  it("serves a chosen-at-create harness as alternatives, Claude then Codex, in the overflow scenario", async () => {
+    setScenario("overflow-codex-default");
+    const got = await mockApi.previewScheduleSettings({ target: "sweep" });
+    expect(got.harness).toMatchObject({ value: null, source: "chosen_at_create" });
+    expect(got.worker_model).toBeNull();
+    expect(got.alternatives?.map((a) => a.harness)).toEqual(["claude", "codex"]);
+  });
+
+  it("serves the scenario's plain case for the target when the request is unrecorded, as a copy", async () => {
+    const got = await mockApi.previewScheduleSettings({ target: "sweep", harness: "claude", model: "opus" });
+    expect(got).toEqual(behavior.scenarios[0].schedule_previews[0].response);
+    got.notes.length = 0;
+    expect((await mockApi.previewScheduleSettings({ target: "sweep" })).notes).toEqual(behavior.scenarios[0].schedule_previews[0].response.notes);
+  });
+
+  it("treats a saved schedule like an unrecorded request", async () => {
+    const got = await mockApi.previewScheduleSettings({ schedule_id: "00000000-0000-4000-8000-000000000001" });
+    expect(got).toEqual(behavior.scenarios[0].schedule_previews[0].response);
+  });
+});
