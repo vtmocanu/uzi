@@ -2670,6 +2670,8 @@ describe("issue #3980: awaitTickSurvivorsGone with a gate deadline", () => {
       await new Promise((resolve) => setImmediate(resolve));
       if (!settled) t.mock.timers.tick(25);
     }
+    // Mocked time no longer advances past this loop, so fail rather than await a promise that never settles.
+    assert.ok(settled, "awaitTickSurvivorsGone settled within the driven mock time");
     const verdict = await pending;
     assert.equal(verdict, "unconfirmed");
     assert.deepEqual(signals, [101], "the second group was not signalled after the deadline passed");

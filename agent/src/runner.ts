@@ -23484,9 +23484,9 @@ export class RunRunner {
       throw error;
     }
     if (result.kind !== "observed_empty") {
-      // runFreeCapture reports "incomplete" for any abort. On Claude the bound's sink-gate stop check
-      // turns that into a deadline-family error for the catch above; on the capture lane (no bound) it
-      // lands here. Either way an owner Cancel or a shutdown keeps its own reason (issue #3980).
+      // runFreeCapture may report "incomplete" after an abort. On Claude the bound's sink-gate stop check
+      // usually turns that into a deadline-family error for the catch above; on the capture lane (no
+      // bound) it lands here. Either way an owner Cancel or a shutdown keeps its own reason (issue #3980).
       if (ownerSignal.aborted) throw ownerSignal.reason;
       if (this.shutdownSignal.signal.aborted) throw this.shutdownSignal.signal.reason;
       throw new TransientRecoveryError("plan gate checkpoint could not be published and proven recoverable");
