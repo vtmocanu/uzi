@@ -51,18 +51,14 @@ function Th({ children, left, title }: { children: ReactNode; left?: boolean; ti
 }
 
 function Td({ children, left, total, title }: { children?: ReactNode; left?: boolean; total?: boolean; title?: string }) {
-  return (
-    <td
-      title={title}
-      className={cx(
-        "whitespace-nowrap px-2.5 py-2 align-top tabular-nums",
-        left ? "text-left" : "text-right",
-        total ? "border-t-2 border-edge-strong font-semibold text-fg" : "border-b border-edge/50 text-fg",
-      )}
-    >
-      {children}
-    </td>
+  const cls = cx(
+    "whitespace-nowrap px-2.5 py-2 align-top tabular-nums",
+    left ? "text-left" : "text-right",
+    total ? "border-t-2 border-edge-strong font-semibold text-fg" : "border-b border-edge/50 text-fg",
   );
+  // The first column names its row.
+  if (left) return <th scope="row" title={title} className={cx(cls, !total && "font-normal")}>{children}</th>;
+  return <td title={title} className={cls}>{children}</td>;
 }
 
 function FailRateCell({ outcomes, total }: { outcomes: RunOutcomes; total?: boolean }) {
@@ -78,7 +74,7 @@ function CostCell({ cost, disclosure, total }: { cost: number; disclosure: Retur
   return (
     <Td total={total}>
       <span className="font-mono">{summaryCost(cost)}</span>
-      {disclosure.incomplete && <span className="block text-[11px] font-normal text-faint" title={disclosure.title}>{disclosure.text}</span>}
+      {disclosure.incomplete && <span className="ml-auto block max-w-[16ch] whitespace-normal text-[11px] font-normal text-faint" title={disclosure.title}>{disclosure.text}</span>}
     </Td>
   );
 }
@@ -101,7 +97,7 @@ function ByUserTable({ admin, window, viewerId }: { admin: AdminUsage; window: U
       ) : rows.length === 0 ? (
         <p className="mt-2 text-sm text-faint">No usage across the factory yet.</p>
       ) : (
-        <div data-testid="by-user-scroll" className="mt-2 overflow-x-auto">
+        <div data-testid="by-user-scroll" role="region" aria-label="By user table" tabIndex={0} className="mt-2 overflow-x-auto focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">
           <table className="w-full min-w-[640px] border-collapse text-[13px]">
             <thead>
               <tr>

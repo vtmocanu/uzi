@@ -289,10 +289,10 @@ describe("OverviewUsageCard by-user table (#3881 M2)", () => {
   };
   const section = (view: ReturnType<typeof mount>) => within(view.getByRole("region", { name: "By user" }));
   const headers = (view: ReturnType<typeof mount>) => section(view).getAllByRole("columnheader").map((h) => h.textContent);
-  const cells = (row: HTMLElement) => within(row).getAllByRole("cell").map((c) => c.textContent);
+  const cells = (row: HTMLElement) => Array.from(row.children).map((c) => c.textContent);
   const rowOf = (view: ReturnType<typeof mount>, name: RegExp | string) =>
     section(view).getAllByRole("row").find((r) => {
-      const first = within(r).queryAllByRole("cell")[0]?.textContent ?? "";
+      const first = r.firstElementChild?.textContent ?? "";
       return typeof name === "string" ? first === name : name.test(first);
     })!;
   const PRS = 2;
@@ -438,5 +438,42 @@ describe("OverviewUsageCard by-user table (#3881 M2)", () => {
     expect(row[6]).toMatch(/^\$1,235.+/);
     expect(within(rowOf(view, /^owner\./)).getByTitle("10 of 100 finished runs")).toBeTruthy();
     expect(cells(rowOf(view, "Factory"))[4]).toBe("10.0%of 200 finished");
+  });
+
+  it("takes the Factory row's lifetime Runs from the factory count, not the row sum", () => {
+    const { self, admin } = fixture();
+    admin.factory.run_count = 50;
+    const view = factoryView({ self, admin });
+    expect(cells(rowOf(view, "Factory"))[1]).toBe("50");
+    expect(cells(rowOf(view, /^owner\./))[1]).toBe("23");
+  });
+
+  it("discloses the Factory row's own incomplete cost, per window", () => {
+    const { self, admin } = fixture();
+    Object.assign(admin.factory, {
+      lifetime_subscription_run_count: 5, lifetime_unreported_run_count: 3,
+      last7_subscription_run_count: 2, last7_unreported_run_count: 1,
+    });
+    const view = factoryView({ self, admin });
+    const note = () => within(rowOf(view, "Factory")).getByText(/^\+ /);
+    expect(note().textContent).toBe("+ 5 runs without a cost estimate and 3 unreported runs");
+    expect(note().getAttribute("title")).toBe(
+      "Runs without a cost estimate: tokens only; Unreported runs: cost incomplete; recorded partial costs included",
+    );
+    // A user row keeps its own counts.
+    expect(within(rowOf(view, /^owner\./)).getByText(/^\+ /).textContent).toBe("+ 4 runs without a cost estimate and 1 unreported run");
+    fireEvent.click(view.getByRole("button", { name: "Last 7 days" }));
+    expect(note().textContent).toBe("+ 2 runs without a cost estimate and 1 unreported run");
+  });
+
+  it("names the scroll wrapper as a focusable region and each row's first cell as a row header", () => {
+    const { self, admin } = fixture();
+    const view = factoryView({ self, admin });
+    const scroll = view.getByRole("region", { name: "By user table" });
+    expect(scroll.getAttribute("tabindex")).toBe("0");
+    expect(scroll.getAttribute("data-testid")).toBe("by-user-scroll");
+    expect(section(view).getAllByRole("rowheader").map((h) => h.textContent)).toEqual([
+      "other.person@example.com", "owner.person@example.com (you)", "Factory",
+    ]);
   });
 });

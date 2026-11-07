@@ -16,7 +16,7 @@ import type { UsageWindow } from "./UsageCards";
 // "Unavailable", "–" and "no failures" words stand alone.
 export function failureAgo(outcomes: RunOutcomes, now: number): string {
   const value = failureRecency(outcomes, now);
-  return /^(<1m|\d+[mhd])$/.test(value) ? `${value} ago` : value;
+  return outcomes.last_failed_at != null && value !== "Unavailable" ? `${value} ago` : value;
 }
 
 // PRD #1293 D6: the failed-run rate as failed / finished, one decimal, "—" when the scope

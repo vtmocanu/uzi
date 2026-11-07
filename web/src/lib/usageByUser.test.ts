@@ -79,6 +79,13 @@ describe("perUserRows", () => {
     expect(week.factoryRuns).not.toBe(admin.factory.run_count);
   });
 
+  it("takes the lifetime factory runs from the factory count, not the row sum", () => {
+    const { admin } = fixture();
+    admin.factory.run_count = 50;
+    expect(perUserRows(admin, "lifetime").factoryRuns).toBe(50);
+    expect(perUserRows(admin, "last_7_days").factoryRuns).toBe(sum((s) => s.runs7));
+  });
+
   it("takes the fail rate's denominator from finished runs, not runs", () => {
     const { admin } = fixture();
     const a = perUserRows(admin, "lifetime").rows.find((r) => r.user_id === "a")!;
