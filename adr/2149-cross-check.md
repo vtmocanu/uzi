@@ -630,8 +630,9 @@ estimates, not proofs.
   sizing batch, was measured with the helper's wall-clock bounds lifted for validation
   (validation, deadline lifted; the harness rewrites the spawned helper source, no production
   flag): the 1536 MiB / 1 CPU row (unmetered) peaked at 985.1 MiB and the 4 GiB / 2 CPU row
-  (metered) at 1,111.9 MiB, both below 1536 MiB. Discovery and the full sizing batch completed;
-  the capture then ended on the `--no-checkout` fixture's post-discovery `git_pipe_cap`. The
+  (metered) at 1,111.9 MiB, both below 1536 MiB. For the metered 4 GiB / 2 CPU row, discovery completed and the sizing
+  batch was recorded (sizingBytes 57,507,840 = 48 x 1,198,080 ids); for the unmetered 1536 MiB / 1
+  CPU row, which has no discovery record, completion is inferred from phase evidence. The capture then ended on the `--no-checkout` fixture's post-discovery `git_pipe_cap`. The
   rows are not production timing and not an unchanged production-path control. An earlier ×4
   deadline row (767.5 MiB, partial) and a sizing-batch extrapolation (about 1,166 MiB) are
   superseded context. Both over-cap fixtures refuse on their own cap at both configurations.
@@ -643,10 +644,11 @@ estimates, not proofs.
 **Residuals.** Compose enforces memory per worker, not per run. The measurements are single-run.
 The Compose sizing formula (`docker-compose.yml`: `mem_limit = (WORKER_MAX_CONCURRENT_RUNS +
 WORKER_CHAT_SESSIONS) x per-slot budget + headroom`) does not count cross-check lane slots
-(`WORKER_CROSS_CHECK_SLOTS`, default 1), so a checker capture can run beside run and chat slots in
-the same worker container, sharing one cgroup. The 985.1 and 1,111.9 MiB figures are for a
-capture alone; they are not additive-safe against a full set of other slots. The lifted rows do
-not show that a base this size finishes inside the production 28 s deadline.
+(`WORKER_CROSS_CHECK_SLOTS`, default 1), so a cross-check lane child can run beside a run slot's
+capture and the chat slots, sharing the one worker cgroup. The 985.1 and 1,111.9 MiB figures are
+for a capture alone; they are not additive-safe against a full set of other slots. They cover
+discovery and the sizing batch only: the post-discovery phase on a real checkout was not measured.
+The lifted rows do not show that a base this size finishes inside the production 28 s deadline.
 The soft-deadline overrun is out of scope. The negative-timer misclassification (#3993) was
 fixed separately (#3996), before the M3 measurements.
 

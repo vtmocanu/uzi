@@ -33,7 +33,7 @@ import {
 import type { Phases } from "./planning-deadline-lift.js";
 
 // The opt-in gate (UZI_PLANNING_DISCOVERY_MEASURE=1) is enforced in main() for every job kind
-// except the pure, read-only `model` kind.
+// except the pure, read-only `model` and `verify` kinds.
 
 // ---------------------------------------------------------------------------------------------
 // Fixture generation (deterministic: pinned identities and dates, plumbing-built objects).

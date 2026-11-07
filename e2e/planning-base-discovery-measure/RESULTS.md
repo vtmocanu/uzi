@@ -220,7 +220,7 @@ Measured on 2026-11-06/07 with the capped helper (`baseDiscoveryEntryCap` = 1,20
   2. rerun and sizing-batch rows: the same with `FIXTURES="repo synthetic-50000 distinct-256x1024n75 distinct-512x1024n75"`;
   3. twelve validation probes, 1641 s: one invocation each with `MEM_CONFIGS="4g:2:full"`, `LIMITS_JSON` and `LIMITS_TAG` (below).
 - **Raw records:** `results-2026-11-06-bound-m3.jsonl` beside this file. It holds 50 records, each tagged with its `run` (`m3-production`, `m3-rerun`, `m3-probes`, `m3-deadline-scaled`).
-- **Disk:** each configuration's container and its anonymous volumes were removed with `docker rm -v` as soon as its results were on the mounted output directory. No measurement container remained after any invocation.
+- **Disk:** each configuration's container and its anonymous volumes were removed with `docker rm -f -v` as soon as its results were on the mounted output directory. No measurement container remained after any invocation.
 
 ## Production rows (default limits)
 
@@ -259,7 +259,7 @@ The auditor of M2 noted that every M1 fixture shared one blob, so the post-disco
 
 ## Near-both-caps peak (validation, deadline ×4, 1536m/1)
 
-**Superseded by the M3 joint-cap measurement below** (validation, deadline lifted), which completed discovery and the full sizing batch at both caps; this partial lower bound is kept as context.
+**Superseded by the M3 joint-cap measurement below** (validation, deadline lifted), which recorded discovery and the full sizing batch for the metered row and inferred them for the unmetered row; this partial lower bound is kept as context.
 
 Measured on 2026-11-07 with the harness's `DEADLINE_SCALE` mode (README, "Deadline scale") at the shipped caps, so that a near-cap base can get past the 28 s helper deadline on this host. Only the helper's clock, the outer capture timeout and the harness timers are stretched ×4; every cap and memory bound stays at its production value. Each git command's timer is 5 s of real time, clamped to the deadline's remaining helper time (README, "Deadline scale"): the distinct row failed at about 9.7 s of helper time, under the plain 5 s clamp, while the wide row's post-discovery commands after 23 s of helper time ran under a shorter clamp. These rows measure memory at the caps, not production timing. Command, as actually run (one invocation, one container): `DEADLINE_SCALE=4 MEASURE_IMAGE=pbd-measure:1fca12dd FIXTURES="distinct-1170x1024n75 wide-1170x1024" MEM_CONFIGS="1536m:1:full,control"`, with the harness at `3258368a` (the helper is unchanged since the caps landed). Peaks are the container cgroup peak at the end of the capture, as in the earlier sections (the distinct row's sampled process-tree RSS peak was 788.3 MiB). Every job exited 0, with no OOM and no harness kill.
 
@@ -268,7 +268,7 @@ Measured on 2026-11-07 with the harness's `DEADLINE_SCALE` mode (README, "Deadli
 | distinct-1170x1024n75 (1,199,250 entries = 99.94 % of the entry cap; 99,448,830 path bytes = 98.8 % of the path-byte cap; 1,198,080 distinct blobs) | `git_deadline` in the sizing batch (that `cat-file --batch-check` exceeded its own 5 s real-time timer) | all 1,199,250 entries fetched (meter); the sizing batch was partly read | **767.5** | 39,815 |
 | wide-1170x1024 (1,199,250 entries; 17,979,390 path bytes) | discovery completed (charged 1,199,250 / 17,979,390, `analytic; meter match`), then a post-discovery `git_pipe_cap` from this `--no-checkout` fixture's all-deleted diff | completed, 28.8 s real (7.2 s helper clock) | 499.9 | 103,451 |
 
-- The distinct row is the closest this host gets to both caps reached: discovery of every entry plus part of the maximal sizing batch (26,550,384 bytes of `--batch-check` output read for 1,198,080 ids at 48 or more bytes per line, so under half the batch), in `full` (instrumented) mode, which adds metering overhead. Its 767.5 MiB peak complements, and does not replace, the earlier two-point extrapolation for a completed sizing batch (about 1,166 MiB, in the sizing-batch section above): it is a partial measurement and only a lower bound for that base; the measured 767.5 MiB is half the 1536 MiB budget, while the completed-batch estimate leaves about 1.3× headroom. It is not a completed whole capture: the sizing batch's 5 s per-command timer fired first.
+- The distinct row is the closest this host gets to both caps reached: discovery of every entry plus part of the maximal sizing batch (26,550,384 bytes of `--batch-check` output read for 1,198,080 ids at 48 or more bytes per line, so under half the batch), in `full` (instrumented) mode, which adds metering overhead. Its 767.5 MiB peak (at the time) complemented, and did not replace, the earlier two-point extrapolation for a completed sizing batch (about 1,166 MiB, in the sizing-batch section above): it is a partial measurement and only a lower bound for that base; the measured 767.5 MiB is half the 1536 MiB budget, while the completed-batch estimate leaves about 1.3× headroom. It is not a completed whole capture: the sizing batch's 5 s per-command timer fired first.
 - The same invocation also ran `control` rows. `control` runs the unmodified helper without the metering preamble that slows the clock, so those rows ran at the production deadline under a stretched label; they were discarded (not in the jsonl). The full-mode code path is identical in the current harness, which, like `run.sh`, now refuses `DEADLINE_SCALE` for any mode other than `full` (so this exact command is no longer accepted; rerun it with `MEM_CONFIGS="1536m:1:full"`).
 
 ## Validation probes (7f, injected limits, 4g/2)
@@ -298,7 +298,7 @@ For each index i, the pair `(entryCap = i, pathByteCap = Pm(i) − 1)` must refu
 
 **Residual, not measured:**
 - Compose enforces memory per worker, not per run, so concurrent runs in one worker share the 1536 MiB-per-slot arithmetic.
-- In the lifted rows, discovery and the full sizing batch at both caps completed (metered row: discovery at 50,515 ms, sizing closed at 45,161 ms). The whole capture then ended on the fixture's post-discovery `git_pipe_cap`, an artifact of the `--no-checkout` fixture (every base path diffs as a deletion). Production timing was not exercised in those rows: the helper deadline and per-command timer were lifted, so whether a base this size finishes inside 28 s on a production host is not measured.
+- In the lifted rows, discovery and the full sizing batch were recorded for the metered 4g / 2 CPU row (discovery completed; sizingBytes 57,507,840 = 48 × 1,198,080 ids; 50,515 ms and 45,161 ms are on the helper's own clock) and inferred from phase evidence for the unmetered 1536m / 1 CPU row, which has no discovery record. The whole capture then ended on the fixture's post-discovery `git_pipe_cap`, an artifact of the `--no-checkout` fixture (every base path diffs as a deletion). Production timing was not exercised in those rows: the helper deadline and per-command timer were lifted, so whether a base this size finishes inside 28 s on a production host is not measured.
 - The post-discovery phase of such a base (reading a real checkout) was not measured; the `--no-checkout` fixture cannot exercise it.
 - Each configuration ran once.
 
@@ -314,7 +314,7 @@ Measured on 2026-11-07 with the capped helper (`baseDiscoveryEntryCap` = 1,200,0
   2. 1b: the same with `FIXTURES="distinct-1171x1024n75 distinct-1170x1024n77"`;
   3. 2: `DEADLINE_LIFT=1` with the three fixtures and `MEM_CONFIGS="4g:2:full"`;
   4. 3, production (no lift): `REPO_SHA=e613f033 FIXTURES="repo synthetic-50000" MEM_CONFIGS="1536m:1:control 4g:2:full"`.
-- **Termination:** every invocation exited 0; every job exited 0 with no OOM, no harness kill and no preserved container. Containers were removed with `docker rm -v` after the readability gate passed. Fixture generation took about 230-237 s each. The host load average was about 5-10 during run 3. Disk preflight floor 5 GiB (Docker store about 24.9 GiB free, the data filesystem about 35 GiB at the time).
+- **Termination:** every invocation exited 0; every job exited 0 with no OOM, no harness kill and no preserved container. Containers were removed with `docker rm -f -v` after the readability gate passed. Generating each of the three lift fixtures took about 230-237 s (the clean-control fixtures took 41.7 s and 47.5 s). The host load average was about 5-10 during run 3. Disk preflight floor 5 GiB (Docker store about 25 GiB free, the data filesystem about 35 GiB at the time).
 
 ## Fixtures
 
@@ -345,7 +345,7 @@ Container peak is the cgroup `memory.peak` at the end of the capture, as in the 
 
 - The helper's own maxRSS in the metered n76 row was 1,022,288 KiB at the discovery boundary and at exit.
 - The metered n76 peak at the discovery boundary equals the peak at the end (1,111.9 MiB), so on this row the peak was reached by the end of discovery and the sizing batch; the post-discovery phase added nothing to it.
-- The unmetered n76 row's sampled process-tree RSS peak was 950.0 MiB; its cgroup peak includes the harness parent (about 60 MiB) and page cache.
+- The unmetered n76 row's sampled process-tree RSS peak was 950.0 MiB; its cgroup peak includes everything in the container (about 62 MiB held at job start, cgroup currentAtStart 61.9 MiB) and page cache.
 - Both n76 rows ended on `git_pipe_cap` in the post-discovery phase. In these `--no-checkout` fixtures every base path diffs as a deletion, so that phase is shaped by the fixture, not by production (as for `wide-1024x1024` above).
 - The cap-refusal rows peak well below the joint-cap row because they stop at the first cap, before the sizing batch.
 
@@ -360,7 +360,7 @@ Observer times, ms from the job start:
 | later git spawn seen | 61,186 |
 | clone index open seen | not observed (best-effort) |
 
-Phase evidence `post_sizing_observed`: the sizing batch was seen and gone, and a later git spawn followed it, all before the refusal. The metered n76 row independently recorded the discovery boundary at 50,515 ms and its first post-boundary spawn at 54,106 ms.
+Phase evidence `post_sizing_observed`: the sizing batch was seen and gone, and a later git spawn followed it, all before the refusal. The metered n76 row corroborates this: the helper recorded the discovery boundary at 50,515 ms and its first post-boundary spawn at 54,106 ms on its own clock, measured from the helper's start (the 45,161 ms sizing close is on that clock too); its own observer, on the job-start clock, saw the sizing batch at 37,705 ms, saw it gone at 45,308 ms and saw the first later git spawn at 54,589 ms (the observer records no discovery boundary).
 
 ## Verification
 

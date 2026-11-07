@@ -220,8 +220,8 @@ DEADLINE_SCALE=4 OUT=/abs/out FIXTURES="distinct-60x19998n75" ./e2e/planning-bas
 
 ### Deadline lift (validation only: the wall-clock bounds are lifted)
 
-`DEADLINE_LIFT=1` (the only accepted value) lets a base just under both production caps run its
-whole capture, sizing batch included, on a host too slow for the 28 s deadline. It is
+`DEADLINE_LIFT=1` (the only accepted value) lets a base just under both production caps run past
+discovery and its sizing batch on a host too slow for the 28 s deadline. It is
 harness-only: no production flag or hook exists and `agent/src` is untouched. The harness
 rewrites the helper source text it hands to its spawner
 (`agent/test/planning-deadline-lift.ts`) and nothing else:
@@ -286,7 +286,8 @@ with a job file of
 ```
 
 A row is valid only with container exit code 0, no OOM, no harness kill, matching labels, no
-failures, an outcome matching `expect` and, on a lift row, the exact lifted values.
+failures, an outcome matching `expect` and, on a lift row, the exact lifted values. A full-mode cap-refusal
+row also needs a numeric `treeEntriesFetched.value`.
 `expect` is `completed`, `phase-evidence` (a recorded `phaseEvidence` consistent with the outcome)
 or a refusal token such as `base_discovery_entry_cap` (which also needs a derived charge). Cite a
 lift row only after it verifies.
@@ -373,8 +374,8 @@ report `no`.
 - **tree RSS:** the sum of VmRSS over the helper and its descendants, sampled every 10 ms. It
   can miss short peaks, and it double-counts shared pages.
 - **cgroup peak:** `memory.peak` at the boundary and at the end. It is the authoritative
-  container figure, and it includes the harness parent (about 60 MiB at capture start, recorded
-  per job as `cgroup.currentAtStart`) and page cache.
+  container figure, and it includes whatever the container held at job start (about 62 MiB,
+  recorded per job as `cgroup.currentAtStart`) and page cache.
 
 **Termination classes:**
 - `oom` only with affirmative evidence: Docker `OOMKilled`, or an increase in `memory.events`
