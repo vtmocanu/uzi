@@ -1,4 +1,4 @@
-import { describe, it, type TestContext } from "node:test";
+import { after, describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
@@ -36,6 +36,7 @@ const revokedAfterOpen: Step = async action => {
 };
 
 describe("a step that throws after the open completed still closes the handle", () => {
+  after(() => fs.rmSync(dir, { recursive: true, force: true }));
   it("readSmallRegularFile", async t => {
     const handles = trackHandles(t);
     await assert.rejects(readSmallRegularFile(file, 64, revokedAfterOpen), /revoked/);

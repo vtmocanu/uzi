@@ -22,7 +22,10 @@ import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
 
 const RUN = "run-worktree-proof";
 const BRANCH = "agent/issue-3431";
-const ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
+const ENV: NodeJS.ProcessEnv = {
+  ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_"))),
+  GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0",
+};
 const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const PINS = [
   "core.fsmonitor=false", "core.excludesFile=/dev/null", "core.trustctime=true", "core.checkStat=default",
@@ -885,7 +888,12 @@ it("index parser agrees with git on a v3 index (assume-valid, skip-worktree, int
   assert.equal(by("skipped").skipWorktree, true);
   assert.equal(by("added").intentToAdd, true);
   assert.equal(by("normal").assumeValid || by("normal").skipWorktree || by("normal").intentToAdd, false);
-  assert.throws(() => parseGitIndex(index, { maxEntries: 100 }), /./);
+  assert.throws(() => parseGitIndex(index, { maxEntries: 100 }), error => {
+    assert.ok(error instanceof GitIndexError);
+    assert.equal(error.kind, "refused");
+    assert.match(error.message, /extended entry flags/);
+    return true;
+  });
 });
 
 it("index parser refuses each hostile shape in strict mode and names the reason", () => {
@@ -1035,7 +1043,8 @@ it("B1: a forged cache-tree hides a staged change from status, and the proof ref
   const forged = Buffer.concat([Buffer.from("\0-1 1\n"), Buffer.from("dir\x002 0\n", "latin1"), Buffer.from(subtree, "hex")]);
   fs.writeFileSync(file, withCacheTree(fs.readFileSync(file), forged));
   // Control: the staged change is real, yet a plain `git status` on the forged index prints nothing.
-  assert.match(command(clonePath, "diff", "--cached", "--name-only", "--no-renames"), /dir\/inner\.txt|^$/);
+  assert.notEqual(command(clonePath, "rev-parse", ":dir/inner.txt"),
+    command(clonePath, "rev-parse", "HEAD:dir/inner.txt"), "control: the index really holds a staged change");
   const naive = spawnSync("git", ["-C", clonePath, "status", "--porcelain"], { env: { ...ENV, GIT_OPTIONAL_LOCKS: "0" }, encoding: "utf8" });
   assert.equal(naive.stdout, "", "control: the forged cache-tree makes status report clean");
   const rec = recordLaunches(t);
@@ -1228,11 +1237,16 @@ it("index parser refuses hostile version 4 names", () => {
   const first = 12, second = 12 + 62 + 1 + 5;
   assert.equal(index[first + 62], 0);
   assert.equal(index[second + 62], 1);
-  const refused = (data: Buffer, pattern: RegExp) => assert.throws(() => parseGitIndex(data, { maxEntries: 4 }), pattern);
+  const refused = (data: Buffer, pattern: RegExp) => assert.throws(() => parseGitIndex(data, { maxEntries: 4 }), error => {
+    assert.ok(error instanceof GitIndexError);
+    assert.equal(error.kind, "refused");
+    assert.match(error.message, pattern);
+    return true;
+  });
   refused(patched(index, b => { b[first + 62] = 1; }), /strip length exceeds/);
   refused(patched(index, b => { b[second + 62] = 9; }), /strip length exceeds/);
-  refused(patched(index, b => { b[second + 62] = 0x80; }), /./);
-  refused(patched(index, b => { b[first + 62 + 1 + 4] = 0x61; }), /./);
+  refused(patched(index, b => { b[second + 62] = 0x80; }), /version 4 strip length exceeds/);
+  refused(patched(index, b => { b[first + 62 + 1 + 4] = 0x61; }), /version 4 path length disagrees/);
 });
 
 it("index: a version 4 index Git wrote for the clone is proven", async () => {
