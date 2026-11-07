@@ -48,6 +48,9 @@ var (
 	ErrForgeUnreachableHeld            = errors.New("forge_unreachable held: use Resume before switching its token")
 	ErrCodexIdleStallHeld              = errors.New("codex_idle_stall held: use Resume before switching its token")
 	ErrCredentialSwitchRaced           = errors.New("credential switch: run state changed, retry")
+	// ErrCredentialsResetHeld is the owner-facing 409 text for a Resume or set-token on a run held on
+	// credentials_reset (PRD #3989 M3): only the credential promoter releases that hold.
+	ErrCredentialsResetHeld = errors.New("credentials were reset; add a credential in Settings and the run resumes automatically")
 )
 
 // CredentialSwitchWorkerUnsupportedError refuses a held-state switch whose holding worker does
@@ -127,6 +130,11 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 	}
 	switch run.Status {
 	case "paused":
+		if run.HoldReason.Valid && run.HoldReason.String == holdCredentialsReset {
+			// PRD #3989 M3: only the promoter releases this hold, so ResumePausedRun would refuse
+			// it after the override was already written. Refuse up front, writing nothing.
+			return SetRunCredentialResult{}, ErrCredentialsResetHeld
+		}
 		if run.HoldReason.Valid && run.HoldReason.String == "credential_disabled" {
 			// PRD #1732 D2/D14: the reassignment writes the override and leaves the hold in
 			// the promoter's lock order, so it and a concurrent promotion serialize: exactly
