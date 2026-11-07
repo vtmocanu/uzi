@@ -1944,9 +1944,145 @@ for mode in success cleanup-reaped before-reaped post-reaped delete-reaped after
   else echo "FAIL: phase50 ephemeral window $mode result=$got seeds=$actual_seeds expected=$want/$seeds: $output"; fi
 done
 
+# --- capture_agent_logs (#4060): snapshot agent logs before a lifecycle op discards them ------------
+# Real helper extracted from lib.sh; stateful fake compose; every case in a subshell with its own
+# RUNROOT/COMPOSE so nothing global changes for later code.
+eval "$(awk '/^capture_agent_logs\(\) \{/,/^\}/' "$LIB")"
+CAL_DEFINED=yes
+type capture_agent_logs >/dev/null 2>&1 || CAL_DEFINED=no
+CAL_DIR="$(mktemp -d "$SEQ_DIR/cal-fixture.XXXXXX")" # removed with SEQ_DIR by the file's EXIT trap
+
+# State files under $CAL_STATE: current.log (live log), mode (ok|logs-fail|logs-empty|ps-fail|ps-empty),
+# recorded (lifecycle observations), bad-argv (any unexpected invocation).
+fake_lifecycle_compose() {
+  local mode
+  mode="$(cat "$CAL_STATE/mode")"
+  case "$*" in
+    "ps -a -q agent")
+      case "$mode" in ps-fail) return 3 ;; ps-empty) return 0 ;; *) echo "container-id-1" ;; esac ;;
+    "logs --no-color agent")
+      case "$mode" in logs-fail) return 4 ;; logs-empty) return 0 ;; *) cat "$CAL_STATE/current.log" ;; esac ;;
+    *"--force-recreate agent" | "kill agent" | "stop agent" | "restart agent" | "down")
+      if grep -qs outgoing-process "$RUNROOT"/artifacts/agent-logs/*.log 2>/dev/null; then
+        echo "snapshot-present=yes" >> "$CAL_STATE/recorded"
+      else
+        echo "snapshot-present=no" >> "$CAL_STATE/recorded"
+      fi
+      echo replacement > "$CAL_STATE/current.log" ;;
+    *) echo "unexpected argv: $*" >> "$CAL_STATE/bad-argv"; return 9 ;;
+  esac
+}
+
+# cal_setup MODE PAYLOAD — fresh RUNROOT + state; sets CAL_STATE, RUNROOT, COMPOSE in the caller.
+cal_setup() {
+  CAL_STATE="$(mktemp -d "$CAL_DIR/state.XXXXXX")"
+  RUNROOT="$(mktemp -d "$CAL_DIR/run.XXXXXX")"
+  echo "$1" > "$CAL_STATE/mode"
+  echo "$2" > "$CAL_STATE/current.log"
+  : > "$CAL_STATE/bad-argv"
+  COMPOSE=(fake_lifecycle_compose)
+}
+
+cal_case() { # NAME DETAIL(empty = pass)
+  cases=$((cases + 1))
+  if [ -z "$2" ]; then passed=$((passed + 1)); echo "PASS: $1"; else echo "FAIL: $1 — $2"; fi
+}
+
+cal_run() { # NAME FUNCTION — run a case body in a subshell, capturing its detail output
+  local detail
+  if [ "$CAL_DEFINED" != yes ]; then cal_case "$1" "capture_agent_logs not defined in lib.sh"; return 0; fi
+  detail="$( ( "$2" ) 2>&1 )" || detail="${detail:-body exited nonzero}"
+  cal_case "$1" "$detail"
+}
+
+cal_files() { ls "$RUNROOT/artifacts/agent-logs"/*."$1" 2>/dev/null || true; }
+
+cal_before_discard() {
+  cal_setup ok outgoing-process
+  local rc=0 err
+  err="$(capture_agent_logs 42-x before-recreate 2>&1)" || rc=$?
+  "${COMPOSE[@]}" up -d --no-deps --force-recreate agent
+  [ "$rc" = 0 ] || { echo "rc=$rc"; return 0; }
+  grep -qx 'snapshot-present=yes' "$CAL_STATE/recorded" || { echo "missing outgoing evidence: no snapshot at recreate time"; return 0; }
+  grep -q outgoing-process "$(cal_files log | head -1)" || { echo "missing outgoing evidence: .log lacks payload"; return 0; }
+  [ "$(cat "$CAL_STATE/current.log")" = replacement ] || echo "live log is not only replacement"
+  [ ! -s "$CAL_STATE/bad-argv" ] || echo "unexpected argv: $(cat "$CAL_STATE/bad-argv")"
+  case "$err" in *PASS* | *'FAIL '*) echo "message contains PASS/FAIL token: $err" ;; esac
+}
+cal_run "capture_agent_logs snapshots outgoing logs before force-recreate" cal_before_discard
+
+cal_repeat() {
+  cal_setup ok payload-one
+  capture_agent_logs 42-x same
+  echo payload-two > "$CAL_STATE/current.log"
+  capture_agent_logs 42-x same
+  local files n1 n2
+  files="$(cal_files log)"
+  [ "$(printf '%s\n' "$files" | wc -l)" = 2 ] || { echo "expected 2 distinct logs, got: $files"; return 0; }
+  n1="$(basename "$(printf '%s\n' "$files" | sed -n 1p)")"; n2="$(basename "$(printf '%s\n' "$files" | sed -n 2p)")"
+  [ "$((10#${n1%%-*}))" -lt "$((10#${n2%%-*}))" ] || echo "NNNN not strictly increasing: $n1 $n2"
+  grep -q payload-one "$RUNROOT/artifacts/agent-logs/$n1" || echo "first payload lost"
+  grep -q payload-two "$RUNROOT/artifacts/agent-logs/$n2" || echo "second payload lost"
+}
+cal_run "capture_agent_logs repeat capture keeps distinct increasing snapshots" cal_repeat
+
+# cal_missing_body MODE REASON-SUBSTRING — shared body for cases 3-5
+cal_missing_body() {
+  cal_setup "$1" some-payload
+  local rc=0 err
+  err="$(capture_agent_logs 42-x lbl 2>&1 >/dev/null)" || rc=$?
+  [ "$rc" = 0 ] || { echo "rc=$rc"; return 0; }
+  case "$err" in *"MISSING-EVIDENCE: agent logs 42-x/lbl: "*"$2"*) ;; *) echo "stderr lacks MISSING-EVIDENCE/$2: $err" ;; esac
+  case "$err" in *PASS* | *'FAIL '*) echo "message contains PASS/FAIL token" ;; esac
+  [ -n "$(cal_files missing)" ] || echo "no .missing file"
+  [ -z "$(cal_files log)" ] || echo ".log written on failure"
+  [ -z "$(cal_files absent)" ] || echo ".absent written on failure"
+  [ -z "$(cal_files log.part)" ] || echo ".part left behind"
+  # bare statement under errexit, outside any if/||/$( ) context
+  ( set -euo pipefail; capture_agent_logs 42-x lbl2; echo SENTINEL ) > "$CAL_STATE/sentinel.out" 2>/dev/null || true
+  grep -qx SENTINEL "$CAL_STATE/sentinel.out" || echo "errexit aborted caller (no SENTINEL)"
+}
+cal_logs_fail() { cal_missing_body logs-fail "read failure: compose logs"; }
+cal_logs_empty() { cal_missing_body logs-empty "empty log output"; }
+cal_ps_fail() { cal_missing_body ps-fail "read failure: compose ps"; }
+cal_run "capture_agent_logs logs read failure is reported as missing evidence" cal_logs_fail
+cal_run "capture_agent_logs empty logs output is reported as missing evidence" cal_logs_empty
+cal_run "capture_agent_logs ps failure is a read failure, not absent" cal_ps_fail
+
+cal_write_fail() {
+  cal_setup ok some-payload
+  mkdir -p "$RUNROOT/artifacts"
+  : > "$RUNROOT/artifacts/agent-logs"   # a regular file where the directory must be
+  local rc=0 err
+  err="$(capture_agent_logs 42-x lbl 2>&1 >/dev/null)" || rc=$?
+  [ "$rc" = 0 ] || { echo "rc=$rc"; return 0; }
+  case "$err" in *"MISSING-EVIDENCE: agent logs 42-x/lbl: "*) ;; *) echo "stderr lacks MISSING-EVIDENCE: $err" ;; esac
+  case "$err" in *PASS* | *'FAIL '*) echo "message contains PASS/FAIL token" ;; esac
+  [ -z "$(find "$RUNROOT" -name '*.log' 2>/dev/null)" ] || echo ".log written despite write failure"
+  ( set -euo pipefail; capture_agent_logs 42-x lbl2; echo SENTINEL ) > "$CAL_STATE/sentinel.out" 2>/dev/null || true
+  grep -qx SENTINEL "$CAL_STATE/sentinel.out" || echo "errexit aborted caller (no SENTINEL)"
+}
+cal_run "capture_agent_logs write failure is reported and returns 0" cal_write_fail
+
+cal_absent() {
+  cal_setup ps-empty x
+  local err rc=0
+  err="$(capture_agent_logs 05-x cleanup absent-ok 2>&1)" || rc=$?
+  [ "$rc" = 0 ] || { echo "rc=$rc"; return 0; }
+  [ -n "$(cal_files absent)" ] || echo "absent-ok: no .absent"
+  [ -z "$(cal_files log)" ] || echo "absent-ok: .log written"
+  [ -z "$(cal_files missing)" ] || echo "absent-ok: .missing written"
+  case "$err" in *MISSING-EVIDENCE*) echo "absent-ok printed MISSING-EVIDENCE: $err" ;; esac
+  case "$err" in *PASS* | *'FAIL '*) echo "message contains PASS/FAIL token" ;; esac
+  err="$(capture_agent_logs 05-x strict 2>&1)" || true
+  [ -n "$(cal_files missing)" ] || echo "without absent-ok: no .missing"
+  case "$err" in *"MISSING-EVIDENCE: agent logs 05-x/strict: agent container absent"*) ;; *) echo "without absent-ok: stderr lacks MISSING-EVIDENCE: $err" ;; esac
+}
+cal_run "capture_agent_logs absent agent is expected only with absent-ok" cal_absent
+
 node --test "$ROOT/e2e/settlement-diagnostic.test.mjs"
 node --test "$ROOT/e2e/recovery-record-projection.test.mjs"
 echo "cases=$cases passed=$passed"
 # Tally guard (the driver.test.sh idiom): a real run has at least 203 cases green; a zero-case or
 # partially-red run must exit nonzero.
-[ "$cases" -ge 203 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -ge 210 ] && [ "$cases" -eq "$passed" ]
