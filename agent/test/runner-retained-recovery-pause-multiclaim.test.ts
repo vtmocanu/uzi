@@ -199,6 +199,8 @@ interface Run {
   sdkCalls: number;
   summaryCalls: number;
   ownershipReads: number;
+  executionErrors: unknown[];
+  publishCountsAtPause: number[];
   publishes: number;
   pauseParks: number;
   fired: number;
@@ -241,7 +243,8 @@ async function setup(opts: RunOptions): Promise<Run> {
   if (opts.pause) model.requestPause("now");
 
   const run = { model, bare, claims: [first], models: 0, reserves: 0, prepares: 0, sdkCalls: 0,
-    summaryCalls: 0, ownershipReads: 0, publishes: 0, pauseParks: 0, fired: 0 } as unknown as Run;
+    summaryCalls: 0, ownershipReads: 0, executionErrors: [], publishCountsAtPause: [],
+    publishes: 0, pauseParks: 0, fired: 0 } as unknown as Run;
   const logs = recordingLogger();
   const makeExecutor: ExecutorFactory = runId => {
     const homeForRun = path.join(homeDir, runId);
@@ -311,6 +314,11 @@ async function setup(opts: RunOptions): Promise<Run> {
     if (opts.failPublish) return { ok: false, httpStatus: 500 } as any;
     return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/agent/issue-x" } } as any;
   };
+  const report = client.reportState.bind(client);
+  client.reportState = (async (...args: any[]) => {
+    if (args[0] === first.run_id && args[1].status === "paused") run.publishCountsAtPause.push(run.publishes);
+    return (report as any)(...args);
+  }) as typeof client.reportState;
   if (opts.report) {
     const wrapped = client.reportState.bind(client);
     client.reportState = (async (...args: any[]) => {
@@ -337,7 +345,8 @@ async function setup(opts: RunOptions): Promise<Run> {
 async function drive(run: Run, maxClaims = REQUEUE_CAP + 3): Promise<void> {
   let claim: any = run.claims[0];
   for (let n = 0; n < maxClaims; n++) {
-    try { await run.runner.execute(claim); } catch { /* a thrown flight is still a departure */ }
+    try { await run.runner.execute(claim); } catch (error) { run.executionErrors.push(error); }
+    assert.deepEqual(run.executionErrors, [], "execute must settle the expected flight outcomes without an uncaught rejection");
     claim = run.model.afterFlight(run.offer);
     if (!claim) return;
   }
@@ -376,6 +385,8 @@ it("combined #3994/#3995: post-adoption transport retry settles an owner pause i
   assert.equal(run.model.pausedApplied, 1, "one server-confirmed pause");
   assert.equal(run.flight.parked, true);
   assert.equal(run.pauseParks, 1);
+  assert.equal(run.publishCountsAtPause.length, 1);
+  assert.ok(run.publishCountsAtPause[0]! > 0, "a checkpoint was published before the paused report was sent");
   assert.equal(run.reserves, control.reserves);
   assert.equal(run.prepares, 1, "the same adopted successor is retained throughout the retry");
   assert.equal(allowance(run, branchFor(3995)), allowance(control, branchFor(3996)));
@@ -409,7 +420,8 @@ it("a deferred owner now pause settles as one claim, no automatic requeue and a 
   assert.equal(run.model.pausePending, false, "SetRunPaused cleared the pause columns");
   assert.equal(run.models, 0, "no model call in the paused run");
   assert.equal(run.pauseParks, 1);
-  assert.equal(run.publishes >= 1, true, "checkpoint first");
+  assert.equal(run.publishCountsAtPause.length, 1);
+  assert.ok(run.publishCountsAtPause[0]! > 0, "a checkpoint was published before the paused report was sent");
   assert.equal(run.reserves, control.reserves, "reservations equal the no-pause control");
   assert.equal(allowance(run, branchFor(3995)), allowance(control, branchFor(3996)), "allowance consumption equals the control");
 });
