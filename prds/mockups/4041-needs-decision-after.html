@@ -173,7 +173,7 @@ h1 { font-size: 22px; font-weight: 600; margin: 0; text-wrap: balance; }
       <li>Kind icons: shield for held work and owner parks, plan, question, PR.</li>
       <li>Plan rows add "Plan ready, N milestones" from data the page already loads (the cross-check outcome needs a server change and is left out).</li>
       <li>Question rows quote the pending question in one line, full text on hover, from a sanitized 280-character server excerpt (#4040).</li>
-      <li>Two or more decisions of the same kind (plans, questions, runs waiting on you) group into one row like PRs; the button expands them in place, each with its own action (try scenario 3).</li>
+      <li>Two or more decisions of the same kind (plans; questions and follow-ups; runs waiting on you) group into one row like PRs; the button expands them in place, each with its own action (try scenario 3).</li>
       <li>Two columns only at 4 rows or fewer on wide screens; one column otherwise and always at phone width.</li>
     </ul>
   </section>
@@ -220,7 +220,7 @@ h1 { font-size: 22px; font-weight: 600; margin: 0; text-wrap: balance; }
       { ref: "#4040", title: "Show the pending question inline", detail: "Plan ready, 1 milestone", age: "waiting 40m" },
       { ref: "#3876", title: "Per-user Claude / Codex split in admin usage", detail: "Plan ready, 2 milestones", age: "waiting 25m" },
       { ref: "#3875", title: "Command menu for navigation and your decisions", detail: "Plan ready, 2 milestones", age: "waiting 10m" } ] },
-    { kind: "question", icon: "i-q", noun: ["run asked you a question", "runs asked you a question"], btn: "Answer questions", each: "Answer", items: [
+    { kind: "question", icon: "i-q", noun: ["run needs your input", "runs need your input"], btn: "Open runs", each: "Answer", items: [
       { ref: "#3543", title: "Cross-check base discovery aggregate bound", quote: "Lower the caps to the 2× Chromium floor, or keep them and record the measurement as not obtained?", age: "asked 25m ago" },
       { ref: "#3877", title: "Promote the new Overview and retire the old one", quote: "Keep the old Overview behind a per-user setting, or delete it?", age: "asked 1h ago" } ] },
     { kind: "park", icon: "i-shield", noun: ["run waits on you", "runs wait on you"], btn: "Resume runs", each: "Resume", items: [

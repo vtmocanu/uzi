@@ -86,7 +86,7 @@ body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--sa
       <div class="ph">
         <div>
           <h2>Welcome, Vlad</h2>
-          <p class="lede"><b>3 decisions</b> and <b>8 pull requests</b> are waiting on you. 6 runs are executing across the factory for <b>4 people</b>, 1 is queued.</p>
+          <p class="lede"><b>3 decisions</b> and <b>8 pull requests</b> are waiting on you. 6 runs are executing across the factory for <b>3 people</b>, 1 is queued.</p>
         </div>
         <div class="actions">
           <a class="chip health" href="#"><span class="dot" aria-hidden="true"></span>23 of 23 checks passing</a>
@@ -102,11 +102,11 @@ body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--sa
               <div class="person"><span class="av" style="background:var(--a2)">RS</span><span class="nm">Radu S.</span><span class="pill run">1 running</span></div>
               <div class="person"><span class="av" style="background:var(--a3)">GD</span><span class="nm">Gabi D.</span><span class="pill wait">1 waits on them</span></div>
               <div class="person"><span class="av" style="background:var(--a4)">AT</span><span class="nm">Ana T.</span><span class="pill run">1 running · 1 queued</span></div>
-              <p class="grp">Signed in today, no runs</p>
+              <p class="grp">Signed in within 24h, no listed active run</p>
               <div class="person"><span class="av" style="background:var(--a5)">MP</span><span class="nm">Mihai P.</span><span class="st">2h ago</span></div>
               <p class="grp">Idle</p>
-              <div class="person"><span class="av" style="background:var(--idle)">+4</span><span class="nm st">4 people, last seen 2 to 19 days ago</span><span></span></div>
-              <div class="foot"><span>This week: 7 people ran work</span><a href="#">Usage by user →</a></div>
+              <div class="person"><span class="av" style="background:var(--idle)">+4</span><span class="nm st">3 people, last seen 2 to 19 days ago · 1 never signed in</span><span></span></div>
+              <div class="foot"><span>This week: 7 people had runs with recorded usage</span><a href="#">Usage by user →</a></div>
             </div>
           </div>
           <button class="chip" type="button" style="padding-left:12px">Search <span class="of">⌘K</span></button>
@@ -120,7 +120,7 @@ body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--sa
     <p class="label">A at phone width (closed)</p>
     <div class="frame phone">
       <div class="ph">
-        <div><h2 style="font-size:22px">Welcome, Vlad</h2><p class="lede"><b>3 decisions</b> and <b>8 pull requests</b> are waiting on you. 6 runs executing for <b>4 people</b>.</p></div>
+        <div><h2 style="font-size:22px">Welcome, Vlad</h2><p class="lede"><b>3 decisions</b> and <b>8 pull requests</b> are waiting on you. 6 runs executing for <b>3 people</b>.</p></div>
         <div class="actions">
           <a class="chip health" href="#"><span class="dot" aria-hidden="true"></span>23 of 23 OK</a>
           <button class="chip" type="button"><span class="stack" aria-hidden="true"><span class="av" style="background:var(--a1)">VM</span><span class="av" style="background:var(--a2)">RS</span><span class="av more">+2</span></span><span><b>4 active</b> <span class="of">of 9</span></span></button>
@@ -135,7 +135,7 @@ body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--sa
       <div class="tile"><div class="k">Workers</div><div class="v">5</div><div class="s">1 draining</div></div>
       <div class="tile"><div class="k">Run slots</div><div class="v">7/9</div><div class="s">2 free</div></div>
       <div class="tile"><div class="k">Held work</div><div class="v">8/8</div><div class="s">at the cap</div></div>
-      <div class="tile people"><div class="k">People active</div><div class="v">4 <small>of 9</small></div><div class="s">7 ran work this week</div></div>
+      <div class="tile people"><div class="k">People active</div><div class="v">4 <small>of 9</small></div><div class="s">7 with usage this week</div></div>
     </div>
     <p style="color:var(--muted);font-size:13px;margin:8px 0 0">Good for a glanceable number, but it sits lower on the page and cannot list who without its own popover. A answers the question where the eye lands first.</p>
   </section>
@@ -143,10 +143,11 @@ body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--sa
   <section>
     <p class="label">What the numbers mean</p>
     <ul class="defs">
-      <li><b>Active now</b>: owns at least one run that is not finished (running, queued, parked, or waiting on them). It comes from the admin run list the preview already loads, so it needs <b>no new API</b>.</li>
+      <li><b>Active now</b>: owns at least one run in the admin active-runs list the preview already loads (running, queued, parked, or waiting on them; chat, judge and cross-check runs are not listed), so it needs <b>no new API</b>. That list is capped at 500 rows: at the cap the chip says "at least N", and when the fetch fails it says "Active now unavailable".</li>
       <li><b>Of 9</b>: all enabled accounts, from the admin user list.</li>
-      <li><b>Signed in today</b>: from each account's last sign-in time, which the server already stores. uzi does not track who has a browser tab open, so "online" is not claimed.</li>
-      <li><b>This week</b>: people with at least one run in the last 7 days, from the admin usage data the page already loads.</li>
+      <li><b>Signed in within 24h, no listed active run</b>: from each account's last sign-in time, which the server already stores. uzi does not track who has a browser tab open, so "online" is not claimed.</li>
+      <li><b>This week</b>: people with runs that recorded usage in the last 7 days, from the admin usage data the page already loads.</li>
+      <li><b>"for N people"</b> in the status sentence counts only the owners of executing runs.</li>
       <li>Non-admins see no chip: they only see their own work. The status sentence gains "for N people" for admins only.</li>
     </ul>
   </section>
