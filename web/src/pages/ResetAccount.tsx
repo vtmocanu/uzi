@@ -22,7 +22,7 @@ const MIN_PASSWORD = 12;
 const INVALID_LINK_MESSAGE = "This link is invalid or has expired. Ask an administrator for a new one.";
 
 const REDEEM_UNCONFIRMED =
-  "The reset could not be confirmed; try signing in with the new password, or ask for a new link";
+  "The reset could not be confirmed; try signing in again, or ask for a new link";
 
 // The fetcher throws this when the page was opened with no fragment at all.
 const MISSING_TOKEN = Symbol("missing-token");
