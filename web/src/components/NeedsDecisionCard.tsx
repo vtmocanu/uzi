@@ -33,9 +33,10 @@ import { SectionTitle } from "./ui";
 const ACTION_CLASS =
   "inline-flex h-7 shrink-0 select-none items-center justify-center gap-1 rounded-lg border border-edge bg-raised px-2.5 text-xs font-medium text-fg transition-colors hover:border-edge-strong hover:bg-raised/70";
 
-// The per-item action inside an expanded group: the same look, one step smaller.
+// The per-item action inside an expanded group: a small trailing text link, so each item
+// stays on one line ("ref title · age · Action") even in a narrow column.
 const ITEM_ACTION_CLASS =
-  "inline-flex h-6 shrink-0 select-none items-center justify-center rounded-md border border-edge bg-raised px-2 text-[11px] font-medium text-fg transition-colors hover:border-edge-strong hover:bg-raised/70";
+  "shrink-0 text-[11px] font-medium text-fg underline decoration-edge-strong underline-offset-2 transition-colors hover:decoration-fg";
 
 // A compact decision age that rolls into days (activityAge stops at hours: "678h 0m").
 function decisionAge(since: string, now: number): string {
@@ -154,16 +155,43 @@ function Age({ age }: { age: string }) {
   return <span className="text-warn">waiting {age}</span>;
 }
 
-// One top-level row: tile, body, action. Below md the action drops under the body.
-function RowShell({ kind, border, children, action }: { kind: IconKind; border: string; children: ReactNode; action: ReactNode }) {
+// One top-level row: tile, body, action, top-aligned so an expanding body never moves the
+// action. Below md the action drops under the body. actionFirst puts the action before the
+// body in DOM (focus) order while the grid keeps it in the same place: a group's toggle then
+// precedes the list it reveals.
+function RowShell({
+  kind,
+  border,
+  children,
+  action,
+  actionFirst = false,
+}: {
+  kind: IconKind;
+  border: string;
+  children: ReactNode;
+  action: ReactNode;
+  actionFirst?: boolean;
+}) {
+  const body = (
+    <div key="body" className="col-start-2 row-start-1 min-w-0">
+      {children}
+    </div>
+  );
+  const act = (
+    <div
+      key="action"
+      className="col-start-2 row-start-2 justify-self-start md:col-start-3 md:row-start-1 md:justify-self-auto"
+    >
+      {action}
+    </div>
+  );
   return (
     <li
       data-decision-row=""
-      className={`grid min-w-0 grid-cols-[30px_minmax(0,1fr)] items-center gap-x-3.5 gap-y-2 py-3.5 md:grid-cols-[34px_minmax(0,1fr)_auto] md:gap-y-0 ${border}`}
+      className={`grid min-w-0 grid-cols-[30px_minmax(0,1fr)] items-start gap-x-3.5 gap-y-2 py-3.5 md:grid-cols-[34px_minmax(0,1fr)_auto] md:gap-y-0 ${border}`}
     >
       <KindTile kind={kind} />
-      <div className="min-w-0">{children}</div>
-      <div className="col-start-2 justify-self-start md:col-start-3 md:justify-self-auto">{action}</div>
+      {actionFirst ? [act, body] : [body, act]}
     </li>
   );
 }
@@ -216,8 +244,8 @@ function IssueLabel({ run }: { run: RunSummaryItem }) {
   );
 }
 
-// A lone plan, question or park. Follows the mock: no repo path on a single row.
-function SingleRow({ item, now, border }: { item: RunDecisionItem; now: number; border: string }) {
+// A lone plan, question or park: "<repo> #7 Title", the repo muted and omitted when empty.
+function SingleRow({ item, now, demo, border }: { item: RunDecisionItem; now: number; demo: boolean; border: string }) {
   const { run } = item;
   const age = decisionAge(item.since, now);
   // The row's title describes its action link, so several "Review plan" links are told apart
@@ -237,6 +265,11 @@ function SingleRow({ item, now, border }: { item: RunDecisionItem; now: number; 
       }
     >
       <p id={titleId} className="truncate text-sm font-medium text-fg">
+        {run.repo_path && (
+          <>
+            <span className="font-normal text-muted">{repoLabel(run, demo)}</span>{" "}
+          </>
+        )}
         <IssueLabel run={run} />
       </p>
       {parts.length > 0 && <Meta parts={parts} />}
@@ -250,11 +283,26 @@ function PrRef({ run, demo }: { run: RunSummaryItem; demo: boolean }) {
   const href = prHrefOf(run);
   const repo = run.repo_path ? repoLabel(run, demo) : "";
   const num = run.mr_iid != null ? `${mrRefSymbol(run.forge_type)}${run.mr_iid}` : mrAbbrev(run.forge_type);
-  const text = repo ? `${repo} ${num}` : num;
-  const cls = "font-mono text-fg hover:underline";
+  // Only the repo truncates (full path on hover); the number never shrinks, so a long repo path
+  // cannot hide which PR this is. The space rides in the number span (whitespace-pre, a flex
+  // container drops a bare whitespace node), keeping the text content "<repo> <sigil><iid>".
+  // The link's name is pinned to the same string: name-from-content trims each child's text,
+  // which would otherwise drop the space ("<repo>#12").
+  const name = repo ? `${repo} ${num}` : num;
+  const text = repo ? (
+    <>
+      <span data-pr-repo="" title={repo} className="min-w-0 truncate">
+        {repo}
+      </span>
+      <span data-pr-num="" className="shrink-0 whitespace-pre">{` ${num}`}</span>
+    </>
+  ) : (
+    <span data-pr-num="">{num}</span>
+  );
+  const cls = "inline-flex min-w-0 max-w-full align-top font-mono text-fg hover:underline";
   if (!href) {
     return (
-      <Link to={`/runs/${run.id}`} className={cls}>
+      <Link to={`/runs/${run.id}`} aria-label={name} className={cls}>
         {text}
       </Link>
     );
@@ -266,6 +314,7 @@ function PrRef({ run, demo }: { run: RunSummaryItem; demo: boolean }) {
         target="_blank"
         rel="noopener noreferrer"
         aria-describedby={newTabId}
+        aria-label={name}
         className={cls}
       >
         {text}
@@ -297,10 +346,36 @@ function GroupItem({ item, now, demo, open }: { item: RunDecisionItem; now: numb
     return <li className="relative min-w-0 truncate">{label}</li>;
   }
   const href = item.kind === "pr" ? prHrefOf(run) : null;
+  // One line: the ref keeps its width up to a cap (a long repo path truncates), the title takes
+  // and truncates the rest, the age and action never shrink.
+  const refCls = "relative max-w-[40%] shrink-0 truncate";
   return (
-    <li className="relative flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 py-0.5">
-      <span className="relative min-w-0 flex-1 basis-40 truncate">{label}</span>
-      {age && <Age age={age} />}
+    <li className="relative flex min-w-0 items-center gap-x-2 py-0.5">
+      {item.kind === "pr" ? (
+        <>
+          <span className={refCls}>
+            <PrRef run={run} demo={demo} />
+          </span>
+          <span id={labelId} title={stripUnsafeChars(run.issue_title)} className="min-w-0 flex-1 truncate">
+            {stripUnsafeChars(run.issue_title)}
+          </span>
+        </>
+      ) : (
+        <span id={labelId} className="flex min-w-0 flex-1 items-center gap-x-1">
+          <span className={refCls}>
+            <RunIssueRef issueIid={run.issue_iid} issueWebUrl={run.issue_web_url} kind={run.kind} forgeType={run.forge_type} />
+          </span>{" "}
+          <span title={stripUnsafeChars(run.issue_title)} className="min-w-0 truncate">
+            {stripUnsafeChars(run.issue_title)}
+          </span>
+        </span>
+      )}
+      {age && (
+        <span className="shrink-0 text-warn">
+          <span className="sr-only">waiting </span>
+          {age}
+        </span>
+      )}
       {href ? (
         <>
           <a
@@ -346,12 +421,14 @@ function GroupRow({
   const hidden = items.length - shown.length;
   const oldest = decisionAge(items[0].since, now);
   // One cached-state note for the whole group: the forge's own noun when every PR shares it.
-  const forges = new Set(items.map((i) => i.run.forge_type ?? null));
-  const noun = forges.size === 1 ? mrAbbrev(items[0].run.forge_type) : "PR";
+  // Compared by the noun shown, so a GitLab PR and a forge-less one (both "MR") agree.
+  const nouns = new Set(items.map((i) => mrAbbrev(i.run.forge_type)));
+  const noun = nouns.size === 1 ? [...nouns][0] : "PR";
   return (
     <RowShell
       kind={kind}
       border={border}
+      actionFirst
       action={
         <button
           type="button"
@@ -411,7 +488,7 @@ export function NeedsDecisionCard({ items, now, demo }: { items: DecisionItem[];
           row.type === "held" ? (
             <HeldDecisionRow key="held" item={row.item} now={now} border={border(i)} />
           ) : row.type === "single" ? (
-            <SingleRow key={`${row.item.kind}:${row.item.run.id}`} item={row.item} now={now} border={border(i)} />
+            <SingleRow key={`${row.item.kind}:${row.item.run.id}`} item={row.item} now={now} demo={demo} border={border(i)} />
           ) : (
             <GroupRow key={`group:${row.kind}`} kind={row.kind} items={row.items} now={now} demo={demo} border={border(i)} />
           ),

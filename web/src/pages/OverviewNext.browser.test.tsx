@@ -732,27 +732,86 @@ describe("OverviewNext decision card layout", () => {
     expect(lefts().size).toBe(1);
   });
 
-  it("expands the PR group from the keyboard at 400px without horizontal overflow", async () => {
-    await page.viewport(400, 900);
-    const { card } = await mountCard([aRun({ id: "plan", status: "awaiting_approval", issue_title: LONG_TITLE }), ...prs(8)]);
-    const button = within(card).getByRole("button", { name: "Review PRs" });
-    const list = document.getElementById(button.getAttribute("aria-controls") ?? "") as HTMLElement;
-    expect(list).not.toBeNull();
-    // Tab from the last previewed PR link reaches the group's button.
-    const refs = within(list).getAllByRole("link");
-    refs[refs.length - 1].focus();
-    await userEvent.tab();
-    expect(document.activeElement).toBe(button);
-    await userEvent.keyboard("{Enter}");
-    expect(button.getAttribute("aria-expanded")).toBe("true");
-    expect(within(list).getAllByRole("link", { name: "Review PR" })).toHaveLength(8);
-    expect(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(window.innerWidth);
-    const cardRight = card.getBoundingClientRect().right;
-    for (const el of list.querySelectorAll<HTMLElement>("li")) {
-      expect.soft(el.getBoundingClientRect().right, el.textContent?.slice(0, 30)).toBeLessThanOrEqual(cardRight + 1);
-    }
-    await userEvent.keyboard(" ");
-    expect(button.getAttribute("aria-expanded")).toBe("false");
-    expect(button.textContent).toBe("Review PRs");
+  it("keeps a lone row in one column spanning the list at 1280px", async () => {
+    await page.viewport(1280, 900);
+    const { card, rows } = await mountCard([aRun({ id: "plan", status: "awaiting_approval", issue_title: LONG_TITLE })]);
+    expect(rows()).toHaveLength(1);
+    const list = (card.querySelector("[data-decision-rows]") as HTMLElement).getBoundingClientRect();
+    const row = rows()[0].getBoundingClientRect();
+    expect(row.left).toBeCloseTo(list.left, 0);
+    expect(row.width).toBeCloseTo(list.width, 0);
   });
+
+  // Expanding keeps every item on one line, holds the neighbouring row still (and, in a
+  // two-column column at 1280px, the toggle too), puts the revealed items next in Tab order, and
+  // never pushes the page sideways, at 1280px and stacked at 400px.
+  for (const width of [1280, 400]) {
+    it(`expands the PR group from the keyboard at ${width}px: one line per item, toggle holds still`, async () => {
+      await page.viewport(width, 900);
+      const { card, rows, lefts } = await mountCard([
+        aRun({ id: "plan", status: "awaiting_approval", issue_title: LONG_TITLE }),
+        aRun({ id: "ask", status: "awaiting_input", issue_title: LONG_TITLE }),
+        ...prs(8),
+      ]);
+      expect(lefts().size).toBe(width === 1280 ? 2 : 1);
+      const button = within(card).getByRole("button", { name: "Review PRs" });
+      const list = document.getElementById(button.getAttribute("aria-controls") ?? "") as HTMLElement;
+      expect(list).not.toBeNull();
+      const neighbour = within(card).getByRole("link", { name: "Answer" });
+      const pageTop = (el: HTMLElement) => el.getBoundingClientRect().top + window.scrollY;
+      const before = { toggle: pageTop(button), neighbour: pageTop(neighbour) };
+
+      button.focus();
+      await userEvent.keyboard("{Enter}");
+      expect(button.getAttribute("aria-expanded")).toBe("true");
+      expect(within(list).getAllByRole("link", { name: "Review PR" })).toHaveLength(8);
+      if (width === 1280) {
+        expect.soft(pageTop(button), "toggle holds still").toBeCloseTo(before.toggle, 0);
+      } else {
+        // Stacked, the toggle sits under the body by design, so it follows the list down.
+        expect.soft(button.getBoundingClientRect().top, "toggle under the list").toBeGreaterThanOrEqual(list.getBoundingClientRect().bottom);
+      }
+      expect.soft(pageTop(neighbour), "neighbouring row holds still").toBeCloseTo(before.neighbour, 0);
+
+      // WCAG 2.4.3: the toggle precedes what it reveals, so the next Tab lands inside the list.
+      await userEvent.tab();
+      expect(list.contains(document.activeElement)).toBe(true);
+
+      const items = Array.from(list.children) as HTMLElement[];
+      expect(items).toHaveLength(8);
+      const cardRight = card.getBoundingClientRect().right;
+      for (const el of items) {
+        const r = el.getBoundingClientRect();
+        expect.soft(r.height, `one line: ${el.textContent?.slice(0, 30)}`).toBeLessThanOrEqual(24);
+        expect.soft(r.right, el.textContent?.slice(0, 30)).toBeLessThanOrEqual(cardRight + 1);
+        // The title keeps a readable share of the line.
+        const title = el.children[1] as HTMLElement;
+        expect.soft(title.getBoundingClientRect().width, "title width").toBeGreaterThanOrEqual(width === 1280 ? 100 : 50);
+        // A long repo path truncates on its own; the PR number always shows whole, inside the link.
+        const num = el.querySelector("[data-pr-num]") as HTMLElement;
+        const link = num.closest("a") as HTMLElement;
+        const n = num.getBoundingClientRect();
+        const l = link.getBoundingClientRect();
+        expect.soft(num.textContent, "number span").toMatch(/ #1\d\d$/);
+        expect.soft(num.scrollWidth, `number not clipped: ${link.textContent}`).toBeLessThanOrEqual(num.clientWidth);
+        expect.soft(n.width, "number has width").toBeGreaterThan(0);
+        expect.soft(n.right, "number inside the link").toBeLessThanOrEqual(l.right + 0.5);
+        expect.soft(n.left, "number inside the link").toBeGreaterThanOrEqual(l.left - 0.5);
+        // The ref cell clips its overflow, so the link itself must fit inside it.
+        expect.soft(l.right, "link inside its ref cell").toBeLessThanOrEqual((el.children[0] as HTMLElement).getBoundingClientRect().right + 0.5);
+        if (width === 1280) {
+          const repo = el.querySelector("[data-pr-repo]") as HTMLElement;
+          expect.soft(repo.scrollWidth, "the long repo path is the part that truncates").toBeGreaterThan(repo.clientWidth);
+          expect.soft(repo.title, "full repo on hover").toBe("an-organisation/a-repository-with-a-long-name");
+        }
+      }
+      expect(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(window.innerWidth);
+      expect(rows()).toHaveLength(3);
+
+      button.focus();
+      await userEvent.keyboard(" ");
+      expect(button.getAttribute("aria-expanded")).toBe("false");
+      expect(button.textContent).toBe("Review PRs");
+    });
+  }
 });

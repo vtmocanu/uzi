@@ -70,6 +70,15 @@ describe("NeedsDecisionCard", () => {
     expect(screen.queryByText("MR state as last seen by uzi")).toBeNull();
   });
 
+  it("compares forges by the noun shown: GitLab and a forge-less PR both read MR", () => {
+    mount([prItem({ id: "gl", forge_type: "gitlab" }), prItem({ id: "nf", forge_type: undefined, mr_iid: 13 })]);
+    expect(screen.getAllByText("MR state as last seen by uzi")).toHaveLength(1);
+    cleanup();
+    mount([prItem({ id: "gh", forge_type: "github" }), prItem({ id: "gl", forge_type: "gitlab", mr_iid: 13 })]);
+    expect(screen.getAllByText("PR state as last seen by uzi")).toHaveLength(1);
+    expect(screen.queryByText("MR state as last seen by uzi")).toBeNull();
+  });
+
   it("does not show the cached-state text on a non-PR row", () => {
     mount([item("plan")]);
     expect(screen.queryByText(/state as last seen by uzi/)).toBeNull();
@@ -155,13 +164,12 @@ describe("NeedsDecisionCard", () => {
         expect(container.textContent).not.toContain(RLO);
       });
 
-      // Single rows follow the mock and render no repo path, so the guarantee is that the
-      // override never reaches the row's text at all.
-      it(`never renders it in a single row (demo=${demo})`, () => {
-        mount([item("plan", { repo_path: path })], demo);
-        const row = screen.getByRole("link", { name: "Review plan" }).closest("li") as HTMLElement;
-        expect(row.textContent).not.toContain(RLO);
-        expect(row.textContent).not.toContain("acme");
+      it(`strips it from a single row's repo text (demo=${demo})`, () => {
+        mount([item("plan", { repo_path: path, issue_iid: 7, issue_title: "Title" })], demo);
+        const link = screen.getByRole("link", { name: "Review plan" });
+        const title = document.getElementById(link.getAttribute("aria-describedby") ?? "") as HTMLElement;
+        expect(title.textContent).toBe(`${demo ? "demo/repo" : "acme/repo"} #7 Title`);
+        expect((link.closest("li") as HTMLElement).textContent).not.toContain(RLO);
       });
     }
   });
@@ -182,11 +190,19 @@ describe("NeedsDecisionCard", () => {
     mount([item("plan", run)]);
     const link = screen.getByRole("link", { name: "Review plan" });
     const title = document.getElementById(link.getAttribute("aria-describedby") ?? "");
-    expect(title?.textContent).toBe("#3881 Overview usage");
+    expect(title?.textContent).toBe("vtmocanu/uzi #3881 Overview usage");
     const row = link.closest("li") as HTMLElement;
     expect(row.querySelector("[data-meta]")?.textContent).toBe("Plan ready, 4 milestones · waiting 14m");
-    // The mock drops the repo path from a single row.
-    expect(row.textContent).not.toContain("vtmocanu/uzi");
+  });
+
+  it("masks a single row's repo in demo mode and omits it when the run has none", () => {
+    mount([item("plan", { repo_path: "acme-corp/secret-repo", issue_iid: 7, issue_title: "T" })], true);
+    expect(screen.getByText("demo/secret-repo")).toBeTruthy();
+    expect(screen.queryByText(/acme-corp/)).toBeNull();
+    cleanup();
+    mount([item("plan", { repo_path: "", issue_iid: 7, issue_title: "T" })]);
+    const link = screen.getByRole("link", { name: "Review plan" });
+    expect(document.getElementById(link.getAttribute("aria-describedby") ?? "")?.textContent).toBe("#7 T");
   });
 
   it("describes each single row's action by its title, so repeated verbs are distinguishable", () => {
@@ -199,8 +215,8 @@ describe("NeedsDecisionCard", () => {
         .split(" ")
         .map((id) => document.getElementById(id)?.textContent)
         .join(" ");
-    expect(describedBy(screen.getByRole("link", { name: "Review plan" }))).toBe("#7 First plan");
-    expect(describedBy(screen.getByRole("link", { name: "Answer" }))).toBe("#7 First question");
+    expect(describedBy(screen.getByRole("link", { name: "Review plan" }))).toBe("vtmocanu/uzi #7 First plan");
+    expect(describedBy(screen.getByRole("link", { name: "Answer" }))).toBe("vtmocanu/uzi #7 First question");
   });
 
   it("tells assistive tech that an expanded PR action opens a new tab without renaming it", () => {
@@ -288,13 +304,36 @@ describe("NeedsDecisionCard", () => {
       const planLinks = within(planRow).getAllByRole("link", { name: "Review plan" });
       expect(planLinks.map((a) => a.getAttribute("href"))).toEqual([0, 1, 2, 3].map((i) => `/runs/plan-${i}`));
       expect(document.getElementById(planLinks[3].getAttribute("aria-describedby") ?? "")?.textContent).toBe("#7 Plan 3");
-      expect(within(planRow).getAllByText("waiting 14m")).toHaveLength(4);
+      // Each expanded item reads "ref title age Action" on one line; the age is announced as a wait.
+      expect(within(planRow).getAllByText(/^(waiting )?14m$/).map((el) => el.textContent)).toEqual(
+        Array(4).fill("waiting 14m"),
+      );
 
       fireEvent.click(within(askRow).getByRole("button", { name: "Open runs" }));
       expect(within(askRow).getAllByRole("link", { name: "Answer" }).map((a) => a.getAttribute("href"))).toEqual([
         "/runs/ask-1",
         "/runs/ask-2",
       ]);
+    });
+
+    // Two columns on wide screens only for 2 to 4 rows.
+    it.each([
+      [1, [item("plan")], false],
+      [2, [item("plan"), item("question")], true],
+      [4, [heldItem, item("plan"), item("question"), item("park")], true],
+      [5, [heldItem, item("plan"), item("question"), item("park"), prItem()], false],
+    ] as const)("uses two columns at md for %i rows: %s", (n, items, twoCol) => {
+      const { container } = mount([...items]);
+      const list = rowsList(container);
+      expect(list.children).toHaveLength(n);
+      expect(list.classList.contains("md:grid-cols-2")).toBe(twoCol);
+    });
+
+    it("puts a group's toggle before the list it reveals in DOM order", () => {
+      mount(prs(4));
+      const button = screen.getByRole("button", { name: "Review PRs" });
+      const list = document.getElementById(button.getAttribute("aria-controls") ?? "") as HTMLElement;
+      expect(button.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     });
 
     it("keeps a lone park as a normal row with no group button", () => {
