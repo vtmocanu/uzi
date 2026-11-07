@@ -1539,15 +1539,15 @@ showed.
 exit in `agent/src/main.ts` before its stop log:
 
 1. `worker.run` is joined by the caller.
-2. Registered producers are joined.
-3. Git children and continuations, including their settlement promises
-   (`GitCache.pendingWork()`), are joined.
-4. Outer transactions are joined, with the inline applies their owners joined.
-5. `sealForShutdown`: a new outermost transaction throws `AuthorityShutdownRefusal`
+2. Registered producers, outer transactions (with the inline applies their owners
+   joined) and Git children and continuations, including their settlement promises
+   (`GitCache.pendingWork()`), are joined together, repeated until quiet; none of them
+   is cancelled.
+3. `sealForShutdown`: a new outermost transaction throws `AuthorityShutdownRefusal`
    (a subclass of `AuthorityRefusal`). The runtime's own drain is exempt.
-6. `drainForShutdown`: the final drain of what is queued.
+4. `drainForShutdown`: the final drain of what is queued.
 
-Steps 2 to 4 repeat until quiet and have no timeout; nothing is cancelled.
+Step 2 has no timeout; the 35 s observer reports past the deadline without cancelling it.
 
 ### Owner-join lock lifetime
 

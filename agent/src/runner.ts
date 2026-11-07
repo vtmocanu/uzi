@@ -5925,11 +5925,11 @@ export class RunRunner {
           // publish RPC to the api, and the server-side maxPublishDuration is 60s — longer
           // than the entire grace — so the CLIENT must not simply await it. We cap the whole
           // sequence with a Promise.race against shutdownPublishTimeoutMs (default 15s): that
-          // leaves ~15s of the 30s grace for the runtime's own SIGTERM teardown and for the
+          // leaves ~25s of the 40s grace for the runtime's own SIGTERM teardown and for the
           // concurrently-aborted sibling runs' sequences (shutdown() aborts every active run
           // at once; their catch branches race the same wall clock, so the cost is the slowest
           // plus contention, not the sum). 15s is generous for a healthy publish yet caps a
-          // hung/unreachable forge well short of both the 30s SIGKILL and the 60s server cap.
+          // hung/unreachable forge well short of both the 40s SIGKILL and the 60s server cap.
           // issue #1597 M1: the sequence resolves to a typed ShutdownCheckpointOutcome instead of a
           // boolean, so the feed names WHY a shutdown checkpoint did not land (and a published
           // checkpoint is never misreported by a later boundary error).
