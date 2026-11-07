@@ -536,7 +536,7 @@ production defaults (request 3 s, preparation ≤3 s, poll ≤15 s, HTTP 30 s, s
 |---|---|---|---|
 | APPROVE / automatic REVISE | prepare ≤3 s, submit stage ≤30 s, poll window to the deadline, final transport check ≤3 s | ≈31 min | ≈2 h 1 min (7,236 s) |
 | Checked human gate (timed out, block, gated pass), first gate | the above + 3 s, semantic review ≤60 s, resumed-delivery wait ≤153 s (failure path), `planChangedFiles` ≤600 s, receipt settlement ≤60 s, presentation report ≤422 s, preparation ≤9 s | ≈53 min (rounded up) | ≈2 h 23 min (8,543 s, rounded up) |
-| Checked human gate on a re-plan gate (frozen milestones changed) | the first-gate row + gate checkpoint ≤60 s + post-deadline tail ≤≈16 s (≈1 s child kill and join, ≤10 s private temp-dir cleanup, ≤5 s helper overrun) = ≈76 s when those operations return (see Limits above) | ≈54 min (3,143 s + 76 s = 3,219 s, rounded up; when those operations return) | ≈2 h 24 min (8,543 s + 76 s = 8,619 s, rounded up; when those operations return) |
+| Checked human gate on a re-plan gate (frozen milestones changed) | the first-gate row + gate checkpoint ≤60 s + post-deadline tail ≤≈16 s (≈1 s child kill and join, ≤10 s private temp-dir cleanup, ≤5 s helper overrun) = ≈76 s when those operations return (see Limits below) | ≈54 min (3,143 s + 76 s = 3,219 s, rounded up; when those operations return) | ≈2 h 24 min (8,543 s + 76 s = 8,619 s, rounded up; when those operations return) |
 
 **Gate checkpoint on a re-plan gate (#3980).** `prepareGateCheckpoint` runs only when the
 claim carries frozen execution milestones and the candidate's milestones differ from them, so a
