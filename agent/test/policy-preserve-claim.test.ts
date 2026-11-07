@@ -62,6 +62,40 @@ describe("preserve-only claim fields on the production claim path", () => {
     }
   });
 
+  it("policy_fresh_session: only the literal true survives; anything else grants no fresh start", async () => {
+    assert.equal((await claimWith({ policy_preserve_only: true, policy_fresh_session: true })).policy_fresh_session, true);
+    assert.equal((await claimWith({})).policy_fresh_session, undefined);
+    for (const bad of [false, "true", 1, null, {}, []]) {
+      const claim = await claimWith({ policy_preserve_only: true, policy_fresh_session: bad });
+      assert.notEqual(claim.policy_fresh_session, true, `${JSON.stringify(bad)} must not grant a fresh start`);
+      assert.equal(claim.policy_preserve_only, true);
+    }
+  });
+
+  it("policy_fresh_unconfirmed: a boolean is kept and a present non-boolean under preserve-only fails closed as true", async () => {
+    assert.equal((await claimWith({ policy_preserve_only: true, policy_fresh_unconfirmed: true })).policy_fresh_unconfirmed, true);
+    assert.equal((await claimWith({ policy_preserve_only: true, policy_fresh_unconfirmed: false })).policy_fresh_unconfirmed, false);
+    assert.equal((await claimWith({})).policy_fresh_unconfirmed, undefined);
+    for (const bad of ["false", "true", 0, 1, null, {}]) {
+      const claim = await claimWith({ policy_preserve_only: true, policy_fresh_unconfirmed: bad });
+      assert.equal(claim.policy_fresh_unconfirmed, true, `${JSON.stringify(bad)} must read as unconfirmed`);
+    }
+    // Outside a preserve-only claim a malformed value cannot constrain anything.
+    assert.equal((await claimWith({ policy_fresh_unconfirmed: "x" })).policy_fresh_unconfirmed, false);
+  });
+
+  it("the shared Fresh fixtures parse to the same claim fields", async () => {
+    for (const [name, key] of [["policy-fresh-session-claim.json", "policy_fresh_session"],
+      ["policy-fresh-unconfirmed-claim.json", "policy_fresh_unconfirmed"]] as const) {
+      const raw = JSON.parse(await fs.readFile(new URL(`../../fixtures/claims/${name}`, import.meta.url), "utf8")) as Record<string, unknown>;
+      assert.deepEqual(Object.keys(raw).sort(), ["policy_expected_head", "policy_preserve_only", key].sort());
+      const claim = await claimWith(raw);
+      assert.equal(claim.policy_preserve_only, true);
+      assert.equal(claim.policy_expected_head, raw.policy_expected_head);
+      assert.equal(claim[key], true);
+    }
+  });
+
   it("the shared fixture parses to the same claim fields", async () => {
     const raw = JSON.parse(await fs.readFile(new URL("../../fixtures/claims/policy-preserve-claim.json", import.meta.url), "utf8")) as
       Record<string, unknown>;

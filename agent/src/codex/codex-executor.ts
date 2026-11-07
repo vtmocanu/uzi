@@ -6667,6 +6667,7 @@ export class CodexExecutor implements Executor {
       // a fresh epoch, the rejected-resume retry) carries it, so the harness's one fresh-thread branch
       // can refuse. Side passes never use this builder.
       ...(ctx.preserveConversation === true ? { preserveConversation: true } : {}),
+      ...(ctx.preserveConversation === true && ctx.policyFreshAllowance !== undefined ? { policyFreshAllowance: ctx.policyFreshAllowance } : {}),
       ...(effort !== undefined ? { effort } : {}),
     };
     return request;

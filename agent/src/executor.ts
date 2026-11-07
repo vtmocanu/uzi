@@ -202,6 +202,10 @@ export interface RunContext {
    *  never start or fall back to a fresh conversation (carried to RunTurnRequest.preserveConversation).
    *  Absent means false, the unconstrained behaviour. */
   preserveConversation?: boolean;
+  /** One-claim Fresh allowance of a policy-held claim, shared by reference by every root lead request of the
+   *  claim. `remaining` is decremented to 0 BEFORE the single thread/start it permits. Absent means no fresh
+   *  conversation is allowed. */
+  policyFreshAllowance?: { remaining: number };
   /** Claim support assertion; absent means false. The runner separately gates root and phase. */
   parkRunSupported?: boolean;
   /** Request a park and await its authoritative outcome or a racing owner answer. */

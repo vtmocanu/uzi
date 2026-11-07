@@ -304,8 +304,6 @@ func (h *Handler) resumePolicyHold(w http.ResponseWriter, r *http.Request, userI
 		h.writeResumedRun(w, r, userID, runID, res.Replay)
 	case errors.Is(err, workersvc.ErrInvalidState):
 		httpx.Error(w, http.StatusBadRequest, "invalid policy resume request")
-	case errors.Is(err, workersvc.ErrPolicyFreshUnavailable):
-		httpx.Error(w, http.StatusConflict, workersvc.ErrPolicyFreshUnavailable.Error())
 	case errors.Is(err, workersvc.ErrPolicyResumeGuidanceMismatch):
 		httpx.Error(w, http.StatusConflict, "already resumed with different guidance; the new guidance was not recorded")
 	case errors.Is(err, workersvc.ErrPolicyResumeConflict):

@@ -332,6 +332,115 @@ describe("preserve-only claim admission in phaseResume", () => {
     });
   });
 
+  describe("one-claim Fresh admission", () => {
+    const fixtureFields = (name: string): Record<string, unknown> => {
+      const raw = JSON.parse(fs.readFileSync(new URL(`../../fixtures/claims/${name}`, import.meta.url), "utf8")) as Record<string, unknown>;
+      const { _comment: _ignored, ...fields } = raw;
+      return fields;
+    };
+    /** The claim crosses the production client normalizer, exactly as a worker receives it. */
+    async function delivered(over: Record<string, unknown>, iid = nextIid++): Promise<ClaimResponse> {
+      const wire = claimFor(over, iid) as unknown as Record<string, unknown>;
+      api.enqueueClaim(wire as never);
+      const claim = await client.claimRun();
+      assert.ok(claim, "the fake API delivered the claim");
+      return claim;
+    }
+    const heldHead = (iid: number): string =>
+      originBranch(`agent/issue-${iid}`, gitIn(fx.originPath, ["rev-parse", "HEAD"]), "held.txt", "held work\n");
+
+    it("the consuming claim skips the session and transcript rules and hands the executor one allowance", async () => {
+      transcript = "absent"; // would re-hold a resuming claim; a Fresh start has no transcript to find
+      const iid = nextIid++;
+      const head = heldHead(iid);
+      const claim = await delivered({ ...fixtureFields("policy-fresh-session-claim.json"), policy_expected_head: head, session_id: null }, iid);
+      assert.equal(claim.policy_fresh_session, true);
+      await runner().execute(claim);
+      assert.deepEqual(events.filter(e => !e.startsWith("state:")), ["verify", "model"], "the head is still verified before the one Fresh start");
+      assert.equal(holds.length, 0);
+      assert.equal(contexts[0]?.preserveConversation, true);
+      assert.equal(contexts[0]?.sessionId ?? undefined, undefined, "no session is resumed");
+      assert.deepEqual(contexts[0]?.policyFreshAllowance, { remaining: 1 });
+    });
+
+    it("a Fresh claim without a verifiable head still re-holds on the saved-work rule first", async () => {
+      const claim = await delivered({ policy_fresh_session: true, policy_expected_head: MISSING_HEAD, session_id: null });
+      await runner().execute(claim);
+      assert.deepEqual(events, ["state:running", "hold:saved_work_missing"]);
+      assert.equal(contexts.length, 0);
+    });
+
+    it("a Fresh claim on an attempt path re-holds as attempt_path with zero provider work", async () => {
+      const claim = await delivered({ policy_fresh_session: true, session_id: null });
+      await runner({ dockerHost: "unix:///fixture" }).execute(claim);
+      assert.deepEqual(events, ["state:running", "hold:attempt_path"]);
+      reholdShape(holds[0], "attempt_path", "fresh_from_saved_work");
+      assert.equal(contexts.length, 0);
+    });
+
+    it("a malformed policy_fresh_session grants nothing: the claim re-holds as session_missing", async () => {
+      for (const bad of ["true", 1, null, {}, "yes"]) {
+        events.length = 0; holds.length = 0; contexts.length = 0;
+        const claim = await delivered({ policy_fresh_session: bad, session_id: null });
+        assert.equal(claim.policy_fresh_session, undefined, `${JSON.stringify(bad)} is dropped`);
+        await runner().execute(claim);
+        assert.deepEqual(events, ["state:running", "hold:session_missing"], JSON.stringify(bad));
+        assert.equal(contexts.length, 0);
+      }
+    });
+
+    it("the shared unconfirmed fixture re-holds as fresh_start_uncertain with zero provider requests", async () => {
+      const iid = nextIid++;
+      const head = heldHead(iid);
+      const fields = fixtureFields("policy-fresh-unconfirmed-claim.json");
+      assert.equal(fields.policy_fresh_unconfirmed, true);
+      assert.equal(fields.policy_fresh_session, undefined);
+      // The fixture's head names no commit of this clone; swap in one the clone holds so the saved-work
+      // rule passes and the unconfirmed rule is the one under test.
+      const claim = await delivered({ ...fields, policy_expected_head: head, session_id: null }, iid);
+      assert.equal(claim.policy_fresh_unconfirmed, true);
+      await runner().execute(claim);
+      assert.deepEqual(events, ["state:running", "verify", "hold:fresh_start_uncertain"]);
+      reholdShape(holds[0], "fresh_start_uncertain");
+      assert.equal(contexts.length, 0, "no provider request of any kind");
+      noLineageNotice(claim.run_id);
+    });
+
+    it("unconfirmed wins over a session or a Fresh grant on the same claim", async () => {
+      const claim = await delivered({ policy_fresh_unconfirmed: true, policy_fresh_session: true, session_id: "saved-session" });
+      await runner().execute(claim);
+      assert.deepEqual(events, ["state:running", "hold:fresh_start_uncertain"]);
+      assert.equal(contexts.length, 0);
+    });
+
+    it("saved work is checked before the unconfirmed rule, attempt path before both", async () => {
+      await runner().execute(await delivered({ policy_fresh_unconfirmed: true, policy_expected_head: MISSING_HEAD, session_id: null }));
+      assert.deepEqual(events, ["state:running", "hold:saved_work_missing"]);
+      events.length = 0; holds.length = 0;
+      await runner({ dockerHost: "unix:///fixture" }).execute(await delivered({ policy_fresh_unconfirmed: true, policy_expected_head: MISSING_HEAD, session_id: null }));
+      assert.deepEqual(events, ["state:running", "hold:attempt_path"]);
+    });
+
+    it("a malformed policy_fresh_unconfirmed under a preserving claim fails closed as unconfirmed", async () => {
+      for (const bad of ["false", 0, null, {}]) {
+        events.length = 0; holds.length = 0; contexts.length = 0;
+        const claim = await delivered({ policy_fresh_unconfirmed: bad, policy_fresh_session: true, session_id: null });
+        assert.equal(claim.policy_fresh_unconfirmed, true, JSON.stringify(bad));
+        await runner().execute(claim);
+        assert.deepEqual(events, ["state:running", "hold:fresh_start_uncertain"], JSON.stringify(bad));
+        assert.equal(contexts.length, 0);
+      }
+    });
+
+    it("an explicit false marker is ordinary: the claim resumes its session", async () => {
+      const claim = await delivered({ policy_fresh_unconfirmed: false });
+      await runner().execute(claim);
+      assert.deepEqual(events.filter(e => !e.startsWith("state:")), ["model"]);
+      assert.equal(contexts[0]?.sessionId, "saved-session");
+      assert.equal(contexts[0]?.policyFreshAllowance, undefined);
+    });
+  });
+
   describe("every cause comes from its real path", () => {
     it("attempt_path: a Docker-wired worker re-holds as fresh_from_saved_work before verification", async () => {
       const claim = claimFor({ policy_expected_head: MISSING_HEAD });

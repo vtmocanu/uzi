@@ -82,7 +82,16 @@ type ClaimPayload struct {
 	// episode was resolved fresh_from_saved_work) but whose saved work must still be proven to
 	// contain it. Lowercase 40/64-hex; omitted otherwise. Mutually exclusive with PolicyExpectedHead.
 	PolicySavedWorkHead *string `json:"policy_saved_work_head,omitempty"`
-	CheckpointTip       *string `json:"checkpoint_tip,omitempty"` // resume: own-checkpoint anchor (owner-anchor guard)
+	// PolicyFreshSession is true only for the one claim that consumed a compatible-lane one-claim
+	// Fresh authorization and whose new conversation no current-generation report has confirmed yet
+	// (runs.policy_fresh_consumed_generation = this claim's generation, confirmed distinct, still
+	// preserving). The agent may start exactly one new conversation for it. Omitted otherwise.
+	PolicyFreshSession bool `json:"policy_fresh_session,omitempty"`
+	// PolicyFreshUnconfirmed is true on a LATER claim of a preserving run whose earlier claim consumed
+	// the one-claim Fresh authorization and never confirmed a new conversation: a new conversation may
+	// already exist, so the agent re-holds as fresh_start_uncertain instead of resuming or starting one.
+	PolicyFreshUnconfirmed bool    `json:"policy_fresh_unconfirmed,omitempty"`
+	CheckpointTip          *string `json:"checkpoint_tip,omitempty"` // resume: own-checkpoint anchor (owner-anchor guard)
 	// CheckpointAttestedSource (issue #3194) is the source OID a flight of THIS run published
 	// after its --require-base guard strictly accepted (runs.checkpoint_attested_source, set-only).
 	// A continuation may adopt exactly this source. nil (omitted) for legacy, unattested and

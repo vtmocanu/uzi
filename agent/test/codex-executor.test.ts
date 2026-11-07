@@ -29568,3 +29568,89 @@ describe("CodexExecutor: a preserve-only conversation never starts a fresh provi
     assert.deepEqual(routes(rig.epochs[1]!.transport).map((r) => r.method), ["thread/resume"]);
   });
 });
+
+// The compatible-lane one-claim Fresh: the claim that consumed the owner's authorization may start exactly
+// one new conversation. The allowance is one object shared by every root lead request of the claim and is
+// spent in the harness's single fresh-thread branch BEFORE thread/start is sent.
+describe("CodexExecutor: the one-claim Fresh allowance starts at most one provider thread", () => {
+  const routes = (t: FakeTransport) => t.requests.filter((r) => r.method === "thread/start" || r.method === "thread/resume");
+  const rpcRejection = () => new CodexTransportError({ category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)" });
+  const rejectsWith = (cause: PolicyContinuationRejected["cause"]) => (error: unknown): boolean =>
+    error instanceof PolicyContinuationRejected && error.cause === cause;
+
+  it("positive: a Fresh claim without a session sends exactly one thread/start and the turn runs", async () => {
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const allowance = { remaining: 1 };
+    const { ctx } = makeCtx({ preserveConversation: true, policyFreshAllowance: allowance });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "fresh start");
+    assert.deepEqual(routes(rig.transport).map((r) => r.method), ["thread/start"]);
+    assert.equal(rig.transport.requests.filter((r) => r.method === "turn/start").length, 1, "the turn ran on the new thread");
+    assert.equal(allowance.remaining, 0, "the allowance is spent by the single start");
+  });
+
+  it("an allowance does not apply without the preserving fact: the unconstrained path is unchanged", async () => {
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const allowance = { remaining: 1 };
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx({ policyFreshAllowance: allowance }).ctx), 3000, "unconstrained");
+    assert.deepEqual(routes(rig.transport).map((r) => r.method), ["thread/start"]);
+    assert.equal(allowance.remaining, 1, "only a preserving root spends the allowance");
+  });
+
+  it("the same claim without an allowance re-holds with session_missing and zero thread/start", async () => {
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx } = makeCtx({ preserveConversation: true });
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "no allowance"), rejectsWith("session_missing"));
+    assert.deepEqual(routes(rig.transport), []);
+  });
+
+  it("a spent allowance re-holds: a second sessionless root of the same claim sends no second thread/start", async () => {
+    const allowance = { remaining: 1 };
+    const first = makeRig();
+    first.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    await withTimeout(makeExecutor(first, bindingOf(SUBSCRIPTION)).run(makeCtx({ preserveConversation: true, policyFreshAllowance: allowance }).ctx), 3000, "first root");
+    assert.deepEqual(routes(first.transport).map((r) => r.method), ["thread/start"]);
+    // The recreated root has no session id to resume (it never persisted): the shared allowance is gone.
+    const second = makeRig();
+    second.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    await assert.rejects(withTimeout(makeExecutor(second, bindingOf(SUBSCRIPTION)).run(makeCtx({ preserveConversation: true, policyFreshAllowance: allowance }).ctx), 3000, "second root"),
+      rejectsWith("session_missing"));
+    assert.deepEqual(routes(second.transport), [], "no second conversation was started");
+  });
+
+  it("an allowance that is not exactly one never starts a thread", async () => {
+    for (const remaining of [0, 2, -1, Number.NaN]) {
+      const rig = makeRig();
+      rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+      const { ctx } = makeCtx({ preserveConversation: true, policyFreshAllowance: { remaining } });
+      await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, `allowance ${remaining}`), rejectsWith("session_missing"));
+      assert.deepEqual(routes(rig.transport), []);
+    }
+  });
+
+  it("forced epoch recreation in the same claim never sends a second thread/start and re-holds", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "checkpoint", {}, th, tn, "c-ckpt")).push(turnCompleted("completed", th, tn));
+      }),
+      epochResponder("th-1", "tn-2", () => {}),
+    ]);
+    rig.epochs[1]!.transport.requestOverride = (c) => c.method === "thread/resume" ? Promise.reject(rpcRejection()) : undefined;
+    let exec!: CodexExecutor;
+    const allowance = { remaining: 1 };
+    const { ctx } = makeCtx({
+      preserveConversation: true, policyFreshAllowance: allowance,
+      checkpoint: async (opts) => {
+        if (opts.reap) await exec.safety!.withBoundary({ boundary: "checkpoint", deadlineMs: 200 }, async () => {});
+      },
+    });
+    exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    await assert.rejects(withTimeout(exec.run(ctx), 5000, "fresh then recreation"), rejectsWith("provider_resume_rejected"));
+    assert.equal(rig.providerLaunches(), 2, "the checkpoint reap recreated the epoch");
+    assert.deepEqual(routes(rig.epochs[0]!.transport).map((r) => r.method), ["thread/start"], "the claim's one new conversation");
+    assert.deepEqual(routes(rig.epochs[1]!.transport).map((r) => r.method), ["thread/resume"], "the recreated root never started another");
+    assert.equal(allowance.remaining, 0);
+  });
+});

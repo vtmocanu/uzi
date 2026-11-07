@@ -18,7 +18,10 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// downFx is one isolated database migrated to 413 with real rows produced by the production queries.
+// downFx is one isolated database migrated to 414 (the head, so the production queries run) with real
+// rows produced by those queries. The 413 rollback tests call mc() once their rows exist: it runs
+// migration 414's Down, which for these fixtures (no one-claim Fresh authorization) converts nothing,
+// so the migration 413 Down then runs against exactly the rows the production queries produced.
 type downFx struct {
 	t                   *testing.T
 	ctx                 context.Context
@@ -27,6 +30,7 @@ type downFx struct {
 	q                   *store.Queries
 	owner, worker, repo uuid.UUID
 	iid                 int64
+	atMc                bool
 }
 
 var recoveryColumns = []string{"policy_required_head", "policy_recovery_verified_generation", "policy_recovery_verified_head", "policy_hold_cause"}
@@ -34,7 +38,7 @@ var recoveryColumns = []string{"policy_required_head", "policy_recovery_verified
 func newDownFx(t *testing.T) *downFx {
 	t.Helper()
 	ctx, dsn := standIsolatedDB(t, "policy_recovery_down_")
-	if err := store.MigrateTo(ctx, dsn, 413); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 414); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := store.OpenPool(ctx, dsn)
@@ -50,6 +54,18 @@ func newDownFx(t *testing.T) *downFx {
 	mustExec(ctx, t, pool, `INSERT INTO forge_connections(id,user_id,forge_type,base_url,bot_username,bot_forge_user_id,token_ciphertext) VALUES($1,$2,'github','https://example.com','bot',1,'x')`, conn, f.owner)
 	mustExec(ctx, t, pool, `INSERT INTO repos(id,connection_id,forge_project_id,path_with_namespace,web_url,default_branch) VALUES($1,$2,1,'example/policy','https://example.com/policy','main')`, repo, conn)
 	return f
+}
+
+// mc rolls the head migration back to 413 so a test can exercise migration 413's own Down.
+func (f *downFx) mc() {
+	f.t.Helper()
+	if f.atMc {
+		return
+	}
+	if err := store.MigrateDownTo(f.ctx, f.dsn, 413); err != nil {
+		f.t.Fatalf("Down to 413: %v", err)
+	}
+	f.atMc = true
 }
 
 // running seeds a Codex run running at claim generation 1 with a saved session.
@@ -123,7 +139,8 @@ func (f *downFx) row(id uuid.UUID) map[string]any {
 	f.t.Helper()
 	var raw []byte
 	if err := f.pool.QueryRow(f.ctx, `SELECT (to_jsonb(r) - 'policy_required_head' - 'policy_recovery_verified_generation'
-		- 'policy_recovery_verified_head' - 'policy_hold_cause') FROM runs r WHERE id=$1`, id).Scan(&raw); err != nil {
+		- 'policy_recovery_verified_head' - 'policy_hold_cause'
+		- 'policy_fresh_consumed_generation' - 'policy_fresh_confirmed_generation') FROM runs r WHERE id=$1`, id).Scan(&raw); err != nil {
 		f.t.Fatal(err)
 	}
 	var m map[string]any
@@ -164,6 +181,7 @@ func (f *downFx) columns(names ...string) int {
 // refused asserts a Down to 412 fails with a message naming why, changing nothing at all.
 func (f *downFx) refused(wantMsg string) {
 	f.t.Helper()
+	f.mc()
 	before := f.snapshot()
 	err := store.MigrateDownTo(f.ctx, f.dsn, 412)
 	if err == nil || !strings.Contains(err.Error(), wantMsg) {
@@ -445,6 +463,7 @@ func TestPolicyRecoveryDownWaitsForInFlightWriterLiveDB(t *testing.T) {
 	a := strings.Repeat("a", 40)
 	other := f.pausedPreserving(a)
 	target := f.queuedPreserving(a)
+	f.mc()
 	tx, err := f.pool.Begin(f.ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -497,6 +516,7 @@ func downSQL(t *testing.T) string {
 func TestPolicyRecoveryDownBlocksConcurrentWritersLiveDB(t *testing.T) {
 	f := newDownFx(t)
 	target := f.queuedPreserving(strings.Repeat("a", 40))
+	f.mc()
 	tx, err := f.pool.Begin(f.ctx)
 	if err != nil {
 		t.Fatal(err)

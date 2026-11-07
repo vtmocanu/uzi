@@ -39,6 +39,8 @@ WITH held AS (
         checkpoint_contains_latest=sqlc.narg('checkpoint_contains_latest')::boolean,
         policy_hold_published= @published::boolean,
         policy_preserve_required=true,policy_pending_fresh=false,
+        -- A new hold retires any one-claim Fresh history: the owner decides again from this episode.
+        policy_fresh_consumed_generation=NULL,policy_fresh_confirmed_generation=NULL,
         policy_outcome_id= @outcome_id,policy_continuation_mode= @continuation_mode,
         policy_resolved_at=NULL,policy_applying_worker_id= @worker_id,
         policy_applying_generation= @claim_generation,policy_source_generation= @source_generation,
@@ -73,6 +75,10 @@ SELECT * FROM held;
 -- (policy_saved_work_head on the claim) before the head is cleared by RecordPolicyRecoveryVerified's
 -- non-preserving arm. preserve keeps the session, preserve_required, the required head and the
 -- verification pair. Outcome, applying and source facts stay in both.
+-- fresh_one_claim (same_conversation episodes only, #3607 Mf) clears the active session like
+-- fresh_from_saved_work but KEEPS preserve_required, the required head and the verification pair,
+-- and arms policy_pending_fresh: ClaimRun consumes it exactly once. Every mode retires prior
+-- one-claim history (both generation stamps NULL).
 UPDATE runs SET
     status = 'queued',
     status_since = now(),
@@ -80,9 +86,11 @@ UPDATE runs SET
         + GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int),
     worker_id = CASE WHEN runs.claim_released_at IS NOT NULL THEN NULL ELSE runs.worker_id END,
     hold_reason = NULL,
-    session_id = CASE WHEN @mode::text = 'fresh_from_saved_work' THEN NULL ELSE runs.session_id END,
+    session_id = CASE WHEN @mode::text IN ('fresh_from_saved_work','fresh_one_claim') THEN NULL ELSE runs.session_id END,
     policy_preserve_required = CASE WHEN @mode::text = 'fresh_from_saved_work' THEN false ELSE runs.policy_preserve_required END,
-    policy_pending_fresh = false,
+    policy_pending_fresh = (@mode::text = 'fresh_one_claim'),
+    policy_fresh_consumed_generation = NULL,
+    policy_fresh_confirmed_generation = NULL,
     policy_recovery_verified_generation = CASE WHEN @mode::text = 'fresh_from_saved_work' THEN NULL ELSE runs.policy_recovery_verified_generation END,
     policy_recovery_verified_head = CASE WHEN @mode::text = 'fresh_from_saved_work' THEN NULL ELSE runs.policy_recovery_verified_head END,
     policy_resolved_at = now(),
@@ -96,6 +104,7 @@ WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.policy_outcome_id = @expected_episode_id
   AND runs.policy_resolved_at IS NULL
   AND ((@mode::text = 'preserve' AND runs.policy_continuation_mode = 'same_conversation')
+    OR (@mode::text = 'fresh_one_claim' AND runs.policy_continuation_mode = 'same_conversation')
     OR (@mode::text = 'fresh_from_saved_work' AND runs.policy_continuation_mode = 'fresh_from_saved_work'))
 RETURNING runs.*;
 

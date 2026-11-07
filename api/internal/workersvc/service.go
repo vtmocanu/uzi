@@ -5109,6 +5109,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		}
 		runningParams.IterationCount = req.IterationCount
 		runningParams.SessionID = sessionID
+		// The report's authenticated claim generation: SetRunRunning confirms a compatible-lane one-claim
+		// Fresh only when it equals the consuming and the current generation (nil from a legacy worker).
+		runningParams.FreshConfirmGeneration = pgconv.Int8Ptr(req.ClaimGeneration)
 		runningParams.ID = runID
 		runningParams.WorkerID = pgconv.UUID(wkr.ID)
 		// PRD #122 M2 (Decision 5/5b): the budget-scaling config the SQL freeze reads.

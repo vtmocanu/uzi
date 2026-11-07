@@ -397,6 +397,9 @@ export interface RunTurnRequest {
   /** Policy-held (preserve-only) conversation: this root lead turn may continue `resumeSessionId` but must
    *  never start a fresh provider thread. Set by the executor on every root lead request of such a claim. */
   preserveConversation?: boolean;
+  /** With preserveConversation and no resumeSessionId: the compatible-lane one-claim Fresh allowance. The
+   *  harness spends it (remaining = 0) before sending thread/start; an exhausted or absent allowance re-holds. */
+  policyFreshAllowance?: { remaining: number };
   signal: AbortSignal;
   model?: string;
   /** PRD #1551 (D4/D5): trusted provenance for `model`. `"worker_default"` means the

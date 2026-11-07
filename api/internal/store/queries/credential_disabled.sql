@@ -18,7 +18,24 @@
 -- hold_reason IS NULL instead would match 0 rows after the custody release, roll the
 -- finisher back and leak this claim's custody hold on every ClaimGrace requeue.
 -- name: ParkCredentialDisabledRun :execrows
+WITH fresh_restored AS (
+    INSERT INTO run_user_inputs (run_id, kind, body)
+    SELECT r.id, 'resume', '{"policy_fresh":"restored","generation":' || r.claim_generation::text || '}'
+    FROM runs r
+    WHERE r.id = @id AND r.worker_id = @worker_id AND r.claim_generation = @claim_generation
+      AND r.claim_released_at IS NULL AND r.status = 'claimed'
+      AND r.policy_fresh_consumed_generation = @claim_generation::bigint
+      AND r.policy_fresh_confirmed_generation IS NULL AND r.policy_preserve_required
+    RETURNING 1
+)
 UPDATE runs SET
+    -- One-claim Fresh restore (#3607 Mf): this writer proves the claim payload was never delivered, so an
+    -- authorization the exact claim consumed and no report confirmed is restored to pending. Only
+    -- server-known non-delivery restores; stale requeue, snapshot recovery and the sweeper never do.
+    policy_pending_fresh = CASE WHEN runs.policy_fresh_consumed_generation = @claim_generation::bigint AND runs.policy_fresh_confirmed_generation IS NULL AND runs.policy_preserve_required
+        THEN true ELSE runs.policy_pending_fresh END,
+    policy_fresh_consumed_generation = CASE WHEN runs.policy_fresh_consumed_generation = @claim_generation::bigint AND runs.policy_fresh_confirmed_generation IS NULL AND runs.policy_preserve_required
+        THEN NULL ELSE runs.policy_fresh_consumed_generation END,
     status = 'paused',
     status_since = now(),
     hold_reason = 'credential_disabled',

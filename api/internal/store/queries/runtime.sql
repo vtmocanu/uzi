@@ -1058,6 +1058,7 @@ WITH checker_template_pins AS MATERIALIZED (
     SELECT * FROM workers WHERE id = @worker_id FOR UPDATE
 ), target AS (
     SELECT r.id, r.user_id, r.repo_id, r.kind, r.claim_generation, r.egress_profile_id,
+           r.policy_pending_fresh,
            fo.connection_id AS forge_connection_id, fo.origin AS forge_origin, fc.incarnation AS forge_incarnation,
            fc.observation_version AS forge_observation_version,
            fo.api_origin AS forge_api_origin, fca.incarnation AS forge_api_incarnation,
@@ -1891,6 +1892,16 @@ hold AS (
       -- push), so it never opens a custody hold, whatever the claiming worker advertises.
       AND t.egress_profile_id IS NULL
     RETURNING 1
+), fresh_consumed AS (
+    -- Compatible-lane one-claim Fresh (#3607 Mf): the consumption audit commits in the SAME statement
+    -- as the claim UPDATE below, keyed on the locked target carrying the pending authorization.
+    -- 'resume' is a server-only input kind that is never delivered to a worker.
+    INSERT INTO run_user_inputs (run_id, kind, body)
+    SELECT t.id, 'resume',
+           '{"policy_fresh":"consumed","generation":' || (t.claim_generation + 1)::text || '}'
+    FROM forge_admitted t
+    WHERE t.policy_pending_fresh
+    RETURNING 1
 )
 UPDATE runs SET
     forge_admission = jsonb_build_object('generation', runs.claim_generation + 1, 'worker_id', @worker_id::uuid,
@@ -1905,6 +1916,12 @@ UPDATE runs SET
     -- PRD #1296 M1 (D2): the general claim-lane counter, incremented once per successful
     -- claim. Returned in the claim payload; the hold above binds the identical value.
     claim_generation = runs.claim_generation + 1,
+    -- Compatible-lane one-claim Fresh (#3607 Mf): a pending authorization is consumed by exactly this
+    -- claim, which records the generation it spent it on; RETURNING projects it for this claim only.
+    -- Every right-hand side reads the PRE-update row.
+    policy_fresh_consumed_generation = CASE WHEN runs.policy_pending_fresh
+        THEN runs.claim_generation + 1 ELSE runs.policy_fresh_consumed_generation END,
+    policy_pending_fresh = false,
     -- #2988 reverses PRD #1147's provisional-requeue revocation: every successful
     -- fresh claim supersedes the old capability atomically, even for the same worker.
     codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
@@ -2319,6 +2336,18 @@ UPDATE runs SET
     first_started_at = COALESCE(first_started_at, now()),
     iteration_count  = GREATEST(iteration_count, @iteration_count),
     session_id       = COALESCE(sqlc.narg('session_id'), session_id),
+    -- Compatible-lane one-claim Fresh confirmation (#3607 Mf): a running report carrying a session id
+    -- confirms the new conversation only when the report's authenticated claim generation equals the
+    -- generation that consumed the authorization AND is still the row's current generation. Anything
+    -- else leaves the stamp alone. Never clears preserve_required or the saved-work head.
+    policy_fresh_confirmed_generation = CASE
+        WHEN sqlc.narg('fresh_confirm_generation')::bigint IS NOT NULL
+             AND NULLIF(sqlc.narg('session_id')::text, '') IS NOT NULL
+             AND runs.policy_fresh_consumed_generation = sqlc.narg('fresh_confirm_generation')::bigint
+             AND runs.claim_generation = sqlc.narg('fresh_confirm_generation')::bigint
+             AND runs.policy_fresh_confirmed_generation IS NULL
+            THEN runs.policy_fresh_consumed_generation
+        ELSE runs.policy_fresh_confirmed_generation END,
     repo_agents      = COALESCE(sqlc.narg('repo_agents')::jsonb, repo_agents),
     repo_agent_source_commit = COALESCE(repo_agent_source_commit, sqlc.narg('repo_agent_source_commit')::text),
     agent_source     = COALESCE(sqlc.narg('agent_source'), agent_source),
@@ -6081,7 +6110,24 @@ WHERE runs.id = @id AND runs.status = 'claimed'
 -- ParkQueuedCodexAccountUnavailablePage's plus one extra
 -- column: this exact-claim park also rewrites worker_id to the newest open custody holder (D4),
 -- while the queued park leaves worker_id alone.
+WITH fresh_restored AS (
+    INSERT INTO run_user_inputs (run_id, kind, body)
+    SELECT r.id, 'resume', '{"policy_fresh":"restored","generation":' || r.claim_generation::text || '}'
+    FROM runs r
+    WHERE r.id = @id AND r.worker_id = @worker_id AND r.claim_generation = @claim_generation
+      AND r.status = 'claimed' AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework', 'cross_check')
+      AND r.policy_fresh_consumed_generation = @claim_generation::bigint
+      AND r.policy_fresh_confirmed_generation IS NULL AND r.policy_preserve_required
+    RETURNING 1
+)
 UPDATE runs SET
+    -- One-claim Fresh restore (#3607 Mf): this writer proves the claim payload was never delivered, so an
+    -- authorization the exact claim consumed and no report confirmed is restored to pending. Only
+    -- server-known non-delivery restores; stale requeue, snapshot recovery and the sweeper never do.
+    policy_pending_fresh = CASE WHEN runs.policy_fresh_consumed_generation = @claim_generation::bigint AND runs.policy_fresh_confirmed_generation IS NULL AND runs.policy_preserve_required
+        THEN true ELSE runs.policy_pending_fresh END,
+    policy_fresh_consumed_generation = CASE WHEN runs.policy_fresh_consumed_generation = @claim_generation::bigint AND runs.policy_fresh_confirmed_generation IS NULL AND runs.policy_preserve_required
+        THEN NULL ELSE runs.policy_fresh_consumed_generation END,
     status = 'recovery_wait', recovery_wait_cause = 'codex_account_unavailable',
     status_since = now(), recovery_retry_not_before = NULL,
     started_at = NULL, budget_paused_seconds = 0,
@@ -6433,8 +6479,24 @@ WITH candidates AS MATERIALIZED (
     SELECT DISTINCT mapping.run_id
     FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
     WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+), fresh_restored AS (
+    INSERT INTO run_user_inputs (run_id, kind, body)
+    SELECT r.id, 'resume', '{"policy_fresh":"restored","generation":' || r.claim_generation::text || '}'
+    FROM runs r
+    WHERE r.id IN (SELECT run_id FROM eligible_candidates) AND r.worker_id = @worker_id AND r.claim_generation = @claim_generation
+      AND r.status = 'claimed'
+      AND r.policy_fresh_consumed_generation = @claim_generation::bigint
+      AND r.policy_fresh_confirmed_generation IS NULL AND r.policy_preserve_required
+    RETURNING 1
 )
 UPDATE runs SET
+    -- One-claim Fresh restore (#3607 Mf): this writer proves the claim payload was never delivered, so an
+    -- authorization the exact claim consumed and no report confirmed is restored to pending. Only
+    -- server-known non-delivery restores; stale requeue, snapshot recovery and the sweeper never do.
+    policy_pending_fresh = CASE WHEN runs.policy_fresh_consumed_generation = @claim_generation::bigint AND runs.policy_fresh_confirmed_generation IS NULL AND runs.policy_preserve_required
+        THEN true ELSE runs.policy_pending_fresh END,
+    policy_fresh_consumed_generation = CASE WHEN runs.policy_fresh_consumed_generation = @claim_generation::bigint AND runs.policy_fresh_confirmed_generation IS NULL AND runs.policy_preserve_required
+        THEN NULL ELSE runs.policy_fresh_consumed_generation END,
     status = CASE WHEN @pool_wait::boolean THEN 'pool_wait' ELSE 'queued' END,
     status_since = now(),
     started_at = CASE WHEN @pool_wait::boolean THEN NULL ELSE runs.started_at END,

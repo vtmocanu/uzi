@@ -239,11 +239,14 @@ func TestPolicyResumeHoldLiveDB(t *testing.T) {
 					t.Fatalf("cross-mode %s on %s: %v", lane.wrong, lane.held, err)
 				}
 			})
-			p.untouched(t, id, "fresh_one_claim", func() {
-				if _, err := p.resume(id, PolicyResumeFreshOneClaim, req.OutcomeID, "guidance"); !errors.Is(err, ErrPolicyFreshUnavailable) {
-					t.Fatalf("fresh_one_claim: %v", err)
-				}
-			})
+			if lane.held == "fresh_from_saved_work" {
+				// The one-claim Fresh belongs to a same_conversation episode only.
+				p.untouched(t, id, "fresh_one_claim on an attempt-path episode", func() {
+					if _, err := p.resume(id, PolicyResumeFreshOneClaim, req.OutcomeID, "guidance"); !errors.Is(err, ErrPolicyResumeConflict) {
+						t.Fatalf("fresh_one_claim: %v", err)
+					}
+				})
+			}
 			p.untouched(t, id, "stale episode id", func() {
 				if _, err := p.resume(id, lane.wrong, uuid.NewString(), ""); !errors.Is(err, ErrPolicyResumeConflict) {
 					t.Fatalf("stale id: %v", err)

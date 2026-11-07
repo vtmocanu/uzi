@@ -73,7 +73,7 @@ export function policyRefusalMessage(tag: PolicyRefusalTag): string {
 
 /** Why a preserve-only continuation could not proceed. Each maps 1:1 onto the policy-hold report cause. */
 export type PolicyContinuationCause = "attempt_path" | "saved_work_missing" | "session_missing"
-  | "transcript_unknown" | "provider_resume_rejected";
+  | "transcript_unknown" | "provider_resume_rejected" | "fresh_start_uncertain";
 
 /** A preserve-only claim could not continue the earlier conversation (or its saved work). Typed so the
  *  runner re-holds the run for its owner instead of failing it or starting a fresh conversation. Carries

@@ -111,14 +111,14 @@ func (r PolicyHoldRequest) Validate() error {
 		return fmt.Errorf("%w: invalid policy detail", ErrInvalidState)
 	}
 	// The closed owner-facing cause. "refused" is the actual provider refusal; every other value
-	// describes a re-hold. fresh_start_uncertain needs the later fresh-start milestone, so this
-	// server rejects it rather than store a cause it cannot yet act on.
+	// describes a re-hold. fresh_start_uncertain is the re-hold of a one-claim Fresh whose consumed
+	// authorization never confirmed a new conversation.
 	switch r.Cause {
 	case "refused":
 		if r.Detail != "refused" {
 			return fmt.Errorf("%w: cause refused requires detail refused", ErrInvalidState)
 		}
-	case "attempt_path", "saved_work_missing", "session_missing", "transcript_unknown", "provider_resume_rejected", "pending_conversion":
+	case "attempt_path", "saved_work_missing", "session_missing", "transcript_unknown", "provider_resume_rejected", "pending_conversion", "fresh_start_uncertain":
 		if r.Detail != "resume_rejected" {
 			return fmt.Errorf("%w: re-hold cause requires detail resume_rejected", ErrInvalidState)
 		}

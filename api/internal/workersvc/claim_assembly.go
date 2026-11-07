@@ -774,9 +774,11 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		CheckpointTip:  textPtr(run.CheckpointTip),
 		// Compact policy hold (#3607 M2a): the preserving fact and the required recovery head,
 		// read off the claimed row. Only a still-preserving run carries either.
-		PolicyPreserveOnly:  run.PolicyPreserveRequired,
-		PolicyExpectedHead:  policyExpectedHead(run),
-		PolicySavedWorkHead: policySavedWorkHead(run),
+		PolicyPreserveOnly:     run.PolicyPreserveRequired,
+		PolicyExpectedHead:     policyExpectedHead(run),
+		PolicySavedWorkHead:    policySavedWorkHead(run),
+		PolicyFreshSession:     policyFreshSession(run),
+		PolicyFreshUnconfirmed: policyFreshUnconfirmed(run),
 		// Issue #3194: read off the claimed run row, never derived from ownership or the tip.
 		CheckpointAttestedSource: textPtr(run.CheckpointAttestedSource),
 		// PRD #1247 M9 (task c): the last_seq recordRunCredential actually landed — bumped past any
@@ -1368,6 +1370,23 @@ func policyExpectedHead(run store.Run) *string {
 		return nil
 	}
 	return textPtr(run.PolicyRequiredHead)
+}
+
+// policyFreshSession is true only for the claim that consumed the one-claim Fresh authorization:
+// the consumed generation is this claim's, no report confirmed a new conversation, and the run is
+// still preserving. It is read off the row ClaimRun returned, never reconstructed from audit.
+func policyFreshSession(run store.Run) bool {
+	return run.PolicyPreserveRequired && run.PolicyFreshConsumedGeneration.Valid &&
+		run.PolicyFreshConsumedGeneration.Int64 == run.ClaimGeneration &&
+		(!run.PolicyFreshConfirmedGeneration.Valid || run.PolicyFreshConfirmedGeneration.Int64 != run.PolicyFreshConsumedGeneration.Int64)
+}
+
+// policyFreshUnconfirmed is true on a later claim of a preserving run whose consumed one-claim Fresh
+// authorization (an earlier generation) was never confirmed by a current-generation session report.
+func policyFreshUnconfirmed(run store.Run) bool {
+	return run.PolicyPreserveRequired && run.PolicyFreshConsumedGeneration.Valid &&
+		run.PolicyFreshConsumedGeneration.Int64 < run.ClaimGeneration &&
+		(!run.PolicyFreshConfirmedGeneration.Valid || run.PolicyFreshConfirmedGeneration.Int64 != run.PolicyFreshConsumedGeneration.Int64)
 }
 
 // policySavedWorkHead projects policy_required_head onto the claim for a run whose episode was

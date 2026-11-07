@@ -30,8 +30,9 @@ func policyHoldDTO(r store.Run) *apitypes.PolicyHoldDTO {
 	}
 }
 
-// policyResumeModes names the owner actions the exact held episode accepts. Only the shipped modes
-// appear: the lane decides which one, and any other state offers none.
+// policyResumeModes names the owner actions the exact held episode accepts. The lane decides which
+// modes: a same_conversation episode offers preserve and the one-claim Fresh, an attempt-path episode only
+// fresh_from_saved_work, and any other state offers none.
 func policyResumeModes(r store.Run) []string {
 	modes := []string{}
 	if r.Status != "paused" || r.HoldReason.String != "codex_policy_hold" || r.PolicyResolvedAt.Valid {
@@ -41,7 +42,7 @@ func policyResumeModes(r store.Run) []string {
 	case "fresh_from_saved_work":
 		modes = append(modes, "fresh_from_saved_work")
 	case "same_conversation":
-		modes = append(modes, "preserve")
+		modes = append(modes, "preserve", "fresh_one_claim")
 	}
 	return modes
 }

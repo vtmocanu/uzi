@@ -1333,8 +1333,13 @@ export class CodexHarness implements RunHarness {
       if (this.threadId === undefined) {
         // The single authoritative fresh-thread branch: a preserve-only turn with no session to resume
         // must re-hold, never start a new conversation (no thread/start is sent).
-        if (request.preserveConversation === true && request.resumeSessionId === undefined)
-          throw new PolicyContinuationRejected("session_missing");
+        if (request.preserveConversation === true && request.resumeSessionId === undefined) {
+          // Only the claim's one-claim Fresh allowance may start a conversation, exactly once: it is spent
+          // BEFORE thread/start, so a failure after the send can never admit a second new conversation.
+          const allowance = request.policyFreshAllowance;
+          if (allowance === undefined || allowance.remaining !== 1) throw new PolicyContinuationRejected("session_missing");
+          allowance.remaining = 0;
+        }
         const resumed = request.resumeSessionId !== undefined;
         this.resumedRoot = resumed;
         this.threadId = resumed

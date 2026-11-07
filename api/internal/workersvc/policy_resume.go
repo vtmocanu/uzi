@@ -37,11 +37,9 @@ var (
 	// ErrPolicyResumeConflict is a safe refusal: stale, foreign-episode, mode-mismatched or
 	// otherwise ineligible requests change nothing.
 	ErrPolicyResumeConflict = errors.New("policy hold resume conflict")
-	// ErrPolicyFreshUnavailable reports that the optional one-claim Fresh action is not shipped.
 	// ErrPolicyResumeGuidanceMismatch reports a repeat of an already-resolved episode with guidance
 	// that differs from the recorded request; nothing is recorded.
 	ErrPolicyResumeGuidanceMismatch = errors.New("policy hold already resumed with different guidance")
-	ErrPolicyFreshUnavailable       = errors.New("fresh_one_claim is unavailable on this server")
 )
 
 // PolicyResumeRequest is the decoded owner request. ExpectedEpisodeID is the outcome id of the
@@ -89,9 +87,6 @@ type PolicyResumeResult struct {
 func (s *Service) ResumePolicyHold(ctx context.Context, userID, runID uuid.UUID, req PolicyResumeRequest) (PolicyResumeResult, error) {
 	if err := req.Validate(); err != nil {
 		return PolicyResumeResult{}, err
-	}
-	if req.Mode == PolicyResumeFreshOneClaim {
-		return PolicyResumeResult{}, ErrPolicyFreshUnavailable
 	}
 	if s.txBeginner == nil {
 		return PolicyResumeResult{}, fmt.Errorf("policy resume requires transaction support")

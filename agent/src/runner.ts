@@ -2516,6 +2516,9 @@ interface RunFlight {
   policyAdmission?: boolean;
   initialPlanningEligible?: boolean;
   policyReservation?: symbol;
+  /** One-claim Fresh allowance set by admitPolicyPreserveOnly for the claim that consumed the owner's
+   *  authorization; shared by reference into every root lead request of the claim. */
+  policyFreshAllowance?: { remaining: number };
   forgeCloneSuccess?: AbortController;
   defaultBranchTip?: string;
   operationAdmission?: CodexOperationController;
@@ -14340,6 +14343,15 @@ export class RunRunner {
     } else {
       flight.runLog.info("policy preserve-only claim carries no held head; skipping recovery verification");
     }
+    // A consumed one-claim Fresh authorization that no report confirmed may already own a new
+    // conversation: re-hold instead of resuming (no session) or starting another.
+    if (claim.policy_fresh_unconfirmed === true) throw new PolicyContinuationRejected("fresh_start_uncertain", true);
+    if (claim.policy_fresh_session === true) {
+      // The owner's single Fresh start: no session or transcript to find. The allowance is spent by the
+      // harness's one fresh-thread branch before thread/start.
+      flight.policyFreshAllowance = { remaining: 1 };
+      return;
+    }
     if (!claim.session_id) throw new PolicyContinuationRejected("session_missing", true);
     if (claim.secrets.codex &&
         (!flight.runHome || await CodexSessionStore.inspectSession(join(flight.runHome, "codex-session-store"), claim.session_id) !== "present"))
@@ -17030,6 +17042,7 @@ export class RunRunner {
       parkRunSupported: claim.park_run_supported === true,
       // A policy-held claim continues its saved conversation or re-holds; every root lead turn is guarded.
       ...(claim.policy_preserve_only === true ? { preserveConversation: true } : {}),
+      ...(claim.policy_preserve_only === true && flight.policyFreshAllowance !== undefined ? { policyFreshAllowance: flight.policyFreshAllowance } : {}),
       requestParkRun: async (pausedAt) => {
         const supported = claim.park_run_supported === true;
         const checkLifecycle = (): void => {

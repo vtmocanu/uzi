@@ -47,7 +47,7 @@ func TestPolicyHoldDTOResumeModes(t *testing.T) {
 		mutate func(*store.Run)
 		want   []string
 	}{
-		"unresolved session-compatible hold": {nil, []string{"preserve"}},
+		"unresolved session-compatible hold": {nil, []string{"preserve", "fresh_one_claim"}},
 		"unresolved attempt-path hold": {func(r *store.Run) { r.PolicyContinuationMode = pgconv.Text("fresh_from_saved_work") },
 			[]string{"fresh_from_saved_work"}},
 		"resolved episode":      {resolved, []string{}},

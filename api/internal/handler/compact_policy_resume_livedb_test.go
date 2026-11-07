@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -195,9 +196,13 @@ func TestCompactPolicyResumeAuthMountLiveDB(t *testing.T) {
 				t.Fatalf("GET run = %d %s", rec.Code, rec.Body.String())
 			}
 			dto := wrapped.Run
+			wantModes := []string{lane.mode}
+			if lane.hold == "same_conversation" {
+				wantModes = []string{"preserve", "fresh_one_claim"}
+			}
 			if dto.PolicyHold.HoldCause == nil || *dto.PolicyHold.HoldCause != "refused" || !dto.PolicyHold.RecoveryRequired || dto.PolicyHold.VerifiedThis ||
-				len(dto.PolicyHold.ResumeModes) != 1 || dto.PolicyHold.ResumeModes[0] != lane.mode {
-				t.Fatalf("owner DTO policy_hold = %+v (%s), want one mode %s", dto.PolicyHold, rec.Body.String(), lane.mode)
+				!slices.Equal(dto.PolicyHold.ResumeModes, wantModes) {
+				t.Fatalf("owner DTO policy_hold = %+v (%s), want modes %v", dto.PolicyHold, rec.Body.String(), wantModes)
 			}
 
 			refused := func(what string, client, body string, want int) {
@@ -216,15 +221,14 @@ func TestCompactPolicyResumeAuthMountLiveDB(t *testing.T) {
 				refused("unknown mode fresh", client, resumeBody("fresh", episode, "g"), http.StatusBadRequest)
 				refused("missing episode id", client, `{"mode":"`+lane.mode+`"}`, http.StatusBadRequest)
 				refused("unknown field", client, `{"mode":"`+lane.mode+`","expected_episode_id":"`+episode+`","extra":1}`, http.StatusBadRequest)
-				refused("fresh_one_claim", client, resumeBody("fresh_one_claim", episode, "g"), http.StatusConflict)
+				if lane.hold == "fresh_from_saved_work" {
+					// The one-claim Fresh belongs to a same_conversation episode only.
+					refused("fresh_one_claim on an attempt-path episode", client, resumeBody("fresh_one_claim", episode, "g"), http.StatusConflict)
+				}
 				refused("cross-mode with correct id and guidance", client, resumeBody(lane.wrongMode, episode, "narrow"), http.StatusConflict)
 				refused("stale episode id", client, resumeBody(lane.mode, uuid.NewString(), "narrow"), http.StatusConflict)
 				refused("NUL guidance", client, resumeBody(lane.mode, episode, "a\x00b"), http.StatusBadRequest)
 				refused("oversized guidance", client, resumeBody(lane.mode, episode, strings.Repeat("x", 16001)), http.StatusBadRequest)
-			}
-			// fresh_one_claim names its unavailability in the typed 409.
-			if got := fx.resumeAs(lane.client, run, resumeBody("fresh_one_claim", episode, "")); got.Code != http.StatusConflict || !strings.Contains(got.Body.String(), "fresh_one_claim is unavailable on this server") {
-				t.Fatalf("fresh_one_claim body = %d %s", got.Code, got.Body.String())
 			}
 			// Foreign owners are 404 on both credential kinds, and mutate nothing.
 			for _, client := range []string{"foreign cookie", "foreign bearer"} {

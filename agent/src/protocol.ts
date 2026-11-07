@@ -18,10 +18,10 @@ import type { HarnessEffort } from "./harness.js";
 export const WORKER_API_PREFIX = "/api/worker";
 
 /** Why a hold was entered. "refused" is the only cause of a `refused` detail; every other cause is a
- *  metadata-free `resume_rejected` re-hold. The shared fixture rejects fresh_start_uncertain until the
- *  fresh-start slice ships it, so it is not accepted here either. */
+ *  metadata-free `resume_rejected` re-hold. fresh_start_uncertain re-holds a claim whose earlier one-claim
+ *  Fresh authorization was consumed without confirming a new conversation. */
 export const POLICY_HOLD_CAUSES = ["refused", "attempt_path", "saved_work_missing", "session_missing",
-  "transcript_unknown", "provider_resume_rejected", "pending_conversion"] as const;
+  "transcript_unknown", "provider_resume_rejected", "pending_conversion", "fresh_start_uncertain"] as const;
 export type PolicyHoldCause = typeof POLICY_HOLD_CAUSES[number];
 export interface PolicyHoldRequest {
   outcome_id: string;
@@ -139,6 +139,12 @@ export function decodePolicyRecoveryVerifiedReply(value: unknown): PolicyRecover
 export function normalizePolicyPreserveClaim(claim: Record<string, unknown>): void {
   if (claim.policy_preserve_only !== undefined && typeof claim.policy_preserve_only !== "boolean")
     claim.policy_preserve_only = true;
+  // The one-claim Fresh grant fails closed: anything but the literal boolean true is dropped, so a
+  // malformed value never lets a claim start a new conversation. The unconfirmed marker fails the other
+  // way: a present non-boolean value under a preserve-only claim reads as true (re-hold).
+  if (claim.policy_fresh_session !== undefined && claim.policy_fresh_session !== true) delete claim.policy_fresh_session;
+  if (claim.policy_fresh_unconfirmed !== undefined && typeof claim.policy_fresh_unconfirmed !== "boolean")
+    claim.policy_fresh_unconfirmed = claim.policy_preserve_only === true;
   if (claim.policy_expected_head !== undefined && !isPolicyHeadId(claim.policy_expected_head))
     claim.policy_expected_head = "";
   if (claim.policy_saved_work_head !== undefined && !isPolicyHeadId(claim.policy_saved_work_head))
@@ -1721,6 +1727,13 @@ export interface ClaimResponse extends ClaimMemoryState {
    *  required head remains (lowercase 40/64 hex). "" means a malformed value (missing saved work);
    *  absent means no requirement. Normalized by normalizePolicyPreserveClaim. */
   policy_saved_work_head?: string;
+  /** Only on the one claim that consumed the owner's compatible-lane one-claim Fresh authorization while
+   *  no new conversation is confirmed: the worker may start exactly one new conversation for it. Anything
+   *  but `true` is dropped by normalizePolicyPreserveClaim (no fresh allowed). */
+  policy_fresh_session?: boolean;
+  /** A later claim of a preserving run whose consumed Fresh authorization never confirmed a new
+   *  conversation: re-hold (fresh_start_uncertain), never resume or start a conversation. */
+  policy_fresh_unconfirmed?: boolean;
   cross_check?: ClaimPlanCrossCheck | ClaimCodeCrossCheck;
   /** Frozen owner steering for a plan cross-check (issue #3841); decoded by decodeOwnerSteering. */
   cross_check_owner_steering?: ClaimOwnerSteering;
