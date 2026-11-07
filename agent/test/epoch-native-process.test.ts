@@ -24,7 +24,44 @@ interface PrivateCache {
   };
   unsettledDeletes: Map<string, number>;
   beginDestructive: () => Promise<{ settle(result: { ok: boolean }): Promise<void> }>;
+  runGitAsRunner(cwd: string | undefined, args: string[], opts: { onStderr?: (stderr: string) => void }): Promise<string>;
 }
+
+it("runner Git reports joined child stderr before wrapping a nonzero exit", async t => {
+  const git = new GitCache(path.join(process.env.TMPDIR!, "cache"), nullLogger());
+  const internal = git as unknown as PrivateCache;
+  t.mock.method(internal, "execScoped", async () => {
+    throw Object.assign(new Error("for-each-ref failed"), {
+      stderr: "warning: ignoring broken ref\n", code: 1, epochProcessJoined: true,
+    });
+  });
+  const verdict = new Error("for-each-ref reported a problem");
+  await assert.rejects(internal.runGitAsRunner(undefined, ["for-each-ref"], {
+    onStderr: stderr => { if (stderr !== "") throw verdict; },
+  }), error => error === verdict);
+});
+
+it("runner Git preserves a stderr callback's unknown verdict after exit zero", async t => {
+  const git = new GitCache(path.join(process.env.TMPDIR!, "cache"), nullLogger());
+  const internal = git as unknown as PrivateCache;
+  t.mock.method(internal, "execScoped", async () => ({ stdout: "", stderr: "warning: ignoring broken ref\n" }));
+  const verdict = new Error("for-each-ref reported a problem");
+  await assert.rejects(internal.runGitAsRunner(undefined, ["for-each-ref"], {
+    onStderr: stderr => { if (stderr !== "") throw verdict; },
+  }), error => error === verdict);
+});
+
+it("runner Git keeps a boundary abort ahead of partial stderr classification", async t => {
+  const git = new GitCache(path.join(process.env.TMPDIR!, "cache"), nullLogger());
+  const internal = git as unknown as PrivateCache;
+  t.mock.method(internal, "execScoped", async () => {
+    throw Object.assign(new Error("aborted"), { name: "AbortError", stderr: "partial warning\n" });
+  });
+  const verdict = new Error("stderr classification");
+  await assert.rejects(internal.runGitAsRunner(undefined, ["for-each-ref"], {
+    onStderr: stderr => { if (stderr !== "") throw verdict; },
+  }), error => (error as Error).constructor.name === "GitBoundaryAbortError");
+});
 
 function fixture(deleteLaunch = false, identity: Identity = "worker_pat") {
   const git = new GitCache(path.join(process.env.TMPDIR!, "cache"), nullLogger());
