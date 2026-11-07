@@ -26356,14 +26356,21 @@ export class RunRunner {
     flight.preserveSession = true;
     flight.retainedLocalCustody = true;
     const predecessor = RUN_ID_RE.test(hold.ownerRunId) ? hold.ownerRunId : "unknown";
+    const willPark = this.client?.protocolFeatures?.includes(RETAINED_ADOPTION_FAILED_FEATURE) === true &&
+      Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0;
+    const consequence = willPark
+      ? "Resume on this worker will hold again unchanged and adds at least one admission-counted custody hold; lost " +
+        "reports, crashes or worker re-registration can add more, up to this run's custody admission limit, unless " +
+        "that remediation has been resolved through a separately authorized route. "
+      : "This run was not placed on an owner hold: each automatic retry on this worker will stop the same way and adds " +
+        "at least one admission-counted custody hold, up to this run's custody admission limit, unless that " +
+        "remediation has been resolved through a separately authorized route. ";
     flight.batcher.emit({
       kind: "status",
       agent: "worker",
       payload: {
         text: `The agent did not start. The source of predecessor run ${predecessor} on this worker is held under secret-scan ` +
-          "remediation and requires review. Resume on this worker will hold again unchanged and adds at least one " +
-          "admission-counted custody hold; lost reports, crashes or worker re-registration can add more, up to this run's " +
-          "custody admission limit, unless that remediation has been resolved through a separately authorized route. " +
+          `remediation and requires review. ${consequence}` +
           `Cancel ends this run. \`uzi run recovery ${predecessor}\` inspects the predecessor.`,
       },
     });
@@ -26371,15 +26378,13 @@ export class RunRunner {
     try {
       delivered = await flight.batcher.flushOwned(
         AbortSignal.any([this.retainedLifecycleSignal(flight), AbortSignal.timeout(GUIDANCE_FLUSH_MS)]));
+      if (!delivered) flight.runLog.warn("guidance_unconfirmed", { reason: "not_confirmed" });
     } catch (error) {
       this.retainedLifecycleGuard(flight);
       flight.runLog.warn("guidance_unconfirmed", { reason: "flush_error", ...formatRetainedRecoveryDiagnostic(error, flight.redactText) });
     }
     this.retainedLifecycleGuard(flight);
-    if (!delivered) flight.runLog.warn("guidance_unconfirmed", { reason: "not_confirmed" });
-    this.retainedLifecycleGuard(flight);
-    if (this.client?.protocolFeatures?.includes(RETAINED_ADOPTION_FAILED_FEATURE) &&
-        Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0) {
+    if (willPark) {
       await this.parkRetainedRecoveryExhausted(flight, "retained_recovery_adoption_failed");
     }
     throw new RetainedRecoveryStop({ cause: hold });
@@ -26966,7 +26971,7 @@ export class RunRunner {
               () => this.retainedLifecycleGuard(flight));
             this.retainedLifecycleGuard(flight);
             if ((this.client?.protocolFeatures?.includes(RETAINED_EXHAUSTED_FEATURE) ||
-                this.client?.protocolFeatures?.includes("recovery_cause_retained_recovery_adoption_failed")) &&
+                this.client?.protocolFeatures?.includes(RETAINED_ADOPTION_FAILED_FEATURE)) &&
                 Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0) {
               const snapshot = await this.git.terminalRetainedSnapshot(bare, branch, key, expectedSource);
               this.retainedLifecycleGuard(flight);
@@ -26998,7 +27003,7 @@ export class RunRunner {
         blocker === "decoded_history_limit" && persistence === "" && !flight.sourceExitDenied && !flight.sourceDispatchDenied;
       if (persistence === "" && persisted?.recovery?.stage === "blocked" &&
           persisted.recovery.blocker === "adoption_failed" &&
-          this.client?.protocolFeatures?.includes("recovery_cause_retained_recovery_adoption_failed") &&
+          this.client?.protocolFeatures?.includes(RETAINED_ADOPTION_FAILED_FEATURE) &&
           Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0) {
         const deadline = Date.now() + this.codexBoundaryDeadlineMs;
         let quiescent = false;

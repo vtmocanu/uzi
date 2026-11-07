@@ -139,7 +139,7 @@ describe("negative controls keep their existing terminal refusals", linux, () =>
     edit(j);
     gitIn(s.bare, "config", "--local", `uzi-recovery.${s.branch}.clone`, JSON.stringify(j));
   };
-  async function refused(t: TestContext, s: Scene) {
+  async function refused(s: Scene) {
     const before = snapshot(s);
     await s.run();
     assert.equal(s.parks(), 0, "never held");
@@ -148,14 +148,13 @@ describe("negative controls keep their existing terminal refusals", linux, () =>
     assert.equal(s.entered.value, false);
     assert.deepEqual(snapshot(s), before, "nothing changed");
     assert.equal(s.calls.release() + s.calls.retire() + s.calls.detach(), 0);
-    void t;
   }
 
   it("a live (nonterminal) owner", async t => {
     confirmParks(t);
     const s = await scene(t, { entry: "A", attemptPaths: true });
     api.setOrphanClassification(s.ownerRun, { status: "running", repo_id: "r1", kind: "issue", issue_iid: s.iid, branch: null, pipeline_ref: null, pipeline_id: null });
-    await refused(t, s);
+    await refused(s);
     assert.ok(s.lines.some(l => l.reason === "nonterminal_owner"));
   });
 
@@ -163,7 +162,7 @@ describe("negative controls keep their existing terminal refusals", linux, () =>
     confirmParks(t);
     const s = await scene(t, { entry: "A", attemptPaths: true });
     api.setOrphanClassification(s.ownerRun, { status: "cancelled", repo_id: "other", kind: "issue", issue_iid: s.iid, branch: null, pipeline_ref: null, pipeline_id: null });
-    await refused(t, s);
+    await refused(s);
     assert.ok(s.lines.some(l => l.reason === "repo_mismatch"));
   });
 
@@ -171,38 +170,45 @@ describe("negative controls keep their existing terminal refusals", linux, () =>
     confirmParks(t);
     const s = await scene(t, { entry: "A", attemptPaths: true });
     api.setOrphanClassification(s.ownerRun, { status: "cancelled", repo_id: "r1", kind: "issue", issue_iid: s.iid + 1, branch: null, pipeline_ref: null, pipeline_id: null });
-    await refused(t, s);
+    await refused(s);
     assert.ok(s.lines.some(l => l.reason === "branch_mismatch"));
   });
 
-  it("a forged record (another attempt id) stays a path_error", async t => {
+  /** The journal parse rejects these at discovery: reclaim is never entered and the run fails as a corrupt journal. */
+  function corruptBeforeReclaim(s: Scene) {
+    assert.equal(s.entries.length, 0, "reclaimTerminalOrphan was never entered");
+    assert.ok(failures(s).every(f => /corrupt journal/.test(f)), failures(s).join(" | "));
+  }
+
+  it("a forged record (another attempt id) is rejected as a corrupt journal before reclaim and never held", async t => {
     confirmParks(t);
     const s = await scene(t, { entry: "A", attemptPaths: true });
     rewrite(s, j => { j.remediationRecovery.attemptId = "20261011T000000Z-g29-bbbbbbbbbbbbbbbb"; });
-    await refused(t, s);
-    console.log("PROBE", s.entries.map(e => e.constructor.name), failures(s));
+    await refused(s);
+    corruptBeforeReclaim(s);
   });
 
-  it("a malformed record (unknown field) stays a path_error", async t => {
+  it("a malformed record (unknown field) is rejected as a corrupt journal before reclaim and never held", async t => {
     confirmParks(t);
     const s = await scene(t, { entry: "B", attemptPaths: true });
     rewrite(s, j => { j.remediationRecovery.unexpected = 1; });
-    await refused(t, s);
-    console.log("PROBE", s.entries.map(e => e.constructor.name), failures(s));
+    await refused(s);
+    corruptBeforeReclaim(s);
   });
 
   it("a schema-valid record naming another branch is a path_error at the first classification", async t => {
     confirmParks(t);
     const s = await scene(t, { entry: "A", attemptPaths: false });
     rewrite(s, j => { j.remediationRecovery.branch = "agent/issue-9999"; });
-    await refused(t, s);
+    await refused(s);
     assert.ok(s.lines.some(l => l.stage === "path" && l.reason === "path_error"));
   });
 
-  it("a hand-written canonical-path remediation journal is refused as before and never held", async t => {
+  it("a hand-written canonical-path remediation journal is rejected as a corrupt journal before reclaim and never held", async t => {
     confirmParks(t);
     const s = await scene(t, { entry: "A", attemptPaths: true });
     rewrite(s, j => { delete j.attemptId; delete j.remediationRecovery.attemptId; });
-    await refused(t, s);
+    await refused(s);
+    corruptBeforeReclaim(s);
   });
 });

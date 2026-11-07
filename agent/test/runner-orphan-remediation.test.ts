@@ -45,6 +45,8 @@ function assertGuidance(s: Scene, claim = s.claim): void {
   assert.ok(joined.includes(s.ownerRun), "names the predecessor run id");
   assert.ok(!joined.includes(s.clone) && !joined.includes(s.bare) && !joined.includes(s.tip) && !/Error/.test(joined),
     "no path, commit id or inner error text");
+  assert.ok(joined.includes("Resume on this worker will hold again unchanged"), "the park is reported, so Resume holds again");
+  assert.ok(!joined.includes("not placed on an owner hold"));
   const log = api.requestLog;
   const messages = log.indexOf("messages");
   const park = log.indexOf("state:recovery_wait");
@@ -213,6 +215,10 @@ describe("the park acknowledgement", linux, () => {
     assert.equal(s.parks(), 0);
     assert.deepEqual(terminal(s), []);
     assert.equal(s.guidance().length >= 1, true);
+    const joined = s.guidance().join("\n");
+    assert.ok(joined.includes("This run was not placed on an owner hold"), "the no-park wording");
+    assert.ok(joined.includes("each automatic retry on this worker will stop the same way"));
+    assert.ok(!joined.includes("Resume on this worker"), "no Resume promise when nothing is parked");
     assert.deepEqual(snapshot(s), before);
     assert.equal(client.protocolFeatures?.includes(FEATURE), false);
   });
@@ -248,7 +254,8 @@ describe("owner cancellation around the hold", linux, () => {
     assert.deepEqual(snapshot(s), before);
   });
 
-  it("a Cancel after the confirmed hold causes no further worker action", async t => {
+  it("a Cancel marked after the flight ended causes no further request or local change", async t => {
+    // run() has already returned, so this checks only that nothing the flight left behind reacts to a late Cancel.
     confirmParks(t);
     const s = await scene(t, { entry: "A", attemptPaths: true });
     const before = snapshot(s);
@@ -263,16 +270,25 @@ describe("owner cancellation around the hold", linux, () => {
 });
 
 describe("the guidance is confirmed before the park, whatever the message transport does", linux, () => {
-  async function heldWith(t: TestContext, arrange: (s: Scene) => void): Promise<void> {
+  async function heldWith(t: TestContext, arrange: (s: Scene) => void, delivered = true): Promise<Scene> {
     confirmParks(t);
     const s = await scene(t, { entry: "A", attemptPaths: true });
     const before = snapshot(s);
     arrange(s);
+    // Server-side order: the guidance message text (not any "messages" entry) must already be stored when the park lands.
+    let guidanceAtPark: boolean | undefined;
+    const reportReal = client.reportState.bind(client) as unknown as (...a: unknown[]) => Promise<unknown>;
+    t.mock.method(client, "reportState", (async (...args: unknown[]) => {
+      if ((args[1] as Record<string, unknown>).status === "recovery_wait") guidanceAtPark ??= s.guidance().length > 0;
+      return reportReal(...args);
+    }) as never);
     await s.run();
+    if (delivered) assert.equal(guidanceAtPark, true, "the guidance text reached the server before the park report");
     assert.equal(s.parks(), 1, "the confirmed park ACK");
     assert.deepEqual(terminal(s), [], "no failed report");
     assert.deepEqual(snapshot(s), before);
     assert.equal(s.entered.value, false);
+    return s;
   }
 
   it("an already-running periodic send is joined", async t => {
@@ -288,11 +304,11 @@ describe("the guidance is confirmed before the park, whatever the message transp
         void flight.batcher.flush();
       };
     });
-    assert.ok(api.requestLog.indexOf("messages") < api.requestLog.indexOf("state:recovery_wait"));
   });
 
   it("a transport failure of the guidance batch", async t => {
-    await heldWith(t, () => api.failMessagesNext(1, 503));
+    // The failed batch is retried later, so the order is not guaranteed here: only the unconfirmed-but-reported park is.
+    await heldWith(t, () => api.failMessagesNext(1, 503), false);
   });
 
   it("a lost message ACK", async t => {
@@ -306,8 +322,16 @@ describe("the guidance is confirmed before the park, whatever the message transp
   });
 
   it("a permanent batch refusal drives the real breaker callback without failing the run", async t => {
-    await heldWith(t, () => api.failMessagesNext(1, 403));
+    await heldWith(t, () => api.failMessagesNext(1, 403), false);
     assert.ok(api.states.every(x => x.body.status !== "failed"));
+  });
+
+  it("an unconfirmed guidance flush is logged as guidance_unconfirmed and the park is still reported", async t => {
+    // A permanent refusal trips the batcher, so flushOwned returns false without waiting out GUIDANCE_FLUSH_MS.
+    const s = await heldWith(t, () => api.failMessagesNext(1, 403), false);
+    assert.ok(s.lines.some(l => l.msg === "guidance_unconfirmed" && l.reason === "not_confirmed"),
+      s.lines.map(l => String(l.msg)).join(" | "));
+    assert.equal(s.lines.filter(l => l.msg === "guidance_unconfirmed").length, 1, "logged once");
   });
 });
 
@@ -335,9 +359,9 @@ describe("repeated claims, restarts and a server-only discard", linux, () => {
     assertHeld(s, before, 2);
   });
 
-  it("a server-only discard of the predecessor's custody hold changes nothing on the worker", async t => {
-    // The FakeApi models no custody holds, so the discard is the absence of any worker-visible change; the cold reader
-    // below is what proves the worker holds on its own durable bytes only.
+  it("a cold reader holds from the worker's own durable bytes, independent of server-side custody state", async t => {
+    // The FakeApi has no way to drop a predecessor custody hold or recovery record, so a server-only discard cannot be
+    // simulated; this proves the worker's hold depends only on its durable bytes, via a cold reader.
     confirmParks(t);
     const s = await scene(t, { entry: "A", attemptPaths: true });
     const before = snapshot(s);
@@ -361,7 +385,7 @@ describe("the worker-side cancellation release log", linux, () => {
       throw new Error("fixture stops after the predecessor capture");
     };
     const before = snapshot(s);
-    await s.run(s.nextClaim(6).run_id === s.claim.run_id ? { ...s.nextClaim(6), run_id: s.ownerRun } : s.claim);
+    await s.run({ ...s.nextClaim(6), run_id: s.ownerRun });
     const msgs = s.lines.map(l => String(l.msg));
     assert.ok(msgs.some(m => m === "predecessor attempt release refused: active remediation record retained (remediation_retained); nothing released, journal kept"),
       msgs.filter(m => m.startsWith("predecessor")).join(" | "));
