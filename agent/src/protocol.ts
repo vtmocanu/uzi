@@ -1147,6 +1147,16 @@ export interface LeadConfigReportBody {
   observed_effort_evidence: string | null;
 }
 
+/** Issue #3251: the body of POST /api/worker/runs/{id}/codex-catalog-default. The server schema is
+ *  closed (unknown fields are a 400). */
+export interface CodexCatalogDefaultBody {
+  claim_generation: number;
+  catalog_context: string;
+  model: string;
+  runtime_version: string;
+  default_effort: string;
+}
+
 /** Per-run caps the server may push down (PRD §Configuration). Advisory in M2.
  *  Field names + units match M1's claim.go: timeouts are in *seconds*; any
  *  future ms consumer converts at the use site. */
@@ -1206,6 +1216,9 @@ export interface ClaimConfig {
   /** PRD #3244: where `default_effort` (or its absence) came from. Always present on a lead-lane
    *  claim of an upgraded API, which makes it the worker's lead-config reporting activation signal. */
   default_effort_source?: LeadEffortSource;
+  /** Issue #3251: the opaque catalog context (64 lowercase hex) of a Codex lead-lane claim with a
+   *  complete credential binding; echoed verbatim when reporting the catalog default effort. */
+  codex_catalog_context?: string;
   /** The run owner's AI-attribution opt-out (issue #916), read live per claim. When
    *  false, the worker suppresses the Agent SDK's Co-Authored-By: Claude commit trailer
    *  for this run. Always sent by an upgraded server (NOT null); absent on an older
@@ -1964,6 +1977,7 @@ export interface ClaimResponse extends ClaimMemoryState {
    *  (PRD #209 M4 Open Question 3, `--require-base`). Meaningful only alongside
    *  planned_base_commit. Absent on an older server ⇒ false, i.e. warn-and-implement. */
   require_base_match?: boolean;
+  repo_agent_source_commit?: string | null;
   /** The run's PERSISTED subagent selection (`runs.agent_source` /
    *  `agent_exclusions`), replayed on every claim (PRD #35).
    *
@@ -1981,6 +1995,7 @@ export interface ClaimResponse extends ClaimMemoryState {
    *  missing key as "absent", never as "source own with no exclusions". Also absent
    *  from an older server, which is the same case and wants the same handling. */
   agent_selection?: AgentSelection;
+  requested_agent_source?: AgentSource | null;
   /** This run's usage-limit opt-in (PRD #35 Decision 7), read from the runs row on
    *  EVERY claim so a resumed or re-queued run keeps it — the same convention as
    *  `auto_approve` above, and for the same reason: an unattended resume must not
@@ -2375,6 +2390,10 @@ export interface CompletionPermitResponse {
 /** issue #3194: the `hold_reason` of the `--require-base` base-attestation hold (POST
  *  /api/worker/runs/:id/base-attestation-hold). Mirrors workersvc.HoldReasonBaseAttestationMissing. */
 export const BASE_ATTESTATION_HOLD_REASON = "base_attestation_missing";
+
+export const REPO_AGENT_SOURCE_HOLD_REASON = "repo_agent_source_unavailable";
+
+export const REPO_AGENT_SOURCE_FEATURE = "repo_agent_source_v1";
 
 /** issue #3194: what a base-attestation hold request established. `held` is the server's positive
  *  ACK for this flight's generation; `stale` is a fence refusal (the claim moved on); `unknown`
@@ -2784,25 +2803,38 @@ export function parseAgentSelection(
 export function resolveAgentSelection(
   parse: AgentSelectionParse,
   repoAvailable: boolean,
+  requested?: AgentSource | null,
 ): { selection: AgentSelection; note?: string } {
   switch (parse.status) {
     case "ok":
-      if (parse.selection.source === "repo" && !repoAvailable)
-        return {
-          selection: { source: "own", exclusions: [] },
-          note: "this clone has no repo agent roster; using your own agent templates",
-        };
-      return { selection: parse.selection };
+      return degradeRepoWithoutRoster(parse.selection, repoAvailable);
     case "invalid":
       return {
         selection: { source: "own", exclusions: [] },
         note: "the submitted agent selection was malformed; using your own agent templates",
       };
     case "absent":
-      return {
-        selection: { source: repoAvailable ? "repo" : "own", exclusions: [] },
-      };
+      return degradeRepoWithoutRoster(
+        { source: requestedAgentSource(requested) ?? (repoAvailable ? "repo" : "own"), exclusions: [] },
+        repoAvailable,
+      );
   }
+}
+
+function degradeRepoWithoutRoster(
+  selection: AgentSelection,
+  repoAvailable: boolean,
+): { selection: AgentSelection; note?: string } {
+  if (selection.source === "repo" && !repoAvailable)
+    return {
+      selection: { source: "own", exclusions: [] },
+      note: "this clone has no repo agent roster; using your own agent templates",
+    };
+  return { selection };
+}
+
+function requestedAgentSource(raw: unknown): AgentSource | undefined {
+  return raw === "repo" || raw === "own" ? raw : undefined;
 }
 
 /**
@@ -2817,6 +2849,14 @@ export function resolveAgentSelection(
  */
 export function seedAgentSelection(persisted?: AgentSelection | null): AgentSelectionParse {
   return persisted ? { status: "ok", selection: persisted } : { status: "absent" };
+}
+
+export function gateVerdictSelection(
+  verdict: AgentSelectionParse,
+  persisted: AgentSelection | null | undefined,
+  requested: AgentSource | null | undefined,
+): AgentSelectionParse {
+  return verdict.status === "absent" && requested && persisted ? seedAgentSelection(persisted) : verdict;
 }
 
 /** Body of POST /runs/:id/state. Fields are set per target status.
@@ -2874,7 +2914,20 @@ export type CapabilityInferenceEvidence = Partial<Record<"docker" | "jvm", {
   truncated: boolean;
 }>>;
 
+/** Issue #3859: negotiated feature for the `running` report's registration witness. */
+export const RUN_REGISTRATION_EVIDENCE_FEATURE = "run_registration_evidence_v1";
+
+/** Issue #3859: the witness that this worker registered the flight at `registration_epoch`
+ *  under `register_nonce`. Attached by the client to a `running` report only. */
+export interface RunRegistrationEvidence {
+  register_nonce: string;
+  claim_generation: number;
+  registration_epoch: number;
+}
+
 export interface StateRequest {
+  /** Issue #3859: set by the client alone, never by a caller. */
+  registration_evidence?: RunRegistrationEvidence;
   /** Memory-pressure park fence, bound to the current registration. */
   register_nonce?: string;
   /** Memory-pressure episode; zero is the first episode. */
@@ -3010,6 +3063,7 @@ export interface StateRequest {
    *  means "detected nothing" (the gate's repo card goes inert), while an absent
    *  field/NULL column means "pre-feature run". */
   repo_agents?: RepoAgentSummary[];
+  repo_agent_source_commit?: string;
   /** The selection an AUTOPILOT run resolved for itself (PRD #37 Decision 6):
    *  repo agents when detected, else the owner's templates, with no exclusions.
    *  Human-gated runs persist their selection through the `approve_plan` input
@@ -3185,8 +3239,8 @@ export interface StateRequest {
   provider_progress_turns?: number;
   /** PRD #1809 D6: qualifies a `recovery_cause: "data_volume_full"` park. `true` parks WITHOUT
    *  counting toward the api's lifetime cap (UZI_RUN_DISK_PARK_MAX), for M4's soft cache-cap park;
-   *  absent or false is a counted park, and past the cap the api fails the run itself (fail_origin
-   *  data_volume_full). The api 400s it with any other cause, and only accepts it once it
+   *  absent or false is a counted park, and past the finite cap the api holds the run for owner
+   *  Resume with a NULL retry time and unchanged count. The api 400s it with any other cause, and only accepts it once it
    *  advertises `recovery_cause_data_volume_full`. The disk-full handling (M5) never sends it. */
   disk_park_preventive?: boolean;
   /** PRD #1809 D8: on a process-ending park report that published a checkpoint (the usage-limit
@@ -3304,6 +3358,9 @@ export interface StateAck {
   completedPublicationReceipt?: CompletedPublicationReceipt;
   completedPublicationReason?: CompletedPublicationReason;
   reconciliation?: PlanCrossCheckReconciliation;
+  /** Issue #3859: the server's top-level answer to a report that carried registration_evidence.
+   *  Logged only; no behavior branches on it. */
+  registrationEvidence?: "recorded" | "refused";
   /** Whether the server applied the transition. Diagnostics and logging only —
    *  see the warning above before branching on it. */
   applied: boolean;
@@ -3323,6 +3380,7 @@ export interface StateAck {
    *  a plain stop. null/absent (older server, an unparseable body, a run with no hold) leaves it
    *  undefined, treated as "no hold" — the safe default. */
   holdReason?: string | null;
+  repoAgentSourceCommit?: string;
   /** The server-computed effective per-run budget (PRD #122 M2, Decisions 5/5b), read
    *  off the SAME `{run: RunDTO}` body as `status`. `budgetMaxIterations` is the scaled
    *  total implement/review turn ceiling; `budgetWallSeconds` is the effective wall clock

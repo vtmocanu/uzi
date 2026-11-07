@@ -173,6 +173,12 @@ test("claim wire contract: worker parses the server's skill shape", () => {
   assert.equal(claim.config?.skill_max_bytes, 65536);
   assert.equal(claim.config?.skills_max_per_run, 32);
 
+  // Issue #3251: the opaque Codex catalog context rides the config verbatim (64 lowercase hex).
+  assert.equal(
+    claim.config?.codex_catalog_context,
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  );
+
   // issue #916: the owner's AI-attribution flag rides the config as an always-present
   // bool (default true = today's behavior; worker suppresses the trailer when false).
   assert.equal(claim.config?.attribution_enabled, true);

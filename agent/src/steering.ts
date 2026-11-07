@@ -115,7 +115,13 @@ export interface SteeringOptions {
   /** Issue #1604: the server's GET /inputs page size (default REPLAY_PAGE_LIMIT). Injectable so a
    *  test can match a FakeApi inputPageSize. */
   replayPageLimit?: number;
+  /** Issue #3974: the bound on the one cancel probe a poll makes while a credential switch is
+   *  withheld (default WITHHELD_SWITCH_CANCEL_PROBE_MS). Injectable for tests. */
+  withheldSwitchCancelProbeMs?: number;
 }
+
+/** Issue #3974: default bound for the withheld-switch cancel probe. */
+const WITHHELD_SWITCH_CANCEL_PROBE_MS = 5000;
 
 /** Feed notices for events discarded because they were written against a plan version
  *  that has since been revised (PRD #41 Decision 3). */
@@ -199,6 +205,15 @@ function parseAnswerBody(
  * sdk-executor.ts, and `instanceof`-tested in runner.ts) so it crosses files and knip sees a
  * live consumer of the export.
  */
+/** A handle on a counted credential-switch hold (SteeringChannel.holdCredentialSwitch). */
+export interface CredentialSwitchHold {
+  /** Whether a switch generation is latched on the channel. */
+  latched(): boolean;
+  /** Close once (a second close is a no-op). At depth 0, `service: true` trips a latched switch
+   *  synchronously; `service: false` discards the latch. */
+  close(opts: { service: boolean }): void;
+}
+
 /** The sticky pause mode (see SteeringChannel.getPauseMode): an owner `milestone`/`now` pause, the
  *  sweep's `wall` park (PRD #1497), the worker-local `disk` stop (PRD #1809 D4), or none. */
 export type PauseMode = "milestone" | "now" | "wall" | "disk" | null;
@@ -568,6 +583,13 @@ export class SteeringChannel {
    *  behind it. */
   private delivered = false;
   private readonly replayPageLimit: number;
+  /** Issue #3974: bound for the withheld-switch cancel probe. */
+  private readonly withheldSwitchCancelProbeMs: number;
+  /** Issue #3974: sticky. An owner cancel was committed while a credential switch was withheld
+   *  (hold or revision-turn defer); the runner must not enter the switch for this flight. */
+  private withheldSwitchCancelCommitted = false;
+  /** Issue #3974: aborted by stop() so an in-flight withheld-switch cancel probe returns promptly. */
+  private readonly probeStop = new AbortController();
   /** Consecutive reads of a full page with nothing new while no lane can clear it, and when the
    *  first was: bounded like a failed read (deliveryFailures), then initial delivery gives up. */
   private deliveryStalls = 0;
@@ -743,11 +765,18 @@ export class SteeringChannel {
         const refused = new InputReceiptError(
           `the applied receipt for ${this.held.ids.length} routed operator input(s) was refused: ${errMessage(err)}`,
         );
-        // A pending switch: take the EXISTING credential-switch path, never a generic failure. The
-        // reports waiting now reject with a CredentialSwitchSignal (so the executor/runner enter the
-        // switch release, which never reports `failed`), the batch is dropped for the next claim to
-        // replay, and the switch is tripped as the GET's signal would. The failure is not sticky, so
-        // the release report, finding nothing pending, goes out.
+        if (reason === "switch_pending" && this.holdActive()) {
+          // Hold: latch, keep the batch unapplied (rearm returns it to the ready lane), reject nobody.
+          for (const id of this.held.ids) if (!this.heldForSwitch.includes(id)) this.heldForSwitch.push(id);
+          this.maybeTripCredentialSwitch(this.claimGeneration);
+          this.releaseHeld();
+          return;
+        }
+        // A pending switch (no hold): take the EXISTING credential-switch path, never a generic
+        // failure. The reports waiting now reject with a CredentialSwitchSignal (so the
+        // executor/runner enter the switch release, which never reports `failed`), the batch is
+        // dropped for the next claim to replay, and the switch is tripped as the GET's signal would.
+        // The failure is not sticky, so the release report, finding nothing pending, goes out.
         if (reason === "switch_pending") {
           this.rejectHeld(new CredentialSwitchSignal());
           this.maybeTripCredentialSwitch(this.claimGeneration);
@@ -785,7 +814,7 @@ export class SteeringChannel {
    *  id is never ACKed again, re-routed, or applied with a held batch. */
   private isGateReceiptId(id: number): boolean {
     return this.persistedRevisionIds.has(id) || this.awaitingGateIds.has(id) || (this.ready?.ids.includes(id) ?? false) ||
-      this.disposedApproves.has(id) || this.parkedReady.includes(id);
+      this.disposedApproves.has(id) || this.parkedReady.includes(id) || this.heldForSwitch.includes(id);
   }
 
   /** Move ids to the ready lane (state ii) and make sure the lane is running. */
@@ -1132,12 +1161,28 @@ export class SteeringChannel {
         count,
       });
       this.parkReady(ids);
-      if (ids.some((id) => this.takenApproveIds.has(id))) {
+      // During a hold: latch and settle, rejecting nobody.
+      if (this.holdActive()) {
+        // Never reject during a hold. A taken approve stays parked and becomes urgent only once the
+        // switch is actually pending (maybeTripCredentialSwitch derives it from the parked ids).
+        this.maybeTripCredentialSwitch(this.claimGeneration);
+        this.settleWaiters();
+      } else if (ids.some((id) => this.takenApproveIds.has(id))) {
         this.approveRefusedBySwitch = true;
         for (const w of this.receiptWaiters.splice(0)) w.reject(new CredentialSwitchSignal());
         this.maybeTripCredentialSwitch(this.claimGeneration);
       } else this.settleWaiters();
       return "continue";
+    }
+    if (reason === "switch_pending" && this.holdActive()) {
+      // Hold: latch, park the ids, settle, reject nobody. A taken approve is recorded and becomes
+      // urgent only once the switch is actually pending (maybeTripCredentialSwitch).
+      if (this.ready) {
+        this.parkReady([...this.ready.ids]);
+      }
+      this.maybeTripCredentialSwitch(this.claimGeneration);
+      this.settleWaiters();
+      return "stop";
     }
     if (reason === "switch_pending") {
       // As on the held path: the reports waiting reject with the switch signal, the ids are parked
@@ -1513,6 +1558,14 @@ export class SteeringChannel {
    *  revise (awaitGateEvent rejects at once when the switch tripped before it parked). A COUNTER
    *  (not a bool) so nested/re-entrant windows compose. */
   private switchDeferDepth = 0;
+  /** Counted hold (holdCredentialSwitch), separate from switchDeferDepth: while > 0 a matching
+   *  switch only latches its generation; nothing is aborted, pending is not set, no waiter is
+   *  rejected. Serviced synchronously by the last handle's close({ service: true }). */
+  private switchHoldDepth = 0;
+  private latchedSwitchGeneration: number | undefined;
+  /** Ids of a routed batch whose APPLIED a switch refused during a hold: kept unapplied (a release
+   *  leaves them for the next claim) and returned to the ready lane by rearmCredentialSwitch. */
+  private readonly heldForSwitch: number[] = [];
   /** PRD #1247 M5b: a RE-ARMABLE interrupt the executor registers (via ctx.onCredentialSwitch),
    *  the exact analog of pauseNowInterrupt — invoked on the matching switch so a switch drops the
    *  in-flight turn even after the shared cancel controller has already fired once (an
@@ -1578,6 +1631,7 @@ export class SteeringChannel {
     this.inclusions = new InclusionReporter(client, runId, this.claimGeneration, log);
     this.receiptDeadlineMs = opts.receiptDeadlineMs ?? ACTIVE_APPLY_DEADLINE_MS;
     this.replayPageLimit = opts.replayPageLimit ?? REPLAY_PAGE_LIMIT;
+    this.withheldSwitchCancelProbeMs = opts.withheldSwitchCancelProbeMs ?? WITHHELD_SWITCH_CANCEL_PROBE_MS;
   }
 
   /** Seed the sticky `stop` state at construction time (issue #552 M3), before the poll
@@ -1745,6 +1799,65 @@ export class SteeringChannel {
     return this.pendingSwitchGeneration;
   }
 
+  /** Issue #3974: true once an owner cancel was committed while a credential switch was withheld.
+   *  The runner reads it at its switch choke points and takes the cancelled route instead. */
+  cancelCommittedUnderWithheldSwitch(): boolean {
+    return this.withheldSwitchCancelCommitted;
+  }
+
+  /** Issue #3974: the predicate under which the api withholds every input row behind a switch
+   *  signal, so a queued owner cancel cannot reach this worker through GET inputs. */
+  private withheldSwitchCancelEligible(generation: number | undefined): boolean {
+    return generation === this.claimGeneration && this.pendingSwitchGeneration === undefined &&
+      (this.holdActive() || this.switchDeferDepth > 0) && !this.cancelled && this.fence === undefined &&
+      !this.terminalLifecycle.signal.aborted;
+  }
+
+  /** The cancel effects shared by the `cancel` input and the withheld-switch cancel commit. */
+  private commitCancel(): void {
+    // Sticky BEFORE the abort: the abort's listeners run synchronously and read it (a parked
+    // delivery waiter resolves on a cancel instead of rejecting with the AbortError).
+    this.markCancelled();
+    try { this.onCancel?.(); }
+    finally {
+      try { if (!this.cancel.signal.aborted) this.cancel.abort(); }
+      finally { this.abortLifecycle(); }
+    }
+  }
+
+  /** Issue #3974: while a switch is withheld the api serves no input rows, so an owner Cancel never
+   *  arrives. Each poll makes one bounded, non-committing ownership probe (one probe per poll, not a
+   *  single probe per flight); commit the cancel only on a positive answer after a synchronous
+   *  re-check. Any failure is "unknown": nothing committed, no delivery/receipt failure counted. */
+  private async probeWithheldSwitchCancel(generation: number): Promise<void> {
+    const reasons: AbortSignal[] = [
+      AbortSignal.timeout(this.withheldSwitchCancelProbeMs),
+      this.terminalLifecycle.signal, this.lifecycle.signal, this.probeStop.signal,
+    ];
+    // A PauseNow aborts this.cancel with a PauseNowSignal AND aborts this.lifecycle (abortLifecycle
+    // with terminal=false), so the lifecycle signal above already ends probes until rearmLifecycle
+    // replaces it. Leaving the spent PauseNow cancel signal out only keeps it from ending the probes
+    // made after that rearm; any other cancel.signal abort ends the probe.
+    if (!(this.cancel.signal.aborted && this.cancel.signal.reason instanceof PauseNowSignal)) {
+      reasons.push(this.cancel.signal);
+    }
+    let verdict: "cancel" | "unknown" = "unknown";
+    try {
+      verdict = await this.readCancellationRequested(
+        AbortSignal.any(reasons), ["running", "claimed", "awaiting_approval", "awaiting_input"]);
+    } catch (err) {
+      this.log.warn("steering: withheld-switch cancel probe did not complete", {
+        run_id: this.runId, error: errMessage(err),
+      });
+      return;
+    }
+    // Re-check synchronously: state may have moved while the probe was in flight.
+    if (verdict !== "cancel" || !this.withheldSwitchCancelEligible(generation)) return;
+    this.withheldSwitchCancelCommitted = true;
+    this.log.info("steering: owner cancel observed while a credential switch is withheld", { run_id: this.runId });
+    this.commitCancel();
+  }
+
   /** PRD #1247 M5b (BLOCKING-3 rework): re-arm the credential-switch trip after a give-up whose
    *  stamp-clear the server POSITIVELY confirmed. Clears pendingSwitchGeneration so a LATER
    *  same-generation switch signal — a re-request the owner makes on the STILL-OPEN claim, whose
@@ -1758,6 +1871,41 @@ export class SteeringChannel {
     // pending switch refused are due their APPLIED again.
     this.approveRefusedBySwitch = false;
     if (this.parkedReady.length > 0) this.markReady(this.parkedReady.splice(0));
+    if (this.heldForSwitch.length > 0) this.markReady(this.heldForSwitch.splice(0));
+  }
+
+  /** A hold changes behaviour only while no switch is pending: with one pending, every path runs as
+   *  it does without a hold. */
+  private holdActive(): boolean {
+    return this.switchHoldDepth > 0 && this.pendingSwitchGeneration === undefined;
+  }
+
+  /** Whether a switch hold (holdCredentialSwitch) is open on this channel. */
+  credentialSwitchHoldOpen(): boolean {
+    return this.switchHoldDepth > 0;
+  }
+
+  /** Open a counted hold: a matching credential switch is latched, not tripped, until the last
+   *  handle closes. Close with `service: true` at a verified release (trips synchronously if a
+   *  generation is latched), or `service: false` to discard the latch (the stamp rides every poll,
+   *  so a later poll trips normally). Each handle closes at most once.
+   *  Boundary: `service: false` leaves parked / heldForSwitch ids where they are; they wait for the
+   *  stamp's next poll trip (and a later give-up rearm) or for the next claim. */
+  holdCredentialSwitch(): CredentialSwitchHold {
+    this.switchHoldDepth++;
+    let closed = false;
+    return {
+      latched: () => this.latchedSwitchGeneration !== undefined,
+      close: ({ service }) => {
+        if (closed) return;
+        closed = true;
+        this.switchHoldDepth--;
+        if (this.switchHoldDepth > 0) return;
+        const generation = this.latchedSwitchGeneration;
+        this.latchedSwitchGeneration = undefined;
+        if (service && generation !== undefined) this.maybeTripCredentialSwitch(generation);
+      },
+    };
   }
 
   /** PRD #1247 M5b (MINOR-7): the PUBLIC entry the runner's reportState closure calls to feed the
@@ -1796,6 +1944,7 @@ export class SteeringChannel {
   /** Stop polling and await the loop's exit. */
   async stop(): Promise<void> {
     this.stopped = true;
+    this.probeStop.abort();
     if (this.loop) await this.loop;
     // Issue #1604: a ready gate input gets its bounded stop attempts too; one still awaiting its
     // result (state i) stays unapplied for the next claim.
@@ -2442,7 +2591,16 @@ export class SteeringChannel {
    *      abort, so the awaited promise itself must reject to release the flight).
    */
   private maybeTripCredentialSwitch(generation: number): void {
+    // Issue #3974: an owner cancel was committed under a withheld switch; never enter the switch.
+    if (this.withheldSwitchCancelCommitted) return;
     if (generation !== this.claimGeneration) return; // a stale signal for a superseded claim
+    // A switch hold (holdCredentialSwitch): latch the generation and return BEFORE anything is
+    // aborted, so the flight looks exactly like one that has not yet polled the stamp. The hold's
+    // service-close replays this call at depth 0.
+    if (this.holdActive()) {
+      this.latchedSwitchGeneration = generation;
+      return;
+    }
     this.shutdownStop.abort();
     // PRD #1247 M5b (MAJOR-6): inside a defer window (a plan-revision planning turn), DEFER — do NOT
     // set pendingSwitchGeneration and do NOT abort. The signal rides every poll, so it trips at the
@@ -2450,6 +2608,9 @@ export class SteeringChannel {
     if (this.switchDeferDepth > 0) return;
     if (this.pendingSwitchGeneration !== undefined) return; // already tripped once — idempotent
     this.pendingSwitchGeneration = generation;
+    // A taken approve refused during a hold becomes urgent only now that the switch is pending.
+    if (this.parkedReady.some((id) => this.takenApproveIds.has(id)) ||
+        this.heldForSwitch.some((id) => this.takenApproveIds.has(id))) this.approveRefusedBySwitch = true;
     // Mid-turn: trip the shared controller (guarded on !aborted so we don't double-abort a
     // controller a cancel/pause already spent) and the re-armable interrupt, exactly like a `now`
     // pause. The abort reason is a CredentialSwitchSignal so the executor's cancel listener routes
@@ -2556,14 +2717,7 @@ export class SteeringChannel {
         }
         break;
       case "cancel":
-        // Sticky BEFORE the abort: the abort's listeners run synchronously and read it (a parked
-        // delivery waiter resolves on a cancel instead of rejecting with the AbortError).
-        this.markCancelled();
-        try { this.onCancel?.(); }
-        finally {
-          try { if (!this.cancel.signal.aborted) this.cancel.abort(); }
-          finally { this.abortLifecycle(); }
-        }
+        this.commitCancel();
         break;
       case "stop":
         // PRD #517 M4: a graceful wind-down of an interactive task. Sticky, like cancel, but
@@ -2766,6 +2920,10 @@ export class SteeringChannel {
           // empty one). It is not an input row — it is the server's "a switch is pending for the
           // current claim" fact — and acting on it releases the claim.
           if (credentialSwitch) this.maybeTripCredentialSwitch(credentialSwitch.generation);
+          // Issue #3974: a withheld switch hides every input row, cancel included; one probe per poll.
+          if (credentialSwitch && this.withheldSwitchCancelEligible(credentialSwitch.generation)) {
+            await this.probeWithheldSwitchCancel(credentialSwitch.generation);
+          }
           // Issue #1604: a short read (under the server's cap) that returns nothing this claim has
           // not already routed completes initial delivery: the replayed backlog is drained. A full
           // page may hide rows behind it, even when every row on it is one this claim tracks, so

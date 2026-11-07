@@ -270,7 +270,8 @@ type ClaimPayload struct {
 	// the feed (runs.require_base_match, PRD #209 M4 Open Question 3). Always present (the
 	// column is NOT NULL); false for every run that did not opt in, so an old worker that
 	// ignores it, and every non-seeded run, keep today's behaviour.
-	RequireBaseMatch bool `json:"require_base_match"`
+	RequireBaseMatch      bool    `json:"require_base_match"`
+	RepoAgentSourceCommit *string `json:"repo_agent_source_commit,omitempty"`
 	// AgentSelection is the run's PERSISTED subagent selection (runs.agent_source /
 	// agent_exclusions), replayed on every claim. Omitted when the run has none.
 	//
@@ -294,7 +295,8 @@ type ClaimPayload struct {
 	// Nil, not an empty selection, when the run never reached a gate — the worker's
 	// absent-default is correct there and must stay reachable. Additive on the wire:
 	// an old worker ignores the key and behaves exactly as it does today.
-	AgentSelection *AgentSelection `json:"agent_selection,omitempty"`
+	AgentSelection       *AgentSelection `json:"agent_selection,omitempty"`
+	RequestedAgentSource *string         `json:"requested_agent_source,omitempty"`
 
 	// Milestones is the run's FROZEN, human-approved milestone list (PRD #122 M1),
 	// decoded from runs.milestones_frozen and replayed on every claim so a resumed
@@ -317,11 +319,12 @@ type ClaimPayload struct {
 	// JudgeModel is the model alias a JUDGE run runs on (PRD #46 Decision 7), resolved
 	// from the judge_model setting at claim assembly. Present only for kind=judge.
 	JudgeModel *string `json:"judge_model,omitempty"`
-	// SummaryModel is the model alias the inline run-summary generator runs on (PRD
-	// #362 Decision 8), resolved user-value-wins from users.summary_model over the
-	// instance summary_model at ISSUE-run claim assembly. Unlike JudgeModel it rides
-	// the issue-run claim, not the judge claim; nil (omitted) when unresolved so an
-	// old worker's wire shape is unchanged.
+	// SummaryModel is the summary model for this claim's harness (PRD #362 Decision 8,
+	// PRD #3248 D3): the inline run-summary generator's model, resolved user-value-wins
+	// over the instance value and the built-in from the harness's own lane
+	// (summary_model for Claude, codex_summary_model for Codex) at ISSUE-run claim
+	// assembly. Unlike JudgeModel it rides the issue-run claim, not the judge claim;
+	// nil (omitted) when no settings are wired so an old worker's wire shape is unchanged.
 	SummaryModel *string `json:"summary_model,omitempty"`
 	// SummaryIntentPresent tells the worker the run's intent summary is ALREADY set
 	// (PRD #362 M3c, Decision 3), so the executor skips INTENT generation on a
@@ -684,6 +687,12 @@ type ClaimConfig struct {
 	// user_default or builtin today). PRD #3244: present on every lead-lane claim, which makes
 	// it the worker's activation signal for the lead-config reporter; absent otherwise.
 	DefaultEffortSource *string `json:"default_effort_source,omitempty"`
+	// CodexCatalogContext is the opaque catalog context (issue #3251): lowercase hex SHA-256 of
+	// the credential revision this claim releases (user, secret id, auth mode, material revision,
+	// subscription account key). The worker echoes it verbatim when it reports the Codex catalog's
+	// default reasoning effort. Present only on a Codex lead-lane claim whose frozen binding is
+	// complete; omitempty keeps every other claim byte-identical.
+	CodexCatalogContext *string `json:"codex_catalog_context,omitempty"`
 	// AttributionEnabled is the run owner's AI-attribution opt-out (issue #916), read
 	// LIVE from the owner's users row on every claim. When false, the worker suppresses
 	// the Agent SDK's Co-Authored-By: Claude commit trailer for this run (agent-side, a

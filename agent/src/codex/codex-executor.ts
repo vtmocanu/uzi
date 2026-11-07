@@ -139,11 +139,12 @@ import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts,
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
 import { errMessage } from "../util.js";
-import { SummaryRunner, type PlanSummaryResult } from "../summary-runner.js";
+import { SummaryRunner, type PlanSummaryResult, type SummarySkipReason } from "../summary-runner.js";
+import { summarySkipPayload } from "./summary-skip.js";
 import { resolvePrdInput } from "../prd-link.js";
 import { appendLeadTextTail, emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "../plan-missing.js";
 import { makeTextRedactor } from "../redact.js";
-import { resolveAgentSelection, seedAgentSelection, type AgentSelection, type AgentTemplate, type AskUserQuestion, type ClaimSkill, type IterationBudget, type Milestone, type MilestoneProgress } from "../protocol.js";
+import { gateVerdictSelection, resolveAgentSelection, seedAgentSelection, type AgentSelection, type AgentTemplate, type AskUserQuestion, type ClaimSkill, type IterationBudget, type Milestone, type MilestoneProgress } from "../protocol.js";
 import { ownSubagentTemplates, selectLeadTemplate, selectSubagentTemplates } from "../agents.js";
 import { REPO_AGENT_DENIED_TOOLS } from "../repoagents.js";
 import type { CommandSandboxMode } from "../config.js";
@@ -1192,6 +1193,7 @@ export async function makeCodexAdviceHarness(
   ownership?: SummaryOwnership,
   admissionReporter?: CodexAdmissionReporter,
   operationScope?: CodexAdviceHarnessOptions["operationScope"],
+  onRefreshDenied?: () => void,
 ): Promise<CodexAdviceHarness> {
   // Register EVERY advice token — the initial release AND any subscription refresh — with the
   // harness redactor so neither can ride a log line verbatim. The advice lane has no separate
@@ -1206,7 +1208,7 @@ export async function makeCodexAdviceHarness(
   const initial = await bridge.release(signal);
   ownership?.guard();
   registerToken(initial);
-  const appServerAuth = createCodexAppServerAuth(buildAdviceAuthConfig(bridge, initial, registerToken, refresh === "deny"));
+  const appServerAuth = createCodexAppServerAuth(buildAdviceAuthConfig(bridge, initial, registerToken, refresh === "deny", onRefreshDenied));
   return new CodexAdviceHarness({ launchRoot, provider, appServerAuth, authMode: bridge.authMode, log, admissionReporter, operationScope });
 }
 
@@ -1264,6 +1266,7 @@ function buildAdviceAuthConfig(
   initial: string,
   registerToken: (token: string) => void,
   denyRefresh = false,
+  onRefreshDenied?: () => void,
 ): CodexAppServerAuthConfig {
   if (bridge.authMode !== "subscription") {
     return { mode: "api_key", apiKey: initial };
@@ -1279,7 +1282,7 @@ function buildAdviceAuthConfig(
     // PRD #2603: the Now summary shares the RUN's credential, so its advice call must never
     // advance the run's committed generation: a refresh request fails the (advisory) call instead.
     bridge: denyRefresh
-      ? { refresh: () => Promise.reject(new Error("codex advice refresh is denied for this call")) }
+      ? { refresh: () => { onRefreshDenied?.(); return Promise.reject(new Error("codex advice refresh is denied for this call")); } }
       : bridge.buildSubscriptionRefreshBridge(registerToken),
   };
 }
@@ -1435,6 +1438,9 @@ export interface CodexAdviceHarnessBuildParams {
   /** PRD #2603: "deny" makes the call's app-server refresh bridge fail instead of calling
    *  refreshCodex, for callers sharing the run's credential (Now, intent and plan summaries). */
   readonly refresh?: "deny";
+  /** Issue #3248 M3: called when the deny bridge refuses a refresh the app-server requested
+   *  during this call (only with `refresh: "deny"`). The model pass reads it as a typed flag. */
+  readonly onRefreshDenied?: () => void;
 }
 
 /** The injected judge/review advice-harness seam (PRD #1429 M3): built ONLY here and in
@@ -1459,7 +1465,7 @@ export function makeProductionCodexAdviceHarnessFactory(
   deps: { launchRoot?: LaunchAdviceRootSeam } = {},
 ): CodexAdviceHarnessFactory {
   return async (params: CodexAdviceHarnessBuildParams): Promise<CodexAdviceHarness> => {
-    const { runId, binding, signal, refresh } = params;
+    const { runId, binding, signal, refresh, onRefreshDenied } = params;
     const ownership = summaryOwnership.get(params);
     ownership?.guard();
     // Retain the owner's scope before credential release can yield. A delayed advice
@@ -1474,7 +1480,8 @@ export function makeProductionCodexAdviceHarnessFactory(
       const launchRoot = deps.launchRoot ?? makeProductionLaunchAdviceRoot(homeRoot, binding.authMode, log, ownership);
       return await makeCodexAdviceHarness(bridge, CODEX_PRODUCTION_PROVIDER, launchRoot, log, signal, refresh, ownership,
         binding.authMode === "subscription" ? client.codexAdmissionReporter?.(runId, params.claimGeneration) : undefined,
-        scope ? () => ({ prepare: (signal, check) => scope.prepare("advice", signal, () => { ownership?.guard(); check(); }), close }) : undefined);
+        scope ? () => ({ prepare: (signal, check) => scope.prepare("advice", signal, () => { ownership?.guard(); check(); }), close }) : undefined,
+        onRefreshDenied);
     } catch (error) { close(); throw error; }
   };
 }
@@ -3217,8 +3224,10 @@ export class CodexExecutor implements Executor {
             if (!allowed()) return;
             const inputs = await summaryInputs();
             if (!allowed()) return;
+            const skip: { reason?: SummarySkipReason } = {};
             const result = await this.summaryRunner.generatePlanSummary({
               ...inputs, planMd, signal: AbortSignal.any([lifecycleSignal, owned.ctrl.signal]),
+              onSkip: reason => { skip.reason = reason; },
               // Spend observed during bounded settlement counts even after close/abort; only
               // abandonment, a fence or a superseding flight drops it (as for the intent pass).
               onUsage: usage => {
@@ -3228,7 +3237,12 @@ export class CodexExecutor implements Executor {
                 ctx.emit({ kind: "summary_usage", agent: "worker", payload: { pass: "plan", model_usage: usage } });
               },
             });
-            if (!result || !allowed()) return;
+            if (!result) {
+              // Issue #3248 M3: one visible note under the same guards as the post it replaces.
+              if (skip.reason && allowed()) ctx.emit({ kind: "status", agent: "worker", payload: summarySkipPayload("plan", skip.reason) });
+              return;
+            }
+            if (!allowed()) return;
             await this.opts.client.postPlanSummary(ctx.runId, {
               ...result, plan_md: planMd.replaceAll("\u0000", ""),
             });
@@ -3877,16 +3891,20 @@ export class CodexExecutor implements Executor {
           try {
             const inputs = await summaryInputs();
             if (!summaryAllowed() || flight.ctrl.signal.aborted) return;
+            const skip: { reason?: SummarySkipReason } = {};
             const summary = await this.summaryRunner.generateIntentSummary({
               ...inputs, signal: flight.ctrl.signal,
+              onSkip: reason => { skip.reason = reason; },
               onUsage: usage => {
                 if (flight.delivered || flight.abandoned || ctx.claimFenced?.() || this.intentFlight !== flight) return;
                 flight.delivered = true;
                 ctx.emit({ kind: "summary_usage", agent: "worker", payload: { pass: "intent", model_usage: usage } });
               },
             });
-            if (summary && !flight.abandoned && !flight.ctrl.signal.aborted && summaryAllowed() && this.intentFlight === flight) {
-              await this.opts.client.postIntentSummary(ctx.runId, summary);
+            if ((summary || skip.reason) && !flight.abandoned && !flight.ctrl.signal.aborted && summaryAllowed() && this.intentFlight === flight) {
+              // Issue #3248 M3: a skipped summary posts nothing and leaves one visible note instead.
+              if (summary) await this.opts.client.postIntentSummary(ctx.runId, summary);
+              else if (skip.reason) ctx.emit({ kind: "status", agent: "worker", payload: summarySkipPayload("intent", skip.reason) });
             }
           } catch (error) {
             this.log.warn("intent summary hook failed", { run_id: ctx.runId, error: errMessage(error) });
@@ -4184,7 +4202,7 @@ export class CodexExecutor implements Executor {
           gatedPlan = planMd;
           approvedMilestones = planResult.milestones;
         }
-        approvedSelection = verdict.selection;
+        approvedSelection = gateVerdictSelection(verdict.selection, ctx.approvedSelection, ctx.requestedAgentSource);
 
         // NEW-ROOT RESUME at plan approval. The plan turn's provider root holds a live credential
         // it does not need during the approval wait, so: persist the credential-free session,
@@ -4242,7 +4260,7 @@ export class CodexExecutor implements Executor {
       // gate), before any implement turn. An invalid selection forces `own` and a repo selection
       // with no detected roster degrades to `own` (resolveAgentSelection owns both rules), so a
       // malformed verdict can never activate attacker-authored repo agents.
-      const resolvedSelection = resolveAgentSelection(approvedSelection, (ctx.repoAgents?.length ?? 0) > 0);
+      const resolvedSelection = resolveAgentSelection(approvedSelection, (ctx.repoAgents?.length ?? 0) > 0, ctx.requestedAgentSource);
       if (resolvedSelection.note) {
         ctx.emit({ kind: "status", agent: "worker", payload: { text: resolvedSelection.note } });
       }
@@ -5110,11 +5128,26 @@ export class CodexExecutor implements Executor {
     return {
       timeoutMs: this.deps.catalogProbeTimeoutMs ?? CODEX_CATALOG_PROBE_TIMEOUT_MS,
       onEntry: (entry: CodexCatalogEntry | undefined, model: string): void => {
+        // Issue #3251: feed the catalog default report first; it never throws and must not
+        // be skipped by the early return below.
+        try { ctx.codexCatalogReport?.report(entry, model); } catch { /* best-effort */ }
         if (entry === undefined || entry.supportedEfforts.includes(level)) return;
         ctx.emit({ kind: "status", agent: "worker", payload: {
           event: "effort_not_in_catalog",
           text: `Codex does not list reasoning effort ${level} for ${sanitizeName(model)}. uzi sends it unchanged; the provider may reject it. Choose a listed level or Runtime default.`,
         } });
+      },
+    };
+  }
+
+  /** Issue #3251: Runtime default claims with a catalog reporter. Report only (no note), and the
+   *  first turn/start does not wait for the reply. */
+  private catalogReportProbeFor(ctx: RunContext) {
+    return {
+      timeoutMs: this.deps.catalogProbeTimeoutMs ?? CODEX_CATALOG_PROBE_TIMEOUT_MS,
+      blocking: false,
+      onEntry: (entry: CodexCatalogEntry | undefined, model: string): void => {
+        try { ctx.codexCatalogReport?.report(entry, model); } catch { /* best-effort */ }
       },
     };
   }
@@ -5446,10 +5479,13 @@ export class CodexExecutor implements Executor {
         emitClaimInit: epochIndex === 0,
         // Issue #1583: projected tool frames are scrubbed of runtime-released Codex tokens.
         scrubProjected,
-        // PRD #3247 M2: advisory catalog probe, only on the claim's first root epoch and only for an
-        // explicit level (Runtime default carries none). The note is emitted from onEntry, which the
-        // harness calls before the first turn/start; the level itself is always sent unchanged.
-        ...(epochIndex === 0 && level !== undefined ? { catalogProbe: this.catalogProbeFor(ctx, level) } : {}),
+        // Advisory catalog probe, only on the claim's first root epoch. PRD #3247 M2: an explicit
+        // level gets the awaiting probe; its note is emitted from onEntry, which the harness calls
+        // before the first turn/start, and the level itself is always sent unchanged. Issue #3251:
+        // a Runtime default claim (no level) with a catalog reporter gets the report-only probe,
+        // which does not delay turn/start.
+        ...(epochIndex === 0 && level !== undefined ? { catalogProbe: this.catalogProbeFor(ctx, level) }
+          : epochIndex === 0 && ctx.codexCatalogReport !== undefined ? { catalogProbe: this.catalogReportProbeFor(ctx) } : {}),
       });
 
       const epochHarness = harness;

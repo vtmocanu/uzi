@@ -39,6 +39,84 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Milestone reconciliation audit snapshots no longer drop when the run has large plan or issue text ([#3945](https://github.com/vtmocanu/uzi/pull/3945), [#3947](https://github.com/vtmocanu/uzi/pull/3947)).**
   Before and after snapshots now carry a fixed set of reconciliation fields instead of the whole run row, so unrelated plan and issue text no longer pushes them over the audit size limit.
 
+- **Repo TOML agents honour supported Codex model pins ([#3265](https://github.com/vtmocanu/uzi/pull/3265), [#3972](https://github.com/vtmocanu/uzi/pull/3972)).**
+  Optional top-level model pins use the existing Codex role vocabulary; invalid values skip the agent, Claude follows the lead, and the schedule model override takes precedence.
+
+- **A retained continuation whose running report is refused no longer loops through uncharged requeues ([#3859](https://github.com/vtmocanu/uzi/pull/3859), [#3960](https://github.com/vtmocanu/uzi/pull/3960)).**
+  A witnessed flight departure is now charged against RUN_MAX_REQUEUES and parks at `worker_requeue_exhausted` at the cap, and presence without a departure within 2x the claim grace parks at the new owner-held `retained_continuation_unwitnessed` (Resume or Cancel); old agents and re-registering workers stay bounded only by the custody hold limit.
+
+- **A no-change report-only issue run is no longer failed by a predecessor's checkpoint that origin no longer holds ([#3944](https://github.com/vtmocanu/uzi/pull/3944), [#3948](https://github.com/vtmocanu/uzi/pull/3948)).**
+  The completion guard now ignores a stale local checkpoint copy only when origin positively reports the ref absent; a present, unknown or unreadable result, or an unproven lost-ack publish, still blocks, and no ref, hold or custody is changed.
+
+- **A credential switch during an automatic plan cross-check no longer fails the run ([#3953](https://github.com/vtmocanu/uzi/pull/3953), [#3979](https://github.com/vtmocanu/uzi/pull/3979)).**
+  The worker defers the switch until the checker's reservation settles (at most about 31 minutes after an approve or revise and about 53 minutes at a first checked human gate with the default 30-minute deadline), then switches; a cancel or other failure keeps its normal outcome. Known limit: an owner Cancel pressed during that wait takes effect only once the check settles and the switch is serviced ([#3974](https://github.com/vtmocanu/uzi/pull/3974) tracks a prompt Cancel).
+
+- **Repeated disk pressure waits for owner Resume instead of failing a run ([#3969](https://github.com/vtmocanu/uzi/pull/3969), [#3973](https://github.com/vtmocanu/uzi/pull/3973)).**
+  Runs that exhaust counted disk parks keep their work and recovery budgets in an owner hold; CLI and web offer Resume for one more attempt or Cancel.
+
+- **An owner Cancel takes effect promptly while a credential switch waits on a plan cross-check ([#3974](https://github.com/vtmocanu/uzi/pull/3974), [#4006](https://github.com/vtmocanu/uzi/pull/4006)).**
+  The worker checks for a requested cancel on each poll while the switch is held, ends the run cancelled and never services the switch; a re-plan gate whose checkpoint step is running still has no fixed limit ([#3980](https://github.com/vtmocanu/uzi/pull/3980)).
+
+- **A temporary API connection failure no longer owner-holds a verified retained recovery successor ([#3994](https://github.com/vtmocanu/uzi/pull/3994), [#4004](https://github.com/vtmocanu/uzi/pull/4004)).**
+  The post-adoption ownership check now retries in place, at most 5 attempts (about 15 s by default) inside the iteration deadline, only for ECONNREFUSED, ECONNRESET or UND_ERR_SOCKET before any response or a 502, 503 or 504 answer; other failures and exhausted retries keep each check's existing outcome, and a deadline that passes still ends as budget_exhausted.
+
+- **Factory status rows say a waiting run waits on its owner ([#3954](https://github.com/vtmocanu/uzi/pull/3954), [#3962](https://github.com/vtmocanu/uzi/pull/3962)).**
+  An admin viewing another user's waiting run on the Runs page now sees "waits on owner" instead of "waits on you".
+
+- **Workers now see an owner-discarded recovery hold as closed ([#4002](https://github.com/vtmocanu/uzi/pull/4002), [#4009](https://github.com/vtmocanu/uzi/pull/4009)).**
+  The exact-hold observation accepts the production owner-discard shape, which leaves the release timestamp unset, so it is reported as refusal evidence without granting release or publication authority.
+
+- **The startup forge seed and the connect API no longer assume GitLab ([#3785](https://github.com/vtmocanu/uzi/pull/3785), [#3967](https://github.com/vtmocanu/uzi/pull/3967)).**
+  Set `UZI_SEED_FORGE_TYPE` to `gitlab` (default), `forgejo` or `github` for the seeded connection; `POST /api/forge/connections` now returns 400 when `forge_type` is missing or blank, naming the supported values.
+
+- **Plan cross-check capture reports an expired Git command as a deadline refusal ([#3993](https://github.com/vtmocanu/uzi/pull/3993), [#3996](https://github.com/vtmocanu/uzi/pull/3996)).**
+  The capture helper clamps a late timer to zero, preserving its `git_deadline` reason without a Node warning.
+
+- **A manual rework reads a reviewer who just got repository access ([#3422](https://github.com/vtmocanu/uzi/pull/3422), [#3968](https://github.com/vtmocanu/uzi/pull/3968)).**
+  `uzi run rework` and Rework now ask the forge again about review authors uzi stored as not eligible in the last 6 hours; automatic reworks keep the 6-hour cache.
+
+### Added
+
+- **A preview of the new Overview at /overview/next, decisions first ([#3878](https://github.com/vtmocanu/uzi/pull/3878), [#3952](https://github.com/vtmocanu/uzi/pull/3952)).**
+  It leads with a status sentence, the app banners under the header, what needs your decision and your runs, linked both ways with the current Overview.
+
+- **Run uzi on one VPS with Docker Compose ([#1173](https://github.com/vtmocanu/uzi/pull/1173), [#3951](https://github.com/vtmocanu/uzi/pull/3951)).**
+  Add `docs/vps-deployment.md`, a tutorial from a bare VPS to a first run with Caddy for HTTPS and a daily database dump, plus `docs/glossary.md`. Add `deploy/compose/compose.yaml`, a server Compose file of signed release images that restarts after a reboot, with parity checks against the laptop Compose stack that keep worker hardening, persistent storage and mounted token secrets.
+
+- **Intent and plan summaries pick their model per harness ([#3248](https://github.com/vtmocanu/uzi/pull/3248), [#3961](https://github.com/vtmocanu/uzi/pull/3961)).**
+  Users and admins can set a Codex summary model beside the Claude one, and admins can reset either lane to its built-in; each run uses its own harness's lane, and the run feed notes a Codex summary skipped because its credential could not be used.
+
+- **Issue work line on the Overview preview ([#3879](https://github.com/vtmocanu/uzi/pull/3879), [#3978](https://github.com/vtmocanu/uzi/pull/3978)).**
+  `/overview/next` shows where issue runs stand (queued, planning, plan review, building, PR open, plus questions, parked and other work); clicking a stage filters the Runs list.
+
+- **The api reads JWT_SECRET, UZI_SECRET_KEY and DATABASE_URL from files ([#3938](https://github.com/vtmocanu/uzi/pull/3938), [#3966](https://github.com/vtmocanu/uzi/pull/3966)).**
+  Set JWT_SECRET_FILE, UZI_SECRET_KEY_FILE or DATABASE_URL_FILE to a mounted secret file; the api refuses to start when both forms of one value are set.
+
+- **Each user can set a default agent source for their runs on a repo ([#3914](https://github.com/vtmocanu/uzi/pull/3914), [#3941](https://github.com/vtmocanu/uzi/pull/3941)).**
+  The Repos page offers uzi templates, repo agents or not set; the choice is frozen onto new issue runs, governs approvals without a selection and autopilot, and needs a worker reporting agent_source_request_v1.
+
+- **Run defaults shows the Codex catalog default effort behind Runtime default ([#3251](https://github.com/vtmocanu/uzi/pull/3251), [#4014](https://github.com/vtmocanu/uzi/pull/4014)).**
+  Workers report the level when an issue or other lead Codex run starts, kept per credential for 30 days (at most 32 rows per user); settings, the web option label and `uzi settings get` (`catalog_default` in `--json`) show unknown until a run reports, and Codex account mode `auto` with at least one pooled login reads unknown.
+
+### Changed
+
+- **The Overview preview shows your capacity and held work in a right-hand rail ([#3880](https://github.com/vtmocanu/uzi/pull/3880), [#3971](https://github.com/vtmocanu/uzi/pull/3971)).**
+  Run slots in use, closed and open with every worker behind a disclosure replace the worker-load card, and a Held work card plus one held-work decision row replace the custody banner on /overview/next.
+
+- **Run health flags a run gone silent behind an open subagent delegation ([#3950](https://github.com/vtmocanu/uzi/pull/3950), [#3955](https://github.com/vtmocanu/uzi/pull/3955)).**
+  An open Agent or Task delegation no longer hides a quiet run: once the run sends no updates for the longer of Long tool call after and Stalled after, it is flagged stalled with a fixed advisory reason.
+
+- **Schedule modal groups where a run executes and says what Default means ([#3256](https://github.com/vtmocanu/uzi/pull/3256), [#3977](https://github.com/vtmocanu/uzi/pull/3977)).**
+  Harness, model, token and the renamed subagent-model toggle now sit together, with Default labels and model chips that show whether a value is pinned at fire.
+
+- **Retained re-claims still leave older generations' guarded holds open ([#2969](https://github.com/vtmocanu/uzi/pull/2969), [#3992](https://github.com/vtmocanu/uzi/pull/3992)).**
+  The worker now carries a predecessor settlement pass for a lower generation's inventory hold, but it is disabled in production until a proof that no leftover command-user process can write into the older clone exists, so holds stay open and counted as before.
+
+### Security
+
+- **A run can no longer rewrite the repo agents its later claims use ([#3913](https://github.com/vtmocanu/uzi/pull/3913), [#3940](https://github.com/vtmocanu/uzi/pull/3940)).**
+  The repo-agent roster is read from git objects at the commit of the repository's configured default branch, recorded on the run's first claim, never from the working tree; a branch-seeded `mr_rework` or `ci_fix` run gets the default-branch agents. No agent turn starts until the server confirms the recorded commit. A default branch that cannot be resolved, a revision that cannot be recorded or read holds the run, and a hold keeps the resolved commit for the claim after a resume. Only a worker reporting `repo_agent_source_v1` claims a run that reads repo agents, its first claim included. The run view shows the revision.
+
 ## [0.86.1] - 2026-11-05
 
 ### Added

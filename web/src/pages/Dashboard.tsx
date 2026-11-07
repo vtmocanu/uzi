@@ -4,243 +4,31 @@
 // table (moved to Settings), which told a new user nothing about what to do
 // next.
 
-import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
-import { api, isTerminalRun, type AdminUsage, type RunSummaryItem, type RunStatus, type SelfUsage, type Worker } from "../lib/api";
-import { hasAnthropicToken } from "../lib/hasToken";
-import {
-  isAccountCooldownWaiting,
-  effectiveRunStatus,
-  firstInProgressMilestoneId,
-  milestoneBadge,
-  milestoneBadgeText,
-  mrChipState,
-} from "../lib/runBadge";
-import { activityAge } from "../lib/runActivity";
+import { isTerminalRun } from "../lib/api";
+import { isAccountCooldownWaiting } from "../lib/runBadge";
 import { useNow } from "../lib/useNow";
-import { MrChip } from "../components/MrChip";
-import { RunIssueRef } from "../components/RunIssueRef";
-import { mrAbbrev } from "../lib/forgeNoun";
-import { UsageCard, type UsageWindow } from "../components/UsageCards";
-import { RunHealthBadge } from "../components/RunHealthBadge";
-import { RunProgressCell, progressShowsStall } from "../components/RunProgressCell";
-import { WorkerStatLine, hasStats } from "../components/WorkerStats";
-import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
-import { WorkerRunBadge } from "../components/WorkerRunBadge";
+import { UsageCard } from "../components/UsageCards";
+import { OnboardingChecklist } from "../components/OnboardingChecklist";
+import { OverviewRunRow } from "../components/OverviewRunRow";
+import { WorkerLoadCard } from "../components/WorkerLoadCard";
 import { CustodyBoardAlert } from "../components/CustodyBoardAlert";
 import { HealthOverviewCard } from "../components/HealthOverviewCard";
 import { HealthPlatformLine } from "../components/HealthPlatformLine";
-import { usePollWhileVisible } from "../lib/usePollWhileVisible";
-import { Badge, Button, Card, cx, PageHeader, SectionTitle, Skeleton, StatTile, StatusPill } from "../components/ui";
-import { CheckIcon, ChevronRightIcon } from "../components/icons";
-import { stripUnsafeChars } from "../lib/safeText";
+import { activeRunBuckets, ownRecoveryWaitCount, setupComplete, workerJoined } from "../lib/overview";
+import { useOverviewData } from "../lib/useOverviewData";
+import { Card, PageHeader, SectionTitle, Skeleton, StatTile } from "../components/ui";
 import { useDemoMode } from "../lib/demoMode";
-import { maskName, maskRepoPath } from "../lib/demoMask";
-
-// Exhaustive over the wire status union; a new status needs an explicit bucket.
-const activeRunBuckets: Record<RunStatus, "running" | "needsYou" | "queued" | "waiting" | null> = {
-  running: "running",
-  awaiting_approval: "needsYou",
-  awaiting_input: "needsYou",
-  awaiting_followup: "needsYou",
-  queued: "queued",
-  claimed: "queued",
-  limit_wait: "waiting",
-  pool_wait: "waiting",
-  recovery_wait: "waiting",
-  paused: "waiting",
-  completed: null,
-  failed: null,
-  cancelled: null,
-};
-
-interface Overview {
-  runs: RunSummaryItem[];
-  // The full fleet drives both the online/total count and the per-worker load lines
-  // (PRD #49); the mount load and the 10s poll both already fetch it.
-  workers: Worker[];
-  workersOnline: number;
-  workersTotal: number;
-  reposEnabled: number;
-  templates: number;
-  hasToken: boolean;
-  hasForge: boolean;
-  // PRD #40: the caller's own usage (everyone) + the factory view (admins only).
-  // Best-effort: a usage fetch failure leaves these null and simply hides the cards,
-  // never blocking the rest of the dashboard.
-  selfUsage: SelfUsage | null;
-  adminUsage: AdminUsage | null;
-}
-
-function Step({
-  done,
-  index,
-  title,
-  hint,
-  to,
-  cta,
-}: {
-  done: boolean;
-  index: number;
-  title: string;
-  hint: string;
-  to: string;
-  cta: string;
-}) {
-  return (
-    <li className="flex items-center gap-3 py-2.5">
-      <span
-        className={cx(
-          "flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-xs",
-          done ? "bg-ok/15 text-ok" : "bg-raised text-faint",
-        )}
-      >
-        {done ? <CheckIcon /> : index}
-      </span>
-      <div className="min-w-0 flex-1">
-        <p className={cx("text-sm font-medium", done ? "text-muted line-through" : "text-fg")}>
-          {title}
-        </p>
-        {!done && <p className="text-xs text-faint">{hint}</p>}
-      </div>
-      {!done && (
-        <Link to={to}>
-          <Button variant="secondary" size="sm">
-            {cta} <ChevronRightIcon />
-          </Button>
-        </Link>
-      )}
-    </li>
-  );
-}
-
-// PRD #40: a browser preference only, never authoritative for usage or access.
-const USAGE_WINDOW_KEY = "uzi.usageWindow";
-
-function readUsageWindow(): UsageWindow {
-  try {
-    const stored = window.localStorage.getItem(USAGE_WINDOW_KEY);
-    return stored === "lifetime" ? "lifetime" : "last_7_days";
-  } catch {
-    return "last_7_days";
-  }
-}
+import { maskName } from "../lib/demoMask";
 
 export function Dashboard() {
   const demo = useDemoMode();
   const { user } = useAuth();
-  const [data, setData] = useState<Overview | null>(null);
-  const [usageWindow, setUsageWindow] = useState<UsageWindow>(readUsageWindow);
-  const changeUsageWindow = useCallback((value: UsageWindow) => {
-    setUsageWindow(value);
-    try {
-      window.localStorage.setItem(USAGE_WINDOW_KEY, value);
-    } catch {
-      // Storage restrictions must not prevent the current view from switching.
-    }
-  }, []);
-
-  // First load fetches everything — volatile tiles plus the rarely-changing
-  // fields the onboarding checklist reads. An error here keeps `data` null so the
-  // skeletons stay (skeletons only ever show pre-first-load); the background poll
-  // below never reaches this path.
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const [{ runs }, { workers }, { repos }, { templates }, { secrets }, { connections }, selfUsage, adminUsage] =
-          await Promise.all([
-            api.listRuns({ view: "summary" }),
-            api.listWorkers(),
-            api.listRepos(),
-            api.listAgentTemplates(),
-            api.listSecrets(),
-            api.listConnections(),
-            // Usage is best-effort (.catch → null) so it can never fail the core load,
-            // and the admin view is fetched ONLY for an admin — a non-admin never hits
-            // the admin-gated endpoint.
-            api.getUsage().catch(() => null),
-            user?.is_admin ? api.getAdminUsage().catch(() => null) : Promise.resolve(null),
-          ]);
-        if (cancelled) return;
-        setData({
-          runs,
-          workers,
-          workersOnline: workers.filter((w) => w.status === "online").length,
-          workersTotal: workers.length,
-          reposEnabled: repos.filter((r) => r.enabled).length,
-          templates: templates.length,
-          hasToken: hasAnthropicToken(secrets),
-          hasForge: connections.length > 0,
-          selfUsage,
-          adminUsage,
-        });
-      } catch {
-        if (!cancelled) setData(null);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-    // Deps list `user?.is_admin` (the value the effect branches on at the
-    // getAdminUsage call above), NOT the whole `user` object. ProtectedRoute renders
-    // this page only once auth has resolved to a non-null user, so is_admin holds its
-    // final value at mount. On the ordinary focus/vault-lock refresh path it does not
-    // flip: those replace the user object but re-read the same is_admin. React compares
-    // deps with Object.is per element, so listing the boolean means the effect re-runs
-    // ONLY if is_admin actually changes value — which on the normal path is never, so
-    // it still runs exactly once. (The one case it would change — an admin grant/revoke
-    // by another admin, then a refresh — correctly re-loads the dashboard rather than
-    // showing stale admin/non-admin data, so the fix is safe there too.) Listing the
-    // whole `user` object instead WOULD churn on every refresh; that is why it is the
-    // boolean, not the object. Resolved #200 (the M3 exhaustive-deps review).
-  }, [user?.is_admin]);
-
-  // Liveness: re-fetch only the volatile endpoints (runs, workers) every 10s while
-  // the tab is visible, so a run moving to awaiting_approval or a worker dropping
-  // offline shows without a reload. Repos/templates/secrets/connections change
-  // rarely and stay mount-only. A poll failure keeps the last-good data — unlike
-  // the first load, a transient re-poll error must NOT blank the page back to
-  // skeletons.
-  const pollAliveRef = useRef(false);
-  useEffect(() => {
-    pollAliveRef.current = true;
-    return () => { pollAliveRef.current = false; };
-  }, []);
-  const poll = useCallback(async () => {
-    try {
-      const [{ runs }, { workers }] = await Promise.all([api.listRuns({ view: "summary" }), api.listWorkers()]);
-      if (!pollAliveRef.current) return;
-      setData((prev) =>
-        prev
-          ? {
-              ...prev,
-              runs,
-              workers,
-              workersOnline: workers.filter((w) => w.status === "online").length,
-              workersTotal: workers.length,
-            }
-          : prev,
-      );
-    } catch {
-      // keep the last-good data
-    }
-  }, []);
-  usePollWhileVisible(poll, 10000);
-  // #2399: usage has its own cadence and failure handling. Each successful
-  // endpoint updates immediately; a failure retains only its own last-good data.
-  const pollUsage = useCallback(() => {
-    void api.getUsage().then((selfUsage) => {
-      setData((prev) => prev ? { ...prev, selfUsage } : prev);
-    }).catch(() => {});
-    if (user?.is_admin) {
-      void api.getAdminUsage().then((adminUsage) => {
-        setData((prev) => prev ? { ...prev, adminUsage } : prev);
-      }).catch(() => {});
-    }
-  }, [user?.is_admin]);
-  usePollWhileVisible(pollUsage, 30_000);
+  // The data loading and both polls live in useOverviewData, shared with the
+  // /overview/next preview. Dashboard asks for no admin runs, so it sends exactly the
+  // requests it always has.
+  const { data, usageWindow, changeUsageWindow } = useOverviewData();
   // PRD #1064 M3: a slow clock to age the board cards' "now" line client-side. Declared
   // with the other hooks, above the early return, so the hook order is stable.
   const now = useNow(30_000);
@@ -260,7 +48,7 @@ export function Dashboard() {
   // dashboard already polls — the count of the owner's runs currently self-healing in the
   // recovery_wait park. Surfaced in the custody alert for diagnosis (it explains why holds
   // may be accumulating); no backend field and no lifetime cap on the count.
-  const recoveryWaitCount = data?.runs.filter((r) => r.status === "recovery_wait").length ?? 0;
+  const recoveryWaitCount = ownRecoveryWaitCount(data?.runs ?? []);
   const activeHint = active.length
     ? [
         activeCounts.running ? `${activeCounts.running} running` : null,
@@ -270,24 +58,19 @@ export function Dashboard() {
       ].filter(Boolean).join(" · ")
     : "nothing in flight";
   const recent = data?.runs.slice(0, 5) ?? [];
-  // Step 4 is a SETUP fact, not live health: a worker counts as brought online if
-  // it is online now OR has ever registered (last_heartbeat_at is stamped at
-  // register/heartbeat and never cleared by the offline sweep), so a fleet mid-roll
-  // (every worker offline + upgrading) does not reopen the step. Live health stays
-  // on the "Workers online N/M" tile.
-  const workerJoined = (data?.workers ?? []).some(
-    (w) => w.status === "online" || w.last_heartbeat_at != null,
-  );
-  const steps = data
-    ? [data.hasToken, data.hasForge, data.reposEnabled > 0, workerJoined]
-    : [];
-  const ready = steps.length > 0 && steps.every(Boolean);
+  const joined = workerJoined(data?.workers ?? []);
+  const ready = data ? setupComplete(data, joined) : false;
 
   return (
     <div className="space-y-6">
       <PageHeader
         title={`Welcome${user.display_name ? `, ${maskName(user.display_name, demo)}` : ""}`}
         description="The factory floor at a glance."
+        actions={
+          <Link to="/overview/next" className="text-sm font-medium text-brand hover:text-brand-hover">
+            Try the new Overview
+          </Link>
+        }
       />
 
       {/* PRD #1349 M6 (D8): the conditional custody-pressure alert. Self-hides unless a hold
@@ -335,75 +118,15 @@ export function Dashboard() {
       {/* Per-worker resource load (PRD #49): a compact "cpu · mem" line per worker
           that has reported a sample, so the factory floor shows live pressure at a
           glance. Hidden until at least one worker reports (no empty card churn). */}
-      {data && data.workers.some(hasStats) && (
-        <Card>
-          <div className="flex items-center justify-between">
-            <SectionTitle>Worker load</SectionTitle>
-            <Link to="/workers" className="text-xs font-medium text-brand hover:text-brand-hover">
-              Workers →
-            </Link>
-          </div>
-          <ul className="mt-2 divide-y divide-edge">
-            {data.workers
-              .filter(hasStats)
-              .map((w) => (
-                <li key={w.id} className="flex items-center justify-between gap-3 py-2">
-                  <div className="flex min-w-0 items-center gap-2">
-                    <Badge tone={w.status === "online" ? "ok" : "neutral"} dot>
-                      {w.status}
-                    </Badge>
-                    <WorkerCordonBadge worker={w} />
-                    <WorkerRunBadge worker={w} hideIdleCrossChecks />
-                    <span className="truncate text-sm font-medium text-fg">{w.name}</span>
-                  </div>
-                  <WorkerStatLine worker={w} />
-                </li>
-              ))}
-          </ul>
-        </Card>
-      )}
+      {data && <WorkerLoadCard workers={data.workers} />}
 
       {data && !ready && (
-        <Card>
-          <div className="flex items-center justify-between">
-            <SectionTitle>Get the factory running</SectionTitle>
-            <span className="text-xs text-faint">{steps.filter(Boolean).length}/4 done</span>
-          </div>
-          <ol className="mt-2 divide-y divide-edge">
-            <Step
-              done={data.hasToken}
-              index={1}
-              title="Add your Anthropic token"
-              hint="Agents run on your own credentials; the token is encrypted at rest."
-              to="/settings"
-              cta="Settings"
-            />
-            <Step
-              done={data.hasForge}
-              index={2}
-              title="Connect your bot"
-              hint="A bot PAT lets uzi see and move your issues."
-              to="/settings/forge"
-              cta="Forge"
-            />
-            <Step
-              done={data.reposEnabled > 0}
-              index={3}
-              title="Enable a repo"
-              hint="Enabled repos get a kanban board of their uzi-labeled issues."
-              to="/repos"
-              cta="Repos"
-            />
-            <Step
-              done={workerJoined}
-              index={4}
-              title="Bring a worker online"
-              hint="Generate a join token and start the uzi-agent container with it."
-              to="/workers"
-              cta="Workers"
-            />
-          </ol>
-        </Card>
+        <OnboardingChecklist
+          hasToken={data.hasToken}
+          hasForge={data.hasForge}
+          reposEnabled={data.reposEnabled}
+          workerJoined={joined}
+        />
       )}
 
       {/* Factory usage is rendered only from the admin-gated response. */}
@@ -429,137 +152,9 @@ export function Dashboard() {
           </p>
         ) : (
           <ul className="mt-2 divide-y divide-edge">
-            {recent.map((r) => {
-              const mrState = mrChipState(r.mr_state);
-              // PRD #122: compact milestone progress; null for a non-milestone run.
-              // PRD #1064 M3: the badge gains a ◐ suffix while a milestone is in progress.
-              const ms = milestoneBadge(r);
-              const msBadge = ms
-                ? milestoneBadgeText(ms, (r.milestones_in_progress?.length ?? 0) > 0)
-                : null;
-              // PRD #1064 M3: the "now" line under the title uses current_activity from
-              // the RunSummaryItem. Hidden when null, terminal, or held; untrusted fields
-              // render escaped through stripUnsafeChars.
-              const activity = r.current_activity;
-              // Verified 2026-09-08: the API includes all non-terminal runs in its last
-              // tool-use lookup, so holds can retain stale activity. The four waiting
-              // states must not turn that history into a pulsing live-work indicator.
-              const showNow =
-                activity != null &&
-                !isAccountCooldownWaiting(r) &&
-                !isTerminalRun(r.status) &&
-                r.status !== "paused" &&
-                r.status !== "limit_wait" &&
-                r.status !== "pool_wait" &&
-                r.status !== "recovery_wait";
-              const nowMilestone = firstInProgressMilestoneId(r);
-              return (
-              // Issue #485 NB1: RunIssueRef renders a real forge <a>, which cannot nest
-              // inside the row's navigational <Link> (also an <a> — invalid HTML). The
-              // <li> is a `group relative` container, the run-details <Link> is a
-              // stretched absolute overlay, and the content row sits in normal flow with
-              // the interactive ref raised above the overlay (relative z-10). The
-              // row-hover tint lives on the content layer via group-hover so the
-              // transparent overlay never paints over the content.
-              <li key={r.id} className="group relative">
-                <Link
-                  to={`/runs/${r.id}`}
-                  // Issue #485 review FIX 2: name the link by the run's visible title so
-                  // multiple issue-less runs (all "Open run" otherwise) get distinct,
-                  // meaningful accessible names. issue_title is untrusted forge text, so it
-                  // stays sanitized (same stripUnsafeChars as the visible title).
-                  aria-label={`Open run${r.issue_iid != null ? ` for issue #${r.issue_iid}` : ""}${
-                    r.issue_title.trim() ? `: ${stripUnsafeChars(r.issue_title)}` : ""
-                  }`}
-                  className="absolute inset-0 rounded-md"
-                />
-                <div className="flex items-center gap-3 py-2.5 transition-colors group-hover:bg-raised/40">
-                  <div className="min-w-0 flex-1">
-                    {/* Issue #124: forge-supplied issue title, untrusted (see RunsList). */}
-                    <p className="truncate text-sm font-medium text-fg">{stripUnsafeChars(r.issue_title)}</p>
-                    {showNow && activity && (
-                      <p className="mt-0.5 flex items-center gap-1.5 text-xs text-faint">
-                        <span aria-hidden className="h-1.5 w-1.5 shrink-0 rounded-full bg-ok animate-pulse" />
-                        <span className="shrink-0 font-medium text-ok">{stripUnsafeChars(activity.agent)}</span>
-                        {nowMilestone && <span className="shrink-0 font-mono text-faint">{nowMilestone}</span>}
-                        <span className="min-w-0 truncate italic text-muted">
-                          {stripUnsafeChars(activity.agent_label || activity.detail || activity.tool)}
-                        </span>
-                        <span className="ml-auto shrink-0 whitespace-nowrap font-mono tabular-nums text-faint">
-                          {activityAge(activity.at, now)}
-                        </span>
-                      </p>
-                    )}
-                    <p className="flex flex-wrap items-center gap-x-1 text-xs text-faint">
-                      {/* PRD #1908: a repo-less job run shows only its kind chip. */}
-                      {r.repo_path && <>{maskRepoPath(r.repo_path, demo)}{" "}</>}
-                      <RunIssueRef
-                        issueIid={r.issue_iid}
-                        issueWebUrl={r.issue_web_url}
-                        kind={r.kind}
-                        forgeType={r.forge_type}
-                        raised
-                      />
-                      {r.mr_iid != null && (
-                        <MrChip
-                          variant="inline"
-                          label={`${mrAbbrev(r.forge_type)} `}
-                          forgeType={r.forge_type}
-                          mrIid={r.mr_iid}
-                          mrState={mrState}
-                          href={null}
-                          // Issue #485 review FIX 1: raised above the card overlay
-                          // (relative z-10) so its `title` (MR state) fires on hover.
-                          className="relative z-10 ml-2"
-                        />
-                      )}
-                    </p>
-                  </div>
-                  {/* Issue #485 review FIX 1: raise the right-side badge cluster above the
-                      card's stretched-link overlay (relative z-10) so each badge's native
-                      `title` tooltip fires on hover — the transparent overlay otherwise
-                      intercepts the pointer and carries no title. These status badges are
-                      not click-to-navigate targets, so the trade is correct; the title/body
-                      text stays under the overlay and still opens the run. The wrapper keeps
-                      the row's gap-3 spacing so the layout is unchanged. */}
-                  <div className="relative z-10 flex items-center gap-3">
-                    {r.iteration_count > 0 && (
-                      <Badge tone="neutral" title="implement ⇄ review iterations">
-                        iter {r.iteration_count}
-                      </Badge>
-                    )}
-                    {/* PRD #122: compact milestone progress next to the iter badge; a
-                        non-milestone run keeps only the iter badge. PRD #265 M2: an
-                        unreported tracker shows M–/N, not a 0/N that reads as failure. */}
-                    {msBadge && (
-                      <Badge tone="info" title={msBadge.title}>
-                        {msBadge.label}
-                      </Badge>
-                    )}
-                    {/* PRD #2602: the server-derived waiting/stalled flags;
-                        renders nothing for a pre-feature server or a terminal run. This
-                        cluster does not wrap, so below sm the flags yield their space to the
-                        truncating title (the M badge still carries the count there); the
-                        Runs list rows wrap and keep it at every width. */}
-                    <span className="hidden sm:contents">
-                      <RunProgressCell run={r} now={now} />
-                    </span>
-                    {/* A stalled cell already says so (with the health word in its
-                        tooltip), so the health badge yields to it from sm up and stays
-                        the only stall signal on phones, where the cell is hidden. */}
-                    {progressShowsStall(r) ? (
-                      <span className="contents sm:hidden">
-                        <RunHealthBadge run={r} nowMs={now} />
-                      </span>
-                    ) : (
-                      <RunHealthBadge run={r} nowMs={now} />
-                    )}
-                    <StatusPill health={r.health} status={effectiveRunStatus(r)} progress={r.progress} recovery_wait_cause={r.recovery_wait_cause} recovery_retry_not_before={r.recovery_retry_not_before} recovery_wait_phase={r.recovery_wait_phase} />
-                  </div>
-                </div>
-              </li>
-              );
-            })}
+            {recent.map((r) => (
+              <OverviewRunRow key={r.id} run={r} now={now} demo={demo} />
+            ))}
           </ul>
         )}
       </Card>

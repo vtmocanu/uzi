@@ -706,6 +706,22 @@ scenarios are mutually exclusive by construction. Known values:
   (`hold_reason: "weekly_reserve"`). Resuming one asks for the override
   confirmation and records `reserve_exempt_until`; cancelling a reserve pause
   request is refused with a 409. Board cards are not touched. (PRD #3522.)
+- `overview-next` — `/overview/next?mock=overview-next`, signed in as the
+  admin, seeds the Overview preview: the maintenance banner is on, the health
+  document carries one owner warning that raises the admin attention banner (and
+  a non-passing health chip), and three other users' runs join the admin
+  all-users list (one awaiting approval, one running, one in a usage-limit
+  wait). One of your own completed runs shares its open MR with `run-ci-halted`,
+  so the pull-request list has a duplicate to collapse. Your fleet gains seven
+  workers for the Capacity card (full, draining and upgrading, manually
+  cordoned, offline, no advertised slot cap and no stats), and four open
+  custody holds feed the Held work card, two of them needing a decision, so
+  Needs your decision carries one held-work row. Nothing is seeded outside the
+  scenario. (PRD #3878, PRD #3880.)
+- `overview-calm` — `/overview/next?mock=overview-calm`: you have active runs
+  but nothing waiting on a decision (no plan review, question, owner-action
+  park, open pull request or custody hold), so the decision card stays hidden.
+  (PRD #3878, PRD #3880.)
 
 ### What keeps the mock build current
 

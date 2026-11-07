@@ -107,7 +107,8 @@ import { FakePrDescApi } from "./fake-pr-desc-api.js";
 import { ResidueQuarantinedError, latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
 import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
 import { scanSignals } from "../src/signals.js";
-import { detectRepoAgents } from "../src/repoagents.js";
+import { detectRepoAgents, filterRepoAgentModel } from "../src/repoagents.js";
+import { parseCodexAgentFile } from "../src/repoagents-codex.js";
 import { buildReviewCommentsContext, REVIEWED_RESUME_APPROVAL_GUIDANCE, CLAUDE_LONG_COMMAND_APPEND, CODEX_LONG_COMMAND_APPEND, COMPLETION_CONTRACT_GUIDANCE, FOLLOW_UP_TRAILER, PR_SUMMARY_GUIDANCE, REPO_SUBAGENT_UNTRUSTED_APPEND, SUBAGENT_SAFETY_APPEND } from "../src/prompt.js";
 import { SEEDED_PLAN_RULES } from "../src/seeded-plan.js";
 
@@ -136,7 +137,11 @@ import { SupervisedChildExitTimeoutError } from "../src/codex/launcher.js";
 import { CommandDeadlineError } from "../src/codex/broker.js";
 import { CODEX_M3B_LOOPBACK_PROVIDER_NAME } from "../src/codex/config.js";
 import { renderCodexRun } from "../src/codex/render.js";
+import { CodexCatalogReporter, type CodexCatalogReportClient } from "../src/codex/catalog-report.js";
+import type { LeadConfigPostOutcome } from "../src/client.js";
+import type { CodexCatalogDefaultBody } from "../src/protocol.js";
 import { MAX_LEAD_FINAL_MESSAGE_LEN, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING } from "../src/plan-missing.js";
+import { REQUESTED_SOURCE_TABLE, NO_ROSTER_NOTE, caseLabel } from "./requested-agent-source-table.js";
 
 /** Issue #1718: every implement prompt now ends with the roster line; makeCtx has no agents. */
 const NO_SUBAGENTS_BLOCK = "\n\nNo subagents are available; do the work yourself.";
@@ -6478,6 +6483,8 @@ describe("CodexExecutor: #3247 catalog probe and effort_not_in_catalog policy", 
   async function run(opts: {
     effort?: string; model?: string; list: (c: ResponderCtx) => unknown; timeoutMs?: number;
     rejectTurn?: boolean; sessionId?: string; providerModel?: string; rejectResume?: boolean;
+    /** Issue #3251: attach a catalog reporter over this client (RunContext.codexCatalogReport). */
+    reporterClient?: CodexCatalogReportClient; onTurnStart?: () => void;
   }) {
     let emittedRef: { kind: string; payload: Record<string, unknown> }[] = [];
     const log: string[] = [];
@@ -6485,6 +6492,7 @@ describe("CodexExecutor: #3247 catalog probe and effort_not_in_catalog policy", 
       if (c.method === "model/list") { log.push("model/list"); return opts.list(c); }
       if (c.method === "turn/start") {
         log.push(`turn/start:notes=${emittedRef.filter((m) => m.payload.event === NOTE_EVENT).length}`);
+        opts.onTurnStart?.();
         return { turn: { id: "tn-1" } };
       }
       if (c.method === "thread/start") return { thread: { id: "th-1" } };
@@ -6504,6 +6512,11 @@ describe("CodexExecutor: #3247 catalog probe and effort_not_in_catalog policy", 
     const { ctx, emitted } = makeCtx({
       config: { ...(opts.effort !== undefined ? { default_effort: opts.effort as never } : {}), ...(opts.model ? { default_model: opts.model } : {}) },
       ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
+      ...(opts.reporterClient ? {
+        codexCatalogReport: new CodexCatalogReporter({
+          client: opts.reporterClient, runId: "run-1", claimGeneration: 7, catalogContext: CATALOG_CTX, logger: noopLog,
+        }),
+      } : {}),
     });
     emittedRef = emitted as never;
     const executor = makeExecutor({ ...rig, deps: { ...rig.deps, catalogProbeTimeoutMs: opts.timeoutMs ?? 10 } }, bindingOf(SUBSCRIPTION), noopLog, undefined,
@@ -6570,6 +6583,99 @@ describe("CodexExecutor: #3247 catalog probe and effort_not_in_catalog policy", 
     });
   }
 
+  // Issue #3251: the catalog default report.
+  const CATALOG_CTX = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+  class ReportStub implements CodexCatalogReportClient {
+    readonly posts: CodexCatalogDefaultBody[] = [];
+    outcome: LeadConfigPostOutcome | "throw" = { kind: "ok" };
+    async recordCodexCatalogDefault(_runId: string, body: CodexCatalogDefaultBody): Promise<LeadConfigPostOutcome> {
+      this.posts.push(body);
+      if (this.outcome === "throw") throw new Error("boom");
+      return this.outcome;
+    }
+  }
+  const settle = async () => { for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r)); };
+  const withDefault = (model: string, levels: string[], def: string | undefined) =>
+    ({ data: [{ id: model, model, supportedReasoningEfforts: levels.map(opt), ...(def !== undefined ? { defaultReasoningEffort: def } : {}) }] });
+
+  it("Runtime default with a reporter: the first turn/start does not wait for model/list, then one report is posted", async () => {
+    const reporterClient = new ReportStub();
+    let release!: (v: unknown) => void;
+    const reply = new Promise<unknown>((resolve) => { release = resolve; });
+    const { rig, notes, log, error } = await run({
+      reporterClient, timeoutMs: 60_000, list: () => reply,
+      onTurnStart: () => release(withDefault("gpt-6-astra", ["low", "medium"], "medium")),
+    });
+    assert.equal(error, undefined);
+    assert.deepEqual(log, ["model/list", "turn/start:notes=0"], "turn/start was sent while model/list was unanswered");
+    await settle();
+    assert.equal(notes.length, 0, "Runtime default never emits the note");
+    assert.equal(rig.transport.requests.filter((r) => r.method === "model/list").length, 1);
+    assert.equal(rec(rig.transport.requests.find((r) => r.method === "turn/start")!.params).effort, undefined);
+    assert.equal(reporterClient.posts.length, 1);
+    assert.equal(reporterClient.posts[0]!.default_effort, "medium");
+    assert.equal(reporterClient.posts[0]!.catalog_context, CATALOG_CTX);
+    assert.equal(reporterClient.posts[0]!.claim_generation, 7);
+  });
+
+  it("an explicit level absent from the catalog still emits the note and also reports the default", async () => {
+    const reporterClient = new ReportStub();
+    const { notes, log } = await run({
+      effort: "max", model: "example-model", reporterClient,
+      list: () => withDefault("example-model", ["low", "high"], "low"),
+    });
+    await settle();
+    assert.equal(notes.length, 1);
+    assert.deepEqual(log, ["model/list", "turn/start:notes=1"]);
+    assert.equal(reporterClient.posts.length, 1);
+    assert.equal(reporterClient.posts[0]!.default_effort, "low");
+    assert.equal(reporterClient.posts[0]!.model, "example-model");
+  });
+
+  it("an explicit listed level reports the default and emits no note", async () => {
+    const reporterClient = new ReportStub();
+    const { notes } = await run({ effort: "high", reporterClient, list: () => withDefault("gpt-6-astra", ["low", "high"], "high") });
+    await settle();
+    assert.equal(notes.length, 0);
+    assert.equal(reporterClient.posts.length, 1);
+    assert.equal(reporterClient.posts[0]!.default_effort, "high");
+  });
+
+  it("no reporter (no catalog context): a Runtime default claim sends no model/list and posts nothing", async () => {
+    const { rig } = await run({ list: () => { throw new Error("must not be called"); } });
+    assert.equal(rig.transport.requests.filter((r) => r.method === "model/list").length, 0);
+  });
+
+  it("a persistent default posts nothing, for both an explicit and a Runtime default claim", async () => {
+    for (const effort of [undefined, "high"]) {
+      const reporterClient = new ReportStub();
+      const { error } = await run({ effort, reporterClient, list: () => withDefault("gpt-6-astra", ["low", "high"], "persistent") });
+      await settle();
+      assert.equal(error, undefined);
+      assert.deepEqual(reporterClient.posts, []);
+    }
+  });
+
+  for (const [name, outcome] of [
+    ["404", { kind: "http", status: 404 }],
+    ["409", { kind: "http", status: 409 }],
+    ["a transport error", { kind: "transport", error: new Error("econnreset") }],
+    ["a throwing client", "throw"],
+  ] as const) {
+    it(`report outcome ${name} does not affect the run`, async () => {
+      for (const effort of [undefined, "high"]) {
+        const reporterClient = new ReportStub();
+        reporterClient.outcome = outcome;
+        const { rig, error } = await run({ effort, reporterClient, list: () => withDefault("gpt-6-astra", ["low", "high"], "low") });
+        await settle();
+        assert.equal(error, undefined);
+        assert.equal(reporterClient.posts.length, 1);
+        assert.equal(rig.transport.requests.filter((r) => r.method === "turn/start").length, 1);
+        assert.equal(rig.transport.requests.filter((r) => r.method === "model/list").length, 1);
+      }
+    });
+  }
+
   it("a recreated later epoch in the same run sends no second model/list", async () => {
     const rig = makeMultiEpochRig([
       epochResponder("th-1", "tn-1", (t, th, tn) => {
@@ -6586,6 +6692,41 @@ describe("CodexExecutor: #3247 catalog probe and effort_not_in_catalog policy", 
     const listed = rig.epochs.map((e) => e.transport.requests.filter((r) => r.method === "model/list").length);
     assert.deepEqual(listed, [1, 0]);
     assert.ok(rig.epochs[1]!.transport.requests.some((r) => r.method === "turn/start"));
+  });
+
+  it("a Runtime default with a reporter: a recreated later epoch sends no second model/list", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "checkpoint", {}, th, tn, "checkpoint")).push(turnCompleted("completed", th, tn));
+      }),
+      resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
+        t.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    rig.deps = { ...rig.deps, catalogProbeTimeoutMs: 10 };
+    const reporterClient = new ReportStub();
+    const { ctx } = makeCtx({
+      config: {}, checkpoint: async () => undefined,
+      codexCatalogReport: new CodexCatalogReporter({
+        client: reporterClient, runId: "run-1", claimGeneration: 7, catalogContext: CATALOG_CTX, logger: noopLog,
+      }),
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "two-epoch run");
+    assert.equal(rig.providerLaunches(), 2, "a second epoch was really built");
+    const listed = rig.epochs.map((e) => e.transport.requests.filter((r) => r.method === "model/list").length);
+    assert.deepEqual(listed, [1, 0]);
+    assert.ok(rig.epochs[1]!.transport.requests.some((r) => r.method === "turn/start"));
+  });
+
+  it("a Runtime default with a reporter: a resume rejection fallback probes at most once", async () => {
+    const reporterClient = new ReportStub();
+    const { rig, error } = await run({
+      reporterClient, list: () => withDefault("gpt-6-astra", ["high"], "high"), sessionId: "claimed-thread", rejectResume: true,
+    });
+    assert.equal(error, undefined);
+    assert.ok(rig.transport.requests.some((r) => r.method === "thread/resume"));
+    assert.equal(rig.transport.requests.filter((r) => r.method === "model/list").length, 1);
+    assert.equal(rig.transport.requests.filter((r) => r.method === "turn/start").length, 1);
   });
 
   it("a resume rejection fallback probes at most once and sends one root turn/start", async () => {
@@ -19122,6 +19263,35 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
     assert.equal(starts.length, 2, "root and selected child started");
     return rec(starts[1]!.params).model;
   };
+  it("TOML model pin reaches delegated Codex child", async () => {
+    for (const pin of ['model = "gpt-6-luna"', "", 'model = ""']) {
+      for (const override of [false, true]) {
+        const parsed = parseCodexAgentFile(
+          'name = "toml-child"\ndescription = "Works."\ndeveloper_instructions = "Implement."\n' + pin,
+          "file",
+        );
+        assert.equal(parsed.ok, true);
+        if (!parsed.ok) return;
+        const template = filterRepoAgentModel(parsed.template, "codex");
+        const { rig, admitted, result } = await preApproved({
+          repoAgents: [template], approvedSelection: { source: "repo", exclusions: [] },
+          config: { default_model: "gpt-6-astra", default_effort: "medium", override_subagent_model: override },
+        }, ["toml-child"]);
+        assert.deepEqual(admitted, { "toml-child": true });
+        assert.equal(result.branch, "agent/issue-42");
+        const expected = override || pin !== 'model = "gpt-6-luna"' ? "gpt-6-astra" : "gpt-6-luna";
+        assert.equal(childModel(rig.transport), expected);
+        const starts = rig.transport.requests.filter((r) => r.method === "thread/start");
+        assert.equal(rec(starts[0]!.params).model, "gpt-6-astra");
+        const childId = rec(rig.transport.requests.filter((r) => r.method === "turn/start")[1]!.params).threadId;
+        assert.equal(childId, "th-child-1");
+        const turns = rig.transport.requests.filter((r) => r.method === "turn/start");
+        assert.equal(rec(turns[1]!.params).effort, "medium");
+        assert.equal(rec(turns[0]!.params).effort, "medium");
+      }
+    }
+  });
+
   const renderedModels = (ctx: RunContext, source?: "own" | "repo") => {
     const rig = makeRig();
     const request = makeExecutor(rig, bindingOf(SUBSCRIPTION))["buildRunRequest"](
@@ -19282,6 +19452,56 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
     assert.equal(result.agentSelection?.source, "repo");
   });
 
+  it("PRD #3914: an absent approval at the gate follows the requested own source over a detected roster", async () => {
+    const { admitted, result } = await gated({ status: "absent" }, { repoAgents: [repoReviewer], requestedAgentSource: "own" }, ["coder", "repo-reviewer"]);
+    assert.deepEqual(admitted, { coder: true, "repo-reviewer": false });
+    assert.equal(result.agentSelection?.source, "own");
+  });
+
+  it("PRD #3914: an absent approval on a requested repo run keeps a saved own selection", async () => {
+    const own = await gated({ status: "absent" }, { repoAgents: [repoReviewer], requestedAgentSource: "repo",
+      approvedSelection: { source: "own", exclusions: [] } }, ["coder", "repo-reviewer"]);
+    assert.deepEqual(own.admitted, { coder: true, "repo-reviewer": false });
+    assert.equal(own.result.agentSelection?.source, "own");
+  });
+
+  it("PRD #3914: an absent approval on a requested repo run keeps a saved repo selection's exclusions", async () => {
+    const repo = await gated({ status: "absent" }, { repoAgents: [repoReviewer, repoTester], requestedAgentSource: "repo",
+      approvedSelection: { source: "repo", exclusions: ["repo-tester"] } }, ["repo-reviewer", "repo-tester"]);
+    assert.deepEqual(repo.admitted, { "repo-reviewer": true, "repo-tester": false });
+    assert.equal(repo.result.agentSelection?.source, "repo");
+  });
+
+  it("PRD #3914: a pre-approved run with no selection follows the requested source", async () => {
+    const own = await preApproved({ repoAgents: [repoReviewer], requestedAgentSource: "own" }, ["coder", "repo-reviewer"]);
+    assert.deepEqual(own.admitted, { coder: true, "repo-reviewer": false });
+    assert.deepEqual(own.result.agentSelection, { source: "own", agents: ["coder", "tester"] });
+    const repo = await preApproved({ repoAgents: [repoReviewer], requestedAgentSource: "repo" }, ["repo-reviewer", "coder"]);
+    assert.deepEqual(repo.admitted, { "repo-reviewer": true, coder: false });
+    assert.deepEqual(repo.result.agentSelection, { source: "repo", agents: ["repo-reviewer"] });
+  });
+
+  for (const c of REQUESTED_SOURCE_TABLE) {
+    it(`PRD #3914 shared call-site table, pre-approved: ${caseLabel(c)}`, async () => {
+      const { result, emitted } = await preApproved({ repoAgents: c.roster ? [repoReviewer] : [], requestedAgentSource: c.requested }, []);
+      assert.equal(result.agentSelection?.source, c.want);
+      assert.equal(statuses(emitted).includes(NO_ROSTER_NOTE), c.note);
+    });
+  }
+
+  it("PRD #3914: a requested repo source with no roster degrades to own with the no-roster note", async () => {
+    const { admitted, result, emitted } = await preApproved({ requestedAgentSource: "repo" }, ["coder"]);
+    assert.deepEqual(admitted, { coder: true });
+    assert.equal(result.agentSelection?.source, "own");
+    assert.ok(statuses(emitted).includes("this clone has no repo agent roster; using your own agent templates"));
+  });
+
+  it("PRD #3914: an explicit gate selection wins over the requested source", async () => {
+    const { admitted, result } = await gated(okSel("repo"), { repoAgents: [repoReviewer], requestedAgentSource: "own" }, ["repo-reviewer", "coder"]);
+    assert.deepEqual(admitted, { "repo-reviewer": true, coder: false });
+    assert.equal(result.agentSelection?.source, "repo");
+  });
+
   it("an invalid selection forces own and emits the malformed-selection note", async () => {
     const { admitted, emitted } = await gated({ status: "invalid" }, { repoAgents: [repoReviewer] }, ["coder", "repo-reviewer"]);
     assert.deepEqual(admitted, { coder: true, "repo-reviewer": false });
@@ -19325,7 +19545,7 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
       await fs.mkdir(path.join(clone, ".codex", "agents"), { recursive: true });
       await fs.writeFile(
         path.join(clone, ".codex", "agents", "t.toml"),
-        'name = "toml-agent"\ndescription = "From toml."\ndeveloper_instructions = "TOML BODY"\nmodel = "gpt-5"\n',
+        'name = "toml-agent"\ndescription = "From toml."\ndeveloper_instructions = "TOML BODY"\nmodel = "gpt-6-luna"\n',
       );
       const detected = await detectRepoAgents(clone, "codex");
       assert.deepEqual(detected.agents.map((a) => a.name), ["toml-agent"]);
@@ -24380,6 +24600,189 @@ describe("2833 Codex inline summaries", () => {
     });
   }
 
+  // Issue #3248 M3: a skipped Codex summary leaves one visible, fixed status note under exactly
+  // the guards of the post it replaces. The runner reports the reason through `onSkip`.
+  const skipReasons = ["refresh_denied", "vault_locked", "account_unavailable", "credential_rejected"] as const;
+  const skipSentence = {
+    refresh_denied: "the run's Codex credential needed a refresh, which summaries may not do.",
+    vault_locked: "the run owner's vault is locked.",
+    account_unavailable: "the run's Codex account is unavailable.",
+    credential_rejected: "the run's Codex credential could not be used.",
+  } as const;
+  const skipNotes = (emitted: { kind: string; payload?: unknown }[]) => emitted
+    .filter(m => m.kind === "status" && (m.payload as { event?: string }).event === "summary_skipped")
+    .map(m => m.payload);
+
+  for (const reason of skipReasons) {
+    it(`M3 Codex intent summary skipped (${reason}) emits one fixed note, posts nothing and leaves the outcome`, async () => {
+      const { rig, intents, plans } = summaryRig();
+      const { ctx, emitted } = makeCtx({ kind: "issue" });
+      const result = await makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, {
+        summaryRunner: {
+          generateIntentSummary: async (i: IntentSummaryInput) => { i.onSkip?.(reason); i.onSkip?.(reason); return null; },
+          generatePlanSummary: async () => null,
+        },
+      }).run(ctx);
+      assert.deepEqual(skipNotes(emitted), [{
+        text: `Intent summary skipped: ${skipSentence[reason]} The run continues.`,
+        event: "summary_skipped", pass: "intent", reason,
+      }]);
+      assert.deepEqual([intents, plans], [[], []], "no summary is posted");
+      assert.equal(result.summaryPlan, undefined);
+    });
+  }
+
+  for (const invalidation of ["fence", "cancel"] as const) {
+    it(`M3 Codex intent skip note is suppressed after ${invalidation}`, async () => {
+      const { rig, intents } = summaryRig();
+      let fenced = false, cancelled = false;
+      const { ctx, emitted } = makeCtx({ kind: "issue", claimFenced: () => fenced, cancelRequested: () => cancelled });
+      const executor = makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, {
+        summaryRunner: {
+          generateIntentSummary: async (i: IntentSummaryInput) => {
+            i.onSkip?.("vault_locked");
+            if (invalidation === "fence") fenced = true; else cancelled = true;
+            return null;
+          },
+          generatePlanSummary: async () => null,
+        },
+      });
+      await executor.run(ctx).catch(() => undefined);
+      assert.deepEqual(skipNotes(emitted), []);
+      assert.deepEqual(intents, []);
+    });
+  }
+
+  it("M3 Codex intent skip note is suppressed for a superseded generation", async () => {
+    const { rig, intents } = summaryRig();
+    const { ctx, emitted } = makeCtx({ kind: "issue" });
+    const executor = makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, {
+      summaryRunner: {
+        generateIntentSummary: async (i: IntentSummaryInput) => {
+          // A new leg replaces the intent flight (runLeg resets it); this flight is now stale.
+          (executor as unknown as { intentFlight: undefined }).intentFlight = undefined;
+          i.onSkip?.("vault_locked");
+          return null;
+        },
+        generatePlanSummary: async () => null,
+      },
+    });
+    await executor.run(ctx).catch(() => undefined);
+    assert.deepEqual(skipNotes(emitted), []);
+    assert.deepEqual(intents, []);
+  });
+
+  function skipPlanRig(plans: string[], gatePlan: NonNullable<RunContext["gatePlan"]>) {
+    const planResponder = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
+      t.push(toolCall(98, "submit_plan", { plan_md: "# Plan" }, th, tn, "plan")).push(turnCompleted("completed", th, tn)));
+    const rig = makeMultiEpochRig([planResponder, done]);
+    Object.assign(rig.client, { postIntentSummary: async () => {}, postPlanSummary: async (_id: string, p: { summary: string }) => { plans.push(p.summary); } });
+    return { rig, ...makeCtx({ kind: "issue", planApproved: false, approvedPlan: undefined, summaryIntentPresent: true, gatePlan }) };
+  }
+
+  for (const reason of skipReasons) {
+    it(`M3 Codex plan summary skipped (${reason}) emits one fixed note per generation, posts nothing and leaves the outcome`, async () => {
+      const posted: string[] = [];
+      let callbackDone: Promise<void> | undefined;
+      const { rig, ctx, emitted } = skipPlanRig(posted, async (md, _milestones, persisted) => {
+        callbackDone = persisted!(md); assert.equal(persisted!(md), callbackDone); await callbackDone; return approve;
+      });
+      const result = await makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, {
+        summaryRunner: {
+          generateIntentSummary: async () => null,
+          generatePlanSummary: async (i: PlanSummaryInput) => { i.onSkip?.(reason); i.onSkip?.(reason); return null; },
+        },
+      }).run(ctx);
+      assert.deepEqual(skipNotes(emitted), [{
+        text: `Plan summary skipped: ${skipSentence[reason]} The run continues.`,
+        event: "summary_skipped", pass: "plan", reason,
+      }]);
+      assert.deepEqual(posted, []);
+      assert.equal(result.summaryPlan, undefined);
+    });
+  }
+
+  for (const invalidation of ["live", "close", "fence", "cancel"] as const) {
+    it(`M3 Codex plan skip note after ${invalidation} ${invalidation === "live" ? "is emitted" : "is suppressed"}`, async () => {
+      const entered = m1Barrier(), generate = m1Barrier(), implementation = m1Barrier(), finish = m1Barrier();
+      let fenced = false, cancelled = false, callbackDone: Promise<void> | undefined;
+      const planResponder = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
+        t.push(toolCall(98, "submit_plan", { plan_md: "# Plan" }, th, tn, "plan")).push(turnCompleted("completed", th, tn)));
+      const implementResponder: Responder = c => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-impl" } };
+        if (c.method !== "turn/start") return {};
+        implementation.resolve();
+        void finish.promise.then(() => c.transport
+          .push(toolCall(99, "signal_done", {}, "th-impl", "tn-impl", "done"))
+          .push(turnCompleted("completed", "th-impl", "tn-impl")));
+        return { turn: { id: "tn-impl" } };
+      };
+      const rig = makeMultiEpochRig([planResponder, implementResponder]);
+      Object.assign(rig.client, { postIntentSummary: async () => {}, postPlanSummary: async () => {} });
+      const { ctx, emitted } = makeCtx({ kind: "issue", planApproved: false, approvedPlan: undefined, summaryIntentPresent: true,
+        claimFenced: () => fenced, cancelRequested: () => cancelled,
+        gatePlan: async (md, _milestones, persisted) => { callbackDone = persisted!(md); return approve; } });
+      const executor = makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, {
+        summarySettleMs: 1,
+        summaryRunner: {
+          generateIntentSummary: async () => null,
+          generatePlanSummary: async (i: PlanSummaryInput) => {
+            entered.resolve(); await generate.promise;
+            i.onSkip?.("account_unavailable");
+            return null;
+          },
+        },
+      });
+      const execution = executor.run(ctx);
+      try {
+        await Promise.all([entered.promise, implementation.promise]);
+        if (invalidation === "close") await executor.closeAndSettlePlanSummary(1);
+        if (invalidation === "fence") fenced = true;
+        if (invalidation === "cancel") cancelled = true;
+        generate.resolve();
+        await callbackDone;
+        assert.equal(skipNotes(emitted).length, invalidation === "live" ? 1 : 0);
+      } finally { generate.resolve(); finish.resolve(); }
+      if (invalidation === "cancel") await assert.rejects(execution, /run cancelled/); else await execution;
+    });
+  }
+
+  it("M3 Codex plan skip note is suppressed for a superseded generation and kept for its replacement", async () => {
+    const oldEntry = m1Barrier(), release = m1Barrier();
+    let calls = 0, oldDone: Promise<void> | undefined;
+    let gates = 0;
+    const gatePlan: NonNullable<RunContext["gatePlan"]> = async (md, _milestones, persisted) => {
+      if (++gates === 1) { oldDone = persisted!(md); await oldEntry.promise; return { kind: "revise", feedback: "Replace it" }; }
+      await persisted!(md); release.resolve(); await oldDone; return approve;
+    };
+    let plans = 0;
+    const planResponder: Responder = c => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" } };
+      if (c.method !== "turn/start") return {};
+      const tn = `tn-${++plans}`;
+      c.transport.push(toolCall(98 + plans, "submit_plan", { plan_md: plans === 1 ? "# Old" : "# Replacement" }, "th-plan", tn, tn))
+        .push(turnCompleted("completed", "th-plan", tn));
+      return { turn: { id: tn } };
+    };
+    const rig = makeMultiEpochRig([planResponder, done]);
+    Object.assign(rig.client, { postIntentSummary: async () => {}, postPlanSummary: async () => {} });
+    const { ctx, emitted } = makeCtx({ planApproved: false, approvedPlan: undefined, summaryIntentPresent: true, gatePlan });
+    await makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, {
+      summarySettleMs: 1,
+      summaryRunner: {
+        generateIntentSummary: async () => null,
+        generatePlanSummary: async (i: PlanSummaryInput) => {
+          calls++;
+          if (calls === 1) { oldEntry.resolve(); await release.promise; i.onSkip?.("vault_locked"); return null; }
+          i.onSkip?.("account_unavailable");
+          return null;
+        },
+      },
+    }).run(ctx);
+    assert.equal(calls, 2);
+    assert.deepEqual(skipNotes(emitted).map(n => (n as { reason: string }).reason), ["account_unavailable"]);
+  });
+
   for (const kind of ["issue", "self_improve", "prompt"] as const) {
     for (const present of [false, true]) it(`M1 Codex ${kind} intent and human plan summaries present=${present}`, async () => {
       const planResponder = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
@@ -24495,6 +24898,63 @@ describe("2833 Codex inline summaries", () => {
       assert.deepEqual(intents, ["Intent."]);
     });
   }
+  it("3248 a configured summary model reaches a revised plan gate; the superseded flight reports no usage", async () => {
+    const planResponder: Responder = c => {
+      if (c.method === "thread/start") return { thread: { id: "th-plan" } };
+      if (c.method === "turn/start") {
+        const tn = `tn-${c.turnStartCount}`;
+        if (c.turnStartCount === 1) c.transport.push(threadStarted("th-plan"));
+        c.transport.push(toolCall(c.turnStartCount, "submit_plan", { plan_md: `plan-${c.turnStartCount}` }, "th-plan", tn, tn))
+          .push(turnCompleted("completed", "th-plan", tn));
+        return { turn: { id: tn } };
+      }
+      return {};
+    };
+    const rig = makeMultiEpochRig([planResponder, done]);
+    Object.assign(rig.client, { postIntentSummary: async () => {}, postPlanSummary: async () => {} });
+    const requests: { model?: string; effort?: string; prompt: string }[] = [];
+    let releaseFirst!: () => void;
+    const firstHeld = new Promise<void>(r => { releaseFirst = r; });
+    const terminal = { outcome: "success", subtype: "success", errors: [], metrics: { cost: { kind: "unreported" } } };
+    const runner = new SummaryRunner(noopLog, {
+      homeRoot: path.resolve("../.uzi/scratch"), modelTimeoutMs: 5000,
+      codexAdviceHarnessFactory: (async () => ({ kind: "codex", run: async (request: import("../src/harness.js").AdviceRequest) => {
+        requests.push(request);
+        if (/Intent/.test(request.prompt) && !/plan-/.test(request.prompt)) {
+          return { text: "Intent.", end: { kind: "terminal", terminal } };
+        }
+        const first = /plan-1/.test(request.prompt);
+        if (first) await firstHeld;
+        request.usageObserver?.({ [request.model!]: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 } });
+        return { text: JSON.stringify({ summary: first ? "one" : "two", deltas: [] }), end: { kind: "terminal", terminal } };
+      } })) as unknown as import("../src/codex/codex-executor.js").CodexAdviceHarnessFactory,
+    });
+    let gates = 0;
+    let firstFlight: Promise<void> | undefined;
+    const { ctx, emitted } = makeCtx({
+      planApproved: false, approvedPlan: undefined, summaryModel: "gpt-6-astra",
+      gatePlan: async (md, _milestones, awaiting) => {
+        gates++;
+        if (gates === 1) {
+          firstFlight = awaiting!(md);
+          await waitForSummary(() => requests.some(r => /plan-1/.test(r.prompt)), "first plan request");
+          return { kind: "revise", feedback: "revise", inputId: 5 };
+        }
+        const second = awaiting!(md);
+        await waitForSummary(() => emitted.some(m => m.kind === "summary_usage"), "replacement usage");
+        releaseFirst();
+        await firstFlight; await second;
+        return approve;
+      },
+    });
+    await makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, { summaryRunner: runner }).run(ctx);
+    const planRequests = requests.filter(r => /plan-/.test(r.prompt));
+    assert.equal(planRequests.length, 2);
+    assert.deepEqual(planRequests.map(r => [r.model, r.effort]), [["gpt-6-astra", "low"], ["gpt-6-astra", "low"]]);
+    const usages = emitted.filter(m => m.kind === "summary_usage" && (m.payload as { pass?: string }).pass === "plan");
+    assert.equal(usages.length, 1, "only the replacement flight reports usage");
+    assert.deepEqual(Object.keys(usages[0]!.payload.model_usage as object), ["gpt-6-astra"]);
+  });
   for (const overrides of [{ summaryIntentPresent: true }, { kind: "job" }, { kind: "chat" }] as Partial<RunContext>[]) {
     it(`2833 skips resumed/nonissue intent ${JSON.stringify(overrides)}`, async () => {
       const { rig, intents } = summaryRig();

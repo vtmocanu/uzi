@@ -441,10 +441,10 @@ describe("terminal execution disk deferral", () => {
         assert.equal(f.calls(), 1);
         assert.equal(f.reclaims(), 1);
         assert.deepEqual(latest, [undefined, undefined, undefined], "no publish ACK means no latest-checkpoint claim");
-        assert.equal(api.states.filter((s) => s.body.status === "failed").length, 0, "cap ACK causes no extra failure report");
+        assert.equal(api.states.filter((s) => s.body.status === "failed").length, 0, "legacy terminal ACK causes no extra failure report");
         // issue #1786: a terminal ACK is reporting evidence, not a source proof. A verified capture that is
         // still covered at the exit uses normal cleanup; the unverified (degraded) one keeps its clone.
-        assert.equal(fs.existsSync(f.clone()), !verified, verified ? "server-terminal cap uses normal cleanup" : "an unverified capture keeps the clone");
+        assert.equal(fs.existsSync(f.clone()), !verified, verified ? "legacy terminal ACK uses normal cleanup" : "an unverified capture keeps the clone");
       } finally { client.reportState = report; }
     });
   }
@@ -472,7 +472,7 @@ describe("terminal execution disk deferral", () => {
       assert.equal(readGit(bare, "show", "refs/uzi-runner/agent/issue-2201:DIRTY.txt"), "dirty sentinel");
     });
   }
-  it("fresh generations exhaust the counted disk cap without replay or a second failure", { skip: LINUX_CAPTURE }, async () => {
+  it("fresh generations reach an owner-held disk park without replay or a failure", { skip: LINUX_CAPTURE }, async () => {
     const modelPaths: string[] = [];
     const parkedJournals: RecoveryJournalEntry[] = [];
     const readJournal = (): RecoveryJournalEntry => JSON.parse(readGit(git.barePathFor(fx.originPath),
@@ -527,10 +527,11 @@ describe("terminal execution disk deferral", () => {
       assert.equal(body.claim_generation, options.generation);
       assert.equal(body.recovery_cause, "data_volume_full");
       assert.notEqual(body.disk_park_preventive, true);
-      if (body.recovery_cause === "data_volume_full" && body.disk_park_preventive !== true) counted++;
-      const status = counted > 3 ? "failed" : "recovery_wait";
+      const held = counted >= 3;
+      if (!held) counted++;
+      const status = "recovery_wait";
       api.overrideStateStatus(id, status);
-      const ack = await report(id, body, signal);
+      const ack = { ...await report(id, body, signal), recoveryRetryNotBefore: held ? null : "2026-11-06T12:00:00Z" };
       api.setOwnershipStatus(id, status, options.generation);
       records.push({ body, ack });
       return ack;
@@ -548,10 +549,10 @@ describe("terminal execution disk deferral", () => {
         admissionChecks[leg]!();
         assert.equal(f.calls(), leg + 1);
         assert.equal(f.reclaims(), leg + 1);
-        assert.equal(counted, leg + 1);
+        assert.equal(counted, Math.min(leg + 1, 3));
         assert.equal(records.length, leg + 1);
         await new Promise((resolve) => setTimeout(resolve, 10));
-        assert.equal(f.calls(), leg + 1, "park/terminal ACK cannot replay the executor");
+        assert.equal(f.calls(), leg + 1, "park ACK cannot replay the executor");
         assert.equal(f.clone(), modelPaths[leg], "clone() names the latest executed attempt");
         const parked = readJournal();
         assert.equal(parked.runId, f.claim.run_id);
@@ -567,9 +568,11 @@ describe("terminal execution disk deferral", () => {
         for (const clonePath of modelPaths) assertCloneBytes(clonePath);
         if (leg < 3) assert.equal(fs.readFileSync(path.join(f.home, "session"), "utf8"), "transcript");
       }
-      assert.deepEqual(records.map((r) => r.ack.status), ["recovery_wait", "recovery_wait", "recovery_wait", "failed"]);
+      assert.deepEqual(records.map((r) => r.ack.status), ["recovery_wait", "recovery_wait", "recovery_wait", "recovery_wait"]);
       assert.deepEqual(records.map((r) => r.body.claim_generation), [4, 5, 6, 7]);
-      // Server origin stamping is proved by TestDiskParkCapFailsRunLiveDB, not this ACK model.
+      // Server scheduling and owner Resume are proved separately by LiveDB, not this ACK model.
+      assert.deepEqual(records.map(r => r.ack.recoveryRetryNotBefore),
+        ["2026-11-06T12:00:00Z", "2026-11-06T12:00:00Z", "2026-11-06T12:00:00Z", null]);
       assert.equal(api.states.filter((s) => s.body.status === "failed").length, 0, "no second generic failure report");
       assert.equal(f.forge.calls.length, 0, "no finalize/MR");
       // recoverRetainedClaim carries episode custody into each rejected successor;
@@ -580,14 +583,14 @@ describe("terminal execution disk deferral", () => {
       assert.equal(modelPaths.length, 4);
       assert.equal(new Set(modelPaths).size, 4);
       for (const clonePath of modelPaths) {
-        assert.equal(fs.existsSync(clonePath), true, "terminal ACK does not release retained episode custody");
+        assert.equal(fs.existsSync(clonePath), true, "owner-held ACK does not release retained episode custody");
         assertCloneBytes(clonePath);
       }
-      assert.deepEqual(readJournal(), parkedJournals[3], "terminal cleanup preserves the latest lineage journal");
+      assert.deepEqual(readJournal(), parkedJournals[3], "owner-held cleanup preserves the latest lineage journal");
       assert.ok(readGit(git.barePathFor(fx.originPath), "for-each-ref", "--format=%(refname)",
         `refs/uzi-recovery-episode/${f.claim.run_id}/`), "episode pins remain attributable");
       // executeClaim also preserves the shared HOME while retained episode custody remains.
-      assert.equal(fs.existsSync(f.home), true, "terminal cap ACK does not release the retained session");
+      assert.equal(fs.existsSync(f.home), true, "owner-held ACK does not release the retained session");
       assert.equal(fs.readFileSync(path.join(f.home, "session"), "utf8"), "transcript");
     } finally { client.reportState = report; }
   });

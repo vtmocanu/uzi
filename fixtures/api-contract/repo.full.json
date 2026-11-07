@@ -9,6 +9,7 @@
   "default_branch": "x",
   "enabled": true,
   "repo_skills_enabled": true,
+  "agent_source_default": "x",
   "repo_claudemd_enabled": true,
   "repo_devbox_opt_in": true,
   "repo_fold_improve_uzi_backlog": true,

@@ -26,6 +26,7 @@ var modelSettingLabels = map[[2]string]string{
 	{"effort", "user_default"}:    "your choice",
 	{"effort", "builtin"}:         "built-in",
 	{"effort", "runtime_default"}: "runtime default",
+	{"effort", "catalog_default"}: "catalog default",
 }
 
 // modelSettingSource labels a provenance token for a settings field. An unknown
@@ -63,7 +64,7 @@ func effortSettingRows(cells []apitypes.EffortSettingCellDTO) []settingRow {
 		case c.Mode == "runtime_default" && c.Harness == "claude":
 			resolved = "runtime default (value not reported)"
 		case c.Mode == "runtime_default":
-			resolved = "runtime default"
+			resolved = codexRuntimeDefaultResolved(c.CatalogDefault)
 		case c.ResolvedEffort != nil:
 			resolved = *c.ResolvedEffort
 		default:
@@ -76,6 +77,34 @@ func effortSettingRows(cells []apitypes.EffortSettingCellDTO) []settingRow {
 		})
 	}
 	return rows
+}
+
+// codexRuntimeDefaultResolved renders the codex Runtime default RESOLVED text (issue
+// #3251) with the catalog default the server reported. Every server string is passed
+// through crossCheckPlain; an absent or unrecognised catalog state reads unknown, and
+// a known/varies state without its value fields does too.
+func codexRuntimeDefaultResolved(cd *apitypes.CatalogDefaultDTO) string {
+	label := modelSettingSource("effort", "runtime_default")
+	catalog := modelSettingSource("effort", "catalog_default")
+	unknown := label + " (" + catalog + " unknown)"
+	if cd == nil || (cd.State != "known" && cd.State != "varies") ||
+		cd.Effort == nil || cd.Model == nil || cd.RuntimeVersion == nil {
+		return unknown
+	}
+	// PRD D13: Codex 0.164.0 sends every stored level as-is except ultra, which
+	// resolve_reasoning_effort replaces before the request.
+	effort := crossCheckPlain(*cd.Effort)
+	switch effort {
+	case "none":
+		effort = "none, no reasoning level requested"
+	case "ultra":
+		effort = "ultra, Codex substitutes another level"
+	}
+	out := label + " (" + catalog + ": " + effort + ", " + crossCheckPlain(*cd.Model) + ", Codex " + crossCheckPlain(*cd.RuntimeVersion) + ")"
+	if cd.State == "varies" {
+		out += " · may differ on workers still on another version"
+	}
+	return out
 }
 
 // settingRowStored renders the STORED column. Only an effort row holding exactly the
@@ -103,5 +132,6 @@ func settingRowsTable(rows []settingRow) [][]string {
 
 // settingsModelRows collects every setting family's rows for `uzi settings get`.
 func settingsModelRows(s apitypes.UserSettingsDTO) []settingRow {
-	return append(modelSettingRows("judge", s.JudgeModels), effortSettingRows(s.EffortSettings)...)
+	rows := append(modelSettingRows("judge", s.JudgeModels), modelSettingRows("summary", s.SummaryModels)...)
+	return append(rows, effortSettingRows(s.EffortSettings)...)
 }

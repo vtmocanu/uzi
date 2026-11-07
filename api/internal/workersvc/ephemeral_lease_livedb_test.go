@@ -143,7 +143,7 @@ func (e leaseEnv) seedBound(t *testing.T, status string, gen int64, interlocked 
 	               ephemeral_run_id, status, online_since, last_heartbeat_at, protocol_capabilities, snapshot_register_nonce, snapshot_epoch)
 	        VALUES ($1, $2, $3, $4, 'base', 'hosted', 'm', false, true, $5, 'online', now(), now(), $6, 'nonce-A', 0)`,
 		workerID, e.userID, "eph-"+workerID.String()[:8], workerID[:], runID,
-		[]string{capability.CompletionInterlockV1})
+		[]string{capability.CompletionInterlockV1, capability.RepoAgentSourceV1})
 	e.exec(`UPDATE runs SET worker_id = $2 WHERE id = $1`, runID, workerID)
 	return workerID, runID, iid
 }

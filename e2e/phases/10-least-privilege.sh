@@ -30,7 +30,7 @@ OVER_BODY="$RUNROOT/overpriv.json"
 OVER_CODE="$(curl -sS -b "$FRESHJAR" -o "$OVER_BODY" -w '%{http_code}' \
   -X POST "$BASE/api/forge/connections" -H 'Content-Type: application/json' \
   -H "X-CSRF-Token: $(awk '$6=="uzi_csrf"{print $7}' "$FRESHJAR")" \
-  -d "{\"base_url\":\"$FORGE_BASE\",\"token\":\"e2e-overprivileged-pat-000000\"}")"
+  -d "{\"forge_type\":\"gitlab\",\"base_url\":\"$FORGE_BASE\",\"token\":\"e2e-overprivileged-pat-000000\"}")"
 [ "$OVER_CODE" = 422 ] || fail "over-privileged connect: expected 422, got $OVER_CODE (body: $(cat "$OVER_BODY"))"
 jq -e '.violations | length > 0' "$OVER_BODY" >/dev/null 2>&1 \
   || fail "422 body missing a violations list: $(cat "$OVER_BODY")"

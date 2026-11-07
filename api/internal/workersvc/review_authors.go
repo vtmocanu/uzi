@@ -167,6 +167,13 @@ type ReviewAssessParams struct {
 	// by a concurrent assessor after that point has a larger sequence value and survives a keep
 	// set that could not have seen its comment. Zero prunes nothing.
 	QueueBound int64
+	// RecheckNotEligible ignores the stored not-eligible verdicts for this one assessment, so
+	// an author the cache holds as not eligible is asked again through the same lookup, queue,
+	// attempt cap and deadline as any other author (issue #3422). Only the owner's manual
+	// rework (POST /api/runs/{id}/rework) sets it: a reviewer who got access inside the TTL is
+	// then read at once. Automatic callers leave it false and keep the six-hour negative
+	// cache. It never deletes a verdict, and a new not-eligible answer is stored as usual.
+	RecheckNotEligible bool
 }
 
 type reviewClass int
@@ -294,16 +301,18 @@ func (a *ReviewAssessor) Begin(ctx context.Context, p ReviewAssessParams) (*Revi
 
 func (r *ReviewAssessment) begin(ctx context.Context) error {
 	a, p := r.assessor, r.p
-	fresh, err := a.Store.ListFreshNotEligibleAuthors(ctx, store.ListFreshNotEligibleAuthorsParams{
-		RepoID: p.RepoID,
-		Since:  pgtype.Timestamptz{Time: a.now().Add(-reviewVerdictTTL), Valid: true},
-	})
-	if err != nil {
-		return err
-	}
-	freshSet := make(map[int64]bool, len(fresh))
-	for _, id := range fresh {
-		freshSet[id] = true
+	freshSet := map[int64]bool{}
+	if !p.RecheckNotEligible {
+		fresh, err := a.Store.ListFreshNotEligibleAuthors(ctx, store.ListFreshNotEligibleAuthorsParams{
+			RepoID: p.RepoID,
+			Since:  pgtype.Timestamptz{Time: a.now().Add(-reviewVerdictTTL), Valid: true},
+		})
+		if err != nil {
+			return err
+		}
+		for _, id := range fresh {
+			freshSet[id] = true
+		}
 	}
 	for _, c := range r.kept {
 		id := c.AuthorForgeUserID

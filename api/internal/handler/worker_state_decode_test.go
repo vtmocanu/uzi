@@ -39,6 +39,7 @@ const workerStateFixtureDir = "../../../fixtures/worker-state-request"
 // after #1795 by design (TestWorkerStateDecodeMirrorInLockstep fails until they are mirrored
 // here), so it is not a frozen snapshot of the pre-#1795 struct.
 type stateRequestMinusGateRevision struct {
+	RegistrationEvidence        *workersvc.RegistrationEvidence    `json:"registration_evidence,omitempty"`
 	SourcePublication           *workersvc.SourcePublicationReport `json:"source_publication,omitempty"`
 	RegisterNonce               string                             `json:"register_nonce,omitempty"`
 	MemoryEpisode               *int64                             `json:"memory_episode,omitempty"`
@@ -72,6 +73,7 @@ type stateRequestMinusGateRevision struct {
 	ScopeCapped                 *bool                              `json:"scope_capped"`
 	BranchMoved                 *bool                              `json:"branch_moved"`
 	RepoAgents                  *[]workersvc.RepoAgent             `json:"repo_agents"`
+	RepoAgentSourceCommit       *string                            `json:"repo_agent_source_commit"`
 	PlanChangedFiles            *[]string                          `json:"plan_changed_files"`
 	Milestones                  *[]workersvc.Milestone             `json:"milestones"`
 	MilestonesCompleted         *[]string                          `json:"milestones_completed"`

@@ -253,6 +253,15 @@ type CodexActiveRunCooldown struct {
 	AccountCooldownEligibleAt pgtype.Timestamptz `json:"account_cooldown_eligible_at"`
 }
 
+type CodexCatalogDefault struct {
+	UserID         uuid.UUID          `json:"user_id"`
+	ContextID      string             `json:"context_id"`
+	Model          string             `json:"model"`
+	RuntimeVersion string             `json:"runtime_version"`
+	DefaultEffort  string             `json:"default_effort"`
+	ReportedAt     pgtype.Timestamptz `json:"reported_at"`
+}
+
 type CodexCredentialState struct {
 	UserSecretID      uuid.UUID          `json:"user_secret_id"`
 	UserID            uuid.UUID          `json:"user_id"`
@@ -1020,6 +1029,7 @@ type Repo struct {
 	CodeCrossCheckGuidance            pgtype.Text        `json:"code_cross_check_guidance"`
 	CrossCheckRepoInstructionsEnabled bool               `json:"cross_check_repo_instructions_enabled"`
 	IgnoredInferredCapabilities       []string           `json:"ignored_inferred_capabilities"`
+	AgentSourceDefault                pgtype.Text        `json:"agent_source_default"`
 }
 
 type RepoToolProfile struct {
@@ -1267,10 +1277,20 @@ type Run struct {
 	HarnessOtherHeld                 pgtype.Bool        `json:"harness_other_held"`
 	HarnessPreferredWeeklyResetAt    pgtype.Timestamptz `json:"harness_preferred_weekly_reset_at"`
 	HarnessOtherWeeklyResetAt        pgtype.Timestamptz `json:"harness_other_weekly_reset_at"`
+	RegistrationEvidenceGeneration   pgtype.Int8        `json:"registration_evidence_generation"`
+	RegistrationEvidenceNonce        pgtype.Text        `json:"registration_evidence_nonce"`
+	RegistrationEvidenceEpoch        pgtype.Int8        `json:"registration_evidence_epoch"`
+	SnapshotDepartedGeneration       pgtype.Int8        `json:"snapshot_departed_generation"`
+	SnapshotDepartedNonce            pgtype.Text        `json:"snapshot_departed_nonce"`
+	SnapshotDepartedEpoch            pgtype.Int8        `json:"snapshot_departed_epoch"`
 	PolicyRequiredHead               pgtype.Text        `json:"policy_required_head"`
 	PolicyRecoveryVerifiedGeneration pgtype.Int8        `json:"policy_recovery_verified_generation"`
 	PolicyRecoveryVerifiedHead       pgtype.Text        `json:"policy_recovery_verified_head"`
 	PolicyHoldCause                  pgtype.Text        `json:"policy_hold_cause"`
+	RepoAgentSourceCommit            pgtype.Text        `json:"repo_agent_source_commit"`
+	RepoAgentSourceRequired          bool               `json:"repo_agent_source_required"`
+	AgentSourceRequested             pgtype.Text        `json:"agent_source_requested"`
+	AgentSourceRequestedBasis        pgtype.Text        `json:"agent_source_requested_basis"`
 }
 
 type RunCompletionAttempt struct {
@@ -1787,6 +1807,7 @@ type User struct {
 	VaultSlotGeneration       int64              `json:"vault_slot_generation"`
 	CodexAccountMode          string             `json:"codex_account_mode"`
 	HarnessOverflowEnabled    bool               `json:"harness_overflow_enabled"`
+	CodexSummaryModel         pgtype.Text        `json:"codex_summary_model"`
 }
 
 type UserCrossCheckPin struct {

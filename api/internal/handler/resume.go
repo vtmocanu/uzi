@@ -77,12 +77,16 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusConflict, hint)
 			return
 		}
-		if !run.RecoveryWaitCause.Valid || (run.RecoveryWaitCause.String != "forge_unreachable" && run.RecoveryWaitCause.String != "worker_requeue_exhausted" && run.RecoveryWaitCause.String != "worker_memory_pressure" && run.RecoveryWaitCause.String != "retained_recovery_exhausted" && run.RecoveryWaitCause.String != "codex_idle_stall" && run.RecoveryWaitCause.String != "retained_recovery_adoption_failed") {
+		if !run.RecoveryWaitCause.Valid || (run.RecoveryWaitCause.String != "forge_unreachable" && run.RecoveryWaitCause.String != "data_volume_full" && run.RecoveryWaitCause.String != "worker_requeue_exhausted" && run.RecoveryWaitCause.String != "worker_memory_pressure" && run.RecoveryWaitCause.String != "retained_recovery_exhausted" && run.RecoveryWaitCause.String != "codex_idle_stall" && run.RecoveryWaitCause.String != "retained_recovery_adoption_failed" && run.RecoveryWaitCause.String != "retained_continuation_unwitnessed") {
 			httpx.Error(w, http.StatusConflict, fmt.Sprintf("run is %s", run.Status))
 			return
 		}
 		var resumeErr error
 		switch run.RecoveryWaitCause.String {
+		case "data_volume_full":
+			_, resumeErr = h.q.ResumeDataVolumeFullHold(r.Context(), store.ResumeDataVolumeFullHoldParams{
+				ID: runID, UserID: user.ID, GlobalTimeoutSeconds: int32(h.cfg.RunTimeout.Seconds()),
+			})
 		case "forge_unreachable":
 			if run.RecoveryWaitPhase.Valid {
 				// Issue #1324: a publication-phase hold has its own Resume, which also starts a new

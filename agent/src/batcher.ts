@@ -548,6 +548,14 @@ export class MessageBatcher {
     if (seq > this.pendingRangeLast) this.pendingRangeLast = seq;
   }
 
+  /** Whether a candidate transport reservation is installed. A cancelled (failed) reservation stays
+   * installed for the batcher's lifetime: releaseReservation refuses it, and close()/trip() never
+   * clear it. A credential-switch hold opened around a reservation therefore stays open for the
+   * rest of the flight. Read-only. */
+  hasCandidateReservation(): boolean {
+    return this.reservation !== undefined;
+  }
+
   /** Synchronously stop sequence assignment before a candidate submission.
    * Preparation owns no service loop. Its deadline bounds requests; one failed
    * ACK ends the attempt and retains the reservation and original replay.

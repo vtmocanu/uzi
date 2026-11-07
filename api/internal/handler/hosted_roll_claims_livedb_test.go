@@ -52,7 +52,7 @@ func TestHostedRollRetainedClaimsLiveDB(t *testing.T) {
 		if i == 0 {
 			mustExecT(ctx, t, f.pool, `UPDATE workers SET token_hash=$2 WHERE id=$1`, id, hash)
 		} else {
-			mustExecT(ctx, t, f.pool, `INSERT INTO workers (id,user_id,name,token_hash,status) VALUES ($1,$2,'fleet-old',$3,'online')`, id, f.owner, hash)
+			mustExecT(ctx, t, f.pool, `INSERT INTO workers (id,user_id,name,token_hash,status,protocol_capabilities) VALUES ($1,$2,'fleet-old',$3,'online','{repo_agent_source_v1}')`, id, f.owner, hash)
 		}
 		mustExecT(ctx, t, f.pool, `UPDATE workers SET kind='hosted',hosted_size='m',template_declared='base',draining_since=now(),draining_reason=NULL WHERE id=$1`, id)
 		members = append(members, member{id.String(), uuid.NewString()})
@@ -216,7 +216,7 @@ func TestHostedRollRetainedClaimsLiveDB(t *testing.T) {
 		t.Fatalf("build controller child: %v\n%s", err, out)
 	}
 	for _, m := range members {
-		raw, status, err := call(base, "/api/worker/register", keys[m.ID], map[string]any{"name": "uzi-pod:" + m.UID, "version": "0.1.0", "template": "base"})
+		raw, status, err := call(base, "/api/worker/register", keys[m.ID], map[string]any{"name": "uzi-pod:" + m.UID, "version": "0.1.0", "template": "base", "protocol_capabilities": []string{"repo_agent_source_v1"}})
 		if err != nil || status != 200 {
 			t.Fatalf("register status=%d transport=%v", status, err)
 		}

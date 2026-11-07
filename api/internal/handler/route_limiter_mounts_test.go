@@ -219,6 +219,7 @@ var limiterNames = [...]string{
 // the table had 388 rows after it. PRD #3244 M3 added GET /api/runs/{id}/lead-config (noLimiter, an
 // owner-or-admin read like /review), making it 389 rows. Issue #3811 adds the two owner-only
 // cross-check history reads, making it 391 rows. The earlier history figures above were not re-tallied.
+// Issue #3251 adds POST /api/worker/runs/{id}/codex-catalog-default (noLimiter, like lead-config).
 // THIS SENTENCE IS DOWNSTREAM OF ANY NEW ROUTE — see the note above wantRouteMounts for
 // which lines a mount-adder owns.
 //
@@ -883,6 +884,7 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/pause", noLimiter},
 	// issue #3194: the base-attestation HOLD report, fenced server-side like the wall park above.
 	{"POST", "/api/worker/runs/{id}/base-attestation-hold", noLimiter},
+	{"POST", "/api/worker/runs/{id}/repo-agent-source-hold", noLimiter},
 	// PRD #333 M2: the incidental-findings capture route. It rides
 	// proposalLimiter.PerWorkerMiddleware (a per-WORKER, IP-fallback mount), which this
 	// per-USER probe reads as noLimiter — same as the proposals route below it.
@@ -923,6 +925,7 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/memory", noLimiter},
 	{"POST", "/api/worker/runs/{id}/decisions-memo", noLimiter},
 	{"POST", "/api/worker/runs/{id}/lead-config", noLimiter},
+	{"POST", "/api/worker/runs/{id}/codex-catalog-default", noLimiter},
 	{"POST", "/api/worker/runs/{id}/messages", noLimiter},
 	{"POST", "/api/worker/runs/{id}/usage", noLimiter},
 	{"POST", "/api/worker/runs/{id}/proposals", noLimiter},

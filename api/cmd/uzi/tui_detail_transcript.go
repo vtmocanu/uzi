@@ -438,6 +438,12 @@ func resultIsError(payload json.RawMessage) bool {
 // transcriptBudgetWithoutCard shares the existing chrome accounting with the card.
 // It excludes the pane title, and deliberately has no minimum floor.
 func (m tuiModel) transcriptBudgetWithoutCard() int {
+	return m.transcriptBudgetWithoutDiskGuidance() - len(m.diskHoldDetailLines())
+}
+
+// transcriptBudgetWithoutDiskGuidance counts the existing chrome without the disk
+// guidance or question card. It is pure and does not call either layout builder.
+func (m tuiModel) transcriptBudgetWithoutDiskGuidance() int {
 	lineCount := func(s string) int {
 		if s == "" {
 			return 0

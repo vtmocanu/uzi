@@ -668,10 +668,14 @@ WHERE status = 'online'
 -- query's own "name every column" convention so an unstamped path is visible in a diff
 -- of THIS file, and guarded by a per-path test rather than the compiler (the narg trap
 -- above applies identically).
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, issue_saved_body, issue_raw_digest, issue_input_reason, auto_approve_blocked_reasons, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, completion_contract_version, harness, credential_override_mode, credential_override_secret_id, plan_cross_check_required, plan_cross_check_gated, code_cross_check_required)
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, issue_saved_body, issue_raw_digest, issue_input_reason, auto_approve_blocked_reasons, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, completion_contract_version, harness, credential_override_mode, credential_override_secret_id, plan_cross_check_required, plan_cross_check_gated, code_cross_check_required, repo_agent_source_required, agent_source_requested, agent_source_requested_basis)
 VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('issue_saved_body'), sqlc.narg('issue_raw_digest'), sqlc.narg('issue_input_reason'), COALESCE(sqlc.narg('auto_approve_blocked_reasons')::text[], '{}'), sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), COALESCE((SELECT rp.ignored_inferred_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source, sqlc.narg('completion_contract_version'), @harness, sqlc.narg('credential_override_mode'), sqlc.narg('credential_override_secret_id'),
     (@auto_approve AND @plan_source <> 'seeded' AND COALESCE(sqlc.narg('captured_plan_cross_check')::boolean, (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id))),
-    (NOT @auto_approve AND @plan_source <> 'seeded' AND COALESCE(sqlc.narg('captured_plan_cross_check')::boolean, (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id))), COALESCE(sqlc.narg('captured_code_cross_check')::boolean, (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id)))
+    (NOT @auto_approve AND @plan_source <> 'seeded' AND COALESCE(sqlc.narg('captured_plan_cross_check')::boolean, (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id))), COALESCE(sqlc.narg('captured_code_cross_check')::boolean, (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id)), true,
+    COALESCE(sqlc.narg('agent_source_requested')::text, (SELECT rp.agent_source_default FROM repos rp WHERE rp.id = @repo_id::uuid)),
+    CASE WHEN sqlc.narg('agent_source_requested')::text IS NOT NULL THEN 'explicit'
+         WHEN (SELECT rp.agent_source_default FROM repos rp WHERE rp.id = @repo_id::uuid) IS NOT NULL THEN 'repo_default'
+    END)
 RETURNING *;
 
 -- name: GetRunByIDForUser :one
@@ -1196,7 +1200,9 @@ WITH checker_template_pins AS MATERIALIZED (
       -- is below @custody_hold_limit (and at least one). Without the bound a claimed run that never
       -- reports running is swept back to queued by SweepClaimedNeverStarted (no requeue_count
       -- bump, no hold release), reclaims under the exemption, opens another generation hold,
-      -- and loops forever; the owner cap used to stop that loop. Once a single run holds
+      -- and loops forever; the owner cap used to stop that loop. Issue #3859 charges a
+      -- WITNESSED departure of such a continuation (SweepClaimedNeverStartedCohort), so this
+      -- bound remains the backstop for unwitnessed ones (e.g. older agents). Once a single run holds
       -- @custody_hold_limit open holds of its own, it faces the owner cap like new work. The
       -- same exemption expression is mirrored by GetCustodyAdmissionForRun (health reason) and
       -- GetCustodyAggregateForOwner.blocked_runs, so the pill, the aggregate and the claim
@@ -1290,6 +1296,8 @@ WITH checker_template_pins AS MATERIALIZED (
       -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
       -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
       AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(@worker_protocol_caps::text[]))
+      AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(@worker_protocol_caps::text[]))
+      AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(@worker_protocol_caps::text[]))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL)) OR 'provider_policy_hold_v1' = ANY(@worker_protocol_caps::text[]))
       AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(@worker_protocol_caps::text[]))
       -- PRD #1332 M5A (D3): the NON-BYPASSABLE Codex-harness claim clause, MIRRORING the
@@ -1570,6 +1578,8 @@ WITH checker_template_pins AS MATERIALIZED (
                 -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
                 -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
                 AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(p.protocol_capabilities))
+                AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(p.protocol_capabilities))
+                AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(p.protocol_capabilities))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL)) OR 'provider_policy_hold_v1' = ANY(p.protocol_capabilities))
                 AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(p.protocol_capabilities))
                 -- PRD #1332 M5A (D3): MIRROR the non-bypassable Codex-harness clause for the peer, or
@@ -2310,6 +2320,7 @@ UPDATE runs SET
     iteration_count  = GREATEST(iteration_count, @iteration_count),
     session_id       = COALESCE(sqlc.narg('session_id'), session_id),
     repo_agents      = COALESCE(sqlc.narg('repo_agents')::jsonb, repo_agents),
+    repo_agent_source_commit = COALESCE(repo_agent_source_commit, sqlc.narg('repo_agent_source_commit')::text),
     agent_source     = COALESCE(sqlc.narg('agent_source'), agent_source),
     agent_exclusions = COALESCE(sqlc.narg('agent_exclusions')::jsonb, agent_exclusions),
     -- PRD #84 M4: persist the plan-time INFERRED requirement set an AUTOPILOT run emits
@@ -2462,7 +2473,8 @@ UPDATE runs SET
                THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int)
                ELSE 0 END,
     updated_at       = now()
-WHERE runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'data_volume_full' AND recovery_retry_not_before IS NULL)
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND runs.id = @id AND worker_id = @worker_id
   -- Semantic freeze has no structural fallback when cross-check is disabled.
@@ -2892,7 +2904,8 @@ UPDATE runs SET
     -- this transition's fresh status_since; health_notified_at is preserved.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'data_volume_full' AND recovery_retry_not_before IS NULL)
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND runs.id = @id AND worker_id = @worker_id
   -- Resume can retain worker affinity while fencing the old invocation. A late
@@ -3599,6 +3612,47 @@ WHERE id = @id AND user_id = @user_id AND status = 'recovery_wait'
           - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
 RETURNING *;
 
+-- name: HoldRunDataVolumeFull :one
+-- The exhausted finite disk allowance holds for an explicit owner Resume.
+-- Preserve lifetime counts, custody, worker/session affinity and claim posture.
+-- The service holds the exact-generation run lock before this write.
+UPDATE runs SET
+    status = 'recovery_wait', status_since = now(),
+    recovery_wait_cause = 'data_volume_full', recovery_retry_not_before = NULL,
+    recovery_wait_count = recovery_wait_count + 1,
+    session_id = COALESCE(sqlc.narg('session_id'), session_id),
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE id = @id AND worker_id = @worker_id
+  AND status = 'running' AND claim_generation = @claim_generation::bigint
+  AND claim_released_at IS NULL AND COALESCE(stop_kind, '') = ''
+  AND kind NOT IN ('judge', 'job', 'cross_check')
+RETURNING *;
+
+-- name: ResumeDataVolumeFullHold :one
+-- One ordinary queued attempt, without a new allowance, grant or episode.
+-- Custody and all recovery allowances survive Resume.
+-- Preserve started_at and bank the hold only after execution started, as in ResumeWorkerRecoveryEpisode.
+UPDATE runs SET
+    status = 'queued', status_since = now(),
+    recovery_wait_cause = NULL, recovery_retry_not_before = NULL,
+    budget_paused_seconds = runs.budget_paused_seconds
+        + CASE WHEN runs.started_at IS NOT NULL
+               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int)
+               ELSE 0 END,
+    claim_released_at = now(),
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE id = @id AND user_id = @user_id AND status = 'recovery_wait'
+  AND recovery_wait_cause = 'data_volume_full' AND recovery_retry_not_before IS NULL
+  AND recovery_wait_phase IS NULL
+  AND COALESCE(stop_kind, '') = ''
+  AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL
+       OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
+          - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
+RETURNING *;
+
 -- name: ParkRunDataVolumeFull :one
 -- PRD #1809 M5 (D6): the DATA-VOLUME-FULL park writer, the typed sibling of
 -- ParkRunForgeUnreachable — same 'recovery_wait' transition, same backoff-shaping
@@ -3783,6 +3837,7 @@ WITH candidates AS MATERIALIZED (
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_continuation_unwitnessed'
   AND runs.recovery_retry_not_before <= @now
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
@@ -3836,6 +3891,7 @@ WHERE runs.status = 'recovery_wait' AND runs.recovery_wait_cause IS DISTINCT FRO
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_continuation_unwitnessed'
   AND runs.recovery_retry_not_before <= @now
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
   AND (runs.kind <> 'cross_check' OR EXISTS (
@@ -3889,10 +3945,12 @@ WITH candidates AS MATERIALIZED (
   AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND (runs.recovery_wait_cause IS DISTINCT FROM 'codex_idle_stall' OR runs.recovery_retry_not_before IS NOT NULL)
   AND (runs.recovery_wait_cause IS DISTINCT FROM 'forge_unreachable' OR runs.recovery_retry_not_before IS NOT NULL)
+  AND (runs.recovery_wait_cause IS DISTINCT FROM 'data_volume_full' OR runs.recovery_retry_not_before IS NOT NULL)
   AND runs.recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_continuation_unwitnessed'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_exhausted'
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
@@ -3948,10 +4006,12 @@ WHERE runs.id = @id AND runs.user_id = @user_id AND runs.status = 'recovery_wait
   AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND (runs.recovery_wait_cause IS DISTINCT FROM 'codex_idle_stall' OR runs.recovery_retry_not_before IS NOT NULL)
   AND (runs.recovery_wait_cause IS DISTINCT FROM 'forge_unreachable' OR runs.recovery_retry_not_before IS NOT NULL)
+  AND (runs.recovery_wait_cause IS DISTINCT FROM 'data_volume_full' OR runs.recovery_retry_not_before IS NOT NULL)
   AND runs.recovery_wait_cause IS DISTINCT FROM 'codex_account_unavailable'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_continuation_unwitnessed'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_exhausted'
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
   AND (runs.kind <> 'cross_check' OR EXISTS (
@@ -4757,7 +4817,8 @@ UPDATE runs SET
     session_id       = COALESCE(sqlc.narg('session_id'), session_id),
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE hold_reason IS DISTINCT FROM 'codex_policy_hold'
+WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'data_volume_full' AND recovery_retry_not_before IS NULL)
+  AND hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (policy_outcome_id IS NULL OR policy_resolved_at IS NOT NULL)
   AND id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_generation > 0)
   AND NOT (status = 'paused' AND COALESCE(hold_reason = 'iteration_budget_exhausted', FALSE))
@@ -4877,7 +4938,8 @@ UPDATE runs SET
          WHERE run_user_inputs.run_id = @id AND kind = 'follow_up' AND applied_at IS NOT NULL))),
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE hold_reason IS DISTINCT FROM 'codex_policy_hold'
+WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'data_volume_full' AND recovery_retry_not_before IS NULL)
+  AND hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (policy_outcome_id IS NULL OR policy_resolved_at IS NOT NULL)
   AND id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_generation > 0)
   AND NOT (status = 'paused' AND COALESCE(hold_reason = 'iteration_budget_exhausted', FALSE))
@@ -4998,7 +5060,8 @@ UPDATE runs SET
     -- #3607 M2a: a terminal run carries no required-recovery identity.
     policy_required_head = NULL, policy_recovery_verified_generation = NULL, policy_recovery_verified_head = NULL,
     updated_at         = now()
-WHERE runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'data_volume_full' AND recovery_retry_not_before IS NULL)
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
   AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason = 'iteration_budget_exhausted', FALSE))
@@ -5092,7 +5155,8 @@ UPDATE runs SET
     -- #3607 M2a: a terminal run carries no required-recovery identity.
     policy_required_head = NULL, policy_recovery_verified_generation = NULL, policy_recovery_verified_head = NULL,
     updated_at         = now()
-WHERE hold_reason IS DISTINCT FROM 'codex_policy_hold'
+WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM 'data_volume_full' AND recovery_retry_not_before IS NULL)
+  AND hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (policy_outcome_id IS NULL OR policy_resolved_at IS NOT NULL)
   AND id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_generation > 0)
   AND NOT (status = 'paused' AND COALESCE(hold_reason = 'iteration_budget_exhausted', FALSE))
@@ -5798,6 +5862,33 @@ WITH candidates AS MATERIALIZED (
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w
                            WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+  -- Issue #3859: a charge-eligible continuation is the charge pass's, never an uncharged reset;
+  -- and a continuation still inside the bounded witness window with presence under the worker's
+  -- current registration is DEFERRED. COALESCE makes a NULL witness never exclude (a NULL
+  -- departure stamp would otherwise turn the exclusion NULL and strand the run). A NULL
+  -- @witness_cutoff disables the deferral. A pending server-stamped stop (stop_kind set) is in
+  -- neither exclusion: the charge and unwitnessed-park arms skip it, so it keeps this uncharged
+  -- reset and the reclaimed flight observes the stop.
+  AND NOT COALESCE((runs.kind <> 'cross_check'
+      AND COALESCE(runs.stop_kind, '') = ''
+      AND runs.claim_released_at IS NULL
+      AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+      AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
+      AND EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.state = 'open' AND h.generation < runs.claim_generation)
+      AND runs.snapshot_departed_generation = runs.claim_generation
+      AND EXISTS (SELECT 1 FROM workers w WHERE w.id = runs.worker_id AND w.snapshot_register_nonce IS NOT NULL AND runs.snapshot_departed_nonce = w.snapshot_register_nonce AND runs.snapshot_departed_epoch <= w.snapshot_epoch)
+      AND NOT EXISTS (SELECT 1 FROM worker_active_runs a WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.claim_generation = runs.claim_generation)), false)
+  AND NOT COALESCE((runs.kind <> 'cross_check'
+      AND COALESCE(runs.stop_kind, '') = ''
+      AND runs.claim_released_at IS NULL
+      AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+      AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
+      AND EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.state = 'open' AND h.generation < runs.claim_generation)
+      AND runs.snapshot_departed_generation IS DISTINCT FROM runs.claim_generation
+      AND EXISTS (SELECT 1 FROM workers w WHERE w.id = runs.worker_id AND w.status = 'online'
+                  AND ((runs.registration_evidence_generation = runs.claim_generation AND runs.registration_evidence_nonce = w.snapshot_register_nonce AND runs.registration_evidence_epoch >= w.snapshot_epoch)
+                       OR EXISTS (SELECT 1 FROM worker_active_runs a WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.claim_generation = runs.claim_generation AND NOT a.terminal_pending)))
+      AND runs.claimed_at >= @witness_cutoff::timestamptz), false)
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
     FROM candidates
@@ -5876,6 +5967,27 @@ WHERE runs.status = 'claimed' AND runs.claimed_at < @cutoff
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w
                            WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+  -- Issue #3859: the same two exclusions, rechecked against the locked row.
+  AND NOT COALESCE((runs.kind <> 'cross_check'
+      AND COALESCE(runs.stop_kind, '') = ''
+      AND runs.claim_released_at IS NULL
+      AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+      AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
+      AND EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.state = 'open' AND h.generation < runs.claim_generation)
+      AND runs.snapshot_departed_generation = runs.claim_generation
+      AND EXISTS (SELECT 1 FROM workers w WHERE w.id = runs.worker_id AND w.snapshot_register_nonce IS NOT NULL AND runs.snapshot_departed_nonce = w.snapshot_register_nonce AND runs.snapshot_departed_epoch <= w.snapshot_epoch)
+      AND NOT EXISTS (SELECT 1 FROM worker_active_runs a WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.claim_generation = runs.claim_generation)), false)
+  AND NOT COALESCE((runs.kind <> 'cross_check'
+      AND COALESCE(runs.stop_kind, '') = ''
+      AND runs.claim_released_at IS NULL
+      AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+      AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
+      AND EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.state = 'open' AND h.generation < runs.claim_generation)
+      AND runs.snapshot_departed_generation IS DISTINCT FROM runs.claim_generation
+      AND EXISTS (SELECT 1 FROM workers w WHERE w.id = runs.worker_id AND w.status = 'online'
+                  AND ((runs.registration_evidence_generation = runs.claim_generation AND runs.registration_evidence_nonce = w.snapshot_register_nonce AND runs.registration_evidence_epoch >= w.snapshot_epoch)
+                       OR EXISTS (SELECT 1 FROM worker_active_runs a WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.claim_generation = runs.claim_generation AND NOT a.terminal_pending)))
+      AND runs.claimed_at >= @witness_cutoff::timestamptz), false)
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
   AND (runs.kind <> 'cross_check' OR EXISTS (
       SELECT 1 FROM locked_checks cc
@@ -10529,7 +10641,7 @@ SELECT id, runs.user_id, status, auto_approve,
        budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, budget_finalize_seconds, interactive,
        repo_id, kind, dispatched_at, required_capabilities, completion_contract_version,
        harness, codex_material_revision, codex_secret_id, worker_id, released_worker_id,
-       egress_profile_id, job_protocol, ci_config_guard,
+       egress_profile_id, job_protocol, ci_config_guard, repo_agent_source_commit, repo_agent_source_required, agent_source_requested,
        EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = runs.id AND af.direction = 'input' AND af.state = 'attached')::boolean AS ci_artifacts_attached,
        COALESCE(runs.status = 'queued' AND runs.kind <> 'cross_check'
                 AND runs.worker_id IS NOT NULL
@@ -10866,6 +10978,8 @@ WHERE run.id = @run_id
   -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
   -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
   AND (NOT run.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
+  AND ((NOT run.repo_agent_source_required AND run.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
+  AND (run.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
       AND (NOT (run.policy_preserve_required OR run.policy_pending_fresh OR (run.policy_outcome_id IS NOT NULL AND run.policy_resolved_at IS NULL)) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
   AND (NOT (run.kind = 'prompt' AND run.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = run.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(w.protocol_capabilities))
   AND (NOT (run.harness = 'codex' OR run.codex_material_revision IS NOT NULL OR run.codex_secret_id IS NOT NULL)
@@ -11100,6 +11214,24 @@ WHERE w.user_id = @user_id
   AND NOT w.isolated_lane
   AND 'ci_config_guard_v1' = ANY(w.protocol_capabilities);
 
+-- name: CountOnlineWorkersSatisfyingRepoAgentSource :one
+SELECT count(*) FROM workers w
+WHERE w.user_id = @user_id
+  AND w.status = 'online'
+  AND fn_worker_accepts_new_intake(w)
+  AND NOT w.ephemeral
+  AND NOT w.isolated_lane
+  AND 'repo_agent_source_v1' = ANY(w.protocol_capabilities);
+
+-- name: CountOnlineWorkersSatisfyingAgentSourceRequest :one
+SELECT count(*) FROM workers w
+WHERE w.user_id = @user_id
+  AND w.status = 'online'
+  AND fn_worker_accepts_new_intake(w)
+  AND NOT w.ephemeral
+  AND NOT w.isolated_lane
+  AND 'agent_source_request_v1' = ANY(w.protocol_capabilities);
+
 -- name: CountOnlineWorkersSatisfyingCodexHarness :one
 -- PRD #1332 M5A (D3): how many of a user's ONLINE, non-draining, non-ephemeral workers self-report
 -- the 'codex_harness_v1' PROTOCOL capability (workers.protocol_capabilities). This is the
@@ -11329,7 +11461,7 @@ WHERE r.status = 'queued'
   -- the CODE exclusion above keeps known CODE children on their own worker.
   -- PRD #2865: a GUARDED run (ci_config_guard) is demand too: with no worker reporting
   -- ci_config_guard_v1 online, only a freshly provisioned worker can claim it.
-  AND (r.checkpoint_coordinates IS NOT NULL OR cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]))
+  AND (r.checkpoint_coordinates IS NOT NULL OR cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR r.repo_agent_source_required OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]))
 
   AND NOT EXISTS (
       SELECT 1 FROM workers w
@@ -11363,6 +11495,8 @@ WHERE r.status = 'queued'
         -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
         -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
         AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
+        AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
+        AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL)) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
         AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
@@ -11609,6 +11743,8 @@ WHERE r.status = 'queued'
         -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
         -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
         AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
+        AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
+        AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL)) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
         AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
@@ -11694,6 +11830,8 @@ WHERE r.status = 'queued'
         -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
         -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
         AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
+        AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
+        AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL)) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
         AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
@@ -12427,6 +12565,23 @@ WHERE lead.id = @lead_run_id AND lead.worker_id = @worker_id
   AND lead.claim_released_at IS NULL
   AND cc.stage = 'plan' AND cc.round = @round;
 
+-- name: LockPlanCrossCheckLeadWorkerForVerdict :one
+-- Issue #3859: take the lead's worker row (FOR KEY SHARE, what the foreign-key re-check would take
+-- later) BEFORE the lead and check locks, so a verdict follows the lock order the sweeps and the
+-- snapshot apply use: workers, runs, cross_checks. The verdict transaction updates the lead row
+-- twice (BankPlanCrossCheckWait, then UpdateRunLastSeq); the second update re-checks runs.worker_id
+-- against workers because the old tuple was written by the same transaction, which would
+-- otherwise queue it behind a sweep that holds the worker FOR UPDATE while that sweep waits for
+-- the lead lock this transaction already holds. The worker id is stable within a claim
+-- generation; the locking statement below still fences the generation.
+SELECT w.id FROM workers w
+WHERE w.id = (SELECT lead.worker_id FROM runs lead
+              JOIN cross_checks cc ON cc.lead_run_id = lead.id
+              WHERE cc.checker_run_id = @child_id AND cc.stage = 'plan'
+                AND lead.claim_generation = cc.lead_claim_generation
+              LIMIT 1)
+FOR KEY SHARE OF w;
+
 -- name: LockPlanCrossCheckLeadForVerdict :one
 SELECT lead.* FROM runs lead
 JOIN cross_checks cc ON cc.lead_run_id = lead.id
@@ -12566,7 +12721,7 @@ WHERE lead.id = @lead_run_id AND cc.stage = 'plan'
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.id = @id AND runs.user_id = @user_id
-  AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed')
+  AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')
   AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL
        OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
           - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
@@ -12615,7 +12770,9 @@ UPDATE runs SET
                THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int)
                ELSE 0 END,
     -- Retained recovery preserves affinity even though its execution claim is released.
-    worker_id = CASE WHEN runs.claim_released_at IS NOT NULL AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_exhausted' AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed' THEN NULL ELSE runs.worker_id END,
+    -- retained_continuation_unwitnessed keeps it too: the retained source it parks over lives on
+    -- that worker's disk, so the resumed run must requeue back to the same worker.
+    worker_id = CASE WHEN runs.claim_released_at IS NOT NULL AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_exhausted' AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed' AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_continuation_unwitnessed' THEN NULL ELSE runs.worker_id END,
     hold_reason = NULL,
     hold_captured_head = NULL,
     worker_recovery_episode = runs.worker_recovery_episode + 1,
@@ -12626,7 +12783,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at            = now()
 WHERE runs.id = @id AND runs.user_id = @user_id
-  AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed')
+  AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')
   -- Honor the wall sweep's chat/judge/interactive exemptions; timed runs still need remaining budget.
   -- Extending does not itself release this hold; checker parent/deadline guards below still apply.
   AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL

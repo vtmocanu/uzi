@@ -46,7 +46,8 @@ func (c *Cache) HealthStallSeconds(ctx context.Context) (int, error) {
 
 // HealthToolCallSeconds returns how long a run's oldest open lead tool call may stay
 // in flight on an otherwise quiet run before the run is flagged stalled (issue #2046).
-// 0 disables the long-tool-call signal; otherwise it is in [60, 86400].
+// It is also (with the stall threshold) the silence threshold for an open delegation
+// (issue #3950). 0 disables both signals; otherwise it is in [60, 86400].
 func (c *Cache) HealthToolCallSeconds(ctx context.Context) (int, error) {
 	return c.intSetting(ctx, KeyHealthToolCallSeconds)
 }

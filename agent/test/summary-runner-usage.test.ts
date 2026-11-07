@@ -180,6 +180,29 @@ for (const c of CASES) {
   });
 }
 
+// Issue #3248: usage is attributed to the configured Codex model the request actually ran on.
+describe("Codex usage is keyed by the configured summary model (#3248)", () => {
+  for (const pass of ["intent", "plan"] as const) {
+    it(`${pass}: a gpt-6-astra claim model reports usage under gpt-6-astra`, async () => {
+      const calls: AdviceUsageSnapshot[] = [];
+      const factory = (async () => ({
+        kind: "codex" as const,
+        run: async (req: { model: string; usageObserver?: (u: AdviceUsageSnapshot) => void }) => {
+          req.usageObserver?.({ [req.model]: { inputTokens: 3, outputTokens: 2, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 } });
+          return { text: textFor(pass, "success"), end: { kind: "terminal", terminal: { outcome: "success" } } };
+        },
+      })) as never;
+      const r = await newRunner({ codex: factory, log: logs().log });
+      const onUsage = (u: AdviceUsageSnapshot) => void calls.push(u);
+      const model = "gpt-6-astra";
+      if (pass === "intent") await r.generateIntentSummary({ ...base, model, claim: codexClaim, onUsage });
+      else await r.generatePlanSummary({ ...base, model, claim: codexClaim, planMd: "# plan", onUsage });
+      assert.equal(calls.length, 1);
+      assert.deepEqual(Object.keys(calls[0]!), ["gpt-6-astra"]);
+    });
+  }
+});
+
 for (const pass of ["intent", "plan"] as const) {
   describe(`${pass}: an external abort`, () => {
     it("rejects the pass at once and delivers the observed usage once", async () => {

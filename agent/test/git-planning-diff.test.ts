@@ -1391,6 +1391,45 @@ phaseCp.spawn = function(...args) {
     });
   }
 
+  it("keeps a git deadline refusal classified when the deadline passes before its timer is armed", async () => {
+    // The helper's command() checks the deadline before spawning Git. Jump the
+    // clock only after that check. Keep the spawned Git child waiting on stdin
+    // until the command timer fires: SIGSTOP alone did not establish that ordering,
+    // so a fast close could let the next helper check return capture_deadline.
+    // A negative delay makes Node print a warning ahead of the trusted refusal
+    // line, hiding the git_deadline token.
+    const hook = `
+const timerCp = require("node:child_process"), timerFs = require("node:fs");
+const timerSpawn = timerCp.spawn, timerNow = Date.now;
+let timerOffset = 0, timerHeld = false;
+Date.now = () => timerNow() + timerOffset;
+timerCp.spawn = function(...args) {
+  const p = timerSpawn.apply(this, args);
+  // The helper first runs git init and check-attr. Let those finish; hold its
+  // first object() batch-check only after command() has passed check().
+  if (!timerHeld && args[1].includes("cat-file") && args[1].some(a => a.startsWith("--batch-check"))) {
+    timerHeld = true;
+    // command() calls stdin.end(input) after arming the timer. Write the input but
+    // keep stdin open, so cat-file cannot close before the zero-delay timeout.
+    p.stdin.end = input => { if (input) p.stdin.write(input); return p.stdin; };
+    timerOffset = 28001;
+    timerFs.writeFileSync(__DATA__ + "/timer-held", "1");
+  }
+  return p;
+};
+`;
+    const f = await fixture({ hook });
+    try {
+      const got = await refusalOf(f.capture());
+      assert.equal(await fs.readFile(path.join(f.data, "timer-held"), "utf8"), "1");
+      assert.deepEqual({
+        refusal: got.refusal,
+        diagnostic: got.diagnostic,
+        timeoutWarning: /TimeoutNegativeWarning/.test(got.message),
+      }, { refusal: "diff_failed", diagnostic: "git_deadline", timeoutWarning: false });
+    } finally { await f.dispose(); }
+  });
+
   it("primary proof: neutralizes poisoned Git redirect and config environment inside helper", async () => {
     const hook = `
 const poisonFs = require("node:fs"), poisonCp = require("node:child_process"), poisonSpawn = poisonCp.spawn;

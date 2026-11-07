@@ -433,6 +433,11 @@ func (s *Service) DecidePlanCrossCheck(ctx context.Context, worker store.Worker,
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	q := store.New(tx)
+	// Workers before runs: see LockPlanCrossCheckLeadWorkerForVerdict. No row means the lead has
+	// no worker to order against; the locking statement below decides whether the verdict applies.
+	if _, err = q.LockPlanCrossCheckLeadWorkerForVerdict(ctx, pgconv.UUID(childID)); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return store.CrossCheck{}, err
+	}
 	lead, err := q.LockPlanCrossCheckLeadForVerdict(ctx, store.LockPlanCrossCheckLeadForVerdictParams{
 		ChildID: childID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: generation,
 	})

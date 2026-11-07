@@ -111,6 +111,13 @@ export class ActiveRunRegistry {
     private readonly coverageGetter?: () => boolean,
   ) {}
 
+  /** Issue #3859: the epoch of the latest snapshot built so far (0 before any build). Read-only;
+   *  never advances the epoch. A flight that registers now is first listed by a snapshot with a
+   *  strictly larger epoch, so this value is the lower bound a registration witness reports. */
+  latestBuiltEpoch(): number {
+    return this.epoch;
+  }
+
   /** Register a run as executing at `running`, at the generation it was claimed at.
    *  Idempotent per run id (re-registering, e.g. a promoted re-claim serialised behind an
    *  old park, overwrites the prior entry). */

@@ -13,6 +13,7 @@ import {
 } from "react";
 import { Link } from "react-router-dom";
 import { forgeWaitLabel } from "../lib/forgeCooldown";
+import { diskWaitLabel } from "../lib/diskRecovery";
 import { effectiveRunStatus } from "../lib/runBadge";
 import type { RunHealth, RunProgress } from "../lib/apiTypes";
 import { ArrowLeftIcon, EyeIcon, EyeOffIcon } from "./icons";
@@ -520,6 +521,7 @@ export const RUN_STATUS_TONES: Record<
   retained_recovery_retrying: { tone: "warning" },
   retained_recovery_held: { tone: "warning" },
   retained_recovery_adoption_failed: { tone: "warning" },
+  retained_continuation_unwitnessed: { tone: "warning" },
   retained_recovery_unknown: { tone: "warning" },
   worker_requeue_exhausted: { tone: "warning" },
   worker_memory_pressure: { tone: "warning" },
@@ -554,6 +556,7 @@ export const RUN_STATUS_TONES: Record<
   codex_policy_hold: { tone: "warning" },
   // Issue #3194: a --require-base run held because its adopted work is not attested to the planned base.
   base_attestation_missing: { tone: "warning" },
+  repo_agent_source_unavailable: { tone: "warning" },
   provider_outage: { tone: "warning" },
   // Issue #3181: token-switch holds (raw "paused", overlaid from hold_reason). Static warning:
   // the owner's decision is pending (unsettled) or waits on the worker finishing (settling).
@@ -601,6 +604,7 @@ const RUN_STATUS_LABELS: Record<string, string> = {
   retained_recovery_retrying: "retained recovery retrying",
   retained_recovery_held: "retained recovery needs decision",
   retained_recovery_adoption_failed: "retained recovery integrity hold",
+  retained_continuation_unwitnessed: "unwitnessed continuation hold",
   retained_recovery_unknown: "retained recovery timing unknown",
   worker_requeue_exhausted: "recovery needs decision",
   worker_memory_pressure: "memory pressure: owner hold",
@@ -623,6 +627,7 @@ const RUN_STATUS_LABELS: Record<string, string> = {
   provider_unavailable: "provider unavailable: owner hold",
   codex_policy_hold: "Codex policy hold",
   base_attestation_missing: "base unverified: owner hold",
+  repo_agent_source_unavailable: "repo agents unreadable: owner hold",
   provider_outage: "waiting for provider",
   // Issue #3181: kept in step with runBadge's parked wording by the label-agreement test.
   credential_switch_settling: "settling: token switch",
@@ -644,6 +649,7 @@ export function StatusPill({ status: rawStatus, progress, health, recovery_wait_
   const cfg = accountWait ? { tone: "info" as BadgeTone, pulse: false } :
     RUN_STATUS_TONES[status] ?? { tone: "neutral" as BadgeTone };
   const label = accountWait ? "waiting" :
+    diskWaitLabel({ status: rawStatus, recovery_wait_cause, recovery_retry_not_before }) ??
     forgeWaitLabel({ status: rawStatus, recovery_wait_cause, recovery_retry_not_before, recovery_wait_phase }) ?? RUN_STATUS_LABELS[status] ?? status.replace(/_/g, " ");
   const showsProgress = status === "running" || status === "completion_checking" || status === "completion_reworking";
   const pct = !accountWait && showsProgress && progress?.state === "percent" &&
