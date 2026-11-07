@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { type ChildProcess, execFileSync, spawn } from "node:child_process";
+import { ChildProcess, execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
-import { INCOMPLETE_REASONS, type RunProcsOptions, helperRejectionReason, reapRunProcesses, scanRunProcesses } from "../src/run-procs.js";
+import { INCOMPLETE_REASONS, type RunProcsOptions, helperRejectionReason, helperUidKiller, reapRunProcesses, scanRunProcesses } from "../src/run-procs.js";
+import { killRunnerGroup, runnerCommand } from "../src/runner-uid.js";
 import type { CommandWrapper } from "../src/rmtree.js";
 import { realProcfsSkip } from "./real-procfs.js";
 
@@ -762,6 +763,69 @@ describe("run process passes with a gate deadline (issue #3980)", () => {
     assert.ok(r.incompleteReasons?.includes("helper_timeout"));
     assert.deepStrictEqual(seen.args, [], "the later pass was not admitted after the deadline");
     assert.ok(took >= 350 && took < 4000, `bounded by the deadline, not the helper's 15 s: ${took} ms`);
+  });
+
+  describe("under the runner-uid split, where the worker cannot signal the helper", () => {
+    /** Node's own contract for a refused kill (EPERM, as from the worker to a `runner` process):
+     *  `'error'` emitted synchronously from `kill`, which returns false. */
+    const refuseKill = (t: { mock: { method: (o: object, m: string, f: (...a: unknown[]) => unknown) => unknown } }): void => {
+      t.mock.method(ChildProcess.prototype, "kill", function (this: ChildProcess) {
+        this.emit("error", Object.assign(new Error("kill EPERM"), { code: "EPERM", errno: -1, syscall: "kill" }));
+        return false;
+      });
+    };
+    const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    const hanging = (): CommandWrapper => {
+      const hang = path.join(root, "hang-split.cjs");
+      fs.writeFileSync(hang, "setInterval(() => {}, 1000);\n");
+      return () => ({ command: process.execPath, args: [hang] });
+    };
+
+    it("a hung helper is killed as its own uid at the deadline, joined, and the reap reads unconfirmed", async (t) => {
+      refuseKill(t);
+      for (const run of [
+        (o: RunProcsOptions) => scan(o),
+        (o: RunProcsOptions) => reapRunProcesses(runHome, worktree, [], { procRoot, workerPid: 1, ...o }),
+      ]) {
+        const killed: number[] = [];
+        const killHelperAsUid = (pid: number): boolean => { killed.push(pid); strays.push(pid); process.kill(pid, "SIGKILL"); return true; };
+        const started = Date.now();
+        const r = await run({ wrappers: [hanging()], deadlineAt: started + 400, killHelperAsUid });
+        const took = Date.now() - started;
+        assert.strictEqual(r.complete, false, "an unconfirmed result");
+        assert.ok(took >= 350 && took < 4000, `bounded by the deadline: ${took} ms`);
+        assert.strictEqual(killed.length, 1, "killed once, as the helper's uid");
+        assert.strictEqual(alive(killed[0]!), false, "the helper is gone once the pass returned");
+        if ("incompleteReasons" in r) assert.ok(r.incompleteReasons?.includes("helper_timeout"), String(r.incompleteReasons));
+      }
+    });
+
+    it("a same-uid kill that also fails leaves the helper joined: the pass returns only once it closed", async (t) => {
+      refuseKill(t);
+      const tried: number[] = [];
+      const started = Date.now();
+      let settledAt = 0;
+      const pending = scan({ wrappers: [hanging()], deadlineAt: started + 300, killHelperAsUid: (pid) => { tried.push(pid); strays.push(pid); return false; } })
+        .then((r) => { settledAt = Date.now(); return r; });
+      await new Promise((resolve) => setTimeout(resolve, 1300));
+      assert.strictEqual(settledAt, 0, "fail-closed: not returned while the helper may still be running");
+      assert.strictEqual(tried.length, 1);
+      assert.ok(alive(tried[0]!), "the helper was not signalled");
+      const freedAt = Date.now();
+      process.kill(tried[0]!, "SIGKILL");
+      const r = await pending;
+      assert.strictEqual(r.complete, false);
+      assert.ok(settledAt >= freedAt, "settled only after the helper closed");
+    });
+
+    it("the default killer is killRunnerGroup for the runner helper under the split only; a test override wins", () => {
+      const other: CommandWrapper = (c, a) => ({ command: c, args: [...a] });
+      const override = (): boolean => true;
+      assert.strictEqual(helperUidKiller(runnerCommand, undefined, true), killRunnerGroup);
+      assert.strictEqual(helperUidKiller(runnerCommand, undefined, false), undefined);
+      assert.strictEqual(helperUidKiller(other, undefined, true), undefined);
+      assert.strictEqual(helperUidKiller(runnerCommand, override, true), override);
+    });
   });
 
   it("with time left every pass runs as before", async () => {

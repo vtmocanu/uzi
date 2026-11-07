@@ -562,7 +562,11 @@ exited" holds for direct children, so a descendant spawned by an agent-planted g
 outlive the step and is left to a later quiesce; a single kernel-blocked procfs read cannot be
 interrupted; a killed child that never closes is still joined; and the worker-owned synchronous
 process-group probe and kill (`processGroupAlive`, `signalProcessGroup` and `killRunnerGroup` via
-`spawnSync`, under the uid split) carry no timer of their own, as elsewhere in the worker. Codex deadline mechanics are unchanged (their
+`spawnSync`, under the uid split) carry no timer of their own, as elsewhere in the worker. Under the
+split a run-process scan or reap pass helper runs as `runner`, which the worker cannot signal
+(EPERM), so a helper that outlives its deadline-capped timer is killed as that uid
+(`killRunnerGroup`) before it is joined; if that same-uid kill fails too, the helper is still
+joined (fail-closed) and the bound does not hold for that pass. Codex deadline mechanics are unchanged (their
 capture scope already bounds the step near 60 s). An owner Cancel or shutdown reason now survives
 when the capture lane returns incomplete, instead of being remapped to the transient failure
 (issue #3980); a recovery deadline or timeout that git wraps is mapped to the transient failure,
