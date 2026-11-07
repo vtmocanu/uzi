@@ -157,6 +157,32 @@ This is a PARTIAL delivery. Verified against the branch source (symbol anchors, 
 
 **Owner acceptance (pending, not verified here):** the activation co-sign on the re-measured numbers; M1b hosted deletion acceptance on an attested supported worker; and replacing #3329's before-park acceptance with the genuine-idle roll #3329 owns. Until then this delivery is non-closing for #3329 and #1860.
 
+### R9 measurement detail (per class)
+
+Measured 2026-11-06 at the candidate limits on `027d6c89` plus the then-uncommitted R9 limit change, before the streaming, topology-first and loose-leaf changes. The counters were cross-checked exactly against `git ls-files`, `ls-tree -r -l`, `count-objects -v` and `verify-pack -v`. Peak RSS in this table predates streaming; the re-measurement above supersedes it. The large and self-contained rows were not re-run after the overflow semantics changed: their limit hits would now be a content-stage keep (pack-index object count) and an object-store-budget keep respectively. The harness, raw results and generator were kept in the run's scratch directory and are not committed.
+
+| class | tracked files / bytes | index bytes | metadata MiB (16) | path records idx/dir/untracked (131,072 each) | worktree content MiB (512) | largest Git stdout |
+|---|---|---|---|---|---|---|
+| small | 3 / 22 B | 325 | 0.005 | 3 / 40 / 3 | 0.00002 | 1,442 B |
+| mid (1 pack; gc'd and 8-pack variants equal) | 5,001 / 52.6 MB | 403,350 | 1.11 | 5,001 / 6,037 / 304 | 50.2 | 539,191 B (cat-file) |
+| large (demand, caps raised) | 50,001 / 525.9 MB | 4,032,152 | 11.1 | 50,001 / 54,637 / 304 | 501.6 | 7,555,316 B (cat-file) |
+| real (this repository) | 8,692 / 153.9 MB | 969,253 | 2.67 | 8,692 / 10,025 / 3 | 146.7 | 2,264,471 B |
+
+Object store per snapshot, in MiB (budget 4,096); the figures were identical across the three snapshots:
+
+| class | packs / loose | pack span (compressed) | loose compressed | inflated | delta-generated | idx | total | OFS/REF graph: objects / deltas / max chain | occurrences (131,072) |
+|---|---|---|---|---|---|---|---|---|---|
+| small | 0 / 6 | 0 | 0.0003 | 0.0003 | 0 | 0 | 0.02 | n/a | 6 |
+| mid, 1 pack | 1 / 0 | 30.3 | 0 | 51.9 | 54.0 | 0.35 | 136.5 | 13,151 / 7,950 / 37 | 13,151 |
+| mid, 8 packs | 8 / 0 | 44.7 | 0 | 77.3 | 28.0 | 0.36 | 150.4 | per pack 1,006-2,356 objects | 13,151 |
+| mid, loose | 0 / 13,151 | 0 | 62.5 | 104.7 | 0 | 0 | 179.3 | n/a | 13,151 |
+| mid, self-contained (clone plus bare pack) | 2 / 0 | 60.5 | 0 | 103.8 | 108.1 | 0.7 | 273.0 | twice the mid pack | 26,302 |
+| large (demand) | 1 / 0 | 310.8 | 0 | 528.0 | 853.1 | 4.9 | 1,696.8 | 184,276 / 132,549 / 48 | 184,276 (over) |
+| real | 1 / 0 | 99.9 | 0 | 247.1 | 2,403.9 | 1.5 | 2,752.4 | 55,231 / 39,864 / 49 | 55,231 |
+| real, self-contained (demand) | 2 / 0 | 199.4 | 0 | 493-494 | 4,751-4,808 | 2.9 | 5,447-5,505 (over) | twice the real pack | 109,948-110,462 |
+
+Admitted alternates: the default attempt clone is `clone --shared`, so its own store is empty and its `objects/info/alternates` names the bare. Every class above therefore measures one alternate edge to the managed bare; no fixture used a second alternate. Wall time (real): about 50 s in total. The `verify-pack` child takes 26 s of that, the three snapshot walks 4-5 s each, and worktree hashing 5.5 s. A loose bare is about 4x slower per snapshot.
+
 ## #3775 partial-shadow diagnostic contract
 
 `runPodEpochShadow` adds `partial_causes` to its result; `main.ts` spreads that result into the `pod_epoch_reclaim` log. The fixed vocabulary is defined in `agent/src/pod-epoch-partial-causes.ts`. The `partial_causes` object is diagnostic-only: it changes no candidate, verdict, reason, authority, cap, retry policy or deletion/settlement permission. (The same log line now also carries the M1b reclaim counters recorded in the 2026-11-06 delivery section; the log as a whole is a report and is never read back as authority.) The operator retained-source server explicitly projects the existing inspection fields; this adds no CLI/API response field.
