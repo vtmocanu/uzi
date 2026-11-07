@@ -92,7 +92,8 @@ before(async () => {
   rc2Home = await import(pathToFileURL(path.join(src, "home-reclaim.ts")).href) as Rc2Home;
   rc2Runner = await import(pathToFileURL(path.join(src, "runner.ts")).href) as Record<string, unknown>;
 });
-after(async () => { if (suite) await fsp.rm(path.join(suite, "reader-rc2"), { recursive: true, force: true }); });
+// Only the directory this run created (the mkdtemp above) is removed, with the archive and every environment built under it.
+after(async () => { if (suite) await fsp.rm(suite, { recursive: true, force: true }); });
 
 interface Env {
   fx: Fixture; dataDir: string; bare: string; current: GitCache; rc2: InstanceType<Rc2Git["GitCache"]>;

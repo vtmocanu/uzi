@@ -11857,17 +11857,39 @@ export class GitCache {
 
   /**
    * The retry of a P exit whose config rewrite already landed (the record is gone) but whose marker removal did not complete:
-   * re-sync the bare config and its directory, then remove the retained-home marker of `runId` once the bare carries no
-   * attribution of the run (no journal or restore entry naming it, no non-retired ledger entry). Returns true only when it
-   * removed the marker; false leaves everything as found. Under the bare lock.
+   * re-sync the bare config and its directory, then remove the retained-home marker of `runId`. It runs only on positive proof
+   * that THIS bare was the restore bare of the run and the exit completed here: the holds were read and are empty, the run is
+   * terminal, THIS bare's attempt ledger carries a `retired` value for exactly the selector's attempt id naming the run (the
+   * value the exit's single config rewrite appends; `confirm` cannot be digest-checked against a record that no longer exists,
+   * so that ledger entry is the binding, and the attempt id's generation must equal the selector's), and the bare carries no
+   * other attribution of the run (no record, no non-retired ledger value, no restore entry, no `uzi-retained.<R>.journal`, no
+   * `uzi-stopped.<R>.entry`, read from the config directly). Anything else returns false and leaves everything as found.
+   * Under the bare lock.
    */
   private async finishOrphanRestoreMarker(g: GatheredBare, runId: string, opts: RetainedDiscardOptions): Promise<boolean> {
     const { hasRetainedHomeMarker, removeRetainedHomeMarker } = opts;
     if (!hasRetainedHomeMarker || !removeRetainedHomeMarker || opts.lifecycle?.state !== "terminal") return false;
+    if (opts.holds.state !== "read" || opts.holds.holds.length > 0) return false;
+    const sel = opts.selector;
+    if (sel.attempt === "canonical") return false;
+    const bound = g.ledger.get(sel.attempt);
+    if (!bound || bound.runId !== runId || bound.state !== "retired") return false;
+    const generation = attemptGeneration(sel.attempt);
+    if (sel.generation !== "none" && generation !== undefined && generation !== sel.generation) return false;
     if (g.records.some(r => r.runId === runId)) return false;
     if ([...g.ledger.values()].some(e => e.runId === runId && e.state !== "retired")) return false;
     for (const item of await this.configEntries(g.barePath)) {
       const key = item.split("\n", 1)[0]!;
+      if (key === `uzi-retained.${runId}.journal` || key === stoppedMarkerKey(runId)) return false;
+      if (key.startsWith("uzi-recovery.") && key.endsWith(".clone")) {
+        // A branch journal still naming the run (whatever its path state), or one that cannot be read, is attribution.
+        const value = item.slice(key.length + 1);
+        if (value !== "") {
+          let named: string | undefined;
+          try { named = (JSON.parse(value) as { runId?: string }).runId; } catch { return false; }
+          if (named === undefined || named === runId) return false;
+        }
+      }
       const branch = restoreKeyBranch(key);
       if (branch === undefined) continue;
       const holder = this.restoreHolder([item], branch);
@@ -12432,9 +12454,11 @@ export class GitCache {
   /**
    * Mode `holding`'s filesystem half (amendment 14 (b)/(N3)): P's path is absent, `runner-quarantine` is a real 0700 directory
    * owned by this worker's uid with at most 4096 entries, and EXACTLY ONE entry starts with R's holding prefix: a real directory
-   * named `<R sanitised>-<uuid v4>` whose ctime is not before the instant S's attempt id encodes. The ctime is the anchor because
-   * the restore entry carries no write time; S's id is minted before S exists, so a holding directory rc.2 made for P after the
-   * restore cannot predate it. Only names are listed and only the matching entry is lstat'd; no content is ever read. Returns the
+   * named `<R sanitised>-<uuid v4>` whose ctime is not before the instant S's attempt id encodes. The ctime (last STATUS change,
+   * not creation: a later chmod or rename of the directory moves it forward) is a NECESSARY check only, never sufficient: it
+   * rejects a holding directory that provably predates the restore, nothing more. The weight is carried by EXACTLY ONE entry
+   * matching R's holding prefix, together with the config facts of {@link releasedConfigFacts}; the restore entry carries no write
+   * time to anchor on. Only names are listed and only the matching entry is lstat'd; no content is ever read. Returns the
    * directory name, or undefined for anything else.
    */
   private async holdingEvidence(runId: string, sAttemptId: string, pPath: string): Promise<string | undefined> {

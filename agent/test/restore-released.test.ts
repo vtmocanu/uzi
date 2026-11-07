@@ -473,6 +473,17 @@ describe("controls: partial, ambiguous or mismatched states stay refused with no
     assert.equal(rawKey(S_KEY)?.includes("retired"), true);
   });
 
+  it("the released state is re-proven after the caller's quiescence: the holding directory renamed to another valid name meanwhile refuses restore_state_changed", async () => {
+    const { holding } = await rc2Release("holding");
+    assert.equal((await discardS()).kind, "done");
+    const renamed = path.join(HOLDING_ROOT, `${RUN.replace(/[^A-Za-z0-9_-]/g, "_")}-${randomUUID()}`);
+    const r = await discardP({ quiesce: async () => { fs.renameSync(holding!, renamed); return true; } });
+    assert.equal(r.kind === "refused" && r.reason, "restore_state_changed", JSON.stringify(r));
+    assert.equal(fs.existsSync(renamed), true, "the holding copy is untouched");
+    assert.equal(ledgerStates().get(P_ID), "live", "P stays live");
+    assert.equal(rawKey(S_KEY)?.includes("retired"), true);
+  });
+
   it("C2 (Q4): ledger reclaimed with P's key still P's journal is an ordinary composite and the normal exit reaches done", async () => {
     await cache.seedIndependentAttempt(seedInput());
     addLedger(P_ID, P_PATH, "reclaimed");

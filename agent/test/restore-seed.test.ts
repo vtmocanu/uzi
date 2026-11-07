@@ -887,6 +887,122 @@ describe("the ordinary discard dispositions never reach P or S (#3431 negative)"
   });
 });
 
+describe("the orphan marker finisher is bound to this bare's retired ledger entry (#3644 review)", () => {
+  const MADE_UP = formatAttemptId(new Date("2026-11-05T13:13:13Z"), 1, "bbbbbbbbbbbbbbbb");
+  const spy = () => {
+    const s = { present: true, removals: 0, order: [] as string[] };
+    return { s, hooks: {
+      hasRetainedHomeMarker: async () => s.present,
+      removeRetainedHomeMarker: async () => { s.order.push("remove"); s.present = false; s.removals++; },
+    } };
+  };
+  const retry = (barePath: string, over: Record<string, unknown> = {}, attempt = P_ID, generation = 1) => cache.discardStoppedSource({
+    selector: { runId: RUN, generation, attempt }, confirm: "0".repeat(64), holds: { state: "read", holds: [] },
+    lifecycle: { state: "terminal", status: "failed" }, isLivePath: () => false, quiesce: async () => true, barePath, ...over,
+  } as never);
+  /** The completed P exit whose marker removal never ran: P's record is gone, its ledger value is retired, the marker is still there. */
+  async function completedExit(): Promise<ReturnType<typeof spy>> {
+    await cache.seedIndependentAttempt(seedInput({ steps: [] }));
+    fs.rmSync(S_PATH, { recursive: true, force: true });
+    addLedger(S_ID, S_PATH, "retired");
+    await cache.advanceRestoreEntry(bare, BRANCH, "retired");
+    const g = await internals().withLock(bare, () => internals().gatherRetainedUnderLock(bare));
+    const confirm = g.records.find(r => r.parts.some(part => part.clonePath === P_PATH))!.digest;
+    const m = spy();
+    const first = await cache.discardStoppedSource({
+      selector: { runId: RUN, generation: 1, attempt: P_ID }, confirm, holds: { state: "read", holds: [] },
+      lifecycle: { state: "terminal", status: "failed" }, isLivePath: () => false, quiesce: async () => true, barePath: bare,
+      hasRetainedHomeMarker: m.hooks.hasRetainedHomeMarker, removeRetainedHomeMarker: async () => { throw new Error("interrupted"); },
+    } as never);
+    assert.equal(first.kind === "unknown" && first.metadata, "retired");
+    return m;
+  }
+  const untouched = (r: { kind: string }, m: { s: { present: boolean; removals: number } }, what: string): void => {
+    assert.notEqual(r.kind, "done", `${what}: ${JSON.stringify(r)}`);
+    assert.equal(m.s.removals, 0, `${what}: the marker hook must not run`);
+    assert.equal(m.s.present, true, `${what}: the marker stays`);
+  };
+  const notFound = (r: { kind: string; reason?: string }, what: string): void => assert.equal(r.kind === "refused" && r.reason, "not_found", `${what}: ${JSON.stringify(r)}`);
+
+  it("control: the completed exit's retry (retired ledger entry for exactly the selector's attempt) syncs, then removes the marker", async () => {
+    const m = await completedExit();
+    failSync = () => { m.s.order.push("sync"); return false; };
+    const r = await retry(bare, m.hooks);
+    failSync = undefined;
+    assert.equal(r.kind, "done", JSON.stringify(r));
+    assert.equal(m.s.removals, 1);
+    assert.ok(m.s.order.includes("sync"), "a durability sync ran");
+    assert.equal(m.s.order.at(-1), "remove");
+    assert.equal(m.s.order.lastIndexOf("sync") < m.s.order.indexOf("remove"), true, "every sync precedes the removal");
+  });
+
+  it("the auditor's two-bare probe: a live restore in one bare and an unrelated bare as the caller's never remove the marker", async () => {
+    await cache.seedIndependentAttempt(seedInput({ steps: [] }));
+    const fx2 = makeFixture();
+    try {
+      const bare2 = await cache.ensureClone(fx2.originPath);
+      const m = spy();
+      const probe = await retry(bare2, { ...m.hooks, holds: { state: "unknown" } }, MADE_UP);
+      notFound(probe, "unknown holds, made-up attempt, other bare");
+      untouched(probe, m, "probe");
+      const read = await retry(bare2, m.hooks, MADE_UP);
+      notFound(read, "read holds, made-up attempt, other bare");
+      const real = await retry(bare2, m.hooks, P_ID);
+      notFound(real, "P's own attempt id against an unrelated bare");
+      untouched(real, m, "P's attempt id, other bare");
+      assert.equal(rawKey(P_KEY), pRaw, "P stays a live record in its own bare");
+    } finally { fx2.cleanup(); }
+  });
+
+  it("holds unknown or open, a made-up attempt id and a non-terminal lifecycle each leave the marker", async () => {
+    const m = await completedExit();
+    const unknown = await retry(bare, { ...m.hooks, holds: { state: "unknown" } });
+    untouched(unknown, m, "holds unknown");
+    const open = await retry(bare, { ...m.hooks, holds: { state: "read", holds: [{ id: "h1", generation: 1 }] } });
+    untouched(open, m, "an open hold");
+    const madeUp = await retry(bare, m.hooks, MADE_UP);
+    notFound(madeUp, "no retired entry for the selector's attempt id");
+    untouched(madeUp, m, "made-up attempt id");
+    const wrongGeneration = await retry(bare, m.hooks, P_ID, 2);
+    notFound(wrongGeneration, "the selector's generation is not the attempt id's");
+    untouched(wrongGeneration, m, "wrong generation");
+    const running = await retry(bare, { ...m.hooks, lifecycle: { state: "running" } });
+    untouched(running, m, "non-terminal lifecycle");
+    const none = await retry(bare, { ...m.hooks, lifecycle: undefined });
+    untouched(none, m, "no lifecycle");
+    const canonical = await retry(bare, m.hooks, "canonical" as never, "none" as never);
+    untouched(canonical, m, "canonical selector");
+  });
+
+  it("P still a record, a live ledger value, a restore entry, a descriptor or a stopped marker of the run each leave the marker", async () => {
+    const m = await completedExit();
+    setKey(P_KEY, pRaw);
+    untouched(await retry(bare, m.hooks), m, "P's journal is back (still a record)");
+    gitIn(bare, ["config", "--unset-all", P_KEY]);
+    const later = formatAttemptId(new Date("2026-11-05T14:14:14Z"), 3, "cccccccccccccccc");
+    addLedger(later, attemptClonePath(cache.runnerClonePath(bare, KEY), later), "live");
+    notFound(await retry(bare, m.hooks), "a live ledger value of the run");
+    untouched(await retry(bare, m.hooks), m, "live ledger value");
+    gitIn(bare, ["config", "--unset-all", LEDGER_KEY]);
+    addLedger(P_ID, P_PATH, "retired");
+    notFound(await retry(bare, m.hooks, MADE_UP), "restored ledger without the made-up id");
+    // Back to the completed state (retired P entry, nothing else): the control proves the finisher would run, then each extra key blocks it.
+    for (const [key, value] of [
+      [S_KEY, JSON.stringify({ runId: RUN, clonePath: S_PATH, attemptId: S_ID })],
+      [`uzi-retained.${RUN}.journal`, JSON.stringify({ runId: RUN })],
+      [`uzi-stopped.${RUN}.entry`, JSON.stringify({ runId: RUN })],
+    ] as const) {
+      setKey(key, value);
+      let r: { kind: string } | undefined;
+      try { r = await retry(bare, m.hooks); } catch { r = { kind: "threw" }; }
+      untouched(r, m, `config key ${key}`);
+      gitIn(bare, ["config", "--unset-all", key]);
+    }
+    const ok = await retry(bare, m.hooks);
+    assert.equal(ok.kind, "done", `the cleaned state finishes the marker: ${JSON.stringify(ok)}`);
+  });
+});
+
 describe("sanity of the happy-path fixture", () => {
   it("P's journal digest is sha256 of the raw value", () => {
     assert.equal(restoreDigest(pRaw), sha256(pRaw));
