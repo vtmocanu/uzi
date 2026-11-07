@@ -23067,19 +23067,29 @@ try {
   private async runGitAsRunner(cwd: string | undefined, args: string[], opts: { timeoutMs?: number; env?: NodeJS.ProcessEnv; input?: string | Buffer; encoding?: "latin1"; onStderr?: (stderr: string) => void } = {}): Promise<string> {
     const { env, wrapped } = this.runnerGitInvocation(cwd, args, opts.env);
     this.log.debug("git (runner uid)", { cwd, args });
+    let result: { stdout: string; stderr: string };
     try {
-      const result = await this.execScoped(wrapped.command, wrapped.args, {
+      result = await this.execScoped(wrapped.command, wrapped.args, {
         env,
         timeout: opts.timeoutMs ?? GIT_TIMEOUT_MS,
         maxBuffer: GIT_MAX_BUFFER,
         ...(opts.input !== undefined ? { input: opts.input } : {}),
         ...(opts.encoding !== undefined ? { encoding: opts.encoding } : {}),
       }, "command");
-      opts.onStderr?.(result.stderr);
-      return result.stdout;
     } catch (err) {
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
+      // A joined Git child may warn on stderr and then exit nonzero. The epoch
+      // refs reader must see that warning before the generic failure wrapper.
+      const stderr = (err as { stderr?: unknown } | null)?.stderr;
+      if (typeof stderr === "string") opts.onStderr?.(stderr);
+      else if (Buffer.isBuffer(stderr)) opts.onStderr?.(stderr.toString());
       throw this.runnerGitFailure(err, args);
     }
+    // Keep caller classification outside the Git-failure catch. A successful
+    // for-each-ref can still warn that it skipped a broken ref.
+    opts.onStderr?.(result.stderr);
+    return result.stdout;
   }
 
   /**

@@ -457,13 +457,14 @@ function filterRun(t: TestContext, channel: "worktree" | "tracked" | "attr.tree"
       fs.writeFileSync(path.join(home, ".config", "git", "attributes"), rule);
     }
     command(clonePath, "config", "filter.x.clean", `sh -c 'echo ran > ${marker}; cat'`);
-    const future = new Date(Date.now() + 7200_000);
-    fs.utimesSync(inClone("tracked.txt"), future, future);
-    const homeEnv = channel === "home" ? { HOME: home } : {};
+    // Force a content read on Git versions that can dismiss an mtime-only refresh.
+    fs.writeFileSync(inClone("tracked.txt"), "changed\n");
+    const homeEnv = channel === "home" ? { HOME: home, XDG_CONFIG_HOME: path.join(home, ".config") } : {};
     const launched = rec.launches.length;
     // Control: an unpinned status really runs the filter through this channel.
-    spawnSync("/usr/bin/git", ["-C", clonePath, "status", "--porcelain"],
+    const unpinned = spawnSync("/usr/bin/git", ["-C", clonePath, "status", "--porcelain"],
       { env: { ...ENV, GIT_OPTIONAL_LOCKS: "0", ...homeEnv } });
+    assert.equal(unpinned.status, 0, String(unpinned.stderr));
     const naive = fs.existsSync(marker);
     fs.rmSync(marker, { force: true });
     if (channel === "info") {
