@@ -18,10 +18,11 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// downFx is one isolated database migrated to 414 (the head, so the production queries run) with real
-// rows produced by those queries. The 413 rollback tests call mc() once their rows exist: it runs
-// migration 414's Down, which for these fixtures (no one-claim Fresh authorization) converts nothing,
-// so the migration 413 Down then runs against exactly the rows the production queries produced.
+// downFx is one isolated database migrated to 415 (the head, so the production queries run) with real
+// rows produced by those queries. The 413 rollback tests call mc() once their rows exist: it walks
+// 415 -> 414 -> 413 through migration 415's and 414's Downs, which for these fixtures (no one-claim
+// Fresh authorization) convert nothing, so the migration 413 Down then runs against exactly the rows
+// the production queries produced.
 type downFx struct {
 	t                   *testing.T
 	ctx                 context.Context
@@ -38,7 +39,7 @@ var recoveryColumns = []string{"policy_required_head", "policy_recovery_verified
 func newDownFx(t *testing.T) *downFx {
 	t.Helper()
 	ctx, dsn := standIsolatedDB(t, "policy_recovery_down_")
-	if err := store.MigrateTo(ctx, dsn, 414); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 415); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := store.OpenPool(ctx, dsn)
@@ -62,8 +63,13 @@ func (f *downFx) mc() {
 	if f.atMc {
 		return
 	}
-	if err := store.MigrateDownTo(f.ctx, f.dsn, 413); err != nil {
-		f.t.Fatalf("Down to 413: %v", err)
+	for _, step := range []int64{414, 413} {
+		if err := store.MigrateDownTo(f.ctx, f.dsn, step); err != nil {
+			f.t.Fatalf("Down to %d: %v", step, err)
+		}
+		if got := f.version(); got != step {
+			f.t.Fatalf("Down to %d left version %d", step, got)
+		}
 	}
 	f.atMc = true
 }

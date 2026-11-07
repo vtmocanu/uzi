@@ -33,8 +33,36 @@ func (f *downFx) consumedFresh(gen int64, confirmed bool) uuid.UUID {
 	return id
 }
 
+// baseColumns are migration 00397 columns that neither the 413 nor the 414 Down may drop.
+var baseColumns = []string{"policy_preserve_required", "policy_outcome_id", "policy_hold_published", "policy_pending_fresh"}
+
+func (f *downFx) freshValidated() bool {
+	f.t.Helper()
+	var v bool
+	if err := f.pool.QueryRow(f.ctx, "SELECT convalidated FROM pg_constraint WHERE conname=$1", freshShapeConstraint).Scan(&v); err != nil {
+		f.t.Fatal(err)
+	}
+	return v
+}
+
+// toMf steps the head fixture (415) down to 414 through migration 415's Down: no conversion and no
+// refusal, the Fresh columns stay and the shape check is NOT VALID. It is a no-op once at 414.
+func (f *downFx) toMf() {
+	f.t.Helper()
+	if f.version() != 415 {
+		return
+	}
+	if err := store.MigrateDownTo(f.ctx, f.dsn, 414); err != nil {
+		f.t.Fatalf("Down to 414: %v", err)
+	}
+	if f.version() != 414 || f.columns(freshColumns...) != 2 || f.freshValidated() {
+		f.t.Fatalf("415 Down left version %d, %d fresh columns, validated=%v", f.version(), f.columns(freshColumns...), f.freshValidated())
+	}
+}
+
 func (f *downFx) mfRefused(wantMsg string) {
 	f.t.Helper()
+	f.toMf()
 	before := f.snapshot()
 	err := store.MigrateDownTo(f.ctx, f.dsn, 413)
 	if err == nil || !strings.Contains(err.Error(), wantMsg) {
@@ -49,9 +77,10 @@ func (f *downFx) mfRefused(wantMsg string) {
 // still guards new writes, and Down drops exactly its two columns.
 func TestPolicyFreshOneClaimMigrationLiveDB(t *testing.T) {
 	f := newDownFx(t)
-	if f.version() != 414 || f.columns(freshColumns...) != 2 {
+	if f.version() != 415 || f.columns(freshColumns...) != 2 {
 		t.Fatalf("head fixture: version %d, %d fresh columns", f.version(), f.columns(freshColumns...))
 	}
+	f.toMf()
 	var validated bool
 	if err := f.pool.QueryRow(f.ctx, "SELECT convalidated FROM pg_constraint WHERE conname=$1", freshShapeConstraint).Scan(&validated); err != nil || validated {
 		t.Fatalf("shape check must be NOT VALID (validated=%v, err=%v)", validated, err)
@@ -152,6 +181,7 @@ func TestPolicyFreshOneClaimDownConvertsActiveLiveDB(t *testing.T) {
 	for _, id := range append(append([]uuid.UUID{}, converted...), kept...) {
 		before[id] = f.row(id)
 	}
+	f.toMf()
 	if err := store.MigrateDownTo(f.ctx, f.dsn, 413); err != nil {
 		t.Fatalf("Down: %v", err)
 	}
@@ -191,6 +221,9 @@ func TestPolicyFreshOneClaimDownConvertsActiveLiveDB(t *testing.T) {
 	if f.version() != 412 || f.columns(recoveryColumns...) != 0 {
 		t.Fatalf("chain left version %d and %d recovery columns", f.version(), f.columns(recoveryColumns...))
 	}
+	if f.columns(baseColumns...) != len(baseColumns) {
+		t.Fatal("the 413 Down dropped a 00397 column")
+	}
 }
 
 func TestPolicyFreshOneClaimDownRefusesLiveRowsLiveDB(t *testing.T) {
@@ -221,6 +254,9 @@ func TestPolicyFreshOneClaimDownRefusesLiveRowsLiveDB(t *testing.T) {
 						t.Fatalf("run %s not converted", id)
 					}
 				}
+				if v, n := f.version(), f.columns(freshColumns...); v != 413 || n != 0 {
+					t.Fatalf("retried Down left version %d with %d fresh columns, want 413 and 0", v, n)
+				}
 			})
 		}
 	}
@@ -234,6 +270,7 @@ func TestPolicyFreshOneClaimDownRefusesOrphansLiveDB(t *testing.T) {
 	t.Run("confirmed without consumed", func(t *testing.T) {
 		f := newDownFx(t)
 		convertible := f.queuedFresh(strings.Repeat("a", 40))
+		f.toMf()
 		dropShape(f)
 		orphan := f.running()
 		mustExec(f.ctx, t, f.pool, "UPDATE runs SET status='queued',policy_fresh_confirmed_generation=3 WHERE id=$1", orphan)
@@ -256,6 +293,7 @@ func TestPolicyFreshOneClaimDownRefusesOrphansLiveDB(t *testing.T) {
 	})
 	t.Run("terminal orphan is ignored", func(t *testing.T) {
 		f := newDownFx(t)
+		f.toMf()
 		dropShape(f)
 		done := f.running()
 		mustExec(f.ctx, t, f.pool, "UPDATE runs SET status='failed',finished_at=now(),policy_fresh_confirmed_generation=3 WHERE id=$1", done)
@@ -293,6 +331,7 @@ func TestPolicyFreshOneClaimHistoryRetiredThenDownLiveDB(t *testing.T) {
 	for _, id := range runs {
 		before[id] = f.row(id)
 	}
+	f.toMf()
 	if err := store.MigrateDownTo(f.ctx, f.dsn, 413); err != nil {
 		t.Fatalf("Down refused retired history: %v", err)
 	}
@@ -303,5 +342,81 @@ func TestPolicyFreshOneClaimHistoryRetiredThenDownLiveDB(t *testing.T) {
 	}
 	if f.version() != 413 || f.columns(freshColumns...) != 0 {
 		t.Fatalf("Down left version %d and %d fresh columns", f.version(), f.columns(freshColumns...))
+	}
+}
+
+// TestPolicyShapeAFullRollbackWalkLiveDB is the Shape-A rollback walk (issue #3607): from head 415 it
+// goes down one version at a time (415, 414, 413), asserting each step converts only what that
+// migration's Down owns, with rows produced by the real production queries.
+func TestPolicyShapeAFullRollbackWalkLiveDB(t *testing.T) {
+	// Up from H0: a database at 412 (the pre-feature head) migrates through 413 and 414 to 415.
+	upCtx, upDSN := standIsolatedDB(t, "policy_shape_a_up_")
+	for _, v := range []int64{412, 413, 414, 415} {
+		if err := store.MigrateTo(upCtx, upDSN, v); err != nil {
+			t.Fatalf("Up to %d: %v", v, err)
+		}
+		upPool, err := store.OpenPool(upCtx, upDSN)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got int64
+		err = upPool.QueryRow(upCtx, "SELECT max(version_id) FROM goose_db_version WHERE is_applied").Scan(&got)
+		upPool.Close()
+		if err != nil || got != v {
+			t.Fatalf("after Up to %d the version is %d (%v)", v, got, err)
+		}
+	}
+	f := newDownFx(t) // a fresh isolated database migrated 0 -> 415
+	if f.version() != 415 {
+		t.Fatalf("head fixture at version %d, want 415", f.version())
+	}
+	a := strings.Repeat("a", 40)
+	requiredHead := f.pausedPreserving(a)
+	freshPending := f.queuedFresh(a)
+	rows := []uuid.UUID{requiredHead, freshPending}
+	before := map[uuid.UUID]map[string]any{}
+	for _, id := range rows {
+		before[id] = f.row(id)
+	}
+	if before[requiredHead]["status"] != "paused" || before[freshPending]["status"] != "queued" {
+		t.Fatalf("fixture statuses: %v %v", before[requiredHead]["status"], before[freshPending]["status"])
+	}
+
+	// 415 -> 414: validation is undone, nothing is converted.
+	f.toMf()
+	if f.version() != 414 || f.freshValidated() || f.columns(freshColumns...) != 2 {
+		t.Fatalf("415 Down: version %d, validated=%v, %d fresh columns", f.version(), f.freshValidated(), f.columns(freshColumns...))
+	}
+	for _, id := range rows {
+		if !reflect.DeepEqual(before[id], f.row(id)) {
+			t.Fatalf("415 Down changed run %s", id)
+		}
+	}
+
+	// 414 -> 413: the Fresh columns go and the pending Fresh row is converted; the Mc columns stay.
+	if err := store.MigrateDownTo(f.ctx, f.dsn, 413); err != nil {
+		t.Fatalf("414 Down: %v", err)
+	}
+	if f.version() != 413 || f.columns(freshColumns...) != 0 || f.columns(recoveryColumns...) != 4 {
+		t.Fatalf("414 Down: version %d, %d fresh columns, %d recovery columns", f.version(), f.columns(freshColumns...), f.columns(recoveryColumns...))
+	}
+	if got := f.row(freshPending)["status"]; got != "failed" {
+		t.Fatalf("pending Fresh run status = %v after the 414 Down, want failed", got)
+	}
+	if got := f.row(requiredHead)["status"]; got != "paused" {
+		t.Fatalf("required-head run status = %v after the 414 Down, want paused", got)
+	}
+
+	// 413 -> 412: the Mc columns go and the required-head row is converted; 00397 columns stay.
+	if err := store.MigrateDownTo(f.ctx, f.dsn, 412); err != nil {
+		t.Fatalf("413 Down: %v", err)
+	}
+	if f.version() != 412 || f.columns(recoveryColumns...) != 0 || f.columns(baseColumns...) != len(baseColumns) {
+		t.Fatalf("413 Down: version %d, %d recovery columns, %d 00397 columns", f.version(), f.columns(recoveryColumns...), f.columns(baseColumns...))
+	}
+	for _, id := range rows {
+		if got := f.row(id)["status"]; got != "failed" {
+			t.Fatalf("run %s status = %v after the full walk, want failed", id, got)
+		}
 	}
 }
