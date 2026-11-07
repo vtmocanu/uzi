@@ -579,7 +579,10 @@ bad request still fails the run, as before), the worker stops retrying and
 reports nothing. A 404 on the check still means the run is no longer owned by
 this worker, and the worker cleans up as before. A 404 on the resend stops
 without a second check and keeps the session. Timeouts, 429, 5xx responses and
-transport failures are retried with backoff. The worker keeps the session when it can
+transport failures are retried with backoff. A typed acknowledgement returned
+for the resend, including a 409 body, is not a refusal and is handled as
+before: it can confirm the park or take the failed path (for example
+`custody_unsettled`). On a refusal, the worker keeps the session when it can
 be resumed on that worker, keeps any publication record and source, leaves
 custody unsettled, and leaves the run to the server or its owner. A refusal
 is not treated as proof that the run ended. The same applies to the
