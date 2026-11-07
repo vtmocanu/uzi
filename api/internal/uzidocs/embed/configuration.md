@@ -317,7 +317,7 @@ Recorded sources are nullable for legacy checks and remain unknown when absent; 
 
 ## Effective settings
 
-The effective-settings view answers "what would a run of mine use right now?" for the harness, the models and the reasoning efforts, instead of leaving you to combine the stored choices, the instance defaults and the built-ins by hand. It is **read-only**: it reads the same rules a run creation and a worker claim apply, writes nothing, takes no lock, reads no limit evidence and calls no model provider. Design: [PRD #3254](../prds/3254-effective-settings-resolver.md). This release covers the account view and the manual-start preview below. A schedule preview (`/api/me/effective-settings/schedule-preview`, `uzi settings get --schedule`) is **not built yet**; nothing on this page describes it as available.
+The effective-settings view answers "what would a run of mine use right now?" for the harness, the models and the reasoning efforts, instead of leaving you to combine the stored choices, the instance defaults and the built-ins by hand. It is **read-only**: it reads the same rules a run creation and a worker claim apply, writes nothing, takes no lock, reads no limit evidence and calls no model provider. Design: [PRD #3254](../prds/3254-effective-settings-resolver.md). This page covers the account view and the manual-start preview below; the schedule preview (`POST /api/me/effective-settings/schedule-preview`, `uzi settings get --schedule`) is described in [Scheduling](./scheduling.md#settings-preview).
 
 Both routes are owner-scoped and accept a browser session or a CLI token. They carry wire `version: 1`, tokens only (display labels live in `fixtures/model-settings/contract.json`), and never a credential id, label or value.
 
@@ -347,7 +347,7 @@ Each model and effort cell carries the stored choice, what **Default** would mea
 | Task-review effort | Neither review pass sends an effort (note `not_sent`). | `builtin` |
 | Cross-check model and effort | Your pin, else the worker default (model) or the cross-check default (effort). | `cross_check_pin`, `cross_check_worker_default`, `cross_check_default` |
 
-Subagent pins and repository-defined agents are not part of this view.
+Subagent pins and repository-defined agents are not part of the account view or the start-preview; the [schedule preview](./scheduling.md#settings-preview) predicts your own subagents' pins, and not repository-defined agents.
 
 ### When a value is fixed
 
@@ -392,7 +392,7 @@ When the harness is chosen at creation, `harness.value` and `credential` are nul
 
 An `inherit` override is dropped on the Codex alternative where creation drops it: under the automatic policy, and under overflow when Claude is preferred. When Codex is preferred, overflow moves to Claude, so the Codex alternative is the stay-on-Codex outcome, which creation refuses.
 
-The CLI does not call the start-preview. [`uzi settings get`](./cli.md#effective-settings) reads only the `GET`.
+The CLI does not call the start-preview. [`uzi settings get`](./cli.md#effective-settings) reads the `GET`, and with `--schedule` the [schedule preview](./scheduling.md#settings-preview).
 
 ## Agent runtime (PRD #4)
 
