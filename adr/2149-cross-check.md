@@ -591,7 +591,8 @@ A plan cross-check run (gated, or required on a claim issued after a forced huma
 HUMAN revise. When the lead asks a clarification, the run parks at `awaiting_input`. (In the
 same flight that hit the forced gate the claim still carries `auto_approve`, so the lead's
 question resolves through the autopilot sentinel without parking; that pre-existing behaviour
-is unchanged here, and only a reclaimed claim reaches this settlement.) An answer is not plan approval,
+is unchanged here, and in required mode only a reclaimed claim reaches this settlement; a gated
+claim never carries `auto_approve`, so its first flight does.) An answer is not plan approval,
 so `SetRunRunning`'s bound-approval clause refuses an ordinary `running` settlement there, and
 an issue run (or any run with `plan_revision_retry` negotiated) failed with "clarification
 running settlement was not confirmed"; other callers' unconfirmed `running` was refused
