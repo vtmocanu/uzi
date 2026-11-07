@@ -501,8 +501,9 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
         !invalid && !controller.signal.aborted && typeof ownership.beginReclaim === "function") {
       // With no admitted candidate nothing can be mutated, so no native scope is opened or finished; the pass
       // still reports reclaim_complete. Every loop body below runs only when admits is non-empty.
-      // An unsettled runner delete anywhere in this process (including startup sweeps) is fatal before any
-      // scope opens: EX is kept and no handover happens.
+      // An unsettled runner delete already recorded in this process is fatal before any scope opens (defence in
+      // depth: no startup step before the pass deletes today, but any delete recorded before or during the pass
+      // counts): EX is kept and no handover happens.
       try { deps.git.assertNoUnsettledDeletes(); } catch { fatal = true; throw new PodEpochSettlementError(); }
       const scope = admits.size > 0 ? ownership.beginReclaim() : undefined;
       reclaimScope = scope;

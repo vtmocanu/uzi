@@ -2553,6 +2553,13 @@ function isBoundOverflow(error: unknown): boolean {
   const e = error as { outputExceeded?: unknown; outputStream?: unknown; epochProcessJoined?: unknown };
   return e.outputExceeded === true && e.outputStream === "stdout" && e.epochProcessJoined === true;
 }
+/** Whether a failed Git child captured any stderr. Callers such as the clone refs read treat stderr as a
+ *  skipped-item signal, so a wrapper must not turn such an error into a settled limit. */
+function hasChildStderr(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const stderr = (error as { stderr?: unknown }).stderr;
+  return (typeof stderr === "string" || Buffer.isBuffer(stderr)) && stderr.length > 0;
+}
 // A fully observed, explicitly forbidden source setting is a settled keep;
 // it is not an incomplete observation of an admitted object store.
 class AutomaticContentRefusal extends Error {}
@@ -22250,13 +22257,15 @@ try {
     return output;
   }
 
-  private checkEpochMetadata(args: string[], stdout: string): void {
+  private checkEpochMetadata(args: string[], stdout: string, stderr = ""): void {
     const limits = this.epochRetained.getStore();
     if (!limits) return;
     this.checkRecoveryInterruption();
     const overflow = (message: string, suffix: "metadata_byte_cap" | "metadata_record_cap"): Error => {
       const error = this.retainedCause(new Error(message), suffix);
-      BOUND_OVERFLOW_ERRORS.add(error);
+      // A child that wrote any stderr is not a settled limit: callers read stderr as a skipped-item signal
+      // (for-each-ref warnings), and this throw happens before they can see it.
+      if (stderr === "") BOUND_OVERFLOW_ERRORS.add(error);
       return error;
     };
     if (Buffer.byteLength(stdout) > limits.maxMetadataBytes) throw overflow("epoch metadata byte limit", "metadata_byte_cap");
@@ -22313,7 +22322,7 @@ try {
     const { input, bytes: wantBytes, ...execOptions } = options;
     if (this.epochNative.getStore()) {
       const result = await this.execEpochNative(command === "git" ? GIT_BIN : command, args, options, identity, operationSignal);
-      this.checkEpochMetadata(args, result.stdout);
+      this.checkEpochMetadata(args, result.stdout, result.stderr);
       return result;
     }
     if (!boundary) {
@@ -22322,7 +22331,7 @@ try {
       assertNoCredentialedGitWhileQuarantined(options.env);
       if (MaintenanceResources.active()) {
         const result = await this.execMeteredNative(command, args, options, operationSignal);
-        this.checkEpochMetadata(args, result.stdout);
+        this.checkEpochMetadata(args, result.stdout, String(result.stderr ?? ""));
         return result;
       }
       // issue #1597 M2: optional stdin (the checkpoint scan's cat-file / gitleaks stdin). An EPIPE on
@@ -22344,7 +22353,7 @@ try {
         const result = await pending;
         this.checkRecoveryInterruption();
         const stdout = String(result.stdout);
-        this.checkEpochMetadata(args, stdout);
+        this.checkEpochMetadata(args, stdout, String(result.stderr));
         return { stdout, stderr: String(result.stderr),
           ...(wantBytes ? { stdoutBytes: Buffer.from(result.stdout), stderrBytes: Buffer.from(result.stderr) } : {}) };
       } catch (error) {
@@ -22521,7 +22530,7 @@ try {
       failure.stderr = err;
       throw failure;
     }
-    this.checkEpochMetadata(args, out);
+    this.checkEpochMetadata(args, out, err);
     return { stdout: out, stderr: err,
       ...(wantBytes ? { stdoutBytes: Buffer.concat(stdout.chunks), stderrBytes: Buffer.concat(stderr.chunks) } : {}) };
   }
@@ -22651,9 +22660,9 @@ try {
     this.assertCaptureDecoration(extraEnv);
     const env = { ...gitEnv(), ...extraEnv };
     this.log.debug("git (env)", { cwd, args });
+    const quietVerify = this.epochNative.getStore() !== undefined && args.length === 3 &&
+      args[0] === "verify-pack" && args[1] === "--";
     try {
-      const quietVerify = this.epochNative.getStore() !== undefined && args.length === 3 &&
-        args[0] === "verify-pack" && args[1] === "--";
       const { stdout, stderr } = await this.execScoped("git", withDir(cwd, [...args]), {
         env,
         timeout: GIT_TIMEOUT_MS,
@@ -22667,8 +22676,10 @@ try {
       const abort = this.boundaryAbortError(err);
       if (abort) throw abort;
       const failure = new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`, recoveryDeadlineCause(err));
-      // The wrapper drops the overflow facts; carry a positively identified stdout overflow to isBoundOverflow.
-      if (isBoundOverflow(err)) BOUND_OVERFLOW_ERRORS.add(failure);
+      // The wrapper drops the overflow facts; carry a positively identified stdout overflow to isBoundOverflow,
+      // except when the child wrote stderr (a skipped-item signal) or the call is a quiet pack verification
+      // (any output is UNKNOWN there).
+      if (isBoundOverflow(err) && !hasChildStderr(err) && !quietVerify) BOUND_OVERFLOW_ERRORS.add(failure);
       throw failure;
     }
   }
@@ -23141,7 +23152,7 @@ try {
     // an expected non-zero status (e.g. `config --unset-all` exit 5 = key absent) from a
     // real failure — the same `.code` idiom `tryGit` reads off the raw execFile error.
     const failure = new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
-    if (isBoundOverflow(err)) BOUND_OVERFLOW_ERRORS.add(failure);
+    if (isBoundOverflow(err) && !hasChildStderr(err)) BOUND_OVERFLOW_ERRORS.add(failure);
     const code = (err as { code?: unknown }).code;
     if (typeof code === "number") (failure as { code?: number }).code = code;
     return failure;

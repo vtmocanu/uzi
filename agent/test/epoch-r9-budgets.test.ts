@@ -323,6 +323,45 @@ describe("an overflow of each finite limit is a settled keep, not UNKNOWN", () =
   });
 });
 
+// The production read step runs a liveness check in its finally, so a revocation that lands while an open is in
+// flight throws AFTER the descriptor was acquired. Each git.ts site that opens a directory or file for the proof
+// must still close it (epoch-handle-close.test.ts pins the git-index.ts readers the same way).
+describe("a revocation that lands right after an open still closes the handle", () => {
+  /** Revokes the reservation when the first matching open resolves; counts the matching opens and closes. */
+  function revokeOnOpen(t: TestContext, method: "opendir" | "open", match: (target: string) => boolean) {
+    const original = (fsp[method] as (...a: unknown[]) => Promise<{ close(): Promise<void> }>).bind(fsp);
+    let opens = 0, closes = 0;
+    t.mock.method(fsp, method as "open", (async (...args: unknown[]) => {
+      const handle = await original(...args);
+      if (!match(String(args[0]))) return handle;
+      opens++;
+      const close = handle.close.bind(handle);
+      handle.close = () => { closes++; return close(); };
+      live = false;
+      return handle;
+    }) as never);
+    return { opens: () => opens, closes: () => closes };
+  }
+  it("control: the proof is provable when nothing is revoked", async () => {
+    assert.equal(await observation(), true);
+  });
+  const sites: Array<[string, "opendir" | "open", () => (target: string) => boolean]> = [
+    ["listDirectory (an object-store directory)", "opendir", () => target => target === objectDir(bare)],
+    ["the untracked-directory expansion", "opendir", () => target => target === path.join(clonePath, ".uzi")],
+    ["hashRegularFile (a tracked file)", "open", () => target => target.startsWith(clonePath + path.sep) &&
+      !target.startsWith(path.join(clonePath, ".git") + path.sep)],
+  ];
+  for (const [label, method, matcher] of sites) {
+    it(label, async t => {
+      const handles = revokeOnOpen(t, method, matcher());
+      // The revocation ends the proof (as a keep or as UNKNOWN); only the handle's fate is under test.
+      assert.notEqual(await observation().catch(() => "unknown"), true, "the revocation ended the proof");
+      assert.equal(handles.opens(), 1, "the site was reached and revoked");
+      assert.equal(handles.closes(), 1, "the acquired descriptor was closed");
+    });
+  }
+});
+
 // A corrupt, unreadable or indirect store, and an unresolved Git execution, are never a settled keep.
 describe("UNKNOWN is preserved for anything that is not a positively identified overflow", () => {
   async function assertUnknown(t: TestContext, limits: Limits = {}, message?: RegExp): Promise<void> {
@@ -434,6 +473,53 @@ describe("UNKNOWN is preserved for anything that is not a positively identified 
     const error = await failure(observeStores());
     assert.equal(error.name, "AutomaticCompletenessUnknown");
     assert.equal(error.message, "object config listing exceeds the observation limit");
+  });
+  // `for-each-ref` exits 0 with a stderr warning for a ref it ignores (a broken name); the clone refs read treats ANY
+  // stderr as UNKNOWN. A record-cap overflow of the same listing must not win over that signal and become a keep.
+  // A real fixture cannot isolate it (the shape stage counts the same refs first), so the Git child is faked below
+  // the real scoped wrapper: 131,073 ordinary lines plus Git's own warning text, with the real record-cap check.
+  it("a refs listing past the record cap that also warned on stderr is UNKNOWN, not a keep", async t => {
+    const head = command(clonePath, "rev-parse", "HEAD");
+    const original = git["execEpochNative"].bind(git);
+    let listed = 0;
+    t.mock.method(git as unknown as { execEpochNative: typeof original }, "execEpochNative", async (...args: Parameters<typeof original>) => {
+      if (args[1].includes("for-each-ref") && args[1].includes("--format=%(objectname) %(refname) %(symref)")) {
+        listed++;
+        return { stdout: `${head} refs/heads/r \n`.repeat(131_073),
+          stderr: "warning: ignoring ref with broken name refs/heads/bad..name\n" };
+      }
+      return original(...args);
+    });
+    const error = await failure(observation());
+    assert.ok(listed > 0, "the refs listing was reached");
+    assert.equal(error.name, "AutomaticCompletenessUnknown", error.message);
+    assert.equal(stopped, false);
+  });
+  it("the same oversized refs listing without any stderr is still a settled keep", async t => {
+    const head = command(clonePath, "rev-parse", "HEAD");
+    const original = git["execEpochNative"].bind(git);
+    t.mock.method(git as unknown as { execEpochNative: typeof original }, "execEpochNative", async (...args: Parameters<typeof original>) => {
+      if (args[1].includes("for-each-ref") && args[1].includes("--format=%(objectname) %(refname) %(symref)"))
+        return { stdout: `${head} refs/heads/r \n`.repeat(131_073), stderr: "" };
+      return original(...args);
+    });
+    assert.equal(await observation(), false);
+  });
+  it("a quiet verify-pack whose joined stdout overruns the cap is UNKNOWN, not a keep", async t => {
+    const original = git["execScoped"].bind(git);
+    let verified = 0;
+    t.mock.method(git as unknown as { execScoped: typeof original }, "execScoped", async (...args: Parameters<typeof original>) => {
+      if (args[1].includes("verify-pack")) {
+        verified++;
+        throw Object.assign(new Error("git subprocess maxBuffer exceeded"), { outputExceeded: true, outputStream: "stdout",
+          code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", epochProcessJoined: true, stdout: "", stderr: "" });
+      }
+      return original(...args);
+    });
+    command(bare, "repack", "-a", "-d");
+    const error = await failure(observation());
+    assert.ok(verified > 0, "verify-pack was reached");
+    assert.equal(error.name, "AutomaticCompletenessUnknown", error.message);
   });
   it("a 630 KB clone config with partialclone and 90,000 rows under 250-character sections is UNKNOWN at the default caps", async t => {
     const section = "s".repeat(250);

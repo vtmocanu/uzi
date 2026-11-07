@@ -1506,19 +1506,23 @@ async function refusedReinspectWithLatch(count: number) {
     return w;
   } finally { for (const cancel of timers) cancel(); await d.close(); }
 }
-// A Git delete left unsettled by a startup sweep (GitCache's process-wide unsettled map) is fatal for the pass even
-// when every candidate is only refused or settled by metadata, which never consult that map themselves.
+// A Git delete left unsettled before the pass (GitCache's process-wide unsettled map; defence in depth for any
+// delete the process records before or during the pass) is fatal for the pass even when every candidate is only
+// refused or settled by metadata, which never consult that map themselves.
 test("an unsettled Git delete is fatal: EX kept, no finish, no handover", async () => {
   const missing = (s: RetainedSourceEvidence) => {
     s.ledgerState = "retired" as never; s.sources[0]!.ledgerState = "retired" as never;
     s.presence = "missing"; s.sources[0]!.presence = "missing"; s.sources[0]!.allocatedBytes = null;
   };
-  const cases: Array<[string, (w: ReturnType<typeof makeWorld>) => void]> = [
+  // `before` marks the cases where the delete is outstanding when the deletion phase starts: the pre-scope check
+  // alone must end the pass, so no scope opens and nothing is proved, discarded or quiesced.
+  const cases: Array<[string, (w: ReturnType<typeof makeWorld>) => void, number?]> = [
     ["outstanding before a pre-effect refusal", w => { w.unsettled = true; w.ownership = (() => { let n = 0; return () => ({ status: ++n === 1 ? "completed" : "running" }); })(); }],
     ["outstanding before a metadata-only repair", w => {
       w.unsettled = true; w.journal = () => [""]; w.mutateSource = missing;
       w.discard = (_o, path) => ({ kind: "done", sources: [{ clonePath: path, outcome: "missing" }], metadata: "retired" });
     }],
+    ["outstanding before a pass with zero admitted candidates", w => { w.unsettled = true; }, 0],
     ["raised during a refusal, found at finish", w => {
       w.discard = () => { w.unsettled = true; return { kind: "refused", reason: "x", consumers: [] }; };
     }],
@@ -1527,15 +1531,21 @@ test("an unsettled Git delete is fatal: EX kept, no finish, no handover", async 
       w.discard = (_o, path) => { w.unsettled = true; return { kind: "done", sources: [{ clonePath: path, outcome: "missing" }], metadata: "retired" }; };
     }],
   ];
-  for (const [label, tune] of cases) {
+  for (const [label, tune, count = 1] of cases) {
     const d = await daemon();
     const timers: Array<() => void> = [];
     try {
-      const w = deletionWorld(1, tune); w.options.dockerHost = d.host;
+      const w = deletionWorld(count, tune); w.options.dockerHost = d.host;
+      let quiesces = 0;
+      w.options.deletion!.quiesce = async () => { quiesces++; return true; };
       w.options.schedule = (callback, ms) => { const t = setTimeout(callback, ms); const c = () => clearTimeout(t); timers.push(c); return c; };
       await assert.rejects(runPodEpochShadow(w.options), PodEpochSettlementError, label);
       assert.equal(w.spies.finishes, 0, label + ": finish is never reached");
       assert.equal(w.calls.handovers, 0, label); assert.ok(!w.events.includes("handover"), label);
+      if (label.startsWith("outstanding before")) {
+        noMutation(w);
+        assert.equal(w.spies.begins, 0, label + ": no scope opened"); assert.equal(quiesces, 0, label + ": no quiesce");
+      }
     } finally { for (const cancel of timers) cancel(); await d.close(); }
   }
 });
