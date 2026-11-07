@@ -363,6 +363,9 @@ func TestPolicyRecoveryDownRefusesLiveRowsWithoutPartialConversionLiveDB(t *test
 					t.Fatalf("run %s not converted", id)
 				}
 			}
+			if v, n := f.version(), f.columns(recoveryColumns...); v != 412 || n != 0 {
+				t.Fatalf("retried Down left version %d with %d recovery columns, want 412 and 0", v, n)
+			}
 		})
 	}
 }
@@ -420,6 +423,14 @@ func TestPolicyRecoveryDownRefusesOrphansLiveDB(t *testing.T) {
 		f.refused("orphaned or malformed recovery identity")
 		if f.row(convertible)["status"] != "paused" {
 			t.Fatal("convertible row changed")
+		}
+		// Repairing the orphan lets the same Down proceed and convert the paused row.
+		mustExec(f.ctx, t, f.pool, "UPDATE runs SET policy_recovery_verified_generation=NULL,policy_recovery_verified_head=NULL WHERE id=$1", orphan)
+		if err := store.MigrateDownTo(f.ctx, f.dsn, 412); err != nil {
+			t.Fatalf("Down after repair: %v", err)
+		}
+		if v := f.version(); v != 412 || f.row(convertible)["status"] != "failed" {
+			t.Fatalf("retried Down: version %d, convertible status %v", v, f.row(convertible)["status"])
 		}
 	})
 	t.Run("malformed head that predates the shape check", func(t *testing.T) {

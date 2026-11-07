@@ -30,8 +30,21 @@ func TestPolicyRecoveryIdentityMigrationLiveDB(t *testing.T) {
 	mustExec(ctx, t, pool, `INSERT INTO runs(id,user_id,repo_id,issue_iid,issue_title,issue_description,status,harness,worker_id,claim_generation,session_id,
 		policy_outcome_id,policy_continuation_mode,policy_applying_worker_id,policy_applying_generation,policy_source_generation,policy_preserve_required)
 		VALUES($1,$2,$3,3607,'t','d','paused','codex',$4,1,'s',$5,'same_conversation',$4,1,1,true)`, run, owner, repo, worker, uuid.New())
+	version := func(want int64) {
+		t.Helper()
+		var v int64
+		if err := pool.QueryRow(ctx, "SELECT max(version_id) FROM goose_db_version WHERE is_applied").Scan(&v); err != nil || v != want {
+			t.Fatalf("goose version = %d (%v), want %d", v, err, want)
+		}
+	}
+	version(412)
 	if err := store.MigrateTo(ctx, dsn, 413); err != nil {
 		t.Fatal(err)
+	}
+	version(413)
+	var validated bool
+	if err := pool.QueryRow(ctx, "SELECT convalidated FROM pg_constraint WHERE conname='runs_policy_required_recovery_shape'").Scan(&validated); err != nil || !validated {
+		t.Fatalf("runs_policy_required_recovery_shape validated = %v (%v), want a validated check", validated, err)
 	}
 	var nulls bool
 	if err := pool.QueryRow(ctx, `SELECT policy_required_head IS NULL AND policy_recovery_verified_generation IS NULL
@@ -66,6 +79,7 @@ func TestPolicyRecoveryIdentityMigrationLiveDB(t *testing.T) {
 	if err := store.MigrateDownTo(ctx, dsn, 412); err != nil {
 		t.Fatalf("Down must convert the paused R-bearing row, not refuse it: %v", err)
 	}
+	version(412)
 	var status string
 	if err := pool.QueryRow(ctx, "SELECT status FROM runs WHERE id=$1", run).Scan(&status); err != nil || status != "failed" {
 		t.Fatalf("paused R-bearing row status = %q (%v), want failed", status, err)
