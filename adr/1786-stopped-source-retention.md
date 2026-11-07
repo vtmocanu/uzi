@@ -535,6 +535,8 @@ mechanism, its crash table and its R9 limits are recorded in the
 - **Admitted shapes.** The strict three-key journal `{runId, clonePath, attemptId}` with
   the ledger `live` (footprint present or missing) or `retired` (footprint missing; the
   retry skips the retired append), and the explicitly valued `[""]` repair (metadata only).
+  The epoch disposal also refuses non-live/non-retired ledger states (`reclaimed`,
+  `abandoned`), and `[""]` requires the exact retired-empty-journal repair.
 - **Same holds rule, stricter.** Besides a terminal lifecycle and an empty hold list, the
   epoch path needs a run-wide `run_open_holds` count of exactly 0 for the run.
 - **Process crash only.** No storage or power-loss durability is claimed; the residual

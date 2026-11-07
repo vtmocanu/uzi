@@ -287,8 +287,9 @@ per-pod `emptyDir`.
   threshold, and the volume sizes are unchanged. A full Docker data PVC can
   leave capacity degraded. Existing run park-and-trim and supported manual
   settled-tree cleanup remain the reclaim paths; see
-  [Run recovery](./run-recovery.md). PRD #3431 M1b settlement/deletion is not
-  started and #3329's genuine-idle reclaim roll remains deferred; no new
+  [Run recovery](./run-recovery.md). PRD #3431 M1b settlement/deletion is
+  implemented behind an off-by-default gate, so production still deletes
+  nothing, and #3329's genuine-idle reclaim roll remains deferred; no new
   reclaim authority is granted. Data-pressure deferral neither requests nor
   clears drains: existing pressure drains persist until pressure clears,
   and the worker stays out of roll coverage. Independent Nix pressure can

@@ -1559,7 +1559,11 @@ The epoch path admits three shapes, each one attempt, one part, sole namer of it
 Everything else is kept and counted without any authority read or proof: a no-key journal
 (`[]`), a valueless key, duplicates or extra fields, and every marker-less canonical source
 are `kept_unrecoverable_shape`; a `local_protected_discard` disposition is `kept_protected`.
-Structural keeps never downgrade the verdict. A successor's journal is never cleared.
+Structural keeps never downgrade the verdict. The epoch disposal also refuses any ledger state other than `live` or `retired`
+(`reclaimed`, `abandoned`), so a `reclaimed` or `abandoned` attempt with an empty journal is kept
+as `kept_unrecoverable_shape`; `[""]` is admitted only as the exact retired-empty-journal
+repair (shape b). Journal shape and ledger state are classified before any authority read.
+The shadow pass's `would_delete` may still count such an attempt. A successor's journal is never cleared.
 
 ### R5: the proof constructor narrows itself
 
