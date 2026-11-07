@@ -1562,7 +1562,7 @@ are `kept_unrecoverable_shape`; a `local_protected_discard` disposition is `kept
 Structural keeps never downgrade the verdict. The epoch disposal also refuses any ledger state other than `live` or `retired`
 (`reclaimed`, `abandoned`), so a `reclaimed` or `abandoned` attempt with an empty journal is kept
 as `kept_unrecoverable_shape`; `[""]` is admitted only as the exact retired-empty-journal
-repair (shape b). Journal shape and ledger state are classified before any authority read.
+repair (shape b). Journal shape and ledger state are classified before any deletion-phase authority read (the shadow pass has already read ownership and holds).
 The shadow pass's `would_delete` may still count such an attempt. A successor's journal is never cleared.
 
 ### R5: the proof constructor narrows itself
