@@ -210,3 +210,77 @@ Counted on 2026-11-06 from depth-1, blob-less bare clones of each repository's d
 - **`baseDiscoveryPathByteCap` = 100,663,296 (96 MiB)** (2.36× Chromium's 42,616,138 path bytes).
 - **Estimated container peak with both caps reached:** 134 MiB + 1,200,000 × 240 B (≈ 275 MiB, already including about 15 path bytes per entry) + (96 MiB − 17 MiB) × 1.91 (≈ 151 MiB) ≈ **560 MiB**, inside the 1536 MiB per-slot budget. This is an estimate only; M3 measures the capped helper and decides acceptance.
 - **Time:** at 1 CPU the wide fixtures charge about 44,000 entries/s, so a wide base reaches the entry cap after about 27.5 s (projected from wide-1024x1024), within about 0.5 s of the 28 s helper deadline. Which one binds depends on host speed (the 2 CPU rows charge 50,700–54,150 entries/s). The path-byte cap is reached in seconds (about 3 s for 96 MiB at the f4 rate).
+
+# Aggregate bound (issue #3543): M3 measurement with the capped helper and acceptance
+
+Measured on 2026-11-06/07 with the capped helper (`baseDiscoveryEntryCap` = 1,200,000, `baseDiscoveryPathByteCap` = 100,663,296) and the harness at commit `455673e7`, in the same `pbd-measure:1fca12dd` image as the M1 section. The image is the runtime only: `run.sh` bind-mounts this checkout's `agent/`, so the helper measured is the one at `455673e7`. Each configuration ran once unless stated. Every job exited 0, with no OOM, no harness kill and no `FAIL` flag.
+
+- **Commands** (all `MEASURE_IMAGE=pbd-measure:1fca12dd`):
+  1. production rows, 1127 s: `REPO_SHA=455673e7 FIXTURES="repo synthetic-50000 wide-1170x1024 wide-1171x1024 longpath-d60n250w2000f3 longpath-d60n250w2000f4 distinct-1170x1024n75 fatchain-d64" MEM_CONFIGS="1536m:1:full,control 4g:2:full"`;
+  2. rerun and sizing-batch rows: the same with `FIXTURES="repo synthetic-50000 distinct-256x1024n75 distinct-512x1024n75"`;
+  3. twelve validation probes, 1641 s: one invocation each with `MEM_CONFIGS="4g:2:full"`, `LIMITS_JSON` and `LIMITS_TAG` (below).
+- **Raw records:** `results-2026-11-06-bound-m3.jsonl` beside this file. It holds 48 records, each tagged with its `run` (`m3-production`, `m3-rerun`, `m3-probes`).
+- **Disk:** each configuration's container and its anonymous volumes were removed with `docker rm -v` as soon as its results were on the mounted output directory. No measurement container remained after any invocation.
+
+## Production rows (default limits)
+
+| fixture | what it exercises | outcome, `control` 1536m/1 | container peak MiB, `control` 1536m/1 | outcome, `full` 4g/2 | container peak MiB, `full` 4g/2 |
+|---|---|---|---|---|---|
+| repo (`455673e7`, 9,368 entries) | clean control | completed | 146.4 | completed | 218.9 |
+| synthetic-50000 (50,500 entries) | clean control | completed | 177.6 | **`capture_deadline`** (28.2 s, first run); completed in 13.9 s on the rerun | 295.0; rerun 210.5 |
+| wide-1170x1024 (1,199,250 entries, under the entry cap) | entry cap, just under | `capture_deadline` before discovery finished | 442.2 | `capture_deadline` (1,098,898 entries fetched) | 440.1 |
+| wide-1171x1024 (1,200,275 entries) | entry cap, just over | **`base_discovery_entry_cap`** (25.7 s) | 367.1 | `git_deadline` before the cap (1,185,939 entries fetched) | 447.1 |
+| longpath-d60n250w2000f3 (93,237,810 path bytes) | path-byte cap, just under | discovery completed, then `errno:ENAMETOOLONG` (see the M1 section) | 226.1 | same | 226.3 |
+| longpath-d60n250w2000f4 (124,317,080 path bytes) | path-byte cap, just over | **`base_discovery_path_byte_cap`** (3.7 s) | 229.9 | **`base_discovery_path_byte_cap`** | 230.7 |
+| distinct-1170x1024n75 (1,199,250 entries, 1,198,080 distinct blobs, 99,448,830 path bytes) | both caps nearly reached, maximal sizing batch | `capture_deadline` before discovery finished | 449.3 | `git_deadline` (974,994 entries fetched) | 448.5 |
+| fatchain-d64 (65 nested 1.95 MiB trees) | pinned in-flight tree buffers | **`base_discovery_path_byte_cap`** (13.1 s) | **502.4** | **`base_discovery_path_byte_cap`** | **575.5** |
+
+- **Charged work at the cap refusals**, labelled `derived-from-refusal` (7c) and confirmed by the probes below where noted:
+  - wide-1171x1024 at 1536m/1: E = 1,200,001, P = 17,990,632. The P figure is not probe-confirmed at that index (see the probes).
+  - longpath-d60n250w2000f4: E = 6,696, P = 100,678,440.
+  - fatchain-d64: E = 830,983, P = 100,663,348. The fat chain's filler file names, charged under a 64-level prefix, reach the path-byte cap before the entry cap.
+- **Discovery speed binds before the entry cap on this host.** No near-cap wide or distinct base finished discovery within the 28 s helper deadline at either configuration. The entry cap fired only on wide-1171x1024 at 1 CPU (25.7 s). On this host the deadline therefore stops most near-cap bases first. The caps bound memory on any host, however fast.
+- **The synthetic-50000 `capture_deadline` at 4g/2** happened in the first production run, with a host load average of about 10 from other runs. Its discovery had completed (5,964 ms, 50,500 entries, `meterMatch`). The deadline fired in the post-discovery file walk, at 28.2 s, against 13.0–13.9 s in every other 4g/2 run of this fixture (#3991, M1, the rerun here). It is 24× below the entry cap and 200× below the path-byte cap, so the caps cannot cause it. The rerun completed at both configurations.
+
+## Sizing-batch worst case (distinct blobs)
+
+The auditor of M2 noted that every M1 fixture shared one blob, so the post-discovery sizing batch (`cat-file --batch-check` over the distinct blob ids) was never large. The distinct fixtures complete discovery, including the sizing batch, up to 512 directories:
+
+| fixture | entries / distinct blobs | discovery (`full` 1536m/1) | container peak MiB, `control` 1536m/1 | container peak MiB, `full` 4g/2 |
+|---|---|---|---|---|
+| distinct-256x1024n75 | 262,400 / 262,144 | 10.9 s | 301.2 | 386.4 |
+| distinct-512x1024n75 | 524,800 / 524,288 | 21.6 s | 543.4 | 505.1 |
+
+- **Extrapolated to the entry cap** (1,199,250 entries, all distinct). This is an extrapolation, not a measurement, because no such base completes discovery inside the deadline on this host.
+  - Linear in the `control` rows: 301.2 MiB + 936,850 × 968 B ≈ **1,166 MiB**.
+  - Linear in the `full` 4g/2 rows: ≈ 810 MiB.
+  - Both include the post-discovery work these `--no-checkout` fixtures add (every base path diffs as a deletion until `git_deadline`), so they are conservative for discovery alone.
+
+## Validation probes (7f, injected limits, 4g/2)
+
+For each index i, the pair `(entryCap = i, pathByteCap = Pm(i) − 1)` must refuse with `base_discovery_path_byte_cap` (actual A(i) ≥ Pm(i)), and `(entryCap = i, pathByteCap = Pm(i))` must refuse with `base_discovery_entry_cap` (A(i) ≤ Pm(i)). Pm comes from the harness's analytic model.
+
+| fixture | i | Pm(i) | path-token probe | entry-token probe | result |
+|---|---|---|---|---|---|
+| longpath-d60n250w2000f4 | 6,695 | 100,663,130 | path cap | entry cap | A = Pm |
+| longpath-d60n250w2000f4 | 6,696 | 100,678,440 | path cap | entry cap | A = Pm |
+| fatchain-d64 | 830,982 | 100,663,240 | path cap | entry cap | A = Pm |
+| fatchain-d64 | 830,983 | 100,663,348 | path cap | entry cap | A = Pm |
+| wide-8x1024 | 3,000 (inside a leaf tree buffer) | 44,976 | path cap | entry cap | A = Pm |
+| wide-1171x1024 | 1,200,000 | 17,990,632 | `capture_deadline` | `capture_deadline` | inconclusive: the deadline fired before entry 1,200,000 |
+
+- The pairs at k and k − 1 pin both production path-cap refusals (longpath-d60n250w2000f4 and fatchain-d64) to exactly k with the derived E and P: A(k − 1) = Pm(k − 1) ≤ 100,663,296 < Pm(k) = A(k).
+- The probe meter's fetched counts (8,240 longpath; 3,900,064 fatchain; 3,080 wide-8x1024) exceed the charged counts. This shows why fetched counts are never reported as charges.
+
+## Decision (M3 rule)
+
+1. **Memory:** the largest measured whole-capture container peak with the caps in force is 575.5 MiB (fatchain-d64, 4g/2), and 502.4 MiB on the 1536 MiB / 1 CPU slot. The extrapolated sizing-batch worst case is about 1,166 MiB. All fit the 1536 MiB per-slot budget.
+2. **Clean controls:** this repository and synthetic-50000 capture at the caps in the M2 tests (`git-planning-diff.test.ts`, "Base discovery aggregate caps (#3543)") and in the harness rerun at both configurations. The one 4g/2 `capture_deadline` above is a post-discovery deadline under host load, not a cap.
+3. **Realistic margin (rule 5a):** the caps stay at 2.13× (entries) and 2.36× (path bytes) Chromium's tree, as in the M1 section.
+
+**Accepted:** `baseDiscoveryEntryCap` = 1,200,000 and `baseDiscoveryPathByteCap` = 100,663,296 (96 MiB). No lowering iteration was needed.
+
+**Residual, not measured:**
+- Compose enforces memory per worker, not per run, so concurrent runs in one worker share the 1536 MiB-per-slot arithmetic.
+- The extrapolated 1,166 MiB case was not reached on this host.
+- Each configuration ran once.
