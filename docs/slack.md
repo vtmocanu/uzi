@@ -166,9 +166,12 @@ with the bot, so the sender is already `uzi`. Glyph legend:
   prefers the run harness's native folder. A present preferred folder is final
   even if empty or invalid; see [Repo agents](./repo-agents.md#which-folder-is-read).
   The repo card is a whole-roster choice only; to exclude individual agents,
-  approve from the web UI instead. With no detected roster, the gate shows the
-  single **Approve** button (your templates). Mere directory existence does not
-  enable the repo choice.
+  approve from the web UI instead. **Approve · repo agents (N)** comes first
+  and is the primary button, unless the run's [default for the
+  repo](./repo-agents.md#set-a-default-for-your-runs-on-a-repo) is **uzi
+  templates**: then **Approve · my templates** comes first and is the primary
+  button. With no detected roster, the gate shows the single **Approve** button
+  (your templates). Mere directory existence does not enable the repo choice.
 - **Answering a question**: an agent that hits a fork it shouldn't resolve
   alone can stop and ask you. The run parks, its status reads **needs your
   answer**, and the question is posted into the run thread with any suggested

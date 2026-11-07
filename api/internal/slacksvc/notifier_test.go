@@ -991,6 +991,43 @@ func TestNotifierGateOffersRepoAndOwnWhenRosterDetected(t *testing.T) {
 	}
 }
 
+func TestNotifierGateFollowsRunRequestedSource(t *testing.T) {
+	repoFirst := []string{ActionGateApproveRepo, ActionGateApproveOwn, ActionGateRequestChanges, ActionGateReject, ActionGateOpen}
+	ownFirst := []string{ActionGateApproveOwn, ActionGateApproveRepo, ActionGateRequestChanges, ActionGateReject, ActionGateOpen}
+	for _, tc := range []struct {
+		name      string
+		requested pgtype.Text
+		runErr    error
+		want      []string
+	}{
+		{"unset", pgtype.Text{}, nil, repoFirst},
+		{"repo", txt("repo"), nil, repoFirst},
+		{"own", txt("own"), nil, ownFirst},
+		{"run lookup fails", txt("own"), errors.New("boom"), repoFirst},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rc := baseRun("awaiting_approval")
+			rc.RepoAgentNames = []string{"coder", "reviewer"}
+			fs := &fakeNotifStore{
+				rc:            rc,
+				delivery:      txt("U1"),
+				msg:           store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"},
+				planCount:     1,
+				crossCheckRun: store.Run{ID: rc.ID, AgentSourceRequested: tc.requested},
+				runErr:        tc.runErr,
+			}
+			fp := &fakePoster{dmChannel: "D1"}
+			NewNotifier(fs, fp, fixedBase, nil).handle(context.Background(), stateEvent{runID: rc.ID, status: "awaiting_approval"})
+			if len(fp.blocks) != 1 {
+				t.Fatalf("gate must post one Block Kit message: %+v", fp.blocks)
+			}
+			if got := strings.Join(fp.blocks[0].actionIDs, ","); got != strings.Join(tc.want, ",") {
+				t.Fatalf("gate buttons = %s, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // A redundant awaiting_approval re-broadcast of the SAME plan generation must not get
 // a second gate message or re-post the plan (PRD #41 Decision 10e).
 func TestNotifierDoesNotDoublePostGate(t *testing.T) {
