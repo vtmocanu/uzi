@@ -75,7 +75,7 @@ func newInterlockCreateSvc(t *testing.T, reader CompletionInterlockReader) (*Ser
 // D1), so the D2 hard claim clause is not vacuous for the plan-phase worker.
 func TestCreateRunStampsInterlockWhenRolloutOn(t *testing.T) {
 	svc, fs := newInterlockCreateSvc(t, fakeCompletionInterlock{on: true})
-	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, nil, nil, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, nil, nil, nil, nil); err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
 	if fs.createRunParams == nil {
@@ -91,7 +91,7 @@ func TestCreateRunStampsInterlockWhenRolloutOn(t *testing.T) {
 // completion_contract_version NULL — so it is never interlocked.
 func TestCreateRunNoStampWhenRolloutOff(t *testing.T) {
 	svc, fs := newInterlockCreateSvc(t, fakeCompletionInterlock{on: false})
-	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, nil, nil, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, nil, nil, nil, nil); err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
 	if fs.createRunParams == nil {
@@ -107,7 +107,7 @@ func TestCreateRunNoStampWhenRolloutOff(t *testing.T) {
 // new run is legacy, never interlocked.
 func TestCreateRunNoStampWhenReaderUnset(t *testing.T) {
 	svc, fs := newInterlockCreateSvc(t, nil)
-	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, nil, nil, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, nil, nil, nil, nil); err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
 	if fs.createRunParams.CompletionContractVersion.Valid {
@@ -120,7 +120,7 @@ func TestCreateRunNoStampWhenReaderUnset(t *testing.T) {
 // plus the error), so a momentary cold settings-read failure never stamps a run.
 func TestCreateRunNoStampOnReadError(t *testing.T) {
 	svc, fs := newInterlockCreateSvc(t, fakeCompletionInterlock{on: true, err: context.DeadlineExceeded})
-	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, nil, nil, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, nil, nil, nil, nil); err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
 	if fs.createRunParams.CompletionContractVersion.Valid {
@@ -192,7 +192,7 @@ func TestBuildCompletionContractEmpty(t *testing.T) {
 func TestCreateRunNoStampForSeededPlan(t *testing.T) {
 	svc, fs := newInterlockCreateSvc(t, fakeCompletionInterlock{on: true})
 	seed := &SeededPlan{PlanMD: "Refactor the token store; add a test in queries_test.go"}
-	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, seed, nil, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, seed, nil, nil, nil); err != nil {
 		t.Fatalf("CreateRun (seeded): %v", err)
 	}
 	if fs.createRunParams == nil {
