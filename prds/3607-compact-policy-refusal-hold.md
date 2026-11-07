@@ -18,19 +18,21 @@ The M1 history and its candidate-bound CI evidence remain in git history (PR #36
 - Compatible-lane preserve Resume and optional `fresh_one_claim`, with consumption, fenced non-delivery restore, confirmation and `fresh_start_uncertain` reclaim.
 - R/VG/VH continuity and the post-Fresh saved-work verification.
 - Guidance-bound exact replay.
-- Guarded Downs for migrations 00413/00414/00415.
+- Guarded Downs for migrations 00414 and 00413; the 00415 Down restores the NOT VALID check.
 - The web `PolicyHoldPanel` and the CLI `uzi run resume-now --policy-mode`.
 - API enablement of `provider_policy_hold_v1`.
 - Docs, spec, ADR section and changelog.
+- F5: retention flags held by a pending policy admission are released by that admission alone (`RetentionFlag` / `releasePolicyAdmission` in `agent/src/runner.ts`), keeping independent vetoes.
 
 ### Evidence on this run (in-run, labelled by SHA)
 
-- **Core-only tree C** (merge-tree of 4164c7a4a with main 13712c445, tree f9ec4ec4): build, vet and race unit tests pass for store/workersvc/handler/apitypes; 28 core LiveDB tests pass with 0 skipped; agent typecheck passes; 140 agent tests pass. Agent lint did not run in the export (a path artifact).
-- **Full tree at 436b09ced:** fmt-check, vet, build, sqlc-drift and `lint:api` (0 issues) pass; race unit tests pass for store/workersvc/handler/apitypes; `check:agent` strict passes; `test:codex-m4` 209/209 with completeness OK; 1856 agent tests pass; 51 policy LiveDB tests pass with 0 skipped (store/workersvc/handler at 592262afa); the Shape-A Up and rollback walk passes.
-- **Mutation checks:** consumption, restore generation fence, confirmation generation conjunct, reclaim predicate, harness allowance spend, and supersession conjuncts (published, checkpoint-contains-latest, verified generation) each turn a test red. The verification route's generation fence is red through a store-level test.
+- **Core-only tree C** (merge-tree of 4164c7a4a with main 13712c445, tree f9ec4ec4): build, vet and race unit tests pass for store/workersvc/handler/apitypes; 28 core LiveDB tests pass with 0 skipped; agent typecheck passes; 140 agent tests pass. Agent lint was not run in the export (oxlint found no files under the scratch path); it passed on the real tree.
+- **LiveDB at 592262afa:** 51 policy LiveDB tests (16 store including the Shape-A Up and rollback walk, 26 workersvc, 9 handler) pass with 0 skipped (skip guard).
+- **Full tree at 436b09ced:** fmt-check, vet, build, sqlc-drift and `lint:api` (0 issues) pass; race unit tests pass for store/workersvc/handler/apitypes; `UZI_DEADCODE_AGENT_REQUIRED=1 task check:agent` passes; `test:codex-m4` 209/209 with its completeness report OK; a nine-file agent selection (1856 tests) passes; the new store fence LiveDB tests and the `TestPolicyFresh*LiveDB` set pass.
+- **Mutation checks (scratch exports):** consumption, restore generation fence, confirmation generation conjunct, reclaim predicate, harness allowance spend, and the checkpoint-contains-latest and verified-generation supersession conjuncts each turn a test red. The `published` supersession conjunct and the verification route's generation fence are shadowed by Go checks and turn red only through the store-level tests added at 436b09ced. The #3153 saved-work guard removal turns `runner-policy-saved-work.test.ts` red. At 920972ae4 the matrix guidance mutant is red; the harness missing-allowance mutant survives the matrix but is pinned by the executor test "the same claim without an allowance re-holds with session_missing and zero thread/start".
 - **m3 at e600bc34a/1f819ba3c:** CLI race tests pass; `check:web` passes; 1311 Vitest tests and 4 browser cases pass.
-- **m4 at 920972ae4:** the integrated owner/worker lifecycle LiveDB test passes; handler race unit tests pass; 1821 agent tests including the fake-provider matrix pass; `test:e2e-lib` and `test:forge-fake` pass.
-- Security scans and final slices at 920972ae4: scan:secrets (0 tracked findings, canaries detected), sast:semgrep, check:token-literals, vulncheck:api/web/agent (0 called vulnerabilities), fmt-check/vet/build/sqlc-drift, lint:api (0 issues), migration numbering, check:changelog-entry and check-docs:web all passed; no .github change.
+- **m4 at 920972ae4:** the integrated owner/worker lifecycle LiveDB test passes; handler race unit tests pass; a six-file agent selection (1821 tests, including the fake-provider matrix) passes; `test:e2e-lib` and `test:forge-fake` pass.
+- Security scans and final slices at 920972ae4: scan:secrets (0 tracked findings, canaries detected), sast:semgrep, check:token-literals, vulncheck:api (0 called vulnerabilities), vulncheck:web and vulncheck:agent (0 reported), fmt-check/vet/build/sqlc-drift, lint:api (0 issues), migration numbering, check:changelog-entry and check-docs:web all passed; no .github change.
 
 ### Not run in-run / pending
 
@@ -38,13 +40,15 @@ The M1 history and its candidate-bound CI evidence remain in git history (PR #36
 - Full `test:api`, `test-api-store-it` (the full seven-package LiveDB lane), `test:web`, `test:web-browser`, `gate:repo` and the full agent suite are exact-head PR CI landing obligations.
 - Test and CI time: the new tests' run times were not measured against the base; CI critical-path impact is unmeasured.
 - Natural-refusal acceptance stays in #3608. Docker same-conversation stays in #3609.
+- I1, the informative milestone deferred by the M1 partial decision, is not delivered or claimed here.
+- Optional m3 historic-head hardening stays deferred: the report path validates 40/64-hex heads and React escapes text, but arbitrary historic database values are not revalidated.
 
 ### Cross-issue regression map
 
 | Reference | Disposition | Evidence |
 |---|---|---|
 | #2852 | Existing guard; refused or unverified disposal retains source/custody. A named residual, no fix here. | M1 pending-disposition LiveDB tests |
-| #2969 | Predecessor holds unchanged; `settlePredecessorHolds` and the ordinary terminal FINAL path untouched (diff against 13712c445). | `agent/test/predecessor-command-uid.test.ts` and the runner-retained-predecessor tests pass |
+| #2969 | Predecessor holds unchanged; `settlePredecessorHolds` and the ordinary terminal FINAL path untouched (diff against 13712c445). | `agent/test/predecessor-command-uid.test.ts` and `runner-retained-predecessor-{final,transport}.test.ts` passed in the nine-file selection at 436b09ced |
 | #3153 | The PVC subPath mount is pinned; replacement recovery and re-hold are covered, with a mutant red. | controller `TestDockerWorkerSharesTheRunWorkdirWithDindButNotSecrets`; `agent/test/runner-policy-saved-work.test.ts` |
 | #3149 | The first fresh turn carries the guidance, earlier follow-ups and approval/plan framing. | codex-executor fake-provider matrix case (v-a) |
 | #3181 | Set-token cannot consent; credential-disabled park restore is covered. The Claude switching fix is out of scope (a residual). | `TestSetTokenOnPolicyHeldCodexRunLiveDB`; `TestPolicyFreshRestoreLiveDB` |

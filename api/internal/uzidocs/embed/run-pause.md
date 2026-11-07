@@ -306,7 +306,7 @@ changing the run.
 
 Rollback is drain-only. Stop owner policy traffic, drain or cordon workers, and
 wait until no `codex_policy_hold_pending` outcome, no live consumed-unconfirmed
-Fresh grant, no claimed or running row carrying a required saved-work head,
+Fresh grant, no claimed, running or waiting row carrying a required saved-work head or a recorded verification,
 and no claimed, running or waiting run still preserving after an owner Resume
 (preserve or fresh_one_claim) remains. Otherwise stay on the new version and keep undrained worker volumes.
 Then stop all API replicas and run goose down exactly one version at a time

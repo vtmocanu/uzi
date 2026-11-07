@@ -322,7 +322,7 @@ or custody disposal.
 claim-only exception. Their earlier decisions remain historical records.
 
 M2/M3/I1 were deferred under the formal owner partial decision at M1; M2/M3 have
-since delivered Policy Resume (2026-11-07), and Policy Stop remains omitted. F5's eventual flag clearing belongs to M2: clear solely
+since delivered Policy Resume (2026-11-07), Policy Stop remains omitted, and I1 stays deferred. F5's flag clearing was delivered with M2 (`RetentionFlag`, `releasePolicyAdmission`): it clears solely
 successful policy-admission retention while preserving independent vetoes, including
 `retainedEpisode` and `predecessorCapture`. Optional m3 historic-head hardening stays
 deferred: current report-path 40/64-hex validation and React escaping do not validate
@@ -346,8 +346,8 @@ then use task migration:renumber above the fetched live head and fix reported
 references. Changed runtime, API, SQL and package inputs require renewed validation;
 no history rewrite, manual dependency installation or object reconstruction is allowed.
 
-The [PRD validation record](../prds/3607-compact-policy-refusal-hold.md#delivery-status-recovery-continuation-2026-11-07)
-records the successful current-branch strict agent, Codex M4 and complete seven-package
+The PRD's earlier M1 validation record (in git history before the 2026-11-07 rewrite; see PR #3676)
+recorded the successful current-branch strict agent, Codex M4 and complete seven-package
 LiveDB gates at 5b8a14f8, including the shared claim-route fixture. The API component
 inputs remain unchanged from its recorded successful gate. The expanded 125-file
 affected-agent selection also passed at f6240187. A small matched common-check
