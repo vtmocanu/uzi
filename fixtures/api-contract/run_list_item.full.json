@@ -862,5 +862,6 @@
   "owner_email": "x",
   "judge_verdict": "x",
   "judge_todo_count": 1,
-  "pending_question": "x"
+  "pending_question": "x",
+  "cross_check_active": "x"
 }

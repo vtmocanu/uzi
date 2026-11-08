@@ -149,5 +149,6 @@
   "worker_name": null,
   "judge_verdict": null,
   "judge_todo_count": 0,
-  "is_revising": false
+  "is_revising": false,
+  "cross_check_active": null
 }

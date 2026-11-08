@@ -569,5 +569,6 @@
   "judge_verdict": "x",
   "judge_todo_count": 1,
   "is_revising": true,
-  "pending_question": "x"
+  "pending_question": "x",
+  "cross_check_active": "x"
 }

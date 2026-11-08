@@ -478,6 +478,229 @@ describe("OverviewNext issue work scope switch", () => {
   }
 });
 
+// #4082: a run chip carries its cross-check state as an inner tag: "cross-checking" in
+// Planning (plan) and Building (code), and in Plan review why the cross-check sent the plan to
+// its owner. The tag wraps with the chip and never pokes out of it, down to a phone.
+describe("OverviewNext issue work cross-check tags", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    document.documentElement.dataset.font = "plex";
+  });
+  afterEach(() => {
+    delete document.documentElement.dataset.font;
+  });
+
+  const OTHER = "lena@uzi.local";
+
+  function mountCrossCheckLine() {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({ id: "own-plan", status: "running", is_planning: true, issue_iid: 4040, cross_check_active: "plan" }),
+        aRun({ id: "own-plan-quiet", status: "running", is_planning: true, issue_iid: 4041, cross_check_active: null }),
+        aRun({ id: "own-review", status: "awaiting_approval", issue_iid: 3881, plan_cross_check_required: true, plan_cross_check_gate_reason: "revise" }),
+        aRun({ id: "own-build", status: "running", issue_iid: 3543, cross_check_active: "code" }),
+        aRun({ id: "own-build-quiet", status: "running", issue_iid: 3251, cross_check_active: null }),
+      ],
+    });
+    mockApi.adminListRuns.mockResolvedValue({
+      runs: [
+        aRun({ id: "x-plan", status: "running", is_planning: true, issue_iid: 97, cross_check_active: "plan", owner_email: OTHER }),
+        aRun({ id: "x-review", status: "awaiting_approval", issue_iid: 88, plan_cross_check_required: true, plan_cross_check_gate_reason: "worker_unsupported", owner_email: OTHER }),
+        aRun({ id: "x-blocked", status: "awaiting_approval", issue_iid: 77, plan_cross_check_required: true, plan_cross_check_gate_reason: "block", owner_email: OTHER }),
+        aRun({ id: "x-build", status: "running", issue_iid: 91, cross_check_active: "code", owner_email: OTHER }),
+      ],
+    });
+    render(
+      <MemoryRouter initialEntries={["/overview/next"]}>
+        <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+          <OverviewNext />
+        </main>
+      </MemoryRouter>,
+    );
+  }
+
+  // The chips of one station, keyed by their "#N" reference.
+  function chips(card: HTMLElement, stage: string): Map<string, HTMLElement> {
+    const station = card.querySelector(`[data-stage="${stage}"]`) as HTMLElement;
+    const out = new Map<string, HTMLElement>();
+    for (const el of station.querySelectorAll<HTMLElement>("span")) {
+      const ref = /^#\d+/.exec(el.textContent ?? "")?.[0];
+      // A chip is the outermost span whose text starts with its reference.
+      if (ref && !out.has(ref) && el.firstChild?.nodeType === Node.TEXT_NODE) out.set(ref, el);
+    }
+    return out;
+  }
+
+  // The chip's tag text (its inner span), or null when it carries none.
+  const tagOf = (chip: HTMLElement | undefined) => chip?.querySelector("span")?.textContent ?? null;
+
+  function expectTagsInsideChips(card: HTMLElement) {
+    for (const stage of ["planning", "review", "building"]) {
+      for (const [ref, chip] of chips(card, stage)) {
+        const tag = chip.querySelector("span");
+        if (!tag) continue;
+        const c = chip.getBoundingClientRect();
+        const t = tag.getBoundingClientRect();
+        expect.soft(t.width, `${ref} tag has width`).toBeGreaterThan(0);
+        expect.soft(t.left, `${ref} tag left`).toBeGreaterThanOrEqual(c.left - 0.5);
+        expect.soft(t.right, `${ref} tag right`).toBeLessThanOrEqual(c.right + 0.5);
+        expect.soft(t.top, `${ref} tag top`).toBeGreaterThanOrEqual(c.top - 0.5);
+        expect.soft(t.bottom, `${ref} tag bottom`).toBeLessThanOrEqual(c.bottom + 0.5);
+      }
+    }
+  }
+
+  async function ready() {
+    const card = await screen.findByRole("region", { name: "Issue work" });
+    const toggle = screen.getByRole("group", { name: "Issue work scope" });
+    await expect.poll(() => (within(toggle).getByRole("button", { name: "All users" }) as HTMLButtonElement).disabled).toBe(false);
+    await document.fonts.ready;
+    return { card, toggle };
+  }
+
+  for (const width of [1280, 400]) {
+    it(`tags the chips in Planning, Plan review and Building, inside their boxes, at ${width}px`, async () => {
+      await page.viewport(width, 900);
+      mountCrossCheckLine();
+      const { card, toggle } = await ready();
+      expect(window.innerWidth).toBe(width);
+
+      const planning = chips(card, "planning");
+      const review = chips(card, "review");
+      const building = chips(card, "building");
+      expect(tagOf(planning.get("#4040"))).toBe("cross-checking");
+      expect(tagOf(planning.get("#4041")), "no live check, no tag").toBeNull();
+      expect(tagOf(review.get("#3881"))).toBe("cross-check: revise");
+      expect(tagOf(building.get("#3543"))).toBe("cross-checking");
+      expect(tagOf(building.get("#3251")), "no live check, no tag").toBeNull();
+      // The chip reads as one phrase, and its tooltip says which check.
+      expect(planning.get("#4040")!.textContent).toBe("#4040 cross-checking");
+      expect(planning.get("#4040")!.title).toBe("Plan cross-check in progress");
+      expect(building.get("#3543")!.title).toMatch(/^Code cross-check in progress/);
+      // You scope: other users' chips are not on the line.
+      expect(planning.has("#97")).toBe(false);
+      expectTagsInsideChips(card);
+
+      // All users: another user's chips carry the same tags, with the owner first in the tooltip.
+      await userEvent.click(within(toggle).getByRole("button", { name: "All users" }));
+      const allPlanning = chips(card, "planning");
+      const allReview = chips(card, "review");
+      const allBuilding = chips(card, "building");
+      expect(tagOf(allPlanning.get("#97"))).toBe("cross-checking");
+      expect(tagOf(allReview.get("#88"))).toBe("cross-check: unavailable");
+      expect(tagOf(allBuilding.get("#91"))).toBe("cross-checking");
+      expect(tagOf(allPlanning.get("#4040")), "yours keep theirs").toBe("cross-checking");
+      expect(tagOf(allReview.get("#3881"))).toBe("cross-check: revise");
+      expect(tagOf(allReview.get("#77"))).toBe("cross-check: blocked");
+      expect(allReview.get("#88")!.title).toMatch(/ · Unavailable/);
+      expect(allReview.get("#88")!.title.startsWith("Unavailable")).toBe(false);
+      expectTagsInsideChips(card);
+
+      if (width === 400) {
+        const cardRight = card.getBoundingClientRect().right;
+        for (const el of card.querySelectorAll<HTMLElement>("*")) {
+          expect.soft(el.getBoundingClientRect().right, `${el.tagName} ${el.textContent?.slice(0, 24)}`).toBeLessThanOrEqual(cardRight + 1);
+        }
+      }
+      expect(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(window.innerWidth);
+    });
+  }
+
+  // A long tag ("cross-check: unavailable") in a narrow side-by-side station breaks inside its
+  // pill rather than running past the station into the next one's chips (#4082 review).
+  for (const width of [768, 1024, 1280]) {
+    it(`keeps every chip inside its station at ${width}px, All users`, async () => {
+      await page.viewport(width, 900);
+      mountCrossCheckLine();
+      const { card, toggle } = await ready();
+      expect(window.innerWidth).toBe(width);
+      await userEvent.click(within(toggle).getByRole("button", { name: "All users" }));
+      expect(tagOf(chips(card, "review").get("#88"))).toBe("cross-check: unavailable");
+
+      for (const stage of ["planning", "review", "building"]) {
+        const s = (card.querySelector(`[data-stage="${stage}"]`) as HTMLElement).getBoundingClientRect();
+        for (const [ref, chip] of chips(card, stage)) {
+          const c = chip.getBoundingClientRect();
+          expect.soft(c.left, `${width}px ${stage} ${ref} chip left`).toBeGreaterThanOrEqual(s.left - 1);
+          expect.soft(c.right, `${width}px ${stage} ${ref} chip right`).toBeLessThanOrEqual(s.right + 1);
+        }
+      }
+      expectTagsInsideChips(card);
+    });
+  }
+
+  // The tag is 11px text, so it needs WCAG AA's 4.5:1 against what is actually painted under
+  // it: the page, the card, the station (raised when pressed) and the chip's own tint, stacked.
+  // The canvas does the compositing, so any CSS colour form (oklab, color-mix) resolves.
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = 1;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
+  function paint(color: string, under: number[]): number[] {
+    ctx.globalCompositeOperation = "copy";
+    ctx.fillStyle = `rgb(${under.join(",")})`;
+    ctx.fillRect(0, 0, 1, 1);
+    ctx.globalCompositeOperation = "source-over";
+    ctx.fillStyle = "transparent";
+    ctx.fillStyle = color;
+    ctx.fillRect(0, 0, 1, 1);
+    return Array.from(ctx.getImageData(0, 0, 1, 1).data.slice(0, 3));
+  }
+  function backdrop(el: HTMLElement): number[] {
+    const chain: Element[] = [];
+    for (let n: Element | null = el; n; n = n.parentElement) chain.unshift(n);
+    return chain.reduce((under, n) => paint(getComputedStyle(n).backgroundColor, under), [255, 255, 255]);
+  }
+  const luminance = (rgb: number[]) => {
+    const [r, g, b] = rgb.map((v) => {
+      const c = v / 255;
+      return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+    });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  };
+  function tagContrast(chip: HTMLElement | undefined): number {
+    const tag = chip!.querySelector("span") as HTMLElement;
+    const bg = backdrop(tag);
+    const fg = paint(getComputedStyle(tag).color, bg);
+    const [hi, lo] = [luminance(fg), luminance(bg)].sort((a, b) => b - a);
+    return (hi + 0.05) / (lo + 0.05);
+  }
+
+  for (const theme of ["ember", "dawn"]) {
+    it(`keeps every tag at AA contrast on its chip in ${theme}, with a station pressed too`, async () => {
+      document.documentElement.dataset.theme = theme;
+      try {
+        await page.viewport(1280, 900);
+        mountCrossCheckLine();
+        const { card, toggle } = await ready();
+        await userEvent.click(within(toggle).getByRole("button", { name: "All users" }));
+        const cases: [string, string][] = [
+          ["planning", "#4040"],
+          ["building", "#3543"],
+          ["review", "#3881"],
+          ["review", "#88"],
+          ["review", "#77"],
+        ];
+        for (const [stage, ref] of cases) {
+          const chip = chips(card, stage).get(ref);
+          expect(tagOf(chip), `${ref} carries a tag`).not.toBeNull();
+          expect.soft(tagContrast(chip), `${theme} ${stage} ${ref}`).toBeGreaterThanOrEqual(4.5);
+        }
+        // Pressing a station raises its fill under the chips; the tags must hold there too.
+        for (const stage of ["planning", "building", "review"]) {
+          const station = card.querySelector(`[data-stage="${stage}"]`) as HTMLElement;
+          await userEvent.click(station);
+          expect(station.getAttribute("aria-pressed")).toBe("true");
+          for (const [s, ref] of cases.filter(([s]) => s === stage)) {
+            expect.soft(tagContrast(chips(card, s).get(ref)), `${theme} ${s} ${ref} pressed`).toBeGreaterThanOrEqual(4.5);
+          }
+        }
+      } finally {
+        delete document.documentElement.dataset.theme;
+      }
+    });
+  }
+});
+
 describe("OverviewNext capacity rail", () => {
   function mountPreview() {
     mockApi.listWorkers.mockResolvedValue({

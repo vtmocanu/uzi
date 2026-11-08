@@ -4558,6 +4558,11 @@ export interface RunListItem extends Run {
    *  render as plain text. */
   pending_question?: string;
 
+  /** Which cross-check is live for this run: "plan" or "code". Non-null only while the
+   *  run's plan or code cross-check is live. Older APIs omit it, and an absent value
+   *  shows no tag. */
+  cross_check_active?: "plan" | "code" | null;
+
   repo_path: string;
   worker_name: string | null;
   owner_email?: string;

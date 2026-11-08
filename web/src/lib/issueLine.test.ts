@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { aRun } from "../pages/overviewFixtures";
 import {
+  crossCheckTag,
   issueLineModel,
   issueLineOtherRuns,
   issueLineStage,
@@ -309,6 +310,114 @@ describe("issueLineModel parked captions", () => {
       parked({ id: "e", status: "running", health: "waiting_account_cooldown" }),
     );
     expect(more.parkedReason).toBe("limit wait, waiting for pool, paused, +2 more");
+  });
+});
+
+describe("crossCheckTag", () => {
+  const gated = (reason: string | null | undefined) =>
+    aRun({ status: "awaiting_approval", plan_cross_check_gate_reason: reason });
+  const reviewTag = (reason: string | null | undefined) => crossCheckTag(gated(reason), "review");
+
+  it("reads cross-checking for a live plan check in Planning and a live code check in Building", () => {
+    const plan = aRun({ status: "running", is_planning: true, cross_check_active: "plan" });
+    expect(issueLineStage(plan, none)).toBe("planning");
+    expect(crossCheckTag(plan, "planning")).toEqual({
+      text: "cross-checking",
+      tone: "check",
+      title: "Plan cross-check in progress",
+    });
+    const code = aRun({ status: "running", cross_check_active: "code" });
+    expect(issueLineStage(code, none)).toBe("building");
+    expect(crossCheckTag(code, "building")).toEqual({
+      text: "cross-checking",
+      tone: "check",
+      title: "Code cross-check in progress (advisory, does not block)",
+    });
+  });
+
+  it("tags the review stage by the recorded gate reason, titled with the coarse result", () => {
+    expect(reviewTag("revise")).toEqual({ text: "cross-check: revise", tone: "warn", title: "Changes requested" });
+    expect(reviewTag("revisions_exhausted")).toEqual({
+      text: "cross-check: revise",
+      tone: "warn",
+      title: "Revisions exhausted",
+    });
+    expect(reviewTag("block")).toEqual({ text: "cross-check: blocked", tone: "danger", title: "Blocked" });
+    expect(reviewTag("worker_unsupported")).toEqual({
+      text: "cross-check: unavailable",
+      tone: "warn",
+      title: "Unavailable, not supported on this worker",
+    });
+    expect(reviewTag("timed_out")).toEqual({ text: "cross-check: unavailable", tone: "warn", title: "Timed out" });
+    expect(reviewTag("brand_new_reason")).toEqual({
+      text: "cross-check: unavailable",
+      tone: "warn",
+      title: "Unavailable",
+    });
+  });
+
+  it("gives no tag when the check is off or the field is absent", () => {
+    expect(reviewTag(null)).toBeNull();
+    expect(reviewTag("")).toBeNull();
+    expect(reviewTag(undefined)).toBeNull();
+    expect(crossCheckTag(aRun({ status: "running", cross_check_active: null }), "building")).toBeNull();
+    expect(crossCheckTag(aRun({ status: "running" }), "building")).toBeNull();
+  });
+
+  it("reads cross-checking whatever the station: a claimed run under plan check sits in Queued", () => {
+    const claimed = aRun({ status: "claimed", cross_check_active: "plan" });
+    expect(issueLineStage(claimed, none)).toBe("queued");
+    expect(crossCheckTag(claimed, "queued")).toEqual({
+      text: "cross-checking",
+      tone: "check",
+      title: "Plan cross-check in progress",
+    });
+  });
+
+  it("tags a live code check outside Building too, e.g. a running ci_fix in Other work", () => {
+    const fix = aRun({ kind: "ci_fix", issue_iid: null, status: "running", cross_check_active: "code" });
+    expect(issueLineStage(fix, none)).toBe("other");
+    expect(crossCheckTag(fix, "other")?.title).toBe("Code cross-check in progress (advisory, does not block)");
+  });
+
+  it("lets a recorded gate reason win over a live check in Plan review", () => {
+    const both = aRun({ status: "awaiting_approval", plan_cross_check_gate_reason: "block", cross_check_active: "plan" });
+    expect(crossCheckTag(both, "review")?.text).toBe("cross-check: blocked");
+  });
+
+  it("tags another user's run under All users the same way", () => {
+    const run = { ...gated("block"), owner_email: "mira@uzi.local" };
+    const model = issueLineModel({ ownRuns: [], otherRuns: [run] });
+    expect(model.entries.review[0].own).toBe(false);
+    expect(crossCheckTag(model.entries.review[0].run, "review")?.text).toBe("cross-check: blocked");
+  });
+
+  it("leaves station counts and captions the same with tags present or absent", () => {
+    const base = (tagged: boolean) => [
+      aRun({ id: "p", status: "running", is_planning: true, cross_check_active: tagged ? "plan" : null }),
+      aRun({ id: "g", status: "awaiting_approval", plan_cross_check_gate_reason: tagged ? "block" : null }),
+      aRun({ id: "b", status: "running", cross_check_active: tagged ? "code" : null }),
+    ];
+    const a = issueLineModel({ ownRuns: base(true), otherRuns: [] });
+    const b = issueLineModel({ ownRuns: base(false), otherRuns: [] });
+    expect(a.captions).toEqual(b.captions);
+    expect(a.onLine).toBe(b.onLine);
+    for (const s of ["planning", "review", "building"] as const) {
+      expect(a.entries[s].length, s).toBe(b.entries[s].length);
+    }
+  });
+
+  it("never counts a cross_check child run anywhere", () => {
+    for (const status of ["queued", "running", "awaiting_approval", "paused", "completed"] as const) {
+      const child = aRun({ id: "c", kind: "cross_check" as never, status });
+      expect(issueLineStage(child, new Set(["c"])), status).toBe("none");
+    }
+    const model = issueLineModel({
+      ownRuns: [aRun({ id: "c", kind: "cross_check" as never, status: "running" })],
+      otherRuns: [aRun({ id: "d", kind: "cross_check" as never, status: "queued", owner_email: "mira@uzi.local" })],
+    });
+    expect(model.onLine).toBe(0);
+    expect(model.entries.other).toHaveLength(0);
   });
 });
 
