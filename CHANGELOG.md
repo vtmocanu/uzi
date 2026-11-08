@@ -75,6 +75,27 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **A manual rework reads a reviewer who just got repository access ([#3422](https://github.com/vtmocanu/uzi/pull/3422), [#3968](https://github.com/vtmocanu/uzi/pull/3968)).**
   `uzi run rework` and Rework now ask the forge again about review authors uzi stored as not eligible in the last 6 hours; automatic reworks keep the 6-hour cache.
 
+- **Plan cross-check base discovery is bounded by absolute aggregate caps ([#3543](https://github.com/vtmocanu/uzi/pull/3543), [#4033](https://github.com/vtmocanu/uzi/pull/4033)).**
+  Walking a pathological base tree now refuses as diff_too_large once it exceeds 1,200,000 tree-entry occurrences or 96 MiB of cumulative path bytes, instead of growing memory until the deadline stops it.
+
+- **Answering a question during a plan revision no longer fails cross-check runs ([#3985](https://github.com/vtmocanu/uzi/pull/3985), [#4024](https://github.com/vtmocanu/uzi/pull/4024)).**
+  A plan cross-check run whose lead asks a question while working your requested changes returns to the plan gate after your answer, with the revision still pending, instead of failing.
+
+- **Cross-check history shows a Plan verdict recorded before the lead lost custody as that verdict, not as interrupted ([#4037](https://github.com/vtmocanu/uzi/pull/4037), [#4057](https://github.com/vtmocanu/uzi/pull/4057)).**
+  Such attempts now count under the passed and raised-issues filters instead of replaced, show their finished checker run, and stay historical.
+
+- **The Claude re-plan gate checkpoint step now has a 60-second deadline ([#3980](https://github.com/vtmocanu/uzi/pull/3980), [#4050](https://github.com/vtmocanu/uzi/pull/4050)).**
+  On expiry the step fails closed like a failed checkpoint (transient recovery error, source clone kept, candidate reservation untouched; a few narrow races, such as an authority-lock timeout just before the deadline, still surface as a plain error, as ADR-2149 lists) and finishes in about 76 seconds provided its untimed operations (process probes and kills, a kernel-blocked procfs read, a child that never closes) return, superseding the 0.87.0 note that a re-plan gate checkpoint still had no fixed limit.
+
+- **A Pause now sent during retained recovery waits and parks with a checkpoint instead of stopping recovery ([#3995](https://github.com/vtmocanu/uzi/pull/3995), [#4010](https://github.com/vtmocanu/uzi/pull/4010)).**
+  The pause is recorded until recovery returns, then parked checkpoint-first before any model turn; recovery failures and holds still win, and publication-only claims keep the immediate stop.
+
+- **Claude cross-checks re-ask for a malformed final verdict instead of discarding the paid check ([#4038](https://github.com/vtmocanu/uzi/pull/4038), [#4070](https://github.com/vtmocanu/uzi/pull/4070)).**
+  The Claude checker now requests its verdict through the SDK's structured output, so the SDK re-asks within the same session (up to 5 attempts, same turn limit, deadline and usage) when the answer does not match the schema; only the SDK's verdict-return tool is added to the read-only tools, the validators are unchanged, exhausted retries still fail the check as malformed, and a schema-valid verdict that fails the other verdict checks (size caps, duplicate ids) fails as malformed without a retry.
+
+- **A lost forge-park reply no longer retries forever on a refused ownership check ([#3856](https://github.com/vtmocanu/uzi/pull/3856), [#4062](https://github.com/vtmocanu/uzi/pull/4062)).**
+  When a forge-park report's reply is lost and the follow-up ownership check is permanently refused (any client error except not found, timeout or rate limiting), or the resend is (any client error except timeout or rate limiting; a bad-request resend still fails the run as before), the worker now stops retrying instead of looping, reports nothing, keeps a resumable session and any publication record, and leaves custody unsettled.
+
 ### Added
 
 - **A preview of the new Overview at /overview/next, decisions first ([#3878](https://github.com/vtmocanu/uzi/pull/3878), [#3952](https://github.com/vtmocanu/uzi/pull/3952)).**
@@ -98,6 +119,18 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Run defaults shows the Codex catalog default effort behind Runtime default ([#3251](https://github.com/vtmocanu/uzi/pull/3251), [#4014](https://github.com/vtmocanu/uzi/pull/4014)).**
   Workers report the level when an issue or other lead Codex run starts, kept per credential for 30 days (at most 32 rows per user); settings, the web option label and `uzi settings get` (`catalog_default` in `--json`) show unknown until a run reports, and Codex account mode `auto` with at least one pooled login reads unknown.
 
+- **`uzi run create --agent-source` chooses a run's agents without a plan file ([#3914](https://github.com/vtmocanu/uzi/pull/3914), [#4048](https://github.com/vtmocanu/uzi/pull/4048)).**
+  The choice overrides the per-repo default for that run and is shown as (this run); exclusions still need a plan file or the plan gate, and the API returns 400 for exclusions without plan_md.
+
+- **Plan gates pre-select the repo's default agent source ([#3914](https://github.com/vtmocanu/uzi/pull/3914), [#4045](https://github.com/vtmocanu/uzi/pull/4045)).**
+  The web plan gate pre-selects the run's requested agent source, and with uzi templates requested the Slack gate makes "Approve · my templates" the first, primary button.
+
+- **The TUI workers list shows each online worker's uptime ([#4061](https://github.com/vtmocanu/uzi/pull/4061)).**
+  A new UP column after HB, in the wide layout, reads like the worker detail header and gives way first when ATTENTION needs the room.
+
+- **Admins can issue a one-time account reset link for a user who forgot their password ([#3989](https://github.com/vtmocanu/uzi/pull/3989), [#4054](https://github.com/vtmocanu/uzi/pull/4054)).**
+  Redeeming it sets a new password, ends the user's browser sessions and deletes their model credentials, Codex logins and vault; the account is left protected and the next password login creates a fresh vault. Users with no password (SSO-only) get a link that asks for no password, ends their sessions, refuses approved CLI login requests and deletes the same credentials and vault; after SSO sign-in the app banner asks for a new vault passphrase. The seed admin and the issuing admin's own account cannot be reset by link. Runs already executing keep their credential. Claude and chat runs created before the reset pause with the hold reason `credentials_reset` instead of failing and resume when a credential is added, while Codex runs created before it fail and need a new run.
+
 ### Changed
 
 - **The Overview preview shows your capacity and held work in a right-hand rail ([#3880](https://github.com/vtmocanu/uzi/pull/3880), [#3971](https://github.com/vtmocanu/uzi/pull/3971)).**
@@ -111,6 +144,24 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Retained re-claims still leave older generations' guarded holds open ([#2969](https://github.com/vtmocanu/uzi/pull/2969), [#3992](https://github.com/vtmocanu/uzi/pull/3992)).**
   The worker now carries a predecessor settlement pass for a lower generation's inventory hold, but it is disabled in production until a proof that no leftover command-user process can write into the older clone exists, so holds stay open and counted as before.
+
+- **The completion tool tells the lead how long its summary may be ([#3943](https://github.com/vtmocanu/uzi/pull/3943)).**
+  `signal_done`'s `summary` was described as one line on Claude and not described at all on Codex; both now say a report-only summary keeps only about its first 8 KiB, that long logs and gate output belong in the final message, and that a report-only run keeps its findings in the summary, to help leads avoid oversized completion calls that fail to parse.
+
+- **Overview preview Issue work card gains a You / All users scope for admins, and Show all is gone ([#4052](https://github.com/vtmocanu/uzi/pull/4052), [#4055](https://github.com/vtmocanu/uzi/pull/4055)).**
+  The scope defaults to You and is remembered per browser; the Usage card scope is renamed from "Factory · all users" to "All users" and remembered separately; a stage filter is cleared by pressing the pressed station or bay again.
+
+- **The Overview preview's usage card has a You / Factory toggle and a by-user table ([#3881](https://github.com/vtmocanu/uzi/pull/3881), [#4049](https://github.com/vtmocanu/uzi/pull/4049)).**
+  One card shows your or the factory's cost, PRs, failed-run rate, tokens, outcomes and latest failure; admins also get a trimmed per-user table.
+
+- **Harness decisions that never compared usage no longer list empty readings ([#4064](https://github.com/vtmocanu/uzi/pull/4064)).**
+  An `off` or `excluded` decision in the TUI, `uzi run get` and the web run page shows what happened instead of eight unknown readings; `--json` is unchanged.
+
+- **The Overview preview groups "Needs your decision" by kind so a busy queue stays short ([#4041](https://github.com/vtmocanu/uzi/pull/4041), [#4067](https://github.com/vtmocanu/uzi/pull/4067)).**
+  Held work comes first, then plan reviews, questions and follow-ups, owner parks and open pull requests last, oldest first within a kind; two or more of one kind collapse into one expandable row (expanded, each item keeps its age and action), open PRs always form one row, and the card uses two columns on wide screens only when it has 2 to 4 rows. The status sentence and header counts still count items, not rows.
+
+- **A run whose retained recovery was refused only for data volume capacity is now held for the owner ([#4046](https://github.com/vtmocanu/uzi/pull/4046), [#4065](https://github.com/vtmocanu/uzi/pull/4065)).**
+  Such a window no longer spends a counted park or a retry timer; the run keeps its worker and source custody until the owner chooses Resume (one more window) or Cancel, so freeing headroom alone no longer auto-resumes it. Mixed or deadline-only windows keep today's park rules, and a worker talking to an API without the new capability sends today's report.
 
 ### Security
 
