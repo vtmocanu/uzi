@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { issueLineModel, issueLineStage, type LineStage } from "../lib/issueLine";
+import { overviewNextCrossCheckActive } from "./data/overviewNext";
 
 // ?mock=overview-next (PRD #3878): scenario-gated seeding for the Overview preview. The
 // scenario is read when the store seeds, so each test re-imports a fresh mockApi.
@@ -58,12 +59,13 @@ describe("overview-next mock scenario", () => {
     expect(stageOf("run-ov-ines-prompt")).toBe("other");
   });
 
-  it("seeds the viewer's revising, cooldown and ci_fix runs on the stages the line gives them", async () => {
+  it("seeds the viewer's planning, revising, cooldown and ci_fix runs on the stages the line gives them", async () => {
     const api = await freshApi("overview-next");
     const own = (await api.listRuns({ view: "summary" })).runs;
     const stageOf = (id: string) => issueLineStage(own.find((r) => r.id === id)!, new Set());
     expect(own.find((r) => r.id === "run-ov-own-revising")).toMatchObject({ status: "awaiting_approval", is_revising: true });
     expect(stageOf("run-ov-own-revising")).toBe("planning");
+    expect(stageOf("run-ov-own-planning")).toBe("planning");
     expect(own.find((r) => r.id === "run-ov-own-cooldown")).toMatchObject({ status: "running", health: "waiting_account_cooldown" });
     expect(stageOf("run-ov-own-cooldown")).toBe("parked");
     expect(own.find((r) => r.id === "run-ov-own-cifix")).toMatchObject({ kind: "ci_fix" });
@@ -152,6 +154,107 @@ describe("overview-next mock scenario", () => {
       question_id: expect.any(String),
       questions: [{ question: "Should the cap count exports that are still queued?" }],
     });
+  });
+
+  // Issue #4082: both lists carry cross_check_active on every row: the seeded value on the
+  // scenario's issue runs, null on every other row, in both views.
+  it("sets cross_check_active on the seeded issue runs in both lists, null elsewhere", async () => {
+    const api = await freshApi("overview-next");
+    const seeded: Record<string, "plan" | "code"> = {
+      "run-ov-own-planning": "plan",
+      "run-ov-lena-planning": "plan",
+      "run-seeded": "code",
+      "run-ov-sam-running": "code",
+    };
+    const lists = [
+      (await api.listRuns({ view: "summary" })).runs,
+      (await api.listRuns()).runs,
+      (await api.adminListRuns({ view: "summary" })).runs,
+      (await api.adminListRuns()).runs,
+    ];
+    for (const list of lists) {
+      for (const r of list) {
+        expect(r, r.id).toHaveProperty("cross_check_active", seeded[r.id] ?? null);
+      }
+    }
+    const [mine, , factory] = lists;
+    // Own runs in the owner list, everyone's active runs in the admin list.
+    for (const id of ["run-ov-own-planning", "run-seeded"]) expect(mine.some((r) => r.id === id), id).toBe(true);
+    for (const id of Object.keys(seeded)) expect(factory.some((r) => r.id === id), id).toBe(true);
+    for (const id of Object.keys(seeded)) expect([...mine, ...factory].find((r) => r.id === id)?.kind, id).toBe("issue");
+    // These seeds' stations: the plan checks sit in Planning, the code checks in Building.
+    const stageOf = (id: string) => issueLineStage([...mine, ...factory].find((r) => r.id === id)!, new Set());
+    expect(stageOf("run-ov-own-planning")).toBe("planning");
+    expect(stageOf("run-ov-lena-planning")).toBe("planning");
+    expect(stageOf("run-seeded")).toBe("building");
+    expect(stageOf("run-ov-sam-running")).toBe("building");
+    // The plan-review gate reasons: yours sent back for revision, another user's unavailable.
+    expect(mine.find((r) => r.id === "run-awaiting")).toMatchObject({ status: "awaiting_approval", plan_cross_check_gate_reason: "revise" });
+    expect(factory.find((r) => r.id === "run-ov-priya-approval")).toMatchObject({
+      plan_cross_check_required: true,
+      plan_cross_check_gate_reason: "worker_unsupported",
+    });
+    // The re-planning run after a revise is not under a live check.
+    expect(mine.find((r) => r.id === "run-ov-own-revising")).toMatchObject({ status: "awaiting_approval", cross_check_active: null });
+    // A base fixture the seed names stays null outside the scenario.
+    const plain = await freshApi(null);
+    expect((await plain.listRuns({ view: "summary" })).runs.find((r) => r.id === "run-seeded")).toHaveProperty("cross_check_active", null);
+  });
+
+  // Issue #4082: the seed holds only states the real API can produce: a plan check on a claimed
+  // or running run, a code check on a running run. A future impossible entry fails here.
+  it("seeds cross_check_active only on runs the server's live predicates can match", async () => {
+    await freshApi("overview-next");
+    const { state } = await import("./store");
+    for (const [id, stage] of Object.entries(overviewNextCrossCheckActive)) {
+      const run = state.runs.get(id);
+      expect(run, id).toBeDefined();
+      expect(run!.kind, id).toBe("issue");
+      if (stage === "code") {
+        // GetLiveCodeCrossCheckDeadline: running, code_cross_check_required, not report_only,
+        // not judged not_code, a claude or codex lead.
+        expect(run!.status, id).toBe("running");
+        expect(run!.code_cross_check_required, id).toBe(true);
+        expect(run!.report_only ?? false, id).toBe(false);
+        expect(run!.fix_verdict, id).not.toBe("not_code");
+        expect(["claude", "codex"], id).toContain(run!.harness);
+      } else {
+        // HasLivePlanCrossCheck: claimed or running, plan check required or gated.
+        expect(["claimed", "running"], id).toContain(run!.status);
+        expect(run!.plan_cross_check_required || run!.plan_cross_check_gated === true, id).toBe(true);
+      }
+    }
+    // The own planning run is mid first turn with no plan, under the plan check.
+    expect(state.runs.get("run-ov-own-planning")).toMatchObject({
+      status: "running",
+      is_planning: true,
+      iteration_count: 0,
+      plan_md: null,
+      plan_cross_check_required: true,
+    });
+  });
+
+  // Issue #4082: checker children ride runs as kind cross_check; neither list shows them, as
+  // the server lists exclude them, in either view.
+  it("keeps a cross_check child run out of both lists", async () => {
+    const api = await freshApi("overview-next");
+    const { state } = await import("./store");
+    const parent = state.runs.get("run-ov-own-revising")!;
+    state.runs.set("run-ov-checker-child", { ...parent, id: "run-ov-checker-child", kind: "cross_check", status: "running", is_revising: false });
+    const foreignParent = state.runs.get("run-ov-sam-running")!;
+    state.runs.set("run-ov-checker-foreign", { ...foreignParent, id: "run-ov-checker-foreign", kind: "cross_check" });
+    const { mockOtherRunOwners } = await import("./data");
+    mockOtherRunOwners["run-ov-checker-foreign"] = "sam@uzi.local";
+    const lists = [
+      (await api.listRuns({ view: "summary" })).runs,
+      (await api.listRuns()).runs,
+      (await api.adminListRuns({ view: "summary" })).runs,
+      (await api.adminListRuns()).runs,
+    ];
+    for (const list of lists) {
+      expect(list.some((r) => r.id === "run-ov-own-revising")).toBe(true);
+      expect(list.filter((r) => r.kind === "cross_check").map((r) => r.id)).toEqual([]);
+    }
   });
 
   it("seeds none of it outside the scenario", async () => {
