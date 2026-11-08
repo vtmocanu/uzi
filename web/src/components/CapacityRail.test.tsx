@@ -232,7 +232,7 @@ describe("CapacityRail expanded row", () => {
       run_disk: sizes.map((g, i) => ({ run_id: `s${i}-sized-run-aaaa`, home_bytes: g * GIB, cache_bytes: 0, truncated: i === 3, sampled_at: "2026-07-05T11:59:00Z" })),
     });
     const { container } = mount([w]);
-    const rows = Array.from(container.querySelectorAll("details p.flex")).map((p) => p.textContent ?? "");
+    const rows = Array.from(container.querySelectorAll("details [data-run-row]")).map((p) => p.textContent ?? "");
     expect(rows).toHaveLength(9);
     const sized = rows.slice(0, 5).map((t) => /running · (.*)$/.exec(t)?.[1]);
     expect(sized).toEqual(["at least 9 GiB", "8 GiB", "7 GiB", "5 GiB", "3 GiB"]);

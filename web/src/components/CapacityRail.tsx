@@ -188,7 +188,7 @@ function RunIdentity({ runId, runs }: { runId: string; runs: RunSummaryItem[] })
   const run = runs.find((r) => r.id === runId);
   if (!run) {
     return (
-      <span className="font-mono" title={safeId}>
+      <span className="truncate font-mono" title={safeId}>
         run {shortId}
       </span>
     );
@@ -196,7 +196,7 @@ function RunIdentity({ runId, runs }: { runId: string; runs: RunSummaryItem[] })
   const title = stripUnsafeChars(run.issue_title ?? "").trim();
   const label = [run.issue_iid != null ? `#${run.issue_iid}` : "", title].filter(Boolean).join(" ") || shortId;
   return (
-    <Link to={`/runs/${run.id}`} className="font-medium text-brand hover:text-brand-hover">
+    <Link to={`/runs/${run.id}`} title={label} className="truncate font-medium text-brand hover:text-brand-hover">
       {label}
     </Link>
   );
@@ -208,12 +208,12 @@ function HostedRuns({ worker: w, runs }: { worker: Worker; runs: RunSummaryItem[
   const offline = w.status !== "online";
   return (
     <div className={cx(offline && "opacity-50")}>
-      <p className="font-medium text-fg">{offline ? "Last reported" : "On this worker"}</p>
+      <p className="text-[0.7rem] font-semibold uppercase tracking-wide text-faint">{offline ? "Last reported" : "On this worker"}</p>
       <div className="mt-1 space-y-0.5">
         {rows.map((r, i) => (
-          <p key={`${r.runId}:${i}`} className="flex flex-wrap items-baseline gap-x-2">
+          <p key={`${r.runId}:${i}`} data-run-row className="grid grid-cols-[minmax(0,1fr)_auto] items-baseline gap-x-2">
             <RunIdentity runId={r.runId} runs={runs} />
-            <span className="text-faint">{r.size ? `${r.phase} · ${r.size}` : r.phase}</span>
+            <span className="whitespace-nowrap font-mono text-faint">{r.size ? `${r.phase} · ${r.size}` : r.phase}</span>
           </p>
         ))}
       </div>
