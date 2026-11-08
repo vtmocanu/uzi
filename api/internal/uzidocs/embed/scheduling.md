@@ -532,6 +532,9 @@ that lands on Codex with a disabled stored pinned token is held as
 when a repair would fire. This hold order is the scheduled tick's: a manual
 Run now skips that pre-check. The preview knows the timing only of a saved
 schedule (`schedule_id`); a draft has none and is treated as recurring.
+The hold comes before the harness check: a one-time schedule whose disabled
+stored pin was your last usable Anthropic token, with no Codex credential,
+answers `credential_disabled`, not `no_usable_credential`.
 
 A pinned token that was **deleted** has no id left. On Claude the fire
 inherits and refuses nothing, and the preview shows the credential the claim
@@ -550,13 +553,18 @@ refusal is recorded as a `no_usable_credential` skip.
 |---|---|
 | `issue`, `sweep` | A fire creates an issue run, so the creation-time harness policies (automatic, overflow) apply. The notes carry `issue_labels_may_select_harness`: the labels of the issue picked at fire time can choose a harness the preview cannot see. |
 | `prompt`, `ci_watch` | The fire creates a run kind no creation-time policy applies to, so the harness is exact. |
-| `self_improve` | As above, and a Claude run uses your default Anthropic token: the credential source is `owner_default` and the notes carry `token_fixed`. |
+| `self_improve` | As above, and a Claude run spends the credential of your Judge binding, not a worker's and not a per-schedule override. The credential source is `token_override` for a pinned Judge token, `auto_selection` for an automatic Judge binding (an empty pool falls back to your default, shown as `owner_default`), and `owner_default` for the default binding. The notes carry `token_fixed` unless the binding is automatic. No token id or label is shown. |
 
 `worker_model`, `worker_effort`, `credential` and `subagents` are those of
 the chosen harness. A Codex run accepts only the curated model pins, so a
 model pin it cannot run is not used: the cell shows the default model, the
 pin appears as `ignored` (with source `schedule_pin`) and the notes carry
 `schedule_pin_ignored`.
+
+A model pin the harness accepts is frozen into the run when the schedule
+fires, so its `worker_model` cell (source `schedule_pin`) is `fixed_at`
+`create`. A default chosen after an ignored pin is read when a worker claims
+the run, so that cell stays `fixed_at` `claim`.
 
 `subagents` says how subagents pick a model: `mode` `follow_lead` (all use
 the lead's model) or `own_pins` (each pinned subagent keeps its own pin,

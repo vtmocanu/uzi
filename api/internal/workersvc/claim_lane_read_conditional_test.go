@@ -3,7 +3,6 @@ package workersvc
 import (
 	"context"
 	"errors"
-	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -48,12 +47,13 @@ func TestCheckerClaimDoesNotReadTheOwnerLane(t *testing.T) {
 		Stage: "plan", CheckerHarness: pgconv.TextOrNull("claude"), TemplateModel: pgconv.TextOrNull("opus"),
 	}}
 	svc := newOffModeService(fake, newBox(t), testParams())
-	// The fake store has no transaction, so assembly stops at the final run-claim check, after the
-	// lane-read decision. The lane read itself must never have been attempted, and its error must
-	// not be what the claim fails with.
+	// The fake store has no transaction, so a checker claim that assembles fully stops at the final
+	// run-claim check with exactly this refusal, after the lane-read decision. Requiring it (and
+	// not just any error) proves assembly got past the seam rather than failing on something
+	// earlier; the lane read must never have been attempted either.
 	_, err := svc.Claim(context.Background(), w, nil)
-	if err != nil && strings.Contains(err.Error(), "harness model defaults lookup") {
-		t.Fatalf("checker claim failed on the owner lane read: %v", err)
+	if !errors.Is(err, errClaimRecoveryNoTx) {
+		t.Fatalf("checker claim = %v, want assembly to reach the final run-claim check", err)
 	}
 	if reads != 0 {
 		t.Fatalf("checker claim read the owner lane %d times, want 0", reads)

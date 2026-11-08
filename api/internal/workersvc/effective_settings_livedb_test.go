@@ -575,3 +575,60 @@ func TestEffectiveSettingsOverrideSentinelsEqualCreateLiveDB(t *testing.T) {
 }
 
 func effUUID(id uuid.UUID) *uuid.UUID { return &id }
+
+// TestEffectiveSettingsJudgeAndSummaryMatchClaimLiveDB compares the judge and summary models the
+// effective-settings cells resolve with the fields real claims ship. The summary model rides an
+// issue-run claim (summary_model, for the run's harness); the judge model rides only a judge-run
+// claim (judge_model). The inputs are the ones handler's TestEffectiveSettingsCellsEqualMySettingsLiveDB
+// feeds the cells, and the expected values here are the literals it asserts, so the two tests pin
+// the same four resolved models: the Claude judge user value (opus), the Codex judge instance value
+// (gpt-6-sol), the Claude summary instance value (sonnet) and the Codex summary user value (gpt-6-luna).
+func TestEffectiveSettingsJudgeAndSummaryMatchClaimLiveDB(t *testing.T) {
+	codex, claude := HarnessCodex, HarnessClaude
+	fx := newEffFix(t)
+	fx.anthropic()
+	fx.codexDefault()
+	fx.svc.SetSettings(fakeSettings{model: "haiku", codexModel: "gpt-6-sol", summaryModel: "sonnet"})
+	fx.lane("judge_model", "opus")
+	fx.lane("codex_summary_model", "gpt-6-luna")
+
+	for _, c := range []struct {
+		harness     Harness
+		explicit    *Harness
+		wantSummary string
+	}{{HarnessClaude, &claude, "sonnet"}, {HarnessCodex, &codex, "gpt-6-luna"}} {
+		run := fx.mustCreate(c.explicit)
+		if run.Harness != string(c.harness) {
+			t.Fatalf("created run harness = %q, want %q", run.Harness, c.harness)
+		}
+		if got := derefOr(fx.claim(run).SummaryModel, "<nil>"); got != c.wantSummary {
+			t.Errorf("%s issue claim summary_model = %q, want %q", c.harness, got, c.wantSummary)
+		}
+	}
+
+	for i, c := range []struct {
+		harness   Harness
+		wantJudge string
+	}{{HarnessClaude, "opus"}, {HarnessCodex, "gpt-6-sol"}} {
+		// One active judge per target, so each judge run reviews its own completed issue run.
+		target := uuid.New()
+		fx.env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status)
+			VALUES ($1, $2, $3, 'issue', $4, 't', 'd', 'completed')`, target, fx.userID, fx.repoID, 900+i)
+		id := uuid.New()
+		fx.env.exec(`INSERT INTO runs (id, user_id, kind, issue_title, issue_description, status, target_run_id, harness)
+			VALUES ($1, $2, 'judge', 't', 'd', 'queued', $3, $4)`, id, fx.userID, target, string(c.harness))
+		if c.harness == HarnessCodex {
+			if err := fx.svc.FreezeCodexBinding(fx.env.ctx, fx.userID, id, fx.codex.alias, codexAuthModeSubscription); err != nil {
+				t.Fatalf("FreezeCodexBinding: %v", err)
+			}
+		}
+		fx.env.exec(`UPDATE runs SET status = 'claimed', worker_id = $2, claim_generation = 1 WHERE id = $1`, id, fx.workerID)
+		payload, err := fx.svc.assembleJudgeClaim(fx.env.ctx, store.Worker{ID: fx.workerID, UserID: fx.userID}, mustRun(t, fx.env, id))
+		if err != nil {
+			t.Fatalf("assembleJudgeClaim %s: %v", c.harness, err)
+		}
+		if got := derefOr(payload.JudgeModel, "<nil>"); got != c.wantJudge {
+			t.Errorf("%s judge claim judge_model = %q, want %q", c.harness, got, c.wantJudge)
+		}
+	}
+}

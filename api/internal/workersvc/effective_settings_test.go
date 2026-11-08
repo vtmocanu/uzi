@@ -395,6 +395,24 @@ func TestPredictLeadModelAndEffort(t *testing.T) {
 			wantModel: "", wantSrc: "builtin", wantDefault: "", wantEffort: strp("medium"), wantEffortSrc: "builtin",
 		},
 		{
+			name: "claude empty lane runs the template, as the worker's || does", harness: HarnessClaude,
+			mut: func(r *store.ListUserCrossCheckPinsRow) {
+				r.DefaultClaudeModel = pgtype.Text{String: "", Valid: true}
+				r.TemplateModel = pgconv.TextOrNull("opus")
+			},
+			wantModel: "opus", wantSrc: "template", wantClaim: strp(""), wantDefault: "opus", wantEffort: strp("medium"), wantEffortSrc: "builtin",
+		},
+		{
+			name: "claude empty lane with no template is the SDK default", harness: HarnessClaude,
+			mut:       func(r *store.ListUserCrossCheckPinsRow) { r.DefaultClaudeModel = pgtype.Text{String: "", Valid: true} },
+			wantModel: "", wantSrc: "builtin", wantClaim: strp(""), wantDefault: "", wantEffort: strp("medium"), wantEffortSrc: "builtin",
+		},
+		{
+			name: "codex empty lane stays empty, as the worker's ?? does", harness: HarnessCodex,
+			mut:       func(r *store.ListUserCrossCheckPinsRow) { r.DefaultCodexModel = pgtype.Text{String: "", Valid: true} },
+			wantModel: "", wantSrc: "user_default", wantClaim: strp(""), wantDefault: agenttmpl.DefaultCodexModel, wantEffort: strp("medium"), wantEffortSrc: "builtin",
+		},
+		{
 			name: "codex nothing configured is the built-in", harness: HarnessCodex,
 			wantModel: agenttmpl.DefaultCodexModel, wantSrc: "builtin", wantDefault: agenttmpl.DefaultCodexModel, wantEffort: strp("medium"), wantEffortSrc: "builtin",
 		},

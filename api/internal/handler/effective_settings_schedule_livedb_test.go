@@ -135,7 +135,12 @@ func wantModelCell(t *testing.T, c *apitypes.EffectiveModelCellDTO, resolved, so
 	if c.Ignored != nil {
 		gotIgnored = c.Ignored.Value + "/" + c.Ignored.Source
 	}
-	if c.Setting != "worker_model" || c.FixedAt != "claim" || c.ResolvedModel != resolved || c.Source != source ||
+	// An honoured schedule pin is frozen into runs.model at the fire; every other source is read at the claim.
+	wantFixed := "claim"
+	if source == "schedule_pin" {
+		wantFixed = "create"
+	}
+	if c.Setting != "worker_model" || c.FixedAt != wantFixed || c.ResolvedModel != resolved || c.Source != source ||
 		gotIgnored != ignored || strings.Join(c.Notes, ",") != strings.Join(notes, ",") {
 		t.Fatalf("worker_model = %+v (ignored %q), want %q (%s) ignored %q notes %v", c, gotIgnored, resolved, source, ignored, notes)
 	}
@@ -739,6 +744,27 @@ func (s *ownScheduleStore) ClaimDueSchedules(ctx context.Context) ([]store.RunSc
 	return owned, nil
 }
 
+// assertOnceHeldAsCredentialDisabled runs the real tick over the once schedule and requires the
+// credential_disabled hold: not advanced, the skip recorded, no run created.
+func (f *effFix) assertOnceHeldAsCredentialDisabled(id string) {
+	f.t.Helper()
+	t := f.t
+	sched := schedsvc.New(&ownScheduleStore{Queries: f.h.q, scheduleID: uuid.MustParse(id)}, f.h.wsvc, sweepGateBuilder{f: &sweepGateForge{}}, sweepGateSettings{}, nil, nil, time.Minute, nil)
+	sched.Boot(f.ctx)
+	var lastFire, status string
+	var due bool
+	if err := f.pool.QueryRow(f.ctx, `SELECT COALESCE(last_fire::text, ''), status, next_fire_at IS NOT NULL FROM run_schedules WHERE id = $1`, id).Scan(&lastFire, &status, &due); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(lastFire, `"credential_disabled"`) || strings.Contains(lastFire, "codex_override_conflict") || status != "active" || !due {
+		t.Fatalf("after the tick: last_fire %s status %s due %v, want the credential_disabled hold", lastFire, status, due)
+	}
+	var runs int
+	if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM runs WHERE user_id = $1`, f.user).Scan(&runs); err != nil || runs != 0 {
+		t.Fatalf("the held schedule created %d runs (err %v)", runs, err)
+	}
+}
+
 func TestSchedulePreviewUnpinnedCodexWithDisabledPinLiveDB(t *testing.T) {
 	t.Run("a ci_watch schedule has the scheduler's codex_override_conflict pre-check", func(t *testing.T) {
 		f := newEffFix(t, nil)
@@ -781,26 +807,80 @@ func TestSchedulePreviewUnpinnedCodexWithDisabledPinLiveDB(t *testing.T) {
 			if strs(dto.Refusal) != "credential_disabled" || dto.WorkerModel != nil || dto.Credential != nil || dto.Subagents != nil {
 				t.Fatalf("preview = %s, want credential_disabled", body)
 			}
-			// The real tick: the once schedule is held, not advanced, with the skip recorded.
-			sched := schedsvc.New(&ownScheduleStore{Queries: f.h.q, scheduleID: uuid.MustParse(id)}, f.h.wsvc, sweepGateBuilder{f: &sweepGateForge{}}, sweepGateSettings{}, nil, nil, time.Minute, nil)
-			sched.Boot(f.ctx)
-			var lastFire, status string
-			var due bool
-			if err := f.pool.QueryRow(f.ctx, `SELECT COALESCE(last_fire::text, ''), status, next_fire_at IS NOT NULL FROM run_schedules WHERE id = $1`, id).Scan(&lastFire, &status, &due); err != nil {
-				t.Fatal(err)
-			}
-			if !strings.Contains(lastFire, `"credential_disabled"`) || strings.Contains(lastFire, "codex_override_conflict") || status != "active" || !due {
-				t.Fatalf("after the tick: last_fire %s status %s due %v, want the credential_disabled hold", lastFire, status, due)
-			}
-			var runs int
-			if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM runs WHERE user_id = $1`, f.user).Scan(&runs); err != nil || runs != 0 {
-				t.Fatalf("the held schedule created %d runs (err %v)", runs, err)
-			}
+			f.assertOnceHeldAsCredentialDisabled(id)
 			// The same stored shape recurring is not held: it reaches the conflict gate.
 			rec := f.insertPinned(target, "recurring", pin)
 			dto, body = f.schedulePreview(fmt.Sprintf(`{"schedule_id":%q}`, rec))
 			if strs(dto.Refusal) != "codex_override_conflict" {
 				t.Fatalf("recurring preview = %s, want codex_override_conflict", body)
+			}
+		})
+	}
+}
+
+// A one-time schedule's disabled stored pin is the owner's last Anthropic token and there is no
+// Codex credential: PredictHarness alone says no_usable_credential, but the tick checks the disabled
+// pin before it fires, so the preview must say credential_disabled.
+func TestSchedulePreviewOnceDisabledLastTokenBeatsHarnessRefusalLiveDB(t *testing.T) {
+	f := newEffFix(t, nil)
+	pin := f.addToken(uuid.New(), "eff-last-"+uuid.NewString()[:8], false)
+	id := f.insertPinned("prompt", "once", pin)
+	f.exec(`UPDATE user_secrets SET disabled_at = now() WHERE id = $1`, pin)
+	dto, body := f.schedulePreview(fmt.Sprintf(`{"schedule_id":%q}`, id))
+	if strs(dto.Refusal) != "credential_disabled" || dto.WorkerModel != nil || dto.Credential != nil || dto.Subagents != nil || len(dto.Alternatives) != 0 {
+		t.Fatalf("preview = %s, want credential_disabled", body)
+	}
+	f.assertOnceHeldAsCredentialDisabled(id)
+	// The same stored shape recurring is not held by the tick, and keeps the harness refusal.
+	rec := f.insertPinned("prompt", "recurring", pin)
+	dto, body = f.schedulePreview(fmt.Sprintf(`{"schedule_id":%q}`, rec))
+	if strs(dto.Refusal) != "no_usable_credential" {
+		t.Fatalf("recurring preview = %s, want no_usable_credential", body)
+	}
+}
+
+// A self_improve claim follows the owner's judge binding, so the preview reports that binding's
+// policy with the existing credential sources and never an id or label. workersvc's
+// TestEffectiveSettingsSelfImproveCredentialMatchesClaimLiveDB compares the same prediction with a
+// real claim's choice.
+func TestSchedulePreviewSelfImproveJudgeBindingLiveDB(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		setup     func(f *effFix, other uuid.UUID)
+		want      string
+		wantNotes string
+	}{
+		{"pinned judge token", func(f *effFix, other uuid.UUID) {
+			f.exec(`UPDATE users SET judge_anthropic_bind_mode = 'pinned', judge_anthropic_secret_id = $2 WHERE id = $1`, f.user, other)
+		}, "token_override", "token_fixed"},
+		{"auto with a pooled token", func(f *effFix, _ uuid.UUID) {
+			f.exec(`UPDATE users SET judge_anthropic_bind_mode = 'auto', judge_anthropic_secret_id = NULL WHERE id = $1`, f.user)
+			f.exec(`UPDATE user_secrets SET auto_eligible = true WHERE id = $1`, f.token)
+			f.claudeReading(10)
+		}, "auto_selection", ""},
+		{"auto with an empty pool falls back to the default", func(f *effFix, _ uuid.UUID) {
+			f.exec(`UPDATE users SET judge_anthropic_bind_mode = 'auto', judge_anthropic_secret_id = NULL WHERE id = $1`, f.user)
+			f.exec(`UPDATE user_secrets SET auto_eligible = false WHERE user_id = $1`, f.user)
+		}, "owner_default", "token_fixed"},
+		{"default", func(f *effFix, _ uuid.UUID) {
+			f.exec(`UPDATE users SET judge_anthropic_bind_mode = 'default', judge_anthropic_secret_id = NULL WHERE id = $1`, f.user)
+		}, "owner_default", "token_fixed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newEffFix(t, nil)
+			f.anthropic()
+			other := f.addToken(uuid.New(), "eff-judge-pin-"+uuid.NewString()[:8], false)
+			tc.setup(f, other)
+			dto, body := f.schedulePreview(`{"target":"self_improve"}`)
+			wantHarness(t, dto.Harness, "claude", "automatic")
+			wantCredential(t, dto.Credential, "anthropic", tc.want, "claim")
+			if strings.Join(dto.Notes, ",") != tc.wantNotes {
+				t.Fatalf("notes = %v, want %q", dto.Notes, tc.wantNotes)
+			}
+			for _, secret := range f.secretsToScan {
+				if secret != "" && bytes.Contains(body, []byte(secret)) {
+					t.Errorf("response carries credential material %q", secret)
+				}
 			}
 		})
 	}

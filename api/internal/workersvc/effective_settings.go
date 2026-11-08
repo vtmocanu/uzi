@@ -11,6 +11,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -224,6 +225,27 @@ func predictCredential(res resolvedHarness) *CredentialPrediction {
 	return &CredentialPrediction{Kind: CredentialKindCodex, Source: source, FixedAt: FixedAtCreate, AuthMode: res.Codex.AuthMode}
 }
 
+// PredictSelfImproveCredential is the Anthropic credential a self_improve claim would spend for
+// userID. The claim ladder (resolveClaimSecret) sends that run kind to judgeChoice, the owner's
+// judge binding, so this runs the same function on a run that carries only the owner and maps its
+// choice to the wire sources: a pinned judge token is token_override, the auto ranker (a picked or
+// floored pool token) is auto_selection, and the default, an unbound pin or the empty-pool fallback
+// is owner_default. No id or label leaves this function.
+func (s *Service) PredictSelfImproveCredential(ctx context.Context, userID uuid.UUID) (*CredentialPrediction, error) {
+	choice, err := s.judgeChoice(ctx, store.Run{UserID: userID, Kind: runkind.SelfImprove})
+	if err != nil {
+		return nil, fmt.Errorf("self_improve credential predict: %w", err)
+	}
+	source := CredentialSourceAutoSelection
+	switch {
+	case choice.secretID == nil:
+		source = CredentialSourceOwnerDefault
+	case choice.reason == selectReasonJudge:
+		source = CredentialSourceTokenOverride
+	}
+	return &CredentialPrediction{Kind: CredentialKindAnthropic, Source: source, FixedAt: FixedAtClaim}, nil
+}
+
 // SubagentPin is one own subagent whose template pins a model for the harness.
 type SubagentPin struct {
 	Name  string
@@ -329,6 +351,12 @@ func (s *Service) PredictLead(ctx context.Context, userID uuid.UUID, harness Har
 		m := settings.Model.String
 		out.ClaimModel, out.ClaimModelSource = &m, string(settings.ModelSource)
 		out.Model, out.ModelSource = m, string(settings.ModelSource)
+		if harness == HarnessClaude && m == "" {
+			// The worker's resolveLeadRequest (agent/src/lead-config-report.ts) takes
+			// claimModel || templateModel for Claude, so a valid but empty claim model runs the
+			// template. Codex takes ?? and keeps "".
+			out.Model, out.ModelSource = out.DefaultModel, out.DefaultModelSource
+		}
 	} else {
 		out.Model, out.ModelSource = out.DefaultModel, out.DefaultModelSource
 	}

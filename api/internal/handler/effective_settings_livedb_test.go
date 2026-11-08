@@ -840,6 +840,16 @@ func TestEffectiveSettingsCellsEqualMySettingsLiveDB(t *testing.T) {
 	if judge := modelCell(t, dto.Models, "judge_model", "codex"); judge.Source != "instance_default" || judge.ResolvedModel != "gpt-6-sol" {
 		t.Errorf("instance codex judge: %+v", judge)
 	}
+	// The same inputs and resolved models workersvc's TestEffectiveSettingsJudgeAndSummaryMatchClaimLiveDB
+	// pins against the fields real claims ship.
+	for _, w := range []struct{ setting, harness, model string }{
+		{"judge_model", "claude", "opus"}, {"judge_model", "codex", "gpt-6-sol"},
+		{"summary_model", "claude", "sonnet"}, {"summary_model", "codex", "gpt-6-luna"},
+	} {
+		if got := modelCell(t, dto.Models, w.setting, w.harness).ResolvedModel; got != w.model {
+			t.Errorf("%s %s resolves %q, want %q", w.setting, w.harness, got, w.model)
+		}
+	}
 	for i, p := range mine.Settings.Pins {
 		m := modelCell(t, dto.CrossCheck.Models, "cross_check_"+p.Stage, p.Harness)
 		e := effortCell(t, dto.CrossCheck.Efforts, "cross_check_"+p.Stage, p.Harness)

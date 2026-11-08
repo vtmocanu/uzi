@@ -989,7 +989,7 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
             "resolved_model": "sonnet",
             "source": "schedule_pin",
             "setting": "worker_model",
-            "fixed_at": "claim",
+            "fixed_at": "create",
             "ignored": null,
             "notes": []
           },

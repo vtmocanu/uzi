@@ -345,6 +345,21 @@ func (h *Handler) scheduleOverrideRefusal(ctx context.Context, d scheduleDraft, 
 	return refusal{}, nil
 }
 
+// onceDisabledHold is the scheduler's pre-fire check for a one-time schedule (process calls
+// ScheduleCredentialDisabled before firing): a disabled stored pin, or an unusable pinned harness,
+// holds the row. Any other schedule, or an error the tick does not hold on, is no hold.
+func (h *Handler) onceDisabledHold(ctx context.Context, d scheduleDraft) (refusal, error) {
+	if !d.once {
+		return refusal{}, nil
+	}
+	if err := h.wsvc.ScheduleCredentialDisabled(ctx, d.userID, d.override, d.pin); err != nil {
+		if r, ok := scheduleFireRefusal(err); ok {
+			return r, nil
+		}
+	}
+	return refusal{}, nil
+}
+
 // scheduleBranch is what a fire would use on one harness, or that harness's fire refusal.
 type scheduleBranch struct {
 	harness    workersvc.Harness
@@ -377,6 +392,11 @@ func (h *Handler) scheduleBranch(ctx context.Context, d scheduleDraft, hn worker
 		model.Ignored = &apitypes.EffectiveIgnoredDTO{Value: *lead.DroppedRunModel, Source: sourceSchedulePin}
 		model.Notes = modelNotes(lead.Model, noteSchedulePinIgnored)
 	}
+	if lead.ModelSource == sourceSchedulePin {
+		// An honoured pin is frozen into runs.model when the schedule fires; a default chosen after
+		// an ignored pin is still read at the claim.
+		model.FixedAt = workersvc.FixedAtCreate
+	}
 	b.model = &model
 
 	effort := effortSettingCell(string(hn), lead.UserEffort)
@@ -388,7 +408,10 @@ func (h *Handler) scheduleBranch(ctx context.Context, d scheduleDraft, hn worker
 	cred := base
 	switch {
 	case d.target == "self_improve" && hn == workersvc.HarnessClaude:
-		cred = &workersvc.CredentialPrediction{Kind: workersvc.CredentialKindAnthropic, Source: workersvc.CredentialSourceOwnerDefault, FixedAt: workersvc.FixedAtClaim}
+		// A self_improve claim follows the owner's judge binding, not a worker's.
+		if cred, err = h.wsvc.PredictSelfImproveCredential(ctx, d.userID); err != nil {
+			return b, err
+		}
 	case d.override != nil && hn == workersvc.HarnessClaude && !(d.override.Mode == workersvc.CredentialOverrideModePinned && d.override.SecretID == nil):
 		if cred, err = overrideCredential(d.override.Mode); err != nil {
 			return b, err
@@ -434,9 +457,22 @@ func scheduleAlternatives(branches []scheduleBranch) ([]apitypes.ScheduleAlterna
 // harness-dependent fields; a chosen-at-create harness answers per branch.
 func (h *Handler) buildScheduleSettingsPreview(ctx context.Context, d scheduleDraft) (apitypes.ScheduleSettingsPreviewDTO, error) {
 	dto := apitypes.ScheduleSettingsPreviewDTO{Version: apitypes.EffectiveSettingsVersion, Notes: scheduleTargetNotes(d.target)}
+	// A one-time schedule's tick runs the disabled-credential hold before it fires, so it outranks
+	// any harness refusal. The harness is still reported when it resolves.
+	hold, err := h.onceDisabledHold(ctx, d)
+	if err != nil {
+		return dto, err
+	}
 	pred, ref, err := h.predictFire(ctx, d, d.pin)
 	if err != nil {
 		return dto, err
+	}
+	if hold.Token != "" {
+		if ref.Token == "" {
+			dto.Harness = harnessValue(pred, harnessSourceSchedulePin)
+		}
+		dto.Refusal, dto.RefusalDetail = hold.ptrs()
+		return dto, nil
 	}
 	if ref.Token != "" {
 		dto.Refusal, dto.RefusalDetail = ref.ptrs()
@@ -454,7 +490,8 @@ func (h *Handler) buildScheduleSettingsPreview(ctx context.Context, d scheduleDr
 			return dto, nil
 		}
 		dto.WorkerModel, dto.WorkerEffort, dto.Credential, dto.Subagents = b.model, b.effort, b.credential, b.subagents
-		if d.target == "self_improve" && pred.Harness == workersvc.HarnessClaude {
+		// The judge binding fixes the token; an auto binding picks one at the claim instead.
+		if d.target == "self_improve" && pred.Harness == workersvc.HarnessClaude && dto.Credential != nil && dto.Credential.Source != workersvc.CredentialSourceAutoSelection {
 			dto.Notes = append(dto.Notes, noteTokenFixed)
 		}
 		return dto, nil
