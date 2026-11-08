@@ -1532,12 +1532,12 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
   const evidence = recovery?.evidence;
   return (
     <div className="rounded-xl border border-warn/40 bg-warn/10 p-4">
-      <p className="text-sm font-semibold text-warn">{adoptionFailed ? "Retained recovery integrity check failed" : unwitnessed ? "Unwitnessed continuation hold needs your decision" : retained ? decisionHeld ? `${decisionName} needs your decision`
+      <p className="text-sm font-semibold text-warn">{adoptionFailed ? "Integrity hold needs your decision" : unwitnessed ? "Unwitnessed continuation hold needs your decision" : retained ? decisionHeld ? `${decisionName} needs your decision`
         : decisionRetrying ? `${decisionName} retrying` : `${decisionName} timing unknown`
         : memoryHeld ? "Worker memory pressure — waiting for owner" : "Worker recovery needs your decision"}</p>
       <p className="mt-0.5 text-xs text-muted">
         {retained ? <>
-          {adoptionFailed && "Integrity checks refused to adopt the retained work. Local work and its custody are preserved. "}
+          {adoptionFailed && "Integrity hold: retained adoption or a predecessor remediation record refused source use, so the agent did not start. Local work and its custody are preserved. "}
           {unwitnessed && "The continuation was never confirmed to start, so the claim was released. Local work and its custody are kept. "}
           {decisionHeld
             ? "This hold has no scheduled retry. Only the run owner can Resume or Cancel."
@@ -1552,6 +1552,9 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
         {memoryHeld && " Only the run owner can resume or cancel this run."}{" "}
         This hold has no scheduled retry. Credential changes, messages and capture expiry do not release it.</>}
       </p>
+      {adoptionFailed && <p className="mt-1.5 text-xs text-warn">
+        Resume starts another recovery episode. If the underlying block persists, the run can hold again. Each new claim adds a custody hold. Resolve the cause before resuming.
+      </p>}
       {idleStall && <p className="mt-1.5 text-xs text-muted">Resume starts a fresh wall and resets the idle-stall count. Cancel ends this run. Resume requests an attempt; success is not assured.</p>}
       {!retained && <p className="mt-1.5 text-xs text-muted">
         {memoryHeld
@@ -2530,7 +2533,7 @@ export function RunView() {
         : parkKey === "pool_wait"
           ? "The run is waiting for a pooled Anthropic token. Add a token to the pool and it resumes automatically."
           : parkKey === "retained_recovery_adoption_failed"
-            ? "Integrity checks refused to adopt the retained work. Local work and its custody are preserved. Only the run owner can Resume or Cancel. There is no scheduled retry."
+            ? "Integrity hold: retained adoption or a predecessor remediation record refused source use, so the agent did not start. Local work and its custody are preserved. Only the run owner can Resume or Cancel. There is no scheduled retry."
           : parkKey === "retained_continuation_unwitnessed"
             ? "The continuation was never confirmed to start, so the claim was released. Local work and its custody are kept. Only the run owner can Resume or Cancel. There is no scheduled retry."
           : parkKey === "codex_idle_stall_held"
@@ -3752,10 +3755,21 @@ export function AgentRosterSummary({ run }: { run: Run }) {
 
 const AGENT_SOURCE_RUN_LABELS: Record<AgentSource, string> = { own: "my templates", repo: "repo agents" };
 
-function agentSourceRequestLine(run: Pick<Run, "agent_source" | "agent_source_requested" | "agent_source_requested_basis">): string | null {
+function agentSourceRequestLine(
+  run: Pick<Run, "agent_source" | "agent_source_requested" | "agent_source_requested_basis" | "plan_agent_source">,
+): string | null {
   const requested = run.agent_source_requested;
   if (!requested || !run.agent_source) return null;
   const basis = run.agent_source_requested_basis === "repo_default" ? "repo default" : "this run";
+  const planned = run.plan_agent_source;
+  const parts: string[] = [];
+  if (planned === requested) {
+    parts.push(`Planned with: ${AGENT_SOURCE_RUN_LABELS[planned]} (${basis})`);
+  } else {
+    parts.push(`Requested: ${AGENT_SOURCE_RUN_LABELS[requested]} (${basis})`);
+    parts.push(`Planned with: ${planned ? AGENT_SOURCE_RUN_LABELS[planned] : "—"}`);
+  }
   const outcome = run.agent_source === requested ? "as requested" : "changed at approval";
-  return `Requested: ${AGENT_SOURCE_RUN_LABELS[requested]} (${basis}) · Implemented with: ${AGENT_SOURCE_RUN_LABELS[run.agent_source]} (${outcome})`;
+  parts.push(`Implemented with: ${AGENT_SOURCE_RUN_LABELS[run.agent_source]} (${outcome})`);
+  return parts.join(" · ");
 }

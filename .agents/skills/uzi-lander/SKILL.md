@@ -242,7 +242,8 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    `worker_memory_pressure` (regardless of remaining interventions),
    or `retained_recovery_exhausted` with its retry stamp explicitly null: the poller
    stops on it (exit 0) because only the owner can Resume or Cancel; back up first (`uzi-watcher` recovery).
-   Adoption failure means an integrity check refused adoption, with local work and custody
+   Adoption failure is an integrity hold: retained adoption or a predecessor remediation
+   record refused source use (the agent did not start), with local work and custody
    preserved and no automatic retry. Resume requests a bounded attempt; success is not assured,
    and repeated failure holds again. Unwitnessed means a claimed flight was never seen starting; claim released, work and custody kept, no automatic retry, not an integrity refusal. `paused` stops the poller because it never
    resumes on its own: read `hold_reason`. A run that hit its wall-clock limit is `paused`
@@ -396,7 +397,9 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    `watch-pr.sh --reviewer none`, which scopes Greptile's comments to its last verdict);
    when unsure, decide with the buddy (*Buddy*). Say which in the merge note. Greptile does not
    re-review on its own; re-comment if you want its second pass.
-5. **Base hygiene, when needed, unprompted.** `BEHIND` alone is fine under an admin merge.
+5. **Base hygiene, when needed, unprompted.** `BEHIND` alone is fine under an admin merge
+   only when main moved independently of the PR (references/merge-mechanics.md, *Merging
+   behind main*); otherwise update the branch and wait for fresh exact-head CI.
    Prepare lazily: run `land-prep.sh` only on a PR that is next in the merge order, after
    its blocker has merged. Defer base-only preparation of a held PR: its push would only be
    redone after the blocker lands, at a full CI run per push.

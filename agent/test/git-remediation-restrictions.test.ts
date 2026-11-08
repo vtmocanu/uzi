@@ -12,6 +12,7 @@ import { testLockOptions } from "./authority-test-support.js";
 import { formatAttemptId } from "../src/attempt-path.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, noProofReseed, testGitCacheOptions } from "./helpers.js";
+import { legacyProtectedDetach } from "./legacy-protected-detach.js";
 
 const BRANCH = "agent/issue-3747", RUN = "run-3747", KEY = "issue-3747";
 const ATTEMPT = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "0123456789abcdef");
@@ -57,7 +58,7 @@ async function detach() {
   const current = git(clone, "rev-parse", "HEAD");
   const reservation = await cache.reserveRecoveryIteration(bare, BRANCH, KEY, source());
   await cache.recordRecoveryCapture(bare, BRANCH, KEY, source(), reservation.attempts, current, current);
-  await cache.detachTerminalRetained(bare, BRANCH, KEY, journal());
+  await legacyProtectedDetach(cache, bare, BRANCH, KEY, journal());
 }
 beforeEach(async () => {
   fx = makeFixture();

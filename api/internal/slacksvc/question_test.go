@@ -11,14 +11,15 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/slack-go/slack"
 
+	"github.com/vtmocanu/uzi/api/internal/runquestion"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // questionJSON builds a `question` run-message payload the way the worker persists
 // it (agent/src/protocol.ts QuestionPayload).
-func questionJSON(t *testing.T, id string, qs ...questionItem) []byte {
+func questionJSON(t *testing.T, id string, qs ...runquestion.Item) []byte {
 	t.Helper()
-	b, err := json.Marshal(questionPayload{QuestionID: id, Questions: qs})
+	b, err := json.Marshal(runquestion.Payload{QuestionID: id, Questions: qs})
 	if err != nil {
 		t.Fatalf("marshal question payload: %v", err)
 	}
@@ -28,7 +29,7 @@ func questionJSON(t *testing.T, id string, qs ...questionItem) []byte {
 func parkedQuestionCtx(t *testing.T, questionID string) (store.GetSlackRunContextRow, []byte) {
 	t.Helper()
 	rc := baseRun("awaiting_input")
-	return rc, questionJSON(t, questionID, questionItem{
+	return rc, questionJSON(t, questionID, runquestion.Item{
 		Header: "Storage backend", Question: "Which store should the cache use?",
 	})
 }
@@ -241,10 +242,10 @@ func TestNotifierNonParkedStatusPostsNoQuestion(t *testing.T) {
 // escaped nor truncated away.
 func TestQuestionThreadBlocksEscapesAndScrubs(t *testing.T) {
 	runID := uuid.New()
-	p := questionPayload{QuestionID: "q-1", Questions: []questionItem{{
+	p := runquestion.Payload{QuestionID: "q-1", Questions: []runquestion.Item{{
 		Header:   "<@U0HOSTILE> heads up",
 		Question: "Use <https://evil.example|Open in uzi> with token xoxb-1234-hostile & proceed?",
-		Options:  []questionOption{{Label: "<b>yes</b>", Description: "ship it & go"}},
+		Options:  []runquestion.Option{{Label: "<b>yes</b>", Description: "ship it & go"}},
 	}}}
 
 	blocks := questionThreadBlocks(runID, p, "https://uzi.example")
@@ -272,7 +273,7 @@ func TestQuestionThreadBlocksEscapesAndScrubs(t *testing.T) {
 // becomes *bold*, a list becomes • bullets, and an https link becomes <url|label>.
 func TestQuestionThreadBlocksRendersMarkdown(t *testing.T) {
 	runID := uuid.New()
-	p := questionPayload{QuestionID: "q-1", Questions: []questionItem{{
+	p := runquestion.Payload{QuestionID: "q-1", Questions: []runquestion.Item{{
 		Question: "**pick** one:\n\n- alpha\n- beta\n\nsee [docs](https://x)",
 	}}}
 
@@ -294,7 +295,7 @@ func TestQuestionThreadBlocksRendersMarkdown(t *testing.T) {
 // deep link sits OUTSIDE that bound, so an over-long question cannot displace it.
 func TestQuestionThreadBlocksTruncatesBodyNotLink(t *testing.T) {
 	runID := uuid.New()
-	p := questionPayload{QuestionID: "q-1", Questions: []questionItem{{
+	p := runquestion.Payload{QuestionID: "q-1", Questions: []runquestion.Item{{
 		Question: strings.Repeat("é", maxSlackSectionRunes+500),
 	}}}
 
@@ -309,32 +310,5 @@ func TestQuestionThreadBlocksTruncatesBodyNotLink(t *testing.T) {
 	}
 	if !strings.Contains(contextTexts(blocks), runID.String()) {
 		t.Fatalf("the deep link must survive an over-long question")
-	}
-}
-
-// A payload the notifier cannot use — unparseable, identity-less, or carrying no
-// question with text — yields no post rather than a park nobody can explain or answer.
-func TestParseQuestionPayloadRejectsUnusable(t *testing.T) {
-	cases := []struct {
-		name string
-		raw  []byte
-	}{
-		{"empty", nil},
-		{"not json", []byte("{oops")},
-		{"no question id", questionJSON(t, "", questionItem{Question: "what?"})},
-		{"no questions", questionJSON(t, "q-1")},
-		{"question with no text", questionJSON(t, "q-1", questionItem{Header: "h", Question: "   "})},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if _, ok := parseQuestionPayload(tc.raw); ok {
-				t.Fatalf("payload must be rejected: %s", tc.raw)
-			}
-		})
-	}
-	if p, ok := parseQuestionPayload(questionJSON(t, " q-1 ",
-		questionItem{Question: "a?"}, questionItem{Question: " "})); !ok ||
-		p.QuestionID != "q-1" || len(p.Questions) != 1 {
-		t.Fatalf("a usable payload must keep only questions carrying text, with a trimmed id: %+v %v", p, ok)
 	}
 }

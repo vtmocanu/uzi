@@ -1486,11 +1486,19 @@ export type OrphanReason = "http" | "transport_unknown" | "nonterminal_owner" | 
  *  Only these literals leave the diagnostics boundary; anything else is written as `unknown`. */
 export type OrphanRetirementSubreason =
   | "fenced_source" | "pair_changed" | "completion_pending" | "completion_preflight_retained" | "completion_unverified"
-  | "completion_uncertain" | "completion_unsupported" | "authority_busy" | "published_source_retained" | "unknown";
+  | "completion_uncertain" | "completion_unsupported" | "authority_busy" | "published_source_retained" | "remediation_retained" | "unknown";
 const ORPHAN_RETIREMENT_SUBREASONS: ReadonlySet<string> = Object.freeze(new Set<string>([
   "fenced_source", "pair_changed", "completion_pending", "completion_preflight_retained", "completion_unverified",
-  "completion_uncertain", "completion_unsupported", "authority_busy", "published_source_retained", "unknown",
+  "completion_uncertain", "completion_unsupported", "authority_busy", "published_source_retained", "remediation_retained", "unknown",
 ]));
+/** issue #4058: a release, retirement or detach was refused because the journal carries an active remediation
+ *  recovery record. Nothing was written; only a reviewed owner proof may clear such a journal. */
+export class RemediationRecoveryRetainedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RemediationRecoveryRetainedError";
+  }
+}
 export type RunnerCloneRetireResult = "quarantined" | "source-already-absent";
 export interface OrphanDiagnostics {
   logger: Logger;
@@ -7946,16 +7954,19 @@ export class GitCache {
   async readOrphanJournalFence(
     barePath: string, branch: string, ownerRunId: string, clonePath: string,
     signal?: AbortSignal,
-  ): Promise<{ state: "changed" } | { state: "unfenced"; retained: boolean } |
-    { state: "fenced"; fence: CompletionSourceFence; attemptId?: string; retained: boolean }> {
+  ): Promise<{ state: "changed" } | { state: "unfenced"; retained: boolean; remediation?: "exact" | "mismatch" } |
+    { state: "fenced"; fence: CompletionSourceFence; attemptId?: string; retained: boolean; remediation?: "exact" | "mismatch" }> {
     return this.withLock(barePath, async () => {
       await this.assertRecoveryBare(barePath);
       const journal = await this.readRecoveryCapture(barePath, branch);
       if (!journal || journal.runId !== ownerRunId || journal.clonePath !== clonePath) return { state: "changed" as const };
       const retained = !!journal.recovery || !!journal.retainedSources?.length;
-      if (!this.authorityRequired || journal.completionSourceFence === undefined) return { state: "unfenced" as const, retained };
+      // issue #4058: the parse already binds the record to (run, path, attempt); the branch is checked here.
+      const remediation = journal.remediationRecovery === undefined ? {}
+        : { remediation: journal.remediationRecovery.branch === branch ? "exact" as const : "mismatch" as const };
+      if (!this.authorityRequired || journal.completionSourceFence === undefined) return { state: "unfenced" as const, retained, ...remediation };
       return {
-        state: "fenced" as const, fence: journal.completionSourceFence, retained,
+        state: "fenced" as const, fence: journal.completionSourceFence, retained, ...remediation,
         ...(journal.attemptId === undefined ? {} : { attemptId: journal.attemptId }),
       };
     }, signal);
@@ -8421,6 +8432,8 @@ export class GitCache {
    * one deliberate fence-carrying clear outside the certified retirement, and is not refused. */
   async detachTerminalRetained(barePath: string, branch: string, key: string, expected: RecoveryJournalEntry): Promise<void> {
     expected = parseRecoveryJournal(JSON.stringify(expected));
+    const remediationRefusal = () => new RemediationRecoveryRetainedError("remediation recovery detach requires proof");
+    if (expected.remediationRecovery) throw remediationRefusal();
     await this.withLock(barePath, async () => {
       await this.refuseMarkedPaths(barePath, this.recoverySources(expected).map((x) => x.clonePath), expected.runId);
       const records = await this.protectedRecoveries(barePath);
@@ -8428,6 +8441,8 @@ export class GitCache {
       const value = JSON.stringify({ version: 1, branch, key, journal: expected });
       if (prior && JSON.stringify({ version: 1, ...prior }) !== value) throw new Error("conflicting protected recovery descriptor");
       const current = await this.readRecoveryCapture(barePath, branch);
+      // issue #4058: refuse before any write when a remediation record is present, expected or under the lock.
+      if (current?.remediationRecovery) throw remediationRefusal();
       if (prior) await this.checkedRecovery(barePath, branch, key, expected, true, prior.journal);
       if (prior && (!current || current.runId !== expected.runId)) return;
       if (!current || JSON.stringify(current) !== JSON.stringify(expected)) throw new Error("terminal recovery snapshot changed");
@@ -8833,7 +8848,7 @@ export class GitCache {
   /** Throws {@link CompletionSourceFenceError} before any effect when {@link dropsFence}. */
   private refuseFenceDrop(journal: RecoveryJournalEntry | undefined, op: string): void {
     if (journal?.remediationRecovery && op !== "discardRetainedRecovery")
-      throw new Error("remediation recovery rebind requires proof");
+      throw new RemediationRecoveryRetainedError("remediation recovery rebind requires proof");
     if (this.dropsFence(journal)) {
       throw new CompletionSourceFenceError(`${op}: the journal carries a completion source fence; only a certified retirement may clear it`);
     }
@@ -13738,7 +13753,7 @@ export class GitCache {
       }
       // issue #3404 M2: only a certified completion retirement (checked against its expectedFence below)
       // may clear a fenced journal; any other retirement (orphan reclaim included) refuses before effects.
-      if (pending.remediationRecovery) throw new Error("remediation recovery retirement requires proof");
+      if (pending.remediationRecovery) throw new RemediationRecoveryRetainedError("remediation recovery retirement requires proof");
       if (!opts.completionSource) this.refuseFenceDrop(pending, "retireRunnerClone");
       // issue #1786: a marked stopped canonical source is retired only by the operator discard.
       checkProcessProof();
