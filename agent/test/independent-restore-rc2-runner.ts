@@ -72,8 +72,8 @@ export async function runnerOverDisk(o: RunnerOverOptions): Promise<RunnerOver> 
     secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan" },
   });
   api.setOwnershipStatus(o.runId, "running", o.claimGeneration);
-  // The Cancel is persisted server-side the way the server derives it (a cancel row still unapplied), so a claim that stops before
-  // steering's first input read routes it through the ownership read at the stop (the outbox is what lets that read run).
+  // The Cancel is persisted server-side the way the server derives it (a cancel row still unapplied, also served as an input row),
+  // and the outbox lets the stop's ownership read run. In the proof steering routes the row first; see CANCEL_LOGS there.
   let outbox: Outbox | undefined;
   if (o.cancel === true) {
     api.setInputs(o.runId, [{ id: 1, kind: "cancel", body: null }]);

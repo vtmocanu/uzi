@@ -282,6 +282,8 @@ function assertCancelledOnce(r: Rig, generation = r.generation): void {
   assert.equal(r.gets(), r.getsAtSeam, "the seam never reads inputs");
   assert.equal(treeHash(r.pred.clonePath), r.before, "custody and the clone are retained untouched");
   assert.equal(r.flight.steering.isCancelled(), true);
+  assert.equal(r.lines.filter(l => (l as { msg?: string }).msg ===
+    "retained predecessor held; owner cancel observed at the refusal, reporting cancellation").length, 1, "the held seam's own cancel line");
 }
 
 /** The journal is either gone or marked settled by the server (nothing is left to resend). */
