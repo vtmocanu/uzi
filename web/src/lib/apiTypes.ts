@@ -4352,6 +4352,12 @@ export interface RunListItem extends Run {
   judge_verdict: JudgeVerdict | null;
   judge_todo_count: number;
 
+  /** PRD #4040: a one-line, sanitized excerpt (at most 280 characters plus " (+N more)")
+   *  of the newest pending question, set only on the viewer's own awaiting_input rows of
+   *  GET /api/runs. Absent otherwise, and never on the admin list. Untrusted model text:
+   *  render as plain text. */
+  pending_question?: string;
+
   repo_path: string;
   worker_name: string | null;
   owner_email?: string;
