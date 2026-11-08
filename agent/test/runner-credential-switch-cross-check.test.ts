@@ -1444,16 +1444,29 @@ describe("issue #3953 m3: every trip entry reaches neither guard (the state-ack 
       const delivery = watchSwitchDelivery();
       let rowId = 0;
       const forced = base.verdicts?.[0] === "block";
+      let latchTimedOut = false;
       const d = await drive({ ...base, capture, switchRounds: [], rejectAfterGiveUp: forced && capture === "giveup", duringPending: async (c) => {
         if (forced) {
           // Hold the APPLIED request back (the fake api refuses a pending switch's APPLIED before it applies
-          // any reply delay), so the forced gate's presentation is already waiting on the receipt.
+          // any reply delay) until the forced gate's presentation really waits on the receipt: the first
+          // awaitReceiptSettlement entry, after the operator row is ACKed, that sees a receipt pending.
+          let release!: () => void;
+          const waiting = new Promise<void>((resolve) => { release = resolve; });
+          const channelProto = SteeringChannel.prototype as unknown as { awaitReceiptSettlement: (signal?: AbortSignal) => Promise<void>; receiptPending: () => boolean };
+          const settle = channelProto.awaitReceiptSettlement;
+          channelProto.awaitReceiptSettlement = function (this: typeof channelProto, signal?: AbortSignal) {
+            if (rowId > 0 && api.isAcked(c.run_id, rowId) && this.receiptPending()) release();
+            return settle.call(this, signal);
+          };
           const apply = client.applyInputs;
           client.applyInputs = async (...args: Parameters<typeof apply>) => {
-            await new Promise((resolve) => setTimeout(resolve, 150));
+            let timer: NodeJS.Timeout | undefined;
+            const deadline = new Promise<void>((resolve) => { timer = setTimeout(() => { latchTimedOut = true; resolve(); }, 10_000); });
+            await Promise.race([waiting, deadline]);
+            clearTimeout(timer);
             return apply.apply(client, args);
           };
-          restorers.push(() => { client.applyInputs = apply; });
+          restorers.push(() => { client.applyInputs = apply; channelProto.awaitReceiptSettlement = settle; });
         }
         api.pendSwitchAfterNextAck(c.run_id);
         rowId = send(c.run_id, row("follow_up", "operator note while the checker is pending"))[0]!.id;
@@ -1466,6 +1479,7 @@ describe("issue #3953 m3: every trip entry reaches neither guard (the state-ack 
         assert.ok(await handlerWait(() => watched.refused > 0), "the held batch's APPLIED was refused switch_pending");
         assert.ok(await handlerWait(() => delivery.latched()), "the refusal latched under the hold");
       } });
+      assert.equal(latchTimedOut, false, "the forced gate's presentation waited on the receipt while the APPLIED was held back");
       assert.ok(watched.refused > 0, "the held batch's APPLIED was refused switch_pending");
       noInvariant(d.c.run_id);
       assertServicedAfterRelease(d);
@@ -1742,7 +1756,7 @@ describe("issue #3990: in-place continuation of retained checked storage", () =>
     // operation is continued in place (a second send of the same canonical plan), never recomputed.
     assert.equal(gateEntries, 1, "gatePlan entered once: the retained storage was continued, not recomputed");
     assert.equal(d.storage.length, 2, `the interrupted send and the in-place continuation: ${JSON.stringify(seen)}`);
-    assert.deepEqual(d.storage[1], d.storage[0], "the continuation re-sends the identical canonical storage");
+    assert.equal(d.storage[1], d.storage[0], "the continuation re-sends the same retained storage request");
     assert.equal(d.storage[0]!.plan_md, NORMALIZED, "the stored plan is the normalized canonical plan");
     assert.equal(everyState(c.run_id).filter((s) => s.status === "running" && s.candidate_digest === digest).length, 1,
       "the server stored the canonical plan exactly once");
