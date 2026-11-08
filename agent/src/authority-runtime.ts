@@ -1493,7 +1493,9 @@ export class AuthorityRuntime implements AuthorityScope {
           part.settled = true;
           if (part.bareSlot) {
             // Leave `active` so a successor worker is not refused by a slot with nothing pending.
-            await store.transition(tx, part.lease, "ineligible").catch((error: unknown) => {
+            await store.transition(tx, part.lease, "ineligible").then(() => {
+              if (this.#bareEndFailed.delete(part.lease)) this.#notify();
+            }).catch((error: unknown) => {
               this.#bareEndFailed.set(part.lease, part.operation);
               this.#notify();
               this.#options.log?.warn("bare-mutator slot could not leave active", { error: error instanceof Error ? error.message : String(error) });

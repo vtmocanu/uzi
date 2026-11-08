@@ -9,7 +9,7 @@ import { acquireWorkerLifetime } from "../src/authority-lock.js";
 import { AuthorityRuntime } from "../src/authority-runtime.js";
 import { openAuthorityStore, type SlotSnapshot } from "../src/completion-authority.js";
 import { GitCache, type FetchAgentBranchOptions, type PositiveOwedCandidateContext } from "../src/git.js";
-import { agentRoot, makeTmp, testLockOptions, utilLinux } from "./authority-test-support.js";
+import { agentRoot, makeTmp, testLockOptions } from "./authority-test-support.js";
 import type { Barrier, ChildConfig } from "./fixtures/authority-crash-child.js";
 import { makeFixture } from "./fixture-repo.js";
 import { nullLogger, noProofReseed } from "./helpers.js";
@@ -497,10 +497,16 @@ async function releaseGo(rig: Rig): Promise<void> {
 }
 
 /** Try to take A on `dataDir` from a separate process (W is held by the worker, so A is probed at the kernel lock). */
-function probeAuthorityLock(dataDir: string): { acquired: boolean; status: number | null } {
+function probeAuthorityLock(dataDir: string): { status: number } {
   const file = path.join(dataDir, ".uzi-authority", "authority.lock");
-  const result = spawnSync("/usr/bin/flock", utilLinux ? ["-x", "-w", "0.2", file, "true"] : ["-x", "-n", file, "true"], { encoding: "utf8" });
-  return { acquired: result.status === 0, status: result.status };
+  // Resolve via PATH. Both util-linux and BusyBox return 1 for a conflict with this common -n form.
+  const result = spawnSync("flock", ["-x", "-n", file, "true"], { encoding: "utf8" });
+  assert.ifError(result.error);
+  assert.equal(result.signal, null, "flock probe must not be killed");
+  assert.ok(result.status !== null, "flock probe must produce an exit status");
+  assert.ok(result.status === 0 || result.status === 1, `flock probe failed with status ${result.status}: ${result.stderr}`);
+  assert.equal(result.stderr, "", "flock probe must not report an execution or usage error");
+  return { status: result.status };
 }
 
 const GATE_LATE = { rmTimeoutMs: 100, shutdownBudgetMs: 5_000 } as const;
@@ -610,7 +616,7 @@ test("issue #4066 (c): a late close that fires inside an open transaction keeps 
 
   // (ii) A is still held by the paused apply: the transaction's callback returned, but its lock lifetime is the apply's.
   const probe = probeAuthorityLock(dataDir);
-  assert.equal(probe.acquired, false, `A is still held while the inline settlement write is paused (flock status ${probe.status})`);
+  assert.equal(probe.status, 1, "confirmed flock conflict: A is still held while the inline settlement write is paused");
 
   // (i) the observer reports the incomplete shutdown while the write is paused; nothing reports a clean shutdown.
   const logged = await until(worker, (line) => line.startsWith("LOG:") && line.includes("worker_shutdown_result"));

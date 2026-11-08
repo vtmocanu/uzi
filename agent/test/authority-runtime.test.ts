@@ -1379,6 +1379,27 @@ describe("issue #4066: what keeps a shutdown from being drained", () => {
     assert.deepEqual(f.rt.snapshot().reasons, [], "a later successful transition of the same lease clears it");
   });
 
+  it("retrying the same bare mutation clears a previous bare-slot end failure after transition succeeds", async (t) => {
+    const f = await faultRig(t);
+    await f.warm();
+    let first!: AuthoritySettlement;
+    await f.rt.withTransaction(async () => {
+      first = await f.rt.hooks.beginBareMutation(f.bare, "recovery-cleanup-delete-ref", ["refs/x"]);
+    });
+    f.ctl.renames = 0;
+    f.ctl.failWhen = nth => nth === 3; // settlement lands; its following ineligible transition fails
+    await f.rt.withTransaction(() => first.settle({ ok: true }));
+    assert.deepEqual(f.rt.snapshot().reasons, ["bare_slot_end_failed"]);
+    assert.equal((await peek(f, f.bare))?.state, "active");
+    f.ctl.failWhen = undefined;
+    await f.rt.withTransaction(async () => {
+      const retry = await f.rt.hooks.beginBareMutation(f.bare, "recovery-cleanup-delete-ref", ["refs/x"]);
+      await retry.settle({ ok: true });
+    });
+    assert.equal((await peek(f, f.bare))?.state, "ineligible");
+    assert.deepEqual(f.rt.snapshot().reasons, [], "successful retry must clear the previous end failure for its lease");
+  });
+
   it("an admission whose slot landed and whose head write failed is enrollment_uncertain", async (t) => {
     const f = await faultRig(t);
     await f.warm();
