@@ -128,6 +128,8 @@ describe("executingPeople", () => {
       run({ status: "running", owner_email: "a@x.io" }),
       run({ status: "running", owner_email: "b@x.io", health: "waiting_account_cooldown" }),
       run({ status: "completed", owner_email: "c@x.io" }),
+      // Running in its owner's pill, but not executing in the sentence.
+      run({ status: "awaiting_approval", is_revising: true, owner_email: "d@x.io" }),
     ];
     const merged = mergeOverviewRows(own, adminRows, ME);
     const people = executingPeople(merged, ME);
@@ -137,8 +139,9 @@ describe("executingPeople", () => {
     expect(people).toBe(1);
   });
 
-  it("attributes an owner-less row to the viewer", () => {
-    expect(executingPeople([run({ status: "running" })], ME)).toBe(1);
+  it("counts a personal row (no owner_email) as the viewer's", () => {
+    const rows = [run({ status: "running" }), run({ status: "running" }), run({ status: "running", owner_email: ME })];
+    expect(executingPeople(rows, ME)).toBe(1);
   });
 });
 
@@ -171,7 +174,7 @@ describe("active people", () => {
     expect(m.active.people[0].you).toBe(true);
     expect(m.active.people[3].pill).toBe("waits on them");
     expect(m.total).toBe(9);
-    expect(m.signedIn).toEqual([{ key: "d@x.io", name: "d@x.io", initials: "D", ago: "2h ago" }]);
+    expect(m.signedIn).toEqual([{ key: "d@x.io", name: "d@x.io", initials: "D", you: false, ago: "2h ago" }]);
     expect(m.idle).toEqual({ count: 2, minDays: 3, maxDays: 10, never: 2 });
     expect(idleText(m.idle!)).toBe("2 people, last seen 3 to 10 days ago · 2 never signed in");
   });
@@ -229,12 +232,19 @@ describe("signed in and idle", () => {
       users: [
         user("in@x.io", { last_login: ago(23 * HOUR + 59 * 60 * 1000) }),
         user("out@x.io", { last_login: ago(24 * HOUR + 60 * 1000) }),
+        user("edge@x.io", { last_login: ago(24 * HOUR) }),
         user("newer@x.io", { last_login: ago(HOUR) }),
         user("future@x.io", { last_login: new Date(NOW + HOUR).toISOString() }),
       ],
     });
     expect(m.signedIn?.map((s) => s.key)).toEqual(["future@x.io", "newer@x.io", "in@x.io"]);
-    expect(m.idle).toEqual({ count: 1, minDays: 1, maxDays: 1, never: 0 });
+    expect(m.idle).toEqual({ count: 2, minDays: 1, maxDays: 1, never: 0 });
+  });
+
+  it("marks the viewer in the signed-in group", () => {
+    const m = model({ users: [user(ME, { last_login: ago(HOUR) }), user("a@x.io", { last_login: ago(HOUR) })] });
+    expect(m.signedIn?.find((s) => s.key === ME)?.you).toBe(true);
+    expect(m.signedIn?.find((s) => s.key === "a@x.io")?.you).toBe(false);
   });
 
   it("words the idle range and keeps never-signed-in out of it", () => {

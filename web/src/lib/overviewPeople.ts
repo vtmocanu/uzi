@@ -93,7 +93,8 @@ export function peopleRows(
 
 // Distinct owners with a run the status sentence counts as executing. Feed it the SAME rows
 // the sentence counts (mergeOverviewRows output), never peopleRows, so "for N people" can
-// never exceed the executing count beside it.
+// never exceed the executing count beside it. A row without owner_email is a personal row
+// (only the admin list carries it), so it is the viewer's.
 export function executingPeople(rows: ReadonlyArray<RunSummaryItem>, viewerEmail: string): number {
   const owners = new Set<string>();
   for (const r of rows) {
@@ -117,6 +118,7 @@ export interface SignedInPerson {
   key: string;
   name: string;
   initials: string;
+  you: boolean;
   ago: string;
 }
 
@@ -153,7 +155,7 @@ function initialsOf(name: string): string {
   const first = (tokens: string[]) =>
     tokens
       .slice(0, 2)
-      .map((t) => letters(t).charAt(0))
+      .map((t) => [...letters(t)][0] ?? "")
       .join("");
   const spaced = name.split(/\s+/).filter((t) => t !== "");
   let out: string;
@@ -254,7 +256,14 @@ export function peopleModel(input: {
           idle.never++;
         } else if (t !== null && now - t < DAY_MS) {
           const name = displayName(u.email, u, demo);
-          recent.push({ key: u.email, name, initials: initialsOf(name), ago: formatAgo(u.last_login, now), t });
+          recent.push({
+            key: u.email,
+            name,
+            initials: initialsOf(name),
+            you: u.email === viewer.email,
+            ago: formatAgo(u.last_login, now),
+            t,
+          });
         } else {
           idle.count++;
           if (t !== null) {
@@ -265,7 +274,7 @@ export function peopleModel(input: {
         }
       }
       recent.sort((a, b) => b.t - a.t);
-      signedIn = recent.map(({ key, name, initials, ago }) => ({ key, name, initials, ago }));
+      signedIn = recent.map(({ key, name, initials, you, ago }) => ({ key, name, initials, you, ago }));
     }
   }
 
