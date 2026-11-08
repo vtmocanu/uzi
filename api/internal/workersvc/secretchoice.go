@@ -250,11 +250,10 @@ func (s *Service) openAnthropic(ctx context.Context, userID uuid.UUID, secretID 
 		// failed with this string, and it is read by e2e and handler assertions.
 		// Anything else is a real lookup error, surfaced verbatim (no secret bytes).
 		if errors.Is(err, pgx.ErrNoRows) {
-			unavailable := fmt.Errorf("%w: no Anthropic token configured for this user", errCredentialUnavailable)
 			if secretID == nil {
-				return claimCred{}, noAnthropicDefaultError{err: unavailable}
+				return claimCred{}, noAnthropicDefaultError{err: errNoModelCredential}
 			}
-			return claimCred{}, unavailable
+			return claimCred{}, errNoModelCredential
 		}
 		return claimCred{}, fmt.Errorf("anthropic credential lookup: %w", err)
 	}
@@ -274,7 +273,7 @@ func (s *Service) openAnthropic(ctx context.Context, userID uuid.UUID, secretID 
 	case errors.Is(err, secretopen.ErrVaultLocked):
 		return claimCred{}, errVaultLocked
 	case errors.Is(err, secretopen.ErrNoSecret):
-		return claimCred{}, fmt.Errorf("%w: no Anthropic token configured for this user", errCredentialUnavailable)
+		return claimCred{}, errNoModelCredential
 	case errors.Is(err, secretopen.ErrUndecryptable):
 		return claimCred{}, fmt.Errorf("%w: Anthropic token could not be decrypted", errCredentialUnavailable)
 	default:

@@ -68,6 +68,7 @@ else
   # force-recreated container re-reads the SAME join token and re-registers into its
   # existing row; without the provide it would read the --env-file placeholder and 401.
   printf 'UZI_E2E_MAX_CONCURRENT_RUNS=2\n' >> "$ENVFILE"
+  capture_agent_logs 45-bounded-concurrency before-recreate-cap2
   "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null
   # Wait for the NEW worker's registration to actually LAND its advertised cap —
   # not merely for `online`. The recreated container reuses the join token (same
@@ -200,6 +201,7 @@ else
   # Hard-kill the agent: no graceful drain, no re-register — only the server-side
   # sweeper can recover the two orphaned runs. Do NOT restart the worker yet, so
   # the SWEEPER (not the restart's register-time requeue) is what re-queues them.
+  capture_agent_logs 45-bounded-concurrency before-sigkill
   "${COMPOSE[@]}" kill -s KILL agent >/dev/null
   pass "SIGKILL delivered to the agent container (two runs left in-flight)"
 
@@ -215,6 +217,7 @@ else
   # #2512 verifies/captures the retained predecessor and seeds a fresh attempt
   # inside the acquired successor claim. The 90s gate ceiling covers recovery
   # work under CI load; no extra park, promotion or generation is expected.
+  capture_agent_logs 45-bounded-concurrency before-restart-after-kill
   "${COMPOSE[@]}" up -d --wait agent >/dev/null
   wait_worker_online
   wait_status "$RUN_KA" awaiting_approval 90

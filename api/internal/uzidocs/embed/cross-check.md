@@ -60,7 +60,9 @@ replaced or interrupted evidence; a recorded review can survive missing child
 metadata without proving that execution finished. Missing or unrecognized
 values remain unknown or not recorded. An absent valid child has no checker
 link. A historical approval concerns an earlier plan candidate and does not
-certify a later candidate or human revision. Cause, next action and effect
+certify a later candidate or human revision. A Plan verdict recorded before the
+lead lost custody shows as that verdict (passed or raised issues) rather than
+as interrupted, keeps its interruption time, and stays historical. Cause, next action and effect
 can be unrecorded; the history view grants no new approval or policy effect.
 
 ### Page sizes and continuation
@@ -478,9 +480,15 @@ the next gate.
 
 ## Claude checker isolation
 
-The Claude checker has only the `Read`, `Grep` and `Glob` tools: no shell, web,
-nested-agent or write tools, and no repository settings, plugins, skills or MCP
-servers. It runs with an isolated environment holding only your Anthropic token
+The Claude checker's repository access tools are `Read`, `Grep` and `Glob`: no
+shell, web, nested-agent or write tools, and no repository settings, plugins,
+skills or MCP servers. Besides those it has only the SDK's end-turn
+`StructuredOutput` tool, which returns its final verdict and touches no files or
+network. When that verdict does not match the expected schema, the SDK re-asks
+within the same session (up to five attempts, same turn limit, deadline and
+usage); if those retries are exhausted the check fails as malformed. A verdict
+that matches the schema but fails uzi's other verdict checks (size caps,
+duplicate finding ids and the like) is not retried and also fails as malformed. It runs with an isolated environment holding only your Anthropic token
 (a Codex checker holds only Codex credentials), as the worker's runner user.
 Direct reads are limited to its own checkout, plus its own SDK spill files for
 oversized tool output. Glob and Grep patterns that are absolute, home-relative

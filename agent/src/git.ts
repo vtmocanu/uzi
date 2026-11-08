@@ -420,6 +420,17 @@ export type ScratchPublicationKind =
 export type ScratchPublicationStep =
   | "resolve_tip" | "shallow_check" | "object_walk" | "scratch_walk" | "floor_refresh" | "checkpoint_floor";
 
+/** An intrinsic recovery-operation deadline (the withRecoveryOperation clock or the per-process remaining budget).
+ *  The message is load-bearing for existing text matchers; the type lets the retained loop classify without text. */
+export class RecoveryDeadlineExhaustedError extends Error {
+  constructor() { super("recovery deadline exhausted"); }
+}
+
+/** reserveRecoveryIteration refused because the episode window is spent (attempts or deadline). */
+export class RecoveryBudgetExhaustedError extends Error {
+  constructor() { super("recovery budget exhausted"); }
+}
+
 export class ScratchPublicationError extends Error {
   readonly code = "scratch_publication_refused";
   readonly kind: ScratchPublicationKind;
@@ -3195,9 +3206,9 @@ export class GitCache {
     const combined = AbortSignal.any([signal, timeout.signal, ...(parent ? [parent.signal] : []),
       ...(budget ? [budget.signal] : []), ...(pending ? [pending] : [])]);
     const timer = Number.isFinite(deadline)
-      ? setTimeout(() => timeout.abort(new Error("recovery deadline exhausted")), Math.max(0, deadline - Date.now()))
+      ? setTimeout(() => timeout.abort(new RecoveryDeadlineExhaustedError()), Math.max(0, deadline - Date.now()))
       : undefined;
-    if (Date.now() >= deadline) timeout.abort(new Error("recovery deadline exhausted"));
+    if (Date.now() >= deadline) timeout.abort(new RecoveryDeadlineExhaustedError());
     const run = async (): Promise<T> => {
       combined.throwIfAborted();
       budget?.check();
@@ -3240,7 +3251,7 @@ export class GitCache {
     // Native execFile requires an unsigned integer timeout. Rounding down also
     // keeps the per-operation cap within the absolute remaining budget.
     const remaining = Math.floor(Math.min(operation.deadline - Date.now(), operation.budget?.remainingMs() ?? Infinity));
-    if (remaining <= 0) throw new Error("recovery deadline exhausted");
+    if (remaining <= 0) throw new RecoveryDeadlineExhaustedError();
     return remaining;
   }
   /** An awaited supervisor may hand back a root after the deadline. Stop and
@@ -9061,7 +9072,7 @@ export class GitCache {
       if (old?.stage === "blocked" && !renewal) throw new Error("recovery episode is blocked");
       if (old && !renewal && (old.attempts >= 3 || (!newWindow && now >= old.deadline))) {
         await this.writeRecovery(barePath, branch, { ...journal, recovery: { ...old, stage: "blocked", blocker: "budget_exhausted" } });
-        throw new Error("recovery budget exhausted");
+        throw new RecoveryBudgetExhaustedError();
       }
       const source = old?.source ?? recoverySource({ runId: journal.runId, clonePath: journal.clonePath,
         ...(journal.attemptId ? { attemptId: journal.attemptId } : {}) });
@@ -19666,7 +19677,8 @@ try {
       if (err instanceof RunResidueBlockedError) throw err;
       const abort = this.boundaryAbortError(err);
       if (abort) throw abort;
-      const failure = this.transferRetainedCause(err, new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`));
+      const failure = this.transferRetainedCause(err,
+        new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`, recoveryDeadlineCause(err)));
       const stderr = (err as { stderr?: unknown })?.stderr;
       retainedGitDiagnostics.set(failure, {
         stderr: typeof stderr === "string" ? stderr : "",
@@ -19705,7 +19717,7 @@ try {
       if (err instanceof RunResidueBlockedError) throw err;
       const abort = this.boundaryAbortError(err);
       if (abort) throw abort;
-      const failure = new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
+      const failure = new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`, recoveryDeadlineCause(err));
       const stderr = (err as { stderr?: unknown })?.stderr;
       retainedGitDiagnostics.set(failure, {
         stderr: typeof stderr === "string" ? stderr : "",
@@ -19775,7 +19787,7 @@ try {
       if (err instanceof RunResidueBlockedError) throw err;
       const abort = this.boundaryAbortError(err);
       if (abort) throw abort;
-      throw new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
+      throw new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`, recoveryDeadlineCause(err));
     }
   }
 
@@ -23985,6 +23997,21 @@ function addedLinesOfDiff(diff: string): string {
 function isOutputOverflow(err: unknown): boolean {
   const e = err as { code?: unknown; message?: unknown };
   return e.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" || /output exceeded|maxBuffer/i.test(String(e.message ?? ""));
+}
+
+/** issue #3980: the Error options for a `git ... failed: ...` wrapper. Keeps the raw cause ONLY when the
+ *  failure is this process's own recovery-deadline stop (the bare "recovery deadline exhausted" Error that
+ *  recoveryRemaining throws, with no git stderr, or the TimeoutError of an abort signal that had already fired
+ *  before the child started; an abort during a child arrives as an AbortError that boundaryAbortError takes first), so the runner's
+ *  gate classifier can recognise a deadline stop that the wrapper's message alone cannot distinguish from a
+ *  git failure. Every other failure keeps no cause. */
+function recoveryDeadlineCause(err: unknown): { cause: Error } | undefined {
+  if (!(err instanceof Error)) return undefined;
+  const stderr = (err as { stderr?: unknown }).stderr;
+  if (err.name === "TimeoutError" || (err.message === "recovery deadline exhausted" && typeof stderr !== "string")) {
+    return { cause: err };
+  }
+  return undefined;
 }
 
 function gitErrorMessage(err: unknown): string {

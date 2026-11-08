@@ -550,6 +550,8 @@ export const RUN_STATUS_TONES: Record<
    *  other involuntary holds, NOT the owner-pause info tone, and not pulsing: it does no
    *  work until the credential is enabled. Label below. */
   credential_disabled: { tone: "warning" },
+  /** PRD #3989 M3: parked after an account reset deleted every credential; warns like credential_disabled. */
+  credentials_reset: { tone: "warning" },
   // Provider holds are parked: owner attention and outage retry share a static warning.
   iteration_budget_exhausted: { tone: "warning" },
   provider_unavailable: { tone: "warning" },
@@ -622,6 +624,7 @@ const RUN_STATUS_LABELS: Record<string, string> = {
   completion_blocked: "Completion blocked",
   // PRD #1732: kept in step with runBadge's matching label.
   credential_disabled: "waiting: credential disabled",
+  credentials_reset: "waiting: credentials were reset",
   // Kept in step with runBadge's parked wording by the label-agreement test.
   iteration_budget_exhausted: "Iteration limit reached",
   provider_unavailable: "provider unavailable: owner hold",

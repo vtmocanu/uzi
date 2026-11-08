@@ -175,6 +175,11 @@ describe("StatusPill", () => {
       label: "waiting: credential disabled", tone: "text-warn", pulse: false,
     },
     {
+      name: "credentials reset (PRD #3989)",
+      run: { status: "paused", hold_reason: "credentials_reset" },
+      label: "waiting: credentials were reset", tone: "text-warn", pulse: false,
+    },
+    {
       name: "token switch settling",
       run: { status: "paused", hold_reason: "credential_switch_settling" },
       label: "settling: token switch", tone: "text-warn", pulse: false,

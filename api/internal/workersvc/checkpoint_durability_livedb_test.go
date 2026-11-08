@@ -141,6 +141,7 @@ func TestCheckpointDurabilityClearedOnResumeLiveDB(t *testing.T) {
 	// (c) A server-side park of the claimed run carries no report and reads NULL.
 	n, err := e.q.ParkCredentialDisabledRun(e.ctx, store.ParkCredentialDisabledRunParams{
 		ID: runID, WorkerID: pgconv.UUID(w), ClaimGeneration: claimed.ClaimGeneration,
+		HoldReason: "credential_disabled",
 	})
 	if err != nil || n != 1 {
 		t.Fatalf("ParkCredentialDisabledRun = %d err=%v, want 1 row", n, err)

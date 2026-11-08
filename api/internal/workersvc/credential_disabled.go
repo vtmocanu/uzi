@@ -22,7 +22,9 @@ import (
 
 // credential_disabled.go is the server side of the credential_disabled park (PRD #1732 D14):
 // the claim-time classification sentinel, and the automatic promoter that returns a parked run
-// to queued once its exact credential requirement is enabled again.
+// to queued once its exact credential requirement is enabled again. The promoter also releases
+// the credentials_reset hold (PRD #3989 M3) under the same lock order, with its own requirement
+// rule (credentialsResetRequirementMet).
 //
 // Lock order, shared by every writer that can change a parked run's requirement:
 //
@@ -35,7 +37,8 @@ import (
 // Enable/disable, default changes, pool opt-in, worker and Judge rebinding (SetWorkerAnthropicToken,
 // SetUserJudgeBinding) and the per-run reassignment of a HELD run (SetRunCredential's
 // credential_disabled branch) take (1) first, so each promotion decision is serialized against
-// them. Other requirement writers do not take (1): the override of a run in any other state, and
+// them. Other requirement writers do not take (1): the override of a run in any other state (a
+// credentials_reset hold SetRunCredential observes is refused before any write), and
 // the held-state credential switch (StampHeldCredentialSwitch / ReleaseCredentialSwitch), touch
 // runs that are not parked here and never race this hold. The promotion UPDATE is additionally
 // guarded on the requirement columns it evaluated, so a writer outside (1) that does reach a held
@@ -243,12 +246,18 @@ func (s *Service) promoteCredentialDisabledRun(ctx context.Context, userID, runI
 	if err != nil {
 		return "", err
 	}
-	if run.Status != "paused" || !run.HoldReason.Valid || run.HoldReason.String != "credential_disabled" {
+	if run.Status != "paused" || !run.HoldReason.Valid ||
+		(run.HoldReason.String != holdCredentialDisabled && run.HoldReason.String != holdCredentialsReset) {
 		return "", nil // no longer this hold
 	}
 	// (3) + (4) The requirement source and the requirement credential.
-	heartbeatCutoff := pgconv.Time(s.now().Add(-s.p.WorkerHeartbeatStale))
-	met, err := credentialRequirementMet(ctx, q, run, heartbeatCutoff)
+	var met bool
+	if run.HoldReason.String == holdCredentialsReset {
+		met, err = s.credentialsResetRequirementMet(ctx, q, run)
+	} else {
+		heartbeatCutoff := pgconv.Time(s.now().Add(-s.p.WorkerHeartbeatStale))
+		met, err = credentialRequirementMet(ctx, q, run, heartbeatCutoff)
+	}
 	if err != nil || !met {
 		return "", err
 	}
@@ -592,6 +601,28 @@ func credentialRequirementMet(ctx context.Context, q *store.Queries, run store.L
 		return true, nil // the next claim spends an enabled pooled token or holds in pool_wait
 	default:
 		return defaultEnabledForPromotion(ctx, q, run.UserID, true)
+	}
+}
+
+// credentialsResetRequirementMet is the promoter's requirement for a credentials_reset hold (PRD
+// #3989 M3): the harness resolver must find an enabled credential for the run's harness. It is
+// deliberately NOT credentialRequirementMet, which treats an unresolvable requirement (a NULL
+// binding, a deleted credential) as met: after a reset every binding is NULL, so that rule would
+// promote every held run each pass and the next claim would park it again, burning claim slots.
+// Run under the user's secret mutation lock like the other requirement reads, so credential
+// creation, deletion and vault unlock serialize against this decision. A credential that vanishes
+// after promotion is caught by the claim-time check, which parks the run again; promotion never
+// causes a terminal failure.
+func (s *Service) credentialsResetRequirementMet(ctx context.Context, q *store.Queries, run store.LockCredentialDisabledRunForPromotionRow) (bool, error) {
+	harness := Harness(run.Harness)
+	_, err := s.resolveRunHarnessQ(ctx, run.UserID, &harness, q)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, errNoCredentialForHarness) || errors.Is(err, errCredentialUnavailable):
+		return false, nil
+	default:
+		return false, fmt.Errorf("credentials_reset requirement: %w", err)
 	}
 }
 

@@ -79,6 +79,7 @@ Acceptance: filter tests; keyboard operable; mock parity for the pressed state.
 - **PR open counts PRs from completed runs and stays out of active totals**: completed runs are not active work, and one PR can have several runs.
 - **Unknown non-terminal statuses fall back to Building**: a new status must never hide a run. Rejected: dropping unknown runs.
 - **Tones reuse `RUN_STATUS_TONES`**, so all five themes work without new tokens.
+- **Superseded 2026-11-07 by #4052**: the card's scope (own runs, every user's active runs for an admin) became an admin You / All users toggle, and the Show all button was removed.
 - **Pickup refresh (2026-11-06)**: anchors rechecked on `main` after #3878 and #3880 landed; `parkDisposition` and `openPrs` live in `web/src/lib/overview.ts`; the cooldown helper moved to `runBadge.ts:537`. No scope change.
 - **Parked bay shows disposition and reason, not a countdown** (2026-11-06, mock deviation): park causes have no single reliable reset time, and the brief asks for the reason; the reason is `parkLabel`, the wording the run pill already uses, so no second reason table exists.
 - **PR open carries "PR state as last seen by uzi"** (2026-11-06, mock deviation; brief Run populations): `mr_state` is a cached hint, so the station says so above "Not counted as active".

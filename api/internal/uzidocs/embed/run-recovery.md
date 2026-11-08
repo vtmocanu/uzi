@@ -581,7 +581,9 @@ reservation count. Owner Resume of `worker_requeue_exhausted` and bounded
 `retained_recovery_exhausted` retries can also renew: a fresh generation and
 higher derived episode charge one of three reservations in a new five-minute
 window and clear only `budget_exhausted`. The default three timed parks are
-followed by an owner hold; Resume preserves that count. Timer promotion resets
+followed by an owner hold; Resume preserves that count. A window refused
+only for data-volume capacity is held for the owner without consuming a counted retained park.
+Timer promotion resets
 the run wall, while manual Resume preserves remaining wall budget and may need
 an owner extension. Other requeues, disk retries, memory-pressure Resume or a
 new claim alone do not renew. See
@@ -643,7 +645,8 @@ usage (and the projected usage when it was computed). The refusal is not a disk
 park and spends one of the same three reservations; the worker runs one reclaim
 pass and re-checks before refusing. If the volume stays full, the iterations end
 in the existing retained-recovery park, whose automatic retries stop for owner
-Resume once the retained-park allowance is spent. The
+Resume once the retained-park allowance is spent, or at once, uncounted, when
+every reservation in the window was refused for data volume capacity. The
 projection is an estimate and applies only when the API supports both the disk
 and retained-recovery park causes. The check has no off switch: setting
 `UZI_DISK_HARD_STOP_ENABLED=false` disables the hard governor's stops but not
