@@ -86,6 +86,26 @@ beforeEach(async () => {
 });
 afterEach(() => fx?.cleanup());
 
+it("runGitWithEnv preserves only a raw recovery deadline as its wrapped cause", async t => {
+  const original = git["execScoped"].bind(git);
+  let fault: Error = Object.assign(new Error("ordinary git failure"), { stderr: "fatal: bad object" });
+  t.mock.method(git as unknown as { execScoped: typeof original }, "execScoped",
+    async (..._args: Parameters<typeof original>) => { throw fault; });
+  const run = () => git["runGitWithEnv"](bare, ["rev-parse", "HEAD"], {});
+
+  await assert.rejects(run(), error => {
+    assert.equal((error as Error).cause, undefined);
+    return true;
+  });
+
+  const deadline = new Error("recovery deadline exhausted");
+  fault = deadline;
+  await assert.rejects(run(), error => {
+    assert.equal((error as Error).cause, deadline);
+    return true;
+  });
+});
+
 
 
 type Limits = {
