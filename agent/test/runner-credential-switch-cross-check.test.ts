@@ -1710,6 +1710,42 @@ describe("issue #3990: a failed checker leg closes its credential-switch hold wi
   });
 });
 
+describe("issue #3990: in-place continuation of retained checked storage", () => {
+  it("a switch that surfaces inside the canonical storage report gives up and continues the retained storage in place: no resubmit, implementation runs", { skip: LINUX_CAPTURE, timeout: 30_000 }, async () => {
+    const seen: string[] = [];
+    const d = await drive({ capture: "giveup", switchRounds: [],
+      setup: (c, x) => {
+        let armed = true;
+        const report = client.reportPlanCrossCheckGateState.bind(client);
+        client.reportPlanCrossCheckGateState = async (id, fields, signal) => {
+          seen.push(`${fields.status}:${fields.candidate_digest ?? ""}`);
+          if (armed && id === c.run_id && fields.status === "running" && fields.candidate_digest === digest) {
+            armed = false;
+            api.requestCredentialSwitch(c.run_id, 1);
+            assert.ok(await handlerWait(() => x.switchSeen.delivered), "the worker polled the switch");
+            seen.push("delivered");
+          }
+          return report(id, fields, signal);
+        };
+      } });
+    const { c, tl } = d;
+    assert.deepEqual(d.attempts, ["attempt", "gave_up"], "the switch was attempted once and the capture gave up");
+    assert.deepEqual(switchReports(c.run_id), ["credential_switch_failed"]);
+    // The first storage send was interrupted by the switch before the server saw it; the retained
+    // operation is continued in place (a second send of the same canonical plan), never recomputed.
+    assert.equal(seen.filter((s) => s.startsWith("running:" + digest)).length, 2, `storage sent twice: ${JSON.stringify(seen)}`);
+    assert.equal(d.storage.length, 2, "the interrupted send and the in-place continuation");
+    assert.equal(everyState(c.run_id).filter((s) => s.status === "running" && s.candidate_digest === digest).length, 1,
+      "the server stored the canonical plan exactly once");
+    assert.equal(d.posts().length, 1, "one cross-check POST: the decision is never resubmitted");
+    assert.equal(d.counter.calls, 2, "planning turn, then implementation only");
+    assert.ok(tl.events.indexOf("state:credential_switch_failed") < tl.events.lastIndexOf("storage"), "storage continued after the give-up");
+    assert.equal(gates(c.run_id).length, 0);
+    assert.ok(statuses(c.run_id).includes("completed"), JSON.stringify(statuses(c.run_id)));
+    assert.ok(!statuses(c.run_id).includes("failed"));
+  });
+});
+
 describe("issue #3953 m3: semantic coverage forces a human gate after the checker approve (real SemanticPlanningGate)", () => {
   const milestones = [{ id: "m1", title: "A" }];
   const submitted = (issueIid: number | null) => {
