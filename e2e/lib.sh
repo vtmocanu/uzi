@@ -166,6 +166,34 @@ case "$mode" in
     printf 'digest=%s head=%s tip=%s\n' "$d" "$h" "$t" ;;
   pin) cat "/data/recovery/$1/$2.json" ;;
   shead) git -c safe.directory='*' --git-dir="$1/.git" rev-parse HEAD ;;
+  isanc)
+    if git -c safe.directory='*' --git-dir="$1/.git" merge-base --is-ancestor "$2" HEAD; then echo yes; else echo no; fi ;;
+  slots)
+    # name and digest of every authority slot file (the slot key is a keyed hash of the clone path, so a shell
+    # cannot name P's slot; every slot present before the restart must be byte-identical after it).
+    d=/data/.uzi-authority/slots
+    [ -d "$d" ] || exit 0
+    cd "$d"
+    find . -maxdepth 1 -type f -name '*.json' -exec sha256sum {} + | LC_ALL=C sort -k2 ;;
+  bind)
+    # bind BARE KIND RUN SHA GENERATION: does the bare evidence the pin binding KIND (agent/src/git.ts
+    # verifyRestorePinRefsUnderLock; the e2e repository's default branch is main)?
+    bare="$1"; kind="$2"; run="$3"; sha="$4"; gen="$5"
+    g() { git -c safe.directory='*' --git-dir="$bare" "$@"; }
+    case "$kind" in
+      on_default)
+        for ref in refs/remotes/origin/main refs/heads/main; do
+          if g rev-parse --verify --quiet "$ref^{commit}" >/dev/null && g merge-base --is-ancestor "$sha" "$ref"; then
+            echo yes; exit 0
+          fi
+        done
+        echo no ;;
+      owed)
+        if [ "$(g rev-parse --verify --quiet "refs/uzi-owed/$run/$sha" || true)" = "$sha" ]; then echo yes; else echo no; fi ;;
+      recovery_pin_ref)
+        if [ "$(g rev-parse --verify --quiet "refs/uzi-recovery-pin/$run/$gen" || true)" = "$sha" ]; then echo yes; else echo no; fi ;;
+      *) echo no ;;
+    esac ;;
   *) exit 2 ;;
 esac
 WITNESS
@@ -190,11 +218,24 @@ _restore_journal_value() {
   printf '%s\n' "$1" | awk -F'\t' -v k="$2" '$2 == k { print $3 }' \
     | jq -Rr --arg run "$3" 'select((((fromjson? // {}) | (.runId // .successor.runId)?)) == $run)'
 }
+# _restore_journal_bare ROWS KEY RUN — the bare directory whose KEY value belongs to RUN (see above).
+_restore_journal_bare() {
+  local d k v
+  while IFS=$'\t' read -r d k v; do
+    [ "$k" = "$2" ] || continue
+    if printf '%s' "$v" | jq -e --arg run "$3" '((.runId // .successor.runId)? // "") == $run' >/dev/null 2>&1; then
+      printf '%s' "$d"; return 0
+    fi
+  done <<<"$1"
+  return 1
+}
 # restore_snapshot_predecessor RUN BRANCH — take AFTER the kill and BEFORE the restart: P's recovery journal
-# value (raw) and the digest of P's clone contents, written to $RUNROOT/.restore-p-RUN.json. Returns non-zero
-# (never calls fail) so callers that must restore the api first can judge it later.
+# value (raw) and whether it carries completionSourceFence, the digest of P's clone contents, every authority
+# slot file's digest (P's slot is read-only to a restore), and the run's custody hold rows (id state generation),
+# written to $RUNROOT/.restore-p-RUN.json. The holds come from the database so they are readable while the api
+# is down. Returns non-zero (never calls fail) so callers that must restore the api first can judge it later.
 restore_snapshot_predecessor() {
-  local run="$1" branch="$2" out="$RUNROOT/.restore-p-$1.json" rows journal clone digest
+  local run="$1" branch="$2" out="$RUNROOT/.restore-p-$1.json" rows journal clone digest slots holds fence
   rows="$(restore_witness_exec journals "$branch")" || { echo "issue 3644: witness could not read the bare journals for $run" >&2; return 1; }
   journal="$(_restore_journal_value "$rows" "uzi-recovery.$branch.clone" "$run")"
   [ -n "$journal" ] && [ "$(printf '%s\n' "$journal" | grep -c .)" = 1 ] \
@@ -202,16 +243,28 @@ restore_snapshot_predecessor() {
   clone="$(printf '%s' "$journal" | jq -er '.clonePath')" || { echo "issue 3644: predecessor journal has no clonePath" >&2; return 1; }
   digest="$(restore_witness_exec digest "$clone")" || { echo "issue 3644: witness could not digest the predecessor clone" >&2; return 1; }
   [ -n "$digest" ] && [ "$digest" != MISSING ] || { echo "issue 3644: predecessor clone $clone is missing before the restart" >&2; return 1; }
-  jq -nc --arg journal "$journal" --arg clone "$clone" --arg digest "$digest" \
-    '{journal: $journal, clonePath: $clone, digest: $digest}' > "$out"
+  fence="$(printf '%s' "$journal" | jq -r '.completionSourceFence != null')" || { echo "issue 3644: predecessor journal is not JSON" >&2; return 1; }
+  slots="$(restore_witness_exec slots)" || { echo "issue 3644: witness could not read the authority slots" >&2; return 1; }
+  [ -n "$slots" ] || { echo "issue 3644: no authority slot files before the restart (P's slot must exist)" >&2; return 1; }
+  holds="$(db_psql_rows "SELECT id||' '||state||' '||generation FROM recovery_custody_holds WHERE run_id = '$run' ORDER BY id")" \
+    || { echo "issue 3644: could not read the custody holds of run $run" >&2; return 1; }
+  [ -n "$holds" ] || { echo "issue 3644: run $run has no custody hold before the restart" >&2; return 1; }
+  jq -nc --arg journal "$journal" --arg clone "$clone" --arg digest "$digest" --arg fence "$fence" --arg slots "$slots" --arg holds "$holds" \
+    '{journal: $journal, clonePath: $clone, digest: $digest, fence: $fence, slots: $slots, holds: $holds}' > "$out"
 }
-# restore_assert_seed_witness RUN BRANCH GEN — after wait_independent_restore_resume. Compares the log's
-# fields with the bare's restore journal basis (a data read; the pin record's MAC is NOT re-verified here),
-# and, while S is live (run not terminal), that P's journal and clone are unchanged since the snapshot and
-# S's HEAD resolves. Once the run is terminal S's completion discards P legitimately, so only the log fields,
-# the basis and the pin record (when still present) are judged.
+# restore_assert_seed_witness RUN BRANCH GEN [HEAD_MODE] — after wait_independent_restore_resume. Compares the
+# log's fields with the bare's restore journal basis (a data read; the pin record's MAC is NOT re-verified
+# here) and the binding the log names with the bare's refs. The restore key keeps the basis for the whole
+# life of S: completion turns S's entry into a `retired` tombstone and only the owner's guarded discard clears
+# it (agent/src/git.ts advanceRestoreEntryUnderLock), so the basis is required for a terminal run too.
+# While S is live (run not terminal) the pin record is required and P must be unchanged since the snapshot:
+# journal (and its completionSourceFence), clone contents, every authority slot file, the run's custody hold
+# rows; S's HEAD must be seededHead (HEAD_MODE exact) or a descendant of it (HEAD_MODE descendant, the default).
+# Once the run is terminal S's completion discards P legitimately, so only the pin record file is soft.
 restore_assert_seed_witness() {
-  local run="$1" branch="$2" gen="$3" snap="$RUNROOT/.restore-p-$1.json" status live=1 rows rj pin cur shead
+  local run="$1" branch="$2" gen="$3" head_mode="${4:-descendant}" snap="$RUNROOT/.restore-p-$1.json"
+  local status live=1 rows rj pin cur shead bare yes
+  [ "$head_mode" = exact ] || [ "$head_mode" = descendant ] || fail "issue 3644: unknown successor HEAD mode [$head_mode]"
   [ -n "${RESTORE_SOURCE_SHA:-}" ] || fail "issue 3644: seed witness run before wait_independent_restore_resume for $run"
   [ "$RESTORE_SLOT_HOSTNAME" = "${RESTORE_SLOT_CONTAINER:0:12}" ] \
     || fail "issue 3644: logged slot hostname [$RESTORE_SLOT_HOSTNAME] is not the container id prefix [${RESTORE_SLOT_CONTAINER:0:12}]"
@@ -222,42 +275,58 @@ restore_assert_seed_witness() {
   case "$status" in completed|failed|cancelled) live=0;; esac
   rows="$(restore_witness_exec journals "$branch")" || fail "issue 3644: witness could not read the bare journals for $run"
   rj="$(_restore_journal_value "$rows" "uzi-restore.$branch.journal" "$run")"
-  if [ -n "$rj" ]; then
-    [ "$(printf '%s\n' "$rj" | grep -c .)" = 1 ] || fail "issue 3644: several restore journals for run $run on $branch"
-    printf '%s' "$rj" | jq -e --arg sha "$RESTORE_SOURCE_SHA" --arg head "$RESTORE_SEEDED_HEAD" --arg cap "$RESTORE_CAPTURE_ID" \
-      --argjson gen "$gen" '
-      .restore as $b | $b.pin.sourceSha == $sha and $b.restoreTip == $sha and $head == $sha
-      and $b.pin.captureId == $cap and $b.pin.generation == ($gen - 1) and $b.predecessor.generation == ($gen - 1)
-      and (.restoreStage | IN("seeding", "ready", "retired"))' >/dev/null \
-      || fail "issue 3644: restore journal basis for run $run disagrees with the log (sourceSha/restoreTip/seededHead/capture/generation): $rj"
-    if [ -f "$snap" ]; then
-      jq -e --slurpfile p "$snap" '.restore.predecessor.clonePath == $p[0].clonePath' <<<"$rj" >/dev/null \
-        || fail "issue 3644: restore basis names a different predecessor clone than the one snapshot after the kill"
-    fi
-  elif [ "$live" = 1 ]; then
-    fail "issue 3644: no restore journal for live run $run on $branch"
-  else
-    echo "  NOTE no restore journal for terminal run $run (cleared or retired at completion); basis not asserted"
+  [ -n "$rj" ] || fail "issue 3644: no restore journal (entry or retired tombstone) for run $run on $branch; the restore basis outlives S until the owner's guarded discard"
+  [ "$(printf '%s\n' "$rj" | grep -c .)" = 1 ] || fail "issue 3644: several restore journals for run $run on $branch"
+  printf '%s' "$rj" | jq -e --arg sha "$RESTORE_SOURCE_SHA" --arg head "$RESTORE_SEEDED_HEAD" --arg cap "$RESTORE_CAPTURE_ID" \
+    --argjson gen "$gen" '
+    .restore as $b | $b.pin.sourceSha == $sha and $b.restoreTip == $sha and $head == $sha
+    and $b.pin.captureId == $cap and $b.pin.generation == ($gen - 1) and $b.predecessor.generation == ($gen - 1)
+    and (.restoreStage | IN("seeding", "ready", "retired"))' >/dev/null \
+    || fail "issue 3644: restore journal basis for run $run disagrees with the log (sourceSha/restoreTip/seededHead/capture/generation): $rj"
+  if [ -f "$snap" ]; then
+    jq -e --slurpfile p "$snap" '.restore.predecessor.clonePath == $p[0].clonePath' <<<"$rj" >/dev/null \
+      || fail "issue 3644: restore basis names a different predecessor clone than the one snapshot after the kill"
   fi
+  # Binding evidence from the bare's own refs, not the log: the binding the worker logged must be true there.
+  bare="$(_restore_journal_bare "$rows" "uzi-restore.$branch.journal" "$run")" || fail "issue 3644: cannot tell which bare holds the restore journal of run $run"
+  yes="$(restore_witness_exec bind "$bare" "$RESTORE_BINDING" "$run" "$RESTORE_SOURCE_SHA" "$((gen - 1))")" || fail "issue 3644: witness could not check the pin binding for run $run"
+  [ "$yes" = yes ] || fail "issue 3644: binding $RESTORE_BINDING of run $run is not evidenced in $bare for $RESTORE_SOURCE_SHA at generation $((gen - 1))"
   pin="$(restore_witness_exec pin "$run" "$RESTORE_CAPTURE_ID" 2>/dev/null)" || pin=""
   if [ -n "$pin" ]; then
     printf '%s' "$pin" | jq -e --arg run "$run" --arg branch "$branch" --arg sha "$RESTORE_SOURCE_SHA" --arg cap "$RESTORE_CAPTURE_ID" \
       --argjson gen "$gen" '.runId == $run and .branch == $branch and .generation == ($gen - 1) and .sourceSha == $sha and .captureId == $cap' >/dev/null \
       || fail "issue 3644: pin record for run $run disagrees with the log"
+  elif [ "$live" = 1 ]; then
+    fail "issue 3644: pin record $RESTORE_CAPTURE_ID.json for live run $run is not readable"
   else
-    echo "  NOTE pin record $RESTORE_CAPTURE_ID.json for run $run not readable (removed or not at the derived path); not asserted"
+    echo "  NOTE pin record $RESTORE_CAPTURE_ID.json for terminal run $run not readable (removed at completion); not asserted"
   fi
   if [ "$live" = 1 ]; then
     [ -f "$snap" ] || fail "issue 3644: no predecessor snapshot for live run $run (taken after the kill, before the restart)"
     cur="$(_restore_journal_value "$rows" "uzi-recovery.$branch.clone" "$run")"
     [ "$cur" = "$(jq -r .journal "$snap")" ] || fail "issue 3644: predecessor journal of run $run changed across the restore"
+    [ "$(printf '%s' "$cur" | jq -r '.completionSourceFence != null')" = "$(jq -r .fence "$snap")" ] \
+      || fail "issue 3644: predecessor completionSourceFence of run $run changed across the restore"
     cur="$(restore_witness_exec digest "$(jq -r .clonePath "$snap")")" || fail "issue 3644: witness could not digest the predecessor clone"
     [ "$cur" = "$(jq -r .digest "$snap")" ] || fail "issue 3644: predecessor clone of run $run changed across the restore (before=[$(jq -r .digest "$snap")] after=[$cur])"
+    cur="$(restore_witness_exec slots)" || fail "issue 3644: witness could not read the authority slots"
+    yes="$(comm -23 <(jq -r .slots "$snap" | LC_ALL=C sort) <(printf '%s\n' "$cur" | LC_ALL=C sort))"
+    [ -z "$yes" ] || fail "issue 3644: authority slot file(s) present before the restart changed or vanished across the restore: $yes"
+    cur="$(db_psql_rows "SELECT id||' '||state||' '||generation FROM recovery_custody_holds WHERE run_id = '$run' AND generation < $gen ORDER BY id")" \
+      || fail "issue 3644: could not read the custody holds of run $run"
+    [ "$cur" = "$(jq -r .holds "$snap")" ] \
+      || fail "issue 3644: predecessor custody holds of run $run changed across the restore (before=[$(jq -r .holds "$snap" | tr '\n' ';')] after=[$(printf '%s' "$cur" | tr '\n' ';')])"
     shead="$(restore_witness_exec shead "$RESTORE_ATTEMPT_PATH")" || fail "issue 3644: witness could not read the successor HEAD"
     [[ "$shead" =~ ^[0-9a-f]{40}$ ]] || fail "issue 3644: successor HEAD [$shead] is not a commit id"
-    pass "run $run: restore witness: basis=pin=seed=$RESTORE_SOURCE_SHA, predecessor journal and clone unchanged, successor HEAD $shead (seededHead $RESTORE_SEEDED_HEAD)"
+    if [ "$head_mode" = exact ]; then
+      [ "$shead" = "$RESTORE_SEEDED_HEAD" ] || fail "issue 3644: successor HEAD $shead of run $run is not the seeded head $RESTORE_SEEDED_HEAD"
+    else
+      yes="$(restore_witness_exec isanc "$RESTORE_ATTEMPT_PATH" "$RESTORE_SEEDED_HEAD")" || fail "issue 3644: witness could not compare the successor HEAD"
+      [ "$yes" = yes ] || fail "issue 3644: seeded head $RESTORE_SEEDED_HEAD is not an ancestor of the successor HEAD $shead of run $run"
+    fi
+    pass "run $run: restore witness: basis=pin=seed=$RESTORE_SOURCE_SHA ($RESTORE_BINDING evidenced in the bare), predecessor journal (fence), clone, authority slots and holds unchanged, successor HEAD $shead (seededHead $RESTORE_SEEDED_HEAD, $head_mode)"
   else
-    pass "run $run: restore witness (terminal run): log fields and basis agree on $RESTORE_SOURCE_SHA"
+    pass "run $run: restore witness (terminal run): log fields, basis and $RESTORE_BINDING binding agree on $RESTORE_SOURCE_SHA"
   fi
 }
 
@@ -268,15 +337,22 @@ log_hold_census() {
     || echo unreadable
   return 0
 }
-# log_custody_entry_census — logging only (phase 72 entry): admission headroom and any queued run.
+# log_custody_entry_census — logging only (phase 72 entry): admission headroom, any queued run and, for each
+# queued run, its open holds (run_id, generation) so the queue is attributed.
 log_custody_entry_census() {
-  local snap
+  local snap queued id
   snap="$(apiget /api/recovery/holds)" || { echo 'custody entry census: holds unreadable'; return 0; }
   printf '%s' "$snap" | jq -r '.aggregate | "custody entry census: limit=\(.custody_hold_limit) counted=\(.admission_counted_holds) open=\(.open_holds) headroom=\(.custody_hold_limit - .admission_counted_holds)"' \
     || echo 'custody entry census: aggregate unreadable'
-  db_psql_rows "SELECT 'custody entry census: queued run '||id||' issue '||COALESCE(issue_iid::text,'-')||' since '||created_at FROM runs
-    WHERE status = 'queued' AND user_id = (SELECT id FROM users WHERE email = '$ADMIN_EMAIL') ORDER BY created_at" \
-    || echo 'custody entry census: queued runs unreadable'
+  queued="$(db_psql_rows "SELECT id FROM runs WHERE status = 'queued' AND user_id = (SELECT id FROM users WHERE email = '$ADMIN_EMAIL') ORDER BY created_at")" \
+    || { echo 'custody entry census: queued runs unreadable'; return 0; }
+  for id in $queued; do
+    db_psql_rows "SELECT 'custody entry census: queued run '||id||' issue '||COALESCE(issue_iid::text,'-')||' since '||created_at FROM runs WHERE id = '$id'" \
+      || echo "custody entry census: queued run $id unreadable"
+    printf '%s' "$snap" | jq -r --arg r "$id" '"custody entry census: run \($r) open holds: " + (
+      [.holds[] | select(.run_id == $r and .state == "open") | "(run_id=\(.run_id) generation=\(.generation))"] | if length == 0 then "none" else join(" ") end)' \
+      || echo "custody entry census: holds of run $id unreadable"
+  done
   return 0
 }
 # --- output helpers ----------------------------------------------------------

@@ -898,7 +898,7 @@ f42_cut_judge() {
 # error, the api is restored, and only then is the error judged. A precondition or UPDATE error skips
 # the kill (the attempt is inconclusive) but still restores the api.
 f42_restart_cycle() {
-  local run="$1" gen="$2" max="$3" set_max="${4:-0}" err="" rc=0 st="" regs_before=0 regs_now=0 deadline id_before=""
+  local run="$1" gen="$2" max="$3" set_max="${4:-0}" err="" rc=0 st="" regs_before=0 regs_now=0 deadline id_before="" pbranch=""
   # One exec prints a state token, so an exec/container error (no token) is told apart from a
   # journaled terminal.
   rc=0; st="$("${COMPOSE[@]}" exec -T agent sh -c \
@@ -938,7 +938,7 @@ f42_restart_cycle() {
     # first cut of a run (SET_MAX=1) is followed by an independent-restore assertion; the second cut of
     # case 8 interrupts the restored attempt itself and is judged by assert_finalize_allowance_spent.
     if [ "$rc" = 0 ] && [ "$set_max" = 1 ]; then
-      restore_snapshot_predecessor "$run" "$(rb_run_field "$run" branch)" \
+      pbranch="$(f42_run_branch "$run")" && restore_snapshot_predecessor "$run" "$pbranch" \
         || err="${err:+$err; }could not snapshot the killed predecessor of run $run"
     fi
     capture_agent_logs 52-api-outage-outbox before-start
@@ -960,6 +960,15 @@ f42_restart_cycle() {
     || fail "issue 1742: the restarted agent never logged a new 'registered' line within 90s (before=$regs_before now=${regs_now:-0}) for run $run"
   wait_worker_online
   restore_assert_agent_identity "phase 52 kill/start (run $run generation $gen)" "$id_before"
+}
+# f42_run_branch RUN — the run's agent branch. runs.branch is NULL for an issue run until its terminal report
+# (CreateRun sets none), so derive it from issue_iid with the server's convention (agentIssueBranch in
+# api/internal/workersvc/ci_fix.go). Prints nothing and returns non-zero when issue_iid is not a positive integer.
+f42_run_branch() {
+  local iid
+  iid="$(rb_run_field "$1" issue_iid)" || return 1
+  [[ "$iid" =~ ^[1-9][0-9]*$ ]] || return 1
+  printf 'agent/issue-%s' "$iid"
 }
 # f42_wait_reclaim RUN GEN TIMEOUT — poll until RUN is running at claim generation GEN. A run that goes
 # failed while waiting is a failure with its origin named.
@@ -985,7 +994,7 @@ f42_wait_reclaim() {
 # TIMEOUT=0 (third argument) is a single observation for the hermetic decoder regressions.
 f42_assert_capture_resume() {
   local run="$1" gen="$2" timeout="${3:-60}" branch
-  branch="$(rb_run_field "$run" branch)"
+  branch="$(f42_run_branch "$run")" || fail "issue 3644: cannot derive the branch of run $run from its issue_iid"
   wait_independent_restore_resume "$run" "$gen" "$branch" owed,on_default "$timeout"
   restore_assert_seed_witness "$run" "$branch" "$gen"
 }
@@ -995,9 +1004,9 @@ F42_MAX="$(f42_max_requeues)" || fail "issue 1742: cannot resolve RUN_MAX_REQUEU
 
 # -----------------------------------------------------------------------------
 # CASE 7 (A, completion control): the durable finalize record lets the run resume at G+1 even with the
-# requeue budget spent. G+1 captures the predecessor and completes in the same claim.
+# requeue budget spent. G+1 restores independently from the predecessor's pin and completes in the same claim.
 transition_outbox_feature before7 false "$RUN_B4"
-say "CASE 7: finalize restart on spent budget -> G+1 capture and completion (never worker_lost)"
+say "CASE 7: finalize restart on spent budget -> G+1 independent restore and completion (never worker_lost)"
 make_outbox_run first_cut_barrier
 RUN_F1="$OUTBOX_RUN"
 GEN_F1="$(rb_run_field "$RUN_F1" claim_generation)"
@@ -1018,11 +1027,11 @@ wait_status "$RUN_F1" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_D
 f42_assert_capture_resume "$RUN_F1" "$((GEN_F1 + 1))"
 [ "$(rb_run_field "$RUN_F1" claim_generation)" = "$((GEN_F1 + 1))" ] \
   || fail "case 7: run $RUN_F1 completed at generation $(rb_run_field "$RUN_F1" claim_generation), want $((GEN_F1 + 1)) after same-claim recovery"
-pass "case 7: run $RUN_F1 captured and completed at generation $((GEN_F1 + 1)); finalize_resume_generation=$GEN_F1, never worker_lost"
+pass "case 7: run $RUN_F1 restored and completed at generation $((GEN_F1 + 1)); finalize_resume_generation=$GEN_F1, never worker_lost"
 resolve_fixture_source_hold "$RUN_F1" "$GEN_F1"
 
 # -----------------------------------------------------------------------------
-# CASE 8 (B, one-shot control): the allowance is used ONCE. After the G+1 capture and fresh
+# CASE 8 (B, one-shot control): the allowance is used ONCE. After the G+1 independent restore and fresh
 # seed, a second interruption of the EXECUTING generation G+1 leaves the
 # spent budget to hold preserved work for owner recovery, with no second finalize allowance.
 # The orphan/finalize exhaustion writers in worker_recovery.sql (#2426) preserve the
@@ -1036,7 +1045,7 @@ assert_finalize_allowance_spent() {
   [ "$(rb_run_field "$run" finalize_resume_generation)" = "$original" ] || fail "case 8: finalize allowance marker changed"
   [ "$(rb_run_field "$run" requeue_count)" = "$((max + 1))" ] || fail "case 8: spent requeue count changed"
 }
-say "CASE 8: allowance is one-shot: G+1 captured, resumed finalize interrupted -> owner recovery hold, mark stays G"
+say "CASE 8: allowance is one-shot: G+1 restored, resumed finalize interrupted -> owner recovery hold, mark stays G"
 make_outbox_run cut_barrier
 RUN_F2="$OUTBOX_RUN"
 GEN_F2="$(rb_run_field "$RUN_F2" claim_generation)"
@@ -1055,7 +1064,7 @@ f42_assert_capture_resume "$RUN_F2" "$((GEN_F2 + 1))"
 # The allowance is charged as a requeue, and the second cut below must NOT reset the counter downward.
 [ "$(rb_run_field "$RUN_F2" requeue_count)" = "$((F42_MAX + 1))" ] \
   || fail "case 8: after the allowance requeue requeue_count is '$(rb_run_field "$RUN_F2" requeue_count)', want $((F42_MAX + 1)) (RUN_MAX_REQUEUES $F42_MAX + the one charged requeue)"
-pass "case 8: run $RUN_F2 used the allowance, captured at G+1, and is executing at generation $((GEN_F2 + 1)) (finalize_resume_generation=$GEN_F2, requeue_count=$((F42_MAX + 1)))"
+pass "case 8: run $RUN_F2 used the allowance, restored at G+1, and is executing at generation $((GEN_F2 + 1)) (finalize_resume_generation=$GEN_F2, requeue_count=$((F42_MAX + 1)))"
 # Second cut follows the proved G+1 fresh seed and post-clone inventory, without a timed sleep.
 GEN_F2B=$((GEN_F2 + 1))
 GEN_F2_OBSERVED="$(rb_run_field "$RUN_F2" claim_generation)"

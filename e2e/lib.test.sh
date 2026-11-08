@@ -590,6 +590,7 @@ restore_fixture() {
     {run_id:"R",msg:"recovery: bundle uploaded (durable capture)",server_capture_id:"capture",server_state:"available"} as $capture |
     [$claim,$claim,$seed,$restored,$ready] |
     if $variant=="owed" then .[3].binding="owed"
+    elif $variant=="pin-ref" then .[3].binding="recovery_pin_ref"
     elif $variant=="wrong-pin-generation" then .[3].pinGeneration=2
     elif $variant=="extra-capture" then [.[0],.[1],$capture,.[2],.[3],.[4]]
     elif $variant=="extra-claim" then . + [$claim]
@@ -622,6 +623,10 @@ custody_case "independent restore exports the seeded fields" pass 'restore field
 restore_fixture owed
 custody_case "independent restore accepts owed" pass 'restored independently' wait_independent_restore_resume R 2 agent/issue-1 owed,on_default 0
 custody_case "independent restore exports the owed binding" pass 'restore fields exported' restore_globals_case owed
+restore_fixture pin-ref
+custody_case "independent restore accepts recovery_pin_ref when allowed" pass 'binding=recovery_pin_ref' wait_independent_restore_resume R 2 agent/issue-1 owed,on_default,recovery_pin_ref 0
+custody_case "independent restore refuses recovery_pin_ref when it is not allowed" fail 'independent-restore G+1 sequence' wait_independent_restore_resume R 2 agent/issue-1 owed,on_default 0
+restore_fixture owed
 custody_case "independent restore refuses owed when only on_default is allowed" fail 'independent-restore G+1 sequence' wait_independent_restore_resume R 2 agent/issue-1 on_default 0
 for variant in wrong-pin-generation extra-capture extra-claim wrong-order admission-before-restore wrong-generation mismatched-attempt-path \
   disallowed-binding seeded-head-mismatch short-source-sha slot-not-compose cross-check-failed empty-verdict admission-wrong-generation \
@@ -636,13 +641,25 @@ custody_case "independent restore needs the branch" fail 'needs the run' wait_in
 
 # Phase 52's wrapper: the run's branch comes from the database, the allowed bindings are owed,on_default,
 # and the seed witness runs only after the log sequence is proved.
+eval "$(awk '/^f42_run_branch\(\) \{/,/^\}/' "$ROOT/e2e/phases/52-api-outage-outbox.sh")"
 f42_case() {
-  rb_run_field() { echo agent/issue-1; }
+  # runs.branch is NULL for a live issue run: only issue_iid is readable, as in the database.
+  rb_run_field() { case "$2" in issue_iid) echo "${F42_IID-1}";; branch) echo "";; *) echo "unexpected column $2" >&2; return 1;; esac; }
   restore_assert_seed_witness() { echo "witnessed $1 $2 $3"; }
   f42_assert_capture_resume R 2 0
 }
+f42_branch_case() {
+  rb_run_field() { echo "$F42_IID"; }
+  f42_run_branch R
+}
 restore_fixture owed
 custody_case "phase 52 accepts an owed pin and runs the seed witness" pass 'witnessed R agent/issue-1 2' f42_case
+F42_IID=7 custody_case "phase 52 branch derivation names the issue" pass 'agent/issue-7' f42_branch_case
+for bad in "" 0 007 x1; do
+  F42_IID="$bad" custody_case "phase 52 branch derivation refuses issue_iid [$bad]" fail "" f42_branch_case
+done
+restore_fixture owed
+F42_IID='' custody_case "phase 52 refuses a run without an issue_iid" fail 'cannot derive the branch' f42_case
 restore_fixture disallowed-binding
 custody_case "phase 52 refuses a recovery_pin_ref binding" fail 'independent-restore G+1 sequence' f42_case
 restore_fixture extra-capture
@@ -652,6 +669,7 @@ custody_case "phase 52 refuses a bundle capture on the restore route" fail 'inde
 # unchanged. The witness container is replaced by canned outputs (the real one needs the compose stack).
 eval "$(awk '/^restore_assert_seed_witness\(\) \{/,/^\}/' "$LIB")"
 eval "$(awk '/^_restore_journal_value\(\) \{/,/^\}/' "$LIB")"
+eval "$(awk '/^_restore_journal_bare\(\) \{/,/^\}/' "$LIB")"
 eval "$(awk '/^restore_assert_agent_identity\(\) \{/,/^\}/' "$LIB")"
 witness_case() {
   local variant="$1" pclone=/data/runner/repo/issue-1.attempt-20260101T000000Z-g1-1111111111111111
@@ -661,7 +679,29 @@ witness_case() {
   restore="$(jq -nc --arg c "$pclone" --arg sha "$RESTORE_SHA" '{restore:{version:1,predecessor:{clonePath:$c,generation:1},
     pin:{captureId:"cap",generation:1,sourceSha:$sha,finalization:false},restoreTip:$sha},restoreStage:"ready",runId:"R"}')"
   pin="$(jq -nc --arg sha "$RESTORE_SHA" '{runId:"R",branch:"agent/issue-1",generation:1,sourceSha:$sha,captureId:"cap",mac:"x"}')"
-  jq -nc --arg j "$pjournal" --arg c "$pclone" --arg d "$digest" '{journal:$j,clonePath:$c,digest:$d}' > "$SEQ_DIR/.restore-p-R.json"
+  local slots_before='aaa  ./k1.json
+bbb  ./k2.json' slots_after='aaa  ./k1.json
+bbb  ./k2.json' holds_before='h1 open 1' holds_after='h1 open 1' bound=on_default fence=false hmode=descendant sh="$RESTORE_SHA" anc=yes
+  case "$variant" in
+    slot-changed) slots_after='aaa  ./k1.json
+ccc  ./k2.json';;
+    slot-removed) slots_after='aaa  ./k1.json';;
+    slot-added) slots_after='aaa  ./k1.json
+bbb  ./k2.json
+ddd  ./k3.json';;
+    hold-changed) holds_after='h1 released 1';;
+    hold-removed) holds_after='';;
+    fence-flag) fence=true;;
+    binding-unevidenced|terminal-binding-unevidenced) bound=owed;;
+    head-exact-mismatch) hmode=exact; sh=cccccccccccccccccccccccccccccccccccccccc;;
+    head-exact-ok) hmode=exact;;
+    head-descendant) sh=cccccccccccccccccccccccccccccccccccccccc;;
+    head-not-descendant) sh=cccccccccccccccccccccccccccccccccccccccc; anc=no;;
+  esac
+  jq -nc --arg j "$pjournal" --arg c "$pclone" --arg d "$digest" --arg f "$fence" --arg s "$slots_before" --arg h "$holds_before" \
+    '{journal:$j,clonePath:$c,digest:$d,fence:$f,slots:$s,holds:$h}' > "$SEQ_DIR/.restore-p-R.json"
+  printf '%s' "$slots_after" > "$SEQ_DIR/w-slots"; printf '%s' "$holds_after" > "$SEQ_DIR/w-holds"
+  printf '%s' "$bound" > "$SEQ_DIR/w-bound"; printf '%s' "$sh" > "$SEQ_DIR/w-shead"; printf '%s' "$anc" > "$SEQ_DIR/w-anc"
   case "$variant" in
     basis-tip) restore="$(jq -c --arg s cccccccccccccccccccccccccccccccccccccccc '.restore.restoreTip=$s' <<<"$restore")";;
     basis-generation) restore="$(jq -c '.restore.pin.generation=2' <<<"$restore")";;
@@ -670,6 +710,8 @@ witness_case() {
     no-restore) restore="";;
     terminal) run_state=completed; digest='digest=changed head=x tip=y';;
     terminal-no-restore) run_state=completed; restore="";;
+    terminal-pin-absent) run_state=completed; pin="";;
+    terminal-binding-unevidenced) run_state=completed;;
     p-journal-changed) pjournal="${pjournal%\}},\"x\":1}";;
     p-clone-changed) digest='digest=d2 head=ref: refs/heads/agent/issue-1 tip=t1';;
     pin-sha) pin="$(jq -c '.sourceSha="dddddddddddddddddddddddddddddddddddddddd"' <<<"$pin")";;
@@ -684,33 +726,52 @@ witness_case() {
   printf '%s' "$digest" > "$SEQ_DIR/w-digest"
   printf '%s' "$pin" > "$SEQ_DIR/w-pin"
   db_psql() { echo "$run_state"; }
+  db_psql_rows() { cat "$SEQ_DIR/w-holds"; echo; }
   restore_agent_identity() { echo "$RESTORE_CID ${RESTORE_CID:0:12}"; }
   restore_witness_exec() {
     case "$1" in
       journals) cat "$SEQ_DIR/w-journals";;
       digest) cat "$SEQ_DIR/w-digest";;
       pin) [ -s "$SEQ_DIR/w-pin" ] && cat "$SEQ_DIR/w-pin";;
-      shead) echo "$RESTORE_SHA";;
+      shead) cat "$SEQ_DIR/w-shead";;
+      slots) cat "$SEQ_DIR/w-slots";;
+      isanc) cat "$SEQ_DIR/w-anc";;
+      # bind BARE KIND RUN SHA GENERATION: evidenced only for the kind the bare is staged with, in the restore journal's bare.
+      bind) [ "$2:$3:$4:$5:$6" = "bare:$(cat "$SEQ_DIR/w-bound"):R:$RESTORE_SHA:1" ] && echo yes || echo no;;
     esac
   }
   RESTORE_SOURCE_SHA="$RESTORE_SHA" RESTORE_SEEDED_HEAD="$RESTORE_SHA" RESTORE_CAPTURE_ID=cap RESTORE_SLOT_CONTAINER="$RESTORE_CID"
-  RESTORE_SLOT_HOSTNAME="${RESTORE_CID:0:12}" RESTORE_ATTEMPT_PATH="$RESTORE_PATH"
+  RESTORE_SLOT_HOSTNAME="${RESTORE_CID:0:12}" RESTORE_ATTEMPT_PATH="$RESTORE_PATH" RESTORE_BINDING=on_default
   [ "$variant" != slot-hostname ] || RESTORE_SLOT_HOSTNAME=ffffffffffff
   if [ "$variant" = slot-container ]; then
     RESTORE_SLOT_CONTAINER="$(printf 'e%.0s' $(seq 64))"
     RESTORE_SLOT_HOSTNAME="${RESTORE_SLOT_CONTAINER:0:12}"
   fi
-  restore_assert_seed_witness R agent/issue-1 2
+  restore_assert_seed_witness R agent/issue-1 2 "$hmode"
 }
 custody_case "seed witness accepts a live restore" pass 'basis=pin=seed' witness_case valid
+custody_case "seed witness reports the binding it evidenced" pass 'on_default evidenced in the bare' witness_case valid
 custody_case "seed witness accepts a terminal run whose predecessor is gone" pass 'terminal run' witness_case terminal
-custody_case "seed witness accepts a terminal run with no restore journal" pass 'terminal run' witness_case terminal-no-restore
-custody_case "seed witness accepts an unreadable pin record with a note" pass 'not readable' witness_case pin-absent
+custody_case "seed witness accepts a terminal run whose pin record is gone, with a note" pass 'not readable' witness_case terminal-pin-absent
+custody_case "seed witness requires the retained basis of a terminal run" fail 'no restore journal' witness_case terminal-no-restore
+custody_case "seed witness requires a readable pin record for a live run" fail 'for live run R is not readable' witness_case pin-absent
+custody_case "seed witness refuses a binding the bare does not evidence" fail 'is not evidenced' witness_case binding-unevidenced
+custody_case "seed witness refuses an unevidenced binding on a terminal run too" fail 'is not evidenced' witness_case terminal-binding-unevidenced
+custody_case "seed witness accepts an authority slot set that only grew" pass 'slots and holds unchanged' witness_case slot-added
+custody_case "seed witness refuses a changed authority slot" fail 'authority slot file' witness_case slot-changed
+custody_case "seed witness refuses a vanished authority slot" fail 'authority slot file' witness_case slot-removed
+custody_case "seed witness refuses a changed custody hold" fail 'custody holds of run R changed' witness_case hold-changed
+custody_case "seed witness refuses a vanished custody hold" fail 'custody holds of run R changed' witness_case hold-removed
+custody_case "seed witness refuses a changed completionSourceFence flag" fail 'completionSourceFence' witness_case fence-flag
+custody_case "seed witness accepts S at exactly the seeded head" pass 'exact)' witness_case head-exact-ok
+custody_case "seed witness refuses S away from the seeded head in exact mode" fail 'is not the seeded head' witness_case head-exact-mismatch
+custody_case "seed witness accepts S descending from the seeded head" pass 'descendant)' witness_case head-descendant
+custody_case "seed witness refuses S not descending from the seeded head" fail 'not an ancestor of the successor HEAD' witness_case head-not-descendant
 for variant in basis-tip basis-generation basis-capture; do
   custody_case "seed witness refuses a $variant disagreement" fail 'disagrees with the log' witness_case "$variant"
 done
 custody_case "seed witness refuses a basis naming another predecessor clone" fail 'different predecessor clone' witness_case basis-predecessor
-custody_case "seed witness requires a restore journal for a live run" fail 'no restore journal for live run' witness_case no-restore
+custody_case "seed witness requires a restore journal for a live run" fail 'no restore journal' witness_case no-restore
 custody_case "seed witness refuses a pin record that disagrees" fail 'pin record' witness_case pin-sha
 custody_case "seed witness refuses a changed predecessor journal" fail 'predecessor journal of run R changed' witness_case p-journal-changed
 custody_case "seed witness refuses a changed predecessor clone" fail 'predecessor clone of run R changed' witness_case p-clone-changed

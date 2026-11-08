@@ -45,8 +45,10 @@ assert_cap2_recovered_run() {
   # #3644: the re-claim seeds a fresh attempt from the killed predecessor's verified pin (no bundle
   # capture). The stub's pin is already on the default branch here, hence the on_default binding. The
   # run is parked at the gate, so the witness also proves the predecessor is untouched while S is live.
+  # The stub executor commits only after the plan gate (StubExecutor.run, agent/src/executor.ts), so S's HEAD
+  # at awaiting_approval is exactly the seeded head.
   wait_independent_restore_resume "$run" "$generation" "$branch" on_default 60
-  restore_assert_seed_witness "$run" "$branch" "$generation"
+  restore_assert_seed_witness "$run" "$branch" "$generation" exact
 }
 
 if [ "$EXECUTOR" != stub ]; then
@@ -223,8 +225,8 @@ else
   # affinity and drives them to completion. The exported UZI_WORKER_TOKEN re-sources
   # the `worker_token` secret; no token re-delivery is needed.
   #
-  # #2512 verifies/captures the retained predecessor and seeds a fresh attempt
-  # inside the acquired successor claim. The 90s gate ceiling covers recovery
+  # #3644 restores independently: the successor claim seeds a fresh attempt from the
+  # killed predecessor's verified pin and captures nothing. The 90s gate ceiling covers recovery
   # work under CI load; no extra park, promotion or generation is expected.
   capture_agent_logs 45-bounded-concurrency before-restart-after-kill
   "${COMPOSE[@]}" up -d --wait agent >/dev/null
@@ -234,7 +236,7 @@ else
   wait_status "$RUN_KB" awaiting_approval 90
   assert_cap2_recovered_run "$RUN_KA" "$GEN_KA_ORIGINAL" "agent/issue-$IID_KA"
   assert_cap2_recovered_run "$RUN_KB" "$GEN_KB_ORIGINAL" "agent/issue-$IID_KB"
-  pass "restarted worker captured and re-gated both runs inside one successor claim each (affinity preserved)"
+  pass "restarted worker restored and re-gated both runs inside one successor claim each (affinity preserved)"
 
   apipost "/api/runs/$RUN_KA/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
   apipost "/api/runs/$RUN_KB/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
