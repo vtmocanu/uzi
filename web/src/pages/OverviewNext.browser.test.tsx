@@ -31,6 +31,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       adminListRuns: vi.fn(),
       getRecoveryHolds: vi.fn(),
       getAdminHealth: vi.fn(),
+      listUsers: vi.fn(),
     },
   };
 });
@@ -74,6 +75,7 @@ beforeEach(() => {
   mockApi.getUsage.mockResolvedValue(emptySelf());
   mockApi.getAdminUsage.mockResolvedValue({ factory: emptySelf(), users: [], earliest_run: null });
   mockApi.getAdminHealth.mockResolvedValue(healthySilentDoc());
+  mockApi.listUsers.mockResolvedValue({ users: [] });
   mockApi.getRecoveryHolds.mockResolvedValue({
     aggregate: { open_holds: 0, admission_counted_holds: 0, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0 },
     holds: [],
@@ -860,5 +862,210 @@ describe("OverviewNext decision card layout", () => {
     }
     expect(card.scrollWidth, "card does not overflow").toBeLessThanOrEqual(card.clientWidth + 1);
     expect(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(window.innerWidth);
+  });
+});
+
+// #4042: the admin People chip's popover stays inside the viewport (below the chip on desktop,
+// a bottom sheet on a phone, short phones included), Escape hands focus back to the chip, and
+// its Usage by user action can be driven from the keyboard to the usage card's By user section.
+describe("OverviewNext People chip", () => {
+  const VIEWER = aUser.email;
+  const person = (id: string, email: string, display_name: string | null, last_login: string | null) => ({
+    ...aUser,
+    id,
+    email,
+    display_name,
+    last_login,
+    created_at: "2026-06-01T00:00:00Z",
+  });
+  const hoursAgo = (h: number) => new Date(Date.now() - h * 3600_000).toISOString();
+
+  beforeEach(() => {
+    localStorage.clear();
+    document.documentElement.dataset.font = "plex";
+    mockApi.adminListRuns.mockResolvedValue({
+      runs: [
+        aRun({ id: "o1", status: "running", issue_title: LONG_TITLE, owner_email: "priya@uzi.local" }),
+        aRun({ id: "o2", status: "awaiting_approval", issue_title: LONG_TITLE, owner_email: "sam@uzi.local" }),
+        aRun({ id: "o3", status: "queued", issue_title: LONG_TITLE, owner_email: "priya@uzi.local" }),
+        aRun({ id: "o4", status: "limit_wait", issue_title: LONG_TITLE, owner_email: "jordan@uzi.local" }),
+        aRun({ id: "o5", status: "awaiting_input", issue_title: LONG_TITLE, owner_email: LONG_EMAIL }),
+        aRun({ id: "o6", status: "running", issue_title: LONG_TITLE, owner_email: "lena@uzi.local" }),
+      ],
+    });
+    mockApi.listUsers.mockResolvedValue({
+      users: [
+        person("u1", VIEWER, "Admin", hoursAgo(0.1)),
+        person("u-priya", "priya@uzi.local", "Priya Desai", hoursAgo(1)),
+        person("u-sam", "sam@uzi.local", "Sam Okafor", hoursAgo(3)),
+        person("u-jordan", "jordan@uzi.local", "Jordan Lee", hoursAgo(30)),
+        person("u-lena", "lena@uzi.local", "Lena Fischer", hoursAgo(0.5)),
+        person("u-long", LONG_EMAIL, null, hoursAgo(5)),
+        person("u-elif", "elif@uzi.local", "Elif Kaya", hoursAgo(2)),
+        person("u-hana", "hana@uzi.local", "Hana Ito", hoursAgo(24 * 9)),
+        person("u-mateo", "mateo@uzi.local", "Mateo Silva", null),
+      ],
+    });
+    const self = emptySelf();
+    mockApi.getAdminUsage.mockResolvedValue({
+      factory: self,
+      users: ["u1", "u-priya", "u-sam"].map((id, i) => ({
+        user_id: id,
+        email: `${id}@uzi.local`,
+        usage: self.lifetime,
+        run_count: 4,
+        outcomes: self.outcomes.lifetime,
+        subscription_run_count: 0,
+        unreported_run_count: 0,
+        last_7_days: self.last_7_days,
+        last7_run_count: [3, 1, 0][i],
+        last7_outcomes: self.outcomes.last_7_days,
+      })),
+      earliest_run: "2026-06-01T00:00:00Z",
+    });
+  });
+  afterEach(() => {
+    delete document.documentElement.dataset.font;
+  });
+
+  async function mountChip() {
+    render(
+      <MemoryRouter initialEntries={["/overview/next"]}>
+        <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+          <OverviewNext />
+        </main>
+      </MemoryRouter>,
+    );
+    // The chip renders once the admin list has loaded; wait for the users too so the
+    // popover holds its full content (names, signed-in group, idle line) before measuring.
+    const chip = await screen.findByRole("button", { name: /^People: \d+ active now of \d+$/ });
+    // The usage data loads separately from the admin lists. Wait for the Usage card, so the
+    // footer action reads "Usage by user →" (not unavailable) and the card can be queried.
+    await screen.findByRole("group", { name: "Usage scope" });
+    await document.fonts.ready;
+    return chip;
+  }
+
+  const inViewport = (r: DOMRect, what: string) => {
+    expect.soft(r.left, `${what} left`).toBeGreaterThanOrEqual(0);
+    expect.soft(r.top, `${what} top`).toBeGreaterThanOrEqual(0);
+    expect.soft(r.right, `${what} right`).toBeLessThanOrEqual(window.innerWidth);
+    expect.soft(r.bottom, `${what} bottom`).toBeLessThanOrEqual(window.innerHeight);
+  };
+
+  for (const [width, height] of [
+    [1280, 900],
+    [400, 900],
+  ] as const) {
+    it(`opens inside the viewport and closes on Escape back to the chip at ${width}x${height}`, async () => {
+      await page.viewport(width, height);
+      const chip = await mountChip();
+      expect(window.innerWidth).toBe(width);
+      await userEvent.click(chip);
+      const dialog = await screen.findByRole("dialog", { name: "People using uzi" });
+      expect(chip.getAttribute("aria-expanded")).toBe("true");
+      // The popover holds every group the fixture feeds it.
+      expect(within(dialog).getByText("Priya Desai")).toBeTruthy();
+      expect(within(dialog).getByText("Elif Kaya")).toBeTruthy();
+      expect(within(dialog).getByText(/never signed in/)).toBeTruthy();
+      inViewport(dialog.getBoundingClientRect(), "dialog");
+      if (width === 1280) {
+        // Desktop: below the chip, right edges aligned.
+        const c = chip.getBoundingClientRect();
+        const d = dialog.getBoundingClientRect();
+        expect.soft(d.top, "below the chip").toBeGreaterThanOrEqual(c.bottom);
+        expect.soft(Math.abs(d.right - c.right), "right edge aligned to the chip").toBeLessThanOrEqual(1);
+      }
+      // No row pokes out of the dialog.
+      const dRight = dialog.getBoundingClientRect().right;
+      for (const li of dialog.querySelectorAll<HTMLElement>("li")) {
+        expect.soft(li.getBoundingClientRect().right, li.textContent?.slice(0, 30)).toBeLessThanOrEqual(dRight + 1);
+      }
+      expect(document.documentElement.scrollWidth, "no horizontal scroll").toBeLessThanOrEqual(
+        document.documentElement.clientWidth,
+      );
+
+      await userEvent.keyboard("{Escape}");
+      expect(screen.queryByRole("dialog", { name: "People using uzi" })).toBeNull();
+      expect(chip.getAttribute("aria-expanded")).toBe("false");
+      expect(document.activeElement).toBe(chip);
+    });
+  }
+
+  // A busy viewer's pill ("3 running · 2 queued · 2 waiting · waits on them") once squeezed
+  // their own name to a single letter; the name keeps a readable width and the pill wraps.
+  for (const width of [1280, 400]) {
+    it(`keeps a busy viewer's name readable beside a long pill at ${width}px`, async () => {
+      mockApi.listRuns.mockResolvedValue({
+        runs: [
+          ...["r1", "r2", "r3"].map((id) => aRun({ id, status: "running" })),
+          ...["q1", "q2"].map((id) => aRun({ id, status: "queued" })),
+          ...["l1", "l2"].map((id) => aRun({ id, status: "limit_wait" })),
+          aRun({ id: "a1", status: "awaiting_input" }),
+        ],
+      });
+      await page.viewport(width, 900);
+      const chip = await mountChip();
+      await userEvent.click(chip);
+      const dialog = await screen.findByRole("dialog", { name: "People using uzi" });
+      const row = within(dialog).getByText("(you)").closest("li") as HTMLElement;
+      const [, name, pill] = Array.from(row.children) as HTMLElement[];
+      expect(pill.textContent).toBe("3 running · 2 queued · 2 waiting · waits on them");
+      expect.soft(name.getBoundingClientRect().width, "name keeps a readable width").toBeGreaterThanOrEqual(120);
+      expect.soft(name.scrollWidth, "the viewer's short name shows whole").toBeLessThanOrEqual(name.clientWidth + 1);
+      expect.soft(pill.getBoundingClientRect().right, "pill inside the dialog").toBeLessThanOrEqual(
+        dialog.getBoundingClientRect().right,
+      );
+      expect.soft(pill.getBoundingClientRect().left, "pill right of the name").toBeGreaterThanOrEqual(
+        name.getBoundingClientRect().right,
+      );
+    });
+  }
+
+  it("fits a short phone (400x600) with the Usage by user action on screen", async () => {
+    await page.viewport(400, 600);
+    const chip = await mountChip();
+    await userEvent.click(chip);
+    const dialog = await screen.findByRole("dialog", { name: "People using uzi" });
+    inViewport(dialog.getBoundingClientRect(), "dialog");
+    const action = within(dialog).getByRole("button", { name: "Usage by user →" });
+    inViewport(action.getBoundingClientRect(), "Usage by user");
+    expect(document.documentElement.scrollWidth, "no horizontal scroll").toBeLessThanOrEqual(
+      document.documentElement.clientWidth,
+    );
+  });
+
+  it("keeps the Usage by user action pinned on screen when the sheet scrolls (400x400)", async () => {
+    await page.viewport(400, 400);
+    const chip = await mountChip();
+    await userEvent.click(chip);
+    const dialog = await screen.findByRole("dialog", { name: "People using uzi" });
+    inViewport(dialog.getBoundingClientRect(), "dialog");
+    // The content must overflow, or this case proves nothing about the sticky footer.
+    expect(dialog.scrollHeight, "sheet scrolls").toBeGreaterThan(dialog.clientHeight);
+    const action = within(dialog).getByRole("button", { name: "Usage by user →" });
+    inViewport(action.getBoundingClientRect(), "Usage by user");
+  });
+
+  it("drives Usage by user from the keyboard: Enter opens, Tab reaches the action, Enter lands on By user", async () => {
+    await page.viewport(1280, 900);
+    const chip = await mountChip();
+    const usageScope = screen.getByRole("group", { name: "Usage scope" });
+    const allUsers = within(usageScope).getByRole("button", { name: "All users" });
+    expect(allUsers.getAttribute("aria-pressed")).toBe("false");
+
+    chip.focus();
+    await userEvent.keyboard("{Enter}");
+    const dialog = await screen.findByRole("dialog", { name: "People using uzi" });
+    expect(chip.getAttribute("aria-expanded")).toBe("true");
+    await userEvent.tab();
+    const action = within(dialog).getByRole("button", { name: "Usage by user →" });
+    expect(document.activeElement).toBe(action);
+    await userEvent.keyboard("{Enter}");
+
+    expect(chip.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByRole("dialog", { name: "People using uzi" })).toBeNull();
+    expect(within(screen.getByRole("group", { name: "Usage scope" })).getByRole("button", { name: "All users" }).getAttribute("aria-pressed")).toBe("true");
+    await expect.poll(() => document.activeElement?.id).toBe("overview-usage-by-user");
   });
 });

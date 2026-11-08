@@ -138,6 +138,29 @@ describe("statusSentence", () => {
     );
   });
 
+  it("adds how many people are executing to the factory-wide sentence", () => {
+    const f = { ...base, acrossFactory: true, counts: { executing: 6, queued: 1, parked: 2 } };
+    expect(statusSentence({ ...f, executingPeople: 3 })).toBe(
+      "Nothing needs you right now. 6 runs are executing across the factory for 3 people, 1 queued and 2 parked.",
+    );
+    expect(statusSentence({ ...f, counts: { executing: 1, queued: 0, parked: 0 }, executingPeople: 1 })).toBe(
+      "Nothing needs you right now. 1 run is executing across the factory for 1 person.",
+    );
+  });
+
+  it("leaves the people clause out when nothing executes, the scope is not the factory, or the field is absent", () => {
+    const f = { ...base, acrossFactory: true, counts: { executing: 3, queued: 0, parked: 0 } };
+    expect(statusSentence({ ...f, counts: { executing: 0, queued: 1, parked: 0 }, executingPeople: 2 })).not.toContain(
+      "for 2 people",
+    );
+    expect(statusSentence({ ...f, acrossFactory: false, executingPeople: 2 })).toBe(
+      "Nothing needs you right now. 3 runs are executing.",
+    );
+    expect(statusSentence({ ...f, adminUnavailable: true, executingPeople: 2 })).not.toContain("people");
+    expect(statusSentence({ ...f, executingPeople: 0 })).toBe(statusSentence(f));
+    expect(statusSentence(f)).toBe("Nothing needs you right now. 3 runs are executing across the factory.");
+  });
+
   it("counts only the viewer's runs, says so and never claims the factory when the admin list is unavailable", () => {
     const sentence = statusSentence({
       ...base,

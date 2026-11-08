@@ -127,5 +127,29 @@ describe("overview-next mock scenario", () => {
     expect(factory.some((r) => r.id.startsWith("run-ov-"))).toBe(false);
     expect(own.some((r) => r.id.startsWith("run-ov-"))).toBe(false);
     expect((await api.getMaintenance()).active).toBe(false);
+    // #4042: the People chip's extra users stay out of the base roster.
+    const emails = (await api.listUsers()).users.map((u) => u.email);
+    expect(emails.some((e) => /^(priya|sam|jordan|lena|omar|ines|elif|mateo|hana)@/.test(e))).toBe(false);
+  });
+
+  // #4042: every other-run owner has a named user row, and the people without runs fill the
+  // popover's signed-in and idle groups (one within 24 hours, one never signed in, one idle).
+  it("gives every other-run owner a user row and seeds signed-in and idle people", async () => {
+    const api = await freshApi("overview-next");
+    const users = (await api.listUsers()).users;
+    const byEmail = new Map(users.map((u) => [u.email, u]));
+    const factory = (await api.adminListRuns({ view: "summary" })).runs;
+    for (const r of factory.filter((r) => r.id.startsWith("run-ov-") && r.owner_email)) {
+      const u = byEmail.get(r.owner_email!);
+      expect(u, r.owner_email!).toBeDefined();
+      expect(u!.display_name, r.owner_email!).toBeTruthy();
+      expect(u!.is_active).toBe(true);
+    }
+    const owners = new Set(factory.map((r) => r.owner_email));
+    const idleOnes = users.filter((u) => u.is_active && !owners.has(u.email) && u.id.startsWith("u-ov-"));
+    const age = (u: (typeof users)[number]) => (u.last_login ? Date.now() - Date.parse(u.last_login) : null);
+    expect(idleOnes.some((u) => age(u) !== null && age(u)! < 24 * 3600_000)).toBe(true);
+    expect(idleOnes.some((u) => u.last_login === null)).toBe(true);
+    expect(idleOnes.some((u) => age(u) !== null && age(u)! > 2 * 24 * 3600_000)).toBe(true);
   });
 });

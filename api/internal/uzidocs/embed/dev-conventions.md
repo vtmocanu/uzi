@@ -725,7 +725,11 @@ scenarios are mutually exclusive by construction. Known values:
   Needs your decision carries one held-work row. Nothing is seeded outside the
   scenario. With no scope saved in the browser, the Issue work card opens on
   You, so its counts include the seeded other users' runs only under All users
-  (the Runs card still lists them). (PRD #3878, PRD #3880, #4052.)
+  (the Runs card still lists them). The user list gains named rows for the six
+  other-run owners plus three people with no runs (one signed in two hours ago,
+  one never signed in, one last seen nine days ago), so the admin People chip's
+  popover shows names, a signed-in-within-24-hours row and an Idle line.
+  (PRD #3878, PRD #3880, #4052, #4042.)
 - `overview-calm` — `/overview/next?mock=overview-calm`: you have active runs
   but nothing waiting on a decision (no plan review, question, owner-action
   park, open pull request or custody hold), so the decision card stays hidden.
