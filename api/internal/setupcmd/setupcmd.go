@@ -131,12 +131,12 @@ func (w scrubWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// scrubLogs routes the default slog logger, which provisionsvc and forgesvc
-// write to, through the scrubber onto setup's stderr, and returns the restore.
-func (r *runner) scrubLogs() func() {
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(scrubWriter{r}, nil)))
-	return func() { slog.SetDefault(prev) }
+// logger is this run's slog logger: it writes through the scrubber onto this
+// run's stderr. provisionsvc, the one slog writer on the setup path, gets it
+// through WithLogger. Setup never changes the process-global logger, so two
+// runs at the same time keep their log lines apart.
+func (r *runner) logger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(scrubWriter{r}, nil))
 }
 
 // emit scrubs every string in the report that came from outside this package,
@@ -197,7 +197,6 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return r.reject(stdout, err)
 	}
 	r.token = token
-	defer r.scrubLogs()()
 
 	be, closeBackend, err := env.Open(ctx, cfg)
 	if err != nil {
@@ -218,7 +217,7 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	}
 
 	// Every precondition holds. From here on, writes may happen and are kept.
-	prov := provisionsvc.New(be.Q, be.Forges, be.Guard, cfg.ForgeBaseURLAllowed)
+	prov := provisionsvc.New(be.Q, be.Forges, be.Guard, cfg.ForgeBaseURLAllowed).WithLogger(r.logger())
 	r.report = &Report{SchemaVersion: ReportSchemaVersion, Status: ReportOK}
 	conn, forgeOK := r.connectForge(ctx, prov, be.Q, owner.ID, in, normBase)
 	discovered := forgeOK && r.discoverRepos(ctx, prov, owner.ID, conn.ID)

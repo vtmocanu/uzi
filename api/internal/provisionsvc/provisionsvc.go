@@ -88,11 +88,27 @@ type Service struct {
 	forges         Forges
 	guard          Guard
 	baseURLAllowed func(raw string) bool
+	log            *slog.Logger // nil: slog.Default() at each call
 }
 
 // New wires a Service. baseURLAllowed is Config.ForgeBaseURLAllowed.
 func New(q Store, forges Forges, guard Guard, baseURLAllowed func(raw string) bool) *Service {
 	return &Service{q: q, forges: forges, guard: guard, baseURLAllowed: baseURLAllowed}
+}
+
+// WithLogger makes the Service write its log lines to l instead of the
+// process default. The setup command gives each run its own scrubbed logger,
+// so two runs at the same time never share a log destination.
+func (s *Service) WithLogger(l *slog.Logger) *Service {
+	s.log = l
+	return s
+}
+
+func (s *Service) logger() *slog.Logger {
+	if s.log != nil {
+		return s.log
+	}
+	return slog.Default()
 }
 
 // ConnectForge validates and stores a bot token for the user: forge type,
@@ -113,7 +129,7 @@ func (s *Service) ConnectForge(ctx context.Context, userID uuid.UUID, forgeType,
 		TokenCiphertext: p.ciphertext,
 	})
 	if err != nil {
-		slog.Error("upsert forge connection", "error", err)
+		s.logger().Error("upsert forge connection", "error", err)
 		return store.ForgeConnection{}, internal()
 	}
 	return conn, nil
@@ -141,7 +157,7 @@ func (s *Service) ConnectForgeCreateOnly(ctx context.Context, userID uuid.UUID, 
 		return conn, true, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
-		slog.Error("create forge connection", "error", err)
+		s.logger().Error("create forge connection", "error", err)
 		return store.ForgeConnection{}, false, internal()
 	}
 	// Conflict: a connection already holds this target. Reuse the winner.
@@ -149,7 +165,7 @@ func (s *Service) ConnectForgeCreateOnly(ctx context.Context, userID uuid.UUID, 
 		UserID: userID, ForgeType: p.forgeType, BaseUrl: p.baseURL,
 	})
 	if err != nil {
-		slog.Error("read winning forge connection", "error", err)
+		s.logger().Error("read winning forge connection", "error", err)
 		return store.ForgeConnection{}, false, internal()
 	}
 	return conn, false, nil
@@ -207,7 +223,7 @@ func (s *Service) validateConnection(ctx context.Context, forgeType, baseURL, to
 
 	ciphertext, err := s.forges.EncryptToken(token)
 	if err != nil {
-		slog.Error("encrypt token", "error", err)
+		s.logger().Error("encrypt token", "error", err)
 		return validatedConnection{}, internal()
 	}
 	return validatedConnection{forgeType: forgeType, baseURL: norm, identity: identity, ciphertext: ciphertext}, nil
@@ -222,7 +238,7 @@ func (s *Service) DiscoverRepos(ctx context.Context, userID, connID uuid.UUID) (
 	}
 	f, err := s.forges.ForgeForConnection(conn.ForgeType, conn.BaseUrl, conn.TokenCiphertext)
 	if err != nil {
-		slog.Error("build forge for connection", "error", err)
+		s.logger().Error("build forge for connection", "error", err)
 		return store.ForgeConnection{}, internal()
 	}
 	projects, err := f.ListProjects(ctx)
@@ -237,7 +253,7 @@ func (s *Service) DiscoverRepos(ctx context.Context, userID, connID uuid.UUID) (
 			WebUrl:            p.WebURL,
 			DefaultBranch:     pgconv.TextOrNull(p.DefaultBranch),
 		}); err != nil {
-			slog.Error("upsert repo", "error", err)
+			s.logger().Error("upsert repo", "error", err)
 			return store.ForgeConnection{}, internal()
 		}
 	}
@@ -256,7 +272,7 @@ func (s *Service) EnableRepo(ctx context.Context, userID, repoID uuid.UUID) (sto
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.Repo{}, &Error{Kind: KindNotFound, Message: "repo not found"}
 		}
-		slog.Error("get repo for enable guard", "error", err)
+		s.logger().Error("get repo for enable guard", "error", err)
 		return store.Repo{}, internal()
 	}
 	res := s.guard.GuardRepo(ctx, privcheck.GuardInput{
@@ -282,7 +298,7 @@ func (s *Service) EnableRepo(ctx context.Context, userID, repoID uuid.UUID) (sto
 	// disabled rather than enabled with a board no card can resolve against.
 	f, err := s.forges.ForgeForConnection(row.ForgeType, row.BaseUrl, row.TokenCiphertext)
 	if err != nil {
-		slog.Error("build forge for connection", "error", err)
+		s.logger().Error("build forge for connection", "error", err)
 		return store.Repo{}, internal()
 	}
 	if err := forgesvc.EnsureBoardColumns(ctx, s.q, f, row.ID, row.ForgeProjectID); err != nil {
@@ -290,7 +306,7 @@ func (s *Service) EnableRepo(ctx context.Context, userID, repoID uuid.UUID) (sto
 		if errors.As(err, &seedErr) {
 			return store.Repo{}, &Error{Kind: KindBadGateway, Message: "could not seed board labels on the forge: " + seedErr.Error()}
 		}
-		slog.Error("ensure board columns", "error", err)
+		s.logger().Error("ensure board columns", "error", err)
 		return store.Repo{}, internal()
 	}
 
@@ -299,14 +315,14 @@ func (s *Service) EnableRepo(ctx context.Context, userID, repoID uuid.UUID) (sto
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.Repo{}, &Error{Kind: KindNotFound, Message: "repo not found"}
 		}
-		slog.Error("set repo enabled", "error", err)
+		s.logger().Error("set repo enabled", "error", err)
 		return store.Repo{}, internal()
 	}
 
 	// A successful enable makes any pending override request moot. Best effort:
 	// the enable already succeeded.
 	if err := s.q.DeletePendingGuardrailOverrideRequestsForRepo(ctx, repoID); err != nil {
-		slog.Warn("set repo enabled: settle pending override request", "error", err)
+		s.logger().Warn("set repo enabled: settle pending override request", "error", err)
 	}
 	return repo, nil
 }

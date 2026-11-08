@@ -58,6 +58,41 @@ func TestRunScrubsTheTokenFromServiceLogLines(t *testing.T) {
 	assertNoToken(t, h)
 }
 
+// Two setup runs at the same time keep their service log lines apart (PR #3956,
+// CodeRabbit review of 597bee6dd). Run A pauses inside the enable step, run B
+// starts, then A logs: A's line must reach A's stderr only. When setup swapped
+// the process-global slog logger, A's line went to B's stderr.
+func TestRunConcurrentRunsKeepTheirServiceLogsApart(t *testing.T) {
+	a, b := newHarness(), newHarness()
+	a.st.getRepoErr = errors.New("read failed in run A")
+	b.st.getRepoErr = errors.New("read failed in run B")
+
+	aIn, aGo := make(chan struct{}), make(chan struct{})
+	a.st.onGetRepo = func() { close(aIn); <-aGo }
+	bIn, bGo := make(chan struct{}), make(chan struct{})
+	b.st.onGetRepo = func() { close(bIn); <-bGo }
+
+	aDone, bDone := make(chan struct{}), make(chan struct{})
+	go func() { a.run(context.Background(), baseArgs("--repos", "acme/app")...); close(aDone) }()
+	<-aIn
+	go func() { b.run(context.Background(), baseArgs("--repos", "acme/app")...); close(bDone) }()
+	<-bIn
+	close(aGo)
+	<-aDone
+	close(bGo)
+	<-bDone
+
+	if !strings.Contains(a.stderr.String(), "read failed in run A") {
+		t.Errorf("run A's service log line did not reach run A's stderr:\n%s", a.stderr.String())
+	}
+	if strings.Contains(b.stderr.String(), "run A") {
+		t.Errorf("run A's service log line reached run B's stderr:\n%s", b.stderr.String())
+	}
+	if !strings.Contains(b.stderr.String(), "read failed in run B") {
+		t.Errorf("run B's service log line did not reach run B's stderr:\n%s", b.stderr.String())
+	}
+}
+
 // A database error can carry the password (pgx redacts malformed connection
 // strings only best-effort), so setup prints a fixed message instead of the raw
 // error on both streams (PR #3956 review, item 8).

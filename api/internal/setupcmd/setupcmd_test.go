@@ -86,6 +86,9 @@ type fakeStore struct {
 	// getRepoErr makes GetRepoForUser fail; provisionsvc logs that error
 	// through slog, the path a scrub test needs.
 	getRepoErr error
+	// onGetRepo, when set, runs at the start of GetRepoForUser, so a test can
+	// hold one run inside the enable step while another run starts.
+	onGetRepo func()
 }
 
 func newFakeStore() *fakeStore {
@@ -145,6 +148,9 @@ func (s *fakeStore) ListReposByConnectionForUser(context.Context, store.ListRepo
 	return out, nil
 }
 func (s *fakeStore) GetRepoForUser(_ context.Context, a store.GetRepoForUserParams) (store.GetRepoForUserRow, error) {
+	if s.onGetRepo != nil {
+		s.onGetRepo()
+	}
 	if s.getRepoErr != nil {
 		return store.GetRepoForUserRow{}, s.getRepoErr
 	}
