@@ -99,15 +99,18 @@ describe("live identity and cross-check", () => {
   describe("procfs visibility undeterminable (fails closed)", () => {
     const POD = "123e4567-e89b-12d3-a456-426614174000";
     const HOST_ROW = `31 20 8:1 /var/lib/docker/containers/${CID}/hostname /etc/hostname rw,relatime - ext4 /dev/sda1 rw\n`;
-    const cases = (): Array<[string, string | null]> => [
-      ["unreadable mountinfo", null],
-      ["no row at the proc root", `20 10 0:30 / / rw - overlay overlay rw\n${HOST_ROW}`],
-      ["a non-proc fstype at the proc root", `20 10 0:30 / / rw - overlay overlay rw\n${HOST_ROW}41 20 0:5 / ${proc} rw - tmpfs tmpfs rw\n`],
-      ["a malformed row", `20 10 0:30 / / rw - overlay overlay rw\n${HOST_ROW}garbage row without separator\n41 20 0:5 / ${proc} rw - proc proc rw\n`],
+    // Built inside each test: `proc` is assigned by beforeEach, after the describe block registers.
+    const cases: Array<[string, (root: string) => string | null]> = [
+      ["unreadable mountinfo", () => null],
+      ["no row at the proc root", () => `20 10 0:30 / / rw - overlay overlay rw\n${HOST_ROW}`],
+      ["a non-proc fstype at the proc root", root => `20 10 0:30 / / rw - overlay overlay rw\n${HOST_ROW}41 20 0:5 / ${root} rw - tmpfs tmpfs rw\n`],
+      ["a malformed row", root => `20 10 0:30 / / rw - overlay overlay rw\n${HOST_ROW}garbage row without separator\n41 20 0:5 / ${root} rw - proc proc rw\n`],
+      ["a row with too few fields", root => `20 10 0:30 / / rw - overlay overlay rw\n${HOST_ROW}41 20 - proc\n41 20 0:5 / ${root} rw - proc proc rw\n`],
     ];
     for (const kind of ["compose", "hosted"] as const) {
-      for (const [name, mountinfo] of cases()) {
+      for (const [name, build] of cases) {
         it(`refuses ${name} for a ${kind} slot`, async () => {
+          const mountinfo = build(proc);
           await fsp.rm(proc, { recursive: true });
           await makeProc(proc, { mountinfo });
           const r = await readLiveIdentity({ procRoot: proc, hostname: host, ...(kind === "hosted" ? { podUid: POD } : {}) });
