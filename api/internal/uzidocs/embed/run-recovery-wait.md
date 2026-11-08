@@ -601,6 +601,24 @@ not itself recover publication. A forge outage met later, while the run is
 publishing finished work, is a different park with its own bound; see
 [Forge unreachable while publishing](#forge-unreachable-while-publishing).
 
+If a park report is sent but its reply is lost, the worker asks uzi whether
+the run is parked, resending the report if it is not. When that check is
+refused with an HTTP 4xx status other than 404, 408 or 429, or the resend is
+refused with a 4xx status other than 400, 408 or 429 (a resend rejected as a
+bad request still fails the run, as before), the worker stops retrying and
+reports nothing. A 404 on the check still means the run is no longer owned by
+this worker, and the worker cleans up as before. A 404 on the resend stops
+without a second check and keeps the session. Timeouts, 429, 5xx responses and
+transport failures are retried with backoff. A typed acknowledgement returned
+for the resend, including a 409 body, is not a refusal and is handled as
+before: it can confirm the park or take the failed path (for example
+`custody_unsettled`). On a refusal, the worker keeps the session when it can
+be resumed on that worker, keeps any publication record and source, leaves
+custody unsettled, and leaves the run to the server or its owner. A refusal
+is not treated as proof that the run ended. The same applies to the
+data-volume park and to a claim already enrolled for publication whose clone
+fails; the later publishing park below is a separate path.
+
 ## Forge unreachable while publishing
 
 A run whose work is finished can meet the same kind of forge outage at

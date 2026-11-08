@@ -36,7 +36,7 @@ import { MaintenanceBudget } from "./maintenance-budget.js";
 // not quiet). The reap still kills what it can see.
 
 import { type CommandWrapper, runAgentHelper } from "./rmtree.js";
-import { runnerCommand } from "./runner-uid.js";
+import { killRunnerGroup, runnerCommand, uidSplitActive } from "./runner-uid.js";
 
 /** Pids one pass may look at before it stops (and says the scan is incomplete). */
 const MAX_PIDS = 200_000;
@@ -369,6 +369,26 @@ export interface RunProcsOptions {
   /** The worker's pid, never attributed and whose direct children are never killed (default
    *  `process.pid`). */
   workerPid?: number;
+  /** issue #3980: absolute epoch-ms deadline of a bounded caller (the Claude gate checkpoint). A pass is
+   *  admitted only while time is left, its budget and its helper kill timer are capped by what is left,
+   *  and the helper is joined (killed and closed) before the pass returns. Absent: unchanged. */
+  deadlineAt?: number;
+  /** Test seam only (issue #3980): the same-uid kill a deadline-capped pass uses on its timed-out
+   *  helper, in place of {@link helperUidKiller}'s default. */
+  killHelperAsUid?: (pid: number) => boolean;
+}
+
+/** issue #3980: how a deadline-capped pass kills its timed-out helper when the worker cannot signal
+ *  it. Under the uid split the default `runner` helper runs as a uid the worker (no CAP_KILL) gets
+ *  EPERM from, so it is killed as `runner` through {@link killRunnerGroup}; otherwise `undefined`
+ *  (a plain `child.kill`). `override` (the test seam) wins. */
+export function helperUidKiller(
+  wrap: CommandWrapper,
+  override?: (pid: number) => boolean,
+  split: boolean = uidSplitActive(),
+): ((pid: number) => boolean) | undefined {
+  if (override) return override;
+  return wrap === runnerCommand && split ? killRunnerGroup : undefined;
 }
 
 /** What one scan found. */
@@ -473,7 +493,7 @@ export type LeftReason = "unreadable" | "worker_child" | "restarted" | "kill_fai
 export interface RunProcessOps {
   /** Live CLI pids link an unreadable descendant to this run. */
   scan: (home: string, worktree: string | undefined, spawnedPids: readonly number[]) => Promise<RunProcessScan>;
-  reap: (home: string, worktree: string | undefined, spawnedPids: readonly number[]) => Promise<RunProcessReap>;
+  reap: (home: string, worktree: string | undefined, spawnedPids: readonly number[], opts?: { deadlineAt?: number }) => Promise<RunProcessReap>;
 }
 
 const REAL_RUN_PROCESS_OPS: RunProcessOps = { scan: scanRunProcesses, reap: reapRunProcesses };
@@ -520,7 +540,15 @@ async function passes(
   let complete = true;
   for (const wrap of wrappers) {
     budget?.check();
-    const duration = budget ? Math.min(budgetMs, budget.remainingMs()) : budgetMs;
+    const deadlineLeft = opts.deadlineAt === undefined ? Infinity : opts.deadlineAt - Date.now();
+    if (deadlineLeft <= 0) {
+      // Past the deadline no further pass is admitted: the scan is unknown, never quiet.
+      causes.add("time_budget");
+      complete = false;
+      break;
+    }
+    const capped = budget ? Math.min(budgetMs, budget.remainingMs()) : budgetMs;
+    const duration = opts.deadlineAt === undefined ? capped : Math.floor(Math.min(capped, deadlineLeft));
     const args = [
       mode,
       opts.procRoot ?? PROC_ROOT,
@@ -533,7 +561,9 @@ async function passes(
     ];
     let result;
     try {
-      result = await runAgentHelper(wrap, RUN_PROCS_SCRIPT, args, duration + HELPER_SLACK_MS);
+      result = opts.deadlineAt === undefined
+        ? await runAgentHelper(wrap, RUN_PROCS_SCRIPT, args, duration + HELPER_SLACK_MS)
+        : await runAgentHelper(wrap, RUN_PROCS_SCRIPT, args, Math.max(1, Math.floor(Math.min(duration + HELPER_SLACK_MS, opts.deadlineAt - Date.now()))), "", { joinOnTimeout: true, killAsHelperUid: helperUidKiller(wrap, opts.killHelperAsUid) });
       budget?.check();
     } catch (err) {
       causes.add(helperRejectionReason(err));

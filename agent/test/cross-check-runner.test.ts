@@ -441,7 +441,7 @@ class SentinelXyzError extends Error {}
 class DiagnosticSyntaxError extends SyntaxError {}
 
 const diagnosticRunnerModes = [
- "typed explicit", "typed unannotated", "plain JSON error", "returned invalid JSON",
+ "typed explicit", "typed structured retries", "typed unannotated", "plain JSON error", "returned invalid JSON",
  "exact SyntaxError", "exact TypeError", "exact RangeError", "exact Error",
  "custom alphabetic class", "built-in subclass", "name spoof", "constructor-name spoof",
 ] as const;
@@ -489,6 +489,7 @@ for (const stage of ["plan", "code"] as const) {
       modelCalls++;
       if (stage === "code") { assert.equal(typeof cleanupConfirmed, "function"); cleanupConfirmed!(); }
       if (mode === "typed explicit") throw new CrossCheckMalformedError(sentinel, "finding_schema");
+      if (mode === "typed structured retries") throw new CrossCheckMalformedError(sentinel, "structured_output_retries");
       if (mode === "typed unannotated") throw new CrossCheckMalformedError(sentinel);
       const message = "JSON invalid code cross-check " + sentinel;
       if (mode === "plain JSON error") throw new Error("JSON " + sentinel);
@@ -525,7 +526,7 @@ for (const stage of ["plan", "code"] as const) {
     for (const forbidden of [sentinel, classSentinel]) {
      assert.equal(serialized.includes(forbidden), false, "diagnostics must not expose " + forbidden);
     }
-    const typed = mode === "typed explicit" || mode === "typed unannotated";
+    const typed = mode === "typed explicit" || mode === "typed structured retries" || mode === "typed unannotated";
     const codeFindings = mode === "returned invalid JSON" && stage === "code";
     const errorName = mode === "exact SyntaxError" || (mode === "returned invalid JSON" && stage === "plan") ? "SyntaxError"
      : mode === "exact TypeError" ? "TypeError"
@@ -534,7 +535,7 @@ for (const stage of ["plan", "code"] as const) {
     const warnings = recorded.lines.filter((line) => (line as { level?: string }).level === "warn");
     assert.deepEqual(warnings, [{
      level: "warn", msg: "cross-check verdict malformed", run_id: "check", stage,
-     subreason: mode === "typed explicit" ? "finding_schema" : typed ? "unknown"
+     subreason: mode === "typed explicit" ? "finding_schema" : mode === "typed structured retries" ? "structured_output_retries" : typed ? "unknown"
       : codeFindings ? "code_findings" : "unclassified_error",
      ...(!typed && !codeFindings ? { error_name: errorName } : {}),
     }]);
@@ -1026,6 +1027,14 @@ for (const stage of ["plan", "code"] as const) {
       yield sdkInit; yield { type: "result", subtype, is_error };
      })()) as unknown as SdkQueryFn,
     }) });
+    if (subtype === "error_max_structured_output_retries" && typeof is_error === "boolean") {
+     // Retry exhaustion is the checker's malformed verdict, not an execution incomplete.
+     assert.deepEqual(r.diagnostics, []);
+     assert.equal(r.decisions.at(-1).reason_class, "malformed");
+     assert.deepEqual(r.logs.filter((line: any) => line.msg === "cross-check verdict malformed"), [{
+      level: "warn", msg: "cross-check verdict malformed", run_id: "check", stage, subreason: "structured_output_retries" }]);
+     return;
+    }
     assertDiagnostic(r, stage, "claude", typeof is_error === "boolean" ? "checker_error_result" : "unknown_execution_error");
    });
   }
