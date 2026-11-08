@@ -194,7 +194,7 @@ function RunIdentity({ runId, runs }: { runId: string; runs: RunSummaryItem[] })
     );
   }
   const title = stripUnsafeChars(run.issue_title ?? "").trim();
-  const label = [run.issue_iid != null ? `#${run.issue_iid}` : "", title].filter(Boolean).join(" ") || shortId;
+  const label = title ? (run.issue_iid != null ? `#${run.issue_iid} ${title}` : title) : shortId;
   return (
     <Link to={`/runs/${run.id}`} title={label} className="truncate font-medium text-brand hover:text-brand-hover">
       {label}

@@ -141,6 +141,21 @@ describe("CapacityRail collapsed-row problem badges", () => {
     expect(summary).toContain("upgrade failed");
   });
 
+  const problemBadges = [/quarantined/, /memory authority lost/, /upgrade failed|waiting for capacity/, /disk \d+%/];
+  it.each([
+    ["residue_quarantined_at", { residue_quarantined_at: "2026-07-05T11:00:00Z", residue_quarantine_cause: "unreadable" }, /quarantined/, 0],
+    ["memory_authority_lost_at", { memory_authority_lost_at: "2026-07-05T11:30:00Z" }, /memory authority lost/, 1],
+    ["upgrade_failed", { kind: "hosted", upgrade_status: "upgrade_failed" }, /upgrade failed/, 2],
+    ["capacity_blocked", { kind: "hosted", upgrade_status: "capacity_blocked" }, /waiting for capacity/, 2],
+  ] as const)("shows only the %s badge when only that field is set", (_name, fields, own, group) => {
+    const { container } = mount([aWorker({ ...fields })]);
+    const summary = container.querySelector("summary")?.textContent ?? "";
+    expect(summary).toMatch(own);
+    problemBadges.forEach((other, i) => {
+      if (i !== group) expect(summary).not.toMatch(other);
+    });
+  });
+
   it("does not show the upgrade badge for a merely outdated worker", () => {
     const { container } = mount([aWorker({ upgrade_status: "outdated" })]);
     expect(container.querySelector("summary")?.textContent ?? "").not.toMatch(/outdated|upgrade/i);
@@ -176,6 +191,21 @@ describe("CapacityRail collapsed-row problem badges", () => {
   it("matches the disk gauge percent when stats exist", () => {
     const { container } = mount([aWorker({ ...withStats, ...dataDisk(91) })]);
     const gauge = screen.getByRole("progressbar", { name: "Disk /data", hidden: true });
+    expect(badge(container, /^disk \d+%$/)?.textContent).toBe(`disk ${gauge.getAttribute("aria-valuenow")}%`);
+  });
+
+  it("matches the dind gauge when inodes, not bytes, are the danger", () => {
+    const { container } = mount([
+      aWorker({
+        ...withStats,
+        stats_disk_dind_bytes: 20 * GIB,
+        stats_disk_dind_total_bytes: 100 * GIB,
+        stats_disk_dind_inodes: 91,
+        stats_disk_dind_total_inodes: 100,
+      }),
+    ]);
+    const gauge = screen.getByRole("progressbar", { name: "Disk dind", hidden: true });
+    expect(gauge.getAttribute("aria-valuenow")).toBe("91");
     expect(badge(container, /^disk \d+%$/)?.textContent).toBe(`disk ${gauge.getAttribute("aria-valuenow")}%`);
   });
 });
@@ -219,6 +249,15 @@ describe("CapacityRail expanded row", () => {
     expect(container.textContent).toContain("awaiting followup");
     expect(container.textContent).not.toContain("pending-");
     expect(screen.getAllByRole("listitem")).toHaveLength(1);
+  });
+
+  it("falls back to the short run id for a blank title even when the issue number is known", () => {
+    const runs = [aRun({ id: "run-iid-blank-0042", issue_iid: 42, issue_title: " \t " })] as RunSummaryItem[];
+    const { container } = mount([aWorker({ reported_runs: [{ run_id: "run-iid-blank-0042", phase: "running", claim_generation: 1 }] })], runs);
+    const link = screen.getByRole("link", { name: "run-iid-" });
+    expect(link.textContent).toBe("run-iid-");
+    expect(link.getAttribute("href")).toBe("/runs/run-iid-blank-0042");
+    expect(container.textContent).not.toContain("#42");
   });
 
   it("sizes the five largest, largest first, and lists an unsized run after them", () => {
@@ -346,6 +385,11 @@ describe("CapacityRail untrusted worker text", () => {
         reported_runs: [{ run_id: `${BIDI}${evil}`, phase: evil, claim_generation: 1 }],
       }),
     ]);
+    // Positive pins: the stripped values are still rendered, as text.
+    expect(screen.getByText("run <img src")).toBeTruthy();
+    expect(screen.getByText("run <img src").getAttribute("title")).toBe("<img src=x onerror=alert(1)>");
+    expect(screen.getByText("<img src=x onerror=alert(1)>", { exact: true, selector: "span.font-mono.text-faint" })).toBeTruthy();
+    expect(container.querySelector("p.font-mono")?.textContent).toBe("v<img src=x onerror=alert(1)>");
     expect(container.querySelector("img")).toBeNull();
     expect(container.textContent).not.toContain(BIDI);
     for (const el of Array.from(container.querySelectorAll("*"))) {
