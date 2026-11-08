@@ -1597,3 +1597,143 @@ text) now says which kind of record a refusal met.
 
 Hosted and compose end-to-end acceptance is pending owner acceptance. Power-loss
 durability is not claimed.
+
+
+## Amendment 2026-11-08 — #3644 independent restore
+
+Refs #3644. Builds on the #3404, #3645 and #4066 amendments above. It adds one
+route for a retained predecessor whose authority slot a dead worker incarnation
+still owns. It does not change the authority store, the fence, the certificate or
+any refusal above. In particular, the guarded operator discard stays the only
+takeover: the restore does not take the predecessor P over. It seeds a new
+attempt S beside P and leaves P's slot, ledger, journal and clone bytes untouched.
+
+### The problem
+
+When a worker process dies and a new incarnation claims generation G+1 of the same
+run, the predecessor's slot is still owned by the dead incarnation. The #3645
+refusal then stops the run at retained recovery and, with no operator action, parks
+it. The saved work is intact on the forge (a pin of generation G) while the clone
+that produced it can be neither fenced nor read.
+
+### Scope
+
+- Compose only. A hosted (Kubernetes) slot refuses; hosted delivery is deferred.
+- Guarded `issue`, `mr_rework` and `self_improve` runs only, with the
+  `recovery_completed_publication_v1` capability negotiated and the authority
+  runtime present (the certified-completion prerequisites).
+- Only a predecessor written by a build that recorded a per-process boundary record.
+  A worker started by an older build has none, so its predecessor is never restored
+  (Q10: a missing, invalid or unsupported record refuses).
+
+### Evidence
+
+On the G+1 claim the runner (`opaquePreDiscovery`, `runRestoreRoute`,
+`restoreFromPin` in `agent/src/runner.ts`) classifies P read-only
+(`classifyRestoreRelationships`, `evaluateRestoreRoute` in
+`agent/src/restore-route.ts`) before anything is written. Eligibility needs all of:
+
+- the boundary record of the dead incarnation (`establishProcessBoundary`,
+  `readLiveIdentity`, `evaluateComposeRestore` in `agent/src/restore-boundary.ts`:
+  rules R1-R6, R8 and R9). A procfs mounted `hidepid` or as a subset gives
+  `procfs_hidden`;
+- exactly one ordinary pin record of generation G, and `verifyRestorePinRefs`;
+- the attribution census, and `checkpoint_tip` ancestry of the pin source.
+
+Any miss is a refusal, not a retry with weaker evidence.
+
+### The A, J, B predicate
+
+The seed takes the locks in the existing order A (`inFlightAuthority`), then J (the
+recovery journal lock, re-authenticating the pin by `captureId`), then B
+(`git.seedIndependentAttempt`). B's `predecessorUnchanged` re-runs the checks, the
+digests and P's root device and inode under the locks, so a predecessor that
+changed between the read-only pass and the seed refuses. A is never taken beneath B.
+
+### The new attempt
+
+S is seeded at the pin with its own executor and HOME, `agent-home/<runId>.g<N>` and
+`provision/<runId>.g<N>`, so nothing of P's HOME is reachable from the flight. The
+governor's cache target is rebound through `drainThenBind`
+(`agent/src/cache-target.ts`): a callback still holding the old target finishes
+before the pair changes. S's attribution lives in
+`uzi-restore.<branch>.journal`; P's `uzi-recovery.<branch>.clone` key is never
+written. S completes through the ordinary certified path and its ledger entry becomes
+a `retired` tombstone.
+
+### P stays held until the owner discards it
+
+P stays retained. Its generation-G hold fails closed: FINAL, settlement, ancestry
+and report retirement all refuse for G (`restorePredecessorHolds`). The exit is the
+owner's guarded discard, S first and then P, through the retained-source server;
+that route removes the retained-home marker
+`<dataDir>/retained-homes/<runId>.json`. The server's existing verified-merge
+discard closes only the server custody holds. It never deletes P's worker-side bytes.
+
+### Refusals
+
+A refusal is nonterminal. The worker logs `independent restore refused; predecessor
+retained`, puts one bounded line on the feed and stops with `RetainedRecoveryStop`.
+It writes nothing to P's journal, ledger or slot. An owner Cancel already persisted is
+observed at the pre-write stops.
+
+### Costs
+
+- P's hold stays open and counts toward `custody_hold_limit` until the owner
+  discards it.
+- On refusal the run is charged at most `RUN_MAX_REQUEUES - u` claims, then parks at
+  `recovery_wait` / `worker_requeue_exhausted` with custody uncertain. This is
+  LiveDB-tested.
+- Edits made in P after the pin are not carried into S. How much work that loses is
+  not measured.
+- `finalize-G.json` is never retired.
+
+### Costs measured
+
+- Boundary record: 378 bytes, written with the real `establishProcessBoundary` into a
+  scratch data directory against a synthetic procfs fixture and counted with
+  `wc -c`. It is one file per worker process.
+- Tests: the worker-uid namespace-teardown proof took about 51 s locally; the restore
+  test files took about 2 m 40 s for 215 tests locally.
+- Not measured: production growth (owner: the post-rollout operator) and the CI and
+  end-to-end impact.
+
+### Failure model
+
+Narrowed to process and container crashes and injected faults. The restore writers
+publish before they sync: the Git config replacement renames before `syncRestoreWrite`,
+later `writeRestoreJournal` replacements are unsynced, and `rewriteConfigAtomically`
+never syncs the directory. No storage or power-loss guarantee is claimed. What holds is
+that a crash leaves a refusal, never a reuse of P.
+
+### Rollback
+
+Rolling back to v0.87.0-rc.2 after a restore is unsupported.
+
+- Amendment 9 of #3644: rc.2 may write a reservation and a `preservation_failed`
+  blocker into P's journal (and `uzi-attemptmode.<key>.enabled`, observed), and deletes
+  P's legacy HOME and provision directories once the run is terminal. It keeps S's
+  ledger entry, restore entry and clone, and P's clone bytes, owed refs and pins.
+  `agent/test/independent-restore-rc2-compat.proof.ts` runs the archived rc.2
+  sources against a fixture written by this build and asserts that. Its tests titled
+  "OWNER REVIEW PENDING" record what rc.2 was observed to do, not an acceptance of it.
+- Amendment 14 of #3644: after rc.2 reclaims P for another run, rolling forward
+  recognises the released predecessor, and the guarded discards of S then P reach done
+  (attempt-path mode A; mode H, the holding root, whose copy is kept and still needs an
+  owner).
+- Residual: when rc.2's ledger compaction has dropped the evidence (S tombstoned before
+  the rollback in mode A, or a second rollback), the roll-forward refuses fail-closed
+  and P's bytes stay. The fence is tracked by #3981.
+
+### Limitations and follow-ups
+
+#3998 (non-retired composite claims charge and park), #3999 (feature off with an
+existing entry stops), #4000 and #3981. Hosted delivery is deferred.
+
+### Not claimed
+
+Evidence run: the agent unit tests and the rc.2 proof (28 tests) locally; the
+worker-uid namespace-teardown proof locally; the LiveDB regression locally. The
+end-to-end phase 45 and 52 helpers are tested hermetically only (`lib.test.sh`); the
+live end-to-end run is pending exact-head CI. Hosted slots, power-loss durability and
+rollback after a restore are not claimed.

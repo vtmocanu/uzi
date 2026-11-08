@@ -2228,6 +2228,70 @@ consumes a requeue, so repeated restarts end at `recovery_wait` / `worker_requeu
 unless the run's own open holds reach the custody admission limit first; it then stays queued for
 capacity (not an owner park) until it can be claimed again.
 
+### When a restarted worker continues from a saved pin (independent restore)
+
+If a worker process dies and the run is claimed again, the earlier attempt (the
+predecessor) can still be owned by the dead process, so the new claim cannot take
+its clone over. On a Docker Compose worker uzi can then start a **fresh attempt**
+from the run's verified saved work instead of stopping. It does not fence, read or
+reuse the predecessor.
+
+**When it happens.** Only when all of these hold: the worker is a Compose worker (a
+hosted Kubernetes worker refuses); the run is an issue, MR-rework or self-improvement
+run with guarded recovery; the dead worker was started by a build that wrote a
+per-process boundary record (a worker started by an older build has none, so its
+predecessor is never restored); and the run has exactly one saved pin for the
+generation that died, whose checks all pass. Any other case is a refusal.
+
+**What you see.** The run feed shows one of two worker lines:
+
+- `independent restore: a fresh attempt was seeded from the verified pin`, followed by
+  `continues from verified saved work at pin <id> (generation <n>, sha <sha>); later
+  unpinned edits may remain only in the retained predecessor on the worker (not
+  measured); merging closes only the server custody holds; the retained predecessor's
+  worker-side copy stays until the owner's guarded discard`.
+- `independent restore refused (<reason>); the retained predecessor is kept and the
+  run is not failed`.
+
+A refusal is not a failure. Nothing is written to the predecessor and its work is
+kept. The worker log records `independent restore refused; predecessor retained` with
+the reason. A refused claim is charged against the run's requeue allowance: after the
+remaining allowance is used the run parks at `recovery_wait` /
+`worker_requeue_exhausted` with its custody kept, and only you can Resume or Cancel
+it. Back the work
+up first. A Cancel you already issued is honored before anything is written.
+
+**What it costs.**
+
+- Edits the predecessor made after the pin are not carried into the new attempt, and
+  how much that is has not been measured.
+- The predecessor's hold stays open and counts toward your
+  [custody admission limit](admin-settings.md) (`custody_hold_limit`) until you
+  discard it. The generation's final acknowledgment, settlement and report retirement
+  all refuse while it is open. Merging the PR closes only the server custody holds; it
+  never deletes the predecessor's copy on the worker.
+- The restore keeps the new attempt's HOME separate (`agent-home/<run-id>.g<n>`), so
+  the predecessor's HOME is never touched.
+
+**How to release it.** Discard the new attempt's retained source first, then the
+predecessor's, with the guarded worker-local inspect and discard described in
+[Retained sources with no open hold](#retained-sources-with-no-open-hold-worker-local-inspect-and-discard)
+and `uzi run discard <run-id> --hold <hold-id> --yes` for the server hold (see
+[the CLI reference](cli.md)). Run `inspect` first and read its disposition; never delete a clone by
+hand. Inspect, discard and `run discard` stay owner-guarded; nothing here is automatic.
+
+**Limits.** Rolling back to v0.87.0-rc.2 after a restore is unsupported. That build
+can write a reservation and a `preservation_failed` blocker into the predecessor's
+journal and delete the predecessor's legacy HOME and provision directories once the run
+is terminal; it does not delete the new attempt's clone, the predecessor's clone
+bytes, owed refs or pins. If rc.2 has reclaimed the predecessor for another run, rolling
+forward recognises it and the guarded discards still finish, except when rc.2's ledger
+compaction dropped the evidence (the new attempt was already retired before the
+rollback, or a second rollback): the roll-forward then refuses and the predecessor's
+bytes stay (issue #3981 is open). The crash model is process and
+container crashes only; no storage or power-loss guarantee is claimed. Design and
+evidence: [ADR-1783](../adr/1783-run-quiescence-and-attempt-clone-paths.md#amendment-2026-11-08--3644-independent-restore).
+
 ### Retained sources with no open hold (worker-local inspect and discard)
 
 A retained source can outlive its server hold: the hold was released or discarded,
