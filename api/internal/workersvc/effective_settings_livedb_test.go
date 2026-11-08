@@ -323,7 +323,17 @@ func TestEffectiveSettingsSubagentPinsMatchClaimLiveDB(t *testing.T) {
 			for _, a := range payload.Agents {
 				names = append(names, a.Name)
 			}
-			leadIdx, _ := agenttmpl.SelectLead(names)
+			leadIdx, ok := agenttmpl.SelectLead(names)
+			if !ok {
+				t.Fatalf("claim roster %v carries no lead-shaped agent", names)
+			}
+			wantLead := map[Harness]string{HarnessClaude: "opus", HarnessCodex: "gpt-6-sol"}[h]
+			if got := derefOr(payload.Agents[leadIdx].Model, ""); got != wantLead {
+				t.Errorf("claim lead agent %q model = %q, want %q", payload.Agents[leadIdx].Name, got, wantLead)
+			}
+			if lead.Model != wantLead || lead.Subagents == nil || lead.Subagents.LeadValue != wantLead {
+				t.Errorf("predicted lead model %q (subagents lead value %+v), want %q as delivered", lead.Model, lead.Subagents, wantLead)
+			}
 			for i, a := range payload.Agents {
 				if i != leadIdx && a.Model != nil {
 					want[a.Name] = *a.Model
@@ -339,6 +349,15 @@ func TestEffectiveSettingsSubagentPinsMatchClaimLiveDB(t *testing.T) {
 			for name, model := range want {
 				if got[name] != model {
 					t.Errorf("subagent %s: predicted %q, claim delivers %q", name, got[name], model)
+				}
+			}
+			wantPins := map[Harness]map[string]string{
+				HarnessClaude: {"eff-coder": "sonnet", "scribe": "haiku"},
+				HarnessCodex:  {"eff-coder": "gpt-6-astra"},
+			}[h]
+			for name, model := range wantPins {
+				if want[name] != model {
+					t.Errorf("subagent %s: claim delivers %q, want the template pin %q", name, want[name], model)
 				}
 			}
 		})
