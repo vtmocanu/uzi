@@ -15,8 +15,10 @@ import {
   rmHomeTree,
   rmTreeForce,
   restoreTreeWritability,
+  helperUidKillerFor,
   runAgentHelper,
 } from "../src/rmtree.js";
+import { commandRootCommand, killCommandRootPid, killRunnerGroup, runnerCommand } from "../src/runner-uid.js";
 
 /**
  * PRD #108 M6. `fs.rm(recursive, force)` cannot delete a tree the Go module cache
@@ -952,5 +954,15 @@ describe("runAgentHelper joinOnTimeout (issue #3980)", () => {
   it("with joinOnTimeout a helper that finishes in time resolves normally", async () => {
     const ok = await runAgentHelper((command, args) => ({ command, args: [...args] }), "process.stdout.write('hi')", [], 10_000, "", { joinOnTimeout: true });
     assert.deepStrictEqual(ok, { code: 0, stdout: "hi" });
+  });
+});
+
+describe("helperUidKillerFor (issue #4089)", () => {
+  it("selects the same-uid kill by wrapper identity, only under the uid split", () => {
+    assert.strictEqual(helperUidKillerFor(runnerCommand, true), killRunnerGroup);
+    assert.strictEqual(helperUidKillerFor(commandRootCommand, true), killCommandRootPid);
+    assert.strictEqual(helperUidKillerFor(runnerCommand, false), undefined);
+    assert.strictEqual(helperUidKillerFor(commandRootCommand, false), undefined);
+    assert.strictEqual(helperUidKillerFor((command, args) => ({ command, args: [...args] }), true), undefined);
   });
 });
