@@ -124,6 +124,10 @@ const (
 	holdCredentialDisabled  = "credential_disabled" //nolint:gosec // G101: a run hold-reason VOCABULARY value (the server enum), not a credential.
 	holdBaseAttestation     = "base_attestation_missing"
 	holdRepoAgentSource     = "repo_agent_source_unavailable"
+	// holdCredentialsReset (PRD #3989) is the park of a Claude-harness or chat run whose owner had
+	// an admin reset their account: the reset deleted every model credential, so the run could not
+	// get one. It resumes by itself once the owner adds a credential; resume is refused (409).
+	holdCredentialsReset = "credentials_reset"
 	// holdWeeklyReserve (PRD #3522) is the park the weekly usage reserve puts a running run in when the
 	// credential it spends reaches the owner's threshold. It releases by itself when usage falls back
 	// below the threshold (or the setting is cleared); `uzi run resume` overrides it until the next

@@ -69,6 +69,10 @@ import type {
   SessionResponse,
   VaultStatus,
   VaultToggleResponse,
+  AccountResetLink,
+  ResetLinkPreview,
+  ResetLinkPreviewRequest,
+  ResetLinkRedeemRequest,
   AdminRateLimitUser,
   Branding,
   Chat,
@@ -253,6 +257,14 @@ import vaultStatusZero from "../../../fixtures/api-contract/vault_status.zero.js
 import vaultStatusFull from "../../../fixtures/api-contract/vault_status.full.json";
 import vaultToggleZero from "../../../fixtures/api-contract/vault_toggle.zero.json";
 import vaultToggleFull from "../../../fixtures/api-contract/vault_toggle.full.json";
+import accountResetLinkZero from "../../../fixtures/api-contract/account_reset_link.zero.json";
+import accountResetLinkFull from "../../../fixtures/api-contract/account_reset_link.full.json";
+import resetLinkPreviewZero from "../../../fixtures/api-contract/reset_link_preview.zero.json";
+import resetLinkPreviewFull from "../../../fixtures/api-contract/reset_link_preview.full.json";
+import resetLinkPreviewRequestZero from "../../../fixtures/api-contract/reset_link_preview_request.zero.json";
+import resetLinkPreviewRequestFull from "../../../fixtures/api-contract/reset_link_preview_request.full.json";
+import resetLinkRedeemRequestZero from "../../../fixtures/api-contract/reset_link_redeem_request.zero.json";
+import resetLinkRedeemRequestFull from "../../../fixtures/api-contract/reset_link_redeem_request.full.json";
 import anthropicAdminRateLimitRowZero from "../../../fixtures/api-contract/anthropic_admin_rate_limit_row.zero.json";
 import anthropicAdminRateLimitRowFull from "../../../fixtures/api-contract/anthropic_admin_rate_limit_row.full.json";
 import codexAdminRateLimitRowZero from "../../../fixtures/api-contract/codex_admin_rate_limit_row.zero.json";
@@ -1060,6 +1072,35 @@ it("recorded nested checker metadata always has the nullable member", () => {
   const extra: never = null as unknown as Exclude<keyof typeof vaultToggleFull, keyof VaultToggleResponse>;
   const zero: ZeroOf<VaultToggleResponse> = vaultToggleZero;
   const full: Widen<VaultToggleResponse> = vaultToggleFull;
+  void missing; void extra; void zero; void full;
+}
+// PRD #3989: the account reset link issue response, preview response and both request bodies.
+{
+  const missing: never = null as unknown as Exclude<keyof AccountResetLink, keyof typeof accountResetLinkFull>;
+  const extra: never = null as unknown as Exclude<keyof typeof accountResetLinkFull, keyof AccountResetLink>;
+  const zero: ZeroOf<AccountResetLink> = accountResetLinkZero;
+  const full: Widen<AccountResetLink> = accountResetLinkFull;
+  void missing; void extra; void zero; void full;
+}
+{
+  const missing: never = null as unknown as Exclude<keyof ResetLinkPreview, keyof typeof resetLinkPreviewFull>;
+  const extra: never = null as unknown as Exclude<keyof typeof resetLinkPreviewFull, keyof ResetLinkPreview>;
+  const zero: ZeroOf<ResetLinkPreview> = resetLinkPreviewZero;
+  const full: Widen<ResetLinkPreview> = resetLinkPreviewFull;
+  void missing; void extra; void zero; void full;
+}
+{
+  const missing: never = null as unknown as Exclude<keyof ResetLinkPreviewRequest, keyof typeof resetLinkPreviewRequestFull>;
+  const extra: never = null as unknown as Exclude<keyof typeof resetLinkPreviewRequestFull, keyof ResetLinkPreviewRequest>;
+  const zero: ZeroOf<ResetLinkPreviewRequest> = resetLinkPreviewRequestZero;
+  const full: Widen<ResetLinkPreviewRequest> = resetLinkPreviewRequestFull;
+  void missing; void extra; void zero; void full;
+}
+{
+  const missing: never = null as unknown as Exclude<keyof ResetLinkRedeemRequest, keyof typeof resetLinkRedeemRequestFull>;
+  const extra: never = null as unknown as Exclude<keyof typeof resetLinkRedeemRequestFull, keyof ResetLinkRedeemRequest>;
+  const zero: ZeroOf<ResetLinkRedeemRequest> = resetLinkRedeemRequestZero;
+  const full: Widen<ResetLinkRedeemRequest> = resetLinkRedeemRequestFull;
   void missing; void extra; void zero; void full;
 }
 {
@@ -1914,7 +1955,28 @@ const dtos: { stem: string; nullable: boolean }[] = [
   // PRD #1909 M6: applied_at/applied_by/staged are present-as-null and applied.skills is a
   // nil-slice null in zero.json.
   { stem: "product_skills", nullable: true },
+  // PRD #3989: the reset link DTOs are all-scalar, so no zero.json carries a null.
+  { stem: "account_reset_link", nullable: false },
+  { stem: "reset_link_preview", nullable: false },
+  { stem: "reset_link_preview_request", nullable: false },
+  { stem: "reset_link_redeem_request", nullable: false },
 ];
+
+describe("account reset link contract (PRD #3989)", () => {
+  it("pins the issue and preview key sets", () => {
+    expect(Object.keys(accountResetLinkFull).sort()).toEqual(["expires_at", "kind", "target_is_admin", "token"]);
+    expect(Object.keys(accountResetLinkZero).sort()).toEqual(Object.keys(accountResetLinkFull).sort());
+    expect(Object.keys(resetLinkPreviewFull).sort()).toEqual(["expires_at", "kind"]);
+    expect(Object.keys(resetLinkPreviewZero).sort()).toEqual(["expires_at", "kind"]);
+  });
+
+  it("carries the token in the request bodies and omits an unset redeem password", () => {
+    expect(resetLinkPreviewRequestFull).toEqual({ token: "x" });
+    expect(resetLinkRedeemRequestFull).toEqual({ token: "x", password: "x" });
+    // vault_only redemption sends no password: the zero value omits the key entirely.
+    expect(resetLinkRedeemRequestZero).toEqual({ token: "" });
+  });
+});
 
 describe("vault lifecycle contract fixtures", () => {
   it("pins the session envelope and nested public metadata keys", () => {

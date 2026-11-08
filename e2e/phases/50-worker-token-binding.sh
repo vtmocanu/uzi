@@ -39,6 +39,7 @@ login
 # synthetic workers, but they add no custody. Wait while the real agent can settle
 # its pending final inventories, before stopping it for the payload-only claims.
 wait_custody_headroom 1
+capture_agent_logs 50-worker-token-binding before-stop
 "${COMPOSE[@]}" stop agent >/dev/null 2>&1 || true
 
 # A SECOND credential with a DISTINCT value — distinct is the whole test: the two

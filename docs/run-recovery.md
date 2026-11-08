@@ -581,7 +581,9 @@ reservation count. Owner Resume of `worker_requeue_exhausted` and bounded
 `retained_recovery_exhausted` retries can also renew: a fresh generation and
 higher derived episode charge one of three reservations in a new five-minute
 window and clear only `budget_exhausted`. The default three timed parks are
-followed by an owner hold; Resume preserves that count. Timer promotion resets
+followed by an owner hold; Resume preserves that count. A window refused
+only for data-volume capacity is held for the owner without consuming a counted retained park.
+Timer promotion resets
 the run wall, while manual Resume preserves remaining wall budget and may need
 an owner extension. Other requeues, disk retries, memory-pressure Resume or a
 new claim alone do not renew. See
@@ -643,7 +645,8 @@ usage (and the projected usage when it was computed). The refusal is not a disk
 park and spends one of the same three reservations; the worker runs one reclaim
 pass and re-checks before refusing. If the volume stays full, the iterations end
 in the existing retained-recovery park, whose automatic retries stop for owner
-Resume once the retained-park allowance is spent. The
+Resume once the retained-park allowance is spent, or at once, uncounted, when
+every reservation in the window was refused for data volume capacity. The
 projection is an estimate and applies only when the API supports both the disk
 and retained-recovery park causes. The check has no off switch: setting
 `UZI_DISK_HARD_STOP_ENABLED=false` disables the hard governor's stops but not
@@ -2191,6 +2194,7 @@ owner/path pair changed or the re-admission bound of 2 was passed),
 `completion_pending`, `completion_preflight_retained`, `completion_uncertain`,
 `authority_busy` (the authority lock wait ran out), `published_source_retained`
 (a fenced journal with retained sources was kept, never detached),
+`remediation_retained` (the predecessor's source is held under secret-scan remediation; see below),
 `completion_unverified`, `completion_unsupported`, or `unknown`. It carries no
 error text or paths. IDs are UUID strings
 or `invalid`; path shape is `canonical`, `attempt`, or `unknown`. The fingerprint
@@ -2207,6 +2211,22 @@ it does not establish the cause of the historical refusal in
 [issue #1848](https://github.com/vtmocanu/uzi/issues/1848): the supplied report
 lacked the deployed worker revision, classification request status, and
 underlying retirement error.
+
+A successor run can reclaim an orphaned attempt whose predecessor is terminal (for example
+cancelled) while the predecessor's source is held under secret-scan remediation. The worker then
+does not start the agent and touches nothing of the predecessor. It emits `orphan_reclaim_refused`
+with `remediation_retained`, sends a status message naming only the predecessor run id, and parks the
+run for you at `recovery_wait` / `retained_recovery_adoption_failed`. The message says the agent did not
+start and the source requires review. **Resume** on this worker holds again and adds at least one
+admission-counted custody hold; **Cancel** ends the run and leaves its open holds for you to discard.
+Run `uzi run recovery <predecessor-run-id>` to inspect the predecessor. Resume grants no remediation
+authority, and this page names no route that disposes of the remediation. While held or queued, the
+run's holds count toward your [custody admission limit](admin-settings.md) (`custody_hold_limit`), and a
+held run blocks its worker's upgrade or drain. If the api does not support the park, the worker does not
+park and the message says so; the run is then handled by the ordinary requeue paths. A worker restart
+consumes a requeue, so repeated restarts end at `recovery_wait` / `worker_requeue_exhausted`,
+unless the run's own open holds reach the custody admission limit first; it then stays queued for
+capacity (not an owner park) until it can be claimed again.
 
 ### Retained sources with no open hold (worker-local inspect and discard)
 

@@ -34,6 +34,7 @@ import {
   runListItem,
 } from "../data";
 import { ensureLive, handleInput, startNewRun } from "../engine";
+import { overviewNextPendingQuestions } from "../data/overviewNext";
 import { foreignCooldownRun } from "../runProgress";
 import { getRun, nextRunId, patchRun, state } from "../store";
 import { delay, mockScenario, requireSession } from "./shared";
@@ -293,6 +294,17 @@ function toSummary(item: RunListItem): RunSummaryItem {
   return summary;
 }
 
+// PRD #4040: the server sets `pending_question` only on the caller's own awaiting_input rows
+// of GET /api/runs, from the newest question message. The mock reads a static per-run seed
+// (overviewNextPendingQuestions); mockAdminListRuns never calls this.
+function withPendingQuestion(item: RunListItem): RunListItem {
+  const excerpt =
+    item.status === "awaiting_input" && Object.prototype.hasOwnProperty.call(overviewNextPendingQuestions, item.id)
+      ? overviewNextPendingQuestions[item.id]
+      : undefined;
+  return excerpt ? { ...item, pending_question: excerpt } : item;
+}
+
 // Overload order mirrors realApi.listRuns: summary first, legacy LAST.
 function mockListRuns(params: {
   repoId?: string;
@@ -323,7 +335,7 @@ function mockListRuns(params?: {
     .filter((r) => !(r.id in mockOtherRunOwners))
     .filter((r) => (params?.repoId ? r.repo_id === params.repoId : true))
     .filter((r) => (params?.issueIid != null ? r.issue_iid === params.issueIid : true))
-    .map((r) => runListItem(harnessOverlay(r)));
+    .map((r) => withPendingQuestion(runListItem(harnessOverlay(r))));
   return delay({ runs: params?.view === "summary" ? items.map(toSummary) : items });
 }
 

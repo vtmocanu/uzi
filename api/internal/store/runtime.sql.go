@@ -17728,6 +17728,48 @@ func (q *Queries) ParkRunsAtWall(ctx context.Context, arg ParkRunsAtWallParams) 
 	return items, nil
 }
 
+const pendingQuestionsForRuns = `-- name: PendingQuestionsForRuns :many
+SELECT run_id, (CASE WHEN octet_length(payload::text) <= 65536 THEN payload ELSE NULL END)::jsonb AS payload
+FROM (
+  SELECT DISTINCT ON (run_id) run_id, payload
+  FROM run_messages
+  WHERE run_id = ANY($1::uuid[])
+    AND kind = 'question'
+  ORDER BY run_id, seq DESC
+) newest
+`
+
+type PendingQuestionsForRunsRow struct {
+	RunID   uuid.UUID `json:"run_id"`
+	Payload []byte    `json:"payload"`
+}
+
+// The newest `question` message per run for a page of awaiting_input runs (PRD #4040,
+// pending_question). The inner query picks the newest row per run FIRST, the outer one
+// then bounds it: an oversized newest payload (over 64 KiB as text) comes back NULL, so
+// it yields no excerpt and never falls back to an older question. A run with no question
+// message returns no row. Served by the partial index idx_run_messages_question_seq
+// (migration 00400).
+func (q *Queries) PendingQuestionsForRuns(ctx context.Context, runIds []uuid.UUID) ([]PendingQuestionsForRunsRow, error) {
+	rows, err := q.db.Query(ctx, pendingQuestionsForRuns, runIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []PendingQuestionsForRunsRow{}
+	for rows.Next() {
+		var i PendingQuestionsForRunsRow
+		if err := rows.Scan(&i.RunID, &i.Payload); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const promoteCodexAccountWaitRun = `-- name: PromoteCodexAccountWaitRun :execrows
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
@@ -21564,6 +21606,8 @@ WITH candidates AS MATERIALIZED (
     WHERE runs.id = $6 AND runs.user_id = $7
   AND runs.status = 'paused'
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
+  -- PRD #3989: a credentials_reset hold is released only by the credential promoter.
+  AND runs.hold_reason IS DISTINCT FROM 'credentials_reset'
   AND NOT runs.policy_preserve_required AND NOT runs.policy_pending_fresh
   AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
@@ -21656,6 +21700,8 @@ UPDATE runs SET
 WHERE runs.id = $6 AND runs.user_id = $7
   AND runs.status = 'paused'
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
+  -- PRD #3989: a credentials_reset hold is released only by the credential promoter.
+  AND runs.hold_reason IS DISTINCT FROM 'credentials_reset'
   AND NOT runs.policy_preserve_required AND NOT runs.policy_pending_fresh
   AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'

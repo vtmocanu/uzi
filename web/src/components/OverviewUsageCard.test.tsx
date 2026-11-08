@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { useState } from "react";
@@ -69,9 +69,27 @@ function Harness({ self, admin, initial = "lifetime", onChange }: {
   );
 }
 const mount = (props: Parameters<typeof Harness>[0]) => render(<MemoryRouter><Harness {...props} /></MemoryRouter>);
+beforeEach(() => { localStorage.clear(); });
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); setDemoMode(false); });
 
 describe("OverviewUsageCard (#3881 M1)", () => {
+  it("draws both usage toggles at one weight, like Issue work's, so a pick never shifts them (#4052)", () => {
+    const { self, admin } = fixture();
+    const view = mount({ self, admin });
+    const weights = () =>
+      ["Usage scope", "Usage reporting period"].flatMap((name) =>
+        within(view.getByRole("group", { name })).getAllByRole("button").map((b) => ({
+          medium: b.classList.contains("font-medium"),
+          semibold: b.classList.contains("font-semibold"),
+        })),
+      );
+    const steady = Array(4).fill({ medium: true, semibold: false });
+    expect(weights()).toEqual(steady);
+    fireEvent.click(view.getByRole("button", { name: "All users" }));
+    fireEvent.click(view.getByRole("button", { name: "Last 7 days" }));
+    expect(weights()).toEqual(steady);
+  });
+
   it("shows the four figures for All time with the cost disclosure and 'at least' per-PR cost sharing its title", () => {
     const { self } = fixture();
     const view = mount({ self });
@@ -181,7 +199,7 @@ describe("OverviewUsageCard (#3881 M1)", () => {
     const view = mount({ self, admin });
     const scope = within(view.getByRole("group", { name: "Usage scope" }));
     expect(scope.getByRole("button", { name: "You" }).getAttribute("aria-pressed")).toBe("true");
-    fireEvent.click(scope.getByRole("button", { name: "Factory · all users" }));
+    fireEvent.click(scope.getByRole("button", { name: "All users" }));
     expect(view.queryByRole("region", { name: "Your usage" })).toBeNull();
     const region = within(view.getByRole("region", { name: "Factory usage" }));
     expect(region.getByText("$2,469")).toBeTruthy();
@@ -196,12 +214,55 @@ describe("OverviewUsageCard (#3881 M1)", () => {
     expect(region.queryByRole("link", { name: "Your failed runs →" })).toBeNull();
   });
 
+  it("remembers the scope choice per browser across a remount", () => {
+    const { self, admin } = fixture();
+    const first = mount({ self, admin });
+    fireEvent.click(first.getByRole("button", { name: "All users" }));
+    expect(JSON.parse(localStorage.getItem("uzi.overviewUsageScope")!)).toBe("all");
+    cleanup();
+    const second = mount({ self, admin });
+    expect(second.getByRole("button", { name: "All users" }).getAttribute("aria-pressed")).toBe("true");
+    expect(second.getByRole("region", { name: "Factory usage" })).toBeTruthy();
+    fireEvent.click(second.getByRole("button", { name: "You" }));
+    cleanup();
+    expect(mount({ self, admin }).getByRole("region", { name: "Your usage" })).toBeTruthy();
+  });
+
+  it("reads an unknown stored value as You", () => {
+    const { self, admin } = fixture();
+    localStorage.setItem("uzi.overviewUsageScope", JSON.stringify("factory"));
+    expect(mount({ self, admin }).getByRole("region", { name: "Your usage" })).toBeTruthy();
+  });
+
+  it("reads as You when storage throws", () => {
+    const { self, admin } = fixture();
+    // A saved "all" first, so only a handled read error can yield You.
+    localStorage.setItem("uzi.overviewUsageScope", JSON.stringify("all"));
+    vi.spyOn(localStorage, "getItem").mockImplementation(() => { throw new Error("denied"); });
+    expect(mount({ self, admin }).getByRole("region", { name: "Your usage" })).toBeTruthy();
+  });
+
+  it("never writes the scope for a non-admin, even with a saved all", () => {
+    const { self } = fixture();
+    localStorage.setItem("uzi.overviewUsageScope", JSON.stringify("all"));
+    const setItem = vi.spyOn(localStorage, "setItem");
+    const view = mount({ self });
+    expect(view.getByRole("region", { name: "Your usage" })).toBeTruthy();
+    fireEvent.click(view.getByRole("button", { name: "Last 7 days" }));
+    expect(setItem).not.toHaveBeenCalledWith("uzi.overviewUsageScope", expect.anything());
+    // Positive control: the same spy sees an admin's write, so the negative above is not vacuous.
+    cleanup();
+    const admin = mount({ self, admin: fixture().admin });
+    fireEvent.click(admin.getByRole("button", { name: "All users" }));
+    expect(setItem).toHaveBeenCalledWith("uzi.overviewUsageScope", JSON.stringify("all"));
+  });
+
   it("does not render the dropped side-by-side or run-count pieces", () => {
     const { self, admin } = fixture();
     const view = mount({ self, admin });
     expect(view.queryByText(/runs with token usage/)).toBeNull();
     expect(view.getAllByRole("region", { name: /^(Your|Factory) usage$/ })).toHaveLength(1);
-    fireEvent.click(view.getByRole("button", { name: "Factory · all users" }));
+    fireEvent.click(view.getByRole("button", { name: "All users" }));
     expect(view.queryByText(/runs with token usage/)).toBeNull();
     expect(view.getAllByRole("region", { name: /^(Your|Factory) usage$/ })).toHaveLength(1);
   });
@@ -215,7 +276,7 @@ describe("OverviewUsageCard (#3881 M1)", () => {
         .toEqual([expect.stringMatching(/^Finished runs: /)]);
     };
     noChart();
-    fireEvent.click(view.getByRole("button", { name: "Factory · all users" }));
+    fireEvent.click(view.getByRole("button", { name: "All users" }));
     noChart();
     fireEvent.click(view.getByRole("button", { name: "Last 7 days" }));
     noChart();
@@ -234,7 +295,7 @@ describe("OverviewUsageCard (#3881 M1)", () => {
   it("masks the failure owner's email in demo mode in the Factory scope", () => {
     const { self, admin } = fixture();
     const view = mount({ self, admin });
-    fireEvent.click(view.getByRole("button", { name: "Factory · all users" }));
+    fireEvent.click(view.getByRole("button", { name: "All users" }));
     const region = within(view.getByRole("region", { name: "Factory usage" }));
     expect(region.getByTitle("owner.person@example.com")).toBeTruthy();
     act(() => setDemoMode(true));
@@ -249,7 +310,7 @@ describe("OverviewUsageCard (#3881 M1)", () => {
     admin.factory.outcomes.last_7_days = { ...admin.factory.outcomes.last_7_days, finished: 40, failed: 2 };
     const view = mount({ self, admin, initial: "last_7_days" });
     expect(view.getByText("−5.0 pp vs all-time 10.0%")).toBeTruthy();
-    fireEvent.click(view.getByRole("button", { name: "Factory · all users" }));
+    fireEvent.click(view.getByRole("button", { name: "All users" }));
     expect(view.getByText("−5.0 pp vs all-time 10.0%")).toBeTruthy();
     cleanup();
     const worse = fixture().self;
@@ -272,7 +333,7 @@ describe("OverviewUsageCard (#3881 M1)", () => {
       fail_origins: { agent_failure: 8, run_timeout: 5, workflow_scope_missing: 3, push_secret_blocked: 2, unknown: 2 },
     };
     const view = mount({ self, admin });
-    fireEvent.click(view.getByRole("button", { name: "Factory · all users" }));
+    fireEvent.click(view.getByRole("button", { name: "All users" }));
     const row = view.getByText("other causes").closest("li")!;
     expect(row.textContent).toBe("other causes4");
     expect(within(row).queryByRole("link")).toBeNull();
@@ -289,7 +350,7 @@ describe("OverviewUsageCard (#3881 M1)", () => {
     const { self, admin } = fixture();
     admin.earliest_run = null;
     const view = mount({ self, admin });
-    fireEvent.click(view.getByRole("button", { name: "Factory · all users" }));
+    fireEvent.click(view.getByRole("button", { name: "All users" }));
     expect(view.queryByText(/across every user/)).toBeNull();
   });
 });
@@ -301,7 +362,7 @@ describe("OverviewUsageCard by-user table (#3881 M2)", () => {
   };
   const factoryView = (props: Parameters<typeof Harness>[0]) => {
     const view = mount(props);
-    fireEvent.click(view.getByRole("button", { name: "Factory · all users" }));
+    fireEvent.click(view.getByRole("button", { name: "All users" }));
     return view;
   };
   const section = (view: ReturnType<typeof mount>) => within(view.getByRole("region", { name: "By user" }));
@@ -318,7 +379,7 @@ describe("OverviewUsageCard by-user table (#3881 M2)", () => {
     const { self, admin } = fixture();
     const view = mount({ self, admin });
     expect(view.queryByRole("region", { name: "By user" })).toBeNull();
-    fireEvent.click(view.getByRole("button", { name: "Factory · all users" }));
+    fireEvent.click(view.getByRole("button", { name: "All users" }));
     expect(view.getByRole("region", { name: "By user" })).toBeTruthy();
     fireEvent.click(view.getByRole("button", { name: "You" }));
     expect(view.queryByRole("region", { name: "By user" })).toBeNull();

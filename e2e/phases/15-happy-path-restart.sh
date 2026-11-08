@@ -32,6 +32,7 @@ pass "PRD #37: run detected + reported the repo's .claude/agents/ roster (repo-c
 say "restart-resilience: down/up (keep volumes) while parked at the gate"
 CLAIMED_BEFORE="$(run_claimed_at "$RUN")"
 [ -n "$CLAIMED_BEFORE" ] || fail "run parked at the gate carries no claimed_at"
+capture_agent_logs 15-happy-path-restart before-down
 "${COMPOSE[@]}" down                      # keeps the named volumes (pgdata, agentdata)
 # The recreated worker re-registers into its EXISTING row using the same join token:
 # UZI_WORKER_TOKEN reaches this (post-#966) subshell via phase 13's `provides` round-trip
@@ -42,6 +43,7 @@ CLAIMED_BEFORE="$(run_claimed_at "$RUN")"
 "${COMPOSE[@]}" up -d --wait db api web forge-fake
 wait_http
 login
+capture_agent_logs 15-happy-path-restart before-up absent-ok
 "${COMPOSE[@]}" up -d --wait agent
 wait_worker_online
 pass "stack restarted; worker back online"

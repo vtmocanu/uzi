@@ -7,7 +7,7 @@
 import type { Board, BoardPrefs, IssueProposal, LatestRun, Run, RunMessage, RunStatus, User, VaultMode, WsEvent } from "../lib/api";
 import { seedUnifiedProgress } from "./data/unifiedProgress";
 import { mockGatedCheckedMessages } from "./data/planCrossCheckGated";
-import { overviewNextOtherRunOwners, overviewNextRuns } from "./data/overviewNext";
+import { overviewNextOtherRunOwners, overviewNextOwnAskingMessages, overviewNextRuns } from "./data/overviewNext";
 import { deriveMockProgress, foreignCooldownRun } from "./runProgress";
 import { mockScenario } from "./mockScenario";
 import {
@@ -151,6 +151,7 @@ function seed(): MockState {
   // hold carries no feed rows of its own, and an empty log opens the run view.
   messages.set("run-cred-disabled", []);
   messages.set("run-cred-disabled-codex", []);
+  messages.set("run-cred-reset", []);
   // Issue #3181: the token-switch holds, empty logs for the same reason.
   messages.set("run-cred-switch-settling", []);
   messages.set("run-cred-switch-unsettled", []);
@@ -177,6 +178,8 @@ function seed(): MockState {
   messages.set("run-andrei-queued", []);
   // ?mock=overview-next runs open without a 404 (empty logs).
   for (const r of overviewNextRuns) if (runs.has(r.id)) messages.set(r.id, []);
+  // PRD #4040: the viewer's own asking run carries the question its excerpt quotes.
+  if (runs.has("run-ov-own-asking")) messages.set("run-ov-own-asking", overviewNextOwnAskingMessages.map((m) => ({ ...m })));
   // Job runs: empty logs, so both open without a 404 (their deliverable is the result panel).
   for (const r of mockJobRuns) messages.set(r.id, []);
   for (const [id, log] of Object.entries(mockChatMessages)) messages.set(id, log.map((m) => ({ ...m })));

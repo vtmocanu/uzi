@@ -242,6 +242,12 @@ func contractCases() []contractCase {
 		// run.zero.json is unchanged) and nested in run.full.json; the standalone pair pins
 		// its own nullability surface (origin members, result).
 		newContractCase[RunJobDTO]("run_job"),
+		// PRD #3989: the admin-issued account reset link (issue response, preview request and
+		// response, redeem request).
+		newContractCase[AccountResetLinkDTO]("account_reset_link"),
+		newContractCase[ResetLinkPreviewRequest]("reset_link_preview_request"),
+		newContractCase[ResetLinkPreviewDTO]("reset_link_preview"),
+		newContractCase[ResetLinkRedeemRequest]("reset_link_redeem_request"),
 	}
 }
 

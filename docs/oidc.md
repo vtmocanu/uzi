@@ -332,7 +332,8 @@ nobody can log in — a known trade-off, not a bug. The seed admin
 recovery is: set `UZI_PASSWORD_LOGIN_ENABLED=true` and restart. This
 re-enables the password form (and `/api/auth/register`) without touching
 anything OIDC-related, and the seed admin can log in with their password
-while the IdP is down.
+while the IdP is down. The seed admin's password is operator config, so it
+cannot receive an admin-issued [reset link](./auth-design.md#accepted-limitations).
 
 ## Troubleshooting
 

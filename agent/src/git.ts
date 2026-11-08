@@ -420,6 +420,17 @@ export type ScratchPublicationKind =
 export type ScratchPublicationStep =
   | "resolve_tip" | "shallow_check" | "object_walk" | "scratch_walk" | "floor_refresh" | "checkpoint_floor";
 
+/** An intrinsic recovery-operation deadline (the withRecoveryOperation clock or the per-process remaining budget).
+ *  The message is load-bearing for existing text matchers; the type lets the retained loop classify without text. */
+export class RecoveryDeadlineExhaustedError extends Error {
+  constructor() { super("recovery deadline exhausted"); }
+}
+
+/** reserveRecoveryIteration refused because the episode window is spent (attempts or deadline). */
+export class RecoveryBudgetExhaustedError extends Error {
+  constructor() { super("recovery budget exhausted"); }
+}
+
 export class ScratchPublicationError extends Error {
   readonly code = "scratch_publication_refused";
   readonly kind: ScratchPublicationKind;
@@ -1475,11 +1486,19 @@ export type OrphanReason = "http" | "transport_unknown" | "nonterminal_owner" | 
  *  Only these literals leave the diagnostics boundary; anything else is written as `unknown`. */
 export type OrphanRetirementSubreason =
   | "fenced_source" | "pair_changed" | "completion_pending" | "completion_preflight_retained" | "completion_unverified"
-  | "completion_uncertain" | "completion_unsupported" | "authority_busy" | "published_source_retained" | "unknown";
+  | "completion_uncertain" | "completion_unsupported" | "authority_busy" | "published_source_retained" | "remediation_retained" | "unknown";
 const ORPHAN_RETIREMENT_SUBREASONS: ReadonlySet<string> = Object.freeze(new Set<string>([
   "fenced_source", "pair_changed", "completion_pending", "completion_preflight_retained", "completion_unverified",
-  "completion_uncertain", "completion_unsupported", "authority_busy", "published_source_retained", "unknown",
+  "completion_uncertain", "completion_unsupported", "authority_busy", "published_source_retained", "remediation_retained", "unknown",
 ]));
+/** issue #4058: a release, retirement or detach was refused because the journal carries an active remediation
+ *  recovery record. Nothing was written; only a reviewed owner proof may clear such a journal. */
+export class RemediationRecoveryRetainedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RemediationRecoveryRetainedError";
+  }
+}
 export type RunnerCloneRetireResult = "quarantined" | "source-already-absent";
 export interface OrphanDiagnostics {
   logger: Logger;
@@ -3195,9 +3214,9 @@ export class GitCache {
     const combined = AbortSignal.any([signal, timeout.signal, ...(parent ? [parent.signal] : []),
       ...(budget ? [budget.signal] : []), ...(pending ? [pending] : [])]);
     const timer = Number.isFinite(deadline)
-      ? setTimeout(() => timeout.abort(new Error("recovery deadline exhausted")), Math.max(0, deadline - Date.now()))
+      ? setTimeout(() => timeout.abort(new RecoveryDeadlineExhaustedError()), Math.max(0, deadline - Date.now()))
       : undefined;
-    if (Date.now() >= deadline) timeout.abort(new Error("recovery deadline exhausted"));
+    if (Date.now() >= deadline) timeout.abort(new RecoveryDeadlineExhaustedError());
     const run = async (): Promise<T> => {
       combined.throwIfAborted();
       budget?.check();
@@ -3240,7 +3259,7 @@ export class GitCache {
     // Native execFile requires an unsigned integer timeout. Rounding down also
     // keeps the per-operation cap within the absolute remaining budget.
     const remaining = Math.floor(Math.min(operation.deadline - Date.now(), operation.budget?.remainingMs() ?? Infinity));
-    if (remaining <= 0) throw new Error("recovery deadline exhausted");
+    if (remaining <= 0) throw new RecoveryDeadlineExhaustedError();
     return remaining;
   }
   /** An awaited supervisor may hand back a root after the deadline. Stop and
@@ -7935,16 +7954,19 @@ export class GitCache {
   async readOrphanJournalFence(
     barePath: string, branch: string, ownerRunId: string, clonePath: string,
     signal?: AbortSignal,
-  ): Promise<{ state: "changed" } | { state: "unfenced"; retained: boolean } |
-    { state: "fenced"; fence: CompletionSourceFence; attemptId?: string; retained: boolean }> {
+  ): Promise<{ state: "changed" } | { state: "unfenced"; retained: boolean; remediation?: "exact" | "mismatch" } |
+    { state: "fenced"; fence: CompletionSourceFence; attemptId?: string; retained: boolean; remediation?: "exact" | "mismatch" }> {
     return this.withLock(barePath, async () => {
       await this.assertRecoveryBare(barePath);
       const journal = await this.readRecoveryCapture(barePath, branch);
       if (!journal || journal.runId !== ownerRunId || journal.clonePath !== clonePath) return { state: "changed" as const };
       const retained = !!journal.recovery || !!journal.retainedSources?.length;
-      if (!this.authorityRequired || journal.completionSourceFence === undefined) return { state: "unfenced" as const, retained };
+      // issue #4058: the parse already binds the record to (run, path, attempt); the branch is checked here.
+      const remediation = journal.remediationRecovery === undefined ? {}
+        : { remediation: journal.remediationRecovery.branch === branch ? "exact" as const : "mismatch" as const };
+      if (!this.authorityRequired || journal.completionSourceFence === undefined) return { state: "unfenced" as const, retained, ...remediation };
       return {
-        state: "fenced" as const, fence: journal.completionSourceFence, retained,
+        state: "fenced" as const, fence: journal.completionSourceFence, retained, ...remediation,
         ...(journal.attemptId === undefined ? {} : { attemptId: journal.attemptId }),
       };
     }, signal);
@@ -8410,6 +8432,8 @@ export class GitCache {
    * one deliberate fence-carrying clear outside the certified retirement, and is not refused. */
   async detachTerminalRetained(barePath: string, branch: string, key: string, expected: RecoveryJournalEntry): Promise<void> {
     expected = parseRecoveryJournal(JSON.stringify(expected));
+    const remediationRefusal = () => new RemediationRecoveryRetainedError("remediation recovery detach requires proof");
+    if (expected.remediationRecovery) throw remediationRefusal();
     await this.withLock(barePath, async () => {
       await this.refuseMarkedPaths(barePath, this.recoverySources(expected).map((x) => x.clonePath), expected.runId);
       const records = await this.protectedRecoveries(barePath);
@@ -8417,6 +8441,8 @@ export class GitCache {
       const value = JSON.stringify({ version: 1, branch, key, journal: expected });
       if (prior && JSON.stringify({ version: 1, ...prior }) !== value) throw new Error("conflicting protected recovery descriptor");
       const current = await this.readRecoveryCapture(barePath, branch);
+      // issue #4058: refuse before any write when a remediation record is present, expected or under the lock.
+      if (current?.remediationRecovery) throw remediationRefusal();
       if (prior) await this.checkedRecovery(barePath, branch, key, expected, true, prior.journal);
       if (prior && (!current || current.runId !== expected.runId)) return;
       if (!current || JSON.stringify(current) !== JSON.stringify(expected)) throw new Error("terminal recovery snapshot changed");
@@ -8822,7 +8848,7 @@ export class GitCache {
   /** Throws {@link CompletionSourceFenceError} before any effect when {@link dropsFence}. */
   private refuseFenceDrop(journal: RecoveryJournalEntry | undefined, op: string): void {
     if (journal?.remediationRecovery && op !== "discardRetainedRecovery")
-      throw new Error("remediation recovery rebind requires proof");
+      throw new RemediationRecoveryRetainedError("remediation recovery rebind requires proof");
     if (this.dropsFence(journal)) {
       throw new CompletionSourceFenceError(`${op}: the journal carries a completion source fence; only a certified retirement may clear it`);
     }
@@ -9061,7 +9087,7 @@ export class GitCache {
       if (old?.stage === "blocked" && !renewal) throw new Error("recovery episode is blocked");
       if (old && !renewal && (old.attempts >= 3 || (!newWindow && now >= old.deadline))) {
         await this.writeRecovery(barePath, branch, { ...journal, recovery: { ...old, stage: "blocked", blocker: "budget_exhausted" } });
-        throw new Error("recovery budget exhausted");
+        throw new RecoveryBudgetExhaustedError();
       }
       const source = old?.source ?? recoverySource({ runId: journal.runId, clonePath: journal.clonePath,
         ...(journal.attemptId ? { attemptId: journal.attemptId } : {}) });
@@ -13727,7 +13753,7 @@ export class GitCache {
       }
       // issue #3404 M2: only a certified completion retirement (checked against its expectedFence below)
       // may clear a fenced journal; any other retirement (orphan reclaim included) refuses before effects.
-      if (pending.remediationRecovery) throw new Error("remediation recovery retirement requires proof");
+      if (pending.remediationRecovery) throw new RemediationRecoveryRetainedError("remediation recovery retirement requires proof");
       if (!opts.completionSource) this.refuseFenceDrop(pending, "retireRunnerClone");
       // issue #1786: a marked stopped canonical source is retired only by the operator discard.
       checkProcessProof();
@@ -19666,7 +19692,8 @@ try {
       if (err instanceof RunResidueBlockedError) throw err;
       const abort = this.boundaryAbortError(err);
       if (abort) throw abort;
-      const failure = this.transferRetainedCause(err, new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`));
+      const failure = this.transferRetainedCause(err,
+        new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`, recoveryDeadlineCause(err)));
       const stderr = (err as { stderr?: unknown })?.stderr;
       retainedGitDiagnostics.set(failure, {
         stderr: typeof stderr === "string" ? stderr : "",
@@ -19705,7 +19732,7 @@ try {
       if (err instanceof RunResidueBlockedError) throw err;
       const abort = this.boundaryAbortError(err);
       if (abort) throw abort;
-      const failure = new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
+      const failure = new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`, recoveryDeadlineCause(err));
       const stderr = (err as { stderr?: unknown })?.stderr;
       retainedGitDiagnostics.set(failure, {
         stderr: typeof stderr === "string" ? stderr : "",
@@ -19775,7 +19802,7 @@ try {
       if (err instanceof RunResidueBlockedError) throw err;
       const abort = this.boundaryAbortError(err);
       if (abort) throw abort;
-      throw new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
+      throw new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`, recoveryDeadlineCause(err));
     }
   }
 
@@ -23985,6 +24012,21 @@ function addedLinesOfDiff(diff: string): string {
 function isOutputOverflow(err: unknown): boolean {
   const e = err as { code?: unknown; message?: unknown };
   return e.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" || /output exceeded|maxBuffer/i.test(String(e.message ?? ""));
+}
+
+/** issue #3980: the Error options for a `git ... failed: ...` wrapper. Keeps the raw cause ONLY when the
+ *  failure is this process's own recovery-deadline stop (the bare "recovery deadline exhausted" Error that
+ *  recoveryRemaining throws, with no git stderr, or the TimeoutError of an abort signal that had already fired
+ *  before the child started; an abort during a child arrives as an AbortError that boundaryAbortError takes first), so the runner's
+ *  gate classifier can recognise a deadline stop that the wrapper's message alone cannot distinguish from a
+ *  git failure. Every other failure keeps no cause. */
+function recoveryDeadlineCause(err: unknown): { cause: Error } | undefined {
+  if (!(err instanceof Error)) return undefined;
+  const stderr = (err as { stderr?: unknown }).stderr;
+  if (err.name === "TimeoutError" || (err.message === "recovery deadline exhausted" && typeof stderr !== "string")) {
+    return { cause: err };
+  }
+  return undefined;
 }
 
 function gitErrorMessage(err: unknown): string {

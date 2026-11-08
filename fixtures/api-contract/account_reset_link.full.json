@@ -1,0 +1,6 @@
+{
+  "token": "x",
+  "expires_at": "2020-01-02T03:04:05Z",
+  "kind": "x",
+  "target_is_admin": true
+}

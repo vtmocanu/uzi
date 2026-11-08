@@ -152,12 +152,90 @@ Unattended continuity is outside this feature's scope.
 Losing a password/passphrase does not imply immediate loss while usable key
 material remains (for example a cached DEK or usable browser grant). Losing
 both the password/passphrase and remaining usable key material makes protected
-contents unrecoverable; this feature adds no password-reset, passphrase-change
-or recovery workflow.
+contents unrecoverable; this feature adds no passphrase-change or recovery
+workflow. The only way back is the destructive
+[admin-issued account reset](#admin-issued-account-reset) below.
 
 This threat-model review records the bearer capability and accepted residuals.
 Executed checks and independent security review evidence belong in the
 implementation PR; this analysis does not certify those checks.
+
+## Admin-issued account reset
+
+An admin can issue a one-time reset link for another active, non-seed user
+(PRD #3989; flow in [Auth design](./auth-design.md#accepted-limitations)). It
+never restores vault contents; a `password` link also restores password access,
+and a `vault_only` link grants no access.
+
+- **What redemption deletes.** Every `user_secrets` row of every kind and every
+  Codex account (live and recovery slots), whatever their sealing marker, plus
+  the vault wrapper and all browser re-unlock grants. The account becomes
+  protected with no wrapper; after a `password` link the next password login
+  creates a fresh vault (after a `vault_only` link, see below). The
+  reset never rewraps or reuses a cached key, even while the vault is unlocked,
+  so it cannot be used to read the user's credentials. Forge connections,
+  repos, schedules, run history, settings, CLI tokens and product OAuth grants
+  are untouched apart from credential references: the sidebar's Codex account
+  list is cleared, references to deleted credentials in judge, worker, run and
+  schedule settings and in run credential history become empty, and per-credential
+  rate-limit and Codex account state is deleted with its credential.
+- **Admin takeover.** An admin can take over any non-seed account that has a
+  password, other admins included, by issuing a `password` link and redeeming it
+  themselves with a password they choose. A `vault_only` link cannot do this: it
+  sets no password and signs no one in, so its holder can delete the user's
+  credentials, vault and sessions without proving identity but cannot take the
+  account over. The admin never learns the user's old password and cannot read the
+  deleted credentials, but then controls the account's non-vault data. Issuing
+  needs no admin re-authentication. Issue and redeem are logged
+  (`reset link issued`, `reset link redeemed`, with user ids and whether the
+  target is an admin, never the token). The seed admin and the issuer's own
+  account are refused. A link is void if its issuer is later deactivated or
+  demoted.
+- **SSO-only instances.** With password login disabled, the web app offers no
+  way to create the fresh vault: it is created at the first password sign-in
+  once an administrator turns password sign-in on, or through
+  `POST /api/vault/enable` with the new password from an SSO session. Until
+  then the user can sign in through SSO but cannot store model credentials. This
+  applies to a `password` link redeemed on such an instance. A user with no
+  password (SSO-only account) gets a `vault_only` link instead (below).
+- **Vault-only reset (users with no password).** An admin can issue a
+  `kind=vault_only` link for an account that has no password. Redeeming it asks
+  for no password, ends the user's browser sessions (`token_version` bump) and
+  denies approved CLI login requests. It deletes the same credentials, Codex
+  logins and vault as a password reset and leaves the account protected with no
+  vault. The user signs in through SSO, the app-wide banner asks for a new vault
+  passphrase through the existing create path (`POST /api/vault/passphrase`),
+  and they add their credentials again. An account linked to both SSO and a
+  password gets a `password` link. The seed admin, the issuer's own account and
+  deactivated targets are still refused.
+- **Running runs.** A run already executing keeps the credential its worker was
+  issued until it ends; stopping or fencing active runs is out of scope. The
+  same holds for a claim whose delivery committed before the reset (the reset
+  waits for it). A Claude or chat claim for a run created before the reset,
+  assembled but not yet delivered when the reset commits, delivers nothing:
+  it parks on `credentials_reset` (a job, judge or cross_check claim fails
+  instead). A run created while the reset transaction is still open is not
+  covered by this check, since the reset marker carries the transaction's
+  start time: if its claim opened the old credential before the reset
+  committed, it is delivered on that credential. A running run's
+  Codex refresh writes against a deleted account fail closed. Queued runs are
+  not claimed until the new vault exists and is unlocked. After that, a
+  Claude-harness or chat run created before the reset that finds no model
+  credential at claim parks (`paused`, `hold_reason` `credentials_reset`)
+  instead of failing. It resumes automatically when the owner adds a credential
+  (promoted on secret create, vault unlock and the periodic sweep), parks again
+  if the credential vanishes before the claim, and refuses manual resume with
+  409. Judge, job and cross_check runs are unchanged, and runs created after the
+  reset fail without a credential. A Codex run created before the reset has its
+  Codex login binding frozen and its bound login deleted, so it fails terminally
+  ("the bound Codex login is unavailable after your account reset; start a new
+  run", `fail_origin` `credential_unavailable`). Claude runs that resolve to an
+  auto-bound worker wait in the credential pool (`pool_wait`) until a credential
+  exists.
+- **Uncertain outcome.** If the commit cannot be confirmed the redeem call
+  returns `503` with "the reset could not be confirmed; try signing in with the
+  new password, or ask for a new link" for a `password` link, or "...try signing
+  in with single sign-on, or ask for a new link" for a `vault_only` link.
 
 ## CLI unlock: authenticated guessing and key custody
 

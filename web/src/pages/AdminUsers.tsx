@@ -1,10 +1,12 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useAuth } from "../auth/AuthContext";
-import { api, type User } from "../lib/api";
+import { api, type AccountResetLink, type User } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { Alert, Badge, Button, Card, ListSkeleton } from "../components/ui";
 import { AdminShell } from "../components/AdminShell";
+import { Modal } from "../components/Modal";
+import { XIcon } from "../components/icons";
 import { useDemoMode } from "../lib/demoMode";
 import { maskEmail, maskName } from "../lib/demoMask";
 
@@ -34,6 +36,8 @@ export function AdminUsers() {
   // the admin settings; a failed read leaves it false so the toggle stays live rather
   // than falsely claiming to be inert.
   const [ciAutofixInstanceOff, setCiAutofixInstanceOff] = useState(false);
+  // The user an admin is issuing a reset link for (PRD #3989); null when no dialog is open.
+  const [resetTarget, setResetTarget] = useState<User | null>(null);
 
   const { loading, error: loadError } = useAsyncData(
     async ({ isCurrent }) => {
@@ -201,14 +205,23 @@ export function AdminUsers() {
                       {u.id === me?.id ? (
                         <span className="text-xs text-faint">you</span>
                       ) : (
-                        <Button
-                          variant={u.is_active ? "danger" : "secondary"}
-                          size="sm"
-                          disabled={busyId === u.id}
-                          onClick={() => toggle(u)}
-                        >
-                          {u.is_active ? "Deactivate" : "Activate"}
-                        </Button>
+                        <div className="flex items-center justify-end gap-2">
+                          {/* A reset link needs a live account to land on: hidden for an
+                              inactive user (the server refuses it too) and for yourself. */}
+                          {u.is_active && (
+                            <Button variant="ghost" size="sm" onClick={() => setResetTarget(u)}>
+                              Reset link
+                            </Button>
+                          )}
+                          <Button
+                            variant={u.is_active ? "danger" : "secondary"}
+                            size="sm"
+                            disabled={busyId === u.id}
+                            onClick={() => toggle(u)}
+                          >
+                            {u.is_active ? "Deactivate" : "Activate"}
+                          </Button>
+                        </div>
                       )}
                     </td>
                   </tr>
@@ -218,6 +231,185 @@ export function AdminUsers() {
           </div>
         </Card>
       )}
+      {resetTarget && (
+        <ResetLinkDialog
+          user={resetTarget}
+          label={maskEmail(resetTarget.email, demo)}
+          onClose={() => setResetTarget(null)}
+        />
+      )}
     </AdminShell>
+  );
+}
+
+// ResetLinkDialog issues a one-time account reset link (PRD #3989) in two steps: a
+// confirmation that spells out what redeeming destroys, then the link itself, shown
+// exactly once. Only the token's hash is stored, so closing the dialog drops the only
+// copy; the admin issues a new link (which cancels this one) if it is lost.
+function ResetLinkDialog({ user, label, onClose }: { user: User; label: string; onClose: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [issued, setIssued] = useState<AccountResetLink | null>(null);
+  const [copied, setCopied] = useState(false);
+  const resultRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (issued) resultRef.current?.focus();
+  }, [issued]);
+
+  // The token rides the URL fragment, never the path or a query (D9), so it stays out of
+  // access logs and Referer headers.
+  const url = issued ? `${window.location.origin}/reset#${issued.token}` : "";
+  // The issue response's snapshot decides the admin warning once a link exists; before
+  // that, the row's role is the best available answer.
+  const targetIsAdmin = issued ? issued.target_is_admin : user.is_admin;
+
+  const create = async () => {
+    setError("");
+    setBusy(true);
+    try {
+      setIssued(await api.createResetLink(user.id));
+    } catch (err) {
+      setError(errorMessage(err, "Could not create the reset link"));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+    } catch {
+      // Clipboard may be unavailable (insecure context); the link stays visible to copy by hand.
+    }
+  };
+
+  return (
+    <Modal label={`Reset link for ${label}`} onClose={onClose} closeOnBackdrop={!busy && !issued}>
+      <div className="my-8 w-full max-w-lg overflow-hidden rounded-2xl border border-edge-strong bg-surface shadow-2xl">
+        <div className="flex items-start justify-between gap-3 border-b border-edge px-5 py-4">
+          <div className="min-w-0">
+            <h2 className="text-base font-semibold">
+              {issued ? "Reset link created" : "Create a reset link?"}
+            </h2>
+            <p className="mt-0.5 truncate text-xs text-muted">{label}</p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={busy}
+            aria-label="Close"
+            className="rounded-md p-1 text-muted hover:bg-raised hover:text-fg"
+          >
+            <XIcon />
+          </button>
+        </div>
+
+        {issued ? (
+          <div ref={resultRef} tabIndex={-1} className="space-y-4 px-5 py-5 outline-hidden">
+            <p className="text-sm text-muted">
+              Copy it now. It is shown <strong className="text-fg">only once</strong> and cannot be retrieved
+              again; if it is lost, create a new link, which cancels this one.
+            </p>
+            <div className="flex items-center gap-2">
+              <code
+                aria-label="Reset link"
+                className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap rounded-lg border border-edge bg-ink console px-3 py-2 font-mono text-sm text-ok"
+              >
+                {url}
+              </code>
+              <Button variant="secondary" onClick={copy}>
+                {copied ? "Copied" : "Copy"}
+              </Button>
+            </div>
+            <dl className="divide-y divide-edge rounded-lg border border-edge bg-raised/40 text-sm">
+              <div className="flex justify-between gap-3 px-3 py-2">
+                <dt className="text-muted">Expires</dt>
+                <dd className="text-fg">{new Date(issued.expires_at).toLocaleString()}</dd>
+              </div>
+              <div className="flex justify-between gap-3 px-3 py-2">
+                <dt className="text-muted">Resets</dt>
+                <dd className="text-fg">
+                  {issued.kind === "vault_only" ? "Vault only (single sign-on account)" : "Password and vault"}
+                </dd>
+              </div>
+            </dl>
+            {issued.kind === "vault_only" && (
+              <p className="text-sm text-muted">
+                This account has no password. The user signs in with single sign-on, then sets a new vault passphrase.
+              </p>
+            )}
+            {targetIsAdmin && <AdminResetWarning kind={issued.kind} />}
+          </div>
+        ) : (
+          <div className="space-y-4 px-5 py-5">
+            {error && <Alert message={error} />}
+            <p className="text-sm text-muted">
+              Hand the link to this person yourself; uzi sends no email. It works once and expires an hour after
+              you create it. When they redeem it:
+            </p>
+            <ul className="list-disc space-y-1.5 pl-5 text-sm text-fg">
+              <li>
+                Their model credentials (Anthropic and OpenAI tokens, Codex logins) and their vault contents are
+                permanently deleted.
+              </li>
+              <li>
+                All their browser sessions end. A CLI login they already approved but have not finished is refused; one
+                still waiting for approval stays pending, but their old sessions can no longer approve it.
+              </li>
+              <li>Their queued Codex runs will fail; they must start new ones.</li>
+            </ul>
+            {targetIsAdmin && <AdminResetWarning kind={null} />}
+          </div>
+        )}
+
+        <div className="flex items-center justify-end gap-2 border-t border-edge bg-ink/40 inset-panel px-5 py-3.5">
+          {issued ? (
+            <Button size="sm" onClick={onClose}>
+              Done
+            </Button>
+          ) : (
+            <>
+              <Button variant="ghost" size="sm" disabled={busy} onClick={onClose}>
+                Cancel
+              </Button>
+              <Button variant="dangerSolid" size="sm" disabled={busy} onClick={create}>
+                {busy ? "Creating…" : "Create reset link"}
+              </Button>
+            </>
+          )}
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+// AdminResetWarning words the admin caveat for what is known at that point. Before the link
+// exists its kind is unknown (the row carries no has-password flag), so the pre-issue text
+// holds for both kinds; the issued result knows the kind and states only what is true for it.
+function AdminResetWarning({ kind }: { kind: AccountResetLink["kind"] | null }) {
+  return (
+    <div role="note" className="rounded-md border border-warn/40 bg-warn/10 p-3 text-sm text-warn">
+      {kind === "password" && (
+        <>
+          This is an admin account. Whoever holds the link takes over an admin account: share it only with that
+          person, over a trusted channel.
+        </>
+      )}
+      {kind === "vault_only" && (
+        <>
+          This is an admin account. The link sets no password and gives no access to the account, but whoever holds
+          it can delete the admin&apos;s credentials, vault and sessions: share it only with that person.
+        </>
+      )}
+      {kind === null && (
+        <>
+          This is an admin account. If it has a password, whoever holds the link can set a new one and take the
+          account over. Either way the link deletes the admin&apos;s credentials and vault: share it only with that
+          person, over a trusted channel.
+        </>
+      )}
+    </div>
   );
 }

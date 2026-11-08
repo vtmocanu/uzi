@@ -1174,7 +1174,8 @@ export interface LatestRun {
   // hold_reason (PRD #1226/#1497/#1732): why a `paused` run is server-held, null for an owner
   // pause or a non-paused run. Non-sensitive, so the board projection sends it on every card
   // (api/internal/handler/board.go latestRunDTO.HoldReason). effectiveRunStatus overlays
-  // 'credential_disabled' so the card reads "waiting: credential disabled", not "paused", and
+  // 'credential_disabled' so the card reads "waiting: credential disabled", not "paused",
+  // 'credentials_reset' (PRD #3989) likewise reads "waiting: credentials were reset", and
   // the issue #3181 token-switch holds ('credential_switch_settling' / 'credential_switch_unsettled')
   // so they read "settling: token switch" / "held: token switch".
   // 'base_attestation_missing' (issue #3194) reads "base unverified: owner hold" likewise.
@@ -2253,6 +2254,39 @@ export interface CliAuthRequestMeta {
   client_desc: string;
   status: CliAuthStatus;
   expires_at: string;
+}
+
+// ── Admin-issued account reset link (PRD #3989) ───────────────────────────────
+// kind says what redeeming does: "password" sets a new login password, "vault_only"
+// (an SSO-only account, M2) only resets the vault. Both delete every model credential.
+export type ResetLinkKind = "password" | "vault_only";
+
+// AccountResetLink is the 201 of POST /api/admin/users/{id}/reset-link. The plaintext
+// token appears here exactly once (only its hash is stored); the web composes
+// `${origin}/reset#<token>` and never sends the token anywhere but a POST body.
+export interface AccountResetLink {
+  token: string;
+  expires_at: string;
+  kind: ResetLinkKind;
+  target_is_admin: boolean;
+}
+
+// ResetLinkPreview is the 200 of POST /api/auth/reset/preview. Every invalid-link
+// cause is one generic 404 instead.
+export interface ResetLinkPreview {
+  kind: ResetLinkKind;
+  expires_at: string;
+}
+
+// Request bodies of the two unauthenticated reset endpoints. The token rides the
+// body, never a path or query. password is required for kind=password and must be
+// absent for kind=vault_only.
+export interface ResetLinkPreviewRequest {
+  token: string;
+}
+export interface ResetLinkRedeemRequest {
+  token: string;
+  password?: string;
 }
 
 // ── OAuth consent flow (PRD #1910 M2) ─────────────────────────────────────────
@@ -3980,8 +4014,8 @@ export interface Run {
    *  a finite timestamp schedules a retry, see disk_park_count);
    *  "provider_outage" is a counted provider interruption with a scheduled retry;
    *  "retained_recovery_exhausted" can be timed or owner-held (see recovery_retry_not_before);
-   *  "retained_recovery_adoption_failed" means integrity checks refused adoption of retained
-   *  work: always owner-held with local work and custody preserved, no automatic retry.
+   *  "retained_recovery_adoption_failed" is an integrity hold: retained adoption or a predecessor
+   *  remediation record refused source use (the agent did not start): always owner-held with local work and custody preserved, no automatic retry.
    *  Only the owner can Resume or Cancel, through the existing owner authorization.
    *  "retained_continuation_unwitnessed" (issue #3859) means a retained-custody continuation's
    *  claimed worker flight was never witnessed starting or departing within a bounded window;
@@ -4148,7 +4182,9 @@ export interface Run {
    *
    *  `hold_reason` names why a `paused` run is server-held, else null: 'completion_blocked' for
    *  a completion hold, 'credential_disabled' for a run waiting on a disabled credential
-   *  (PRD #1732 D14; resumes on Enable, never on a plain Resume), 'budget_exhausted' for a
+   *  (PRD #1732 D14; resumes on Enable, never on a plain Resume), 'credentials_reset' for a run
+   *  created before an account reset that waits for a new credential (PRD #3989; resumes
+   *  automatically once one exists), 'budget_exhausted' for a
    *  wall-clock park (PRD #1497), and 'provider_unavailable' for a provider outage bound
    *  reached (PRD #1733; owner Resume, scoped Stop when permitted, or Cancel).
    *  Issue #3181: 'credential_switch_settling' when an owner token switch on a retained-recovery
@@ -4502,6 +4538,12 @@ export interface RunListItem extends Run {
    *  appends it only when > 0. */
   judge_verdict: JudgeVerdict | null;
   judge_todo_count: number;
+
+  /** PRD #4040: a one-line, sanitized excerpt (at most 280 characters plus " (+N more)")
+   *  of the newest pending question, set only on the viewer's own awaiting_input rows of
+   *  GET /api/runs. Absent otherwise, and never on the admin list. Untrusted model text:
+   *  render as plain text. */
+  pending_question?: string;
 
   repo_path: string;
   worker_name: string | null;

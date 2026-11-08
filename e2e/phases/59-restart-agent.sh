@@ -21,6 +21,7 @@
 # 60-62 FAIL fast on requires-validation (naming restart-agent) instead of timing out
 # with runs stuck in `queued`.
 say "restart the agent worker (stopped by 50; 51 needed it down) before the schedule phases 60-62"
+capture_agent_logs 59-restart-agent before-up
 "${COMPOSE[@]}" up -d --wait agent
 wait_worker_online
 pass "agent worker back online for the schedule phases"

@@ -1,6 +1,7 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { RequestError } from "../src/client.js";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { RecoveryCoordinator } from "../src/recovery.js";
 import type { RecoveryReleaseResponse, RunOwnershipResponse, StateAck, StateRequest } from "../src/protocol.js";
@@ -203,6 +204,25 @@ it("a same-generation terminal ownership probe settles after a lost park acknowl
     disposition: { kind: "settled", coverage_digest: EMPTY_DIGEST } }]);
   assert.equal(r.events.includes("report:failed"), false);
 });
+
+// issue #3856: a permanently refused ownership probe is not proof the run ended, so it never settles custody.
+// The probe answers a terminal same-generation status on its SECOND call (the positive control above), so an
+// unfixed build that retries would release the hold; the first assertion pins the single probe.
+for (const status of [401, 403]) {
+  it(`a permanent ${status} ownership refusal after a lost park acknowledgement keeps guarded custody`, async () => {
+    const r = rig({ parkTransportFailure: "always" });
+    let probes = 0;
+    client.getRunOwnership = async () => {
+      if (++probes === 1) throw new RequestError("GET", "/ownership", status, "refused");
+      return { status: "failed", claim_generation: GEN, inventory_guarded: true };
+    };
+    await r.run(9140 + status % 100, async () => { throw TRANSIENT(); });
+    assert.equal(probes, 1, "a permanent refusal is not retried");
+    assert.deepEqual(r.releases, [], "no custody is released on an unknown outcome");
+    assert.equal(r.events.includes("report:failed"), false);
+    assert.equal(r.events.filter(e => e === "report:recovery_wait").length, 1, "no further park report");
+  });
+}
 
 it("a resend after a running ownership probe settles the terminal acknowledgement", async () => {
   const r = rig({ parkTransportFailure: "once", parkAck: { applied: true, status: "failed" },

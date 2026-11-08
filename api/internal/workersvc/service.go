@@ -817,6 +817,8 @@ type Store interface {
 	// /runs + board + run-view current_activity (PRD #1064 M2): the newest tool_use frame
 	// per run for a page, folded into the "now" line in Go by runactivity.FromFrame.
 	LatestToolUseForRuns(ctx context.Context, runIds []uuid.UUID) ([]store.LatestToolUseForRunsRow, error)
+	// PRD #4040: the newest question payload per run, NULL when over 64 KiB (owner-scoped ids only).
+	PendingQuestionsForRuns(ctx context.Context, runIds []uuid.UUID) ([]store.PendingQuestionsForRunsRow, error)
 	// PRD #1353 run-view milestones_live: the three runtime reads milestonelanes.Derive folds
 	// into per-in-progress-milestone live lanes — the newest tool_use frame per live subagent
 	// instance (LiveLaneFramesForRun), the lead-lane Agent dispatch frames that carry each
@@ -1338,8 +1340,12 @@ type Store interface {
 	ListChatRunsForUser(ctx context.Context, userID uuid.UUID) ([]store.ListChatRunsForUserRow, error)
 	GetLiveChatForUser(ctx context.Context, userID uuid.UUID) (store.Run, error)
 	ClaimChatRun(ctx context.Context, arg store.ClaimChatRunParams) (store.Run, error)
-	// ParkCredentialDisabledChatRun holds a claimed chat on credential_disabled (PRD #1732 D2).
+	// ParkCredentialDisabledChatRun holds a claimed chat on credential_disabled (PRD #1732 D2)
+	// or credentials_reset (PRD #3989), per its HoldReason.
 	ParkCredentialDisabledChatRun(ctx context.Context, arg store.ParkCredentialDisabledChatRunParams) (int64, error)
+	// GetUserCredentialsResetAt is the PRD #3989 reset marker the chat lane reads to park a chat on
+	// credentials_reset; NULL means the owner never redeemed an account reset link.
+	GetUserCredentialsResetAt(ctx context.Context, id uuid.UUID) (pgtype.Timestamptz, error)
 	GetChatRunClaimContext(ctx context.Context, runID uuid.UUID) (pgtype.Text, error)
 	CountChatFollowUps(ctx context.Context, runID uuid.UUID) (int64, error)
 	SweepIdleChatRuns(ctx context.Context, cutoff pgtype.Timestamptz) ([]store.SweepIdleChatRunsRow, error)
@@ -3796,6 +3802,13 @@ func (s *Service) recoverClaimAssembly(ctx context.Context, run store.Run, err e
 // run failure reason (it never includes secret bytes).
 var errCredentialUnavailable = errors.New("credential unavailable")
 
+// errNoModelCredential is the narrow errCredentialUnavailable case "the owner holds no Anthropic
+// token for this claim" (PRD #3989 M3). It wraps errCredentialUnavailable, so its text and every
+// existing errors.Is(err, errCredentialUnavailable) consumer are unchanged. finishRunClaimTx keys
+// the credentials_reset park on it, never on errCredentialUnavailable, which also covers
+// forge-origin refusal, repo-owner mismatch and an undecryptable token or PAT.
+var errNoModelCredential = fmt.Errorf("%w: no Anthropic token configured for this user", errCredentialUnavailable)
+
 // errRunVanished marks a claim whose run disappeared before its payload could be
 // assembled (a cascading delete of the forge connection).
 var errRunVanished = errors.New("run vanished before claim assembly")
@@ -4431,6 +4444,15 @@ type StateRequest struct {
 	// (validateDiskParkPreventive). httpx.DecodeJSON rejects unknown fields, so a worker sends it
 	// only once the api advertises the recovery_cause_data_volume_full feature.
 	DiskParkPreventive *bool `json:"disk_park_preventive"`
+	// RetainedCapacityOnly qualifies a recovery_cause "retained_recovery_exhausted" park (issue
+	// #4046): true means every recovery attempt in the worker's window was refused for disk
+	// capacity, so the park takes the at-cap branch (no retained_park_count increment, NULL retry
+	// deadline, an owner-held recovery_wait). Request-only; nothing is persisted. SetState rejects
+	// it with any other state or cause, a false value, or a missing or non-positive
+	// claim_generation as ErrInvalidState (400) before any SQL (validateRetainedCapacityOnly).
+	// httpx.DecodeJSON rejects unknown fields, so a worker sends it only once the api advertises
+	// the retained_recovery_capacity_hold_v1 feature.
+	RetainedCapacityOnly *bool `json:"retained_capacity_only,omitempty"`
 	// ProductiveTurns qualifies a recovery_cause "provider_outage" park (PRD #1733): the number
 	// of model turns the PARKING FLIGHT completed without error since its claim. A positive value
 	// is progress and starts a new provider-park streak at this park; zero or absent continues
@@ -4575,6 +4597,10 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	}
 	if req.RecoveryCause != nil && !recoveryWaitCauses[*req.RecoveryCause] {
 		return store.Run{}, false, fmt.Errorf("%w: unknown recovery_cause %q", ErrInvalidState, *req.RecoveryCause)
+	}
+	// Issue #4046: before the memory-pressure early return so no marker bypasses validation.
+	if err := validateRetainedCapacityOnly(req); err != nil {
+		return store.Run{}, false, err
 	}
 	if err := validateReportOnlyShape(req); err != nil {
 		return store.Run{}, false, err
