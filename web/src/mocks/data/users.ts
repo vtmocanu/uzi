@@ -150,3 +150,38 @@ export const mockUsers: User[] = [
     last_login: daysAgo(1),
   },
 ];
+
+// ?mock=overview-next (issue #4042): user rows for the scenario's other-run owners
+// (overviewNextOtherRunOwners) plus two people with no runs, so the People chip's popover
+// shows display names for every active person, a signed-in-within-24-hours row and an idle
+// line with a never-signed-in count. Appended to the roster only under that scenario (see
+// mockApi/shared.ts), so every other mock test and scenario keeps the roster above.
+function scenarioUser(id: string, email: string, displayName: string, lastLogin: string | null, createdDays: number): User {
+  return {
+    ...mockUsers[1],
+    id,
+    email,
+    display_name: displayName,
+    is_admin: false,
+    is_active: true,
+    autopilot_enabled: false,
+    plan_cross_check_enabled: false,
+    judge_enabled: false,
+    created_at: daysAgo(createdDays),
+    last_login: lastLogin,
+  };
+}
+
+export const overviewNextUsers: User[] = [
+  scenarioUser("u-ov-priya", "priya@uzi.local", "Priya Desai", minsAgo(50), 30),
+  scenarioUser("u-ov-sam", "sam@uzi.local", "Sam Okafor", minsAgo(14), 28),
+  scenarioUser("u-ov-jordan", "jordan@uzi.local", "Jordan Lee", minsAgo(180), 22),
+  scenarioUser("u-ov-lena", "lena@uzi.local", "Lena Fischer", minsAgo(8), 16),
+  scenarioUser("u-ov-omar", "omar@uzi.local", "Omar Haddad", daysAgo(2), 12),
+  scenarioUser("u-ov-ines", "ines@uzi.local", "Ines Duarte", minsAgo(4), 9),
+  // No runs: one signed in two hours ago, one invited but never signed in, one last seen
+  // nine days ago (the idle line then reads a range with Priya Nair's one day).
+  scenarioUser("u-ov-elif", "elif@uzi.local", "Elif Kaya", minsAgo(120), 11),
+  scenarioUser("u-ov-mateo", "mateo@uzi.local", "Mateo Silva", null, 3),
+  scenarioUser("u-ov-hana", "hana@uzi.local", "Hana Ito", daysAgo(9), 40),
+];

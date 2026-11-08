@@ -23,7 +23,8 @@ function Avatar({ initials, small = false }: { initials: string; small?: boolean
       aria-hidden="true"
       className={cx(
         "inline-flex shrink-0 items-center justify-center rounded-full border border-edge bg-raised font-semibold text-fg",
-        small ? "h-5 w-5 text-[9px]" : "h-6 w-6 text-[10px]",
+        // The stack overlaps, so a ring in the chip colour keeps each initial readable.
+        small ? "h-5 w-5 text-[9px] ring-1 ring-surface" : "h-6 w-6 text-[10px]",
       )}
     >
       {initials}
@@ -130,12 +131,12 @@ export function PeopleChip({ model, onShowUsageByUser }: { model: PeopleModel; o
         className="inline-flex max-w-full items-center gap-2 rounded-full border border-edge bg-surface px-2.5 py-1 text-xs text-fg hover:bg-raised"
       >
         {stack.length > 0 && (
-          <span aria-hidden="true" className="flex items-center -space-x-1.5">
+          <span aria-hidden="true" className="flex items-center -space-x-0.5">
             {stack.map((p) => (
               <Avatar key={p.key} initials={p.initials} small />
             ))}
             {extra > 0 && (
-              <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full border border-edge bg-raised px-1 text-[9px] font-semibold text-muted">
+              <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full border border-edge bg-raised px-1 text-[9px] font-semibold text-muted ring-1 ring-surface">
                 +{extra}
               </span>
             )}
@@ -168,8 +169,13 @@ export function PeopleChip({ model, onShowUsageByUser }: { model: PeopleModel; o
           <div className="space-y-3 p-3">
             <div className="flex items-start justify-between gap-2">
               <h3 className="text-sm font-semibold text-fg">{headerText(active, total)}</h3>
-              <span className="shrink-0 cursor-help text-xs text-faint" title={INFO_TEXT} aria-hidden="true">
-                ⓘ
+              {/* Drawn, not a glyph: the bundled fonts lack U+24D8. */}
+              <span
+                className="inline-flex h-4 w-4 shrink-0 cursor-help items-center justify-center rounded-full border border-edge text-[10px] font-semibold leading-none text-faint"
+                title={INFO_TEXT}
+                aria-hidden="true"
+              >
+                i
               </span>
               <span className="sr-only">{INFO_TEXT}</span>
             </div>
@@ -183,13 +189,15 @@ export function PeopleChip({ model, onShowUsageByUser }: { model: PeopleModel; o
               ) : (
                 <ul className="space-y-1.5">
                   {people.map((p) => (
-                    <li key={p.key} className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 text-sm">
+                    // The name keeps at least 8rem; a long pill (a busy viewer's "14 running ·
+                    // 5 queued · ...") wraps inside the rest instead of squeezing the name to nothing.
+                    <li key={p.key} className="grid grid-cols-[auto_minmax(8rem,1fr)_auto] items-center gap-2 text-sm">
                       <Avatar initials={p.initials} />
                       <span className="truncate text-fg" title={p.name}>
                         {p.name}
                         <Marks you={p.you} deactivated={p.deactivated} />
                       </span>
-                      <span className={cx("rounded-full px-2 py-0.5 text-xs", TONE_CLASS[p.tone])}>{p.pill}</span>
+                      <span className={cx("rounded-xl px-2 py-0.5 text-right text-xs", TONE_CLASS[p.tone])}>{p.pill}</span>
                     </li>
                   ))}
                 </ul>
@@ -222,7 +230,7 @@ export function PeopleChip({ model, onShowUsageByUser }: { model: PeopleModel; o
             )}
           </div>
 
-          <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 border-t border-edge px-3 py-2 text-xs text-muted">
+          <div className="sticky bottom-0 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 border-t border-edge bg-raised px-3 py-2 text-xs text-muted">
             <span>
               {week == null
                 ? "This week: unavailable"
