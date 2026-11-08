@@ -317,6 +317,20 @@ func (s *Service) ciFixPrecheck(ctx context.Context, repoID uuid.UUID, ref strin
 			return ErrBranchInUse
 		}
 	}
+	// Same predicate as uq_runs_one_active_branch_ref (kind ci_fix or mr_rework,
+	// pipeline_ref, non-terminal): an active mr_rework on the ref refuses here, before any
+	// forge call, as it did before the binding lookup existed. The in-transaction insert
+	// stays authoritative.
+	branchRef, err := s.q.CountActiveBranchRunsForRef(ctx, store.CountActiveBranchRunsForRefParams{
+		RepoID:      repoID,
+		PipelineRef: pgtype.Text{String: ref, Valid: true},
+	})
+	if err != nil {
+		return err
+	}
+	if branchRef > 0 {
+		return ErrActiveFixExists
+	}
 	// Same predicate as uq_runs_one_active_ci_fix: kind ci_fix, pipeline_ref, non-terminal.
 	_, err = s.q.GetActiveCIFixTargetForRef(ctx, store.GetActiveCIFixTargetForRefParams{
 		RepoID: repoID,

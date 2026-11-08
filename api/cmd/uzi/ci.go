@@ -107,7 +107,8 @@ func newCICmd(env Env, gf *globalFlags) *cobra.Command {
 			"failed (or has no cached pipeline) is refused with a 409 and a reason. It is " +
 			"also refused with a 409 when the branch's pull request cannot be determined " +
 			"unambiguously (or the association changed while queueing), and with a 502 " +
-			"when the forge could not be reached to verify it.",
+			"when the branch's pull request could not be verified (forge unreachable, a " +
+			"transient state, or a lookup failure).",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ref := args[0]

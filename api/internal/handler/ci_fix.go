@@ -105,8 +105,11 @@ func (h *Handler) CreateCIFixRun(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, workersvc.ErrCIFixBindingChanged):
 			httpx.Error(w, http.StatusConflict, "the branch's pull-request association changed while creating the CI fix; retry")
 		case errors.Is(err, workersvc.ErrCIFixPRUnavailable):
-			// err wraps the driver error, which is already PAT-redacted.
-			httpx.Error(w, http.StatusBadGateway, "could not verify the branch's pull request: "+err.Error())
+			// err already starts with the ErrCIFixPRUnavailable text. Its cause is a fixed
+			// uzi-authored message, a deadline/cancel, or a forge driver error from
+			// GetMergeRequestSummary (PAT-redacted by the driver); database and forge
+			// construction errors are logged in workersvc and never reach this body.
+			httpx.Error(w, http.StatusBadGateway, err.Error())
 		case errors.Is(err, workersvc.ErrRepoNotFound):
 			httpx.Error(w, http.StatusNotFound, "repo not found")
 		case errors.Is(err, workersvc.ErrActiveFixExists):

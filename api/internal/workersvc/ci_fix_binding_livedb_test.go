@@ -230,6 +230,38 @@ func TestCIFixActiveFixBeatsForgeFailureLiveDB(t *testing.T) {
 	}
 }
 
+// An active mr_rework on the ref (pipeline_ref set, branch NULL) is ErrActiveFixExists even
+// when a recorded candidate exists and the forge is failing: the same refusal the
+// uq_runs_one_active_branch_ref index gave before the binding lookup, with zero forge calls.
+func TestCIFixActiveMRReworkBeatsForgeFailureLiveDB(t *testing.T) {
+	const ref = "agent/issue-41012"
+	env, svc, ff, userID, repoID := bindingEnv(t, map[int64]bindingAnswer{
+		410120: {err: errors.New("dial tcp: connection refused")},
+	})
+	source := seedRecordedPR(t, env, userID, repoID, ref, 410120, time.Now().Add(-time.Hour))
+	env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_title, issue_description, pipeline_ref, mr_iid, target_run_id, status, harness)
+	          VALUES ($1, $2, $3, 'mr_rework', 't', 'd', $4, $5, $6, 'queued', 'claude')`,
+		uuid.New(), userID, repoID, ref, 410120, source)
+
+	for name, create := range map[string]func() error{
+		"manual": func() error {
+			_, err := svc.CreateCIFixRun(env.ctx, userID, repoID, ref, "Fix CI", "d", ciFixSnapshot(ref, 4101200), nil)
+			return err
+		},
+		"auto": func() error {
+			_, err := svc.CreateAutoCIFixRun(env.ctx, userID, repoID, ref, "Fix CI", "d", ciFixSnapshot(ref, 4101201), nil)
+			return err
+		},
+	} {
+		if err := create(); !errors.Is(err, ErrActiveFixExists) {
+			t.Fatalf("%s: err = %v, want ErrActiveFixExists", name, err)
+		}
+	}
+	if ff.callCount() != 0 {
+		t.Fatalf("forge calls = %d, want 0 (pool pre-check must refuse first)", ff.callCount())
+	}
+}
+
 // The bound PR is only a publication input: the claim's pr_description is identical for a bound
 // and an unbound ci_fix, because the run's own mr_iid stays NULL.
 func TestCIFixBindingDoesNotChangePrDescriptionLiveDB(t *testing.T) {

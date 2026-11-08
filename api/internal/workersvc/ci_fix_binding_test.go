@@ -106,12 +106,12 @@ func TestCIFixBindingClassification(t *testing.T) {
 		{"merged is not open", []int64{5}, map[int64]bindingAnswer{5: bindSum(5, forge.MRStateMerged, bindRef)}, 0, nil, ""},
 		{"closed is not open", []int64{5}, map[int64]bindingAnswer{5: bindSum(5, forge.MRStateClosed, bindRef)}, 0, nil, ""},
 		{"locked is unavailable", []int64{5}, map[int64]bindingAnswer{5: bindSum(5, forge.MRStateLocked, bindRef)}, 0, ErrCIFixPRUnavailable, ""},
-		{"iid mismatch", []int64{5}, map[int64]bindingAnswer{5: opened(6)}, 0, ErrCIFixPRUnresolved, "pull request !5 returned an unexpected answer"},
-		{"empty state", []int64{5}, map[int64]bindingAnswer{5: bindSum(5, "", bindRef)}, 0, ErrCIFixPRUnresolved, "pull request !5 returned an unexpected answer"},
-		{"empty head branch", []int64{5}, map[int64]bindingAnswer{5: bindSum(5, forge.MRStateOpened, "")}, 0, ErrCIFixPRUnresolved, "pull request !5 returned an unexpected answer"},
-		{"unknown state", []int64{5}, map[int64]bindingAnswer{5: bindSum(5, "draft?", bindRef)}, 0, ErrCIFixPRUnresolved, "pull request !5 returned an unexpected answer"},
-		{"opened on other branch", []int64{5}, map[int64]bindingAnswer{5: bindSum(5, forge.MRStateOpened, "other")}, 0, ErrCIFixPRUnresolved, "pull request !5 is open on a different branch"},
-		{"404", []int64{5}, map[int64]bindingAnswer{5: {err: forge.ErrMergeRequestNotFound}}, 0, ErrCIFixPRUnresolved, "pull request !5 was not found"},
+		{"iid mismatch", []int64{5}, map[int64]bindingAnswer{5: opened(6)}, 0, ErrCIFixPRUnresolved, "pull request 5 returned an unexpected answer"},
+		{"empty state", []int64{5}, map[int64]bindingAnswer{5: bindSum(5, "", bindRef)}, 0, ErrCIFixPRUnresolved, "pull request 5 returned an unexpected answer"},
+		{"empty head branch", []int64{5}, map[int64]bindingAnswer{5: bindSum(5, forge.MRStateOpened, "")}, 0, ErrCIFixPRUnresolved, "pull request 5 returned an unexpected answer"},
+		{"unknown state", []int64{5}, map[int64]bindingAnswer{5: bindSum(5, "draft?", bindRef)}, 0, ErrCIFixPRUnresolved, "pull request 5 returned an unexpected answer"},
+		{"opened on other branch", []int64{5}, map[int64]bindingAnswer{5: bindSum(5, forge.MRStateOpened, "other")}, 0, ErrCIFixPRUnresolved, "pull request 5 is open on a different branch"},
+		{"404", []int64{5}, map[int64]bindingAnswer{5: {err: forge.ErrMergeRequestNotFound}}, 0, ErrCIFixPRUnresolved, "pull request 5 was not found"},
 		{"401 is unavailable", []int64{5}, map[int64]bindingAnswer{5: {err: errors.New("forge: 401 unauthorized")}}, 0, ErrCIFixPRUnavailable, ""},
 		{"transport error is unavailable", []int64{5}, map[int64]bindingAnswer{5: {err: errors.New("dial tcp: connection refused")}}, 0, ErrCIFixPRUnavailable, ""},
 		{"two open", []int64{5, 6}, map[int64]bindingAnswer{5: opened(5), 6: opened(6)}, 0, ErrCIFixPRUnresolved, "more than one open pull request uses this branch"},
@@ -212,6 +212,20 @@ func TestCIFixBindingCandidateReadFailureIsUnavailable(t *testing.T) {
 	}
 }
 
+// A database error can name host, user and database; it must not survive into the error
+// text (the handler echoes it in the 502 body), yet stays ErrCIFixPRUnavailable.
+func TestCIFixBindingCandidateReadErrorTextIsFixed(t *testing.T) {
+	raw := "failed to connect to host=db.internal user=uzi database=uzi_prod"
+	svc, _ := bindingSvc(t, func() ([]int64, error) { return nil, errors.New(raw) }, nil)
+	_, err := svc.CreateCIFixRun(context.Background(), uuid.New(), uuid.New(), bindRef, "t", "d", sampleSnapshot(), nil)
+	if !errors.Is(err, ErrCIFixPRUnavailable) {
+		t.Fatalf("err = %v, want ErrCIFixPRUnavailable", err)
+	}
+	if strings.Contains(err.Error(), "db.internal") || !strings.Contains(err.Error(), errCIFixLookupFailed.Error()) {
+		t.Fatalf("err = %q, want the fixed cause and no raw database text", err.Error())
+	}
+}
+
 func TestCIFixBindingNoCandidatesIsUnboundWithoutForge(t *testing.T) {
 	svc, fs := bindingSvc(t, fixedCands(), nil) // no forge builder at all
 	if _, err := svc.CreateCIFixRun(context.Background(), uuid.New(), uuid.New(), bindRef, "t", "d", sampleSnapshot(), nil); err != nil {
@@ -276,8 +290,8 @@ func TestCIFixPrecheckBeatsForgeError(t *testing.T) {
 }
 
 func TestCIFixUnresolvedErrorMessageHasNoForgeText(t *testing.T) {
-	err := error(&CIFixPRUnresolvedError{Reason: "pull request !5 was not found"})
-	if !strings.Contains(err.Error(), "pull request !5 was not found") || !errors.Is(err, ErrCIFixPRUnresolved) {
+	err := error(&CIFixPRUnresolvedError{Reason: "pull request 5 was not found"})
+	if !strings.Contains(err.Error(), "pull request 5 was not found") || !errors.Is(err, ErrCIFixPRUnresolved) {
 		t.Fatalf("unexpected error %q", err)
 	}
 }

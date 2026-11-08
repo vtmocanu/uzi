@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"time"
 
@@ -56,6 +57,25 @@ func (e *CIFixPRUnresolvedError) Is(target error) bool { return target == ErrCIF
 
 func ciFixUnavailable(err error) error { return fmt.Errorf("%w: %w", ErrCIFixPRUnavailable, err) }
 
+// errCIFixLookupFailed is the fixed uzi-authored cause shown for a failure that is not a
+// forge driver error (database read, forge construction, missing forge client).
+var errCIFixLookupFailed = errors.New("the pull-request lookup could not run")
+
+// ciFixLookupFailed logs a non-driver lookup failure and returns it as unavailable with a
+// fixed cause, so a database or construction error (which can carry host, user or
+// database names) never reaches an HTTP body. A deadline or cancellation carries no such
+// data and stays reachable through errors.Is.
+func ciFixLookupFailed(op string, err error) error {
+	slog.Warn("ci-fix: pull-request lookup failed", "op", op, "error", err)
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return ciFixUnavailable(context.DeadlineExceeded)
+	case errors.Is(err, context.Canceled):
+		return ciFixUnavailable(context.Canceled)
+	}
+	return ciFixUnavailable(errCIFixLookupFailed)
+}
+
 // resolveCIFixBinding decides which pull request a ci_fix on ref binds to.
 //
 // The candidates are only the pull requests uzi recorded (runs.mr_iid) on its own runs
@@ -86,7 +106,7 @@ func (s *Service) resolveCIFixBinding(ctx context.Context, row store.GetRepoForU
 		UserID: userID, RepoID: repoID, Ref: pgtype.Text{String: ref, Valid: true},
 	})
 	if err != nil {
-		return pgtype.Int8{}, nil, ciFixUnavailable(err)
+		return pgtype.Int8{}, nil, ciFixLookupFailed("list candidates", err)
 	}
 	if len(cands) > ciFixBindingMaxCandidates {
 		return pgtype.Int8{}, nil, &CIFixPRUnresolvedError{Reason: "too many pull requests were recorded on this branch"}
@@ -100,11 +120,11 @@ func (s *Service) resolveCIFixBinding(ctx context.Context, row store.GetRepoForU
 		return pgtype.Int8{}, []int64{}, nil
 	}
 	if s.forges == nil {
-		return pgtype.Int8{}, nil, ciFixUnavailable(errors.New("no forge client is configured"))
+		return pgtype.Int8{}, nil, ciFixLookupFailed("forge client", errors.New("no forge client is configured"))
 	}
 	f, err := s.forges.ForgeForConnection(row.ForgeType, row.BaseUrl, row.TokenCiphertext)
 	if err != nil {
-		return pgtype.Int8{}, nil, ciFixUnavailable(err)
+		return pgtype.Int8{}, nil, ciFixLookupFailed("forge for connection", err)
 	}
 
 	var (
@@ -117,7 +137,7 @@ func (s *Service) resolveCIFixBinding(ctx context.Context, row store.GetRepoForU
 		switch {
 		case gerr != nil && errors.Is(gerr, forge.ErrMergeRequestNotFound):
 			if reason == "" {
-				reason = fmt.Sprintf("pull request !%d was not found", iid)
+				reason = fmt.Sprintf("pull request %d was not found", iid)
 			}
 		case gerr != nil:
 			if unavailable == nil {
@@ -125,17 +145,17 @@ func (s *Service) resolveCIFixBinding(ctx context.Context, row store.GetRepoForU
 			}
 		case sum.IID != iid || sum.State == "" || sum.SourceBranch == "" || !forge.IsKnownMRState(sum.State):
 			if reason == "" {
-				reason = fmt.Sprintf("pull request !%d returned an unexpected answer", iid)
+				reason = fmt.Sprintf("pull request %d returned an unexpected answer", iid)
 			}
 		case sum.State == forge.MRStateLocked:
 			if unavailable == nil {
-				unavailable = ciFixUnavailable(fmt.Errorf("pull request !%d is being merged", iid))
+				unavailable = ciFixUnavailable(fmt.Errorf("pull request %d is being merged", iid))
 			}
 		case sum.State == forge.MRStateOpened && sum.SourceBranch == ref:
 			open = append(open, iid)
 		case sum.State == forge.MRStateOpened:
 			if reason == "" {
-				reason = fmt.Sprintf("pull request !%d is open on a different branch", iid)
+				reason = fmt.Sprintf("pull request %d is open on a different branch", iid)
 			}
 		}
 		if ctx.Err() != nil {

@@ -1856,9 +1856,9 @@ func (f *fakeStore) HasActiveIssueRunForIID(context.Context, store.HasActiveIssu
 	return f.activeIssueRunForIID, nil
 }
 
-// GetActiveCIFixTargetForRef reports no active ci_fix on the ref (ErrNoRows), and
-// ListCIFixBindingCandidates an empty candidate set, unless a test sets the fields below
-// (issue #4079).
+// GetActiveCIFixTargetForRef always reports no active ci_fix on the ref (ErrNoRows); it is
+// not configurable. ListCIFixBindingCandidates returns an empty candidate set unless a test
+// sets ciFixCandidatesFn (issue #4079).
 func (f *fakeStore) GetActiveCIFixTargetForRef(context.Context, store.GetActiveCIFixTargetForRefParams) (pgtype.Int8, error) {
 	return pgtype.Int8{}, pgx.ErrNoRows
 }
