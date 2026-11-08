@@ -362,11 +362,16 @@ describe("crossCheckTag", () => {
     expect(reviewTag(undefined)).toBeNull();
     expect(crossCheckTag(aRun({ status: "running", cross_check_active: null }), "building")).toBeNull();
     expect(crossCheckTag(aRun({ status: "running" }), "building")).toBeNull();
-    // The station names the check: a live plan check outside Planning (a claimed run in
-    // Queued) and a code check outside Building read nothing.
-    expect(crossCheckTag(aRun({ status: "claimed", cross_check_active: "plan" }), "queued")).toBeNull();
-    expect(crossCheckTag(aRun({ status: "running", cross_check_active: "plan" }), "building")).toBeNull();
-    expect(crossCheckTag(aRun({ status: "running", is_planning: true, cross_check_active: "code" }), "planning")).toBeNull();
+  });
+
+  it("reads cross-checking whatever the station: a claimed run under plan check sits in Queued", () => {
+    const claimed = aRun({ status: "claimed", cross_check_active: "plan" });
+    expect(issueLineStage(claimed, none)).toBe("queued");
+    expect(crossCheckTag(claimed, "queued")).toEqual({
+      text: "cross-checking",
+      tone: "check",
+      title: "Plan cross-check in progress",
+    });
   });
 
   it("tags another user's run under All users the same way", () => {

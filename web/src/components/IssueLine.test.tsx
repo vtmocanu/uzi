@@ -136,6 +136,13 @@ describe("IssueLine", () => {
     );
   });
 
+  it("tags a claimed run under plan check in Queued, the tooltip naming the check", () => {
+    mount([aRun({ id: "q", issue_iid: 4044, status: "claimed", cross_check_active: "plan" })]);
+    const chip = within(station(/^Queued/)).getByText("#4044");
+    expect(chip.textContent).toBe("#4044 cross-checking");
+    expect(chip.getAttribute("title")).toBe("Plan cross-check in progress");
+  });
+
   it("joins the owner and the tag meaning in another user's chip tooltip", () => {
     const other = theirs(aRun({ id: "x", issue_iid: 7, status: "running", cross_check_active: "plan", is_planning: true }));
     mount([], [other], { scope: "all" });
