@@ -6742,6 +6742,25 @@ export class RecoveryCoordinator {
   }
 
   /**
+   * issue #3644 m4b: run `fn` under this run's journal lock J. The independent restore's authoritative pass takes it inside the
+   * runner's authority transaction A and holds it across the seed, so a competing recovery cycle (pin, settle, forget: all
+   * J then the bare lock B) serializes with the seed instead of interleaving: order A -> J -> B. Nothing run under `fn` may
+   * take J again (the lock is not reentrant); use {@link restoreRecordsUnderJournalLock} for reads.
+   */
+  withRestoreJournalLock<T>(runId: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    return this.withJournalLock(runId, fn, signal);
+  }
+
+  /**
+   * issue #3644 m4b: every AUTHENTICATED record of the run, for a caller that ALREADY holds J through
+   * {@link withRestoreJournalLock}. It never takes J, writes nothing and omits a tampered or unreadable record, so a pin that was
+   * advanced, removed, corrupted or settled since the caller's first read is reported as the difference it is.
+   */
+  restoreRecordsUnderJournalLock(runId: string): Promise<RecoveryRecord[]> {
+    return this.inspect(runId);
+  }
+
+  /**
    * issue #2969: the guarded, ordinary-origin records of generations strictly below `claimGeneration` whose FINAL is
    * not yet acknowledged, oldest generation first. A pure authenticated read (it never freezes, writes or contacts the
    * api), so the retained-claim runner can decide whether a predecessor pass has anything to do before it enters one.

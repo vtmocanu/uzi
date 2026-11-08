@@ -7,9 +7,10 @@
 // Git, capture, normalization, reaping or quiescence on it: the only touches of the path are the authority store's own slot-key
 // derivation inside `peekSlot`, and the bare's config and objects.
 //
-// This milestone only DECIDES. The runner turns a refusal into a nonterminal stop that writes nothing, and an eligible verdict
-// into a nonterminal stop too (seeding is not enabled in this build); the verdict object is what the seeding transaction will
-// re-derive and compare.
+// The pass only DECIDES. The runner turns a refusal into a nonterminal stop that writes nothing; an eligible verdict goes on to the
+// seeding transaction (runner.ts restoreFromPin), which re-derives the whole verdict under the authority transaction, the
+// recovery journal lock and the bare lock and seeds only if it is unchanged (the verdict object is what it compares).
+import { createHash } from "node:crypto";
 import { attemptGeneration } from "./attempt-path.js";
 import {
   parseAttemptLedgerEntry, recoveryCaptureKey, stoppedMarkerKey,
@@ -59,8 +60,8 @@ export type RelationshipResult =
   | { ok: false; reason: ClassificationRefusal };
 
 /**
- * Plan 3.2, pure over one config snapshot. Module-private until the seeding transaction (m4b) repeats it over its own snapshot,
- * when it is exported.
+ * Plan 3.2, pure over one config snapshot. Module-private: the seeding transaction repeats it through {@link evaluateRestoreRoute}
+ * over its own, fresh snapshot.
  *   shape          the journal is exactly `{runId, clonePath, attemptId}`: a `completionSourceFence` is `uncertain_publication`,
  *                  any other field `predecessor_not_plain` (an episode field, a memory park, a restore point, ...).
  *   relationships  the only attributions of this run are P's key and P's own `live` ledger entry. Refused as
@@ -169,7 +170,13 @@ export interface EligibleVerdict {
   clonePath: string;
   attemptId: string;
   generation: number;
-  pin: { captureId: string; sourceSha: string; finalization: boolean; binding: Extract<RestorePinVerdict, { ok: true }>["binding"]; defaultBranch?: string };
+  pin: {
+    captureId: string; sourceSha: string; finalization: boolean; binding: Extract<RestorePinVerdict, { ok: true }>["binding"]; defaultBranch?: string;
+    /** The selected record's identity as the authoritative pass re-authenticates it under J ({@link restorePinStillSelected}). */
+    version: 1; state: string; bareDir?: string;
+    /** A digest of every record of the generation (selected or not), so a record that appears, vanishes or settles is a difference. */
+    recordsDigest: string;
+  };
   predecessorSlot: { worker: string; epoch: string; state: string; seq: number };
   boundary: RestoreVerdict;
   selfCrossCheck: "ok" | "na";
@@ -191,6 +198,32 @@ export type RestoreRouteOutcome =
   | { eligible: false; reason: RestoreRouteReason; known: RestoreKnown };
 
 const PIN_EPISODE_FIELDS = ["heldPolicy", "holdSettlement", "finalRequest", "finalAcknowledged", "completionReceipt", "completionSource", "exactHoldBinding"] as const;
+
+/** One digest over every authenticated record of generation `generation`: id, state, sha, kind of pin and which settlement-class
+ *  fields are present. Two reads agree on it only when no record of the generation appeared, vanished, advanced or settled. */
+function generationRecordsDigest(records: readonly RecoveryRecord[], generation: number): string {
+  const rows = records.filter(r => r.generation === generation).map(r => JSON.stringify([
+    r.captureId, r.version, r.state, r.sourceSha, r.finalizationPin === true, r.bareDir ?? null, r.coverageDigest ?? null,
+    ...PIN_EPISODE_FIELDS.map(field => r[field] !== undefined)])).sort();
+  return createHash("sha256").update(rows.join("\n")).digest("hex");
+}
+
+/**
+ * Plan 3.4 step 3, a pure comparison run by the runner under J (the records come from `restoreRecordsUnderJournalLock`): the
+ * ONE ordinary pin record of the generation is still the record the eligibility pass selected - same capture id, generation,
+ * state, source sha, finalization flag, bare directory and version - none of the coverage, settlement, final or completion
+ * fields appeared on it, and no other record of the generation appeared, vanished or changed. Anything else is `pin_changed`.
+ */
+export function restorePinStillSelected(records: readonly RecoveryRecord[], runId: string, branch: string, verdict: EligibleVerdict): boolean {
+  const candidates = records.filter(r => r.generation === verdict.generation && !r.coverageDigest && classifyRecoveryOrigin(r.captureId) === "ordinary");
+  if (candidates.length !== 1) return false;
+  const r = candidates[0]!;
+  const p = verdict.pin;
+  return r.captureId === p.captureId && r.generation === verdict.generation && r.state === p.state && r.sourceSha === p.sourceSha &&
+    (r.finalizationPin === true) === p.finalization && r.bareDir === p.bareDir && r.version === p.version &&
+    r.runId === runId && r.branch === branch && r.coverageDigest === undefined && PIN_EPISODE_FIELDS.every(field => r[field] === undefined) &&
+    generationRecordsDigest(records, verdict.generation) === p.recordsDigest;
+}
 
 /**
  * Plans 3.2 + 3.4, read-only. Order: shape and relationships (config), P's slot (still foreign-owned and not pending), then
@@ -222,7 +255,8 @@ export async function evaluateRestoreRoute(deps: EligibilityDeps, input: Eligibi
   }
 
   // (c) exactly one ordinary, guarded-or-not pin record of generation G.
-  const candidates = (await deps.inspectRecords(input.runId))
+  const allRecords = await deps.inspectRecords(input.runId);
+  const candidates = allRecords
     .filter(r => r.generation === generation && !r.coverageDigest && classifyRecoveryOrigin(r.captureId) === "ordinary");
   if (candidates.length === 0) return refuse("no_eligible_pin");
   if (candidates.length > 1) return refuse("pin_ambiguous");
@@ -273,7 +307,8 @@ export async function evaluateRestoreRoute(deps: EligibilityDeps, input: Eligibi
 
   return { eligible: true, known, verdict: {
     clonePath, attemptId, generation,
-    pin: { captureId: pin.captureId, sourceSha: pin.sourceSha, finalization, binding: binding.binding, ...(defaultBranch === undefined ? {} : { defaultBranch }) },
+    pin: { captureId: pin.captureId, sourceSha: pin.sourceSha, finalization, binding: binding.binding, ...(defaultBranch === undefined ? {} : { defaultBranch }),
+      version: 1, state: pin.state, ...(pin.bareDir === undefined ? {} : { bareDir: pin.bareDir }), recordsDigest: generationRecordsDigest(allRecords, generation) },
     predecessorSlot: { worker: slot.owner.worker, epoch: slot.epoch, state: slot.state, seq: slot.seq },
     boundary: decision.verdict, selfCrossCheck: self.crossCheck === "ok" ? "ok" : "na", ancestry,
   } };

@@ -325,13 +325,23 @@ export async function writeBoundaryRecord(options: WriteBoundaryOptions):
 export async function readBoundaryRecord(
   options: { dataDir: string; workerToken: string; ops?: BoundaryFsOps }, incarnation: string,
 ): Promise<BoundaryRead> {
+  const read = await readBoundaryRecordRaw(options, incarnation);
+  return read.state === "ok" ? { state: "ok", record: read.record } : { state: read.state };
+}
+
+/** {@link readBoundaryRecord} plus the sha256 (lowercase hex) of the record file's raw bytes, present exactly when the file was
+ *  read (also for an `invalid` record, whose bytes are still what a restore basis would pin). */
+export async function readBoundaryRecordRaw(
+  options: { dataDir: string; workerToken: string; ops?: BoundaryFsOps }, incarnation: string,
+): Promise<BoundaryRead & { digest?: string }> {
   const ops = options.ops ?? realBoundaryOps();
   let raw: string | null;
   try { raw = await ops.readFile(path.join(options.dataDir, AUTHORITY_DIR, BOUNDARIES_DIR, boundaryFileName(incarnation))); }
   catch { return { state: "invalid" }; }
   if (raw === null) return { state: "missing" };
+  const digest = createHash("sha256").update(Buffer.from(raw, "utf8")).digest("hex");
   const record = unsealBoundaryRecord(options.workerToken, raw);
-  return record && record.incarnation === incarnation ? { state: "ok", record } : { state: "invalid" };
+  return record && record.incarnation === incarnation ? { state: "ok", record, digest } : { state: "invalid", digest };
 }
 
 // ---- process-wide state (set once at startup; read by the runner) ----------------------------------------------

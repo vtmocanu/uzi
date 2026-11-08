@@ -18,7 +18,7 @@ import { selectCodexBinding, CodexSelectionError } from "./codex/select.js";
 import { CodexExecutor, FailClosedExecutor, CODEX_PRODUCTION_PROVIDER, makeProductionCodexAdviceHarnessFactory } from "./codex/codex-executor.js";
 import { ChatExecutor, type ChatExecutorLike } from "./chat-executor.js";
 import { StubChatExecutor } from "./chat-executor-stub.js";
-import { RunRunner, type ExecutorFactory, type RunExecution, type RunnerOptions } from "./runner.js";
+import { RunRunner, type ExecutorFactory, type RunExecution, type RunExecutorAddress, type RunnerOptions } from "./runner.js";
 import { ChatRunner } from "./chat-runner.js";
 import { Outbox, deriveTerminalReserveBytes } from "./outbox.js";
 import { ActiveRunRegistry } from "./active-run-registry.js";
@@ -263,10 +263,6 @@ export function buildIsolatedExecutor(deps: { log: Logger; executorKind: Executo
     ...(deps.executorKind === "stub" ? { queryFn: stubJudgeQueryFn } : {}),
   });
 }
-
-/** issue #3644: which per-attempt directories an executor is built for. `generation` set = an independent restore's successor,
- *  whose HOME and provision dir are `<runId>.g<generation>`; absent = today's `<runId>` paths. */
-export interface RunExecutorAddress { generation?: number }
 
 export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undefined, deps: BuildRunExecutorDeps, addr: RunExecutorAddress = {}): RunExecution {
   const dirKey = runDirKey(runId, addr.generation);
