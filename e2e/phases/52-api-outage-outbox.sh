@@ -898,7 +898,7 @@ f42_cut_judge() {
 # error, the api is restored, and only then is the error judged. A precondition or UPDATE error skips
 # the kill (the attempt is inconclusive) but still restores the api.
 f42_restart_cycle() {
-  local run="$1" gen="$2" max="$3" set_max="${4:-0}" err="" rc=0 st="" regs_before=0 regs_now=0 deadline
+  local run="$1" gen="$2" max="$3" set_max="${4:-0}" err="" rc=0 st="" regs_before=0 regs_now=0 deadline id_before=""
   # One exec prints a state token, so an exec/container error (no token) is told apart from a
   # journaled terminal.
   rc=0; st="$("${COMPOSE[@]}" exec -T agent sh -c \
@@ -929,9 +929,18 @@ f42_restart_cycle() {
   fi
   if [ -z "$err" ]; then
     say "SIGKILLing the agent container with the api still down (run $run generation $gen)"
+    # #3644: record the container identity (the compose slot) the restart must preserve.
+    id_before="$(restore_agent_identity)" || err="could not read the agent container identity before the SIGKILL"
     capture_agent_logs 52-api-outage-outbox before-sigkill
     rc=0; "${COMPOSE[@]}" kill -s SIGKILL agent >/dev/null 2>&1 || rc=$?
-    [ "$rc" = 0 ] || err="could not SIGKILL the agent container (exit $rc)"
+    [ "$rc" = 0 ] || err="${err:+$err; }could not SIGKILL the agent container (exit $rc)"
+    # The agent is stopped: snapshot the killed predecessor before the restart can touch it. Only the
+    # first cut of a run (SET_MAX=1) is followed by an independent-restore assertion; the second cut of
+    # case 8 interrupts the restored attempt itself and is judged by assert_finalize_allowance_spent.
+    if [ "$rc" = 0 ] && [ "$set_max" = 1 ]; then
+      restore_snapshot_predecessor "$run" "$(rb_run_field "$run" branch)" \
+        || err="${err:+$err; }could not snapshot the killed predecessor of run $run"
+    fi
     capture_agent_logs 52-api-outage-outbox before-start
     rc=0; "${COMPOSE[@]}" start agent >/dev/null 2>&1 || rc=$?
     [ "$rc" = 0 ] || err="${err:+$err; }could not start the agent container again (exit $rc)"
@@ -950,6 +959,7 @@ f42_restart_cycle() {
   [ "${regs_now:-0}" -gt "${regs_before:-0}" ] \
     || fail "issue 1742: the restarted agent never logged a new 'registered' line within 90s (before=$regs_before now=${regs_now:-0}) for run $run"
   wait_worker_online
+  restore_assert_agent_identity "phase 52 kill/start (run $run generation $gen)" "$id_before"
 }
 # f42_wait_reclaim RUN GEN TIMEOUT — poll until RUN is running at claim generation GEN. A run that goes
 # failed while waiting is a failure with its origin named.
@@ -967,14 +977,17 @@ f42_wait_reclaim() {
   fail "issue 1742: run $run was never re-claimed and running at generation $gen (status=${s:-none} generation=${g:-none})"
 }
 
-# #2512: retained-source recovery completes inside the acquired claim. The exact
-# G+1 capture must be available before its fresh attempt is seeded, without another
-# claim. The seed log names branch and generation; the run-scoped post-clone
-# inventory confirms that generation before model admission. One active run per
-# issue binds the branch's seed between this run's two claim events.
-# TIMEOUT=0 is a single observation for the hermetic decoder regressions.
+# #3644: after the SIGKILL the re-claim at G+1 restores independently: it seeds a fresh
+# attempt from the predecessor's verified pin inside the one successor claim (no bundle
+# capture). The seed log names the branch and generation; the run-scoped post-clone
+# inventory confirms that generation before model admission. The SIGKILL races the
+# finalization pin, so the pin may still be owed or already on the default branch.
+# TIMEOUT=0 (third argument) is a single observation for the hermetic decoder regressions.
 f42_assert_capture_resume() {
-  wait_same_claim_capture_resume "$@"
+  local run="$1" gen="$2" timeout="${3:-60}" branch
+  branch="$(rb_run_field "$run" branch)"
+  wait_independent_restore_resume "$run" "$gen" "$branch" owed,on_default "$timeout"
+  restore_assert_seed_witness "$run" "$branch" "$gen"
 }
 
 # The api is up here, so a failure to resolve the budget can fail at once.
@@ -1112,6 +1125,7 @@ pass "case 8: owner cancelled the test-owned recovery hold without discarding it
 # the available G+1 archive stays exportable. Case 3's completed hold is untouched.
 resolve_fixture_source_hold "$RUN_F2" "$GEN_F2"
 resolve_fixture_source_hold "$RUN_F2" "$GEN_F2_OBSERVED"
+log_hold_census "after phase 52"
 
 # =============================================================================
 # RESTORE — return the api stale window, outbox knobs and recovery retry spacing to defaults so

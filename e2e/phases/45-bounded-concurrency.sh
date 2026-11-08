@@ -42,7 +42,11 @@ assert_cap2_recovered_run() {
   [ "$generation" = "$((original + 1))" ] \
     || fail "run $run recovery generation is $generation, want $((original + 1))"
   [ "$parks" = 0 ] || fail "run $run re-parked retained recovery ($parks parks)"
-  wait_same_claim_capture_resume "$run" "$generation" 60 "$branch"
+  # #3644: the re-claim seeds a fresh attempt from the killed predecessor's verified pin (no bundle
+  # capture). The stub's pin is already on the default branch here, hence the on_default binding. The
+  # run is parked at the gate, so the witness also proves the predecessor is untouched while S is live.
+  wait_independent_restore_resume "$run" "$generation" "$branch" on_default 60
+  restore_assert_seed_witness "$run" "$branch" "$generation"
 }
 
 if [ "$EXECUTOR" != stub ]; then
@@ -201,6 +205,8 @@ else
   # Hard-kill the agent: no graceful drain, no re-register — only the server-side
   # sweeper can recover the two orphaned runs. Do NOT restart the worker yet, so
   # the SWEEPER (not the restart's register-time requeue) is what re-queues them.
+  # The compose slot identity is the container: the kill/start cycle must restart this same container.
+  AGENT_IDENTITY_BEFORE="$(restore_agent_identity)" || fail "phase 45: cannot read the agent container identity before the kill"
   capture_agent_logs 45-bounded-concurrency before-sigkill
   "${COMPOSE[@]}" kill -s KILL agent >/dev/null
   pass "SIGKILL delivered to the agent container (two runs left in-flight)"
@@ -209,6 +215,9 @@ else
   wait_status "$RUN_KA" queued 60
   wait_status "$RUN_KB" queued 60
   pass "sweeper marked the dead worker offline and re-queued BOTH runs (N=2)"
+  # Predecessor snapshots: the agent is stopped, so nothing mutates P between here and the restart.
+  restore_snapshot_predecessor "$RUN_KA" "agent/issue-$IID_KA" || fail "phase 45: could not snapshot the killed predecessor of run KA"
+  restore_snapshot_predecessor "$RUN_KB" "agent/issue-$IID_KB" || fail "phase 45: could not snapshot the killed predecessor of run KB"
 
   # Restart the worker (same join token ⇒ same worker id): it re-claims both by
   # affinity and drives them to completion. The exported UZI_WORKER_TOKEN re-sources
@@ -220,6 +229,7 @@ else
   capture_agent_logs 45-bounded-concurrency before-restart-after-kill
   "${COMPOSE[@]}" up -d --wait agent >/dev/null
   wait_worker_online
+  restore_assert_agent_identity "phase 45 kill/start" "$AGENT_IDENTITY_BEFORE"
   wait_status "$RUN_KA" awaiting_approval 90
   wait_status "$RUN_KB" awaiting_approval 90
   assert_cap2_recovered_run "$RUN_KA" "$GEN_KA_ORIGINAL" "agent/issue-$IID_KA"
@@ -241,4 +251,5 @@ else
   # asserted above; now record the fixture owner's decision, keeping ready archives.
   resolve_fixture_source_hold "$RUN_KA" "$GEN_KA_ORIGINAL"
   resolve_fixture_source_hold "$RUN_KB" "$GEN_KB_ORIGINAL"
+  log_hold_census "after phase 45"
 fi

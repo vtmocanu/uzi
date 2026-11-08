@@ -562,15 +562,172 @@ capture_fixture() {
     else . end | .[]' > "$SEQ_DIR/events"
 }
 capture_fixture guarded
-custody_case "guarded typed G+1 same-claim retries retain one distinct capture" pass 'exact generation 2 captured' f42_assert_capture_resume R 2 0
+custody_case "guarded typed G+1 same-claim retries retain one distinct capture" pass 'exact generation 2 captured' wait_same_claim_capture_resume R 2 0
 capture_fixture legacy
-custody_case "legacy typed G+1 same-claim capture still accepted" pass 'exact generation 2 captured' f42_assert_capture_resume R 2 0
+custody_case "legacy typed G+1 same-claim capture still accepted" pass 'exact generation 2 captured' wait_same_claim_capture_resume R 2 0
 capture_fixture single-upload
-custody_case "same-claim capture precedes fresh reseed" pass 'exact generation 2 captured' f42_assert_capture_resume R 2 0
+custody_case "same-claim capture precedes fresh reseed" pass 'exact generation 2 captured' wait_same_claim_capture_resume R 2 0
 for variant in wrong-generation wrong-order two-captures missing-id extra-claim wrong-seed-generation; do
   capture_fixture "$variant"
-  custody_case "capture decoder refuses $variant" fail 'lacks the exact G+1' f42_assert_capture_resume R 2 0
+  custody_case "capture decoder refuses $variant" fail 'lacks the exact G+1' wait_same_claim_capture_resume R 2 0
 done
+
+# #3644 independent restore: the production log sequence, in production order (agent/src/runner.ts
+# "run claimed", agent/src/git.ts "runner clone: seeding" with seeded_from restore_pin, runner.ts
+# "independent restore seeded", then the admission line), and no bundle upload.
+eval "$(awk '/^wait_independent_restore_resume\(\) \{/,/^\}/' "$LIB")"
+RESTORE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+RESTORE_CID="$(printf 'b%.0s' $(seq 64))"
+RESTORE_PATH=/data/runner/repo/issue-1.attempt-20260101T000000Z-g2-0123456789abcdef
+restore_fixture() {
+  jq -nc --arg variant "$1" --arg sha "$RESTORE_SHA" --arg cid "$RESTORE_CID" --arg path "$RESTORE_PATH" '
+    {run_id:"R",msg:"run claimed"} as $claim |
+    {msg:"runner clone: seeding",branch:"agent/issue-1",seeded_from:"restore_pin",prior_commits:1,path:$path} as $seed |
+    {run_id:"R",msg:"independent restore seeded",slot:{kind:"compose",hostname:$cid[0:12],containerId:$cid},
+      crossCheck:"ok",verdict:{predecessorIncarnation:"p",boot:"same_boot"},binding:"on_default",pinGeneration:1,
+      sourceSha:$sha,captureId:"cap",recordState:"pending",attemptPath:$path,seededHead:$sha,claim_generation:2} as $restored |
+    {run_id:"R",msg:"recovery: prior open custody holds inventoried after clone",claim_generation:2} as $ready |
+    {run_id:"R",msg:"recovery: bundle uploaded (durable capture)",server_capture_id:"capture",server_state:"available"} as $capture |
+    [$claim,$claim,$seed,$restored,$ready] |
+    if $variant=="owed" then .[3].binding="owed"
+    elif $variant=="wrong-pin-generation" then .[3].pinGeneration=2
+    elif $variant=="extra-capture" then [.[0],.[1],$capture,.[2],.[3],.[4]]
+    elif $variant=="extra-claim" then . + [$claim]
+    elif $variant=="wrong-order" then [.[0],.[1],.[3],.[2],.[4]]
+    elif $variant=="admission-before-restore" then [.[0],.[1],.[2],.[4],.[3]]
+    elif $variant=="wrong-generation" then .[2].path="/data/runner/repo/issue-1.attempt-20260101T000000Z-g3-0123456789abcdef"
+    elif $variant=="mismatched-attempt-path" then .[3].attemptPath="/data/runner/repo/issue-1.attempt-20260101T000000Z-g2-fedcba9876543210"
+    elif $variant=="disallowed-binding" then .[3].binding="recovery_pin_ref"
+    elif $variant=="seeded-head-mismatch" then .[3].seededHead="cccccccccccccccccccccccccccccccccccccccc"
+    elif $variant=="short-source-sha" then .[3].sourceSha="aaaa" | .[3].seededHead="aaaa"
+    elif $variant=="slot-not-compose" then .[3].slot={kind:"hosted",podUid:"u",container:"worker"}
+    elif $variant=="cross-check-failed" then .[3].crossCheck="failed"
+    elif $variant=="empty-verdict" then .[3].verdict={}
+    elif $variant=="admission-wrong-generation" then .[4].claim_generation=3
+    elif $variant=="not-restore-pin-seed" then .[2].seeded_from="tracking"
+    elif $variant=="two-restore-lines" then [.[0],.[1],.[2],.[3],.[3],.[4]]
+    else . end | .[]' > "$SEQ_DIR/events"
+}
+restore_globals_case() {
+  wait_independent_restore_resume R 2 agent/issue-1 owed,on_default 0 >/dev/null
+  [ "$RESTORE_BINDING:$RESTORE_SOURCE_SHA:$RESTORE_SEEDED_HEAD:$RESTORE_ATTEMPT_PATH" = "$1:$RESTORE_SHA:$RESTORE_SHA:$RESTORE_PATH" ] \
+    || fail "restore fields not exported: $RESTORE_BINDING $RESTORE_SOURCE_SHA $RESTORE_SEEDED_HEAD $RESTORE_ATTEMPT_PATH"
+  [ "$RESTORE_CAPTURE_ID:$RESTORE_SLOT_CONTAINER:$RESTORE_SLOT_HOSTNAME" = "cap:$RESTORE_CID:${RESTORE_CID:0:12}" ] \
+    || fail "restore slot fields not exported"
+  echo 'restore fields exported'
+}
+restore_fixture valid
+custody_case "independent restore accepts on_default" pass 'restored independently' wait_independent_restore_resume R 2 agent/issue-1 on_default 0
+custody_case "independent restore exports the seeded fields" pass 'restore fields exported' restore_globals_case on_default
+restore_fixture owed
+custody_case "independent restore accepts owed" pass 'restored independently' wait_independent_restore_resume R 2 agent/issue-1 owed,on_default 0
+custody_case "independent restore exports the owed binding" pass 'restore fields exported' restore_globals_case owed
+custody_case "independent restore refuses owed when only on_default is allowed" fail 'independent-restore G+1 sequence' wait_independent_restore_resume R 2 agent/issue-1 on_default 0
+for variant in wrong-pin-generation extra-capture extra-claim wrong-order admission-before-restore wrong-generation mismatched-attempt-path \
+  disallowed-binding seeded-head-mismatch short-source-sha slot-not-compose cross-check-failed empty-verdict admission-wrong-generation \
+  not-restore-pin-seed two-restore-lines; do
+  restore_fixture "$variant"
+  custody_case "independent restore refuses $variant" fail 'independent-restore G+1 sequence' wait_independent_restore_resume R 2 agent/issue-1 owed,on_default 0
+done
+restore_fixture valid
+custody_case "independent restore refuses another branch" fail 'independent-restore G+1 sequence' wait_independent_restore_resume R 2 agent/issue-2 on_default 0
+custody_case "independent restore refuses another generation" fail 'independent-restore G+1 sequence' wait_independent_restore_resume R 3 agent/issue-1 on_default 0
+custody_case "independent restore needs the branch" fail 'needs the run' wait_independent_restore_resume R 2 "" on_default 0
+
+# Phase 52's wrapper: the run's branch comes from the database, the allowed bindings are owed,on_default,
+# and the seed witness runs only after the log sequence is proved.
+f42_case() {
+  rb_run_field() { echo agent/issue-1; }
+  restore_assert_seed_witness() { echo "witnessed $1 $2 $3"; }
+  f42_assert_capture_resume R 2 0
+}
+restore_fixture owed
+custody_case "phase 52 accepts an owed pin and runs the seed witness" pass 'witnessed R agent/issue-1 2' f42_case
+restore_fixture disallowed-binding
+custody_case "phase 52 refuses a recovery_pin_ref binding" fail 'independent-restore G+1 sequence' f42_case
+restore_fixture extra-capture
+custody_case "phase 52 refuses a bundle capture on the restore route" fail 'independent-restore G+1 sequence' f42_case
+
+# The seed-time witness: the bare's restore basis must agree with the log, and while S is live P must be
+# unchanged. The witness container is replaced by canned outputs (the real one needs the compose stack).
+eval "$(awk '/^restore_assert_seed_witness\(\) \{/,/^\}/' "$LIB")"
+eval "$(awk '/^_restore_journal_value\(\) \{/,/^\}/' "$LIB")"
+eval "$(awk '/^restore_assert_agent_identity\(\) \{/,/^\}/' "$LIB")"
+witness_case() {
+  local variant="$1" pclone=/data/runner/repo/issue-1.attempt-20260101T000000Z-g1-1111111111111111
+  # Names here must not collide with the locals of restore_assert_seed_witness: the fakes below are dynamically scoped.
+  local pjournal restore run_state=running digest='digest=d1 head=ref: refs/heads/agent/issue-1 tip=t1' pin
+  pjournal="$(jq -nc --arg c "$pclone" '{runId:"R",clonePath:$c,attemptId:"20260101T000000Z-g1-1111111111111111"}')"
+  restore="$(jq -nc --arg c "$pclone" --arg sha "$RESTORE_SHA" '{restore:{version:1,predecessor:{clonePath:$c,generation:1},
+    pin:{captureId:"cap",generation:1,sourceSha:$sha,finalization:false},restoreTip:$sha},restoreStage:"ready",runId:"R"}')"
+  pin="$(jq -nc --arg sha "$RESTORE_SHA" '{runId:"R",branch:"agent/issue-1",generation:1,sourceSha:$sha,captureId:"cap",mac:"x"}')"
+  jq -nc --arg j "$pjournal" --arg c "$pclone" --arg d "$digest" '{journal:$j,clonePath:$c,digest:$d}' > "$SEQ_DIR/.restore-p-R.json"
+  case "$variant" in
+    basis-tip) restore="$(jq -c --arg s cccccccccccccccccccccccccccccccccccccccc '.restore.restoreTip=$s' <<<"$restore")";;
+    basis-generation) restore="$(jq -c '.restore.pin.generation=2' <<<"$restore")";;
+    basis-capture) restore="$(jq -c '.restore.pin.captureId="other"' <<<"$restore")";;
+    basis-predecessor) restore="$(jq -c '.restore.predecessor.clonePath="/elsewhere"' <<<"$restore")";;
+    no-restore) restore="";;
+    terminal) run_state=completed; digest='digest=changed head=x tip=y';;
+    terminal-no-restore) run_state=completed; restore="";;
+    p-journal-changed) pjournal="${pjournal%\}},\"x\":1}";;
+    p-clone-changed) digest='digest=d2 head=ref: refs/heads/agent/issue-1 tip=t1';;
+    pin-sha) pin="$(jq -c '.sourceSha="dddddddddddddddddddddddddddddddddddddddd"' <<<"$pin")";;
+    pin-absent) pin="";;
+  esac
+  local other=''
+  [ "$variant" != other-run ] || other="$(jq -c '.runId="Z"' <<<"$restore")"
+  { printf 'bare\tuzi-recovery.agent/issue-1.clone\t%s\n' "$pjournal"
+    [ -z "$restore" ] || printf 'bare\tuzi-restore.agent/issue-1.journal\t%s\n' "$restore"
+    [ -z "$other" ] || printf 'bare\tuzi-restore.agent/issue-1.journal\t%s\n' "$other"
+  } > "$SEQ_DIR/w-journals"
+  printf '%s' "$digest" > "$SEQ_DIR/w-digest"
+  printf '%s' "$pin" > "$SEQ_DIR/w-pin"
+  db_psql() { echo "$run_state"; }
+  restore_agent_identity() { echo "$RESTORE_CID ${RESTORE_CID:0:12}"; }
+  restore_witness_exec() {
+    case "$1" in
+      journals) cat "$SEQ_DIR/w-journals";;
+      digest) cat "$SEQ_DIR/w-digest";;
+      pin) [ -s "$SEQ_DIR/w-pin" ] && cat "$SEQ_DIR/w-pin";;
+      shead) echo "$RESTORE_SHA";;
+    esac
+  }
+  RESTORE_SOURCE_SHA="$RESTORE_SHA" RESTORE_SEEDED_HEAD="$RESTORE_SHA" RESTORE_CAPTURE_ID=cap RESTORE_SLOT_CONTAINER="$RESTORE_CID"
+  RESTORE_SLOT_HOSTNAME="${RESTORE_CID:0:12}" RESTORE_ATTEMPT_PATH="$RESTORE_PATH"
+  [ "$variant" != slot-hostname ] || RESTORE_SLOT_HOSTNAME=ffffffffffff
+  if [ "$variant" = slot-container ]; then
+    RESTORE_SLOT_CONTAINER="$(printf 'e%.0s' $(seq 64))"
+    RESTORE_SLOT_HOSTNAME="${RESTORE_SLOT_CONTAINER:0:12}"
+  fi
+  restore_assert_seed_witness R agent/issue-1 2
+}
+custody_case "seed witness accepts a live restore" pass 'basis=pin=seed' witness_case valid
+custody_case "seed witness accepts a terminal run whose predecessor is gone" pass 'terminal run' witness_case terminal
+custody_case "seed witness accepts a terminal run with no restore journal" pass 'terminal run' witness_case terminal-no-restore
+custody_case "seed witness accepts an unreadable pin record with a note" pass 'not readable' witness_case pin-absent
+for variant in basis-tip basis-generation basis-capture; do
+  custody_case "seed witness refuses a $variant disagreement" fail 'disagrees with the log' witness_case "$variant"
+done
+custody_case "seed witness refuses a basis naming another predecessor clone" fail 'different predecessor clone' witness_case basis-predecessor
+custody_case "seed witness requires a restore journal for a live run" fail 'no restore journal for live run' witness_case no-restore
+custody_case "seed witness refuses a pin record that disagrees" fail 'pin record' witness_case pin-sha
+custody_case "seed witness refuses a changed predecessor journal" fail 'predecessor journal of run R changed' witness_case p-journal-changed
+custody_case "seed witness refuses a changed predecessor clone" fail 'predecessor clone of run R changed' witness_case p-clone-changed
+custody_case "seed witness refuses a slot hostname that is not the id prefix" fail 'slot hostname' witness_case slot-hostname
+custody_case "seed witness refuses a slot that is not the agent container" fail 'logged slot container' witness_case slot-container
+custody_case "seed witness ignores a restore journal of another run" pass 'basis=pin=seed' witness_case other-run
+
+identity_case() {
+  local fake_after="$2"
+  restore_agent_identity() { echo "$fake_after"; }
+  restore_assert_agent_identity "label" "$1"
+}
+custody_case "agent identity accepts the same container" pass 'same agent container' identity_case "$RESTORE_CID ${RESTORE_CID:0:12}" "$RESTORE_CID ${RESTORE_CID:0:12}"
+custody_case "agent identity refuses a recreated container" fail 'changed across the kill/start cycle' \
+  identity_case "$(printf 'e%.0s' $(seq 64)) eeeeeeeeeeee" "$RESTORE_CID ${RESTORE_CID:0:12}"
+custody_case "agent identity refuses a hostname that is not the id prefix" fail 'not the container id prefix' \
+  identity_case "$RESTORE_CID ffffffffffff" "$RESTORE_CID ffffffffffff"
 
 cap2_recovery_contract() {
   local mode="$1" RUN_KA=R RUN_KB=S fixture_generation=2
@@ -578,10 +735,11 @@ cap2_recovery_contract() {
   local RWC_KA RWC_KB
   [ "$mode" != extra-generation ] || fixture_generation=3
   db_psql() { case "$1" in *claim_generation*) echo "$fixture_generation";; *) echo 0;; esac; }
-  wait_same_claim_capture_resume() {
+  wait_independent_restore_resume() {
     [ "$mode" != missing-capture ] || fail 'cap2 recovery missing exact capture'
-    [ "$2:$4" = 2:agent/fixture ] || fail 'cap2 recovery lost generation or branch'
+    [ "$2:$3:$4" = 2:agent/fixture:on_default ] || fail 'cap2 recovery lost generation, branch or binding'
   }
+  restore_assert_seed_witness() { [ "$1:$2:$3" = "R:agent/fixture:2" ] || fail 'cap2 witness lost run, branch or generation'; }
   local definition
   definition="$(awk '/^assert_cap2_recovered_run\(\) \{/,/^\}/' "$ROOT/e2e/phases/45-bounded-concurrency.sh")"
   if [ -n "$definition" ]; then

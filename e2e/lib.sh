@@ -39,6 +39,246 @@ wait_same_claim_capture_resume() {
     sleep 0.5
   done
 }
+
+# --- #3644 independent restore ------------------------------------------------
+# When a run's worker is SIGKILLed and the run is re-claimed at generation G+1, the worker no longer
+# captures the retained predecessor P (a bundle upload, wait_same_claim_capture_resume above). It seeds a
+# fresh attempt S from P's verified pin and runs it. The production log lines, in production order:
+#   run claimed (x2) < runner clone: seeding (seeded_from restore_pin, path ...-g<G+1>-<16 hex>)
+#     < independent restore seeded < recovery: prior open custody holds inventoried after clone
+# and no "recovery: bundle uploaded (durable capture)" line for the run. The restore line's `slot` is the
+# object {kind:"compose",hostname,containerId}; `binding` is owed, recovery_pin_ref or on_default.
+# wait_independent_restore_resume RUN GEN BRANCH ALLOWED_BINDINGS [TIMEOUT] — ALLOWED_BINDINGS is comma
+# separated. TIMEOUT=0 is a single observation (hermetic decoder regressions). On success it sets
+# RESTORE_SOURCE_SHA, RESTORE_SEEDED_HEAD, RESTORE_BINDING, RESTORE_ATTEMPT_PATH, RESTORE_CAPTURE_ID,
+# RESTORE_SLOT_CONTAINER and RESTORE_SLOT_HOSTNAME for restore_assert_seed_witness.
+wait_independent_restore_resume() {
+  local run="$1" gen="$2" branch="$3" allowed="$4" timeout="${5:-60}" deadline=$((SECONDS + ${5:-60}))
+  local log_file="$RUNROOT/.restore-3644.log" found_file="$RUNROOT/.restore-3644.json"
+  [ -n "$branch" ] || fail "issue 3644: wait_independent_restore_resume needs the run's branch"
+  while :; do
+    "${COMPOSE[@]}" logs --no-color agent > "$log_file" 2>/dev/null \
+      || fail "issue 3644: could not read independent-restore evidence for $run"
+    if jq -Rse --arg run "$run" --argjson gen "$gen" --arg branch "$branch" --arg allowed "$allowed" '
+      [split("\n")[] | sub("^[^{]*"; "") | fromjson? | select(type == "object")] as $events |
+      ($events | to_entries) as $ix |
+      ($allowed | split(",")) as $bindings |
+      [$ix[] | select(.value.run_id == $run and .value.msg == "run claimed") | .key] as $claims |
+      [$ix[] | select(.value.msg == "runner clone: seeding" and .value.branch == $branch
+        and .value.seeded_from == "restore_pin"
+        and ((.value.path // "") | test("-g" + ($gen | tostring) + "-[0-9a-f]{16}$")))] as $seeds |
+      [$ix[] | select(.value.run_id == $run and .value.msg == "independent restore seeded")] as $restored |
+      [$ix[] | select(.value.run_id == $run
+        and .value.msg == "recovery: prior open custody holds inventoried after clone"
+        and .value.claim_generation == $gen) | .key] as $ready |
+      [$ix[] | select(.value.run_id == $run and .value.msg == "recovery: bundle uploaded (durable capture)")] as $uploads |
+      ($restored[0].value // {}) as $r |
+      (if ($r.slot | type) == "object" then $r.slot else {kind: $r.slot} end) as $slot |
+      if ($claims | length) == 2 and ($seeds | length) == 1 and ($restored | length) == 1
+         and ($ready | length) == 1 and ($uploads | length) == 0
+         and $slot.kind == "compose" and $r.crossCheck == "ok"
+         and ($r.verdict != null and $r.verdict != "" and $r.verdict != {})
+         and (($bindings | index($r.binding)) != null)
+         and $r.pinGeneration == ($gen - 1) and $r.claim_generation == $gen
+         and (($r.sourceSha // "") | test("^[0-9a-f]{40}$")) and $r.seededHead == $r.sourceSha
+         and $r.attemptPath == $seeds[0].value.path
+         and $claims[1] < $seeds[0].key and $seeds[0].key < $restored[0].key and $restored[0].key < $ready[0]
+      then {sourceSha: $r.sourceSha, seededHead: $r.seededHead, binding: $r.binding, attemptPath: $r.attemptPath,
+        captureId: ($r.captureId // ""), slotContainer: ($slot.containerId // ""), slotHostname: ($slot.hostname // "")}
+      else null end
+    ' "$log_file" > "$found_file"; then
+      RESTORE_SOURCE_SHA="$(jq -r .sourceSha "$found_file")"
+      RESTORE_SEEDED_HEAD="$(jq -r .seededHead "$found_file")"
+      RESTORE_BINDING="$(jq -r .binding "$found_file")"
+      RESTORE_ATTEMPT_PATH="$(jq -r .attemptPath "$found_file")"
+      RESTORE_CAPTURE_ID="$(jq -r .captureId "$found_file")"
+      RESTORE_SLOT_CONTAINER="$(jq -r .slotContainer "$found_file")"
+      RESTORE_SLOT_HOSTNAME="$(jq -r .slotHostname "$found_file")"
+      pass "run $run: generation $gen restored independently from the verified pin (binding=$RESTORE_BINDING sourceSha=$RESTORE_SOURCE_SHA) with one successor claim and no bundle capture"
+      return 0
+    fi
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      jq -Rr --arg run "$run" '
+        [split("\n")[] | sub("^[^{]*"; "") | fromjson? | select(type == "object")] as $e |
+        "independent-restore evidence for \($run): claims=\([$e[] | select(.run_id == $run and .msg == "run claimed")] | length)" +
+        " seeding=\([$e[] | select(.msg == "runner clone: seeding")] | length)" +
+        " restored=\([$e[] | select(.run_id == $run and .msg == "independent restore seeded")] | length)" +
+        " admission=\([$e[] | select(.run_id == $run and .msg == "recovery: prior open custody holds inventoried after clone")] | length)" +
+        " bundle_uploads=\([$e[] | select(.run_id == $run and .msg == "recovery: bundle uploaded (durable capture)")] | length)"
+      ' "$log_file" 2>/dev/null | tail -n 1 >&2 || true
+      fail "issue 3644: run $run lacks the independent-restore G+1 sequence (one successor claim, restore_pin seed, restore line, admission line, no bundle upload) after ${timeout}s"
+    fi
+    sleep 0.5
+  done
+}
+
+# The agent container's identity: "<Id> <Hostname>", read with docker inspect (works on a stopped container).
+restore_agent_container() {
+  local ids
+  ids="$("${COMPOSE[@]}" ps -a -q agent 2>/dev/null)" || return 1
+  [ -n "$ids" ] && [ "$(printf '%s\n' "$ids" | grep -c .)" = 1 ] || return 1
+  printf '%s' "$ids"
+}
+restore_agent_identity() {
+  local cid
+  cid="$(restore_agent_container)" || return 1
+  docker inspect -f '{{.Id}} {{.Config.Hostname}}' "$cid"
+}
+# restore_assert_agent_identity LABEL BEFORE — the kill/start cycle must restart the SAME container
+# (compose slot identity), whose hostname is the first 12 characters of its id.
+restore_assert_agent_identity() {
+  local label="$1" before="$2" after id host
+  after="$(restore_agent_identity)" || fail "issue 3644: $label: cannot read the agent container identity"
+  [ "$after" = "$before" ] \
+    || fail "issue 3644: $label: the agent container changed across the kill/start cycle (before=[$before] after=[$after])"
+  id="${after%% *}"; host="${after#* }"
+  [[ "$id" =~ ^[0-9a-f]{64}$ ]] || fail "issue 3644: $label: unexpected container id [$id]"
+  [ "$host" = "${id:0:12}" ] || fail "issue 3644: $label: hostname [$host] is not the container id prefix [${id:0:12}]"
+  pass "$label: the same agent container (${id:0:12}) was restarted; hostname is its id prefix"
+}
+
+# Read-only witness container: shares the agent's /data volumes read-only, has no network, runs only
+# fixed commands (config reads on the bare repositories, a file digest of P, a pin-record cat), never a
+# git command inside P's clone, and ignores global/system git config. The one script is passed with
+# the mode as its first positional argument.
+_restore_witness_script() {
+  cat <<'WITNESS'
+set -eu
+mode="$1"; shift
+case "$mode" in
+  journals)
+    for d in /data/repos/*; do
+      [ -d "$d" ] || continue
+      for k in "uzi-recovery.$1.clone" "uzi-restore.$1.journal"; do
+        if v="$(git -c safe.directory='*' -C "$d" config --get "$k" 2>/dev/null)"; then
+          printf '%s\t%s\t%s\n' "$d" "$k" "$v"
+        fi
+      done
+    done ;;
+  digest)
+    p="$1"
+    if [ ! -d "$p" ]; then echo MISSING; exit 0; fi
+    d="$(find "$p" -path "$p/.git" -prune -o -type f -exec sha256sum {} + | LC_ALL=C sort -k2 | sha256sum | cut -d' ' -f1)"
+    h="$(cat "$p/.git/HEAD" 2>/dev/null || echo -)"
+    t=-
+    ref="${h#ref: }"
+    if [ "$ref" != "$h" ] && [ -f "$p/.git/$ref" ]; then t="$(cat "$p/.git/$ref")"; fi
+    printf 'digest=%s head=%s tip=%s\n' "$d" "$h" "$t" ;;
+  pin) cat "/data/recovery/$1/$2.json" ;;
+  shead) git -c safe.directory='*' --git-dir="$1/.git" rev-parse HEAD ;;
+  *) exit 2 ;;
+esac
+WITNESS
+}
+# restore_witness_exec MODE ARGS... — stdout of the witness container; the container is removed by its
+# exact name before and after (and by cleanup).
+restore_witness_exec() {
+  local cid image name rc=0
+  cid="$(restore_agent_container)" || return 1
+  image="$(docker inspect -f '{{.Image}}' "$cid")" || return 1
+  name="cdr-3644-witness-$$"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  docker run --rm --name "$name" --volumes-from "$cid:ro" --network none --user 0:0 --entrypoint sh \
+    -e GIT_CONFIG_GLOBAL=/dev/null -e GIT_CONFIG_NOSYSTEM=1 \
+    "$image" -c "$(_restore_witness_script)" witness "$@" || rc=$?
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  return "$rc"
+}
+# _restore_journal_value ROWS KEY RUN — the raw journal value of KEY whose run is RUN (a restore tombstone
+# names its run under .successor). Prints nothing when absent; never judges.
+_restore_journal_value() {
+  printf '%s\n' "$1" | awk -F'\t' -v k="$2" '$2 == k { print $3 }' \
+    | jq -Rr --arg run "$3" 'select((((fromjson? // {}) | (.runId // .successor.runId)?)) == $run)'
+}
+# restore_snapshot_predecessor RUN BRANCH — take AFTER the kill and BEFORE the restart: P's recovery journal
+# value (raw) and the digest of P's clone contents, written to $RUNROOT/.restore-p-RUN.json. Returns non-zero
+# (never calls fail) so callers that must restore the api first can judge it later.
+restore_snapshot_predecessor() {
+  local run="$1" branch="$2" out="$RUNROOT/.restore-p-$1.json" rows journal clone digest
+  rows="$(restore_witness_exec journals "$branch")" || { echo "issue 3644: witness could not read the bare journals for $run" >&2; return 1; }
+  journal="$(_restore_journal_value "$rows" "uzi-recovery.$branch.clone" "$run")"
+  [ -n "$journal" ] && [ "$(printf '%s\n' "$journal" | grep -c .)" = 1 ] \
+    || { echo "issue 3644: expected exactly one predecessor journal for run $run on $branch" >&2; return 1; }
+  clone="$(printf '%s' "$journal" | jq -er '.clonePath')" || { echo "issue 3644: predecessor journal has no clonePath" >&2; return 1; }
+  digest="$(restore_witness_exec digest "$clone")" || { echo "issue 3644: witness could not digest the predecessor clone" >&2; return 1; }
+  [ -n "$digest" ] && [ "$digest" != MISSING ] || { echo "issue 3644: predecessor clone $clone is missing before the restart" >&2; return 1; }
+  jq -nc --arg journal "$journal" --arg clone "$clone" --arg digest "$digest" \
+    '{journal: $journal, clonePath: $clone, digest: $digest}' > "$out"
+}
+# restore_assert_seed_witness RUN BRANCH GEN — after wait_independent_restore_resume. Compares the log's
+# fields with the bare's restore journal basis (a data read; the pin record's MAC is NOT re-verified here),
+# and, while S is live (run not terminal), that P's journal and clone are unchanged since the snapshot and
+# S's HEAD resolves. Once the run is terminal S's completion discards P legitimately, so only the log fields,
+# the basis and the pin record (when still present) are judged.
+restore_assert_seed_witness() {
+  local run="$1" branch="$2" gen="$3" snap="$RUNROOT/.restore-p-$1.json" status live=1 rows rj pin cur shead
+  [ -n "${RESTORE_SOURCE_SHA:-}" ] || fail "issue 3644: seed witness run before wait_independent_restore_resume for $run"
+  [ "$RESTORE_SLOT_HOSTNAME" = "${RESTORE_SLOT_CONTAINER:0:12}" ] \
+    || fail "issue 3644: logged slot hostname [$RESTORE_SLOT_HOSTNAME] is not the container id prefix [${RESTORE_SLOT_CONTAINER:0:12}]"
+  cur="$(restore_agent_identity)" || fail "issue 3644: cannot read the agent container identity for run $run"
+  [ "${cur%% *}" = "$RESTORE_SLOT_CONTAINER" ] \
+    || fail "issue 3644: logged slot container [$RESTORE_SLOT_CONTAINER] is not the agent container [${cur%% *}]"
+  status="$(db_psql "SELECT status FROM runs WHERE id = '$run'")"
+  case "$status" in completed|failed|cancelled) live=0;; esac
+  rows="$(restore_witness_exec journals "$branch")" || fail "issue 3644: witness could not read the bare journals for $run"
+  rj="$(_restore_journal_value "$rows" "uzi-restore.$branch.journal" "$run")"
+  if [ -n "$rj" ]; then
+    [ "$(printf '%s\n' "$rj" | grep -c .)" = 1 ] || fail "issue 3644: several restore journals for run $run on $branch"
+    printf '%s' "$rj" | jq -e --arg sha "$RESTORE_SOURCE_SHA" --arg head "$RESTORE_SEEDED_HEAD" --arg cap "$RESTORE_CAPTURE_ID" \
+      --argjson gen "$gen" '
+      .restore as $b | $b.pin.sourceSha == $sha and $b.restoreTip == $sha and $head == $sha
+      and $b.pin.captureId == $cap and $b.pin.generation == ($gen - 1) and $b.predecessor.generation == ($gen - 1)
+      and (.restoreStage | IN("seeding", "ready", "retired"))' >/dev/null \
+      || fail "issue 3644: restore journal basis for run $run disagrees with the log (sourceSha/restoreTip/seededHead/capture/generation): $rj"
+    if [ -f "$snap" ]; then
+      jq -e --slurpfile p "$snap" '.restore.predecessor.clonePath == $p[0].clonePath' <<<"$rj" >/dev/null \
+        || fail "issue 3644: restore basis names a different predecessor clone than the one snapshot after the kill"
+    fi
+  elif [ "$live" = 1 ]; then
+    fail "issue 3644: no restore journal for live run $run on $branch"
+  else
+    echo "  NOTE no restore journal for terminal run $run (cleared or retired at completion); basis not asserted"
+  fi
+  pin="$(restore_witness_exec pin "$run" "$RESTORE_CAPTURE_ID" 2>/dev/null)" || pin=""
+  if [ -n "$pin" ]; then
+    printf '%s' "$pin" | jq -e --arg run "$run" --arg branch "$branch" --arg sha "$RESTORE_SOURCE_SHA" --arg cap "$RESTORE_CAPTURE_ID" \
+      --argjson gen "$gen" '.runId == $run and .branch == $branch and .generation == ($gen - 1) and .sourceSha == $sha and .captureId == $cap' >/dev/null \
+      || fail "issue 3644: pin record for run $run disagrees with the log"
+  else
+    echo "  NOTE pin record $RESTORE_CAPTURE_ID.json for run $run not readable (removed or not at the derived path); not asserted"
+  fi
+  if [ "$live" = 1 ]; then
+    [ -f "$snap" ] || fail "issue 3644: no predecessor snapshot for live run $run (taken after the kill, before the restart)"
+    cur="$(_restore_journal_value "$rows" "uzi-recovery.$branch.clone" "$run")"
+    [ "$cur" = "$(jq -r .journal "$snap")" ] || fail "issue 3644: predecessor journal of run $run changed across the restore"
+    cur="$(restore_witness_exec digest "$(jq -r .clonePath "$snap")")" || fail "issue 3644: witness could not digest the predecessor clone"
+    [ "$cur" = "$(jq -r .digest "$snap")" ] || fail "issue 3644: predecessor clone of run $run changed across the restore (before=[$(jq -r .digest "$snap")] after=[$cur])"
+    shead="$(restore_witness_exec shead "$RESTORE_ATTEMPT_PATH")" || fail "issue 3644: witness could not read the successor HEAD"
+    [[ "$shead" =~ ^[0-9a-f]{40}$ ]] || fail "issue 3644: successor HEAD [$shead] is not a commit id"
+    pass "run $run: restore witness: basis=pin=seed=$RESTORE_SOURCE_SHA, predecessor journal and clone unchanged, successor HEAD $shead (seededHead $RESTORE_SEEDED_HEAD)"
+  else
+    pass "run $run: restore witness (terminal run): log fields and basis agree on $RESTORE_SOURCE_SHA"
+  fi
+}
+
+# log_hold_census LABEL — logging only: the owner's custody holds as the API reports them.
+log_hold_census() {
+  printf 'hold census (%s): ' "$1"
+  apiget /api/recovery/holds | jq -c '{aggregate, holds: [.holds[] | {run_id, generation, state, attention, has_available_capture, capture_state}]}' \
+    || echo unreadable
+  return 0
+}
+# log_custody_entry_census — logging only (phase 72 entry): admission headroom and any queued run.
+log_custody_entry_census() {
+  local snap
+  snap="$(apiget /api/recovery/holds)" || { echo 'custody entry census: holds unreadable'; return 0; }
+  printf '%s' "$snap" | jq -r '.aggregate | "custody entry census: limit=\(.custody_hold_limit) counted=\(.admission_counted_holds) open=\(.open_holds) headroom=\(.custody_hold_limit - .admission_counted_holds)"' \
+    || echo 'custody entry census: aggregate unreadable'
+  db_psql_rows "SELECT 'custody entry census: queued run '||id||' issue '||COALESCE(issue_iid::text,'-')||' since '||created_at FROM runs
+    WHERE status = 'queued' AND user_id = (SELECT id FROM users WHERE email = '$ADMIN_EMAIL') ORDER BY created_at" \
+    || echo 'custody entry census: queued runs unreadable'
+  return 0
+}
 # --- output helpers ----------------------------------------------------------
 say()  { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
 # Read-only, bounded allocation evidence; no contents, credentials or reclamation.
@@ -199,6 +439,8 @@ cleanup() {
   # `set -u` in a function all fire the trap normally — and the cause is still unknown.
   # One line converts the next occurrence from an investigation into a reading.
   printf '\n[cleanup] EXIT trap entered (code %s)\n' "$code"
+  # #3644 witness container (restore_witness_exec): removed by its exact name; absent is the normal case.
+  docker rm -f "cdr-3644-witness-$$" >/dev/null 2>&1 || true
   storage_diagnostic_snapshot teardown || true
   # Margin report BEFORE teardown (PRD #97 M9) — on the failure path too, where it is
   # most useful: a red run's margins usually show the whole suite running hot, which is
