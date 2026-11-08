@@ -1771,7 +1771,7 @@ Design record: [ADR-3845](../adr/3845-limit-aware-automatic-harness.md).
 Design record: `prds/done/3878-overview-preview-decisions.md` (epic #3873).
 
 - A new Overview lives at `/overview/next`, linked both ways with the current Overview at `/dashboard`, which is unchanged apart from that link; both read one shared data hook. (AI-synced 2026-11-05)
-- The page header shows a greeting and one status sentence: decisions and (deduplicated) pull requests waiting on the viewer, or "Nothing needs you right now.", then executing / queued / parked counts, across the factory for admins. Admins get a compact health chip. (AI-synced 2026-11-05)
+- The page header shows a greeting and one status sentence: decisions and (deduplicated) pull requests waiting on the viewer, or "Nothing needs you right now.", then executing / queued / parked counts, across the factory for admins, where an admin's sentence also says how many people own the executing runs ("for N people"). Admins get a compact health chip and a People chip (see #4042). (AI-synced 2026-11-08)
 - On that page the app-wide banner stack renders under the header; every other page keeps it above the content. The stack never remounts on navigation, so snoozes and dismissals survive moving to and from the preview. (AI-synced 2026-11-05)
 - Needs your decision lists only the viewer's own plan reviews, questions and follow-ups, owner-action parks and open PRs for admins too, and hides when empty; items of one kind are grouped (see #4041) and each keeps its verb and age once its group is expanded. A parked run counts as resuming on its own only with evidence (account cooldown, weekly-reserve pause, limit / pool wait, a parseable scheduled retry); anything else is an owner action. Review PR opens the forge only for an https URL. (AI-synced 2026-11-07)
 - Runs are grouped Yours, then for admins Other users (admin) with the owner email (masked in demo mode); another user's waiting run reads "waits on owner". A failed admin read shows "Other users' runs are unavailable" with the last good read time, and a non-admin never calls an admin endpoint. (AI-synced 2026-11-05)
@@ -1808,6 +1808,14 @@ Design record: `prds/done/4040-overview-pending-question.md` (epic #3873).
 
 - In Needs your decision, a viewer's own awaiting_input run shows a one-line excerpt of its newest pending question under the run title, on a single row and on each expanded group item. The excerpt is sanitized and capped at 280 characters plus " (+N more)". (AI-synced 2026-11-07)
 - The excerpt is never shown on the admin all-users list, the collapsed group preview, or follow-ups (awaiting_followup). The age and the Answer action are unchanged. (AI-synced 2026-11-07)
+
+## Feature #4042 — Overview preview, People chip
+
+Design record: issue #4042 (epic #3873); target mock `prds/mockups/3873-overview-people-chip.html` (version A).
+
+- Admins get a People chip beside the health chip on `/overview/next`: up to 3 avatar initials then "+N", and "N active now of M". Active means owning a listed active run (the admin active-runs list, which excludes chat, judge and cross-check runs and stops at 500 rows; at 500 rows it reads "at least N"). M is the active accounts plus any deactivated account or unknown owner that still owns a listed active run, so N never exceeds M. A failed admin runs read shows "Active now unavailable", never stale rows; a failed user list drops "of M". Non-admins see no chip and send no admin request. (AI-synced 2026-11-08)
+- Its popover (a named dialog; Escape or an outside click closes it and returns focus) lists Active now with one pill per person ("N running · N queued · N waiting · waits on them", zero parts omitted; each run counts once, an account cooldown as waiting, a revising plan as running, an owner-action park or a pending approval, question or follow-up as "waits on them"), "(you)" and "(deactivated)"; people signed in within 24 hours with no listed active run, with their age; one Idle line ("N people, last seen X to Y days ago", never-signed-in counted separately); and "This week: N people had runs with recorded usage", unavailable when admin usage or any per-user seven-day count is missing. Names use the display name or email, masked in demo mode and stripped of unsafe characters; the UI never says "online". (AI-synced 2026-11-08)
+- The popover's "Usage by user" switches the Usage card to All users (remembered like a pick) and focuses its By user section, and reads as unavailable when admin or personal usage is missing. The admin user list is fetched on load and every 30 seconds, never on the 10-second poll. The status sentence's "for N people" counts only owners of runs it counts as executing. (AI-synced 2026-11-08)
 
 ## Demo mode branding
 
