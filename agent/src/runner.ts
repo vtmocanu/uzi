@@ -3142,6 +3142,9 @@ export interface RunnerOptions {
    *  fresh attempt from the verified pin (default true). Off, an
    *  eligible verdict stops the claim exactly as a refusal does: nonterminal, nothing written, never the legacy path. */
   independentRestore?: boolean;
+  /** TEST-ONLY (no configuration or environment variable sets it). issue #3644 PRD #3831 8.1: the named UNSAFE variant of the
+   *  restore predicate, with the R5 execution comparison disabled. Production never sets it. */
+  restoreSkipExecutionComparison?: boolean;
   memoryRuntime?: WorkerMemoryRuntime;
   /** issue #3639: the memory guard's timing, from which the receipt gate derives its sample wait. Absent: the wait cannot
    *  prove a fresh sample, so a gated claim falls back to a re-park. */
@@ -3383,6 +3386,7 @@ export class RunRunner {
   private readonly restoreIdentity: LiveIdentityOptions | undefined;
   /** issue #3644 m4b: see RunnerOptions.independentRestore. */
   private readonly independentRestore: boolean;
+  private readonly restoreSkipExecutionComparison: boolean;
   /** issue #1582 M2 — the authenticated ancestry-settlement journal (adopted predecessor holds)
    *  and the settler that drives the api settle for them. Disabled without a worker token. */
   private readonly settlement: SettlementJournal;
@@ -3587,6 +3591,7 @@ export class RunRunner {
     this.authority = opts.authority;
     this.restoreIdentity = opts.restoreIdentity;
     this.independentRestore = opts.independentRestore !== false;
+    this.restoreSkipExecutionComparison = opts.restoreSkipExecutionComparison === true;
     // issue #3404 M2 U5: the runtime's retired-tombstone finisher must not run while a binder for the path is pending.
     this.authority?.registerBinderPending(clonePath => this.completionBinderPendingAt(clonePath));
     this.memoryRuntime = opts.memoryRuntime;
@@ -27296,6 +27301,7 @@ export class RunRunner {
       },
       peekBareSlot: () => authority.peekSlot(bare),
       isAncestor: (tip, sha) => this.git.isAncestorRef(bare, tip, sha),
+      ...(this.restoreSkipExecutionComparison ? { skipExecutionComparison: true } : {}),
     };
   }
 
@@ -28241,7 +28247,9 @@ export class RunRunner {
     let candidates: RecoveryRecord[];
     try {
       // issue #3644 3.9: a restore predecessor's generations (and any below) are never settled, exempted or finalized through
-      // this pass: their hold closes only by owner discard or the server's verified-merge discard.
+      // this pass: their hold closes only by the owner's guarded discard through the restore exit (the only
+      // thing that removes the worker-side P bytes). The server's existing DiscardMergedPredecessorHold reconciliation closes
+      // only the server custody holds; no agent code path takes part in it.
       candidates = [];
       for (const record of await this.recovery.predecessorRecords(claim.run_id, flight.claimGeneration))
         if (!await this.git.restoreKeepsRecoveryRef(bare, claim.run_id, { generation: record.generation })) candidates.push(record);

@@ -416,12 +416,21 @@ describe("the restored attempt completes through the certified completion path (
     const { r, claim } = await completeRestore(t);
     const settle = (runner: Rig["runner"]) => (runner as unknown as { settlePredecessorHolds(...a: unknown[]): Promise<string> });
     const flight = { claimGeneration: claim.claim_generation! + 1, runLog: r.logs.logger };
-    mock.method(r.recovery(), "predecessorRecords", async () => [SYNTHETIC_G(r, 1)]);
-    const next = { ...claim, claim_generation: claim.claim_generation! + 1, inventory_guarded: true };
-    const outcome = await settle(r.runner).settlePredecessorHolds(next, flight, r.bare, {}, { attempts: 0, deadline: Date.now() + 3_600_000 }, new AbortController().signal);
-    assert.equal(outcome, "proceed");
+    let offered: RecoveryRecord[] = [];
+    mock.method(r.recovery(), "predecessorRecords", async () => offered);
+    const drive = async (records: RecoveryRecord[]): Promise<string> => {
+      offered = records;
+      const next = { ...claim, claim_generation: claim.claim_generation! + 1, inventory_guarded: true };
+      return settle(r.runner).settlePredecessorHolds(next, flight, r.bare, {}, { attempts: 0, deadline: Date.now() + 3_600_000 }, new AbortController().signal);
+    };
+    assert.equal(await drive([SYNTHETIC_G(r, 1)]), "proceed");
     assert.equal(logged(r, "retained predecessor FINAL skipped").length, 0,
       "no candidate survived the restore filter, so the pass never reached its gate (nor any boundary, scope or exemption): " + JSON.stringify(logged(r, "retained predecessor FINAL skipped")));
+    // S's own generation N is NOT filtered: it is still offered, so the pass reaches its disabling gate and logs the skip.
+    assert.equal(await drive([SYNTHETIC_G(r, 1), SYNTHETIC_G(r, claim.claim_generation!)]), "proceed");
+    const skips = logged(r, "retained predecessor FINAL skipped");
+    assert.equal(skips.length, 1, JSON.stringify(skips));
+    assert.equal((skips[0] as { reason?: string } | undefined)?.reason, "command_uid_unproven", JSON.stringify(skips));
   });
 });
 

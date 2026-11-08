@@ -501,6 +501,8 @@ export interface RestoreEvalInput {
   /** The bound bare's own slot (null: none). */
   bareSlot: SlotSnapshot | null;
   census: CensusResult;
+  /** TEST-ONLY (issue #3644 PRD #3831 8.1 named unsafe variant): skips the R5 execution comparison. Production never sets it. */
+  skipExecutionComparison?: boolean;
 }
 
 function sameSlot(a: BoundarySlot, b: BoundarySlot): boolean {
@@ -533,7 +535,7 @@ export async function evaluateComposeRestore(input: RestoreEvalInput): Promise<R
   if (s.crossCheck !== "ok" || p.crossCheck !== "ok") return refuse("cross_check_failed");
   // R5: a distinct, strictly older execution.
   const sameBoot = s.execution.bootId === p.execution.bootId;
-  if (sameBoot) {
+  if (sameBoot && input.skipExecutionComparison !== true) {
     if (s.execution.nsDev === p.execution.nsDev && s.execution.nsIno === p.execution.nsIno &&
         s.execution.initStartTicks === p.execution.initStartTicks) return refuse("same_execution");
     if (!(BigInt(p.execution.initStartTicks) < BigInt(s.execution.initStartTicks))) return refuse("predecessor_not_older");

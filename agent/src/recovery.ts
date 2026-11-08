@@ -690,7 +690,10 @@ export interface InventorySourceBoundaryContext {
  * `generation`. The inventory readers exclude the predecessor's clone (it is opaque) and report it only as
  * `retainedPredecessors`, so an exclusion alone would read as "nothing physical is left" and make that generation FINAL-eligible
  * the moment the successor stopped executing. Every consumer that would settle, prove or retire a record of generation
- * `generation` must refuse while this is true; the hold closes only by owner discard (or the server's verified-merge discard).
+ * `generation` must refuse while this is true; the hold closes only by the owner's guarded discard through the restore exit,
+ * which is what removes the worker-side P bytes. The server's verified-merge discard (the existing server-side
+ * DiscardMergedPredecessorHold reconciliation) closes only the server custody holds; no agent code path takes part in it
+ * and it never removes P's worker-side bytes.
  * A missing or unsafe generation holds (fail closed). The successor's own, higher generation is unaffected.
  */
 export function restorePredecessorHolds(

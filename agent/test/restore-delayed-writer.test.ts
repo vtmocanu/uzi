@@ -7,8 +7,9 @@
 //
 //   safe   : the real predicate refuses at R5 (`same_execution`) before any successor byte; the released child's write then lands
 //            with no S attribution anywhere in the bare.
-//   unsafe : only under the scratch mutation that removes the execution comparison (UZI_TEST_NO_EXECUTION_COMPARISON=1, see the
-//            skip below); S is admitted and seeds, and the released child's stale write lands AFTER the restore entry was written.
+//   unsafe : the named unsafe variant, run every time through the TEST-ONLY RunnerOptions.restoreSkipExecutionComparison seam
+//            (the R5 comparison disabled); S is admitted and seeds, and the released child's stale write lands AFTER the restore
+//            entry was written.
 import assert from "node:assert/strict";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
@@ -61,7 +62,8 @@ async function startDelayedWriter(r: Rig): Promise<Delayed> {
   };
 }
 
-const sRig = (): Promise<Rig> => buildRig({ addrAware: true, pBoundary: "same_execution", successorExecutor: new StubExecutor(nullLogger()) });
+const sRig = (unsafe = false): Promise<Rig> => buildRig({ addrAware: true, pBoundary: "same_execution", successorExecutor: new StubExecutor(nullLogger()),
+  ...(unsafe ? { runnerExtra: { restoreSkipExecutionComparison: true } } : {}) });
 
 describe("a delayed config writer whose namespace survives its worker (PRD #3831 8.1)", () => {
   it("refuses at R5 (same_execution) before any successor byte; the released child's write then lands with no S attribution present", async () => {
@@ -94,11 +96,8 @@ describe("a delayed config writer whose namespace survives its worker (PRD #3831
     assert.equal(failed(r).length, 0, "the refusal is nonterminal");
   });
 
-  // The unsafe variant is meaningful only when the execution comparison is removed (a scratch copy of restore-boundary.ts with
-  // the R5 block deleted); against the real predicate it must not run, because the real predicate never admits here.
-  const unsafe = process.env.UZI_TEST_NO_EXECUTION_COMPARISON === "1";
-  it("UNSAFE (execution comparison removed): S is admitted and the released child's stale write lands after the restore entry", { skip: !unsafe }, async () => {
-    const r = await sRig();
+  it("UNSAFE (execution comparison disabled by the test-only seam): S is admitted and the released child's stale write lands after the restore entry", async () => {
+    const r = await sRig(true);
     const writer = await startDelayedWriter(r);
     await r.runner.execute(r.claim);
     assert.equal(logged(r, "independent restore seeded").length, 1, "without the comparison S is admitted and seeds");

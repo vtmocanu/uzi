@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { afterEach, beforeEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import { DiskParkSignal } from "../src/cache-cap.js";
 import type { Executor, ExecutorResult, RunContext } from "../src/executor.js";
 import { StubExecutor } from "../src/executor.js";
@@ -120,4 +120,53 @@ describe("a restored attempt that stops without finishing keeps S and P and refu
       assert.equal(r.factoryCalls.filter(f => f.generation === 3).length, 0, "no executor was built for the refused claim");
     });
   }
+});
+
+// ---- a park signal raised after the executor swap acts on S's executor (review NB1) -------------------------------------------
+
+/** Every property read on the executor after `armed.on`, by name: the park sink's reaps and quiescence proofs call methods on it. */
+function recordingExecutor(inner: Executor, armed: { on: boolean }, used: string[]): Executor {
+  return new Proxy(inner, { get(target, prop, receiver) {
+    if (armed.on && typeof prop === "string") used.push(prop);
+    return Reflect.get(target, prop, receiver) as unknown;
+  } });
+}
+
+describe("a park signal raised inside the restore route after the executor swap (issue #3644 review NB1)", () => {
+  it("dispatchFailure's park sink runs on S's executor and never on the disposed initial one", async () => {
+    const armed = { on: false };
+    const initialUsed: string[] = [];
+    const successorUsed: string[] = [];
+    const r = await buildRig({ addrAware: true, claim: { wait_on_limit: true },
+      executor: recordingExecutor(new StubExecutor(nullLogger()), armed, initialUsed),
+      successorExecutor: recordingExecutor(new StubExecutor(nullLogger()), armed, successorUsed) });
+    const pBefore = { journal: cfgGet(r, r.journalKey), pLedger: cfgAll(r, r.ledgerKey)[0], home: treeDigest(r.runHome), provision: treeDigest(r.provisionDir) };
+    // The production guard only raises stop signals, and every other error inside the route is folded into a nonterminal route
+    // stop. A park signal can therefore escape only from the guard call a catch block makes: the journal-lock step (after the
+    // swap) fails, and the guard that catch calls is made to raise the usage limit.
+    const runner = r.runner as unknown as { retainedLifecycleGuard(flight: { restoreExecutorSwapped?: boolean }): void };
+    const original = runner.retainedLifecycleGuard.bind(runner);
+    let raised = 0;
+    let failing = false;
+    mock.method(r.recovery(), "withRestoreJournalLock", async () => { failing = true; throw new Error("journal lock step failed after the swap"); });
+    mock.method(runner, "retainedLifecycleGuard", (flight: { restoreExecutorSwapped?: boolean }) => {
+      if (failing && flight.restoreExecutorSwapped === true && raised === 0) {
+        raised++;
+        armed.on = true;
+        throw new LimitReachedError({ resetsAtMs: Date.now() + 3_600_000, rateLimitType: "five_hour" });
+      }
+      original(flight);
+    });
+    await r.runner.execute(r.claim);
+    assert.equal(raised, 1, "the park signal was raised after the swap");
+    assert.equal(logged(r, "independent restore seeded").length, 0, "the route never finished");
+    assert.equal(failed(r).length, 0, "nonterminal");
+    assert.deepEqual(initialUsed, [], "the disposed initial executor was never touched by the park: " + initialUsed.join(","));
+    assert.ok(successorUsed.length > 0, "the park sink acted on S's executor");
+    assert.equal(cfgGet(r, r.journalKey), pBefore.journal, "P's key is never written");
+    assert.equal(cfgAll(r, r.ledgerKey)[0], pBefore.pLedger);
+    assert.equal(treeDigest(r.runHome), pBefore.home, "P's HOME is untouched");
+    assert.equal(treeDigest(r.provisionDir), pBefore.provision);
+    assert.equal(fs.existsSync(r.pPath), true, "P's clone is kept");
+  });
 });

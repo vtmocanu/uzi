@@ -150,6 +150,8 @@ export interface EligibilityDeps {
   peekBareSlot(): Promise<SlotSnapshot | null>;
   /** `git merge-base --is-ancestor tip sha` in the bare only. */
   isAncestor(tip: string, sha: string): Promise<boolean>;
+  /** TEST-ONLY: forwarded to evaluateComposeRestore's skipExecutionComparison. Production never sets it. */
+  skipExecutionComparison?: boolean;
 }
 
 export interface EligibilityInput {
@@ -290,6 +292,7 @@ export async function evaluateRestoreRoute(deps: EligibilityDeps, input: Eligibi
     selfIncarnation: deps.selfIncarnation, selfRead, selfLive: live.ok ? live.identity : undefined,
     ...(live.ok ? {} : { selfLiveRefusal: live.reason }),
     predecessor: slot, predecessorFenced: false, readBoundary: deps.readBoundary, bareBusy, bareSlot, census,
+    ...(deps.skipExecutionComparison === true ? { skipExecutionComparison: true } : {}),
   });
   if (!decision.admit) return refuse(decision.reason);
   known.verdict = decision.verdict;
