@@ -1928,6 +1928,26 @@ export function composeHistoryRewrittenReason(publishedTip: string): string {
 }
 
 /**
+ * Issue #4080: the feed status for a pre-push publication refusal. On a refresh it appends one
+ * pointer to where retained work, if any, is listed (held publication, ADR-2545, then recovery),
+ * without claiming the work exists. The terminal `failure_reason` is composed separately and never
+ * carries the pointer. A run id that is not a UUID is shown as `<run-id>`. Exported for a direct test.
+ */
+export function composePrepushRefusalStatus(
+  kind: "closing" | "unknown" | "context", failureReason: string, holdEligible: boolean,
+  refresh: boolean, runId: string,
+): string {
+  const text = kind === "context" ? failureReason : kind === "unknown"
+    ? holdEligible
+      ? "Completion state could not be confirmed before push; the run is held for the owner."
+      : "Completion state could not be confirmed before push; publication stopped."
+    : `${failureReason}; work is preserved for owner history correction; partial or accept decisions cannot fix commit history.${holdEligible ? " For unpublished history on a run without a Stop, choose continue with guidance for the lead to reword its own commits; for published history or a Stop, cancel and deliver the preserved work with corrected messages." : ""}`;
+  if (!refresh) return text;
+  const id = RUN_ID_RE.test(runId) ? runId : "<run-id>";
+  return `${text}${text.endsWith(".") ? " " : ". "}Retained work, if any, is listed by uzi run held ${id} or uzi run recovery ${id}.`;
+}
+
+/**
  * PRD #1416 M2: the body of the worker-authoritative safety steer handed to the agent when the
  * runner detects the branch's history was rewritten at/below a published floor. It is uzi's own
  * guidance (armed in-process by maybeSteerOnDivergence), NOT untrusted user text, so both
@@ -10820,11 +10840,7 @@ export class RunRunner {
         ? `${refusalReason}; refused candidate ${refusedCandidate}` : refusalReason;
       const holdEligible = !refreshPublication && interlocked && !(effectiveDeclared && !this.client.hasFeature("completion_non_closing_v1"));
       batcher.emit({ kind: "status", agent: "worker", payload: {
-        text: kind === "context" ? failureReason : kind === "unknown"
-          ? holdEligible
-            ? "Completion state could not be confirmed before push; the run is held for the owner."
-            : "Completion state could not be confirmed before push; publication stopped."
-          : `${failureReason}; work is preserved for owner history correction; partial or accept decisions cannot fix commit history.${holdEligible ? " For unpublished history on a run without a Stop, choose continue with guidance for the lead to reword its own commits; for published history or a Stop, cancel and deliver the preserved work with corrected messages." : ""}`,
+        text: composePrepushRefusalStatus(kind, failureReason, holdEligible, refreshPublication, runId),
       } });
       // An old API cannot retain declared intent on a new hold. Preserve the existing terminal path.
       if (!holdEligible) {
