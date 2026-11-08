@@ -6,7 +6,7 @@
 import type { User } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { state } from "../store";
-import { mockUsers } from "../data";
+import { mockUsers, overviewNextUsers } from "../data";
 
 const jitter = () => 90 + Math.random() * 180;
 export const delay = <T>(value: T, ms = jitter()): Promise<T> =>
@@ -28,8 +28,12 @@ export function requireAdmin(): User {
 
 // Mutable copy of the seed roster (CRUD operates on this). Lives in shared
 // because several domains read it, and keeping it in its own users module would
-// make a settings → users → settings cycle later. Never reassigned.
-export let users: User[] = mockUsers.map((u) => ({ ...u }));
+// make a settings → users → settings cycle later. Never reassigned. ?mock=overview-next
+// (issue #4042) appends the scenario's extra people for the People chip; every other
+// scenario sees the base roster.
+export let users: User[] = [...mockUsers, ...(mockScenario() === "overview-next" ? overviewNextUsers : [])].map((u) => ({
+  ...u,
+}));
 
 import { mockScenario } from "../mockScenario";
 export { mockScenario } from "../mockScenario";

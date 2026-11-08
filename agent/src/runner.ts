@@ -31,7 +31,7 @@ import type { ClarificationSettlement } from "./protocol.js";
 import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
 import { MaintenanceBudget, RetainedSwitchSettlement } from "./maintenance-budget.js";
 import { MaintenanceResources } from "./recovery-maintenance.js";
-import { AuthorityRefusal, SourceUseHeldRefusal } from "./authority-lock.js";
+import { AuthorityRefusal, AuthorityShutdownRefusal, SourceUseHeldRefusal } from "./authority-lock.js";
 import type { AuthorityRuntime, AuthorityWait } from "./authority-runtime.js";
 import { leaseEpoch, leaseHarness, type SourceUseLease } from "./completion-authority.js";
 import { buildClaudeSourceCore, buildCodexSourceCore, serializeSourceFence, sourceFenceOf } from "./completion-source.js";
@@ -1931,6 +1931,26 @@ export function composeHistoryRewrittenReason(publishedTip: string): string {
       : publishedTip;
   // Belt-and-braces final net, mirroring composeBaseAlignConflictReason's caller.
   return (prefix + tip + suffix).slice(0, MAX_FAILURE_REASON_LEN);
+}
+
+/**
+ * Issue #4080: the feed status for a pre-push publication refusal. On a refresh it appends one
+ * pointer to where retained work, if any, is listed (held publication, ADR-2545, then recovery),
+ * without claiming the work exists. The terminal `failure_reason` is composed separately and never
+ * carries the pointer. A run id that is not a UUID is shown as `<run-id>`. Exported for a direct test.
+ */
+export function composePrepushRefusalStatus(
+  kind: "closing" | "unknown" | "context", failureReason: string, holdEligible: boolean,
+  refresh: boolean, runId: string,
+): string {
+  const text = kind === "context" ? failureReason : kind === "unknown"
+    ? holdEligible
+      ? "Completion state could not be confirmed before push; the run is held for the owner."
+      : "Completion state could not be confirmed before push; publication stopped."
+    : `${failureReason}; work is preserved for owner history correction; partial or accept decisions cannot fix commit history.${holdEligible ? " For unpublished history on a run without a Stop, choose continue with guidance for the lead to reword its own commits; for published history or a Stop, cancel and deliver the preserved work with corrected messages." : ""}`;
+  if (!refresh) return text;
+  const id = RUN_ID_RE.test(runId) ? runId : "<run-id>";
+  return `${text}${text.endsWith(".") ? " " : ". "}Retained work, if any, is listed by uzi run held ${id} or uzi run recovery ${id}.`;
 }
 
 /**
@@ -6006,18 +6026,19 @@ export class RunRunner {
           //      recovers the committed tree instead of cold-starting from the default branch.
           //
           // BUDGET (issue #1030 M4 / PRD #1030): this whole best-effort sequence runs inside
-          // the k8s termination grace. No terminationGracePeriodSeconds is set on the worker
-          // pod (confirmed in controller/internal/kube/materializer.go), so the default 30s
-          // applies: after SIGTERM the process must exit before SIGKILL at 30s. The local git
+          // the termination grace. Issue #4066 set the worker pod's terminationGracePeriodSeconds
+          // (controller/internal/kube/render.go) and the compose agent's stop_grace_period to 40s,
+          // covering the worker's 35s shutdown result deadline (shutdown-barrier.ts); this
+          // publication budget is unchanged and gets no share of the extra time. The local git
           // steps (marker, fetch-back) are sub-second; the ONLY step that can hang is the
           // publish RPC to the api, and the server-side maxPublishDuration is 60s — longer
           // than the entire grace — so the CLIENT must not simply await it. We cap the whole
           // sequence with a Promise.race against shutdownPublishTimeoutMs (default 15s): that
-          // leaves ~15s of the 30s grace for the runtime's own SIGTERM teardown and for the
+          // leaves ~25s of the 40s grace for the runtime's own SIGTERM teardown and for the
           // concurrently-aborted sibling runs' sequences (shutdown() aborts every active run
           // at once; their catch branches race the same wall clock, so the cost is the slowest
           // plus contention, not the sum). 15s is generous for a healthy publish yet caps a
-          // hung/unreachable forge well short of both the 30s SIGKILL and the 60s server cap.
+          // hung/unreachable forge well short of both the 40s SIGKILL and the 60s server cap.
           // issue #1597 M1: the sequence resolves to a typed ShutdownCheckpointOutcome instead of a
           // boolean, so the feed names WHY a shutdown checkpoint did not land (and a published
           // checkpoint is never misreported by a later boundary error).
@@ -6137,6 +6158,9 @@ export class RunRunner {
           const raced: ShutdownCheckpointOutcome = executor.safety
             ? await durability
             : ((await this.raceShutdownBudget(durability, this.shutdownPublishTimeoutMs)) ?? "timeout");
+          // issue #4066: a Claude race that returned without the durability sequence abandons it still running;
+          // the shutdown barrier joins it before sealing so it can still settle what it opened.
+          if (!executor.safety && raced === "timeout") this.authority?.trackProducer(durability, "claude_shutdown_durability");
           // issue #1597 M2: when a cancelled mid-turn tick left a git lock in the worker bare that
           // could not be proven its own AND that lock STILL exists, a shutdown checkpoint that did
           // not land is named for that cause — the retained lock is what blocks the fetch-back/
@@ -10902,11 +10926,7 @@ export class RunRunner {
         ? `${refusalReason}; refused candidate ${refusedCandidate}` : refusalReason;
       const holdEligible = !refreshPublication && interlocked && !(effectiveDeclared && !this.client.hasFeature("completion_non_closing_v1"));
       batcher.emit({ kind: "status", agent: "worker", payload: {
-        text: kind === "context" ? failureReason : kind === "unknown"
-          ? holdEligible
-            ? "Completion state could not be confirmed before push; the run is held for the owner."
-            : "Completion state could not be confirmed before push; publication stopped."
-          : `${failureReason}; work is preserved for owner history correction; partial or accept decisions cannot fix commit history.${holdEligible ? " For unpublished history on a run without a Stop, choose continue with guidance for the lead to reword its own commits; for published history or a Stop, cancel and deliver the preserved work with corrected messages." : ""}`,
+        text: composePrepushRefusalStatus(kind, failureReason, holdEligible, refreshPublication, runId),
       } });
       // An old API cannot retain declared intent on a new hold. Preserve the existing terminal path.
       if (!holdEligible) {
@@ -14325,9 +14345,12 @@ export class RunRunner {
     // did the preceding `running` report carry it, so the next snapshot that omits the run stamps a witnessed
     // departure charged against RUN_MAX_REQUEUES (the claimed-never-started charge), parking at
     // worker_requeue_exhausted. Otherwise the existing per-run custody bound (ADR-1751 D2a) is what stops the loop.
-    const stopOnHeldSource = (err: SourceUseHeldRefusal): never => {
+    const stopOnHeldSource = (err: SourceUseHeldRefusal | AuthorityShutdownRefusal): never => {
       this.retainedLifecycleGuard(flight);
-      flight.runLog.warn("clone path held by an earlier flight's unended source use; stopping claim for retry", {
+      // issue #4066: a shutdown refusal is the same nonterminal stop; it is never a verdict about the clone.
+      flight.runLog.warn(err instanceof AuthorityShutdownRefusal
+        ? "authority sealed for worker shutdown; stopping claim for retry"
+        : "clone path held by an earlier flight's unended source use; stopping claim for retry", {
         error: errMessage(err), claim_generation: flight.claimGeneration });
       throw new RetainedRecoveryStop({ cause: err });
     };
@@ -14341,7 +14364,7 @@ export class RunRunner {
         flight.branch = runnerClone.branch;
         await this.bindFlightSource(flight, runnerClone.path);
       } catch (err) {
-        if (err instanceof SourceUseHeldRefusal) stopOnHeldSource(err);
+        if (err instanceof SourceUseHeldRefusal || err instanceof AuthorityShutdownRefusal) stopOnHeldSource(err);
         stopOnRetiringSlot(err);
         throw err;
       }
@@ -14441,7 +14464,7 @@ export class RunRunner {
           // The SAME owner-derived validation decides; any unmet predicate fails closed.
           if (await readmitted(() => this.reclaimTerminalOrphan(barePath, claim, flight, err.journaledPath, err.branch, err.ownerRunId, err))) continue;
           await reseedAfterReclaim();
-        } else if (err instanceof SourceUseHeldRefusal) {
+        } else if (err instanceof SourceUseHeldRefusal || err instanceof AuthorityShutdownRefusal) {
           // The canonical clone path is shared by every run of the issue on this worker, so an earlier flight of
           // this process can still hold it with no confirmed end (held_unended).
           stopOnHeldSource(err);
@@ -27563,6 +27586,13 @@ export class RunRunner {
               flight.runLog.warn("retained predecessor held by an earlier flight's unended source use; stopping claim for retry", {
                 error: errMessage(error), claim_generation: flight.claimGeneration });
               await this.observeCancelAtHeldSeam(claim, flight);
+              throw new RetainedRecoveryStop({ cause: error });
+            }
+            if (error instanceof AuthorityShutdownRefusal) {
+              // issue #4066: the authority is sealed because this worker is leaving. That says nothing about the
+              // predecessor's source, so it must never become a durable preservation verdict: stop nonterminal.
+              flight.runLog.warn("retained predecessor admission refused: the worker is shutting down; stopping claim for retry", {
+                claim_generation: flight.claimGeneration });
               throw new RetainedRecoveryStop({ cause: error });
             }
             if (error instanceof AuthorityRefusal) {

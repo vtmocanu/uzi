@@ -10,6 +10,7 @@ import { MemoryRouter } from "react-router-dom";
 import { OverviewNext } from "./OverviewNext";
 import { api } from "../lib/api";
 import { healthySilentDoc } from "../mocks/data";
+import { overviewNextOwnerWorkers } from "../mocks/data/overviewNext";
 import { aRun, aUser, aWorker, authValue, emptySelf } from "./overviewFixtures";
 import { useAuth } from "../auth/AuthContext";
 
@@ -31,6 +32,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       adminListRuns: vi.fn(),
       getRecoveryHolds: vi.fn(),
       getAdminHealth: vi.fn(),
+      listUsers: vi.fn(),
     },
   };
 });
@@ -74,6 +76,7 @@ beforeEach(() => {
   mockApi.getUsage.mockResolvedValue(emptySelf());
   mockApi.getAdminUsage.mockResolvedValue({ factory: emptySelf(), users: [], earliest_run: null });
   mockApi.getAdminHealth.mockResolvedValue(healthySilentDoc());
+  mockApi.listUsers.mockResolvedValue({ users: [] });
   mockApi.getRecoveryHolds.mockResolvedValue({
     aggregate: { open_holds: 0, admission_counted_holds: 0, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0 },
     holds: [],
@@ -513,6 +516,20 @@ describe("OverviewNext capacity rail", () => {
           active_runs: 1,
           max_concurrent_runs: 2,
         }),
+        // Several problem pills at once: full slots, a dind volume at 91%, lost memory
+        // authority and a failed upgrade.
+        aWorker({
+          id: "w5",
+          name: "base.l-highmem-7c2e",
+          kind: "hosted",
+          status: "online",
+          active_runs: 2,
+          max_concurrent_runs: 2,
+          stats_disk_dind_bytes: 45_600_000_000,
+          stats_disk_dind_total_bytes: 50_000_000_000,
+          memory_authority_lost_at: "2026-07-05T11:30:00Z",
+          upgrade_status: "upgrade_failed",
+        }),
       ],
     });
     render(
@@ -528,7 +545,7 @@ describe("OverviewNext capacity rail", () => {
     await page.viewport(1280, 900);
     mountPreview();
     await screen.findByText("Capacity");
-    const stat = await screen.findByText(/cpu 34%/);
+    const stat = await screen.findByRole("progressbar", { name: "CPU", hidden: true });
     const details = stat.closest("details") as HTMLDetailsElement;
     expect(details.open).toBe(false);
     expect(stat.checkVisibility(), "closed: stat line hidden").toBe(false);
@@ -564,7 +581,8 @@ describe("OverviewNext capacity rail", () => {
       expect.soft(el.getBoundingClientRect().right, `${el.tagName}`).toBeLessThanOrEqual(rail.right + 1);
     }
     expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(window.innerWidth);
-    expectRailSummariesFit(railCard);
+    expectRailSummariesFit(railCard, 5);
+    expectFifthWorkerPills(railCard);
   });
 
   it("keeps worker names readable and rows inside the rail at 320px", async () => {
@@ -574,8 +592,101 @@ describe("OverviewNext capacity rail", () => {
     await document.fonts.ready;
     expect(window.innerWidth).toBe(320);
     const railCard = screen.getByRole("heading", { name: /Capacity/ }).closest("div.rounded-xl") as HTMLElement;
-    expectRailSummariesFit(railCard);
+    expectRailSummariesFit(railCard, 5);
+    expectFifthWorkerPills(railCard);
   });
+});
+
+// PRD #4078: the mock's owner fleet (every problem state at once) in the real rail. Problem
+// badges stay in the collapsed summary, and the expanded rows hold the gauges, runs on the
+// worker, held-work link and footer without pushing the page sideways.
+describe("OverviewNext capacity rail worker rows", () => {
+  const FLEET = overviewNextOwnerWorkers();
+
+  function mountFleet() {
+    mockApi.listWorkers.mockResolvedValue({ workers: FLEET });
+    // The viewer's own run that the disk-danger worker reports, so its row joins to a link.
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "run-mr-rework", status: "running", issue_iid: 77, issue_title: "Rework the cost cap" })],
+    });
+    render(
+      <MemoryRouter initialEntries={["/overview/next"]}>
+        <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+          <OverviewNext />
+        </main>
+      </MemoryRouter>,
+    );
+  }
+
+  const railOf = () => screen.getByRole("heading", { name: /Capacity/ }).closest("div.rounded-xl") as HTMLElement;
+  const rowOf = (rail: HTMLElement, name: string) => {
+    const label = within(rail).getByText(name);
+    return label.closest("details") as HTMLDetailsElement;
+  };
+
+  for (const width of [1280, 400]) {
+    it(`shows disk and memory-authority badges with every row closed at ${width}px`, async () => {
+      await page.viewport(width, 900);
+      mountFleet();
+      await screen.findByText("Capacity");
+      await document.fonts.ready;
+      expect(window.innerWidth).toBe(width);
+      const rail = railOf();
+      for (const d of rail.querySelectorAll("details")) expect((d as HTMLDetailsElement).open).toBe(false);
+
+      const disk = within(rail).getByText("disk 91%");
+      expect(disk.checkVisibility(), "disk badge visible while closed").toBe(true);
+      expect(disk.closest("summary")).toBe(rowOf(rail, "base.l-highmem-7c2e").querySelector("summary"));
+      const memory = within(rail).getByText("memory authority lost");
+      expect(memory.checkVisibility(), "memory authority badge visible while closed").toBe(true);
+      expect(memory.closest("summary")).toBe(rowOf(rail, "ephemeral-4b2d9e70").querySelector("summary"));
+
+      expectRailSummariesFit(rail, FLEET.length);
+      expect(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(window.innerWidth);
+    });
+  }
+
+  for (const width of [1280, 400]) {
+    it(`opens the disk-danger, offline, leased and rolling rows into gauges, runs, notes, held-work link and footer at ${width}px`, async () => {
+      await page.viewport(width, 900);
+      expect(window.innerWidth).toBe(width);
+      mountFleet();
+      await screen.findByText("Capacity");
+      await document.fonts.ready;
+      const rail = railOf();
+
+      const danger = rowOf(rail, "base.l-highmem-7c2e");
+      const offline = rowOf(rail, "ci-runner-offline");
+      const leased = rowOf(rail, "ephemeral-9e17a0d3");
+      const rolling = rowOf(rail, "base.l-highmem-b54d");
+      for (const row of [danger, offline, leased, rolling]) {
+        (row.querySelector("summary") as HTMLElement).click();
+        expect(row.open).toBe(true);
+      }
+
+      expect(within(leased).getByText(/Kept warm for same-branch follow-up work until/).checkVisibility()).toBe(true);
+      expect(within(rolling).getByText(/Takes no new runs\./).checkVisibility()).toBe(true);
+      expect(within(rolling).getByText(/Rolls to v0\.86\.1-rc\.2 once fully idle/).checkVisibility()).toBe(true);
+
+      const cpu = within(danger).getByRole("progressbar", { name: "CPU" });
+      expect(cpu.checkVisibility()).toBe(true);
+      expect(within(danger).getByText("On this worker").checkVisibility()).toBe(true);
+      const run = within(danger).getByRole("link", { name: /#77 Rework the cost cap/ });
+      expect(run.getAttribute("href")).toBe("/runs/run-mr-rework");
+      expect(within(danger).getByText("run 5e44c9d7").checkVisibility(), "unjoined run shows its short id").toBe(true);
+      expect(within(danger).getByRole("link", { name: /Review held work/ }).checkVisibility()).toBe(true);
+      expect(within(danger).getByText(/^v0\.87\.0-rc\.4 · up /).checkVisibility()).toBe(true);
+
+      expect(within(offline).getByText("Last reported").checkVisibility()).toBe(true);
+      expect(within(offline).getByText(/last seen/).checkVisibility()).toBe(true);
+
+      const railRight = rail.getBoundingClientRect().right;
+      for (const el of rail.querySelectorAll<HTMLElement>("li, li *")) {
+        expect.soft(el.getBoundingClientRect().right, `${el.tagName} ${el.textContent?.slice(0, 30)}`).toBeLessThanOrEqual(railRight + 1);
+      }
+      expect(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(window.innerWidth);
+    });
+  }
 });
 
 describe("OverviewNext held work card", () => {
@@ -630,11 +741,19 @@ describe("OverviewNext held work card", () => {
   });
 });
 
+// The several-problem-pills worker (the 5th in mountPreview) shows every pill in its summary.
+function expectFifthWorkerPills(railCard: HTMLElement) {
+  const summary = railCard.querySelectorAll<HTMLElement>("li summary")[4];
+  for (const text of ["2/2 runs", "disk 91%", "memory authority lost", "upgrade failed"]) {
+    expect(within(summary).getByText(text).checkVisibility(), `${text} visible`).toBe(true);
+  }
+}
+
 // Every worker summary stays inside its box and its name keeps a readable width, however
 // many badges the worker shows.
-function expectRailSummariesFit(railCard: HTMLElement) {
+function expectRailSummariesFit(railCard: HTMLElement, count: number) {
   const summaries = railCard.querySelectorAll<HTMLElement>("li summary");
-  expect(summaries.length).toBe(4);
+  expect(summaries.length).toBe(count);
   for (const s of summaries) {
     expect.soft(s.scrollWidth, `summary ${s.textContent?.slice(0, 30)} overflow`).toBeLessThanOrEqual(s.clientWidth + 1);
     const name = s.querySelector<HTMLElement>("[data-worker-name]") as HTMLElement;
@@ -860,5 +979,210 @@ describe("OverviewNext decision card layout", () => {
     }
     expect(card.scrollWidth, "card does not overflow").toBeLessThanOrEqual(card.clientWidth + 1);
     expect(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(window.innerWidth);
+  });
+});
+
+// #4042: the admin People chip's popover stays inside the viewport (below the chip on desktop,
+// a bottom sheet on a phone, short phones included), Escape hands focus back to the chip, and
+// its Usage by user action can be driven from the keyboard to the usage card's By user section.
+describe("OverviewNext People chip", () => {
+  const VIEWER = aUser.email;
+  const person = (id: string, email: string, display_name: string | null, last_login: string | null) => ({
+    ...aUser,
+    id,
+    email,
+    display_name,
+    last_login,
+    created_at: "2026-06-01T00:00:00Z",
+  });
+  const hoursAgo = (h: number) => new Date(Date.now() - h * 3600_000).toISOString();
+
+  beforeEach(() => {
+    localStorage.clear();
+    document.documentElement.dataset.font = "plex";
+    mockApi.adminListRuns.mockResolvedValue({
+      runs: [
+        aRun({ id: "o1", status: "running", issue_title: LONG_TITLE, owner_email: "priya@uzi.local" }),
+        aRun({ id: "o2", status: "awaiting_approval", issue_title: LONG_TITLE, owner_email: "sam@uzi.local" }),
+        aRun({ id: "o3", status: "queued", issue_title: LONG_TITLE, owner_email: "priya@uzi.local" }),
+        aRun({ id: "o4", status: "limit_wait", issue_title: LONG_TITLE, owner_email: "jordan@uzi.local" }),
+        aRun({ id: "o5", status: "awaiting_input", issue_title: LONG_TITLE, owner_email: LONG_EMAIL }),
+        aRun({ id: "o6", status: "running", issue_title: LONG_TITLE, owner_email: "lena@uzi.local" }),
+      ],
+    });
+    mockApi.listUsers.mockResolvedValue({
+      users: [
+        person("u1", VIEWER, "Admin", hoursAgo(0.1)),
+        person("u-priya", "priya@uzi.local", "Priya Desai", hoursAgo(1)),
+        person("u-sam", "sam@uzi.local", "Sam Okafor", hoursAgo(3)),
+        person("u-jordan", "jordan@uzi.local", "Jordan Lee", hoursAgo(30)),
+        person("u-lena", "lena@uzi.local", "Lena Fischer", hoursAgo(0.5)),
+        person("u-long", LONG_EMAIL, null, hoursAgo(5)),
+        person("u-elif", "elif@uzi.local", "Elif Kaya", hoursAgo(2)),
+        person("u-hana", "hana@uzi.local", "Hana Ito", hoursAgo(24 * 9)),
+        person("u-mateo", "mateo@uzi.local", "Mateo Silva", null),
+      ],
+    });
+    const self = emptySelf();
+    mockApi.getAdminUsage.mockResolvedValue({
+      factory: self,
+      users: ["u1", "u-priya", "u-sam"].map((id, i) => ({
+        user_id: id,
+        email: `${id}@uzi.local`,
+        usage: self.lifetime,
+        run_count: 4,
+        outcomes: self.outcomes.lifetime,
+        subscription_run_count: 0,
+        unreported_run_count: 0,
+        last_7_days: self.last_7_days,
+        last7_run_count: [3, 1, 0][i],
+        last7_outcomes: self.outcomes.last_7_days,
+      })),
+      earliest_run: "2026-06-01T00:00:00Z",
+    });
+  });
+  afterEach(() => {
+    delete document.documentElement.dataset.font;
+  });
+
+  async function mountChip() {
+    render(
+      <MemoryRouter initialEntries={["/overview/next"]}>
+        <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+          <OverviewNext />
+        </main>
+      </MemoryRouter>,
+    );
+    // The chip renders once the admin list has loaded; wait for the users too so the
+    // popover holds its full content (names, signed-in group, idle line) before measuring.
+    const chip = await screen.findByRole("button", { name: /^People: \d+ active now of \d+$/ });
+    // The usage data loads separately from the admin lists. Wait for the Usage card, so the
+    // footer action reads "Usage by user →" (not unavailable) and the card can be queried.
+    await screen.findByRole("group", { name: "Usage scope" });
+    await document.fonts.ready;
+    return chip;
+  }
+
+  const inViewport = (r: DOMRect, what: string) => {
+    expect.soft(r.left, `${what} left`).toBeGreaterThanOrEqual(0);
+    expect.soft(r.top, `${what} top`).toBeGreaterThanOrEqual(0);
+    expect.soft(r.right, `${what} right`).toBeLessThanOrEqual(window.innerWidth);
+    expect.soft(r.bottom, `${what} bottom`).toBeLessThanOrEqual(window.innerHeight);
+  };
+
+  for (const [width, height] of [
+    [1280, 900],
+    [400, 900],
+  ] as const) {
+    it(`opens inside the viewport and closes on Escape back to the chip at ${width}x${height}`, async () => {
+      await page.viewport(width, height);
+      const chip = await mountChip();
+      expect(window.innerWidth).toBe(width);
+      await userEvent.click(chip);
+      const dialog = await screen.findByRole("dialog", { name: "People using uzi" });
+      expect(chip.getAttribute("aria-expanded")).toBe("true");
+      // The popover holds every group the fixture feeds it.
+      expect(within(dialog).getByText("Priya Desai")).toBeTruthy();
+      expect(within(dialog).getByText("Elif Kaya")).toBeTruthy();
+      expect(within(dialog).getByText(/never signed in/)).toBeTruthy();
+      inViewport(dialog.getBoundingClientRect(), "dialog");
+      if (width === 1280) {
+        // Desktop: below the chip, right edges aligned.
+        const c = chip.getBoundingClientRect();
+        const d = dialog.getBoundingClientRect();
+        expect.soft(d.top, "below the chip").toBeGreaterThanOrEqual(c.bottom);
+        expect.soft(Math.abs(d.right - c.right), "right edge aligned to the chip").toBeLessThanOrEqual(1);
+      }
+      // No row pokes out of the dialog.
+      const dRight = dialog.getBoundingClientRect().right;
+      for (const li of dialog.querySelectorAll<HTMLElement>("li")) {
+        expect.soft(li.getBoundingClientRect().right, li.textContent?.slice(0, 30)).toBeLessThanOrEqual(dRight + 1);
+      }
+      expect(document.documentElement.scrollWidth, "no horizontal scroll").toBeLessThanOrEqual(
+        document.documentElement.clientWidth,
+      );
+
+      await userEvent.keyboard("{Escape}");
+      expect(screen.queryByRole("dialog", { name: "People using uzi" })).toBeNull();
+      expect(chip.getAttribute("aria-expanded")).toBe("false");
+      expect(document.activeElement).toBe(chip);
+    });
+  }
+
+  // A busy viewer's pill ("3 running · 2 queued · 2 waiting · waits on them") once squeezed
+  // their own name to a single letter; the name keeps a readable width and the pill wraps.
+  for (const width of [1280, 400]) {
+    it(`keeps a busy viewer's name readable beside a long pill at ${width}px`, async () => {
+      mockApi.listRuns.mockResolvedValue({
+        runs: [
+          ...["r1", "r2", "r3"].map((id) => aRun({ id, status: "running" })),
+          ...["q1", "q2"].map((id) => aRun({ id, status: "queued" })),
+          ...["l1", "l2"].map((id) => aRun({ id, status: "limit_wait" })),
+          aRun({ id: "a1", status: "awaiting_input" }),
+        ],
+      });
+      await page.viewport(width, 900);
+      const chip = await mountChip();
+      await userEvent.click(chip);
+      const dialog = await screen.findByRole("dialog", { name: "People using uzi" });
+      const row = within(dialog).getByText("(you)").closest("li") as HTMLElement;
+      const [, name, pill] = Array.from(row.children) as HTMLElement[];
+      expect(pill.textContent).toBe("3 running · 2 queued · 2 waiting · waits on them");
+      expect.soft(name.getBoundingClientRect().width, "name keeps a readable width").toBeGreaterThanOrEqual(120);
+      expect.soft(name.scrollWidth, "the viewer's short name shows whole").toBeLessThanOrEqual(name.clientWidth + 1);
+      expect.soft(pill.getBoundingClientRect().right, "pill inside the dialog").toBeLessThanOrEqual(
+        dialog.getBoundingClientRect().right,
+      );
+      expect.soft(pill.getBoundingClientRect().left, "pill right of the name").toBeGreaterThanOrEqual(
+        name.getBoundingClientRect().right,
+      );
+    });
+  }
+
+  it("fits a short phone (400x600) with the Usage by user action on screen", async () => {
+    await page.viewport(400, 600);
+    const chip = await mountChip();
+    await userEvent.click(chip);
+    const dialog = await screen.findByRole("dialog", { name: "People using uzi" });
+    inViewport(dialog.getBoundingClientRect(), "dialog");
+    const action = within(dialog).getByRole("button", { name: "Usage by user →" });
+    inViewport(action.getBoundingClientRect(), "Usage by user");
+    expect(document.documentElement.scrollWidth, "no horizontal scroll").toBeLessThanOrEqual(
+      document.documentElement.clientWidth,
+    );
+  });
+
+  it("keeps the Usage by user action pinned on screen when the sheet scrolls (400x400)", async () => {
+    await page.viewport(400, 400);
+    const chip = await mountChip();
+    await userEvent.click(chip);
+    const dialog = await screen.findByRole("dialog", { name: "People using uzi" });
+    inViewport(dialog.getBoundingClientRect(), "dialog");
+    // The content must overflow, or this case proves nothing about the sticky footer.
+    expect(dialog.scrollHeight, "sheet scrolls").toBeGreaterThan(dialog.clientHeight);
+    const action = within(dialog).getByRole("button", { name: "Usage by user →" });
+    inViewport(action.getBoundingClientRect(), "Usage by user");
+  });
+
+  it("drives Usage by user from the keyboard: Enter opens, Tab reaches the action, Enter lands on By user", async () => {
+    await page.viewport(1280, 900);
+    const chip = await mountChip();
+    const usageScope = screen.getByRole("group", { name: "Usage scope" });
+    const allUsers = within(usageScope).getByRole("button", { name: "All users" });
+    expect(allUsers.getAttribute("aria-pressed")).toBe("false");
+
+    chip.focus();
+    await userEvent.keyboard("{Enter}");
+    const dialog = await screen.findByRole("dialog", { name: "People using uzi" });
+    expect(chip.getAttribute("aria-expanded")).toBe("true");
+    await userEvent.tab();
+    const action = within(dialog).getByRole("button", { name: "Usage by user →" });
+    expect(document.activeElement).toBe(action);
+    await userEvent.keyboard("{Enter}");
+
+    expect(chip.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByRole("dialog", { name: "People using uzi" })).toBeNull();
+    expect(within(screen.getByRole("group", { name: "Usage scope" })).getByRole("button", { name: "All users" }).getAttribute("aria-pressed")).toBe("true");
+    await expect.poll(() => document.activeElement?.id).toBe("overview-usage-by-user");
   });
 });

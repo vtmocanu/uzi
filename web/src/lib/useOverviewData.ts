@@ -11,6 +11,7 @@ import {
   type RecoveryCustodyHolds,
   type RunSummaryItem,
   type SelfUsage,
+  type User,
   type Worker,
 } from "./api";
 import { hasAnthropicToken } from "./hasToken";
@@ -61,7 +62,19 @@ const ADMIN_RUNS_DEADLINE_MS = 30_000;
 
 const NO_ADMIN_RUNS: AdminRunsState = { runs: null, failed: false, lastOkAt: null };
 
-export function useOverviewData(opts?: { includeAdminRuns?: boolean; includeRecoveryHolds?: boolean }) {
+// The admin's user list: last good users (null before any success) plus a failure flag.
+export interface AdminUsersState {
+  users: User[] | null;
+  failed: boolean;
+}
+
+const NO_ADMIN_USERS: AdminUsersState = { users: null, failed: false };
+
+export function useOverviewData(opts?: {
+  includeAdminRuns?: boolean;
+  includeRecoveryHolds?: boolean;
+  includeAdminUsers?: boolean;
+}) {
   const { user } = useAuth();
   const [data, setData] = useState<Overview | null>(null);
   const [adminRuns, setAdminRuns] = useState<AdminRunsState>(NO_ADMIN_RUNS);
@@ -233,6 +246,38 @@ export function useOverviewData(opts?: { includeAdminRuns?: boolean; includeReco
   }, [loadHolds]);
   usePollWhileVisible(loadHolds, 10000);
 
+  // The admin user list (People chip, #4042) is opt-in per page AND admin-only, and rides its
+  // own request: once on mount and on the 30 s usage poll, never the 10 s poll. A failure keeps
+  // the last good users but flags `failed` (the page treats failed as unavailable) and never
+  // touches `data`, runs or usage. The same applied-id guard as holds: an older response never
+  // overwrites a newer one that already landed.
+  const usersEnabled = opts?.includeAdminUsers === true && user?.is_admin === true;
+  const [adminUsers, setAdminUsers] = useState<AdminUsersState>(NO_ADMIN_USERS);
+  const usersRequestIdRef = useRef(0);
+  const usersAppliedIdRef = useRef(0);
+  const loadUsers = useCallback(async () => {
+    if (!usersEnabled) return;
+    const id = ++usersRequestIdRef.current;
+    try {
+      const { users } = await api.listUsers();
+      if (!pollAliveRef.current || id <= usersAppliedIdRef.current) return;
+      usersAppliedIdRef.current = id;
+      setAdminUsers({ users, failed: false });
+    } catch {
+      if (!pollAliveRef.current || id <= usersAppliedIdRef.current) return;
+      setAdminUsers((prev) => ({ ...prev, failed: true }));
+    }
+  }, [usersEnabled]);
+  useEffect(() => {
+    if (!usersEnabled) {
+      // Admin revoked (or never granted): drop the list and orphan pending requests.
+      usersAppliedIdRef.current = usersRequestIdRef.current;
+      setAdminUsers(NO_ADMIN_USERS);
+      return;
+    }
+    void loadUsers();
+  }, [usersEnabled, loadUsers]);
+
   const poll = useCallback(async () => {
     try {
       const [{ runs }, { workers }] = await Promise.all([api.listRuns({ view: "summary" }), api.listWorkers()]);
@@ -264,9 +309,18 @@ export function useOverviewData(opts?: { includeAdminRuns?: boolean; includeReco
         setData((prev) => prev ? { ...prev, adminUsage } : prev);
       }).catch(() => {});
     }
-  }, [user?.is_admin]);
+    void loadUsers();
+  }, [user?.is_admin, loadUsers]);
   usePollWhileVisible(pollUsage, 30_000);
 
   // holdsFailed: a request failed and there is no good data to show (only meaningful with the opt-in).
-  return { data, usageWindow, changeUsageWindow, adminRuns, holds, holdsFailed: holdsRequestFailed && holds === null };
+  return {
+    data,
+    usageWindow,
+    changeUsageWindow,
+    adminRuns,
+    adminUsers,
+    holds,
+    holdsFailed: holdsRequestFailed && holds === null,
+  };
 }

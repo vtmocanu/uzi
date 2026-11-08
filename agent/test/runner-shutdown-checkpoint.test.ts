@@ -39,7 +39,7 @@ installHarness();
 // cold-started from the default branch. M4 mirrors the park path's ordering on the
 // shutdown branch — commitWipMarker → fetchBackBestEffort → publishCheckpointBestEffort —
 // under a client-side budget (shutdownPublishTimeoutMs) that keeps the whole sequence
-// well within the k8s termination grace (30s default), and surfaces the outcome on the
+// well within the termination grace (40s since issue #4066), and surfaces the outcome on the
 // feed (published vs NOT-published) reusing the M1 batcher-emit mechanism. The publish
 // stays on the join-token seam (client.publishCheckpoint), never a git push / PAT.
 

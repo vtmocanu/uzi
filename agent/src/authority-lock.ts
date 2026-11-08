@@ -62,6 +62,18 @@ export class SourceUseHeldRefusal extends AuthorityRefusal {
   }
 }
 
+/**
+ * issue #4066: a NEW outermost authority transaction was refused because the worker sealed its shutdown barrier.
+ * It is its own class (and carries no `kind`) so a catch that maps an AuthorityRefusal to a durable verdict can
+ * branch on it and stay fail-closed: the refusal says nothing about the source, only that this process is leaving.
+ */
+export class AuthorityShutdownRefusal extends AuthorityRefusal {
+  constructor() {
+    super("authority transaction refused: the worker is shutting down");
+    this.name = "AuthorityShutdownRefusal";
+  }
+}
+
 export interface FlockResult { code: number; output: string }
 
 /** Narrow injection points. Production callers pass nothing. */
