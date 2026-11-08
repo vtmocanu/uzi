@@ -188,6 +188,10 @@ export interface RunDecisionItem {
   run: RunSummaryItem;
   verb: "Review plan" | "Answer" | "Resume" | "Review PR";
   since: string;
+  // PRD #4040: the server's one-line excerpt of the pending question, only on an
+  // awaiting_input question item (never awaiting_followup). Untrusted model text: the card
+  // strips unsafe characters and renders it as plain text.
+  excerpt?: string;
 }
 
 // The aggregate's decision_needed holds, as ONE row. `count` is the server's aggregate
@@ -230,7 +234,11 @@ export function overviewDecisions(
 ): DecisionItem[] {
   const out: DecisionItem[] = [];
   const add = (kind: DecisionKind, runs: ReadonlyArray<RunSummaryItem>, sinceOf: (r: RunSummaryItem) => string) => {
-    const items: RunDecisionItem[] = runs.map((run) => ({ kind, run, verb: DECISION_VERB[kind], since: sinceOf(run) }));
+    const items: RunDecisionItem[] = runs.map((run) => {
+      const item: RunDecisionItem = { kind, run, verb: DECISION_VERB[kind], since: sinceOf(run) };
+      if (run.status === "awaiting_input" && run.pending_question) item.excerpt = run.pending_question;
+      return item;
+    });
     // Deterministic ordering for unparseable timestamps: they sort last and keep input order
     // (the comparator below treats two of them as equal rather than subtracting Infinity).
     const t = (i: RunDecisionItem) => {

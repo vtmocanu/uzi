@@ -39,6 +39,16 @@ The design lets a retained re-claim settle a **lower** generation's guarded inve
 
 Cleanup of predecessor records is unchanged and stays with the [ADR-2417 amendment](2417-guarded-local-retention.md#amendment-2969-predecessor-record-cleanup-deferral).
 
+## Amendment 2026-11-07: orphan reclaim and enrolled secret-scan remediation (#4058)
+
+Source selection only. Retirement of an enrolled journal (one carrying an active secret-scan
+`remediationRecovery` record bound to the same run, clone path and branch) still refuses. What changed is
+the successor's outcome: it now holds for its owner at `recovery_wait` / `retained_recovery_adoption_failed`
+instead of failing terminally with an untyped refusal, and a retained enrolled journal is no longer detached
+by an orphan reclaim. No retirement, rebind or discard authority is added, and the owner-disposition surface
+(D6) is unchanged. See the
+[ADR-1197 amendment](1197-transient-recovery-park.md#amendment-2026-11-07-4058-a-successor-holds-for-its-owner-when-a-terminal-predecessors-source-is-under-remediation).
+
 ## Amendment 2026-11-04: operator local-record resolution (#3885)
 
 A worker-local operator command can now retire guarded local recovery records,

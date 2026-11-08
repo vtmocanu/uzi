@@ -93,6 +93,33 @@ describe("overview-next mock scenario", () => {
     expect((await plain.listWorkers()).workers.some((w) => w.id.startsWith("w-ov-"))).toBe(false);
   });
 
+  // PRD #4040: the owner list carries the pending-question excerpt on the seeded own
+  // awaiting_input run only; the admin list never does, in either view, for any owner.
+  it("puts pending_question on the viewer's seeded asking run only, never on admin rows", async () => {
+    const api = await freshApi("overview-next");
+    for (const own of [(await api.listRuns({ view: "summary" })).runs, (await api.listRuns()).runs]) {
+      const carriers = own.filter((r) => r.pending_question !== undefined);
+      expect(carriers.map((r) => [r.id, r.pending_question])).toEqual([
+        ["run-ov-own-asking", "Should the cap count exports that are still queued?"],
+      ]);
+      expect(own.find((r) => r.id === "run-ov-own-asking")).toMatchObject({ status: "awaiting_input", issue_iid: 409 });
+      // The malformed-payload fixture gets no excerpt, as the server rule gives none.
+      expect(own.find((r) => r.id === "run-unreadable-question")).toBeDefined();
+      expect(own.find((r) => r.id === "run-unreadable-question")).not.toHaveProperty("pending_question");
+    }
+    for (const factory of [(await api.adminListRuns({ view: "summary" })).runs, (await api.adminListRuns()).runs]) {
+      expect(factory.find((r) => r.id === "run-ov-omar-asking")).toMatchObject({ status: "awaiting_input" });
+      expect(factory.find((r) => r.id === "run-ov-own-asking")).toMatchObject({ status: "awaiting_input" });
+      for (const r of factory) expect(r, r.id).not.toHaveProperty("pending_question");
+    }
+    // The run's log holds the question the excerpt quotes.
+    const log = await api.getRunMessages("run-ov-own-asking");
+    expect(log.messages.find((m) => m.kind === "question")?.payload).toMatchObject({
+      question_id: expect.any(String),
+      questions: [{ question: "Should the cap count exports that are still queued?" }],
+    });
+  });
+
   it("seeds none of it outside the scenario", async () => {
     const api = await freshApi(null);
     const factory = (await api.adminListRuns({ view: "summary" })).runs;

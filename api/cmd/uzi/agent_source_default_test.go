@@ -78,3 +78,51 @@ func TestRunGetAgentSourceRows(t *testing.T) {
 		})
 	}
 }
+
+func TestRunGetPlannedWithRow(t *testing.T) {
+	s := func(v string) *string { return &v }
+	for _, tc := range []struct {
+		name string
+		run  apitypes.RunDTO
+		want string
+	}{
+		{"repo default planned and implemented with repo agents", apitypes.RunDTO{ID: "r1", Status: "running",
+			AgentSourceRequested: s("repo"), AgentSourceRequestedBasis: s("repo_default"), PlanAgentSource: s("repo"), AgentSource: s("repo")},
+			"repo agents (repo default)"},
+		{"per-run request", apitypes.RunDTO{ID: "r1", Status: "awaiting_approval",
+			AgentSourceRequested: s("own"), AgentSourceRequestedBasis: s("explicit"), PlanAgentSource: s("own")},
+			"my templates (this run)"},
+		{"requested repo planned with own templates", apitypes.RunDTO{ID: "r1", Status: "awaiting_approval",
+			AgentSourceRequested: s("repo"), AgentSourceRequestedBasis: s("repo_default"), PlanAgentSource: s("own")},
+			"my templates"},
+		{"seeded run with no plan turn", apitypes.RunDTO{ID: "r1", Status: "running",
+			AgentSourceRequested: s("repo"), AgentSourceRequestedBasis: s("explicit"), AgentSource: s("repo")},
+			"—"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": tc.run}}
+			out, _, code := runCLI(t, fakeEnv(fc), "run", "get", "r1")
+			if code != uzicli.ExitOK {
+				t.Fatalf("exit = %d", code)
+			}
+			var row string
+			for _, line := range strings.Split(out, "\n") {
+				if strings.HasPrefix(strings.TrimSpace(line), "PLANNED_WITH") {
+					row = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "PLANNED_WITH"))
+				}
+			}
+			if row != tc.want {
+				t.Errorf("PLANNED_WITH = %q, want %q:\n%s", row, tc.want, out)
+			}
+		})
+	}
+
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": {ID: "r1", Status: "running", PlanAgentSource: s("own"), AgentSource: s("repo")}}}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "get", "r1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d", code)
+	}
+	if strings.Contains(out, "PLANNED_WITH") {
+		t.Errorf("an unset request shows no PLANNED_WITH row:\n%s", out)
+	}
+}

@@ -259,6 +259,24 @@ describe("overviewDecisions", () => {
     return d.run;
   };
 
+  // PRD #4040: the server's pending-question excerpt rides only awaiting_input question items.
+  it("carries the pending-question excerpt on awaiting_input items only", () => {
+    const got = overviewDecisions([
+      run({ id: "ask", status: "awaiting_input", status_since: at(1), pending_question: "Keep the cap?" }),
+      run({ id: "follow", status: "awaiting_followup", status_since: at(2), pending_question: "Not shown" }),
+      run({ id: "missing", status: "awaiting_input", status_since: at(3) }),
+      run({ id: "empty", status: "awaiting_input", status_since: at(4), pending_question: "" }),
+      run({ id: "plan", status: "awaiting_approval", status_since: at(5), pending_question: "Not shown" }),
+    ]);
+    const byId = new Map(got.map((d) => [runOf(d).id, d]));
+    expect(byId.get("ask")).toMatchObject({ kind: "question", excerpt: "Keep the cap?" });
+    for (const id of ["follow", "missing", "empty", "plan"]) {
+      expect(byId.get(id), id).toBeDefined();
+      expect(Object.prototype.hasOwnProperty.call(byId.get(id), "excerpt"), id).toBe(false);
+    }
+    expect(byId.get("follow")?.kind).toBe("question");
+  });
+
   it("excludes revising plans, stalled running runs and the weekly-reserve pause; includes owner parks", () => {
     const got = overviewDecisions([
       run({ id: "revising", status: "awaiting_approval", is_revising: true }),

@@ -18,6 +18,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/runpresentation"
+	"github.com/vtmocanu/uzi/api/internal/runquestion"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -420,7 +421,7 @@ func (n *Notifier) handleQuestion(ctx context.Context, rc store.GetSlackRunConte
 		}
 		return
 	}
-	q, ok := parseQuestionPayload(raw)
+	q, ok := runquestion.Parse(raw)
 	if !ok {
 		n.logf("parse question payload", fmt.Errorf("run %s: unusable question payload", rc.ID))
 		return

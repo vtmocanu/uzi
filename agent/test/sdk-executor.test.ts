@@ -40,6 +40,8 @@ import {
   GATE_APPROVED_FRESH_SESSION_GUIDANCE,
   CURRENT_EXECUTION_STATE_GUIDANCE,
   REVIEWED_RESUME_APPROVAL_GUIDANCE,
+  REPO_SUBAGENT_UNTRUSTED_APPEND,
+  REPO_SUBAGENT_PLANNING_APPEND,
 } from "../src/prompt.js";
 import type { WorkerClient } from "../src/client.js";
 import type {
@@ -3015,6 +3017,175 @@ describe("SdkExecutor model precedence on baseOptions", () => {
     const o = turns[0]!.options;
     assert.strictEqual(o.model, undefined);
     assert.ok(!("model" in o), "model key must be omitted, not set to undefined");
+  });
+});
+
+describe("SdkExecutor plan turn agent source (PRD #3914 M3)", () => {
+  async function planWith(overrides: Partial<RunContext>, verdict: PlanVerdict = { kind: "approve", selection: { status: "absent" } }) {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const reported: string[] = [];
+    const probe = makeCtx({
+      agents: [lead, coder, reviewer],
+      reportPlanAgentSource: async (source) => { reported.push(source); },
+      ...overrides,
+    }, verdict);
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    return { turns, probe, result, reported };
+  }
+
+  function delegatesOf(prompt: string | undefined): string | undefined {
+    return (prompt ?? "").split("\n").find((l) => l.startsWith("Available subagents to delegate to:"));
+  }
+
+  async function agentDecision(options: SdkOptions, subagent: string): Promise<string | undefined> {
+    const guard = options.hooks!.PreToolUse!.find((m) => m.matcher === "Agent")!.hooks[0]!;
+    const out = await guard(
+      { hook_event_name: "PreToolUse", tool_name: "Agent", tool_input: { subagent_type: subagent } } as unknown as HookInput,
+      "tu",
+      { signal: new AbortController().signal },
+    );
+    return (out as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput?.permissionDecision;
+  }
+
+  it("a requested repo source with a roster plans with the repo agents, write tools stripped", async () => {
+    const { turns, reported, probe } = await planWith({ repoAgents: [repoCoder, repoAuditor], requestedAgentSource: "repo" });
+    const plan = turns[0]!.options;
+    assert.deepStrictEqual(Object.keys(plan.agents ?? {}), ["coder", "auditor"]);
+    assert.strictEqual(plan.agents!.coder!.prompt, withNudge("REPO CODER BODY"));
+    assert.deepStrictEqual(plan.agents!.coder!.tools, ["Read", "Bash", "WebFetch", FINDINGS_TOOL]);
+    for (const name of ["coder", "auditor"]) {
+      for (const t of ["Edit", "Write", "MultiEdit", "NotebookEdit"]) {
+        assert.ok(plan.agents![name]!.disallowedTools?.includes(t), `${name} is denied ${t} while planning`);
+      }
+      assert.ok(plan.agents![name]!.disallowedTools?.includes("Agent"), `${name} keeps the structural Agent denial`);
+    }
+    assert.strictEqual(plan.agents!.auditor!.tools, undefined);
+    assert.strictEqual(
+      delegatesOf(turns[0]!.promptText),
+      "Available subagents to delegate to: coder (can edit files), auditor (can edit files).",
+    );
+    assert.strictEqual(await agentDecision(plan, "reviewer"), "deny");
+    assert.notStrictEqual(await agentDecision(plan, "auditor"), "deny");
+    const append = appendOf(plan.systemPrompt);
+    assert.ok(append.includes(REPO_SUBAGENT_UNTRUSTED_APPEND), "the plan prompt carries the untrusted framing");
+    assert.ok(append.includes(REPO_SUBAGENT_PLANNING_APPEND), "the plan prompt says planning subagents do not change files");
+    assert.strictEqual(REPO_SUBAGENT_PLANNING_APPEND, "Planning subagents report findings; they do not change files.");
+    assert.deepStrictEqual(reported, ["repo"]);
+    assert.ok(probe.emits.some((m) => String(m.payload.text ?? "") === "planning with the repo's agents (coder, auditor)"));
+    assert.deepStrictEqual(Object.keys(turns[1]!.options.agents ?? {}).sort(), ["auditor", "coder"]);
+  });
+
+  it("an unset request plans with the owner templates and no untrusted framing", async () => {
+    const { turns, reported } = await planWith({ repoAgents: [repoCoder, repoAuditor] });
+    const plan = turns[0]!.options;
+    assert.deepStrictEqual(Object.keys(plan.agents ?? {}).sort(), ["coder", "reviewer"]);
+    assert.strictEqual(plan.agents!.coder!.prompt, withNudge("You implement."));
+    assert.ok(!appendOf(plan.systemPrompt).includes(REPO_SUBAGENT_UNTRUSTED_APPEND));
+    assert.ok(!appendOf(plan.systemPrompt).includes(REPO_SUBAGENT_PLANNING_APPEND));
+    assert.deepStrictEqual(reported, ["own"]);
+  });
+
+  it("a requested own source plans with the owner templates", async () => {
+    const { turns, reported } = await planWith({ repoAgents: [repoCoder, repoAuditor], requestedAgentSource: "own" });
+    assert.deepStrictEqual(Object.keys(turns[0]!.options.agents ?? {}).sort(), ["coder", "reviewer"]);
+    assert.ok(!appendOf(turns[0]!.options.systemPrompt).includes(REPO_SUBAGENT_UNTRUSTED_APPEND));
+    assert.deepStrictEqual(reported, ["own"]);
+  });
+
+  it("a requested repo source with no roster plans with the owner templates", async () => {
+    const { turns, reported } = await planWith({ requestedAgentSource: "repo" });
+    assert.deepStrictEqual(Object.keys(turns[0]!.options.agents ?? {}).sort(), ["coder", "reviewer"]);
+    assert.ok(!appendOf(turns[0]!.options.systemPrompt).includes(REPO_SUBAGENT_UNTRUSTED_APPEND));
+    assert.deepStrictEqual(reported, ["own"]);
+  });
+
+  it("a replan with a persisted own source plans with the owner templates", async () => {
+    const { turns, reported } = await planWith({
+      repoAgents: [repoCoder, repoAuditor], requestedAgentSource: "repo", approvedSelection: { source: "own", exclusions: [] },
+    });
+    assert.deepStrictEqual(Object.keys(turns[0]!.options.agents ?? {}).sort(), ["coder", "reviewer"]);
+    assert.ok(!appendOf(turns[0]!.options.systemPrompt).includes(REPO_SUBAGENT_UNTRUSTED_APPEND));
+    assert.deepStrictEqual(reported, ["own"]);
+  });
+
+  it("an unset request with a persisted repo source from autopilot plans with the owner templates", async () => {
+    const { turns, reported } = await planWith({
+      repoAgents: [repoCoder, repoAuditor], approvedSelection: { source: "repo", exclusions: [] },
+    });
+    assert.deepStrictEqual(Object.keys(turns[0]!.options.agents ?? {}).sort(), ["coder", "reviewer"]);
+    assert.ok(!appendOf(turns[0]!.options.systemPrompt).includes(REPO_SUBAGENT_UNTRUSTED_APPEND));
+    assert.deepStrictEqual(reported, ["own"]);
+  });
+
+  it("a persisted repo source keeps its exclusions on a repo-sourced replan", async () => {
+    const { turns, reported } = await planWith({
+      repoAgents: [repoCoder, repoAuditor], requestedAgentSource: "repo", approvedSelection: { source: "repo", exclusions: ["auditor"] },
+    });
+    assert.deepStrictEqual(Object.keys(turns[0]!.options.agents ?? {}), ["coder"]);
+    assert.strictEqual(await agentDecision(turns[0]!.options, "auditor"), "deny");
+    assert.deepStrictEqual(reported, ["repo"]);
+  });
+
+  it("a revision turn keeps the repo-sourced plan roster and framing", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [submitPlan("plan 2"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const reported: string[] = [];
+    const probe = makeCtx({
+      agents: [lead, coder, reviewer], repoAgents: [repoCoder, repoAuditor], requestedAgentSource: "repo",
+      reportPlanAgentSource: async (source) => { reported.push(source); },
+    }, [{ kind: "revise", feedback: "tighten it" } as PlanVerdict, { kind: "approve", selection: { status: "absent" } }]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    for (const turn of [turns[0]!, turns[1]!]) {
+      assert.deepStrictEqual(Object.keys(turn.options.agents ?? {}), ["coder", "auditor"]);
+      assert.ok(appendOf(turn.options.systemPrompt).includes(REPO_SUBAGENT_PLANNING_APPEND));
+    }
+    assert.deepStrictEqual(reported, ["repo"]);
+  });
+
+  it("the run model overrides a pinned repo planning agent", async () => {
+    const { turns } = await planWith({
+      repoAgents: [repoCoder, { ...repoAuditor, model: "opus" }], requestedAgentSource: "repo",
+      config: { default_model: "fable", override_subagent_model: true },
+    });
+    assert.strictEqual(turns[0]!.options.agents!.auditor!.model, "fable");
+  });
+
+  it("a repo agent whose tools are only write tools does not plan", async () => {
+    const penman: AgentTemplate = { name: "penman", description: "writes", prompt_body: "PENMAN", tools: ["Write", "Edit"] };
+    const { turns, probe } = await planWith({ repoAgents: [repoAuditor, penman], requestedAgentSource: "repo" });
+    assert.deepStrictEqual(Object.keys(turns[0]!.options.agents ?? {}), ["auditor"]);
+    assert.strictEqual(await agentDecision(turns[0]!.options, "penman"), "deny");
+    assert.ok(probe.emits.some((m) => String(m.payload.text ?? "").startsWith("not planning with penman")));
+  });
+
+  it("a pre-approved resume reports no plan source", async () => {
+    const { queryFn } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const reported: string[] = [];
+    const probe = makeCtx({
+      planApproved: true, sessionId: "sess-parked", approvedPlan: "# Approved plan",
+      agents: [lead, coder, reviewer], repoAgents: [repoCoder], requestedAgentSource: "repo",
+      reportPlanAgentSource: async (source) => { reported.push(source); },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.deepStrictEqual(reported, []);
+  });
+
+  it("a seeded run reports no plan source", async () => {
+    const { queryFn } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const reported: string[] = [];
+    const probe = makeCtx({
+      planApproved: true, seeded: true, approvedPlan: "# Seeded plan",
+      agents: [lead, coder, reviewer], repoAgents: [repoCoder], requestedAgentSource: "repo",
+      reportPlanAgentSource: async (source) => { reported.push(source); },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.deepStrictEqual(reported, []);
   });
 });
 

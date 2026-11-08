@@ -1249,10 +1249,12 @@ describe("AgentRosterSummary — roster revision (issue #3913)", () => {
 
 describe("AgentRosterSummary — requested agent source (PRD #3914)", () => {
   it.each([
-    ["own", "own", "repo_default", "Requested: my templates (repo default) · Implemented with: my templates (as requested)"],
-    ["repo", "own", "explicit", "Requested: repo agents (this run) · Implemented with: my templates (changed at approval)"],
-    ["repo", "repo", "repo_default", "Requested: repo agents (repo default) · Implemented with: repo agents (as requested)"],
-  ] as const)("requested %s, implemented %s (%s)", (requested, implemented, basis, line) => {
+    ["own", "own", "own", "repo_default", "Planned with: my templates (repo default) · Implemented with: my templates (as requested)"],
+    ["repo", "repo", "own", "explicit", "Planned with: repo agents (this run) · Implemented with: my templates (changed at approval)"],
+    ["repo", "repo", "repo", "repo_default", "Planned with: repo agents (repo default) · Implemented with: repo agents (as requested)"],
+    ["repo", "own", "own", "repo_default", "Requested: repo agents (repo default) · Planned with: my templates · Implemented with: my templates (changed at approval)"],
+    ["repo", null, "repo", "explicit", "Requested: repo agents (this run) · Planned with: — · Implemented with: repo agents (as requested)"],
+  ] as const)("requested %s, planned %s, implemented %s (%s)", (requested, planned, implemented, basis, line) => {
     render(
       <AgentRosterSummary
         run={run({
@@ -1260,6 +1262,7 @@ describe("AgentRosterSummary — requested agent source (PRD #3914)", () => {
           agent_source: implemented,
           agent_source_requested: requested,
           agent_source_requested_basis: basis,
+          plan_agent_source: planned,
           own_agents: [agent("coder")],
           repo_agents: [{ name: "site-plan-check", description: "d" }],
         })}
@@ -1269,8 +1272,9 @@ describe("AgentRosterSummary — requested agent source (PRD #3914)", () => {
   });
 
   it("an unset run shows no requested line", () => {
-    render(<AgentRosterSummary run={run({ status: "running", agent_source: "repo", repo_agents: [agent("coder")] })} />);
+    render(<AgentRosterSummary run={run({ status: "running", agent_source: "repo", plan_agent_source: "own", repo_agents: [agent("coder")] })} />);
     expect(screen.queryByText(/Requested:/)).toBeNull();
+    expect(screen.queryByText(/Planned with:/)).toBeNull();
     expect(screen.queryByText(/Implemented with:/)).toBeNull();
   });
 });

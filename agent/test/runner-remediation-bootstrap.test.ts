@@ -18,6 +18,7 @@ import { SteeringChannel } from "../src/steering.js";
 import { formatAttemptId } from "../src/attempt-path.js";
 import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
 import { portableTeardownTestDeps } from "./teardown-fixtures.js";
+import { legacyProtectedDetach } from "./legacy-protected-detach.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness } from "./runner-harness.js";
 
 installHarness();
@@ -63,7 +64,7 @@ async function fixture(enrolled = true) {
   const detach = async () => {
     const reservation = await git.reserveRecoveryIteration(bare, BRANCH, KEY, source);
     await git.recordRecoveryCapture(bare, BRANCH, KEY, source, reservation.attempts, s, s);
-    await git.detachTerminalRetained(bare, BRANCH, KEY, journal());
+    await legacyProtectedDetach(git, bare, BRANCH, KEY, journal());
   };
   const fresh = (authority?: AuthorityRuntime) => {
     const cache = new GitCache(fx.dataDir, nullLogger(), undefined,

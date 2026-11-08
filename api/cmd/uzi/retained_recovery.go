@@ -51,6 +51,9 @@ func recoveryDecisionLine(r apitypes.RunDTO) string {
 		state = recoveryDecisionName(r) + " · timed retry not before " + r.RecoveryRetryNotBefore.UTC().Format(time.RFC3339) + "; retry may still be pending"
 	}
 	guidance := idleStallResumeGuidance(r)
+	if strOr(r.RecoveryWaitCause, "") == retainedRecoveryAdoptionFailedCause {
+		guidance = "Resume starts another recovery episode. If the block persists, the run can hold again. Each new claim adds a custody hold. Resolve the cause before resuming."
+	}
 	if guidance != "" {
 		guidance = " · " + guidance
 	}
@@ -62,10 +65,14 @@ func recoveryDecisionLine(r apitypes.RunDTO) string {
 func recoveryDecisionTUILines(r apitypes.RunDTO) []string {
 	if strOr(r.RecoveryWaitCause, "") == retainedRecoveryAdoptionFailedCause {
 		return append([]string{
-			"Retained recovery adoption failed.",
-			"Integrity check refused adoption.",
+			"Integrity hold: the agent did not start.",
+			"Adoption or a remediation record refused source use.",
 			"Local work and custody preserved.",
 			"Owner-held · no automatic resume.",
+			"Resume starts another recovery episode.",
+			"If the block persists, the run can hold again.",
+			"Each new claim adds a custody hold.",
+			"Resolve the cause before resuming.",
 			"Owner Resume or Cancel:",
 			"Resume: uzi run resume " + cellText(r.ID),
 			"Cancel: uzi run cancel " + cellText(r.ID) + " (terminal)",
@@ -132,7 +139,7 @@ func workerHoldNoticeKey(r apitypes.RunDTO) string {
 
 func recoveryDecisionName(r apitypes.RunDTO) string {
 	if strOr(r.RecoveryWaitCause, "") == retainedRecoveryAdoptionFailedCause {
-		return "retained recovery adoption failed · integrity check refused adoption · local work and custody preserved"
+		return "integrity hold · retained adoption or a predecessor remediation record refused source use · local work and custody preserved"
 	}
 	if strOr(r.RecoveryWaitCause, "") == retainedContinuationUnwitnessedCause {
 		return "retained continuation not witnessed · owner decision needed · claim released · local work and custody kept · no retry scheduled"

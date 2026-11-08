@@ -37,6 +37,7 @@ import {
   CURRENT_EXECUTION_STATE_GUIDANCE,
   FOLLOW_UP_TRAILER,
   REPO_SUBAGENT_UNTRUSTED_APPEND,
+  REPO_SUBAGENT_PLANNING_APPEND,
   SECRET_FIXTURE_HYGIENE_APPEND,
   LEAD_GATE_SEQUENCING_APPEND,
   LEAD_FAST_CHECK_APPEND,
@@ -1421,6 +1422,17 @@ describe("buildLeadSystemPrompt", () => {
     const repo = buildLeadSystemPrompt("lead body", { repoSourced: true });
     assert.ok(repo.append.endsWith(REPO_SUBAGENT_UNTRUSTED_APPEND), "repo source: passage appended last");
     assert.match(REPO_SUBAGENT_UNTRUSTED_APPEND, /UNVERIFIED/);
+  });
+
+  it("a repo-sourced planning prompt adds the planning line after the untrusted passage (PRD #3914 M3)", () => {
+    const plan = buildLeadSystemPrompt("lead body", { repoSourced: true, planning: true }).append;
+    assert.ok(plan.endsWith(`${REPO_SUBAGENT_UNTRUSTED_APPEND}\n\n${REPO_SUBAGENT_PLANNING_APPEND}`));
+    const ownPlan = buildLeadSystemPrompt("lead body", { repoSourced: false, planning: true }).append;
+    assert.ok(!ownPlan.includes(REPO_SUBAGENT_PLANNING_APPEND));
+    assert.ok(!ownPlan.includes(REPO_SUBAGENT_UNTRUSTED_APPEND));
+    assert.equal(ownPlan, buildLeadSystemPrompt("lead body", {}).append, "an own-source plan prompt is unchanged");
+    const implement = buildLeadSystemPrompt("lead body", { repoSourced: true }).append;
+    assert.ok(!implement.includes(REPO_SUBAGENT_PLANNING_APPEND));
   });
 
   it("the repo-agent passage audits revision-linked evidence instead of rechecking everything (#3912)", () => {
