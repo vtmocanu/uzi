@@ -59,7 +59,7 @@ func (h *Handler) CreateCIFixRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	f, err := h.forgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("build forge for connection", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -97,7 +97,16 @@ func (h *Handler) CreateCIFixRun(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		var unresolved *workersvc.CIFixPRUnresolvedError
 		switch {
+		case errors.As(err, &unresolved):
+			// Reason is a fixed uzi-authored string, never forge text.
+			httpx.Error(w, http.StatusConflict, "could not determine which pull request this branch belongs to: "+unresolved.Reason)
+		case errors.Is(err, workersvc.ErrCIFixBindingChanged):
+			httpx.Error(w, http.StatusConflict, "the branch's pull-request association changed while creating the CI fix; retry")
+		case errors.Is(err, workersvc.ErrCIFixPRUnavailable):
+			// err wraps the driver error, which is already PAT-redacted.
+			httpx.Error(w, http.StatusBadGateway, "could not verify the branch's pull request: "+err.Error())
 		case errors.Is(err, workersvc.ErrRepoNotFound):
 			httpx.Error(w, http.StatusNotFound, "repo not found")
 		case errors.Is(err, workersvc.ErrActiveFixExists):

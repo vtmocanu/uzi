@@ -50,6 +50,8 @@ type fakeStore struct {
 	promoteVaultLocked func(context.Context, uuid.UUID) ([]store.PromoteVaultLockedRecoveryWaitRunsRow, error)
 	// reviseErr forces CreateRunReviseInputIfUnderCap to fail (PRD #1795: a 0-row race).
 	reviseErr error
+	// ciFixCandidatesFn overrides ListCIFixBindingCandidates (issue #4079).
+	ciFixCandidatesFn func() ([]int64, error)
 	Store
 
 	// Claim path.
@@ -1852,6 +1854,19 @@ func (f *fakeStore) CountActiveBranchRunsForRef(context.Context, store.CountActi
 }
 func (f *fakeStore) HasActiveIssueRunForIID(context.Context, store.HasActiveIssueRunForIIDParams) (bool, error) {
 	return f.activeIssueRunForIID, nil
+}
+
+// GetActiveCIFixTargetForRef reports no active ci_fix on the ref (ErrNoRows), and
+// ListCIFixBindingCandidates an empty candidate set, unless a test sets the fields below
+// (issue #4079).
+func (f *fakeStore) GetActiveCIFixTargetForRef(context.Context, store.GetActiveCIFixTargetForRefParams) (pgtype.Int8, error) {
+	return pgtype.Int8{}, pgx.ErrNoRows
+}
+func (f *fakeStore) ListCIFixBindingCandidates(context.Context, store.ListCIFixBindingCandidatesParams) ([]int64, error) {
+	if f.ciFixCandidatesFn != nil {
+		return f.ciFixCandidatesFn()
+	}
+	return []int64{}, nil
 }
 
 // LockRunBranch is a no-op: the in-memory fake has no transaction to serialize (issue #1626).

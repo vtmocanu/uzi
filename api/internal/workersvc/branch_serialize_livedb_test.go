@@ -155,15 +155,18 @@ func TestActiveCIFixBlocksUnforcedIssueRunLiveDB(t *testing.T) {
 func TestConcurrentBranchCreatesSerializeLiveDB(t *testing.T) {
 	const k = 8
 	pairs := []struct {
-		name  string
-		base  int64
-		other func(svc *Service, env codexTestEnv, userID, repoID, source uuid.UUID, n int64) error
+		name string
+		base int64
+		// forges wires the issue #4079 PR-binding forge fake: the ci_fix side reads the
+		// seeded source run's recorded PR from the forge before it takes the run-branch lock.
+		forges bool
+		other  func(svc *Service, env codexTestEnv, userID, repoID, source uuid.UUID, n int64) error
 	}{
-		{"issue_vs_mr_rework", 17000, func(svc *Service, env codexTestEnv, userID, repoID, source uuid.UUID, n int64) error {
+		{"issue_vs_mr_rework", 17000, false, func(svc *Service, env codexTestEnv, userID, repoID, source uuid.UUID, n int64) error {
 			_, err := svc.CreateAutoMRReworkRun(env.ctx, userID, repoID, agentIssueBranch(n), n*10, source, "Rework MR review", "desc", nil)
 			return err
 		}},
-		{"issue_vs_ci_fix", 18000, func(svc *Service, env codexTestEnv, userID, repoID, _ uuid.UUID, n int64) error {
+		{"issue_vs_ci_fix", 18000, true, func(svc *Service, env codexTestEnv, userID, repoID, _ uuid.UUID, n int64) error {
 			ref := agentIssueBranch(n)
 			_, err := svc.CreateAutoCIFixRun(env.ctx, userID, repoID, ref, "Fix CI", "d", ciFixSnapshot(ref, n*10), nil)
 			return err
@@ -172,6 +175,14 @@ func TestConcurrentBranchCreatesSerializeLiveDB(t *testing.T) {
 	for _, p := range pairs {
 		t.Run(p.name, func(t *testing.T) {
 			env, svc, userID, repoID := branchSerializeEnv(t)
+			// The ci_fix side gets its OWN Service wired with the forge fake: a forge on the
+			// shared one would also change how CreateRun reads its issue.
+			otherSvc := svc
+			if p.forges {
+				otherSvc = New(env.q, env.box, Params{})
+				otherSvc.SetTxBeginner(env.pool)
+				otherSvc.SetForges(bindingBuilder{&mergedEverywhereForge{}})
+			}
 			issueWins, otherWins := 0, 0
 			for i := int64(0); i < k; i++ {
 				n := p.base + i
@@ -190,7 +201,7 @@ func TestConcurrentBranchCreatesSerializeLiveDB(t *testing.T) {
 				go func() {
 					defer wg.Done()
 					<-start
-					otherErr = p.other(svc, env, userID, repoID, source, n)
+					otherErr = p.other(otherSvc, env, userID, repoID, source, n)
 				}()
 				close(start)
 				wg.Wait()
@@ -227,6 +238,8 @@ func TestMRReworkWaitsOnRunBranchLockLiveDB(t *testing.T) {
 func TestCIFixWaitsOnRunBranchLockLiveDB(t *testing.T) {
 	testCreateWaitsOnRunBranchLock(t, 16264, holdIssueRow, func(svc *Service, env codexTestEnv, userID, repoID, _ uuid.UUID, n int64) error {
 		ref := agentIssueBranch(n)
+		// Issue #4079: the binding lookup runs before the lock; the seeded PR reads as merged.
+		svc.SetForges(bindingBuilder{&mergedEverywhereForge{}})
 		_, err := svc.CreateCIFixRun(env.ctx, userID, repoID, ref, "Fix CI", "d", ciFixSnapshot(ref, n*10), nil)
 		return err
 	})

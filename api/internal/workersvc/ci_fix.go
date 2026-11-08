@@ -142,6 +142,12 @@ func claimPipelineFromSnapshot(raw []byte) *ClaimPipeline {
 // ciConfigPaths is the guard's watch set (PRD #71 M2), persisted onto the run so the
 // claim delivers it to the worker; nil/empty is fine (the column is NULL).
 //
+// The fix is bound at creation to the branch's single open pull request (runs.ci_fix_mr_iid,
+// issue #4079; see resolveCIFixBinding). Ambiguity returns *CIFixPRUnresolvedError
+// (errors.Is ErrCIFixPRUnresolved), an unverifiable branch returns an error wrapping
+// ErrCIFixPRUnavailable, and a candidate set that moved during the create returns
+// ErrCIFixBindingChanged.
+//
 // This is the MANUAL Fix-CI path: it delegates to createCIFixRun with
 // autoApprove=false, so the run parks at the plan gate like any other. Its exported
 // signature is unchanged (the handler calls it verbatim); the automatic sibling is
@@ -157,7 +163,9 @@ func (s *Service) CreateCIFixRun(ctx context.Context, userID, repoID uuid.UUID, 
 // run at awaiting_approval (PRD #71 M4, mirroring autopilot's Decision 2). It runs
 // the SAME guards — the one-active-ci_fix-per-ref index and the cross-kind
 // same-branch exclusion — so the detector gets ErrActiveFixExists / ErrBranchInUse
-// to swallow on a race with the manual Fix-CI button.
+// to swallow on a race with the manual Fix-CI button. The automatic path rebinds like the
+// manual one: the poller's candidate PR number is never trusted, the binding is always
+// re-resolved from the forge here.
 func (s *Service) CreateAutoCIFixRun(ctx context.Context, userID, repoID uuid.UUID, ref, title, description string, snapshot FailureSnapshot, ciConfigPaths []string) (store.Run, error) {
 	return s.createCIFixRun(ctx, userID, repoID, ref, title, description, snapshot, ciConfigPaths, true)
 }
@@ -184,6 +192,18 @@ func (s *Service) createCIFixRun(ctx context.Context, userID, repoID uuid.UUID, 
 	snapJSON, err := json.Marshal(snapshot)
 	if err != nil {
 		return store.Run{}, fmt.Errorf("marshal failure snapshot: %w", err)
+	}
+	// Issue #4079: refuse the cheap, existing conflicts on the pool BEFORE the forge lookup,
+	// so ErrBranchInUse / ErrActiveFixExists win over a forge error. These are advisory
+	// (unlocked) reads; the authoritative checks stay inside the create transaction below.
+	if err := s.ciFixPrecheck(ctx, repoID, ref); err != nil {
+		return store.Run{}, err
+	}
+	// Issue #4079: bind the fix to the branch's single open PR (or leave it unbound). The
+	// forge reads happen here, outside the create transaction and its run-branch lock.
+	bound, checked, err := s.resolveCIFixBinding(ctx, row, userID, repoID, ref)
+	if err != nil {
+		return store.Run{}, err
 	}
 	// PRD #35: the OWNER's default, read on the pool before the create transaction so the
 	// lock-holding closure below issues no pool read (issue #1626).
@@ -227,7 +247,22 @@ func (s *Service) createCIFixRun(ctx context.Context, userID, repoID uuid.UUID, 
 				return store.Run{}, ErrBranchInUse
 			}
 		}
+		// Issue #4079: re-read the candidate set on the tx queries and refuse if it moved since
+		// the forge check. This narrows the window, it does not close it: SetRunCompleted and
+		// ReconcileRunMR record runs.mr_iid without taking the run-branch lock. The guarantee is
+		// the publication-time forge barrier (publication_context.go), which requires the bound
+		// PR to be opened on the same branch at that instant.
+		now, err := q.ListCIFixBindingCandidates(ctx, store.ListCIFixBindingCandidatesParams{
+			UserID: userID, RepoID: repoID, Ref: pgtype.Text{String: ref, Valid: true},
+		})
+		if err != nil {
+			return store.Run{}, err
+		}
+		if !sameCIFixCandidateSet(now, checked) {
+			return store.Run{}, ErrCIFixBindingChanged
+		}
 		return q.CreateCIFixRun(ctx, store.CreateCIFixRunParams{
+			CiFixMrIid:       bound,
 			UserID:           userID,
 			RepoID:           repoID,
 			IssueTitle:       title,
@@ -257,4 +292,41 @@ func (s *Service) createCIFixRun(ctx context.Context, userID, repoID uuid.UUID, 
 	s.notify(run.ID, "queued")
 	logRunCreated(run)
 	return run, nil
+}
+
+// ciFixPrecheck runs the pool-side advisory form of the create guards (branch occupied by
+// an active run, active issue run for agent/issue-N, active ci_fix on the ref) so those
+// refusals precede any forge call. The in-transaction checks remain authoritative.
+func (s *Service) ciFixPrecheck(ctx context.Context, repoID uuid.UUID, ref string) error {
+	active, err := s.q.CountActiveRunsWithBranch(ctx, store.CountActiveRunsWithBranchParams{
+		RepoID: repoID,
+		Branch: pgtype.Text{String: ref, Valid: true},
+	})
+	if err != nil {
+		return err
+	}
+	if active > 0 {
+		return ErrBranchInUse
+	}
+	if iid, ok := issueIIDFromAgentBranch(ref); ok {
+		busy, err := s.q.HasActiveIssueRunForIID(ctx, store.HasActiveIssueRunForIIDParams{RepoID: repoID, IssueIid: iid})
+		if err != nil {
+			return err
+		}
+		if busy {
+			return ErrBranchInUse
+		}
+	}
+	// Same predicate as uq_runs_one_active_ci_fix: kind ci_fix, pipeline_ref, non-terminal.
+	_, err = s.q.GetActiveCIFixTargetForRef(ctx, store.GetActiveCIFixTargetForRefParams{
+		RepoID: repoID,
+		Ref:    pgtype.Text{String: ref, Valid: true},
+	})
+	switch {
+	case err == nil:
+		return ErrActiveFixExists
+	case errors.Is(err, pgx.ErrNoRows):
+		return nil
+	}
+	return err
 }

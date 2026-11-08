@@ -577,6 +577,10 @@ type Store interface {
 	CountActiveRunsWithBranch(ctx context.Context, arg store.CountActiveRunsWithBranchParams) (int64, error)
 	CountActiveBranchRunsForRef(ctx context.Context, arg store.CountActiveBranchRunsForRefParams) (int64, error)
 	HasActiveIssueRunForIID(ctx context.Context, arg store.HasActiveIssueRunForIIDParams) (bool, error)
+	// GetActiveCIFixTargetForRef: ErrNoRows means no active ci_fix on the ref (ciFixPrecheck).
+	GetActiveCIFixTargetForRef(ctx context.Context, arg store.GetActiveCIFixTargetForRefParams) (pgtype.Int8, error)
+	// ListCIFixBindingCandidates: the recorded PRs a ci_fix on a ref may bind to (issue #4079).
+	ListCIFixBindingCandidates(ctx context.Context, arg store.ListCIFixBindingCandidatesParams) ([]int64, error)
 	// LockRunBranch takes the per-(repo, branch) advisory lock that serializes issue /
 	// mr_rework / ci_fix creation on one agent branch (issue #1626, store.RunBranchLockClass).
 	LockRunBranch(ctx context.Context, repoID uuid.UUID, branch string) error

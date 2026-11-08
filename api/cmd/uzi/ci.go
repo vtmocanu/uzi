@@ -104,7 +104,10 @@ func newCICmd(env Env, gf *globalFlags) *cobra.Command {
 		Short: "Queue a CI-fix run for a failed pipeline on a ref",
 		Long: "Queue a ci_fix run for a ref whose latest cached pipeline is failed (PRD " +
 			"#1255 D12). The server re-validates the precondition, so a ref that is not " +
-			"failed (or has no cached pipeline) is refused with a 409 and a reason.",
+			"failed (or has no cached pipeline) is refused with a 409 and a reason. It is " +
+			"also refused with a 409 when the branch's pull request cannot be determined " +
+			"unambiguously (or the association changed while queueing), and with a 502 " +
+			"when the forge could not be reached to verify it.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ref := args[0]
