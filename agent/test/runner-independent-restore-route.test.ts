@@ -256,6 +256,23 @@ async function snapshot(r: Rig): Promise<Snapshot> {
   };
 }
 
+/** Replaces the runner's authority peek for the FIRST call made from a frame named `marker` (everything else, the test's own
+ *  snapshots included, reads through). */
+function peekOnceFrom(r: Rig, marker: string, impl: () => SlotSnapshot | null): void {
+  let done = false;
+  const original = r.sRt.peekSlot.bind(r.sRt);
+  mock.method(r.sRt, "peekSlot", async (p: string) => {
+    if (!done && (new Error().stack ?? "").includes(marker)) { done = true; return impl(); }
+    return original(p);
+  });
+}
+
+const ownLedger = (r: Rig): Record<string, unknown> => JSON.parse(cfgAll(r, r.ledgerKey)[0]!) as Record<string, unknown>;
+const olderLedgerEntry = (r: Rig, state: string): string => {
+  const id = mintAttemptId(0);
+  return JSON.stringify({ attemptId: id, runId: r.runId, clonePath: `${r.pPath.replace(/\.attempt-.*$/, "")}.attempt-${id}`, state });
+};
+
 // ---- traps: nothing may reach P's path or the legacy P-touching steps ------------------------------------------------
 
 interface Traps { hits: string[]; calls: Record<string, number>; armed: boolean }
@@ -457,6 +474,21 @@ describe("the independent restore route (issue #3644 m4a)", () => {
         await r.pRt.withTransaction(() => r.pRt.hooks.admitSourceUse(other, "seed-attempt"));
         cfgAdd(r, "uzi-attempts.agent/issue-77.entry", JSON.stringify({ attemptId: id, runId: otherRun, clonePath: other, state: "live" }));
       } },
+      { name: "P's own ledger entry retired", reason: "predecessor_ledger", arrange: r => { cfgSet(r, r.ledgerKey, JSON.stringify({ ...ownLedger(r), state: "retired" })); } },
+      { name: "P's own ledger entry reclaimed", reason: "predecessor_ledger", arrange: r => { cfgSet(r, r.ledgerKey, JSON.stringify({ ...ownLedger(r), state: "reclaimed" })); } },
+      { name: "an older-generation live ledger entry of the run", reason: "conflicting_attribution", arrange: r => { cfgAdd(r, r.ledgerKey, olderLedgerEntry(r, "live")); } },
+      { name: "an incomplete attribution config read", reason: "attribution_unverifiable", arrange: () => {
+        mock.method(git, "readRestoreAttribution", async () => ({ entries: [], complete: false }));
+      } },
+      { name: "a slot that changed owner between classification and evaluation", reason: "predecessor_changed", arrange: r => {
+        peekOnceFrom(r, "evaluateRestoreRoute", () => null);
+      } },
+      { name: "a slot peek that throws during classification (a slot one write ahead of its head)", reason: "slot_unreadable", arrange: r => {
+        peekOnceFrom(r, "opaquePreDiscovery", () => { throw new Error("slot ahead of its head record"); });
+      } },
+      { name: "a slot peek that throws during evaluation", reason: "slot_unreadable", arrange: r => {
+        peekOnceFrom(r, "evaluateRestoreRoute", () => { throw new Error("unreadable"); });
+      } },
       { name: "a hosted predecessor", reason: "hosted_restore_not_delivered", rig: { pBoundary: "hosted" } },
       { name: "a predecessor with a failed cross-check", reason: "cross_check_failed", rig: { pBoundary: "failed" } },
       { name: "a predecessor of another slot", reason: "slot_mismatch", rig: { pBoundary: "slot_mismatch" } },
@@ -484,6 +516,29 @@ describe("the independent restore route (issue #3644 m4a)", () => {
         await assertStoppedUntouched(r, before, traps);
       });
     }
+  });
+
+  describe("positive controls", () => {
+    it("an older retired ledger entry of the run is history, not attribution", async () => {
+      const r = await buildRig();
+      cfgAdd(r, r.ledgerKey, olderLedgerEntry(r, "retired"));
+      const { before, traps } = await drive(r);
+      assert.equal(logged(r, "independent restore eligible; seeding not enabled in this build").length, 1);
+      assert.equal(refusals(r).length, 0);
+      await assertStoppedUntouched(r, before, traps);
+    });
+
+    it("a journal with another key order is classified by shape, from the exact raw value discovery read", async () => {
+      const r = await buildRig();
+      const j = journalOf(r);
+      const raw = JSON.stringify({ runId: j.runId, attemptId: j.attemptId, clonePath: j.clonePath });
+      assert.notEqual(raw, cfgGet(r, r.journalKey), "the reordered value differs byte-wise");
+      cfgSet(r, r.journalKey, raw);
+      const { before, traps } = await drive(r);
+      assert.equal(refusals(r).length, 0, JSON.stringify(refusals(r)));
+      assert.equal(logged(r, "independent restore eligible; seeding not enabled in this build").length, 1);
+      await assertStoppedUntouched(r, before, traps);
+    });
   });
 
   describe("a blocked or memory-parked foreign-owned predecessor keeps its legacy outcome", () => {

@@ -2931,7 +2931,12 @@ interface RunFlight {
   inventoryGuarded?: boolean;
   /** issue #3644 m4a: set by opaque pre-discovery when this retained claim takes the independent-restore route (the predecessor's
    *  slot is foreign-owned). It skips legacy discovery and the predecessor diagnostics and never reaches the reservation. */
-  restoreRoute?: boolean;
+  restoreRoute?: {
+    /** The journal value exactly as discovery read it from the active key; classification reads this, never a re-serialization. */
+    raw: string;
+    /** The slot peek threw during pre-discovery: the route refuses `slot_unreadable` without evaluating. */
+    slotUnreadable: boolean;
+  };
   /** issue #3644 m4a: the disk governor's cache target (executor + HOME), bound per the claim's route; see cache-target.ts. */
   cacheTarget?: CacheTargetBinding<Executor>;
   /** Transient ambiguity guard; conveys neither durable evidence nor deletion authority. */
@@ -14051,7 +14056,7 @@ export class RunRunner {
             // The predecessor's slot is foreign-owned: skip legacy discovery entirely (it would lstat P's path) and hand the
             // opaque journal to the restore route in recoverRetainedClaim.
             flight.barePath = opaque.barePath;
-            flight.restoreRoute = true;
+            flight.restoreRoute = { raw: opaque.raw, slotUnreadable: opaque.slotUnreadable };
             retainedJournal = opaque.journal;
             return;
           }
@@ -27120,7 +27125,7 @@ export class RunRunner {
    * A journal already blocked or memory-parked keeps its legacy outcome. Writes nothing.
    */
   private async opaquePreDiscovery(claim: ClaimResponse, flight: RunFlight, branch: string):
-    Promise<{ route: "legacy" } | { route: "restore"; journal: RecoveryJournalEntry; barePath: string }> {
+    Promise<{ route: "legacy" } | { route: "restore"; journal: RecoveryJournalEntry; barePath: string; raw: string; slotUnreadable: boolean }> {
     const legacy = { route: "legacy" as const };
     if (typeof this.git.discoverOpaque !== "function") return legacy;
     const barePath = this.git.barePathFor(claim.repo.clone_url);
@@ -27145,11 +27150,17 @@ export class RunRunner {
         !this.client.hasFeature("active_run_snapshot") || !Number.isSafeInteger(generation) || (generation as number) < 2) return legacy;
     if (found.journal.recovery?.stage === "blocked" || found.journal.memoryPark !== undefined) return legacy;
     let slot: Awaited<ReturnType<AuthorityRuntime["peekSlot"]>>;
-    try { slot = await authority.peekSlot(found.journal.clonePath); } catch { return legacy; }
+    try { slot = await authority.peekSlot(found.journal.clonePath); } catch {
+      // The journal is this run's own active one and would be a restore candidate if foreign-owned. A slot that cannot be read (for
+      // example one write ahead of its head record after a mid-transition kill) must not fall to the legacy path, which would
+      // reserve an iteration and rewrite P's journal before admission refuses it: stop nonterminally, writing nothing.
+      flight.runLog.warn("retained predecessor's slot is unreadable; taking the restore route to refuse", { claim_generation: generation });
+      return { route: "restore", journal: found.journal, barePath, raw: found.raw, slotUnreadable: true };
+    }
     if (slot === null || slot.owner.worker === (authority.authorityIncarnation() ?? processWorkerIncarnation())) return legacy;
     if (slot.state !== "active" && slot.pending === null) return legacy;
     flight.runLog.info("retained predecessor is foreign-owned; taking the independent restore route", { claim_generation: generation });
-    return { route: "restore", journal: found.journal, barePath };
+    return { route: "restore", journal: found.journal, barePath, raw: found.raw, slotUnreadable: false };
   }
 
   /**
@@ -27160,9 +27171,10 @@ export class RunRunner {
    * eligible verdict logs `independent restore eligible; seeding not enabled in this build`. Neither writes P's journal, ledger
    * or slot, deletes agent-home/<runId> or provision/<runId>, or reports a terminal state.
    */
-  private async stopRestoreRoute(claim: ClaimResponse, flight: RunFlight, source: RecoveryJournalEntry, bare: string, branch: string): Promise<never> {
+  private async stopRestoreRoute(claim: ClaimResponse, flight: RunFlight, bare: string, branch: string): Promise<never> {
     const authority = this.authority;
-    if (!authority || !((claim.claim_generation ?? 0) > 1)) throw new Error("the restore route requires an authority runtime and a retained claim generation");
+    const route = flight.restoreRoute;
+    if (!authority || !route || !((claim.claim_generation ?? 0) > 1)) throw new Error("the restore route requires an authority runtime and a retained claim generation");
     const evidence = authority.restoreEvidenceOptions();
     const deps: EligibilityDeps = {
       selfIncarnation: authority.authorityIncarnation() ?? processWorkerIncarnation(),
@@ -27182,10 +27194,13 @@ export class RunRunner {
       peekBareSlot: () => authority.peekSlot(bare),
       isAncestor: (tip, sha) => this.git.isAncestorRef(bare, tip, sha),
     };
-    const raw = JSON.stringify(source);
+    const raw = route.raw;
     let outcome: RestoreRouteOutcome;
     try {
-      outcome = await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.codexBoundaryDeadlineMs,
+      // Fail closed without evaluating: an unreadable slot, or no exact raw journal value to classify.
+      if (route.slotUnreadable) outcome = { eligible: false, reason: "slot_unreadable", known: {} };
+      else if (typeof raw !== "string" || raw === "") outcome = { eligible: false, reason: "predecessor_changed", known: {} };
+      else outcome = await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.codexBoundaryDeadlineMs,
         () => evaluateRestoreRoute(deps, {
           runId: flight.runId, branch, bareDirName: pathBasename(bare), claimDefaultBranch: claim.repo.default_branch ?? undefined,
           checkpointTip: claim.checkpoint_tip, journalRaw: raw,
@@ -27454,7 +27469,7 @@ export class RunRunner {
           flight.claimGeneration <= (episode.claimGeneration ?? 0))) throw new RetainedRecoveryStop();
     // issue #3644 m4a: the restore route classifies from the bare config and the authority/boundary evidence alone, BEFORE the
     // reservation below (which rewrites the predecessor's journal) and without ever entering it. Always throws.
-    if (flight.restoreRoute) await this.stopRestoreRoute(claim, flight, source, bare, branch);
+    if (flight.restoreRoute) await this.stopRestoreRoute(claim, flight, bare, branch);
     for (;;) {
       this.retainedLifecycleGuard(flight);
       let reservation: Awaited<ReturnType<GitCache["reserveRecoveryIteration"]>>;
