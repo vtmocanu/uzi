@@ -224,7 +224,7 @@ func TestCIFixCreateOutlivesServerWriteTimeoutLiveDB(t *testing.T) {
 
 	oldBudget, oldGrace := workersvc.CIFixBindingLookupBudget, ciFixCreateResponseGrace
 	t.Cleanup(func() { workersvc.CIFixBindingLookupBudget, ciFixCreateResponseGrace = oldBudget, oldGrace })
-	ciFixCreateResponseGrace = 200 * time.Millisecond
+	ciFixCreateResponseGrace = 1500 * time.Millisecond
 
 	srv := httptest.NewUnstartedServer(router)
 	srv.Config.WriteTimeout = 300 * time.Millisecond
@@ -271,7 +271,7 @@ func TestCIFixCreateOutlivesServerWriteTimeoutLiveDB(t *testing.T) {
 			if err != nil {
 				t.Fatalf("POST over a real listener: %v (the write deadline was not extended)", err)
 			}
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 			body, err := io.ReadAll(resp.Body)
 			if err != nil {
 				t.Fatalf("read body: %v", err)

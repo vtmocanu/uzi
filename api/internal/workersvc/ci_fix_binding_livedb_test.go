@@ -329,13 +329,14 @@ func TestCIFixBindingCandidateQueryBoundaryLiveDB(t *testing.T) {
 	now := time.Now()
 
 	t.Run("query scoping and distinct newest-first", func(t *testing.T) {
-		env, svc, userID, repoID := branchSerializeEnv(t)
+		env, _, userID, repoID := branchSerializeEnv(t)
 		otherUser, otherRepo := seedClaudeOnlyOriginUser(t, env)
-		_ = svc
-		// 41 is the older PR (3 runs), 42 the newer (2 runs, newest overall).
-		for i, age := range []time.Duration{72, 71, 70} {
-			seedRecordedPR(t, env, userID, repoID, ref, 41, now.Add(-age*time.Hour+time.Duration(i)*time.Minute))
-		}
+		// Interleaved so max(created_at) and min(created_at) disagree: 41 has the oldest run
+		// and the newest run overall, 42 sits in between. Newest-first by max gives [41 42];
+		// ordering by min would give [42 41].
+		seedRecordedPR(t, env, userID, repoID, ref, 41, now.Add(-72*time.Hour))
+		seedRecordedPR(t, env, userID, repoID, ref, 41, now.Add(-71*time.Hour))
+		seedRecordedPR(t, env, userID, repoID, ref, 41, now.Add(-30*time.Minute))
 		seedRecordedPR(t, env, userID, repoID, ref, 42, now.Add(-2*time.Hour))
 		seedRecordedPR(t, env, userID, repoID, ref, 42, now.Add(-1*time.Hour))
 		// Unrelated records.
@@ -351,8 +352,8 @@ func TestCIFixBindingCandidateQueryBoundaryLiveDB(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ListCIFixBindingCandidates: %v", err)
 		}
-		if len(got) != 2 || got[0] != 42 || got[1] != 41 {
-			t.Fatalf("candidates = %v, want [42 41]", got)
+		if len(got) != 2 || got[0] != 41 || got[1] != 42 {
+			t.Fatalf("candidates = %v, want [41 42]", got)
 		}
 	})
 

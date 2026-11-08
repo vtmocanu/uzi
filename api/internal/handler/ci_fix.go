@@ -92,7 +92,10 @@ func (h *Handler) CreateCIFixRun(w http.ResponseWriter, r *http.Request) {
 
 	// The binding lookup inside CreateCIFixRun can run for workersvc.CIFixBindingLookupBudget,
 	// after the snapshot already spent part of the listener's WriteTimeout. Reset the write
-	// deadline so the 201/409/502 is always deliverable (worker_publish_deadline.go precedent).
+	// deadline so an answer that arrives within the lookup budget plus the grace is still
+	// deliverable (worker_publish_deadline.go precedent). The guardrail check that runs first
+	// inside CreateCIFixRun is bounded only by the forge client timeout, so a guard that is
+	// itself slow can still outlast this deadline, as it could the listener's before #4079.
 	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(workersvc.CIFixBindingLookupBudget + ciFixCreateResponseGrace))
 	run, err := h.wsvc.CreateCIFixRun(r.Context(), user.ID, repo.ID, ref, title, description, snapshot, ciConfigPaths)
 	if err != nil {
