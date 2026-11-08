@@ -128,3 +128,16 @@ func TestSkipReasonCredentialDisabled(t *testing.T) {
 		t.Fatalf("absent explicit-harness credential mapped to %q, want the hard refusal", got)
 	}
 }
+
+func TestSkipReasonForErrExportedMatchesInternal(t *testing.T) {
+	for _, err := range []error{workersvc.ErrNotPRDIssue, workersvc.ErrActiveRunExists, context.DeadlineExceeded} {
+		wantR, wantOK := skipReasonForErr(err)
+		gotR, gotOK := SkipReasonForErr(err)
+		if gotR != wantR || gotOK != wantOK {
+			t.Errorf("SkipReasonForErr(%v) = (%q, %t), want (%q, %t)", err, gotR, gotOK, wantR, wantOK)
+		}
+	}
+	if r, ok := SkipReasonForErr(workersvc.ErrNotPRDIssue); !ok || r != SkipNotEligible {
+		t.Errorf("SkipReasonForErr(ErrNotPRDIssue) = (%q, %t), want not_eligible", r, ok)
+	}
+}

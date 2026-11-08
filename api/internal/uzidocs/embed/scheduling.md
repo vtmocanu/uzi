@@ -452,6 +452,149 @@ persisting cadence, last-fire or recent-fire changes. Each started run
 records its actual harness. See [Fire outcomes](#fire-outcomes) for the
 labels and repair hints shown in web and CLI.
 
+### Settings preview
+
+The settings preview answers "if this schedule fired now and a worker
+claimed the run, what would it use?" for the harness, the worker model and
+effort, the credential and the subagents. It is **read-only**: it creates no
+run, saves nothing and calls no model provider. It is part of the
+[effective-settings view](./configuration.md#effective-settings) (design:
+[PRD #3254](../prds/3254-effective-settings-resolver.md)).
+
+From the CLI, preview a saved schedule with
+[`uzi settings get --schedule <id>`](./cli.md#effective-settings). The
+endpoint is `POST /api/me/effective-settings/schedule-preview`; it accepts a
+browser session or a CLI token and carries wire `version: 1`.
+
+#### Request
+
+A strict JSON body of at most 2 KiB; unknown fields are rejected.
+
+| Field | Meaning |
+|---|---|
+| `schedule_id` | A saved schedule of yours. A missing or foreign id is a 404 (`schedule not found`); a malformed id is a 400. Omit it to preview a draft. |
+| `target` | `issue`, `sweep`, `prompt`, `self_improve` or `ci_watch`. Required without `schedule_id`; with it, the stored target is used unless you supply one. |
+| `harness` | `claude` or `codex`; `null` clears the pin. |
+| `model` | A model pin; `null` or blank means inherit. |
+| `override_subagent_model` | Whether the lead's model replaces subagent pins. |
+| `credential_override` | `{"mode": "inherit"\|"auto"\|"default"\|"pinned", "secret_id": "<uuid>"}`; `null` means inherit. |
+
+With a `schedule_id`, every field you supply **replaces** the stored one and
+an omitted field is as stored, so you can ask "what if I changed only the
+model?" without saving. `harness`, `model` and `credential_override` tell
+omitted from `null`: omitted keeps the stored value, an explicit `null`
+clears it. An explicit `"credential_override": null` is inherit and is
+validated as a save would validate it; omitted means not set, so a fire
+threads the stored override as stored. A `self_improve` schedule ignores a
+stored override (it follows its own credential ladder) and refuses any
+override you supply, `inherit` and `null` included, with
+`credential_override_lane_not_switchable`.
+
+#### Order of the checks
+
+The preview applies the rules in the order a schedule save and then a fire
+would:
+
+1. **Save step.** The model's syntax, then a supplied credential override
+   against the schedule's lane and effective harness, as the schedule save
+   validates it.
+2. **Fire step.** The harness, then the stored override's fire-time checks,
+   then the lead and subagent prediction.
+
+A failure in the save step, or before a harness is decided, returns a
+top-level `refusal` with a null `harness` and nothing else predicted. A
+refusal on a known harness keeps `harness` and nulls the harness-dependent
+fields (`worker_model`, `worker_effort`, `credential`, `subagents`).
+
+Refusals are closed tokens, with an optional `refusal_detail`:
+
+| Step | Tokens |
+|---|---|
+| Save | `invalid_model`, `credential_not_found`, `credential_disabled`, `credential_override_lane_not_switchable`, `credential_override_harness_unsupported`, `credential_override_invalid` |
+| Fire | `no_credential_for_harness`, `no_usable_credential`, `credential_disabled`, `codex_pool_unavailable`, `codex_override_conflict` |
+
+The fire tokens other than `no_credential_for_harness` are the schedule
+[skip reasons](#fire-outcomes) a real fire would record. For an override that a fire threads, the checks run in this
+order once the harness is known:
+
+1. An **unpinned** schedule that lands on Codex with any override is refused
+   `codex_override_conflict`: the scheduler fails closed before creating the
+   run. Every target has this check, a CI watch included.
+2. A **stored pinned token** that has been disabled since the save is
+   refused `credential_disabled`.
+3. Any Anthropic override on a Codex run is refused `codex_override_conflict`
+   by the run-create step.
+
+A **one-time** schedule runs check 2 before the fire, so a one-time schedule
+that lands on Codex with a disabled stored pinned token is held as
+`credential_disabled` and the preview answers that, not
+`codex_override_conflict`. For a CI watch, `codex_override_conflict` applies
+when a repair would fire. This hold order is the scheduled tick's: a manual
+Run now skips that pre-check. The preview knows the timing only of a saved
+schedule (`schedule_id`); a draft has none and is treated as recurring.
+The hold comes before the harness check: a one-time schedule whose disabled
+stored pin was your last usable Anthropic token, with no Codex credential,
+answers `credential_disabled`, not `no_usable_credential`.
+
+A pinned token that was **deleted** has no id left. On Claude the fire
+inherits and refuses nothing, and the preview shows the credential the claim
+would choose (source `claim_selection`). On Codex the override still
+conflicts.
+
+`no_credential_for_harness` is a hard refusal of a fire that names a harness
+with no usable credential, and is not recorded as a skip under that name: a
+real fire retries rather than recording a skip. The exception is a sweep
+candidate whose harness was selected by an issue label: there the same
+refusal is recorded as a `no_usable_credential` skip.
+
+#### What each target shows
+
+| Target | Behaviour |
+|---|---|
+| `issue`, `sweep` | A fire creates an issue run, so the creation-time harness policies (automatic, overflow) apply. The notes carry `issue_labels_may_select_harness`: the labels of the issue picked at fire time can choose a harness the preview cannot see. |
+| `prompt`, `ci_watch` | The fire creates a run kind no creation-time policy applies to, so the harness is exact. |
+| `self_improve` | As above, and a Claude run spends the credential of your Judge binding, not a worker's and not a per-schedule override. The credential source is `token_override` for a pinned Judge token, `auto_selection` for an automatic Judge binding (an empty pool falls back to your default, shown as `owner_default`), and `owner_default` for the default binding. The notes carry `token_fixed` unless the binding is automatic. No token id or label is shown. |
+
+`worker_model`, `worker_effort`, `credential` and `subagents` are those of
+the chosen harness. A Codex run accepts only the curated model pins, so a
+model pin it cannot run is not used: the cell shows the default model, the
+pin appears as `ignored` (with source `schedule_pin`) and the notes carry
+`schedule_pin_ignored`.
+
+A model pin the harness accepts is frozen into the run when the schedule
+fires, so its `worker_model` cell (source `schedule_pin`) is `fixed_at`
+`create`. A default chosen after an ignored pin is read when a worker claims
+the run, so that cell stays `fixed_at` `claim`.
+
+For a `self_improve` schedule the credential is a prediction that the claim
+re-checks. A weekly usage reserve hold, or a pinned Judge token disabled after
+the preview, is decided at the claim and is not shown here.
+
+`subagents` says how subagents pick a model: `mode` `follow_lead` (all use
+the lead's model) or `own_pins` (each pinned subagent keeps its own pin,
+listed in `pinned` by name; the rest follow the lead). At most 32 pins are
+listed and `pinned_truncated` is `true` when there were more. Repository-
+defined agents are not predicted.
+
+#### When the harness is chosen at create
+
+When the schedule is unpinned and the creation-time policies decide the
+harness when the run is created, `harness.value` is `null` and the four
+harness-dependent fields are `null`. `alternatives` lists Claude then Codex,
+neither marked as the likely choice; each is computed as if that harness
+were chosen and carries its own fields or its own `refusal`.
+
+The top-level `refusal` follows the same rule as the
+[start preview](./configuration.md#post-apimeeffective-settingsstart-preview):
+it is set only for a failure before a harness is decided, or when **every**
+alternative refuses for the **same** reason. When the reasons differ, the
+top-level `refusal` and `refusal_detail` stay null and each alternative keeps
+its own reason; one branch's reason is never promoted to stand for both.
+
+Any stored or supplied override, or a model pin, makes the harness exact, so
+`alternatives` appear only for an **unpinned, override-free** issue or sweep
+schedule.
+
 ### Running a schedule on several repos
 
 Creating a custom schedule can target more than one repo at once: the "New

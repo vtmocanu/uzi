@@ -101,6 +101,16 @@ var (
 	errCodexPoolUnavailable = fmt.Errorf("%w: no pooled Codex account is available; check Codex accounts in Settings", errNoCredentialForHarness)
 )
 
+// harnessRule names the resolveHarness step that decided the harness.
+type harnessRule string
+
+const (
+	harnessRuleExplicit    harnessRule = "explicit"
+	harnessRuleUserDefault harnessRule = "user_default"
+	harnessRuleSoleUsable  harnessRule = "sole_usable"
+	harnessRuleBothClaude  harnessRule = "both_claude"
+)
+
 // resolveHarness is the PURE D11 harness resolver (PRD #1332 D4, parent D11). It takes
 // no context and no store and touches nothing external, so the whole decision matrix is
 // unit-testable against hand-written inputs. The order is EXACTLY:
@@ -113,34 +123,37 @@ var (
 //  4. otherwise (both usable, no usable default) Claude is chosen (the usage-free answer;
 //     an eligible automatic creation may choose by weekly limits, see harness_automatic.go);
 //  5. otherwise (neither usable) errNoUsableCredential.
-func resolveHarness(in resolveHarnessInput) (Harness, error) {
+//
+// It also returns the rule that fired (harnessRule), empty on error, so a read-only preview can
+// say why the harness was chosen without a second implementation of the order.
+func resolveHarness(in resolveHarnessInput) (Harness, harnessRule, error) {
 	// (1) Explicit selection is authoritative and terminal — used if usable, else a
 	// typed refusal with NO fallback to the other harness.
 	if in.explicit != nil {
 		h := *in.explicit
 		if in.avail.usable(h) {
-			return h, nil
+			return h, harnessRuleExplicit, nil
 		}
-		return "", errNoCredentialForHarness
+		return "", "", errNoCredentialForHarness
 	}
 
 	// (2) A usable user default wins next. A default set to a harness with no usable
 	// credential is skipped so the resolver falls through to the availability rules,
 	// rather than refusing.
 	if in.userDefault != nil && in.avail.usable(*in.userDefault) {
-		return *in.userDefault, nil
+		return *in.userDefault, harnessRuleUserDefault, nil
 	}
 
 	// (3)-(5) Availability rules.
 	switch {
 	case in.avail.claudeUsable && !in.avail.codexUsable:
-		return HarnessClaude, nil // (3) sole Claude
+		return HarnessClaude, harnessRuleSoleUsable, nil // (3) sole Claude
 	case in.avail.codexUsable && !in.avail.claudeUsable:
-		return HarnessCodex, nil // (3) sole Codex
+		return HarnessCodex, harnessRuleSoleUsable, nil // (3) sole Codex
 	case in.avail.claudeUsable && in.avail.codexUsable:
-		return HarnessClaude, nil // (4) both usable, no usable default → Claude (usage-free answer; eligible automatic creation may choose by weekly limits, harness_automatic.go)
+		return HarnessClaude, harnessRuleBothClaude, nil // (4) both usable, no usable default → Claude (usage-free answer; eligible automatic creation may choose by weekly limits, harness_automatic.go)
 	default:
-		return "", errNoUsableCredential // (5) neither usable
+		return "", "", errNoUsableCredential // (5) neither usable
 	}
 }
 
@@ -190,6 +203,11 @@ type resolvedHarness struct {
 	// BothUsable is true when both harnesses have a usable credential. The pure resolveHarness
 	// never reads either field, so every usage-independent reader is unchanged.
 	BothUsable bool
+	// Rule is the resolveHarness rule that fired. Existing readers ignore it.
+	Rule harnessRule
+	// DefaultSkipped is true when users.default_harness named a harness with no usable credential
+	// and no explicit harness was given, so the resolver fell through to the availability rules.
+	DefaultSkipped bool
 }
 
 // automaticHarnessEligible reports whether creation picks the harness by soonest weekly reset
@@ -285,7 +303,7 @@ func (s *Service) resolveRunHarnessQ(ctx context.Context, userID uuid.UUID, expl
 	}
 	bothUsable := claudeUsable && codexUsable
 
-	h, err := resolveHarness(resolveHarnessInput{
+	h, rule, err := resolveHarness(resolveHarnessInput{
 		explicit:    explicit,
 		userDefault: userDefault,
 		avail:       harnessAvailability{claudeUsable: claudeUsable, codexUsable: codexUsable},
@@ -297,6 +315,9 @@ func (s *Service) resolveRunHarnessQ(ctx context.Context, userID uuid.UUID, expl
 		return resolvedHarness{}, err
 	}
 
+	defaultSkipped := explicit == nil && userDefault != nil &&
+		!(harnessAvailability{claudeUsable: claudeUsable, codexUsable: codexUsable}).usable(*userDefault)
+
 	if h == HarnessCodex {
 		// resolveHarness returns Codex only when codexUsable was true, so the choice is
 		// populated. Guard defensively: an unpopulated choice would mean the two facts
@@ -305,9 +326,9 @@ func (s *Service) resolveRunHarnessQ(ctx context.Context, userID uuid.UUID, expl
 			return resolvedHarness{}, errNoUsableCredential
 		}
 		choice := codexChoice
-		return resolvedHarness{Harness: HarnessCodex, Codex: &choice, DefaultUnset: defaultUnset, BothUsable: bothUsable}, nil
+		return resolvedHarness{Harness: HarnessCodex, Codex: &choice, DefaultUnset: defaultUnset, BothUsable: bothUsable, Rule: rule, DefaultSkipped: defaultSkipped}, nil
 	}
-	return resolvedHarness{Harness: h, DefaultUnset: defaultUnset, BothUsable: bothUsable}, nil
+	return resolvedHarness{Harness: h, DefaultUnset: defaultUnset, BothUsable: bothUsable, Rule: rule, DefaultSkipped: defaultSkipped}, nil
 }
 
 // explicitHarnessRefusal classifies an explicit harness's no-usable-credential refusal (PRD
@@ -405,7 +426,7 @@ func (s *Service) ResolveSettingsHarnessWithDefault(ctx context.Context, userID 
 	if err != nil {
 		return "", err
 	}
-	h, err := resolveHarness(resolveHarnessInput{
+	h, _, err := resolveHarness(resolveHarnessInput{
 		userDefault: proposed,
 		avail:       harnessAvailability{claudeUsable: claudeUsable, codexUsable: codexUsable},
 	})

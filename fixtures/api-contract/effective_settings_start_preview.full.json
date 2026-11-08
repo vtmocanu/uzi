@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "harness": {
+    "value": "x",
+    "source": "x",
+    "fixed_at": "x",
+    "notes": [
+      "x"
+    ]
+  },
+  "refusal": "x",
+  "refusal_detail": "x",
+  "credential": {
+    "kind": "x",
+    "source": "x",
+    "fixed_at": "x",
+    "auth_mode": "x"
+  },
+  "alternatives": [
+    {
+      "harness": "x",
+      "credential": {
+        "kind": "x",
+        "source": "x",
+        "fixed_at": "x",
+        "auth_mode": "x"
+      },
+      "refusal": "x",
+      "refusal_detail": "x"
+    }
+  ]
+}
