@@ -1,18 +1,24 @@
-import { after, before, describe, it } from "node:test";
+import { after, afterEach, before, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
+import net from "node:net";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   GitCache, RestoreCompositeError, type IndependentSeedInput, type PositiveOwedCandidateContext, type RecoveryJournalEntry,
 } from "../src/git.js";
-import { restoreDigest, restoreJournalKey } from "../src/restore-journal.js";
+import { DindPruneGate } from "../src/dind-prune.js";
+import { reclaimStrandedRunHomes } from "../src/home-reclaim.js";
+import { RetainedSourceServer } from "../src/ops/retained-source-server.js";
+import { writeRetainedHomeMarker } from "../src/retained-homes.js";
+import { holdingNamePrefix, isHoldingName, parseRestoreValue, restoreDigest, restoreJournalKey } from "../src/restore-journal.js";
 import { attemptClonePath, formatAttemptId } from "../src/attempt-path.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
+import { runnerOverDisk, type RunnerOver } from "./independent-restore-rc2-runner.js";
 
 // issue #3644 plan 4.3 / 3.11: the RELEASED reader, v0.87.0-rc.2, executed against a restore fixture written by this build.
 //
@@ -36,8 +42,12 @@ import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
 //
 // Amendment 14 (the owner's "recognise the rc.2-released predecessor"): the last describe below runs the actual rc.2 sequence (S
 // terminal on this build, roll back to rc.2, another claim of the branch, markRecoveryCapture of the other run), then rolls forward
-// with the current GitCache on the same disk and drives S's discard and P's discard to `done` with no hand edits. Cancel is
-// runner-level (m4) and is not modelled here. The CI-gated twin, from a byte fixture of the same end state, is restore-released.test.ts.
+// with the current build on the same disk, with no hand edits. The first part of that describe drives GitCache.discardStoppedSource
+// directly with stub marker hooks. The last describe (m4c) is the production end to end, one fixture per mode: a later claim of the run
+// on the production RunRunner (test/independent-restore-rc2-runner.ts) with an owner Cancel queued, then S's and P's guarded discards through
+// the production RetainedSourceServer over its socket with a real retained-home marker, the HOME sweeps of this build, and the controls
+// (partial attribution, digest mismatch, a wrong-inode holding directory, an uncancelled claim as the unsafe-adoption control). The
+// CI-gated twin, from a byte fixture of the same end state, is restore-released.test.ts.
 
 const root = path.resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const scratch = path.join(root, ".uzi", "scratch");
@@ -240,6 +250,22 @@ async function reclaimAsOtherRun(e: Env, attemptPaths: boolean): Promise<{ recla
   return { reclaimError, diagnostics };
 }
 
+const OTHER = "another-run";
+
+/** The rc.2 claim by the other run, whole: its real reclaimTerminalOrphan, its reseed (attempt path in mode A, canonical in mode H) and
+ *  its markRecoveryCapture, which writes O's journal into P's own key. */
+async function rc2ClaimsBranch(e: Env, attemptPaths: boolean): Promise<{ oPath: string }> {
+  const { reclaimError, diagnostics } = await reclaimAsOtherRun(e, attemptPaths);
+  assert.equal(reclaimError, undefined, `reclaim failed: ${String(reclaimError)} ${diagnostics.join("|")}`);
+  const otherId = formatAttemptId(new Date("2026-11-05T12:00:00Z"), 3, "bbbbbbbbbbbbbbbb");
+  const reseed = { beforeFree: async () => {}, isLive: () => false };
+  const clone = await e.rc2.runnerCloneForBranch(e.bare, BRANCH, KEY, reseed, OTHER, false, undefined,
+    (attemptPaths ? { attemptId: otherId, isLive: () => false, beforeSeed: async () => {} } : undefined) as never);
+  await e.rc2.markRecoveryCapture(e.bare, clone.path, BRANCH, OTHER, attemptPaths ? otherId : undefined);
+  assert.equal(JSON.parse(configEntries(e.bare).get(P_KEY)![0]!).runId, OTHER, "rc.2 wrote O's journal into P's key");
+  return { oPath: clone.path };
+}
+
 describe("rc.2 against a restore written by this build", () => {
   it("the released source is the tagged source, ignores the restore prefix, and loads (git, home reclaim, runner)", () => {
     const src = path.join(suite, "reader-rc2", "agent", "src");
@@ -423,25 +449,9 @@ describe("rc.2 against a restore written by this build", () => {
 
 // ---- amendment 14: roll forward from the rc.2-released predecessor -----------------------------------------------------------------
 
-const OTHER = "another-run";
-
 describe("amendment 14: roll forward from the state rc.2 leaves after another claim of the branch", () => {
   const holdingRoot = (e: Env): string => path.join(e.dataDir, "runner-quarantine");
   const quiet = { isLivePath: () => false, quiesce: async () => true };
-
-  /** The rc.2 claim by the other run, whole: its real reclaimTerminalOrphan, its reseed (attempt path in mode A, canonical in mode H) and
-   *  its markRecoveryCapture, which writes O's journal into P's own key. */
-  async function rc2ClaimsBranch(e: Env, attemptPaths: boolean): Promise<{ oPath: string }> {
-    const { reclaimError, diagnostics } = await reclaimAsOtherRun(e, attemptPaths);
-    assert.equal(reclaimError, undefined, `reclaim failed: ${String(reclaimError)} ${diagnostics.join("|")}`);
-    const otherId = formatAttemptId(new Date("2026-11-05T12:00:00Z"), 3, "bbbbbbbbbbbbbbbb");
-    const reseed = { beforeFree: async () => {}, isLive: () => false };
-    const clone = await e.rc2.runnerCloneForBranch(e.bare, BRANCH, KEY, reseed, OTHER, false, undefined,
-      (attemptPaths ? { attemptId: otherId, isLive: () => false, beforeSeed: async () => {} } : undefined) as never);
-    await e.rc2.markRecoveryCapture(e.bare, clone.path, BRANCH, OTHER, attemptPaths ? otherId : undefined);
-    assert.equal(JSON.parse(configEntries(e.bare).get(P_KEY)![0]!).runId, OTHER, "rc.2 wrote O's journal into P's key");
-    return { oPath: clone.path };
-  }
 
   /** One of the owner's own discards on the rolled-forward build: inspect for the confirm digest, then discard. */
   async function discardOn(e: Env, runId: string, attempt: string, generation: number, over: Record<string, unknown> = {}) {
@@ -596,5 +606,352 @@ describe("amendment 14: roll forward from the state rc.2 leaves after another cl
       assert.equal((await discardOn(f, RUN, S_ID, 2)).kind, "done");
       assert.equal((await discardOn(f, RUN, P_ID, 1)).kind, "done");
     } finally { f.fx.cleanup(); }
+  });
+});
+
+// ---- m4c: the PRODUCTION Cancel path and the PRODUCTION guarded discard, on the state rc.2 leaves ---------------------------------
+//
+// One fixture per mode, end to end: the unmodified rc.2 terminal/reclaim sequence (rc2ClaimsBranch), the same files read by this build,
+// a later claim of RUN on the production RunRunner (independent-restore-rc2-runner.ts) with an owner Cancel queued, then the guarded
+// discard of S and of P through the production RetainedSourceServer over its socket, with a real retained-home marker on disk.
+
+const homeSweep = (root: string) => reclaimStrandedRunHomes(root, async () => "failed", nullLogger(), { minAgeMs: 0, now: () => Date.now() + 10_000 });
+type Json = Record<string, any>;
+const ident = (p: string): { dev: string; ino: string } => {
+  const st = fs.lstatSync(p, { bigint: true });
+  return { dev: String(st.dev), ino: String(st.ino) };
+};
+/** The GitCache entry points that adopt, seed, capture, reserve, release or discard: a stopped claim must call none of them. */
+const MUTATORS = ["seedIndependentAttempt", "markRecoveryCapture", "reserveRecoveryIteration", "blockRecoveryEpisode", "recordRecoveryCapture",
+  "retireRunnerClone", "releaseAttemptInPlace", "installCompletionSourceFence", "discardStoppedSource", "discardProtectedSource"] as const;
+/** What the production runner logs for a later claim of RUN on the released state, in order (recorded from the run, not chosen). */
+const STOP_LOG = ["run claimed", "restore entry present; claim stopped", "retained recovery stopped; source and accounting kept",
+  "retained recovery stopped; preserving plugin dir and HOME for a same-worker resume"];
+/** What it logs when steering has observed the owner Cancel first: the RetainedRecoveryCancelled arm of the dispatcher (runner.ts), which
+ *  never reaches the restore-entry composite stop. */
+const CANCEL_LOG = ["run claimed", "run failed", "run event", "recovery: unadopted guarded generation disposition", "retained recovery stopped; source and accounting kept",
+  "retained recovery stopped; preserving plugin dir and HOME for a same-worker resume"];
+
+describe("m4c: the production Cancel path and the production guarded discard on the state rc.2 leaves", () => {
+  const cleanups: Array<() => Promise<void> | void> = [];
+  afterEach(async () => {
+    mock.restoreAll();
+    for (const c of cleanups.splice(0).reverse()) await c();
+  });
+  const holdingRootOf = (e: Env): string => path.join(e.dataDir, "runner-quarantine");
+  const markerFile = (e: Env): string => path.join(e.dataDir, "retained-homes", `${RUN}.json`);
+
+  interface Released { e: Env; oPath: string; pHolder: string; modeA: boolean }
+
+  /** The P/S restore of this build, S terminal, the real marker the seed writes, then rc.2's own claim of the branch by another run. */
+  async function released(modeA: boolean): Promise<Released> {
+    const e = await build();
+    cleanups.push(() => e.fx.cleanup());
+    await writeRetainedHomeMarker(e.dataDir, { version: 1, runId: RUN, predecessorGeneration: 1, predecessorAttemptId: P_ID, barePath: e.bare });
+    const { oPath } = await rc2ClaimsBranch(e, modeA);
+    let pHolder = e.pPath;
+    if (!modeA) {
+      const held = fs.readdirSync(holdingRootOf(e)).filter(n => isHoldingName(n, RUN));
+      assert.equal(held.length, 1, `rc.2 moved P to exactly one holding directory: ${JSON.stringify(held)}`);
+      pHolder = path.join(holdingRootOf(e), held[0]!);
+    }
+    return { e, oPath, pHolder, modeA };
+  }
+
+  /** Every byte and every binding the discard flow may not change, in one comparable object. */
+  function world(r: Released): Record<string, unknown> {
+    const { e } = r;
+    return { config: configEntries(e.bare), refs: refList(e.bare), pHolder: tree(r.pHolder), holding: tree(holdingRootOf(e)), s: tree(e.sPath), o: tree(r.oPath),
+      pHome: tree(path.join(e.homeRoot, RUN)), pProvision: tree(path.join(e.provisionRoot, RUN)),
+      sHome: tree(path.join(e.homeRoot, `${RUN}.g2`)), sProvision: tree(path.join(e.provisionRoot, `${RUN}.g2`)),
+      marker: fs.existsSync(markerFile(e)) ? fs.readFileSync(markerFile(e), "utf8") : null };
+  }
+  function assertWorld(before: Record<string, unknown>, after: Record<string, unknown>, except: string[], what: string): void {
+    for (const key of Object.keys(before)) if (!except.includes(key)) assert.deepEqual(after[key], before[key], `${what}: ${key} unchanged`);
+  }
+  const ledgerOf = (e: Env): Array<{ attemptId: string; runId: string; clonePath: string; state: string }> =>
+    (configEntries(e.bare).get(LEDGER_KEY) ?? []).map(v => JSON.parse(v) as { attemptId: string; runId: string; clonePath: string; state: string });
+
+  /** Plan 3.11's exact bindings of the rolled-forward state, read from the files alone. */
+  function assertBindings(r: Released): void {
+    const { e } = r;
+    const config = configEntries(e.bare);
+    const value = parseRestoreValue(config.get(S_KEY)![0]!);
+    assert.equal(value.kind, "entry", "S's restore entry is intact");
+    const basis = value.basis;
+    assert.deepEqual({ clonePath: basis.predecessor.clonePath, attemptId: basis.predecessor.attemptId, generation: basis.predecessor.generation },
+      { clonePath: e.pPath, attemptId: P_ID, generation: 1 }, "the basis names P's path, attempt and generation");
+    assert.equal(basis.journalDigest, restoreDigest(e.pRaw), "the basis digest is P's own journal's");
+    assert.deepEqual(basis.pin, { captureId: "capture-1", generation: 1, sourceSha: e.pinSha, finalization: true });
+    assert.deepEqual(basis.predecessor.root, ident(r.pHolder), "the recorded root dev/ino is the inode of P's bytes wherever they are now");
+    assert.equal(fs.readFileSync(path.join(r.pHolder, "later.txt"), "utf8"), "later bytes that were never saved");
+    const ledger = ledgerOf(e);
+    assert.deepEqual(ledger.filter(x => x.attemptId === S_ID).at(-1), { attemptId: S_ID, runId: RUN, clonePath: e.sPath, state: "live" });
+    assert.deepEqual(ledger.filter(x => x.attemptId === P_ID).at(-1), { attemptId: P_ID, runId: RUN, clonePath: e.pPath, state: r.modeA ? "reclaimed" : "live" },
+      "P's ledger value is the rc.2 one of its mode");
+    const pKey = JSON.parse(config.get(P_KEY)![0]!) as { runId: string; clonePath: string };
+    assert.equal(pKey.runId, OTHER, "P's key holds O's journal");
+    assert.equal(pKey.clonePath, r.oPath);
+    assert.equal(fs.existsSync(e.pPath), r.modeA, r.modeA ? "mode A: P is at its own path" : "mode H: P moved to the holding root");
+    assert.equal(fs.existsSync(path.join(e.sPath, "work.txt")), true, "S's clone is intact");
+    const marker = JSON.parse(fs.readFileSync(markerFile(e), "utf8")) as Json;
+    assert.deepEqual({ runId: marker.runId, attempt: marker.predecessorAttemptId, bare: marker.barePath }, { runId: RUN, attempt: P_ID, bare: e.bare });
+  }
+
+  /** A later claim of RUN on the production RunRunner over the proof's own files. */
+  async function laterClaim(r: Released, cancel: boolean): Promise<{ run: RunnerOver; calls: Record<string, number> }> {
+    const run = await runnerOverDisk({ dataDir: r.e.dataDir, originPath: r.e.fx.originPath, runId: RUN, iid: 3644, claimGeneration: 3,
+      homeDir: path.join(r.e.homeRoot, RUN), cancel });
+    cleanups.push(() => run.close());
+    const calls: Record<string, number> = {};
+    for (const name of MUTATORS) {
+      const target = run.git as unknown as Record<string, (...a: unknown[]) => unknown>;
+      const original = target[name]!.bind(run.git);
+      mock.method(target, name, (...args: unknown[]) => { calls[name] = (calls[name] ?? 0) + 1; return original(...args); });
+    }
+    if (cancel) {
+      // Without this the outcome is a race between steering's first input read and the claim's own discovery (measured: both outcomes
+      // occur). Discovery waits until the api has the Cancel acknowledged, so steering has observed it.
+      const target = run.git as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>;
+      const discover = target["discoverOpaque"]!.bind(run.git);
+      mock.method(target, "discoverOpaque", async (...args: unknown[]) => {
+        const deadline = Date.now() + 10_000;
+        while (!run.api.isAcked(RUN, 1) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
+        assert.equal(run.api.isAcked(RUN, 1), true, "steering observed the Cancel before discovery ran");
+        await new Promise(resolve => setTimeout(resolve, 50));
+        return discover(...args);
+      });
+    }
+    await run.runner.execute(run.claim);
+    return { run, calls };
+  }
+  /** The observed Cancel outcome: the claim's `running` ack, then ONE terminal report, `failed` / "run cancelled" (the runner's cancelled report;
+   *  the dispatcher keeps custody with it), and no adoption, seed, capture, reservation, FINAL, release or discard of any kind. */
+  function assertCancelledReport(run: RunnerOver, calls: Record<string, number>): void {
+    assert.deepEqual(run.api.states.map(s => ({ status: s.body.status, reason: s.body.failure_reason })),
+      [{ status: "running", reason: undefined }, { status: "failed", reason: "run cancelled" }], "running ack, then the cancelled report, nothing else");
+    assert.deepEqual(calls, {}, "no adoption, restore seed, capture, reservation, FINAL, release or discard was attempted");
+    assert.equal(run.counters.ran, 0, "no model turn");
+    assert.deepEqual((run.logs.lines as Array<{ msg: string }>).map(l => l.msg), CANCEL_LOG);
+    assert.equal((run.logs.lines as Array<{ msg: string }>).some(l => l.msg === "restore entry present; claim stopped"), false, "the Cancel never reached the composite stop");
+  }
+  /** An uncancelled claim: the composite stop, nonterminal. */
+  function assertNonterminalStop(run: RunnerOver, calls: Record<string, number>): void {
+    assert.deepEqual(run.api.states.map(s => s.body.status), ["running"], "the claim's running ack and nothing else: no failed, completed, paused or cancelled report");
+    assert.deepEqual(calls, {}, "no adoption, restore seed, capture, reservation, FINAL, release or discard was attempted");
+    assert.equal(run.counters.ran, 0, "no model turn");
+    const lines = run.logs.lines as Array<{ msg: string; error?: string }>;
+    assert.deepEqual(lines.map(l => l.msg), STOP_LOG);
+    assert.match(lines[1]!.error ?? "", /restore entry names another run \(predecessor released or missing\)/);
+  }
+
+  async function serve(r: Released, run: RunnerOver): Promise<string> {
+    const server = new RetainedSourceServer({
+      dataDir: r.e.dataDir, git: run.git, gate: new DindPruneGate(), runner: run.runner, log: nullLogger(), isIdle: () => true, authority: run.authority,
+      client: { listRecoveryHolds: async (runId: string) => ({ run_id: runId, holds: [] }), getRunOwnership: async () => ({ status: "failed", claim_generation: 3 }) } as never,
+    });
+    const ac = new AbortController();
+    const served = server.serve(ac.signal);
+    await server.ready;
+    cleanups.push(async () => { ac.abort(); await server.close(); await served.catch(() => undefined); });
+    return server.path;
+  }
+  function send(sock: string, req: unknown): Promise<Json> {
+    return new Promise((resolve, reject) => {
+      const conn = net.createConnection(sock);
+      const chunks: Buffer[] = [];
+      conn.on("error", reject);
+      conn.on("connect", () => conn.write(`${JSON.stringify(req)}\n`));
+      conn.on("data", c => chunks.push(Buffer.from(c)));
+      conn.on("end", () => { try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Json); } catch (err) { reject(err); } });
+    });
+  }
+  /** inspect, then discard with the digest inspect returned: the owner's own two requests. `confirm` overrides the digest. */
+  async function ownerDiscard(sock: string, generation: number, confirm?: string): Promise<Json & { found: boolean }> {
+    const listed = await send(sock, { op: "inspect" });
+    const found = (listed.sources as Json[]).filter(x => x.runId === RUN && x.generation === generation);
+    if (found.length !== 1) return { found: false, result: { kind: "not_listed", sources: found.length } } as Json & { found: boolean };
+    const source = found[0]!;
+    const out = await send(sock, { op: "discard", run: RUN, generation: source.generation, attempt: source.attempt, confirm: confirm ?? source.descriptor });
+    return { ...out, found: true };
+  }
+  /** A server over a fresh runner that has not claimed anything. */
+  async function idleServer(r: Released): Promise<string> {
+    const run = await runnerOverDisk({ dataDir: r.e.dataDir, originPath: r.e.fx.originPath, runId: RUN, iid: 3644, claimGeneration: 3, homeDir: path.join(r.e.homeRoot, RUN) });
+    cleanups.push(() => run.close());
+    return serve(r, run);
+  }
+
+  for (const modeA of [true, false]) {
+    const mode = modeA ? "A (attempt paths, in_place)" : "H (holding root)";
+
+    it(`mode ${mode}: the rolled-forward files bind exactly P, S, the ledger, the restore entry and the inode`, async () => {
+      assertBindings(await released(modeA));
+    });
+
+    it(`mode ${mode}: an owner Cancel on a later claim of RUN is reported cancelled and touches nothing; then S's and P's guarded discards run through the production server`, async () => {
+      const r = await released(modeA);
+      assertBindings(r);
+      const before = world(r);
+      // 3. The production Cancel path: RunRunner.execute on the rolled-forward state, an owner Cancel queued for the run.
+      const { run, calls } = await laterClaim(r, true);
+      assertCancelledReport(run, calls);
+      assertWorld(before, world(r), [], "the Cancel claim");
+      assertBindings(r);
+      // 4. The guarded discards, through the production RetainedSourceServer and the marker hooks it wires.
+      const sock = await serve(r, run);
+      const sDone = await ownerDiscard(sock, 2);
+      assert.equal(sDone.result.kind, "done", JSON.stringify(sDone));
+      assert.equal(fs.existsSync(r.e.sPath), false, "S's clone is gone");
+      assert.ok(configEntries(r.e.bare).get(S_KEY)?.[0]?.includes('"restoreStage":"retired"'), "the basis survives as the tombstone");
+      const afterS = world(r);
+      assertWorld(before, afterS, ["config", "s", "sHome", "sProvision"], "S's discard");
+      assert.deepEqual(afterS.marker, before.marker, "S's discard leaves the marker");
+      assert.deepEqual(configEntries(r.e.bare).get(P_KEY), (before.config as Map<string, string[]>).get(P_KEY), "S's exit never writes P's key (it holds O's journal)");
+      assert.equal(fs.readFileSync(path.join(r.pHolder, "later.txt"), "utf8"), "later bytes that were never saved", "P's bytes survive S's exit");
+      // P's own authorised discard.
+      const pDone = await ownerDiscard(sock, 1);
+      assert.equal(pDone.result.kind, "done", JSON.stringify(pDone));
+      assert.equal(fs.existsSync(markerFile(r.e)), false, "the production hook removed the marker with P's exit");
+      assert.deepEqual(configEntries(r.e.bare).get(P_KEY), (before.config as Map<string, string[]>).get(P_KEY), "P's key (O's journal) is byte-identical after P's exit");
+      assert.equal(configEntries(r.e.bare).get(S_KEY)?.[0] ?? "", "", "the restore entry is gone");
+      assert.equal(ledgerOf(r.e).filter(x => x.attemptId === P_ID).at(-1)?.state, "retired");
+      assert.equal(ledgerOf(r.e).filter(x => x.attemptId === S_ID).at(-1)?.state, "retired");
+      assert.deepEqual(tree(r.oPath), before.o, "O's clone is untouched by every step");
+      assert.deepEqual(tree(path.join(r.e.homeRoot, RUN)), before.pHome, "P's legacy HOME is not touched by the discard");
+      assert.deepEqual(tree(path.join(r.e.provisionRoot, RUN)), before.pProvision);
+      if (modeA) assert.equal(fs.existsSync(r.e.pPath), false, "the owner's authorised discard removed P's directory");
+      else {
+        assert.deepEqual(tree(holdingRootOf(r.e)), before.holding, "the holding root is byte-identical after P's exit: the copy stays for the owner");
+        assert.equal(pDone.result.holding, path.basename(r.pHolder), "the holding copy is reported by name");
+      }
+      assert.equal((await r.e.current.discoverOpaque(r.e.bare, BRANCH, OTHER)).kind, "sameRun", "O's branch is O's again");
+    });
+
+    it(`mode ${mode}: on the released state every adoption, restore, FINAL, release and cleanup refuses and writes nothing`, async () => {
+      const r = await released(modeA);
+      const before = world(r);
+      const { e } = r;
+      const reseed = { beforeFree: async () => {}, isLive: () => false };
+      const attempt = (id: string) => ({ attemptId: id, isLive: () => false, beforeSeed: async () => {} });
+      const newId = formatAttemptId(new Date("2026-11-06T12:00:00Z"), 4, "eeeeeeeeeeeeeeee");
+      const expected = { runId: RUN, clonePath: e.pPath, attemptId: P_ID };
+      const guarded = async (what: string, fn: () => Promise<unknown>): Promise<void> => {
+        await assert.rejects(fn, (err: unknown) => {
+          const x = err as Error & { cause?: unknown; reason?: string };
+          const typed = err instanceof RestoreCompositeError || x.cause instanceof RestoreCompositeError || (x.name === "RestoreSeedError" && x.reason === "restore_entry_exists") ||
+            (what.startsWith("runnerCloneForBranch") && x.name === "ForeignCaptureBlockedError");
+          assert.ok(typed, `${what}: ${x.name}: ${x.message}`);
+          return true;
+        });
+      };
+      await guarded("resolveBranchJournal", () => e.current.resolveBranchJournal(e.bare, BRANCH));
+      await guarded("discoverOpaque(RUN)", () => e.current.discoverOpaque(e.bare, BRANCH, RUN));
+      await guarded("discoverOpaque(O)", () => e.current.discoverOpaque(e.bare, BRANCH, OTHER));
+      for (const run of [RUN, OTHER]) await guarded(`runnerCloneForBranch(${run})`, () => e.current.runnerCloneForBranch(e.bare, BRANCH, KEY, reseed, run, false, undefined, attempt(newId) as never));
+      await guarded("reserveRecoveryIteration", () => e.current.reserveRecoveryIteration(e.bare, BRANCH, KEY, expected, 1000, 2));
+      await guarded("markRecoveryCapture(P)", () => e.current.markRecoveryCapture(e.bare, e.pPath, BRANCH, RUN, P_ID));
+      await guarded("recordRecoveryCapture", () => e.current.recordRecoveryCapture(e.bare, BRANCH, KEY, expected, 1, e.pinSha));
+      await guarded("installCompletionSourceFence", () => e.current.installCompletionSourceFence(e.bare, BRANCH, expected,
+        { version: 1, sourceUseEpoch: "0123abcd-0123-4abc-8def-0123456789ab", sourceCoreDigest: "a".repeat(64) }));
+      for (const discard of [false, true]) {
+        await guarded(`retireRunnerClone(discard ${discard})`, () => e.current.retireRunnerClone(e.bare, e.pPath, BRANCH, RUN,
+          discard ? { discard, completionSource: { expectedHead: e.pinSha, canDelete: () => true } } : { discard }));
+      }
+      assert.equal(await e.current.restoreKeepsRecoveryRef(e.bare, RUN, { sha: e.pinSha }), true, "the pin stays protected");
+      assertWorld(before, world(r), [], "refusals");
+      // Automatic cleanup: this build's own HOME sweeps, the run terminal, keep P's legacy HOME and provision directory (the marker). What
+      // they do reclaim is S's per-attempt `<run>.g2` directories, which the marker deliberately does not cover (disk-reclaim.ts).
+      for (const root of [e.homeRoot, e.provisionRoot]) {
+        const swept = await homeSweep(root);
+        assert.equal(swept.skippedRetainedHome, 1, `${root}: the marker protects the legacy directory`);
+        assert.equal(swept.removed, 1, `${root}: only S's own per-attempt directory is reclaimed`);
+      }
+      const swept = world(r);
+      for (const key of ["pHome", "pProvision", "config", "refs", "pHolder", "holding", "s", "o", "marker"]) assert.deepEqual(swept[key], before[key], `sweeps: ${key} unchanged`);
+      assert.deepEqual([swept.sHome, swept.sProvision], [{}, {}], "S's per-attempt HOME and provision directory follow their terminal run");
+    });
+
+    it(`mode ${mode}: UNSAFE-ADOPTION CONTROL: an uncancelled claim of RUN on the released state adopts nothing and stops as the Cancel claim does`, async () => {
+      const r = await released(modeA);
+      const before = world(r);
+      const { run, calls } = await laterClaim(r, false);
+      assertNonterminalStop(run, calls);
+      assertWorld(before, world(r), [], "the uncancelled claim");
+    });
+  }
+
+  it("controls (mode H, partial attribution): no holding directory, two holding directories and a malformed name refuse P's discard; P's own directory then completes it", async t => {
+    const r = await released(false);
+    const sock = await idleServer(r);
+    assert.equal((await ownerDiscard(sock, 2)).result.kind, "done");
+    const held = r.pHolder;
+    const aside = path.join(r.e.dataDir, "p-aside");
+    const refused = async (what: string): Promise<void> => {
+      const before = world(r);
+      const out = await ownerDiscard(sock, 1);
+      assert.notEqual(out.result.kind, "done", `${what}: ${JSON.stringify(out)}`);
+      t.diagnostic(`${what}: ${JSON.stringify({ found: out.found, kind: out.result.kind, reason: out.result.reason })}`);
+      assert.deepEqual(world(r), before, `${what}: nothing written`);
+    };
+    fs.renameSync(held, aside);
+    await refused("no holding directory");
+    fs.renameSync(aside, held);
+    const second = path.join(holdingRootOf(r.e), `${holdingNamePrefix(RUN)}${randomUUID()}`);
+    fs.mkdirSync(second, { mode: 0o700 });
+    await refused("two holding directories");
+    fs.rmdirSync(second);
+    const malformed = path.join(holdingRootOf(r.e), `${RUN}-not-a-uuid`);
+    fs.mkdirSync(malformed, { mode: 0o700 });
+    await refused("a malformed holding name of the run");
+    fs.rmdirSync(malformed);
+    const done = await ownerDiscard(sock, 1);
+    assert.equal(done.result.kind, "done", `control: ${JSON.stringify(done)}`);
+    assert.equal(done.result.holding, path.basename(held));
+  });
+
+  it("controls (digest mismatch): a wrong confirm digest is refused before anything is touched; P's key holding a journal of RUN is not the released shape", async t => {
+    const r = await released(true);
+    const sock = await idleServer(r);
+    const before = world(r);
+    const wrong = await ownerDiscard(sock, 2, "0".repeat(64));
+    assert.equal(wrong.result.kind, "refused", JSON.stringify(wrong));
+    assert.equal(wrong.result.reason, "descriptor_changed");
+    assertWorld(before, world(r), [], "wrong confirm digest");
+    // P's key now holds a journal of RUN itself (its digest is not the basis's, and it is not O's): ambiguous, never released.
+    git(r.e.bare, "config", P_KEY, JSON.stringify({ runId: RUN, clonePath: r.e.pPath, attemptId: P_ID, peeledMarkers: ["a".repeat(40)] }));
+    const tampered = world(r);
+    for (const generation of [2, 1]) {
+      const out = await ownerDiscard(sock, generation);
+      assert.notEqual(out.result.kind, "done", `generation ${generation}: ${JSON.stringify(out)}`);
+      t.diagnostic(`journal of RUN in P's key, generation ${generation}: ${JSON.stringify({ found: out.found, kind: out.result.kind, reason: out.result.reason })}`);
+    }
+    assertWorld(tampered, world(r), [], "a journal of RUN in P's key");
+  });
+
+  it("controls (mode H, wrong inode): a sole run-prefixed directory that is a COPY of P's refuses P's discard; P's own inode completes it", async t => {
+    const r = await released(false);
+    const sock = await idleServer(r);
+    assert.equal((await ownerDiscard(sock, 2)).result.kind, "done");
+    const real = r.pHolder;
+    const recorded = parseRestoreValue(configEntries(r.e.bare).get(S_KEY)![0]!).basis.predecessor.root;
+    assert.deepEqual(ident(real), recorded, "control: the recorded inode is the holding copy's");
+    const aside = path.join(r.e.dataDir, "p-aside");
+    fs.renameSync(real, aside);
+    execFileSync("cp", ["-a", aside, real], { env: ENV });
+    assert.notDeepEqual(ident(real), recorded, "the copy has another inode");
+    assert.equal(fs.readFileSync(path.join(real, "later.txt"), "utf8"), "later bytes that were never saved", "and the same bytes");
+    const before = world(r);
+    const out = await ownerDiscard(sock, 1);
+    assert.equal(out.found, true, "the copy is listed as P's source, so the refusal below comes from the binding and not from a missing record");
+    assert.notEqual(out.result.kind, "done", JSON.stringify(out));
+    t.diagnostic(`wrong inode: ${JSON.stringify({ kind: out.result.kind, reason: out.result.reason })}`);
+    assert.deepEqual(world(r), before, "nothing written, nothing deleted");
+    assert.equal(fs.existsSync(markerFile(r.e)), true);
+    fs.rmSync(real, { recursive: true });
+    fs.renameSync(aside, real);
+    const done = await ownerDiscard(sock, 1);
+    assert.equal(done.result.kind, "done", `control: ${JSON.stringify(done)}`);
+    assert.equal(fs.existsSync(markerFile(r.e)), false);
   });
 });
