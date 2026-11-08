@@ -637,9 +637,11 @@ function spyMutators(target: object): Record<string, number> {
 const STOP_LOG = ["run claimed", "restore entry present; claim stopped", "retained recovery stopped; source and accounting kept",
   "retained recovery stopped; preserving plugin dir and HOME for a same-worker resume"];
 /** What it logs, in natural order (no waiting), when the owner Cancel is persisted server-side. Two orders occur and both are the
- *  one cancelled report: steering's first input read routes the Cancel before discovery (no stop line), or the claim reaches the
- *  restore-entry composite stop first and the stop's cancel observation (runner.ts, opaquePreDiscovery) converts it into the
- *  cancelled report. Recorded from the runs, not chosen. */
+ *  one cancelled report. The proof queues a real cancel input row and steering routes it while the stop's ownership read is in
+ *  flight, or before discoverOpaque returns (so the lifecycle guard throws before the stop line); which of the two happens is
+ *  timing, not mode. Either way the discovery catch's terminal guard (runner.ts, retainedTerminalGuard) reports it. Neither
+ *  accepted sequence contains the cancel observation's commit line, so the production observe (observeCancelAtHeldSeam at the
+ *  restore stops) is NOT exercised here; runner-independent-restore-cancel.test.ts proves it. Recorded from the runs, not chosen. */
 const CANCEL_TAIL = ["run failed", "run event", "outbox: terminal journaled write-ahead", "recovery: unadopted guarded generation disposition",
   "retained recovery stopped; source and accounting kept", "retained recovery stopped; preserving plugin dir and HOME for a same-worker resume"];
 const CANCEL_LOGS = [["run claimed", ...CANCEL_TAIL], ["run claimed", "restore entry present; claim stopped", ...CANCEL_TAIL]];

@@ -26198,8 +26198,9 @@ export class RunRunner {
    *  probe) whether a cancel is requested for this claim and, only when every outcome-safety condition
    *  still holds at the commit instant, convert the stop into a cancellation (RetainedRecoveryCancelled);
    *  otherwise return and let the caller throw today's stop. */
-  private async observeCancelAtHeldSeam(claim: ClaimResponse, flight: RunFlight): Promise<void> {
+  private async observeCancelAtHeldSeam(claim: ClaimResponse, flight: RunFlight, seam: "held" | "restore" = "held"): Promise<void> {
     if (claim.run_id !== flight.runId) return;
+    const restore = seam === "restore";
     let cause: unknown;
     try {
       if (!this.heldSeamSyncSafe(flight) || !await this.heldSeamPolicySafe(flight)) return;
@@ -26210,16 +26211,18 @@ export class RunRunner {
           // One synchronous block: no await between the last safety check and the commit.
           if (this.heldSeamSyncSafe(flight)) {
             flight.steering.markCancelled();
-            cause = new Error("owner cancel observed at held-predecessor refusal");
+            cause = new Error(restore ? "owner cancel observed at independent restore stop" : "owner cancel observed at held-predecessor refusal");
             this.observeCancellation(flight);
-            flight.runLog.info("retained predecessor held; owner cancel observed at the refusal, reporting cancellation",
-              { claim_generation: flight.claimGeneration });
+            flight.runLog.info(restore ? "independent restore stopped; owner cancel observed at the stop, reporting cancellation"
+              : "retained predecessor held; owner cancel observed at the refusal, reporting cancellation",
+            { claim_generation: flight.claimGeneration });
           }
         }
       }
     } catch {
-      flight.runLog.warn("owner cancel read at the held-predecessor refusal did not complete; stopping without cancel",
-        { claim_generation: flight.claimGeneration });
+      flight.runLog.warn(restore ? "owner cancel read at the restore stop did not complete; stopping without cancel"
+        : "owner cancel read at the held-predecessor refusal did not complete; stopping without cancel",
+      { claim_generation: flight.claimGeneration });
     }
     if (cause !== undefined) throw new RetainedRecoveryCancelled({ cause });
   }
@@ -27201,13 +27204,13 @@ export class RunRunner {
       this.retainedLifecycleGuard(flight);
       flight.runLog.warn("restore entry present; claim stopped", {
         blocked_by_other_run: error instanceof RestoreCompositeBlockedError, error: sanitizeForLog(errMessage(error)) });
-      await this.observeCancelAtHeldSeam(claim, flight);
+      await this.observeCancelAtHeldSeam(claim, flight, "restore");
       throw new RestoreRouteStop({ cause: error });
     }
     this.retainedLifecycleGuard(flight);
     if (found.kind === "composite") {
       flight.runLog.warn("restore entry present; claim stopped", { stage: found.composite.stage });
-      await this.observeCancelAtHeldSeam(claim, flight);
+      await this.observeCancelAtHeldSeam(claim, flight, "restore");
       throw new RestoreRouteStop();
     }
     const authority = this.authority;
@@ -27273,7 +27276,7 @@ export class RunRunner {
       flight.runLog.info("independent restore eligible; seeding disabled for this runner instance", {
         verdict: outcome.verdict.boundary, pin_generation: outcome.verdict.generation, source_sha: outcome.verdict.pin.sourceSha,
         slot: outcome.known.slot, cross_check: outcome.known.crossCheck, claim_generation: claim.claim_generation });
-      await this.observeCancelAtHeldSeam(claim, flight);
+      await this.observeCancelAtHeldSeam(claim, flight, "restore");
       throw new RestoreRouteStop();
     }
     await this.restoreFromPin(claim, flight, bare, branch, key, route.raw, outcome.verdict, outcome.known, input);
@@ -27312,7 +27315,7 @@ export class RunRunner {
    *  Writes nothing of its own; a seed that already wrote reports the window it left behind. */
   private async refuseRestoreRoute(claim: ClaimResponse, flight: RunFlight, reason: string, known: RestoreKnown): Promise<never> {
     // Nothing has been written yet: an owner cancel already persisted server-side but not yet routed by steering is reported here.
-    await this.observeCancelAtHeldSeam(claim, flight);
+    await this.observeCancelAtHeldSeam(claim, flight, "restore");
     return this.stopRestoreRoute(claim, flight, reason, known);
   }
 
@@ -27375,8 +27378,10 @@ export class RunRunner {
    * become the basis the seed persists; the seed's `predecessorUnchanged` callback re-reads all of it plus a fresh config
    * snapshot (classification, compose predicate, census) and answers true only when the whole verdict is unchanged.
    *
-   * Every refusal (`RestoreSeedError` of any window, a changed pin, an unbuildable executor) takes the 3.5 disposition
-   * ({@link refuseRestoreRoute}): the flags keep their original values, so the predecessor and its custody are untouched.
+   * A refusal before the first durable write (an unconfirmed ownership, an unbuildable executor) takes the 3.5 disposition
+   * ({@link refuseRestoreRoute}, which first observes a persisted owner Cancel). A refusal after the seed may have written
+   * (`RestoreSeedError` of any window, a changed pin) uses {@link stopRestoreRoute}, the same log, feed line and stop without
+   * the cancel observation. Either way the flags keep their original values, so the predecessor and its custody are untouched.
    *
    * Flag table. `original` is what recoverRetainedClaimBody set for the retained predecessor; `success` the value once S is the
    * flight's source (a fresh attempt, exactly what a first claim has); a refusal keeps `original` throughout:
