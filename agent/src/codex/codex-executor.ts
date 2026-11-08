@@ -40,7 +40,8 @@ import { ExecutorLifetime, type ExecutorSealResult, type ExecutorTerminalSeal } 
 // too: in the implement phase through ctx.parkForPause (a declined park re-drives the turn), in
 // the plan phase by throwing a PauseNowSignal the runner parks.
 // Issue #1800: the pending owner follow-ups (ctx.pullFollowUps, one batch up to the rune cap) ride the
-// base implement prompt of the next ordinary turn, each in its own <follow_up> fence, and every one is
+// base implement prompt of the next ordinary turn (or the first policy-continuation plan request),
+// each in its own <follow_up> fence, and every one is
 // reported included (ctx.followUpIncluded) when that turn first yields an event evidencing the model processed them (evidencesModelProcessing; not
 // thread/turn lifecycle notifications); a completion-rework or secret-remediation turn leaves it waiting.
 // It reuses `ctx.gatePlan` for the plan→approval gate exactly like SdkExecutor, but drives
@@ -87,7 +88,7 @@ import { type CodexErrorClassification, CodexTurnFailedError, formatCodexClassif
 import type { DockerWiring } from "../docker-wiring.js";
 import { PlanRejectedError, PlanRevisionReplacedError, stampPrSummaryHead, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type PlanRevisionOwnerWaitObserver, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
 import type { PrSummaryClaim } from "../signals.js";
-import { PauseNowSignal, MAX_FOLLOW_UP_BATCH_RUNES } from "../steering.js";
+import { PauseNowSignal, MAX_FOLLOW_UP_BATCH_RUNES, followUpRunes } from "../steering.js";
 import { isRunSummaryKind, resolveRunKind } from "../run-kind.js";
 import {
   STALL_LIMIT,
@@ -3966,6 +3967,11 @@ export class CodexExecutor implements Executor {
         ctx.emit({ kind: "answer", agent: "lead", payload: { answers: verdict.answers } });
         return answeredPrompt(questions, verdict.answers, parkAt && parkRunEnabled(ctx, "implement") ? PARK_RUN_CONTINUATION : undefined);
       };
+      // One batch survives pre-evidence retries. Policy continuations may place it on their first
+      // planning request; ordinary planning leaves it for implementation, as before (#1800).
+      let ownerBatch: Array<{ id: number; body: string }> | undefined;
+      let priorOwnerHistoryPlaced = false;
+      let policyPlanPending = ctx.policyOwnerContinuation === true;
       let planSourceReported = false;
       const drivePlan = async (initialPrompt: string, humanRevision = false) => {
         // issue #2213: a quarantined worker stops a run cleanly at the plan and revise boundaries,
@@ -4027,7 +4033,35 @@ export class CodexExecutor implements Executor {
               chargeSilentRecovery();
               silentRevision.needsRebuild = false;
             }
-            turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, shared.selection.current, shared.repoInstructions, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completion, undefined, undefined, undefined, undefined, false, !humanRevision, humanRevision);
+            if (policyPlanPending && ownerBatch === undefined) {
+              const pulled = ctx.pullFollowUps?.(MAX_FOLLOW_UP_BATCH_RUNES, true);
+              if (pulled?.length) ownerBatch = pulled;
+              // A prefix may omit the owner's latest narrowing correction. Refuse before model work
+              // rather than silently plan from that prefix; unacknowledged rows remain replayable.
+              const overflow = ctx.pullFollowUps?.(0, true);
+              if ((ownerBatch?.reduce((n, f) => n + followUpRunes(f.body), 0) ?? 0) > MAX_FOLLOW_UP_BATCH_RUNES || overflow?.length) {
+                if (overflow?.length) ownerBatch = [...(ownerBatch ?? []), ...overflow];
+                throw new TransientRecoveryError("policy planning owner inputs exceed the first-turn context budget");
+              }
+            }
+            const ownerRides = policyPlanPending ? ownerBatch : undefined;
+            const liveIds = new Set((ownerRides ?? []).map(f => f.id));
+            const historyBodies = policyPlanPending && !ctx.sessionId && !priorOwnerHistoryPlaced
+              ? selectPriorOwnerHistory(ctx.priorOwnerFollowUps, id => liveIds.has(id) || (ctx.isLiveFollowUpId?.(id) ?? false))
+              : [];
+            const planningPrompt = ownerRides || historyBodies.length > 0
+              ? [prompt, ...renderPriorOwnerHistory(historyBodies), ...(ownerRides ? renderFollowUpBatch(ownerRides.map(f => f.body)) : [])].join("\n")
+              : prompt;
+            const onPolicyPlanFirstEvent = policyPlanPending ? () => {
+              if (!policyPlanPending) return;
+              policyPlanPending = false;
+              if (historyBodies.length > 0) priorOwnerHistoryPlaced = true;
+              if (ownerRides && ownerBatch === ownerRides) {
+                ownerBatch = undefined;
+                for (const f of ownerRides) ctx.followUpIncluded?.(f.id);
+              }
+            } : undefined;
+            turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", planningPrompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, shared.selection.current, shared.repoInstructions, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completion, undefined, onPolicyPlanFirstEvent, undefined, undefined, false, !humanRevision, humanRevision);
           } catch (error) {
             if (silentRevision?.needsRebuild && error instanceof CodexTurnTripError && error.message === REASON_WALL) {
               const stopped = await routeSilentInterruption();
@@ -4336,13 +4370,6 @@ export class CodexExecutor implements Executor {
       const noProgress = new NoProgressStallTracker();
       let lastServedCompletionAttempts: number | undefined;
       let lastServedCompletedCount: number | undefined;
-      // Issue #1800: the owner's follow-up batch (never empty; an empty pull stays undefined). Pulled from steering only immediately before an ordinary
-      // implement prompt is built (never while a system text owns the turn), carried across loop
-      // iterations (the base prompt is rebuilt each time), and cleared only when the turn whose
-      // prompt held it first yields a model-evidencing event (evidencesModelProcessing), which is when every entry is reported included. A turn that
-      // throws, parks, walls, pauses or whose epoch is recreated first keeps it for the next turn.
-      let ownerBatch: Array<{ id: number; body: string }> | undefined;
-      let priorOwnerHistoryPlaced = false;
       // Issue #1674: the approved breakdown this loop reports against: the list approved at this
       // run's gate, else (a pre-approved resume) the claim's frozen list.
       const milestones = approvedMilestones ?? ctx.frozenMilestones ?? undefined;
@@ -4572,15 +4599,15 @@ export class CodexExecutor implements Executor {
               ? { milestones: approvedMilestones, findings: checkedFindings, humanApproved: humanCanonicalPlan,
                 scopeSuperseded: approvedContractSuperseded } : undefined);
         const ownerBase = depsNote ? `${ownerPrompt}\n\n${depsNote}` : ownerPrompt;
-        // Issue #3149: earlier owner follow-ups ride only the first implement turn of a reviewed-plan
-        // resume (never a system-text turn), deduped by id against this turn's live batch and the
+        // Issues #3149/#3607: earlier owner follow-ups ride the first ordinary implement turn of a
+        // reviewed-plan or policy resume unless policy planning already placed them. Dedup by id against this turn's live batch and the
         // claim's live ids. The latch is spent only on the turn's first model event, so a turn that
         // aborts before any event composes the history again. No inclusion receipt for a history id.
         // The `systemFollowUp === undefined` term is defensive: every system-text turn follows an
         // evidenced turn that already spent the latch, and a system-text body replaces basePrompt,
         // so today it never changes the outcome; it keeps history off such a turn if that changes.
         let historyBodies: string[] = [];
-        if (systemFollowUp === undefined && ctx.reviewedPlanResume === true && !ctx.sessionId && !priorOwnerHistoryPlaced) {
+        if (systemFollowUp === undefined && (ctx.reviewedPlanResume === true || ctx.policyOwnerContinuation === true) && !ctx.sessionId && !priorOwnerHistoryPlaced) {
           const liveIds = new Set((ownerRides ?? []).map((f) => f.id));
           historyBodies = selectPriorOwnerHistory(ctx.priorOwnerFollowUps, (id) => liveIds.has(id) || (ctx.isLiveFollowUpId?.(id) ?? false));
         }

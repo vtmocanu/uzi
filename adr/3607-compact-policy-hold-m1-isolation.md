@@ -426,6 +426,30 @@ later ordinary pickups are the chosen baseline behaviour, not reuse of old
 consent. Only the optional compatible-lane one-claim Fresh uses a pending intent,
 below.
 
+### Resume context before the first model turn
+
+Root initial planning must see the owner's Resume correction too. The worker
+waits for input delivery, then places the bounded live batch and any earlier
+owner history in the existing untrusted fences on the first policy planning
+request. Inclusion is reported once, only on evidence of model processing;
+pre-evidence retries keep the batch. Ordinary planning still leaves queued
+follow-ups for implementation. Seeded policy continuations retain their existing
+owner-plan framing and replay earlier history without inventing a planning turn.
+
+The optional claim marker `policy_resume_context_pending` is derived from a
+resolved episode with no reported session, and retires when the session is
+reported. `policy_resume_inputs_pending` covers only this episode's unresolved
+follow-up delivery: modern applied-but-unincluded rows remain pending until
+inclusion, excluding superseded rows and blank-only bodies under
+`String.prototype.trim` semantics. The markers grant no plan approval, Fresh
+start, session reuse or broader scope. They add no schema or capability; older
+workers ignore them and older APIs omit them, so both updated sides are needed.
+
+Unknown or over-budget owner history, or a live backlog whose first bounded batch
+could omit the current correction, defers through the existing recovery path
+before a model request. Work and unincluded input rows remain preserved; the
+worker never silently plans from truncated owner context.
+
 ### R/VG/VH continuity: the required head moves only on verified publication
 
 A recorded required saved-work head is superseded only by a published report whose

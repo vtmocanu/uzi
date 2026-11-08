@@ -93,7 +93,8 @@ func TestPolicyFreshOneClaimChainLiveDB(t *testing.T) {
 		t.Fatalf("first claim: generation=%v session=%v", first["claim_generation"], first["session_id"])
 	}
 	wantFirst := readClaimFixture(t, "policy-fresh-session-claim.json")
-	wantFirst["policy_resume_inputs_pending"] = true // owner guidance has not been delivered
+	wantFirst["policy_resume_inputs_pending"] = true  // owner guidance has not been delivered
+	wantFirst["policy_resume_context_pending"] = true // the fresh session has not been reported
 	if got := policyClaimKeys(first); !reflect.DeepEqual(got, wantFirst) {
 		t.Fatalf("first claim policy keys %v, fixture %v", got, wantFirst)
 	}
@@ -120,6 +121,7 @@ func TestPolicyFreshOneClaimChainLiveDB(t *testing.T) {
 	}
 	wantSecond := readClaimFixture(t, "policy-fresh-unconfirmed-claim.json")
 	wantSecond["policy_resume_inputs_pending"] = true // the lost claim did not consume its guidance
+	wantSecond["policy_resume_context_pending"] = true
 	if got := policyClaimKeys(second); !reflect.DeepEqual(got, wantSecond) {
 		t.Fatalf("G+1 claim policy keys %v, fixture %v", got, wantSecond)
 	}

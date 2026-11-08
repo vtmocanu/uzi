@@ -79,9 +79,12 @@ type ClaimPayload struct {
 	PolicyPreserveOnly bool    `json:"policy_preserve_only,omitempty"`
 	PolicyExpectedHead *string `json:"policy_expected_head,omitempty"`
 	// PolicyResumeInputsPending selects the initial input-delivery barrier while a resolved policy
-	// episode still has Resume guidance owed, even with no captured head. It grants no session or
-	// Fresh-start authority; omitted after delivery and on ordinary claims. Older workers ignore it.
+	// episode still has Resume guidance owed, even with no captured head. Modern applied-but-unincluded
+	// rows remain owed. It grants no session/Fresh authority; omitted once included or on ordinary claims.
 	PolicyResumeInputsPending bool `json:"policy_resume_inputs_pending,omitempty"`
+	// PolicyResumeContextPending carries earlier owner history into a resolved policy episode's
+	// fresh conversation until a session is reported. It is context only, never Fresh authority.
+	PolicyResumeContextPending bool `json:"policy_resume_context_pending,omitempty"`
 	// PolicySavedWorkHead is the required recovery head of a run that is NOT preserving (its
 	// episode was resolved fresh_from_saved_work) but whose saved work must still be proven to
 	// contain it. Lowercase 40/64-hex; omitted otherwise. Mutually exclusive with PolicyExpectedHead.

@@ -15130,6 +15130,15 @@ export class RunRunner {
     const priorOwnerHistory = steering.priorOwnerHistory();
     const ownerHistoryIncomplete = m4Candidate && priorOwnerHistory.status !== "complete";
     const m4ResumeReviewedPlan = m4Candidate && !ownerHistoryIncomplete;
+    const policyOwnerContinuation = claim.policy_resume_context_pending === true ||
+      claim.policy_resume_inputs_pending === true || claim.policy_preserve_only === true ||
+      claim.policy_fresh_session === true || claim.policy_saved_work_head !== undefined;
+    const policyFreshContext = policyOwnerContinuation && !sessionId;
+    if (policyFreshContext && priorOwnerHistory.status !== "complete") {
+      // A human approval cannot replace missing owner context. Reuse the bounded recovery path,
+      // preserving the source, rather than start a model turn with truncated/unknown history.
+      throw new TransientRecoveryError("policy continuation owner history could not be restored completely");
+    }
 
     // PRD #1064 M1 (Decision 1): ONE per-run promise chain serializing EVERY `running`
     // report of the run — the immediate `reportProgress` pushes, the turn-boundary
@@ -16181,10 +16190,11 @@ export class RunRunner {
       // embeds the persisted plan body on the implement turn. Drives the relaxed
       // preApproved session guard and the embedSeededPlan reviewedResume term.
       reviewedPlanResume: m4ResumeReviewedPlan,
-      // Issue #3149: the earlier owner follow-ups a fresh reviewed-plan session never saw, and the
+      ...(policyOwnerContinuation ? { policyOwnerContinuation: true } : {}),
+      // Issues #3149/#3607: earlier owner follow-ups a fresh reviewed-plan or policy session never saw, and the
       // predicate that keeps the ones this claim delivers live out of that replay.
       priorOwnerFollowUps:
-        m4ResumeReviewedPlan && priorOwnerHistory.status === "complete" ? priorOwnerHistory.entries : undefined,
+        (m4ResumeReviewedPlan || policyFreshContext) && priorOwnerHistory.status === "complete" ? priorOwnerHistory.entries : undefined,
       isLiveFollowUpId: (id: number) => steering.isLiveDeliveryId(id),
       // PRD #759 M2: the reseed recovered an uncommitted WIP snapshot (a wip(park):
       // marker reset --soft back to the tree), so a cold resumed lead is told to treat
@@ -17568,11 +17578,8 @@ export class RunRunner {
         // shares the gate path's recovery handling (transient read failure parks, definitive fails).
         // An owner policy continuation (preserve-only, owner Fresh, or fresh_from_saved_work) records its
         // guidance as a follow_up input, so the first provider turn must also wait for that first read.
-        const policyContinuation = claim.policy_resume_inputs_pending === true ||
-          claim.policy_preserve_only === true || claim.policy_fresh_session === true ||
-          (typeof claim.policy_saved_work_head === "string" && claim.policy_saved_work_head !== "");
         if ((m4ResumeReviewedPlan && priorOwnerHistory.status === "complete" && priorOwnerHistory.entries.length > 0) ||
-            policyContinuation) {
+            policyOwnerContinuation) {
           await this.awaitResumedDelivery(runId, steering, batcher, runLog, cancel.signal);
         }
         // A prior quiescence/command receipt cannot settle newly admitted model work.

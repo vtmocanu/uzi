@@ -437,11 +437,14 @@ export interface RunContext {
    *  (a plan approved at the gate with no session to carry it), which does not use this flag.
    *  Absent/false ⇒ today's behaviour, byte-for-byte. */
   reviewedPlanResume?: boolean;
-  /** Issue #3149: on a reviewedPlanResume the fresh session has none of the run's earlier owner
+  /** Policy continuation's first model request carries pending owner inputs, including initial
+   *  planning. Context only; never a grant to start a session or broaden approved scope. */
+  policyOwnerContinuation?: boolean;
+  /** Issue #3149: on a reviewedPlanResume, or fresh policy continuation, the session has none of the run's earlier owner
    *  follow-ups. These are the ones earlier claims consumed (id order, trimmed), complete or
-   *  absent: the runner leaves this undefined, and drops reviewedPlanResume, when the history
-   *  could not be restored in full. The executor renders them (selectPriorOwnerHistory +
-   *  renderPriorOwnerHistory) on the first implement turn as historical context. */
+   *  absent: incomplete history drops reviewedPlanResume; a fresh policy continuation instead parks
+   *  before provider work. The executor renders them (selectPriorOwnerHistory +
+   *  renderPriorOwnerHistory) on its first applicable turn as historical context. */
   priorOwnerFollowUps?: readonly { id: number; body: string }[];
   /** Issue #3149: true when follow-up `id` reaches the lead live on this claim (steering
    *  isLiveDeliveryId), so the history replay skips it by id and it is delivered once. */

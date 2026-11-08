@@ -774,12 +774,13 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		CheckpointTip:  textPtr(run.CheckpointTip),
 		// Compact policy hold (#3607 M2a): the preserving fact and the required recovery head,
 		// read off the claimed row. Only a still-preserving run carries either.
-		PolicyPreserveOnly:        run.PolicyPreserveRequired,
-		PolicyExpectedHead:        policyExpectedHead(run),
-		PolicySavedWorkHead:       policySavedWorkHead(run),
-		PolicyFreshSession:        policyFreshSession(run),
-		PolicyFreshUnconfirmed:    policyFreshUnconfirmed(run),
-		PolicyResumeInputsPending: rc.PolicyResumeInputsPending,
+		PolicyPreserveOnly:         run.PolicyPreserveRequired,
+		PolicyExpectedHead:         policyExpectedHead(run),
+		PolicySavedWorkHead:        policySavedWorkHead(run),
+		PolicyFreshSession:         policyFreshSession(run),
+		PolicyFreshUnconfirmed:     policyFreshUnconfirmed(run),
+		PolicyResumeInputsPending:  rc.PolicyResumeInputsPending,
+		PolicyResumeContextPending: rc.PolicyResumeContextPending,
 		// Issue #3194: read off the claimed run row, never derived from ownership or the tip.
 		CheckpointAttestedSource: textPtr(run.CheckpointAttestedSource),
 		// PRD #1247 M9 (task c): the last_seq recordRunCredential actually landed — bumped past any

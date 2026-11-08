@@ -38,6 +38,7 @@ describe("preserve-only claim fields on the production claim path", () => {
     assert.equal(claim.policy_preserve_only, undefined);
     assert.equal(claim.policy_expected_head, undefined);
     assert.equal(claim.policy_resume_inputs_pending, undefined);
+    assert.equal(claim.policy_resume_context_pending, undefined);
   });
 
   it("pending policy Resume inputs select only an input barrier, including on a headless claim", async () => {
@@ -52,6 +53,26 @@ describe("preserve-only claim fields on the production claim path", () => {
       assert.equal((await claimWith({ policy_resume_inputs_pending: bad })).policy_resume_inputs_pending, true,
         "a malformed present marker must not bypass input delivery");
     }
+  });
+
+  it("pending fresh policy context keeps history without granting a Fresh start", async () => {
+    const raw = JSON.parse(await fs.readFile(new URL("../../fixtures/claims/policy-resume-context-claim.json", import.meta.url), "utf8")) as Record<string, unknown>;
+    const claim = await claimWith(raw);
+    assert.equal(claim.policy_resume_context_pending, true);
+    assert.equal(claim.policy_preserve_only, undefined);
+    assert.equal(claim.policy_fresh_session, undefined);
+    assert.equal((await claimWith({ policy_resume_context_pending: false })).policy_resume_context_pending, false);
+    for (const bad of ["false", 0, null, {}]) {
+      assert.equal((await claimWith({ policy_resume_context_pending: bad })).policy_resume_context_pending, true);
+    }
+  });
+
+  it("pending-input blank controls mirror String.trim used by steering", async () => {
+    const raw = JSON.parse(await fs.readFile(new URL("../../fixtures/claims/policy-resume-whitespace.json", import.meta.url), "utf8")) as
+      { blank: string; not_blank: string[] };
+    assert.ok(raw.blank.includes("\uFEFF") && raw.blank.includes("\n"), "Unicode and line-terminator controls exist");
+    for (const char of raw.blank) assert.equal(char.trim(), "", `U+${char.codePointAt(0)!.toString(16)}`);
+    for (const body of raw.not_blank) assert.ok(body.trim(), "nearby nonblank controls must remain input");
   });
 
   it("a preserve-only claim without a head stays distinguishable from one with a malformed head", async () => {

@@ -117,7 +117,7 @@ import { CommandCacheStartError } from "../src/codex/launcher.js";
 import { isBrokerModelCommand, type CapturedMemoryContext, type SpawnCommandOptions } from "../src/codex/broker.js";
 import { WorkerMemoryCommands } from "../src/worker-memory-commands.js";
 import { WorkerMemoryRuntime } from "../src/worker-memory-runtime.js";
-import type { ClaimResponse, MemoryReservationRequest, StateAck } from "../src/protocol.js";
+import type { ClaimResponse, MemoryReservationRequest, StateAck, StateRequest } from "../src/protocol.js";
 import { makeGitRepo, PR_SUMMARY_EXPECTED, PR_SUMMARY_INPUT } from "./pr-summary-fixture.js";
 import type { Logger } from "../src/log.js";
 import type { DockerWiring } from "../src/docker-wiring.js";
@@ -29807,22 +29807,32 @@ describe("compact policy hold: fake-provider continuation matrix (production run
     /** Observe the real delivery wait and release the held GET on entry, without a timer or
      *  an executor-side wait. If execution overtakes the barrier, release only for cleanup. */
     inputBarrierTest?: TestContext;
+    modelEvidence?: boolean;
+    retryBeforeEvidence?: boolean;
+    parkBeforeEvidence?: boolean;
+    runId?: string;
+    issueIid?: number;
+    historyUnavailable?: boolean;
   }
 
   async function drive(o: Drive) {
     const { api, client, fx } = m2Runner;
     CodexSessionStore.inspectSession = (async () => transcript) as typeof CodexSessionStore.inspectSession;
-    api.setRegisterProtocolFeatures(["provider_policy_hold_v1", "claim_generation_fence"]);
+    api.setRegisterProtocolFeatures(["provider_policy_hold_v1", "claim_generation_fence",
+      ...(o.parkBeforeEvidence ? ["recovery_cause_provider_outage"] : [])]);
     await client.register("policy-matrix", "base", 1, [], ["provider_policy_hold_v1"], undefined, 0);
     const head = spawnSync("git", ["-C", fx.originPath, "rev-parse", "HEAD"], { env: gitEnv(), encoding: "utf8" }).stdout.trim();
     assert.match(head, /^[0-9a-f]{40}$/);
-    const runId = randomUUID();
-    const claim = m2Runner.gitlabClaim(nextIid++, {
+    const runId = o.runId ?? randomUUID();
+    const claim = m2Runner.gitlabClaim(o.issueIid ?? nextIid++, {
       run_id: runId, claim_generation: 3, plan_approved: true, plan_source: "agent", plan_md: PLAN, auto_approve: true,
       secrets: { forge_pat: "fixture-forge-pat-000000", codex: { auth_mode: "api_key", capability: "fixture-capability", access_token: "fixture-access" } },
       ...o.claim(head),
     }) as ClaimResponse;
+    api.setInputClaimGeneration(runId, claim.claim_generation!);
+    api.setOwnershipStatus(runId, "running", claim.claim_generation!);
     if (o.earlier) api.overrideFollowUps(runId, 200, { inputs: o.earlier.map(e => ({ id: e.id, kind: "follow_up", body: e.body })) });
+    if (o.historyUnavailable) api.overrideFollowUps(runId, 503, { error: "history unavailable" });
     if (o.guidance) api.setInputs(runId, [{ id: GUIDANCE_ID, kind: "follow_up", body: GUIDANCE }]);
     const inputHold = o.holdFirstInputGet ? api.holdNextInputGet(runId) : undefined;
     let inputBarrierObserved = false;
@@ -29841,9 +29851,9 @@ describe("compact policy hold: fake-provider continuation matrix (production run
     const events: string[] = [];
     const holds: PolicyHoldRequest[] = [];
     const verifies: { claim_generation: number; required_head: string }[] = [];
-    const states: { status?: string }[] = [];
+    const states: StateRequest[] = [];
     const reportState = client.reportState.bind(client);
-    client.reportState = async (...args) => { states.push({ status: args[1].status }); return reportState(...args); };
+    client.reportState = async (...args) => { states.push(structuredClone(args[1])); return reportState(...args); };
     client.reportPolicyHold = async (_id, body) => {
       holds.push(structuredClone(body));
       events.push(`hold:${body.cause}`);
@@ -29856,37 +29866,57 @@ describe("compact policy hold: fake-provider continuation matrix (production run
       return { disposition: "recorded" };
     };
 
-    const rig = makeRig({ responder: c => {
-      if (c.method === "thread/start" || c.method === "thread/resume" || c.method === "turn/start") events.push(`provider:${c.method}`);
-      if (c.method === "thread/start") return { thread: { id: "th-new" } };
-      if (c.method === "thread/resume") return { thread: { id: "saved-session" } };
-      if (c.method === "turn/start") {
-        const th = String(rec(c.params).threadId);
-        c.transport.push({ ...turnCompleted("failed", th), params: { threadId: th, turn: { id: "tn-1", status: "failed",
-          error: { codexErrorInfo: "cyberPolicy", message: "PRIVATE-PROVIDER-TEXT" } } } });
-        return { turn: { id: "tn-1" } };
-      }
-      return {};
-    } });
-    if (o.rejectResume) rig.transport.requestOverride = c => c.method === "thread/resume" ? Promise.reject(rpcRejection()) : undefined;
-    const launch = rig.deps.launchEffectRoot!;
-    rig.deps = { ...rig.deps, deferRegistryTeardown: true,
-      launchEffectRoot: async (spec, deadline) => forwardCredentialFreeGitRoot(spec, deadline, await launch(spec, deadline)) };
     const runHome = path.join(m2Runner.homeDir, runId);
-    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, runHome);
     const seen: RunContext[] = [];
-    const run = executor.run.bind(executor);
-    executor.run = async ctx => {
-      seen.push(ctx);
-      if (inputHold && o.inputBarrierTest && !inputBarrierObserved) inputHold.release();
-      await fs.writeFile(path.join(ctx.worktreePath, "POLICY-WORK.txt"), "retained work\n");
-      if (o.guidance && !o.holdFirstInputGet) await waitFor(() => ctx.isLiveFollowUpId?.(GUIDANCE_ID) === true, "owner guidance routed live");
-      return run(ctx);
+    const rigs: Rig[] = [];
+    let executingRig: Rig | undefined;
+    // Retained adoption can consume a capture-only executor before constructing the model executor.
+    // Match production's per-invocation factory; never reuse a capture-closed executor for execution.
+    const executorFactory = () => {
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start" || c.method === "thread/resume" || c.method === "turn/start") events.push(`provider:${c.method}`);
+        if (c.method === "thread/start") return { thread: { id: "th-new" } };
+        if (c.method === "thread/resume") return { thread: { id: String(rec(c.params).threadId) } };
+        if (c.method === "turn/start") {
+          const th = String(rec(c.params).threadId);
+          const tn = `tn-${c.turnStartCount}`;
+          const retry = o.parkBeforeEvidence || (o.retryBeforeEvidence && c.turnStartCount === 1);
+          if (o.parkBeforeEvidence) c.transport.push(threadStarted(th));
+          if (o.modelEvidence && !retry) {
+            events.push("provider:model-evidence");
+            c.transport.push(agentMessage("planning model evidence", th));
+          }
+          c.transport.push({ ...turnCompleted("failed", th, tn), params: { threadId: th, turn: { id: tn, status: "failed",
+            error: { codexErrorInfo: retry ? "serverOverloaded" : "cyberPolicy", message: "PRIVATE-PROVIDER-TEXT" } } } });
+          return { turn: { id: tn } };
+        }
+        return {};
+      } });
+      rigs.push(rig);
+      if (o.rejectResume) rig.transport.requestOverride = c => c.method === "thread/resume" ? Promise.reject(rpcRejection()) : undefined;
+      const launch = rig.deps.launchEffectRoot!;
+      rig.deps = { ...rig.deps, deferRegistryTeardown: true,
+        ...(o.retryBeforeEvidence ? { transientRetryMax: 1, transientBackoffBaseMs: 0 } : {}),
+        ...(o.parkBeforeEvidence ? { transientRetryMax: 0 } : {}),
+        launchEffectRoot: async (spec, deadline) => forwardCredentialFreeGitRoot(spec, deadline, await launch(spec, deadline)) };
+      const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, runHome);
+      const run = executor.run.bind(executor);
+      executor.run = async ctx => {
+        executingRig = rig;
+        seen.push(ctx);
+        const included = ctx.followUpIncluded;
+        ctx.followUpIncluded = id => { events.push(`included:${id}`); included?.(id); };
+        if (inputHold && o.inputBarrierTest && !inputBarrierObserved) inputHold.release();
+        await fs.writeFile(path.join(ctx.worktreePath, "POLICY-WORK.txt"), "retained work\n");
+        if (o.guidance && !o.holdFirstInputGet) await waitFor(() => ctx.isLiveFollowUpId?.(GUIDANCE_ID) === true, "owner guidance routed live");
+        return run(ctx);
+      };
+      return { executor, homeDir: runHome };
     };
     const outbox = new Outbox({ root: path.join(fx.dataDir, "policy-matrix-outbox"), log: noopLog,
       runMaxBytes: 64 * 1024 * 1024, maxBytes: 128 * 1024 * 1024, retentionMs: 86400000 });
     await outbox.init();
-    const runner = m2Runner.runnerWith(() => ({ executor, homeDir: runHome }), m2Runner.fakeGitlab().gitlab, undefined, noopLog, {
+    const runner = m2Runner.runnerWith(executorFactory, m2Runner.fakeGitlab().gitlab, undefined, noopLog, {
       outbox, activeRuns: new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 10),
       quiesceRun: async () => ({ process: { state: "quiescent", processes: [], killed: [], detail: "fixture proof" },
         docker: { state: "not_wired", removed: [], detail: "not wired" } }),
@@ -29898,7 +29928,8 @@ describe("compact policy hold: fake-provider continuation matrix (production run
       inputHold?.release();
       inputBarrier?.mock.restore();
     }
-    const requests = rig.transport.requests;
+    const rig = executingRig ?? rigs.at(-1)!;
+    const requests = rigs.flatMap(r => r.transport.requests);
     if (inputHoldReleased) await inputHoldReleased;
     return {
       inputGetHeld: inputHold !== undefined, inputBarrierObserved, claim, runId, holds, verifies, states, events, seen, rig, head,
@@ -30027,6 +30058,103 @@ describe("compact policy hold: fake-provider continuation matrix (production run
     });
   }
 
+  for (const mode of ["preserve", "fresh_from_saved_work"] as const) {
+    it(`policy initial planning (${mode}) sees Resume guidance before any approval`, async t => {
+      const r = await drive({ claim: head => ({ plan_approved: false, plan_md: null,
+        ...(mode === "preserve" ? preserving()(head) : { session_id: null, policy_resume_inputs_pending: true }) }),
+        guidance: true, holdFirstInputGet: true, inputBarrierTest: t, modelEvidence: mode === "preserve",
+        ...(mode === "fresh_from_saved_work" ? { earlier: [...EARLIER, { id: GUIDANCE_ID, body: GUIDANCE }] } : {}) });
+      assert.equal(r.seen[0]?.planApproved, false, "the actual unapproved planning branch ran");
+      assert.equal(r.prompts.length, 1);
+      assert.match(r.prompts[0]!, /Produce a plan/);
+      assert.ok(r.prompts[0]!.includes(GUIDANCE), "the first planning request must contain the Resume correction");
+      assert.ok(!r.prompts[0]!.includes("<approved_plan>"), "planning must not acquire approval framing");
+      const included = r.events.filter(e => e.startsWith("included:"));
+      if (mode === "preserve") {
+        assert.deepEqual(included, [`included:${GUIDANCE_ID}`], "one inclusion receipt after model evidence");
+        assert.ok(r.events.indexOf(`included:${GUIDANCE_ID}`) > r.events.indexOf("provider:model-evidence"));
+      } else {
+        assert.deepEqual(included, [], "a refused turn without model evidence keeps the guidance unacknowledged");
+        assert.equal(r.prompts[0]!.split(GUIDANCE).length - 1, 1, "live/history overlap is deduplicated by id");
+        for (const entry of EARLIER) assert.equal(r.prompts[0]!.split(entry.body).length - 1, 1);
+      }
+      refusedHold(r);
+    });
+  }
+
+  it("policy fresh initial planning with no new guidance replays earlier owner history", async () => {
+    const r = await drive({ claim: () => ({ plan_approved: false, plan_md: null, session_id: null,
+      policy_resume_context_pending: true }), earlier: EARLIER });
+    assert.equal(r.seen[0]?.planApproved, false);
+    assert.equal(r.prompts.length, 1);
+    for (const entry of EARLIER) {
+      assert.equal(r.prompts[0]!.split(entry.body).length - 1, 1, "earlier owner history reaches fresh planning once");
+    }
+    assert.ok(!r.prompts[0]!.includes(GUIDANCE));
+    assert.ok(!r.prompts[0]!.includes("<approved_plan>"));
+    refusedHold(r);
+  });
+
+  it("policy fresh seeded implementation keeps earlier history without inventing a planning turn", async () => {
+    const r = await drive({ claim: () => ({ session_id: null, plan_source: "seeded", policy_resume_context_pending: true }), earlier: EARLIER });
+    assert.equal(r.seen[0]?.planApproved, true);
+    assert.equal(r.prompts.length, 1);
+    assert.ok(r.prompts[0]!.includes(`<plan>\n${PLAN}\n</plan>`), "the seeded owner plan keeps its existing framing");
+    for (const entry of EARLIER) assert.equal(r.prompts[0]!.split(entry.body).length - 1, 1);
+    refusedHold(r);
+  });
+
+  it("policy fresh initial planning refuses unavailable owner history before provider work", async () => {
+    const r = await drive({ claim: () => ({ plan_approved: false, plan_md: null, session_id: null,
+      policy_resume_context_pending: true }), historyUnavailable: true });
+    assert.equal(r.rig.providerLaunches(), 0);
+    assert.deepEqual(r.prompts, []);
+    assert.equal(r.states.some(s => s.status === "failed"), false, "history loading failure preserves the continuation");
+    assert.ok(r.states.some(s => s.status === "recovery_wait"));
+  });
+
+  it("policy initial planning retry before model evidence keeps its guidance and receipts once", async t => {
+    const r = await drive({ claim: head => ({ ...preserving()(head), plan_approved: false, plan_md: null }),
+      guidance: true, holdFirstInputGet: true, inputBarrierTest: t, modelEvidence: true, retryBeforeEvidence: true });
+    assert.equal(r.prompts.length, 2);
+    for (const prompt of r.prompts) assert.equal(prompt.split(GUIDANCE).length - 1, 1);
+    assert.deepEqual(r.events.filter(e => e.startsWith("included:")), [`included:${GUIDANCE_ID}`]);
+    assert.ok(r.events.indexOf(`included:${GUIDANCE_ID}`) > r.events.lastIndexOf("provider:turn/start"));
+    refusedHold(r);
+  });
+
+  it("policy initial planning reclaim after a session report replays unincluded guidance", async t => {
+    m2Runner.api.inclusionTracking = true;
+    // The matrix's synthetic roots use host-owned fixture files, as in the retained-source
+    // executor fixture above. UID normalization is a fixture precondition, not a real-UID proof.
+    const readiness = t.mock.method(m2Runner.git, "normalizeRetainedSourceObjects", async () => {});
+    const first = await drive({ claim: () => ({ plan_approved: false, plan_md: null, session_id: null,
+      policy_resume_inputs_pending: true, policy_resume_context_pending: true }),
+      guidance: true, holdFirstInputGet: true, inputBarrierTest: t, parkBeforeEvidence: true });
+    assert.ok(first.states.some(s => s.status === "running" && s.session_id === "th-new"), "the fresh session was actually reported");
+    assert.ok(first.states.some(s => s.status === "recovery_wait"), "the claim parked before model processing");
+    assert.equal(first.states.some(s => s.status === "failed"), false);
+    assert.deepEqual(first.events.filter(e => e.startsWith("included:")), []);
+    assert.ok(first.prompts[0]!.includes(GUIDANCE));
+
+    // The session-bounded context marker is gone, but applied/unincluded input remains pending.
+    // The real Go claim-projection test pins this exact split after the session report.
+    const second = await drive({ runId: first.runId, issueIid: first.claim.issue_iid!,
+      claim: () => ({ claim_generation: 4, plan_approved: false, plan_md: null,
+        session_id: "th-new", policy_resume_inputs_pending: true }), modelEvidence: true });
+    assert.ok(second.seen.length > 0, JSON.stringify({ states: second.states, holds: second.holds, events: second.events, notices: second.notices }));
+    assert.equal(second.seen[0]?.planApproved, false);
+    assert.equal(second.claim.session_id, "th-new", "the server supplied the reported session");
+    assert.match(second.seen[0]!.worktreePath, /\.attempt-/, "retained adoption uses the existing fresh-attempt lane");
+    assert.equal(second.seen[0]?.sessionId, undefined);
+    assert.equal(second.seen[0]?.preserveConversation, undefined, "the input marker supplies no session/Fresh permission");
+    assert.deepEqual(second.routes, ["thread/start"], "owner fresh_from_saved_work consent keeps normal attempt-path behavior");
+    assert.ok(second.prompts[0]!.includes(GUIDANCE), "the reclaimed planning request carries the unprocessed input");
+    assert.deepEqual(second.events.filter(e => e.startsWith("included:")), [`included:${GUIDANCE_ID}`]);
+    assert.equal(readiness.mock.callCount(), 1, "the second claim passed through retained-source readiness");
+    refusedHold(second);
+  });
+
   it("ordinary headless claim keeps its existing initial-delivery behavior", async t => {
     const r = await drive({ claim: () => ({ session_id: null }), holdFirstInputGet: true, inputBarrierTest: t });
     assert.equal(r.inputBarrierObserved, false, "an ordinary claim gains no policy input barrier");
@@ -30102,4 +30230,65 @@ describe("compact policy hold: fake-provider continuation matrix (production run
     assert.equal(r.notices.includes("resume_lineage_break"), true);
     assert.equal(r.verifies.length, 0);
   });
+});
+
+it("ordinary initial planning leaves its queued follow-ups for implementation", async () => {
+  const prompts: string[] = [];
+  let pulls = 0;
+  for (const queued of [false, true]) {
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "th-ordinary" } };
+      if (c.method === "turn/start") {
+        prompts.push(String((rec(c.params).input as { text?: string }[])[0]?.text));
+        c.transport.push({ ...turnCompleted("failed", "th-ordinary"), params: { threadId: "th-ordinary",
+          turn: { id: "tn-1", status: "failed", error: { codexErrorInfo: "cyberPolicy" } } } });
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined,
+      gatePlan: async () => { assert.fail("refusal must not reach approval"); },
+      ...(queued ? {
+        pullFollowUps: () => { pulls++; return [{ id: 1, body: "ORDINARY-PENDING-GUIDANCE" }]; },
+        priorOwnerFollowUps: [{ id: 2, body: "ORDINARY-PRIOR-HISTORY" }],
+      } : {}),
+    });
+    await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), ProviderPolicyRefusal);
+  }
+  assert.equal(pulls, 0, "ordinary planning still does not drain the implementation follow-up queue");
+  assert.equal(prompts.length, 2);
+  // The existing untrusted issue fence deliberately has a fresh nonce on each rendering.
+  assert.equal(prompts[0]!.replace(/issue_context_[0-9a-f]{16}/g, "issue_context_NONCE"),
+    prompts[1]!.replace(/issue_context_[0-9a-f]{16}/g, "issue_context_NONCE"));
+});
+
+it("policy initial planning refuses a backlog that could exclude the latest Resume correction", async () => {
+  for (const overflow of ["second batch", "oversized entry"] as const) {
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "th-budget" } };
+      if (c.method === "turn/start") {
+        c.transport.push({ ...turnCompleted("failed", "th-budget"), params: { threadId: "th-budget",
+          turn: { id: "tn-1", status: "failed", error: { codexErrorInfo: "cyberPolicy" } } } });
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    const rows = [{ id: 1, body: "A".repeat(MAX_FOLLOW_UP_BATCH_RUNES) }];
+    if (overflow === "oversized entry") rows[0]!.body += "x";
+    else rows.push({ id: 2, body: "LATEST-RESUME-CORRECTION" });
+    const included: number[] = [];
+    const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined,
+      policyOwnerContinuation: true, priorOwnerFollowUps: [],
+      gatePlan: async () => { assert.fail("overflow must not reach approval"); },
+      pullFollowUps: (remaining, empty) => {
+        const next = rows[0];
+        return next && (empty || followUpRunes(next.body) <= remaining) ? [rows.shift()!] : [];
+      },
+      followUpIncluded: id => { included.push(id); },
+    });
+    await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), error =>
+      error instanceof TransientRecoveryError && error.message.includes("first-turn context budget"), overflow);
+    assert.equal(rig.transport.turnStartCount, 0, "do not plan from a prefix that may omit the latest correction");
+    assert.deepEqual(included, [], "overflow is never acknowledged as model inclusion");
+  }
 });

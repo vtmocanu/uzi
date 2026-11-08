@@ -218,7 +218,7 @@ func TestPolicyHoldLifecycleLiveDB(t *testing.T) {
 	if claim["claim_generation"] != float64(3) {
 		t.Fatalf("claim generation = %v", claim["claim_generation"])
 	}
-	if got := policyClaimKeys(claim); !reflect.DeepEqual(got, map[string]any{"policy_saved_work_head": savedWork, "policy_resume_inputs_pending": true}) {
+	if got := policyClaimKeys(claim); !reflect.DeepEqual(got, map[string]any{"policy_saved_work_head": savedWork, "policy_resume_inputs_pending": true, "policy_resume_context_pending": true}) {
 		t.Fatalf("saved-work claim policy keys %v, want policy_saved_work_head=%s and pending guidance", got, savedWork)
 	}
 	if _, present := claim["policy_preserve_only"]; present {
@@ -246,7 +246,7 @@ func TestPolicyHoldLifecycleLiveDB(t *testing.T) {
 	if claim["claim_generation"] != float64(4) {
 		t.Fatalf("claim generation = %v", claim["claim_generation"])
 	}
-	if got := policyClaimKeys(claim); !reflect.DeepEqual(got, map[string]any{"policy_resume_inputs_pending": true}) {
+	if got := policyClaimKeys(claim); !reflect.DeepEqual(got, map[string]any{"policy_resume_inputs_pending": true, "policy_resume_context_pending": true}) {
 		t.Fatalf("later claim must carry only its still-pending input barrier: %v", got)
 	}
 

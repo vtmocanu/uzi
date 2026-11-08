@@ -45,6 +45,35 @@ func TestPolicyResumeInputsClaimWire(t *testing.T) {
 	}
 }
 
+func TestPolicyResumeContextClaimWire(t *testing.T) {
+	for _, pending := range []bool{false, true} {
+		f := newClaimFixture(t)
+		f.fs.claimCtx.PolicyResumeContextPending = pending
+		payload, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner}, nil)
+		if err != nil || payload == nil {
+			t.Fatalf("claim: %v, %v", payload, err)
+		}
+		wire, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(wire, &got); err != nil {
+			t.Fatal(err)
+		}
+		if !pending {
+			if _, present := got["policy_resume_context_pending"]; present {
+				t.Fatal("ordinary or session-reported claim must omit the context marker")
+			}
+		} else if want := readClaimFixture(t, "policy-resume-context-claim.json"); got["policy_resume_context_pending"] != want["policy_resume_context_pending"] {
+			t.Fatalf("context claim %s, fixture %v", wire, want)
+		}
+		if payload.PolicyPreserveOnly || payload.PolicyFreshSession || payload.PolicySavedWorkHead != nil {
+			t.Fatal("the context marker must grant no preserving, Fresh or recovery-head authority")
+		}
+	}
+}
+
 // The agent reads the same file (fixtures/claims/policy-preserve-claim.json), so the two sides
 // cannot drift on the claim keys that carry the preserving constraint.
 func TestPolicyPreserveClaimSharedWire(t *testing.T) {

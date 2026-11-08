@@ -29,7 +29,7 @@ func TestPolicyResumeClaimPayloadLiveDB(t *testing.T) {
 	if dsn == "" {
 		t.Skip("UZI_TEST_DATABASE_URL not set; run via ./e2e/run-store-it.sh for live-DB coverage")
 	}
-	for _, lane := range []string{"fresh_from_saved_work", "fresh_from_saved_work_headless", "same_conversation"} {
+	for _, lane := range []string{"fresh_from_saved_work", "fresh_from_saved_work_headless", "fresh_from_saved_work_history_only", "same_conversation"} {
 		t.Run(lane, func(t *testing.T) {
 			ctx := context.Background()
 			if err := store.Migrate(ctx, dsn); err != nil {
@@ -68,7 +68,7 @@ func TestPolicyResumeClaimPayloadLiveDB(t *testing.T) {
 			exec(`INSERT INTO user_secrets (id, user_id, kind, label, is_default, ciphertext, sealed_with)
 			      VALUES ($1, $2, 'anthropic_token', $3, true, $4, 'master')`, uuid.New(), userID, "anthropic-"+uuid.NewString(), sealedAnthropic)
 			exec(`INSERT INTO workers (id, user_id, name, token_hash, status) VALUES ($1, $2, 'w-3607', $3, 'offline')`, wkrID, userID, wkrID[:])
-			if _, err := q.RegisterWorker(ctx, store.RegisterWorkerParams{ID: wkrID, ProtocolCapabilities: []string{capability.ProviderPolicyHoldV1}}); err != nil {
+			if _, err := q.RegisterWorker(ctx, store.RegisterWorkerParams{ID: wkrID, ProtocolCapabilities: []string{capability.ProviderPolicyHoldV1, capability.InputReceiptsV1, capability.InputInclusionV1}}); err != nil {
 				t.Fatal(err)
 			}
 			wkr, err := q.GetWorkerByID(ctx, wkrID)
@@ -77,9 +77,10 @@ func TestPolicyResumeClaimPayloadLiveDB(t *testing.T) {
 			}
 			head := hexHead("e")
 			fresh := lane != "same_conversation"
+			historyOnly := lane == "fresh_from_saved_work_history_only"
 			continuationMode := lane
 			var requiredHead any = head
-			if lane == "fresh_from_saved_work_headless" {
+			if lane == "fresh_from_saved_work_headless" || historyOnly {
 				continuationMode = "fresh_from_saved_work"
 				requiredHead = nil
 			}
@@ -94,14 +95,19 @@ func TestPolicyResumeClaimPayloadLiveDB(t *testing.T) {
 			// Older pending inputs and an unresolved episode do not select the new marker.
 			exec(`INSERT INTO run_user_inputs (run_id, kind, body, created_at) VALUES ($1, 'follow_up', 'older guidance', now() - interval '1 hour')`, runID)
 			before, err := q.GetRunClaimContext(ctx, runID)
-			if err != nil || before.PolicyResumeInputsPending {
+			if err != nil || before.PolicyResumeInputsPending || before.PolicyResumeContextPending {
 				t.Fatalf("unresolved episode: pending=%v, error=%v", before.PolicyResumeInputsPending, err)
 			}
 			mode := PolicyResumePreserve
 			if fresh {
 				mode = PolicyResumeFreshFromSavedWork
 			}
-			if _, err := svc.ResumePolicyHold(ctx, userID, runID, PolicyResumeRequest{Mode: mode, ExpectedEpisodeID: outcome, Guidance: "stay narrow"}); err != nil {
+			guidance := "stay narrow"
+			if historyOnly {
+				guidance = ""
+				exec(`UPDATE run_user_inputs SET consumed_at=now(), applied_at=now(), inclusion_reported=true, included_at=now() WHERE run_id=$1 AND body='older guidance'`, runID)
+			}
+			if _, err := svc.ResumePolicyHold(ctx, userID, runID, PolicyResumeRequest{Mode: mode, ExpectedEpisodeID: outcome, Guidance: guidance}); err != nil {
 				t.Fatalf("resume: %v", err)
 			}
 			payload, err := svc.Claim(ctx, wkr, nil)
@@ -116,16 +122,82 @@ func TestPolicyResumeClaimPayloadLiveDB(t *testing.T) {
 			if err := json.Unmarshal(wire, &claim); err != nil {
 				t.Fatal(err)
 			}
-			if claim["policy_resume_inputs_pending"] != true {
+			if (claim["policy_resume_inputs_pending"] == true) != !historyOnly {
 				t.Fatalf("Resume guidance must select the input barrier even without a head: %s", wire)
 			}
-			// Delivery retires the marker, even though the resolved episode remains on the run.
-			// Leave the older input pending to prove the resolution-time bound is real.
-			exec(`UPDATE run_user_inputs SET consumed_at=now(), applied_at=now()
-			      WHERE run_id=$1 AND kind='follow_up' AND created_at >= (SELECT policy_resolved_at FROM runs WHERE id=$1)`, runID)
+			if _, present := claim["policy_resume_context_pending"]; present != fresh {
+				t.Fatalf("fresh context presence=%v, want %v: %s", present, fresh, wire)
+			}
+			generation := payload.ClaimGeneration
+			var inputID int64
+			if !historyOnly {
+				if err := pool.QueryRow(ctx, `SELECT id FROM run_user_inputs WHERE run_id=$1 AND body='stay narrow'`, runID).Scan(&inputID); err != nil {
+					t.Fatal(err)
+				}
+				for _, receipt := range []func(context.Context, store.Worker, uuid.UUID, int64, []int64) (InputReceiptResult, error){svc.AckInputs, svc.ApplyInputs} {
+					if result, err := receipt(ctx, wkr, runID, generation, []int64{inputID}); err != nil || !result.Active {
+						t.Fatalf("input receipt: %+v, %v", result, err)
+					}
+				}
+			}
 			after, err := q.GetRunClaimContext(ctx, runID)
-			if err != nil || after.PolicyResumeInputsPending {
-				t.Fatalf("delivered guidance: pending=%v, error=%v", after.PolicyResumeInputsPending, err)
+			if err != nil || after.PolicyResumeInputsPending != !historyOnly {
+				t.Fatalf("applied-but-unincluded guidance: pending=%v, error=%v", after.PolicyResumeInputsPending, err)
+			}
+			if after.PolicyResumeContextPending != fresh {
+				t.Fatal("input delivery must not retire an unreported fresh context")
+			}
+			if fresh {
+				session := "fresh-policy-session"
+				if _, applied, err := svc.SetState(ctx, wkr, runID, StateRequest{State: "running", ClaimGeneration: &generation, SessionID: &session}); err != nil || !applied {
+					t.Fatalf("session report applied=%v, error=%v", applied, err)
+				}
+				reported, err := q.GetRunClaimContext(ctx, runID)
+				if err != nil || reported.PolicyResumeContextPending || reported.PolicyResumeInputsPending != !historyOnly {
+					t.Fatalf("reported session must retire the context marker: %+v, %v", reported, err)
+				}
+			}
+			if !historyOnly {
+				if receipt, err := svc.IncludeInputs(ctx, wkr, runID, generation, []int64{inputID}); err != nil || !receipt.Active || len(receipt.Inputs) != 1 {
+					t.Fatalf("include receipt: %+v, %v", receipt, err)
+				}
+			}
+			assertPending := func(want bool) {
+				t.Helper()
+				current, err := q.GetRunClaimContext(ctx, runID)
+				if err != nil || current.PolicyResumeInputsPending != want {
+					t.Fatalf("pending guidance=%v, want %v (%v)", current.PolicyResumeInputsPending, want, err)
+				}
+			}
+			// Older and foreign unincluded inputs cannot keep this episode's marker set.
+			exec(`UPDATE run_user_inputs SET consumed_at=now(), applied_at=now(), inclusion_reported=true, included_at=NULL WHERE run_id=$1 AND body='older guidance'`, runID)
+			foreign := uuid.New()
+			exec(`INSERT INTO runs (id,user_id,repo_id,kind,status,title,issue_title,issue_description) VALUES ($1,$2,$3,'prompt','queued','foreign','foreign','foreign')`, foreign, userID, repoID)
+			exec(`INSERT INTO run_user_inputs (run_id,kind,body,consumed_at,applied_at,inclusion_reported) VALUES ($1,'follow_up','foreign guidance',now(),now(),true)`, foreign)
+			assertPending(false)
+			var trim struct {
+				Blank    string   `json:"blank"`
+				NotBlank []string `json:"not_blank"`
+			}
+			raw, err := os.ReadFile("../../../fixtures/claims/policy-resume-whitespace.json")
+			if err != nil || json.Unmarshal(raw, &trim) != nil || trim.Blank == "" || len(trim.NotBlank) == 0 {
+				t.Fatalf("whitespace controls missing or invalid: %v", err)
+			}
+			checkBody := func(body string, pending bool) {
+				t.Helper()
+				var id int64
+				if err := pool.QueryRow(ctx, `INSERT INTO run_user_inputs (run_id,kind,body,consumed_at,applied_at,inclusion_reported) VALUES ($1,'follow_up',$2,now(),now(),true) RETURNING id`, runID, body).Scan(&id); err != nil {
+					t.Fatal(err)
+				}
+				assertPending(pending)
+				exec(`UPDATE run_user_inputs SET disposition='superseded' WHERE id=$1`, id)
+			}
+			checkBody(trim.Blank, false)
+			for _, r := range trim.Blank {
+				checkBody(string(r), false)
+			}
+			for _, body := range trim.NotBlank {
+				checkBody(body, true)
 			}
 			var autoApprove bool
 			var planSource string
