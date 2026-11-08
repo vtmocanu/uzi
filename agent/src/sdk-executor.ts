@@ -2176,18 +2176,20 @@ export class SdkExecutor implements Executor {
       maxRevisions,
       environmentFacts,
     } = drive;
+    let planSourceAnnounced = false;
     let planSourceReported = false;
     const reportPlanSource = async (): Promise<void> => {
       if (planSourceReported) return;
-      planSourceReported = true;
-      if (planSource === "repo") {
+      if (!planSourceAnnounced && planSource === "repo") {
         ctx.emit({
           kind: "status",
           agent: "worker",
           payload: { text: `planning with the repo's agents (${planSubagentNames.join(", ") || "none"})` },
         });
       }
+      planSourceAnnounced = true;
       await ctx.reportPlanAgentSource?.(planSource);
+      planSourceReported = true;
     };
     let resumeId = drive.resumeId;
     let frozenMilestones = drive.frozenMilestones;
@@ -2599,8 +2601,8 @@ export class SdkExecutor implements Executor {
           // Issue #3174: a give-up re-runs this closure; a plan turn that started session-less resumes
           // the session the aborted attempt ran (the last planning round's, after a clarification).
           let planResume = resumeId;
-          await reportPlanSource();
           const planStep = await this.runThroughSwitch(ctx, state, async () => {
+            await reportPlanSource();
             try {
               return await this.drivePlanningTurn(ctx, baseConfig, planResume, planPrompt, state, idleMs, budget);
             } catch (err) {
@@ -2742,7 +2744,8 @@ export class SdkExecutor implements Executor {
           // memo block on the plain issue/rework path: announce where it is actually placed.
           if (resumeId === undefined && !isCIFix && !isSelfImprove && announceDecisionsMemo(ctx))
             decisionsMemoPlaced = true;
-          await reportPlanSource();
+          const sourceStep = await this.runThroughSwitch(ctx, state, reportPlanSource);
+          if ("released" in sourceStep) return { branch: ctx.branch, switchReleased: true };
           const runRevisionTurn = () =>
             this.drivePlanningTurn(ctx, baseConfig, resumeId, revisePrompt, state, idleMs, budget, !automatic);
           let turn: TurnResult & { plan: string };

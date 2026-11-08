@@ -3971,13 +3971,13 @@ export class CodexExecutor implements Executor {
         // before the next prompt is built; the call-site gates remain the guarantee.
         assertResidueQuarantineOpen("provider_turn");
         if (!planSourceReported) {
-          planSourceReported = true;
           const planSelection = planTemplateSelection(ctx);
           if (planSelection) {
             ctx.emit({ kind: "status", agent: "worker", payload: {
               text: `planning with the repo's agents (${implementTemplates(ctx, planSelection).map((t) => t.name).join(", ") || "none"})` } });
           }
           await ctx.reportPlanAgentSource?.(planSelection ? "repo" : "own");
+          planSourceReported = true;
         }
         let prompt = initialPrompt;
         // #1593: the prose-only recovery budget, LOCAL to this invocation so the initial plan
