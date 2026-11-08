@@ -615,6 +615,7 @@ restore_globals_case() {
     || fail "restore fields not exported: $RESTORE_BINDING $RESTORE_SOURCE_SHA $RESTORE_SEEDED_HEAD $RESTORE_ATTEMPT_PATH"
   [ "$RESTORE_CAPTURE_ID:$RESTORE_SLOT_CONTAINER:$RESTORE_SLOT_HOSTNAME" = "cap:$RESTORE_CID:${RESTORE_CID:0:12}" ] \
     || fail "restore slot fields not exported"
+  [ "$RESTORE_PRED_INCARNATION" = p ] || fail "restore predecessor incarnation not exported: [$RESTORE_PRED_INCARNATION]"
   echo 'restore fields exported'
 }
 restore_fixture valid
@@ -668,6 +669,7 @@ custody_case "phase 52 refuses a bundle capture on the restore route" fail 'inde
 # The seed-time witness: the bare's restore basis must agree with the log, and while S is live P must be
 # unchanged. The witness container is replaced by canned outputs (the real one needs the compose stack).
 eval "$(awk '/^restore_assert_seed_witness\(\) \{/,/^\}/' "$LIB")"
+eval "$(awk '/^_restore_p_slots\(\) \{/,/^\}/' "$LIB")"
 eval "$(awk '/^_restore_journal_value\(\) \{/,/^\}/' "$LIB")"
 eval "$(awk '/^_restore_journal_bare\(\) \{/,/^\}/' "$LIB")"
 eval "$(awk '/^restore_assert_agent_identity\(\) \{/,/^\}/' "$LIB")"
@@ -679,16 +681,16 @@ witness_case() {
   restore="$(jq -nc --arg c "$pclone" --arg sha "$RESTORE_SHA" '{restore:{version:1,predecessor:{clonePath:$c,generation:1},
     pin:{captureId:"cap",generation:1,sourceSha:$sha,finalization:false},restoreTip:$sha},restoreStage:"ready",runId:"R"}')"
   pin="$(jq -nc --arg sha "$RESTORE_SHA" '{runId:"R",branch:"agent/issue-1",generation:1,sourceSha:$sha,captureId:"cap",mac:"x"}')"
-  local slots_before='aaa  ./k1.json
-bbb  ./k2.json' slots_after='aaa  ./k1.json
-bbb  ./k2.json' holds_before='h1 open 1' holds_after='h1 open 1' bound=on_default fence=false hmode=descendant sh="$RESTORE_SHA" anc=yes
+  # Slot lines are "name<TAB>digest<TAB>owner": k1 is owned by the predecessor incarnation (p), k2 by another worker (q).
+  local slots_before slots_after holds_before='h1 open 1' holds_after='h1 open 1' bound=on_default fence=false hmode=descendant sh="$RESTORE_SHA" anc=yes
+  slots_before="$(printf './k1.json\taaa\tp\n./k2.json\tbbb\tq\n')"; slots_after="$slots_before"
   case "$variant" in
-    slot-changed) slots_after='aaa  ./k1.json
-ccc  ./k2.json';;
-    slot-removed) slots_after='aaa  ./k1.json';;
-    slot-added) slots_after='aaa  ./k1.json
-bbb  ./k2.json
-ddd  ./k3.json';;
+    p-slot-changed) slots_after="$(printf './k1.json\tccc\tp\n./k2.json\tbbb\tq\n')";;
+    p-slot-removed) slots_after="$(printf './k2.json\tbbb\tq\n')";;
+    other-slot-changed) slots_after="$(printf './k1.json\taaa\tp\n./k2.json\tccc\tq\n')";;
+    other-slot-removed) slots_after="$(printf './k1.json\taaa\tp\n')";;
+    no-p-slot) slots_before="$(printf './k2.json\tbbb\tq\n')"; slots_after="$slots_before";;
+    slot-added) slots_after="$(printf './k1.json\taaa\tp\n./k2.json\tbbb\tq\n./k3.json\tddd\tp\n')";;
     hold-changed) holds_after='h1 released 1';;
     hold-removed) holds_after='';;
     fence-flag) fence=true;;
@@ -741,7 +743,7 @@ ddd  ./k3.json';;
     esac
   }
   RESTORE_SOURCE_SHA="$RESTORE_SHA" RESTORE_SEEDED_HEAD="$RESTORE_SHA" RESTORE_CAPTURE_ID=cap RESTORE_SLOT_CONTAINER="$RESTORE_CID"
-  RESTORE_SLOT_HOSTNAME="${RESTORE_CID:0:12}" RESTORE_ATTEMPT_PATH="$RESTORE_PATH" RESTORE_BINDING=on_default
+  RESTORE_SLOT_HOSTNAME="${RESTORE_CID:0:12}" RESTORE_ATTEMPT_PATH="$RESTORE_PATH" RESTORE_BINDING=on_default RESTORE_PRED_INCARNATION=p
   [ "$variant" != slot-hostname ] || RESTORE_SLOT_HOSTNAME=ffffffffffff
   if [ "$variant" = slot-container ]; then
     RESTORE_SLOT_CONTAINER="$(printf 'e%.0s' $(seq 64))"
@@ -758,8 +760,11 @@ custody_case "seed witness requires a readable pin record for a live run" fail '
 custody_case "seed witness refuses a binding the bare does not evidence" fail 'is not evidenced' witness_case binding-unevidenced
 custody_case "seed witness refuses an unevidenced binding on a terminal run too" fail 'is not evidenced' witness_case terminal-binding-unevidenced
 custody_case "seed witness accepts an authority slot set that only grew" pass 'slots and holds unchanged' witness_case slot-added
-custody_case "seed witness refuses a changed authority slot" fail 'authority slot file' witness_case slot-changed
-custody_case "seed witness refuses a vanished authority slot" fail 'authority slot file' witness_case slot-removed
+custody_case "seed witness refuses a changed predecessor-owned authority slot" fail 'predecessor-owned authority slot' witness_case p-slot-changed
+custody_case "seed witness refuses a vanished predecessor-owned authority slot" fail 'predecessor-owned authority slot' witness_case p-slot-removed
+custody_case "seed witness accepts a changed slot of another owner" pass 'slots and holds unchanged' witness_case other-slot-changed
+custody_case "seed witness accepts a vanished slot of another owner" pass 'slots and holds unchanged' witness_case other-slot-removed
+custody_case "seed witness requires a predecessor-owned slot before the restart" fail 'no authority slot owned by predecessor' witness_case no-p-slot
 custody_case "seed witness refuses a changed custody hold" fail 'custody holds of run R changed' witness_case hold-changed
 custody_case "seed witness refuses a vanished custody hold" fail 'custody holds of run R changed' witness_case hold-removed
 custody_case "seed witness refuses a changed completionSourceFence flag" fail 'completionSourceFence' witness_case fence-flag

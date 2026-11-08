@@ -51,7 +51,7 @@ wait_same_claim_capture_resume() {
 # wait_independent_restore_resume RUN GEN BRANCH ALLOWED_BINDINGS [TIMEOUT] — ALLOWED_BINDINGS is comma
 # separated. TIMEOUT=0 is a single observation (hermetic decoder regressions). On success it sets
 # RESTORE_SOURCE_SHA, RESTORE_SEEDED_HEAD, RESTORE_BINDING, RESTORE_ATTEMPT_PATH, RESTORE_CAPTURE_ID,
-# RESTORE_SLOT_CONTAINER and RESTORE_SLOT_HOSTNAME for restore_assert_seed_witness.
+# RESTORE_SLOT_CONTAINER, RESTORE_SLOT_HOSTNAME and RESTORE_PRED_INCARNATION (verdict.predecessorIncarnation) for restore_assert_seed_witness.
 wait_independent_restore_resume() {
   local run="$1" gen="$2" branch="$3" allowed="$4" timeout="${5:-60}" deadline=$((SECONDS + ${5:-60}))
   local log_file="$RUNROOT/.restore-3644.log" found_file="$RUNROOT/.restore-3644.json"
@@ -78,13 +78,15 @@ wait_independent_restore_resume() {
          and ($ready | length) == 1 and ($uploads | length) == 0
          and $slot.kind == "compose" and $r.crossCheck == "ok"
          and ($r.verdict != null and $r.verdict != "" and $r.verdict != {})
+         and (($r.verdict | type) == "object") and (($r.verdict.predecessorIncarnation // "") | type == "string" and length > 0)
          and (($bindings | index($r.binding)) != null)
          and $r.pinGeneration == ($gen - 1) and $r.claim_generation == $gen
          and (($r.sourceSha // "") | test("^[0-9a-f]{40}$")) and $r.seededHead == $r.sourceSha
          and $r.attemptPath == $seeds[0].value.path
          and $claims[1] < $seeds[0].key and $seeds[0].key < $restored[0].key and $restored[0].key < $ready[0]
       then {sourceSha: $r.sourceSha, seededHead: $r.seededHead, binding: $r.binding, attemptPath: $r.attemptPath,
-        captureId: ($r.captureId // ""), slotContainer: ($slot.containerId // ""), slotHostname: ($slot.hostname // "")}
+        captureId: ($r.captureId // ""), slotContainer: ($slot.containerId // ""), slotHostname: ($slot.hostname // ""),
+        predInc: $r.verdict.predecessorIncarnation}
       else null end
     ' "$log_file" > "$found_file"; then
       RESTORE_SOURCE_SHA="$(jq -r .sourceSha "$found_file")"
@@ -94,6 +96,7 @@ wait_independent_restore_resume() {
       RESTORE_CAPTURE_ID="$(jq -r .captureId "$found_file")"
       RESTORE_SLOT_CONTAINER="$(jq -r .slotContainer "$found_file")"
       RESTORE_SLOT_HOSTNAME="$(jq -r .slotHostname "$found_file")"
+      RESTORE_PRED_INCARNATION="$(jq -r .predInc "$found_file")"
       pass "run $run: generation $gen restored independently from the verified pin (binding=$RESTORE_BINDING sourceSha=$RESTORE_SOURCE_SHA) with one successor claim and no bundle capture"
       return 0
     fi
@@ -169,12 +172,18 @@ case "$mode" in
   isanc)
     if git -c safe.directory='*' --git-dir="$1/.git" merge-base --is-ancestor "$2" HEAD; then echo yes; else echo no; fi ;;
   slots)
-    # name and digest of every authority slot file (the slot key is a keyed hash of the clone path, so a shell
-    # cannot name P's slot; every slot present before the restart must be byte-identical after it).
+    # one line per authority slot file: name, sha256 and owner worker incarnation (tab separated; "-" when the
+    # owner cannot be read). The slot key is a keyed hash of the clone path, so a shell cannot name P's slot;
+    # the host selects P's slots by owner (see _restore_p_slots).
     d=/data/.uzi-authority/slots
     [ -d "$d" ] || exit 0
     cd "$d"
-    find . -maxdepth 1 -type f -name '*.json' -exec sha256sum {} + | LC_ALL=C sort -k2 ;;
+    for f in ./*.json; do
+      [ -f "$f" ] || continue
+      dg="$(sha256sum "$f" | cut -d' ' -f1)"
+      ow="$(tr -d '\n' < "$f" | sed -n 's/.*"owner" *: *{ *"worker" *: *"\([^"]*\)".*/\1/p')"
+      printf '%s\t%s\t%s\n' "$f" "$dg" "${ow:--}"
+    done | LC_ALL=C sort ;;
   bind)
     # bind BARE KIND RUN SHA GENERATION: does the bare evidence the pin binding KIND (agent/src/git.ts
     # verifyRestorePinRefsUnderLock; the e2e repository's default branch is main)?
@@ -229,9 +238,17 @@ _restore_journal_bare() {
   done <<<"$1"
   return 1
 }
+# _restore_p_slots SLOTS INCARNATION — "name<TAB>digest" of the slot files in the witness `slots` output
+# owned by worker INCARNATION, sorted. The restarted worker legitimately rewrites other owners' slots
+# (shared-bare ref deletions, retirement of recorded sources); only P's are read-only to a restore.
+_restore_p_slots() {
+  [ -n "$2" ] || return 1
+  printf '%s\n' "$1" | awk -F'\t' -v inc="$2" 'NF >= 3 && $3 == inc { print $1 "\t" $2 }' | LC_ALL=C sort
+}
 # restore_snapshot_predecessor RUN BRANCH — take AFTER the kill and BEFORE the restart: P's recovery journal
 # value (raw) and whether it carries completionSourceFence, the digest of P's clone contents, every authority
-# slot file's digest (P's slot is read-only to a restore), and the run's custody hold rows (id state generation),
+# slot file's digest and owner (filtered to P's incarnation at comparison time, since the log naming it does not
+# exist yet), and the run's custody hold rows (id state generation) below the successor generation,
 # written to $RUNROOT/.restore-p-RUN.json. The holds come from the database so they are readable while the api
 # is down. Returns non-zero (never calls fail) so callers that must restore the api first can judge it later.
 restore_snapshot_predecessor() {
@@ -246,7 +263,9 @@ restore_snapshot_predecessor() {
   fence="$(printf '%s' "$journal" | jq -r '.completionSourceFence != null')" || { echo "issue 3644: predecessor journal is not JSON" >&2; return 1; }
   slots="$(restore_witness_exec slots)" || { echo "issue 3644: witness could not read the authority slots" >&2; return 1; }
   [ -n "$slots" ] || { echo "issue 3644: no authority slot files before the restart (P's slot must exist)" >&2; return 1; }
-  holds="$(db_psql_rows "SELECT id||' '||state||' '||generation FROM recovery_custody_holds WHERE run_id = '$run' ORDER BY id")" \
+  # Before the restart the run's claim generation is P's, so "<= claim_generation" is the "< successor generation"
+  # set that restore_assert_seed_witness compares.
+  holds="$(db_psql_rows "SELECT id||' '||state||' '||generation FROM recovery_custody_holds WHERE run_id = '$run' AND generation <= (SELECT claim_generation FROM runs WHERE id = '$run') ORDER BY id")" \
     || { echo "issue 3644: could not read the custody holds of run $run" >&2; return 1; }
   [ -n "$holds" ] || { echo "issue 3644: run $run has no custody hold before the restart" >&2; return 1; }
   jq -nc --arg journal "$journal" --arg clone "$clone" --arg digest "$digest" --arg fence "$fence" --arg slots "$slots" --arg holds "$holds" \
@@ -263,7 +282,7 @@ restore_snapshot_predecessor() {
 # Once the run is terminal S's completion discards P legitimately, so only the pin record file is soft.
 restore_assert_seed_witness() {
   local run="$1" branch="$2" gen="$3" head_mode="${4:-descendant}" snap="$RUNROOT/.restore-p-$1.json"
-  local status live=1 rows rj pin cur shead bare yes
+  local status live=1 rows rj pin cur shead bare yes pslots
   [ "$head_mode" = exact ] || [ "$head_mode" = descendant ] || fail "issue 3644: unknown successor HEAD mode [$head_mode]"
   [ -n "${RESTORE_SOURCE_SHA:-}" ] || fail "issue 3644: seed witness run before wait_independent_restore_resume for $run"
   [ "$RESTORE_SLOT_HOSTNAME" = "${RESTORE_SLOT_CONTAINER:0:12}" ] \
@@ -305,13 +324,17 @@ restore_assert_seed_witness() {
     [ -f "$snap" ] || fail "issue 3644: no predecessor snapshot for live run $run (taken after the kill, before the restart)"
     cur="$(_restore_journal_value "$rows" "uzi-recovery.$branch.clone" "$run")"
     [ "$cur" = "$(jq -r .journal "$snap")" ] || fail "issue 3644: predecessor journal of run $run changed across the restore"
+    # Diagnostic label only: the raw journal comparison above already covers the fence; this names it when it is the change.
     [ "$(printf '%s' "$cur" | jq -r '.completionSourceFence != null')" = "$(jq -r .fence "$snap")" ] \
       || fail "issue 3644: predecessor completionSourceFence of run $run changed across the restore"
     cur="$(restore_witness_exec digest "$(jq -r .clonePath "$snap")")" || fail "issue 3644: witness could not digest the predecessor clone"
     [ "$cur" = "$(jq -r .digest "$snap")" ] || fail "issue 3644: predecessor clone of run $run changed across the restore (before=[$(jq -r .digest "$snap")] after=[$cur])"
+    [ -n "${RESTORE_PRED_INCARNATION:-}" ] || fail "issue 3644: the restore line names no predecessor incarnation for run $run"
+    pslots="$(_restore_p_slots "$(jq -r .slots "$snap")" "$RESTORE_PRED_INCARNATION")"
+    [ -n "$pslots" ] || fail "issue 3644: no authority slot owned by predecessor incarnation $RESTORE_PRED_INCARNATION existed before the restart (P's slot must)"
     cur="$(restore_witness_exec slots)" || fail "issue 3644: witness could not read the authority slots"
-    yes="$(comm -23 <(jq -r .slots "$snap" | LC_ALL=C sort) <(printf '%s\n' "$cur" | LC_ALL=C sort))"
-    [ -z "$yes" ] || fail "issue 3644: authority slot file(s) present before the restart changed or vanished across the restore: $yes"
+    yes="$(comm -23 <(printf '%s\n' "$pslots") <(printf '%s\n' "$cur" | awk -F'\t' 'NF >= 2 { print $1 "\t" $2 }' | LC_ALL=C sort))"
+    [ -z "$yes" ] || fail "issue 3644: predecessor-owned authority slot file(s) changed or vanished across the restore: $(printf '%s' "$yes" | tr '\t\n' ' ;')"
     cur="$(db_psql_rows "SELECT id||' '||state||' '||generation FROM recovery_custody_holds WHERE run_id = '$run' AND generation < $gen ORDER BY id")" \
       || fail "issue 3644: could not read the custody holds of run $run"
     [ "$cur" = "$(jq -r .holds "$snap")" ] \
