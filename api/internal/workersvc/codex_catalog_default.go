@@ -15,10 +15,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
 	"golang.org/x/mod/semver"
 
-	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/leadcfg"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -445,23 +443,4 @@ func selectCatalogDefault(rows []store.ListFreshCodexCatalogDefaultsRow, now tim
 		}
 	}
 	return out
-}
-
-// CodexWorkerDefaultModel mirrors the worker's root-model precedence for a Codex run with no
-// schedule-frozen model: a set (non-NULL) lane default_codex_model always wins, as the worker's
-// `config.default_model ?? template ?? provider` does not skip an empty string; an empty lane
-// then resolves to the provider default (the worker's render drops ""). With a NULL lane, the lead
-// template's Codex pin when it is a Codex role model (the worker ignores any other), else the
-// provider default.
-func CodexWorkerDefaultModel(lane, leadCodexPin pgtype.Text) string {
-	if lane.Valid {
-		if lane.String == "" {
-			return agenttmpl.DefaultCodexModel
-		}
-		return lane.String
-	}
-	if leadCodexPin.Valid && agenttmpl.CodexRoleModels[leadCodexPin.String] {
-		return leadCodexPin.String
-	}
-	return agenttmpl.DefaultCodexModel
 }

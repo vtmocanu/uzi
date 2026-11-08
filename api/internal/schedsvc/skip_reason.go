@@ -179,6 +179,11 @@ var AllSkipReasons = []SkipReason{
 	SkipCIConfigChanged,
 }
 
+// SkipReasonForErr is skipReasonForErr for callers outside the package (the read-only schedule
+// preview classifies a refusal with the same map the fire path records). It returns
+// (reason, true) for a recognized benign sentinel and ("", false) otherwise.
+func SkipReasonForErr(err error) (SkipReason, bool) { return skipReasonForErr(err) }
+
 // skipReasonForErr maps the benign run-creation seam sentinels to their SkipReason.
 // It returns (reason, true) for a recognized benign sentinel and ("", false) for
 // anything else, so the caller decides whether an unrecognized error is transient or

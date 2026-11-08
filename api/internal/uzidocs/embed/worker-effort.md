@@ -195,6 +195,10 @@ used](./worker-model.md#see-which-model-a-run-used).
 The record is attested by the worker and is display only: it never affects
 billing, authorization or scheduling.
 
+To see the effort your next run would use before it starts, read the read-only
+[effective settings](./configuration.md#effective-settings) view
+(`uzi settings get`).
+
 ## Worker rollout
 
 Codex claims require a worker advertising `codex_runtime_v2`: the current

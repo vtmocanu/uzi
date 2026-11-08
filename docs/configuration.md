@@ -315,6 +315,86 @@ A claim-time snapshot freezes delivered values and independent provenance for th
 
 Recorded sources are nullable for legacy checks and remain unknown when absent; later settings edits do not rewrite history. Each new round resolves pins at its own claim time. See [CLI settings](./cli.md#plan-cross-check-settings) and [the completed pin design](../prds/done/2151-cross-check-model-pins.md). The **Code** row of the same grid (`stage: "code"`) holds the pins for [Code cross-check](./cross-check.md#code-cross-check) (#2170), the opt-in advisory stage set with the cookie-only `PUT /api/me/cross-check` (`{"code": bool}`). A pinned checker of either family is placed only on a worker advertising `cross_check_pins_v1`, as for the Plan row; a claim on a worker without it is requeued rather than run unpinned.
 
+## Effective settings
+
+The effective-settings view answers "what would a run of mine use right now?" for the harness, the models and the reasoning efforts, instead of leaving you to combine the stored choices, the instance defaults and the built-ins by hand. It is **read-only**: it reads the same rules a run creation and a worker claim apply, writes nothing, takes no lock, reads no limit evidence and calls no model provider. Design: [PRD #3254](../prds/3254-effective-settings-resolver.md). This page covers the account view and the manual-start preview below; the schedule preview (`POST /api/me/effective-settings/schedule-preview`, `uzi settings get --schedule`) is described in [Scheduling](./scheduling.md#settings-preview).
+
+Both routes are owner-scoped and accept a browser session or a CLI token. They carry wire `version: 1`, tokens only (display labels live in `fixtures/model-settings/contract.json`), and never a credential id, label or value.
+
+### `GET /api/me/effective-settings`
+
+The body holds, for a manual start of an issue run with no model and no Anthropic token override:
+
+| Key | Content |
+|---|---|
+| `harnesses` | Claude then Codex, each taken as an explicit choice: `usable`, a `refusal` (and optional `refusal_detail`) when not, and the `credential` it would use. |
+| `start` | The three start choices (`default`, `claude`, `codex`): the predicted `harness` (`value`, `source`, `fixed_at`, `notes`) or a refusal, plus `anthropic_override_allowed`. |
+| `models` | Eight cells: worker model, judge model, run-summary model and task-review model, each for Claude then Codex. |
+| `efforts` | Four cells: worker effort and task-review effort, each for Claude then Codex. |
+| `cross_check` | Eight cells: plan then code, Claude then Codex, as `models` and `efforts`. |
+
+Each model and effort cell carries the stored choice, what **Default** would mean, the resolved value, its `source`, `fixed_at` and `notes`. An empty `resolved_model` means the runtime decides (note `sdk_default`); a null `resolved_effort` means nothing is sent. A Codex effort cell also carries the [catalog default](./worker-effort.md#what-the-codex-catalog-default-means).
+
+### Where each value comes from
+
+| Value | Resolution (first match wins) | `source` tokens |
+|---|---|---|
+| Harness | The harness you pick for this start; else your default harness (skipped, with note `user_default_harness_unusable`, when it has no usable credential); else automatic. | `run_override`, `user_default`, `automatic`, `chosen_at_create` |
+| Worker model | Your model lane for the harness; else the `lead` template's pin; else the built-in (Codex `gpt-6.1-sol`; Claude has none, so the SDK or account decides). | `user_default`, `template`, `builtin` |
+| Judge and run-summary model | Your lane; else the instance default; else the built-in. If the instance settings cannot be read, the built-in applies and the cell carries note `instance_settings_unavailable`. | `user_default`, `instance_default`, `builtin` |
+| Task-review model | A built-in you cannot configure. Codex carries note `not_configurable`; the Claude review sends no model, so the SDK decides. | `builtin` |
+| Worker effort | Your effort preference for the harness, then the product default. | see [Reasoning effort](./worker-effort.md) |
+| Task-review effort | Neither review pass sends an effort (note `not_sent`). | `builtin` |
+| Cross-check model and effort | Your pin, else the worker default (model) or the cross-check default (effort). | `cross_check_pin`, `cross_check_worker_default`, `cross_check_default` |
+
+Subagent pins and repository-defined agents are not part of the account view or the start-preview; the [schedule preview](./scheduling.md#settings-preview) predicts your own subagents' pins, and not repository-defined agents.
+
+### When a value is fixed
+
+`fixed_at` says when the answer stops changing:
+
+- `create`: frozen when the run is created. The harness, and a Codex credential, are fixed here.
+- `claim`: read again each time a worker claims the run, including a queued, scheduled or resumed run. Models, efforts and an Anthropic token (`claim_selection`) are fixed here, so a settings change made before the claim still applies.
+- An honoured schedule model pin is also fixed at `create`: the schedule freezes it into the run when it fires, so the schedule-preview `worker_model` cell for that pin reads `fixed_at: create`.
+
+Two creation-time policies can choose the harness only when the run is created, from live usage that this read-only view does not consult: the **automatic** default harness (the soonest weekly reset) and the optional [overflow](./worker-model.md#overflow-to-the-other-harness). When one applies, the harness `value` is null, its `source` is `chosen_at_create`, and the cell carries the policy as note `automatic_weekly_reset` or `overflow`. The view then promises no harness and no harness-specific credential.
+
+### What can change before the claim
+
+The view is a prediction made now. Between the read and the claim, these can still move:
+
+- **Settings, credentials and templates, until the claim.** Anything fixed at `claim` (models, efforts, the Anthropic token) reads your stored choices, the credentials and the `lead` template again when a worker claims the run, so an edit made after the read applies. Only the `create`-fixed values (the harness and a Codex credential) are frozen at creation.
+- **The Anthropic token.** A Claude run's token is `claim_selection`: it is selected when a worker claims the run, so the view names no token, only that the claim chooses it.
+- **The worker image during a roll.** The view is computed by the API; the claim is served by whichever worker takes the run. While a new worker image rolls out the fleet can mix versions, so a claim can be handled by a worker that behaves differently from what the API predicted.
+- **The SDK default.** A cell noted `sdk_default` sends no model, so the Claude SDK or your account decides at run time; the view cannot name that model.
+
+### Cache semantics
+
+The judge and run-summary instance defaults come from the per-process instance settings cache (`SETTINGS_CACHE_TTL`, default `5s`, see [Admin settings](./admin-settings.md)). A replica that serves an admin write drops its cache, so its next read sees the change; other replicas see it at their first successful refresh after one TTL. If a refresh fails:
+
+- A **warm** cache (a snapshot still held from an earlier successful read) keeps serving that last map until a refresh succeeds, so during a database outage the view can be older than one TTL.
+- A **cold** cache (nothing read yet, for example right after a restart), or a read **right after an admin write** (the write dropped the snapshot), has nothing to fall back on and fails. The view then does not fail: the built-in applies to the instance tier and the affected judge and summary cells carry note `instance_settings_unavailable`.
+
+A store error while reading the Codex [catalog default](./worker-effort.md#what-the-codex-catalog-default-means) for an effort cell also does not fail the view: that cell's `catalog_default` degrades to unknown. Any other store error fails the whole request with a 500 rather than returning a partial body.
+
+### `POST /api/me/effective-settings/start-preview`
+
+Predicts a manual issue start with a given harness and token choice, validated by the same code creation runs, without creating a run. Request body (strict, at most 1 KiB; unknown fields are rejected):
+
+```json
+{"harness": "codex", "credential_override": {"mode": "pinned", "secret_id": "<uuid>"}}
+```
+
+`harness` is `claude` or `codex`; omit it (or send null) for the default. `credential_override.mode` is `inherit`, `auto`, `default` or `pinned`; `secret_id` names the pinned token. A bad enum or uuid is a 400. Any override other than `inherit` makes the creation-time policies ineligible, as at creation.
+
+The response has `harness`, `credential`, `refusal` and `refusal_detail`. A refusal is a closed token: `no_credential_for_harness` (detail `credential_disabled` or `codex_pool_unavailable`), `no_usable_credential`, `credential_disabled`, `credential_not_found`, `credential_override_harness_unsupported` or `credential_override_invalid`.
+
+When the harness is chosen at creation, `harness.value` and `credential` are null and `alternatives` lists Claude then Codex, neither marked as the likely choice. Each alternative is computed as if that harness were chosen and carries its own `credential`, or its own `refusal` and `refusal_detail`. The top-level `refusal` is set only when the request fails before a harness is decided, or when **every** alternative is refused for the **same** reason. When the reasons differ, the top-level `refusal` and `refusal_detail` stay null and each alternative keeps its own reason; one branch's reason is never promoted to stand for both. If one alternative is valid, nothing is promoted either.
+
+An `inherit` override is dropped on the Codex alternative where creation drops it: under the automatic policy, and under overflow when Claude is preferred. When Codex is preferred, overflow moves to Claude, so the Codex alternative is the stay-on-Codex outcome, which creation refuses.
+
+The CLI does not call the start-preview. [`uzi settings get`](./cli.md#effective-settings) reads the `GET`, and with `--schedule` the [schedule preview](./scheduling.md#settings-preview).
+
 ## Agent runtime (PRD #4)
 
 See [ARCHITECTURE.md](../ARCHITECTURE.md#agent-runtime-workers-runs-live-view) for how these are used (run lifecycle, sweeper, claim affinity) and [worker-setup.md](worker-setup.md) for the operator procedure. `UZI_SEED_ANTHROPIC_TOKEN` (dev convenience: boot-seeds an existing Anthropic token for the seed admin) is documented above, in the Forge integration seed table, alongside the other startup seeds.

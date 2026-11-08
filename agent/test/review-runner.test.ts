@@ -597,6 +597,43 @@ describe("ReviewRunner", () => {
     assert.equal(reqModel, "gpt-6-sol", "the built-in review model is gpt-6-sol");
   });
 
+  // #3254: neither task-review pass sends a reasoning effort, and the Claude pass sends no model
+  // (the SDK default). The effective-settings preview relies on both facts.
+  it("the Codex review pass sends a model and no effort", async () => {
+    const { client } = fakeClient();
+    const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+    let seen: { model?: string; effort?: string } | undefined;
+    const fakeHarness = {
+      kind: "codex" as const,
+      run: async (req: { model?: string; effort?: string }) => {
+        seen = req;
+        return { text: JSON.stringify({ summary: "codex review", findings: [] }), end: { kind: "terminal", terminal: { outcome: "success" } } };
+      },
+    };
+    const codexAdviceHarnessFactory = (async () => fakeHarness) as never;
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: forbiddenQueryFn(), codexAdviceHarnessFactory });
+    await runner.execute(reviewClaim({ secrets: { forge_pat: "pat", codex: { auth_mode: "api_key", access_token: "codex-tok", capability: "cap-1" } } as never }));
+    assert.equal(seen?.model, CODEX_TASK_REVIEW_MODEL);
+    assert.equal(seen?.effort, undefined, "the Codex review pass must not send an effort");
+  });
+
+  it("the Claude review pass sends no model and no effort", async () => {
+    const { client, calls } = fakeClient();
+    const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+    let options: Record<string, unknown> | undefined;
+    const queryFn = (async function* (args: { options?: Record<string, unknown> }) {
+      options = args.options;
+      yield { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: goodModelJson }] } };
+      yield { type: "result", subtype: "success", is_error: false };
+    }) as unknown as SdkQueryFn;
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn });
+    await runner.execute(reviewClaim({ config: { default_model: "opus", default_effort: "high" } as never }));
+    assert.equal(calls.review?.review.status, "complete");
+    assert.ok(options, "the Claude pass must have called the query");
+    assert.equal(options.model, undefined, "the Claude review pass must send no model");
+    assert.equal(options.effort, undefined, "the Claude review pass must send no effort");
+  });
+
   // PRD #1429 M3: the control — an ordinary Claude claim (no codex block) must never touch
   // the injected Codex advice-harness factory, even when one is wired.
   it("a Claude review claim never touches the injected Codex advice-harness factory", async () => {

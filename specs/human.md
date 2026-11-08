@@ -210,6 +210,7 @@ Tracked as GitLab issue vtmocanu/uzi#17; PRD at `prds/done/17-lead-template-and-
 - Each effort preference can also be Runtime default, which sends no effort level to the harness (Claude gets no `--effort`, Codex requests carry none). Claude still reports no value; Codex uses its catalog default for the model, and settings show that default per credential as last reported by a Codex run (within 30 days, unknown until one reports; Codex account mode `auto` with at least one pooled login reads unknown). A resumed session may keep the level it last used. Unset still means explicit medium, and cross-check checker defaults are unaffected. [PRD #3251] (AI-synced 2026-11-06)
 - When the Codex catalog does not list the chosen explicit effort for the model, the run feed warns once per claim, before its first turn (a re-claimed run can warn again); uzi never changes the level, and the warning is advisory (the catalog is per-account and can be wrong either way). (AI-synced 2026-10-30)
 - Codex runs wait for a worker with the current runtime/catalog and correct effort handling; an older worker must not silently substitute a model or ignore the requested effort. (AI-synced 2026-10-01)
+- A read-only effective-settings view (`GET /api/me/effective-settings`, `uzi settings get`) shows the harness, models and efforts a manual start would use, where each comes from and when it is fixed (harness at create, models and efforts at claim); a harness chosen by the automatic weekly-reset policy or overflow is reported as chosen at create, not guessed. `POST /api/me/effective-settings/start-preview` validates a harness and token choice as creation does, without creating a run; when the harness is chosen at create it lists Claude and Codex alternatives, each with its own credential or refusal, and the top-level refusal is set only for a failure before a harness is decided or when every alternative is refused for the same reason (differing reasons stay per alternative). `POST /api/me/effective-settings/schedule-preview` (`uzi settings get --schedule <id>`) previews what firing a saved or draft schedule now would use, applying the save step then the fire step, with the same top-level refusal rule and per-alternative refusals; alternatives appear only for an unpinned, override-free issue or sweep schedule, since any override or model pin makes the harness exact. [PRD #3254] (AI-synced 2026-11-07)
 
 ## Feature #18 — Worker templates, per-repo tools & agent scopes
 
@@ -389,7 +390,7 @@ Tracked as GitLab issue vtmocanu/uzi#37; PRD at `prds/done/37-run-agent-selectio
 
 ## Feature #3914 — Per-repo default agent source
 
-PRD at `prds/3914-repo-agent-source-default.md`.
+PRD at `prds/done/3914-repo-agent-source-default.md`.
 
 - Each user may set, per repo connection, a default agent source for their own runs: `own`, `repo`, or unset (today's behaviour). Only the owner may choose `repo`; an admin may clear it or set `own`. A teammate's runs on the same project follow only their own setting. (AI-synced 2026-11-04)
 - The default is frozen onto each issue run at creation (manual, CLI, chat, schedules, autopilot), recorded as requested source plus basis (`repo_default`, or `explicit` for a seeded plan's source or a create-time choice); a later settings change never alters an existing run, and other run kinds are unaffected. (AI-synced 2026-11-04)

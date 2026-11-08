@@ -3425,7 +3425,7 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
       fs.readFileSync(path.join(import.meta.dirname, "..", "..", "fixtures", "lead-config", "contract.json"), "utf8"),
     ) as { request_cases: Array<{ id: string; harness: string; phase: "plan" | "implement"; config: ClaimConfig; templateModel?: string; agents?: Array<{ name: string; model?: string | null }>; expect: import("../src/lead-config-report.js").LeadRequest }> };
     const cases = contract.request_cases.filter((c) => c.harness === "claude");
-    assert.equal(cases.length, 10, "all Claude request cases loaded");
+    assert.equal(cases.length, 13, "all Claude request cases loaded");
     const visited: string[] = [];
     for (const c of cases) {
       const agents = leadRequestCaseAgents(c);
@@ -3471,7 +3471,7 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
       visited.push(c.id);
     }
     assert.deepEqual(visited, cases.map((c) => c.id));
-    assert.equal(visited.length, 10);
+    assert.equal(visited.length, 13);
   });
 
   /** fakeTurns plus init frames carrying `effort`, and an optional getSettings on each instance. */
