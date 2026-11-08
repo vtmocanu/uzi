@@ -104,6 +104,10 @@ function seed(): MockState {
   if (mockScenario() === "overview-next") {
     Object.assign(mockOtherRunOwners, overviewNextOtherRunOwners);
     for (const r of overviewNextRuns) runs.set(r.id, seedRun(r));
+    // #4082: run-seeded carries this scenario's live code check (overviewNextCrossCheckActive),
+    // which the server reports only for a lead that requires a code cross-check.
+    const seeded = runs.get("run-seeded");
+    if (seeded) runs.set(seeded.id, { ...seeded, code_cross_check_required: true });
   }
   const messages = new Map<string, RunMessage[]>();
   messages.set("run-crew", mockCrewMessages.map((m) => ({ ...m })));
