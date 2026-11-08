@@ -251,6 +251,9 @@ function SingleRow({ item, now, demo, border }: { item: RunDecisionItem; now: nu
   // The row's title describes its action link, so several "Review plan" links are told apart
   // without changing the link's name.
   const titleId = useId();
+  // PRD #4040: the pending question's server excerpt, untrusted model text. ONE stripped value
+  // feeds both the visible line and the title tooltip (a separate render sink).
+  const safeExcerpt = item.excerpt ? stripUnsafeChars(item.excerpt) : "";
   const parts: ReactNode[] = [];
   if (item.kind === "plan") parts.push(<span key="plan">{planDetail(run)}</span>);
   if (age) parts.push(<Age key="age" age={age} />);
@@ -272,6 +275,11 @@ function SingleRow({ item, now, demo, border }: { item: RunDecisionItem; now: nu
         )}
         <IssueLabel run={run} />
       </p>
+      {safeExcerpt && (
+        <p data-excerpt="" title={safeExcerpt} className="mt-1 truncate text-[13px] italic text-muted">
+          “{safeExcerpt}”
+        </p>
+      )}
       {parts.length > 0 && <Meta parts={parts} />}
     </RowShell>
   );
@@ -346,55 +354,65 @@ function GroupItem({ item, now, demo, open }: { item: RunDecisionItem; now: numb
     return <li className="relative min-w-0 truncate">{label}</li>;
   }
   const href = item.kind === "pr" ? prHrefOf(run) : null;
+  // PRD #4040: an awaiting_input item quotes its pending question on a second line, only once
+  // the group is expanded. ONE stripped value feeds both the text and the title tooltip.
+  const safeExcerpt = item.excerpt ? stripUnsafeChars(item.excerpt) : "";
   // One line: the ref keeps its width up to a cap (a long repo path truncates), the title takes
   // and truncates the rest, the age and action never shrink.
   const refCls = "relative max-w-[40%] shrink-0 truncate";
   return (
-    <li className="relative flex min-w-0 items-center gap-x-2 py-0.5">
-      {item.kind === "pr" ? (
-        <>
-          <span className={refCls}>
-            <PrRef run={run} demo={demo} />
+    <li className="relative min-w-0 py-0.5">
+      <div className="flex min-w-0 items-center gap-x-2">
+        {item.kind === "pr" ? (
+          <>
+            <span className={refCls}>
+              <PrRef run={run} demo={demo} />
+            </span>
+            <span id={labelId} title={stripUnsafeChars(run.issue_title)} className="min-w-0 flex-1 truncate">
+              {stripUnsafeChars(run.issue_title)}
+            </span>
+          </>
+        ) : (
+          <span id={labelId} className="flex min-w-0 flex-1 items-center gap-x-1">
+            <span className={refCls}>
+              <RunIssueRef issueIid={run.issue_iid} issueWebUrl={run.issue_web_url} kind={run.kind} forgeType={run.forge_type} />
+            </span>{" "}
+            <span title={stripUnsafeChars(run.issue_title)} className="min-w-0 truncate">
+              {stripUnsafeChars(run.issue_title)}
+            </span>
           </span>
-          <span id={labelId} title={stripUnsafeChars(run.issue_title)} className="min-w-0 flex-1 truncate">
-            {stripUnsafeChars(run.issue_title)}
+        )}
+        {age && (
+          <span className="shrink-0 text-warn">
+            <span className="sr-only">waiting </span>
+            {age}
           </span>
-        </>
-      ) : (
-        <span id={labelId} className="flex min-w-0 flex-1 items-center gap-x-1">
-          <span className={refCls}>
-            <RunIssueRef issueIid={run.issue_iid} issueWebUrl={run.issue_web_url} kind={run.kind} forgeType={run.forge_type} />
-          </span>{" "}
-          <span title={stripUnsafeChars(run.issue_title)} className="min-w-0 truncate">
-            {stripUnsafeChars(run.issue_title)}
-          </span>
-        </span>
-      )}
-      {age && (
-        <span className="shrink-0 text-warn">
-          <span className="sr-only">waiting </span>
-          {age}
-        </span>
-      )}
-      {href ? (
-        <>
-          <a
-            href={href}
-            target="_blank"
-            rel="noopener noreferrer"
-            aria-describedby={`${labelId} ${newTabId}`}
-            className={ITEM_ACTION_CLASS}
-          >
+        )}
+        {href ? (
+          <>
+            <a
+              href={href}
+              target="_blank"
+              rel="noopener noreferrer"
+              aria-describedby={`${labelId} ${newTabId}`}
+              className={ITEM_ACTION_CLASS}
+            >
+              {item.verb}
+            </a>
+            <span id={newTabId} className="sr-only">
+              (opens in a new tab)
+            </span>
+          </>
+        ) : (
+          <Link to={`/runs/${run.id}`} aria-describedby={labelId} className={ITEM_ACTION_CLASS}>
             {item.verb}
-          </a>
-          <span id={newTabId} className="sr-only">
-            (opens in a new tab)
-          </span>
-        </>
-      ) : (
-        <Link to={`/runs/${run.id}`} aria-describedby={labelId} className={ITEM_ACTION_CLASS}>
-          {item.verb}
-        </Link>
+          </Link>
+        )}
+      </div>
+      {safeExcerpt && (
+        <p data-excerpt="" title={safeExcerpt} className="truncate italic">
+          “{safeExcerpt}”
+        </p>
       )}
     </li>
   );

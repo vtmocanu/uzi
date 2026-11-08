@@ -4092,8 +4092,11 @@ for renewal bounds, storage risks and rollout requirements.
 ### Retained recovery adoption failed
 
 `recovery_wait` / `retained_recovery_adoption_failed` means an integrity check
-refused adoption. Local work and custody are preserved; the run is owner-held
-with no automatic retry, regardless of a displayed retry timestamp.
+refused adoption, or that a predecessor's active secret-scan remediation record
+refused source use so the agent did not start. Local work and custody are
+preserved; the run is owner-held with no automatic retry, regardless of a
+displayed retry timestamp. In the remediation case, Resume holds again unless
+that remediation was resolved through a separately authorized route.
 
 Read `uzi run recovery <id>` and export an available archive before deciding.
 Use `uzi run resume <id>` (or `resume-now`) to request another bounded attempt,

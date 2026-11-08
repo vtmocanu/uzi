@@ -709,9 +709,15 @@ scenarios are mutually exclusive by construction. Known values:
 - `overview-next` — `/overview/next?mock=overview-next`, signed in as the
   admin, seeds the Overview preview: the maintenance banner is on, the health
   document carries one owner warning that raises the admin attention banner (and
-  a non-passing health chip), and three other users' runs join the admin
-  all-users list (one awaiting approval, one running, one in a usage-limit
-  wait). One of your own completed runs shares its open MR with `run-ci-halted`,
+  a non-passing health chip), and six other users' runs join the admin
+  all-users list (one awaiting approval, three running, one in a usage-limit
+  wait, and `run-ov-omar-asking`, which is awaiting input). One of your own
+  runs is awaiting input too (`#409`, "Let admins cap concurrent exports per
+  tenant"). It joins `run-awaiting-followup` and `run-unreadable-question` in a
+  collapsed three-item question group in Needs your decision; expand it ("Open
+  runs") and #409 quotes its pending question "Should the cap count exports
+  that are still queued?" under its title; `run-unreadable-question` has a malformed question
+  payload and shows no excerpt. One of your own completed runs shares its open MR with `run-ci-halted`,
   so the pull-request list has a duplicate to collapse. Your fleet gains seven
   workers for the Capacity card (full, draining and upgrading, manually
   cordoned, offline, no advertised slot cap and no stats), and four open
