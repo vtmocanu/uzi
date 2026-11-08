@@ -52,7 +52,10 @@ stop rather than forcing.
   holds, rechecked immediately before `merge.sh`. Otherwise, or when unsure, update the
   branch, get the rebase-lane buddy review and wait for fresh exact-head CI.
   - Required CI is green on the exact head, and that run finished within the last 24 hours.
-  - Current `main`'s required CI is green on its tip.
+  - `main` is not red: its newest finished, non-cancelled required CI run passed. An in-progress tip run
+    does not block (main CI cancels in-progress runs on every push), but a red one does,
+    except for the fix itself. Leave at least 5 minutes between merges to `main`, and follow
+    a merge coordinator's GO/WAIT when one is running.
   - The buddy's `APPROVE` is pinned to the head, and the merge is clean (no conflict).
   - The main delta (`merge-base..origin/main`) and the PR are independent. Use the whole
     component as the unit: `api/` (with `docs/`, which `api` embeds), `controller/`,
@@ -72,7 +75,7 @@ stop rather than forcing.
   - the tested head, its CI run id and completion time;
   - the tested base when known; otherwise compare from the PR's merge-base and do not claim
     an unverified tested base;
-  - the current main SHA and its green required CI;
+  - the current main SHA and its newest completed required CI result;
   - the full delta, including renames as old and new paths;
   - the component, dependency and exclusion assessment;
   - the pinned buddy verdict.
