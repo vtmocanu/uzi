@@ -319,4 +319,8 @@ describe("names", () => {
     expect(one(user("zed@x.io")).initials).toBe("Z");
     expect(one(user("q@x.io", { display_name: "Maria" })).initials).toBe("M");
   });
+
+  it("takes whole code points for astral-plane letters, not UTF-16 halves", () => {
+    expect(one(user("c@x.io", { display_name: "\u{20000}a \u{20001}b" })).initials).toBe("\u{20000}\u{20001}");
+  });
 });

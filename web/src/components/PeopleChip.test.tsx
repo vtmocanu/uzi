@@ -70,7 +70,7 @@ describe("PeopleChip trigger", () => {
     );
     expect(chip().getAttribute("aria-label")).toBe("People: Active now unavailable");
     rerender(<PeopleChip model={model({ active: { state: "loading" } })} onShowUsageByUser={() => {}} />);
-    expect(container.textContent).toBe("");
+    expect(container.firstChild).toBeNull();
   });
 });
 
@@ -193,6 +193,32 @@ describe("PeopleChip keyboard and focus", () => {
     fireEvent.mouseDown(screen.getByText("elsewhere"));
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(chip().getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("keeps focus on a control clicked outside, but returns it to the chip after a click on nothing", async () => {
+    const nextFrame = () => new Promise<void>((r) => requestAnimationFrame(() => r()));
+    render(
+      <div>
+        <PeopleChip model={model()} onShowUsageByUser={() => {}} />
+        <input aria-label="other" />
+        <p>elsewhere</p>
+      </div>,
+    );
+    const input = screen.getByLabelText("other");
+    open();
+    fireEvent.mouseDown(input);
+    input.focus();
+    await nextFrame();
+    await nextFrame();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(input);
+
+    open();
+    fireEvent.mouseDown(screen.getByText("elsewhere"));
+    (document.activeElement as HTMLElement).blur();
+    await nextFrame();
+    await nextFrame();
+    expect(document.activeElement).toBe(chip());
   });
 
   it("closes without taking focus back when Usage by user is activated, then calls the handler", () => {

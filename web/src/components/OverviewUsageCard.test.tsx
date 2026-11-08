@@ -602,6 +602,19 @@ describe("OverviewUsageCard controlled scope and By user focus (#4042)", () => {
     expect(document.activeElement).not.toBe(byUser);
   });
 
+  it("does not refocus for the same counter value after the section is hidden and shown again", () => {
+    const { self, admin } = fixture();
+    const ui = (scope: "you" | "all", n: number) => (
+      <Controlled self={self} admin={admin} scope={scope} onScopeChange={() => {}} focusByUser={n} />
+    );
+    const view = render(ui("all", 1));
+    expect(document.activeElement).toBe(view.getByRole("region", { name: "By user" }));
+    (document.activeElement as HTMLElement).blur();
+    view.rerender(ui("you", 1));
+    view.rerender(ui("all", 1));
+    expect(document.activeElement).not.toBe(view.getByRole("region", { name: "By user" }));
+  });
+
   it("focuses the section once it mounts when the scope and the bump arrive together", () => {
     const { self, admin } = fixture();
     const view = render(<Controlled self={self} admin={admin} scope="you" onScopeChange={() => {}} focusByUser={0} />);

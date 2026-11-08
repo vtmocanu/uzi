@@ -78,7 +78,6 @@ export function PeopleChip({ model, onShowUsageByUser }: { model: PeopleModel; o
 
   useEffect(() => {
     if (!open) return;
-    const focusTrigger = () => triggerRef.current?.focus();
     panelRef.current?.focus();
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") close(true);
@@ -86,8 +85,12 @@ export function PeopleChip({ model, onShowUsageByUser }: { model: PeopleModel; o
     const onDown = (e: MouseEvent) => {
       if (hostRef.current && !hostRef.current.contains(e.target as Node)) {
         setOpen(false);
-        // The native mousedown moves focus to <body> after this handler, so refocus a frame later.
-        refocusRaf.current = requestAnimationFrame(focusTrigger);
+        // The native mousedown moves focus to <body> after this handler, so refocus a frame later,
+        // but only when focus was left on nothing: a control the user clicked keeps it.
+        refocusRaf.current = requestAnimationFrame(() => {
+          const a = document.activeElement;
+          if (a == null || a === document.body) triggerRef.current?.focus({ preventScroll: true });
+        });
       }
     };
     document.addEventListener("keydown", onKey);
@@ -115,7 +118,7 @@ export function PeopleChip({ model, onShowUsageByUser }: { model: PeopleModel; o
   const idleLine = idle ? idleText(idle) : null;
 
   return (
-    <div ref={hostRef} className="relative inline-block">
+    <div ref={hostRef} className="relative inline-block min-w-0 max-w-full">
       <button
         ref={triggerRef}
         type="button"
@@ -157,10 +160,10 @@ export function PeopleChip({ model, onShowUsageByUser }: { model: PeopleModel; o
           aria-label="People using uzi"
           tabIndex={-1}
           // Desktop: below the chip, right edge aligned to it. Below sm the header actions can wrap
-          // so the chip may sit anywhere horizontally; the panel then switches to fixed with a 1rem
-          // inset on both sides (top stays at its in-flow position under the chip), so it can never
-          // leave the viewport. No measuring needed.
-          className="absolute right-0 top-full z-30 mt-2 max-h-[70vh] w-[min(360px,calc(100vw-32px))] overflow-y-auto rounded-xl border border-edge bg-raised text-left shadow-2xl outline-hidden max-sm:fixed max-sm:inset-x-4 max-sm:top-auto max-sm:w-auto"
+          // so the chip may sit anywhere horizontally; the panel then becomes a bottom sheet: fixed
+          // with a 1rem inset on the sides and bottom, and a max height of the viewport minus the
+          // two 1rem insets, so it always fits whatever the chip's position. No measuring needed.
+          className="absolute right-0 top-full z-30 mt-2 max-h-[70vh] w-[min(360px,calc(100vw-32px))] overflow-y-auto rounded-xl border border-edge bg-raised text-left shadow-2xl outline-hidden max-sm:fixed max-sm:inset-x-4 max-sm:bottom-4 max-sm:top-auto max-sm:mt-0 max-sm:max-h-[calc(100dvh-2rem)] max-sm:w-auto"
         >
           <div className="space-y-3 p-3">
             <div className="flex items-start justify-between gap-2">

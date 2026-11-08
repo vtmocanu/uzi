@@ -67,7 +67,7 @@ function ByUserTable({ admin, window, viewerId, ref }: { admin: AdminUsage; wind
   const { available, rows, factoryRuns, factoryPRs, factoryOutcomes, factory, factoryDisclosure } = perUserRows(admin, window);
   const recent = window === "last_7_days";
   return (
-    <section ref={ref} id="overview-usage-by-user" tabIndex={-1} aria-label="By user" className="mt-5 border-t border-edge pt-4 outline-hidden">
+    <section ref={ref} id="overview-usage-by-user" tabIndex={-1} aria-label="By user" className="mt-5 border-t border-edge pt-4 scroll-mt-20 rounded-md outline-hidden focus:ring-2 focus:ring-ring">
       <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
         <h3 className="text-sm font-semibold text-fg">By user</h3>
         <span className="text-xs text-faint">{recent ? "last 7 days" : "all time"}, by cost</span>
