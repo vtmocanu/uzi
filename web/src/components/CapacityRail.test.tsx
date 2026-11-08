@@ -363,6 +363,8 @@ describe("CapacityRail untrusted worker text", () => {
     const link = screen.getByRole("link", { name: /^#7 / });
     expect(link.textContent).not.toContain(BIDI);
     expect(link.textContent).toContain("<img src=x onerror=alert(1)>");
+    // The truncated link carries its full (stripped) label as a tooltip.
+    expect(link.getAttribute("title")).toBe(link.textContent);
     expect(container.querySelector("img")).toBeNull();
     expect(container.textContent).not.toContain(BIDI);
     for (const el of Array.from(container.querySelectorAll("*"))) {
