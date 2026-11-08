@@ -88,7 +88,10 @@ function RunBadges({
           <Badge key={run.id} tone={tone} wrap={tag != null} title={title ? stripUnsafeChars(title) : undefined}>
             {runRef(run)}
             {tag && (
-              <span className={`ml-1 rounded px-1 ${TAG_CLASSES[tag.tone]}`}>{stripUnsafeChars(tag.text)}</span>
+              <>
+                {/* A real space, so the chip reads "#N cross-checking" to assistive tech and copy. */}{" "}
+                <span className={`rounded px-1 ${TAG_CLASSES[tag.tone]}`}>{stripUnsafeChars(tag.text)}</span>
+              </>
             )}
           </Badge>
         );

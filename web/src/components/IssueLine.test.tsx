@@ -120,7 +120,7 @@ describe("IssueLine", () => {
     ]);
     const building = station(/^Building/);
     const chip = within(building).getByText("#4040");
-    expect(chip.textContent).toBe("#4040cross-checking");
+    expect(chip.textContent).toBe("#4040 cross-checking");
     expect(within(chip).getByText("cross-checking")).toBeTruthy();
     expect(chip.getAttribute("title")).toBe("Code cross-check in progress (advisory, does not block)");
     expect(within(building).getByText("#4041").textContent).toBe("#4041");
@@ -128,6 +128,12 @@ describe("IssueLine", () => {
     const gated = within(station(/^Plan review/)).getByText("#4042");
     expect(within(gated).getByText("cross-check: revise").className).toContain("text-warn");
     expect(gated.getAttribute("title")).toBe("Revisions exhausted");
+    const blocked = aRun({ id: "b", issue_iid: 4043, status: "awaiting_approval", plan_cross_check_gate_reason: "block" });
+    cleanup();
+    mount([blocked]);
+    expect(within(within(station(/^Plan review/)).getByText("#4043")).getByText("cross-check: blocked").className).toContain(
+      "text-danger",
+    );
   });
 
   it("joins the owner and the tag meaning in another user's chip tooltip", () => {

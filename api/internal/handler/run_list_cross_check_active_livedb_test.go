@@ -43,7 +43,7 @@ func newCCListFixture(t *testing.T, pool *pgxpool.Pool) *ccListFixture {
 	// Deleting the owner cascades to exactly the connection, repos, workers and runs seeded here.
 	t.Cleanup(func() {
 		if _, err := pool.Exec(context.Background(), `DELETE FROM users WHERE id = $1`, f.owner); err != nil {
-			t.Logf("cleanup owner: %v", err)
+			t.Errorf("cleanup owner: %v", err)
 		}
 	})
 	f.conn = rmSeedConn(t, pool, f.owner)
@@ -71,7 +71,9 @@ func (f *ccListFixture) lead(t *testing.T, kind, status string) uuid.UUID {
 		"task":   `,issue_iid=NULL,branch='cc-list-task'`,
 		"ci_fix": `,pipeline_id=1,pipeline_ref='main'`,
 	}[kind]
-	cliMustExec(t, f.pool, `UPDATE runs SET kind=$2,worker_id=$3,harness='claude',claim_generation=1`+shape+` WHERE id=$1`, id, kind, f.worker)
+	// created_at two days ahead keeps every case inside the admin list's global newest-500
+	// window, whatever other LiveDB tests left behind in the shared database.
+	cliMustExec(t, f.pool, `UPDATE runs SET kind=$2,worker_id=$3,harness='claude',claim_generation=1,created_at=now()+interval '2 days'`+shape+` WHERE id=$1`, id, kind, f.worker)
 	return id
 }
 

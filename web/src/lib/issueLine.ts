@@ -112,8 +112,12 @@ export function crossCheckTag(run: RunSummaryItem, stage: IssueStage): CrossChec
     if (reason === "block") return { text: "cross-check: blocked", tone: "danger", title };
     return { text: "cross-check: unavailable", tone: "warn", title };
   }
-  if (run.cross_check_active === "plan") return { text: "cross-checking", tone: "check", title: "Plan cross-check in progress" };
-  if (run.cross_check_active === "code") {
+  // The station names the check: a plan check reads only in Planning, a code check only in
+  // Building. A claimed run whose plan is being checked sits in Queued, untagged.
+  if (stage === "planning" && run.cross_check_active === "plan") {
+    return { text: "cross-checking", tone: "check", title: "Plan cross-check in progress" };
+  }
+  if (stage === "building" && run.cross_check_active === "code") {
     return { text: "cross-checking", tone: "check", title: "Code cross-check in progress (advisory, does not block)" };
   }
   return null;
