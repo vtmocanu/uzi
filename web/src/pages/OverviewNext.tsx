@@ -186,7 +186,7 @@ export function OverviewNext() {
         </div>
         {/* Below xl the rail is full width: Capacity and Held work sit side by side from lg. */}
         <div className="min-w-0 space-y-6 lg:grid lg:grid-cols-2 lg:items-start lg:gap-6 lg:space-y-0 xl:block xl:space-y-6">
-          {data && <CapacityRail workers={data.workers} />}
+          {data && <CapacityRail workers={data.workers} runs={ownRuns} now={now} />}
           {/* Not gated on `data`: custody states must show while the personal load is slow or failed. */}
           <HeldWorkCard holds={holds} holdsFailed={holdsFailed} recoveryWaitCount={ownRecoveryWaitCount(ownRuns)} />
         </div>
