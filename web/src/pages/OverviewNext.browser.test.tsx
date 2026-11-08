@@ -10,6 +10,7 @@ import { MemoryRouter } from "react-router-dom";
 import { OverviewNext } from "./OverviewNext";
 import { api } from "../lib/api";
 import { healthySilentDoc } from "../mocks/data";
+import { overviewNextOwnerWorkers } from "../mocks/data/overviewNext";
 import { aRun, aUser, aWorker, authValue, emptySelf } from "./overviewFixtures";
 import { useAuth } from "../auth/AuthContext";
 
@@ -515,6 +516,20 @@ describe("OverviewNext capacity rail", () => {
           active_runs: 1,
           max_concurrent_runs: 2,
         }),
+        // Several problem pills at once: full slots, a dind volume at 91%, lost memory
+        // authority and a failed upgrade.
+        aWorker({
+          id: "w5",
+          name: "base.l-highmem-7c2e",
+          kind: "hosted",
+          status: "online",
+          active_runs: 2,
+          max_concurrent_runs: 2,
+          stats_disk_dind_bytes: 45_600_000_000,
+          stats_disk_dind_total_bytes: 50_000_000_000,
+          memory_authority_lost_at: "2026-07-05T11:30:00Z",
+          upgrade_status: "upgrade_failed",
+        }),
       ],
     });
     render(
@@ -566,7 +581,7 @@ describe("OverviewNext capacity rail", () => {
       expect.soft(el.getBoundingClientRect().right, `${el.tagName}`).toBeLessThanOrEqual(rail.right + 1);
     }
     expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(window.innerWidth);
-    expectRailSummariesFit(railCard);
+    expectRailSummariesFit(railCard, 5);
   });
 
   it("keeps worker names readable and rows inside the rail at 320px", async () => {
@@ -576,8 +591,93 @@ describe("OverviewNext capacity rail", () => {
     await document.fonts.ready;
     expect(window.innerWidth).toBe(320);
     const railCard = screen.getByRole("heading", { name: /Capacity/ }).closest("div.rounded-xl") as HTMLElement;
-    expectRailSummariesFit(railCard);
+    expectRailSummariesFit(railCard, 5);
   });
+});
+
+// PRD #4078: the mock's owner fleet (every problem state at once) in the real rail. Problem
+// badges stay in the collapsed summary, and the expanded rows hold the gauges, runs on the
+// worker, held-work link and footer without pushing the page sideways.
+describe("OverviewNext capacity rail worker rows", () => {
+  const FLEET = overviewNextOwnerWorkers();
+
+  function mountFleet() {
+    mockApi.listWorkers.mockResolvedValue({ workers: FLEET });
+    // The viewer's own run that the disk-danger worker reports, so its row joins to a link.
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "run-mr-rework", status: "running", issue_iid: 77, issue_title: "Rework the cost cap" })],
+    });
+    render(
+      <MemoryRouter initialEntries={["/overview/next"]}>
+        <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+          <OverviewNext />
+        </main>
+      </MemoryRouter>,
+    );
+  }
+
+  const railOf = () => screen.getByRole("heading", { name: /Capacity/ }).closest("div.rounded-xl") as HTMLElement;
+  const rowOf = (rail: HTMLElement, name: string) => {
+    const label = within(rail).getByText(name);
+    return label.closest("details") as HTMLDetailsElement;
+  };
+
+  for (const width of [1280, 400]) {
+    it(`shows disk and memory-authority badges with every row closed at ${width}px`, async () => {
+      await page.viewport(width, 900);
+      mountFleet();
+      await screen.findByText("Capacity");
+      await document.fonts.ready;
+      expect(window.innerWidth).toBe(width);
+      const rail = railOf();
+      for (const d of rail.querySelectorAll("details")) expect((d as HTMLDetailsElement).open).toBe(false);
+
+      const disk = within(rail).getByText("disk 91%");
+      expect(disk.checkVisibility(), "disk badge visible while closed").toBe(true);
+      expect(disk.closest("summary")).toBe(rowOf(rail, "base.l-highmem-7c2e").querySelector("summary"));
+      const memory = within(rail).getByText("memory authority lost");
+      expect(memory.checkVisibility(), "memory authority badge visible while closed").toBe(true);
+      expect(memory.closest("summary")).toBe(rowOf(rail, "ephemeral-4b2d9e70").querySelector("summary"));
+
+      expectRailSummariesFit(rail, FLEET.length);
+      expect(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(window.innerWidth);
+    });
+  }
+
+  for (const width of [1280, 400]) {
+  it(`opens the disk-danger and offline rows into gauges, runs, held-work link and footer at ${width}px`, async () => {
+    await page.viewport(width, 900);
+    mountFleet();
+    await screen.findByText("Capacity");
+    await document.fonts.ready;
+    const rail = railOf();
+
+    const danger = rowOf(rail, "base.l-highmem-7c2e");
+    const offline = rowOf(rail, "ci-runner-offline");
+    (danger.querySelector("summary") as HTMLElement).click();
+    (offline.querySelector("summary") as HTMLElement).click();
+    expect(danger.open).toBe(true);
+    expect(offline.open).toBe(true);
+
+    const cpu = within(danger).getByRole("progressbar", { name: "CPU" });
+    expect(cpu.checkVisibility()).toBe(true);
+    expect(within(danger).getByText("On this worker").checkVisibility()).toBe(true);
+    const run = within(danger).getByRole("link", { name: /#77 Rework the cost cap/ });
+    expect(run.getAttribute("href")).toBe("/runs/run-mr-rework");
+    expect(within(danger).getByText("run 5e44c9d7").checkVisibility(), "unjoined run shows its short id").toBe(true);
+    expect(within(danger).getByRole("link", { name: /Review held work/ }).checkVisibility()).toBe(true);
+    expect(within(danger).getByText(/^v0\.87\.0-rc\.4 · up /).checkVisibility()).toBe(true);
+
+    expect(within(offline).getByText("Last reported").checkVisibility()).toBe(true);
+    expect(within(offline).getByText(/last seen/).checkVisibility()).toBe(true);
+
+    const railRight = rail.getBoundingClientRect().right;
+    for (const el of rail.querySelectorAll<HTMLElement>("li, li *")) {
+      expect.soft(el.getBoundingClientRect().right, `${el.tagName} ${el.textContent?.slice(0, 30)}`).toBeLessThanOrEqual(railRight + 1);
+    }
+    expect(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(window.innerWidth);
+  });
+  }
 });
 
 describe("OverviewNext held work card", () => {
@@ -634,9 +734,9 @@ describe("OverviewNext held work card", () => {
 
 // Every worker summary stays inside its box and its name keeps a readable width, however
 // many badges the worker shows.
-function expectRailSummariesFit(railCard: HTMLElement) {
+function expectRailSummariesFit(railCard: HTMLElement, count: number) {
   const summaries = railCard.querySelectorAll<HTMLElement>("li summary");
-  expect(summaries.length).toBe(4);
+  expect(summaries.length).toBe(count);
   for (const s of summaries) {
     expect.soft(s.scrollWidth, `summary ${s.textContent?.slice(0, 30)} overflow`).toBeLessThanOrEqual(s.clientWidth + 1);
     const name = s.querySelector<HTMLElement>("[data-worker-name]") as HTMLElement;
