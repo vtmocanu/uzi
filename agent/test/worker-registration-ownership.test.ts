@@ -22,7 +22,7 @@ function outbox(entries: PendingTerminal[]): Outbox {
   return { listPendingTerminals: () => entries, listPendingOutcomeSources: () => entries,
     listPendingFinalizes: () => [], listPublicationRegisterEntries: () => [], uncleanRuns: () => [], depths: () => [],
     runsWithPending: () => [], unclassifiedPolicyRunIds: () => [], depthFor: () => undefined,
-    drain: async () => {}, hasUndrainedMessages: () => false } as unknown as Outbox;
+    drain: async () => {}, hasUndrainedMessages: () => false, isDisabled: () => false } as unknown as Outbox;
 }
 const pending = (n: number): PendingTerminal => ({ run_id: id(n), claim_generation: 1,
   outcome_kind: "unknown", phase: "policy_pending", since: 1, blocked: false });
