@@ -57,11 +57,13 @@ const STATIONS: Station[] = [
   { stage: "pr", label: "PR open", tone: "ok", flows: false },
 ];
 
-// The inner pill of a cross-check tag, after the chip's own tone.
+// The inner pill of a cross-check tag. An outline only: a fill would stack on the chip's own
+// tint and pull 11px coloured text under AA 4.5:1 (#4082 review), so the tone lives in the
+// text and its border alone. A plain check reads in the foreground colour, as the mock's .why.chk.
 const TAG_CLASSES: Record<CrossCheckTag["tone"], string> = {
-  check: "bg-faint/20",
-  warn: "bg-warn/20 text-warn",
-  danger: "bg-danger/20 text-danger",
+  check: "text-fg",
+  warn: "text-warn",
+  danger: "text-danger",
 };
 
 function RunBadges({
@@ -90,7 +92,7 @@ function RunBadges({
             {tag && (
               <>
                 {/* A real space, so the chip reads "#N cross-checking" to assistive tech and copy. */}{" "}
-                <span className={`rounded px-1 ${TAG_CLASSES[tag.tone]}`}>{stripUnsafeChars(tag.text)}</span>
+                <span className={`whitespace-nowrap rounded border border-current/40 px-1 ${TAG_CLASSES[tag.tone]}`}>{stripUnsafeChars(tag.text)}</span>
               </>
             )}
           </Badge>

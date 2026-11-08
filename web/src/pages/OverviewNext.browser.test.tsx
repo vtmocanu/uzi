@@ -506,6 +506,7 @@ describe("OverviewNext issue work cross-check tags", () => {
       runs: [
         aRun({ id: "x-plan", status: "running", is_planning: true, issue_iid: 97, cross_check_active: "plan", owner_email: OTHER }),
         aRun({ id: "x-review", status: "awaiting_approval", issue_iid: 88, plan_cross_check_required: true, plan_cross_check_gate_reason: "worker_unsupported", owner_email: OTHER }),
+        aRun({ id: "x-blocked", status: "awaiting_approval", issue_iid: 77, plan_cross_check_required: true, plan_cross_check_gate_reason: "block", owner_email: OTHER }),
         aRun({ id: "x-build", status: "running", issue_iid: 91, cross_check_active: "code", owner_email: OTHER }),
       ],
     });
@@ -590,6 +591,7 @@ describe("OverviewNext issue work cross-check tags", () => {
       expect(tagOf(allBuilding.get("#91"))).toBe("cross-checking");
       expect(tagOf(allPlanning.get("#4040")), "yours keep theirs").toBe("cross-checking");
       expect(tagOf(allReview.get("#3881"))).toBe("cross-check: revise");
+      expect(tagOf(allReview.get("#77"))).toBe("cross-check: blocked");
       expect(allReview.get("#88")!.title).toMatch(/ · Unavailable/);
       expect(allReview.get("#88")!.title.startsWith("Unavailable")).toBe(false);
       expectTagsInsideChips(card);
@@ -601,6 +603,77 @@ describe("OverviewNext issue work cross-check tags", () => {
         }
       }
       expect(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(window.innerWidth);
+    });
+  }
+
+  // The tag is 11px text, so it needs WCAG AA's 4.5:1 against what is actually painted under
+  // it: the page, the card, the station (raised when pressed) and the chip's own tint, stacked.
+  // The canvas does the compositing, so any CSS colour form (oklab, color-mix) resolves.
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = 1;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
+  function paint(color: string, under: number[]): number[] {
+    ctx.globalCompositeOperation = "copy";
+    ctx.fillStyle = `rgb(${under.join(",")})`;
+    ctx.fillRect(0, 0, 1, 1);
+    ctx.globalCompositeOperation = "source-over";
+    ctx.fillStyle = "transparent";
+    ctx.fillStyle = color;
+    ctx.fillRect(0, 0, 1, 1);
+    return Array.from(ctx.getImageData(0, 0, 1, 1).data.slice(0, 3));
+  }
+  function backdrop(el: HTMLElement): number[] {
+    const chain: Element[] = [];
+    for (let n: Element | null = el; n; n = n.parentElement) chain.unshift(n);
+    return chain.reduce((under, n) => paint(getComputedStyle(n).backgroundColor, under), [255, 255, 255]);
+  }
+  const luminance = (rgb: number[]) => {
+    const [r, g, b] = rgb.map((v) => {
+      const c = v / 255;
+      return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+    });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  };
+  function tagContrast(chip: HTMLElement | undefined): number {
+    const tag = chip!.querySelector("span") as HTMLElement;
+    const bg = backdrop(tag);
+    const fg = paint(getComputedStyle(tag).color, bg);
+    const [hi, lo] = [luminance(fg), luminance(bg)].sort((a, b) => b - a);
+    return (hi + 0.05) / (lo + 0.05);
+  }
+
+  for (const theme of ["ember", "dawn"]) {
+    it(`keeps every tag at AA contrast on its chip in ${theme}, with a station pressed too`, async () => {
+      document.documentElement.dataset.theme = theme;
+      try {
+        await page.viewport(1280, 900);
+        mountCrossCheckLine();
+        const { card, toggle } = await ready();
+        await userEvent.click(within(toggle).getByRole("button", { name: "All users" }));
+        const cases: [string, string][] = [
+          ["planning", "#4040"],
+          ["building", "#3543"],
+          ["review", "#3881"],
+          ["review", "#88"],
+          ["review", "#77"],
+        ];
+        for (const [stage, ref] of cases) {
+          const chip = chips(card, stage).get(ref);
+          expect(tagOf(chip), `${ref} carries a tag`).not.toBeNull();
+          expect.soft(tagContrast(chip), `${theme} ${stage} ${ref}`).toBeGreaterThanOrEqual(4.5);
+        }
+        // Pressing a station raises its fill under the chips; the tags must hold there too.
+        for (const stage of ["planning", "building", "review"]) {
+          const station = card.querySelector(`[data-stage="${stage}"]`) as HTMLElement;
+          await userEvent.click(station);
+          expect(station.getAttribute("aria-pressed")).toBe("true");
+          for (const [s, ref] of cases.filter(([s]) => s === stage)) {
+            expect.soft(tagContrast(chips(card, s).get(ref)), `${theme} ${s} ${ref} pressed`).toBeGreaterThanOrEqual(4.5);
+          }
+        }
+      } finally {
+        delete document.documentElement.dataset.theme;
+      }
     });
   }
 });

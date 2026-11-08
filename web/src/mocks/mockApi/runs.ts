@@ -339,7 +339,7 @@ function mockListRuns(params?: {
   const items = listRunsFor()
     // Chat conversations ride runs but have their own page (PRD #39), and judge
     // is a repo-less meta-run — both are excluded here exactly as the real
-    // ListRunsForUser excludes them (`kind NOT IN ('chat','judge')`, PRD #239 D4).
+    // ListRunsForUser excludes them (`kind NOT IN ('chat', 'judge', 'cross_check')`, PRD #239 D4).
     .filter((r) => r.kind !== "chat" && r.kind !== "judge" && r.kind !== "cross_check")
     // Caller-scoped, like the real ListRunsForUser: other demo users' runs
     // (mockOtherRunOwners) belong to the admin all-users list only.
