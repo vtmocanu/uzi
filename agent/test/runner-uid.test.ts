@@ -1,10 +1,14 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
+import childProcess, { spawn } from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import assert from "node:assert/strict";
+import { WORKER_SPAWN_ENV } from "../src/worker-spawn-mark.js";
 import {
   COMMAND_UID,
   RUNNER_UID,
   WORKER_UID,
   commandRootCommand,
+  killCommandRootPid,
   killRunnerGroup,
   runnerCommand,
   runnerPath,
@@ -225,6 +229,72 @@ describe("runner-uid: codex command/boundary identities (#1171)", () => {
         "--",
         "git", "push", "origin", "HEAD",
       ],
+    });
+  });
+});
+
+describe("runner-uid: killCommandRootPid (issue #4089)", () => {
+  it("is false for an undefined or non-positive pid", () => {
+    assert.equal(killCommandRootPid(undefined, false), false);
+    assert.equal(killCommandRootPid(0, false), false);
+    assert.equal(killCommandRootPid(-5, false), false);
+  });
+
+  it("single-uid: SIGKILLs a real same-uid child", async () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    try {
+      const closed = new Promise<string | null>((resolve) => child.on("close", (_code, signal) => resolve(signal)));
+      assert.equal(killCommandRootPid(child.pid, false), true);
+      assert.equal(await closed, "SIGKILL");
+    } finally {
+      child.kill("SIGKILL");
+    }
+  });
+
+  describe("under the split", () => {
+    interface Call { command: string; args: string[]; options: { env?: NodeJS.ProcessEnv; stdio?: unknown } }
+    const stubbed = (t: { mock: { method: (o: object, m: string, f: (...a: never[]) => unknown) => unknown; restoreAll: () => void }; after: (f: () => void) => void }, result: { status: number | null; error?: Error }): Call[] => {
+      const calls: Call[] = [];
+      t.mock.method(childProcess, "spawnSync", ((command: string, args: string[], options: Call["options"]) => {
+        calls.push({ command, args, options });
+        return result;
+      }) as never);
+      syncBuiltinESMExports();
+      return calls;
+    };
+
+    it("forks a setpriv-to-runner-cmd `kill -KILL <pid>` with the worker mark and no stdio", (t) => {
+      t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+      const calls = stubbed(t, { status: 0 });
+      assert.equal(killCommandRootPid(4242, true), true);
+      assert.equal(calls.length, 1, "the spawnSync stub intercepts runner-uid's own call");
+      const call = calls[0]!;
+      assert.equal(call.command, "/bin/setpriv");
+      assert.deepEqual(call.args, [...setprivArgsForUid(COMMAND_UID), "kill", "-KILL", "4242"]);
+      assert.ok(call.args.includes("--reuid") && call.args[call.args.indexOf("--reuid") + 1] === "10003");
+      assert.ok(!call.args.includes("runner") && !call.args.includes("10002"));
+      assert.deepEqual(call.args.slice(call.args.indexOf("--inh-caps"), call.args.indexOf("--inh-caps") + 2), ["--inh-caps", "-all"]);
+      assert.deepEqual(call.args.slice(call.args.indexOf("--ambient-caps"), call.args.indexOf("--ambient-caps") + 2), ["--ambient-caps", "-all"]);
+      assert.ok(call.options.env?.[WORKER_SPAWN_ENV], "the worker spawn mark rides the env");
+      assert.equal(call.options.stdio, "ignore");
+    });
+
+    it("reports the kill's exit status", (t) => {
+      t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+      stubbed(t, { status: 1 });
+      assert.equal(killCommandRootPid(4242, true), false);
+      t.mock.restoreAll();
+      stubbed(t, { status: null, error: new Error("spawn failed") });
+      assert.equal(killCommandRootPid(4242, true), false);
+    });
+
+    it("spawns nothing for an undefined or non-positive pid", (t) => {
+      t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+      const calls = stubbed(t, { status: 0 });
+      assert.equal(killCommandRootPid(0, true), false);
+      assert.equal(killCommandRootPid(-1, true), false);
+      assert.equal(killCommandRootPid(undefined, true), false);
+      assert.equal(calls.length, 0);
     });
   });
 });
