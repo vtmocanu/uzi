@@ -2194,6 +2194,7 @@ owner/path pair changed or the re-admission bound of 2 was passed),
 `completion_pending`, `completion_preflight_retained`, `completion_uncertain`,
 `authority_busy` (the authority lock wait ran out), `published_source_retained`
 (a fenced journal with retained sources was kept, never detached),
+`remediation_retained` (the predecessor's source is held under secret-scan remediation; see below),
 `completion_unverified`, `completion_unsupported`, or `unknown`. It carries no
 error text or paths. IDs are UUID strings
 or `invalid`; path shape is `canonical`, `attempt`, or `unknown`. The fingerprint
@@ -2210,6 +2211,22 @@ it does not establish the cause of the historical refusal in
 [issue #1848](https://github.com/vtmocanu/uzi/issues/1848): the supplied report
 lacked the deployed worker revision, classification request status, and
 underlying retirement error.
+
+A successor run can reclaim an orphaned attempt whose predecessor is terminal (for example
+cancelled) while the predecessor's source is held under secret-scan remediation. The worker then
+does not start the agent and touches nothing of the predecessor. It emits `orphan_reclaim_refused`
+with `remediation_retained`, sends a status message naming only the predecessor run id, and parks the
+run for you at `recovery_wait` / `retained_recovery_adoption_failed`. The message says the agent did not
+start and the source requires review. **Resume** on this worker holds again and adds at least one
+admission-counted custody hold; **Cancel** ends the run and leaves its open holds for you to discard.
+Run `uzi run recovery <predecessor-run-id>` to inspect the predecessor. Resume grants no remediation
+authority, and this page names no route that disposes of the remediation. While held or queued, the
+run's holds count toward your [custody admission limit](admin-settings.md) (`custody_hold_limit`), and a
+held run blocks its worker's upgrade or drain. If the api does not support the park, the worker does not
+park and the message says so; the run is then handled by the ordinary requeue paths. A worker restart
+consumes a requeue, so repeated restarts end at `recovery_wait` / `worker_requeue_exhausted`,
+unless the run's own open holds reach the custody admission limit first; it then stays queued for
+capacity (not an owner park) until it can be claimed again.
 
 ### Retained sources with no open hold (worker-local inspect and discard)
 

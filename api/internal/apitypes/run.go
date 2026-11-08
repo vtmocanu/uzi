@@ -920,8 +920,10 @@ type RunDTO struct {
 	// "provider_outage" is active: a typed provider-transient retry park (PRD #1733).
 	// "worker_requeue_exhausted" and "worker_memory_pressure" require owner action.
 	// "retained_recovery_exhausted" can be timed or owner-held; see RecoveryRetryNotBefore.
-	// "retained_recovery_adoption_failed" is an integrity refusal: retained local work and
-	// custody are preserved, and only the owner can Resume or Cancel, without automatic retry.
+	// "retained_recovery_adoption_failed" is an integrity hold: retained adoption or a
+	// predecessor remediation record refused source use (in the remediation case the agent did
+	// not start and nothing was adopted or touched). Local work and custody are preserved, and
+	// only the owner can Resume or Cancel, without automatic retry.
 	// "retained_continuation_unwitnessed" is a claimed-never-started park whose retained custody
 	// continuation was never witnessed starting: the claim is released, retained work and custody
 	// are preserved, and only the owner can Resume or Cancel, without automatic retry.
@@ -1820,8 +1822,10 @@ type RunSummaryItemDTO struct {
 	// "provider_outage" is active: a typed provider-transient retry park (PRD #1733).
 	// "worker_requeue_exhausted" and "worker_memory_pressure" require owner action.
 	// "retained_recovery_exhausted" can be timed or owner-held; see RecoveryRetryNotBefore.
-	// "retained_recovery_adoption_failed" is an integrity refusal: retained local work and
-	// custody are preserved, and only the owner can Resume or Cancel, without automatic retry.
+	// "retained_recovery_adoption_failed" is an integrity hold: retained adoption or a
+	// predecessor remediation record refused source use (in the remediation case the agent did
+	// not start and nothing was adopted or touched). Local work and custody are preserved, and
+	// only the owner can Resume or Cancel, without automatic retry.
 	// "retained_continuation_unwitnessed" is a claimed-never-started park whose retained custody
 	// continuation was never witnessed starting: the claim is released, retained work and custody
 	// are preserved, and only the owner can Resume or Cancel, without automatic retry.
