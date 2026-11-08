@@ -220,7 +220,6 @@ function assertSame(before: Snap, after: Snap, allowedConfigKeys: string[], what
 // "reclaimed")` (git.ts) -> `reseedAfterReclaim` -> runnerCloneForClaim -> GitCache.runnerCloneForBranch. The collaborators stubbed
 // here are the classification endpoint (a terminal owner of this repo) and the process quiescence proof (no survivors).
 async function reclaimAsOtherRun(e: Env, attemptPaths: boolean): Promise<{ reclaimError?: unknown; diagnostics: string[] }> {
-  const OTHER = "another-run";
   const attempt = (id: string) => ({ attemptId: id, isLive: () => false, beforeSeed: async () => {} });
   const reseed = { beforeFree: async () => {}, isLive: () => false };
   const otherId = formatAttemptId(new Date("2026-11-05T12:00:00Z"), 3, "aaaaaaaaaaaaaaaa");
@@ -624,13 +623,26 @@ const ident = (p: string): { dev: string; ino: string } => {
 /** The GitCache entry points that adopt, seed, capture, reserve, release or discard: a stopped claim must call none of them. */
 const MUTATORS = ["seedIndependentAttempt", "markRecoveryCapture", "reserveRecoveryIteration", "blockRecoveryEpisode", "recordRecoveryCapture",
   "retireRunnerClone", "releaseAttemptInPlace", "installCompletionSourceFence", "discardStoppedSource", "discardProtectedSource"] as const;
+/** Count every call of the MUTATORS on `target` (mock.method throws when a name is not a function there). */
+function spyMutators(target: object): Record<string, number> {
+  const calls: Record<string, number> = {};
+  const t = target as Record<string, (...a: unknown[]) => unknown>;
+  for (const name of MUTATORS) {
+    const original = t[name]!.bind(target);
+    mock.method(t, name, (...args: unknown[]) => { calls[name] = (calls[name] ?? 0) + 1; return original(...args); });
+  }
+  return calls;
+}
 /** What the production runner logs for a later claim of RUN on the released state, in order (recorded from the run, not chosen). */
 const STOP_LOG = ["run claimed", "restore entry present; claim stopped", "retained recovery stopped; source and accounting kept",
   "retained recovery stopped; preserving plugin dir and HOME for a same-worker resume"];
-/** What it logs when steering has observed the owner Cancel first: the RetainedRecoveryCancelled arm of the dispatcher (runner.ts), which
- *  never reaches the restore-entry composite stop. */
-const CANCEL_LOG = ["run claimed", "run failed", "run event", "recovery: unadopted guarded generation disposition", "retained recovery stopped; source and accounting kept",
-  "retained recovery stopped; preserving plugin dir and HOME for a same-worker resume"];
+/** What it logs, in natural order (no waiting), when the owner Cancel is persisted server-side. Two orders occur and both are the
+ *  one cancelled report: steering's first input read routes the Cancel before discovery (no stop line), or the claim reaches the
+ *  restore-entry composite stop first and the stop's cancel observation (runner.ts, opaquePreDiscovery) converts it into the
+ *  cancelled report. Recorded from the runs, not chosen. */
+const CANCEL_TAIL = ["run failed", "run event", "outbox: terminal journaled write-ahead", "recovery: unadopted guarded generation disposition",
+  "retained recovery stopped; source and accounting kept", "retained recovery stopped; preserving plugin dir and HOME for a same-worker resume"];
+const CANCEL_LOGS = [["run claimed", ...CANCEL_TAIL], ["run claimed", "restore entry present; claim stopped", ...CANCEL_TAIL]];
 
 describe("m4c: the production Cancel path and the production guarded discard on the state rc.2 leaves", () => {
   const cleanups: Array<() => Promise<void> | void> = [];
@@ -703,25 +715,7 @@ describe("m4c: the production Cancel path and the production guarded discard on 
     const run = await runnerOverDisk({ dataDir: r.e.dataDir, originPath: r.e.fx.originPath, runId: RUN, iid: 3644, claimGeneration: 3,
       homeDir: path.join(r.e.homeRoot, RUN), cancel });
     cleanups.push(() => run.close());
-    const calls: Record<string, number> = {};
-    for (const name of MUTATORS) {
-      const target = run.git as unknown as Record<string, (...a: unknown[]) => unknown>;
-      const original = target[name]!.bind(run.git);
-      mock.method(target, name, (...args: unknown[]) => { calls[name] = (calls[name] ?? 0) + 1; return original(...args); });
-    }
-    if (cancel) {
-      // Without this the outcome is a race between steering's first input read and the claim's own discovery (measured: both outcomes
-      // occur). Discovery waits until the api has the Cancel acknowledged, so steering has observed it.
-      const target = run.git as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>;
-      const discover = target["discoverOpaque"]!.bind(run.git);
-      mock.method(target, "discoverOpaque", async (...args: unknown[]) => {
-        const deadline = Date.now() + 10_000;
-        while (!run.api.isAcked(RUN, 1) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
-        assert.equal(run.api.isAcked(RUN, 1), true, "steering observed the Cancel before discovery ran");
-        await new Promise(resolve => setTimeout(resolve, 50));
-        return discover(...args);
-      });
-    }
+    const calls = spyMutators(run.git);
     await run.runner.execute(run.claim);
     return { run, calls };
   }
@@ -732,8 +726,8 @@ describe("m4c: the production Cancel path and the production guarded discard on 
       [{ status: "running", reason: undefined }, { status: "failed", reason: "run cancelled" }], "running ack, then the cancelled report, nothing else");
     assert.deepEqual(calls, {}, "no adoption, restore seed, capture, reservation, FINAL, release or discard was attempted");
     assert.equal(run.counters.ran, 0, "no model turn");
-    assert.deepEqual((run.logs.lines as Array<{ msg: string }>).map(l => l.msg), CANCEL_LOG);
-    assert.equal((run.logs.lines as Array<{ msg: string }>).some(l => l.msg === "restore entry present; claim stopped"), false, "the Cancel never reached the composite stop");
+    const logged = (run.logs.lines as Array<{ msg: string }>).map(l => l.msg);
+    assert.ok(CANCEL_LOGS.some(expected => JSON.stringify(expected) === JSON.stringify(logged)), `a natural-order Cancel log: ${JSON.stringify(logged)}`);
   }
   /** An uncancelled claim: the composite stop, nonterminal. */
   function assertNonterminalStop(run: RunnerOver, calls: Record<string, number>): void {
@@ -781,6 +775,15 @@ describe("m4c: the production Cancel path and the production guarded discard on 
     cleanups.push(() => run.close());
     return serve(r, run);
   }
+
+  it("wiring control: the MUTATORS spy records a call to each mutator, so an empty record on a stop is not vacuous", () => {
+    const stub: Record<string, () => string> = {};
+    for (const name of MUTATORS) stub[name] = () => name;
+    const calls = spyMutators(stub);
+    assert.deepEqual(calls, {});
+    for (const name of MUTATORS) assert.equal(stub[name]!(), name, "the spied method still delegates");
+    assert.deepEqual(calls, Object.fromEntries(MUTATORS.map(name => [name, 1])));
+  });
 
   for (const modeA of [true, false]) {
     const mode = modeA ? "A (attempt paths, in_place)" : "H (holding root)";
@@ -890,8 +893,9 @@ describe("m4c: the production Cancel path and the production guarded discard on 
     const refused = async (what: string): Promise<void> => {
       const before = world(r);
       const out = await ownerDiscard(sock, 1);
-      assert.notEqual(out.result.kind, "done", `${what}: ${JSON.stringify(out)}`);
       t.diagnostic(`${what}: ${JSON.stringify({ found: out.found, kind: out.result.kind, reason: out.result.reason })}`);
+      assert.equal(out.found, true, `${what}: the source is listed, so the refusal comes from the discard and not a missing record: ${JSON.stringify(out)}`);
+      assert.deepEqual(out.result, { kind: "unknown", sources: [], metadata: "kept" }, `${what}: the discard answers unknown and keeps the metadata: ${JSON.stringify(out)}`);
       assert.deepEqual(world(r), before, `${what}: nothing written`);
     };
     fs.renameSync(held, aside);
@@ -923,8 +927,9 @@ describe("m4c: the production Cancel path and the production guarded discard on 
     const tampered = world(r);
     for (const generation of [2, 1]) {
       const out = await ownerDiscard(sock, generation);
-      assert.notEqual(out.result.kind, "done", `generation ${generation}: ${JSON.stringify(out)}`);
-      t.diagnostic(`journal of RUN in P's key, generation ${generation}: ${JSON.stringify({ found: out.found, kind: out.result.kind, reason: out.result.reason })}`);
+      assert.equal(out.found, true, `generation ${generation}: the source is listed: ${JSON.stringify(out)}`);
+      assert.deepEqual(out.result, { kind: "unknown", sources: [], metadata: "kept" }, `generation ${generation}: the discard answers unknown and keeps the metadata: ${JSON.stringify(out)}`);
+      t.diagnostic(`journal of RUN in P's key, generation ${generation}: ${JSON.stringify({ found: out.found, kind: out.result.kind })}`);
     }
     assertWorld(tampered, world(r), [], "a journal of RUN in P's key");
   });

@@ -27201,11 +27201,13 @@ export class RunRunner {
       this.retainedLifecycleGuard(flight);
       flight.runLog.warn("restore entry present; claim stopped", {
         blocked_by_other_run: error instanceof RestoreCompositeBlockedError, error: sanitizeForLog(errMessage(error)) });
+      await this.observeCancelAtHeldSeam(claim, flight);
       throw new RestoreRouteStop({ cause: error });
     }
     this.retainedLifecycleGuard(flight);
     if (found.kind === "composite") {
       flight.runLog.warn("restore entry present; claim stopped", { stage: found.composite.stage });
+      await this.observeCancelAtHeldSeam(claim, flight);
       throw new RestoreRouteStop();
     }
     const authority = this.authority;
@@ -27266,11 +27268,12 @@ export class RunRunner {
       outcome = { eligible: false, reason: "evaluation_failed", known: { detail: sanitizeForLog(errMessage(error)) } };
     }
     this.retainedLifecycleGuard(flight);
-    if (!outcome.eligible) return this.refuseRestoreRoute(claim, flight, outcome.reason, outcome.known);
+    if (!outcome.eligible) return await this.refuseRestoreRoute(claim, flight, outcome.reason, outcome.known);
     if (!this.independentRestore) {
       flight.runLog.info("independent restore eligible; seeding disabled for this runner instance", {
         verdict: outcome.verdict.boundary, pin_generation: outcome.verdict.generation, source_sha: outcome.verdict.pin.sourceSha,
         slot: outcome.known.slot, cross_check: outcome.known.crossCheck, claim_generation: claim.claim_generation });
+      await this.observeCancelAtHeldSeam(claim, flight);
       throw new RestoreRouteStop();
     }
     await this.restoreFromPin(claim, flight, bare, branch, key, route.raw, outcome.verdict, outcome.known, input);
@@ -27307,7 +27310,14 @@ export class RunRunner {
 
   /** The nonterminal refusal disposition of the restore route (plan 3.5): log the reason, put one bounded line on the feed, stop.
    *  Writes nothing of its own; a seed that already wrote reports the window it left behind. */
-  private refuseRestoreRoute(claim: ClaimResponse, flight: RunFlight, reason: string, known: RestoreKnown, left?: { window: string; step: string }): never {
+  private async refuseRestoreRoute(claim: ClaimResponse, flight: RunFlight, reason: string, known: RestoreKnown): Promise<never> {
+    // Nothing has been written yet: an owner cancel already persisted server-side but not yet routed by steering is reported here.
+    await this.observeCancelAtHeldSeam(claim, flight);
+    return this.stopRestoreRoute(claim, flight, reason, known);
+  }
+
+  /** The refusal's log, feed line and nonterminal stop, without the cancel observation (used once a seed may have written). */
+  private stopRestoreRoute(claim: ClaimResponse, flight: RunFlight, reason: string, known: RestoreKnown, left?: { window: string; step: string }): never {
     flight.runLog.warn("independent restore refused; predecessor retained", {
       reason, slot: known.slot, crossCheck: known.crossCheck, verdict: known.verdict,
       pinGeneration: known.pinGeneration, sourceSha: known.sourceSha, ...(known.detail === undefined ? {} : { detail: known.detail }),
@@ -27390,7 +27400,9 @@ export class RunRunner {
     const runId = flight.runId;
     const evidence = authority.restoreEvidenceOptions();
     const refuse: (reason: string, extra?: RestoreKnown, left?: { window: string; step: string }) => never = (reason, extra = {}, left) =>
-      this.refuseRestoreRoute(claim, flight, reason, { ...known, ...extra }, left);
+      this.stopRestoreRoute(claim, flight, reason, { ...known, ...extra }, left);
+    const refuseBeforeWrite = (reason: string, extra: RestoreKnown = {}): Promise<never> =>
+      this.refuseRestoreRoute(claim, flight, reason, { ...known, ...extra });
     const isControl = (error: unknown): boolean => error instanceof RetainedRecoveryStop || error instanceof CredentialSwitchSignal;
     // The legacy handoff confirms ownership after adoption and before swapping the executor (confirmPostAdoptionOwnership, with
     // its transient-read retry). The same proof comes BEFORE the first durable restore write, so a claim the server has moved
@@ -27399,13 +27411,13 @@ export class RunRunner {
     catch (error) {
       this.retainedLifecycleGuard(flight);
       if (isControl(error)) throw error;
-      refuse("ownership_unconfirmed", { detail: sanitizeForLog(errMessage(error)) });
+      return await refuseBeforeWrite("ownership_unconfirmed", { detail: sanitizeForLog(errMessage(error)) });
     }
     try { await this.swapRestoreExecutor(claim, flight); }
     catch (error) {
       this.retainedLifecycleGuard(flight);
       if (isControl(error)) throw error;
-      refuse("executor_unavailable", { detail: sanitizeForLog(errMessage(error)) });
+      return await refuseBeforeWrite("executor_unavailable", { detail: sanitizeForLog(errMessage(error)) });
     }
     const attemptId = mintAttemptId(claim.claim_generation, new Date(this.now()));
     const pIncarnation = verdict.predecessorSlot.worker;

@@ -10,6 +10,7 @@ import { AuthorityRuntime } from "../src/authority-runtime.js";
 import { WorkerClient } from "../src/client.js";
 import type { Executor } from "../src/executor.js";
 import { GitLabClient } from "../src/forge.js";
+import { Outbox } from "../src/outbox.js";
 import { GitCache } from "../src/git.js";
 import type { ClaimResponse } from "../src/protocol.js";
 import { establishProcessBoundary } from "../src/restore-boundary.js";
@@ -71,7 +72,16 @@ export async function runnerOverDisk(o: RunnerOverOptions): Promise<RunnerOver> 
     secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan" },
   });
   api.setOwnershipStatus(o.runId, "running", o.claimGeneration);
-  if (o.cancel === true) api.setInputs(o.runId, [{ id: 1, kind: "cancel", body: null }]);
+  // The Cancel is persisted server-side the way the server derives it (a cancel row still unapplied), so a claim that stops before
+  // steering's first input read routes it through the ownership read at the stop (the outbox is what lets that read run).
+  let outbox: Outbox | undefined;
+  if (o.cancel === true) {
+    api.setInputs(o.runId, [{ id: 1, kind: "cancel", body: null }]);
+    api.deriveCancellationRequested = true;
+    outbox = new Outbox({ root: path.join(tmp, "outbox"), log: nullLogger(), runMaxBytes: 64 * 1024 * 1024, maxBytes: 512 * 1024 * 1024, retentionMs: 7 * 86_400_000 });
+    await outbox.init();
+    for (let page = 0; page < 8; page++) if ((await outbox.scanTerminalObservationsPage()).passComplete) break;
+  }
 
   const counters = { factories: 0, ran: 0 };
   const executor: Executor = { run: async () => { counters.ran++; throw new Error("a stopped claim runs no model"); } };
@@ -81,10 +91,12 @@ export async function runnerOverDisk(o: RunnerOverOptions): Promise<RunnerOver> 
   const runner = new RunRunner(client, git, () => { counters.factories++; return { executor, homeDir: o.homeDir }; }, logs.logger, 20, AUTH_TOKEN, {
     pollMs: 5, planApprovalTimeoutMs: 0, questionTimeoutMs: 600, prDescriptionHeadLagMs: 0, gitlab, teardownTestDeps: portableTeardownTestDeps,
     authority, codexBoundaryDeadlineMs: 5000, recoveryRetryMs: 5, restoreIdentity: { procRoot: sProc, hostname: host }, independentRestore: true,
-    checkpointTestHooks: { retryBackoffMs: [0, 0] },
+    checkpointTestHooks: { retryBackoffMs: [0, 0] }, ...(outbox ? { outbox } : {}),
   });
   return {
     runner, api, git, authority, claim, logs, counters,
+    // The worker lifetime lock (acquireWorkerLifetime, "no release") and the AuthorityRuntime expose no release or close API: both are
+    // held for the life of the test process, so only the api and the temp directory are released here.
     close: async () => { try { await api.close(); } finally { fs.rmSync(tmp, { recursive: true, force: true }); } },
   };
 }
