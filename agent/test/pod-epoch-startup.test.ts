@@ -48,8 +48,11 @@ function contract(text: string): void {
   assert.ok(at('if (verdict === "shutdown")') < shadow, "reaper refusal and shutdown precede shadow");
   assert.ok(at("startupReapVerdict(") < shadow, "startup settlement precedes shadow");
   const admission = at("await worker.run(");
-  assert.ok(shadow < at("if (controller.signal.aborted) return;"), "cancellation checked after shadow");
-  assert.ok(at("if (controller.signal.aborted) return;") < admission, "cancellation prevents admission");
+  const cancellation = at("if (controller.signal.aborted) {");
+  assert.ok(shadow < cancellation, "cancellation checked after shadow");
+  assert.ok(cancellation < admission, "cancellation prevents admission");
+  assert.match(main.slice(cancellation, admission), /await finishShutdown\(\);[\s\S]*return;/,
+    "shadow cancellation joins the shutdown barrier and returns before admission");
   assert.match(main.slice(shadow, admission), /if \(result !== undefined\) log.info\("pod_epoch_reclaim", \{ \.\.\.result \}\)/);
   assert.doesNotMatch(main, /epochOwnership\.(close|reacquireShared)\(/, "main retains lifetime ownership and delegates handover");
   const fatal = main.slice(at("main().catch((err) => {"));
@@ -171,6 +174,8 @@ function admissionPorts(shadow: (options: Record<string, unknown>) => Promise<un
   const controller = new AbortController();
   const ports = {
     controller, reap: undefined, startupReapVerdict: () => "run",
+    shutdownSignal: undefined,
+    finishShutdown: async () => { events.push("shutdown"); return { result: "drained", exitCode: 0 }; },
     epochBootstrap: {}, epochOwnership: {}, epochConsumption: {},
     config: { dockerWiring: { dockerHost: "unix:///docker.sock" } }, git: {}, client: {},
     runPodEpochShadow: shadow,
@@ -207,8 +212,23 @@ test("main omits undefined verdict logging and refuses admission after shadow ca
   assert.deepEqual(ordinary.events, ["run"]);
 
   const aborted = admissionPorts(async () => { aborted.controller.abort(); return undefined; });
-  await aborted.run();
-  assert.deepEqual(aborted.events, []);
+  let entered!: () => void;
+  let release!: () => void;
+  const atBarrier = new Promise<void>(resolve => { entered = resolve; });
+  const barrier = new Promise<void>(resolve => { release = resolve; });
+  aborted.ports.finishShutdown = async () => {
+    aborted.events.push("shutdown"); entered();
+    await barrier;
+    return { result: "drained", exitCode: 0 };
+  };
+  const stopping = aborted.run();
+  await atBarrier;
+  try {
+    assert.deepEqual(aborted.events, ["shutdown"], "pending barrier keeps admission closed and precedes the stop log");
+  } finally { release(); }
+  await stopping;
+  assert.deepEqual(aborted.events, ["shutdown", "uzi-agent stopped before the worker started"],
+    "cancelled shadow joins shutdown and never admits the worker");
 
   for (const error of [new PodEpochSettlementError(), new Error("native SH handover failed")]) {
     const failed = admissionPorts(async () => { throw error; });
