@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -17,6 +19,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/forge/forgetest"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // ciFixBindingForge serves what the Fix CI handler needs (failed jobs, a log tail, the CI
@@ -26,6 +29,8 @@ type ciFixBindingForge struct {
 	summaries map[int64]forge.MergeRequestSummary
 	errs      map[int64]error
 	calls     atomic.Int64
+	delay     time.Duration // GetMergeRequestSummary sleeps this long (or until ctx is done) first
+	block     bool          // GetMergeRequestSummary waits for ctx.Done and returns its error
 }
 
 func (*ciFixBindingForge) ListPipelineJobs(context.Context, int64, int64) ([]forge.Job, error) {
@@ -40,8 +45,19 @@ func (*ciFixBindingForge) ProjectCIConfigPath(context.Context, int64) (string, e
 	return ".gitlab-ci.yml", nil
 }
 
-func (f *ciFixBindingForge) GetMergeRequestSummary(_ context.Context, _ int64, iid int64) (forge.MergeRequestSummary, error) {
+func (f *ciFixBindingForge) GetMergeRequestSummary(ctx context.Context, _ int64, iid int64) (forge.MergeRequestSummary, error) {
 	f.calls.Add(1)
+	if f.block {
+		<-ctx.Done()
+		return forge.MergeRequestSummary{}, ctx.Err()
+	}
+	if f.delay > 0 {
+		select {
+		case <-time.After(f.delay):
+		case <-ctx.Done():
+			return forge.MergeRequestSummary{}, ctx.Err()
+		}
+	}
 	if err := f.errs[iid]; err != nil {
 		return forge.MergeRequestSummary{}, err
 	}
@@ -185,6 +201,94 @@ func TestCIFixBindingRouteLiveDB(t *testing.T) {
 			}
 			if stored == nil || *stored != tc.wantBound {
 				t.Fatalf("stored ci_fix_mr_iid = %v, want %d", stored, tc.wantBound)
+			}
+		})
+	}
+}
+
+// TestCIFixCreateOutlivesServerWriteTimeoutLiveDB serves the route through a real listener whose
+// WriteTimeout is shorter than the PR-binding lookup, which the recorder-based test cannot expose:
+// the handler must extend the write deadline so a slow lookup still delivers its 201, and a lookup
+// that hits its budget still delivers its 502 (issue #4079).
+func TestCIFixCreateOutlivesServerWriteTimeoutLiveDB(t *testing.T) {
+	h, router, pool := cliLiveDB(t)
+	h.cfg.CIFixMaxJobs = 5
+	h.cfg.CIFixLogTailBytes = 4096
+	h.wsvc.SetTxBeginner(pool)
+
+	owner := cliSeedUser(t, pool, false)
+	cliMustExec(t, pool, `INSERT INTO user_secrets (id, user_id, kind, label, is_default, ciphertext, sealed_with)
+	          VALUES ($1, $2, 'anthropic_token', 'anthropic-default', true, $3, 'master')`, uuid.New(), owner, []byte("ct"))
+	uzc := cliMintToken(t, pool, owner, clitoken.ScopeUser)
+	connID := rmSeedConn(t, pool, owner)
+
+	oldBudget, oldGrace := workersvc.CIFixBindingLookupBudget, ciFixCreateResponseGrace
+	t.Cleanup(func() { workersvc.CIFixBindingLookupBudget, ciFixCreateResponseGrace = oldBudget, oldGrace })
+	ciFixCreateResponseGrace = 200 * time.Millisecond
+
+	srv := httptest.NewUnstartedServer(router)
+	srv.Config.WriteTimeout = 300 * time.Millisecond
+	srv.Start()
+	t.Cleanup(srv.Close)
+
+	cases := []struct {
+		name     string
+		project  int64
+		budget   time.Duration
+		delay    time.Duration
+		block    bool
+		wantCode int
+		wantBody string
+	}{
+		{"slow lookup still delivers the 201", 4079101, 2 * time.Second, 600 * time.Millisecond, false, http.StatusCreated, ""},
+		{"lookup hitting its budget still delivers the 502", 4079102, 800 * time.Millisecond, 0, true, http.StatusBadGateway, "could not verify the branch's pull request"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			workersvc.CIFixBindingLookupBudget = tc.budget
+			repoID := rmSeedRepo(t, pool, connID, tc.project, true)
+			ref := fmt.Sprintf("agent/issue-%d", tc.project)
+			cliMustExec(t, pool, `INSERT INTO pipeline_statuses (repo_id, ref, pipeline_id, sha, status, web_url, synced_at)
+			          VALUES ($1, $2, $3, 'abc1234', 'failed', 'https://forge.e2e/p', now())`, repoID, ref, tc.project*10)
+			iid := tc.project * 10
+			ciFixBindingSeedPR(t, pool, owner, repoID, ref, iid, time.Hour)
+
+			ff := &ciFixBindingForge{
+				summaries: map[int64]forge.MergeRequestSummary{iid: ciFixBindingSummary(iid, forge.MRStateOpened, ref)},
+				delay:     tc.delay, block: tc.block,
+			}
+			h.forgeFactory = func(string, string, []byte) (forge.Forge, error) { return ff, nil }
+			h.wsvc.SetForges(ciFixBindingBuilder{f: ff})
+
+			req, err := http.NewRequest(http.MethodPost, srv.URL+fmt.Sprintf("/api/repos/%s/ci-fix-runs", repoID), strings.NewReader(fmt.Sprintf(`{"ref":%q}`, ref)))
+			if err != nil {
+				t.Fatalf("build request: %v", err)
+			}
+			req.Header.Set("Authorization", "Bearer "+uzc)
+			req.Header.Set("Content-Type", "application/json")
+			client := &http.Client{Timeout: 10 * time.Second}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("POST over a real listener: %v (the write deadline was not extended)", err)
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read body: %v", err)
+			}
+			if resp.StatusCode != tc.wantCode {
+				t.Fatalf("POST ci-fix = %d, want %d\nbody: %s", resp.StatusCode, tc.wantCode, body)
+			}
+			if tc.wantBody != "" && !strings.Contains(string(body), tc.wantBody) {
+				t.Fatalf("body %q does not contain %q", body, tc.wantBody)
+			}
+			if tc.wantCode == http.StatusCreated {
+				var created struct {
+					Run map[string]json.RawMessage `json:"run"`
+				}
+				if err := json.Unmarshal(body, &created); err != nil || created.Run == nil {
+					t.Fatalf("decode 201 body: %v (%s)", err, body)
+				}
 			}
 		})
 	}

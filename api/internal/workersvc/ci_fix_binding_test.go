@@ -177,9 +177,9 @@ func TestCIFixBindingRefusesInvalidCandidatesWithoutForgeCalls(t *testing.T) {
 }
 
 func TestCIFixBindingForgeTimeoutIsUnavailable(t *testing.T) {
-	old := ciFixBindingLookupBudget
-	ciFixBindingLookupBudget = 50 * time.Millisecond
-	t.Cleanup(func() { ciFixBindingLookupBudget = old })
+	old := CIFixBindingLookupBudget
+	CIFixBindingLookupBudget = 50 * time.Millisecond
+	t.Cleanup(func() { CIFixBindingLookupBudget = old })
 
 	ff := &bindingForge{answers: map[int64]bindingAnswer{
 		5: bindSum(5, forge.MRStateOpened, bindRef),

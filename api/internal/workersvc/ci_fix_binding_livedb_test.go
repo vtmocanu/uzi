@@ -8,9 +8,11 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // ci_fix_binding_livedb_test.go pins issue #4079 against a REAL Postgres: a ci_fix on a
@@ -317,4 +319,88 @@ func svcForCheck(t *testing.T, env codexTestEnv, userID, repoID uuid.UUID) (uuid
 	_, err := env.pool.Exec(env.ctx, `INSERT INTO runs (id, user_id, repo_id, kind, issue_title, issue_description, pipeline_id, pipeline_ref, status, harness)
 	          VALUES ($1, $2, $3, $4, 't', 'd', 41011, 'agent/issue-41011', 'completed', 'claude')`, id, userID, repoID, runkind.CIFix)
 	return id, err
+}
+
+// ListCIFixBindingCandidates returns the distinct recorded iids for exactly (user, repo, branch),
+// newest first by max(created_at), ignoring other users, repos, branches and NULL mr_iid; nine
+// distinct ids refuse the create as unresolved with no forge call, eight do not.
+func TestCIFixBindingCandidateQueryBoundaryLiveDB(t *testing.T) {
+	const ref = "agent/issue-41013"
+	now := time.Now()
+
+	t.Run("query scoping and distinct newest-first", func(t *testing.T) {
+		env, svc, userID, repoID := branchSerializeEnv(t)
+		otherUser, otherRepo := seedClaudeOnlyOriginUser(t, env)
+		_ = svc
+		// 41 is the older PR (3 runs), 42 the newer (2 runs, newest overall).
+		for i, age := range []time.Duration{72, 71, 70} {
+			seedRecordedPR(t, env, userID, repoID, ref, 41, now.Add(-age*time.Hour+time.Duration(i)*time.Minute))
+		}
+		seedRecordedPR(t, env, userID, repoID, ref, 42, now.Add(-2*time.Hour))
+		seedRecordedPR(t, env, userID, repoID, ref, 42, now.Add(-1*time.Hour))
+		// Unrelated records.
+		seedRecordedPR(t, env, otherUser, repoID, ref, 43, now)       // another user
+		seedRecordedPR(t, env, userID, otherRepo, ref, 44, now)       // another repo
+		seedRecordedPR(t, env, userID, repoID, ref+"-other", 45, now) // another branch
+		env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, branch, status, harness)
+		          VALUES ($1, $2, $3, 'issue', 410139, 'nil', 'd', $4, 'completed', 'claude')`, uuid.New(), userID, repoID, ref)
+
+		got, err := env.q.ListCIFixBindingCandidates(env.ctx, store.ListCIFixBindingCandidatesParams{
+			UserID: userID, RepoID: repoID, Ref: pgtype.Text{String: ref, Valid: true},
+		})
+		if err != nil {
+			t.Fatalf("ListCIFixBindingCandidates: %v", err)
+		}
+		if len(got) != 2 || got[0] != 42 || got[1] != 41 {
+			t.Fatalf("candidates = %v, want [42 41]", got)
+		}
+	})
+
+	seedN := func(env codexTestEnv, userID, repoID uuid.UUID, n int) map[int64]bindingAnswer {
+		answers := map[int64]bindingAnswer{}
+		for i := 0; i < n; i++ {
+			iid := int64(4101300 + i)
+			seedRecordedPR(t, env, userID, repoID, ref, iid, now.Add(-time.Duration(i+1)*time.Hour))
+			answers[iid] = bindSum(iid, forge.MRStateMerged, ref)
+		}
+		return answers
+	}
+
+	t.Run("nine distinct ids overflow", func(t *testing.T) {
+		env, svc, userID, repoID := branchSerializeEnv(t)
+		ff := &bindingForge{answers: seedN(env, userID, repoID, 9)}
+		svc.SetForges(bindingBuilder{ff})
+		got, err := env.q.ListCIFixBindingCandidates(env.ctx, store.ListCIFixBindingCandidatesParams{
+			UserID: userID, RepoID: repoID, Ref: pgtype.Text{String: ref, Valid: true},
+		})
+		if err != nil || len(got) != 9 {
+			t.Fatalf("query rows = %d, %v; want 9 rows", len(got), err)
+		}
+		_, err = svc.CreateAutoCIFixRun(env.ctx, userID, repoID, ref, "Fix CI", "d", ciFixSnapshot(ref, 4101301), nil)
+		if !errors.Is(err, ErrCIFixPRUnresolved) {
+			t.Fatalf("err = %v, want ErrCIFixPRUnresolved", err)
+		}
+		if ff.callCount() != 0 {
+			t.Fatalf("forge calls = %d, want 0", ff.callCount())
+		}
+		if c := countCIFixRuns(t, env, repoID); c != 0 {
+			t.Fatalf("ci_fix runs = %d, want 0", c)
+		}
+	})
+
+	t.Run("eight distinct ids are not an overflow", func(t *testing.T) {
+		env, svc, userID, repoID := branchSerializeEnv(t)
+		ff := &bindingForge{answers: seedN(env, userID, repoID, 8)}
+		svc.SetForges(bindingBuilder{ff})
+		run, err := svc.CreateAutoCIFixRun(env.ctx, userID, repoID, ref, "Fix CI", "d", ciFixSnapshot(ref, 4101302), nil)
+		if err != nil {
+			t.Fatalf("CreateAutoCIFixRun = %v, want success", err)
+		}
+		if run.CiFixMrIid.Valid {
+			t.Fatalf("CiFixMrIid = %+v, want unbound", run.CiFixMrIid)
+		}
+		if ff.callCount() != 8 {
+			t.Fatalf("forge calls = %d, want 8", ff.callCount())
+		}
+	})
 }

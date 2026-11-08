@@ -26,9 +26,10 @@ const ciFixBindingMaxCandidates = 8
 // JSON number carries exactly).
 const maxSafeMRIID = 9007199254740991
 
-// ciFixBindingLookupBudget bounds the whole candidate read plus every forge call of one
-// binding resolution. A var so a test can shorten it.
-var ciFixBindingLookupBudget = 15 * time.Second
+// CIFixBindingLookupBudget bounds the whole candidate read plus every forge call of one
+// binding resolution. Exported so the manual Fix CI handler can size its response write
+// deadline from it; a var so a test can shorten it.
+var CIFixBindingLookupBudget = 15 * time.Second
 
 // ErrCIFixPRUnresolved is matched (errors.Is) by *CIFixPRUnresolvedError: the branch's
 // pull-request association cannot be determined unambiguously. It is a verdict about
@@ -102,7 +103,7 @@ func ciFixLookupFailed(op string, err error) error {
 // binds; else the fix is unbound (Valid=false). checked is the candidate set the
 // decision was made on, for the in-transaction recheck.
 func (s *Service) resolveCIFixBinding(ctx context.Context, row store.GetRepoForUserRow, userID, repoID uuid.UUID, ref string) (bound pgtype.Int8, checked []int64, err error) {
-	ctx, cancel := context.WithTimeout(ctx, ciFixBindingLookupBudget)
+	ctx, cancel := context.WithTimeout(ctx, CIFixBindingLookupBudget)
 	defer cancel()
 
 	cands, err := s.q.ListCIFixBindingCandidates(ctx, store.ListCIFixBindingCandidatesParams{

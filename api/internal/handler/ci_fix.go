@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -15,6 +16,10 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
+
+// ciFixCreateResponseGrace is the time allowed to write the answer after the PR-binding
+// lookup's full budget. A var so a test can scale it.
+var ciFixCreateResponseGrace = 10 * time.Second
 
 // CreateCIFixRun queues a ci_fix run for a failed pipeline on a watched ref (PRD
 // #6). It re-validates the Fix CI preconditions server-side — the pipeline cache
@@ -85,6 +90,10 @@ func (h *Handler) CreateCIFixRun(w http.ResponseWriter, r *http.Request) {
 	title := fmt.Sprintf("Fix CI: %s pipeline #%d", ref, ps.PipelineID)
 	description := fmt.Sprintf("Diagnose and fix the failed pipeline for `%s`.\n\nFailing pipeline: %s", ref, ps.WebUrl)
 
+	// The binding lookup inside CreateCIFixRun can run for workersvc.CIFixBindingLookupBudget,
+	// after the snapshot already spent part of the listener's WriteTimeout. Reset the write
+	// deadline so the 201/409/502 is always deliverable (worker_publish_deadline.go precedent).
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(workersvc.CIFixBindingLookupBudget + ciFixCreateResponseGrace))
 	run, err := h.wsvc.CreateCIFixRun(r.Context(), user.ID, repo.ID, ref, title, description, snapshot, ciConfigPaths)
 	if err != nil {
 		// #66 D1 layer 2: the service-layer guardrail refused. 422 with the forge.go:191
