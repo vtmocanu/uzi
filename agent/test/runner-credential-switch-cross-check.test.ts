@@ -1645,6 +1645,18 @@ describe("issue #3953 m3: the invariant guards (hold bypassed, reservation insta
           "the invariant is logged");
         assert.ok(logged.some((l) => l.level === "warn" && l.message.includes("closed with candidate transport reservation held")),
           "the close logs the reservation it could not release");
+        if (guard.startsWith("G2")) {
+          // Pins close-before-report ordering at dispatchFailure's invariant arm (the batcher is closed
+          // before reportGenericFailure), not that dropping the failure diagnostic is desired: the
+          // diagnostic emitted after the close is refused, and the close persisted one unassigned
+          // event fewer than a report-first order would have held.
+          const late = logged.find((l) => l.level === "warn" && l.message.includes("run message emitted after the batcher closed; not delivered"));
+          assert.ok(late, `a post-close emit is refused and logged: ${JSON.stringify(logged.map((l) => [l.level, l.message]))}`);
+          assert.equal(late.fields?.kind, "error");
+          const closed = logged.find((l) => l.level === "warn" && l.message.includes("closed with candidate transport reservation held"));
+          assert.ok(typeof closed?.fields?.unassigned === "number" && closed.fields.unassigned < 3,
+            `the close precedes the failure report: ${JSON.stringify(closed?.fields)}`);
+        }
         assert.ok(!everyState(c.run_id).some((x) => x.status === "running" && x.candidate_digest === digest), "no approval stored");
         assert.equal(api.crossCheckRequests.length, 0);
         assert.ok(outbox.hasUndrainedMessages(c.run_id), "the batcher close persisted the assigned replay");
@@ -1665,6 +1677,39 @@ describe("issue #3953 m3: the invariant guards (hold bypassed, reservation insta
   }
 });
 
+/** Record every hold SteeringChannel.holdCredentialSwitch hands out and each close() call it receives
+ *  (the real close still runs). Restored after the test via `restorers`. */
+function spyHolds(): { closes: { service: boolean }[] }[] {
+  const proto = SteeringChannel.prototype as unknown as {
+    holdCredentialSwitch: () => { close(o: { service: boolean }): void } };
+  const original = proto.holdCredentialSwitch;
+  const holds: { closes: { service: boolean }[] }[] = [];
+  proto.holdCredentialSwitch = function (this: unknown) {
+    const handle = original.call(this);
+    const seen = { closes: [] as { service: boolean }[] };
+    const close = handle.close.bind(handle);
+    handle.close = (o) => { seen.closes.push(o); close(o); };
+    holds.push(seen);
+    return handle;
+  };
+  restorers.push(() => { proto.holdCredentialSwitch = original; });
+  return holds;
+}
+
+describe("issue #3990: a failed checker leg closes its credential-switch hold without servicing it", () => {
+  it("a reservation that cannot be installed ends the run failed, closes the hold once unserviced and stores nothing", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const holds = spyHolds();
+    const d = await drive({ capture: "giveup",
+      setup: () => { MessageBatcher.prototype.reserveCandidateTransport = () => { throw new Error("no transport"); }; } });
+    failedWith(d.c.run_id, "plan cross-check: transport reservation unavailable");
+    assert.equal(holds.length, 1, "the hold opened before the reservation was attempted, once");
+    assert.deepEqual(holds[0]!.closes, [{ service: false }], "closed exactly once, never serviced");
+    assert.deepEqual(d.storage, [], "no checker approval was stored");
+    assert.ok(!everyState(d.c.run_id).some((s) => s.status === "running" && s.candidate_digest !== undefined), "no approval-bearing report");
+    assert.equal(d.posts().length, 0, "the checker was never asked");
+  });
+});
+
 describe("issue #3953 m3: semantic coverage forces a human gate after the checker approve (real SemanticPlanningGate)", () => {
   const milestones = [{ id: "m1", title: "A" }];
   const submitted = (issueIid: number | null) => {
@@ -1672,7 +1717,7 @@ describe("issue #3953 m3: semantic coverage forces a human gate after the checke
     p.criteria[0]!.citations[0]!.source_id = "issue:" + issueIid;
     return p;
   };
-  function semanticRig(c: ReturnType<typeof claim>, events: string[]) {
+  function semanticRig(c: ReturnType<typeof claim>, events: string[], switchWhilePending = true) {
     // Isolate gate ordering from native alternate-object capture; no repository mutation.
     git.capturePlanningDiff = async () => Buffer.from("");
     const server = semanticServer(client, events);
@@ -1685,10 +1730,12 @@ describe("issue #3953 m3: semantic coverage forces a human gate after the checke
     const switchSeen = watchSwitchDelivery();
     api.crossCheckHandler = async ({ runId, body }) => {
       const { stage: _stage, claim_generation: _generation, round = 1, ...candidate } = body;
-      events.push("switch-requested");
-      api.requestCredentialSwitch(runId, 1);
-      assert.ok(await handlerWait(() => switchSeen.delivered), "the worker polled the switch while the checker is pending");
-      assert.ok(await handlerWait(() => switchSeen.latched()), "the hold latched the switch");
+      if (switchWhilePending) {
+        events.push("switch-requested");
+        api.requestCredentialSwitch(runId, 1);
+        assert.ok(await handlerWait(() => switchSeen.delivered), "the worker polled the switch while the checker is pending");
+        assert.ok(await handlerWait(() => switchSeen.latched()), "the hold latched the switch");
+      }
       const identity = server.compiled().candidate;
       return { status: 200, body: {
         result: "candidate", round, checker_run_id: child, candidate_digest: identity.digest, candidate_generation: 1,
@@ -1768,6 +1815,41 @@ describe("issue #3953 m3: semantic coverage forces a human gate after the checke
     assert.equal(verdict!.approval, undefined, "a human decided; the checker approve is evidence only");
     assert.ok(!everyState(c.run_id).some((s) => s.status === "running" && s.candidate_digest !== undefined),
       "the checker approve was never stored as an auto approval");
+  });
+
+  it("issue #3990: a switch that surfaces in the coverage review after the approve stashes it; the re-run adopts the approve and takes no human gate", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const c = semanticClaim();
+    const events: string[] = [];
+    // The checker's approve is delivered with no switch pending, so the hold is serviced with nothing latched and
+    // the approve is NOT stashed at the control exit. The switch arrives only inside the coverage review.
+    const server = semanticRig(c, events, false);
+    const transport = await boundedTransport("claude", server.report, events);
+    const status = client.semanticCoverageStatus.bind(client);
+    let raised = false;
+    client.semanticCoverageStatus = async (...args) => {
+      if (!raised && api.crossCheckRequests.some((r) => r.method === "POST")) {
+        raised = true;
+        events.push("switch-in-review");
+        api.requestCredentialSwitch(c.run_id, 1);
+        assert.ok(await until(() => args[2]?.aborted === true, 4000), "the worker tripped the switch into the review's signal");
+        args[2]!.throwIfAborted();
+      }
+      return status(...args);
+    };
+    const verdicts: unknown[] = [];
+    try {
+      await runner(semanticExec(c, verdicts), fakeGitlab().gitlab, undefined, { semanticCoverageTestTransport: transport,
+        planCrossCheckTiming: timing, recoveryRetryMs: 1, planApprovalTimeoutMs: 1500 }).execute(c);
+    } finally { client.semanticCoverageStatus = status; }
+    assert.equal(raised, true, "the switch surfaced after the checker's approve");
+    assert.equal(api.crossCheckRequests.filter((r) => r.method === "POST").length, 1, "never resubmitted");
+    assert.equal(gates(c.run_id).length, 0, JSON.stringify(everyState(c.run_id).map((s) => [s.status, s.failure_reason])));
+    assert.ok(everyState(c.run_id).some((s) => s.status === "running" && s.candidate_digest !== undefined),
+      "the adopted approve was stored: " + JSON.stringify(everyState(c.run_id).map((s) => [s.status, s.failure_reason])));
+    const [verdict] = verdicts as { kind: string; approval?: string }[];
+    assert.equal(verdict?.kind, "approve", JSON.stringify(verdicts));
+    assert.ok(!everyState(c.run_id).some((s) => s.failure_reason !== undefined && s.failure_reason !== null),
+      JSON.stringify(everyState(c.run_id).map((s) => [s.status, s.failure_reason])));
   });
 
   it("a stashed approve whose candidate digest differs from the re-run's compile fails closed", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
