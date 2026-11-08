@@ -23,6 +23,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       getUsage: vi.fn(),
       getAdminUsage: vi.fn(),
       getRecoveryHolds: vi.fn(),
+      listUsers: vi.fn(),
     },
   };
 });

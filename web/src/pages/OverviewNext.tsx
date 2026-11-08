@@ -5,7 +5,8 @@
 
 import { useState } from "react";
 import { Link } from "react-router-dom";
-import { overviewScope, ISSUE_WORK_SCOPE_KEY } from "../lib/prefs";
+import { overviewScope, ISSUE_WORK_SCOPE_KEY, USAGE_SCOPE_KEY } from "../lib/prefs";
+import { executingPeople, peopleModel } from "../lib/overviewPeople";
 import { useAuth } from "../auth/AuthContext";
 import { useNow } from "../lib/useNow";
 import { useDemoMode } from "../lib/demoMode";
@@ -31,17 +32,23 @@ import { CapacityRail } from "../components/CapacityRail";
 import { HeldWorkCard } from "../components/HeldWorkCard";
 import { HealthPlatformLine } from "../components/HealthPlatformLine";
 import { HealthChip } from "../components/HealthChip";
+import { PeopleChip } from "../components/PeopleChip";
 import { InShellHeader } from "../components/PageHeaderSlot";
 import { PageHeader } from "../components/ui";
 
 export function OverviewNext() {
   const demo = useDemoMode();
   const { user } = useAuth();
-  const { data, usageWindow, changeUsageWindow, adminRuns, holds, holdsFailed } = useOverviewData({
+  const { data, usageWindow, changeUsageWindow, adminRuns, adminUsers, holds, holdsFailed } = useOverviewData({
     includeAdminRuns: true,
     includeRecoveryHolds: true,
+    includeAdminUsers: true,
   });
   const now = useNow(30_000);
+  // The Usage card's scope is owned here so the People chip's "Usage by user" can switch it to
+  // All users; focusByUser is the counter that tells the card to move focus to By user.
+  const [usageScope, setUsageScope] = useState(() => overviewScope.get(USAGE_SCOPE_KEY));
+  const [focusByUser, setFocusByUser] = useState(0);
   // The stage picked on the issue-work line; the Runs widget filters its groups by it.
   const [lineStage, setLineStage] = useState<IssueStage | null>(null);
   // The admin's remembered Issue work scope (#4052); written only on a click, so a scope
@@ -79,8 +86,29 @@ export function OverviewNext() {
         counts: overviewCounts(factoryRows ?? ownRuns),
         acrossFactory: factoryRows != null,
         adminUnavailable,
+        executingPeople: factoryRows ? executingPeople(factoryRows, user.email) : undefined,
       })
     : undefined;
+  // The People chip's model: admins only, from the viewer's own runs plus the admin list, users
+  // and usage. Each source degrades on its own (see peopleModel).
+  const people = isAdmin
+    ? peopleModel({
+        ownRuns,
+        adminRuns,
+        users: adminUsers.users,
+        usersFailed: adminUsers.failed,
+        viewer: { email: user.email },
+        adminUsage: data?.adminUsage,
+        usageTargetAvailable: data?.selfUsage != null,
+        now,
+        demo,
+      })
+    : null;
+  const showUsageByUser = () => {
+    setUsageScope("all");
+    overviewScope.set(USAGE_SCOPE_KEY, "all");
+    setFocusByUser((n) => n + 1);
+  };
   const joined = workerJoined(data?.workers ?? []);
   const ready = data ? setupComplete(data, joined) : false;
 
@@ -94,6 +122,7 @@ export function OverviewNext() {
           actions={
             <>
               {isAdmin && <HealthChip />}
+              {people && <PeopleChip model={people} onShowUsageByUser={showUsageByUser} />}
               <Link to="/dashboard" className="text-sm font-medium text-brand hover:text-brand-hover">
                 Back to the current Overview
               </Link>
@@ -171,6 +200,12 @@ export function OverviewNext() {
           window={usageWindow}
           onWindowChange={changeUsageWindow}
           viewerId={user.id}
+          scope={usageScope}
+          onScopeChange={(s) => {
+            setUsageScope(s);
+            overviewScope.set(USAGE_SCOPE_KEY, s);
+          }}
+          focusByUser={focusByUser}
         />
       )}
     </div>

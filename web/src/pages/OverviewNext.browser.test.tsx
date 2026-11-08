@@ -31,6 +31,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       adminListRuns: vi.fn(),
       getRecoveryHolds: vi.fn(),
       getAdminHealth: vi.fn(),
+      listUsers: vi.fn(),
     },
   };
 });
@@ -74,6 +75,7 @@ beforeEach(() => {
   mockApi.getUsage.mockResolvedValue(emptySelf());
   mockApi.getAdminUsage.mockResolvedValue({ factory: emptySelf(), users: [], earliest_run: null });
   mockApi.getAdminHealth.mockResolvedValue(healthySilentDoc());
+  mockApi.listUsers.mockResolvedValue({ users: [] });
   mockApi.getRecoveryHolds.mockResolvedValue({
     aggregate: { open_holds: 0, admission_counted_holds: 0, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0 },
     holds: [],
