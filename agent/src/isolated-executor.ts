@@ -90,6 +90,10 @@ const RUN_SECRETS_DIR = "/run/uzi-secrets";
 const PINNED_BUILTIN_AGENTS: ReadonlySet<string> = new Set(["claude", "general-purpose", "statusline-setup"]);
 const PINNED_BUILTIN_SKILLS: ReadonlySet<string> = new Set(["doctor"]);
 
+/** The SDK's end-turn tool for `outputFormat: {type: "json_schema"}`, recorded in
+ *  test/fixtures/claude-structured-output-0.3.310.json (init tools and assistant tool_use name). */
+export const STRUCTURED_OUTPUT_CARRIER = "StructuredOutput" as const;
+
 /**
  * What an isolated session is allowed to expose, in every layer at once: the tool gate, the
  * init check and the SDK options all read the same surface, so they cannot drift apart. The
@@ -97,6 +101,9 @@ const PINNED_BUILTIN_SKILLS: ReadonlySet<string> = new Set(["doctor"]);
  * its own with the result server, and the single product-skills plugin only when it has skills.
  */
 export interface IsolationSurface {
+  /** Set only by the Claude checker when it sets `outputFormat`: the one extra tool name the gate
+   *  admits (exact equality, after the init latch) and the init check tolerates beside `tools`. */
+  readonly structuredOutputCarrier?: typeof STRUCTURED_OUTPUT_CARRIER;
   /** The exact effective tool list (the init frame must be set-equal to it). */
   readonly tools: readonly string[];
   /** The exact MCP server names (set-equal). */
@@ -180,10 +187,11 @@ export interface InitGate {
  *  the surface always. */
 function buildIsolatedToolGate(gate: InitGate, log: Logger, surface: IsolationSurface): (input: HookInput) => Promise<HookJSONOutput> {
   const allowed = new Set(surface.tools);
+  const carrier = surface.structuredOutputCarrier;
   return async (input: HookInput): Promise<HookJSONOutput> => {
     if (input.hook_event_name !== "PreToolUse") return {};
     let reason: string | undefined;
-    if (!allowed.has(input.tool_name)) reason = REASON_TOOL_NOT_ALLOWED;
+    if (!allowed.has(input.tool_name) && !(carrier !== undefined && input.tool_name === carrier)) reason = REASON_TOOL_NOT_ALLOWED;
     else if (!gate.passed) reason = REASON_INIT_PENDING;
     if (!reason) return {};
     log.warn("isolated tool gate denied a tool call", { tool: input.tool_name, reason });
@@ -237,8 +245,11 @@ function checkIsolatedInitRefusal(message: unknown, surface: IsolationSurface): 
   if (!tools) return { code: "init_malformed", message: "init frame has a malformed tool list" };
   const want = new Set(surface.tools);
   const got = new Set(tools);
-  const extra = [...got].filter((t) => !want.has(t));
   const missing = [...want].filter((t) => !got.has(t));
+  // The carrier may appear in the init list, once, beside the surface tools; nothing else may.
+  const carrier = surface.structuredOutputCarrier;
+  if (carrier !== undefined) want.add(carrier);
+  const extra = [...got].filter((t) => !want.has(t));
   if (extra.length || missing.length || tools.length !== got.size) {
     return { code: "init_tools", message: `effective tool set differs from the fixed set (extra: ${extra.join(",") || "none"}; missing: ${missing.join(",") || "none"})` };
   }

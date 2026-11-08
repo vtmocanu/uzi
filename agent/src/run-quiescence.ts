@@ -1414,6 +1414,9 @@ export interface ReapDeps {
    *  (e.g. its own TypeScript loader's service process, which inherits its env) is its own. */
   excludeAllDescendants?: boolean;
   reportBudget?: { signal: AbortSignal; deadline: number };
+  /** issue #3980: absolute epoch-ms deadline (see {@link QuiesceRunRequest.deadlineAt}). Unlike
+   *  `reportBudget` it keeps the normal multi-pass loop and kill behaviour, only capped at the deadline. */
+  deadlineAt?: number;
 }
 
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -1452,12 +1455,14 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
     return { state: "unverified", processes: [], killed: [], detail: "proc table helper work context mismatch" };
   let tableFailure: unknown;
   let bytes = 0;
+  const gateDeadline = deps.deadlineAt;
   const bounded = <T>(read: () => T, cap?: number): T => {
     try {
       ambient?.check();
       MaintenanceResources.checkIfActive();
       reportBudget?.signal?.throwIfAborted();
       if (reportBudget && Date.now() >= reportBudget.deadline) throw new Error("process proof deadline");
+      if (gateDeadline !== undefined && (deps.now ?? Date.now)() >= gateDeadline) throw new Error("process proof deadline");
       const result = read();
       if (typeof result === "string") {
         const work = helperWork.getStore();
@@ -1479,7 +1484,7 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
       throw error;
     }
   };
-  const table: ProcTable = reportBudget || ambient || scoped ? {
+  const table: ProcTable = reportBudget || ambient || scoped || gateDeadline !== undefined ? {
     listPids: () => bounded(() => {
       const pids = baseTable.listPids();
       const work = helperWork.getStore();
@@ -1507,7 +1512,7 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
   const sleep = deps.sleep ?? defaultSleep;
   const now = deps.now ?? Date.now;
   // Report observations never kill a writer after byte inspection.
-  const deadline = reportBudget ? now() : now() + (deps.deadlineMs ?? view?.deadlineMs ?? REAP_DEADLINE_MS);
+  const deadline = reportBudget ? now() : Math.min(now() + (deps.deadlineMs ?? view?.deadlineMs ?? REAP_DEADLINE_MS), gateDeadline ?? Infinity);
   const selfPid = deps.selfPid ?? process.pid;
   const killed: number[] = [];
   let last: ScanResult;
@@ -1516,8 +1521,13 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
       return { state: "unverified", processes: [], killed, detail: "maintenance deadline exhausted" };
     }
     MaintenanceResources.checkIfActive();
+    // issue #3980: a scan is admitted only before the gate deadline.
+    if (gateDeadline !== undefined && now() >= gateDeadline) {
+      return { state: "unverified", processes: [], killed, detail: "process proof deadline" };
+    }
     last = scanOnce(req, table, selfPid, deps.excludeAllDescendants ?? false);
-    if (last.tableError || tableFailure || helperWork.getStore()?.failed || (ambient && (ambient.signal.aborted || ambient.remainingMs() <= 0)) || (reportBudget && Date.now() >= reportBudget.deadline)) {
+    if (last.tableError || tableFailure || helperWork.getStore()?.failed || (ambient && (ambient.signal.aborted || ambient.remainingMs() <= 0)) || (reportBudget && Date.now() >= reportBudget.deadline) ||
+        (gateDeadline !== undefined && now() >= gateDeadline)) {
       return { state: "unverified", processes: [], killed, detail: last.tableError ?? String(tableFailure ?? (helperWork.getStore()?.failed ? "helper work exhausted" : "process proof deadline")) };
     }
     if (exclusiveScans !== undefined) {
@@ -1538,10 +1548,12 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
       if (p.startTime === undefined || currentStartTime !== p.startTime) continue;
       ambient?.check();
       if (remaining && remaining() <= 0) break;
+      if (gateDeadline !== undefined && now() >= gateDeadline) break;
       kill(p.pid);
       killed.push(p.pid);
     }
-    const delay = deps.intervalMs ?? view?.intervalMs ?? REAP_INTERVAL_MS;
+    const delay = gateDeadline === undefined ? deps.intervalMs ?? view?.intervalMs ?? REAP_INTERVAL_MS
+      : Math.max(0, Math.min(deps.intervalMs ?? view?.intervalMs ?? REAP_INTERVAL_MS, gateDeadline - now()));
     if (ambient) await ambient.raceIO(() => sleep(Math.min(delay, remaining!())));
     else await sleep(delay);
   }
@@ -1918,7 +1930,9 @@ function parseHelperVerdict(stdout: string): ProcessQuiescence {
  */
 async function reapProcessesViaHelper(
   req: HelperScanRequest,
-  opts: { producerWorkLimits?: HelperWorkLimits; spawnHelper?: HelperSpawn; timeoutMs?: number; helperTmp?: HelperTmp; reportBudget?: { signal: AbortSignal; deadline: number } } = {},
+  opts: { producerWorkLimits?: HelperWorkLimits; spawnHelper?: HelperSpawn; timeoutMs?: number; helperTmp?: HelperTmp; reportBudget?: { signal: AbortSignal; deadline: number };
+    /** issue #3980: absolute epoch-ms deadline (see {@link QuiesceRunRequest.deadlineAt}). */
+    deadlineAt?: number } = {},
 ): Promise<ProcessQuiescence> {
   if (uidSplitActive() && hasReaperCaptureScope()) {
     return { state: "unverified", processes: [], killed: [], detail: "raw scoped helper refused" };
@@ -1935,6 +1949,13 @@ async function reapProcessesViaHelper(
   if (scoped) req = { ...req, reportDeadline: Math.floor(Math.min(req.reportDeadline ?? Infinity,
     Date.now() + MaintenanceResources.remainingMsIfActive())) };
   const unverified = (detail: string): ProcessQuiescence => ({ state: "unverified", processes: [], killed: [], detail });
+  // issue #3980: the absolute gate-checkpoint deadline. Every stage below is admitted only before it,
+  // the helper and the private-temp commands are killed and JOINED at it, and an expiry is unverified.
+  const gateDeadline = opts.deadlineAt;
+  const gateExpired = (): boolean => gateDeadline !== undefined && Date.now() >= gateDeadline;
+  if (gateExpired()) return unverified("gate checkpoint deadline exhausted");
+  const gateBudget = gateDeadline === undefined ? undefined
+    : { signal: AbortSignal.timeout(Math.max(1, gateDeadline - Date.now())), deadline: gateDeadline };
   let argv: string[];
   try {
     argv = helperArgv();
@@ -1948,7 +1969,7 @@ async function reapProcessesViaHelper(
     MaintenanceResources.checkIfActive();
     opts.reportBudget?.signal.throwIfAborted();
     if (opts.reportBudget && Date.now() >= opts.reportBudget.deadline) throw new Error("report helper setup deadline");
-    tmpDir = await helperTmp.make(opts.reportBudget);
+    tmpDir = await helperTmp.make(opts.reportBudget ?? gateBudget);
   } catch (err) {
     return unverified(`quiescence helper TMPDIR unavailable: ${(err as Error).message}`);
   }
@@ -1974,6 +1995,11 @@ async function reapProcessesViaHelper(
   if (opts.reportBudget && (opts.reportBudget.signal.aborted || Date.now() >= opts.reportBudget.deadline)) {
     if (!ambient && !scoped) await Promise.resolve().then(() => helperTmp.remove(tmpDir, cleanupBudget())).catch(() => undefined);
     return unverified("report helper setup expired");
+  }
+  if (gateExpired()) {
+    // Setup crossed the deadline: no helper is launched, and the private temp is removed (awaited).
+    await Promise.resolve().then(() => helperTmp.remove(tmpDir, cleanupBudget())).catch(() => undefined);
+    return unverified("gate checkpoint deadline exhausted");
   }
   const wrapped = runnerCommand(process.execPath, argv);
   const helperEnv: NodeJS.ProcessEnv = { PATH: runnerPath() ?? HELPER_PATH, TMPDIR: tmpDir, TSX_DISABLE_CACHE: "1" };
@@ -2003,6 +2029,12 @@ async function reapProcessesViaHelper(
           () => resolve(opts.reportBudget!.signal.aborted || Date.now() >= opts.reportBudget!.deadline
             ? unverified("report helper cleanup expired") : r),
           () => resolve(unverified("report helper cleanup failed")));
+      } else if (gateDeadline !== undefined) {
+        // The helper has closed. Await the private-temp removal before resolving; an expiry at any
+        // stage turns a quiescent verdict unverified (a non-quiescent one already fails closed).
+        Promise.resolve().then(() => helperTmp.remove(tmpDir, cleanupBudget())).then(
+          () => resolve(r.state === "quiescent" && gateExpired() ? unverified("gate checkpoint deadline exhausted") : r),
+          () => resolve(unverified("gate checkpoint helper cleanup failed")));
       } else { removeTmp(); resolve(r); }
     };
     let reportFailure: ProcessQuiescence | undefined;
@@ -2040,10 +2072,11 @@ async function reapProcessesViaHelper(
     if (opts.reportBudget?.signal.aborted || ambient?.signal.aborted || resourceSignal?.aborted) cancelReport();
     timer = setTimeout(() => {
       killRunnerGroup(child.pid);
-      if (opts.reportBudget || ambient || scoped) reportFailure = unverified("quiescence helper timed out");
+      if (opts.reportBudget || ambient || scoped || gateDeadline !== undefined) reportFailure = unverified("quiescence helper timed out");
       else done(unverified("quiescence helper timed out"));
     }, Math.min(remaining ? Math.max(1, remaining()) : opts.timeoutMs ?? HELPER_TIMEOUT_MS, opts.reportBudget ? Math.max(1, Math.min(opts.timeoutMs ?? HELPER_TIMEOUT_MS,
-      opts.reportBudget.deadline - Date.now())) : opts.timeoutMs ?? HELPER_TIMEOUT_MS));
+      opts.reportBudget.deadline - Date.now())) : opts.timeoutMs ?? HELPER_TIMEOUT_MS,
+      gateDeadline === undefined ? Infinity : Math.max(1, gateDeadline - Date.now())));
     const out: Buffer[] = [];
     let outBytes = 0;
     if (scoped) {
@@ -2055,7 +2088,7 @@ async function reapProcessesViaHelper(
         outBytes += c.length;
         if (outBytes > HELPER_STDOUT_MAX) {
           killRunnerGroup(child.pid);
-          if (opts.reportBudget || ambient) reportFailure = unverified("quiescence helper output exceeded 1 MiB");
+          if (opts.reportBudget || ambient || gateDeadline !== undefined) reportFailure = unverified("quiescence helper output exceeded 1 MiB");
           else done(unverified("quiescence helper output exceeded 1 MiB"));
           return;
         }
@@ -2068,7 +2101,7 @@ async function reapProcessesViaHelper(
     child.stdin?.on("error", () => undefined);
     child.on("error", (err) => {
       const failure = unverified(`quiescence helper spawn failed: ${err.message}`);
-      if (opts.reportBudget || ambient || scoped) { reportFailure = failure; if (ambient || scoped) killRunnerGroup(child.pid); }
+      if (opts.reportBudget || ambient || scoped || gateDeadline !== undefined) { reportFailure = failure; if (ambient || scoped || gateDeadline !== undefined) killRunnerGroup(child.pid); }
       else done(failure);
     });
     child.on("close", (code, signal) => within(() => {
@@ -2135,6 +2168,7 @@ export async function reapRunProcesses(req: ScanRequest, opts: ReapRunOptions = 
       helperTmp: opts.helperTmp,
       reportBudget: opts.reportBudget,
       producerWorkLimits: opts.producerWorkLimits,
+      ...(opts.deadlineAt === undefined ? {} : { deadlineAt: opts.deadlineAt }),
     });
   }
     // In-process work keeps actual scoped parent metering and a sticky local envelope.
@@ -2452,6 +2486,10 @@ export interface QuiesceRunRequest {
   /** The runner site asking (e.g. `finalize`, `park:after_runner_git` for a re-proof after a
    *  runner-clone git): diagnostic only, the proof itself never reads it. */
   site?: string;
+  /** issue #3980: absolute epoch-ms deadline of a bounded Claude gate checkpoint. With it, every process
+   *  read, scan, helper, scoped lane and Docker request is admitted only while time is left and ends at
+   *  it; an expiry is `unverified`. Absent: byte-for-byte the unbounded behaviour. */
+  deadlineAt?: number;
 }
 
 /** The two halves' results. `process` is undefined when the process half was skipped. */
@@ -2494,7 +2532,7 @@ function reapScopedRunProcesses(
   return runClosedReaper(attempt, async lane => {
     const ambient = MaintenanceBudget.current();
     const deadline = Math.floor(Math.min(lane.deadlineAt, reportBudget?.deadline ?? Infinity,
-      helperDeadline, ambient ? Date.now() + ambient.remainingMs() : Infinity));
+      helperDeadline, ambient ? Date.now() + ambient.remainingMs() : Infinity, req.deadlineAt ?? Infinity));
     if (!Number.isSafeInteger(deadline) || deadline <= Date.now()) throw new Error("scoped reaper deadline");
     const signal = AbortSignal.any([lane.signal, ...(reportBudget ? [reportBudget.signal] : []),
       ...(ambient ? [ambient.signal] : [])]);
@@ -2639,7 +2677,7 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
     return { process: { state: "unverified", processes: [], killed: [], detail: (err as Error).message },
       docker: { state: "not_wired", removed: [], detail: "" } };
   }
-  const reapOptions = { ...deps.reap, producerWorkLimits };
+  const reapOptions = { ...deps.reap, producerWorkLimits, ...(req.deadlineAt === undefined ? {} : { deadlineAt: req.deadlineAt }) };
   if (req.processes) {
     const others = req.registry.others(req.attempt?.marker);
     const collected = collectLiveRoots(others, workerRunnerRootPids());
@@ -2671,9 +2709,21 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
       req.reportBudget ? { ...reapOptions, reportBudget: req.reportBudget,
         deadlineMs: Math.max(0, req.reportBudget.deadline - Date.now()) } : reapOptions);
   }
-  const docker = await teardownDocker({ ...deps.docker, dockerHost: req.dockerHost, targetPaths: req.targetPaths }).catch(
-    (err: unknown): DockerTeardown => ({ state: "docker_error", removed: [], detail: (err as Error).message }),
-  );
+  // issue #3980: the Docker request is admitted only before the gate deadline and bounded by what is
+  // left; past it nothing is sent and a quiescent process verdict is withdrawn (unverified).
+  const dockerLeft = req.deadlineAt === undefined ? Infinity : req.deadlineAt - Date.now();
+  let docker: DockerTeardown;
+  if (dockerLeft <= 0) {
+    docker = { state: "docker_error", removed: [], detail: "deadline exhausted" };
+    if (processResult?.state === "quiescent") {
+      processResult = { state: "unverified", processes: [], killed: processResult.killed, detail: "gate checkpoint deadline exhausted" };
+    }
+  } else {
+    docker = await teardownDocker({ ...deps.docker, dockerHost: req.dockerHost, targetPaths: req.targetPaths,
+      ...(req.deadlineAt === undefined ? {} : { deadlineMs: Math.min(deps.docker?.deadlineMs ?? 15_000, dockerLeft) }) }).catch(
+      (err: unknown): DockerTeardown => ({ state: "docker_error", removed: [], detail: (err as Error).message }),
+    );
+  }
   const ambient = MaintenanceBudget.current();
   if (ambient && (ambient.signal.aborted || ambient.remainingMs() <= 0)) {
     processResult = { state: "unverified", processes: [], killed: processResult?.killed ?? [], detail: "maintenance deadline exhausted" };
