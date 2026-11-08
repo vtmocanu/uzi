@@ -18,9 +18,11 @@
 | #4041 (issue) | Needs your decision: group same-kind decisions and PR reviews into expandable rows, kind icons, plan milestone line, two-column rule; target mock `prds/mockups/4041-needs-decision-after.html` | #3881 |
 | #4040 (`prds/done/4040-overview-pending-question.md`) | The pending question quoted inline in Needs your decision (owner-scoped server excerpt) | #3881, #4041 |
 | #4042 (issue) | Admin People chip: how many people are active now, with a who-is-doing-what popover; target mock `prds/mockups/3873-overview-people-chip.html` | #3881 |
-| #3877 (`prds/3877-overview-promote.md`) | Promote the new Overview to `/dashboard` and retire the old one | #3878, #3879, #3880, #3881, #4052, #4041, #4040, #4042, and the maintainer's trial verdict |
+| #4078 (issue) | Capacity rail: richer worker rows (gauges, problem badges on the collapsed row, runs on the worker, version and uptime); target mock `prds/mockups/3873-overview-worker-rows.html` | #4042 (same page and fixtures) |
+| #4082 (issue) | Issue work: cross-check state in the run chip ("cross-checking", "cross-check: revise / blocked / unavailable"); target mock `prds/mockups/3873-overview-issue-work-crosscheck.html` | #4078 (same page and fixtures) |
+| #3877 (`prds/3877-overview-promote.md`) | Promote the new Overview to `/dashboard` and retire the old one | #3878, #3879, #3880, #3881, #4052, #4041, #4040, #4042, #4078, #4082, and the maintainer's trial verdict |
 
-Every child edits the preview page, so run them one at a time, in this order: #3878, #3880, #3879, #3881, #4052, #4041, #4040, #4042, #3876; #3875 any time after #3880; #3877 last.
+Every child edits the preview page, so run them one at a time, in this order: #3878, #3880, #3879, #3881, #4052, #4041, #4040, #4042, #4078, #4082, #3876; #3875 any time after #3880; #3877 last.
 
 ## Mock contract (applies to every child PRD)
 

@@ -93,6 +93,40 @@ describe("overview-next mock scenario", () => {
     expect((await plain.listWorkers()).workers.some((w) => w.id.startsWith("w-ov-"))).toBe(false);
   });
 
+  it("gives the fleet rows their problem states, stats and runs on the worker", async () => {
+    const api = await freshApi("overview-next");
+    const fleet = (await api.listWorkers()).workers;
+    const byId = new Map(fleet.map((w) => [w.id, w]));
+    const own = (await api.listRuns({ view: "summary" })).runs;
+
+    const b = byId.get("w-ov-full-b")!;
+    expect(b.stats_disk_dind_bytes! / b.stats_disk_dind_total_bytes!).toBeGreaterThanOrEqual(0.85);
+    expect(b.custody_decisions_needed).toBe(1);
+    expect(b.version).toBe("0.87.0-rc.4");
+    expect(b.run_disk?.some((d) => d.truncated)).toBe(true);
+
+    const memauth = byId.get("w-ov-memauth")!;
+    expect(memauth).toMatchObject({ kind: "hosted", ephemeral: true, status: "online" });
+    expect(memauth.memory_authority_lost_at).toEqual(expect.any(String));
+
+    const leased = byId.get("w-ov-leased")!;
+    expect(leased).toMatchObject({ kind: "hosted", ephemeral: true, active_runs: 0 });
+    expect(Date.parse(leased.ephemeral_lease_expires_at!)).toBeGreaterThan(Date.now());
+
+    const offline = byId.get("w-ov-offline")!;
+    expect(offline.status).toBe("offline");
+    expect(offline.stats_source).toBe("cgroup");
+    expect(offline.reported_runs?.length).toBeGreaterThan(0);
+
+    // Exactly one reported run is unjoined; every other one is the viewer's own run.
+    const unjoined = fleet.flatMap((w) => w.reported_runs ?? []).filter((r) => !own.some((o) => o.id === r.run_id));
+    expect(unjoined.map((r) => r.run_id)).toEqual(["5e44c9d7-3b1a-4c8e-9f20-6a7d81c4e2b0"]);
+    // A reported run never exceeds the worker's active-run count while it is online.
+    for (const w of fleet.filter((w) => w.status === "online")) {
+      expect(w.reported_runs?.length ?? 0, w.id).toBeLessThanOrEqual(w.active_runs);
+    }
+  });
+
   // PRD #4040: the owner list carries the pending-question excerpt on the seeded own
   // awaiting_input run only; the admin list never does, in either view, for any owner.
   it("puts pending_question on the viewer's seeded asking run only, never on admin rows", async () => {
@@ -127,5 +161,29 @@ describe("overview-next mock scenario", () => {
     expect(factory.some((r) => r.id.startsWith("run-ov-"))).toBe(false);
     expect(own.some((r) => r.id.startsWith("run-ov-"))).toBe(false);
     expect((await api.getMaintenance()).active).toBe(false);
+    // #4042: the People chip's extra users stay out of the base roster.
+    const emails = (await api.listUsers()).users.map((u) => u.email);
+    expect(emails.some((e) => /^(priya|sam|jordan|lena|omar|ines|elif|mateo|hana)@/.test(e))).toBe(false);
+  });
+
+  // #4042: every other-run owner has a named user row, and the people without runs fill the
+  // popover's signed-in and idle groups (one within 24 hours, one never signed in, one idle).
+  it("gives every other-run owner a user row and seeds signed-in and idle people", async () => {
+    const api = await freshApi("overview-next");
+    const users = (await api.listUsers()).users;
+    const byEmail = new Map(users.map((u) => [u.email, u]));
+    const factory = (await api.adminListRuns({ view: "summary" })).runs;
+    for (const r of factory.filter((r) => r.id.startsWith("run-ov-") && r.owner_email)) {
+      const u = byEmail.get(r.owner_email!);
+      expect(u, r.owner_email!).toBeDefined();
+      expect(u!.display_name, r.owner_email!).toBeTruthy();
+      expect(u!.is_active).toBe(true);
+    }
+    const owners = new Set(factory.map((r) => r.owner_email));
+    const idleOnes = users.filter((u) => u.is_active && !owners.has(u.email) && u.id.startsWith("u-ov-"));
+    const age = (u: (typeof users)[number]) => (u.last_login ? Date.now() - Date.parse(u.last_login) : null);
+    expect(idleOnes.some((u) => age(u) !== null && age(u)! < 24 * 3600_000)).toBe(true);
+    expect(idleOnes.some((u) => u.last_login === null)).toBe(true);
+    expect(idleOnes.some((u) => age(u) !== null && age(u)! > 2 * 24 * 3600_000)).toBe(true);
   });
 });

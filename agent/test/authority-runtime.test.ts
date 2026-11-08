@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { describe, it, type TestContext } from "node:test";
-import { acquireWorkerLifetime, AuthorityRefusal, withAuthorityTransaction, type WorkerLifetime } from "../src/authority-lock.js";
-import { AuthorityRuntime, type AuthorityScope } from "../src/authority-runtime.js";
-import { leaseEpoch, leaseHarness, openAuthorityStore, type SlotSnapshot } from "../src/completion-authority.js";
+import fsp from "node:fs/promises";
+import {
+  acquireWorkerLifetime, AuthorityLockBusy, AuthorityRefusal, withAuthorityTransaction, type WorkerLifetime,
+} from "../src/authority-lock.js";
+import { AuthorityRuntime, AuthorityShutdownRefusal, type AuthorityRuntimeOptions, type AuthorityScope } from "../src/authority-runtime.js";
+import { leaseEpoch, leaseHarness, openAuthorityStore, type AuthorityFsOps, type SlotSnapshot } from "../src/completion-authority.js";
+import type { AuthoritySettlement } from "../src/git-authority-hooks.js";
+import { armShutdownResultDeadline, finishWorkerShutdown, type ShutdownPhase } from "../src/shutdown-barrier.js";
 import { buildClaudeSourceCore } from "../src/completion-source.js";
 import { loadConfig } from "../src/config.js";
 import type { WorkerClient } from "../src/client.js";
@@ -984,5 +989,866 @@ describe("M1 remediation authenticates the bound source lease", () => {
     await assert.rejects(r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "remediation-recovery")),
       /current active source lease/);
     assert.equal(await slotOf(r.rt, r.clone), null);
+  });
+});
+
+
+// ---- issue #4066: the shutdown ledger, the owner join of inline applies and the barrier ------------------------------
+//
+// In-process units over the real AuthorityRuntime and the real durable store. Filesystem faults and pauses are injected
+// through AuthorityFsOps.rename (the one place a slot becomes durable): every slot save is two renames, the slot and
+// then its head shard. Nothing here sleeps for a shutdown-scale time; budgets are tens to hundreds of milliseconds.
+
+interface Gate<T = void> { promise: Promise<T>; resolve(value: T): void }
+function gate<T = void>(): Gate<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => { resolve = r; });
+  return { promise, resolve };
+}
+
+interface FaultControl {
+  renames: number;
+  failWhen: ((nth: number) => boolean) | undefined;
+  pause: { hit: () => void; release: Promise<void> } | undefined;
+  /** Runs after the real rename of the nth counted rename (to mutate what landed). */
+  afterRename?: ((nth: number, to: string) => Promise<void>) | undefined;
+}
+
+interface FaultRig extends Rig {
+  ctl: FaultControl;
+  /** Creates the store and one slot so later counted renames start from a known point. */
+  warm(): Promise<void>;
+  warns: string[];
+}
+
+async function faultRig(t: TestContext, extra: Partial<AuthorityRuntimeOptions> = {}): Promise<FaultRig> {
+  const base = await rig(t);
+  const ctl: FaultControl = { renames: 0, failWhen: undefined, pause: undefined };
+  const ops: AuthorityFsOps = {
+    syncFile: (handle) => handle.sync(),
+    syncDir: (handle) => handle.sync(),
+    rename: async (from, to) => {
+      ctl.renames += 1;
+      if (ctl.failWhen?.(ctl.renames)) throw new Error("injected authority rename failure");
+      if (ctl.pause) {
+        const pause = ctl.pause;
+        ctl.pause = undefined;
+        pause.hit();
+        await pause.release;
+      }
+      await fsp.rename(from, to);
+      await ctl.afterRename?.(ctl.renames, to);
+    },
+  };
+  const warns: string[] = [];
+  const rt = new AuthorityRuntime({
+    lifetime: base.lifetime, workerToken: TOKEN, timeoutMs: 5000, ops,
+    log: { warn: (message: string) => { warns.push(message); } }, ...extra,
+  });
+  const warm = async (): Promise<void> => {
+    await rt.withTransaction(() => rt.hooks.admitSourceUse(base.clone, "seed-canonical"));
+  };
+  return { ...base, rt, ctl, warm, warns };
+}
+
+const settle = <T>(promise: Promise<T>, ms = 1_500): Promise<T | "pending"> =>
+  Promise.race([promise, new Promise<"pending">((resolve) => { setTimeout(() => resolve("pending"), ms).unref(); })]);
+
+/** A raw holder of A that is not AuthorityRuntime.withTransaction: nothing in the runtime knows about it. */
+async function holdA(lifetime: WorkerLifetime): Promise<{ release(): void; done: Promise<void> }> {
+  const held = gate();
+  const release = gate();
+  const done = withAuthorityTransaction(lifetime, { timeoutMs: 5000 }, async () => { held.resolve(); await release.promise; });
+  await held.promise;
+  return { release: () => release.resolve(), done };
+}
+
+const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+
+describe("issue #4066: the owner joins inline settlement applies", () => {
+  it("an apply started by code detached from the callback keeps the transaction active and A held until it is durable", async (t) => {
+    const f = await faultRig(t);
+    await f.warm();
+    const written = gate();
+    const release = gate();
+    const callbackReturned = gate();
+    let detached: Promise<void> | undefined;
+    const done = f.rt.withTransaction(async () => {
+      const settlement = await f.rt.hooks.beginDestructive([f.clone], "runner-uid-delete");
+      f.ctl.pause = { hit: () => written.resolve(), release: release.promise };
+      // Detached from this callback (it is not awaited here) but inside its async context, like a child's 'close'.
+      detached = Promise.resolve().then(() => settlement.settle({ ok: true }));
+      await written.promise;
+      callbackReturned.resolve();
+    });
+    await callbackReturned.promise;
+    await tick();
+    assert.equal(f.rt.snapshot().counts.inline_applies, 1, "the paused apply is in the ledger");
+    assert.equal(f.rt.snapshot().counts.outer, 1, "the transaction is still counted after its callback returned");
+    assert.equal(await settle(done, 50), "pending", "withTransaction does not resolve while the apply is paused");
+    await assert.rejects(withAuthorityTransaction(f.lifetime, { timeoutMs: 50 }, async () => undefined), AuthorityLockBusy,
+      "A is still held by the paused apply");
+
+    release.resolve();
+    await done;
+    await detached;
+    assert.equal(f.rt.snapshot().counts.inline_applies, 0);
+    assert.equal(f.rt.snapshot().counts.outer, 0, "decremented only once the transaction finished");
+    assert.equal((await slotOf(f.rt, f.clone))?.pending, null, "the settlement is durable once withTransaction resolved");
+    assert.deepEqual(f.rt.snapshot().reasons, []);
+  });
+
+  it("a settle that finds no active transaction is queued, stays in the ledger and is applied by the final drain", async (t) => {
+    const f = await faultRig(t, { lateWaitMs: 100 });
+    await f.warm();
+    let settlement!: AuthoritySettlement;
+    await f.rt.withTransaction(async () => { settlement = await f.rt.hooks.beginDestructive([f.clone], "runner-uid-delete"); });
+    assert.equal(f.rt.snapshot().counts.open_settlements, 1, "opened, not yet settled");
+    const holder = await holdA(f.lifetime);
+    await settlement.settle({ ok: true });
+    assert.equal(f.rt.snapshot().counts.queued_settlements, 1);
+    assert.ok(f.rt.snapshot().reasons.includes("queued_settlement"));
+    assert.equal(f.rt.snapshot().counts.open_settlements, 0, "queued is not open");
+    assert.equal(f.rt.snapshot().operations.length, 1);
+    await until(() => f.warns.some((w) => w.includes("stays queued until the next transaction")));
+    holder.release();
+    await holder.done;
+    const outcome = await f.rt.drainForShutdown({ deadlineAt: Date.now() + 5000 });
+    assert.equal(outcome.result, "drained");
+    assert.equal((await slotOf(f.rt, f.clone))?.pending, null);
+  });
+
+  it("an outermost transaction is counted from entry, before it has A", async (t) => {
+    const f = await faultRig(t);
+    const holder = await holdA(f.lifetime);
+    const waiting = f.rt.withTransaction(async () => "ran");
+    assert.equal(f.rt.snapshot().counts.outer, 1, "counted while still waiting for A");
+    assert.equal(f.rt.prerequisitesPending(), true);
+    holder.release();
+    await holder.done;
+    assert.equal(await waiting, "ran");
+    assert.equal(f.rt.snapshot().counts.outer, 0);
+    assert.equal(f.rt.prerequisitesPending(), false);
+  });
+});
+
+/** The durable slot `target` as the runtime's own store reads it, without a transaction of the runtime. */
+async function peek(f: FaultRig, target: string): Promise<SlotSnapshot | null> {
+  return withAuthorityTransaction(f.lifetime, { timeoutMs: 5000 }, async (tx) => {
+    const store = await openAuthorityStore(tx, { workerToken: TOKEN });
+    return store.readSlot(tx, await store.slotKey(tx, target));
+  });
+}
+
+async function until(condition: () => boolean, ms = 5_000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!condition()) {
+    if (Date.now() > deadline) assert.fail("condition not reached");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+describe("issue #4066: the seal", () => {
+  it("refuses a NEW outermost transaction only; a borrowed one, the runtime's drain and the read-only raw reads go on", async (t) => {
+    const f = await faultRig(t);
+    await f.warm();
+    await f.rt.withTransaction(async () => {
+      f.rt.sealForShutdown();
+      assert.equal(await f.rt.withTransaction(async () => "borrowed"), "borrowed", "a borrowed transaction is not new");
+    });
+    const refused = await f.rt.withTransaction(async () => "new").then(() => undefined, (e: unknown) => e);
+    assert.ok(refused instanceof AuthorityShutdownRefusal);
+    assert.ok(refused instanceof AuthorityRefusal, "it IS a refusal for every existing catch");
+    assert.equal((refused as AuthorityShutdownRefusal).kind, undefined, "and carries no kind a mapping could key on");
+    assert.equal(f.rt.snapshot().counts.outer, 0, "a refused entry is never counted");
+    assert.equal(await f.rt.awaitSinkQuiescent({ timeoutMs: 1000 }), true, "read-only raw methods are excluded");
+  });
+
+  it("the drain still applies a queued settlement after the seal", async (t) => {
+    const f = await faultRig(t, { lateWaitMs: 100 });
+    await f.warm();
+    let settlement!: AuthoritySettlement;
+    await f.rt.withTransaction(async () => { settlement = await f.rt.hooks.beginDestructive([f.clone], "runner-uid-delete"); });
+    const holder = await holdA(f.lifetime);
+    await settlement.settle({ ok: false, residue: [f.clone] });
+    f.rt.sealForShutdown();
+    holder.release();
+    await holder.done;
+    const outcome = await f.rt.drainForShutdown({ deadlineAt: Date.now() + 5000 });
+    assert.equal(outcome.result, "drained", outcome.reasons.join());
+    assert.equal((await peek(f, f.clone))?.pending?.status, "settled_failed");
+    await assert.rejects(f.rt.withTransaction(async () => undefined), AuthorityShutdownRefusal);
+  });
+});
+
+describe("issue #4066: the shutdown budget", () => {
+  it("an outermost entry that is not sealed keeps its own wait: the budget does not cut it", async (t) => {
+    const f = await faultRig(t);
+    f.rt.beginShutdown(Date.now() + 80);
+    const holder = await holdA(f.lifetime);
+    const waiting = f.rt.withTransaction(async () => "ok");
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    holder.release();
+    await holder.done;
+    assert.equal(await waiting, "ok", "it waited past the 80ms budget for A");
+  });
+
+  it("an idle drain after beginShutdown waits for A at most the budget that is left, counting the time already spent", async (t) => {
+    const f = await faultRig(t, { lateWaitMs: 20_000 });
+    await f.warm();
+    let settlement!: AuthoritySettlement;
+    await f.rt.withTransaction(async () => { settlement = await f.rt.hooks.beginDestructive([f.clone], "runner-uid-delete"); });
+    f.rt.beginShutdown(Date.now() + 500);
+    await new Promise((resolve) => setTimeout(resolve, 300)); // most of the budget is already consumed
+    const holder = await holdA(f.lifetime);
+    const queuedAt = Date.now();
+    await settlement.settle({ ok: true });
+    const outcome = await settle(until(() => f.warns.some((w) => w.includes("stays queued until the next transaction"))).then(() => Date.now() - queuedAt), 4_000);
+    assert.notEqual(outcome, "pending", "the drain gave up on A at the budget, not after LATE_WAIT_MS");
+    assert.ok((outcome as number) < 2_500, `waited ${String(outcome)}ms`);
+    holder.release();
+    await holder.done;
+  });
+
+  it("no drain or retry starts once the budget is spent or the shutdown is decided", async (t) => {
+    for (const how of ["deadline", "decided"] as const) {
+      const f = await faultRig(t);
+      await f.warm();
+      let settlement!: AuthoritySettlement;
+      await f.rt.withTransaction(async () => { settlement = await f.rt.hooks.beginDestructive([f.clone], "runner-uid-delete"); });
+      if (how === "deadline") f.rt.beginShutdown(Date.now() - 1);
+      else { f.rt.beginShutdown(Date.now() + 60_000); f.rt.markShutdownDecided(); }
+      await settlement.settle({ ok: true });
+      for (let i = 0; i < 5; i += 1) await tick();
+      assert.equal(f.rt.snapshot().counts.queued_settlements, 1, `${how}: still queued, no drain ran`);
+      assert.equal(f.rt.snapshot().counts.drain_in_flight, 0);
+      assert.equal((await peek(f, f.clone))?.pending?.status, "running", `${how}: nothing was written`);
+    }
+  });
+
+  it("the final drain never opens the store or takes A when nothing is queued", async (t) => {
+    const f = await faultRig(t);
+    const holder = await holdA(f.lifetime);
+    const startedAt = Date.now();
+    const outcome = await f.rt.drainForShutdown({ deadlineAt: Date.now() + 2_000 });
+    assert.equal(outcome.result, "drained");
+    assert.ok(Date.now() - startedAt < 1_000, "it did not wait for the held A");
+    assert.equal(fs.existsSync(path.join(f.root, ".uzi-authority", "slots")), false, "the store was not opened");
+    holder.release();
+    await holder.done;
+  });
+
+  it("its waits are ref'd timers that are all cleared before it returns", async (t) => {
+    const f = await faultRig(t);
+    await f.warm();
+    await f.rt.withTransaction(async () => { await f.rt.hooks.beginDestructive([f.clone], "runner-uid-delete"); }); // open forever
+    const created: Array<{ timer: NodeJS.Timeout; ref: boolean }> = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const timersBefore = process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
+    globalThis.setTimeout = ((handler: () => void, ms?: number, ...args: unknown[]) => {
+      const timer = (realSetTimeout as unknown as (...a: unknown[]) => NodeJS.Timeout)(handler, ms, ...args);
+      created.push({ timer, ref: timer.hasRef() });
+      return timer;
+    }) as typeof setTimeout;
+    let outcome;
+    try { outcome = await f.rt.drainForShutdown({ deadlineAt: Date.now() + 200 }); }
+    finally { globalThis.setTimeout = realSetTimeout; }
+    assert.equal(outcome.result, "incomplete");
+    assert.ok(created.length > 0 && created.every((c) => c.ref), "every wait was a ref'd timer");
+    assert.equal(process.getActiveResourcesInfo().filter((r) => r === "Timeout").length, timersBefore, "none outlived the call");
+  });
+
+  it("a drain already in flight is waited for, not duplicated", async (t) => {
+    const hold = gate();
+    const spliced = gate();
+    const f = await faultRig(t, { lateWaitMs: 5_000, testHooks: { afterLateSplice: async () => { spliced.resolve(); await hold.promise; } } });
+    await f.warm();
+    let settlement!: AuthoritySettlement;
+    await f.rt.withTransaction(async () => { settlement = await f.rt.hooks.beginDestructive([f.clone], "runner-uid-delete"); });
+    await settlement.settle({ ok: true }); // queues; the idle drain splices it and pauses
+    await spliced.promise;
+    assert.equal(f.rt.snapshot().counts.queued_settlements, 0, "spliced out of the queue");
+    assert.equal(f.rt.snapshot().counts.applying, 1, "but still in the ledger");
+    assert.ok(f.rt.snapshot().reasons.includes("drain_in_flight"));
+    const draining = f.rt.drainForShutdown({ deadlineAt: Date.now() + 10_000 });
+    assert.equal(await settle(draining, 100), "pending");
+    hold.resolve();
+    const outcome = await draining;
+    assert.equal(outcome.result, "drained", outcome.reasons.join());
+    assert.equal((await peek(f, f.clone))?.pending, null, "the spliced settlement was applied");
+  });
+});
+
+describe("issue #4066: retry timing and closing transactions", () => {
+  it("a retry armed after beginShutdown is cut to the budget left, not the configured retryMs", async (t) => {
+    const RETRY_MS = 60_000;
+    const BUDGET_MS = 2_000;
+    const f = await faultRig(t, { retryMs: RETRY_MS, lateWaitMs: 50 });
+    await f.warm();
+    let settlement!: AuthoritySettlement;
+    await f.rt.withTransaction(async () => { settlement = await f.rt.hooks.beginDestructive([f.clone], "runner-uid-delete"); });
+    f.rt.beginShutdown(Date.now() + BUDGET_MS);
+    const delays: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = ((handler: () => void, ms?: number, ...args: unknown[]) => {
+      if (typeof ms === "number") delays.push(ms);
+      return (realSetTimeout as unknown as (...a: unknown[]) => NodeJS.Timeout)(handler, ms, ...args);
+    }) as typeof setTimeout;
+    const holder = await holdA(f.lifetime);
+    try {
+      await settlement.settle({ ok: true }); // queues; the idle drain fails to get A within lateWaitMs and arms the retry
+      await until(() => f.warns.some((w) => w.includes("stays queued until the next transaction")));
+      for (let i = 0; i < 5; i += 1) await tick();
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+      holder.release();
+      await holder.done;
+      f.rt.markShutdownDecided(); // clears the armed retry timer
+    }
+    assert.ok(!delays.includes(RETRY_MS), `a timer used retryMs: ${delays.join(",")}`);
+    assert.ok(delays.some((ms) => ms > BUDGET_MS - 500 && ms <= BUDGET_MS), `no timer was cut to the remaining budget: ${delays.join(",")}`);
+  });
+
+  it("a settle inside a transaction that is already closing is queued, not applied inline", async (t) => {
+    let armedHook = false;
+    let settlement!: AuthoritySettlement;
+    let observed: { queued: number; inline: number } | undefined;
+    const f: FaultRig = await faultRig(t, { testHooks: { onInlineClosing: () => {
+      if (!armedHook) return;
+      armedHook = false;
+      void settlement.settle({ ok: true }); // synchronous part: still inside the closing transaction
+      const counts = f.rt.snapshot().counts;
+      observed = { queued: counts.queued_settlements!, inline: counts.inline_applies! };
+    } } });
+    await f.warm();
+    await f.rt.withTransaction(async () => { settlement = await f.rt.hooks.beginDestructive([f.clone], "runner-uid-delete"); });
+    armedHook = true;
+    await f.rt.withTransaction(async () => undefined);
+    assert.deepEqual(observed, { queued: 1, inline: 0 }, "queued for the idle drain, not applied under the closing transaction");
+    const outcome = await f.rt.drainForShutdown({ deadlineAt: Date.now() + 5_000 });
+    assert.equal(outcome.result, "drained", outcome.reasons.join());
+    assert.equal((await peek(f, f.clone))?.pending, null, "the queued settlement was applied later");
+  });
+});
+
+describe("issue #4066: what keeps a shutdown from being drained", () => {
+  const incompleteReasons = async (f: FaultRig): Promise<string[]> =>
+    (await f.rt.drainForShutdown({ deadlineAt: Date.now() + 250 })).reasons;
+
+  it("an inline apply that rejects is owner-joined, recorded as settlement_failed and never retried", async (t) => {
+    const f = await faultRig(t);
+    await f.warm();
+    let detached: Promise<unknown> | undefined;
+    await f.rt.withTransaction(async () => {
+      const settlement = await f.rt.hooks.beginDestructive([f.clone], "runner-uid-delete");
+      f.ctl.failWhen = () => true;
+      detached = Promise.resolve().then(() => settlement.settle({ ok: true })).then(() => "settled", () => "rejected");
+    });
+    assert.equal(await detached, "rejected", "the caller of settle saw the failure");
+    f.ctl.failWhen = undefined;
+    assert.equal(f.rt.snapshot().counts.inline_applies, 0, "the owner joined it before withTransaction resolved");
+    assert.deepEqual(await incompleteReasons(f), ["settlement_failed"]);
+    assert.equal((await peek(f, f.clone))?.pending?.status, "running", "fail closed: the record stays running");
+  });
+
+  it("a settlement left open (no live child, no settle call) is open_settlement", async (t) => {
+    const f = await faultRig(t);
+    await f.warm();
+    await f.rt.withTransaction(async () => { await f.rt.hooks.beginDestructive([f.clone], "runner-uid-delete"); });
+    const slot = await peek(f, f.clone);
+    const reasons = await incompleteReasons(f);
+    assert.deepEqual(reasons, ["open_settlement"]);
+    assert.deepEqual(f.rt.snapshot().operations, [slot!.pending!.operation]);
+  });
+
+  it("a bare slot that settled but could not leave active is bare_slot_end_failed until a later transition succeeds", async (t) => {
+    const f = await faultRig(t);
+    await f.warm();
+    const bare = f.bare;
+    let settlement!: AuthoritySettlement;
+    await f.rt.withTransaction(async () => { settlement = await f.rt.hooks.beginBareMutation(bare, "recovery-cleanup-delete-ref", ["refs/x"]); });
+    f.ctl.renames = 0;
+    f.ctl.failWhen = (nth) => nth === 3; // the settle's slot and head renames succeed, the transition's slot rename fails
+    await f.rt.withTransaction(async () => { await settlement.settle({ ok: true }); });
+    f.ctl.failWhen = undefined;
+    assert.equal((await peek(f, bare))?.pending, null, "the settlement itself is durable");
+    assert.equal((await peek(f, bare))?.state, "active", "but the slot did not leave active");
+    assert.deepEqual(await incompleteReasons(f), ["bare_slot_end_failed"]);
+    const ended = await f.rt.endSourceUse([bare]);
+    assert.deepEqual(ended.kept, []);
+    assert.deepEqual(f.rt.snapshot().reasons, [], "a later successful transition of the same lease clears it");
+  });
+
+  it("retrying the same bare mutation clears a previous bare-slot end failure after transition succeeds", async (t) => {
+    const f = await faultRig(t);
+    await f.warm();
+    let first!: AuthoritySettlement;
+    await f.rt.withTransaction(async () => {
+      first = await f.rt.hooks.beginBareMutation(f.bare, "recovery-cleanup-delete-ref", ["refs/x"]);
+    });
+    f.ctl.renames = 0;
+    f.ctl.failWhen = nth => nth === 3; // settlement lands; its following ineligible transition fails
+    await f.rt.withTransaction(() => first.settle({ ok: true }));
+    assert.deepEqual(f.rt.snapshot().reasons, ["bare_slot_end_failed"]);
+    assert.equal((await peek(f, f.bare))?.state, "active");
+    f.ctl.failWhen = undefined;
+    await f.rt.withTransaction(async () => {
+      const retry = await f.rt.hooks.beginBareMutation(f.bare, "recovery-cleanup-delete-ref", ["refs/x"]);
+      await retry.settle({ ok: true });
+    });
+    assert.equal((await peek(f, f.bare))?.state, "ineligible");
+    assert.deepEqual(f.rt.snapshot().reasons, [], "successful retry must clear the previous end failure for its lease");
+  });
+
+  it("an admission whose slot landed and whose head write failed is enrollment_uncertain", async (t) => {
+    const f = await faultRig(t);
+    await f.warm();
+    f.ctl.renames = 0;
+    f.ctl.failWhen = (nth) => nth === 2;
+    await assert.rejects(f.rt.withTransaction(() => f.rt.hooks.admitSourceUse(f.clone + "-b", "seed-attempt")), /injected authority rename failure/);
+    f.ctl.failWhen = undefined;
+    assert.deepEqual(await incompleteReasons(f), ["enrollment_uncertain"]);
+  });
+
+  it("an admission whose head did not read back after its durable write is enrollment_uncertain", async (t) => {
+    const f = await faultRig(t);
+    await f.warm();
+    f.ctl.renames = 0;
+    f.ctl.afterRename = async (nth, to) => {
+      if (nth === 2) await fsp.appendFile(to, " "); // the head landed, then differs on read-back
+    };
+    await assert.rejects(f.rt.withTransaction(() => f.rt.hooks.admitSourceUse(f.clone + "-b", "seed-attempt")), /authority head did not read back/);
+    f.ctl.afterRename = undefined;
+    assert.deepEqual(await incompleteReasons(f), ["enrollment_uncertain"]);
+  });
+
+  it("a plain refusal raised after the slot landed (heads directory made unsafe) is enrollment_uncertain and incomplete", async (t) => {
+    const f = await faultRig(t);
+    await f.warm();
+    f.ctl.renames = 0;
+    const headsDir = path.join(f.root, ".uzi-authority", "heads");
+    const mode = fs.statSync(headsDir).mode & 0o777;
+    f.ctl.afterRename = async (nth) => {
+      if (nth === 1) await fsp.chmod(headsDir, 0o755); // the slot landed; the head write now meets an unsafe directory
+    };
+    await assert.rejects(
+      f.rt.withTransaction(() => f.rt.hooks.admitSourceUse(f.clone + "-b", "seed-attempt")),
+      (error: unknown) => error instanceof AuthorityRefusal && /unsafe authority directory/.test(error.message),
+    );
+    f.ctl.afterRename = undefined;
+    await fsp.chmod(headsDir, mode);
+    assert.equal(f.rt.snapshot().counts.enrollment_uncertain, 1);
+    assert.deepEqual(await incompleteReasons(f), ["enrollment_uncertain"]);
+  });
+
+  it("a slot that does not read back after its rename is enrollment_uncertain", async (t) => {
+    const f = await faultRig(t);
+    await f.warm();
+    f.ctl.renames = 0;
+    f.ctl.afterRename = async (nth, to) => {
+      if (nth === 1) await fsp.appendFile(to, " "); // the slot landed, then differs on read-back
+    };
+    await assert.rejects(f.rt.withTransaction(() => f.rt.hooks.admitSourceUse(f.clone + "-b", "seed-attempt")), /authority slot did not read back/);
+    f.ctl.afterRename = undefined;
+    assert.equal(f.rt.snapshot().counts.enrollment_uncertain, 1);
+    assert.deepEqual(await incompleteReasons(f), ["enrollment_uncertain"]);
+  });
+
+  it("a clean refusal is not counted as an uncertain enrollment", async (t) => {
+    const f = await faultRig(t);
+    await f.warm();
+    await assert.rejects(f.rt.withTransaction(() => f.rt.hooks.admitSourceUse(f.clone + "-x", "remediation-recovery")), /current active source lease/);
+    assert.equal(f.rt.snapshot().counts.enrollment_uncertain, 0);
+  });
+
+  it("a destructive rollback that could not close its records is rollback_failed", async (t) => {
+    const f = await faultRig(t);
+    await f.warm();
+    const second = path.join(f.root, "runner", "repo", "issue-2");
+    fs.mkdirSync(second, { recursive: true });
+    f.ctl.renames = 0;
+    // Group one: admission (2 renames) and its pending record (2). Group two fails at its admission, then every
+    // later write fails too, so the rollback close of group one fails as well.
+    f.ctl.failWhen = (nth) => nth >= 5;
+    await assert.rejects(f.rt.withTransaction(() => f.rt.hooks.beginDestructive([f.clone, second], "runner-uid-delete")),
+      /injected authority rename failure/);
+    f.ctl.failWhen = undefined;
+    assert.equal(f.rt.snapshot().counts.rollback_failed, 1);
+    assert.ok((await incompleteReasons(f)).includes("rollback_failed"));
+  });
+
+  it("a settlement whose apply keeps failing is retried a bounded number of times, then apply_exhausted", async (t) => {
+    const f = await faultRig(t, { lateWaitMs: 500, shutdownBackoffMs: 10 });
+    await f.warm();
+    let settlement!: AuthoritySettlement;
+    await f.rt.withTransaction(async () => { settlement = await f.rt.hooks.beginDestructive([f.clone], "runner-uid-delete"); });
+    f.ctl.failWhen = () => true;
+    await settlement.settle({ ok: true });
+    const outcome = await f.rt.drainForShutdown({ deadlineAt: Date.now() + 5_000 });
+    f.ctl.failWhen = undefined;
+    assert.equal(outcome.result, "incomplete");
+    assert.deepEqual(outcome.reasons, ["apply_exhausted"]);
+    assert.equal(outcome.counts.queued_settlements, 0);
+    assert.equal(outcome.operations.length, 1);
+    assert.equal((await peek(f, f.clone))?.pending?.status, "running");
+  });
+});
+
+describe("issue #4066: finishWorkerShutdown", () => {
+  const collect = (): { logs: Array<{ level: string; message: string; fields: Record<string, unknown> }>; log: Parameters<typeof finishWorkerShutdown>[0]["log"] } => {
+    const logs: Array<{ level: string; message: string; fields: Record<string, unknown> }> = [];
+    return { logs, log: {
+      info: (message, fields) => { logs.push({ level: "info", message, fields: fields ?? {} }); },
+      warn: (message, fields) => { logs.push({ level: "warn", message, fields: fields ?? {} }); },
+    } };
+  };
+  const preserveExitCode = (t: TestContext): void => {
+    const previous = process.exitCode;
+    t.after(() => { process.exitCode = previous; });
+  };
+
+  it("joins a registered producer before it seals, so the producer's own transaction still succeeds", async (t) => {
+    preserveExitCode(t);
+    const f = await faultRig(t);
+    await f.warm();
+    const release = gate();
+    const phases: string[] = [];
+    let producerResult: string | undefined;
+    const producer = (async () => {
+      await release.promise;
+      producerResult = await f.rt.withTransaction(async () => "committed");
+    })();
+    f.rt.trackProducer(producer, "retained_source_request");
+    const { log, logs } = collect();
+    const finishing = finishWorkerShutdown({ authority: f.rt, deadlineAt: Date.now() + 5_000, log,
+      testHooks: { onShutdownPhase: (phase: ShutdownPhase) => { phases.push(phase); } } });
+    assert.equal(await settle(finishing, 100), "pending", "the barrier is joining the producer");
+    assert.deepEqual(phases, []);
+    release.resolve();
+    const result = await finishing;
+    assert.equal(producerResult, "committed");
+    assert.deepEqual(phases, ["prerequisites_joined", "sealed", "final_drain_started"]);
+    assert.deepEqual(result, { result: "drained", exitCode: 0 });
+    assert.equal(logs.filter((l) => l.message === "worker_shutdown_result").length, 1);
+    assert.equal(logs[0]!.fields.result, "drained");
+  });
+
+  it("an open settlement with no live child ends incomplete (open_settlement, exit 1) with its operation id and no paths", async (t) => {
+    preserveExitCode(t);
+    const f = await faultRig(t);
+    await f.warm();
+    await f.rt.withTransaction(async () => { await f.rt.hooks.beginDestructive([f.clone], "runner-uid-delete"); });
+    const slot = await peek(f, f.clone);
+    const { log, logs } = collect();
+    const result = await finishWorkerShutdown({ authority: f.rt, deadlineAt: Date.now() + 300, log });
+    assert.deepEqual(result, { result: "incomplete", exitCode: 1 });
+    assert.equal(process.exitCode, 1);
+    const decision = logs.filter((l) => l.message === "worker_shutdown_result");
+    assert.equal(decision.length, 1, "one decision");
+    assert.deepEqual(decision[0]!.fields.reasons, ["deadline", "open_settlement"]);
+    assert.deepEqual(decision[0]!.fields.operations, [slot!.pending!.operation]);
+    assert.equal(decision[0]!.level, "warn");
+    assert.ok(!JSON.stringify(decision[0]!.fields).includes(f.root), "no path in the decision");
+    // Fail closed across the restart: the record is still running and a successor incarnation refuses the footprint.
+    assert.equal((await peek(f, f.clone))?.pending?.status, "running");
+    const successor = successorOf(f);
+    await assert.rejects(successor.withTransaction(() => successor.hooks.admitSourceUse(f.clone, "seed-canonical")), /unresolved pending footprint/);
+  });
+
+  it("the deadline observer reports once while a prerequisite is pending, sets exit 1 and the barrier then logs nothing more", async (t) => {
+    preserveExitCode(t);
+    const f = await faultRig(t);
+    await f.warm();
+    const { log, logs } = collect();
+    const deadlineAt = Date.now() + 80;
+    const observer = armShutdownResultDeadline({ deadlineAt, log });
+    const second = armShutdownResultDeadline({ deadlineAt: Date.now() + 60_000, log });
+    const hold = gate();
+    f.rt.trackProducer(hold.promise, "claude_shutdown_durability");
+    const finishing = finishWorkerShutdown({ authority: f.rt, deadlineAt, log });
+    await until(() => logs.some((l) => l.message === "worker_shutdown_result"));
+    const decision = logs.find((l) => l.message === "worker_shutdown_result")!;
+    assert.equal(decision.fields.result, "incomplete");
+    assert.deepEqual(decision.fields.reasons, ["deadline", "prerequisite_pending", "producer_pending"]);
+    assert.equal((decision.fields.counts as Record<string, number>).producers, 1);
+    assert.equal(process.exitCode, 1);
+    assert.equal(await settle(finishing, 100), "pending", "the observer cancels nothing: the join continues");
+    hold.resolve();
+    assert.deepEqual(await finishing, { result: "incomplete", exitCode: 1 });
+    assert.equal(logs.filter((l) => l.message === "worker_shutdown_result").length, 1, "decided once");
+    observer.clear();
+    second.clear();
+  });
+
+  it("the observer stays live through the final drain: an apply paused inside it past the deadline is reported once at the deadline (exit 1) and the later drain logs nothing more", async (t) => {
+    preserveExitCode(t);
+    const f = await faultRig(t, { lateWaitMs: 100 });
+    await f.warm();
+    let settlement!: AuthoritySettlement;
+    await f.rt.withTransaction(async () => { settlement = await f.rt.hooks.beginDestructive([f.clone], "runner-uid-delete"); });
+    const holder = await holdA(f.lifetime);
+    await settlement.settle({ ok: true }); // queued; the idle drain cannot take A and gives up
+    const written = gate();
+    const release = gate();
+    const { log, logs } = collect();
+    const deadlineAt = Date.now() + 600;
+    const observer = armShutdownResultDeadline({ deadlineAt, log });
+    const finishing = finishWorkerShutdown({ authority: f.rt, deadlineAt, log, testHooks: { onShutdownPhase: (phase: ShutdownPhase) => {
+      if (phase !== "final_drain_started") return;
+      // Only the FINAL drain can reach the write: A is freed now and the next rename pauses.
+      f.ctl.pause = { hit: () => written.resolve(), release: release.promise };
+      holder.release();
+    } } });
+    await written.promise;
+    const decisions = (): typeof logs => logs.filter((l) => l.message === "worker_shutdown_result");
+    assert.equal(decisions().length, 0, "nothing decided before the deadline");
+    await until(() => decisions().length === 1);
+    assert.equal(decisions()[0]!.fields.result, "incomplete");
+    assert.ok((decisions()[0]!.fields.reasons as string[]).includes("deadline"));
+    assert.equal(process.exitCode, 1);
+    assert.equal(await settle(finishing, 100), "pending", "the write is not cancelled");
+    release.resolve();
+    assert.deepEqual(await finishing, { result: "incomplete", exitCode: 1 });
+    assert.equal(decisions().length, 1, "no second result");
+    assert.equal(process.exitCode, 1);
+    assert.equal((await peek(f, f.clone))?.pending, null, "the paused write completed after release");
+    observer.clear();
+    await holder.done;
+  });
+
+  it("is idempotent per runtime: a second call returns the first call's result", async (t) => {
+    preserveExitCode(t);
+    const f = await faultRig(t);
+    const { log, logs } = collect();
+    const deadlineAt = Date.now() + 1_000;
+    const first = finishWorkerShutdown({ authority: f.rt, deadlineAt, log });
+    const again = finishWorkerShutdown({ authority: f.rt, deadlineAt, log });
+    assert.equal(first, again);
+    await first;
+    assert.equal(logs.filter((l) => l.message === "worker_shutdown_result").length, 1);
+  });
+});
+
+// ---- issue #4066 M4: the bare_slot_refusal diagnostic ---------------------------------------------------------------
+
+describe("issue #4066: the bare_slot_refusal diagnostic", () => {
+  interface Logged { message: string; fields: Record<string, unknown> | undefined }
+  const PIN_REF = "refs/uzi-recovery-pin/run1/4";
+  const CLEANUP = "recovery-cleanup-delete-ref";
+
+  function capture(): { logged: Logged[]; log: { warn(message: string, fields?: Record<string, unknown>): void }; refusals(): Logged[] } {
+    const logged: Logged[] = [];
+    return {
+      logged,
+      log: { warn: (message, fields) => { logged.push({ message, fields }); } },
+      refusals: () => logged.filter((l) => l.message === "bare_slot_refusal"),
+    };
+  }
+
+  async function begin(f: FaultRig, ref = PIN_REF, op = CLEANUP): Promise<{ settlement: AuthoritySettlement; operation: string }> {
+    let settlement!: AuthoritySettlement;
+    await f.rt.withTransaction(async () => { settlement = await f.rt.hooks.beginBareMutation(f.bare, op, [ref]); });
+    const operation = (await peek(f, f.bare))?.pending?.operation;
+    assert.ok(operation);
+    return { settlement, operation };
+  }
+
+  const message = (operation: string): string => `owed-pin: an unresolved bare_mutation (${operation}) covers this bare`;
+
+  it("keeps the refusal message byte for byte and logs the classified fields for the owning worker", async (t) => {
+    const c = capture();
+    const f = await faultRig(t, { log: c.log });
+    const { operation } = await begin(f);
+    await assert.rejects(f.rt.hooks.assertBareClear(f.bare, "owed-pin"), (error: unknown) => {
+      assert.ok(error instanceof AuthorityRefusal);
+      assert.equal(error.message, message(operation));
+      return true;
+    });
+    const [entry] = c.refusals();
+    assert.ok(entry?.fields);
+    const slot = await peek(f, f.bare);
+    assert.deepEqual(entry.fields, {
+      operation, deletion_class: CLEANUP, subject_run: "run1", generation: 4, slot_epoch: slot?.epoch,
+      pending_status: "running", pending_kind: "bare_mutation", self_owned: true, local_settlement: "open", actor: "unknown",
+    });
+    assert.ok(!JSON.stringify(entry.fields).includes(slot!.owner.worker), "the incarnation is never logged");
+    assert.ok(!JSON.stringify(entry.fields).includes(f.bare), "no path is logged");
+  });
+
+  it("reports a foreign owner and no local ledger entry from another worker's runtime", async (t) => {
+    const f = await faultRig(t);
+    const { operation } = await begin(f);
+    const c = capture();
+    const foreign = new AuthorityRuntime({ lifetime: f.lifetime, workerToken: TOKEN, workerIncarnation: randomUUID(), timeoutMs: 5000, log: c.log });
+    await assert.rejects(foreign.hooks.assertBareClear(f.bare, "owed-pin"), (error: unknown) => (error as Error).message === message(operation));
+    const [entry] = c.refusals();
+    assert.equal(entry?.fields?.self_owned, false);
+    assert.equal(entry?.fields?.local_settlement, "none");
+    // Inside a transaction the same record is read through the transactional load.
+    const c2 = capture();
+    const foreign2 = new AuthorityRuntime({ lifetime: f.lifetime, workerToken: TOKEN, workerIncarnation: randomUUID(), timeoutMs: 5000, log: c2.log });
+    await assert.rejects(foreign2.withTransaction(() => foreign2.hooks.assertBareClear(f.bare, "owed-pin")), AuthorityRefusal);
+    assert.equal(c2.refusals()[0]?.fields?.self_owned, false);
+  });
+
+  it("marks self ownership from inside a transaction too", async (t) => {
+    const c = capture();
+    const f = await faultRig(t, { log: c.log });
+    await begin(f);
+    await assert.rejects(f.rt.withTransaction(() => f.rt.hooks.assertBareClear(f.bare, "owed-pin")), AuthorityRefusal);
+    assert.equal(c.refusals()[0]?.fields?.self_owned, true);
+  });
+
+  it("logs once per operation", async (t) => {
+    const c = capture();
+    const f = await faultRig(t, { log: c.log });
+    await begin(f);
+    for (let i = 0; i < 3; i += 1) await assert.rejects(f.rt.hooks.assertBareClear(f.bare, "owed-pin"), AuthorityRefusal);
+    assert.equal(c.refusals().length, 1);
+  });
+
+  it("bounds the dedupe set: only the first N distinct operations are logged", async (t) => {
+    const c = capture();
+    const f = await faultRig(t, { log: c.log, refusalLogLimit: 2 });
+    const seen: string[] = [];
+    for (let i = 0; i < 3; i += 1) {
+      const { settlement, operation } = await begin(f);
+      seen.push(operation);
+      await assert.rejects(f.rt.hooks.assertBareClear(f.bare, "owed-pin"), (error: unknown) =>
+        error instanceof AuthorityRefusal && error.message === message(operation));
+      await f.rt.withTransaction(() => settlement.settle({ ok: true }));
+    }
+    assert.equal(new Set(seen).size, 3, "three distinct operations were refused");
+    assert.deepEqual(c.refusals().map((l) => l.fields?.operation), seen.slice(0, 2));
+  });
+
+  it("clears the inline ledger once the inline apply settled", async (t) => {
+    const f = await faultRig(t);
+    const written = gate();
+    const release = gate();
+    await f.rt.withTransaction(async () => {
+      const settlement = await f.rt.hooks.beginBareMutation(f.bare, CLEANUP, [PIN_REF]);
+      f.ctl.pause = { hit: () => written.resolve(), release: release.promise };
+      const applying = settlement.settle({ ok: true });
+      await written.promise;
+      assert.equal(f.rt.inlineLedgerSize(), 1, "the in-flight inline apply is on the ledger");
+      release.resolve();
+      await applying;
+    });
+    assert.equal(f.rt.inlineLedgerSize(), 0, "a settled inline apply leaves nothing on the ledger");
+    await f.rt.hooks.assertBareClear(f.bare, "owed-pin");
+  });
+
+  it("reports a queued settlement", async (t) => {
+    const c = capture();
+    const f = await faultRig(t, { log: c.log, lateWaitMs: 100 });
+    const { settlement } = await begin(f);
+    const holder = await holdA(f.lifetime);
+    await settlement.settle({ ok: true });
+    await assert.rejects(f.rt.hooks.assertBareClear(f.bare, "owed-pin"), AuthorityRefusal);
+    assert.equal(c.refusals()[0]?.fields?.local_settlement, "queued");
+    holder.release();
+    await holder.done;
+    assert.equal((await f.rt.drainForShutdown({ deadlineAt: Date.now() + 5000 })).result, "drained");
+  });
+
+  it("reports a settlement a drain is applying", async (t) => {
+    const hold = gate();
+    const spliced = gate();
+    const c = capture();
+    const f = await faultRig(t, { log: c.log, lateWaitMs: 5_000, testHooks: { afterLateSplice: async () => { spliced.resolve(); await hold.promise; } } });
+    const { settlement } = await begin(f);
+    await settlement.settle({ ok: true });
+    await spliced.promise;
+    await assert.rejects(f.rt.hooks.assertBareClear(f.bare, "owed-pin"), AuthorityRefusal);
+    assert.equal(c.refusals()[0]?.fields?.local_settlement, "applying");
+    hold.resolve();
+    assert.equal((await f.rt.drainForShutdown({ deadlineAt: Date.now() + 5000 })).result, "drained");
+  });
+
+  it("reports an inline apply paused on its durable write", async (t) => {
+    const c = capture();
+    const f = await faultRig(t, { log: c.log });
+    const written = gate();
+    const release = gate();
+    const callbackReturned = gate();
+    let detached: Promise<void> | undefined;
+    const done = f.rt.withTransaction(async () => {
+      const settlement = await f.rt.hooks.beginBareMutation(f.bare, CLEANUP, [PIN_REF]);
+      f.ctl.pause = { hit: () => written.resolve(), release: release.promise };
+      detached = Promise.resolve().then(() => settlement.settle({ ok: true }));
+      await written.promise;
+      callbackReturned.resolve();
+    });
+    await callbackReturned.promise;
+    await tick();
+    await assert.rejects(f.rt.hooks.assertBareClear(f.bare, "owed-pin"), AuthorityRefusal);
+    assert.equal(c.refusals()[0]?.fields?.local_settlement, "inline");
+    release.resolve();
+    await done;
+    await detached;
+    await f.rt.hooks.assertBareClear(f.bare, "owed-pin");
+  });
+
+  it("reports a settlement whose inline apply was rejected", async (t) => {
+    const c = capture();
+    const f = await faultRig(t, { log: c.log });
+    const { settlement } = await begin(f);
+    f.ctl.failWhen = () => true;
+    await assert.rejects(f.rt.withTransaction(() => settlement.settle({ ok: true })), /injected authority rename failure/);
+    f.ctl.failWhen = undefined;
+    assert.equal(f.rt.inlineLedgerSize(), 0, "a rejected inline apply leaves nothing on the ledger");
+    await assert.rejects(f.rt.hooks.assertBareClear(f.bare, "owed-pin"), AuthorityRefusal);
+    assert.equal(c.refusals()[0]?.fields?.local_settlement, "failed");
+  });
+
+  it("digests an unparsed footprint and never logs its text", async (t) => {
+    const c = capture();
+    const f = await faultRig(t, { log: c.log });
+    await begin(f, "refs/x/secret-ish", "recovery-cleanup-delete-ref");
+    await assert.rejects(f.rt.hooks.assertBareClear(f.bare, "owed-pin"), AuthorityRefusal);
+    const fields = c.refusals()[0]?.fields;
+    assert.equal(fields?.deletion_class, "unparsed");
+    assert.equal(fields?.subject_run, "unknown");
+    assert.equal(fields?.generation, "unknown");
+    assert.equal(fields?.footprint_digest, createHash("sha256").update("recovery-cleanup-delete-ref: refs/x/secret-ish").digest("hex"));
+    assert.ok(!JSON.stringify(fields).includes("secret-ish"));
+  });
+
+  it("omits the digest and the generation for a parsed owed ref", async (t) => {
+    const c = capture();
+    const f = await faultRig(t, { log: c.log });
+    await begin(f, `refs/uzi-owed/run9/${"a".repeat(40)}`, "owed-reconcile-delete-ref");
+    await assert.rejects(f.rt.hooks.assertBareClear(f.bare, "owed-pin"), AuthorityRefusal);
+    const fields = c.refusals()[0]?.fields;
+    assert.equal(fields?.deletion_class, "owed-reconcile-delete-ref");
+    assert.equal(fields?.subject_run, "run9");
+    assert.equal(fields?.generation, "unknown");
+    assert.ok(!("footprint_digest" in fields!));
+  });
+
+  it("a logger that throws never changes the refusal", async (t) => {
+    const f = await faultRig(t, { log: { warn: () => { throw new Error("logger down"); } } });
+    const { operation } = await begin(f);
+    await assert.rejects(f.rt.hooks.assertBareClear(f.bare, "owed-pin"), (error: unknown) =>
+      error instanceof AuthorityRefusal && error.message === message(operation));
+  });
+
+  it("an unreadable slot keeps today's error and logs no diagnostic", async (t) => {
+    const c = capture();
+    const f = await faultRig(t, { log: c.log });
+    await begin(f);
+    const slots = path.join(f.root, ".uzi-authority", "slots");
+    const [file] = fs.readdirSync(slots).filter((n) => n.endsWith(".json"));
+    fs.writeFileSync(path.join(slots, file!), "{}\n", { mode: 0o600 });
+    await assert.rejects(f.rt.hooks.assertBareClear(f.bare, "owed-pin"), AuthorityRefusal);
+    assert.equal(c.refusals().length, 0);
+  });
+
+  it("logs nothing when the bare is clear", async (t) => {
+    const c = capture();
+    const f = await faultRig(t, { log: c.log });
+    await f.rt.hooks.assertBareClear(f.bare, "owed-pin");
+    assert.equal(c.logged.length, 0);
   });
 });

@@ -1444,16 +1444,29 @@ describe("issue #3953 m3: every trip entry reaches neither guard (the state-ack 
       const delivery = watchSwitchDelivery();
       let rowId = 0;
       const forced = base.verdicts?.[0] === "block";
+      let latchTimedOut = false;
       const d = await drive({ ...base, capture, switchRounds: [], rejectAfterGiveUp: forced && capture === "giveup", duringPending: async (c) => {
         if (forced) {
           // Hold the APPLIED request back (the fake api refuses a pending switch's APPLIED before it applies
-          // any reply delay), so the forced gate's presentation is already waiting on the receipt.
+          // any reply delay) until the forced gate's presentation really waits on the receipt: the first
+          // awaitReceiptSettlement entry, after the operator row is ACKed, that sees a receipt pending.
+          let release!: () => void;
+          const waiting = new Promise<void>((resolve) => { release = resolve; });
+          const channelProto = SteeringChannel.prototype as unknown as { awaitReceiptSettlement: (signal?: AbortSignal) => Promise<void>; receiptPending: () => boolean };
+          const settle = channelProto.awaitReceiptSettlement;
+          channelProto.awaitReceiptSettlement = function (this: typeof channelProto, signal?: AbortSignal) {
+            if (rowId > 0 && api.isAcked(c.run_id, rowId) && this.receiptPending()) release();
+            return settle.call(this, signal);
+          };
           const apply = client.applyInputs;
           client.applyInputs = async (...args: Parameters<typeof apply>) => {
-            await new Promise((resolve) => setTimeout(resolve, 150));
+            let timer: NodeJS.Timeout | undefined;
+            const deadline = new Promise<void>((resolve) => { timer = setTimeout(() => { latchTimedOut = true; resolve(); }, 10_000); });
+            await Promise.race([waiting, deadline]);
+            clearTimeout(timer);
             return apply.apply(client, args);
           };
-          restorers.push(() => { client.applyInputs = apply; });
+          restorers.push(() => { client.applyInputs = apply; channelProto.awaitReceiptSettlement = settle; });
         }
         api.pendSwitchAfterNextAck(c.run_id);
         rowId = send(c.run_id, row("follow_up", "operator note while the checker is pending"))[0]!.id;
@@ -1466,6 +1479,7 @@ describe("issue #3953 m3: every trip entry reaches neither guard (the state-ack 
         assert.ok(await handlerWait(() => watched.refused > 0), "the held batch's APPLIED was refused switch_pending");
         assert.ok(await handlerWait(() => delivery.latched()), "the refusal latched under the hold");
       } });
+      assert.equal(latchTimedOut, false, "the forced gate's presentation waited on the receipt while the APPLIED was held back");
       assert.ok(watched.refused > 0, "the held batch's APPLIED was refused switch_pending");
       noInvariant(d.c.run_id);
       assertServicedAfterRelease(d);
@@ -1645,6 +1659,18 @@ describe("issue #3953 m3: the invariant guards (hold bypassed, reservation insta
           "the invariant is logged");
         assert.ok(logged.some((l) => l.level === "warn" && l.message.includes("closed with candidate transport reservation held")),
           "the close logs the reservation it could not release");
+        if (guard.startsWith("G2")) {
+          // Pins close-before-report ordering at dispatchFailure's invariant arm (the batcher is closed
+          // before reportGenericFailure), not that dropping the failure diagnostic is desired: the
+          // diagnostic emitted after the close is refused, and the close persisted one unassigned
+          // event fewer than a report-first order would have held.
+          const late = logged.find((l) => l.level === "warn" && l.message.includes("run message emitted after the batcher closed; not delivered"));
+          assert.ok(late, `a post-close emit is refused and logged: ${JSON.stringify(logged.map((l) => [l.level, l.message]))}`);
+          assert.equal(late.fields?.kind, "error");
+          const closed = logged.find((l) => l.level === "warn" && l.message.includes("closed with candidate transport reservation held"));
+          assert.ok(typeof closed?.fields?.unassigned === "number" && closed.fields.unassigned < 3,
+            `the close precedes the failure report: ${JSON.stringify(closed?.fields)}`);
+        }
         assert.ok(!everyState(c.run_id).some((x) => x.status === "running" && x.candidate_digest === digest), "no approval stored");
         assert.equal(api.crossCheckRequests.length, 0);
         assert.ok(outbox.hasUndrainedMessages(c.run_id), "the batcher close persisted the assigned replay");
@@ -1665,6 +1691,84 @@ describe("issue #3953 m3: the invariant guards (hold bypassed, reservation insta
   }
 });
 
+/** Record every hold SteeringChannel.holdCredentialSwitch hands out and each close() call it receives
+ *  (the real close still runs). Restored after the test via `restorers`. */
+function spyHolds(): { closes: { service: boolean }[] }[] {
+  const proto = SteeringChannel.prototype as unknown as {
+    holdCredentialSwitch: () => { close(o: { service: boolean }): void } };
+  const original = proto.holdCredentialSwitch;
+  const holds: { closes: { service: boolean }[] }[] = [];
+  proto.holdCredentialSwitch = function (this: unknown) {
+    const handle = original.call(this);
+    const seen = { closes: [] as { service: boolean }[] };
+    const close = handle.close.bind(handle);
+    handle.close = (o) => { seen.closes.push(o); close(o); };
+    holds.push(seen);
+    return handle;
+  };
+  restorers.push(() => { proto.holdCredentialSwitch = original; });
+  return holds;
+}
+
+describe("issue #3990: a failed checker leg closes its credential-switch hold without servicing it", () => {
+  it("a reservation that cannot be installed ends the run failed, closes the hold once unserviced and stores nothing", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const holds = spyHolds();
+    const d = await drive({ capture: "giveup",
+      setup: () => { MessageBatcher.prototype.reserveCandidateTransport = () => { throw new Error("no transport"); }; } });
+    failedWith(d.c.run_id, "plan cross-check: transport reservation unavailable");
+    assert.equal(holds.length, 1, "the hold opened before the reservation was attempted, once");
+    assert.deepEqual(holds[0]!.closes, [{ service: false }], "closed exactly once, never serviced");
+    assert.deepEqual(d.storage, [], "no checker approval was stored");
+    assert.ok(!everyState(d.c.run_id).some((s) => s.status === "running" && s.candidate_digest !== undefined), "no approval-bearing report");
+    assert.equal(d.posts().length, 0, "the checker was never asked");
+  });
+});
+
+describe("issue #3990: in-place continuation of retained checked storage", () => {
+  it("a switch that surfaces inside the canonical storage report gives up and continues the retained storage in place: no resubmit, implementation runs", { skip: LINUX_CAPTURE, timeout: 30_000 }, async () => {
+    const seen: string[] = [];
+    let gateEntries = 0;
+    const d = await drive({ capture: "giveup", switchRounds: [],
+      // A recomputed storage report re-enters gatePlan: refuse the re-entry so that run ends promptly, and
+      // assert the recorded entry count after it (rather than leaving the regression to a test timeout).
+      gateMd: (n, md) => {
+        gateEntries = n;
+        if (n > 1) throw new assert.AssertionError({ message: "gatePlan re-entered: the retained storage was recomputed instead of continued" });
+        return md;
+      },
+      setup: (c, x) => {
+        let armed = true;
+        const report = client.reportPlanCrossCheckGateState.bind(client);
+        client.reportPlanCrossCheckGateState = async (id, fields, signal) => {
+          seen.push(`${fields.status}:${fields.candidate_digest ?? ""}`);
+          if (armed && id === c.run_id && fields.status === "running" && fields.candidate_digest === digest) {
+            armed = false;
+            api.requestCredentialSwitch(c.run_id, 1);
+            assert.ok(await handlerWait(() => x.switchSeen.delivered), "the worker polled the switch");
+          }
+          return report(id, fields, signal);
+        };
+      } });
+    const { c, tl } = d;
+    assert.deepEqual(d.attempts, ["attempt", "gave_up"], "the switch was attempted once and the capture gave up");
+    assert.deepEqual(switchReports(c.run_id), ["credential_switch_failed"]);
+    // The first storage send was interrupted by the switch before the server saw it; the retained
+    // operation is continued in place (a second send of the same canonical plan), never recomputed.
+    assert.equal(gateEntries, 1, "gatePlan entered once: the retained storage was continued, not recomputed");
+    assert.equal(d.storage.length, 2, `the interrupted send and the in-place continuation: ${JSON.stringify(seen)}`);
+    assert.equal(d.storage[1], d.storage[0], "the continuation re-sends the same retained storage request");
+    assert.equal(d.storage[0]!.plan_md, NORMALIZED, "the stored plan is the normalized canonical plan");
+    assert.equal(everyState(c.run_id).filter((s) => s.status === "running" && s.candidate_digest === digest).length, 1,
+      "the server stored the canonical plan exactly once");
+    assert.equal(d.posts().length, 1, "one cross-check POST: the decision is never resubmitted");
+    assert.equal(d.counter.calls, 2, "planning turn, then implementation only");
+    assert.ok(tl.events.indexOf("state:credential_switch_failed") < tl.events.lastIndexOf("storage"), "storage continued after the give-up");
+    assert.equal(gates(c.run_id).length, 0);
+    assert.ok(statuses(c.run_id).includes("completed"), JSON.stringify(statuses(c.run_id)));
+    assert.ok(!statuses(c.run_id).includes("failed"));
+  });
+});
+
 describe("issue #3953 m3: semantic coverage forces a human gate after the checker approve (real SemanticPlanningGate)", () => {
   const milestones = [{ id: "m1", title: "A" }];
   const submitted = (issueIid: number | null) => {
@@ -1672,7 +1776,7 @@ describe("issue #3953 m3: semantic coverage forces a human gate after the checke
     p.criteria[0]!.citations[0]!.source_id = "issue:" + issueIid;
     return p;
   };
-  function semanticRig(c: ReturnType<typeof claim>, events: string[]) {
+  function semanticRig(c: ReturnType<typeof claim>, events: string[], switchWhilePending = true) {
     // Isolate gate ordering from native alternate-object capture; no repository mutation.
     git.capturePlanningDiff = async () => Buffer.from("");
     const server = semanticServer(client, events);
@@ -1685,10 +1789,12 @@ describe("issue #3953 m3: semantic coverage forces a human gate after the checke
     const switchSeen = watchSwitchDelivery();
     api.crossCheckHandler = async ({ runId, body }) => {
       const { stage: _stage, claim_generation: _generation, round = 1, ...candidate } = body;
-      events.push("switch-requested");
-      api.requestCredentialSwitch(runId, 1);
-      assert.ok(await handlerWait(() => switchSeen.delivered), "the worker polled the switch while the checker is pending");
-      assert.ok(await handlerWait(() => switchSeen.latched()), "the hold latched the switch");
+      if (switchWhilePending) {
+        events.push("switch-requested");
+        api.requestCredentialSwitch(runId, 1);
+        assert.ok(await handlerWait(() => switchSeen.delivered), "the worker polled the switch while the checker is pending");
+        assert.ok(await handlerWait(() => switchSeen.latched()), "the hold latched the switch");
+      }
       const identity = server.compiled().candidate;
       return { status: 200, body: {
         result: "candidate", round, checker_run_id: child, candidate_digest: identity.digest, candidate_generation: 1,
@@ -1768,6 +1874,41 @@ describe("issue #3953 m3: semantic coverage forces a human gate after the checke
     assert.equal(verdict!.approval, undefined, "a human decided; the checker approve is evidence only");
     assert.ok(!everyState(c.run_id).some((s) => s.status === "running" && s.candidate_digest !== undefined),
       "the checker approve was never stored as an auto approval");
+  });
+
+  it("issue #3990: a switch that surfaces in the coverage review after the approve stashes it; the re-run adopts the approve and takes no human gate", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const c = semanticClaim();
+    const events: string[] = [];
+    // The checker's approve is delivered with no switch pending, so the hold is serviced with nothing latched and
+    // the approve is NOT stashed at the control exit. The switch arrives only inside the coverage review.
+    const server = semanticRig(c, events, false);
+    const transport = await boundedTransport("claude", server.report, events);
+    const status = client.semanticCoverageStatus.bind(client);
+    let raised = false;
+    client.semanticCoverageStatus = async (...args) => {
+      if (!raised && api.crossCheckRequests.some((r) => r.method === "POST")) {
+        raised = true;
+        events.push("switch-in-review");
+        api.requestCredentialSwitch(c.run_id, 1);
+        assert.ok(await until(() => args[2]?.aborted === true, 4000), "the worker tripped the switch into the review's signal");
+        args[2]!.throwIfAborted();
+      }
+      return status(...args);
+    };
+    const verdicts: unknown[] = [];
+    try {
+      await runner(semanticExec(c, verdicts), fakeGitlab().gitlab, undefined, { semanticCoverageTestTransport: transport,
+        planCrossCheckTiming: timing, recoveryRetryMs: 1, planApprovalTimeoutMs: 1500 }).execute(c);
+    } finally { client.semanticCoverageStatus = status; }
+    assert.equal(raised, true, "the switch surfaced after the checker's approve");
+    assert.equal(api.crossCheckRequests.filter((r) => r.method === "POST").length, 1, "never resubmitted");
+    assert.equal(gates(c.run_id).length, 0, JSON.stringify(everyState(c.run_id).map((s) => [s.status, s.failure_reason])));
+    assert.ok(everyState(c.run_id).some((s) => s.status === "running" && s.candidate_digest !== undefined),
+      "the adopted approve was stored: " + JSON.stringify(everyState(c.run_id).map((s) => [s.status, s.failure_reason])));
+    const [verdict] = verdicts as { kind: string; approval?: string }[];
+    assert.equal(verdict?.kind, "approve", JSON.stringify(verdicts));
+    assert.ok(!everyState(c.run_id).some((s) => s.failure_reason !== undefined && s.failure_reason !== null),
+      JSON.stringify(everyState(c.run_id).map((s) => [s.status, s.failure_reason])));
   });
 
   it("a stashed approve whose candidate digest differs from the re-run's compile fails closed", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {

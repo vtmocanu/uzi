@@ -107,7 +107,7 @@ Known residuals, accepted:
 ## Out of scope (recorded so a future reader does not assume it landed)
 
 - **Full cross-worker SDK session durability** — PRD #556's domain; M4 settles for a cold re-implement from a provably-reviewed plan.
-- **Non-`limit_wait` interruptions (crash/eviction/shutdown).** #218 M1 covered the shutdown path for *committed* work; extending the WIP commit there is deferred (the network publish must not be forced into the ~30s termination grace), flagged for a fast-follow.
+- **Non-`limit_wait` interruptions (crash/eviction/shutdown).** #218 M1 covered the shutdown path for *committed* work; extending the WIP commit there is deferred (the network publish must not be forced into the ~30s termination grace) [Later note: #4066 set the worker termination grace to 40 s on compose and hosted pods.], flagged for a fast-follow.
 
 ## Linked from ARCHITECTURE.md
 

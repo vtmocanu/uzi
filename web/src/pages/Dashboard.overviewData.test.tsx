@@ -24,6 +24,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       getAdminUsage: vi.fn(),
       adminListRuns: vi.fn(),
       getRecoveryHolds: vi.fn(),
+      listUsers: vi.fn(),
     },
   };
 });

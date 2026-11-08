@@ -558,3 +558,67 @@ describe("OverviewUsageCard by-user table (#3881 M2)", () => {
     ]);
   });
 });
+
+describe("OverviewUsageCard controlled scope and By user focus (#4042)", () => {
+  function Controlled({ self, admin, scope, onScopeChange, focusByUser }: {
+    self: SelfUsage; admin: AdminUsage; scope: "you" | "all"; onScopeChange: (s: "you" | "all") => void; focusByUser?: number;
+  }) {
+    return (
+      <MemoryRouter>
+        <OverviewUsageCard
+          self={self} admin={admin} window="lifetime" viewerId="owner" onWindowChange={() => {}}
+          scope={scope} onScopeChange={onScopeChange} focusByUser={focusByUser}
+        />
+      </MemoryRouter>
+    );
+  }
+
+  it("draws the scope from the prop, reports a pick and leaves the saved choice to the parent", () => {
+    const { self, admin } = fixture();
+    const onScopeChange = vi.fn();
+    const view = render(<Controlled self={self} admin={admin} scope="all" onScopeChange={onScopeChange} />);
+    expect(view.getByRole("region", { name: "By user" })).toBeTruthy();
+    expect(view.getByRole("button", { name: "All users" }).getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(view.getByRole("button", { name: "You" }));
+    expect(onScopeChange).toHaveBeenCalledWith("you");
+    // Still driven by the prop: no change until the parent passes a new one.
+    expect(view.getByRole("region", { name: "By user" })).toBeTruthy();
+    expect(localStorage.getItem("uzi.overviewUsageScope")).toBeNull();
+    view.rerender(<Controlled self={self} admin={admin} scope="you" onScopeChange={onScopeChange} />);
+    expect(view.queryByRole("region", { name: "By user" })).toBeNull();
+    expect(view.getByRole("region", { name: "Your usage" })).toBeTruthy();
+  });
+
+  it("focuses the By user section when focusByUser is bumped, once per value", () => {
+    const { self, admin } = fixture();
+    const view = render(<Controlled self={self} admin={admin} scope="all" onScopeChange={() => {}} focusByUser={0} />);
+    const byUser = view.getByRole("region", { name: "By user" });
+    expect(byUser.id).toBe("overview-usage-by-user");
+    expect(document.activeElement).not.toBe(byUser);
+    view.rerender(<Controlled self={self} admin={admin} scope="all" onScopeChange={() => {}} focusByUser={1} />);
+    expect(document.activeElement).toBe(byUser);
+    (document.activeElement as HTMLElement).blur();
+    view.rerender(<Controlled self={self} admin={admin} scope="all" onScopeChange={() => {}} focusByUser={1} />);
+    expect(document.activeElement).not.toBe(byUser);
+  });
+
+  it("does not refocus for the same counter value after the section is hidden and shown again", () => {
+    const { self, admin } = fixture();
+    const ui = (scope: "you" | "all", n: number) => (
+      <Controlled self={self} admin={admin} scope={scope} onScopeChange={() => {}} focusByUser={n} />
+    );
+    const view = render(ui("all", 1));
+    expect(document.activeElement).toBe(view.getByRole("region", { name: "By user" }));
+    (document.activeElement as HTMLElement).blur();
+    view.rerender(ui("you", 1));
+    view.rerender(ui("all", 1));
+    expect(document.activeElement).not.toBe(view.getByRole("region", { name: "By user" }));
+  });
+
+  it("focuses the section once it mounts when the scope and the bump arrive together", () => {
+    const { self, admin } = fixture();
+    const view = render(<Controlled self={self} admin={admin} scope="you" onScopeChange={() => {}} focusByUser={0} />);
+    view.rerender(<Controlled self={self} admin={admin} scope="all" onScopeChange={() => {}} focusByUser={1} />);
+    expect(document.activeElement).toBe(view.getByRole("region", { name: "By user" }));
+  });
+});

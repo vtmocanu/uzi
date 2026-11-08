@@ -313,6 +313,9 @@ services:
       args:
         UZI_SRC_SHA: ${UZI_SRC_SHA:-}
     profiles: ["agent"]
+    # The worker's shutdown result deadline is 35 s from the first SIGTERM
+    # (SHUTDOWN_RESULT_DEADLINE_MS in agent/src/main.ts); 5 s margin.
+    stop_grace_period: 40s
     security_opt:
       # Blocks suid privilege GAIN; does NOT block the entrypoint's root -> worker
       # drop (a setuid to a LOWER uid). Stays on post-drop.

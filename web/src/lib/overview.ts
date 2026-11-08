@@ -377,6 +377,9 @@ export function statusSentence(input: {
   counts: OverviewCounts;
   acrossFactory: boolean;
   adminUnavailable: boolean;
+  // Distinct owners among the executing runs (executingPeople over the same rows as counts);
+  // shown only on the factory-wide sentence.
+  executingPeople?: number;
 }): string {
   const { decisions, prs, counts, adminUnavailable } = input;
   const across = input.acrossFactory && !adminUnavailable;
@@ -397,6 +400,9 @@ export function statusSentence(input: {
   const runs =
     `${counts.executing} ${counts.executing === 1 ? "run is" : "runs are"} executing` +
     (across ? " across the factory" : "") +
+    (across && counts.executing > 0 && input.executingPeople !== undefined && input.executingPeople > 0
+      ? ` for ${plural(input.executingPeople, "person", "people")}`
+      : "") +
     (rest.length === 2 ? `, ${rest[0]} and ${rest[1]}` : rest.length === 1 ? ` and ${rest[0]}` : "") +
     ".";
 
