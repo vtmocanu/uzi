@@ -152,7 +152,7 @@ export const mockUsers: User[] = [
 ];
 
 // ?mock=overview-next (issue #4042): user rows for the scenario's other-run owners
-// (overviewNextOtherRunOwners) plus two people with no runs, so the People chip's popover
+// (overviewNextOtherRunOwners) plus three people with no runs, so the People chip's popover
 // shows display names for every active person, a signed-in-within-24-hours row and an idle
 // line with a never-signed-in count. Appended to the roster only under that scenario (see
 // mockApi/shared.ts), so every other mock test and scenario keeps the roster above.

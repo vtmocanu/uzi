@@ -1032,6 +1032,18 @@ describe("OverviewNext People chip", () => {
     );
   });
 
+  it("keeps the Usage by user action pinned on screen when the sheet scrolls (400x400)", async () => {
+    await page.viewport(400, 400);
+    const chip = await mountChip();
+    await userEvent.click(chip);
+    const dialog = await screen.findByRole("dialog", { name: "People using uzi" });
+    inViewport(dialog.getBoundingClientRect(), "dialog");
+    // The content must overflow, or this case proves nothing about the sticky footer.
+    expect(dialog.scrollHeight, "sheet scrolls").toBeGreaterThan(dialog.clientHeight);
+    const action = within(dialog).getByRole("button", { name: "Usage by user →" });
+    inViewport(action.getBoundingClientRect(), "Usage by user");
+  });
+
   it("drives Usage by user from the keyboard: Enter opens, Tab reaches the action, Enter lands on By user", async () => {
     await page.viewport(1280, 900);
     const chip = await mountChip();
