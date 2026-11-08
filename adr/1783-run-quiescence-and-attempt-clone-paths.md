@@ -1487,7 +1487,7 @@ The orphan events gain a closed-set `retirement_subreason`, taken from
 `OrphanRetirementSubreason` in `agent/src/git.ts`: `fenced_source`, `pair_changed`,
 `completion_pending`, `completion_preflight_retained`, `completion_unverified`,
 `completion_uncertain`, `completion_unsupported`, `authority_busy`,
-`published_source_retained` and `unknown`. Anything outside the set is written as
+`published_source_retained`, `remediation_retained` (#4058) and `unknown`. Anything outside the set is written as
 `unknown`, and no error text, path or provider output is included. Outward errors
 are unchanged. See [Reading orphan-reclaim diagnostics](../docs/run-recovery.md#reading-orphan-reclaim-diagnostics).
 

@@ -349,8 +349,9 @@ A few worth knowing:
   for this run only; `run get` shows it as `AGENTS_REQUESTED ... (this run)`.
   It applies to implementation the same way a default does: an approval with
   no agent choice and an autopilot run implement with it, and an explicit choice
-  at the plan gate still wins. Planning is not affected: the plan turn uses your
-  own templates. `--exclude-agents` without `--plan-file` is a usage error
+  at the plan gate still wins. A choice of `repo` also applies to planning; see
+  [Planning with repo agents](repo-agents.md#planning-with-repo-agents).
+  `--exclude-agents` without `--plan-file` is a usage error
   (exit 2); exclude agents at the plan gate instead. Over the API, the same
   choice is `"agent_selection": {"source": "own"|"repo"}` on
   `POST /api/repos/{id}/runs` without `plan_md`; non-empty `exclusions`
@@ -389,12 +390,15 @@ A few worth knowing:
   empty or invalid. See [Repo agents](repo-agents.md#which-folder-is-read).
   `run create` takes the same two flags (see `run create --agent-source`
   above).
-- **`run get` shows the requested and implemented agents.** A run that carries
-  a frozen agent-source request shows `AGENTS_REQUESTED` (for example
-  `repo agents (repo default)`, or `(this run)` for a source chosen at create), and
-  once a selection is recorded `IMPLEMENTED_WITH` shows the roster used, with
-  `(as requested)` or `(changed at approval)` when a request exists. `--json`
-  carries `agent_source_requested` and `agent_source_requested_basis`.
+- **`run get` shows the requested, planning and implemented agents.** A run that
+  carries a frozen agent-source request shows `AGENTS_REQUESTED` (for example
+  `repo agents (repo default)`, or `(this run)` for a source chosen at create or
+  a seeded plan's source) and `PLANNED_WITH`, the agents its plan turn used (with
+  the request's basis when they match it, or `—` when no plan turn was recorded,
+  as on a seeded run). Once a selection is recorded `IMPLEMENTED_WITH` shows the
+  roster used, with `(as requested)` or `(changed at approval)` when a request
+  exists. `--json` carries `agent_source_requested`, `agent_source_requested_basis` and
+  `plan_agent_source`.
 - **`repo list` shows each repo's default agents.** The `DEFAULT_AGENTS` column
   reads `own`, `repo` or `unset`; `--json` carries `agent_source_default`
   (`"own"`, `"repo"` or `null`). The setting is changed on the Repos page; the
@@ -4053,8 +4057,11 @@ for renewal bounds, storage risks and rollout requirements.
 ### Retained recovery adoption failed
 
 `recovery_wait` / `retained_recovery_adoption_failed` means an integrity check
-refused adoption. Local work and custody are preserved; the run is owner-held
-with no automatic retry, regardless of a displayed retry timestamp.
+refused adoption, or that a predecessor's active secret-scan remediation record
+refused source use so the agent did not start. Local work and custody are
+preserved; the run is owner-held with no automatic retry, regardless of a
+displayed retry timestamp. In the remediation case, Resume holds again unless
+that remediation was resolved through a separately authorized route.
 
 Read `uzi run recovery <id>` and export an available archive before deciding.
 Use `uzi run resume <id>` (or `resume-now`) to request another bounded attempt,

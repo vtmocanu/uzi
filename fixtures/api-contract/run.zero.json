@@ -114,6 +114,7 @@
   "agent_exclusions": null,
   "agent_source_requested": null,
   "agent_source_requested_basis": null,
+  "plan_agent_source": null,
   "own_agents": null,
   "anthropic_secret_id": null,
   "anthropic_secret_label": null,

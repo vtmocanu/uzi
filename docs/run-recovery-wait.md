@@ -341,6 +341,11 @@ adoption that failed other than through a connection failure the worker retries
 (connection refused or reset, a dropped socket, or a 502/503/504 answer). Local work and custody are preserved. This is an owner hold
 with **no automatic retry**, regardless of any displayed retry timestamp.
 
+The same cause also holds a successor run whose terminal predecessor's source on
+the worker is under an active secret-scan remediation record (issue #4058): the
+agent did not start, nothing was adopted, and neither quiescence nor adoption was
+attempted. See the remediation paragraph in [Run recovery](run-recovery.md).
+
 1. Read `uzi run recovery <id>` and export an available archive before deciding;
    an earlier archive may omit the latest local work.
 2. Choose `uzi run resume <id>` to request another bounded attempt, or
@@ -391,8 +396,8 @@ and keeps its local work and custody. Export/recover the retained work rather th
 expecting Resume alone to rebind changed storage. Reholding does
 not rebind the owner record or consume the pending execution grant.
 
-This path requires API feature support, exact persisted `adoption_failed`
-evidence, current ownership and proven quiescence. Missing support or unconfirmed
+The adoption path (not the issue #4058 remediation hold) requires API feature
+support, exact persisted `adoption_failed` evidence, current ownership and proven quiescence. Missing support or unconfirmed
 persistence fails closed with custody kept. An uncertain park response uses
 bounded reconciliation and a nonterminal stop; it does not confirm the hold.
 Deploy the API fully before workers; API rollback remains unsupported. See the

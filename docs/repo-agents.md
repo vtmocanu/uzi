@@ -87,30 +87,78 @@ To choose for a single run instead, pass `--agent-source own|repo` to
 `uzi run create` (or `"agent_selection": {"source": "own"|"repo"}` in the API
 create request). The choice overrides your default for that run only, is frozen
 the same way, and shows as "(this run)". It decides the implementation agents
-exactly as a default does; a create-time choice of **repo agents** does not
-change planning. Exclusions are not part of a create-time choice: exclude
+exactly as a default does. Exclusions are not part of a create-time choice: exclude
 agents at the plan gate, or seed a plan with `--plan-file` and `--exclude-agents`.
 Board, chat, schedule and autopilot runs carry no create-time choice, so they
 follow your default.
 
-Planning is not yet affected: the plan turn still uses your own templates. A
-run that carries a default or a create-time choice is claimed only by a worker
-new enough to honour it;
-while every online worker is older, the run stays queued and its health reason
-names the missing worker version (`agent_source_request_v1`).
+A request of **repo agents**, from a default or a create-time choice, also
+applies to planning; see [Planning with repo agents](#planning-with-repo-agents).
+A run that carries a default or a create-time choice is claimed only by a worker
+new enough to honour it; while every online worker is older, the run stays
+queued and its health reason names the missing worker version
+(`agent_source_request_v1`).
 
-The run page's **Agents used** card shows the request and the outcome, for
-example "Requested: my templates (repo default) · Implemented with: my
-templates (as requested)". `uzi run get` shows the same facts as the
-`AGENTS_REQUESTED` and `IMPLEMENTED_WITH` rows, and `uzi repo list` shows each
+The run page's **Agents used** card shows which agents planned and implemented
+the run, for example "Planned with: repo agents (repo default) · Implemented
+with: repo agents (as requested)". When planning used a different source than
+the request, the card also shows the request, for example "Requested: repo
+agents (repo default) · Planned with: my templates · Implemented with: my
+templates (changed at approval)". "Planned with: —" means no planning turn was
+recorded: a seeded run has none, and a worker older than this feature records
+nothing. `uzi run get` shows the same facts as the `AGENTS_REQUESTED`,
+`PLANNED_WITH` and `IMPLEMENTED_WITH` rows, and `uzi repo list` shows each
 repo's setting (`agent_source_default` in `--json`).
+
+## Planning with repo agents
+
+The plan turn runs before you review the plan. It uses the repo's agents only
+when all of these hold:
+
+- the run requests repo agents, from your default on the repo or a per-run
+  choice;
+- a roster was detected at the run's recorded revision (see
+  [Which revision is read](#which-revision-is-read));
+- the run does not record a choice of your templates from an earlier approval.
+
+Otherwise the plan turn uses your own templates. A run with no request plans
+with your templates even when it records repo agents from an earlier autopilot
+or approval, so a recorded choice can keep planning on your templates but never
+switch it to repo agents. When the run records repo agents with exclusions, the
+excluded agents do not plan either. A revision of the plan at the gate uses the
+same agents as the first plan turn.
+
+A repo-sourced plan turn keeps these safeguards:
+
+- **No file-write tools.** On Claude runs each planning subagent loses `Edit`,
+  `Write`, `MultiEdit` and `NotebookEdit`, and a repo agent whose declared tools
+  are only write tools does not take part in planning. On Codex runs the worker
+  refuses the file-write requests a planning agent makes. The shell stays
+  available on both harnesses, so planning is not a read-only sandbox: a repo
+  agent with a shell can still run commands, and those commands can change
+  files.
+- **The usual repo-agent limits.** A repo agent cannot spawn nested agents or
+  schedule deferred work, and on a memory-guarded Claude run its shell goes
+  through the same supervised command tool as your templates.
+- **Unverified output.** The lead's planning instructions say the subagents
+  were defined by the repository, that their output is unverified, and that
+  planning subagents report findings and do not change files.
+- **The recorded revision.** Planning reads the roster at the revision the run
+  records on its first claim, and no agent turn starts before the server
+  confirms that revision.
+
+The run records which agents planned it (`plan_agent_source`, `own` or `repo`)
+when its plan turn starts; a later re-plan replaces the record. The feed shows
+"planning with the repo's agents" with the agent names. The worker sends the
+record only to an API that advertises `plan_agent_source_v1`.
 
 ## Repo agents on Codex runs
 
 On a Codex run the agent selection applies the same way: implementation
 delegates to the roster you chose at the plan gate (by default the detected
 repo roster), honours your exclusions, and falls back to your own templates when
-the selection is invalid. Planning keeps your own templates. The model rule
+the selection is invalid. Planning follows the rules in
+[Planning with repo agents](#planning-with-repo-agents). The model rule
 below applies to both harnesses; Codex also filters tools:
 
 - **Markdown `model:`** maps by vocabulary: a supported Codex role id is a
@@ -306,7 +354,9 @@ Two consequences are worth stating plainly:
   request on that repo.
 
 Repo agents need no opt-in; they are offered at the plan gate whenever the
-repo has a `.claude/agents/` or `.codex/agents/` folder. Two related per-repo opt-ins are separate:
+repo has a `.claude/agents/` or `.codex/agents/` folder. They run before you
+review the plan only when you request them, by setting **repo agents** as your
+default on the repo or choosing them for a run. Two related per-repo opt-ins are separate:
 the repo's own skills and its root `CLAUDE.md`, both off by default (see
 [Agent skills](./skills.md#repo-skills-opt-in-default-off) and
 [Repo instructions](./skills.md#repo-instructions-opt-in-default-off)).

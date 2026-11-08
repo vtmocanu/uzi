@@ -10,8 +10,9 @@ import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import type { Executor, RunContext } from "../src/executor.js";
 import { RunRunner } from "../src/runner.js";
 import { RecoveryCoordinator } from "../src/recovery.js";
+import { CredentialSwitchSignal } from "../src/steering.js";
 import type { BaseAttestationHoldOutcome, ClaimResponse } from "../src/protocol.js";
-import { REPO_AGENT_SOURCE_FEATURE } from "../src/protocol.js";
+import { PLAN_AGENT_SOURCE_FEATURE, REPO_AGENT_SOURCE_FEATURE } from "../src/protocol.js";
 import { api, client, fakeGitlab, fx, installHarness } from "./runner-harness.js";
 
 installHarness();
@@ -672,6 +673,143 @@ describe("repo-agent roster pinned to the default-branch revision (issue #3913)"
       assert.equal(reviewerBody(seen), "Original review body");
       assert.ok(reportedCommits(claim.run_id).every((c) => c === trusted), JSON.stringify(reportedCommits(claim.run_id)));
     });
+  });
+
+  it("PRD #3914 M3: a requested repo plan reads the confirmed pin and records its source after it", async () => {
+    client.protocolFeatures = [REPO_AGENT_SOURCE_FEATURE, PLAN_AGENT_SOURCE_FEATURE];
+    try {
+      const h = HARNESSES[0]!;
+      const trusted = commitOnOrigin({ [h.file]: h.content("Original review body") }, "ship the reviewer");
+      const order: string[] = [];
+      const claim = claimFor(h, { issue_iid: 85, issue_title: "repo-sourced plan", claim_generation: 1, requested_agent_source: "repo" });
+      api.repoAgentSourceAckDelayMs = 200;
+      await newRunner({
+        run: async (ctx) => {
+          order.push(`executor:${api.repoAgentSourceByRun.get(claim.run_id) ?? "none"}:${reviewerBody(ctx) ?? "none"}`);
+          assert.ok(ctx.reportPlanAgentSource, "the api advertised plan_agent_source_v1");
+          await ctx.reportPlanAgentSource!("repo");
+          order.push("reported");
+          return { branch: ctx.branch };
+        },
+      }).execute(claim).finally(() => { api.repoAgentSourceAckDelayMs = 0; });
+      assert.deepEqual(order, [`executor:${trusted}:Original review body`, "reported"]);
+      const bodies = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body);
+      const pin = bodies.findIndex((b) => b.repo_agent_source_commit === trusted);
+      const plan = bodies.findIndex((b) => b.plan_agent_source !== undefined);
+      assert.ok(pin >= 0 && plan > pin, JSON.stringify(bodies));
+      assert.deepEqual(bodies[plan], { status: "running", plan_agent_source: "repo" });
+    } finally {
+      client.protocolFeatures = [];
+    }
+  });
+
+  it("PRD #3914 M3: without plan_agent_source_v1 the worker sends no plan source", async () => {
+    await withFeature(async () => {
+      const h = HARNESSES[0]!;
+      commitOnOrigin({ [h.file]: h.content("Original review body") }, "ship the reviewer");
+      let wired: boolean | undefined;
+      const claim = claimFor(h, { issue_iid: 86, issue_title: "older api", claim_generation: 1, requested_agent_source: "repo" });
+      await newRunner({ run: async (ctx) => { wired = ctx.reportPlanAgentSource !== undefined; return { branch: ctx.branch }; } }).execute(claim);
+      assert.equal(wired, false);
+      assert.ok(!api.states.some((s) => s.runId === claim.run_id && s.body.plan_agent_source !== undefined));
+    });
+  });
+
+  it("PRD #3914 M3: a refused plan source report does not stop the run", async () => {
+    client.protocolFeatures = [REPO_AGENT_SOURCE_FEATURE, PLAN_AGENT_SOURCE_FEATURE];
+    try {
+      const h = HARNESSES[0]!;
+      commitOnOrigin({ [h.file]: h.content("Original review body") }, "ship the reviewer");
+      let finished = false;
+      const claim = claimFor(h, { issue_iid: 87, issue_title: "refused plan source", claim_generation: 1, requested_agent_source: "repo" });
+      api.failStateWhen(claim.run_id, (b) => b.plan_agent_source !== undefined, { httpStatus: 400 });
+      await newRunner({
+        run: async (ctx) => { await ctx.reportPlanAgentSource!("repo"); finished = true; return { branch: ctx.branch }; },
+      }).execute(claim);
+      assert.equal(finished, true, "the executor continued past the refused report");
+    } finally {
+      client.protocolFeatures = [];
+    }
+  });
+
+  it("PRD #3914 M3: a run cancelled while its plan source report stalls starts no provider turn", async () => {
+    client.protocolFeatures = [REPO_AGENT_SOURCE_FEATURE, PLAN_AGENT_SOURCE_FEATURE];
+    let release!: () => void;
+    api.planAgentSourceAckHold = new Promise<void>((resolve) => { release = resolve; });
+    try {
+      const h = HARNESSES[0]!;
+      commitOnOrigin({ [h.file]: h.content("Original review body") }, "ship the reviewer");
+      let providerTurns = 0;
+      const claim = claimFor(h, { issue_iid: 88, issue_title: "stalled plan source", claim_generation: 1, requested_agent_source: "repo" });
+      const execution = newRunner({
+        run: async (ctx) => { await ctx.reportPlanAgentSource!("repo"); providerTurns++; return { branch: ctx.branch }; },
+      }).execute(claim);
+      const stalledAt = Date.now();
+      while (!api.stateWire.some((s) => s.runId === claim.run_id && s.body.plan_agent_source !== undefined)) {
+        assert.ok(Date.now() - stalledAt < 10_000, "the plan source report never reached the api");
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
+      const settled = await Promise.race([
+        execution.then(() => "settled" as const),
+        new Promise<"stalled">((r) => setTimeout(() => r("stalled"), 5_000)),
+      ]);
+      release();
+      await execution;
+      assert.equal(settled, "settled", "execute() waited out the stalled report after the cancel");
+      assert.equal(providerTurns, 0, "no provider turn started after the cancel");
+    } finally {
+      release();
+      api.planAgentSourceAckHold = undefined;
+      client.protocolFeatures = [];
+    }
+  });
+
+  it("PRD #3914 M3: after a confirmed credential switch give-up the plan source report still lands", async () => {
+    client.protocolFeatures = [REPO_AGENT_SOURCE_FEATURE, PLAN_AGENT_SOURCE_FEATURE];
+    try {
+      const h = HARNESSES[0]!;
+      commitOnOrigin({ [h.file]: h.content("Original review body") }, "ship the reviewer");
+      const claim = claimFor(h, { issue_iid: 89, issue_title: "plan source after switch give-up", claim_generation: 1, requested_agent_source: "repo" });
+      const git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
+      const realStatus = git.worktreeStatus.bind(git);
+      const realWip = git.commitWipMarker.bind(git);
+      const outcomes: string[] = [];
+      let spentSwitch = false;
+      let proceeded = false;
+      const rec = recordingLogger();
+      const { gitlab } = fakeGitlab();
+      const runner = new RunRunner(client, git, () => ({
+        executor: {
+          run: async (ctx) => {
+            git.worktreeStatus = (async () => ["M src/impl.ts"]) as typeof git.worktreeStatus;
+            git.commitWipMarker = (async () => false) as typeof git.commitWipMarker;
+            api.requestCredentialSwitch(claim.run_id, 1);
+            const since = Date.now();
+            while (!ctx.signal?.aborted) {
+              assert.ok(Date.now() - since < 10_000, "the credential switch never tripped");
+              await new Promise((r) => setTimeout(r, 5));
+            }
+            outcomes.push(await ctx.attemptCredentialSwitch!());
+            git.worktreeStatus = realStatus;
+            git.commitWipMarker = realWip;
+            spentSwitch = ctx.signal?.aborted === true && ctx.signal.reason instanceof CredentialSwitchSignal;
+            await ctx.reportPlanAgentSource!("repo");
+            proceeded = true;
+            return { branch: ctx.branch };
+          },
+        },
+      }), rec.logger, 20, undefined, { pollMs: 5, planApprovalTimeoutMs: 0, recoveryRetryMs: 1, gitlab });
+      await runner.execute(claim);
+      assert.deepEqual(outcomes, ["gave_up"], "the switch gave up and the run continued on the same claim");
+      assert.equal(spentSwitch, true, "the shared cancel signal still carries the spent switch");
+      assert.equal(proceeded, true, "the executor continued past the plan source report");
+      assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.plan_agent_source === "repo"),
+        JSON.stringify(api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body)));
+      assert.ok(!loggedMessages(rec.lines).includes("could not record the plan agent source"), loggedMessages(rec.lines).join("\n"));
+    } finally {
+      client.protocolFeatures = [];
+    }
   });
 
   it("without the api feature a failed roster report does not stop the run", async () => {

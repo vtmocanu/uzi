@@ -53,6 +53,12 @@ type runsStore struct {
 	latestToolUseArg  []uuid.UUID
 	latestToolUseErr  error
 
+	// PRD #4040 pending_question: scripted newest-question rows, the id slice of EACH
+	// PendingQuestionsForRuns call, and an error to inject. Zero calls is the default.
+	pendingQuestionRows  []store.PendingQuestionsForRunsRow
+	pendingQuestionCalls [][]uuid.UUID
+	pendingQuestionErr   error
+
 	// PRD #1353 milestones_live: scripted frames for the run-detail live-lanes derivation.
 	// Empty by default so GetRun reads milestones_live: null and unrelated tests are unaffected.
 	liveLaneRows     []store.LiveLaneFramesForRunRow
@@ -1953,6 +1959,27 @@ func (s *runsStore) ListJudgeTriageRowsForRuns(_ context.Context, arg store.List
 func (s *runsStore) ListPlanRevisionStateForRuns(_ context.Context, runIds []uuid.UUID) ([]store.ListPlanRevisionStateForRunsRow, error) {
 	s.planRevisionRunArg = runIds
 	return s.planRevisionRunRows, s.planRevisionRunErr
+}
+
+// PendingQuestionsForRuns backs the owner list's pending_question (PRD #4040). It records
+// every call's ids and, like the real `run_id = ANY($1)` predicate, returns only scripted
+// rows whose RunID was requested.
+func (s *runsStore) PendingQuestionsForRuns(_ context.Context, runIds []uuid.UUID) ([]store.PendingQuestionsForRunsRow, error) {
+	s.pendingQuestionCalls = append(s.pendingQuestionCalls, append([]uuid.UUID(nil), runIds...))
+	if s.pendingQuestionErr != nil {
+		return nil, s.pendingQuestionErr
+	}
+	want := make(map[uuid.UUID]bool, len(runIds))
+	for _, id := range runIds {
+		want[id] = true
+	}
+	var out []store.PendingQuestionsForRunsRow
+	for _, row := range s.pendingQuestionRows {
+		if want[row.RunID] {
+			out = append(out, row)
+		}
+	}
+	return out, nil
 }
 
 // LatestToolUseForRuns backs the current_activity "now" line (PRD #1064 M2). The default

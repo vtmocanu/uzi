@@ -242,7 +242,8 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    `worker_memory_pressure` (regardless of remaining interventions),
    or `retained_recovery_exhausted` with its retry stamp explicitly null: the poller
    stops on it (exit 0) because only the owner can Resume or Cancel; back up first (`uzi-watcher` recovery).
-   Adoption failure means an integrity check refused adoption, with local work and custody
+   Adoption failure is an integrity hold: retained adoption or a predecessor remediation
+   record refused source use (the agent did not start), with local work and custody
    preserved and no automatic retry. Resume requests a bounded attempt; success is not assured,
    and repeated failure holds again. Unwitnessed means a claimed flight was never seen starting; claim released, work and custody kept, no automatic retry, not an integrity refusal. `paused` stops the poller because it never
    resumes on its own: read `hold_reason`. A run that hit its wall-clock limit is `paused`

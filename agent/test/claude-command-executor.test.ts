@@ -133,8 +133,8 @@ const promptOf = (options: SdkOptions): string => {
   const sp = options.systemPrompt;
   return typeof sp === "object" && sp !== null && "append" in sp ? String(sp.append) : String(sp);
 };
-const agentsOf = (options: SdkOptions): Record<string, { prompt: string; tools?: string[] }> =>
-  (options.agents ?? {}) as Record<string, { prompt: string; tools?: string[] }>;
+const agentsOf = (options: SdkOptions): Record<string, { prompt: string; tools?: string[]; disallowedTools?: string[] }> =>
+  (options.agents ?? {}) as Record<string, { prompt: string; tools?: string[]; disallowedTools?: string[] }>;
 
 describe("default-off: no ctx.capturedMemory", () => {
   it("keeps the options, hooks, prompts and roster of an unguarded run", async () => {
@@ -243,6 +243,36 @@ describe("guard-bound run", () => {
     }
     assert.ok(statuses.some((t) => t.includes("not planning with scoped") && t.includes(UNAVAILABLE_TEXT)));
     assert.ok(statuses.some((t) => t.includes("not implementing with scoped") && t.includes(UNAVAILABLE_TEXT)));
+  });
+
+  it("PRD #3914 M3: a repo-sourced plan roster is shaped to the guarded command lane", async () => {
+    const { queryFn, seen } = fakeTurns(planAndDone());
+    const { capture } = fakeCapture();
+    const statuses: string[] = [];
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({
+      capturedMemory: capture,
+      emit: (m) => { const text = (m.payload as { text?: unknown } | undefined)?.text; if (typeof text === "string") statuses.push(text); },
+      agents: [template("coder", ["Bash", "Read"])],
+      repoAgents: [template("repo-coder", ["Bash", "Read", "Edit"]), template("repo-scoped", ["Bash(git status:*)", "Read"])],
+      requestedAgentSource: "repo",
+    }));
+    const plan = agentsOf(seen[0]!);
+    assert.deepEqual(Object.keys(plan), ["repo-coder"]);
+    assert.equal(plan["repo-coder"]!.tools?.[0], GUARDED_COMMAND_TOOL);
+    assert.equal(plan["repo-coder"]!.tools?.includes("Bash"), false);
+    assert.equal(plan["repo-coder"]!.tools?.includes("Edit"), false);
+    assert.ok(plan["repo-coder"]!.disallowedTools?.includes("Write"));
+    assert.ok(promptOf(seen[0]!).includes(`- repo-scoped: ${UNAVAILABLE_TEXT}`));
+    const guard = seen[0]!.hooks!.PreToolUse!.find((m) => m.matcher === NESTED_AGENT_TOOL)!.hooks[0]!;
+    const call = (sub: string) => guard({ hook_event_name: "PreToolUse", tool_name: NESTED_AGENT_TOOL,
+      tool_input: { subagent_type: sub, prompt: "do it" }, tool_use_id: "u1", session_id: "s", transcript_path: "", cwd: "" } as never,
+      "u1", { signal: new AbortController().signal });
+    const scoped = await call("repo-scoped") as { hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string } };
+    assert.equal(scoped.hookSpecificOutput?.permissionDecision, "deny");
+    assert.ok(scoped.hookSpecificOutput?.permissionDecisionReason?.includes(UNAVAILABLE_TEXT));
+    const own = await call("coder") as { hookSpecificOutput?: { permissionDecision?: string } };
+    assert.equal(own.hookSpecificOutput?.permissionDecision, "deny");
+    assert.ok(statuses.some((t) => t.includes("not planning with repo-scoped") && t.includes(UNAVAILABLE_TEXT)));
   });
 
   it("captures the memory context once per turn and a renewal never aborts the approval handoff", async () => {
