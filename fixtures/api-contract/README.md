@@ -294,7 +294,7 @@ src/lib/apiContract.test.ts(70,9): error TS2322: Type '"base_branch" | "branch_h
 ```
 
 `RunListItem`'s own fields (`repo_path`, `worker_name`, `owner_email`,
-`judge_verdict`, `judge_todo_count`, `is_revising`) match; only the inherited 7 drift.
+`judge_verdict`, `judge_todo_count`, `is_revising`, `cross_check_active`) match; only the inherited 7 drift.
 
 When M4 adds the missing TS fields the directive becomes unused and **tsc itself
 forces its removal** (an unused `@ts-expect-error` is an error), so the ratchet is
