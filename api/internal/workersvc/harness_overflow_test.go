@@ -140,7 +140,7 @@ func TestHarnessOverflowOffPreservesResolverMatrix(t *testing.T) {
 	for _, explicit := range []*Harness{nil, &claude, &codex, &invalid} {
 		for _, preference := range []*Harness{nil, &claude, &codex, &invalid} {
 			for _, a := range []harnessAvailability{{}, {claudeUsable: true}, {codexUsable: true}, {claudeUsable: true, codexUsable: true}} {
-				preferred, err := resolveHarness(resolveHarnessInput{explicit: explicit, userDefault: preference, avail: a})
+				preferred, _, err := resolveHarness(resolveHarnessInput{explicit: explicit, userDefault: preference, avail: a})
 				if err != nil {
 					continue // The unchanged resolver's existing tests pin refusals.
 				}

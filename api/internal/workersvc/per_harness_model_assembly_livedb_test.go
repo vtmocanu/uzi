@@ -1,6 +1,7 @@
 package workersvc
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -142,6 +143,59 @@ func TestAssembleCodexReviewClaimShipsNoModelLiveDB(t *testing.T) {
 	}
 	if payload.Config.DefaultModel != nil {
 		t.Fatalf("a Codex task-review claim must ship NO default_model (built-in gpt-6-sol); got %q", *payload.Config.DefaultModel)
+	}
+}
+
+// failingLaneQueries wraps the real store and fails GetUserHarnessModelDefaults, counting calls.
+type failingLaneQueries struct {
+	*store.Queries
+	laneReads *int
+}
+
+func (f failingLaneQueries) GetUserHarnessModelDefaults(context.Context, uuid.UUID) (store.GetUserHarnessModelDefaultsRow, error) {
+	*f.laneReads++
+	return store.GetUserHarnessModelDefaultsRow{}, errors.New("owner lane read must not happen for a Codex review claim")
+}
+
+// TestAssembleCodexReviewClaimDoesNotReadOwnerLaneLiveDB pins the Codex-review half of the conditional
+// lane read: with GetUserHarnessModelDefaults failing, a fully-bound Codex task-review claim still
+// assembles, ships no default_model, and never attempted the lane read.
+//
+// MUTATION: drop the `harness != HarnessCodex || !isReviewRun` half of the lane-read condition in
+// claim_assembly.go — the read is attempted, the claim fails on it and this test fails.
+func TestAssembleCodexReviewClaimDoesNotReadOwnerLaneLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	userID, workerID, repoID := env.seedCodexInfra(t)
+	resealBotPAT(t, env, userID)
+
+	targetID := uuid.New()
+	env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, branch, base_branch, issue_title, issue_description, status, harness)
+	          VALUES ($1, $2, $3, 'task', $4, 'main', 't', 'd', 'completed', 'codex')`,
+		targetID, userID, repoID, "uzi/task/"+targetID.String())
+	reviewID := uuid.New()
+	env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, branch, base_branch, review_target_run_id, dispatched_at, issue_title, issue_description, status, worker_id, harness)
+	          VALUES ($1, $2, $3, 'task', $4, 'main', $5, now(), 't', 'd', 'claimed', $6, 'codex')`,
+		reviewID, userID, repoID, "uzi/task/"+reviewID.String(), targetID, workerID)
+
+	aliasID := env.seedLinkedSubscription(t, userID, "codex-review-"+uuid.NewString(), codexToken("access"), codexToken("refresh"))
+	reads := 0
+	svc := New(failingLaneQueries{Queries: env.q, laneReads: &reads}, env.box, testParams())
+	svc.SetVault(env.vlt)
+	if err := svc.FreezeCodexBinding(env.ctx, userID, reviewID, aliasID, codexAuthModeSubscription); err != nil {
+		t.Fatalf("FreezeCodexBinding on the review run: %v", err)
+	}
+
+	run := mustRun(t, env, reviewID)
+	harnessOnly := store.Worker{ID: workerID, UserID: userID, ProtocolCapabilities: []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}}
+	payload, err := svc.assembleClaim(env.ctx, harnessOnly, run)
+	if err != nil {
+		t.Fatalf("a Codex review claim must assemble with the owner lane read failing: %v", err)
+	}
+	if payload.Config.DefaultModel != nil {
+		t.Fatalf("a Codex task-review claim must ship NO default_model; got %q", *payload.Config.DefaultModel)
+	}
+	if reads != 0 {
+		t.Fatalf("Codex review claim read the owner lane %d times, want 0", reads)
 	}
 }
 
