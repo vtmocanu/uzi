@@ -939,6 +939,9 @@ describe("OverviewNext People chip", () => {
     // The chip renders once the admin list has loaded; wait for the users too so the
     // popover holds its full content (names, signed-in group, idle line) before measuring.
     const chip = await screen.findByRole("button", { name: /^People: \d+ active now of \d+$/ });
+    // The usage data loads separately from the admin lists. Wait for the Usage card, so the
+    // footer action reads "Usage by user →" (not unavailable) and the card can be queried.
+    await screen.findByRole("group", { name: "Usage scope" });
     await document.fonts.ready;
     return chip;
   }
