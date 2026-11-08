@@ -527,6 +527,49 @@ partial decision the owner had usually already seen in the plan.
   guards. Scope notes are capped, so the submitted plan keeps the complete
   acceptance text.
 
+## Addendum — ci_fix publication scoped to its creation-bound PR (2026-11-08, #4079)
+
+The #3120 resolver finds the source run of a `ci_fix` by branch. A branch can
+carry several runs with recorded pull/merge requests, so the source could be
+ambiguous or come from an unrelated PR. A `ci_fix` is now bound to one PR when
+it is created, and the resolver scopes to it.
+
+- **Binding.** `workersvc.createCIFixRun` (shared by the manual button, `uzi ci
+  fix` and the automatic poller) reads the PRs uzi itself recorded on runs whose
+  branch is the `ci_fix` ref (cap 8; more is ambiguous), asks the forge about
+  each, and stores the single open one. Exactly one open binds; none open or all
+  merged/closed leaves the fix unbound, as before.
+- **Dedicated column.** The result is `runs.ci_fix_mr_iid`, not `runs.mr_iid`.
+  `mr_iid` is written by completion and reconcile and read by autofix
+  candidates, the PR description and the run DTO; overloading it would change
+  what those show.
+- **Classification and precedence.** Open on the same branch is a match;
+  merged or closed is not open; 404, a malformed or mismatched answer, an
+  unknown state, or open on another branch is unresolvable; transport, 401/403,
+  rate limit, the 15 s budget, or a `locked` PR is unavailable (a bad token says
+  nothing about the PR, and `locked` is transient). Unavailable wins and is
+  retryable (manual 502; the poller leaves the pipeline unrecorded). Otherwise
+  any unresolvable, more than 8, or two or more open refuse (manual 409; the
+  poller records the pipeline without spending an attempt). The existing
+  refusals (branch in use, active fix or `mr_rework`) still win over forge errors.
+- **Recheck narrows, does not serialize.** `ErrCIFixBindingChanged` fires when
+  the recorded PR set differs between the forge check and the insert. It does
+  not serialize: completion and reconcile writers do not take the run-branch
+  lock, so a write can still land after the recheck.
+- **Publication.** For a bound `ci_fix`, the source-publication context
+  considers only runs recorded on the bound PR and their `mr_rework` ancestry.
+  The guarantee is the existing publication-time forge check: the bound PR is
+  open on that branch at that instant. There is no lease, and a closed PR
+  reopened on the same head is an accepted race.
+- **Accepted narrowing.** For a bound `ci_fix`, same-branch rows with a NULL
+  `mr_iid` (for example a failed older issue run with a non-closing restriction)
+  no longer influence it.
+- **Legacy rows unchanged.** Unbound and older `ci_fix` rows resolve exactly as
+  before and are not repaired. Two non-rework roots on the bound PR still give
+  `ambiguous_source`.
+
+User-facing behavior: [Automatic CI fixes](../docs/ci-autofix.md#when-the-branchs-pull-request-cant-be-determined) and [Completion holds](../docs/run-completion-hold.md).
+
 ## Semantic default-on amendment: semantic auditing did not ship (2026-10-17, #1230/#1231; status updated 2026-10-24)
 
 Semantic completion auditing did not ship. #1231 and #1233 were closed not planned on 2026-10-23 because no supported credential path gives an enforceable whole-call bound for subscription credentials. The text below is the historical design of 2026-10-17 to 2026-10-21, kept for its rationale; where it says "planned", read "not planned".

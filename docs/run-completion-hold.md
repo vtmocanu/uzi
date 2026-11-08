@@ -514,6 +514,20 @@ pinned head was verifiably archived. Preservation does not promise a remote copy
 The guard does not rewrite offending messages or force-push to repair a
 refusal; the owner recovers and corrects the preserved work.
 
+A `ci_fix` is bound to its pull/merge request when it is created (#4079),
+whether from **Fix CI**, `uzi ci fix` or the automatic poller. Creation reads
+each PR uzi recorded on its own runs for that branch, checks it on the forge,
+and stores the single open one in `runs.ci_fix_mr_iid` (`runs.mr_iid` is
+unchanged). For a bound `ci_fix` the source-publication context considers only
+runs recorded on that PR and their `mr_rework` ancestry; same-branch rows with
+no recorded PR, such as a failed older issue run with a non-closing restriction,
+no longer influence it. Unbound and older `ci_fix` rows resolve as before and
+are not repaired. The publication-time forge check confirms the bound PR is
+open on that branch at that instant: there is no lease, and a closed PR
+reopened on the same head is an accepted race. Two non-rework roots on the
+bound PR still refuse as `ambiguous_source`. Creation refusals are in
+[Automatic CI fix](ci-autofix.md#when-the-branchs-pull-request-cant-be-determined).
+
 A new worker without the negotiated feature refuses affected refreshes.
 Old workers retain their earlier publication behavior. New workers against
 old APIs refuse affected refreshes; source-issue runs retain their earlier

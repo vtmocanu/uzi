@@ -639,6 +639,7 @@ Tracked as GitLab issue vtmocanu/uzi#71; PRD at `prds/done/71-ci-autofix.md`.
 - Scope: this is the `ci_fix` lane only. Failures on the default branch are the `ci-repair` scheduled lane (Feature #2865), not auto-fixed here. (AI-synced 2026-10-14)
 - Loop-guarded: max 2 automatic attempts per branch + an early stop when the failure hasn't changed; on giving up, uzi comments + notifies and stops (the manual Fix CI button remains). [user 2026-07-17]
 - "Usually we fix the code, not CI itself, but if CI is really at fault we can add a CI fix in the MR" — code fixes push automatically; a fix that edits the CI config passes the approval gate (human-approved before it pushes). [user 2026-07-17]
+- A CI fix is bound at creation to the one open PR among those uzi recorded for the branch; when that cannot be determined or verified, none is created (manual button: 409/502; automatic: retried or skipped without spending an attempt), and its source-publication context is scoped to that PR. (AI-synced 2026-11-08)
 
 ## Feature #72 — PRD lifecycle inside the run
 
