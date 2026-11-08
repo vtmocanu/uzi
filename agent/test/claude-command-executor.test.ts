@@ -600,3 +600,157 @@ describe("protected CLI roots and executor seams", () => {
     assert.deepEqual(await executor.settleWorkerCommands(10), { confirmed: false }, "an unconfirmed lane never settles");
   });
 });
+
+// Issue #4076: a credential switch that gives up leaves the shared cancel signal aborted with a
+// CredentialSwitchSignal. The retried turn's guarded commands must still run.
+describe("guarded commands after a given-up credential switch (#4076)", () => {
+  const TOOL_INPUT = { command: "echo hi" };
+
+  function liveCapture(): { capture: () => CapturedMemoryContext } {
+    const { capture } = fakeCapture();
+    return {
+      capture: () => {
+        const captured = capture() as unknown as { commands: Record<string, unknown> };
+        Object.assign(captured.commands, {
+          isCurrent: () => true,
+          admissionReason: () => undefined,
+          admissionMessage: () => "x",
+          phaseRevision: () => 1,
+        });
+        return captured as unknown as CapturedMemoryContext;
+      },
+    };
+  }
+
+  /** Attribute and run one guarded command on the executor's lane; launch is stubbed and counted. */
+  function guardedRunner(executor: SdkExecutor): { run: (id: string) => Promise<string>; launches: { n: number } } {
+    const launches = { n: 0 };
+    let stubbed: ClaudeCommandLane | undefined;
+    return {
+      launches,
+      run: async (id) => {
+        const lane = (executor as unknown as { guardLane: ClaudeCommandLane }).guardLane;
+        if (stubbed !== lane) {
+          (lane as unknown as { launch: () => Promise<never> }).launch = async () => { launches.n++; throw new Error("sentinel-launch"); };
+          stubbed = lane;
+        }
+        await (lane.hook as (input: unknown) => Promise<unknown>)({
+          hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: TOOL_INPUT, tool_use_id: id,
+        });
+        const result = await lane.handle(TOOL_INPUT, { _meta: { "claudecode/toolUseId": id } });
+        return result.content.map((c) => c.text ?? "").join("");
+      },
+    };
+  }
+
+  /** A turn that runs one guarded command, then yields `messages`. */
+  function commandTurn(run: (id: string) => Promise<string>, id: string, texts: string[], messages: SDKMessage[]): (signal: AbortSignal) => AsyncIterable<SDKMessage> {
+    return () => (async function* () {
+      texts.push(await run(id));
+      yield* messages;
+    })();
+  }
+
+  it("a planning turn retried after a given-up switch runs its guarded command", async () => {
+    const cancel = new AbortController();
+    const texts: string[] = [];
+    let switches = 0;
+    let runner!: ReturnType<typeof guardedRunner>;
+    const { queryFn, seen } = fakeTurns([
+      actThenHang(() => cancel.abort(new CredentialSwitchSignal())),
+      (signal) => commandTurn((id) => runner.run(id), "toolu_1", texts, [submitPlan("plan"), resultSuccess()])(signal),
+      [signalDone(), resultSuccess()],
+    ]);
+    const executor = new SdkExecutor(nullLogger(), homeDir, { queryFn });
+    runner = guardedRunner(executor);
+    await executor.run(makeCtx({
+      capturedMemory: liveCapture().capture,
+      signal: cancel.signal,
+      attemptCredentialSwitch: async () => { switches++; return "gave_up"; },
+    }));
+    assert.equal(switches, 1);
+    assert.equal(seen.length, 3, "aborted plan turn, retried plan turn, implement turn");
+    assert.equal(texts.length, 1);
+    assert.ok(texts[0]!.includes("Command could not be started: sentinel-launch"), String(texts[0]));
+    assert.equal(runner.launches.n, 1);
+  });
+
+  it("an implement turn retried after a given-up switch runs its guarded command", async () => {
+    const cancel = new AbortController();
+    const texts: string[] = [];
+    let switches = 0;
+    let runner!: ReturnType<typeof guardedRunner>;
+    const { queryFn, seen } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      actThenHang(() => cancel.abort(new CredentialSwitchSignal())),
+      (signal) => commandTurn((id) => runner.run(id), "toolu_2", texts, [signalDone(), resultSuccess()])(signal),
+    ]);
+    const executor = new SdkExecutor(nullLogger(), homeDir, { queryFn });
+    runner = guardedRunner(executor);
+    await executor.run(makeCtx({
+      capturedMemory: liveCapture().capture,
+      signal: cancel.signal,
+      attemptCredentialSwitch: async () => { switches++; return "gave_up"; },
+    }));
+    assert.equal(switches, 1);
+    assert.equal(seen.length, 3, "plan turn, aborted implement turn, retried implement turn");
+    assert.equal(texts.length, 1);
+    assert.ok(texts[0]!.includes("Command could not be started: sentinel-launch"), String(texts[0]));
+    assert.equal(runner.launches.n, 1);
+  });
+
+  it("behaviour check: a command in the turn of a pending switch is refused as cancelled", async () => {
+    const cancel = new AbortController();
+    const texts: string[] = [];
+    let runner!: ReturnType<typeof guardedRunner>;
+    const { queryFn } = fakeTurns([
+      // eslint-disable-next-line require-yield
+      (signal) => (async function* () {
+        cancel.abort(new CredentialSwitchSignal());
+        texts.push(await runner.run("toolu_3"));
+        await hang(signal);
+      })(),
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const executor = new SdkExecutor(nullLogger(), homeDir, { queryFn });
+    runner = guardedRunner(executor);
+    await executor.run(makeCtx({
+      capturedMemory: liveCapture().capture,
+      signal: cancel.signal,
+      attemptCredentialSwitch: async () => "gave_up",
+    }));
+    assert.equal(texts.length, 1);
+    assert.ok(texts[0]!.includes("cancelled before it started"), String(texts[0]));
+    assert.equal(runner.launches.n, 0);
+  });
+
+  it("behaviour check: a terminal lifecycle stop after the give-up still refuses guarded commands", async () => {
+    const cancel = new AbortController();
+    const terminal = new AbortController();
+    const texts: string[] = [];
+    let runner!: ReturnType<typeof guardedRunner>;
+    const { queryFn } = fakeTurns([
+      actThenHang(() => cancel.abort(new CredentialSwitchSignal())),
+      // eslint-disable-next-line require-yield
+      (signal) => (async function* () {
+        terminal.abort(new Stop());
+        texts.push(await runner.run("toolu_4"));
+        await hang(signal);
+      })(),
+      [signalDone(), resultSuccess()],
+    ]);
+    const executor = new SdkExecutor(nullLogger(), homeDir, { queryFn });
+    runner = guardedRunner(executor);
+    const outcome = await executor.run(makeCtx({
+      capturedMemory: liveCapture().capture,
+      signal: cancel.signal,
+      terminalLifecycleSignal: terminal.signal,
+      attemptCredentialSwitch: async () => "gave_up",
+    })).then(() => undefined, (err: unknown) => err);
+    assert.equal(texts.length, 1);
+    assert.ok(texts[0]!.includes("cancelled before it started"), String(texts[0]));
+    assert.equal(runner.launches.n, 0);
+    assert.ok(outcome instanceof Error && /run cancelled/.test(outcome.message), "the run ends as cancelled");
+  });
+});
