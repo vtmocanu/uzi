@@ -27,7 +27,7 @@ SET LOCAL lock_timeout = '30s';
 -- or an active row is not paused or queued (live rows must be drained first); then end the
 -- paused/queued active rows as failed with the same terminal bookkeeping as the 00397 rollback,
 -- keeping session, custody, captures and sources untouched. Only this migration's columns are
--- dropped; the required-recovery identity of 00415 is not touched.
+-- dropped; the required-recovery identity of 00417 is not touched.
 LOCK TABLE runs IN ACCESS EXCLUSIVE MODE;
 -- +goose StatementBegin
 DO $$

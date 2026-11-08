@@ -1358,7 +1358,7 @@ chain in the diagram above, with no intervening `running`.
 - **claimed or running → paused (Codex policy hold)** (`hold_reason=codex_policy_hold`, issue #3607).
   A root Codex provider policy refusal on an eligible run pauses it with work and custody
   preserved; the owner resumes per exact episode, and rollback is drain-only. Decisions,
-  residual limits and the guarded migration Downs (00414 and 00413) are in
+  residual limits and the guarded migration Downs (00418 and 00417) are in
   [ADR-3607](adr/3607-compact-policy-hold-m1-isolation.md#consent-and-continuity-m2m3);
   owner behaviour is in [docs/run-pause.md](docs/run-pause.md#held-on-a-codex-policy-refusal).
 

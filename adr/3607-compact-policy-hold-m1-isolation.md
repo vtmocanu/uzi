@@ -446,18 +446,18 @@ already exist. A released worker image that advertises
 re-hold as `session_missing` without starting a conversation, so the API rolls
 first and capable workers follow.
 
-### Guarded Downs (migrations 00416 and 00415, "Shape A")
+### Guarded Downs (migrations 00418 and 00417, "Shape A")
 
-00415 adds the recorded hold cause and the required-head and recovery-verification
-columns, 00416 the one-claim Fresh generation columns and a `NOT VALID` shape check, and 00417 validates it. The
-Downs are guarded and run one version at a time from 00417: 00416 and 00415 refuse
+00417 adds the recorded hold cause and the required-head and recovery-verification
+columns, 00418 the one-claim Fresh generation columns and a `NOT VALID` shape check, and 00419 validates it. The
+Downs are guarded and run one version at a time from 00419: 00418 and 00417 refuse
 live or orphan rows and convert paused or queued active rows to failed, and refuse
 any other live row (claimed, running, `recovery_wait`, `limit_wait`, `pool_wait`,
 `awaiting_*`) that still carries an active policy requirement; live rows without
-policy state do not block. 00415 also refuses any live row where
+policy state do not block. 00417 also refuses any live row where
 `policy_preserve_required AND policy_resolved_at IS NOT NULL`, even with no head
 (the normal state after a `preserve` or `fresh_one_claim` resume). Each is one transaction, so a `RAISE` rolls back fully;
-each holds `ACCESS EXCLUSIVE` on `runs`. 00415's Down is destructive for the hold
+each holds `ACCESS EXCLUSIVE` on `runs`. 00417's Down is destructive for the hold
 cause and recovery identity columns of every row. Rollback is drain-only; the
 operator procedure is in
 [Rolling back](../docs/run-pause.md#rolling-back). Rejected: quiescing workers
@@ -465,7 +465,7 @@ alone, which leaves an old API able to resume rows it does not understand.
 
 ### Mcv not added
 
-A separate validation migration for the 00415 check (an "Mcv") was not added. The
+A separate validation migration for the 00417 check (an "Mcv") was not added. The
 dba judged it optional: the API is a single Recreate-strategy instance, and the
 check cannot fail on the new all-NULL columns.
 

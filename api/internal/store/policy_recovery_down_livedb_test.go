@@ -18,10 +18,10 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// downFx is one isolated database migrated to 417 (the head, so the production queries run) with real
-// rows produced by those queries. The 415 rollback tests call mc() once their rows exist: it walks
-// 417 -> 416 -> 415 through migration 417's and 416's Downs, which for these fixtures (no one-claim
-// Fresh authorization) convert nothing, so the migration 415 Down then runs against exactly the rows
+// downFx is one isolated database migrated to 419 (the head, so the production queries run) with real
+// rows produced by those queries. The 417 rollback tests call mc() once their rows exist: it walks
+// 419 -> 418 -> 417 through migration 419's and 418's Downs, which for these fixtures (no one-claim
+// Fresh authorization) convert nothing, so the migration 417 Down then runs against exactly the rows
 // the production queries produced.
 type downFx struct {
 	t                   *testing.T
@@ -39,7 +39,7 @@ var recoveryColumns = []string{"policy_required_head", "policy_recovery_verified
 func newDownFx(t *testing.T) *downFx {
 	t.Helper()
 	ctx, dsn := standIsolatedDB(t, "policy_recovery_down_")
-	if err := store.MigrateTo(ctx, dsn, 417); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 419); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := store.OpenPool(ctx, dsn)
@@ -57,13 +57,13 @@ func newDownFx(t *testing.T) *downFx {
 	return f
 }
 
-// mc rolls the head migration back to 415 so a test can exercise migration 415's own Down.
+// mc rolls the head migration back to 417 so a test can exercise migration 417's own Down.
 func (f *downFx) mc() {
 	f.t.Helper()
 	if f.atMc {
 		return
 	}
-	for _, step := range []int64{416, 415} {
+	for _, step := range []int64{418, 417} {
 		if err := store.MigrateDownTo(f.ctx, f.dsn, step); err != nil {
 			f.t.Fatalf("Down to %d: %v", step, err)
 		}
@@ -140,7 +140,7 @@ func (f *downFx) queuedSavedWork(head string) uuid.UUID {
 	return id
 }
 
-// row is the run as JSON without the four columns migration 415 adds.
+// row is the run as JSON without the four columns migration 417 adds.
 func (f *downFx) row(id uuid.UUID) map[string]any {
 	f.t.Helper()
 	var raw []byte
@@ -184,16 +184,16 @@ func (f *downFx) columns(names ...string) int {
 	return n
 }
 
-// refused asserts a Down to 414 fails with a message naming why, changing nothing at all.
+// refused asserts a Down to 416 fails with a message naming why, changing nothing at all.
 func (f *downFx) refused(wantMsg string) {
 	f.t.Helper()
 	f.mc()
 	before := f.snapshot()
-	err := store.MigrateDownTo(f.ctx, f.dsn, 414)
+	err := store.MigrateDownTo(f.ctx, f.dsn, 416)
 	if err == nil || !strings.Contains(err.Error(), wantMsg) {
 		f.t.Fatalf("Down error = %v, want it to contain %q", err, wantMsg)
 	}
-	if f.snapshot() != before || f.version() != 415 || f.columns(recoveryColumns...) != 4 {
+	if f.snapshot() != before || f.version() != 417 || f.columns(recoveryColumns...) != 4 {
 		f.t.Fatal("refused Down changed rows, history or schema")
 	}
 }
@@ -252,7 +252,7 @@ func TestPolicyRecoveryDownConvertsPausedAndQueuedLiveDB(t *testing.T) {
 	for _, id := range append([]uuid.UUID{ordinary, completed}, converted...) {
 		before[id] = f.row(id)
 	}
-	if err := store.MigrateDownTo(f.ctx, f.dsn, 414); err != nil {
+	if err := store.MigrateDownTo(f.ctx, f.dsn, 416); err != nil {
 		t.Fatalf("Down: %v", err)
 	}
 	for _, id := range converted {
@@ -284,7 +284,7 @@ func TestPolicyRecoveryDownConvertsPausedAndQueuedLiveDB(t *testing.T) {
 			t.Fatalf("unrelated run %s changed", id)
 		}
 	}
-	if f.version() != 414 || f.columns(recoveryColumns...) != 0 {
+	if f.version() != 416 || f.columns(recoveryColumns...) != 0 {
 		t.Fatalf("Down left version %d and %d recovery columns", f.version(), f.columns(recoveryColumns...))
 	}
 	if f.columns("policy_preserve_required", "policy_pending_fresh", "policy_outcome_id", "policy_continuation_mode", "policy_resolved_at",
@@ -293,10 +293,10 @@ func TestPolicyRecoveryDownConvertsPausedAndQueuedLiveDB(t *testing.T) {
 		t.Fatal("Down touched the 00397 columns")
 	}
 	// Re-runnable: Up again restores the columns with the shape check.
-	if err := store.MigrateTo(f.ctx, f.dsn, 415); err != nil {
+	if err := store.MigrateTo(f.ctx, f.dsn, 417); err != nil {
 		t.Fatalf("Up after Down: %v", err)
 	}
-	if f.version() != 415 || f.columns(recoveryColumns...) != 4 {
+	if f.version() != 417 || f.columns(recoveryColumns...) != 4 {
 		t.Fatal("Up after Down did not restore the schema")
 	}
 }
@@ -333,7 +333,7 @@ func TestPolicyRecoveryDownIgnoresResolvedAttemptPathLiveDB(t *testing.T) {
 			t.Fatalf("fixture row must retain attempt_path with no head: %q %v %v", cause, head, err)
 		}
 	}
-	if err := store.MigrateDownTo(f.ctx, f.dsn, 414); err != nil {
+	if err := store.MigrateDownTo(f.ctx, f.dsn, 416); err != nil {
 		t.Fatalf("resolved attempt-path rows blocked Down: %v", err)
 	}
 	for _, id := range rows {
@@ -361,7 +361,7 @@ func TestPolicyRecoveryDownRefusesLiveRowsWithoutPartialConversionLiveDB(t *test
 			}
 			// Once the live run is drained to a convertible state Down proceeds and converts all three.
 			mustExec(f.ctx, t, f.pool, "UPDATE runs SET status='queued' WHERE id=$1", active)
-			if err := store.MigrateDownTo(f.ctx, f.dsn, 414); err != nil {
+			if err := store.MigrateDownTo(f.ctx, f.dsn, 416); err != nil {
 				t.Fatal(err)
 			}
 			for _, id := range []uuid.UUID{convertible, queued, active} {
@@ -369,8 +369,8 @@ func TestPolicyRecoveryDownRefusesLiveRowsWithoutPartialConversionLiveDB(t *test
 					t.Fatalf("run %s not converted", id)
 				}
 			}
-			if v, n := f.version(), f.columns(recoveryColumns...); v != 414 || n != 0 {
-				t.Fatalf("retried Down left version %d with %d recovery columns, want 414 and 0", v, n)
+			if v, n := f.version(), f.columns(recoveryColumns...); v != 416 || n != 0 {
+				t.Fatalf("retried Down left version %d with %d recovery columns, want 416 and 0", v, n)
 			}
 		})
 	}
@@ -395,7 +395,7 @@ func TestPolicyRecoveryDownConvertsHeadlessResolvedPreservingLiveDB(t *testing.T
 	queued := f.headlessPreserving()
 	paused := f.headlessPreserving()
 	mustExec(f.ctx, t, f.pool, "UPDATE runs SET status='paused',hold_reason='credential_disabled' WHERE id=$1", paused)
-	if err := store.MigrateDownTo(f.ctx, f.dsn, 414); err != nil {
+	if err := store.MigrateDownTo(f.ctx, f.dsn, 416); err != nil {
 		t.Fatalf("Down: %v", err)
 	}
 	for _, id := range []uuid.UUID{queued, paused} {
@@ -432,10 +432,10 @@ func TestPolicyRecoveryDownRefusesOrphansLiveDB(t *testing.T) {
 		}
 		// Repairing the orphan lets the same Down proceed and convert the paused row.
 		mustExec(f.ctx, t, f.pool, "UPDATE runs SET policy_recovery_verified_generation=NULL,policy_recovery_verified_head=NULL WHERE id=$1", orphan)
-		if err := store.MigrateDownTo(f.ctx, f.dsn, 414); err != nil {
+		if err := store.MigrateDownTo(f.ctx, f.dsn, 416); err != nil {
 			t.Fatalf("Down after repair: %v", err)
 		}
-		if v := f.version(); v != 414 || f.row(convertible)["status"] != "failed" {
+		if v := f.version(); v != 416 || f.row(convertible)["status"] != "failed" {
 			t.Fatalf("retried Down: version %d, convertible status %v", v, f.row(convertible)["status"])
 		}
 	})
@@ -450,7 +450,7 @@ func TestPolicyRecoveryDownRefusesOrphansLiveDB(t *testing.T) {
 		f := newDownFx(t)
 		done := f.running()
 		mustExec(f.ctx, t, f.pool, "UPDATE runs SET status='failed',finished_at=now(),policy_recovery_verified_generation=3 WHERE id=$1", done)
-		if err := store.MigrateDownTo(f.ctx, f.dsn, 414); err != nil {
+		if err := store.MigrateDownTo(f.ctx, f.dsn, 416); err != nil {
 			t.Fatalf("terminal row blocked Down: %v", err)
 		}
 	})
@@ -491,7 +491,7 @@ func TestPolicyRecoveryDownWaitsForInFlightWriterLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	done := make(chan error, 1)
-	go func() { done <- store.MigrateDownTo(f.ctx, f.dsn, 414) }()
+	go func() { done <- store.MigrateDownTo(f.ctx, f.dsn, 416) }()
 	f.waitForLock("AccessExclusiveLock", 1)
 	select {
 	case err := <-done:
@@ -508,15 +508,15 @@ func TestPolicyRecoveryDownWaitsForInFlightWriterLiveDB(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "a live run still carries a required recovery head or preserving constraint") {
 		t.Fatalf("Down after the writer committed a live status = %v", err)
 	}
-	if f.row(other)["status"] != "paused" || f.row(target)["status"] != "claimed" || f.version() != 415 || f.columns(recoveryColumns...) != 4 {
+	if f.row(other)["status"] != "paused" || f.row(target)["status"] != "claimed" || f.version() != 417 || f.columns(recoveryColumns...) != 4 {
 		t.Fatal("refused Down changed rows or schema")
 	}
 }
 
-// downSQL returns the Down section of migration 415 so a test can run it inside a transaction it controls.
+// downSQL returns the Down section of migration 417 so a test can run it inside a transaction it controls.
 func downSQL(t *testing.T) string {
 	t.Helper()
-	raw, err := os.ReadFile("migrations/00415_policy_required_recovery_identity.sql")
+	raw, err := os.ReadFile("migrations/00417_policy_required_recovery_identity.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
