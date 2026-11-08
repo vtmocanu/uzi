@@ -45,13 +45,13 @@ const (
 	noteDefaultHarnessUnusable = "user_default_harness_unusable"
 	noteInstanceUnavailable    = "instance_settings_unavailable"
 
-	refusalNoCredentialForHarness = "no_credential_for_harness" //nolint:gosec // refusal-reason token, not a secret
-	refusalNoUsableCredential     = "no_usable_credential"      //nolint:gosec // refusal-reason token, not a secret
-	refusalCredentialDisabled     = "credential_disabled"       //nolint:gosec // refusal-reason token, not a secret
-	refusalCredentialNotFound     = "credential_not_found"
+	refusalNoCredentialForHarness = "no_credential_for_harness" //nolint:gosec // G101: refusal-reason token, not a secret
+	refusalNoUsableCredential     = "no_usable_credential"      //nolint:gosec // G101: refusal-reason token, not a secret
+	refusalCredentialDisabled     = "credential_disabled"       //nolint:gosec // G101: refusal-reason token, not a secret
+	refusalCredentialNotFound     = "credential_not_found"      //nolint:gosec // G101: refusal-reason token, not a secret
 	refusalOverrideUnsupported    = "credential_override_harness_unsupported"
 	refusalOverrideInvalid        = "credential_override_invalid"
-	detailCredentialDisabled      = "credential_disabled"
+	detailCredentialDisabled      = "credential_disabled" //nolint:gosec // G101: refusal-reason token, not a secret
 )
 
 // refusal is a refusal token with its optional detail ("" = none).

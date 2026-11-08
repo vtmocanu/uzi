@@ -348,17 +348,17 @@ func (h *Handler) scheduleOverrideRefusal(ctx context.Context, d scheduleDraft, 
 // onceDisabledHold is the scheduler's pre-fire check for a one-time schedule (process calls
 // ScheduleCredentialDisabled before firing): a disabled stored pin, or an unusable pinned harness,
 // holds the row. Any other schedule, or an error the tick does not hold on, is no hold.
-func (h *Handler) onceDisabledHold(ctx context.Context, d scheduleDraft) (refusal, error) {
+func (h *Handler) onceDisabledHold(ctx context.Context, d scheduleDraft) refusal {
 	if !d.once {
-		return refusal{}, nil
+		return refusal{}
 	}
 	if err := h.wsvc.ScheduleCredentialDisabled(ctx, d.userID, d.override, d.pin); err != nil {
 		if r, ok := scheduleFireRefusal(err); ok {
-			return r, nil
+			return r
 		}
 		// A non-refusal error (for example a DB failure) falls through to the harness prediction, as the tick does.
 	}
-	return refusal{}, nil
+	return refusal{}
 }
 
 // scheduleBranch is what a fire would use on one harness, or that harness's fire refusal.
@@ -466,10 +466,7 @@ func (h *Handler) buildScheduleSettingsPreview(ctx context.Context, d scheduleDr
 	dto := apitypes.ScheduleSettingsPreviewDTO{Version: apitypes.EffectiveSettingsVersion, Notes: scheduleTargetNotes(d.target)}
 	// A one-time schedule's tick runs the disabled-credential hold before it fires, so it outranks
 	// any harness refusal. The harness is still reported when it resolves.
-	hold, err := h.onceDisabledHold(ctx, d)
-	if err != nil {
-		return dto, err
-	}
+	hold := h.onceDisabledHold(ctx, d)
 	pred, ref, err := h.predictFire(ctx, d, d.pin)
 	if err != nil {
 		return dto, err

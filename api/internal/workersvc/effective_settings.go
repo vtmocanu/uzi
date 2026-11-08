@@ -40,7 +40,7 @@ const (
 	CredentialKindCodex     = "codex"
 
 	CredentialSourceClaimSelection = "claim_selection"
-	CredentialSourceCodexDefault   = "codex_default_credential"
+	CredentialSourceCodexDefault   = "codex_default_credential" //nolint:gosec // G101: credential-source label, not a secret
 	CredentialSourceChosenAtCreate = "chosen_at_create"
 	CredentialSourceAutoSelection  = "auto_selection"
 	CredentialSourceOwnerDefault   = "owner_default"

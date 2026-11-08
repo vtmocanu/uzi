@@ -26,14 +26,14 @@ func TestStartRefusalMapsTheCreateSentinels(t *testing.T) {
 		err  error
 		want refusal
 	}{
-		{"plain explicit refusal", workersvc.ErrNoCredentialForHarness, refusal{Token: "no_credential_for_harness"}},
+		{"plain explicit refusal", workersvc.ErrNoCredentialForHarness, refusal{Token: "no_credential_for_harness"}}, //nolint:gosec // G101: refusal-reason tokens, not secrets
 		{"all credentials disabled", workersvc.ErrHarnessCredentialDisabled, refusal{"no_credential_for_harness", "credential_disabled"}},
 		{"codex pool unavailable", workersvc.ErrCodexPoolUnavailable, refusal{"no_credential_for_harness", "codex_pool_unavailable"}},
-		{"neither usable", workersvc.ErrNoUsableCredential, refusal{Token: "no_usable_credential"}},
-		{"disabled pinned token", workersvc.ErrCredentialDisabled, refusal{Token: "credential_disabled"}},
-		{"missing, deleted or foreign token", workersvc.ErrCredentialOverrideSecretNotFound, refusal{Token: "credential_not_found"}},
-		{"codex harness", workersvc.ErrCredentialOverrideHarnessUnsupported, refusal{Token: "credential_override_harness_unsupported"}},
-		{"pinned without a token", workersvc.ErrCredentialOverridePinnedNeedsSecret, refusal{Token: "credential_override_invalid"}},
+		{"neither usable", workersvc.ErrNoUsableCredential, refusal{Token: "no_usable_credential"}},                                     //nolint:gosec // G101: refusal-reason tokens, not secrets
+		{"disabled pinned token", workersvc.ErrCredentialDisabled, refusal{Token: "credential_disabled"}},                               //nolint:gosec // G101: refusal-reason tokens, not secrets
+		{"missing, deleted or foreign token", workersvc.ErrCredentialOverrideSecretNotFound, refusal{Token: "credential_not_found"}},    //nolint:gosec // G101: refusal-reason tokens, not secrets
+		{"codex harness", workersvc.ErrCredentialOverrideHarnessUnsupported, refusal{Token: "credential_override_harness_unsupported"}}, //nolint:gosec // G101: refusal-reason tokens, not secrets
+		{"pinned without a token", workersvc.ErrCredentialOverridePinnedNeedsSecret, refusal{Token: "credential_override_invalid"}},     //nolint:gosec // G101: refusal-reason tokens, not secrets
 		{"wrapped sentinel", fmt.Errorf("create: %w", workersvc.ErrHarnessCredentialDisabled), refusal{"no_credential_for_harness", "credential_disabled"}},
 	}
 	for _, c := range cases {
@@ -60,7 +60,7 @@ func alt(harness string, ref *refusal) apitypes.StartPreviewAlternativeDTO {
 // TestCommonAlternativeRefusal pins the owner-bound top-level rule: promoted only when every
 // alternative is refused for the same reason; differing reasons or any valid branch leave it null.
 func TestCommonAlternativeRefusal(t *testing.T) {
-	unsupported := refusal{Token: "credential_override_harness_unsupported"}
+	unsupported := refusal{Token: "credential_override_harness_unsupported"} //nolint:gosec // G101: refusal-reason tokens, not secrets
 	noCred := refusal{"no_credential_for_harness", "credential_disabled"}
 	cases := []struct {
 		name string
@@ -71,7 +71,7 @@ func TestCommonAlternativeRefusal(t *testing.T) {
 		{"both refused for the same token and detail", []apitypes.StartPreviewAlternativeDTO{alt("claude", &noCred), alt("codex", &noCred)}, noCred},
 		{"both refused for differing reasons stays null", []apitypes.StartPreviewAlternativeDTO{alt("claude", &noCred), alt("codex", &unsupported)}, refusal{}},
 		{"same token with a differing detail stays null", []apitypes.StartPreviewAlternativeDTO{
-			alt("claude", &refusal{Token: "no_credential_for_harness"}), alt("codex", &noCred)}, refusal{}},
+			alt("claude", &refusal{Token: "no_credential_for_harness"}), alt("codex", &noCred)}, refusal{}}, //nolint:gosec // G101: refusal-reason tokens, not secrets
 		{"a valid branch leaves it null", []apitypes.StartPreviewAlternativeDTO{alt("claude", nil), alt("codex", &unsupported)}, refusal{}},
 		{"two valid branches", []apitypes.StartPreviewAlternativeDTO{alt("claude", nil), alt("codex", nil)}, refusal{}},
 	}
@@ -247,7 +247,7 @@ func previewRequest(body string) *http.Request {
 
 func TestStartPreviewRejectsMalformedRequests(t *testing.T) {
 	huge := `{"harness":null,"credential_override":{"mode":"pinned","secret_id":"` + strings.Repeat("a", startPreviewBodyLimit) + `"}}`
-	cases := map[string]string{
+	cases := map[string]string{ //nolint:gosec // G101: refusal-reason tokens, not secrets
 		"unknown field":            `{"harness":null,"credential_override":null,"model":"opus"}`,
 		"unknown nested field":     `{"credential_override":{"mode":"auto","label":"x"}}`,
 		"trailing value":           `{"harness":null} {"harness":null}`,
