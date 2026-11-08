@@ -52,6 +52,9 @@ const otherRuns: Run[] = [
     issue_title: "Cache the board column counts",
     status: "awaiting_approval",
     updated_at: minsAgo(55),
+    // #4082: no checker could run on its worker, so the plan went to its owner's gate.
+    plan_cross_check_required: true,
+    plan_cross_check_gate_reason: "worker_unsupported",
   }),
   otherUserRun({
     id: "run-ov-sam-running",
@@ -130,6 +133,7 @@ const ownLineRuns: Run[] = [
     issue_title: "Show the cost cap on the run page",
     status: "awaiting_approval",
     is_revising: true,
+    plan_cross_check_required: true,
     worker_id: mockWorkers[0].id,
     claimed_at: minsAgo(30),
     started_at: minsAgo(30),
@@ -206,6 +210,23 @@ export const overviewNextPendingQuestions: Readonly<Record<string, string>> = {
 };
 
 export const overviewNextRuns: Run[] = [...otherRuns, ...ownLineRuns, ownDuplicateMrRun, ownAskingRun];
+
+// Issue #4082: the list-only `cross_check_active` value the server joins from a live checker
+// child, standing in for that join. Issue runs only; mockListRuns and mockAdminListRuns read
+// it under this scenario and set null on every other row. The chips it drives:
+//   - Planning: run-ov-own-revising (yours, its revised plan is being checked) and
+//     run-ov-lena-planning (another user's) read "cross-checking";
+//   - Building: run-seeded (yours, a base fixture, overlaid only here) and run-ov-sam-running
+//     (another user's) read "cross-checking";
+//   - Plan review: run-awaiting (yours, base gate reason "revise") reads "cross-check: revise"
+//     and run-ov-priya-approval (gate reason "worker_unsupported") "cross-check: unavailable".
+// No `kind: "cross_check"` child is seeded: the lists exclude them, as the server does.
+export const overviewNextCrossCheckActive: Readonly<Record<string, "plan" | "code">> = {
+  "run-ov-own-revising": "plan",
+  "run-ov-lena-planning": "plan",
+  "run-seeded": "code",
+  "run-ov-sam-running": "code",
+};
 
 // The owner fleet for the Capacity rail (PRD #3880 M1): full, draining mid-roll, manually
 // cordoned, offline, with no advertised cap and with no stats. Replaces the default seeded

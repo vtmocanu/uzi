@@ -34,7 +34,7 @@ import {
   runListItem,
 } from "../data";
 import { ensureLive, handleInput, startNewRun } from "../engine";
-import { overviewNextPendingQuestions } from "../data/overviewNext";
+import { overviewNextCrossCheckActive, overviewNextPendingQuestions } from "../data/overviewNext";
 import { foreignCooldownRun } from "../runProgress";
 import { getRun, nextRunId, patchRun, state } from "../store";
 import { delay, mockScenario, requireSession } from "./shared";
@@ -305,6 +305,17 @@ function withPendingQuestion(item: RunListItem): RunListItem {
   return excerpt ? { ...item, pending_question: excerpt } : item;
 }
 
+// Issue #4082: both list endpoints carry the list-only `cross_check_active` on every row, null
+// when no checker child is live. The mock reads a static seed under ?mock=overview-next only
+// (overviewNextCrossCheckActive), so base fixtures it names stay null in every other scenario.
+function withCrossCheckActive(item: RunListItem): RunListItem {
+  const active =
+    mockScenario() === "overview-next" && Object.prototype.hasOwnProperty.call(overviewNextCrossCheckActive, item.id)
+      ? overviewNextCrossCheckActive[item.id]
+      : null;
+  return { ...item, cross_check_active: active };
+}
+
 // Overload order mirrors realApi.listRuns: summary first, legacy LAST.
 function mockListRuns(params: {
   repoId?: string;
@@ -329,13 +340,13 @@ function mockListRuns(params?: {
     // Chat conversations ride runs but have their own page (PRD #39), and judge
     // is a repo-less meta-run — both are excluded here exactly as the real
     // ListRunsForUser excludes them (`kind NOT IN ('chat','judge')`, PRD #239 D4).
-    .filter((r) => r.kind !== "chat" && r.kind !== "judge")
+    .filter((r) => r.kind !== "chat" && r.kind !== "judge" && r.kind !== "cross_check")
     // Caller-scoped, like the real ListRunsForUser: other demo users' runs
     // (mockOtherRunOwners) belong to the admin all-users list only.
     .filter((r) => !(r.id in mockOtherRunOwners))
     .filter((r) => (params?.repoId ? r.repo_id === params.repoId : true))
     .filter((r) => (params?.issueIid != null ? r.issue_iid === params.issueIid : true))
-    .map((r) => withPendingQuestion(runListItem(harnessOverlay(r))));
+    .map((r) => withCrossCheckActive(withPendingQuestion(runListItem(harnessOverlay(r)))));
   return delay({ runs: params?.view === "summary" ? items.map(toSummary) : items });
 }
 
@@ -345,7 +356,7 @@ function mockAdminListRuns(params?: {
   view?: "summary";
 }): Promise<{ runs: RunListItem[] | RunSummaryItem[] }> {
   const items = listRunsFor()
-    .filter((r) => r.kind !== "chat")
+    .filter((r) => r.kind !== "chat" && r.kind !== "cross_check")
     .filter((r) => !["completed", "failed", "cancelled"].includes(r.status))
     // Owner attribution: the mock's owner column is mockOtherRunOwners; every
     // other run belongs to the session admin. Before this map existed, EVERY
@@ -361,7 +372,7 @@ function mockAdminListRuns(params?: {
         if (item.queue_reason !== "maintenance") delete item.queue_reason;
         item.health_reason = null;
       }
-      return item;
+      return withCrossCheckActive(item);
     });
   return delay({ runs: params?.view === "summary" ? items.map(toSummary) : items });
 }

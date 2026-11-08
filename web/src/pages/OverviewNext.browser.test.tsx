@@ -478,6 +478,133 @@ describe("OverviewNext issue work scope switch", () => {
   }
 });
 
+// #4082: a run chip carries its cross-check state as an inner tag: "cross-checking" in
+// Planning (plan) and Building (code), and in Plan review why the cross-check sent the plan to
+// its owner. The tag wraps with the chip and never pokes out of it, down to a phone.
+describe("OverviewNext issue work cross-check tags", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    document.documentElement.dataset.font = "plex";
+  });
+  afterEach(() => {
+    delete document.documentElement.dataset.font;
+  });
+
+  const OTHER = "lena@uzi.local";
+
+  function mountCrossCheckLine() {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({ id: "own-plan", status: "running", is_planning: true, issue_iid: 4040, cross_check_active: "plan" }),
+        aRun({ id: "own-plan-quiet", status: "running", is_planning: true, issue_iid: 4041, cross_check_active: null }),
+        aRun({ id: "own-review", status: "awaiting_approval", issue_iid: 3881, plan_cross_check_required: true, plan_cross_check_gate_reason: "revise" }),
+        aRun({ id: "own-build", status: "running", issue_iid: 3543, cross_check_active: "code" }),
+        aRun({ id: "own-build-quiet", status: "running", issue_iid: 3251, cross_check_active: null }),
+      ],
+    });
+    mockApi.adminListRuns.mockResolvedValue({
+      runs: [
+        aRun({ id: "x-plan", status: "running", is_planning: true, issue_iid: 97, cross_check_active: "plan", owner_email: OTHER }),
+        aRun({ id: "x-review", status: "awaiting_approval", issue_iid: 88, plan_cross_check_required: true, plan_cross_check_gate_reason: "worker_unsupported", owner_email: OTHER }),
+        aRun({ id: "x-build", status: "running", issue_iid: 91, cross_check_active: "code", owner_email: OTHER }),
+      ],
+    });
+    render(
+      <MemoryRouter initialEntries={["/overview/next"]}>
+        <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+          <OverviewNext />
+        </main>
+      </MemoryRouter>,
+    );
+  }
+
+  // The chips of one station, keyed by their "#N" reference.
+  function chips(card: HTMLElement, stage: string): Map<string, HTMLElement> {
+    const station = card.querySelector(`[data-stage="${stage}"]`) as HTMLElement;
+    const out = new Map<string, HTMLElement>();
+    for (const el of station.querySelectorAll<HTMLElement>("span")) {
+      const ref = /^#\d+/.exec(el.textContent ?? "")?.[0];
+      // A chip is the outermost span whose text starts with its reference.
+      if (ref && !out.has(ref) && el.firstChild?.nodeType === Node.TEXT_NODE) out.set(ref, el);
+    }
+    return out;
+  }
+
+  // The chip's tag text (its inner span), or null when it carries none.
+  const tagOf = (chip: HTMLElement | undefined) => chip?.querySelector("span")?.textContent ?? null;
+
+  function expectTagsInsideChips(card: HTMLElement) {
+    for (const stage of ["planning", "review", "building"]) {
+      for (const [ref, chip] of chips(card, stage)) {
+        const tag = chip.querySelector("span");
+        if (!tag) continue;
+        const c = chip.getBoundingClientRect();
+        const t = tag.getBoundingClientRect();
+        expect.soft(t.width, `${ref} tag has width`).toBeGreaterThan(0);
+        expect.soft(t.left, `${ref} tag left`).toBeGreaterThanOrEqual(c.left - 0.5);
+        expect.soft(t.right, `${ref} tag right`).toBeLessThanOrEqual(c.right + 0.5);
+        expect.soft(t.top, `${ref} tag top`).toBeGreaterThanOrEqual(c.top - 0.5);
+        expect.soft(t.bottom, `${ref} tag bottom`).toBeLessThanOrEqual(c.bottom + 0.5);
+      }
+    }
+  }
+
+  async function ready() {
+    const card = await screen.findByRole("region", { name: "Issue work" });
+    const toggle = screen.getByRole("group", { name: "Issue work scope" });
+    await expect.poll(() => (within(toggle).getByRole("button", { name: "All users" }) as HTMLButtonElement).disabled).toBe(false);
+    await document.fonts.ready;
+    return { card, toggle };
+  }
+
+  for (const width of [1280, 400]) {
+    it(`tags the chips in Planning, Plan review and Building, inside their boxes, at ${width}px`, async () => {
+      await page.viewport(width, 900);
+      mountCrossCheckLine();
+      const { card, toggle } = await ready();
+      expect(window.innerWidth).toBe(width);
+
+      const planning = chips(card, "planning");
+      const review = chips(card, "review");
+      const building = chips(card, "building");
+      expect(tagOf(planning.get("#4040"))).toBe("cross-checking");
+      expect(tagOf(planning.get("#4041")), "no live check, no tag").toBeNull();
+      expect(tagOf(review.get("#3881"))).toBe("cross-check: revise");
+      expect(tagOf(building.get("#3543"))).toBe("cross-checking");
+      expect(tagOf(building.get("#3251")), "no live check, no tag").toBeNull();
+      // The chip reads as one phrase, and its tooltip says which check.
+      expect(planning.get("#4040")!.textContent).toBe("#4040 cross-checking");
+      expect(planning.get("#4040")!.title).toBe("Plan cross-check in progress");
+      expect(building.get("#3543")!.title).toMatch(/^Code cross-check in progress/);
+      // You scope: other users' chips are not on the line.
+      expect(planning.has("#97")).toBe(false);
+      expectTagsInsideChips(card);
+
+      // All users: another user's chips carry the same tags, with the owner first in the tooltip.
+      await userEvent.click(within(toggle).getByRole("button", { name: "All users" }));
+      const allPlanning = chips(card, "planning");
+      const allReview = chips(card, "review");
+      const allBuilding = chips(card, "building");
+      expect(tagOf(allPlanning.get("#97"))).toBe("cross-checking");
+      expect(tagOf(allReview.get("#88"))).toBe("cross-check: unavailable");
+      expect(tagOf(allBuilding.get("#91"))).toBe("cross-checking");
+      expect(tagOf(allPlanning.get("#4040")), "yours keep theirs").toBe("cross-checking");
+      expect(tagOf(allReview.get("#3881"))).toBe("cross-check: revise");
+      expect(allReview.get("#88")!.title).toMatch(/ · Unavailable/);
+      expect(allReview.get("#88")!.title.startsWith("Unavailable")).toBe(false);
+      expectTagsInsideChips(card);
+
+      if (width === 400) {
+        const cardRight = card.getBoundingClientRect().right;
+        for (const el of card.querySelectorAll<HTMLElement>("*")) {
+          expect.soft(el.getBoundingClientRect().right, `${el.tagName} ${el.textContent?.slice(0, 24)}`).toBeLessThanOrEqual(cardRight + 1);
+        }
+      }
+      expect(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(window.innerWidth);
+    });
+  }
+});
+
 describe("OverviewNext capacity rail", () => {
   function mountPreview() {
     mockApi.listWorkers.mockResolvedValue({
