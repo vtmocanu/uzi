@@ -210,8 +210,8 @@ function HostedRuns({ worker: w, runs }: { worker: Worker; runs: RunSummaryItem[
     <div className={cx(offline && "opacity-50")}>
       <p className="font-medium text-fg">{offline ? "Last reported" : "On this worker"}</p>
       <div className="mt-1 space-y-0.5">
-        {rows.map((r) => (
-          <p key={r.runId} className="flex flex-wrap items-baseline gap-x-2">
+        {rows.map((r, i) => (
+          <p key={`${r.runId}:${i}`} className="flex flex-wrap items-baseline gap-x-2">
             <RunIdentity runId={r.runId} runs={runs} />
             <span className="text-faint">{r.size ? `${r.phase} · ${r.size}` : r.phase}</span>
           </p>

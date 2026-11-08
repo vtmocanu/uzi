@@ -225,19 +225,31 @@ describe("CapacityRail expanded row", () => {
     const sizes = [3, 7, 1, 9, 5, 2, 8];
     const w = aWorker({
       reported_runs: [
-        { run_id: "unsized-run-xx", phase: "running", claim_generation: 1 },
-        ...sizes.map((_g, i) => ({ run_id: `sized-run-${i}-aaaa`, phase: "running", claim_generation: 1 })),
+        { run_id: "u0-unsized-xx", phase: "running", claim_generation: 1 },
+        ...sizes.map((_g, i) => ({ run_id: `s${i}-sized-run-aaaa`, phase: "running", claim_generation: 1 })),
+        { run_id: "u1-unsized-yy", phase: "running", claim_generation: 1 },
       ],
-      run_disk: sizes.map((g, i) => ({ run_id: `sized-run-${i}-aaaa`, home_bytes: g * GIB, cache_bytes: 0, truncated: i === 3, sampled_at: "2026-07-05T11:59:00Z" })),
+      run_disk: sizes.map((g, i) => ({ run_id: `s${i}-sized-run-aaaa`, home_bytes: g * GIB, cache_bytes: 0, truncated: i === 3, sampled_at: "2026-07-05T11:59:00Z" })),
     });
     const { container } = mount([w]);
-    const rows = Array.from(container.querySelectorAll("details p.flex")).map((p) => p.textContent);
-    expect(rows).toHaveLength(8);
-    const sized = rows.slice(0, 5).map((t) => /running · (.*)$/.exec(t ?? "")?.[1]);
+    const rows = Array.from(container.querySelectorAll("details p.flex")).map((p) => p.textContent ?? "");
+    expect(rows).toHaveLength(9);
+    const sized = rows.slice(0, 5).map((t) => /running · (.*)$/.exec(t)?.[1]);
     expect(sized).toEqual(["at least 9 GiB", "8 GiB", "7 GiB", "5 GiB", "3 GiB"]);
-    expect(rows[5]).toMatch(/^run sized-ru|^run unsized/);
-    expect(rows.slice(5).every((t) => !/GiB/.test(t ?? ""))).toBe(true);
-    expect(rows.some((t) => t?.startsWith("run unsized"))).toBe(true);
+    // Unsized rows follow in report order: the two smallest sampled runs fell out of the top five.
+    const rest = rows.slice(5);
+    expect(rest.every((t) => !/GiB/.test(t))).toBe(true);
+    expect(rest.map((t) => t.slice(0, 12))).toEqual(["run u0-unsiz", "run s2-sized", "run s5-sized", "run u1-unsiz"]);
+  });
+
+  it("leaves the largest-run line out of the rail's gauges", () => {
+    const w = aWorker({
+      ...withStats,
+      run_disk: [{ run_id: "r-disk-0001", home_bytes: 4 * GIB, cache_bytes: 0, truncated: false, sampled_at: "2026-07-05T11:59:00Z" }],
+    });
+    const { container } = mount([w]);
+    expect(screen.getByRole("progressbar", { name: "CPU", hidden: true })).toBeTruthy();
+    expect(container.textContent).not.toContain("Largest run");
   });
 
   it("titles the section Last reported when offline", () => {
@@ -256,9 +268,9 @@ describe("CapacityRail footer", () => {
 
   it("shows version and uptime for an online worker, never a heartbeat", () => {
     const { container } = mount([
-      aWorker({ version: "v1.2.3", online_since: "2026-07-05T09:30:00Z", last_heartbeat_at: "2026-07-05T11:59:00Z" }),
+      aWorker({ version: "1.2.3", online_since: "2026-07-05T09:30:00Z", last_heartbeat_at: "2026-07-05T11:59:00Z" }),
     ]);
-    expect(footer(container)).toBe("vv1.2.3 · up 2h 30m");
+    expect(footer(container)).toBe("v1.2.3 · up 2h 30m");
   });
 
   it("shows last seen for an offline worker", () => {
@@ -338,6 +350,23 @@ describe("CapacityRail untrusted worker text", () => {
     expect(container.textContent).not.toContain(BIDI);
     for (const el of Array.from(container.querySelectorAll("*"))) {
       for (const attr of ["title", "href"]) expect(el.getAttribute(attr) ?? "").not.toContain(BIDI);
+    }
+  });
+
+  it("renders a loaded run's issue title inert", () => {
+    const evil = `${BIDI}<img src=x onerror=alert(1)>`;
+    const runs = [aRun({ id: "run-evil-000001", issue_iid: 7, issue_title: evil })] as RunSummaryItem[];
+    const { container } = mount(
+      [aWorker({ reported_runs: [{ run_id: "run-evil-000001", phase: "running", claim_generation: 1 }] })],
+      runs,
+    );
+    const link = screen.getByRole("link", { name: /^#7 / });
+    expect(link.textContent).not.toContain(BIDI);
+    expect(link.textContent).toContain("<img src=x onerror=alert(1)>");
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.textContent).not.toContain(BIDI);
+    for (const el of Array.from(container.querySelectorAll("*"))) {
+      for (const attr of ["title", "href", "aria-label"]) expect(el.getAttribute(attr) ?? "").not.toContain(BIDI);
     }
   });
 });
