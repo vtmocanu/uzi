@@ -90,6 +90,131 @@ mkdir -p "$ROOT/.uzi/scratch"
 SEQ_DIR="$(mktemp -d "$ROOT/.uzi/scratch/e2e-lib.XXXXXX")"
 trap 'rm -rf "$SEQ_DIR"' EXIT
 
+# Run the real phase prefixes in fresh errexit-enabled shells. Force an early
+# assertion failure after mutation, as happened before the first binding claim.
+# The fake API persists state outside command-substitution subshells.
+cat > "$SEQ_DIR/harness-state.sh" <<'HARNESS'
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$1" STATE="$2" SCENARIO="$3" ORIGINAL="$4"
+BASE=http://fixture JAR=fixture DUMMY_ANTHROPIC=different
+COMPOSE=(true)
+say() { :; }; pass() { :; }; login() { :; }; wait_custody_headroom() { :; }; capture_agent_logs() { :; }
+fail() { echo "$*" >&2; exit 17; }; csrf() { echo fixture; }
+eval "$(awk '/^synthetic_issue_worker_capabilities\(\) \{/,/^\}/; /^set_owner_autopilot\(\) \{/,/^\}/' "$ROOT/e2e/lib.sh")"
+apiget() {
+  case "$1" in
+    /api/auth/me) jq -cn --argjson value "$ORIGINAL" '{user:{autopilot_enabled:$value}}' ;;
+    /api/forge/connections) echo '{"connections":[{"id":"connection","human_username":"owner-alice"}]}' ;;
+    /api/forge/connections/connection/projects) echo '{"repos":[{"id":"repo2","path_with_namespace":"group/repo2"}]}' ;;
+    /api/me/secrets)
+      if [ -f "$STATE/token" ]; then
+        echo '{"secrets":[{"id":"11111111-1111-4111-8111-111111111111","kind":"anthropic_token","label":"default","is_default":true},{"id":"22222222-2222-4222-8222-222222222222","kind":"anthropic_token","label":"console-key","is_default":false}]}'
+      else echo '{"secrets":[{"kind":"anthropic_token","label":"default","is_default":true}]}'; fi ;;
+    *) return 1 ;;
+  esac
+}
+apiput() {
+  case "$1" in
+    /api/forge/connections/connection) echo '{"warning":"fixture"}' ;;
+    /api/me/autopilot)
+      value="$(printf '%s' "$2" | jq -r '.enabled')"
+      if [ "$SCENARIO" = autopilot-cleanup-fail ] && [ "$value" = false ]; then return 1; fi
+      printf '%s\n' "$value" > "$STATE/autopilot"
+      jq -cn --argjson value "$value" '{user:{autopilot_enabled:$value}}' ;;
+    /api/repos/repo2) echo 'repo enabled' >> "$STATE/events"; echo '{"repo":{"enabled":true}}' ;;
+    *) return 1 ;;
+  esac
+}
+apipost() {
+  case "$1" in
+    /api/me/secrets/anthropic_token) touch "$STATE/token"; echo '{}' ;;
+    /api/workers) echo '{"worker":{"id":"worker"},"token":"fixture"}' ;;
+    *) return 1 ;;
+  esac
+}
+curl() {
+  local payload='' arg
+  while [ "$#" -gt 0 ]; do
+    arg="$1"; shift
+    case "$arg" in
+      -d) payload="$1"; shift ;;
+      */api/worker/register) printf '%s\n' "$payload" > "$STATE/register" ;;
+      */api/me/secrets/anthropic_token/22222222-2222-4222-8222-222222222222)
+        [ "$SCENARIO" != token-cleanup-fail ] || return 1
+        rm "$STATE/token"; echo deleted >> "$STATE/events" ;;
+    esac
+  done
+  # -d follows the URL in these calls, so record it after parsing all arguments.
+  if [ -n "$payload" ]; then printf '%s\n' "$payload" > "$STATE/register"; fi
+}
+case "$SCENARIO" in
+  autopilot*)
+    eval "$(awk '/^# --- autopilot #1:/ {exit} {print}' "$ROOT/e2e/phases/29-autopilot-lifecycle.sh")" ;;
+  guard)
+    EXECUTOR=stub
+    # Stop at the first compose call: consent must already be false when repo2
+    # is enabled, even if phase 29 was skipped and owner opt-in was true.
+    apiput() {
+      case "$1" in
+        /api/me/autopilot) printf '%s\n' "$2" > "$STATE/guard-consent"; echo '{"user":{"autopilot_enabled":false}}' ;;
+        /api/repos/repo2) jq -e '.enabled == false' "$STATE/guard-consent" >/dev/null || return 1; echo guarded > "$STATE/events"; exit 17 ;;
+        *) return 1 ;;
+      esac
+    }
+    # The prefix sits inside the phase's if/else; close it for this fixture.
+    eval "$(awk '/^  # Recreate the one worker/ {exit} {print}' "$ROOT/e2e/phases/45-bounded-concurrency.sh")
+fi" ;;
+  token*)
+    eval "$(awk '/^# claim_token DESC/ {exit} {print}' "$ROOT/e2e/phases/50-worker-token-binding.sh")" ;;
+  autostop)
+    WTOK=fixture
+    eval "$(awk '/^curl .*api\/worker\/register/ {printing=1} printing {print} printing && /could not register|synthetic worker register failed/ {exit}' "$ROOT/e2e/phases/51-auto-stop-poison.sh")" ;;
+  manual)
+    M5_FIXTURE=fixture M5_JOIN=fixture
+    eval "$(awk '/^  curl .*api\/worker\/register/ {printing=1} printing && /^  m5_heartbeat\(\)/ {exit} printing {print}' "$ROOT/e2e/phases/50-worker-token-binding.sh")" ;;
+esac
+exit 17
+HARNESS
+harness_state_case() {
+  local scenario="$1" original="$2" expected_rc="$3" expected_state="$4" rc=0 state="$SEQ_DIR/harness-$1-$2"
+  cases=$((cases + 1))
+  mkdir -p "$state"
+  # No if/! wrapper around the child shell: its own errexit remains active.
+  bash "$SEQ_DIR/harness-state.sh" "$ROOT" "$state" "$scenario" "$original" > "$state/output" 2>&1 || rc=$?
+  if [ "$rc" = "$expected_rc" ] && [ "$(cat "$state/autopilot" 2>/dev/null || true)" = "$expected_state" ]; then
+    passed=$((passed + 1)); echo "PASS: $scenario restores original=$original with rc=$rc"
+  else echo "FAIL: $scenario original=$original rc=$rc"; cat "$state/output"; fi
+}
+harness_state_case autopilot false 17 false
+harness_state_case autopilot true 17 true
+harness_state_case autopilot-cleanup-fail false 1 true
+harness_state_case guard true 17 ''
+cases=$((cases + 1))
+if [ "$(cat "$SEQ_DIR/harness-guard-true/events" 2>/dev/null || true)" = guarded ]; then
+  passed=$((passed + 1)); echo 'PASS: phase 45 disables autopilot before exposing repo2'
+else echo 'FAIL: repo2 exposed before autopilot disabled'; fi
+for scenario in token token-cleanup-fail autostop manual; do
+  state="$SEQ_DIR/harness-$scenario"
+  mkdir -p "$state"
+  rc=0
+  bash "$SEQ_DIR/harness-state.sh" "$ROOT" "$state" "$scenario" false > "$state/output" 2>&1 || rc=$?
+  cases=$((cases + 1))
+  expected_rc=17; [ "$scenario" != token-cleanup-fail ] || expected_rc=1
+  if [ "$rc" = "$expected_rc" ] && jq -e '
+      .protocol_capabilities | sort == (["completion_interlock_v1","repo_agent_source_v1","agent_source_request_v1"] | sort)
+    ' "$state/register" >/dev/null 2>&1; then
+    passed=$((passed + 1)); echo "PASS: $scenario registers the shared claim-only capabilities"
+  else echo "FAIL: $scenario capabilities/exit rc=$rc"; cat "$state/output"; fi
+  if [[ "$scenario" == token* ]]; then
+    cases=$((cases + 1))
+    if { [ "$scenario" = token ] && [ ! -e "$state/token" ] && [ "$(cat "$state/events")" = deleted ]; } \
+      || { [ "$scenario" = token-cleanup-fail ] && [ -e "$state/token" ] && grep -F 'console-key cleanup failed' "$state/output" >/dev/null; }; then
+      passed=$((passed + 1)); echo "PASS: $scenario cleans up early failure or reports cleanup failure"
+    else echo "FAIL: $scenario token cleanup"; cat "$state/output"; fi
+  fi
+done
+
 # compose_build_logged (#3468): extract the shipped multiline helper without
 # sourcing lib.sh's stack setup. A missing helper counts as a failure, then lets
 # the other regression groups continue producing useful diagnostics.

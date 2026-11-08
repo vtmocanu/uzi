@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode, type Ref } from "react";
 import type { SelfUsage, AdminUsage, RunOutcomes } from "../lib/api";
 import { formatTokens } from "../lib/formatTokens";
 import { aggregateDisclosure } from "../lib/costStatus";
@@ -60,13 +60,14 @@ function CostCell({ cost, disclosure, total }: { cost: number; disclosure: Retur
 
 // PRD #3881 M2: the Factory scope's per-user table. Columns are fixed on every API version;
 // a PR count the API does not report reads "—", never 0.
-function ByUserTable({ admin, window, viewerId }: { admin: AdminUsage; window: UsageWindow; viewerId: string }) {
+// The section takes focus (tabIndex -1) when the People chip's "Usage by user" lands here.
+function ByUserTable({ admin, window, viewerId, ref }: { admin: AdminUsage; window: UsageWindow; viewerId: string; ref: Ref<HTMLElement> }) {
   const now = useNow(30_000);
   const demo = useDemoMode();
   const { available, rows, factoryRuns, factoryPRs, factoryOutcomes, factory, factoryDisclosure } = perUserRows(admin, window);
   const recent = window === "last_7_days";
   return (
-    <section aria-label="By user" className="mt-5 border-t border-edge pt-4">
+    <section ref={ref} id="overview-usage-by-user" tabIndex={-1} aria-label="By user" className="mt-5 border-t border-edge pt-4 scroll-mt-20 rounded-md outline-hidden focus:ring-2 focus:ring-ring">
       <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
         <h3 className="text-sm font-semibold text-fg">By user</h3>
         <span className="text-xs text-faint">{recent ? "last 7 days" : "all time"}, by cost</span>
@@ -125,20 +126,44 @@ function ByUserTable({ admin, window, viewerId }: { admin: AdminUsage; window: U
   );
 }
 
-export function OverviewUsageCard({ self, admin, window, onWindowChange, viewerId }: {
+export function OverviewUsageCard({ self, admin, window, onWindowChange, viewerId, scope: controlledScope, onScopeChange, focusByUser }: {
   self: SelfUsage;
   admin?: AdminUsage;
   window: UsageWindow;
   onWindowChange: (w: UsageWindow) => void;
   viewerId: string;
+  // Optional controlled scope (the People chip's "Usage by user" switches it from outside). The
+  // parent then owns remembering the choice; without them the card keeps its own, as before.
+  scope?: Scope;
+  onScopeChange?: (s: Scope) => void;
+  // A counter the parent bumps to move focus to the By user section once it is shown.
+  focusByUser?: number;
 }) {
   const demo = useDemoMode();
   const [chosen, setChosen] = useState<Scope>(() => overviewScope.get(USAGE_SCOPE_KEY));
   const setScope = (s: Scope) => {
+    if (controlledScope !== undefined) {
+      onScopeChange?.(s);
+      return;
+    }
     setChosen(s);
     overviewScope.set(USAGE_SCOPE_KEY, s);
   };
-  const scope: Scope = admin ? chosen : "you";
+  const scope: Scope = admin ? (controlledScope ?? chosen) : "you";
+  const byUserShown = scope === "all" && admin != null;
+
+  // Each new nonzero focusByUser value is handled once: scroll the By user section to the top
+  // and focus it, as soon as it is mounted (the scope switch and the bump can land together).
+  const byUserRef = useRef<HTMLElement>(null);
+  const handledFocus = useRef(0);
+  useEffect(() => {
+    if (!focusByUser || focusByUser === handledFocus.current) return;
+    const el = byUserRef.current;
+    if (!byUserShown || !el) return;
+    handledFocus.current = focusByUser;
+    if (typeof el.scrollIntoView === "function") el.scrollIntoView({ block: "start" });
+    el.focus({ preventScroll: true });
+  }, [focusByUser, byUserShown]);
   const personal = scope === "you";
   const usage = scope === "all" && admin ? admin.factory : self;
 
@@ -206,7 +231,7 @@ export function OverviewUsageCard({ self, admin, window, onWindowChange, viewerI
           </div>
         </div>
       </section>
-      {scope === "all" && admin && <ByUserTable admin={admin} window={window} viewerId={viewerId} />}
+      {scope === "all" && admin && <ByUserTable ref={byUserRef} admin={admin} window={window} viewerId={viewerId} />}
     </Card>
   );
 }

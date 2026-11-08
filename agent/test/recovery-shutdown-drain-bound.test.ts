@@ -11,9 +11,10 @@ import { GitCache } from "../src/git.js";
 import { makeFixture } from "./fixture-repo.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
 
-// Issue #3031: Worker.run's shutdown now joins RecoveryCoordinator.shutdown(). The default
-// termination grace is 10 s under docker compose and 30 s on k8s, so a pass blocked in real
-// work must abort and settle well inside the shorter one.
+// Issue #3031: Worker.run's shutdown now joins RecoveryCoordinator.shutdown(). The termination
+// grace is 40 s on both docker compose and k8s (issue #4066; it was 10 s and 30 s), and the
+// worker's shutdown settlement barrier still needs time after this join, so a pass blocked in
+// real work must abort and settle well inside it.
 const BOUND_MS = 5_000;
 const CEILING_MS = 12_000;
 const token = "drain-bound-fixture";

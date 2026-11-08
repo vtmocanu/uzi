@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Target design for the Overview preview "Issue work" scope toggle (epic #3873 follow-up): an admin-only You | All users toggle pinned to the far right of the card header, matching the usage card (#3881); no "Show all" button. Example data only. Open this file directly in a browser. -->
+<title>Cross-check Markers</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root {
+  --bg: #eef0f4; --surface: #ffffff; --raised: #f2f4f7; --edge: #dde1e8; --edge-strong: #c4cad4;
+  --fg: #171b22; --muted: #5d6573; --faint: #8a91a0;
+  --queue: #8a91a0; --plan: #6366f1; --warn: #b7791f; --info: #0e86b8; --ok: #13865a;
+  --tag: #e7ecf7; --tag-fg: #34508a; --sel: #ffffff; --seg: #e6e9ef;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0b0e14; --surface: #121620; --raised: #1a1f2b; --edge: #262c38; --edge-strong: #3a4150;
+  --fg: #e8eaee; --muted: #a2a9b6; --faint: #7f8796;
+  --queue: #8a91a0; --plan: #8b8ff8; --warn: #f2b33d; --info: #38bdf8; --ok: #34d399;
+  --tag: #1d2638; --tag-fg: #a9bfee; --sel: #2a3140; --seg: #0d1118; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #0b0e14; --surface: #121620; --raised: #1a1f2b; --edge: #262c38; --edge-strong: #3a4150;
+  --fg: #e8eaee; --muted: #a2a9b6; --faint: #7f8796;
+  --queue: #8a91a0; --plan: #8b8ff8; --warn: #f2b33d; --info: #38bdf8; --ok: #34d399;
+  --tag: #1d2638; --tag-fg: #a9bfee; --sel: #2a3140; --seg: #0d1118; color-scheme: dark }
+
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--sans); font-size: 14px; line-height: 1.45; }
+.page { max-width: 1180px; margin: 0 auto; padding: 28px 16px 64px; display: grid; gap: 28px; }
+h1 { font-size: 22px; font-weight: 600; margin: 0; }
+.lede { color: var(--muted); margin: 6px 0 0; max-width: 78ch; }
+.controls { display: flex; flex-wrap: wrap; gap: 10px 22px; align-items: center; margin-top: 14px; font-size: 13px; color: var(--muted); }
+.controls label { display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
+.controls fieldset { border: 0; padding: 0; margin: 0; display: inline-flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.controls legend { float: left; margin-right: 8px; font-weight: 600; color: var(--fg); }
+.scenario { display: grid; gap: 10px; }
+.scenario h2 { font-size: 13px; font-weight: 600; margin: 0; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+.scenario p.why { margin: 0; color: var(--muted); font-size: 13px; max-width: 80ch; }
+.tag { font-family: var(--mono); font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--tag); color: var(--tag-fg); }
+
+/* The card */
+.card { background: var(--surface); border: 1px solid var(--edge); border-radius: 14px; padding: 20px 22px; min-width: 0; }
+/* Toggle pinned to the far right so it never moves when the note's length changes. */
+.head { display: grid; grid-template-columns: auto minmax(0,1fr) auto; grid-template-areas: "title meta seg"; align-items: center; gap: 8px 12px; }
+.stitle { grid-area: title; margin: 0; font-size: 12px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase; color: var(--faint); }
+.head-meta { grid-area: meta; justify-self: end; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; font-size: 12px; color: var(--faint); min-width: 0; }
+.head .seg { grid-area: seg; }
+.phone .head { grid-template-columns: minmax(0,1fr) auto; grid-template-areas: "title seg" "meta meta"; }
+.phone .head-meta { justify-self: start; }
+@media (max-width: 760px) {
+  .head { grid-template-columns: minmax(0,1fr) auto; grid-template-areas: "title seg" "meta meta"; }
+  .head-meta { justify-self: start; }
+}
+.ghost { font: inherit; font-size: 12.5px; font-weight: 500; color: var(--fg); background: transparent; border: 0; border-radius: 8px; padding: 4px 8px; cursor: pointer; }
+.ghost:hover { background: var(--raised); }
+.new { outline: 2px dashed var(--tag-fg); outline-offset: 3px; border-radius: 10px; }
+
+/* Segmented toggle, same shape as the usage card's */
+.seg { display: inline-flex; padding: 2px; border-radius: 9px; background: var(--seg); border: 1px solid var(--edge); }
+.seg button { font: inherit; font-size: 12.5px; font-weight: 500; color: var(--muted); background: transparent; border: 0; border-radius: 7px; padding: 4px 11px; cursor: pointer; white-space: nowrap; }
+.seg button[aria-pressed="true"] { background: var(--sel); color: var(--fg); box-shadow: 0 1px 2px rgb(0 0 0 / .18); }
+.seg button:disabled { cursor: not-allowed; opacity: .5; }
+.seg button:focus-visible, .ghost:focus-visible, .station:focus-visible, .bay:focus-visible { outline: 2px solid var(--tag-fg); outline-offset: 2px; }
+
+.line { position: relative; display: grid; grid-template-columns: repeat(5, minmax(0,1fr)); margin-top: 10px; }
+.rail { position: absolute; left: 26px; right: calc(20% - 26px); top: 25px; height: 2px; background: var(--edge-strong); }
+.station { position: relative; display: flex; flex-direction: column; align-items: flex-start; gap: 2px; text-align: left; padding: 44px 10px 12px; margin: 0 2px; border: 1px solid transparent; border-radius: 11px; background: transparent; color: inherit; font: inherit; cursor: pointer; min-width: 0; }
+.station:hover { background: var(--raised); }
+.station[aria-pressed="true"] { background: var(--raised); border-color: var(--edge); }
+.node { position: absolute; top: 16px; left: 18px; width: 16px; height: 16px; border-radius: 50%; border: 2px solid var(--c); background: var(--surface); }
+.node.fill { background: var(--c); box-shadow: 0 0 0 5px color-mix(in srgb, var(--c) 22%, transparent); }
+.node.gate { border-radius: 2px; transform: rotate(45deg); width: 14px; height: 14px; left: 19px; top: 17px; }
+.st-name { font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--faint); }
+.st-count { font-size: 26px; font-weight: 600; line-height: 1.1; }
+.st-count small { font-size: 12px; font-weight: 500; color: var(--muted); margin-left: 3px; }
+.gate-st .st-count { color: var(--warn); }
+.st-cap { font-size: 12.5px; color: var(--muted); }
+.st-note { font-size: 12px; color: var(--faint); }
+.badges { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.badge { font-family: var(--mono); font-size: 11.5px; padding: 1px 7px; border-radius: 7px; border: 1px solid color-mix(in srgb, var(--c) 55%, transparent); background: color-mix(in srgb, var(--c) 14%, transparent); color: var(--fg); }
+.badge.other { border-style: dashed; opacity: .8; }
+.bays { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 12px; margin-top: 12px; }
+.bay { display: flex; gap: 12px; align-items: center; text-align: left; padding: 12px 14px; border-radius: 11px; border: 1px dashed var(--edge-strong); background: transparent; color: inherit; font: inherit; cursor: pointer; min-width: 0; }
+.bay:hover { background: var(--raised); }
+.bay-ico { flex: none; width: 30px; height: 30px; border-radius: 8px; display: grid; place-items: center; border: 1px solid var(--edge-strong); color: var(--muted); }
+.bay-ico.ask { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 60%, transparent); }
+.bay-ico svg { width: 16px; height: 16px; }
+.bay b { font-weight: 600; }
+.bay .sub { display: block; font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bay > span:last-child { min-width: 0; }
+.unavail { margin-top: 8px; font-size: 12px; color: var(--warn); }
+
+/* Phone frame */
+.phone { width: 400px; max-width: 100%; }
+.phone .line { grid-template-columns: 1fr; }
+.phone .rail { display: none; }
+.phone .station { padding: 10px 10px 10px 52px; }
+.phone .node { top: 14px; }
+.phone .bays { grid-template-columns: 1fr; }
+@media (max-width: 760px) {
+  .line { grid-template-columns: 1fr; } .rail { display: none; }
+  .station { padding: 10px 10px 10px 52px; } .node { top: 14px; }
+  .bays { grid-template-columns: 1fr; }
+}
+.notes { margin: 0; padding-left: 18px; color: var(--muted); font-size: 13px; display: grid; gap: 4px; max-width: 86ch; }
+/* cross-check markers (proposal) */
+.badge.ck { display: inline-flex; align-items: center; gap: 4px; outline: 1px dashed var(--tag-fg); outline-offset: 2px; }
+.badge .ckico { width: 12px; height: 12px; color: var(--c); }
+.badge .why { font-family: var(--sans, inherit); font-size: 10.5px; font-weight: 600; padding: 0 5px; border-radius: 5px; background: color-mix(in srgb, var(--warn) 22%, transparent); color: var(--warn); }
+.badge .why.chk { background: color-mix(in srgb, var(--c) 28%, transparent); color: var(--fg); font-weight: 500; }
+.badge .why.bad { background: color-mix(in srgb, var(--danger, #e11d48) 20%, transparent); color: var(--danger, #e11d48); }
+.st-ck { font-size: 12px; color: var(--muted); display: inline-flex; align-items: center; gap: 4px; outline: 1px dashed var(--tag-fg); outline-offset: 2px; border-radius: 4px; padding: 0 2px; }
+.st-ck svg { width: 12px; height: 12px; }
+</style>
+</head>
+<body>
+<main class="page">
+  <header>
+    <h1>Issue work: cross-check state in the run chip</h1>
+    <p class="lede">No new stations. Everything sits in the run's chip: "cross-checking" while its cross-check runs (the station says which: Planning = plan, Building = code), and in Plan review why the cross-check sent it to you ("cross-check: revise / blocked / unavailable"). The checker's harness and model are in the tooltip, not the chip: it is always the other family from the lead. Captions and counts are unchanged. Dashed outlines mark what is new. Hover a chip for its tooltip. Owners with cross-check off see today's card unchanged. Example data.</p>
+    <div class="controls">
+      <fieldset><legend>Theme</legend>
+        <label><input type="radio" name="th" value=""> System</label>
+        <label><input type="radio" name="th" value="dark"> Ember</label>
+        <label><input type="radio" name="th" value="light"> Dawn</label>
+      </fieldset>
+    </div>
+  </header>
+
+  <section class="scenario">
+    <h2>1 · Desktop, You: checks in flight and one plan sent to you</h2>
+    <p class="why">#4040 reads "cross-checking" in Planning (plan), #3543 in Building (code), and #3881 reads "cross-check: revise" in Plan review: the checker still asked for changes after its automatic rounds.</p>
+    <div class="card" data-card data-scope="you"></div>
+  </section>
+
+  <section class="scenario">
+    <h2>2 · Desktop, All users</h2>
+    <p class="why">Other users' runs get the same markers (their own cross-check setting). #96's checker was unavailable, so it went to its owner's gate.</p>
+    <div class="card" data-card data-scope="all"></div>
+  </section>
+
+  <section class="scenario">
+    <h2>3 · Cross-check off (today's look)</h2>
+    <p class="why">No markers, no extra lines: nothing changes for owners who never enabled it.</p>
+    <div class="card" data-card data-scope="you" data-xoff></div>
+  </section>
+
+  <section class="scenario">
+    <h2>4 · Phone, 400 px</h2>
+    <p class="why">The tag stays inside the chip and wraps with it.</p>
+    <div class="card phone" data-card data-scope="you"></div>
+  </section>
+
+  <section class="scenario">
+    <h2>Notes</h2>
+    <ul class="notes">
+      <li>Data: the run list does not carry cross-check state today (the summaries live on the owner's run detail). Needs one small list-side field, e.g. <code>cross_check_pending: "plan" | "code" | null</code> plus the plan gate reason, joined in the list query (no per-run fetch).</li>
+      <li>Code cross-check is advisory, so it never moves a run or sends it to you; its findings stay on the run page.</li>
+      <li>Checker child runs stay out of the counts (the lists already exclude <code>kind=cross_check</code>), so "Other work" does not change.</li>
+      <li>Placement: an auto-approved lead stays <code>running</code> with no stored plan while its plan is cross-checked (the plan is stored only after a passing check), so it reads as Planning; a code cross-check runs after implementation, so Building.</li>
+    </ul>
+  </section>
+</main>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-q" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16v11H9l-5 4z"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></symbol>
+  <symbol id="i-ck" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6z"/><path d="M9 12l2 2 4-4"/></symbol>
+  <symbol id="i-act" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3-7 4 14 3-7h4"/></symbol>
+</svg>
+
+<script>
+// Example data. own: the viewer's run. stage: queued|planning|review|building|question|parked|other.
+const RUNS = [
+  { n: 4041, stage: "queued", own: true }, { n: 412, stage: "queued", own: false, who: "user B" }, { n: 418, stage: "queued", own: false, who: "user C" },
+  { n: 4040, stage: "planning", own: true, check: "plan" }, { n: 237, stage: "planning", own: false, who: "user B" },
+  { n: 3881, stage: "review", own: true, why: "revise" }, { n: 96, stage: "review", own: false, who: "user C", why: "unavailable" }, { n: 97, stage: "review", own: false, who: "user D" },
+  { n: 3543, stage: "building", own: true, check: "code" }, { n: 3251, stage: "building", own: true }, { n: 24, stage: "building", own: false, who: "user B", check: "code" },
+  { n: 34, stage: "building", own: false, who: "user C" }, { n: 99, stage: "building", own: false, who: "user D" }, { n: 38, stage: "building", own: false, who: "user D" },
+  { n: 3989, stage: "question", own: true }, { n: 61, stage: "question", own: false, who: "user B" },
+  { n: 3607, stage: "parked", own: true, auto: true }, { n: 77, stage: "parked", own: false, who: "user C", auto: false },
+  { n: 88, stage: "parked", own: false, who: "user D", auto: true },
+  { n: 0, stage: "other", own: true }, { n: 0, stage: "other", own: false, who: "user B" }, { n: 0, stage: "other", own: false, who: "user C" },
+];
+const OWN_PRS = [4033, 4049, 4035, 4006];
+
+const STATIONS = [
+  { stage: "queued", name: "Queued", c: "--queue", cap: () => "Claiming a slot" },
+  { stage: "planning", name: "Planning", c: "--plan", fill: true, cap: () => "Lead drafting a plan" },
+  { stage: "review", name: "Plan review", c: "--warn", gate: true },
+  { stage: "building", name: "Building", c: "--info", fill: true, cap: () => "Implement, review, validate" },
+  { stage: "pr", name: "PR open", c: "--ok" },
+];
+const LABEL = "All users";
+
+function split(list) {
+  const own = list.filter(r => r.own).length;
+  if (own === list.length) return "Waiting on you";
+  if (own === 0) return "Waiting on owners";
+  return `${own} on you, ${list.length - own} on others`;
+}
+const esc = s => String(s).replace(/[&<>"]/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch]));
+
+function render(card) {
+  const unavailable = card.hasAttribute("data-unavailable");
+  let scope = card.dataset.scope;
+  if (unavailable) scope = "you";
+  const sel = card.dataset.sel || "";
+  const xoff = card.hasAttribute("data-xoff");
+  const runs = RUNS.filter(r => scope === "all" || r.own).map(r => xoff ? { ...r, check: undefined, why: undefined } : r);
+  const at = s => runs.filter(r => r.stage === s);
+  const onLine = runs.filter(r => ["queued", "planning", "review", "building"].includes(r.stage)).length;
+  const other = at("other").length;
+  const note = `${onLine} runs on the line, ${other} other${scope === "all" ? ", all users" : ""}`;
+
+  const stations = STATIONS.map(st => {
+    const isPr = st.stage === "pr";
+    const list = isPr ? OWN_PRS.map(n => ({ n, own: true })) : at(st.stage);
+    const cap = isPr ? "PR state as last seen by uzi" : st.gate ? (list.length ? split(list) : "Nothing to review") : st.cap();
+    const prNote = isPr ? (scope === "all" ? "Yours only, not counted as active" : "Not counted as active") : "";
+    const WHY = { revise: ["cross-check: revise", "Codex cross-check asked for changes after its automatic rounds; your review decides"], blocked: ["cross-check: blocked", "Codex cross-check blocked this plan"], unavailable: ["cross-check: unavailable", "No checker could run (credential or slot); sent to the owner's gate"] };
+    const tip = r => [r.who, r.check === "plan" ? "Codex is cross-checking the plan (gpt-6-astra, deadline 14:20)" : r.check === "code" ? "Codex is cross-checking the code (advisory, does not block)" : "", r.why ? WHY[r.why][1] : ""].filter(Boolean).join(" · ");
+    const badges = list.map(r => {
+      const ck = r.check || r.why;
+      const ico = "";
+      const why = r.why ? `<span class="why${r.why === "blocked" ? " bad" : ""}">${WHY[r.why][0]}</span>` : r.check ? `<span class="why chk">cross-checking</span>` : "";
+      const t = tip(r);
+      return `<span class="badge${r.own ? "" : " other"}${ck ? " ck" : ""}"${t ? ` title="${esc(t)}"` : ""}>${ico}#${r.n}${why}</span>`;
+    }).join("");
+    const nCk = list.filter(r => r.check).length, nWhy = list.filter(r => r.why).length;
+    const ckLine = st.stage === "planning" && nCk ? `${nCk} in plan cross-check` : st.stage === "building" && nCk ? `${nCk} in code cross-check` : st.gate && nWhy ? `${nWhy} sent here by cross-check` : "";
+    const node = `<span class="node${st.fill ? " fill" : ""}${st.gate ? " gate" : ""}" aria-hidden="true"></span>`;
+    return `<button type="button" class="station${st.gate ? " gate-st" : ""}" style="--c: var(${st.c})" data-stage="${st.stage}" aria-pressed="${sel === st.stage}">
+      ${node}<span class="st-name">${st.name}</span>
+      <span class="st-count">${list.length}${isPr ? "<small>PRs</small>" : ""}</span>
+      <span class="st-cap">${cap}</span>${prNote ? `<span class="st-note">${prNote}</span>` : ""}
+      <span class="badges">${badges}</span></button>`;
+  }).join("");
+
+  const q = at("question"), pk = at("parked");
+  const qOwn = q.filter(r => r.own).length;
+  const qTitle = qOwn === q.length ? "Asking you" : "Questions";
+  const qSub = qOwn === q.length ? q.map(r => `#${r.n} paused on a question`).join(", ") : qOwn === 0 ? "Waiting on owners" : `${qOwn} on you, ${q.length - qOwn} on others`;
+  const autoN = pk.filter(r => r.auto).length;
+  const pkSub = `${autoN} resume on their own, ${pk.length - autoN} need action`;
+
+  const allDisabled = unavailable ? " disabled" : "";
+  card.innerHTML = `
+    <div class="head">
+      <h3 class="stitle">Issue work</h3>
+      <div class="head-meta">
+        <span>${note}</span>
+      </div>
+      <span class="seg new" role="group" aria-label="Issue work scope">
+        <button type="button" data-scope="you" aria-pressed="${scope === "you"}">You</button>
+        <button type="button" data-scope="all" aria-pressed="${scope === "all"}"${allDisabled} title="Every user's active runs">${esc(LABEL)}</button>
+      </span>
+    </div>
+    ${unavailable ? `<p class="unavail">Other users' runs are unavailable (last read 2 min ago). Showing yours.</p>` : ""}
+    <div class="line" role="group" aria-label="Filter runs by stage"><span class="rail" aria-hidden="true"></span>${stations}</div>
+    <div class="bays">
+      <button type="button" class="bay" data-stage="question" aria-pressed="${sel === "question"}"><span class="bay-ico ask"><svg><use href="#i-q"/></svg></span><span><b>${q.length}</b> ${qTitle}<span class="sub">${esc(qSub)}</span></span></button>
+      <button type="button" class="bay" data-stage="parked" aria-pressed="${sel === "parked"}"><span class="bay-ico"><svg><use href="#i-clock"/></svg></span><span><b>${pk.length}</b> Parked<span class="sub">${pkSub}</span></span></button>
+      <button type="button" class="bay" data-stage="other" aria-pressed="${sel === "other"}"><span class="bay-ico"><svg><use href="#i-act"/></svg></span><span><b>${other}</b> Other work<span class="sub">Jobs, self-improve, CI fixes, reworks</span></span></button>
+    </div>`;
+}
+
+document.querySelectorAll("[data-card]").forEach(card => {
+  render(card);
+  card.addEventListener("click", e => {
+    const b = e.target.closest("button");
+    if (!b || b.disabled) return;
+    if (b.closest(".seg")) { card.dataset.scope = b.dataset.scope; render(card); return; }
+    if (b.dataset.stage) { card.dataset.sel = card.dataset.sel === b.dataset.stage ? "" : b.dataset.stage; render(card); }
+  });
+});
+document.querySelectorAll('input[name="th"]').forEach(i => i.addEventListener("change", () => {
+  if (i.value) document.documentElement.dataset.theme = i.value; else delete document.documentElement.dataset.theme;
+}));
+</script>
+</body>
+</html>

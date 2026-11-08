@@ -101,7 +101,7 @@ export interface RetainedSourceServerDeps {
    *  reservation (lock order A -> S), so the Git discard hooks borrow it. Absent: legacy behaviour.
    *  `endSourceUse` (the production AuthorityRuntime has it) ends the source use the discard's admissions
    *  opened once the discard finished, so a later worker incarnation is not refused by a slot left active. */
-  authority?: AuthorityScope & Partial<Pick<AuthorityRuntime, "endSourceUse">>;
+  authority?: AuthorityScope & Partial<Pick<AuthorityRuntime, "endSourceUse" | "trackProducer">>;
   /** How long the discard waits for A before refusing. The claim gate is closed meanwhile, so this must
    *  stay short (default 30 s); a shutdown still ends the wait at once. */
   authorityWaitMs?: number;
@@ -268,6 +268,8 @@ export class RetainedSourceServer {
     // neither establishes settlement nor releases ownership: it only stops close() from hanging, and
     // it deliberately never reopens the gate or clears busy/inflight for a still-running request.
     const inflight = this.inflight;
+    // issue #4066: the bounded wait below may return with the request still running; the shutdown barrier joins it.
+    if (inflight) this.deps.authority?.trackProducer?.(inflight, "retained_source_request");
     if (inflight) await Promise.race([inflight.catch(() => undefined), realSleep(this.deps.shutdownSettleMs ?? SHUTDOWN_SETTLE_MS)]);
     const sock = this.socketPath;
     this.socketPath = undefined;

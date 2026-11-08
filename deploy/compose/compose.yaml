@@ -130,6 +130,7 @@ services:
     image: ghcr.io/vtmocanu/uzi/agent-base:${UZI_VERSION:?set UZI_VERSION in .env}
     restart: unless-stopped
     profiles: ["agent"]
+    stop_grace_period: 40s
     security_opt:
       - "no-new-privileges:true"
     cap_drop:

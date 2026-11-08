@@ -60,6 +60,11 @@ import type {
   OAuthConnection,
   AdminOAuthConnection,
   OAuthRedirect,
+  EffectiveSettings,
+  ScheduleSettingsPreview,
+  ScheduleSettingsPreviewRequest,
+  StartPreview,
+  StartPreviewRequest,
   CliToken,
   CliTokenMint,
   CliTokenScope,
@@ -826,6 +831,12 @@ const realApi = {
   vaultDisable: () => request<VaultDisableResponse>("POST", "/vault/disable"),
   getMySettings: (passive = false) =>
     request<{ settings: UserSettings }>("GET", "/me/settings", undefined, passive ? { "X-Uzi-Passive": "1" } : undefined),
+  // PRD #3254: what model, effort and harness a run would use, and what a start choice resolves to.
+  getEffectiveSettings: () => request<EffectiveSettings>("GET", "/me/effective-settings"),
+  previewStartSettings: (body: StartPreviewRequest) =>
+    request<StartPreview>("POST", "/me/effective-settings/start-preview", body),
+  previewScheduleSettings: (body: ScheduleSettingsPreviewRequest) =>
+    request<ScheduleSettingsPreview>("POST", "/me/effective-settings/schedule-preview", body),
   setHarnessOverflow: (enabled: boolean) =>
     request<{ harness_overflow_enabled: boolean }>("PUT", "/me/harness-overflow", {
       harness_overflow_enabled: enabled,

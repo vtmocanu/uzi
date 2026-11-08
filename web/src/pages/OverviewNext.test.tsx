@@ -26,6 +26,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       adminListRuns: vi.fn(),
       getRecoveryHolds: vi.fn(),
       getAdminHealth: vi.fn(),
+      listUsers: vi.fn(),
     },
   };
 });
@@ -35,7 +36,7 @@ const mockApi = vi.mocked(api);
 const admin = { ...aUser, is_admin: true };
 
 // Every endpoint a non-admin must never reach.
-const adminEndpoints = () => [mockApi.adminListRuns, mockApi.getAdminUsage, mockApi.getAdminHealth];
+const adminEndpoints = () => [mockApi.adminListRuns, mockApi.getAdminUsage, mockApi.getAdminHealth, mockApi.listUsers];
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -52,6 +53,7 @@ beforeEach(() => {
   mockApi.getAdminUsage.mockResolvedValue({ factory: emptySelf(), users: [], earliest_run: null });
   mockApi.adminListRuns.mockResolvedValue({ runs: [] });
   mockApi.getAdminHealth.mockResolvedValue(healthySilentDoc());
+  mockApi.listUsers.mockResolvedValue({ users: [] });
   mockApi.getRecoveryHolds.mockResolvedValue(noHolds());
 });
 
@@ -152,7 +154,7 @@ describe("OverviewNext for an admin", () => {
     await mount();
     expect(mockApi.adminListRuns).toHaveBeenCalledWith({ view: "summary" });
     expect(mockApi.adminListRuns).toHaveBeenCalledTimes(1);
-    expect(sentence()).toBe("Nothing needs you right now. 2 runs are executing across the factory and 1 queued.");
+    expect(sentence()).toBe("Nothing needs you right now. 2 runs are executing across the factory for 2 people and 1 queued.");
     expect(screen.getByRole("group", { name: "Usage scope" })).toBeTruthy();
     // The admin's own row is shown once, under Yours; the other users' rows under Other users.
     expect(within(screen.getByRole("list", { name: "Your runs" })).getAllByText("Live run row")).toHaveLength(1);
@@ -827,5 +829,143 @@ describe("Issue work scope (#4052)", () => {
     expect(screen.queryByRole("group", { name: "Usage scope" })).toBeNull();
     for (const call of adminEndpoints()) expect(call).not.toHaveBeenCalled();
     expect(within(line()).queryByText(/all users/)).toBeNull();
+  });
+});
+
+describe("People chip (issue #4042)", () => {
+  const SCOPE_KEY = "uzi.overviewUsageScope";
+  const user = (name: string, over: { last_login?: string | null; is_active?: boolean } = {}) => ({
+    ...aUser,
+    id: `u-${name}`,
+    email: `${name}@uzi.local`,
+    display_name: name[0].toUpperCase() + name.slice(1),
+    ...over,
+  });
+  const ago = (ms: number) => new Date(Date.now() - ms).toISOString();
+  const H = 3_600_000;
+  const chip = () => screen.getByRole("button", { name: /^People:/ });
+  const dialog = () => within(screen.getByRole("dialog", { name: "People using uzi" }));
+  const openChip = async () => {
+    await act(async () => {
+      fireEvent.click(chip());
+    });
+  };
+
+  // Nine active accounts: four own listed active work, one signed in recently, four are idle.
+  function seedRoster() {
+    vi.mocked(useAuth).mockReturnValue(authValue(admin));
+    mockApi.listRuns.mockResolvedValue({ runs: [aRun({ id: "own-1", status: "running" })] });
+    mockApi.adminListRuns.mockResolvedValue({
+      runs: [
+        aRun({ id: "own-1", status: "running", owner_email: admin.email }),
+        aRun({ id: "m-1", status: "running", owner_email: "mira@uzi.local" }),
+        aRun({ id: "a-1", status: "queued", owner_email: "andrei@uzi.local" }),
+        aRun({ id: "i-1", status: "paused", owner_email: "ioana@uzi.local" }),
+        aRun({ id: "done", status: "completed", owner_email: "bogdan@uzi.local" }),
+      ],
+    });
+    mockApi.listUsers.mockResolvedValue({
+      users: [
+        { ...admin, last_login: ago(H) },
+        user("mira"),
+        user("andrei"),
+        user("ioana"),
+        user("bogdan", { last_login: ago(2 * H) }),
+        user("c1", { last_login: ago(10 * 24 * H) }),
+        user("c2", { last_login: ago(10 * 24 * H) }),
+        user("c3", { last_login: ago(10 * 24 * H) }),
+        user("c4", { last_login: ago(10 * 24 * H) }),
+        user("gone", { is_active: false }),
+      ],
+    });
+  }
+
+  it("counts four of nine people for an admin, with the right pills and one signed-in person", async () => {
+    seedRoster();
+    await mount();
+    expect(chip().getAttribute("aria-label")).toBe("People: 4 active now of 9");
+    expect(sentence()).toContain("2 runs are executing across the factory for 2 people");
+    await openChip();
+    const rows = dialog().getAllByRole("listitem").map((li) => li.textContent ?? "");
+    expect(rows).toHaveLength(5);
+    expect(rows[0]).toBe("AAdmin (you)1 running");
+    expect(rows).toContain("AAndrei1 queued");
+    expect(rows).toContain("MMira1 running");
+    expect(rows).toContain("IIoana" + "waits on them");
+    expect(rows[4]).toContain("Bogdan");
+    expect(rows[4]).toContain("2h ago");
+    expect(dialog().getByText("4 people, last seen 10 days ago")).toBeTruthy();
+    expect(dialog().queryByText(/online/i)).toBeNull();
+  });
+
+  it("keeps the sentence's people count within its executing count for a viewer run only the admin list has", async () => {
+    vi.mocked(useAuth).mockReturnValue(authValue(admin));
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListRuns.mockResolvedValue({
+      runs: [
+        aRun({ id: "v-only", status: "running", owner_email: admin.email }),
+        aRun({ id: "m-1", status: "running", owner_email: "mira@uzi.local" }),
+      ],
+    });
+    await mount();
+    const m = sentence().match(/(\d+) runs? (?:is|are) executing across the factory for (\d+) (?:person|people)/);
+    expect(m).not.toBeNull();
+    expect(Number(m![2])).toBeLessThanOrEqual(Number(m![1]));
+    await openChip();
+    expect(dialog().getAllByRole("listitem").some((li) => li.textContent?.includes("(you)"))).toBe(true);
+  });
+
+  it("says active now is unavailable when the first admin run list fails", async () => {
+    vi.mocked(useAuth).mockReturnValue(authValue(admin));
+    mockApi.adminListRuns.mockRejectedValue(new Error("down"));
+    await mount();
+    expect(chip().getAttribute("aria-label")).toBe("People: Active now unavailable");
+  });
+
+  it("shows no total, and no signed-in or idle group, when the user list fails", async () => {
+    seedRoster();
+    mockApi.listUsers.mockRejectedValue(new Error("403"));
+    await mount();
+    expect(chip().getAttribute("aria-label")).toBe("People: 4 active now");
+    await openChip();
+    expect(dialog().queryByText(/Signed in within 24 hours/)).toBeNull();
+    expect(dialog().queryByText("Idle")).toBeNull();
+    expect(dialog().getAllByRole("listitem")).toHaveLength(4);
+    expect(screen.getByRole("region", { name: "Your usage" })).toBeTruthy();
+    expect(screen.getAllByText("Live run row").length).toBeGreaterThan(0);
+  });
+
+  it("disables the usage action when the viewer's own usage could not be read", async () => {
+    seedRoster();
+    mockApi.getUsage.mockRejectedValue(new Error("down"));
+    await mount();
+    await openChip();
+    const btn = dialog().getByRole("button", { name: "Usage by user unavailable" }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+  });
+
+  it("switches the Usage card to All users and focuses By user when Usage by user is activated", async () => {
+    seedRoster();
+    await mount();
+    expect(localStorage.getItem(SCOPE_KEY)).toBeNull();
+    expect(screen.queryByRole("region", { name: "By user" })).toBeNull();
+    await openChip();
+    await act(async () => {
+      fireEvent.click(dialog().getByRole("button", { name: "Usage by user →" }));
+    });
+    expect(chip().getAttribute("aria-expanded")).toBe("false");
+    const byUser = screen.getByRole("region", { name: "By user" });
+    expect(within(screen.getByRole("group", { name: "Usage scope" })).getByRole("button", { name: "All users" }).getAttribute("aria-pressed")).toBe("true");
+    expect(document.activeElement).toBe(byUser);
+    expect(byUser.id).toBe("overview-usage-by-user");
+    expect(JSON.parse(localStorage.getItem(SCOPE_KEY)!)).toBe("all");
+  });
+
+  it("gives a non-admin no chip, no 'for' in the sentence and no admin or user request", async () => {
+    await mount();
+    await settle(30_000);
+    expect(screen.queryByRole("button", { name: /^People:/ })).toBeNull();
+    expect(sentence()).not.toContain(" for ");
+    for (const call of adminEndpoints()) expect(call).not.toHaveBeenCalled();
   });
 });

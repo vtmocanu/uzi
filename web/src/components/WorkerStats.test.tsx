@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
-import { WorkerStatGauges, WorkerStatLine, formatBytes, formatBytesPair } from "./WorkerStats";
+import { WorkerStatGauges, WorkerStatLine, diskDangerPct, formatBytes, formatBytesPair, runHomeSize } from "./WorkerStats";
 import type { Worker } from "../lib/api";
 
 afterEach(cleanup);
@@ -440,5 +440,47 @@ describe("WorkerStatGauges: largest run and data-volume inodes (PRD #1809 M6)", 
     const bar = screen.getByRole("progressbar", { name: "Disk /data" });
     expect(bar.getAttribute("aria-valuenow")).toBe("97");
     expect(screen.getByText(/2\/10 GiB · 20% · inodes 97%/)).toBeTruthy();
+  });
+});
+
+describe("diskDangerPct", () => {
+  const GIB = 1024 ** 3;
+  const data = (used: number, total = 100 * GIB) => ({ stats_disk_data_bytes: used, stats_disk_data_total_bytes: total });
+
+  it("is null at 84% and reports 85% as danger", () => {
+    expect(diskDangerPct(aWorker(data(84 * GIB)))).toBeNull();
+    expect(diskDangerPct(aWorker(data(85 * GIB)))).toEqual({ pct: 85, label: "Disk /data", inodes: false });
+  });
+
+  it("rounds before comparing, like the gauge", () => {
+    expect(diskDangerPct(aWorker(data(84.4 * GIB)))).toBeNull();
+    expect(diskDangerPct(aWorker(data(84.6 * GIB)))?.pct).toBe(85);
+  });
+
+  it("picks the fullest volume and flags inode-driven fill", () => {
+    const w = aWorker({
+      ...data(50 * GIB),
+      stats_disk_dind_bytes: 10 * GIB,
+      stats_disk_dind_total_bytes: 100 * GIB,
+      stats_disk_dind_inodes: 97,
+      stats_disk_dind_total_inodes: 100,
+    });
+    expect(diskDangerPct(w)).toEqual({ pct: 97, label: "Disk dind", inodes: true });
+  });
+
+  it("clamps an over-full reading to 100 and is null with no disk reported", () => {
+    expect(diskDangerPct(aWorker(data(150 * GIB)))?.pct).toBe(100);
+    expect(diskDangerPct(aWorker())).toBeNull();
+  });
+
+  it("does not need a CPU/memory sample", () => {
+    expect(diskDangerPct(aWorker({ ...data(90 * GIB), stats_source: null, stats_mem_bytes: null }))?.pct).toBe(90);
+  });
+});
+
+describe("runHomeSize", () => {
+  it("formats the size and says at least when truncated", () => {
+    expect(runHomeSize(4294967296, false)).toBe("4 GiB");
+    expect(runHomeSize(4294967296, true)).toBe("at least 4 GiB");
   });
 });

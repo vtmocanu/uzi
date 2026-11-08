@@ -1,7 +1,7 @@
 # PRD #3914: Per-repo default agent source, applied before the first plan turn
 
 **Issue:** #3914
-**Status:** Draft r2, 2026-11-04 (r1 reviewed by an architect pass and the Codex peer; findings folded). Source anchors checked against origin/main `9cc6ab5a1`. Line numbers drift; cite by symbol.
+**Status:** Done, 2026-11-08. M1 #3941 (`1fca12dd7`), M2 #4045 (`ac7f75fb6`), M3 #4053 (`9b057343`) and M4 #4048 (`4d4d8e08`) are merged; the M3 prerequisite #3913 landed first (#3940, `4ff75ad47`). Follow-up: #4076 (guarded commands are refused as cancelled after a credential-switch give-up; it predates this PRD). Draft r2 was dated 2026-11-04, with source anchors checked against origin/main `9cc6ab5a1`; line numbers drift, so cite by symbol.
 **Priority:** Medium (`priority::normal`).
 **Blocked by:** M3 (planning) is blocked by #3913 (pin the repo-agent roster to a trusted default-branch revision), because M3 is the first change that runs repo agents before a human plan gate. M1, M2 and M4 do not depend on it.
 **Related:** PRD #37 (`prds/done/37-run-agent-selection.md`, Decisions 4, 5, 6, 10), #3912 (evidence-audit wording of the repo-agent passage), #3250 (per-run model at start), #602 (instance-wide agent-source sync), #2242.
