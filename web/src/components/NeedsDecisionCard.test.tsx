@@ -368,6 +368,112 @@ describe("NeedsDecisionCard", () => {
     });
   });
 
+  // PRD #4040: an awaiting_input question quotes the server's pending-question excerpt.
+  describe("pending-question excerpt", () => {
+    const ask = (id: string, excerpt?: string, over: Partial<RunSummaryItem> = {}): RunDecisionItem => ({
+      ...item("question", { id, status: "awaiting_input", issue_title: `Title ${id}`, ...over }),
+      ...(excerpt !== undefined ? { excerpt } : {}),
+    });
+    const excerpts = (root: ParentNode) => Array.from(root.querySelectorAll("[data-excerpt]")) as HTMLElement[];
+    const groupRow = () => screen.getByText(/runs need your input$/).closest("li") as HTMLElement;
+
+    it("quotes the excerpt under a single row's title, with the excerpt as its tooltip", () => {
+      const { container } = mount([ask("q1", "Should the cap count exports that are still queued?")]);
+      const [line] = excerpts(container);
+      expect(excerpts(container)).toHaveLength(1);
+      expect(line.textContent).toBe("“Should the cap count exports that are still queued?”");
+      expect(line.getAttribute("title")).toBe("Should the cap count exports that are still queued?");
+      // Under the title, before the age; the age stays "waiting <age>" and Answer links to the run.
+      const link = screen.getByRole("link", { name: "Answer" });
+      const title = document.getElementById(link.getAttribute("aria-describedby") ?? "") as HTMLElement;
+      expect(title.nextElementSibling).toBe(line);
+      expect(line.nextElementSibling?.textContent).toBe("waiting 14m");
+      expect(link.getAttribute("href")).toBe("/runs/q1");
+    });
+
+    it("keeps a long excerpt to one truncated line", () => {
+      const long = "Lower the caps to the floor, or keep them and record the measurement as not obtained? ".repeat(4).trim();
+      const { container } = mount([ask("q1", long)]);
+      const lines = excerpts(container);
+      expect(lines).toHaveLength(1);
+      expect(lines[0].classList.contains("truncate")).toBe(true);
+      expect(lines[0].children).toHaveLength(0);
+      expect(lines[0].getAttribute("title")).toBe(long);
+    });
+
+    it("renders exactly the title, the age and Answer when there is no excerpt", () => {
+      const { container } = mount([ask("q1")]);
+      expect(excerpts(container)).toHaveLength(0);
+      const link = screen.getByRole("link", { name: "Answer" });
+      expect(link.getAttribute("href")).toBe("/runs/q1");
+      const row = link.closest("[data-decision-row]") as HTMLElement;
+      const title = document.getElementById(link.getAttribute("aria-describedby") ?? "") as HTMLElement;
+      expect(Array.from((title.parentElement as HTMLElement).children).map((el) => el.textContent)).toEqual([
+        "vtmocanu/uzi #7 Title q1",
+        "waiting 14m",
+      ]);
+      expect(within(row).getAllByRole("link")).toEqual([link]);
+    });
+
+    it("leaves the collapsed group preview without excerpts and quotes each expanded awaiting_input item", () => {
+      const { container } = mount([ask("q1", "First question?"), ask("q2", "Second question?"), ask("q3", "Third question?")]);
+      expect(excerpts(container)).toHaveLength(0);
+      expect(within(groupRow()).getByText("Title q1")).toBeTruthy();
+      fireEvent.click(within(groupRow()).getByRole("button", { name: "Open runs" }));
+      const lines = excerpts(groupRow());
+      expect(lines.map((el) => [el.textContent, el.getAttribute("title")])).toEqual([
+        ["“First question?”", "First question?"],
+        ["“Second question?”", "Second question?"],
+        ["“Third question?”", "Third question?"],
+      ]);
+      // Each excerpt sits in its own item, after the item's one-line ref, title, age and action.
+      for (const [i, el] of lines.entries()) {
+        const li = el.closest("li") as HTMLElement;
+        expect(within(li).getByRole("link", { name: "Answer" }).getAttribute("href")).toBe(`/runs/q${i + 1}`);
+        expect(el.classList.contains("truncate")).toBe(true);
+      }
+      fireEvent.click(within(groupRow()).getByRole("button", { name: "Show fewer" }));
+      expect(excerpts(container)).toHaveLength(0);
+    });
+
+    it("never quotes the follow-up in a mixed question and follow-up group", () => {
+      // overviewDecisions never gives a follow-up an excerpt; the card shows only what it gets.
+      const followup = item("question", { id: "f1", status: "awaiting_followup", issue_title: "Title f1" });
+      mount([ask("q1", "Only this one?"), followup]);
+      fireEvent.click(within(groupRow()).getByRole("button", { name: "Open runs" }));
+      const answers = within(groupRow()).getAllByRole("link", { name: "Answer" });
+      expect(answers.map((a) => a.getAttribute("href"))).toEqual(["/runs/q1", "/runs/f1"]);
+      expect(excerpts(answers[0].closest("li") as HTMLElement)).toHaveLength(1);
+      expect(excerpts(answers[1].closest("li") as HTMLElement)).toHaveLength(0);
+    });
+
+    // Binding (plan seq 159): the tooltip is a separate render sink, so a bidi override in the
+    // excerpt must leave neither the text nor the title attribute. Assembled at runtime.
+    describe("with a bidi override", () => {
+      const RLO = String.fromCharCode(0x202e);
+      const raw = "Should " + RLO + "we";
+
+      it("strips it from a single row's text and title", () => {
+        const { container } = mount([ask("q1", raw)]);
+        const [line] = excerpts(container);
+        expect(line.textContent).toBe("“Should we”");
+        expect(line.getAttribute("title")).toBe("Should we");
+        expect(container.textContent).not.toContain(RLO);
+        for (const el of container.querySelectorAll("[title]")) expect(el.getAttribute("title")).not.toContain(RLO);
+      });
+
+      it("strips it from an expanded group item's text and title", () => {
+        const { container } = mount([ask("q1", raw), ask("q2", "Plain?")]);
+        fireEvent.click(within(groupRow()).getByRole("button", { name: "Open runs" }));
+        const [line] = excerpts(container);
+        expect(line.textContent).toBe("“Should we”");
+        expect(line.getAttribute("title")).toBe("Should we");
+        expect(container.textContent).not.toContain(RLO);
+        for (const el of container.querySelectorAll("[title]")) expect(el.getAttribute("title")).not.toContain(RLO);
+      });
+    });
+  });
+
   describe("held work row", () => {
     const heldItem = (over: Partial<HeldDecisionItem> = {}): HeldDecisionItem => ({
       kind: "held",

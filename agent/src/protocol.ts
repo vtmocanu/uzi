@@ -2345,6 +2345,8 @@ export const REPO_AGENT_SOURCE_HOLD_REASON = "repo_agent_source_unavailable";
 
 export const REPO_AGENT_SOURCE_FEATURE = "repo_agent_source_v1";
 
+export const PLAN_AGENT_SOURCE_FEATURE = "plan_agent_source_v1";
+
 /** issue #3194: what a base-attestation hold request established. `held` is the server's positive
  *  ACK for this flight's generation; `stale` is a fence refusal (the claim moved on); `unknown`
  *  covers every answer that proves neither (transport, 5xx, 404, 400, an unreadable body). */
@@ -2801,6 +2803,15 @@ export function seedAgentSelection(persisted?: AgentSelection | null): AgentSele
   return persisted ? { status: "ok", selection: persisted } : { status: "absent" };
 }
 
+export function planAgentSource(
+  persisted: AgentSource | null | undefined,
+  requested: AgentSource | null | undefined,
+  repoAvailable: boolean,
+): AgentSource {
+  const narrowed = persisted !== undefined && persisted !== null && persisted !== "repo";
+  return requestedAgentSource(requested) === "repo" && repoAvailable && !narrowed ? "repo" : "own";
+}
+
 export function gateVerdictSelection(
   verdict: AgentSelectionParse,
   persisted: AgentSelection | null | undefined,
@@ -3028,6 +3039,7 @@ export interface StateRequest {
    *  Human-gated runs persist their selection through the `approve_plan` input
    *  instead, so this is absent there. */
   agent_selection?: AgentSelection;
+  plan_agent_source?: AgentSource;
   /** The plan's milestone breakdown (PRD #122 M1, Decision 2). Additive + optional
    *  and OMITTED ENTIRELY when absent — never `null` or `[]` — so an old worker's
    *  payload and a new worker's "no milestones" payload stay the same shape on the

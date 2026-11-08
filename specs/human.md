@@ -394,9 +394,10 @@ PRD at `prds/3914-repo-agent-source-default.md`.
 - Each user may set, per repo connection, a default agent source for their own runs: `own`, `repo`, or unset (today's behaviour). Only the owner may choose `repo`; an admin may clear it or set `own`. A teammate's runs on the same project follow only their own setting. (AI-synced 2026-11-04)
 - The default is frozen onto each issue run at creation (manual, CLI, chat, schedules, autopilot), recorded as requested source plus basis (`repo_default`, or `explicit` for a seeded plan's source or a create-time choice); a later settings change never alters an existing run, and other run kinds are unaffected. (AI-synced 2026-11-04)
 - An approval with no agent choice implements with the requested source and records it; `repo` without a detected roster falls back to the user's templates with the existing note. Autopilot implements with the requested source. An explicit gate choice still wins and shows as "changed at approval". (AI-synced 2026-11-04)
-- A run carrying a request is claimable only by a worker reporting `agent_source_request_v1`, with no owner or admin bypass; while none is online the queued run's health reason names it. Unset runs behave exactly as before. Planning with the requested source is a later milestone. (AI-synced 2026-11-04)
+- A run carrying a request is claimable only by a worker reporting `agent_source_request_v1`, with no owner or admin bypass; while none is online the queued run's health reason names it. Unset runs behave exactly as before. (AI-synced 2026-11-04)
 - The web and Slack plan gates pre-select the run's requested source: `own` selects the user's templates even when the repo ships agents (in Slack, "Approve · my templates" comes first as the primary button); `repo` selects the repo roster when one is detected. Unset keeps today's pre-selection and button order; Slack action ids are unchanged. (AI-synced 2026-11-07)
 - `uzi run create --agent-source` and the API's `agent_selection` work without a plan file and override the default for that run (basis `explicit`); exclusions without a plan file are refused. Chat, schedules and autopilot pass no create-time choice and keep the default. (AI-synced 2026-11-07)
+- The plan turn uses the repo's agents only when the run's request is `repo`, a roster was detected at the run's recorded revision, and the run does not record a choice of the user's templates; otherwise it uses the user's templates. A recorded source only narrows planning to the user's templates and never enables repo agents. Repo planning agents lose file-write tools (Claude write tools removed, Codex planning file-write requests refused) but keep the shell, so shell commands can still change files; this is not write isolation. The lead's planning prompt marks their output as unverified. The run records which source planned it (`plan_agent_source`, overwritten on a re-plan, absent on a seeded run), shown on the run page and in `uzi run get`. (AI-synced 2026-11-07)
 
 ## Feature #41 — Plan revision at the approval gate
 
@@ -1799,6 +1800,13 @@ Design record: issue #4041 (epic #3873); target mock `prds/mockups/4041-needs-de
 - Open PRs always form one row, "N pull requests are open for your review" (singular for one), with "PR state as last seen by uzi" once (MR on GitLab). Items read `owner/repo #N` (`!N` on GitLab) and link to the PR only for an https URL, else the run page; the repo is masked in demo mode and stripped of control and bidi characters, on single rows too. (AI-synced 2026-11-07)
 - Rows carry decorative kind icons, and a plan row reads "Plan ready, N milestones · waiting <age>" from the proposed milestones, falling back to the approved list, or just "Plan ready" when none. (AI-synced 2026-11-07)
 - The card uses two columns on wide screens only when it has 2 to 4 rows, one column otherwise and at phone width. The status sentence and header counts are unchanged and count items, not rows. (AI-synced 2026-11-07)
+
+## Feature #4040 — Overview preview, pending question excerpt
+
+Design record: `prds/done/4040-overview-pending-question.md` (epic #3873).
+
+- In Needs your decision, a viewer's own awaiting_input run shows a one-line excerpt of its newest pending question under the run title, on a single row and on each expanded group item. The excerpt is sanitized and capped at 280 characters plus " (+N more)". (AI-synced 2026-11-07)
+- The excerpt is never shown on the admin all-users list, the collapsed group preview, or follow-ups (awaiting_followup). The age and the Answer action are unchanged. (AI-synced 2026-11-07)
 
 ## Demo mode branding
 

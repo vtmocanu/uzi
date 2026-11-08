@@ -3650,6 +3650,7 @@ export interface Run {
   agent_exclusions: string[] | null;
   agent_source_requested?: AgentSource | null;
   agent_source_requested_basis?: AgentSourceRequestedBasis | null;
+  plan_agent_source?: AgentSource | null;
   /** PRD #37 M4-fix: the owner's OWN-source subagent roster (name + description) —
    *  exactly the allocation-resolved templates the worker runs for source="own",
    *  lead already stripped. The plan gate's "My agent templates" card is built from
@@ -4351,6 +4352,12 @@ export interface RunListItem extends Run {
    *  appends it only when > 0. */
   judge_verdict: JudgeVerdict | null;
   judge_todo_count: number;
+
+  /** PRD #4040: a one-line, sanitized excerpt (at most 280 characters plus " (+N more)")
+   *  of the newest pending question, set only on the viewer's own awaiting_input rows of
+   *  GET /api/runs. Absent otherwise, and never on the admin list. Untrusted model text:
+   *  render as plain text. */
+  pending_question?: string;
 
   repo_path: string;
   worker_name: string | null;

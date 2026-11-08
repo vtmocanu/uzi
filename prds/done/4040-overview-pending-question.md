@@ -1,6 +1,6 @@
 # PRD #4040: Overview preview, show the pending question inline in Needs your decision
 
-**Status**: Ready for dispatch (refreshed 2026-11-07 against main `d3b6baf8`). Follow-up of #3878, child of epic #3873. #3881 landed in PR #4049 and #4041 in PR #4067; this is next in #3873's serial order (every child edits the Overview preview page; run them one at a time).
+**Status**: Done (2026-11-08). M1 implemented on branch `agent/issue-4040`, pending merge (the run split it into an api half and a web half, committed as "#4040 M1" and "#4040 M2"): owner-scoped `pending_question` on `GET /api/runs`, the quoted line in Needs your decision, mock seed, tests, docs, and side-by-side screenshots in `prds/mockups/4040/`. Exact-head PR CI (full `test:api`, `test:web`, `test:web-browser`, `gate:repo`, and `deadcode:api`, which the worker memory guard blocked in-run) is a landing obligation. Follow-up of #3878, child of epic #3873.
 
 **Design brief**: `prds/3873-overview-redesign.md`. **Design mock**: `prds/mockups/4041-needs-decision-after.html` (the target card after #4041 and this PRD; open it in a browser), with `prds/mockups/3873-overview-redesign-mock.html` as the original, the question row in "Needs your decision" (`#409 … "Should the cap count exports that are still queued?" Asked 25 min ago`). The brief's mock contract applies: implement the mock for this row, small consistency tweaks are fine, larger deviations go under `Mock deviations` in the PR body with a reason, and the PR carries side-by-side screenshots (app left, mock right; desktop and 400 px; Ember and Dawn). This PRD's text wins where it is more specific.
 
@@ -71,7 +71,7 @@ Acceptance examples:
 
 The batched decoration, DTO field, web type, card rendering, mock sample, tests and docs (`docs/` only if a user doc describes the card).
 
-Acceptance: the four acceptance examples above pass as tests; mock parity for the question row, with side-by-side screenshots. Expected `Mock deviations` for the PR body: the row keeps "waiting <age>" where the mock says "Asked"; expanded group items carry the excerpt, which the #4041 target mock does not depict (both maintainer decisions, 2026-11-07).
+Acceptance: the four acceptance examples above pass as tests; mock parity for the question row, with side-by-side screenshots. Expected `Mock deviations` for the PR body: the row keeps "waiting <age>" where the mock says "Asked"; group items keep their title and add the excerpt as a second line, only when the group is expanded, where the #4041 target mock replaces the title with the quote in collapsed and expanded groups alike (both maintainer decisions, 2026-11-07; wording corrected 2026-11-08 against the mock).
 
 ## Decision Log
 
@@ -81,3 +81,5 @@ Acceptance: the four acceptance examples above pass as tests; mock parity for th
 - **On the owner list item, never the admin list** (2026-11-07, architecture review): the field sits on `RunListItemDTO` so the pinned summary-equals-list-minus-omitted invariant holds, and it is set only in owner-scoped `ListRuns`. Rejected: a summary-only field (breaks that invariant) and decorating in the shared `writeRunList` path (would send other users' questions to admins).
 - **No new CLI column** (2026-11-07): the CLI already prints the question where a CLI user answers it; `uzi run list --json` carries the field because it reads the full owner list.
 - **Shared excerpt function, whitespace collapsed before stripping** (2026-11-07): one parser for Slack and the web avoids two copies drifting; collapsing first keeps words separated because the control-character check also matches newlines and tabs.
+- **Red/green for the admin exclusion is a regression mutant** (2026-11-08, implementation): `AdminListRuns` never decorated before this change, so its test cannot go red on base; it was watched red against two mutants (decorating inside `AdminListRuns`, and inside the shared `overlayListDecorations`) and green on the candidate. The owner decoration test was watched red with the decoration removed.
+- **Single-row screenshots use a scratch-only data tweak** (2026-11-08): in `?mock=overview-next` #409 shares the question group with `run-awaiting-followup` and `run-unreadable-question`, so the single-row parity shots drop those two runs in an uncommitted scratch export; the expanded-group shots use the committed mock.

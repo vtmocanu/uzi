@@ -784,8 +784,10 @@ describe("OverviewNext decision card layout", () => {
         const r = el.getBoundingClientRect();
         expect.soft(r.height, `one line: ${el.textContent?.slice(0, 30)}`).toBeLessThanOrEqual(24);
         expect.soft(r.right, el.textContent?.slice(0, 30)).toBeLessThanOrEqual(cardRight + 1);
-        // The title keeps a readable share of the line.
-        const title = el.children[1] as HTMLElement;
+        // The item's first child is its one-line row (an awaiting_input item adds an excerpt line
+        // under it, #4040; PRs never do). The title keeps a readable share of the line.
+        const line = el.children[0] as HTMLElement;
+        const title = line.children[1] as HTMLElement;
         expect.soft(title.getBoundingClientRect().width, "title width").toBeGreaterThanOrEqual(width === 1280 ? 100 : 50);
         // A long repo path truncates on its own; the PR number always shows whole, inside the link.
         const num = el.querySelector("[data-pr-num]") as HTMLElement;
@@ -798,7 +800,7 @@ describe("OverviewNext decision card layout", () => {
         expect.soft(n.right, "number inside the link").toBeLessThanOrEqual(l.right + 0.5);
         expect.soft(n.left, "number inside the link").toBeGreaterThanOrEqual(l.left - 0.5);
         // The ref cell clips its overflow, so the link itself must fit inside it.
-        expect.soft(l.right, "link inside its ref cell").toBeLessThanOrEqual((el.children[0] as HTMLElement).getBoundingClientRect().right + 0.5);
+        expect.soft(l.right, "link inside its ref cell").toBeLessThanOrEqual((line.children[0] as HTMLElement).getBoundingClientRect().right + 0.5);
         if (width === 1280) {
           const repo = el.querySelector("[data-pr-repo]") as HTMLElement;
           expect.soft(repo.scrollWidth, "the long repo path is the part that truncates").toBeGreaterThan(repo.clientWidth);
@@ -814,4 +816,49 @@ describe("OverviewNext decision card layout", () => {
       expect(button.textContent).toBe("Review PRs");
     });
   }
+
+  // PRD #4040: expanded awaiting_input items quote long pending questions on a second line that
+  // truncates to one line inside the card, never pushing the page sideways on a phone.
+  it("keeps an expanded question group with long excerpts inside the viewport at 400px", async () => {
+    await page.viewport(400, 900);
+    const LONG_QUESTION =
+      "The joint-cap fixture does not finish within the lifted deadline on this worker. Lower the caps to the 2x Chromium floor, or keep them and record the measurement as not obtained?";
+    const { card } = await mountCard(
+      [0, 1, 2].map((i) =>
+        aRun({
+          id: `ask-${i}`,
+          status: "awaiting_input",
+          issue_iid: 3540 + i,
+          issue_title: LONG_TITLE,
+          pending_question: LONG_QUESTION,
+          status_since: `2026-07-05T1${i}:00:00Z`,
+        }),
+      ),
+    );
+    expect(window.innerWidth).toBe(400);
+    const button = within(card).getByRole("button", { name: "Open runs" });
+    const list = document.getElementById(button.getAttribute("aria-controls") ?? "") as HTMLElement;
+    expect(list.querySelectorAll("[data-excerpt]")).toHaveLength(0);
+    button.focus();
+    await userEvent.keyboard("{Enter}");
+    expect(button.getAttribute("aria-expanded")).toBe("true");
+
+    const excerpts = Array.from(list.querySelectorAll("[data-excerpt]")) as HTMLElement[];
+    expect(excerpts).toHaveLength(3);
+    const cardRight = card.getBoundingClientRect().right;
+    const lineHeight = parseFloat(getComputedStyle(excerpts[0]).lineHeight);
+    for (const el of excerpts) {
+      const r = el.getBoundingClientRect();
+      expect.soft(r.right, "excerpt inside the card").toBeLessThanOrEqual(cardRight + 1);
+      expect.soft(r.height, "excerpt is one line").toBeLessThanOrEqual(lineHeight + 1);
+      expect.soft(el.scrollWidth, "the long excerpt truncates").toBeGreaterThan(el.clientWidth);
+      expect.soft(el.title, "full excerpt on hover").toBe(LONG_QUESTION);
+    }
+    for (const li of Array.from(list.children) as HTMLElement[]) {
+      expect.soft(li.getBoundingClientRect().right, "item inside the card").toBeLessThanOrEqual(cardRight + 1);
+      expect.soft(li.scrollWidth, "item does not overflow").toBeLessThanOrEqual(li.clientWidth + 1);
+    }
+    expect(card.scrollWidth, "card does not overflow").toBeLessThanOrEqual(card.clientWidth + 1);
+    expect(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(window.innerWidth);
+  });
 });
