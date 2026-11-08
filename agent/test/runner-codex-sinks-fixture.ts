@@ -690,11 +690,16 @@ export function receiptError(): Error {
 
 
 const SESSION_KEPT = "run interrupted by worker shutdown; preserving its plugin dir and HOME for a same-worker resume";
+const RETAINED_SESSION_KEPT = /^retained recovery stopped( with an owner pause pending)?; preserving plugin dir and HOME for a same-worker resume$/;
 
 /** True when executeClaim's finally kept the run's plugin dir and HOME (preserveSession on an
  *  unparked flight: the only branch that logs this line). */
 export function sessionKept(lines: unknown[]): boolean {
-  return lines.some((l) => (l as { msg?: string }).msg === SESSION_KEPT);
+  return lines.some((l) => {
+    const msg = (l as { msg?: string }).msg;
+    // issue #3995: a retained recovery stop now names its own cause instead of "worker shutdown".
+    return msg === SESSION_KEPT || RETAINED_SESSION_KEPT.test(msg ?? "");
+  });
 }
 
 /** Count client.publishCheckpoint calls made while `when()` holds; every call still lands. */

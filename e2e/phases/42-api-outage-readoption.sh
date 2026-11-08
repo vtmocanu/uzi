@@ -96,6 +96,7 @@ make_gate_run() {
 # Exported so it out-ranks the overlay's ${UZI_E2E_MAX_CONCURRENT_RUNS:-1} default, exactly as
 # phase 45 sets it (via the env-file) / phase 52 exports E2E_WORKER_HEARTBEAT_STALE.
 export UZI_E2E_MAX_CONCURRENT_RUNS=2
+capture_agent_logs 42-api-outage-readoption before-recreate-cap2
 "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null
 wait_worker_online
 # Wait for the RECREATED worker's registration to actually LAND its advertised cap — not
@@ -248,6 +249,7 @@ say "CASE (c): a live worker silently loses one execution → requeued after the
 # Arm the seam and recreate the agent (fresh worker under the drop env; still cap 2). Any
 # leftover queued run would confuse the claim, so make sure only run X exists.
 export UZI_E2E_DROP_ON_SENTINEL=1
+capture_agent_logs 42-api-outage-readoption before-recreate-drop-seam
 "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null
 wait_worker_online
 pass "case c: agent recreated with the drop seam armed (UZI_E2E_DROP_ON_SENTINEL=1)"
@@ -321,6 +323,7 @@ pass "case c: second worker got NOTHING on every probe and was deleted while idl
 # the drop seam (a fresh process clears the pause latch and the env). It reclaims X by affinity
 # exactly once: the generation advances by exactly one.
 unset UZI_E2E_DROP_ON_SENTINEL
+capture_agent_logs 42-api-outage-readoption before-recreate-resume
 "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null
 wait_worker_online
 wait_status "$X" awaiting_approval 90
@@ -387,6 +390,7 @@ login
 # restarting the worker, then let its new register re-enable the empty snapshot.
 wait_status "$ED" cancelled 60
 RA_RESTORE_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+capture_agent_logs 42-api-outage-readoption before-restore-recreate
 "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null
 wait_worker_online
 wait_runs_terminal_off_worker 60 "$ED"

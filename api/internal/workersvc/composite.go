@@ -194,7 +194,7 @@ func (s *Service) DismissProposalForUser(ctx context.Context, userID, runID, pro
 // composite no longer computes any PRD-link bypass. It returns the CreateRun
 // sentinels unchanged (ErrNotPRDIssue, ErrActiveRunExists, …) plus the forge
 // sentinels above.
-func (s *Service) StartRunForUser(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, waitOnLimit, mrReworkEnabled *bool, force bool, seed *SeededPlan, explicit *Harness, rawOverride *RawCredentialOverride) (store.Run, error) {
+func (s *Service) StartRunForUser(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, waitOnLimit, mrReworkEnabled *bool, force bool, seed *SeededPlan, requested *AgentSelection, explicit *Harness, rawOverride *RawCredentialOverride) (store.Run, error) {
 	if s.forges == nil {
 		return store.Run{}, ErrForgesUnavailable
 	}
@@ -224,7 +224,7 @@ func (s *Service) StartRunForUser(ctx context.Context, userID, repoID uuid.UUID,
 	// credential override (D5). Both are threaded straight into CreateRun, which resolves D11 and
 	// validates the override INSIDE the create transaction against the resolved harness — the old
 	// pre-transaction effective-harness guess is gone. The web board / chat start card pass nil/nil.
-	return s.CreateRun(issueinput.WithCapture(ctx, capture), userID, repo.ID, issueIID, capture.Issue.Description, waitOnLimit, mrReworkEnabled, force, seed, explicit, rawOverride)
+	return s.CreateRun(issueinput.WithCapture(ctx, capture), userID, repo.ID, issueIID, capture.Issue.Description, waitOnLimit, mrReworkEnabled, force, seed, requested, explicit, rawOverride)
 }
 
 // StartRunForUserByPath is StartRunForUser keyed by the human repo PATH the chat
@@ -246,5 +246,5 @@ func (s *Service) StartRunForUserByPath(ctx context.Context, userID uuid.UUID, r
 	// open-MR dedup.
 	// explicit is the chat start_run card's optional harness (PRD #1429 M2 / D2); nil rawOverride:
 	// the start card carries no per-run token choice, so the run inherits the worker binding.
-	return s.StartRunForUser(ctx, userID, repoID, issueIID, waitOnLimit, nil, false, seed, explicit, nil /*rawOverride*/)
+	return s.StartRunForUser(ctx, userID, repoID, issueIID, waitOnLimit, nil, false, seed, nil, explicit, nil /*rawOverride*/)
 }

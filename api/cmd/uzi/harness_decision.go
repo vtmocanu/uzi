@@ -23,6 +23,17 @@ func harnessDecisionLinesWith(d *apitypes.HarnessDecisionDTO, fmtTime func(*time
 	if d == nil {
 		return []string{"not recorded"}
 	}
+	// off and excluded decisions return before any usage is read, so every reading
+	// would print as unknown/false; show what happened instead. Each note fits the
+	// 26-column TUI rail. --json still carries every field.
+	if note, ok := harnessDecisionUnmeasured[d.Reason]; ok {
+		return []string{
+			"preferred: " + cellText(d.Preferred),
+			"chosen: " + cellText(d.Chosen),
+			"reason: " + cellText(d.Reason),
+			note,
+		}
+	}
 	// Automatic rows always describe Claude as the "preferred" side and Codex as the
 	// "other" side, so they are labelled by harness rather than by role.
 	pref, other, prefMeasured := "preferred", "other", "pref"
@@ -42,6 +53,12 @@ func harnessDecisionLinesWith(d *apitypes.HarnessDecisionDTO, fmtTime func(*time
 		prefMeasured + " reset: " + fmtTime(d.PreferredWeeklyResetAt),
 		other + " reset: " + fmtTime(d.OtherWeeklyResetAt),
 	}
+}
+
+// harnessDecisionUnmeasured names the reasons recorded before any usage reading.
+var harnessDecisionUnmeasured = map[string]string{
+	"off":      "overflow off in settings",
+	"excluded": "overflow not considered",
 }
 
 // harnessDecisionTime is the CLI reset form: RFC3339 in UTC, or "unknown".

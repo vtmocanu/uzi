@@ -35,6 +35,18 @@ UPDATE cli_auth_requests
    SET status = 'denied'
  WHERE id = $1 AND status = 'pending' AND expires_at > now();
 
+-- name: LockCLIAuthRequestUserKeyShare :one
+-- Lock-order guard for the poll tx (PRD #3989): take FOR KEY SHARE on the request's
+-- user row BEFORE ClaimCLIAuthRequest, so the order is users -> cli_auth_requests, the
+-- same as an account-reset redeem (users FOR UPDATE, then deny the user's approved
+-- requests). CreateCLIToken's FK check needs this lock anyway; taking it after the
+-- claim would hold the request row while waiting on users and deadlock (40P01) against
+-- the redeem. A pending request has NULL user_id and an unknown id has no row: both
+-- return pgx.ErrNoRows, which the handler treats as "nothing to lock".
+SELECT u.id FROM users u
+ WHERE u.id = (SELECT r.user_id FROM cli_auth_requests r WHERE r.id = $1)
+   FOR KEY SHARE OF u;
+
 -- name: ClaimCLIAuthRequest :one
 -- The claim-first mint guard (PRD #64), run INSIDE the poll transaction. Under READ
 -- COMMITTED two concurrent polls could both SELECT status='approved' and both mint,

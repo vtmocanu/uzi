@@ -520,10 +520,11 @@ func (n *Notifier) handleGate(ctx context.Context, rc store.GetSlackRunContextRo
 		}
 		// Only the persisted reason describes this gate; a cleared reason after
 		// human revision must not imply checker unavailability.
-		crossCheckReason := ""
+		crossCheckReason, requestedSource := "", ""
 		if run, rerr := n.store.GetRunByID(ctx, rc.ID); rerr != nil {
 			n.logf("load gate cross-check reason", rerr)
 		} else {
+			requestedSource = run.AgentSourceRequested.String
 			if (run.PlanCrossCheckRequired || run.PlanCrossCheckGated) && run.PlanCrossCheckGateReason.Valid {
 				crossCheckReason = run.PlanCrossCheckGateReason.String
 				if run.PlanCrossCheckGated && crossCheckReason == "worker_unsupported" {
@@ -539,7 +540,7 @@ func (n *Notifier) handleGate(ctx context.Context, rc store.GetSlackRunContextRo
 				crossCheckReason = n.gatedCrossCheckLine(ctx, run)
 			}
 		}
-		ts, err := n.poster.PostBlocks(ctx, anchor.ChannelID, anchor.RootTs, "Plan ready for review in uzi", gateBlocks(rc.ID, base, rc.RepoAgentNames, rc.RepoAgentFolder, crossCheckReason))
+		ts, err := n.poster.PostBlocks(ctx, anchor.ChannelID, anchor.RootTs, "Plan ready for review in uzi", gateBlocks(rc.ID, base, rc.RepoAgentNames, rc.RepoAgentFolder, requestedSource, crossCheckReason))
 		if err != nil {
 			n.logf("post gate", err)
 			return

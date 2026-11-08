@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import { buildCodexDynamicTools } from "../src/codex/dynamic-tools.js";
+import { SIGNAL_DONE_SUMMARY_DESCRIPTION } from "../src/forge-tool-help.js";
 import type { RunGrants } from "../src/codex/broker.js";
 
 function grants(allowedTools: readonly string[]): RunGrants {
@@ -73,6 +74,17 @@ describe("#3360 report_only dynamic schema", () => {
     assert.match(String(declaration.description), /non_closing/);
     assert.match(String(declaration.description), /^Issue runs only:/);
     assert.match(String(declaration.description), /already published to a checkpoint, the committed branch is delivered as a non-closing merge request/);
+  });
+});
+
+describe("signal_done summary dynamic schema (#3/#14 self-improve)", () => {
+  it("carries the shared stored-report-limit description, which names no conditionally offered parameter", () => {
+    const spec = buildCodexDynamicTools(grants(["signal_done"])).find(s => s.name === "signal_done")!;
+    const props = spec.inputSchema.properties as Record<string, Record<string, unknown>>;
+    assert.deepEqual(props["summary"], { type: "string", description: SIGNAL_DONE_SUMMARY_DESCRIPTION });
+    assert.ok(!("decisions_memo" in props), "the Codex signal_done schema has no decisions_memo");
+    // report_only is gated on Claude's schema and decisions_memo is absent here, so the shared copy names neither.
+    for (const absent of ["report_only", "decisions_memo"]) assert.ok(!SIGNAL_DONE_SUMMARY_DESCRIPTION.includes(absent), absent);
   });
 });
 

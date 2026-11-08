@@ -50,6 +50,7 @@ type stateRequestMinusGateRevision struct {
 	RequireRunning              bool                               `json:"require_running,omitempty"`
 	CompletionFinalHead         *string                            `json:"completion_final_head,omitempty"`
 	State                       string                             `json:"status"`
+	ClarificationSettlement     *workersvc.ClarificationSettlement `json:"clarification_settlement,omitempty"`
 	ClaimGeneration             *int64                             `json:"claim_generation"`
 	MessagesThroughSeq          *int64                             `json:"messages_through_seq"`
 	CandidateDigest             string                             `json:"candidate_digest,omitempty"`
@@ -99,6 +100,7 @@ type stateRequestMinusGateRevision struct {
 	HandoffCheckpointTip        *string                            `json:"handoff_checkpoint_tip,omitempty"`
 	PublicationHoldReason       *string                            `json:"publication_hold_reason,omitempty"`
 	DiskParkPreventive          *bool                              `json:"disk_park_preventive"`
+	RetainedCapacityOnly        *bool                              `json:"retained_capacity_only,omitempty"`
 	ProductiveTurns             *int32                             `json:"productive_turns"`
 	ProviderProgressTurns       *int32                             `json:"provider_progress_turns"`
 	CheckpointContainsLatest    *bool                              `json:"checkpoint_contains_latest"`

@@ -2381,4 +2381,28 @@ mockRuns.push(
     status_since: minsAgo(22),
     updated_at: minsAgo(22),
   },
+  {
+    // PRD #3989 M3: a Claude issue run parked after an admin reset deleted every credential.
+    // No Resume (the server refuses it); it resumes once a credential is added in Settings.
+    ...pausedBase,
+    id: "run-cred-reset",
+    issue_iid: 193,
+    issue_title: "Document the worker image rebuild cadence",
+    issue_description: "See prds/193-image-rebuild-cadence.md.",
+    branch: "agent/issue-193",
+    hold_reason: "credentials_reset",
+    credential_override: null,
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
+    anthropic_select_reason: null,
+    anthropic_headroom_pct: null,
+    milestones_completed: [],
+    checkpoint_tip_at: null,
+    budget_used_seconds: 300,
+    claimed_at: minsAgo(25),
+    started_at: minsAgo(25),
+    created_at: minsAgo(26),
+    status_since: minsAgo(9),
+    updated_at: minsAgo(9),
+  },
 );

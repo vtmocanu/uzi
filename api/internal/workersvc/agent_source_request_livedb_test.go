@@ -47,7 +47,7 @@ func setRepoDefault(f *crFix, repoID uuid.UUID, value any) {
 func (f *crFix) createIssueRun(t *testing.T, iid int64, seed *SeededPlan) uuid.UUID {
 	t.Helper()
 	seedEligibleIssue(t, f.env, f.repo, iid)
-	run, err := f.svc.CreateRun(f.env.ctx, f.user, f.repo, iid, "desc", nil, nil, false, seed, nil, nil)
+	run, err := f.svc.CreateRun(f.env.ctx, f.user, f.repo, iid, "desc", nil, nil, false, seed, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateRun(%d): %v", iid, err)
 	}

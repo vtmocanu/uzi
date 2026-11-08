@@ -25,6 +25,7 @@ import type {
   Proposal,
 } from "./protocol.js";
 import { DRAFT_PLAN_ACK, parseDraftPlan } from "./draft-plan.js";
+import { SIGNAL_DONE_SUMMARY_DESCRIPTION } from "./forge-tool-help.js";
 import { clampUtf8Bytes, DECISIONS_MEMO_TRANSPORT_MAX_BYTES } from "./decisions-memo.js";
 
 /** The in-process MCP server name; tools surface as `mcp__uzi__<tool>`. */
@@ -391,7 +392,7 @@ export function buildSignalMcpServer(
     summary: z
       .string()
       .optional()
-      .describe("One-line summary of what was implemented."),
+      .describe(SIGNAL_DONE_SUMMARY_DESCRIPTION),
     // PRD #929 M2: how an ISSUES-MODE scheduled prompt run delivers its proposal for
     // server-side filing as a forge issue. UNGATED on run kind on purpose (unlike
     // prd_done_path/report_only): the fire-time delivery instruction (a later milestone)

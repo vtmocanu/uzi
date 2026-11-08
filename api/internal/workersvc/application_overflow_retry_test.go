@@ -35,9 +35,9 @@ func TestR3RunOriginsOverflowRetry(t *testing.T) {
 					for attempt := int64(1); attempt <= 2; attempt++ {
 						var err error
 						if origin == "composite" {
-							_, err = svc.StartRunForUser(context.Background(), uuid.New(), uuid.New(), 7, nil, nil, false, nil, nil, nil)
+							_, err = svc.StartRunForUser(context.Background(), uuid.New(), uuid.New(), 7, nil, nil, false, nil, nil, nil, nil)
 						} else {
-							_, err = svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 7, "caller body", nil, nil, false, nil, nil, nil)
+							_, err = svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 7, "caller body", nil, nil, false, nil, nil, nil, nil)
 						}
 						if mode == "issue" {
 							if !errors.Is(err, ErrDescriptionTooLarge) || errors.Is(err, ErrForgeIssueRead) {

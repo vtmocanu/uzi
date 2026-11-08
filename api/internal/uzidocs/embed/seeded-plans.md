@@ -109,8 +109,10 @@ uzi run create --repo <repo-id> --issue <issue-iid> \
 
 Pass `-` instead of a file path to read the plan from stdin. An empty plan,
 or one over the 256 KiB cap, is rejected at create time (exit 1) rather than
-stored. A roster or base-commit flag without `--plan-file` is a usage error
-(exit 2) — see [Agents: `--json` and exit codes](./cli.md).
+stored. `--exclude-agents` or a base-commit flag without `--plan-file` is a
+usage error (exit 2) — see [Agents: `--json` and exit codes](./cli.md).
+`--agent-source` without `--plan-file` creates an ordinary planned run with
+that source as its [per-run agent choice](./repo-agents.md#set-a-default-for-your-runs-on-a-repo).
 
 The worker then clones, checks out, and implements the plan directly. Watch
 it the same way as any other run — `uzi run logs --follow` or `uzi tui

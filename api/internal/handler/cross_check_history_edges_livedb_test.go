@@ -36,8 +36,10 @@ func TestCrossCheckHistoryPastOutcomeWindowsLiveDB(t *testing.T) {
 	type attempt struct {
 		stage, result, reason, review, execution, category string
 		round                                              int
-		historical, prestart, interrupted                  bool
+		historical, prestart, interrupted, noChild         bool
 		findings                                           int32
+		// decided moves decided_at relative to the interruption: "after" or "equal".
+		decided string
 	}
 	// Literal expectations are independent of the classifier under test.
 	plans := []attempt{
@@ -51,8 +53,19 @@ func TestCrossCheckHistoryPastOutcomeWindowsLiveDB(t *testing.T) {
 		{stage: "plan", round: 8, result: "failed", reason: "malformed", review: "none", execution: "didnt_finish", category: "didnt_finish", historical: true},
 		{stage: "plan", round: 9, result: "failed", reason: "superseded", review: "none", execution: "replaced", category: "replaced", historical: true},
 		{stage: "plan", round: 10, result: "failed", reason: "approved_not_stored", review: "approved", execution: "replaced", category: "replaced", historical: true},
-		{stage: "plan", round: 11, result: "approve", reason: "approve", review: "approved", execution: "interrupted", category: "replaced", historical: true, interrupted: true},
-		{stage: "plan", round: 12, result: "approve", reason: "approve", review: "approved", execution: "finished", category: "passed"},
+		// A Plan verdict recorded before custody loss keeps its verdict and stays historical (#4037).
+		{stage: "plan", round: 11, result: "approve", reason: "approve", review: "approved", execution: "finished", category: "passed", historical: true, interrupted: true},
+		{stage: "plan", round: 12, result: "revise", reason: "revise", review: "changes_requested", execution: "finished", category: "raised_issues", historical: true, interrupted: true},
+		{stage: "plan", round: 13, result: "block", reason: "block", review: "blocked", execution: "finished", category: "raised_issues", historical: true, interrupted: true},
+		{stage: "plan", round: 14, result: "approve", reason: "approve", review: "approved", execution: "finished", category: "passed", historical: true, interrupted: true, decided: "equal"},
+		// Controls that stay replaced: decided after interruption, missing reason,
+		// pending, settled supersession and an unstored approval.
+		{stage: "plan", round: 15, result: "approve", reason: "approve", review: "approved", execution: "interrupted", category: "replaced", historical: true, interrupted: true, decided: "after"},
+		{stage: "plan", round: 16, result: "approve", review: "none", execution: "interrupted", category: "replaced", historical: true, interrupted: true},
+		{stage: "plan", round: 17, result: "pending", review: "none", execution: "interrupted", category: "replaced", historical: true, interrupted: true, noChild: true},
+		{stage: "plan", round: 18, result: "failed", reason: "superseded", review: "none", execution: "interrupted", category: "replaced", historical: true, interrupted: true, noChild: true, decided: "equal"},
+		{stage: "plan", round: 19, result: "failed", reason: "approved_not_stored", review: "approved", execution: "interrupted", category: "replaced", historical: true, interrupted: true},
+		{stage: "plan", round: 20, result: "approve", reason: "approve", review: "approved", execution: "finished", category: "passed"},
 		{stage: "code", round: 1, result: "completed", review: "changes_requested", execution: "finished", category: "raised_issues", findings: 1},
 	}
 	parent := f.parent("completed", "mixed retained outcomes")
@@ -60,7 +73,7 @@ func TestCrossCheckHistoryPastOutcomeWindowsLiveDB(t *testing.T) {
 	for _, a := range plans {
 		created := base.Add(time.Duration(a.round) * time.Second)
 		var child any
-		if a.execution == "finished" || a.interrupted || a.reason == "approved_not_stored" {
+		if (a.execution == "finished" || a.interrupted || a.reason == "approved_not_stored") && !a.noChild {
 			child = f.child(parent, "completed")
 		}
 		if a.stage == "plan" {
@@ -78,6 +91,12 @@ func TestCrossCheckHistoryPastOutcomeWindowsLiveDB(t *testing.T) {
 		}
 		if a.interrupted {
 			cliMustExec(t, f.pool, "UPDATE cross_checks SET interrupted_at=$3 WHERE lead_run_id=$1 AND stage='plan' AND round=$2", parent, a.round, interrupted)
+		}
+		switch a.decided {
+		case "after":
+			cliMustExec(t, f.pool, "UPDATE cross_checks SET decided_at=$3 WHERE lead_run_id=$1 AND stage='plan' AND round=$2", parent, a.round, interrupted.Add(time.Second))
+		case "equal":
+			cliMustExec(t, f.pool, "UPDATE cross_checks SET decided_at=$3 WHERE lead_run_id=$1 AND stage='plan' AND round=$2", parent, a.round, interrupted)
 		}
 	}
 	// Code has one retained attempt per parent. Keep failure, missing-child,
@@ -160,7 +179,7 @@ func TestCrossCheckHistoryPastOutcomeWindowsLiveDB(t *testing.T) {
 									got.Effect != "Effect not recorded" || got.NextAction != "No action recorded" {
 									t.Fatalf("%s %s/%d: unexpected review/execution/effect: %+v", g.ParentID, a.stage, a.round, got)
 								}
-								wantChild := a.execution == "finished" || a.interrupted || a.reason == "approved_not_stored"
+								wantChild := (a.execution == "finished" || a.interrupted || a.reason == "approved_not_stored") && !a.noChild
 								if wantChild {
 									if got.ChildID == nil || got.ChildStatus == nil || *got.ChildStatus != "completed" || got.ChildContext != "Checker run available" {
 										t.Fatalf("%s/%d: completed child evidence missing: %+v", a.stage, a.round, got)

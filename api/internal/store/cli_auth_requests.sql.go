@@ -170,3 +170,23 @@ func (q *Queries) GetCLIAuthRequest(ctx context.Context, id uuid.UUID) (CliAuthR
 	)
 	return i, err
 }
+
+const lockCLIAuthRequestUserKeyShare = `-- name: LockCLIAuthRequestUserKeyShare :one
+SELECT u.id FROM users u
+ WHERE u.id = (SELECT r.user_id FROM cli_auth_requests r WHERE r.id = $1)
+   FOR KEY SHARE OF u
+`
+
+// Lock-order guard for the poll tx (PRD #3989): take FOR KEY SHARE on the request's
+// user row BEFORE ClaimCLIAuthRequest, so the order is users -> cli_auth_requests, the
+// same as an account-reset redeem (users FOR UPDATE, then deny the user's approved
+// requests). CreateCLIToken's FK check needs this lock anyway; taking it after the
+// claim would hold the request row while waiting on users and deadlock (40P01) against
+// the redeem. A pending request has NULL user_id and an unknown id has no row: both
+// return pgx.ErrNoRows, which the handler treats as "nothing to lock".
+func (q *Queries) LockCLIAuthRequestUserKeyShare(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, lockCLIAuthRequestUserKeyShare, id)
+	var id_2 uuid.UUID
+	err := row.Scan(&id_2)
+	return id_2, err
+}

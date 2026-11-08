@@ -5,13 +5,13 @@
 
 import { useState } from "react";
 import { Link } from "react-router-dom";
-import { isTerminalRun } from "../lib/api";
+import { overviewScope, ISSUE_WORK_SCOPE_KEY } from "../lib/prefs";
 import { useAuth } from "../auth/AuthContext";
 import { useNow } from "../lib/useNow";
 import { useDemoMode } from "../lib/demoMode";
 import { maskName } from "../lib/demoMask";
 import { useOverviewData } from "../lib/useOverviewData";
-import { issueLineModel, type IssueStage } from "../lib/issueLine";
+import { issueLineModel, issueLineOtherRuns, issueWorkScope, type IssueStage } from "../lib/issueLine";
 import {
   decisionCount,
   mergeOverviewRows,
@@ -22,7 +22,7 @@ import {
   statusSentence,
   workerJoined,
 } from "../lib/overview";
-import { UsageCard } from "../components/UsageCards";
+import { OverviewUsageCard } from "../components/OverviewUsageCard";
 import { OnboardingChecklist } from "../components/OnboardingChecklist";
 import { NeedsDecisionCard } from "../components/NeedsDecisionCard";
 import { IssueLine } from "../components/IssueLine";
@@ -44,6 +44,9 @@ export function OverviewNext() {
   const now = useNow(30_000);
   // The stage picked on the issue-work line; the Runs widget filters its groups by it.
   const [lineStage, setLineStage] = useState<IssueStage | null>(null);
+  // The admin's remembered Issue work scope (#4052); written only on a click, so a scope
+  // forced to "you" while the admin list loads never overwrites the saved choice.
+  const [issueScope, setIssueScope] = useState(() => overviewScope.get(ISSUE_WORK_SCOPE_KEY));
 
   if (!user) return null;
 
@@ -60,15 +63,13 @@ export function OverviewNext() {
     isAdmin && adminRuns.runs != null && !adminRuns.failed
       ? mergeOverviewRows(ownRuns, adminRuns.runs, user.email)
       : null;
-  // The issue-work line counts the Runs widget's populations: the viewer's own runs, and for
-  // an admin with a readable list every other user's active runs.
+  // The issue-work line counts the viewer's own runs; an admin who chose "All users" with a
+  // readable list also counts every other user's active runs. An unreadable list forces "you".
+  const lineScope = issueWorkScope({ isAdmin, adminRuns, chosen: issueScope });
   const lineModel = data
     ? issueLineModel({
         ownRuns,
-        otherRuns:
-          factoryRows != null
-            ? (adminRuns.runs ?? []).filter((r) => r.owner_email !== user.email && !isTerminalRun(r.status))
-            : [],
+        otherRuns: issueLineOtherRuns({ scope: lineScope, adminRuns, viewerEmail: user.email }),
       })
     : null;
   const sentence = data
@@ -114,7 +115,25 @@ export function OverviewNext() {
       <NeedsDecisionCard items={decisions} now={now} demo={demo} />
 
       {lineModel && (
-        <IssueLine model={lineModel} selected={lineStage} onSelect={setLineStage} demo={demo} factory={factoryRows != null} />
+        <IssueLine
+          model={lineModel}
+          selected={lineStage}
+          onSelect={setLineStage}
+          demo={demo}
+          scope={lineScope}
+          scopeToggle={
+            isAdmin
+              ? {
+                  value: lineScope,
+                  onChange: (s) => {
+                    setIssueScope(s);
+                    overviewScope.set(ISSUE_WORK_SCOPE_KEY, s);
+                  },
+                  allDisabled: adminRuns.failed || adminRuns.runs == null,
+                }
+              : undefined
+          }
+        />
       )}
 
       {/* Same inputs as Dashboard: the viewer's own runs, never the admin rows. */}
@@ -132,6 +151,7 @@ export function OverviewNext() {
             demo={demo}
             loading={!data}
             stage={lineStage}
+            scope={lineScope}
             prRuns={lineModel?.prs}
           />
         </div>
@@ -145,7 +165,13 @@ export function OverviewNext() {
 
       {/* Factory usage is rendered only from the admin-gated response. */}
       {data?.selfUsage && (
-        <UsageCard self={data.selfUsage} admin={data.adminUsage ?? undefined} window={usageWindow} onWindowChange={changeUsageWindow} />
+        <OverviewUsageCard
+          self={data.selfUsage}
+          admin={data.adminUsage ?? undefined}
+          window={usageWindow}
+          onWindowChange={changeUsageWindow}
+          viewerId={user.id}
+        />
       )}
     </div>
   );

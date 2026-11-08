@@ -581,7 +581,9 @@ reservation count. Owner Resume of `worker_requeue_exhausted` and bounded
 `retained_recovery_exhausted` retries can also renew: a fresh generation and
 higher derived episode charge one of three reservations in a new five-minute
 window and clear only `budget_exhausted`. The default three timed parks are
-followed by an owner hold; Resume preserves that count. Timer promotion resets
+followed by an owner hold; Resume preserves that count. A window refused
+only for data-volume capacity is held for the owner without consuming a counted retained park.
+Timer promotion resets
 the run wall, while manual Resume preserves remaining wall budget and may need
 an owner extension. Other requeues, disk retries, memory-pressure Resume or a
 new claim alone do not renew. See
@@ -609,6 +611,21 @@ execution remain required, including an exact `ready-for-model` handoff. See
 [Retained recovery adoption failed](./run-recovery-wait.md#retained-recovery-adoption-failed)
 and the [ADR-1197 #3527 amendment](../adr/1197-transient-recovery-park.md#amendment-2026-10-27-3527-owner-held-retained-adoption-retry).
 
+An owner **Pause now** delivered while a retained re-claim is recovering
+(`recoverRetainedClaim`, before any model turn) is only recorded, like a pause
+pending at claim time; it no longer stops recovery. A successful park spends
+no requeue; a refused park (`pause_failed`) still leaves the run for the normal
+requeue path. When
+recovery returns and no stronger control (cancel, credential switch, wall,
+fence, worker shutdown) is pending, the run parks through the ordinary
+checkpoint-first owner pause, before any planning turn or provider call. If
+recovery fails or holds first, that outcome wins and a `recovery_wait` hold
+leaves the request pending. A publication-only retained claim keeps its
+immediate stop. When recovery is stopped, the worker's HOME-preservation log
+says "retained recovery stopped" (naming a pending owner pause) instead of
+"run interrupted by worker shutdown". See the
+[ADR-1190 #3995 amendment](../adr/1190-run-pause-invariants.md#amendment-2026-11-06--3995-owner-pause-during-retained-recovery).
+
 Other permanent blockers, or exhaustion without both durable journal confirmation
 and API support, end the run **failed** with custody kept,
 without automatic reclaim or failed-run Resume. The reason names the
@@ -628,7 +645,8 @@ usage (and the projected usage when it was computed). The refusal is not a disk
 park and spends one of the same three reservations; the worker runs one reclaim
 pass and re-checks before refusing. If the volume stays full, the iterations end
 in the existing retained-recovery park, whose automatic retries stop for owner
-Resume once the retained-park allowance is spent. The
+Resume once the retained-park allowance is spent, or at once, uncounted, when
+every reservation in the window was refused for data volume capacity. The
 projection is an estimate and applies only when the API supports both the disk
 and retained-recovery park causes. The check has no off switch: setting
 `UZI_DISK_HARD_STOP_ENABLED=false` disables the hard governor's stops but not
