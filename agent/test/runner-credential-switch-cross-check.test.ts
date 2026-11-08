@@ -1713,7 +1713,15 @@ describe("issue #3990: a failed checker leg closes its credential-switch hold wi
 describe("issue #3990: in-place continuation of retained checked storage", () => {
   it("a switch that surfaces inside the canonical storage report gives up and continues the retained storage in place: no resubmit, implementation runs", { skip: LINUX_CAPTURE, timeout: 30_000 }, async () => {
     const seen: string[] = [];
+    let gateEntries = 0;
     const d = await drive({ capture: "giveup", switchRounds: [],
+      // A recomputed storage report re-enters gatePlan: refuse the re-entry so that run ends promptly, and
+      // assert the recorded entry count after it (rather than leaving the regression to a test timeout).
+      gateMd: (n, md) => {
+        gateEntries = n;
+        if (n > 1) throw new assert.AssertionError({ message: "gatePlan re-entered: the retained storage was recomputed instead of continued" });
+        return md;
+      },
       setup: (c, x) => {
         let armed = true;
         const report = client.reportPlanCrossCheckGateState.bind(client);
@@ -1723,7 +1731,6 @@ describe("issue #3990: in-place continuation of retained checked storage", () =>
             armed = false;
             api.requestCredentialSwitch(c.run_id, 1);
             assert.ok(await handlerWait(() => x.switchSeen.delivered), "the worker polled the switch");
-            seen.push("delivered");
           }
           return report(id, fields, signal);
         };
@@ -1733,8 +1740,10 @@ describe("issue #3990: in-place continuation of retained checked storage", () =>
     assert.deepEqual(switchReports(c.run_id), ["credential_switch_failed"]);
     // The first storage send was interrupted by the switch before the server saw it; the retained
     // operation is continued in place (a second send of the same canonical plan), never recomputed.
-    assert.equal(seen.filter((s) => s.startsWith("running:" + digest)).length, 2, `storage sent twice: ${JSON.stringify(seen)}`);
-    assert.equal(d.storage.length, 2, "the interrupted send and the in-place continuation");
+    assert.equal(gateEntries, 1, "gatePlan entered once: the retained storage was continued, not recomputed");
+    assert.equal(d.storage.length, 2, `the interrupted send and the in-place continuation: ${JSON.stringify(seen)}`);
+    assert.deepEqual(d.storage[1], d.storage[0], "the continuation re-sends the identical canonical storage");
+    assert.equal(d.storage[0]!.plan_md, NORMALIZED, "the stored plan is the normalized canonical plan");
     assert.equal(everyState(c.run_id).filter((s) => s.status === "running" && s.candidate_digest === digest).length, 1,
       "the server stored the canonical plan exactly once");
     assert.equal(d.posts().length, 1, "one cross-check POST: the decision is never resubmitted");
