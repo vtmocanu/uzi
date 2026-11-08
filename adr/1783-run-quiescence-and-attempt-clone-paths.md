@@ -1515,3 +1515,85 @@ These came from the preserved earlier attempt (`bc3c7750`).
 ### Related issues
 
 Out of scope: #3638 and #3639 (memory-park settlement) and #3644 (same-run restart).
+
+
+## Amendment 2026-11-07 — #4066 shutdown settlement barrier
+
+Refs #4066. Builds on the #3404 and #3645 amendments above. It changes what a
+graceful worker exit waits for and reports. It does not change the authority
+store, the fence, the certificate or any refusal.
+
+### The problem
+
+A graceful exit trusted that every authority settlement was durable once
+`worker.run` returned. It was not: a settlement could be queued behind a holder of
+A, spliced out of the queue by a drain that had not finished, applied inline by
+code detached from the transaction that owned it, or owed by a Git child or a pin
+continuation the caller's deadline had abandoned. Causation of the incident that
+motivated the issue is not proven; the amendment closes the mechanisms the code
+showed.
+
+### Admission order
+
+`finishWorkerShutdown` (`agent/src/shutdown-barrier.ts`), called by every graceful
+exit in `agent/src/main.ts` before its stop log:
+
+1. `worker.run` is joined by the caller.
+2. Registered producers, outer transactions (with the inline applies their owners
+   joined) and Git children and continuations, including their settlement promises
+   (`GitCache.pendingWork()`), are joined together, repeated until quiet; none of them
+   is cancelled.
+3. `sealForShutdown`: a new outermost transaction throws `AuthorityShutdownRefusal`
+   (a subclass of `AuthorityRefusal`). The runtime's own drain is exempt.
+4. `drainForShutdown`: the final drain of what is queued.
+
+Step 2 has no timeout; the 35 s observer reports past the deadline without cancelling it.
+
+### Owner-join lock lifetime
+
+An inline apply completes while A is held. The settling transaction registers the
+apply, and the outermost callback joins its inline applies (`#closeInline`) before
+its transaction releases A. When the join observes none outstanding it marks the
+transaction closing in the same tick; a settle that arrives after the closing mark
+queues for the drain instead of applying inline. The join has no timeout and takes
+no second lock, so the lock order is unchanged and A is never taken beneath B.
+
+### Result deadline and decision
+
+The worker logs one `worker_shutdown_result` (`drained` or `incomplete`, fixed
+reasons, counts, at most 16 operation ids, no paths or error text) within 35 s of
+the first signal, or of barrier entry when no signal came. The observer is armed
+first-wins and the first decision stands. After an `incomplete` decision the
+barrier keeps joining the actual work until it completes or the process is killed,
+and any late settle stays queued. `incomplete` sets exit code 1. The 15 s
+publication grace is unchanged.
+
+Compose (`stop_grace_period`) and hosted pods (`terminationGracePeriodSeconds`,
+`controller/internal/kube/render.go`) allow 40 s, the 35 s result deadline plus a
+5 s margin. The pod field changes the pod spec hash, so upgrading the controller
+rolls every hosted worker once through the paced roll
+([ADR-1470](1470-paced-hosted-worker-rolls.md)).
+
+### Failure model
+
+A settlement is durable once its slot was written with `writeDurable` and the
+directory sync returned. The tests prove process crashes. For a power loss before
+that sync the rename is either lost (the previous `running` slot survives) or kept
+(the slot is one ahead of its head and the next transaction completes it through
+`#load`). Neither outcome is re-proven here.
+
+### Unchanged residuals
+
+The #3404 and #3645 residuals stand. An unresolved record is refused indefinitely
+and there is still no generic force-clear; the guarded operator discard is the only
+takeover. An `incomplete` result never certifies anything: any unresolved record
+keeps its protections (a successor still refuses it, the intended fail-closed
+answer), while a write already started may still complete after the diagnostic;
+`incomplete` can also occur with no enrolled operation. A bounded
+`bare_slot_refusal` warning (once per operation per process, no paths or footprint
+text) now says which kind of record a refusal met.
+
+### Not claimed
+
+Hosted and compose end-to-end acceptance is pending owner acceptance. Power-loss
+durability is not claimed.

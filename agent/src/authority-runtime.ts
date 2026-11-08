@@ -3,18 +3,22 @@ import { createHash } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import path from "node:path";
 import {
-  AuthorityRefusal, SourceUseHeldRefusal, activeAuthorityTransaction, withAuthorityTransaction,
+  AuthorityRefusal, AuthorityShutdownRefusal, SourceUseHeldRefusal, activeAuthorityTransaction, withAuthorityTransaction,
   type AuthorityTransaction, type WorkerLifetime,
 } from "./authority-lock.js";
 import {
-  leaseEpoch, leaseHarness, openAuthorityStore, peekAuthoritySlot, processWorkerIncarnation,
+  AuthorityPostWriteRefusal, leaseEpoch, leaseHarness, openAuthorityStore, peekAuthoritySlot, processWorkerIncarnation,
   type AuthorityFsOps, type AuthorityStore, type EndedSlotReceipt, type SlotCohort, type SlotSnapshot, type SourceUseLease,
 } from "./completion-authority.js";
 import {
   sourceCoreDigest, sourceFenceOf, verifyCertifiedSource, verifyPublishedSource,
   type CompletionSourceFence, type CompletionSourceV2,
 } from "./completion-source.js";
+import { classifyBareFootprint } from "./bare-refusal-diagnostic.js";
 import type { AuthoritySettlement, GitAuthorityHooks } from "./git-authority-hooks.js";
+import type { ShutdownReason } from "./shutdown-barrier.js";
+
+export { AuthorityShutdownRefusal };
 
 // issue #3404 M2 U3 — the process runtime that turns the completion-authority store into the
 // GitAuthorityHooks GitCache calls, and the single place a production entry point asks for A.
@@ -117,6 +121,19 @@ export interface AuthorityRuntimeOptions {
   timeoutMs?: number;
   /** Diagnostics only. */
   log?: { warn(message: string, fields?: Record<string, unknown>): void };
+  /** Tests only: replaces LATE_WAIT_MS, the bound on the idle drain's wait for A. Production never passes it. */
+  lateWaitMs?: number;
+  /** Tests only: replaces SHUTDOWN_BACKOFF_MS, the first retry delay of the final shutdown drain. */
+  shutdownBackoffMs?: number;
+  /** Tests only: replaces MAX_LOGGED_REFUSALS, the bound on distinct operations the bare-refusal diagnostic logs. */
+  refusalLogLimit?: number;
+  /** Tests only: production-inert pause points. Production never passes them. */
+  testHooks?: {
+    /** Awaited by #applyLate right after it took the queued settlements out of the queue and before it applies any. */
+    afterLateSplice?: () => Promise<void>;
+    /** Called synchronously by #closeInline right after it marked the transaction closing, still inside that transaction. */
+    onInlineClosing?: () => void;
+  };
 }
 
 /** Bounded wait for A at an outermost entry: a recovery pass or a discard may hold it for a while. */
@@ -127,6 +144,12 @@ const LATE_WAIT_MS = 20_000;
 const MAX_LATE_ATTEMPTS = 3;
 /** While anything is queued, the idle drain runs again after this long. */
 const DEFAULT_RETRY_MS = 30_000;
+/** issue #4066: the final shutdown drain retries after 1s, 2s, 4s ... capped at this. */
+const SHUTDOWN_BACKOFF_MS = 1_000;
+const SHUTDOWN_BACKOFF_CAP_MS = 8_000;
+/** issue #4066: operation ids a shutdown decision names at most. */
+const MAX_OPERATIONS = 16;
+const NOOP = (): void => undefined;
 /** The seed ops that may consume a live publication: git.ts runs them after its journal guards found no journal naming the path. */
 const CONSUMING_OPS: ReadonlySet<string> = new Set(["seed-canonical", "seed-attempt"]);
 const SKILLS_PREFIX = ".uzi-skills-";
@@ -137,6 +160,8 @@ const RECORD_ITEM = "record:";
 /** The ops that create the path they admit: GitCache creates its parent directory right after admission. */
 const SEED_OPS: ReadonlySet<string> = new Set(["seed-canonical", "seed-attempt", "replace"]);
 const MAX_FOOTPRINT = 1024;
+/** Operations whose bare-refusal diagnostic is remembered (and so logged) per process. */
+const MAX_LOGGED_REFUSALS = 256;
 const MAX_ITEM = 512;
 const MAX_RESIDUE = 64;
 
@@ -168,17 +193,75 @@ interface PendingPart {
   settled: boolean;
 }
 
+/** A queued settlement: the apply, how often it failed, and the operation ids it settles. */
+interface LateEntry {
+  apply: (tx: AuthorityTransaction) => Promise<void>;
+  attempts: number;
+  ops: readonly string[];
+}
+
+interface OpenSettlement { readonly ops: readonly string[] }
+
+/** What a producer outliving the worker's run is: tracked so the shutdown barrier can join it. */
+export type ShutdownProducerKind = "retained_source_request" | "claude_shutdown_durability";
+
+/** The in-process ledger as the shutdown barrier and its observer read it. */
+export interface AuthoritySnapshot {
+  /** Fixed-name counters only. */
+  counts: Record<string, number>;
+  /** The reasons the ledger alone implies (the barrier adds `deadline` and `prerequisite_pending`). */
+  reasons: ShutdownReason[];
+  /** At most 16 operation ids. */
+  operations: string[];
+}
+
+export interface ShutdownDrainOutcome extends AuthoritySnapshot { result: "drained" | "incomplete" }
+
 export class AuthorityRuntime implements AuthorityScope {
   readonly #options: AuthorityRuntimeOptions;
   #store: AuthorityStore | undefined;
   /** The flight-visible lease per normalized slot path, minted by this process. */
   readonly #leases = new Map<string, SourceUseLease>();
   /** Settlements that arrived with no active transaction; applied under the next outermost A. */
-  readonly #late: Array<{ apply: (tx: AuthorityTransaction) => Promise<void>; attempts: number }> = [];
+  readonly #late: LateEntry[] = [];
   /** Source-use ends that could not be applied, per normalized slot path with the lease they must still match. */
   readonly #ends = new Map<string, SourceUseLease>();
-  #draining = false;
   #retryTimer: NodeJS.Timeout | undefined;
+  // ---- issue #4066: the shutdown obligation ledger. Every set below is in-process memory only; nothing here is
+  // persisted, and a crash never consults it (the durable record stays `running`, fail closed).
+  /** Outermost transactions counted from entry (before the wait for A) until after {@link #closeInline}, with their promises. */
+  #outer = 0;
+  readonly #outerPromises = new Set<Promise<void>>();
+  /** Inline settlement applies per owning transaction, and runtime-wide: the owner joins them before A is released. */
+  readonly #inline = new Map<AuthorityTransaction, Set<Promise<void>>>();
+  readonly #inlineAll = new Set<Promise<void>>();
+  /** Operation ids of the inline applies in {@link #inlineAll}, for the bare-refusal diagnostic only. */
+  readonly #inlineOps = new Set<string>();
+  /** Operation ids the bare-refusal diagnostic already logged (bounded: at most refusalLogLimit, default MAX_LOGGED_REFUSALS). */
+  readonly #refusalLogged = new Set<string>();
+  /** Transactions whose inline join finished: a settle that still finds one active queues instead of applying. */
+  readonly #closing = new WeakSet<AuthorityTransaction>();
+  /** The drain transaction in flight (idle or final), if any. */
+  #drainInFlight: Promise<void> | undefined;
+  /** Operation ids of queued settlements a drain has taken out of {@link #late} and is applying. */
+  readonly #applying = new Map<string, Promise<void>>();
+  /** Settlements whose pending record was opened and whose obligation (apply or queue) is not discharged yet. */
+  readonly #open = new Set<OpenSettlement>();
+  /** Operation ids whose inline or drained apply was rejected (never retried), by reason. */
+  readonly #failed = new Map<string, "settlement_failed">();
+  /** Bare-mutator slots whose settle succeeded but whose transition out of `active` failed, per lease. */
+  readonly #bareEndFailed = new Map<SourceUseLease, string>();
+  /** Admissions whose write may have partly landed (an I/O failure, not a clean refusal). */
+  #uncertainEnrollment = 0;
+  /** Destructive records whose rollback close failed. */
+  #failedRollback = 0;
+  /** Operation ids a late settlement gave up on after MAX_LATE_ATTEMPTS. */
+  readonly #exhausted = new Set<string>();
+  readonly #producers = new Map<Promise<unknown>, ShutdownProducerKind>();
+  readonly #listeners = new Set<() => void>();
+  #shutdownDeadlineAt: number | undefined;
+  #sealed = false;
+  #decided = false;
   /** Collects the normalized slot paths this runtime admits inside {@link recordAdmissions}. */
   readonly #collector = new AsyncLocalStorage<Set<string>>();
   /** Sinks whose flight finished its source use: any guarded admission made inside one is refused, permanently. */
@@ -234,6 +317,11 @@ export class AuthorityRuntime implements AuthorityScope {
    * the settlements queued by {@link #settlement} first, and after an outermost transaction released
    * with any still queued, a microtask (started from this exit, never from a settle call) acquires A
    * once more to apply them.
+   *
+   * issue #4066: the outermost transaction OWNS every settlement applied inline under it. A settle that arrives
+   * from code detached from `fn` (a child's late close inherits the async context) is applied inline and joined
+   * by {@link #closeInline} before A is released, so the lock's lifetime covers the write. After the shutdown
+   * seal ({@link sealForShutdown}) a NEW outermost entry is refused with {@link AuthorityShutdownRefusal}.
    */
   withTransaction<T>(
     fn: (tx: AuthorityTransaction) => Promise<T>,
@@ -241,29 +329,92 @@ export class AuthorityRuntime implements AuthorityScope {
   ): Promise<T> {
     const tx = this.active();
     if (tx) return fn(tx);
-    return withAuthorityTransaction(this.#options.lifetime, {
+    return this.#outermost(fn, options, false);
+  }
+
+  #outermost<T>(fn: (tx: AuthorityTransaction) => Promise<T>, options: AuthorityWait, internal: boolean): Promise<T> {
+    if (this.#sealed && !internal) return Promise.reject(new AuthorityShutdownRefusal());
+    // Counted from entry, before the wait for A: a transaction still queueing for A is an obligation too.
+    this.#outer += 1;
+    const run = withAuthorityTransaction(this.#options.lifetime, {
       ...(options.signal ? { signal: options.signal } : {}),
       timeoutMs: options.timeoutMs ?? this.#options.timeoutMs ?? DEFAULT_WAIT_MS,
     }, async (outer) => {
-      await this.#applyLate(outer);
-      return fn(outer);
-    }).finally(() => this.#scheduleDrain());
+      try {
+        await this.#applyLate(outer);
+        return await fn(outer);
+      } finally {
+        await this.#closeInline(outer);
+      }
+    });
+    const joined: Promise<void> = run.then(NOOP, NOOP).then(() => {
+      this.#outer -= 1;
+      this.#outerPromises.delete(joined);
+      this.#notify();
+    });
+    this.#outerPromises.add(joined);
+    return run.finally(() => this.#scheduleDrain());
+  }
+
+  /**
+   * Join every inline settlement applied under `tx` (repeating while new ones appear), then, in the same tick the
+   * set is observed empty, mark `tx` closing so a later settle queues instead of applying. No timeout: the write is
+   * what A protects. The wait runs inside the outermost callback, so A stays held until it returns.
+   */
+  async #closeInline(tx: AuthorityTransaction): Promise<void> {
+    const set = this.#inline.get(tx);
+    while (set !== undefined && set.size > 0) await Promise.allSettled(set);
+    this.#closing.add(tx);
+    this.#inline.delete(tx);
+    this.#options.testHooks?.onInlineClosing?.();
+  }
+
+  /** Register an inline apply under its owning transaction and runtime-wide; it removes itself once settled. */
+  #trackInline(tx: AuthorityTransaction, applying: Promise<void>): void {
+    let set = this.#inline.get(tx);
+    if (set === undefined) { set = new Set(); this.#inline.set(tx, set); }
+    const owned = set;
+    let tracked!: Promise<void>;
+    tracked = (async () => {
+      try { await applying; }
+      catch { /* surfaced to the settle caller; the join only waits */ }
+      finally { owned.delete(tracked); this.#inlineAll.delete(tracked); this.#notify(); }
+    })();
+    owned.add(tracked);
+    this.#inlineAll.add(tracked);
   }
 
   async #applyLate(tx: AuthorityTransaction): Promise<void> {
     // Taken only once A is held, so a failed acquisition leaves every queued settlement in place.
-    for (const entry of this.#late.splice(0)) {
-      try { await entry.apply(tx); }
-      catch (error) {
-        const reason = error instanceof Error ? error.message : String(error);
-        if (entry.attempts + 1 < MAX_LATE_ATTEMPTS) {
-          this.#late.push({ apply: entry.apply, attempts: entry.attempts + 1 });
-          this.#options.log?.warn("late authority settlement could not be applied; it is queued again", { error: reason });
-        } else {
-          // Fail closed: the durable record stays `running`, and a successor finds it unresolved.
-          this.#options.log?.warn("late authority settlement could not be applied; its record stays open", { error: reason });
+    const queued = this.#late.splice(0);
+    let spliceDone: (() => void) | undefined;
+    if (queued.length > 0) {
+      // Out of the queue but not yet applied: the ledger must still see them.
+      const done = new Promise<void>((resolve) => { spliceDone = resolve; });
+      for (const entry of queued) for (const op of entry.ops) this.#applying.set(op, done);
+    }
+    try {
+      if (queued.length > 0) await this.#options.testHooks?.afterLateSplice?.();
+      for (const entry of queued) {
+        try { await entry.apply(tx); }
+        catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          if (entry.attempts + 1 < MAX_LATE_ATTEMPTS) {
+            this.#late.push({ apply: entry.apply, attempts: entry.attempts + 1, ops: entry.ops });
+            this.#options.log?.warn("late authority settlement could not be applied; it is queued again", { error: reason });
+          } else {
+            // Fail closed: the durable record stays `running`, and a successor finds it unresolved.
+            for (const op of entry.ops) this.#exhausted.add(op);
+            this.#options.log?.warn("late authority settlement could not be applied; its record stays open", { error: reason });
+          }
         }
+        for (const op of entry.ops) this.#applying.delete(op);
+        this.#notify();
       }
+    } finally {
+      for (const entry of queued) for (const op of entry.ops) this.#applying.delete(op);
+      spliceDone?.();
+      this.#notify();
     }
     await this.#applyEnds(tx);
   }
@@ -285,37 +436,217 @@ export class AuthorityRuntime implements AuthorityScope {
         this.#options.log?.warn("a queued source-use end could not be applied yet", { source: key, error: error instanceof Error ? error.message : String(error) });
       }
     }
+    this.#notify();
+  }
+
+  /** The bound of one idle drain's wait for A: LATE_WAIT_MS, cut to the shutdown budget left; 0 or less means none. */
+  #drainWaitMs(): number {
+    const base = this.#options.lateWaitMs ?? LATE_WAIT_MS;
+    if (this.#decided) return 0;
+    if (this.#shutdownDeadlineAt === undefined) return base;
+    return Math.min(base, this.#shutdownDeadlineAt - Date.now());
   }
 
   /**
    * Idle drain: schedule one acquisition of A (a microtask, never awaited by anyone, holding no lock) when
    * anything is queued and no transaction is active. Called from every outermost transaction's exit (success
    * or failure), from a settle that found no transaction, and from a queued end. One drain runs at a time; while
-   * anything stays queued it is repeated on a timer (unref'd, so it never holds the process open).
+   * anything stays queued it is repeated on a timer (unref'd, so it never holds the process open). After
+   * {@link beginShutdown} its wait is cut to the budget left, and none starts once the budget is spent or the
+   * shutdown decided.
    */
   #scheduleDrain(): void {
-    if (this.#draining || this.active() || (this.#late.length === 0 && this.#ends.size === 0)) return;
-    this.#draining = true;
-    queueMicrotask(() => {
-      this.withTransaction(async () => undefined, { timeoutMs: LATE_WAIT_MS })
-        .catch((error: unknown) => {
-          this.#options.log?.warn("queued authority work stays queued until the next transaction", {
-            error: error instanceof Error ? error.message : String(error) });
-        })
-        .finally(() => {
-          this.#draining = false;
-          this.#armRetry();
-        });
+    if (this.#drainInFlight !== undefined || this.active() || (this.#late.length === 0 && this.#ends.size === 0)) return;
+    const wait = this.#drainWaitMs();
+    if (wait <= 0) return;
+    void this.#drainOnce(wait);
+  }
+
+  /** One acquisition of A that applies what is queued. Resolves true when A was taken. Exempt from the seal. */
+  #drainOnce(timeoutMs: number): Promise<boolean> {
+    let acquired = false;
+    const done = new Promise<void>((resolve) => {
+      queueMicrotask(() => {
+        this.#outermost(async () => { acquired = true; }, { timeoutMs }, true)
+          .catch((error: unknown) => {
+            this.#options.log?.warn("queued authority work stays queued until the next transaction", {
+              error: error instanceof Error ? error.message : String(error) });
+          })
+          .finally(() => {
+            this.#drainInFlight = undefined;
+            this.#armRetry();
+            this.#notify();
+            resolve();
+          });
+      });
     });
+    this.#drainInFlight = done;
+    return done.then(() => acquired);
   }
 
   #armRetry(): void {
     if (this.#retryTimer !== undefined || (this.#late.length === 0 && this.#ends.size === 0)) return;
+    let delay = this.#options.retryMs ?? DEFAULT_RETRY_MS;
+    if (this.#decided) return;
+    if (this.#shutdownDeadlineAt !== undefined) {
+      const remaining = this.#shutdownDeadlineAt - Date.now();
+      if (remaining <= 0) return;
+      delay = Math.min(delay, remaining);
+    }
     this.#retryTimer = setTimeout(() => {
       this.#retryTimer = undefined;
       this.#scheduleDrain();
-    }, this.#options.retryMs ?? DEFAULT_RETRY_MS);
+    }, delay);
     this.#retryTimer.unref();
+  }
+
+  // ---- issue #4066: the shutdown barrier's view of this runtime ---------------------------------
+
+  /** Wake everything waiting on a ledger change (the final drain). */
+  #notify(): void {
+    for (const wake of this.#listeners) wake();
+  }
+
+  /**
+   * Register work that outlives the worker's run and could still open a transaction or settle a record (an
+   * abandoned request, a Claude durability sequence the shutdown budget stopped waiting for). The barrier joins it
+   * before sealing. It is only observed: a rejection is swallowed here and never changes the promise.
+   */
+  trackProducer(promise: Promise<unknown>, kind: ShutdownProducerKind): void {
+    if (this.#producers.has(promise)) return;
+    this.#producers.set(promise, kind);
+    const done = (): void => { this.#producers.delete(promise); this.#notify(); };
+    promise.then(done, done);
+  }
+
+  /**
+   * The first call fixes the shutdown budget (later calls change nothing). From then on an idle drain waits for A at
+   * most the budget left and the retry timer is cut to it; neither starts once the budget is spent.
+   */
+  beginShutdown(deadlineAt: number): void {
+    if (this.#shutdownDeadlineAt !== undefined) return;
+    this.#shutdownDeadlineAt = deadlineAt;
+  }
+
+  /** After this, a NEW outermost {@link withTransaction} is refused. A borrowed one, the runtime's own drain and the read-only raw reads are not. */
+  sealForShutdown(): void {
+    this.#sealed = true;
+  }
+
+  /** The shutdown outcome is fixed (by the final drain or the observer's deadline): no further drain or retry starts. */
+  markShutdownDecided(): void {
+    this.#decided = true;
+    if (this.#retryTimer !== undefined) { clearTimeout(this.#retryTimer); this.#retryTimer = undefined; }
+    this.#notify();
+  }
+
+  /** Whether any outermost transaction (idle drains included), inline apply or registered producer is still unfinished. */
+  prerequisitesPending(): boolean {
+    return this.#outer > 0 || this.#inlineAll.size > 0 || this.#producers.size > 0;
+  }
+
+  /** Resolves once {@link prerequisitesPending} is false. Never rejects, never times out; callers bound the wait themselves. */
+  async joinPrerequisites(): Promise<void> {
+    while (this.prerequisitesPending()) {
+      await Promise.allSettled([...this.#producers.keys(), ...this.#outerPromises, ...this.#inlineAll]);
+    }
+  }
+
+  /** After the decision: join whatever is still running. Starts no drain. Never rejects. */
+  async joinAfterDecision(): Promise<void> {
+    for (;;) {
+      const running: Array<Promise<unknown>> = [...this.#producers.keys(), ...this.#outerPromises, ...this.#inlineAll, ...new Set(this.#applying.values())];
+      if (this.#drainInFlight !== undefined) running.push(this.#drainInFlight);
+      if (running.length === 0) return;
+      await Promise.allSettled(running);
+    }
+  }
+
+  /** The ledger as counters, the reasons it implies and up to 16 operation ids. No paths, footprints or error text. */
+  snapshot(external: { unsettled_delete?: number; pin_continuation?: number } = {}): AuthoritySnapshot {
+    const counts: Record<string, number> = {
+      outer: this.#outer, inline_applies: this.#inlineAll.size, producers: this.#producers.size,
+      drain_in_flight: this.#drainInFlight === undefined ? 0 : 1, applying: new Set(this.#applying.values()).size,
+      open_settlements: this.#open.size, failed_settlements: this.#failed.size, bare_slot_end_failed: this.#bareEndFailed.size,
+      enrollment_uncertain: this.#uncertainEnrollment, rollback_failed: this.#failedRollback,
+      queued_settlements: this.#late.length, queued_source_ends: this.#ends.size, exhausted: this.#exhausted.size,
+      unsettled_delete: external.unsettled_delete ?? 0, pin_continuation: external.pin_continuation ?? 0,
+    };
+    const reasons: ShutdownReason[] = [];
+    const add = (reason: ShutdownReason, on: boolean): void => { if (on) reasons.push(reason); };
+    add("producer_pending", counts.producers! > 0);
+    add("inline_apply_in_flight", counts.inline_applies! > 0);
+    add("open_settlement", counts.open_settlements! > 0);
+    add("settlement_failed", counts.failed_settlements! > 0);
+    add("bare_slot_end_failed", counts.bare_slot_end_failed! > 0);
+    add("enrollment_uncertain", counts.enrollment_uncertain! > 0);
+    add("rollback_failed", counts.rollback_failed! > 0);
+    add("queued_settlement", counts.queued_settlements! > 0);
+    add("queued_source_end", counts.queued_source_ends! > 0);
+    add("apply_exhausted", counts.exhausted! > 0);
+    add("drain_in_flight", counts.drain_in_flight! > 0 || counts.applying! > 0);
+    add("transaction_in_flight", counts.outer! > 0);
+    add("unsettled_delete", counts.unsettled_delete! > 0);
+    add("pin_continuation", counts.pin_continuation! > 0);
+    const operations = new Set<string>();
+    const take = (ops: Iterable<string>): void => { for (const op of ops) if (operations.size < MAX_OPERATIONS) operations.add(op); };
+    for (const entry of this.#late) take(entry.ops);
+    for (const open of this.#open) take(open.ops);
+    take(this.#failed.keys());
+    take(this.#bareEndFailed.values());
+    take(this.#exhausted);
+    take(this.#applying.keys());
+    return { counts, reasons, operations: [...operations] };
+  }
+
+  /**
+   * The final drain, after {@link sealForShutdown}: apply every queued settlement and source-use end, then wait
+   * (the WAIT is bounded by `deadlineAt`; an apply already running is not cancelled, so the caller's deadline observer
+   * in shutdown-barrier.ts is what reports a result past the deadline) for every other obligation in the ledger to discharge. `drained` only when the
+   * ledger and the GitCache counters in `external` are all empty. It never opens the store or takes A when nothing is
+   * queued, never takes A beneath another lock, and never touches another epoch. A pass waits for A at most
+   * min(LATE_WAIT_MS, budget left) and failed passes back off 1s, 2s, 4s ... (ref'd timers, cleared before it returns);
+   * nothing starts once the budget is spent or the shutdown decided. Never throws.
+   */
+  async drainForShutdown(options: {
+    deadlineAt: number;
+    external?: () => { unsettled_delete: number; pin_continuation: number };
+  }): Promise<ShutdownDrainOutcome> {
+    this.beginShutdown(options.deadlineAt);
+    const deadlineAt = this.#shutdownDeadlineAt ?? options.deadlineAt;
+    const evaluate = (): AuthoritySnapshot => this.snapshot(options.external?.());
+    let backoff = this.#options.shutdownBackoffMs ?? SHUTDOWN_BACKOFF_MS;
+    let nextPassAt = 0;
+    let outcome: ShutdownDrainOutcome | undefined;
+    try {
+      while (outcome === undefined) {
+        const now = Date.now();
+        const remaining = deadlineAt - now;
+        if (!this.#decided && remaining > 0 && now >= nextPassAt && this.#drainInFlight === undefined &&
+            (this.#late.length > 0 || this.#ends.size > 0)) {
+          const acquired = await this.#drainOnce(Math.min(this.#options.lateWaitMs ?? LATE_WAIT_MS, remaining));
+          if (acquired) { backoff = this.#options.shutdownBackoffMs ?? SHUTDOWN_BACKOFF_MS; nextPassAt = 0; }
+          else { nextPassAt = Date.now() + backoff; backoff = Math.min(backoff * 2, SHUTDOWN_BACKOFF_CAP_MS); }
+        }
+        const state = evaluate();
+        if (state.reasons.length === 0) { outcome = { result: "drained", ...state }; break; }
+        const left = deadlineAt - Date.now();
+        if (this.#decided || left <= 0) { outcome = { result: "incomplete", ...state }; break; }
+        const wake = Math.max(1, Math.min(left, nextPassAt > Date.now() ? nextPassAt - Date.now() : backoff));
+        await new Promise<void>((resolve) => {
+          let timer!: NodeJS.Timeout;
+          const finish = (): void => { clearTimeout(timer); this.#listeners.delete(finish); resolve(); };
+          timer = setTimeout(finish, wake);
+          this.#listeners.add(finish);
+        });
+      }
+    } catch (error) {
+      // Defensive: the barrier never throws. An unexpected failure is reported as an incomplete shutdown.
+      this.#options.log?.warn("the final authority drain failed unexpectedly", { error: error instanceof Error ? error.name : "non-error" });
+      outcome = { result: "incomplete", ...evaluate() };
+    }
+    this.markShutdownDecided();
+    return outcome;
   }
 
   /** The lease this process minted for `clonePath` (what a flight keeps for publication). */
@@ -631,6 +962,7 @@ export class AuthorityRuntime implements AuthorityScope {
       return "kept";
     }
     const receipt = await store.transition(tx, lease, "ineligible");
+    this.#bareEndFailed.delete(lease);
     this.#leases.delete(key);
     this.#releaseOwner(key);
     onEnded?.(receipt);
@@ -893,7 +1225,7 @@ export class AuthorityRuntime implements AuthorityScope {
       if (executorIncarnation === undefined) return this.#mint(tx, store, key);
       // Re-checked inside A after the store and slot I/O above: the sink may have been retired meanwhile.
       this.#assertSinkLive();
-      const lease = await store.admitSourceUse(tx, key, { executor: executorIncarnation });
+      const lease = await this.#enrolling(store.admitSourceUse(tx, key, { executor: executorIncarnation }));
       this.#leases.set(key, lease);
       this.#recordOwner(key, lease);
       return lease;
@@ -929,6 +1261,18 @@ export class AuthorityRuntime implements AuthorityScope {
     return opened;
   }
 
+  /**
+   * An admission or pending-record write that rejects with anything but a clean pre-write AuthorityRefusal (a post-write read-back refusal is not clean) may have partly
+   * landed (a slot renamed whose head was not written): it is counted so the shutdown result is not "drained".
+   */
+  async #enrolling<T>(write: Promise<T>): Promise<T> {
+    try { return await write; }
+    catch (error) {
+      if (!(error instanceof AuthorityRefusal) || error instanceof AuthorityPostWriteRefusal) { this.#uncertainEnrollment += 1; this.#notify(); }
+      throw error;
+    }
+  }
+
   async #slotOf(tx: AuthorityTransaction, store: AuthorityStore, key: string): Promise<SlotSnapshot | null> {
     return store.readSlot(tx, await store.slotKey(tx, key));
   }
@@ -946,7 +1290,7 @@ export class AuthorityRuntime implements AuthorityScope {
     if (purpose.destructive !== true) this.#assertSinkLive();
     // Recorded before the admission so a path whose admission wrote the slot and then failed is still named.
     this.#note(key);
-    const lease = await store.admitSourceUse(tx, key, purpose);
+    const lease = await this.#enrolling(store.admitSourceUse(tx, key, purpose));
     this.#leases.set(key, lease);
     // A destructive record's lease is not a flight's source use: only a non-destructive mint is owned.
     if (purpose.destructive !== true) this.#recordOwner(key, lease);
@@ -976,7 +1320,7 @@ export class AuthorityRuntime implements AuthorityScope {
       for (const item of footprint) {
         if (await fsp.lstat(item).then(() => true, (error: NodeJS.ErrnoException) => error.code !== "ENOENT")) existing.push(item);
       }
-      const lease = await store.admitOperatorDiscard(tx, key, footprint);
+      const lease = await this.#enrolling(store.admitOperatorDiscard(tx, key, footprint));
       this.#leases.set(key, lease);
       this.#discards.set(key, lease);
       this.#discardPresent.set(key, existing);
@@ -994,7 +1338,7 @@ export class AuthorityRuntime implements AuthorityScope {
       if (held && slot && this.#ends.get(key) !== held && this.#ownedActive(store, slot, held)) {
         this.#assertSinkLive();
         this.#note(key);
-        await store.admitSourceUse(tx, key, { lease: held });
+        await this.#enrolling(store.admitSourceUse(tx, key, { lease: held }));
         return;
       }
       if (op === "remediation-recovery") throw new AuthorityRefusal("remediation requires the current active source lease");
@@ -1034,10 +1378,10 @@ export class AuthorityRuntime implements AuthorityScope {
     const held = this.#leases.get(key);
     const slot = held ? await this.#slotOf(tx, store, key) : null;
     if (held && slot && slot.owner.worker === store.workerIncarnation && slot.epoch === leaseEpoch(held) && slot.state === "active") {
-      const operation = await store.beginPending(tx, held, { kind: "bare_mutation", footprint: text });
+      const operation = await this.#enrolling(store.beginPending(tx, held, { kind: "bare_mutation", footprint: text }));
       return this.#settlement(store, [{ lease: held, operation, covers, bareSlot: true, settled: false }]);
     }
-    const admitted = await store.admitBareMutation(tx, key, { footprint: text });
+    const admitted = await this.#enrolling(store.admitBareMutation(tx, key, { footprint: text }));
     this.#leases.set(key, admitted.lease);
     return this.#settlement(store, [{ lease: admitted.lease, operation: admitted.operation, covers, bareSlot: true, settled: false }]);
   }
@@ -1054,8 +1398,54 @@ export class AuthorityRuntime implements AuthorityScope {
       : await peekAuthoritySlot(
         { dataDir: this.#options.lifetime.dataDir, workerToken: this.#options.workerToken }, path.resolve(bare));
     if (slot?.pending?.status === "running") {
+      this.#logBareRefusal(slot, tx !== undefined);
       throw new AuthorityRefusal(`${op}: an unresolved ${slot.pending.kind} (${slot.pending.operation}) covers this bare`);
     }
+  }
+
+  /**
+   * issue #4066 M4: one `bare_slot_refusal` warning per operation per process. Best effort: a failure here (a
+   * throwing logger included) is swallowed and never changes the refusal. It logs no footprint text, path, key or
+   * incarnation: only the classified fields, a digest when the footprint did not parse, and the local ledger state.
+   */
+  #logBareRefusal(slot: SlotSnapshot, inTransaction: boolean): void {
+    try {
+      const pending = slot.pending;
+      if (!pending || this.#refusalLogged.has(pending.operation)) return;
+      if (this.#refusalLogged.size >= (this.#options.refusalLogLimit ?? MAX_LOGGED_REFUSALS)) return;
+      this.#refusalLogged.add(pending.operation);
+      const op = pending.operation;
+      const parsed = classifyBareFootprint(pending.footprint);
+      const incarnation = (inTransaction ? this.#store?.workerIncarnation : undefined)
+        ?? this.authorityIncarnation() ?? processWorkerIncarnation();
+      let local: "queued" | "applying" | "inline" | "open" | "failed" | "none" = "none";
+      if (this.#failed.has(op) || this.#exhausted.has(op)) local = "failed";
+      else if (this.#applying.has(op)) local = "applying";
+      else if (this.#inlineOps.has(op)) local = "inline";
+      else if (this.#late.some((entry) => entry.ops.includes(op))) local = "queued";
+      else if ([...this.#open].some((open) => open.ops.includes(op))) local = "open";
+      const fields: Record<string, unknown> = {
+        operation: op,
+        deletion_class: parsed.deletionClass,
+        subject_run: parsed.subjectRun,
+        generation: parsed.generation,
+        slot_epoch: slot.epoch,
+        pending_status: pending.status,
+        pending_kind: pending.kind,
+        self_owned: slot.owner.worker === incarnation,
+        local_settlement: local,
+        actor: "unknown",
+      };
+      if (parsed.deletionClass === "unparsed") {
+        fields.footprint_digest = createHash("sha256").update(pending.footprint).digest("hex");
+      }
+      this.#options.log?.warn("bare_slot_refusal", fields);
+    } catch { /* diagnostics never change the refusal */ }
+  }
+
+  /** Tests only: how many operations the inline-apply ledger still holds (it must be empty once applies settle). */
+  inlineLedgerSize(): number {
+    return this.#inlineOps.size;
   }
 
   async #beginDestructive(paths: readonly string[], op: string): Promise<AuthoritySettlement> {
@@ -1072,20 +1462,29 @@ export class AuthorityRuntime implements AuthorityScope {
     try {
       for (const [owner, covers] of groups) {
         const lease = await this.#leaseForPending(tx, store, owner, ["active", "retiring"]);
-        const operation = await store.beginPending(tx, lease, {
+        const operation = await this.#enrolling(store.beginPending(tx, lease, {
           kind: "destructive", footprint: boundedText(covers.join("\n"), MAX_FOOTPRINT),
-        });
+        }));
         begun.push({ lease, operation, covers, bareSlot: false, settled: false });
       }
     } catch (error) {
       // No effect has started: the records opened so far were never acted on, so they close ok.
-      for (const part of begun) await store.settlePending(tx, part.lease, part.operation, { ok: true }).catch(() => undefined);
+      for (const part of begun) {
+        await store.settlePending(tx, part.lease, part.operation, { ok: true }).catch(() => {
+          // The record stays running (fail closed); the shutdown barrier reports it.
+          this.#failedRollback += 1;
+        });
+      }
       throw error;
     }
     return this.#settlement(store, begun);
   }
 
   #settlement(store: AuthorityStore, parts: PendingPart[]): AuthoritySettlement {
+    // The obligation exists from the moment the pending record is opened: until it is applied or queued the
+    // shutdown barrier must not report a clean shutdown.
+    const record: OpenSettlement = { ops: parts.map((part) => part.operation) };
+    this.#open.add(record);
     const apply = async (tx: AuthorityTransaction, outcome: { ok: true } | { ok: false; residue: string[] }): Promise<void> => {
       for (const part of parts) {
         if (part.settled) continue;
@@ -1094,7 +1493,11 @@ export class AuthorityRuntime implements AuthorityScope {
           part.settled = true;
           if (part.bareSlot) {
             // Leave `active` so a successor worker is not refused by a slot with nothing pending.
-            await store.transition(tx, part.lease, "ineligible").catch((error: unknown) => {
+            await store.transition(tx, part.lease, "ineligible").then(() => {
+              if (this.#bareEndFailed.delete(part.lease)) this.#notify();
+            }).catch((error: unknown) => {
+              this.#bareEndFailed.set(part.lease, part.operation);
+              this.#notify();
               this.#options.log?.warn("bare-mutator slot could not leave active", { error: error instanceof Error ? error.message : String(error) });
             });
           }
@@ -1111,9 +1514,32 @@ export class AuthorityRuntime implements AuthorityScope {
         // while still holding B) it must NOT acquire A, which would invert the lock order beneath B: it is queued
         // and the idle drain (scheduled here, not awaited) or the next outermost acquisition applies it. Until then the durable record stays running, fail-closed;
         // if the process dies first a successor finds it unresolved, which is correct.
+        //
+        // issue #4066: an inline apply is owned by the outermost transaction it runs under, which joins it before it
+        // releases A (see #closeInline); a transaction already closing no longer takes inline applies and the
+        // settlement queues like one with no transaction.
         const tx = this.active();
-        if (tx) { await apply(tx, outcome); return; }
-        this.#late.push({ apply: (outer) => apply(outer, outcome), attempts: 0 });
+        if (tx && !this.#closing.has(tx)) {
+          // The ledger is updated inside the tracked promise itself, so the owner's join never observes a settled
+          // apply whose obligation is still open.
+          for (const op of record.ops) this.#inlineOps.add(op);
+          const applying = apply(tx, outcome).then(
+            () => {
+              this.#open.delete(record);
+              for (const op of record.ops) this.#inlineOps.delete(op);
+            },
+            (error: unknown) => {
+              this.#open.delete(record);
+              for (const op of record.ops) { this.#inlineOps.delete(op); this.#failed.set(op, "settlement_failed"); }
+              throw error;
+            });
+          this.#trackInline(tx, applying);
+          await applying;
+          return;
+        }
+        this.#late.push({ apply: (outer) => apply(outer, outcome), attempts: 0, ops: record.ops });
+        this.#open.delete(record);
+        this.#notify();
         // Idle drain, started from here: it holds no lock and nobody awaits it (see #scheduleDrain).
         this.#scheduleDrain();
       },
