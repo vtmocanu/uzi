@@ -530,7 +530,7 @@ describe("OverviewNext capacity rail", () => {
     await page.viewport(1280, 900);
     mountPreview();
     await screen.findByText("Capacity");
-    const stat = await screen.findByText(/cpu 34%/);
+    const stat = await screen.findByRole("progressbar", { name: "CPU", hidden: true });
     const details = stat.closest("details") as HTMLDetailsElement;
     expect(details.open).toBe(false);
     expect(stat.checkVisibility(), "closed: stat line hidden").toBe(false);

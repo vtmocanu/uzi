@@ -22,7 +22,7 @@ import { WorkerCordonMetadata } from "../components/WorkerCordonMetadata";
 import { WorkerCordonControls } from "../components/WorkerCordonControls";
 import { WorkerMemoryAuthorityBadge } from "../components/WorkerMemoryAuthorityBadge";
 import { WorkerQuarantineBadge } from "../components/WorkerQuarantineBadge";
-import { WorkerLeaseBadge } from "../components/WorkerLeaseBadge";
+import { EPHEMERAL_WORKER_TITLE, WorkerLeaseBadge } from "../components/WorkerLeaseBadge";
 import { WorkerCustodyBadge } from "../components/WorkerCustodyBadge";
 import { RecoveryHoldsSurface } from "../components/RecoveryHoldsSurface";
 import { WorkerStatGauges, formatBytes } from "../components/WorkerStats";
@@ -854,7 +854,7 @@ export function WorkersSettings() {
                               {w.ephemeral === true && (
                                 <Badge
                                   tone="plan"
-                                  title="Auto-provisioned on demand for a run that needed a capability no online worker had. Removed after that run finishes and any lease ends."
+                                  title={EPHEMERAL_WORKER_TITLE}
                                 >
                                   ephemeral
                                 </Badge>
