@@ -1199,9 +1199,7 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
               "repo_agents_not_predicted"
             ]
           },
-          "notes": [
-            "token_fixed"
-          ]
+          "notes": []
         }
       },
       {

@@ -566,6 +566,10 @@ fires, so its `worker_model` cell (source `schedule_pin`) is `fixed_at`
 `create`. A default chosen after an ignored pin is read when a worker claims
 the run, so that cell stays `fixed_at` `claim`.
 
+For a `self_improve` schedule the credential is a prediction that the claim
+re-checks. A weekly usage reserve hold, or a pinned Judge token disabled after
+the preview, is decided at the claim and is not shown here.
+
 `subagents` says how subagents pick a model: `mode` `follow_lead` (all use
 the lead's model) or `own_pins` (each pinned subagent keeps its own pin,
 listed in `pinned` by name; the rest follow the lead). At most 32 pins are

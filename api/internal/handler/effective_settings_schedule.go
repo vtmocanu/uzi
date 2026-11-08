@@ -356,6 +356,7 @@ func (h *Handler) onceDisabledHold(ctx context.Context, d scheduleDraft) (refusa
 		if r, ok := scheduleFireRefusal(err); ok {
 			return r, nil
 		}
+		// A non-refusal error (for example a DB failure) falls through to the harness prediction, as the tick does.
 	}
 	return refusal{}, nil
 }
@@ -368,6 +369,10 @@ type scheduleBranch struct {
 	credential *apitypes.CredentialDTO
 	subagents  *apitypes.EffectiveSubagentsDTO
 	refused    refusal
+	// tokenFixed is set for a self_improve claim whose judge binding is not auto: the binding, not a
+	// ranker, decides the token. It follows the bind mode, because an auto binding with an empty pool
+	// reports owner_default yet re-ranks once a token is pooled.
+	tokenFixed bool
 }
 
 // scheduleBranch predicts the harness-dependent fields for a fire that lands on hn. base is the
@@ -409,9 +414,11 @@ func (h *Handler) scheduleBranch(ctx context.Context, d scheduleDraft, hn worker
 	switch {
 	case d.target == "self_improve" && hn == workersvc.HarnessClaude:
 		// A self_improve claim follows the owner's judge binding, not a worker's.
-		if cred, err = h.wsvc.PredictSelfImproveCredential(ctx, d.userID); err != nil {
+		var auto bool
+		if cred, auto, err = h.wsvc.PredictSelfImproveCredential(ctx, d.userID); err != nil {
 			return b, err
 		}
+		b.tokenFixed = !auto
 	case d.override != nil && hn == workersvc.HarnessClaude && !(d.override.Mode == workersvc.CredentialOverrideModePinned && d.override.SecretID == nil):
 		if cred, err = overrideCredential(d.override.Mode); err != nil {
 			return b, err
@@ -491,7 +498,7 @@ func (h *Handler) buildScheduleSettingsPreview(ctx context.Context, d scheduleDr
 		}
 		dto.WorkerModel, dto.WorkerEffort, dto.Credential, dto.Subagents = b.model, b.effort, b.credential, b.subagents
 		// The judge binding fixes the token; an auto binding picks one at the claim instead.
-		if d.target == "self_improve" && pred.Harness == workersvc.HarnessClaude && dto.Credential != nil && dto.Credential.Source != workersvc.CredentialSourceAutoSelection {
+		if b.tokenFixed {
 			dto.Notes = append(dto.Notes, noteTokenFixed)
 		}
 		return dto, nil

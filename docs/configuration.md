@@ -355,6 +355,7 @@ Subagent pins and repository-defined agents are not part of the account view or 
 
 - `create`: frozen when the run is created. The harness, and a Codex credential, are fixed here.
 - `claim`: read again each time a worker claims the run, including a queued, scheduled or resumed run. Models, efforts and an Anthropic token (`claim_selection`) are fixed here, so a settings change made before the claim still applies.
+- An honoured schedule model pin is also fixed at `create`: the schedule freezes it into the run when it fires, so the schedule-preview `worker_model` cell for that pin reads `fixed_at: create`.
 
 Two creation-time policies can choose the harness only when the run is created, from live usage that this read-only view does not consult: the **automatic** default harness (the soonest weekly reset) and the optional [overflow](./worker-model.md#overflow-to-the-other-harness). When one applies, the harness `value` is null, its `source` is `chosen_at_create`, and the cell carries the policy as note `automatic_weekly_reset` or `overflow`. The view then promises no harness and no harness-specific credential.
 

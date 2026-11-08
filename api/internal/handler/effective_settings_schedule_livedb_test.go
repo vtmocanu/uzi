@@ -546,7 +546,9 @@ func TestSchedulePreviewAlternativesLiveDB(t *testing.T) {
 		dto, _ := f.schedulePreview(`{"target":"self_improve"}`)
 		wantHarness(t, dto.Harness, "claude", "automatic")
 		wantCredential(t, dto.Credential, "anthropic", "owner_default", "claim")
-		if strings.Join(dto.Notes, ",") != "token_fixed" {
+		// The new-user judge binding is auto; with an empty pool it falls back to the default but
+		// re-ranks once a token is pooled, so the token is not fixed.
+		if len(dto.Notes) != 0 {
 			t.Fatalf("self_improve notes = %v", dto.Notes)
 		}
 		dto, _ = f.schedulePreview(`{"target":"self_improve","harness":"codex"}`)
@@ -861,7 +863,11 @@ func TestSchedulePreviewSelfImproveJudgeBindingLiveDB(t *testing.T) {
 		{"auto with an empty pool falls back to the default", func(f *effFix, _ uuid.UUID) {
 			f.exec(`UPDATE users SET judge_anthropic_bind_mode = 'auto', judge_anthropic_secret_id = NULL WHERE id = $1`, f.user)
 			f.exec(`UPDATE user_secrets SET auto_eligible = false WHERE user_id = $1`, f.user)
-		}, "owner_default", "token_fixed"},
+		}, "owner_default", ""},
+		{"auto with pooled tokens and no reading takes the floor", func(f *effFix, _ uuid.UUID) {
+			f.exec(`UPDATE users SET judge_anthropic_bind_mode = 'auto', judge_anthropic_secret_id = NULL WHERE id = $1`, f.user)
+			f.exec(`UPDATE user_secrets SET auto_eligible = true WHERE id = $1`, f.token)
+		}, "auto_selection", ""},
 		{"default", func(f *effFix, _ uuid.UUID) {
 			f.exec(`UPDATE users SET judge_anthropic_bind_mode = 'default', judge_anthropic_secret_id = NULL WHERE id = $1`, f.user)
 		}, "owner_default", "token_fixed"},

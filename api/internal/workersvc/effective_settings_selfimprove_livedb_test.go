@@ -23,6 +23,8 @@ func TestEffectiveSettingsSelfImproveCredentialMatchesClaimLiveDB(t *testing.T) 
 		// what the real claim chose: a pinned token id, any pooled token, or the owner default (nil id)
 		wantPinned, wantSome bool
 		wantReason           string
+		// whether the binding is auto, which the preview uses to decide token_fixed
+		wantAuto bool
 	}{
 		{
 			name: "judge pinned to a token", wantSource: "token_override", wantPinned: true, wantReason: "judge",
@@ -37,7 +39,7 @@ func TestEffectiveSettingsSelfImproveCredentialMatchesClaimLiveDB(t *testing.T) 
 			},
 		},
 		{
-			name: "judge auto with a pooled token", wantSource: "auto_selection", wantSome: true, wantReason: "auto",
+			name: "judge auto with a pooled token", wantSource: "auto_selection", wantSome: true, wantReason: "auto", wantAuto: true,
 			setup: func(fx *effFix, _ uuid.UUID) {
 				fx.env.exec(`UPDATE users SET judge_anthropic_bind_mode = 'auto', judge_anthropic_secret_id = NULL WHERE id = $1`, fx.userID)
 				fx.env.exec(`UPDATE user_secrets SET auto_eligible = true WHERE id = $1`, fx.token)
@@ -48,7 +50,14 @@ func TestEffectiveSettingsSelfImproveCredentialMatchesClaimLiveDB(t *testing.T) 
 			},
 		},
 		{
-			name: "judge auto with an empty pool falls back to the default", wantSource: "owner_default", wantReason: "pool_empty",
+			name: "judge auto with pooled tokens and no reading takes the floor", wantSource: "auto_selection", wantSome: true, wantReason: "pool_stale", wantAuto: true,
+			setup: func(fx *effFix, _ uuid.UUID) {
+				fx.env.exec(`UPDATE users SET judge_anthropic_bind_mode = 'auto', judge_anthropic_secret_id = NULL WHERE id = $1`, fx.userID)
+				fx.env.exec(`UPDATE user_secrets SET auto_eligible = true WHERE id = $1`, fx.token)
+			},
+		},
+		{
+			name: "judge auto with an empty pool falls back to the default", wantSource: "owner_default", wantReason: "pool_empty", wantAuto: true,
 			setup: func(fx *effFix, _ uuid.UUID) {
 				fx.env.exec(`UPDATE users SET judge_anthropic_bind_mode = 'auto', judge_anthropic_secret_id = NULL WHERE id = $1`, fx.userID)
 				fx.env.exec(`UPDATE user_secrets SET auto_eligible = false WHERE user_id = $1`, fx.userID)
@@ -74,9 +83,12 @@ func TestEffectiveSettingsSelfImproveCredentialMatchesClaimLiveDB(t *testing.T) 
 				VALUES ($1, $2, 'anthropic_token', $3, false, $4, 'master')`, other, fx.userID, "eff-second-"+other.String()[:8], sealed)
 			c.setup(fx, other)
 
-			pred, err := fx.svc.PredictSelfImproveCredential(fx.env.ctx, fx.userID)
+			pred, auto, err := fx.svc.PredictSelfImproveCredential(fx.env.ctx, fx.userID)
 			if err != nil {
 				t.Fatal(err)
+			}
+			if auto != c.wantAuto {
+				t.Errorf("auto binding = %v, want %v", auto, c.wantAuto)
 			}
 			if pred.Kind != "anthropic" || pred.Source != c.wantSource || pred.FixedAt != "claim" {
 				t.Fatalf("prediction = %+v, want anthropic %s fixed at claim", pred, c.wantSource)

@@ -230,11 +230,17 @@ func predictCredential(res resolvedHarness) *CredentialPrediction {
 // judge binding, so this runs the same function on a run that carries only the owner and maps its
 // choice to the wire sources: a pinned judge token is token_override, the auto ranker (a picked or
 // floored pool token) is auto_selection, and the default, an unbound pin or the empty-pool fallback
-// is owner_default. No id or label leaves this function.
-func (s *Service) PredictSelfImproveCredential(ctx context.Context, userID uuid.UUID) (*CredentialPrediction, error) {
+// is owner_default. The second result is true when the binding is auto: the empty-pool fallback
+// maps to owner_default yet still re-ranks at the claim, so the source alone cannot say whether the
+// token is fixed. No id or label leaves this function.
+func (s *Service) PredictSelfImproveCredential(ctx context.Context, userID uuid.UUID) (*CredentialPrediction, bool, error) {
+	bound, err := s.q.GetUserJudgeAnthropicBinding(ctx, userID)
+	if err != nil {
+		return nil, false, fmt.Errorf("self_improve credential predict: judge binding lookup: %w", err)
+	}
 	choice, err := s.judgeChoice(ctx, store.Run{UserID: userID, Kind: runkind.SelfImprove})
 	if err != nil {
-		return nil, fmt.Errorf("self_improve credential predict: %w", err)
+		return nil, false, fmt.Errorf("self_improve credential predict: %w", err)
 	}
 	source := CredentialSourceAutoSelection
 	switch {
@@ -243,7 +249,7 @@ func (s *Service) PredictSelfImproveCredential(ctx context.Context, userID uuid.
 	case choice.reason == selectReasonJudge:
 		source = CredentialSourceTokenOverride
 	}
-	return &CredentialPrediction{Kind: CredentialKindAnthropic, Source: source, FixedAt: FixedAtClaim}, nil
+	return &CredentialPrediction{Kind: CredentialKindAnthropic, Source: source, FixedAt: FixedAtClaim}, bound.JudgeAnthropicBindMode == BindModeAuto, nil
 }
 
 // SubagentPin is one own subagent whose template pins a model for the harness.
