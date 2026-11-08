@@ -266,22 +266,30 @@ func TestForgeConnectionCreatesBoardColumnsForEnabledRepo(t *testing.T) {
 	}
 }
 
-// A forge that refuses the labels must not stop boot or the enable.
-func TestForgeConnectionColumnFailureIsNonFatal(t *testing.T) {
+// Regression (PR #3956 review, Decision 13): a forge that refuses the labels
+// leaves the repo disabled, like the web enable and setup, and boot still
+// succeeds. A repo enabled with 0 columns would make the run lifecycle read an
+// automated card move as a person's.
+func TestForgeConnectionLabelRefusalLeavesRepoDisabled(t *testing.T) {
 	st := &fakeStore{user: store.User{ID: uuid.New(), Email: "admin@uzi.test"}}
 	ff := &fakeForge{
 		identity:  forge.BotIdentity{ForgeUserID: 42, Username: "uzi-bot"},
 		projects:  []forge.Project{{ForgeProjectID: 1, PathWithNamespace: "vtmocanu/uzi"}},
-		labelsErr: errors.New("forge down"),
+		labelsErr: errors.New("403 from forge"),
 	}
 	if err := ForgeConnection(context.Background(), st, &fakeSvc{forge: ff}, baseCfg()); err != nil {
-		t.Fatalf("a label failure must not fail the seed: %v", err)
+		t.Fatalf("a label refusal must not fail boot: %v", err)
 	}
-	if len(st.enabled) != 1 {
-		t.Fatalf("repo must still be enabled, got %d enables", len(st.enabled))
+	if len(st.enabled) != 0 {
+		t.Fatalf("a repo whose labels the forge refused must stay disabled, got %d enables", len(st.enabled))
 	}
 	if n := len(st.columns[st.repoIDByPath["vtmocanu/uzi"]]); n != 0 {
 		t.Fatalf("no columns may be recorded when the labels failed, got %d", n)
+	}
+	// The connection stays created (create-only): the operator fixes the forge
+	// access and reruns /server setup to enable the repo.
+	if st.upsertedConn == nil {
+		t.Fatal("the forge connection must still be created")
 	}
 }
 
