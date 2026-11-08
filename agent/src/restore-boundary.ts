@@ -184,28 +184,34 @@ function unescapeMount(s: string): string {
 }
 
 /**
- * True when the mountinfo row for `procRoot` carries a hiding option: the rule of the run-procs.ts procMount scan
- * (`hidepid` other than 0/off, or any `subset`), read from both the per-mount and the per-superblock options.
- * A malformed row or an absent proc row is not "hidden" here (run-procs reports those as unknown, not hidden).
+ * Three-way visibility of the procfs mounted at `procRoot`, the rule of the run-procs.ts procMount scan:
+ * "hidden" when its row carries `hidepid` other than 0/off or any `subset` (per-mount or per-superblock options);
+ * "unknown" for a malformed row, a row at `procRoot` that is not fstype `proc`, or no row at `procRoot`;
+ * "ok" otherwise. Unknown fails closed exactly like hidden (run-procs callers fail closed on unknown too).
  */
-function procfsHidden(text: string, procRoot: string): boolean {
+function procfsVisibility(text: string, procRoot: string): "ok" | "hidden" | "unknown" {
+  const want = path.resolve(procRoot);
+  let found = false;
   for (const line of text.split("\n")) {
     if (line === "") continue;
     const cut = line.indexOf(" - ");
-    if (cut < 0) continue;
+    if (cut < 0) return "unknown";
     const lf = line.slice(0, cut).split(" ").filter(x => x !== "");
     const rf = line.slice(cut + 3).split(" ").filter(x => x !== "");
-    if (lf.length < 6 || rf.length < 3 || unescapeMount(lf[4]!) !== procRoot || rf[0] !== "proc") continue;
+    if (lf.length < 6 || rf.length < 3) return "unknown";
+    if (unescapeMount(lf[4]!) !== want) continue;
+    found = true;
+    if (rf[0] !== "proc") return "unknown";
     for (const opts of [lf[5]!, rf[2]!]) {
       for (const opt of opts.split(",")) {
         const eq = opt.indexOf("=");
         const k = eq < 0 ? opt : opt.slice(0, eq);
         const v = eq < 0 ? "" : opt.slice(eq + 1);
-        if ((k === "hidepid" && v !== "0" && v !== "off") || k === "subset") return true;
+        if ((k === "hidepid" && v !== "0" && v !== "off") || k === "subset") return "hidden";
       }
     }
   }
-  return false;
+  return found ? "ok" : "unknown";
 }
 
 /** The container id behind `/etc/hostname`, or undefined when the topmost row does not look like a container hostname bind. */
@@ -245,13 +251,17 @@ export async function readLiveIdentity(options: LiveIdentityOptions = {}):
   let mountinfo: string | undefined;
   try { mountinfo = await fsp.readFile(`${root}/self/mountinfo`, "utf8"); } catch { mountinfo = undefined; }
   // Same visibility rule as the run-procs scan: a procfs mounted with hidepid/subset hides processes, so the
-  // identity fields above cannot be trusted to describe the whole container. Applies to both slot kinds.
-  if (mountinfo !== undefined && procfsHidden(mountinfo, root)) return { ok: false, reason: "procfs_hidden" };
+  // identity fields above cannot be trusted to describe the whole container. Applies to both slot kinds, and an
+  // undeterminable visibility (unreadable mountinfo, malformed/non-proc/missing row) fails closed as
+  // procfs_unreadable.
+  if (mountinfo === undefined) return { ok: false, reason: "procfs_unreadable" };
+  const visibility = procfsVisibility(mountinfo, root);
+  if (visibility === "hidden") return { ok: false, reason: "procfs_hidden" };
+  if (visibility === "unknown") return { ok: false, reason: "procfs_unreadable" };
   if (options.podUid !== undefined && UUID_RE.test(options.podUid)) {
     return { ok: true, identity: { slot: { kind: "hosted", podUid: options.podUid.toLowerCase(), container: options.container ?? "worker" },
       crossCheck: "na", execution } };
   }
-  if (mountinfo === undefined) return { ok: false, reason: "cross_check_failed" };
   const containerId = containerIdFromMountinfo(mountinfo);
   const hostname = (options.hostname ?? os.hostname)();
   if (containerId === undefined || hostname !== containerId.slice(0, 12)) return { ok: false, reason: "cross_check_failed" };

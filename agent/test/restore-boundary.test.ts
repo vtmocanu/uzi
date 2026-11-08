@@ -24,7 +24,9 @@ let root: string;
 let proc: string;
 let dataDir: string;
 
-interface ProcOpts { cid?: string | null; boot?: string; ticks?: string; timens?: string | null; mountRoot?: string }
+// mountinfo: undefined = a clean proc row at `dir` (plus the hostname bind unless cid is null); null = no mountinfo
+// file at all; a string = that text verbatim.
+interface ProcOpts { cid?: string | null; boot?: string; ticks?: string; timens?: string | null; mountRoot?: string; mountinfo?: string | null }
 async function makeProc(dir: string, o: ProcOpts = {}): Promise<void> {
   await fsp.mkdir(path.join(dir, "self/ns"), { recursive: true });
   await fsp.mkdir(path.join(dir, "1"), { recursive: true });
@@ -34,11 +36,15 @@ async function makeProc(dir: string, o: ProcOpts = {}): Promise<void> {
   await fsp.writeFile(path.join(dir, "1/stat"), `1 (init (x)) S 0 1 1 0 -1 4194560 1 0 0 0 0 0 0 0 20 0 1 0 ${ticks} 1 1 18446744073709551615\n`);
   await fsp.writeFile(path.join(dir, "sys/kernel/random/boot_id"), `${o.boot ?? BOOT}\n`);
   if (o.timens !== null) await fsp.writeFile(path.join(dir, "self/timens_offsets"), o.timens ?? "monotonic           0         0\nboottime            0         0\n");
+  if (o.mountinfo === null) return;
+  if (o.mountinfo !== undefined) { await fsp.writeFile(path.join(dir, "self/mountinfo"), o.mountinfo); return; }
+  let text = "20 10 0:30 / / rw - overlay overlay rw\n";
   if (o.cid !== null) {
     const mroot = o.mountRoot ?? `/var/lib/docker/containers/${o.cid ?? CID}/hostname`;
-    await fsp.writeFile(path.join(dir, "self/mountinfo"),
-      `20 10 0:30 / / rw - overlay overlay rw\n31 20 8:1 ${mroot} /etc/hostname rw,relatime - ext4 /dev/sda1 rw\n`);
+    text += `31 20 8:1 ${mroot} /etc/hostname rw,relatime - ext4 /dev/sda1 rw\n`;
   }
+  text += `41 20 0:5 / ${dir} rw,nosuid,nodev,noexec,relatime - proc proc rw\n`;
+  await fsp.writeFile(path.join(dir, "self/mountinfo"), text);
 }
 
 beforeEach(async () => {
@@ -89,6 +95,30 @@ describe("live identity and cross-check", () => {
     assert.ok(r.ok);
     assert.equal(r.identity.slot.kind, "hosted");
     assert.equal(r.identity.crossCheck, "na");
+  });
+  describe("procfs visibility undeterminable (fails closed)", () => {
+    const POD = "123e4567-e89b-12d3-a456-426614174000";
+    const HOST_ROW = `31 20 8:1 /var/lib/docker/containers/${CID}/hostname /etc/hostname rw,relatime - ext4 /dev/sda1 rw\n`;
+    const cases = (): Array<[string, string | null]> => [
+      ["unreadable mountinfo", null],
+      ["no row at the proc root", `20 10 0:30 / / rw - overlay overlay rw\n${HOST_ROW}`],
+      ["a non-proc fstype at the proc root", `20 10 0:30 / / rw - overlay overlay rw\n${HOST_ROW}41 20 0:5 / ${proc} rw - tmpfs tmpfs rw\n`],
+      ["a malformed row", `20 10 0:30 / / rw - overlay overlay rw\n${HOST_ROW}garbage row without separator\n41 20 0:5 / ${proc} rw - proc proc rw\n`],
+    ];
+    for (const kind of ["compose", "hosted"] as const) {
+      for (const [name, mountinfo] of cases()) {
+        it(`refuses ${name} for a ${kind} slot`, async () => {
+          await fsp.rm(proc, { recursive: true });
+          await makeProc(proc, { mountinfo });
+          const r = await readLiveIdentity({ procRoot: proc, hostname: host, ...(kind === "hosted" ? { podUid: POD } : {}) });
+          assert.deepEqual(r, { ok: false, reason: "procfs_unreadable" });
+        });
+      }
+    }
+    it("a trailing-slash procRoot with a clean proc row is admitted", async () => {
+      const r = await readLiveIdentity({ procRoot: `${proc}/`, hostname: host });
+      assert.ok(r.ok);
+    });
   });
   describe("procfs visibility (hidepid / subset on the proc mount)", () => {
     // The proc row is found by its mount point, which is the injected root; super options are the last field.
