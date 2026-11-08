@@ -92,7 +92,8 @@ function RunBadges({
             {tag && (
               <>
                 {/* A real space, so the chip reads "#N cross-checking" to assistive tech and copy. */}{" "}
-                <span className={`whitespace-nowrap rounded border border-current/40 px-1 ${TAG_CLASSES[tag.tone]}`}>{stripUnsafeChars(tag.text)}</span>
+                {/* One bordered box that may break inside itself in a narrow station, never past it. */}
+                <span className={`inline-block max-w-full rounded border border-current/40 px-1 ${TAG_CLASSES[tag.tone]}`}>{stripUnsafeChars(tag.text)}</span>
               </>
             )}
           </Badge>

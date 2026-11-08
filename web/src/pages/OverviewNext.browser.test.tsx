@@ -606,6 +606,29 @@ describe("OverviewNext issue work cross-check tags", () => {
     });
   }
 
+  // A long tag ("cross-check: unavailable") in a narrow side-by-side station breaks inside its
+  // pill rather than running past the station into the next one's chips (#4082 review).
+  for (const width of [768, 1024, 1280]) {
+    it(`keeps every chip inside its station at ${width}px, All users`, async () => {
+      await page.viewport(width, 900);
+      mountCrossCheckLine();
+      const { card, toggle } = await ready();
+      expect(window.innerWidth).toBe(width);
+      await userEvent.click(within(toggle).getByRole("button", { name: "All users" }));
+      expect(tagOf(chips(card, "review").get("#88"))).toBe("cross-check: unavailable");
+
+      for (const stage of ["planning", "review", "building"]) {
+        const s = (card.querySelector(`[data-stage="${stage}"]`) as HTMLElement).getBoundingClientRect();
+        for (const [ref, chip] of chips(card, stage)) {
+          const c = chip.getBoundingClientRect();
+          expect.soft(c.left, `${width}px ${stage} ${ref} chip left`).toBeGreaterThanOrEqual(s.left - 1);
+          expect.soft(c.right, `${width}px ${stage} ${ref} chip right`).toBeLessThanOrEqual(s.right + 1);
+        }
+      }
+      expectTagsInsideChips(card);
+    });
+  }
+
   // The tag is 11px text, so it needs WCAG AA's 4.5:1 against what is actually painted under
   // it: the page, the card, the station (raised when pressed) and the chip's own tint, stacked.
   // The canvas does the compositing, so any CSS colour form (oklab, color-mix) resolves.
