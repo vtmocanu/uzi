@@ -7,7 +7,7 @@ SET LOCAL lock_timeout = '5s';
 ALTER TABLE runs
     ADD COLUMN policy_fresh_consumed_generation bigint,
     ADD COLUMN policy_fresh_confirmed_generation bigint;
--- NOT VALID: new and updated rows are checked immediately; migration 417 validates it, per the
+-- NOT VALID: new and updated rows are checked immediately; migration 419 validates it, per the
 -- repo's paired NOT VALID / VALIDATE convention. The pending-with-consumed and consumed-without-
 -- preserving invariants are deliberately not encoded here (an older API writing during a rolling
 -- deploy does not know these columns); the writers and this migration's Down enforce them.

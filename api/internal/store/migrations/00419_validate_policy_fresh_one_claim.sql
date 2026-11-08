@@ -1,5 +1,5 @@
 -- +goose Up
--- Validates the one-claim Fresh shape check that migration 416 added NOT VALID (issue #3607 Mf).
+-- Validates the one-claim Fresh shape check that migration 418 added NOT VALID (issue #3607 Mf).
 ALTER TABLE runs VALIDATE CONSTRAINT runs_policy_fresh_generation_shape;
 
 -- +goose Down
