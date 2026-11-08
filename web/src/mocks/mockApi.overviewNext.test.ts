@@ -182,7 +182,7 @@ describe("overview-next mock scenario", () => {
     for (const id of ["run-ov-own-planning", "run-seeded"]) expect(mine.some((r) => r.id === id), id).toBe(true);
     for (const id of Object.keys(seeded)) expect(factory.some((r) => r.id === id), id).toBe(true);
     for (const id of Object.keys(seeded)) expect([...mine, ...factory].find((r) => r.id === id)?.kind, id).toBe("issue");
-    // The chips' stations: a plan check sits in Planning, a code check in Building.
+    // These seeds' stations: the plan checks sit in Planning, the code checks in Building.
     const stageOf = (id: string) => issueLineStage([...mine, ...factory].find((r) => r.id === id)!, new Set());
     expect(stageOf("run-ov-own-planning")).toBe("planning");
     expect(stageOf("run-ov-lena-planning")).toBe("planning");
@@ -203,15 +203,26 @@ describe("overview-next mock scenario", () => {
 
   // Issue #4082: the seed holds only states the real API can produce: a plan check on a claimed
   // or running run, a code check on a running run. A future impossible entry fails here.
-  it("seeds cross_check_active only on runs the server's predicates allow", async () => {
+  it("seeds cross_check_active only on runs the server's live predicates can match", async () => {
     await freshApi("overview-next");
     const { state } = await import("./store");
     for (const [id, stage] of Object.entries(overviewNextCrossCheckActive)) {
       const run = state.runs.get(id);
       expect(run, id).toBeDefined();
       expect(run!.kind, id).toBe("issue");
-      if (stage === "code") expect(run!.status, id).toBe("running");
-      else expect(["claimed", "running"], id).toContain(run!.status);
+      if (stage === "code") {
+        // GetLiveCodeCrossCheckDeadline: running, code_cross_check_required, not report_only,
+        // not judged not_code, a claude or codex lead.
+        expect(run!.status, id).toBe("running");
+        expect(run!.code_cross_check_required, id).toBe(true);
+        expect(run!.report_only ?? false, id).toBe(false);
+        expect(run!.fix_verdict, id).not.toBe("not_code");
+        expect(["claude", "codex"], id).toContain(run!.harness);
+      } else {
+        // HasLivePlanCrossCheck: claimed or running, plan check required or gated.
+        expect(["claimed", "running"], id).toContain(run!.status);
+        expect(run!.plan_cross_check_required || run!.plan_cross_check_gated === true, id).toBe(true);
+      }
     }
     // The own planning run is mid first turn with no plan, under the plan check.
     expect(state.runs.get("run-ov-own-planning")).toMatchObject({

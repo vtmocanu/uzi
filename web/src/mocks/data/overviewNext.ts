@@ -61,6 +61,7 @@ const otherRuns: Run[] = [
     issue_iid: 91,
     issue_title: "Paginate the audit log export",
     status: "running",
+    code_cross_check_required: true,
     worker_id: "w-mira",
     iteration_count: 1,
     claimed_at: minsAgo(12),
@@ -84,6 +85,7 @@ const otherRuns: Run[] = [
     issue_iid: 97,
     issue_title: "Add a dry-run flag to the importer",
     status: "running",
+    plan_cross_check_required: true,
     is_planning: true,
     worker_id: "w-mira",
     claimed_at: minsAgo(6),
@@ -228,9 +230,11 @@ export const overviewNextRuns: Run[] = [...otherRuns, ...ownLineRuns, ownDuplica
 
 // Issue #4082: the list-only `cross_check_active` value the server joins from a live checker
 // child, standing in for that join. Issue runs only; mockListRuns and mockAdminListRuns read
-// it under this scenario and set null on every other row. Only states the server can produce:
-// a plan check on a claimed or running run, a code check on a running run (the mock test pins
-// this). The chips it drives:
+// it under this scenario and set null on every other row. Each seeded run is in a state the
+// server's live predicates can match (the mock test pins this): a plan check on a claimed or
+// running run with plan_cross_check_required, a code check on a running run with
+// code_cross_check_required (run-seeded gets that flag in store.ts under this scenario only).
+// The chips it drives:
 //   - Planning: run-ov-own-planning (yours, its first plan is being checked) and
 //     run-ov-lena-planning (another user's) read "cross-checking";
 //   - Building: run-seeded (yours, a base fixture, overlaid only here) and run-ov-sam-running

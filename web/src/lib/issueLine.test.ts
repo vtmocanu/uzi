@@ -374,6 +374,17 @@ describe("crossCheckTag", () => {
     });
   });
 
+  it("tags a live code check outside Building too, e.g. a running ci_fix in Other work", () => {
+    const fix = aRun({ kind: "ci_fix", issue_iid: null, status: "running", cross_check_active: "code" });
+    expect(issueLineStage(fix, none)).toBe("other");
+    expect(crossCheckTag(fix, "other")?.title).toBe("Code cross-check in progress (advisory, does not block)");
+  });
+
+  it("lets a recorded gate reason win over a live check in Plan review", () => {
+    const both = aRun({ status: "awaiting_approval", plan_cross_check_gate_reason: "block", cross_check_active: "plan" });
+    expect(crossCheckTag(both, "review")?.text).toBe("cross-check: blocked");
+  });
+
   it("tags another user's run under All users the same way", () => {
     const run = { ...gated("block"), owner_email: "mira@uzi.local" };
     const model = issueLineModel({ ownRuns: [], otherRuns: [run] });
