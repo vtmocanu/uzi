@@ -382,7 +382,20 @@ export class GitLabClient extends HttpForgeClient {
     const res = await this.request("GET", q, p.pat, undefined, signal);
     if (res.status !== 200) return undefined;
     const list = safeJson(await readCapped(res, MR_LIST_MAX_BYTES));
-    if (Array.isArray(list) && list.length > 0) return parseGitlabMr(list[0]);
+    if (!Array.isArray(list)) return undefined;
+    // The project-scoped list also returns MRs opened FROM FORKS into this project, and a
+    // fork can use the same branch name. Adopt only an open MR whose source project is the
+    // target project (both numeric, as GitLab sends them) on exactly these branches; anything
+    // else is not ours, and the create's 409 propagates.
+    for (const item of list) {
+      if (!item || typeof item !== "object") continue;
+      const rec = item as Record<string, unknown>;
+      const src = rec["source_project_id"];
+      if (typeof src !== "number" || src !== rec["target_project_id"]) continue;
+      if (rec["state"] !== "opened") continue;
+      if (rec["source_branch"] !== p.sourceBranch || rec["target_branch"] !== p.targetBranch) continue;
+      return parseGitlabMr(rec);
+    }
     return undefined;
   }
 

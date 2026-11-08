@@ -43,7 +43,8 @@ test("shared fake serves a single MR/PR by iid in all three dialects", { timeout
   }
   const statePath = path.join(scratch, "state.json");
   writeFileSync(statePath, JSON.stringify({
-    mrs: [mr(1, "agent/open", "opened"), mr(2, "agent/merged", "merged"), mr(3, "agent/closed", "closed")],
+    mrs: [mr(1, "agent/open", "opened"), mr(2, "agent/merged", "merged"), mr(3, "agent/closed", "closed"),
+      { ...mr(4, "agent/open", "opened"), project_id: 2 }],
   }));
   const gitRoot = path.join(scratch, "gitroot");
   mkdirSync(gitRoot);
@@ -115,6 +116,18 @@ test("shared fake serves a single MR/PR by iid in all three dialects", { timeout
       assert.equal(res.body.source_branch, branch);
     }
     assert.equal((await get(`${route}/999`)).status, 404);
+  });
+
+  await t.test("GitLab /merge_requests list is project-scoped and carries source/target project ids", async () => {
+    // The worker's duplicate-create lookup (GitLabClient.findOpenMr) adopts only an
+    // own-project MR, so each listed row must name its source and target project.
+    const res = await get("/api/v4/projects/1/merge_requests?state=opened&source_branch=agent%2Fopen&target_branch=main");
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.body.map((m) => m.iid), [1]);
+    assert.equal(res.body[0].source_project_id, 1);
+    assert.equal(res.body[0].target_project_id, 1);
+    const other = await get("/api/v4/projects/2/merge_requests?state=opened&source_branch=agent%2Fopen&target_branch=main");
+    assert.deepEqual(other.body.map((m) => [m.iid, m.source_project_id, m.target_project_id]), [[4, 2, 2]]);
   });
 
   for (const [dialect, name, notFound] of [["v1", "Forgejo", "pull request does not exist"], ["v3", "GitHub", "Not Found"]]) {
