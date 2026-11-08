@@ -242,6 +242,30 @@ export function killRunnerGroup(pid: number | undefined): boolean {
 }
 
 /**
+ * SIGKILL the single process `pid` of a command-root (`runner-cmd`, COMMAND_UID) child.
+ * Under the split the worker cannot signal it directly (EPERM), so it forks a
+ * setpriv-to-runner-cmd `kill` that signals as the same uid. Pid only, never the group: the
+ * caller (issue #4089, `helperUidKillerFor` in rmtree.ts) spawned it non-detached, so it
+ * leads no group of its own. The runner-cmd analogue of {@link killRunnerGroup}'s pid
+ * fallback; `split` is a test seam defaulting to {@link uidSplitActive}.
+ * @returns true if a kill was dispatched; false for an undefined/non-positive pid or a
+ * failed signal.
+ */
+export function killCommandRootPid(pid: number | undefined, split: boolean = uidSplitActive()): boolean {
+  if (pid === undefined || pid <= 0) return false;
+  if (!split) {
+    try {
+      process.kill(pid, "SIGKILL");
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  const r = spawnSync(SETPRIV, [...setprivArgsForUid(COMMAND_UID), "kill", "-KILL", `${pid}`], { env: workerSpawnEnv(), stdio: "ignore" });
+  return r.status === 0;
+}
+
+/**
  * SIGKILL the process GROUP `pgid` and nothing else: unlike {@link killRunnerGroup} there is
  * no fallback to the bare numeric pid, which for a leader that already exited may name an
  * unrelated, recycled process (issue #1656). @returns true if the signal was delivered; false
