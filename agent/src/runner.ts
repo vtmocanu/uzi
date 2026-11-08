@@ -13,7 +13,7 @@ import {
   type PolicyContinuationCause,
 } from "./provider-policy-refusal.js";
 import { isParkAnswer } from "./park-run.js";
-import { TrustedExecutionRefusal, legacyTrustedExecutionRefusal } from "./trusted-execution-refusal.js";
+import { PolicyContextRefusal, TrustedExecutionRefusal, legacyTrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import { AsyncResource } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
@@ -6479,6 +6479,16 @@ export class RunRunner {
       } else if (err instanceof RepoAgentSourceUnavailableError && this.client.protocolFeatures.includes(REPO_AGENT_SOURCE_FEATURE)) {
         await this.enterRepoAgentSourceHold(claim, flight, err, runLog);
         if (err.beforeSeed && flight.parked) await this.settleUnadoptedGuardedClaim(claim, flight, runLog, true);
+      } else if (err instanceof PolicyContextRefusal && !flight.steering.isCancelled()) {
+        // A deterministic context limit cannot drain without model inclusion. Auto-recovery would
+        // capture and reclaim indefinitely. End visibly, retaining the exact source and custody;
+        // these latches authorize no park, publication, release or new provider operation.
+        flight.preserveRecoveryClone = true;
+        flight.preserveSession = true;
+        flight.keepGuardedInventoryOpen = true;
+        flight.stoppedSourceKept = true;
+        flight.sourceExitDenied = true;
+        await this.reportGenericFailure(claim, flight, err, { keepCustody: true });
       } else if (codexDeferralOf(err) !== undefined) {
         // Codex credentials were deferred by a vault lock, an unknown boundary refresh,
         // or exhausted epoch-start release retries. Vault locks also arise mid-turn.
@@ -15135,9 +15145,15 @@ export class RunRunner {
       claim.policy_fresh_session === true || claim.policy_saved_work_head !== undefined;
     const policyFreshContext = policyOwnerContinuation && !sessionId;
     if (policyFreshContext && priorOwnerHistory.status !== "complete") {
-      // A human approval cannot replace missing owner context. Reuse the bounded recovery path,
-      // preserving the source, rather than start a model turn with truncated/unknown history.
-      throw new TransientRecoveryError("policy continuation owner history could not be restored completely");
+      // The whole snapshot is over bound, never a truncated prefix. It cannot self-heal by
+      // reclaiming; the terminal wrapper keeps the source and unincluded guidance for recovery.
+      if (priorOwnerHistory.status === "over_bound") throw new PolicyContextRefusal("history_over_bound");
+      // A read failure may self-heal. This existing timer park has a capped cadence, not a
+      // lifetime retry bound; disclose it rather than misrepresenting an owner-only hold.
+      const detail = "Policy continuation not started: owner history could not be read. No model turn was sent. " +
+        "Work and owner guidance are preserved; automatic recovery retries continue with capped backoff. Cancel the run to stop retries.";
+      batcher.emit({ kind: "status", agent: "worker", payload: { text: detail } });
+      throw new TransientRecoveryError(detail);
     }
 
     // PRD #1064 M1 (Decision 1): ONE per-run promise chain serializing EVERY `running`

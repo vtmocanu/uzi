@@ -70,7 +70,7 @@ import { FakeApi } from "./fake-api.js";
 import { makeFixture } from "./fixture-repo.js";
 import { leadRequestCaseAgents, makeClaim, testGitCacheOptions, recordingLogger, withReceipts } from "./helpers.js";
 import { configureGoConcurrency } from "../src/go-concurrency.js";
-import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
+import { PolicyContextRefusal, TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { PlanRevisionRecovery } from "../src/plan-revision-retry.js";
 import { WORKER_UID, RUNNER_UID, runnerCommand, commandRootCommand } from "../src/runner-uid.js";
@@ -29813,6 +29813,8 @@ describe("compact policy hold: fake-provider continuation matrix (production run
     runId?: string;
     issueIid?: number;
     historyUnavailable?: boolean;
+    liveInputs?: { id: number; body: string }[];
+    retainEvidence?: TestContext;
   }
 
   async function drive(o: Drive) {
@@ -29833,7 +29835,28 @@ describe("compact policy hold: fake-provider continuation matrix (production run
     api.setOwnershipStatus(runId, "running", claim.claim_generation!);
     if (o.earlier) api.overrideFollowUps(runId, 200, { inputs: o.earlier.map(e => ({ id: e.id, kind: "follow_up", body: e.body })) });
     if (o.historyUnavailable) api.overrideFollowUps(runId, 503, { error: "history unavailable" });
-    if (o.guidance) api.setInputs(runId, [{ id: GUIDANCE_ID, kind: "follow_up", body: GUIDANCE }]);
+    if (o.liveInputs) api.setInputs(runId, o.liveInputs.map(row => ({ ...row, kind: "follow_up" })));
+    else if (o.guidance) api.setInputs(runId, [{ id: GUIDANCE_ID, kind: "follow_up", body: GUIDANCE }]);
+    let sourcePath: string | undefined;
+    let sourceJournal: string | undefined;
+    let sourceBranch: string | undefined;
+    let custodyOpen = true;
+    const attach = m2Runner.git.createOrAttachRunnerClone.bind(m2Runner.git);
+    o.retainEvidence?.mock.method(m2Runner.git, "createOrAttachRunnerClone", async (...args: Parameters<typeof attach>) => {
+      const clone = await attach(...args);
+      sourcePath = clone.path;
+      sourceBranch = clone.branch;
+      await fs.writeFile(path.join(clone.path, "CONTEXT-RETAIN.txt"), "unfinished context work\n");
+      await m2Runner.git.markRecoveryCapture(args[0], clone.path, clone.branch, runId, clone.attemptId);
+      sourceJournal = spawnSync("git", ["-C", args[0], "config", `uzi-recovery.${clone.branch}.clone`],
+        { env: gitEnv(), encoding: "utf8" }).stdout.trim();
+      assert.ok(sourceJournal, "the test has a real source journal to preserve");
+      return clone;
+    });
+    o.retainEvidence?.mock.method(client, "releaseRecoveryCustody", async () => {
+      custodyOpen = false;
+      return { run_id: runId, released: true, holds_released: 1 };
+    });
     const inputHold = o.holdFirstInputGet ? api.holdNextInputGet(runId) : undefined;
     let inputBarrierObserved = false;
     const awaitDelivery = SteeringChannel.prototype.awaitInitialDelivery;
@@ -29852,8 +29875,14 @@ describe("compact policy hold: fake-provider continuation matrix (production run
     const holds: PolicyHoldRequest[] = [];
     const verifies: { claim_generation: number; required_head: string }[] = [];
     const states: StateRequest[] = [];
+    const acknowledgedStates: string[] = [];
     const reportState = client.reportState.bind(client);
-    client.reportState = async (...args) => { states.push(structuredClone(args[1])); return reportState(...args); };
+    client.reportState = async (...args) => {
+      states.push(structuredClone(args[1]));
+      const ack = await reportState(...args);
+      if (ack.status) acknowledgedStates.push(ack.status);
+      return ack;
+    };
     client.reportPolicyHold = async (_id, body) => {
       holds.push(structuredClone(body));
       events.push(`hold:${body.cause}`);
@@ -29922,6 +29951,22 @@ describe("compact policy hold: fake-provider continuation matrix (production run
         docker: { state: "not_wired", removed: [], detail: "not wired" } }),
       ...(o.dockerHost ? { dockerHost: o.dockerHost } : {}),
     });
+    // Observe the safety boundary before generic terminal disposal, not only the final files:
+    // existing retained journals can independently keep a synthetic fixture's source. The wrapper
+    // must also protect non-retained Fresh shapes and disallow custody settlement at this boundary.
+    type RetentionState = { preserveRecoveryClone: boolean; preserveSession: boolean;
+      keepGuardedInventoryOpen: boolean; stoppedSourceKept: boolean; sourceExitDenied: boolean };
+    const terminalRetention: Array<RetentionState & { keepCustody: boolean }> = [];
+    const fail = Reflect.get(runner, "reportGenericFailure").bind(runner) as
+      (claim: ClaimResponse, flight: RetentionState, error: unknown, options?: { keepCustody?: boolean }) => Promise<void>;
+    if (o.retainEvidence) Reflect.set(runner, "reportGenericFailure", async (c: ClaimResponse,
+      f: RetentionState, error: unknown, options?: { keepCustody?: boolean }) => {
+      if (error instanceof PolicyContextRefusal) terminalRetention.push({ preserveRecoveryClone: f.preserveRecoveryClone,
+        preserveSession: f.preserveSession, keepGuardedInventoryOpen: f.keepGuardedInventoryOpen,
+        stoppedSourceKept: f.stoppedSourceKept, sourceExitDenied: f.sourceExitDenied,
+        keepCustody: options?.keepCustody === true });
+      return fail(c, f, error, options);
+    });
     try {
       await withTimeout(runner.execute(claim), 30000, "matrix run");
     } finally {
@@ -29936,6 +29981,7 @@ describe("compact policy hold: fake-provider continuation matrix (production run
       routes: requests.filter(r => r.method === "thread/start" || r.method === "thread/resume").map(r => r.method),
       prompts: requests.filter(r => r.method === "turn/start").map(r => String((rec(r.params).input as { text?: string }[])[0]?.text)),
       notices: api.messages(runId).map(m => String(rec(m.payload).event)),
+      messages: api.messages(runId), sourcePath, sourceJournal, sourceBranch, custodyOpen, acknowledgedStates, terminalRetention,
     };
   }
   type Result = Awaited<ReturnType<typeof drive>>;
@@ -30111,7 +30157,35 @@ describe("compact policy hold: fake-provider continuation matrix (production run
     assert.deepEqual(r.prompts, []);
     assert.equal(r.states.some(s => s.status === "failed"), false, "history loading failure preserves the continuation");
     assert.ok(r.states.some(s => s.status === "recovery_wait"));
+    assert.match(JSON.stringify(r.messages), /owner history could not be read.*automatic recovery retries/i);
   });
+
+  for (const blocked of ["live backlog", "history over bound"] as const) {
+    it(`policy context terminal refusal retains ${blocked} source, journal and custody`, async t => {
+      const r = await drive({ claim: () => ({ plan_approved: false, plan_md: null, session_id: null,
+        policy_resume_context_pending: true, policy_resume_inputs_pending: true }),
+        guidance: blocked === "live backlog", retainEvidence: t,
+        ...(blocked === "live backlog" ? { liveInputs: [{ id: 30, body: "A".repeat(MAX_FOLLOW_UP_BATCH_RUNES) },
+          { id: GUIDANCE_ID, body: GUIDANCE }] } : { earlier: [{ id: 21, body: "A".repeat(MAX_FOLLOW_UP_BATCH_RUNES + 1) }] }) });
+      assert.equal(r.prompts.length, 0, "no model turn was sent");
+      assert.equal(r.states.filter(s => s.status === "failed").length, 1, "a real terminal state acknowledgement");
+      assert.equal(r.acknowledgedStates.filter(s => s === "failed").length, 1, "the failed report was actually acknowledged");
+      assert.equal(r.states.some(s => s.status === "recovery_wait"), false, "never automatically requeued");
+      assert.match(r.states.find(s => s.status === "failed")?.failure_reason ?? "", /No model turn was sent.*guidance is preserved.*successor.*manually/s);
+      assert.deepEqual(r.events.filter(e => e.startsWith("included:")), [], "no fabricated inclusion");
+      assert.equal(m2Runner.api.isInputIncluded(r.runId, GUIDANCE_ID), false, "the API has no model-inclusion receipt");
+      assert.equal(r.custodyOpen, true, "the custody release endpoint was never used");
+      assert.deepEqual(r.terminalRetention, [{ preserveRecoveryClone: true, preserveSession: true,
+        keepGuardedInventoryOpen: true, stoppedSourceKept: true, sourceExitDenied: true, keepCustody: true }],
+        "retention must be established before generic failure can settle custody or retire the source");
+      assert.ok(r.sourcePath && r.sourceJournal);
+      assert.equal(await fs.readFile(path.join(r.sourcePath, "CONTEXT-RETAIN.txt"), "utf8"), "unfinished context work\n");
+      const bare = m2Runner.git.barePathFor(m2Runner.fx.originPath);
+      const journal = spawnSync("git", ["-C", bare, "config", `uzi-recovery.${r.sourceBranch}.clone`],
+        { env: gitEnv(), encoding: "utf8" }).stdout.trim();
+      assert.equal(journal, r.sourceJournal, "the actual bare journal is unchanged");
+    });
+  }
 
   it("policy initial planning retry before model evidence keeps its guidance and receipts once", async t => {
     const r = await drive({ claim: head => ({ ...preserving()(head), plan_approved: false, plan_md: null }),
@@ -30287,7 +30361,7 @@ it("policy initial planning refuses a backlog that could exclude the latest Resu
       followUpIncluded: id => { included.push(id); },
     });
     await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), error =>
-      error instanceof TransientRecoveryError && error.message.includes("first-turn context budget"), overflow);
+      error instanceof TrustedExecutionRefusal && error.message.includes("context budget"), overflow);
     assert.equal(rig.transport.turnStartCount, 0, "do not plan from a prefix that may omit the latest correction");
     assert.deepEqual(included, [], "overflow is never acknowledged as model inclusion");
   }

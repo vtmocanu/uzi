@@ -6,6 +6,18 @@ export class TrustedExecutionRefusal extends Error {
   }
 }
 
+/** A deterministic owner-context limit, not a provider failure or retryable read error.
+ * The runner must retain source and custody before reporting this terminal refusal. */
+export class PolicyContextRefusal extends TrustedExecutionRefusal {
+  constructor(kind: "live_guidance_over_bound" | "history_over_bound") {
+    super(`Policy continuation not started: ${kind === "live_guidance_over_bound"
+      ? "queued owner guidance exceeds the first planning request's context budget"
+      : "earlier owner history exceeds the first request's context budget"}. ` +
+      "No model turn was sent. Owner guidance is preserved. Start a smaller successor and carry the guidance over manually; it is not replayed automatically.");
+    this.name = "PolicyContextRefusal";
+  }
+}
+
 // Verbatim fixed reasons from the committed execution-refusal catalogue and runner controls.
 // Raw filesystem, provider and transport detail is never a reason by itself.
 const FIXED_REASONS = new Set<string>([

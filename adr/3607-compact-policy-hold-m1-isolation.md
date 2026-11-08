@@ -445,10 +445,22 @@ inclusion, excluding superseded rows and blank-only bodies under
 start, session reuse or broader scope. They add no schema or capability; older
 workers ignore them and older APIs omit them, so both updated sides are needed.
 
-Unknown or over-budget owner history, or a live backlog whose first bounded batch
-could omit the current correction, defers through the existing recovery path
-before a model request. Work and unincluded input rows remain preserved; the
-worker never silently plans from truncated owner context.
+Owner decision (2026-11-08, option B): over-budget owner history, or a live backlog
+whose first bounded batch could omit the current correction, ends as a distinct
+terminal refusal before a model request. The worker retains the source, session,
+journal and custody, and sends no inclusion receipt. The owner must arrange a
+smaller successor and carry guidance over manually; another run does not inherit
+these input rows automatically. This adds no pause authority, schema or wire
+field, and never disguises the refusal as a provider, idle or credential failure.
+
+Unavailable history remains a transient read failure that can self-heal, with a
+distinct worker status message and Cancel advice. Ordinary recovery has no
+lifetime retry bound: the default backoff is 1, 2, 4, 8, 16, then 30 minutes per
+park, plus 5 to 30 seconds of jitter. Operators can configure those durations.
+Each claim can repeat capture, checkpoint publication and custody work; it is not
+an owner-only hold or a journal-only retry. The owner can Cancel to stop retries.
+Work and unincluded inputs remain preserved; the worker never silently plans from
+truncated or unknown owner context. A dedicated bounded context hold is deferred.
 
 ### R/VG/VH continuity: the required head moves only on verified publication
 

@@ -63,7 +63,7 @@ import { ownedSummaryFactories, ownedSummaryHarnesses, summaryCallDeadlines, sum
 import { MaintenanceBudget } from "../maintenance-budget.js";
 import { chunkedTimeout } from "../chunked-timeout.js";
 import { CI_EVIDENCE_READ, readCIEvidence, ciEvidencePrompt } from "../ci-evidence-tools.js";
-import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
+import { PolicyContextRefusal, TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
 import { checkedImplementationContext, nextAutomaticRound, validateCheckedPlanBundle } from "../checked-plan.js";
 import { recordRoot, type RecordedRoot, type StartTimeReader } from "../worker-spawn-mark.js";
 import path from "node:path";
@@ -4041,7 +4041,7 @@ export class CodexExecutor implements Executor {
               const overflow = ctx.pullFollowUps?.(0, true);
               if ((ownerBatch?.reduce((n, f) => n + followUpRunes(f.body), 0) ?? 0) > MAX_FOLLOW_UP_BATCH_RUNES || overflow?.length) {
                 if (overflow?.length) ownerBatch = [...(ownerBatch ?? []), ...overflow];
-                throw new TransientRecoveryError("policy planning owner inputs exceed the first-turn context budget");
+                throw new PolicyContextRefusal("live_guidance_over_bound");
               }
             }
             const ownerRides = policyPlanPending ? ownerBatch : undefined;
