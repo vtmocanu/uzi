@@ -140,7 +140,7 @@ import type {
 import { resolveAgentSelection, RUN_KINDS } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
-import { RecoveryCoordinator, PredecessorAuthorityLost, canonicalJson, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, inventoryProcessDiagnostic, type ClosedSourceObservation, type InventorySourceBoundaryContext, type InventorySourceDiagnostic, type CompletionSource, type DurableCompletionRetirement, type HandoffRetirement, type RetainedBoundaryReason, type RecoveryRecord, type PredecessorMeasurements, type RecoveryOutcome, type RecoveryCoordinatorOptions, type OperatorRequestSignals, type DescribeLocalRecordsResult, type ResolveLocalRecordResult } from "./recovery.js";
+import { RecoveryCoordinator, PredecessorAuthorityLost, restorePredecessorHolds, canonicalJson, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, inventoryProcessDiagnostic, type ClosedSourceObservation, type InventorySourceBoundaryContext, type InventorySourceDiagnostic, type CompletionSource, type DurableCompletionRetirement, type HandoffRetirement, type RetainedBoundaryReason, type RecoveryRecord, type PredecessorMeasurements, type RecoveryOutcome, type RecoveryCoordinatorOptions, type OperatorRequestSignals, type DescribeLocalRecordsResult, type ResolveLocalRecordResult } from "./recovery.js";
 import { classifyRecoveryOrigin } from "./recovery-origin.js";
 import {
   PUSHED_HEAD_UNRECORDED,
@@ -2656,6 +2656,9 @@ interface RunFlight {
   /** The HOME the flight's executor was built on. Reassigned exactly once, by an independent restore's executor swap
    *  (`swapRestoreExecutor`), to the successor's `<runId>.g<N>` HOME; every consumer reads the flight's CURRENT value. */
   runHome: string | undefined;
+  /** issue #3644: `swapRestoreExecutor` installed the successor's executor. executeClaimInAttempt's local `executor` is refreshed only
+   *  after phaseClone returns, so its catch and finally re-read `flight.executor` when this is set. */
+  restoreExecutorSwapped?: boolean;
   /** Issue #3870: this claim's managed Go work leaf (`<runHome>/.uzi-go-work/g<gen>`), set in
    *  phasePreflightHandoff for a Claude flight only; undefined when none was prepared. */
   managedGoWorkDir?: string;
@@ -3135,7 +3138,8 @@ export interface RunnerOptions {
   /** issue #3644 m4a: how this process's live identity is re-read for the restore predicate (tests inject a procfs root and
    *  hostname). Absent: the real procfs, with the pod uid and container from the environment. */
   restoreIdentity?: LiveIdentityOptions;
-  /** issue #3644 m4b: whether an eligible restore verdict seeds a fresh attempt from the verified pin (default true). Off, an
+  /** TEST-ONLY (no configuration or environment variable sets it). issue #3644 m4b: whether an eligible restore verdict seeds a
+   *  fresh attempt from the verified pin (default true). Off, an
    *  eligible verdict stops the claim exactly as a refusal does: nonterminal, nothing written, never the legacy path. */
   independentRestore?: boolean;
   memoryRuntime?: WorkerMemoryRuntime;
@@ -4511,6 +4515,13 @@ export class RunRunner {
     const inventory = await read();
     if (inventory.kind !== "verified")
       return fail("inventory_read_not_verified", { check: "inventory_read_not_verified", cause: inventoryReadCause(inventory) });
+    // issue #3644 3.9: the retained restore predecessor is excluded from `clones` (it is opaque), so without this its generation
+    // would prove "empty" the moment the successor stopped executing. This is the one source proof of the ordinary boundary, the
+    // predecessor boundary (a restore predecessor is never settled through it either) and the recovery coordinator's FINAL.
+    if (restorePredecessorHolds(inventory, context.generation)) {
+      this.log.warn("recovery: restore predecessor retained; source boundary refused", { run_id: runId, generation: context.generation });
+      return fail("physical_sources_without_boundary", { check: "physical_sources_without_boundary" });
+    }
     const identity = JSON.stringify({ heads: inventory.heads, clones: inventory.clones });
     if (state.sourceIdentity !== undefined && state.sourceIdentity !== identity) return fail("source_identity_changed", { check: "source_identity_changed" });
     state.sourceIdentity = identity;
@@ -6659,8 +6670,11 @@ export class RunRunner {
       // the boundary's expiring signal, so a near-deadline MR cannot become a failed run.
       await postFinalizeTerminal?.();
     } catch (err) {
+      // A refusal after the restore swap (phaseClone never returned) must act on the successor's executor, not the disposed one.
+      if (flight.restoreExecutorSwapped) executor = flight.executor;
       await dispatchFailure(err, true);
     } finally {
+      if (flight.restoreExecutorSwapped) executor = flight.executor;
       flight.forgeCloneSuccess?.abort();
       if (flight.policyHold) {
         flight.preserveRecoveryClone = true;
@@ -7312,6 +7326,8 @@ export class RunRunner {
               bareForRead = bare;
               const first = await readSources();
               if (first.kind !== "verified" || process.platform !== "linux") return false;
+              // issue #3644 3.9: a report of a generation at or below a retained restore predecessor's is never retired.
+              if (restorePredecessorHolds(first, generation)) return false;
               const identity = JSON.stringify(first);
               for (const head of first.heads) if (!laterHead(head) && !await covered(head)) return false;
               // Each complete content inspection is bracketed by process observations.
@@ -27247,7 +27263,7 @@ export class RunRunner {
     this.retainedLifecycleGuard(flight);
     if (!outcome.eligible) return this.refuseRestoreRoute(claim, flight, outcome.reason, outcome.known);
     if (!this.independentRestore) {
-      flight.runLog.info("independent restore eligible; seeding disabled by configuration", {
+      flight.runLog.info("independent restore eligible; seeding disabled for this runner instance", {
         verdict: outcome.verdict.boundary, pin_generation: outcome.verdict.generation, source_sha: outcome.verdict.pin.sourceSha,
         slot: outcome.known.slot, cross_check: outcome.known.crossCheck, claim_generation: claim.claim_generation });
       throw new RestoreRouteStop();
@@ -27299,8 +27315,8 @@ export class RunRunner {
   /**
    * issue #3644 plan 3.6 (ii): the successor's executor and HOME, installed BEFORE the seed so the seed's own quiescence uses
    * them and nothing of the predecessor's HOME is ever reachable from the flight again. Built at `{generation}` (HOME
-   * agent-home/<runId>.g<N>, provision/<runId>.g<N>); the initial executor is disposed the way the retained-capture handoff
-   * disposes a Codex executor; the governor's cache target is rebound through `drainThenBind`, so a callback still holding the old
+   * agent-home/<runId>.g<N>, provision/<runId>.g<N>); a Codex (safety-bearing) initial executor is disposed BEFORE the
+   * successor is installed, the way the retained-capture handoff disposes one (a Claude executor has nothing to dispose); the governor's cache target is rebound through `drainThenBind`, so a callback still holding the old
    * (or no) target finishes before the pair changes. A factory that hands back the predecessor's HOME refuses. On any failure
    * before the installation the flight and the target are untouched.
    */
@@ -27311,13 +27327,20 @@ export class RunRunner {
     if (initialHome !== undefined && built.homeDir === initialHome) throw new Error("the successor executor was built on the predecessor's HOME");
     const next = publicationOnlyExecutor(claim, built.executor);
     const prior = flight.executor;
-    if (prior.safety) {
-      await prior.closeAndSettlePlanSummary?.(this.codexBoundaryDeadlineMs);
-      const disposal = await prior.safety.dispose({ boundary: "shutdown", deadlineMs: this.codexBoundaryDeadlineMs });
-      if (disposal.kind !== "disposed") throw new Error("the initial executor could not be disposed");
+    try {
+      if (prior.safety) {
+        await prior.closeAndSettlePlanSummary?.(this.codexBoundaryDeadlineMs);
+        const disposal = await prior.safety.dispose({ boundary: "shutdown", deadlineMs: this.codexBoundaryDeadlineMs });
+        if (disposal.kind !== "disposed") throw new Error("the initial executor could not be disposed");
+      }
+      this.retainedLifecycleGuard(flight);
+    } catch (error) {
+      // Built but never installed: nothing else owns it, so it is disposed here (best effort, bounded by the boundary deadline).
+      await next.safety?.dispose({ boundary: "shutdown", deadlineMs: this.codexBoundaryDeadlineMs }).catch(() => undefined);
+      throw error;
     }
-    this.retainedLifecycleGuard(flight);
     flight.executor = next;
+    flight.restoreExecutorSwapped = true;
     flight.runHome = built.homeDir;
     this.registerEvidenceExecutor(flight);
     if (flight.cacheTarget && built.homeDir !== undefined && !next.safety)
@@ -27363,6 +27386,15 @@ export class RunRunner {
     const refuse: (reason: string, extra?: RestoreKnown, left?: { window: string; step: string }) => never = (reason, extra = {}, left) =>
       this.refuseRestoreRoute(claim, flight, reason, { ...known, ...extra }, left);
     const isControl = (error: unknown): boolean => error instanceof RetainedRecoveryStop || error instanceof CredentialSwitchSignal;
+    // The legacy handoff confirms ownership after adoption and before swapping the executor (confirmPostAdoptionOwnership, with
+    // its transient-read retry). The same proof comes BEFORE the first durable restore write, so a claim the server has moved
+    // stops nonterminally with nothing written: no marker, no ledger entry, no restore entry.
+    try { await this.confirmPostAdoptionOwnership(flight, Date.now() + this.codexBoundaryDeadlineMs, this.retainedLifecycleSignal(flight)); }
+    catch (error) {
+      this.retainedLifecycleGuard(flight);
+      if (isControl(error)) throw error;
+      refuse("ownership_unconfirmed", { detail: sanitizeForLog(errMessage(error)) });
+    }
     try { await this.swapRestoreExecutor(claim, flight); }
     catch (error) {
       this.retainedLifecycleGuard(flight);
@@ -27423,13 +27455,7 @@ export class RunRunner {
             if (!proof.blocked) return;
             // attemptSeedOptions tolerates an unreadable, unattributed runner-uid process because a FRESH attempt path moves and frees
             // nothing. Here such a process could be the retained predecessor's, which must be neither killed nor ignored, so this
-            // seed does not take the relaxation: only a positive proof lets it proceed.
-            if (protectedMarkers.length === 0 && unverifiedOnlyByUnattributedUnreadable(proof.outcome.process)) {
-              flight.sourceJoinFailed = true;
-              flight.runLog.warn("attempt seed: unattributable unreadable runner-uid process(es); seeding the fresh path, no retention deletion this seed", {
-                site: "attempt_seed", processes: describeProcesses(proof.outcome.process), root_context: describeRootContext(proof.outcome.process) });
-              return;
-            }
+            // seed never takes that relaxation: only a positive proof lets it proceed.
             throw new RunResidueBlockedError(proof.outcome.process?.detail ?? "not quiescent");
           },
           onSeeded: clonePath => {
@@ -27474,6 +27500,9 @@ export class RunRunner {
     flight.publishedTip = flight.publicationFloor.kind === "pinned" ? flight.publicationFloor.oid : undefined;
     flight.checkpointFloor = flight.publishedTip;
     try {
+      // The legacy handoff's re-check after adoption, mirrored: the server may have moved the claim while the seed ran. The seed
+      // is already durable, so a lost claim stops with S kept (the catch below); the live restore entry refuses later claims.
+      await this.confirmPostAdoptionOwnership(flight, Date.now() + this.codexBoundaryDeadlineMs, lifecycle);
       await this.bindFlightSource(flight, seeded.path);
       await this.git.markRecoveryCapture(bare, seeded.path, flight.branch, runId, attemptId);
       await this.inFlightAuthority(flight, () => this.withRemediationLifecycle(lifecycle, async () => {
@@ -27488,12 +27517,14 @@ export class RunRunner {
         seededHead, claim_generation: claim.claim_generation });
       flight.batcher.emit({ kind: "status", agent: "worker", payload: { text: "independent restore: a fresh attempt was seeded from the verified pin" } });
     } catch (error) {
-      this.retainedLifecycleGuard(flight);
-      if (isControl(error)) throw error;
+      // The seed is durable: whatever stops the flight from here (a control error included) keeps S and its custody, so the
+      // preserve flags are set before anything is rethrown.
       flight.preserveRecoveryClone = true;
       flight.preserveSession = true;
       flight.retainedLocalCustody = true;
       flight.keepGuardedInventoryOpen = true;
+      this.retainedLifecycleGuard(flight);
+      if (isControl(error)) throw error;
       flight.runLog.warn("independent restore: the seeded attempt could not be handed to the flight; stopping with it kept",
         formatRetainedRecoveryDiagnostic(error, flight.redactText));
       throw new RestoreRouteStop({ cause: error });
@@ -28208,7 +28239,13 @@ export class RunRunner {
       scopeDeadline - this.predecessorFinalBudget.settlementMarginMs);
     if (capDeadline <= startedAt) return skip("budget");
     let candidates: RecoveryRecord[];
-    try { candidates = await this.recovery.predecessorRecords(claim.run_id, flight.claimGeneration); }
+    try {
+      // issue #3644 3.9: a restore predecessor's generations (and any below) are never settled, exempted or finalized through
+      // this pass: their hold closes only by owner discard or the server's verified-merge discard.
+      candidates = [];
+      for (const record of await this.recovery.predecessorRecords(claim.run_id, flight.claimGeneration))
+        if (!await this.git.restoreKeepsRecoveryRef(bare, claim.run_id, { generation: record.generation })) candidates.push(record);
+    }
     catch (error) {
       this.retainedLifecycleGuard(flight);
       if (passthrough(error)) throw error;

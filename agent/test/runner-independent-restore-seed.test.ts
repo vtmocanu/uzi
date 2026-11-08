@@ -11,7 +11,7 @@ import fsp from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { afterEach, beforeEach, describe, it, mock } from "node:test";
+import { afterEach, beforeEach, describe, it, mock, type TestContext } from "node:test";
 import type { Executor } from "../src/executor.js";
 import { StubExecutor } from "../src/executor.js";
 import { AuthorityRuntime } from "../src/authority-runtime.js";
@@ -207,7 +207,8 @@ describe("the restored attempt completes through the certified completion path (
     return gitIn(dir, ["rev-parse", "HEAD"]);
   }
 
-  it("retires S under its certified receipt: the entry becomes a tombstone, P's key and slot are never cleared, and a restart changes nothing", async t => {
+  /** The certified completion of a restored attempt (P unpinned work, S through checkpoint, PR and receipt). Returns the rig and the facts. */
+  async function completeRestore(t: TestContext) {
     api.setRegisterProtocolFeatures(FEATURES);
     const forge = fakeGitlab();
     let finalHead = "", checkpointHead = "", clone = "";
@@ -282,6 +283,11 @@ describe("the restored attempt completes through the certified completion path (
     assert.equal(api.states.filter(s => s.body.status === "completed").length, 1);
     assert.equal(logged(r, "independent restore seeded").length, 1);
     await r.runner.resumePendingRecoveries();
+    return { r, claim, clone, before, checkpointHead, finalHead, retires, registration };
+  }
+
+  it("retires S under its certified receipt: the entry becomes a tombstone, P's key and slot are never cleared, and a restart changes nothing", async t => {
+    const { r, claim, clone, before, checkpointHead, finalHead, retires } = await completeRestore(t);
     const sRetire = retires.mock.calls.filter(c => (c.arguments[1] as string) === clone);
     assert.ok(sRetire.length >= 1, "S's clone was retired");
     assert.ok(sRetire.some(c => (c.arguments[4] as { completionSource?: unknown }).completionSource !== undefined), "through the certified completion source");
@@ -311,6 +317,111 @@ describe("the restored attempt completes through the certified completion path (
     assert.deepEqual(await pFacts(r), after.p);
     assert.equal(fs.readFileSync(markerFile(r), "utf8"), after.marker);
     assert.equal(cfgGet(r, r.journalKey), before.journal, "P's key is never cleared");
+  });
+
+  // ---- 3.9: the predecessor's generation G stays held after S has stopped executing ------------------------------------------
+  const SYNTHETIC_G = (r: Rig, generation: number | undefined): RecoveryRecord => ({
+    runId: r.runId, generation, captureId: randomUUID(), sourceSha: r.pinSha, inventoryGuarded: true,
+    coverageContext: { barePath: r.bare } } as unknown as RecoveryRecord);
+
+  /** The boundary proof exactly as FINAL enters it: the runner's ordinary inventory source boundary. */
+  async function boundary(runner: Rig["runner"], r: Rig, generation: number): Promise<{ result: string; checks: string[] }> {
+    const checks: string[] = [];
+    const result = await (runner as unknown as { withInventorySourceBoundary(c: unknown, a: (p: () => Promise<boolean>) => Promise<void>): Promise<string> })
+      .withInventorySourceBoundary({ runId: r.runId, generation, barePath: r.bare, reportDiagnostic: (d: { check: string }) => { checks.push(d.check); } },
+        async prove => { await prove(); });
+    return { result, checks };
+  }
+
+  it("G stays held after S completes: the boundary, ancestry, unadopted settlement and report retirement refuse for G, S's own generation settles, and a restart changes nothing", async t => {
+    const { r, claim } = await completeRestore(t);
+    const tombstone = restoreValue(r);
+    assert.equal(tombstone.kind, "tombstone", "S has stopped executing and is retired");
+    // Only the opaque predecessor's attribution is left: the inventory reports it and nothing else.
+    const inventory = await git.readInventoryCloneHeads(r.bare, r.runId);
+    assert.equal(inventory.kind, "verified");
+    if (inventory.kind !== "verified") return;
+    assert.deepEqual(inventory.clones, []);
+    assert.deepEqual(inventory.retainedPredecessors?.map(p => [p.clonePath, p.generation]), [[r.pPath, 1]]);
+
+    const checkAll = async (runner: Rig["runner"]): Promise<void> => {
+      const g = await boundary(runner, r, 1);
+      assert.equal(g.result, "retained", "FINAL's source boundary refuses P's generation");
+      assert.deepEqual(g.checks, ["physical_sources_without_boundary"]);
+      const n = await boundary(runner, r, claim.claim_generation!);
+      assert.equal(n.result, "passed", "S's own generation proves empty");
+      assert.deepEqual(n.checks, []);
+      const coordinator = (runner as unknown as { recovery: { frozenSourceAncestry(rec: RecoveryRecord, owed: unknown[]): Promise<string> } }).recovery;
+      assert.equal(await coordinator.frozenSourceAncestry(SYNTHETIC_G(r, 1), []), "unproven", "ancestry of P's generation is never proven");
+      assert.equal(await coordinator.frozenSourceAncestry(SYNTHETIC_G(r, claim.claim_generation!), []), "verified", "S's generation still is");
+    };
+    await checkAll(r.runner);
+
+    // The coordinator's own callback-free boundary (no runner wiring) refuses the predecessor's generation the same way.
+    {
+      const coordinator = r.recovery() as unknown as { withInventorySourceBoundary: unknown;
+        inventorySourceBoundary(c: unknown, a: (p: () => Promise<boolean>) => Promise<void>): Promise<string> };
+      const wired = coordinator.withInventorySourceBoundary;
+      coordinator.withInventorySourceBoundary = undefined;
+      try {
+        const run = (generation: number) => coordinator.inventorySourceBoundary({ runId: r.runId, generation, barePath: r.bare }, async prove => { await prove(); });
+        assert.equal(await run(1), "retained");
+        assert.equal(await run(claim.claim_generation!), "passed");
+      } finally { coordinator.withInventorySourceBoundary = wired; }
+    }
+
+    // The unadopted-generation settlement: no record, no owed candidate and no clone, yet P's generation keeps its hold.
+    const records = await r.recovery().inspect(r.runId);
+    for (const rec of records) fs.rmSync(recordFile(r, rec), { force: true });
+    let openGeneration = 1;
+    const released: number[] = [];
+    client.listRecoveryHolds = async runId => ({ run_id: runId, holds: [{ hold_id: randomUUID(), generation: openGeneration, inventory_guarded: true,
+      has_available_capture: false }] });
+    client.releaseRecoveryCustody = async (runId, generation) => {
+      released.push(generation as number);
+      return { run_id: runId, generation, released: true, holds_released: 1 };
+    };
+    assert.equal(await r.recovery().settleUnadoptedGuardedGeneration({ runId: r.runId, generation: 1, barePath: r.bare }), "retained");
+    assert.deepEqual(released, [], "no release for P's generation");
+    openGeneration = claim.claim_generation!;
+    assert.equal(await r.recovery().settleUnadoptedGuardedGeneration({ runId: r.runId, generation: openGeneration, barePath: r.bare }), "settled");
+    assert.deepEqual(released, [openGeneration], "S's own generation is released");
+
+    // Report retirement: both modes' source inspection refuses P's generation and accepts S's.
+    const inspections: Array<[string, number, boolean]> = [];
+    const budget = { signal: new AbortController().signal, deadline: Date.now() + 60_000 };
+    for (const mode of ["retireAcknowledgedFinalReport", "retireArchivedReport"] as const) {
+      mock.method(r.recovery(), mode, (async (_run: string, generation: number, b: typeof budget, _reserve: unknown,
+        inspect: (bare: string, covered: (h: string) => Promise<boolean>, later: (h: string) => boolean) => Promise<boolean>) => {
+        inspections.push([mode, generation, await git.withReportProofBudget(b, () => inspect(r.bare, async () => true, () => false))]);
+      }) as never);
+    }
+    for (const generation of [1, claim.claim_generation!])
+      await (r.runner as unknown as { retireRecoveryReport(...a: unknown[]): Promise<unknown> })
+        .retireRecoveryReport(r.runId, generation, { expectedIdentity: {} }, "terminal", {});
+    assert.deepEqual(inspections.filter(i => i[1] === 1).map(i => i[2]), [false, false], JSON.stringify(inspections));
+    // (The archived-report read under a proof budget also refuses S's retired-but-absent ledger path, a pre-existing property of
+    // that read; the acknowledged-report read accepts S's generation, which is what shows the refusal above is the predecessor's.)
+    assert.deepEqual(inspections.filter(i => i[1] !== 1 && i[0] === "retireAcknowledgedFinalReport").map(i => i[2]), [true], JSON.stringify(inspections));
+    mock.restoreAll();
+
+    // A restart (a new authority runtime and runner) reads the same attribution and refuses the same way.
+    const again = new AuthorityRuntime({ lifetime: r.lifetime, workerToken: AUTH_TOKEN, workerIncarnation: randomUUID(), timeoutMs: 5000 });
+    const runner2 = runnerWith(() => ({ executor: r.executor, homeDir: r.runHome }), fakeGitlab().gitlab, AUTH_TOKEN, r.logs.logger, {
+      authority: again, codexBoundaryDeadlineMs: 5000, recoveryRetryMs: 5, restoreIdentity: { procRoot: r.sProc, hostname: () => CID.slice(0, 12) } });
+    await checkAll(runner2);
+  });
+
+  it("a restore predecessor is never offered to the retained-predecessor FINAL pass (issue #2969 scope)", async t => {
+    const { r, claim } = await completeRestore(t);
+    const settle = (runner: Rig["runner"]) => (runner as unknown as { settlePredecessorHolds(...a: unknown[]): Promise<string> });
+    const flight = { claimGeneration: claim.claim_generation! + 1, runLog: r.logs.logger };
+    mock.method(r.recovery(), "predecessorRecords", async () => [SYNTHETIC_G(r, 1)]);
+    const next = { ...claim, claim_generation: claim.claim_generation! + 1, inventory_guarded: true };
+    const outcome = await settle(r.runner).settlePredecessorHolds(next, flight, r.bare, {}, { attempts: 0, deadline: Date.now() + 3_600_000 }, new AbortController().signal);
+    assert.equal(outcome, "proceed");
+    assert.equal(logged(r, "retained predecessor FINAL skipped").length, 0,
+      "no candidate survived the restore filter, so the pass never reached its gate (nor any boundary, scope or exemption): " + JSON.stringify(logged(r, "retained predecessor FINAL skipped")));
   });
 });
 
@@ -890,7 +1001,7 @@ describe("later claims never reach the legacy path (issue #3644 3.10)", () => {
     const config = configText(r);
     const before = await pFacts(r);
     await r.runner.execute(r.claim);
-    assert.equal(logged(r, "independent restore eligible; seeding disabled by configuration").length, 1);
+    assert.equal(logged(r, "independent restore eligible; seeding disabled for this runner instance").length, 1);
     assert.equal(logged(r, "independent restore seeded").length, 0);
     assert.equal(configText(r), config);
     assert.deepEqual(await pFacts(r), before);

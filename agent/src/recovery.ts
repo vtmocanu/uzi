@@ -685,6 +685,22 @@ export interface InventorySourceBoundaryContext {
   predecessor?: object;
 }
 
+/**
+ * issue #3644 plan 3.9: whether the inventory read reports a retained RESTORE predecessor whose generation is at or above
+ * `generation`. The inventory readers exclude the predecessor's clone (it is opaque) and report it only as
+ * `retainedPredecessors`, so an exclusion alone would read as "nothing physical is left" and make that generation FINAL-eligible
+ * the moment the successor stopped executing. Every consumer that would settle, prove or retire a record of generation
+ * `generation` must refuse while this is true; the hold closes only by owner discard (or the server's verified-merge discard).
+ * A missing or unsafe generation holds (fail closed). The successor's own, higher generation is unaffected.
+ */
+export function restorePredecessorHolds(
+  inventory: { retainedPredecessors?: ReadonlyArray<{ generation: number }> } | undefined, generation: number | undefined,
+): boolean {
+  const retained = inventory?.retainedPredecessors;
+  if (!retained || retained.length === 0) return false;
+  return retained.some(p => typeof generation !== "number" || !Number.isSafeInteger(generation) || generation <= p.generation);
+}
+
 export function inventoryReadCause(inventory: unknown): InventoryReadCause {
   const cause = (inventory as { cause?: unknown } | undefined)?.cause;
   return INVENTORY_READ_CAUSES.find(known => known === cause) ?? "other";
@@ -1922,6 +1938,9 @@ export class RecoveryCoordinator {
         if (owed.some(c => c.contexts.some(x => x.runId === runId))) return "retained";
         const clones = await ownedRecoveryIO(() => this.git.readInventoryCloneHeads!(barePath, runId));
         if (clones.kind !== "verified" || clones.clones.length > 0 || clones.heads.length > 0) return "retained";
+        // issue #3644 3.9: a generation at or below a retained restore predecessor's is never "unadopted": its source is the
+        // opaque predecessor, so the hold stays.
+        if (restorePredecessorHolds(clones, generation)) return "retained";
       }
     } catch (err) { MaintenanceBudget.current()?.check();
       this.log.warn("recovery: unadopted-generation proof unavailable; custody retained", { run_id: runId, generation, error: errText(err) });
@@ -2199,6 +2218,8 @@ export class RecoveryCoordinator {
       if (inventory?.kind !== "verified" || !Array.isArray(inventory.clones))
         return refuse({ check: "inventory_read_not_verified", cause: inventoryReadCause(inventory) });
       if (inventory.clones.length !== 0) return refuse({ check: "physical_sources_without_boundary" });
+      // issue #3644 3.9: the retained restore predecessor is a physical source this boundary cannot prove.
+      if (restorePredecessorHolds(inventory, context.generation)) return refuse({ check: "physical_sources_without_boundary" });
       return true;
     };
     try {
@@ -2516,6 +2537,9 @@ export class RecoveryCoordinator {
     try { sources = await this.checkedRecords(record.runId); } catch { MaintenanceBudget.current()?.check(); return "unavailable"; }
     const clones = await ownedRecoveryIO(() => this.git.readInventoryCloneHeads!(record.coverageContext!.barePath, record.runId));
     if (clones.kind !== "verified") return "unavailable";
+    // issue #3644 3.9: the opaque restore predecessor's content cannot be compared, so ancestry is never proven for a generation
+    // at or below it.
+    if (restorePredecessorHolds(clones, record.generation)) return "unproven";
     const laterHead = (sha: string): boolean => {
       const journals = sources.filter(r => !r.coverageDigest && r.sourceSha === sha);
       const producers = unresolved.filter(c => c.sha === sha).flatMap(c => c.contexts);

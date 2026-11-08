@@ -1,8 +1,8 @@
 // issue #3644 (plan 3.12): the retained-home marker. An independent restore leaves the predecessor P's legacy HOME
 // (`agent-home/<runId>`) and provision dir (`provision/<runId>`) untouched; this marker, `<dataDir>/retained-homes/<runId>.json`,
 // is what keeps the disk reclaimers off them until P's own guarded discard removes it. The restore seed's
-// `beforeRestoreAttribution` callback must write it durably before any bare write of the restore (the runner wires that
-// callback in m4; no production caller does yet). A marker that is present, malformed, unreadable or whose directory fails with anything but ENOENT counts
+// `beforeRestoreAttribution` callback must write it durably before any bare write of the restore (the runner's `restoreFromPin`
+// wires it; the retained-source server wires the discard's `hasRetainedHomeMarker` / `removeRetainedHomeMarker` hooks). A marker that is present, malformed, unreadable or whose directory fails with anything but ENOENT counts
 // as PRESENT for every reclaimer: when in doubt the directories are protected, never reclaimed.
 
 import { constants as fsc } from "node:fs";

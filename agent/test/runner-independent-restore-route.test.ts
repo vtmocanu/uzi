@@ -38,7 +38,7 @@ describe("the independent restore route (issue #3644 m4a)", () => {
   it("an eligible foreign-active predecessor stops nonterminally, writes nothing, and says seeding is not enabled", async () => {
     const r = await buildRig();
     const { before, traps } = await drive(r);
-    const eligible = logged(r, "independent restore eligible; seeding disabled by configuration");
+    const eligible = logged(r, "independent restore eligible; seeding disabled for this runner instance");
     assert.equal(eligible.length, 1, JSON.stringify(r.logs.lines.filter(l => /restore/i.test(String((l as { msg: string }).msg)))));
     const verdict = eligible[0]!.verdict as { predecessorIncarnation: string; boot: string };
     assert.equal(verdict.predecessorIncarnation, r.pInc);
@@ -55,7 +55,7 @@ describe("the independent restore route (issue #3644 m4a)", () => {
     fs.mkdirSync(other, { recursive: true });
     await r.pRt.withTransaction(() => r.pRt.hooks.admitSourceUse(other, "seed-canonical"));
     const { before, traps } = await drive(r);
-    assert.equal(logged(r, "independent restore eligible; seeding disabled by configuration").length, 1);
+    assert.equal(logged(r, "independent restore eligible; seeding disabled for this runner instance").length, 1);
     assert.equal(refusals(r).length, 0);
     await assertStoppedUntouched(r, before, traps);
   });
@@ -72,14 +72,14 @@ describe("the independent restore route (issue #3644 m4a)", () => {
     assert.ok(spies.reserve >= 1, "the legacy path reserved an iteration");
     assert.equal(logged(r, "retained predecessor refused by source-use admission; capture not started").length, 1);
     assert.equal(failed(r).length, 1, "today's outcome: the run is failed");
-    assert.equal(logged(r, "independent restore eligible; seeding disabled by configuration").length, 0);
+    assert.equal(logged(r, "independent restore eligible; seeding disabled for this runner instance").length, 0);
     assert.equal(refusals(r).length, 0);
   });
 
   it("a claim generation of 1 never takes the restore route", async () => {
     const r = await buildRig({ claim: { claim_generation: 1 } });
     await r.runner.execute(r.claim);
-    assert.equal(logged(r, "independent restore eligible; seeding disabled by configuration").length, 0);
+    assert.equal(logged(r, "independent restore eligible; seeding disabled for this runner instance").length, 0);
     assert.equal(refusals(r).length, 0);
     assert.equal(logged(r, "retained predecessor is foreign-owned; taking the independent restore route").length, 0);
   });
@@ -190,7 +190,7 @@ describe("the independent restore route (issue #3644 m4a)", () => {
         const logs = refusals(r);
         assert.equal(logs.length, 1, JSON.stringify(r.logs.lines.filter(l => /restore|retained/i.test(String((l as { msg: string }).msg)))));
         assert.equal(logs[0]!.reason, c.reason);
-        assert.equal(logged(r, "independent restore eligible; seeding disabled by configuration").length, 0);
+        assert.equal(logged(r, "independent restore eligible; seeding disabled for this runner instance").length, 0);
         const feed = api.messages(r.runId).map(m => JSON.stringify(m.payload)).filter(t => t.includes("independent restore refused"));
         assert.equal(feed.length, 1, "one bounded feed line");
         assert.ok(feed[0]!.includes(c.reason) && feed[0]!.length < 400);
@@ -204,7 +204,7 @@ describe("the independent restore route (issue #3644 m4a)", () => {
       const r = await buildRig();
       cfgAdd(r, r.ledgerKey, olderLedgerEntry(r, "retired"));
       const { before, traps } = await drive(r);
-      assert.equal(logged(r, "independent restore eligible; seeding disabled by configuration").length, 1);
+      assert.equal(logged(r, "independent restore eligible; seeding disabled for this runner instance").length, 1);
       assert.equal(refusals(r).length, 0);
       await assertStoppedUntouched(r, before, traps);
     });
@@ -217,7 +217,7 @@ describe("the independent restore route (issue #3644 m4a)", () => {
       cfgSet(r, r.journalKey, raw);
       const { before, traps } = await drive(r);
       assert.equal(refusals(r).length, 0, JSON.stringify(refusals(r)));
-      assert.equal(logged(r, "independent restore eligible; seeding disabled by configuration").length, 1);
+      assert.equal(logged(r, "independent restore eligible; seeding disabled for this runner instance").length, 1);
       await assertStoppedUntouched(r, before, traps);
     });
   });
@@ -228,7 +228,7 @@ describe("the independent restore route (issue #3644 m4a)", () => {
       setJournal(r, { recovery: { version: 1, source: { runId: r.runId, clonePath: r.pPath, attemptId: r.pAttempt }, attempts: 3,
         startedAt: 1000, deadline: 301_000, claimGeneration: 1, backoffMs: 0, stage: "blocked", blocker: "capture_failed" } });
       await r.runner.execute(r.claim);
-      assert.equal(logged(r, "independent restore eligible; seeding disabled by configuration").length, 0);
+      assert.equal(logged(r, "independent restore eligible; seeding disabled for this runner instance").length, 0);
       assert.equal(refusals(r).length, 0);
       assert.equal(logged(r, "retained predecessor is foreign-owned; taking the independent restore route").length, 0);
       assert.equal(failed(r).length, 1, "the legacy blocked path fails the run");
@@ -246,7 +246,7 @@ describe("the independent restore route (issue #3644 m4a)", () => {
       git.discoverRetainedRecovery = ((...args: Parameters<typeof discover>) => { discovered++; return discover(...args); }) as typeof git.discoverRetainedRecovery;
       await r.runner.execute(r.claim);
       assert.ok(discovered >= 1, "legacy discovery ran");
-      assert.equal(logged(r, "independent restore eligible; seeding disabled by configuration").length, 0);
+      assert.equal(logged(r, "independent restore eligible; seeding disabled for this runner instance").length, 0);
       assert.equal(refusals(r).length, 0);
       assert.equal(logged(r, "retained predecessor is foreign-owned; taking the independent restore route").length, 0);
     });
