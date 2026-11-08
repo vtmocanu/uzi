@@ -692,7 +692,7 @@ export interface InventorySourceBoundaryContext {
  * the moment the successor stopped executing. Every consumer that would settle, prove or retire a record of generation
  * `generation` must refuse while this is true; the hold closes only by the owner's guarded discard through the restore exit,
  * which is what removes the worker-side P bytes. The server's verified-merge discard (the existing server-side
- * DiscardMergedPredecessorHold reconciliation) closes only the server custody holds; no agent code path takes part in it
+ * DiscardMergedPredecessorHolds reconciliation) closes only the server custody holds; no agent code path takes part in it
  * and it never removes P's worker-side bytes.
  * A missing or unsafe generation holds (fail closed). The successor's own, higher generation is unaffected.
  */

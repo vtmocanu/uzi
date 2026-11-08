@@ -11,7 +11,7 @@
 // seeding transaction (runner.ts restoreFromPin), which re-derives the whole verdict under the authority transaction, the
 // recovery journal lock and the bare lock and seeds only if it is unchanged (the verdict object is what it compares).
 import { createHash } from "node:crypto";
-import { attemptGeneration } from "./attempt-path.js";
+import { attemptClonePath, attemptGeneration, cloneKeyOf } from "./attempt-path.js";
 import {
   parseAttemptLedgerEntry, recoveryCaptureKey, stoppedMarkerKey,
   type BareAttributionEntry, type RestorePinSpec, type RestorePinVerdict,
@@ -27,7 +27,8 @@ import {
 
 /** Refusals decided from the bare config alone, before any reservation (plan 3.2). */
 export type ClassificationRefusal =
-  | "uncertain_publication" | "predecessor_not_plain" | "conflicting_attribution" | "predecessor_ledger" | "attribution_unverifiable";
+  | "uncertain_publication" | "predecessor_not_plain" | "conflicting_attribution" | "predecessor_ledger" | "attribution_unverifiable"
+  | "predecessor_path";
 
 /** Every reason the route can refuse with. */
 export type RestoreRouteReason =
@@ -86,6 +87,9 @@ function classifyRestoreRelationships(input: RelationshipInput): RelationshipRes
   const generation = attemptGeneration(attemptId);
   // The pin is looked up by the attempt's generation: an attempt id that carries none cannot be restored from.
   if (generation === undefined) return refuse("predecessor_not_plain");
+  // The seed only accepts a predecessor whose path is `<canonical>.attempt-<its own attemptId>` (a canonical-path P, or a path
+  // carrying another id, is not restorable by design), so refuse here, before the executor swap, rather than at the seed.
+  if (clonePath !== attemptClonePath(cloneKeyOf(clonePath).canonicalPath, attemptId)) return refuse("predecessor_path");
   if (!input.complete) return refuse("attribution_unverifiable");
 
   const names = (value: string): boolean => value.includes(input.runId) || namesWholePath(value, clonePath);

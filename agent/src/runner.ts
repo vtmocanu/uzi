@@ -14552,7 +14552,7 @@ export class RunRunner {
           text: sanitizeForLog(flight.redactText(
             `continues from verified saved work at pin ${note?.captureId ?? "(unknown)"} (generation ${note?.generation ?? "?"}, sha ${(note?.sourceSha ?? "").slice(0, 12)}); ` +
             "later unpinned edits may remain only in the retained predecessor on the worker (not measured); " +
-            "the predecessor's hold stays open until this run's PR is merged, and merging accepts discarding it"), 600),
+            "merging closes only the server custody holds; the retained predecessor's worker-side copy stays until the owner's guarded discard"), 600),
         },
       });
     } else if (runnerClone.seededFrom === "tracking" && runnerClone.priorCommits > 0) {
@@ -28248,7 +28248,7 @@ export class RunRunner {
     try {
       // issue #3644 3.9: a restore predecessor's generations (and any below) are never settled, exempted or finalized through
       // this pass: their hold closes only by the owner's guarded discard through the restore exit (the only
-      // thing that removes the worker-side P bytes). The server's existing DiscardMergedPredecessorHold reconciliation closes
+      // thing that removes the worker-side P bytes). The server's existing DiscardMergedPredecessorHolds reconciliation closes
       // only the server custody holds; no agent code path takes part in it.
       candidates = [];
       for (const record of await this.recovery.predecessorRecords(claim.run_id, flight.claimGeneration))

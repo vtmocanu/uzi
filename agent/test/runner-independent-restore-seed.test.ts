@@ -100,6 +100,13 @@ describe("the independent restore (issue #3644 m4b)", () => {
     const homeBytes = sha256(path.join(r.runHome, "session-proof"));
     const before = await pFacts(r);
     const traps = armTraps(r);
+    const seedingAt: number[] = [];
+    const gitLog = (git as unknown as { log: { info(msg: string, ...rest: unknown[]): void } }).log;
+    const logInfo = gitLog.info.bind(gitLog);
+    mock.method(gitLog, "info", (msg: string, ...rest: unknown[]) => {
+      if (msg === "runner clone: seeding") seedingAt.push(r.logs.lines.length);
+      return logInfo(msg, ...rest);
+    });
     try { await r.runner.execute(r.claim); } finally { traps.armed = false; }
 
     // P is never read, captured, reserved, admitted or reaped.
@@ -166,7 +173,16 @@ describe("the independent restore (issue #3644 m4b)", () => {
     assert.equal(feed.length, 1);
     assert.match(feed[0]!, /pin [^ ]+ \(generation 1, sha [0-9a-f]{12}\)/);
     assert.match(feed[0]!, /later unpinned edits may remain only in the retained predecessor on the worker \(not measured\)/);
-    assert.match(feed[0]!, /hold stays open until this run's PR is merged, and merging accepts discarding it/);
+    assert.match(feed[0]!, /merging closes only the server custody holds; the retained predecessor's worker-side copy stays until the owner's guarded discard/);
+
+    // Order: the claim, then the git cache's own seeding line (its logger is not the run's, so it is positioned by how many run
+    // lines existed when it was written), then the restore's seeded line.
+    const runMsgs = r.logs.lines.map(l => (l as { msg: string }).msg);
+    const claimedAt = runMsgs.indexOf("run claimed");
+    const seededAt = runMsgs.indexOf("independent restore seeded");
+    assert.ok(claimedAt >= 0 && seededAt > claimedAt, `run claimed precedes independent restore seeded: ${runMsgs.slice(0, 6).join(" | ")}`);
+    assert.equal(seedingAt.length, 1, "the git cache logged `runner clone: seeding` once");
+    assert.ok(seedingAt[0]! > claimedAt && seedingAt[0]! <= seededAt, `seeding at run-line ${seedingAt[0]}, claimed ${claimedAt}, seeded ${seededAt}`);
     assert.ok(feed[0]!.length < 700);
     assert.equal(api.messages(r.runId).map(m => JSON.stringify(m.payload)).filter(t => /recovered \d+ commit/.test(t)).length, 0,
       "no 'recovered N commits' claim");
@@ -985,6 +1001,92 @@ describe("a seed that refuses or fails is a nonterminal stop that leaves exactly
     assert.equal(failed(r).length, 0);
   });
 
+  /** P's journal, ledger entry, slot, bytes, HOME and provision directory are unchanged after a failed seed, and the run is not failed. */
+  async function assertPKept(r: Rig, before: Awaited<ReturnType<typeof pFacts>>): Promise<void> {
+    assert.equal(failed(r).length, 0, "no failed report");
+    assert.deepEqual(await pFacts(r), before, "P's journal, ledger entry, slot, clone, HOME and provision directory are byte-identical");
+    assert.equal(logged(r, "independent restore seeded").length, 0);
+  }
+
+  /** S's clone path as its own ledger entry (the last value) names it. */
+  const successorPath = (r: Rig): string => (JSON.parse(cfgAll(r, r.ledgerKey).at(-1)!) as { clonePath: string }).clonePath;
+
+  it("before_seed: the quiesce refuses (a protected process blocks the seed); the runner forwards P's marker to quiesceRun in seed mode, the refusal is nonterminal, and the clone never exists", async () => {
+    const { r } = await restoreRig();
+    const before = await pFacts(r);
+    const calls: Array<Record<string, unknown>> = [];
+    type Quiesce = (flight: unknown, executor: unknown, opts: Record<string, unknown>) => Promise<unknown>;
+    const target = r.runner as unknown as { quiesceRun: Quiesce };
+    const original = target.quiesceRun.bind(r.runner);
+    mock.method(target, "quiesceRun", async (flight: unknown, executor: unknown, opts: Record<string, unknown>) => {
+      if (opts.mode !== "seed") return original(flight, executor, opts);
+      calls.push(opts);
+      return { blocked: true, outcome: { process: { state: "unverified", processes: [], killed: [], detail: "a protected attempt marker is still running" } } };
+    });
+    await r.runner.execute(r.claim);
+    assert.equal(calls.length, 1, "the seed's sweep ran once");
+    assert.deepEqual(calls[0]!.protectedMarkers, [`${r.runId}:${r.pAttempt}`], "P's marker is protected");
+    assert.equal(calls[0]!.site, "attempt_seed");
+    const refusal = refusals(r)[0]!;
+    assert.equal(refusal.reason, "before_seed_refused", JSON.stringify(refusal));
+    assert.match(String(refusal.detail), /a protected attempt marker is still running/);
+    assert.equal(refusal.window, "seeding");
+    assert.equal(fs.existsSync(successorPath(r)), false, "no successor clone was seeded");
+    await assertPKept(r, before);
+  });
+
+  it("pin_recheck: a pin that stops verifying after the callbacks refuses before the clone is seeded", async () => {
+    const { r } = await restoreRig();
+    const before = await pFacts(r);
+    let armed = false;
+    type Quiesce = (flight: unknown, executor: unknown, opts: Record<string, unknown>) => Promise<unknown>;
+    const target = r.runner as unknown as { quiesceRun: Quiesce };
+    const original = target.quiesceRun.bind(r.runner);
+    mock.method(target, "quiesceRun", async (flight: unknown, executor: unknown, opts: Record<string, unknown>) => {
+      if (opts.mode === "seed") armed = true; // the sweep ran: from here the pin no longer verifies
+      return original(flight, executor, opts);
+    });
+    const verify = (git as unknown as { verifyRestorePinRefsUnderLock(...a: unknown[]): Promise<unknown> }).verifyRestorePinRefsUnderLock.bind(git);
+    mock.method(git as unknown as { verifyRestorePinRefsUnderLock(...a: unknown[]): Promise<unknown> }, "verifyRestorePinRefsUnderLock",
+      async (...args: unknown[]) => armed ? { ok: false, reason: "pin_unbound" } : verify(...args));
+    await r.runner.execute(r.claim);
+    const refusal = refusals(r)[0]!;
+    assert.equal(refusal.reason, "pin_unbound", JSON.stringify(refusal));
+    assert.equal(refusal.window, "seeding");
+    assert.equal(fs.existsSync(successorPath(r)), false, "no successor clone was seeded");
+    await assertPKept(r, before);
+  });
+
+  it("seed: a failing clone leaves the seeding window and a nonterminal refusal", async () => {
+    const { r } = await restoreRig();
+    const before = await pFacts(r);
+    type Exec = (command: string, args: string[], options: unknown) => Promise<unknown>;
+    const target = git as unknown as { execScoped: Exec };
+    const exec = target.execScoped.bind(git);
+    mock.method(target, "execScoped", async (command: string, args: string[], options: unknown) => {
+      if (args.includes("clone") && args.includes("--no-checkout")) throw Object.assign(new Error("injected clone failure"), { code: 128, stdout: "", stderr: "x" });
+      return exec(command, args, options);
+    });
+    await r.runner.execute(r.claim);
+    const refusal = refusals(r)[0]!;
+    assert.equal(refusal.window, "seeding", JSON.stringify(refusal));
+    assert.equal(refusal.reason, "seed_failed");
+    assert.ok(cfgGet(r, restoreKey), "the restore entry is left in its seeding stage");
+    await assertPKept(r, before);
+  });
+
+  it("ready: the final entry write is not durable; the clone exists, the refusal is nonterminal and P is untouched", async () => {
+    const { r } = await restoreRig();
+    const before = await pFacts(r);
+    failSync(5);
+    await r.runner.execute(r.claim);
+    const refusal = refusals(r)[0]!;
+    assert.equal(refusal.window, "seeding", JSON.stringify(refusal));
+    assert.match(String(refusal.detail), /injected fsync failure/);
+    assert.ok(cfgGet(r, restoreKey), "the restore entry exists");
+    await assertPKept(r, before);
+  });
+
   it("an authority refusal inside the seed (assertBareClear) is a refusal with window none and nothing written", async () => {
     const { r } = await restoreRig();
     const config = configText(r);
@@ -999,6 +1101,36 @@ describe("a seed that refuses or fails is a nonterminal stop that leaves exactly
     assert.equal(refusal.window, "none");
     assert.equal(configText(r), config);
     assert.equal(fs.existsSync(markerFile(r)), false);
+  });
+});
+
+describe("a predecessor at the canonical clone path is not restorable (issue #3644 3.2)", () => {
+  beforeEach(() => { resetRigRoots(); });
+
+  it("is refused as predecessor_path during classification, before any executor is built or swapped, with nothing written", async () => {
+    const { r } = await restoreRig();
+    // P's journal and `live` ledger entry name the canonical path (no attempt id in it); its active foreign slot is keyed there.
+    const canonical = r.pPath.replace(/\.attempt-.*$/, "");
+    assert.notEqual(canonical, r.pPath);
+    fs.mkdirSync(canonical, { recursive: true });
+    await r.pRt.withTransaction(() => r.pRt.hooks.admitSourceUse(canonical, "seed-canonical"));
+    const ledger = JSON.parse(cfgAll(r, r.ledgerKey)[0]!) as Record<string, unknown>;
+    cfgSet(r, r.ledgerKey, JSON.stringify({ ...ledger, clonePath: canonical }));
+    cfgSet(r, r.journalKey, JSON.stringify({ ...journalOf(r), clonePath: canonical }));
+    const config = configText(r);
+    const before = await pFacts(r);
+    const swaps = mock.method(r.runner as unknown as { swapRestoreExecutor(...a: unknown[]): Promise<void> }, "swapRestoreExecutor");
+    await r.runner.execute(r.claim);
+    const refusal = refusals(r);
+    assert.equal(refusal.length, 1, JSON.stringify(r.logs.lines.filter(l => /restore/i.test(String((l as { msg: string }).msg)))));
+    assert.equal(refusal[0]!.reason, "predecessor_path");
+    assert.equal(failed(r).length, 0, "nonterminal: the run is not failed");
+    assert.equal(swaps.mock.callCount(), 0, "no successor executor was swapped in");
+    assert.deepEqual(r.factoryCalls.map(c => c.generation), [undefined], "no successor executor was built");
+    assert.equal(logged(r, "independent restore seeded").length, 0);
+    assert.equal(configText(r), config, "nothing was written to the bare");
+    assert.equal(fs.existsSync(markerFile(r)), false);
+    assert.deepEqual(await pFacts(r), before, "P's key, ledger, slot, clone, HOME and provision directory are unchanged");
   });
 });
 
