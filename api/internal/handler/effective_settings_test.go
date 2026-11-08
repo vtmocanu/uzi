@@ -247,7 +247,7 @@ func previewRequest(body string) *http.Request {
 
 func TestStartPreviewRejectsMalformedRequests(t *testing.T) {
 	huge := `{"harness":null,"credential_override":{"mode":"pinned","secret_id":"` + strings.Repeat("a", startPreviewBodyLimit) + `"}}`
-	cases := map[string]string{ //nolint:gosec // G101: refusal-reason tokens, not secrets
+	cases := map[string]string{ //nolint:gosec // G101: malformed request-body fixtures keyed by case name, not secrets
 		"unknown field":            `{"harness":null,"credential_override":null,"model":"opus"}`,
 		"unknown nested field":     `{"credential_override":{"mode":"auto","label":"x"}}`,
 		"trailing value":           `{"harness":null} {"harness":null}`,

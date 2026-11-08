@@ -42,6 +42,13 @@ func newEffFix(t *testing.T) *effFix {
 	if err := pf.env.pool.QueryRow(pf.env.ctx, `SELECT id FROM workers WHERE user_id = $1`, pf.userID).Scan(&fx.workerID); err != nil {
 		t.Fatalf("read worker: %v", err)
 	}
+	// Seed the builtin roster first so the shared namespace is identical in every
+	// test order, then switch all of it off for this user. A user template whose
+	// name exists in the shared namespace is excluded by the prediction and claim
+	// queries, so fixtures use names no builtin carries (see template).
+	if _, err := store.ReconcileBuiltinTemplates(pf.env.ctx, pf.env.q); err != nil {
+		t.Fatalf("reconcile builtins: %v", err)
+	}
 	// The shared lead roster must not decide: every shared template is off for this user.
 	pf.env.exec(`INSERT INTO agent_template_allocations(template_id,user_id,enabled)
 		SELECT id,$1,false FROM agent_templates
@@ -74,8 +81,19 @@ func (fx *effFix) lane(column, value string) {
 	fx.env.exec(`UPDATE users SET `+column+` = NULLIF($2,'') WHERE id = $1`, fx.userID, value)
 }
 
+// effLeadName is lead-shaped (agenttmpl.IsLeadName) but not a builtin name, so
+// the fixture's user template is not shadowed by the shared builtin "lead".
+const effLeadName = "orchestrator"
+
 func (fx *effFix) template(name, claudePin, codexPin string) {
 	fx.t.Helper()
+	var shared int
+	if err := fx.env.pool.QueryRow(fx.env.ctx, `SELECT count(*) FROM agent_templates WHERE scope <> 'user' AND name = $1`, name).Scan(&shared); err != nil {
+		fx.t.Fatalf("shared name probe: %v", err)
+	}
+	if shared != 0 {
+		fx.t.Fatalf("fixture template %q collides with a shared template: the resolver and claim path exclude a user template whose name exists in the shared namespace", name)
+	}
 	id := uuid.New()
 	fx.env.exec(`INSERT INTO agent_templates(id,name,description,prompt_body,scope,user_id,model,codex_model)
 		VALUES($1,$2,'d','b','user',$3,NULLIF($4,''),NULLIF($5,''))`, id, name, fx.userID, claudePin, codexPin)
@@ -159,6 +177,20 @@ func (w leadWant) check(t *testing.T, lead LeadPrediction, payload *ClaimPayload
 	if got := derefOr(payload.Config.DefaultEffortSource, ""); got != w.effortSource {
 		t.Errorf("claim default_effort_source = %q, want %q", got, w.effortSource)
 	}
+	// A template-sourced lead model is delivered on the lead agent of the claim roster.
+	if w.modelSource == "template" {
+		var names []string
+		for _, ag := range payload.Agents {
+			names = append(names, ag.Name)
+		}
+		idx, ok := agenttmpl.SelectLead(names)
+		if !ok {
+			t.Fatalf("claim roster %v carries no lead-shaped agent", names)
+		}
+		if got := derefOr(payload.Agents[idx].Model, ""); got != w.model {
+			t.Errorf("claim lead agent %q model = %q, want the predicted %q", payload.Agents[idx].Name, got, w.model)
+		}
+	}
 }
 
 // TestEffectiveSettingsLeadClaimEquivalenceLiveDB walks the lead rows: harness frozen at create,
@@ -179,14 +211,14 @@ func TestEffectiveSettingsLeadClaimEquivalenceLiveDB(t *testing.T) {
 		},
 		{
 			name:  "claude only with a lead template",
-			setup: func(fx *effFix) { fx.anthropic(); fx.template("lead", "opus", "") },
+			setup: func(fx *effFix) { fx.anthropic(); fx.template(effLeadName, "opus", "") },
 			want:  leadWant{harness: HarnessClaude, model: "opus", modelSource: "template", effort: "medium", effortSource: "builtin"},
 		},
 		{
 			name: "claude lane wins over the template and ships",
 			setup: func(fx *effFix) {
 				fx.anthropic()
-				fx.template("lead", "opus", "")
+				fx.template(effLeadName, "opus", "")
 				fx.lane("default_claude_model", "sonnet")
 			},
 			want: leadWant{harness: HarnessClaude, model: "sonnet", modelSource: "user_default", claimModel: "sonnet", claimSource: "user_default",
@@ -194,14 +226,14 @@ func TestEffectiveSettingsLeadClaimEquivalenceLiveDB(t *testing.T) {
 		},
 		{
 			name:  "legacy codex pin on the claude column is the SDK default",
-			setup: func(fx *effFix) { fx.anthropic(); fx.template("lead", "gpt-6-luna", "") },
+			setup: func(fx *effFix) { fx.anthropic(); fx.template(effLeadName, "gpt-6-luna", "") },
 			want:  leadWant{harness: HarnessClaude, model: "", modelSource: "builtin", effort: "medium", effortSource: "builtin"},
 		},
 		{
 			name: "claude lane holding a codex role id is dropped",
 			setup: func(fx *effFix) {
 				fx.anthropic()
-				fx.template("lead", "opus", "")
+				fx.template(effLeadName, "opus", "")
 				fx.lane("default_claude_model", "gpt-6-luna")
 			},
 			want: leadWant{harness: HarnessClaude, model: "opus", modelSource: "template", effort: "medium", effortSource: "builtin"},
@@ -218,14 +250,14 @@ func TestEffectiveSettingsLeadClaimEquivalenceLiveDB(t *testing.T) {
 		},
 		{
 			name:  "codex lead pin",
-			setup: func(fx *effFix) { fx.codexDefault(); fx.template("lead", "", "gpt-6-sol") },
+			setup: func(fx *effFix) { fx.codexDefault(); fx.template(effLeadName, "", "gpt-6-sol") },
 			want:  leadWant{harness: HarnessCodex, model: "gpt-6-sol", modelSource: "template", effort: "medium", effortSource: "builtin"},
 		},
 		{
 			name: "codex lane",
 			setup: func(fx *effFix) {
 				fx.codexDefault()
-				fx.template("lead", "", "gpt-6-astra")
+				fx.template(effLeadName, "", "gpt-6-astra")
 				fx.lane("default_codex_model", "gpt-6-sol")
 			},
 			want: leadWant{harness: HarnessCodex, model: "gpt-6-sol", modelSource: "user_default", claimModel: "gpt-6-sol", claimSource: "user_default",
@@ -278,9 +310,9 @@ func TestEffectiveSettingsSubagentPinsMatchClaimLiveDB(t *testing.T) {
 			fx := newEffFix(t)
 			fx.anthropic()
 			fx.codexDefault()
-			fx.template("lead", "opus", "gpt-6-sol")
-			fx.template("coder", "sonnet", "gpt-6-astra")
-			fx.template("tester", "", "")
+			fx.template(effLeadName, "opus", "gpt-6-sol")
+			fx.template("eff-coder", "sonnet", "gpt-6-astra")
+			fx.template("eff-tester", "", "")
 			fx.template("scribe", "haiku", "")
 			run := fx.mustCreate(&h)
 			lead := fx.predictLead(h, false)

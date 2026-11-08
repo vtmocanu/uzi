@@ -120,6 +120,13 @@ func pgText(t pgtype.Text) *string {
 
 func (f *effFix) subagent(name, claudePin, codexPin string) {
 	f.t.Helper()
+	var shared int
+	if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM agent_templates WHERE scope <> 'user' AND name = $1`, name).Scan(&shared); err != nil {
+		f.t.Fatalf("shared name probe: %v", err)
+	}
+	if shared != 0 {
+		f.t.Fatalf("fixture template %q collides with a shared template: the resolver and claim path exclude a user template whose name exists in the shared namespace", name)
+	}
 	id := uuid.New()
 	f.exec(`INSERT INTO agent_templates(id,name,description,prompt_body,scope,user_id,model,codex_model)
 		VALUES($1,$2,'d','b','user',$3,NULLIF($4,''),NULLIF($5,''))`, id, name, f.user, claudePin, codexPin)
@@ -188,7 +195,7 @@ func TestSchedulePreviewExample3LiveDB(t *testing.T) {
 	t.Run("override omitted: preview, save, fire", func(t *testing.T) {
 		f := newEffFix(t, nil)
 		setup(f)
-		f.subagent("coder", "sonnet", "gpt-6-astra")
+		f.subagent("eff-coder", "sonnet", "gpt-6-astra")
 		dto, body := f.schedulePreview(`{"target":"sweep","harness":null,"model":"sonnet","override_subagent_model":true}`)
 		wantHarness(t, dto.Harness, "codex", "user_default")
 		if dto.Refusal != nil || len(dto.Alternatives) != 0 || strings.Join(dto.Notes, ",") != "issue_labels_may_select_harness" {
@@ -241,13 +248,13 @@ func TestSchedulePreviewExample3LiveDB(t *testing.T) {
 	t.Run("pinned to claude with a claude lead model that resolves to empty gives own pins", func(t *testing.T) {
 		f := newEffFix(t, nil)
 		f.anthropic()
-		f.subagent("coder", "sonnet", "")
+		f.subagent("eff-coder", "sonnet", "")
 		f.subagent("scribe", "haiku", "")
 		f.subagent("plain", "", "gpt-6-astra")
 		dto, body := f.schedulePreview(`{"target":"sweep","harness":"claude","override_subagent_model":true}`)
 		wantHarness(t, dto.Harness, "claude", "schedule_pin")
 		wantModelCell(t, dto.WorkerModel, "", "builtin", "", "sdk_default")
-		wantSubagents(t, dto.Subagents, "own_pins", "", "coder=sonnet", "scribe=haiku")
+		wantSubagents(t, dto.Subagents, "own_pins", "", "eff-coder=sonnet", "scribe=haiku")
 		wantCredential(t, dto.Credential, "anthropic", "claim_selection", "claim")
 		if dto.Refusal != nil || len(dto.Alternatives) != 0 {
 			t.Fatalf("preview = %s", body)
@@ -404,9 +411,9 @@ func TestSchedulePreviewSubagentsLiveDB(t *testing.T) {
 		pins            []string
 		model           string
 	}{
-		{"claude", "false", "own_pins", "opus", []string{"coder=sonnet", "scribe=haiku"}, ""},
+		{"claude", "false", "own_pins", "opus", []string{"eff-coder=sonnet", "scribe=haiku"}, ""},
 		{"claude", "true", "follow_lead", "opus", nil, ""},
-		{"codex", "false", "own_pins", "gpt-6-sol", []string{"coder=gpt-6-astra"}, ""},
+		{"codex", "false", "own_pins", "gpt-6-sol", []string{"eff-coder=gpt-6-astra"}, ""},
 		{"codex", "true", "follow_lead", "gpt-6-sol", nil, ""},
 		// A frozen schedule model becomes the lead the subagents follow.
 		{"claude", "true", "follow_lead", "haiku", nil, "haiku"},
@@ -416,7 +423,7 @@ func TestSchedulePreviewSubagentsLiveDB(t *testing.T) {
 			f := newEffFix(t, nil)
 			f.bothUsable(10, 10)
 			f.leadTemplate("opus", "gpt-6-sol")
-			f.subagent("coder", "sonnet", "gpt-6-astra")
+			f.subagent("eff-coder", "sonnet", "gpt-6-astra")
 			f.subagent("scribe", "haiku", "")
 			f.subagent("plain", "", "")
 			body := fmt.Sprintf(`{"target":"sweep","harness":%q,"override_subagent_model":%s`, tc.harness, tc.toggle)

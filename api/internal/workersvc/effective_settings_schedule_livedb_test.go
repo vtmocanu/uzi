@@ -38,7 +38,7 @@ func TestEffectiveSettingsSchedulePinClaimEquivalenceLiveDB(t *testing.T) {
 			fx := newEffFix(t)
 			fx.anthropic()
 			fx.codexDefault()
-			fx.template("lead", "opus", "gpt-6-astra")
+			fx.template(effLeadName, "opus", "gpt-6-astra")
 			fx.lane("default_codex_model", "gpt-6-sol")
 			fx.iid++
 			seedEligibleIssue(t, fx.env, fx.repoID, fx.iid)
@@ -81,9 +81,9 @@ func TestEffectiveSettingsScheduleSubagentModesLiveDB(t *testing.T) {
 				fx := newEffFix(t)
 				fx.anthropic()
 				fx.codexDefault()
-				fx.template("lead", "opus", "gpt-6-sol")
-				fx.template("coder", "sonnet", "gpt-6-astra")
-				fx.template("tester", "", "")
+				fx.template(effLeadName, "opus", "gpt-6-sol")
+				fx.template("eff-coder", "sonnet", "gpt-6-astra")
+				fx.template("eff-tester", "", "")
 				fx.iid++
 				seedEligibleIssue(t, fx.env, fx.repoID, fx.iid)
 				created, err := fx.svc.CreateScheduledRun(fx.env.ctx, fx.userID, fx.repoID, fx.iid, "eff", nil, nil, nil, toggle, nil, nil, &h)

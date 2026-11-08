@@ -136,6 +136,13 @@ func newEffFix(t *testing.T, instance settings.Store) *effFix {
 		VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, conn, f.user, []byte("x"))
 	f.exec(`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
 		VALUES ($1, $2, 1, $3, $4, 'main', true)`, f.repo, conn, "g/"+f.repo.String(), "https://forge.e2e/g/"+f.repo.String())
+	// Seed the builtin roster first so the shared namespace is identical in every
+	// test order, then switch all of it off for this user. A user template whose
+	// name exists in the shared namespace is excluded by the prediction and claim
+	// queries, so fixtures use names no builtin carries (see leadTemplate, subagent).
+	if _, err := store.ReconcileBuiltinTemplates(ctx, q); err != nil {
+		t.Fatalf("reconcile builtins: %v", err)
+	}
 	// The shared lead roster must not decide: every shared template is off for this user.
 	f.exec(`INSERT INTO agent_template_allocations(template_id,user_id,enabled)
 		SELECT id,$1,false FROM agent_templates
@@ -243,11 +250,23 @@ func (f *effFix) set(column, value string) {
 	f.exec(`UPDATE users SET `+column+` = NULLIF($2,'') WHERE id = $1`, f.user, value)
 }
 
+// effLeadName is lead-shaped (agenttmpl.IsLeadName) but not a builtin name, so
+// the fixture's user template is not shadowed by the shared builtin "lead".
+const effLeadName = "orchestrator"
+
 func (f *effFix) leadTemplate(claudePin, codexPin string) {
 	f.t.Helper()
+	name := effLeadName
+	var shared int
+	if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM agent_templates WHERE scope <> 'user' AND name = $1`, name).Scan(&shared); err != nil {
+		f.t.Fatalf("shared name probe: %v", err)
+	}
+	if shared != 0 {
+		f.t.Fatalf("fixture template %q collides with a shared template: the resolver and claim path exclude a user template whose name exists in the shared namespace", name)
+	}
 	id := uuid.New()
 	f.exec(`INSERT INTO agent_templates(id,name,description,prompt_body,scope,user_id,model,codex_model)
-		VALUES($1,'lead','d','b','user',$2,NULLIF($3,''),NULLIF($4,''))`, id, f.user, claudePin, codexPin)
+		VALUES($1,$2,'d','b','user',$3,NULLIF($4,''),NULLIF($5,''))`, id, name, f.user, claudePin, codexPin)
 	f.exec(`INSERT INTO agent_template_allocations(template_id,user_id,enabled) VALUES($1,$2,true)`, id, f.user)
 }
 
