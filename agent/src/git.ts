@@ -1678,7 +1678,7 @@ export function isCompletionSourceFenceError(e: unknown): boolean {
   return e instanceof CompletionSourceFenceError;
 }
 
-function recoveryCaptureKey(branch: string): string {
+export function recoveryCaptureKey(branch: string): string {
   return `uzi-recovery.${branch}.clone`;
 }
 
@@ -2394,7 +2394,7 @@ function journalHasExtraFields(raw: string): boolean {
   }
 }
 
-function stoppedMarkerKey(runId: string): string {
+export function stoppedMarkerKey(runId: string): string {
   return `uzi-stopped.${runId}.entry`;
 }
 
@@ -12696,6 +12696,14 @@ export class GitCache {
       this.checkRecoveryInterruption();
       return { entries: [], complete: false };
     }
+  }
+
+  /**
+   * issue #3644 m4a: {@link readBareAttributionConfig} under the bare lock, for a caller that does not hold it (the restore
+   * route's pre-claim classification). Config only: it opens no path under the runner root and writes nothing.
+   */
+  readRestoreAttribution(barePath: string): Promise<{ entries: BareAttributionEntry[]; complete: boolean }> {
+    return this.withLock(barePath, () => this.readBareAttributionConfig(barePath));
   }
 
   /** The journal naming `expected` ((a) sites): S's entry when a composite's S matches it, else P's plain journal. */

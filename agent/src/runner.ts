@@ -30,7 +30,11 @@ import { MaintenanceBudget, RetainedSwitchSettlement } from "./maintenance-budge
 import { MaintenanceResources } from "./recovery-maintenance.js";
 import { AuthorityRefusal, SourceUseHeldRefusal } from "./authority-lock.js";
 import type { AuthorityRuntime, AuthorityWait } from "./authority-runtime.js";
-import { leaseEpoch, leaseHarness, type SourceUseLease } from "./completion-authority.js";
+import { leaseEpoch, leaseHarness, processWorkerIncarnation, type SourceUseLease } from "./completion-authority.js";
+import { CacheTargetBinding } from "./cache-target.js";
+import { RestoreCompositeBlockedError, RestoreCompositeError } from "./restore-journal.js";
+import { evaluateRestoreRoute, type EligibilityDeps, type RestoreRouteOutcome } from "./restore-route.js";
+import { processBoundary, processBoundaryDisabledReason, readBoundaryRecord, readLiveIdentity, type LiveIdentityOptions } from "./restore-boundary.js";
 import { buildClaudeSourceCore, buildCodexSourceCore, serializeSourceFence, sourceFenceOf } from "./completion-source.js";
 import type { CheckpointPublicationContext, PushPublicationContext, RemediationRestrictionIdentity, RemediationRecovery, MemoryParkRecord, WipIncompleteInfo, CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult, TrackingAttemptToken } from "./git.js";
 import {
@@ -1361,6 +1365,10 @@ class RetainedRecoveryStop extends Error {
 }
 
 class RetainedRecoveryCancelled extends RetainedRecoveryStop {}
+
+/** issue #3644 m4a: a nonterminal stop decided by the independent-restore route (a composite, a refusal, or an eligible verdict
+ *  with seeding not yet enabled). The discovery catch rethrows it untouched: it is never a discovery failure and never reported. */
+class RestoreRouteStop extends RetainedRecoveryStop {}
 
 /** issue #3865: a retained successor seed refused for data-volume capacity. An ordinary retryable
  *  failure of the reserved iteration: it is never an adoption failure, a disk park or a stop. */
@@ -2921,6 +2929,11 @@ interface RunFlight {
    *  captured, so a drift observation reads each PRD at the same commit. Detection input only. */
   semanticDrift?: { barePath: string; headSha: string; sources: FrozenSource[] };
   inventoryGuarded?: boolean;
+  /** issue #3644 m4a: set by opaque pre-discovery when this retained claim takes the independent-restore route (the predecessor's
+   *  slot is foreign-owned). It skips legacy discovery and the predecessor diagnostics and never reaches the reservation. */
+  restoreRoute?: boolean;
+  /** issue #3644 m4a: the disk governor's cache target (executor + HOME), bound per the claim's route; see cache-target.ts. */
+  cacheTarget?: CacheTargetBinding<Executor>;
   /** Transient ambiguity guard; conveys neither durable evidence nor deletion authority. */
   completionSendAttempted?: boolean;
   /** PRD #1416 M2: the set of fetched tips already steered on for a divergence, so the mid-run
@@ -3096,6 +3109,9 @@ export interface RunnerOptions {
    *  GitCache effect opens its transaction through it, BEFORE any C/S/J/B it takes; the flight's
    *  executor is bound to its clone through it. Absent (unit tests): legacy behaviour. */
   authority?: AuthorityRuntime;
+  /** issue #3644 m4a: how this process's live identity is re-read for the restore predicate (tests inject a procfs root and
+   *  hostname). Absent: the real procfs, with the pod uid and container from the environment. */
+  restoreIdentity?: LiveIdentityOptions;
   memoryRuntime?: WorkerMemoryRuntime;
   /** issue #3639: the memory guard's timing, from which the receipt gate derives its sample wait. Absent: the wait cannot
    *  prove a fresh sample, so a gated claim falls back to a re-park. */
@@ -3333,6 +3349,8 @@ export class RunRunner {
    *  Disabled when the worker has no join token (a token-less test harness). */
   private readonly recovery: RecoveryCoordinator;
   private readonly authority: AuthorityRuntime | undefined;
+  /** issue #3644 m4a: see RunnerOptions.restoreIdentity. */
+  private readonly restoreIdentity: LiveIdentityOptions | undefined;
   /** issue #1582 M2 — the authenticated ancestry-settlement journal (adopted predecessor holds)
    *  and the settler that drives the api settle for them. Disabled without a worker token. */
   private readonly settlement: SettlementJournal;
@@ -3535,6 +3553,7 @@ export class RunRunner {
     opts: RunnerOptions = {},
   ) {
     this.authority = opts.authority;
+    this.restoreIdentity = opts.restoreIdentity;
     // issue #3404 M2 U5: the runtime's retired-tombstone finisher must not run while a binder for the path is pending.
     this.authority?.registerBinderPending(clonePath => this.completionBinderPendingAt(clonePath));
     this.memoryRuntime = opts.memoryRuntime;
@@ -5578,21 +5597,29 @@ export class RunRunner {
       // Issue #1830: every phase is covered. A run that cannot take the counted park right now (a
       // gate or question wait, a revision turn, finalize) has its rebuildable caches dropped in
       // place instead; the governor decides which, from the statuses this runner reports.
-      const home = runHome;
+      // issue #3644 m4a: the callbacks work on ONE bindable {executor, home} target, never on values captured here. A first
+      // claim (generation 1, or one with no generation) binds it now; a retained re-claim (generation > 1) starts unbound and
+      // is bound by legacy routing, or by the restore swap (drainThenBind), so nothing touches a predecessor's HOME before then.
+      const cacheTarget = (flight.cacheTarget = new CacheTargetBinding<Executor>());
+      if (!((claim.claim_generation ?? 0) > 1)) cacheTarget.bind({ executor, home: runHome });
       this.diskGovernor.register(runId, {
-        home,
+        home: () => cacheTarget.home(),
+        withHome: use => cacheTarget.use(target => use(target.home)),
         requestStop: () => steering.requestDiskStop(),
         reclaimInPlace: async () => {
           const message = "run caches dropped in place at the hard disk threshold";
-          // The self-improve finalize's evidence install reads `.npm/_cacache`; the executor's own
-          // keep-until-joined rule does not cover it, so keep it here and bypass the executor.
-          const r =
-            executor.reclaimCachesInPlace && !flight.jsDepsInstalling
-              ? await executor.reclaimCachesInPlace()
-              : await dropRunCaches(home, runLog, {
+          // One snapshot for the whole drop: the executor reclaim and the fallback both act on the pair read here. Unbound
+          // (or a swap draining) refuses and drops nothing.
+          const r = await cacheTarget.use(async target => {
+            // The self-improve finalize's evidence install reads `.npm/_cacache`; the executor's own
+            // keep-until-joined rule does not cover it, so keep it here and bypass the executor.
+            return target.executor.reclaimCachesInPlace && !flight.jsDepsInstalling
+              ? await target.executor.reclaimCachesInPlace()
+              : await dropRunCaches(target.home, runLog, {
                   message,
                   ...(flight.jsDepsInstalling ? { keep: [".npm/_cacache"] } : {}),
                 });
+          });
           if (r && r.dropped.length > 0) {
             batcher.emit({
               kind: "status",
@@ -6488,6 +6515,7 @@ export class RunRunner {
       this.bindWorkerMemory(claim, flight);
       await this.phaseClone(claim, flight);
       executor = flight.executor;
+      flight.cacheTarget?.refreshExecutor(executor);
       if (flight.policyAdmission && !await this.reconcilePolicyAdmission(claim, flight)) return;
       // Issue #1324 M5: a claim that carries an ACTIVE publication enrollment is a PUBLICATION-ONLY episode.
       // The run's work is already done and recorded in the intent, so no executor runs, no session starts
@@ -13991,6 +14019,7 @@ export class RunRunner {
     const discoverRetained = async (required = false, branch = coordinates.branch) => {
       retainedJournal = undefined;
       receiptBare = undefined;
+      flight.restoreRoute = undefined;
       try {
         this.retainedLifecycleGuard(flight);
         if (required && branch !== coordinates.branch) throw new Error("retained recovery branch mismatch");
@@ -14000,6 +14029,10 @@ export class RunRunner {
             throw error;
           });
           const receipt = flight.memoryReceipt;
+          // issue #3644 m4a: classify the branch from the bare's config alone BEFORE any legacy discovery (which lstats every
+          // source it names). A composite or an invalid one stops here; a receipt flight only needs that stop (its own source
+          // is bound by the receipt); the active-key route decision is made for ordinary retained claims below.
+          const opaque = cachePresent ? await this.opaquePreDiscovery(claim, flight, branch) : undefined;
           if (receipt) {
             // issue #3639: bound to the receipt's source, read-only, and no flight coordinate is assigned here.
             if (cachePresent) {
@@ -14012,6 +14045,14 @@ export class RunRunner {
                 retainedJournal = retained.journal;
               }
             }
+            return;
+          }
+          if (opaque?.route === "restore") {
+            // The predecessor's slot is foreign-owned: skip legacy discovery entirely (it would lstat P's path) and hand the
+            // opaque journal to the restore route in recoverRetainedClaim.
+            flight.barePath = opaque.barePath;
+            flight.restoreRoute = true;
+            retainedJournal = opaque.journal;
             return;
           }
           if (cachePresent && typeof this.git.recoveryAttemptMode === "function") {
@@ -14068,6 +14109,7 @@ export class RunRunner {
           throw error;
         }
         this.retainedLifecycleGuard(flight);
+        if (error instanceof RestoreRouteStop) throw error;
         if (flight.memoryReceipt && !(error instanceof RetainedRecoveryStop)) {
           // issue #3639: every discovery failure of a receipt flight is a receipt fallback: no recovery episode is blocked,
           // no coordinate is assigned and no generic failure is reported.
@@ -14113,6 +14155,10 @@ export class RunRunner {
       }
     };
     await discoverRetained();
+    // issue #3644 m4a: every non-restore outcome is the legacy route, which binds the governor's cache target to the initial
+    // executor and HOME before any HOME use (the receipt handoff, the attributed-process reap, the recovery itself). The restore
+    // route stays unbound through classification and every refusal.
+    if (!flight.restoreRoute && flight.runHome) flight.cacheTarget?.bind({ executor: flight.executor, home: flight.runHome });
     if (flight.memoryReceipt) {
       // issue #3639: never a fresh clone and never an unchecked continuation.
       if (!retainedJournal || receiptBare === undefined) {
@@ -27064,6 +27110,114 @@ export class RunRunner {
       sources: record.settlement.sources.length, claim_generation: record.binding.claimGeneration });
   }
 
+  /**
+   * issue #3644 m4a - classify the branch from the bare's config alone, before any legacy discovery (which lstats every source it
+   * names). A composite restore entry stops the claim; an invalid composite or another run's stops it too (today those would
+   * fall into the discovery catch and be reported as a generic failure). For an ordinary retained claim whose active-key journal
+   * is this run's and whose slot is foreign-owned the answer is the restore route; everything else is the unchanged legacy
+   * discovery. Foreign-owned means: `active_run_snapshot` negotiated, a claim generation above 1 (a first claim never has a
+   * predecessor), a different worker incarnation owning the slot, and the slot either `active` or carrying a pending footprint.
+   * A journal already blocked or memory-parked keeps its legacy outcome. Writes nothing.
+   */
+  private async opaquePreDiscovery(claim: ClaimResponse, flight: RunFlight, branch: string):
+    Promise<{ route: "legacy" } | { route: "restore"; journal: RecoveryJournalEntry; barePath: string }> {
+    const legacy = { route: "legacy" as const };
+    if (typeof this.git.discoverOpaque !== "function") return legacy;
+    const barePath = this.git.barePathFor(claim.repo.clone_url);
+    let found: Awaited<ReturnType<GitCache["discoverOpaque"]>>;
+    try {
+      found = await this.git.discoverOpaque(barePath, branch, flight.runId);
+    } catch (error) {
+      if (!(error instanceof RestoreCompositeError)) throw error;
+      this.retainedLifecycleGuard(flight);
+      flight.runLog.warn("restore entry present; claim stopped", {
+        blocked_by_other_run: error instanceof RestoreCompositeBlockedError, error: sanitizeForLog(errMessage(error)) });
+      throw new RestoreRouteStop({ cause: error });
+    }
+    this.retainedLifecycleGuard(flight);
+    if (found.kind === "composite") {
+      flight.runLog.warn("restore entry present; claim stopped", { stage: found.composite.stage });
+      throw new RestoreRouteStop();
+    }
+    const authority = this.authority;
+    const generation = claim.claim_generation;
+    if (flight.memoryReceipt || found.kind !== "sameRun" || found.source !== "active" || !authority ||
+        !this.client.hasFeature("active_run_snapshot") || !Number.isSafeInteger(generation) || (generation as number) < 2) return legacy;
+    if (found.journal.recovery?.stage === "blocked" || found.journal.memoryPark !== undefined) return legacy;
+    let slot: Awaited<ReturnType<AuthorityRuntime["peekSlot"]>>;
+    try { slot = await authority.peekSlot(found.journal.clonePath); } catch { return legacy; }
+    if (slot === null || slot.owner.worker === (authority.authorityIncarnation() ?? processWorkerIncarnation())) return legacy;
+    if (slot.state !== "active" && slot.pending === null) return legacy;
+    flight.runLog.info("retained predecessor is foreign-owned; taking the independent restore route", { claim_generation: generation });
+    return { route: "restore", journal: found.journal, barePath };
+  }
+
+  /**
+   * issue #3644 m4a - the restore route's decision for a retained claim whose predecessor P is foreign-owned. Reached after the
+   * #3607 policy hold, the #3638 memory re-park and `heldByOtherSink` (all unchanged and run first) and before the reservation,
+   * so P's journal is never rewritten and nothing is admitted, captured, normalized, reaped or quiesced. ALWAYS throws a
+   * {@link RestoreRouteStop}: a refusal logs `independent restore refused; predecessor retained` plus one bounded feed line; an
+   * eligible verdict logs `independent restore eligible; seeding not enabled in this build`. Neither writes P's journal, ledger
+   * or slot, deletes agent-home/<runId> or provision/<runId>, or reports a terminal state.
+   */
+  private async stopRestoreRoute(claim: ClaimResponse, flight: RunFlight, source: RecoveryJournalEntry, bare: string, branch: string): Promise<never> {
+    const authority = this.authority;
+    if (!authority || !((claim.claim_generation ?? 0) > 1)) throw new Error("the restore route requires an authority runtime and a retained claim generation");
+    const evidence = authority.restoreEvidenceOptions();
+    const deps: EligibilityDeps = {
+      selfIncarnation: authority.authorityIncarnation() ?? processWorkerIncarnation(),
+      processBoundary, processBoundaryDisabledReason,
+      readBoundary: incarnation => readBoundaryRecord(evidence, incarnation),
+      readLive: () => readLiveIdentity(this.restoreIdentity ?? {
+        podUid: process.env.UZI_POD_UID, ...(process.env.UZI_POD_CONTAINER ? { container: process.env.UZI_POD_CONTAINER } : {}) }),
+      peekSlot: clonePath => authority.peekSlot(clonePath),
+      inspectRecords: runId => this.recovery.inspect(runId),
+      verifyPin: spec => this.git.verifyRestorePinRefs(bare, spec),
+      readConfig: () => this.git.readRestoreAttribution(bare),
+      // The runtime's read-only assertBareClear: with no transaction active it only peeks the bare's own slot and refuses while a
+      // running pending footprint covers it. An answer that cannot be obtained is busy.
+      bareBusy: async () => {
+        try { await authority.hooks.assertBareClear(bare, "restore-route"); return false; } catch { return true; }
+      },
+      peekBareSlot: () => authority.peekSlot(bare),
+      isAncestor: (tip, sha) => this.git.isAncestorRef(bare, tip, sha),
+    };
+    const raw = JSON.stringify(source);
+    let outcome: RestoreRouteOutcome;
+    try {
+      outcome = await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.codexBoundaryDeadlineMs,
+        () => evaluateRestoreRoute(deps, {
+          runId: flight.runId, branch, bareDirName: pathBasename(bare), claimDefaultBranch: claim.repo.default_branch ?? undefined,
+          checkpointTip: claim.checkpoint_tip, journalRaw: raw,
+          certified: {
+            guardedRunKind: ["issue", "mr_rework", "self_improve"].includes(flight.runKind),
+            inventoryGuarded: flight.inventoryGuarded === true,
+            featureNegotiated: this.client.hasFeature("recovery_completed_publication_v1"),
+            authorityPresent: true,
+          },
+        }));
+    } catch (error) {
+      this.retainedLifecycleGuard(flight);
+      if (error instanceof RetainedRecoveryStop || error instanceof CredentialSwitchSignal) throw error;
+      outcome = { eligible: false, reason: "evaluation_failed", known: { detail: sanitizeForLog(errMessage(error)) } };
+    }
+    this.retainedLifecycleGuard(flight);
+    if (outcome.eligible) {
+      flight.runLog.info("independent restore eligible; seeding not enabled in this build", {
+        verdict: outcome.verdict.boundary, pin_generation: outcome.verdict.generation, source_sha: outcome.verdict.pin.sourceSha,
+        slot: outcome.known.slot, cross_check: outcome.known.crossCheck, claim_generation: claim.claim_generation });
+      throw new RestoreRouteStop();
+    }
+    const known = outcome.known;
+    flight.runLog.warn("independent restore refused; predecessor retained", {
+      reason: outcome.reason, slot: known.slot, crossCheck: known.crossCheck, verdict: known.verdict,
+      pinGeneration: known.pinGeneration, sourceSha: known.sourceSha, ...(known.detail === undefined ? {} : { detail: known.detail }),
+      claim_generation: claim.claim_generation });
+    flight.batcher.emit({ kind: "status", agent: "worker", payload: {
+      text: sanitizeForLog(flight.redactText(`independent restore refused (${outcome.reason}); the retained predecessor is kept and the run is not failed`), 240) } });
+    throw new RestoreRouteStop();
+  }
+
   /** At most three durably precharged iterations per server recovery episode.
    * A newer episode with a fresh owned claim can renew budget exhaustion. Adoption failure
    * needs an unconsumed raw owner grant and a newer owned claim; other blockers persist.
@@ -27122,8 +27276,10 @@ export class RunRunner {
       await this.observeCancelAtHeldSeam(claim, flight);
       throw new RetainedRecoveryStop();
     }
-    await this.logPredecessorMemorySettlement(flight, bare, branch, source);
-    const inherited = flight.sourceInherited?.family;
+    // issue #3644 m4a: both diagnostics read the predecessor's source tree (settlement sources, maintenance family), which the
+    // restore route must never touch.
+    if (!flight.restoreRoute) await this.logPredecessorMemorySettlement(flight, bare, branch, source);
+    const inherited = flight.restoreRoute ? undefined : flight.sourceInherited?.family;
     if (inherited?.observedExecution.runId === flight.runId) {
       flight.sourceFamilyMatched = !!await this.git.matchMaintenanceSourceFamily(bare, branch, key, flight.runId,
         inherited.originals, { signal: this.retainedLifecycleSignal(flight) });
@@ -27296,6 +27452,9 @@ export class RunRunner {
     if (episode && (recoveryEpisode ?? 0) > (episode.episode ?? 0) &&
         (!Number.isSafeInteger(flight.claimGeneration) || flight.claimGeneration < 1 ||
           flight.claimGeneration <= (episode.claimGeneration ?? 0))) throw new RetainedRecoveryStop();
+    // issue #3644 m4a: the restore route classifies from the bare config and the authority/boundary evidence alone, BEFORE the
+    // reservation below (which rewrites the predecessor's journal) and without ever entering it. Always throws.
+    if (flight.restoreRoute) await this.stopRestoreRoute(claim, flight, source, bare, branch);
     for (;;) {
       this.retainedLifecycleGuard(flight);
       let reservation: Awaited<ReturnType<GitCache["reserveRecoveryIteration"]>>;

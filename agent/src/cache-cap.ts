@@ -152,6 +152,10 @@ export interface GovernedRun {
    *  a restore's successor runs under `<runId>.g<N>`): it returns undefined while the run is unbound, and an unbound run is
    *  skipped by the measurement, the boundary and the hard layer's selection. A plain string is a permanently bound HOME. */
   home: string | (() => string | undefined);
+  /** Optional (issue #3644 m4a): run `use` with ONE snapshot of the bound HOME held for the whole operation, so a drain-then-bind
+   *  swap (see cache-target.ts) waits for a measurement or trim still working on the old HOME. Resolves undefined, running nothing,
+   *  while the run is unbound. Absent: `home` is read once per operation and nothing is held. */
+  withHome?: <T>(use: (home: string) => Promise<T>) => Promise<T | undefined>;
   /** Stop the run's current turn through the steering channel's `disk` pause mode. */
   requestStop: () => void;
   /** Issue #1830: drop the run's rebuildable caches where it stands, for a run that cannot be
@@ -159,9 +163,11 @@ export interface GovernedRun {
   reclaimInPlace: () => Promise<RunCacheDropResult | undefined>;
 }
 
-interface RunState extends Omit<GovernedRun, "home"> {
+interface RunState extends Omit<GovernedRun, "home" | "withHome"> {
   /** {@link GovernedRun.home}, normalised to its function form. */
   home: () => string | undefined;
+  /** {@link GovernedRun.withHome}, normalised: one HOME snapshot per operation. */
+  withHome: <T>(use: (home: string) => Promise<T>) => Promise<T | undefined>;
   /** Latest measured cache bytes (a boundary's or the hard layer's), if any. */
   cacheBytes?: number;
   /** Consecutive turn boundaries that ended over the cap. */
@@ -235,7 +241,12 @@ export class DiskGovernor {
   /** Watch a running Claude run. Idempotent per run id (a later call replaces the entry). */
   register(runId: string, run: GovernedRun): void {
     const { home } = run;
-    this.runs.set(runId, { ...run, home: typeof home === "string" ? () => home : home, overStreak: 0, inExecutor: false, sentSeq: 0, lastNonRunningSentSeq: 0, runningAckedSeq: 0, lastNonRunningAckedSeq: 0, ackedStatusSeq: 0, stopRequested: false, inPlaceSkipped: false });
+    const homeOf = typeof home === "string" ? () => home : home;
+    const withHome = run.withHome ?? (async <T>(use: (h: string) => Promise<T>): Promise<T | undefined> => {
+      const h = homeOf();
+      return h === undefined ? undefined : use(h);
+    });
+    this.runs.set(runId, { ...run, home: homeOf, withHome, overStreak: 0, inExecutor: false, sentSeq: 0, lastNonRunningSentSeq: 0, runningAckedSeq: 0, lastNonRunningAckedSeq: 0, ackedStatusSeq: 0, stopRequested: false, inPlaceSkipped: false });
   }
 
   /** Issue #1830: `executor.run` is about to start; the run may now take a stop (see {@link parkable}). */
@@ -376,9 +387,9 @@ export class DiskGovernor {
       const lowWater = Math.floor(cap * this.opts.config.lowWater);
       let result: TrimResult | undefined;
       try {
-        const home = run.home();
-        if (home === undefined) throw new Error("the run has no bound HOME");
-        result = await this.trim(home, { totalBytes: measured, capBytes: cap, lowWaterBytes: lowWater }, this.opts.log);
+        const trimmed = await run.withHome(home => this.trim(home, { totalBytes: measured, capBytes: cap, lowWaterBytes: lowWater }, this.opts.log));
+        if (trimmed === undefined) throw new Error("the run has no bound HOME");
+        result = trimmed;
       } catch (e) {
         this.opts.log.warn("run cache trim failed", { ...fields, error: errMessage(e) });
       }
@@ -560,14 +571,16 @@ export class DiskGovernor {
 
   /** Measure one run's caches, recording the reading; undefined when it failed. */
   private async measureRun(run: RunState, deadline = this.now() + MEASURE_DEADLINE_MS): Promise<number | undefined> {
-    const home = run.home();
-    if (home === undefined) return undefined;
+    let measuring: string | undefined;
     try {
-      const m = await this.measure(home, { deadline });
-      run.cacheBytes = m.cacheBytes;
-      return m.cacheBytes;
+      return await run.withHome(async home => {
+        measuring = home;
+        const m = await this.measure(home, { deadline });
+        run.cacheBytes = m.cacheBytes;
+        return m.cacheBytes;
+      });
     } catch (e) {
-      this.opts.log.warn("run cache measurement failed", { run_home: home, error: errMessage(e) });
+      this.opts.log.warn("run cache measurement failed", { run_home: measuring, error: errMessage(e) });
       return undefined;
     }
   }

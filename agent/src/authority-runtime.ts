@@ -509,6 +509,20 @@ export class AuthorityRuntime implements AuthorityScope {
     }, read);
   }
 
+  /**
+   * issue #3644 m4a - one slot read through {@link peekAuthoritySlot}: no authority transaction, no write, no repair. The slot
+   * key derivation is the only touch of `clonePath` (its lstat walk); nothing inside the clone is read. Rejects on any
+   * uncertainty (an unreadable or unauthenticated store, a slot one ahead of its head); null when no slot exists.
+   */
+  peekSlot(clonePath: string): Promise<SlotSnapshot | null> {
+    return peekAuthoritySlot({ dataDir: this.#options.lifetime.dataDir, workerToken: this.#options.workerToken }, path.resolve(clonePath));
+  }
+
+  /** issue #3644 m4a - the data root and join token the restore boundary records are read and authenticated with. */
+  restoreEvidenceOptions(): { dataDir: string; workerToken: string } {
+    return { dataDir: this.#options.lifetime.dataDir, workerToken: this.#options.workerToken };
+  }
+
   /** Whether `clonePath` is owned by a sink other than `sink` whose end has not been confirmed. Read-only. */
   heldByOtherSink(clonePath: string, sink: Set<string> | undefined): boolean {
     const owner = this.#owners.get(path.resolve(clonePath));
