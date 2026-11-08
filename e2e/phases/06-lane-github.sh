@@ -116,7 +116,7 @@ BADCARD="$(apiget "/api/repos/$REPO_ID/board" | jq '[.board.cards[] | select(.ii
 pass "no PR on the board — R4 holds ✓"
 
 # 6) CI-fix TRIGGER gate (D8, the CI-fix loop's silent-failure surface): main is at
-#    "failure" in the cache (step 4), so the trigger must ACCEPT it (ci_fix.go:95
+#    "failure" in the cache (step 4), so the trigger must ACCEPT it (handler CreateCIFixRun's
 #    IsFailed("failure")), snapshot the failed pipeline (ListWorkflowJobs +
 #    GetWorkflowJobLogs), and create a ci_fix run. A duplicate on the same ref is 409.
 #    NOTE: the job-log 302 → text/plain second hop is unit-tested with the SSRF guard
@@ -126,7 +126,7 @@ pass "no PR on the board — R4 holds ✓"
 say "github Fix-CI gate: a 'failure' Actions run drives Fix CI → ci_fix run"
 GHFIX="$(apipost "/api/repos/$REPO_ID/ci-fix-runs" '{"ref":"main"}' | jq -r '.run.id')"
 { [ -n "$GHFIX" ] && [ "$GHFIX" != null ]; } \
-  || fail "Fix CI not triggered on a GitHub 'failure' run (the ci_fix.go:95 gate must accept 'failure')"
+  || fail "Fix CI not triggered on a GitHub 'failure' run (the CreateCIFixRun IsFailed gate must accept 'failure')"
 [ "$(apiget "/api/runs/$GHFIX" | jq -r '.run.kind')" = ci_fix ] || fail "run kind is not ci_fix"
 GHDUP="$(apipost_code "/api/repos/$REPO_ID/ci-fix-runs" '{"ref":"main"}')"
 [ "$GHDUP" = 409 ] || fail "a duplicate Fix CI on main should be 409, got $GHDUP"

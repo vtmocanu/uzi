@@ -241,14 +241,105 @@ function fleetWorker(over: Partial<Worker> & Pick<Worker, "id" | "name">): Worke
     draining_since: null,
     manual_cordoned_at: null,
     effective_cordoned: false,
+    // A coherent fleet release: current unless a row says otherwise.
+    version: "0.87.0-rc.4",
+    upgrade_status: "up_to_date",
+    upgrade_detail: null,
+    upgrade_target: "0.87.0-rc.4",
     ...over,
   };
 }
 
+const GiB = 1024 ** 3;
+const gib = (n: number) => Math.round(n * GiB);
+// A worker with no /nix volume and only the volumes named, in GiB (used, total). fleetBase
+// carries /nix and no dind, so every row that sets disk goes through here.
+function disks(over: { data?: [number, number]; dind?: [number, number] }): Partial<Worker> {
+  return {
+    stats_disk_nix_bytes: null,
+    stats_disk_nix_total_bytes: null,
+    stats_disk_data_bytes: over.data ? gib(over.data[0]) : null,
+    stats_disk_data_total_bytes: over.data ? gib(over.data[1]) : null,
+    stats_disk_data_inodes: null,
+    stats_disk_data_total_inodes: null,
+    stats_disk_dind_bytes: over.dind ? gib(over.dind[0]) : null,
+    stats_disk_dind_total_bytes: over.dind ? gib(over.dind[1]) : null,
+    stats_disk_dind_inodes: null,
+    stats_disk_dind_total_inodes: null,
+  };
+}
+
+// Reported runs join to the viewer's own mock runs (run-task-handoff, run-seeded and
+// run-mr-rework are seeded as running in every scenario; run-ov-own-* come from this file).
+// "5e44c9d7-..." is a uuid-looking id with no run in the list, so it renders as "run 5e44c9d7".
+const UNJOINED_RUN_ID = "5e44c9d7-3b1a-4c8e-9f20-6a7d81c4e2b0";
+const reported = (run_id: string, phase = "running") => ({ run_id, phase, claim_generation: 1 });
+const runDisk = (run_id: string, home: number, cache: number, truncated = false) => ({
+  run_id,
+  home_bytes: gib(home),
+  cache_bytes: gib(cache),
+  truncated,
+  sampled_at: minsAgo(1),
+});
+
 export function overviewNextOwnerWorkers(): Worker[] {
   return [
-    fleetWorker({ id: "w-ov-full-a", name: "base.l-highmem-3a1f", busy: true, active_runs: 2, max_concurrent_runs: 2, stats_cpu_pct: 30, stats_mem_bytes: 6442450944, stats_mem_limit_bytes: 34359738368, stats_source: "cgroup" }),
-    fleetWorker({ id: "w-ov-full-b", name: "base.l-highmem-7c2e", busy: true, active_runs: 2, max_concurrent_runs: 2, stats_cpu_pct: 100, stats_mem_bytes: 7194132480, stats_mem_limit_bytes: 34359738368, stats_source: "cgroup" }),
+    // Healthy: data volume in the warn band, two joined runs with sizes, version and uptime.
+    fleetWorker({
+      id: "w-ov-full-a",
+      name: "base.l-highmem-3a1f",
+      busy: true,
+      active_runs: 2,
+      max_concurrent_runs: 2,
+      stats_cpu_pct: 30,
+      stats_mem_bytes: 6442450944,
+      stats_mem_limit_bytes: 34359738368,
+      stats_source: "cgroup",
+      ...disks({ data: [33.6, 48.9], dind: [15.5, 50] }),
+      version: "0.87.0-rc.4",
+      online_since: minsAgo(2 * 24 * 60 + 4 * 60),
+      reported_runs: [reported("run-task-handoff"), reported("run-seeded")],
+      run_disk: [runDisk("run-task-handoff", 14.2, 6.1), runDisk("run-seeded", 1.1, 0.4)],
+    }),
+    // Disk danger: dind at 91%, a held-work decision, one joined and one unjoined run.
+    fleetWorker({
+      id: "w-ov-full-b",
+      name: "base.l-highmem-7c2e",
+      busy: true,
+      active_runs: 2,
+      max_concurrent_runs: 2,
+      stats_cpu_pct: 100,
+      stats_mem_bytes: 7194132480,
+      stats_mem_limit_bytes: 34359738368,
+      stats_source: "cgroup",
+      ...disks({ data: [22.8, 29.4], dind: [45.6, 50] }),
+      custody_decisions_needed: 1,
+      version: "0.87.0-rc.4",
+      online_since: minsAgo(19 * 60 + 40),
+      reported_runs: [reported("run-mr-rework"), reported(UNJOINED_RUN_ID)],
+      run_disk: [runDisk("run-mr-rework", 9.8, 3.2), runDisk(UNJOINED_RUN_ID, 21.7, 8.5, true)],
+    }),
+    // Memory authority lost: a hosted ephemeral worker the api withholds guard-bound runs from.
+    fleetWorker({
+      id: "w-ov-memauth",
+      name: "ephemeral-4b2d9e70",
+      kind: "hosted",
+      hosted_size: "l-highmem",
+      ephemeral: true,
+      busy: true,
+      active_runs: 1,
+      max_concurrent_runs: 2,
+      memory_authority_lost_at: minsAgo(30),
+      stats_cpu_pct: 41,
+      stats_mem_bytes: 9663676416,
+      stats_mem_limit_bytes: 34359738368,
+      stats_source: "cgroup",
+      ...disks({ data: [11.2, 48.9] }),
+      version: "0.87.0-rc.4",
+      online_since: minsAgo(95),
+      reported_runs: [reported("run-ov-own-cifix")],
+      run_disk: [runDisk("run-ov-own-cifix", 3.4, 1.2)],
+    }),
     fleetWorker({
       id: "w-ov-rolling",
       name: "base.l-highmem-b54d",
@@ -265,9 +356,49 @@ export function overviewNextOwnerWorkers(): Worker[] {
       stats_mem_bytes: 7405568000,
       stats_mem_limit_bytes: 34359738368,
       stats_source: "cgroup",
+      ...disks({ data: [18.4, 48.9], dind: [9.1, 50] }),
+      version: "0.86.0",
+      online_since: minsAgo(3 * 24 * 60),
+      reported_runs: [reported("run-ov-own-cooldown")],
+      run_disk: [runDisk("run-ov-own-cooldown", 5.3, 2.0)],
+    }),
+    // Ephemeral with a lease: idle, kept warm until the lease ends.
+    fleetWorker({
+      id: "w-ov-leased",
+      name: "ephemeral-9e17a0d3",
+      kind: "hosted",
+      hosted_size: "l-highmem",
+      ephemeral: true,
+      max_concurrent_runs: 1,
+      ephemeral_lease_expires_at: minsAhead(75),
+      stats_cpu_pct: 1,
+      stats_mem_bytes: 805306368,
+      stats_mem_limit_bytes: 34359738368,
+      stats_source: "cgroup",
+      ...disks({ data: [4.2, 48.9] }),
+      version: "0.87.0-rc.4",
+      online_since: minsAgo(50),
     }),
     fleetWorker({ id: "w-ov-cordoned", name: "bench-cordoned", max_concurrent_runs: 1, manual_cordoned_at: minsAgo(30), manual_cordoned_by_label: "you", effective_cordoned: true, stats_cpu_pct: 2, stats_mem_bytes: 536870912, stats_mem_limit_bytes: 8589934592, stats_source: "cgroup" }),
-    fleetWorker({ id: "w-ov-offline", name: "ci-runner-offline", status: "offline", max_concurrent_runs: 2, last_heartbeat_at: minsAgo(240), online_since: null, ...noStats }),
+    // Offline: last-known readings and the run it last reported.
+    fleetWorker({
+      id: "w-ov-offline",
+      name: "ci-runner-offline",
+      status: "offline",
+      max_concurrent_runs: 2,
+      last_heartbeat_at: minsAgo(120),
+      online_since: null,
+      stats_cpu_pct: 4,
+      stats_mem_bytes: gib(1.4),
+      stats_mem_limit_bytes: gib(16),
+      stats_source: "cgroup",
+      ...disks({ data: [23, 48.9] }),
+      version: "0.86.1",
+      upgrade_status: "outdated",
+      upgrade_detail: "running 0.86.1, target 0.87.0-rc.4",
+      reported_runs: [reported("run-ov-own-revising", "awaiting_approval")],
+      run_disk: [runDisk("run-ov-own-revising", 2.6, 0.9)],
+    }),
     fleetWorker({ id: "w-ov-nocap", name: "legacy-no-cap", max_concurrent_runs: null, active_runs: 1, busy: true, stats_cpu_pct: 12, stats_mem_bytes: 1073741824, stats_mem_limit_bytes: null, stats_source: "process" }),
     fleetWorker({ id: "w-ov-nostats", name: "quiet-worker", ...noStats }),
   ];

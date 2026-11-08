@@ -1301,6 +1301,7 @@ type Run struct {
 	AgentSourceRequested           pgtype.Text        `json:"agent_source_requested"`
 	AgentSourceRequestedBasis      pgtype.Text        `json:"agent_source_requested_basis"`
 	PlanAgentSource                pgtype.Text        `json:"plan_agent_source"`
+	CiFixMrIid                     pgtype.Int8        `json:"ci_fix_mr_iid"`
 }
 
 type RunCompletionAttempt struct {

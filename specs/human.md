@@ -640,6 +640,7 @@ Tracked as GitLab issue vtmocanu/uzi#71; PRD at `prds/done/71-ci-autofix.md`.
 - Scope: this is the `ci_fix` lane only. Failures on the default branch are the `ci-repair` scheduled lane (Feature #2865), not auto-fixed here. (AI-synced 2026-10-14)
 - Loop-guarded: max 2 automatic attempts per branch + an early stop when the failure hasn't changed; on giving up, uzi comments + notifies and stops (the manual Fix CI button remains). [user 2026-07-17]
 - "Usually we fix the code, not CI itself, but if CI is really at fault we can add a CI fix in the MR" — code fixes push automatically; a fix that edits the CI config passes the approval gate (human-approved before it pushes). [user 2026-07-17]
+- A CI fix is bound at creation to the one open PR among those uzi recorded for the branch; when that cannot be determined or verified, none is created (manual button: 409/502; automatic: retried or skipped without spending an attempt), and its source-publication context is scoped to that PR. (AI-synced 2026-11-08)
 
 ## Feature #72 — PRD lifecycle inside the run
 
@@ -850,6 +851,7 @@ Tracked as GitLab issue vtmocanu/uzi#218; PRD at `prds/done/218-park-resume-work
   guaranteed. The separate episode failure remains unsolved; this decision changes no
   retention, deletion, drain, recovery framework or episode journal. [approved #3101]
   (AI-synced 2026-10-18)
+- Worker shutdown joins its own already-authorized authority settlements and reports one bounded closed result (`drained` or `incomplete`, exit 1 on `incomplete`) within 35 s; compose and hosted workers allow a 40 s termination grace. The existing fail-closed refusal of unresolved records is unchanged. [approved #4066] (AI-synced 2026-11-07, #4066)
 - The WIP auto-save never commits a core dump (`core`, `core.<pid>`) or a file over 8 MiB and never drops one silently: a park keeps the clone and its journal, notifies once per claim and kind, and stays unverified until the file is removed. A `wip(park):` marker under a verified coverage wrapper is restored uncommitted at successor adopt; unproven look-alikes refuse and need owner action. (AI-synced 2026-10-21)
 
 ## Feature #1392 — Park a run on a transient forge failure at clone or fetch
@@ -1771,7 +1773,7 @@ Design record: [ADR-3845](../adr/3845-limit-aware-automatic-harness.md).
 Design record: `prds/done/3878-overview-preview-decisions.md` (epic #3873).
 
 - A new Overview lives at `/overview/next`, linked both ways with the current Overview at `/dashboard`, which is unchanged apart from that link; both read one shared data hook. (AI-synced 2026-11-05)
-- The page header shows a greeting and one status sentence: decisions and (deduplicated) pull requests waiting on the viewer, or "Nothing needs you right now.", then executing / queued / parked counts, across the factory for admins. Admins get a compact health chip. (AI-synced 2026-11-05)
+- The page header shows a greeting and one status sentence: decisions and (deduplicated) pull requests waiting on the viewer, or "Nothing needs you right now.", then executing / queued / parked counts, across the factory for admins, where an admin's sentence also says how many people own the executing runs ("for N people"). Admins get a compact health chip and a People chip (see #4042). (AI-synced 2026-11-08)
 - On that page the app-wide banner stack renders under the header; every other page keeps it above the content. The stack never remounts on navigation, so snoozes and dismissals survive moving to and from the preview. (AI-synced 2026-11-05)
 - Needs your decision lists only the viewer's own plan reviews, questions and follow-ups, owner-action parks and open PRs for admins too, and hides when empty; items of one kind are grouped (see #4041) and each keeps its verb and age once its group is expanded. A parked run counts as resuming on its own only with evidence (account cooldown, weekly-reserve pause, limit / pool wait, a parseable scheduled retry); anything else is an owner action. Review PR opens the forge only for an https URL. (AI-synced 2026-11-07)
 - Runs are grouped Yours, then for admins Other users (admin) with the owner email (masked in demo mode); another user's waiting run reads "waits on owner". A failed admin read shows "Other users' runs are unavailable" with the last good read time, and a non-admin never calls an admin endpoint. (AI-synced 2026-11-05)
@@ -1781,7 +1783,7 @@ Design record: `prds/done/3878-overview-preview-decisions.md` (epic #3873).
 Design record: `prds/done/3880-overview-capacity-held-work.md` (epic #3873).
 
 - On `/overview/next` a right-hand rail beside the runs replaces the worker-load card and custody banner; `/dashboard` keeps both. Everything in the rail is the viewer's own, for admins too. (AI-synced 2026-11-05)
-- Capacity: run slots in use, closed and open across the viewer's online workers with a known advertised cap; a draining, cordoned or hosted-upgrading worker's spare slots are closed, and "open" is advertised spare capacity, not a promised claim. Every worker is listed (offline and no-stats included, uncounted ones labelled) with today's badges and its stats behind a disclosure; "Rolls to X once fully idle" needs a hosted upgrading report, a target and a drain. (AI-synced 2026-11-05)
+- Capacity: run slots in use, closed and open across the viewer's online workers with a known advertised cap; a draining, cordoned or hosted-upgrading worker's spare slots are closed, and "open" is advertised spare capacity, not a promised claim. Every worker is listed (offline and no-stats included, uncounted ones labelled) with today's badges and its stats behind a disclosure; "Rolls to X once fully idle" needs a hosted upgrading report, a target and a drain. Revised by #4078: collapsed rows add problem badges and expanded rows show gauges, the runs on the worker, notes and a footer; see the #4078 entry. (AI-synced 2026-11-08)
 - Held work always shows custody slots used of the configured limit, open holds and holds needing a decision, keeps the custody alert's headline and tone when it applies, and offers Review held work only when a decision is pending. Its holds read polls on its own, keeps the last good data and never waits on the runs load. (AI-synced 2026-11-05)
 - Needs your decision gains one held-work row when open holds need a decision; the header counts the aggregate decisions once, and the row names a run only for a single listed decision hold. (AI-synced 2026-11-05)
 
@@ -1808,6 +1810,22 @@ Design record: `prds/done/4040-overview-pending-question.md` (epic #3873).
 
 - In Needs your decision, a viewer's own awaiting_input run shows a one-line excerpt of its newest pending question under the run title, on a single row and on each expanded group item. The excerpt is sanitized and capped at 280 characters plus " (+N more)". (AI-synced 2026-11-07)
 - The excerpt is never shown on the admin all-users list, the collapsed group preview, or follow-ups (awaiting_followup). The age and the Answer action are unchanged. (AI-synced 2026-11-07)
+
+## Feature #4042 — Overview preview, People chip
+
+Design record: issue #4042 (epic #3873); target mock `prds/mockups/3873-overview-people-chip.html` (version A).
+
+- Admins get a People chip beside the health chip on `/overview/next`: up to 3 avatar initials then "+N", and "N active now of M". Active means owning a listed active run (the admin active-runs list, which excludes chat, judge and cross-check runs and stops at 500 rows; at 500 rows it reads "at least N"). M is the active accounts plus any deactivated account or unknown owner that still owns a listed active run, so N never exceeds M. A failed admin runs read shows "Active now unavailable", never stale rows; a failed user list drops "of M". Non-admins see no chip and send no admin request. (AI-synced 2026-11-08)
+- Its popover (a named dialog; Escape closes it and returns focus to the chip; an outside click closes it, returning focus to the chip unless the click landed on another control) lists Active now with one pill per person ("N running · N queued · N waiting · waits on them", zero parts omitted; each run counts once, an account cooldown as waiting, a revising plan as running, an owner-action park or a pending approval, question or follow-up as "waits on them"), "(you)" and "(deactivated)"; people signed in within 24 hours with no listed active run, with their age; one Idle line ("N people, last seen X to Y days ago", never-signed-in counted separately); and "This week: N people had runs with recorded usage", unavailable when admin usage or any per-user seven-day count is missing. Names use the display name or email, masked in demo mode and stripped of unsafe characters; the UI never says "online". (AI-synced 2026-11-08)
+- The popover's "Usage by user" switches the Usage card to All users (remembered like a pick) and focuses its By user section, and reads as unavailable when admin or personal usage is missing. The admin user list is fetched on load and every 30 seconds, never on the 10-second poll. The status sentence's "for N people" counts only owners of runs it counts as executing. (AI-synced 2026-11-08)
+
+## Feature #4078 — Overview preview, richer worker rows
+
+Design record: issue #4078 (epic #3873); target mock `prds/mockups/3873-overview-worker-rows.html`.
+
+- On `/overview/next` the Capacity rail's collapsed worker row shows problems: quarantined, memory authority lost, a failed or blocked upgrade, and "disk N%" when the fullest reported disk volume (bytes or inodes) reaches the gauges' danger tone (85%), computed exactly as the gauge and shown even without a CPU or memory sample. A healthy row adds no badge. (AI-synced 2026-11-08)
+- Expanded, a worker shows tone-coloured gauges (CPU, memory, each disk volume) instead of the one-line stats; "No stats reported" stays, with a disk line when only disk is reported, and offline readings are dimmed as last known. "On this worker" (offline: "Last reported", dimmed) lists the worker's reported runs excluding pending outcomes, titled and linked when among the viewer's own loaded runs, else a short run id, with phase and HOME size from the worker's run_disk (top 5, largest first; "at least" when truncated). Worker-reported text is sanitized. (AI-synced 2026-11-08)
+- Notes add the ephemeral explanation, the warm-lease end, "Review held work" when held work needs a decision, and a restart hint when memory authority is lost, beside the existing "Takes no new runs" and roll note. The footer reads "v<version> · up <uptime>" online and "v<version> · last seen <ago>" or "never seen" offline; missing parts are omitted, and nothing shows when all are missing. No API change; the Workers page and `/dashboard` are unchanged. (AI-synced 2026-11-08)
 
 ## Demo mode branding
 

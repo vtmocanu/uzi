@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -15,6 +16,10 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
+
+// ciFixCreateResponseGrace is the time allowed to write the answer after the PR-binding
+// lookup's full budget. A var so a test can scale it.
+var ciFixCreateResponseGrace = 10 * time.Second
 
 // CreateCIFixRun queues a ci_fix run for a failed pipeline on a watched ref (PRD
 // #6). It re-validates the Fix CI preconditions server-side — the pipeline cache
@@ -59,7 +64,7 @@ func (h *Handler) CreateCIFixRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	f, err := h.forgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("build forge for connection", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -85,6 +90,13 @@ func (h *Handler) CreateCIFixRun(w http.ResponseWriter, r *http.Request) {
 	title := fmt.Sprintf("Fix CI: %s pipeline #%d", ref, ps.PipelineID)
 	description := fmt.Sprintf("Diagnose and fix the failed pipeline for `%s`.\n\nFailing pipeline: %s", ref, ps.WebUrl)
 
+	// The binding lookup inside CreateCIFixRun can run for workersvc.CIFixBindingLookupBudget,
+	// after the snapshot already spent part of the listener's WriteTimeout. Reset the write
+	// deadline so an answer that arrives within the lookup budget plus the grace is still
+	// deliverable (worker_publish_deadline.go precedent). The guardrail check that runs first
+	// inside CreateCIFixRun is bounded only by the forge client timeout, so a guard that is
+	// itself slow can still outlast this deadline, as it could the listener's before #4079.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(workersvc.CIFixBindingLookupBudget + ciFixCreateResponseGrace))
 	run, err := h.wsvc.CreateCIFixRun(r.Context(), user.ID, repo.ID, ref, title, description, snapshot, ciConfigPaths)
 	if err != nil {
 		// #66 D1 layer 2: the service-layer guardrail refused. 422 with the forge.go:191
@@ -97,7 +109,19 @@ func (h *Handler) CreateCIFixRun(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		var unresolved *workersvc.CIFixPRUnresolvedError
 		switch {
+		case errors.As(err, &unresolved):
+			// Reason is a fixed uzi-authored string, never forge text.
+			httpx.Error(w, http.StatusConflict, "could not determine which pull request this branch belongs to: "+unresolved.Reason)
+		case errors.Is(err, workersvc.ErrCIFixBindingChanged):
+			httpx.Error(w, http.StatusConflict, "the branch's pull-request association changed while creating the CI fix; retry")
+		case errors.Is(err, workersvc.ErrCIFixPRUnavailable):
+			// err already starts with the ErrCIFixPRUnavailable text. Its cause is a fixed
+			// uzi-authored message, a deadline/cancel, or a forge driver error from
+			// GetMergeRequestSummary (PAT-redacted by the driver); database and forge
+			// construction errors are logged in workersvc and never reach this body.
+			httpx.Error(w, http.StatusBadGateway, err.Error())
 		case errors.Is(err, workersvc.ErrRepoNotFound):
 			httpx.Error(w, http.StatusNotFound, "repo not found")
 		case errors.Is(err, workersvc.ErrActiveFixExists):

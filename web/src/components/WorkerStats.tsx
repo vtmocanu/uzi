@@ -10,7 +10,7 @@
 
 import { useId } from "react";
 import { cx } from "./ui";
-import { MeterTrack } from "./Meter";
+import { MeterTrack, clampPct, toneFor } from "./Meter";
 import type { Worker, WorkerRunDisk } from "../lib/api";
 
 const KIB = 1024;
@@ -115,8 +115,21 @@ function largestRun(w: Worker): WorkerRunDisk | null {
 }
 
 /** "4.2 GiB" or "at least 4.2 GiB" when the worker's size walk was truncated. */
-function runBytes(bytes: number, truncated: boolean): string {
+export function runHomeSize(bytes: number, truncated: boolean): string {
   return truncated ? `at least ${formatBytes(bytes)}` : formatBytes(bytes);
+}
+
+/** The fullest reported disk volume when it reads as danger (the same >= 85 whole-percent
+ *  line the disk gauge paints with), else null. Independent of hasStats: a worker can report
+ *  disk without a CPU/memory sample. `pct` is the rounded, clamped value the gauge shows as
+ *  aria-valuenow; `inodes` is true when inode fill (not bytes) drives it. */
+export function diskDangerPct(w: Worker): { pct: number; label: string; inodes: boolean } | null {
+  const vols = diskVolumes(w);
+  if (vols.length === 0) return null;
+  const fullest = vols.reduce((a, b) => (b.pct > a.pct ? b : a));
+  const n = Math.round(clampPct(fullest.pct));
+  if (toneFor(n) !== "danger") return null;
+  return { pct: n, label: fullest.label, inodes: fullest.inodePct != null };
 }
 
 /** The largest run's HOME and cache size under the disk bars (PRD #1809 M6), so one run growing
@@ -128,7 +141,7 @@ function LargestRun({ worker }: { worker: Worker }) {
     <div className="flex items-center justify-between text-xs" title={`run ${run.run_id}`}>
       <span className="text-muted">Largest run</span>
       <span className="tabular-nums text-muted">
-        {runBytes(run.home_bytes, run.truncated)} home
+        {runHomeSize(run.home_bytes, run.truncated)} home
         <span className="text-faint"> · {formatBytes(run.cache_bytes)} cache</span>
       </span>
     </div>
@@ -187,7 +200,7 @@ function Bar({ label, hint, value, valueText, fillPct }: { label: string; hint?:
  * is known, else an absolute memory readout with no bar. Renders nothing until the
  * worker has reported a sample. Dimmed + labeled last-known when the worker is offline.
  */
-export function WorkerStatGauges({ worker }: { worker: Worker }) {
+export function WorkerStatGauges({ worker, showLargestRun = true }: { worker: Worker; showLargestRun?: boolean }) {
   if (!hasStats(worker)) return null;
   const offline = worker.status !== "online";
   const isProcess = worker.stats_source === "process";
@@ -236,7 +249,7 @@ export function WorkerStatGauges({ worker }: { worker: Worker }) {
           fillPct={d.pct}
         />
       ))}
-      <LargestRun worker={worker} />
+      {showLargestRun && <LargestRun worker={worker} />}
       {isProcess && <p className="text-[0.7rem] text-faint">worker process only</p>}
     </div>
   );

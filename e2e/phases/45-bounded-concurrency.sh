@@ -8,8 +8,8 @@
 # requires: UZI_WORKER_TOKEN
 # provides: -
 # handoff:  -
-# mutates:  -
-# restores: -
+# mutates: owner autopilot disabled; group/repo2 enabled; agent cap 2; creates cap-test runs
+# restores: owner autopilot stays disabled to isolate later phases; repo2 stays enabled and agent stays at cap 2 for the next phase
 # =============================================================================
 # PRD #42 — bounded worker concurrency (cap 2). ADDITIVE + LAST: the entire suite
 # above ran the single worker at the DEFAULT cap (1 — the pre-#42 serial loop),
@@ -50,6 +50,10 @@ if [ "$EXECUTOR" != stub ]; then
 else
   say "PRD #42: reconfigure the worker to WORKER_MAX_CONCURRENT_RUNS=2 and enable a second repo"
   login   # fresh admin session (also re-unlocks the admin vault so claims proceed)
+
+  # Phase 29 restores its opt-in, but selective/failed earlier phases must not let
+  # enabling repo2 dispatch old autopilot issues alongside this exact-count test.
+  set_owner_autopilot false || fail "could not disable autopilot before enabling repo2"
 
   # Enable group/repo2 (served by forge-fake only when FORGE_FAKE_PROJECT2 is set;
   # the seed enabled just group/repo, so repo2 has been a disabled, invisible row).

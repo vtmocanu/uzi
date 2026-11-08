@@ -5053,9 +5053,11 @@ export class SdkExecutor implements Executor {
       if (lane) {
         // Issue #2471: capture the worker-memory context for this turn. A capture failure has
         // already tripped the turn with the runner's own stop (the carrier), and rethrows it.
+        // Issue #4076: a ctx.signal already spent by a given-up credential switch stays aborted
+        // for the rest of the run; leaving it out keeps the retried turn's guarded commands live.
         lane.beginTurn(AbortSignal.any([
           abortController.signal,
-          ...(ctx.signal ? [ctx.signal] : []),
+          ...(ctx.signal && ctx.signal !== this.spentSwitchSignal ? [ctx.signal] : []),
           ...(ctx.terminalLifecycleSignal ? [ctx.terminalLifecycleSignal] : []),
         ]));
       }

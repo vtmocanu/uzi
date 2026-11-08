@@ -3297,6 +3297,11 @@ export class GitCache {
    *  under it ({@link deleteRetainedArtifact}), for as long as that rm may still be running. An
    *  entry is logged (warn) when it is recorded and (info) when its 'close' removes it. */
   private readonly unsettledDeletes = new Map<string, number>();
+  /** issue #4066: cleanupArchivedRecoveryPin continuations its caller's deadline abandoned that are still running
+   *  (child join, read-back and the awaited authority settle), counted until the whole attempt settles. */
+  private abandonedPinContinuations = 0;
+  /** issue #4066: wakes {@link pendingWork} when an unsettled delete or a pin continuation finishes. */
+  private readonly pendingWorkWaiters = new Set<() => void>();
   private readonly authority: GitAuthorityHooks | undefined;
   private readonly authorityRequired: boolean;
   /** issue #1597 M2: memoised `--remerge-diff` support probe. */
@@ -4357,6 +4362,36 @@ export class GitCache {
     });
   }
 
+  /** issue #4066: runner-uid deletes recorded as unsettled whose late close and its authority settle have not
+   *  both happened yet. Read-only. */
+  unsettledDeleteCount(): number {
+    let total = 0;
+    for (const n of this.unsettledDeletes.values()) total += n;
+    return total;
+  }
+
+  /** issue #4066: abandoned cleanupArchivedRecoveryPin attempts still running. Read-only. */
+  pendingArchivedPinContinuations(): number {
+    return this.abandonedPinContinuations;
+  }
+
+  /**
+   * issue #4066: resolves once no unsettled runner-uid delete and no abandoned pin continuation remains. It waits
+   * on events (no timer), never rejects and starts nothing; a child that never exits keeps it pending, so a caller
+   * bounds its own wait.
+   */
+  async pendingWork(): Promise<void> {
+    while (this.unsettledDeleteCount() > 0 || this.abandonedPinContinuations > 0) {
+      await new Promise<void>((resolve) => { this.pendingWorkWaiters.add(resolve); });
+    }
+  }
+
+  private notifyPendingWork(): void {
+    const waiters = [...this.pendingWorkWaiters];
+    this.pendingWorkWaiters.clear();
+    for (const wake of waiters) wake();
+  }
+
   /** issue #1783 (N1) — refuse a path an earlier runner-uid delete may still be walking: its
    *  child settled as a {@link RunnerDeleteUnsettledError} and has not closed since. Throws
    *  {@link CloneResidueBlockedError}. */
@@ -4873,8 +4908,6 @@ export class GitCache {
           });
           child.once("close", (code: number | null, signal: NodeJS.Signals | null) => {
             const n = (this.unsettledDeletes.get(key) ?? 1) - 1;
-            if (n > 0) this.unsettledDeletes.set(key, n);
-            else this.unsettledDeletes.delete(key);
             this.log.info("runner-uid delete exited and left the unsettled record", {
               path: key,
               pid: child.pid,
@@ -4882,9 +4915,17 @@ export class GitCache {
               pending: n,
             });
             // The late 'close' is the positive join the timeout lacked; the killed rm may have left residue.
-            void settlement?.settle({ ok: false, residue: [target] }).catch((err: unknown) =>
+            // issue #4066: the path stays counted (and pendingWork pending) until that settle has SETTLED, so a
+            // shutdown barrier cannot pass while the late settlement is mid-apply.
+            const settled = (settlement?.settle({ ok: false, residue: [target] }) ?? Promise.resolve()).catch((err: unknown) =>
               this.log.warn("runner-uid delete late settlement failed; the authority record stays open", {
                 path: key, error: sanitizeForLog(gitErrorMessage(err), 157) }));
+            void settled.finally(() => {
+              const left = (this.unsettledDeletes.get(key) ?? 1) - 1;
+              if (left > 0) this.unsettledDeletes.set(key, left);
+              else this.unsettledDeletes.delete(key);
+              this.notifyPendingWork();
+            });
           });
         }
         if (err) reject(err);
@@ -7411,7 +7452,15 @@ export class GitCache {
         }, stop.signal);
       }, stop.signal);
     };
-    try { return await bounded(attempt()); }
+    // issue #4066: an attempt the caller's bound abandons keeps running (child join, read-back, authority settle). It
+    // is counted from the moment it is abandoned until the whole attempt settles, so a shutdown barrier can join it.
+    let attemptSettled = false;
+    let continuationCounted = false;
+    const running = attempt().finally(() => {
+      attemptSettled = true;
+      if (continuationCounted) { this.abandonedPinContinuations -= 1; this.notifyPendingWork(); }
+    });
+    try { return await bounded(running); }
     catch (error) {
       if (error instanceof AuthorityRefusedError) throw error;
       const message = error instanceof Error ? error.message : "";
@@ -7420,6 +7469,7 @@ export class GitCache {
       return { state: "retained", reason: input.signal?.aborted ? "cancelled" :
         Date.now() >= deadline ? "deadline" : reasons.includes(message as Reason) ? message as Reason : "unsafe_metadata" };
     } finally {
+      if (!attemptSettled) { continuationCounted = true; this.abandonedPinContinuations += 1; }
       clearTimeout(timer);
       input.signal?.removeEventListener("abort", abort);
       await Promise.all(activeChildren);

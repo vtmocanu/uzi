@@ -51,6 +51,7 @@ type publicationAuthority struct {
 	Branch              *string         `json:"branch"`
 	PipelineRef         *string         `json:"pipeline_ref"`
 	MRIID               *int64          `json:"mr_iid"`
+	CIFixMRIID          *int64          `json:"ci_fix_mr_iid"`
 	TargetRunID         *uuid.UUID      `json:"target_run_id"`
 	IssueIID            *int64          `json:"issue_iid"`
 	ReportOnly          bool            `json:"report_only"`
@@ -195,6 +196,10 @@ func resolvePublicationSnapshot(s publicationSnapshot, w store.Worker, id uuid.U
 		source = a
 	}
 	if s.Request.MRIID != nil && *s.Request.MRIID != *source.MRIID {
+		return publicationUnknown("association_unknown"), false
+	}
+	// A ci_fix bound to a PR at creation (#4079) never publishes against another PR's source.
+	if s.Request.CIFixMRIID != nil && *s.Request.CIFixMRIID != *source.MRIID {
 		return publicationUnknown("association_unknown"), false
 	}
 	binding := &PublicationContextBinding{RunID: id, ClaimGeneration: req.ClaimGeneration, Branch: req.Branch,

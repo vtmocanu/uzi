@@ -22,6 +22,7 @@ vi.mock("./api", async (importOriginal) => {
       getAdminUsage: vi.fn(),
       adminListRuns: vi.fn(),
       getRecoveryHolds: vi.fn(),
+      listUsers: vi.fn(),
     },
   };
 });
@@ -45,6 +46,7 @@ beforeEach(() => {
   mockApi.getAdminUsage.mockResolvedValue({ factory: emptySelf(), users: [], earliest_run: null });
   mockApi.adminListRuns.mockResolvedValue({ runs: [] });
   mockApi.getRecoveryHolds.mockResolvedValue(holdsWith(1));
+  mockApi.listUsers.mockResolvedValue({ users: [] });
 });
 
 afterEach(() => {
@@ -275,6 +277,70 @@ describe("useOverviewData admin runs", () => {
     await settle(30_000);
     expect(mockApi.adminListRuns).not.toHaveBeenCalled();
     expect(result.current.adminRuns).toEqual({ runs: null, failed: false, lastOkAt: null });
+  });
+});
+
+describe("useOverviewData admin users", () => {
+  const user = (id: string) => ({ ...aUser, id, email: `${id}@uzi.local` });
+  const emails = (users: { email: string }[] | null) => (users ?? []).map((u) => u.email);
+
+  it("loads once on mount, skips the 10 s poll and reloads on the 30 s usage poll", async () => {
+    mockApi.listUsers.mockResolvedValue({ users: [user("a")] });
+    const { result } = renderHook(() => useOverviewData({ includeAdminUsers: true }));
+    await settle();
+    expect(mockApi.listUsers).toHaveBeenCalledTimes(1);
+    expect(emails(result.current.adminUsers.users)).toEqual(["a@uzi.local"]);
+    await settle(10_000);
+    expect(mockApi.listUsers).toHaveBeenCalledTimes(1);
+    mockApi.listUsers.mockResolvedValue({ users: [user("a"), user("b")] });
+    await settle(20_000);
+    expect(mockApi.listUsers).toHaveBeenCalledTimes(2);
+    expect(emails(result.current.adminUsers.users)).toEqual(["a@uzi.local", "b@uzi.local"]);
+  });
+
+  it("never calls listUsers without the opt-in, or for a non-admin who asks", async () => {
+    renderHook(() => useOverviewData({ includeAdminRuns: true }));
+    renderHook(() => useOverviewData());
+    await settle(30_000);
+    expect(mockApi.listUsers).not.toHaveBeenCalled();
+    vi.mocked(useAuth).mockReturnValue(authValue(aUser));
+    const { result } = renderHook(() => useOverviewData({ includeAdminUsers: true }));
+    await settle(30_000);
+    expect(mockApi.listUsers).not.toHaveBeenCalled();
+    expect(result.current.adminUsers).toEqual({ users: null, failed: false });
+  });
+
+  it("flags failed, keeps the last good users and leaves the other data alone", async () => {
+    mockApi.listUsers.mockResolvedValueOnce({ users: [user("a")] });
+    const { result } = renderHook(() => useOverviewData({ includeAdminUsers: true, includeAdminRuns: true }));
+    await settle();
+    const data = result.current.data;
+    const adminRuns = result.current.adminRuns;
+    expect(data).not.toBeNull();
+    mockApi.listUsers.mockRejectedValue(new Error("down"));
+    await settle(30_000);
+    expect(result.current.adminUsers.failed).toBe(true);
+    expect(emails(result.current.adminUsers.users)).toEqual(["a@uzi.local"]);
+    expect(result.current.data?.selfUsage).not.toBeNull();
+    expect(result.current.data?.runs).toEqual(data?.runs);
+    expect(result.current.adminRuns.failed).toBe(false);
+    expect(result.current.adminRuns.runs).toEqual(adminRuns.runs);
+    mockApi.listUsers.mockResolvedValue({ users: [user("c")] });
+    await settle(30_000);
+    expect(result.current.adminUsers).toEqual({ users: [user("c")], failed: false });
+  });
+
+  it("does not let an older response overwrite a newer one", async () => {
+    const first: { resolve: (v: { users: ReturnType<typeof user>[] }) => void } = { resolve: () => {} };
+    mockApi.listUsers.mockImplementationOnce(() => new Promise((res) => { first.resolve = res; }));
+    const { result } = renderHook(() => useOverviewData({ includeAdminUsers: true }));
+    await settle();
+    mockApi.listUsers.mockResolvedValue({ users: [user("new")] });
+    await settle(30_000);
+    expect(emails(result.current.adminUsers.users)).toEqual(["new@uzi.local"]);
+    first.resolve({ users: [user("old")] });
+    await settle();
+    expect(emails(result.current.adminUsers.users)).toEqual(["new@uzi.local"]);
   });
 });
 
