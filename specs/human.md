@@ -1797,7 +1797,7 @@ Design record: issue #4041 (epic #3873); target mock `prds/mockups/4041-needs-de
 
 ## Feature #4040 — Overview preview, pending question excerpt
 
-Design record: `prds/4040-overview-pending-question.md` (epic #3873).
+Design record: `prds/done/4040-overview-pending-question.md` (epic #3873).
 
 - In Needs your decision, a viewer's own awaiting_input run shows a one-line excerpt of its newest pending question under the run title, on a single row and on each expanded group item. The excerpt is sanitized and capped at 280 characters plus " (+N more)". (AI-synced 2026-11-07)
 - The excerpt is never shown on the admin all-users list, the collapsed group preview, or follow-ups (awaiting_followup). The age and the Answer action are unchanged. (AI-synced 2026-11-07)
