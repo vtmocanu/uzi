@@ -168,5 +168,30 @@ stays Actions-only, so a fix attempt there has less to go on.
 - **It doesn't fight the manual button.** If you click **Fix CI** yourself
   while the automatic path would also have fired, uzi treats the run that's
   already in flight as covering it and doesn't start a second one.
+- **One pull request per fix.** A CI fix is tied to the one open pull/merge
+  request among those uzi recorded for the branch. See
+  [below](#when-the-branchs-pull-request-cant-be-determined).
 - **Cost.** Every automatic attempt is an ordinary run billed to your own
   Anthropic token, exactly like a run you started by hand.
+
+## When the branch's pull request can't be determined
+
+Before queuing a CI fix, uzi checks on the forge each pull/merge request it
+recorded for the branch (at most 8) and binds the fix to the single open one.
+No recorded PR, or every recorded PR merged or closed: the fix starts unbound, as before.
+Otherwise nothing is queued, and what happens depends on why:
+
+| Situation | **Fix CI** / `uzi ci fix` | Automatic |
+|---|---|---|
+| The forge can't be asked: network, rate limit, `401`/`403` token problem, 15 s budget spent, or a PR mid-merge (`locked`) | `502` "could not verify the branch's pull request: ...". Retry. | Left for the next poll, which tries again. No attempt is spent. |
+| Two or more open PRs, a recorded PR that is missing or open on another branch, an unexpected forge answer, or more than 8 recorded | `409` "could not determine which pull request this branch belongs to: <reason>" | The pipeline is marked seen, no attempt is spent, and no comment is posted. The next failing pipeline is a fresh candidate. |
+| The lookup itself could not run (database or forge setup failure) | `502` "the pull-request lookup could not run". Retry. | Left for the next poll, which tries again. No attempt is spent. |
+| A recorded PR number is invalid | `409` | The pipeline is marked seen, no attempt is spent, and no comment is posted. |
+| The recorded PRs changed while the fix was being created | `409` "the branch's pull-request association changed while creating the CI fix; retry" | Retried on the next poll. |
+
+When one PR can't be verified and another is undeterminable, the retryable
+case wins, because it can clear on retry.
+The existing refusals (a run already on the branch, an active fix or
+`mr_rework`) still take precedence over these. The recheck at insert narrows
+the window for a changed PR set; it does not lock out completion or
+reconcile writers.

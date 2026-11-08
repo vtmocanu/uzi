@@ -1183,9 +1183,10 @@ tasks:
         done
 
   test:forge-fake:
-    desc: offline HTTPS issue-comment and bot-author contracts for the shared forge fake
+    desc: offline HTTPS issue-comment, bot-author and per-iid MR/PR GET contracts for the shared forge fake
     cmds:
       - env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node --test e2e/forge-fake/issue-comments.test.mjs
+      - env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node --test e2e/forge-fake/mr-get.test.mjs
 
   test:forge-fake-contract:
     desc: offline production Go and worker forge operation contracts over real HTTPS

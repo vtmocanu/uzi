@@ -1904,7 +1904,10 @@ export class SteeringChannel {
     return this.switchHoldDepth > 0 && this.pendingSwitchGeneration === undefined;
   }
 
-  /** Whether a switch hold (holdCredentialSwitch) is open on this channel. */
+  /** Whether a switch hold (holdCredentialSwitch) is open on this channel. Production never calls it: the
+   *  channel's own decisions read holdActive(), which also requires that no switch is pending. This is a
+   *  read-only view of the hold depth kept for tests (runner-credential-switch-cross-check, steering,
+   *  steering-withheld-switch-cancel) to observe that a hold is open. */
   credentialSwitchHoldOpen(): boolean {
     return this.switchHoldDepth > 0;
   }

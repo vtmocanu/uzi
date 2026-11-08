@@ -549,6 +549,21 @@ wait_eq() {
   fail "timeout: $desc never reached '$want' (last: '${got:-none}')"
 }
 
+# Claim-payload-only fixtures, not executors: support the completion contract and
+# the frozen repo-agent source/request carried by every new issue claim (#3940/#3941).
+# Do not copy the real worker's recovery/publication capabilities: these fixtures
+# neither execute agents nor promise those durable protocols.
+synthetic_issue_worker_capabilities() {
+  printf '%s\n' '["completion_interlock_v1","repo_agent_source_v1","agent_source_request_v1"]'
+}
+
+# Verify the owner consent bit before a phase exposes more issues to the poller.
+set_owner_autopilot() {
+  local enabled="$1"
+  apiput /api/me/autopilot "$(jq -cn --argjson enabled "$enabled" '{enabled:$enabled}')" \
+    | jq -e --argjson enabled "$enabled" '.user.autopilot_enabled == $enabled' >/dev/null
+}
+
 # One-shot getters for wait_eq (and for direct point-in-time assertions).
 worker_status()         { apiget /api/workers | jq -r '.workers[0].status // empty'; }
 # Worker resource stats (PRD #49): the sample the worker self-reports from its own

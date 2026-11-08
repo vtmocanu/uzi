@@ -26,6 +26,9 @@ func TestCreateAutoMRReworkRunAndAdvanceFirstFireAndRefusalsLiveDB(t *testing.T)
 		return env.q.GetMRReworkLedger(env.ctx, store.GetMRReworkLedgerParams{RepoID: repoID, Ref: branch})
 	}
 
+	// Issue #4079: the seed ci_fix reads the source run's recorded PR from the forge (merged).
+	svc.SetForges(bindingBuilder{&mergedEverywhereForge{}})
+
 	// An active ci_fix on the branch refuses the create and leaves no ledger row.
 	ciFix, err := svc.CreateCIFixRun(env.ctx, userID, repoID, branch, "Fix CI", "d", ciFixSnapshot(branch, 91), nil)
 	if err != nil {

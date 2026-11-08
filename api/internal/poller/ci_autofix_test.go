@@ -3,6 +3,7 @@ package poller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -791,5 +792,80 @@ func TestCIAutofixNoCandidatesNoOp(t *testing.T) {
 
 	if len(runs.calls) != 0 || len(st.upserts) != 0 || len(st.records) != 0 {
 		t.Fatal("empty candidate set must be a no-op")
+	}
+}
+
+// cfSeqRuns returns errs[i] on the i-th CreateAutoCIFixRun call (nil past the end).
+type cfSeqRuns struct {
+	errs  []error
+	calls int
+}
+
+func (r *cfSeqRuns) CreateAutoCIFixRun(context.Context, uuid.UUID, uuid.UUID, string, string, string, workersvc.FailureSnapshot, []string) (store.Run, error) {
+	i := r.calls
+	r.calls++
+	if i < len(r.errs) && r.errs[i] != nil {
+		return store.Run{}, r.errs[i]
+	}
+	return store.Run{ID: uuid.New()}, nil
+}
+
+func TestCIAutofixPRBindingRefusals(t *testing.T) {
+	// Issue #4079: an unresolved PR association records the pipeline (no per-tick
+	// retry) but never a run, comment or counter advance; an unavailable or changed
+	// binding records nothing so the next tick retries.
+	tests := []struct {
+		name        string
+		err         error
+		wantRecords int
+	}{
+		{"unresolved", &workersvc.CIFixPRUnresolvedError{Reason: "more than one open pull request uses this branch"}, 1},
+		{"unavailable", fmt.Errorf("%w: %w", workersvc.ErrCIFixPRUnavailable, context.DeadlineExceeded), 0},
+		{"binding changed", workersvc.ErrCIFixBindingChanged, 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &cfStore{candidates: []store.ListCIAutofixCandidateRefsRow{cfCand(9001)}}
+			runs := &cfRuns{err: tc.err}
+			notifier := &cfNotifier{}
+			f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "boom"}
+
+			newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f)
+
+			if len(runs.calls) != 1 {
+				t.Fatalf("create attempts = %d, want 1", len(runs.calls))
+			}
+			if len(st.upserts) != 0 {
+				t.Fatalf("upserts = %d, want 0", len(st.upserts))
+			}
+			if len(st.records) != tc.wantRecords {
+				t.Fatalf("records = %d, want %d", len(st.records), tc.wantRecords)
+			}
+			if tc.wantRecords == 1 && st.records[0].LastPipelineID.Int64 != 9001 {
+				t.Fatalf("recorded pipeline = %d, want 9001", st.records[0].LastPipelineID.Int64)
+			}
+			if len(f.notes) != 0 || len(notifier.calls) != 0 {
+				t.Fatalf("must not comment/notify: notes=%d notifs=%d", len(f.notes), len(notifier.calls))
+			}
+		})
+	}
+}
+
+func TestCIAutofixUnavailableBindingRetriesNextTick(t *testing.T) {
+	st := &cfStore{candidates: []store.ListCIAutofixCandidateRefsRow{cfCand(9001)}}
+	runs := &cfSeqRuns{errs: []error{fmt.Errorf("%w: %w", workersvc.ErrCIFixPRUnavailable, context.DeadlineExceeded)}}
+	f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "boom"}
+	cf := NewCIAutoFix(st, runs, &cfNotifier{}, cfSettings{enabled: true}, 5, 4096, 2, []string{".gitlab-ci.yml"})
+
+	cf.detect(context.Background(), cfRepoRow(), f)
+	if len(st.records) != 0 || len(st.upserts) != 0 {
+		t.Fatalf("tick 1 must record nothing: records=%d upserts=%d", len(st.records), len(st.upserts))
+	}
+	cf.detect(context.Background(), cfRepoRow(), f)
+	if runs.calls != 2 {
+		t.Fatalf("create calls after tick 2 = %d, want 2 (retried)", runs.calls)
+	}
+	if len(st.upserts) != 1 {
+		t.Fatalf("upserts after tick 2 = %d, want 1", len(st.upserts))
 	}
 }
