@@ -177,13 +177,13 @@ pass "board cached the NEWEST run (failure) over the older success — id-DESC [
 # 7) Fix-CI loop DRIVE — the headline [live] criterion, unblocked by the Go
 #    pipeline-status classifier (internal/pipelinestatus). main is at "failure"
 #    (above), so this drives the loop end to end and OBSERVES two of the three Go
-#    sites against a real run: the Fix-CI START GATE (ci_fix.go:88) must ACCEPT a
+#    sites against a real run: the Fix-CI START GATE (handler CreateCIFixRun's pipelinestatus.IsFailed check) must ACCEPT a
 #    Forgejo "failure" (no run id is returned unless IsFailed("failure") passes),
 #    and the fix VERDICT (pipeline_sync.go) must stamp fix_failed on a re-"failure".
-#    The failed-job SNAPSHOT filter (ci_fix.go:144) is deliberately NOT asserted
+#    The failed-job SNAPSHOT filter (workersvc.BuildFailureSnapshot's job filter) is deliberately NOT asserted
 #    here — an empty snapshot does not error and the fix run is created regardless,
 #    so this lane cannot see its content — its "failure"-job inclusion is
-#    unit-covered (handler.TestSnapshotFailedPipelineIncludesForgejoFailureJobs).
+#    unit-covered (workersvc.TestBuildFailureSnapshotIncludesForgejoFailureJobs).
 # The admin setting ci_autofix_enabled defaults ON (#1109), and the CIAutoFix poller treats a
 # ci_fix run's own fix branch like an agent branch: the re-failure posted on it below makes
 # the poller open a SECOND ci_fix of its own just as this phase ends, which the quarantine
@@ -194,11 +194,11 @@ trap 'apiput /api/admin/settings '\''{"settings":{"ci_autofix_enabled":"true"}}'
 say "forgejo Fix-CI loop: a 'failure' pipeline drives Fix CI → fix run → fix_failed verdict"
 FJFIX="$(apipost "/api/repos/$REPO_ID/ci-fix-runs" '{"ref":"main"}' | jq -r '.run.id')"
 { [ -n "$FJFIX" ] && [ "$FJFIX" != null ]; } \
-  || fail "Fix CI not triggered on a Forgejo 'failure' pipeline (the ci_fix.go:88 gate must accept 'failure')"
+  || fail "Fix CI not triggered on a Forgejo 'failure' pipeline (the CreateCIFixRun IsFailed gate must accept 'failure')"
 [ "$(apiget "/api/runs/$FJFIX" | jq -r '.run.kind')" = ci_fix ] || fail "run kind is not ci_fix"
 DUP="$(apipost_code "/api/repos/$REPO_ID/ci-fix-runs" '{"ref":"main"}')"
 [ "$DUP" = 409 ] || fail "a duplicate Fix CI on main should be 409, got $DUP"
-pass "Fix CI triggered on a Forgejo 'failure' pipeline (the ci_fix.go:88 gate accepts 'failure') — ci_fix run $FJFIX"
+pass "Fix CI triggered on a Forgejo 'failure' pipeline (the CreateCIFixRun IsFailed gate accepts 'failure') — ci_fix run $FJFIX"
 
 wait_status "$FJFIX" awaiting_approval
 [ "$(apiget "/api/runs/$FJFIX" | jq -r '.run.plan_md // empty')" != "" ] || fail "ci_fix run carried no plan"
