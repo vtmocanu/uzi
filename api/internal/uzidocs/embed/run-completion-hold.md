@@ -511,6 +511,10 @@ count, without publishing commit text. These refresh refusals fail rather than
 entering the structural completion hold. Recovery keeps the existing inventory
 settlement rules; legacy refreshes retain the local source unless its original
 pinned head was verifiably archived. Preservation does not promise a remote copy.
+A failed refresh's retained work, if any, follows the normal failed-run
+[recovery order](run-recovery.md#recovery-order): check `uzi run held <run-id>`
+first (held publication, ADR-2545), then `uzi run export` / `uzi run recovery`.
+The refusal's status line names both commands.
 The guard does not rewrite offending messages or force-push to repair a
 refusal; the owner recovers and corrects the preserved work.
 
