@@ -447,8 +447,11 @@ workers ignore them and older APIs omit them, so both updated sides are needed.
 
 Owner decision (2026-11-08, option B): over-budget owner history, or a live backlog
 whose first bounded batch could omit the current correction, ends as a distinct
-terminal refusal before a model request. The worker retains the source, session,
-journal and custody, and sends no inclusion receipt. The owner must arrange a
+terminal refusal before a model request. The worker retains the source, recovery
+journal and custody, and sends no inclusion receipt. The terminal run's HOME and
+model-session artifacts are disposable, not recovery exports or successor session
+inputs. Both HOME reclaimers can remove them without traversing the retained clone
+or bare journal. The owner must arrange a
 smaller successor and carry guidance over manually; another run does not inherit
 these input rows automatically. This adds no pause authority, schema or wire
 field, and never disguises the refusal as a provider, idle or credential failure.

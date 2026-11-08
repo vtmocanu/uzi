@@ -6484,7 +6484,8 @@ export class RunRunner {
         // capture and reclaim indefinitely. End visibly, retaining the exact source and custody;
         // these latches authorize no park, publication, release or new provider operation.
         flight.preserveRecoveryClone = true;
-        flight.preserveSession = true;
+        // Terminal runs do not resume their model session. HOME/session artifacts remain
+        // disposable; source retention is independent of both HOME reclaimers.
         flight.keepGuardedInventoryOpen = true;
         flight.stoppedSourceKept = true;
         flight.sourceExitDenied = true;

@@ -71,6 +71,10 @@ import { makeFixture } from "./fixture-repo.js";
 import { leadRequestCaseAgents, makeClaim, testGitCacheOptions, recordingLogger, withReceipts } from "./helpers.js";
 import { configureGoConcurrency } from "../src/go-concurrency.js";
 import { PolicyContextRefusal, TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
+import { runDiskReclaimPass } from "../src/disk-reclaim.js";
+import { reclaimStrandedRunHomes } from "../src/home-reclaim.js";
+import { RunDiskLocks } from "../src/run-disk-locks.js";
+import { portableTeardownTestDeps } from "./teardown-fixtures.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { PlanRevisionRecovery } from "../src/plan-revision-retry.js";
 import { WORKER_UID, RUNNER_UID, runnerCommand, commandRootCommand } from "../src/runner-uid.js";
@@ -29981,7 +29985,7 @@ describe("compact policy hold: fake-provider continuation matrix (production run
       routes: requests.filter(r => r.method === "thread/start" || r.method === "thread/resume").map(r => r.method),
       prompts: requests.filter(r => r.method === "turn/start").map(r => String((rec(r.params).input as { text?: string }[])[0]?.text)),
       notices: api.messages(runId).map(m => String(rec(m.payload).event)),
-      messages: api.messages(runId), sourcePath, sourceJournal, sourceBranch, custodyOpen, acknowledgedStates, terminalRetention,
+      messages: api.messages(runId), sourcePath, sourceJournal, sourceBranch, custodyOpen, acknowledgedStates, terminalRetention, runHome,
     };
   }
   type Result = Awaited<ReturnType<typeof drive>>;
@@ -30175,7 +30179,7 @@ describe("compact policy hold: fake-provider continuation matrix (production run
       assert.deepEqual(r.events.filter(e => e.startsWith("included:")), [], "no fabricated inclusion");
       assert.equal(m2Runner.api.isInputIncluded(r.runId, GUIDANCE_ID), false, "the API has no model-inclusion receipt");
       assert.equal(r.custodyOpen, true, "the custody release endpoint was never used");
-      assert.deepEqual(r.terminalRetention, [{ preserveRecoveryClone: true, preserveSession: true,
+      assert.deepEqual(r.terminalRetention, [{ preserveRecoveryClone: true, preserveSession: false,
         keepGuardedInventoryOpen: true, stoppedSourceKept: true, sourceExitDenied: true, keepCustody: true }],
         "retention must be established before generic failure can settle custody or retire the source");
       assert.ok(r.sourcePath && r.sourceJournal);
@@ -30184,6 +30188,32 @@ describe("compact policy hold: fake-provider continuation matrix (production run
       const journal = spawnSync("git", ["-C", bare, "config", `uzi-recovery.${r.sourceBranch}.clone`],
         { env: gitEnv(), encoding: "utf8" }).stdout.trim();
       assert.equal(journal, r.sourceJournal, "the actual bare journal is unchanged");
+      await assert.rejects(fs.stat(r.runHome), { code: "ENOENT" }, "a terminal context refusal promises source retention, not a resumable HOME");
+      // A stranded HOME can exist after an interrupted teardown. Exercise both real cleanup paths:
+      // they may delete session artifacts, but their roots never include the retained source/bare.
+      for (const cleanup of ["periodic", "startup"] as const) {
+        const store = path.join(r.runHome, "codex-session-store", "sessions");
+        await fs.mkdir(store, { recursive: true });
+        await fs.writeFile(path.join(store, "session.jsonl"), "disposable terminal transcript\n");
+        if (cleanup === "periodic") {
+          // The existing lifecycle fixture supplies removal off Linux, where /proc/self/fd is
+          // unavailable. Linux CI uses the real descriptor-pinned removal unchanged.
+          const portableRemoval = portableTeardownTestDeps?.removeTreePinned;
+          const result = await runDiskReclaimPass({ homeRoot: m2Runner.homeDir,
+            provisionRoot: path.join(m2Runner.fx.dataDir, "provision"), statusOf: async () => "failed",
+            isRunLive: () => false, locks: new RunDiskLocks(), log: noopLog,
+            ...(portableRemoval ? { removeTree: (parent: string, name: string, deadline: number) => portableRemoval(parent, name, { deadline }) } : {}) });
+          assert.equal(result.terminalHomesRemoved, 1, JSON.stringify(result));
+        } else {
+          const result = await reclaimStrandedRunHomes(m2Runner.homeDir, async () => "failed", noopLog, { minAgeMs: 0 });
+          assert.equal(result.removed, 1, JSON.stringify(result));
+        }
+        await assert.rejects(fs.stat(r.runHome), { code: "ENOENT" }, cleanup);
+        assert.equal(await fs.readFile(path.join(r.sourcePath, "CONTEXT-RETAIN.txt"), "utf8"), "unfinished context work\n", cleanup);
+        assert.equal(spawnSync("git", ["-C", bare, "config", `uzi-recovery.${r.sourceBranch}.clone`],
+          { env: gitEnv(), encoding: "utf8" }).stdout.trim(), r.sourceJournal, `${cleanup}: source journal remains`);
+        assert.equal(r.custodyOpen, true, `${cleanup}: HOME cleanup grants no custody release`);
+      }
     });
   }
 
