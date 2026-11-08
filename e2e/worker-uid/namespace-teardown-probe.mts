@@ -1,8 +1,11 @@
 // In-container half of the namespace teardown proof (issue #3644, PRD #3831 section 8.1).
 //
 // namespace-teardown-real.test.mts drives this file with `docker exec` as the worker uid. It runs the
-// real agent/src/restore-boundary.ts writer, reader, live-identity reader and R1-R9 predicate against the
-// container's real procfs. Each subcommand prints exactly one JSON line.
+// real agent/src/restore-boundary.ts writer, reader, live-identity reader and evaluateComposeRestore (the
+// compose predicate: R1-R6, R8, R9) against the container's real procfs. The R8 inputs are stubbed (bareBusy
+// false, bareSlot null, census ok) and the predecessor slot is a cast stub carrying only the fields the
+// predicate reads; that is what this kernel proof needs, so the admission instant is the compose predicate
+// with stubbed R8 inputs, not a full restore. Each subcommand prints exactly one JSON line.
 //   boundary <incarnation>      establishProcessBoundary for that incarnation; prints the outcome and the
 //                               wall clock taken right after the record was durable
 //   admit <predecessor> <self>  re-reads both records, snapshots the bare repo config, evaluates the compose

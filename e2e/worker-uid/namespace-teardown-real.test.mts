@@ -6,7 +6,8 @@
 // compose restart: same slot, new execution). The successor writes its boundary record through the real
 // agent/src/restore-boundary.ts, and the proof shows that the child's write never lands before the
 // child's deadline has passed, through to the successor's restore admission (evaluateComposeRestore), and
-// that the execution identity the R5 comparison reads (nsIno, initStartTicks, bootId) did change.
+// that the execution tuple the R5 comparison reads changed: initStartTicks is strictly newer on the same
+// boot (bootId equal); nsIno may repeat because the kernel can reuse the freed namespace inode number.
 //
 // This test is host-driven: it runs the Docker CLI against the worker image and removes only the
 // container and volume it created, by exact name. It is never skipped: a missing Docker or image fails it,
@@ -127,7 +128,6 @@ test("a predecessor's pending git-config write dies with its PID namespace and c
     // The kernel may hand the freed namespace inode number to the new namespace, so nsIno alone is not
     // evidence of a new namespace (observed on this host); R5 refuses only when nsIno AND initStartTicks both
     // match, so the new init's start time is what distinguishes the executions.
-    assert.ok(sExecution.nsIno !== pExecution.nsIno || sExecution.initStartTicks !== pExecution.initStartTicks, "execution identity changed");
     assert.ok(BigInt(sExecution.initStartTicks) > BigInt(pExecution.initStartTicks), "successor init started after the predecessor's");
 
     // Wait until the child's deadline is well past, then take the admission instant.
@@ -140,7 +140,7 @@ test("a predecessor's pending git-config write dies with its PID namespace and c
     assert.deepEqual(admission.decision, { admit: true, verdict: { predecessorIncarnation: P, slot: s.result.record.slot, boot: "same_boot" } },
       "the R5 comparison admits the restart: a distinct, strictly older execution");
     assert.equal(admission.live.ok, true);
-    assert.equal(admission.live.identity.execution.nsIno, sExecution.nsIno, "the live identity is the successor's");
+    assert.equal(admission.live.identity.execution.initStartTicks, sExecution.initStartTicks, "the live identity is the successor's");
 
     // The child's write never landed: not at the admission instant, and not after.
     for (const snap of [admission.before, admission.after, probeJson("snapshot")]) {
@@ -153,8 +153,13 @@ test("a predecessor's pending git-config write dies with its PID namespace and c
     assert.equal(sh("git --git-dir=/data/bare.git config --get uzi.late; echo rc=$?").endsWith("rc=1"), true, "uzi.late is unset");
     assert.deepEqual(liveChildren(), [], "no child process exists after the deadline");
   } finally {
-    // Exact names only; both were created by this invocation.
-    docker(["rm", "--force", "--volumes", name], 60);
-    docker(["volume", "rm", volume], 60);
+    // Exact names only; both were created by this invocation. Each cleanup call is attempted regardless of
+    // the other and never throws, so a cleanup failure cannot mask the test's own failure.
+    for (const args of [["rm", "--force", "--volumes", name], ["volume", "rm", volume]]) {
+      const r = spawnSync("docker", args, { encoding: "utf8", timeout: 60_000, killSignal: "SIGKILL" });
+      if (r.error !== undefined || r.status !== 0) {
+        console.error(`cleanup: docker ${args.join(" ")} failed: ${String(r.error ?? r.stderr)}`);
+      }
+    }
   }
 });
