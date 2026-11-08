@@ -113,6 +113,10 @@ unless the schedule applies its model to all agents. Your worker-model
 setting does not override a subagent pin. **Chat always uses your Claude
 lane**, whichever harness is your default.
 
+To see what these rules give you right now, without starting a run, read the
+read-only [effective settings](./configuration.md#effective-settings) view
+(`uzi settings get`).
+
 ## Claude model guard and recovery
 
 Saving the Claude worker lane (`default_claude_model`, or legacy

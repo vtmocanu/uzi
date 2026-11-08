@@ -61,6 +61,53 @@ type Contract struct {
 	DisplayCases []DisplayCase     `json:"display_cases"`
 }
 
+// ServerInputs is the optional `server` block of a request case: the stored inputs the claim assembly
+// would resolve into the case's `config` (the lead-lane claim fields) and, for the part the claim
+// leaves to the worker, its model. Absent on a case the server cannot produce.
+type ServerInputs struct {
+	// Lane is the owner's model lane for the case's harness (users.default_*_model); null is unset.
+	Lane *string `json:"lane"`
+	// RunModel is the schedule-frozen runs.model; null is unset.
+	RunModel *string `json:"run_model"`
+	// UserEffort is the owner's per-harness effort column; null is unset.
+	UserEffort *string `json:"user_effort"`
+	// TemplateClaude and TemplateCodex are the lead template's stored per-harness pins. The case's own
+	// agents / templateModel are the form the claim delivers after PinForHarness filtering.
+	TemplateClaude *string `json:"template_claude"`
+	TemplateCodex  *string `json:"template_codex"`
+}
+
+// RequestExpect is a request case's expected resolved request. Model is nil for the SDK default.
+type RequestExpect struct {
+	Model       *string `json:"model"`
+	ModelSource string  `json:"modelSource"`
+}
+
+// RequestCase is one typed request_cases entry; only the fields the Go readers use are decoded.
+type RequestCase struct {
+	ID                   string         `json:"id"`
+	Harness              string         `json:"harness"`
+	Phase                string         `json:"phase"`
+	Config               map[string]any `json:"config"`
+	ProviderDefaultModel *string        `json:"providerDefaultModel"`
+	Expect               RequestExpect  `json:"expect"`
+	Server               *ServerInputs  `json:"server"`
+}
+
+// RequestCases decodes the contract's request_cases into typed cases.
+func RequestCases(t testing.TB) []RequestCase {
+	t.Helper()
+	var out []RequestCase
+	for _, raw := range LoadContract(t).RequestCases {
+		var rc RequestCase
+		if err := json.Unmarshal(raw, &rc); err != nil {
+			t.Fatalf("request case: %v", err)
+		}
+		out = append(out, rc)
+	}
+	return out
+}
+
 // LoadContract reads the contract, failing the test (never skipping) when it is unreadable.
 func LoadContract(t testing.TB) Contract {
 	t.Helper()

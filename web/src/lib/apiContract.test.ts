@@ -99,6 +99,17 @@ import type {
   GuardrailOverrideRequest,
   CodexAccountRateLimit,
   CodexAdminRateLimitRow,
+  EffectiveSettings,
+  EffectiveModelCell,
+  EffectiveEffortCell,
+  Credential,
+  HarnessValue,
+  ScheduleAlternative,
+  ScheduleSettingsPreview,
+  ScheduleSettingsPreviewRequest,
+  StartPreview,
+  StartPreviewAlternative,
+  StartPreviewRequest,
   HealthDoc,
   BuildInfo,
   ReleaseCheckStatus,
@@ -167,6 +178,16 @@ import runOutcomesZero from "../../../fixtures/api-contract/run_outcomes.zero.js
 import runOutcomesFull from "../../../fixtures/api-contract/run_outcomes.full.json";
 import userSettingsZero from "../../../fixtures/api-contract/user_settings.zero.json";
 import userSettingsFull from "../../../fixtures/api-contract/user_settings.full.json";
+import effectiveSettingsZero from "../../../fixtures/api-contract/effective_settings.zero.json";
+import effectiveSettingsFull from "../../../fixtures/api-contract/effective_settings.full.json";
+import startPreviewZero from "../../../fixtures/api-contract/effective_settings_start_preview.zero.json";
+import startPreviewFull from "../../../fixtures/api-contract/effective_settings_start_preview.full.json";
+import schedulePreviewZero from "../../../fixtures/api-contract/effective_settings_schedule_preview.zero.json";
+import schedulePreviewFull from "../../../fixtures/api-contract/effective_settings_schedule_preview.full.json";
+import schedulePreviewRequestZero from "../../../fixtures/api-contract/effective_settings_schedule_preview_request.zero.json";
+import schedulePreviewRequestFull from "../../../fixtures/api-contract/effective_settings_schedule_preview_request.full.json";
+import startPreviewRequestZero from "../../../fixtures/api-contract/effective_settings_start_preview_request.zero.json";
+import startPreviewRequestFull from "../../../fixtures/api-contract/effective_settings_start_preview_request.full.json";
 import settingsUserSettingsFull from "../../../fixtures/api-contract/settings_user_settings.full.json";
 import settingsUserSettingsZero from "../../../fixtures/api-contract/settings_user_settings.zero.json";
 import catalogEntryZero from "../../../fixtures/api-contract/catalog_entry.zero.json";
@@ -881,6 +902,83 @@ void _releaseCheckStatusFull;
   void _userSettingsZero;
   void _userSettingsFull;
 }
+
+// ── Effective settings (PRD #3254 M2) ───────────────────────────────────────
+// ZeroOf exemptions: the four top-level slices and the two cross_check slices are Go nil-slices
+// whose zero marshals null (GET always emits them). The start-preview response omits
+// `alternatives` when empty (omitempty), so its zero fixture simply lacks the key.
+{
+  type SettingsZero = Omit<ZeroOf<EffectiveSettings, "harnesses" | "start" | "models" | "efforts">, "cross_check"> & {
+    cross_check: { models: EffectiveModelCell[] | null; efforts: EffectiveEffortCell[] | null };
+  };
+  const zero: SettingsZero = effectiveSettingsZero;
+  const full: Widen<EffectiveSettings> = effectiveSettingsFull;
+  // A mismatch in either direction makes the call's argument type `false`, which fails to compile.
+  const keysOf = <A, B>(_same: [Exclude<keyof A, keyof B> | Exclude<keyof B, keyof A>] extends [never] ? true : false): true => true;
+  type Fixture = typeof effectiveSettingsFull;
+  const checks = [
+    keysOf<EffectiveSettings, Fixture>(true),
+    keysOf<EffectiveSettings["cross_check"], Fixture["cross_check"]>(true),
+    keysOf<EffectiveSettings["harnesses"][number], Fixture["harnesses"][number]>(true),
+    keysOf<EffectiveSettings["start"][number], Fixture["start"][number]>(true),
+    keysOf<HarnessValue, Fixture["start"][number]["harness"]>(true),
+    keysOf<Credential, Fixture["harnesses"][number]["credential"]>(true),
+    keysOf<EffectiveModelCell, Fixture["models"][number]>(true),
+    keysOf<NonNullable<EffectiveModelCell["ignored"]>, Fixture["models"][number]["ignored"]>(true),
+    keysOf<EffectiveEffortCell, Fixture["efforts"][number]>(true),
+    keysOf<EffectiveModelCell, Fixture["cross_check"]["models"][number]>(true),
+    keysOf<EffectiveEffortCell, Fixture["cross_check"]["efforts"][number]>(true),
+  ];
+  type PreviewZero = ZeroOf<StartPreview>;
+  const previewZero: PreviewZero = startPreviewZero;
+  const previewFull: Widen<StartPreview> = startPreviewFull;
+  const previewChecks = [
+    keysOf<StartPreview, typeof startPreviewFull>(true),
+    keysOf<StartPreviewAlternative, typeof startPreviewFull.alternatives[number]>(true),
+    keysOf<StartPreviewRequest, typeof startPreviewRequestFull>(true),
+    keysOf<NonNullable<StartPreviewRequest["credential_override"]>, typeof startPreviewRequestFull.credential_override>(true),
+  ];
+  const requestZero: ZeroOf<StartPreviewRequest> = startPreviewRequestZero;
+  const requestFull: Widen<StartPreviewRequest> = startPreviewRequestFull;
+  void [zero, full, checks, previewZero, previewFull, previewChecks, requestZero, requestFull];
+}
+// PRD #3254 M3: the schedule preview. Its zero fixture has a null `notes` (a Go nil slice that
+// the handler always fills) and omits `alternatives` (omitempty). The request has no zero-null
+// member: every field is omitted when unset, so its zero is `{}`. The refused-branch shape (null
+// worker_model, worker_effort, credential and subagents plus a refusal) is covered by the
+// `ScheduleAlternative` assignment below, since the full fixture's alternative is the valid shape.
+{
+  const scheduleZero: ZeroOf<ScheduleSettingsPreview, "notes"> = schedulePreviewZero;
+  const scheduleFull: Widen<ScheduleSettingsPreview> = schedulePreviewFull;
+  const keysOf = <A, B>(_same: [Exclude<keyof A, keyof B> | Exclude<keyof B, keyof A>] extends [never] ? true : false): true => true;
+  type Full = typeof schedulePreviewFull;
+  const scheduleChecks = [
+    keysOf<ScheduleSettingsPreview, Full>(true),
+    keysOf<ScheduleAlternative, Full["alternatives"][number]>(true),
+    keysOf<NonNullable<ScheduleSettingsPreview["subagents"]>, Full["subagents"]>(true),
+    keysOf<NonNullable<ScheduleSettingsPreview["subagents"]>["pinned"][number], Full["subagents"]["pinned"][number]>(true),
+    keysOf<EffectiveModelCell, Full["worker_model"]>(true),
+    keysOf<EffectiveEffortCell, Full["worker_effort"]>(true),
+    keysOf<ScheduleSettingsPreviewRequest, typeof schedulePreviewRequestFull>(true),
+    keysOf<NonNullable<ScheduleSettingsPreviewRequest["credential_override"]>, typeof schedulePreviewRequestFull.credential_override>(true),
+  ];
+  const scheduleRequestFull: Widen<ScheduleSettingsPreviewRequest> = schedulePreviewRequestFull;
+  const scheduleRequestZero: ScheduleSettingsPreviewRequest = schedulePreviewRequestZero;
+  const refusedBranch: ScheduleAlternative = {
+    harness: "codex", worker_model: null, worker_effort: null, credential: null, subagents: null,
+    refusal: "codex_override_conflict", refusal_detail: null,
+  };
+  void [scheduleZero, scheduleFull, scheduleChecks, scheduleRequestFull, scheduleRequestZero, refusedBranch];
+}
+it("effective-settings zero fixtures carry null slices and the alternatives omission", () => {
+  expect(effectiveSettingsZero.harnesses).toBeNull();
+  expect(effectiveSettingsZero.cross_check.models).toBeNull();
+  expect(startPreviewZero).not.toHaveProperty("alternatives");
+  expect(startPreviewFull.alternatives[0].refusal).toBe("x");
+  expect(schedulePreviewZero.notes).toBeNull();
+  expect(schedulePreviewZero).not.toHaveProperty("alternatives");
+  expect(schedulePreviewRequestZero).toEqual({});
+});
 
 // Nested members must match the Go recorder, including required nullable metadata.
 {
@@ -1758,6 +1856,13 @@ const dtos: { stem: string; nullable: boolean }[] = [
   { stem: "admin_user_usage", nullable: true },
   { stem: "admin_usage", nullable: true },
   { stem: "user_settings", nullable: true },
+  // PRD #3254 M2: all three carry nulls in zero.json (nil slices, nil pointers).
+  { stem: "effective_settings", nullable: true },
+  { stem: "effective_settings_start_preview", nullable: true },
+  { stem: "effective_settings_start_preview_request", nullable: true },
+  // PRD #3254 M3: the schedule preview's zero carries nulls; its request zero is `{}` (all omitempty).
+  { stem: "effective_settings_schedule_preview", nullable: true },
+  { stem: "effective_settings_schedule_preview_request", nullable: false },
   { stem: "catalog_entry", nullable: true },
   { stem: "cli_token", nullable: true },
   // M3 — the handler-package hot set.
