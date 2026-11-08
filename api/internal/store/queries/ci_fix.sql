@@ -68,9 +68,11 @@ RETURNING *;
 
 -- name: ListCIFixBindingCandidates :many
 -- Issue #4079: the candidate pull requests a ci_fix on a ref can bind to. The set is
--- the PRs uzi itself recorded (runs.mr_iid) on its own runs for this branch, which is
--- the fork boundary: no driver's head-branch field identifies the head repo, so a
--- forge-side listing by branch name could match a fork's PR. Newest first. Capped at
+-- the PRs uzi itself recorded (runs.mr_iid) on its own runs for this branch; a
+-- head-branch match alone is never proof, since no driver's head-branch field
+-- identifies the head repo. On GitLab the worker's duplicate-create recovery
+-- (GitLabClient.findOpenMr) can adopt a same-named fork MR into runs.mr_iid, so the
+-- recorded set is only as fork-safe as that recording (tracked separately). Newest first. Capped at
 -- 8 by the caller; the LIMIT 9 returns one extra row so an overflow is detectable.
 SELECT mr_iid::bigint AS mr_iid FROM runs
 WHERE user_id = @user_id AND repo_id = @repo_id::uuid AND branch = @ref AND mr_iid IS NOT NULL

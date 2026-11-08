@@ -108,6 +108,9 @@ func TestPublicationContextQueryPlanLiveDB(t *testing.T) {
 		if err := json.Unmarshal(raw, &s); err != nil || len(s.Nodes) != 1 || s.Nodes[0].Run.ID != f.id || s.AssociationUnknown || s.AncestryUnknown || s.CIMRConflict {
 			t.Fatalf("bound snapshot: nodes=%d error=%v %+v", len(s.Nodes), err, s)
 		}
+		if s.Request.CIFixMRIID == nil || *s.Request.CIFixMRIID != 7 {
+			t.Fatalf("snapshot request ci_fix_mr_iid = %v, want 7", s.Request.CIFixMRIID)
+		}
 		got, _ := resolvePublicationSnapshot(s, f.w, boundID, PublicationContextRequest{ClaimGeneration: 1, Branch: branch, CandidateHead: strings.Repeat("c", 40)})
 		if got.Status != "resolved" || got.Binding == nil || got.Binding.SourceRunID != f.id || got.Binding.MRIID != 7 {
 			t.Fatalf("bound resolution: %+v", got)

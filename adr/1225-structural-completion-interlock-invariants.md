@@ -537,8 +537,12 @@ it is created, and the resolver scopes to it.
 - **Binding.** `workersvc.createCIFixRun` (shared by the manual button, `uzi ci
   fix` and the automatic poller) reads the PRs uzi itself recorded on runs whose
   branch is the `ci_fix` ref (cap 8; more is ambiguous), asks the forge about
-  each, and stores the single open one. Exactly one open binds; none open or all
-  merged/closed leaves the fix unbound, as before.
+  each, and stores the single open one. Exactly one open binds; no recorded PR,
+  or every recorded PR merged or closed, leaves the fix unbound, as before. A
+  head-branch match alone is never proof (no driver identifies the head repo).
+  On GitLab the worker's duplicate-create recovery (`GitLabClient.findOpenMr`)
+  can adopt a same-named fork MR into `runs.mr_iid`, so the recorded set is only
+  as fork-safe as that recording (tracked separately).
 - **Dedicated column.** The result is `runs.ci_fix_mr_iid`, not `runs.mr_iid`.
   `mr_iid` is written by completion and reconcile and read by autofix
   candidates, the PR description and the run DTO; overloading it would change

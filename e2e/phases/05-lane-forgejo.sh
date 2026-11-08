@@ -183,7 +183,7 @@ pass "board cached the NEWEST run (failure) over the older success — id-DESC [
 #    The failed-job SNAPSHOT filter (workersvc.BuildFailureSnapshot's job filter) is deliberately NOT asserted
 #    here — an empty snapshot does not error and the fix run is created regardless,
 #    so this lane cannot see its content — its "failure"-job inclusion is
-#    unit-covered (handler.TestSnapshotFailedPipelineIncludesForgejoFailureJobs).
+#    unit-covered (workersvc.TestBuildFailureSnapshotIncludesForgejoFailureJobs).
 # The admin setting ci_autofix_enabled defaults ON (#1109), and the CIAutoFix poller treats a
 # ci_fix run's own fix branch like an agent branch: the re-failure posted on it below makes
 # the poller open a SECOND ci_fix of its own just as this phase ends, which the quarantine

@@ -98,7 +98,7 @@ func TestPublicationContextCIFixBindingIgnoresNullMRRowsLiveDB(t *testing.T) {
 
 func TestPublicationContextCIFixBindingToOldPRLiveDB(t *testing.T) {
 	c := seedCIBinding(t, ptr64(ciBindingOldMR))
-	// The old PR's root is the only candidate; the forge reports the current PR merged.
+	// The old PR's root is the only candidate; the forge reports that old bound PR merged.
 	c.proof.summary = forge.MergeRequestSummary{IID: ciBindingOldMR, State: forge.MRStateMerged,
 		SourceBranch: c.branch, HeadSHA: strings.Repeat("b", 40)}
 	wantUnknown(t, c.resolve(), "forge_mismatch")

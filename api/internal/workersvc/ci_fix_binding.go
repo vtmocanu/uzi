@@ -79,9 +79,12 @@ func ciFixLookupFailed(op string, err error) error {
 // resolveCIFixBinding decides which pull request a ci_fix on ref binds to.
 //
 // The candidates are only the pull requests uzi recorded (runs.mr_iid) on its own runs
-// for this branch. That is the fork boundary: no driver's head-branch field identifies
-// the head repository, so asking the forge "which PRs use this branch name" could match
-// a fork's PR. Each candidate is read from the forge and classified:
+// for this branch. A head-branch match alone is never proof: no driver's head-branch
+// field identifies the head repository, so asking the forge "which PRs use this branch
+// name" could match a fork's PR. On GitLab the worker's duplicate-create recovery
+// (GitLabClient.findOpenMr in agent/src/forge.ts) can adopt a same-named fork MR into
+// runs.mr_iid, so the recorded set is only as fork-safe as that recording (tracked
+// separately). Each candidate is read from the forge and classified:
 //
 //	forge answer                                   class
 //	opened, source branch == ref                   open match
