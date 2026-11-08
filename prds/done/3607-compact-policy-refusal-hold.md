@@ -18,7 +18,7 @@ The M1 history and its candidate-bound CI evidence remain in git history (PR #36
 - Compatible-lane preserve Resume and optional `fresh_one_claim`, with consumption, fenced non-delivery restore, confirmation and `fresh_start_uncertain` reclaim.
 - R/VG/VH continuity and the post-Fresh saved-work verification.
 - Guidance-bound exact replay.
-- Guarded Downs for migrations 00418 and 00417; the 00419 Down restores the NOT VALID check.
+- Guarded Downs for migrations 00420 and 00419; the 00421 Down restores the NOT VALID check.
 - The web `PolicyHoldPanel` and the CLI `uzi run resume-now --policy-mode`.
 - API enablement of `provider_policy_hold_v1`.
 - Docs, spec, ADR section and changelog.
@@ -304,6 +304,6 @@ The child closes when its implementation is merged under the repository's normal
 | 2026-10-31 | User approves lead/buddy's unusable-root intake stop and bounded outbox_root_unusable diagnostic. | Stop new claims only on a positively unusable initialized root. Keep healthy incomplete coverage claimable, preserve exact-target arbitration, and leave already-claimed/running targets operator-held without a new release or requeue mechanism. Repair preserves the original key and journals before restart. |
 | 2026-11-07 | Recovery continuation built on the existing branch; main merged without rebase. | The existing branch carried the reviewed M1 and repair history; merging main avoids rewriting it. |
 | 2026-11-07 | The Mc paired validate migration was not added. | The dba judged it optional: the API is a single Recreate-strategy instance, and the check cannot fail on new all-NULL columns. |
-| 2026-11-07 | `fresh_one_claim` shipped (Shape A, head 00419). | The optional compatible-lane checkpoint passed, so the choice is available rather than cut. |
+| 2026-11-07 | `fresh_one_claim` shipped (Shape A, head 00421). | The optional compatible-lane checkpoint passed, so the choice is available rather than cut. |
 | 2026-11-07 | A spent one-claim allowance re-holds `fresh_start_uncertain` rather than `session_missing`. | A provider thread may exist, so the uncertain state is the truthful one. |
 | 2026-11-07 | The in-run `deadcode:api` is unmet under the worker memory budget and goes to an owner decision. | The in-run `check:api` aggregate is incomplete; exact-head `validate-api` stays mandatory and no waiver is implied. |

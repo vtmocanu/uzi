@@ -8,12 +8,12 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// TestPolicyRecoveryIdentityMigrationLiveDB pins migration 417: the four columns are additive and
+// TestPolicyRecoveryIdentityMigrationLiveDB pins migration 419: the four columns are additive and
 // uncoupled (a row in the earlier compact-hold shape stays valid), the checks are closed, and Down
 // drops exactly these four columns.
 func TestPolicyRecoveryIdentityMigrationLiveDB(t *testing.T) {
 	ctx, dsn := standIsolatedDB(t, "policy_recovery_identity_")
-	if err := store.MigrateTo(ctx, dsn, 416); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 418); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := store.OpenPool(ctx, dsn)
@@ -37,11 +37,11 @@ func TestPolicyRecoveryIdentityMigrationLiveDB(t *testing.T) {
 			t.Fatalf("goose version = %d (%v), want %d", v, err, want)
 		}
 	}
-	version(416)
-	if err := store.MigrateTo(ctx, dsn, 417); err != nil {
+	version(418)
+	if err := store.MigrateTo(ctx, dsn, 419); err != nil {
 		t.Fatal(err)
 	}
-	version(417)
+	version(419)
 	var validated bool
 	if err := pool.QueryRow(ctx, "SELECT convalidated FROM pg_constraint WHERE conname='runs_policy_required_recovery_shape'").Scan(&validated); err != nil || !validated {
 		t.Fatalf("runs_policy_required_recovery_shape validated = %v (%v), want a validated check", validated, err)
@@ -76,10 +76,10 @@ func TestPolicyRecoveryIdentityMigrationLiveDB(t *testing.T) {
 		}
 	}
 	mustExec(ctx, t, pool, "UPDATE runs SET policy_hold_cause=NULL WHERE id=$1", run)
-	if err := store.MigrateDownTo(ctx, dsn, 416); err != nil {
+	if err := store.MigrateDownTo(ctx, dsn, 418); err != nil {
 		t.Fatalf("Down must convert the paused R-bearing row, not refuse it: %v", err)
 	}
-	version(416)
+	version(418)
 	var status string
 	if err := pool.QueryRow(ctx, "SELECT status FROM runs WHERE id=$1", run).Scan(&status); err != nil || status != "failed" {
 		t.Fatalf("paused R-bearing row status = %q (%v), want failed", status, err)
