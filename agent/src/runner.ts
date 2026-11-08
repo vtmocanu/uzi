@@ -21,7 +21,7 @@ import type { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
 import { GUARDED_LANE_JOIN_MS } from "./claude-command/lane.js";
 import type { CapturedMemoryContext } from "./codex/broker.js";
 import type { BaseAttestationHoldOutcome, MemoryIncarnation, MemoryParkReference, WorkerMemoryPressureResult } from "./protocol.js";
-import { BASE_ATTESTATION_HOLD_REASON, CAPABILITY_INFERENCE_EVIDENCE_FEATURE, REPO_AGENT_SOURCE_FEATURE, REPO_AGENT_SOURCE_HOLD_REASON } from "./protocol.js";
+import { BASE_ATTESTATION_HOLD_REASON, CAPABILITY_INFERENCE_EVIDENCE_FEATURE, PLAN_AGENT_SOURCE_FEATURE, REPO_AGENT_SOURCE_FEATURE, REPO_AGENT_SOURCE_HOLD_REASON } from "./protocol.js";
 import { PublicationContextLatch, publicationContextReason } from "./publication-context.js";
 import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, isTransientStatus, HELD_PUBLICATION_FEATURE, CHECKPOINT_PUBLISH_TIMEOUT_MS, CREDENTIAL_SWITCH_HOLD_FEATURE, CLARIFICATION_REVISION_SETTLEMENT_FEATURE } from "./client.js";
 import type { ClarificationSettlement } from "./protocol.js";
@@ -16003,6 +16003,22 @@ export class RunRunner {
       // executor only reads it on the path that has no verdict to supply one.
       approvedSelection: claim.agent_selection,
       requestedAgentSource: claim.requested_agent_source ?? null,
+      ...(this.client.protocolFeatures.includes(PLAN_AGENT_SOURCE_FEATURE) ? {
+        reportPlanAgentSource: async (source: AgentSource) => {
+          const signal = AbortSignal.any([
+            steering.lifecycleSignal(),
+            steering.terminalLifecycleSignal(),
+            this.shutdownSignal.signal,
+          ]);
+          try {
+            await reportState({ status: "running", plan_agent_source: source }, signal);
+          } catch (error) {
+            if (isCheckedLifecycleControl(error) || error instanceof RetainedRecoveryStop) throw error;
+            signal.throwIfAborted();
+            runLog.warn("could not record the plan agent source", { plan_agent_source: source, error: errMessage(error) });
+          }
+        },
+      } : {}),
       signal: cancel.signal,
       terminalLifecycleSignal: steering.terminalLifecycleSignal(),
       lifecycleSignal: () => steering.lifecycleSignal(),

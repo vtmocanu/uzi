@@ -24,7 +24,7 @@ A run's planning turn always uses the run owner's uzi templates. The owner's cho
 | Persisted selection | `seedAgentSelection`, `protocol.ts`; `persistedSelection`, `api/internal/workersvc/agent_selection.go` | A persisted `runs.agent_source` reaches the claim as `AgentSelection`; NULL sends none and the worker falls to the absent rule. |
 | Writers of `runs.agent_source` | `submitApproval` (`workersvc/submit.go`) via the approve query in `runtime.sql`; the autopilot `running` report (`COALESCE(sqlc.narg('agent_source'), agent_source)` in `runtime.sql`, handled in `workersvc/service.go` only when the run is autopilot); a seeded plan in `createRun` (`service.go`); milestone reconciliation (`workersvc/milestone_reconciliation.go`, `agent_source = CASE WHEN $4::jsonb IS NULL ...`) | `submitApproval` runs only when the approval carries a selection, so a no-selection approval leaves it NULL and nothing records what implementation used. Migration `00052_run_agent_selection.sql` documents it as a record of what ran; a requeue or resume that re-enters the human plan gate overwrites it. |
 | Plan turn, Claude | `sdk-executor.ts` (comment "plan turn runs with the OWN subagents (PRD #37 Decision 5)"); `planTurnSubagents`, `agent/src/agents.ts` | Owner templates only, write tools stripped, agents left with only write tools dropped. `subagentWriteCapabilities` is derived from `assembled.subagents` (PRD #266). The implement path builds its roster with `selectSubagents`, then `shapeGuardedGrants` (#2471), then the #305 model override. |
-| Plan turn, Codex | `buildRunRequest` `phase === "plan"`, `agent/src/codex/codex-executor.ts` | `ownSubagentTemplates(ctx.agents)` only. No `planTurnSubagents` strip; read-only planning is enforced by the broker and the plan prompt ("All planning dispatches are read-only"). The implement phase uses `implementTemplates(ctx, selection)`, which maps repo agents with `toHarnessAgent` and passes `repoSkills`. |
+| Plan turn, Codex | `buildRunRequest` `phase === "plan"`, `agent/src/codex/codex-executor.ts` | `ownSubagentTemplates(ctx.agents)` only. No `planTurnSubagents` strip; the broker refuses planning file-write requests and the plan prompt says "All planning dispatches are read-only"; the shell remains. The implement phase uses `implementTemplates(ctx, selection)`, which maps repo agents with `toHarnessAgent` and passes `repoSkills`. |
 | Untrusted framing | `REPO_SUBAGENT_UNTRUSTED_APPEND`, `agent/src/prompt.ts`; `buildLeadSystemPrompt` `opts.repoSourced` | Applied to the implement prompt when `selection.source === "repo"` on both harnesses. The plan phase passes `repoSourced = false`. |
 | Roster detection | `detectRepoAgents`, `agent/src/repoagents.ts`; runner preflight (`parseRepoAgents`, `agent/src/runner.ts`) | Every claim, before plan and gate, on the working clone. Reported to the server as `repo_agents` on a `running` state. The server knows no roster before the first claim's preflight. #3913 changes the source to git objects at a pinned default-branch revision. |
 | Autopilot exposure today | `runner.ts` autopilot branch | An autopilot run with a detected roster already implements with write-enabled repo agents and no human review. |
@@ -44,7 +44,7 @@ Each user can set, per repo they have connected, a **default agent source**: `ow
 - **Approval with no selection** (CLI, API, an external dispatcher) implements with the requested source, and the run records it.
 - **Autopilot** implements with the requested source.
 - **Web and Slack** pre-select the requested source; an explicit choice at approval still wins.
-- **Planning:** with a requested source of `repo` and a detected roster, the plan turn uses the repo's agents under today's plan-phase restrictions (report-only: write tools stripped on Claude, broker-enforced read-only on Codex; the shell remains, so this is not a read-only sandbox), with the same untrusted framing as implementation.
+- **Planning:** with a requested source of `repo` and a detected roster, the plan turn uses the repo's agents under today's plan-phase restrictions (write tools stripped on Claude, file-write requests refused by the broker on Codex; the shell remains on both, so shell commands can still change files and this is not a read-only sandbox), with the same untrusted framing as implementation.
 - **Per-run choice:** `uzi run create --agent-source` and the API's `agent_selection` work without a plan file and override the default for that run.
 - **Visibility:** the run shows "Planned with X (repo default / this run)" and "Implemented with Y (as requested / changed at approval)".
 - **Unset** keeps today's behaviour exactly.
@@ -106,7 +106,7 @@ The new exposure is limited: autopilot runs already implement with write-enabled
 
 - **Plan source:** `planAgentSource(persisted, requested, repoAvailable)` returns `repo` only when `requested === "repo"`, a roster was detected, and the persisted `runs.agent_source` is not `own`; otherwise `own`. A persisted value can only narrow the source, never widen it: `runs.agent_source` also records automatic choices (autopilot, materialization), so it is never read as consent. An explicit gate choice of `own` therefore wins on a replan, and an unset request always plans with owner templates.
 - **Claude:** a repo-sourced plan turn builds its roster through the implement-path pipeline: `selectSubagents("repo", ...)`, then `planTurnSubagents`, then `shapeGuardedGrants` (#2471), then the #305 model override. `subagentWriteCapabilities` is derived from the pre-strip repo definitions. The Agent-guard allow set and the "Available subagents" line come from the result.
-- **Codex:** the plan phase maps repo agents as `implementTemplates` does (`toHarnessAgent`, plus `repoSkills`), and every planning dispatch keeps the broker's read-only enforcement. A test proves a repo planning agent cannot write.
+- **Codex:** the plan phase maps repo agents as `implementTemplates` does (`toHarnessAgent`, plus `repoSkills`), and every planning dispatch keeps plan-phase grants, so the broker refuses its file-write requests (`write_denied_in_plan`); the shell remains. A test proves the broker refuses a repo planning agent's file write.
 - **Prompt:** `buildLeadSystemPrompt` receives `repoSourced = true` for a repo-sourced plan turn, so the plan prompt carries `REPO_SUBAGENT_UNTRUSTED_APPEND` plus "Planning subagents report findings; they do not change files."
 - **Record:** the worker reports `plan_agent_source` (`own` | `repo`) on the `running` state that starts the plan turn; the server stores it in `runs.plan_agent_source` (overwritten on replan). A seeded run skips the plan turn, so it stays NULL and the run page shows "—".
 - **Roster provenance:** planning reads the roster #3913 pins; this PRD adds no second detection path.
@@ -135,7 +135,7 @@ The new exposure is limited: autopilot runs already implement with write-enabled
 - **Worker gate (live DB):** a worker without `agent_source_request_v1` cannot claim a requested run even with `capability_aware` off; an unset run is claimable as today.
 - **Materialization:** a no-selection approval on a requested run writes `agent_source` (degrading `repo` to `own` with no roster); an explicit approval wins; the requested columns never change.
 - **PatchRepo:** owner can set and clear; admin can set `own` or clear but gets 403 for `repo`; another user gets 404; invalid value 400; combined groups 400.
-- **Plan turn (agent, both harnesses):** with requested `repo` and a roster, the plan request carries the repo agents through the implement-path pipeline (Claude write tools stripped, correct write-capability labels; Codex broker read-only) and the untrusted append; with unset, today's owner templates and no append; with a persisted `own` on a replan, owner templates; with the request unset and a persisted `repo` from autopilot, a re-entered plan still uses owner templates. Watch each red on today's code.
+- **Plan turn (agent, both harnesses):** with requested `repo` and a roster, the plan request carries the repo agents through the implement-path pipeline (Claude write tools stripped, correct write-capability labels; Codex broker refuses file-write requests) and the untrusted append; with unset, today's owner templates and no append; with a persisted `own` on a replan, owner templates; with the request unset and a persisted `repo` from autopilot, a re-entered plan still uses owner templates. Watch each red on today's code.
 - **Slack:** `gateBlocks` primary button follows the requested source; action ids unchanged (`gate_test.go`).
 - **Web:** `PlanPanel` pre-selection and the repo setting control (Vitest).
 - **CLI:** `run create --agent-source` without `--plan-file` sends the source; `--exclude-agents` without `--plan-file` still errors; `repo list --json` shows the setting.
@@ -162,7 +162,7 @@ Module 6, docs and changelog.
 Module 5, `plan_agent_source` in module 8, docs and changelog.
 
 - **Blocked by:** M1 and #3913.
-- **Acceptance:** examples 1 and 6 pass on Claude and Codex; example 3's replan part passes; a Codex repo planning agent cannot write; the plan prompt carries the untrusted append only for a repo-sourced plan; full agent suite: exact-head PR CI.
+- **Acceptance:** examples 1 and 6 pass on Claude and Codex; example 3's replan part passes; the broker refuses a Codex repo planning agent's file write; the plan prompt carries the untrusted append only for a repo-sourced plan; full agent suite: exact-head PR CI.
 
 ### M4: explicit per-run choice at create
 
@@ -173,8 +173,8 @@ Module 7, docs and changelog.
 
 ## Risks
 
-- **Pre-gate execution of repo code (M3).** Repo-authored agents with a shell run before the owner reviews the plan. Mitigations: owner-only opt-in per repo connection, the #3913 roster pin, write tools stripped / broker read-only, the untrusted framing, and the setting's warning line. Autopilot already carries a larger exposure today.
-- **Codex plan-phase roster mapping** is new code on the read-only boundary; its no-write test is mandatory in M3.
+- **Pre-gate execution of repo code (M3).** Repo-authored agents with a shell run before the owner reviews the plan. Mitigations: owner-only opt-in per repo connection, the #3913 roster pin, write tools stripped / broker file-write refusal (the shell can still change files), the untrusted framing, and the setting's warning line. Autopilot already carries a larger exposure today.
+- **Codex plan-phase roster mapping** is new code on the plan-phase file-write boundary; its file-write refusal test is mandatory in M3.
 - **Worker roll.** Requested runs wait for a worker reporting `agent_source_request_v1`; until the fleet rolls they stay queued, and the queued-run health reason must name the missing worker version (extend it if it does not). Unset runs are unaffected.
 - **Two fields for a run's agents** (`agent_source_requested` vs `agent_source`): the DTO names and run-page labels keep "requested" and "implemented with" distinct.
 

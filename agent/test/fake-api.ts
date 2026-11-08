@@ -330,6 +330,7 @@ export class FakeApi {
   readonly states: Array<{ runId: string; body: StateRequest }> = [];
   readonly repoAgentSourceByRun = new Map<string, string>();
   repoAgentSourceAckDelayMs = 0;
+  planAgentSourceAckHold: Promise<void> | undefined;
   /** Issue #3859: every /state body as it arrived on the wire, including reports the fake then
    *  refuses (which `states` omits because the real server persists nothing for a refusal). */
   readonly stateWire: Array<{ runId: string; body: StateRequest }> = [];
@@ -2181,6 +2182,7 @@ export class FakeApi {
       }
       this.repoAgentSourceByRun.set(runId, body.repo_agent_source_commit);
     }
+    if (body.plan_agent_source !== undefined && this.planAgentSourceAckHold) await this.planAgentSourceAckHold;
     if (this.checkedTransport && body.status === "awaiting_approval") this.checkedFencedRuns.add(runId);
     this.states.push({ runId, body });
     this.requestLog.push(`state:${body.status}`);

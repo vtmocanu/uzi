@@ -4311,7 +4311,8 @@ type StateRequest struct {
 	// Such a run self-approves the gate and never receives a SubmitInput, so the state
 	// report is its only channel for recording which roster it used. A human-gated run
 	// omits this and persists its selection through the approve_plan input instead.
-	AgentSelection *AgentSelection `json:"agent_selection"`
+	AgentSelection  *AgentSelection `json:"agent_selection"`
+	PlanAgentSource *string         `json:"plan_agent_source"`
 	// OpenQuestionID is the identity of the question the run is parking on (PRD #88
 	// M1), carried only by the `awaiting_input` transition. The worker mints it at the
 	// first park and re-sends the SAME value when a resumed worker re-parks on the same
@@ -6202,6 +6203,14 @@ func (s *Service) runningStateParams(ctx context.Context, run store.Run, req Sta
 			return p, fmt.Errorf("encode repo agents: %w", err)
 		}
 		p.RepoAgents = encoded
+	}
+
+	if req.PlanAgentSource != nil {
+		source := *req.PlanAgentSource
+		if source != AgentSourceOwn && source != AgentSourceRepo {
+			return p, fmt.Errorf("%w: plan_agent_source must be own or repo", ErrInvalidState)
+		}
+		p.PlanAgentSource = pgconv.TextOrNull(source)
 	}
 
 	if req.AgentSelection == nil {

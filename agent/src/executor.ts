@@ -465,6 +465,7 @@ export interface RunContext {
    *  which is the CORRECT answer for a gate-less run, not a fallback to tolerate. */
   approvedSelection?: AgentSelection;
   requestedAgentSource?: AgentSource | null;
+  reportPlanAgentSource?(source: AgentSource): Promise<void>;
   /** Called once with the SDK session id when first observed (for /state). */
   onSessionId?(sessionId: string): void;
   /** Aborts the SDK subprocess when signalled (cancel/shutdown; wired in M4). */

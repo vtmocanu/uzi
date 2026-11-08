@@ -382,6 +382,8 @@ export const REPO_SUBAGENT_UNTRUSTED_APPEND = [
   "responsible for the correctness and safety of what you commit.",
 ].join("\n");
 
+export const REPO_SUBAGENT_PLANNING_APPEND = "Planning subagents report findings; they do not change files.";
+
 /**
  * PRD #457: a short, capability-framed nudge making the incidental-findings tool
  * discoverable. The tool's own schema description carries the AUTHORITATIVE quality
@@ -714,6 +716,7 @@ export interface LeadSystemPromptOptions {
   /** When true, the run's subagents are repo-sourced — append the untrusted-review
    *  passage so the lead treats their output as unverified (Decision 3a). */
   repoSourced?: boolean;
+  planning?: boolean;
   /** The run's kind (PRD #72 M3). The PRD-lifecycle clause is appended for
    *  `issue` only (Decision 13): a `ci_fix` run carries no issue at all, and a
    *  `self_improve` run's issue is a reused backlog container whose description
@@ -805,6 +808,7 @@ export function buildLeadSystemPrompt(
   // ci_fix/self_improve run's prompt is byte-identical to before.
   if (isMrReworkKind(opts.kind)) parts.push(MR_REWORK_LIFECYCLE_APPEND);
   if (opts.repoSourced) parts.push(REPO_SUBAGENT_UNTRUSTED_APPEND);
+  if (opts.repoSourced && opts.planning) parts.push(REPO_SUBAGENT_PLANNING_APPEND);
   // PRD #246: the nonce-fenced UNTRUSTED/ADVISORY repo instructions go LAST, so no
   // part of the untrusted block precedes uzi's own guardrail text above.
   if (opts.repoInstructions && opts.repoInstructions.length > 0) parts.push(opts.repoInstructions);
