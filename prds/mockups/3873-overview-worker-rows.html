@@ -1144,7 +1144,7 @@ body[data-scenario="calm"] .station.gate-st .st-count { color: rgb(var(--fg)); }
 <h3>Target: richer worker rows (Capacity rail)</h3>
 <p class="src">Annotations (this panel, the purple numbers) are review aids, not UI. Fork of 3873-overview-redesign-mock.html; only the Capacity card's worker rows changed. Base: swap today's one-line text for the existing <code>WorkerStatGauges</code> (tone-coloured bars ok &lt;40, warn &lt;85, danger; data and dind volumes separately).</p>
 <ol>
-<li><b>Trouble on the collapsed row</b>, no expand needed: disk at danger tone (fullest volume), "restart needed" (memory authority lost), plus outbox blocked, residue quarantine, upgrade blocked. Same badges the Workers page already has.</li>
+<li><b>Trouble on the collapsed row</b>, no expand needed: disk at danger tone (fullest volume), "restart needed" (memory authority lost), plus residue quarantine and a failed or blocked upgrade. Same badges the Workers page already has.</li>
 <li><b>On this worker</b>: its runs (<code>reported_runs</code>, run id + phase), titled by joining the runs the Overview already loads (else short id), each with its disk from <code>run_disk</code> (top 5 by HOME size).</li>
 <li><b>Plain-language notes</b>: ephemeral binding, warm-lease expiry, memory-authority restart hint, and a held-work link when <code>custody_decisions_needed</code> &gt; 0.</li>
 <li><b>Version and uptime</b> (<code>online_since</code>) on online rows. Offline rows show "last seen X ago" instead: the api marks a worker offline after 45s without a heartbeat, so an online row never has a stale one. Offline workers sit outside the slot bar, as today.</li>
