@@ -3662,6 +3662,7 @@ export interface Run {
   agent_exclusions: string[] | null;
   agent_source_requested?: AgentSource | null;
   agent_source_requested_basis?: AgentSourceRequestedBasis | null;
+  plan_agent_source?: AgentSource | null;
   /** PRD #37 M4-fix: the owner's OWN-source subagent roster (name + description) —
    *  exactly the allocation-resolved templates the worker runs for source="own",
    *  lead already stripped. The plan gate's "My agent templates" card is built from

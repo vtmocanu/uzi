@@ -64,10 +64,12 @@ import {
   subagentWriteCapabilities,
 } from "./agents.js";
 import {
+  planAgentSource,
   resolveAgentSelection,
   seedAgentSelection,
   gateVerdictSelection,
   type AgentSelectionParse,
+  type AgentSource,
   type AskUserQuestion,
   type ClaimConfig,
   type Milestone,
@@ -848,6 +850,7 @@ interface DriveState {
   assembled: ReturnType<typeof assembleAgents>;
   leadModel: string | undefined;
   planSubagentNames: string[];
+  planSource: AgentSource;
   subagentCanWrite: ReturnType<typeof subagentWriteCapabilities>;
   preToolUse: (
     allowedSubagents: string[],
@@ -1729,31 +1732,36 @@ export class SdkExecutor implements Executor {
     if (ctx.config?.override_subagent_model && leadModel) {
       applySubagentModelOverride(assembled.subagents, leadModel);
     }
-    // The plan turn runs with the OWN subagents (PRD #37 Decision 5): the roster
-    // choice only takes effect after the plan is approved. #203 additionally
-    // strips the file-write tools from each of them, and DROPS any whose declared
-    // allowlist consisted only of write tools (see planTurnSubagents).
-    //
     // The names come from the RESULT, never from `assembled.subagents`. They feed
     // the plan turn's Agent-guard allowSet AND the "Available subagents to
     // delegate to:" line of every plan prompt, so a name surviving here while its
     // definition is gone would advertise — and let the lead invoke — an agent the
     // SDK cannot resolve. Every use of this list is plan-turn; the implement turn
     // derives its own from `selectSubagents`.
-    const planTurn = planTurnSubagents(assembled.subagents);
+    const planSource = planAgentSource(ctx.approvedSelection?.source, ctx.requestedAgentSource, (ctx.repoAgents?.length ?? 0) > 0);
+    const planPool = planSource === "repo"
+      ? selectSubagents(
+        "repo",
+        assembled.subagents,
+        ctx.repoAgents ?? [],
+        ctx.approvedSelection?.source === "repo" ? ctx.approvedSelection.exclusions : [],
+        survivorNames,
+        prepared.repoSurvivorNames,
+      )
+      : assembled.subagents;
+    const planTurn = planTurnSubagents(planPool);
     // Issue #2471: a memory-guard-bound run (ctx.capturedMemory present at run start, fixed for the
     // run) routes Bash to the supervised command tool, so the roster is shaped to it. The shaped
     // keys feed the Agent guard's allow set and the delegation lines below.
     const guarded = ctx.capturedMemory !== undefined;
     const planShaped = guarded ? shapeGuardedGrants(planTurn.subagents) : undefined;
     const planAgents = planShaped ? planShaped.agents : planTurn.subagents;
+    if (planSource === "repo" && ctx.config?.override_subagent_model && leadModel) {
+      applySubagentModelOverride(planAgents, leadModel);
+    }
     const planUnavailable: UnavailableRole[] = planShaped ? planShaped.unavailable : [];
     const planSubagentNames = Object.keys(planAgents);
-    // PRD #266 M1: each roster name's write capability, derived from the PRE-STRIP
-    // `assembled.subagents` (NOT `planTurn.subagents`, which subtracts the write
-    // tools and would falsely mark `coder` read-only). Built once and threaded into
-    // every plan prompt AND the implement prompt, looked up by roster name.
-    const subagentCanWrite = subagentWriteCapabilities(assembled.subagents);
+    const subagentCanWrite = subagentWriteCapabilities(planPool);
     if (planTurn.dropped.length > 0) {
       // Visible rather than silent: an agent missing from the plan wave is a
       // template-shape problem the operator can fix, and the approver should not
@@ -1997,6 +2005,8 @@ export class SdkExecutor implements Executor {
       skillsPluginPath,
       skills: runSkills.map((s) => qualifiedSkillName(s.name)),
       systemPrompt: buildLeadSystemPrompt(assembled.leadSystemPrompt, {
+        repoSourced: planSource === "repo",
+        planning: true,
         kind: ctx.kind,
         repoInstructions: repoInstructionsBlock,
         harness: "claude",
@@ -2124,6 +2134,7 @@ export class SdkExecutor implements Executor {
       assembled,
       leadModel,
       planSubagentNames,
+      planSource,
       subagentCanWrite,
       preToolUse,
       lane,
@@ -2160,10 +2171,26 @@ export class SdkExecutor implements Executor {
       idleMs,
       oauthToken,
       planSubagentNames,
+      planSource,
       subagentCanWrite,
       maxRevisions,
       environmentFacts,
     } = drive;
+    let planSourceAnnounced = false;
+    let planSourceReported = false;
+    const reportPlanSource = async (): Promise<void> => {
+      if (planSourceReported) return;
+      if (!planSourceAnnounced && planSource === "repo") {
+        ctx.emit({
+          kind: "status",
+          agent: "worker",
+          payload: { text: `planning with the repo's agents (${planSubagentNames.join(", ") || "none"})` },
+        });
+      }
+      planSourceAnnounced = true;
+      await ctx.reportPlanAgentSource?.(planSource);
+      planSourceReported = true;
+    };
     let resumeId = drive.resumeId;
     let frozenMilestones = drive.frozenMilestones;
       // --- PRD #35 Decision 6b + PRD #209 D4: skip planning for an approved plan ---
@@ -2575,6 +2602,7 @@ export class SdkExecutor implements Executor {
           // the session the aborted attempt ran (the last planning round's, after a clarification).
           let planResume = resumeId;
           const planStep = await this.runThroughSwitch(ctx, state, async () => {
+            await reportPlanSource();
             try {
               return await this.drivePlanningTurn(ctx, baseConfig, planResume, planPrompt, state, idleMs, budget);
             } catch (err) {
@@ -2695,9 +2723,6 @@ export class SdkExecutor implements Executor {
             agent: "worker",
             payload: automatic ? { automatic: true, cross_check_round: automaticRound } : { round: revisions },
           });
-          // A revision turn is a PLANNING turn (pre-approval), so it runs with the OWN
-          // subagents (baseConfig), exactly like the first plan turn — the roster
-          // selection only takes effect once a plan is APPROVED (PRD #37 Decision 5).
           // PRD #1247 M5b (MAJOR-6 rework): DEFER the credential switch across the revision planning
           // turn instead of releasing mid-turn. The turn's new plan is not persisted until the gate
           // report below. Since issue #1604 a mid-turn release is recoverable (the revise stays
@@ -2719,6 +2744,8 @@ export class SdkExecutor implements Executor {
           // memo block on the plain issue/rework path: announce where it is actually placed.
           if (resumeId === undefined && !isCIFix && !isSelfImprove && announceDecisionsMemo(ctx))
             decisionsMemoPlaced = true;
+          const sourceStep = await this.runThroughSwitch(ctx, state, reportPlanSource);
+          if ("released" in sourceStep) return { branch: ctx.branch, switchReleased: true };
           const runRevisionTurn = () =>
             this.drivePlanningTurn(ctx, baseConfig, resumeId, revisePrompt, state, idleMs, budget, !automatic);
           let turn: TurnResult & { plan: string };

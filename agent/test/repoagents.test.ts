@@ -29,6 +29,7 @@ import {
   AGENT_EXCLUSIONS_MAX,
   encodeAgentSelection,
   parseAgentSelection,
+  planAgentSource,
   resolveAgentSelection,
   seedAgentSelection,
 } from "../src/protocol.js";
@@ -632,6 +633,34 @@ describe("resolveAgentSelection — the requested source (PRD #3914)", () => {
       assert.equal(resolved.note === NO_ROSTER_NOTE, c.note);
     });
   }
+});
+
+describe("planAgentSource (PRD #3914 M3)", () => {
+  const sources: (AgentSource | null | undefined)[] = [undefined, null, "own", "repo"];
+  for (const persisted of sources) {
+    for (const requested of sources) {
+      for (const roster of [true, false]) {
+        const want: AgentSource = requested === "repo" && roster && persisted !== "own" ? "repo" : "own";
+        it(`persisted=${String(persisted)} requested=${String(requested)} roster=${roster} plans with ${want}`, () => {
+          assert.equal(planAgentSource(persisted, requested, roster), want);
+        });
+      }
+    }
+  }
+
+  it("an unset request with a persisted repo source from autopilot plans with owner templates", () => {
+    assert.equal(planAgentSource("repo", undefined, true), "own");
+    assert.equal(planAgentSource("repo", null, true), "own");
+  });
+
+  it("a persisted own source narrows a requested repo source to owner templates", () => {
+    assert.equal(planAgentSource("own", "repo", true), "own");
+  });
+
+  it("an unknown persisted or requested value never widens to repo", () => {
+    assert.equal(planAgentSource("both" as unknown as AgentSource, "repo", true), "own");
+    assert.equal(planAgentSource(undefined, "both" as unknown as AgentSource, true), "own");
+  });
 });
 
 describe("seedAgentSelection (issue #1718)", () => {

@@ -759,6 +759,7 @@ type RunDTO struct {
 	AgentExclusions           []string    `json:"agent_exclusions"`
 	AgentSourceRequested      *string     `json:"agent_source_requested"`
 	AgentSourceRequestedBasis *string     `json:"agent_source_requested_basis"`
+	PlanAgentSource           *string     `json:"plan_agent_source"`
 	// OwnAgents is the OWN-source subagent roster (name + description) the run's
 	// owner would run: exactly what ListClaimAgentTemplates delivers to a claim,
 	// minus the lead. It is the single source of truth the plan-gate "My agent
@@ -1661,6 +1662,7 @@ type RunSummaryItemDTO struct {
 	AgentExclusions           []string `json:"agent_exclusions"`
 	AgentSourceRequested      *string  `json:"agent_source_requested"`
 	AgentSourceRequestedBasis *string  `json:"agent_source_requested_basis"`
+	PlanAgentSource           *string  `json:"plan_agent_source"`
 	// OwnAgents is the OWN-source subagent roster (name + description) the run's
 	// owner would run: exactly what ListClaimAgentTemplates delivers to a claim,
 	// minus the lead. It is the single source of truth the plan-gate "My agent
@@ -2153,6 +2155,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		AgentExclusions:               item.AgentExclusions,
 		AgentSourceRequested:          item.AgentSourceRequested,
 		AgentSourceRequestedBasis:     item.AgentSourceRequestedBasis,
+		PlanAgentSource:               item.PlanAgentSource,
 		OwnAgents:                     item.OwnAgents,
 		AnthropicSecretID:             item.AnthropicSecretID,
 		AnthropicSecretLabel:          item.AnthropicSecretLabel,
@@ -2344,6 +2347,7 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			AgentExclusions:               s.AgentExclusions,
 			AgentSourceRequested:          s.AgentSourceRequested,
 			AgentSourceRequestedBasis:     s.AgentSourceRequestedBasis,
+			PlanAgentSource:               s.PlanAgentSource,
 			OwnAgents:                     s.OwnAgents,
 			AnthropicSecretID:             s.AnthropicSecretID,
 			AnthropicSecretLabel:          s.AnthropicSecretLabel,

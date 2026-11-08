@@ -3724,10 +3724,21 @@ export function AgentRosterSummary({ run }: { run: Run }) {
 
 const AGENT_SOURCE_RUN_LABELS: Record<AgentSource, string> = { own: "my templates", repo: "repo agents" };
 
-function agentSourceRequestLine(run: Pick<Run, "agent_source" | "agent_source_requested" | "agent_source_requested_basis">): string | null {
+function agentSourceRequestLine(
+  run: Pick<Run, "agent_source" | "agent_source_requested" | "agent_source_requested_basis" | "plan_agent_source">,
+): string | null {
   const requested = run.agent_source_requested;
   if (!requested || !run.agent_source) return null;
   const basis = run.agent_source_requested_basis === "repo_default" ? "repo default" : "this run";
+  const planned = run.plan_agent_source;
+  const parts: string[] = [];
+  if (planned === requested) {
+    parts.push(`Planned with: ${AGENT_SOURCE_RUN_LABELS[planned]} (${basis})`);
+  } else {
+    parts.push(`Requested: ${AGENT_SOURCE_RUN_LABELS[requested]} (${basis})`);
+    parts.push(`Planned with: ${planned ? AGENT_SOURCE_RUN_LABELS[planned] : "—"}`);
+  }
   const outcome = run.agent_source === requested ? "as requested" : "changed at approval";
-  return `Requested: ${AGENT_SOURCE_RUN_LABELS[requested]} (${basis}) · Implemented with: ${AGENT_SOURCE_RUN_LABELS[run.agent_source]} (${outcome})`;
+  parts.push(`Implemented with: ${AGENT_SOURCE_RUN_LABELS[run.agent_source]} (${outcome})`);
+  return parts.join(" · ");
 }
