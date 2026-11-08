@@ -2041,8 +2041,15 @@ const server = https.createServer(
         // source->target branch pair; the worker catches it and reuses the existing
         // MR (findOpenMr) instead of stacking a second one. Emulate that so a ci_fix
         // landing on an agent branch updates the existing MR (PRD #6), not a dupe.
+        // Only an OWN-SOURCE MR conflicts: a fork MR into this project on the same
+        // branch name (source_project_id differs) does not block our create.
         const dup = state.mrs.find(
-          (m) => m.source_branch === body.source_branch && m.target_branch === body.target_branch && m.state === "opened",
+          (m) =>
+            m.project_id === project.id &&
+            (m.source_project_id ?? m.project_id) === project.id &&
+            m.source_branch === body.source_branch &&
+            m.target_branch === body.target_branch &&
+            m.state === "opened",
         );
         if (dup) {
           log("MR create 409 (open MR exists)", dup.iid, body.source_branch);
@@ -2066,9 +2073,19 @@ const server = https.createServer(
         return send(res, 201, syncHead(mr));
       }
       if (method === "GET" && rest === "/merge_requests") {
+        // Project-scoped like GitLab's /projects/:id/merge_requests, and each row carries
+        // source_project_id/target_project_id: the worker adopts only an own-project MR.
+        // A fixture models a fork MR with its own source_project_id (default: project_id).
         const src = url.searchParams.get("source_branch");
-        const list = state.mrs.filter((m) => (src ? m.source_branch === src : true) && m.state === "opened");
-        return send(res, 200, list.map(syncHead));
+        const tgt = url.searchParams.get("target_branch");
+        const list = state.mrs.filter(
+          (m) =>
+            m.project_id === project.id &&
+            (src ? m.source_branch === src : true) &&
+            (tgt ? m.target_branch === tgt : true) &&
+            m.state === "opened",
+        );
+        return send(res, 200, list.map((m) => ({ ...syncHead(m), source_project_id: m.source_project_id ?? m.project_id, target_project_id: m.project_id })));
       }
     }
 

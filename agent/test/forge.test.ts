@@ -88,6 +88,24 @@ const base = {
   description: "Closes #5",
 };
 
+/** A GitLab MR list row as the project-scoped list returns it: an own-project MR on
+ *  `base`'s branches by default (source and target project 42). Override a field with
+ *  `undefined` to drop it. */
+function gitlabListedMr(over: Record<string, unknown>): Record<string, unknown> {
+  const row: Record<string, unknown> = {
+    iid: 7,
+    web_url: "https://gitlab.example.com/x/-/merge_requests/7",
+    state: "opened",
+    source_project_id: 42,
+    target_project_id: 42,
+    source_branch: base.sourceBranch,
+    target_branch: base.targetBranch,
+    ...over,
+  };
+  for (const k of Object.keys(row)) if (row[k] === undefined) delete row[k];
+  return row;
+}
+
 describe("GitLabClient.createMergeRequest", () => {
   it("POSTs to the MR endpoint with the PAT in the header (never URL/body) and returns iid + web url", async () => {
     const { fetchFn, calls } = recorder([{ status: 201, body: { iid: 12, web_url: "https://gitlab.example.com/group/sub/repo/-/merge_requests/12" } }]);
@@ -110,7 +128,7 @@ describe("GitLabClient.createMergeRequest", () => {
   it("is idempotent: on 409 it finds and returns the existing open MR", async () => {
     const { fetchFn, calls } = recorder([
       { status: 409, body: { message: ["Another open merge request already exists for this source branch: !7"] } },
-      { status: 200, body: [{ iid: 7, web_url: "https://gitlab.example.com/x/-/merge_requests/7" }] },
+      { status: 200, body: [gitlabListedMr({ iid: 7, web_url: "https://gitlab.example.com/x/-/merge_requests/7" })] },
     ]);
     const mr = await new GitLabClient({ fetchFn }).createMergeRequest(base);
     assert.deepStrictEqual(mr, { iid: 7, webUrl: "https://gitlab.example.com/x/-/merge_requests/7" });
@@ -119,6 +137,42 @@ describe("GitLabClient.createMergeRequest", () => {
     assert.strictEqual(calls[1]!.headers["PRIVATE-TOKEN"], PAT);
     assert.match(calls[1]!.url, /state=opened&source_branch=agent%2Fissue-5/);
   });
+
+  it("on 409 adopts the project's own MR, never a fork MR listed first for the same branch", async () => {
+    const { fetchFn } = recorder([
+      { status: 409, body: { message: ["Another open merge request already exists for this source branch: !7"] } },
+      {
+        status: 200,
+        body: [
+          gitlabListedMr({ iid: 9, web_url: "https://gitlab.example.com/x/-/merge_requests/9", source_project_id: 999 }),
+          gitlabListedMr({ iid: 7, web_url: "https://gitlab.example.com/x/-/merge_requests/7" }),
+        ],
+      },
+    ]);
+    const mr = await new GitLabClient({ fetchFn }).createMergeRequest(base);
+    assert.deepStrictEqual(mr, { iid: 7, webUrl: "https://gitlab.example.com/x/-/merge_requests/7" });
+  });
+
+  for (const [name, item] of [
+    ["a fork MR", gitlabListedMr({ iid: 9, source_project_id: 999 })],
+    ["an MR without source_project_id", gitlabListedMr({ iid: 9, source_project_id: undefined })],
+    ["an MR without target_project_id", gitlabListedMr({ iid: 9, target_project_id: undefined })],
+    ["an MR with a non-numeric project id", gitlabListedMr({ iid: 9, source_project_id: "42", target_project_id: "42" })],
+    ["an MR on another source branch", gitlabListedMr({ iid: 9, source_branch: "agent/issue-50" })],
+    ["an MR on another target branch", gitlabListedMr({ iid: 9, target_branch: "release" })],
+    ["an MR that is not open", gitlabListedMr({ iid: 9, state: "merged" })],
+  ] as const) {
+    it(`on 409 never adopts ${name}: the create error propagates`, async () => {
+      const { fetchFn } = recorder([
+        { status: 409, body: { message: ["Another open merge request already exists for this source branch: !7"] } },
+        { status: 200, body: [item] },
+      ]);
+      await assert.rejects(
+        new GitLabClient({ fetchFn }).createMergeRequest(base),
+        (err: unknown) => err instanceof ForgeError && err.status === 409,
+      );
+    });
+  }
 
   it("propagates boundary cancellation through the duplicate-MR lookup GET", async () => {
     const calls: Call[] = [];
@@ -388,7 +442,7 @@ describe("createMergeRequest — transient findOpenMr during a duplicate (PRD #2
   it("adopt-existing is preserved: a duplicate POST + 200 GET returns the existing MR", async () => {
     const { fetchFn } = recorder([
       { status: 409, body: { message: ["Another open merge request already exists: !7"] } },
-      { status: 200, body: [{ iid: 7, web_url: "https://gitlab.example.com/x/-/merge_requests/7" }] },
+      { status: 200, body: [gitlabListedMr({ iid: 7, web_url: "https://gitlab.example.com/x/-/merge_requests/7" })] },
     ]);
     const mr = await new GitLabClient({ fetchFn }).createMergeRequest(base);
     assert.deepStrictEqual(mr, { iid: 7, webUrl: "https://gitlab.example.com/x/-/merge_requests/7" });
@@ -1203,7 +1257,7 @@ describe("byte caps on every forge read path (H1)", () => {
 
   it("the list cap admits one worst-case MR: a list over the detail cap but under the list cap is adopted", async () => {
     assert.ok(MR_LIST_MAX_BYTES > MR_DETAIL_MAX_BYTES + 64 * 1024, "the list cap holds one detail-sized object");
-    const one = [{ iid: 7, web_url: "https://gitlab.example.com/x/-/merge_requests/7", description: "\u0001".repeat(Math.ceil(MR_DETAIL_MAX_BYTES / 6) + 1024) }];
+    const one = [gitlabListedMr({ iid: 7, web_url: "https://gitlab.example.com/x/-/merge_requests/7", description: "\u0001".repeat(Math.ceil(MR_DETAIL_MAX_BYTES / 6) + 1024) })];
     const text = JSON.stringify(one);
     assert.ok(Buffer.byteLength(text) > MR_DETAIL_MAX_BYTES && Buffer.byteLength(text) < MR_LIST_MAX_BYTES);
     let n = 0;
