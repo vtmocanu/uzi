@@ -713,8 +713,10 @@ scenarios are mutually exclusive by construction. Known values:
   all-users list (one awaiting approval, three running, one in a usage-limit
   wait, and `run-ov-omar-asking`, which is awaiting input). One of your own
   runs is awaiting input too (`#409`, "Let admins cap concurrent exports per
-  tenant"), so its Needs your decision row shows the pending-question excerpt
-  "Should the cap count exports that are still queued?" under the title; `run-unreadable-question` has a malformed question
+  tenant"). It joins `run-awaiting-followup` and `run-unreadable-question` in a
+  collapsed three-item question group in Needs your decision; expand it ("Open
+  runs") and #409 quotes its pending question "Should the cap count exports
+  that are still queued?" under its title; `run-unreadable-question` has a malformed question
   payload and shows no excerpt. One of your own completed runs shares its open MR with `run-ci-halted`,
   so the pull-request list has a duplicate to collapse. Your fleet gains seven
   workers for the Capacity card (full, draining and upgrading, manually
