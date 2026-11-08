@@ -582,6 +582,7 @@ describe("OverviewNext capacity rail", () => {
     }
     expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(window.innerWidth);
     expectRailSummariesFit(railCard, 5);
+    expectFifthWorkerPills(railCard);
   });
 
   it("keeps worker names readable and rows inside the rail at 320px", async () => {
@@ -592,6 +593,7 @@ describe("OverviewNext capacity rail", () => {
     expect(window.innerWidth).toBe(320);
     const railCard = screen.getByRole("heading", { name: /Capacity/ }).closest("div.rounded-xl") as HTMLElement;
     expectRailSummariesFit(railCard, 5);
+    expectFifthWorkerPills(railCard);
   });
 });
 
@@ -645,38 +647,45 @@ describe("OverviewNext capacity rail worker rows", () => {
   }
 
   for (const width of [1280, 400]) {
-  it(`opens the disk-danger and offline rows into gauges, runs, held-work link and footer at ${width}px`, async () => {
-    await page.viewport(width, 900);
-    mountFleet();
-    await screen.findByText("Capacity");
-    await document.fonts.ready;
-    const rail = railOf();
+    it(`opens the disk-danger, offline, leased and rolling rows into gauges, runs, notes, held-work link and footer at ${width}px`, async () => {
+      await page.viewport(width, 900);
+      expect(window.innerWidth).toBe(width);
+      mountFleet();
+      await screen.findByText("Capacity");
+      await document.fonts.ready;
+      const rail = railOf();
 
-    const danger = rowOf(rail, "base.l-highmem-7c2e");
-    const offline = rowOf(rail, "ci-runner-offline");
-    (danger.querySelector("summary") as HTMLElement).click();
-    (offline.querySelector("summary") as HTMLElement).click();
-    expect(danger.open).toBe(true);
-    expect(offline.open).toBe(true);
+      const danger = rowOf(rail, "base.l-highmem-7c2e");
+      const offline = rowOf(rail, "ci-runner-offline");
+      const leased = rowOf(rail, "ephemeral-9e17a0d3");
+      const rolling = rowOf(rail, "base.l-highmem-b54d");
+      for (const row of [danger, offline, leased, rolling]) {
+        (row.querySelector("summary") as HTMLElement).click();
+        expect(row.open).toBe(true);
+      }
 
-    const cpu = within(danger).getByRole("progressbar", { name: "CPU" });
-    expect(cpu.checkVisibility()).toBe(true);
-    expect(within(danger).getByText("On this worker").checkVisibility()).toBe(true);
-    const run = within(danger).getByRole("link", { name: /#77 Rework the cost cap/ });
-    expect(run.getAttribute("href")).toBe("/runs/run-mr-rework");
-    expect(within(danger).getByText("run 5e44c9d7").checkVisibility(), "unjoined run shows its short id").toBe(true);
-    expect(within(danger).getByRole("link", { name: /Review held work/ }).checkVisibility()).toBe(true);
-    expect(within(danger).getByText(/^v0\.87\.0-rc\.4 · up /).checkVisibility()).toBe(true);
+      expect(within(leased).getByText(/Kept warm for same-branch follow-up work until/).checkVisibility()).toBe(true);
+      expect(within(rolling).getByText(/Takes no new runs\./).checkVisibility()).toBe(true);
+      expect(within(rolling).getByText(/Rolls to v0\.86\.1-rc\.2 once fully idle/).checkVisibility()).toBe(true);
 
-    expect(within(offline).getByText("Last reported").checkVisibility()).toBe(true);
-    expect(within(offline).getByText(/last seen/).checkVisibility()).toBe(true);
+      const cpu = within(danger).getByRole("progressbar", { name: "CPU" });
+      expect(cpu.checkVisibility()).toBe(true);
+      expect(within(danger).getByText("On this worker").checkVisibility()).toBe(true);
+      const run = within(danger).getByRole("link", { name: /#77 Rework the cost cap/ });
+      expect(run.getAttribute("href")).toBe("/runs/run-mr-rework");
+      expect(within(danger).getByText("run 5e44c9d7").checkVisibility(), "unjoined run shows its short id").toBe(true);
+      expect(within(danger).getByRole("link", { name: /Review held work/ }).checkVisibility()).toBe(true);
+      expect(within(danger).getByText(/^v0\.87\.0-rc\.4 · up /).checkVisibility()).toBe(true);
 
-    const railRight = rail.getBoundingClientRect().right;
-    for (const el of rail.querySelectorAll<HTMLElement>("li, li *")) {
-      expect.soft(el.getBoundingClientRect().right, `${el.tagName} ${el.textContent?.slice(0, 30)}`).toBeLessThanOrEqual(railRight + 1);
-    }
-    expect(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(window.innerWidth);
-  });
+      expect(within(offline).getByText("Last reported").checkVisibility()).toBe(true);
+      expect(within(offline).getByText(/last seen/).checkVisibility()).toBe(true);
+
+      const railRight = rail.getBoundingClientRect().right;
+      for (const el of rail.querySelectorAll<HTMLElement>("li, li *")) {
+        expect.soft(el.getBoundingClientRect().right, `${el.tagName} ${el.textContent?.slice(0, 30)}`).toBeLessThanOrEqual(railRight + 1);
+      }
+      expect(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(window.innerWidth);
+    });
   }
 });
 
@@ -731,6 +740,14 @@ describe("OverviewNext held work card", () => {
     expect(held.right).toBeLessThanOrEqual(window.innerWidth);
   });
 });
+
+// The several-problem-pills worker (the 5th in mountPreview) shows every pill in its summary.
+function expectFifthWorkerPills(railCard: HTMLElement) {
+  const summary = railCard.querySelectorAll<HTMLElement>("li summary")[4];
+  for (const text of ["2/2 runs", "disk 91%", "memory authority lost", "upgrade failed"]) {
+    expect(within(summary).getByText(text).checkVisibility(), `${text} visible`).toBe(true);
+  }
+}
 
 // Every worker summary stays inside its box and its name keeps a readable width, however
 // many badges the worker shows.
