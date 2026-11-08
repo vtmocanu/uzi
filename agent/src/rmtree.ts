@@ -1703,8 +1703,8 @@ export async function runAgentHelper(
    *  helper and settles only once it has closed (as the ambient-budget branch does), so a caller with
    *  an absolute deadline never returns while its helper may still be running. Default: unchanged.
    *  `killAsHelperUid` (read with `joinOnTimeout` and, issue #4089, under an ambient budget, where
-   *  it overrides {@link helperUidKillerFor}'s default): the timeout signals the helper through it
-   *  instead of `child.kill`, for a helper running as a uid the worker cannot signal (the runner-uid
+   *  it overrides {@link helperUidKillerFor}'s default): the timeout (and, under a budget, the cancel)
+   *  kill signals the helper through it instead of `child.kill`, for a helper running as a uid the worker cannot signal (the runner-uid
    *  split: EPERM). A false return leaves the helper running; it is still joined (fail-closed).
    *  `uidSplit`: test seam only, forwarded to {@link helperUidKillerFor}. */
   opts: { joinOnTimeout?: boolean; killAsHelperUid?: (pid: number) => boolean; uidSplit?: boolean } = {},

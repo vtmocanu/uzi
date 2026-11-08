@@ -66,11 +66,16 @@ function launch(
   const ac = new AbortController();
   let helperPid: number | undefined;
   t.after(() => {
-    try { process.kill(helperPid ?? Number(readFileSync(pidFile, "utf8")), "SIGKILL"); } catch { /* gone or never started */ }
+    // Only a positive pid: an empty or partly written pid file reads as 0, and kill(0) would hit
+    // the test runner's own process group.
+    let p = helperPid;
+    if (p === undefined) { try { p = Number(readFileSync(pidFile, "utf8")); } catch { /* never started */ } }
+    if (p !== undefined && Number.isInteger(p) && p > 0) { try { process.kill(p, "SIGKILL"); } catch { /* gone */ } }
     rmSync(dir, { recursive: true, force: true });
   });
   const state: Launched["state"] = { settled: false, error: undefined, value: undefined };
-  const helperTimeout = mode === "timeout" ? 300 : 10_000;
+  // Long enough that a loaded host still writes the pid file before the timeout fires.
+  const helperTimeout = mode === "timeout" ? 1500 : 10_000;
   const done = MaintenanceBudget.runProducer(
     () => runAgentHelper(wrap, SCRIPT, [pidFile], helperTimeout, "", opts),
     { durationMs: 600_000, signal: ac.signal },
@@ -80,7 +85,9 @@ function launch(
   );
   const pid = async (): Promise<number> => {
     await until(() => { try { return readFileSync(pidFile, "utf8") !== ""; } catch { return false; } }, 8000, "the helper's pid file");
-    helperPid = Number(readFileSync(pidFile, "utf8"));
+    const read = Number(readFileSync(pidFile, "utf8"));
+    assert.ok(Number.isInteger(read) && read > 0, `a positive helper pid, got ${read}`);
+    helperPid = read;
     return helperPid;
   };
   return {
