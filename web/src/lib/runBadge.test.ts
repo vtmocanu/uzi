@@ -1409,6 +1409,20 @@ describe("effectiveRunStatus — credential_disabled hold (PRD #1732)", () => {
   });
 });
 
+// PRD #3989 M3: an account reset deleted every credential; the run parks until one is added.
+describe("credentials_reset hold (PRD #3989)", () => {
+  it("overlays a paused run held on credentials_reset with the warn badge", () => {
+    expect(effectiveRunStatus({ status: "paused", hold_reason: "credentials_reset" })).toBe("credentials_reset");
+    expect(runStatusTone("credentials_reset", null)).toBe("warning");
+    expect(runBadge(run({ status: "paused", hold_reason: "credentials_reset" }), NOW)).toMatchObject({
+      kind: "badge",
+      label: "waiting: credentials were reset",
+      tone: "warning",
+      pulse: false,
+    });
+  });
+});
+
 // PRD #1732 D14, board shape: the board projection sends hold_reason on every card
 // (latestRunDTO.HoldReason), so a card whose latest run is parked on a disabled credential
 // arrives as a LatestRun with status "paused" + hold_reason "credential_disabled" and must
@@ -1624,7 +1638,7 @@ it.each([null, undefined, "invalid", "2099-01-01T00:00:00Z", "2020-01-01T00:00:0
   expect(runStatusTone(status, null)).toBe("warning");
   const badge = runBadge(input, NOW);
   expect(badge).toMatchObject({ label: "retained recovery integrity hold", tone: "warning", pulse: false });
-  expect(badge.kind === "badge" && badge.title).toMatch(/Integrity checks refused/);
+  expect(badge.kind === "badge" && badge.title).toMatch(/Integrity hold.*remediation record/);
   expect(badge.kind === "badge" && badge.title).toMatch(/local work and its custody are preserved/i);
   expect(badge.kind === "badge" && badge.title).toMatch(/owner can Resume or Cancel.*no scheduled retry/);
   expect(badge.kind === "badge" && badge.title).not.toMatch(/automatically|retrying in|retry in/);

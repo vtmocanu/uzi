@@ -65,7 +65,14 @@
       "default_source": "x",
       "resolved_effort": "x",
       "source": "x",
-      "mode": "x"
+      "mode": "x",
+      "catalog_default": {
+        "state": "x",
+        "effort": "x",
+        "model": "x",
+        "runtime_version": "x",
+        "observed_at": "2020-01-02T03:04:05Z"
+      }
     }
   ],
   "weekly_reserve_pct": 1,

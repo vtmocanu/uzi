@@ -228,6 +228,20 @@ export interface EffortSettingCell {
   resolved_effort: string | null;
   source: string;
   mode: "explicit" | "runtime_default";
+  /** Codex cell only (issue #3251): the effort the Codex model catalog applies when no
+   *  level is sent. Absent on the Claude cell and on an older server. */
+  catalog_default?: CatalogDefault;
+}
+
+/** What a Codex run's catalog reported as its default effort (issue #3251). `state` is
+ *  known, unknown (nothing reported yet; effort/model/runtime_version are null) or
+ *  varies (workers disagree). effort "none" means the catalog requests no level. */
+export interface CatalogDefault {
+  state: "known" | "unknown" | "varies";
+  effort: string | null;
+  model: string | null;
+  runtime_version: string | null;
+  observed_at: string | null;
 }
 
 export interface UserSettings {
@@ -651,6 +665,7 @@ export interface Repo {
   // skills from the repo's own .claude/skills/ (skills only, never hooks/
   // settings/commands). Default false.
   repo_skills_enabled: boolean;
+  agent_source_default?: AgentSource | null;
   // Repo-instructions opt-in (PRD #246): when true, the lead reads the repo's
   // root CLAUDE.md as nonce-fenced, advisory, lead-only context. It is the second
   // capability behind the "Trusted repo" affordance, independently revocable from
@@ -972,7 +987,8 @@ export interface LatestRun {
   // hold_reason (PRD #1226/#1497/#1732): why a `paused` run is server-held, null for an owner
   // pause or a non-paused run. Non-sensitive, so the board projection sends it on every card
   // (api/internal/handler/board.go latestRunDTO.HoldReason). effectiveRunStatus overlays
-  // 'credential_disabled' so the card reads "waiting: credential disabled", not "paused", and
+  // 'credential_disabled' so the card reads "waiting: credential disabled", not "paused",
+  // 'credentials_reset' (PRD #3989) likewise reads "waiting: credentials were reset", and
   // the issue #3181 token-switch holds ('credential_switch_settling' / 'credential_switch_unsettled')
   // so they read "settling: token switch" / "held: token switch".
   // 'base_attestation_missing' (issue #3194) reads "base unverified: owner hold" likewise.
@@ -2051,6 +2067,39 @@ export interface CliAuthRequestMeta {
   client_desc: string;
   status: CliAuthStatus;
   expires_at: string;
+}
+
+// ── Admin-issued account reset link (PRD #3989) ───────────────────────────────
+// kind says what redeeming does: "password" sets a new login password, "vault_only"
+// (an SSO-only account, M2) only resets the vault. Both delete every model credential.
+export type ResetLinkKind = "password" | "vault_only";
+
+// AccountResetLink is the 201 of POST /api/admin/users/{id}/reset-link. The plaintext
+// token appears here exactly once (only its hash is stored); the web composes
+// `${origin}/reset#<token>` and never sends the token anywhere but a POST body.
+export interface AccountResetLink {
+  token: string;
+  expires_at: string;
+  kind: ResetLinkKind;
+  target_is_admin: boolean;
+}
+
+// ResetLinkPreview is the 200 of POST /api/auth/reset/preview. Every invalid-link
+// cause is one generic 404 instead.
+export interface ResetLinkPreview {
+  kind: ResetLinkKind;
+  expires_at: string;
+}
+
+// Request bodies of the two unauthenticated reset endpoints. The token rides the
+// body, never a path or query. password is required for kind=password and must be
+// absent for kind=vault_only.
+export interface ResetLinkPreviewRequest {
+  token: string;
+}
+export interface ResetLinkRedeemRequest {
+  token: string;
+  password?: string;
 }
 
 // ── OAuth consent flow (PRD #1910 M2) ─────────────────────────────────────────
@@ -3593,11 +3642,15 @@ export interface Run {
    *  none (the plan gate's repo card is inert, NOT the same as null). Names +
    *  descriptions only — REPO-SUPPLIED, untrusted text; render as plain JSX. */
   repo_agents: RepoAgent[] | null;
+  repo_agent_source_commit?: string | null;
   /** PRD #37: which roster the run's subagents came from, once a selection is made
    *  (at the gate, or an autopilot run's resolved default). null before then. */
   agent_source: AgentSource | null;
   /** PRD #37: the names excluded from the chosen source. null before a selection. */
   agent_exclusions: string[] | null;
+  agent_source_requested?: AgentSource | null;
+  agent_source_requested_basis?: AgentSourceRequestedBasis | null;
+  plan_agent_source?: AgentSource | null;
   /** PRD #37 M4-fix: the owner's OWN-source subagent roster (name + description) —
    *  exactly the allocation-resolved templates the worker runs for source="own",
    *  lead already stripped. The plan gate's "My agent templates" card is built from
@@ -3775,8 +3828,8 @@ export interface Run {
    *  a finite timestamp schedules a retry, see disk_park_count);
    *  "provider_outage" is a counted provider interruption with a scheduled retry;
    *  "retained_recovery_exhausted" can be timed or owner-held (see recovery_retry_not_before);
-   *  "retained_recovery_adoption_failed" means integrity checks refused adoption of retained
-   *  work: always owner-held with local work and custody preserved, no automatic retry.
+   *  "retained_recovery_adoption_failed" is an integrity hold: retained adoption or a predecessor
+   *  remediation record refused source use (the agent did not start): always owner-held with local work and custody preserved, no automatic retry.
    *  Only the owner can Resume or Cancel, through the existing owner authorization.
    *  "retained_continuation_unwitnessed" (issue #3859) means a retained-custody continuation's
    *  claimed worker flight was never witnessed starting or departing within a bounded window;
@@ -3943,7 +3996,9 @@ export interface Run {
    *
    *  `hold_reason` names why a `paused` run is server-held, else null: 'completion_blocked' for
    *  a completion hold, 'credential_disabled' for a run waiting on a disabled credential
-   *  (PRD #1732 D14; resumes on Enable, never on a plain Resume), 'budget_exhausted' for a
+   *  (PRD #1732 D14; resumes on Enable, never on a plain Resume), 'credentials_reset' for a run
+   *  created before an account reset that waits for a new credential (PRD #3989; resumes
+   *  automatically once one exists), 'budget_exhausted' for a
    *  wall-clock park (PRD #1497), and 'provider_unavailable' for a provider outage bound
    *  reached (PRD #1733; owner Resume, scoped Stop when permitted, or Cancel).
    *  Issue #3181: 'credential_switch_settling' when an owner token switch on a retained-recovery
@@ -4298,6 +4353,12 @@ export interface RunListItem extends Run {
   judge_verdict: JudgeVerdict | null;
   judge_todo_count: number;
 
+  /** PRD #4040: a one-line, sanitized excerpt (at most 280 characters plus " (+N more)")
+   *  of the newest pending question, set only on the viewer's own awaiting_input rows of
+   *  GET /api/runs. Absent otherwise, and never on the admin list. Untrusted model text:
+   *  render as plain text. */
+  pending_question?: string;
+
   repo_path: string;
   worker_name: string | null;
   owner_email?: string;
@@ -4309,7 +4370,7 @@ export interface RunListItem extends Run {
  *  or ordering reads only these keys; the run detail page fetches the full Run. */
 export type RunSummaryItem = Omit<
   RunListItem,
-  "plan_md" | "repo_agents" | "issue_description" | "preserved_patch"
+  "plan_md" | "repo_agents" | "repo_agent_source_commit" | "issue_description" | "preserved_patch"
   | "reset_state_digest" | "milestone_reconciliations" | "milestone_reconciliations_next_before_gate_revision"
   | "semantic_gate" | "completion_pending" | "semantic_drift"
   | "capability_provenance" | "lead_config" | "created_issues"
@@ -5240,6 +5301,7 @@ export interface SteerInput {
 // own agent folder (.claude/agents/ or .codex/agents/), or the user's uzi templates. The lead orchestrator is
 // always uzi's builtin and is never selectable.
 export type AgentSource = "repo" | "own";
+export type AgentSourceRequestedBasis = "explicit" | "repo_default";
 
 // RepoAgent is one agent the worker detected in the cloned repo's .claude/agents/
 // or .codex/agents/

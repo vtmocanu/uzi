@@ -107,9 +107,9 @@ import { FakePrDescApi } from "./fake-pr-desc-api.js";
 import { ResidueQuarantinedError, latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
 import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
 import { scanSignals } from "../src/signals.js";
-import { detectRepoAgents, filterRepoAgentModel } from "../src/repoagents.js";
+import { detectRepoAgents, filterRepoAgentModel, REPO_AGENT_DENIED_TOOLS } from "../src/repoagents.js";
 import { parseCodexAgentFile } from "../src/repoagents-codex.js";
-import { buildReviewCommentsContext, REVIEWED_RESUME_APPROVAL_GUIDANCE, CLAUDE_LONG_COMMAND_APPEND, CODEX_LONG_COMMAND_APPEND, COMPLETION_CONTRACT_GUIDANCE, FOLLOW_UP_TRAILER, PR_SUMMARY_GUIDANCE, REPO_SUBAGENT_UNTRUSTED_APPEND, SUBAGENT_SAFETY_APPEND } from "../src/prompt.js";
+import { buildReviewCommentsContext, REVIEWED_RESUME_APPROVAL_GUIDANCE, CLAUDE_LONG_COMMAND_APPEND, CODEX_LONG_COMMAND_APPEND, COMPLETION_CONTRACT_GUIDANCE, FOLLOW_UP_TRAILER, PR_SUMMARY_GUIDANCE, REPO_SUBAGENT_UNTRUSTED_APPEND, REPO_SUBAGENT_PLANNING_APPEND, SUBAGENT_SAFETY_APPEND } from "../src/prompt.js";
 import { SEEDED_PLAN_RULES } from "../src/seeded-plan.js";
 
 import { ENV_PROBE_SCRIPT, EnvProbeCleanupError } from "../src/env-probe.js";
@@ -137,7 +137,11 @@ import { SupervisedChildExitTimeoutError } from "../src/codex/launcher.js";
 import { CommandDeadlineError } from "../src/codex/broker.js";
 import { CODEX_M3B_LOOPBACK_PROVIDER_NAME } from "../src/codex/config.js";
 import { renderCodexRun } from "../src/codex/render.js";
+import { CodexCatalogReporter, type CodexCatalogReportClient } from "../src/codex/catalog-report.js";
+import type { LeadConfigPostOutcome } from "../src/client.js";
+import type { CodexCatalogDefaultBody } from "../src/protocol.js";
 import { MAX_LEAD_FINAL_MESSAGE_LEN, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING } from "../src/plan-missing.js";
+import { REQUESTED_SOURCE_TABLE, NO_ROSTER_NOTE, caseLabel } from "./requested-agent-source-table.js";
 
 /** Issue #1718: every implement prompt now ends with the roster line; makeCtx has no agents. */
 const NO_SUBAGENTS_BLOCK = "\n\nNo subagents are available; do the work yourself.";
@@ -6479,6 +6483,8 @@ describe("CodexExecutor: #3247 catalog probe and effort_not_in_catalog policy", 
   async function run(opts: {
     effort?: string; model?: string; list: (c: ResponderCtx) => unknown; timeoutMs?: number;
     rejectTurn?: boolean; sessionId?: string; providerModel?: string; rejectResume?: boolean;
+    /** Issue #3251: attach a catalog reporter over this client (RunContext.codexCatalogReport). */
+    reporterClient?: CodexCatalogReportClient; onTurnStart?: () => void;
   }) {
     let emittedRef: { kind: string; payload: Record<string, unknown> }[] = [];
     const log: string[] = [];
@@ -6486,6 +6492,7 @@ describe("CodexExecutor: #3247 catalog probe and effort_not_in_catalog policy", 
       if (c.method === "model/list") { log.push("model/list"); return opts.list(c); }
       if (c.method === "turn/start") {
         log.push(`turn/start:notes=${emittedRef.filter((m) => m.payload.event === NOTE_EVENT).length}`);
+        opts.onTurnStart?.();
         return { turn: { id: "tn-1" } };
       }
       if (c.method === "thread/start") return { thread: { id: "th-1" } };
@@ -6505,6 +6512,11 @@ describe("CodexExecutor: #3247 catalog probe and effort_not_in_catalog policy", 
     const { ctx, emitted } = makeCtx({
       config: { ...(opts.effort !== undefined ? { default_effort: opts.effort as never } : {}), ...(opts.model ? { default_model: opts.model } : {}) },
       ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
+      ...(opts.reporterClient ? {
+        codexCatalogReport: new CodexCatalogReporter({
+          client: opts.reporterClient, runId: "run-1", claimGeneration: 7, catalogContext: CATALOG_CTX, logger: noopLog,
+        }),
+      } : {}),
     });
     emittedRef = emitted as never;
     const executor = makeExecutor({ ...rig, deps: { ...rig.deps, catalogProbeTimeoutMs: opts.timeoutMs ?? 10 } }, bindingOf(SUBSCRIPTION), noopLog, undefined,
@@ -6571,6 +6583,99 @@ describe("CodexExecutor: #3247 catalog probe and effort_not_in_catalog policy", 
     });
   }
 
+  // Issue #3251: the catalog default report.
+  const CATALOG_CTX = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+  class ReportStub implements CodexCatalogReportClient {
+    readonly posts: CodexCatalogDefaultBody[] = [];
+    outcome: LeadConfigPostOutcome | "throw" = { kind: "ok" };
+    async recordCodexCatalogDefault(_runId: string, body: CodexCatalogDefaultBody): Promise<LeadConfigPostOutcome> {
+      this.posts.push(body);
+      if (this.outcome === "throw") throw new Error("boom");
+      return this.outcome;
+    }
+  }
+  const settle = async () => { for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r)); };
+  const withDefault = (model: string, levels: string[], def: string | undefined) =>
+    ({ data: [{ id: model, model, supportedReasoningEfforts: levels.map(opt), ...(def !== undefined ? { defaultReasoningEffort: def } : {}) }] });
+
+  it("Runtime default with a reporter: the first turn/start does not wait for model/list, then one report is posted", async () => {
+    const reporterClient = new ReportStub();
+    let release!: (v: unknown) => void;
+    const reply = new Promise<unknown>((resolve) => { release = resolve; });
+    const { rig, notes, log, error } = await run({
+      reporterClient, timeoutMs: 60_000, list: () => reply,
+      onTurnStart: () => release(withDefault("gpt-6-astra", ["low", "medium"], "medium")),
+    });
+    assert.equal(error, undefined);
+    assert.deepEqual(log, ["model/list", "turn/start:notes=0"], "turn/start was sent while model/list was unanswered");
+    await settle();
+    assert.equal(notes.length, 0, "Runtime default never emits the note");
+    assert.equal(rig.transport.requests.filter((r) => r.method === "model/list").length, 1);
+    assert.equal(rec(rig.transport.requests.find((r) => r.method === "turn/start")!.params).effort, undefined);
+    assert.equal(reporterClient.posts.length, 1);
+    assert.equal(reporterClient.posts[0]!.default_effort, "medium");
+    assert.equal(reporterClient.posts[0]!.catalog_context, CATALOG_CTX);
+    assert.equal(reporterClient.posts[0]!.claim_generation, 7);
+  });
+
+  it("an explicit level absent from the catalog still emits the note and also reports the default", async () => {
+    const reporterClient = new ReportStub();
+    const { notes, log } = await run({
+      effort: "max", model: "example-model", reporterClient,
+      list: () => withDefault("example-model", ["low", "high"], "low"),
+    });
+    await settle();
+    assert.equal(notes.length, 1);
+    assert.deepEqual(log, ["model/list", "turn/start:notes=1"]);
+    assert.equal(reporterClient.posts.length, 1);
+    assert.equal(reporterClient.posts[0]!.default_effort, "low");
+    assert.equal(reporterClient.posts[0]!.model, "example-model");
+  });
+
+  it("an explicit listed level reports the default and emits no note", async () => {
+    const reporterClient = new ReportStub();
+    const { notes } = await run({ effort: "high", reporterClient, list: () => withDefault("gpt-6-astra", ["low", "high"], "high") });
+    await settle();
+    assert.equal(notes.length, 0);
+    assert.equal(reporterClient.posts.length, 1);
+    assert.equal(reporterClient.posts[0]!.default_effort, "high");
+  });
+
+  it("no reporter (no catalog context): a Runtime default claim sends no model/list and posts nothing", async () => {
+    const { rig } = await run({ list: () => { throw new Error("must not be called"); } });
+    assert.equal(rig.transport.requests.filter((r) => r.method === "model/list").length, 0);
+  });
+
+  it("a persistent default posts nothing, for both an explicit and a Runtime default claim", async () => {
+    for (const effort of [undefined, "high"]) {
+      const reporterClient = new ReportStub();
+      const { error } = await run({ effort, reporterClient, list: () => withDefault("gpt-6-astra", ["low", "high"], "persistent") });
+      await settle();
+      assert.equal(error, undefined);
+      assert.deepEqual(reporterClient.posts, []);
+    }
+  });
+
+  for (const [name, outcome] of [
+    ["404", { kind: "http", status: 404 }],
+    ["409", { kind: "http", status: 409 }],
+    ["a transport error", { kind: "transport", error: new Error("econnreset") }],
+    ["a throwing client", "throw"],
+  ] as const) {
+    it(`report outcome ${name} does not affect the run`, async () => {
+      for (const effort of [undefined, "high"]) {
+        const reporterClient = new ReportStub();
+        reporterClient.outcome = outcome;
+        const { rig, error } = await run({ effort, reporterClient, list: () => withDefault("gpt-6-astra", ["low", "high"], "low") });
+        await settle();
+        assert.equal(error, undefined);
+        assert.equal(reporterClient.posts.length, 1);
+        assert.equal(rig.transport.requests.filter((r) => r.method === "turn/start").length, 1);
+        assert.equal(rig.transport.requests.filter((r) => r.method === "model/list").length, 1);
+      }
+    });
+  }
+
   it("a recreated later epoch in the same run sends no second model/list", async () => {
     const rig = makeMultiEpochRig([
       epochResponder("th-1", "tn-1", (t, th, tn) => {
@@ -6587,6 +6692,41 @@ describe("CodexExecutor: #3247 catalog probe and effort_not_in_catalog policy", 
     const listed = rig.epochs.map((e) => e.transport.requests.filter((r) => r.method === "model/list").length);
     assert.deepEqual(listed, [1, 0]);
     assert.ok(rig.epochs[1]!.transport.requests.some((r) => r.method === "turn/start"));
+  });
+
+  it("a Runtime default with a reporter: a recreated later epoch sends no second model/list", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "checkpoint", {}, th, tn, "checkpoint")).push(turnCompleted("completed", th, tn));
+      }),
+      resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
+        t.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    rig.deps = { ...rig.deps, catalogProbeTimeoutMs: 10 };
+    const reporterClient = new ReportStub();
+    const { ctx } = makeCtx({
+      config: {}, checkpoint: async () => undefined,
+      codexCatalogReport: new CodexCatalogReporter({
+        client: reporterClient, runId: "run-1", claimGeneration: 7, catalogContext: CATALOG_CTX, logger: noopLog,
+      }),
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "two-epoch run");
+    assert.equal(rig.providerLaunches(), 2, "a second epoch was really built");
+    const listed = rig.epochs.map((e) => e.transport.requests.filter((r) => r.method === "model/list").length);
+    assert.deepEqual(listed, [1, 0]);
+    assert.ok(rig.epochs[1]!.transport.requests.some((r) => r.method === "turn/start"));
+  });
+
+  it("a Runtime default with a reporter: a resume rejection fallback probes at most once", async () => {
+    const reporterClient = new ReportStub();
+    const { rig, error } = await run({
+      reporterClient, list: () => withDefault("gpt-6-astra", ["high"], "high"), sessionId: "claimed-thread", rejectResume: true,
+    });
+    assert.equal(error, undefined);
+    assert.ok(rig.transport.requests.some((r) => r.method === "thread/resume"));
+    assert.equal(rig.transport.requests.filter((r) => r.method === "model/list").length, 1);
+    assert.equal(rig.transport.requests.filter((r) => r.method === "turn/start").length, 1);
   });
 
   it("a resume rejection fallback probes at most once and sends one root turn/start", async () => {
@@ -8462,6 +8602,55 @@ describe("CodexExecutor: per-turn phase-correct broker (plan write ban)", () => 
     assert.match(childReply.text ?? "", /not permitted during the plan phase/, "the child deny is write_denied_in_plan");
     assert.deepEqual(childFileop.ops, [], "no child fileop op ran during the plan phase");
     assert.equal(rig.transport.turnStartCount, 2, "the child turn ran on the same transport (demuxed)");
+  });
+
+  it("(P3) PRD #3914 M3: a repo agent spawned during a repo-sourced PLAN turn cannot write", async () => {
+    const agents: AgentTemplate[] = [
+      { name: "lead", description: "the lead", prompt_body: "lead body", tools: null, skills: [] },
+      { name: "coder", description: "a coder", prompt_body: "coder body", tools: null, skills: [] },
+    ];
+    const repoWriter: AgentTemplate = { name: "repo-writer", description: "a repo writer", prompt_body: "REPO WRITER BODY", tools: null, skills: [] };
+    const CHILD_WRITE_ID = 89;
+    const OWN_SPAWN_ID = 2;
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
+        c.transport
+          .push(toolCall(CHILD_WRITE_ID, "Write", { file_path: "REPO.md", content: "repo agent must not write in plan" }, "th-child", "tn-child", "cc-repo-write"))
+          .push(turnCompleted("completed", "th-child", "tn-child"));
+        return { turn: { id: "tn-child" } };
+      }
+      if (c.method === "turn/interrupt") return {};
+      return {};
+    };
+    const rig = makeRig({ responder });
+    const childFileop = recordingFileop();
+    rig.deps = { ...rig.deps, wireFileop: () => childFileop.handle };
+    rig.transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { role: "repo-writer", prompt: "check the plan" }, "th-1", "tn-1", "c-root"));
+
+    const reported: string[] = [];
+    const { ctx } = makeCtx({
+      planApproved: false, approvedPlan: undefined, gatePlan, agents, repoAgents: [repoWriter], requestedAgentSource: "repo",
+      reportPlanAgentSource: async (source) => { reported.push(source); },
+    });
+    const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+
+    await waitFor(() => rig.transport.responses.some((r) => r.requestId === 1), "parent spawn_agent reply", 5000);
+    assert.equal(replyForId(rig, 1).success, true, "the repo agent is a planning delegate");
+    rig.transport.push(toolCall(OWN_SPAWN_ID, "spawn_agent", { role: "coder", prompt: "help" }, "th-1", "tn-1", "c-own"));
+    await waitFor(() => rig.transport.responses.some((r) => r.requestId === OWN_SPAWN_ID), "own spawn_agent reply", 5000);
+    assert.equal(replyForId(rig, OWN_SPAWN_ID).success, false, "an owner template is not on a repo-sourced plan roster");
+    rig.transport.push(turnCompleted("completed", "th-1", "tn-1")).end();
+    await assert.rejects(withTimeout(runP, 5000, "repo plan-turn subagent write"), /produced no plan/);
+
+    const childReply = replyForId(rig, CHILD_WRITE_ID);
+    assert.equal(childReply.success, false, "the repo agent's plan-turn Write was DENIED");
+    assert.match(childReply.text ?? "", /not permitted during the plan phase/, "the deny is write_denied_in_plan");
+    assert.deepEqual(childFileop.ops, [], "no fileop op ran during the plan phase");
+    const childStart = rig.transport.requests.filter((r) => r.method === "thread/start")[1];
+    assert.ok(String(rec(childStart?.params).developerInstructions).includes("REPO WRITER BODY"), "the child ran the repo agent's body");
+    assert.deepEqual(reported, ["repo"]);
   });
 });
 
@@ -19297,6 +19486,60 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
     assert.ok(rootInstructions(rig.epochs[1]!.transport).includes("OWN LEAD BODY"), "the lead stays uzi's builtin");
   });
 
+  const planReported = () => {
+    const reported: string[] = [];
+    return { reported, reportPlanAgentSource: async (source: string) => { reported.push(source); } };
+  };
+
+  it("PRD #3914 M3: a requested repo source with a roster plans with the repo agents and the untrusted framing", async () => {
+    const r = planReported();
+    const { rig } = await gated({ status: "absent" }, { repoAgents: [repoReviewer, repoTester], requestedAgentSource: "repo",
+      reportPlanAgentSource: r.reportPlanAgentSource }, []);
+    const [planText] = turnInputs(rig.epochs[0]!.transport);
+    assert.ok(planText!.includes(PASSAGE), "the plan turn carries the untrusted-review passage");
+    assert.ok(planText!.includes(REPO_SUBAGENT_PLANNING_APPEND));
+    assert.equal(REPO_SUBAGENT_PLANNING_APPEND, "Planning subagents report findings; they do not change files.");
+    assert.ok(planText!.includes("Available subagents to delegate to: repo-reviewer (can edit files), repo-tester (can edit files)."));
+    assert.ok(planText!.includes("All planning dispatches are read-only"));
+    assert.ok(!planText!.includes("coder (can edit files)"), "the owner templates are not on the plan roster");
+    const instructions = rootInstructions(rig.epochs[0]!.transport);
+    assert.ok(instructions.includes(PASSAGE), "the plan thread's instructions carry the passage");
+    assert.ok(instructions.includes(REPO_SUBAGENT_PLANNING_APPEND));
+    assert.ok(instructions.includes("OWN LEAD BODY"), "the lead stays the owner's");
+    assert.deepEqual(r.reported, ["repo"]);
+  });
+
+  for (const [name, extra] of [
+    ["an unset request", { repoAgents: [repoReviewer] }],
+    ["a requested own source", { repoAgents: [repoReviewer], requestedAgentSource: "own" }],
+    ["a requested repo source with no roster", { requestedAgentSource: "repo" }],
+    ["a persisted own source on a replan", { repoAgents: [repoReviewer], requestedAgentSource: "repo", approvedSelection: { source: "own", exclusions: [] } }],
+    ["an unset request with a persisted repo source from autopilot", { repoAgents: [repoReviewer], approvedSelection: { source: "repo", exclusions: [] } }],
+  ] as [string, Partial<RunContext>][]) {
+    it(`PRD #3914 M3: ${name} plans with the owner templates and no framing`, async () => {
+      const r = planReported();
+      const { rig } = await gated({ status: "absent" }, { ...extra, reportPlanAgentSource: r.reportPlanAgentSource }, []);
+      const [planText] = turnInputs(rig.epochs[0]!.transport);
+      assert.ok(planText!.includes("Available subagents to delegate to: coder (can edit files), tester (can edit files)."));
+      assert.ok(!planText!.includes(PASSAGE));
+      assert.ok(!planText!.includes(REPO_SUBAGENT_PLANNING_APPEND));
+      assert.ok(!rootInstructions(rig.epochs[0]!.transport).includes(PASSAGE));
+      assert.deepEqual(r.reported, ["own"]);
+    });
+  }
+
+  it("PRD #3914 M3: a repo-sourced plan request maps repo agents with the repo denylist and the run's skills", () => {
+    const { ctx } = makeCtx({ agents: ownAgents, repoAgents: [repoReviewer], requestedAgentSource: "repo",
+      skills: [{ name: "lint", description: "d", body: "b" }] });
+    const request = makeExecutor(makeRig(), bindingOf(SUBSCRIPTION))["buildRunRequest"](ctx, "plan", "p", undefined, new AbortController().signal, undefined);
+    assert.deepEqual(Object.keys(request.agents), ["repo-reviewer"]);
+    assert.deepEqual(request.agents["repo-reviewer"]!.deniedTools, [...REPO_AGENT_DENIED_TOOLS]);
+    assert.deepEqual(request.agents["repo-reviewer"]!.skills, ["lint"]);
+    assert.equal(request.phase, "plan");
+    const rendered = renderCodexRun(request);
+    assert.equal(rendered.perRoleGrants.get("repo-reviewer")!.phase, "plan", "the repo planning agent runs under plan-phase grants");
+  });
+
   it("own source: names on the base turn, no passage", async () => {
     const { rig } = await gated(okSel("own"), { repoAgents: [repoReviewer] }, []);
     const [implText] = turnInputs(rig.epochs[1]!.transport);
@@ -19308,6 +19551,56 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
 
   it("absent selection at the gate resolves to the repo roster when one was detected", async () => {
     const { admitted, result } = await gated({ status: "absent" }, { repoAgents: [repoReviewer] }, ["repo-reviewer", "coder"]);
+    assert.deepEqual(admitted, { "repo-reviewer": true, coder: false });
+    assert.equal(result.agentSelection?.source, "repo");
+  });
+
+  it("PRD #3914: an absent approval at the gate follows the requested own source over a detected roster", async () => {
+    const { admitted, result } = await gated({ status: "absent" }, { repoAgents: [repoReviewer], requestedAgentSource: "own" }, ["coder", "repo-reviewer"]);
+    assert.deepEqual(admitted, { coder: true, "repo-reviewer": false });
+    assert.equal(result.agentSelection?.source, "own");
+  });
+
+  it("PRD #3914: an absent approval on a requested repo run keeps a saved own selection", async () => {
+    const own = await gated({ status: "absent" }, { repoAgents: [repoReviewer], requestedAgentSource: "repo",
+      approvedSelection: { source: "own", exclusions: [] } }, ["coder", "repo-reviewer"]);
+    assert.deepEqual(own.admitted, { coder: true, "repo-reviewer": false });
+    assert.equal(own.result.agentSelection?.source, "own");
+  });
+
+  it("PRD #3914: an absent approval on a requested repo run keeps a saved repo selection's exclusions", async () => {
+    const repo = await gated({ status: "absent" }, { repoAgents: [repoReviewer, repoTester], requestedAgentSource: "repo",
+      approvedSelection: { source: "repo", exclusions: ["repo-tester"] } }, ["repo-reviewer", "repo-tester"]);
+    assert.deepEqual(repo.admitted, { "repo-reviewer": true, "repo-tester": false });
+    assert.equal(repo.result.agentSelection?.source, "repo");
+  });
+
+  it("PRD #3914: a pre-approved run with no selection follows the requested source", async () => {
+    const own = await preApproved({ repoAgents: [repoReviewer], requestedAgentSource: "own" }, ["coder", "repo-reviewer"]);
+    assert.deepEqual(own.admitted, { coder: true, "repo-reviewer": false });
+    assert.deepEqual(own.result.agentSelection, { source: "own", agents: ["coder", "tester"] });
+    const repo = await preApproved({ repoAgents: [repoReviewer], requestedAgentSource: "repo" }, ["repo-reviewer", "coder"]);
+    assert.deepEqual(repo.admitted, { "repo-reviewer": true, coder: false });
+    assert.deepEqual(repo.result.agentSelection, { source: "repo", agents: ["repo-reviewer"] });
+  });
+
+  for (const c of REQUESTED_SOURCE_TABLE) {
+    it(`PRD #3914 shared call-site table, pre-approved: ${caseLabel(c)}`, async () => {
+      const { result, emitted } = await preApproved({ repoAgents: c.roster ? [repoReviewer] : [], requestedAgentSource: c.requested }, []);
+      assert.equal(result.agentSelection?.source, c.want);
+      assert.equal(statuses(emitted).includes(NO_ROSTER_NOTE), c.note);
+    });
+  }
+
+  it("PRD #3914: a requested repo source with no roster degrades to own with the no-roster note", async () => {
+    const { admitted, result, emitted } = await preApproved({ requestedAgentSource: "repo" }, ["coder"]);
+    assert.deepEqual(admitted, { coder: true });
+    assert.equal(result.agentSelection?.source, "own");
+    assert.ok(statuses(emitted).includes("this clone has no repo agent roster; using your own agent templates"));
+  });
+
+  it("PRD #3914: an explicit gate selection wins over the requested source", async () => {
+    const { admitted, result } = await gated(okSel("repo"), { repoAgents: [repoReviewer], requestedAgentSource: "own" }, ["repo-reviewer", "coder"]);
     assert.deepEqual(admitted, { "repo-reviewer": true, coder: false });
     assert.equal(result.agentSelection?.source, "repo");
   });

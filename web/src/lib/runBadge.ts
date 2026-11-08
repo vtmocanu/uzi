@@ -172,10 +172,12 @@ const PARK_LABELS = {
   worker_memory_pressure: "memory pressure: owner hold",
   paused: "paused",
   credential_disabled: "waiting: credential disabled",
+  credentials_reset: "waiting: credentials were reset",
   iteration_budget_exhausted: "Iteration limit reached",
   provider_unavailable: "provider unavailable: owner hold",
   codex_policy_hold: "Codex policy hold",
   base_attestation_missing: "base unverified: owner hold",
+  repo_agent_source_unavailable: "repo agents unreadable: owner hold",
   provider_outage: "waiting for provider",
   completion_blocked: "Completion blocked",
   credential_switch_settling: "settling: token switch",
@@ -226,6 +228,7 @@ export function effectiveRunStatus(
   // Issue #3194: a --require-base run whose adopted work no checkpoint attests to the planned
   // base. Server-held (raw status "paused"), so overlaid like the other holds.
   if (run.status === "paused" && run.hold_reason === "base_attestation_missing") return "base_attestation_missing";
+  if (run.status === "paused" && run.hold_reason === "repo_agent_source_unavailable") return "repo_agent_source_unavailable";
   if (run.status === "recovery_wait" && run.recovery_wait_cause === "provider_outage") return "provider_outage";
   if (isPlanningRun(run)) return "planning";
   if (isRevisingRun(run)) return "revising";
@@ -252,6 +255,8 @@ export function effectiveRunStatus(
   // and the board card's LatestRun (the server's board projection sends hold_reason on every
   // card, so runBadge meets this key too).
   if (run.status === "paused" && run.hold_reason === "credential_disabled") return "credential_disabled";
+  // PRD #3989 M3: parked because an admin reset the owner's account deleted every credential.
+  if (run.status === "paused" && run.hold_reason === "credentials_reset") return "credentials_reset";
   // Integrity refusal is always owner-held, even if a malformed DTO carries a retry stamp.
   if (run.status === "recovery_wait" && run.recovery_wait_cause === "retained_recovery_adoption_failed") return "retained_recovery_adoption_failed";
   // Owner-only, no timer: the claimed flight was never witnessed, so the server released the
@@ -395,7 +400,7 @@ export function runStatusTone(
   if (status === "completion_blocked") return "warning";
   // PRD #1732: held on a disabled credential. Warn like the other involuntary holds.
   if (status === "iteration_budget_exhausted") return "warning";
-  if (status === "credential_disabled" || status === "provider_unavailable" || status === "codex_policy_hold" || status === "base_attestation_missing" || status === "provider_outage") return "warning";
+  if (status === "credential_disabled" || status === "credentials_reset" || status === "provider_unavailable" || status === "codex_policy_hold" || status === "base_attestation_missing" || status === "repo_agent_source_unavailable" || status === "provider_outage") return "warning";
   // Issue #3181: both token-switch holds wait on something outside the run; warn, never danger.
   if (status === "credential_switch_settling" || status === "credential_switch_unsettled") return "warning";
   if (status === "awaiting_approval" || status === "awaiting_input")
@@ -814,6 +819,9 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
     case "base_attestation_missing":
       return { kind: "badge", label: PARK_LABELS.base_attestation_missing, tone: "warning", pulse: false,
         title: "The retained work is not attested to the planned base commit, so the agent was not started. Open the run to recover the work or start a successor." };
+    case "repo_agent_source_unavailable":
+      return { kind: "badge", label: PARK_LABELS.repo_agent_source_unavailable, tone: "warning", pulse: false,
+        title: "The repo agents could not be read at the run's recorded default-branch revision, so the agent was not started. Open the run to Resume once the repository can be fetched, or Cancel." };
     case "provider_outage":
       return { kind: "badge", label: PARK_LABELS.provider_outage, tone: "warning", pulse: false,
         title: "Provider outage. Open the run for park count, streak start and next retry." };
@@ -824,6 +832,14 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
         tone: "warning",
         pulse: false,
         title: "A credential this run needs is disabled. It resumes by itself when you enable it.",
+      };
+    case "credentials_reset":
+      return {
+        kind: "badge",
+        label: PARK_LABELS.credentials_reset,
+        tone: "warning",
+        pulse: false,
+        title: "An admin reset this account and its credentials were deleted. The run resumes by itself once you add a credential in Settings.",
       };
     case "running":
       // The running elapsed moved OUT of the badge to the uniform per-card duration
@@ -898,7 +914,7 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
     case "retained_recovery_adoption_failed":
       return {
         kind: "badge", label: PARK_LABELS.retained_recovery_adoption_failed, tone: "warning", pulse: false,
-        title: "Integrity checks refused to adopt the retained work. Local work and its custody are preserved. Only the run owner can Resume or Cancel; there is no scheduled retry.",
+        title: "Integrity hold: retained adoption or a predecessor remediation record refused source use, so the agent did not start. Local work and its custody are preserved. Only the run owner can Resume or Cancel; there is no scheduled retry.",
       };
     case "retained_continuation_unwitnessed":
       return {
@@ -1227,6 +1243,7 @@ export function needsHumanAttention(status: string): boolean {
     status === "codex_policy_hold" ||
     status === "credential_switch_settling" ||
     status === "credential_switch_unsettled" ||
-    status === "base_attestation_missing"
+    status === "base_attestation_missing" ||
+    status === "repo_agent_source_unavailable"
   );
 }

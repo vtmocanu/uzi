@@ -182,6 +182,11 @@ export type RunState =
   /** issue #3181: the worker's acknowledgement that the held flight's owned operations have
    *  joined (hold_reason credential_switch_unsettled). Same fences as the hold report. */
   | "credential_switch_hold_settled"
+  /** Issue #3985: a plan cross-check run whose lead asked a clarification after a HUMAN
+   *  revise_plan verdict has the owner's answer; the run returns to awaiting_approval with the
+   *  revise still pending (an answer is never plan approval). Carries `clarification_settlement`
+   *  and `claim_generation`; requires the `clarification_revision_settlement_v1` feature. */
+  | "clarification_settled"
   | "completed"
   | "failed";
 
@@ -1098,6 +1103,16 @@ export interface LeadConfigReportBody {
   observed_effort_evidence: string | null;
 }
 
+/** Issue #3251: the body of POST /api/worker/runs/{id}/codex-catalog-default. The server schema is
+ *  closed (unknown fields are a 400). */
+export interface CodexCatalogDefaultBody {
+  claim_generation: number;
+  catalog_context: string;
+  model: string;
+  runtime_version: string;
+  default_effort: string;
+}
+
 /** Per-run caps the server may push down (PRD §Configuration). Advisory in M2.
  *  Field names + units match M1's claim.go: timeouts are in *seconds*; any
  *  future ms consumer converts at the use site. */
@@ -1157,6 +1172,9 @@ export interface ClaimConfig {
   /** PRD #3244: where `default_effort` (or its absence) came from. Always present on a lead-lane
    *  claim of an upgraded API, which makes it the worker's lead-config reporting activation signal. */
   default_effort_source?: LeadEffortSource;
+  /** Issue #3251: the opaque catalog context (64 lowercase hex) of a Codex lead-lane claim with a
+   *  complete credential binding; echoed verbatim when reporting the catalog default effort. */
+  codex_catalog_context?: string;
   /** The run owner's AI-attribution opt-out (issue #916), read live per claim. When
    *  false, the worker suppresses the Agent SDK's Co-Authored-By: Claude commit trailer
    *  for this run. Always sent by an upgraded server (NOT null); absent on an older
@@ -1909,6 +1927,7 @@ export interface ClaimResponse extends ClaimMemoryState {
    *  (PRD #209 M4 Open Question 3, `--require-base`). Meaningful only alongside
    *  planned_base_commit. Absent on an older server ⇒ false, i.e. warn-and-implement. */
   require_base_match?: boolean;
+  repo_agent_source_commit?: string | null;
   /** The run's PERSISTED subagent selection (`runs.agent_source` /
    *  `agent_exclusions`), replayed on every claim (PRD #35).
    *
@@ -1926,6 +1945,7 @@ export interface ClaimResponse extends ClaimMemoryState {
    *  missing key as "absent", never as "source own with no exclusions". Also absent
    *  from an older server, which is the same case and wants the same handling. */
   agent_selection?: AgentSelection;
+  requested_agent_source?: AgentSource | null;
   /** This run's usage-limit opt-in (PRD #35 Decision 7), read from the runs row on
    *  EVERY claim so a resumed or re-queued run keeps it — the same convention as
    *  `auto_approve` above, and for the same reason: an unattended resume must not
@@ -2320,6 +2340,12 @@ export interface CompletionPermitResponse {
 /** issue #3194: the `hold_reason` of the `--require-base` base-attestation hold (POST
  *  /api/worker/runs/:id/base-attestation-hold). Mirrors workersvc.HoldReasonBaseAttestationMissing. */
 export const BASE_ATTESTATION_HOLD_REASON = "base_attestation_missing";
+
+export const REPO_AGENT_SOURCE_HOLD_REASON = "repo_agent_source_unavailable";
+
+export const REPO_AGENT_SOURCE_FEATURE = "repo_agent_source_v1";
+
+export const PLAN_AGENT_SOURCE_FEATURE = "plan_agent_source_v1";
 
 /** issue #3194: what a base-attestation hold request established. `held` is the server's positive
  *  ACK for this flight's generation; `stale` is a fence refusal (the claim moved on); `unknown`
@@ -2729,25 +2755,38 @@ export function parseAgentSelection(
 export function resolveAgentSelection(
   parse: AgentSelectionParse,
   repoAvailable: boolean,
+  requested?: AgentSource | null,
 ): { selection: AgentSelection; note?: string } {
   switch (parse.status) {
     case "ok":
-      if (parse.selection.source === "repo" && !repoAvailable)
-        return {
-          selection: { source: "own", exclusions: [] },
-          note: "this clone has no repo agent roster; using your own agent templates",
-        };
-      return { selection: parse.selection };
+      return degradeRepoWithoutRoster(parse.selection, repoAvailable);
     case "invalid":
       return {
         selection: { source: "own", exclusions: [] },
         note: "the submitted agent selection was malformed; using your own agent templates",
       };
     case "absent":
-      return {
-        selection: { source: repoAvailable ? "repo" : "own", exclusions: [] },
-      };
+      return degradeRepoWithoutRoster(
+        { source: requestedAgentSource(requested) ?? (repoAvailable ? "repo" : "own"), exclusions: [] },
+        repoAvailable,
+      );
   }
+}
+
+function degradeRepoWithoutRoster(
+  selection: AgentSelection,
+  repoAvailable: boolean,
+): { selection: AgentSelection; note?: string } {
+  if (selection.source === "repo" && !repoAvailable)
+    return {
+      selection: { source: "own", exclusions: [] },
+      note: "this clone has no repo agent roster; using your own agent templates",
+    };
+  return { selection };
+}
+
+function requestedAgentSource(raw: unknown): AgentSource | undefined {
+  return raw === "repo" || raw === "own" ? raw : undefined;
 }
 
 /**
@@ -2762,6 +2801,23 @@ export function resolveAgentSelection(
  */
 export function seedAgentSelection(persisted?: AgentSelection | null): AgentSelectionParse {
   return persisted ? { status: "ok", selection: persisted } : { status: "absent" };
+}
+
+export function planAgentSource(
+  persisted: AgentSource | null | undefined,
+  requested: AgentSource | null | undefined,
+  repoAvailable: boolean,
+): AgentSource {
+  const narrowed = persisted !== undefined && persisted !== null && persisted !== "repo";
+  return requestedAgentSource(requested) === "repo" && repoAvailable && !narrowed ? "repo" : "own";
+}
+
+export function gateVerdictSelection(
+  verdict: AgentSelectionParse,
+  persisted: AgentSelection | null | undefined,
+  requested: AgentSource | null | undefined,
+): AgentSelectionParse {
+  return verdict.status === "absent" && requested && persisted ? seedAgentSelection(persisted) : verdict;
 }
 
 /** Body of POST /runs/:id/state. Fields are set per target status.
@@ -2830,7 +2886,16 @@ export interface RunRegistrationEvidence {
   registration_epoch: number;
 }
 
+/** Issue #3985: the identities a `clarification_settled` report binds. */
+export interface ClarificationSettlement {
+  question_id: string;
+  revision_input_id: number;
+  gate_revision: number;
+}
+
 export interface StateRequest {
+  /** Issue #3985: present only on a `clarification_settled` report. */
+  clarification_settlement?: ClarificationSettlement;
   /** Issue #3859: set by the client alone, never by a caller. */
   registration_evidence?: RunRegistrationEvidence;
   /** Memory-pressure park fence, bound to the current registration. */
@@ -2968,11 +3033,13 @@ export interface StateRequest {
    *  means "detected nothing" (the gate's repo card goes inert), while an absent
    *  field/NULL column means "pre-feature run". */
   repo_agents?: RepoAgentSummary[];
+  repo_agent_source_commit?: string;
   /** The selection an AUTOPILOT run resolved for itself (PRD #37 Decision 6):
    *  repo agents when detected, else the owner's templates, with no exclusions.
    *  Human-gated runs persist their selection through the `approve_plan` input
    *  instead, so this is absent there. */
   agent_selection?: AgentSelection;
+  plan_agent_source?: AgentSource;
   /** The plan's milestone breakdown (PRD #122 M1, Decision 2). Additive + optional
    *  and OMITTED ENTIRELY when absent — never `null` or `[]` — so an old worker's
    *  payload and a new worker's "no milestones" payload stay the same shape on the
@@ -3147,6 +3214,12 @@ export interface StateRequest {
    *  Resume with a NULL retry time and unchanged count. The api 400s it with any other cause, and only accepts it once it
    *  advertises `recovery_cause_data_volume_full`. The disk-full handling (M5) never sends it. */
   disk_park_preventive?: boolean;
+  /** Issue #4046: qualifies a `recovery_cause: "retained_recovery_exhausted"` park. `true` says every
+   *  recovery reservation this flight positively witnessed in the window ended in a data volume capacity
+   *  refusal, so the api holds the run for the owner (uncounted, NULL retry time) instead of retrying on
+   *  a timer. Sent only when the api advertised `retained_recovery_capacity_hold_v1` at register; absent
+   *  is today's counted park. */
+  retained_capacity_only?: boolean;
   /** PRD #1809 D8: on a process-ending park report that published a checkpoint (the usage-limit
    *  park, the owner pause park, a recovery park including the mid-run `data_volume_full` one),
    *  whether that published checkpoint contains the run's latest committed work. `false` when the
@@ -3284,6 +3357,7 @@ export interface StateAck {
    *  a plain stop. null/absent (older server, an unparseable body, a run with no hold) leaves it
    *  undefined, treated as "no hold" — the safe default. */
   holdReason?: string | null;
+  repoAgentSourceCommit?: string;
   /** The server-computed effective per-run budget (PRD #122 M2, Decisions 5/5b), read
    *  off the SAME `{run: RunDTO}` body as `status`. `budgetMaxIterations` is the scaled
    *  total implement/review turn ceiling; `budgetWallSeconds` is the effective wall clock
@@ -3371,6 +3445,8 @@ export interface StateAck {
   credentialSwitchHeld?: boolean;
   /** issue #3181: true when the 200 ack carried `disposition: "hold_settled"`. */
   credentialSwitchHoldSettled?: boolean;
+  /** Issue #3985: true when the 200 ack carried `disposition: "clarification_settled"`. */
+  clarificationSettled?: boolean;
   /** PRD #1795 M1 (decision 5): the TOP-LEVEL `gate_revision` of an `awaiting_approval` ACK — the
    *  revision the report was answered with, allocated or returned inside the report's transaction.
    *  The gate confirms THIS revision for bound-verdict matching. A positive integer only; absent

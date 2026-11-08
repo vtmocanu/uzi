@@ -550,12 +550,15 @@ export const RUN_STATUS_TONES: Record<
    *  other involuntary holds, NOT the owner-pause info tone, and not pulsing: it does no
    *  work until the credential is enabled. Label below. */
   credential_disabled: { tone: "warning" },
+  /** PRD #3989 M3: parked after an account reset deleted every credential; warns like credential_disabled. */
+  credentials_reset: { tone: "warning" },
   // Provider holds are parked: owner attention and outage retry share a static warning.
   iteration_budget_exhausted: { tone: "warning" },
   provider_unavailable: { tone: "warning" },
   codex_policy_hold: { tone: "warning" },
   // Issue #3194: a --require-base run held because its adopted work is not attested to the planned base.
   base_attestation_missing: { tone: "warning" },
+  repo_agent_source_unavailable: { tone: "warning" },
   provider_outage: { tone: "warning" },
   // Issue #3181: token-switch holds (raw "paused", overlaid from hold_reason). Static warning:
   // the owner's decision is pending (unsettled) or waits on the worker finishing (settling).
@@ -621,11 +624,13 @@ const RUN_STATUS_LABELS: Record<string, string> = {
   completion_blocked: "Completion blocked",
   // PRD #1732: kept in step with runBadge's matching label.
   credential_disabled: "waiting: credential disabled",
+  credentials_reset: "waiting: credentials were reset",
   // Kept in step with runBadge's parked wording by the label-agreement test.
   iteration_budget_exhausted: "Iteration limit reached",
   provider_unavailable: "provider unavailable: owner hold",
   codex_policy_hold: "Codex policy hold",
   base_attestation_missing: "base unverified: owner hold",
+  repo_agent_source_unavailable: "repo agents unreadable: owner hold",
   provider_outage: "waiting for provider",
   // Issue #3181: kept in step with runBadge's parked wording by the label-agreement test.
   credential_switch_settling: "settling: token switch",

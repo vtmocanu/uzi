@@ -338,10 +338,24 @@ A few worth knowing:
   [Seeding a plan](./seeded-plans.md) for the full walkthrough, including the
   constraint that matters most: the plan must stand on its own, since a
   seeded run starts with no session and no memory of how it was written.
-  `--agent-source`/`--exclude-agents` (below) and `--planned-commit`/
-  `--require-base` (the base-commit staleness guard) are all optional and all
-  require `--plan-file`; an empty or oversized plan is rejected at create
-  time. A run created with no `--plan-file` is unchanged.
+  `--exclude-agents` (below) and `--planned-commit`/`--require-base` (the
+  base-commit staleness guard) are all optional and all require
+  `--plan-file`; `--agent-source` sets the seeded run's roster here and also
+  works without a plan file (below). An empty or oversized plan is rejected at
+  create time. A run created with no `--plan-file` is unchanged.
+- **`run create --agent-source own|repo` chooses this run's agents.** Without
+  `--plan-file` the choice is frozen onto the run as its agent-source request,
+  overriding your [per-repo default](repo-agents.md#set-a-default-for-your-runs-on-a-repo)
+  for this run only; `run get` shows it as `AGENTS_REQUESTED ... (this run)`.
+  It applies to implementation the same way a default does: an approval with
+  no agent choice and an autopilot run implement with it, and an explicit choice
+  at the plan gate still wins. A choice of `repo` also applies to planning; see
+  [Planning with repo agents](repo-agents.md#planning-with-repo-agents).
+  `--exclude-agents` without `--plan-file` is a usage error
+  (exit 2); exclude agents at the plan gate instead. Over the API, the same
+  choice is `"agent_selection": {"source": "own"|"repo"}` on
+  `POST /api/repos/{id}/runs` without `plan_md`; non-empty `exclusions`
+  without `plan_md` returns 400 `exclusions require a plan file or an approval`.
 - **`run create --force` re-runs an issue that already has an open MR.** By
   default, creating a run for an issue whose last completed run still owns an
   open MR is refused (a 409, exit 5) — re-running would spend budget building
@@ -364,15 +378,31 @@ A few worth knowing:
   [proposal output](./scheduling.md#proposal-output-mr-or-issues) for record scope
   and ordering; run lists and summaries do not carry this field.
 - **`run approve` picks the subagent roster explicitly.** By default a run
-  uses its own default roster; `--agent-source own|repo` overrides it
+  uses its own default roster: the run's frozen
+  [per-repo default](repo-agents.md#set-a-default-for-your-runs-on-a-repo) when
+  one was set, else the repo roster when one is detected and your templates
+  otherwise. `--agent-source own|repo` overrides it
   (`own` = your template roster, `repo` = the agents the worker detected in
   the clone's `.claude/agents/` or `.codex/agents/`), and `--exclude-agents a,b`
   drops individual subagents from that source. `--exclude-agents` requires
   `--agent-source`. Detection reads one folder, never merges rosters, and prefers
   the run harness's native folder; a present preferred folder is final even if
   empty or invalid. See [Repo agents](repo-agents.md#which-folder-is-read).
-  `run create --plan-file` takes the same two flags, for the seeded run's
-  roster.
+  `run create` takes the same two flags (see `run create --agent-source`
+  above).
+- **`run get` shows the requested, planning and implemented agents.** A run that
+  carries a frozen agent-source request shows `AGENTS_REQUESTED` (for example
+  `repo agents (repo default)`, or `(this run)` for a source chosen at create or
+  a seeded plan's source) and `PLANNED_WITH`, the agents its plan turn used (with
+  the request's basis when they match it, or `—` when no plan turn was recorded,
+  as on a seeded run). Once a selection is recorded `IMPLEMENTED_WITH` shows the
+  roster used, with `(as requested)` or `(changed at approval)` when a request
+  exists. `--json` carries `agent_source_requested`, `agent_source_requested_basis` and
+  `plan_agent_source`.
+- **`repo list` shows each repo's default agents.** The `DEFAULT_AGENTS` column
+  reads `own`, `repo` or `unset`; `--json` carries `agent_source_default`
+  (`"own"`, `"repo"` or `null`). The setting is changed on the Repos page; the
+  CLI only reads it.
 - **`run approve <id> --override-capabilities`** clears this run's required
   capabilities and approves even when its assigned worker cannot satisfy them.
   Use it only when the plan can proceed without those capabilities. It does not
@@ -3125,9 +3155,28 @@ for example:
 effort  claude  runtime default  medium  runtime default (value not reported)  your choice
 ```
 
+When the preference is Runtime default, the Codex row's `RESOLVED` shows the
+catalog default last reported for your credential by issue and other lead Codex
+runs ([details](./worker-effort.md#what-the-codex-catalog-default-means)):
+
+| `RESOLVED` | Meaning |
+| --- | --- |
+| `runtime default (catalog default: low, gpt-6.1-sol, Codex 0.164.0)` | Known. |
+| `runtime default (catalog default: none, no reasoning level requested, gpt-6.1-sol, Codex 0.164.0)` | Known; the level is `none`. |
+| `runtime default (catalog default: ultra, Codex substitutes another level, gpt-6.1-sol, Codex 0.164.0)` | Known; the level is `ultra`. |
+| `runtime default (catalog default: medium, gpt-6.1-sol, Codex 0.164.0) · may differ on workers still on another version` | Varies. |
+| `runtime default (catalog default unknown)` | Unknown (also shown for an absent or unrecognised state). |
+
+```text
+effort  codex  runtime default  medium  runtime default (catalog default: low, gpt-6.1-sol, Codex 0.164.0)  your choice
+```
+
 `--json` carries the effort rows as the read-only `effort_settings` (ordered
 claude, codex: `harness`, `effort`, `default_effort`, `default_source`,
-`resolved_effort`, `source`, `mode`). `resolved_effort` is `null` exactly when
+`resolved_effort`, `source`, `mode`, and on the `codex` cell only
+`catalog_default`: `state` (`known`, `unknown` or `varies`), `effort`, `model`,
+`runtime_version`, `observed_at`, the last four `null` when `state` is
+`unknown`). `resolved_effort` is `null` exactly when
 `mode` is `runtime_default`. The CLI cannot set effort: the write endpoint is
 cookie-only, so use **Settings → Run defaults → Reasoning effort**. See
 [Reasoning effort](./worker-effort.md#runtime-default).
@@ -3282,8 +3331,13 @@ never changes an existing run or resume. See
 [rate limits](./rate-limits.md#how-overflow-compares-headroom) for selected
 accounts, Claude aggregation and capacity holds.
 
-`uzi run get <id>` shows `HARNESS_PICK` rows headed `at creation:`. The last
-two rows are the weekly resets, `pref reset:` and `other reset:`, or
+`uzi run get <id>` shows `HARNESS_PICK` rows headed `at creation:`. An `off`
+or `excluded` decision was recorded before any usage was read, so it shows
+only `preferred:`, `chosen:`, `reason:` and one line saying overflow was off
+(`overflow off in settings`) or not considered (`overflow not considered`);
+the stored reason does not say which exclusion applied, and `--json` still
+carries every field. For every other
+reason the last two rows are the weekly resets, `pref reset:` and `other reset:`, or
 `claude reset:` and `codex reset:` for an `auto_*` reason (whose score,
 measured and held rows are likewise labelled `claude` and `codex` instead of
 `preferred`/`pref` and `other`). A reset reads as an RFC3339 UTC timestamp, or `unknown`. The TUI detail rail has **HARNESS at creation**, fitted as a whole block
@@ -3726,6 +3780,14 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   Settings, or `uzi run set-token` where the run accepts a token switch),
   `run list` shows `paused (credential disabled)`, and the TUI draws it as
   `⊘ cred disabled` in NEEDS YOU.
+  A `paused` run can also be **waiting because your credentials were reset**
+  (`hold_reason: credentials_reset`): a Claude or chat run created before an
+  admin-issued [account reset](auth-design.md) found no model credential at
+  claim. `run get` prints a `HOLD` row reading `credentials were reset` with
+  the action "add a credential in Settings; the run resumes automatically",
+  and the web badge reads "waiting: credentials were reset". It resumes on its
+  own once you add a credential; `run resume` and `run set-token` are refused
+  with a 409 until then.
   A `paused` run can also be held after an owner token switch on a run with
   retained recovery work (`hold_reason: credential_switch_settling`, then
   `credential_switch_unsettled`). `run get` prints a `HOLD` row reading
@@ -3749,6 +3811,13 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   `uzi run recovery <id>`, recover the work with `uzi run export <id>
   --output <path>`, or start a successor run. See [Seeded
   plans](seeded-plans.md).
+  A `paused` run can also be **held because its repo agents could not be
+  read** (`hold_reason: repo_agent_source_unavailable`): the worker could not
+  resolve, record or read the default-branch revision it reads
+  `.claude/agents/` and `.codex/agents/` from, so the agent never started. `run get` prints a
+  `HOLD` row reading `repo agents unreadable`; resume the run with
+  `uzi run resume <id>` once the repository can be fetched, or cancel it. See
+  [Repo agents](repo-agents.md#which-revision-is-read).
 
 For an ordinary pause, human `run get` makes one supplemental message read
 (`tail=100`). Its pause detail reads **paused by the run's lead** for
@@ -3988,8 +4057,11 @@ for renewal bounds, storage risks and rollout requirements.
 ### Retained recovery adoption failed
 
 `recovery_wait` / `retained_recovery_adoption_failed` means an integrity check
-refused adoption. Local work and custody are preserved; the run is owner-held
-with no automatic retry, regardless of a displayed retry timestamp.
+refused adoption, or that a predecessor's active secret-scan remediation record
+refused source use so the agent did not start. Local work and custody are
+preserved; the run is owner-held with no automatic retry, regardless of a
+displayed retry timestamp. In the remediation case, Resume holds again unless
+that remediation was resolved through a separately authorized route.
 
 Read `uzi run recovery <id>` and export an available archive before deciding.
 Use `uzi run resume <id>` (or `resume-now`) to request another bounded attempt,

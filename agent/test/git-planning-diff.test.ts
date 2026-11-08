@@ -21,7 +21,8 @@ import { PlanningFixtureIO, planningExec, planningGitEnv } from "./planning-fixt
 const workerExec = promisify(execFile);
 const defaultLimits = { sourceAllowance: 128 * 1024 * 1024, indexAllowance: 2 * 1024 * 1024,
   pathAllowance: 20000, entryAllowance: 30000, directoryAllowance: 2048,
-  ignoreAllowance: 128 * 1024 * 1024, ignorePipeAllowance: 2 * 1024 * 1024 };
+  ignoreAllowance: 128 * 1024 * 1024, ignorePipeAllowance: 2 * 1024 * 1024,
+  baseDiscoveryEntryCap: 1_200_000, baseDiscoveryPathByteCap: 96 * 1024 * 1024 };
 
 const cap = 512 * 1024;
 const git = new GitCache(process.cwd(), nullLogger());
@@ -83,6 +84,17 @@ async function fixture(options: {
   killGraceMs?: number;
   // Add this many unreferenced tiny loose objects to the clone's object store.
   looseObjects?: number;
+  // Replace the committed base with a tree built directly in the seed object store (git mktree);
+  // the returned oid is the root tree. Pair with noCheckout when the tree cannot exist on disk.
+  baseTree?: (tools: {
+    mktree: (lines: string[]) => Promise<string>; blob: (content: string) => Promise<string>;
+  }) => Promise<string>;
+  // Clone without a working tree (discovery reads only .git and the bare's objects).
+  noCheckout?: boolean;
+  // Timeout for each fixture git command (default 5 s); heavy fixtures raise it.
+  gitTimeoutMs?: number;
+  // Stage the seed with `git add -f` so files matching the seed's own .gitignore are committed.
+  forceAdd?: boolean;
 } = {}): Promise<{
   cache: GitCache; clone: string; bare: string; protectedRoot: string; base: string; data: string; tmp: string;
   git: (...args: string[]) => Promise<string>;
@@ -107,14 +119,30 @@ async function fixture(options: {
     const bare = path.join(protectedRoot, "repos", "repo.git");
     await fs.mkdir(seed);
     const run = async (cwd: string, ...args: string[]): Promise<string> =>
-      (await exec("git", ["-C", cwd, ...args], { env: planningGitEnv(), timeout: 5000 })).stdout;
+      (await exec("git", ["-C", cwd, ...args], { env: planningGitEnv(), timeout: options.gitTimeoutMs ?? 5000 })).stdout;
     await run(seed, "init", "--quiet", "--template=");
     await fs.writeFile(path.join(seed, "tracked"), "base\n");
     await fs.writeFile(path.join(seed, "deleted"), "delete me\n");
     await fs.writeFile(path.join(seed, ".gitignore"), "ignored\nignored-dir/\n");
     await options.seed?.(seed);
-    await run(seed, "add", ".");
+    // forceAdd keeps tracked files that the seed's own .gitignore rules would drop.
+    await run(seed, "add", ...(options.forceAdd ? ["-f"] : []), ".");
     await run(seed, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "base");
+    if (options.baseTree) {
+      const seedGit = async (args: string[], input: string): Promise<string> => {
+        const pending = exec("git", ["-C", seed, ...args], { env: planningGitEnv(), timeout: options.gitTimeoutMs ?? 60000 });
+        // A git that exits before reading its input surfaces through the awaited exit status
+        // (with its stderr), not as an unhandled EPIPE on the stdin socket.
+        pending.child.stdin?.on("error", () => {});
+        pending.child.stdin?.end(input);
+        return (await pending).stdout.trim();
+      };
+      const tree = await options.baseTree({
+        mktree: lines => seedGit(["mktree"], lines.length > 0 ? lines.join("\n") + "\n" : ""),
+        blob: content => seedGit(["hash-object", "-w", "--stdin"], content),
+      });
+      await run(seed, "update-ref", "HEAD", (await seedGit(["commit-tree", "-m", "base", tree], "")));
+    }
     // Worker native IO owns the bare and protected parents. Runner IPC never creates
     // authority. The worker cannot traverse the runner's private TMPDIR, so the runner
     // stages a bare copy of the seed in a temporarily open directory, removed afterwards.
@@ -123,13 +151,15 @@ async function fixture(options: {
     await run(seed, "clone", "--quiet", "--bare", "--no-local", seed, staged);
     await nativeFs.mkdir(path.dirname(bare), { recursive: true, mode: 0o755 });
     const bareGit = async (...args: string[]): Promise<string> => (await workerExec("git", ["-C", bare, ...args],
-      { env: gitEnv(), timeout: 5000 })).stdout;
-    await workerExec("git", ["clone", "--quiet", "--bare", "--no-local", staged, bare], { env: gitEnv(), timeout: 5000 });
+      { env: gitEnv(), timeout: options.gitTimeoutMs ?? 5000 })).stdout;
+    await workerExec("git", ["clone", "--quiet", "--bare", "--no-local", staged, bare],
+      { env: gitEnv(), timeout: options.gitTimeoutMs ?? 5000 });
     await fs.rm(staged, { recursive: true, force: true });
     await nativeFs.rmdir(stage);
     await nativeFs.mkdir(path.dirname(clone), { recursive: true, mode: 0o755 });
     await nativeFs.chmod(path.dirname(clone), 0o777);
-    await run(seed, "clone", "--quiet", options.shared ? "--shared" : "--no-local", bare, clone);
+    await run(seed, "clone", "--quiet", ...(options.noCheckout ? ["--no-checkout"] : []),
+      options.shared ? "--shared" : "--no-local", bare, clone);
     await nativeFs.chmod(path.dirname(clone), 0o755);
     if (options.looseObjects) {
       // A clone keeps its fetched objects in a pack, so write the tiny loose objects directly.
@@ -1391,6 +1421,45 @@ phaseCp.spawn = function(...args) {
     });
   }
 
+  it("keeps a git deadline refusal classified when the deadline passes before its timer is armed", async () => {
+    // The helper's command() checks the deadline before spawning Git. Jump the
+    // clock only after that check. Keep the spawned Git child waiting on stdin
+    // until the command timer fires: SIGSTOP alone did not establish that ordering,
+    // so a fast close could let the next helper check return capture_deadline.
+    // A negative delay makes Node print a warning ahead of the trusted refusal
+    // line, hiding the git_deadline token.
+    const hook = `
+const timerCp = require("node:child_process"), timerFs = require("node:fs");
+const timerSpawn = timerCp.spawn, timerNow = Date.now;
+let timerOffset = 0, timerHeld = false;
+Date.now = () => timerNow() + timerOffset;
+timerCp.spawn = function(...args) {
+  const p = timerSpawn.apply(this, args);
+  // The helper first runs git init and check-attr. Let those finish; hold its
+  // first object() batch-check only after command() has passed check().
+  if (!timerHeld && args[1].includes("cat-file") && args[1].some(a => a.startsWith("--batch-check"))) {
+    timerHeld = true;
+    // command() calls stdin.end(input) after arming the timer. Write the input but
+    // keep stdin open, so cat-file cannot close before the zero-delay timeout.
+    p.stdin.end = input => { if (input) p.stdin.write(input); return p.stdin; };
+    timerOffset = 28001;
+    timerFs.writeFileSync(__DATA__ + "/timer-held", "1");
+  }
+  return p;
+};
+`;
+    const f = await fixture({ hook });
+    try {
+      const got = await refusalOf(f.capture());
+      assert.equal(await fs.readFile(path.join(f.data, "timer-held"), "utf8"), "1");
+      assert.deepEqual({
+        refusal: got.refusal,
+        diagnostic: got.diagnostic,
+        timeoutWarning: /TimeoutNegativeWarning/.test(got.message),
+      }, { refusal: "diff_failed", diagnostic: "git_deadline", timeoutWarning: false });
+    } finally { await f.dispose(); }
+  });
+
   it("primary proof: neutralizes poisoned Git redirect and config environment inside helper", async () => {
     const hook = `
 const poisonFs = require("node:fs"), poisonCp = require("node:child_process"), poisonSpawn = poisonCp.spawn;
@@ -2040,5 +2109,207 @@ describe("Unit2 bounded runner stdout transport", () => {
     await owner.settled();
     assert.deepEqual(owner.survivors(), []);
     assert.throws(() => process.kill(owner.pids()[0]!, 0), { code: "ESRCH" });
+  });
+});
+
+// Base discovery is bounded by two absolute aggregate caps, chosen in #3543 from measurement
+// (e2e/planning-base-discovery-measure/RESULTS.md). Every directory and leaf entry occurrence is
+// charged once per walk (a shared subtree is charged again for each reference); path bytes are
+// byteLength(relative path) of each entry, which is the entry name plus its ancestor prefix.
+describe("Base discovery aggregate caps (#3543)", { skip: process.platform !== "linux" && "Linux /proc capture required" }, () => {
+  const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+  const PRODUCTION_ENTRY_CAP = 1_200_000, PRODUCTION_PATH_BYTE_CAP = 96 * 1024 * 1024;
+  const longName = (letter: string, index: number, length: number): string =>
+    (letter + String(index).padStart(4, "0")).padEnd(length, "x");
+  const DEPTH = 60, NAME = 250;
+
+  it("pins the production caps and the token mapping", () => {
+    // The shipped values live in GitCache's private planningLimits field (PLANNING_LIMITS is not
+    // exported); read them from a real instance so a change in agent/src/git.ts fails this test.
+    const shipped = (new GitCache(os.tmpdir(), nullLogger()) as unknown as { planningLimits: unknown }).planningLimits;
+    assert.ok(typeof shipped === "object" && shipped !== null, "GitCache.planningLimits must be an object");
+    const limits = shipped as Record<string, number>;
+    assert.equal(limits.baseDiscoveryEntryCap, 1_200_000);
+    assert.equal(limits.baseDiscoveryPathByteCap, 100_663_296);
+    assert.equal(defaultLimits.baseDiscoveryEntryCap, limits.baseDiscoveryEntryCap);
+    assert.equal(defaultLimits.baseDiscoveryPathByteCap, limits.baseDiscoveryPathByteCap);
+    for (const token of ["base_discovery_entry_cap", "base_discovery_path_byte_cap"]) {
+      assert.equal(PLANNING_REFUSAL_TOKENS[token], "diff_too_large", token);
+      assert.deepEqual(classifyPlanningCaptureError("bounded runner process failed: UZI-PLANNING-REFUSAL " + token + "\n"),
+        { refusal: "diff_too_large", diagnostic: token });
+    }
+  });
+
+  it("refuses a long-name chain over the production path-byte cap with few tree objects", { timeout: 100_000 }, async () => {
+    const fan = 4, width = 2000;
+    // Per fan: one root entry; one directory entry in each chain tree at depth k (prefix k*(N+1));
+    // width files in the deepest tree at depth DEPTH.
+    let charged = 0;
+    for (let j = 0; j < fan; j++) {
+      charged += NAME;
+      for (let k = 1; k <= DEPTH - 1; k++) charged += k * (NAME + 1) + NAME;
+      charged += width * (DEPTH * (NAME + 1) + NAME);
+    }
+    assert.ok(charged > PRODUCTION_PATH_BYTE_CAP, "the fixture must exceed the production cap: " + charged);
+    assert.ok(fan * width + fan * DEPTH < PRODUCTION_ENTRY_CAP);
+    const f = await fixture({ noCheckout: true, gitTimeoutMs: 60000, baseTree: async ({ mktree, blob }) => {
+      const leaf = await blob("leaf\n");
+      let t = await mktree(Array.from({ length: width }, (_, i) => `100644 blob ${leaf}\t${longName("f", i, NAME)}`));
+      for (let level = DEPTH - 1; level >= 1; level--) t = await mktree([`040000 tree ${t}\t${longName("c", level, NAME)}`]);
+      return mktree(Array.from({ length: fan }, (_, j) => `040000 tree ${t}\t${longName("d", j, NAME)}`));
+    } });
+    try {
+      await assertRefused(f.capture(), "diff_too_large", "base_discovery_path_byte_cap");
+    } finally { await f.dispose(); }
+  });
+
+  // Production defaults cannot be exceeded by directory entries alone inside the discovery deadline:
+  // depth is capped at 64, so a directory entry charges at most about 64 * 256 bytes and a tree read
+  // costs milliseconds. The directory-only charge is therefore proven with an injected cap.
+  it("charges directory entries without any leaf (injected path-byte cap)", { timeout: 100_000 }, async () => {
+    const fan = 3, injected = 1024 * 1024;
+    let charged = 0;
+    for (let j = 0; j < fan; j++) {
+      charged += NAME;
+      for (let k = 1; k <= DEPTH; k++) charged += k * (NAME + 1) + NAME;
+    }
+    assert.ok(charged > injected, "directory entries alone exceed the cap: " + charged);
+    const build = async ({ mktree }: { mktree: (lines: string[]) => Promise<string> }): Promise<string> => {
+      let t = await mktree([]);
+      assert.equal(t, EMPTY_TREE);
+      for (let level = DEPTH; level >= 1; level--) t = await mktree([`040000 tree ${t}\t${longName("c", level, NAME)}`]);
+      return mktree(Array.from({ length: fan }, (_, j) => `040000 tree ${t}\t${longName("d", j, NAME)}`));
+    };
+    const f = await fixture({ noCheckout: true, gitTimeoutMs: 60000, baseTree: build,
+      limits: { baseDiscoveryPathByteCap: injected } });
+    try {
+      await assertRefused(f.capture(), "diff_too_large", "base_discovery_path_byte_cap");
+    } finally { await f.dispose(); }
+  });
+
+  // The production entry cap needs about 27 s of discovery, too close to the 28 s deadline for a
+  // reliable test, so the cap is injected. The fixture is one leaf tree referenced several times.
+  it("charges every occurrence of a shared subtree against the entry cap (injected entry cap)", async () => {
+    const fan = 4, width = 500, injected = 1000;
+    assert.ok(fan + fan * width > injected);
+    const f = await fixture({ noCheckout: true, gitTimeoutMs: 60000, limits: { baseDiscoveryEntryCap: injected },
+      baseTree: async ({ mktree, blob }) => {
+        const object = await blob("x\n");
+        const leaf = await mktree(Array.from({ length: width }, (_, i) => `100644 blob ${object}\tf${String(i).padStart(4, "0")}`));
+        return mktree(Array.from({ length: fan }, (_, j) => `040000 tree ${leaf}\td${j}`));
+      } });
+    try {
+      await assertRefused(f.capture(), "diff_too_large", "base_discovery_entry_cap");
+    } finally { await f.dispose(); }
+  });
+
+  // A checked-out base: its charged totals follow from the path list alone.
+  const files: Record<string, string> = { "dir1/a.txt": "a\n", "dir1/sub/b.txt": "b\n", "dir2/c.txt": "c\n", "dir2/雪.txt": "d\n" };
+  const entries = [".gitignore", "deleted", "tracked", "dir1", "dir2", "dir1/sub", ...Object.keys(files)];
+  const E = entries.length, P = entries.reduce((sum, rel) => sum + Buffer.byteLength(rel), 0);
+  const seedFiles = async (seed: string): Promise<void> => {
+    for (const [rel, content] of Object.entries(files)) {
+      await fs.mkdir(path.dirname(path.join(seed, rel)), { recursive: true });
+      await fs.writeFile(path.join(seed, rel), content);
+    }
+  };
+
+  it("succeeds at exactly each cap and refuses one below it", async () => {
+    const f = await fixture({ seed: seedFiles });
+    try {
+      const run = (limits: Partial<typeof defaultLimits>): Promise<Buffer> => {
+        f.cache.setPlanningLimitsForTest({ ...defaultLimits, ...limits });
+        return f.capture();
+      };
+      assert.equal((await run({ baseDiscoveryEntryCap: E })).length, 0);
+      assert.equal((await run({ baseDiscoveryPathByteCap: P })).length, 0);
+      await assertRefused(run({ baseDiscoveryEntryCap: E - 1 }), "diff_too_large", "base_discovery_entry_cap");
+      await assertRefused(run({ baseDiscoveryPathByteCap: P - 1 }), "diff_too_large", "base_discovery_path_byte_cap");
+    } finally { await f.dispose(); }
+  });
+
+  it("names the cap that trips first when both are injected", async () => {
+    const f = await fixture({ seed: seedFiles });
+    try {
+      const run = (limits: Partial<typeof defaultLimits>): Promise<Buffer> => {
+        f.cache.setPlanningLimitsForTest({ ...defaultLimits, ...limits });
+        return f.capture();
+      };
+      // Git tree order is .gitignore (10 bytes), deleted (7), dir1 (4): after the third entry the
+      // entry count is 3 and the charged path bytes are 21.
+      await assertRefused(run({ baseDiscoveryEntryCap: 2, baseDiscoveryPathByteCap: P }), "diff_too_large", "base_discovery_entry_cap");
+      await assertRefused(run({ baseDiscoveryEntryCap: E, baseDiscoveryPathByteCap: 20 }), "diff_too_large", "base_discovery_path_byte_cap");
+      // Both exceeded at the same entry: the entry cap is checked first.
+      await assertRefused(run({ baseDiscoveryEntryCap: 2, baseDiscoveryPathByteCap: 20 }), "diff_too_large", "base_discovery_entry_cap");
+    } finally { await f.dispose(); }
+  });
+
+  it("charges an empty subtree as one entry and one directory", async () => {
+    const empty = async ({ mktree }: { mktree: (lines: string[]) => Promise<string> }, names: string[]): Promise<string> => {
+      const tree = await mktree([]);
+      assert.equal(tree, EMPTY_TREE);
+      return mktree(names.map(name => `040000 tree ${tree}\t${name}`));
+    };
+    const one = await fixture({ noCheckout: true, limits: { baseDiscoveryEntryCap: 1 }, baseTree: tools => empty(tools, ["empty"]) });
+    try {
+      assert.equal((await one.capture()).length, 0);
+    } finally { await one.dispose(); }
+    const two = await fixture({ noCheckout: true, limits: { baseDiscoveryEntryCap: 1 }, baseTree: tools => empty(tools, ["a", "b"]) });
+    try {
+      await assertRefused(two.capture(), "diff_too_large", "base_discovery_entry_cap");
+    } finally { await two.dispose(); }
+  });
+
+  it("captures this repository at production defaults", { timeout: 100_000 }, async t => {
+    if (uidSplitActive()) { t.skip("the runner identity cannot read the repository checkout"); return; }
+    const repoRoot = path.resolve(import.meta.dirname, "..", "..");
+    let seeded = 0;
+    const f = await fixture({ gitTimeoutMs: 90000, forceAdd: true, seed: async seed => {
+      // Fail loudly when repoRoot is not a git work tree rather than archiving some other repository.
+      assert.equal((await exec("git", ["-C", repoRoot, "rev-parse", "--is-inside-work-tree"], { timeout: 30000 })).stdout.trim(), "true");
+      const archive = path.join(path.dirname(seed), "repo.tar");
+      await exec("git", ["-C", repoRoot, "archive", "--format=tar", "-o", archive, "HEAD"], { timeout: 90000 });
+      // Drop the builder's own placeholder files so the base holds exactly the repository's files.
+      await fs.rm(path.join(seed, "tracked"));
+      await fs.rm(path.join(seed, "deleted"));
+      await exec("tar", ["-xf", archive, "-C", seed], { timeout: 90000 });
+      await fs.rm(archive);
+      seeded = (await exec("git", ["-C", repoRoot, "ls-tree", "-r", "--name-only", "HEAD"], { timeout: 30000, maxBuffer: 64 * 1024 * 1024 }))
+        .stdout.split("\n").filter(Boolean).length;
+    } });
+    try {
+      const committed = (await f.git("ls-tree", "-r", "--name-only", f.base)).split("\n").filter(Boolean).length;
+      assert.equal(committed, seeded, "the fixture base must hold every tracked file of the repository");
+      assert.ok(seeded >= 5000, "the archive must hold the repository's files: " + seeded);
+      const started = Date.now();
+      assert.equal((await f.capture()).length, 0);
+      t.diagnostic("repository capture (" + seeded + " files) took " + (Date.now() - started) + " ms");
+    } finally { await f.dispose(); }
+  });
+
+  // 50,000 files in 500 directories (50,500 entries). Each file is a few bytes, so content reads
+  // and hashing add little; the remaining capture time is per-tree and per-directory git spawns
+  // and per-file opens.
+  it("captures a 50k-file synthetic tree at production defaults", { timeout: 90_000 }, async t => {
+    const setupStarted = Date.now();
+    const f = await fixture({ gitTimeoutMs: 80000, seed: async seed => {
+      // Written by a runner-identity child: 50k IPC file writes would be far slower.
+      const script = `
+const fs = require("node:fs"), path = require("node:path");
+const seed = process.argv[1];
+for (let i = 0; i < 50000; i++) {
+  const dir = path.join(seed, "d" + String(Math.floor(i / 100)).padStart(5, "0"));
+  if (i % 100 === 0) fs.mkdirSync(dir);
+  fs.writeFileSync(path.join(dir, "f" + String(i % 100).padStart(2, "0")), i + "\\n");
+}`;
+      await exec(process.execPath, ["-e", script, seed], { timeout: 80000 });
+    } });
+    t.diagnostic("synthetic 50k fixture setup took " + (Date.now() - setupStarted) + " ms");
+    try {
+      const started = Date.now();
+      const captured = await f.capture();
+      t.diagnostic("synthetic 50k capture alone took " + (Date.now() - started) + " ms");
+      assert.equal(captured.length, 0);
+    } finally { await f.dispose(); }
   });
 });

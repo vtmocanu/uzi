@@ -28,6 +28,14 @@ run** section with two cards:
 2. **My agent templates** — your uzi templates. This is the default (and the
    repo card is inert) when the repo has no agent folder uzi reads.
 
+A run that carries a [default for your runs on the
+repo](#set-a-default-for-your-runs-on-a-repo), or a source chosen when the run
+was created, pre-selects that source instead:
+**uzi templates** selects **My agent templates** even when the repo ships agents,
+and **repo agents** selects **Repo agents** when a roster is detected (with no
+roster, **My agent templates** stays selected). The pre-selected card carries the
+**default** badge.
+
 Pick one source, then click any agent chip to exclude it from the run. At least
 one subagent must remain. The choice locks in when you approve; the run view then
 shows which roster ran. Autopilot runs and CI-fix runs (which have no human gate)
@@ -37,14 +45,120 @@ and record what they used.
 Approving from a [Slack](./slack.md) DM offers the source choice too: when a repo
 roster is detected the message shows two approve buttons — **Approve · repo agents**
 and **Approve · my templates** — so you pick the source without leaving Slack.
-Per-agent exclusions are a web-only refinement; use "Open in uzi" for those.
+**Approve · repo agents** comes first and is the primary button, unless the run's
+default for the repo is **uzi templates**: then **Approve · my templates** comes
+first and is the primary button. Per-agent exclusions are a web-only refinement;
+use "Open in uzi" for those.
+
+## Set a default for your runs on a repo
+
+Each repo you connect has a **Default agents for my runs on this repo** setting,
+in the repo's **Trusted repo** settings on the Repos page:
+
+- **uzi templates**: your runs on this repo use your own templates.
+- **repo agents**: your runs on this repo use the repo's roster when one is
+  detected, and fall back to your templates (with the usual "no repo agent
+  roster" note) when it is not.
+- **not set (today's behaviour)**: the defaults described above apply.
+
+The setting is yours alone. It changes only the runs you create on your own
+connection to that repo; a teammate connected to the same project keeps their
+own setting. An admin can clear it or set **uzi templates** on any repo, but only
+the repo's owner can choose **repo agents**.
+
+uzi freezes the setting onto each issue run when the run is created, whether you
+start it from the board, the CLI, chat, a schedule or autopilot. Changing the
+setting later does not change runs already queued or running. Other run kinds
+(CI fix, MR rework, self-improvement, prompt, task and job runs) are not affected.
+
+A frozen default decides the implementation agents when nothing else does:
+
+- an approval that carries no agent choice (for example `uzi run approve` with
+  no `--agent-source`, or an external dispatcher using the API) implements with
+  the default, and the run records it. When the run already records a choice
+  from an earlier approval, that choice and its exclusions are kept instead;
+- an autopilot run implements with the default;
+- an explicit choice at the plan gate (web, Slack, or `--agent-source`) still
+  wins, and the run page then shows it as "changed at approval". The web and
+  Slack gates pre-select the default, so approving without changing the
+  selection keeps it.
+
+To choose for a single run instead, pass `--agent-source own|repo` to
+`uzi run create` (or `"agent_selection": {"source": "own"|"repo"}` in the API
+create request). The choice overrides your default for that run only, is frozen
+the same way, and shows as "(this run)". It decides the implementation agents
+exactly as a default does. Exclusions are not part of a create-time choice: exclude
+agents at the plan gate, or seed a plan with `--plan-file` and `--exclude-agents`.
+Board, chat, schedule and autopilot runs carry no create-time choice, so they
+follow your default.
+
+A request of **repo agents**, from a default or a create-time choice, also
+applies to planning; see [Planning with repo agents](#planning-with-repo-agents).
+A run that carries a default or a create-time choice is claimed only by a worker
+new enough to honour it; while every online worker is older, the run stays
+queued and its health reason names the missing worker version
+(`agent_source_request_v1`).
+
+The run page's **Agents used** card shows which agents planned and implemented
+the run, for example "Planned with: repo agents (repo default) · Implemented
+with: repo agents (as requested)". When planning used a different source than
+the request, the card also shows the request, for example "Requested: repo
+agents (repo default) · Planned with: my templates · Implemented with: my
+templates (changed at approval)". "Planned with: —" means no planning turn was
+recorded: a seeded run has none, and a worker older than this feature records
+nothing. `uzi run get` shows the same facts as the `AGENTS_REQUESTED`,
+`PLANNED_WITH` and `IMPLEMENTED_WITH` rows, and `uzi repo list` shows each
+repo's setting (`agent_source_default` in `--json`).
+
+## Planning with repo agents
+
+The plan turn runs before you review the plan. It uses the repo's agents only
+when all of these hold:
+
+- the run requests repo agents, from your default on the repo or a per-run
+  choice;
+- a roster was detected at the run's recorded revision (see
+  [Which revision is read](#which-revision-is-read));
+- the run does not record a choice of your templates from an earlier approval.
+
+Otherwise the plan turn uses your own templates. A run with no request plans
+with your templates even when it records repo agents from an earlier autopilot
+or approval, so a recorded choice can keep planning on your templates but never
+switch it to repo agents. When the run records repo agents with exclusions, the
+excluded agents do not plan either. A revision of the plan at the gate uses the
+same agents as the first plan turn.
+
+A repo-sourced plan turn keeps these safeguards:
+
+- **No file-write tools.** On Claude runs each planning subagent loses `Edit`,
+  `Write`, `MultiEdit` and `NotebookEdit`, and a repo agent whose declared tools
+  are only write tools does not take part in planning. On Codex runs the worker
+  refuses the file-write requests a planning agent makes. The shell stays
+  available on both harnesses, so planning is not a read-only sandbox: a repo
+  agent with a shell can still run commands, and those commands can change
+  files.
+- **The usual repo-agent limits.** A repo agent cannot spawn nested agents or
+  schedule deferred work, and on a memory-guarded Claude run its shell goes
+  through the same supervised command tool as your templates.
+- **Unverified output.** The lead's planning instructions say the subagents
+  were defined by the repository, that their output is unverified, and that
+  planning subagents report findings and do not change files.
+- **The recorded revision.** Planning reads the roster at the revision the run
+  records on its first claim, and no agent turn starts before the server
+  confirms that revision.
+
+The run records which agents planned it (`plan_agent_source`, `own` or `repo`)
+when its plan turn starts; a later re-plan replaces the record. The feed shows
+"planning with the repo's agents" with the agent names. The worker sends the
+record only to an API that advertises `plan_agent_source_v1`.
 
 ## Repo agents on Codex runs
 
 On a Codex run the agent selection applies the same way: implementation
 delegates to the roster you chose at the plan gate (by default the detected
 repo roster), honours your exclusions, and falls back to your own templates when
-the selection is invalid. Planning keeps your own templates. The model rule
+the selection is invalid. Planning follows the rules in
+[Planning with repo agents](#planning-with-repo-agents). The model rule
 below applies to both harnesses; Codex also filters tools:
 
 - **Markdown `model:`** maps by vocabulary: a supported Codex role id is a
@@ -117,18 +231,59 @@ deferral tools stay denied.
 Out of scope: the `[agents]` table in `.codex/config.toml`, and other tools'
 agent folders, are not read.
 
-### How uzi keeps the read inside the clone
+### Which revision is read
 
-Detection is hardened against a repo that tries to point it elsewhere. uzi
-walks the folder's path components without following symlinks: a symlink
-anywhere in them means the folder is not read, and it still counts as present,
-so there is no fallback to the other folder. Each file is opened without
-following symlinks, and before any byte is read the opened file's real path must
-sit directly inside the agents folder; a file that fails this check is skipped.
-The size check and read use that same open handle. The check relies on Linux
-`/proc`, so on a platform without it nothing is read. As supporting context,
-detection runs during preflight, after the clone or resume and before the
-executor starts, in a clone owned by the runner.
+uzi never reads the agent folders from the run's working tree. On a run's
+first claim the worker fetches the repo and resolves the repository's
+configured default branch from its remote-tracking ref after that fetch, never
+from another branch. It reads `.claude/agents/` and `.codex/agents/` from git
+objects at that commit and reports the commit together with the roster. No
+agent turn starts until the server confirms it recorded that commit. A
+`--require-base` run held because its kept work is not attested
+(`base_attestation_missing`) has the commit recorded the same way before the
+hold. The server records the commit once per run and refuses a later report
+that names a different one.
+
+Every later claim of the same run (a resume, a requeue, a restart on another
+worker) reads the agent folders at the recorded commit. Edits a run makes to its
+own agent files, and agent files already on the branch an `mr_rework` or
+`ci_fix` run starts from, therefore never change the roster that run uses. The
+run view shows the revision under **Agents used**.
+
+Agent files stay writable: a run can still change them as part of its task. The
+change reaches runs whose first claim comes after it is merged into the default
+branch.
+
+The read follows the same rules as the folder layout above: a symlink for
+`.claude`, `.codex` or either `agents` folder means that folder is not read (it
+still counts as present, so there is no fallback to the other folder), symlinks
+and submodules inside the folder are skipped, and the same caps apply.
+
+The agent does not start, and the run is held as **repo agents unreadable**
+(`hold_reason` `repo_agent_source_unavailable`), when the worker:
+
+- cannot resolve the configured default branch (the repository has none, the
+  branch is missing from the fetch, or the repository has no commits yet);
+- cannot get the server's confirmation that it recorded the commit (the report
+  failed, was refused, or its answer did not name the commit);
+- cannot read the agent folders at the commit, or the recorded commit is missing
+  from its repository cache and fetching it fails.
+
+When the worker resolved a commit, the hold records it under the same
+record-once rule, so the claim after an owner resume reads the same commit even
+if the default branch has moved since. Resume the run once the repository can
+be fetched, or cancel it.
+
+A run that reads repo agents is marked when it is created
+(`repo_agent_source_required`). Only a worker that reports the
+`repo_agent_source_v1` protocol capability claims a marked run or a run with a
+recorded revision, its first claim included. Judge, job, cross-check,
+task-review and chat runs do not read repo agents and are not marked. While no
+such worker is online, a queued run's health reason names the capability.
+
+When the API is older than the worker, nothing is recorded: each claim reads
+the agent folders at the configured default branch's commit at that time, and
+a failure to read them leaves the run on the owner's own agent templates.
 
 ## What is loaded, and what is never
 
@@ -199,7 +354,9 @@ Two consequences are worth stating plainly:
   request on that repo.
 
 Repo agents need no opt-in; they are offered at the plan gate whenever the
-repo has a `.claude/agents/` or `.codex/agents/` folder. Two related per-repo opt-ins are separate:
+repo has a `.claude/agents/` or `.codex/agents/` folder. They run before you
+review the plan only when you request them, by setting **repo agents** as your
+default on the repo or choosing them for a run. Two related per-repo opt-ins are separate:
 the repo's own skills and its root `CLAUDE.md`, both off by default (see
 [Agent skills](./skills.md#repo-skills-opt-in-default-off) and
 [Repo instructions](./skills.md#repo-instructions-opt-in-default-off)).

@@ -424,12 +424,16 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 	} else {
 		dto.RepoAgents = agents
 	}
+	dto.RepoAgentSourceCommit = textPtrValue(r.RepoAgentSourceCommit.Valid, r.RepoAgentSourceCommit.String)
 	if excl, err := workersvc.DecodeExclusions(r.AgentExclusions); err != nil {
 		slog.Error("decode run agent exclusions", "run_id", r.ID, "error", err)
 	} else {
 		dto.AgentExclusions = excl
 	}
 	dto.AgentSource = textPtrValue(r.AgentSource.Valid, r.AgentSource.String)
+	dto.AgentSourceRequested = textPtrValue(r.AgentSourceRequested.Valid, r.AgentSourceRequested.String)
+	dto.AgentSourceRequestedBasis = textPtrValue(r.AgentSourceRequestedBasis.Valid, r.AgentSourceRequestedBasis.String)
+	dto.PlanAgentSource = textPtrValue(r.PlanAgentSource.Valid, r.PlanAgentSource.String)
 	// PRD #122 M1: the FROZEN milestone list. Degrades gracefully on a decode error
 	// (impossible in practice — every write is validated and the column carries a
 	// jsonb_typeof CHECK), logged and treated as "no list" rather than failing the read.

@@ -123,6 +123,11 @@ const (
 	holdCompletionBlocked   = "completion_blocked"
 	holdCredentialDisabled  = "credential_disabled" //nolint:gosec // G101: a run hold-reason VOCABULARY value (the server enum), not a credential.
 	holdBaseAttestation     = "base_attestation_missing"
+	holdRepoAgentSource     = "repo_agent_source_unavailable"
+	// holdCredentialsReset (PRD #3989) is the park of a Claude-harness or chat run whose owner had
+	// an admin reset their account: the reset deleted every model credential, so the run could not
+	// get one. It resumes by itself once the owner adds a credential; resume is refused (409).
+	holdCredentialsReset = "credentials_reset"
 	// holdWeeklyReserve (PRD #3522) is the park the weekly usage reserve puts a running run in when the
 	// credential it spends reaches the owner's threshold. It releases by itself when usage falls back
 	// below the threshold (or the setting is cleared); `uzi run resume` overrides it until the next
@@ -349,19 +354,12 @@ var plannedCommitRe = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
 
 // seededPlanFlag assembles PRD #209's optional seeded plan from the `create` flags, and
 // returns nil when no --plan-file was given (an ordinary issue-planned run, unchanged).
-//
-// It reuses approveSelection — so `--exclude-agents` without `--agent-source` is the
-// SAME usage error the plan gate raises — and mirrors the server's coupling
-// client-side: a roster flag with no --plan-file is a usage error here (the server
-// would answer 400 "agent_selection requires plan_md"), so the user gets a clean
-// message before any request is sent. The plan's size cap and empty-plan rejection stay
-// the SERVER's (422): readPlanFile forwards the bytes.
-func seededPlanFlag(env Env, cmd *cobra.Command) (*uzicli.CreateRunSeed, error) {
+func seededPlanFlag(env Env, cmd *cobra.Command) (*uzicli.CreateRunSeed, string, error) {
 	source, _ := cmd.Flags().GetString("agent-source")
 	exclude, _ := cmd.Flags().GetStringSlice("exclude-agents")
 	sel, err := approveSelection(source, exclude)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	plannedCommit, _ := cmd.Flags().GetString("planned-commit")
 	plannedCommit = strings.TrimSpace(plannedCommit)
@@ -369,7 +367,7 @@ func seededPlanFlag(env Env, cmd *cobra.Command) (*uzicli.CreateRunSeed, error) 
 	// M4: --require-base needs a --planned-commit to compare against; without one the
 	// flag can never fire (usage error before any request, mirroring the server's 400).
 	if requireBase && plannedCommit == "" {
-		return nil, uzicli.Exitf(uzicli.ExitUsage,
+		return nil, "", uzicli.Exitf(uzicli.ExitUsage,
 			"--require-base requires --planned-commit (there is no commit to compare the clone's base against)")
 	}
 	// A pre-flight mirror of the server's ErrInvalidPlannedCommit (the server is the
@@ -377,33 +375,35 @@ func seededPlanFlag(env Env, cmd *cobra.Command) (*uzicli.CreateRunSeed, error) 
 	// request, so the user gets exit 2 rather than a round-trip 400. A too-short value is
 	// the load-bearing case — it would silently disarm --require-base server-side.
 	if plannedCommit != "" && !plannedCommitRe.MatchString(plannedCommit) {
-		return nil, uzicli.Exitf(uzicli.ExitUsage,
+		return nil, "", uzicli.Exitf(uzicli.ExitUsage,
 			"--planned-commit must be a hex commit sha of 7-64 characters")
 	}
 	planProvided := cmd.Flags().Changed("plan-file")
-	// A roster / a planned commit / a require-base is only meaningful for a seeded plan.
-	// Reject any of them without --plan-file up front, mirroring the server's
-	// "agent_selection requires plan_md" / "planned_commit and require_base require
-	// plan_md" 400s with a clean message before any request is sent.
-	if (sel != nil || plannedCommit != "" || requireBase) && !planProvided {
-		return nil, uzicli.Exitf(uzicli.ExitUsage,
-			"--agent-source/--exclude-agents/--planned-commit/--require-base require --plan-file "+
-				"(they are only meaningful for a seeded plan)")
-	}
 	if !planProvided {
-		return nil, nil
+		if len(exclude) > 0 {
+			return nil, "", uzicli.Exitf(uzicli.ExitUsage,
+				"--exclude-agents requires --plan-file (without a plan, exclude agents at approval)")
+		}
+		if plannedCommit != "" || requireBase {
+			return nil, "", uzicli.Exitf(uzicli.ExitUsage,
+				"--planned-commit/--require-base require --plan-file (they are only meaningful for a seeded plan)")
+		}
+		if sel == nil {
+			return nil, "", nil
+		}
+		return nil, sel.Source, nil
 	}
 	path, _ := cmd.Flags().GetString("plan-file")
 	plan, err := readPlanFile(env, path)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	return &uzicli.CreateRunSeed{
 		PlanMD:        plan,
 		Selection:     sel,
 		PlannedCommit: plannedCommit,
 		RequireBase:   requireBase,
-	}, nil
+	}, "", nil
 }
 
 // expectedGateRevisionFlag is the PRD #1795 D5 flag on `run approve|reject|revise`.

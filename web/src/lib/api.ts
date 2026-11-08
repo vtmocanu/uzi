@@ -23,6 +23,7 @@ export const MOCK_MODE = import.meta.env.VITE_UZI_MOCK === "1";
 // type import below names only the DTOs this module's own code (realApi, the
 // request helpers, ProjectSyncVisibility) references in its signatures.
 import type {
+  AgentSource,
   CrossCheckHistoryDTO,
   CrossCheckHistoryAvailabilityDTO,
   CrossCheckHistoryParams,
@@ -51,6 +52,10 @@ import type {
   Card,
   ChatListResponse,
   CliAuthRequestMeta,
+  AccountResetLink,
+  ResetLinkPreview,
+  ResetLinkPreviewRequest,
+  ResetLinkRedeemRequest,
   OAuthAuthorizeRequest,
   OAuthConnection,
   AdminOAuthConnection,
@@ -1007,6 +1012,10 @@ const realApi = {
   setRepoFoldImproveUziBacklog: (id: string, enabled: boolean) =>
     request<{ repo: Repo }>("PATCH", `/repos/${id}`, {
       repo_fold_improve_uzi_backlog: enabled,
+    }),
+  setRepoAgentSourceDefault: (id: string, value: AgentSource | null) =>
+    request<{ repo: Repo }>("PATCH", `/repos/${id}`, {
+      agent_source_default: value,
     }),
   // Static per-repo capability hint (PRD #84 M2). Owner or admin. Mutually
   // exclusive in one request with repo_devbox_opt_in and the trust flags, so it is
@@ -2093,6 +2102,21 @@ const realApi = {
     request<{ status: string }>("POST", "/auth/cli/deny", {
       request_id: requestId,
     }),
+
+  // ── Admin-issued account reset link (PRD #3989) ────────────────────────────
+  // Issue is a cookie-only admin CSRF write (201, the plaintext token once). Preview and
+  // redeem are unauthenticated and carry the token ONLY in the POST body, never in the
+  // path or a query, so it stays out of access logs and Referer (D9). Redeem is a 204.
+  createResetLink: (id: string) =>
+    request<AccountResetLink>("POST", `/admin/users/${encodeURIComponent(id)}/reset-link`),
+  previewReset: (token: string) =>
+    request<ResetLinkPreview>("POST", "/auth/reset/preview", { token } satisfies ResetLinkPreviewRequest),
+  redeemReset: (token: string, password?: string) =>
+    request<null>(
+      "POST",
+      "/auth/reset/redeem",
+      (password === undefined ? { token } : { token, password }) satisfies ResetLinkRedeemRequest,
+    ),
 
   // ── OAuth consent flow (PRD #1910 M2) ──────────────────────────────────────
   // The `/connect` page's three calls, all cookie-session reads/writes (the POSTs carry CSRF)

@@ -268,7 +268,37 @@ plus jitter. This cause has its own `retained_park_count`, separate from the
 lifetime recovery-wait count and worker-death requeue allowance.
 `RUN_RETAINED_RECOVERY_MAX_PARKS` sets the cap; **0 holds immediately**.
 The fourth exhaustion at defaults stays held for the owner, without a timer
-or another counted park. Resume does not reset that cap.
+or another counted park. Resume does not reset that cap. The one exception to
+"below the cap is counted" is a capacity-only window, described next.
+
+**Capacity-only window (owner hold below the cap).** When a retained-recovery
+window ends with every reservation the worker witnessed refused for
+data-volume capacity (including a window that reaches its recovery deadline
+or budget after at least one such refusal; a deadline that aborts a consumed
+attempt, rather than a capacity refusal ending it, makes the window mixed), the
+worker sends its
+`retained_recovery_exhausted` park with the request-only field
+`retained_capacity_only: true`, and only if the API advertises
+`retained_recovery_capacity_hold_v1`. The API then holds the run for the
+owner: `retained_park_count` is not incremented, there is no retry time
+(`recovery_retry_not_before` stays NULL), and `worker_id` and source custody
+are kept. It is not a disk park and does not reset the budget. Nothing new is
+stored, so the CLI and web show the same owner-held state as an at-cap hold
+(CLI text is unchanged). The worker posts one run-feed status: "retained
+recovery held for owner: every recovery attempt in this window was refused for
+data volume capacity; owner Resume required; predecessor work and custody
+retained". Owner Resume gives one more window; a further all-capacity window
+holds again. Mixed windows (any non-capacity failure), deadline-only windows
+and every other case keep the ordinary park rules above (counted and timed
+below the cap, held at it). An older API never advertises the feature, so it
+never receives the marker; if a rolled-back API answers the marked report with
+400, the worker falls back to one unmarked pass, which follows the ordinary
+park rules above.
+
+Trade-offs: freeing headroom alone no longer auto-resumes such a run, because
+owner Resume is required. The hold keeps `worker_id`, so it can delay that
+worker's image roll. The later non-claim after Resume is the separate
+capability and image-roll cycle tracked in #4047, not part of this hold.
 
 A fresh claim with a higher derived recovery episode charges one of three
 reservations in a new five-minute window and must prove quiescence again.
@@ -304,9 +334,17 @@ upgrading workers; mixed API replicas and API rollback are unsupported.
 
 ### Retained recovery adoption failed
 
-`recovery_wait` / `retained_recovery_adoption_failed` means an integrity check
-refused adoption. Local work and custody are preserved. This is an owner hold
+`recovery_wait` / `retained_recovery_adoption_failed` means adoption of the
+retained work did not complete: an integrity check refused it, or another
+adoption step could not be verified, including an ownership check right after
+adoption that failed other than through a connection failure the worker retries
+(connection refused or reset, a dropped socket, or a 502/503/504 answer). Local work and custody are preserved. This is an owner hold
 with **no automatic retry**, regardless of any displayed retry timestamp.
+
+The same cause also holds a successor run whose terminal predecessor's source on
+the worker is under an active secret-scan remediation record (issue #4058): the
+agent did not start, nothing was adopted, and neither quiescence nor adoption was
+attempted. See the remediation paragraph in [Run recovery](run-recovery.md).
 
 1. Read `uzi run recovery <id>` and export an available archive before deciding;
    an earlier archive may omit the latest local work.
@@ -329,6 +367,22 @@ fresh claim opens another counted custody hold and repeated failures can leave
 retained successor paths. Keep the original worker storage: a peer after worker
 loss or affinity expiry may use a published checkpoint behind the retained work.
 
+A temporary API connection problem during the worker's read-only ownership
+check, after the successor was verified and journaled, is retried in place
+before any hold: at most 5 attempts (about 15 s at the default recovery retry
+interval), inside the iteration's existing deadline, on the same claim and
+successor with no recapture and no extra recovery-attempt charge. Only a request
+that failed before any response with `ECONNREFUSED`, `ECONNRESET` or
+`UND_ERR_SOCKET`, or a 502, 503 or 504 answer, qualifies. Unknown errors,
+malformed or truncated responses and other statuses are not retried, and
+exhausted retries give the check's existing outcome: for the first check the
+`adoption_failed` path described above (this hold when its preconditions hold),
+and for the second check in the Codex/safety branch after executor disposal the
+existing `quiescence_failed` failure with custody kept, not a hold. A deadline
+that actually passes ends as `budget_exhausted`. The retry state is in-process
+only. The hold itself still has no automatic retry. See the
+[ADR-1197 #3994 amendment](../adr/1197-transient-recovery-park.md#amendment-2026-11-06-3994-transient-api-connection-failures-retry-the-ownership-check-in-place).
+
 A positively identified temporary local resource error during the read-only
 renewal check stops the claim without consuming its owner grant or creating a
 new owner hold. The existing bounded claim-recovery policy may retry it.
@@ -342,8 +396,8 @@ and keeps its local work and custody. Export/recover the retained work rather th
 expecting Resume alone to rebind changed storage. Reholding does
 not rebind the owner record or consume the pending execution grant.
 
-This path requires API feature support, exact persisted `adoption_failed`
-evidence, current ownership and proven quiescence. Missing support or unconfirmed
+The adoption path (not the issue #4058 remediation hold) requires API feature
+support, exact persisted `adoption_failed` evidence, current ownership and proven quiescence. Missing support or unconfirmed
 persistence fails closed with custody kept. An uncertain park response uses
 bounded reconciliation and a nonterminal stop; it does not confirm the hold.
 Deploy the API fully before workers; API rollback remains unsupported. See the
@@ -551,6 +605,24 @@ This clone/fetch policy adds no probes, run states or credentials and does
 not itself recover publication. A forge outage met later, while the run is
 publishing finished work, is a different park with its own bound; see
 [Forge unreachable while publishing](#forge-unreachable-while-publishing).
+
+If a park report is sent but its reply is lost, the worker asks uzi whether
+the run is parked, resending the report if it is not. When that check is
+refused with an HTTP 4xx status other than 404, 408 or 429, or the resend is
+refused with a 4xx status other than 400, 408 or 429 (a resend rejected as a
+bad request still fails the run, as before), the worker stops retrying and
+reports nothing. A 404 on the check still means the run is no longer owned by
+this worker, and the worker cleans up as before. A 404 on the resend stops
+without a second check and keeps the session. Timeouts, 429, 5xx responses and
+transport failures are retried with backoff. A typed acknowledgement returned
+for the resend, including a 409 body, is not a refusal and is handled as
+before: it can confirm the park or take the failed path (for example
+`custody_unsettled`). On a refusal, the worker keeps the session when it can
+be resumed on that worker, keeps any publication record and source, leaves
+custody unsettled, and leaves the run to the server or its owner. A refusal
+is not treated as proof that the run ended. The same applies to the
+data-volume park and to a claim already enrolled for publication whose clone
+fails; the later publishing park below is a separate path.
 
 ## Forge unreachable while publishing
 
@@ -1211,7 +1283,7 @@ historical-evidence rules above remain in force.
   `worker_requeue_exhausted` is an owner-only exhaustion hold: explicit
   Resume starts a new episode; Cancel ends the run. It has no automatic retry.
   `retained_recovery_exhausted` has bounded timed retries followed by an owner
-  hold; see [Retained recovery exhausted](#retained-recovery-exhausted).
+  hold (a capacity-only window is held for the owner below the cap); see [Retained recovery exhausted](#retained-recovery-exhausted).
   `retained_recovery_adoption_failed` instead requires owner Resume or Cancel,
   with no automatic retry; see [Retained recovery adoption failed](#retained-recovery-adoption-failed).
   `retained_continuation_unwitnessed` is likewise owner Resume or Cancel with no

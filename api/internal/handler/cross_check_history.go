@@ -268,7 +268,9 @@ func crossCheckHistoryAttempt(row store.CrossCheckHistoryAttemptsRow) apitypes.C
 		}
 	}
 	// A recorded review survives missing child metadata, but cannot certify execution.
-	// Persisted interruption/replacement takes precedence over a completed child.
+	// A row SQL classifies as replaced takes precedence over a completed child.
+	// The exception is a Plan verdict recorded before the interruption: SQL classifies
+	// it by that verdict (#4037), so its execution comes from the child and it stays historical.
 	if row.Category == "replaced" {
 		dto.Execution = "replaced"
 		if row.InterruptedAt.Valid {

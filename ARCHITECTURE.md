@@ -838,7 +838,11 @@ existing gate path; original checker findings remain historical evidence.
 
 The Claude checker (for a Codex lead) is confined in layers: the SDK `tools`
 list is `Read`, `Grep` and `Glob` only, with every other tool disallowed and
-`settingSources` empty; its environment is isolated and holds only the
+`settingSources` empty. When the check requests structured output, the SDK's
+end-turn `StructuredOutput` carrier (final verdict only, no file access) is
+additionally admitted by exact name in the tool gate, the init check and the
+Code tool budget (issue #4038). Its
+environment is isolated and holds only the
 Anthropic token; it runs as the runner uid through `spawnDetached`; one path
 guard allows reads only inside the checkout plus its own SDK spill files under
 its home; and a Glob/Grep pattern guard denies absolute, home-relative and
@@ -857,8 +861,8 @@ escaping sibling/symlink reads are denied. This does not prove network
 isolation. Web and CLI show bounded findings and recorded child metadata,
 with current gate reason separate from historical candidate evidence; Slack
 shows the reason without findings. See [ADR-2149](adr/2149-cross-check.md) for
-confinement/proof limits and [PRD #2149](prds/2149-plan-cross-check.md) for
-rationale, validation provenance and pending hosted acceptance. The Codex-lead
+confinement/proof limits and [PRD #2149](prds/done/2149-plan-cross-check.md) for
+rationale, validation provenance and its closed hosted acceptance (#2152). The Codex-lead
 direction is [PRD #2460](prds/done/2460-codex-lead-plan-cross-check.md) and the
 [ADR-2149 addendum](adr/2149-cross-check.md#2460-addendum-codex-lead-claude-checker). Automatic rounds extend the original #2149
 scope through [PRD #2150](prds/done/2150-plan-cross-check-auto-revise.md) and
@@ -1257,6 +1261,22 @@ chain in the diagram above, with no intervening `running`.
   on demand via `uzi run resume-now` / the run view's "Resume now" control.
   See the Anthropic-credential discussion above and
   [docs/anthropic-token.md](docs/anthropic-token.md#waiting-for-a-token).
+
+- **claimed → paused (`credential_disabled` / `credentials_reset`)** (PRD
+  #3989 M3): `paused` carries two credential hold reasons on one park,
+  promoter and partial index. `credential_disabled` is a disabled credential
+  the run needs; `credentials_reset` is a Claude-harness or chat run created
+  before the owner's admin-issued account reset that finds, at claim, no model
+  credential left. Both park instead of failing and are promoted back to
+  `queued` by the same pass on secret create or enable, vault unlock and the
+  periodic sweep; a credential that vanishes again before the claim re-parks
+  the run, never fails it. A manual resume of a `credentials_reset` run is
+  refused with 409. Not parked: judge, job and cross_check runs, runs created
+  after the reset (they fail without a credential), and Codex runs, whose bound
+  login was frozen at create and so fail terminally. Auto-bound workers keep
+  `pool_wait`. All of it runs only after the vault gate, since queued runs are
+  not claimed until the new vault exists and is unlocked. See
+  [docs/vault-threat-model.md](docs/vault-threat-model.md#admin-issued-account-reset).
 
 - **running → recovery_wait → queued** (issue #1197): an SDK turn
   that comes back **positively empty** (zero reported turns, no model activity,
@@ -2043,8 +2063,9 @@ Four independent layers, any one of which failing still leaves the others:
    projects has. The one deliberate, user-gated exception is per-run agent
    selection (PRD #37): the *worker* parses `.claude/agents/*.md` (or, issue #2085,
    `.codex/agents/*.toml`, projected onto the same shape; the harness's native
-   folder wins, never merged) itself and
-   feeds them through the same programmatic `agents` map, only when the user
+   folder wins, never merged) itself, from git objects at the default-branch
+   commit the run recorded on its first claim (issue #3913), never from the
+   working tree, and feeds them through the same programmatic `agents` map, only when the user
    picks the repo source at the plan gate. `settingSources` stays `[]`; repo
    hooks/settings/commands never load; and repo subagents are still bound by
    the `disallowedTools` list and the deny-hook above. See the Repo agents docs

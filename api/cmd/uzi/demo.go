@@ -104,6 +104,17 @@ func boolPtr(b bool) *bool { return &b }
 
 func demoStr(s string) *string { return &s }
 
+// demoCatalogDefault is one sample Codex catalog default (issue #3251) per state: "known"
+// (shown by the demo's Codex Runtime default row), "varies" and "unknown".
+func demoCatalogDefault(state string, now time.Time) *apitypes.CatalogDefaultDTO {
+	if state == "unknown" {
+		return &apitypes.CatalogDefaultDTO{State: "unknown"}
+	}
+	observed := now.Add(-2 * time.Hour)
+	return &apitypes.CatalogDefaultDTO{State: state, Effort: demoStr("low"), Model: demoStr("gpt-6.1-sol"),
+		RuntimeVersion: demoStr("0.164.0"), ObservedAt: &observed}
+}
+
 // fPtr returns a pointer to a float64, for the nullable Codex window fields (e.g.
 // CodexRateLimitWindowDTO.UsedPercent, where nil = no reading rather than 0%).
 func fPtr(f float64) *float64 { return &f }
@@ -205,7 +216,8 @@ func newDemoClient() *uzicli.FakeClient {
 				{Harness: "claude", DefaultEffort: "medium", DefaultSource: "builtin",
 					ResolvedEffort: demoStr("medium"), Source: "builtin", Mode: "explicit"},
 				{Harness: "codex", Effort: demoStr("runtime"), DefaultEffort: "medium", DefaultSource: "builtin",
-					Source: "user_default", Mode: "runtime_default"},
+					Source: "user_default", Mode: "runtime_default",
+					CatalogDefault: demoCatalogDefault("known", now)},
 			},
 		},
 		// StreamEvents nil: NewRunStream emits nothing and stays OPEN (so the detail reads

@@ -90,6 +90,9 @@ describe("OverviewNext for a non-admin", () => {
     expect(sentence()).toBe("Nothing needs you right now. 1 run is executing.");
     expect(screen.getByText("Live run row")).toBeTruthy();
     for (const call of adminEndpoints()) expect(call).not.toHaveBeenCalled();
+    expect(screen.getByRole("region", { name: "Your usage" })).toBeTruthy();
+    expect(screen.queryByRole("group", { name: "Usage scope" })).toBeNull();
+    expect(screen.queryByRole("region", { name: "By user" })).toBeNull();
     expect(screen.queryByText(/Other users/)).toBeNull();
     // The health chip is admin-only.
     expect(screen.queryByRole("link", { name: /System health/ })).toBeNull();
@@ -150,6 +153,7 @@ describe("OverviewNext for an admin", () => {
     expect(mockApi.adminListRuns).toHaveBeenCalledWith({ view: "summary" });
     expect(mockApi.adminListRuns).toHaveBeenCalledTimes(1);
     expect(sentence()).toBe("Nothing needs you right now. 2 runs are executing across the factory and 1 queued.");
+    expect(screen.getByRole("group", { name: "Usage scope" })).toBeTruthy();
     // The admin's own row is shown once, under Yours; the other users' rows under Other users.
     expect(within(screen.getByRole("list", { name: "Your runs" })).getAllByText("Live run row")).toHaveLength(1);
     expect(within(screen.getByRole("list", { name: "Other users' runs" })).getAllByText("Live run row")).toHaveLength(2);
@@ -458,6 +462,9 @@ describe("Needs your decision", () => {
     mockApi.listRuns.mockResolvedValue({ runs: [aRun({ id: "plan-1", status: "awaiting_approval" }), prRun()] });
     await mount();
     expect(screen.getByText(/^1 decision and 1 pull request are waiting on you\./)).toBeTruthy();
+    // The PR sits in its group: its ref links to the forge, and so does its action once expanded.
+    expect(screen.getByRole("link", { name: "vtmocanu/uzi #4" }).getAttribute("href")).toBe("https://github.com/o/r/pull/4");
+    fireEvent.click(screen.getByRole("button", { name: "Review PRs" }));
     expect(screen.getByRole("link", { name: "Review PR" }).getAttribute("href")).toBe("https://github.com/o/r/pull/4");
   });
 
@@ -486,6 +493,13 @@ describe("Issue work line", () => {
     return rows("Your runs").length + rows("Other users' runs").length;
   };
 
+  const scopeGroup = () => within(screen.getByRole("group", { name: "Issue work scope" }));
+  const chooseScope = async (name: "You" | "All users") => {
+    await act(async () => {
+      fireEvent.click(scopeGroup().getByRole("button", { name }));
+    });
+  };
+
   it("sits right after the decision card, only once the data has loaded", async () => {
     mockApi.listRuns.mockResolvedValue({ runs: [aRun({ id: "plan-1", status: "awaiting_approval" })] });
     await mount();
@@ -504,6 +518,7 @@ describe("Issue work line", () => {
       runs: [aRun({ id: "x-1", status: "queued", issue_iid: 55, owner_email: "mira@uzi.local" })],
     });
     await mount();
+    await chooseScope("All users");
     expect(countOf("queued")).toBe(1);
     expect(within(stationOf("queued")).getByText("#55").getAttribute("title")).toBe("mira@uzi.local");
     expect(within(line()).getByText("2 runs on the line, 0 other, all users")).toBeTruthy();
@@ -563,6 +578,7 @@ describe("Issue work line", () => {
       ],
     });
     await mount();
+    await chooseScope("All users");
     expect(widgetRows()).toBe(8 + 4);
     expect(activeStages.reduce((n, s) => n + countOf(s), 0)).toBe(widgetRows());
     expect(countOf("pr")).toBe(1);
@@ -579,6 +595,7 @@ describe("Issue work line", () => {
       ],
     });
     await mount();
+    await chooseScope("All users");
     expect(countOf("queued")).toBe(1);
     expect(countOf("building")).toBe(1);
     expect(activeStages.reduce((n, s) => n + countOf(s), 0)).toBe(widgetRows());
@@ -595,7 +612,7 @@ describe("Issue work line", () => {
       return list ? within(list).getAllByRole("listitem").map((li) => li.textContent ?? "") : [];
     };
     const pressed = () =>
-      Array.from(line().querySelectorAll('[aria-pressed="true"]')).map((b) => b.getAttribute("data-stage"));
+      Array.from(line().querySelectorAll('[data-stage][aria-pressed="true"]')).map((b) => b.getAttribute("data-stage"));
     const adminMixed = () => {
       vi.mocked(useAuth).mockReturnValue(authValue(admin));
       mockApi.listRuns.mockResolvedValue({
@@ -615,6 +632,7 @@ describe("Issue work line", () => {
     it("shows only plan-review runs in both groups, and restores all on a second click", async () => {
       adminMixed();
       await mount();
+      await chooseScope("All users");
       expect(rows("Your runs")).toHaveLength(2);
       expect(rows("Other users' runs")).toHaveLength(2);
       await click("review");
@@ -627,7 +645,7 @@ describe("Issue work line", () => {
       expect(rows("Other users' runs")).toHaveLength(2);
     });
 
-    it("moves the pressed state with the selection, and Show all clears it", async () => {
+    it("moves the pressed state with the selection, and pressing the same station again clears it", async () => {
       adminMixed();
       await mount();
       await click("building");
@@ -635,11 +653,34 @@ describe("Issue work line", () => {
       await click("review");
       expect(pressed()).toEqual(["review"]);
       expect(rows("Your runs")).toEqual([expect.stringContaining("Own plan")]);
-      await act(async () => {
-        fireEvent.click(within(line()).getByRole("button", { name: "Show all" }));
-      });
+      await click("review");
       expect(pressed()).toEqual([]);
       expect(rows("Your runs")).toHaveLength(2);
+      expect(within(line()).queryByRole("button", { name: "Show all" })).toBeNull();
+    });
+
+    it("with You chosen, shows only the viewer's runs at the stage, and clears on a second press", async () => {
+      adminMixed();
+      await mount();
+      await click("building");
+      expect(rows("Your runs")).toEqual([expect.stringContaining("Own build")]);
+      expect(screen.queryByRole("list", { name: "Other users' runs" })).toBeNull();
+      expect(screen.queryByText("Their build")).toBeNull();
+      await click("building");
+      expect(pressed()).toEqual([]);
+      expect(rows("Other users' runs")).toHaveLength(2);
+    });
+
+    it("keeps the pressed stage when the scope changes", async () => {
+      adminMixed();
+      await mount();
+      await click("review");
+      await chooseScope("All users");
+      expect(pressed()).toEqual(["review"]);
+      expect(rows("Other users' runs")).toEqual([expect.stringContaining("Their plan")]);
+      await chooseScope("You");
+      expect(pressed()).toEqual(["review"]);
+      expect(screen.queryByRole("list", { name: "Other users' runs" })).toBeNull();
     });
 
     it("lists a pull request once when two runs share it, and counts the same", async () => {
@@ -677,5 +718,114 @@ describe("Issue work line", () => {
       expect(screen.getByRole("status").textContent).toBe("Other users' runs are unavailable");
       expect(screen.getByText("No runs at this stage.")).toBeTruthy();
     });
+  });
+});
+
+describe("Issue work scope (#4052)", () => {
+  const SCOPE_KEY = "uzi.overviewIssueWorkScope";
+  const line = () => screen.getByRole("region", { name: "Issue work" });
+  const group = () => within(screen.getByRole("group", { name: "Issue work scope" }));
+  const countOf = (stage: string) => Number(line().querySelector(`[data-stage="${stage}"]`)!.getAttribute("data-count"));
+  const pick = async (name: "You" | "All users") => {
+    await act(async () => {
+      fireEvent.click(group().getByRole("button", { name }));
+    });
+  };
+  const seed = () => {
+    vi.mocked(useAuth).mockReturnValue(authValue(admin));
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "o-plan", status: "awaiting_approval" }), aRun({ id: "o-build", status: "running" })],
+    });
+    mockApi.adminListRuns.mockResolvedValue({
+      runs: [
+        aRun({ id: "x-plan", status: "awaiting_approval", owner_email: "mira@uzi.local" }),
+        aRun({ id: "x-queued", status: "queued", owner_email: "mira@uzi.local" }),
+      ],
+    });
+  };
+
+  it("defaults an admin to You: own-only counts, own-only captions, and no all-users note", async () => {
+    seed();
+    await mount();
+    expect(group().getByRole("button", { name: "You" }).getAttribute("aria-pressed")).toBe("true");
+    expect(countOf("queued")).toBe(0);
+    expect(countOf("review")).toBe(1);
+    expect(line().querySelector('[data-stage="review"]')!.textContent).toContain("Waiting on you");
+    expect(within(line()).getByText("2 runs on the line, 0 other")).toBeTruthy();
+    expect(within(line()).queryByText(/all users/)).toBeNull();
+    expect(localStorage.getItem(SCOPE_KEY)).toBeNull();
+  });
+
+  it("shows today's all-user counts after choosing All users, and remembers the choice", async () => {
+    seed();
+    await mount();
+    await pick("All users");
+    expect(countOf("queued")).toBe(1);
+    expect(countOf("review")).toBe(2);
+    expect(line().querySelector('[data-stage="review"]')!.textContent).toContain("1 on you, 1 on others");
+    expect(within(line()).getByText("4 runs on the line, 0 other, all users")).toBeTruthy();
+    expect(JSON.parse(localStorage.getItem(SCOPE_KEY)!)).toBe("all");
+    cleanup();
+    await mount();
+    expect(group().getByRole("button", { name: "All users" }).getAttribute("aria-pressed")).toBe("true");
+    expect(countOf("review")).toBe(2);
+    await pick("You");
+    expect(JSON.parse(localStorage.getItem(SCOPE_KEY)!)).toBe("you");
+  });
+
+  it("reads an unknown stored value, or an unreadable store, as You", async () => {
+    seed();
+    localStorage.setItem(SCOPE_KEY, JSON.stringify("factory"));
+    await mount();
+    expect(countOf("review")).toBe(1);
+    cleanup();
+    localStorage.setItem(SCOPE_KEY, JSON.stringify("all"));
+    vi.spyOn(localStorage, "getItem").mockImplementation(() => {
+      throw new Error("denied");
+    });
+    await mount();
+    expect(countOf("review")).toBe(1);
+    expect(group().getByRole("button", { name: "You" }).getAttribute("aria-pressed")).toBe("true");
+    vi.restoreAllMocks();
+  });
+
+  it("disables All users and draws You when the admin list failed", async () => {
+    seed();
+    mockApi.adminListRuns.mockRejectedValue(new Error("down"));
+    localStorage.setItem(SCOPE_KEY, JSON.stringify("all"));
+    await mount();
+    const all = group().getByRole("button", { name: "All users" }) as HTMLButtonElement;
+    expect(all.disabled).toBe(true);
+    expect(group().getByRole("button", { name: "You" }).getAttribute("aria-pressed")).toBe("true");
+    expect(countOf("review")).toBe(1);
+    expect(within(line()).queryByText(/all users/)).toBeNull();
+    expect(localStorage.getItem(SCOPE_KEY)).toBe(JSON.stringify("all"));
+  });
+
+  it("shows You while a saved all waits for the admin list, then All users once it resolves, leaving storage alone", async () => {
+    seed();
+    let resolve!: (v: { runs: ReturnType<typeof aRun>[] }) => void;
+    mockApi.adminListRuns.mockImplementation(() => new Promise((r) => (resolve = r as typeof resolve)));
+    localStorage.setItem(SCOPE_KEY, JSON.stringify("all"));
+    await mount();
+    expect((group().getByRole("button", { name: "All users" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(countOf("review")).toBe(1);
+    expect(localStorage.getItem(SCOPE_KEY)).toBe(JSON.stringify("all"));
+    await act(async () => {
+      resolve({ runs: [aRun({ id: "x-plan", status: "awaiting_approval", owner_email: "mira@uzi.local" })] });
+    });
+    await settle();
+    expect(group().getByRole("button", { name: "All users" }).getAttribute("aria-pressed")).toBe("true");
+    expect(countOf("review")).toBe(2);
+    expect(localStorage.getItem(SCOPE_KEY)).toBe(JSON.stringify("all"));
+  });
+
+  it("gives a non-admin no scope switch on either card and requests nothing from the admin endpoints", async () => {
+    localStorage.setItem(SCOPE_KEY, JSON.stringify("all"));
+    await mount();
+    expect(screen.queryByRole("group", { name: "Issue work scope" })).toBeNull();
+    expect(screen.queryByRole("group", { name: "Usage scope" })).toBeNull();
+    for (const call of adminEndpoints()) expect(call).not.toHaveBeenCalled();
+    expect(within(line()).queryByText(/all users/)).toBeNull();
   });
 });

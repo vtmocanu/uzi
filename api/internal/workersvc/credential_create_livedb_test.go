@@ -47,7 +47,7 @@ func TestCreateRunOverrideFirstClaimSpendsPinnedTokenLiveDB(t *testing.T) {
 	// and passes; here we call the service method directly to prove createRun threads it).
 	waitFalse := false
 	pinnedB := &RawCredentialOverride{Mode: CredentialOverrideModePinned, SecretID: &tokenB}
-	run, err := svc.CreateRun(env.ctx, userID, repoID, iid, "desc", &waitFalse, nil, false /*force*/, nil /*seed*/, nil /*explicit*/, pinnedB)
+	run, err := svc.CreateRun(env.ctx, userID, repoID, iid, "desc", &waitFalse, nil, false /*force*/, nil /*seed*/, nil, nil /*explicit*/, pinnedB)
 	if err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
@@ -61,10 +61,12 @@ func TestCreateRunOverrideFirstClaimSpendsPinnedTokenLiveDB(t *testing.T) {
 
 	// The worker is BOUND (pinned) to A; the run's first claim must still spend the
 	// create-pinned B — the run override outranks the worker binding (D2).
+	env.exec(`UPDATE workers SET protocol_capabilities = array_append(protocol_capabilities, 'repo_agent_source_v1') WHERE id = $1`, workerID)
 	wkr := store.Worker{
 		ID: workerID, UserID: userID, Name: "worker-bound-to-a", Status: "online",
-		AnthropicBindMode: BindModePinned,
-		AnthropicSecretID: pgconv.UUID(tokenA),
+		ProtocolCapabilities: []string{"repo_agent_source_v1"},
+		AnthropicBindMode:    BindModePinned,
+		AnthropicSecretID:    pgconv.UUID(tokenA),
 	}
 	payload, err := svc.Claim(env.ctx, wkr, nil)
 	if err != nil {

@@ -50,6 +50,7 @@ type stateRequestMinusGateRevision struct {
 	RequireRunning              bool                               `json:"require_running,omitempty"`
 	CompletionFinalHead         *string                            `json:"completion_final_head,omitempty"`
 	State                       string                             `json:"status"`
+	ClarificationSettlement     *workersvc.ClarificationSettlement `json:"clarification_settlement,omitempty"`
 	ClaimGeneration             *int64                             `json:"claim_generation"`
 	MessagesThroughSeq          *int64                             `json:"messages_through_seq"`
 	CandidateDigest             string                             `json:"candidate_digest,omitempty"`
@@ -73,6 +74,7 @@ type stateRequestMinusGateRevision struct {
 	ScopeCapped                 *bool                              `json:"scope_capped"`
 	BranchMoved                 *bool                              `json:"branch_moved"`
 	RepoAgents                  *[]workersvc.RepoAgent             `json:"repo_agents"`
+	RepoAgentSourceCommit       *string                            `json:"repo_agent_source_commit"`
 	PlanChangedFiles            *[]string                          `json:"plan_changed_files"`
 	Milestones                  *[]workersvc.Milestone             `json:"milestones"`
 	MilestonesCompleted         *[]string                          `json:"milestones_completed"`
@@ -80,6 +82,7 @@ type stateRequestMinusGateRevision struct {
 	MilestonesAgents            *[]apitypes.MilestoneAgent         `json:"milestones_agents"`
 	SeededFromDefault           *bool                              `json:"seeded_from_default"`
 	AgentSelection              *workersvc.AgentSelection          `json:"agent_selection"`
+	PlanAgentSource             *string                            `json:"plan_agent_source"`
 	OpenQuestionID              *string                            `json:"open_question_id"`
 	CompletionQuestion          bool                               `json:"completion_question"`
 	OpenFollowupID              *int64                             `json:"open_followup_id"`
@@ -98,6 +101,7 @@ type stateRequestMinusGateRevision struct {
 	HandoffCheckpointTip        *string                            `json:"handoff_checkpoint_tip,omitempty"`
 	PublicationHoldReason       *string                            `json:"publication_hold_reason,omitempty"`
 	DiskParkPreventive          *bool                              `json:"disk_park_preventive"`
+	RetainedCapacityOnly        *bool                              `json:"retained_capacity_only,omitempty"`
 	ProductiveTurns             *int32                             `json:"productive_turns"`
 	ProviderProgressTurns       *int32                             `json:"provider_progress_turns"`
 	CheckpointContainsLatest    *bool                              `json:"checkpoint_contains_latest"`

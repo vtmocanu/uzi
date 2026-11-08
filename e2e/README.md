@@ -114,6 +114,15 @@ Results and artifacts (written under the rundir, `$RUNROOT`):
   (`api`, `agent`, `forge-fake`, `db`, via `docker compose logs --since`), `runs.txt`
   (the run enumeration) and `run-counts.txt` (runs by status × kind). Capture is fully
   guarded, so it can never change a phase's recorded status or the suite exit code.
+- `artifacts/agent-logs/`: written before every agent kill/stop/restart/recreate/down (and
+  teardown), on every run, not only a red one (#4060): `NNNN-<phase>-<label>.log` is the
+  snapshot of the outgoing agent's `compose logs`; `.missing` means the capture failed (the
+  file holds the reason, and a `MISSING-EVIDENCE` line goes to stderr: the phase log, or the
+  run output for teardown); `.absent` means the agent was absent where that is expected
+  (initial start, the restart after phase 15's `down`, teardown). A snapshot is
+  point-in-time: logs emitted between it and the operation are not guaranteed captured, and
+  this is not a continuous collector. Kept only when the rundir is kept (a red run, a LEAK
+  sentinel, `KEEP_RUNDIR` or `KEEP_STACK`; under `KEEP_STACK` no teardown snapshot is taken).
 
 Fail-soft behavior: a red run now prints `summary.md` (every failing phase, not
 just the first) to stdout **before** teardown, and the suite exits `1` iff any

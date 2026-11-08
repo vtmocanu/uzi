@@ -11,6 +11,19 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type AccountResetLink struct {
+	ID            uuid.UUID          `json:"id"`
+	UserID        uuid.UUID          `json:"user_id"`
+	TokenHash     []byte             `json:"token_hash"`
+	Kind          string             `json:"kind"`
+	TargetIsAdmin bool               `json:"target_is_admin"`
+	IssuedBy      uuid.UUID          `json:"issued_by"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	ExpiresAt     pgtype.Timestamptz `json:"expires_at"`
+	RedeemedAt    pgtype.Timestamptz `json:"redeemed_at"`
+	SupersededAt  pgtype.Timestamptz `json:"superseded_at"`
+}
+
 type AgentMemory struct {
 	ID        uuid.UUID          `json:"id"`
 	UserID    uuid.UUID          `json:"user_id"`
@@ -251,6 +264,15 @@ type CodexActiveRunCooldown struct {
 	UserID                    uuid.UUID          `json:"user_id"`
 	AccountCooldownClass      string             `json:"account_cooldown_class"`
 	AccountCooldownEligibleAt pgtype.Timestamptz `json:"account_cooldown_eligible_at"`
+}
+
+type CodexCatalogDefault struct {
+	UserID         uuid.UUID          `json:"user_id"`
+	ContextID      string             `json:"context_id"`
+	Model          string             `json:"model"`
+	RuntimeVersion string             `json:"runtime_version"`
+	DefaultEffort  string             `json:"default_effort"`
+	ReportedAt     pgtype.Timestamptz `json:"reported_at"`
 }
 
 type CodexCredentialState struct {
@@ -1020,6 +1042,7 @@ type Repo struct {
 	CodeCrossCheckGuidance            pgtype.Text        `json:"code_cross_check_guidance"`
 	CrossCheckRepoInstructionsEnabled bool               `json:"cross_check_repo_instructions_enabled"`
 	IgnoredInferredCapabilities       []string           `json:"ignored_inferred_capabilities"`
+	AgentSourceDefault                pgtype.Text        `json:"agent_source_default"`
 }
 
 type RepoToolProfile struct {
@@ -1273,6 +1296,11 @@ type Run struct {
 	SnapshotDepartedGeneration     pgtype.Int8        `json:"snapshot_departed_generation"`
 	SnapshotDepartedNonce          pgtype.Text        `json:"snapshot_departed_nonce"`
 	SnapshotDepartedEpoch          pgtype.Int8        `json:"snapshot_departed_epoch"`
+	RepoAgentSourceCommit          pgtype.Text        `json:"repo_agent_source_commit"`
+	RepoAgentSourceRequired        bool               `json:"repo_agent_source_required"`
+	AgentSourceRequested           pgtype.Text        `json:"agent_source_requested"`
+	AgentSourceRequestedBasis      pgtype.Text        `json:"agent_source_requested_basis"`
+	PlanAgentSource                pgtype.Text        `json:"plan_agent_source"`
 }
 
 type RunCompletionAttempt struct {
@@ -1790,6 +1818,7 @@ type User struct {
 	CodexAccountMode          string             `json:"codex_account_mode"`
 	HarnessOverflowEnabled    bool               `json:"harness_overflow_enabled"`
 	CodexSummaryModel         pgtype.Text        `json:"codex_summary_model"`
+	CredentialsResetAt        pgtype.Timestamptz `json:"credentials_reset_at"`
 }
 
 type UserCrossCheckPin struct {

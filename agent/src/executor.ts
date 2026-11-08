@@ -196,6 +196,9 @@ export interface RunContext {
   /** PRD #3244: the claim's single lead-config reporter, constructed by the runner only. Executors
    *  call `enterPhase` before a lead turn; absent for stub/test executors and non-lead lanes. */
   leadConfig?: import("./lead-config-report.js").LeadConfigReporter;
+  /** Issue #3251: the claim's single Codex catalog default reporter, built by the runner only when
+   *  the claim carries a well-formed `codex_catalog_context`. Absent otherwise. */
+  codexCatalogReport?: import("./codex/catalog-report.js").CodexCatalogReporter;
   /** Negotiated before execution/capture; remains binding if registration features shrink. */
   codexIdleStallRecovery?: boolean;
   /** Claim support assertion; absent means false. The runner separately gates root and phase. */
@@ -464,6 +467,8 @@ export interface RunContext {
    *  field), and the executor then applies resolveAgentSelection's absent-default —
    *  which is the CORRECT answer for a gate-less run, not a fallback to tolerate. */
   approvedSelection?: AgentSelection;
+  requestedAgentSource?: AgentSource | null;
+  reportPlanAgentSource?(source: AgentSource): Promise<void>;
   /** Called once with the SDK session id when first observed (for /state). */
   onSessionId?(sessionId: string): void;
   /** Aborts the SDK subprocess when signalled (cancel/shutdown; wired in M4). */
@@ -1070,7 +1075,11 @@ export interface Executor {
    * complete. Absent on the stub/test and
    * Codex executors.
    */
-  reapAttributedProcesses?(): Promise<RunProcessReap>;
+  reapAttributedProcesses?(opts?: {
+    /** issue #3980: absolute epoch-ms deadline of a bounded gate checkpoint. Past it nothing new is
+     *  admitted and a join that is still pending reads as an unconfirmed (incomplete) reap. */
+    deadlineAt?: number;
+  }): Promise<RunProcessReap>;
   /**
    * Issue #2471: dispose and confirm the model commands of a memory-guard-bound Claude flight
    * within `deadlineMs`, and refuse new ones until the next turn. `confirmed: false` means a

@@ -994,6 +994,7 @@ describe("Worker — job dispatch and capability (PRD #1908 M4)", () => {
     assert.ok(caps?.includes("cross_check_gated_v1"), "the gated plan cross-check capability (PRD #3708 M2) is advertised independently of Codex availability");
     assert.ok(caps?.includes("cross_check_semantic_plan_v1") && caps?.includes("completion_semantic_publication_v1"), "the dormant semantic capabilities are advertised independently of Codex availability");
     assert.ok(caps?.includes("ci_config_guard_v1"), "ci_config_guard_v1 (issue #2865) is advertised unconditionally, even when Codex is unavailable");
+    assert.ok(caps?.includes("repo_agent_source_v1"), "repo_agent_source_v1 (issue #3913) is advertised unconditionally");
     assert.equal(caps?.includes("ci_artifacts_v1"), process.platform === "linux", "artifact capability requires the descriptor-backed consumer");
   });
 });
@@ -1046,6 +1047,8 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     "cross_check_owner_steering_v1",
     "completion_semantic_publication_v1",
     "ci_config_guard_v1",
+    "repo_agent_source_v1",
+    "agent_source_request_v1",
     ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),
   ];
   // A client whose register() captures the protocol-capabilities argument (5th param) so a

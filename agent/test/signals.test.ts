@@ -14,6 +14,7 @@ describe("M3 exact park answers", () => {
   });
 });
 import { buildSignalMcpServer, isSignalToolName, REPORT_MD_MAX_LEN, scanSignals } from "../src/signals.js";
+import { REPORT_MD_STORED_MAX_BYTES, SIGNAL_DONE_SUMMARY_DESCRIPTION } from "../src/forge-tool-help.js";
 
 // The plan/done signals are observed from the SDK message stream, so a scripted
 // tool_use proves them with no live session.
@@ -477,6 +478,29 @@ describe("buildSignalMcpServer prd_done_path schema gate (PRD #72 M4)", () => {
     const description = (enabled["report_only"] as { description?: string }).description ?? "";
     assert.match(description, /NO code change/);
     assert.match(description, /non_closing/, "report_only points to non_closing for leaving the issue open (#3360)");
+  });
+
+  it("describes signal_done summary by its stored-report limit, not as one line (#3/#14 self-improve)", () => {
+    // A report_only summary is stored as report_md, which the api cuts at 8 KiB
+    // (workersvc ReviewSummaryMaxBytes); the old "One-line" text advertised neither.
+    assert.equal(REPORT_MD_STORED_MAX_BYTES, 8192);
+    for (const server of [
+      buildSignalMcpServer({ decisionsMemo: false }),
+      buildSignalMcpServer({ decisionsMemo: true }),
+      buildSignalMcpServer({ reportOnly: true }),
+    ]) {
+      const description = (doneToolShape(server)["summary"] as { description?: string }).description ?? "";
+      assert.equal(description, SIGNAL_DONE_SUMMARY_DESCRIPTION);
+      for (const needle of ["report-only", "8 KiB", "8192", "final message"]) assert.ok(description.includes(needle), needle);
+      // Long detail goes to the final message, which every run kind and harness has. Never the
+      // worker's 32768 transport clamp, and never a parameter offered only on some runs
+      // (report_only and decisions_memo are gated); pr_summary is meant for PR-opening runs.
+      for (const absent of ["One-line", "32768", "report_only", "decisions_memo", "pr_summary"]) assert.ok(!description.includes(absent), absent);
+      // The report-only summary IS the stored report (runner.ts report_md: result.summary), so
+      // findings must stay in it; only logs and gate output move to the final message (MR !3943).
+      assert.ok(!description.includes("detailed findings in your final message"), "findings not routed to the final message");
+      assert.ok(description.includes("keep the findings in this summary"), "report-only keeps findings in the summary");
+    }
   });
 
   it("exposes signal_done proposal UNGATED on run kind, and it is optional (PRD #929 M2)", () => {

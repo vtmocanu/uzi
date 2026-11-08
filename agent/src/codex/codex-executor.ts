@@ -134,7 +134,7 @@ import {
   type TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { buildRepoInstructionsContext, interruptedSnapshotNote, interruptedCallsNote, NON_CLOSING_REMINDER, COMPLETION_CONTRACT_GUIDANCE, CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, renderPlanApprovalAdvice, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBatch, REVIEWED_RESUME_APPROVAL_GUIDANCE, selectPriorOwnerHistory, renderPriorOwnerHistory } from "../prompt.js";
+import { buildRepoInstructionsContext, interruptedSnapshotNote, interruptedCallsNote, NON_CLOSING_REMINDER, COMPLETION_CONTRACT_GUIDANCE, CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, REPO_SUBAGENT_PLANNING_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, renderPlanApprovalAdvice, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBatch, REVIEWED_RESUME_APPROVAL_GUIDANCE, selectPriorOwnerHistory, renderPriorOwnerHistory } from "../prompt.js";
 import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "../env-probe.js";
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
@@ -144,7 +144,7 @@ import { summarySkipPayload } from "./summary-skip.js";
 import { resolvePrdInput } from "../prd-link.js";
 import { appendLeadTextTail, emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "../plan-missing.js";
 import { makeTextRedactor } from "../redact.js";
-import { resolveAgentSelection, seedAgentSelection, type AgentSelection, type AgentTemplate, type AskUserQuestion, type ClaimSkill, type IterationBudget, type Milestone, type MilestoneProgress } from "../protocol.js";
+import { gateVerdictSelection, planAgentSource, resolveAgentSelection, seedAgentSelection, type AgentSelection, type AgentTemplate, type AskUserQuestion, type ClaimSkill, type IterationBudget, type Milestone, type MilestoneProgress } from "../protocol.js";
 import { ownSubagentTemplates, selectLeadTemplate, selectSubagentTemplates } from "../agents.js";
 import { REPO_AGENT_DENIED_TOOLS } from "../repoagents.js";
 import type { CommandSandboxMode } from "../config.js";
@@ -587,6 +587,12 @@ function planMaxRevisionsOf(config: RunContext["config"]): number {
  *  builder and run()'s status line / result so the names cannot diverge. */
 function implementTemplates(ctx: RunContext, selection: AgentSelection): AgentTemplate[] {
   return selectSubagentTemplates(selection.source, ctx.agents ?? [], ctx.repoAgents ?? [], selection.exclusions);
+}
+
+function planTemplateSelection(ctx: RunContext): AgentSelection | undefined {
+  const persisted = ctx.approvedSelection;
+  if (planAgentSource(persisted?.source, ctx.requestedAgentSource, (ctx.repoAgents?.length ?? 0) > 0) !== "repo") return undefined;
+  return { source: "repo", exclusions: persisted?.source === "repo" ? persisted.exclusions : [] };
 }
 
 /** Map one uzi {@link AgentTemplate} onto the neutral {@link HarnessAgent} the Codex
@@ -3963,10 +3969,20 @@ export class CodexExecutor implements Executor {
         ctx.emit({ kind: "answer", agent: "lead", payload: { answers: verdict.answers } });
         return answeredPrompt(questions, verdict.answers, parkAt && parkRunEnabled(ctx, "implement") ? PARK_RUN_CONTINUATION : undefined);
       };
+      let planSourceReported = false;
       const drivePlan = async (initialPrompt: string, humanRevision = false) => {
         // issue #2213: a quarantined worker stops a run cleanly at the plan and revise boundaries,
         // before the next prompt is built; the call-site gates remain the guarantee.
         assertResidueQuarantineOpen("provider_turn");
+        if (!planSourceReported) {
+          const planSelection = planTemplateSelection(ctx);
+          if (planSelection) {
+            ctx.emit({ kind: "status", agent: "worker", payload: {
+              text: `planning with the repo's agents (${implementTemplates(ctx, planSelection).map((t) => t.name).join(", ") || "none"})` } });
+          }
+          await ctx.reportPlanAgentSource?.(planSelection ? "repo" : "own");
+          planSourceReported = true;
+        }
         let prompt = initialPrompt;
         // #1593: the prose-only recovery budget, LOCAL to this invocation so the initial plan
         // turn and every revision turn each get one nudge and one owner park.
@@ -4205,7 +4221,7 @@ export class CodexExecutor implements Executor {
           gatedPlan = planMd;
           approvedMilestones = planResult.milestones;
         }
-        approvedSelection = verdict.selection;
+        approvedSelection = gateVerdictSelection(verdict.selection, ctx.approvedSelection, ctx.requestedAgentSource);
 
         // NEW-ROOT RESUME at plan approval. The plan turn's provider root holds a live credential
         // it does not need during the approval wait, so: persist the credential-free session,
@@ -4263,7 +4279,7 @@ export class CodexExecutor implements Executor {
       // gate), before any implement turn. An invalid selection forces `own` and a repo selection
       // with no detected roster degrades to `own` (resolveAgentSelection owns both rules), so a
       // malformed verdict can never activate attacker-authored repo agents.
-      const resolvedSelection = resolveAgentSelection(approvedSelection, (ctx.repoAgents?.length ?? 0) > 0);
+      const resolvedSelection = resolveAgentSelection(approvedSelection, (ctx.repoAgents?.length ?? 0) > 0, ctx.requestedAgentSource);
       if (resolvedSelection.note) {
         ctx.emit({ kind: "status", agent: "worker", payload: { text: resolvedSelection.note } });
       }
@@ -5131,11 +5147,26 @@ export class CodexExecutor implements Executor {
     return {
       timeoutMs: this.deps.catalogProbeTimeoutMs ?? CODEX_CATALOG_PROBE_TIMEOUT_MS,
       onEntry: (entry: CodexCatalogEntry | undefined, model: string): void => {
+        // Issue #3251: feed the catalog default report first; it never throws and must not
+        // be skipped by the early return below.
+        try { ctx.codexCatalogReport?.report(entry, model); } catch { /* best-effort */ }
         if (entry === undefined || entry.supportedEfforts.includes(level)) return;
         ctx.emit({ kind: "status", agent: "worker", payload: {
           event: "effort_not_in_catalog",
           text: `Codex does not list reasoning effort ${level} for ${sanitizeName(model)}. uzi sends it unchanged; the provider may reject it. Choose a listed level or Runtime default.`,
         } });
+      },
+    };
+  }
+
+  /** Issue #3251: Runtime default claims with a catalog reporter. Report only (no note), and the
+   *  first turn/start does not wait for the reply. */
+  private catalogReportProbeFor(ctx: RunContext) {
+    return {
+      timeoutMs: this.deps.catalogProbeTimeoutMs ?? CODEX_CATALOG_PROBE_TIMEOUT_MS,
+      blocking: false,
+      onEntry: (entry: CodexCatalogEntry | undefined, model: string): void => {
+        try { ctx.codexCatalogReport?.report(entry, model); } catch { /* best-effort */ }
       },
     };
   }
@@ -5467,10 +5498,13 @@ export class CodexExecutor implements Executor {
         emitClaimInit: epochIndex === 0,
         // Issue #1583: projected tool frames are scrubbed of runtime-released Codex tokens.
         scrubProjected,
-        // PRD #3247 M2: advisory catalog probe, only on the claim's first root epoch and only for an
-        // explicit level (Runtime default carries none). The note is emitted from onEntry, which the
-        // harness calls before the first turn/start; the level itself is always sent unchanged.
-        ...(epochIndex === 0 && level !== undefined ? { catalogProbe: this.catalogProbeFor(ctx, level) } : {}),
+        // Advisory catalog probe, only on the claim's first root epoch. PRD #3247 M2: an explicit
+        // level gets the awaiting probe; its note is emitted from onEntry, which the harness calls
+        // before the first turn/start, and the level itself is always sent unchanged. Issue #3251:
+        // a Runtime default claim (no level) with a catalog reporter gets the report-only probe,
+        // which does not delay turn/start.
+        ...(epochIndex === 0 && level !== undefined ? { catalogProbe: this.catalogProbeFor(ctx, level) }
+          : epochIndex === 0 && ctx.codexCatalogReport !== undefined ? { catalogProbe: this.catalogReportProbeFor(ctx) } : {}),
       });
 
       const epochHarness = harness;
@@ -6558,10 +6592,16 @@ export class CodexExecutor implements Executor {
     const agents: Record<string, HarnessAgent> = {};
     let repoSourced = false;
     if (phase === "plan") {
-      // The plan phase is deliberately independent of the selection: it runs before the human
-      // approves one, with the owner's roster, exactly as before issue #1718.
-      for (const t of ownSubagentTemplates(ctx.agents ?? [])) {
-        agents[t.name] = toHarnessAgent(t);
+      const planSelection = planTemplateSelection(ctx);
+      if (planSelection) {
+        repoSourced = true;
+        const repoSkills = (ctx.skills ?? []).map((s) => s.name);
+        for (const t of implementTemplates(ctx, planSelection)) agents[t.name] = toHarnessAgent(t, repoSkills);
+        prompt += `\n\n${REPO_SUBAGENT_UNTRUSTED_APPEND}\n\n${REPO_SUBAGENT_PLANNING_APPEND}`;
+      } else {
+        for (const t of ownSubagentTemplates(ctx.agents ?? [])) {
+          agents[t.name] = toHarnessAgent(t);
+        }
       }
     } else {
       if (!selection) throw new TrustedExecutionRefusal("codex implement request built without a resolved agent selection");
@@ -6602,6 +6642,7 @@ export class CodexExecutor implements Executor {
       harness: "codex",
       repoInstructions,
       repoSourced,
+      planning: phase === "plan",
       // Issue #3272: only an implement-phase request of an owner-supplied plan gets the seeded variant.
       seeded: phase === "implement" && isSeededOwnerPlan(ctx),
       codexChildTurnBudgetMs: this.childTurnDeadlineMs(),

@@ -76,6 +76,7 @@ func (s *Service) admitApproval(ctx context.Context, owner, runID uuid.UUID, bod
 	if err := requireNoPendingRevision(ctx, tx, run); err != nil {
 		return SubmitInputResult{}, err
 	}
+	sel = materializeRequestedSelection(run, sel)
 	locked := s.boundClaimControlService(q)
 	if txq, ok := q.(*store.Queries); ok {
 		presentation, coverage, loadErr := loadSemanticGate(ctx, txq, run)

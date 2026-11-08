@@ -28,11 +28,13 @@ func validCoverageDigest(digest string) bool {
 
 // finalRunFacts is the run state a FINAL release judges its generation by.
 type finalRunFacts struct {
-	status    string
-	gen       int64
-	released  pgtype.Timestamptz
-	parkCause pgtype.Text
-	retry     pgtype.Timestamptz
+	status       string
+	gen          int64
+	released     pgtype.Timestamptz
+	parkCause    pgtype.Text
+	holdReason   pgtype.Text
+	sourceCommit pgtype.Text
+	retry        pgtype.Timestamptz
 }
 
 // finalReplayMatches reports whether a released hold is the receipt of exactly this FINAL.
@@ -61,7 +63,9 @@ func finalInventoryEligible(hold store.RecoveryCustodyHold, workerID uuid.UUID, 
 	// positive no-adopted-source proof, empty digest) may end that exact generation early. An
 	// archive release and a publication release keep the terminal/released/newer-claim gate.
 	forgeParkedEmpty := forgeNoOutput && run.status == "recovery_wait" && run.parkCause.Valid && run.parkCause.String == "forge_unreachable"
-	return run.gen > generation || (run.gen == generation && (run.released.Valid || custodyRunTerminalStatuses[run.status] || forgeParkedEmpty))
+	sourceHeldEmpty := forgeNoOutput && run.status == "paused" && run.holdReason.Valid &&
+		run.holdReason.String == "repo_agent_source_unavailable" && !run.sourceCommit.Valid
+	return run.gen > generation || (run.gen == generation && (run.released.Valid || custodyRunTerminalStatuses[run.status] || forgeParkedEmpty || sourceHeldEmpty))
 }
 
 // releaseFinalInventory locks worker, run, hold, then capture. All proof and release
@@ -106,10 +110,10 @@ func (s *Service) releaseFinalInventory(ctx context.Context, wkr store.Worker, r
 	var gen int64
 	var worker pgtype.UUID
 	var released pgtype.Timestamptz
-	var parkCause pgtype.Text
+	var parkCause, holdReason, sourceCommit pgtype.Text
 	var retry pgtype.Timestamptz
-	err = tx.QueryRow(ctx, "SELECT status, claim_generation, worker_id, claim_released_at, recovery_wait_cause, recovery_retry_not_before FROM runs WHERE id=$1 AND user_id=$2 FOR UPDATE",
-		runID, wkr.UserID).Scan(&status, &gen, &worker, &released, &parkCause, &retry)
+	err = tx.QueryRow(ctx, "SELECT status, claim_generation, worker_id, claim_released_at, recovery_wait_cause, hold_reason, repo_agent_source_commit, recovery_retry_not_before FROM runs WHERE id=$1 AND user_id=$2 FOR UPDATE",
+		runID, wkr.UserID).Scan(&status, &gen, &worker, &released, &parkCause, &holdReason, &sourceCommit, &retry)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return apitypes.RecoveryReleaseResponse{}, ErrNotAuthorized
@@ -137,7 +141,7 @@ func (s *Service) releaseFinalInventory(ctx context.Context, wkr store.Worker, r
 		return apitypes.RecoveryReleaseResponse{}, ErrManifestConflict
 	}
 	forgeNoOutput := f.Kind == "settled" && *req.ReleaseEvidence == "forge_no_output"
-	if !finalInventoryEligible(hold, wkr.ID, finalRunFacts{status, gen, released, parkCause, retry}, *req.Generation, forgeNoOutput) {
+	if !finalInventoryEligible(hold, wkr.ID, finalRunFacts{status, gen, released, parkCause, holdReason, sourceCommit, retry}, *req.Generation, forgeNoOutput) {
 		return apitypes.RecoveryReleaseResponse{}, ErrNotAuthorized
 	}
 	evidence := "archive"

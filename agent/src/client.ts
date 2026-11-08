@@ -8,7 +8,7 @@ import { decodeCodeCoverage, type CodeCoverage } from "./code-cross-check-covera
 import { decodePublicationContext, validatePublicationContextRequest } from "./publication-context.js";
 import type { PublicationContextRequest, PublicationContextResponse } from "./protocol.js";
 import type { PublicationIntentRequest, PublicationIntentResult } from "./publication-intent.js";
-import type { LeadConfigReportBody } from "./protocol.js";
+import type { CodexCatalogDefaultBody, LeadConfigReportBody } from "./protocol.js";
 import { decodeCompletionPending, type CompletionPending } from "./completion-pending.js";
 import { SEMANTIC_GATE_ACK_MAX_BYTES, semanticGateAckSchema } from "./semantic-gate-wire.js";
 import { decodeInterruptedCalls, interruptedRegistration, type InterruptedRegistration, type InterruptedCalls } from "./interrupted-calls.js";
@@ -131,6 +131,7 @@ import {
   type RecoverySettleResponse,
   type BaseAttestationHoldOutcome,
   BASE_ATTESTATION_HOLD_REASON,
+  REPO_AGENT_SOURCE_HOLD_REASON,
 } from "./protocol.js";
 
 export type PlanCrossCheckGateReason = "revise" | "block" | "malformed" | "model_error" | "model_timeout"
@@ -1294,6 +1295,8 @@ type CompletionReservation = { live: boolean; tickets: Set<CompletionTicket> };
 
 /** issue #3181: the registration feature that lets a worker hold a credential switch it cannot settle. */
 export const CREDENTIAL_SWITCH_HOLD_FEATURE = "credential_switch_hold";
+/** Issue #3985: the server accepts `clarification_settled` after a human revise's clarification. */
+export const CLARIFICATION_REVISION_SETTLEMENT_FEATURE = "clarification_revision_settlement_v1";
 
 /** Issue #1324: the api accepts NEW publication intents and the typed publication-phase park. */
 const PUBLICATION_RESUME_FEATURE = "publication_resume_v1";
@@ -2749,6 +2752,16 @@ export class WorkerClient {
         throw new Error("credential switch hold report requires the credential_switch_hold feature, a registration nonce and a positive claim_generation");
       return this.reportStateOnce(runId, path, { ...body, register_nonce: nonce }, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
     }
+    if (body.status === "clarification_settled") {
+      // Issue #3985: a settlement is not an ordinary running report. It is sent once, whole, and
+      // never stripped, downgraded or re-sent as an unqualified `running` (the server refuses that
+      // for a human-revise clarification), so it bypasses every legacy strip-and-retry path.
+      if (!this.hasFeature(CLARIFICATION_REVISION_SETTLEMENT_FEATURE) ||
+          !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0 ||
+          !body.clarification_settlement)
+        throw new Error("clarification settlement requires the clarification_revision_settlement_v1 feature, a positive claim_generation and clarification_settlement");
+      return this.reportStateOnce(runId, path, body, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
+    }
     // Once a source fence is negotiated, never retry its write without that fence
     // on a rolled-back strict decoder. Initial older-API calls retain compatibility.
     if (hasRevisionSourceFields(body))
@@ -3080,6 +3093,8 @@ export class WorkerClient {
           // can recognise a SERVER-side wall park (paused + budget_exhausted) on a fenced stale ACK.
           if (fields.holdReason !== undefined)
             ack.holdReason = fields.holdReason;
+          if (fields.repoAgentSourceCommit !== undefined)
+            ack.repoAgentSourceCommit = fields.repoAgentSourceCommit;
           if (fields.budgetMaxIterations !== undefined)
             ack.budgetMaxIterations = fields.budgetMaxIterations;
           if (fields.budgetWallSeconds !== undefined)
@@ -3129,6 +3144,8 @@ export class WorkerClient {
           if (fields.credentialSwitchHeld !== undefined) ack.credentialSwitchHeld = fields.credentialSwitchHeld;
           if (fields.credentialSwitchHoldSettled !== undefined)
             ack.credentialSwitchHoldSettled = fields.credentialSwitchHoldSettled;
+          // Issue #3985: only a 200 can confirm a clarification settlement; a 409 is a refusal.
+          if (res.status === 200 && fields.clarificationSettled === true) ack.clarificationSettled = true;
           // PRD #1795 M1 (decision 5): the revision an awaiting_approval report was answered with,
           // read like contractRevision off the same single-use body (top-level, beside `run`).
           if (fields.gateRevision !== undefined) ack.gateRevision = fields.gateRevision;
@@ -4529,13 +4546,32 @@ export class WorkerClient {
       return { outcome: "unknown", detail: "no claim generation to fence the hold" };
     }
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/base-attestation-hold`;
+    return this.requestPreflightHold(path, { head: args.head, claim_generation: args.claimGeneration }, BASE_ATTESTATION_HOLD_REASON, signal);
+  }
+
+  async requestRepoAgentSourceHold(
+    runId: string,
+    args: { commit: string; claimGeneration: number },
+    signal?: AbortSignal,
+  ): Promise<BaseAttestationHoldOutcome> {
+    if (!Number.isSafeInteger(args.claimGeneration) || args.claimGeneration <= 0) {
+      return { outcome: "unknown", detail: "no claim generation to fence the hold" };
+    }
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/repo-agent-source-hold`;
+    return this.requestPreflightHold(path, { commit: args.commit, claim_generation: args.claimGeneration }, REPO_AGENT_SOURCE_HOLD_REASON, signal);
+  }
+
+  private async requestPreflightHold(
+    path: string,
+    body: Record<string, unknown>,
+    reason: string,
+    signal?: AbortSignal,
+  ): Promise<BaseAttestationHoldOutcome> {
     try {
-      const res = await this.fetchRaw(
-        "POST", path, { head: args.head, claim_generation: args.claimGeneration }, this.httpTimeoutMs, signal,
-      );
+      const res = await this.fetchRaw("POST", path, body, this.httpTimeoutMs, signal);
       if (res.status === 200) {
         const fields = await readRunAck(res);
-        if (fields.status === "paused" && fields.holdReason === BASE_ATTESTATION_HOLD_REASON) {
+        if (fields.status === "paused" && fields.holdReason === reason) {
           return { outcome: "held", status: fields.status };
         }
         return { outcome: "unknown", detail: `unexpected hold acknowledgement (status ${fields.status ?? "none"})` };
@@ -4868,6 +4904,24 @@ export class WorkerClient {
         }
         return { kind: "http", status: err.status, ...(code !== undefined ? { error: code } : {}) };
       }
+      return { kind: "transport", error: err };
+    }
+  }
+
+  // ── Codex catalog default report (issue #3251) ─────────────────────────────
+  /** POST /worker/runs/:id/codex-catalog-default (204, no body). One attempt, never throws: a
+   *  refusal (404 from an older API, 409 stale claim/context, 400) is `http`, a network failure or
+   *  timeout is `transport`. */
+  async recordCodexCatalogDefault(
+    runId: string,
+    body: CodexCatalogDefaultBody,
+    timeoutMs = 5_000,
+  ): Promise<LeadConfigPostOutcome> {
+    try {
+      await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/codex-catalog-default`, body, timeoutMs);
+      return { kind: "ok" };
+    } catch (err) {
+      if (err instanceof RequestError) return { kind: "http", status: err.status };
       return { kind: "transport", error: err };
     }
   }
@@ -5370,16 +5424,33 @@ function maintenanceSignal(timeoutMs: number): AbortSignal {
   return AbortSignal.any([budget.signal, AbortSignal.timeout(duration), ...(pending ? [pending] : [])]);
 }
 
+// Rejections of the transport (fetch) promise itself, as opposed to budget checks or body reads.
+const fetchRejections = new WeakSet<object>();
+
+function markTransportRejection<T>(p: Promise<T>, signal?: AbortSignal | null): Promise<T> {
+  return p.catch((error: unknown) => {
+    // undici rejects with `signal.reason` itself on abort; that is an abort, not a transport failure.
+    if (signal?.aborted && error === signal.reason) throw error;
+    if ((typeof error === "object" || typeof error === "function") && error !== null) fetchRejections.add(error);
+    throw error;
+  });
+}
+
+/** True only for an error object that the transport promise rejected with (identity-preserved). */
+export function isFetchRejection(error: unknown): boolean {
+  return (typeof error === "object" || typeof error === "function") && error !== null && fetchRejections.has(error);
+}
+
 async function maintenanceFetch(transport: typeof fetch, url: string, init: RequestInit): Promise<Response> {
   MaintenanceResources.consumeIfActive("rpcAttempts", 1);
   const resourceSignal = MaintenanceResources.signalIfActive();
   if (resourceSignal) init = { ...init, signal: AbortSignal.any([resourceSignal, ...(init.signal ? [init.signal] : [])]) };
   const budget = MaintenanceBudget.current();
-  if (!budget && !resourceSignal && !MaintenanceBudget.ownedSignal()) return transport(url, init);
+  if (!budget && !resourceSignal && !MaintenanceBudget.ownedSignal()) return markTransportRejection(transport(url, init), init.signal);
   if (!budget || MaintenanceBudget.ownedSignal()) {
     budget?.check();
     init.signal?.throwIfAborted();
-    const res = await transport(url, init);
+    const res = await markTransportRejection(transport(url, init), init.signal);
     if (init.signal) responseSignals.set(res, init.signal);
     ownResponse(res, init.signal);
     if (MaintenanceBudget.ownedSignal()) {
@@ -5390,7 +5461,7 @@ async function maintenanceFetch(transport: typeof fetch, url: string, init: Requ
   }
   budget.check();
   const signal = AbortSignal.any([budget.signal, ...(init.signal ? [init.signal] : [])]);
-  const res = await budget.raceIO(() => transport(url, { ...init, signal }), late => {
+  const res = await budget.raceIO(() => markTransportRejection(transport(url, { ...init, signal }), signal), late => {
     // One detached cancellation attempt; an uncooperative body cannot block the caller.
     void late.body?.cancel().catch(() => undefined);
   }, signal);
@@ -5659,6 +5730,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   memoryParkUndisposed?: boolean;
   status?: string;
   holdReason?: string | null;
+  repoAgentSourceCommit?: string;
   budgetMaxIterations?: number;
   budgetWallSeconds?: number;
   contractRevision?: number;
@@ -5678,6 +5750,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   credentialSwitchReleased?: boolean;
   credentialSwitchHeld?: boolean;
   credentialSwitchHoldSettled?: boolean;
+  clarificationSettled?: boolean;
   gateRevision?: number;
   revisionInputId?: number;
   supersededRevisionInputIds?: number[];
@@ -5710,6 +5783,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
         // PRD #1497 M2: the run's hold_reason on the RunDTO, read beside `status` to recognise a
         // SERVER-side wall park (paused + budget_exhausted) from a fenced stale-claim ACK.
         hold_reason?: unknown;
+        repo_agent_source_commit?: unknown;
         budget_max_iterations?: unknown;
         budget_wall_seconds?: unknown;
         // Issue #1626: the frozen completion-contract revision (RunDTO.completion_revision).
@@ -5753,6 +5827,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       memoryParkUndisposed?: boolean;
       status?: string;
       holdReason?: string | null;
+      repoAgentSourceCommit?: string;
       budgetMaxIterations?: number;
       budgetWallSeconds?: number;
       contractRevision?: number;
@@ -5772,6 +5847,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       credentialSwitchReleased?: boolean;
       credentialSwitchHeld?: boolean;
       credentialSwitchHoldSettled?: boolean;
+      clarificationSettled?: boolean;
       gateRevision?: number;
       revisionInputId?: number;
       supersededRevisionInputIds?: number[];
@@ -5813,6 +5889,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     // non-string (older server that omits it, a null hold, an unparseable value) leaves it absent,
     // which the ServerWallParkedError check reads as "no hold" (never a wall park).
     if (typeof run?.hold_reason === "string") out.holdReason = run.hold_reason;
+    if (typeof run?.repo_agent_source_commit === "string" && /^[0-9a-f]{40}$/.test(run.repo_agent_source_commit))
+      out.repoAgentSourceCommit = run.repo_agent_source_commit;
     if (typeof run?.budget_max_iterations === "number")
       out.budgetMaxIterations = run.budget_max_iterations;
     if (typeof run?.budget_wall_seconds === "number")
@@ -5906,6 +5984,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     // acknowledgement applied (`hold_settled`). Read only off the 200 ack, like `released`.
     if (parsed?.disposition === "held") out.credentialSwitchHeld = true;
     if (parsed?.disposition === "hold_settled") out.credentialSwitchHoldSettled = true;
+    // Issue #3985: the clarification settlement applied; read only off the 200 ack.
+    if (parsed?.disposition === "clarification_settled") out.clarificationSettled = true;
     // PRD #1795 M1 (decision 5): the gate revision an awaiting_approval report was answered with. A
     // positive integer only; anything else (absent on an older api or another report, garbled)
     // leaves it undefined, which the gate reads as "no revision confirmed" (bound verdicts wait).

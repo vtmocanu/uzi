@@ -12,6 +12,7 @@ import {
   preferForgeUrl,
   isTerminalRun,
   type Repo,
+  type AgentSource,
   type Run,
   type Worker,
 } from "../lib/api";
@@ -91,6 +92,7 @@ import {
   SwitchTokenAction,
 } from "../components/RunCredentialOverride";
 import { CredentialDisabledPanel, isCredentialDisabledHold } from "../components/CredentialDisabledPanel";
+import { CredentialsResetPanel, isCredentialsResetHold } from "../components/CredentialsResetPanel";
 import { CredentialSwitchHoldPanel } from "../components/CredentialSwitchHoldPanel";
 import { RunPriorityBadge } from "../components/RunPriorityBadge";
 import { formatDuration } from "../components/RunEvent";
@@ -502,9 +504,9 @@ export function CompletionStatePanel({ run }: { run: Run }) {
   if (run.status === "paused" && (run.hold_reason === "provider_unavailable" || run.hold_reason === "iteration_budget_exhausted")) return null;
   const phase = run.completion_phase ?? "";
   // PRD #1732: a credential_disabled hold is not a completion state; its own panel covers it.
-  // Issue #3181/#3194: token-switch and base-attestation holds have their own panels.
-  const held = run.hold_reason != null && run.hold_reason !== "credential_disabled" && run.hold_reason !== "provider_unavailable" &&
-    run.hold_reason !== "base_attestation_missing" && credentialSwitchHold(run) === null;
+  // Token-switch, base-attestation and repo-agent source holds have their own panels.
+  const held = run.hold_reason != null && run.hold_reason !== "credential_disabled" && run.hold_reason !== "credentials_reset" && run.hold_reason !== "provider_unavailable" &&
+    run.hold_reason !== "base_attestation_missing" && run.hold_reason !== "repo_agent_source_unavailable" && credentialSwitchHold(run) === null;
   if (phase === "" && !held) return null;
   const unmet = run.completion_unmet ?? [];
   const attempts = run.completion_attempts ?? 0;
@@ -983,11 +985,13 @@ export function PausedPanel({
     policyBlocksContinuation(run) ||
     run.hold_reason === "completion_blocked" ||
     run.hold_reason === "credential_disabled" ||
+    run.hold_reason === "credentials_reset" ||
     run.hold_reason === "provider_unavailable" ||
     run.hold_reason === "iteration_budget_exhausted" ||
     // Issue #3181: the token-switch holds have their own panel and Resume gating.
     credentialSwitchHold(run) !== null ||
-    run.hold_reason === "base_attestation_missing"
+    run.hold_reason === "base_attestation_missing" ||
+    run.hold_reason === "repo_agent_source_unavailable"
   )
     return null;
 
@@ -1528,12 +1532,12 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
   const evidence = recovery?.evidence;
   return (
     <div className="rounded-xl border border-warn/40 bg-warn/10 p-4">
-      <p className="text-sm font-semibold text-warn">{adoptionFailed ? "Retained recovery integrity check failed" : unwitnessed ? "Unwitnessed continuation hold needs your decision" : retained ? decisionHeld ? `${decisionName} needs your decision`
+      <p className="text-sm font-semibold text-warn">{adoptionFailed ? "Integrity hold needs your decision" : unwitnessed ? "Unwitnessed continuation hold needs your decision" : retained ? decisionHeld ? `${decisionName} needs your decision`
         : decisionRetrying ? `${decisionName} retrying` : `${decisionName} timing unknown`
         : memoryHeld ? "Worker memory pressure — waiting for owner" : "Worker recovery needs your decision"}</p>
       <p className="mt-0.5 text-xs text-muted">
         {retained ? <>
-          {adoptionFailed && "Integrity checks refused to adopt the retained work. Local work and its custody are preserved. "}
+          {adoptionFailed && "Integrity hold: retained adoption or a predecessor remediation record refused source use, so the agent did not start. Local work and its custody are preserved. "}
           {unwitnessed && "The continuation was never confirmed to start, so the claim was released. Local work and its custody are kept. "}
           {decisionHeld
             ? "This hold has no scheduled retry. Only the run owner can Resume or Cancel."
@@ -1548,6 +1552,9 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
         {memoryHeld && " Only the run owner can resume or cancel this run."}{" "}
         This hold has no scheduled retry. Credential changes, messages and capture expiry do not release it.</>}
       </p>
+      {adoptionFailed && <p className="mt-1.5 text-xs text-warn">
+        Resume starts another recovery episode. If the underlying block persists, the run can hold again. Each new claim adds a custody hold. Resolve the cause before resuming.
+      </p>}
       {idleStall && <p className="mt-1.5 text-xs text-muted">Resume starts a fresh wall and resets the idle-stall count. Cancel ends this run. Resume requests an attempt; success is not assured.</p>}
       {!retained && <p className="mt-1.5 text-xs text-muted">
         {memoryHeld
@@ -1639,6 +1646,21 @@ function ProviderHoldPanel({ run, ownerProof, busy, onResume, onStop, onCancel }
       <Button size="sm" disabled={busy || unavailable !== null} onClick={onStop}>Stop completed work</Button>
       <Button size="sm" variant="danger" disabled={busy} onClick={onCancel}>Cancel</Button>
     </div> : <p className="mt-2 text-xs text-muted">Only the confirmed run owner can Resume, Stop or Cancel.</p>}
+  </Card>;
+}
+
+function RepoAgentSourceHoldPanel({ run, ownerProof, busy, onResume, onCancel }: {
+  run: Run; ownerProof: boolean; busy: boolean; onResume: () => void; onCancel: () => void;
+}) {
+  if (run.status !== "paused" || run.hold_reason !== "repo_agent_source_unavailable") return null;
+  return <Card className="p-4">
+    <h2 className="text-sm font-semibold text-warn">Repo agents unreadable: waiting for owner</h2>
+    <p className="mt-1 text-xs text-muted">The worker could not read the repository's agent definitions at the required revision. The agent was not started.</p>
+    <p className="mt-1 text-xs text-muted">Check repository access and its default branch, then Resume when the revision is available, or Cancel. This run does not resume automatically.</p>
+    {ownerProof ? <div className="mt-3 flex gap-2">
+      <Button size="sm" disabled={busy} onClick={onResume}>Resume</Button>
+      <Button size="sm" variant="danger" disabled={busy} onClick={onCancel}>Cancel</Button>
+    </div> : <p className="mt-2 text-xs text-muted">Only the run owner can Resume or Cancel this hold.</p>}
   </Card>;
 }
 
@@ -2482,12 +2504,16 @@ export function RunView() {
               ? "provider_unavailable"
             : run?.status === "paused" && run.hold_reason === "credential_disabled"
               ? "credential_disabled"
+            : run?.status === "paused" && run.hold_reason === "credentials_reset"
+              ? "credentials_reset"
             : run?.status === "paused" && run.hold_reason === "credential_switch_settling"
               ? "credential_switch_settling"
             : run?.status === "paused" && run.hold_reason === "credential_switch_unsettled"
               ? "credential_switch_unsettled"
             : run?.status === "paused" && run.hold_reason === "base_attestation_missing"
               ? "base_attestation_missing"
+            : run?.status === "paused" && run.hold_reason === "repo_agent_source_unavailable"
+              ? "repo_agent_source_unavailable"
             : run?.status === "paused"
               ? "paused"
             : "";
@@ -2507,7 +2533,7 @@ export function RunView() {
         : parkKey === "pool_wait"
           ? "The run is waiting for a pooled Anthropic token. Add a token to the pool and it resumes automatically."
           : parkKey === "retained_recovery_adoption_failed"
-            ? "Integrity checks refused to adopt the retained work. Local work and its custody are preserved. Only the run owner can Resume or Cancel. There is no scheduled retry."
+            ? "Integrity hold: retained adoption or a predecessor remediation record refused source use, so the agent did not start. Local work and its custody are preserved. Only the run owner can Resume or Cancel. There is no scheduled retry."
           : parkKey === "retained_continuation_unwitnessed"
             ? "The continuation was never confirmed to start, so the claim was released. Local work and its custody are kept. Only the run owner can Resume or Cancel. There is no scheduled retry."
           : parkKey === "codex_idle_stall_held"
@@ -2546,8 +2572,12 @@ export function RunView() {
               ? codexHoldCopy(parkKey.slice("codex:".length) || null, "").announce
             : parkKey === "credential_disabled"
               ? "The run is waiting because a credential it needs is disabled. Enable it and the run resumes automatically."
+            : parkKey === "credentials_reset"
+              ? "The run is waiting because your account's credentials were reset. Add a credential in Settings and the run resumes automatically."
             : parkKey === "base_attestation_missing"
               ? "The run is held because its retained work is not attested to the planned base commit. The agent was not started. Recover the work or start a successor run."
+            : parkKey === "repo_agent_source_unavailable"
+              ? "The repository's agent definitions could not be read. The agent was not started. Only the run owner can Resume when the revision is available, or Cancel. There is no automatic retry."
             : parkKey === "iteration_budget_exhausted:spent"
               ? "Iteration limit reached. The remaining wall budget is spent. Extend time, then explicitly Resume, or Cancel. Extend leaves the run paused."
             : parkKey === "iteration_budget_exhausted"
@@ -2627,7 +2657,7 @@ export function RunView() {
         actionsBesideTitle
         actions={<div className="relative flex flex-wrap items-center gap-2">
           <RunSettingsDisclosure>
-            {!policyBlocked && !isCredentialDisabledHold(run) && !(run.status === "awaiting_approval" && changedMilestones(run)) && (
+            {!policyBlocked && !isCredentialDisabledHold(run) && !isCredentialsResetHold(run) && !(run.status === "awaiting_approval" && changedMilestones(run)) && (
               <SwitchTokenAction run={run} canSteer={canSteer} onSwitched={refreshRun} />
             )}
             <CredentialEpochList epochs={run.credential_epochs} />
@@ -2748,6 +2778,9 @@ export function RunView() {
                 // PRD #1732: a credential_disabled hold resumes on Enable (its panel), and a
                 // plain Resume would only park it again.
                 run.hold_reason !== "credential_disabled" &&
+                // PRD #3989 M3: the server refuses Resume (409) for a credentials_reset hold; it
+                // resumes on its own once a credential is added.
+                run.hold_reason !== "credentials_reset" &&
                 run.hold_reason !== "provider_unavailable" &&
                 run.hold_reason !== "iteration_budget_exhausted" &&
                 // Issue #3181: the token-switch holds offer Resume in their own panel, which
@@ -2755,6 +2788,7 @@ export function RunView() {
                 credentialSwitchHold(run) === null &&
                 // Issue #3194: Resume is refused by the server for a base-attestation hold.
                 run.hold_reason !== "base_attestation_missing" &&
+                run.hold_reason !== "repo_agent_source_unavailable" &&
                 (canSteer ? (
                   <Button
                     size="sm"
@@ -3087,6 +3121,8 @@ export function RunView() {
         }}
       />
 
+      <CredentialsResetPanel run={run} canSteer={canSteer} />
+
       <IterationHoldPanel run={run} ownerProof={canSteer && run.id === id} busy={busy}
         onResume={() => act(async (isCurrent) => {
           if (!canSteer || run.id !== id) return;
@@ -3155,6 +3191,12 @@ export function RunView() {
         onCancel={() => cancelRun()}
       />
       <BaseAttestationHoldPanel run={run} ownerProof={canSteer && run.id === id} busy={busy} onCancel={() => cancelRun()} />
+      <RepoAgentSourceHoldPanel run={run} ownerProof={canSteer && run.id === id} busy={busy}
+        onResume={() => { void act(async (isCurrent) => {
+          await api.resumeRun(run.id);
+          if (isCurrent()) await refreshRun();
+        }); }}
+        onCancel={() => { void cancelRun(); }} />
       <PausedPanel
         run={run}
         origin={pauseOrigin(run, messages, pauseOriginReady)}
@@ -3663,6 +3705,7 @@ export function AgentRosterSummary({ run }: { run: Run }) {
   // missing roster, so it keeps its definitive copy.
   const repoRosterPending =
     run.plan_source === "seeded" && run.agent_source === "repo" && roster.length === 0;
+  const request = agentSourceRequestLine(run);
   return (
     <Card className="space-y-2 p-4">
       <h2 className="text-xs font-semibold uppercase tracking-wider text-faint">
@@ -3697,6 +3740,36 @@ export function AgentRosterSummary({ run }: { run: Run }) {
         </div>
       )}
       {excluded.size > 0 && <p className="text-xs text-faint">Excluded: {[...excluded].join(", ")}</p>}
+      {request && <p className="text-xs text-faint">{request}</p>}
+      {run.repo_agent_source_commit && (
+        <p className="text-xs text-faint">
+          Repo agents read at default-branch revision{" "}
+          <code title={run.repo_agent_source_commit} className="font-mono">
+            {run.repo_agent_source_commit.slice(0, 12)}
+          </code>
+        </p>
+      )}
     </Card>
   );
+}
+
+const AGENT_SOURCE_RUN_LABELS: Record<AgentSource, string> = { own: "my templates", repo: "repo agents" };
+
+function agentSourceRequestLine(
+  run: Pick<Run, "agent_source" | "agent_source_requested" | "agent_source_requested_basis" | "plan_agent_source">,
+): string | null {
+  const requested = run.agent_source_requested;
+  if (!requested || !run.agent_source) return null;
+  const basis = run.agent_source_requested_basis === "repo_default" ? "repo default" : "this run";
+  const planned = run.plan_agent_source;
+  const parts: string[] = [];
+  if (planned === requested) {
+    parts.push(`Planned with: ${AGENT_SOURCE_RUN_LABELS[planned]} (${basis})`);
+  } else {
+    parts.push(`Requested: ${AGENT_SOURCE_RUN_LABELS[requested]} (${basis})`);
+    parts.push(`Planned with: ${planned ? AGENT_SOURCE_RUN_LABELS[planned] : "—"}`);
+  }
+  const outcome = run.agent_source === requested ? "as requested" : "changed at approval";
+  parts.push(`Implemented with: ${AGENT_SOURCE_RUN_LABELS[run.agent_source]} (${outcome})`);
+  return parts.join(" · ");
 }

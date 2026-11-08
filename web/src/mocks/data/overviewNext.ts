@@ -1,4 +1,4 @@
-import type { Run, Worker } from "../../lib/api";
+import type { Run, RunMessage, Worker } from "../../lib/api";
 import { minsAgo, minsAhead } from "./time";
 import { mockRuns } from "./runs";
 import { mockWorkers } from "./workers";
@@ -16,6 +16,8 @@ import { mockOtherUserRuns } from "./runHistories";
 //     account-cooldown and ci_fix runs below, every stage of the line holds at least one run.
 //   - One of the viewer's OWN completed issue runs whose open MR shares repo_id + mr_iid with
 //     run-ci-halted, so the pull-request list has a duplicate to collapse.
+//   - One of the viewer's OWN runs waiting on a question (PRD #4040, the mock's #409), whose
+//     pending-question excerpt the owner run list carries (overviewNextPendingQuestions).
 
 const template = mockOtherUserRuns[0];
 
@@ -164,7 +166,46 @@ const ownDuplicateMrRun: Run = {
   finished_at: minsAgo(30),
 };
 
-export const overviewNextRuns: Run[] = [...otherRuns, ...ownLineRuns, ownDuplicateMrRun];
+// PRD #4040: the viewer's own run asking a question, #409 in the design mock.
+const OWN_ASKING_QUESTION = "Should the cap count exports that are still queued?";
+const ownAskingRun: Run = ownRun({
+  id: "run-ov-own-asking",
+  issue_iid: 409,
+  issue_title: "Let admins cap concurrent exports per tenant",
+  status: "awaiting_input",
+  status_since: minsAgo(25),
+  worker_id: mockWorkers[0].id,
+  claimed_at: minsAgo(50),
+  started_at: minsAgo(50),
+});
+
+// The question message behind it, in the shape the worker emits (question_id + questions).
+export const overviewNextOwnAskingMessages: RunMessage[] = [
+  { seq: 1, kind: "status", agent: null, agent_instance: null, agent_label: null, payload: { event: "init", model: "claude-sonnet-4-6" }, created_at: minsAgo(50) },
+  {
+    seq: 2,
+    kind: "question",
+    agent: "lead",
+    agent_instance: null,
+    agent_label: null,
+    payload: {
+      question_id: "q-ov-own-asking",
+      questions: [{ question: OWN_ASKING_QUESTION, header: "Queued exports" }],
+    },
+    created_at: minsAgo(25),
+  },
+];
+
+// PRD #4040: the static seed the mock's owner run list (mockListRuns) reads for
+// `pending_question`, standing in for the server's excerpt of the newest question message. It
+// applies only to the caller's own awaiting_input rows, and the admin list never sets it.
+// run-unreadable-question has no entry on purpose: its question payload is malformed, and the
+// server gives a malformed payload no excerpt.
+export const overviewNextPendingQuestions: Readonly<Record<string, string>> = {
+  [ownAskingRun.id]: OWN_ASKING_QUESTION,
+};
+
+export const overviewNextRuns: Run[] = [...otherRuns, ...ownLineRuns, ownDuplicateMrRun, ownAskingRun];
 
 // The owner fleet for the Capacity rail (PRD #3880 M1): full, draining mid-roll, manually
 // cordoned, offline, with no advertised cap and with no stats. Replaces the default seeded

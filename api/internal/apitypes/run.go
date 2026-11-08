@@ -464,6 +464,7 @@ type RunDTO struct {
 	// for a completion hold (PRD #1226), 'budget_exhausted' for a wall-clock park (PRD #1497),
 	// 'iteration_budget_exhausted' for an iteration park (Resume/Cancel; Extend adds time only),
 	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14),
+	// 'credentials_reset' while a run created before an account reset waits for a new credential (PRD #3989),
 	// 'credential_switch_settling' while the worker is still finishing its own operations on a run whose
 	// token switch could not be proven settled (Resume is refused until it finishes; Cancel works),
 	// 'credential_switch_unsettled' once it finished them, processes not proven stopped (Resume is open) (issue
@@ -752,9 +753,13 @@ type RunDTO struct {
 	// The names and descriptions here are REPO-SUPPLIED text. The gate panel
 	// renders them as plain JSX, never through <Markdown>: an attacker-authored
 	// description must not put a clickable link inside an approval dialog.
-	RepoAgents      []RepoAgent `json:"repo_agents"`
-	AgentSource     *string     `json:"agent_source"`
-	AgentExclusions []string    `json:"agent_exclusions"`
+	RepoAgents                []RepoAgent `json:"repo_agents"`
+	RepoAgentSourceCommit     *string     `json:"repo_agent_source_commit"`
+	AgentSource               *string     `json:"agent_source"`
+	AgentExclusions           []string    `json:"agent_exclusions"`
+	AgentSourceRequested      *string     `json:"agent_source_requested"`
+	AgentSourceRequestedBasis *string     `json:"agent_source_requested_basis"`
+	PlanAgentSource           *string     `json:"plan_agent_source"`
 	// OwnAgents is the OWN-source subagent roster (name + description) the run's
 	// owner would run: exactly what ListClaimAgentTemplates delivers to a claim,
 	// minus the lead. It is the single source of truth the plan-gate "My agent
@@ -916,8 +921,10 @@ type RunDTO struct {
 	// "provider_outage" is active: a typed provider-transient retry park (PRD #1733).
 	// "worker_requeue_exhausted" and "worker_memory_pressure" require owner action.
 	// "retained_recovery_exhausted" can be timed or owner-held; see RecoveryRetryNotBefore.
-	// "retained_recovery_adoption_failed" is an integrity refusal: retained local work and
-	// custody are preserved, and only the owner can Resume or Cancel, without automatic retry.
+	// "retained_recovery_adoption_failed" is an integrity hold: retained adoption or a
+	// predecessor remediation record refused source use (in the remediation case the agent did
+	// not start and nothing was adopted or touched). Local work and custody are preserved, and
+	// only the owner can Resume or Cancel, without automatic retry.
 	// "retained_continuation_unwitnessed" is a claimed-never-started park whose retained custody
 	// continuation was never witnessed starting: the claim is released, retained work and custody
 	// are preserved, and only the owner can Resume or Cancel, without automatic retry.
@@ -1386,6 +1393,7 @@ type RunSummaryItemDTO struct {
 	// for a completion hold (PRD #1226), 'budget_exhausted' for a wall-clock park (PRD #1497),
 	// 'iteration_budget_exhausted' for an iteration park (Resume/Cancel; Extend adds time only),
 	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14),
+	// 'credentials_reset' while a run created before an account reset waits for a new credential (PRD #3989),
 	// 'credential_switch_settling' while the worker is still finishing its own operations on a run whose
 	// token switch could not be proven settled (Resume is refused until it finishes; Cancel works),
 	// 'credential_switch_unsettled' once it finished them, processes not proven stopped (Resume is open) (issue
@@ -1650,8 +1658,11 @@ type RunSummaryItemDTO struct {
 	// Per-run agent selection (PRD #37). The detected repo_agents roster is a detail field and is
 	// omitted from this summary; see RunDTO.RepoAgents. AgentSource/AgentExclusions stay null
 	// until a selection is made, at the gate or by an autopilot run's self-resolved default.
-	AgentSource     *string  `json:"agent_source"`
-	AgentExclusions []string `json:"agent_exclusions"`
+	AgentSource               *string  `json:"agent_source"`
+	AgentExclusions           []string `json:"agent_exclusions"`
+	AgentSourceRequested      *string  `json:"agent_source_requested"`
+	AgentSourceRequestedBasis *string  `json:"agent_source_requested_basis"`
+	PlanAgentSource           *string  `json:"plan_agent_source"`
 	// OwnAgents is the OWN-source subagent roster (name + description) the run's
 	// owner would run: exactly what ListClaimAgentTemplates delivers to a claim,
 	// minus the lead. It is the single source of truth the plan-gate "My agent
@@ -1813,8 +1824,10 @@ type RunSummaryItemDTO struct {
 	// "provider_outage" is active: a typed provider-transient retry park (PRD #1733).
 	// "worker_requeue_exhausted" and "worker_memory_pressure" require owner action.
 	// "retained_recovery_exhausted" can be timed or owner-held; see RecoveryRetryNotBefore.
-	// "retained_recovery_adoption_failed" is an integrity refusal: retained local work and
-	// custody are preserved, and only the owner can Resume or Cancel, without automatic retry.
+	// "retained_recovery_adoption_failed" is an integrity hold: retained adoption or a
+	// predecessor remediation record refused source use (in the remediation case the agent did
+	// not start and nothing was adopted or touched). Local work and custody are preserved, and
+	// only the owner can Resume or Cancel, without automatic retry.
 	// "retained_continuation_unwitnessed" is a claimed-never-started park whose retained custody
 	// continuation was never witnessed starting: the claim is released, retained work and custody
 	// are preserved, and only the owner can Resume or Cancel, without automatic retry.
@@ -2015,6 +2028,8 @@ type RunSummaryItemDTO struct {
 	JudgeVerdict   *string `json:"judge_verdict"`
 	JudgeTodoCount int     `json:"judge_todo_count"`
 	IsRevising     bool    `json:"is_revising"`
+	// PendingQuestion mirrors RunListItemDTO.PendingQuestion (PRD #4040).
+	PendingQuestion string `json:"pending_question,omitempty"`
 }
 
 // RunSummaryOf projects a decorated list row onto the compact summary view (issue #2661). The
@@ -2138,6 +2153,9 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		StatusSince:                   item.StatusSince,
 		AgentSource:                   item.AgentSource,
 		AgentExclusions:               item.AgentExclusions,
+		AgentSourceRequested:          item.AgentSourceRequested,
+		AgentSourceRequestedBasis:     item.AgentSourceRequestedBasis,
+		PlanAgentSource:               item.PlanAgentSource,
 		OwnAgents:                     item.OwnAgents,
 		AnthropicSecretID:             item.AnthropicSecretID,
 		AnthropicSecretLabel:          item.AnthropicSecretLabel,
@@ -2197,6 +2215,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		JudgeVerdict:                  item.JudgeVerdict,
 		JudgeTodoCount:                item.JudgeTodoCount,
 		IsRevising:                    item.IsRevising,
+		PendingQuestion:               item.PendingQuestion,
 		CodeCrossCheckRequired:        item.CodeCrossCheckRequired,
 		CodeCrossCheckSummary:         item.CodeCrossCheckSummary,
 		AccountCooldownClass:          item.AccountCooldownClass,
@@ -2326,6 +2345,9 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			StatusSince:                   s.StatusSince,
 			AgentSource:                   s.AgentSource,
 			AgentExclusions:               s.AgentExclusions,
+			AgentSourceRequested:          s.AgentSourceRequested,
+			AgentSourceRequestedBasis:     s.AgentSourceRequestedBasis,
+			PlanAgentSource:               s.PlanAgentSource,
 			OwnAgents:                     s.OwnAgents,
 			AnthropicSecretID:             s.AnthropicSecretID,
 			AnthropicSecretLabel:          s.AnthropicSecretLabel,
@@ -2385,11 +2407,12 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			AccountCooldownClass:          s.AccountCooldownClass,
 			AccountCooldownEligibleAt:     s.AccountCooldownEligibleAt,
 		},
-		RepoPath:       s.RepoPath,
-		WorkerName:     s.WorkerName,
-		OwnerEmail:     s.OwnerEmail,
-		JudgeVerdict:   s.JudgeVerdict,
-		JudgeTodoCount: s.JudgeTodoCount,
+		RepoPath:        s.RepoPath,
+		WorkerName:      s.WorkerName,
+		OwnerEmail:      s.OwnerEmail,
+		JudgeVerdict:    s.JudgeVerdict,
+		JudgeTodoCount:  s.JudgeTodoCount,
+		PendingQuestion: s.PendingQuestion,
 	}
 }
 
@@ -2421,6 +2444,10 @@ type RunListItemDTO struct {
 	// bucketed in Go. See queries/runtime.sql for why the count cannot ride the join.
 	JudgeVerdict   *string `json:"judge_verdict"`
 	JudgeTodoCount int     `json:"judge_todo_count"`
+	// PendingQuestion is the one-line excerpt of the run's newest pending question (PRD
+	// #4040), runquestion.Excerpt of the question message. Owner-only: ListRuns sets it for
+	// awaiting_input rows; the admin list never carries it. Omitted when absent.
+	PendingQuestion string `json:"pending_question,omitempty"`
 }
 
 // MessageDTO is one persisted run message (the replay source a reconnecting
@@ -2658,17 +2685,19 @@ func (r *RunListItemDTO) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	var context struct {
-		RepoPath       string  `json:"repo_path"`
-		WorkerName     *string `json:"worker_name"`
-		OwnerEmail     *string `json:"owner_email"`
-		JudgeVerdict   *string `json:"judge_verdict"`
-		JudgeTodoCount int     `json:"judge_todo_count"`
+		RepoPath        string  `json:"repo_path"`
+		WorkerName      *string `json:"worker_name"`
+		OwnerEmail      *string `json:"owner_email"`
+		JudgeVerdict    *string `json:"judge_verdict"`
+		JudgeTodoCount  int     `json:"judge_todo_count"`
+		PendingQuestion string  `json:"pending_question"`
 	}
 	if err := json.Unmarshal(data, &context); err != nil {
 		return err
 	}
 	*r = RunListItemDTO{RunDTO: run, RepoPath: context.RepoPath, WorkerName: context.WorkerName,
-		OwnerEmail: context.OwnerEmail, JudgeVerdict: context.JudgeVerdict, JudgeTodoCount: context.JudgeTodoCount}
+		OwnerEmail: context.OwnerEmail, JudgeVerdict: context.JudgeVerdict, JudgeTodoCount: context.JudgeTodoCount,
+		PendingQuestion: context.PendingQuestion}
 	return nil
 }
 

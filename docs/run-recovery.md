@@ -581,7 +581,9 @@ reservation count. Owner Resume of `worker_requeue_exhausted` and bounded
 `retained_recovery_exhausted` retries can also renew: a fresh generation and
 higher derived episode charge one of three reservations in a new five-minute
 window and clear only `budget_exhausted`. The default three timed parks are
-followed by an owner hold; Resume preserves that count. Timer promotion resets
+followed by an owner hold; Resume preserves that count. A window refused
+only for data-volume capacity is held for the owner without consuming a counted retained park.
+Timer promotion resets
 the run wall, while manual Resume preserves remaining wall budget and may need
 an owner extension. Other requeues, disk retries, memory-pressure Resume or a
 new claim alone do not renew. See
@@ -593,6 +595,9 @@ retained recovery keep same-path continuity.
 
 A confirmed `adoption_failed` blocker can instead hold at `recovery_wait` /
 `retained_recovery_adoption_failed` for owner Resume or Cancel, with no timer.
+A temporary API connection failure of the ownership check after the successor
+is verified is retried in place first; see
+[Retained recovery adoption failed](run-recovery-wait.md#retained-recovery-adoption-failed).
 A retained continuation whose `running` report the server refuses, and whose
 flight departed or showed presence without a witnessed departure, is charged
 against the requeue budget or held at `retained_continuation_unwitnessed`
@@ -605,6 +610,21 @@ repeated adoption failure reholds. Quiescence and verification before model
 execution remain required, including an exact `ready-for-model` handoff. See
 [Retained recovery adoption failed](./run-recovery-wait.md#retained-recovery-adoption-failed)
 and the [ADR-1197 #3527 amendment](../adr/1197-transient-recovery-park.md#amendment-2026-10-27-3527-owner-held-retained-adoption-retry).
+
+An owner **Pause now** delivered while a retained re-claim is recovering
+(`recoverRetainedClaim`, before any model turn) is only recorded, like a pause
+pending at claim time; it no longer stops recovery. A successful park spends
+no requeue; a refused park (`pause_failed`) still leaves the run for the normal
+requeue path. When
+recovery returns and no stronger control (cancel, credential switch, wall,
+fence, worker shutdown) is pending, the run parks through the ordinary
+checkpoint-first owner pause, before any planning turn or provider call. If
+recovery fails or holds first, that outcome wins and a `recovery_wait` hold
+leaves the request pending. A publication-only retained claim keeps its
+immediate stop. When recovery is stopped, the worker's HOME-preservation log
+says "retained recovery stopped" (naming a pending owner pause) instead of
+"run interrupted by worker shutdown". See the
+[ADR-1190 #3995 amendment](../adr/1190-run-pause-invariants.md#amendment-2026-11-06--3995-owner-pause-during-retained-recovery).
 
 Other permanent blockers, or exhaustion without both durable journal confirmation
 and API support, end the run **failed** with custody kept,
@@ -625,7 +645,8 @@ usage (and the projected usage when it was computed). The refusal is not a disk
 park and spends one of the same three reservations; the worker runs one reclaim
 pass and re-checks before refusing. If the volume stays full, the iterations end
 in the existing retained-recovery park, whose automatic retries stop for owner
-Resume once the retained-park allowance is spent. The
+Resume once the retained-park allowance is spent, or at once, uncounted, when
+every reservation in the window was refused for data volume capacity. The
 projection is an estimate and applies only when the API supports both the disk
 and retained-recovery park causes. The check has no off switch: setting
 `UZI_DISK_HARD_STOP_ENABLED=false` disables the hard governor's stops but not
@@ -963,7 +984,9 @@ needs all of the following.
   serves park-observed records in `paused`, `recovery_wait` or `limit_wait`) can pass
   any of four grants, and the #2969 retained-claim caller passes only grants 1 and 4
   (it runs while the run still executes, so it captures without minting; the mint
-  comes from the later frozen pass):
+  comes from the later frozen pass; that retained-claim path does not yet settle older
+  generations' holds in production, see
+  [Automatic settlement of an older held generation](#automatic-settlement-of-an-older-held-generation)):
   (1) a missing v2 metadata record; (2) a proven held-publication ineligibility;
   (3) a held-publication fallback in the same pass that the server explicitly
   refused (a 409, 413 or 422 with a bounded reason, a 200 `create_refused`, or a
@@ -1540,6 +1563,11 @@ locally (no journal record for the generation, no retained pin or clone of
 the run); on any doubt the hold stays open. The API accepts that release for
 a parked run only for a `forge_unreachable` park and only for the settled
 `forge_no_output` class. A parked run that adopted source keeps its hold.
+The same release closes the hold of a generation held as **repo agents
+unreadable** (`repo_agent_source_unavailable`) right after its fetch, before
+any clone was seeded, because its default branch had no resolvable commit. The
+run stays paused for its owner. The API accepts it only for that hold on a run
+with no recorded repo-agent revision.
 
 A dirty or unverified source, or an unproven process boundary, retains the
 clone and hold, reports **Needs action**, and uses bounded retries. Boot
@@ -1940,6 +1968,26 @@ reclaimed, or moved in the meantime keeps the hold. An older generation taken
 by a *different* worker is never settled this way; it waits for you or for the
 completed-run check above.
 
+**Known limits.** A retained re-claim, which starts a later generation while an
+older generation's guarded (inventory) hold is still open, does not yet settle that
+older hold in production. The code exists but is switched off until a proof that no
+leftover command-user process can still write into the older clone is built, so
+those holds stay open and counted toward the admission limit exactly as before.
+To resolve one, first preserve its work with `uzi run export` (export saves the
+evidence but does not settle the hold), then apply a separately authorized
+disposition such as `uzi run discard`. The worker logs `command_uid_unproven` when
+it skips. Enabling the pass will require a separately reviewed proof contract, not
+just removing the switch. The quiescence check used before an ordinary terminal
+inventory FINAL has the same blind spot for command-user processes; it is a known
+gap, not yet closed.
+
+Even once enabled, the pass carries an accepted residual: the scoped quiescence scan
+does not see an unmarked process running outside the clone, so writes such a
+process makes after the last proof can be missing from the archive even though the
+hold is released. This is a disclosed limit, separate from the command-user gap that
+keeps the pass switched off. See the
+[ADR-1296 amendment](../adr/1296-durable-run-recovery.md#amendment-2969-predecessor-guarded-hold-settlement-is-built-and-disabled-in-production).
+
 ## Reviewing and resolving held work
 
 Once the **admission-counted holds per owner** limit (the *Admission-counted
@@ -2146,6 +2194,7 @@ owner/path pair changed or the re-admission bound of 2 was passed),
 `completion_pending`, `completion_preflight_retained`, `completion_uncertain`,
 `authority_busy` (the authority lock wait ran out), `published_source_retained`
 (a fenced journal with retained sources was kept, never detached),
+`remediation_retained` (the predecessor's source is held under secret-scan remediation; see below),
 `completion_unverified`, `completion_unsupported`, or `unknown`. It carries no
 error text or paths. IDs are UUID strings
 or `invalid`; path shape is `canonical`, `attempt`, or `unknown`. The fingerprint
@@ -2162,6 +2211,22 @@ it does not establish the cause of the historical refusal in
 [issue #1848](https://github.com/vtmocanu/uzi/issues/1848): the supplied report
 lacked the deployed worker revision, classification request status, and
 underlying retirement error.
+
+A successor run can reclaim an orphaned attempt whose predecessor is terminal (for example
+cancelled) while the predecessor's source is held under secret-scan remediation. The worker then
+does not start the agent and touches nothing of the predecessor. It emits `orphan_reclaim_refused`
+with `remediation_retained`, sends a status message naming only the predecessor run id, and parks the
+run for you at `recovery_wait` / `retained_recovery_adoption_failed`. The message says the agent did not
+start and the source requires review. **Resume** on this worker holds again and adds at least one
+admission-counted custody hold; **Cancel** ends the run and leaves its open holds for you to discard.
+Run `uzi run recovery <predecessor-run-id>` to inspect the predecessor. Resume grants no remediation
+authority, and this page names no route that disposes of the remediation. While held or queued, the
+run's holds count toward your [custody admission limit](admin-settings.md) (`custody_hold_limit`), and a
+held run blocks its worker's upgrade or drain. If the api does not support the park, the worker does not
+park and the message says so; the run is then handled by the ordinary requeue paths. A worker restart
+consumes a requeue, so repeated restarts end at `recovery_wait` / `worker_requeue_exhausted`,
+unless the run's own open holds reach the custody admission limit first; it then stays queued for
+capacity (not an owner park) until it can be claimed again.
 
 ### Retained sources with no open hold (worker-local inspect and discard)
 
@@ -2680,7 +2745,7 @@ Subsequent #2852 C adds exact post-disposal registered-process proof for positiv
 sources; the accepted limit still applies to writers outside that boundary.
 
 This extension adds no model-free blocked/orphan producer (#3031),
-live-predecessor widening (#2969), writer design (#2852), plan-rejection
+live-predecessor widening (#2969, built but disabled in production), writer design (#2852), plan-rejection
 producer/discard policy (#2884), zero-write fast path or workflow-file editing
 authority. Full-root/WIP coverage, non-ignored untracked work, secret and
 workflow guards remain required; it adds no holdless kinds or model reopening.

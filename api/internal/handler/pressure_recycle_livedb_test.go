@@ -58,7 +58,7 @@ func TestPressureRecycleRouteClaimsLiveDB(t *testing.T) {
 		}
 		return data
 	}
-	raw := assertCall("POST", "/api/worker/register", workerKey, `{"name":"pressure-worker","version":"0.1.0","template":"base"}`, 200)
+	raw := assertCall("POST", "/api/worker/register", workerKey, `{"name":"pressure-worker","version":"0.1.0","template":"base","protocol_capabilities":["repo_agent_source_v1"]}`, 200)
 	var reg struct {
 		Nonce string `json:"register_nonce"`
 	}

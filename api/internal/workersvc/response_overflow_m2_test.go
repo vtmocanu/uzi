@@ -35,9 +35,9 @@ func TestM2RunOriginsResponseOverflow(t *testing.T) {
 				svc.SetForges(&fakeForges{f: &fakeForge{getIssueErr: source}})
 				var err error
 				if origin == "composite" {
-					_, err = svc.StartRunForUser(context.Background(), uuid.New(), uuid.New(), 4, nil, nil, false, nil, nil, nil)
+					_, err = svc.StartRunForUser(context.Background(), uuid.New(), uuid.New(), 4, nil, nil, false, nil, nil, nil, nil)
 				} else {
-					_, err = svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "body", nil, nil, false, nil, nil, nil)
+					_, err = svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "body", nil, nil, false, nil, nil, nil, nil)
 				}
 				if overflow {
 					var got *forge.ResponseTooLargeError

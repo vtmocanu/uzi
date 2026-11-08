@@ -116,6 +116,7 @@
     "default_model": "sonnet",
     "default_model_source": "schedule_pin",
     "default_effort_source": "user_default",
+    "codex_catalog_context": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     "attribution_enabled": true,
     "skill_max_bytes": 65536,
     "skills_max_per_run": 32,

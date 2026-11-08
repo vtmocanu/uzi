@@ -101,7 +101,7 @@ func TestChatRunsLiveDB(t *testing.T) {
 	}
 	worker := createWorker(ctx, t, pool, userID)
 	claimParams := func() store.ClaimRunParams {
-		return store.ClaimRunParams{WorkerID: pgtype.UUID{Bytes: worker, Valid: true}, UserID: userID, AffinityCutoff: pgtype.Timestamptz{Time: time.Now().Add(-2 * time.Minute), Valid: true}}
+		return store.ClaimRunParams{WorkerID: pgtype.UUID{Bytes: worker, Valid: true}, UserID: userID, AffinityCutoff: pgtype.Timestamptz{Time: time.Now().Add(-2 * time.Minute), Valid: true}, WorkerProtocolCaps: []string{"repo_agent_source_v1"}}
 	}
 	// The RUN lane claims the issue run, NEVER the chat run.
 	claimedRun, err := q.ClaimRun(ctx, claimParams())

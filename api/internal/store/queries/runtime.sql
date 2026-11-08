@@ -668,10 +668,14 @@ WHERE status = 'online'
 -- query's own "name every column" convention so an unstamped path is visible in a diff
 -- of THIS file, and guarded by a per-path test rather than the compiler (the narg trap
 -- above applies identically).
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, issue_saved_body, issue_raw_digest, issue_input_reason, auto_approve_blocked_reasons, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, completion_contract_version, harness, credential_override_mode, credential_override_secret_id, plan_cross_check_required, plan_cross_check_gated, code_cross_check_required)
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, issue_saved_body, issue_raw_digest, issue_input_reason, auto_approve_blocked_reasons, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, completion_contract_version, harness, credential_override_mode, credential_override_secret_id, plan_cross_check_required, plan_cross_check_gated, code_cross_check_required, repo_agent_source_required, agent_source_requested, agent_source_requested_basis)
 VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('issue_saved_body'), sqlc.narg('issue_raw_digest'), sqlc.narg('issue_input_reason'), COALESCE(sqlc.narg('auto_approve_blocked_reasons')::text[], '{}'), sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), COALESCE((SELECT rp.ignored_inferred_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source, sqlc.narg('completion_contract_version'), @harness, sqlc.narg('credential_override_mode'), sqlc.narg('credential_override_secret_id'),
     (@auto_approve AND @plan_source <> 'seeded' AND COALESCE(sqlc.narg('captured_plan_cross_check')::boolean, (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id))),
-    (NOT @auto_approve AND @plan_source <> 'seeded' AND COALESCE(sqlc.narg('captured_plan_cross_check')::boolean, (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id))), COALESCE(sqlc.narg('captured_code_cross_check')::boolean, (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id)))
+    (NOT @auto_approve AND @plan_source <> 'seeded' AND COALESCE(sqlc.narg('captured_plan_cross_check')::boolean, (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id))), COALESCE(sqlc.narg('captured_code_cross_check')::boolean, (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id)), true,
+    COALESCE(sqlc.narg('agent_source_requested')::text, (SELECT rp.agent_source_default FROM repos rp WHERE rp.id = @repo_id::uuid)),
+    CASE WHEN sqlc.narg('agent_source_requested')::text IS NOT NULL THEN 'explicit'
+         WHEN (SELECT rp.agent_source_default FROM repos rp WHERE rp.id = @repo_id::uuid) IS NOT NULL THEN 'repo_default'
+    END)
 RETURNING *;
 
 -- name: GetRunByIDForUser :one
@@ -839,6 +843,22 @@ FROM run_messages
 WHERE run_id = ANY(@run_ids::uuid[])
   AND kind = 'tool_use'
 ORDER BY run_id, seq DESC;
+
+-- name: PendingQuestionsForRuns :many
+-- The newest `question` message per run for a page of awaiting_input runs (PRD #4040,
+-- pending_question). The inner query picks the newest row per run FIRST, the outer one
+-- then bounds it: an oversized newest payload (over 64 KiB as text) comes back NULL, so
+-- it yields no excerpt and never falls back to an older question. A run with no question
+-- message returns no row. Served by the partial index idx_run_messages_question_seq
+-- (migration 00400).
+SELECT run_id, (CASE WHEN octet_length(payload::text) <= 65536 THEN payload ELSE NULL END)::jsonb AS payload
+FROM (
+  SELECT DISTINCT ON (run_id) run_id, payload
+  FROM run_messages
+  WHERE run_id = ANY(@run_ids::uuid[])
+    AND kind = 'question'
+  ORDER BY run_id, seq DESC
+) newest;
 
 -- name: LiveLaneFramesForRun :many
 -- PRD #1353: newest tool_use frame per live subagent instance for a run (DISTINCT ON
@@ -1292,6 +1312,8 @@ WITH checker_template_pins AS MATERIALIZED (
       -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
       -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
       AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(@worker_protocol_caps::text[]))
+      AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(@worker_protocol_caps::text[]))
+      AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(@worker_protocol_caps::text[]))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL)) OR 'provider_policy_hold_v1' = ANY(@worker_protocol_caps::text[]))
       AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(@worker_protocol_caps::text[]))
       -- PRD #1332 M5A (D3): the NON-BYPASSABLE Codex-harness claim clause, MIRRORING the
@@ -1572,6 +1594,8 @@ WITH checker_template_pins AS MATERIALIZED (
                 -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
                 -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
                 AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(p.protocol_capabilities))
+                AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(p.protocol_capabilities))
+                AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(p.protocol_capabilities))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL)) OR 'provider_policy_hold_v1' = ANY(p.protocol_capabilities))
                 AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(p.protocol_capabilities))
                 -- PRD #1332 M5A (D3): MIRROR the non-bypassable Codex-harness clause for the peer, or
@@ -2246,7 +2270,9 @@ UPDATE runs SET
     -- intervening `running` report, so this statement is never executed on it (D-AG).
     -- Deleting either clear as redundant re-opens the defect on the path the other
     -- one does not cover, and a third non-terminal destination added later needs its
-    -- own. The full argument lives at SetRunAwaitingApproval; this pointer exists so
+    -- own: SettleRunClarificationToGate (issue #3985) is that third writer, an
+    -- awaiting_input -> awaiting_approval move that never passes through running.
+    -- The full argument lives at SetRunAwaitingApproval; this pointer exists so
     -- the invariant is discoverable from EITHER end, which is the only version that
     -- works — a reader who opens only this statement would otherwise learn it is the
     -- sole clear.
@@ -2312,8 +2338,10 @@ UPDATE runs SET
     iteration_count  = GREATEST(iteration_count, @iteration_count),
     session_id       = COALESCE(sqlc.narg('session_id'), session_id),
     repo_agents      = COALESCE(sqlc.narg('repo_agents')::jsonb, repo_agents),
+    repo_agent_source_commit = COALESCE(repo_agent_source_commit, sqlc.narg('repo_agent_source_commit')::text),
     agent_source     = COALESCE(sqlc.narg('agent_source'), agent_source),
     agent_exclusions = COALESCE(sqlc.narg('agent_exclusions')::jsonb, agent_exclusions),
+    plan_agent_source = COALESCE(sqlc.narg('plan_agent_source')::text, plan_agent_source),
     -- PRD #84 M4: persist the plan-time INFERRED requirement set an AUTOPILOT run emits
     -- on this self-contained `running` report. An autopilot run auto-approves its own
     -- plan and never reports awaiting_approval, so SetRunAwaitingApproval's identical
@@ -2860,12 +2888,12 @@ UPDATE runs SET
     -- so a garbled worker report becomes a nil param (no change) rather than a bad value.
     size_class = COALESCE(sqlc.narg('size_class'), runs.size_class),
     session_id = COALESCE(sqlc.narg('session_id'), session_id),
-    -- 🔴 INVARIANT, carried by TWO call sites and by nothing else:
-    -- NO SETTER MAY LEAVE A RESOLVED open_question_id BEHIND. The sibling clear is in
-    -- SetRunRunning, which covers the mid-run path; this one covers M4's pre-run park,
-    -- which reaches the gate without ever executing that statement. A third
-    -- non-terminal destination added later re-opens this a third time and nothing
-    -- would catch it.
+    -- 🔴 INVARIANT, carried by THREE call sites and by nothing else:
+    -- NO SETTER MAY LEAVE A RESOLVED open_question_id BEHIND. The sibling clears are in
+    -- SetRunRunning, which covers the mid-run path, and in SettleRunClarificationToGate
+    -- (issue #3985, awaiting_input -> awaiting_approval without running); this one covers
+    -- M4's pre-run park, which reaches the gate without ever executing either. A further
+    -- non-terminal destination added later re-opens this again and nothing would catch it.
     --
     -- Why this statement needs the clear at all (PRD #88 D-AG, measured): M4 lets the
     -- lead ask BEFORE it plans, so a pre-run park goes awaiting_input →
@@ -2885,7 +2913,8 @@ UPDATE runs SET
     --
     -- Sufficient by enumeration: from awaiting_input the only non-terminal
     -- destinations are `running` (cleared in SetRunRunning) and `awaiting_approval`
-    -- (here). The terminal three never resume, so a stale id there is inert.
+    -- (cleared here, and in SettleRunClarificationToGate for the settlement path).
+    -- The terminal three never resume, so a stale id there is inert.
     --
     -- Unlike SetRunRunning's clear there is no WHERE-clause interaction to get wrong:
     -- this statement's WHERE never references open_question_id.
@@ -4213,6 +4242,8 @@ WITH candidates AS MATERIALIZED (
     WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.status = 'paused'
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
+  -- PRD #3989: a credentials_reset hold is released only by the credential promoter.
+  AND runs.hold_reason IS DISTINCT FROM 'credentials_reset'
   AND NOT runs.policy_preserve_required AND NOT runs.policy_pending_fresh
   AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
@@ -4305,6 +4336,8 @@ UPDATE runs SET
 WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.status = 'paused'
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
+  -- PRD #3989: a credentials_reset hold is released only by the credential promoter.
+  AND runs.hold_reason IS DISTINCT FROM 'credentials_reset'
   AND NOT runs.policy_preserve_required AND NOT runs.policy_pending_fresh
   AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
@@ -4791,6 +4824,123 @@ WHERE NOT (status = 'recovery_wait' AND recovery_wait_cause IS NOT DISTINCT FROM
   AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('credential_switch_settling', 'credential_switch_unsettled'), FALSE))
   -- issue #3194: nor may one leave the base-attestation hold, which keeps this claim.
   AND NOT (status = 'paused' AND COALESCE(hold_reason = 'base_attestation_missing', FALSE));
+
+-- name: SettleRunClarificationToGate :execrows
+-- Issue #3985: the clarification-during-human-revision settlement. On a plan cross-check run
+-- (gated, or required with auto_approve cleared by the server) a non-witness human revise leaves the
+-- run at awaiting_approval; the lead then asks a clarification and SetRunAwaitingInput parks it at
+-- awaiting_input. After the owner's answer is applied, the worker reports clarification_settled and
+-- this statement returns the run to awaiting_approval WITHOUT passing through running. It does NOT
+-- relax SetRunRunning, whose bound-approval clause correctly refuses a running report here.
+--
+-- Contract:
+--   * An answer never implies approval: the statement refuses when an applied bound approve_plan
+--     exists for the current gate revision.
+--   * It does not settle the revise. The pending revise row (consumed by THIS worker and claim
+--     generation, bound to the current gate revision, not applied, not superseded, non-empty) stays
+--     pending, so the lead's next presentation applies it and allocates the next gate revision.
+--   * It adds no presentation and no checker pass (ADR-2149 D16): plan_md, the gate payload,
+--     gate_revision and the candidate columns are not written.
+--
+-- Exactly six columns are written. open_question_id is cleared here as the THIRD non-terminal
+-- destination the SetRunRunning comment names (the other two clears are SetRunRunning and
+-- SetRunAwaitingApproval): NO SETTER MAY LEAVE A RESOLVED open_question_id BEHIND.
+-- completion_question_at is cleared with it, and the awaiting_input gap is banked into
+-- budget_paused_seconds exactly as SetRunRunning banks a park->running transition. Postgres
+-- evaluates every SET right-hand side against the OLD row, so status_since is the park entry.
+--
+-- Every run_user_inputs subquery binds i.run_id = runs.id: the other runs of the same worker may
+-- share a claim generation and gate revision, and a receipt of another run must never satisfy
+-- this run's predicate.
+UPDATE runs SET
+    status                = 'awaiting_approval',
+    status_since          = now(),
+    updated_at            = now(),
+    open_question_id      = NULL,
+    completion_question_at = NULL,
+    budget_paused_seconds = budget_paused_seconds
+        + GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int)
+WHERE runs.id = @id
+  AND runs.worker_id = @worker_id
+  AND runs.claim_generation = @claim_generation
+  AND runs.claim_released_at IS NULL
+  AND runs.kind IN ('issue', 'prompt', 'ci_fix')
+  AND runs.status = 'awaiting_input'
+  AND runs.open_question_id = sqlc.arg('question_id')::text
+  AND runs.completion_question_at IS NULL
+  AND (runs.plan_cross_check_required OR runs.plan_cross_check_gated)
+  AND NOT runs.auto_approve
+  AND runs.plan_md IS NOT NULL
+  AND runs.gate_revision = sqlc.arg('gate_revision')::bigint
+  AND runs.gate_revision > 0
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
+  AND EXISTS (
+      SELECT 1 FROM run_user_inputs i
+      WHERE i.run_id = runs.id AND i.kind = 'answer'
+        AND i.question_id = sqlc.arg('question_id')::text
+        AND i.applied_at IS NOT NULL
+        AND i.disposition IS DISTINCT FROM 'superseded')
+  AND EXISTS (
+      SELECT 1 FROM run_user_inputs i
+      WHERE i.run_id = runs.id AND i.id = sqlc.arg('revision_input_id')::bigint
+        AND i.kind = 'revise_plan'
+        AND btrim(i.body, E' \t\n\r\f\013\u0085\u00A0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF') <> ''
+        AND i.consumed_at IS NOT NULL
+        AND i.consumed_worker_id = runs.worker_id
+        AND i.consumed_claim_generation = runs.claim_generation
+        AND i.applied_at IS NULL
+        AND i.disposition IS NULL
+        AND i.gate_binding = 'bound'
+        AND i.gate_revision = runs.gate_revision)
+  AND NOT EXISTS (
+      SELECT 1 FROM run_user_inputs i
+      WHERE i.run_id = runs.id AND i.kind = 'approve_plan'
+        AND i.gate_binding = 'bound'
+        AND i.gate_revision = runs.gate_revision
+        AND i.applied_at IS NOT NULL
+        AND i.disposition IS DISTINCT FROM 'superseded');
+
+-- name: GetClarificationGateSettlementReplay :one
+-- Issue #3985: read-only idempotent replay for SettleRunClarificationToGate after a lost ACK. True
+-- only when the run is already at awaiting_approval on the SAME claim and gate revision with no open
+-- question, the same applied answer and the same still-pending revise exist, and no applied bound
+-- approval exists. It writes nothing. Every run_user_inputs subquery binds i.run_id = runs.id.
+SELECT EXISTS (
+    SELECT 1 FROM runs
+    WHERE runs.id = @id
+      AND runs.worker_id = @worker_id
+      AND runs.claim_generation = @claim_generation
+      AND runs.claim_released_at IS NULL
+      AND runs.status = 'awaiting_approval'
+      AND runs.open_question_id IS NULL
+      AND runs.gate_revision = sqlc.arg('gate_revision')::bigint
+      AND EXISTS (
+          SELECT 1 FROM run_user_inputs i
+          WHERE i.run_id = runs.id AND i.kind = 'answer'
+            AND i.question_id = sqlc.arg('question_id')::text
+            AND i.applied_at IS NOT NULL
+            AND i.disposition IS DISTINCT FROM 'superseded')
+      AND EXISTS (
+          SELECT 1 FROM run_user_inputs i
+          WHERE i.run_id = runs.id AND i.id = sqlc.arg('revision_input_id')::bigint
+            AND i.kind = 'revise_plan'
+            AND btrim(i.body, E' \t\n\r\f\013\u0085\u00A0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF') <> ''
+            AND i.consumed_at IS NOT NULL
+            AND i.consumed_worker_id = runs.worker_id
+            AND i.consumed_claim_generation = runs.claim_generation
+            AND i.applied_at IS NULL
+            AND i.disposition IS NULL
+            AND i.gate_binding = 'bound'
+            AND i.gate_revision = runs.gate_revision)
+      AND NOT EXISTS (
+          SELECT 1 FROM run_user_inputs i
+          WHERE i.run_id = runs.id AND i.kind = 'approve_plan'
+            AND i.gate_binding = 'bound'
+            AND i.gate_revision = runs.gate_revision
+            AND i.applied_at IS NOT NULL
+            AND i.disposition IS DISTINCT FROM 'superseded')
+)::boolean;
 
 -- name: ClearRunMilestonesCompleted :execrows
 -- PRD #628 M4: the ONLY non-union writer of milestones_completed. milestones_completed
@@ -10580,7 +10730,7 @@ SELECT id, runs.user_id, status, auto_approve,
        budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, budget_finalize_seconds, interactive,
        repo_id, kind, dispatched_at, required_capabilities, completion_contract_version,
        harness, codex_material_revision, codex_secret_id, worker_id, released_worker_id,
-       egress_profile_id, job_protocol, ci_config_guard,
+       egress_profile_id, job_protocol, ci_config_guard, repo_agent_source_commit, repo_agent_source_required, agent_source_requested,
        EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = runs.id AND af.direction = 'input' AND af.state = 'attached')::boolean AS ci_artifacts_attached,
        COALESCE(runs.status = 'queued' AND runs.kind <> 'cross_check'
                 AND runs.worker_id IS NOT NULL
@@ -10917,6 +11067,8 @@ WHERE run.id = @run_id
   -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
   -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
   AND (NOT run.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
+  AND ((NOT run.repo_agent_source_required AND run.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
+  AND (run.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
       AND (NOT (run.policy_preserve_required OR run.policy_pending_fresh OR (run.policy_outcome_id IS NOT NULL AND run.policy_resolved_at IS NULL)) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
   AND (NOT (run.kind = 'prompt' AND run.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = run.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(w.protocol_capabilities))
   AND (NOT (run.harness = 'codex' OR run.codex_material_revision IS NOT NULL OR run.codex_secret_id IS NOT NULL)
@@ -11151,6 +11303,24 @@ WHERE w.user_id = @user_id
   AND NOT w.isolated_lane
   AND 'ci_config_guard_v1' = ANY(w.protocol_capabilities);
 
+-- name: CountOnlineWorkersSatisfyingRepoAgentSource :one
+SELECT count(*) FROM workers w
+WHERE w.user_id = @user_id
+  AND w.status = 'online'
+  AND fn_worker_accepts_new_intake(w)
+  AND NOT w.ephemeral
+  AND NOT w.isolated_lane
+  AND 'repo_agent_source_v1' = ANY(w.protocol_capabilities);
+
+-- name: CountOnlineWorkersSatisfyingAgentSourceRequest :one
+SELECT count(*) FROM workers w
+WHERE w.user_id = @user_id
+  AND w.status = 'online'
+  AND fn_worker_accepts_new_intake(w)
+  AND NOT w.ephemeral
+  AND NOT w.isolated_lane
+  AND 'agent_source_request_v1' = ANY(w.protocol_capabilities);
+
 -- name: CountOnlineWorkersSatisfyingCodexHarness :one
 -- PRD #1332 M5A (D3): how many of a user's ONLINE, non-draining, non-ephemeral workers self-report
 -- the 'codex_harness_v1' PROTOCOL capability (workers.protocol_capabilities). This is the
@@ -11380,7 +11550,7 @@ WHERE r.status = 'queued'
   -- the CODE exclusion above keeps known CODE children on their own worker.
   -- PRD #2865: a GUARDED run (ci_config_guard) is demand too: with no worker reporting
   -- ci_config_guard_v1 online, only a freshly provisioned worker can claim it.
-  AND (r.checkpoint_coordinates IS NOT NULL OR cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]))
+  AND (r.checkpoint_coordinates IS NOT NULL OR cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR r.repo_agent_source_required OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]))
 
   AND NOT EXISTS (
       SELECT 1 FROM workers w
@@ -11414,6 +11584,8 @@ WHERE r.status = 'queued'
         -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
         -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
         AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
+        AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
+        AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL)) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
         AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
@@ -11660,6 +11832,8 @@ WHERE r.status = 'queued'
         -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
         -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
         AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
+        AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
+        AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL)) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
         AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
@@ -11745,6 +11919,8 @@ WHERE r.status = 'queued'
         -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
         -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
         AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
+        AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
+        AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL)) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
         AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
@@ -11973,13 +12149,41 @@ LIMIT @max_rows;
 -- approximately zero runs per tick. As a projection on ListActiveRunsForHealth it would be
 -- one such scan per active run per 15s tick and an index would become mandatory.
 --
+-- SECOND BRANCH (issue #3985): a pending human revise for the run's CURRENT gate counts
+-- regardless of its age. SettleRunClarificationToGate returns a run to awaiting_approval and
+-- stamps status_since = now() while the revise that preceded the clarification stays pending
+-- (consumed, bound to the current gate_revision, unapplied, undisposed), so that revise's
+-- created_at predates the new boundary and the first branch cannot see it; the run is still
+-- waiting on its WORKER (the lead's next presentation applies the revise), not on its owner.
+-- The branch is not age-based, so it stays monotone within an episode: it holds from the
+-- settlement until the next presentation applies the revise (applied_at set), which also
+-- re-stamps status_since through SetRunAwaitingApproval. A run that never had a revise is
+-- unaffected, and so is one whose revise was applied or superseded. The branch carries the
+-- SAME pending-revise predicate SettleRunClarificationToGate requires (non-empty body, consumed
+-- by the run's CURRENT worker and claim generation): a revise consumed only by an earlier,
+-- reclaimed claim that the current flight never re-ACKed (the #1604 dropped-revise shape) does
+-- not count, so that run still reads approval_idle and nudges its owner.
+--
 -- The EXISTS is CAST because sqlc's inference is weaker on expressions than on columns:
 -- uncast, the projection arrives in Go as interface{} rather than bool.
 SELECT (EXISTS (
     SELECT 1 FROM run_user_inputs
-    WHERE run_id = @run_id
-      AND kind IN ('approve_plan', 'reject_plan', 'cancel', 'revise_plan')
-      AND created_at >= @gate_opened_at
+    WHERE run_user_inputs.run_id = @run_id
+      AND run_user_inputs.kind IN ('approve_plan', 'reject_plan', 'cancel', 'revise_plan')
+      AND run_user_inputs.created_at >= @gate_opened_at
+) OR EXISTS (
+    SELECT 1 FROM run_user_inputs i
+    JOIN runs r ON r.id = i.run_id
+    WHERE i.run_id = @run_id
+      AND i.kind = 'revise_plan'
+      AND btrim(i.body, E' \t\n\r\f\013\u0085\u00A0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF') <> ''
+      AND i.applied_at IS NULL
+      AND i.disposition IS NULL
+      AND i.consumed_at IS NOT NULL
+      AND i.consumed_worker_id = r.worker_id
+      AND i.consumed_claim_generation = r.claim_generation
+      AND i.gate_binding = 'bound'
+      AND i.gate_revision = r.gate_revision
 ))::boolean AS has_verdict;
 
 -- name: SetRunWaitOnLimit :execrows

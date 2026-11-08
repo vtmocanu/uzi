@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -93,6 +94,11 @@ func (t *fakeClaimFinishTx) LockSecretEnablementForShareNowait(context.Context, 
 func (t *fakeClaimFinishTx) ParkCredentialDisabledRun(_ context.Context, arg store.ParkCredentialDisabledRunParams) (int64, error) {
 	t.pending = append(t.pending, func() { t.f.claimCredParked = &arg })
 	return 1, nil
+}
+
+// GetUserCredentialsResetAt: the fake users have never redeemed a reset link (NULL marker).
+func (t *fakeClaimFinishTx) GetUserCredentialsResetAt(context.Context, uuid.UUID) (pgtype.Timestamptz, error) {
+	return pgtype.Timestamptz{}, nil
 }
 
 func (t *fakeClaimFinishTx) RequeueClaimAssemblyExact(_ context.Context, arg store.RequeueClaimAssemblyExactParams) (int64, error) {
