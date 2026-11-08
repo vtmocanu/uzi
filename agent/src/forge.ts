@@ -54,10 +54,11 @@ export const MR_DETAIL_MAX_BYTES = 6 * 1_048_576 + 64 * 1024;
 
 /** PRD #1798 M6 (H1): the byte cap on the find-existing LIST read (findOpenMr on GitLab and GitHub).
  *  The list is filtered to open MRs/PRs for one source and target branch, and both forges allow only
- *  one open MR/PR per such pair, so it normally carries a single object: the cap admits one
+ *  one open MR/PR per such pair from one source project, so it normally carries a single object
+ *  (on GitLab, plus any fork MR reusing the branch name): the cap admits one
  *  worst-case object (MR_DETAIL_MAX_BYTES) with room to spare, while a list that grew past a few MiB
- *  (a forge ignoring the filter, or a hostile answer) is refused instead of buffered. Only the first
- *  element is ever used. */
+ *  (a forge ignoring the filter, or a hostile answer) is refused instead of buffered. GitLab scans the
+ *  list for an own-project match; GitHub uses only the first element. */
 export const MR_LIST_MAX_BYTES = 8 * 1_048_576;
 
 /** The bytes an error body is read to before it is cut (the message keeps 512 characters). */

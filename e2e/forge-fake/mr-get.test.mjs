@@ -44,7 +44,10 @@ test("shared fake serves a single MR/PR by iid in all three dialects", { timeout
   const statePath = path.join(scratch, "state.json");
   writeFileSync(statePath, JSON.stringify({
     mrs: [mr(1, "agent/open", "opened"), mr(2, "agent/merged", "merged"), mr(3, "agent/closed", "closed"),
-      { ...mr(4, "agent/open", "opened"), project_id: 2 }],
+      { ...mr(4, "agent/open", "opened"), project_id: 2 },
+      // Fork MRs into project 1: one reusing an own MR's branch name, one alone on its branch.
+      { ...mr(5, "agent/open", "opened"), source_project_id: 99 },
+      { ...mr(6, "agent/forkonly", "opened"), source_project_id: 99 }],
   }));
   const gitRoot = path.join(scratch, "gitroot");
   mkdirSync(gitRoot);
@@ -85,10 +88,12 @@ test("shared fake serves a single MR/PR by iid in all three dialects", { timeout
   assert.ok(port > 0);
   const origin = `https://127.0.0.1:${port}`;
   const ca = readFileSync(certPath);
-  async function get(route) {
+  const get = (route) => call("GET", route);
+  async function call(method, route, payload) {
     try {
       return await new Promise((resolve, reject) => {
-        const req = https.request(new URL(route, origin), { method: "GET", ca }, (res) => {
+        const headers = payload === undefined ? {} : { "content-type": "application/json" };
+        const req = https.request(new URL(route, origin), { method, ca, headers }, (res) => {
           let data = "";
           res.setEncoding("utf8");
           res.on("data", (chunk) => { data += chunk; });
@@ -99,10 +104,10 @@ test("shared fake serves a single MR/PR by iid in all three dialects", { timeout
         });
         req.setTimeout(3000, () => req.destroy(new Error("HTTP request timed out")));
         req.on("error", reject);
-        req.end();
+        req.end(payload === undefined ? undefined : JSON.stringify(payload));
       });
     } catch (error) {
-      throw new Error(`GET ${route} failed; child ${child.exitCode}/${child.signalCode}\n${diagnostics}`, { cause: error });
+      throw new Error(`${method} ${route} failed; child ${child.exitCode}/${child.signalCode}\n${diagnostics}`, { cause: error });
     }
   }
 
@@ -123,11 +128,23 @@ test("shared fake serves a single MR/PR by iid in all three dialects", { timeout
     // own-project MR, so each listed row must name its source and target project.
     const res = await get("/api/v4/projects/1/merge_requests?state=opened&source_branch=agent%2Fopen&target_branch=main");
     assert.equal(res.status, 200);
-    assert.deepEqual(res.body.map((m) => m.iid), [1]);
-    assert.equal(res.body[0].source_project_id, 1);
-    assert.equal(res.body[0].target_project_id, 1);
+    // The fork MR !5 reuses the branch name: listed (as GitLab does) with its own source project.
+    assert.deepEqual(res.body.map((m) => [m.iid, m.source_project_id, m.target_project_id]), [[1, 1, 1], [5, 99, 1]]);
     const other = await get("/api/v4/projects/2/merge_requests?state=opened&source_branch=agent%2Fopen&target_branch=main");
     assert.deepEqual(other.body.map((m) => [m.iid, m.source_project_id, m.target_project_id]), [[4, 2, 2]]);
+  });
+
+  await t.test("GitLab MR create 409s only on an open own-source MR, not on a fork MR", async () => {
+    // GitLab's duplicate-create conflict is per source project: a fork MR on the same branch
+    // name must not manufacture the 409 that sends the worker into findOpenMr.
+    const route = "/api/v4/projects/1/merge_requests";
+    const dup = await call("POST", route, { source_branch: "agent/open", target_branch: "main", title: "dup" });
+    assert.equal(dup.status, 409);
+    const forkOnly = await call("POST", route, { source_branch: "agent/forkonly", target_branch: "main", title: "ours" });
+    assert.equal(forkOnly.status, 201);
+    assert.equal(forkOnly.body.project_id, 1);
+    const list = await get(`${route}?state=opened&source_branch=agent%2Fforkonly&target_branch=main`);
+    assert.deepEqual(list.body.map((m) => [m.iid, m.source_project_id]), [[6, 99], [forkOnly.body.iid, 1]]);
   });
 
   for (const [dialect, name, notFound] of [["v1", "Forgejo", "pull request does not exist"], ["v3", "GitHub", "Not Found"]]) {
