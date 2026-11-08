@@ -353,7 +353,7 @@ func wantHarness(t *testing.T, v *apitypes.HarnessValueDTO, value, source string
 	if v == nil {
 		t.Fatalf("harness is null, want %s/%s", value, source)
 	}
-	if strs(v.Value) != strs(sp(value)) && !(value == "" && v.Value == nil) || v.Source != source || v.FixedAt != "create" || strings.Join(v.Notes, ",") != strings.Join(notes, ",") {
+	if strs(v.Value) != strs(sp(value)) && (value != "" || v.Value != nil) || v.Source != source || v.FixedAt != "create" || strings.Join(v.Notes, ",") != strings.Join(notes, ",") {
 		t.Fatalf("harness = {value:%s source:%s fixed_at:%s notes:%v}, want {%q %s create %v}", strs(v.Value), v.Source, v.FixedAt, v.Notes, value, source, notes)
 	}
 }

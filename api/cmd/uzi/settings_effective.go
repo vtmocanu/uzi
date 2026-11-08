@@ -149,7 +149,7 @@ func readSchedulePreview(ctx context.Context, c uzicli.Client, id string, stderr
 	if errors.As(err, &ee) && ee.Code != uzicli.ExitUnreachable {
 		return nil, err
 	}
-	fmt.Fprintf(stderr, "Schedule preview: unavailable (%s)\n", crossCheckPlain(err.Error()))
+	_, _ = fmt.Fprintf(stderr, "Schedule preview: unavailable (%s)\n", crossCheckPlain(err.Error()))
 	return nil, nil
 }
 

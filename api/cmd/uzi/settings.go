@@ -161,9 +161,9 @@ func readEffectiveSettings(ctx context.Context, c uzicli.Client, stderr io.Write
 	}
 	var ee *uzicli.ExitError
 	if errors.As(err, &ee) && ee.Code == uzicli.ExitNotFound {
-		fmt.Fprintln(stderr, "Effective settings: not available on this server")
+		_, _ = fmt.Fprintln(stderr, "Effective settings: not available on this server")
 		return nil
 	}
-	fmt.Fprintf(stderr, "Effective settings: unavailable (%s)\n", crossCheckPlain(err.Error()))
+	_, _ = fmt.Fprintf(stderr, "Effective settings: unavailable (%s)\n", crossCheckPlain(err.Error()))
 	return nil
 }

@@ -45,9 +45,9 @@ const (
 	noteDefaultHarnessUnusable = "user_default_harness_unusable"
 	noteInstanceUnavailable    = "instance_settings_unavailable"
 
-	refusalNoCredentialForHarness = "no_credential_for_harness"
-	refusalNoUsableCredential     = "no_usable_credential"
-	refusalCredentialDisabled     = "credential_disabled"
+	refusalNoCredentialForHarness = "no_credential_for_harness" //nolint:gosec // refusal-reason token, not a secret
+	refusalNoUsableCredential     = "no_usable_credential"      //nolint:gosec // refusal-reason token, not a secret
+	refusalCredentialDisabled     = "credential_disabled"       //nolint:gosec // refusal-reason token, not a secret
 	refusalCredentialNotFound     = "credential_not_found"
 	refusalOverrideUnsupported    = "credential_override_harness_unsupported"
 	refusalOverrideInvalid        = "credential_override_invalid"

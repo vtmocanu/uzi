@@ -419,7 +419,7 @@ func (h *Handler) scheduleBranch(ctx context.Context, d scheduleDraft, hn worker
 			return b, err
 		}
 		b.tokenFixed = !auto
-	case d.override != nil && hn == workersvc.HarnessClaude && !(d.override.Mode == workersvc.CredentialOverrideModePinned && d.override.SecretID == nil):
+	case d.override != nil && hn == workersvc.HarnessClaude && (d.override.Mode != workersvc.CredentialOverrideModePinned || d.override.SecretID != nil):
 		if cred, err = overrideCredential(d.override.Mode); err != nil {
 			return b, err
 		}

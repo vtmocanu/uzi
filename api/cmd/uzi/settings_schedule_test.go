@@ -180,7 +180,7 @@ func TestSettingsGetScheduleServerFailureDegrades(t *testing.T) {
 }
 
 func TestSettingsGetScheduleHostileTextAndBounds(t *testing.T) {
-	hostile := "visible\n\x1b]8;;https://evil.example\x07link\x1b]8;;\x07‮" + strings.Repeat("x", 10000)
+	hostile := "visible\n\x1b]8;;https://evil.example\x07link\x1b]8;;\x07\u202e" + strings.Repeat("x", 10000)
 	d := schedulePreviewFixture()
 	d.Harness = harnessValue(&hostile, hostile, hostile)
 	d.Refusal, d.RefusalDetail = &hostile, &hostile
@@ -195,7 +195,7 @@ func TestSettingsGetScheduleHostileTextAndBounds(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit %d: %s", code, stderr)
 	}
-	if strings.ContainsAny(out, "\x1b\x07‮") || strings.Contains(out, strings.Repeat("x", 201)) {
+	if strings.ContainsAny(out, "\x1b\x07\u202e") || strings.Contains(out, strings.Repeat("x", 201)) {
 		t.Fatalf("unsafe output (%d bytes)", len(out))
 	}
 	// Two alternatives and eight pins are read at most; the 38 and 32 extra of each are not.
@@ -213,7 +213,7 @@ func TestSettingsGetScheduleHostileTextAndBounds(t *testing.T) {
 	}
 	fc = &uzicli.FakeClient{Settings: settingsWithLegacyCells(), SchedulePreviewErr: errors.New(hostile)}
 	_, stderr, code = runCLI(t, fakeEnv(fc), "settings", "get", "--schedule", schedID)
-	if code != 0 || strings.ContainsAny(stderr, "\x1b\x07‮") || len(stderr) > 400 {
+	if code != 0 || strings.ContainsAny(stderr, "\x1b\x07\u202e") || len(stderr) > 400 {
 		t.Fatalf("hostile failure text on stderr: exit %d, %q", code, stderr)
 	}
 }
