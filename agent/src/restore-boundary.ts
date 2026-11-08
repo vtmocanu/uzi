@@ -149,7 +149,7 @@ export function realBoundaryOps(uid: number = process.getuid?.() ?? -1): Boundar
 
 // ---- procfs readers (injectable root) ---------------------------------------------------------------------------
 
-export type IdentityRefusal = "procfs_unreadable" | "timens_refused" | "cross_check_failed";
+export type IdentityRefusal = "procfs_unreadable" | "timens_refused" | "cross_check_failed" | "procfs_hidden";
 
 export interface LiveIdentityOptions {
   /** Defaults to `/proc`. */
@@ -181,6 +181,31 @@ function timensZero(text: string): boolean {
 /** The mount point field of a mountinfo row, with its `\040`-style escapes decoded. */
 function unescapeMount(s: string): string {
   return s.replace(/\\([0-7]{3})/g, (_, o: string) => String.fromCharCode(parseInt(o, 8)));
+}
+
+/**
+ * True when the mountinfo row for `procRoot` carries a hiding option: the rule of the run-procs.ts procMount scan
+ * (`hidepid` other than 0/off, or any `subset`), read from both the per-mount and the per-superblock options.
+ * A malformed row or an absent proc row is not "hidden" here (run-procs reports those as unknown, not hidden).
+ */
+function procfsHidden(text: string, procRoot: string): boolean {
+  for (const line of text.split("\n")) {
+    if (line === "") continue;
+    const cut = line.indexOf(" - ");
+    if (cut < 0) continue;
+    const lf = line.slice(0, cut).split(" ").filter(x => x !== "");
+    const rf = line.slice(cut + 3).split(" ").filter(x => x !== "");
+    if (lf.length < 6 || rf.length < 3 || unescapeMount(lf[4]!) !== procRoot || rf[0] !== "proc") continue;
+    for (const opts of [lf[5]!, rf[2]!]) {
+      for (const opt of opts.split(",")) {
+        const eq = opt.indexOf("=");
+        const k = eq < 0 ? opt : opt.slice(0, eq);
+        const v = eq < 0 ? "" : opt.slice(eq + 1);
+        if ((k === "hidepid" && v !== "0" && v !== "off") || k === "subset") return true;
+      }
+    }
+  }
+  return false;
 }
 
 /** The container id behind `/etc/hostname`, or undefined when the topmost row does not look like a container hostname bind. */
@@ -217,13 +242,17 @@ export async function readLiveIdentity(options: LiveIdentityOptions = {}):
   try {
     if (!timensZero(await fsp.readFile(`${root}/self/timens_offsets`, "utf8"))) return { ok: false, reason: "timens_refused" };
   } catch { return { ok: false, reason: "timens_refused" }; }
+  let mountinfo: string | undefined;
+  try { mountinfo = await fsp.readFile(`${root}/self/mountinfo`, "utf8"); } catch { mountinfo = undefined; }
+  // Same visibility rule as the run-procs scan: a procfs mounted with hidepid/subset hides processes, so the
+  // identity fields above cannot be trusted to describe the whole container. Applies to both slot kinds.
+  if (mountinfo !== undefined && procfsHidden(mountinfo, root)) return { ok: false, reason: "procfs_hidden" };
   if (options.podUid !== undefined && UUID_RE.test(options.podUid)) {
     return { ok: true, identity: { slot: { kind: "hosted", podUid: options.podUid.toLowerCase(), container: options.container ?? "worker" },
       crossCheck: "na", execution } };
   }
-  let containerId: string | undefined;
-  try { containerId = containerIdFromMountinfo(await fsp.readFile(`${root}/self/mountinfo`, "utf8")); }
-  catch { return { ok: false, reason: "cross_check_failed" }; }
+  if (mountinfo === undefined) return { ok: false, reason: "cross_check_failed" };
+  const containerId = containerIdFromMountinfo(mountinfo);
   const hostname = (options.hostname ?? os.hostname)();
   if (containerId === undefined || hostname !== containerId.slice(0, 12)) return { ok: false, reason: "cross_check_failed" };
   return { ok: true, identity: { slot: { kind: "compose", hostname, containerId }, crossCheck: "ok", execution } };
@@ -425,7 +454,7 @@ export async function runAttributionCensus(input: CensusInput): Promise<CensusRe
 export type RestoreRefusal =
   | "self_record_invalid" | "predecessor_record_missing" | "predecessor_record_invalid" | "hosted_restore_not_delivered"
   | "slot_mismatch" | "cross_check_failed" | "same_execution" | "predecessor_not_older"
-  | "predecessor_pending" | "predecessor_fenced" | "bare_busy" | "bare_slot_foreign_active" | CensusRefusal;
+  | "procfs_hidden" | "predecessor_pending" | "predecessor_fenced" | "bare_busy" | "bare_slot_foreign_active" | CensusRefusal;
 
 export interface RestoreVerdict {
   predecessorIncarnation: string;
@@ -440,6 +469,8 @@ export interface RestoreEvalInput {
   /** S's own record as read from disk, and S's live identity re-read now (undefined when it could not be). */
   selfRead: BoundaryRead;
   selfLive: LiveBoundaryIdentity | undefined;
+  /** Why `readLiveIdentity` refused when selfLive is undefined; a hidden procfs is reported as its own reason. */
+  selfLiveRefusal?: IdentityRefusal;
   /** P's slot snapshot (owner.worker, epoch, pending, publication, state) and whether P's journal carries a completionSourceFence. */
   predecessor: SlotSnapshot;
   predecessorFenced: boolean;
@@ -465,6 +496,7 @@ function sameExecution(a: BoundaryExecution, b: BoundaryExecution): boolean {
 export async function evaluateComposeRestore(input: RestoreEvalInput): Promise<RestoreDecision> {
   const refuse = (reason: RestoreRefusal): RestoreDecision => ({ admit: false, reason });
   // R1: S's record is valid and equals its live identity.
+  if (input.selfLiveRefusal === "procfs_hidden") return refuse("procfs_hidden");
   if (input.selfRead.state !== "ok" || input.selfLive === undefined) return refuse("self_record_invalid");
   const s = input.selfRead.record;
   if (s.incarnation !== input.selfIncarnation || s.crossCheck !== input.selfLive.crossCheck ||

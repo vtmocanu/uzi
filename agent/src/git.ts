@@ -2296,7 +2296,11 @@ export interface IndependentSeedInput {
   runId: string;
   /** S's attempt id, minted by the caller from `mintAttemptId(claimGeneration, ...)`. */
   attemptId: string;
-  predecessor: { clonePath: string; attemptId: string; generation: number; journalDigest: string; slotOwner: { worker: string; epoch: string } };
+  predecessor: { clonePath: string; attemptId: string; generation: number; journalDigest: string; slotOwner: { worker: string; epoch: string };
+    /** Decimal dev/ino of P's clone root, from the authority's `sourceRootIdentity`. */
+    root: { dev: string; ino: string } };
+  /** Lowercase sha256 hex of the raw bytes of P's and S's boundary record files. */
+  boundary: { predecessor: string; successor: string };
   pin: { captureId: string; generation: number; sourceSha: string; finalization: boolean };
   defaultBranch?: string;
   /** The claim's `checkpoint_tip`: it must be an ancestor of the pin. */
@@ -12579,7 +12583,7 @@ export class GitCache {
    * time to anchor on. Only names are listed and only the matching entry is lstat'd; no content is ever read. Returns the
    * directory name, or undefined for anything else.
    */
-  private async holdingEvidence(runId: string, sAttemptId: string, pPath: string): Promise<string | undefined> {
+  private async holdingEvidence(runId: string, sAttemptId: string, pPath: string, pRoot: { dev: string; ino: string }): Promise<string | undefined> {
     try {
       const startMs = attemptIdStartMs(sAttemptId);
       if (startMs === undefined) return undefined;
@@ -12596,8 +12600,10 @@ export class GitCache {
         if (entry.name.startsWith(prefix)) named.push(entry.name);
       }
       if (named.length !== 1 || !isHoldingName(named[0]!, runId)) return undefined;
-      const held = await fs.lstat(path.join(this.runnerHoldingRoot, named[0]!));
-      if (!held.isDirectory() || held.isSymbolicLink() || held.ctimeMs < startMs) return undefined;
+      const held = await fs.lstat(path.join(this.runnerHoldingRoot, named[0]!), { bigint: true });
+      if (!held.isDirectory() || held.isSymbolicLink() || Number(held.ctimeMs) < startMs) return undefined;
+      // The holding directory is P's own root renamed (same inode), not another run-prefixed directory such as S's retired copy.
+      if (held.dev.toString() !== pRoot.dev || held.ino.toString() !== pRoot.ino) return undefined;
       return named[0];
     } catch {
       this.checkRecoveryInterruption();
@@ -12621,7 +12627,7 @@ export class GitCache {
       const facts = await this.releasedConfigFacts(barePath, branch, entries);
       if (!facts) throw err;
       if (facts.mode === "in_place") return facts;
-      const holding = await this.holdingEvidence(facts.pLedger.runId, facts.ledger.attemptId, facts.basis.predecessor.clonePath);
+      const holding = await this.holdingEvidence(facts.pLedger.runId, facts.ledger.attemptId, facts.basis.predecessor.clonePath, facts.basis.predecessor.root);
       if (holding === undefined) throw err;
       return { ...facts, holding };
     }
@@ -12916,6 +12922,9 @@ export class GitCache {
       if (pin.generation !== p.generation || !SHA40_RE.test(pin.sourceSha) || typeof pin.captureId !== "string" || pin.captureId === "")
         return refuse("pin_malformed");
       if (!SHA256_RE.test(p.journalDigest)) return refuse("digest_malformed");
+      const idShape = (v: unknown): boolean => typeof v === "string" && /^[0-9]{1,30}$/.test(v);
+      if (!idShape(p.root?.dev) || !idShape(p.root?.ino) || !SHA256_RE.test(String(input.boundary?.predecessor)) ||
+          !SHA256_RE.test(String(input.boundary?.successor))) return refuse("basis_malformed");
       const canonical = this.runnerClonePath(barePath, key);
       const sPath = attemptClonePath(canonical, sId);
       if (this.clonePathShape(p.clonePath, canonical)?.attemptId !== p.attemptId) return refuse("predecessor_path");
@@ -12967,7 +12976,9 @@ export class GitCache {
       step = "entry";
       window = "seeding";
       const basis: RestoreBasis = {
-        version: 1, predecessor: { clonePath: p.clonePath, attemptId: p.attemptId, generation: p.generation }, journalDigest: p.journalDigest,
+        version: 1,
+        predecessor: { clonePath: p.clonePath, attemptId: p.attemptId, generation: p.generation, root: { dev: p.root.dev, ino: p.root.ino } },
+        journalDigest: p.journalDigest, boundary: { predecessor: input.boundary.predecessor, successor: input.boundary.successor },
         slotOwner: { worker: p.slotOwner.worker, epoch: p.slotOwner.epoch },
         pin: { captureId: pin.captureId, generation: pin.generation, sourceSha: pin.sourceSha, finalization: pin.finalization },
         restoreTip: pin.sourceSha,

@@ -23,7 +23,7 @@ const PARK: MemoryParkRecord = {
 
 const pRaw = JSON.stringify({ runId: RUN, clonePath: P_PATH, attemptId: P_ID });
 const basis = (): RestoreBasis => ({
-  version: 1, predecessor: { clonePath: P_PATH, attemptId: P_ID, generation: 1 }, journalDigest: restoreDigest(pRaw),
+  version: 1, predecessor: { clonePath: P_PATH, attemptId: P_ID, generation: 1, root: { dev: "2049", ino: "131072" } }, journalDigest: restoreDigest(pRaw), boundary: { predecessor: "c".repeat(64), successor: "d".repeat(64) },
   slotOwner: { worker: "worker-incarnation-1", epoch: "epoch-1" },
   pin: { captureId: "capture-1", generation: 1, sourceSha: SHA, finalization: true }, restoreTip: SHA,
 });
@@ -74,10 +74,13 @@ describe("parseRestoreJournal accepts", () => {
 
   it("serializes the envelope keys in the documented order whatever order the basis was built in", () => {
     const shuffled = { restoreTip: SHA, pin: { finalization: true, sourceSha: SHA, generation: 1, captureId: "capture-1" }, slotOwner: { epoch: "epoch-1", worker: "worker-incarnation-1" },
-      journalDigest: restoreDigest(pRaw), predecessor: { generation: 1, attemptId: P_ID, clonePath: P_PATH }, version: 1 as const };
+      journalDigest: restoreDigest(pRaw), predecessor: { root: { ino: "131072", dev: "2049" }, generation: 1, attemptId: P_ID, clonePath: P_PATH }, boundary: { successor: "d".repeat(64), predecessor: "c".repeat(64) }, version: 1 as const };
     const out = restoreJournalJson(shuffled, "seeding", { runId: RUN, clonePath: S_PATH, attemptId: S_ID });
     assert.deepEqual(Object.keys(JSON.parse(out)), ["restore", "restoreStage", "runId", "clonePath", "attemptId"]);
-    assert.deepEqual(Object.keys(JSON.parse(out).restore), ["version", "predecessor", "journalDigest", "slotOwner", "pin", "restoreTip"]);
+    assert.deepEqual(Object.keys(JSON.parse(out).restore), ["version", "predecessor", "journalDigest", "boundary", "slotOwner", "pin", "restoreTip"]);
+    assert.deepEqual(Object.keys(JSON.parse(out).restore.predecessor), ["clonePath", "attemptId", "generation", "root"]);
+    assert.deepEqual(Object.keys(JSON.parse(out).restore.predecessor.root), ["dev", "ino"]);
+    assert.deepEqual(Object.keys(JSON.parse(out).restore.boundary), ["predecessor", "successor"]);
     assert.deepEqual(Object.keys(JSON.parse(out).restore.pin), ["captureId", "generation", "sourceSha", "finalization"]);
   });
 });
@@ -132,6 +135,16 @@ describe("the restore basis is validated strictly", () => {
     ["digest too short", b => { b.journalDigest = "ab"; }],
     ["digest upper case", b => { b.journalDigest = "A".repeat(64); }],
     ["digest missing", b => { delete b.journalDigest; }],
+    ["root missing", b => { delete b.predecessor.root; }],
+    ["root dev not digits", b => { b.predecessor.root.dev = "0x1"; }],
+    ["root ino number", b => { b.predecessor.root.ino = 5; }],
+    ["root ino too long", b => { b.predecessor.root.ino = "1".repeat(31); }],
+    ["root ino empty", b => { b.predecessor.root.ino = ""; }],
+    ["extra root key", b => { b.predecessor.root.extra = "1"; }],
+    ["boundary missing", b => { delete b.boundary; }],
+    ["boundary predecessor short", b => { b.boundary.predecessor = "ab"; }],
+    ["boundary successor upper case", b => { b.boundary.successor = "D".repeat(64); }],
+    ["extra boundary key", b => { b.boundary.extra = "c".repeat(64); }],
     ["slot owner worker empty", b => { b.slotOwner.worker = ""; }],
     ["slot owner epoch number", b => { b.slotOwner.epoch = 1; }],
     ["extra slot owner key", b => { b.slotOwner.extra = 1; }],

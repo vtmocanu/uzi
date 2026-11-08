@@ -90,6 +90,52 @@ describe("live identity and cross-check", () => {
     assert.equal(r.identity.slot.kind, "hosted");
     assert.equal(r.identity.crossCheck, "na");
   });
+  describe("procfs visibility (hidepid / subset on the proc mount)", () => {
+    // The proc row is found by its mount point, which is the injected root; super options are the last field.
+    const withProc = async (superOpts: string, mountOpts = "rw,nosuid,nodev,noexec,relatime", extraDir = proc): Promise<void> => {
+      const file = path.join(proc, "self/mountinfo");
+      const prior = await fsp.readFile(file, "utf8");
+      await fsp.writeFile(file, `${prior}41 20 0:5 / ${extraDir} ${mountOpts} - proc proc ${superOpts}\n`);
+    };
+    const live = (podUid?: string) => readLiveIdentity({ procRoot: proc, hostname: host, ...(podUid ? { podUid } : {}) });
+    for (const [name, superOpts, mountOpts] of [
+      ["hidepid=2", "rw,hidepid=2", undefined], ["hidepid=invisible", "rw,hidepid=invisible", undefined],
+      ["hidepid=1", "rw,hidepid=1", undefined], ["hidepid=noaccess", "rw,hidepid=noaccess", undefined],
+      ["subset=pid", "rw,subset=pid", undefined], ["hidepid on the mount options", "rw", "rw,nosuid,hidepid=2"],
+    ] as const) {
+      it(`refuses ${name} for a compose slot`, async () => {
+        await withProc(superOpts, mountOpts);
+        assert.deepEqual(await live(), { ok: false, reason: "procfs_hidden" });
+      });
+    }
+    it("refuses a hidden procfs for a hosted slot too", async () => {
+      await withProc("rw,hidepid=2");
+      assert.deepEqual(await live("123e4567-e89b-12d3-a456-426614174000"), { ok: false, reason: "procfs_hidden" });
+    });
+    it("allows hidepid=0, hidepid=off and no option", async () => {
+      for (const superOpts of ["rw,hidepid=0", "rw,hidepid=off", "rw"]) {
+        await fsp.rm(proc, { recursive: true });
+        await makeProc(proc);
+        await withProc(superOpts);
+        const r = await live();
+        assert.ok(r.ok, superOpts);
+      }
+    });
+    it("an hiding option on another mount point is not the procfs row", async () => {
+      await withProc("rw,hidepid=2", "rw", "/somewhere/else");
+      assert.ok((await live()).ok);
+    });
+    it("unsafe control: every readable identity field with hidepid=2 is still not admitted, and no record is written", async () => {
+      await withProc("rw,hidepid=2");
+      assert.equal((await fsp.stat(path.join(proc, "1/stat"))).isFile(), true);
+      assert.match(await fsp.readFile(path.join(proc, "sys/kernel/random/boot_id"), "utf8"), /^[0-9a-f-]{36}\n$/);
+      assert.deepEqual(await writeBoundaryRecord(base()), { ok: false, reason: "procfs_hidden" });
+      assert.deepEqual(await establishProcessBoundary(base()), { ok: false, reason: "procfs_hidden" });
+      assert.equal(processBoundary(), undefined);
+      assert.equal(processBoundaryDisabledReason(), "procfs_hidden");
+      assert.deepEqual(await fsp.readdir(path.join(dataDir, ".uzi-authority")), []);
+    });
+  });
   it("a non-UUID UZI_POD_UID is a compose candidate", async () => {
     const r = await readLiveIdentity({ procRoot: proc, hostname: host, podUid: "not-a-uuid" });
     assert.ok(r.ok && r.identity.slot.kind === "compose");
@@ -311,6 +357,10 @@ describe("evaluateComposeRestore", () => {
     const own = await decide({ bareSlot: slot({ owner: { worker: "inc-S", executor: null } }) });
     assert.ok(own.admit);
   });
+  it("procfs_hidden: a live re-read that refused for a hidden procfs refuses with that reason, not a generic one", async () => {
+    assert.deepEqual(await decide({ selfLive: undefined, selfLiveRefusal: "procfs_hidden" }), { admit: false, reason: "procfs_hidden" });
+    assert.deepEqual(await decide({ selfLive: undefined, selfLiveRefusal: "timens_refused" }), { admit: false, reason: "self_record_invalid" });
+  });
   it("census refusals pass through", async () => {
     for (const reason of ["census_foreign_active", "census_pending", "attribution_unverifiable"] as const)
       assert.deepEqual(await decide({ census: { ok: false, reason } }), { admit: false, reason });
@@ -324,7 +374,7 @@ const P_ATT = formatAttemptId(new Date("2026-01-02T00:00:00Z"), 1, "1123456789ab
 const S_ATT = formatAttemptId(new Date("2026-01-03T00:00:00Z"), 2, "2123456789abcdef");
 const SHA = "a".repeat(40);
 const rbasis = (predecessor: string): RestoreBasis => ({
-  version: 1, predecessor: { clonePath: predecessor, attemptId: P_ATT, generation: 1 }, journalDigest: restoreDigest("p"),
+  version: 1, predecessor: { clonePath: predecessor, attemptId: P_ATT, generation: 1, root: { dev: "2049", ino: "131072" } }, journalDigest: restoreDigest("p"), boundary: { predecessor: "c".repeat(64), successor: "d".repeat(64) },
   slotOwner: { worker: "worker-incarnation-1", epoch: "epoch-1" }, pin: { captureId: "capture-1", generation: 1, sourceSha: SHA, finalization: true }, restoreTip: SHA,
 });
 const j = (clonePath: string, extra: object = {}): string => JSON.stringify({ runId: "r1", clonePath, ...extra });

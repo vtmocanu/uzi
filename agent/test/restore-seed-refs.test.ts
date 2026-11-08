@@ -49,7 +49,8 @@ const ownedFiles = (): string[] => fs.readdirSync(path.join(bare, "uzi-owed")).s
 async function seed(): Promise<void> {
   const input: IndependentSeedInput = {
     barePath: bare, branch: BRANCH, key: KEY, runId: RUN, attemptId: S_ID,
-    predecessor: { clonePath: P_PATH, attemptId: P_ID, generation: 1, journalDigest: restoreDigest(pRaw), slotOwner: { worker: "w1", epoch: "e1" } },
+    predecessor: { clonePath: P_PATH, attemptId: P_ID, generation: 1, journalDigest: restoreDigest(pRaw), slotOwner: { worker: "w1", epoch: "e1" }, root: { dev: "2049", ino: "131072" } },
+    boundary: { predecessor: "c".repeat(64), successor: "d".repeat(64) },
     pin: { captureId: "capture-1", generation: 1, sourceSha: pinSha, finalization: true }, defaultBranch: "main",
     predecessorUnchanged: async () => true, census: async () => ({ ok: true }), beforeRestoreAttribution: async () => {},
     isLive: () => false, beforeSeed: async () => {},
@@ -91,7 +92,7 @@ const owed = (): Promise<OwedCandidate[]> => cache.enumerateOwedCandidates(bare,
 describe("the pure fold of restore values into protection", () => {
   const G3 = formatAttemptId(new Date("2026-11-05T10:10:10Z"), 3, "0123456789abcdef");
   const v = (stage: string, run = RUN): string => JSON.stringify({
-    restore: { version: 1, predecessor: { clonePath: `/x/issue-3644.attempt-${G3}`, attemptId: G3, generation: 3 }, journalDigest: "a".repeat(64),
+    restore: { version: 1, predecessor: { clonePath: `/x/issue-3644.attempt-${G3}`, attemptId: G3, generation: 3, root: { dev: "2049", ino: "131072" } }, journalDigest: "a".repeat(64), boundary: { predecessor: "c".repeat(64), successor: "d".repeat(64) },
       slotOwner: { worker: "w", epoch: "e" }, pin: { captureId: "c", generation: 3, sourceSha: "b".repeat(40), finalization: true }, restoreTip: "b".repeat(40) },
     restoreStage: stage, ...(stage === "retired" ? { successor: { runId: run, attemptId: S_ID, clonePath: "/x/y." + S_ID } } : { runId: run, clonePath: "/x/issue-3644.attempt-" + S_ID, attemptId: S_ID }),
   });

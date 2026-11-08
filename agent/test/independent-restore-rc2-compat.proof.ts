@@ -143,7 +143,9 @@ async function build(): Promise<Env> {
   }
   const seed: IndependentSeedInput = {
     barePath: bare, branch: BRANCH, key: KEY, runId: RUN, attemptId: S_ID,
-    predecessor: { clonePath: pPath, attemptId: P_ID, generation: 1, journalDigest: restoreDigest(pRaw), slotOwner: { worker: "w1", epoch: "e1" } },
+    predecessor: { clonePath: pPath, attemptId: P_ID, generation: 1, journalDigest: restoreDigest(pRaw), slotOwner: { worker: "w1", epoch: "e1" },
+      root: { dev: String(fs.lstatSync(pPath, { bigint: true }).dev), ino: String(fs.lstatSync(pPath, { bigint: true }).ino) } },
+    boundary: { predecessor: "c".repeat(64), successor: "d".repeat(64) },
     pin: { captureId: "capture-1", generation: 1, sourceSha: pinSha, finalization: true }, defaultBranch: "main",
     predecessorUnchanged: async () => true, census: async () => ({ ok: true }), beforeRestoreAttribution: async () => {},
     isLive: () => false, beforeSeed: async () => {},

@@ -1736,7 +1736,7 @@ RS="$RB/issue-4242.attempt-$A2"
 # restore_value <stage> <runId> <S clonePath> <S attemptId>: the persisted spelling of S's entry (envelope, then remainder).
 restore_value() {
   jq -cn --arg stage "$1" --arg rid "$2" --arg p "$3" --arg a "$4" --arg pp "$RP" --arg pa "$A1" --arg d "$DIGR" --arg sha "$SHAR" '
-    {restore:{version:1,predecessor:{clonePath:$pp,attemptId:$pa,generation:1},journalDigest:$d,
+    {restore:{version:1,predecessor:{clonePath:$pp,attemptId:$pa,generation:1,root:{dev:"2049",ino:"131072"}},journalDigest:$d,boundary:{predecessor:$d,successor:$d},
       slotOwner:{worker:"w-1",epoch:"e-1"},pin:{captureId:"cap-1",generation:1,sourceSha:$sha,finalization:true},restoreTip:$sha},
      restoreStage:$stage} + {runId:$rid,clonePath:$p,attemptId:$a}'
 }
@@ -1769,7 +1769,7 @@ git --git-dir="$BARE" config --unset-all "$LKEY"
 ledger "$A1" run-4242 "$RP" live
 ledger "$A2" run-4242 "$RS" retired
 git --git-dir="$BARE" config "$RKEY" "$(jq -cn --arg rs "$RS" --arg a "$A2" --arg pp "$RP" --arg pa "$A1" --arg d "$DIGR" --arg sha "$SHAR" '
-  {restore:{version:1,predecessor:{clonePath:$pp,attemptId:$pa,generation:1},journalDigest:$d,slotOwner:{worker:"w-1",epoch:"e-1"},
+  {restore:{version:1,predecessor:{clonePath:$pp,attemptId:$pa,generation:1,root:{dev:"2049",ino:"131072"}},journalDigest:$d,boundary:{predecessor:$d,successor:$d},slotOwner:{worker:"w-1",epoch:"e-1"},
    pin:{captureId:"cap-1",generation:1,sourceSha:$sha,finalization:true},restoreTip:$sha},restoreStage:"retired",
    successor:{runId:"run-4242",attemptId:$a,clonePath:$rs}}')"
 expect_pick restore-tombstone "$RP" pred-dirty
@@ -1804,12 +1804,21 @@ restore_bad basis-digest "$(printf '%s' "$GOOD" | jq -c '.restore.journalDigest=
 restore_bad basis-sha "$(printf '%s' "$GOOD" | jq -c '.restore.pin.sourceSha="abc"')"
 restore_bad basis-finalization "$(printf '%s' "$GOOD" | jq -c '.restore.pin.finalization="yes"')"
 restore_bad basis-generation "$(printf '%s' "$GOOD" | jq -c '.restore.predecessor.generation=0')"
+restore_bad root-missing "$(printf '%s' "$GOOD" | jq -c 'del(.restore.predecessor.root)')"
+restore_bad root-dev "$(printf '%s' "$GOOD" | jq -c '.restore.predecessor.root.dev="0x1"')"
+restore_bad root-ino-number "$(printf '%s' "$GOOD" | jq -c '.restore.predecessor.root.ino=5')"
+restore_bad root-ino-long "$(printf '%s' "$GOOD" | jq -c --arg n "$(printf '9%.0s' $(seq 31))" '.restore.predecessor.root.ino=$n')"
+restore_bad root-extra "$(printf '%s' "$GOOD" | jq -c '.restore.predecessor.root.extra="1"')"
+restore_bad boundary-missing "$(printf '%s' "$GOOD" | jq -c 'del(.restore.boundary)')"
+restore_bad boundary-short "$(printf '%s' "$GOOD" | jq -c '.restore.boundary.predecessor="abc"')"
+restore_bad boundary-upper "$(printf '%s' "$GOOD" | jq -c --arg u "$(printf 'D%.0s' $(seq 64))" '.restore.boundary.successor=$u')"
+restore_bad boundary-extra "$(printf '%s' "$GOOD" | jq -c '.restore.boundary.extra=$ARGS.positional[0]' --args "$DIGR")"
 restore_bad path-mismatch "$(printf '%s' "$GOOD" | jq -c --arg p "$RP" '.clonePath=$p')"
 restore_bad run-type "$(printf '%s' "$GOOD" | jq -c '.runId=42')"
 restore_bad attempt "$(printf '%s' "$GOOD" | jq -c '.attemptId="nope"')"
 restore_bad fence "$(printf '%s' "$GOOD" | jq -c '.completionSourceFence={version:2}')"
 restore_bad tombstone-extra "$(jq -cn --arg rs "$RS" --arg a "$A2" --arg pp "$RP" --arg pa "$A1" --arg d "$DIGR" --arg sha "$SHAR" '
-  {restore:{version:1,predecessor:{clonePath:$pp,attemptId:$pa,generation:1},journalDigest:$d,slotOwner:{worker:"w-1",epoch:"e-1"},
+  {restore:{version:1,predecessor:{clonePath:$pp,attemptId:$pa,generation:1,root:{dev:"2049",ino:"131072"}},journalDigest:$d,boundary:{predecessor:$d,successor:$d},slotOwner:{worker:"w-1",epoch:"e-1"},
    pin:{captureId:"cap-1",generation:1,sourceSha:$sha,finalization:true},restoreTip:$sha},restoreStage:"retired",
    successor:{runId:"run-4242",attemptId:$a,clonePath:$rs},fence:1}')"
 restore_bad repeated-key "$GOOD" "$GOOD"

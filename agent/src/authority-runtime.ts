@@ -7,7 +7,7 @@ import {
   type AuthorityTransaction, type WorkerLifetime,
 } from "./authority-lock.js";
 import {
-  leaseEpoch, leaseHarness, openAuthorityStore, peekAuthoritySlot, processWorkerIncarnation,
+  leaseEpoch, leaseHarness, openAuthorityStore, peekAuthoritySlot, peekSourceRootIdentity, processWorkerIncarnation,
   type AuthorityFsOps, type AuthorityStore, type EndedSlotReceipt, type SlotCohort, type SlotSnapshot, type SourceUseLease,
 } from "./completion-authority.js";
 import {
@@ -492,6 +492,21 @@ export class AuthorityRuntime implements AuthorityScope {
     } catch {
       return { kind: "other" };
     }
+  }
+
+  /**
+   * issue #3644 Gate B - the clone root's decimal dev/ino for a restore basis, read under lock A without writing or
+   * repairing anything, by the same lstat walk as the slot-key derivation (nothing inside the root is read). Undefined
+   * when the root is absent; any refusal or lock timeout rejects.
+   */
+  async sourceRootIdentity(clonePath: string, wait: AuthorityWait = {}): Promise<{ dev: string; ino: string } | undefined> {
+    const read = (): Promise<{ dev: string; ino: string } | undefined> =>
+      peekSourceRootIdentity({ dataDir: this.#options.lifetime.dataDir }, path.resolve(clonePath));
+    if (this.active()) return read();
+    return withAuthorityTransaction(this.#options.lifetime, {
+      ...(wait.signal ? { signal: wait.signal } : {}),
+      timeoutMs: wait.timeoutMs ?? this.#options.timeoutMs ?? DEFAULT_WAIT_MS,
+    }, read);
   }
 
   /** Whether `clonePath` is owned by a sink other than `sink` whose end has not been confirmed. Read-only. */

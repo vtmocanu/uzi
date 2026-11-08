@@ -45,6 +45,9 @@
 # validator accepts exactly that v1 shape and refuses anything else; the record grants no attribution of its own.
 # An independent restore (issue #3644) leaves the killed predecessor P's plain journal byte-identical and keeps its
 # successor S in its OWN key, uzi-restore.<branch>.journal (single-valued, "" = cleared): {"restore":<basis>,
+# (the basis is exactly {version:1, predecessor:{clonePath,attemptId,generation,root:{dev,ino}}, journalDigest,
+# boundary:{predecessor,successor}, slotOwner, pin, restoreTip}: dev/ino are decimal digit strings of 1..30 characters and
+# the boundary values are 64 lowercase hex digests),
 # "restoreStage":"seeding"|"ready",<S's runId, clonePath, attemptId[, memoryPark][, completionSourceFence]>}, or a
 # tombstone {"restore":<basis>,"restoreStage":"retired","successor":{runId,attemptId,clonePath}} once S is gone. For a
 # run that is not completed or cancelled, S's entry makes S's clone the journal-current (primary) source exactly like a
@@ -836,10 +839,13 @@ select_clone(){
         def uuid: type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
         def fence: type == "object" and keys == ["sourceCoreDigest","sourceUseEpoch","version"]
           and .version == 1 and (.sourceUseEpoch | uuid) and (.sourceCoreDigest | hex64);
-        def basis: type == "object" and keys == ["journalDigest","pin","predecessor","restoreTip","slotOwner","version"]
+        def digits: type == "string" and test("^[0-9]{1,30}$");
+        def basis: type == "object" and keys == ["boundary","journalDigest","pin","predecessor","restoreTip","slotOwner","version"]
           and .version == 1 and (.journalDigest | hex64) and (.restoreTip | sha)
-          and (.predecessor | type == "object" and keys == ["attemptId","clonePath","generation"]
+          and (.boundary | type == "object" and keys == ["predecessor","successor"] and (.predecessor | hex64) and (.successor | hex64))
+          and (.predecessor | type == "object" and keys == ["attemptId","clonePath","generation","root"]
             and (.attemptId | aid) and (.clonePath | abs) and (.generation | pos)
+            and (.root | type == "object" and keys == ["dev","ino"] and (.dev | digits) and (.ino | digits))
             and (. as $x | .clonePath | endswith(".attempt-" + $x.attemptId)))
           and (.slotOwner | type == "object" and keys == ["epoch","worker"] and (.epoch | str) and (.worker | str))
           and (.pin | type == "object" and keys == ["captureId","finalization","generation","sourceSha"]

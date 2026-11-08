@@ -135,10 +135,16 @@ beforeEach(async () => {
 });
 afterEach(() => fx.cleanup());
 
+/** P's clone root identity as the authority's slot-key walk would record it (P is on disk when a restore is seeded). */
+function pRoot(): { dev: string; ino: string } {
+  const st = fs.lstatSync(P_PATH, { bigint: true });
+  return { dev: st.dev.toString(), ino: st.ino.toString() };
+}
 function seedInput(over: Partial<IndependentSeedInput> = {}): IndependentSeedInput {
   return {
     barePath: bare, branch: BRANCH, key: KEY, runId: RUN, attemptId: S_ID,
-    predecessor: { clonePath: P_PATH, attemptId: P_ID, generation: 1, journalDigest: restoreDigest(pRaw), slotOwner: { worker: "worker-incarnation-1", epoch: "epoch-1" } },
+    predecessor: { clonePath: P_PATH, attemptId: P_ID, generation: 1, journalDigest: restoreDigest(pRaw), slotOwner: { worker: "worker-incarnation-1", epoch: "epoch-1" }, root: pRoot() },
+    boundary: { predecessor: "c".repeat(64), successor: "d".repeat(64) },
     pin: { captureId: "capture-1", generation: 1, sourceSha: pinSha, finalization: true }, defaultBranch: "main",
     predecessorUnchanged: async () => true, census: async () => ({ ok: true }), beforeRestoreAttribution: async () => {},
     isLive: () => false, beforeSeed: async () => {}, ...over,
@@ -419,6 +425,38 @@ describe("controls: partial, ambiguous or mismatched states stay refused with no
     // P's path present again: P was not moved.
     fs.mkdirSync(path.join(P_PATH, ".git"), { recursive: true });
     await assertRefusedUnchanged("P's path present", true);
+  });
+
+  it("C1 (mode H binding, amendment 14): the sole run-matching holding directory must be P's own root (same dev/ino), not another directory", async () => {
+    await rc2Release("holding");
+    const dir = fs.readdirSync(HOLDING_ROOT)[0]!;
+    const real = path.join(HOLDING_ROOT, dir);
+    const pIdentity = fs.lstatSync(real, { bigint: true });
+    assert.equal(String(pIdentity.ino), JSON.parse(rawKey(S_KEY)!).restore.predecessor.root.ino, "control: the recorded root is the inode of the holding copy");
+    // A different, perfectly well-formed, run-prefixed directory (S's own retired holding copy would look like this) stands in for P's.
+    const aside = path.join(fx.dataDir, "p-aside");
+    fs.renameSync(real, aside);
+    const impostor = holdingDir();
+    assert.notEqual(fs.lstatSync(impostor, { bigint: true }).ino, pIdentity.ino);
+    await assertRefusedUnchanged("a holding directory with another inode", true);
+    // The same device but the wrong inode is refused, and so is a missing directory.
+    fs.rmSync(impostor, { recursive: true });
+    await assertRefusedUnchanged("no holding directory", true);
+    // Control: P's own directory, renamed back (same inode, new ctime), is accepted again.
+    fs.renameSync(aside, real);
+    assert.equal((await discardS()).kind, "done");
+    const p = await discardP();
+    assert.equal(p.kind === "done" && p.holding, dir, JSON.stringify(p));
+  });
+
+  it("C1 (mode H binding): a basis recording another root inode refuses even though the holding directory is P's", async () => {
+    await cache.seedIndependentAttempt(seedInput({ predecessor: { ...seedInput().predecessor, root: { dev: pRoot().dev, ino: String(BigInt(pRoot().ino) + 1n) } } }));
+    const holding = holdingDir();
+    fs.rmdirSync(holding);
+    fs.renameSync(P_PATH, holding);
+    fs.rmSync(skillsOf(P_PATH), { recursive: true, force: true });
+    setKey(P_KEY, "");
+    await assertRefusedUnchanged("a basis whose root differs from the holding directory", true);
   });
 
   it("C1 (mode H attribution): a holding root that is not a real 0700 directory, or a holding entry that is not a real directory, refuses", async () => {

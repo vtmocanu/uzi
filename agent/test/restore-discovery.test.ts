@@ -77,7 +77,7 @@ const addLedger = (attemptId: string, clonePath: string, state: string, runId = 
 const pJournal = () => ({ runId: RUN, clonePath: P_PATH, attemptId: P_ID });
 const sJournal = (extra: Record<string, unknown> = {}) => ({ runId: RUN, clonePath: S_PATH, attemptId: S_ID, ...extra });
 const basis = (raw = pRaw): RestoreBasis => ({
-  version: 1, predecessor: { clonePath: P_PATH, attemptId: P_ID, generation: 1 }, journalDigest: restoreDigest(raw),
+  version: 1, predecessor: { clonePath: P_PATH, attemptId: P_ID, generation: 1, root: { dev: "2049", ino: "131072" } }, journalDigest: restoreDigest(raw), boundary: { predecessor: "c".repeat(64), successor: "d".repeat(64) },
   slotOwner: { worker: "worker-incarnation-1", epoch: "epoch-1" },
   pin: { captureId: "capture-1", generation: 1, sourceSha: SHA, finalization: true }, restoreTip: SHA,
 });
@@ -627,6 +627,29 @@ describe("enumerators exclude the predecessor's path", () => {
     setKey(S_KEY, "");
     const plain = await cache.readInventoryCloneHeads(bare, RUN);
     assert.ok(plain.kind === "verified" && plain.retainedPredecessors === undefined);
+  });
+
+  it("a cloneIdentity read under a restore composite reports retainedPredecessors and never stats or returns P's path", async () => {
+    compose({ stage: "ready", ledger: "live" });
+    fs.mkdirSync(path.join(S_PATH, ".git"), { recursive: true });
+    fs.writeFileSync(path.join(S_PATH, ".git", "HEAD"), `${SHA}\n`);
+    const expected = [{ clonePath: P_PATH, branch: BRANCH, runId: RUN, attemptId: P_ID, generation: 1 }];
+    const reads: Array<[string, () => ReturnType<GitCache["readInventoryCloneHeads"]>]> = [
+      ["options form", () => cache.readInventoryCloneHeads(bare, RUN, { cloneIdentity: true })],
+      ["boolean form", () => cache.readInventoryCloneHeads(bare, RUN, true)],
+      ["under the lock", () => cache.withBareLock(bare, () => cache.readInventoryCloneHeadsUnderLock(bare, RUN, true))],
+    ];
+    for (const [name, read] of reads) {
+      const trap = trapPredecessor();
+      let heads;
+      try { heads = await read(); } finally { trap.restore(); }
+      assert.deepEqual(trap.hits, [], `${name}: P is never touched`);
+      assert.ok(heads.kind === "verified", `${name}: ${JSON.stringify(heads)}`);
+      assert.deepEqual(heads.retainedPredecessors, expected, name);
+      assert.ok(!heads.clones.some(c => c.clonePath === P_PATH), `${name}: P's path is not a clone entry`);
+      assert.ok(!JSON.stringify(heads.clones).includes(P_PATH), `${name}: P's path is not returned among the clones`);
+      assert.ok(!(heads.foreignOwners ?? []).some(o => JSON.stringify(o).includes(P_PATH)), `${name}: nor among the foreign owners`);
+    }
   });
 
   it("the retained-source inspector lists the predecessor without a presence probe", async () => {

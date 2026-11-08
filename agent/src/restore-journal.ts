@@ -41,8 +41,11 @@ export class RestoreCompositeBlockedError extends RestoreCompositeError {
 
 export interface RestoreBasis {
   version: 1;
-  predecessor: { clonePath: string; attemptId: string; generation: number };
+  /** `root` is the decimal dev/ino of P's clone root (bigint-safe strings), as the authority's slot-key derivation lstat'd it. */
+  predecessor: { clonePath: string; attemptId: string; generation: number; root: { dev: string; ino: string } };
   journalDigest: string;
+  /** Lowercase sha256 hex of the RAW bytes of P's and S's boundary record files. */
+  boundary: { predecessor: string; successor: string };
   slotOwner: { worker: string; epoch: string };
   pin: { captureId: string; generation: number; sourceSha: string; finalization: boolean };
   restoreTip: string;
@@ -83,6 +86,12 @@ function gen(v: unknown, what: string): number {
   return v;
 }
 
+/** A decimal digit string of up to 30 characters (a stat dev/ino rendered bigint-safe). */
+function digits(v: unknown, what: string): string {
+  if (typeof v !== "string" || !/^[0-9]{1,30}$/.test(v)) return bad(what);
+  return v;
+}
+
 function attempt(v: unknown, what: string): string {
   if (typeof v !== "string" || !ATTEMPT_ID_RE.test(v)) return bad(what);
   return v;
@@ -98,11 +107,15 @@ function successor(v: unknown): RestoreSuccessor {
 
 /** Strict basis: exact keys, no extras, no coercion. */
 export function parseRestoreBasis(v: unknown): RestoreBasis {
-  const o = obj(v, ["version", "predecessor", "journalDigest", "slotOwner", "pin", "restoreTip"], "restore basis");
+  const o = obj(v, ["version", "predecessor", "journalDigest", "boundary", "slotOwner", "pin", "restoreTip"], "restore basis");
   if (o.version !== 1) bad("restore basis version");
-  const p = obj(o.predecessor, ["clonePath", "attemptId", "generation"], "restore predecessor");
+  const p = obj(o.predecessor, ["clonePath", "attemptId", "generation", "root"], "restore predecessor");
+  const r = obj(p.root, ["dev", "ino"], "restore predecessor root");
   const predecessor = { clonePath: str(p.clonePath, "restore predecessor path"), attemptId: attempt(p.attemptId, "restore predecessor attempt"),
-    generation: gen(p.generation, "restore predecessor generation") };
+    generation: gen(p.generation, "restore predecessor generation"), root: { dev: digits(r.dev, "restore root dev"), ino: digits(r.ino, "restore root ino") } };
+  const bd = obj(o.boundary, ["predecessor", "successor"], "restore boundary");
+  if (typeof bd.predecessor !== "string" || !SHA256_RE.test(bd.predecessor) || typeof bd.successor !== "string" || !SHA256_RE.test(bd.successor)) bad("restore boundary");
+  const boundary = { predecessor: bd.predecessor as string, successor: bd.successor as string };
   if (!predecessor.clonePath.endsWith(`.attempt-${predecessor.attemptId}`)) bad("restore predecessor path");
   // P's attempt id must carry g<G> (a `gx` id has no generation and is refused); the basis generation must be exactly that G.
   if (attemptGeneration(predecessor.attemptId) !== predecessor.generation) bad("restore predecessor generation");
@@ -115,14 +128,15 @@ export function parseRestoreBasis(v: unknown): RestoreBasis {
     sourceSha: n.sourceSha as string, finalization: n.finalization as boolean };
   if (pin.generation !== predecessor.generation) bad("restore pin generation");
   if (typeof o.restoreTip !== "string" || !SHA40_RE.test(o.restoreTip)) bad("restore tip");
-  return { version: 1, predecessor, journalDigest: o.journalDigest as string, slotOwner, pin, restoreTip: o.restoreTip as string };
+  return { version: 1, predecessor, journalDigest: o.journalDigest as string, boundary, slotOwner, pin, restoreTip: o.restoreTip as string };
 }
 
 /** Fixed key order of the basis: the persisted spelling. */
 function basisOrdered(b: RestoreBasis): RestoreBasis {
   return { version: 1,
-    predecessor: { clonePath: b.predecessor.clonePath, attemptId: b.predecessor.attemptId, generation: b.predecessor.generation },
-    journalDigest: b.journalDigest, slotOwner: { worker: b.slotOwner.worker, epoch: b.slotOwner.epoch },
+    predecessor: { clonePath: b.predecessor.clonePath, attemptId: b.predecessor.attemptId, generation: b.predecessor.generation,
+      root: { dev: b.predecessor.root.dev, ino: b.predecessor.root.ino } },
+    journalDigest: b.journalDigest, boundary: { predecessor: b.boundary.predecessor, successor: b.boundary.successor }, slotOwner: { worker: b.slotOwner.worker, epoch: b.slotOwner.epoch },
     pin: { captureId: b.pin.captureId, generation: b.pin.generation, sourceSha: b.pin.sourceSha, finalization: b.pin.finalization },
     restoreTip: b.restoreTip };
 }

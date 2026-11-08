@@ -138,7 +138,8 @@ interface Trace { steps: string[]; seedTargets?: string[]; canonical?: string; p
 function seedInput(trace: Trace, over: Partial<IndependentSeedInput> = {}): IndependentSeedInput {
   return {
     barePath: bare, branch: BRANCH, key: KEY, runId: RUN, attemptId: S_ID,
-    predecessor: { clonePath: P_PATH, attemptId: P_ID, generation: 1, journalDigest: restoreDigest(pRaw), slotOwner: { worker: "worker-incarnation-1", epoch: "epoch-1" } },
+    predecessor: { clonePath: P_PATH, attemptId: P_ID, generation: 1, journalDigest: restoreDigest(pRaw), slotOwner: { worker: "worker-incarnation-1", epoch: "epoch-1" }, root: { dev: "2049", ino: "131072" } },
+    boundary: { predecessor: "c".repeat(64), successor: "d".repeat(64) },
     pin: { captureId: "capture-1", generation: 1, sourceSha: pinSha, finalization: true },
     defaultBranch: "main",
     predecessorUnchanged: async () => { trace.steps.push("predecessorUnchanged"); return true; },
@@ -203,6 +204,8 @@ describe("seedIndependentAttempt: the happy path", () => {
     assert.deepEqual(r.basis.pin, { captureId: "capture-1", generation: 1, sourceSha: pinSha, finalization: true });
     assert.equal(r.basis.restoreTip, pinSha);
     assert.equal(r.basis.journalDigest, restoreDigest(pRaw));
+    assert.deepEqual(r.basis.predecessor.root, { dev: "2049", ino: "131072" }, "the caller's root identity is persisted");
+    assert.deepEqual(r.basis.boundary, { predecessor: "c".repeat(64), successor: "d".repeat(64) });
     assert.ok(ledgerValues().map(v => JSON.parse(v)).some(e => e.attemptId === S_ID && e.state === "live" && Object.keys(e).join() === "attemptId,runId,clonePath,state"),
       "the ledger entry has the four-field rc.2 shape");
     // The hook saw S's path under "seed-attempt" and never P's.
@@ -248,6 +251,16 @@ describe("seedIndependentAttempt: the happy path", () => {
 describe("seedIndependentAttempt: pre-checks refuse before the first bare write", () => {
   it("P's raw journal no longer hashes to the expected digest", async () => {
     await refusesCleanly({ predecessor: { ...seedInput({ steps: [] }).predecessor, journalDigest: restoreDigest("something else") } }, "predecessor_changed");
+  });
+  it("a malformed root identity or boundary digest refuses basis_malformed before any write", async () => {
+    const p = seedInput({ steps: [] }).predecessor;
+    for (const root of [{ dev: "0x1", ino: "5" }, { dev: "1", ino: "" }, { dev: "1", ino: "9".repeat(31) }, { dev: 1, ino: "5" }, undefined]) {
+      await refusesCleanly({ predecessor: { ...p, root: root as never } }, "basis_malformed");
+    }
+    for (const boundary of [{ predecessor: "C".repeat(64), successor: "d".repeat(64) }, { predecessor: "c".repeat(64), successor: "d".repeat(63) },
+      { predecessor: "c".repeat(64) }, undefined]) {
+      await refusesCleanly({ boundary: boundary as never }, "basis_malformed");
+    }
   });
   it("P's journal changed after the caller read it", async () => {
     await refusesCleanly({}, "predecessor_changed", () => setKey(P_KEY, JSON.stringify({ runId: RUN, clonePath: P_PATH, attemptId: P_ID, restoreTip: "a".repeat(40) })));
