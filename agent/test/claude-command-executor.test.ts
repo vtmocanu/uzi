@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import type { Options as SdkOptions, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
-import { CredentialSwitchSignal } from "../src/steering.js";
+import { CredentialSwitchSignal, PauseNowSignal, type PauseMode } from "../src/steering.js";
 import type { RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
 import type { AgentTemplate } from "../src/protocol.js";
@@ -601,56 +601,59 @@ describe("protected CLI roots and executor seams", () => {
   });
 });
 
+const TOOL_INPUT = { command: "echo hi" };
+
+function liveCapture(): { capture: () => CapturedMemoryContext } {
+  const { capture } = fakeCapture();
+  return {
+    capture: () => {
+      const captured = capture() as unknown as { commands: Record<string, unknown> };
+      Object.assign(captured.commands, {
+        isCurrent: () => true,
+        admissionReason: () => undefined,
+        admissionMessage: () => "x",
+        phaseRevision: () => 1,
+      });
+      return captured as unknown as CapturedMemoryContext;
+    },
+  };
+}
+
+/** Attribute and run one guarded command on the executor's lane; launch is stubbed and counted. */
+function guardedRunner(executor: SdkExecutor): { run: (id: string) => Promise<string>; launches: { n: number } } {
+  const launches = { n: 0 };
+  let stubbed: ClaudeCommandLane | undefined;
+  return {
+    launches,
+    run: async (id) => {
+      const lane = (executor as unknown as { guardLane: ClaudeCommandLane }).guardLane;
+      if (stubbed !== lane) {
+        (lane as unknown as { launch: () => Promise<never> }).launch = async () => { launches.n++; throw new Error("sentinel-launch"); };
+        stubbed = lane;
+      }
+      await (lane.hook as (input: unknown) => Promise<unknown>)({
+        hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: TOOL_INPUT, tool_use_id: id,
+      });
+      const result = await lane.handle(TOOL_INPUT, { _meta: { "claudecode/toolUseId": id } });
+      return result.content.map((c) => c.text ?? "").join("");
+    },
+  };
+}
+
+/** A turn that runs one guarded command, then yields `messages`. */
+function commandTurn(run: (id: string) => Promise<string>, id: string, texts: string[], messages: SDKMessage[]): (signal: AbortSignal) => AsyncIterable<SDKMessage> {
+  return () => (async function* () {
+    texts.push(await run(id));
+    yield* messages;
+  })();
+}
+
+const LAUNCHED = "Command could not be started: sentinel-launch";
+const REFUSED = "cancelled before it started";
+
 // Issue #4076: a credential switch that gives up leaves the shared cancel signal aborted with a
 // CredentialSwitchSignal. The retried turn's guarded commands must still run.
 describe("guarded commands after a given-up credential switch (#4076)", () => {
-  const TOOL_INPUT = { command: "echo hi" };
-
-  function liveCapture(): { capture: () => CapturedMemoryContext } {
-    const { capture } = fakeCapture();
-    return {
-      capture: () => {
-        const captured = capture() as unknown as { commands: Record<string, unknown> };
-        Object.assign(captured.commands, {
-          isCurrent: () => true,
-          admissionReason: () => undefined,
-          admissionMessage: () => "x",
-          phaseRevision: () => 1,
-        });
-        return captured as unknown as CapturedMemoryContext;
-      },
-    };
-  }
-
-  /** Attribute and run one guarded command on the executor's lane; launch is stubbed and counted. */
-  function guardedRunner(executor: SdkExecutor): { run: (id: string) => Promise<string>; launches: { n: number } } {
-    const launches = { n: 0 };
-    let stubbed: ClaudeCommandLane | undefined;
-    return {
-      launches,
-      run: async (id) => {
-        const lane = (executor as unknown as { guardLane: ClaudeCommandLane }).guardLane;
-        if (stubbed !== lane) {
-          (lane as unknown as { launch: () => Promise<never> }).launch = async () => { launches.n++; throw new Error("sentinel-launch"); };
-          stubbed = lane;
-        }
-        await (lane.hook as (input: unknown) => Promise<unknown>)({
-          hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: TOOL_INPUT, tool_use_id: id,
-        });
-        const result = await lane.handle(TOOL_INPUT, { _meta: { "claudecode/toolUseId": id } });
-        return result.content.map((c) => c.text ?? "").join("");
-      },
-    };
-  }
-
-  /** A turn that runs one guarded command, then yields `messages`. */
-  function commandTurn(run: (id: string) => Promise<string>, id: string, texts: string[], messages: SDKMessage[]): (signal: AbortSignal) => AsyncIterable<SDKMessage> {
-    return () => (async function* () {
-      texts.push(await run(id));
-      yield* messages;
-    })();
-  }
-
   it("a planning turn retried after a given-up switch runs its guarded command", async () => {
     const cancel = new AbortController();
     const texts: string[] = [];
@@ -752,5 +755,327 @@ describe("guarded commands after a given-up credential switch (#4076)", () => {
     assert.ok(texts[0]!.includes("cancelled before it started"), String(texts[0]));
     assert.equal(runner.launches.n, 0);
     assert.ok(outcome instanceof Error && /run cancelled/.test(outcome.message), "the run ends as cancelled");
+  });
+});
+
+// Issue #4090: a `now`/`wall` pause aborts the shared cancel signal with a PauseNowSignal, which
+// cannot be reset. When the park is declined or refused the run continues in place, and the
+// restarted turn's guarded commands must run, unless an interrupt was dropped by the first-wins
+// trip this run (then the stale abort keeps fencing in front of the lost stop).
+describe("guarded commands after a declined or refused pause (#4090)", () => {
+  /** Mirrors steering: abort the shared controller, then fire the paired re-armable interrupt. */
+  function steering(): {
+    cancel: AbortController;
+    ctx: Partial<RunContext>;
+    pause: (mode: "now" | "wall") => void;
+    switchCredential: () => void;
+    pauseInterrupt: () => void;
+    setMode: (mode: PauseMode) => void;
+  } {
+    const cancel = new AbortController();
+    let mode: PauseMode = null;
+    let onPause: (() => void) | undefined;
+    let onSwitch: (() => void) | undefined;
+    return {
+      cancel,
+      ctx: {
+        signal: cancel.signal,
+        pauseModeRequested: () => mode,
+        clearWallMode: () => { if (mode === "wall") mode = null; },
+        onPauseNow: (cb) => { onPause = cb; },
+        onCredentialSwitch: (cb) => { onSwitch = cb; },
+      },
+      pause: (next) => {
+        mode = next;
+        if (!cancel.signal.aborted) cancel.abort(new PauseNowSignal());
+        onPause?.();
+      },
+      switchCredential: () => {
+        if (!cancel.signal.aborted) cancel.abort(new CredentialSwitchSignal());
+        onSwitch?.();
+      },
+      pauseInterrupt: () => onPause?.(),
+      setMode: (next) => { mode = next; },
+    };
+  }
+
+  const planTurn = (): Script => [submitPlan("plan"), resultSuccess()];
+  const doneMessages = (): SDKMessage[] => [signalDone(), resultSuccess()];
+  const settle = (p: Promise<unknown>): Promise<unknown> => p.then(() => undefined, (err: unknown) => err);
+
+  it("(a) a declined `now` pause: the restarted turn's guarded command launches, after one park request", async () => {
+    const s = steering();
+    const texts: string[] = [];
+    let parks = 0;
+    let runner!: ReturnType<typeof guardedRunner>;
+    const { queryFn, seen } = fakeTurns([
+      planTurn(),
+      actThenHang(() => s.pause("now")),
+      (signal) => commandTurn((id) => runner.run(id), "toolu_a", texts, doneMessages())(signal),
+    ]);
+    const executor = new SdkExecutor(nullLogger(), homeDir, { queryFn });
+    runner = guardedRunner(executor);
+    await executor.run(makeCtx({
+      ...s.ctx, capturedMemory: liveCapture().capture,
+      parkForPause: async () => { parks++; s.setMode(null); return false; },
+    }));
+    assert.equal(parks, 1, "the abort and its paired interrupt are one stop");
+    assert.equal(seen.length, 3);
+    assert.deepEqual(texts.map((t) => t.includes(LAUNCHED)), [true], String(texts));
+    assert.equal(runner.launches.n, 1);
+  });
+
+  it("(b) a refused `wall` pause: the restarted turn's guarded command launches", async () => {
+    const s = steering();
+    const texts: string[] = [];
+    let walls = 0;
+    let runner!: ReturnType<typeof guardedRunner>;
+    const { queryFn } = fakeTurns([
+      planTurn(),
+      actThenHang(() => s.pause("wall")),
+      (signal) => commandTurn((id) => runner.run(id), "toolu_b", texts, doneMessages())(signal),
+    ]);
+    const executor = new SdkExecutor(nullLogger(), homeDir, { queryFn });
+    runner = guardedRunner(executor);
+    await executor.run(makeCtx({
+      ...s.ctx, capturedMemory: liveCapture().capture,
+      parkForWall: async () => { walls++; return "refused"; },
+    }));
+    assert.equal(walls, 1);
+    assert.deepEqual(texts.map((t) => t.includes(LAUNCHED)), [true], String(texts));
+    assert.equal(runner.launches.n, 1);
+  });
+
+  it("(c) a refused REASON_WALL park with the shared signal never aborted: the guarded command launches", async () => {
+    const s = steering();
+    const texts: string[] = [];
+    let walls = 0;
+    let runner!: ReturnType<typeof guardedRunner>;
+    const { queryFn } = fakeTurns([
+      planTurn(),
+      actThenHang(() => {}), // the local wall timer trips the turn
+      (signal) => commandTurn((id) => runner.run(id), "toolu_c", texts, doneMessages())(signal),
+    ]);
+    const executor = new SdkExecutor(nullLogger(), homeDir, { queryFn });
+    runner = guardedRunner(executor);
+    await executor.run(makeCtx({
+      ...s.ctx, capturedMemory: liveCapture().capture,
+      config: { idle_timeout_seconds: 100, run_timeout_seconds: 0.05 },
+      reportIteration: async () => (walls > 0 ? { totalWallSeconds: 60 } : undefined),
+      parkForWall: async () => { walls++; return "refused"; },
+    }));
+    assert.equal(walls, 1);
+    assert.equal(s.cancel.signal.aborted, false);
+    assert.deepEqual(texts.map((t) => t.includes(LAUNCHED)), [true], String(texts));
+    assert.equal(runner.launches.n, 1);
+  });
+
+  it("(c2) a pause landing while the wall trip is held stays fenced after the refused park", async () => {
+    const s = steering();
+    const texts: string[] = [];
+    let walls = 0;
+    let runner!: ReturnType<typeof guardedRunner>;
+    const { queryFn } = fakeTurns([
+      planTurn(),
+      actThenHang(() => {}),
+      (signal) => commandTurn((id) => runner.run(id), "toolu_c2", texts, doneMessages())(signal),
+    ]);
+    const executor = new SdkExecutor(nullLogger(), homeDir, { queryFn });
+    runner = guardedRunner(executor);
+    await settle(executor.run(makeCtx({
+      ...s.ctx, capturedMemory: liveCapture().capture,
+      config: { idle_timeout_seconds: 100, run_timeout_seconds: 0.05 },
+      reportIteration: async () => (walls > 0 ? { totalWallSeconds: 60 } : undefined),
+      parkForWall: async () => { walls++; s.pause("wall"); return "refused"; },
+    })));
+    assert.equal(walls, 1);
+    assert.equal(texts.length, 1);
+    assert.ok(texts[0]!.includes(REFUSED), String(texts[0]));
+    assert.equal(runner.launches.n, 0);
+  });
+
+  it("(d) a newer `now` interrupt inside an awaited declined park keeps the next command fenced", async () => {
+    const s = steering();
+    const texts: string[] = [];
+    let parks = 0;
+    let runner!: ReturnType<typeof guardedRunner>;
+    const { queryFn } = fakeTurns([
+      planTurn(),
+      actThenHang(() => s.pause("now")),
+      (signal) => commandTurn((id) => runner.run(id), "toolu_d", texts, doneMessages())(signal),
+    ]);
+    const executor = new SdkExecutor(nullLogger(), homeDir, { queryFn });
+    runner = guardedRunner(executor);
+    await settle(executor.run(makeCtx({
+      ...s.ctx, capturedMemory: liveCapture().capture,
+      parkForPause: async () => {
+        if (++parks === 1) { s.pause("now"); s.setMode(null); return false; }
+        return true;
+      },
+    })));
+    assert.equal(texts.length, 1);
+    assert.ok(texts[0]!.includes(REFUSED), String(texts[0]));
+    assert.equal(runner.launches.n, 0);
+  });
+
+  it("(e) a consumed pause is re-fenced once a later interrupt drops", async () => {
+    const s = steering();
+    const texts: string[] = [];
+    let parks = 0;
+    let runner!: ReturnType<typeof guardedRunner>;
+    const { queryFn } = fakeTurns([
+      planTurn(),
+      actThenHang(() => s.pause("now")),
+      // eslint-disable-next-line require-yield
+      (signal) => (async function* () {
+        texts.push(await runner.run("toolu_e1"));
+        s.pause("now");
+        await hang(signal);
+      })(),
+      (signal) => commandTurn((id) => runner.run(id), "toolu_e2", texts, doneMessages())(signal),
+    ]);
+    const executor = new SdkExecutor(nullLogger(), homeDir, { queryFn });
+    runner = guardedRunner(executor);
+    await settle(executor.run(makeCtx({
+      ...s.ctx, capturedMemory: liveCapture().capture,
+      parkForPause: async () => {
+        parks++;
+        if (parks === 2) s.pauseInterrupt(); // dropped: the second pause's trip is still held
+        if (parks <= 2) { s.setMode(null); return false; }
+        return true;
+      },
+    })));
+    assert.equal(texts.length, 2, String(texts));
+    assert.ok(texts[0]!.includes(LAUNCHED), String(texts[0]));
+    assert.ok(texts[1]!.includes(REFUSED), String(texts[1]));
+    assert.equal(runner.launches.n, 1);
+  });
+
+  it("(f) a credential-switch interrupt inside an awaited declined park keeps the next command fenced", async () => {
+    const s = steering();
+    const texts: string[] = [];
+    let runner!: ReturnType<typeof guardedRunner>;
+    const { queryFn } = fakeTurns([
+      planTurn(),
+      actThenHang(() => s.pause("now")),
+      (signal) => commandTurn((id) => runner.run(id), "toolu_f", texts, doneMessages())(signal),
+    ]);
+    const executor = new SdkExecutor(nullLogger(), homeDir, { queryFn });
+    runner = guardedRunner(executor);
+    await settle(executor.run(makeCtx({
+      ...s.ctx, capturedMemory: liveCapture().capture,
+      parkForPause: async () => { s.switchCredential(); s.setMode(null); return false; },
+    })));
+    assert.equal(texts.length, 1);
+    assert.ok(texts[0]!.includes(REFUSED), String(texts[0]));
+    assert.equal(runner.launches.n, 0);
+  });
+
+  it("(g) a credential switch after the pause trip but before the park keeps the next command fenced", async () => {
+    const s = steering();
+    const texts: string[] = [];
+    let parks = 0;
+    let runner!: ReturnType<typeof guardedRunner>;
+    const { queryFn } = fakeTurns([
+      planTurn(),
+      // eslint-disable-next-line require-yield
+      (signal) => (async function* () {
+        s.pause("now");
+        await hang(signal);
+        s.switchCredential(); // lands while the aborted turn drains, before parkForPause
+      })(),
+      (signal) => commandTurn((id) => runner.run(id), "toolu_g", texts, doneMessages())(signal),
+    ]);
+    const executor = new SdkExecutor(nullLogger(), homeDir, { queryFn });
+    runner = guardedRunner(executor);
+    await settle(executor.run(makeCtx({
+      ...s.ctx, capturedMemory: liveCapture().capture,
+      parkForPause: async () => { parks++; s.setMode(null); return false; },
+    })));
+    assert.equal(parks, 1);
+    assert.equal(texts.length, 1);
+    assert.ok(texts[0]!.includes(REFUSED), String(texts[0]));
+    assert.equal(runner.launches.n, 0);
+  });
+
+  it("a pause dropped during a switch attempt re-fences a consumed pause before the give-up continue", async () => {
+    const s = steering();
+    const texts: string[] = [];
+    let parks = 0;
+    let switches = 0;
+    let runner!: ReturnType<typeof guardedRunner>;
+    const { queryFn } = fakeTurns([
+      planTurn(),
+      actThenHang(() => s.pause("now")),
+      // eslint-disable-next-line require-yield
+      (signal) => (async function* () {
+        texts.push(await runner.run("toolu_r1"));
+        s.switchCredential(); // the controller is spent: only the re-armable interrupt trips
+        await hang(signal);
+      })(),
+      (signal) => commandTurn((id) => runner.run(id), "toolu_r2", texts, doneMessages())(signal),
+    ]);
+    const executor = new SdkExecutor(nullLogger(), homeDir, { queryFn });
+    runner = guardedRunner(executor);
+    await settle(executor.run(makeCtx({
+      ...s.ctx, capturedMemory: liveCapture().capture,
+      parkForPause: async () => { parks++; s.setMode(null); return false; },
+      // A pause interrupt dropped during the attempt (the switch trip is held); no pause mode is
+      // set, so no pause handler (and no settle site) runs before the restarted turn.
+      attemptCredentialSwitch: async () => { switches++; s.pauseInterrupt(); return "gave_up"; },
+    })));
+    assert.equal(parks, 1, "only the first pause reached a pause handler");
+    assert.equal(switches, 1);
+    assert.equal(texts.length, 2, String(texts));
+    assert.ok(texts[0]!.includes(LAUNCHED), String(texts[0]));
+    assert.ok(texts[1]!.includes(REFUSED), String(texts[1]));
+    assert.equal(runner.launches.n, 1);
+  });
+
+  it("a signal-only context (no re-armable interrupt wired): a declined pause launches the next command", async () => {
+    const s = steering();
+    const texts: string[] = [];
+    let parks = 0;
+    let runner!: ReturnType<typeof guardedRunner>;
+    const { queryFn } = fakeTurns([
+      planTurn(),
+      actThenHang(() => s.pause("now")),
+      (signal) => commandTurn((id) => runner.run(id), "toolu_s", texts, doneMessages())(signal),
+    ]);
+    const executor = new SdkExecutor(nullLogger(), homeDir, { queryFn });
+    runner = guardedRunner(executor);
+    const { onPauseNow: _p, onCredentialSwitch: _c, ...signalOnly } = s.ctx;
+    await executor.run(makeCtx({
+      ...signalOnly, capturedMemory: liveCapture().capture,
+      parkForPause: async () => { parks++; s.setMode(null); return false; },
+    }));
+    assert.equal(parks, 1);
+    assert.deepEqual(texts.map((t) => t.includes(LAUNCHED)), [true], String(texts));
+    assert.equal(runner.launches.n, 1);
+  });
+
+  it("an initially-aborted signal on a pre-approved resume: a declined pause launches the next command", async () => {
+    const s = steering();
+    // Before run(): the executor sees an already-aborted signal at setup. No pause mode is seeded,
+    // so the resume boundary's seeded park stays out of it and the setup trip alone parks.
+    s.pause("now");
+    s.setMode(null);
+    const texts: string[] = [];
+    let parks = 0;
+    let runner!: ReturnType<typeof guardedRunner>;
+    const { queryFn, seen } = fakeTurns([
+      (signal) => commandTurn((id) => runner.run(id), "toolu_i", texts, doneMessages())(signal),
+    ]);
+    const executor = new SdkExecutor(nullLogger(), homeDir, { queryFn });
+    runner = guardedRunner(executor);
+    await executor.run(makeCtx({
+      ...s.ctx, capturedMemory: liveCapture().capture,
+      planApproved: true, approvedPlan: "approved", sessionId: "sess-1",
+      parkForPause: async () => { parks++; s.setMode(null); return false; },
+    }));
+    assert.equal(parks, 1);
+    assert.equal(seen.length, 1, "the tripped turn never reached the provider");
+    assert.deepEqual(texts.map((t) => t.includes(LAUNCHED)), [true], String(texts));
+    assert.equal(runner.launches.n, 1);
   });
 });
