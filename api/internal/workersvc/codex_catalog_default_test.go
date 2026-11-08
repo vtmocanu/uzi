@@ -183,25 +183,3 @@ func TestSelectCatalogDefault(t *testing.T) {
 		}
 	}
 }
-
-func TestCodexWorkerDefaultModel(t *testing.T) {
-	txt := func(s string) pgtype.Text { return pgtype.Text{String: s, Valid: true} }
-	for _, c := range []struct {
-		name      string
-		lane, pin pgtype.Text
-		want      string
-	}{
-		{"lane wins over pin", txt("gpt-6-sol"), txt("gpt-6-astra"), "gpt-6-sol"},
-		{"lane custom id passes through", txt("gpt-custom-1"), txt("gpt-6-astra"), "gpt-custom-1"},
-		{"provider default", pgtype.Text{}, pgtype.Text{}, "gpt-6.1-sol"},
-		{"empty lane is unset", txt(""), pgtype.Text{}, "gpt-6.1-sol"},
-		{"empty lane still wins over a role-model pin", txt(""), txt("gpt-6-luna"), "gpt-6.1-sol"},
-		{"lead role-model pin", pgtype.Text{}, txt("gpt-6-luna"), "gpt-6-luna"},
-		{"pin outside the role models is ignored", pgtype.Text{}, txt("gpt-custom-1"), "gpt-6.1-sol"},
-		{"claude alias pin is ignored", pgtype.Text{}, txt("opus"), "gpt-6.1-sol"},
-	} {
-		if got := CodexWorkerDefaultModel(c.lane, c.pin); got != c.want {
-			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
-		}
-	}
-}

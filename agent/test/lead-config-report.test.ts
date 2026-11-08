@@ -128,8 +128,8 @@ describe("lead request matrix (fixtures/lead-config/contract.json request_cases)
       visited.add(c.id);
     }
     assert.deepEqual([...visited].sort(), LEAD_REQUEST_CASES.map((c) => c.id).sort());
-    assert.equal(LEAD_REQUEST_CASES.length, 26);
-    assert.equal(visited.size, 26, "all shared request cases exercised");
+    assert.equal(LEAD_REQUEST_CASES.length, 31);
+    assert.equal(visited.size, 31, "all shared request cases exercised");
   });
 
   it("a blank claim model falls back to the template (|| not ??), and nothing resolves to no model", () => {

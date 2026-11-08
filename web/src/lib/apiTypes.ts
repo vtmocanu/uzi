@@ -244,6 +244,193 @@ export interface CatalogDefault {
   observed_at: string | null;
 }
 
+/** PRD #3254: the closed provenance vocabularies of the effective-settings view, mirroring the
+ *  Go constants (handler/effective_settings.go, workersvc/effective_settings.go) and the
+ *  source_labels of fixtures/model-settings/contract.json. */
+type EffectiveModelSource =
+  | "user_default" | "instance_default" | "builtin" | "schedule_pin" | "template"
+  | "cross_check_pin" | "cross_check_worker_default";
+type EffectiveEffortSource =
+  | "user_default" | "builtin" | "cross_check_pin" | "cross_check_default";
+type EffectiveHarnessSource = "run_override" | "schedule_pin" | "user_default" | "automatic" | "chosen_at_create";
+type EffectiveCredentialSource =
+  | "claim_selection" | "codex_default_credential" | "chosen_at_create" | "auto_selection" | "owner_default" | "token_override";
+type EffectiveRefusal =
+  | "no_credential_for_harness" | "no_usable_credential" | "credential_disabled" | "credential_not_found"
+  | "credential_override_harness_unsupported" | "credential_override_invalid";
+type EffectiveRefusalDetail = "credential_disabled" | "codex_pool_unavailable";
+type EffectiveModelSetting = "worker_model" | "judge_model" | "summary_model" | "task_review_model" | "cross_check_plan" | "cross_check_code";
+type EffectiveEffortSetting = "worker_effort" | "task_review_effort" | "cross_check_plan" | "cross_check_code";
+
+/** PRD #3254: a supplied value that does not apply (a schedule's model pin on the other harness). */
+export interface EffectiveIgnored {
+  value: string;
+  source: string;
+}
+
+/** PRD #3254: one harness's model cell of a setting (the shared ModelSettingCell, flattened)
+ *  plus which setting it is and when the value is fixed. `resolved_model` "" means the runtime
+ *  decides (note `sdk_default`). `fixed_at` is create or claim. */
+export interface EffectiveModelCell extends ModelSettingCell {
+  source: EffectiveModelSource;
+  setting: EffectiveModelSetting;
+  fixed_at: string;
+  ignored: EffectiveIgnored | null;
+  notes: string[];
+}
+
+/** PRD #3254: one harness's effort cell (the shared EffortSettingCell, flattened). */
+export interface EffectiveEffortCell extends EffortSettingCell {
+  source: EffectiveEffortSource;
+  setting: EffectiveEffortSetting;
+  fixed_at: string;
+  notes: string[];
+}
+
+/** PRD #3254: which credential a run would use and when that is fixed, never which one.
+ *  `kind` is anthropic or codex; `auth_mode` (codex only) is subscription or api_key. */
+export interface Credential {
+  kind: string;
+  source: EffectiveCredentialSource;
+  fixed_at: string;
+  auth_mode: string | null;
+}
+
+/** PRD #3254: a predicted harness. `value` is null with source chosen_at_create when a
+ *  creation-time policy (a note: automatic_weekly_reset or overflow) picks it at creation. */
+export interface HarnessValue {
+  value: string | null;
+  source: EffectiveHarnessSource;
+  fixed_at: string;
+  notes: string[];
+}
+
+export interface EffectiveHarness {
+  harness: Harness;
+  usable: boolean;
+  refusal: EffectiveRefusal | null;
+  refusal_detail: EffectiveRefusalDetail | null;
+  credential: Credential | null;
+}
+
+export interface EffectiveStartChoice {
+  choice: string;
+  harness: HarnessValue | null;
+  refusal: EffectiveRefusal | null;
+  refusal_detail: EffectiveRefusalDetail | null;
+  anthropic_override_allowed: boolean;
+}
+
+/** GET /api/me/effective-settings (PRD #3254). */
+export interface EffectiveSettings {
+  version: number;
+  harnesses: EffectiveHarness[];
+  start: EffectiveStartChoice[];
+  models: EffectiveModelCell[];
+  efforts: EffectiveEffortCell[];
+  cross_check: { models: EffectiveModelCell[]; efforts: EffectiveEffortCell[] };
+}
+
+export interface StartPreviewCredentialOverride {
+  mode: string;
+  secret_id?: string;
+}
+
+/** POST /api/me/effective-settings/start-preview body. */
+export interface StartPreviewRequest {
+  harness: string | null;
+  credential_override: StartPreviewCredentialOverride | null;
+}
+
+/** One harness a creation-time policy might choose, computed as if it were chosen. A refused
+ *  branch has a null credential and its own refusal; both are null on a valid branch. */
+export interface StartPreviewAlternative {
+  harness: string;
+  credential: Credential | null;
+  refusal: EffectiveRefusal | null;
+  refusal_detail: EffectiveRefusalDetail | null;
+}
+
+/** The start-preview response. When the harness is chosen at creation, `credential` is null and
+ *  `alternatives` lists Claude then Codex. A top-level `refusal` is set only for a failure before
+ *  a harness is decided, or when every alternative is refused for the same reason. */
+export interface StartPreview {
+  version: number;
+  harness: HarnessValue | null;
+  refusal: EffectiveRefusal | null;
+  refusal_detail: EffectiveRefusalDetail | null;
+  credential: Credential | null;
+  alternatives?: StartPreviewAlternative[];
+}
+
+/** PRD #3254 M3: the schedule preview's refusals, the start-preview set plus the save-step
+ *  (invalid_model, credential_override_lane_not_switchable) and fire-step (codex_override_conflict,
+ *  codex_pool_unavailable) ones, mirroring handler/effective_settings_schedule.go and the
+ *  scheduler's skip reasons it maps. */
+type ScheduleRefusal =
+  | EffectiveRefusal | "invalid_model" | "credential_override_lane_not_switchable"
+  | "codex_override_conflict" | "codex_pool_unavailable";
+
+/** POST /api/me/effective-settings/schedule-preview body. Without `schedule_id` it is a draft and
+ *  `target` is required; with it, supplied fields replace the stored ones. `harness`, `model` and
+ *  `credential_override` distinguish omitted (as stored) from null (clear). */
+export interface ScheduleSettingsPreviewRequest {
+  schedule_id?: string;
+  target?: string;
+  harness?: string | null;
+  model?: string | null;
+  override_subagent_model?: boolean;
+  credential_override?: StartPreviewCredentialOverride | null;
+}
+
+/** One own subagent whose template pins a model for the harness. */
+export interface EffectiveSubagentPin {
+  name: string;
+  model: string;
+}
+
+/** How a run's subagents pick a model. `lead_value` "" means the SDK decides. `pinned` lists at
+ *  most 32 subagents sorted by name; `pinned_truncated` says there were more. */
+export interface EffectiveSubagents {
+  mode: "follow_lead" | "own_pins";
+  lead_value: string;
+  pinned: EffectiveSubagentPin[];
+  pinned_truncated: boolean;
+  /** Labels; `repo_agents_not_predicted` is always present. */
+  notes: string[];
+}
+
+/** One harness a creation-time policy might choose for a schedule fire, computed as if it were
+ *  chosen. A refused branch has null worker_model, worker_effort, credential and subagents and
+ *  carries its own refusal; both refusal fields are null on a valid branch. */
+export interface ScheduleAlternative {
+  harness: string;
+  worker_model: EffectiveModelCell | null;
+  worker_effort: EffectiveEffortCell | null;
+  credential: Credential | null;
+  subagents: EffectiveSubagents | null;
+  refusal: ScheduleRefusal | null;
+  refusal_detail: EffectiveRefusalDetail | null;
+}
+
+/** The schedule-preview response: what firing the schedule now and claiming the run would use.
+ *  When the harness is chosen at creation, `harness.value` is null, the four harness-dependent
+ *  fields are null and `alternatives` lists Claude then Codex. A top-level `refusal` is set for a
+ *  save-step failure, a failure before the harness is decided, a fire-rule refusal on a known
+ *  harness, or when every alternative is refused for the same reason. */
+export interface ScheduleSettingsPreview {
+  version: number;
+  harness: HarnessValue | null;
+  refusal: ScheduleRefusal | null;
+  refusal_detail: EffectiveRefusalDetail | null;
+  worker_model: EffectiveModelCell | null;
+  worker_effort: EffectiveEffortCell | null;
+  credential: Credential | null;
+  subagents: EffectiveSubagents | null;
+  notes: string[];
+  alternatives?: ScheduleAlternative[];
+}
+
 export interface UserSettings {
   vault_auto_reunlock?: boolean;
   cross_check_pins?: CrossCheckPinDTO[];
