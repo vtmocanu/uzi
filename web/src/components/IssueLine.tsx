@@ -8,7 +8,7 @@
 import { useId, type ReactNode } from "react";
 import type { RunSummaryItem } from "../lib/api";
 import { maskEmail } from "../lib/demoMask";
-import { runRef, type IssueLineModel, type IssueStage, type IssueWorkScope, type LineEntry } from "../lib/issueLine";
+import { crossCheckTag, runRef, type CrossCheckTag, type IssueLineModel, type IssueStage, type IssueWorkScope, type LineEntry } from "../lib/issueLine";
 import { stripUnsafeChars } from "../lib/safeText";
 import { ActivityIcon, ChatIcon, ClockIcon } from "./icons";
 import { Badge, RUN_STATUS_TONES, type BadgeTone } from "./ui";
@@ -57,29 +57,42 @@ const STATIONS: Station[] = [
   { stage: "pr", label: "PR open", tone: "ok", flows: false },
 ];
 
+// The inner pill of a cross-check tag, after the chip's own tone.
+const TAG_CLASSES: Record<CrossCheckTag["tone"], string> = {
+  check: "bg-faint/20",
+  warn: "bg-warn/20 text-warn",
+  danger: "bg-danger/20 text-danger",
+};
+
 function RunBadges({
   runs,
   tone,
+  stage,
   demo,
 }: {
   runs: { run: RunSummaryItem; own: boolean }[];
   tone: BadgeTone;
+  stage: IssueStage;
   demo: boolean;
 }) {
   if (runs.length === 0) return null;
   const shown = runs.slice(0, MAX_BADGES);
   return (
     <span className="mt-2 flex min-w-0 flex-wrap gap-1">
-      {shown.map(({ run, own }) => (
-        <Badge
-          key={run.id}
-          tone={tone}
-          // Another user's run names its owner on hover, masked in demo mode.
-          title={!own && run.owner_email ? stripUnsafeChars(maskEmail(run.owner_email, demo)) : undefined}
-        >
-          {runRef(run)}
-        </Badge>
-      ))}
+      {shown.map(({ run, own }) => {
+        const tag = crossCheckTag(run, stage);
+        // Another user's run names its owner on hover, masked in demo mode; a tag adds its meaning.
+        const ownerPart = !own && run.owner_email ? maskEmail(run.owner_email, demo) : undefined;
+        const title = [ownerPart, tag?.title].filter(Boolean).join(" · ");
+        return (
+          <Badge key={run.id} tone={tone} wrap={tag != null} title={title ? stripUnsafeChars(title) : undefined}>
+            {runRef(run)}
+            {tag && (
+              <span className={`ml-1 rounded px-1 ${TAG_CLASSES[tag.tone]}`}>{stripUnsafeChars(tag.text)}</span>
+            )}
+          </Badge>
+        );
+      })}
       {runs.length > shown.length && <Badge tone="neutral">+{runs.length - shown.length}</Badge>}
     </span>
   );
@@ -164,7 +177,7 @@ function StationButton({
       </span>
       <span className="text-xs text-faint">{caption}</span>
       {note && <span className="text-xs text-faint opacity-80">{note}</span>}
-      <RunBadges runs={entries} tone={station.tone} demo={demo} />
+      <RunBadges runs={entries} tone={station.tone} stage={station.stage} demo={demo} />
     </button>
   );
 }

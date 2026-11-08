@@ -5,6 +5,7 @@
 // the existing seams (parkLabel, parkDisposition), so no second rule lives here.
 
 import { isTerminalRun, type RunSummaryItem } from "./api";
+import { planCrossCheckGateLabel } from "./crossCheckGate";
 import { openPrs, parkDisposition } from "./overview";
 import type { AdminRunsState } from "./useOverviewData";
 import { isAccountCooldownWaiting, isPlanningRun, isRevisingRun, parkLabel } from "./runBadge";
@@ -30,6 +31,8 @@ export type LineStage = Exclude<IssueStage, "pr" | "none">;
 // so a finished job or task never reaches "other", and a run in a status this list does not
 // name falls through to "building" rather than dropping off the line.
 export function issueLineStage(run: RunSummaryItem, openPrIds: ReadonlySet<string>): IssueStage {
+  // The server lists exclude checker children; this keeps them off the line even if one leaked.
+  if (run.kind === "cross_check") return "none";
   if (isTerminalRun(run.status)) return openPrIds.has(run.id) ? "pr" : "none";
   if (run.kind !== "issue") return "other";
   // Before the status rules: a cooldown run can be claimed, running or awaiting approval,
@@ -90,6 +93,30 @@ function plural(n: number, one: string, many: string): string {
 // A run's short reference: its issue number, or its kind label when it has none.
 export function runRef(run: Pick<RunSummaryItem, "issue_iid" | "kind">): string {
   return run.issue_iid != null ? `#${run.issue_iid}` : stripUnsafeChars(runKindLabel(run.kind));
+}
+
+export interface CrossCheckTag {
+  text: string;
+  tone: "check" | "warn" | "danger";
+  title: string;
+}
+
+// The small tag a run's chip carries when a cross-check is live or has gated the plan
+// review. At the review stage a recorded gate reason wins; otherwise the live-check field
+// decides. An absent field (older API) or no reason gives no tag.
+export function crossCheckTag(run: RunSummaryItem, stage: IssueStage): CrossCheckTag | null {
+  const reason = run.plan_cross_check_gate_reason;
+  if (stage === "review" && typeof reason === "string" && reason !== "") {
+    const title = planCrossCheckGateLabel(reason);
+    if (reason === "revise" || reason === "revisions_exhausted") return { text: "cross-check: revise", tone: "warn", title };
+    if (reason === "block") return { text: "cross-check: blocked", tone: "danger", title };
+    return { text: "cross-check: unavailable", tone: "warn", title };
+  }
+  if (run.cross_check_active === "plan") return { text: "cross-checking", tone: "check", title: "Plan cross-check in progress" };
+  if (run.cross_check_active === "code") {
+    return { text: "cross-checking", tone: "check", title: "Code cross-check in progress (advisory, does not block)" };
+  }
+  return null;
 }
 
 // Why a parked run waits, in the words the status pill uses.

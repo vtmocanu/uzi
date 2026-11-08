@@ -112,6 +112,31 @@ describe("IssueLine", () => {
     expect(within(station(/^Queued/)).getByText("#2").getAttribute("title")).toBe(masked);
   });
 
+  it("adds a cross-check tag to the chip, with its meaning in the tooltip", () => {
+    mount([
+      aRun({ id: "c", issue_iid: 4040, status: "running", cross_check_active: "code" }),
+      aRun({ id: "plain", issue_iid: 4041, status: "running" }),
+      aRun({ id: "g", issue_iid: 4042, status: "awaiting_approval", plan_cross_check_gate_reason: "revisions_exhausted" }),
+    ]);
+    const building = station(/^Building/);
+    const chip = within(building).getByText("#4040");
+    expect(chip.textContent).toBe("#4040cross-checking");
+    expect(within(chip).getByText("cross-checking")).toBeTruthy();
+    expect(chip.getAttribute("title")).toBe("Code cross-check in progress (advisory, does not block)");
+    expect(within(building).getByText("#4041").textContent).toBe("#4041");
+    expect(within(building).getByText("#4041").getAttribute("title")).toBeNull();
+    const gated = within(station(/^Plan review/)).getByText("#4042");
+    expect(within(gated).getByText("cross-check: revise").className).toContain("text-warn");
+    expect(gated.getAttribute("title")).toBe("Revisions exhausted");
+  });
+
+  it("joins the owner and the tag meaning in another user's chip tooltip", () => {
+    const other = theirs(aRun({ id: "x", issue_iid: 7, status: "running", cross_check_active: "plan", is_planning: true }));
+    mount([], [other], { scope: "all" });
+    const chip = within(station(/^Planning/)).getByText("#7");
+    expect(chip.getAttribute("title")).toBe("mira@uzi.local · Plan cross-check in progress");
+  });
+
   it("collapses badges past twelve into a +N badge", () => {
     const runs = Array.from({ length: 15 }, (_, i) => aRun({ id: `r${i}`, issue_iid: 100 + i }));
     mount(runs);
