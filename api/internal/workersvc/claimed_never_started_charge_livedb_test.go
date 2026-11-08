@@ -1082,8 +1082,9 @@ func (f *cncFixture) holdRows(t *testing.T, run uuid.UUID) []string {
 // charges a requeue below RUN_MAX_REQUEUES, and at the cap frozenFailRunsMissingFromSnapshotLocked
 // parks the run at recovery_wait / worker_requeue_exhausted with custody_uncertain=true. Neither
 // path touches the holds. SetRunRunning has no custody guard, so the running report is applied.
-// Every subtest also seeds testCustodyLimit-1 unrelated open holds for the owner, so the owner
-// sits at custody_hold_limit; the run still claims, which is all that is pinned about the limit.
+// Every subtest also seeds testCustodyLimit-1 unrelated open holds for the owner. The retained
+// subtests (which seed the predecessor hold too) therefore sit at custody_hold_limit; the hold-free
+// control sits one below it. The run still claims, which is all that is pinned about the limit.
 //
 // svc.Claim opens one hold per claimed generation, so three subtests isolate which hold matters:
 //   - "retained predecessor hold" keeps every hold: it ends in the park, custody_uncertain=true.
@@ -1193,7 +1194,7 @@ func TestClaimedNeverStartedChargeRetainedCustodyRunningPathLiveDB(t *testing.T)
 		if retained {
 			f.seedHold(f.userID, run, 1, "open")
 		}
-		f.seedUnrelatedOpenHolds(testCustodyLimit - 1) // the owner sits at custody_hold_limit
+		f.seedUnrelatedOpenHolds(testCustodyLimit - 1) // retained: owner at custody_hold_limit; hold-free control: one below
 		return f, run
 	}
 	parks := func(t *testing.T, mode holdMode) {
