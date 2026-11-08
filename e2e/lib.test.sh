@@ -801,10 +801,13 @@ custody_case "seed witness ignores a restore journal of another run" pass 'basis
 eval "$(awk '/^_restore_witness_script\(\) \{/ { f = 1 } f { print } /^WITNESS$/ { w = 1 } w && /^\}/ { exit }' "$LIB")"
 eval "$(_restore_witness_script | awk '/^slot_fields\(\) \{/,/^\}/')"
 slot_fields_case() {
-  local key out
+  local key out version
   key="$(printf 'a%.0s' $(seq 64))"
-  line() { jq -nc --arg key "$key" --arg epoch "$1" --arg worker "$2" --arg fp "$3" \
-    '{version:1,key:$key,state:"active",epoch:$epoch,seq:3,owner:{worker:$worker,executor:null},
+  # The production slot version, read from the store's own constant so the fixture cannot drift from it.
+  version="$(sed -n 's/^const SLOT_VERSION = "\([^"]*\)";$/\1/p' "$ROOT/agent/src/completion-authority.ts")"
+  [ -n "$version" ] || fail "SLOT_VERSION not found in agent/src/completion-authority.ts"
+  line() { jq -nc --arg version "$version" --arg key "$key" --arg epoch "$1" --arg worker "$2" --arg fp "$3" \
+    '{version:$version,key:$key,state:"active",epoch:$epoch,seq:3,owner:{worker:$worker,executor:null},
       pending:(if $fp == "" then null else {operation:"op",kind:"destructive",footprint:$fp,status:"running",residue:[]} end),
       retiring:null,publication:null,codexMarked:false,mac:"m"}'; }
   out="$(line 11111111-aaaa 22222222-bbbb '' | slot_fields)"
@@ -813,7 +816,9 @@ slot_fields_case() {
   [ "$out" = "w2 e2" ] || fail "slot with an owner-shaped fragment in a string field: [$out]"
   line e3 w3 'x' | grep -q 'owner' || fail "fixture is not canonical slot JSON"
   line e2 w2 '{"owner":{"worker":"bad"' | grep -qF '\"owner\":{\"worker\":\"bad\"' || fail "fixture does not carry the escaped fragment"
-  out="$(printf '{"version":1,"key":"k","owner":{"worker":"w"}}\n' | slot_fields)"
+  out="$(line e4 w4 '' | sed 's/^{"version":"[^"]*"/{"version":1/' | slot_fields)"
+  [ -z "$out" ] || fail "a slot with a non-production version must print nothing: [$out]"
+  out="$(printf '{"version":"%s","key":"k","owner":{"worker":"w"}}\n' "$version" | slot_fields)"
   [ -z "$out" ] || fail "a record outside the canonical key order must print nothing: [$out]"
   echo 'slot fields extracted'
 }

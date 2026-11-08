@@ -148,11 +148,11 @@ _restore_witness_script() {
   cat <<'WITNESS'
 set -eu
 # slot_fields — reads one slot file (newlines removed) on stdin, prints "worker epoch" or nothing. Slot files are
-# the compact JSON agent/src/completion-authority.ts seal writes in the fixed key order version, key, state,
+# the compact JSON agent/src/completion-authority.ts seal writes (version "uzi-authority-slot/N") in the fixed key order version, key, state,
 # epoch, seq, owner{worker, executor}, so the match is anchored at the start of the record: an owner-shaped
 # fragment inside a later string field is JSON-escaped (\"owner\") and can never match.
 slot_fields() {
-  tr -d '\n' | sed -n 's/^{"version":[0-9]*,"key":"[0-9a-f]*","state":"[a-z_]*","epoch":"\([^"\\ ]*\)","seq":[0-9]*,"owner":{"worker":"\([^"\\ ]*\)".*/\2 \1/p'
+  tr -d '\n' | sed -n 's/^{"version":"uzi-authority-slot\/[0-9]*","key":"[0-9a-f]*","state":"[a-z_]*","epoch":"\([^"\\ ]*\)","seq":[0-9]*,"owner":{"worker":"\([^"\\ ]*\)".*/\2 \1/p'
 }
 mode="$1"; shift
 case "$mode" in
