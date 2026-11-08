@@ -147,6 +147,13 @@ restore_assert_agent_identity() {
 _restore_witness_script() {
   cat <<'WITNESS'
 set -eu
+# slot_fields — reads one slot file (newlines removed) on stdin, prints "worker epoch" or nothing. Slot files are
+# the compact JSON agent/src/completion-authority.ts seal writes in the fixed key order version, key, state,
+# epoch, seq, owner{worker, executor}, so the match is anchored at the start of the record: an owner-shaped
+# fragment inside a later string field is JSON-escaped (\"owner\") and can never match.
+slot_fields() {
+  tr -d '\n' | sed -n 's/^{"version":[0-9]*,"key":"[0-9a-f]*","state":"[a-z_]*","epoch":"\([^"\\ ]*\)","seq":[0-9]*,"owner":{"worker":"\([^"\\ ]*\)".*/\2 \1/p'
+}
 mode="$1"; shift
 case "$mode" in
   journals)
@@ -172,17 +179,18 @@ case "$mode" in
   isanc)
     if git -c safe.directory='*' --git-dir="$1/.git" merge-base --is-ancestor "$2" HEAD; then echo yes; else echo no; fi ;;
   slots)
-    # one line per authority slot file: name, sha256 and owner worker incarnation (tab separated; "-" when the
-    # owner cannot be read). The slot key is a keyed hash of the clone path, so a shell cannot name P's slot;
-    # the host selects P's slots by owner (see _restore_p_slots).
+    # one line per authority slot file: name, sha256, owner worker incarnation and slot epoch (tab separated; "-"
+    # when they cannot be read). The slot key is a keyed hash of the clone path, so a shell cannot name P's slot;
+    # the host selects it by the restore basis's slotOwner (see _restore_p_slots).
     d=/data/.uzi-authority/slots
     [ -d "$d" ] || exit 0
     cd "$d"
     for f in ./*.json; do
       [ -f "$f" ] || continue
       dg="$(sha256sum "$f" | cut -d' ' -f1)"
-      ow="$(tr -d '\n' < "$f" | sed -n 's/.*"owner" *: *{ *"worker" *: *"\([^"]*\)".*/\1/p')"
-      printf '%s\t%s\t%s\n' "$f" "$dg" "${ow:--}"
+      of="$(slot_fields < "$f")"
+      if [ -n "$of" ]; then w="${of% *}"; e="${of#* }"; else w=-; e=-; fi
+      printf '%s\t%s\t%s\t%s\n' "$f" "$dg" "$w" "$e"
     done | LC_ALL=C sort ;;
   bind)
     # bind BARE KIND RUN SHA GENERATION: does the bare evidence the pin binding KIND (agent/src/git.ts
@@ -238,21 +246,22 @@ _restore_journal_bare() {
   done <<<"$1"
   return 1
 }
-# _restore_p_slots SLOTS INCARNATION — "name<TAB>digest" of the slot files in the witness `slots` output
-# owned by worker INCARNATION, sorted. The restarted worker legitimately rewrites other owners' slots
-# (shared-bare ref deletions, retirement of recorded sources); only P's are read-only to a restore.
+# _restore_p_slots SLOTS WORKER EPOCH — "name<TAB>digest" of the slot files in the witness `slots` output
+# owned by worker WORKER at epoch EPOCH, sorted. That pair is the restore basis's slotOwner, i.e. P's clone slot.
+# The restarted worker legitimately rewrites every other slot, even ones the same process owns (bare slots of
+# ref deletions, published slots of earlier runs); only P's clone slot is read-only to a restore.
 _restore_p_slots() {
-  [ -n "$2" ] || return 1
-  printf '%s\n' "$1" | awk -F'\t' -v inc="$2" 'NF >= 3 && $3 == inc { print $1 "\t" $2 }' | LC_ALL=C sort
+  [ -n "$2" ] && [ -n "$3" ] || return 1
+  printf '%s\n' "$1" | awk -F'\t' -v w="$2" -v e="$3" 'NF >= 4 && $3 == w && $4 == e { print $1 "\t" $2 }' | LC_ALL=C sort
 }
 # restore_snapshot_predecessor RUN BRANCH — take AFTER the kill and BEFORE the restart: P's recovery journal
-# value (raw) and whether it carries completionSourceFence, the digest of P's clone contents, every authority
-# slot file's digest and owner (filtered to P's incarnation at comparison time, since the log naming it does not
-# exist yet), and the run's custody hold rows (id state generation) below the successor generation,
+# value (raw), the digest of P's clone contents, every authority slot file's digest, owner and epoch (P's clone
+# slot is selected at comparison time, since the restore journal naming its owner does not exist yet), and the
+# run's custody hold rows (id state generation) below the successor generation,
 # written to $RUNROOT/.restore-p-RUN.json. The holds come from the database so they are readable while the api
 # is down. Returns non-zero (never calls fail) so callers that must restore the api first can judge it later.
 restore_snapshot_predecessor() {
-  local run="$1" branch="$2" out="$RUNROOT/.restore-p-$1.json" rows journal clone digest slots holds fence
+  local run="$1" branch="$2" out="$RUNROOT/.restore-p-$1.json" rows journal clone digest slots holds
   rows="$(restore_witness_exec journals "$branch")" || { echo "issue 3644: witness could not read the bare journals for $run" >&2; return 1; }
   journal="$(_restore_journal_value "$rows" "uzi-recovery.$branch.clone" "$run")"
   [ -n "$journal" ] && [ "$(printf '%s\n' "$journal" | grep -c .)" = 1 ] \
@@ -260,7 +269,6 @@ restore_snapshot_predecessor() {
   clone="$(printf '%s' "$journal" | jq -er '.clonePath')" || { echo "issue 3644: predecessor journal has no clonePath" >&2; return 1; }
   digest="$(restore_witness_exec digest "$clone")" || { echo "issue 3644: witness could not digest the predecessor clone" >&2; return 1; }
   [ -n "$digest" ] && [ "$digest" != MISSING ] || { echo "issue 3644: predecessor clone $clone is missing before the restart" >&2; return 1; }
-  fence="$(printf '%s' "$journal" | jq -r '.completionSourceFence != null')" || { echo "issue 3644: predecessor journal is not JSON" >&2; return 1; }
   slots="$(restore_witness_exec slots)" || { echo "issue 3644: witness could not read the authority slots" >&2; return 1; }
   [ -n "$slots" ] || { echo "issue 3644: no authority slot files before the restart (P's slot must exist)" >&2; return 1; }
   # Before the restart the run's claim generation is P's, so "<= claim_generation" is the "< successor generation"
@@ -268,8 +276,8 @@ restore_snapshot_predecessor() {
   holds="$(db_psql_rows "SELECT id||' '||state||' '||generation FROM recovery_custody_holds WHERE run_id = '$run' AND generation <= (SELECT claim_generation FROM runs WHERE id = '$run') ORDER BY id")" \
     || { echo "issue 3644: could not read the custody holds of run $run" >&2; return 1; }
   [ -n "$holds" ] || { echo "issue 3644: run $run has no custody hold before the restart" >&2; return 1; }
-  jq -nc --arg journal "$journal" --arg clone "$clone" --arg digest "$digest" --arg fence "$fence" --arg slots "$slots" --arg holds "$holds" \
-    '{journal: $journal, clonePath: $clone, digest: $digest, fence: $fence, slots: $slots, holds: $holds}' > "$out"
+  jq -nc --arg journal "$journal" --arg clone "$clone" --arg digest "$digest" --arg slots "$slots" --arg holds "$holds" \
+    '{journal: $journal, clonePath: $clone, digest: $digest, slots: $slots, holds: $holds}' > "$out"
 }
 # restore_assert_seed_witness RUN BRANCH GEN [HEAD_MODE] — after wait_independent_restore_resume. Compares the
 # log's fields with the bare's restore journal basis (a data read; the pin record's MAC is NOT re-verified
@@ -277,12 +285,12 @@ restore_snapshot_predecessor() {
 # life of S: completion turns S's entry into a `retired` tombstone and only the owner's guarded discard clears
 # it (agent/src/git.ts advanceRestoreEntryUnderLock), so the basis is required for a terminal run too.
 # While S is live (run not terminal) the pin record is required and P must be unchanged since the snapshot:
-# journal (and its completionSourceFence), clone contents, every authority slot file, the run's custody hold
-# rows; S's HEAD must be seededHead (HEAD_MODE exact) or a descendant of it (HEAD_MODE descendant, the default).
+# journal, clone contents, P's clone authority slot file (the one the restore basis's slotOwner names), the run's
+# custody hold rows; S's HEAD must be seededHead (HEAD_MODE exact) or a descendant of it (HEAD_MODE descendant, the default).
 # Once the run is terminal S's completion discards P legitimately, so only the pin record file is soft.
 restore_assert_seed_witness() {
   local run="$1" branch="$2" gen="$3" head_mode="${4:-descendant}" snap="$RUNROOT/.restore-p-$1.json"
-  local status live=1 rows rj pin cur shead bare yes pslots
+  local status live=1 rows rj pin cur shead bare yes pslots sw se
   [ "$head_mode" = exact ] || [ "$head_mode" = descendant ] || fail "issue 3644: unknown successor HEAD mode [$head_mode]"
   [ -n "${RESTORE_SOURCE_SHA:-}" ] || fail "issue 3644: seed witness run before wait_independent_restore_resume for $run"
   [ "$RESTORE_SLOT_HOSTNAME" = "${RESTORE_SLOT_CONTAINER:0:12}" ] \
@@ -324,17 +332,19 @@ restore_assert_seed_witness() {
     [ -f "$snap" ] || fail "issue 3644: no predecessor snapshot for live run $run (taken after the kill, before the restart)"
     cur="$(_restore_journal_value "$rows" "uzi-recovery.$branch.clone" "$run")"
     [ "$cur" = "$(jq -r .journal "$snap")" ] || fail "issue 3644: predecessor journal of run $run changed across the restore"
-    # Diagnostic label only: the raw journal comparison above already covers the fence; this names it when it is the change.
-    [ "$(printf '%s' "$cur" | jq -r '.completionSourceFence != null')" = "$(jq -r .fence "$snap")" ] \
-      || fail "issue 3644: predecessor completionSourceFence of run $run changed across the restore"
     cur="$(restore_witness_exec digest "$(jq -r .clonePath "$snap")")" || fail "issue 3644: witness could not digest the predecessor clone"
     [ "$cur" = "$(jq -r .digest "$snap")" ] || fail "issue 3644: predecessor clone of run $run changed across the restore (before=[$(jq -r .digest "$snap")] after=[$cur])"
     [ -n "${RESTORE_PRED_INCARNATION:-}" ] || fail "issue 3644: the restore line names no predecessor incarnation for run $run"
-    pslots="$(_restore_p_slots "$(jq -r .slots "$snap")" "$RESTORE_PRED_INCARNATION")"
-    [ -n "$pslots" ] || fail "issue 3644: no authority slot owned by predecessor incarnation $RESTORE_PRED_INCARNATION existed before the restart (P's slot must)"
+    sw="$(printf '%s' "$rj" | jq -er '.restore.slotOwner.worker')" && se="$(printf '%s' "$rj" | jq -er '.restore.slotOwner.epoch')" \
+      || fail "issue 3644: restore basis of run $run has no readable slotOwner"
+    [ "$sw" = "$RESTORE_PRED_INCARNATION" ] \
+      || fail "issue 3644: restore basis slotOwner worker [$sw] is not the predecessor incarnation [$RESTORE_PRED_INCARNATION]"
+    pslots="$(_restore_p_slots "$(jq -r .slots "$snap")" "$sw" "$se")"
+    [ -n "$pslots" ] && [ "$(printf '%s\n' "$pslots" | grep -c .)" = 1 ] \
+      || fail "issue 3644: expected exactly one authority slot owned by predecessor $sw at epoch $se before the restart, found $(printf '%s\n' "$pslots" | grep -c .)"
     cur="$(restore_witness_exec slots)" || fail "issue 3644: witness could not read the authority slots"
     yes="$(comm -23 <(printf '%s\n' "$pslots") <(printf '%s\n' "$cur" | awk -F'\t' 'NF >= 2 { print $1 "\t" $2 }' | LC_ALL=C sort))"
-    [ -z "$yes" ] || fail "issue 3644: predecessor-owned authority slot file(s) changed or vanished across the restore: $(printf '%s' "$yes" | tr '\t\n' ' ;')"
+    [ -z "$yes" ] || fail "issue 3644: predecessor-owned authority slot file changed or vanished across the restore: $(printf '%s' "$yes" | tr '\t\n' ' ;')"
     cur="$(db_psql_rows "SELECT id||' '||state||' '||generation FROM recovery_custody_holds WHERE run_id = '$run' AND generation < $gen ORDER BY id")" \
       || fail "issue 3644: could not read the custody holds of run $run"
     [ "$cur" = "$(jq -r .holds "$snap")" ] \
@@ -347,7 +357,7 @@ restore_assert_seed_witness() {
       yes="$(restore_witness_exec isanc "$RESTORE_ATTEMPT_PATH" "$RESTORE_SEEDED_HEAD")" || fail "issue 3644: witness could not compare the successor HEAD"
       [ "$yes" = yes ] || fail "issue 3644: seeded head $RESTORE_SEEDED_HEAD is not an ancestor of the successor HEAD $shead of run $run"
     fi
-    pass "run $run: restore witness: basis=pin=seed=$RESTORE_SOURCE_SHA ($RESTORE_BINDING evidenced in the bare), predecessor journal (fence), clone, authority slots and holds unchanged, successor HEAD $shead (seededHead $RESTORE_SEEDED_HEAD, $head_mode)"
+    pass "run $run: restore witness: basis=pin=seed=$RESTORE_SOURCE_SHA ($RESTORE_BINDING evidenced in the bare), predecessor journal, clone, clone authority slot and holds unchanged, successor HEAD $shead (seededHead $RESTORE_SEEDED_HEAD, $head_mode)"
   else
     pass "run $run: restore witness (terminal run): log fields, basis and $RESTORE_BINDING binding agree on $RESTORE_SOURCE_SHA"
   fi

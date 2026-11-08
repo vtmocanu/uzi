@@ -679,35 +679,40 @@ witness_case() {
   local pjournal restore run_state=running digest='digest=d1 head=ref: refs/heads/agent/issue-1 tip=t1' pin
   pjournal="$(jq -nc --arg c "$pclone" '{runId:"R",clonePath:$c,attemptId:"20260101T000000Z-g1-1111111111111111"}')"
   restore="$(jq -nc --arg c "$pclone" --arg sha "$RESTORE_SHA" '{restore:{version:1,predecessor:{clonePath:$c,generation:1},
-    pin:{captureId:"cap",generation:1,sourceSha:$sha,finalization:false},restoreTip:$sha},restoreStage:"ready",runId:"R"}')"
+    slotOwner:{worker:"p",epoch:"e1"},pin:{captureId:"cap",generation:1,sourceSha:$sha,finalization:false},restoreTip:$sha},restoreStage:"ready",runId:"R"}')"
   pin="$(jq -nc --arg sha "$RESTORE_SHA" '{runId:"R",branch:"agent/issue-1",generation:1,sourceSha:$sha,captureId:"cap",mac:"x"}')"
-  # Slot lines are "name<TAB>digest<TAB>owner": k1 is owned by the predecessor incarnation (p), k2 by another worker (q).
-  local slots_before slots_after holds_before='h1 open 1' holds_after='h1 open 1' bound=on_default fence=false hmode=descendant sh="$RESTORE_SHA" anc=yes
-  slots_before="$(printf './k1.json\taaa\tp\n./k2.json\tbbb\tq\n')"; slots_after="$slots_before"
+  # Slot lines are "name<TAB>digest<TAB>owner<TAB>epoch": k1 is P's clone slot (owner p, epoch e1, the restore basis's
+  # slotOwner), k3 is another slot of the same process (p, epoch e2), k2 belongs to another worker (q).
+  local slots_before slots_after holds_before='h1 open 1' holds_after='h1 open 1' bound=on_default hmode=descendant sh="$RESTORE_SHA" anc=yes
+  slots_before="$(printf './k1.json\taaa\tp\te1\n./k2.json\tbbb\tq\te9\n./k3.json\teee\tp\te2\n')"; slots_after="$slots_before"
   case "$variant" in
-    p-slot-changed) slots_after="$(printf './k1.json\tccc\tp\n./k2.json\tbbb\tq\n')";;
-    p-slot-removed) slots_after="$(printf './k2.json\tbbb\tq\n')";;
-    other-slot-changed) slots_after="$(printf './k1.json\taaa\tp\n./k2.json\tccc\tq\n')";;
-    other-slot-removed) slots_after="$(printf './k1.json\taaa\tp\n')";;
-    no-p-slot) slots_before="$(printf './k2.json\tbbb\tq\n')"; slots_after="$slots_before";;
-    slot-added) slots_after="$(printf './k1.json\taaa\tp\n./k2.json\tbbb\tq\n./k3.json\tddd\tp\n')";;
+    p-slot-changed) slots_after="$(printf './k1.json\tccc\tp\te1\n./k2.json\tbbb\tq\te9\n./k3.json\teee\tp\te2\n')";;
+    p-slot-removed) slots_after="$(printf './k2.json\tbbb\tq\te9\n./k3.json\teee\tp\te2\n')";;
+    same-owner-other-epoch-changed) slots_after="$(printf './k1.json\taaa\tp\te1\n./k2.json\tbbb\tq\te9\n./k3.json\tfff\tp\te2\n')";;
+    same-owner-other-epoch-removed) slots_after="$(printf './k1.json\taaa\tp\te1\n./k2.json\tbbb\tq\te9\n')";;
+    other-slot-changed) slots_after="$(printf './k1.json\taaa\tp\te1\n./k2.json\tccc\tq\te9\n./k3.json\teee\tp\te2\n')";;
+    other-slot-removed) slots_after="$(printf './k1.json\taaa\tp\te1\n./k3.json\teee\tp\te2\n')";;
+    no-p-slot) slots_before="$(printf './k2.json\tbbb\tq\te9\n./k3.json\teee\tp\te2\n')"; slots_after="$slots_before";;
+    two-p-slots) slots_before="$(printf './k1.json\taaa\tp\te1\n./k2.json\tbbb\tq\te9\n./k4.json\tggg\tp\te1\n')"; slots_after="$slots_before";;
+    slot-added) slots_after="$(printf './k1.json\taaa\tp\te1\n./k2.json\tbbb\tq\te9\n./k3.json\teee\tp\te2\n./k5.json\tddd\tp\te1\n')";;
     hold-changed) holds_after='h1 released 1';;
     hold-removed) holds_after='';;
-    fence-flag) fence=true;;
     binding-unevidenced|terminal-binding-unevidenced) bound=owed;;
     head-exact-mismatch) hmode=exact; sh=cccccccccccccccccccccccccccccccccccccccc;;
     head-exact-ok) hmode=exact;;
     head-descendant) sh=cccccccccccccccccccccccccccccccccccccccc;;
     head-not-descendant) sh=cccccccccccccccccccccccccccccccccccccccc; anc=no;;
   esac
-  jq -nc --arg j "$pjournal" --arg c "$pclone" --arg d "$digest" --arg f "$fence" --arg s "$slots_before" --arg h "$holds_before" \
-    '{journal:$j,clonePath:$c,digest:$d,fence:$f,slots:$s,holds:$h}' > "$SEQ_DIR/.restore-p-R.json"
+  jq -nc --arg j "$pjournal" --arg c "$pclone" --arg d "$digest" --arg s "$slots_before" --arg h "$holds_before" \
+    '{journal:$j,clonePath:$c,digest:$d,slots:$s,holds:$h}' > "$SEQ_DIR/.restore-p-R.json"
   printf '%s' "$slots_after" > "$SEQ_DIR/w-slots"; printf '%s' "$holds_after" > "$SEQ_DIR/w-holds"
   printf '%s' "$bound" > "$SEQ_DIR/w-bound"; printf '%s' "$sh" > "$SEQ_DIR/w-shead"; printf '%s' "$anc" > "$SEQ_DIR/w-anc"
   case "$variant" in
     basis-tip) restore="$(jq -c --arg s cccccccccccccccccccccccccccccccccccccccc '.restore.restoreTip=$s' <<<"$restore")";;
     basis-generation) restore="$(jq -c '.restore.pin.generation=2' <<<"$restore")";;
     basis-capture) restore="$(jq -c '.restore.pin.captureId="other"' <<<"$restore")";;
+    basis-slot-owner-worker) restore="$(jq -c '.restore.slotOwner.worker="q"' <<<"$restore")";;
+    basis-no-slot-owner) restore="$(jq -c 'del(.restore.slotOwner)' <<<"$restore")";;
     basis-predecessor) restore="$(jq -c '.restore.predecessor.clonePath="/elsewhere"' <<<"$restore")";;
     no-restore) restore="";;
     terminal) run_state=completed; digest='digest=changed head=x tip=y';;
@@ -759,15 +764,19 @@ custody_case "seed witness requires the retained basis of a terminal run" fail '
 custody_case "seed witness requires a readable pin record for a live run" fail 'for live run R is not readable' witness_case pin-absent
 custody_case "seed witness refuses a binding the bare does not evidence" fail 'is not evidenced' witness_case binding-unevidenced
 custody_case "seed witness refuses an unevidenced binding on a terminal run too" fail 'is not evidenced' witness_case terminal-binding-unevidenced
-custody_case "seed witness accepts an authority slot set that only grew" pass 'slots and holds unchanged' witness_case slot-added
-custody_case "seed witness refuses a changed predecessor-owned authority slot" fail 'predecessor-owned authority slot' witness_case p-slot-changed
-custody_case "seed witness refuses a vanished predecessor-owned authority slot" fail 'predecessor-owned authority slot' witness_case p-slot-removed
-custody_case "seed witness accepts a changed slot of another owner" pass 'slots and holds unchanged' witness_case other-slot-changed
-custody_case "seed witness accepts a vanished slot of another owner" pass 'slots and holds unchanged' witness_case other-slot-removed
-custody_case "seed witness requires a predecessor-owned slot before the restart" fail 'no authority slot owned by predecessor' witness_case no-p-slot
+custody_case "seed witness accepts an authority slot set that only grew" pass 'clone authority slot and holds unchanged' witness_case slot-added
+custody_case "seed witness refuses a changed predecessor clone slot" fail 'predecessor-owned authority slot file changed' witness_case p-slot-changed
+custody_case "seed witness refuses a vanished predecessor clone slot" fail 'predecessor-owned authority slot file changed' witness_case p-slot-removed
+custody_case "seed witness accepts a changed slot of the same owner at another epoch" pass 'clone authority slot and holds unchanged' witness_case same-owner-other-epoch-changed
+custody_case "seed witness accepts a vanished slot of the same owner at another epoch" pass 'clone authority slot and holds unchanged' witness_case same-owner-other-epoch-removed
+custody_case "seed witness accepts a changed slot of another owner" pass 'clone authority slot and holds unchanged' witness_case other-slot-changed
+custody_case "seed witness accepts a vanished slot of another owner" pass 'clone authority slot and holds unchanged' witness_case other-slot-removed
+custody_case "seed witness requires a clone slot before the restart" fail 'exactly one authority slot owned by predecessor p at epoch e1 before the restart, found 0' witness_case no-p-slot
+custody_case "seed witness refuses two clone slots before the restart" fail 'found 2' witness_case two-p-slots
+custody_case "seed witness refuses a slotOwner worker that is not the predecessor incarnation" fail 'is not the predecessor incarnation' witness_case basis-slot-owner-worker
+custody_case "seed witness refuses a basis without a slotOwner" fail 'no readable slotOwner' witness_case basis-no-slot-owner
 custody_case "seed witness refuses a changed custody hold" fail 'custody holds of run R changed' witness_case hold-changed
 custody_case "seed witness refuses a vanished custody hold" fail 'custody holds of run R changed' witness_case hold-removed
-custody_case "seed witness refuses a changed completionSourceFence flag" fail 'completionSourceFence' witness_case fence-flag
 custody_case "seed witness accepts S at exactly the seeded head" pass 'exact)' witness_case head-exact-ok
 custody_case "seed witness refuses S away from the seeded head in exact mode" fail 'is not the seeded head' witness_case head-exact-mismatch
 custody_case "seed witness accepts S descending from the seeded head" pass 'descendant)' witness_case head-descendant
@@ -783,6 +792,32 @@ custody_case "seed witness refuses a changed predecessor clone" fail 'predecesso
 custody_case "seed witness refuses a slot hostname that is not the id prefix" fail 'slot hostname' witness_case slot-hostname
 custody_case "seed witness refuses a slot that is not the agent container" fail 'logged slot container' witness_case slot-container
 custody_case "seed witness ignores a restore journal of another run" pass 'basis=pin=seed' witness_case other-run
+
+# The witness `slots` mode prints each slot file's owner and epoch through slot_fields, extracted here from the
+# script text the witness container runs. The slot lines are built like agent/src/completion-authority.ts seal
+# writes them (compact JSON, key order version, key, state, epoch, seq, owner, pending, ...), one with an
+# owner-shaped fragment inside a string field, which JSON escapes.
+# (the function's body is a heredoc holding shell functions of its own, so the range ends at the first brace line after it)
+eval "$(awk '/^_restore_witness_script\(\) \{/ { f = 1 } f { print } /^WITNESS$/ { w = 1 } w && /^\}/ { exit }' "$LIB")"
+eval "$(_restore_witness_script | awk '/^slot_fields\(\) \{/,/^\}/')"
+slot_fields_case() {
+  local key out
+  key="$(printf 'a%.0s' $(seq 64))"
+  line() { jq -nc --arg key "$key" --arg epoch "$1" --arg worker "$2" --arg fp "$3" \
+    '{version:1,key:$key,state:"active",epoch:$epoch,seq:3,owner:{worker:$worker,executor:null},
+      pending:(if $fp == "" then null else {operation:"op",kind:"destructive",footprint:$fp,status:"running",residue:[]} end),
+      retiring:null,publication:null,codexMarked:false,mac:"m"}'; }
+  out="$(line 11111111-aaaa 22222222-bbbb '' | slot_fields)"
+  [ "$out" = "22222222-bbbb 11111111-aaaa" ] || fail "plain slot: worker/epoch [$out]"
+  out="$(line e2 w2 '{"owner":{"worker":"bad"' | slot_fields)"
+  [ "$out" = "w2 e2" ] || fail "slot with an owner-shaped fragment in a string field: [$out]"
+  line e3 w3 'x' | grep -q 'owner' || fail "fixture is not canonical slot JSON"
+  line e2 w2 '{"owner":{"worker":"bad"' | grep -qF '\"owner\":{\"worker\":\"bad\"' || fail "fixture does not carry the escaped fragment"
+  out="$(printf '{"version":1,"key":"k","owner":{"worker":"w"}}\n' | slot_fields)"
+  [ -z "$out" ] || fail "a record outside the canonical key order must print nothing: [$out]"
+  echo 'slot fields extracted'
+}
+custody_case "slot owner and epoch are read from canonical slot JSON, not from string fields" pass 'slot fields extracted' slot_fields_case
 
 identity_case() {
   local fake_after="$2"
