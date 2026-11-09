@@ -103,7 +103,7 @@ it("Claude code stub returns exact empty findings and confirms cleanup despite p
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 const stripNonces = (text: string) => text.replace(/_[a-f0-9]{32}>/g, "_NONCE>");
 const GOLDEN_CLAUDE_CODE_PROMPT = "a8c6f3483904d377afb8abaa3fc6d2075840ae6c2f10bac2020fdc3c271f4fa0";
-const GOLDEN_CLAUDE_CODE_BRIEF = "ad434dc642a7b82dfeaded95350f5f63977dafb6342fe3f7923bebc2c9f4779e";
+const GOLDEN_CLAUDE_CODE_BRIEF = "74a5d66bbdf4471ac75b5363191c37cfd74706dcf3cd5f76e28d9449f8fae879";
 
 async function claudeRequest(c: ClaimResponse): Promise<{ brief: string; prompt: string }> {
   let brief = "";

@@ -919,7 +919,7 @@ then report missing or partly delivered criteria:
   mutation runs, and their logs) are not supplied to the checker. Their absence
   alone is neither a defect nor a criterion finding, and run results claimed in
   committed text or the plan are unverified claims, not evidence. A criterion
-  that itself requires a run result keeps its minor `Coverage uncertainty:`
+  that itself requires a run result gets a minor `Coverage uncertainty:`
   finding. Tests and validation are judged from the committed code.
 - Treat a missing requirement stated by the issue as a safety, security or
   data-integrity constraint as a critical or major defect, without either prefix.

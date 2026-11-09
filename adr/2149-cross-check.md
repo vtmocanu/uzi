@@ -398,7 +398,7 @@ The code brief now states that the worker's own command results (gate, build,
 lint, test, red/green and mutation runs, and their logs) are not supplied. Their
 absence alone is neither a defect nor a criterion finding; run results claimed in
 committed text or the plan are unverified claims, not evidence. A criterion that
-itself requires a run result keeps its minor Coverage uncertainty: finding, and
+itself requires a run result gets a minor Coverage uncertainty: finding, and
 tests are judged from the committed code. Motive: findings that only reported
 invisible run evidence cost a repair turn without a code change. Supplying gate
 records stays parked (PRD #3167 "Gate evidence parked"). Only the revised brief

@@ -272,7 +272,7 @@ it("code checker uses the confined provider and file broker and returns only fin
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 const stripNonces = (text: string) => text.replace(/_[a-f0-9]{32}>/g, "_NONCE>");
 const GOLDEN_CODE_PROMPT = "35fd960289a82fde40b0d12e24533b5130a8db60687b4023ddb14b07d5c080a9";
-const GOLDEN_CODEX_CODE_BRIEF = "25ca469838ac6d97169866525891266f94354d19710d5573bd5f5d2b055b8669";
+const GOLDEN_CODEX_CODE_BRIEF = "9f6489adf9e43295e04fcfe688d55408b734f3fe0c35e72f02390ba48850d437";
 
 async function codeRequests(c: ClaimResponse) {
  const r = rig({ claim: c, notes: (emit) => r.terminal(emit, '{"findings":[]}') });

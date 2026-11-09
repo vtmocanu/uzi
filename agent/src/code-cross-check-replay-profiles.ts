@@ -6,7 +6,7 @@ export const REPLAY_PROFILES = {
     claude: "27f677678fbf3ffb78c08ec6d5549ca4ceaf722b6997e8599a5fe03092413192",
   },
   revised: {
-    codex: "25ca469838ac6d97169866525891266f94354d19710d5573bd5f5d2b055b8669",
-    claude: "ad434dc642a7b82dfeaded95350f5f63977dafb6342fe3f7923bebc2c9f4779e",
+    codex: "9f6489adf9e43295e04fcfe688d55408b734f3fe0c35e72f02390ba48850d437",
+    claude: "74a5d66bbdf4471ac75b5363191c37cfd74706dcf3cd5f76e28d9449f8fae879",
   },
 } as const;

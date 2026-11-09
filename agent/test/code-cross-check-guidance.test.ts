@@ -28,7 +28,7 @@ const rules = {
   name: /Neither a variable name nor its destination proves harmlessness/,
   evidence: /Effects on configuration, credentials and test behavior need inspectable evidence/,
   localRuns: /Results of the worker's own command runs[^\n]+their absence alone is neither a defect nor a criterion finding/,
-  runCriterion: /A criterion that itself requires a run result keeps its minor Coverage uncertainty: finding/,
+  runCriterion: /A criterion that itself requires a run result gets a minor Coverage uncertainty: finding/,
 } satisfies Record<string, RegExp>;
 type Rule = keyof typeof rules;
 const fixtures = JSON.parse(readFileSync(new URL("../../fixtures/code-cross-check/cases.json", import.meta.url), "utf8")) as {
