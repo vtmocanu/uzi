@@ -26,6 +26,8 @@ from commit `4d018dbd69175cc7d60f5acefd7ae122311a1ba1`, using that
 checkout's lockfile dependencies and matching pinned worker binary, as described
 in the maintainer follow-up below.
 
+The revised profile tracks the current code brief: M3a plus the 2026-11-09
+worker run-evidence rule, so a comparison against the baseline must name both.
 On the M2 checkout, select `--profile revised` explicitly for `verify`,
 `replay` and `score`. For example:
 

@@ -27,6 +27,8 @@ const rules = {
   children: /including inherited Go build and test child temporary files/,
   name: /Neither a variable name nor its destination proves harmlessness/,
   evidence: /Effects on configuration, credentials and test behavior need inspectable evidence/,
+  localRuns: /Results of the worker's own command runs[^\n]+their absence alone is neither a defect nor a criterion finding/,
+  runCriterion: /A criterion that itself requires a run result keeps its minor Coverage uncertainty: finding/,
 } satisfies Record<string, RegExp>;
 type Rule = keyof typeof rules;
 const fixtures = JSON.parse(readFileSync(new URL("../../fixtures/code-cross-check/cases.json", import.meta.url), "utf8")) as {
@@ -44,6 +46,7 @@ test("code guidance fixtures have exactly the code-specific case set", () => {
     "defects-forbid-prefixes", "defects-first-no-eviction", "spare-room-omission", "full-defect-cap",
     "hosted-only-minor", "missing-implementation-and-tests", "issue-safety-carveout", "advisory-single-pass",
     "regression-cannot-fail", "tmpdir-go-children", "tmpdir-narrows-tests", "misleading-scratch-destination",
+    "local-run-evidence-not-supplied",
   ].sort());
   for (const c of fixtures) {
     assert.ok(c.scenario.trim() && c.expected.trim() && c.rules.length);

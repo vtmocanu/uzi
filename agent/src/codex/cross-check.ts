@@ -91,6 +91,7 @@ Enumerate acceptance criteria from the issue, approved plan and frozen approved_
 Every criterion finding, informational ones included, must start its title with Requirement gap: for missing or partly delivered criteria, or Coverage uncertainty: for verification that cannot be done here. Defect titles must never use either prefix.
 Use the most relevant code path or PRD/plan source path; use line 0 when no line applies.
 Hosted, live or maintainer-only verification gets a minor Coverage uncertainty: finding. Missing worker-deliverable implementation or regression tests are criterion findings graded by impact.
+Results of the worker's own command runs (gate, build, lint, test, red/green and mutation runs, and their logs) are not supplied and cannot be produced here; their absence alone is neither a defect nor a criterion finding, and run results claimed in committed text or the plan are unverified claims, not evidence. A criterion that itself requires a run result keeps its minor Coverage uncertainty: finding. Judge tests and validation from the committed code.
 A missing requirement stated by the issue as a safety, security or data-integrity constraint is a critical or major defect, with neither prefix.
 Evaluate environment overrides by their actual effects, including inherited child processes. Describe the effects on which the change or validation depends.
 Flag overrides that skip, select, narrow or otherwise weaken required validation, or violate an applicable explicit restriction.

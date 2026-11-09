@@ -145,5 +145,16 @@
       "evidence",
       "reject"
     ]
+  },
+  {
+    "name": "local-run-evidence-not-supplied",
+    "scenario": "The diff commits a regression test; no gate, test or red/green logs are supplied, and the plan claims they passed.",
+    "expected": "No finding for absent run evidence; the claimed results stay unverified; a criterion that itself requires a run result keeps a minor Coverage uncertainty:.",
+    "rules": [
+      "localRuns",
+      "runCriterion",
+      "worker",
+      "tests"
+    ]
   }
 ]
