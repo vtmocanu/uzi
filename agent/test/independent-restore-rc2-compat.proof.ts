@@ -136,7 +136,7 @@ async function build(): Promise<Env> {
   const sPath = attemptClonePath(canonical, S_ID);
   // P: a real clone on the branch at the pin, plus unsaved bytes.
   fs.mkdirSync(path.dirname(pPath), { recursive: true });
-  execFileSync("git", ["clone", "-q", "--shared", "--no-checkout", bare, pPath], { env: ENV });
+  execFileSync("git", ["clone", "-q", "--shared", "--no-checkout", "--", bare, pPath], { env: ENV });
   git(pPath, "checkout", "-q", "-b", BRANCH, pinSha);
   fs.writeFileSync(path.join(pPath, "later.txt"), "later bytes that were never saved");
   const pRaw = JSON.stringify({ runId: RUN, clonePath: pPath, attemptId: P_ID });
