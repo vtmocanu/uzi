@@ -80,6 +80,7 @@ cd agent && env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node --i
 ### Dead code
 
 - `task deadcode` runs all four components; each `gate:<component>` runs its own. The halves gate differently, so a green means different things for Go and npm.
+- **CI runs `deadcode:api` on `main` pushes only** (job `deadcode-api`, #4109): PR CI skips it, so an exported dead function can reach `main` and turns its CI red there. `task gate:api` still runs it locally.
 - **Go**: `deadcode -test ./...` per module, via `scripts/deadcode-gate.sh`, holds both modules at zero against a committed, empty baseline. The routine fix is to delete the function, not to baseline it.
 - **npm (knip)**: the whole report gates at `error` in `web/knip.jsonc` / `agent/knip.jsonc`, zero tolerance — unused files, dependencies, unlisted imports, binaries, unresolved imports, duplicate exports, and the unused-export/type family (`exports`, `types`, `nsExports`, `nsTypes`, `enumMembers`, `namespaceMembers`). A green `deadcode:web` / `deadcode:agent` does mean "no unused exports"; a new one reddens the gate. Keep DTO/contract types exported via `ignoreExportsUsedInFile`, not a blanket suppression.
 - **`deadcode` exits 0 whether it finds 0, 1 or 44 dead functions.** rc=1 means a load error, and then stdout is 0 bytes, so a run-sort-diff wrapper reads a module that does not compile as clean. `scripts/deadcode-gate.sh` exists for the exit code and reads rc before output, using `fmt-check:api`'s convention (2 = instrument broken, 1 = findings).
