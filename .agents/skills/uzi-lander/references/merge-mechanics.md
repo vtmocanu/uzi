@@ -141,14 +141,18 @@ than waiting for the whole run. Keep the owned callback/log receipt; do not re-a
 a poll loop per merge:
 
 ```
-<this skill's directory>/scripts/watch-run-ci.sh --sha "$MERGE_SHA" --follow --interval 60
+<this skill's directory>/scripts/watch-run-ci.sh --sha "$MERGE_SHA" --follow --interval 60 --max-ticks 200
 ```
 
 It exits **0** when every run that exists for the SHA is green, **1** on a real red
 (`failure`/`timed_out`/`startup_failure`/`action_required`), **2** on timeout, **3** when
 no run ever appeared (or gh failed). On supersession, `--follow` resolves the current branch
 head, prints `FOLLOW sha=OLD -> NEW` for each switch and watches within the original
-`--max-ticks` budget. The final result covers the last watched SHA. Without `--follow`,
+`--max-ticks` budget. The final result covers the last watched SHA, a descendant that contains
+your merge. Main runs finish rather than cancel (#2561), so the followed head may wait for a
+whole running run before its own starts: pass `--max-ticks 200`, and treat exit 2 as still
+pending, never as red; re-arm it. A finished run for an older (ancestor) SHA does not cover
+your merge. Without `--follow`,
 supersession exits **4** (see below).
 
 **Exit 0 means "every run that EXISTS for the SHA is green" — NOT "the full expected
@@ -180,16 +184,16 @@ run in progress; `gh run view RUN --job JOB --log-failed` may refuse until that 
 terminal. When only the failed step name is needed, use
 `gh api repos/O/R/actions/jobs/JOB --jq '.steps[]|select(.conclusion=="failure")|.name'`.
 
-**`conclusion == cancelled` is almost never a failure — it is concurrency
-supersession.** The CI workflows run with `concurrency: cancel-in-progress` on the `main`
-branch, so when a NEWER commit lands (another session's merge, or your own next merge) the
-in-progress run of the older SHA is cancelled mid-flight. This is common on this repo's
-shared, fast-moving `main` (measured 2026-08-20: `759199c8`'s CI was cancelled when a
-renovate merge landed on top seconds later). **Do not read `cancelled` as red.** On exit 4,
-your merge is fine — re-point at the CURRENT `origin/main` HEAD (`git fetch origin main`)
-and confirm *that* commit's run goes green, since it exercises your change plus whatever
-superseded it. If a peer session owns that newer commit (coordinate via SendMessage), its
-green is theirs to watch and report.
+**`conclusion == cancelled` is almost never a failure: it is concurrency
+supersession.** On a PR branch a newer push cancels the in-progress run. On `main`,
+`ci.yml` and `kind-smoke.yml` let the running run finish (pilot, #2561): the group keeps one
+pending run, and a newer merge replaces that pending run, which then shows `cancelled`
+without having started. **Do not read `cancelled` as red.** A finished `main` run covers
+every commit merged since the previous finished run, so confirm the run that includes your
+commit (`git merge-base --is-ancestor <yours> <run head>`) goes green. If a peer session
+owns that newer commit (coordinate via SendMessage), its green is theirs to watch and
+report. Rerun only the current tip: rerunning an older `main` commit replaces the pending
+tip run.
 
 ## Post-merge publish steps
 

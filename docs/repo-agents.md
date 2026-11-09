@@ -97,7 +97,10 @@ applies to planning; see [Planning with repo agents](#planning-with-repo-agents)
 A run that carries a default or a create-time choice is claimed only by a worker
 new enough to honour it; while every online worker is older, the run stays
 queued and its health reason names the missing worker version
-(`agent_source_request_v1`).
+(`agent_source_request_v1`). A run that
+also reads repo agents needs one worker reporting both capabilities; when they
+are online only on different workers, its health reason says no single worker
+supports both.
 
 The run page's **Agents used** card shows which agents planned and implemented
 the run, for example "Planned with: repo agents (repo default) · Implemented
@@ -279,7 +282,10 @@ A run that reads repo agents is marked when it is created
 `repo_agent_source_v1` protocol capability claims a marked run or a run with a
 recorded revision, its first claim included. Judge, job, cross-check,
 task-review and chat runs do not read repo agents and are not marked. While no
-such worker is online, a queued run's health reason names the capability.
+such worker is online, a queued run's health reason names the capability. A
+marked run that also carries an agent source request waits for a single worker
+reporting both `repo_agent_source_v1` and `agent_source_request_v1`, and its
+health reason says so when the two are split across workers.
 
 When the API is older than the worker, nothing is recorded: each claim reads
 the agent folders at the configured default branch's commit at that time, and

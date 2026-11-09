@@ -46,6 +46,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/secretopen"
 	"github.com/vtmocanu/uzi/api/internal/seed"
 	"github.com/vtmocanu/uzi/api/internal/settings"
+	"github.com/vtmocanu/uzi/api/internal/setupcmd"
 	"github.com/vtmocanu/uzi/api/internal/slacksvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/sweeper"
@@ -151,6 +152,13 @@ func bindWorkerListeners(
 }
 
 func main() {
+	// `setup` is the one-shot operator command (PRD #3760). It dispatches
+	// before flag parsing and normal initialisation: no seeds, no listener, no
+	// background service, and no config.Load.
+	if len(os.Args) > 1 && os.Args[1] == "setup" {
+		os.Exit(setupcmd.Main(os.Args[2:], os.Stdin, os.Stdout, os.Stderr))
+	}
+
 	// -health is a shell-free container healthcheck: the distroless runtime
 	// image has no wget/curl, so the binary probes itself.
 	health := flag.Bool("health", false, "probe the local /api/health endpoint and exit")
