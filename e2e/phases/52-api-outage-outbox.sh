@@ -519,7 +519,7 @@ restore_outbox_resolution() {
 restore_outage_state() {
   local rc=$?
   if ! restore_outbox_resolution; then
-    echo 'outbox cleanup: restore failed; no blind agent recreate or Docker teardown attempted' >&2
+    echo 'outbox cleanup: restore failed; refusing any additional blind agent recreate or Docker teardown' >&2
     [ "$rc" != 0 ] || rc=1
   fi
   set_interlock true 2>/dev/null || true
@@ -1184,7 +1184,7 @@ say "restore: recreate api + agent back to their defaults"
 restore_outbox_resolution
 pass "api + agent recreated back to their defaults"
 
-# Best-effort cleanup: every run is terminal (completed, or failed for the case 8 run), so a cancel is a
+# Best-effort cleanup: every run is terminal (completed, or owner-cancelled for case 8), so a cancel is a
 # no-op, but never let a cleanup blip redden a passed phase.
 for r in "$RUN1" "$RUN2" "$RUN_B1" "$RUN_B2" "$RUN_B3" "$RUN_B4" "$RUN_F1" "$RUN_F2"; do
   [ -n "${r:-}" ] && apipost "/api/runs/$r/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true
