@@ -478,6 +478,16 @@ the next gate.
 [CLI](./cli.md#plan-cross-check-evidence) shows the reason and findings;
 [Slack](./slack.md#using-it) shows the reason without findings.
 
+## Codex Plan verdict output
+
+The Codex Plan checker requests a JSON verdict using the expected schema.
+The worker still validates the complete final text: prose, Markdown fences,
+invalid verdicts and results over the UTF-8 byte caps fail as malformed. The
+schema does not replace those checks or add retries, rounds or fallback.
+Code checks and the Claude policy below are unchanged. See
+[ADR-2149's #4103 amendment](../adr/2149-cross-check.md#amendment-2026-11-09--4103-codex-plan-output-schema)
+for the evidence and pending hosted owner acceptance.
+
 ## Claude checker isolation
 
 The Claude checker's repository access tools are `Read`, `Grep` and `Glob`: no
