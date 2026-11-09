@@ -1618,13 +1618,18 @@ that produced it can be neither fenced nor read.
 
 ### Scope
 
-- Compose only. A hosted (Kubernetes) slot refuses; hosted delivery is deferred.
+- Eligible attempt-path predecessors on Compose, normally Docker-wired, or an unwired
+  key already in the supported persisted attempt mode. A fresh unwired (no-DinD) key
+  keeps canonical paths, so its predecessor is the canonical unsupported class and is
+  parked (amendment 15). A hosted (Kubernetes) slot is not restored and is parked the
+  same way; hosted delivery is deferred.
 - Guarded `issue`, `mr_rework` and `self_improve` runs only, with the
   `recovery_completed_publication_v1` capability negotiated and the authority
   runtime present (the certified-completion prerequisites).
 - Only a predecessor written by a build that recorded a per-process boundary record.
   A worker started by an older build has none, so its predecessor is never restored
-  (Q10: a missing, invalid or unsupported record refuses).
+  (Q10: a missing, invalid or unsupported record refuses; a missing record is parked,
+  amendment 15).
 
 ### Evidence
 
@@ -1677,15 +1682,25 @@ worker-side bytes.
 A refusal is nonterminal. The worker logs `independent restore refused; predecessor
 retained`, puts one bounded line on the feed and stops with `RetainedRecoveryStop`.
 It writes nothing to P's journal, ledger or slot. An owner Cancel already persisted is
-observed at the pre-write stops.
+observed at the pre-write stops. Three positively evidenced classes are parked for the
+owner instead of stopping (amendment 15 below); every other refusal keeps this
+nonterminal stop and its server-side accounting.
 
 ### Costs
 
 - P's hold stays open and counts toward `custody_hold_limit` until the owner
   discards it.
-- On refusal the run is charged at most `RUN_MAX_REQUEUES - u` claims, then parks at
-  `recovery_wait` / `worker_requeue_exhausted` with custody uncertain. This is
-  LiveDB-tested.
+- Every refusal other than the parked classes keeps the item-7 accounting, whose
+  per-crash cost is conditional. On the running path the run is charged at most
+  `RUN_MAX_REQUEUES - u` claims, then parks at `recovery_wait` /
+  `worker_requeue_exhausted` when custody is uncertain (LiveDB-tested). The claimed path
+  can consume uncharged generations, up to the run's own hold-admission bound, or park
+  at the server-only `retained_continuation_unwitnessed`. A custody-blocked queued run on
+  a live worker may stay queued even at the cap: there is no universal hold at the cap.
+  Each accepted generation opens a custody hold counting toward `custody_hold_limit`.
+- Unmet, deferred: the restore uses the single ordinary pin record of P's authenticated
+  generation. Several records refuse `pin_ambiguous`, none `no_eligible_pin`; ordering
+  among multiple records and a finalization-pin preference are not implemented.
 - Edits made in P after the pin are not carried into S. How much work that loses is
   not measured.
 - `finalize-G.json` is never retired.
@@ -1710,9 +1725,11 @@ observed at the pre-write stops.
 
 ### Failure model
 
-Narrowed to process and container crashes and injected faults. The restore writers
-publish before they sync: the Git config replacement renames before `syncRestoreWrite`,
-later `writeRestoreJournal` replacements are unsynced, and `rewriteConfigAtomically`
+Narrowed to process and container crashes and injected faults. The boundary record and
+the seed's ledger append, the seeding and ready entry writes and the retirement tombstone
+keep sync and read-back. The remaining restore writers publish before they sync: the Git
+config replacement renames before `syncRestoreWrite`, later live successor
+`writeRestoreJournal` replacements are unsynced, and `rewriteConfigAtomically`
 never syncs the directory. No storage or power-loss guarantee is claimed. What holds is
 that a crash leaves a refusal, never a reuse of P.
 
@@ -1736,6 +1753,44 @@ proof executed the rc.2 sources specifically.
 - Residual: when rc.2's ledger compaction has dropped the evidence (S tombstoned before
   the rollback in mode A, or a second rollback), the roll-forward refuses fail-closed
   and P's bytes stay. The fence is tracked by #3981.
+
+### Amendment 15: unsupported predecessors are parked for the owner
+
+Decision record (AI-synced 2026-11-09). This qualifies the Refusals and Costs above and
+the admission rules of the [ADR-1197 #3527 and #4058 amendments](1197-transient-recovery-park.md#amendment-2026-11-09-3644-an-unsupported-predecessor-holds-for-its-owner).
+
+- **Classes.** On the restore route (`evaluateRestoreRoute` in
+  `agent/src/restore-route.ts`), three classes are positively evidenced and decided
+  before any pin check or read of P's boundary record: canonical (P's journal is exactly
+  `{runId, clonePath}` at the canonical clone path, with the slot foreign-owned and
+  active), hosted (this worker's own boundary record shows a hosted slot) and a missing
+  boundary record for P's incarnation (`predecessor_record_missing`,
+  `evaluateComposeRestore`). Hosted outranks canonical.
+- **Park.** `holdUnsupportedRestore` (`agent/src/runner.ts`) logs the refusal, emits one
+  conditionally worded guidance line, confirms its delivery, then parks through the
+  existing writer at `recovery_wait` / `retained_recovery_adoption_failed`. It requires the
+  api capability `recovery_cause_retained_recovery_adoption_failed`, a positive claim
+  generation and a first `running` report acknowledged as `running`; otherwise the
+  nonterminal stop and item-7 accounting above apply. Feed: `Independent continuation was
+  refused before any source effect: this release does not support this predecessor
+  (<class>).` Log: `restore unsupported predecessor held`.
+- **Third meaning of the cause.** Continuation was refused before any source effect
+  because this release does not support the predecessor. It is not an attempted adoption:
+  no `adoption_failed` blocker is persisted and no quiescence is proven.
+- **No effect on P.** The park changes none of P's bytes (journal, slot, clone, HOME,
+  provision) and reaps nothing. Resume claims again, holds again unchanged on this
+  release, and adds a claim and an admission-counted hold. The parked run holds P's hold
+  and the current generation's.
+- **Hosted.** An owner-held hosted run blocks its worker's image roll until the owner
+  cancels or discards it.
+- **Unchanged.** A stale claim, a credential switch, lost ownership and an owner Cancel
+  propagate as before. Every other refusal (for example a path naming another attempt
+  id, `predecessor_path`) keeps the nonterminal stop.
+- **Reviewed fixes in this branch.** A restored run reads the default-branch tip from
+  the bare without fetching, so an unpinned restored claim no longer falls into the
+  repo-agent source hold when the bare has `origin/<default>`. A `--require-base`
+  restore whose planned base differs from the pin holds for attestation instead of
+  failing `base_diverged`.
 
 ### Limitations and follow-ups
 
