@@ -49,13 +49,24 @@ set -o pipefail
 source .agents/skills/uzi-lander/scripts/lib/sanitize.sh
 gh issue list --repo vtmocanu/uzi --state open --limit 400 --json number,title,author,labels \
   | jq -r "$UNTRUSTED_JQ"'[.[] | (.author.login // "unknown") as $a | select($a != "vtmocanu")
-      | {k: (if ($a | startswith("app/")) then "bot" else "external" end), a: $a, n: .number,
+      | {k: (if ($a | startswith("app/")) or ($a | endswith("[bot]")) or $a == "vtmocanu-uzi" then "bot" else "external" end), a: $a, n: .number,
          l: ([.labels[].name | untrusted_clean] | join(",")), t: (.title | untrusted_excerpt(64))}]
     | sort_by([(.k != "external"), .n])[]
     | "\(.k)\t#\(.n)\t\(.a | untrusted_clean)\t[\(.l)]\t\(.t)"'
 ```
 
 A successful empty result = maintainer-only backlog. If it looks wrong, compare it against the total number of open issues.
+
+**C. External activity.** 0B sees only who opened an open issue. List external comments, inline review comments and PR reviews on any item (maintainer-authored, closed and merged ones included), plus open issues and PRs external accounts opened:
+
+```sh
+.agents/skills/issue-triage/scripts/external-activity.sh --days 14
+```
+
+- Labels are facts, not verdicts: `external-last`, `maintainer-later`, `authored-open`. A later maintainer comment may answer something else.
+- Read the linked activity of every row in full, `external-last` first, before reporting that nothing is owed.
+- Per item, propose a reply or a disposition (none needed, handled elsewhere) under the review and approval rules for that reply.
+- Exit 3 means a lookup failed and nothing was printed: report it, never read it as no activity. Report its `LIMITATION` lines.
 
 ## Queue audit (what fires next)
 
