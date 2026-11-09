@@ -494,7 +494,8 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    writes the merge trail and releases the claim while preserving that trail through the
    post-merge CI watch — exit 9 if it is not merged yet). Do this
    BEFORE `reap`/`release`, or the trail is purged before it was ever written (#1510).
-7. **Post-merge CI.** `S/watch-run-ci.sh --sha MERGE_SHA --follow --interval 60` in the background.
+7. **Post-merge CI.** `S/watch-run-ci.sh --sha MERGE_SHA --follow --interval 60 --max-ticks 200` in the background
+   (main runs finish, so a followed head can wait a whole run before starting; exit 2 is not red: re-arm).
    Pass the exact SHA from `merge.sh`; never hand-complete a prefix. The poller resolves it
    through GitHub and exits 3 before polling when it is invalid or unknown.
    Exit 0 green (a partial dispatch counts; confirm a gate fix another way), 1 red (use the
