@@ -793,6 +793,14 @@ interface RunDrive {
   observedEntries?: Set<string>;
   refreshCodeCrossCheckTools?: () => Promise<void>;
   tripReason?: string;
+  /** Issue #4090: sticky for the run. Set when a cancel/pause/switch interrupt landed while another
+   *  trip was held, so first-wins dropped it. A declined or refused park then keeps the aborted
+   *  ctx.signal fencing guarded commands instead of consuming it in front of the lost stop. */
+  interruptDropped: boolean;
+  /** Issue #4090: the reason the ctx.signal abort listener just tripped (or found held) for a
+   *  pause/switch, until the steering channel's synchronous paired interrupt for the SAME abort
+   *  arrives (or a microtask passes). That paired call is the same stop, never a drop. */
+  pairedAbsorb?: string;
   /** Issue #2471: the exact error a memory-authority trip carries (the runner's stop, or an
    *  unconfirmed-command error). When set, tripError returns it and no clear-and-continue site
    *  may swallow it. */
@@ -955,6 +963,10 @@ export class SdkExecutor implements Executor {
   /** Issue #2945: a ctx.signal that a credential switch aborted and that then gave up; it is never
    *  un-aborted, so a later plan-summary flight must not treat it as a live cancel. */
   private spentSwitchSignal?: AbortSignal;
+  /** Issue #4090: a ctx.signal a `now`/`wall` pause aborted whose park was then declined or
+   *  refused, with no interrupt dropped this run; it is never un-aborted, so later turns' guarded
+   *  commands must not treat it as a live cancel. Cleared (re-fenced) once any interrupt drops. */
+  private consumedPauseSignal?: AbortSignal;
 
   /** Close admission before yielding. Intent and all owned plan flights drain concurrently
    * within one short bound; an ignored abort is abandoned and cannot publish or emit usage. */
@@ -1468,6 +1480,7 @@ export class SdkExecutor implements Executor {
     this.planFlight = undefined;
     this.planCandidate = undefined;
     this.spentSwitchSignal = undefined;
+    this.consumedPauseSignal = undefined;
     this.planGeneration++;
     let summaryResult: ExecutorResult | undefined;
     let laneFailure: unknown;
@@ -2053,6 +2066,7 @@ export class SdkExecutor implements Executor {
       skillsSelected: runSkills.length > 0,
       pluginWarned: false,
       turnEvidencedSessions: new Set<string>(),
+      interruptDropped: false,
     };
     observeState(state);
     const idleMs = seconds(
@@ -2064,30 +2078,44 @@ export class SdkExecutor implements Executor {
     // current turn's abort; the gate also unblocks via the steering verdict. It also
     // reclaims the dependency install (PRD #121 M2) — a cancelled run must not sit at
     // the join waiting out an install whose results nobody will read.
-    const onSignal = (): void => {
+    const tripFromSignal = (fromListener: boolean): void => {
       // PRD #1190 M2: a `now` pause aborts the SAME controller as a cancel, but with a
       // PauseNowSignal as the abort reason. Trip with REASON_PAUSE_NOW so driveTurn throws a
       // PauseNowSignal (via tripError) instead of Error(REASON_CANCELLED) — the loop then PARKS
       // the run rather than failing it. Every other abort (a steering cancel, a shutdown) has
       // the default reason and takes the cancel path unchanged.
-      this.trip(
-        state,
-        ctx.signal?.reason instanceof PauseNowSignal
-          ? REASON_PAUSE_NOW
-          : // PRD #1247 M5b: a held-state credential switch aborts the SAME controller as a cancel,
-            // but with a CredentialSwitchSignal reason. Trip with REASON_CREDENTIAL_SWITCH so
-            // driveTurn throws a CredentialSwitchSignal (via tripError) instead of the cancel error —
-            // the runner then RELEASES the claim rather than failing the run.
-            ctx.signal?.reason instanceof CredentialSwitchSignal
-            ? REASON_CREDENTIAL_SWITCH
-            : REASON_CANCELLED,
-      );
+      const reason = ctx.signal?.reason instanceof PauseNowSignal
+        ? REASON_PAUSE_NOW
+        : // PRD #1247 M5b: a held-state credential switch aborts the SAME controller as a cancel,
+          // but with a CredentialSwitchSignal reason. Trip with REASON_CREDENTIAL_SWITCH so
+          // driveTurn throws a CredentialSwitchSignal (via tripError) instead of the cancel error —
+          // the runner then RELEASES the claim rather than failing the run.
+          ctx.signal?.reason instanceof CredentialSwitchSignal
+          ? REASON_CREDENTIAL_SWITCH
+          : REASON_CANCELLED;
+      // Issue #4090: first-wins drops this stop while another trip is held; remember that.
+      if (state.tripReason !== undefined) this.markInterruptDropped(state);
+      else this.trip(state, reason);
+      // Issue #4090: steering invokes the re-armable interrupt synchronously right after this
+      // abort; that paired call is the same stop. Only the live listener arms the exemption.
+      if (fromListener && (reason === REASON_PAUSE_NOW || reason === REASON_CREDENTIAL_SWITCH)) {
+        state.pairedAbsorb = reason;
+        queueMicrotask(() => { if (state.pairedAbsorb === reason) state.pairedAbsorb = undefined; });
+      }
       depsAbort.abort();
     };
+    const onSignal = (): void => tripFromSignal(true);
     if (ctx.signal) {
-      if (ctx.signal.aborted) onSignal();
+      if (ctx.signal.aborted) tripFromSignal(false);
       else ctx.signal.addEventListener("abort", onSignal, { once: true });
     }
+    // Issue #4090: a re-armable interrupt is a drop when it lands on another held trip, unless it
+    // is the synchronous pair of the ctx.signal abort just processed.
+    const onInterrupt = (reason: string): void => {
+      if (state.pairedAbsorb === reason) state.pairedAbsorb = undefined;
+      else if (state.tripReason !== undefined) this.markInterruptDropped(state);
+      this.trip(state, reason);
+    };
 
     // PRD #1190 rework (N2): register the RE-ARMABLE pause-now interrupt. The shared cancel
     // controller (ctx.signal) fires 'abort' exactly once, so a SECOND `now` pause after a declined
@@ -2096,14 +2124,14 @@ export class SdkExecutor implements Executor {
     // first-wins-per-turn (cleared after a declined park), so a `now` that lands after the loop
     // cleared the prior trip still drops the (restarted) turn. `state` is the run-lifetime drive
     // object, so this one registration covers every turn.
-    ctx.onPauseNow?.(() => this.trip(state, REASON_PAUSE_NOW));
+    ctx.onPauseNow?.(() => onInterrupt(REASON_PAUSE_NOW));
 
     // PRD #1247 M5b: register the RE-ARMABLE credential-switch interrupt, the exact analog of the
     // pause-now interrupt above. The shared cancel controller fires 'abort' once, so a switch that
     // lands after a declined `now` park (which already aborted it) cannot re-fire it; the steering
     // channel invokes THIS on the matching switch, and trip() is first-wins-per-turn, so the switch
     // drops the (restarted) turn as REASON_CREDENTIAL_SWITCH. One registration covers every turn.
-    ctx.onCredentialSwitch?.(() => this.trip(state, REASON_CREDENTIAL_SWITCH));
+    ctx.onCredentialSwitch?.(() => onInterrupt(REASON_CREDENTIAL_SWITCH));
 
     // Issue #2471: the runner tells a guard-bound run when its memory authority is invalidated
     // mid-run; the lane then trips the turn with that stop and disposes every live command.
@@ -3621,6 +3649,7 @@ export class SdkExecutor implements Executor {
           this.throwIfTerminal(ctx);
           this.clearTrip(state);
           throwIfDiskStop(ctx);
+          this.settlePauseSignal(ctx, state);
           return false;
         };
         const requestPark: NonNullable<RunContext["requestParkRun"]> = async (at) => {
@@ -3887,6 +3916,7 @@ export class SdkExecutor implements Executor {
               this.throwIfTerminal(ctx);
               this.clearTrip(state);
               throwIfDiskStop(ctx);
+              this.settlePauseSignal(ctx, state);
               completionRework = reworkForTurn;
               prepareInPlaceRestart();
               continue;
@@ -4192,6 +4222,7 @@ export class SdkExecutor implements Executor {
                     this.throwIfTerminal(ctx);
                     this.clearTrip(state);
                     throwIfDiskStop(ctx);
+                    this.settlePauseSignal(ctx, state);
                     return false;
                   }
                 }
@@ -4703,6 +4734,21 @@ export class SdkExecutor implements Executor {
     if (ctx.signal?.reason instanceof CredentialSwitchSignal) this.spentSwitchSignal = ctx.signal;
   }
 
+  /** Issue #4090: an interrupt was dropped by first-wins. Re-fence now (some continue paths, such
+   *  as a switch give-up, restart a turn without a settle site) and never consume again this run. */
+  private markInterruptDropped(state: RunDrive): void {
+    state.interruptDropped = true;
+    this.consumedPauseSignal = undefined;
+  }
+
+  /** Issue #4090: after a declined or refused pause/wall park continues in place, stop the spent
+   *  PauseNowSignal ctx.signal from fencing later guarded commands, unless an interrupt was
+   *  dropped this run (then the stale abort keeps fencing in front of the lost stop; the drop
+   *  already re-fenced in markInterruptDropped). */
+  private settlePauseSignal(ctx: RunContext, state: RunDrive): void {
+    if (!state.interruptDropped && ctx.signal?.reason instanceof PauseNowSignal) this.consumedPauseSignal = ctx.signal;
+  }
+
   /** Drive ONE SDK turn to its result frame, capturing signals + the session id. */
   /**
    * PRD #1247 M5b (data-integrity fix): run an idle held-state WAIT (the plan gate, an ask_user
@@ -5055,9 +5101,12 @@ export class SdkExecutor implements Executor {
         // already tripped the turn with the runner's own stop (the carrier), and rethrows it.
         // Issue #4076: a ctx.signal already spent by a given-up credential switch stays aborted
         // for the rest of the run; leaving it out keeps the retried turn's guarded commands live.
+        // Issue #4090: likewise a PauseNowSignal ctx.signal whose park was declined or refused,
+        // unless an interrupt was dropped this run (settlePauseSignal / markInterruptDropped).
         lane.beginTurn(AbortSignal.any([
           abortController.signal,
-          ...(ctx.signal && ctx.signal !== this.spentSwitchSignal ? [ctx.signal] : []),
+          ...(ctx.signal && ctx.signal !== this.spentSwitchSignal && ctx.signal !== this.consumedPauseSignal
+            ? [ctx.signal] : []),
           ...(ctx.terminalLifecycleSignal ? [ctx.terminalLifecycleSignal] : []),
         ]));
       }
