@@ -2243,7 +2243,8 @@ per-process boundary record (a worker started by an older build has none, so its
 predecessor is never restored); and the run has exactly one saved pin for the
 generation that died, whose checks all pass. Any other case is a refusal.
 
-**What you see.** The run feed shows one of two worker lines:
+**What you see.** The run feed can show one of two worker lines (some stops put
+nothing on the feed, see below):
 
 - `independent restore: a fresh attempt was seeded from the verified pin`, followed by
   `continues from verified saved work at pin <id> (generation <n>, sha <sha>); later
@@ -2255,11 +2256,15 @@ generation that died, whose checks all pass. Any other case is a refusal.
 
 A refusal is not a failure. Nothing is written to the predecessor and its work is
 kept. The worker log records `independent restore refused; predecessor retained` with
-the reason. A refused claim is charged against the run's requeue allowance: after the
+the reason. The composite stop (`restore entry present; claim stopped`), the
+seeding-disabled stop and a post-seed handoff failure put nothing on the feed; they
+are in the worker log only. A refused claim is charged against the run's requeue allowance: after the
 remaining allowance is used the run parks at `recovery_wait` /
 `worker_requeue_exhausted` with its custody kept, and only you can Resume or Cancel
 it. Back the work
-up first. A Cancel you already issued is honored before anything is written.
+up first. A Cancel you already issued is honored before anything is written. That
+check is a bounded best-effort read: if the read fails, the worker logs that it stops
+without cancel and stops nonterminally.
 
 **What it costs.**
 
@@ -2269,26 +2274,31 @@ up first. A Cancel you already issued is honored before anything is written.
   [custody admission limit](admin-settings.md) (`custody_hold_limit`) until you
   discard it. The generation's final acknowledgment, settlement and report retirement
   all refuse while it is open. Merging the PR closes only the server custody holds; it
-  never deletes the predecessor's copy on the worker.
+  never deletes the predecessor's copy on the worker. The server's verified-merge
+  discard closes only server holds, and also discards those holds' non-ready captures.
 - The restore keeps the new attempt's HOME separate (`agent-home/<run-id>.g<n>`), so
   the predecessor's HOME is never touched.
 
 **How to release it.** Discard the new attempt's retained source first, then the
-predecessor's, with the guarded worker-local inspect and discard described in
+predecessor's. Both guarded discards require the run to be terminal
+(`run_state_not_terminal` otherwise). Use the guarded worker-local inspect and discard described in
 [Retained sources with no open hold](#retained-sources-with-no-open-hold-worker-local-inspect-and-discard)
 and `uzi run discard <run-id> --hold <hold-id> --yes` for the server hold (see
 [the CLI reference](cli.md)). Run `inspect` first and read its disposition; never delete a clone by
 hand. Inspect, discard and `run discard` stay owner-guarded; nothing here is automatic.
 
-**Limits.** Rolling back to v0.87.0-rc.2 after a restore is unsupported. That build
-can write a reservation and a `preservation_failed` blocker into the predecessor's
+**Limits.** Rolling back to any build before the restore-enabling release after a
+restore is unsupported (v0.87.0-rc.3 to rc.5 lack the restore code too; the
+compatibility proof executed the rc.2 sources specifically). rc.2 can write a reservation and a `preservation_failed` blocker into the predecessor's
 journal and delete the predecessor's legacy HOME and provision directories once the run
 is terminal; it does not delete the new attempt's clone, the predecessor's clone
 bytes, owed refs or pins. If rc.2 has reclaimed the predecessor for another run, rolling
-forward recognises it and the guarded discards still finish, except when rc.2's ledger
-compaction dropped the evidence (the new attempt was already retired before the
-rollback, or a second rollback): the roll-forward then refuses and the predecessor's
-bytes stay (issue #3981 is open). The crash model is process and
+forward recognises it and the guarded discards still finish. In the holding-root mode
+the predecessor's holding copy is reported and kept and still needs an owner. The
+exception is when rc.2's ledger compaction dropped the evidence (a second rollback, or,
+in the attempt-path mode only, the new attempt already retired before the rollback): the
+roll-forward then refuses and the predecessor's bytes stay (issue #3981 is open). In the
+holding-root mode a retired new attempt does not cause that refusal; it still completes. The crash model is process and
 container crashes only; no storage or power-loss guarantee is claimed. Design and
 evidence: [ADR-1783](../adr/1783-run-quiescence-and-attempt-clone-paths.md#amendment-2026-11-08--3644-independent-restore).
 

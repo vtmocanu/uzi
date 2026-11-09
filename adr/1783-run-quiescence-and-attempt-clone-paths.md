@@ -1658,8 +1658,8 @@ governor's cache target is rebound through `drainThenBind`
 (`agent/src/cache-target.ts`): a callback still holding the old target finishes
 before the pair changes. S's attribution lives in
 `uzi-restore.<branch>.journal`; P's `uzi-recovery.<branch>.clone` key is never
-written. S completes through the ordinary certified path and its ledger entry becomes
-a `retired` tombstone.
+written. S completes through the ordinary certified path: S's ledger entry goes
+`retired` and S's restore entry becomes the tombstone.
 
 ### P stays held until the owner discards it
 
@@ -1668,7 +1668,9 @@ and report retirement all refuse for G (`restorePredecessorHolds`). The exit is 
 owner's guarded discard, S first and then P, through the retained-source server;
 that route removes the retained-home marker
 `<dataDir>/retained-homes/<runId>.json`. The server's existing verified-merge
-discard closes only the server custody holds. It never deletes P's worker-side bytes.
+discard closes only server custody holds (and discards those holds' non-ready
+captures, `api/internal/recovery/merged_predecessor.go`). It never deletes P's
+worker-side bytes.
 
 ### Refusals
 
@@ -1690,11 +1692,19 @@ observed at the pre-write stops.
 
 ### Costs measured
 
-- Boundary record: 378 bytes, written with the real `establishProcessBoundary` into a
-  scratch data directory against a synthetic procfs fixture and counted with
-  `wc -c`. It is one file per worker process.
-- Tests: the worker-uid namespace-teardown proof took about 51 s locally; the restore
-  test files took about 2 m 40 s for 215 tests locally.
+- Boundary record: about 410 to 420 bytes with a production UUID incarnation (414
+  measured with a `randomUUID` incarnation), written with the real
+  `establishProcessBoundary` into a scratch data directory against a synthetic procfs
+  fixture and counted with `wc -c`. 378 bytes was measured only with the 5-character
+  test incarnation; the size varies with the digit lengths of `nsDev`, `nsIno` and the
+  tick. It is one file per worker process.
+- Tests: the worker-uid namespace-teardown proof took about 51 s locally. At an earlier
+  commit, the 7 files `restore-delayed-writer`, `runner-independent-restore-seed`,
+  `runner-independent-restore-stops`, `runner-independent-restore-route`,
+  `runner-independent-restore-review`, `retained-source-restore-discard` and
+  `restore-boundary` took about 2 m 40 s for 215 tests locally. A later full run of
+  `restore-*.test.ts` plus `runner-independent-restore-*.test.ts` was 446 tests in about
+  235 s.
 - Not measured: production growth (owner: the post-rollout operator) and the CI and
   end-to-end impact.
 
@@ -1708,7 +1718,9 @@ that a crash leaves a refusal, never a reuse of P.
 
 ### Rollback
 
-Rolling back to v0.87.0-rc.2 after a restore is unsupported.
+Rolling back to any build before the restore-enabling release after a restore is
+unsupported. rc.3 to rc.5 exist and lack the restore code too; the reader-compatibility
+proof executed the rc.2 sources specifically.
 
 - Amendment 9 of #3644: rc.2 may write a reservation and a `preservation_failed`
   blocker into P's journal (and `uzi-attemptmode.<key>.enabled`, observed), and deletes
