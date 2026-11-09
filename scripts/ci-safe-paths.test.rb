@@ -167,7 +167,7 @@ pin_repo = lambda do |text|
     FileUtils.mkdir_p(File.join(dir, root_path))
     File.write(File.join(dir, root_path, 'SKILL.md'), "# skill\n#{text}\n")
   end
-  File.write(File.join(dir, 'outside.md'), "codex-cli 0.0.1\n")
+  File.write(File.join(dir, 'outside.md'), 'codex-cli ' + "0.0.1\n")
   _, err, status = Open3.capture3(git_env, 'git', '-C', dir, 'add', '-A')
   raise err unless status.success?
   dir
