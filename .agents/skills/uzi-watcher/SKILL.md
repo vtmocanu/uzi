@@ -551,7 +551,7 @@ scripts do this, preferring the **live runner working clone** (so uncommitted wo
 and falling back to the durable bare tracking ref when no clone survives:
 
 - **`scripts/backup-runs.sh <RUN_ID>...`** — one snapshot per run into
-  `$UZI_BACKUP_DIR` (default `~/.local/state/uzi-backups/<ts>/`, excluded from Time Machine on macOS): `issue-N.tgz` (git **bundle** of
+  `$UZI_BACKUP_DIR` (default `~/.local/state/uzi-backups/<ts>/`; on macOS run `tmutil addexclusion` on the root once, since snapshot churn pins Time Machine local snapshots): `issue-N.tgz` (git **bundle** of
   commits not on `origin/main` + `uncommitted.patch` + `untracked.tar.gz` + `meta.txt`),
   plus a self-describing status set (`run.json`, `plan.md`, `progress.txt` with milestones
   DONE vs LEFT, `log-tail.ndjson`). It picks the clone (canonical or `.attempt-*`) by

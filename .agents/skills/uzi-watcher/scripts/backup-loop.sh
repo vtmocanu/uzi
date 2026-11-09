@@ -4,7 +4,9 @@
 # target run is terminal, when MAX_HOURS elapses, or when a STOP file appears.
 #
 # Launch it outside the agent session so it outlives the launching shell:
-#   Linux:  setsid bash backup-loop.sh <RUN_ID>... </dev/null >>~/.local/state/uzi-backups/loop.log 2>&1 &
+#   Linux:  B="${UZI_BACKUP_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/uzi-backups}"
+#           mkdir -p -m 700 "$B"
+#           setsid bash backup-loop.sh <RUN_ID>... </dev/null >>"$B/loop.log" 2>&1 &
 #   macOS:  use a launchd LaunchAgent. The Claude Code harness reaps nohup children.
 #           Keep launchd stdout/stderr under /tmp wherever UZI_BACKUP_DIR points;
 #           a Downloads log path failed before the job could start.
@@ -12,8 +14,8 @@
 #           EnvironmentVariables): outside a checkout the slug derivation from
 #           `origin` fails, so every cycle exits rc=2 and captures nothing.
 #
-# Stop it:  touch "$UZI_BACKUP_DIR/STOP"   (default ~/.local/state/uzi-backups/STOP)
-#     or:   kill "$(cat "$UZI_BACKUP_DIR/backup-loop.pid")"
+# Stop it:  touch "$B/STOP"   ($B = the backup root, as in the launch example)
+#     or:   kill "$(cat "$B/backup-loop.pid")"
 #
 # Env: UZI_BACKUP_INTERVAL (default 900s), UZI_BACKUP_MAX_HOURS (default 12),
 #      UZI_BACKUP_DIR (default ${XDG_STATE_HOME:-~/.local/state}/uzi-backups), UZI_BIN (uzi path).
@@ -62,6 +64,8 @@ if [ -n "${UZI_CTX:-}" ]; then
   fi
 fi
 
+# The root is persistent and holds unpushed work: owner-only, like backup-runs.sh.
+umask 077
 mkdir -p "$ROOT"
 echo "$$" > "$ROOT/backup-loop.pid"
 START_EPOCH="$(date +%s)"
