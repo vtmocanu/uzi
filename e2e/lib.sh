@@ -450,7 +450,7 @@ _docker_wire_service_running() {
 # append UZI_DIND_SOCKET to $ENVFILE. The caller performs its own agent force-recreate afterwards. A second
 # call in the same phase is a no-op so it cannot clobber the recorded ownership.
 docker_wire_prepare() {
-  local svc rc running=0 has_line=0
+  local svc rc running=0 has_line=0 uplog tail_out
   if [ "${DOCKER_WIRE_OWNED:-0}" = 1 ]; then return 0; fi
   DOCKER_WIRE_OWNED=0 DOCKER_WIRE_STARTED="" DOCKER_WIRE_LINE_OWNED=0
   rc=0; _docker_wire_service_running dind || rc=$?
@@ -473,8 +473,12 @@ docker_wire_prepare() {
     esac
   done
   DOCKER_WIRE_OWNED=1
-  "${COMPOSE[@]}" --profile agent-docker up -d --wait dind >/dev/null 2>&1 \
-    || fail "docker wiring: the DinD sidecar did not become healthy (up -d --wait dind)"
+  uplog="$(mktemp)" || fail "docker wiring: could not create a temp file for the sidecar start output"
+  if ! "${COMPOSE[@]}" --profile agent-docker up -d --wait dind >"$uplog" 2>&1; then
+    tail_out="$(tail -n 15 "$uplog" 2>/dev/null || true)"; rm -f "$uplog"
+    fail "docker wiring: the DinD sidecar did not become healthy (up -d --wait dind): ${tail_out:-no compose output}"
+  fi
+  rm -f "$uplog"
   if [ "$has_line" = 0 ]; then
     printf '%s\n' "$DOCKER_WIRE_LINE" >> "$ENVFILE" || fail "docker wiring: could not append $DOCKER_WIRE_LINE to the env file"
     DOCKER_WIRE_LINE_OWNED=1
@@ -522,15 +526,37 @@ _docker_wire_check() {
 docker_wire_assert() {
   _docker_wire_check true "${1:-60}" wired
 }
+# _docker_wire_drop_line — remove the env line this phase appended (no-op when it did not append one).
+_docker_wire_drop_line() {
+  local tmp="$ENVFILE.unwire"
+  [ "${DOCKER_WIRE_LINE_OWNED:-0}" = 1 ] || return 0
+  { grep -vxF "$DOCKER_WIRE_LINE" "$ENVFILE" > "$tmp" || [ "$?" = 1 ]; } \
+    && cat "$tmp" > "$ENVFILE" && rm -f "$tmp" || return 1
+  DOCKER_WIRE_LINE_OWNED=0
+}
+# docker_wire_exit_restore [STATUS] — EXIT-trap body for a phase that called docker_wire_prepare: if the phase
+# still owns the wiring (a failure or abort before its normal docker_restore_posture), restore the entry
+# posture best-effort in a subshell so a restore failure is reported loudly but the phase's original exit
+# status is preserved. After a successful docker_restore_posture it is a no-op. Install it BEFORE
+# docker_wire_prepare (`trap docker_wire_exit_restore EXIT`), or call it from a phase's own trap.
+docker_wire_exit_restore() {
+  local rc=${1:-$?}
+  if [ "${DOCKER_WIRE_OWNED:-0}" = 1 ]; then
+    echo "docker wiring: the phase ended before restoring the entry Docker posture (status $rc); restoring it now" >&2
+    ( docker_restore_posture ) \
+      || echo "docker wiring: LOUD: the posture restore on exit FAILED; later phases may run with the Docker wiring left in place" >&2
+  fi
+  return "$rc"
+}
 # docker_restore_posture — if this phase wired the stack: (1) stop and remove ONLY the sidecar services it
 # started, (2) remove the env line it appended, (3) THEN force-recreate the agent (the agent resolves wiring
 # once, at startup, so removing the sidecar alone leaves it wired) and wait for the new registration,
 # (4) assert the FINAL container is unwired. If the phase wired nothing it changes nothing.
 docker_restore_posture() {
-  local svc before after tmp
+  local svc before after
   local -a svcs=()
   if [ "${DOCKER_WIRE_OWNED:-0}" != 1 ]; then
-    echo "docker wiring: the entry posture was already wired; nothing to restore"
+    echo "docker wiring: this phase owns no Docker wiring (entry already wired, or already restored); nothing to restore"
     return 0
   fi
   for svc in dind dind-init; do
@@ -540,12 +566,7 @@ docker_restore_posture() {
     "${COMPOSE[@]}" --profile agent-docker stop "${svcs[@]}" >/dev/null || fail "docker wiring: could not stop ${svcs[*]}"
     "${COMPOSE[@]}" --profile agent-docker rm -f "${svcs[@]}" >/dev/null || fail "docker wiring: could not remove ${svcs[*]}"
   fi
-  if [ "${DOCKER_WIRE_LINE_OWNED:-0}" = 1 ]; then
-    tmp="$ENVFILE.unwire"
-    { grep -vxF "$DOCKER_WIRE_LINE" "$ENVFILE" > "$tmp" || [ "$?" = 1 ]; } \
-      && cat "$tmp" > "$ENVFILE" && rm -f "$tmp" \
-      || fail "docker wiring: could not remove $DOCKER_WIRE_LINE from the env file"
-  fi
+  _docker_wire_drop_line || fail "docker wiring: could not remove $DOCKER_WIRE_LINE from the env file"
   before="$(restore_agent_container 2>/dev/null)" || before=""
   capture_agent_logs docker-wire before-unwire-recreate
   "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null || fail "docker wiring: could not recreate the agent to unwire it"

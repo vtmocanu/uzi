@@ -508,7 +508,14 @@ restore_outbox_resolution() {
 }
 restore_outage_state() {
   local rc=$?
+  # #3644: drop the phase-appended UZI_DIND_SOCKET line BEFORE restore_outbox_resolution recreates the agent
+  # from the env file, so that recreate comes up unwired; the full posture restore (sidecar, final recreate
+  # and unwired assertion) follows it. Both are no-ops once the phase's own docker_restore_posture ran.
+  if [ "${DOCKER_WIRE_OWNED:-0}" = 1 ]; then
+    _docker_wire_drop_line || echo 'docker wiring: LOUD: could not remove the phase-owned env line on exit' >&2
+  fi
   restore_outbox_resolution || echo 'outbox cleanup: API alias restore failed' >&2
+  docker_wire_exit_restore "$rc" || true
   set_interlock true 2>/dev/null || true
   return "$rc"
 }
@@ -1027,7 +1034,7 @@ F42_MAX="$(f42_max_requeues)" || fail "issue 1742: cannot resolve RUN_MAX_REQUEU
 # requeue budget spent. G+1 restores independently from the predecessor's pin and completes in the same claim.
 # #3644: cases 7 and 8 kill an attempt-shaped predecessor. The agent resolves Docker wiring once at startup, so
 # wire the sidecar immediately before the agent recreate this transition performs, and assert it before any
-# case run is created. Cases 1-6 keep their unwired agent.
+# case run is created. Cases 1-6 keep the entry posture, whatever it is (wired already under --profile agent-docker, unwired otherwise).
 docker_wire_prepare
 transition_outbox_feature before7 false "$RUN_B4"
 docker_wire_assert

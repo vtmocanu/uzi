@@ -2719,7 +2719,7 @@ fake_compose() {
       esac ;;
     up)
       case "${!#}" in
-        dind) [ -z "${DIND_UP_FAIL:-}" ] || return 1
+        dind) [ -z "${DIND_UP_FAIL:-}" ] || { echo "${DIND_UP_MSG:-}"; return 1; }
           : > "$S/running.dind"; : > "$S/running.dind-init"; : > "$S/daemon"; : > "$S/sock" ;;
         agent) agent_create ;;
         *) echo "unexpected up: $*" >> "$S/forbidden" ;;
@@ -2745,7 +2745,7 @@ fn() { eval "$(awk -v n="$1" '$0 ~ ("^" n "\\(\\) \\{") { p = 1 } p { print } p 
 eval "$(awk '/^DOCKER_WIRE_LINE=/ { p = 1 } p { print } p && /^docker_restore_posture\(\) \{/ { q = 1 } q && /^\}/ { exit }' "$LIB")"
 for f in restore_agent_container hold_open_count assert_hold_count_le log_hold_census log_run_hold_census assert_no_open_run_holds \
   _restore_journal_value restore_check_p_shape restore_assert_canonical_refusal; do fn "$f"; done
-for f in docker_wire_prepare docker_wire_assert docker_restore_posture restore_agent_container; do
+for f in docker_wire_prepare docker_wire_assert docker_restore_posture docker_wire_exit_restore restore_agent_container; do
   type "$f" >/dev/null 2>&1 || { echo "fail: $f not extracted from $LIB" >&2; exit 2; }
 done
 
@@ -2815,8 +2815,36 @@ case "$SCENARIO" in
     [ "$(grep -c '^up -d --wait dind$' "$S/calls")" = 1 ] || fail "the sidecar must be started once"
     [ "$(grep -cxF "$LINE" "$ENVFILE")" = 1 ] || fail "the env line must appear once"
     echo "OK second prepare is a no-op; ownership and single start/line kept" ;;
+  restore-idempotent)
+    docker_wire_prepare
+    fake_compose up -d --no-deps --force-recreate agent
+    docker_restore_posture
+    : > "$S/calls"
+    before="$(cat "$S/agent.id")"
+    docker_restore_posture
+    [ ! -s "$S/calls" ] || fail "a second restore after a successful one must issue no compose call: $(cat "$S/calls")"
+    [ "$(cat "$S/agent.id")" = "$before" ] || fail "a second restore must not recreate the agent"
+    docker_wire_exit_restore 0
+    [ ! -s "$S/calls" ] || fail "the exit restore after a successful restore must be a no-op: $(cat "$S/calls")"
+    echo "OK restore is idempotent: a second restore and the exit restore after it do nothing" ;;
+  exit-restore)
+    # A phase that fails between prepare and its restore: the exit hook restores the posture and keeps the status.
+    docker_wire_prepare
+    fake_compose up -d --no-deps --force-recreate agent
+    rc=0; docker_wire_exit_restore 3 2>/dev/null || rc=$?
+    [ "$rc" = 3 ] || fail "the exit restore must preserve the phase status 3, got $rc"
+    last="$(tail -n 1 "$S/recreates")"
+    case "$last" in *"wired=0 envline=absent dind=down") ;; *) fail "the exit restore did not leave an unwired agent: $last" ;; esac
+    ! grep -qxF "$LINE" "$ENVFILE" || fail "the exit restore left the env line"
+    # A restore that itself fails is reported loudly and still preserves the original status.
+    DOCKER_WIRE_OWNED=0; reset_state; docker_wire_prepare; fake_compose up -d --no-deps --force-recreate agent; STUCK_WIRED=1
+    rc=0; out="$(docker_wire_exit_restore 5 2>&1)" || rc=$?
+    [ "$rc" = 5 ] || fail "a failing exit restore must preserve the phase status 5, got $rc"
+    case "$out" in *LOUD*) ;; *) fail "a failing exit restore must be loud: $out" ;; esac
+    echo "OK exit restore: unwires on a failed phase, loud on its own failure, original status preserved" ;;
   prepare-failures)
     ( reset_state; DIND_UP_FAIL=1; expect_failure 'the DinD sidecar did not become healthy' docker_wire_prepare )
+    ( reset_state; DIND_UP_FAIL=1; DIND_UP_MSG='boom-from-compose'; expect_failure 'boom-from-compose' docker_wire_prepare )
     ( reset_state; PS_FAIL=1; expect_failure 'cannot read the dind service state at entry' docker_wire_prepare )
     ( reset_state; : > "$S/running.dind"; expect_failure 'inconsistent entry posture' docker_wire_prepare )
     ( reset_state; printf '%s\n' "$LINE" >> "$ENVFILE"; expect_failure 'inconsistent entry posture' docker_wire_prepare )
@@ -2924,6 +2952,8 @@ dw_case "docker wiring: NEGATIVE old order (remove line, recreate, stop dind, re
 dw_case "docker wiring: old order is only unwired when a stale socket file happens to linger" old-sequence SOCK_MODE=stale
 dw_case "docker wiring: an already wired entry posture issues no stop, rm or recreate" already-wired
 dw_case "docker wiring: prepare is idempotent and keeps its recorded ownership" prepare-idempotent
+dw_case "docker wiring: a second restore (and the exit restore after it) is a no-op" restore-idempotent
+dw_case "docker wiring: the exit restore unwires a failed phase, is loud on failure and keeps the status" exit-restore
 dw_case "docker wiring: prepare failures name their cause" prepare-failures
 dw_case "docker wiring: assert failures name their cause" assert-failures
 dw_case "docker wiring: restore verifies the FINAL container is unwired" restore-failures

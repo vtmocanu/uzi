@@ -81,6 +81,9 @@ else
   # #3644: the kill scenarios below need attempt-shaped predecessors, and the agent resolves its Docker
   # wiring once at startup, so wire the DinD sidecar BEFORE this recreate (docker_wire_prepare starts it
   # and appends UZI_DIND_SOCKET; this recreate is the one that picks it up) and assert it right after.
+  # The trap restores the entry posture if the phase ends (fails) before its normal docker_restore_posture;
+  # it is a no-op once that has run, and never changes the phase's exit status.
+  trap docker_wire_exit_restore EXIT
   docker_wire_prepare
   printf 'UZI_E2E_MAX_CONCURRENT_RUNS=2\n' >> "$ENVFILE"
   capture_agent_logs 45-bounded-concurrency before-recreate-cap2
