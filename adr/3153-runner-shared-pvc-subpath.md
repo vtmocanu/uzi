@@ -78,7 +78,7 @@ On Docker-lane hosted workers, the run's working clones and `$TMPDIR` (`/data/ru
 - Admission fails open on an unknown sample and reopens after the bounded wait `UZI_DISK_ADMISSION_MAX_WAIT` (default 15m, `agent/src/config.ts`). **No admission headroom is claimed.**
 - `workerDefaultDockerEphemeralRequest` stays 5Gi (not remeasured). Data PVC sizes are unchanged (presets 5/25/50Gi, run-bound 40Gi) pending live measurement.
 - Since #3852, automatic pressure recycle preserves Docker `/data` regardless of custody or runner layout: explicit Nix pressure selects Nix only; data pressure without Nix defers. This protection requires the fixed controller; old controllers can still delete data. Ephemeral teardown and manual data-PVC deletion still physically remove runner contents. A DinD-only maintenance recycle keeps `/data/runner` and loses only DinD state.
-- Full Docker data now degrades capacity. Existing run park-and-trim and supported manual settled-tree cleanup remain the reclaim paths; D9's custody procedure remains binding for protected sources. PRD #3431 M1b settlement/deletion is not started and #3329's genuine-idle reclaim roll remains deferred. No new reclaim authority is granted; see [ADR-837 D9](0837-worker-disk-lifecycle.md#d9--recycle-defaults-on-over-recorded-reviewer-dissent).
+- Full Docker data now degrades capacity. Existing run park-and-trim and supported manual settled-tree cleanup remain the reclaim paths; D9's custody procedure remains binding for protected sources. PRD #3431 M1b settlement/deletion is implemented behind an off-by-default gate (amendment 2026-11-06 below), so production still grants it no authority, and #3329's genuine-idle reclaim roll remains deferred. No new reclaim authority is granted; see [ADR-837 D9](0837-worker-disk-lifecycle.md#d9--recycle-defaults-on-over-recorded-reviewer-dissent).
 
 ### D9. Availability residual: daemon-owned bytes on a custody-held worker (maintainer wording)
 
@@ -174,3 +174,26 @@ The issue made "rootless isolation is preserved" a merge condition. The maintain
 - Docker-lane disk thresholds.
 - Kubelet `subPath` re-resolution behavior (read from source, not run on a live kubelet).
 - Rootless-container/UID functional check: whether a real rootless dind container is denied (or allowed) at the `runner-shared` top, the `TMPDIR` root and inside checkouts, in each uid mode. The Permissions analysis is code reading only.
+
+## Amendment 2026-11-06 — PRD #3431 M1b: gated epoch deletion of `runner-shared` sources
+
+Refs [PRD #3431](../prds/3431-pod-epoch-reclaim.md) M1b. The first-process pod-epoch pass
+can now settle and delete a retained attempt clone under `/data/runner` (the `runner-shared`
+subPath), but only behind `EPOCH_RECLAIM_DELETION_ENABLED`, which is `false`. Until a
+separate owner activation co-sign, the D5, D8 and Consequences statements that automatic
+retention deletion stays off remain true in production. The mechanism is recorded in the
+[ADR-1783 amendment of the same date](1783-run-quiescence-and-attempt-clone-paths.md).
+
+- **Scope.** Plain attempt sources in the admitted journal shapes only; protected sources,
+  canonical clones and unrecoverable shapes are kept. D9's custody procedure stays binding:
+  deletion needs a terminal run, an empty hold list and a run-wide `run_open_holds` count of
+  exactly 0, and the first roll onto an image advertising that capability keeps everything.
+- **Bounded proof work.** R9 limits (owner answer seq 1162): metadata 16 MiB, worktree
+  content 512 MiB, object store 4 GiB per snapshot (logical work, not a memory ceiling),
+  records 131,072, directory entries 16,384, `maxBares` 1,024 and `maxSeenPaths` 4,096
+  unchanged, delta base cache 96 MiB. A content-stage overflow keeps the source; an
+  indirection overflow is UNKNOWN.
+- **Durability.** Process crash only. No storage or power-loss durability is claimed: the
+  tree removal's parent directory under `runner-shared` is not fsynced.
+- **Not verified.** No hosted run of the deletion phase on a real `runner-shared` PVC; it is
+  maintainer-owned live acceptance, like the list above.

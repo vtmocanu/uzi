@@ -159,6 +159,34 @@ func (q *Queries) CountOpenCustodyHoldsForWorker(ctx context.Context, arg CountO
 	return count, err
 }
 
+const countOpenHoldsForOwnedRun = `-- name: CountOpenHoldsForOwnedRun :one
+SELECT r.id AS run_id,
+       (SELECT count(*) FROM recovery_custody_holds h
+         WHERE h.run_id = r.id AND h.state = 'open')::bigint AS open_holds
+FROM runs r
+WHERE r.id = $1 AND r.user_id = $2
+`
+
+type CountOpenHoldsForOwnedRunParams struct {
+	RunID  uuid.UUID `json:"run_id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+type CountOpenHoldsForOwnedRunRow struct {
+	RunID     uuid.UUID `json:"run_id"`
+	OpenHolds int64     `json:"open_holds"`
+}
+
+// Issue #3431: the run-wide count of open custody holds (every worker, every generation) for a
+// run the caller's owner owns. Authorized on runs.user_id; the count deliberately carries no
+// hold-level user filter. pgx.ErrNoRows when the run is unknown or foreign.
+func (q *Queries) CountOpenHoldsForOwnedRun(ctx context.Context, arg CountOpenHoldsForOwnedRunParams) (CountOpenHoldsForOwnedRunRow, error) {
+	row := q.db.QueryRow(ctx, countOpenHoldsForOwnedRun, arg.RunID, arg.UserID)
+	var i CountOpenHoldsForOwnedRunRow
+	err := row.Scan(&i.RunID, &i.OpenHolds)
+	return i, err
+}
+
 const discardCaptureForOwner = `-- name: DiscardCaptureForOwner :one
 WITH owned AS (
     SELECT rc.id FROM recovery_captures rc

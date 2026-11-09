@@ -174,7 +174,7 @@ changes it); trust it over a handover's claim.
 | `run_active:<status>` | step 1 |
 | `run_failed:*`, `run_completed_no_pr` | hand to `uzi-watcher` (*When a run fails*, recovery) |
 | `migration_collision`, `conflict` | step 5; the `EVERY_AUTHOR=` line and its rows (threads, code-scanning alerts, unacked comments) print whatever `NEXT` is, so read them first |
-| `ci_red` | read the failing job; fix locally (step 4) or classify flake. An infra fix that landed on `main` (e.g. a registry mirror) needs a rebase (step 5): a rerun reuses the old head's workflow |
+| `ci_red` | read the failing job; attribute a named failing test locally, narrowly, before a CI rerun (references/ci-red.md); fix locally (step 4) or classify flake. An infra fix that landed on `main` (e.g. a registry mirror) needs a rebase (step 5): a rerun reuses the old head's workflow |
 | `claimed_by_other` | another live lander holds it: message the owner, take the patient path |
 | `mr_rework_active` | `S/wait-mrrework.sh` (references/mr-rework.md), then re-snapshot |
 | `ci_fix_active` | follow *CI-fix branch ownership* below before touching the branch |
@@ -755,7 +755,7 @@ unattributed process. Tell dependent peers which obligation remains.
   merge SHA; `scripts/watch-prs-ci.sh` CI-only for a batch of PRs (shared
   `scripts/lib/pr-checks-classify.sh`). The sibling and `lib/*.test.sh` scripts are the
   hermetic regressions, wired through `task test:uzi-lander` and `gate:repo`.
-- `references/review-signals.md` every pollable surface per bot; `references/coderabbit-triage.md`
+- `references/review-signals.md` every pollable surface per bot; `references/ci-red.md` attributing a red CI test locally; `references/coderabbit-triage.md`
   verifying and deciding findings; `references/mr-rework.md` coordinating with uzi's own
   rework; `references/merge-mechanics.md` ruleset, red `main`, post-merge CI;
   `references/batch.md` landing the whole open-PR set in order; `references/renovate.md`

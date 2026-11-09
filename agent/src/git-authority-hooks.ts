@@ -5,9 +5,8 @@
  * Contract for every implementer (the runner, over the authority store):
  *  - admitSourceUse, beginBareMutation and beginDestructive are called from INSIDE an outer authority
  *    transaction the runner established. The hooks borrow that transaction; GitCache never acquires the
- *    authority lock itself. assertBareClear is the exception: it is a read-only load of a durable record
- *    that needs no transaction (see its entry below), so a call site whose only hook is assertBareClear
- *    runs without A.
+ *    authority lock itself. assertBareClear and isRetiredSource are read-only exceptions:
+ *    neither takes A under the caller's bare lock B; unknown retirement stays counted.
  *  - A rejected promise is a refusal. GitCache aborts BEFORE the effect it was about to perform.
  *  - Settlement (`settle`) is called only once the effect's child process or in-process await has
  *    been positively joined. When joining is unknown (a spawn error after a possible start, a
@@ -17,7 +16,7 @@
  * Implementation: `AuthorityRuntime.hooks` (authority-runtime.ts), built in main.ts over the worker lifetime
  * and passed by buildWorkerGitCache. admitSourceUse, beginBareMutation and beginDestructive REQUIRE the
  * transaction the outermost entry point opened in the current async context and refuse (AuthorityRefusal)
- * when there is none; assertBareClear does not (see its entry below). No hook acquires A beneath B.
+ * when there is none; assertBareClear and isRetiredSource do not. No hook acquires A beneath B.
  * Every `settle` call is awaited inside the caller's own B section and borrows its transaction, except
  * two that can run with none active: the runner-uid delete's late `close` (a child that outlived its
  * caller) and the continuation GitCache.cleanupArchivedRecoveryPin abandons when its caller's deadline
@@ -136,6 +135,9 @@ export interface AuthoritySettlement {
 }
 
 export interface GitAuthorityHooks {
+  /** Read-only, authenticated retired tombstone for an exact source path. No A acquisition under B;
+   *  false means absent or uncertain, so an epoch metadata repair remains counted. */
+  isRetiredSource?(clonePath: string): Promise<boolean>;
   admitSourceUse(clonePath: string, op: string): Promise<void>;
   beginBareMutation(barePath: string, op: string, footprint: readonly string[]): Promise<AuthoritySettlement>;
   assertBareClear(barePath: string, op: string): Promise<void>;
