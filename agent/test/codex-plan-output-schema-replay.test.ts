@@ -22,9 +22,9 @@ it("captured strict-schema turn replays through CodexCrossCheck with a usable Re
  assert.deepEqual(result.disposed, ["provider", "fileop"]);
 });
 
-async function rejectsDamagedReplay(fixture: SchemaFixture): Promise<void> {
+async function rejectsDamagedReplay(fixture: SchemaFixture, expectedMessage: string): Promise<void> {
  await assert.rejects(replaySchemaFixture(fixture), (error: Error) => {
-  assert.doesNotMatch(error.message, /initialize|login|deadline/, "must reach the damaged replay seam");
+  assert.equal(error.message, expectedMessage, "must reach the damaged replay seam");
   return true;
  });
 }
@@ -34,7 +34,7 @@ for (const target of ["item/tool/call", "turn/completed"] as const) {
   const f = load();
   f.events = f.events.filter(e => e.frame.method !== target);
   assert.throws(() => assertFixture(f));
-  await rejectsDamagedReplay(f);
+  await rejectsDamagedReplay(f, "cross-check ended without a result or terminal turn");
  });
  it("rejects capture altering " + target, async () => {
   const f = load();
@@ -42,6 +42,7 @@ for (const target of ["item/tool/call", "turn/completed"] as const) {
   if (target === "item/tool/call") e.frame.params!.arguments.path = "missing.ts";
   else e.frame.params!.turn.status = "failed";
   assert.throws(() => assertFixture(f));
-  await rejectsDamagedReplay(f);
+  await rejectsDamagedReplay(f, target === "item/tool/call"
+   ? "codex transport write stream error" : "cross-check model error: terminal turn unsuccessful");
  });
 }

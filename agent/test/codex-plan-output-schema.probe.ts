@@ -89,8 +89,6 @@ export async function captureSchemaFixture(out = DEFAULT_OUT): Promise<void> {
  const home = path.join(base, "home");
  const codexHome = path.join(home, ".codex");
  const tmp = path.join(base, "tmp");
- await Promise.all([mkdir(checkout), mkdir(codexHome, { recursive: true }), mkdir(tmp)]);
- await writeFile(path.join(checkout, "anchor.ts"), ANCHOR);
  const credential = "synthetic-schema-provider";
  const events: Event[] = [];
  const requests: Record<string, any>[] = [];
@@ -140,6 +138,8 @@ export async function captureSchemaFixture(out = DEFAULT_OUT): Promise<void> {
  server.requestTimeout = TIMEOUT;
  server.headersTimeout = TIMEOUT;
  try {
+  await Promise.all([mkdir(checkout), mkdir(codexHome, { recursive: true }), mkdir(tmp)]);
+  await writeFile(path.join(checkout, "anchor.ts"), ANCHOR);
   await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
   const address = server.address();
   assert.ok(address && typeof address !== "string");
