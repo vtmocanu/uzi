@@ -147,6 +147,8 @@ run_case(){
     # Also shadow PATH so an accidental default kubectl cannot reach a cluster.
     export PATH="$CASE_DIR:$PATH"
     export UZI_CTX=test-ctx
+    # A typical permissive caller umask: the loop must still write owner-only.
+    umask 022
     case "$CASE" in
       context-unset) unset UZI_CTX ;;
       context-empty) export UZI_CTX= ;;
@@ -181,6 +183,11 @@ run_case(){
       case "$CASE" in
         baseline)
           assert_backups 2 run-a run-b
+          # The root is persistent and holds unpushed work: owner-only despite umask 022.
+          [ -n "$(find "$CASE_DIR/out" -maxdepth 0 -perm 700)" ] ||
+            fail "backup root is not mode 0700"
+          [ -n "$(find "$CASE_DIR/out/backup-loop.state" -maxdepth 0 -perm 600)" ] ||
+            fail "backup-loop.state is not mode 0600"
           contains "$CASE_DIR/out/backup-loop.state" "context=test-ctx"
           contains "$CASE_DIR/stdout" "backup cycle incomplete rc=1"
           contains "$CASE_DIR/stdout" "keeping terminal run run-a after incomplete backup cycle"

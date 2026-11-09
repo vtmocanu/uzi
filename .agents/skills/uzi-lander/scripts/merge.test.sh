@@ -105,6 +105,10 @@ if [ "\${1:-}" = api ]; then
   case "\$*" in
     *'/commits/deadbee '*) [ "\${EXPECT_AMBIGUOUS:-0}" = 1 ] && exit 1; echo '$HEAD'; exit 0 ;;
     *'/commits/abcdef0 '*) echo 'abcdef0123456789abcdef0123456789abcdef01'; exit 0 ;;
+    *'/contents/.github/workflows/'*)
+      [ "\${WF_FAIL:-0}" = 1 ] && exit 1
+      printf '{"content":"%s"}\n' "\$(base64 < "\${WF_BODY_FILE:?}" | tr -d '\n')"
+      exit 0 ;;
     *'/pulls/42/files'*)
       [ "\${PR_FILES_FAIL:-0}" = 1 ] && { echo '[]'; exit 1; }
       if [ -n "\${PR_FILES_RAW:-}" ]; then printf '%s\n' "\$PR_FILES_RAW"; else printf '%s\n' "\${PR_FILES_JSON:-[]}"; fi
@@ -552,6 +556,52 @@ rel_case relmixed 10
 [ ! -e "$WORK/merge.log" ] || fail "merged over a second, uncovered release run"
 unset TAG_REF_JSON COV_RC
 unset MAIN_RUNS_JSON
+# 8c. Since #4107 a merge's new main run no longer cancels a RUNNING ci.yml / kind-smoke.yml
+#     main run (the incoming run's cancel-in-progress decides). A release run already in
+#     progress there is allowed when live main's file has the main-finishes line ACTIVE and the
+#     PR does not touch that file. Queued runs, other workflows, a cancelling or commented-out
+#     policy, a PR editing the workflow, or an unreadable file keep exit 10.
+WF_OK="$WORK/wf-ok.yml" WF_TRUE="$WORK/wf-true.yml" WF_COMMENT="$WORK/wf-comment.yml"
+cat > "$WF_OK" <<'YAML'
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+YAML
+cat > "$WF_TRUE" <<'YAML'
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+YAML
+cat > "$WF_COMMENT" <<'YAML'
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+  # cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+YAML
+export WF_BODY_FILE="$WF_OK"
+prun() { jq -nc --arg s "$1" --arg p "$2" --argjson id "$3" '{status:$s,display_title:"chore(release): v0.86.0-rc.30",head_sha:"5f9145cbaaaa0000",name:"CI",path:$p,id:$id}'; }
+relrefuse() { # label: expect exit 10 and no merge
+  merge_run "$1"
+  [ "$rc" -eq 10 ] || fail "release case $1 did not refuse, rc=$rc: $(cat "$WORK/m.$1")"
+  [ ! -e "$WORK/merge.log" ] || fail "release case $1 merged"
+}
+MAIN_RUNS_JSON="[$(prun in_progress .github/workflows/ci.yml 911),$(prun in_progress '.github/workflows/kind-smoke.yml@refs/heads/main' 912)]"; export MAIN_RUNS_JSON
+merge_run relrunning
+[ "$rc" -ne 10 ] || fail "a running release run in a no-cancel workflow still refused: $(cat "$WORK/m.relrunning")"
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "running no-cancel release run did not merge: $(cat "$WORK/m.relrunning")"
+grep -q 'whose main runs finish rather than cancel' "$WORK/m.relrunning" || fail "finish rule not printed: $(cat "$WORK/m.relrunning")"
+export WF_BODY_FILE="$WF_TRUE"; relrefuse relcancelling
+export WF_BODY_FILE="$WF_COMMENT"; relrefuse relcommented
+export WF_BODY_FILE="$WF_OK" WF_FAIL=1; relrefuse relwfunread; unset WF_FAIL
+export PR_FILES_JSON='[{"filename":".github/workflows/ci.yml","status":"modified"}]'; relrefuse relprtouch; unset PR_FILES_JSON
+MAIN_RUNS_JSON="[$(prun queued .github/workflows/ci.yml 913)]"; export MAIN_RUNS_JSON
+relrefuse relqueued
+MAIN_RUNS_JSON="[$(prun in_progress .github/workflows/codeql.yml 914)]"; export MAIN_RUNS_JSON
+relrefuse relcodeql
+MAIN_RUNS_JSON="[$(prun in_progress .github/workflows/ci.yml 915),$(prun queued .github/workflows/kind-smoke.yml 916)]"; export MAIN_RUNS_JSON
+relrefuse relhalf
+unset WF_BODY_FILE
+unset MAIN_RUNS_JSON
 export RUNS_FAIL=1
 merge_run runsfail
 [ "$rc" -eq 2 ] || fail "an unreadable main run page did not refuse, rc=$rc: $(cat "$WORK/m.runsfail")"
@@ -897,4 +947,4 @@ unset POLICY_FETCH_FAIL
 echo 'PASS merge-policy: six changes/admin modes/repo spellings refuse stale policy; rebase/unrelated-main/own-policy-edit/remote-head accept; Git errors refuse; optional lock still checks; confirm-only skips'
 if [ "${UZI_MERGE_POLICY_ONLY:-0}" = 1 ]; then exit 0; fi
 
-echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only/unregistered required checks refuse; a conflicting PR names the conflict; every unresolved thread (bots included), alerts and unacknowledged comments refuse; an in-flight release run on main refuses unless its tag is on origin and coverage holds without it; --expect-closes refuses a closing-reference mismatch"
+echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only/unregistered required checks refuse; a conflicting PR names the conflict; every unresolved thread (bots included), alerts and unacknowledged comments refuse; an in-flight release run on main refuses unless it is already running in a no-cancel workflow (#4107) or its tag is on origin and coverage holds without it; --expect-closes refuses a closing-reference mismatch"
