@@ -273,8 +273,12 @@ pass "admin logged in; repo $REPO_ID enabled"
 
 # The startup seed enabled the repo and created its board columns (PRD #3760),
 # so the run-lifecycle's single-column moves never leave a card carrying two
-# column labels. Open the board once up front to confirm the columns exist
-# before the run-lifecycle path and the PRD #24 MR-close phase rely on them.
+# column labels. Check the rows BEFORE any board read: GET .../board creates
+# missing columns, so reading it first would hide a seed that skipped them.
+seed_cols="$(db_psql "SELECT string_agg(label_name, ',' ORDER BY position) FROM board_columns WHERE repo_id = '$REPO_ID'")"
+[ "$seed_cols" = "Planned,In Progress,Human Review,Later" ] \
+  || fail "the startup seed must create the default board columns before enabling the repo; got '$seed_cols'"
+# Later phases still read the board through the API; open it once here.
 apiget "/api/repos/$REPO_ID/board" >/dev/null
 pass "board columns present"
 
