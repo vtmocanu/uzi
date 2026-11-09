@@ -25,6 +25,10 @@ explicitly authorizes public disclosure before the release.
   commits unchanged on current `main` and gate that exact stack, every gate the diff
   touches plus `gate:repo`: `main` may have moved, and separate fixes may never have been
   gated together.
+- Each stacked commit lands on `main`'s first parent, so the release coverage oracle needs
+  every code-touching commit cited. Give each one its own changelog fragment, or squash the
+  stack into one commit before landing. `check:changelog-entry` checks the branch as a
+  whole and passes an uncited commit.
 - The landing is an admin fast-forward past `protect-main`. If the harness refuses it
   (auto mode classifies it as a merge without review), stop and hand the user the exact
   command: `! git -C <worktree> push origin <stack-branch>:main`.
