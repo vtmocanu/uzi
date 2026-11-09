@@ -32,11 +32,15 @@ name: CI
 permissions:
   contents: read
 
-# Cancel a superseded run's still-running jobs when a newer commit lands on the
-# same ref -- mirrors GitLab's workflow.auto_cancel over interruptible gate jobs.
+# On a PR, cancel a superseded run's still-running jobs when a newer commit
+# lands on the same ref. On main, let the running run finish (pilot, #2561):
+# the group keeps one pending run, and a newer push replaces it, so each
+# finished main run covers every commit since the previous one and Go caches
+# (saved only from main) get written. Rerunning an older main commit also
+# replaces the pending tip run; rerun the tip instead.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # A PR may skip component gates only after changes proves every changed file
 # is an added/modified input in the audited allowlist. Unknown paths, deletions,
