@@ -57,7 +57,7 @@ MODE="${3:-}"
 
 if [ -z "$MODULE_DIR" ] || [ -z "$TOOL" ]; then
   echo "usage: scripts/deadcode-gate.sh <module-dir> <pkg@version> [--write]" >&2
-  echo "  e.g. scripts/deadcode-gate.sh api golang.org/x/tools/cmd/deadcode@v0.48.0" >&2
+  echo '  e.g. (repo root) scripts/deadcode-gate.sh api "golang.org/x/tools/cmd/deadcode@$(sed -n '"'"'s/^  DEADCODE_VERSION: "\(.*\)"$/\1/p'"'"' Taskfile.yml)"' >&2
   exit 2
 fi
 
