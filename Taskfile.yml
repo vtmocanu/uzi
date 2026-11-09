@@ -771,7 +771,7 @@ tasks:
     # LINES of the four existing per-toolchain jobs -- `lint:api`,
     # `lint:controller`, `validate:web`, `validate:agent` -- exactly the way
     # `deadcode:api` was a second script line inside the `lint:api` job until #4109
-    # moved it to its own main-push-only `deadcode-api` job. The vulncheck targets
+    # moved it to the nightly deadcode-nightly.yml workflow. The vulncheck targets
     # add no new CI job, so no `.gate_needs` / `.publish_needs` edit.
     #
     # 🔴 AND `lint:api` NAMES BOTH A CI JOB AND A TASKFILE TARGET. That ambiguity
@@ -2201,7 +2201,7 @@ tasks:
       # contention.
       #
       # GOMEMLIMIT=12GiB (issue #3433). GitHub-hosted lint-api runners were
-      # killed during this step (it runs in the main-only deadcode-api job since #4109). Comment [3] on the issue measured the runner at
+      # killed during this step (it runs in deadcode-nightly.yml since #4109). Comment [3] on the issue measured the runner at
       # 16.76 GB total and 14.78 GB available at step start, with a 15.64 GB peak
       # RSS: 0.86 GB above the available memory and 1.1 GB below the total.
       #
