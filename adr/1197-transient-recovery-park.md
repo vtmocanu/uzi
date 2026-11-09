@@ -2045,8 +2045,12 @@ any source effect because this release does not support the predecessor. Nothing
 **The case.** A later claim of a run finds the predecessor's source still owned by a dead worker
 process, and the independent-restore route (`evaluateRestoreRoute` in `agent/src/restore-route.ts`)
 positively identifies one of three unsupported classes: canonical (an attempt-less journal naming only
-the run and the canonical clone path, slot foreign-owned and active), hosted (this worker is a hosted
-pod) or a missing boundary record for the predecessor's incarnation. Design and the restore itself:
+the run and the canonical clone path, slot foreign-owned and active with no pending footprint or
+publication, and complete, non-conflicting attribution), hosted (this worker is a hosted pod with a
+valid own boundary record matching live, and the predecessor's slot has no publication) or a missing
+boundary record for the predecessor's incarnation (only once the pin, census and own-record checks
+pass; with no pin or several pins the refusal is `no_eligible_pin` or `pin_ambiguous` and is not
+parked). Design and the restore itself:
 [ADR-1783 amendments](1783-run-quiescence-and-attempt-clone-paths.md#amendment-15-unsupported-predecessors-are-parked-for-the-owner).
 
 **Decision.**
@@ -2067,7 +2071,7 @@ pod) or a missing boundary record for the predecessor's incarnation. Design and 
 
 **Accounting.** The park holds the predecessor's custody hold and the current generation's, and an
 owner Resume adds a claim and a hold, each counting toward `custody_hold_limit`. An owner-held hosted
-run blocks its worker's image roll until the owner cancels or discards it. Every other restore refusal
+run blocks its worker's ordinary image roll until the owner cancels or discards it. Every other restore refusal
 keeps the item-7 accounting disclosed in the #4058 amendment above: charged requeues up to
 `RUN_MAX_REQUEUES` then `worker_requeue_exhausted` on the running path when custody is uncertain,
 uncharged generations on the claimed path up to the run's own hold-admission bound or the server-only

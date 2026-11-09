@@ -4149,9 +4149,10 @@ preserved; the run is owner-held with no automatic retry, regardless of a
 displayed retry timestamp. In the remediation case, Resume holds again unless
 that remediation was resolved through a separately authorized route. The same cause
 also holds a run whose predecessor an independent restore does not support (canonical,
-hosted or no boundary record): the worker refused before any source effect, adopted
-nothing and proved no quiescence; Resume holds again on the same release, and an
-owner-held hosted run blocks its worker's image roll until you cancel or discard it
+hosted or no boundary record, when the earlier checks pass): the worker refused before
+any source effect, adopted nothing and proved no quiescence; Resume holds again on the
+same release, and an owner-held hosted run blocks its worker's ordinary image roll until
+you cancel or discard it
 ([Run recovery](run-recovery.md#when-a-restarted-worker-continues-from-a-saved-pin-independent-restore)).
 
 Read `uzi run recovery <id>` and export an available archive before deciding.

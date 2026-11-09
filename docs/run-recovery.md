@@ -2236,7 +2236,7 @@ its clone over. On a Docker Compose worker uzi can then start a **fresh attempt*
 from the run's verified saved work instead of stopping. It does not fence, read or
 reuse the predecessor.
 
-**When it happens.** Only for an eligible attempt-path predecessor on Compose,
+**When it happens.** Only for an eligible attempt-path predecessor,
 normally Docker-wired, or an unwired key already in the supported persisted attempt
 mode, and only when all of these hold: the worker is a Compose worker (a hosted
 Kubernetes worker is not supported); the run is an issue, MR-rework or self-improvement
@@ -2248,11 +2248,17 @@ unwired (no Docker-in-Docker) key keeps canonical clone paths, so its predecesso
 the canonical unsupported class below.
 
 **Unsupported predecessors are held for you.** Three classes are positively
-recognised and refused before any source effect: a **canonical** predecessor (its
-journal names only the run and the canonical clone path, and its slot is active under
-another worker process), a predecessor of a **hosted** worker (this worker is a hosted
-pod), and a predecessor of a worker process with **no boundary record** (started by an
-older build). If the api supports it (it advertises
+recognised and refused before any source effect, and are parked when the earlier checks
+pass: a **canonical** predecessor (its journal names only the run and the canonical
+clone path, with no attempt id, and its slot is active under another worker process with
+no pending footprint or publication; a journal that carries an attempt id at the
+canonical path is still refused as `predecessor_path` and not parked), a predecessor
+seen from a **hosted** worker (this worker is a hosted pod with a valid boundary record
+of its own; a hosted predecessor reached from a Compose worker is refused as
+`hosted_restore_not_delivered` and not parked), and a predecessor of a worker process
+with **no boundary record** (started by an older build; parked only once the saved-pin,
+attribution and own-record checks pass, so with no pin or several pins it is refused as
+`no_eligible_pin` or `pin_ambiguous` and not parked). If the api supports it (it advertises
 `recovery_cause_retained_recovery_adoption_failed`), the run parks for you at
 `recovery_wait` / `retained_recovery_adoption_failed` instead of requeueing into the
 same refusal: Resume claims again and holds again unchanged on this release and adds at
@@ -2265,13 +2271,15 @@ was attempted, so no `adoption_failed` blocker is persisted and no quiescence is
 proven. The feed shows `Independent continuation was refused before any source effect:
 this release does not support this predecessor (<class>).` The worker log records
 `restore unsupported predecessor held`. An owner-held hosted run blocks its worker's
-image roll until you cancel or discard it.
+ordinary image roll until you cancel or discard it. In this release the CLI, web and
+watcher descriptions of this hold still describe the cause's earlier two meanings
+(presentation deferred, [#4000](https://github.com/vtmocanu/uzi/issues/4000)).
 
 This is a behaviour change for hosted workers, canonical predecessors and predecessors
 started by an older build. Before this release, a claim that found its predecessor still
 owned by a dead process failed with `preservation_failed`. Now, on the normal running
-path with active-run snapshots, those three classes are parked for you as described
-above (when the api supports it). Every other refusal, and those classes on an api
+path with active-run snapshots, those classes are parked for you as described
+above when the qualifying checks pass (and the api supports it). Every other refusal, and those classes on an api
 without the capability, keeps the ordinary accounting: the claim stops without failing
 and its cost depends on the path (see "What it costs"; details in
 [ADR-1783](../adr/1783-run-quiescence-and-attempt-clone-paths.md#amendment-2026-11-08--3644-independent-restore)).
@@ -2352,9 +2360,11 @@ roll-forward then refuses and the predecessor's bytes stay (issue #3981 is open)
 holding-root mode a retired new attempt does not cause that refusal; it still completes. The crash model is process and
 container crashes and injected faults only; no storage or power-loss guarantee is claimed.
 The boundary record, the seed's ledger append, the seeding and ready entry writes and the
-retirement tombstone keep their sync and read-back; later live successor journal rewrites
-are unsynced, the Git config replacement renames before its sync, and the atomic config
-rewrite does not sync the directory. Design and
+retirement tombstone are config renames followed by a sync; the entry writes and the
+tombstone are also read back, while the seed's ledger append is only checked indirectly
+when the next `seeding` write re-reads the config. The writers with no following sync are
+later live successor journal rewrites and the atomic config rewrite (no directory sync);
+the exit's config replacement renames before its sync. Design and
 evidence: [ADR-1783](../adr/1783-run-quiescence-and-attempt-clone-paths.md#amendment-2026-11-08--3644-independent-restore).
 
 ### Retained sources with no open hold (worker-local inspect and discard)
