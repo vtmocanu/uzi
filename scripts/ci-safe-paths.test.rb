@@ -88,7 +88,7 @@ assert = lambda do |actual, expected, label|
 end
 components = %w[validate-api lint-api test-api test-api-store-it test-codex-refresh-lostreply-e2e validate-controller lint-controller test-controller validate-web test-web test-web-browser validate-agent test-agent-shard]
 context = {
-  'github.event_name' => 'pull_request', 'needs.changes.result' => 'success',
+  'github.event_name' => 'pull_request', 'github.ref' => 'refs/pull/1/merge', 'needs.changes.result' => 'success',
   'needs.changes.outputs.skip_components' => '1',
   'needs.changes.outputs.worker_uid' => 'false', 'needs.validate-agent.result' => 'success',
   'needs.test-agent-shard.result' => 'skipped', 'needs.test-agent-worker-uid.result' => 'skipped',
@@ -117,6 +117,11 @@ components.each do |job|
   # test-api-store-it uses always() (the test-agent pattern) and is asserted below.
   assert.call(run_job.call(job, 'cancelled' => true), false, "supersession cancels #{job}") unless job == 'test-api-store-it'
 end
+assert.call(run_job.call('deadcode-api'), false, 'deadcode-api skips on PRs (#4109)')
+assert.call(run_job.call('deadcode-api', 'github.event_name' => 'push', 'github.ref' => 'refs/heads/main'), true, 'deadcode-api runs on main pushes')
+assert.call(run_job.call('deadcode-api', 'github.event_name' => 'push', 'github.ref' => 'refs/tags/v1.0.0'), false, 'deadcode-api stays main-only')
+assert.call(jobs.fetch('deadcode-api').fetch('steps').map { |step| step['run'].to_s }.join.include?('task deadcode:api'), true, 'deadcode-api runs the gate target')
+assert.call(jobs.fetch('lint-api').fetch('steps').map { |step| step['run'].to_s }.join.include?('task deadcode:api'), false, 'lint-api no longer runs deadcode')
 assert.call(jobs.fetch('lint-repo').key?('needs'), false, 'repo gate remains independent')
 assert.call(jobs.fetch('lint-repo').key?('if'), false, 'repo gate remains unconditional')
 assert.call(workflow.fetch('on').keys.sort, %w[pull_request push], 'triggers unchanged')
