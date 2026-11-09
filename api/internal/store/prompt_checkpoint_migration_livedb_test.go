@@ -76,9 +76,27 @@ func TestPromptCheckpointMigrationLifecycleLiveDB(t *testing.T) {
 		}
 	})
 
+	// The definitions Down must restore exactly (function body and constraint, incl. validation).
+	defs418 := schemaDefs(ctx, t, pool)
+
 	if err := store.MigrateTo(ctx, dsn, 420); err != nil {
 		t.Fatal(err)
 	}
+
+	t.Run("version 420 still resolves no coordinates for non-checkpoint kinds", func(t *testing.T) {
+		// Synthetic rows bypass runs_kind_shape: only the resolver's kind dispatch is under test.
+		for _, kind := range []string{"ci_fix", "mr_rework", "chat", "judge", "job", "cross_check"} {
+			var isNull bool
+			if err := pool.QueryRow(ctx, `SELECT fn_checkpoint_coordinates(jsonb_populate_record(NULL::runs,
+				jsonb_build_object('id',gen_random_uuid(),'user_id',r.user_id,'repo_id',r.repo_id,'kind',$2::text,
+				  'branch','uzi/prompt-'||r.id::text))) IS NULL FROM runs r WHERE r.id=$1`, run1, kind).Scan(&isNull); err != nil {
+				t.Fatal(err)
+			}
+			if !isNull {
+				t.Fatalf("kind %s resolved checkpoint coordinates, want NULL", kind)
+			}
+		}
+	})
 
 	t.Run("version 420 resolves prompt coordinates", func(t *testing.T) {
 		var ok bool
@@ -128,7 +146,7 @@ func TestPromptCheckpointMigrationLifecycleLiveDB(t *testing.T) {
 		if !validated {
 			t.Fatal("00420 left the salvage branch constraint NOT VALID")
 		}
-		wantPgCode(insertSalvage(run1, "uzi/prompt-not-a-uuid"), "23514")
+		_ = wantPgCode(insertSalvage(run1, "uzi/prompt-not-a-uuid"), "23514")
 	})
 
 	// MigrateDownTo commits one migration per step, so a refused Down to 418 has already
@@ -221,6 +239,22 @@ func TestPromptCheckpointMigrationLifecycleLiveDB(t *testing.T) {
 		if strings.Contains(def, "uzi/prompt-") {
 			t.Fatalf("constraint still admits prompt branches: %s", def)
 		}
-		wantPgCode(insertSalvage(run2, "uzi/prompt-"+run2.String()), "23514")
+		_ = wantPgCode(insertSalvage(run2, "uzi/prompt-"+run2.String()), "23514")
+		if got := schemaDefs(ctx, t, pool); got != defs418 {
+			t.Fatalf("Down did not restore the 418 definitions:\n got  %s\n want %s", got, defs418)
+		}
 	})
+}
+
+// schemaDefs renders fn_checkpoint_coordinates and run_salvage_branch_format_check (with its
+// validation flag) so a Down that restores a different body or constraint is caught.
+func schemaDefs(ctx context.Context, t *testing.T, pool *pgxpool.Pool) string {
+	t.Helper()
+	var s string
+	if err := pool.QueryRow(ctx, `SELECT pg_get_functiondef('fn_checkpoint_coordinates(runs)'::regprocedure)
+		|| E'\n' || pg_get_constraintdef(c.oid) || ' validated=' || c.convalidated::text
+		FROM pg_constraint c WHERE c.conrelid='run_salvage'::regclass AND c.conname='run_salvage_branch_format_check'`).Scan(&s); err != nil {
+		t.Fatal(err)
+	}
+	return s
 }
