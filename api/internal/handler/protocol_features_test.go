@@ -17,7 +17,7 @@ import (
 // then recovery_cause_vault_locked, then gate_revision_v1, then milestone_reconciliation_v1, then plan_revision_retry_v1 (#3001),
 // then recovery_cause_data_volume_full,
 // then run_checkpoint_durability, then repo_agent_folder, then terminal_rejection_report
-// (independent of the snapshot kill switch), then issue #3181's credential_switch_hold (unconditional), then issue #3985's clarification_revision_settlement_v1 (unconditional), then active_run_snapshot and pending_outcome_scoped_claim_v1, and issue #2545's
+// (independent of the snapshot kill switch), then issue #3181's credential_switch_hold (unconditional), then issue #3985's clarification_revision_settlement_v1 (unconditional), then issue #3607's provider_policy_hold_v1 (unconditional), then active_run_snapshot and pending_outcome_scoped_claim_v1, and issue #2545's
 // recovery_held_publication_v1 followed by recovery_held_publication_v2 (gated on UZI_HELD_PUBLICATION) are last. A drift here is a
 // wire-contract change a worker negotiates on. Issue #2507 adds
 // recovery_completed_publication_v1 beside the recovery inventory feature, and issue #2625 adds
