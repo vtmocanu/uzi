@@ -346,7 +346,10 @@ describe("the restored attempt completes through the certified completion path (
   /** A restarted worker: a fresh runner over a fresh-incarnation authority on the same data dir and bare. */
   function restarted(r: Rig): Rig["runner"] {
     const again = new AuthorityRuntime({ lifetime: r.lifetime, workerToken: AUTH_TOKEN, workerIncarnation: randomUUID(), timeoutMs: 5000 });
-    return runnerWith(() => ({ executor: r.executor, homeDir: r.runHome }), fakeGitlab().gitlab, AUTH_TOKEN, r.logs.logger, {
+    return runnerWith((_runId, _codex, addr) => {
+      r.factoryCalls.push({ generation: addr?.generation, home: r.runHome });
+      return { executor: r.executor, homeDir: r.runHome };
+    }, fakeGitlab().gitlab, AUTH_TOKEN, r.logs.logger, {
       authority: again, codexBoundaryDeadlineMs: 5000, recoveryRetryMs: 5, independentRestore: true,
       restoreIdentity: { procRoot: r.sProc, hostname: () => CID.slice(0, 12) } });
   }
@@ -371,7 +374,8 @@ describe("the restored attempt completes through the certified completion path (
     assert.equal(failed(r).length, 0, "no failed report");
     assert.equal(api.states.filter(s => s.runId === r.runId && s.body.status === "completed").length, completedBefore, "no new completed report");
     assert.equal(logged(r, "independent restore seeded").length, seededBefore, "no new seed");
-    assert.equal(r.factoryCalls.length, factoryBefore, "no executor was built for the restarted claim");
+    assert.equal(r.factoryCalls.slice(factoryBefore).filter(c => c.generation !== undefined).length, 0,
+      "no successor executor was built for the restarted claim");
     assert.equal(cfgAll(r, r.ledgerKey).length, ledger.length, "no new attempt ledger entry");
     assert.deepEqual(cfgAll(r, r.ledgerKey), ledger, "the attempt ledger is unchanged");
     assert.equal(cfgGet(r, restoreKey), entry, "S's restore value is byte-identical");
