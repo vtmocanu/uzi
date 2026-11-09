@@ -219,6 +219,9 @@ const (
 	reasonNoCIConfigGuardCapableWorker      = "no online worker enforces the CI-config push guard (ci_config_guard_v1); provision a capable worker"
 	reasonNoRepoAgentSourceCapableWorker    = "no online worker reads repo agents at a recorded default-branch revision (repo_agent_source_v1); upgrade a worker"
 	reasonNoAgentSourceRequestCapableWorker = "no online worker honours the run's requested agent source (agent_source_request_v1); upgrade a worker"
+	// reasonNoRepoAgentSourceAndRequestCapableWorker (issue #4005) is emitted when each of the two
+	// reasons above is satisfied by some worker but no single worker satisfies both.
+	reasonNoRepoAgentSourceAndRequestCapableWorker = "no single online worker supports both repo agent sources (repo_agent_source_v1) and the requested agent source (agent_source_request_v1); upgrade a worker"
 	// reasonNoCodexCapableWorker (PRD #1332 M5A, D3) is emitted for a CODEX-INDICATING queued run
 	// (harness='codex', or a surviving M1 binding sentinel) whose owner has NO online worker
 	// advertising the 'codex_harness_v1' protocol capability. Like reasonNoCompletionCapableWorker
@@ -1502,6 +1505,21 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 				slog.Error("health: count agent-source-request capable workers", "run_id", r.ID, "error", err)
 			} else if n == 0 {
 				return reasonNoAgentSourceRequestCapableWorker
+			}
+		}
+	}
+	// Issue #4005: ClaimRun applies both clauses to one worker, so a fleet that splits them
+	// passes both rungs above yet cannot claim the run. Same intersection idea as the
+	// CountOnlineWorkersSatisfyingCodexCompletion rung below.
+	if (r.RepoAgentSourceRequired || r.RepoAgentSourceCommit.Valid) && r.AgentSourceRequested.Valid {
+		if q, ok := s.q.(interface {
+			CountOnlineWorkersSatisfyingRepoAgentSourceAndRequest(context.Context, uuid.UUID) (int64, error)
+		}); ok {
+			n, err := q.CountOnlineWorkersSatisfyingRepoAgentSourceAndRequest(ctx, r.UserID)
+			if err != nil {
+				slog.Error("health: count repo agent source and request capable workers", "run_id", r.ID, "error", err)
+			} else if n == 0 {
+				return reasonNoRepoAgentSourceAndRequestCapableWorker
 			}
 		}
 	}
