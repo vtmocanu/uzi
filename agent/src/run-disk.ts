@@ -88,6 +88,8 @@ export class RunDiskSampler {
   /** The run id the last sample stopped after when it ended early (budget or deadline); the next
    *  sample starts just after it. Undefined after a sample that visited every listed run. */
   private resumeAfter: string | undefined;
+  /** Runs whose previous reading was carried only because the listing was truncated, in the last sample. */
+  private truncatedCarry = new Set<string>();
 
   constructor(opts: RunDiskSamplerOptions) {
     this.opts = opts;
@@ -255,14 +257,18 @@ export class RunDiskSampler {
     // worker-owned directory. A run that is gone from the listing of a complete sample fails that
     // check and drops out.
     let carried = 0;
-    const previous = new Set<string>();
+    const carriedIds = new Set<string>();
+    const nextTruncatedCarry = new Set<string>();
     for (const prev of this.latest ?? []) {
-      previous.add(prev.run_id);
       // A run's entry is replaced only when this sample decided EVERY HOME of the run; otherwise (a HOME was not reached, or
       // not measured) the previous full reading is kept in place of a partial sum.
       const dirsOfRun = namesOfRun.get(prev.run_id) ?? [prev.run_id];
       // A truncated listing may have missed a sibling HOME (`<id>` vs `<id>.g<N>`), so the fresh sum is partial as well.
-      if (!listingTruncated && dirsOfRun.every((n) => reached.has(n))) continue;
+      const allReached = dirsOfRun.every((n) => reached.has(n));
+      if (!listingTruncated && allReached) continue;
+      // Truncation alone (every HOME reached) carries only a complete previous reading, and only once in a row, so sampled_at
+      // advances at least every other sample; otherwise the fresh sum is taken and marked truncated below.
+      if (allReached && (prev.truncated || this.truncatedCarry.has(prev.run_id))) continue;
       let owned = false;
       for (const n of dirsOfRun) {
         try {
@@ -273,11 +279,14 @@ export class RunDiskSampler {
       const at = entries.findIndex((e) => e.run_id === prev.run_id);
       if (at >= 0) entries.splice(at, 1);
       entries.push(prev);
+      carriedIds.add(prev.run_id);
+      if (allReached) nextTruncatedCarry.add(prev.run_id);
       carried += 1;
     }
+    this.truncatedCarry = nextTruncatedCarry;
     // A partial sum of a run with no previous reading to fall back on is reported, marked truncated (a lower bound).
     for (const e of entries) {
-      if (e.truncated || previous.has(e.run_id) || !fresh.some((f) => f.run_id === e.run_id)) continue;
+      if (e.truncated || carriedIds.has(e.run_id) || !fresh.some((f) => f.run_id === e.run_id)) continue;
       if (listingTruncated || (namesOfRun.get(e.run_id) ?? []).some((n) => !reached.has(n))) e.truncated = true;
     }
 

@@ -426,6 +426,43 @@ describe("RunDiskSampler (issue #3644) — truncated directory listing and sibli
     });
   });
 
+  it("a persistently truncated listing keeps sampled_at advancing and reports the fresh partial reading marked truncated", async () => {
+    await withRoot(async (root) => {
+      fs.mkdirSync(path.join(root, id(1)));
+      fs.mkdirSync(path.join(root, sibling(1)));
+      const clock = { now: 0 };
+      let size = 10;
+      const { o } = opts(root, new Map(), {
+        measure: async () => ({ homeBytes: size, cacheBytes: 0, entries: 1, truncated: false }),
+        maxDirReads: 1_000,
+        now: () => clock.now,
+      });
+      const sampler = new RunDiskSampler(o);
+      const tick = async (): Promise<RunDiskEntry> => {
+        clock.now += 10 * 60_000;
+        sampler.current();
+        await sampler.settled();
+        const e = sampler.current();
+        assert.strictEqual(e?.length, 1);
+        return e![0]!;
+      };
+      const first = await tick();
+      assert.strictEqual(first.truncated, undefined);
+      o.maxDirReads = 1;
+      const seen: RunDiskEntry[] = [];
+      for (let i = 0; i < 4; i++) {
+        size += 10;
+        seen.push(await tick());
+      }
+      // sampled_at advances at least every other sample, and a fresh partial reading is marked truncated.
+      const times = [first, ...seen].map((e) => e.sampled_at);
+      for (let i = 0; i + 2 < times.length; i++) assert.notStrictEqual(times[i + 2], times[i]);
+      const fresh = seen.filter((e) => e.sampled_at !== first.sampled_at && e.truncated === true);
+      assert.ok(fresh.length >= 2, "fresh partial readings are reported, marked truncated");
+      assert.ok(seen.at(-1)!.home_bytes > first.home_bytes);
+    });
+  });
+
   it("a truncated listing with no previous reading marks the run's partial sum as truncated", async () => {
     await withRoot(async (root) => {
       fs.mkdirSync(path.join(root, id(1)));

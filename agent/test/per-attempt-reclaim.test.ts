@@ -115,9 +115,10 @@ describe("runDiskReclaimPass: markers and .g<N> directories", () => {
     }));
     assert.deepEqual([digest(t.pHome), digest(t.pProv)], before);
     assert.equal(s.skippedRetainedHome, 1);
+    assert.equal(s.unexamined, 0);
   });
 
-  it("a marker protects the legacy dirs of a parked run too: no cache drop, nothing touched",{ skip: LINUX_ONLY }, async () => {
+  it("a marker protects the legacy dirs of a parked run too: no cache drop, nothing touched", { skip: LINUX_ONLY }, async () => {
     const t = seedBoth();
     fs.mkdirSync(path.join(t.pHome, ".cache", "go-build"), { recursive: true });
     fs.writeFileSync(path.join(t.pHome, ".cache", "go-build", "obj"), "x");
