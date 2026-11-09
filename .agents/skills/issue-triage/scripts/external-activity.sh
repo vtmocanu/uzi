@@ -71,26 +71,32 @@ fail() {
 ghq() { local out="$1" what="$2"; shift 2; gh "$@" > "$out" 2> "$tmp/err" || fail "$what lookup"; }
 jqq() { local what="$1"; shift; jq "$@" 2> "$tmp/err" || fail "$what"; }
 
-# A --paginate REST response is one or more JSON arrays of objects; empty, null or any
-# other shape is a failed lookup, never an empty list.
+# A --paginate REST response is one or more JSON arrays of objects, each satisfying the
+# source's row check; empty, null or any other shape is a failed lookup, never an empty list.
+# Numbers become row labels and timestamps drive ordering, so their types are checked too.
 rest_list() {
-  local out="$1" what="$2" required="$3"; shift 3
+  local out="$1" what="$2" row="$3"; shift 3
   ghq "$tmp/raw" "$what" api --paginate "$@"
-  jqq "$what (shape)" -s --arg req "$required" '
-    ($req | split(",")) as $r
-    | if length > 0 and all(.[]; type == "array")
-        and all(.[][]; type == "object" and (. as $o | all($r[]; $o[.] != null)))
-      then add else error("unexpected \(map(type) | unique | join(",")) response") end' \
-    "$tmp/raw" > "$out"
+  jqq "$what (shape)" -s '
+    def str: type == "string";
+    def posint: type == "number" and . > 0 and . == floor;
+    def numurl: str and (split("/") | last | test("^[1-9][0-9]{0,9}$"));
+    def who: .user == null or (.user | type == "object" and (.login | str));
+    def ok: '"$row"';
+    if length > 0 and all(.[]; type == "array") and all(.[][]; type == "object" and ok)
+    then add else error("unexpected response shape") end' "$tmp/raw" > "$out"
 }
 
 # Conversation comments (issues and PRs) and inline review comments, filtered by updated_at.
-rest_list "$tmp/ic.json" "issue comments" issue_url,updated_at,html_url \
+rest_list "$tmp/ic.json" "issue comments" \
+  '(.issue_url | numurl) and (.updated_at | str) and (.html_url | str) and who' \
   "repos/$repo/issues/comments?since=$since&per_page=100"
-rest_list "$tmp/pc.json" "review comments" pull_request_url,updated_at,html_url \
+rest_list "$tmp/pc.json" "review comments" \
+  '(.pull_request_url | numurl) and (.updated_at | str) and (.html_url | str) and who' \
   "repos/$repo/pulls/comments?since=$since&per_page=100"
 # Open issues and PRs, any age, for externally authored items.
-rest_list "$tmp/open.json" "open items" number,state,title,html_url \
+rest_list "$tmp/open.json" "open items" \
+  '(.number | posint) and (.state | str) and (.title | str) and (.html_url | str) and who' \
   "repos/$repo/issues?state=open&per_page=100"
 
 # PR reviews over every state, newest-updated PR first, until PRs fall below the floor.
@@ -108,10 +114,16 @@ while :; do
     and (.data.repository.pullRequests.pageInfo.hasNextPage | type == "boolean")
     and (.data.repository.pullRequests.nodes | type == "array")
     and all(.data.repository.pullRequests.nodes[];
-          (.number | type == "number") and (.updatedAt | type == "string")
-          and (.reviews.totalCount | type == "number") and (.reviews.nodes | type == "array"))
+          (.number | type == "number" and . > 0 and . == floor) and (.updatedAt | type == "string")
+          and (.reviews.totalCount | type == "number") and (.reviews.nodes | type == "array")
+          and all(.reviews.nodes[]; type == "object"
+                and (.author == null or (.author | type == "object" and (.login | type == "string")))
+                and (.url | type == "string")
+                and all(.submittedAt, .updatedAt; . == null or type == "string")
+                and ((.submittedAt | type == "string") or (.updatedAt | type == "string"))))
     and (if .data.repository.pullRequests.pageInfo.hasNextPage
          then (.data.repository.pullRequests.pageInfo.endCursor | type == "string" and length > 0)
+           and (.data.repository.pullRequests.nodes | length > 0)
          else true end)' "$tmp/rv.page" > /dev/null
   jqq "PR reviews page $page (merge)" -s '.[0] + .[1].data.repository.pullRequests.nodes' \
     "$tmp/prs.json" "$tmp/rv.page" > "$tmp/prs.next"

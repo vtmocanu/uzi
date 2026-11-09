@@ -49,11 +49,15 @@ if args[:2] == ["api", "graphql"]:
 paginate = "--paginate" in args
 path = [a for a in args if not a.startswith("-") and a != "api"][0]
 def rest(name):
-    pages = json.loads(body(name)) if name not in override else None
-    if pages is None:
+    # Fixtures hold a list of pages; without --paginate only page one is returned.
+    # An override that is not a list of pages (empty, null) is returned verbatim.
+    try:
+        pages = json.loads(body(name))
+    except ValueError:
+        pages = None
+    if not (isinstance(pages, list) and pages and all(isinstance(pg, list) for pg in pages)):
         out(name)
     else:
-        # Fixtures hold a list of pages; without --paginate only page one is returned.
         out(name, "".join(json.dumps(pg) for pg in (pages if paginate else pages[:1])))
 if path.startswith("repos/o/r/issues/comments"):
     rest("ic")
@@ -136,7 +140,8 @@ FIXTURES = {
         pr(23, "2026-11-05T12:00:00Z", [{**review("ext10", "2026-10-20T00:00:00Z"),
                                          "updatedAt": "2026-11-05T11:00:00Z"}], state="CLOSED"),
         # 3: review before the window: not listed.
-        pr(3, "2026-11-04T00:00:00Z", [review("ext7", "2026-10-20T00:00:00Z")]),
+        pr(3, "2026-11-04T00:00:00Z", [review("ext7", "2026-10-20T00:00:00Z"),
+                                       {**review("x", "2026-10-21T00:00:00Z"), "author": None}]),
     ], "C1")),
     "graphql2": json.dumps(page([
         # 22: PR updatedAt a few seconds BEFORE its own review (the slack day finds it).
@@ -249,12 +254,32 @@ def main():
             "graphql errors": dict(override={"graphql1": json.dumps({"errors": [{"message": "x"}]})}),
             "cursor does not advance": dict(override={"graphql2": stuck}),
             "item identity mismatch": dict(override={"item21": json.dumps(item(99, kind="PR"))}),
+            "string item number": dict(override={"open": json.dumps(
+                [[{**item(30, state="open", author="ext9"), "number": "30\u001b[2J"}]])}),
+            "non-numeric issue_url": dict(override={"ic": json.dumps([[
+                {**comment(10, "ext1", "2026-11-03T10:00:00Z"), "issue_url": "x/issues/abc"}]])}),
+            "numeric timestamp": dict(override={"pc": json.dumps([[
+                {"pull_request_url": "https://api.github.com/repos/o/r/pulls/20",
+                 "user": user("ext5"), "updated_at": 1, "html_url": f"{R}/pull/20#d1"}]])}),
+            "user is not an object": dict(override={"ic": json.dumps([[
+                {**comment(10, "ext1", "2026-11-03T10:00:00Z"), "user": "ext1"}]])}),
+            "malformed review node": dict(override={"graphql1": json.dumps(page(
+                [pr(21, "2026-11-06T00:00:00Z", [{}])], None))}),
+            "empty continuation page": dict(override={"graphql1": json.dumps(page([], "C1"))}),
         }
+        SHAPE = {"empty REST response", "null REST response", "REST rows missing fields",
+                 "graphql missing pageInfo", "graphql errors", "string item number",
+                 "non-numeric issue_url", "numeric timestamp", "malformed review node",
+                 "user is not an object",
+                 "empty continuation page", "item identity mismatch"}
         for name, kw in cases.items():
             res, _ = run(tmp, **kw)
             assert res.returncode == 3, (name, res.returncode, res.stderr.decode())
             assert res.stdout == b"", (name, res.stdout)
             assert clean(res.stderr.decode()), (name, res.stderr)
+            # Shape cases must be refused by validation, not by a later crash.
+            if name in SHAPE:
+                assert b"(shape) failed" in res.stderr, (name, res.stderr)
         print(f"PASS: {len(cases)} failure shapes exit 3 with no report and a sanitized error")
 
         for argv in (["--days"], ["--repo"], ["--since", "yesterday"], ["--repo", "noslash"]):

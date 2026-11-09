@@ -67,6 +67,7 @@ A successful empty result = maintainer-only backlog. If it looks wrong, compare 
 - For every row, `external-last` first, read the item's conversation and review threads in full, earlier external questions included, not just the newest permalink.
 - Per item, propose a reply or a disposition (none needed, handled elsewhere) under the review and approval rules for that reply.
 - Scope any "nothing owed" to the items read and the window. A `LIMITATION` line on truncated reviews blocks an all-clear until those PRs are read by hand.
+- Report every `LIMITATION` line with the result. Any all-clear must explicitly retain the PR-updatedAt coverage bound.
 - Exit 3 means a lookup failed or returned an unexpected shape, and nothing was printed: report it, never read it as no activity.
 
 ## Queue audit (what fires next)
