@@ -1,0 +1,76 @@
+package config
+
+import (
+	"fmt"
+	"net/mail"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/vtmocanu/uzi/api/internal/secretbox"
+)
+
+// SetupConfig is the slice of configuration the operator setup command
+// (`/server setup`, PRD #3760) reads. It is deliberately not Config: Load
+// refuses a seed email without a valid seed password, and setup must run
+// without UZI_SEED_PASSWORD in the environment. Load is unchanged.
+type SetupConfig struct {
+	DatabaseURL          string
+	SecretKey            []byte
+	ForgeAllowedBaseURLs []string
+	ForgeHTTPTimeout     time.Duration
+	// SeedEmail is the normalised UZI_SEED_EMAIL: the account setup acts for.
+	SeedEmail string
+}
+
+// ForgeBaseURLAllowed reports whether raw normalizes to an allowlisted base
+// URL, with the same rule as Config.ForgeBaseURLAllowed.
+func (c SetupConfig) ForgeBaseURLAllowed(raw string) bool {
+	return Config{ForgeAllowedBaseURLs: c.ForgeAllowedBaseURLs}.ForgeBaseURLAllowed(raw)
+}
+
+// LoadSetup reads and validates the setup configuration from the environment.
+// It shares the DATABASE_URL, UZI_SECRET_KEY, FORGE_ALLOWED_BASE_URLS and
+// seed-email validators with Load, requires UZI_SEED_EMAIL, and never reads
+// UZI_SEED_PASSWORD.
+func LoadSetup() (SetupConfig, error) {
+	cfg := SetupConfig{
+		DatabaseURL:      os.Getenv("DATABASE_URL"),
+		ForgeHTTPTimeout: parseDuration("FORGE_HTTP_TIMEOUT", 15*time.Second),
+	}
+	if strings.TrimSpace(cfg.DatabaseURL) == "" {
+		return SetupConfig{}, fmt.Errorf("DATABASE_URL is required")
+	}
+	key, err := secretbox.LoadKey("UZI_SECRET_KEY")
+	if err != nil {
+		return SetupConfig{}, err
+	}
+	cfg.SecretKey = key
+	allowed, err := parseAllowedBaseURLs(getenv("FORGE_ALLOWED_BASE_URLS", defaultForgeBaseURL))
+	if err != nil {
+		return SetupConfig{}, err
+	}
+	cfg.ForgeAllowedBaseURLs = allowed
+	email, err := parseSeedEmail(os.Getenv("UZI_SEED_EMAIL"))
+	if err != nil {
+		return SetupConfig{}, err
+	}
+	if email == "" {
+		return SetupConfig{}, fmt.Errorf("UZI_SEED_EMAIL is required: setup acts for the seed admin")
+	}
+	cfg.SeedEmail = email
+	return cfg, nil
+}
+
+// parseSeedEmail normalises a UZI_SEED_EMAIL value the way registration stores
+// it. An empty value returns ("", nil); a malformed one is an error.
+func parseSeedEmail(raw string) (string, error) {
+	email := strings.TrimSpace(strings.ToLower(raw))
+	if email == "" {
+		return "", nil
+	}
+	if _, err := mail.ParseAddress(email); err != nil {
+		return "", fmt.Errorf("UZI_SEED_EMAIL is not a valid email address")
+	}
+	return email, nil
+}

@@ -1945,7 +1945,9 @@ const server = https.createServer(
         });
       }
 
-      // Labels (defensive; not on the harness critical path).
+      // Labels. On the harness critical path: enabling a repo (the startup seed,
+      // the web enable, /server setup) creates the board column labels first, and
+      // a refusal here keeps the repo off (PRD #3760).
       if (method === "GET" && rest === "/labels") return send(res, 200, []);
       if (method === "POST" && rest === "/labels") {
         const body = await readBody(req);

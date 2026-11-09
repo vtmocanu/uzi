@@ -18,6 +18,8 @@ Today a setup script therefore logs in with the admin password and drives the co
 
 The forge seed also differs from the web path in two safety checks: it skips the least-privilege token check (`handler/forge.go`, `CreateConnection` calls `pcheck.CheckToken`) and it enables repos with `SetRepoEnabledForUser` directly, skipping the live `GuardRepo` enable gate (`handler/forge.go`, `SetRepoEnabled`). Claim time still runs `GuardRepo` (`workersvc/claim_assembly.go`), so this is not an open hole, but it is the wrong model to copy.
 
+A repo enabled without the web UI also has no board. The board columns are created only on the first `GET /api/repos/<id>/board` (`handler/board.go`, `seedBoard`), which only the web page sends. With 0 columns, `board.ResolveColumn` returns no column, the run lifecycle treats the card as moved by a person and drops the automated move (`runlifecycle/lifecycle.go`), the card stays on `In Progress` after the run opens its PR, the PR watcher (it selects `Human Review` cards) never records the merge request, and `uzi run rework` answers that the merge request is not open. The startup seed has the same gap. Found in a headless install on 2026-11-01; one board read repaired it.
+
 ## Outcome
 
 A one-shot command in the API image, `/server setup`, run on the deployment through `docker compose exec` or `kubectl exec`, connects the forge, enables the named repos and creates the first worker for the configured seed admin. It applies the same checks as the web UI, reports every step in machine-readable form, and exits with a code a script can branch on. No new token class, no new listener, and no change to what `uzc_` or `uza_` tokens can do.
@@ -25,8 +27,8 @@ A one-shot command in the API image, `/server setup`, run on the deployment thro
 Acceptance examples:
 
 1. **Fresh Compose install, GitHub.** After `docker compose up -d`, the operator runs
-   `printf '%s' "$PAT" | docker compose exec -T api /server setup --forge-type github --forge-base-url https://api.github.com --forge-token-file - --repos acme/app,acme/lib --worker-name vps-1`.
-   It prints one JSON report on stdout: forge `connected`, both repos `enabled`, worker `created` with its join token, and exits 0. The operator writes the token into `UZI_WORKER_TOKEN` and starts the `agent` profile.
+   `printf '%s' "$PAT" | docker compose exec -T api /server setup --forge-type github --forge-base-url https://github.com --forge-token-file - --repos acme/app,acme/lib --worker-name vps-1`.
+   It prints one JSON report on stdout: forge `connected`, both repos `enabled` with their board columns created, worker `created` with its join token, and exits 0. The operator writes the token into `UZI_WORKER_TOKEN` and starts the `agent` profile.
 2. **Unprotected default branch.** Same command, but `acme/lib` lets the bot push to `main`. The report shows `acme/app` `enabled`, `acme/lib` `refused` with the same reasons the web UI shows, and the worker `skipped_dependency` with no join token minted; the command exits 1. The forge connection and `acme/app` stay in place; nothing is rolled back.
 3. **Re-run after success.** The same command again reports forge `present`, repos `enabled` (re-checked, unchanged), worker `exists` with no token, and exits 3, telling the script that a worker already exists and its token cannot be recovered.
 
@@ -49,11 +51,11 @@ Extract the decision logic of three handlers into one service that both the hand
 
 - `ConnectForge(ctx, userID, forgeType, baseURL, token) (conn, error)`: allowlist check (`cfg.ForgeBaseURLAllowed`), base URL normalisation, client build, `VerifyToken`, `pcheck.CheckToken` (over-privileged token refused with its violations), encrypt, upsert. Same order and errors as `CreateConnection` today.
 - `DiscoverRepos(ctx, userID, connID) ([]repo, error)`: the forge project listing and `UpsertRepo` loop from `ListProjects`.
-- `EnableRepo(ctx, userID, repoID) (repo, GuardResult, error)`: `GuardRepo` before the flip, honouring the live override, then `SetRepoEnabledForUser` and the pending-override settlement. Same 422 findings as `SetRepoEnabled`.
+- `EnableRepo(ctx, userID, repoID) (repo, GuardResult, error)`: `GuardRepo` before the flip, honouring the live override, then the board columns, then `SetRepoEnabledForUser` and the pending-override settlement. Same 422 findings as `SetRepoEnabled`. When the repo has no board columns, it creates the default column labels on the forge (`forgesvc.DefaultColumns`) and their `board_columns` rows, the same columns `seedBoard` creates on first board read; a repo that already has columns keeps them. If the forge refuses the labels, the repo stays disabled and the step fails (the web enable answers 502). No issue import here: the poller imports issues on its next pass. The first board read keeps creating columns for repos enabled before this change, and the startup seed calls the same column step before it enables a repo.
 
 Worker creation already lives in `workersvc.(*Service).CreateWorker`; `setup` calls it with the same name validation the handler applies (`termsafe.Validate`, the 200-byte limit, template validity).
 
-Invariant: the handlers' HTTP behaviour (status codes, bodies, side effects) is unchanged. The handler-local `invalidateRepoSync` hook stays in the handler; `setup` runs in another process and cannot reach it (see Decision 6).
+Invariant: the handlers' HTTP behaviour (status codes, bodies, side effects) is unchanged, except that enabling a repo now creates its board columns and answers 502 when the forge refuses the column labels. The handler-local `invalidateRepoSync` hook stays in the handler; `setup` runs in another process and cannot reach it (see Decision 6).
 
 ### 2. `/server setup` mode
 
@@ -70,18 +72,19 @@ Invariant: the handlers' HTTP behaviour (status codes, bodies, side effects) is 
 
 ## Testing decisions
 
-- **Prefactor**: the existing handler tests for `CreateConnection`, `ListProjects` and `SetRepoEnabled` must pass unchanged; add service-level tests on a fake forge (embedding `forgetest.BaseFake`) for an over-privileged token refusal and a `GuardRepo` block.
+- **Prefactor**: the existing handler tests for `CreateConnection`, `ListProjects` and `SetRepoEnabled` must pass; the only allowed change is a fake-forge `labels` route, which the new column step calls; add service-level tests on a fake forge (embedding `forgetest.BaseFake`) for an over-privileged token refusal and a `GuardRepo` block.
 - **Setup command**: a live-DB test (the repo's store-it pattern, see `.claude/rules/go.md`) drives `setup` in-process against a fake forge for: the three acceptance examples; a missing or non-admin seed owner (exit 2, nothing written); a schema behind head (exit 2); setup succeeding with `UZI_SEED_PASSWORD` absent once the owner exists; oversized token and repo input; invalid worker input caught before any write; cancellation of a blocked stdin read, without real-time waits; concurrent invocations that must not rotate a connection or mint two workers; and a check that the forge token appears in neither stream and the join token appears only once, in stdout.
 - **Regression for the bypass**: a test that fails if `setup` enables a repo whose guard blocks, the bug class the forge seed has.
+- **Regression for the missing board**: a test that fails if enabling a repo with no board columns (web enable, startup seed or `setup`) leaves it with 0 columns, and a test that a repo with existing columns keeps them unchanged.
 - **Execution paths**: document the Compose and Kubernetes invocations, and exercise the binary's `setup` entry in the existing compose smoke if the harness change is small. Otherwise cover it with an `acceptance` issue (below).
 - Follow the existing seed tests (`api/internal/seed/seed_test.go`) for the fake-store pattern.
 
 ## Milestones
 
 ### M1: Prefactor, shared provisioning service
-Extract `ConnectForge`, `DiscoverRepos` and `EnableRepo` from the handlers; handlers call the service. No behaviour change.
+Extract `ConnectForge`, `DiscoverRepos` and `EnableRepo` from the handlers; handlers call the service. No behaviour change, except that enabling a repo creates its board columns (web enable and startup seed).
 - **Blocked by**: none
-- **Acceptance**: handler tests unchanged and green; new service tests cover the token-privilege refusal and the enable guard.; `task gate:api` green.
+- **Acceptance**: handler tests unchanged and green; new service tests cover the token-privilege refusal, the enable guard and a refused column label; the missing-board regression test passes; `task gate:api` green.
 
 ### M2: `/server setup` connects the forge and enables repos
 The subcommand, preconditions, inputs, JSON report and exit codes 0/1/2 for the forge and repo steps, with tests and operator docs (Compose and Kubernetes invocations). The ADR for the on-box setup boundary lands here.
@@ -111,3 +114,4 @@ The worker step via `workersvc.CreateWorker`, create-only, exit code 3, token in
 10. **Secrets from a file or stdin only.** Flag values and environment variables leak through process listings and container inspection.
 11. **A setup-specific config loader.** `config.Load` refuses a seed email without a valid seed password, so reusing it would force operators to keep the admin password in the environment, the very thing this PRD removes. Rejected: relaxing `config.Load` for the server.
 12. **Atomic create-only writes in setup only.** A lookup followed by the existing upsert can rotate a concurrently created connection, and a lookup followed by worker creation can mint two first workers. Setup gets a create-only connection write and a per-owner serialized worker step; the web path keeps its reconnect/upsert semantics. Rejected: changing the shared upsert.
+13. **Enabling a repo creates its board columns.** A repo enabled without a board read had 0 columns, and the run lifecycle then dropped every automated card move (Problem). Creating the columns in the shared enable step fixes the web enable, the startup seed and `setup` in one place. A refused label keeps the repo disabled, because a repo without columns breaks runs silently later. The startup seed follows the same rule: it creates the columns before it enables a repo, and on a refused label it logs the refusal and leaves that repo disabled. Boot continues (Decision 1), and a database error stays boot-fatal. The seed keeps its connection create-only, so a later boot does not retry the repo: the operator fixes the forge access and reruns `/server setup` to enable it. Rejected: enabling the repo from the seed and only logging a refused label (a later boot skips the existing connection and a headless install never reads the board, so the repo can stay at 0 columns); keeping the creation on first board read only (a headless install never sends one), and a poller repair for enabled repos with 0 columns (more moving parts; the first board read already repairs older repos).

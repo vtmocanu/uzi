@@ -23,9 +23,10 @@ a manual reload.
   GitLab when a card sits here; GitLab's own board lists these issues in its
   built-in **Open** list instead, and the two names cannot be reconciled
   (GitLab's built-in list can't be renamed).
-- One column per configured label, seeded on first open in this order:
-  `Planned`, `In Progress`, `Human Review`, `Later`. Reconfigure any time
-  from the board's column settings.
+- One column per configured label, created when a repo is turned on (older
+  repos: on the first board open), in this order: `Planned`, `In Progress`,
+  `Human Review`, `Later`. A repo that already has columns keeps them.
+  Reconfigure any time from the board's column settings.
 - **Closed** (implicit): the issue's open/closed state on the forge, not a
   label. Cards here are draggable too: drag a card in to close the issue,
   drag one out to reopen it — see [Move a card](#move-a-card).
