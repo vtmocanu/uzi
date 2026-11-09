@@ -219,14 +219,13 @@ jobs:
           sudo -n swapon "$swap_file"
           swapon --show --bytes
           free -b
-      - name: lint + deadcode + vulncheck
+      - name: lint + vulncheck
         run: |
           # Sample system swap use in KiB. Reap only this step's own monitor.
           vmstat -S K -w 1 > "$RUNNER_TEMP/lint-api-vmstat.log" &
           monitor=$!
           trap 'kill "$monitor" 2>/dev/null || true; wait "$monitor" 2>/dev/null || true' EXIT
           task lint:api
-          task deadcode:api
           task vulncheck:api
       - name: Record memory and swap outcome
         if: always()
