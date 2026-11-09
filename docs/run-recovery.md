@@ -2251,7 +2251,7 @@ failing, its requeue allowance is used up, and it usually ends at
 `worker_requeue_exhausted`, with the predecessor's hold counting toward your custody
 admission limit. A claimed or queued continuation can still end differently (see
 [ADR-1783](../adr/1783-run-quiescence-and-attempt-clone-paths.md#amendment-2026-11-08--3644-independent-restore)).
-A worker without active-run snapshots keeps the old `preservation_failed` outcome.
+Without active-run snapshots, a first foreign-active predecessor refusal with no restore entry keeps the old `preservation_failed` outcome. An existing restore entry still stops the claim nonterminally; turning snapshots off after a restore does not enable legacy recovery (known limitation [#3999](https://github.com/vtmocanu/uzi/issues/3999)).
 
 **What you see.** The run feed can show one of two worker lines (some stops put
 nothing on the feed, see below):
@@ -2290,7 +2290,7 @@ without cancel and stops nonterminally.
   the predecessor's HOME is never touched.
 - A retained predecessor also blocks other restores on the same repository. Before it
   restores, the worker checks every attributed source in the run's bare repository,
-  and a source still owned by another live or dead process refuses with
+  and a source still marked active under another worker incarnation refuses with
   `census_foreign_active`. Only the predecessor being restored is excluded. So until
   you discard a retained predecessor, even one whose new attempt has already finished,
   no other run on that repository can be restored independently; those runs are
