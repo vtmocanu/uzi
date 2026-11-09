@@ -547,7 +547,15 @@ func TestListSalvageCandidatesLiveDB(t *testing.T) {
 	f.run(gl, salvageRunSpec{kind: "issue", status: "failed", issueIID: &iid, finishedAt: at(7)}) // never published
 	f.run(gl, salvageRunSpec{kind: "issue", status: "completed", issueIID: &iid, tip: &tip, finishedAt: at(8)})
 	f.run(gl, salvageRunSpec{kind: "issue", status: "cancelled", issueIID: &iid, tip: &tip, finishedAt: at(8)})
-	f.run(gl, salvageRunSpec{kind: "prompt", status: "failed", tip: &tip, finishedAt: at(9)})                 // non-eligible kind
+	// Issue #4116: a prompt run is checkpoint-eligible (uzi/prompt-<run-id>), so it is a candidate.
+	prompt := f.run(gl, salvageRunSpec{kind: "prompt", status: "failed", tip: &tip, finishedAt: at(9)})
+	ciFix := uuid.New() // non-eligible kind
+	mustExec(f.ctx, t, f.pool,
+		`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, kind,
+		                   pipeline_id, pipeline_ref, checkpoint_tip, finished_at)
+		 VALUES ($1, $2, $3, $4, 't', 'd', 'failed', 'ci_fix', 1, 'main', $5, $6)`,
+		ciFix, f.user, gl, iid, tip, at(9))
+	f.runs = append(f.runs, ciFix)
 	f.run(gl, salvageRunSpec{kind: "issue", status: "failed", issueIID: &iid, tip: &tip, finishedAt: at(-1)}) // outside the window
 
 	list := func(forges []string, lim int32) []uuid.UUID {
@@ -579,10 +587,10 @@ func TestListSalvageCandidatesLiveDB(t *testing.T) {
 		return true
 	}
 
-	if got, want := list([]string{"gitlab"}, 100), []uuid.UUID{self, withSecret, issue}; !eq(got, want) {
-		t.Fatalf("candidates(gitlab) = %v, want %v (self, secret, issue by finished_at)", got, want)
+	if got, want := list([]string{"gitlab"}, 100), []uuid.UUID{self, withSecret, issue, prompt}; !eq(got, want) {
+		t.Fatalf("candidates(gitlab) = %v, want %v (self, secret, issue, prompt by finished_at)", got, want)
 	}
-	if got, want := list([]string{"gitlab", "forgejo"}, 100), []uuid.UUID{self, withSecret, issue, onForgejo}; !eq(got, want) {
+	if got, want := list([]string{"gitlab", "forgejo"}, 100), []uuid.UUID{self, withSecret, issue, onForgejo, prompt}; !eq(got, want) {
 		t.Fatalf("candidates(gitlab,forgejo) = %v, want %v", got, want)
 	}
 	if got := list([]string{"github"}, 100); len(got) != 0 {
@@ -610,7 +618,7 @@ func TestListSalvageCandidatesLiveDB(t *testing.T) {
 	}
 	// Recording the issue run removes it.
 	f.mustInsert(issue, gl, "pending")
-	if got, want := list([]string{"gitlab"}, 100), []uuid.UUID{self, withSecret}; !eq(got, want) {
+	if got, want := list([]string{"gitlab"}, 100), []uuid.UUID{self, withSecret, prompt}; !eq(got, want) {
 		t.Fatalf("after recording issue: %v, want %v", got, want)
 	}
 }

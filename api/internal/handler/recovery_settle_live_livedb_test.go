@@ -458,11 +458,24 @@ func TestRecoveryLiveSettleEligibilityLiveDB(t *testing.T) {
 	})
 	t.Run("checkpoint target on a kind with no checkpoint", func(t *testing.T) {
 		e := newLiveEnv(t)
-		e.exec(`UPDATE runs SET kind = 'prompt', issue_iid = NULL WHERE id = $1`, e.run)
+		e.exec(`UPDATE runs SET kind = 'ci_fix', pipeline_id = 1, pipeline_ref = 'main' WHERE id = $1`, e.run)
 		code, res, raw := e.settleLive(e.tokenA, e.run, e.pred, goodLiveBody(cp))
 		e.assertRetained(code, res, raw, apitypes.RecoverySettleNotEligible)
 		e.assertNoLiveForgeCalls()
 		e.assertOpen(e.pred)
+	})
+	// Issue #4116: a prompt run has the checkpoint key uzi/prompt-<run-id>, so the api proves a
+	// checkpoint target against that ref (the worker does not request it yet; live settle for
+	// prompt is deferred on the worker side).
+	t.Run("prompt run: checkpoint target proves against uzi/prompt-<run-id>", func(t *testing.T) {
+		e := newLiveEnv(t)
+		e.exec(`UPDATE runs SET kind = 'prompt', issue_iid = NULL WHERE id = $1`, e.run)
+		code, res, raw := e.settleLive(e.tokenA, e.run, e.pred, goodLiveBody(cp))
+		e.assertReleased(code, res, raw)
+		refs, branches := e.lf.asked()
+		if want := "refs/uzi-checkpoints/uzi/prompt-" + e.run.String(); len(refs) != 1 || refs[0] != want || len(branches) != 0 {
+			t.Fatalf("forge reads: refs %v branches %v, want exactly %s", refs, branches, want)
+		}
 	})
 	// A task run carries its branch from creation and no checkpoint: the checkpoint target is
 	// not eligible, the branch target proves against runs.branch and releases.
