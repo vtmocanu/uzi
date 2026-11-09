@@ -21271,6 +21271,8 @@ export class RunRunner {
    *   - `branch`: task runs ONLY — the one kind whose runs.branch is set at creation (task.sql).
    *     prompt (CreatePromptRun), ci_fix and mr_rework runs leave runs.branch NULL, so the api
    *     answers not_eligible for them while live; they fire nothing and settle on completion.
+   *   Prompt runs have a checkpoint key (`uzi/prompt-<run-id>`, issue #4116) and the api can
+   *   prove a prompt `checkpoint` target, but prompt live settle is deferred: they stay excluded.
    */
   private triggerLiveSettle(flight: RunFlight, publishedSha: string, target: LiveSettleTarget): void {
     if (flight.retainedLocalCustody || !this.settlement.enabled) return;
