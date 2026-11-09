@@ -85,10 +85,11 @@ func TestPromptCheckpointMigrationLifecycleLiveDB(t *testing.T) {
 
 	t.Run("version 420 still resolves no coordinates for non-checkpoint kinds", func(t *testing.T) {
 		// Synthetic rows bypass runs_kind_shape: only the resolver's kind dispatch is under test.
+		// issue_iid is set so widening the issue arm to another kind is visible too.
 		for _, kind := range []string{"ci_fix", "mr_rework", "chat", "judge", "job", "cross_check"} {
 			var isNull bool
 			if err := pool.QueryRow(ctx, `SELECT fn_checkpoint_coordinates(jsonb_populate_record(NULL::runs,
-				jsonb_build_object('id',gen_random_uuid(),'user_id',r.user_id,'repo_id',r.repo_id,'kind',$2::text,
+				jsonb_build_object('id',gen_random_uuid(),'user_id',r.user_id,'repo_id',r.repo_id,'kind',$2::text,'issue_iid',1,
 				  'branch','uzi/prompt-'||r.id::text))) IS NULL FROM runs r WHERE r.id=$1`, run1, kind).Scan(&isNull); err != nil {
 				t.Fatal(err)
 			}
