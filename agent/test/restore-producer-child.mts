@@ -208,6 +208,10 @@ async function main(): Promise<void> {
   await runner.resumePendingRecoveries();
 }
 
+// The parent holds our stdin open; if it dies (or closes it), do not outlive it.
+process.stdin.on("end", () => process.exit(1));
+process.stdin.resume();
+
 main().then(() => { note("child:done"); process.exit(0); }, error => {
   note("child:error", { error: error instanceof Error ? (error.stack ?? error.message) : String(error) });
   process.exit(1);

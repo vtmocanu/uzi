@@ -21,15 +21,16 @@ import type { ClaimResponse } from "../src/protocol.js";
 import type { FetchFn } from "../src/forge.js";
 import { TOKEN, api, baseUrl, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness } from "./runner-harness.js";
 import { AUTH_TOKEN, FEATURES as RIG_FEATURES, PARK_FEATURE, gitIn, host, makeProc, treeDigest } from "./restore-route-rig.js";
-import { startChild, startForgeBridge, waitFor, type Child, type ChildConfig, type LogLine } from "./restore-producer-rig.js";
+import { exitedWithin, startChild, startForgeBridge, waitFor, type Child, type ChildConfig, type LogLine } from "./restore-producer-rig.js";
 
 const children: Child[] = [];
 const closers: Array<() => Promise<void>> = [];
 const tmpDirs: string[] = [];
 
 installHarness({}, async () => {
-  for (const child of children.splice(0)) if (child.proc.exitCode === null && child.proc.signalCode === null) child.proc.kill("SIGKILL");
-  for (const child of children) await child.exited.catch(() => undefined);
+  const live = children.splice(0);
+  for (const child of live) if (child.proc.exitCode === null && child.proc.signalCode === null) child.proc.kill("SIGKILL");
+  for (const child of live) await child.exited.catch(() => undefined);
   for (const close of closers.splice(0)) await close();
 });
 afterEach(() => { for (const dir of tmpDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
@@ -85,7 +86,7 @@ async function world(iid: number, features: string[]): Promise<World> {
     journalKey: `uzi-recovery.${branch}.clone`, ledgerKey: `uzi-attempts.${branch}.entry`, forgeUrl: bridge.url, procs, config,
     spawn: (role, generation, extra) => {
       const cfg = config(role, generation, extra);
-      const child = startChild(cfg, path.join(tmp, `${role}.config.json`));
+      const child = startChild(cfg, path.join(tmp, `${role}.config.json`), tmp);
       children.push(child);
       return child;
     },
@@ -132,6 +133,23 @@ function advanceP(pPath: string): string {
   return gitIn(pPath, ["rev-parse", "HEAD"]);
 }
 
+/** The pin records the producer wrote under `<dataDir>/recovery/<runId>/` (read-only; the file name is the capture id). */
+function pinRecords(w: World): Array<{ captureId: string; raw: Record<string, unknown> }> {
+  const dir = path.join(w.dataDir, "recovery", w.runId);
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir).filter(n => n.endsWith(".json")).sort()
+    .map(n => ({ captureId: n.slice(0, -".json".length), raw: JSON.parse(fs.readFileSync(path.join(dir, n), "utf8")) as Record<string, unknown> }));
+}
+
+/** Advances the bare's origin/main by one descendant commit (the pin stays an ancestor); returns the new tip. */
+function advanceOriginMain(w: World): string {
+  const ref = "refs/remotes/origin/main";
+  const tip = gitIn(w.bare, ["rev-parse", ref]);
+  const next = gitIn(w.bare, [...IDENT, "commit-tree", `${tip}^{tree}`, "-p", tip, "-m", "origin moved after the pin"]);
+  gitIn(w.bare, ["update-ref", ref, next, tip]);
+  return next;
+}
+
 const sha = (text: string): string => createHash("sha256").update(text).digest("hex");
 
 describe("a producer-written predecessor, restored by a successor process (issue #3644 m3)", () => {
@@ -151,14 +169,22 @@ describe("a producer-written predecessor, restored by a successor process (issue
     const slot = await peekAuthoritySlot({ dataDir: w.dataDir, workerToken: AUTH_TOKEN }, pPath);
     assert.equal(slot?.state, "active", "the killed producer's slot is still active under its own incarnation");
 
+    const pins = pinRecords(w);
+    assert.equal(pins.length, 1, "the producer wrote exactly one pin record");
+    const pinCaptureId = pins[0]!.captureId;
+    assert.equal(pins[0]!.raw.sourceSha, pinSha, "the producer's pin record names the default tip it saw");
+
     const pHead = advanceP(pPath);
     assert.notEqual(pHead, pinSha, "P holds a commit the pin does not");
+    // origin/main moves on after the kill (the pin stays an ancestor): "seeded from P's pin" and "seeded from whatever origin/main is now" differ.
+    const newTip = advanceOriginMain(w);
+    assert.notEqual(newTip, pinSha);
     const before = await pFacts(w, pPath);
 
     // ---- S: a fresh process, a different incarnation, generation 2 ----
     api.setOwnershipStatus(w.runId, "running", 2);
     const s = w.spawn("S", 2, docker);
-    const [sCode] = await s.exited;
+    const [sCode] = await exitedWithin(s, "S");
     const sLog = s.log();
     assert.equal(sCode, 0, `S exited cleanly: ${s.stderr()} ${JSON.stringify(msgs(sLog, "child:error"))}`);
     const sInc = String(msgs(sLog, "child:identity")[0]!.incarnation);
@@ -168,8 +194,11 @@ describe("a producer-written predecessor, restored by a successor process (issue
     assert.equal(seeded.length, 1, JSON.stringify(sLog.filter(l => /restore/i.test(l.msg))));
     const seededNote = seeded[0]!;
     assert.equal(seededNote.sourceSha, pinSha, "the pin the producer wrote names the default tip");
-    assert.equal(seededNote.seededHead, pinSha, "S starts at the pin");
+    assert.equal(seededNote.seededHead, pinSha, "S starts at the pin P recorded");
+    assert.notEqual(seededNote.seededHead, newTip, "not at the origin tip that moved after the pin");
     assert.notEqual(seededNote.seededHead, pHead, "not at P's newer commit");
+    assert.equal(seededNote.pinGeneration, 1, "the pin is the producer's generation 1");
+    assert.equal(seededNote.captureId, pinCaptureId, "the pin is the capture the producer wrote");
     assert.equal(seededNote.binding, "on_default");
     assert.equal((seededNote.verdict as { predecessorIncarnation: string }).predecessorIncarnation, pInc, "the verdict names the producer's incarnation");
     assert.match(String(seededNote.attemptPath), /\.attempt-[0-9TZ]+-g2-/);
@@ -221,7 +250,7 @@ describe("a producer-written predecessor, restored by a successor process (issue
     const markerBytes = sha(fs.readFileSync(path.join(w.dataDir, "retained-homes", `${w.runId}.json`), "utf8"));
     api.setOwnershipStatus(w.runId, "running", 3);
     const s2 = w.spawn("S2", 3, docker);
-    const [s2Code] = await s2.exited;
+    const [s2Code] = await exitedWithin(s2, "S2");
     const s2Log = s2.log();
     assert.equal(s2Code, 0, `S2 exited cleanly: ${s2.stderr()} ${JSON.stringify(msgs(s2Log, "child:error"))}`);
     assert.notEqual(String(msgs(s2Log, "child:identity")[0]!.incarnation), sInc, "S2 is a fresh incarnation");
@@ -247,13 +276,15 @@ describe("a producer-written predecessor, restored by a successor process (issue
     assert.equal(pPath.includes(".attempt-"), false);
     assert.equal(cfgAll(w, w.ledgerKey).length, 0, "an attempt-less source has no ledger entry");
 
+    const pSlot = await peekAuthoritySlot({ dataDir: w.dataDir, workerToken: AUTH_TOKEN }, pPath);
+    assert.equal(pSlot?.state, "active", "the killed producer's slot exists and is active, so 'unchanged' is not null-vs-null");
     advanceP(pPath);
     const before = await pFacts(w, pPath);
     const config = configText(w);
 
     api.setOwnershipStatus(w.runId, "running", 2);
     const s = w.spawn("S", 2, { echoRecoveryCause: true });
-    const [sCode] = await s.exited;
+    const [sCode] = await exitedWithin(s, "S");
     const sLog = s.log();
     assert.equal(sCode, 0, `S exited cleanly: ${s.stderr()} ${JSON.stringify(msgs(sLog, "child:error"))}`);
     assert.notEqual(String(msgs(sLog, "child:identity")[0]!.incarnation), pInc);

@@ -50,9 +50,13 @@ export interface Child {
 }
 
 /** Starts a child node process (`--import tsx`, as the other test child processes do) on the given config. */
-export function startChild(cfg: ChildConfig, cfgFile: string): Child {
+export function startChild(cfg: ChildConfig, cfgFile: string, tmpDir: string): Child {
   fs.writeFileSync(cfgFile, JSON.stringify(cfg));
-  const proc = spawn(process.execPath, ["--import", "tsx", CHILD_ENTRY, cfgFile], { cwd: AGENT_ROOT, stdio: ["ignore", "ignore", "pipe"] });
+  // TMPDIR is the per-test dir so a SIGKILLed child's own temp dirs (hermetic procfs, gitleaks shim) go with it. stdin is a pipe the
+  // parent holds open: the child exits when the parent dies (see restore-producer-child.mts).
+  const proc = spawn(process.execPath, ["--import", "tsx", CHILD_ENTRY, cfgFile], {
+    cwd: AGENT_ROOT, stdio: ["pipe", "ignore", "pipe"], env: { ...process.env, TMPDIR: tmpDir },
+  });
   let err = "";
   proc.stderr!.on("data", (d: Buffer) => { err += d.toString(); });
   const exited = new Promise<[number | null, NodeJS.Signals | null]>((resolve, reject) => {
@@ -60,6 +64,18 @@ export function startChild(cfg: ChildConfig, cfgFile: string): Child {
     proc.once("error", reject);
   });
   return { proc, exited, stderr: () => err.slice(-4000), log: () => readLog(cfg.logPath) };
+}
+
+/** Awaits the child's exit, failing with its stderr tail (and killing it) when it has not exited within `timeoutMs`. */
+export async function exitedWithin(child: Child, what: string, timeoutMs = 90_000): Promise<[number | null, NodeJS.Signals | null]> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      child.proc.kill("SIGKILL");
+      reject(new Error(`${what} did not exit within ${timeoutMs}ms: ${child.stderr()}`));
+    }, timeoutMs);
+  });
+  try { return await Promise.race([child.exited, timeout]); } finally { clearTimeout(timer); }
 }
 
 /** Polls `cond` until it holds, failing early when the watched child exits first. */
