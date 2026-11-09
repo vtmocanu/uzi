@@ -40,9 +40,10 @@ name: KinD Smoke
 permissions:
   contents: read
 
+# Same main policy as ci.yml (pilot, #2561): finish the running main run.
 concurrency:
   group: kind-smoke-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   # Path filter (PR only): decide whether this PR touches chart/deploy surfaces. On
