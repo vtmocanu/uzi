@@ -401,69 +401,18 @@ describe("RunDiskSampler (PRD #1809 D8) — sampled_at, partial samples and rota
   });
 });
 
-describe("RunDiskSampler (issue #3644) — truncated directory listing and sibling HOMEs", () => {
+describe("RunDiskSampler (issue #3644) — truncated directory listing marks fresh sums", () => {
+  async function tick(sampler: RunDiskSampler, clock: { now: number }): Promise<RunDiskEntry[] | undefined> {
+    clock.now += 10 * 60_000;
+    sampler.current();
+    await sampler.settled();
+    return sampler.current();
+  }
   const sibling = (n: number): string => runDirKey(id(n), 2);
   const sized = (home: string): RunHomeBytes => ({
     homeBytes: path.basename(home) === id(1) ? 3 : 4, cacheBytes: 0, entries: 1, truncated: false });
 
-  it("a truncated listing keeps the previous complete reading of a run instead of a partial sum of its HOMEs", async () => {
-    await withRoot(async (root) => {
-      fs.mkdirSync(path.join(root, id(1)));
-      fs.mkdirSync(path.join(root, sibling(1)));
-      const clock = { now: 0 };
-      const { o } = opts(root, new Map(), { measure: async (home) => sized(home), maxDirReads: 1_000, now: () => clock.now });
-      const sampler = new RunDiskSampler(o);
-      const tick = async (): Promise<RunDiskEntry[] | undefined> => {
-        clock.now += 10 * 60_000;
-        sampler.current();
-        await sampler.settled();
-        return sampler.current();
-      };
-      assert.deepStrictEqual(sizesOf(await tick()), [{ run_id: id(1), home_bytes: 7, cache_bytes: 0 }]);
-      // The next listing stops after one dirent, so one of the run's two HOMEs is missed.
-      o.maxDirReads = 1;
-      assert.deepStrictEqual(sizesOf(await tick()), [{ run_id: id(1), home_bytes: 7, cache_bytes: 0 }]);
-    });
-  });
-
-  it("a persistently truncated listing keeps sampled_at advancing and reports the fresh partial reading marked truncated", async () => {
-    await withRoot(async (root) => {
-      fs.mkdirSync(path.join(root, id(1)));
-      fs.mkdirSync(path.join(root, sibling(1)));
-      const clock = { now: 0 };
-      let size = 10;
-      const { o } = opts(root, new Map(), {
-        measure: async () => ({ homeBytes: size, cacheBytes: 0, entries: 1, truncated: false }),
-        maxDirReads: 1_000,
-        now: () => clock.now,
-      });
-      const sampler = new RunDiskSampler(o);
-      const tick = async (): Promise<RunDiskEntry> => {
-        clock.now += 10 * 60_000;
-        sampler.current();
-        await sampler.settled();
-        const e = sampler.current();
-        assert.strictEqual(e?.length, 1);
-        return e![0]!;
-      };
-      const first = await tick();
-      assert.strictEqual(first.truncated, undefined);
-      o.maxDirReads = 1;
-      const seen: RunDiskEntry[] = [];
-      for (let i = 0; i < 4; i++) {
-        size += 10;
-        seen.push(await tick());
-      }
-      // sampled_at advances at least every other sample, and a fresh partial reading is marked truncated.
-      const times = [first, ...seen].map((e) => e.sampled_at);
-      for (let i = 0; i + 2 < times.length; i++) assert.notStrictEqual(times[i + 2], times[i]);
-      const fresh = seen.filter((e) => e.sampled_at !== first.sampled_at && e.truncated === true);
-      assert.ok(fresh.length >= 2, "fresh partial readings are reported, marked truncated");
-      assert.ok(seen.at(-1)!.home_bytes > first.home_bytes);
-    });
-  });
-
-  it("a truncated listing with no previous reading marks the run's partial sum as truncated", async () => {
+  it("a truncated listing marks the run's fresh sum truncated (it may miss a sibling HOME)", async () => {
     await withRoot(async (root) => {
       fs.mkdirSync(path.join(root, id(1)));
       fs.mkdirSync(path.join(root, sibling(1)));
@@ -471,6 +420,70 @@ describe("RunDiskSampler (issue #3644) — truncated directory listing and sibli
       const entries = await new RunDiskSampler(o).sample();
       assert.strictEqual(entries.length, 1);
       assert.strictEqual(entries[0]!.truncated, true);
+    });
+  });
+
+  it("truncation plus rotation keeps every reached run's sampled_at advancing and marks fresh entries truncated", async () => {
+    await withRoot(async (root) => {
+      for (let n = 1; n <= 3; n++) fs.mkdirSync(path.join(root, id(n)));
+      const clock = { now: Date.UTC(2026, 8, 28, 12, 0, 0) };
+      let size = 10;
+      let reachedNow = new Set<string>();
+      const { o } = opts(root, new Map(), {
+        now: () => clock.now,
+        measure: async (home) => {
+          reachedNow.add(path.basename(home));
+          return { homeBytes: size, cacheBytes: 0, entries: 1, truncated: false };
+        },
+      });
+      const sampler = new RunDiskSampler(o);
+      const first = await tick(sampler, clock);
+      assert.strictEqual(first?.length, 3);
+      assert.ok(first!.every((e) => e.truncated === undefined), "a complete listing sets no flag");
+      // The listing stops after two dirents and a sample measures one HOME: truncation and rotation together.
+      o.maxDirReads = 2;
+      o.maxMeasured = 1;
+      const TICKS = 9;
+      const reachedAt = new Map<string, number[]>();
+      const sampledAt = new Map<string, string[]>([...first!].map((e) => [e.run_id, [e.sampled_at]]));
+      const bytes = new Map<string, number[]>(first!.map((e) => [e.run_id, [e.home_bytes]]));
+      for (let i = 1; i <= TICKS; i++) {
+        size += 10;
+        reachedNow = new Set();
+        const reading = await tick(sampler, clock);
+        const stamp = new Date(clock.now).toISOString();
+        assert.strictEqual(reading?.length, 3, "no run drops out");
+        for (const e of reading!) {
+          sampledAt.get(e.run_id)!.push(e.sampled_at);
+          bytes.get(e.run_id)!.push(e.home_bytes);
+          if (reachedNow.has(e.run_id)) {
+            assert.strictEqual(e.sampled_at, stamp, `${e.run_id} reached in sample ${i} is stamped fresh`);
+            assert.strictEqual(e.home_bytes, size, `${e.run_id} reached in sample ${i} reports its current size`);
+            assert.strictEqual(e.truncated, true, `${e.run_id} reached in sample ${i} is marked truncated`);
+            reachedAt.set(e.run_id, [...(reachedAt.get(e.run_id) ?? []), i]);
+          }
+        }
+      }
+      assert.ok(reachedAt.size >= 2, "rotation reaches more than one run");
+      for (const [run, at] of reachedAt) {
+        const marks = [0, ...at, TICKS + 1];
+        for (let k = 1; k < marks.length; k++) {
+          assert.ok(marks[k]! - marks[k - 1]! <= 3, `${run} is re-measured at least every 3 samples (${marks.join(",")})`);
+        }
+        assert.ok(new Set(sampledAt.get(run)).size > 2, `${run}'s sampled_at keeps advancing`);
+        assert.ok(bytes.get(run)!.at(-1)! > bytes.get(run)![0]!, `${run} reports growth`);
+      }
+    });
+  });
+
+  it("a complete listing does not set the truncated flag", async () => {
+    await withRoot(async (root) => {
+      fs.mkdirSync(path.join(root, id(1)));
+      fs.mkdirSync(path.join(root, sibling(1)));
+      const { o } = opts(root, new Map(), { measure: async (home) => sized(home), maxDirReads: 1_000 });
+      const entries = await new RunDiskSampler(o).sample();
+      assert.strictEqual(entries.length, 1);
+      assert.strictEqual(entries[0]!.truncated, undefined);
     });
   });
 });
