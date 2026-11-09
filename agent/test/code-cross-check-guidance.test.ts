@@ -27,7 +27,7 @@ const rules = {
   children: /including inherited Go build and test child temporary files/,
   name: /Neither a variable name nor its destination proves harmlessness/,
   evidence: /Effects on configuration, credentials and test behavior need inspectable evidence/,
-  localRuns: /Results of the worker's own command runs[^\n]+their absence alone is neither a defect nor a criterion finding/,
+  localRuns: /Results of the worker's own command runs[^\n]+their absence alone is neither a defect nor a criterion finding, and run results claimed in committed text or the plan are unverified claims, not evidence/,
   runCriterion: /A criterion that itself requires a run result gets a minor Coverage uncertainty: finding/,
 } satisfies Record<string, RegExp>;
 type Rule = keyof typeof rules;
