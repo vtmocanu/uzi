@@ -12,6 +12,14 @@ export TMPDIR="$TMP/temp"
 GO_LOG="$TMP/go.log"
 export GO_LOG
 unset ImageOS ImageVersion GOMEMLIMIT GOGC
+# The one Renovate-tracked pin (#4108); the Taskfile probes below render it.
+DEADCODE_VERSION="$(sed -n 's/^  DEADCODE_VERSION: "\(v[0-9][0-9.]*\)"$/\1/p' "$ROOT/Taskfile.yml")"
+case "$DEADCODE_VERSION" in
+  v[0-9]*.[0-9]*.[0-9]*) ;;
+  *) printf 'deadcode-gate.test.sh: FAIL: Taskfile.yml lacks a static DEADCODE_VERSION\n' >&2; exit 1 ;;
+esac
+DEADCODE_TOOL="golang.org/x/tools/cmd/deadcode@$DEADCODE_VERSION"
+export DEADCODE_TOOL
 # Resolve before the fakes shadow PATH: the Taskfile probes need the real task.
 TASK="$(command -v task || true)"
 [ -n "$TASK" ] && [ -x "$TASK" ] || {
@@ -31,7 +39,7 @@ cat > "$TMP/bin/go" <<'EOF'
 #!/bin/sh
 printf 'called gomemlimit=%s gogc=%s\n' "${GOMEMLIMIT-unset}" "${GOGC-unset}" >> "$GO_LOG"
 [ "$#" -eq 5 ] && [ "$1" = run ] &&
-  [ "$2" = golang.org/x/tools/cmd/deadcode@v0.48.0 ] &&
+  [ "$2" = "$DEADCODE_TOOL" ] &&
   [ "$3" = -test ] && [ "$5" = ./... ] &&
   [ "$PWD" = "$EXPECTED_MODULE" ] || exit 99
 case "$4" in -f=*) ;; *) exit 99 ;; esac
@@ -117,7 +125,7 @@ run_case() {
   err="$TMP/$name.stderr"
   actual=0
   sh "$ROOT/scripts/deadcode-gate.sh" "$EXPECTED_MODULE" \
-    golang.org/x/tools/cmd/deadcode@v0.48.0 >"$out" 2>"$err" || actual=$?
+    "$DEADCODE_TOOL" >"$out" 2>"$err" || actual=$?
   if [ "$actual" -ne "$expected" ]; then
     cat "$out" "$err" >&2
     fail "$name: expected $expected, got $actual"
@@ -179,7 +187,7 @@ TIME_BEHAVIOR=no-launch
 run_case timer-no-launch controller clean gnu 0
 contains "$err" 'timer did not launch command'
 
-grep -Fq -- '- env GOMEMLIMIT=12GiB ./scripts/deadcode-gate.sh api golang.org/x/tools/cmd/deadcode@v0.48.0' "$ROOT/Taskfile.yml" ||
+grep -Fq -- '- env GOMEMLIMIT=12GiB ./scripts/deadcode-gate.sh api "golang.org/x/tools/cmd/deadcode@{{.DEADCODE_VERSION}}"' "$ROOT/Taskfile.yml" ||
   fail 'Taskfile.yml deadcode:api lacks the fixed GOMEMLIMIT=12GiB command'
 
 # Real Taskfile probes: run the actual targets against the fake Go. These do not

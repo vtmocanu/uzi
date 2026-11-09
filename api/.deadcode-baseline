@@ -41,7 +41,7 @@
 #
 # REGENERATE WITH (by hand -- deliberately NOT a Taskfile target, because a
 # fixing variant of a gate is a target testers are told to refuse):
-#     ./scripts/deadcode-gate.sh api golang.org/x/tools/cmd/deadcode@v0.48.0 --write
+#     ./scripts/deadcode-gate.sh api golang.org/x/tools/cmd/deadcode@<DEADCODE_VERSION in Taskfile.yml> --write
 # It re-runs the same producer the gate uses and keeps this header, so the
 # regeneration command cannot drift from the checking command.
 #

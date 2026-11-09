@@ -183,6 +183,7 @@ RUN SQLC_PIN="$(awk -F '"' '/^SQLC_LINUX_AMD64_VERSION=/{print $2}' /tmp/worker-
 # broken install fails the BUILD, not every run. Pinned to v8.30.1 to match the repo's gate:repo
 # scan (Taskfile.yml:913 / scripts/scan-secrets.sh). CI-verified: this image build cannot run in
 # the worker itself. MIRRORED from templates/base (jvm is NOT `FROM base`) — keep in lockstep.
+# renovate: datasource=github-releases depName=gitleaks/gitleaks
 RUN GOFLAGS=-buildvcs=false GOBIN=/usr/local/bin go install github.com/zricethezav/gitleaks/v8@v8.30.1 && gitleaks version
 
 # Yarn Classic 1.22.22 for yarn.lock repos (node:26-alpine ships no yarn). MIRRORED from

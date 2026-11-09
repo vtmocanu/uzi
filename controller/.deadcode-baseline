@@ -17,7 +17,7 @@
 # rather than on entries. There is no CODEOWNERS file anywhere in this tree today.
 #
 # REGENERATE WITH (by hand):
-#     ./scripts/deadcode-gate.sh controller golang.org/x/tools/cmd/deadcode@v0.48.0 --write
+#     ./scripts/deadcode-gate.sh controller golang.org/x/tools/cmd/deadcode@<DEADCODE_VERSION in Taskfile.yml> --write
 #
 # ONE FIGURE WORTH KNOWING BEFORE YOU READ A ZERO HERE AS "no dead code":
 # WITHOUT `-test` this module reports FOUR functions -- `SpecHashOf`,

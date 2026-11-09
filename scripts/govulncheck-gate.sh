@@ -77,7 +77,7 @@ TOOL="${2:-}"
 
 if [ -z "$MODULE_DIR" ] || [ -z "$TOOL" ]; then
   echo "usage: scripts/govulncheck-gate.sh <module-dir> <pkg@version>" >&2
-  echo "  e.g. scripts/govulncheck-gate.sh api golang.org/x/vuln/cmd/govulncheck@v1.8.0" >&2
+  echo "  e.g. scripts/govulncheck-gate.sh api golang.org/x/vuln/cmd/govulncheck@<pin in Taskfile.yml>" >&2
   exit 2
 fi
 
