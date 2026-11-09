@@ -129,6 +129,14 @@ reporter = nightly.fetch('jobs').fetch('report')
 assert.call(reporter.fetch('permissions'), {'issues' => 'write'}, 'only the reporter writes issues')
 assert.call(reporter.fetch('steps').any? { |step| step['uses'].to_s.include?('checkout') }, false, 'the reporter checks out no code')
 assert.call(reporter.fetch('if').include?("github.ref == 'refs/heads/main'"), true, 'the reporter files only for main')
+# The reporter keys on the job result, so a setup failure (deadcode step skipped) still files.
+assert.call(nightly.fetch('jobs').fetch('deadcode-api').key?('outputs'), false, 'reporter does not read a step-outcome output')
+report_ctx = {'github.ref' => 'refs/heads/main', 'needs.deadcode-api.result' => 'failure'}
+assert.call(Expression.new(reporter.fetch('if'), report_ctx).value, true, 'a failed nightly job files an issue, whichever step failed')
+%w[success cancelled skipped].each do |result|
+  assert.call(Expression.new(reporter.fetch('if'), report_ctx.merge('needs.deadcode-api.result' => result)).value, false, "no issue after #{result}")
+end
+assert.call(Expression.new(reporter.fetch('if'), report_ctx.merge('github.ref' => 'refs/heads/ci/x')).value, false, 'no issue off main')
 assert.call(jobs.fetch('lint-repo').key?('needs'), false, 'repo gate remains independent')
 assert.call(jobs.fetch('lint-repo').key?('if'), false, 'repo gate remains unconditional')
 assert.call(workflow.fetch('on').keys.sort, %w[pull_request push], 'triggers unchanged')
