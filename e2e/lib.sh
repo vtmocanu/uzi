@@ -548,12 +548,10 @@ docker_wire_exit_restore() {
   fi
   return "$rc"
 }
-# docker_restore_posture — if this phase wired the stack: (1) stop and remove ONLY the sidecar services it
-# started, (2) remove the env line it appended, (3) THEN force-recreate the agent (the agent resolves wiring
-# once, at startup, so removing the sidecar alone leaves it wired) and wait for the new registration,
-# (4) assert the FINAL container is unwired. If the phase wired nothing it changes nothing.
-docker_restore_posture() {
-  local svc before after
+# Remove only the wiring this phase introduced. Callers with pending fixture ACKs must settle and stop first.
+# The caller must then recreate the agent (wiring is resolved at startup) and verify that final container.
+docker_unwire_prepare() {
+  local svc
   local -a svcs=()
   if [ "${DOCKER_WIRE_OWNED:-0}" != 1 ]; then
     echo "docker wiring: this phase owns no Docker wiring (entry already wired, or already restored); nothing to restore"
@@ -567,14 +565,25 @@ docker_restore_posture() {
     "${COMPOSE[@]}" --profile agent-docker rm -f "${svcs[@]}" >/dev/null || fail "docker wiring: could not remove ${svcs[*]}"
   fi
   _docker_wire_drop_line || fail "docker wiring: could not remove $DOCKER_WIRE_LINE from the env file"
+}
+# Verify the container recreated by the caller, then relinquish this phase's wiring ownership.
+# Phase 52 uses its settlement-aware recreate rather than a second blind recreate here.
+docker_unwire_assert() {
+  [ "${DOCKER_WIRE_OWNED:-0}" = 1 ] || return 0
+  _docker_wire_check false "${DOCKER_WIRE_TIMEOUT:-60}" unwired
+  DOCKER_WIRE_OWNED=0 DOCKER_WIRE_STARTED="" DOCKER_WIRE_LINE_OWNED=0
+}
+docker_restore_posture() {
+  local before after
+  [ "${DOCKER_WIRE_OWNED:-0}" = 1 ] || return 0
+  docker_unwire_prepare
   before="$(restore_agent_container 2>/dev/null)" || before=""
   capture_agent_logs docker-wire before-unwire-recreate
   "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null || fail "docker wiring: could not recreate the agent to unwire it"
   wait_worker_online
   after="$(restore_agent_container)" || fail "docker wiring: cannot identify the agent container after the unwire recreate"
   [ "$after" != "$before" ] || fail "docker wiring: the agent container was not recreated by the unwire step (${after:0:12})"
-  _docker_wire_check false "${DOCKER_WIRE_TIMEOUT:-60}" unwired
-  DOCKER_WIRE_OWNED=0 DOCKER_WIRE_STARTED="" DOCKER_WIRE_LINE_OWNED=0
+  docker_unwire_assert
 }
 
 # --- #3644 predecessor shape and canonical-refusal witnesses -------------------

@@ -8,7 +8,7 @@
 # provides: -
 # handoff:  -
 # mutates:  Docker wiring for cases 7-8 when not already wired (dind/dind-init started, UZI_DIND_SOCKET appended to $ENVFILE, picked up by the case 7 agent recreate); publication resume feature on for cases 1-3/6, off for 4-5/7-8; compose:api(force-recreated: heartbeat-stale window raised for the outage; stopped/started per case for each outage), compose:agent(force-recreated: outbox knobs; short stub-outbox stream for the M6 cases; RESTARTED mid-outage for the boot-gate case; SIGKILLed + started for the #1742 cases), compose:outbox-api-placeholder(phase-only idle container using the built worker image; api DNS alias, no listener, credentials or mounts); eight stub runs created (the last two for the #1742 finalize-resume cases); the agent container is SIGKILLed and started again mid-outage in those two cases (case 8 does so twice; cases 7 and 8 run with the completion interlock on) and runs.requeue_count of each of those two runs is set to RUN_MAX_REQUEUES in-DB (SQL UPDATE, once, during its first cut with the API already stopped, before its FIRST restart only) so only the one-shot finalize allowance can requeue them; admin completion_interlock_rollout set false for cases 3-5, true from case 6; one run's started_at/completion_attempts back-dated in-DB to reach the timeout-sweep carve-out
-# restores: Docker posture (docker_wire_prepare before case 7 starts the DinD sidecar and appends UZI_DIND_SOCKET only when the stack is not already wired; docker_restore_posture after case 8 stops and removes only what it started, removes only its own env line, force-recreates agent and asserts it unwired; nothing changes when the stack was already wired); publication resume overlay unset (default true), verified by stopped-agent probe + fresh registration; placeholder removed; cleanup evidence saved under artifacts/52-api-outage-outbox (agent logs + allowlisted recovery-record projections, before API restore and before agent recreation); api + agent force-recreated back to their defaults (stream length + quotas reset); completion_interlock_rollout back to true (also on EXIT); stub runs (incl. the two #1742 runs) cancelled best-effort; custody: the declared owner discards (resolve_fixture_source_hold) of the killed generation-1 hold of the case 7 run and of both generation holds of the case 8 run, nothing else is discarded; expected exit residue is at most the case 3 completed hold (this phase does not discard it) plus at most one per case 1, 2, 4, 5, 6 run whose final custody ack has not landed (see custody:), which phases 72 and 74 see under the unchanged custody limit 8
+# restores: Docker posture (docker_wire_prepare before case 7 starts the DinD sidecar and appends UZI_DIND_SOCKET only when the stack is not already wired; after case 8, cleanup settles known fixtures and stops the agent, then docker_unwire_prepare stops and removes only the sidecars it started and removes only its own env line; recreate_outbox_agent performs the sole final recreate and docker_unwire_assert verifies that final container is unwired; nothing changes when the stack was already wired); publication resume overlay unset (default true), verified by stopped-agent probe + fresh registration; placeholder removed; cleanup evidence saved under artifacts/52-api-outage-outbox (agent logs + allowlisted recovery-record projections, before API restore and before agent recreation); api + agent force-recreated back to their defaults (stream length + quotas reset); completion_interlock_rollout back to true (also on EXIT); stub runs (incl. the two #1742 runs) cancelled best-effort; custody: the declared owner discards (resolve_fixture_source_hold) of the killed generation-1 hold of the case 7 run and of both generation holds of the case 8 run, nothing else is discarded; expected exit residue is at most the case 3 completed hold (this phase does not discard it) plus at most one per case 1, 2, 4, 5, 6 run whose final custody ack has not landed (see custody:), which phases 72 and 74 see under the unchanged custody limit 8
 # custody:  holds are counted relative to E52, the open_holds census taken at phase entry (log_hold_census "phase 52 entry"). Each accepted claim generation opens ONE hold. admission_counted_holds (ADR-2445) = open holds minus at most one hold per run that is live and healthy at its current generation; every other open hold counts, including a completed run's hold not yet released and a run in recovery_wait. Every make_outbox_run calls wait_custody_headroom 1 before creating its run (8 initial claims); the restore claims of cases 7 and 8 are continuations and need none.
 #   cases 1, 2, 4, 5, 6 (one run and one claim each; the generation is asserted unchanged across the outage in 4, 5 and 6, and the 300s heartbeat-stale window is meant to prevent any re-claim in 1 and 2): +1 open while live, +0 counted. Completion releases the hold through the worker's final custody ack, which this phase does not await (no wait_completed_custody_receipt); the log_run_hold_census line after each case records it. Delta against E52 after settling: 0; up to +1 open and +1 counted between the completion and that ack.
 #   case 3 (one run and one claim, generation asserted unchanged; durable publication intent reconciled, one MR): its completed hold is not discarded by this phase. Nothing in this phase awaits, discards or asserts it, and the closing comment of the phase says it is untouched: +1 open and +1 counted (terminal runs are counted) against E52 for the rest of the phase, unless the worker's final ack releases it.
@@ -507,21 +507,21 @@ restore_outbox_resolution() {
     apipost "/api/runs/$run/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true
   done
   stop_outbox_agent "${own_runs[@]}" || { echo 'outbox cleanup: fixtures did not settle; agent retained' >&2; return 1; }
-  recreate_outbox_agent
+  # Keep Docker available through fixture settlement. Only then remove the owned wiring,
+  # and let the normal stopped-agent probe/recreate produce the final unwired container.
+  docker_unwire_prepare || return 1
+  recreate_outbox_agent || return 1
+  docker_unwire_assert || return 1
   record_outbox_transition cleanup "$transition_start" reused-existing
   storage_diagnostic_snapshot outbox-after-restore
   OUTBOX_RESTORE_NEEDED=0
 }
 restore_outage_state() {
   local rc=$?
-  # #3644: drop the phase-appended UZI_DIND_SOCKET line BEFORE restore_outbox_resolution recreates the agent
-  # from the env file, so that recreate comes up unwired; the full posture restore (sidecar, final recreate
-  # and unwired assertion) follows it. Both are no-ops once the phase's own docker_restore_posture ran.
-  if [ "${DOCKER_WIRE_OWNED:-0}" = 1 ]; then
-    _docker_wire_drop_line || echo 'docker wiring: LOUD: could not remove the phase-owned env line on exit' >&2
+  if ! restore_outbox_resolution; then
+    echo 'outbox cleanup: restore failed; no blind agent recreate or Docker teardown attempted' >&2
+    [ "$rc" != 0 ] || rc=1
   fi
-  restore_outbox_resolution || echo 'outbox cleanup: API alias restore failed' >&2
-  docker_wire_exit_restore "$rc" || true
   set_interlock true 2>/dev/null || true
   return "$rc"
 }
@@ -1176,11 +1176,6 @@ resolve_fixture_source_hold "$RUN_F2" "$GEN_F2"
 resolve_fixture_source_hold "$RUN_F2" "$GEN_F2_OBSERVED"
 log_hold_census "after phase 52"
 assert_no_open_run_holds "cases 7 and 8" "$RUN_F1" "$RUN_F2"
-
-# #3644: return the entry Docker posture BEFORE the final restore below (which recreates the agent from the
-# env file): sidecar services out, the phase-owned env line out, then an unconditional agent recreate whose
-# final container is asserted unwired. A no-op when the stack was already wired at entry.
-docker_restore_posture
 
 # =============================================================================
 # RESTORE — return the api stale window, outbox knobs and recovery retry spacing to defaults so
