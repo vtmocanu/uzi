@@ -691,9 +691,10 @@ it("production SdkExecutor: a pre-approved claim parks on the deferred pause wit
   assert.equal(rg.summaryCalls, 0);
 });
 
-it("required-base validation holds an unattested retained successor before a deferred pause can publish", async t => {
+for (const prompt of [false, true]) it(`${prompt ? "prompt kind (issue #4116, characterization): " : ""}required-base validation holds an unattested retained successor before a deferred pause can publish`, async t => {
   const planned = gitOut(fx.originPath, "rev-parse", "HEAD");
   const rg = await rig("reserve", flight => route(flight, "pause", "now"), {
+    prompt,
     production: true,
     claim: { plan_md: "# Plan\n- preserve the planned base", plan_approved: true, plan_source: "seeded",
       planned_base_commit: planned, require_base_match: true },

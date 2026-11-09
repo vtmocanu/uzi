@@ -1550,6 +1550,7 @@ describe("RunRunner — prompt-kind pause park and recovery (issue #4116, charac
         } finally {
           pub.restore();
           del(refFor(claim.run_id));
+          del(`refs/heads/uzi/prompt-${claim.run_id}`); // the continued run finalizes and pushes its branch
           fs.rmSync(homeRoot, { recursive: true, force: true });
         }
       });
@@ -1606,8 +1607,8 @@ describe("RunRunner — prompt-kind pause park and recovery (issue #4116, charac
       rd(fx.originPath, "update-ref", ref, orphan);
       const { g, bare } = await freshWorker(homeRoot, "worker-b");
       const rc = await g.runnerCloneForBranch(bare, `uzi/prompt-${runId}`, `uzi-prompt-${runId}`, noProofReseed, runId, true, orphan);
-      assert.notEqual(rc.seededFrom, "checkpoint");
-      assert.equal(isAncestor(bare, orphan, rd(rc.path, "rev-parse", "HEAD")), false);
+      assert.equal(rc.seededFrom, "default", "seeds off the default branch");
+      assert.equal(rd(rc.path, "rev-parse", "HEAD"), rd(fx.originPath, "rev-parse", "HEAD"), "HEAD is the default tip");
     } finally {
       del(refFor(runId));
       fs.rmSync(homeRoot, { recursive: true, force: true });
