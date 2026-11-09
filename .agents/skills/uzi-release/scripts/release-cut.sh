@@ -528,7 +528,7 @@ fi
 
 # Require green main-push CI and smoke on the exact prospective parent. The
 # same coverage policy gates publication remotely; local failures are early feedback.
-# A release push cancels in-flight parent CI on main, destroying inheritance evidence.
+# A release push replaces a still-pending parent main run, destroying inheritance evidence.
 # Only the offline fixture harness may omit network evidence.
 if [ "${UZI_RELEASE_OFFLINE_FIXTURE:-}" = "1" ]; then
   fixture_origin="$(git remote get-url origin 2>/dev/null || true)"

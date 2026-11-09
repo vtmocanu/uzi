@@ -120,7 +120,7 @@ end
 assert.call(jobs.fetch('lint-repo').key?('needs'), false, 'repo gate remains independent')
 assert.call(jobs.fetch('lint-repo').key?('if'), false, 'repo gate remains unconditional')
 assert.call(workflow.fetch('on').keys.sort, %w[pull_request push], 'triggers unchanged')
-assert.call(workflow.fetch('concurrency').fetch('cancel-in-progress'), true, 'supersession retained')
+assert.call(workflow.fetch('concurrency').fetch('cancel-in-progress'), "${{ github.ref != 'refs/heads/main' }}", 'PR supersession retained; main runs finish')
 assert.call(run_job.call('test-agent-worker-uid'), false, 'safe PR skips worker lane')
 %w[failure cancelled skipped].each do |result|
   assert.call(run_job.call('test-agent-worker-uid', 'needs.changes.result' => result), true, 'unknown classification runs worker lane')
