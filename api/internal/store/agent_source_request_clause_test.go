@@ -44,10 +44,23 @@ func TestAgentSourceRequestClaimClauseSitesPinned(t *testing.T) {
 			t.Errorf("%s carries %d unexpected agent_source_request clauses", name, n)
 		}
 	}
+	healthCounts := []string{
+		"CountOnlineWorkersSatisfyingAgentSourceRequest",
+		// Issue #4005: the one-worker intersection with repo_agent_source_v1.
+		"CountOnlineWorkersSatisfyingRepoAgentSourceAndRequest",
+	}
+	isHealthCount := func(name string) bool {
+		for _, h := range healthCounts {
+			if name == h {
+				return true
+			}
+		}
+		return false
+	}
 	for name, n := range mentions {
-		if name == "CountOnlineWorkersSatisfyingAgentSourceRequest" {
+		if isHealthCount(name) {
 			if n != 1 {
-				t.Errorf("health count mentions agent_source_request_v1 %d times, want 1", n)
+				t.Errorf("health count %s mentions agent_source_request_v1 %d times, want 1", name, n)
 			}
 			continue
 		}
@@ -55,7 +68,9 @@ func TestAgentSourceRequestClaimClauseSitesPinned(t *testing.T) {
 			t.Errorf("%s mentions agent_source_request_v1 %d times outside a claim clause", name, n-clauses[name])
 		}
 	}
-	if mentions["CountOnlineWorkersSatisfyingAgentSourceRequest"] != 1 {
-		t.Error("CountOnlineWorkersSatisfyingAgentSourceRequest must test agent_source_request_v1")
+	for _, h := range healthCounts {
+		if mentions[h] != 1 {
+			t.Errorf("%s must test agent_source_request_v1", h)
+		}
 	}
 }
