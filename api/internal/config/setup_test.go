@@ -1,7 +1,10 @@
 package config
 
 import (
+	"bytes"
 	"encoding/base64"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -59,6 +62,43 @@ func TestLoadSetupNeedsNoSeedPassword(t *testing.T) {
 	t.Setenv("UZI_SEED_PASSWORD", strings.Repeat("p", 16))
 	if _, err := Load(); err != nil {
 		t.Fatalf("Load with a valid seed password: %v", err)
+	}
+}
+
+// LoadSetup reads its boot secrets like Load: from the plain variable or from a
+// <NAME>_FILE path (a mounted secret), so /server setup runs unchanged on a
+// server that is configured only with secret files.
+func TestLoadSetupReadsSecretFiles(t *testing.T) {
+	setupEnv(t)
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	const dbURL = "postgres://u@db-file.example/uzi"
+	t.Setenv("DATABASE_URL", "")
+	t.Setenv("DATABASE_URL_FILE", write("db", dbURL+"\n"))
+	t.Setenv("UZI_SECRET_KEY", "")
+	t.Setenv("UZI_SECRET_KEY_FILE", write("key", base64.StdEncoding.EncodeToString(setupKey())+"\n"))
+	cfg, err := LoadSetup()
+	if err != nil {
+		t.Fatalf("LoadSetup with _FILE secrets: %v", err)
+	}
+	if cfg.DatabaseURL != dbURL {
+		t.Errorf("DatabaseURL = %q, want %q", cfg.DatabaseURL, dbURL)
+	}
+	if !bytes.Equal(cfg.SecretKey, setupKey()) {
+		t.Error("SecretKey was not read from UZI_SECRET_KEY_FILE")
+	}
+
+	// Setting both forms of one secret is refused, as Load refuses it.
+	t.Setenv("DATABASE_URL", dbURL)
+	if _, err := LoadSetup(); err == nil || !strings.Contains(err.Error(), "DATABASE_URL_FILE") {
+		t.Fatalf("both DATABASE_URL and DATABASE_URL_FILE: err = %v", err)
 	}
 }
 

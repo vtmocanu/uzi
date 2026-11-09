@@ -32,18 +32,28 @@ func (c SetupConfig) ForgeBaseURLAllowed(raw string) bool {
 // LoadSetup reads and validates the setup configuration from the environment.
 // It shares the DATABASE_URL, UZI_SECRET_KEY, FORGE_ALLOWED_BASE_URLS and
 // seed-email validators with Load, requires UZI_SEED_EMAIL, and never reads
-// UZI_SEED_PASSWORD.
+// UZI_SEED_PASSWORD. Like Load, each boot secret comes from the plain variable
+// or its <NAME>_FILE path, never both, so a server configured with mounted
+// secret files runs setup unchanged.
 func LoadSetup() (SetupConfig, error) {
 	cfg := SetupConfig{
-		DatabaseURL:      os.Getenv("DATABASE_URL"),
 		ForgeHTTPTimeout: parseDuration("FORGE_HTTP_TIMEOUT", 15*time.Second),
 	}
-	if strings.TrimSpace(cfg.DatabaseURL) == "" {
-		return SetupConfig{}, fmt.Errorf("DATABASE_URL is required")
-	}
-	key, err := secretbox.LoadKey("UZI_SECRET_KEY")
+	dbURL, dbSource, err := resolveSecret("DATABASE_URL")
 	if err != nil {
 		return SetupConfig{}, err
+	}
+	if strings.TrimSpace(dbURL) == "" {
+		return SetupConfig{}, fmt.Errorf("%s is required", dbSource)
+	}
+	cfg.DatabaseURL = dbURL
+	keyRaw, keySource, err := resolveSecret("UZI_SECRET_KEY")
+	if err != nil {
+		return SetupConfig{}, err
+	}
+	key, err := secretbox.DecodeKey(keySource, keyRaw)
+	if err != nil {
+		return SetupConfig{}, fmt.Errorf("%w; generate one with: openssl rand -base64 32", err)
 	}
 	cfg.SecretKey = key
 	allowed, err := parseAllowedBaseURLs(getenv("FORGE_ALLOWED_BASE_URLS", defaultForgeBaseURL))
