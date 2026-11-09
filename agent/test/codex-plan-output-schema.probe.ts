@@ -77,12 +77,9 @@ function sse(items: Record<string, unknown>[], index: number): string {
 }
 
 /** Returns a fixture only after the real checker and provider-visible Read proof succeed. */
-export async function captureSchemaFixture(out = DEFAULT_OUT): Promise<void> {
- assertNoUnexpectedSystemConfig();
- const version = spawnSync(CODEX_BIN, ["--version"], { encoding: "utf8", timeout: 5000, maxBuffer: 4096 });
- assert.equal(version.status, 0);
- assert.equal(version.stdout.trim(), "codex-cli 0.164.0");
- await access(path.join(path.dirname(CODEX_BIN), "codex-code-mode-host"), constants.X_OK);
+export async function captureSchemaFixture(out = DEFAULT_OUT,
+ /** Test-only setup failure injection; never supplied by model or capture CLI input. */
+ beforeSetupForTest?: (base: string) => Promise<void>): Promise<void> {
  await mkdir(SCRATCH, { recursive: true });
  const base = await mkdtemp(path.join(SCRATCH, "plan-schema-"));
  const checkout = path.join(base, "checkout");
@@ -138,8 +135,17 @@ export async function captureSchemaFixture(out = DEFAULT_OUT): Promise<void> {
  server.requestTimeout = TIMEOUT;
  server.headersTimeout = TIMEOUT;
  try {
-  await Promise.all([mkdir(checkout), mkdir(codexHome, { recursive: true }), mkdir(tmp)]);
+  await beforeSetupForTest?.(base);
+  // Sequential setup leaves no pending filesystem work racing failure cleanup.
+  await mkdir(checkout);
+  await mkdir(codexHome, { recursive: true });
+  await mkdir(tmp);
   await writeFile(path.join(checkout, "anchor.ts"), ANCHOR);
+  assertNoUnexpectedSystemConfig();
+  const version = spawnSync(CODEX_BIN, ["--version"], { encoding: "utf8", timeout: 5000, maxBuffer: 4096 });
+  assert.equal(version.status, 0);
+  assert.equal(version.stdout.trim(), "codex-cli 0.164.0");
+  await access(path.join(path.dirname(CODEX_BIN), "codex-code-mode-host"), constants.X_OK);
   await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
   const address = server.address();
   assert.ok(address && typeof address !== "string");

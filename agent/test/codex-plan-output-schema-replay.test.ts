@@ -1,6 +1,8 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { writeFile, stat, rm } from "node:fs/promises";
+import path from "node:path";
 import { captureSchemaFixture } from "./codex-plan-output-schema.probe.js";
 import { assertFixture, replaySchemaFixture, VERDICT, type SchemaFixture } from "./codex-plan-output-schema-helper.js";
 
@@ -9,6 +11,20 @@ const load = (): SchemaFixture => JSON.parse(readFileSync(fixturePath, "utf8"));
 
 it("probe import exposes capture without executing it", () => {
  assert.equal(typeof captureSchemaFixture, "function");
+});
+
+it("setup failure removes owned scratch before any Codex launch", async () => {
+ let owned: string | undefined;
+ try {
+  await assert.rejects(captureSchemaFixture(undefined, async base => {
+   owned = base;
+   await writeFile(path.join(base, "checkout"), "synthetic setup blocker");
+  }), { code: "EEXIST" });
+  assert.ok(owned);
+  await assert.rejects(stat(owned), { code: "ENOENT" });
+ } finally {
+  if (owned) await rm(owned, { recursive: true, force: true });
+ }
 });
 
 // Missing capture is deliberately a failure, never a fabricated tape or silent skip.
