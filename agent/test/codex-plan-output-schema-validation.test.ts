@@ -63,7 +63,7 @@ for (const v of variants) {
     final_text_bytes: Buffer.byteLength(v.text, "utf8"), final_text_empty: v.text.length === 0,
     final_text_starts_with_code_fence: v.fence,
    });
-   assert.equal(JSON.stringify(error).includes("Synthetic anchor checked"), false);
+   assert.equal((String(error) + (error.stack ?? "") + JSON.stringify(error)).includes("Synthetic anchor checked"), false);
    return true;
   });
  });
