@@ -174,7 +174,7 @@ changes it); trust it over a handover's claim.
 | `run_active:<status>` | step 1 |
 | `run_failed:*`, `run_completed_no_pr` | hand to `uzi-watcher` (*When a run fails*, recovery) |
 | `migration_collision`, `conflict` | step 5; the `EVERY_AUTHOR=` line and its rows (threads, code-scanning alerts, unacked comments) print whatever `NEXT` is, so read them first |
-| `ci_red` | read the failing job; fix locally (step 4) or classify flake. An infra fix that landed on `main` (e.g. a registry mirror) needs a rebase (step 5): a rerun reuses the old head's workflow |
+| `ci_red` | read the failing job; attribute a named failing test locally, narrowly, before a CI rerun (references/ci-red.md); fix locally (step 4) or classify flake. An infra fix that landed on `main` (e.g. a registry mirror) needs a rebase (step 5): a rerun reuses the old head's workflow |
 | `claimed_by_other` | another live lander holds it: message the owner, take the patient path |
 | `mr_rework_active` | `S/wait-mrrework.sh` (references/mr-rework.md), then re-snapshot |
 | `ci_fix_active` | follow *CI-fix branch ownership* below before touching the branch |
@@ -485,8 +485,8 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    Exit 13 (`MIGRATION_COLLISION`) means an added, renamed or copied migration destination is at or below the live base head: run `land-prep.sh` to renumber, then require fresh exact-head CI and review. Unreadable PR files or base migrations refuse with exit 2. The final check shares takeover's parser; a base move outside the lander lock after the snapshot remains a race.
    It refuses on a moved head, an active rework, red, pending or no passing required checks, a
    git conflict, or (exit 5) any unresolved thread, open code-scanning alert or
-   unacknowledged comment, or (exit 10) a `chore(release):` commit's CI still running on
-   `main` (merging would cancel it; wait, unless its tag is already on origin and `release-ci-coverage.py` reports it covered without that run: the refusal then names the rule), takes the repo-wide merge lock (exit 7 = another lander is merging; wait
+   unacknowledged comment, or (exit 10) a `chore(release):` commit's CI that a merge would still supersede on
+   `main`: a pending run, or a running one in a workflow that still cancels (a running `ci.yml`/`kind-smoke.yml` run finishes since #4107 and is allowed when the PR leaves that file alone; also allowed when its tag is already on origin and `release-ci-coverage.py` reports it covered without that run: the line names the rule), takes the repo-wide merge lock (exit 7 = another lander is merging; wait
    for its `main` run to appear), confirms `MERGED`, prints `MERGE_SHA`, writes the trail
    line and releases the claim. A classifier block prints the exact command for the
    user's `!` line; after they run it, reconcile the evidence the out-of-band merge skipped
@@ -494,7 +494,8 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    writes the merge trail and releases the claim while preserving that trail through the
    post-merge CI watch — exit 9 if it is not merged yet). Do this
    BEFORE `reap`/`release`, or the trail is purged before it was ever written (#1510).
-7. **Post-merge CI.** `S/watch-run-ci.sh --sha MERGE_SHA --follow --interval 60` in the background.
+7. **Post-merge CI.** `S/watch-run-ci.sh --sha MERGE_SHA --follow --interval 60 --max-ticks 200` in the background
+   (main runs finish, so a followed head can wait a whole run before starting; exit 2 is not red: re-arm).
    Pass the exact SHA from `merge.sh`; never hand-complete a prefix. The poller resolves it
    through GitHub and exits 3 before polling when it is invalid or unknown.
    Exit 0 green (a partial dispatch counts; confirm a gate fix another way), 1 red (use the
@@ -754,7 +755,7 @@ unattributed process. Tell dependent peers which obligation remains.
   merge SHA; `scripts/watch-prs-ci.sh` CI-only for a batch of PRs (shared
   `scripts/lib/pr-checks-classify.sh`). The sibling and `lib/*.test.sh` scripts are the
   hermetic regressions, wired through `task test:uzi-lander` and `gate:repo`.
-- `references/review-signals.md` every pollable surface per bot; `references/coderabbit-triage.md`
+- `references/review-signals.md` every pollable surface per bot; `references/ci-red.md` attributing a red CI test locally; `references/coderabbit-triage.md`
   verifying and deciding findings; `references/mr-rework.md` coordinating with uzi's own
   rework; `references/merge-mechanics.md` ruleset, red `main`, post-merge CI;
   `references/batch.md` landing the whole open-PR set in order; `references/renovate.md`

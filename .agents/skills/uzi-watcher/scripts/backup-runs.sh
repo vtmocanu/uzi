@@ -86,7 +86,9 @@
 #                   (default: derived from this checkout's origin remote)
 #   UZI_RUNNER_BASE worker clone root override (default: /data/runner/<repo-slug>)
 #   UZI_REPOS_BASE  worker bare-repo root override (default: /data/repos)
-#   UZI_BACKUP_DIR  output root (default: /tmp/uzi-backups)
+#   UZI_BACKUP_DIR  output root (default: ${XDG_STATE_HOME:-~/.local/state}/uzi-backups;
+#                   persistent, unlike /tmp, which macOS cleans daily; on macOS
+#                   exclude it from Time Machine once: `tmutil addexclusion <root>`)
 #   UZI_BACKUP_RETENTION_DAYS  prune timestamped snapshots older than this many
 #                   24-hour periods (default: 14; 0 disables pruning)
 #   UZI_KUBECTL / UZI_BIN / UZI_JQ / UZI_STAT  tool overrides (default: from PATH)
@@ -126,7 +128,7 @@ STAT="${UZI_STAT:-stat}"
 
 CTX="${UZI_CTX:-$("$KUBECTL" config current-context 2>/dev/null)}"
 NAMESPACES="${UZI_WORKER_NS:-uzi-workers uzi-workers-docker}"
-OUTROOT="${UZI_BACKUP_DIR:-/tmp/uzi-backups}"
+OUTROOT="${UZI_BACKUP_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/uzi-backups}"
 RETENTION_DAYS="${UZI_BACKUP_RETENTION_DAYS:-14}"
 
 if [ "$#" -eq 0 ]; then
