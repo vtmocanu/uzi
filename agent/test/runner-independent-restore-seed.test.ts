@@ -26,7 +26,7 @@ import { Outbox } from "../src/outbox.js";
 import type { StateRequest } from "../src/protocol.js";
 import { api, baseUrl, client, fakeGitlab, fx, git, installHarness, runnerWith } from "./runner-harness.js";
 import {
-  AUTH_TOKEN, BRANCH, CID, armTraps, buildRig, cfgAdd, cfgAll, cfgGet, cfgSet, cleanupRig, failed, gitIn, journalOf, logged, makeProc, refusals, resetRigRoots, rigDefaults, slotOf,
+  AUTH_TOKEN, BRANCH, CID, FEATURES, PARK_FEATURE, armTraps, buildRig, cfgAdd, cfgAll, cfgGet, cfgSet, cleanupRig, failed, gitIn, journalOf, logged, makeProc, refusals, resetRigRoots, rigDefaults, slotOf,
   treeDigest, type Rig, type RigOptions,
 } from "./restore-route-rig.js";
 
@@ -1107,9 +1107,41 @@ describe("a seed that refuses or fails is a nonterminal stop that leaves exactly
 describe("a predecessor at the canonical clone path is not restorable (issue #3644 3.2)", () => {
   beforeEach(() => { resetRigRoots(); });
 
-  it("is refused as predecessor_path during classification, before any executor is built or swapped, with nothing written", async () => {
-    const { r } = await restoreRig();
-    // P's journal and `live` ledger entry name the canonical path (no attempt id in it); its active foreign slot is keyed there.
+  it("the real canonical shape {runId, clonePath} is the canonical unsupported class: parked for its owner during classification, with nothing built, swapped or written", async () => {
+    // What markRecoveryCapture(..., undefined) writes for an attempt-less source: no attemptId, no ledger entry, a slot keyed at the canonical path.
+    const { r } = await restoreRig({ pShape: "canonical", features: [...FEATURES, PARK_FEATURE] });
+    assert.deepEqual(Object.keys(journalOf(r)).sort(), ["clonePath", "runId"], "the fixture is the real canonical shape");
+    assert.equal(cfgAll(r, r.ledgerKey).length, 0, "an attempt-less source has no ledger entry");
+    const realReport = client.reportState.bind(client) as unknown as (...a: unknown[]) => Promise<Record<string, unknown>>;
+    mock.method(client, "reportState", (async (...args: unknown[]) => {
+      const body = args[1] as Record<string, unknown>;
+      const ack = await realReport(...args);
+      return body.status === "recovery_wait" && typeof body.recovery_cause === "string" ? { ...ack, recoveryCause: body.recovery_cause } : ack;
+    }) as never);
+    const config = configText(r);
+    const before = await pFacts(r);
+    const swaps = mock.method(r.runner as unknown as { swapRestoreExecutor(...a: unknown[]): Promise<void> }, "swapRestoreExecutor");
+    await r.runner.execute(r.claim);
+    const refusal = refusals(r);
+    assert.equal(refusal.length, 1, JSON.stringify(r.logs.lines.filter(l => /restore/i.test(String((l as { msg: string }).msg)))));
+    assert.equal(refusal[0]!.reason, "predecessor_not_plain");
+    assert.equal(refusal[0]!.unsupported, "canonical");
+    const parks = api.states.filter(x => x.runId === r.runId && x.body.status === "recovery_wait");
+    assert.equal(parks.length, 1, "one owner-hold park");
+    assert.equal(parks[0]!.body.recovery_cause, "retained_recovery_adoption_failed");
+    assert.equal(logged(r, "restore unsupported predecessor held").length, 1);
+    assert.equal(failed(r).length, 0, "nonterminal: the run is not failed");
+    assert.equal(swaps.mock.callCount(), 0, "no successor executor was swapped in");
+    assert.deepEqual(r.factoryCalls.map(c => c.generation), [undefined], "no successor executor was built");
+    assert.equal(logged(r, "independent restore seeded").length, 0);
+    assert.equal(configText(r), config, "nothing was written to the bare");
+    assert.equal(fs.existsSync(markerFile(r)), false);
+    assert.deepEqual(await pFacts(r), before, "P's key, slot, clone, HOME and provision directory are unchanged");
+  });
+
+  it("a journal that keeps an attempt id on the canonical path is not the canonical shape: predecessor_path, the unchanged refusal, no park", async () => {
+    const { r } = await restoreRig({ features: [...FEATURES, PARK_FEATURE] });
+    // P's journal and `live` ledger entry name the canonical path while the journal still carries an attempt id; its active foreign slot is keyed there.
     const canonical = r.pPath.replace(/\.attempt-.*$/, "");
     assert.notEqual(canonical, r.pPath);
     fs.mkdirSync(canonical, { recursive: true });
@@ -1124,6 +1156,8 @@ describe("a predecessor at the canonical clone path is not restorable (issue #36
     const refusal = refusals(r);
     assert.equal(refusal.length, 1, JSON.stringify(r.logs.lines.filter(l => /restore/i.test(String((l as { msg: string }).msg)))));
     assert.equal(refusal[0]!.reason, "predecessor_path");
+    assert.equal(refusal[0]!.unsupported, undefined, "an item-7 refusal carries no class");
+    assert.equal(api.states.filter(x => x.runId === r.runId && x.body.status === "recovery_wait").length, 0, "no park");
     assert.equal(failed(r).length, 0, "nonterminal: the run is not failed");
     assert.equal(swaps.mock.callCount(), 0, "no successor executor was swapped in");
     assert.deepEqual(r.factoryCalls.map(c => c.generation), [undefined], "no successor executor was built");

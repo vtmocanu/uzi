@@ -21,8 +21,9 @@ import type { RecoveryRecord } from "./recovery.js";
 import { classifyRecoveryOrigin } from "./recovery-origin.js";
 import {
   evaluateComposeRestore, runAttributionCensus,
+  selfRecordMatchingLive,
   type BoundaryRead, type BoundaryRecord, type BoundarySlot, type IdentityRefusal, type LiveBoundaryIdentity, type RestoreRefusal,
-  type RestoreVerdict,
+  type RestoreUnsupported, type RestoreVerdict,
 } from "./restore-boundary.js";
 
 /** Refusals decided from the bare config alone, before any reservation (plan 3.2). */
@@ -54,11 +55,50 @@ export interface RelationshipInput {
   entries: readonly BareAttributionEntry[];
   /** False when the config read hit a cap or an error. */
   complete: boolean;
+  /** The runner clone path of this run's canonical key (git.ts runnerClonePath), the only path a canonical journal may name. */
+  canonicalClonePath: string;
 }
 
 export type RelationshipResult =
   | { ok: true; clonePath: string; attemptId: string; generation: number }
-  | { ok: false; reason: ClassificationRefusal };
+  | { ok: false; reason: ClassificationRefusal; canonicalCandidate?: undefined }
+  | { ok: false; reason: "predecessor_not_plain"; canonicalCandidate: true; clonePath: string };
+
+/**
+ * Plan 3.2 item 1: a journal that is exactly `{runId, clonePath}` for this run at the canonical clone path is what an attempt-less
+ * source writes. It is a canonical CANDIDATE only when the same config snapshot also shows no other attribution of the run: P's key
+ * holds exactly this one value, no stopped marker or protected descriptor, no other key or value naming the run or the path, and no
+ * same-run ledger entry that is `live` or `reclaimed`. Every other non-attempt shape stays a plain `predecessor_not_plain`.
+ */
+function classifyCanonicalShape(input: RelationshipInput, j: Record<string, unknown>): RelationshipResult {
+  const plain: RelationshipResult = { ok: false, reason: "predecessor_not_plain" };
+  if (Object.keys(j).sort().join(",") !== "clonePath,runId" || j.runId !== input.runId || j.clonePath !== input.canonicalClonePath) return plain;
+  if (!input.complete) return { ok: false, reason: "attribution_unverifiable" };
+  const clonePath = input.canonicalClonePath;
+  const conflicting: RelationshipResult = { ok: false, reason: "conflicting_attribution" };
+  const names = (value: string): boolean => value.includes(input.runId) || namesWholePath(value, clonePath);
+  const pKey = recoveryCaptureKey(input.branch);
+  const stopped = stoppedMarkerKey(input.runId);
+  const descriptor = `uzi-retained.${input.runId}.journal`;
+  let pKeyValues = 0;
+  for (const { key, value, valueless } of input.entries) {
+    if (key === pKey) {
+      pKeyValues++;
+      if (valueless || value !== input.journalRaw) return conflicting;
+      continue;
+    }
+    if (key === stopped || key === descriptor) return conflicting;
+    if (/^uzi-attempts\..+\.entry$/.test(key)) {
+      const decoded = valueless ? undefined : parseAttemptLedgerEntry(value);
+      if (decoded === undefined) { if (names(value)) return conflicting; continue; }
+      if (decoded.runId === input.runId ? decoded.state === "live" || decoded.state === "reclaimed" : decoded.clonePath === clonePath) return conflicting;
+      continue;
+    }
+    if (names(value)) return conflicting;
+  }
+  if (pKeyValues !== 1) return conflicting;
+  return { ok: false, reason: "predecessor_not_plain", canonicalCandidate: true, clonePath };
+}
 
 /**
  * Plan 3.2, pure over one config snapshot. Module-private: the seeding transaction repeats it through {@link evaluateRestoreRoute}
@@ -79,7 +119,7 @@ function classifyRestoreRelationships(input: RelationshipInput): RelationshipRes
   if (typeof journal !== "object" || journal === null || Array.isArray(journal)) return refuse("predecessor_not_plain");
   const j = journal as Record<string, unknown>;
   if (Object.hasOwn(j, "completionSourceFence")) return refuse("uncertain_publication");
-  if (Object.keys(j).sort().join(",") !== "attemptId,clonePath,runId") return refuse("predecessor_not_plain");
+  if (Object.keys(j).sort().join(",") !== "attemptId,clonePath,runId") return classifyCanonicalShape(input, j);
   if (typeof j.runId !== "string" || typeof j.clonePath !== "string" || typeof j.attemptId !== "string" || j.runId !== input.runId)
     return refuse("predecessor_not_plain");
   const clonePath = j.clonePath;
@@ -169,6 +209,8 @@ export interface EligibilityInput {
   journalRaw: string;
   /** The 3.4(h) prerequisites of certified completion, each evaluated by the caller from the claim and the client. */
   certified: { guardedRunKind: boolean; inventoryGuarded: boolean; featureNegotiated: boolean; authorityPresent: boolean };
+  /** The runner clone path of this run's canonical key; the only path a canonical-shaped journal may name (plan 3.2 item 1). */
+  canonicalClonePath: string;
 }
 
 /** What the seeding transaction will re-derive and compare. Contains only identities, never a path of P's clone. */
@@ -197,11 +239,13 @@ export interface RestoreKnown {
   pinGeneration?: number;
   sourceSha?: string;
   detail?: string;
+  /** P's journal is the canonical `{runId, clonePath}` shape (the log carries it when the hosted class outranks it). */
+  canonicalCandidate?: true;
 }
 
 export type RestoreRouteOutcome =
   | { eligible: true; verdict: EligibleVerdict; known: RestoreKnown }
-  | { eligible: false; reason: RestoreRouteReason; known: RestoreKnown };
+  | { eligible: false; reason: RestoreRouteReason; known: RestoreKnown; unsupported?: RestoreUnsupported };
 
 const PIN_EPISODE_FIELDS = ["heldPolicy", "holdSettlement", "finalRequest", "finalAcknowledged", "completionReceipt", "completionSource", "exactHoldBinding"] as const;
 
@@ -238,19 +282,34 @@ export function restorePinStillSelected(records: readonly RecoveryRecord[], runI
  */
 export async function evaluateRestoreRoute(deps: EligibilityDeps, input: EligibilityInput): Promise<RestoreRouteOutcome> {
   const known: RestoreKnown = {};
-  const refuse = (reason: RestoreRouteReason): RestoreRouteOutcome => ({ eligible: false, reason, known });
+  const refuse = (reason: RestoreRouteReason, unsupported?: RestoreUnsupported): RestoreRouteOutcome =>
+    ({ eligible: false, reason, known, ...(unsupported === undefined ? {} : { unsupported }) });
   const config = await deps.readConfig();
   const relationships = classifyRestoreRelationships({ runId: input.runId, branch: input.branch, journalRaw: input.journalRaw,
-    entries: config.entries, complete: config.complete });
-  if (!relationships.ok) return refuse(relationships.reason);
-  const { clonePath, attemptId, generation } = relationships;
-  known.pinGeneration = generation;
+    entries: config.entries, complete: config.complete, canonicalClonePath: input.canonicalClonePath });
+  if (!relationships.ok && relationships.canonicalCandidate !== true) return refuse(relationships.reason);
+  const clonePath = relationships.clonePath;
+  if (relationships.ok) known.pinGeneration = relationships.generation;
+  else known.canonicalCandidate = true;
 
   let slot: SlotSnapshot | null;
   try { slot = await deps.peekSlot(clonePath); } catch { return refuse("slot_unreadable"); }
   // The route was taken for a foreign-owned slot (active, or with a pending footprint); anything else means it changed.
   if (slot === null || slot.owner.worker === deps.selfIncarnation || (slot.state !== "active" && slot.pending === null)) return refuse("predecessor_changed");
   if (slot.pending !== null) return refuse("predecessor_pending");
+  if (!relationships.ok && slot.publication !== null) return refuse("predecessor_pending");
+
+  // Plan 3.2 items 1-2: an unsupported class is decided here, before any pin check, from the quiet foreign-active slot and S's own
+  // record. Hosted outranks canonical; P's own boundary record is never read for either.
+  const live = await deps.readLive();
+  const selfRead = await deps.readBoundary(deps.selfIncarnation);
+  if (slot.publication === null) {
+    const selfMatch = selfRecordMatchingLive(selfRead, live.ok ? live.identity : undefined, deps.selfIncarnation);
+    if (selfMatch !== undefined) { known.slot = selfMatch.slot; known.crossCheck = selfMatch.crossCheck; }
+    if (selfMatch?.slot.kind === "hosted") return refuse("hosted_restore_not_delivered", "hosted");
+  }
+  if (!relationships.ok) return refuse("predecessor_not_plain", "canonical");
+  const { attemptId, generation } = relationships;
 
   // (a) this process's boundary record.
   const self = deps.processBoundary();
@@ -285,8 +344,6 @@ export async function evaluateRestoreRoute(deps: EligibilityDeps, input: Eligibi
   if (!census.ok) return refuse(census.reason);
 
   // (f) the compose predicate.
-  const live = await deps.readLive();
-  const selfRead = await deps.readBoundary(deps.selfIncarnation);
   known.slot = self.slot;
   known.crossCheck = self.crossCheck;
   const bareBusy = await deps.bareBusy();
@@ -298,7 +355,7 @@ export async function evaluateRestoreRoute(deps: EligibilityDeps, input: Eligibi
     predecessor: slot, predecessorFenced: false, readBoundary: deps.readBoundary, bareBusy, bareSlot, census,
     ...(deps.skipExecutionComparison === true ? { skipExecutionComparison: true } : {}),
   });
-  if (!decision.admit) return refuse(decision.reason);
+  if (!decision.admit) return refuse(decision.reason, decision.unsupported);
   known.verdict = decision.verdict;
 
   // (g) the claim's checkpoint tip is an ancestor of the pin, in the bare only.

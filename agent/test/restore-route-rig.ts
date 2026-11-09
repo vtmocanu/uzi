@@ -36,6 +36,10 @@ export const BRANCH = `agent/issue-${IID}`;
 export const CID = "ab".repeat(32);
 export const BOOT = "11111111-2222-3333-4444-555555555555";
 export const FEATURES = ["active_run_snapshot", "claim_generation_fence", "recovery_completed_publication_v1"];
+/** The api advertises the owner-hold cause the unsupported-predecessor park reports (RETAINED_ADOPTION_FAILED_FEATURE). */
+export const PARK_FEATURE = "recovery_cause_retained_recovery_adoption_failed";
+/** The pod uid of a hosted slot in the rig (a UUID means hosted). */
+const POD_UID = "123e4567-e89b-12d3-a456-426614174000";
 export const GIT_ENV: NodeJS.ProcessEnv = { GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", PATH: process.env.PATH };
 export const host = (): string => CID.slice(0, 12);
 
@@ -124,8 +128,11 @@ export interface RigOptions {
   pin?: boolean;
   /** Default "ok". */
   pBoundary?: "ok" | "missing" | "invalid" | "hosted" | "failed" | "slot_mismatch" | "same_execution";
-  /** Default "ok": S's process boundary. */
-  sBoundary?: "ok" | "none" | "missing_file";
+  /** Default "ok": S's process boundary. "hosted": S is a hosted pod (its record and live identity name a pod uid). */
+  sBoundary?: "ok" | "none" | "missing_file" | "hosted";
+  /** Default "attempt". "canonical": P is an attempt-less source at the canonical clone path, journaled `{runId, clonePath}` with
+   *  no ledger entry (what `markRecoveryCapture(..., undefined)` writes). */
+  pShape?: "attempt" | "canonical";
   /** Default "clean". */
   sLive?: "clean" | "hidden";
   governor?: boolean;
@@ -160,10 +167,13 @@ export async function buildRig(o: RigOptions = {}): Promise<Rig> {
 
   // P: a real attempt clone of generation 1 with unsaved work, its journal and its `live` ledger entry.
   const pAttempt = mintAttemptId(1);
-  const clone = await git.createOrAttachRunnerClone(bare, IID, noProofReseed, runId, false, undefined,
-    { attemptId: pAttempt, isLive: () => false, beforeSeed: async () => {} });
+  const canonicalP = o.pShape === "canonical";
+  const clone = canonicalP
+    ? await git.createOrAttachRunnerClone(bare, IID, noProofReseed, runId, false)
+    : await git.createOrAttachRunnerClone(bare, IID, noProofReseed, runId, false, undefined,
+      { attemptId: pAttempt, isLive: () => false, beforeSeed: async () => {} });
   fs.writeFileSync(path.join(clone.path, "ONLY_COPY.txt"), "work that only the predecessor's clone holds\n");
-  await git.markRecoveryCapture(bare, clone.path, BRANCH, runId, clone.attemptId);
+  await git.markRecoveryCapture(bare, clone.path, BRANCH, runId, canonicalP ? undefined : clone.attemptId);
 
   // The authority: P's active slot under a dead incarnation, S as the restarted worker.
   const lifetime = await acquireWorkerLifetime(dataDir, testLockOptions());
@@ -171,7 +181,7 @@ export async function buildRig(o: RigOptions = {}): Promise<Rig> {
   const sInc = randomUUID();
   const pRt = new AuthorityRuntime({ lifetime, workerToken: AUTH_TOKEN, workerIncarnation: pInc, timeoutMs: 5000 });
   const sRt = new AuthorityRuntime({ lifetime, workerToken: AUTH_TOKEN, workerIncarnation: sInc, timeoutMs: 5000 });
-  await pRt.withTransaction(() => pRt.hooks.admitSourceUse(clone.path, "seed-attempt"));
+  await pRt.withTransaction(() => pRt.hooks.admitSourceUse(clone.path, canonicalP ? "seed-canonical" : "seed-attempt"));
 
   // The boundary records: same compose slot, P's execution strictly older than S's.
   const pProc = path.join(tmp, "proc-p");
@@ -185,7 +195,7 @@ export async function buildRig(o: RigOptions = {}): Promise<Rig> {
     const w = await writeBoundaryRecord({ ...common, procRoot: pMode === "same_execution" ? sProc : pProc, incarnation: pInc });
     assert.ok(w.ok);
   } else if (pMode === "hosted") {
-    const w = await writeBoundaryRecord({ ...common, procRoot: pProc, incarnation: pInc, podUid: "123e4567-e89b-12d3-a456-426614174000" });
+    const w = await writeBoundaryRecord({ ...common, procRoot: pProc, incarnation: pInc, podUid: POD_UID });
     assert.ok(w.ok);
   } else if (pMode === "failed" || pMode === "slot_mismatch") {
     const record: BoundaryRecord = { version: 1, incarnation: pInc,
@@ -202,7 +212,7 @@ export async function buildRig(o: RigOptions = {}): Promise<Rig> {
   }
   const sMode = o.sBoundary ?? "ok";
   if (sMode !== "none") {
-    const w = await establishProcessBoundary({ ...common, procRoot: sProc, incarnation: sInc });
+    const w = await establishProcessBoundary({ ...common, procRoot: sProc, incarnation: sInc, ...(sMode === "hosted" ? { podUid: POD_UID } : {}) });
     assert.ok(w.ok);
     if (sMode === "missing_file") fs.unlinkSync(path.join(dataDir, ".uzi-authority", "boundaries", boundaryFileName(sInc)));
   }
@@ -246,7 +256,7 @@ export async function buildRig(o: RigOptions = {}): Promise<Rig> {
     return made;
   }, o.gitlab ?? fakeGitlab().gitlab, AUTH_TOKEN, logs.logger, {
     authority: sRt, codexBoundaryDeadlineMs: 5000, recoveryRetryMs: 5,
-    restoreIdentity: { procRoot: sProc, hostname: host },
+    restoreIdentity: { procRoot: sProc, hostname: host, ...(sMode === "hosted" ? { podUid: POD_UID } : {}) },
     independentRestore: o.independentRestore ?? rigDefaults.independentRestore,
     ...(diskGovernor ? { diskGovernor } : {}),
     ...o.runnerExtra,

@@ -35,7 +35,7 @@ import { CacheTargetBinding } from "./cache-target.js";
 import { RestoreCompositeBlockedError, RestoreCompositeError, RestoreSeedError, restoreDigest } from "./restore-journal.js";
 import { writeRetainedHomeMarker } from "./retained-homes.js";
 import { evaluateRestoreRoute, restorePinStillSelected, type EligibilityDeps, type EligibilityInput, type EligibleVerdict, type RestoreKnown, type RestoreRouteOutcome } from "./restore-route.js";
-import { processBoundary, processBoundaryDisabledReason, readBoundaryRecord, readBoundaryRecordRaw, readLiveIdentity, runAttributionCensus, type LiveIdentityOptions } from "./restore-boundary.js";
+import { processBoundary, processBoundaryDisabledReason, readBoundaryRecord, readBoundaryRecordRaw, readLiveIdentity, runAttributionCensus, type LiveIdentityOptions, type RestoreUnsupported } from "./restore-boundary.js";
 import { buildClaudeSourceCore, buildCodexSourceCore, serializeSourceFence, sourceFenceOf } from "./completion-source.js";
 import type { CheckpointPublicationContext, PushPublicationContext, RemediationRestrictionIdentity, RemediationRecovery, MemoryParkRecord, WipIncompleteInfo, CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult, TrackingAttemptToken } from "./git.js";
 import {
@@ -87,7 +87,7 @@ import type { BoundedCoverageTestTransport } from "./plan-contract-review.js";
 import type { PlanCrossCheckStateRequest, PlanCrossCheckDiffRefusal } from "./client.js";
 import type { BoundaryPermit, BoundaryRequest, BoundarySink, BoundaryStep, CredentialFreeCaptureContext, GracefulShutdownCheckpoint, SafeBoundary } from "./harness.js";
 import { SinkGate } from "./sink-gate.js";
-import { ATTEMPT_ID_RE, ATTEMPT_SEPARATOR, cloneKeyOf } from "./attempt-path.js";
+import { ATTEMPT_ID_RE, ATTEMPT_SEPARATOR, cloneKeyOf, isWithinPath } from "./attempt-path.js";
 import type { LeftReason, RunProcessReap } from "./run-procs.js";
 import {
   LiveAttemptRegistry,
@@ -2978,6 +2978,17 @@ interface RunFlight {
     /** The slot peek threw during pre-discovery: the route refuses `slot_unreadable` without evaluating. */
     slotUnreadable: boolean;
   };
+  /** issue #3644: what the restore route must never touch while the successor is not yet seeded. Set where discovery selects the
+   *  route (P's clone, P's agent-home/<runId> and the executor built on it), cleared only by `restoreFromPin` right after the seed
+   *  assigns the flight's worktreePath. While set, {@link RunRunner.quiesceRun} refuses P's targets and HOME, a retained credential
+   *  switch stops before settling, and the teardown keeps P's HOME. It stays set on every other exit, a seed failure included. */
+  restorePredecessor?: { clonePath: string; home: string | undefined; executor: Executor };
+  /** issue #3644: an unsupported-predecessor owner hold was requested (or attempted) for this flight; the park teardown that would
+   *  otherwise reap and drop the caches of the HOME the flight holds must not run. */
+  restoreUnsupportedHold?: boolean;
+  /** issue #3644: the `status` of this flight's first `running` report's ACK. Read-only; the unsupported-predecessor park is sent
+   *  only when it is `running` (a redundant client-side check of the server's own fence). */
+  runningAckStatus?: string;
   /** issue #3644 m4a: the disk governor's cache target (executor + HOME), bound per the claim's route; see cache-target.ts. */
   cacheTarget?: CacheTargetBinding<Executor>;
   /** Transient ambiguity guard; conveys neither durable evidence nor deletion authority. */
@@ -6462,7 +6473,7 @@ export class RunRunner {
           return;
         }
         if (flight.retainedEpisode || flight.retainedLocalCustody || flight.retainedEpisodeCustody ||
-            flight.completedRetainedSuccessor) {
+            flight.completedRetainedSuccessor || flight.restorePredecessor !== undefined) {
           if (await this.enterRetainedCredentialSwitch(claim, flight, runLog) === "held") {
             runLog.info("credential switch held; run processes unproven, work and custody kept for an owner Resume or Cancel", {
               run_id: flight.runId,
@@ -7091,7 +7102,10 @@ export class RunRunner {
       // rmTeardownTree pins every directory and removes read-only agent-owned caches.
       // Reaping this run does not stop sibling writers swapping intermediate directories.
       // Refusal warns and retains the tree; cleanup must never change the run's outcome.
-      if (!this.cancellationExpired(flight) && runHome && !preserveResumeArtifacts) {
+      // issue #3644 plan 3.4 (d): while the restore route's predecessor is unseeded, the HOME the flight holds is P's: neither
+      // removed nor reaped and cache-dropped below. The flag is cleared by the seed's success, and S's own HOME is never P's.
+      const predecessorHome = runHome !== undefined && runHome === flight.restorePredecessor?.home;
+      if (!this.cancellationExpired(flight) && runHome && !preserveResumeArtifacts && !predecessorHome) {
         await this.runCancellationMaintenance(flight, () => rmTeardownTree(runHome, this.teardownTestDeps))
           .then(() => { sourceHomeRemoved = true; })
           .catch((e) => {
@@ -7105,7 +7119,8 @@ export class RunRunner {
       // failed pause expects a quick same-worker re-claim, so its warm caches are kept. Claude
       // runs only (no `executor.safety`): a Codex run's caches sit on its own per-run volume
       // (PRD #1809, Codex caches). Never throws: dropRunCaches logs and swallows its failures.
-      if (runHome && preserveResumeArtifacts && flight.parked && !executor.safety && !flight.providerParkUnproven) {
+      if (runHome && preserveResumeArtifacts && flight.parked && !executor.safety && !flight.providerParkUnproven &&
+          !flight.restoreUnsupportedHold && !predecessorHome) {
         parkReapApplied = true;
         // "Only a park that ended the run's processes drops": the park's process-group reap misses
         // what the agent backgrounded (the pinned CLI runs each Bash command detached, in its own
@@ -14036,6 +14051,7 @@ export class RunRunner {
     // continuing the phase clone would work a claim the run has already left. Throw the non-`failed`
     // stop signal rather than clone-and-run on it.
     const runningAck = await reportState({ status: "running" });
+    flight.runningAckStatus = runningAck.status;
     if (!runningAck.applied && runningAck.status !== undefined && TERMINAL_RUN_STATUSES.has(runningAck.status)) {
       runLog.info("first running report refused with a terminal status; stopping the phase clone", {
         run_id: runId,
@@ -14124,6 +14140,7 @@ export class RunRunner {
             // opaque journal to the restore route in recoverRetainedClaim.
             flight.barePath = opaque.barePath;
             flight.restoreRoute = { raw: opaque.raw, slotUnreadable: opaque.slotUnreadable };
+            flight.restorePredecessor = { clonePath: opaque.journal.clonePath, home: flight.runHome, executor: flight.executor };
             retainedJournal = opaque.journal;
             return;
           }
@@ -17832,6 +17849,21 @@ export class RunRunner {
     } finally { this.cancellationExpired(flight); }
   }
 
+  /**
+   * issue #3644: whether a quiescence request would touch the restore route's predecessor P: P's executor (its HOME-attributed
+   * reap and agent-tree kill), or a target that is P's clone, inside it or above it. A request with explicit targets is judged on
+   * those alone (the seed's own S-only sweeps); one without resolves the implicit target the way quiesceRun does (the capture-mode
+   * target is `flight.worktreePath`, which names P until the seed succeeds).
+   */
+  private touchesRestorePredecessor(flight: RunFlight, executor: Executor, opts: { targetPaths?: string[]; clonePath?: string }): boolean {
+    const p = flight.restorePredecessor;
+    if (p === undefined) return false;
+    if (executor === p.executor) return true;
+    const targets = opts.targetPaths ?? [opts.clonePath, flight.attempt?.clonePath, flight.worktreePath]
+      .filter((t): t is string => t !== undefined);
+    return targets.some(t => isWithinPath(t, p.clonePath) || isWithinPath(p.clonePath, t));
+  }
+
   private async quiesceRun(
     flight: RunFlight,
     executor: Executor,
@@ -17841,6 +17873,29 @@ export class RunRunner {
       /** issue #3980: absolute deadline of a bounded Claude gate checkpoint; absent = unchanged behaviour. */
       deadlineAt?: number },
   ): Promise<{ outcome: QuiesceRunOutcome; blocked: boolean }> {
+    // issue #3644 plan 3.4 (a): until the restore's seed returns, P's processes, clone and HOME belong to the other incarnation.
+    // Refuse before any kill, settle, scan or reap; every caller reads a blocked proof as "not quiescent" and keeps what it holds.
+    // Callers reachable while the guard is armed (restorePredecessor is set from route selection to the seed's success):
+    //   covered here   retainStoppedSource (claim_fence, stale_claim, plan_revision_recovery_stopped, input_receipt_unconfirmed, the
+    //                  deferred terminal release) -> quiesceRun, so the claimFence and StaleClaimError arms stay effect-free;
+    //                  the shutdown arm's reapForSink -> quiesceOrBlockSink skips its body on the blocked proof; reportGenericFailure's
+    //                  terminal_retire and custody settles; the finally's terminal_retire; settleRetainedSwitch's quiesceRun.
+    //   permitted      the seed's own beforeSeed sweep (S's executor, explicit P-free targets).
+    //   covered else   settleForCredentialCapture and the credential switch: enterRetainedCredentialSwitch stops before settling
+    //                  (3.4 b); the finally's park reap and HOME teardown skip P's HOME (3.4 d, restoreUnsupportedHold).
+    //   unreachable    every site after the window: pause_park, iteration_park, wall_park, completion_hold, finalize, the milestone
+    //                  checkpoint and the tick, handleRecoveryExhausted's disk/transient/credential parks (their errors are not
+    //                  thrown by the route), the legacy recovery loop and the retained rehold (the route returns or stops before
+    //                  them), phaseClone's pre-clone HOME reap (after the retained branch returned).
+    if (this.touchesRestorePredecessor(flight, executor, opts)) {
+      flight.runLog.warn("run quiescence refused: the restore route's predecessor is untouchable", {
+        reason: "restore_predecessor_untouchable", site: opts.site });
+      if (!executor.safety) flight.evidenceJoinFailed = true;
+      return { outcome: {
+        process: { state: "unverified", processes: [], killed: [], detail: "restore_predecessor_untouchable" },
+        docker: { state: "not_wired", removed: [], detail: "restore_predecessor_untouchable" },
+      }, blocked: true };
+    }
     if (!MaintenanceBudget.current() && flight.cancellationBudget) {
       return this.runCancellationMaintenance(flight, () => this.quiesceRun(flight, executor, opts)).catch(() => ({ outcome: { process: { state: "unverified" as const, processes: [], killed: [], detail: "maintenance deadline exhausted" }, docker: { state: "not_wired" as const, removed: [], detail: "maintenance deadline exhausted" } }, blocked: true }));
     }
@@ -26269,6 +26324,13 @@ export class RunRunner {
     flight.retainedLocalCustody = true;
     flight.retainedEpisodeCustody = true;
     flight.keepGuardedInventoryOpen = true;
+    // issue #3644 plan 3.4 (b): the restore route's predecessor is another incarnation's until the seed returns, so no settlement
+    // (it reaps the flight's HOME-attributed processes, P's included), no release report: the run stays nonterminal and the
+    // switch is served by the next claim.
+    if (flight.restorePredecessor !== undefined) {
+      runLog.warn("retained credential switch deferred: the restore route's predecessor is untouchable until the successor is seeded");
+      return "stopped";
+    }
     const generation = flight.steering.pendingCredentialSwitch();
     const lifecycle = AbortSignal.any([flight.steering.terminalLifecycleSignal(), this.shutdownSignal.signal]);
     let disposition: "released" | "stopped" | "held" = "stopped";
@@ -27278,6 +27340,7 @@ export class RunRunner {
         featureNegotiated: this.client.hasFeature("recovery_completed_publication_v1"),
         authorityPresent: true,
       },
+      canonicalClonePath: this.git.runnerClonePath(bare, key),
     };
     const deps = this.restoreEligibilityDeps(authority, bare, false);
     const raw = route.raw;
@@ -27294,7 +27357,7 @@ export class RunRunner {
       outcome = { eligible: false, reason: "evaluation_failed", known: { detail: sanitizeForLog(errMessage(error)) } };
     }
     this.retainedLifecycleGuard(flight);
-    if (!outcome.eligible) return await this.refuseRestoreRoute(claim, flight, outcome.reason, outcome.known);
+    if (!outcome.eligible) return await this.refuseRestoreRoute(claim, flight, outcome.reason, outcome.known, outcome.unsupported);
     if (!this.independentRestore) {
       flight.runLog.info("independent restore eligible; seeding disabled for this runner instance", {
         verdict: outcome.verdict.boundary, pin_generation: outcome.verdict.generation, source_sha: outcome.verdict.pin.sourceSha,
@@ -27336,21 +27399,89 @@ export class RunRunner {
 
   /** The nonterminal refusal disposition of the restore route (plan 3.5): log the reason, put one bounded line on the feed, stop.
    *  Writes nothing of its own; a seed that already wrote reports the window it left behind. */
-  private async refuseRestoreRoute(claim: ClaimResponse, flight: RunFlight, reason: string, known: RestoreKnown): Promise<never> {
+  private async refuseRestoreRoute(claim: ClaimResponse, flight: RunFlight, reason: string, known: RestoreKnown,
+    unsupported?: RestoreUnsupported): Promise<never> {
     // Nothing has been written yet: an owner cancel already persisted server-side but not yet routed by steering is reported here.
     await this.observeCancelAtHeldSeam(claim, flight, "restore");
-    return this.stopRestoreRoute(claim, flight, reason, known);
+    // The owner hold is requested only for a classified unsupported predecessor, from a flight whose first `running` report
+    // came back `running`, on an api that advertises the cause. The ACK check keys on `status`, never `applied` (protocol.ts: a
+    // coerced-but-applied report would read true), and is redundant with the server's own fence on the park.
+    if (unsupported !== undefined && this.client.hasFeature(RETAINED_ADOPTION_FAILED_FEATURE) &&
+        Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0 && flight.runningAckStatus === "running")
+      return this.holdUnsupportedRestore(claim, flight, reason, known, unsupported);
+    return this.stopRestoreRoute(claim, flight, reason, known, undefined, unsupported);
+  }
+
+  private logRestoreRefused(claim: ClaimResponse, flight: RunFlight, reason: string, known: RestoreKnown,
+    left?: { window: string; step: string }, unsupported?: RestoreUnsupported): void {
+    flight.runLog.warn("independent restore refused; predecessor retained", {
+      reason, ...(unsupported === undefined ? {} : { unsupported }), slot: known.slot, crossCheck: known.crossCheck, verdict: known.verdict,
+      pinGeneration: known.pinGeneration, sourceSha: known.sourceSha, ...(known.detail === undefined ? {} : { detail: known.detail }),
+      ...(known.canonicalCandidate === undefined ? {} : { canonical_candidate: true }),
+      ...(left === undefined ? {} : { window: left.window, step: left.step }),
+      claim_generation: claim.claim_generation });
+  }
+
+  private emitRestoreRefusedLine(flight: RunFlight, reason: string): void {
+    flight.batcher.emit({ kind: "status", agent: "worker", payload: {
+      text: sanitizeForLog(flight.redactText(`independent restore refused (${reason}); the retained predecessor is kept and the run is not failed`), 240) } });
   }
 
   /** The refusal's log, feed line and nonterminal stop, without the cancel observation (used once a seed may have written). */
-  private stopRestoreRoute(claim: ClaimResponse, flight: RunFlight, reason: string, known: RestoreKnown, left?: { window: string; step: string }): never {
-    flight.runLog.warn("independent restore refused; predecessor retained", {
-      reason, slot: known.slot, crossCheck: known.crossCheck, verdict: known.verdict,
-      pinGeneration: known.pinGeneration, sourceSha: known.sourceSha, ...(known.detail === undefined ? {} : { detail: known.detail }),
-      ...(left === undefined ? {} : { window: left.window, step: left.step }),
-      claim_generation: claim.claim_generation });
-    flight.batcher.emit({ kind: "status", agent: "worker", payload: {
-      text: sanitizeForLog(flight.redactText(`independent restore refused (${reason}); the retained predecessor is kept and the run is not failed`), 240) } });
+  private stopRestoreRoute(claim: ClaimResponse, flight: RunFlight, reason: string, known: RestoreKnown, left?: { window: string; step: string },
+    unsupported?: RestoreUnsupported): never {
+    this.logRestoreRefused(claim, flight, reason, known, left, unsupported);
+    this.emitRestoreRefusedLine(flight, reason);
+    throw new RestoreRouteStop();
+  }
+
+  /**
+   * issue #3644 plan 3.3: an unsupported predecessor (canonical, hosted, or no boundary record) is a permanent refusal on this
+   * release, so the run is parked for its owner instead of requeueing into the same refusal. Mirrors
+   * {@link holdForPredecessorRemediation}: log the refusal, emit one conditionally worded guidance line and confirm its delivery
+   * BEFORE the park, then park at `recovery_wait` / `retained_recovery_adoption_failed`. Nothing is written to P's journal, slot,
+   * ledger, clone, HOME or provision, no blocker is recorded and nothing is reserved. Always ends in {@link RestoreRouteStop};
+   * a stale claim, a credential switch, a lost ownership and an owner Cancel propagate unchanged.
+   */
+  private async holdUnsupportedRestore(claim: ClaimResponse, flight: RunFlight, reason: string, known: RestoreKnown,
+    unsupported: RestoreUnsupported): Promise<never> {
+    this.logRestoreRefused(claim, flight, reason, known, undefined, unsupported);
+    flight.restoreUnsupportedHold = true;
+    const hostedRoll = unsupported === "hosted"
+      ? " An owner-held hosted run blocks this worker's image roll until you cancel or discard it." : "";
+    flight.batcher.emit({ kind: "status", agent: "worker", payload: { text: sanitizeForLog(flight.redactText(
+      `Independent continuation was refused before any source effect: this release does not support this predecessor (${unsupported}). ` +
+      "The predecessor's source and custody stay on this worker. The worker is requesting an owner hold; the run's status shows " +
+      "whether it was applied. If held, Resume claims again, will hold again unchanged on this release and adds at least one " +
+      "admission-counted custody hold (lost reports, crashes or worker re-registration can add more), and Cancel ends the run. " +
+      `If not held, automatic retries follow the ordinary requeue accounting.${hostedRoll}`), 1200) } });
+    try {
+      const delivered = await flight.batcher.flushOwned(
+        AbortSignal.any([this.retainedLifecycleSignal(flight), AbortSignal.timeout(GUIDANCE_FLUSH_MS)]));
+      if (!delivered) {
+        this.retainedLifecycleGuard(flight);
+        flight.runLog.warn("guidance_unconfirmed", { reason: "not_confirmed" });
+      }
+    } catch (error) {
+      this.retainedLifecycleGuard(flight);
+      flight.runLog.warn("guidance_unconfirmed", { reason: "flush_error", ...formatRetainedRecoveryDiagnostic(error, flight.redactText) });
+    }
+    this.retainedLifecycleGuard(flight);
+    let held = false;
+    try { held = await this.parkRetainedRecoveryExhausted(flight, "retained_recovery_adoption_failed"); }
+    catch (error) {
+      if (!(error instanceof RetainedRecoveryStop) || error instanceof RetainedRecoveryCancelled) throw error;
+    }
+    if (held) {
+      flight.runLog.info("restore unsupported predecessor held", { unsupported, claim_generation: claim.claim_generation });
+      throw new RestoreRouteStop();
+    }
+    // A 400 or an unresolved report: the guidance promised a conditional hold, so the item-7 line corrects it (best effort).
+    flight.runLog.warn("restore unsupported predecessor hold unconfirmed", { unsupported, claim_generation: claim.claim_generation });
+    this.emitRestoreRefusedLine(flight, reason);
+    try {
+      await flight.batcher.flushOwned(AbortSignal.any([this.retainedLifecycleSignal(flight), AbortSignal.timeout(GUIDANCE_FLUSH_MS)]));
+    } catch { /* best effort: the stop below is nonterminal either way */ }
     throw new RestoreRouteStop();
   }
 
@@ -27531,6 +27662,8 @@ export class RunRunner {
     flight.runnerClone = seeded;
     flight.restoreSeedNote = { captureId: verdict.pin.captureId, generation: verdict.generation, sourceSha: verdict.pin.sourceSha };
     flight.worktreePath = seeded.path;
+    // The flight names S from here on: P's guard (quiesceRun, the credential switch, the teardown) is released in the same breath.
+    flight.restorePredecessor = undefined;
     flight.branch = seeded.branch ?? branch;
     flight.attemptId = attemptId;
     flight.effectiveAttemptPaths = true;

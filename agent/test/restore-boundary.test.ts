@@ -348,8 +348,8 @@ describe("evaluateComposeRestore", () => {
       { selfLive: { slot: { ...slotS, hostname: "cdcdcdcdcdcd" }, crossCheck: "ok", execution: execS } as LiveBoundaryIdentity },
     ]) assert.deepEqual(await decide(over as never), { admit: false, reason: "self_record_invalid" });
   });
-  it("a missing predecessor record refuses and is never treated as clean", async () => {
-    assert.deepEqual(await decide({ pRecord: "missing" }), { admit: false, reason: "predecessor_record_missing" });
+  it("a missing predecessor record refuses, is never treated as clean, and is the missing_record unsupported class", async () => {
+    assert.deepEqual(await decide({ pRecord: "missing" }), { admit: false, reason: "predecessor_record_missing", unsupported: "missing_record" });
   });
   it("an invalid predecessor record, or one naming another incarnation, refuses", async () => {
     assert.deepEqual(await decide({ pRecord: "invalid" }), { admit: false, reason: "predecessor_record_invalid" });

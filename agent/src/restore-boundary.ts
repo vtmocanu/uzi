@@ -482,7 +482,10 @@ export interface RestoreVerdict {
   boot: "same_boot" | "different_boot";
 }
 
-export type RestoreDecision = { admit: true; verdict: RestoreVerdict } | { admit: false; reason: RestoreRefusal };
+/** The predecessor classes this release cannot restore from, set only where the route decides one (plan 3.2), never mapped from a reason. */
+export type RestoreUnsupported = "canonical" | "hosted" | "missing_record";
+
+export type RestoreDecision = { admit: true; verdict: RestoreVerdict } | { admit: false; reason: RestoreRefusal; unsupported?: RestoreUnsupported };
 
 export interface RestoreEvalInput {
   selfIncarnation: string;
@@ -514,19 +517,29 @@ function sameExecution(a: BoundaryExecution, b: BoundaryExecution): boolean {
   return a.nsDev === b.nsDev && a.nsIno === b.nsIno && a.initStartTicks === b.initStartTicks && a.bootId === b.bootId;
 }
 
+/** R1: S's record is valid and equals its live identity. Returns the record, or undefined when any part differs or could not be read.
+ *  The one comparison both {@link evaluateComposeRestore} and the route's hosted classification use. */
+export function selfRecordMatchingLive(
+  selfRead: BoundaryRead, selfLive: LiveBoundaryIdentity | undefined, selfIncarnation: string,
+): BoundaryRecord | undefined {
+  if (selfRead.state !== "ok" || selfLive === undefined) return undefined;
+  const s = selfRead.record;
+  if (s.incarnation !== selfIncarnation || s.crossCheck !== selfLive.crossCheck ||
+      !sameSlot(s.slot, selfLive.slot) || !sameExecution(s.execution, selfLive.execution)) return undefined;
+  return s;
+}
+
 /** R1-R6, R8, R9 of PRD #3644 6(d), compose only. Reads exactly P's boundary file; every uncertainty refuses. */
 export async function evaluateComposeRestore(input: RestoreEvalInput): Promise<RestoreDecision> {
-  const refuse = (reason: RestoreRefusal): RestoreDecision => ({ admit: false, reason });
-  // R1: S's record is valid and equals its live identity.
+  const refuse = (reason: RestoreRefusal, unsupported?: RestoreUnsupported): RestoreDecision =>
+    ({ admit: false, reason, ...(unsupported === undefined ? {} : { unsupported }) });
   if (input.selfLiveRefusal === "procfs_hidden") return refuse("procfs_hidden");
-  if (input.selfRead.state !== "ok" || input.selfLive === undefined) return refuse("self_record_invalid");
-  const s = input.selfRead.record;
-  if (s.incarnation !== input.selfIncarnation || s.crossCheck !== input.selfLive.crossCheck ||
-      !sameSlot(s.slot, input.selfLive.slot) || !sameExecution(s.execution, input.selfLive.execution)) return refuse("self_record_invalid");
+  const s = selfRecordMatchingLive(input.selfRead, input.selfLive, input.selfIncarnation);
+  if (s === undefined) return refuse("self_record_invalid");
   // R2/R3: exactly P's record, no fallback.
   const pInc = input.predecessor.owner.worker;
   const pRead = await input.readBoundary(pInc);
-  if (pRead.state === "missing") return refuse("predecessor_record_missing");
+  if (pRead.state === "missing") return refuse("predecessor_record_missing", "missing_record");
   if (pRead.state !== "ok" || pRead.record.incarnation !== pInc) return refuse("predecessor_record_invalid");
   const p = pRead.record;
   // R4: same compose slot, both cross-checked.
