@@ -46,7 +46,9 @@
   // go runs the existing real sanitizer helper for the opt-in offline evaluator.
   // `setpriv` (util-linux) is run ONLY by test/retained-source-channel.test.ts to connect to the
   // retained-source socket as the runner uids (a root-only case that skips otherwise).
-  "ignoreBinaries": ["mkfifo", "openssl", "task", "go", "setpriv"],
+  // `flock` is a system kernel-lock utility used by the real A-lock probe in
+  // test/authority-crash-proofs.test.ts, not an npm binary; a missing executable fails the test.
+  "ignoreBinaries": ["mkfifo", "openssl", "task", "go", "setpriv", "flock"],
 
   // The confinement probe and the standalone editor and code cross-check replay evaluators are opt-in entries. The operator
   // retained-source client is executed by path inside the image (`node /app/src/ops/retained-source.mjs`,

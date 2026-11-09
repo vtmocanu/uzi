@@ -25,7 +25,7 @@ import { launchCodexRoot, launchCodexEffectRoot, CODEX_BIN, SUPERVISOR_BIN, PROV
 import { prepareCodexRunHome, buildAppServerRefreshBridge } from "./codex-executor.js";
 
 type CrossCheckMalformedSubreason = "invalid_json" | "verdict_schema" | "finding_schema" | "findings_cap" | "code_findings" | "result_cap" | "unknown"
- | "foreign_item" | "delta_after_completion" | "invalid_item_identity" | "stream_cap" | "completion_invalid" | "stream_mismatch" | "invalid_phase";
+ | "foreign_item" | "delta_after_completion" | "invalid_item_identity" | "stream_cap" | "completion_invalid" | "stream_mismatch" | "invalid_phase" | "structured_output_retries";
 
 export class CrossCheckMalformedError extends Error {
  constructor(message: string, readonly subreason?: CrossCheckMalformedSubreason) {
@@ -91,6 +91,7 @@ Enumerate acceptance criteria from the issue, approved plan and frozen approved_
 Every criterion finding, informational ones included, must start its title with Requirement gap: for missing or partly delivered criteria, or Coverage uncertainty: for verification that cannot be done here. Defect titles must never use either prefix.
 Use the most relevant code path or PRD/plan source path; use line 0 when no line applies.
 Hosted, live or maintainer-only verification gets a minor Coverage uncertainty: finding. Missing worker-deliverable implementation or regression tests are criterion findings graded by impact.
+Results of the worker's own command runs (gate, build, lint, test, red/green and mutation runs, and their logs) are not supplied and cannot be produced here; their absence alone is neither a defect nor a criterion finding, and run results claimed in committed text or the plan are unverified claims, not evidence. A criterion that itself requires a run result gets a minor Coverage uncertainty: finding. Judge tests and validation from the committed code.
 A missing requirement stated by the issue as a safety, security or data-integrity constraint is a critical or major defect, with neither prefix.
 Evaluate environment overrides by their actual effects, including inherited child processes. Describe the effects on which the change or validation depends.
 Flag overrides that skip, select, narrow or otherwise weaken required validation, or violate an applicable explicit restriction.
@@ -135,6 +136,42 @@ export function codeCrossCheckBriefWithGuidance(tools: string, guidance: string)
  const nonce = randomBytes(16).toString("hex");
  return `${locked}\n\n${OWNER_GUIDANCE_LABEL}\n<owner_guidance_${nonce}>\n${guidance}\n</owner_guidance_${nonce}>`;
 }
+
+/**
+ * JSON Schema for the Claude checker's structured code verdict. It mirrors validateCodeVerdict
+ * and decodeCodeFindings as a model retry aid only and is never stricter than them: a character
+ * maxLength is at most the validators' byte caps, and the 32 KiB byte totals, unique ids and the
+ * coverage caps stay validator-only. Coverage is deliberately unconstrained because the validator
+ * accepts any coverage value and normalizeCodeCoverage degrades a bad one. The intended shape is
+ * an array of {path, status: examined|excluded|unassessed, reason}.
+ */
+export const CODE_VERDICT_SCHEMA = {
+ type: "object",
+ additionalProperties: false,
+ required: ["findings"],
+ properties: {
+  findings: {
+   type: "array",
+   maxItems: 20,
+   items: {
+    type: "object",
+    additionalProperties: false,
+    required: ["id", "severity", "path", "line", "title", "detail"],
+    properties: {
+     id: { type: "string", pattern: "^[A-Za-z0-9_-]{1,64}$" },
+     severity: { type: "string", enum: ["critical", "major", "minor"] },
+     path: { type: "string", maxLength: 2048 },
+     line: { type: "integer", minimum: 0, maximum: 2147483647 },
+     title: { type: "string", maxLength: 2048 },
+     detail: { type: "string", maxLength: 2048 },
+    },
+   },
+  },
+  coverage: {
+   description: "Optional coverage report: an array of {path, status: examined|excluded|unassessed, reason}.",
+  },
+ },
+} as const;
 
 /** Parse the complete bounded code output, shared by both native checker families. */
 export function validateCodeVerdict(text: string): { findings: ReturnType<typeof decodeCodeFindings>; coverage: unknown } {
@@ -641,6 +678,36 @@ function hasOutput(usage: CodexThreadTokenUsage): boolean {
  return usage.total.outputTokens > 0 || usage.total.reasoningOutputTokens > 0
   || usage.last.outputTokens > 0 || usage.last.reasoningOutputTokens > 0;
 }
+
+/**
+ * JSON Schema for the Claude checker's structured plan verdict. It mirrors validateVerdict as a
+ * model retry aid only and is never stricter than it: a character maxLength is at most the
+ * validator's byte caps, and the per-item and total byte caps stay validator-only.
+ */
+export const PLAN_VERDICT_SCHEMA = {
+ type: "object",
+ additionalProperties: false,
+ required: ["verdict", "summary", "items"],
+ properties: {
+  verdict: { type: "string", enum: ["approve", "revise", "block"] },
+  summary: { type: "string", maxLength: 4096 },
+  items: {
+   type: "array",
+   maxItems: 20,
+   items: {
+    type: "object",
+    additionalProperties: false,
+    required: ["file", "severity", "summary", "rationale"],
+    properties: {
+     file: { type: "string", maxLength: 2048 },
+     severity: { type: "string", enum: ["info", "warning", "error"] },
+     summary: { type: "string", maxLength: 2048 },
+     rationale: { type: "string", maxLength: 2048 },
+    },
+   },
+  },
+ },
+} as const;
 
 // Parse the entire assistant item; the ordinary lead tail parser is intentionally
 // absent here. The server repeats its validation before storing a verdict.

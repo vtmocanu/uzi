@@ -770,8 +770,9 @@ tasks:
     # recipes are defined once, in this file). They are invoked as EXTRA SCRIPT
     # LINES of the four existing per-toolchain jobs -- `lint:api`,
     # `lint:controller`, `validate:web`, `validate:agent` -- exactly the way
-    # `deadcode:api` is already a second script line inside the `lint:api` job. No
-    # new CI job, so no `.gate_needs` / `.publish_needs` edit.
+    # `deadcode:api` was a second script line inside the `lint:api` job until #4109
+    # moved it to the nightly deadcode-nightly.yml workflow. The vulncheck targets
+    # add no new CI job, so no `.gate_needs` / `.publish_needs` edit.
     #
     # 🔴 AND `lint:api` NAMES BOTH A CI JOB AND A TASKFILE TARGET. That ambiguity
     # is the trap here: the Taskfile target `lint:api` IS reachable from `task
@@ -1183,9 +1184,10 @@ tasks:
         done
 
   test:forge-fake:
-    desc: offline HTTPS issue-comment and bot-author contracts for the shared forge fake
+    desc: offline HTTPS issue-comment, bot-author and per-iid MR/PR GET contracts for the shared forge fake
     cmds:
       - env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node --test e2e/forge-fake/issue-comments.test.mjs
+      - env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node --test e2e/forge-fake/mr-get.test.mjs
 
   test:forge-fake-contract:
     desc: offline production Go and worker forge operation contracts over real HTTPS
@@ -1594,9 +1596,10 @@ tasks:
     # to catch quoting/word-splitting differences; print a bash-only note if absent.
     # Local zsh verification is required when editing these workstation snippets.
     # No forge reads: the regression mocks gh and exercises SKILL.md's real pipelines.
-    desc: reject terminal-control and bidi bytes in issue-triage renderers
+    desc: reject terminal-control and bidi bytes in issue-triage renderers; offline external-activity collector regression
     cmds:
       - python3 -B .agents/skills/issue-triage/scripts/test-rendering.py
+      - python3 -B .agents/skills/issue-triage/scripts/test-external-activity.py
 
   check:skill-size:
     desc: no repo skill's SKILL.md exceeds the 65536-byte runtime cap (over-cap skills are dropped silently at run time), with a canary proving the detector fired
@@ -2199,7 +2202,7 @@ tasks:
       # contention.
       #
       # GOMEMLIMIT=12GiB (issue #3433). GitHub-hosted lint-api runners were
-      # killed during this step. Comment [3] on the issue measured the runner at
+      # killed during this step (it runs in deadcode-nightly.yml since #4109). Comment [3] on the issue measured the runner at
       # 16.76 GB total and 14.78 GB available at step start, with a 15.64 GB peak
       # RSS: 0.86 GB above the available memory and 1.1 GB below the total.
       #

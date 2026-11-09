@@ -52,10 +52,19 @@ import type {
   Card,
   ChatListResponse,
   CliAuthRequestMeta,
+  AccountResetLink,
+  ResetLinkPreview,
+  ResetLinkPreviewRequest,
+  ResetLinkRedeemRequest,
   OAuthAuthorizeRequest,
   OAuthConnection,
   AdminOAuthConnection,
   OAuthRedirect,
+  EffectiveSettings,
+  ScheduleSettingsPreview,
+  ScheduleSettingsPreviewRequest,
+  StartPreview,
+  StartPreviewRequest,
   CliToken,
   CliTokenMint,
   CliTokenScope,
@@ -822,6 +831,12 @@ const realApi = {
   vaultDisable: () => request<VaultDisableResponse>("POST", "/vault/disable"),
   getMySettings: (passive = false) =>
     request<{ settings: UserSettings }>("GET", "/me/settings", undefined, passive ? { "X-Uzi-Passive": "1" } : undefined),
+  // PRD #3254: what model, effort and harness a run would use, and what a start choice resolves to.
+  getEffectiveSettings: () => request<EffectiveSettings>("GET", "/me/effective-settings"),
+  previewStartSettings: (body: StartPreviewRequest) =>
+    request<StartPreview>("POST", "/me/effective-settings/start-preview", body),
+  previewScheduleSettings: (body: ScheduleSettingsPreviewRequest) =>
+    request<ScheduleSettingsPreview>("POST", "/me/effective-settings/schedule-preview", body),
   setHarnessOverflow: (enabled: boolean) =>
     request<{ harness_overflow_enabled: boolean }>("PUT", "/me/harness-overflow", {
       harness_overflow_enabled: enabled,
@@ -2098,6 +2113,21 @@ const realApi = {
     request<{ status: string }>("POST", "/auth/cli/deny", {
       request_id: requestId,
     }),
+
+  // ── Admin-issued account reset link (PRD #3989) ────────────────────────────
+  // Issue is a cookie-only admin CSRF write (201, the plaintext token once). Preview and
+  // redeem are unauthenticated and carry the token ONLY in the POST body, never in the
+  // path or a query, so it stays out of access logs and Referer (D9). Redeem is a 204.
+  createResetLink: (id: string) =>
+    request<AccountResetLink>("POST", `/admin/users/${encodeURIComponent(id)}/reset-link`),
+  previewReset: (token: string) =>
+    request<ResetLinkPreview>("POST", "/auth/reset/preview", { token } satisfies ResetLinkPreviewRequest),
+  redeemReset: (token: string, password?: string) =>
+    request<null>(
+      "POST",
+      "/auth/reset/redeem",
+      (password === undefined ? { token } : { token, password }) satisfies ResetLinkRedeemRequest,
+    ),
 
   // ── OAuth consent flow (PRD #1910 M2) ──────────────────────────────────────
   // The `/connect` page's three calls, all cookie-session reads/writes (the POSTs carry CSRF)

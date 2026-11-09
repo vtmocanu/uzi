@@ -5,7 +5,9 @@
 // the existing seams (parkLabel, parkDisposition), so no second rule lives here.
 
 import { isTerminalRun, type RunSummaryItem } from "./api";
+import { planCrossCheckGateLabel } from "./crossCheckGate";
 import { openPrs, parkDisposition } from "./overview";
+import type { AdminRunsState } from "./useOverviewData";
 import { isAccountCooldownWaiting, isPlanningRun, isRevisingRun, parkLabel } from "./runBadge";
 import { runKindLabel } from "./runKind";
 import { stripUnsafeChars } from "./safeText";
@@ -29,6 +31,8 @@ export type LineStage = Exclude<IssueStage, "pr" | "none">;
 // so a finished job or task never reaches "other", and a run in a status this list does not
 // name falls through to "building" rather than dropping off the line.
 export function issueLineStage(run: RunSummaryItem, openPrIds: ReadonlySet<string>): IssueStage {
+  // The server lists exclude checker children; this keeps them off the line even if one leaked.
+  if (run.kind === "cross_check") return "none";
   if (isTerminalRun(run.status)) return openPrIds.has(run.id) ? "pr" : "none";
   if (run.kind !== "issue") return "other";
   // Before the status rules: a cooldown run can be claimed, running or awaiting approval,
@@ -91,6 +95,32 @@ export function runRef(run: Pick<RunSummaryItem, "issue_iid" | "kind">): string 
   return run.issue_iid != null ? `#${run.issue_iid}` : stripUnsafeChars(runKindLabel(run.kind));
 }
 
+export interface CrossCheckTag {
+  text: string;
+  tone: "check" | "warn" | "danger";
+  title: string;
+}
+
+// The small tag a run's chip carries when a cross-check is live or has gated the plan
+// review. At the review stage a recorded gate reason wins; otherwise the live-check field
+// decides. An absent field (older API) or no reason gives no tag.
+export function crossCheckTag(run: RunSummaryItem, stage: IssueStage): CrossCheckTag | null {
+  const reason = run.plan_cross_check_gate_reason;
+  if (stage === "review" && typeof reason === "string" && reason !== "") {
+    const title = planCrossCheckGateLabel(reason);
+    if (reason === "revise" || reason === "revisions_exhausted") return { text: "cross-check: revise", tone: "warn", title };
+    if (reason === "block") return { text: "cross-check: blocked", tone: "danger", title };
+    return { text: "cross-check: unavailable", tone: "warn", title };
+  }
+  if (run.cross_check_active === "plan") {
+    return { text: "cross-checking", tone: "check", title: "Plan cross-check in progress" };
+  }
+  if (run.cross_check_active === "code") {
+    return { text: "cross-checking", tone: "check", title: "Code cross-check in progress (advisory, does not block)" };
+  }
+  return null;
+}
+
 // Why a parked run waits, in the words the status pill uses.
 function parkedReason(run: RunSummaryItem): string {
   return isAccountCooldownWaiting(run) ? "account cooldown" : stripUnsafeChars(parkLabel(run));
@@ -143,6 +173,31 @@ function parkedCaptions(list: LineEntry[]): { sub: string; reason: string | null
   const distinct = [...new Set(list.map((e) => parkedReason(e.run)))];
   const shown = distinct.slice(0, 3).join(", ");
   return { sub, reason: distinct.length > 3 ? `${shown}, +${distinct.length - 3} more` : shown };
+}
+
+// The scope the Issue work card draws with (#4052). "all" only for an admin whose list of
+// every user's runs is readable and who chose it; otherwise the viewer's own runs.
+export type IssueWorkScope = "you" | "all";
+
+export function issueWorkScope(input: {
+  isAdmin: boolean;
+  adminRuns: Pick<AdminRunsState, "runs" | "failed">;
+  chosen: IssueWorkScope;
+}): IssueWorkScope {
+  const { isAdmin, adminRuns, chosen } = input;
+  return isAdmin && adminRuns.runs != null && !adminRuns.failed && chosen === "all" ? "all" : "you";
+}
+
+// Other users' active runs on the line: none under "you"; under "all" the Runs widget's
+// "Other users" population (not the viewer's, not terminal).
+export function issueLineOtherRuns(input: {
+  scope: IssueWorkScope;
+  adminRuns: Pick<AdminRunsState, "runs">;
+  viewerEmail: string;
+}): RunSummaryItem[] {
+  const { scope, adminRuns, viewerEmail } = input;
+  if (scope !== "all") return [];
+  return (adminRuns.runs ?? []).filter((r) => r.owner_email !== viewerEmail && !isTerminalRun(r.status));
 }
 
 // `ownRuns` is the viewer's full own list (terminal rows included, for the PR station).

@@ -160,10 +160,20 @@ func TestSettingsGetHostileTextAndBounds(t *testing.T) {
 
 func TestSettingsGetTokenGET(t *testing.T) {
 	token := "uzc_" + "test-settings"
-	requests := 0
+	requests, effectiveRequests := 0, 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/version" {
 			_, _ = w.Write([]byte("{}"))
+			return
+		}
+		if r.URL.Path == "/api/me/effective-settings" {
+			// A server that predates the effective view answers 404; the read must still succeed.
+			effectiveRequests++
+			if r.Method != http.MethodGet || r.Header.Get("Authorization") != "Bearer "+token {
+				t.Errorf("unexpected effective-settings request: %s auth=%q", r.Method, r.Header.Get("Authorization"))
+			}
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":"not found"}`))
 			return
 		}
 		requests++
@@ -182,8 +192,11 @@ func TestSettingsGetTokenGET(t *testing.T) {
 	if code := Main(env, []string{"settings", "get", "--json"}); code != 0 {
 		t.Fatalf("exit %d: %s", code, stderr.String())
 	}
-	if requests != 1 || !strings.Contains(out.String(), `"resolved_model": null`) {
-		t.Fatalf("requests=%d, output=%s", requests, out.String())
+	if requests != 1 || effectiveRequests != 1 || !strings.Contains(out.String(), `"resolved_model": null`) || !strings.Contains(out.String(), `"effective": null`) {
+		t.Fatalf("requests=%d effective=%d, output=%s", requests, effectiveRequests, out.String())
+	}
+	if !strings.Contains(stderr.String(), "Effective settings: not available on this server") {
+		t.Fatalf("stderr = %q", stderr.String())
 	}
 }
 

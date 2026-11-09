@@ -331,8 +331,8 @@ drain and recycle nix/data, losing everything on `/data`. After the fixed #3852
 controller deploys, hosted Docker workers keep their data PVC: explicit nix
 pressure permits nix-only recycle; other causes defer with
 `disk-recycle-skipped-docker-data`. A full Docker data volume therefore relies
-on the run's park-and-trim and supported manual cleanup until #3431 M1b and
-#3329's idle roll land. Use the inspect/discard procedures in
+on the run's park-and-trim and supported manual cleanup until #3431 M1b
+deletion is activated and #3329's idle roll lands. Use the inspect/discard procedures in
 [Run recovery](run-recovery.md#retained-sources-with-no-open-hold-worker-local-inspect-and-discard),
 or enlarge the PVC where the StorageClass allows it; do not delete the PVC or
 pod by hand to free space. These worker-local mechanisms do not recycle `/nix`.
@@ -599,8 +599,9 @@ The one exception is on the Claude run lane: `Read` may open a file directly
 inside that run's own SDK tool-result spill directory (the "Output too large ...
 Full output saved to" file); Write, Edit, Glob, Grep and the other lanes keep the
 worktree-only rule (see [ADR 2332](../adr/2332-sdk-spill-read-allowance.md)).
-The read-only Plan cross-check Claude checker (for a Codex lead) is stricter:
-`Read`, `Grep` and `Glob` only, with one path guard that confines them to its
+The read-only Claude Plan and Code cross-checker (for a Codex lead) is stricter:
+`Read`, `Grep` and `Glob` only (plus the SDK's end-turn `StructuredOutput`
+tool, which carries only its final verdict and touches no files), with one path guard that confines them to its
 own checkout, apart from its own SDK spill files under its home. It also denies
 absolute, home-relative and `..` Glob/Grep patterns as defense in depth; the
 runner uid it runs as is the boundary, not that pattern check. See

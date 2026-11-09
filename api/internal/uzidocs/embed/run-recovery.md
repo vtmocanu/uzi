@@ -313,7 +313,9 @@ durable authority and is otherwise retained, for both harnesses (see
 [Completed sources after a worker restart](#completed-sources-after-a-worker-restart)).
 Registered-root capture exclusion does not exclude daemon or sibling writers,
 accepted-but-invisible creates (#1860), or Claude terminal residuals; per-attempt
-cgroup proof (#1862) remains unshipped. Automatic reclaim remains disabled (#1858),
+cgroup proof (#1862) remains unshipped. Automatic reclaim remains disabled (#1858;
+the one gated exception, verified-epoch deletion under PRD #3431, is off in
+production, see [Verified-epoch reclaim](#verified-epoch-reclaim-prd-3431)),
 and custody SETTLE and physical CLEANUP remain separate (#2746).
 Failed or uncertain capture keeps local source custody; there is no archive or
 latest-work guarantee, and loss of that worker's retained storage can lose
@@ -581,7 +583,9 @@ reservation count. Owner Resume of `worker_requeue_exhausted` and bounded
 `retained_recovery_exhausted` retries can also renew: a fresh generation and
 higher derived episode charge one of three reservations in a new five-minute
 window and clear only `budget_exhausted`. The default three timed parks are
-followed by an owner hold; Resume preserves that count. Timer promotion resets
+followed by an owner hold; Resume preserves that count. A window refused
+only for data-volume capacity is held for the owner without consuming a counted retained park.
+Timer promotion resets
 the run wall, while manual Resume preserves remaining wall budget and may need
 an owner extension. Other requeues, disk retries, memory-pressure Resume or a
 new claim alone do not renew. See
@@ -609,6 +613,21 @@ execution remain required, including an exact `ready-for-model` handoff. See
 [Retained recovery adoption failed](./run-recovery-wait.md#retained-recovery-adoption-failed)
 and the [ADR-1197 #3527 amendment](../adr/1197-transient-recovery-park.md#amendment-2026-10-27-3527-owner-held-retained-adoption-retry).
 
+An owner **Pause now** delivered while a retained re-claim is recovering
+(`recoverRetainedClaim`, before any model turn) is only recorded, like a pause
+pending at claim time; it no longer stops recovery. A successful park spends
+no requeue; a refused park (`pause_failed`) still leaves the run for the normal
+requeue path. When
+recovery returns and no stronger control (cancel, credential switch, wall,
+fence, worker shutdown) is pending, the run parks through the ordinary
+checkpoint-first owner pause, before any planning turn or provider call. If
+recovery fails or holds first, that outcome wins and a `recovery_wait` hold
+leaves the request pending. A publication-only retained claim keeps its
+immediate stop. When recovery is stopped, the worker's HOME-preservation log
+says "retained recovery stopped" (naming a pending owner pause) instead of
+"run interrupted by worker shutdown". See the
+[ADR-1190 #3995 amendment](../adr/1190-run-pause-invariants.md#amendment-2026-11-06--3995-owner-pause-during-retained-recovery).
+
 Other permanent blockers, or exhaustion without both durable journal confirmation
 and API support, end the run **failed** with custody kept,
 without automatic reclaim or failed-run Resume. The reason names the
@@ -628,7 +647,8 @@ usage (and the projected usage when it was computed). The refusal is not a disk
 park and spends one of the same three reservations; the worker runs one reclaim
 pass and re-checks before refusing. If the volume stays full, the iterations end
 in the existing retained-recovery park, whose automatic retries stop for owner
-Resume once the retained-park allowance is spent. The
+Resume once the retained-park allowance is spent, or at once, uncounted, when
+every reservation in the window was refused for data volume capacity. The
 projection is an estimate and applies only when the API supports both the disk
 and retained-recovery park causes. The check has no off switch: setting
 `UZI_DISK_HARD_STOP_ENABLED=false` disables the hard governor's stops but not
@@ -1354,7 +1374,9 @@ disk parks can compound retained storage (#2013/#225). The retention-only,
 non-closing #1858 change disables unsafe automatic retention reclaim on every
 worker, including abandoned attempts and crash-window live orphans, shared
 own-key residue from canonical and attempt entries, and orphaned skills.
-There is no automatic reclaim escape from that accumulation.
+There is no automatic reclaim escape from that accumulation in production: the
+verified-epoch deletion code exists but is switched off (see
+[Verified-epoch reclaim](#verified-epoch-reclaim-prd-3431)).
 
 **Slice A contract (Refs #2852) (AI-synced 2026-10-22):** credential-free capture, including owner pause,
 keeps execution closed without changing these retention rules. With proven cleanup,
@@ -2176,6 +2198,7 @@ owner/path pair changed or the re-admission bound of 2 was passed),
 `completion_pending`, `completion_preflight_retained`, `completion_uncertain`,
 `authority_busy` (the authority lock wait ran out), `published_source_retained`
 (a fenced journal with retained sources was kept, never detached),
+`remediation_retained` (the predecessor's source is held under secret-scan remediation; see below),
 `completion_unverified`, `completion_unsupported`, or `unknown`. It carries no
 error text or paths. IDs are UUID strings
 or `invalid`; path shape is `canonical`, `attempt`, or `unknown`. The fingerprint
@@ -2193,6 +2216,22 @@ it does not establish the cause of the historical refusal in
 lacked the deployed worker revision, classification request status, and
 underlying retirement error.
 
+A successor run can reclaim an orphaned attempt whose predecessor is terminal (for example
+cancelled) while the predecessor's source is held under secret-scan remediation. The worker then
+does not start the agent and touches nothing of the predecessor. It emits `orphan_reclaim_refused`
+with `remediation_retained`, sends a status message naming only the predecessor run id, and parks the
+run for you at `recovery_wait` / `retained_recovery_adoption_failed`. The message says the agent did not
+start and the source requires review. **Resume** on this worker holds again and adds at least one
+admission-counted custody hold; **Cancel** ends the run and leaves its open holds for you to discard.
+Run `uzi run recovery <predecessor-run-id>` to inspect the predecessor. Resume grants no remediation
+authority, and this page names no route that disposes of the remediation. While held or queued, the
+run's holds count toward your [custody admission limit](admin-settings.md) (`custody_hold_limit`), and a
+held run blocks its worker's upgrade or drain. If the api does not support the park, the worker does not
+park and the message says so; the run is then handled by the ordinary requeue paths. A worker restart
+consumes a requeue, so repeated restarts end at `recovery_wait` / `worker_requeue_exhausted`,
+unless the run's own open holds reach the custody admission limit first; it then stays queued for
+capacity (not an owner park) until it can be claimed again.
+
 ### Retained sources with no open hold (worker-local inspect and discard)
 
 A retained source can outlive its server hold: the hold was released or discarded,
@@ -2202,7 +2241,9 @@ show or discard it. The worker exposes a small operator channel for exactly this
 a read-only **inspect** and a guarded **discard**, run on the worker itself.
 
 Automatic retention reclaim is disabled on every worker (Refs #1858,
-retention-only and non-closing). Attributed attempts and their paired skills may
+retention-only and non-closing); the gated verified-epoch deletion of PRD #3431
+is the one coded exception and is off in production (see
+[Verified-epoch reclaim](#verified-epoch-reclaim-prd-3431)). Attributed attempts and their paired skills may
 use this existing retained-source discard route, subject to all its checks.
 Shared residue (`.uzi-residue-*`) and orphaned skills have **no supported generic
 reclaim route**. API custody discard alone is not local writer-exclusion proof.
@@ -2415,6 +2456,64 @@ remains.
 > namespace from `UZI_WORKER_NS` (which lists namespaces, not pods) unless you have verified
 > that namespace holds no source a tracked run needs: excluding it hides those sources from
 > the search, so their work is no longer backed up and the backup could read green without it.
+
+#### Verified-epoch reclaim (PRD #3431)
+
+On a hosted Docker worker, a fresh pod can evaluate retained attempt trees at a
+verified pod epoch, under the exclusive epoch lock and before it admits runs
+(see [Pod-epoch shadow reclaim](./worker-docker.md#pod-epoch-shadow-reclaim)).
+The evaluation is reported in the `pod_epoch_reclaim` log line. The worker image
+also contains a deletion phase that reclaims through the same discard core as the
+operator channel above. **That phase is gated off: `EPOCH_RECLAIM_DELETION_ENABLED`
+is `false`, so a production worker deletes nothing and settles no records.**
+Enabling it needs a separate owner decision on the re-measured numbers in
+[PRD #3431](../prds/3431-pod-epoch-reclaim.md); this guide does not describe it as
+available. Hosted deletion acceptance, the later idle-gated roll (#3329) and the
+Compose and plain lanes (#3709, #3710) are not shipped.
+
+If the phase is enabled, it runs only for an `eligible` and `attested` pass, one
+source at a time, and keeps everything else:
+
+- It needs a fresh positive terminal lifecycle and a recovery-holds response with
+  a run-wide `run_open_holds` count of 0 for the exact run. A worker advertises
+  `recovery_run_open_holds_v1` for this; an absent, mismatched or non-zero count
+  keeps the source. The server reads the predecessor's capabilities, so the first
+  roll onto an image that advertises it keeps every tree. A definitive ownership
+  404 keeps only that run's sources.
+- Only an attempt source is admitted, in one of three shapes: the exact strict
+  three-key journal (`runId`, `clonePath`, `attemptId`) with the ledger live;
+  the same journal with the ledger `retired` and the footprint missing; or the
+  explicitly valued empty journal (`[""]`) with the ledger `retired` and the
+  footprint missing (the exact repair, metadata only). A canonical source, a
+  source with no journal keys and a protected source are kept
+  (`kept_unrecoverable_shape`, `kept_protected`). The ledger `reclaimed` and
+  `abandoned` states are not admitted; only an operator discard disposes of
+  them.
+- Automatic content proof has finite budgets (metadata 16 MiB, worktree content
+  512 MiB, 4 GiB per object-store snapshot, 131,072 metadata records, 16,384
+  directory entries). A positively observed content or post-classification
+  worktree overflow keeps only that source (`epoch_content_unproven`). A limit
+  reached while classifying object topology or another indirection-bearing input
+  is unknown; during admitted deletion it stops the epoch scope, retains the
+  exclusive lock and refuses run admission. An unreadable store, an alternate
+  outside the clone's own or managed bare object stores, a promisor remote, a
+  config include, or a redirected `.git` stops the epoch scope as unknown instead. The managed
+  bare alternate used by a shared clone is admitted.
+- The `pod_epoch_reclaim` verdict adds `deleted`, `deleted_bytes`, `settled`,
+  `kept_after_refusal`, `kept_residue`, `kept_protected`,
+  `kept_unrecoverable_shape`, `source_use_not_ended` and `reclaim_bytes_state`,
+  and the reasons `reclaim_complete` and `reclaim_partial`. `deleted_bytes` sums
+  only trees positively removed; a missing tree is counted in `settled` with no
+  bytes.
+- An unknown outcome, a pending child, the stop latch, an unsettled delete or a
+  throwing finish keeps the epoch lock and exits non-zero rather than admitting.
+
+Crash scope is process crashes only; no storage or power-loss durability is
+claimed. A residue failure leaves the slot `retiring` with a `settled_failed`
+pending record, which the next epoch retakes. A crash inside or after the
+destructive-record save and before its settle leaves the slot `retiring` with a
+`running` pending record. That source is kept and not recovered automatically:
+this is a stated residual, and no automatic path clears it.
 
 #### Resolving guarded local records
 

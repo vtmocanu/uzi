@@ -26,6 +26,13 @@ if ! type _psql_strip_tags >/dev/null 2>&1; then
   exit 1
 fi
 
+# The real capture_agent_logs (#4060), defined up front: phase code extracted by later cases now contains
+# capture lines. Later cases provide RUNROOT/COMPOSE; the handoff fixture relies on the exported
+# RUNROOT=$SEQ_DIR to find its snapshots. Without them the helper only reports to stderr and returns 0.
+eval "$(awk '/^capture_agent_logs\(\) \{/,/^\}/' "$LIB")"
+CAL_DEFINED=yes
+type capture_agent_logs >/dev/null 2>&1 || CAL_DEFINED=no
+
 cases=0
 passed=0
 # check NAME INPUT EXPECT — INPUT is a printf %b format (so \n and \r are real), piped through the
@@ -82,6 +89,131 @@ fi
 mkdir -p "$ROOT/.uzi/scratch"
 SEQ_DIR="$(mktemp -d "$ROOT/.uzi/scratch/e2e-lib.XXXXXX")"
 trap 'rm -rf "$SEQ_DIR"' EXIT
+
+# Run the real phase prefixes in fresh errexit-enabled shells. Force an early
+# assertion failure after mutation, as happened before the first binding claim.
+# The fake API persists state outside command-substitution subshells.
+cat > "$SEQ_DIR/harness-state.sh" <<'HARNESS'
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$1" STATE="$2" SCENARIO="$3" ORIGINAL="$4"
+BASE=http://fixture JAR=fixture DUMMY_ANTHROPIC=different
+COMPOSE=(true)
+say() { :; }; pass() { :; }; login() { :; }; wait_custody_headroom() { :; }; capture_agent_logs() { :; }
+fail() { echo "$*" >&2; exit 17; }; csrf() { echo fixture; }
+eval "$(awk '/^synthetic_issue_worker_capabilities\(\) \{/,/^\}/; /^set_owner_autopilot\(\) \{/,/^\}/' "$ROOT/e2e/lib.sh")"
+apiget() {
+  case "$1" in
+    /api/auth/me) jq -cn --argjson value "$ORIGINAL" '{user:{autopilot_enabled:$value}}' ;;
+    /api/forge/connections) echo '{"connections":[{"id":"connection","human_username":"owner-alice"}]}' ;;
+    /api/forge/connections/connection/projects) echo '{"repos":[{"id":"repo2","path_with_namespace":"group/repo2"}]}' ;;
+    /api/me/secrets)
+      if [ -f "$STATE/token" ]; then
+        echo '{"secrets":[{"id":"11111111-1111-4111-8111-111111111111","kind":"anthropic_token","label":"default","is_default":true},{"id":"22222222-2222-4222-8222-222222222222","kind":"anthropic_token","label":"console-key","is_default":false}]}'
+      else echo '{"secrets":[{"kind":"anthropic_token","label":"default","is_default":true}]}'; fi ;;
+    *) return 1 ;;
+  esac
+}
+apiput() {
+  case "$1" in
+    /api/forge/connections/connection) echo '{"warning":"fixture"}' ;;
+    /api/me/autopilot)
+      value="$(printf '%s' "$2" | jq -r '.enabled')"
+      if [ "$SCENARIO" = autopilot-cleanup-fail ] && [ "$value" = false ]; then return 1; fi
+      printf '%s\n' "$value" > "$STATE/autopilot"
+      jq -cn --argjson value "$value" '{user:{autopilot_enabled:$value}}' ;;
+    /api/repos/repo2) echo 'repo enabled' >> "$STATE/events"; echo '{"repo":{"enabled":true}}' ;;
+    *) return 1 ;;
+  esac
+}
+apipost() {
+  case "$1" in
+    /api/me/secrets/anthropic_token) touch "$STATE/token"; echo '{}' ;;
+    /api/workers) echo '{"worker":{"id":"worker"},"token":"fixture"}' ;;
+    *) return 1 ;;
+  esac
+}
+curl() {
+  local payload='' arg
+  while [ "$#" -gt 0 ]; do
+    arg="$1"; shift
+    case "$arg" in
+      -d) payload="$1"; shift ;;
+      */api/worker/register) printf '%s\n' "$payload" > "$STATE/register" ;;
+      */api/me/secrets/anthropic_token/22222222-2222-4222-8222-222222222222)
+        [ "$SCENARIO" != token-cleanup-fail ] || return 1
+        rm "$STATE/token"; echo deleted >> "$STATE/events" ;;
+    esac
+  done
+  # -d follows the URL in these calls, so record it after parsing all arguments.
+  if [ -n "$payload" ]; then printf '%s\n' "$payload" > "$STATE/register"; fi
+}
+case "$SCENARIO" in
+  autopilot*)
+    eval "$(awk '/^# --- autopilot #1:/ {exit} {print}' "$ROOT/e2e/phases/29-autopilot-lifecycle.sh")" ;;
+  guard)
+    EXECUTOR=stub
+    # Stop at the first compose call: consent must already be false when repo2
+    # is enabled, even if phase 29 was skipped and owner opt-in was true.
+    apiput() {
+      case "$1" in
+        /api/me/autopilot) printf '%s\n' "$2" > "$STATE/guard-consent"; echo '{"user":{"autopilot_enabled":false}}' ;;
+        /api/repos/repo2) jq -e '.enabled == false' "$STATE/guard-consent" >/dev/null || return 1; echo guarded > "$STATE/events"; exit 17 ;;
+        *) return 1 ;;
+      esac
+    }
+    # The prefix sits inside the phase's if/else; close it for this fixture.
+    eval "$(awk '/^  # Recreate the one worker/ {exit} {print}' "$ROOT/e2e/phases/45-bounded-concurrency.sh")
+fi" ;;
+  token*)
+    eval "$(awk '/^# claim_token DESC/ {exit} {print}' "$ROOT/e2e/phases/50-worker-token-binding.sh")" ;;
+  autostop)
+    WTOK=fixture
+    eval "$(awk '/^curl .*api\/worker\/register/ {printing=1} printing {print} printing && /could not register|synthetic worker register failed/ {exit}' "$ROOT/e2e/phases/51-auto-stop-poison.sh")" ;;
+  manual)
+    M5_FIXTURE=fixture M5_JOIN=fixture
+    eval "$(awk '/^  curl .*api\/worker\/register/ {printing=1} printing && /^  m5_heartbeat\(\)/ {exit} printing {print}' "$ROOT/e2e/phases/50-worker-token-binding.sh")" ;;
+esac
+exit 17
+HARNESS
+harness_state_case() {
+  local scenario="$1" original="$2" expected_rc="$3" expected_state="$4" rc=0 state="$SEQ_DIR/harness-$1-$2"
+  cases=$((cases + 1))
+  mkdir -p "$state"
+  # No if/! wrapper around the child shell: its own errexit remains active.
+  bash "$SEQ_DIR/harness-state.sh" "$ROOT" "$state" "$scenario" "$original" > "$state/output" 2>&1 || rc=$?
+  if [ "$rc" = "$expected_rc" ] && [ "$(cat "$state/autopilot" 2>/dev/null || true)" = "$expected_state" ]; then
+    passed=$((passed + 1)); echo "PASS: $scenario restores original=$original with rc=$rc"
+  else echo "FAIL: $scenario original=$original rc=$rc"; cat "$state/output"; fi
+}
+harness_state_case autopilot false 17 false
+harness_state_case autopilot true 17 true
+harness_state_case autopilot-cleanup-fail false 1 true
+harness_state_case guard true 17 ''
+cases=$((cases + 1))
+if [ "$(cat "$SEQ_DIR/harness-guard-true/events" 2>/dev/null || true)" = guarded ]; then
+  passed=$((passed + 1)); echo 'PASS: phase 45 disables autopilot before exposing repo2'
+else echo 'FAIL: repo2 exposed before autopilot disabled'; fi
+for scenario in token token-cleanup-fail autostop manual; do
+  state="$SEQ_DIR/harness-$scenario"
+  mkdir -p "$state"
+  rc=0
+  bash "$SEQ_DIR/harness-state.sh" "$ROOT" "$state" "$scenario" false > "$state/output" 2>&1 || rc=$?
+  cases=$((cases + 1))
+  expected_rc=17; [ "$scenario" != token-cleanup-fail ] || expected_rc=1
+  if [ "$rc" = "$expected_rc" ] && jq -e '
+      .protocol_capabilities | sort == (["completion_interlock_v1","repo_agent_source_v1","agent_source_request_v1"] | sort)
+    ' "$state/register" >/dev/null 2>&1; then
+    passed=$((passed + 1)); echo "PASS: $scenario registers the shared claim-only capabilities"
+  else echo "FAIL: $scenario capabilities/exit rc=$rc"; cat "$state/output"; fi
+  if [[ "$scenario" == token* ]]; then
+    cases=$((cases + 1))
+    if { [ "$scenario" = token ] && [ ! -e "$state/token" ] && [ "$(cat "$state/events")" = deleted ]; } \
+      || { [ "$scenario" = token-cleanup-fail ] && [ -e "$state/token" ] && grep -F 'console-key cleanup failed' "$state/output" >/dev/null; }; then
+      passed=$((passed + 1)); echo "PASS: $scenario cleans up early failure or reports cleanup failure"
+    else echo "FAIL: $scenario token cleanup"; cat "$state/output"; fi
+  fi
+done
 
 # compose_build_logged (#3468): extract the shipped multiline helper without
 # sourcing lib.sh's stack setup. A missing helper counts as a failure, then lets
@@ -1530,8 +1662,26 @@ handoff_timing_scope() {
   say() { :; }
   fail() { echo "$*" >&2; exit 1; }
   handoff_compose() {
-    HANDOFF_TEST_COMPOSE_CALLS=$((HANDOFF_TEST_COMPOSE_CALLS + 1))
+    # capture_agent_logs reads the agent with ps/logs (#4060): answer them without touching the
+    # lifecycle numbering, which counts only `up ... --force-recreate agent` calls by argv. ps runs in
+    # a command substitution, so a counter bumped there would be lost anyway.
+    case "$*" in
+      *"ps -a -q agent") echo handoff-container-id; return 0 ;;
+      *"logs --no-color agent") echo handoff-outgoing-process; return 0 ;;
+    esac
     printf 'compose:%s:%s:%s\n' "${UZI_E2E_RECOVERY_FAST_REDRIVE+x}" "$(printenv UZI_E2E_RECOVERY_FAST_REDRIVE || :)" "$*" >> "$SEQ_DIR/handoff-timing"
+    case "$*" in
+      *" up "*"--force-recreate agent"*) ;;
+      *) return 0 ;;
+    esac
+    HANDOFF_TEST_COMPOSE_CALLS=$((HANDOFF_TEST_COMPOSE_CALLS + 1))
+    # Evidence order: by the time the Nth recreate runs, at least N agent-log snapshots must exist.
+    if [ "$(find "$SEQ_DIR/artifacts/agent-logs" -name '*.log' 2>/dev/null | wc -l | tr -d ' ')" -ge "$HANDOFF_TEST_COMPOSE_CALLS" ] \
+        && grep -qs handoff-outgoing-process "$SEQ_DIR"/artifacts/agent-logs/*.log; then
+      echo yes >> "$SEQ_DIR/handoff-snap"
+    else
+      echo no >> "$SEQ_DIR/handoff-snap"
+    fi
     [ "$HANDOFF_TEST_MODE" != activation ] || [ "$HANDOFF_TEST_COMPOSE_CALLS" -ne 1 ] || return 1
     case "$HANDOFF_TEST_MODE:$HANDOFF_TEST_COMPOSE_CALLS" in restore:2|receipt-restore:2) return 1;; esac
   }
@@ -1550,6 +1700,8 @@ for spec in 'success:stub:unset' 'success:stub:0' 'success:stub:empty' 'success:
   cases=$((cases + 1))
   IFS=: read -r mode executor prior <<< "$spec"
   : > "$SEQ_DIR/handoff-timing"
+  : > "$SEQ_DIR/handoff-snap"
+  rm -rf "$SEQ_DIR/artifacts/agent-logs"
   if output="$(handoff_timing_scope "$mode" "$executor" "$prior" 2>&1)"; then got=pass; else got=fail; fi
   events="$(cat "$SEQ_DIR/handoff-timing")"
   if [ "$prior" = unset ]; then restored=':'; elif [ "$prior" = empty ]; then restored='x:'; else restored="x:$prior"; fi
@@ -1569,11 +1721,15 @@ for spec in 'success:stub:unset' 'success:stub:0' 'success:stub:empty' 'success:
         [[ "$events" == *body:x:1* ]] || valid=false
       fi
       case "$mode" in restore|receipt-restore) [[ "$output" == *'handoff timing restore failed'* ]] || valid=false;; esac
+      # Every recreate (activation and the EXIT-trap restore) saw a fresh snapshot of the outgoing agent.
+      recreates="$(grep -c -- ' up .*--force-recreate agent' "$SEQ_DIR/handoff-timing" || true)"
+      snaps="$(grep -c '^yes$' "$SEQ_DIR/handoff-snap" || true)"
+      [ "$recreates" -ge 1 ] && [ "$snaps" = "$recreates" ] && ! grep -q '^no$' "$SEQ_DIR/handoff-snap" || valid=false
     fi
   fi
   if [ "$valid" = true ]; then
     passed=$((passed + 1)); echo "PASS: handoff timing scope $spec"
-  else echo "FAIL: handoff timing scope $spec: result=$got events=[$events] output=[$output]"; fi
+  else echo "FAIL: handoff timing scope $spec: result=$got events=[$events] snaps=[$(cat "$SEQ_DIR/handoff-snap")] output=[$output]"; fi
 done
 
 # Drive the shipped phase-18 continuation/EXIT scope with mocked API/CLI
@@ -1944,9 +2100,293 @@ for mode in success cleanup-reaped before-reaped post-reaped delete-reaped after
   else echo "FAIL: phase50 ephemeral window $mode result=$got seeds=$actual_seeds expected=$want/$seeds: $output"; fi
 done
 
+# --- capture_agent_logs (#4060): snapshot agent logs before a lifecycle op discards them ------------
+# Real helper extracted from lib.sh; stateful fake compose; every case in a subshell with its own
+# RUNROOT/COMPOSE so nothing global changes for later code.
+CAL_DIR="$(mktemp -d "$SEQ_DIR/cal-fixture.XXXXXX")" # removed with SEQ_DIR by the file's EXIT trap
+
+# State files under $CAL_STATE: current.log (live log), mode (ok|logs-fail|logs-empty|ps-fail|ps-empty),
+# recorded (lifecycle observations), bad-argv (any unexpected invocation).
+fake_lifecycle_compose() {
+  local mode
+  mode="$(cat "$CAL_STATE/mode")"
+  case "$*" in
+    "ps -a -q agent")
+      case "$mode" in ps-fail) return 3 ;; ps-empty) return 0 ;; *) echo "container-id-1" ;; esac ;;
+    "logs --no-color agent")
+      case "$mode" in logs-fail) return 4 ;; logs-empty) return 0 ;; *) cat "$CAL_STATE/current.log" ;; esac ;;
+    *"--force-recreate agent" | "kill agent" | "stop agent" | "restart agent" | "down")
+      if grep -qs outgoing-process "$RUNROOT"/artifacts/agent-logs/*.log 2>/dev/null; then
+        echo "snapshot-present=yes" >> "$CAL_STATE/recorded"
+      else
+        echo "snapshot-present=no" >> "$CAL_STATE/recorded"
+      fi
+      echo replacement > "$CAL_STATE/current.log" ;;
+    *) echo "unexpected argv: $*" >> "$CAL_STATE/bad-argv"; return 9 ;;
+  esac
+}
+
+# cal_setup MODE PAYLOAD — fresh RUNROOT + state; sets CAL_STATE, RUNROOT, COMPOSE in the caller.
+cal_setup() {
+  CAL_STATE="$(mktemp -d "$CAL_DIR/state.XXXXXX")"
+  RUNROOT="$(mktemp -d "$CAL_DIR/run.XXXXXX")"
+  echo "$1" > "$CAL_STATE/mode"
+  echo "$2" > "$CAL_STATE/current.log"
+  : > "$CAL_STATE/bad-argv"
+  COMPOSE=(fake_lifecycle_compose)
+}
+
+cal_case() { # NAME DETAIL(empty = pass)
+  cases=$((cases + 1))
+  if [ -z "$2" ]; then passed=$((passed + 1)); echo "PASS: $1"; else echo "FAIL: $1 — $2"; fi
+}
+
+cal_run() { # NAME FUNCTION — run a case body in a subshell, capturing its detail output
+  local detail
+  if [ "$CAL_DEFINED" != yes ]; then cal_case "$1" "capture_agent_logs not defined in lib.sh"; return 0; fi
+  detail="$( ( "$2" ) 2>&1 )" || detail="${detail:-body exited nonzero}"
+  cal_case "$1" "$detail"
+}
+
+cal_files() { ls "$RUNROOT/artifacts/agent-logs"/*."$1" 2>/dev/null || true; }
+
+# cal_bare_errexit — run a bare `capture_agent_logs` under live errexit in a fresh bash process (a
+# subshell inside `||`/`$( )` would silently ignore set -e). Prints a detail line on failure.
+cal_bare_errexit() {
+  local script="$CAL_STATE/bare.sh" out="$CAL_STATE/bare.out" rc=0
+  {
+    echo '#!/usr/bin/env bash'
+    declare -f capture_agent_logs fake_lifecycle_compose
+    echo 'set -euo pipefail'
+    printf 'RUNROOT=%q\nCAL_STATE=%q\nCOMPOSE=(fake_lifecycle_compose)\n' "$RUNROOT" "$CAL_STATE"
+    echo 'capture_agent_logs 42-x lbl2'
+    echo 'echo SENTINEL'
+  } > "$script"
+  bash "$script" > "$out" 2>&1 || rc=$?
+  [ "$rc" = 0 ] || echo "bare errexit run exited $rc"
+  grep -qx SENTINEL "$out" || echo "errexit aborted caller (no SENTINEL)"
+}
+
+cal_before_discard() {
+  cal_setup ok outgoing-process
+  local rc=0 err
+  err="$(capture_agent_logs 42-x before-recreate 2>&1)" || rc=$?
+  "${COMPOSE[@]}" up -d --no-deps --force-recreate agent
+  [ "$rc" = 0 ] || { echo "rc=$rc"; return 0; }
+  grep -qx 'snapshot-present=yes' "$CAL_STATE/recorded" || { echo "missing outgoing evidence: no snapshot at recreate time"; return 0; }
+  grep -q outgoing-process "$(cal_files log | head -1)" || { echo "missing outgoing evidence: .log lacks payload"; return 0; }
+  [ "$(cat "$CAL_STATE/current.log")" = replacement ] || echo "live log is not only replacement"
+  [ ! -s "$CAL_STATE/bad-argv" ] || echo "unexpected argv: $(cat "$CAL_STATE/bad-argv")"
+  case "$err" in *PASS* | *'FAIL '*) echo "message contains PASS/FAIL token: $err" ;; esac
+}
+cal_run "capture_agent_logs snapshots outgoing logs before force-recreate" cal_before_discard
+
+cal_repeat() {
+  cal_setup ok payload-one
+  capture_agent_logs 42-x same
+  echo payload-two > "$CAL_STATE/current.log"
+  capture_agent_logs 42-x same
+  local files n1 n2
+  files="$(cal_files log)"
+  [ "$(printf '%s\n' "$files" | wc -l | tr -d ' ')" -eq 2 ] || { echo "expected 2 distinct logs, got: $files"; return 0; }
+  n1="$(basename "$(printf '%s\n' "$files" | sed -n 1p)")"; n2="$(basename "$(printf '%s\n' "$files" | sed -n 2p)")"
+  [ "$((10#${n1%%-*}))" -lt "$((10#${n2%%-*}))" ] || echo "NNNN not strictly increasing: $n1 $n2"
+  grep -q payload-one "$RUNROOT/artifacts/agent-logs/$n1" || echo "first payload lost"
+  grep -q payload-two "$RUNROOT/artifacts/agent-logs/$n2" || echo "second payload lost"
+}
+cal_run "capture_agent_logs repeat capture keeps distinct increasing snapshots" cal_repeat
+
+# cal_missing_body MODE REASON-SUBSTRING — shared body for cases 3-5
+cal_missing_body() {
+  cal_setup "$1" some-payload
+  local rc=0 err
+  err="$(capture_agent_logs 42-x lbl 2>&1 >/dev/null)" || rc=$?
+  [ "$rc" = 0 ] || { echo "rc=$rc"; return 0; }
+  case "$err" in *"MISSING-EVIDENCE: agent logs 42-x/lbl: "*"$2"*) ;; *) echo "stderr lacks MISSING-EVIDENCE/$2: $err" ;; esac
+  case "$err" in *PASS* | *'FAIL '*) echo "message contains PASS/FAIL token" ;; esac
+  [ -n "$(cal_files missing)" ] || echo "no .missing file"
+  [ -z "$(cal_files log)" ] || echo ".log written on failure"
+  [ -z "$(cal_files absent)" ] || echo ".absent written on failure"
+  [ -z "$(cal_files log.part)" ] || echo ".part left behind"
+  cal_bare_errexit
+}
+cal_logs_fail() { cal_missing_body logs-fail "read failure: compose logs"; }
+cal_logs_empty() { cal_missing_body logs-empty "empty log output"; }
+cal_ps_fail() { cal_missing_body ps-fail "read failure: compose ps"; }
+cal_run "capture_agent_logs logs read failure is reported as missing evidence" cal_logs_fail
+cal_run "capture_agent_logs empty logs output is reported as missing evidence" cal_logs_empty
+cal_run "capture_agent_logs ps failure is a read failure, not absent" cal_ps_fail
+
+cal_write_fail() {
+  cal_setup ok some-payload
+  mkdir -p "$RUNROOT/artifacts"
+  : > "$RUNROOT/artifacts/agent-logs"   # a regular file where the directory must be
+  local rc=0 err
+  err="$(capture_agent_logs 42-x lbl 2>&1 >/dev/null)" || rc=$?
+  [ "$rc" = 0 ] || { echo "rc=$rc"; return 0; }
+  case "$err" in *"MISSING-EVIDENCE: agent logs 42-x/lbl: "*) ;; *) echo "stderr lacks MISSING-EVIDENCE: $err" ;; esac
+  case "$err" in *PASS* | *'FAIL '*) echo "message contains PASS/FAIL token" ;; esac
+  [ -z "$(find "$RUNROOT" -name '*.log' 2>/dev/null)" ] || echo ".log written despite write failure"
+  cal_bare_errexit
+}
+cal_run "capture_agent_logs write failure is reported and returns 0" cal_write_fail
+
+cal_absent() {
+  cal_setup ps-empty x
+  local err rc=0
+  err="$(capture_agent_logs 05-x cleanup absent-ok 2>&1)" || rc=$?
+  [ "$rc" = 0 ] || { echo "rc=$rc"; return 0; }
+  [ -n "$(cal_files absent)" ] || echo "absent-ok: no .absent"
+  [ -z "$(cal_files log)" ] || echo "absent-ok: .log written"
+  [ -z "$(cal_files missing)" ] || echo "absent-ok: .missing written"
+  case "$err" in *MISSING-EVIDENCE*) echo "absent-ok printed MISSING-EVIDENCE: $err" ;; esac
+  case "$err" in *PASS* | *'FAIL '*) echo "message contains PASS/FAIL token" ;; esac
+  err="$(capture_agent_logs 05-x strict 2>&1)" || true
+  [ -n "$(cal_files missing)" ] || echo "without absent-ok: no .missing"
+  case "$err" in *"MISSING-EVIDENCE: agent logs 05-x/strict: agent container absent"*) ;; *) echo "without absent-ok: stderr lacks MISSING-EVIDENCE: $err" ;; esac
+}
+cal_run "capture_agent_logs absent agent is expected only with absent-ok" cal_absent
+
+# A failed .absent marker write (after slot reservation) is missing evidence, not expected absence.
+cal_absent_write_fail() {
+  cal_setup ps-empty x
+  mkdir -p "$RUNROOT/artifacts/agent-logs/0001-05-x-cleanup.absent"   # a directory where the marker goes
+  local err rc=0
+  err="$(capture_agent_logs 05-x cleanup absent-ok 2>&1)" || rc=$?
+  [ "$rc" = 0 ] || { echo "rc=$rc"; return 0; }
+  case "$err" in *"MISSING-EVIDENCE: agent logs 05-x/cleanup: write failure (absent marker)"*) ;; *) echo "stderr lacks MISSING-EVIDENCE write failure: $err" ;; esac
+  case "$err" in *"absent (expected); no snapshot"*) echo "reported expected absence despite write failure: $err" ;; esac
+  [ -n "$(cal_files missing)" ] || echo "no .missing written"
+  [ -z "$(cal_files log)" ] || echo ".log written"
+}
+cal_run "capture_agent_logs failed .absent marker write is missing evidence" cal_absent_write_fail
+
+cal_bare_ok() {
+  cal_setup ok some-payload
+  cal_bare_errexit
+  # The child really took the success path: a snapshot exists and nothing was reported missing.
+  ls "$RUNROOT"/artifacts/agent-logs/*-42-x-lbl2.log >/dev/null 2>&1 || echo "bare run wrote no 42-x-lbl2 snapshot"
+  if grep -q MISSING-EVIDENCE "$CAL_STATE/bare.out"; then echo "bare run reported MISSING-EVIDENCE: $(cat "$CAL_STATE/bare.out")"; fi
+}
+cal_run "capture_agent_logs success path is safe as a bare statement under errexit" cal_bare_ok
+
+cal_slot_parse() {
+  cal_setup ok slot-payload
+  local d="$RUNROOT/artifacts/agent-logs" got
+  mkdir -p "$d"
+  : > "$d/.slot-0009"
+  : > "$d/.slot-x"
+  capture_agent_logs 42-x lbl
+  got="$(basename "$(cal_files log)")"
+  [ "$got" = "0010-42-x-lbl.log" ] || echo "expected 0010-42-x-lbl.log, got: $got"
+}
+cal_run "capture_agent_logs numbers past .slot-0009 in decimal and skips non-numeric slots" cal_slot_parse
+
+# --- call-site guard (#4060 case 8): every agent lifecycle command is preceded by a capture --------
+# Static scan of the real phases and lib.sh. awk (not grep) so backslash continuations join into one
+# logical command and the "previous command" is the nearest non-blank, non-comment logical line.
+# Emits HIT rows (file:line, ok|BAD, context before the capture, command) and ABSENT rows (the
+# capture line carrying absent-ok, plus the command that follows it).
+cal_scan() {
+  awk '
+    function emit_absent(next_line) {
+      if (pend != "") { print "ABSENT\t" pend "\t" next_line; pend = "" }
+    }
+    function proc(t, ln,    idx, rest, n, toks, i, verb, hasagent, isCap, marker) {
+      marker = "\"${COMPOSE[@]}\""
+      if (t ~ /^[[:space:]]*$/ || t ~ /^[[:space:]]*#/) return
+      if (t ~ /^capture_agent_logs\(\) \{/) inhelper = 1
+      if (inhelper) { if (t ~ /^\}/) inhelper = 0; return }
+      emit_absent(t)
+      isCap = (t ~ /^[[:space:]]*capture_agent_logs[[:space:]]/)
+      if (isCap && t ~ /absent-ok/) pend = FILENAME ":" ln
+      idx = index(t, marker)
+      if (idx > 0) {
+        rest = substr(t, idx + length(marker))
+        sub(/[>|&;].*/, "", rest)
+        n = split(rest, toks, /[[:space:]]+/)
+        verb = ""; hasagent = 0
+        for (i = 1; i <= n; i++) {
+          if (toks[i] == "") continue
+          if (verb == "") verb = toks[i]; else if (toks[i] == "agent") hasagent = 1
+        }
+        if (verb == "down" || (hasagent && verb ~ /^(kill|stop|restart|start|rm|up)$/)) {
+          gsub(/^[[:space:]]+/, "", t)
+          print "HIT\t" FILENAME ":" ln "\t" (prev ~ /^[[:space:]]*capture_agent_logs[[:space:]]/ ? "ok" : "BAD") "\t" ctx "\t" t
+        }
+      }
+      prev = t
+      if (!isCap) ctx = t
+    }
+    FNR == 1 { emit_absent(""); prev = ""; ctx = ""; acc = ""; inhelper = 0 }
+    {
+      line = $0
+      if (acc == "") accln = FNR
+      if (line ~ /\\$/) { acc = acc substr(line, 1, length(line) - 1) " "; next }
+      proc(acc line, accln); acc = ""
+    }
+    END { emit_absent("") }
+  ' "$ROOT"/e2e/phases/*.sh "$LIB"
+}
+CAL_SCAN_OUT="$(cal_scan)"
+
+cal_guard_offenders() {
+  local bad
+  bad="$(printf '%s\n' "$CAL_SCAN_OUT" | awk -F'\t' '$1 == "HIT" && $3 == "BAD" { print "  " $2 ": " $5 }')"
+  [ -z "$bad" ] || printf 'agent lifecycle command without a preceding capture_agent_logs:\n%s\n' "$bad"
+}
+cal_run "every agent kill/stop/restart/start/rm/up/down in phases and lib.sh is preceded by capture_agent_logs" cal_guard_offenders
+
+cal_guard_nonvacuous() {
+  local hits
+  hits="$(printf '%s\n' "$CAL_SCAN_OUT" | awk -F'\t' '$1 == "HIT"')"
+  [ "$(printf '%s\n' "$hits" | grep -c .)" -ge 23 ] || echo "scan found only $(printf '%s\n' "$hits" | grep -c .) lifecycle commands, want >= 23"
+  has() { printf '%s\n' "$hits" | awk -F'\t' -v f="$1" -v c="$2" -v t="$3" 'index($2, f) > 0 && $4 ~ c && index($5, t) > 0 { found = 1 } END { exit !found }'; }
+  has phases/42-api-outage-readoption.sh '^export UZI_E2E_MAX_CONCURRENT_RUNS=2' '--force-recreate agent' || echo "scan missed phase 42 first recreate"
+  has phases/42-api-outage-readoption.sh '^RA_RESTORE_AT=' '--force-recreate agent' || echo "scan missed phase 42 RESTORE recreate"
+  has phases/70-handoff.sh '' 'if ! "${COMPOSE[@]}" up' || echo "scan missed phase 70 EXIT-trap recreate"
+  has phases/52-api-outage-outbox.sh '' 'stop agent >/dev/null || return 1' || echo "scan missed phase 52 stop_outbox_agent stop"
+  has phases/52-api-outage-outbox.sh '' 'agent recreation failed' || echo "scan missed phase 52 recreate_outbox_agent up"
+  has e2e/lib.sh '' 'down -v --remove-orphans' || echo "scan missed lib.sh teardown down -v"
+}
+cal_run "lifecycle call-site scan is non-vacuous (finds the incident, restore, trap, helper and teardown sites)" cal_guard_nonvacuous
+
+cal_guard_absent_ok() {
+  local rows n
+  rows="$(printf '%s\n' "$CAL_SCAN_OUT" | awk -F'\t' '$1 == "ABSENT"')"
+  n="$(printf '%s\n' "$rows" | grep -c . || true)"
+  [ "$n" = 4 ] || echo "absent-ok used at $n sites, want exactly 4 (05, 13, 15 post-down up, lib.sh teardown): $rows"
+  printf '%s\n' "$rows" | awk -F'\t' '
+    $2 ~ /phases\/05-lane-forgejo\.sh:/ && $3 ~ /up -d --wait agent/ { a = 1 }
+    $2 ~ /phases\/13-worker-join-online\.sh:/ && $3 ~ /up -d --wait agent/ { b = 1 }
+    $2 ~ /phases\/15-happy-path-restart\.sh:/ && $3 ~ /up -d --wait agent/ { c = 1 }
+    $2 ~ /e2e\/lib\.sh:/ && $3 ~ /down -v/ { d = 1 }
+    END { if (!a) print "absent-ok missing at 05 initial up"
+          if (!b) print "absent-ok missing at 13 initial up"
+          if (!c) print "absent-ok missing at 15 post-down up"
+          if (!d) print "absent-ok missing at lib.sh teardown down" }'
+}
+cal_run "absent-ok appears only at the initial starts, the post-down restart and teardown" cal_guard_absent_ok
+
+# Phase 42 (#4060 case 9): run the REAL block from the cap-2 export through its first force-recreate
+# against the lifecycle fake. The fake records whether a snapshot holding the outgoing log existed
+# when the recreate ran, so deleting the wired capture line turns this red on behaviour.
+cal_phase42_first_recreate() {
+  cal_setup ok outgoing-process
+  local block
+  block="$(awk '/^export UZI_E2E_MAX_CONCURRENT_RUNS=2/ {a=1} a {print} a && /--force-recreate agent/ {exit}' "$ROOT/e2e/phases/42-api-outage-readoption.sh")"
+  [ -n "$block" ] || { echo "could not extract the phase 42 first-recreate block"; return 0; }
+  case "$block" in *'--force-recreate agent'*) ;; *) echo "extracted block lacks the recreate"; return 0 ;; esac
+  eval "$block"
+  grep -qx 'snapshot-present=yes' "$CAL_STATE/recorded" 2>/dev/null || { echo "phase 42 recreated the agent with no outgoing-log snapshot on disk"; return 0; }
+  grep -q outgoing-process "$(cal_files log | head -1)" 2>/dev/null || echo "phase 42 snapshot lacks outgoing-process"
+  [ ! -s "$CAL_STATE/bad-argv" ] || echo "unexpected argv: $(cat "$CAL_STATE/bad-argv")"
+}
+cal_run "phase 42 snapshots the outgoing agent log before its first force-recreate" cal_phase42_first_recreate
+
 node --test "$ROOT/e2e/settlement-diagnostic.test.mjs"
 node --test "$ROOT/e2e/recovery-record-projection.test.mjs"
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has at least 203 cases green; a zero-case or
-# partially-red run must exit nonzero.
-[ "$cases" -ge 203 ] && [ "$cases" -eq "$passed" ]
+# Tally guard (the driver.test.sh idiom): a real run has at least 217 cases green (including the
+# capture_agent_logs cal_* cases); a zero-case or partially-red run must exit nonzero.
+[ "$cases" -ge 217 ] && [ "$cases" -eq "$passed" ]

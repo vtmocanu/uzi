@@ -701,6 +701,7 @@
   ],
   "agent_source_requested": "x",
   "agent_source_requested_basis": "x",
+  "plan_agent_source": "x",
   "own_agents": [
     {
       "name": "x",
@@ -854,5 +855,7 @@
   "worker_name": "x",
   "owner_email": "x",
   "judge_verdict": "x",
-  "judge_todo_count": 1
+  "judge_todo_count": 1,
+  "pending_question": "x",
+  "cross_check_active": "x"
 }

@@ -778,6 +778,38 @@ describe("M2 refresh publication — real runner, scanner and push", () => {
     }
   }
 
+  // Issue #4080: a refresh refusal's feed status points at held publication and recovery; the
+  // terminal failure_reason never carries the pointer.
+  for (const shape of ["context", "closing_hits", "closing_unreadable"] as const) {
+    it(`mr_rework/github: ${shape} refusal status points at uzi run held and uzi run recovery`, async t => {
+      const h = history("Fixes #3120");
+      const f = forgeFor("github", h.original);
+      if (shape === "context") {
+        api.publicationContextWire = () => ({ status: 200, body: { version: 1, status: "unknown", reason: "authority_unknown" } });
+      } else {
+        authority("non_closing", h.original);
+        if (shape === "closing_unreadable") t.mock.method(git, "publishedCommitMessages", async () => null);
+      }
+      const claim = claimFor("mr_rework", "github", h.original);
+      const probe = candidateExecutor(h.candidate);
+      await runner(probe.executor, f.gl.gitlab, undefined, { github: f.gh!.github }).execute(claim);
+      const failure = assertRefused(claim.run_id, h.original, probe, shape === "context"
+        ? /source context could not be confirmed/
+        : shape === "closing_hits" ? /commit message\(s\) close issue/ : /could not read the commit messages/);
+      const pointer = `Retained work, if any, is listed by uzi run held ${claim.run_id} or uzi run recovery ${claim.run_id}.`;
+      assert.ok(!failure.includes("Retained work"), failure);
+      const statuses = api.messages(claim.run_id)
+        .filter(m => m.kind === "status")
+        .map(m => String((m.payload as { text?: unknown }).text ?? ""))
+        .filter(text => text.includes("refused"));
+      assert.equal(statuses.length, 1, JSON.stringify(statuses));
+      const expected = shape === "context"
+        ? `${failure}. ${pointer}`
+        : `${failure}; work is preserved for owner history correction; partial or accept decisions cannot fix commit history. ${pointer}`;
+      assert.equal(statuses[0], expected);
+    });
+  }
+
   it("raw HTTP hook stays unavailable by default and supports malformed and sequenced replies", async () => {
     const runId = randomUUID();
     const request = { claim_generation: 7, branch: BRANCH, candidate_head: "b".repeat(40) };

@@ -44,10 +44,59 @@ stop rather than forcing.
   **Never route around a classifier denial by other means** — retry, or hand the exact
   command to the user to run via a `!`-prefixed shell line, or ask them to add a
   `gh pr merge` allow rule.
-- **`BEHIND` after an earlier merge** is expected (main moved). `--admin` bypasses the
-  strict check; otherwise `gh pr update-branch` the PR and re-wait for CI. A BEHIND PR that
-  also carries a migration-number collision or a conflict needs `scripts/land-prep.sh`
+- **`BEHIND` after an earlier merge** is expected (main moved). A BEHIND PR that also
+  carries a migration-number collision or a conflict needs `scripts/land-prep.sh`
   (rebase or merge + renumber + lease push) first.
+- **Merging behind main.** `--admin` may land a BEHIND PR on its existing exact-head CI,
+  with no fresh run on a head containing current main, only when every condition below
+  holds, rechecked immediately before `merge.sh`. Otherwise, or when unsure, update the
+  branch, get the rebase-lane buddy review and wait for fresh exact-head CI.
+  - Required CI is green on the exact head, and that run finished within the last 24 hours.
+  - `main` is not red. No required check on its current tip has failed. Its latest
+    completed, non-cancelled required CI result passed, judged across the whole required
+    check set, not a single green job or a partial dispatch. An in-progress tip does not
+    block (main CI cancels in-progress runs on every push). Any observed required-check
+    failure does, except for the fix itself, even while sibling jobs still run. A later-finishing rerun on
+    an older SHA never hides a failure on a newer `main` commit. If the result cannot be
+    established, wait. Leave at least 5 minutes between merges to `main`, and follow a merge
+    coordinator's GO/WAIT when one is running.
+  - The buddy's `APPROVE` is pinned to the head, and the merge is clean (no conflict).
+  - The main delta (`merge-base..origin/main`) and the PR are independent. Use the whole
+    component as the unit: `api/` (with `docs/`, which `api` embeds), `controller/`,
+    `web/`, `agent/`, `deploy/`. Separate Go directories in one module are not independent.
+    Documentation paths (`prds/`, `adr/`, `changelog.d/`, `specs/`) are independent only
+    after checking what repository checks read them: doc links (`check-docs:web`), spec
+    numbering, changelog checks and embeds. A move, deletion or shared validation input
+    there takes fresh CI.
+  - Neither the PR nor the main delta touches a migration, a generated or shared contract
+    (sqlc output and `queries/`, `api/openapi/`, `fixtures/`, run-kind or protocol lists), or
+    build and test infrastructure (`Taskfile.yml`, `.github/workflows/`, `scripts/`,
+    `go.mod`/`go.sum`, `package.json`, lockfiles, `tsconfig*`, `.golangci.yml`, vite/vitest
+    config).
+  - Neither side is trust-boundary, auth, untrusted-input or security work.
+
+  Before merging, record an eligibility receipt in the trail or the merge note:
+  - the tested head, its CI run id and completion time;
+  - the tested base when known; otherwise compare from the PR's merge-base and do not claim
+    an unverified tested base;
+  - the current main SHA and its observed tip check state, kept apart from the evidence
+    used: the SHA, run ids, conclusions and completion times of the completed required CI
+    cited (it may be an ancestor);
+  - the coordinator's GO/WAIT, when one runs, and the previous merge time for the spacing;
+  - the full delta, including renames as old and new paths;
+  - the component, dependency and exclusion assessment;
+  - the pinned buddy verdict.
+  Re-read head and main immediately before `merge.sh`; any change voids the receipt until
+  it is recomputed. Unclear inputs take fresh CI; no dependency-analysis tooling is needed.
+
+  Examples: a `web/`-only PR after main changed only `api/` merges on its green head, but
+  only if every other condition holds and the API/DTO contract the web side uses is
+  unchanged. Component separation alone does not prove that. An `agent/test` PR after main
+  changed `agent/src` needs fresh CI; any PR after main touched `Taskfile.yml` needs fresh
+  CI. Post-merge main CI detects a residual integration failure; it does not prevent one.
+  This default never bypasses another required check, review, classifier refusal or a
+  stronger repository rule. A user's per-queue rule, stricter or looser, overrides it for
+  that queue.
 - Merging is **outward-facing**: unless the user pre-authorized it (they chose Auto mode,
   or said "merge as admin"), surface the MR + your review and get their OK first.
 - **Merge each PR the moment it is review-clean and CI-green — do NOT hold the whole
@@ -92,14 +141,18 @@ than waiting for the whole run. Keep the owned callback/log receipt; do not re-a
 a poll loop per merge:
 
 ```
-<this skill's directory>/scripts/watch-run-ci.sh --sha "$MERGE_SHA" --follow --interval 60
+<this skill's directory>/scripts/watch-run-ci.sh --sha "$MERGE_SHA" --follow --interval 60 --max-ticks 200
 ```
 
 It exits **0** when every run that exists for the SHA is green, **1** on a real red
 (`failure`/`timed_out`/`startup_failure`/`action_required`), **2** on timeout, **3** when
 no run ever appeared (or gh failed). On supersession, `--follow` resolves the current branch
 head, prints `FOLLOW sha=OLD -> NEW` for each switch and watches within the original
-`--max-ticks` budget. The final result covers the last watched SHA. Without `--follow`,
+`--max-ticks` budget. The final result covers the last watched SHA, a descendant that contains
+your merge. Main runs finish rather than cancel (#2561), so the followed head may wait for a
+whole running run before its own starts: pass `--max-ticks 200`, and treat exit 2 as still
+pending, never as red; re-arm it. A finished run for an older (ancestor) SHA does not cover
+your merge. Without `--follow`,
 supersession exits **4** (see below).
 
 **Exit 0 means "every run that EXISTS for the SHA is green" — NOT "the full expected
@@ -131,16 +184,17 @@ run in progress; `gh run view RUN --job JOB --log-failed` may refuse until that 
 terminal. When only the failed step name is needed, use
 `gh api repos/O/R/actions/jobs/JOB --jq '.steps[]|select(.conclusion=="failure")|.name'`.
 
-**`conclusion == cancelled` is almost never a failure — it is concurrency
-supersession.** The CI workflows run with `concurrency: cancel-in-progress` on the `main`
-branch, so when a NEWER commit lands (another session's merge, or your own next merge) the
-in-progress run of the older SHA is cancelled mid-flight. This is common on this repo's
-shared, fast-moving `main` (measured 2026-08-20: `759199c8`'s CI was cancelled when a
-renovate merge landed on top seconds later). **Do not read `cancelled` as red.** On exit 4,
-your merge is fine — re-point at the CURRENT `origin/main` HEAD (`git fetch origin main`)
-and confirm *that* commit's run goes green, since it exercises your change plus whatever
-superseded it. If a peer session owns that newer commit (coordinate via SendMessage), its
-green is theirs to watch and report.
+**`conclusion == cancelled` is almost never a failure: it is concurrency
+supersession.** On a PR branch a newer push cancels the in-progress run. On `main`,
+`ci.yml` and `kind-smoke.yml` let the running run finish (pilot, #2561): the group keeps one
+pending run, and a newer merge replaces that pending run, which then shows `cancelled`
+without having started. **Do not read `cancelled` as red.** A finished `main` run covers
+every commit merged since the previous finished run, so confirm the run that includes your
+commit (`git merge-base --is-ancestor <yours> <run head>`) goes green. If a peer session
+owns that newer commit (coordinate via SendMessage), its green is theirs to watch and
+report. Rerun only the current tip: rerunning an older `main` commit replaces the pending
+tip run. On a PR, rerun only the current head's run: a rerun of a superseded head's run joins
+the PR's concurrency group and cancels the current head's run (2026-11-09, #4113).
 
 ## Post-merge publish steps
 

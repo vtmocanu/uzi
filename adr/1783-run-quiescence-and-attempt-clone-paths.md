@@ -1487,7 +1487,7 @@ The orphan events gain a closed-set `retirement_subreason`, taken from
 `OrphanRetirementSubreason` in `agent/src/git.ts`: `fenced_source`, `pair_changed`,
 `completion_pending`, `completion_preflight_retained`, `completion_unverified`,
 `completion_uncertain`, `completion_unsupported`, `authority_busy`,
-`published_source_retained` and `unknown`. Anything outside the set is written as
+`published_source_retained`, `remediation_retained` (#4058) and `unknown`. Anything outside the set is written as
 `unknown`, and no error text, path or provider output is included. Outward errors
 are unchanged. See [Reading orphan-reclaim diagnostics](../docs/run-recovery.md#reading-orphan-reclaim-diagnostics).
 
@@ -1515,3 +1515,203 @@ These came from the preserved earlier attempt (`bc3c7750`).
 ### Related issues
 
 Out of scope: #3638 and #3639 (memory-park settlement) and #3644 (same-run restart).
+
+
+## Amendment 2026-11-07 — #4066 shutdown settlement barrier
+
+Refs #4066. Builds on the #3404 and #3645 amendments above. It changes what a
+graceful worker exit waits for and reports. It does not change the authority
+store, the fence, the certificate or any refusal.
+
+### The problem
+
+A graceful exit trusted that every authority settlement was durable once
+`worker.run` returned. It was not: a settlement could be queued behind a holder of
+A, spliced out of the queue by a drain that had not finished, applied inline by
+code detached from the transaction that owned it, or owed by a Git child or a pin
+continuation the caller's deadline had abandoned. Causation of the incident that
+motivated the issue is not proven; the amendment closes the mechanisms the code
+showed.
+
+### Admission order
+
+`finishWorkerShutdown` (`agent/src/shutdown-barrier.ts`), called by every graceful
+exit in `agent/src/main.ts` before its stop log:
+
+1. `worker.run` is joined by the caller.
+2. Registered producers, outer transactions (with the inline applies their owners
+   joined) and Git children and continuations, including their settlement promises
+   (`GitCache.pendingWork()`), are joined together, repeated until quiet; none of them
+   is cancelled.
+3. `sealForShutdown`: a new outermost transaction throws `AuthorityShutdownRefusal`
+   (a subclass of `AuthorityRefusal`). The runtime's own drain is exempt.
+4. `drainForShutdown`: the final drain of what is queued.
+
+Step 2 has no timeout; the 35 s observer reports past the deadline without cancelling it.
+
+### Owner-join lock lifetime
+
+An inline apply completes while A is held. The settling transaction registers the
+apply, and the outermost callback joins its inline applies (`#closeInline`) before
+its transaction releases A. When the join observes none outstanding it marks the
+transaction closing in the same tick; a settle that arrives after the closing mark
+queues for the drain instead of applying inline. The join has no timeout and takes
+no second lock, so the lock order is unchanged and A is never taken beneath B.
+
+### Result deadline and decision
+
+The worker logs one `worker_shutdown_result` (`drained` or `incomplete`, fixed
+reasons, counts, at most 16 operation ids, no paths or error text) within 35 s of
+the first signal, or of barrier entry when no signal came. The observer is armed
+first-wins and the first decision stands. After an `incomplete` decision the
+barrier keeps joining the actual work until it completes or the process is killed,
+and any late settle stays queued. `incomplete` sets exit code 1. The 15 s
+publication grace is unchanged.
+
+Compose (`stop_grace_period`) and hosted pods (`terminationGracePeriodSeconds`,
+`controller/internal/kube/render.go`) allow 40 s, the 35 s result deadline plus a
+5 s margin. The pod field changes the pod spec hash, so upgrading the controller
+rolls every hosted worker once through the paced roll
+([ADR-1470](1470-paced-hosted-worker-rolls.md)).
+
+### Failure model
+
+A settlement is durable once its slot was written with `writeDurable` and the
+directory sync returned. The tests prove process crashes. For a power loss before
+that sync the rename is either lost (the previous `running` slot survives) or kept
+(the slot is one ahead of its head and the next transaction completes it through
+`#load`). Neither outcome is re-proven here.
+
+### Unchanged residuals
+
+The #3404 and #3645 residuals stand. An unresolved record is refused indefinitely
+and there is still no generic force-clear; the guarded operator discard is the only
+takeover. An `incomplete` result never certifies anything: any unresolved record
+keeps its protections (a successor still refuses it, the intended fail-closed
+answer), while a write already started may still complete after the diagnostic;
+`incomplete` can also occur with no enrolled operation. A bounded
+`bare_slot_refusal` warning (once per operation per process, no paths or footprint
+text) now says which kind of record a refusal met.
+
+### Not claimed
+
+Hosted and compose end-to-end acceptance is pending owner acceptance. Power-loss
+durability is not claimed.
+
+## Amendment 2026-11-06 — PRD #3431 M1b: gated settle-and-delete at a verified pod epoch
+
+Refs [PRD #3431](../prds/3431-pod-epoch-reclaim.md) M1b. Builds on the #1858 and #3404
+amendments above. It adds a deletion phase to the first-process pod-epoch pass
+(`runPodEpochShadow`, `agent/src/pod-epoch-reclaim.ts`) that reuses the existing operator
+discard core and the existing authority store. It adds no new deletion primitive, no new
+authority record and no resolver. Those two amendments remain the history of their
+boundaries: the #1858 "no safe automatic reclaim" statement still holds in production,
+because the phase is off (below).
+
+### Activation gate
+
+`EPOCH_RECLAIM_DELETION_ENABLED` is `false`. While it is false the pass stays shadow-only:
+no proof is created and nothing is mutated, whatever deletion dependencies the caller
+supplies. `main.ts` wires the dependencies (`buildPodEpochDeletionDeps`: authority
+runtime, `RunRunner.withSourceReservation`, the worker-wide deny-only capture-mode proof
+as `quiesce`, GitCache) and carries no activation override. A test-only symbol sentinel
+is the only other way the phase runs; nothing under `agent/src` passes it. Turning
+production deletion on needs a separate owner activation co-sign on the re-measured R9
+numbers; that co-sign has not happened. Hosted acceptance is also pending.
+
+### Disposal is plain-only, through one core
+
+The phase calls `discardStoppedSource`, the same entry as the operator's plain discard,
+with a worker-issued epoch proof. The epoch branch of `discardRetainedSource` refuses any
+mode other than `plain` (`invalid_epoch_proof`), so a protected source is never disposed of
+by this path. The phase runs only on an `eligible` shadow verdict with `attested`
+authority, an intact pass and a native reclaim scope on the ownership.
+
+### Admitted shapes and structural keeps
+
+The epoch path admits three shapes, each one attempt, one part, sole namer of its path:
+
+- **(a)** the strict three-key journal `{runId, clonePath, attemptId}` (exact raw string,
+  no other key) with the attempt ledger `live`, footprint present or missing;
+- **(c)** the same journal with the ledger already `retired` and the footprint missing
+  (the retry of an interrupted settlement); the retired append is skipped;
+- **(b)** the explicitly valued `[""]` empty-journal repair over a `retired` ledger and a
+  missing footprint: metadata settlement only, no bytes.
+
+Everything else is kept and counted without any authority read or proof: a no-key journal
+(`[]`), a valueless key, duplicates or extra fields, and every marker-less canonical source
+are `kept_unrecoverable_shape`; a `local_protected_discard` disposition is `kept_protected`.
+Structural keeps never downgrade the verdict. The epoch disposal also refuses any ledger state other than `live` or `retired`
+(`reclaimed`, `abandoned`), so a `reclaimed` or `abandoned` attempt with an empty journal is kept
+as `kept_unrecoverable_shape`; `[""]` is admitted only as the exact retired-empty-journal
+repair (shape b). Journal shape and ledger state are classified before any deletion-phase authority read (the shadow pass has already read ownership and holds).
+The shadow pass's `would_delete` may still count such an attempt. A successor's journal is never cleared.
+
+### R5: the proof constructor narrows itself
+
+`createEpochDiscardProof` refuses before granting a proof when the selector is canonical
+(an epoch proof names one `ATTEMPT_ID_RE` attempt) or the expected journal is `[]`; a string
+journal must parse to exactly the three keys bound to the selector and path. The shape
+check in the pass is therefore not the only guard.
+
+### R9 limits (owner answer seq 1162, 2026-11-06)
+
+Epoch-only defaults that test seams may only lower (`epochLimits` in `agent/src/git.ts`):
+metadata 16 MiB, worktree content 512 MiB, object store 4 GiB per object-store snapshot
+(logical verification work, not a memory ceiling), metadata records 131,072 (the epoch
+object-occurrence cap follows it), directory entries 16,384; `maxBares` 1,024 and
+`maxSeenPaths` 4,096 unchanged; Git's delta base cache pinned at 96 MiB. An overflow
+observed in the content stage is a settled keep (`epoch_content_unproven`). Every
+indirection-bearing input is classified before any shared bulk budget is charged, and an
+overflow while reading one is UNKNOWN, never a keep. The legacy non-epoch caps are
+unchanged.
+
+### Run-wide holds
+
+Deletion needs a fresh terminal lifecycle and a holds response whose list is empty AND whose
+`run_open_holds` names the run with count exactly 0; absent, mismatched or non-zero is
+unknown and keeps the source. The api reads the predecessor pod's stored capabilities and
+the pass runs before the successor registers, so the first roll onto an image advertising
+`recovery_run_open_holds_v1` gets no count and keeps everything.
+
+### Per-source order
+
+Serial, each source settled before the next: authority transaction A, then the run's source
+reservation S inside it, then fresh lifecycle and hold reads inside S, then the proof (its
+`checkLive` binds the reservation and the exact active transaction), then the discard
+(the #3404 operator-discard takeover comes last, immediately before the first delete), then
+`endSourceUse` after any takeover, then release of S and A, and only then classification.
+A thrown error after the discard began is unproven and fatal: the pass keeps EX and refuses
+admission.
+
+### Authority persistence model (existing mechanisms only)
+
+- `writeDurable` (`agent/src/completion-authority.ts`): tmp file `O_EXCL|O_NOFOLLOW`,
+  write, file sync, directory identity check, rename, directory sync.
+- `#save`: slot write, read-back, then head shard.
+- `#load`: a slot exactly one ahead of its head is finished only under a writable
+  transaction; a read-only load refuses it.
+- The takeover save and the `beginDestructive` save both return before the first delete.
+
+### Crash table (process crash only)
+
+| Crash point | State left | Next epoch |
+|---|---|---|
+| Before or inside the takeover save | prior slot, or `retiring` | ordinary candidate, or retaken |
+| After takeover, before `beginDestructive` | `retiring` | retaken |
+| Inside or after the `beginDestructive` save, before its settle | `retiring` + pending `running` | **kept, not recovered** |
+| After settle ok | `retiring`, footprint gone | retaken, metadata settlement |
+| After settle failed | `retiring` + `settled_failed` | retaken, delete retried |
+| After the retired append, before the journal clear | ledger `retired` | retaken, no duplicate append |
+| After the clear, before the end save | journal `[""]` | retaken, barriers only, tombstone |
+| After the end save | `retired` | nothing to do |
+
+The pending-`running` row is the stated residual: the operator-discard takeover refuses a
+`running` pending record, and no resolver is added, so that source stays retained until a
+later owner-approved mechanism. The table covers process crashes only. No storage or
+power-loss durability is claimed: the tree removal's parent directory is not fsynced.
+
+### Not shipped
+
+Production activation (owner co-sign), hosted acceptance, and any resolver for the pending
+`running` residual. #3329's genuine-idle reclaim roll, #1860 and #2746 are unchanged.

@@ -123,6 +123,10 @@ when the scheduler reports a verified CPU/memory shortage. Capacity blockage
 requires waiting, a smaller worker, or added capacity; Pending claims alone do
 not establish storage health. See [Worker versions and upgrades](worker-upgrades.md).
 
+## Pod shutdown grace
+
+Worker pods render `terminationGracePeriodSeconds: 40`. On a stop, the worker joins its own already-authorized authority settlements and logs one `worker_shutdown_result` line within 35 s of the first signal; the extra 5 s is margin (the result is described in [Configuration](./configuration.md)). The field is part of the pod spec, so upgrading the controller changes the pod spec hash once and every hosted worker rolls once through the existing paced roll ([ADR-1470](../adr/1470-paced-hosted-worker-rolls.md)). If a worker stops on its own and its shutdown is `incomplete` (exit 1), the container restarts in the live pod, and the roll health view may briefly name that terminated container (exit 1) as the blocking one; a pod being deleted by the roll is normally not shown. An `incomplete` result never certifies anything: any unresolved record keeps its protections (a successor still refuses it), while a write already started may still complete after the diagnostic. Hosted end-to-end acceptance is pending.
+
 ## Draining and cordoned
 
 Persistent hosted workers roll one canary first in each owner's placement and
@@ -461,8 +465,9 @@ or supported manual settled-tree cleanup frees space. See
 bounds, periodic reclaim, admission stop and the bounded `data_volume_full`
 park, and [Run recovery](./run-recovery.md) for supported inspect/discard
 procedures; pressure does not authorize deleting protected sources.
-[PRD #3431](../prds/3431-pod-epoch-reclaim.md) M1b settlement/deletion is not
-started, and #3329's genuine-idle reclaim roll is deferred. This policy adds
+[PRD #3431](../prds/3431-pod-epoch-reclaim.md) M1b settlement/deletion is
+implemented behind an off-by-default gate, so production still deletes
+nothing, and #3329's genuine-idle reclaim roll is deferred. This policy adds
 no reclaim authority.
 
 ### Docker workers: run directory on the data volume

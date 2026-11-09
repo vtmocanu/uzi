@@ -465,6 +465,7 @@ export interface RunContext {
    *  which is the CORRECT answer for a gate-less run, not a fallback to tolerate. */
   approvedSelection?: AgentSelection;
   requestedAgentSource?: AgentSource | null;
+  reportPlanAgentSource?(source: AgentSource): Promise<void>;
   /** Called once with the SDK session id when first observed (for /state). */
   onSessionId?(sessionId: string): void;
   /** Aborts the SDK subprocess when signalled (cancel/shutdown; wired in M4). */
@@ -1071,7 +1072,11 @@ export interface Executor {
    * complete. Absent on the stub/test and
    * Codex executors.
    */
-  reapAttributedProcesses?(): Promise<RunProcessReap>;
+  reapAttributedProcesses?(opts?: {
+    /** issue #3980: absolute epoch-ms deadline of a bounded gate checkpoint. Past it nothing new is
+     *  admitted and a join that is still pending reads as an unconfirmed (incomplete) reap. */
+    deadlineAt?: number;
+  }): Promise<RunProcessReap>;
   /**
    * Issue #2471: dispose and confirm the model commands of a memory-guard-bound Claude flight
    * within `deadlineMs`, and refuse new ones until the next turn. `confirmed: false` means a

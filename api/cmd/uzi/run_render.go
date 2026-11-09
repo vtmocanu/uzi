@@ -603,6 +603,8 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 		clauses = append(clauses, "extend: uzi run extend "+r.ID+" --by 2h")
 	case holdCredentialDisabled:
 		clauses = append(clauses, credentialDisabledAction(r))
+	case holdCredentialsReset:
+		clauses = append(clauses, credentialsResetAction)
 	case holdProviderUnavailable:
 		clauses = append(clauses, providerHoldAction(r))
 	case holdCredentialSwitchSettling, holdCredentialSwitchUnsettled:
@@ -631,6 +633,8 @@ func holdReasonLabel(reason string) string {
 		return "completion blocked"
 	case holdCredentialDisabled:
 		return "credential disabled"
+	case holdCredentialsReset:
+		return "credentials were reset"
 	case holdProviderUnavailable:
 		return "provider unavailable"
 	case holdCredentialSwitchSettling:
@@ -674,6 +678,17 @@ func baseAttestationAction(r apitypes.RunDTO) string {
 func isCredentialDisabledHold(r apitypes.RunDTO) bool {
 	return r.Status == statusPaused && strOr(r.HoldReason, "") == holdCredentialDisabled
 }
+
+// isCredentialsResetHold reports whether r is parked because an admin reset its owner's account
+// and deleted every model credential (PRD #3989: status paused, hold_reason credentials_reset).
+func isCredentialsResetHold(r apitypes.RunDTO) bool {
+	return r.Status == statusPaused && strOr(r.HoldReason, "") == holdCredentialsReset
+}
+
+// credentialsResetAction is the owner's next step for a credentials_reset hold (PRD #3989). The
+// run resumes by itself once a credential exists, and the server refuses `uzi run resume` on it
+// (409), so it names Settings and no CLI verb.
+const credentialsResetAction = "add a credential in Settings; the run resumes automatically" //nolint:gosec // G101: owner-facing guidance text, not a credential.
 
 // credentialSwitchableLane reports whether the CLI offers a per-run token switch (`uzi run
 // set-token`) for r, the D16 rule the web's isCredentialSwitchRefusedLane applies: never a
@@ -729,6 +744,8 @@ func pausedHoldNotice(r apitypes.RunDTO, origin ...string) string {
 		return "parked at its time limit; extend: uzi run extend " + id + " --by 2h"
 	case holdCredentialDisabled:
 		return "held, a credential it needs is disabled; " + credentialDisabledAction(r)
+	case holdCredentialsReset:
+		return "held, your credentials were reset; " + credentialsResetAction
 	case holdProviderUnavailable:
 		return "held, provider unavailable; " + providerHoldAction(r)
 	case holdCredentialSwitchSettling:
@@ -753,6 +770,25 @@ func credentialDisabledLine(r apitypes.RunDTO) string {
 		return ""
 	}
 	return "waiting: credential disabled · " + credentialDisabledAction(r)
+}
+
+// credentialsResetLine is the one-line held-run sentence the TUI detail and board print for a
+// credentials_reset hold (PRD #3989), or "" for any other run; the twin of credentialDisabledLine.
+func credentialsResetLine(r apitypes.RunDTO) string {
+	if !isCredentialsResetHold(r) {
+		return ""
+	}
+	return "waiting: credentials were reset · " + credentialsResetAction
+}
+
+// credentialHoldLine is the held-run sentence for either credential park (credential_disabled or
+// credentials_reset), or "" for any other run. The TUI slots that draw one line for a credential
+// hold call this so neither reason falls through to the owner-pause wording.
+func credentialHoldLine(r apitypes.RunDTO) string {
+	if line := credentialDisabledLine(r); line != "" {
+		return line
+	}
+	return credentialsResetLine(r)
 }
 
 // holdParkedClause renders "parked HH:MM (dur)" from the instant the run entered its current
@@ -2527,6 +2563,9 @@ func runStatusCellAt(r apitypes.RunListItemDTO, now time.Time) string {
 		// PRD #1732 D14: say why the run is paused, so it does not read as an owner pause.
 		s += " (credential disabled)"
 	}
+	if isCredentialsResetHold(r.RunDTO) {
+		s += " (credentials were reset)"
+	}
 	switch {
 	case isCredentialSwitchSettlingHold(r.RunDTO):
 		s += " (credential switch settling)"
@@ -2910,6 +2949,14 @@ func agentSourceRows(r apitypes.RunDTO) [][]string {
 			basis = "repo default"
 		}
 		rows = append(rows, []string{"AGENTS_REQUESTED", agentSourceLabel(requested) + " (" + basis + ")"})
+		planned := "—"
+		if source := strOr(r.PlanAgentSource, ""); source != "" {
+			planned = agentSourceLabel(source)
+			if source == requested {
+				planned += " (" + basis + ")"
+			}
+		}
+		rows = append(rows, []string{"PLANNED_WITH", planned})
 	}
 	if implemented := strOr(r.AgentSource, ""); implemented != "" {
 		cell := agentSourceLabel(implemented)

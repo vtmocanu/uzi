@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import type { Run, PlanCrossCheckSummary } from "../lib/apiTypes";
 import { formatLocalTime } from "../lib/budget";
 import { costDisplay, costHeadline } from "../lib/costStatus";
+import { planCrossCheckGateLabel } from "../lib/crossCheckGate";
 import { formatTokens } from "../lib/formatTokens";
 import { isTerminalRun } from "../lib/runStatus";
 import { stripUnsafeChars } from "../lib/safeText";
@@ -20,17 +21,6 @@ const reasons: Record<string, string> = {
   codex_lead_unsupported: "Not yet supported for a Codex lead",
   planning_diff_refused: "Planning diff refused", candidate_refused: "Candidate refused",
   worker_unsupported: "Not supported on this worker",
-};
-
-// PRD #3708: the coarse result a checked-before-your-review run shows for its gate reason.
-// Any other recorded reason means the check could not give a verdict: "Unavailable". The
-// precise reason stays on the "Current gate" line.
-const gatedResults: Record<string, string> = {
-  worker_unsupported: "Unavailable, not supported on this worker",
-  timed_out: "Timed out", model_timeout: "Timed out",
-  block: "Blocked", revisions_exhausted: "Revisions exhausted",
-  interrupted: "Interrupted", superseded: "Interrupted",
-  revise: "Changes requested",
 };
 
 // The lead's response states (PRD #3708). None of them claims a finding was resolved.
@@ -208,7 +198,7 @@ function gatedResult(run: Run): string {
   const passed = passedRounds(run);
   if (passed !== undefined) return `Passed after ${passed} ${passed === 1 ? "round" : "rounds"}`;
   if (s?.historical) return "Checked an earlier version of this plan";
-  if (typeof gate === "string" && gate !== "") return Object.prototype.hasOwnProperty.call(gatedResults, gate) ? gatedResults[gate] : "Unavailable";
+  if (typeof gate === "string" && gate !== "") return planCrossCheckGateLabel(gate);
   if (s) {
     // An approval the passed rule refused (rounds skew, out-of-range round) is never a pass.
     const outcome = planCheckOutcome(s.verdict, s.reason_class);

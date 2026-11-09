@@ -221,7 +221,7 @@ var runDTOKeys = []string{
 	"finished_at", "created_at", "updated_at",
 	// issue #1727: when the run entered its current status; null only defensively.
 	"status_since", "repo_agents", "repo_agent_source_commit", "agent_source",
-	"agent_exclusions", "agent_source_requested", "agent_source_requested_basis", "own_agents",
+	"agent_exclusions", "agent_source_requested", "agent_source_requested_basis", "plan_agent_source", "own_agents",
 	// PRD #111 M1: which Anthropic credential the claim spent. The label is a
 	// snapshot and outlives the id, so both keys are always on the wire.
 	"anthropic_secret_id", "anthropic_secret_label",
@@ -376,7 +376,7 @@ func TestRunListItemDTOTags(t *testing.T) {
 	// worker_name field shadows the embedded one (json collapses the duplicate tag to one key), so it
 	// is NOT appended here any more.
 	// is_revising moved onto RunDTO (issue #2760), so it is in runDTOKeys.
-	want := append(append([]string{}, runDTOKeys...), "judge_verdict", "judge_todo_count")
+	want := append(append([]string{}, runDTOKeys...), "judge_verdict", "judge_todo_count", "cross_check_active")
 	assertTags(t, "RunListItemDTO(no owner)", RunListItemDTO{}, want...)
 	// owner_email present when set.
 	email := "u@example.test"
@@ -1428,6 +1428,7 @@ func TestRecoveryWorkerRPCTags(t *testing.T) {
 		"hold_id", "generation", "has_available_capture", "inventory_guarded", "capture_state")
 	// holds is NOT omitempty (present-as-null on the zero value; the service normalizes to []).
 	assertTags(t, "RecoveryHoldsResponse", RecoveryHoldsResponse{}, "run_id", "holds")
+	assertTags(t, "RecoveryHoldsResponse(full)", RecoveryHoldsResponse{RunOpenHolds: &RecoveryRunOpenHolds{}}, "run_id", "holds", "run_open_holds")
 	// Issue #1582 M1: the predecessor-settle request carries candidate SHAs only (never an
 	// ancestry verdict), every field always on the wire.
 	assertTags(t, "RecoverySettleRequest", RecoverySettleRequest{},

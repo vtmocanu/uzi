@@ -33,8 +33,10 @@ function groups(): Group[] {
       const a = attempt("plan", n + 1, active && (n === 0 || n === retainedPlan - 1));
       return a.active ? executed(a, i + 1) : a;
     });
-    attempts[2] = { ...attempts[2], execution: "replaced", historical: true };
-    attempts[3] = { ...executed(attempts[3], i + 1, "approved"), historical: true };
+    // An unstored approval keeps its review but is replaced, as in the API.
+    attempts[2] = { ...attempts[2], execution: "replaced", review: "approved", reason: "Approval was not stored", historical: true };
+    // A Plan verdict recorded before custody loss keeps its verdict and stays historical (#4037).
+    attempts[3] = { ...executed(attempts[3], i + 1, "approved"), interrupted_at: "2026-10-30T10:45:00Z", historical: true };
     attempts[4] = executed(attempts[4], i + 1, "changes_requested");
     attempts[5] = { ...attempts[5], execution: "unknown", review: "unknown" };
     attempts.push(executed(attempt("code", 1, active), i + 1,
@@ -52,7 +54,9 @@ function matches(a: Attempt, p: Params) {
   if (p.stage && p.stage !== "all" && p.stage !== a.stage) return false;
   if (!p.outcome || p.outcome === "any") return true;
   if (p.outcome === "didnt_finish") return ["didnt_finish", "couldnt_start"].includes(a.execution);
-  if (p.outcome === "replaced") return ["replaced", "interrupted"].includes(a.execution);
+  // Replacement takes precedence over a recorded review, mirroring the API's classification.
+  if (["replaced", "interrupted"].includes(a.execution)) return p.outcome === "replaced";
+  if (p.outcome === "replaced") return false;
   if (p.outcome === "passed") return a.review === "approved";
   return ["changes_requested", "blocked"].includes(a.review);
 }

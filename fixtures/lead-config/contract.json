@@ -125,6 +125,13 @@
         "effort": "medium",
         "effortMode": "explicit",
         "effortSource": "builtin"
+      },
+      "server": {
+        "lane": "sonnet",
+        "run_model": "fable",
+        "user_effort": null,
+        "template_claude": "opus",
+        "template_codex": null
       }
     },
     {
@@ -144,6 +151,13 @@
         "effort": "high",
         "effortMode": "explicit",
         "effortSource": "user_default"
+      },
+      "server": {
+        "lane": "sonnet",
+        "run_model": null,
+        "user_effort": "high",
+        "template_claude": "opus",
+        "template_codex": null
       }
     },
     {
@@ -163,6 +177,13 @@
         "effort": "high",
         "effortMode": "explicit",
         "effortSource": "user_default"
+      },
+      "server": {
+        "lane": "sonnet",
+        "run_model": null,
+        "user_effort": "high",
+        "template_claude": "opus",
+        "template_codex": null
       }
     },
     {
@@ -180,6 +201,13 @@
         "effort": "medium",
         "effortMode": "explicit",
         "effortSource": "builtin"
+      },
+      "server": {
+        "lane": null,
+        "run_model": null,
+        "user_effort": null,
+        "template_claude": "opus",
+        "template_codex": null
       }
     },
     {
@@ -195,6 +223,13 @@
         "effort": "medium",
         "effortMode": "explicit",
         "effortSource": "builtin"
+      },
+      "server": {
+        "lane": null,
+        "run_model": null,
+        "user_effort": null,
+        "template_claude": null,
+        "template_codex": null
       }
     },
     {
@@ -227,6 +262,13 @@
         "modelSource": "user_default",
         "effortMode": "runtime_default",
         "effortSource": "user_default"
+      },
+      "server": {
+        "lane": "opus",
+        "run_model": null,
+        "user_effort": "runtime",
+        "template_claude": null,
+        "template_codex": null
       }
     },
     {
@@ -242,6 +284,13 @@
         "modelSource": "builtin",
         "effortMode": "runtime_default",
         "effortSource": "user_default"
+      },
+      "server": {
+        "lane": null,
+        "run_model": null,
+        "user_effort": "runtime",
+        "template_claude": null,
+        "template_codex": null
       }
     },
     {
@@ -272,6 +321,13 @@
         "effort": "medium",
         "effortMode": "explicit",
         "effortSource": "builtin"
+      },
+      "server": {
+        "lane": null,
+        "run_model": null,
+        "user_effort": null,
+        "template_claude": null,
+        "template_codex": null
       }
     },
     {
@@ -291,6 +347,13 @@
         "effort": "high",
         "effortMode": "explicit",
         "effortSource": "user_default"
+      },
+      "server": {
+        "lane": null,
+        "run_model": "gpt-6-astra",
+        "user_effort": "high",
+        "template_claude": null,
+        "template_codex": null
       }
     },
     {
@@ -310,6 +373,13 @@
         "effort": "xhigh",
         "effortMode": "explicit",
         "effortSource": "user_default"
+      },
+      "server": {
+        "lane": "gpt-6-astra",
+        "run_model": null,
+        "user_effort": "xhigh",
+        "template_claude": null,
+        "template_codex": null
       }
     },
     {
@@ -328,6 +398,13 @@
         "effort": "medium",
         "effortMode": "explicit",
         "effortSource": "builtin"
+      },
+      "server": {
+        "lane": null,
+        "run_model": null,
+        "user_effort": null,
+        "template_claude": "opus",
+        "template_codex": null
       }
     },
     {
@@ -448,6 +525,13 @@
         "effort": "high",
         "effortMode": "explicit",
         "effortSource": "user_default"
+      },
+      "server": {
+        "lane": "gpt-6-astra",
+        "run_model": null,
+        "user_effort": "high",
+        "template_claude": null,
+        "template_codex": "gpt-6-luna"
       }
     },
     {
@@ -612,6 +696,150 @@
         "modelSource": "template",
         "effortMode": "runtime_default",
         "effortSource": "builtin"
+      }
+    },
+    {
+      "id": "claude-no-lead-template-sdk-default",
+      "harness": "claude",
+      "phase": "implement",
+      "config": {
+        "default_effort": "medium",
+        "default_effort_source": "builtin"
+      },
+      "agents": [
+        {
+          "name": "coder",
+          "model": "opus"
+        }
+      ],
+      "expect": {
+        "modelSource": "builtin",
+        "effort": "medium",
+        "effortMode": "explicit",
+        "effortSource": "builtin"
+      },
+      "server": {
+        "lane": null,
+        "run_model": null,
+        "user_effort": null,
+        "template_claude": null,
+        "template_codex": null
+      }
+    },
+    {
+      "id": "claude-template-luna-filtered-sdk-default",
+      "harness": "claude",
+      "phase": "implement",
+      "config": {
+        "default_effort": "medium",
+        "default_effort_source": "builtin"
+      },
+      "agents": [
+        {
+          "name": "lead",
+          "model": null
+        }
+      ],
+      "expect": {
+        "modelSource": "builtin",
+        "effort": "medium",
+        "effortMode": "explicit",
+        "effortSource": "builtin"
+      },
+      "server": {
+        "lane": null,
+        "run_model": null,
+        "user_effort": null,
+        "template_claude": "gpt-6-luna",
+        "template_codex": null
+      }
+    },
+    {
+      "id": "codex-template-pin-with-builtin-effort",
+      "harness": "codex",
+      "phase": "implement",
+      "config": {
+        "default_effort": "medium",
+        "default_effort_source": "builtin"
+      },
+      "agents": [
+        {
+          "name": "lead",
+          "model": "gpt-6-luna"
+        }
+      ],
+      "providerDefaultModel": "gpt-6.1-sol",
+      "expect": {
+        "model": "gpt-6-luna",
+        "modelSource": "template",
+        "effort": "medium",
+        "effortMode": "explicit",
+        "effortSource": "builtin"
+      },
+      "server": {
+        "lane": null,
+        "run_model": null,
+        "user_effort": null,
+        "template_claude": null,
+        "template_codex": "gpt-6-luna"
+      }
+    },
+    {
+      "id": "codex-claim-model-schedule-pin-compatible",
+      "harness": "codex",
+      "phase": "implement",
+      "config": {
+        "default_model": "gpt-6-sol",
+        "default_model_source": "schedule_pin",
+        "default_effort": "medium",
+        "default_effort_source": "builtin"
+      },
+      "agents": [
+        {
+          "name": "lead",
+          "model": "gpt-6-luna"
+        }
+      ],
+      "providerDefaultModel": "gpt-6.1-sol",
+      "expect": {
+        "model": "gpt-6-sol",
+        "modelSource": "schedule_pin",
+        "effort": "medium",
+        "effortMode": "explicit",
+        "effortSource": "builtin"
+      },
+      "server": {
+        "lane": "gpt-6-astra",
+        "run_model": "gpt-6-sol",
+        "user_effort": null,
+        "template_claude": null,
+        "template_codex": "gpt-6-luna"
+      }
+    },
+    {
+      "id": "claude-schedule-pin-incompatible-lane-wins",
+      "harness": "claude",
+      "phase": "implement",
+      "config": {
+        "default_model": "sonnet",
+        "default_model_source": "user_default",
+        "default_effort": "medium",
+        "default_effort_source": "builtin"
+      },
+      "templateModel": "opus",
+      "expect": {
+        "model": "sonnet",
+        "modelSource": "user_default",
+        "effort": "medium",
+        "effortMode": "explicit",
+        "effortSource": "builtin"
+      },
+      "server": {
+        "lane": "sonnet",
+        "run_model": "gpt-6-sol",
+        "user_effort": null,
+        "template_claude": "opus",
+        "template_codex": null
       }
     }
   ],

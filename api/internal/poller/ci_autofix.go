@@ -306,6 +306,16 @@ func (d *CIAutoFix) detectOne(ctx context.Context, r store.ListEnabledReposWithC
 		// A race with the manual Fix-CI button (or an issue run on the branch): swallow,
 		// no comment, do not advance the counter.
 		d.recordPipeline(ctx, r, ref, cand.PipelineID)
+	case errors.Is(err, workersvc.ErrCIFixPRUnresolved):
+		// The branch's PR association is ambiguous (issue #4079): no run, no comment, no
+		// counter. Record the pipeline so the ref is not re-evaluated every tick; the next
+		// failing pipeline is a fresh candidate, and the owner can press Fix CI.
+		slog.Warn("poller: ci-autofix PR association unresolved", "repo", r.PathWithNamespace, "ref", ref, "error", err)
+		d.recordPipeline(ctx, r, ref, cand.PipelineID)
+	case errors.Is(err, workersvc.ErrCIFixPRUnavailable), errors.Is(err, workersvc.ErrCIFixBindingChanged):
+		// Transient (forge unreachable, locked PR, candidates moved): leave the pipeline
+		// unrecorded so the next tick retries.
+		slog.Warn("poller: ci-autofix PR binding not verifiable, will retry", "repo", r.PathWithNamespace, "ref", ref, "error", err)
 	default:
 		// ErrRepoNotFound / a transient DB error: leave unrecorded so the next tick retries.
 		slog.Error("poller: ci-autofix create run", "repo", r.PathWithNamespace, "ref", ref, "error", err)

@@ -96,6 +96,23 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 		slog.Error("current activity", "error", err)
 		activity = nil
 	}
+	// PRD #4040: the pending-question excerpt for the awaiting_input runs on this page. Lives
+	// here, not in overlayListDecorations/writeRunList, which AdminListRuns shares: the rows are
+	// already owner-scoped (ListRunsForUser), so no other user's question can reach this map.
+	// One batched read, skipped when the page has no awaiting_input row (the summary view is
+	// polled by many surfaces). Best-effort like the decorations above.
+	awaitingIDs := make([]uuid.UUID, 0)
+	for _, row := range rows {
+		if row.Run.Status == "awaiting_input" {
+			awaitingIDs = append(awaitingIDs, row.Run.ID)
+		}
+	}
+	// An empty id list reads nothing: PendingQuestionsForRuns returns before the store.
+	pendingQuestions, err := h.wsvc.PendingQuestionsForRuns(r.Context(), awaitingIDs)
+	if err != nil {
+		slog.Error("pending questions", "error", err)
+		pendingQuestions = nil
+	}
 
 	// PRD #1189: read the extension cap and the clock ONCE per list response so every row's
 	// budget_extension_cap_seconds and budget_used_seconds share one cap and one "now".
@@ -117,8 +134,10 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 		// nil stays nil for an unjudged run — absent, not a neutral verdict.
 		item.JudgeVerdict = textPtrValue(row.JudgeVerdict.Valid, row.JudgeVerdict.String)
 		item.JudgeTodoCount = todo[row.Run.ID]
-		applyRevising(&item.RunDTO, revising[row.Run.ID]) // nil map ⇒ false (issue #750)
-		item.CurrentActivity = activity[row.Run.ID]       // nil map ⇒ null (PRD #1064)
+		applyRevising(&item.RunDTO, revising[row.Run.ID])   // nil map ⇒ false (issue #750)
+		item.CurrentActivity = activity[row.Run.ID]         // nil map ⇒ null (PRD #1064)
+		item.PendingQuestion = pendingQuestions[row.Run.ID] // nil map ⇒ "" ⇒ omitted (PRD #4040)
+		item.CrossCheckActive = crossCheckActive(row.HasLivePlanCrossCheck, row.HasLiveCodeCrossCheck)
 		setProgressPhase(&item.RunDTO)
 		// issue #1418: override runToDTO's capture-unaware landing_state with the
 		// capture-aware value from the query's has_available_capture column, so the list
@@ -189,11 +208,27 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 		item.IssueWebURL = textPtrValue(row.IssueWebUrl.Valid, row.IssueWebUrl.String)
 		applyRevising(&item.RunDTO, revising[row.Run.ID]) // nil map ⇒ false (issue #750)
 		item.CurrentActivity = activity[row.Run.ID]       // nil map ⇒ null (PRD #1064)
+		item.CrossCheckActive = crossCheckActive(row.HasLivePlanCrossCheck, row.HasLiveCodeCrossCheck)
 		setProgressPhase(&item.RunDTO)
 		out = append(out, item)
 	}
 	h.overlayListDecorations(r, out)
 	writeRunList(w, r, out)
+}
+
+// crossCheckActive maps the list query's two live-cross-check flags onto the list-only
+// cross_check_active value (issue #4082): "plan" first, then "code", else nil (JSON null).
+func crossCheckActive(plan, code bool) *string {
+	var s string
+	switch {
+	case plan:
+		s = "plan"
+	case code:
+		s = "code"
+	default:
+		return nil
+	}
+	return &s
 }
 
 // writeRunList writes the decorated run list. With ?view=summary (issue #2661) each row is

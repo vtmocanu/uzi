@@ -495,3 +495,107 @@ describe("SdkExecutor — credential switch handled IN PLACE (PRD #1247 M5b data
     assert.strictEqual(followUpCalls, 2, "the follow-up wait was RE-PARKED on the old token after the give-up");
   });
 });
+
+describe("SdkExecutor — credential switch during the plan source report (PRD #3914 M3)", () => {
+  const revisingGate = () => {
+    let gateCalls = 0;
+    return {
+      calls: () => gateCalls,
+      gatePlan: async (): Promise<PlanVerdict> => {
+        gateCalls++;
+        return gateCalls === 1
+          ? { kind: "revise", feedback: "tighten it" } as PlanVerdict
+          : { kind: "approve", selection: { status: "absent" } };
+      },
+    };
+  };
+  const resumedAtGate = { planApproved: false, resumePhase: "awaiting_approval", approvedPlan: "# Submitted plan" } as const;
+
+  it("PRD #3914 M3: a switch during the first plan source report gives up in place, retries the report, then plans", async () => {
+    const { queryFn, turnCount } = fakeTurns([[submitPlan("# Plan"), resultSuccess()], doneTurn()]);
+    let reports = 0;
+    let attempts = 0;
+    let turnsAtRetry = -1;
+    const { ctx } = makeCtx({
+      reportPlanAgentSource: async () => {
+        reports++;
+        if (reports === 1) throw new CredentialSwitchSignal();
+        turnsAtRetry = turnCount();
+      },
+      attemptCredentialSwitch: async () => { attempts++; return "gave_up"; },
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.strictEqual(result.switchReleased, undefined);
+    assert.strictEqual(attempts, 1, "the switch was attempted once, in place");
+    assert.strictEqual(reports, 2, "the interrupted report was retried after the give-up");
+    assert.strictEqual(turnsAtRetry, 0, "the retry ran before any provider turn");
+    assert.strictEqual(turnCount(), 2, "planning and implementation both ran");
+  });
+
+  it("PRD #3914 M3: a switch during the first plan source report that releases starts no provider turn", async () => {
+    const { queryFn, turnCount } = fakeTurns([[submitPlan("# Plan"), resultSuccess()], doneTurn()]);
+    let reports = 0;
+    let attempts = 0;
+    const { ctx } = makeCtx({
+      reportPlanAgentSource: async () => { reports++; throw new CredentialSwitchSignal(); },
+      attemptCredentialSwitch: async () => { attempts++; return "released"; },
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.strictEqual(result.switchReleased, true);
+    assert.strictEqual(attempts, 1);
+    assert.strictEqual(reports, 1);
+    assert.strictEqual(turnCount(), 0, "no provider turn started after the release");
+  });
+
+  it("PRD #3914 M3: a switch during the revision's plan source report gives up in place and the revision stays deferred", async () => {
+    const { queryFn, turnCount } = fakeTurns([[submitPlan("# Revised plan"), resultSuccess()], doneTurn()]);
+    const gate = revisingGate();
+    let reports = 0;
+    let attempts = 0;
+    let deferred = 0;
+    let reportsInDefer = 0;
+    let depth = 0;
+    const { ctx } = makeCtx({
+      ...resumedAtGate,
+      gatePlan: gate.gatePlan,
+      reportPlanAgentSource: async () => {
+        reports++;
+        if (depth > 0) reportsInDefer++;
+        if (reports === 1) throw new CredentialSwitchSignal();
+      },
+      attemptCredentialSwitch: async () => { attempts++; return "gave_up"; },
+      deferCredentialSwitch: async (fn) => {
+        deferred++;
+        depth++;
+        try { return await fn(); } finally { depth--; }
+      },
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.strictEqual(result.switchReleased, undefined);
+    assert.strictEqual(attempts, 1, "the switch was attempted once, in place");
+    assert.strictEqual(reports, 2, "the interrupted report was retried after the give-up");
+    assert.strictEqual(reportsInDefer, 0, "the report runs before the deferred revision turn");
+    assert.strictEqual(deferred, 1, "the revision turn still runs with the switch deferred");
+    assert.strictEqual(gate.calls(), 2, "the revised plan was gated and approved");
+    assert.strictEqual(turnCount(), 2, "the revision turn and implementation both ran");
+  });
+
+  it("PRD #3914 M3: a switch during the revision's plan source report that releases starts no provider turn", async () => {
+    const { queryFn, turnCount } = fakeTurns([[submitPlan("# Revised plan"), resultSuccess()], doneTurn()]);
+    const gate = revisingGate();
+    let attempts = 0;
+    let deferred = 0;
+    const { ctx } = makeCtx({
+      ...resumedAtGate,
+      gatePlan: gate.gatePlan,
+      reportPlanAgentSource: async () => { throw new CredentialSwitchSignal(); },
+      attemptCredentialSwitch: async () => { attempts++; return "released"; },
+      deferCredentialSwitch: async (fn) => { deferred++; return fn(); },
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.strictEqual(result.switchReleased, true);
+    assert.strictEqual(attempts, 1);
+    assert.strictEqual(deferred, 0, "no revision turn was entered");
+    assert.strictEqual(turnCount(), 0, "no provider turn started after the release");
+  });
+});

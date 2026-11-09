@@ -45,14 +45,41 @@ export function WorkerLeaseBadge({ worker }: { worker: Worker }) {
   return <LeaseCountdown key={expiresAt} expiresAt={expiresAt} />;
 }
 
+/** The shared tooltip on the `ephemeral` badge and the expanded Capacity row note. */
+export const EPHEMERAL_WORKER_TITLE =
+  "Auto-provisioned on demand for a run that needed a capability no online worker had. Removed after that run finishes and any lease ends.";
+
+function leaseUntil(expiresAt: string): string {
+  return new Date(Date.parse(expiresAt)).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+/** The lease as a sentence for an expanded row: end time and time left. Same keyed-clock
+ *  rule as WorkerLeaseBadge; nothing once the lease is absent or expired. */
+export function WorkerLeaseNote({ worker }: { worker: Worker }) {
+  const expiresAt = worker.ephemeral_lease_expires_at;
+  if (!expiresAt) return null;
+  return <LeaseSentence key={expiresAt} expiresAt={expiresAt} />;
+}
+
+function LeaseSentence({ expiresAt }: { expiresAt: string }) {
+  const now = useNow(30_000);
+  const left = leaseRemaining(expiresAt, now);
+  if (left == null) return null;
+  return (
+    <p>
+      Kept warm for same-branch follow-up work until {leaseUntil(expiresAt)} ({left} left), then removed.
+    </p>
+  );
+}
+
 function LeaseCountdown({ expiresAt }: { expiresAt: string }) {
   const now = useNow(30_000);
   const left = leaseRemaining(expiresAt, now);
   if (left == null) return null;
-  const until = new Date(Date.parse(expiresAt)).toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+  const until = leaseUntil(expiresAt);
   return (
     <Badge
       tone="plan"

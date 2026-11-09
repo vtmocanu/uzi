@@ -178,7 +178,8 @@ type FakeClient struct {
 	// LastCreateSeed captures PRD #209's optional seeded plan (nil when the run was
 	// created without --plan-file), so a test can assert the plan body and the roster
 	// the CLI forwarded — the assertion M3's flag parsing is proven against.
-	LastCreateSeed *CreateRunSeed
+	LastCreateSeed        *CreateRunSeed
+	LastCreateAgentSource string
 	// LastCreateCredOverride captures PRD #1247 M2's create-time credential choice (nil when
 	// --token was omitted), so a test can assert the CLI resolved a label to {pinned,
 	// secret_id} client-side and sent auto/default/inherit as a bare mode.
@@ -362,6 +363,17 @@ type FakeClient struct {
 
 	// Settings drives GetMySettings: the caller's own non-secret settings.
 	Settings apitypes.UserSettingsDTO
+
+	// Effective and EffectiveErr drive GetEffectiveSettings (PRD #3254); with both unset the fake
+	// behaves like a server that predates the route (404).
+	Effective    *apitypes.EffectiveSettingsDTO
+	EffectiveErr error
+
+	// SchedulePreview and SchedulePreviewErr drive PreviewScheduleSettings; with both unset the
+	// fake answers 404 like a foreign schedule. SchedulePreviewIDs records the ids asked for.
+	SchedulePreview    *apitypes.ScheduleSettingsPreviewDTO
+	SchedulePreviewErr error
+	SchedulePreviewIDs []string
 
 	// SetUsageReserve capture (PRD #3522): how many times it was called and the threshold
 	// (nil = off) and pause flag the command sent.

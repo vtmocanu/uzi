@@ -60,7 +60,9 @@ replaced or interrupted evidence; a recorded review can survive missing child
 metadata without proving that execution finished. Missing or unrecognized
 values remain unknown or not recorded. An absent valid child has no checker
 link. A historical approval concerns an earlier plan candidate and does not
-certify a later candidate or human revision. Cause, next action and effect
+certify a later candidate or human revision. A Plan verdict recorded before the
+lead lost custody shows as that verdict (passed or raised issues) rather than
+as interrupted, keeps its interruption time, and stays historical. Cause, next action and effect
 can be unrecorded; the history view grants no new approval or policy effect.
 
 ### Page sizes and continuation
@@ -468,16 +470,25 @@ comparison, not a bill. See [run cost](./run-cost.md#metered-subscription-and-un
 After a human revision,
 **Earlier-plan evidence** does not certify the current plan. Approve, request
 changes or reject the plan shown at the current gate; the original check stays
-as history, without an automatic new checker round.
+as history, without an automatic new checker round. If the lead asks you a
+question while working your requested changes, your answer returns the run to
+the plan gate; it never approves the plan, and the revised plan is shown at
+the next gate.
 
 [CLI](./cli.md#plan-cross-check-evidence) shows the reason and findings;
 [Slack](./slack.md#using-it) shows the reason without findings.
 
 ## Claude checker isolation
 
-The Claude checker has only the `Read`, `Grep` and `Glob` tools: no shell, web,
-nested-agent or write tools, and no repository settings, plugins, skills or MCP
-servers. It runs with an isolated environment holding only your Anthropic token
+The Claude checker's repository access tools are `Read`, `Grep` and `Glob`: no
+shell, web, nested-agent or write tools, and no repository settings, plugins,
+skills or MCP servers. Besides those it has only the SDK's end-turn
+`StructuredOutput` tool, which returns its final verdict and touches no files or
+network. When that verdict does not match the expected schema, the SDK re-asks
+within the same session (up to five attempts, same turn limit, deadline and
+usage); if those retries are exhausted the check fails as malformed. A verdict
+that matches the schema but fails uzi's other verdict checks (size caps,
+duplicate finding ids and the like) is not retried and also fails as malformed. It runs with an isolated environment holding only your Anthropic token
 (a Codex checker holds only Codex credentials), as the worker's runner user.
 Direct reads are limited to its own checkout, plus its own SDK spill files for
 oversized tool output. Glob and Grep patterns that are absolute, home-relative
@@ -753,8 +764,17 @@ index, path, walk and ignore budgets also scale from the verified base;
 see the [counter definitions and bounds](../adr/2149-cross-check.md#planning-diff-capture-symlinks-gitlinks-and-budgets-2026-10-07-2410).
 
 There is no object-store snapshot copy or snapshot budget. Base discovery
-has per-object, depth and deadline bounds, with no aggregate base cap or
-cache. No additional absolute ceiling applies to the relative totals. Limits remain: 4 MiB per file, 2 MiB per commit/tree object, depth 64,
+has per-object, depth and deadline bounds plus two absolute aggregate caps:
+1,200,000 tree-entry occurrences (a shared subtree counts each time it is
+walked; there is no cache) and 96 MiB of cumulative relative-path bytes
+(directories included). Exceeding either refuses the capture as
+`diff_too_large`; the caps are at least 2x the largest realistic trees
+measured. See the [dated ADR amendment](../adr/2149-cross-check.md#amendment-2026-11-06--3543-aggregate-base-discovery-bound).
+A base just under both caps, measured with the deadline lifted for validation (not production
+timing), peaked at about 985 MiB in a 1536 MiB / 1 CPU container. That covers discovery and
+the sizing batch; the post-discovery phase on a real checkout was not measured. See the
+[measurement](../e2e/planning-base-discovery-measure/RESULTS.md).
+Other limits remain: 4 MiB per file, 2 MiB per commit/tree object, depth 64,
 64 KiB per ignore/exclude read, 512 KiB patch/output and 200 non-ignored
 untracked files. The helper has 28 s and the outer capture 30 s; yielding
 during discovery and reads allows cancellation cleanup within the production
@@ -895,6 +915,12 @@ then report missing or partly delivered criteria:
 - Use minor `Coverage uncertainty:` findings for hosted, live or maintainer-only
   verification. Grade missing worker-deliverable implementation or regression
   tests by impact.
+- The worker's own command results (gate, build, lint, test, red/green and
+  mutation runs, and their logs) are not supplied to the checker. Their absence
+  alone is neither a defect nor a criterion finding, and run results claimed in
+  committed text or the plan are unverified claims, not evidence. A criterion
+  that itself requires a run result gets a minor `Coverage uncertainty:`
+  finding. Tests and validation are judged from the committed code.
 - Treat a missing requirement stated by the issue as a safety, security or
   data-integrity constraint as a critical or major defect, without either prefix.
   Defect titles must not use criterion prefixes.

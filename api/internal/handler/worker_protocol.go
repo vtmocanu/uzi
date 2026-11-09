@@ -430,6 +430,7 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		{"worker_memory_authority_claim_v1"}, // issue #3142: this api accepts the run-lane claim body's memory_authority member
 		{"recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "recovery_archive_redundancy_v1"}, // PRD #1392 M1; issue #2625 adds the redundancy route
 		{capability.RecoveryBindinglessClosedV1}, // Historical reads are independent of publication write switches.
+		{capability.RecoveryRunOpenHoldsV1},      // Issue #3431: the worker holds read may carry the run-wide open-hold count.
 		{"heartbeat_outbox"},                     // PRD #1391 M5, Run A
 		{"heartbeat_outbox_root_unusable"},       // optional worker-global diagnostic
 		{"worker_residue_quarantine"},            // issue #2213: this api accepts the heartbeat's residue_quarantine member
@@ -454,6 +455,10 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		// the cause or the flag, because an older api 400s both.
 		{"recovery_cause_codex_idle_stall_v1"},
 		{"recovery_cause_retained_recovery_exhausted"},
+		// Issue #4046: this api accepts retained_capacity_only on a retained_recovery_exhausted
+		// park and holds it owner-side without counting it. A worker sends the marker ONLY after
+		// seeing this token, because an older api's strict decoder 400s the unknown field.
+		{workersvc.RetainedCapacityHoldFeature},
 		// Issue #3859: this api accepts the nested registration_evidence object on a `running`
 		// report ({register_nonce, claim_generation, registration_epoch}) and answers
 		// registration_evidence "recorded" | "refused" on the ACK, whether or not the status write
@@ -483,6 +488,7 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		// unknown field, so a worker sends it only after seeing this token.
 		{"repo_agent_folder"},
 		{workersvc.RepoAgentSourceFeature},
+		{workersvc.PlanAgentSourceFeature},
 		{"terminal_rejection_report"}, // Issue #1974 M1; independent of active snapshots.
 		// Issue #3181: this api accepts {status:"credential_switch_held"} and
 		// {status:"credential_switch_hold_settled"} (each with claim_generation AND the reporting worker's
@@ -490,6 +496,13 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		// with disposition "held" / "hold_settled". Advertised UNCONDITIONALLY: a worker sends
 		// the two reports ONLY after seeing this token, because an older api 400s the unknown states.
 		{"credential_switch_hold"},
+		// Issue #3985: this api accepts {status:"clarification_settled", claim_generation,
+		// clarification_settlement:{question_id, revision_input_id, gate_revision}} and answers it
+		// with disposition "clarification_settled". It returns a plan cross-check run parked at
+		// awaiting_input, after a clarification asked during a human revision was answered, to its
+		// awaiting_approval gate. Advertised UNCONDITIONALLY: a worker sends the report ONLY after
+		// seeing this token, because an older api 400s the unknown state and field.
+		{"clarification_revision_settlement_v1"},
 	}
 	if publicationResumeEnabled {
 		// Issue #1324: this api accepts NEW publication intents. Omitted when
@@ -1554,7 +1567,7 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			// The service error text already reads "invalid run state: a job run never parks (<state>)".
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, workersvc.ErrInvalidState):
-			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, credential_switch_held, credential_switch_hold_settled, completed, failed")
+			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, credential_switch_held, credential_switch_hold_settled, clarification_settled, completed, failed")
 		default:
 			slog.Error("worker run state", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -1636,6 +1649,10 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		// Issue #3181: the settlement acknowledgement applied (or replayed): the hold is now
 		// credential_switch_unsettled and the owner's Resume is open.
 		ack["disposition"] = "hold_settled"
+	case "clarification_settled":
+		// Issue #3985: the settlement applied (or replayed): the run is back at awaiting_approval
+		// with the human revise still pending. The worker keys on this.
+		ack["disposition"] = "clarification_settled"
 	}
 	if req.State == "awaiting_approval" && gateRevision > 0 {
 		// PRD #1795 M1 (decision 5): the revision this report was answered with, allocated or

@@ -139,20 +139,66 @@ func TestRunCreateExcludeWithoutSourceIsUsageError(t *testing.T) {
 	}
 }
 
-// A roster flag with no --plan-file is a usage error client-side, mirroring the
-// server's 400 "agent_selection requires plan_md" — a clean message before any request.
-func TestRunCreateSelectionWithoutPlanFileIsUsageError(t *testing.T) {
-	fc := &uzicli.FakeClient{}
-	_, errb, code := runCLI(t, fakeEnv(fc), "run", "create", "--repo", "p1", "--issue", "42",
-		"--agent-source", "repo")
-	if code != uzicli.ExitUsage {
-		t.Fatalf("exit = %d, want %d (usage)", code, uzicli.ExitUsage)
+func TestRunCreateAgentSourceWithoutPlanFile(t *testing.T) {
+	for _, source := range []string{"own", "repo"} {
+		fc := &uzicli.FakeClient{CreatedRun: apitypes.RunDTO{ID: "r1", Status: "queued", Kind: "issue"}}
+		_, errb, code := runCLI(t, fakeEnv(fc), "run", "create", "--repo", "p1", "--issue", "42",
+			"--agent-source", source)
+		if code != uzicli.ExitOK {
+			t.Fatalf("--agent-source %s: exit = %d, want 0 (stderr %s)", source, code, errb)
+		}
+		if fc.LastCreateSeed != nil {
+			t.Fatalf("--agent-source %s without --plan-file sent a seed: %+v", source, fc.LastCreateSeed)
+		}
+		if fc.LastCreateAgentSource != source {
+			t.Fatalf("agent source = %q, want %q", fc.LastCreateAgentSource, source)
+		}
 	}
-	if !strings.Contains(errb, "plan-file") {
-		t.Errorf("error should point at --plan-file:\n%s", errb)
+}
+
+func TestRunCreatePlanFileSelectionSendsNoSeparateSource(t *testing.T) {
+	planPath := filepath.Join(t.TempDir(), "plan.md")
+	if err := os.WriteFile(planPath, []byte("do it"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	if fc.LastCreateRepoID != "" {
-		t.Error("a usage error must not create a run")
+	fc := &uzicli.FakeClient{CreatedRun: apitypes.RunDTO{ID: "r1", Status: "queued", Kind: "issue"}}
+	_, _, code := runCLI(t, fakeEnv(fc), "run", "create", "--repo", "p1", "--issue", "42",
+		"--plan-file", planPath, "--agent-source", "repo")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if fc.LastCreateSeed == nil || fc.LastCreateSeed.Selection == nil || fc.LastCreateSeed.Selection.Source != "repo" {
+		t.Fatalf("seed selection = %+v, want source repo", fc.LastCreateSeed)
+	}
+	if fc.LastCreateAgentSource != "" {
+		t.Fatalf("a seeded create sent a separate agent source %q", fc.LastCreateAgentSource)
+	}
+}
+
+func TestRunCreateFlagsWithoutPlanFileAreUsageErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"exclusions", []string{"--agent-source", "own", "--exclude-agents", "tester"}, "--exclude-agents requires --plan-file"},
+		{"planned commit", []string{"--agent-source", "own", "--planned-commit", "abc1234"}, "--plan-file"},
+		{"require base", []string{"--planned-commit", "abc1234", "--require-base"}, "--plan-file"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := &uzicli.FakeClient{}
+			args := append([]string{"run", "create", "--repo", "p1", "--issue", "42"}, tc.args...)
+			_, errb, code := runCLI(t, fakeEnv(fc), args...)
+			if code != uzicli.ExitUsage {
+				t.Fatalf("exit = %d, want %d (usage)", code, uzicli.ExitUsage)
+			}
+			if !strings.Contains(errb, tc.want) {
+				t.Errorf("error should contain %q:\n%s", tc.want, errb)
+			}
+			if fc.LastCreateRepoID != "" {
+				t.Error("a usage error must not create a run")
+			}
+		})
 	}
 }
 

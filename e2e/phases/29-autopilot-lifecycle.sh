@@ -7,8 +7,8 @@
 # requires: -
 # provides: -
 # handoff:  -
-# mutates:  forge connection human_username=owner-alice (:27, saved-with-warning); owner autopilot_enabled=true (:33); creates autopilot-labelled issues + unattended runs
-# restores: - (autopilot left enabled; the owner-alice mapping is RETAINED — 30-autopilot-carry-item's 409 collision test depends on it as DB state, not a var)
+# mutates: forge connection human_username=owner-alice (saved-with-warning); owner autopilot_enabled=true; creates autopilot-labelled issues + unattended runs
+# restores: owner autopilot_enabled to its original value, including on failure; owner-alice mapping retained for 30-autopilot-carry-item's collision test
 # =============================================================================
 # PRD #19 — admin settings + autopilot. The poller is already at ~1s and the
 # reconcile cadence at every-2-ticks (both set with the MR-close phase's api
@@ -30,7 +30,17 @@ WARN="$(apiput "/api/forge/connections/$CONN_ID" '{"human_username":"owner-alice
   || fail "human_username did not persist despite the warning"
 pass "owner mapped to owner-alice (unverifiable → saved WITH a warning)"
 
-[ "$(apiput /api/me/autopilot '{"enabled":true}' | jq -r '.user.autopilot_enabled')" = true ] \
+AP_ORIGINAL="$(apiget /api/auth/me | jq -r '.user.autopilot_enabled | if type == "boolean" then . else error("missing autopilot setting") end')"
+autopilot_exit() {
+  local rc=$?
+  if ! set_owner_autopilot "$AP_ORIGINAL"; then
+    echo 'autopilot: could not restore owner consent' >&2
+    rc=1
+  fi
+  exit "$rc"
+}
+trap autopilot_exit EXIT
+set_owner_autopilot true \
   || fail "autopilot opt-in did not stick"
 pass "repo owner opted into autopilot"
 
@@ -127,4 +137,7 @@ RUN_NP="$(wait_run_for_issue "$IID_NP" 40)"
 [ -n "$RUN_NP" ] && [ "$RUN_NP" != null ] || fail "a uzi+autopilot issue with no PRD link must now start a run"
 wait_status "$RUN_NP" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
 pass "a uzi+autopilot issue with no PRD link runs unattended to completion ($RUN_NP)"
+
+set_owner_autopilot "$AP_ORIGINAL" || fail "could not restore the owner's autopilot setting"
+trap - EXIT
 

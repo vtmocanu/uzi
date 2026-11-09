@@ -4,6 +4,7 @@ import { test } from "node:test";
 import { compileFunction } from "node:vm";
 import { inspectPodEpochBootstrap } from "../src/pod-epoch-bootstrap.js";
 import { PodEpochSettlementError, runPodEpochShadow } from "../src/pod-epoch-reclaim.js";
+import { buildPodEpochDeletionDeps } from "../src/main.js";
 import type { createPodEpoch, PodEpochOwnership } from "../src/pod-epoch-lock.js";
 
 const source = fs.readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
@@ -48,8 +49,18 @@ function contract(text: string): void {
   assert.ok(at('if (verdict === "shutdown")') < shadow, "reaper refusal and shutdown precede shadow");
   assert.ok(at("startupReapVerdict(") < shadow, "startup settlement precedes shadow");
   const admission = at("await worker.run(");
-  assert.ok(shadow < at("if (controller.signal.aborted) return;"), "cancellation checked after shadow");
-  assert.ok(at("if (controller.signal.aborted) return;") < admission, "cancellation prevents admission");
+  // The reservation's runner exists before the pass, and main supplies the production
+  // authority, runner and Git cache without a test activation override.
+  assert.ok(at("const runner = new RunRunner(") < shadow, "the RunRunner exists before the pass");
+  assert.match(main.slice(shadow, admission),
+    /deletion: buildPodEpochDeletionDeps\(\{ authority, runner, git, dockerHost: config.dockerWiring.dockerHost \}\)/,
+    "the pass receives the production deletion dependencies");
+  assert.ok(!main.includes("enableForTest"), "main never passes the deletion test override");
+  const cancellation = at("if (controller.signal.aborted) {");
+  assert.ok(shadow < cancellation, "cancellation checked after shadow");
+  assert.ok(cancellation < admission, "cancellation prevents admission");
+  assert.match(main.slice(cancellation, admission), /await finishShutdown\(\);[\s\S]*return;/,
+    "shadow cancellation joins the shutdown barrier and returns before admission");
   assert.match(main.slice(shadow, admission), /if \(result !== undefined\) log.info\("pod_epoch_reclaim", \{ \.\.\.result \}\)/);
   assert.doesNotMatch(main, /epochOwnership\.(close|reacquireShared)\(/, "main retains lifetime ownership and delegates handover");
   const fatal = main.slice(at("main().catch((err) => {"));
@@ -171,8 +182,12 @@ function admissionPorts(shadow: (options: Record<string, unknown>) => Promise<un
   const controller = new AbortController();
   const ports = {
     controller, reap: undefined, startupReapVerdict: () => "run",
+    shutdownSignal: undefined,
+    finishShutdown: async () => { events.push("shutdown"); return { result: "drained", exitCode: 0 }; },
     epochBootstrap: {}, epochOwnership: {}, epochConsumption: {},
     config: { dockerWiring: { dockerHost: "unix:///docker.sock" } }, git: {}, client: {},
+    authority: {}, runner: {},
+    buildPodEpochDeletionDeps: (parts: Record<string, unknown>) => ({ built: parts }),
     runPodEpochShadow: shadow,
     log: { info: (message: string, fields: unknown) => { events.push(message); assert.ok(fields); } },
     worker: { run: async (signal: AbortSignal) => { assert.equal(signal, controller.signal); events.push("run"); } },
@@ -190,6 +205,12 @@ test("main waits for shadow handover, forwards its ports and logs a defined verd
     assert.equal(options.dockerHost, "unix:///docker.sock");
     assert.equal(options.git, fixture.ports.git);
     assert.equal(options.client, fixture.ports.client);
+    assert.equal(options.log, fixture.ports.log);
+    const built = (options.deletion as { built: Record<string, unknown> }).built;
+    assert.equal(built.authority, fixture.ports.authority);
+    assert.equal(built.runner, fixture.ports.runner);
+    assert.equal(built.git, fixture.ports.git);
+    assert.equal(built.dockerHost, "unix:///docker.sock");
     assert.equal(options.signal, fixture.controller.signal);
     fixture.events.push("shadow");
     return promise;
@@ -207,8 +228,23 @@ test("main omits undefined verdict logging and refuses admission after shadow ca
   assert.deepEqual(ordinary.events, ["run"]);
 
   const aborted = admissionPorts(async () => { aborted.controller.abort(); return undefined; });
-  await aborted.run();
-  assert.deepEqual(aborted.events, []);
+  let entered!: () => void;
+  let release!: () => void;
+  const atBarrier = new Promise<void>(resolve => { entered = resolve; });
+  const barrier = new Promise<void>(resolve => { release = resolve; });
+  aborted.ports.finishShutdown = async () => {
+    aborted.events.push("shutdown"); entered();
+    await barrier;
+    return { result: "drained", exitCode: 0 };
+  };
+  const stopping = aborted.run();
+  await atBarrier;
+  try {
+    assert.deepEqual(aborted.events, ["shutdown"], "pending barrier keeps admission closed and precedes the stop log");
+  } finally { release(); }
+  await stopping;
+  assert.deepEqual(aborted.events, ["shutdown", "uzi-agent stopped before the worker started"],
+    "cancelled shadow joins shutdown and never admits the worker");
 
   for (const error of [new PodEpochSettlementError(), new Error("native SH handover failed")]) {
     const failed = admissionPorts(async () => { throw error; });
@@ -248,4 +284,29 @@ test("startup contract rejects omitted runtime TMPDIR restoration at its named a
   assert.ok(source.includes(call), "restore mutation applies to current candidate");
   assert.throws(() => contract(source.replace(call, "")),
     /required executable symbol: restoreEpochRuntimeTmpdir/, "omit restore must redden the restoration contract");
+});
+
+test("the deletion dependencies main builds bind the runner reservation, never carry the test override and quiesce deny-only", async () => {
+  const calls: unknown[][] = [];
+  const authority = { withTransaction: () => assert.fail("not used"), active: () => undefined, endSourceUse: () => assert.fail("not used") };
+  const git = {};
+  const runner = {
+    withSourceReservation: async (...args: unknown[]) => { calls.push(args); return "reserved"; },
+  };
+  const deps = buildPodEpochDeletionDeps({ authority: authority as never, runner: runner as never, git: git as never, dockerHost: undefined });
+  assert.deepEqual(Object.keys(deps).sort(), ["authority", "git", "quiesce", "reserve"], "no enableForTest key");
+  assert.equal(deps.authority, authority);
+  assert.equal(deps.git, git);
+  const action = async () => 1;
+  assert.equal(await deps.reserve("run-x", action), "reserved");
+  assert.deepEqual(calls, [["run-x", action]]);
+  // Without a recorded maintenance bootstrap the proof is a denial; it never reaches Docker or retains a source.
+  assert.equal(await deps.quiesce(["/tree/0"]), false);
+});
+
+test("main binds the deletion quiesce to the worker-wide terminal maintenance proof over the Docker host", () => {
+  const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+  assert.match(code, /quiesce\s*:\s*\(\s*\)\s*=>\s*terminalMaintenanceProof\s*\(\s*3\s*,\s*parts\s*\.\s*dockerHost\s*\)/);
+  // The deletion binding is worker-wide and never takes a per-pass daemon guard.
+  assert.doesNotMatch(code, /openDaemonGuard/);
 });

@@ -242,13 +242,37 @@ export function killRunnerGroup(pid: number | undefined): boolean {
 }
 
 /**
+ * SIGKILL the single process `pid` of a command-root (`runner-cmd`, COMMAND_UID) child.
+ * Under the split the worker cannot signal it directly (EPERM), so it forks a
+ * setpriv-to-runner-cmd `kill` that signals as the same uid. Pid only, never the group: the
+ * caller (issue #4089, `helperUidKillerFor` in rmtree.ts) spawned it non-detached, so it
+ * leads no group of its own. The runner-cmd analogue of {@link killRunnerGroup}'s pid
+ * fallback; `split` is a test seam defaulting to {@link uidSplitActive}.
+ * @returns true if a kill was dispatched; false for an undefined/non-positive pid or a
+ * failed signal.
+ */
+export function killCommandRootPid(pid: number | undefined, split: boolean = uidSplitActive()): boolean {
+  if (pid === undefined || pid <= 0) return false;
+  if (!split) {
+    try {
+      process.kill(pid, "SIGKILL");
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  const r = spawnSync(SETPRIV, [...setprivArgsForUid(COMMAND_UID), "kill", "-KILL", `${pid}`], { env: workerSpawnEnv(), stdio: "ignore" });
+  return r.status === 0;
+}
+
+/**
  * SIGKILL the process GROUP `pgid` and nothing else: unlike {@link killRunnerGroup} there is
  * no fallback to the bare numeric pid, which for a leader that already exited may name an
  * unrelated, recycled process (issue #1656). @returns true if the signal was delivered; false
  * both when the group is already gone (ESRCH) and when the signal failed, so a caller that
  * needs the group gone must confirm absence independently.
  */
-export function killRunnerGroupOnly(pgid: number): boolean {
+export function killRunnerGroupOnly(pgid: number, fixedHelper = false): boolean {
   if (pgid <= 0) return false;
   if (!uidSplitActive()) {
     // Single-uid: signal the group directly (same uid, permitted).
@@ -259,7 +283,8 @@ export function killRunnerGroupOnly(pgid: number): boolean {
       return false;
     }
   }
-  // Split: reap as `runner` via setpriv. `kill -KILL -<pgid>` targets the process group.
-  const r = spawnSync(SETPRIV, [...setprivRunnerArgs(), "kill", "-KILL", `-${pgid}`], { env: workerSpawnEnv(), stdio: "ignore" });
+  // Split: reap as `runner` via setpriv. The fixed helper receives only group-signal
+  // argv and no EX descriptor; this graph has no tree/ref/config write operation.
+  const r = spawnSync(SETPRIV, [...setprivRunnerArgs(), fixedHelper ? "/bin/kill" : "kill", "-KILL", `-${pgid}`], { env: fixedHelper ? { PATH: "/usr/bin:/bin", LC_ALL: "C" } : workerSpawnEnv(), stdio: "ignore", ...(fixedHelper ? { timeout: 1_000 } : {}) });
   return r.status === 0;
 }

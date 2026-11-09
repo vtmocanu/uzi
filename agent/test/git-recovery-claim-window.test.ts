@@ -2,7 +2,8 @@ import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { GitCache, type RecoveryJournalEntry } from "../src/git.js";
 import { recoveryProgress, type RecoveryBlocker } from "../src/recovery-progress.js";
-import { RequestError } from "../src/client.js";
+import { RequestError, type WorkerClient } from "../src/client.js";
+import { SteeringChannel } from "../src/steering.js";
 import { RunRunner } from "../src/runner.js";
 import { SinkGate } from "../src/sink-gate.js";
 import { nullLogger } from "./helpers.js";
@@ -12,6 +13,12 @@ const permanentBlockers = {
   oversize: true, prerequisites_unavailable: true, quiescence_failed: true,
   preservation_failed: true, decoded_history_limit: true, readiness_cleanup_unconfirmed: true,
 } satisfies Record<Exclude<RecoveryBlocker, "budget_exhausted">, true>;
+
+// These direct recovery fixtures never start the input poller. Keep the production steering
+// dependency so the owner-pause window runs without replacing the ownership/quiescence seam.
+function recoverySteering(cancel = new AbortController()) {
+  return new SteeringChannel({} as WorkerClient, "run-window", 1, nullLogger(), cancel);
+}
 
 // Exercise the production reservation and parser with persistent journal storage in memory.
 // Source/lock/Git IO are stubs here; the real-Git and runner suites cover those Linux boundaries.
@@ -166,7 +173,7 @@ function runnerFixture(f: ReturnType<typeof fixture>, ownership: () => Promise<u
     run: (generation: number | undefined, episode: number) => runner.recoverRetainedClaim({
       run_id: f.source.runId, secrets: {}, worker_recovery_episode: episode,
     }, {
-      barePath: "/tmp/bare", runId: f.source.runId, claimGeneration: generation,
+      barePath: "/tmp/bare", runId: f.source.runId, claimGeneration: generation, steering: recoverySteering(),
       executor: { run: async () => ({ branch: "branch" }) }, sinkGate: new SinkGate(),
       survivingTickGroups: [], runLog: nullLogger(),
     }, "key", f.read()),
@@ -355,7 +362,7 @@ for (const binding of ["bound predecessor", "legacy"] as const) {
       reportGenericFailure: async (_claim: unknown, _flight: unknown, error: Error) => { reports = error.message; },
     });
     await assert.rejects(runner.recoverRetainedClaim({ run_id: f.source.runId, secrets: {} }, {
-      barePath: "/tmp/bare", runId: f.source.runId, claimGeneration: 2,
+      barePath: "/tmp/bare", runId: f.source.runId, claimGeneration: 2, steering: recoverySteering(),
       executor: { run: async () => ({ branch: "branch" }) },
       sinkGate: new SinkGate(), survivingTickGroups: [],
       runLog: nullLogger(),
@@ -387,7 +394,7 @@ for (const blocker of ["clock_invalid", "decoded_history_limit"] as const) {
       reportGenericFailure: async (_claim: unknown, _flight: unknown, error: Error) => { report = error.message; },
     });
     await assert.rejects(runner.recoverRetainedClaim({ run_id: f.source.runId }, {
-      barePath: "/tmp/bare", runId: f.source.runId, claimGeneration: 2, runLog: nullLogger(),
+      barePath: "/tmp/bare", runId: f.source.runId, claimGeneration: 2, runLog: nullLogger(), steering: recoverySteering(),
     }, "key", f.read()));
     assert.deepEqual(f.read(), before);
     assert.doesNotMatch(report, /budget exhausted/);
@@ -412,7 +419,7 @@ test("runner cannot rebase without positive matching claim ownership", async t =
     reportGenericFailure: async () => {},
   });
   await assert.rejects(runner.recoverRetainedClaim({ run_id: f.source.runId }, {
-    barePath: "/tmp/bare", runId: f.source.runId, claimGeneration: 2, runLog: nullLogger(),
+    barePath: "/tmp/bare", runId: f.source.runId, claimGeneration: 2, runLog: nullLogger(), steering: recoverySteering(),
   }, "key", f.read()));
   assert.equal(proof, false, "no predecessor capture without matching ownership");
   assert.deepEqual(f.read(), before, "a lost claim must not block or mutate its predecessor episode");
@@ -439,7 +446,7 @@ test("first recovery window durably charges before ownership probes and preserve
     reportGenericFailure: async (_claim: unknown, _flight: unknown, error: Error) => { report = error.message; },
   });
   await assert.rejects(runner.recoverRetainedClaim({ run_id: f.source.runId }, {
-    barePath: "/tmp/bare", runId: f.source.runId, claimGeneration: 2,
+    barePath: "/tmp/bare", runId: f.source.runId, claimGeneration: 2, steering: recoverySteering(),
     runLog: nullLogger(), batcher: { emit: () => {} },
   }, "key", f.read()));
   assert.deepEqual([...new Set(observed)], [1, 2, 3]);
@@ -470,7 +477,7 @@ for (const fault of ["network", "503"] as const) {
       reportGenericFailure: async () => { reports++; },
     });
     await assert.rejects(runner.recoverRetainedClaim({ run_id: f.source.runId }, {
-      barePath: "/tmp/bare", runId: f.source.runId, claimGeneration: 2, runLog: nullLogger(),
+      barePath: "/tmp/bare", runId: f.source.runId, claimGeneration: 2, runLog: nullLogger(), steering: recoverySteering(),
     }, "key", f.read()));
     assert.deepEqual(f.read(), before, "a transient renewal proof cannot charge, rebase or block saved work");
     assert.equal(reports, 0, "no terminal failure report; leave the claim for bounded missing-flight requeue");
@@ -503,7 +510,7 @@ for (const outcome of ["typed 404", "terminal", "foreign generation"] as const) 
       reportGenericFailure: async () => { reports++; },
     });
     await assert.rejects(runner.recoverRetainedClaim({ run_id: f.source.runId }, {
-      barePath: "/tmp/bare", runId: f.source.runId, claimGeneration: 2, runLog: nullLogger(),
+      barePath: "/tmp/bare", runId: f.source.runId, claimGeneration: 2, runLog: nullLogger(), steering: recoverySteering(),
     }, "key", f.read()));
     assert.deepEqual(f.read(), before);
     assert.equal(reports, 0);
@@ -537,7 +544,7 @@ function exhaustionRunner(f: ReturnType<typeof fixture>, options: {
   }
   if (options.persistence === "write") cache.blockRecoveryEpisode = async () => { throw new Error("write unavailable"); };
   const flight = {
-    barePath: "/tmp/bare", runId: f.source.runId, claimGeneration: 4,
+    barePath: "/tmp/bare", runId: f.source.runId, claimGeneration: 4, steering: recoverySteering(),
     runLog: nullLogger(), parked: false, batcher: { emit: () => {} },
     reportState: async (body: unknown) => {
       reports++;
@@ -645,10 +652,10 @@ test("retained reconciliation converts lifecycle cancellation to the nonterminal
   let cancelled = false;
   const h = exhaustionRunner(f, { ack: async () => { cancelled = true; return { status: "cancelled" }; } });
   const controller = new AbortController();
-  Object.assign(h.flight, { steering: {
+  Object.assign(h.flight, { steering: Object.assign(recoverySteering(controller), {
     claimFence: () => undefined, isCancelled: () => cancelled,
     terminalLifecycleSignal: () => controller.signal, lifecycleSignal: () => controller.signal,
-  }, cancel: controller });
+  }), cancel: controller });
   h.runner.retainedLifecycleGuard = RunRunner.prototype["retainedLifecycleGuard"];
   await assert.rejects(h.run(), (error: Error) => error.constructor.name === "RetainedRecoveryStop");
   assert.equal(h.counts().terminal, 0);

@@ -8,8 +8,8 @@
 # requires: UZI_WORKER_TOKEN
 # provides: -
 # handoff:  -
-# mutates:  -
-# restores: -
+# mutates: owner autopilot disabled; group/repo2 enabled; agent cap 2; creates cap-test runs
+# restores: owner autopilot stays disabled to isolate later phases; repo2 stays enabled and agent stays at cap 2 for the next phase
 # =============================================================================
 # PRD #42 — bounded worker concurrency (cap 2). ADDITIVE + LAST: the entire suite
 # above ran the single worker at the DEFAULT cap (1 — the pre-#42 serial loop),
@@ -51,6 +51,10 @@ else
   say "PRD #42: reconfigure the worker to WORKER_MAX_CONCURRENT_RUNS=2 and enable a second repo"
   login   # fresh admin session (also re-unlocks the admin vault so claims proceed)
 
+  # Phase 29 restores its opt-in, but selective/failed earlier phases must not let
+  # enabling repo2 dispatch old autopilot issues alongside this exact-count test.
+  set_owner_autopilot false || fail "could not disable autopilot before enabling repo2"
+
   # Enable group/repo2 (served by forge-fake only when FORGE_FAKE_PROJECT2 is set;
   # the seed enabled just group/repo, so repo2 has been a disabled, invisible row).
   CONN_ID="$(apiget /api/forge/connections | jq -r '.connections[0].id // empty')"
@@ -68,6 +72,7 @@ else
   # force-recreated container re-reads the SAME join token and re-registers into its
   # existing row; without the provide it would read the --env-file placeholder and 401.
   printf 'UZI_E2E_MAX_CONCURRENT_RUNS=2\n' >> "$ENVFILE"
+  capture_agent_logs 45-bounded-concurrency before-recreate-cap2
   "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null
   # Wait for the NEW worker's registration to actually LAND its advertised cap —
   # not merely for `online`. The recreated container reuses the join token (same
@@ -200,6 +205,7 @@ else
   # Hard-kill the agent: no graceful drain, no re-register — only the server-side
   # sweeper can recover the two orphaned runs. Do NOT restart the worker yet, so
   # the SWEEPER (not the restart's register-time requeue) is what re-queues them.
+  capture_agent_logs 45-bounded-concurrency before-sigkill
   "${COMPOSE[@]}" kill -s KILL agent >/dev/null
   pass "SIGKILL delivered to the agent container (two runs left in-flight)"
 
@@ -215,6 +221,7 @@ else
   # #2512 verifies/captures the retained predecessor and seeds a fresh attempt
   # inside the acquired successor claim. The 90s gate ceiling covers recovery
   # work under CI load; no extra park, promotion or generation is expected.
+  capture_agent_logs 45-bounded-concurrency before-restart-after-kill
   "${COMPOSE[@]}" up -d --wait agent >/dev/null
   wait_worker_online
   wait_status "$RUN_KA" awaiting_approval 90

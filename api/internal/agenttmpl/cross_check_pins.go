@@ -89,18 +89,8 @@ func ResolveCrossCheck(harness string, model, effort, workerModel, templateModel
 	r := CrossCheckResolution{Model: workerModel, Effort: CrossCheckDefaultEffort,
 		ModelSource: CrossCheckWorkerDefault, EffortSource: CrossCheckDefaultSource}
 	if r.Model == nil {
-		var templatePin string
-		if harness == "codex" && templateCodexModel != nil {
-			templatePin = PinForHarness(harness, "", *templateCodexModel)
-		} else if harness == "claude" && templateModel != nil {
-			templatePin = PinForHarness(harness, *templateModel, "")
-		}
-		if m, err := ValidateModel(templatePin); err == nil && m != "" {
+		if m, _ := ResolveWorkerDefaultModel(harness, nil, templateModel, templateCodexModel); m != "" {
 			r.Model = &m
-		}
-		if harness == "codex" && r.Model == nil {
-			fallback := DefaultCodexModel
-			r.Model = &fallback
 		}
 	}
 	if model != nil {

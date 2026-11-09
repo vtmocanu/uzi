@@ -182,6 +182,11 @@ export type RunState =
   /** issue #3181: the worker's acknowledgement that the held flight's owned operations have
    *  joined (hold_reason credential_switch_unsettled). Same fences as the hold report. */
   | "credential_switch_hold_settled"
+  /** Issue #3985: a plan cross-check run whose lead asked a clarification after a HUMAN
+   *  revise_plan verdict has the owner's answer; the run returns to awaiting_approval with the
+   *  revise still pending (an answer is never plan approval). Carries `clarification_settlement`
+   *  and `claim_generation`; requires the `clarification_revision_settlement_v1` feature. */
+  | "clarification_settled"
   | "completed"
   | "failed";
 
@@ -2340,6 +2345,8 @@ export const REPO_AGENT_SOURCE_HOLD_REASON = "repo_agent_source_unavailable";
 
 export const REPO_AGENT_SOURCE_FEATURE = "repo_agent_source_v1";
 
+export const PLAN_AGENT_SOURCE_FEATURE = "plan_agent_source_v1";
+
 /** issue #3194: what a base-attestation hold request established. `held` is the server's positive
  *  ACK for this flight's generation; `stale` is a fence refusal (the claim moved on); `unknown`
  *  covers every answer that proves neither (transport, 5xx, 404, 400, an unreadable body). */
@@ -2796,6 +2803,15 @@ export function seedAgentSelection(persisted?: AgentSelection | null): AgentSele
   return persisted ? { status: "ok", selection: persisted } : { status: "absent" };
 }
 
+export function planAgentSource(
+  persisted: AgentSource | null | undefined,
+  requested: AgentSource | null | undefined,
+  repoAvailable: boolean,
+): AgentSource {
+  const narrowed = persisted !== undefined && persisted !== null && persisted !== "repo";
+  return requestedAgentSource(requested) === "repo" && repoAvailable && !narrowed ? "repo" : "own";
+}
+
 export function gateVerdictSelection(
   verdict: AgentSelectionParse,
   persisted: AgentSelection | null | undefined,
@@ -2870,7 +2886,16 @@ export interface RunRegistrationEvidence {
   registration_epoch: number;
 }
 
+/** Issue #3985: the identities a `clarification_settled` report binds. */
+export interface ClarificationSettlement {
+  question_id: string;
+  revision_input_id: number;
+  gate_revision: number;
+}
+
 export interface StateRequest {
+  /** Issue #3985: present only on a `clarification_settled` report. */
+  clarification_settlement?: ClarificationSettlement;
   /** Issue #3859: set by the client alone, never by a caller. */
   registration_evidence?: RunRegistrationEvidence;
   /** Memory-pressure park fence, bound to the current registration. */
@@ -3014,6 +3039,7 @@ export interface StateRequest {
    *  Human-gated runs persist their selection through the `approve_plan` input
    *  instead, so this is absent there. */
   agent_selection?: AgentSelection;
+  plan_agent_source?: AgentSource;
   /** The plan's milestone breakdown (PRD #122 M1, Decision 2). Additive + optional
    *  and OMITTED ENTIRELY when absent — never `null` or `[]` — so an old worker's
    *  payload and a new worker's "no milestones" payload stay the same shape on the
@@ -3188,6 +3214,12 @@ export interface StateRequest {
    *  Resume with a NULL retry time and unchanged count. The api 400s it with any other cause, and only accepts it once it
    *  advertises `recovery_cause_data_volume_full`. The disk-full handling (M5) never sends it. */
   disk_park_preventive?: boolean;
+  /** Issue #4046: qualifies a `recovery_cause: "retained_recovery_exhausted"` park. `true` says every
+   *  recovery reservation this flight positively witnessed in the window ended in a data volume capacity
+   *  refusal, so the api holds the run for the owner (uncounted, NULL retry time) instead of retrying on
+   *  a timer. Sent only when the api advertised `retained_recovery_capacity_hold_v1` at register; absent
+   *  is today's counted park. */
+  retained_capacity_only?: boolean;
   /** PRD #1809 D8: on a process-ending park report that published a checkpoint (the usage-limit
    *  park, the owner pause park, a recovery park including the mid-run `data_volume_full` one),
    *  whether that published checkpoint contains the run's latest committed work. `false` when the
@@ -3413,6 +3445,8 @@ export interface StateAck {
   credentialSwitchHeld?: boolean;
   /** issue #3181: true when the 200 ack carried `disposition: "hold_settled"`. */
   credentialSwitchHoldSettled?: boolean;
+  /** Issue #3985: true when the 200 ack carried `disposition: "clarification_settled"`. */
+  clarificationSettled?: boolean;
   /** PRD #1795 M1 (decision 5): the TOP-LEVEL `gate_revision` of an `awaiting_approval` ACK — the
    *  revision the report was answered with, allocated or returned inside the report's transaction.
    *  The gate confirms THIS revision for bound-verdict matching. A positive integer only; absent
@@ -3777,6 +3811,9 @@ export interface RecoveryExactHold {
 export interface RecoveryHoldsResponse {
   run_id: string;
   holds: RecoveryHold[];
+  /** Run-wide open-hold count across every worker and generation (issue #3431). Present only when the api
+   *  read it for a worker that advertised recovery_run_open_holds_v1; ABSENT is unknown, never zero. */
+  run_open_holds?: { run_id: string; count: number };
 }
 
 /** RecoverySettleRequest is the worker's request that the api settle ONE older-generation

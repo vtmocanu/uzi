@@ -112,6 +112,7 @@
   "agent_exclusions": null,
   "agent_source_requested": null,
   "agent_source_requested_basis": null,
+  "plan_agent_source": null,
   "own_agents": null,
   "anthropic_secret_id": null,
   "anthropic_secret_label": null,
@@ -153,5 +154,6 @@
   "repo_path": "",
   "worker_name": null,
   "judge_verdict": null,
-  "judge_todo_count": 0
+  "judge_todo_count": 0,
+  "cross_check_active": null
 }

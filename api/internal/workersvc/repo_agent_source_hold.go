@@ -16,6 +16,7 @@ import (
 const (
 	HoldReasonRepoAgentSourceUnavailable = "repo_agent_source_unavailable"
 	RepoAgentSourceFeature               = "repo_agent_source_v1"
+	PlanAgentSourceFeature               = "plan_agent_source_v1"
 )
 
 func (s *Service) SetRunRepoAgentSourceHold(ctx context.Context, wkr store.Worker, runID uuid.UUID, generation int64, commit string) (store.Run, bool, error) {

@@ -8,19 +8,30 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { execFileSync, spawn } from "node:child_process";
+import { processGroupAlive } from "../src/tick-spawner.js";
 import { Outbox } from "../src/outbox.js";
 import { RecoveryCoordinator, type RecoveryArchiveClient } from "../src/recovery.js";
 import { CredentialSwitchSignal } from "../src/steering.js";
 import { createHash } from "node:crypto";
 import type { Executor, RunContext } from "../src/executor.js";
-import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
+import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
+import { SdkExecutor, TransientRecoveryError, type SdkExecutorOptions, type SdkQueryFn } from "../src/sdk-executor.js";
 import { MessageBatcher } from "../src/batcher.js";
-import { CandidateTransportInvariantError, RunRunner } from "../src/runner.js";
+import { CandidateTransportInvariantError, RunRunner, type RunnerOptions } from "../src/runner.js";
+import { GitCache } from "../src/git.js";
+import { acquireWorkerLifetime, type FlockResult } from "../src/authority-lock.js";
+import { AuthorityRuntime } from "../src/authority-runtime.js";
+import { defaultGitleaksShim } from "./gitleaks-shim.js";
+import { portableTeardownTestDeps } from "./teardown-fixtures.js";
+import { testLockOptions } from "./authority-test-support.js";
+import { quiesceRunAttempt, type QuiesceRunRequest } from "../src/run-quiescence.js";
 import { SteeringChannel } from "../src/steering.js";
-import type { PlanCrossCheckStateRequest } from "../src/client.js";
+import { RequestError, type PlanCrossCheckStateRequest } from "../src/client.js";
+import { setTimeout as delay } from "node:timers/promises";
 import type { OutgoingMessage } from "../src/protocol.js";
 import type { Logger } from "../src/log.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { mockCommittedTracking } from "./runner-tracking-fixture.js";
 import { enrollment, proposal, boundedTransport, hash } from "./semantic-coverage-fixture.js";
 import { semanticServer } from "./semantic-server-fixture.js";
@@ -47,6 +58,9 @@ const NORMALIZED = "# PLAN\n- server normalized proposal";
 const digest = "a".repeat(64);
 const child = "11111111-1111-4111-8111-111111111111";
 const timing = { preparationMs: 100, backoffMs: [1, 2] as const, requestMs: 100, pollMs: 5 };
+/** Issue #4099: a first preparation that must deliver an owed backlog gets the production budget (also the
+ *  gate's cap), so a loaded runner does not expire it; expiry cases keep `timing`. */
+const preparedTiming = { ...timing, preparationMs: 3000 };
 const SHA = "cafef00dcafef00dcafef00dcafef00dcafef00d";
 // Runner paths that reach native planning capture walk Linux /proc; Linux CI runs them.
 const LINUX_CAPTURE = process.platform !== "linux" && "Linux /proc capture required";
@@ -109,12 +123,17 @@ interface DriveControl {
   onState(fn: (body: Parameters<Parameters<typeof api.onState>[1]>[0]) => void): void;
   /** Flip the pending checker answer of `round` to `verdict`, keeping its identity. */
   flip(round: number, verdict: "approve" | "block"): void;
+  /** Issue #3980: the candidate reservation's live counters. */
+  reservations: { installed: number; released: number };
+  /** Issue #3980: the one long-lived real SdkExecutor the run uses when `DriveOpts.forward` is set. */
+  sdk?: SdkExecutor;
 }
 /** Observe the candidate reservation (reserve/release), landed state reports and landed messages in
  *  ONE ordered list. Returns the restore function for the shared batcher prototype. */
-function observe(runId: string, tl: Timeline, opts: { prefix?: string; failAfterRelease?: boolean; healAtReserve?: boolean } = {}) {
+function observe(runId: string, tl: Timeline, opts: { prefix?: string; failAfterRelease?: boolean; heal?: () => void } = {}) {
   const reserve = MessageBatcher.prototype.reserveCandidateTransport;
   const reservations = { installed: 0, released: 0 };
+  let ownedAtReserve = false;
   const noteRelease = (): void => {
     reservations.released++; tl.events.push("release");
     // The held events were assigned seqs by the release: fail their first flush (assigned replay).
@@ -126,7 +145,12 @@ function observe(runId: string, tl: Timeline, opts: { prefix?: string; failAfter
       api.failMessagesNext(1);
     }
     // Deliveries failed until now (the owed assigned replay); the reservation's prepare can land them.
-    if (opts.healAtReserve) api.failMessagesNext(0);
+    // Issue #4099: a failed background flush still owned here would fail the first preparation
+    // ("owned request failed") whatever its budget; record it so the case fails by name.
+    if (opts.heal) {
+      ownedAtReserve ||= (this as unknown as { inFlight?: Promise<void> }).inFlight !== undefined;
+      opts.heal();
+    }
     const reservation = reserve.call(this);
     reservations.installed++;
     tl.events.push("reserve");
@@ -161,7 +185,7 @@ function observe(runId: string, tl: Timeline, opts: { prefix?: string; failAfter
     tl.events.push(`state:${b.status}`);
     tl.callsAt[b.status] ??= tl.counter.calls;
   });
-  return { reservations, refused, restore: () => {
+  return { reservations, refused, ownedAtReserve: () => ownedAtReserve, restore: () => {
     MessageBatcher.prototype.reserveCandidateTransport = reserve;
     MessageBatcher.prototype.emit = emit;
     client.postMessages = post;
@@ -228,14 +252,14 @@ function reclaim(c: ReturnType<typeof claim>, generation = 2) {
 }
 
 /** A scripted SDK: turn n submits plans[n] when present, else finishes. */
-function scriptedQuery(plans: string[], counter: { calls: number }): SdkQueryFn {
+function scriptedQuery(plans: string[], counter: { calls: number }, milestones: { id: string; title: string }[] = []): SdkQueryFn {
   return (params) => {
     const turn = counter.calls++;
     return (async function* () {
       for await (const _ of params.prompt) { /* drain */ }
       const plan = plans[turn];
       if (plan !== undefined) {
-        yield assistant([{ type: "tool_use", id: `p${turn}`, name: "mcp__uzi__submit_plan", input: { plan_md: plan, milestones: [] } }]);
+        yield assistant([{ type: "tool_use", id: `p${turn}`, name: "mcp__uzi__submit_plan", input: { plan_md: plan, milestones } }]);
       } else {
         yield assistant([{ type: "text", text: "done implementing" },
           { type: "tool_use", id: `d${turn}`, name: "mcp__uzi__signal_done", input: {} }]);
@@ -254,8 +278,14 @@ interface DriveOpts {
   switchRounds?: number[];
   /** poll: the inputs poll carries the switch. ack: the awaiting_approval state ACK carries it. */
   entry?: "poll" | "ack";
-  capture: "release" | "giveup";
+  /** "real" (issue #3980) installs neither capture double: the runner captures through the real GitCache. */
+  capture: "release" | "giveup" | "real";
+  /** Issue #3980: run through ONE real SdkExecutor built with these options, and forward the Executor
+   *  hooks the runner's quiescence uses (reapAttributedProcesses, with its options) to it. */
+  forward?: Partial<SdkExecutorOptions>;
   plans?: string[];
+  /** The milestones every scripted submit_plan carries (default none). */
+  planMilestones?: { id: string; title: string }[];
   emitHeld?: boolean;
   failAfterRelease?: boolean;
   /** An assigned replay: a status emitted when the reservation installs whose first delivery fails. */
@@ -263,6 +293,9 @@ interface DriveOpts {
   /** An owed assigned replay: a status emitted (and so seq-assigned) during planning whose delivery keeps
    *  failing until the reservation installs, whose prepare then delivers it before the candidate is submitted. */
   owed?: string;
+  /** Issue #4099: delay the first owed delivery after the reservation installs (a loaded runner), honouring
+   *  the preparation's own expiry signal. */
+  owedDeliveryDelayMs?: number;
   dropFirstPost?: boolean;
   /** Reject the human gate once the give-up is confirmed (a gate left presented by the old claim). */
   rejectAfterGiveUp?: boolean;
@@ -294,6 +327,97 @@ interface DriveOpts {
   claimOver?: (base: ReturnType<typeof claim>) => Partial<ReturnType<typeof claim>>;
   /** Extra runner options. */
   runnerOpts?: Record<string, unknown>;
+  /** Issue #3980: build the runner over a production AuthorityRuntime and the GitCache that demands it
+   *  (authorityHarness), instead of the shared harness runner and cache. */
+  authority?: AuthorityHarness;
+}
+
+/** Issue #3980: a RunRunner wired as production wires it with an authority runtime, as
+ *  runner-disk-park-capture-authority.test.ts does (the shared harness cache carries no authority hooks). */
+function authorityRunner(exec: Executor, gitlab: Parameters<typeof runner>[1], a: AuthorityHarness,
+  extra: Record<string, unknown>): RunRunner {
+  const built = new RunRunner(client, a.git, () => ({ executor: exec }), nullLogger(), 20, undefined, {
+    pollMs: 5,
+    planApprovalTimeoutMs: 0,
+    questionTimeoutMs: 600,
+    prDescriptionHeadLagMs: 0,
+    gitlab,
+    teardownTestDeps: portableTeardownTestDeps,
+    authority: a.rt,
+    ...(extra as Partial<RunnerOptions>),
+    checkpointTestHooks: { retryBackoffMs: [0, 0], ...(extra.checkpointTestHooks as object | undefined) },
+  });
+  // The attempt-bound clone paths are what make the owed import carry a producing source (A is then taken).
+  Object.assign(built, { attemptPaths: true });
+  return built;
+}
+
+interface AuthorityWaitSeen { signal: AbortSignal | undefined; timeoutMs: number | undefined; error?: unknown }
+interface AuthorityHarness {
+  rt: AuthorityRuntime;
+  git: GitCache;
+  /** Every authority acquisition requested while armed, with the wait it passed and how it ended. */
+  acquisitions: AuthorityWaitSeen[];
+  /** How many times an armed A attempt was answered "held elsewhere" (each is followed by a retry delay). */
+  contended: () => number;
+  /** From now on A is reported held by someone else and every wait for it is widened (see authorityHarness). */
+  arm: () => void;
+  disarm: () => void;
+}
+
+/** Stands in for authority-lock.ts's private `runFlock` on a util-linux host (where `testLockOptions()`
+ *  supplies no `run`): spawns the real binary. Simplified: it ignores the abort signal, and a helper
+ *  timeout resolves code 2 rather than rejecting `FlockHelperTimeout`. */
+function spawnFlock(args: string[], fd: number | undefined, _signal: AbortSignal | undefined, timeoutMs: number): Promise<FlockResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("/usr/bin/flock", args, {
+      stdio: ["ignore", "pipe", "pipe", ...(fd === undefined ? [] : [fd])], env: { PATH: "/usr/bin:/bin", LC_ALL: "C" } });
+    let output = "";
+    child.stdout!.on("data", (c: Buffer) => { output += c.toString("utf8"); });
+    child.stderr!.on("data", (c: Buffer) => { output += c.toString("utf8"); });
+    const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+    child.once("error", reject);
+    child.once("close", (code) => { clearTimeout(timer); resolve({ code: code ?? 2, output }); });
+  });
+}
+
+/** The production authority stack over this test's data dir: the worker lifetime W, an AuthorityRuntime and a
+ *  GitCache with its hooks. Contention is injected through the lock layer's own `run` seam: while armed, the
+ *  non-blocking A attempt (`flock -x -n -E 200 3`) answers 200, "held by someone else", so
+ *  flockExclusive reaches its retry delay (`delay(wait, undefined, { signal })`) and keeps retrying.
+ *  An external holder process (flock -x <authority.lock> sleep) would be the more physical contention, but the
+ *  real helper spawn takes a few ms of every 50 ms poll, and an abort that lands inside that spawn rejects
+ *  with the signal's reason itself (already mapped) instead of the delay's AbortError: the test could not then
+ *  say which rejection it exercises. The stub answers within a microtask, so the abort always lands in the delay.
+ *  Holding A in-process would not reach the delay either: that wait is the queue's, which rejects with
+ *  signal.reason. W, `--version` and every unarmed acquisition stay on the real helper. */
+async function authorityHarness(): Promise<AuthorityHarness> {
+  let armed = false;
+  let contended = 0;
+  const real = testLockOptions().run ?? spawnFlock;
+  const run = (args: string[], fd: number | undefined, signal: AbortSignal | undefined, timeoutMs: number): Promise<FlockResult> => {
+    if (armed && args[0] === "-x" && args.includes("-n")) { contended++; return Promise.resolve({ code: 200, output: "" }); }
+    return real(args, fd, signal, timeoutMs);
+  };
+  const lifetime = await acquireWorkerLifetime(fs.realpathSync(fx.dataDir), testLockOptions({ run }));
+  const rt = new AuthorityRuntime({ lifetime, workerToken: "unit-gate-3980", timeoutMs: 5000 });
+  const acquisitions: AuthorityWaitSeen[] = [];
+  const original = rt.withTransaction.bind(rt) as (fn: unknown, wait?: { signal?: AbortSignal; timeoutMs?: number }) => Promise<unknown>;
+  (rt as unknown as { withTransaction: typeof original }).withTransaction = (fn, wait) => {
+    if (!armed) return original(fn, wait);
+    const seen: AuthorityWaitSeen = { signal: wait?.signal, timeoutMs: wait?.timeoutMs };
+    acquisitions.push(seen);
+    // Production clamps this wait to the gate deadline, so the last retry delay races the gate timeout
+    // within ~1 ms and otherwise ends in AuthorityLockBusy (deliberately not a deadline-family error).
+    // Widen ONLY the wait's duration, keeping the signal's identity, so the gate timeout fires while a
+    // retry delay is pending, on every run.
+    const widened = wait?.timeoutMs === undefined ? wait : { ...wait, timeoutMs: wait.timeoutMs + 5000 };
+    return original(fn, widened).catch((error: unknown) => { seen.error = error; throw error; });
+  };
+  const authorityGit = new GitCache(fs.realpathSync(fx.dataDir), nullLogger(), undefined, testGitCacheOptions({
+    authority: rt.hooks, authorityRequired: true, gitleaksBin: defaultGitleaksShim(),
+  }));
+  return { rt, git: authorityGit, acquisitions, contended: () => contended, arm: () => { armed = true; }, disarm: () => { armed = false; } };
 }
 /** Run one claim to its end through the real runner + real SdkExecutor + the cross-check api fake. */
 async function drive(o: DriveOpts) {
@@ -306,11 +430,24 @@ async function drive(o: DriveOpts) {
   const tl: Timeline = { events: [], callsAt: {}, counter };
   const failedPosts = { count: 0 };
   const realPost = client.postMessages;
+  // Issue #4099: owed deliveries fail at call time, with no I/O, rather than through the HTTP fake, so a
+  // failing background flush settles before any later macrotask can install the reservation.
+  const owedFailing = { on: false };
+  let owedDelayed = false;
   if (o.owed) client.postMessages = async (...args: Parameters<typeof realPost>) => {
+    if (owedFailing.on && args[0] === c.run_id) {
+      failedPosts.count++;
+      throw new RequestError("POST", `/api/worker/runs/${c.run_id}/messages`, 503, JSON.stringify({ error: "injected failure" }));
+    }
+    if (o.owedDeliveryDelayMs !== undefined && !owedDelayed && args[0] === c.run_id && probe.reservations.installed > 0) {
+      owedDelayed = true;
+      await delay(o.owedDeliveryDelayMs, undefined, { signal: args[3] });
+    }
     try { return await realPost.apply(client, args); }
     catch (error) { if (args[0] === c.run_id) failedPosts.count++; throw error; }
   };
-  const probe = observe(c.run_id, tl, { failAfterRelease: o.failAfterRelease, prefix: o.prefix, healAtReserve: o.owed !== undefined });
+  const probe = observe(c.run_id, tl, { failAfterRelease: o.failAfterRelease, prefix: o.prefix,
+    ...(o.owed ? { heal: () => { owedFailing.on = false; } } : {}) });
   const switchSeen = watchSwitchDelivery();
   const decided = new Map<number, ReturnType<typeof answer>>();
   const leadSeqs: number[] = [];
@@ -320,8 +457,9 @@ async function drive(o: DriveOpts) {
   const trace = { queriesAtRequest: [] as number[], requests: 0 };
   const cancelIds: number[] = [];
   const stateHooks: Parameters<DriveControl["onState"]>[0][] = [];
+  const sdk = o.forward ? new SdkExecutor(nullLogger(), homeDir, { queryFn: scriptedQuery(o.plans ?? [PLAN], counter, o.planMilestones), ...o.forward }) : undefined;
   const ctl: DriveControl = {
-    tl, switchSeen,
+    tl, switchSeen, reservations: probe.reservations, sdk,
     onState: (fn) => { stateHooks.push(fn); },
     requestSwitch: async () => {
       tl.events.push("switch-requested");
@@ -431,11 +569,11 @@ async function drive(o: DriveOpts) {
   const exec: Executor = { run: async (ctx) => {
     emit = ctx.emit;
     if (o.owed) {
-      api.failMessagesNext(1000);
+      owedFailing.on = true;
       ctx.emit({ kind: "status", payload: { text: o.owed } });
       assert.ok(await until(() => failedPosts.count > 0), "the assigned replay's first delivery failed");
     }
-    if (o.capture === "release") healthyCapture(); else failingCapture();
+    if (o.capture === "release") healthyCapture(); else if (o.capture === "giveup") failingCapture();
     const wip = git.worktreeStatus.bind(git);
     git.worktreeStatus = (async (...a: Parameters<typeof wip>) => { tl.events.push("capture"); return wip(...a); }) as typeof git.worktreeStatus;
     const attempt = ctx.attemptCredentialSwitch!;
@@ -452,20 +590,23 @@ async function drive(o: DriveOpts) {
         return gate(o.gateMd ? o.gateMd(n, md) : md, o.gateMilestones ? o.gateMilestones(n, ms) : ms, ...rest);
       };
     }
-    return new SdkExecutor(nullLogger(), homeDir, { queryFn: scriptedQuery(o.plans ?? [PLAN], counter) }).run(ctx);
-  } };
+    return (sdk ?? new SdkExecutor(nullLogger(), homeDir, { queryFn: scriptedQuery(o.plans ?? [PLAN], counter, o.planMilestones) })).run(ctx);
+  }, ...(sdk ? { closeAndSettlePlanSummary: (ms?: number) => sdk.closeAndSettlePlanSummary(ms), reapAttributedProcesses: (opts?: { deadlineAt?: number }) => sdk.reapAttributedProcesses(opts) } : {}) };
   o.setup?.(c, ctl);
   const forge = fakeGitlab();
   const sentinel = path.join(homeDir, "SESSION");
   fs.writeFileSync(sentinel, "resumable session\n");
   try {
-    await runner(exec, forge.gitlab, undefined, { planCrossCheckTiming: timing, recoveryRetryMs: 1,
-      planApprovalTimeoutMs: 3000, ...o.runnerOpts }).execute(c);
+    const runnerOpts = { planCrossCheckTiming: timing, recoveryRetryMs: 1, planApprovalTimeoutMs: 3000, ...o.runnerOpts };
+    await (o.authority ? authorityRunner(exec, forge.gitlab, o.authority, runnerOpts)
+      : runner(exec, forge.gitlab, undefined, runnerOpts)).execute(c);
   } finally {
     MessageBatcher.prototype.reserveCandidateTransport = reserveBeforePreparation;
     probe.restore(); client.postMessages = realPost; client.reportPlanCrossCheckGateState = report; api.failMessagesNext(0);
     client.getRunOwnership = ownership;
   }
+  if (o.owed) assert.equal(probe.ownedAtReserve(), false,
+    "no failed owed flush was still owned when the reservation installed (it would fail the first preparation)");
   const heldSeqs = api.messages(c.run_id).filter((m) => (m.payload as { text?: string }).text?.startsWith("held during"))
     .map((m) => m.seq);
   return { c, tl, counter, forge, probe, storage, attempts, sentinel, trace, cancelIds, gaveUp: () => gaveUp, heldSeqs, leadSeqs,
@@ -938,7 +1079,9 @@ function assertReplayThenHeld(d: Driven, prefix: string): void {
 }
 
 describe("issue #3953 m3: an assigned replay and held unassigned events together", () => {
-  const combined: Omit<DriveOpts, "capture"> = { switchRounds: [1], emitHeld: true, owed: "assigned replay", failAfterRelease: true };
+  // The first preparation delivers the owed backlog, so it runs on the production budget (issue #4099).
+  const combined: Omit<DriveOpts, "capture"> = { switchRounds: [1], emitHeld: true, owed: "assigned replay", failAfterRelease: true,
+    runnerOpts: { planCrossCheckTiming: preparedTiming } };
 
   it("S1 release: replay then held events are delivered once before the release report; the next claim continues the seqs", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
     const d = await drive({ capture: "release", ...combined });
@@ -971,7 +1114,8 @@ describe("issue #3953 m3: an assigned replay and held unassigned events together
   });
 
   it("S1 give-up: replay then held events are delivered once and the adopted approve continues the run", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
-    const d = await drive({ capture: "giveup", ...combined });
+    // Issue #4099: the owed delivery is slowed past the old 100 ms budget, as on a loaded runner.
+    const d = await drive({ capture: "giveup", ...combined, owedDeliveryDelayMs: 400 });
     assertServicedAfterRelease(d);
     assert.deepEqual(d.attempts, ["attempt", "gave_up"]);
     assertReplayThenHeld(d, "assigned replay");
@@ -1331,16 +1475,29 @@ describe("issue #3953 m3: every trip entry reaches neither guard (the state-ack 
       const delivery = watchSwitchDelivery();
       let rowId = 0;
       const forced = base.verdicts?.[0] === "block";
+      let latchTimedOut = false;
       const d = await drive({ ...base, capture, switchRounds: [], rejectAfterGiveUp: forced && capture === "giveup", duringPending: async (c) => {
         if (forced) {
           // Hold the APPLIED request back (the fake api refuses a pending switch's APPLIED before it applies
-          // any reply delay), so the forced gate's presentation is already waiting on the receipt.
+          // any reply delay) until the forced gate's presentation really waits on the receipt: the first
+          // awaitReceiptSettlement entry, after the operator row is ACKed, that sees a receipt pending.
+          let release!: () => void;
+          const waiting = new Promise<void>((resolve) => { release = resolve; });
+          const channelProto = SteeringChannel.prototype as unknown as { awaitReceiptSettlement: (signal?: AbortSignal) => Promise<void>; receiptPending: () => boolean };
+          const settle = channelProto.awaitReceiptSettlement;
+          channelProto.awaitReceiptSettlement = function (this: typeof channelProto, signal?: AbortSignal) {
+            if (rowId > 0 && api.isAcked(c.run_id, rowId) && this.receiptPending()) release();
+            return settle.call(this, signal);
+          };
           const apply = client.applyInputs;
           client.applyInputs = async (...args: Parameters<typeof apply>) => {
-            await new Promise((resolve) => setTimeout(resolve, 150));
+            let timer: NodeJS.Timeout | undefined;
+            const deadline = new Promise<void>((resolve) => { timer = setTimeout(() => { latchTimedOut = true; resolve(); }, 10_000); });
+            await Promise.race([waiting, deadline]);
+            clearTimeout(timer);
             return apply.apply(client, args);
           };
-          restorers.push(() => { client.applyInputs = apply; });
+          restorers.push(() => { client.applyInputs = apply; channelProto.awaitReceiptSettlement = settle; });
         }
         api.pendSwitchAfterNextAck(c.run_id);
         rowId = send(c.run_id, row("follow_up", "operator note while the checker is pending"))[0]!.id;
@@ -1353,6 +1510,7 @@ describe("issue #3953 m3: every trip entry reaches neither guard (the state-ack 
         assert.ok(await handlerWait(() => watched.refused > 0), "the held batch's APPLIED was refused switch_pending");
         assert.ok(await handlerWait(() => delivery.latched()), "the refusal latched under the hold");
       } });
+      assert.equal(latchTimedOut, false, "the forced gate's presentation waited on the receipt while the APPLIED was held back");
       assert.ok(watched.refused > 0, "the held batch's APPLIED was refused switch_pending");
       noInvariant(d.c.run_id);
       assertServicedAfterRelease(d);
@@ -1532,6 +1690,18 @@ describe("issue #3953 m3: the invariant guards (hold bypassed, reservation insta
           "the invariant is logged");
         assert.ok(logged.some((l) => l.level === "warn" && l.message.includes("closed with candidate transport reservation held")),
           "the close logs the reservation it could not release");
+        if (guard.startsWith("G2")) {
+          // Pins close-before-report ordering at dispatchFailure's invariant arm (the batcher is closed
+          // before reportGenericFailure), not that dropping the failure diagnostic is desired: the
+          // diagnostic emitted after the close is refused, and the close persisted one unassigned
+          // event fewer than a report-first order would have held.
+          const late = logged.find((l) => l.level === "warn" && l.message.includes("run message emitted after the batcher closed; not delivered"));
+          assert.ok(late, `a post-close emit is refused and logged: ${JSON.stringify(logged.map((l) => [l.level, l.message]))}`);
+          assert.equal(late.fields?.kind, "error");
+          const closed = logged.find((l) => l.level === "warn" && l.message.includes("closed with candidate transport reservation held"));
+          assert.ok(typeof closed?.fields?.unassigned === "number" && closed.fields.unassigned < 3,
+            `the close precedes the failure report: ${JSON.stringify(closed?.fields)}`);
+        }
         assert.ok(!everyState(c.run_id).some((x) => x.status === "running" && x.candidate_digest === digest), "no approval stored");
         assert.equal(api.crossCheckRequests.length, 0);
         assert.ok(outbox.hasUndrainedMessages(c.run_id), "the batcher close persisted the assigned replay");
@@ -1552,6 +1722,84 @@ describe("issue #3953 m3: the invariant guards (hold bypassed, reservation insta
   }
 });
 
+/** Record every hold SteeringChannel.holdCredentialSwitch hands out and each close() call it receives
+ *  (the real close still runs). Restored after the test via `restorers`. */
+function spyHolds(): { closes: { service: boolean }[] }[] {
+  const proto = SteeringChannel.prototype as unknown as {
+    holdCredentialSwitch: () => { close(o: { service: boolean }): void } };
+  const original = proto.holdCredentialSwitch;
+  const holds: { closes: { service: boolean }[] }[] = [];
+  proto.holdCredentialSwitch = function (this: unknown) {
+    const handle = original.call(this);
+    const seen = { closes: [] as { service: boolean }[] };
+    const close = handle.close.bind(handle);
+    handle.close = (o) => { seen.closes.push(o); close(o); };
+    holds.push(seen);
+    return handle;
+  };
+  restorers.push(() => { proto.holdCredentialSwitch = original; });
+  return holds;
+}
+
+describe("issue #3990: a failed checker leg closes its credential-switch hold without servicing it", () => {
+  it("a reservation that cannot be installed ends the run failed, closes the hold once unserviced and stores nothing", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const holds = spyHolds();
+    const d = await drive({ capture: "giveup",
+      setup: () => { MessageBatcher.prototype.reserveCandidateTransport = () => { throw new Error("no transport"); }; } });
+    failedWith(d.c.run_id, "plan cross-check: transport reservation unavailable");
+    assert.equal(holds.length, 1, "the hold opened before the reservation was attempted, once");
+    assert.deepEqual(holds[0]!.closes, [{ service: false }], "closed exactly once, never serviced");
+    assert.deepEqual(d.storage, [], "no checker approval was stored");
+    assert.ok(!everyState(d.c.run_id).some((s) => s.status === "running" && s.candidate_digest !== undefined), "no approval-bearing report");
+    assert.equal(d.posts().length, 0, "the checker was never asked");
+  });
+});
+
+describe("issue #3990: in-place continuation of retained checked storage", () => {
+  it("a switch that surfaces inside the canonical storage report gives up and continues the retained storage in place: no resubmit, implementation runs", { skip: LINUX_CAPTURE, timeout: 30_000 }, async () => {
+    const seen: string[] = [];
+    let gateEntries = 0;
+    const d = await drive({ capture: "giveup", switchRounds: [],
+      // A recomputed storage report re-enters gatePlan: refuse the re-entry so that run ends promptly, and
+      // assert the recorded entry count after it (rather than leaving the regression to a test timeout).
+      gateMd: (n, md) => {
+        gateEntries = n;
+        if (n > 1) throw new assert.AssertionError({ message: "gatePlan re-entered: the retained storage was recomputed instead of continued" });
+        return md;
+      },
+      setup: (c, x) => {
+        let armed = true;
+        const report = client.reportPlanCrossCheckGateState.bind(client);
+        client.reportPlanCrossCheckGateState = async (id, fields, signal) => {
+          seen.push(`${fields.status}:${fields.candidate_digest ?? ""}`);
+          if (armed && id === c.run_id && fields.status === "running" && fields.candidate_digest === digest) {
+            armed = false;
+            api.requestCredentialSwitch(c.run_id, 1);
+            assert.ok(await handlerWait(() => x.switchSeen.delivered), "the worker polled the switch");
+          }
+          return report(id, fields, signal);
+        };
+      } });
+    const { c, tl } = d;
+    assert.deepEqual(d.attempts, ["attempt", "gave_up"], "the switch was attempted once and the capture gave up");
+    assert.deepEqual(switchReports(c.run_id), ["credential_switch_failed"]);
+    // The first storage send was interrupted by the switch before the server saw it; the retained
+    // operation is continued in place (a second send of the same canonical plan), never recomputed.
+    assert.equal(gateEntries, 1, "gatePlan entered once: the retained storage was continued, not recomputed");
+    assert.equal(d.storage.length, 2, `the interrupted send and the in-place continuation: ${JSON.stringify(seen)}`);
+    assert.equal(d.storage[1], d.storage[0], "the continuation re-sends the same retained storage request");
+    assert.equal(d.storage[0]!.plan_md, NORMALIZED, "the stored plan is the normalized canonical plan");
+    assert.equal(everyState(c.run_id).filter((s) => s.status === "running" && s.candidate_digest === digest).length, 1,
+      "the server stored the canonical plan exactly once");
+    assert.equal(d.posts().length, 1, "one cross-check POST: the decision is never resubmitted");
+    assert.equal(d.counter.calls, 2, "planning turn, then implementation only");
+    assert.ok(tl.events.indexOf("state:credential_switch_failed") < tl.events.lastIndexOf("storage"), "storage continued after the give-up");
+    assert.equal(gates(c.run_id).length, 0);
+    assert.ok(statuses(c.run_id).includes("completed"), JSON.stringify(statuses(c.run_id)));
+    assert.ok(!statuses(c.run_id).includes("failed"));
+  });
+});
+
 describe("issue #3953 m3: semantic coverage forces a human gate after the checker approve (real SemanticPlanningGate)", () => {
   const milestones = [{ id: "m1", title: "A" }];
   const submitted = (issueIid: number | null) => {
@@ -1559,7 +1807,7 @@ describe("issue #3953 m3: semantic coverage forces a human gate after the checke
     p.criteria[0]!.citations[0]!.source_id = "issue:" + issueIid;
     return p;
   };
-  function semanticRig(c: ReturnType<typeof claim>, events: string[]) {
+  function semanticRig(c: ReturnType<typeof claim>, events: string[], switchWhilePending = true) {
     // Isolate gate ordering from native alternate-object capture; no repository mutation.
     git.capturePlanningDiff = async () => Buffer.from("");
     const server = semanticServer(client, events);
@@ -1572,10 +1820,12 @@ describe("issue #3953 m3: semantic coverage forces a human gate after the checke
     const switchSeen = watchSwitchDelivery();
     api.crossCheckHandler = async ({ runId, body }) => {
       const { stage: _stage, claim_generation: _generation, round = 1, ...candidate } = body;
-      events.push("switch-requested");
-      api.requestCredentialSwitch(runId, 1);
-      assert.ok(await handlerWait(() => switchSeen.delivered), "the worker polled the switch while the checker is pending");
-      assert.ok(await handlerWait(() => switchSeen.latched()), "the hold latched the switch");
+      if (switchWhilePending) {
+        events.push("switch-requested");
+        api.requestCredentialSwitch(runId, 1);
+        assert.ok(await handlerWait(() => switchSeen.delivered), "the worker polled the switch while the checker is pending");
+        assert.ok(await handlerWait(() => switchSeen.latched()), "the hold latched the switch");
+      }
       const identity = server.compiled().candidate;
       return { status: 200, body: {
         result: "candidate", round, checker_run_id: child, candidate_digest: identity.digest, candidate_generation: 1,
@@ -1655,6 +1905,41 @@ describe("issue #3953 m3: semantic coverage forces a human gate after the checke
     assert.equal(verdict!.approval, undefined, "a human decided; the checker approve is evidence only");
     assert.ok(!everyState(c.run_id).some((s) => s.status === "running" && s.candidate_digest !== undefined),
       "the checker approve was never stored as an auto approval");
+  });
+
+  it("issue #3990: a switch that surfaces in the coverage review after the approve stashes it; the re-run adopts the approve and takes no human gate", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const c = semanticClaim();
+    const events: string[] = [];
+    // The checker's approve is delivered with no switch pending, so the hold is serviced with nothing latched and
+    // the approve is NOT stashed at the control exit. The switch arrives only inside the coverage review.
+    const server = semanticRig(c, events, false);
+    const transport = await boundedTransport("claude", server.report, events);
+    const status = client.semanticCoverageStatus.bind(client);
+    let raised = false;
+    client.semanticCoverageStatus = async (...args) => {
+      if (!raised && api.crossCheckRequests.some((r) => r.method === "POST")) {
+        raised = true;
+        events.push("switch-in-review");
+        api.requestCredentialSwitch(c.run_id, 1);
+        assert.ok(await until(() => args[2]?.aborted === true, 4000), "the worker tripped the switch into the review's signal");
+        args[2]!.throwIfAborted();
+      }
+      return status(...args);
+    };
+    const verdicts: unknown[] = [];
+    try {
+      await runner(semanticExec(c, verdicts), fakeGitlab().gitlab, undefined, { semanticCoverageTestTransport: transport,
+        planCrossCheckTiming: timing, recoveryRetryMs: 1, planApprovalTimeoutMs: 1500 }).execute(c);
+    } finally { client.semanticCoverageStatus = status; }
+    assert.equal(raised, true, "the switch surfaced after the checker's approve");
+    assert.equal(api.crossCheckRequests.filter((r) => r.method === "POST").length, 1, "never resubmitted");
+    assert.equal(gates(c.run_id).length, 0, JSON.stringify(everyState(c.run_id).map((s) => [s.status, s.failure_reason])));
+    assert.ok(everyState(c.run_id).some((s) => s.status === "running" && s.candidate_digest !== undefined),
+      "the adopted approve was stored: " + JSON.stringify(everyState(c.run_id).map((s) => [s.status, s.failure_reason])));
+    const [verdict] = verdicts as { kind: string; approval?: string }[];
+    assert.equal(verdict?.kind, "approve", JSON.stringify(verdicts));
+    assert.ok(!everyState(c.run_id).some((s) => s.failure_reason !== undefined && s.failure_reason !== null),
+      JSON.stringify(everyState(c.run_id).map((s) => [s.status, s.failure_reason])));
   });
 
   it("a stashed approve whose candidate digest differs from the re-run's compile fails closed", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
@@ -2114,5 +2399,874 @@ describe("issue #3974: the runner never enters a switch once a cancel was commit
         x.switchSeen.serviceHolds();
       } });
     assertCancelledNotSwitched(d);
+  });
+});
+
+// ─── Issue #3980: the changed-plan gate checkpoint on a Claude executor is bounded ───────────────────
+// prepareGateCheckpoint used to enforce its 60 s deadline only through the Codex capture lane. A Claude
+// executor has none, so one hung clone-side git child, a held bare lock, an unsettled executor join or a
+// sink gate that never frees could hold the plan gate (and the held credential switch behind it) forever.
+// These drive the real runner with a real GitCache capture (capture: "real"), the switch held, and a
+// shortened deadline; each regression observes the hang it injected first, then requires the step to
+// settle (fail closed, TransientRecoveryError, custody intact) BEFORE a watchdog that would release it.
+const GATE_MS = 1500;
+/** Scheduling margin: the longest tail past the deadline (children are aborted, then joined). */
+const GATE_TAIL_MS = 3000;
+
+interface TickGroupView { pgid: number; identity: string; killConfirmed: boolean }
+interface GateFlightView { runId: string; worktreePath?: string; barePath?: string; preserveRecoveryClone: boolean; preserveSession: boolean;
+  sinkGate: { run<T>(fn: () => Promise<T>): Promise<T> }; survivingTickGroups: unknown[]; runLog: Logger }
+interface Custody { preserveRecoveryClone: boolean; preserveSession: boolean; groups: TickGroupView[]; gates: number; switchReports: string[];
+  reservations: { installed: number; released: number }; tree?: TreeView; indexLock?: boolean }
+interface GateRec { entered: boolean; startedAt: number; settledAt: number; error: unknown; watchdogFired: boolean;
+  before?: Custody; after?: Custody; flight?: GateFlightView }
+
+const runGitSync = (cwd: string, ...args: string[]): string =>
+  execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" } });
+interface TreeView { head: string; tracked: string; untracked: string; trackedPath: string; untrackedPath: string }
+function viewTree(wt: string, trackedPath: string, untrackedPath: string): TreeView {
+  return { head: runGitSync(wt, "rev-parse", "HEAD").trim(), trackedPath, untrackedPath,
+    tracked: fs.readFileSync(path.join(wt, trackedPath), "utf8"), untracked: fs.readFileSync(path.join(wt, untrackedPath), "utf8") };
+}
+
+/** Synchronous aborts a hang may fire: the owner (lifecycle) signal handed to the step, or the runner's shutdown signal. */
+interface GateAborts { abortOwner: (reason: unknown) => void; abortShutdown: (reason: unknown) => void }
+
+/** Run one claim whose human re-plan gate reaches prepareGateCheckpoint on the real Claude path, with the
+ *  switch held. `hang` injects the failure and returns its release; `entered` must come true on its own. */
+async function gateCheckpointRun(o: {
+  hang: (flight: GateFlightView, x: DriveControl, rec: GateRec, abort: GateAborts) => Promise<{ release: () => void; entered: () => boolean }>;
+  dirty?: boolean; forward?: Partial<SdkExecutorOptions>; tailMs?: number; deadlineMs?: number;
+  runnerOpts?: Record<string, unknown>;
+  /** Abort the lifecycle (owner) signal handed to the step this many ms after it starts, with this reason. */
+  ownerAbort?: { afterMs: number; reason: Error };
+  /** Build the runner over the production authority stack (authorityHarness). */
+  authority?: AuthorityHarness;
+}) {
+  const deadlineMs = o.deadlineMs ?? GATE_MS;
+  client.protocolFeatures = [...client.protocolFeatures, "milestone_reconciliation_v1"];
+  const seam = RunRunner.prototype as unknown as { prepareGateCheckpoint: (...args: unknown[]) => Promise<unknown> };
+  const prepare = seam.prepareGateCheckpoint;
+  restorers.push(() => { seam.prepareGateCheckpoint = prepare; });
+  const rec: GateRec = { entered: false, startedAt: 0, settledAt: 0, error: undefined, watchdogFired: false };
+  let release = (): void => {};
+  let hangEntered = (): boolean => false;
+  let ctl!: DriveControl;
+  let treeBefore: TreeView | undefined;
+  let trackedPath = "";
+  const untrackedPath = "untracked-by-test.txt";
+  const custody = (flight: GateFlightView, c: { run_id: string }): Custody => ({
+    preserveRecoveryClone: flight.preserveRecoveryClone, preserveSession: flight.preserveSession,
+    groups: (flight.survivingTickGroups as TickGroupView[]).map((g) => ({ ...g })), gates: gates(c.run_id).length, switchReports: switchReports(c.run_id),
+    reservations: { ...ctl.reservations },
+    ...(flight.worktreePath ? { indexLock: fs.existsSync(path.join(flight.worktreePath, ".git", "index.lock")) } : {}),
+  });
+  let claimId = "";
+  seam.prepareGateCheckpoint = async function (this: unknown, ...args: unknown[]) {
+    const flight = args[1] as GateFlightView;
+    rec.entered = true;
+    rec.flight = flight;
+    await ctl.requestSwitch();
+    if (o.dirty && flight.worktreePath) {
+      const wt = flight.worktreePath;
+      trackedPath = runGitSync(wt, "ls-files").split("\n").filter(Boolean)[0]!;
+      fs.appendFileSync(path.join(wt, trackedPath), "\nedited by the gate checkpoint test\n");
+      fs.writeFileSync(path.join(wt, untrackedPath), "untracked work\n");
+      treeBefore = viewTree(wt, trackedPath, untrackedPath);
+    }
+    // The owner signal is merged in before `hang` runs, so a hang can abort it synchronously.
+    const owner = new AbortController();
+    args[2] = AbortSignal.any([args[2] as AbortSignal, owner.signal]);
+    const abort: GateAborts = {
+      abortOwner: (reason) => owner.abort(reason),
+      abortShutdown: (reason) => (this as unknown as { shutdownSignal: AbortController }).shutdownSignal.abort(reason),
+    };
+    const injected = await o.hang(flight, ctl, rec, abort);
+    release = injected.release;
+    hangEntered = injected.entered;
+    rec.before = custody(flight, { run_id: claimId });
+    // The watchdog frees the hang only after the allowed tail, so a step that never bounds itself
+    // fails the settle-time assertion rather than the node test timeout.
+    const watchdog = setTimeout(() => { rec.watchdogFired = true; release(); }, deadlineMs + (o.tailMs ?? GATE_TAIL_MS) + 2000);
+    rec.startedAt = Date.now();
+    let ownerTimer: NodeJS.Timeout | undefined;
+    if (o.ownerAbort) {
+      ownerTimer = setTimeout(() => owner.abort(o.ownerAbort!.reason), o.ownerAbort.afterMs);
+    }
+    try { return await prepare.apply(this, args); }
+    catch (error) { rec.error = error; throw error; }
+    finally {
+      rec.settledAt = Date.now();
+      clearTimeout(watchdog);
+      clearTimeout(ownerTimer);
+      rec.after = custody(flight, { run_id: claimId });
+      if (treeBefore && flight.worktreePath) {
+        const after = viewTree(flight.worktreePath, trackedPath, untrackedPath);
+        rec.after!.tree = after;
+      }
+      // The run's own teardown needs what the injected hang held (the bare lock, the sink gate).
+      release();
+    }
+  };
+  const d = await drive({ capture: "real", switchRounds: [], serveCancellation: true, manual: true, verdicts: ["block"],
+    ...(o.forward ? { forward: o.forward } : {}),
+    ...(o.authority ? { authority: o.authority } : {}),
+    planMilestones: [{ id: "changed", title: "A milestone the human has not approved" }],
+    claimOver: () => ({ execution_milestones: [{ id: "frozen", title: "A frozen milestone the candidate drops" }] }),
+    runnerOpts: { gateCheckpointDeadlineMs: deadlineMs, ...o.runnerOpts },
+    setup: (c, x) => { ctl = x; claimId = c.run_id; } });
+  release();
+  return { rec, d, entered: hangEntered(), treeBefore, trackedPath, untrackedPath, deadlineMs };
+}
+
+function assertGateFailedClosed(r: Awaited<ReturnType<typeof gateCheckpointRun>>, tailMs = GATE_TAIL_MS): void {
+  const deadlineMs = r.deadlineMs;
+  const { rec } = r;
+  assert.equal(rec.entered, true, "the run reached prepareGateCheckpoint");
+  assert.equal(r.entered, true, "the injected hang was entered");
+  assert.equal(rec.watchdogFired, false, `the step settled by itself (took ${rec.settledAt - rec.startedAt} ms): ${String(rec.error)}`);
+  assert.ok(rec.settledAt - rec.startedAt <= deadlineMs + tailMs,
+    `settled ${rec.settledAt - rec.startedAt} ms after entry; allowed ${deadlineMs + tailMs}`);
+  assert.ok(rec.error instanceof TransientRecoveryError, `TransientRecoveryError, got ${String(rec.error)}`);
+  assert.equal(rec.after!.preserveRecoveryClone, true, "the recovery clone stays preserved");
+  assert.equal(rec.after!.gates, 0, "no gate presented");
+  assert.deepEqual(rec.after!.switchReports, [], "no switch serviced");
+  assert.deepEqual(rec.after!.reservations, rec.before!.reservations, "the step left the reservation untouched");
+  assert.notEqual(rec.after!.indexLock, true, "no .git/index.lock left behind");
+}
+function assertCustodyIntact(r: Awaited<ReturnType<typeof gateCheckpointRun>>): void {
+  const before = r.treeBefore!, after = r.rec.after!.tree!;
+  assert.equal(after.tracked, before.tracked, "tracked edit byte-identical");
+  assert.equal(after.untracked, before.untracked, "untracked file byte-identical");
+  // HEAD is either untouched or a direct child of the recorded HEAD that holds both pieces of work verbatim.
+  if (after.head !== before.head) {
+    const wt = r.rec.flight!.worktreePath!;
+    assert.equal(runGitSync(wt, "rev-parse", `${after.head}^`).trim(), before.head, "a new HEAD is a direct child of the recorded HEAD");
+    assert.equal(runGitSync(wt, "show", `${after.head}:${before.trackedPath}`), before.tracked, "the new HEAD holds the tracked edit byte-identically");
+    assert.equal(runGitSync(wt, "show", `${after.head}:${before.untrackedPath}`), before.untracked, "and the untracked file byte-identically");
+  }
+  // The step itself never sets preserveSession on this path: it must not be reset relative to before.
+  if (r.rec.before!.preserveSession) assert.equal(r.rec.after!.preserveSession, true, "preserveSession is not reset");
+}
+
+describe("issue #3980: the Claude gate checkpoint is bounded", () => {
+  it("(1) a hung clone-side git child (a planted clean filter) is killed and joined by the deadline; the filter's descendants may outlive the step and are reaped by later quiesce", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const marker = path.join(homeDir, "filter-entered");
+    const orphans = (): number[] => (fs.existsSync(marker) ? fs.readFileSync(marker, "utf8").split("\n").map(Number).filter((n) => n > 0) : []);
+    const killOrphans = (): void => { for (const pid of orphans()) { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } } };
+    try {
+      const r = await gateCheckpointRun({
+        dirty: true,
+        hang: async (flight) => {
+          const wt = flight.worktreePath!;
+          const script = path.join(homeDir, "hang-filter.sh");
+          fs.writeFileSync(script, `#!/bin/sh\necho $$ >> '${marker}'\nsleep 300 &\necho $! >> '${marker}'\nexec sleep 300\n`, { mode: 0o755 });
+          runGitSync(wt, "config", "filter.hang.clean", script);
+          fs.writeFileSync(path.join(wt, ".gitattributes"), "* filter=hang\n");
+          // Releasing also unplants the filter, so a run that never bounded itself is not re-hung by its
+          // later git calls and fails by assertion rather than by the node timeout.
+          const release = (): void => {
+            try { runGitSync(wt, "config", "--unset", "filter.hang.clean"); } catch { /* already unset */ }
+            killOrphans();
+            // A git that already loaded the filter starts a new instance per file: keep killing for a while.
+            const sweep = setInterval(killOrphans, 100);
+            setTimeout(() => clearInterval(sweep), 3000).unref();
+            sweep.unref();
+          };
+          return { release, entered: () => fs.existsSync(marker) };
+        },
+      });
+      assertGateFailedClosed(r);
+      assertCustodyIntact(r);
+    } finally { killOrphans(); }
+  });
+
+  it("(2) a hung bare-lock wait ends at the deadline and fails closed", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    let releaseLock = (): void => {};
+    let queued = 0;
+    const r = await gateCheckpointRun({
+      dirty: true,
+      hang: async (flight) => {
+        const bare = flight.barePath!;
+        const internals = git as unknown as { withLock: (key: string, fn: () => Promise<unknown>, signal?: AbortSignal) => Promise<unknown> };
+        const original = internals.withLock;
+        let held = false;
+        internals.withLock = function (this: unknown, key, fn, signal) {
+          if (held && key === bare) queued++;
+          return original.call(this, key, fn, signal);
+        };
+        void original.call(git, bare, () => new Promise<void>((resolve) => { held = true; releaseLock = resolve; })).catch(() => undefined);
+        assert.ok(await until(() => held), "the test-owned holder took the bare lock");
+        return { release: () => releaseLock(), entered: () => queued > 0 };
+      },
+    });
+    assertGateFailedClosed(r);
+    assertCustodyIntact(r);
+  });
+
+  it("(3) an executor join (the guarded-lane disposal) that never settles cannot hold the attributed reap past the deadline", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    let unblock = (): void => {};
+    const reapOptions: unknown[] = [];
+    const r = await gateCheckpointRun({
+      dirty: true, forward: {},
+      hang: async (_flight, x) => {
+        const sdk = x.sdk!;
+        (sdk as unknown as { laneDisposal?: Promise<void> }).laneDisposal = new Promise<void>((resolve) => { unblock = resolve; });
+        const reap = sdk.reapAttributedProcesses.bind(sdk);
+        sdk.reapAttributedProcesses = ((opts?: { deadlineAt?: number }) => { reapOptions.push(opts); return reap(opts); }) as typeof sdk.reapAttributedProcesses;
+        return { release: () => unblock(), entered: () => reapOptions.length > 0 };
+      },
+    });
+    assertGateFailedClosed(r);
+    assertCustodyIntact(r);
+    const first = reapOptions[0] as { deadlineAt?: number } | undefined;
+    assert.ok(first && Number.isFinite(first.deadlineAt), `the reap carried the gate deadline: ${JSON.stringify(first)}`);
+    assert.ok(first!.deadlineAt! <= r.rec.startedAt + r.deadlineMs + 50, "and it is this step's deadline");
+  });
+
+  it("(4) a sink gate held by another gated operation cannot hold the capture's admission past its deadline", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    let releaseGate = (): void => {};
+    let queued = 0;
+    const r = await gateCheckpointRun({
+      dirty: true,
+      hang: async (flight) => {
+        const gate = flight.sinkGate as unknown as { run: (fn: () => Promise<unknown>, stop?: unknown) => Promise<unknown> };
+        const original = gate.run.bind(gate);
+        let held = false;
+        gate.run = ((fn: () => Promise<unknown>, stop?: unknown) => { if (held) queued++; return original(fn, stop); }) as typeof gate.run;
+        void original(() => new Promise<void>((resolve) => { held = true; releaseGate = resolve; })).catch(() => undefined);
+        assert.ok(await until(() => held), "the test-owned holder took the sink gate");
+        return { release: () => releaseGate(), entered: () => queued > 0 };
+      },
+    });
+    assertGateFailedClosed(r);
+    assertCustodyIntact(r);
+  });
+
+  it("(5) a reap that consumes the deadline leaves no further proof, helper pass or Docker request admitted", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const reaps: { deadlineAt?: number; at: number }[] = [];
+    const quiesces: { deadlineAt?: number; at: number; process?: string; docker?: string; dockerHost?: string }[] = [];
+    let entered = false;
+    let freeReap = (): void => {};
+    const held = new Promise<void>((resolve) => { freeReap = resolve; });
+    const r = await gateCheckpointRun({
+      dirty: true,
+      forward: {
+        runProcesses: {
+          scan: async () => ({ pids: [], complete: true }),
+          // Honours a deadline when handed one; otherwise stays pending until the watchdog releases it, so
+          // an unbounded step outlives the allowed settle bound rather than finishing early by itself.
+          reap: async (_home, _worktree, _pids, opts) => {
+            reaps.push({ deadlineAt: opts?.deadlineAt, at: Date.now() });
+            entered = true;
+            await Promise.race([held, ...(opts?.deadlineAt === undefined ? [] : [(async () => {
+              await new Promise((resolve) => setTimeout(resolve, Math.max(0, opts.deadlineAt! - Date.now())));
+              // A timer can fire ~1 ms before Date.now() reaches the deadline: wait it out, plus a margin.
+              while (Date.now() < opts.deadlineAt!) await new Promise((resolve) => setTimeout(resolve, 1));
+              await new Promise((resolve) => setTimeout(resolve, 10));
+            })()])]);
+            return { killed: [], left: [], complete: true };
+          },
+        },
+      },
+      runnerOpts: { quiesceRun: async (req: QuiesceRunRequest) => {
+        const outcome = await quiesceRunAttempt(req);
+        quiesces.push({ deadlineAt: req.deadlineAt, at: Date.now(), process: outcome.process?.state, docker: outcome.docker.detail, dockerHost: req.dockerHost });
+        return outcome;
+      } },
+      hang: async () => ({ release: () => freeReap(), entered: () => entered }),
+    });
+    assertGateFailedClosed(r);
+    assertCustodyIntact(r);
+    assert.equal(reaps.length, 1, `exactly one attributed reap: ${JSON.stringify(reaps)}`);
+    assert.ok(Number.isFinite(reaps[0]!.deadlineAt), "the reap carried the gate deadline");
+    const inStep = quiesces.filter((q) => q.at >= r.rec.startedAt && q.at <= r.rec.settledAt);
+    assert.deepEqual(inStep, [], `no proof, helper pass or Docker request is admitted once the reap consumed the deadline: ${JSON.stringify(inStep)}`);
+  });
+
+  it("(5b) a plan-summary settle that honours its cap and expires the deadline leaves no attributed reap or proof admitted", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const settles: { deadlineMs: number | undefined; at: number }[] = [];
+    const reaps: number[] = [];
+    const quiesces: number[] = [];
+    let freeSettle = (): void => {};
+    const held = new Promise<void>((resolve) => { freeSettle = resolve; });
+    const r = await gateCheckpointRun({
+      dirty: true, forward: {},
+      runnerOpts: { quiesceRun: async (req: QuiesceRunRequest) => { quiesces.push(Date.now()); return quiesceRunAttempt(req); } },
+      hang: async (_flight, x) => {
+        const sdk = x.sdk!;
+        // Honours its deadlineMs argument; with none (an uncapped settle) it stays pending until released.
+        sdk.closeAndSettlePlanSummary = (async (deadlineMs?: number) => {
+          settles.push({ deadlineMs, at: Date.now() });
+          // The first settle is runFreeCapture's own; quiesceRun's settle is the one burning the deadline.
+          if (settles.length === 1) return;
+          if (deadlineMs === undefined) { await held; return; }
+          const end = Date.now() + deadlineMs;
+          await new Promise((resolve) => setTimeout(resolve, deadlineMs));
+          while (Date.now() < end) await new Promise((resolve) => setTimeout(resolve, 1));
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }) as typeof sdk.closeAndSettlePlanSummary;
+        const reap = sdk.reapAttributedProcesses.bind(sdk);
+        sdk.reapAttributedProcesses = ((opts?: { deadlineAt?: number }) => { reaps.push(Date.now()); return reap(opts); }) as typeof sdk.reapAttributedProcesses;
+        return { release: () => freeSettle(), entered: () => settles.length > 1 };
+      },
+    });
+    assertGateFailedClosed(r);
+    assertCustodyIntact(r);
+    const deadlineAt = r.rec.startedAt + r.deadlineMs;
+    const capped = settles.slice(1).filter((s) => s.at < deadlineAt); // later calls are the run's own teardown
+    assert.ok(capped.length > 0 && capped.every((s) => s.deadlineMs !== undefined), `quiesceRun's settle was capped: ${JSON.stringify(settles)}`);
+    for (const s of capped) assert.ok(s.at + s.deadlineMs! <= deadlineAt + 50, `settle cap ${s.deadlineMs} at ${s.at - r.rec.startedAt} ms outlives the gate deadline`);
+    assert.deepEqual(reaps.filter((t) => t >= deadlineAt), [], "no attributed reap starts after expiry");
+    assert.deepEqual(quiesces.filter((t) => t >= deadlineAt), [], "no proof is admitted after expiry");
+  });
+
+  it("(7) an owner abort during a hung sink-gate wait surfaces the owner's reason, not TransientRecoveryError", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const reason = new Error("owner cancelled the run (3980 test)");
+    let releaseGate = (): void => {};
+    let queued = 0;
+    const r = await gateCheckpointRun({
+      dirty: true, ownerAbort: { afterMs: 600, reason },
+      hang: async (flight) => {
+        const gate = flight.sinkGate as unknown as { run: (fn: () => Promise<unknown>, stop?: unknown) => Promise<unknown> };
+        const original = gate.run.bind(gate);
+        let held = false;
+        gate.run = ((fn: () => Promise<unknown>, stop?: unknown) => { if (held) queued++; return original(fn, stop); }) as typeof gate.run;
+        void original(() => new Promise<void>((resolve) => { held = true; releaseGate = resolve; })).catch(() => undefined);
+        assert.ok(await until(() => held), "the test-owned holder took the sink gate");
+        return { release: () => releaseGate(), entered: () => queued > 0 };
+      },
+    });
+    assert.equal(r.entered, true, "the injected hang was entered");
+    assert.equal(r.rec.watchdogFired, false, "the step settled by itself");
+    assert.ok(!(r.rec.error instanceof TransientRecoveryError), `not remapped to TransientRecoveryError: ${String(r.rec.error)}`);
+    assert.equal(r.rec.error, reason, "the owner's own reason is what the step rejects with");
+    assertCustodyIntact(r);
+    assert.equal(r.rec.after!.preserveRecoveryClone, true, "the recovery clone stays preserved");
+    assert.equal(r.rec.after!.gates, 0, "no gate presented");
+  });
+
+  /** Codex path (`bound` undefined): the executor has a credential-free capture lane. A stub lane aborts via the given
+   *  abort and reports `incomplete` without entering the action, so runFreeCapture returns `incomplete` and only the
+   *  explicit rethrow after it can keep the abort's reason. The stub is removed on release. */
+  async function abortInCodexLane(which: "abortOwner" | "abortShutdown", reason: Error) {
+    let calls = 0;
+    return gateCheckpointRun({
+      dirty: true,
+      hang: async (flight, _x, _rec, abort) => {
+        const executor = (flight as unknown as { executor: Record<string, unknown> }).executor;
+        const had = Object.prototype.hasOwnProperty.call(executor, "withCredentialFreeCapture");
+        const prior = executor.withCredentialFreeCapture;
+        executor.withCredentialFreeCapture = async () => { calls++; abort[which](reason); return { kind: "incomplete" }; };
+        const release = (): void => { if (had) executor.withCredentialFreeCapture = prior; else delete executor.withCredentialFreeCapture; };
+        return { release, entered: () => calls > 0 };
+      },
+    });
+  }
+
+  it("(7d) an owner abort while a Codex-path capture lane reports incomplete surfaces the owner's reason, not TransientRecoveryError", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const reason = new Error("owner cancelled in the codex lane (3980 test)");
+    const r = await abortInCodexLane("abortOwner", reason);
+    assert.equal(r.rec.entered, true, "the run reached prepareGateCheckpoint");
+    assert.equal(r.entered, true, "the stub capture lane was entered");
+    assert.equal(r.rec.watchdogFired, false, "the step settled by itself");
+    assert.ok(!(r.rec.error instanceof TransientRecoveryError), `not remapped to TransientRecoveryError: ${String(r.rec.error)}`);
+    assert.equal(r.rec.error, reason, "the owner's own reason is what the step rejects with");
+  });
+
+  it("(7e) a shutdown abort while a Codex-path capture lane reports incomplete surfaces the shutdown reason, not TransientRecoveryError", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const reason = new Error("worker shutting down in the codex lane (3980 test)");
+    const r = await abortInCodexLane("abortShutdown", reason);
+    assert.equal(r.rec.entered, true, "the run reached prepareGateCheckpoint");
+    assert.equal(r.entered, true, "the stub capture lane was entered");
+    assert.equal(r.rec.watchdogFired, false, "the step settled by itself");
+    assert.ok(!(r.rec.error instanceof TransientRecoveryError), `not remapped to TransientRecoveryError: ${String(r.rec.error)}`);
+    assert.equal(r.rec.error, reason, "the shutdown reason is what the step rejects with");
+  });
+
+  /** Claude path: abort during runFreeCapture's own (first) settle, via the given abort; the step must keep that reason. */
+  async function abortDuringSettle(which: "abortOwner" | "abortShutdown", reason: Error) {
+    let settles = 0;
+    return gateCheckpointRun({
+      dirty: true, forward: {},
+      hang: async (_flight, x, _rec, abort) => {
+        const sdk = x.sdk!;
+        const original = sdk.closeAndSettlePlanSummary.bind(sdk);
+        sdk.closeAndSettlePlanSummary = (async (deadlineMs?: number) => {
+          settles++;
+          if (settles === 1) { abort[which](reason); return; }
+          return original(deadlineMs);
+        }) as typeof sdk.closeAndSettlePlanSummary;
+        return { release: () => undefined, entered: () => settles > 0 };
+      },
+    });
+  }
+
+  it("(7b) Claude path pin: an owner abort during the plan-summary settle keeps the owner's reason via the existing deadline-family mapping", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const reason = new Error("owner cancelled during the settle (3980 test)");
+    const r = await abortDuringSettle("abortOwner", reason);
+    assert.equal(r.rec.entered, true, "the run reached prepareGateCheckpoint");
+    assert.equal(r.entered, true, "the settle was entered");
+    assert.equal(r.rec.watchdogFired, false, "the step settled by itself");
+    assert.ok(!(r.rec.error instanceof TransientRecoveryError), `not remapped to TransientRecoveryError: ${String(r.rec.error)}`);
+    assert.equal(r.rec.error, reason, "the owner's own reason is what the step rejects with");
+    assertCustodyIntact(r);
+    assert.equal(r.rec.after!.gates, 0, "no gate presented");
+  });
+
+  it("(7c) Claude path pin: a shutdown abort during the plan-summary settle keeps the shutdown reason via the existing deadline-family mapping", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const reason = new Error("worker shutting down during the settle (3980 test)");
+    const r = await abortDuringSettle("abortShutdown", reason);
+    assert.equal(r.rec.entered, true, "the run reached prepareGateCheckpoint");
+    assert.equal(r.entered, true, "the settle was entered");
+    assert.equal(r.rec.watchdogFired, false, "the step settled by itself");
+    assert.ok(!(r.rec.error instanceof TransientRecoveryError), `not remapped to TransientRecoveryError: ${String(r.rec.error)}`);
+    assert.equal(r.rec.error, reason, "the shutdown reason is what the step rejects with");
+    assertCustodyIntact(r);
+    assert.equal(r.rec.after!.gates, 0, "no gate presented");
+  });
+
+  it("(8) a non-deadline failure from the capture inside the bound is not remapped to TransientRecoveryError", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const refusal = new TrustedExecutionRefusal("codex harness is closed");
+    const proto = RunRunner.prototype as unknown as { captureRecoveryRestorePoint: (...args: unknown[]) => Promise<unknown> };
+    const original = proto.captureRecoveryRestorePoint;
+    let calls = 0;
+    restorers.push(() => { proto.captureRecoveryRestorePoint = original; });
+    const r = await gateCheckpointRun({
+      dirty: true,
+      hang: async () => {
+        proto.captureRecoveryRestorePoint = async function () { calls++; throw refusal; };
+        return { release: () => undefined, entered: () => calls > 0 };
+      },
+    });
+    assert.equal(r.entered, true, "the stubbed capture ran inside the bound");
+    assert.equal(r.rec.error, refusal, "the refusal passes through unchanged");
+    assertCustodyIntact(r);
+  });
+
+  for (const [label, makeFailure] of [
+    ["a plain git failure", () => new Error("git status failed: fatal: bad object")],
+    // The wrapper text of a deadline stop, but with no cause: nothing proves it was this gate's deadline.
+    ["the wrapper text of a deadline stop with no cause", () => new Error("git x failed: recovery deadline exhausted")],
+    // A deadline-shaped cause under a message that does not end with it (the shape of a mid-child abort
+    // wrapped as "permit-held git operation aborted"): the suffix check keeps it out of the deadline family.
+    ["an unrelated message carrying a TimeoutError cause", () => new Error("permit-held git operation aborted",
+      { cause: new DOMException("The operation was aborted due to timeout", "TimeoutError") })],
+    ["an unrelated git failure carrying a deadline cause", () => new Error("git x failed: fatal: bad object",
+      { cause: new Error("recovery deadline exhausted") })],
+  ] as const) {
+    it(`(8b) ${label} from the capture passes through unchanged, not remapped to TransientRecoveryError`, { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+      const proto = RunRunner.prototype as unknown as { captureRecoveryRestorePoint: (...args: unknown[]) => Promise<unknown> };
+      const original = proto.captureRecoveryRestorePoint;
+      restorers.push(() => { proto.captureRecoveryRestorePoint = original; });
+      const failure = makeFailure();
+      let calls = 0;
+      const r = await gateCheckpointRun({
+        dirty: true,
+        hang: async () => {
+          proto.captureRecoveryRestorePoint = async function () { calls++; throw failure; };
+          return { release: () => undefined, entered: () => calls > 0 };
+        },
+      });
+      assert.equal(r.entered, true, "the stubbed capture ran inside the bound");
+      assert.equal(r.rec.error, failure, `${failure.message} passes through by identity`);
+      assert.ok(!(r.rec.error instanceof TransientRecoveryError), "not remapped to TransientRecoveryError");
+      assertCustodyIntact(r);
+    });
+  }
+
+  /** Hooks the capture's owed-context object check (`git --no-replace-objects cat-file -t`, GitCache.requireOwedCommit),
+   *  a runGit call made outside any bare lock, so the wrapped error is what reaches the step (a call made under
+   *  withLock has its failure replaced by the lock's own raw recovery-interruption error). It records what runGit
+   *  rejects it with. "spin": waits until just before the gate deadline, then blocks the event loop past it so no
+   *  timer fires and the original execScoped throws recoveryRemaining's raw deadline Error. "timeout": throws the
+   *  DOMException a fired AbortSignal.timeout raises. "owner": aborts the owner signal, then throws the raw
+   *  deadline Error (the deadline stop that raced the owner's Cancel). */
+  function hookCaptureGit(mode: "spin" | "timeout" | "owner", rec: GateRec, deadlineMs: number, abort: GateAborts, ownerReason: Error) {
+    const internals = git as unknown as {
+      execScoped: (cmd: string, args: string[], ...rest: unknown[]) => Promise<unknown>;
+      runGit: (...args: unknown[]) => Promise<unknown>;
+    };
+    const originalExec = internals.execScoped;
+    const originalRunGit = internals.runGit;
+    const isFetch = (args: unknown): boolean =>
+      Array.isArray(args) && args.includes("cat-file") && args.includes("--no-replace-objects");
+    let hits = 0;
+    const rejections: unknown[] = [];
+    internals.execScoped = async function (this: unknown, cmd, args, ...rest) {
+      if (!isFetch(args)) return originalExec.call(this, cmd, args, ...rest);
+      hits++;
+      if (mode === "timeout") throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+      if (mode === "owner") {
+        abort.abortOwner(ownerReason);
+        throw new Error("recovery deadline exhausted");
+      }
+      const deadline = rec.startedAt + deadlineMs;
+      while (Date.now() < deadline - 30) await new Promise((resolve) => setTimeout(resolve, 5));
+      // No await from here to the call: the deadline timers cannot fire, so the raw recoveryRemaining throw is what surfaces.
+      while (Date.now() <= deadline + 100) { /* spin past the deadline */ }
+      return originalExec.call(this, cmd, args, ...rest);
+    } as typeof internals.execScoped;
+    internals.runGit = async function (this: unknown, ...args: unknown[]) {
+      try { return await originalRunGit.apply(this, args); }
+      catch (error) { if (isFetch(args[1])) rejections.push(error); throw error; }
+    } as typeof internals.runGit;
+    return { rejections, entered: () => hits > 0, release: () => { internals.execScoped = originalExec; internals.runGit = originalRunGit; } };
+  }
+  const NEVER_OWNER = new Error("unused owner reason");
+
+  it("(9) a recovery deadline that stops the capture's owed-context git check, wrapped by the git wrapper, fails closed as TransientRecoveryError", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    let hook!: ReturnType<typeof hookCaptureGit>;
+    const r = await gateCheckpointRun({
+      dirty: true,
+      hang: async (_flight, _x, rec, abort) => {
+        hook = hookCaptureGit("spin", rec, GATE_MS, abort, NEVER_OWNER);
+        return { release: () => hook.release(), entered: hook.entered };
+      },
+    });
+    assert.equal(hook.rejections.length, 1, "runGit rejected the hooked call once");
+    const wrapped = hook.rejections[0];
+    assert.ok(wrapped instanceof Error);
+    assert.match(wrapped.message, /^git --no-replace-objects cat-file -t [0-9a-f]+ failed: recovery deadline exhausted$/, "the raw deadline was wrapped by runGit");
+    assertGateFailedClosed(r);
+    assertCustodyIntact(r);
+  });
+
+  it("(9b) a fired timeout signal at the capture's owed-context git check, wrapped by the git wrapper, fails closed as TransientRecoveryError", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    let hook!: ReturnType<typeof hookCaptureGit>;
+    const r = await gateCheckpointRun({
+      dirty: true,
+      hang: async (_flight, _x, rec, abort) => {
+        hook = hookCaptureGit("timeout", rec, GATE_MS, abort, NEVER_OWNER);
+        return { release: () => hook.release(), entered: hook.entered };
+      },
+    });
+    assert.equal(hook.rejections.length, 1, "runGit rejected the hooked call once");
+    const wrapped = hook.rejections[0];
+    assert.ok(wrapped instanceof Error);
+    assert.match(wrapped.message, /^git --no-replace-objects cat-file -t [0-9a-f]+ failed: The operation was aborted due to timeout$/);
+    assertGateFailedClosed(r);
+    assertCustodyIntact(r);
+  });
+
+  it("(9c) an owner abort that races the wrapped deadline at the git check surfaces the owner's reason, not TransientRecoveryError", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const reason = new Error("owner cancelled at the capture git check (3980 test)");
+    let hook!: ReturnType<typeof hookCaptureGit>;
+    const r = await gateCheckpointRun({
+      dirty: true,
+      hang: async (_flight, _x, rec, abort) => {
+        hook = hookCaptureGit("owner", rec, GATE_MS, abort, reason);
+        return { release: () => hook.release(), entered: hook.entered };
+      },
+    });
+    assert.equal(r.entered, true, "the git hook was entered");
+    assert.equal(hook.rejections.length, 1, "runGit rejected the hooked call once");
+    assert.ok(!(r.rec.error instanceof TransientRecoveryError), `not remapped to TransientRecoveryError: ${String(r.rec.error)}`);
+    assert.equal(r.rec.error, reason, "the owner's own reason is what the step rejects with");
+    assertCustodyIntact(r);
+  });
+
+  it("(10) a gate deadline that stops the capture's wait for authority A mid-retry (AbortError caused by the gate's timeout) fails closed as TransientRecoveryError", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    // The whole chain is real: prepareGateCheckpoint -> captureRecoveryRestorePoint -> fetchTracking -> GitCache.fetchAgentBranch
+    // (producingSource) -> runner.inFlightAuthority -> AuthorityRuntime.withTransaction -> flockExclusive's retry delay.
+    const auth = await authorityHarness();
+    const started = Date.now();
+    const r = await gateCheckpointRun({
+      dirty: true, authority: auth,
+      hang: async () => {
+        auth.arm();
+        return { release: () => auth.disarm(), entered: () => auth.acquisitions.length > 0 };
+      },
+    });
+    const elapsedMs = Date.now() - started;
+    // Non-vacuity: A was requested inside the gate step and was refused as held, over and over, until the gate stopped it.
+    assert.equal(r.entered, true, "the capture requested authority A inside the gate step");
+    assert.ok(auth.contended() >= 2, `the flock retry delay was reached repeatedly: ${auth.contended()} contended attempts`);
+    const stopped = auth.acquisitions.find((a) => a.error !== undefined);
+    assert.ok(stopped, "an authority acquisition was stopped");
+    const signal = stopped.signal!;
+    assert.ok(signal.aborted, "its wait signal is the aborted gate signal");
+    assert.equal((signal.reason as Error).name, "TimeoutError", "the gate deadline fired it");
+    const error = stopped.error as Error;
+    assert.equal(error.name, "AbortError", `the wait rejected with the retry delay's AbortError: ${String(error)}`);
+    assert.equal(error.cause, signal.reason, "caused by the gate signal's reason, by identity");
+    assertGateFailedClosed(r);
+    assertCustodyIntact(r);
+    console.log(`# (10) wall time ${elapsedMs} ms, contended attempts ${auth.contended()}, acquisitions ${auth.acquisitions.length}`);
+  });
+
+  /** Stub the capture so it outlives the gate deadline, then fails. `after` runs once the held signal has aborted
+   *  (the gate deadline fired first); the returned error is thrown after it. */
+  function lateCaptureFailure(seen: { reasonName?: string; reason?: unknown; calls: number },
+    after: (abort: GateAborts) => void, failure: (heldReason: unknown) => Error) {
+    const proto = RunRunner.prototype as unknown as { captureRecoveryRestorePoint: (...args: unknown[]) => Promise<unknown> };
+    const original = proto.captureRecoveryRestorePoint;
+    restorers.push(() => { proto.captureRecoveryRestorePoint = original; });
+    return (abort: GateAborts) => {
+      proto.captureRecoveryRestorePoint = async function (...args: unknown[]) {
+        seen.calls++;
+        const held = (args[4] as { signal: AbortSignal }).signal;
+        await new Promise<void>((resolve) => {
+          if (held.aborted) return resolve();
+          held.addEventListener("abort", () => resolve(), { once: true });
+          setTimeout(resolve, GATE_MS + GATE_TAIL_MS).unref(); // a missing deadline fails by assertion, not by hanging
+        });
+        seen.reasonName = (held.reason as Error | undefined)?.name;
+        seen.reason = held.reason;
+        after(abort);
+        throw failure(held.reason);
+      };
+    };
+  }
+
+  it("(10b) an AbortError whose cause is a different timeout reason, from the capture after the gate deadline, is not remapped to TransientRecoveryError", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const seen = { calls: 0 } as { reasonName?: string; reason?: unknown; calls: number };
+    // A TimeoutError of someone else's (not the gate's own signal reason): nothing proves it was this gate's deadline.
+    const failure = Object.assign(new Error("The operation was aborted"), {
+      name: "AbortError", cause: new DOMException("The operation was aborted due to timeout", "TimeoutError") });
+    const install = lateCaptureFailure(seen, () => undefined, () => failure);
+    const r = await gateCheckpointRun({
+      dirty: true,
+      hang: async (_flight, _x, _rec, abort) => {
+        install(abort);
+        return { release: () => undefined, entered: () => seen.calls > 0 };
+      },
+    });
+    assert.equal(r.entered, true, "the stubbed capture ran inside the bound");
+    assert.equal(seen.reasonName, "TimeoutError", "the gate deadline had fired when the capture failed");
+    assert.notEqual(failure.cause, seen.reason, "the failure's cause is not the gate signal's reason");
+    assert.equal(r.rec.error, failure, "the failure passes through by identity");
+    assert.ok(!(r.rec.error instanceof TransientRecoveryError), "not remapped to TransientRecoveryError");
+    assertCustodyIntact(r);
+  });
+
+  for (const [label, who] of [["owner Cancel", "abortOwner"], ["worker shutdown", "abortShutdown"]] as const) {
+    it(`(10c) an AbortError caused by the gate deadline that raced a ${label} surfaces that reason, not TransientRecoveryError`, { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+      const reason = new Error(`${label} after the gate deadline (3980 test)`);
+      const seen = { calls: 0 } as { reasonName?: string; reason?: unknown; calls: number };
+      const install = lateCaptureFailure(seen, (abort) => abort[who](reason), (heldReason) =>
+        Object.assign(new Error("The operation was aborted"), { name: "AbortError", cause: heldReason }));
+      const r = await gateCheckpointRun({
+        dirty: true,
+        hang: async (_flight, _x, _rec, abort) => {
+          install(abort);
+          return { release: () => undefined, entered: () => seen.calls > 0 };
+        },
+      });
+      assert.equal(r.entered, true, "the stubbed capture ran inside the bound");
+      assert.equal(seen.reasonName, "TimeoutError", "the gate deadline fired before the owner or the worker stopped");
+      assert.ok(!(r.rec.error instanceof TransientRecoveryError), `not remapped to TransientRecoveryError: ${String(r.rec.error)}`);
+      assert.equal(r.rec.error, reason, `the ${label} reason is what the step rejects with`);
+      assertCustodyIntact(r);
+    });
+  }
+
+  /** A REAL test-owned process group (`sleep 60`, detached: its pid is its pgid) that never goes. The
+   *  runner's own production probe (processGroupAlive) decides its aliveness; the hook only counts probes
+   *  and records signals WITHOUT delivering them, so the group survives until `stop()`. */
+  function survivorHooks() {
+    const child = spawn("sleep", ["60"], { detached: true, stdio: "ignore" });
+    child.unref();
+    const pgid = child.pid!;
+    const seen = { probes: 0, signals: [] as { sig: string; at: number }[] };
+    const stop = (): void => { try { process.kill(-pgid, "SIGKILL"); } catch { /* already gone */ } };
+    return { seen, pgid, stop, opts: { checkpointTestHooks: { tickSpawn: {
+      groupAlive: (g: number) => { seen.probes++; return processGroupAlive(g, "command"); },
+      signalGroup: (_pgid: number, sig: string) => { seen.signals.push({ sig, at: Date.now() }); return true; },
+    } } } };
+  }
+  /** After expiry the real group is still tracked, and killConfirmed is what the prelude left it as. */
+  function assertSurvivorKept(r: Awaited<ReturnType<typeof gateCheckpointRun>>, pgid: number, killConfirmed: boolean): void {
+    assert.deepEqual(r.rec.before!.groups, [{ pgid, identity: "command", killConfirmed: false }], "the group is tracked when the step starts");
+    assert.deepEqual(r.rec.after!.groups, [{ pgid, identity: "command", killConfirmed }], "still tracked after expiry, killConfirmed as the prelude left it");
+  }
+
+  it("(6a) tick survivors with the sink admitted just before the deadline: the wait is capped, no SIGKILL is sent after expiry and no second wait starts", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const { seen, pgid, stop, opts } = survivorHooks();
+    try {
+      const r = await gateCheckpointRun({
+        dirty: true, runnerOpts: opts,
+        hang: async (flight) => {
+          flight.survivingTickGroups.push({ pgid, identity: "command", killConfirmed: false });
+          const gate = flight.sinkGate as unknown as { run: (fn: () => Promise<unknown>) => Promise<unknown> };
+          let releaseGate = (): void => {};
+          let held = false;
+          void gate.run(() => new Promise<void>((resolve) => { held = true; releaseGate = resolve; })).catch(() => undefined);
+          assert.ok(await until(() => held), "the injected sink holder is admitted");
+          // Freed ~100 ms before the deadline, so the first survivor wait can only start just before expiry.
+          const timer = setTimeout(() => releaseGate(), GATE_MS - 100);
+          return { release: () => { clearTimeout(timer); stop(); releaseGate(); }, entered: () => seen.probes > 0 };
+        },
+      });
+      assertGateFailedClosed(r);
+      assertCustodyIntact(r);
+      const deadlineAt = r.rec.startedAt + r.deadlineMs;
+      assert.deepEqual(seen.signals.filter((x) => x.at >= deadlineAt - 20), [], "no signal at or after expiry");
+      assert.deepEqual(seen.signals, [], "the first wait was capped by the deadline, so there was no SIGKILL to send");
+      assertSurvivorKept(r, pgid, false);
+    } finally { stop(); }
+  });
+
+  it("(6b) expiry during the second survivor wait: one SIGKILL before the deadline, none after, and the step still settles at the deadline", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const { seen, pgid, stop, opts } = survivorHooks();
+    try {
+      const r = await gateCheckpointRun({
+        dirty: true, deadlineMs: 2500, tailMs: 700, runnerOpts: opts,
+        hang: async (flight) => {
+          flight.survivingTickGroups.push({ pgid, identity: "command", killConfirmed: false });
+          return { release: () => stop(), entered: () => seen.probes > 0 };
+        },
+      });
+      // The second wait is capped by the deadline: uncapped it would run a further 2 s past it.
+      assertGateFailedClosed(r, 700);
+      assertCustodyIntact(r);
+      const deadlineAt = r.rec.startedAt + r.deadlineMs;
+      assert.equal(seen.signals.length, 1, `exactly one SIGKILL: ${JSON.stringify(seen.signals)}`);
+      assert.equal(seen.signals[0]!.sig, "SIGKILL");
+      assert.ok(seen.signals[0]!.at < deadlineAt, "sent before the deadline");
+      assert.ok(seen.signals[0]!.at >= r.rec.startedAt + 1900, "after the first full wait");
+      assertSurvivorKept(r, pgid, true); // the recording hook reports the one SIGKILL as delivered
+    } finally { stop(); }
+  });
+});
+
+describe("issue #3980: awaitTickSurvivorsGone with a gate deadline", () => {
+  /** A RunRunner whose survivor probe and signal are the test's hooks; no real process is touched. */
+  function survivorRunner(hooks: { alive: (pgid: number) => boolean; signal: (pgid: number, sig: string) => boolean }) {
+    const warns: string[] = [];
+    const runner = Object.create(RunRunner.prototype) as { checkpointTestHooks: unknown;
+      awaitTickSurvivorsGone(flight: unknown, deadlineAt?: number): Promise<string> };
+    runner.checkpointTestHooks = { tickSpawn: { groupAlive: hooks.alive, signalGroup: hooks.signal } };
+    const flight = (pgids: number[]) => ({ runId: "run-x", survivingTickGroups: pgids.map((pgid) => ({ pgid, identity: "command", killConfirmed: false })),
+      runLog: { ...nullLogger(), warn: (m: string) => { warns.push(m); } } });
+    return { runner, flight, warns };
+  }
+
+  it("a deadline that expires between two groups' SIGKILLs sends no later signal and starts no second wait", async (t) => {
+    // Mock Date and setTimeout so the 2 s wait and the "slow" signal are exact, not wall-clock dependent.
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+    const signals: number[] = [];
+    let probesAfterSignal = 0;
+    const { runner, flight, warns } = survivorRunner({
+      alive: () => { if (signals.length > 0) probesAfterSignal++; return true; },
+      // The first signal takes 150 ms of (mock) time, which carries the clock past the deadline.
+      signal: (pgid) => { signals.push(pgid); t.mock.timers.tick(150); return true; },
+    });
+    const started = Date.now();
+    // The first full wait is 2 s, so the deadline must outlast it; the first signal then outlasts the deadline.
+    let settled = false;
+    const pending = runner.awaitTickSurvivorsGone(flight([101, 102]), started + 2000 + 100).finally(() => { settled = true; });
+    for (let i = 0; !settled && i < 1000; i++) {
+      await new Promise((resolve) => setImmediate(resolve));
+      if (!settled) t.mock.timers.tick(25);
+    }
+    // Mocked time no longer advances past this loop, so fail rather than await a promise that never settles.
+    assert.ok(settled, "awaitTickSurvivorsGone settled within the driven mock time");
+    const verdict = await pending;
+    assert.equal(verdict, "unconfirmed");
+    assert.deepEqual(signals, [101], "the second group was not signalled after the deadline passed");
+    assert.equal(probesAfterSignal, 0, "no second wait began");
+    assert.deepEqual(warns, ["tick survivors unresolved at the gate checkpoint deadline"]);
+  });
+
+  it("an expiry during the first wait sends no signal at all", async () => {
+    const signals: number[] = [];
+    const { runner, flight, warns } = survivorRunner({ alive: () => true, signal: (pgid) => { signals.push(pgid); return true; } });
+    const started = Date.now();
+    assert.equal(await runner.awaitTickSurvivorsGone(flight([201]), started + 200), "unconfirmed");
+    assert.deepEqual(signals, []);
+    assert.equal(warns.length, 1);
+    assert.ok(Date.now() - started < 1000, "the 2 s wait was capped at the deadline");
+  });
+
+  it("a deadline already passed returns at once, unconfirmed, without signalling", async () => {
+    const signals: number[] = [];
+    const { runner, flight } = survivorRunner({ alive: () => true, signal: (pgid) => { signals.push(pgid); return true; } });
+    const started = Date.now();
+    assert.equal(await runner.awaitTickSurvivorsGone(flight([301]), started - 1), "unconfirmed");
+    assert.deepEqual(signals, []);
+    assert.ok(Date.now() - started < 500);
+  });
+
+  it("no survivors is gone immediately, with or without a deadline", async () => {
+    const { runner, flight } = survivorRunner({ alive: () => false, signal: () => true });
+    assert.equal(await runner.awaitTickSurvivorsGone(flight([401]), Date.now() - 1), "gone");
+    assert.equal(await runner.awaitTickSurvivorsGone(flight([401])), "gone");
+  });
+
+  it("with time left the wait/SIGKILL/wait sequence is the unbounded one: a group that dies after its SIGKILL reads gone", async () => {
+    let dead = false;
+    const signals: string[] = [];
+    const { runner, flight } = survivorRunner({ alive: () => !dead, signal: (_pgid, sig) => { signals.push(sig); dead = true; return true; } });
+    assert.equal(await runner.awaitTickSurvivorsGone(flight([501]), Date.now() + 60_000), "gone");
+    assert.deepEqual(signals, ["SIGKILL"]);
+  });
+
+  it("without a deadline the first wait is the full 2 s and expiry never short-circuits", async () => {
+    const signals: string[] = [];
+    let dead = false;
+    const { runner, flight } = survivorRunner({ alive: () => !dead, signal: (_pgid, sig) => { signals.push(sig); dead = true; return true; } });
+    const started = Date.now();
+    assert.equal(await runner.awaitTickSurvivorsGone(flight([601])), "gone");
+    assert.ok(Date.now() - started >= 1900, "waited the unbounded first wait before signalling");
+    assert.deepEqual(signals, ["SIGKILL"]);
+  });
+});
+
+describe("issue #3980: SdkExecutor.reapAttributedProcesses with a gate deadline", () => {
+  function executor() {
+    const reaps: unknown[][] = [];
+    const sdk = new SdkExecutor(nullLogger(), homeDir, {
+      runProcesses: { scan: async () => ({ pids: [], complete: true }),
+        reap: async (...args: unknown[]) => { reaps.push(args.slice(3)); return { killed: [], left: [], complete: true }; } },
+    });
+    const internals = sdk as unknown as { laneDisposal?: Promise<void>; activeDeps?: { abort: AbortController; install: Promise<unknown> }; depsJoined: boolean };
+    return { sdk, reaps, internals };
+  }
+  const never = (): Promise<void> => new Promise<void>(() => undefined);
+
+  it("a lane disposal that never settles reads as an unconfirmed reap at the deadline, and nothing is reaped", async () => {
+    const { sdk, reaps, internals } = executor();
+    internals.laneDisposal = never();
+    const started = Date.now();
+    const r = await sdk.reapAttributedProcesses({ deadlineAt: started + 300 });
+    assert.deepEqual(r, { killed: [], left: [], complete: false });
+    assert.ok(Date.now() - started >= 250 && Date.now() - started < 2000);
+    assert.deepEqual(reaps, []);
+  });
+
+  it("a deps install that never settles likewise; the abort was requested before the wait, and the install is not cancelled further", async () => {
+    const { sdk, reaps, internals } = executor();
+    const abort = new AbortController();
+    internals.activeDeps = { abort, install: never() };
+    internals.depsJoined = false;
+    const started = Date.now();
+    const r = await sdk.reapAttributedProcesses({ deadlineAt: started + 300 });
+    assert.equal(r.complete, false);
+    assert.equal(abort.signal.aborted, true, "the install abort was requested");
+    assert.deepEqual(reaps, []);
+    assert.equal(internals.depsJoined, false, "the install was not reported joined");
+    assert.ok(Date.now() - started < 2000);
+  });
+
+  it("past the deadline nothing is admitted: no deps abort, no reap", async () => {
+    const { sdk, reaps, internals } = executor();
+    const abort = new AbortController();
+    internals.activeDeps = { abort, install: Promise.resolve() };
+    internals.depsJoined = false;
+    const r = await sdk.reapAttributedProcesses({ deadlineAt: Date.now() - 1 });
+    assert.equal(r.complete, false);
+    assert.equal(abort.signal.aborted, false);
+    assert.deepEqual(reaps, []);
+  });
+
+  it("with time left the reap runs and carries the deadline; without one it is called exactly as before", async () => {
+    const withDeadline = executor();
+    const deadlineAt = Date.now() + 60_000;
+    assert.equal((await withDeadline.sdk.reapAttributedProcesses({ deadlineAt })).complete, true);
+    assert.deepEqual(withDeadline.reaps, [[{ deadlineAt }]]);
+    const plain = executor();
+    assert.equal((await plain.sdk.reapAttributedProcesses()).complete, true);
+    assert.deepEqual(plain.reaps, [[]], "no options argument is passed when none was given");
   });
 });

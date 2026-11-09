@@ -24,7 +24,7 @@
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
     pipeline_id, pipeline_ref, failure_snapshot, ci_config_paths, wait_on_limit, auto_approve, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, harness, plan_cross_check_required, plan_cross_check_gated
-, code_cross_check_required, ci_config_guard, repo_agent_source_required) VALUES (
+, code_cross_check_required, ci_config_guard, repo_agent_source_required, ci_fix_mr_iid) VALUES (
     -- repo_id is nullable since PRD #39 (chat runs have none); the ::uuid cast keeps
     -- this ci_fix param a non-null uuid.UUID (a ci_fix run always has a repo).
     @user_id, @repo_id::uuid, 'ci_fix', @issue_title, @issue_description,
@@ -60,8 +60,25 @@ INSERT INTO runs (
         SELECT 1 FROM runs g
         WHERE g.repo_id = @repo_id::uuid AND g.ci_config_guard
           AND (g.branch = @pipeline_ref OR 'uzi/prompt-' || g.id::text = @pipeline_ref)
-    ), true)
+    ), true,
+    -- Issue #4079: the single open PR this fix is bound to, resolved at create by
+    -- workersvc.resolveCIFixBinding. NULL = unbound (no open PR on the branch).
+    sqlc.narg(ci_fix_mr_iid))
 RETURNING *;
+
+-- name: ListCIFixBindingCandidates :many
+-- Issue #4079: the candidate pull requests a ci_fix on a ref can bind to. The set is
+-- the PRs uzi itself recorded (runs.mr_iid) on its own runs for this branch; a
+-- head-branch match alone is never proof, since no driver's head-branch field
+-- identifies the head repo. On GitLab the worker's duplicate-create recovery
+-- (GitLabClient.findOpenMr) can adopt a same-named fork MR into runs.mr_iid, so the
+-- recorded set is only as fork-safe as that recording (tracked separately). Newest first. Capped at
+-- 8 by the caller; the LIMIT 9 returns one extra row so an overflow is detectable.
+SELECT mr_iid::bigint AS mr_iid FROM runs
+WHERE user_id = @user_id AND repo_id = @repo_id::uuid AND branch = @ref AND mr_iid IS NOT NULL
+GROUP BY mr_iid
+ORDER BY max(created_at) DESC, mr_iid
+LIMIT 9;
 
 -- name: CountActiveRunsWithBranch :one
 -- Cross-kind same-branch exclusion for the Fix CI trigger (PRD #6): count active

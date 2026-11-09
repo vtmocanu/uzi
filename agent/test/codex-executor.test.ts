@@ -107,9 +107,9 @@ import { FakePrDescApi } from "./fake-pr-desc-api.js";
 import { ResidueQuarantinedError, latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
 import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
 import { scanSignals } from "../src/signals.js";
-import { detectRepoAgents, filterRepoAgentModel } from "../src/repoagents.js";
+import { detectRepoAgents, filterRepoAgentModel, REPO_AGENT_DENIED_TOOLS } from "../src/repoagents.js";
 import { parseCodexAgentFile } from "../src/repoagents-codex.js";
-import { buildReviewCommentsContext, REVIEWED_RESUME_APPROVAL_GUIDANCE, CLAUDE_LONG_COMMAND_APPEND, CODEX_LONG_COMMAND_APPEND, COMPLETION_CONTRACT_GUIDANCE, FOLLOW_UP_TRAILER, PR_SUMMARY_GUIDANCE, REPO_SUBAGENT_UNTRUSTED_APPEND, SUBAGENT_SAFETY_APPEND } from "../src/prompt.js";
+import { buildReviewCommentsContext, REVIEWED_RESUME_APPROVAL_GUIDANCE, CLAUDE_LONG_COMMAND_APPEND, CODEX_LONG_COMMAND_APPEND, COMPLETION_CONTRACT_GUIDANCE, FOLLOW_UP_TRAILER, PR_SUMMARY_GUIDANCE, REPO_SUBAGENT_UNTRUSTED_APPEND, REPO_SUBAGENT_PLANNING_APPEND, SUBAGENT_SAFETY_APPEND } from "../src/prompt.js";
 import { SEEDED_PLAN_RULES } from "../src/seeded-plan.js";
 
 import { ENV_PROBE_SCRIPT, EnvProbeCleanupError } from "../src/env-probe.js";
@@ -8602,6 +8602,55 @@ describe("CodexExecutor: per-turn phase-correct broker (plan write ban)", () => 
     assert.match(childReply.text ?? "", /not permitted during the plan phase/, "the child deny is write_denied_in_plan");
     assert.deepEqual(childFileop.ops, [], "no child fileop op ran during the plan phase");
     assert.equal(rig.transport.turnStartCount, 2, "the child turn ran on the same transport (demuxed)");
+  });
+
+  it("(P3) PRD #3914 M3: a repo agent spawned during a repo-sourced PLAN turn cannot write", async () => {
+    const agents: AgentTemplate[] = [
+      { name: "lead", description: "the lead", prompt_body: "lead body", tools: null, skills: [] },
+      { name: "coder", description: "a coder", prompt_body: "coder body", tools: null, skills: [] },
+    ];
+    const repoWriter: AgentTemplate = { name: "repo-writer", description: "a repo writer", prompt_body: "REPO WRITER BODY", tools: null, skills: [] };
+    const CHILD_WRITE_ID = 89;
+    const OWN_SPAWN_ID = 2;
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
+        c.transport
+          .push(toolCall(CHILD_WRITE_ID, "Write", { file_path: "REPO.md", content: "repo agent must not write in plan" }, "th-child", "tn-child", "cc-repo-write"))
+          .push(turnCompleted("completed", "th-child", "tn-child"));
+        return { turn: { id: "tn-child" } };
+      }
+      if (c.method === "turn/interrupt") return {};
+      return {};
+    };
+    const rig = makeRig({ responder });
+    const childFileop = recordingFileop();
+    rig.deps = { ...rig.deps, wireFileop: () => childFileop.handle };
+    rig.transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { role: "repo-writer", prompt: "check the plan" }, "th-1", "tn-1", "c-root"));
+
+    const reported: string[] = [];
+    const { ctx } = makeCtx({
+      planApproved: false, approvedPlan: undefined, gatePlan, agents, repoAgents: [repoWriter], requestedAgentSource: "repo",
+      reportPlanAgentSource: async (source) => { reported.push(source); },
+    });
+    const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+
+    await waitFor(() => rig.transport.responses.some((r) => r.requestId === 1), "parent spawn_agent reply", 5000);
+    assert.equal(replyForId(rig, 1).success, true, "the repo agent is a planning delegate");
+    rig.transport.push(toolCall(OWN_SPAWN_ID, "spawn_agent", { role: "coder", prompt: "help" }, "th-1", "tn-1", "c-own"));
+    await waitFor(() => rig.transport.responses.some((r) => r.requestId === OWN_SPAWN_ID), "own spawn_agent reply", 5000);
+    assert.equal(replyForId(rig, OWN_SPAWN_ID).success, false, "an owner template is not on a repo-sourced plan roster");
+    rig.transport.push(turnCompleted("completed", "th-1", "tn-1")).end();
+    await assert.rejects(withTimeout(runP, 5000, "repo plan-turn subagent write"), /produced no plan/);
+
+    const childReply = replyForId(rig, CHILD_WRITE_ID);
+    assert.equal(childReply.success, false, "the repo agent's plan-turn Write was DENIED");
+    assert.match(childReply.text ?? "", /not permitted during the plan phase/, "the deny is write_denied_in_plan");
+    assert.deepEqual(childFileop.ops, [], "no fileop op ran during the plan phase");
+    const childStart = rig.transport.requests.filter((r) => r.method === "thread/start")[1];
+    assert.ok(String(rec(childStart?.params).developerInstructions).includes("REPO WRITER BODY"), "the child ran the repo agent's body");
+    assert.deepEqual(reported, ["repo"]);
   });
 });
 
@@ -19437,6 +19486,60 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
     assert.ok(rootInstructions(rig.epochs[1]!.transport).includes("OWN LEAD BODY"), "the lead stays uzi's builtin");
   });
 
+  const planReported = () => {
+    const reported: string[] = [];
+    return { reported, reportPlanAgentSource: async (source: string) => { reported.push(source); } };
+  };
+
+  it("PRD #3914 M3: a requested repo source with a roster plans with the repo agents and the untrusted framing", async () => {
+    const r = planReported();
+    const { rig } = await gated({ status: "absent" }, { repoAgents: [repoReviewer, repoTester], requestedAgentSource: "repo",
+      reportPlanAgentSource: r.reportPlanAgentSource }, []);
+    const [planText] = turnInputs(rig.epochs[0]!.transport);
+    assert.ok(planText!.includes(PASSAGE), "the plan turn carries the untrusted-review passage");
+    assert.ok(planText!.includes(REPO_SUBAGENT_PLANNING_APPEND));
+    assert.equal(REPO_SUBAGENT_PLANNING_APPEND, "Planning subagents report findings; they do not change files.");
+    assert.ok(planText!.includes("Available subagents to delegate to: repo-reviewer (can edit files), repo-tester (can edit files)."));
+    assert.ok(planText!.includes("All planning dispatches are read-only"));
+    assert.ok(!planText!.includes("coder (can edit files)"), "the owner templates are not on the plan roster");
+    const instructions = rootInstructions(rig.epochs[0]!.transport);
+    assert.ok(instructions.includes(PASSAGE), "the plan thread's instructions carry the passage");
+    assert.ok(instructions.includes(REPO_SUBAGENT_PLANNING_APPEND));
+    assert.ok(instructions.includes("OWN LEAD BODY"), "the lead stays the owner's");
+    assert.deepEqual(r.reported, ["repo"]);
+  });
+
+  for (const [name, extra] of [
+    ["an unset request", { repoAgents: [repoReviewer] }],
+    ["a requested own source", { repoAgents: [repoReviewer], requestedAgentSource: "own" }],
+    ["a requested repo source with no roster", { requestedAgentSource: "repo" }],
+    ["a persisted own source on a replan", { repoAgents: [repoReviewer], requestedAgentSource: "repo", approvedSelection: { source: "own", exclusions: [] } }],
+    ["an unset request with a persisted repo source from autopilot", { repoAgents: [repoReviewer], approvedSelection: { source: "repo", exclusions: [] } }],
+  ] as [string, Partial<RunContext>][]) {
+    it(`PRD #3914 M3: ${name} plans with the owner templates and no framing`, async () => {
+      const r = planReported();
+      const { rig } = await gated({ status: "absent" }, { ...extra, reportPlanAgentSource: r.reportPlanAgentSource }, []);
+      const [planText] = turnInputs(rig.epochs[0]!.transport);
+      assert.ok(planText!.includes("Available subagents to delegate to: coder (can edit files), tester (can edit files)."));
+      assert.ok(!planText!.includes(PASSAGE));
+      assert.ok(!planText!.includes(REPO_SUBAGENT_PLANNING_APPEND));
+      assert.ok(!rootInstructions(rig.epochs[0]!.transport).includes(PASSAGE));
+      assert.deepEqual(r.reported, ["own"]);
+    });
+  }
+
+  it("PRD #3914 M3: a repo-sourced plan request maps repo agents with the repo denylist and the run's skills", () => {
+    const { ctx } = makeCtx({ agents: ownAgents, repoAgents: [repoReviewer], requestedAgentSource: "repo",
+      skills: [{ name: "lint", description: "d", body: "b" }] });
+    const request = makeExecutor(makeRig(), bindingOf(SUBSCRIPTION))["buildRunRequest"](ctx, "plan", "p", undefined, new AbortController().signal, undefined);
+    assert.deepEqual(Object.keys(request.agents), ["repo-reviewer"]);
+    assert.deepEqual(request.agents["repo-reviewer"]!.deniedTools, [...REPO_AGENT_DENIED_TOOLS]);
+    assert.deepEqual(request.agents["repo-reviewer"]!.skills, ["lint"]);
+    assert.equal(request.phase, "plan");
+    const rendered = renderCodexRun(request);
+    assert.equal(rendered.perRoleGrants.get("repo-reviewer")!.phase, "plan", "the repo planning agent runs under plan-phase grants");
+  });
+
   it("own source: names on the base turn, no passage", async () => {
     const { rig } = await gated(okSel("own"), { repoAgents: [repoReviewer] }, []);
     const [implText] = turnInputs(rig.epochs[1]!.transport);
@@ -29243,7 +29346,7 @@ describe("CodexExecutor: lead-config reporting (PRD #3244)", () => {
       providerDefaultModel?: string; expect: import("../src/lead-config-report.js").LeadRequest;
     }> };
     const cases = contract.request_cases.filter((c) => c.harness === "codex");
-    assert.equal(cases.length, 16, "all Codex request cases loaded");
+    assert.equal(cases.length, 18, "all Codex request cases loaded");
     const visited: string[] = [];
     const phases = new Set<string>();
     for (const c of cases) {
@@ -29301,7 +29404,7 @@ describe("CodexExecutor: lead-config reporting (PRD #3244)", () => {
       visited.push(c.id);
     }
     assert.deepEqual(visited, cases.map((c) => c.id));
-    assert.equal(visited.length, 16);
+    assert.equal(visited.length, 18);
     assert.deepEqual([...phases].sort(), ["implement", "plan"]);
   });
 

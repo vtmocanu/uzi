@@ -184,7 +184,7 @@ const maxSlackSectionRunes = 2900
 // Descriptions are NEVER rendered (repo-authored free text); names are
 // IsValidName-validated kebab-case and additionally mrkdwn-escaped as defense in
 // depth.
-func gateBlocks(runID uuid.UUID, base string, repoAgentNames []string, repoAgentFolder string, crossCheckReason ...string) []slack.Block {
+func gateBlocks(runID uuid.UUID, base string, repoAgentNames []string, repoAgentFolder, requestedSource string, crossCheckReason ...string) []slack.Block {
 	repoAgentFolder = slackRepoAgentFolder(repoAgentFolder)
 	var section *slack.SectionBlock
 	var approveElems []slack.BlockElement
@@ -208,6 +208,10 @@ func gateBlocks(runID uuid.UUID, base string, repoAgentNames []string, repoAgent
 		ownBtn.Confirm = approveConfirm("own", 0, repoAgentFolder)
 
 		approveElems = []slack.BlockElement{repoBtn, ownBtn}
+		if requestedSource == "own" {
+			repoBtn.Style, ownBtn.Style = "", slack.StylePrimary
+			approveElems = []slack.BlockElement{ownBtn, repoBtn}
+		}
 	} else {
 		section = slack.NewSectionBlock(
 			slack.NewTextBlockObject(slack.MarkdownType,

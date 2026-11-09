@@ -429,20 +429,15 @@ func (h *Handler) seedBoard(w http.ResponseWriter, r *http.Request, repo store.G
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return false
 	}
-	if err := f.EnsureLabels(r.Context(), repo.ForgeProjectID, forgesvc.DefaultColumns); err != nil {
-		httpx.Error(w, http.StatusBadGateway, "could not seed board labels on the forge: "+err.Error())
-		return false
-	}
-	for i, col := range forgesvc.DefaultColumns {
-		if err := h.q.InsertBoardColumn(r.Context(), store.InsertBoardColumnParams{
-			RepoID:    repo.ID,
-			LabelName: col.Name,
-			Position:  int32(i),
-		}); err != nil {
-			slog.Error("insert board column", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
+	if err := forgesvc.EnsureBoardColumns(r.Context(), h.q, f, repo.ID, repo.ForgeProjectID); err != nil {
+		var seedErr *forgesvc.LabelSeedError
+		if errors.As(err, &seedErr) {
+			httpx.Error(w, http.StatusBadGateway, "could not seed board labels on the forge: "+seedErr.Error())
 			return false
 		}
+		slog.Error("ensure board columns", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return false
 	}
 	if _, err := h.svc.FullSync(r.Context(), repo.ID, repo.ForgeProjectID, f); err != nil {
 		// Non-fatal: the board renders empty and the poller/Refresh will fill it.

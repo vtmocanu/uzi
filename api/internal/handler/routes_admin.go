@@ -153,6 +153,10 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			r.Use(h.requireAuth())
 			r.Use(mw.RequireAdmin)
 			r.Patch("/users/{id}", h.PatchUser)
+			// Admin-issued one-time account reset link (PRD #3989): cookie-only so a uza_
+			// Bearer 401s before the handler and CSRF applies. Actor from the session, target
+			// from the path; the plaintext token is returned once.
+			r.Post("/users/{id}/reset-link", h.IssueResetLink)
 			// Admin per-user run-judge toggle (PRD #46 Decision 7): actor authorized by
 			// RequireAdmin, target from the path, never the body (audit H3).
 			r.Put("/users/{id}/judge", h.SetUserJudgeEnabled)

@@ -1044,7 +1044,17 @@ func RenderDeployment(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Sp
 	}
 }
 
+// workerTerminationGracePeriodSeconds is the pod's terminationGracePeriodSeconds:
+// the worker's 35 s shutdown result deadline (SHUTDOWN_RESULT_DEADLINE_MS in
+// agent/src/main.ts, measured from the first SIGTERM) plus a 5 s margin.
+// Kubernetes grace also covers the ordered termination of the native sidecars.
+// The field is part of the pod template, so it changes SpecHashOf: upgrading the
+// controller rolls every hosted worker once through the existing paced roll
+// (ADR-1470, #3103).
+const workerTerminationGracePeriodSeconds int64 = 40
+
 func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) corev1.PodTemplateSpec {
+	terminationGrace := workerTerminationGracePeriodSeconds
 	automount := false
 	runAsNonRoot := true
 	uid, gid := workerUID, workerGID
@@ -1449,11 +1459,12 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 			},
 		},
 		Spec: corev1.PodSpec{
-			ServiceAccountName:           cfg.ServiceAccountName,
-			PriorityClassName:            cfg.PriorityClassName,
-			NodeSelector:                 cfg.NodeSelector,
-			Tolerations:                  cfg.Tolerations,
-			AutomountServiceAccountToken: &automount,
+			ServiceAccountName:            cfg.ServiceAccountName,
+			PriorityClassName:             cfg.PriorityClassName,
+			NodeSelector:                  cfg.NodeSelector,
+			Tolerations:                   cfg.Tolerations,
+			AutomountServiceAccountToken:  &automount,
+			TerminationGracePeriodSeconds: &terminationGrace,
 			// Soft anti-affinity for docker workers ONLY (nil for a plain worker, so its
 			// spec/hash is untouched). Keeps the pod off nodes running the crown-jewel
 			// pods — see dockerNodeAntiAffinity.

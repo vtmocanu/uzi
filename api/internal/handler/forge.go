@@ -21,12 +21,12 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
-	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
+	"github.com/vtmocanu/uzi/api/internal/provisionsvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -242,75 +242,17 @@ func (h *Handler) CreateConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The caller names the forge; the API never guesses it from the URL or a
-	// default (issue #3785), since a guessed driver verifies the token against
-	// the wrong forge.
-	rawType := strings.TrimSpace(req.ForgeType)
-	if rawType == "" {
-		httpx.Error(w, http.StatusBadRequest, "forge_type is required; supported values: "+forge.SupportedTypesList())
-		return
-	}
-	parsedType, ok := forge.ParseType(rawType)
-	if !ok {
-		httpx.Error(w, http.StatusBadRequest, "unsupported forge type; supported values: "+forge.SupportedTypesList())
-		return
-	}
-	forgeType := string(parsedType)
-	if strings.TrimSpace(req.Token) == "" {
-		httpx.Error(w, http.StatusBadRequest, "a bot token is required")
-		return
-	}
-	if !h.cfg.ForgeBaseURLAllowed(req.BaseURL) {
-		httpx.Error(w, http.StatusBadRequest, "base URL is not in the allowed forge list")
-		return
-	}
-	baseURL, err := config.NormalizeForgeBaseURL(req.BaseURL)
+	conn, err := h.provisioner().ConnectForge(r.Context(), user.ID, req.ForgeType, req.BaseURL, req.Token)
 	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid base URL")
-		return
-	}
-
-	f, err := h.svc.ForgeForToken(forge.Type(forgeType), baseURL, req.Token)
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "could not initialize forge client")
-		return
-	}
-	identity, err := f.VerifyToken(r.Context())
-	if err != nil {
-		// err is already PAT-redacted by the driver.
-		httpx.Error(w, http.StatusBadGateway, "token verification failed: "+err.Error())
-		return
-	}
-
-	// Least-privilege gate (PRD #5): token-level violations block the save — this
-	// is the one moment uzi holds the plaintext and the user is present to fix it.
-	// Per-repo checks can't run here (no repos are enabled yet); those warn later.
-	if tr := h.pcheck.CheckToken(r.Context(), f, forge.Type(forgeType), identity.IsAdmin); len(tr.Violations) > 0 {
-		httpx.JSON(w, http.StatusUnprocessableEntity, map[string]any{
-			"error":      "the bot token is over-privileged and was not saved; mint a least-privilege token (see the bot setup doc)",
-			"violations": tr.Violations,
-		})
-		return
-	}
-
-	ciphertext, err := h.svc.EncryptToken(req.Token)
-	if err != nil {
-		slog.Error("encrypt token", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-
-	conn, err := h.q.UpsertForgeConnection(r.Context(), store.UpsertForgeConnectionParams{
-		UserID:          user.ID,
-		ForgeType:       forgeType,
-		BaseUrl:         baseURL,
-		BotUsername:     identity.Username,
-		BotForgeUserID:  identity.ForgeUserID,
-		TokenCiphertext: ciphertext,
-	})
-	if err != nil {
-		slog.Error("upsert forge connection", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		var pe *provisionsvc.Error
+		if errors.As(err, &pe) && pe.Kind == provisionsvc.KindOverPrivileged {
+			httpx.JSON(w, http.StatusUnprocessableEntity, map[string]any{
+				"error":      pe.Message,
+				"violations": pe.Violations,
+			})
+			return
+		}
+		writeProvisionError(w, err)
 		return
 	}
 	httpx.JSON(w, http.StatusCreated, map[string]any{"connection": connToDTO(conn)})
@@ -605,35 +547,10 @@ func (h *Handler) ListProjects(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	conn, err := h.q.GetForgeConnectionForUser(r.Context(), store.GetForgeConnectionForUserParams{ID: id, UserID: user.ID})
+	conn, err := h.provisioner().DiscoverRepos(r.Context(), user.ID, id)
 	if err != nil {
-		httpx.Error(w, http.StatusNotFound, "connection not found")
+		writeProvisionError(w, err)
 		return
-	}
-	f, err := h.svc.ForgeForConnection(conn.ForgeType, conn.BaseUrl, conn.TokenCiphertext)
-	if err != nil {
-		slog.Error("build forge for connection", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-	projects, err := f.ListProjects(r.Context())
-	if err != nil {
-		httpx.Error(w, http.StatusBadGateway, "could not list projects: "+err.Error())
-		return
-	}
-	for _, p := range projects {
-		branch := pgconv.TextOrNull(p.DefaultBranch)
-		if _, err := h.q.UpsertRepo(r.Context(), store.UpsertRepoParams{
-			ConnectionID:      conn.ID,
-			ForgeProjectID:    p.ForgeProjectID,
-			PathWithNamespace: p.PathWithNamespace,
-			WebUrl:            p.WebURL,
-			DefaultBranch:     branch,
-		}); err != nil {
-			slog.Error("upsert repo", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-			return
-		}
 	}
 	repos, err := h.q.ListReposByConnectionForUser(r.Context(), store.ListReposByConnectionForUserParams{ConnectionID: conn.ID, UserID: user.ID})
 	if err != nil {
@@ -874,88 +791,66 @@ func (h *Handler) SetRepoEnabled(w http.ResponseWriter, r *http.Request) {
 
 	// D1 layer 1 (PRD #66): the repo-enable gate. Enabling is the moment the user
 	// is present and can fix a forge misconfiguration, so a live, fail-closed guard
-	// runs BEFORE the flip on the enable path only. The disable path is NEVER gated
-	// (D4) — a user must always be able to stop tracking a repo.
+	// runs BEFORE the flip on the enable path only (inside provisionsvc). The
+	// disable path is NEVER gated (D4) - a user must always be able to stop
+	// tracking a repo.
+	var repo store.Repo
 	if req.Enabled {
-		row, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID})
+		var err error
+		repo, err = h.provisioner().EnableRepo(r.Context(), user.ID, id)
+		if err != nil {
+			var pe *provisionsvc.Error
+			if errors.As(err, &pe) && pe.Kind == provisionsvc.KindGuardBlocked {
+				writeEnableGuardBlocked(w, pe.Guard)
+				return
+			}
+			writeProvisionError(w, err)
+			return
+		}
+		h.importAfterEnable(r.Context(), user.ID, id)
+	} else {
+		var err error
+		repo, err = h.q.SetRepoEnabledForUser(r.Context(), store.SetRepoEnabledForUserParams{ID: id, Enabled: false, UserID: user.ID})
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				httpx.Error(w, http.StatusNotFound, "repo not found")
 				return
 			}
-			slog.Error("get repo for enable guard", "error", err)
+			slog.Error("set repo enabled", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
-		res := h.pcheck.GuardRepo(r.Context(), privcheck.GuardInput{
-			ForgeType:       row.ForgeType,
-			BaseURL:         row.BaseUrl,
-			TokenCiphertext: row.TokenCiphertext,
-			Repo: privcheck.Repo{
-				ID:             row.ID.String(),
-				Path:           row.PathWithNamespace,
-				ForgeProjectID: row.ForgeProjectID,
-				DefaultBranch:  row.DefaultBranch.String,
-			},
-			// Live per-repo override (M8): a non-NULL guardrail_override_reason means
-			// the admin override is active, so GuardRepo downgrades the waivable
-			// findings post-evaluation — never protection_unreadable (D8/D3).
-			Overridden: row.GuardrailOverrideReason.Valid,
-		})
-		if res.Blocked {
-			// 422 mirroring the save-time token gate's body shape (forge.go, key
-			// "violations") so the existing web 422 handling applies. Only the
-			// SeverityBlock findings' messages go in "violations" — an overridden or
-			// warn finding must not appear as a reason the run was refused.
-			httpx.JSON(w, http.StatusUnprocessableEntity, map[string]any{
-				// Headline stays cause-agnostic: the block set spans both "the bot
-				// can push/merge to the default branch" and the fail-closed
-				// "protection could not be verified" case, and hardcoding the
-				// push/merge reason misdescribes the latter. The specific, actionable
-				// reason(s) are in "violations".
-				"error":      "this repo cannot be enabled: uzi will not run while the bot can reach the default branch, or while that cannot be verified (main is never touched). See the reasons below, fix branch protection on the forge, then retry.",
-				"violations": blockFindingMessages(res.Findings),
-				// PRD #1432: machine-readable coded findings + whether an admin override
-				// could actually clear this refusal, computed on res.Findings (the
-				// post-downgrade set, correct for both the non-overridden and
-				// already-overridden cases). These two drive the member's "Request admin
-				// approval" affordance — offered only when waivable is true; a
-				// protection_unreadable block is waivable:false, so the UI steers the
-				// member to fix protection instead.
-				"findings": blockFindingDTOs(res.Findings),
-				"waivable": privcheck.AllBlocksWaivable(res.Findings),
-			})
-			return
-		}
-	}
-
-	repo, err := h.q.SetRepoEnabledForUser(r.Context(), store.SetRepoEnabledForUserParams{ID: id, Enabled: req.Enabled, UserID: user.ID})
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			httpx.Error(w, http.StatusNotFound, "repo not found")
-			return
-		}
-		slog.Error("set repo enabled", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
 	}
 
 	if h.invalidateRepoSync != nil {
 		h.invalidateRepoSync(id)
 	}
 
-	// issue #1432 rework: a successful enable makes any pending override request for this
-	// repo moot. Settle it so it does not linger in the admin queue
-	// (ListPendingGuardrailOverrideRequests is not filtered by enabled state). Best-effort —
-	// the enable already succeeded, so a cleanup error is logged, never surfaced. Enable-only:
-	// SetRepoEnabledForUser is also the disable path, which must not touch requests.
-	if req.Enabled {
-		if err := h.q.DeletePendingGuardrailOverrideRequestsForRepo(r.Context(), id); err != nil {
-			slog.Warn("set repo enabled: settle pending override request", "error", err)
-		}
-	}
-
 	httpx.JSON(w, http.StatusOK, map[string]any{"repo": repoToDTO(repo)})
+}
+
+// importAfterEnable imports the issues of a repo that was just enabled. The
+// enable creates the board columns, so GetBoard's first-open seed, which used
+// to run this import, no longer fires; without it a new board stays empty
+// until the poller's first tick. Best effort: the enable already succeeded,
+// and the poller or Refresh retries a failed import.
+func (h *Handler) importAfterEnable(ctx context.Context, userID, repoID uuid.UUID) {
+	if h.svc == nil {
+		return
+	}
+	row, err := h.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID})
+	if err != nil {
+		slog.Warn("import after enable: read repo", "error", err)
+		return
+	}
+	f, err := h.svc.ForgeForConnection(row.ForgeType, row.BaseUrl, row.TokenCiphertext)
+	if err != nil {
+		slog.Warn("import after enable: build forge", "error", err)
+		return
+	}
+	if _, err := h.svc.FullSync(ctx, row.ID, row.ForgeProjectID, f); err != nil {
+		slog.Warn("import after enable failed; the poller retries", "repo", row.PathWithNamespace, "error", err)
+	}
 }
 
 // DeleteRepo removes a single repo row (PRD #357), cascading its derived data
@@ -1517,4 +1412,52 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 		response["warning"] = "Explicitly required capabilities remain required despite ignored inference: " + strings.Join(overlap, ", ")
 	}
 	httpx.JSON(w, http.StatusOK, response)
+}
+
+// provisioner builds the shared provisioning service over the handler's
+// collaborators. It is cheap, so it is built per call.
+func (h *Handler) provisioner() *provisionsvc.Service {
+	return provisionsvc.New(h.q, h.svc, h.pcheck, h.cfg.ForgeBaseURLAllowed)
+}
+
+// writeProvisionError maps a provisionsvc error to the status and body the
+// handlers have always sent.
+func writeProvisionError(w http.ResponseWriter, err error) {
+	var pe *provisionsvc.Error
+	if !errors.As(err, &pe) {
+		slog.Error("provisioning", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	switch pe.Kind {
+	case provisionsvc.KindBadRequest:
+		httpx.Error(w, http.StatusBadRequest, pe.Message)
+	case provisionsvc.KindNotFound:
+		httpx.Error(w, http.StatusNotFound, pe.Message)
+	case provisionsvc.KindBadGateway:
+		httpx.Error(w, http.StatusBadGateway, pe.Message)
+	default:
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+	}
+}
+
+// writeEnableGuardBlocked writes the enable-refusal 422.
+func writeEnableGuardBlocked(w http.ResponseWriter, res privcheck.GuardResult) {
+	// 422 mirroring the save-time token gate's body shape (key "violations") so
+	// the existing web 422 handling applies. Only the SeverityBlock findings'
+	// messages go in "violations" - an overridden or warn finding must not
+	// appear as a reason the run was refused.
+	httpx.JSON(w, http.StatusUnprocessableEntity, map[string]any{
+		// Headline stays cause-agnostic: the block set spans both "the bot
+		// can push/merge to the default branch" and the fail-closed
+		// "protection could not be verified" case. The specific, actionable
+		// reason(s) are in "violations".
+		"error":      "this repo cannot be enabled: uzi will not run while the bot can reach the default branch, or while that cannot be verified (main is never touched). See the reasons below, fix branch protection on the forge, then retry.",
+		"violations": blockFindingMessages(res.Findings),
+		// PRD #1432: machine-readable coded findings + whether an admin override
+		// could clear this refusal; they drive the member's "Request admin
+		// approval" affordance, offered only when waivable is true.
+		"findings": blockFindingDTOs(res.Findings),
+		"waivable": privcheck.AllBlocksWaivable(res.Findings),
+	})
 }
