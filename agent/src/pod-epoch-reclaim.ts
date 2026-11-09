@@ -1,3 +1,4 @@
+import { countPartialCause, mergePartialCauses, readFailureCause, type PartialCauses } from "./pod-epoch-partial-causes.js";
 import { constants } from "node:fs";
 import { open } from "node:fs/promises";
 import { release as osRelease } from "node:os";
@@ -36,6 +37,7 @@ interface Candidate { run_id: string; path: string; bytes: number; presence: "pr
 const AUDITED_CRIO_KERNELS: readonly string[] = ["6.12.0-243.el10.x86_64", "6.12.0-243.el10.aarch64"];
 const RUNTIME_PREFIX = { "containerd-runc": "containerd://", "crio-crun": "cri-o://" } as const;
 interface Verdict {
+  partial_causes: PartialCauses;
   verdict: "eligible" | "deferred" | "partial";
   reason: string;
   examined: number;
@@ -124,7 +126,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
   let guard: PodEpochDaemonGuard | undefined;
   let detachVeto = () => {};
   const result: Verdict = {
-    verdict: "deferred", reason: "not_evaluated", examined: 0, would_delete: 0, would_delete_bytes: 0,
+    partial_causes: {}, verdict: "deferred", reason: "not_evaluated", examined: 0, would_delete: 0, would_delete_bytes: 0,
     would_settle: 0, by_basis: { discard: 0, strict_plain: 0 }, kept: 0, journal_extra_fields: 0,
     authority: { result: "unproven", reason: "not_evaluated" }, evidence_version: null,
     list: [], list_overflow: 0, inventory_overflow: 0, inventory_overflow_exact: false,
@@ -278,11 +280,13 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
     result.inventory_overflow = Math.max(0, census.overflow);
     result.inventory_overflow_exact = census.inventoryComplete && census.overflowExact;
     let partial = !result.inventory_complete || census.overflow > 0;
+    const censusDiagnosed = mergePartialCauses(result.partial_causes, census.partialCauses);
+    if (partial && !censusDiagnosed) countPartialCause(result.partial_causes, "census_unclassified");
     const censusPaths = new Set<string>();
     const groups = [];
     for (const group of census.groups) {
       const fresh = [...new Set(group.paths)].filter(p => !censusPaths.has(p));
-      if (groups.length >= 200 || censusPaths.size + fresh.length > 200) { partial = true; break; }
+      if (groups.length >= 200 || censusPaths.size + fresh.length > 200) { countPartialCause(result.partial_causes, groups.length >= 200 ? "group_cap" : "group_physical_path_cap"); partial = true; break; }
       for (const p of fresh) censusPaths.add(p);
       groups.push(group);
     }
@@ -292,12 +296,14 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
       // Refuse before either API call: retained metadata is not an HTTP path authority.
       // Keep every path in this group; continue bounded sibling work without retrying it.
       if (typeof group.selector.runId !== "string" || !RUN_ID_RE.test(group.selector.runId)) {
+        countPartialCause(result.partial_causes, "selector_refused");
         partial = true;
         for (const path of group.paths) { candidates.delete(path); refused.add(path); }
         continue;
       }
       let holds: RetainedHoldsSnapshot = { state: "unknown" };
       let lifecycle: RetainedLifecycleSnapshot = { state: "unknown" };
+      let readStage: "ownership" | "holds" = "ownership";
       try {
         // Lifecycle first, so a terminal run's holds read is at least as current.
         const row = await owned(() => MaintenanceBudget.runOwned(controller.signal,
@@ -306,9 +312,10 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
           })), hardPass);
         if (row && (row.status === "completed" || row.status === "failed" || row.status === "cancelled"))
           lifecycle = { state: "terminal", status: row.status };
+        readStage = "holds";
         holds = holdsSnapshot(await owned(() => MaintenanceBudget.runOwned(controller.signal,
           () => options.client.listRecoveryHolds(group.selector.runId, controller.signal)), hardPass), group.selector.runId);
-      } catch (error) { if (fatal || controller.signal.aborted) throw error; partial = true; }
+      } catch (error) { if (fatal || controller.signal.aborted) throw error; countPartialCause(result.partial_causes, readFailureCause(readStage, error)); partial = true; }
       const expected = new Set(group.paths);
       const inspected = await owned(() => options.git.inspectRetainedSources({
         epoch: true, maxDescriptors: 200, maxPhysicalPaths: expected.size,
@@ -322,6 +329,8 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
       const drift = actual.size !== expected.size || [...actual].some(p => !expected.has(p));
       if (drift) { invalidate("path_set_changed"); throw new Refusal("path_set_changed"); }
       const complete = !inspected.partial && inspected.unreadable === 0;
+      const inspectionDiagnosed = mergePartialCauses(result.partial_causes, inspected.partialCauses);
+      if (!complete && !inspectionDiagnosed) countPartialCause(result.partial_causes, "inspection_unclassified");
       partial ||= !complete;
       for (const source of inspected.sources) {
         check(); entry();

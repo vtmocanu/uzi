@@ -23,6 +23,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       getUsage: vi.fn(),
       getAdminUsage: vi.fn(),
       getRecoveryHolds: vi.fn(),
+      listUsers: vi.fn(),
     },
   };
 });
@@ -53,6 +54,7 @@ const user = {
 
 function aRun(over: Partial<RunListItem> = {}): RunListItem {
   return {
+    harness_decision: null,
     id: "run-1",
     repo_id: "repo-1",
     forge_type: "gitlab",

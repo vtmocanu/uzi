@@ -8,13 +8,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/vtmocanu/uzi/api/internal/capability"
 	"log/slog"
 	"slices"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -40,7 +41,8 @@ type ActiveSnapshot struct {
 	Active []ActiveRunEntry `json:"active"`
 	// PendingOverflow is set when the worker has more pending outcomes than it may list; while
 	// its server-side closure is unexpired every run it owns is closed to every claimant and the
-	// worker itself is refused any claim (#1391, D11).
+	// worker itself is refused snapshot claims unless this transaction proves bounded
+	// scoped pending coverage or accepts explicit incomplete-inventory intake (#1391, D11).
 	PendingOverflow bool `json:"pending_overflow"`
 	// FinalizeResume (issue #1742) is carried ONLY on a register snapshot: the attempts whose
 	// executor finished and whose worker holds an authenticated finalize-pending record, but no
@@ -60,6 +62,16 @@ type ActiveSnapshot struct {
 	PendingAll          []PendingOutcomeIdentity `json:"pending_all"`
 	pendingAllMalformed bool
 
+	// PendingPolicyProtection groups retained sources by their current owner generation.
+	// Group membership and complete coverage are worker attestations, not server proof
+	// of filesystem contents, custody, or lifecycle authority.
+	PendingPolicyProtection          []PendingPolicyProtectionEntry `json:"pending_policy_protection,omitempty"`
+	pendingPolicyProtectionMalformed bool
+
+	// Intake attestation only; absent/null lists remain unavailable, never complete.
+	PendingInventoryIncomplete          bool `json:"pending_inventory_incomplete,omitempty"`
+	pendingInventoryIncompleteMalformed bool
+
 	// finalizeResumeMalformed is set by UnmarshalJSON when finalize_resume had a wrong wire type
 	// and was dropped. Only the register path (validateFinalizeResume) logs it, with the worker id;
 	// heartbeat and claim snapshots stay silent about the field.
@@ -68,9 +80,9 @@ type ActiveSnapshot struct {
 	publicationResumeMalformed bool
 }
 
-// UnmarshalJSON decodes finalize_resume and pending_all independently from the
-// strict enclosing active snapshot. Malformed optional evidence drops only its
-// own list. Service validation logs pending_all only after enclosing acceptance;
+// UnmarshalJSON isolates optional evidence from the typed enclosing snapshot;
+// unknown nested fields are ignored for protocol compatibility. Malformed optional
+// evidence grants no authority. Service validation logs pending_all only after enclosing acceptance;
 // finalize_resume retains its register-only validation policy.
 func (s *ActiveSnapshot) UnmarshalJSON(data []byte) error {
 	// json.Unmarshaler convention: a JSON null is a no-op.
@@ -80,12 +92,21 @@ func (s *ActiveSnapshot) UnmarshalJSON(data []byte) error {
 	type plain ActiveSnapshot
 	aux := struct {
 		*plain
-		FinalizeResume    json.RawMessage `json:"finalize_resume"`
-		PublicationResume json.RawMessage `json:"publication_resume"`
-		PendingAll        json.RawMessage `json:"pending_all"`
+		FinalizeResume             json.RawMessage `json:"finalize_resume"`
+		PublicationResume          json.RawMessage `json:"publication_resume"`
+		PendingAll                 json.RawMessage `json:"pending_all"`
+		PendingPolicyProtection    json.RawMessage `json:"pending_policy_protection"`
+		PendingInventoryIncomplete json.RawMessage `json:"pending_inventory_incomplete"`
 	}{plain: (*plain)(s)}
 	if err := json.Unmarshal(data, &aux); err != nil {
 		return err
+	}
+	s.PendingInventoryIncomplete = false
+	s.pendingInventoryIncompleteMalformed = false
+	if raw := bytes.TrimSpace(aux.PendingInventoryIncomplete); len(raw) > 0 && !bytes.Equal(raw, []byte("null")) {
+		if err := json.Unmarshal(raw, &s.PendingInventoryIncomplete); err != nil {
+			s.pendingInventoryIncompleteMalformed = true
+		}
 	}
 	s.PendingAll = nil
 	s.pendingAllMalformed = false
@@ -108,6 +129,27 @@ func (s *ActiveSnapshot) UnmarshalJSON(data []byte) error {
 			}
 		}
 	}
+	s.PendingPolicyProtection = nil
+	s.pendingPolicyProtectionMalformed = false
+	if raw := bytes.TrimSpace(aux.PendingPolicyProtection); len(raw) > 0 && !bytes.Equal(raw, []byte("null")) {
+		var wire []struct {
+			RunID           *string `json:"run_id"`
+			OwnerGeneration *int64  `json:"owner_generation"`
+		}
+		if err := json.Unmarshal(raw, &wire); err != nil {
+			s.pendingPolicyProtectionMalformed = true
+		} else {
+			s.PendingPolicyProtection = make([]PendingPolicyProtectionEntry, 0, len(wire))
+			for _, e := range wire {
+				if e.RunID == nil || e.OwnerGeneration == nil {
+					s.pendingPolicyProtectionMalformed = true
+					s.PendingPolicyProtection = nil
+					break
+				}
+				s.PendingPolicyProtection = append(s.PendingPolicyProtection, PendingPolicyProtectionEntry{RunID: *e.RunID, OwnerGeneration: *e.OwnerGeneration})
+			}
+		}
+	}
 	s.PublicationResume = nil
 	s.publicationResumeMalformed = false
 	if raw := bytes.TrimSpace(aux.PublicationResume); len(raw) > 0 && !bytes.Equal(raw, []byte("null")) {
@@ -119,6 +161,13 @@ func (s *ActiveSnapshot) UnmarshalJSON(data []byte) error {
 		}
 	}
 	s.FinalizeResume = nil
+	// A marked list is not a complete inventory. Do not let contradictory input
+	// fall through to the older complete-inventory exception or identity writes.
+	if s.PendingInventoryIncomplete && (s.PendingAll != nil || s.PendingPolicyProtection != nil || s.pendingAllMalformed || s.pendingPolicyProtectionMalformed) {
+		s.pendingInventoryIncompleteMalformed = true
+		s.pendingAllMalformed = true
+		s.PendingAll = nil
+	}
 	s.finalizeResumeMalformed = false
 	if len(aux.FinalizeResume) == 0 || string(aux.FinalizeResume) == "null" {
 		return nil
@@ -138,6 +187,12 @@ type PendingOutcomeIdentity struct {
 	ClaimGeneration int64  `json:"claim_generation"`
 }
 
+// PendingPolicyProtectionEntry names a current owner of one or more retained sources.
+type PendingPolicyProtectionEntry struct {
+	RunID           string `json:"run_id"`
+	OwnerGeneration int64  `json:"owner_generation"`
+}
+
 type pendingOutcomeTuple struct {
 	runID      uuid.UUID
 	generation int64
@@ -147,6 +202,87 @@ type validatedPendingAll struct {
 	ids         []uuid.UUID
 	generations []int64
 	available   bool
+	// Only Claim creates evidence; heartbeat and register cannot acquire an exception.
+	scoped *scopedPendingClaim
+}
+
+type scopedPendingClaim struct {
+	allowed bool
+}
+
+// Incomplete intake never grants a run lease. ClaimRun's unchanged owner-overflow
+// SQL exclusion protects every attributed candidate, including unlisted sources.
+func (s *Service) incompletePendingClaim(wkr store.Worker, snap *ActiveSnapshot) bool {
+	return snap != nil && snap.PendingOverflow && snap.PendingInventoryIncomplete &&
+		!snap.pendingInventoryIncompleteMalformed && !snap.pendingAllMalformed && !snap.pendingPolicyProtectionMalformed &&
+		snap.PendingAll == nil && snap.PendingPolicyProtection == nil &&
+		s.p.WorkerOutboxMaxPending > 0 &&
+		slices.Contains(wkr.ProtocolCapabilities, capability.PendingOutcomeScopedClaimV1)
+}
+
+// scopedPendingGroups runs only after LockFrozenWorkerSnapshotRuns has returned.
+// The returned IDs prove the existing frozen identity and parent-lock fences;
+// GetRunByID then checks fresh status/release, absent from the frozen ledger.
+// Grouping and completeness remain worker attestations: the server cannot prove
+// that an ordinary journal was not labelled as a policy source.
+func (s *Service) scopedPendingGroups(ctx context.Context, qtx *store.Queries, wkr store.Worker, snap *ActiveSnapshot, entries []validatedEntry, pending validatedPendingAll, targets []uuid.UUID) (map[uuid.UUID]int64, error) {
+	if !pending.available || snap.pendingPolicyProtectionMalformed || len(snap.PendingPolicyProtection) == 0 ||
+		!slices.Contains(wkr.ProtocolCapabilities, capability.PendingOutcomeScopedClaimV1) || s.p.WorkerOutboxMaxPending <= 0 {
+		return nil, nil
+	}
+	ceiling := s.p.ActiveSnapshotMaxEntries
+	if ceiling <= 0 {
+		ceiling = 256
+	}
+	if len(snap.PendingPolicyProtection) > ceiling {
+		return nil, nil
+	}
+	counts := make(map[uuid.UUID]int)
+	tuples := make(map[pendingOutcomeTuple]bool, len(pending.ids))
+	for i, id := range pending.ids {
+		counts[id]++
+		tuples[pendingOutcomeTuple{id, pending.generations[i]}] = true
+	}
+	locked := make(map[uuid.UUID]bool, len(targets))
+	for _, id := range targets {
+		locked[id] = true
+	}
+	groups := make(map[uuid.UUID]int64, len(snap.PendingPolicyProtection))
+	capacity := len(pending.ids)
+	// Work is bounded by the absolute wire ceiling. One invalid group disables the
+	// entire exception; conservative snapshot persistence still proceeds.
+	for _, g := range snap.PendingPolicyProtection {
+		id, err := uuid.Parse(g.RunID)
+		if err != nil || g.OwnerGeneration <= 0 || groups[id] != 0 || counts[id] == 0 || !locked[id] {
+			return nil, nil
+		}
+		r, err := qtx.GetRunByID(ctx, id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if r.UserID != wkr.UserID || r.WorkerID != pgconv.UUID(wkr.ID) || r.ClaimGeneration != g.OwnerGeneration ||
+			r.ClaimReleasedAt.Valid || (r.Status != "claimed" && r.Status != "running") {
+			return nil, nil
+		}
+		groups[id] = g.OwnerGeneration
+		capacity -= counts[id] - 1
+	}
+	// Validate every group before using its current owner generation to explain
+	// a pending lease. Source generations remain independent of that owner lease.
+	// An unmatched ordinary pending entry still contradicts complete coverage.
+	for _, e := range entries {
+		if e.terminalPending && !tuples[pendingOutcomeTuple{e.runID, e.claimGeneration}] &&
+			(groups[e.runID] == 0 || groups[e.runID] != e.claimGeneration) {
+			return nil, nil
+		}
+	}
+	if capacity > s.p.WorkerOutboxMaxPending {
+		return nil, nil
+	}
+	return groups, nil
 }
 
 // validatePendingAll is called only after the enclosing snapshot is accepted.
@@ -156,6 +292,9 @@ func (s *Service) validatePendingAll(wkr store.Worker, snap *ActiveSnapshot) val
 		return validatedPendingAll{}
 	}
 	if snap == nil {
+		return validatedPendingAll{}
+	}
+	if snap.PendingInventoryIncomplete {
 		return validatedPendingAll{}
 	}
 	if snap.pendingAllMalformed {
@@ -472,7 +611,7 @@ func (s *Service) ReplaceWorkerActiveRuns(ctx context.Context, qtx *store.Querie
 		return false, err
 	}
 	pending := s.validatePendingAll(locked, snap)
-	locks, err := captureWorkerRecoveryLocks(ctx, qtx, locked.ID, entries, validatedFinalizeResume{}, pending.ids)
+	locks, err := captureWorkerRecoveryLocks(ctx, qtx, locked.ID, entries, pending.ids)
 	if err != nil {
 		return false, err
 	}
@@ -484,11 +623,20 @@ func (s *Service) applyWorkerActiveSnapshot(ctx context.Context, qtx *store.Quer
 	if err != nil {
 		return false, err
 	}
-	if _, err := qtx.LockFrozenWorkerSnapshotRuns(ctx, store.LockFrozenWorkerSnapshotRunsParams{
+	targets, err := qtx.LockFrozenWorkerSnapshotRuns(ctx, store.LockFrozenWorkerSnapshotRunsParams{
 		WorkerID: pgconv.UUID(wkr.ID), RunIds: append(validatedSnapshotIDs(entries), pending.ids...), FrozenTargets: frozen, LockedParentIds: parents,
-	}); err != nil {
+	})
+	if err != nil {
 		return false, err
 	}
+	var groups map[uuid.UUID]int64
+	if mode == snapshotModeClaim && pending.scoped != nil {
+		groups, err = s.scopedPendingGroups(ctx, qtx, wkr, snap, entries, pending, targets)
+		if err != nil {
+			return false, err
+		}
+	}
+	accounted := groups != nil
 	// ---- Apply (validated) --------------------------------------------------
 	// TerminalPendingLease is a small bounded config duration (env TERMINAL_PENDING_LEASE); its
 	// whole seconds never come near the int32 range, so the truncation is safe.
@@ -531,6 +679,26 @@ func (s *Service) applyWorkerActiveSnapshot(ctx context.Context, qtx *store.Quer
 		}
 	}
 
+	// Issue #3859 departure witness. Only an ACCEPTED heartbeat or claim snapshot stamps: the
+	// register path has no earlier witnessed epoch to compare with and rotated the nonce, and an
+	// ignored or invalid snapshot never reaches this function. It runs BEFORE the prior rows are
+	// deleted and before SetWorkerSnapshotState advances the worker epoch, because both are the
+	// evidence the statement reads.
+	if mode != snapshotModeRegister {
+		listedIDs := make([]uuid.UUID, 0, len(entries))
+		listedGenerations := make([]int64, 0, len(entries))
+		for _, e := range entries {
+			listedIDs = append(listedIDs, e.runID)
+			listedGenerations = append(listedGenerations, e.claimGeneration)
+		}
+		if _, err := qtx.StampSnapshotDepartures(ctx, store.StampSnapshotDeparturesParams{
+			WorkerID: pgconv.UUID(wkr.ID), RegisterNonce: snap.RegisterNonce, SnapshotEpoch: snap.SnapshotEpoch,
+			LockedParentIds: parents, ListedRunIds: listedIDs, ListedGenerations: listedGenerations,
+		}); err != nil {
+			return false, err
+		}
+	}
+
 	if mode == snapshotModeRegister {
 		// Preserve leased rows; drop only ordinary rows the snapshot no longer lists.
 		keep := make([]uuid.UUID, 0, len(entries))
@@ -541,6 +709,12 @@ func (s *Service) applyWorkerActiveSnapshot(ctx context.Context, qtx *store.Quer
 			WorkerID:   wkr.ID,
 			KeepRunIds: keep,
 		}); err != nil {
+			return false, err
+		}
+	} else if slices.Contains(wkr.ProtocolCapabilities, capability.ProviderPolicyHoldV1) {
+		// Preserve the already-issued lease if this process no longer has the body.
+		// Exact ownership/generation/status and the original expiry remain SQL fences.
+		if _, err := qtx.DeleteWorkerActiveRunsPreservingPolicyLease(ctx, wkr.ID); err != nil {
 			return false, err
 		}
 	} else if _, err := qtx.DeleteWorkerActiveRuns(ctx, wkr.ID); err != nil {
@@ -591,12 +765,19 @@ func (s *Service) applyWorkerActiveSnapshot(ctx context.Context, qtx *store.Quer
 			return false, err
 		}
 		for i, id := range pending.ids {
-			if _, err := qtx.UpsertFrozenWorkerPendingOutcomeIdentity(ctx, store.UpsertFrozenWorkerPendingOutcomeIdentityParams{
+			rows, err := qtx.UpsertFrozenWorkerPendingOutcomeIdentity(ctx, store.UpsertFrozenWorkerPendingOutcomeIdentityParams{
 				WorkerID: wkr.ID, RunID: id, ClaimGeneration: pending.generations[i],
 				FirstSeenAt:  fresh[pendingOutcomeTuple{id, pending.generations[i]}],
 				LeaseSeconds: leaseSeconds, FrozenTargets: frozen, LockedParentIds: parents,
-			}); err != nil {
+			})
+			if err != nil {
 				return false, err
+			}
+			// Historical grouped sources legitimately insert zero rows: the current
+			// owner and frozen fences account for those sources. Every ordinary tuple
+			// must independently pass the exact-generation, lease and identity SQL fences.
+			if groups[id] == 0 && rows != 1 {
+				accounted = false
 			}
 		}
 	}
@@ -608,6 +789,9 @@ func (s *Service) applyWorkerActiveSnapshot(ctx context.Context, qtx *store.Quer
 		ID:              wkr.ID,
 	}); err != nil {
 		return false, err
+	}
+	if pending.scoped != nil {
+		pending.scoped.allowed = accounted
 	}
 	return true, nil
 }

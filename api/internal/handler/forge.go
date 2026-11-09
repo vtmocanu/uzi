@@ -186,6 +186,9 @@ func repoToDTO(r store.Repo) apitypes.RepoDTO {
 	if r.DefaultBranch.Valid {
 		dto.DefaultBranch = &r.DefaultBranch.String
 	}
+	if r.AgentSourceDefault.Valid {
+		dto.AgentSourceDefault = &r.AgentSourceDefault.String
+	}
 	// #66 M8 (D8): expose the admin per-repo override metadata when active. The
 	// reason NULL is the discriminator — a non-NULL reason means the override is on.
 	// Display-only surfacing for M9's badge; no findings downgrade happens here.
@@ -210,7 +213,7 @@ func repoToDTO(r store.Repo) apitypes.RepoDTO {
 func (h *Handler) ForgeConfig(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"allowed_base_urls": h.cfg.ForgeAllowedBaseURLs,
-		"forge_types":       []string{string(forge.TypeGitLab), string(forge.TypeForgejo), string(forge.TypeGitHub)},
+		"forge_types":       forge.SupportedTypes(),
 	})
 }
 
@@ -1228,7 +1231,8 @@ type patchRepoRequest struct {
 	// RepoFoldImproveUziBacklog is the per-repo capability flag (PRD #686 M1). Pointer
 	// so an omitted field is a no-op; a present value replaces the stored flag. Its own
 	// exclusive path — cannot be combined with the devbox, trust or capability paths.
-	RepoFoldImproveUziBacklog *bool `json:"repo_fold_improve_uzi_backlog"`
+	RepoFoldImproveUziBacklog *bool           `json:"repo_fold_improve_uzi_backlog"`
+	AgentSourceDefault        json.RawMessage `json:"agent_source_default"`
 }
 
 // optBoolToPgtype maps an optional request bool to a pgtype.Bool: a nil pointer is
@@ -1239,6 +1243,23 @@ func optBoolToPgtype(v *bool) pgtype.Bool {
 		return pgtype.Bool{Valid: false}
 	}
 	return pgtype.Bool{Bool: *v, Valid: true}
+}
+
+var errAgentSourceRepoOwnerOnly = errors.New("agent_source_default repo is owner-only")
+
+func (h *Handler) setRepoAgentSourceDefault(ctx context.Context, user store.User, id uuid.UUID, value *string) (store.Repo, error) {
+	param := pgconv.TextPtr(value)
+	repo, err := h.q.SetRepoAgentSourceDefaultForUser(ctx, store.SetRepoAgentSourceDefaultForUserParams{ID: id, UserID: user.ID, AgentSourceDefault: param})
+	if !errors.Is(err, pgx.ErrNoRows) || !user.IsAdmin {
+		return repo, err
+	}
+	if value != nil && *value == "repo" {
+		if _, lookupErr := h.q.GetRepoByID(ctx, id); lookupErr != nil {
+			return store.Repo{}, lookupErr
+		}
+		return store.Repo{}, errAgentSourceRepoOwnerOnly
+	}
+	return h.q.SetRepoAgentSourceDefault(ctx, store.SetRepoAgentSourceDefaultParams{ID: id, AgentSourceDefault: param})
 }
 
 // PatchRepo updates one exclusive settings group for an owner or admin.
@@ -1282,6 +1303,13 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 	capsSet := req.RepoRequiredCapabilities != nil
 	ignoredSet := req.RepoIgnoredInferredCapabilities != nil
 	foldSet := req.RepoFoldImproveUziBacklog != nil
+	agentSourceSet := len(req.AgentSourceDefault) != 0
+	var agentSourceDefault *string
+	if agentSourceSet && (json.Unmarshal(req.AgentSourceDefault, &agentSourceDefault) != nil ||
+		(agentSourceDefault != nil && *agentSourceDefault != "own" && *agentSourceDefault != "repo")) {
+		httpx.Error(w, http.StatusBadRequest, `agent_source_default must be "own", "repo" or null`)
+		return
+	}
 	// Each settings group is its own exclusive path, at most one per
 	// request. b2i counts how many are present so a combined request is rejected
 	// uniformly rather than pairwise.
@@ -1291,18 +1319,24 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 		}
 		return 0
 	}
-	if b2i(devboxSet)+b2i(trustSet)+b2i(capsSet || ignoredSet)+b2i(foldSet)+b2i(codeSet) > 1 {
-		httpx.Error(w, http.StatusBadRequest, "code cross-check inputs, repo_devbox_opt_in, capability settings (required_capabilities/ignored_inferred_capabilities), repo_fold_improve_uzi_backlog, and the trust flags cannot be combined in one request")
+	if b2i(devboxSet)+b2i(trustSet)+b2i(capsSet || ignoredSet)+b2i(foldSet)+b2i(codeSet)+b2i(agentSourceSet) > 1 {
+		httpx.Error(w, http.StatusBadRequest, "code cross-check inputs, repo_devbox_opt_in, capability settings (required_capabilities/ignored_inferred_capabilities), repo_fold_improve_uzi_backlog, agent_source_default, and the trust flags cannot be combined in one request")
 		return
 	}
-	if !devboxSet && !trustSet && !capsSet && !ignoredSet && !foldSet && !codeSet {
-		httpx.Error(w, http.StatusBadRequest, "provide code cross-check inputs, repo_devbox_opt_in, required_capabilities, ignored_inferred_capabilities, repo_fold_improve_uzi_backlog, or at least one trust flag")
+	if !devboxSet && !trustSet && !capsSet && !ignoredSet && !foldSet && !codeSet && !agentSourceSet {
+		httpx.Error(w, http.StatusBadRequest, "provide code cross-check inputs, repo_devbox_opt_in, required_capabilities, ignored_inferred_capabilities, repo_fold_improve_uzi_backlog, agent_source_default, or at least one trust flag")
 		return
 	}
 
 	var repo store.Repo
 	var err error
 	switch {
+	case agentSourceSet:
+		repo, err = h.setRepoAgentSourceDefault(r.Context(), user, id, agentSourceDefault)
+		if errors.Is(err, errAgentSourceRepoOwnerOnly) {
+			httpx.Error(w, http.StatusForbidden, "only the repo's owner can choose repo agents as the default")
+			return
+		}
 	case codeSet:
 		if user.IsAdmin {
 			repo, err = h.q.SetRepoCodeCrossCheckInputs(r.Context(), store.SetRepoCodeCrossCheckInputsParams{ID: id, GuidancePresent: guidancePresent, Guidance: pgconv.TextPtr(guidance), InstructionsEnabled: optBoolToPgtype(req.CrossCheckRepoInstructionsEnabled)})

@@ -1,13 +1,18 @@
 // Server-fenced DinD maintenance (#1760). No local pressure or retirement trigger.
 import { readDindMeterSample, type DindMeterSample } from "./dind-meter.js";
 import { DOCKER_BIN, DindPruneGate, dockerExecEnvironment, execDocker, type DockerExec } from "./dind-prune.js";
+import {
+  DIND_VOLUME_PRUNE_ARGV,
+  DIND_VOLUME_SERVER_VERSION_ARGV,
+  apiVersionAtLeast142,
+} from "./dind-volume-argv.js";
 import type { DindMaintenance, DindMaintenanceReadyACK } from "./protocol.js";
 import type { Logger } from "./log.js";
 import { errMessage, sleep as abortableSleep } from "./util.js";
 
 const COMMANDS = Object.freeze({
-  version: Object.freeze(["version", "--format", "{{.Server.APIVersion}}"]),
-  prune: Object.freeze(["volume", "prune", "-f"]),
+  version: DIND_VOLUME_SERVER_VERSION_ARGV,
+  prune: DIND_VOLUME_PRUNE_ARGV,
 });
 const PHASES = new Set(["requested", "ready", "stopping", "recycling", "complete", "cancelled"]);
 const TOTAL_BUDGET_MS = 7 * 60_000;
@@ -195,9 +200,7 @@ export class DindMaintenanceController {
     try {
       const version = (await this.docker(COMMANDS.version, Math.min(30_000, deadline - this.now()), controller.signal)).trim();
       if (!current()) return;
-      const match = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.exec(version);
-      if (!match || !Number.isSafeInteger(Number(match[1])) || !Number.isSafeInteger(Number(match[2])) ||
-        !(Number(match[1]) > 1 || (Number(match[1]) === 1 && Number(match[2]) >= 42))) return;
+      if (!apiVersionAtLeast142(version)) return;
       result.afterEpoch = this.sample()?.epochS;
       await this.docker(COMMANDS.prune, Math.min(5 * 60_000, deadline - this.now()), controller.signal);
       result.pruned = true;

@@ -372,3 +372,59 @@ test("pod epoch inventory independently requires every literal image proof and k
     }
   } finally { api.close(); rmSync(scratch, { recursive: true, force: true }); }
 });
+
+const browserFile = "e2e/worker-uid/browser-discovery-real.test.mts";
+const browserSuite = "real browser discovery under the worker identities";
+const browserTitles = [
+  "launches Chromium and agent-browser from the exported discovery paths in the Claude lane and leaves no browser process behind",
+  "launches Chromium from the exported discovery paths in an off-mode Codex command and closes the registry cleanly",
+];
+test("browser inventory requires both literal leaves under one UID gate and stays out of every other lane", () => {
+  mkdirSync(path.join(repo, ".uzi/scratch"), { recursive: true });
+  const scratch = mkdtempSync(path.join(repo, ".uzi/scratch/browser-inventory."));
+  const api = new API({ cwd: scratch });
+  const declarations = browserTitles.map(name => `it(${JSON.stringify(name)}, async () => {});`);
+  const wrap = (body: string, gate = true) =>
+    `describe(${JSON.stringify(browserSuite)}, ${gate ? "{ skip: INIT_SKIP }, " : ""}() => { ${body} });`;
+  try {
+    const fixtures: { name: string; source: string; error?: RegExp }[] = [
+      { name: "literal", source: wrap(declarations.join("\n")) },
+      { name: "actual", source: readFileSync(path.join(repo, browserFile), "utf8") },
+      { name: "duplicate", source: wrap([...declarations, declarations[0]!].join("\n")), error: /duplicate source leaf/ },
+      { name: "nested", source: wrap(`describe("nested", () => { ${declarations.join("\n")} });`), error: /missing required literal browser proof/ },
+      { name: "ungated", source: wrap(declarations.join("\n"), false), error: /expected one UID gate, found 0/ },
+      { name: "double-gated", source: wrap(declarations.join("\n")) + wrap(""), error: /expected one UID gate, found 2/ },
+      { name: "wrong-suite", source: `describe("other suite", { skip: INIT_SKIP }, () => { ${declarations.join("\n")} });`, error: /missing required literal browser proof/ },
+    ];
+    for (let index = 0; index < declarations.length; index++) {
+      for (const mutation of ["missing", "renamed", "nonliteral"] as const) {
+        const changed = [...declarations];
+        if (mutation === "missing") changed.splice(index, 1);
+        else changed[index] = `it(${JSON.stringify(browserTitles[index]! + (mutation === "renamed" ? " changed" : ""))}${mutation === "nonliteral" ? ' + ""' : ""}, async () => {});`;
+        fixtures.push({ name: `${mutation}-${index}`, source: wrap(changed.join("\n")),
+          error: mutation === "nonliteral" ? /nonliteral targeted/ : /missing required literal browser proof/ });
+      }
+    }
+    writeFileSync(path.join(scratch, "tsconfig.json"), JSON.stringify({ files: fixtures.map(f => f.name + ".mts") }));
+    for (const fixture of fixtures) writeFileSync(path.join(scratch, fixture.name + ".mts"), fixture.source);
+    const program = api.updateSnapshot({ openProjects: [path.join(scratch, "tsconfig.json")] }).getProjects()[0].program;
+    const wanted = browserTitles.map(name => ({ file: browserFile, names: [browserSuite, name] }));
+    for (const fixture of fixtures) {
+      const filename = path.join(scratch, fixture.name + ".mts");
+      assert.equal(program.getSyntacticDiagnostics(filename).length, 0, fixture.name);
+      const collect = () => inventoryForSource(program.getSourceFile(filename), "browser-discovery-real");
+      if (fixture.error) assert.throws(collect, fixture.error, fixture.name);
+      else assert.deepEqual(collect(), wanted, fixture.name);
+    }
+    const run = (lane: string) => JSON.parse(execFileSync(process.execPath,
+      [path.join(repo, "e2e/worker-uid/inventory.mjs"), lane], { cwd: repo, encoding: "utf8" }));
+    assert.deepEqual(run("browser"), wanted);
+    // The unmasked-/nix leaves stay out of the default worker proof and every other lane.
+    for (const lane of ["worker", "command", "single", "shared"]) {
+      assert.equal(run(lane).some((item: { file: string }) => item.file === browserFile), false, lane);
+    }
+  } finally {
+    api.close();
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});

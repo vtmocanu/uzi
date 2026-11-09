@@ -780,7 +780,7 @@ func joinTags(sep string, parts ...string) string {
 func (m tuiModel) detailHeaderLines() []string {
 	d := &m.detail
 
-	crumb := m.pal.faint.Render("‹ floor") + m.pal.faint.Render("  run ") + m.pal.title.Render(shortRunID(d.runID))
+	crumb := m.pal.faint.Render("‹ floor") + m.pal.faint.Render("  run ") + m.pal.title.Render(m.renderer.Plain(shortRunID(d.runID), 8))
 	if d.run.ID != "" && d.run.Kind != "" {
 		crumb += m.pal.faint.Render(" · " + m.renderer.Plain(d.run.Kind, 12))
 	}
@@ -914,6 +914,44 @@ func (m tuiModel) providerDetailLines() []string {
 	return rows
 }
 
+// diskHoldDetailLines sheds guidance before wrapping would consume the minimum
+// three transcript rows or the footer. Commands retain their complete run ID.
+func (m tuiModel) diskHoldDetailLines() []string {
+	if !isDiskOwnerHold(m.detail.run) {
+		return nil
+	}
+	budget := max(0, m.transcriptBudgetWithoutDiskGuidance()-3)
+	id := cellText(m.detail.run.ID)
+	// At most four fixed copy variants are wrapped; an oversized variant never
+	// prevents trying the smaller one. No command is clipped to the row budget.
+	variants := [][]string{
+		diskHoldLines(m.detail.run),
+		{
+			"uzi run resume " + id,
+			"uzi run cancel " + id,
+			"Counted parks: " + itoa(m.detail.run.DiskParkCount) + "; counters persist.",
+			"One more attempt; admission may refuse.",
+			"Worker loss may lose unpublished work.",
+		},
+		{"Resume/Cancel: see uzi run get " + id},
+		{"See: uzi run get"},
+	}
+	for _, lines := range variants {
+		var rows []string
+		for _, line := range lines {
+			plain := m.renderer.Plain(line, len([]rune(line)))
+			wrapped := ansi.Hardwrap(ansi.Wrap(plain, max(1, m.width), " "), max(1, m.width), true)
+			for _, row := range strings.Split(wrapped, "\n") {
+				rows = append(rows, m.pal.state(crewWaiting).Render(row))
+			}
+		}
+		if len(rows) <= budget {
+			return rows
+		}
+	}
+	return nil
+}
+
 func (m tuiModel) renderDetail() string {
 	if m.detail.answer.open {
 		return m.renderAnswerDetail()
@@ -975,6 +1013,10 @@ func (m tuiModel) renderDetail() string {
 		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 240)), m.width) + "\n")
 	}
 
+	for _, line := range m.diskHoldDetailLines() {
+		sb.WriteString(line + "\n")
+	}
+
 	for _, line := range m.providerDetailLines() {
 		sb.WriteString(line + "\n")
 	}
@@ -1000,10 +1042,14 @@ func (m tuiModel) renderDetail() string {
 	// show on such a parked run too, matching the web's pending chip and `run get`'s
 	// PAUSE_REQUESTED row. On a limit_wait run both this and the rate-limit park line above
 	// draw: the run is held on a limit AND carries a pending pause.
-	if line := credentialSwitchHoldLine(d.run); line != "" {
+	if isIterationHold(d.run) {
+		for _, line := range m.iterationDetailLines() {
+			sb.WriteString(line + "\n")
+		}
+	} else if line := credentialSwitchHoldLine(d.run); line != "" {
 		// Issue #3181: a credential-switch hold is a server park, not an owner pause.
 		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 120)), m.width) + "\n")
-	} else if line := credentialDisabledLine(d.run); line != "" {
+	} else if line := credentialHoldLine(d.run); line != "" {
 		// PRD #1732 D14: a credential_disabled hold is a server park, not an owner pause, so it
 		// must not read "paused by you". Same slot and colour; clampVisual keeps it one row.
 		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 120)), m.width) + "\n")
@@ -1280,4 +1326,24 @@ func (d *detailState) rememberPauseEpoch() {
 	if d.pauseMetaReady && d.run.Status == statusPaused && d.run.StatusSince != nil {
 		d.pauseLastSince = *d.run.StatusSince
 	}
+}
+
+// iterationDetailLines preserves every owner action when the detail pane is narrow.
+// The fixed copy and renderer-capped ID bound wrapping work.
+func (m tuiModel) iterationDetailLines() []string {
+	r := m.detail.run
+	if !isIterationHold(r) {
+		return nil
+	}
+	r.ID = m.renderer.Plain(r.ID, 240)
+	clauses := append([]string{"Iteration limit reached"}, strings.Split(iterationHoldAction(r), "; ")...)
+	var rows []string
+	for _, clause := range clauses {
+		plain := m.renderer.Plain(clause, len([]rune(clause)))
+		wrapped := ansi.Hardwrap(ansi.Wrap(plain, max(1, m.width), " "), max(1, m.width), true)
+		for _, row := range strings.Split(wrapped, "\n") {
+			rows = append(rows, m.pal.state(crewWaiting).Render(row))
+		}
+	}
+	return rows
 }

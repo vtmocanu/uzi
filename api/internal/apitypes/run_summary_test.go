@@ -11,6 +11,7 @@ import (
 // summaryOmitted is the exact set of RunListItemDTO keys the ?view=summary projection drops
 // (issue #2661). Adding a key here is a deliberate wire decision, never a side effect.
 var summaryOmitted = map[string]bool{
+	"created_issues":            true,
 	"capability_provenance":     true,
 	"completion_pending":        true, // Full owner/worker publication only.
 	"semantic_gate":             true, // Owner detail only; no raw snapshots in summaries.
@@ -18,11 +19,12 @@ var summaryOmitted = map[string]bool{
 	"reset_state_digest":        true,
 	"milestone_reconciliations": true,
 	"milestone_reconciliations_next_before_gate_revision": true,
-	"plan_md":           true,
-	"repo_agents":       true,
-	"issue_description": true,
-	"preserved_patch":   true,
-	"lead_config":       true, // GetRun-only overlay (PRD #3244); never on a list or summary.
+	"plan_md":                  true,
+	"repo_agents":              true,
+	"repo_agent_source_commit": true,
+	"issue_description":        true,
+	"preserved_patch":          true,
+	"lead_config":              true, // GetRun-only overlay (PRD #3244); never on a list or summary.
 }
 
 // TestRunSummaryItemDTOKeys pins the summary key set to the list item's key set minus
@@ -55,6 +57,7 @@ func TestRunSummaryItemRoundTrip(t *testing.T) {
 	apitypestest.Populate(&full)
 
 	want := full
+	want.CreatedIssues = nil
 	want.SemanticGate = nil
 	want.SemanticDrift = nil
 	want.CompletionPending = nil
@@ -63,6 +66,7 @@ func TestRunSummaryItemRoundTrip(t *testing.T) {
 	want.MilestoneReconciliationsNextBeforeGateRevision = nil
 	want.PlanMd = nil
 	want.RepoAgents = nil
+	want.RepoAgentSourceCommit = nil
 	want.IssueDescription = ""
 	want.PreservedPatch = nil
 	want.RunDTO.WorkerName = nil

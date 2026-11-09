@@ -160,6 +160,17 @@ spec:
             - name: UZI_WORKER_NODE_SELECTOR
               value: {{ toJson . | quote }}
             {{- end }}
+            # The worker pods' tolerations, as a JSON array. An empty list or null renders
+            # no env (no tolerations). Anything but a list or null fails the render rather
+            # than being silently skipped by `with`.
+            {{- $tolerations := .Values.workers.tolerations }}
+            {{- if not (or (kindIs "slice" $tolerations) (kindIs "invalid" $tolerations)) }}
+            {{- fail (printf "workers.tolerations must be a list of toleration objects, or null; got %s %v" (kindOf $tolerations) $tolerations) }}
+            {{- end }}
+            {{- with $tolerations }}
+            - name: UZI_WORKER_TOLERATIONS
+              value: {{ toJson . | quote }}
+            {{- end }}
             # The default worker PriorityClass name (issue #1341). Gated on the bool, not
             # `with`: when enabled the class name always has a chart default, and the
             # controller renders priorityClassName onto every worker pod so a busy worker

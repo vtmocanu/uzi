@@ -91,7 +91,8 @@ context = {
   'github.event_name' => 'pull_request', 'needs.changes.result' => 'success',
   'needs.changes.outputs.skip_components' => '1',
   'needs.changes.outputs.worker_uid' => 'false', 'needs.validate-agent.result' => 'success',
-  'needs.test-agent-shard.result' => 'skipped', 'needs.test-agent-worker-uid.result' => 'skipped'
+  'needs.test-agent-shard.result' => 'skipped', 'needs.test-agent-worker-uid.result' => 'skipped',
+  'needs.test-codex-refresh-lostreply-e2e.result' => 'skipped'
 }
 run_job = lambda do |job, overrides = {}|
   source = jobs.fetch(job)['if']
@@ -113,7 +114,8 @@ components.each do |job|
     assert.call(run_job.call(job, 'needs.changes.outputs.skip_components' => output), true, "#{job} rejects #{output.inspect}")
   end
   assert.call(run_job.call(job, 'github.event_name' => 'push', 'needs.changes.result' => 'skipped'), true, "main runs #{job}")
-  assert.call(run_job.call(job, 'cancelled' => true), false, "supersession cancels #{job}")
+  # test-api-store-it uses always() (the test-agent pattern) and is asserted below.
+  assert.call(run_job.call(job, 'cancelled' => true), false, "supersession cancels #{job}") unless job == 'test-api-store-it'
 end
 assert.call(jobs.fetch('lint-repo').key?('needs'), false, 'repo gate remains independent')
 assert.call(jobs.fetch('lint-repo').key?('if'), false, 'repo gate remains unconditional')
@@ -175,7 +177,39 @@ fixtures.each_with_index do |files, index|
   safe = files.count { |status, path| statuses.split('|').include?(status) && File.fnmatch(pattern.sub(/\/\*\*$/, '/**/*'), path, flags) }
   assert.call(classify.call(files.length.to_s, safe.to_s, files.length.to_s), index < 2 ? 'skip_components=1' : 'skip_components=0', "path/status fixture #{index}")
 end
-assert.call(jobs.fetch('test-api-store-it').fetch('steps').any? { |step| step.fetch('run', '').include?('../scripts/livedb-skip-guard.sh livedb.log') }, true, 'LiveDB proof retained')
+# One LiveDB execution backs both required contexts: the producer carries the canonical
+# recipe (the sweep with its livedb-skip-guard, then the combined proofs); test-api-store-it
+# only aggregates the producer's result.
+producer = jobs.fetch('test-codex-refresh-lostreply-e2e')
+assert.call(producer.fetch('steps').any? { |step| step['run'] == 'task test:codex-refresh-lostreply-e2e' }, true, 'single LiveDB execution runs the canonical recipe')
+assert.call(File.read(File.join(root, 'e2e/run-store-it.sh')).include?('"$ROOT/scripts/livedb-skip-guard.sh" "$LOG"'), true, 'LiveDB proof retained in the recipe')
+assert.call(jobs.values.flat_map { |j| j.fetch('steps', []).map { |s| s['run'].to_s } }.grep(/livedb-skip-guard|-run 'LiveDB\$'|run-store-it/), [], 'no workflow step carries a second LiveDB sweep')
+aggregator = jobs.fetch('test-api-store-it')
+assert.call(Array(aggregator['needs']).sort, %w[changes test-codex-refresh-lostreply-e2e], 'store-it context waits for the single execution')
+assert.call(producer.fetch('timeout-minutes'), 75, 'producer headroom for one full sweep')
+agg_run = aggregator.fetch('steps').first.fetch('run')
+assert.call(aggregator.fetch('steps').first.fetch('env'), {'PRODUCER_RESULT' => "${{ needs['test-codex-refresh-lostreply-e2e'].result }}"}, 'aggregator reads the producer result')
+{'success' => true, 'failure' => false, 'cancelled' => false, 'skipped' => false, '' => false}.each do |result, ok|
+  _, _, status = Open3.capture3({'PRODUCER_RESULT' => result}, 'bash', '-e', '-c', agg_run)
+  assert.call(status.success?, ok, "store-it context for producer result #{result.inspect}")
+end
+# Activation fails closed: only the audited component-safe case with a skipped producer
+# may skip the aggregator. Cancellation (evaluator `cancelled` true), a failed, cancelled
+# or missing producer, and unknown classification all run it (and the check above is red).
+store_it = 'test-api-store-it'
+producer_result = 'needs.test-codex-refresh-lostreply-e2e.result'
+assert.call(run_job.call(store_it), false, 'safe PR with skipped producer skips both contexts together')
+%w[failure cancelled success].each do |result|
+  assert.call(run_job.call(store_it, producer_result => result), true, "safe PR still runs aggregator after producer #{result}")
+  assert.call(run_job.call(store_it, producer_result => result, 'needs.changes.outputs.skip_components' => '0'), true, "aggregator runs after producer #{result}")
+end
+assert.call(run_job.call(store_it, producer_result => 'skipped', 'needs.changes.outputs.skip_components' => '0'), true, 'non-safe PR runs aggregator (red) even if producer skipped')
+assert.call(run_job.call(store_it, 'cancelled' => true), false, 'cancelled workflow with a skipped safe producer: nothing to report')
+[['cancelled', true, 'failure'], ['cancelled', true, 'cancelled'], ['cancelled', true, '']].each do |_, cancelled, result|
+  assert.call(run_job.call(store_it, 'cancelled' => cancelled, producer_result => result, 'needs.changes.outputs.skip_components' => '0'), true, "workflow cancellation still runs aggregator (producer #{result.inspect})")
+end
+assert.call(jobs.fetch(store_it)['if'].include?('always()'), true, 'aggregator uses always()')
+assert.call(jobs.fetch(store_it)['if'].include?('cancelled()'), false, 'aggregator never keys skipping on cancelled()')
 brew_workflow = YAML.safe_load(File.read(File.join(root, '.github/workflows/brew.yml')))
 assert.call(brew_workflow['concurrency'], nil, 'publication proof runs without the tap lock')
 brew = brew_workflow.fetch('jobs')
@@ -250,7 +284,7 @@ assert.call(status.success?, true, "actual prepare output fixture: #{err}")
 missing_prepare_outputs = JSON.parse(emitted) - release_auto.fetch('jobs').fetch('prepare').fetch('outputs').keys
 assert.call(missing_prepare_outputs, [], 'prepare forwards every emitted step output to needs')
 assert.call(release_auto.fetch('on').keys.sort, %w[schedule workflow_dispatch], 'manual and nightly routes are explicit')
-assert.call(release_auto.fetch('on').fetch('schedule'), [{'cron' => '47 4 * * *', 'timezone' => 'Europe/Bucharest'}], 'nightly uses local time after the sweep window')
+assert.call(release_auto.fetch('on').fetch('schedule'), [{'cron' => '47 1 * * *', 'timezone' => 'Europe/Bucharest'}], 'nightly uses 01:47 Bucharest to leave room for scheduler delays')
 assert.call(release_auto.fetch('permissions'), {}, 'automation token defaults to no permissions')
 assert.call(release_auto.fetch('concurrency'), {'group' => 'release-auto', 'cancel-in-progress' => false, 'queue' => 'max'}, 'all release routes queue without cancellation')
 auto_jobs = release_auto.fetch('jobs')

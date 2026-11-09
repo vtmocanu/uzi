@@ -44,9 +44,13 @@ var (
 	ErrCredentialSwitchNoLiveWorker    = errors.New("credential switch: run has no live worker")
 	ErrCredentialSwitchClaimAssembling = errors.New("credential switch: claim being assembled")
 	ErrCredentialSwitchRunTerminal     = errors.New("credential switch: run has finished")
+	ErrDataVolumeFullHeld              = errors.New("data_volume_full held: use Resume before switching its token")
 	ErrForgeUnreachableHeld            = errors.New("forge_unreachable held: use Resume before switching its token")
 	ErrCodexIdleStallHeld              = errors.New("codex_idle_stall held: use Resume before switching its token")
 	ErrCredentialSwitchRaced           = errors.New("credential switch: run state changed, retry")
+	// ErrCredentialsResetHeld is the owner-facing 409 text for a Resume or set-token on a run held on
+	// credentials_reset (PRD #3989 M3): only the credential promoter releases that hold.
+	ErrCredentialsResetHeld = errors.New("credentials were reset; add a credential in Settings and the run resumes automatically")
 )
 
 // CredentialSwitchWorkerUnsupportedError refuses a held-state switch whose holding worker does
@@ -126,6 +130,11 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 	}
 	switch run.Status {
 	case "paused":
+		if run.HoldReason.Valid && run.HoldReason.String == holdCredentialsReset {
+			// PRD #3989 M3: only the promoter releases this hold, so ResumePausedRun would refuse
+			// it after the override was already written. Refuse up front, writing nothing.
+			return SetRunCredentialResult{}, ErrCredentialsResetHeld
+		}
 		if run.HoldReason.Valid && run.HoldReason.String == "credential_disabled" {
 			// PRD #1732 D2/D14: the reassignment writes the override and leaves the hold in
 			// the promoter's lock order, so it and a concurrent promotion serialize: exactly
@@ -319,6 +328,9 @@ func (s *Service) setCredentialAndPromote(ctx context.Context, observed store.Ru
 			}
 			return fmt.Errorf("lock run for credential switch: %w", err)
 		}
+		if locked.Status == "recovery_wait" && locked.RecoveryWaitCause.String == recoveryCauseDataVolumeFull && !locked.RecoveryRetryNotBefore.Valid {
+			return ErrDataVolumeFullHeld
+		}
 		if locked.Status == "recovery_wait" && locked.RecoveryWaitCause.Valid && locked.RecoveryWaitCause.String == "forge_unreachable" && !locked.RecoveryRetryNotBefore.Valid {
 			return ErrForgeUnreachableHeld
 		}
@@ -391,7 +403,7 @@ func (s *Service) setCredentialAndPromote(ctx context.Context, observed store.Ru
 
 // resumePausedForCredential is the paused arm of `uzi run set-token`: it resumes any paused run
 // the way the owner's resume does (PRD #1497 M1), with AllowCompletionBlockedHold so a completion
-// hold still resumes here as before. A budget_exhausted wall park with no remaining budget is
+// hold still resumes here as before. Wall and iteration holds with no remaining wall budget are
 // refused by the budget guard (0 rows -> ErrCredentialSwitchRaced); the owner extends such a run
 // rather than set-token-ing it. A provider hold's streak is cleared by ResumePausedRun itself.
 func (s *Service) resumePausedForCredential(ctx context.Context, userID, runID uuid.UUID) error {

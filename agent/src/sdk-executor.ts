@@ -64,9 +64,12 @@ import {
   subagentWriteCapabilities,
 } from "./agents.js";
 import {
+  planAgentSource,
   resolveAgentSelection,
   seedAgentSelection,
+  gateVerdictSelection,
   type AgentSelectionParse,
+  type AgentSource,
   type AskUserQuestion,
   type ClaimConfig,
   type Milestone,
@@ -790,6 +793,14 @@ interface RunDrive {
   observedEntries?: Set<string>;
   refreshCodeCrossCheckTools?: () => Promise<void>;
   tripReason?: string;
+  /** Issue #4090: sticky for the run. Set when a cancel/pause/switch interrupt landed while another
+   *  trip was held, so first-wins dropped it. A declined or refused park then keeps the aborted
+   *  ctx.signal fencing guarded commands instead of consuming it in front of the lost stop. */
+  interruptDropped: boolean;
+  /** Issue #4090: the reason the ctx.signal abort listener just tripped (or found held) for a
+   *  pause/switch, until the steering channel's synchronous paired interrupt for the SAME abort
+   *  arrives (or a microtask passes). That paired call is the same stop, never a drop. */
+  pairedAbsorb?: string;
   /** Issue #2471: the exact error a memory-authority trip carries (the runner's stop, or an
    *  unconfirmed-command error). When set, tripError returns it and no clear-and-continue site
    *  may swallow it. */
@@ -847,6 +858,7 @@ interface DriveState {
   assembled: ReturnType<typeof assembleAgents>;
   leadModel: string | undefined;
   planSubagentNames: string[];
+  planSource: AgentSource;
   subagentCanWrite: ReturnType<typeof subagentWriteCapabilities>;
   preToolUse: (
     allowedSubagents: string[],
@@ -951,6 +963,10 @@ export class SdkExecutor implements Executor {
   /** Issue #2945: a ctx.signal that a credential switch aborted and that then gave up; it is never
    *  un-aborted, so a later plan-summary flight must not treat it as a live cancel. */
   private spentSwitchSignal?: AbortSignal;
+  /** Issue #4090: a ctx.signal a `now`/`wall` pause aborted whose park was then declined or
+   *  refused, with no interrupt dropped this run; it is never un-aborted, so later turns' guarded
+   *  commands must not treat it as a live cancel. Cleared (re-fenced) once any interrupt drops. */
+  private consumedPauseSignal?: AbortSignal;
 
   /** Close admission before yielding. Intent and all owned plan flights drain concurrently
    * within one short bound; an ignored abort is abandoned and cannot publish or emit usage. */
@@ -1237,27 +1253,37 @@ export class SdkExecutor implements Executor {
    * spawns every Bash command detached (its own session and process group), so a backgrounded
    * build survives the group kill. Never throws.
    */
-  async reapAttributedProcesses(): Promise<RunProcessReap> {
+  async reapAttributedProcesses(opts: { deadlineAt?: number } = {}): Promise<RunProcessReap> {
+    // issue #3980: with an absolute `deadlineAt` (the bounded Claude gate checkpoint) every join below
+    // also stops waiting at that deadline, nothing new is admitted once it has passed, and the pending
+    // operations keep running (an unconfirmed reap, never an abort). Without it: unchanged.
+    const { deadlineAt } = opts;
+    const expired = (): boolean => deadlineAt !== undefined && Date.now() >= deadlineAt;
     // issue #3181: inside the retained credential switch's settlement (the RetainedSwitchSettlement
     // marker, not merely any MaintenanceBudget: cancellation and terminal maintenance install one
     // too) the joins below are WAITS on operations this executor already runs, so they stop waiting
     // when the budget is spent; nothing new is started and the operations keep running. Every other
     // caller joins without bound, as before.
     const budget = RetainedSwitchSettlement.active() ? MaintenanceBudget.current() : undefined;
-    const joined = await this.waitWithin(this.closeAndSettlePlanSummary(), budget);
+    if (expired()) return unconfirmedJoinReap();
+    const joined = await this.waitWithin(this.closeAndSettlePlanSummary(), budget, deadlineAt);
     // Issue #2471: join the lane disposal killAgentTree started, so the attributed reap sees
     // the model commands already stopped (it never rejects).
-    if (!joined || !await this.waitWithin(this.laneDisposal, budget)) return unconfirmedJoinReap();
+    if (!joined || !await this.waitWithin(this.laneDisposal, budget, deadlineAt)) return unconfirmedJoinReap();
     // The background deps install carries the run's HOME, so the HOME-attributed reap would count
     // it as a survivor and kill npm's children. Tear it down first. A switch that gives up and
     // continues in place loses it: best-effort by design (the agent installs the dependencies itself).
     const deps = this.activeDeps;
     if (deps && !this.depsJoined) {
+      if (expired()) return unconfirmedJoinReap();
       deps.abort.abort();
-      if (!await this.waitWithin(deps.install, budget)) return unconfirmedJoinReap();
+      if (!await this.waitWithin(deps.install, budget, deadlineAt)) return unconfirmedJoinReap();
       this.depsJoined = true;
     }
-    const r = await this.runProcesses.reap(this.homeDir, this.runWorktree, [...this.spawnedPids]).catch(
+    if (expired()) return unconfirmedJoinReap();
+    const r = await (deadlineAt === undefined
+      ? this.runProcesses.reap(this.homeDir, this.runWorktree, [...this.spawnedPids])
+      : this.runProcesses.reap(this.homeDir, this.runWorktree, [...this.spawnedPids], { deadlineAt })).catch(
       (): RunProcessReap => ({ killed: [], left: [], complete: false }),
     );
     if (r.killed.length > 0 || r.left.length > 0 || !r.complete) {
@@ -1277,11 +1303,12 @@ export class SdkExecutor implements Executor {
    * time left. A promise that already settled reads true even with no time left. The timer is
    * always cleared and the awaited operation is never cancelled by the give-up.
    */
-  private async waitWithin(pending: Promise<unknown> | undefined, budget: MaintenanceBudget | undefined): Promise<boolean> {
+  private async waitWithin(pending: Promise<unknown> | undefined, budget: MaintenanceBudget | undefined, deadlineAt?: number): Promise<boolean> {
     if (!pending) return true;
-    if (!budget) { await pending; return true; }
+    if (!budget && deadlineAt === undefined) { await pending; return true; }
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const expired = new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), Math.min(budget.remainingMs(), 2_147_483_647)); });
+    const limit = Math.min(budget?.remainingMs() ?? Infinity, deadlineAt === undefined ? Infinity : deadlineAt - Date.now());
+    const expired = new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), Math.min(limit, 2_147_483_647)); });
     try { return await Promise.race([pending.then(() => true as const, () => true as const), expired]); }
     finally { clearTimeout(timer); }
   }
@@ -1453,6 +1480,7 @@ export class SdkExecutor implements Executor {
     this.planFlight = undefined;
     this.planCandidate = undefined;
     this.spentSwitchSignal = undefined;
+    this.consumedPauseSignal = undefined;
     this.planGeneration++;
     let summaryResult: ExecutorResult | undefined;
     let laneFailure: unknown;
@@ -1562,7 +1590,7 @@ export class SdkExecutor implements Executor {
 
     // issue #1783 (R2): the runner's attempt marker rides the CLI env, so every process the
     // agent starts is positively attributable to this attempt by the quiescence reaper.
-    const env = buildSdkEnv(oauthToken, this.homeDir, toolEnv, this.dockerHost, ctx.runAttempt);
+    const env = buildSdkEnv(oauthToken, this.homeDir, toolEnv, this.dockerHost, ctx.runAttempt, ctx.managedGoWorkDir);
     // issue #1866 M2: measure the lead's execution environment once, before the plan turn. The
     // probe runs as the runner uid with this SDK env in its own process group: a baseline for
     // what the lead's commands can do, NOT provably identical to an SDK Bash tool call (the SDK
@@ -1717,31 +1745,36 @@ export class SdkExecutor implements Executor {
     if (ctx.config?.override_subagent_model && leadModel) {
       applySubagentModelOverride(assembled.subagents, leadModel);
     }
-    // The plan turn runs with the OWN subagents (PRD #37 Decision 5): the roster
-    // choice only takes effect after the plan is approved. #203 additionally
-    // strips the file-write tools from each of them, and DROPS any whose declared
-    // allowlist consisted only of write tools (see planTurnSubagents).
-    //
     // The names come from the RESULT, never from `assembled.subagents`. They feed
     // the plan turn's Agent-guard allowSet AND the "Available subagents to
     // delegate to:" line of every plan prompt, so a name surviving here while its
     // definition is gone would advertise — and let the lead invoke — an agent the
     // SDK cannot resolve. Every use of this list is plan-turn; the implement turn
     // derives its own from `selectSubagents`.
-    const planTurn = planTurnSubagents(assembled.subagents);
+    const planSource = planAgentSource(ctx.approvedSelection?.source, ctx.requestedAgentSource, (ctx.repoAgents?.length ?? 0) > 0);
+    const planPool = planSource === "repo"
+      ? selectSubagents(
+        "repo",
+        assembled.subagents,
+        ctx.repoAgents ?? [],
+        ctx.approvedSelection?.source === "repo" ? ctx.approvedSelection.exclusions : [],
+        survivorNames,
+        prepared.repoSurvivorNames,
+      )
+      : assembled.subagents;
+    const planTurn = planTurnSubagents(planPool);
     // Issue #2471: a memory-guard-bound run (ctx.capturedMemory present at run start, fixed for the
     // run) routes Bash to the supervised command tool, so the roster is shaped to it. The shaped
     // keys feed the Agent guard's allow set and the delegation lines below.
     const guarded = ctx.capturedMemory !== undefined;
     const planShaped = guarded ? shapeGuardedGrants(planTurn.subagents) : undefined;
     const planAgents = planShaped ? planShaped.agents : planTurn.subagents;
+    if (planSource === "repo" && ctx.config?.override_subagent_model && leadModel) {
+      applySubagentModelOverride(planAgents, leadModel);
+    }
     const planUnavailable: UnavailableRole[] = planShaped ? planShaped.unavailable : [];
     const planSubagentNames = Object.keys(planAgents);
-    // PRD #266 M1: each roster name's write capability, derived from the PRE-STRIP
-    // `assembled.subagents` (NOT `planTurn.subagents`, which subtracts the write
-    // tools and would falsely mark `coder` read-only). Built once and threaded into
-    // every plan prompt AND the implement prompt, looked up by roster name.
-    const subagentCanWrite = subagentWriteCapabilities(assembled.subagents);
+    const subagentCanWrite = subagentWriteCapabilities(planPool);
     if (planTurn.dropped.length > 0) {
       // Visible rather than silent: an agent missing from the plan wave is a
       // template-shape problem the operator can fix, and the approver should not
@@ -1985,6 +2018,8 @@ export class SdkExecutor implements Executor {
       skillsPluginPath,
       skills: runSkills.map((s) => qualifiedSkillName(s.name)),
       systemPrompt: buildLeadSystemPrompt(assembled.leadSystemPrompt, {
+        repoSourced: planSource === "repo",
+        planning: true,
         kind: ctx.kind,
         repoInstructions: repoInstructionsBlock,
         harness: "claude",
@@ -2031,6 +2066,7 @@ export class SdkExecutor implements Executor {
       skillsSelected: runSkills.length > 0,
       pluginWarned: false,
       turnEvidencedSessions: new Set<string>(),
+      interruptDropped: false,
     };
     observeState(state);
     const idleMs = seconds(
@@ -2042,30 +2078,44 @@ export class SdkExecutor implements Executor {
     // current turn's abort; the gate also unblocks via the steering verdict. It also
     // reclaims the dependency install (PRD #121 M2) — a cancelled run must not sit at
     // the join waiting out an install whose results nobody will read.
-    const onSignal = (): void => {
+    const tripFromSignal = (fromListener: boolean): void => {
       // PRD #1190 M2: a `now` pause aborts the SAME controller as a cancel, but with a
       // PauseNowSignal as the abort reason. Trip with REASON_PAUSE_NOW so driveTurn throws a
       // PauseNowSignal (via tripError) instead of Error(REASON_CANCELLED) — the loop then PARKS
       // the run rather than failing it. Every other abort (a steering cancel, a shutdown) has
       // the default reason and takes the cancel path unchanged.
-      this.trip(
-        state,
-        ctx.signal?.reason instanceof PauseNowSignal
-          ? REASON_PAUSE_NOW
-          : // PRD #1247 M5b: a held-state credential switch aborts the SAME controller as a cancel,
-            // but with a CredentialSwitchSignal reason. Trip with REASON_CREDENTIAL_SWITCH so
-            // driveTurn throws a CredentialSwitchSignal (via tripError) instead of the cancel error —
-            // the runner then RELEASES the claim rather than failing the run.
-            ctx.signal?.reason instanceof CredentialSwitchSignal
-            ? REASON_CREDENTIAL_SWITCH
-            : REASON_CANCELLED,
-      );
+      const reason = ctx.signal?.reason instanceof PauseNowSignal
+        ? REASON_PAUSE_NOW
+        : // PRD #1247 M5b: a held-state credential switch aborts the SAME controller as a cancel,
+          // but with a CredentialSwitchSignal reason. Trip with REASON_CREDENTIAL_SWITCH so
+          // driveTurn throws a CredentialSwitchSignal (via tripError) instead of the cancel error —
+          // the runner then RELEASES the claim rather than failing the run.
+          ctx.signal?.reason instanceof CredentialSwitchSignal
+          ? REASON_CREDENTIAL_SWITCH
+          : REASON_CANCELLED;
+      // Issue #4090: first-wins drops this stop while another trip is held; remember that.
+      if (state.tripReason !== undefined) this.markInterruptDropped(state);
+      else this.trip(state, reason);
+      // Issue #4090: steering invokes the re-armable interrupt synchronously right after this
+      // abort; that paired call is the same stop. Only the live listener arms the exemption.
+      if (fromListener && (reason === REASON_PAUSE_NOW || reason === REASON_CREDENTIAL_SWITCH)) {
+        state.pairedAbsorb = reason;
+        queueMicrotask(() => { if (state.pairedAbsorb === reason) state.pairedAbsorb = undefined; });
+      }
       depsAbort.abort();
     };
+    const onSignal = (): void => tripFromSignal(true);
     if (ctx.signal) {
-      if (ctx.signal.aborted) onSignal();
+      if (ctx.signal.aborted) tripFromSignal(false);
       else ctx.signal.addEventListener("abort", onSignal, { once: true });
     }
+    // Issue #4090: a re-armable interrupt is a drop when it lands on another held trip, unless it
+    // is the synchronous pair of the ctx.signal abort just processed.
+    const onInterrupt = (reason: string): void => {
+      if (state.pairedAbsorb === reason) state.pairedAbsorb = undefined;
+      else if (state.tripReason !== undefined) this.markInterruptDropped(state);
+      this.trip(state, reason);
+    };
 
     // PRD #1190 rework (N2): register the RE-ARMABLE pause-now interrupt. The shared cancel
     // controller (ctx.signal) fires 'abort' exactly once, so a SECOND `now` pause after a declined
@@ -2074,14 +2124,14 @@ export class SdkExecutor implements Executor {
     // first-wins-per-turn (cleared after a declined park), so a `now` that lands after the loop
     // cleared the prior trip still drops the (restarted) turn. `state` is the run-lifetime drive
     // object, so this one registration covers every turn.
-    ctx.onPauseNow?.(() => this.trip(state, REASON_PAUSE_NOW));
+    ctx.onPauseNow?.(() => onInterrupt(REASON_PAUSE_NOW));
 
     // PRD #1247 M5b: register the RE-ARMABLE credential-switch interrupt, the exact analog of the
     // pause-now interrupt above. The shared cancel controller fires 'abort' once, so a switch that
     // lands after a declined `now` park (which already aborted it) cannot re-fire it; the steering
     // channel invokes THIS on the matching switch, and trip() is first-wins-per-turn, so the switch
     // drops the (restarted) turn as REASON_CREDENTIAL_SWITCH. One registration covers every turn.
-    ctx.onCredentialSwitch?.(() => this.trip(state, REASON_CREDENTIAL_SWITCH));
+    ctx.onCredentialSwitch?.(() => onInterrupt(REASON_CREDENTIAL_SWITCH));
 
     // Issue #2471: the runner tells a guard-bound run when its memory authority is invalidated
     // mid-run; the lane then trips the turn with that stop and disposes every live command.
@@ -2112,6 +2162,7 @@ export class SdkExecutor implements Executor {
       assembled,
       leadModel,
       planSubagentNames,
+      planSource,
       subagentCanWrite,
       preToolUse,
       lane,
@@ -2148,10 +2199,26 @@ export class SdkExecutor implements Executor {
       idleMs,
       oauthToken,
       planSubagentNames,
+      planSource,
       subagentCanWrite,
       maxRevisions,
       environmentFacts,
     } = drive;
+    let planSourceAnnounced = false;
+    let planSourceReported = false;
+    const reportPlanSource = async (): Promise<void> => {
+      if (planSourceReported) return;
+      if (!planSourceAnnounced && planSource === "repo") {
+        ctx.emit({
+          kind: "status",
+          agent: "worker",
+          payload: { text: `planning with the repo's agents (${planSubagentNames.join(", ") || "none"})` },
+        });
+      }
+      planSourceAnnounced = true;
+      await ctx.reportPlanAgentSource?.(planSource);
+      planSourceReported = true;
+    };
     let resumeId = drive.resumeId;
     let frozenMilestones = drive.frozenMilestones;
       // --- PRD #35 Decision 6b + PRD #209 D4: skip planning for an approved plan ---
@@ -2563,6 +2630,7 @@ export class SdkExecutor implements Executor {
           // the session the aborted attempt ran (the last planning round's, after a clarification).
           let planResume = resumeId;
           const planStep = await this.runThroughSwitch(ctx, state, async () => {
+            await reportPlanSource();
             try {
               return await this.drivePlanningTurn(ctx, baseConfig, planResume, planPrompt, state, idleMs, budget);
             } catch (err) {
@@ -2683,9 +2751,6 @@ export class SdkExecutor implements Executor {
             agent: "worker",
             payload: automatic ? { automatic: true, cross_check_round: automaticRound } : { round: revisions },
           });
-          // A revision turn is a PLANNING turn (pre-approval), so it runs with the OWN
-          // subagents (baseConfig), exactly like the first plan turn — the roster
-          // selection only takes effect once a plan is APPROVED (PRD #37 Decision 5).
           // PRD #1247 M5b (MAJOR-6 rework): DEFER the credential switch across the revision planning
           // turn instead of releasing mid-turn. The turn's new plan is not persisted until the gate
           // report below. Since issue #1604 a mid-turn release is recoverable (the revise stays
@@ -2707,6 +2772,8 @@ export class SdkExecutor implements Executor {
           // memo block on the plain issue/rework path: announce where it is actually placed.
           if (resumeId === undefined && !isCIFix && !isSelfImprove && announceDecisionsMemo(ctx))
             decisionsMemoPlaced = true;
+          const sourceStep = await this.runThroughSwitch(ctx, state, reportPlanSource);
+          if ("released" in sourceStep) return { branch: ctx.branch, switchReleased: true };
           const runRevisionTurn = () =>
             this.drivePlanningTurn(ctx, baseConfig, resumeId, revisePrompt, state, idleMs, budget, !automatic);
           let turn: TurnResult & { plan: string };
@@ -2767,7 +2834,7 @@ export class SdkExecutor implements Executor {
         // Issue #3178: keyed on the post-gate resumeId (a revise turn may have produced a
         // session), never ctx.sessionId. Cross-check approvals carry the canonical contract.
         drive.gateApprovedWithoutSession = verdict.approval !== "cross_check" && resumeId === undefined;
-        approvedSelection = verdict.selection;
+        approvedSelection = gateVerdictSelection(verdict.selection, ctx.approvedSelection, ctx.requestedAgentSource);
         // PRD #122 M6: freeze the APPROVED milestone breakdown for the implement loop.
         // `candidateMilestones` is block-scoped and REPLACED across revision rounds
         // (Decision 2), so this captures the final approved list — the one the loop names
@@ -2876,7 +2943,7 @@ export class SdkExecutor implements Executor {
       // repo": an ABSENT selection resolves to repo when a roster was detected, which
       // is what a gate-less run and an older server both get (see further up).
       const repoAvailable = (ctx.repoAgents?.length ?? 0) > 0;
-      const resolved = resolveAgentSelection(approvedSelection, repoAvailable);
+      const resolved = resolveAgentSelection(approvedSelection, repoAvailable, ctx.requestedAgentSource);
       if (resolved.note)
         ctx.emit({
           kind: "status",
@@ -3052,14 +3119,43 @@ export class SdkExecutor implements Executor {
       };
       // PRD #1226 M3 (D3): completion-interlock attempt-loop state, DISTINCT from the #281 prose
       // stall state above but sharing STALL_LIMIT. completionAttempted latches true once the
-      // first structural attempt has run — it gates the post-attempt failure routing (before it,
-      // wall/idle/max-iter/no-progress fail exactly as today). The completion fingerprint is
+      // first structural attempt has run — it gates the post-attempt failure routing.
+      // Zero-attempt iteration parks use authoritative history separately. The completion fingerprint is
       // (sorted unmet ids, head, worktree fingerprint); an identical fingerprint across
       // consecutive attempts advances completionStallStreak, and STALL_LIMIT identical attempts
       // route to the hold. completionHeld latches the reason when the run entered the hold, so it
       // survives the `break` into the ExecutorResult (like pausedAt/scopeCapped).
       let completionAttempted = false;
       const history = new CompletionHistory();
+      // The runner withholds this capability on review targets and isolated fetches.
+      const iterationParkSupported = ctx.config?.iteration_park_version === 1 &&
+        !!ctx.parkForIteration && !ctx.interactive &&
+        ["issue", "mr_rework", "ci_fix", "task", "prompt", "self_improve"].some(kind => kind === ctx.kind);
+      let resumeSecretPreflightPending = iterationParkSupported && ctx.resumed === true;
+      let iterationParked: ExecutorResult["iterationParked"];
+      const parkIteration = async (iterationCount: number): Promise<boolean> => {
+        // Only the latest authoritative zero admits a park. A historical positive
+        // survives later zero/missing ACKs; a local false latch proves nothing.
+        if (!iterationParkSupported || lastServedCompletionAttempts !== 0 ||
+            completionAttempted || history.priorAttempt) return false;
+        const ready = await this.runThroughSwitch(ctx, state, async () => {
+          this.throwIfTerminal(ctx);
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+          throwIfDiskStop(ctx);
+          if (state.tripReason) throw this.tripError(state);
+          await this.closeAndSettlePlanSummary();
+          this.throwIfTerminal(ctx);
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+          throwIfDiskStop(ctx);
+          if (state.tripReason) throw this.tripError(state);
+        });
+        if ("released" in ready) { switchReleased = true; return true; }
+        // Capture is outside the switch retry wrapper. Once entered, a switch
+        // is deferred by the park ACK; a give-up must never re-enter capture.
+        iterationParked = { outcome: await ctx.parkForIteration!({ iterationCount, maxIterations }) };
+        // Every outcome stops this flight; a refusal never authorizes a redrive.
+        return true;
+      };
       let completionStallStreak = 0;
       let lastCompletionFingerprint: string | undefined;
       let completionHeld: { reason: string } | undefined;
@@ -3295,6 +3391,10 @@ export class SdkExecutor implements Executor {
         // park, whatever the soft layer concluded.
         throwIfDiskStop(ctx);
         if (capVerdict === "park") throw new DiskParkSignal(true);
+        // Checkpoints bypass the post-turn limit. Refresh budget/history and honor
+        // controls first; a clarification still owns the uncompleted current turn.
+        if (iteration - 1 >= maxIterations && !state.tripReason && state.wallRemainingMs > 0 &&
+            await parkIteration(iteration - 1)) break;
         ctx.emit({
           kind: "status",
           agent: "worker",
@@ -3315,6 +3415,20 @@ export class SdkExecutor implements Executor {
         // Issue #1800: fill the owner slot (only when empty) and decide who owns this turn. A system
         // text owns it outright: the owner follow-up is neither pulled nor rendered then and waits
         // in its slot for the next ordinary turn.
+        // A resumed invocation can have lost the previous turn's remediation text
+        // when iteration capture ended it. Re-derive guidance before its first work
+        // turn, including an attempt-path restore with no surviving provider session.
+        // Only remediate owns the prompt; the done/finalize gates remain authoritative.
+        if (resumeSecretPreflightPending && !state.tripReason) {
+          const decision = await ctx.secretRemediationGate?.({ unpublishedOnly: true });
+          resumeSecretPreflightPending = false;
+          this.throwIfTerminal(ctx);
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+          throwIfDiskStop(ctx);
+          if (decision?.action === "remediate") followUp = decision.followUp;
+          // A switch/pause/wall arriving during the await still goes through the
+          // ordinary turn's interruption checks before any model event.
+        }
         const reworkForTurn = completionRework;
         completionRework = undefined;
         if (repeatingContract && reworkForTurn?.answered) drive.approvedContractSuperseded = true;
@@ -3535,11 +3649,13 @@ export class SdkExecutor implements Executor {
           this.throwIfTerminal(ctx);
           this.clearTrip(state);
           throwIfDiskStop(ctx);
+          this.settlePauseSignal(ctx, state);
           return false;
         };
         const requestPark: NonNullable<RunContext["requestParkRun"]> = async (at) => {
           const step = await this.runThroughSwitch(ctx, state, async () => {
-            // Re-entry resumes the runner's pending question, with its original deadline.
+            // Re-entry shares the run's parked-time budget: a same-id re-entry continues its open
+            // interval, while a declined park already closed it and the next attempt opens a new one.
             // Only a settled owner answer permits another attempt; lifecycle refusals keep waiting.
             for (;;) {
               try { return await ctx.requestParkRun!(at); }
@@ -3569,6 +3685,10 @@ export class SdkExecutor implements Executor {
             }
           }
           if (!processed) carriedSafetySteer = safetySteer;
+          // A zero-attempt restart continues this uncompleted iteration, like clarification.
+          // Leave the existing post-attempt and legacy iteration controls unchanged.
+          if (iterationParkSupported && lastServedCompletionAttempts === 0 &&
+              !completionAttempted && !history.priorAttempt) iteration--;
         };
         // The worker's completion-attempt sequence, shared by the done path and the issue #3139
         // stall path so both keep one order and one set of cancel/terminal checks.
@@ -3656,7 +3776,7 @@ export class SdkExecutor implements Executor {
           if (turn.parkRun) {
             if (!parkRunEnabled(ctx, "implement") || !ctx.requestParkRun) throw new Error("illicit park_run signal");
             if (clarificationRounds++ >= questionMax(ctx.config ?? null) + 1) throw new Error("clarification rounds exhausted during implementation");
-            // The worker callback owns explicit owner retries and their absolute deadline.
+            // The worker callback owns explicit owner retries and the shared parked-time budget.
             const disposition = await requestPark(parkAt);
             if (switchReleased || walled || completionHeld || pausedAt) break;
             if (disposition.kind === "paused") { pausedAt = parkAt; break; }
@@ -3796,6 +3916,7 @@ export class SdkExecutor implements Executor {
               this.throwIfTerminal(ctx);
               this.clearTrip(state);
               throwIfDiskStop(ctx);
+              this.settlePauseSignal(ctx, state);
               completionRework = reworkForTurn;
               prepareInPlaceRestart();
               continue;
@@ -4101,6 +4222,7 @@ export class SdkExecutor implements Executor {
                     this.throwIfTerminal(ctx);
                     this.clearTrip(state);
                     throwIfDiskStop(ctx);
+                    this.settlePauseSignal(ctx, state);
                     return false;
                   }
                 }
@@ -4310,9 +4432,8 @@ export class SdkExecutor implements Executor {
           }
         }
         if (iteration >= maxIterations) {
-          // PRD #1226 M3 (D3): a POST-attempt iteration exhaustion routes to the completion hold
-          // (M4) rather than failing; PRE-attempt (or with the seam unwired) it throws the legacy
-          // REASON_MAX_ITERATIONS exactly as before.
+          // Post-attempt exhaustion keeps the completion hold. Supported authoritative-zero
+          // exhaustion parks separately; legacy or ineligible claims keep the original throw.
           if (
             await this.routeSummaryHold(
               ctx,
@@ -4323,6 +4444,7 @@ export class SdkExecutor implements Executor {
             completionHeld = { reason: REASON_MAX_ITERATIONS };
             break;
           }
+          if (await parkIteration(iteration)) break;
           throw new Error(REASON_MAX_ITERATIONS);
         }
 
@@ -4529,6 +4651,7 @@ export class SdkExecutor implements Executor {
       // pausedAt/completionHeld. NOT gated on isIssueRun (all six timed kinds park). OMITTED (not
       // undefined) on every normal completion so existing deepStrictEqual assertions hold.
       if (walled) result.walled = walled;
+      if (iterationParked) result.iterationParked = iterationParked;
       // PRD #1247 M5b (data-integrity fix): forward the released-in-place disposition. Set only when a
       // held-state credential switch RELEASED the claim (ctx.attemptCredentialSwitch → "released")
       // from the implement loop, an ask_user question, or an interactive follow-up wait — the loop
@@ -4544,7 +4667,7 @@ export class SdkExecutor implements Executor {
     toolEnv: Record<string, string> | undefined,
     signal: AbortSignal,
   ): Promise<JsDepsInstall> {
-    return startDepsInstall(ctx, this.log, this.homeDir, toolEnv, signal, this.installDeps);
+    return startDepsInstall(ctx, this.log, this.homeDir, toolEnv, signal, this.installDeps, ctx.managedGoWorkDir);
   }
 
   private async joinDepsInstall(
@@ -4609,6 +4732,21 @@ export class SdkExecutor implements Executor {
 
   private markSwitchSignalSpent(ctx: RunContext): void {
     if (ctx.signal?.reason instanceof CredentialSwitchSignal) this.spentSwitchSignal = ctx.signal;
+  }
+
+  /** Issue #4090: an interrupt was dropped by first-wins. Re-fence now (some continue paths, such
+   *  as a switch give-up, restart a turn without a settle site) and never consume again this run. */
+  private markInterruptDropped(state: RunDrive): void {
+    state.interruptDropped = true;
+    this.consumedPauseSignal = undefined;
+  }
+
+  /** Issue #4090: after a declined or refused pause/wall park continues in place, stop the spent
+   *  PauseNowSignal ctx.signal from fencing later guarded commands, unless an interrupt was
+   *  dropped this run (then the stale abort keeps fencing in front of the lost stop; the drop
+   *  already re-fenced in markInterruptDropped). */
+  private settlePauseSignal(ctx: RunContext, state: RunDrive): void {
+    if (!state.interruptDropped && ctx.signal?.reason instanceof PauseNowSignal) this.consumedPauseSignal = ctx.signal;
   }
 
   /** Drive ONE SDK turn to its result frame, capturing signals + the session id. */
@@ -4961,9 +5099,14 @@ export class SdkExecutor implements Executor {
       if (lane) {
         // Issue #2471: capture the worker-memory context for this turn. A capture failure has
         // already tripped the turn with the runner's own stop (the carrier), and rethrows it.
+        // Issue #4076: a ctx.signal already spent by a given-up credential switch stays aborted
+        // for the rest of the run; leaving it out keeps the retried turn's guarded commands live.
+        // Issue #4090: likewise a PauseNowSignal ctx.signal whose park was declined or refused,
+        // unless an interrupt was dropped this run (settlePauseSignal / markInterruptDropped).
         lane.beginTurn(AbortSignal.any([
           abortController.signal,
-          ...(ctx.signal ? [ctx.signal] : []),
+          ...(ctx.signal && ctx.signal !== this.spentSwitchSignal && ctx.signal !== this.consumedPauseSignal
+            ? [ctx.signal] : []),
           ...(ctx.terminalLifecycleSignal ? [ctx.terminalLifecycleSignal] : []),
         ]));
       }

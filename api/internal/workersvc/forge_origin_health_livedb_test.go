@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 func TestForgeOriginUnknownMappingNotNetworkEvidenceLiveDB(t *testing.T) {
@@ -64,7 +65,7 @@ func TestForgeOriginHealthAdmissionLiveDB(t *testing.T) {
 				t.Fatalf("cooled counts: %+v", counts)
 			}
 			reason := svc.queuedReasonWithEligibility(e.ctx, at, e.healthRowFor(t, id),
-				healthThresholds{custodyLimit: testCustodyLimit, custodyLimitOK: true}, false,
+				healthThresholds{custodyLimit: testCustodyLimit, custodyLimitOK: true},
 				&healthEligibilityResult{counts: counts})
 			if reason != reasonForgeOriginWait {
 				t.Fatalf("cooldown-only reason: %q", reason)
@@ -91,7 +92,7 @@ func TestForgeOriginHealthAdmissionLiveDB(t *testing.T) {
 	// Sweep the claimed-never-started flight through the existing query, not a
 	// telemetry timeout. It must dispose of the reservation, retaining health.
 	e.exec(t, "UPDATE runs SET claimed_at=$2 WHERE id=$1", id, at.Add(-time.Hour))
-	if _, err := e.q.SweepClaimedNeverStarted(e.ctx, pgconv.Time(at)); err != nil {
+	if _, err := e.q.SweepClaimedNeverStarted(e.ctx, store.SweepClaimedNeverStartedParams{Cutoff: pgconv.Time(at)}); err != nil {
 		t.Fatal(err)
 	}
 	c := e.originCooldown(t, worker, "https://forge.e2e")

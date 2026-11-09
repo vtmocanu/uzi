@@ -30,19 +30,23 @@ type fakeNotifStore struct {
 	ccSummary      *store.GetLatestPlanCrossCheckSummaryRow
 	ccSummaryErr   error
 	ccSummaryAsked []store.GetLatestPlanCrossCheckSummaryParams
-	pubSide        *store.RunPublicationResume
-	pubSideErr     error
-	runErr         error
-	rcErr          error
-	delivery       pgtype.Text
-	deliveryErr    error
-	msg            store.SlackRunMessage
-	msgErr         error
-	upserted       []store.UpsertSlackRunMessageParams
-	gateSet        []store.SetSlackRunGateParams
-	gateSetGen     []store.SetSlackRunGateGenParams
-	planCount      int64
-	planCountErr   error
+	// Code cross-check summary (issue #3813): nil + nil error models no row.
+	codeCC       *store.CrossCheck
+	codeCCErr    error
+	codeCCAsked  []store.GetCodeCrossCheckForOwnerParams
+	pubSide      *store.RunPublicationResume
+	pubSideErr   error
+	runErr       error
+	rcErr        error
+	delivery     pgtype.Text
+	deliveryErr  error
+	msg          store.SlackRunMessage
+	msgErr       error
+	upserted     []store.UpsertSlackRunMessageParams
+	gateSet      []store.SetSlackRunGateParams
+	gateSetGen   []store.SetSlackRunGateGenParams
+	planCount    int64
+	planCountErr error
 	// PRD #88 M3: the latest kind='question' payload and the anchor write recording
 	// which question the thread already carries. A nil question with no error models
 	// "no row" the way the generated :one query surfaces it.
@@ -129,6 +133,19 @@ func (f *fakeNotifStore) GetLatestPlanCrossCheckSummary(_ context.Context, arg s
 		return store.GetLatestPlanCrossCheckSummaryRow{}, pgx.ErrNoRows
 	}
 	return *f.ccSummary, nil
+}
+
+// GetCodeCrossCheckForOwner models the :one owner-bound read: with no staged row it
+// returns pgx.ErrNoRows (not recorded). codeCCAsked captures the scoped read.
+func (f *fakeNotifStore) GetCodeCrossCheckForOwner(_ context.Context, arg store.GetCodeCrossCheckForOwnerParams) (store.CrossCheck, error) {
+	f.codeCCAsked = append(f.codeCCAsked, arg)
+	if f.codeCCErr != nil {
+		return store.CrossCheck{}, f.codeCCErr
+	}
+	if f.codeCC == nil {
+		return store.CrossCheck{}, pgx.ErrNoRows
+	}
+	return *f.codeCC, nil
 }
 
 // GetActivePublicationResume models the run's active publication intent (issue #1324): a nil
@@ -971,6 +988,43 @@ func TestNotifierGateOffersRepoAndOwnWhenRosterDetected(t *testing.T) {
 	// The names ride the body; descriptions never do (there are none in the row).
 	if !strings.Contains(fp.blocks[0].sectionText, "coder") {
 		t.Fatalf("gate body must list the repo agent names: %q", fp.blocks[0].sectionText)
+	}
+}
+
+func TestNotifierGateFollowsRunRequestedSource(t *testing.T) {
+	repoFirst := []string{ActionGateApproveRepo, ActionGateApproveOwn, ActionGateRequestChanges, ActionGateReject, ActionGateOpen}
+	ownFirst := []string{ActionGateApproveOwn, ActionGateApproveRepo, ActionGateRequestChanges, ActionGateReject, ActionGateOpen}
+	for _, tc := range []struct {
+		name      string
+		requested pgtype.Text
+		runErr    error
+		want      []string
+	}{
+		{"unset", pgtype.Text{}, nil, repoFirst},
+		{"repo", txt("repo"), nil, repoFirst},
+		{"own", txt("own"), nil, ownFirst},
+		{"run lookup fails", txt("own"), errors.New("boom"), repoFirst},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rc := baseRun("awaiting_approval")
+			rc.RepoAgentNames = []string{"coder", "reviewer"}
+			fs := &fakeNotifStore{
+				rc:            rc,
+				delivery:      txt("U1"),
+				msg:           store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"},
+				planCount:     1,
+				crossCheckRun: store.Run{ID: rc.ID, AgentSourceRequested: tc.requested},
+				runErr:        tc.runErr,
+			}
+			fp := &fakePoster{dmChannel: "D1"}
+			NewNotifier(fs, fp, fixedBase, nil).handle(context.Background(), stateEvent{runID: rc.ID, status: "awaiting_approval"})
+			if len(fp.blocks) != 1 {
+				t.Fatalf("gate must post one Block Kit message: %+v", fp.blocks)
+			}
+			if got := strings.Join(fp.blocks[0].actionIDs, ","); got != strings.Join(tc.want, ",") {
+				t.Fatalf("gate buttons = %s, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

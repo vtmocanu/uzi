@@ -28,6 +28,35 @@ describe("mock agent-source (PRD #602 M5)", () => {
     expect(agent_source.staged!.counts.failed).toBeGreaterThan(0);
   });
 
+  it.each([
+    ["gpt-6-sol", "", "gpt-6-sol"],
+    ["gpt-6-luna", "", "gpt-6-luna"],
+    [" gpt-6-luna ", "", "gpt-6-luna"],
+    ["gpt-custom", "gpt-custom", ""],
+    ["us.anthropic.claude-custom:v1", "us.anthropic.claude-custom:v1", ""],
+    ["", "", ""],
+    [undefined, "", ""],
+  ])("derives review pins without rewriting raw model %s", async (model, claudeModel, codexModel) => {
+    const api = await fresh();
+    await api.login(ADMIN, "x");
+    const { agentSource } = await import("./mockApi/agentSource");
+    const raw = agentSource.staged!.roles[0];
+    if (model === undefined) delete raw.model;
+    else raw.model = model;
+    // Derived fields are a read view, even if stale fields were previously present.
+    raw.claude_model = "stale";
+    raw.codex_model = "stale";
+    for (const response of [await api.getAgentSource(), await api.syncAgentSource()]) {
+      const role = response.agent_source.staged!.roles[0];
+      expect(role).toMatchObject({ claude_model: claudeModel, codex_model: codexModel });
+      expect(role.model).toBe(model);
+      expect(Object.prototype.hasOwnProperty.call(role, "model")).toBe(model !== undefined);
+    }
+    expect(raw.model).toBe(model);
+    expect(raw.claude_model).toBe("stale");
+    expect(raw.codex_model).toBe("stale");
+  });
+
   it("applies the reviewed snapshot and clears pending; a wrong SHA is a 409", async () => {
     const api = await fresh();
     await api.login(ADMIN, "x");

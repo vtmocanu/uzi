@@ -1,0 +1,83 @@
+{
+  "cases": [
+    {
+      "id": "empty",
+      "names": [],
+      "selected_index": null
+    },
+    {
+      "id": "no-lead",
+      "names": [
+        "coder",
+        "researcher"
+      ],
+      "selected_index": null
+    },
+    {
+      "id": "lead-only",
+      "names": [
+        "lead"
+      ],
+      "selected_index": 0
+    },
+    {
+      "id": "orchestrator-only",
+      "names": [
+        "orchestrator"
+      ],
+      "selected_index": 0
+    },
+    {
+      "id": "lead-before-orchestrator",
+      "names": [
+        "lead",
+        "orchestrator"
+      ],
+      "selected_index": 0
+    },
+    {
+      "id": "orchestrator-before-lead",
+      "names": [
+        "orchestrator",
+        "lead"
+      ],
+      "selected_index": 0
+    },
+    {
+      "id": "uppercase-lead",
+      "names": [
+        "coder",
+        "LEAD"
+      ],
+      "selected_index": 1
+    },
+    {
+      "id": "mixed-case-orchestrator",
+      "names": [
+        "researcher",
+        "Orchestrator"
+      ],
+      "selected_index": 1
+    },
+    {
+      "id": "later-lead-shaped-names",
+      "names": [
+        "coder",
+        "orchestrator",
+        "researcher",
+        "LEAD",
+        "tester"
+      ],
+      "selected_index": 1
+    },
+    {
+      "id": "ordinary-name-lookalikes",
+      "names": [
+        "team-lead",
+        "lead-helper",
+        "orchestrators"
+      ],
+      "selected_index": null
+    }
+  ]
+}

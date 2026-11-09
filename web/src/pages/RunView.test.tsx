@@ -161,6 +161,7 @@ function agent(name: string): RepoAgent {
 
 function run(over: Partial<Run>): Run {
   return {
+    harness_decision: null,
     id: "r1",
     repo_id: "repo1",
     forge_type: "gitlab",
@@ -1222,6 +1223,62 @@ describe("AgentRosterSummary (read-only, post-approval)", () => {
   });
 });
 
+describe("AgentRosterSummary — roster revision (issue #3913)", () => {
+  it("shows the default-branch revision the repo agents were read at", () => {
+    const commit = "0123456789abcdef0123456789abcdef01234567";
+    render(
+      <AgentRosterSummary
+        run={run({
+          status: "running",
+          agent_source: "repo",
+          repo_agents: [{ name: "reviewer", description: "rev" }],
+          repo_agent_source_commit: commit,
+        })}
+      />,
+    );
+    expect(screen.getByText(/read at default-branch revision/i)).toBeTruthy();
+    expect(screen.getByText("0123456789ab").getAttribute("title")).toBe(commit);
+  });
+
+  it("shows no revision line when none was recorded", () => {
+    render(<AgentRosterSummary run={run({ status: "running", agent_source: "repo", repo_agents: [] })} />);
+    expect(screen.getByText(/This run used the repository's own agents/i)).toBeTruthy();
+    expect(screen.queryByText(/read at default-branch revision/i)).toBeNull();
+  });
+});
+
+describe("AgentRosterSummary — requested agent source (PRD #3914)", () => {
+  it.each([
+    ["own", "own", "own", "repo_default", "Planned with: my templates (repo default) · Implemented with: my templates (as requested)"],
+    ["repo", "repo", "own", "explicit", "Planned with: repo agents (this run) · Implemented with: my templates (changed at approval)"],
+    ["repo", "repo", "repo", "repo_default", "Planned with: repo agents (repo default) · Implemented with: repo agents (as requested)"],
+    ["repo", "own", "own", "repo_default", "Requested: repo agents (repo default) · Planned with: my templates · Implemented with: my templates (changed at approval)"],
+    ["repo", null, "repo", "explicit", "Requested: repo agents (this run) · Planned with: — · Implemented with: repo agents (as requested)"],
+  ] as const)("requested %s, planned %s, implemented %s (%s)", (requested, planned, implemented, basis, line) => {
+    render(
+      <AgentRosterSummary
+        run={run({
+          status: "running",
+          agent_source: implemented,
+          agent_source_requested: requested,
+          agent_source_requested_basis: basis,
+          plan_agent_source: planned,
+          own_agents: [agent("coder")],
+          repo_agents: [{ name: "site-plan-check", description: "d" }],
+        })}
+      />,
+    );
+    expect(screen.getByText(line)).toBeTruthy();
+  });
+
+  it("an unset run shows no requested line", () => {
+    render(<AgentRosterSummary run={run({ status: "running", agent_source: "repo", plan_agent_source: "own", repo_agents: [agent("coder")] })} />);
+    expect(screen.queryByText(/Requested:/)).toBeNull();
+    expect(screen.queryByText(/Planned with:/)).toBeNull();
+    expect(screen.queryByText(/Implemented with:/)).toBeNull();
+  });
+});
+
 describe("AgentRosterSummary — repo agent folder", () => {
   it("names .codex/agents/ for a repo-source run whose roster was read from it", () => {
     render(
@@ -2002,9 +2059,10 @@ describe("RunView — paused header: Resume + pending-pause chip (PRD #1190)", (
     } as unknown as ReturnType<typeof useRunStream>);
     mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
     const utils = render(
-      <MemoryRouter initialEntries={["/runs/r1"]}>
-        <RunView />
-      </MemoryRouter>,
+      <RouterProvider router={createMemoryRouter(
+        [{ path: "/runs/:id", element: <RunView /> }],
+        { initialEntries: ["/runs/r1"] },
+      )} />,
     );
     return { ...utils, refreshRun, submit };
   }
@@ -2033,6 +2091,35 @@ describe("RunView — paused header: Resume + pending-pause chip (PRD #1190)", (
     renderPage({ ...PAUSED, hold_reason: "completion_blocked" }, true);
     await screen.findByText("Add rate limiting");
     expect(screen.queryByRole("button", { name: /resume/i })).toBeNull();
+  });
+
+  it("a repo-agent source hold offers owner Resume and Cancel without claiming a checkpoint", async () => {
+    const { refreshRun, submit } = renderPage({ ...PAUSED, hold_reason: "repo_agent_source_unavailable",
+      checkpoint_tip_at: null, checkpoint_contains_latest: false, repo_agent_source_commit: null }, true);
+    const heading = await screen.findByRole("heading", { name: "Repo agents unreadable: waiting for owner" });
+    const panel = within(heading.parentElement!);
+    expect(panel.getByText(/the agent was not started/i)).toBeTruthy();
+    expect(panel.getByText(/does not resume automatically/i)).toBeTruthy();
+    expect(screen.queryByText(/the last checkpoint is pushed/i)).toBeNull();
+    expect(screen.queryByText(/the branch is recovered from the checkpoint/i)).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Completion state" })).toBeNull();
+    expect(screen.getAllByRole("button", { name: /resume/i })).toHaveLength(1);
+    await act(async () => { fireEvent.click(panel.getByRole("button", { name: "Resume" })); });
+    await waitFor(() => expect(mockApi.resumeRun).toHaveBeenCalledWith("r1"));
+    await waitFor(() => expect(refreshRun).toHaveBeenCalled());
+    await act(async () => { fireEvent.click(panel.getByRole("button", { name: "Cancel" })); });
+    await waitFor(() => expect(submit).toHaveBeenCalledWith("cancel", "", undefined, undefined, false));
+  });
+
+  it("a repo-agent source hold gives non-owners no Resume or Cancel controls", async () => {
+    renderPage({ ...PAUSED, hold_reason: "repo_agent_source_unavailable" }, false);
+    const heading = await screen.findByRole("heading", { name: "Repo agents unreadable: waiting for owner" });
+    const panel = within(heading.parentElement!);
+    expect(panel.getByText("Only the run owner can Resume or Cancel this hold.")).toBeTruthy();
+    expect(panel.queryByRole("button")).toBeNull();
+    expect(screen.queryByRole("button", { name: /resume/i })).toBeNull();
+    expect(screen.queryByText(/the last checkpoint is pushed/i)).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Completion state" })).toBeNull();
   });
 
   it("clicking Resume calls api.resumeRun(id) then refreshRun", async () => {
@@ -3126,7 +3213,9 @@ describe("RunView preserved-patch surface (PRD #377)", () => {
 // failed hero). So the hint is doubly recoverability-aware: needs_landing AND an available
 // capture. The header pill for such a run reads "needs landing" (issue #1418 part A).
 describe("RunView landing hint (issue #1418)", () => {
-  const EXPORT_CMD = "uzi run export r1 --output <path> --capture cap-ok";
+  const RUN_ID = "00000000-0000-4000-8000-000000001418";
+  const CAPTURE_ID = "00000000-0000-4000-8000-000000001419";
+  const EXPORT_CMD = `uzi run export ${RUN_ID} --output <path> --capture ${CAPTURE_ID}`;
 
   function archiveSummary(over: Record<string, unknown> = {}) {
     return {
@@ -3147,8 +3236,8 @@ describe("RunView landing hint (issue #1418)", () => {
   }
   function availableCapture(over: Record<string, unknown> = {}) {
     return {
-      id: "cap-ok",
-      run_id: "r1",
+      id: CAPTURE_ID,
+      run_id: RUN_ID,
       hold_id: "h1",
       state: "available",
       source_sha: "0123456789abcdef0123456789abcdef01234567",
@@ -3159,7 +3248,7 @@ describe("RunView landing hint (issue #1418)", () => {
 
   function renderPage(over: Partial<Run>, summary: ReturnType<typeof archiveSummary>) {
     mockUseRunStream.mockReturnValue({
-      run: run(over),
+      run: run({ id: RUN_ID, ...over }),
       messages: [],
       connected: true,
       error: "",
@@ -3173,7 +3262,7 @@ describe("RunView landing hint (issue #1418)", () => {
       summary as unknown as Awaited<ReturnType<typeof api.getRunArchives>>,
     );
     return render(
-      <MemoryRouter initialEntries={["/runs/r1"]}>
+      <MemoryRouter initialEntries={[`/runs/${RUN_ID}`]}>
         <RunView />
       </MemoryRouter>,
     );
@@ -5753,10 +5842,10 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
     const { container } = render(<RecoveryWaitPanel run={diskPark()} />);
     expect(container.querySelector('[role="status"]')?.textContent).toContain("Waiting for disk space");
     expect(container.textContent).toContain(
-      `The worker's disk is full or nearly full. uzi frees space on the worker and the run resumes at its next retry (${hhmm("2026-01-01T09:30:00Z")}). No action is needed.`,
+      `Retry at ${hhmm("2026-01-01T09:30:00Z")}.`,
     );
     expect(container.textContent).toContain(
-      "Counted disk parks so far: 2. If the disk stays full, the run can fail after repeated counted parks.",
+      "Counted disk parks so far: 2. Resume does not reset this count.",
     );
     expect(container.textContent).not.toContain("uzi freed");
     expect(container.textContent).not.toContain("transient interruption");
@@ -5766,12 +5855,12 @@ describe("RecoveryWaitPanel (issue #1197)", () => {
     expect(container.querySelector("button")).toBeNull();
   });
 
-  it("data_volume_full with no retry stamp or count drops the time and reads 0 parks", () => {
+  it("data_volume_full with explicit null is an owner hold and reads 0 parks", () => {
     const { container } = render(
       <RecoveryWaitPanel run={diskPark({ recovery_retry_not_before: null, disk_park_count: undefined })} />,
     );
-    expect(container.textContent).toContain("the run resumes at its next retry. No action is needed.");
-    expect(container.textContent).not.toMatch(/retry \(/);
+    expect(container.textContent).toContain("Automatic disk recovery has stopped.");
+    expect(container.textContent).not.toContain("Retry at");
     expect(container.textContent).toContain("Counted disk parks so far: 0.");
   });
 
@@ -6184,14 +6273,14 @@ describe("RunView park announcement — recovery_wait (issue #1197, a11y)", () =
   // PRD #1809 M5: a data_volume_full park announces the disk space it waits on, not the
   // generic transient interruption.
   it("announces a data_volume_full park as waiting for disk space", async () => {
-    renderPage({ status: "recovery_wait", recovery_wait_cause: "data_volume_full" });
+    renderPage({ status: "recovery_wait", recovery_wait_cause: "data_volume_full", recovery_retry_not_before: "2026-01-01T09:30:00Z" });
     const region = await waitFor(() => {
       const el = document.querySelector('div.sr-only[role="status"]') as HTMLElement | null;
       if (!el || el.textContent === "") throw new Error("not announced yet");
       return el;
     });
     expect(region.textContent).toBe(
-      "This run is waiting for disk space. The worker's disk is full or nearly full; uzi frees space on the worker and the run resumes at its next retry.",
+      "The worker's disk is full or nearly full. uzi frees space on the worker and the run retries automatically after its scheduled time, including when already due. Admission may still refuse execution.",
     );
     expect(region.textContent).not.toContain("transient interruption");
   });
@@ -7943,7 +8032,7 @@ describe("HealthFlag Codex admission", () => {
 it.each([
   "handoff setup has not finished",
   "your vault is locked, so this run can't start",
-  "you have too much unpublished work awaiting recovery; resolve or discard some recovery archives to start new runs",
+  "recovery custody capacity is full; retained holds still protect your work; resolve or discard a retained hold to free capacity",
   "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings",
   "your Codex account is unavailable (quarantined or being re-linked), so this run can't start",
 ])("HealthFlag Codex admission keeps %s primary", (reason) => {
@@ -7954,4 +8043,22 @@ it.each([
     expect(container.textContent).toContain(reason);
     expect(container.querySelector("[title]")!.getAttribute("title")).toBe("waiting: provider reported overload; account admission eligible after 2026-10-27T12:01:37Z");
   } finally { now.mockRestore(); }
+});
+
+
+describe("RunView stored harness decision placement", () => {
+  it("shows creation evidence for queued runs without a credential label", () => {
+    viewerVault(true);
+    mockUseRunStream.mockReturnValue({
+      run: run({ status: "queued", harness: "codex", anthropic_secret_label: null, codex_secret_label: null,
+        harness_decision: { preferred: "claude", chosen: "codex", reason: "overflow",
+          preferred_score: 0, other_score: 60, preferred_measured: null, other_measured: 60,
+          preferred_held: true, other_held: false,
+          preferred_weekly_reset_at: null, other_weekly_reset_at: null } }),
+      messages: [], connected: true, error: "", submit: vi.fn(), refreshRun: vi.fn(), inputs: [], canSteer: false,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    render(<MemoryRouter initialEntries={["/runs/r1"]}><RunView /></MemoryRouter>);
+    expect(screen.getByRole("region", { name: "Harness decision at creation time" }).textContent).toContain("preferred claude, chosen codex. Reason: overflow");
+  });
 });

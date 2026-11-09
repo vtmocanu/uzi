@@ -887,7 +887,7 @@ func (s *Service) Summary(ctx context.Context, userID, runID uuid.UUID) (apitype
 	}
 	archives := make([]apitypes.RecoveryArchiveDTO, 0, len(caps))
 	for _, c := range caps {
-		archives = append(archives, captureToDTO(c))
+		archives = append(archives, ownerCaptureToDTO(c))
 	}
 	return apitypes.RecoveryArchiveSummaryDTO{
 		Supported:   sum.Supported,

@@ -6,6 +6,7 @@ import { Landing } from "./pages/Landing";
 import { Login } from "./pages/Login";
 import { Register } from "./pages/Register";
 import { Dashboard } from "./pages/Dashboard";
+import { OverviewNext } from "./pages/OverviewNext";
 import { AdminUsers } from "./pages/AdminUsers";
 import { AdminRateLimits } from "./pages/AdminRateLimits";
 import { AdminSettings } from "./pages/AdminSettings";
@@ -19,6 +20,7 @@ import { AccessSettings } from "./pages/AccessSettings";
 import { MemorySettings } from "./pages/MemorySettings";
 import { CliAuth } from "./pages/CliAuth";
 import { Connect } from "./pages/Connect";
+import { ResetAccount } from "./pages/ResetAccount";
 import { Agents } from "./pages/Agents";
 import { AgentNew } from "./pages/AgentNew";
 import { AgentDetail } from "./pages/AgentDetail";
@@ -41,9 +43,9 @@ import { Docs } from "./pages/Docs";
 import { DocPage } from "./pages/DocPage";
 
 // The guard wrapping a route's page. "public" means the page renders with NO
-// guard (still inside AppShell) — the docs pages and the CLI-auth and Connect consent pages,
-// which handle their own auth. "guest" is the inverse of "protected": the
-// landing/login/register pages are for signed-out visitors only.
+// guard (still inside AppShell) — the docs pages, the CLI-auth and Connect consent pages,
+// which handle their own auth, and the account reset page, which needs none. "guest" is
+// the inverse of "protected": the landing/login/register pages are for signed-out visitors only.
 export type RouteGuard = "guest" | "public" | "protected" | "admin";
 
 // One row of the route table. This array is the SINGLE SOURCE the router and the
@@ -86,6 +88,10 @@ export const APP_ROUTES: AppRoute[] = [
   // for the same reason as /cli-auth: it handles its own auth so it can keep the request across
   // the login redirect (and store a return path for an OIDC login, which cannot carry ?next=).
   { path: "/connect", element: <Connect />, guard: "public" },
+  // Admin-issued account reset link (PRD #3989): public, because the holder has no working
+  // credential. The token rides the URL fragment (/reset#<token>); the page clears it at once
+  // and sends it only in POST bodies.
+  { path: "/reset", element: <ResetAccount />, guard: "public" },
   // Workers moved out of the Settings tabs to a first-class Factory page; the old
   // URL keeps working for bookmarks and stale deep links.
   // The <Navigate> renders unwrapped via the "public" guard, exactly as the old
@@ -95,6 +101,8 @@ export const APP_ROUTES: AppRoute[] = [
   { path: "/admin", element: <Navigate to="/admin/users" replace />, guard: "public" },
   // Authenticated app.
   { path: "/dashboard", element: <Dashboard />, guard: "protected" },
+  // The Overview preview (PRD #3878): linked from /dashboard and back; #3877 promotes or drops it.
+  { path: "/overview/next", element: <OverviewNext />, guard: "protected" },
   { path: "/settings", element: <Settings />, guard: "protected" },
   // Appearance (theme/mode/typeface) + demo mode, split out of the Account tab.
   { path: "/settings/appearance", element: <AppearanceSettings />, guard: "protected" },

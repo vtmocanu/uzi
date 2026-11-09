@@ -87,7 +87,7 @@ var categoryLabels = map[string]string{
 	"improve_agent":       "Improve an agent",
 	"add_agent":           "Add an agent",
 	"improve_uzi":         "Improve uzi",
-	"cost_efficiency":     "Improve cost efficiency",
+	"cost_efficiency":     "Improve efficiency",
 }
 
 var verdictLabels = map[string]string{

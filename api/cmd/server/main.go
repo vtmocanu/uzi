@@ -362,7 +362,7 @@ func run() error {
 		ProposalConfirmStuckTimeout: cfg.ProposalConfirmStuckTimeout,
 		AutoStopEnabled:             cfg.AutoStopEnabled,
 		// The SAME constructor the settings page reads (PRD #111 D21) — not a second
-		// literal mapping the four UZI_AUTOSELECT_* knobs. Two mappings would each be
+		// literal mapping the UZI_AUTOSELECT_* knobs. Two mappings would each be
 		// internally consistent while the meter and the selector disagreed about the
 		// same token, with nothing going red.
 		Autoselect: cfg.AutoselectPolicy(),
@@ -386,7 +386,7 @@ func run() error {
 		RunForgeUnreachableMaxParks: cfg.RunForgeUnreachableMaxParks,
 		RunGateRefusalMax:           cfg.RunGateRefusalMax,
 		// Data-volume-full park cap (PRD #1809 M5, D6): past this many COUNTED disk parks the run
-		// fails with fail_origin='data_volume_full'. 0 = unlimited. Preventive parks never count.
+		// holds for owner Resume with no retry deadline. 0 = unlimited. Preventive parks never count.
 		RunDiskParkMax:              cfg.RunDiskParkMax,
 		RunRetainedRecoveryMaxParks: cfg.RunRetainedRecoveryMaxParks,
 		// PRD #1733: elapsed-time bound on an unbroken provider-outage park streak; past it the next

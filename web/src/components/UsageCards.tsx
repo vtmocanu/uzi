@@ -1,27 +1,20 @@
 import type { ReactNode } from "react";
-import { Link } from "react-router-dom";
 import { failureRecency } from "../lib/failureRecency";
 import { useNow } from "../lib/useNow";
-import { stripUnsafeChars } from "../lib/safeText";
-import type { SelfUsage, AdminUsage, RunUsage, RunOutcomes } from "../lib/api";
+import type { SelfUsage, AdminUsage } from "../lib/api";
 import { formatTokens, formatCost } from "../lib/formatTokens";
-import { failOriginLabel } from "../lib/failOriginLabel";
 import { aggregateDisclosure } from "../lib/costStatus";
 import { useDemoMode } from "../lib/demoMode";
 import { maskEmail } from "../lib/demoMask";
 import { Card, SectionTitle, cx } from "./ui";
+import {
+  failRate, failRateDelta, formatSince, summaryCost, perPrText,
+  FailedRunsBlock, TopCauses, SinceLastFailedRun, WindowToggle, Th, Td,
+} from "./usageParts";
+import { breakdown, perUserRows } from "../lib/usageByUser";
 
 // PRD #40: one usage summary, with personal figures for everyone and factory
 // figures plus the selected-window per-user section only from the admin-gated response.
-
-// A RunUsage bundle split the way the run view splits it: fresh = fresh input +
-// cache creation, cached = cache reads, out = output; total = all three.
-function breakdown(u: RunUsage): { fresh: number; cached: number; out: number; total: number; cost: number } {
-  const fresh = u.input_tokens + u.cache_creation_tokens;
-  const cached = u.cache_read_tokens;
-  const out = u.output_tokens;
-  return { fresh, cached, out, total: fresh + cached + out, cost: u.cost_usd };
-}
 
 // Largest-remainder (Hamilton) rounding: integer percentages that sum to exactly
 // 100. Floor each row's raw share, then award the leftover point(s) to the largest
@@ -55,31 +48,7 @@ function costShares(totals: number[], factoryTotal: number): number[] {
 // `aggregateDisclosure` names both populations whose cost is incomplete while
 // retaining the recorded partial contributions in the displayed dollar total.
 
-// PRD #1293 D6: the failed-run rate as failed / finished, one decimal, "—" when the scope
-// has no finished runs (never a fabricated 0%). One helper for both cards' windows and the
-// per-user table's Fail rate cell, so every surface rounds identically.
-const failRate = (o: RunOutcomes): string =>
-  o.finished === 0 ? "—" : `${((o.failed / o.finished) * 100).toFixed(1)}%`;
-
-// formatSince renders the factory's earliest-run ISO timestamp as "12 May 2026" for
-// the "since <date>" line; "" (falsy → the clause is dropped) when absent/unparseable.
-function formatSince(iso: string | null): string {
-  if (!iso) return "";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "";
-  return d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
-}
-
 export type UsageWindow = "lifetime" | "last_7_days";
-
-// Group dollars only in the summary cards; other usage surfaces keep their formatter.
-function summaryCost(usd: number): string {
-  const value = Number.isFinite(usd) && usd >= 0 ? usd : 0;
-  return "$" + new Intl.NumberFormat("en-US", {
-    minimumFractionDigits: value >= 1000 ? 0 : 2,
-    maximumFractionDigits: value >= 1000 ? 0 : 2,
-  }).format(value);
-}
 
 // Issue #3686: "N PRs · $X per PR" for one window. null when the server did not
 // report the count (older API): never a fabricated 0. The per-PR cost divides the
@@ -88,90 +57,7 @@ function summaryCost(usd: number): string {
 function prSummary(count: number | undefined, cost: number, disclosure: ReturnType<typeof aggregateDisclosure>): ReactNode {
   if (count == null) return null;
   const head = `${count.toLocaleString("en-US")} ${count === 1 ? "PR" : "PRs"}`;
-  if (count === 0) return `${head} · — per PR`;
-  const per = summaryCost(cost / count);
-  if (disclosure.incomplete) return <>{head} · <span title={disclosure.title}>at least {per} per PR</span></>;
-  return `${head} · ${per} per PR`;
-}
-
-// PRD #1293: outcomes use the selected window and failed / finished denominator.
-// Issue #1418: remove the needs_landing hatch because an aggregate cannot know
-// whether recoverable work was landed later. It is a descriptive note, not backlog.
-function FailedRunsBlock({ outcomes, personal }: { outcomes: RunOutcomes; personal: boolean }) {
-  if (outcomes.finished === 0) return <p className="text-sm text-muted">No finished runs in this period.</p>;
-  const segments = [
-    { label: "completed", count: outcomes.completed, background: "rgb(var(--ok))" },
-    { label: "cancelled", count: outcomes.cancelled, background: "rgb(var(--edge-strong))" },
-    { label: "rejected", count: outcomes.plan_rejected + (outcomes.base_diverged ?? 0), background: "repeating-linear-gradient(135deg, rgb(var(--edge-strong)) 0 2px, rgb(var(--surface)) 2px 4px)" },
-    { label: "failed", count: outcomes.failed, background: "rgb(var(--danger))" },
-  ].filter((s) => s.count > 0);
-  return (
-    <div className="border-t border-edge pt-3 space-y-2.5">
-      <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 text-xs">
-        <p className="text-muted"><span className="tabular-nums text-fg">{outcomes.failed.toLocaleString("en-US")}</span> failed of <span className="tabular-nums text-fg">{outcomes.finished.toLocaleString("en-US")}</span> finished runs</p>
-        {personal && <Link className="text-brand hover:underline" to="/runs/history?status=failed">Your failed runs →</Link>}
-      </div>
-      <div className="flex h-2 gap-0.5 overflow-hidden rounded" role="img" aria-label={"Finished runs: " + segments.map((s) => `${s.count} ${s.label}`).join(", ")}>
-        {segments.map((s) => (
-          <span key={s.label} className="block h-full" style={{ width: `${s.count / outcomes.finished * 100}%`, background: s.background }} />
-        ))}
-      </div>
-      <ul className="flex flex-wrap gap-x-3.5 gap-y-1 text-[11px] text-muted">
-        {segments.map((s) => (
-          <li key={s.label} className="inline-flex items-center gap-1.5">
-            <span aria-hidden="true" className="h-2 w-2 rounded-sm" style={{ background: s.background }} />
-            {s.label} <span className="tabular-nums text-fg">{s.count.toLocaleString("en-US")}</span>
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-}
-
-function TopCauses({ outcomes, personal }: { outcomes: RunOutcomes; personal: boolean }) {
-  const causes = Object.entries(outcomes.fail_origins)
-    .filter(([, count]) => count > 0)
-    .sort(([a, ac], [b, bc]) => bc - ac || a.localeCompare(b));
-  const hiddenCauses = Math.max(0, causes.length - 3);
-  if (outcomes.failed === 0 || causes.length === 0) return null;
-  return (
-    <p className="text-xs text-muted">
-      Top causes: {causes.slice(0, 3).map(([origin, count]) => `${stripUnsafeChars(failOriginLabel(origin))} ${count.toLocaleString("en-US")}`).join(" · ")}
-      {hiddenCauses > 0 && <>{" "}{personal ? <Link className="whitespace-nowrap text-brand hover:underline" to="/runs/history?status=failed">+{hiddenCauses} more</Link> : <span className="whitespace-nowrap">+{hiddenCauses} more</span>}</>}
-    </p>
-  );
-}
-
-function SinceLastFailedRun({ outcomes, owner }: { outcomes: RunOutcomes; owner?: string }) {
-  const now = useNow(30_000);
-  const value = failureRecency(outcomes, now);
-  const hasFailure = outcomes.last_failed_at != null && value !== "Unavailable";
-  const originLabel = stripUnsafeChars(failOriginLabel(outcomes.last_failed_origin ?? "unknown"));
-  const ownerLabel = owner ? stripUnsafeChars(owner) : undefined;
-  return (
-    <div className="min-w-0 border-t border-edge pt-3 text-xs text-muted">
-      {hasFailure ? (
-        <p className="flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-1">
-          <span className="shrink-0 text-fg">Latest failure <span className="font-mono tabular-nums">{value}</span> ago</span>
-          <span className="flex min-w-0 flex-1 basis-[120px] items-baseline gap-x-3">
-            <span className="min-w-0 truncate" title={originLabel}>{originLabel}</span>
-            {/* Owner shrinks to an ellipsis before the cause loses its space. */}
-            {ownerLabel && <span className="min-w-0 max-w-max grow shrink-0 basis-[1em] truncate" title={ownerLabel}>{ownerLabel}</span>}
-          </span>
-          <span className="shrink-0">{outcomes.completed_since_last_failure ?? 0} completed since</span>
-          {outcomes.last_failed_run_id && (
-            <Link className="shrink-0 whitespace-nowrap text-brand hover:underline" to={`/runs/${outcomes.last_failed_run_id}`}>run {outcomes.last_failed_run_id.slice(0, 8)} →</Link>
-          )}
-        </p>
-      ) : value === "Unavailable" ? (
-        <p>Latest failure: unavailable</p>
-      ) : (
-        <p className={outcomes.finished > 0 ? "text-ok" : "text-muted"}>
-          {outcomes.finished === 0 ? "No finished runs yet" : `No recorded failures · ${outcomes.completed} completed runs, none failed`}
-        </p>
-      )}
-    </div>
-  );
+  return <>{head} · {perPrText(count, cost, disclosure)}</>;
 }
 
 function UsageColumn({ usage, window, personal, runCountLine, owner, aligned = false }: {
@@ -190,9 +76,7 @@ function UsageColumn({ usage, window, personal, runCountLine, owner, aligned = f
   const disclosure = aggregateDisclosure(subscriptionCount, unreportedCount);
   const prText = prSummary(window === "lifetime" ? usage.lifetime_pr_count : usage.last7_pr_count, selected.cost, disclosure);
   const showRuns = window === "lifetime";
-  const delta = lifetime.finished > 0 && outcomes.finished > 0
-    ? (outcomes.failed / outcomes.finished - lifetime.failed / lifetime.finished) * 100 : null;
-  const deltaText = delta == null ? "" : `${delta < 0 ? "−" : delta > 0 ? "+" : ""}${Math.abs(delta).toFixed(1)} pp vs all-time ${failRate(lifetime)}`;
+  const deltaText = failRateDelta(outcomes, lifetime);
   return (
     <section aria-label={personal ? "Your usage" : "Factory usage"} className={cx("min-w-0 space-y-3", aligned && "md:row-span-[7] md:grid md:grid-rows-subgrid md:space-y-0", aligned && !personal && "border-t border-edge pt-5 md:border-t-0 md:border-l md:pl-6 md:pt-0")}>
       <div><h3 className="text-sm font-semibold text-fg">{personal ? "You" : "Factory · all users"}</h3></div>
@@ -206,7 +90,7 @@ function UsageColumn({ usage, window, personal, runCountLine, owner, aligned = f
           <div className="min-w-0">
             <h4 className="text-xs text-muted">Failed runs rate</h4>
             <p className="mt-1 whitespace-nowrap font-mono text-[22px] font-semibold lg:text-[26px] tabular-nums tracking-tight">{failRate(outcomes)}</p>
-            {window === "last_7_days" && delta !== null && <p className="mt-1 text-[11px] leading-relaxed text-muted">{deltaText}</p>}
+            {window === "last_7_days" && deltaText !== null && <p className="mt-1 text-[11px] leading-relaxed text-muted">{deltaText}</p>}
           </div>
           <div className="min-w-0">
             <h4 className="text-xs text-muted">Tokens</h4>
@@ -226,27 +110,6 @@ function UsageColumn({ usage, window, personal, runCountLine, owner, aligned = f
       <div>{(showRuns || prText != null) && <p className="text-[11px] text-muted">{showRuns && runCountLine}{showRuns && prText != null && " · "}{prText}</p>}</div>
       <div><SinceLastFailedRun outcomes={lifetime} owner={owner} /></div>
     </section>
-  );
-}
-
-function WindowToggle({ value, onChange }: { value: UsageWindow; onChange: (window: UsageWindow) => void }) {
-  return (
-    <div role="group" aria-label="Usage reporting period" className="ml-auto inline-flex shrink-0 rounded-full border border-edge bg-raised p-0.5">
-      {(["lifetime", "last_7_days"] as const).map((window) => (
-        <button
-          key={window}
-          type="button"
-          aria-pressed={value === window}
-          onClick={() => onChange(window)}
-          className={cx(
-            "min-h-11 rounded-full border px-2.5 text-xs focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring sm:min-h-8",
-            value === window ? "border-edge-strong bg-surface font-semibold text-fg shadow-sm" : "border-transparent font-normal text-muted hover:text-fg",
-          )}
-        >
-          {window === "lifetime" ? "All time" : "Last 7 days"}
-        </button>
-      ))}
-    </div>
   );
 }
 
@@ -280,79 +143,17 @@ export function UsageCard({ self, admin, window, onWindowChange }: {
   );
 }
 
-function Th({ children, left, title }: { children: ReactNode; left?: boolean; title?: string }) {
-  return (
-    <th
-      title={title}
-      className={
-        "border-b border-edge px-2.5 py-1.5 text-[10.5px] font-semibold uppercase tracking-[0.06em] text-faint " +
-        (left ? "text-left" : "text-right")
-      }
-    >
-      {children}
-    </th>
-  );
-}
-
-function Td({
-  children,
-  left,
-  total,
-  cost,
-  title,
-}: {
-  children?: ReactNode;
-  left?: boolean;
-  total?: boolean;
-  cost?: boolean;
-  title?: string;
-}) {
-  const cls = ["px-2.5 py-1.5"];
-  cls.push(left ? "text-left font-sans" : "text-right font-mono tabular-nums");
-  if (total) cls.push("font-semibold text-fg");
-  else cls.push(cost ? "text-brand" : left ? "text-fg" : "text-muted", "border-b border-edge/50");
-  return (
-    <td className={cls.join(" ")} title={title}>
-      {children}
-    </td>
-  );
-}
-
 function PerUserUsageTable({ admin, window }: { admin: AdminUsage; window: UsageWindow }) {
   const now = useNow(30_000);
   const demo = useDemoMode();
-  const recent = window === "last_7_days";
-  const available = admin.users.every((u) =>
-    u.last_7_days != null && u.last7_run_count != null && u.last7_outcomes != null &&
-    u.last7_subscription_run_count != null && u.last7_unreported_run_count != null,
-  );
-  if (recent && !available) {
+  const { available, rows, showPRs, factoryRuns, factoryPRs, factoryOutcomes, factory, factoryDisclosure } = perUserRows(admin, window);
+  if (window === "last_7_days" && !available) {
     return <p className="mt-2 text-sm text-muted">Seven-day per-user usage is unavailable. Upgrade the API to view this period.</p>;
   }
-  const factory = breakdown(admin.factory[window]);
-  const factoryOutcomes = admin.factory.outcomes[window];
-  const rows = admin.users.map((u) => ({
-    ...u,
-    b: breakdown(recent ? u.last_7_days! : u.usage),
-    selectedRuns: recent ? u.last7_run_count! : u.run_count,
-    selectedOutcomes: recent ? u.last7_outcomes! : u.outcomes,
-    subscription: recent ? u.last7_subscription_run_count! : u.subscription_run_count,
-    unreported: recent ? u.last7_unreported_run_count! : u.unreported_run_count,
-    selectedPRs: recent ? u.last7_pr_count : u.pr_count,
-  })).sort((a, b) => b.b.cost - a.b.cost || b.b.total - a.b.total || b.b.out - a.b.out ||
-    (a.user_id < b.user_id ? -1 : a.user_id > b.user_id ? 1 : 0));
-  // Issue #3686: render the PRs column only when every row reports the selected window's count.
-  const showPRs = rows.every((r) => r.selectedPRs != null);
-  const factoryPRs = rows.reduce((sum, r) => sum + (r.selectedPRs ?? 0), 0);
   const factoryMicroUSD = Math.round(factory.cost * 1e6);
   const shares = factoryMicroUSD > 0
     ? costShares(rows.map((r) => Math.round(r.b.cost * 1e6)), factoryMicroUSD)
     : undefined;
-  const factoryRuns = recent ? rows.reduce((sum, u) => sum + u.selectedRuns, 0) : admin.factory.run_count;
-  const factoryDisclosure = aggregateDisclosure(
-    recent ? admin.factory.last7_subscription_run_count : admin.factory.lifetime_subscription_run_count,
-    recent ? admin.factory.last7_unreported_run_count : admin.factory.lifetime_unreported_run_count,
-  );
   return (
     <>
       {rows.length === 0 ? (

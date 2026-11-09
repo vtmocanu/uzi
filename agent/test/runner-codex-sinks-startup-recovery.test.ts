@@ -661,9 +661,9 @@ describe("RunRunner M2 positive rejected startup acceptance", () => {
           firstReturned = true;
           assert.equal(injections, 1);
           transport!.assertClosed();
-          assert.deepEqual(events, scenario.target === "pack"
-            ? ["cleanup_held", "verified_rejection"]
-            : ["cleanup_held", "verified_rejection", "lock_release"]);
+          // Fresh remediation evidence adds a B-taking read after a rejected pack
+          // startup too. The release hook still proves cleanup joined first.
+          assert.deepEqual(events, ["cleanup_held", "verified_rejection", "lock_release"]);
           assert.equal(rig.registry.pendingLaunchCount(), 0);
           assert.equal(rig.registry.isPoisoned(), false);
           assert.equal(softFired, scenario.fire, "pending recovery does not depend on firing the soft callback");

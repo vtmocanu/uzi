@@ -1863,7 +1863,8 @@ describe("RunRunner — worker-shutdown fetch-back (PRD #218 M1)", () => {
           (s) => s.runId === claim.run_id && s.body.status === "completed",
         ),
         true,
-        "a natural completion during shutdown still completes (flag+throw is the discriminator)",
+        "a natural completion during shutdown still completes (flag+throw is the discriminator): " +
+          JSON.stringify(api.states.filter(s => s.runId === claim.run_id).map(s => ({ status: s.body.status, reason: s.body.failure_reason }))),
       );
       assert.strictEqual(
         api.states.some(

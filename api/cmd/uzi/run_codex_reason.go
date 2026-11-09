@@ -31,7 +31,7 @@ func codexSelectReasonText(reason codexselect.Reason) string {
 	case codexselect.ReasonPoolEmpty:
 		return "default (auto mode, but no login is pooled)"
 	case codexselect.ReasonAuto:
-		return "auto (most limit headroom)"
+		return "auto (picked from pool)"
 	case codexselect.ReasonBestOfPool:
 		return "auto (best of pool; every login was under the headroom floor)"
 	case codexselect.ReasonPoolStale:

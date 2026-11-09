@@ -1,4 +1,28 @@
-import type { FileFindingRequest, FindingGroupFileRequest } from "./apiTypes";
+import type { CrossCheckHistoryDTO, CrossCheckHistoryAvailabilityDTO, FileFindingRequest, FindingGroupFileRequest } from "./apiTypes";
+import crossHistoryFull from "../../../fixtures/api-contract/cross_check_history.full.json";
+import crossHistoryZero from "../../../fixtures/api-contract/cross_check_history.zero.json";
+import crossAvailabilityFull from "../../../fixtures/api-contract/cross_check_history_availability.full.json";
+import crossAvailabilityZero from "../../../fixtures/api-contract/cross_check_history_availability.zero.json";
+
+it("consumes cross-check history full and zero contracts", () => {
+  const full: CrossCheckHistoryDTO = crossHistoryFull;
+  const historyKeys: never = null as unknown as Exclude<keyof CrossCheckHistoryDTO, keyof typeof crossHistoryFull> | Exclude<keyof typeof crossHistoryFull, keyof CrossCheckHistoryDTO>;
+  type Group = CrossCheckHistoryDTO["groups"][number];
+  type RecordedGroup = typeof crossHistoryFull.groups[number];
+  const groupKeys: never = null as unknown as Exclude<keyof Group, keyof RecordedGroup> | Exclude<keyof RecordedGroup, keyof Group>;
+  type Attempt = Group["attempts"][number];
+  type RecordedAttempt = RecordedGroup["attempts"][number];
+  const attemptKeys: never = null as unknown as Exclude<keyof Attempt, keyof RecordedAttempt> | Exclude<keyof RecordedAttempt, keyof Attempt>;
+  const availabilityKeys: never = null as unknown as Exclude<keyof CrossCheckHistoryAvailabilityDTO, keyof typeof crossAvailabilityFull> | Exclude<keyof typeof crossAvailabilityFull, keyof CrossCheckHistoryAvailabilityDTO>;
+  void [historyKeys, groupKeys, attemptKeys, availabilityKeys];
+  const zero: Omit<CrossCheckHistoryDTO, "groups"> & { groups: CrossCheckHistoryDTO["groups"] | null } = crossHistoryZero;
+  const available: CrossCheckHistoryAvailabilityDTO = crossAvailabilityFull;
+  const empty: CrossCheckHistoryAvailabilityDTO = crossAvailabilityZero;
+  expect(full.groups[0].attempts[0].stage).toBe("x");
+  expect(zero.groups).toBeNull();
+  expect(available.available).toBe(true);
+  expect(empty.available).toBe(false);
+});
 import fileFindingRequestZero from "../../../fixtures/api-contract/file_finding_request.zero.json";
 import fileFindingRequestFull from "../../../fixtures/api-contract/file_finding_request.full.json";
 import findingGroupFileRequestZero from "../../../fixtures/api-contract/finding_group_file_request.zero.json";
@@ -32,6 +56,7 @@ import type {
   AdminUsage,
   SelfUsage,
   UserSettings,
+  CatalogDefault,
   CrossCheckPinDTO,
   CatalogEntry,
   AdminCliToken,
@@ -44,6 +69,10 @@ import type {
   SessionResponse,
   VaultStatus,
   VaultToggleResponse,
+  AccountResetLink,
+  ResetLinkPreview,
+  ResetLinkPreviewRequest,
+  ResetLinkRedeemRequest,
   AdminRateLimitUser,
   Branding,
   Chat,
@@ -60,6 +89,7 @@ import type {
   CIJob,
   CIStep,
   RecoveryArchive,
+  RecoveryPrerequisiteClosure,
   RecoveryArchiveSummary,
   RecoveryCustodyHold,
   RecoveryCustodyAggregate,
@@ -69,6 +99,17 @@ import type {
   GuardrailOverrideRequest,
   CodexAccountRateLimit,
   CodexAdminRateLimitRow,
+  EffectiveSettings,
+  EffectiveModelCell,
+  EffectiveEffortCell,
+  Credential,
+  HarnessValue,
+  ScheduleAlternative,
+  ScheduleSettingsPreview,
+  ScheduleSettingsPreviewRequest,
+  StartPreview,
+  StartPreviewAlternative,
+  StartPreviewRequest,
   HealthDoc,
   BuildInfo,
   ReleaseCheckStatus,
@@ -137,6 +178,16 @@ import runOutcomesZero from "../../../fixtures/api-contract/run_outcomes.zero.js
 import runOutcomesFull from "../../../fixtures/api-contract/run_outcomes.full.json";
 import userSettingsZero from "../../../fixtures/api-contract/user_settings.zero.json";
 import userSettingsFull from "../../../fixtures/api-contract/user_settings.full.json";
+import effectiveSettingsZero from "../../../fixtures/api-contract/effective_settings.zero.json";
+import effectiveSettingsFull from "../../../fixtures/api-contract/effective_settings.full.json";
+import startPreviewZero from "../../../fixtures/api-contract/effective_settings_start_preview.zero.json";
+import startPreviewFull from "../../../fixtures/api-contract/effective_settings_start_preview.full.json";
+import schedulePreviewZero from "../../../fixtures/api-contract/effective_settings_schedule_preview.zero.json";
+import schedulePreviewFull from "../../../fixtures/api-contract/effective_settings_schedule_preview.full.json";
+import schedulePreviewRequestZero from "../../../fixtures/api-contract/effective_settings_schedule_preview_request.zero.json";
+import schedulePreviewRequestFull from "../../../fixtures/api-contract/effective_settings_schedule_preview_request.full.json";
+import startPreviewRequestZero from "../../../fixtures/api-contract/effective_settings_start_preview_request.zero.json";
+import startPreviewRequestFull from "../../../fixtures/api-contract/effective_settings_start_preview_request.full.json";
 import settingsUserSettingsFull from "../../../fixtures/api-contract/settings_user_settings.full.json";
 import settingsUserSettingsZero from "../../../fixtures/api-contract/settings_user_settings.zero.json";
 import catalogEntryZero from "../../../fixtures/api-contract/catalog_entry.zero.json";
@@ -182,6 +233,8 @@ import ciJobZero from "../../../fixtures/api-contract/ci_job.zero.json";
 import ciJobFull from "../../../fixtures/api-contract/ci_job.full.json";
 import ciStepZero from "../../../fixtures/api-contract/ci_step.zero.json";
 import ciStepFull from "../../../fixtures/api-contract/ci_step.full.json";
+import recoveryPrerequisiteClosureZero from "../../../fixtures/api-contract/recovery_prerequisite_closure.zero.json";
+import recoveryPrerequisiteClosureFull from "../../../fixtures/api-contract/recovery_prerequisite_closure.full.json";
 import recoveryArchiveZero from "../../../fixtures/api-contract/recovery_archive.zero.json";
 import recoveryArchiveFull from "../../../fixtures/api-contract/recovery_archive.full.json";
 import recoveryArchiveSummaryZero from "../../../fixtures/api-contract/recovery_archive_summary.zero.json";
@@ -204,6 +257,14 @@ import vaultStatusZero from "../../../fixtures/api-contract/vault_status.zero.js
 import vaultStatusFull from "../../../fixtures/api-contract/vault_status.full.json";
 import vaultToggleZero from "../../../fixtures/api-contract/vault_toggle.zero.json";
 import vaultToggleFull from "../../../fixtures/api-contract/vault_toggle.full.json";
+import accountResetLinkZero from "../../../fixtures/api-contract/account_reset_link.zero.json";
+import accountResetLinkFull from "../../../fixtures/api-contract/account_reset_link.full.json";
+import resetLinkPreviewZero from "../../../fixtures/api-contract/reset_link_preview.zero.json";
+import resetLinkPreviewFull from "../../../fixtures/api-contract/reset_link_preview.full.json";
+import resetLinkPreviewRequestZero from "../../../fixtures/api-contract/reset_link_preview_request.zero.json";
+import resetLinkPreviewRequestFull from "../../../fixtures/api-contract/reset_link_preview_request.full.json";
+import resetLinkRedeemRequestZero from "../../../fixtures/api-contract/reset_link_redeem_request.zero.json";
+import resetLinkRedeemRequestFull from "../../../fixtures/api-contract/reset_link_redeem_request.full.json";
 import anthropicAdminRateLimitRowZero from "../../../fixtures/api-contract/anthropic_admin_rate_limit_row.zero.json";
 import anthropicAdminRateLimitRowFull from "../../../fixtures/api-contract/anthropic_admin_rate_limit_row.full.json";
 import codexAdminRateLimitRowZero from "../../../fixtures/api-contract/codex_admin_rate_limit_row.zero.json";
@@ -376,8 +437,8 @@ void _releaseCheckStatusFull;
 
 // ── RunListItem ─────────────────────────────────────────────────────────────
 // RunListItem extends Run, so its extra keys inherit the same drift fields; its
-// own fields (repo_path, worker_name, owner_email, judge_verdict, judge_todo_count)
-// match. Same six ZeroOf exemptions, inherited from Run.
+// own fields (repo_path, worker_name, owner_email, judge_verdict, judge_todo_count,
+// cross_check_active) match. Same six ZeroOf exemptions, inherited from Run.
 {
   const _runListItemMissing: never = null as unknown as Exclude<keyof RunListItem, keyof typeof runListItemFull>;
   const _runListItemExtra: never = null as unknown as Exclude<keyof typeof runListItemFull, keyof RunListItem>;
@@ -826,14 +887,14 @@ void _releaseCheckStatusFull;
 // ZeroOf exemption: sidebar_token_ids and sidebar_codex_account_ids — the handler mapper
 // runs uuidStrings on both, which returns a non-nil [] (handler/user_settings.go), so the
 // wire is [] though the nil-slice zero marshals null. Every other field is typed X|null in
-// TS. cross_check_pins, judge_models and effort_settings also exempt the Go nil-slice zero; GET always emits their cells.
+// TS. cross_check_pins, judge_models, summary_models and effort_settings also exempt the Go nil-slice zero; GET always emits their cells.
 {
   const _userSettingsMissing: never = null as unknown as Exclude<keyof UserSettings, keyof typeof userSettingsFull>;
   const _userSettingsExtra: never = null as unknown as Exclude<keyof typeof userSettingsFull, keyof UserSettings>;
-  const _userSettingsZero: ZeroOf<UserSettings, "sidebar_token_ids" | "sidebar_codex_account_ids" | "cross_check_pins" | "judge_models" | "effort_settings"> = userSettingsZero;
+  const _userSettingsZero: ZeroOf<UserSettings, "sidebar_token_ids" | "sidebar_codex_account_ids" | "cross_check_pins" | "judge_models" | "summary_models" | "effort_settings"> = userSettingsZero;
   const _userSettingsFull: Widen<UserSettings> = userSettingsFull;
   const _settingsUserFull: Widen<UserSettings> = settingsUserSettingsFull;
-  const _settingsUserZero: ZeroOf<UserSettings, "sidebar_token_ids" | "sidebar_codex_account_ids" | "cross_check_pins" | "judge_models" | "effort_settings"> = settingsUserSettingsZero;
+  const _settingsUserZero: ZeroOf<UserSettings, "sidebar_token_ids" | "sidebar_codex_account_ids" | "cross_check_pins" | "judge_models" | "summary_models" | "effort_settings"> = settingsUserSettingsZero;
   void _settingsUserFull;
   void _settingsUserZero;
   void _userSettingsMissing;
@@ -841,6 +902,83 @@ void _releaseCheckStatusFull;
   void _userSettingsZero;
   void _userSettingsFull;
 }
+
+// ── Effective settings (PRD #3254 M2) ───────────────────────────────────────
+// ZeroOf exemptions: the four top-level slices and the two cross_check slices are Go nil-slices
+// whose zero marshals null (GET always emits them). The start-preview response omits
+// `alternatives` when empty (omitempty), so its zero fixture simply lacks the key.
+{
+  type SettingsZero = Omit<ZeroOf<EffectiveSettings, "harnesses" | "start" | "models" | "efforts">, "cross_check"> & {
+    cross_check: { models: EffectiveModelCell[] | null; efforts: EffectiveEffortCell[] | null };
+  };
+  const zero: SettingsZero = effectiveSettingsZero;
+  const full: Widen<EffectiveSettings> = effectiveSettingsFull;
+  // A mismatch in either direction makes the call's argument type `false`, which fails to compile.
+  const keysOf = <A, B>(_same: [Exclude<keyof A, keyof B> | Exclude<keyof B, keyof A>] extends [never] ? true : false): true => true;
+  type Fixture = typeof effectiveSettingsFull;
+  const checks = [
+    keysOf<EffectiveSettings, Fixture>(true),
+    keysOf<EffectiveSettings["cross_check"], Fixture["cross_check"]>(true),
+    keysOf<EffectiveSettings["harnesses"][number], Fixture["harnesses"][number]>(true),
+    keysOf<EffectiveSettings["start"][number], Fixture["start"][number]>(true),
+    keysOf<HarnessValue, Fixture["start"][number]["harness"]>(true),
+    keysOf<Credential, Fixture["harnesses"][number]["credential"]>(true),
+    keysOf<EffectiveModelCell, Fixture["models"][number]>(true),
+    keysOf<NonNullable<EffectiveModelCell["ignored"]>, Fixture["models"][number]["ignored"]>(true),
+    keysOf<EffectiveEffortCell, Fixture["efforts"][number]>(true),
+    keysOf<EffectiveModelCell, Fixture["cross_check"]["models"][number]>(true),
+    keysOf<EffectiveEffortCell, Fixture["cross_check"]["efforts"][number]>(true),
+  ];
+  type PreviewZero = ZeroOf<StartPreview>;
+  const previewZero: PreviewZero = startPreviewZero;
+  const previewFull: Widen<StartPreview> = startPreviewFull;
+  const previewChecks = [
+    keysOf<StartPreview, typeof startPreviewFull>(true),
+    keysOf<StartPreviewAlternative, typeof startPreviewFull.alternatives[number]>(true),
+    keysOf<StartPreviewRequest, typeof startPreviewRequestFull>(true),
+    keysOf<NonNullable<StartPreviewRequest["credential_override"]>, typeof startPreviewRequestFull.credential_override>(true),
+  ];
+  const requestZero: ZeroOf<StartPreviewRequest> = startPreviewRequestZero;
+  const requestFull: Widen<StartPreviewRequest> = startPreviewRequestFull;
+  void [zero, full, checks, previewZero, previewFull, previewChecks, requestZero, requestFull];
+}
+// PRD #3254 M3: the schedule preview. Its zero fixture has a null `notes` (a Go nil slice that
+// the handler always fills) and omits `alternatives` (omitempty). The request has no zero-null
+// member: every field is omitted when unset, so its zero is `{}`. The refused-branch shape (null
+// worker_model, worker_effort, credential and subagents plus a refusal) is covered by the
+// `ScheduleAlternative` assignment below, since the full fixture's alternative is the valid shape.
+{
+  const scheduleZero: ZeroOf<ScheduleSettingsPreview, "notes"> = schedulePreviewZero;
+  const scheduleFull: Widen<ScheduleSettingsPreview> = schedulePreviewFull;
+  const keysOf = <A, B>(_same: [Exclude<keyof A, keyof B> | Exclude<keyof B, keyof A>] extends [never] ? true : false): true => true;
+  type Full = typeof schedulePreviewFull;
+  const scheduleChecks = [
+    keysOf<ScheduleSettingsPreview, Full>(true),
+    keysOf<ScheduleAlternative, Full["alternatives"][number]>(true),
+    keysOf<NonNullable<ScheduleSettingsPreview["subagents"]>, Full["subagents"]>(true),
+    keysOf<NonNullable<ScheduleSettingsPreview["subagents"]>["pinned"][number], Full["subagents"]["pinned"][number]>(true),
+    keysOf<EffectiveModelCell, Full["worker_model"]>(true),
+    keysOf<EffectiveEffortCell, Full["worker_effort"]>(true),
+    keysOf<ScheduleSettingsPreviewRequest, typeof schedulePreviewRequestFull>(true),
+    keysOf<NonNullable<ScheduleSettingsPreviewRequest["credential_override"]>, typeof schedulePreviewRequestFull.credential_override>(true),
+  ];
+  const scheduleRequestFull: Widen<ScheduleSettingsPreviewRequest> = schedulePreviewRequestFull;
+  const scheduleRequestZero: ScheduleSettingsPreviewRequest = schedulePreviewRequestZero;
+  const refusedBranch: ScheduleAlternative = {
+    harness: "codex", worker_model: null, worker_effort: null, credential: null, subagents: null,
+    refusal: "codex_override_conflict", refusal_detail: null,
+  };
+  void [scheduleZero, scheduleFull, scheduleChecks, scheduleRequestFull, scheduleRequestZero, refusedBranch];
+}
+it("effective-settings zero fixtures carry null slices and the alternatives omission", () => {
+  expect(effectiveSettingsZero.harnesses).toBeNull();
+  expect(effectiveSettingsZero.cross_check.models).toBeNull();
+  expect(startPreviewZero).not.toHaveProperty("alternatives");
+  expect(startPreviewFull.alternatives[0].refusal).toBe("x");
+  expect(schedulePreviewZero.notes).toBeNull();
+  expect(schedulePreviewZero).not.toHaveProperty("alternatives");
+  expect(schedulePreviewRequestZero).toEqual({});
+});
 
 // Nested members must match the Go recorder, including required nullable metadata.
 {
@@ -852,6 +990,19 @@ void _releaseCheckStatusFull;
   const absent: CrossCheckPinDTO = { stage: "plan", harness: "claude", model: null, effort: null, resolved_model: null, resolved_effort: "medium", model_source: "worker default", effort_source: "worker default", active: false };
   void missing; void extra; void nullable; void absent;
 }
+// Issue #3251: the Codex effort cell's catalog_default matches the Go recorder member for member.
+{
+  type RecordedCatalog = Extract<typeof userSettingsFull.effort_settings[number], { catalog_default: unknown }>["catalog_default"];
+  const missing: never = null as unknown as Exclude<keyof CatalogDefault, keyof RecordedCatalog>;
+  const extra: never = null as unknown as Exclude<keyof RecordedCatalog, keyof CatalogDefault>;
+  void missing; void extra;
+}
+it("recorded full effort cell carries the catalog_default object", () => {
+  for (const fixture of [userSettingsFull, settingsUserSettingsFull]) {
+    expect(Object.keys(fixture.effort_settings[0].catalog_default).sort()).toEqual(
+      ["effort", "model", "observed_at", "runtime_version", "state"]);
+  }
+});
 it("recorded nested checker metadata always has the nullable member", () => {
   expect(metadataCorpus.some(c => c.get_cross_check_pins.some(p => p.worker_default_model === null))).toBe(true);
   for (const fixture of [userSettingsFull, settingsUserSettingsFull, ...metadataCorpus.map(c => ({ cross_check_pins: c.get_cross_check_pins }))]) {
@@ -921,6 +1072,35 @@ it("recorded nested checker metadata always has the nullable member", () => {
   const extra: never = null as unknown as Exclude<keyof typeof vaultToggleFull, keyof VaultToggleResponse>;
   const zero: ZeroOf<VaultToggleResponse> = vaultToggleZero;
   const full: Widen<VaultToggleResponse> = vaultToggleFull;
+  void missing; void extra; void zero; void full;
+}
+// PRD #3989: the account reset link issue response, preview response and both request bodies.
+{
+  const missing: never = null as unknown as Exclude<keyof AccountResetLink, keyof typeof accountResetLinkFull>;
+  const extra: never = null as unknown as Exclude<keyof typeof accountResetLinkFull, keyof AccountResetLink>;
+  const zero: ZeroOf<AccountResetLink> = accountResetLinkZero;
+  const full: Widen<AccountResetLink> = accountResetLinkFull;
+  void missing; void extra; void zero; void full;
+}
+{
+  const missing: never = null as unknown as Exclude<keyof ResetLinkPreview, keyof typeof resetLinkPreviewFull>;
+  const extra: never = null as unknown as Exclude<keyof typeof resetLinkPreviewFull, keyof ResetLinkPreview>;
+  const zero: ZeroOf<ResetLinkPreview> = resetLinkPreviewZero;
+  const full: Widen<ResetLinkPreview> = resetLinkPreviewFull;
+  void missing; void extra; void zero; void full;
+}
+{
+  const missing: never = null as unknown as Exclude<keyof ResetLinkPreviewRequest, keyof typeof resetLinkPreviewRequestFull>;
+  const extra: never = null as unknown as Exclude<keyof typeof resetLinkPreviewRequestFull, keyof ResetLinkPreviewRequest>;
+  const zero: ZeroOf<ResetLinkPreviewRequest> = resetLinkPreviewRequestZero;
+  const full: Widen<ResetLinkPreviewRequest> = resetLinkPreviewRequestFull;
+  void missing; void extra; void zero; void full;
+}
+{
+  const missing: never = null as unknown as Exclude<keyof ResetLinkRedeemRequest, keyof typeof resetLinkRedeemRequestFull>;
+  const extra: never = null as unknown as Exclude<keyof typeof resetLinkRedeemRequestFull, keyof ResetLinkRedeemRequest>;
+  const zero: ZeroOf<ResetLinkRedeemRequest> = resetLinkRedeemRequestZero;
+  const full: Widen<ResetLinkRedeemRequest> = resetLinkRedeemRequestFull;
   void missing; void extra; void zero; void full;
 }
 {
@@ -1304,6 +1484,14 @@ it("recorded nested checker metadata always has the nullable member", () => {
   void _ciStepFull;
 }
 
+{
+  const missing: never = null as unknown as Exclude<keyof RecoveryPrerequisiteClosure, keyof typeof recoveryPrerequisiteClosureFull>;
+  const extra: never = null as unknown as Exclude<keyof typeof recoveryPrerequisiteClosureFull, keyof RecoveryPrerequisiteClosure>;
+  const zero: ZeroOf<RecoveryPrerequisiteClosure> = recoveryPrerequisiteClosureZero;
+  const full: Widen<RecoveryPrerequisiteClosure> = recoveryPrerequisiteClosureFull;
+  void missing; void extra; void zero; void full;
+}
+
 // ── RecoveryArchive (PRD #1296 M1) ──────────────────────────────────────────
 // All optional fields are omitempty, so the zero.json carries no null (declared
 // nullable:false below) — the finding shape.
@@ -1668,6 +1856,13 @@ const dtos: { stem: string; nullable: boolean }[] = [
   { stem: "admin_user_usage", nullable: true },
   { stem: "admin_usage", nullable: true },
   { stem: "user_settings", nullable: true },
+  // PRD #3254 M2: all three carry nulls in zero.json (nil slices, nil pointers).
+  { stem: "effective_settings", nullable: true },
+  { stem: "effective_settings_start_preview", nullable: true },
+  { stem: "effective_settings_start_preview_request", nullable: true },
+  // PRD #3254 M3: the schedule preview's zero carries nulls; its request zero is `{}` (all omitempty).
+  { stem: "effective_settings_schedule_preview", nullable: true },
+  { stem: "effective_settings_schedule_preview_request", nullable: false },
   { stem: "catalog_entry", nullable: true },
   { stem: "cli_token", nullable: true },
   // M3 — the handler-package hot set.
@@ -1710,6 +1905,7 @@ const dtos: { stem: string; nullable: boolean }[] = [
   // PRD #1296 M1: recovery_archive is all-omitempty optionals, so its zero.json carries no
   // null (the finding shape). recovery_archive_summary's archives slice is non-omitempty,
   // so its zero.json carries a null the M2 mapper normalizes to [].
+  { stem: "recovery_prerequisite_closure", nullable: false },
   { stem: "recovery_archive", nullable: false },
   { stem: "recovery_archive_summary", nullable: true },
   // PRD #1349 M1: the owner-facing custody-hold DTOs. recovery_custody_hold's only nullable
@@ -1759,7 +1955,28 @@ const dtos: { stem: string; nullable: boolean }[] = [
   // PRD #1909 M6: applied_at/applied_by/staged are present-as-null and applied.skills is a
   // nil-slice null in zero.json.
   { stem: "product_skills", nullable: true },
+  // PRD #3989: the reset link DTOs are all-scalar, so no zero.json carries a null.
+  { stem: "account_reset_link", nullable: false },
+  { stem: "reset_link_preview", nullable: false },
+  { stem: "reset_link_preview_request", nullable: false },
+  { stem: "reset_link_redeem_request", nullable: false },
 ];
+
+describe("account reset link contract (PRD #3989)", () => {
+  it("pins the issue and preview key sets", () => {
+    expect(Object.keys(accountResetLinkFull).sort()).toEqual(["expires_at", "kind", "target_is_admin", "token"]);
+    expect(Object.keys(accountResetLinkZero).sort()).toEqual(Object.keys(accountResetLinkFull).sort());
+    expect(Object.keys(resetLinkPreviewFull).sort()).toEqual(["expires_at", "kind"]);
+    expect(Object.keys(resetLinkPreviewZero).sort()).toEqual(["expires_at", "kind"]);
+  });
+
+  it("carries the token in the request bodies and omits an unset redeem password", () => {
+    expect(resetLinkPreviewRequestFull).toEqual({ token: "x" });
+    expect(resetLinkRedeemRequestFull).toEqual({ token: "x", password: "x" });
+    // vault_only redemption sends no password: the zero value omits the key entirely.
+    expect(resetLinkRedeemRequestZero).toEqual({ token: "" });
+  });
+});
 
 describe("vault lifecycle contract fixtures", () => {
   it("pins the session envelope and nested public metadata keys", () => {
@@ -1955,4 +2172,46 @@ it("records base divergence separately and carries the nullable board origin", (
   expect(cardFull.latest_run).toHaveProperty("fail_origin");
   const nullableOrigin: LatestRun["fail_origin"] = null;
   expect(nullableOrigin).toBeNull();
+});
+
+
+describe("harness overflow shared DTO contract", () => {
+  it("requires the saved boolean in both settings DTOs", () => {
+    for (const settings of [userSettingsZero, settingsUserSettingsZero]) expect(settings.harness_overflow_enabled).toBe(false);
+    for (const settings of [userSettingsFull, settingsUserSettingsFull]) expect(settings.harness_overflow_enabled).toBe(true);
+  });
+  it("preserves nullable stored decisions on detail, list and summary DTOs", () => {
+    for (const run of [runZero, runListItemZero, runSummaryItemZero]) expect(run.harness_decision).toBeNull();
+    for (const run of [runFull, runListItemFull, runSummaryItemFull]) {
+      const decision: NonNullable<Run["harness_decision"]> = run.harness_decision;
+      expect(Object.keys(decision).sort()).toEqual([
+        "preferred", "chosen", "reason", "preferred_score", "other_score",
+        "preferred_measured", "other_measured", "preferred_held", "other_held",
+        "preferred_weekly_reset_at", "other_weekly_reset_at",
+      ].sort());
+      for (const key of ["preferred_weekly_reset_at", "other_weekly_reset_at"] as const) expect(typeof decision[key]).toBe("string");
+      for (const key of ["preferred_score", "other_score", "preferred_measured", "other_measured"] as const) expect(typeof decision[key]).toBe("number");
+      expect(typeof decision.preferred_held).toBe("boolean");
+      expect(typeof decision.other_held).toBe("boolean");
+    }
+    const unknown: NonNullable<Run["harness_decision"]> = {
+      preferred: "claude", chosen: "claude", reason: "unknown_usage",
+      preferred_score: null, other_score: null, preferred_measured: null, other_measured: null,
+      preferred_held: false, other_held: false,
+      preferred_weekly_reset_at: null, other_weekly_reset_at: null,
+    };
+    expect(unknown.preferred_score).toBeNull();
+  });
+});
+
+
+it("created issues are optional detail metadata and excluded from summaries", () => {
+  expect(runZero).not.toHaveProperty("created_issues");
+  expect(runListItemZero).not.toHaveProperty("created_issues");
+  expect(runFull.created_issues).toEqual([{ iid: 1, title: "x", web_url: "x" }]);
+  expect(runSummaryItemFull).not.toHaveProperty("created_issues");
+  const coordinate: NonNullable<Run["created_issues"]>[number] = { iid: 42, title: "Created issue", web_url: "" };
+  expect(coordinate.web_url).toBe("");
+  const excluded: never = null as unknown as Extract<keyof RunSummaryItem, "created_issues">;
+  void excluded;
 });

@@ -1,7 +1,7 @@
 # PRD #2506 (option A): a pinned prerequisite closure lets a thin guarded capture release custody
 
 **Issue:** #2506 (option A only). Delivery under this PRD is **non-closing**: every PR uses `Refs #2506` and closes only its own child issue. #2506 stays open until the whole acceptance below is met. Option D shipped separately (ADR-2506) and does not complete this.
-**Current execution (2026-11-01):** C2 (#3727) is implemented on branch `agent/issue-3727` in four milestones (M1 schema, M2 API release, M3 worker mint, M4 advertisement and combined proof) and M5 documentation; its landing, exact-head CI and the full store-it sweep are pending, so nothing here claims C2 shipped (see the [C2 execution record](#c2-execution-record-2026-11-01-3727)). C1a and C1b source are merged. C1b landed in [PR #3655](https://github.com/vtmocanu/uzi/pull/3655) as `b6fab6b7`, with migration 00387; exact-head hosted checks and timing were collected before merge. The local handoff records below remain historical evidence, not the current hosted-gate status. C1b itself added no thin FINAL release, feature advertisement or agent change; C2 adds them on its branch. C3, E5 and parent acceptance remain open; E6 is post-roll reporting only. M6 operator observation is not claimed performed. See [current execution and checkbox disposition](#c1b-current-execution-2026-10-29-child-3591).
+**Current execution (2026-11-02):** C1a [#3601](https://github.com/vtmocanu/uzi/pull/3601), C1b [#3655](https://github.com/vtmocanu/uzi/pull/3655), C2 [#3748](https://github.com/vtmocanu/uzi/pull/3748) and C3 [#3778](https://github.com/vtmocanu/uzi/pull/3778) are merged, with exact-head child CI/lander acceptance recorded below. E5 is the scoped local full-history measurement, not a production release. The first two [parent goals](#acceptance-assessment-after-the-child-merges-2026-11-02) are met by the #3803 combined large-history release/native-prune/restore proof (landed in [#3821](https://github.com/vtmocanu/uzi/pull/3821); see "#3803 landing"). E6 remains two weeks of hosted post-roll reporting only; no release or operator observation is claimed or authorized by this update. The parent stays active and non-closing. Earlier worker-handoff records remain historical, not the current landing status.
 
 **Historical design status:** DRAFT, revision 18 (2026-10-28), approved C1a/C1b split and review folds, pending exact-text final review. C1a and C1b are API-only; no filing or dispatch follows from this draft. Based on the exact revision-11 artifact (SHA256 `2205e1146950263b2aa90f35863cadec3f3debfbd350590b9e65bd560a9640ec`, whose header still said revision 10). The earlier paired architecture reviews and owner decisions remain the design history; this new evidence fold requires recov6 review and is not filing, dispatch or implementation approval. **E2 ran on GitHub on 2026-10-27 and returned FINDING (one measured workflow-scope refusal, zero probe malfunctions), conclusive for the tested production credential class.** The anchor strategy is feasible in that tested case; other forges and protected/ruleset configurations remain unverified. Existing source line anchors are historical at `91647464c02bd12ae30d4fce6aa656f2245e88e1`, not refreshed line numbers for current main. The new E2 section states the exact observed scope and remaining gates.
 **Priority:** High (inherits #2506). The independent architecture review CLAUDE.md requires for priority::high applies to this PRD and to each child before dispatch; no waiver. M0 is evidence-only and is never auto-dispatched.
@@ -56,10 +56,35 @@ Producer records (#3031) are not on main as a freeze path, but their identity cl
 
 ## Goal and acceptance (from #2506, qualified)
 
-- [ ] A thin guarded capture on a large-history repository reaches released custody without owner action, with prerequisite-lifetime evidence and native-Git restore **demonstrated by tests** (P1 replaces the issue's per-release restore verification with the trust contract plus tests; see "Trust contract"). If preservation cannot be shown, custody is retained with a specific typed refusal.
-- [ ] After a force-push that prunes the cached prerequisites, a released archive still imports into a clean clone plus a fetch of its pin ref, or release was refused. **Qualified:** this holds against default-branch rewrites and uzi's own writers; deletion of `refs/uzi-prereq/*` or rewriting of that history by a party outside uzi **after** a closure release is an accepted preservation residual (user decision 2026-10-25), following ADR-1296's existing "Later user deletion or rewriting is outside the proof" (`adr/1296-durable-run-recovery.md`, ~589-590).
-- [ ] No runner-clone or agent-writable ref is used as a prerequisite or as release evidence.
-- [ ] Records produced by each real freeze path have a stated and tested outcome; no record gains held-publication authority; no binding or policy is reconstructed; the v2 refusal is unchanged; producer-origin records never mint a closure FINAL.
+- [x] A thin guarded capture on a large-history repository reaches released custody without owner action, with prerequisite-lifetime evidence and native-Git restore **demonstrated by tests** (P1 replaces the issue's per-release restore verification with the trust contract plus tests; see "Trust contract"). If preservation cannot be shown, custody is retained with a specific typed refusal. Demonstrated by #3803 (see "#3803 landing" below).
+- [x] After a force-push that prunes the cached prerequisites, a released archive still imports into a clean clone plus a fetch of its pin ref, or release was refused. **Qualified:** this holds against default-branch rewrites and uzi's own writers; deletion of `refs/uzi-prereq/*` or rewriting of that history by a party outside uzi **after** a closure release is an accepted preservation residual (user decision 2026-10-25), following ADR-1296's existing "Later user deletion or rewriting is outside the proof" (`adr/1296-durable-run-recovery.md`, ~589-590). Demonstrated by #3803 (see "#3803 landing" below).
+- [x] No runner-clone or agent-writable ref is used as a prerequisite or as release evidence.
+- [x] Records produced by each real freeze path have a stated and tested outcome; no record gains held-publication authority; no binding or policy is reconstructed; the v2 refusal is unchanged; producer-origin records never mint a closure FINAL.
+
+### Acceptance assessment after the child merges (2026-11-02)
+
+**Historical for goals 1 and 2:** the two **Open** rows and the remaining-work paragraph below are the pre-#3803 assessment, superseded by "#3803 landing" below. The other rows, E6 and the release limits stand.
+
+Reviewed against main `6d6e86bb2f9e275772bc3241fddb0c2a51a9cfd5`.
+All four implementation children are merged. This does not establish the two
+combined parent restore goals or a hosted rollout observation.
+
+| Goal above | Assessment and evidence |
+|---|---|
+| Thin capture on large history reaches released custody, with lifetime and native restore proof | **Open.** C2's `TestPrerequisiteClosureReleaseE2E` composes the real worker client, authenticated API and PostgreSQL, but its forge/listing is synthetic. C3's full-history `TestRecoveryRestoreWorkflowLiveDB/E5FullHistory` measures native pinning, actual prune, export and import on 2,405 input commits, but does not send FINAL. Neither result alone demonstrates the required combined large-history release/restore workflow. The typed refusal branches are covered by the C2 FINAL LiveDB tests. Do not infer this goal from two separate successful fixtures. |
+| Released archive imports after force-push/prune, or release refuses | **Open.** `TestHandlerPrerequisiteFinalPositiveLiveDB` covers source-branch replacement through a synthetic Git listing; it does not run native pruning/import. C3 E5 and `TestPrerequisiteNativeSweepRestoresAfterDefaultRewrite` cover native restore, but not release of that capture. `TestPrerequisiteNativeSweepRefusesRewriteBeforePreparation` covers the before-pin refusal direction. A single native release/prune/import proof remains unrecorded; external deletion of the pin remains the accepted residual. |
+| No runner-clone or agent-writable ref supplies prerequisite/release evidence | **Met at the implementation/test boundary.** `api/internal/pushbroker/prerequisite.go:PreparePrereqCreate` resolves the configured forge default branch; `api/internal/workersvc/prerequisite_closure.go` proves every declared ancestor against that advertised tip. `TestPrerequisiteEveryDeclaredAncestor`, the native rewrite/refusal controls and the FINAL absent/foreign/listing-failure tests discriminate the evidence boundary. FINAL uses the fixed capture pin and a fresh broker listing, not a runner ref. |
+| Freeze-path authority and refusal behavior | **Met at the implementation/test boundary.** The real freeze/downstream runner controls (`#3561 runner` cases in `agent/test/recovery-inventory.test.ts`), C2's mint-grant matrix, retained-claim composed/execution/uncertain-create controls and `mint requirement 3, local origin` cases exercise the path and grant boundaries. Existing boot/origin controls in `agent/test/recovery-origin-routing.test.ts` retain producer identity and refuse reconstruction over unfinished producers. C2's full agent suite passed at its final head. These tests do not claim live-provider reproduction of every path or #2969's separate window integration. |
+
+The authority assessment concerns reconstruction of open held-publication
+binding/policy. The later, separately accepted #3105 change can learn an
+already-closed identity plus settlement for refusal only; it synthesizes no
+`heldPolicy`, open publication grant or producer closure FINAL. It does not
+complete either open combined restore goal above.
+
+The remaining work is not solely E6: the two combined parent test goals above
+must also be verified before claiming parent acceptance. E6 remains reporting
+only, and a release and hosted post-roll observation remain owner decisions.
 - Option C is not an accepted completion outcome. Option D does not complete this.
 - The capture stays credential-free on the worker and keeps covering every owed root.
 
@@ -465,7 +490,7 @@ retention obey these same boundaries. C1a is unaffected by this clarification.
 
 ### Security and data
 
-- A history purge is defeated while a pin anchors pre-purge history; `docs/run-recovery.md` must say a purge also deletes `refs/uzi-*` refs; owner early expiry triggers S7.
+- Pins can keep pre-purge history reachable under `refs/uzi-*`, independently of the external deletion/rewrite restore residual. The run-recovery guide records this limitation without a purge recipe: O10/S7 automatic cleanup follows expiry/discard, expected-tip CAS and confirmed absence; unknown creates and cleanup exhaustion retain blockers.
 - Pins point only at default-branch commits and publish no run content. No new worker credential, endpoint or authority; the four guardrail layers unchanged.
 
 ### Out of scope
@@ -479,7 +504,7 @@ Changing held ordering; deleting pins when another route settles the hold (pins 
 | E1 | Population | done (zero verified standalone A1); user: Proceed | done |
 | E2 | Maintainer-only same-scope/same-role probe; actual production go-git helpers plus native supplement; current-tip and old-tip workflow-tree cases. | **GitHub FINDING, 2026-10-27:** compatible anchor succeeded; differing-workflow old tip refused; same-tree old tips succeeded; zero malfunctions. Other forges/configurations unverified. | evidence fold review and final architecture disposition before filing |
 | E4 | Per-capture prerequisites, guarded manifest-bound thin population, 2026-10-24 snapshot | 386 captures / 257 holds; min 1, median 1, nearest-rank p90 6, p99 16, max 16; 204 expired and 182 available (available p90 8). Source SHA256 349a1c59e4b1eac90c26b63178a73651c1bb2a79fa58ec7725d91708854747b5. Independent local recomputation; no fresh DB query. Not a latency measurement. | reported before C1b dispatch; retain max-64 tests |
-| E5 | Owner restore time on this repository | open | C3 acceptance |
+| E5 | Owner restore time on this repository | [measured locally](#c3-local-e5-measurement-2026-11-01-3728); C3 landing complete | done for C3; does not demonstrate a FINAL or hosted rollout |
 | E6 | Two weeks hosted after the roll: releases, refusals per reason, live pins, unresolved and cleanup-exhausted rows | open | post-acceptance |
 
 ## Child issues (after architecture approval only)
@@ -511,9 +536,9 @@ M1 is committed at `991df8b3a26027ffd162e45cadb3cd8da347d1b6`, based on `2085c75
 - [x] C1a ready-query and UPDATE entry guard implemented, with generated query mirror and three fixture repairs.
 - [x] C1a focused baseline red/candidate green, independent query/trigger mutations, and migration round trip observed as below.
 - [x] C1a reviewer, auditor and DBA review of `991df8b3` completed without blocking findings.
-- [ ] C1a final PR head: exact-head CI/lander acceptance (M3), including full API constituents, repo gate and named store-it DB tests PASS with zero SKIP.
+- [x] C1a final PR head: exact-head CI/lander acceptance (M3), including full API constituents, repo gate and named store-it DB tests PASS with zero SKIP. Landed in [#3601](https://github.com/vtmocanu/uzi/pull/3601), merge `fb61642c`; final head `0ceda1cf55587bd99b7668550fd2c404b8f2fc5d`, [CI run 40738271349](https://github.com/vtmocanu/uzi/actions/runs/40738271349). Named ready-query, transition-guard and migration-round-trip LiveDB results were verified at landing.
 
-The four unchecked parent goals under “Goal and acceptance” were reviewed and remain unchecked: C1a demonstrates no prerequisite pin, custody release, native-Git restore or complete real-freeze-path authority coverage.
+At the C1a handoff, all four parent goals remained unchecked: C1a alone demonstrated no prerequisite pin, custody release, native-Git restore or complete real-freeze-path authority coverage. The current assessment after all child merges is recorded above.
 
 **Writer and fixture audit.** The production state-SQL inventory is an exhaustive enumeration of tracked current statements at `991df8b3`, including generated mirrors; it is not an exhaustive consumer or arbitrary-SQL reachability proof. Starting evidence: `.uzi/scratch/m1-state-writers.txt`, `.uzi/scratch/m1-ready-callers.txt` and `.uzi/scratch/m1-raw-writers.txt` (run-local artifacts, not durable documentation dependencies). Paths below are relative to `api/internal/`; each row states its audit verdict.
 
@@ -595,8 +620,9 @@ they do not assert that hosted checks were available at that earlier time.
 - [x] C1b M5 local evidence: documentation/mirrors, tracked E2E audit, E2E library/fake tests, focused build/vet/race checks, SQLC/migration/static/security checks and committed repair reviews recorded below.
 - [x] C1b M5 overall acceptance: local deliverables and final exact-head hosted checks/timing collected at the #3655 landing boundary.
 - [x] C1b final exact-head hosted acceptance: required API/repo checks and the full store-it sweep passed, all 62 required names PASS with zero SKIP; advisory timing recorded below. This is not a post-deployment runtime result.
-- [ ] C2 thin FINAL release, feature/worker advertisement, permission/replay/reconciliation and real freeze-path authority acceptance. Sub-note: M1-M4 are implemented and checked locally (see the C2 execution record below); this line stays open for exact-head hosted acceptance, the full store-it sweep and the recorded deviations.
-- [ ] C3 owner/web/CLI pin visibility and E5 restore-time acceptance.
+- [x] C2 thin FINAL release, feature/worker advertisement, permission/replay/reconciliation and real freeze-path authority acceptance. Landed in [#3748](https://github.com/vtmocanu/uzi/pull/3748), merge `a07f813708ced206cd7b8c3f9d09e259b2fff64b`; final head `b6672fc5c50d7f3799936829e9ed286d3999f8ec`, [CI run 41316452742](https://github.com/vtmocanu/uzi/actions/runs/41316452742). The landing record below supersedes the historical worker-handoff gaps, not the open combined parent goals.
+- [x] C3 owner/web/CLI pin visibility and E5 restore-time acceptance. Landed in [#3778](https://github.com/vtmocanu/uzi/pull/3778), merge `11b072e83c123ae209485901d1c2298ee461a253`; final head `d26ff555a78b12e77157cdde75c2e45a691ea4e3`, [CI run 41422943989](https://github.com/vtmocanu/uzi/actions/runs/41422943989). E5 remains the explicitly scoped local full-history owner workflow recorded below, not a hosted release measurement.
+- [x] #3803 combined large-history proof (released capture through pin, FINAL, native prune and owner restore; refusal before preparation). Landed in [#3821](https://github.com/vtmocanu/uzi/pull/3821), merge `861068032794551922a2ec5587ec1ca81a1f2b1c`; final head `347dcd36560b3c7af12bf089e856e57c3b22b32b`, [CI run 41502176074](https://github.com/vtmocanu/uzi/actions/runs/41502176074). See "#3803 landing" below.
 - [ ] E6 two weeks of hosted post-roll counts and growth, including unresolved/exhausted pins and removal blockers (reporting only, not a closure gate).
 - [ ] Parent release/acceptance: all child acceptance and remaining end-to-end/rollout criteria below.
 
@@ -765,8 +791,10 @@ unchecked; the earlier local repairs alone did not establish hosted success.
 
 #### C2 execution record (2026-11-01, #3727)
 
-C2 is implemented on branch `agent/issue-3727`; it has **not landed**. Migration
-00393 (draft 00389, renumbered at landing).
+C2 landed in #3748 as `a07f813708ced206cd7b8c3f9d09e259b2fff64b`, with
+migration 00393 (draft 00389, renumbered at landing). The following milestone
+commits and local results describe the earlier worker handoff; the current
+landing acceptance is recorded separately below.
 
 What landed, by milestone (commit subjects):
 
@@ -815,9 +843,9 @@ PASS with no skips.
 - [x] C2 M3 worker mint grants, replay and attestation implemented and checked locally.
 - [x] C2 M4 advertisement predicate and the combined opt-in proof implemented; proof leg PASS locally with no skips.
 - [x] C2 M5 documentation, ADR amendments, spec line, changelog fragment and E2E literal audit written and checked locally.
-- [ ] C2 exact-head hosted acceptance (full agent suite, full store-it sweep, native git tests): not verified in this run.
+- [x] C2 exact-head hosted acceptance (full agent suite, full store-it sweep, native git tests): verified at final head `b6672fc5`, CI run 41316452742. Both agent shards, worker-UID, API/store-it and repository checks passed; the combined lost-reply/closure proof job passed. The added lock-order, graceful-drain and replay/replacement controls were included in the landed tree.
 
-**Not verified in this run.** The full agent suite is left to exact-head PR CI. The full
+**Not verified in the historical worker run.** The full agent suite was left to exact-head PR CI. The full
 store-it sweep exceeded the local 60-minute cap and is left to exact-head CI. Native git
 tests skip locally for lack of `git-http-backend` and run in CI. No live GitHub.com
 observation was made; that is a parent/operator follow-up. Compose e2e phases were not run.
@@ -830,8 +858,9 @@ M6 operator observation, E5, E6 and C3 are not claimed.
 - The exact-observation closure `EXISTS` branch is unreachable by tests, because the schema forbids forged rows.
 - The specified downgrade/roll-forward journal test and the thin replacement-fence tests were not added.
 
-**Landing-review follow-up, 2026-11-01.** The missing frozen acceptance is being
-completed locally, with hosted acceptance above still unchecked:
+**Landing-review follow-up, 2026-11-01 (historical).** The missing frozen
+acceptance was completed locally before the final hosted acceptance recorded
+above:
 
 - `TestRecoveryClosureFinalClosureLastLockOrderLiveDB` observes the blocked FINAL
   through `pg_locks` and checks actual earlier row-lock ownership, in one server
@@ -875,8 +904,9 @@ completed locally, with hosted acceptance above still unchecked:
 
 These are local review proofs, not a full-suite or hosted PASS, an owner/operator
 observation, E5 or parent completion. Exact-head CI and the lead's independent
-delta review remain required. Added fixture/test time and critical-path impact
-must be recorded at landing; local fixture times do not establish hosted cost.
+delta review were still required at this historical handoff. Local fixture times
+do not establish hosted cost. The child has since landed with the exact-head
+acceptance above; live GitHub.com/operator observation remains unclaimed.
 
 Mixed-version, source-history, limiter and #2884 coordination boundaries are recorded in
 the ADR amendments dated 2026-11-01.
@@ -885,6 +915,515 @@ the ADR amendments dated 2026-11-01.
 
 - **Depends on:** C1b (states). Parallel with C2 only with disjoint file ownership.
 - **Scope and evidence:** owner DTO, fixtures, web and CLI (`cellText`), `pin_lost` and `pin_cleanup_exhausted` visibility, restore commands, `docs/cli.md`; E5 measured.
+- **Local completion (#3728, 2026-11-01; landing updated 2026-11-02):** M1–M3 were implemented/reviewed at `60c71323`; M4 guide/product checks passed on `287b04b9` after reviewed documentation at `10ff078c` and a reviewed fixture repair. C3 has since landed in #3778 with the exact-head acceptance below; parent release remains open. Owner projection is advisory persisted history with eight states and independent absence/cleanup flags, not a fresh probe or release/cleanup authority. The [owner restore guide](../docs/run-recovery.md#restoring-with-a-confirmed-pin) uses existing export, a UUID-derived ref and full-tip comparison before native verify/import. E6 remains an unperformed post-roll observation.
+
+#### C3 local E5 measurement (2026-11-01, #3728)
+
+The explicit `TestRecoveryRestoreWorkflowLiveDB/E5FullHistory` invocation
+passed with zero SKIP/FAIL. This is a local owner-workflow measurement, not
+hosted GitHub latency, a C2 FINAL exercise or parent release acceptance.
+The ordinary `SmallNative` controls also passed; they do not substitute for E5.
+The parent remains open. C3 landing is now complete; the following measurements and integration checks remain the historical local evidence.
+
+Input was a `clone --no-local` of this checkout, selected at public revision
+`a07f813708ced206cd7b8c3f9d09e259b2fff64b`: non-shallow, connectivity/full
+object checks passed, 2,405 reachable commits. The captured source added
+`recovery-generated.txt` (26 bytes, SHA-256
+`5a96308b340168c758f0ad6da84524bc09893aa989bc88bccaa22c78dc86b43b`),
+giving 2,406 commits at source
+`eeffd4ccba0fc168d69068bbe0c71a0fb545a8a5`, tree
+`b4ae331a571f7a7c46bba83bb1c442c552b76246`.
+
+| Observed component | Actual result |
+|---|---|
+| Exported thin bundle | 507 bytes; SHA-256 `809a9636aaeb1fae98af11eb7663a46c1c5d54da3da5f48767b236af9981638a` |
+| Pin fetch | 97,835,961 bytes of native upload-pack POST response bodies, including Git protocol framing, excluding advertisements, HTTP headers and transport overhead |
+| Explicit-capture CLI export | 95.414 ms |
+| Exact pin fetch to the same ref namespace | 13.741274 s |
+| Recorded-tip comparison, bundle verify and recovered-source import | 79.169 ms |
+| Owner clock: export start through import completion | 13.915937 s; includes exported-byte comparison, excludes final source/tree/file assertions |
+| Fixture setup through native pinning | 47.765507 s |
+| Owned remote rewrite/prune clock | 2.224715 s |
+| Clean consumer clone | 45.426 ms |
+| Entire case clock | 64.732682 s, including setup, prune, clone, source/tree/file assertions and negative controls |
+| Containing test / Go package test time | 159.08 s / 160.441 s; includes full-input verification and CLI driver compilation outside the case/owner clocks |
+
+The lane used real C1b sweep, broker prepare/send/readback, PostgreSQL
+constraints/transitions, encrypted archive upload/storage, authenticated owner
+metadata/download and the existing CLI export/SafeWriteVerifiedFile path.
+Both owned bare remotes had their default branch rewritten, reflogs expired and
+`gc --prune=now` run. The independently unpinned remote no longer contained
+the frozen prerequisite. The clean consumer initially failed bundle verification
+naming that prerequisite, then fetched its capture-specific pin, compared the
+recorded tip, verified/imported the advertised recovered-source ref and matched
+source SHA, tree and file content. No alternates or local-clone hardlinks supplied
+the consumer's history.
+
+Missing metadata/ref/tip, foreign capture/ref/tip, unavailable history and expired
+download controls passed with the exported archive retained. Expiry required
+HTTP 409 with `not_available`, not an arbitrary error. Read/export/import left
+capture, closure and hold rows byte-identical before the fixture's explicit expiry
+control; the native pin and captured source ref were unchanged.
+Existing S0 no-backfill/admission controls passed separately, including the
+unreviewed-host refusal. No production host policy was relaxed.
+
+Substitutions were fixture identities/configuration, generated source content,
+loopback forge discovery/URL policy, native ancestry in place of the hosted forge
+API, and a test-only Main/Env/config driver in place of the installed CLI entry.
+Upload first used the production GitHub.com S0 policy; only the fixture's pending
+binding then moved to the owned loopback remote. The driver kept HOME unchanged,
+used an owned Store/SkillHome and explicit nonsecret environment allowlist, and
+proved inherited UZI settings/credential sentinels did not reach the API.
+
+Environment: native Linux x86_64/Go linux-amd64 runner, Git 2.54.0, Go 1.27.3,
+CLI version emitted by the test build `dev`, owned PostgreSQL 17 container.
+The Alpine Git package lacked its CGI helper: the initial small control failed
+for that setup reason. The matching git-daemon 2.54.0-r0 package was fetched,
+signature-verified and extracted only under scratch (archive SHA-256
+`b376522eadb4df8dc5274687ceabe07456924d415cfcc5683c4b198e97a6c855`).
+Its native git-http-backend was added to the test PATH; no global install or
+Git exec-path change occurred. A cancelled intermediate compile and an unfinished
+component-static invocation are not passing checks.
+
+Reproduce from `api/`, after preparing a marker-guarded owned test database and
+the independently cloned/full-checked frozen source, with native git-http-backend
+available on PATH:
+
+```sh
+env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+  UZI_TEST_DATABASE_URL="<owned-test-database-url>" \
+  UZI_TEST_RECOVERY_RESTORE_FULL_HISTORY_SOURCE="<absolute-owned-full-source>" \
+  go test -buildvcs=false -race -count=1 -v -p 1 \
+  -run '^TestRecoveryRestoreWorkflowLiveDB$/^E5FullHistory$' ./internal/handler
+```
+
+Require the exact E5FullHistory RUN/PASS, positive archive/fetch byte counts and
+the LiveDB skip guard with zero SKIP/FAIL; an ordinary small-only pass is
+insufficient. The full-input mode rejects missing/wrong/shallow/incomplete input
+rather than falling back. Routine CI omits E5 registration when full mode is
+not requested.
+
+Evidence was collected from the candidate fixture sources with SHA-256
+`6094c38936c0487a8c4f877d7db905005dee6f089f4ef6dcc18f85fad6629b23`
+(native helper),
+`0956a91715973e0e5ee25632219509688f430a3f6fd5175ef58697ba1c861466`
+(workflow), and
+`665eff881f1d5bfdfcbe94cf25f7c026314672cc589c0ef01a24086621a9b683`
+(CLI driver). Local logs were read directly: gate-log.MnbjAQ (small),
+gate-log.v1jaiY (E5), gate-log.k3D0Gr (S0). Scratch paths are run-local,
+not durable artifacts; the sanitized results above are the committed record.
+
+These are the latest successful local passes after setup/static-check repairs,
+with warmed module and filesystem caches. An earlier full-history pass also
+succeeded; these are individual observations, not a performance average. Cache hit rates, hosted queue/cache/rerun costs and CI
+critical-path impact were not measured. The small containing test took 68.28 s
+(case 6.40 s), exposing substantial driver-preparation cost outside the restore
+clock. Full inherited store-it and required exact-head API/repo CI were pending
+at this local handoff and have since passed at the final C3 head. External pin deletion/history rewrite remains the accepted residual;
+this measurement grants no custody-release or cleanup authority.
+
+#### C3 M4 integration record (2026-11-01, #3728)
+
+The owner guide, CLI documentation, visibility ADR and human requirement now
+describe persisted pin observations separately from fresh verification and
+custody authority. The restore sequence selects an explicit available capture,
+compares the fetched pin's full recorded tip before bundle verification/import,
+then checks source/tree/content. Source/documentation review passed at
+`10ff078c`; a test-only UUID fixture repair passed scoped review at
+`287b04b9`. Both embedded mirrors match. The local checks below are complete;
+the broader parent C3 checkbox remained open for landing at that time. The
+landing evidence below now completes that child without claiming parent rollout.
+
+- [x] C3 local M1: owner projection/contracts and authenticated read-only LiveDB controls, with complete history/order/identity and constant Summary SQL round trips.
+- [x] C3 local M2: safe existing CLI/web diagnostics, shared meanings, preserved actions and dawn/ember keyboard/layout controls.
+- [x] C3 local M3: actual full-history E5, native prune/no-pin/tip controls and retained exports; explicit E5 and routine controls PASS with zero SKIP.
+- [x] C3 local M4 guide/product checks: synced documentation, links, shipping fragment/spec note, full web gate, focused Go controls and E2E library/fake gates.
+- [x] C3 landing: exact-head required API/repo checks and full inherited store-it, with named PASS and zero SKIP verified at final head `d26ff555`, CI run 41422943989. The earlier [landing timing record](https://github.com/vtmocanu/uzi/pull/3778#issuecomment-6571956517) is explicitly one sample at `6947bd28`, not the final merged-main head; see the timing limits below. No E5, parent release or E6 requirement is waived.
+
+Full `task gate:web` passed on frozen `287b04b9`: 386 unit files /
+8,425 tests (502.82 s Vitest duration), then 10 real Chromium files / 35 tests
+(19.63 s). Dependency, lint, dead-code, documentation/changelog/style and type
+slots passed first. The four recovery browser cases cover dawn/ember at
+375/1100 widths with keyboard/focus checks. Focused Go checks used
+`-buildvcs=false -race -count=1` and clean Git config: apitypes, uzidocs
+(including byte-equal embeds), owner-summary/status recovery tests and affected
+CLI recovery/export/landing/docs/printed-instruction tests all passed.
+The M1/M3 DB/native proofs remain applicable: their implementation sources are
+unchanged by this documentation integration. The final restored SmallNative
+after both M3 mutations passed at the committed fixture hashes, zero SKIP
+(`gate-log.j6TRGU`, package 96.358 s).
+
+The first web invocation stopped before tests because a relative TMPDIR was
+invalid for the root dependency check. Narrow candidate/base checks reproduced
+the setup failure and passed with an absolute owned scratch path. A scratch
+wrapper runs the existing native Chromium with a short relative TMPDIR to avoid
+Unix socket path limits; it changes no product code or test assertions. A
+subsequent full run exposed one stale RunView fixture expecting an unsafe
+`r1/cap-ok` copy command (8,424 other tests passed). Equivalent narrow base
+PASS / candidate FAIL confirmed that cause. The minimal canonical-UUID fixture
+repair kept the production guard and assertions intact; its three focused
+cases, lint/typecheck and all allocated scoped reviews passed before the final
+full gate rerun. These failed/setup attempts are not counted as passing gates.
+
+Local log identifiers read directly: `msJBoD` (docs/E2E), `qTvnCp`
+(focused Go), `dlqAaG` (full web), `GGeF6t` (repair), `RvY9VX` /
+`uaRUbE` (narrow candidate/base). Logs are run-local scratch artifacts;
+the sanitized results here are the durable record. Local M4 scanner callbacks
+returned no verdict; no final-head scanner pass is claimed. Source audits
+found no security defect. Required repository/API scanners and vulnerability
+checks remain part of exact-head landing acceptance.
+
+A targeted tracked E2E audit searched the changed retired output phrases and
+all recovery/prerequisite identifiers in phases, library tests and the forge
+fake. No retired phrase survived. Existing readers select capture id/state/
+checksum/byte size or tolerate absent fields; the optional projection changes
+no fake forge operation or route. No harness edit was needed. Compose phases
+52 (outage/outbox) and 72 (custody), and general CLI smoke phase 18, are unrun;
+library gates passed all six reported tallies (7/403/24/6/5/6), and the fake-forge gate passed 12 tests with zero skips. No compose acceptance is claimed.
+
+Equivalent focused component commands were run on frozen
+`a07f813708ced206cd7b8c3f9d09e259b2fff64b` and `60c71323` exports,
+baseline first, with copied provisioned dependencies, Node 26.12.1, Vitest
+4.1.12 and TZ=UTC:
+
+| RecoveryArchives test file | Baseline | Candidate |
+|---|---:|---:|
+| Cases, all passing | 28 | 57 |
+| File test time | 944 ms | 2,268 ms |
+| Vitest total | 4.95 s | 8.35 s |
+| Command wall | 7.553 s | 10.765 s |
+
+Command: `npx --no-install vitest run src/components/RecoveryArchives.test.tsx`
+from each export's web directory. Candidate includes 29 added cases; these are
+single sequential samples, not an identical-case comparison or a CI benchmark.
+Filesystem/dependency-copy warming and cache hit rates were uncontrolled.
+Hosted critical path, queue, cache and rerun costs remain unmeasured. The new
+M3 routine native fixture had no pre-existing case comparator; its driver
+preparation cost is reported in the E5 record. Worker command callbacks can
+assign fresh Go cache directories, so those preparation timings do not predict
+hosted CI cache behavior. Full inherited store-it timing and required exact-head
+API/repo checks were landing obligations at this local handoff; the completed
+landing and final-head timing are recorded below.
+
+#### C3 advisory repair evidence (2026-11-01, #3728)
+
+The follow-up confirmed and repaired D1–D5, C1 and C2. An omitted/empty
+prerequisite list means self-contained only with valid bound byte-manifest
+facts; otherwise it is unknown. CLI pending cleanup now requires a pinned
+row on an expired/discarded capture. Human recovery details follow the hold
+table with hold attribution, obey quiet mode, and warn on legacy unlinked
+captures. Relevant mock runs/history use canonical UUIDs while the executable
+command guards stay unchanged. Documentation/skill copy distinguishes byte
+export from prerequisite verification, and JSON pin facts from the smaller
+human capture-choice table. The shared table adds twelve expired/discarded
+non-pinned cases, exercised by Go, CLI and web tests.
+
+Owner-summary LiveDB seeds now use the generated invocation, cleanup,
+reservation, absence and lost/deleted transition methods. A closure-bearing
+capture is discarded with the owner store query and asserted in the complete
+history. The test records the identity-schema limitation: valid sibling rows
+prove isolation, but immutable constraints prevent constructing a mismatched
+closure for the same capture without bypassing guards. Timing substitutions
+remain fixture-only: make scheduling due, and age only the initial absence
+observation through a narrowly checked DBTX clock adapter. That adapter changes
+only the initial timestamp expression of RecordPrerequisiteAbsence; production
+state/generation/pass predicates and the real schema guard remain intact.
+An initial attempt to age an already recorded absence was rejected by the
+immutable-candidate guard; the final fixture does not overwrite it.
+
+Observed regressions failed on the unrepaired CLI and web for manifest,
+cleanup, layout and demo command defects. The final focused Go selection
+passed with race/count flags: apitypes (1.567 s), embedded docs (1.582 s),
+recovery summary/status (1.550 s), CLI recovery/prerequisite/export/landing/
+docs instructions (6.047 s), plus focused vet (`gate-log.viLgAF`). The expanded
+authenticated owner-history LiveDB control passed with zero SKIP (11.238 s
+package; `gate-log.iC7DKY`), including the unchanged two-query/read-only checks.
+The tester callback was cancelled after this completed log; its unfinished
+broad vet callback is not counted as passing. The lead read the result directly.
+
+C3's coverage-uncertainty note does not invalidate the retained local evidence:
+the lead reopened the explicit E5 PASS/measurements (`gate-log.v1jaiY`),
+blackbox baseline missing-projection failure (`gate-log.TJ6kWR`), CLI/web
+red–green logs and full-web PASS (`gate-log.dlqAaG`). All three native E5/driver
+fixture hashes still match the measured record above; no duplicate E5 run is
+claimed. C4 remains an exact-head hosted landing obligation: API/repo checks,
+full inherited store-it, native backend availability and package timeout must
+be observed before merge. Local output cannot promise those hosted results.
+
+#### D5 / C1 documentation audit (2026-11-01, #3728)
+
+This is a current-working-tree documentation audit, not new runtime, hosted,
+restore or release evidence. No acceptance checkbox or earlier measurement is
+changed. Tracked searches started with available/recover/export/prerequisite
+claims in the CLI reference, recovery guide and bundled skill, then inspected
+the matching availability/thin-archive contexts in adjacent live documentation.
+This is not an exhaustive audit of historical PRDs, ADRs, changelog entries or
+other skills.
+
+The M2 product-copy audit covered `web/src/pages/RunView.tsx` (memory,
+exhaustion and terminal recovery sections),
+`web/src/components/RecoveryHoldsSurface.tsx`,
+`web/src/components/RecoveryArchives.tsx`, `web/src/lib/recovery.ts`,
+`api/cmd/uzi/run_export.go`, `api/cmd/uzi/run_recovery.go` and their directly
+affected tests/mocks. The follow-up inspected `api/cmd/uzi/run_get.go` and
+`api/cmd/uzi/run_wait.go` routing/help: terminal get uses the shared
+summary/landing renderer; wait help points to inspection/export without an
+import-success guarantee. This is an enumerated starting point for current
+recovery claims, not a claim that every historical recovery mention was edited.
+
+The documentation file set actually inspected is:
+`docs/cli.md`, `docs/run-recovery.md`,
+`api/internal/uzicli/skill/SKILL.md`, `docs/admin-health.md`,
+`docs/configuration.md`, `docs/issue-3031-delivery.md`,
+`docs/recovery-storage-diagnosis.md`, `docs/run-recovery-wait.md`,
+`ARCHITECTURE.md`, this parent PRD (current execution/C3 integration context),
+and the corresponding `api/internal/uzidocs/embed/cli.md` and
+`api/internal/uzidocs/embed/run-recovery.md` mirrors. Adjacent-file inspection
+covers the matching claim and surrounding paragraph, not every contract in
+each file.
+
+Source boundaries inspected: `api/cmd/uzi/run_export.go`
+(`recoverySummaryLines`, `renderCaptureChoice`, selection, manifest precheck
+and result), `api/cmd/uzi/run_prerequisite.go` (capture/pin detail rendering),
+`api/cmd/uzi/run_recovery.go` (`recoveryHoldCapture`,
+`holdsWithCaptures`, per-hold human details), `api/cmd/uzi/run_get.go`
+(human summary versus JSON run object),
+`api/internal/uzicli/client_recovery.go` (owner archive endpoint),
+`api/internal/uzicli/safefile.go` (byte count/checksum before destination link),
+`api/internal/recovery/service.go` (upload stream checks, manifest binding and
+two-query Summary), and `api/internal/recovery/download.go` (owner/state/
+manifest gate). `api/cmd/uzi/run_prerequisite_test.go` was inspected for its
+JSON inspect-field assertions, not rerun as part of this documentation audit.
+No new claim that all available metadata has a usable bound manifest follows:
+export retains its own manifest precheck and download can fail. The server
+checks uploaded length/checksum; it does not independently verify Git
+dependencies. A thin export still requires destination-clone verification.
+
+Validation for this audit: `task docs:sync` exited 0; `task check-docs:web`
+exited 0 (80 docs validated, 49 line-budget warnings); both changed embed mirrors
+compare byte-for-byte with their sources. `git diff --check` passed. No Go/web
+runtime test, hosted check, new E5 measurement or acceptance decision is claimed.
+
+Per-site verdicts below concern that availability/importability distinction,
+not revalidation of unrelated retention, quota, release or cleanup mechanisms.
+Mirror verdicts apply to the same named sections after byte-for-byte sync.
+
+| Site | Verdict |
+|---|---|
+| docs/cli.md — recovery summary | updated: every retained capture, with state and recorded pin details; human view. |
+| docs/cli.md — export-choice refusal | updated: pin facts preserved in JSON; human table has id/state/source/size/created only. |
+| docs/cli.md — successful export | updated: byte verification, bound-manifest/download gate, no prerequisite guarantee. |
+| docs/cli.md — owner ARCHIVE column | already accurate: presence of an available capture, not an import proof. |
+| docs/cli.md — coverage paragraph | already accurate: an export can omit latest local work. |
+| docs/cli.md — export hint | already accurate: availability offers export independently of attention. |
+| docs/cli.md — retained-recovery exception | already accurate: available/in-flight captures do not settle owner custody. |
+| docs/cli.md — latest versus older capture | already accurate: download and latest coverage are independent. |
+| docs/cli.md — detailed recovery JSON | updated: checksum, ordered prerequisites, expiry, attempted head and optional pin snapshot; absent optional fields remain possible. |
+| docs/cli.md — terminal-record rejection | already accurate: export requires its own available capture. |
+| docs/cli.md — prerequisite-pin lifecycle | updated: recovery/get show persisted pin state; held refs remain separate. |
+| docs/cli.md — completed held alternative | already accurate: thin archive describes fallback eligibility, not standalone importability. |
+| docs/cli.md — worker-recovery exhaustion | already accurate: recorded availability is historical, not current export/coverage proof. |
+| docs/cli.md — retained exhaustion coverage | already accurate: earlier available archive does not prove latest coverage. |
+| docs/cli.md — adoption-failure export advice | already accurate: export before deciding does not promise verified import. |
+| docs/run-recovery.md — opening recovery promise | updated: bytes can outlive the worker; thin prerequisites remain separate. |
+| docs/run-recovery.md — opening guarded release | already accurate: confirmed pins are a distinct release condition. |
+| docs/run-recovery.md — owner-held memory custody | already accurate: availability does not automatically release custody. |
+| docs/run-recovery.md — held-publication-conflict export | already accurate: export can refuse. |
+| docs/run-recovery.md — Available state | updated: archive bytes ready; prerequisite verification before import. |
+| docs/run-recovery.md — needs-landing with no archive | already accurate: lack of diff/archive is unresolved, not losslessness. |
+| docs/run-recovery.md — local thin proof | already accurate: local verified dependencies do not establish remote durability. |
+| docs/run-recovery.md — source-only export limit | already accurate: manifest-bound archive required; no source download API. |
+| docs/run-recovery.md — C2 lifecycle introduction | already accurate: pinning/release distinguished from byte download. |
+| docs/run-recovery.md — confirmed-pin step 1 | updated: recovery JSON supplies inspect fields; missing linking requires owner archive metadata, not run JSON. |
+| docs/run-recovery.md — thin FINAL worker grant | already accurate: release proof is separate from owner import verification. |
+| docs/run-recovery.md — pin retention after alternate settlement | already accurate: available archive retains its pin lifecycle. |
+| docs/run-recovery.md — ready owner quota | already accurate: accounts for archive bytes, not prerequisite storage. |
+| docs/run-recovery.md — instance quota | already accurate: accounts for archive bytes/reservations. |
+| docs/run-recovery.md — thin guarded disposition | already accurate: downloadable does not imply final release. |
+| docs/run-recovery.md — selected archive after receipt | already accurate: download remains available under its retention policy. |
+| docs/run-recovery.md — forge-park history caveat | already accurate: availability alone proves no complete history. |
+| docs/run-recovery.md — prerequisite-release rollout | already accurate: API release guard precedes guarded-thin producer rollout. |
+| docs/run-recovery.md — Option D archive survival | already accurate: bytes, recorded prerequisites and expiry survive hold settlement. |
+| docs/run-recovery.md — same-issue witness archive survival | already accurate: preserves archive metadata/bytes, not external commit availability. |
+| docs/run-recovery.md — terminal rejection older export | already accurate: earlier export may omit latest work. |
+| docs/run-recovery.md — terminal rejection source-only state | already accurate: readiness is distinct from custody attention. |
+| docs/run-recovery.md — terminal rejection export guidance | updated: a pin alone is not an archive; bound manifest/download and destination verification remain required. |
+| api/internal/uzicli/skill/SKILL.md — ARCHIVE column | already accurate: reports capture availability. |
+| api/internal/uzicli/skill/SKILL.md — recovery/export contract | updated: inspect fields and human/JSON pin visibility; bytes versus Git dependencies. |
+| api/internal/uzicli/skill/SKILL.md — needs-landing export/diff | updated: download first, then verify prerequisites before import; preserved diff remains separate. |
+| api/internal/uzicli/skill/SKILL.md — adoption-failure export advice | already accurate: export precedes owner decision without guaranteeing success. |
+| api/internal/uzicli/skill/SKILL.md — source-only/available distinction | updated: pin alone is not an archive; thin exports require dependency verification. |
+| api/internal/uzicli/skill/SKILL.md — held-ref expiry | already accurate: expiring a held ref does not delete an available archive. |
+| docs/admin-health.md — per-owner recovery bytes | already accurate: byte utilization, not restore readiness. |
+| docs/admin-health.md — marker clearance | already accurate: clearance does not prove archive availability. |
+| docs/configuration.md — prerequisite forge knob | already accurate: pin admission/release has separate conditions. |
+| docs/configuration.md — held-publication knob | already accurate: thin fallback and replay are qualified. |
+| docs/configuration.md — proposal limiter | already accurate: thin FINAL listing budget, not import verification. |
+| docs/issue-3031-delivery.md — conditional thin-release invariant | correct as history: explicitly qualified by the following C2 note. |
+| docs/issue-3031-delivery.md — C2 note | already accurate: ordinary-origin closure release grants no producer authority. |
+| docs/recovery-storage-diagnosis.md — hold discard | already accurate: preserves available archive bytes under archive policy. |
+| docs/run-recovery-wait.md — adoption-failure export advice | already accurate: earlier archive can omit latest work. |
+| docs/run-recovery-wait.md — local decoded-history verification | already accurate: local proof grants no custody release. |
+| docs/run-recovery-wait.md — source-only export limit | already accurate: requires manifest-bound available archive. |
+| docs/run-recovery-wait.md — exhaustion evidence | already accurate: recorded availability leads to a hold, not restore proof. |
+| ARCHITECTURE.md — frozen-inventory archive identity | already accurate: digest identity is not server Git-ancestry proof. |
+| ARCHITECTURE.md — same-issue discard TTL | already accurate: archive retention gives no source/PVC guarantee. |
+| ARCHITECTURE.md — held-publication thin fallback | already accurate: fallback qualification, not import proof. |
+| ARCHITECTURE.md — C1b lifecycle boundary | correct as history/component boundary: the later C2 release section is separate. |
+| ARCHITECTURE.md — worker-exhaustion capture evidence | already accurate: historical evidence affects custody disposition. |
+| api/internal/uzidocs/embed/cli.md — recovery/export sections above | updated: synchronized CLI-reference mirror. |
+| api/internal/uzidocs/embed/run-recovery.md — availability/restore sections above | updated: synchronized recovery-guide mirror. |
+
+#### Partial M3 evidence for owner completion decision (2026-11-02)
+
+**Partial record, not completion.** Candidate `f584e2cb2b17277bc4de5b1aa3c76e76ac23ae31`;
+initial `365d3f396175d038149b8970718aaed1d1f2e4dc`;
+baseline `6d6e86bb2f9e275772bc3241fddb0c2a51a9cfd5`.
+Reviewer and tester reviewed source tests on the original and repair ranges.
+The primary tree was clean. M2's mandatory aggregate gate remains unmet;
+neither M2 nor M3 is completed. No formal owner completion decision is recorded.
+At the time of this record the parent was active/open and goals 1/2 were unchecked; see "#3803 landing" below for the landing verification that ticked them.
+This evidence changes no production behavior, workflow or cap.
+
+**Execution identity.** Native linux/amd64: Go 1.27.3, Git 2.54.0,
+Node 26.12.1, tsx 4.23.15 and PostgreSQL 17.11.
+The following sanitized artifact names and SHA256 values identify executed
+tools and loaded artifacts; they do not assert an exact image/package pin for Git.
+The matching Alpine `git-daemon 2.54.0-r0` backend was extracted from a
+signature-verified package into owned scratch, without a global installation.
+
+| Artifact | SHA256 |
+|---|---|
+| Go executable (launcher and effective toolchain) | `159888b397dac32306b4355c52d59ae5bc9b81515d387efa30f04657fc3a4cc7` |
+| Go compiler, linux_amd64 | `ce30144a6c83f099ac67d9cce259949aaf562814c07250fb7a52dfcc78554d27` |
+| Go linker, linux_amd64 | `54f1351cb72bd285269ccae8db5c992719c6e0394cd5d1fa52032cdc8241f158` |
+| Git executable; git-upload-pack; git-receive-pack | `081e55dbb116bd5fce9b5e16df5c1bf843748f03cd5c2ddf0627a8eccda839c1` |
+| git-remote-http; git-remote-https | `cabbcc77c46ca117c5f17ca2fbcc1708f95173ae74c4d1e5e2e690bb2747c0b6` |
+| Native git-http-backend | `e217374667663b49146dc1eadeb5ba0cfc6cc8e916127e308365470683e75ce1` |
+| Node executable | `c6fa3c4a915da799b59b908e74a34f8f3307b7ec3251b211bc88d452558b3351` |
+| tsx package.json | `ab5f14c4251638844ade3905d3cfc52fc1c833644694d655a05f6d0ca746b83c` |
+| Loaded tsx dist/loader.mjs | `17e2a92c5f1f70065b01c65d5ee9ac260839d4fc0ea78fdbb4db7b1155ccd32f` |
+| agent/package-lock.json | `df076786f5bf20814f6b86e147ef25d71f5a6ec5357f50964e8216c28ce97a8f` |
+
+Separately, `api/go.mod` declares floor `go 1.26.4` and
+`toolchain go1.27.3`; the agent lock resolves tsx 4.23.15 from `^4.19.2`.
+The run guarded its owned DB and absolute source environment without printing
+DSNs/tokens; Git global/system configs were `/dev/null`,
+`GOFLAGS=-p=1`, and `TMPDIR` was owned scratch. From `api`:
+
+```sh
+: "${UZI_TEST_DATABASE_URL:?owned database required}"
+: "${UZI_TEST_RECOVERY_RESTORE_FULL_HISTORY_SOURCE:?absolute frozen source required}"
+go test -buildvcs=false -race -count=1 -p 1 -timeout 20m -v ./internal/handler -run '^TestRecoveryRestoreWorkflowLiveDB$/^E5(Released|BeforePinRefusal)FullHistory$'
+```
+
+**Full-history proof.** EXIT 0; 11 RUN/PASS, zero SKIP/FAIL.
+`TestRecoveryRestoreWorkflowLiveDB/E5ReleasedFullHistory` passed in 69.39s;
+`TestRecoveryRestoreWorkflowLiveDB/E5BeforePinRefusalFullHistory` passed in 49.99s.
+Positive: native listings 3 → 4, one create and one receive POST; real
+WorkerClient FINAL released with `prerequisite_closure` for the exact capture
+before prune; restore used that same capture and left its snapshot unchanged.
+Negative: persisted `prerequisite_not_on_default`, no create/receive,
+FINAL 409, open hold, no receipt, retained data and NULL closure binding.
+Connection base remained `https://github.com`; project URL used loopback with an exact
+two-origin policy.
+
+Owned input froze `a07f813708ced206cd7b8c3f9d09e259b2fff64b`:
+nonshallow, fsck/connectivity checked, 2,405 input commits and 2,406 with the
+generated source. Copies used no-local/no-hardlinks and no alternates.
+Original source/checkout stayed read-only; pruning targeted owned remotes.
+The unpinned control actually lost the prerequisite. Restored source SHA was
+`f56fe6e815675ba342bf7bb1c426fbca9cd15b1c`, tree
+`b4ae331a571f7a7c46bba83bb1c442c552b76246`.
+
+Positive archive: 509 bytes, exported byte-equal; generated content: 26 bytes.
+SHA256: archive `a015c8b4be9500bf77ba94ce56907e0e108c1465c3c70d5a1cac8010d6c184c1`;
+generated `5a96308b340168c758f0ad6da84524bc09893aa989bc88bccaa22c78dc86b43b`.
+Upload-pack HTTP response body: 114,899,184 bytes (not pack size or full network).
+Timings: setup 49.07015694s; prune 2.909362587s; clone 52.283312ms;
+export 102.273204ms; fetch 15.229879906s; verify/import 53.543072ms;
+owner total 15.385790858s; case wall 69.214092852s.
+CLI build 84.970082166s was outside the owner clock; command wall 8m55.23s
+included cold Go caches. Owner time runs from export start through import,
+including byte comparison and excluding final source/tree/file assertions.
+Negative setup including prune was 49.236757924s, prune 779.756346ms,
+FINAL 703.285825ms and case wall 49.940044093s; owner restore is inapplicable.
+
+**Omission controls.** Isolated candidate exports passed npm typecheck and Go
+race compilation for both omissions; no primary mutations or synthetic ACK/receipt.
+Omitting pin fetch kept valid declarations/full-tip checking: expected EXIT 1,
+owner `pin_tip` mismatch, 55.03s; restored EXIT 0, positive 75.62s,
+10 RUN/PASS, zero SKIP/FAIL.
+Omitting FINAL send, ACK observations and replay retained the actual inspect-state
+assertion: expected EXIT 1, actual=open/expected=released, 51.95s;
+restored EXIT 0, positive 68.73s, 10 RUN/PASS, zero SKIP/FAIL.
+
+**Aggregate gate remains failed.** Normal candidate seven-package
+`./e2e/run-store-it.sh` failed after 21m12.80s: cumulative store timeout
+20m (1200.106s), active `FrozenRecoveryPhasesHealthy`/readopt at 0s elapsed;
+remaining packages did not run. Narrow healthy-test runs passed on candidate
+7.97s and baseline 6.88s.
+Equivalent baseline aggregate failed after 46m16.74s: store PASS 1174.749s,
+then handler timeout 20m (1200.586s), active
+`SemanticCompletionMaximumRenewal` at 23s.
+The candidate store timeout was not reproduced on baseline; causality remains
+unresolved. No successful full seven-package sweep was observed; caps stayed unchanged.
+
+**Retained controls and static checks.** Latest controls EXIT 0:
+171 RUN/PASS, zero SKIP/FAIL; candidate handler 232.488s,
+workersvc 1.636s, recovery 227.048s. Narrow semantic completion passed on
+candidate 30.09s/baseline 34.32s. These include new small Go FINALs and retained
+auth/refusal/replay/owner-isolation controls.
+`TestPrerequisiteClosureReleaseLiveDB` is a store test, outside that focused run:
+it passed in 5.74s within the failed candidate aggregate (baseline 5.49s);
+that individual PASS does not make the aggregate successful.
+Observed PASS: `fmt-check:api`, `lint:api`, Go vet for handler/workersvc/recovery,
+setup/native focused serial race/count=1 checks, agent npm lint/typecheck,
+and `UZI_DEADCODE_AGENT_REQUIRED=1 task check:agent`.
+No full agent unit run is claimed. Landing still requires full agent suite:
+exact-head PR CI, required API/repo checks and exact published-head full store-it.
+
+Old-case equivalent comparison: candidate 22 RUN/PASS, zero SKIP/FAIL;
+baseline → candidate: C2 6.66s → 8.67s, Small 6.21s → 7.26s,
+old E5 72.28s → 65.84s, total 171.46s → 176.73s.
+Candidate CLI build was 68.927s; baseline build was not separately instrumented.
+No causal CI-performance conclusion follows: full job censored; queue, cache,
+rerun effects and hosted critical path unmeasured.
+
+**Substitution and acceptance boundary.** Allowed substitutions were fixture
+identities/data/tokens, loopback forge transport, native ancestry/project adapter
+instead of hosted forge API, fixture-only forge binding/URL policy and generated
+source content. Native listing/receive/create-only pinning, capture protection,
+WorkerClient, authenticated API, DB receipt and owner CLI remained real.
+Owner CLI used an explicit Store with allowed environment, without DefaultStore
+or HOME changes; foreign-owner summary/download were refused; snapshots immutable.
+No hosted GitHub latency/availability claim follows.
+External post-release pin deletion remains an accepted, non-restorable residual.
+E6 hosted reporting, rollout, #2969 and producer work remain out of scope.
+This sanitized summary is the durable evidence; raw logs are not tracked and
+scratch files are not durable artifact links. M2 is not waived; M3 remains partial.
+
+#### #3803 landing (2026-11-02)
+
+The owner partial decision kept M1 and deferred M2/M3 only for the aggregate
+sweep (both sweeps timed out in the worker; the cause is not established), and
+required this landing verification before ticking goals 1 and 2. PR #3821 does
+not close #3803.
+
+- The exact-head full store-it sweep passed at `347dcd36`, CI run 41502176074:
+  all seven packages `ok`, zero `--- SKIP`/`--- FAIL` at any indentation, and the
+  named retained controls listed above PASS. The opt-in proof leg also ran
+  `TestPrerequisiteClosureReleaseE2E` and
+  `TestRecoveryRestoreWorkerClientSmallE2E` (added to the store-it selector at
+  landing; it previously ran in no lane) to PASS. The full agent suite passed on
+  that head.
+- The full-history proofs and both omission controls recorded above executed at
+  candidate `f584e2cb`. The proof test files and fixture are byte-identical
+  between `f584e2cb` and merge `86106803` (`git diff` empty), so the recorded
+  results apply to the landed code. They are worker-executed, not CI-reproduced:
+  CI has no frozen full-history source.
+- Goals 1 and 2 are ticked on that basis. E6, parent release/acceptance and the
+  accepted external pin-deletion residual are unchanged; #2506 stays open.
 
 ### Parent acceptance
 
@@ -893,6 +1432,38 @@ the ADR amendments dated 2026-11-01.
 - No prerequisite or evidence path reads a runner-clone or agent-writable ref.
 - Real-freeze-path, permission and origin cases pass; the v2 refusal is unchanged.
 - Each fix test red on main and green on the exact PR candidate.
+
+### Exact-head child landing and timing record (2026-11-02)
+
+The final heads and public CI records were rechecked for this progress update:
+
+| Child | Final reviewed head and merged delivery | Recorded landing evidence |
+|---|---|---|
+| C1a | `0ceda1cf55587bd99b7668550fd2c404b8f2fc5d`, #3601, merge `fb61642c` | [CI 40738271349](https://github.com/vtmocanu/uzi/actions/runs/40738271349): API validation/lint and repository checks passed; [store-it](https://github.com/vtmocanu/uzi/actions/runs/40738271349/job/122994824561) passed. Named C1a LiveDB results and zero SKIP were checked by the lander before merge. |
+| C1b | `edb29486e9fc9f531c40eb63079dfc1541a9385a`, #3655, merge `b6fab6b7` | The existing C1b landing record above retains 3,696 PASS / zero SKIP, all 62 prerequisite names and both witness rollback controls. It is unchanged by this update. |
+| C2 | `b6672fc5c50d7f3799936829e9ed286d3999f8ec`, #3748, merge `a07f8137` | [CI 41316452742](https://github.com/vtmocanu/uzi/actions/runs/41316452742): both agent shards, worker-UID, API validation/lint and repository checks passed; [store-it](https://github.com/vtmocanu/uzi/actions/runs/41316452742/job/124878090698) and [combined lost-reply/closure proof job](https://github.com/vtmocanu/uzi/actions/runs/41316452742/job/124878090829) passed. Named/zero-SKIP landing checks complete the child, not the combined parent goals. |
+| C3 | `d26ff555a78b12e77157cdde75c2e45a691ea4e3`, #3778, merge `11b072e8` | [CI 41422943989](https://github.com/vtmocanu/uzi/actions/runs/41422943989): required API/repository/web checks passed; [store-it](https://github.com/vtmocanu/uzi/actions/runs/41422943989/job/125206321794) passed with named PASS and zero SKIP checked at landing. E5's actual full-history output is recorded above and was executed separately in-run, not inferred from ordinary shallow CI. |
+
+Final-head CI job start-to-completion wall times, one observed sample per head:
+
+| Job | C2, CI 41316452742 | C3, CI 41422943989 |
+|---|---:|---:|
+| test-api-store-it | 3,176 s | 3,480 s |
+| test-codex-refresh-lostreply-e2e | 2,901 s | 2,913 s |
+| test-web | 381 s | 267 s |
+
+These samples include each job's setup and execution, with no cache correction.
+They are not a controlled before/after comparison, and the differing source
+bases prevent attributing the difference to either child. Queue/rerun costs and
+whole-pipeline critical-path impact are not derived from these durations.
+The earlier C3 timing comment compares 6947bd28 store-it (47m55s) with its
+recorded main median (46m34s), with about 44s of driver compilation; it is not
+relabelled as the final d26ff555 measurement. E5's owner clock excludes driver
+compilation and remains the separate local transport measurement above.
+
+No child merge establishes a hosted GitHub.com rollout or two weeks of E6 counts.
+The two combined parent restore goals were established later by #3803 (see "#3803 landing"). Release remains an owner decision;
+this progress-only change requests none.
 
 ## Simplification proposals still open
 

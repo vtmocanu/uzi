@@ -17,10 +17,12 @@ api-brokered checkpoint push this ADR's tick reuses without changing the broker)
 overlay-less publish path deliberately does not build — see below).
 
 **Supersession (#1964, 2026-10-07)**: The original #1597 decision left unscanned
-checkpoint sinks able to publish a finding seen by a scanned sink. #1964 supersedes
-that current-policy claim with a shared, process-local remediation hold at the upload
-seam. Scanning coverage is unchanged; the hold and its explicit residual boundaries
-are recorded below.
+checkpoint sinks able to publish a finding seen by a scanned sink. #1964 superseded
+that policy with a shared, process-local remediation hold at the upload seam.
+For unenrolled flights, scanning coverage and the process-local residual remain as
+recorded below. [ADR-1296's 2026-11-02 source-selection amendment](1296-durable-run-recovery.md#amendment-2026-11-02--durable-remediation-source-selection)
+adds the narrow enrolled-source exception: durable restrictions and fresh proofs,
+not a repository-wide scan policy or a publication/release grant.
 
 ## Decision (summary)
 
@@ -52,9 +54,10 @@ whole turn, in the worst case. This closes that gap **inside** the turn:
    packed, minus content already public, before the pack is built; a finding or an
    untrusted scan skips the remote publish and falls back to the local fetch-back only. On
    a Codex run such an overlay-less (non-GitHub) milestone publish is instead deferred
-   (`scan_deferred`) rather than scanned inside the boundary permit; a GitHub milestone —
-   Codex or otherwise — always carries an overlay context and, when the #1964 hold
-   permits publication, publishes unscanned.
+   (`scan_deferred`) rather than scanned inside the boundary permit. For unenrolled
+   flights, a GitHub milestone carries an overlay context and, when the #1964 hold
+   permits publication, publishes unscanned. Enrolled sources additionally require
+   the ADR-1296 proofs described below.
 5. **The tick runs in a cancellable process scope**: a quiescing run, shutdown, or a
    preempting sink waits for every tick child to exit, every lock wait to resolve, and any
    in-flight publish to settle before the clone or bare is touched again.
@@ -81,6 +84,7 @@ recognized exact code wins: ENOTFOUND/EAI_AGAIN → `dns`, ECONNREFUSED →
 `connection_refused`, ECONNRESET → `connection_reset`, ETIMEDOUT or
 UND_ERR_CONNECT_TIMEOUT/UND_ERR_HEADERS_TIMEOUT/UND_ERR_BODY_TIMEOUT → `timeout`,
 UND_ERR_SOCKET/UND_ERR_CLOSED/ECONNABORTED → `connection_closed`,
+ERR_HTTP2_STREAM_ERROR → `stream_reset`,
 EHOSTUNREACH/ENETUNREACH/EHOSTDOWN/ENETDOWN → `network_unreachable`, and
 CERT_HAS_EXPIRED/UNABLE_TO_VERIFY_LEAF_SIGNATURE/DEPTH_ZERO_SELF_SIGNED_CERT/
 SELF_SIGNED_CERT_IN_CHAIN/UNABLE_TO_GET_ISSUER_CERT_LOCALLY/ERR_TLS_CERT_ALTNAME_INVALID
@@ -88,7 +92,13 @@ SELF_SIGNED_CERT_IN_CHAIN/UNABLE_TO_GET_ISSUER_CERT_LOCALLY/ERR_TLS_CERT_ALTNAME
 `connection_closed` does not say which side closed (UND_ERR_CLOSED can be a local client
 close). EPIPE is deliberately excluded: it mostly comes from local pack-objects/gitleaks
 pipes, and the `packing` phase is local. Everything else is `unknown`; messages and
-aggregate collections do not classify errors. The label set stays fixed.
+aggregate collections do not classify errors. The label set is closed and bounded; it
+changes only by an exact-code amendment such as the dated one below.
+(amended 2026-11-04, #3847) `stream_reset` is an HTTP/2 stream reset by the peer (Node
+code ERR_HTTP2_STREAM_ERROR, "Stream closed with error code NGHTTP2_INTERNAL_ERROR"),
+for example the api's write-timeout reset of a slow `/publish` response. Before the
+amendment such errors were `unknown`. Like `connection_closed`, it does not say which
+side's deadline expired.
 Boundary failures, typed refusals and aborts retain their earlier precedence, including
 fail-closed propagation from hostile boundary/name getters.
 
@@ -118,10 +128,20 @@ branch push and merge request publication remain separate and can succeed.
 [Issue #296](https://github.com/vtmocanu/uzi/issues/296) adds retries for explicit numeric
 HTTP 500–599 within one logical checkpoint publish: at most three HTTP requests total,
 with 250ms then 1000ms backoffs. Any supplied caller deadline or abort signal is shared
-across attempts; each HTTP request retains its own client timeout. Some callers supply
-no outer signal, so the first request's timeout does not bound the total operation. The
-`CHECKPOINT_INTERVAL` gate (default `20m`) still measures logical operations. HTTP 4xx,
-nonconfirming 2xx, skips, local errors, transport throws and aborts are not retried.
+across attempts. The `CHECKPOINT_INTERVAL` gate (default `20m`) still measures logical
+operations. HTTP 4xx, nonconfirming 2xx, skips, local errors, transport throws and
+aborts are not retried.
+(amended 2026-11-04, #3847) One request allowance (`CHECKPOINT_PUBLISH_TIMEOUT_MS`,
+480 s, not `WORKER_HTTP_TIMEOUT`) is created once before the first attempt and shared by
+all three; a retry never renews it, so it bounds the whole logical publish even for a
+caller with no outer signal, and an earlier caller or maintenance deadline still wins.
+undici's own 300 s headers/body timeouts are raised to the allowance for that request using an
+owned dispatcher from the pinned undici package, passed to Node 26's native fetch and destroyed
+after the acknowledgement or any failure. Node's default TLS trust and startup environment-proxy
+opt-in (`NODE_USE_ENV_PROXY`, `NODE_OPTIONS`, CLI flags) are preserved. Runtime
+`http.setGlobalProxyFromEnv()` overrides are not tracked; the worker has no such caller. When the
+allowance expires (its owned timer fired while the caller's signal did not), the failure is
+classified `timeout` from that state, not from the error's shape.
 
 The replay factory captures the original source, candidate, literal floor and optional
 `defaultBlobSha`, including its absence. These remain immutable for the logical
@@ -186,8 +206,9 @@ holds only while the tick actually runs (the clone is not git-busy, the sink gat
 and no retained bare lock remains), the scan of the pinned range is trusted and finding-free, and the broker accepts the
 publish. A git-busy marker defers the tick for as long as it is present, whatever its age; a
 finding or an untrusted scan keeps that tick's work on worker-local storage. Under #1964,
-remembered findings also hold unscanned checkpoint uploads in the current flight; that
-memory is lost on reclaim or a new flight, so this is not durable containment (see the
+remembered findings also hold unscanned checkpoint uploads in the current flight. For
+unenrolled flights, that memory is lost on reclaim or a new flight, so it is not durable
+containment; enrolled sources retain restrictions under the ADR-1296 amendment (see the
 explicit residual boundaries below). The tick starts a failed publish's next logical
 operation at most once per `CHECKPOINT_INTERVAL`. In each of those cases the work is at
 risk from a worker-disk loss, and is never reported as durable.
@@ -199,9 +220,11 @@ alone — with the remote publish skipped or failing — is never reported as du
 shutdown feed (see the reason classes below): it is exactly the pre-existing PRD #267
 local-only fallback, unchanged.
 
-### The claim boundary that does not move: park/shutdown/pause/capture and every GitHub milestone stay unscanned
+### Unenrolled scan boundary: park/shutdown/pause/capture and GitHub milestones stay unscanned
 
-**This is unchanged by design, not an oversight.** Scanning covers every checkpoint publish
+**For unenrolled flights, the #1597 scan policy is unchanged.** The enrolled-source
+exception is specified in the ADR-1296 amendment linked above and summarized below.
+For unenrolled flights, scanning covers every checkpoint publish
 that goes through the checkpoint body **without** an overlay context: the mid-turn tick, the
 time-gated iteration-boundary tier, and milestone publishes on non-GitHub forges. On a Codex
 run such a milestone publish is deferred (`scan_deferred`) instead of being scanned inside
@@ -219,8 +242,9 @@ highest-frequency, highest-exposure publish path uzi has. Concretely: **a secret
 and then removed within the same single turn is caught by any scanned publish whose range
 contains the adding commit**, because gitleaks git mode scans each commit's patch. The
 original unscanned publishers (park/shutdown/pause/capture, and GitHub milestone publishes)
-could ship it under #1597. #1964 supersedes that policy: a finding remembered in the current
-flight holds those uploads too, while never-flagged content remains outside that hold.
+could ship it under #1597. #1964 superseded that policy: for unenrolled flights today,
+a finding remembered in the current flight holds those uploads too, while never-flagged
+content remains outside that hold.
 **uzi's push-protection handling runs only at finalize** — it is not relied on as a
 backstop for this path (`agent/src/secret-scan-guard.ts`'s pre-push scan plus the `GH013`
 remote parse). It cannot undo content already shipped by an earlier checkpoint to the
@@ -236,10 +260,12 @@ are added — the same as gitleaks git mode for ordinary commits, and now for me
 
 ### The #1964 remediation hold at the upload seam
 
-Every checkpoint upload goes through `RunRunner.publishCheckpointOutcome`: usage-limit
+Checkpoint uploads go through `RunRunner.publishCheckpointOutcome`: usage-limit
 park, graceful shutdown, pause, credentialed and credential-free recovery, credential
 switch, completion-hold/wall parks, and checkpoint-body publishes, including overlay and
-pinned-range variants. `checkpointRemediationHold` holds a candidate while the current
+pinned-range variants. At this shared seam, enrolled sources require the durable-source
+and candidate proofs summarized below. For unenrolled flights,
+`checkpointRemediationHold` holds a candidate while the current
 `RunFlight.secretRemediation` has nonempty `known` or `blocked` findings, overflow, or a
 retained flagged SHA that is an ancestor of the candidate. Unknown ancestry, an unresolved
 candidate when retained SHAs need checking, or a git error holds the upload too.
@@ -257,18 +283,50 @@ existing capture paths, but a held upload provides no origin durability. A fresh
 whose upload is held fails and the run continues; the already-durable pause shortcut is
 unchanged.
 
+### Enrolled-source exception (ADR-1296, 2026-11-02)
+
+[ADR-1296's source-selection amendment](1296-durable-run-recovery.md#amendment-2026-11-02--durable-remediation-source-selection)
+is authoritative for attempt-bound sources enrolled in `remediationRecovery`.
+The worker persists flagged OIDs, displaced-head edges and excluded roots across
+successor readiness and episode completion. Cold runner, GitCache and recovery
+consumers independently confirm source identity, the attempt ledger, tracking
+ownership and config readback, including config and directory sync confirmation.
+A readable record alone supplies no clean grant.
+
+The enrolled path requires trusted merge-aware continuation history scans before
+successor admission/model launch, plus fresh checks of the actual source, transformed
+candidate and resolved floors before bridge, pack, push and producer replay. Unknown
+or unavailable proof holds the operation. Required floors remain intact; a conflicting
+floor holds rather than being removed. See `readRemediationUnderLock` in
+[git.ts](../agent/src/git.ts) and `requireLaunchAuthority`,
+`withRemediationCandidateAdmission` in [runner.ts](../agent/src/runner.ts);
+the amendment specifies the full proof boundaries.
+
+Selecting clean execution source S while retaining coverage envelope C grants no
+publication, prerequisite closure, FINAL, release or ACK authority over C.
+The independent closure proof remains required, and captured-C guards apply to
+new FINAL mint, saved replay, release, receipt reconciliation, ACK and held
+publication (see `restrictionsAllowCapturedC` in [recovery.ts](../agent/src/recovery.ts)).
+Enrolled retirement/reanchor and unproven metadata-loss rebind refuse. A successful
+path is unimplemented and needs a reviewed authority design. The worker manages the
+existing journal and authority bindings; no new configuration knob or user action is required.
+
 ### Explicit residual boundaries (#1964)
 
-The park/shutdown/pause/capture and GitHub-milestone sinks remain **UNSCANNED**; #1964
-adds no scan. Unknown, never-flagged content is outside the remembered-finding hold.
-Ancestry containment also does not cover workflow tree content copied into an overlay from
-a non-parent commit: copying its tree does not make that commit an ancestor.
+For unenrolled flights, the park/shutdown/pause/capture and GitHub-milestone sinks
+remain **UNSCANNED**; #1964 itself added no scan. Unknown, never-flagged content is
+outside the remembered-finding hold. Ancestry containment also does not cover workflow
+tree content copied into an overlay from a non-parent commit: copying its tree does not
+make that commit an ancestor.
 
-Remediation memory is process-local `RunFlight` state and is **lost on reclaim or a new
-flight**, including same-worker reclaim. Local commits can survive on that worker; a later
-unscanned publish before another finding is recorded may ship the previously flagged
-content. Persisting remediation evidence or mandating resume scans remains separate work
-under the approved plan's explicit residual boundaries; neither is provided by #1964.
+Unenrolled remediation memory is process-local `RunFlight` state and is **lost on reclaim
+or a new flight**, including same-worker reclaim. Local commits can survive on that
+worker; a later unscanned publish before another finding is recorded may ship the
+previously flagged content. Persisting that unenrolled evidence or mandating resume scans
+remains separate work; neither was provided by #1964. The enrolled exception above
+changes neither repository-wide scan policy nor the exposure of already-published
+content. Private local captures, archive upload and export remain available under their
+existing guards; retained private bytes establish no publication or release authority.
 
 ### The scan hardening
 
@@ -372,6 +430,8 @@ if the tick holds the gate when a gated path needs it, the gated path **preempts
 exited, any lock wait resolved, any in-flight publish rejected or completed — before
 proceeding. The tick, by contrast, only ever *tries* to acquire the gate
 (`tryAcquire`, non-blocking); a miss is a normal tick outcome (`gate_busy`), never an error.
+Since #3780 that preemption is a cooperative (soft) stop of the tick's scope, not a hard
+abort; see [the #3780 amendment](#amendment-2026-11-02--3780-soft-tick-stops-and-same-flight-attempt-repair).
 
 ### Amendment 2026-10-19 — #3123: completion budgets and safe stops
 
@@ -497,6 +557,119 @@ on a stopped read. Awaited filesystem writes and fsync stay uninterruptible. A
 as before. A started bridge adoption and in-import mutation stay hard-only (#3123,
 #3315). Source and local test evidence do not establish hosted acceptance. See the
 [cross-check amendment](2149-cross-check.md#amendment-2026-10-26--3304-code-head-reads-settle-at-the-snapshot-boundary).
+
+### Amendment 2026-11-02 — #3780: soft tick stops and same-flight attempt repair
+
+**Incident.** A routine mid-turn tick was hard-aborted after it wrote the pending
+ownership receipt and before the tracking-ref CAS. The inferred cause (not
+reproduced) is preemption by the done checkpoint, which aborted the tick's whole scope.
+The receipt stayed `pending` with the ref unmoved, so every later import observed no
+owner and refused with `ownership_unknown`, and finalize failed the run.
+
+**Soft tick stops.** The tick now has two controllers. Sink-gate preemption, `stop()`,
+and a cooperative lifecycle abort or pre-deadline graceful shutdown abort the soft one,
+which the checkpoint scope masks across GitCache's ownership section (the #3123 mask), so
+a started import settles its receipt before the tick yields. Lifecycle, terminal and
+checkpoint-authority events, and the worker shutdown, are classified with the done-path
+rule (`checkCheckpointStop`): cooperative stops are soft, revocations hard. `stop()`
+is soft unless the current classification is hard; a classifier exception reads as hard.
+The shutdown deadline timer hard-aborts unconditionally (a timer can fire slightly before
+the clock reaches `deadlineAt`, so reclassifying could wrongly stay soft), and the 120 s
+tick cap stays hard. Invariant: the tick's spawner and the scope's hard signal stay on
+the hard controller, so the existing mask lets a started ownership section finish while
+children are still killed on a hard stop. This amends the preemption text in
+"Per-flight sink gate and preemption", which previously aborted the scope. There is no
+cap guard on the masked section: it was optional and not implemented.
+
+**Same-flight repair (a scoped amendment of the receipt-adoption rule).** A flight owns
+an opaque `TrackingAttemptToken`, minted through a module function that registers its
+admission predicate in a module-scoped `WeakMap`; an unregistered token is never admitted.
+It rides the flight's owed options into `fetchAgentBranch` and `updateTrackingRef`. At
+mask entry, before `promoteTrackingUnderLock`'s first write, GitCache records the
+pre-mutation state per token and `bare`/branch (observed ref and raw owner stamp, prior
+receipt, incoming head, context, run, generation, the pending receipt, coverage and
+displaced-head facts). The record is dropped only on an `updated` return or when an
+owner is later observed; any other exit after a write leaves it. The records live in
+the `GitCache` instance, so a restart starts empty.
+
+When an import under the bare lock finds no observable owner, it asks the repair to
+finish that token's own attempt, only from one of three exact disk states:
+
+- **Pre-pending:** ref and stamp unchanged, no receipt, governance marker absent or
+  exact, and the record saw no prior receipt. If the original attempt had not yet passed
+  the ancestor clear, repair observes the same ancestor candidates read-only. It finishes
+  only when every observation succeeds and no ancestor tracking ref exists. Otherwise it
+  refuses without ancestor writes; an ordinary fresh import or the owner handles that
+  residual. Repair never runs ancestor cleanup, pins an ancestor, archives or deletes its
+  ref, or clears its receipt or stamp. Ordinary import cleanup is unchanged.
+  Roll-forward: marker, pending receipt, CAS, stamp, committed receipt.
+- **Ref unchanged:** marker and pending receipt exact, ref and stamp unchanged. CAS,
+  stamp, committed receipt.
+- **CAS landed:** ref equals the incoming head, stamp equals the old or new run, marker and
+  pending receipt exact. Stamp (if needed) and committed receipt.
+
+Only the committed receipt reading back as the record's run, generation and context
+counts as success. Anything else (any other disk state, a context, run or generation
+mismatch, a missing owed anchor, a duplicated stamp) refuses as before. There is no
+rollback: every write is a step the original attempt would have taken, and undoing
+under possibly revoked authority would be a new mutation. Before each roll-forward write
+(marker, pending receipt, CAS, stamp, committed receipt) the repair re-checks the admission proof and the hard boundary signal (the soft signal is
+masked for the repair); the one best-effort rewrite of the pending receipt after a failed
+committed write or readback, mirroring the original attempt's own invalidation, runs only
+while admission holds and the hard boundary signal has not aborted. Admission is true only
+while the steering channel's positive authority
+fields all hold (no terminal lifecycle, shutdown, flight end, receipt failure, cancel,
+claim fence, pending credential switch, disk pause or shutdown checkpoint), the owed
+limit has not stopped the run, the Codex registry is neither poisoned nor disposed, and
+no tick survivors or retained bare locks remain.
+
+Revocation audit (enumerated at implementation, base 59c8ee55). The terminal lifecycle
+and revocation fence (`shutdownStop`, which is `checkpointAuthoritySignal()`) are aborted
+only by:
+- message-transport permanent failure (runner, two sites);
+- cancellation observation (`observeCancellation` → `markCancelled` plus terminal
+  `abortLifecycle`) and steering cancel;
+- the owed-limit stop;
+- receipt give-up (`failReceipts`);
+- the claim fence (`endFencedFlight`);
+- the disk stop (`requestDiskStop`);
+- credential-switch delivery, including inside a defer window;
+- `workerShutdown`.
+
+Cooperative pause and credential-switch lifecycle deliveries pass `terminal = false`.
+Ordinary executor completion and `SteeringChannel.stop()` touch none of these, so a
+normally completed run keeps repair authority through its done checkpoint and finalize,
+while every listed path revokes it. If it turns false between writes, the
+repair stops with no further write and no rollback, leaving a state a later admissible
+import can finish; the import then refuses. After a success the state is re-observed,
+the repaired retained heads are merged into the result, and the CURRENT incoming is
+promoted through the normal path. A soft-stopped bridge starts no repair write.
+
+#3123's rule that a soft stop grants no receipt-adoption authority still holds. The
+proof here is the attempt's own in-memory record plus current authority, not a soft stop.
+A restart, a different run or generation, any mismatch, and revoked authority stay refused.
+
+Accepted residuals:
+
+- A receipt stranded across a restart or worker shutdown still fails the run at finalize;
+  this is to converge with #3738's park design.
+- After a credential switch has been delivered, the revocation fence stays aborted for
+  the rest of the flight, so repair is refused and turn-end tick stops classify hard, as
+  in the done path.
+- Repair runs only in the import paths (`fetchAgentBranch`, `updateTrackingRef`). Other
+  readers stay fail-closed: ownership snapshots, settle-transfer, claim-relinquish
+  retention, the reseed owner read, recovery coverage, ancestor clearing and owed GC.
+  This relies on `tipUnmovedSinceFetch` falling through to a fetch when ownership is
+  unproven.
+- Preemption latency, now up to the masked section's duration, is unmeasured.
+- A soft-stopped import can leave its private `refs/uzi-incoming/` stage ref behind, as the
+  done path already does.
+- If the repair succeeds but the follow-on promote is refused, the retained-head notice is
+  skipped; the pins remain.
+
+The #3304 amendment above is unchanged: its read-settlement rules apply to the done and
+gate paths, and this one concerns the mid-turn tick and the import ownership section.
+Source and local test evidence do not establish hosted acceptance.
 
 ### Git-busy probe
 
@@ -667,11 +840,13 @@ substitute for.
   (ADR-122) and the workflow overlay (ADR-1036) are both reused byte-unchanged.
 - **No durability claim is made while every publish sink is unreachable**; a fetch-back
   with no successful remote publish is reported exactly as before (never `published`).
-- **The claim boundary intentionally does not widen**: park/shutdown/pause/capture and every
-  GitHub milestone publish remain unscanned, by design, not oversight — see the dedicated
-  section above. #1964 holds current-flight remembered findings at the shared upload seam,
-  but does not persist that memory or add resume scans. A future decision to scan these
-  sinks or persist remediation evidence is separate work.
+- **The unenrolled claim boundary does not widen**: park/shutdown/pause/capture and GitHub
+  milestone publishes remain unscanned for unenrolled flights. #1964 holds their
+  current-flight remembered findings at the shared upload seam but did not persist
+  that memory or add resume scans; extending those unenrolled guarantees remains
+  separate work. Enrolled sources instead require the durable restrictions and fresh
+  proofs in [ADR-1296's source-selection amendment](1296-durable-run-recovery.md#amendment-2026-11-02--durable-remediation-source-selection).
+  Neither policy remediates already-published content or forbids private capture/upload/export.
 - **Neither `CHECKPOINT_TICK_INTERVAL` nor `CHECKPOINT_INTERVAL` is exposed via the chart or
   the controller**, so hosted workers run the defaults (`5m`/`20m`); overriding either needs
   a worker-env change outside the chart's current surface.

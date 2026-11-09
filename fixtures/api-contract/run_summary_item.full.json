@@ -1,13 +1,19 @@
 {
-  "forge_origin_cooldown": {
-    "origin": "x",
-    "cooled_until": "2020-01-02T03:04:05Z",
-    "half_open_run_id": "x",
-    "state": "x",
-    "detail": "x",
-    "surfaces": [
-      "x"
-    ]
+  "policy_hold": {
+    "preserve_required": true,
+    "pending_fresh": true,
+    "outcome_id": "x",
+    "continuation_mode": "x",
+    "resolved_at": "2020-01-02T03:04:05Z",
+    "applying_worker_id": "x",
+    "applying_generation": 1,
+    "source_generation": 1,
+    "refusal_count": 1,
+    "policy_tag": "x",
+    "phase": "x",
+    "correlation_id": "x",
+    "published": true,
+    "captured_head": "x"
   },
   "worker_recovery": {
     "episode": 1,
@@ -30,6 +36,16 @@
     "max": 1,
     "remaining": 1
   },
+  "forge_origin_cooldown": {
+    "origin": "x",
+    "cooled_until": "2020-01-02T03:04:05Z",
+    "half_open_run_id": "x",
+    "state": "x",
+    "detail": "x",
+    "surfaces": [
+      "x"
+    ]
+  },
   "id": "x",
   "repo_id": "x",
   "forge_type": "x",
@@ -38,6 +54,19 @@
   "continued_issue_iid": 1,
   "issue_title": "x",
   "harness": "x",
+  "harness_decision": {
+    "preferred": "x",
+    "chosen": "x",
+    "reason": "x",
+    "preferred_score": 1.5,
+    "other_score": 1.5,
+    "preferred_measured": 1.5,
+    "other_measured": 1.5,
+    "preferred_held": true,
+    "other_held": true,
+    "preferred_weekly_reset_at": "2020-01-02T03:04:05Z",
+    "other_weekly_reset_at": "2020-01-02T03:04:05Z"
+  },
   "has_prd_link": true,
   "title": "x",
   "resume_of_run_id": "x",
@@ -402,6 +431,9 @@
   "agent_exclusions": [
     "x"
   ],
+  "agent_source_requested": "x",
+  "agent_source_requested_basis": "x",
+  "plan_agent_source": "x",
   "own_agents": [
     {
       "name": "x",
@@ -530,5 +562,7 @@
   "owner_email": "x",
   "judge_verdict": "x",
   "judge_todo_count": 1,
-  "is_revising": true
+  "is_revising": true,
+  "pending_question": "x",
+  "cross_check_active": "x"
 }

@@ -203,8 +203,35 @@ type MemoryHoldDTO struct {
 	Remaining *int32 `json:"remaining"`
 }
 
+// HarnessDecisionDTO is the creation-time harness comparison. Unknown usage stays
+// null; measured zero is a value. Chosen is the run's stored harness.
+type HarnessDecisionDTO struct {
+	Preferred         string   `json:"preferred"`
+	Chosen            string   `json:"chosen"`
+	Reason            string   `json:"reason"`
+	PreferredScore    *float64 `json:"preferred_score"`
+	OtherScore        *float64 `json:"other_score"`
+	PreferredMeasured *float64 `json:"preferred_measured"`
+	OtherMeasured     *float64 `json:"other_measured"`
+	PreferredHeld     bool     `json:"preferred_held"`
+	OtherHeld         bool     `json:"other_held"`
+	// Weekly resets of the compared accounts; null when unknown or not recorded.
+	PreferredWeeklyResetAt *time.Time `json:"preferred_weekly_reset_at"`
+	OtherWeeklyResetAt     *time.Time `json:"other_weekly_reset_at"`
+}
+
+// CreatedIssueDTO is a confirmed issue created by this scheduled prompt run.
+// WebURL is empty when the stored repository URL cannot safely form a link.
+type CreatedIssueDTO struct {
+	IID    int64  `json:"iid"`
+	Title  string `json:"title"`
+	WebURL string `json:"web_url"`
+}
+
 // RunDTO is the web view of a run; worker-internal session_id and last_seq are omitted.
 type RunDTO struct {
+	PolicyHold    *PolicyHoldDTO    `json:"policy_hold,omitempty"`
+	CreatedIssues []CreatedIssueDTO `json:"created_issues,omitempty"`
 	// Optional advisory cooldown for the assigned worker and current authorized origin.
 	ForgeOriginCooldown *ForgeOriginCooldownDTO `json:"forge_origin_cooldown,omitempty"`
 	// Detail-only detector provenance; never approval authority or summary polling data.
@@ -247,6 +274,8 @@ type RunDTO struct {
 	// value honestly — the API is deployed separately and a newer server can ship a harness
 	// this client has not heard of.
 	Harness string `json:"harness"`
+	// HarnessDecision is private to the run owner; null for legacy and foreign reads.
+	HarnessDecision *HarnessDecisionDTO `json:"harness_decision"`
 	// HasPRDLink is server-computed PRD presence for the runs view (PRD #764),
 	// derived label-independently from the run's snapshotted issue description via
 	// the same detector the board card uses (forgesvc.HasPRDLink). False for
@@ -433,7 +462,9 @@ type RunDTO struct {
 	CompletionUnmet []string `json:"completion_unmet"`
 	// HoldReason is why a paused run is HELD (mapped from run.HoldReason): 'completion_blocked'
 	// for a completion hold (PRD #1226), 'budget_exhausted' for a wall-clock park (PRD #1497),
+	// 'iteration_budget_exhausted' for an iteration park (Resume/Cancel; Extend adds time only),
 	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14),
+	// 'credentials_reset' while a run created before an account reset waits for a new credential (PRD #3989),
 	// 'credential_switch_settling' while the worker is still finishing its own operations on a run whose
 	// token switch could not be proven settled (Resume is refused until it finishes; Cancel works),
 	// 'credential_switch_unsettled' once it finished them, processes not proven stopped (Resume is open) (issue
@@ -722,9 +753,13 @@ type RunDTO struct {
 	// The names and descriptions here are REPO-SUPPLIED text. The gate panel
 	// renders them as plain JSX, never through <Markdown>: an attacker-authored
 	// description must not put a clickable link inside an approval dialog.
-	RepoAgents      []RepoAgent `json:"repo_agents"`
-	AgentSource     *string     `json:"agent_source"`
-	AgentExclusions []string    `json:"agent_exclusions"`
+	RepoAgents                []RepoAgent `json:"repo_agents"`
+	RepoAgentSourceCommit     *string     `json:"repo_agent_source_commit"`
+	AgentSource               *string     `json:"agent_source"`
+	AgentExclusions           []string    `json:"agent_exclusions"`
+	AgentSourceRequested      *string     `json:"agent_source_requested"`
+	AgentSourceRequestedBasis *string     `json:"agent_source_requested_basis"`
+	PlanAgentSource           *string     `json:"plan_agent_source"`
 	// OwnAgents is the OWN-source subagent roster (name + description) the run's
 	// owner would run: exactly what ListClaimAgentTemplates delivers to a claim,
 	// minus the lead. It is the single source of truth the plan-gate "My agent
@@ -882,12 +917,17 @@ type RunDTO struct {
 	// "codex_account_unavailable" (PRD #1590, held on its Codex account) and "vault_locked"
 	// (issue #1766, the owner's vault is locked; the run resumes at its next retry once the
 	// vault is unlocked) and "data_volume_full" (PRD #1809 M5, the worker's data volume was full
-	// or about to fill; the run resumes at its next retry, see DiskParkCount);
+	// or about to fill; timed retries become owner holds with NULL retry at the cap, see DiskParkCount);
 	// "provider_outage" is active: a typed provider-transient retry park (PRD #1733).
 	// "worker_requeue_exhausted" and "worker_memory_pressure" require owner action.
 	// "retained_recovery_exhausted" can be timed or owner-held; see RecoveryRetryNotBefore.
-	// "retained_recovery_adoption_failed" is an integrity refusal: retained local work and
-	// custody are preserved, and only the owner can Resume or Cancel, without automatic retry.
+	// "retained_recovery_adoption_failed" is an integrity hold: retained adoption or a
+	// predecessor remediation record refused source use (in the remediation case the agent did
+	// not start and nothing was adopted or touched). Local work and custody are preserved, and
+	// only the owner can Resume or Cancel, without automatic retry.
+	// "retained_continuation_unwitnessed" is a claimed-never-started park whose retained custody
+	// continuation was never witnessed starting: the claim is released, retained work and custody
+	// are preserved, and only the owner can Resume or Cancel, without automatic retry.
 	// "empty_turn" remains reserved. Clients render an unrecognised value
 	// honestly (a newer server may ship a cause this client has not heard of), the same rule
 	// as RateLimitType.
@@ -945,8 +985,9 @@ type RunDTO struct {
 	// RecoveryRetryNotBefore is the earliest scheduled recovery promotion time, not
 	// a promise of immediate execution. It is separate from the usage-limit RetryNotBefore.
 	// Null means no scheduled recovery retry, including an owner-held codex_idle_stall
-	// or retained_recovery_exhausted park. An omitted key in a partial client read means
+	// or retained_recovery_exhausted or capped data_volume_full park. An omitted key in a partial client read means
 	// timing is unknown; consult RecoveryRetryNotBeforePresent before inferring a hold.
+	// retained_continuation_unwitnessed is likewise always owner-held.
 	// retained_recovery_adoption_failed is always owner-held, even if a malformed
 	// response supplies a retry timestamp; the cause never schedules a timer.
 	RecoveryRetryNotBefore *time.Time `json:"recovery_retry_not_before"`
@@ -968,6 +1009,7 @@ type RunDTO struct {
 	// lifetime (PRD #1809 M5, D6), the DISK-ONLY counter the UZI_RUN_DISK_PARK_MAX cap decides
 	// on — distinct from ForgeParkCount and from the backoff-shaping recovery_wait_count. A
 	// preventive disk park (the worker stopped the run before its volume filled) does not count.
+	// Exhaustion holds for owner Resume with NULL retry time; the count stays saturated.
 	// 0 for a run that has never taken a counted disk park.
 	DiskParkCount int `json:"disk_park_count"`
 	// ProviderParkCount is how many typed 'provider_outage' recovery parks are in this run's open
@@ -1082,13 +1124,12 @@ type RunDTO struct {
 	OutcomePending *OutcomePendingDTO `json:"outcome_pending"`
 }
 
-// OutcomePendingDTO names a finished outcome held on the run's worker (PRD #1391 M3,
-// D13). Reason is one of the closed set the worker may report — completion_permit_mismatch
-// (the run's completion permit no longer matches), gap_unrecoverable (a message hole the
-// worker cannot fill bounds the terminal fence), reserve_exhausted (the terminal-journal
-// reserve is full) — mapped to friendly text by the web owner-resolution UI. The api drops
-// any other value (the worker is untrusted), so a client may render an unrecognised value
-// honestly but will never see one from this api.
+// OutcomePendingDTO describes retained delivery evidence on the run's worker.
+// Worker-reported permanent terminal reasons are restricted to completion_permit_mismatch,
+// gap_unrecoverable and reserve_exhausted (PRD #1391 M3, D13). The API separately derives
+// codex_policy_hold_pending from bounded policy delivery facts belonging to the current
+// worker; this transient reason does not confirm a server-applied hold or terminal outcome.
+// Arbitrary worker reason text is never forwarded. Clients tolerate newer reason values.
 type OutcomePendingDTO struct {
 	Reason string `json:"reason"`
 }
@@ -1136,10 +1177,11 @@ type CredentialEpochDTO struct {
 // RunDTO / RunListItemDTO source fields exactly; the nested value types are reused. There is
 // exactly one worker_name here, the list-level one (RunListItemDTO.WorkerName).
 type RunSummaryItemDTO struct {
+	PolicyHold     *PolicyHoldDTO     `json:"policy_hold,omitempty"`
+	WorkerRecovery *WorkerRecoveryDTO `json:"worker_recovery,omitempty"`
+	MemoryHold     *MemoryHoldDTO     `json:"memory_hold,omitempty"`
 	// Optional advisory cooldown for the assigned worker and current authorized origin.
 	ForgeOriginCooldown *ForgeOriginCooldownDTO `json:"forge_origin_cooldown,omitempty"`
-	WorkerRecovery      *WorkerRecoveryDTO      `json:"worker_recovery,omitempty"`
-	MemoryHold          *MemoryHoldDTO          `json:"memory_hold,omitempty"`
 
 	ID string `json:"id"`
 	// RepoID is null for a chat run (PRD #39): a chat has no repo. Non-null for
@@ -1167,6 +1209,8 @@ type RunSummaryItemDTO struct {
 	// value honestly — the API is deployed separately and a newer server can ship a harness
 	// this client has not heard of.
 	Harness string `json:"harness"`
+	// HarnessDecision is private to the run owner; null for legacy and foreign reads.
+	HarnessDecision *HarnessDecisionDTO `json:"harness_decision"`
 	// HasPRDLink is server-computed PRD presence for the runs view (PRD #764),
 	// derived label-independently from the run's snapshotted issue description via
 	// the same detector the board card uses (forgesvc.HasPRDLink). False for
@@ -1347,7 +1391,9 @@ type RunSummaryItemDTO struct {
 	CompletionUnmet []string `json:"completion_unmet"`
 	// HoldReason is why a paused run is HELD (mapped from run.HoldReason): 'completion_blocked'
 	// for a completion hold (PRD #1226), 'budget_exhausted' for a wall-clock park (PRD #1497),
+	// 'iteration_budget_exhausted' for an iteration park (Resume/Cancel; Extend adds time only),
 	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14),
+	// 'credentials_reset' while a run created before an account reset waits for a new credential (PRD #3989),
 	// 'credential_switch_settling' while the worker is still finishing its own operations on a run whose
 	// token switch could not be proven settled (Resume is refused until it finishes; Cancel works),
 	// 'credential_switch_unsettled' once it finished them, processes not proven stopped (Resume is open) (issue
@@ -1612,8 +1658,11 @@ type RunSummaryItemDTO struct {
 	// Per-run agent selection (PRD #37). The detected repo_agents roster is a detail field and is
 	// omitted from this summary; see RunDTO.RepoAgents. AgentSource/AgentExclusions stay null
 	// until a selection is made, at the gate or by an autopilot run's self-resolved default.
-	AgentSource     *string  `json:"agent_source"`
-	AgentExclusions []string `json:"agent_exclusions"`
+	AgentSource               *string  `json:"agent_source"`
+	AgentExclusions           []string `json:"agent_exclusions"`
+	AgentSourceRequested      *string  `json:"agent_source_requested"`
+	AgentSourceRequestedBasis *string  `json:"agent_source_requested_basis"`
+	PlanAgentSource           *string  `json:"plan_agent_source"`
 	// OwnAgents is the OWN-source subagent roster (name + description) the run's
 	// owner would run: exactly what ListClaimAgentTemplates delivers to a claim,
 	// minus the lead. It is the single source of truth the plan-gate "My agent
@@ -1771,12 +1820,17 @@ type RunSummaryItemDTO struct {
 	// "codex_account_unavailable" (PRD #1590, held on its Codex account) and "vault_locked"
 	// (issue #1766, the owner's vault is locked; the run resumes at its next retry once the
 	// vault is unlocked) and "data_volume_full" (PRD #1809 M5, the worker's data volume was full
-	// or about to fill; the run resumes at its next retry, see DiskParkCount);
+	// or about to fill; timed retries become owner holds with NULL retry at the cap, see DiskParkCount);
 	// "provider_outage" is active: a typed provider-transient retry park (PRD #1733).
 	// "worker_requeue_exhausted" and "worker_memory_pressure" require owner action.
 	// "retained_recovery_exhausted" can be timed or owner-held; see RecoveryRetryNotBefore.
-	// "retained_recovery_adoption_failed" is an integrity refusal: retained local work and
-	// custody are preserved, and only the owner can Resume or Cancel, without automatic retry.
+	// "retained_recovery_adoption_failed" is an integrity hold: retained adoption or a
+	// predecessor remediation record refused source use (in the remediation case the agent did
+	// not start and nothing was adopted or touched). Local work and custody are preserved, and
+	// only the owner can Resume or Cancel, without automatic retry.
+	// "retained_continuation_unwitnessed" is a claimed-never-started park whose retained custody
+	// continuation was never witnessed starting: the claim is released, retained work and custody
+	// are preserved, and only the owner can Resume or Cancel, without automatic retry.
 	// "empty_turn" remains reserved. Clients render an unrecognised value
 	// honestly (a newer server may ship a cause this client has not heard of), the same rule
 	// as RateLimitType.
@@ -1834,8 +1888,9 @@ type RunSummaryItemDTO struct {
 	// RecoveryRetryNotBefore is the earliest scheduled recovery promotion time, not
 	// a promise of immediate execution. It is separate from the usage-limit RetryNotBefore.
 	// Null means no scheduled recovery retry, including an owner-held codex_idle_stall
-	// or retained_recovery_exhausted park. An omitted key in a partial client read means
+	// or retained_recovery_exhausted or capped data_volume_full park. An omitted key in a partial client read means
 	// timing is unknown; consult RecoveryRetryNotBeforePresent before inferring a hold.
+	// retained_continuation_unwitnessed is likewise always owner-held.
 	// retained_recovery_adoption_failed is always owner-held, even if a malformed
 	// response supplies a retry timestamp; the cause never schedules a timer.
 	RecoveryRetryNotBefore *time.Time `json:"recovery_retry_not_before"`
@@ -1857,6 +1912,7 @@ type RunSummaryItemDTO struct {
 	// lifetime (PRD #1809 M5, D6), the DISK-ONLY counter the UZI_RUN_DISK_PARK_MAX cap decides
 	// on — distinct from ForgeParkCount and from the backoff-shaping recovery_wait_count. A
 	// preventive disk park (the worker stopped the run before its volume filled) does not count.
+	// Exhaustion holds for owner Resume with NULL retry time; the count stays saturated.
 	// 0 for a run that has never taken a counted disk park.
 	DiskParkCount int `json:"disk_park_count"`
 	// ProviderParkCount is how many typed 'provider_outage' recovery parks are in this run's open
@@ -1972,6 +2028,10 @@ type RunSummaryItemDTO struct {
 	JudgeVerdict   *string `json:"judge_verdict"`
 	JudgeTodoCount int     `json:"judge_todo_count"`
 	IsRevising     bool    `json:"is_revising"`
+	// PendingQuestion mirrors RunListItemDTO.PendingQuestion (PRD #4040).
+	PendingQuestion string `json:"pending_question,omitempty"`
+	// CrossCheckActive mirrors RunListItemDTO.CrossCheckActive (issue #4082).
+	CrossCheckActive *string `json:"cross_check_active"`
 }
 
 // RunSummaryOf projects a decorated list row onto the compact summary view (issue #2661). The
@@ -1979,6 +2039,7 @@ type RunSummaryItemDTO struct {
 // key-set test in run_summary_test.go fails until the field is placed here on purpose.
 func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 	return RunSummaryItemDTO{
+		PolicyHold:                    item.PolicyHold,
 		WorkerRecovery:                item.WorkerRecovery,
 		MemoryHold:                    item.MemoryHold,
 		ID:                            item.ID,
@@ -1989,6 +2050,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		ContinuedIssueIID:             item.ContinuedIssueIID,
 		IssueTitle:                    item.IssueTitle,
 		Harness:                       item.Harness,
+		HarnessDecision:               item.HarnessDecision,
 		HasPRDLink:                    item.HasPRDLink,
 		Title:                         item.Title,
 		ResumeOfRunID:                 item.ResumeOfRunID,
@@ -2093,6 +2155,9 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		StatusSince:                   item.StatusSince,
 		AgentSource:                   item.AgentSource,
 		AgentExclusions:               item.AgentExclusions,
+		AgentSourceRequested:          item.AgentSourceRequested,
+		AgentSourceRequestedBasis:     item.AgentSourceRequestedBasis,
+		PlanAgentSource:               item.PlanAgentSource,
 		OwnAgents:                     item.OwnAgents,
 		AnthropicSecretID:             item.AnthropicSecretID,
 		AnthropicSecretLabel:          item.AnthropicSecretLabel,
@@ -2152,6 +2217,8 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		JudgeVerdict:                  item.JudgeVerdict,
 		JudgeTodoCount:                item.JudgeTodoCount,
 		IsRevising:                    item.IsRevising,
+		PendingQuestion:               item.PendingQuestion,
+		CrossCheckActive:              item.CrossCheckActive,
 		CodeCrossCheckRequired:        item.CodeCrossCheckRequired,
 		CodeCrossCheckSummary:         item.CodeCrossCheckSummary,
 		AccountCooldownClass:          item.AccountCooldownClass,
@@ -2165,6 +2232,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 	return RunListItemDTO{
 		RunDTO: RunDTO{
+			PolicyHold:                    s.PolicyHold,
 			WorkerRecovery:                s.WorkerRecovery,
 			MemoryHold:                    s.MemoryHold,
 			ID:                            s.ID,
@@ -2175,6 +2243,7 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			ContinuedIssueIID:             s.ContinuedIssueIID,
 			IssueTitle:                    s.IssueTitle,
 			Harness:                       s.Harness,
+			HarnessDecision:               s.HarnessDecision,
 			HasPRDLink:                    s.HasPRDLink,
 			Title:                         s.Title,
 			ResumeOfRunID:                 s.ResumeOfRunID,
@@ -2279,6 +2348,9 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			StatusSince:                   s.StatusSince,
 			AgentSource:                   s.AgentSource,
 			AgentExclusions:               s.AgentExclusions,
+			AgentSourceRequested:          s.AgentSourceRequested,
+			AgentSourceRequestedBasis:     s.AgentSourceRequestedBasis,
+			PlanAgentSource:               s.PlanAgentSource,
 			OwnAgents:                     s.OwnAgents,
 			AnthropicSecretID:             s.AnthropicSecretID,
 			AnthropicSecretLabel:          s.AnthropicSecretLabel,
@@ -2338,11 +2410,13 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			AccountCooldownClass:          s.AccountCooldownClass,
 			AccountCooldownEligibleAt:     s.AccountCooldownEligibleAt,
 		},
-		RepoPath:       s.RepoPath,
-		WorkerName:     s.WorkerName,
-		OwnerEmail:     s.OwnerEmail,
-		JudgeVerdict:   s.JudgeVerdict,
-		JudgeTodoCount: s.JudgeTodoCount,
+		RepoPath:         s.RepoPath,
+		WorkerName:       s.WorkerName,
+		OwnerEmail:       s.OwnerEmail,
+		JudgeVerdict:     s.JudgeVerdict,
+		JudgeTodoCount:   s.JudgeTodoCount,
+		PendingQuestion:  s.PendingQuestion,
+		CrossCheckActive: s.CrossCheckActive,
 	}
 }
 
@@ -2374,6 +2448,14 @@ type RunListItemDTO struct {
 	// bucketed in Go. See queries/runtime.sql for why the count cannot ride the join.
 	JudgeVerdict   *string `json:"judge_verdict"`
 	JudgeTodoCount int     `json:"judge_todo_count"`
+	// PendingQuestion is the one-line excerpt of the run's newest pending question (PRD
+	// #4040), runquestion.Excerpt of the question message. Owner-only: ListRuns sets it for
+	// awaiting_input rows; the admin list never carries it. Omitted when absent.
+	PendingQuestion string `json:"pending_question,omitempty"`
+	// CrossCheckActive is "plan" while a plan cross-check is live for the run, "code" while a
+	// code cross-check is live, and null otherwise (issue #4082). List-only presence flag: it
+	// carries no findings, verdict, model or deadline. Always sent (null when none).
+	CrossCheckActive *string `json:"cross_check_active"`
 }
 
 // MessageDTO is one persisted run message (the replay source a reconnecting
@@ -2611,17 +2693,20 @@ func (r *RunListItemDTO) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	var context struct {
-		RepoPath       string  `json:"repo_path"`
-		WorkerName     *string `json:"worker_name"`
-		OwnerEmail     *string `json:"owner_email"`
-		JudgeVerdict   *string `json:"judge_verdict"`
-		JudgeTodoCount int     `json:"judge_todo_count"`
+		RepoPath         string  `json:"repo_path"`
+		WorkerName       *string `json:"worker_name"`
+		OwnerEmail       *string `json:"owner_email"`
+		JudgeVerdict     *string `json:"judge_verdict"`
+		JudgeTodoCount   int     `json:"judge_todo_count"`
+		PendingQuestion  string  `json:"pending_question"`
+		CrossCheckActive *string `json:"cross_check_active"`
 	}
 	if err := json.Unmarshal(data, &context); err != nil {
 		return err
 	}
 	*r = RunListItemDTO{RunDTO: run, RepoPath: context.RepoPath, WorkerName: context.WorkerName,
-		OwnerEmail: context.OwnerEmail, JudgeVerdict: context.JudgeVerdict, JudgeTodoCount: context.JudgeTodoCount}
+		OwnerEmail: context.OwnerEmail, JudgeVerdict: context.JudgeVerdict, JudgeTodoCount: context.JudgeTodoCount,
+		PendingQuestion: context.PendingQuestion, CrossCheckActive: context.CrossCheckActive}
 	return nil
 }
 

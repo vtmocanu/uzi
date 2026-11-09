@@ -1,0 +1,111 @@
+{
+  "description": "Drift fixture for the owner-steering v1 builder (issue #3841). The agent side reads this file too: snapshot is the canonical v1 text and digest its hex sha256.",
+  "input": {
+    "cutoff": 20,
+    "total": 9,
+    "rows": [
+      {
+        "input_id": 11,
+        "kind": "answer",
+        "question_id": "q0",
+        "answers_status": "ok",
+        "answers": [
+          "x"
+        ],
+        "occurrences": 1,
+        "variants": 1,
+        "question_agent": "worker",
+        "questions_status": "ok",
+        "questions": [
+          {
+            "header": "",
+            "question": "Q?",
+            "options": [],
+            "multi_select": true
+          }
+        ]
+      },
+      {
+        "input_id": 12,
+        "kind": "answer",
+        "question_id": "q1",
+        "answers_status": "ok",
+        "answers": [
+          "Use sqlite",
+          "yes"
+        ],
+        "occurrences": 2,
+        "variants": 1,
+        "question_agent": "lead",
+        "questions_status": "ok",
+        "questions": [
+          {
+            "header": "DB",
+            "question": "Which db?",
+            "options": [
+              "pg",
+              "sqlite"
+            ],
+            "multi_select": false
+          }
+        ]
+      },
+      {
+        "input_id": 13,
+        "kind": "answer",
+        "question_id": "q2",
+        "answers_status": "unparseable",
+        "occurrences": 0,
+        "variants": 0
+      },
+      {
+        "input_id": 14,
+        "kind": "answer",
+        "question_id": "q3",
+        "answers_status": "malformed",
+        "occurrences": 1,
+        "variants": 1,
+        "question_agent": "lead",
+        "questions_status": "malformed"
+      },
+      {
+        "input_id": 15,
+        "kind": "revise_plan",
+        "gate_binding": "bound",
+        "gate_revision": 3,
+        "revise_body": "Drop <b>X</b> &   more"
+      },
+      {
+        "input_id": 16,
+        "kind": "revise_plan",
+        "gate_binding": "unbound"
+      },
+      {
+        "input_id": 18,
+        "kind": "answer",
+        "question_id": "q5",
+        "answers_status": "ok",
+        "answers": [
+          "a"
+        ],
+        "occurrences": 2,
+        "variants": 2,
+        "question_agent": "lead",
+        "questions_status": "ok"
+      },
+      {
+        "input_id": 19,
+        "kind": "answer",
+        "question_id": "q6",
+        "answers_status": "oversized",
+        "occurrences": 1,
+        "variants": 1,
+        "question_agent": "lead",
+        "questions_status": "oversized"
+      }
+    ]
+  },
+  "snapshot": "{\"version\":1,\"cutoff_input_id\":20,\"owner_entries\":[{\"input_id\":11,\"kind\":\"answer\",\"question_id\":\"q0\",\"answers_status\":\"ok\",\"answers\":[\"x\"],\"truncated\":false},{\"input_id\":12,\"kind\":\"answer\",\"question_id\":\"q1\",\"answers_status\":\"ok\",\"answers\":[\"Use sqlite\",\"yes\"],\"truncated\":false},{\"input_id\":13,\"kind\":\"answer\",\"question_id\":\"q2\",\"answers_status\":\"unparseable\",\"answers\":null,\"truncated\":false},{\"input_id\":14,\"kind\":\"answer\",\"question_id\":\"q3\",\"answers_status\":\"malformed\",\"answers\":null,\"truncated\":false},{\"input_id\":15,\"kind\":\"revise\",\"gate_binding\":\"bound\",\"gate_revision\":3,\"feedback\":\"Drop \\u003cb\\u003eX\\u003c/b\\u003e \\u0026 \\u2028 more\",\"truncated\":false},{\"input_id\":16,\"kind\":\"revise\",\"gate_binding\":\"unbound\",\"gate_revision\":null,\"feedback\":null,\"truncated\":false},{\"input_id\":18,\"kind\":\"answer\",\"question_id\":\"q5\",\"answers_status\":\"ok\",\"answers\":[\"a\"],\"truncated\":false},{\"input_id\":19,\"kind\":\"answer\",\"question_id\":\"q6\",\"answers_status\":\"oversized\",\"answers\":null,\"truncated\":false}],\"question_context\":[{\"answer_input_id\":11,\"question_id\":\"q0\",\"status\":\"bound\",\"author\":\"worker\",\"questions\":[{\"header\":\"\",\"question\":\"Q?\",\"options\":[],\"multi_select\":true}],\"truncated\":false},{\"answer_input_id\":12,\"question_id\":\"q1\",\"status\":\"bound\",\"author\":\"lead\",\"questions\":[{\"header\":\"DB\",\"question\":\"Which db?\",\"options\":[\"pg\",\"sqlite\"],\"multi_select\":false}],\"truncated\":false},{\"answer_input_id\":13,\"question_id\":\"q2\",\"status\":\"unavailable\"},{\"answer_input_id\":14,\"question_id\":\"q3\",\"status\":\"malformed\"},{\"answer_input_id\":18,\"question_id\":\"q5\",\"status\":\"ambiguous\"},{\"answer_input_id\":19,\"question_id\":\"q6\",\"status\":\"oversized\"}],\"omitted_entries\":1,\"overflow\":true,\"overflow_reason\":\"entry_cap\"}",
+  "digest": "3295ecc7ad582ea36463d0d54dab14e9fef07ef97068c654ecbced4347dea1a3",
+  "wire_max_bytes": 393337
+}

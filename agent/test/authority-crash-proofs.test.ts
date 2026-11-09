@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
@@ -45,6 +45,8 @@ interface Child {
   exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
   /** SIGKILL the owning worker and wait for the kernel to report it killed by that signal. */
   kill(): Promise<void>;
+  /** Every stdout line the worker has printed, in order (the queue `line()` consumes is a subset). */
+  seen: string[];
 }
 
 function spawnChild(t: TestContext, config: ChildConfig): Child {
@@ -55,23 +57,28 @@ function spawnChild(t: TestContext, config: ChildConfig): Child {
     proc.once("close", (code, signal) => resolve({ code, signal })));
   const queue: string[] = [];
   const waiters: Array<{ resolve(line: string): void; reject(error: Error): void }> = [];
+  const seen: string[] = [];
   let buffer = "";
   proc.stdout!.on("data", (chunk: Buffer) => {
     buffer += chunk.toString("utf8");
     for (let i = buffer.indexOf("\n"); i >= 0; i = buffer.indexOf("\n")) {
       const next = buffer.slice(0, i);
       buffer = buffer.slice(i + 1);
+      seen.push(next);
       const waiter = waiters.shift();
       if (waiter) waiter.resolve(next); else queue.push(next);
     }
   });
+  let closed = false;
   void exited.then(({ code, signal }) => {
+    closed = true;
     for (const waiter of waiters.splice(0)) waiter.reject(new Error(`child exited (${code ?? signal}) before reporting`));
   });
   t.after(() => { if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL"); });
   return {
-    proc, exited,
+    proc, exited, seen,
     line: () => queue.length > 0 ? Promise.resolve(queue.shift()!)
+      : closed ? Promise.reject(new Error("child exited before reporting"))
       : new Promise<string>((resolve, reject) => waiters.push({ resolve, reject })),
     kill: async () => {
       proc.kill("SIGKILL");
@@ -459,4 +466,435 @@ test("proof 3: while P1 holds W, P2 (same dir, symlinked parent, trailing slash)
   assert.equal(fs.readFileSync(path.join(a, "owner-data-a.txt"), "utf8"), "A bytes\n", "the footprint is intact");
   assert.equal(await release(rig1), "0");
   await gone(helperPid);
+});
+
+// ---- issue #4066: the worker shutdown barrier --------------------------------------------------
+//
+// The owning worker is the same real process as above, now with a SIGTERM path that mirrors main.ts (see
+// fixtures/authority-crash-child.ts). Every pause is a FIFO; the shutdown budget and the idle-drain lock wait are small
+// injected values, never real 20/30/35 second waits. Settlements come from the production runner-uid delete (the real
+// rm held behind a FIFO until it times out into RunnerDeleteUnsettledError) and from the production
+// cleanupArchivedRecoveryPin (its real `git update-ref --stdin` child held behind a FIFO), over the real AuthorityRuntime.
+// A successor then reads the durable slot the exited worker left.
+
+/** Read stdout lines until one satisfies `done`; returns that line. Rejects if the worker exits first. */
+async function until(worker: Child, done: (line: string) => boolean): Promise<string> {
+  for (;;) {
+    const line = await worker.line();
+    if (done(line)) return line;
+  }
+}
+
+function makeFifo(t: TestContext): string {
+  const fifo = path.join(makeTmp(t, "m4066-fifo-"), "fifo");
+  execFileSync("mkfifo", [fifo]);
+  return fifo;
+}
+
+/** Release a barrier without waiting for the helper's exit status (the git wrapper execs git, so it reports none). */
+async function releaseGo(rig: Rig): Promise<void> {
+  await fsp.writeFile(rig.go, "go\n");
+}
+
+/** Try to take A on `dataDir` from a separate process (W is held by the worker, so A is probed at the kernel lock). */
+function probeAuthorityLock(dataDir: string): { status: number } {
+  const file = path.join(dataDir, ".uzi-authority", "authority.lock");
+  // Resolve via PATH. Both util-linux and BusyBox return 1 for a conflict with this common -n form.
+  const result = spawnSync("flock", ["-x", "-n", file, "true"], { encoding: "utf8" });
+  assert.ifError(result.error);
+  assert.equal(result.signal, null, "flock probe must not be killed");
+  assert.ok(result.status !== null, "flock probe must produce an exit status");
+  assert.ok(result.status === 0 || result.status === 1, `flock probe failed with status ${result.status}: ${result.stderr}`);
+  assert.equal(result.stderr, "", "flock probe must not report an execution or usage error");
+  return { status: result.status };
+}
+
+const GATE_LATE = { rmTimeoutMs: 100, shutdownBudgetMs: 5_000 } as const;
+
+/** A late-queue worker over a fresh clone pair; returns once the worker reports READY. */
+async function lateWorker(t: TestContext, extra: Partial<ChildConfig>): Promise<{
+  dataDir: string; bare: string; a: string; b: string; worker: Child; rig1: Rig; rig2: Rig;
+}> {
+  const { dataDir, bare, a, b } = await twoClones(t);
+  const rig1 = makeBarrier(t);
+  const rig2 = makeBarrier(t);
+  reapHelper(t, rig1);
+  reapHelper(t, rig2);
+  const worker = spawnChild(t, { scenario: "late-queue", dataDir, token: TOKEN, bare, barrier: rig1, barrier2: rig2,
+    branch: BR_A, key: "issue-5101", runId: RUN_A, branch2: BR_B, key2: "issue-5102", runId2: RUN_B, ...GATE_LATE, ...extra });
+  await until(worker, (line) => line === "READY");
+  assert.ok(worker.seen.some((line) => line.startsWith("UNSETTLED:")), "the production runner-uid delete timed out into an unsettled record");
+  return { dataDir, bare, a, b, worker, rig1, rig2 };
+}
+
+/** What the successor reads of `target` after the worker exited: the durable slot. */
+const persistedSuccessors = new Map<string, ReturnType<typeof successor>>();
+/** One successor per data dir: its W handle lives as long as this test process, so a second acquisition would refuse. */
+function persistedSuccessor(dataDir: string): ReturnType<typeof successor> {
+  let opened = persistedSuccessors.get(dataDir);
+  if (opened === undefined) { opened = successor(dataDir); persistedSuccessors.set(dataDir, opened); }
+  return opened;
+}
+async function persistedSlot(dataDir: string, target: string): Promise<SlotSnapshot | null> {
+  const { rt } = await persistedSuccessor(dataDir);
+  return slotOf(rt, target);
+}
+
+const sigterm = async (worker: Child): Promise<void> => {
+  worker.proc.kill("SIGTERM");
+  await until(worker, (line) => line === "SIGTERM-HANDLER");
+};
+
+function resultOf(worker: Child): { result: string; exitCode: number } | undefined {
+  const line = worker.seen.find((l) => l.startsWith("RESULT:"));
+  return line === undefined ? undefined : JSON.parse(line.slice("RESULT:".length)) as { result: string; exitCode: number };
+}
+
+test("issue #4066 (a1): a settlement queued while the drain is paused after its splice is applied before a SIGTERM exit", { timeout: 120_000 }, async (t) => {
+  const holdGo = makeFifo(t);
+  const { dataDir, a, b, worker, rig1, rig2 } = await lateWorker(t, { lateMode: "a1", holdGo, lateWaitMs: 5_000 });
+  await armed(rig1, worker);
+  await armed(rig2, worker);
+  assert.equal(await release(rig1), "0", "the first held rm exits");
+  await until(worker, (line) => line === "SPLICED"); // the drain took the first late close out of the queue and is paused
+  assert.equal(await release(rig2), "0", "the second held rm exits while the drain is paused");
+  await until(worker, (line) => line === "CLOSED:2"); // its late close is queued behind the spliced one
+  await sigterm(worker);
+  await fsp.writeFile(holdGo, "go\n"); // the paused drain continues; its spliced entry is applied, the queued one is not
+  const exit = await worker.exited;
+
+  const slotB = await persistedSlot(dataDir, b);
+  assert.notEqual(slotB?.pending?.status, "running", "the settlement queued during the paused drain is durable before the worker exits");
+  const slotA = await persistedSlot(dataDir, a);
+  assert.notEqual(slotA?.pending?.status, "running", "the spliced settlement is durable too");
+  assert.deepEqual(resultOf(worker), { result: "drained", exitCode: 0 });
+  assert.equal(exit.code, 0);
+});
+
+test("issue #4066 (a2): a late settlement queued behind a raw A holder is applied before a SIGTERM exit", { timeout: 120_000 }, async (t) => {
+  const holdGo = makeFifo(t);
+  const { dataDir, a, worker, rig1 } = await lateWorker(t, { lateMode: "a2", holdGo, lateWaitMs: 200 });
+  assert.ok(worker.seen.includes("HOLDING-A"), "a raw withAuthorityTransaction holder owns A");
+  await armed(rig1, worker);
+  assert.equal(await release(rig1), "0");
+  await until(worker, (line) => line === "QUEUED-WARN"); // the idle drain's bounded wait for A expired: the settlement stays queued
+  await sigterm(worker);
+  await fsp.writeFile(holdGo, "go\n"); // the raw holder releases
+  const exit = await worker.exited;
+
+  const slot = await persistedSlot(dataDir, a);
+  assert.notEqual(slot?.pending?.status, "running", "the queued settlement is durable before the worker exits");
+  assert.deepEqual(resultOf(worker), { result: "drained", exitCode: 0 });
+  assert.equal(exit.code, 0);
+});
+
+test("issue #4066 (a3): a settlement whose apply failed once and was re-queued is applied before a SIGTERM exit", { timeout: 120_000 }, async (t) => {
+  const { dataDir, a, worker, rig1 } = await lateWorker(t, { lateMode: "a3" });
+  await armed(rig1, worker);
+  assert.equal(await release(rig1), "0");
+  await until(worker, (line) => line === "REQUEUED"); // the first apply failed (one injected rename failure) and was queued again
+  await sigterm(worker);
+  const exit = await worker.exited;
+
+  const slot = await persistedSlot(dataDir, a);
+  assert.notEqual(slot?.pending?.status, "running", "the re-queued settlement is durable before the worker exits");
+  assert.deepEqual(resultOf(worker), { result: "drained", exitCode: 0 });
+  assert.equal(exit.code, 0);
+});
+
+test("issue #4066 (c): a late close that fires inside an open transaction keeps A held until its settlement write finishes", { timeout: 120_000 }, async (t) => {
+  const { dataDir, bare, a } = await twoClones(t);
+  const rig = makeBarrier(t);
+  reapHelper(t, rig);
+  const writeGo = makeFifo(t);
+  const worker = spawnChild(t, { scenario: "late-close-inline", dataDir, token: TOKEN, bare, barrier: rig, writeGo,
+    branch: BR_A, key: "issue-5101", runId: RUN_A, rmTimeoutMs: 100, shutdownBudgetMs: 1_000 });
+  await until(worker, (line) => line === "CALLBACK-RETURNED");
+  assert.ok(worker.seen.includes("ARMED-WRITE"), "the late close fired in the open transaction and its slot write is paused before rename");
+  assert.ok(!worker.seen.includes("INLINE-NOT-REACHED"));
+  await sigterm(worker);
+
+  // (ii) A is still held by the paused apply: the transaction's callback returned, but its lock lifetime is the apply's.
+  const probe = probeAuthorityLock(dataDir);
+  assert.equal(probe.status, 1, "confirmed flock conflict: A is still held while the inline settlement write is paused");
+
+  // (i) the observer reports the incomplete shutdown while the write is paused; nothing reports a clean shutdown.
+  const logged = await until(worker, (line) => line.startsWith("LOG:") && line.includes("worker_shutdown_result"));
+  const decision = JSON.parse(logged.slice("LOG:".length)) as { fields: { result: string; reasons: string[] } };
+  assert.equal(decision.fields.result, "incomplete");
+  assert.ok(decision.fields.reasons.some((r) => r === "inline_apply_in_flight" || r === "transaction_in_flight"), `reasons: ${decision.fields.reasons.join(",")}`);
+  assert.equal(resultOf(worker), undefined, "no clean shutdown was reported while the write is paused");
+  assert.equal(worker.proc.exitCode, null, "the worker is still alive");
+
+  // (iii) releasing the write barrier lets the settlement become durable; the shutdown still exits 1.
+  await fsp.writeFile(writeGo, "go\n");
+  const exit = await worker.exited;
+  const slot = await persistedSlot(dataDir, a);
+  assert.equal(slot?.pending?.status, "settled_failed");
+  assert.ok((slot?.pending?.residue ?? []).length > 0, "the failed delete's residue is recorded");
+  assert.equal(exit.code, 1);
+});
+
+test("issue #4066 (c) SIGKILL variant: killed while the inline settlement write is paused before rename, the successor still refuses the footprint", { timeout: 120_000 }, async (t) => {
+  const { dataDir, bare, a } = await twoClones(t);
+  const rig = makeBarrier(t);
+  reapHelper(t, rig);
+  const writeGo = makeFifo(t);
+  const worker = spawnChild(t, { scenario: "late-close-inline", dataDir, token: TOKEN, bare, barrier: rig, writeGo,
+    branch: BR_A, key: "issue-5101", runId: RUN_A, rmTimeoutMs: 100, shutdownBudgetMs: 1_000 });
+  await until(worker, (line) => line === "CALLBACK-RETURNED");
+  assert.ok(worker.seen.includes("ARMED-WRITE"));
+  await worker.kill();
+  const { rt, git } = await successor(dataDir);
+  assert.equal((await slotOf(rt, a))?.pending?.status, "running", "the rename never happened: the durable record is still running");
+  await assert.rejects(rt.withTransaction(() => reseedA(git, bare)), /unresolved pending footprint/);
+});
+
+test("issue #4066 (b): a held recovery-pin continuation is joined before the seal, and admission after the seal is refused", { timeout: 120_000 }, async (t) => {
+  const fx = makeFixture();
+  t.after(() => fx.cleanup());
+  const dataDir = fs.realpathSync(fx.dataDir);
+  const plain = new GitCache(dataDir, nullLogger(), undefined);
+  const bare = await plain.ensureClone(fx.originPath);
+  fs.chmodSync(path.dirname(bare), 0o700);
+  fs.chmodSync(bare, 0o700);
+  const sourceSha = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
+  const runId = "40664066-1111-2222-3333-444444444444";
+  assert.equal(await plain.anchorRecoveryHead(bare, runId, 1, sourceSha), true);
+  const rig = makeBarrier(t);
+  reapHelper(t, rig);
+  const worker = spawnChild(t, { scenario: "pin-cleanup", dataDir, token: TOKEN, bare, barrier: rig, shutdownBudgetMs: 10_000,
+    wrapDir: makeTmp(t, "m4066-wrap-"), pin: { runId, generation: 1, sourceSha, deadlineMs: 3_000 } });
+  await armed(rig, worker); // the real `git update-ref --stdin` child exists and is held before Git runs
+  await until(worker, (line) => line === "DEADLINE-PASSED"); // the caller's deadline passed with the child in flight
+  await sigterm(worker);
+  assert.ok(!worker.seen.some((line) => line === "PHASE:sealed" || line === "PHASE:final_drain_started"),
+    "nothing sealed or drained while the pin child is held");
+  await releaseGo(rig); // within the abort grace: Git sees prepare then abort and exits by itself
+  const exit = await worker.exited;
+
+  const phases = worker.seen.filter((line) => line.startsWith("PHASE:"));
+  assert.deepEqual(phases, ["PHASE:prerequisites_joined", "PHASE:sealed", "PHASE:final_drain_started"]);
+  assert.ok(worker.seen.includes("ADMISSION:AuthorityShutdownRefusal"), "a new admission after the seal is refused");
+  assert.deepEqual(resultOf(worker), { result: "drained", exitCode: 0 });
+  assert.equal(exit.code, 0);
+  const slot = await persistedSlot(dataDir, bare);
+  assert.notEqual(slot?.pending?.status, "running", "the pin continuation settled its record");
+  assert.equal(gitIn(bare, ["rev-parse", `refs/uzi-recovery-pin/${runId}/1`]), sourceSha, "the aborted delete left the recovery pin on its source");
+});
+
+test("issue #4066 (b): a held unsettled runner-uid delete is joined before the seal; its late close is applied by the final drain", { timeout: 120_000 }, async (t) => {
+  const { dataDir, a, worker, rig1 } = await lateWorker(t, { lateMode: "b2" });
+  await armed(rig1, worker);
+  await sigterm(worker);
+  assert.ok(!worker.seen.some((line) => line === "PHASE:sealed" || line === "PHASE:final_drain_started"),
+    "nothing sealed or drained while the delete is unsettled");
+  assert.equal(await release(rig1), "0");
+  const exit = await worker.exited;
+
+  const phases = worker.seen.filter((line) => line.startsWith("PHASE:"));
+  assert.deepEqual(phases, ["PHASE:prerequisites_joined", "PHASE:sealed", "PHASE:final_drain_started"]);
+  assert.ok(worker.seen.includes("ADMISSION:AuthorityShutdownRefusal"));
+  assert.deepEqual(resultOf(worker), { result: "drained", exitCode: 0 });
+  assert.equal(exit.code, 0);
+  assert.notEqual((await persistedSlot(dataDir, a))?.pending?.status, "running");
+});
+
+test("issue #4066 control: an uninterrupted late close is applied and a SIGTERM exits drained", { timeout: 120_000 }, async (t) => {
+  const { dataDir, a, worker, rig1 } = await lateWorker(t, { lateMode: "plain" });
+  await armed(rig1, worker);
+  assert.equal(await release(rig1), "0");
+  await until(worker, (line) => line === "CLOSED:1");
+  await sigterm(worker);
+  const exit = await worker.exited;
+  assert.notEqual((await persistedSlot(dataDir, a))?.pending?.status, "running", "the idle drain applied the late close");
+  assert.deepEqual(resultOf(worker), { result: "drained", exitCode: 0 });
+  assert.equal(exit.code, 0);
+});
+
+test("issue #4066 control: SIGKILL before the late close leaves the running record and the successor refuses", { timeout: 120_000 }, async (t) => {
+  const { dataDir, bare, a, worker, rig1 } = await lateWorker(t, { lateMode: "plain" });
+  await armed(rig1, worker);
+  await worker.kill();
+  const { rt, git } = await successor(dataDir);
+  assert.equal((await slotOf(rt, a))?.pending?.status, "running");
+  await assert.rejects(rt.withTransaction(() => reseedA(git, bare)), /unresolved pending footprint/);
+  assert.equal(await release(rig1), "0"); // the orphaned rm finishes; that alone settles nothing
+  assert.equal((await slotOf(rt, a))?.pending?.status, "running");
+});
+
+
+// ---- issue #4066: the controls around the barrier ----------------------------------------------
+
+/** The decisions the worker logged (`worker_shutdown_result`), parsed. */
+function decisions(worker: Child): Array<{ level: string; fields: { result: string; reasons: string[]; counts: Record<string, number>; operations: string[] } }> {
+  return worker.seen.filter((l) => l.startsWith("LOG:") && l.includes("worker_shutdown_result"))
+    .map((l) => JSON.parse(l.slice("LOG:".length)) as ReturnType<typeof decisions>[number]);
+}
+
+async function firstDecision(worker: Child): Promise<ReturnType<typeof decisions>[number]> {
+  await until(worker, (line) => line.startsWith("LOG:") && line.includes("worker_shutdown_result"));
+  return decisions(worker)[0]!;
+}
+
+const SHORT_BUDGET = { rmTimeoutMs: 100, shutdownBudgetMs: 700, lateWaitMs: 200 } as const;
+
+test("issue #4066 deadline, holder never released (A): the incomplete line comes first, then SIGKILL leaves the refusal in place", { timeout: 120_000 }, async (t) => {
+  const holdGo = makeFifo(t);
+  const { dataDir, bare, a, worker, rig1 } = await lateWorker(t, { lateMode: "a2", holdGo, ...SHORT_BUDGET });
+  await armed(rig1, worker);
+  assert.equal(await release(rig1), "0");
+  await until(worker, (line) => line === "QUEUED-WARN");
+  await sigterm(worker);
+  const decision = await firstDecision(worker);
+  assert.equal(decision.level, "warn");
+  assert.equal(decision.fields.result, "incomplete");
+  for (const reason of ["deadline", "prerequisite_pending", "queued_settlement"]) {
+    assert.ok(decision.fields.reasons.includes(reason), `reasons: ${decision.fields.reasons.join(",")}`);
+  }
+  assert.equal(decision.fields.operations.length, 1);
+  assert.equal(resultOf(worker), undefined, "no clean result while the holder is unreleased");
+  assert.ok(!worker.seen.some((line) => line.startsWith("PHASE:")), "no phase ran: the prerequisite join is still waiting");
+  assert.equal(worker.proc.exitCode, null, "the worker is still alive");
+
+  await worker.kill();
+  const { rt, git } = await persistedSuccessor(dataDir);
+  assert.equal((await slotOf(rt, a))?.pending?.status, "running", "the settlement never became durable");
+  await assert.rejects(rt.withTransaction(() => reseedA(git, bare)), /unresolved pending footprint/);
+});
+
+test("issue #4066 deadline, holder released late (B): the join completes, the queued settlement stays queued, exit 1, the successor still refuses", { timeout: 120_000 }, async (t) => {
+  const holdGo = makeFifo(t);
+  const { dataDir, bare, a, worker, rig1 } = await lateWorker(t, { lateMode: "a2", holdGo, ...SHORT_BUDGET });
+  await armed(rig1, worker);
+  assert.equal(await release(rig1), "0");
+  await until(worker, (line) => line === "QUEUED-WARN");
+  await sigterm(worker);
+  await firstDecision(worker);
+  await fsp.writeFile(holdGo, "go\n"); // the holder releases after the deadline
+  const exit = await worker.exited;
+
+  assert.equal(exit.code, 1);
+  assert.equal(decisions(worker).length, 1, "decided once: the barrier added no second line");
+  assert.deepEqual(resultOf(worker), { result: "incomplete", exitCode: 1 });
+  assert.deepEqual(worker.seen.filter((l) => l.startsWith("PHASE:")), ["PHASE:prerequisites_joined", "PHASE:sealed", "PHASE:final_drain_started"]);
+  const { rt, git } = await persistedSuccessor(dataDir);
+  assert.equal((await slotOf(rt, a))?.pending?.status, "running", "no drain starts past the deadline");
+  await assert.rejects(rt.withTransaction(() => reseedA(git, bare)), /unresolved pending footprint/);
+});
+
+test("issue #4066 deadline, pin continuation pending: the result is logged while it is pending, nothing is sealed, and after the join the late settle stays queued (exit 1)", { timeout: 120_000 }, async (t) => {
+  const fx = makeFixture();
+  t.after(() => fx.cleanup());
+  const dataDir = fs.realpathSync(fx.dataDir);
+  const plain = new GitCache(dataDir, nullLogger(), undefined);
+  const bare = await plain.ensureClone(fx.originPath);
+  fs.chmodSync(path.dirname(bare), 0o700);
+  fs.chmodSync(bare, 0o700);
+  const sourceSha = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
+  const runId = "40664066-5555-6666-7777-888888888888";
+  assert.equal(await plain.anchorRecoveryHead(bare, runId, 1, sourceSha), true);
+  const rig = makeBarrier(t);
+  reapHelper(t, rig);
+  const worker = spawnChild(t, { scenario: "pin-cleanup", dataDir, token: TOKEN, bare, barrier: rig, shutdownBudgetMs: 500,
+    wrapDir: makeTmp(t, "m4066-wrap-"), pin: { runId, generation: 1, sourceSha, deadlineMs: 3_000 } });
+  t.after(() => t.diagnostic(`worker output:\n${worker.seen.join("\n")}`));
+  await armed(rig, worker);
+  await until(worker, (line) => line === "DEADLINE-PASSED");
+  await sigterm(worker);
+  const decision = await firstDecision(worker);
+  assert.equal(decision.fields.result, "incomplete");
+  assert.ok(decision.fields.reasons.includes("prerequisite_pending") && decision.fields.reasons.includes("deadline"), decision.fields.reasons.join());
+  assert.ok(!worker.seen.some((line) => line === "PHASE:sealed" || line === "PHASE:final_drain_started"), "nothing sealed while the pin child is held");
+  assert.equal(worker.proc.exitCode, null, "the worker is alive");
+
+  await releaseGo(rig);
+  const exit = await worker.exited;
+  assert.equal(exit.code, 1);
+  assert.equal(decisions(worker).length, 1);
+  assert.deepEqual(worker.seen.filter((l) => l.startsWith("PHASE:")), ["PHASE:prerequisites_joined", "PHASE:sealed", "PHASE:final_drain_started"]);
+  assert.equal((await persistedSlot(dataDir, bare))?.pending?.status, "running", "the continuation's settle stayed queued past the deadline");
+  assert.equal(gitIn(bare, ["rev-parse", `refs/uzi-recovery-pin/${runId}/1`]), sourceSha, "the aborted delete left the recovery pin on its source");
+});
+
+test("issue #4066 unjoined git child: a pin-cleanup child killed by a signal never settles; incomplete with open_settlement, exit 1, the successor still refuses", { timeout: 120_000 }, async (t) => {
+  const fx = makeFixture();
+  t.after(() => fx.cleanup());
+  const dataDir = fs.realpathSync(fx.dataDir);
+  const plain = new GitCache(dataDir, nullLogger(), undefined);
+  const bare = await plain.ensureClone(fx.originPath);
+  fs.chmodSync(path.dirname(bare), 0o700);
+  fs.chmodSync(bare, 0o700);
+  const sourceSha = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
+  const runId = "40664066-9999-aaaa-bbbb-cccccccccccc";
+  assert.equal(await plain.anchorRecoveryHead(bare, runId, 1, sourceSha), true);
+  const rig = makeBarrier(t);
+  reapHelper(t, rig);
+  const worker = spawnChild(t, { scenario: "pin-cleanup", dataDir, token: TOKEN, bare, barrier: rig, shutdownBudgetMs: 2_000,
+    wrapDir: makeTmp(t, "m4066-wrap-"), pin: { runId, generation: 1, sourceSha, deadlineMs: 3_000 } });
+  t.after(() => t.diagnostic(`worker output:\n${worker.seen.join("\n")}`));
+  const childPid = await armed(rig, worker); // the real `git update-ref --stdin` child, held before Git runs
+  await until(worker, (line) => line === "DEADLINE-PASSED");
+  await sigterm(worker);
+  process.kill(childPid, "SIGKILL"); // killed by a signal: no real exit status, so the continuation cannot settle
+  const exit = await worker.exited;
+
+  assert.equal(exit.code, 1);
+  const decision = decisions(worker);
+  assert.equal(decision.length, 1, "decided once");
+  assert.equal(decision[0]!.fields.result, "incomplete");
+  assert.ok(decision[0]!.fields.reasons.includes("open_settlement"), `reasons: ${decision[0]!.fields.reasons.join(",")}`);
+  assert.deepEqual(resultOf(worker), { result: "incomplete", exitCode: 1 });
+  assert.equal(gitIn(bare, ["rev-parse", `refs/uzi-recovery-pin/${runId}/1`]), sourceSha, "the pin still names the original source");
+  const { rt, git } = await persistedSuccessor(dataDir);
+  assert.equal((await slotOf(rt, bare))?.pending?.status, "running", "the unjoined child's record was never settled");
+  assert.equal(await git.anchorRecoveryHead(bare, runId, 7, sourceSha), false, "a successor still refuses the bare");
+  assert.equal(gitIn(bare, ["for-each-ref", `refs/uzi-recovery-pin/${runId}/7`]), "", "the refused anchor created no ref");
+  assert.equal(gitIn(bare, ["rev-parse", `refs/uzi-recovery-pin/${runId}/1`]), sourceSha);
+});
+
+test("issue #4066 permanent durable-write failure: every settlement rename fails; incomplete with apply_exhausted, never drained, exit 1, the successor refuses", { timeout: 120_000 }, async (t) => {
+  const { dataDir, bare, a, worker, rig1 } = await lateWorker(t, { lateMode: "a4" });
+  await armed(rig1, worker);
+  assert.equal(await release(rig1), "0");
+  await until(worker, (line) => line === "REQUEUED"); // the idle drain's apply failed and was queued again
+  await sigterm(worker);
+  const exit = await worker.exited;
+
+  assert.equal(exit.code, 1);
+  const decision = decisions(worker);
+  assert.equal(decision.length, 1, "decided once");
+  assert.equal(decision[0]!.fields.result, "incomplete");
+  assert.ok(decision[0]!.fields.reasons.includes("apply_exhausted"), `reasons: ${decision[0]!.fields.reasons.join(",")}`);
+  assert.deepEqual(resultOf(worker), { result: "incomplete", exitCode: 1 });
+  assert.ok(!worker.seen.some((line) => line.startsWith("LOG:") && line.includes('"result":"drained"')), "never reported drained");
+  const { rt, git } = await persistedSuccessor(dataDir);
+  assert.equal((await slotOf(rt, a))?.pending?.status, "running", "no settlement ever became durable");
+  await assert.rejects(rt.withTransaction(() => reseedA(git, bare)), /unresolved pending footprint/);
+});
+
+test("issue #4066 repeated SIGTERM: the second signal changes nothing and the shutdown reports once", { timeout: 120_000 }, async (t) => {
+  const { dataDir, a, worker, rig1 } = await lateWorker(t, { lateMode: "b2" });
+  await armed(rig1, worker);
+  await sigterm(worker);
+  worker.proc.kill("SIGTERM");
+  await until(worker, (line) => line === "SIGTERM-REPEAT");
+  assert.ok(!worker.seen.some((line) => line === "PHASE:sealed"), "still joining the held delete");
+  assert.equal(await release(rig1), "0");
+  const exit = await worker.exited;
+  assert.equal(exit.code, 0);
+  assert.equal(worker.seen.filter((l) => l.startsWith("RESULT:")).length, 1);
+  assert.equal(decisions(worker).length, 1);
+  assert.deepEqual(resultOf(worker), { result: "drained", exitCode: 0 });
+  assert.notEqual((await persistedSlot(dataDir, a))?.pending?.status, "running");
+});
+
+test("issue #4066 SIGTERM, then SIGKILL before the settlement: the record stays running and the successor refuses", { timeout: 120_000 }, async (t) => {
+  const { dataDir, bare, a, worker, rig1 } = await lateWorker(t, { lateMode: "b2" });
+  await armed(rig1, worker);
+  await sigterm(worker);
+  await worker.kill();
+  const { rt, git } = await persistedSuccessor(dataDir);
+  assert.equal((await slotOf(rt, a))?.pending?.status, "running");
+  await assert.rejects(rt.withTransaction(() => reseedA(git, bare)), /unresolved pending footprint/);
 });

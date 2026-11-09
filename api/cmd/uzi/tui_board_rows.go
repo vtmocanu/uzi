@@ -605,9 +605,9 @@ func providerBoardLine(r apitypes.RunDTO) string {
 // boardShowSecondLine reserves the selected row's activity or typed park/hold
 // guidance. It has no milestone precondition; window math and rendering share it.
 func (m tuiModel) boardShowSecondLine(r apitypes.RunListItemDTO) bool {
-	return isForgePark(r.RunDTO) || r.ForgeOriginCooldown != nil || (r.CurrentActivity != nil && !terminalRunStatuses[r.Status]) ||
+	return isIterationHold(r.RunDTO) || isForgePark(r.RunDTO) || r.ForgeOriginCooldown != nil || (r.CurrentActivity != nil && !terminalRunStatuses[r.Status]) ||
 		codexAccountActionLine(r.RunDTO) != "" || vaultParkLine(r.RunDTO) != "" ||
-		diskParkLine(r.RunDTO) != "" || credentialDisabledLine(r.RunDTO) != "" || credentialSwitchHoldLine(r.RunDTO) != "" || isOwnerRequiredWorkerHold(r.RunDTO) || isRecoveryDecisionPark(r.RunDTO) ||
+		diskParkLine(r.RunDTO) != "" || credentialHoldLine(r.RunDTO) != "" || credentialSwitchHoldLine(r.RunDTO) != "" || isOwnerRequiredWorkerHold(r.RunDTO) || isRecoveryDecisionPark(r.RunDTO) ||
 		isProviderUnavailableHold(r.RunDTO) || providerParkLine(r.RunDTO) != ""
 }
 
@@ -629,12 +629,21 @@ func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
 	// bands into NEEDS YOU via runBandOf; its line keeps the wait ink). The line carries
 	// the owner's alias label (user-authored), folded through cellText by
 	// codexAccountActionLine and through renderer.Plain here (D7).
+	if isDiskOwnerHold(r.RunDTO) {
+		out := prefix + paintSeg(m.pal.amber, bg, false, "Disk held · Resume/Cancel · detail: enter")
+		return padSeg(clampVisual(out, m.width), m.width, bg)
+	}
 	if isForgeOwnerHold(r.RunDTO) {
 		hold := "Owner-held · Resume/Cancel · detail: enter"
 		if isPublicationPark(r.RunDTO) {
 			hold = "Publishing held · Resume (publication-only)/Cancel · detail: enter"
 		}
 		out := prefix + paintSeg(m.pal.amber, bg, false, hold)
+		return padSeg(clampVisual(out, m.width), m.width, bg)
+	}
+	if isIterationHold(r.RunDTO) {
+		line := "Resume/Cancel · Iteration limit reached · detail: enter"
+		out := prefix + paintSeg(m.pal.amber, bg, false, m.renderer.Plain(line, 240))
 		return padSeg(clampVisual(out, m.width), m.width, bg)
 	}
 	if line := providerBoardLine(r.RunDTO); line != "" {
@@ -674,7 +683,7 @@ func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
 	if line == "" {
 		// PRD #1732 D14: a run held on credential_disabled has no live activity either; its
 		// second line is what the owner can do about it.
-		line = credentialDisabledLine(r.RunDTO)
+		line = credentialHoldLine(r.RunDTO)
 	}
 	if line == "" {
 		line = credentialSwitchHoldLine(r.RunDTO)

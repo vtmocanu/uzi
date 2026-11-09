@@ -191,16 +191,27 @@ describe("RunRunner — checkpoint on the limit-park path (PRD #628 M2)", () => 
       options.boundary === "park" ? () => body({ signal: abort.signal }) : body, flight);
     const publish = client.publishCheckpoint.bind(client);
     let calls = 0;
+    // Recorded inside the fake, asserted after execute: an assert thrown inside the fake is swallowed
+    // by the runner's catch and would not fail the test.
+    let liveAtStart: boolean | undefined;
+    let abortedAfterPermit: boolean | undefined;
     client.publishCheckpoint = async (_run, _tip, pack, signal) => {
       calls++;
-      assert.equal(signal, abort.signal, "park forwards the original permit signal");
+      liveAtStart = signal ? !signal.aborted : undefined;
       await drain(pack);
       setTimeout(() => abort.abort(), 10);
+      await new Promise(resolve => setTimeout(resolve, 30));
+      abortedAfterPermit = signal?.aborted;
       return { ok: false, httpStatus: 500 };
     };
     try {
       const claim = gitlabClaim(628991, { wait_on_limit: true });
+      const started = Date.now();
       await r.execute(claim);
+      const elapsed = Date.now() - started;
+      assert.equal(liveAtStart, true, "park publishes under a live derived allowance signal");
+      assert.equal(abortedAfterPermit, true, "the derived signal follows the original permit signal");
+      assert.ok(elapsed < 30_000, `permit abort ended the 60 s backoff promptly (took ${elapsed} ms)`);
       assert.equal(calls, 1);
       assert.equal(abort.signal.aborted, true);
       assert.ok(parked(claim.run_id), "deadline cannot undo the park");

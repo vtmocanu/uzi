@@ -19,16 +19,22 @@ import (
 )
 
 // deleteWorkerStore is a minimal workersvc.Store for the DeleteWorker handler tests:
-// it answers only the four queries wsvc.DeleteWorker reaches (active-run count, active-run
-// listing, open custody count, the delete itself) and panics on anything else (embedded
-// interface), so a mapping test cannot pass silently through an unexercised path.
+// it answers only the five queries wsvc.DeleteWorker reaches (active-run count, active-run
+// listing, open custody count, open custody listing, the delete itself) and panics on
+// anything else (embedded interface), so a mapping test cannot pass silently through an
+// unexercised path.
 type deleteWorkerStore struct {
 	workersvc.Store
 	activeRuns int64
 	listRuns   []store.ListWorkerNonTerminalRunsRow
 	holds      int64
+	listHolds  []store.ListOpenCustodyHoldsForWorkerRow
 	deleteRows int64
 	deleted    bool
+}
+
+func (s *deleteWorkerStore) ListOpenCustodyHoldsForWorker(context.Context, store.ListOpenCustodyHoldsForWorkerParams) ([]store.ListOpenCustodyHoldsForWorkerRow, error) {
+	return s.listHolds, nil
 }
 
 func (s *deleteWorkerStore) ListWorkerNonTerminalRuns(context.Context, store.ListWorkerNonTerminalRunsParams) ([]store.ListWorkerNonTerminalRunsRow, error) {
@@ -94,6 +100,82 @@ func TestDeleteWorkerCustodyConflict(t *testing.T) {
 	}
 	if st.deleted {
 		t.Error("a custody-held worker must not be deleted")
+	}
+}
+
+// TestDeleteWorkerCustodyConflictNamesBlockingHolds pins the #3921 additions to the custody
+// 409: the error string and custody_holds are unchanged, and blocking_holds names each hold
+// (capped listing) beside blocking_holds_total (the authoritative count).
+func TestDeleteWorkerCustodyConflictNamesBlockingHolds(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	hold1, run1 := uuid.New(), uuid.New()
+	hold2, run2 := uuid.New(), uuid.New()
+	st := &deleteWorkerStore{holds: 12, listHolds: []store.ListOpenCustodyHoldsForWorkerRow{
+		{ID: hold1, RunID: run1, Generation: 4, RunKind: "issue", RunTitle: "Fix the thing"},
+		{ID: hold2, RunID: run2, Generation: 1},
+	}}
+	h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
+
+	rec := httptest.NewRecorder()
+	h.DeleteWorker(rec, deleteWorkerReq(owner, uuid.New()))
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("DELETE = %d, want 409\nbody: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Error         string `json:"error"`
+		CustodyHolds  int64  `json:"custody_holds"`
+		BlockingHolds []struct {
+			HoldID     string `json:"hold_id"`
+			RunID      string `json:"run_id"`
+			Generation int64  `json:"generation"`
+			Kind       string `json:"kind"`
+			Title      string `json:"title"`
+		} `json:"blocking_holds"`
+		Total int64 `json:"blocking_holds_total"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode 409 body: %v (%s)", err, rec.Body.String())
+	}
+	const wantErr = "this worker is retaining unpublished committed work for recovery in 12 custody hold(s); recover it (uzi run export) or explicitly discard those recovery archives before removing it"
+	if body.Error != wantErr {
+		t.Errorf("error = %q, want it unchanged: %q", body.Error, wantErr)
+	}
+	if body.CustodyHolds != 12 || body.Total != 12 {
+		t.Errorf("custody_holds = %d, blocking_holds_total = %d, want both 12", body.CustodyHolds, body.Total)
+	}
+	if len(body.BlockingHolds) != 2 {
+		t.Fatalf("blocking_holds = %+v, want 2 entries", body.BlockingHolds)
+	}
+	if g := body.BlockingHolds[0]; g.HoldID != hold1.String() || g.RunID != run1.String() || g.Generation != 4 || g.Kind != "issue" || g.Title != "Fix the thing" {
+		t.Errorf("blocking_holds[0] = %+v", g)
+	}
+	if g := body.BlockingHolds[1]; g.HoldID != hold2.String() || g.RunID != run2.String() || g.Generation != 1 || g.Kind != "" || g.Title != "" {
+		t.Errorf("blocking_holds[1] = %+v", g)
+	}
+}
+
+// TestDeleteWorkerCustodyConflictEmptyListEncodesArray: when the holds were released between
+// the count and the listing, blocking_holds must still be a JSON array, never null.
+func TestDeleteWorkerCustodyConflictEmptyListEncodesArray(t *testing.T) {
+	st := &deleteWorkerStore{holds: 2}
+	h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
+
+	rec := httptest.NewRecorder()
+	h.DeleteWorker(rec, deleteWorkerReq(store.User{ID: uuid.New()}, uuid.New()))
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("DELETE = %d, want 409\nbody: %s", rec.Code, rec.Body.String())
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got := string(raw["blocking_holds"]); got != "[]" {
+		t.Errorf("blocking_holds = %s, want []", got)
+	}
+	if got := string(raw["blocking_holds_total"]); got != "2" {
+		t.Errorf("blocking_holds_total = %s, want 2", got)
 	}
 }
 

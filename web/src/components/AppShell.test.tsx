@@ -48,7 +48,7 @@ vi.mock("../lib/api", () => ({
     // account so they render nothing in these nav/collapse assertions.
     getMyCodexRateLimits: vi.fn().mockResolvedValue({ accounts: [] }),
     // SidebarUsageLimits fetches the chosen sidebar-account set on mount.
-    getMySettings: vi.fn().mockResolvedValue({ settings: { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, theme: null } }),
+    getMySettings: vi.fn().mockResolvedValue({ settings: { harness_overflow_enabled: false, default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, theme: null } }),
     // The sidebar-footer version badge fetches GET /api/version on mount; resolve it
     // so the shared module-level promise settles instead of throwing on an undefined
     // mock. Bare (no leading v) so the "renders" test below can assert the UI adds

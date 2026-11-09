@@ -18,6 +18,7 @@ import { changedMilestones } from "../../lib/milestoneReset";
 import { ApiError } from "../../lib/apiError";
 import { isCredentialSwitchRefusedLane } from "../../lib/credentialOverride";
 import { credentialSwitchHold } from "../../lib/credentialSwitchHold";
+import { diskWaitMode } from "../../lib/diskRecovery";
 import { isTerminalRun } from "../../lib/runStatus";
 import {
   LIVE_RUN_ID,
@@ -33,6 +34,7 @@ import {
   runListItem,
 } from "../data";
 import { ensureLive, handleInput, startNewRun } from "../engine";
+import { overviewNextCrossCheckActive, overviewNextPendingQuestions } from "../data/overviewNext";
 import { foreignCooldownRun } from "../runProgress";
 import { getRun, nextRunId, patchRun, state } from "../store";
 import { delay, mockScenario, requireSession } from "./shared";
@@ -55,8 +57,8 @@ function demoFailureRecency(hours: number, origin: string, completed: number) {
 const demoLinkedFailure = {
   ...demoFailureRecency(13.2, "workflow_scope_missing", 14),
   // Match the existing drill-in fixture's actual end time and failure reason.
-  last_failed_at: getRun("run-workflow-scope")?.finished_at ?? new Date(recencyDemoNow - 13.2 * 3_600_000).toISOString(),
-  last_failed_run_id: "run-workflow-scope",
+  last_failed_at: getRun("c57b3989-105a-4e08-bf74-77ebc28e5a03")?.finished_at ?? new Date(recencyDemoNow - 13.2 * 3_600_000).toISOString(),
+  last_failed_run_id: "c57b3989-105a-4e08-bf74-77ebc28e5a03",
 };
 
 function listRunsFor(): Run[] {
@@ -102,7 +104,7 @@ function seedCustodyHolds(): RecoveryCustodyHold[] {
     // Worker B — jvm-worker: an actionable capture failure + a source-only hold.
     // Still at its branch checkpoint slot (PRD #1810); the long branch exercises phone wrapping.
     mk({ id: "hold-b2", run_id: "run-b2", worker_id: "wkr-jvm", worker_name: "jvm-worker", generation: 2, attention: "needs_action", capture_state: "needs_action", checkpoint_ref: "refs/uzi-checkpoints/agent/issue-1810-retain-published-checkpoints-across-supersession", checkpoint_tip: "b41e7d09a2c3f58e61d4a7b90c2e5f3a1d8b6c47", checkpoint_state: "retained", counts_toward_admission: true, admission_reason: "decision_needed" }),
-    mk({ id: "hold-b1", run_id: "run-b1", worker_id: "wkr-jvm", worker_name: "jvm-worker", generation: 1, attention: "source_only", counts_toward_admission: true, admission_reason: "decision_needed" }),
+    mk({ id: "hold-b1", run_id: "run-b1", worker_id: "wkr-jvm", worker_name: "jvm-worker", generation: 1, attention: "source_only", created_at: t(200), counts_toward_admission: true, admission_reason: "decision_needed" }),
     // Worker C — hostile name: a source-only decision + healthy protection.
     mk({ id: "hold-c2", run_id: "run-c2", worker_id: "wkr-ext", worker_name: HOSTILE_WORKER_NAME, generation: 2, attention: "active", counts_toward_admission: true, admission_reason: "earlier_generation" }),
     mk({ id: "hold-c1", run_id: "run-c1", worker_id: "wkr-ext", worker_name: HOSTILE_WORKER_NAME, generation: 1, attention: "source_only", counts_toward_admission: true, admission_reason: "decision_needed" }),
@@ -111,9 +113,37 @@ function seedCustodyHolds(): RecoveryCustodyHold[] {
   ];
 }
 
+// The `?mock=overview-next` scenario's holds (PRD #3880): two decision holds on different runs
+// with different ages (one Held work row, "2 decisions") plus two healthy active holds, so
+// four are open against the default limit of 8 and nothing is blocked. The worker ids match
+// no seeded worker, so deleting a mock worker is never blocked by these.
+function seedOverviewNextHolds(): RecoveryCustodyHold[] {
+  const t = (minsAgo: number) => new Date(Date.now() - minsAgo * 60_000).toISOString();
+  const mk = (o: Partial<RecoveryCustodyHold> & Pick<RecoveryCustodyHold, "id" | "run_id" | "attention">): RecoveryCustodyHold => ({
+    generation: 1,
+    state: "open",
+    worker_id: "wkr-ov-held",
+    worker_name: "held-worker",
+    inventory_guarded: false,
+    has_available_capture: false,
+    created_at: t(180),
+    updated_at: t(20),
+    counts_toward_admission: true,
+    ...o,
+  });
+  return [
+    mk({ id: "hold-ov-1", run_id: "a83c51f0-6d2e-4b7a-9c14-0e5f8a1d3b27", attention: "source_only", created_at: t(125), admission_reason: "decision_needed" }),
+    mk({ id: "hold-ov-2", run_id: "5e7d09b4-1c3a-4f86-b2d7-9a40c6e18f35", attention: "needs_action", capture_state: "needs_action", created_at: t(45), admission_reason: "decision_needed" }),
+    mk({ id: "hold-ov-3", run_id: "run-ov-active-1", attention: "active", admission_reason: "live_claim" }),
+    mk({ id: "hold-ov-4", run_id: "run-ov-active-2", attention: "active", admission_reason: "live_claim" }),
+  ];
+}
+
 function currentCustodyHolds(): RecoveryCustodyHold[] {
-  if (mockScenario() !== "custody") return [];
-  return seedCustodyHolds().filter((h) => !discardedHolds.has(h.id));
+  const scenario = mockScenario();
+  const seeds =
+    scenario === "overview-next" ? seedOverviewNextHolds() : scenario === "custody" ? seedCustodyHolds() : [];
+  return seeds.filter((h) => !discardedHolds.has(h.id));
 }
 
 function custodyResponse(): RecoveryCustodyHolds {
@@ -264,6 +294,28 @@ function toSummary(item: RunListItem): RunSummaryItem {
   return summary;
 }
 
+// PRD #4040: the server sets `pending_question` only on the caller's own awaiting_input rows
+// of GET /api/runs, from the newest question message. The mock reads a static per-run seed
+// (overviewNextPendingQuestions); mockAdminListRuns never calls this.
+function withPendingQuestion(item: RunListItem): RunListItem {
+  const excerpt =
+    item.status === "awaiting_input" && Object.prototype.hasOwnProperty.call(overviewNextPendingQuestions, item.id)
+      ? overviewNextPendingQuestions[item.id]
+      : undefined;
+  return excerpt ? { ...item, pending_question: excerpt } : item;
+}
+
+// Issue #4082: both list endpoints carry the list-only `cross_check_active` on every row, null
+// when no checker child is live. The mock reads a static seed under ?mock=overview-next only
+// (overviewNextCrossCheckActive), so base fixtures it names stay null in every other scenario.
+function withCrossCheckActive(item: RunListItem): RunListItem {
+  const active =
+    mockScenario() === "overview-next" && Object.prototype.hasOwnProperty.call(overviewNextCrossCheckActive, item.id)
+      ? overviewNextCrossCheckActive[item.id]
+      : null;
+  return { ...item, cross_check_active: active };
+}
+
 // Overload order mirrors realApi.listRuns: summary first, legacy LAST.
 function mockListRuns(params: {
   repoId?: string;
@@ -287,14 +339,14 @@ function mockListRuns(params?: {
   const items = listRunsFor()
     // Chat conversations ride runs but have their own page (PRD #39), and judge
     // is a repo-less meta-run — both are excluded here exactly as the real
-    // ListRunsForUser excludes them (`kind NOT IN ('chat','judge')`, PRD #239 D4).
-    .filter((r) => r.kind !== "chat" && r.kind !== "judge")
+    // ListRunsForUser excludes them (`kind NOT IN ('chat', 'judge', 'cross_check')`, PRD #239 D4).
+    .filter((r) => r.kind !== "chat" && r.kind !== "judge" && r.kind !== "cross_check")
     // Caller-scoped, like the real ListRunsForUser: other demo users' runs
     // (mockOtherRunOwners) belong to the admin all-users list only.
     .filter((r) => !(r.id in mockOtherRunOwners))
     .filter((r) => (params?.repoId ? r.repo_id === params.repoId : true))
     .filter((r) => (params?.issueIid != null ? r.issue_iid === params.issueIid : true))
-    .map((r) => runListItem(harnessOverlay(r)));
+    .map((r) => withCrossCheckActive(withPendingQuestion(runListItem(harnessOverlay(r)))));
   return delay({ runs: params?.view === "summary" ? items.map(toSummary) : items });
 }
 
@@ -304,7 +356,7 @@ function mockAdminListRuns(params?: {
   view?: "summary";
 }): Promise<{ runs: RunListItem[] | RunSummaryItem[] }> {
   const items = listRunsFor()
-    .filter((r) => r.kind !== "chat")
+    .filter((r) => r.kind !== "chat" && r.kind !== "cross_check")
     .filter((r) => !["completed", "failed", "cancelled"].includes(r.status))
     // Owner attribution: the mock's owner column is mockOtherRunOwners; every
     // other run belongs to the session admin. Before this map existed, EVERY
@@ -320,7 +372,7 @@ function mockAdminListRuns(params?: {
         if (item.queue_reason !== "maintenance") delete item.queue_reason;
         item.health_reason = null;
       }
-      return item;
+      return withCrossCheckActive(item);
     });
   return delay({ runs: params?.view === "summary" ? items.map(toSummary) : items });
 }
@@ -387,6 +439,7 @@ export const runsApi = {
     }
     const now = new Date().toISOString();
     const run: Run = {
+      harness_decision: null,
       id: nextRunId(),
       repo_id: repoId,
       forge_type: "gitlab",
@@ -478,6 +531,7 @@ export const runsApi = {
     if (active) throw new ApiError(409, "an active CI-fix run already exists for this ref");
     const now = new Date().toISOString();
     const run: Run = {
+      harness_decision: null,
       id: nextRunId(),
       repo_id: repoId,
       forge_type: "gitlab",
@@ -777,6 +831,8 @@ export const runsApi = {
     // is lost); an unsettled hold takes the override and requeues.
     const switchHold = credentialSwitchHold(run);
     if (switchHold === "settling") throw new ApiError(409, CREDENTIAL_SWITCH_SETTLING_REFUSAL);
+    if (diskWaitMode(run) === "held")
+      throw new ApiError(409, "data_volume_full held: use Resume before switching its token");
     credentialSwitched.add(id);
     patchRun(id, {
       credential_override: overrideToRead(body),
@@ -784,6 +840,15 @@ export const runsApi = {
       updated_at: new Date().toISOString(),
       ...(switchHold === "unsettled" ? { status: "queued" as const, hold_reason: null, status_since: new Date().toISOString() } : {}),
     });
+    // This per-run owner action explicitly sets a token AND resumes a paused run.
+    // Availability changes alone do not release an iteration hold.
+    if (run.status === "paused" && run.hold_reason === "iteration_budget_exhausted") {
+      const total = run.budget_total_seconds ??
+        (run.budget_wall_seconds ?? 6 * 3600) + (run.budget_extension_seconds ?? 0) + (run.budget_finalize_seconds ?? 0);
+      if (run.budget_used_seconds != null && total - run.budget_used_seconds <= 0)
+        throw new ApiError(409, "credential switch: run state changed, retry");
+      patchRun(id, { status: "queued", hold_reason: null, hold_context: null, status_since: new Date().toISOString() });
+    }
     const updated = { ...getRun(id)! };
     const pooledEligible = mockSecrets.some((s) => s.kind === "anthropic_token" && s.auto_eligible);
     const warning =
@@ -984,10 +1049,9 @@ export const runsApi = {
 
   // PRD #1190 (D14): resume a `paused` run via the widened /resume-now endpoint. Mirrors
   // ResumePausedRun — paused → queued (the mock has no budget clock to bank, but the
-  // transition is what un-parks it). Owner-scoped; a 409 naming the status on any run that
-  // is neither paused nor pool_wait, so the panel's inline "no longer paused" note is
-  // reachable when a second click races the refetch. Also accepts a pool_wait run, since
-  // the real endpoint dispatches on status.
+  // transition is what un-parks it). Also accepts pool_wait and the supported recovery
+  // holds; a disk hold requires explicit NULL retry timing. Owner-scoped; a second click
+  // after the run is queued gets a 409 naming its status.
   resumeRun: async (id: string) => {
     const run = getRun(id);
     if (!run) throw new ApiError(404, "run not found");
@@ -997,8 +1061,18 @@ export const runsApi = {
       throw new ApiError(404, "run not found");
     const forgeHeld = run.status === "recovery_wait" && run.recovery_wait_cause === "forge_unreachable" && run.recovery_retry_not_before === null;
     const memoryHeld = run.status === "recovery_wait" && run.recovery_wait_cause === "worker_memory_pressure";
-    if (run.status !== "paused" && run.status !== "pool_wait" && !memoryHeld && !forgeHeld)
+    const diskHeld = diskWaitMode(run) === "held";
+    if (run.status !== "paused" && run.status !== "pool_wait" && !memoryHeld && !forgeHeld && !diskHeld)
       throw new ApiError(409, `run is ${run.status}`);
+    const iterationHeld = run.status === "paused" && run.hold_reason === "iteration_budget_exhausted";
+    const diskWallLimited = diskHeld && run.kind !== "chat" && run.kind !== "judge" &&
+      run.interactive !== true && run.started_at != null;
+    if (iterationHeld || diskWallLimited) {
+      const total = run.budget_total_seconds ??
+        (run.budget_wall_seconds ?? 6 * 3600) + (run.budget_extension_seconds ?? 0) + (run.budget_finalize_seconds ?? 0);
+      if (run.budget_used_seconds != null && total - run.budget_used_seconds <= 0)
+        throw new ApiError(409, `this run is out of time; extend it to resume: uzi run extend ${id} --by 2h`);
+    }
     // Issue #3181: mirrors the server's ErrRunHoldSettling refusal; an unsettled hold resumes.
     const switchHold = credentialSwitchHold(run);
     if (switchHold === "settling") throw new ApiError(409, CREDENTIAL_SWITCH_SETTLING_REFUSAL);
@@ -1006,6 +1080,7 @@ export const runsApi = {
     // reset (the mock stands in with seven days).
     const reserveHeld = run.status === "paused" && run.hold_reason === "weekly_reserve";
     patchRun(id, { status: "queued", updated_at: new Date().toISOString(),
+      ...(iterationHeld ? { hold_reason: null, hold_context: null, status_since: new Date().toISOString() } : {}),
       ...(reserveHeld
         ? { hold_reason: null, reserve_exempt_until: new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString() }
         : {}),
@@ -1015,8 +1090,10 @@ export const runsApi = {
         health_reason: "Owner resumed one bounded forge attempt; origin cooldown and other admission limits may still block execution.",
       } : {}),
       ...(memoryHeld ? { memory_hold: undefined, recovery_wait_cause: null, recovery_retry_not_before: null } : {}),
+      ...(diskHeld ? { recovery_wait_cause: null, recovery_retry_not_before: null,
+        recovery_wait_phase: null, health: "ok", health_reason: null, health_since: null } : {}),
       ...(switchHold === "unsettled" ? { hold_reason: null, status_since: new Date().toISOString() } : {}),
-      ...(run.hold_reason === "provider_unavailable" ? {
+      ...(!diskHeld && run.hold_reason === "provider_unavailable" ? {
         provider_park_count: 0, provider_park_streak_started_at: null, can_stop_at_provider_hold: false,
       } : {}),
     });
@@ -1065,7 +1142,7 @@ export const runsApi = {
   getRunArchives: async (id: string) => {
     const r = getRun(id);
     if (!r) throw new ApiError(404, "run not found");
-    const capId = `${id}-cap1`;
+    const capId = `00000000-0000-0000-0000-${([...state.runs.keys()].indexOf(id) + 1).toString(16).padStart(12, "0")}`;
     if (r.status === "failed" && !discardedCaptures.has(capId)) {
       return delay(
         {
@@ -1089,7 +1166,13 @@ export const runsApi = {
               source_sha: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
               attempted_head_sha: "f0e1d2c3b4a5968778695a4b3c2d1e0f01234567",
               byte_size: 4718592,
-              checksum: "sha256:3f786850e387550fdab836ed7e6dc881de23001b",
+              checksum: "3f786850e387550fdab836ed7e6dc881de23001b3f786850e387550fdab836ed7e6d",
+              prerequisite_closure: {
+                state: "pinned", pin_ref: `refs/uzi-prereq/${capId}`,
+                pin_tip: "1111111111111111111111111111111111111111",
+                absence_unconfirmed: false, cleanup_exhausted: false,
+                updated_at: new Date(Date.now() - 3_600_000).toISOString(),
+              },
               prerequisite_shas: ["9988776655443322110099887766554433221100"],
               created_at: new Date(Date.now() - 3_600_000).toISOString(),
               expires_at: new Date(Date.now() + 6 * 86_400_000).toISOString(),
@@ -1118,12 +1201,12 @@ export const runsApi = {
     );
   },
   // Issue #2545: one acknowledged held-work publication for the failed mock run
-  // run-workflow-scope; every other run has none.
+  // workflow-scope run; every other run has none.
   getRunHeldPublications: async (id: string) => {
     const r = getRun(id);
     if (!r) throw new ApiError(404, "run not found");
     const publications =
-      id === "run-workflow-scope" && r.status === "failed"
+      id === "c57b3989-105a-4e08-bf74-77ebc28e5a03" && r.status === "failed"
         ? [
             {
               id: "pub-mock-1",
@@ -1177,6 +1260,9 @@ export const runsApi = {
       throw new ApiError(404, "run not found");
     const current = getRun(id);
     if (!current) throw new ApiError(404, "run not found");
+    // The real endpoint also accepts Stop from CLI clients, outside the web input union.
+    if ((kind as string) === "stop" && current.status === "paused" && current.hold_reason === "iteration_budget_exhausted")
+      throw new ApiError(409, "Stop is unavailable for an iteration hold; Resume to keep working, or Cancel the run");
     // PRD #1795 D5: mirror the server's expected-revision contract. A revision on any kind
     // other than a plan verdict is a 400; a verdict bound to a revision the run no longer
     // shows (a different gate_revision, or no open gate at all) is the typed 409 with the

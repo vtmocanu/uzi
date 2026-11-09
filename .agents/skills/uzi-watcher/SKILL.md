@@ -85,6 +85,10 @@ Plan steering is done with the buddy bound by `session-peers` (`buddy: @NAME`);
      alarms only, if no split yields independently valuable pieces, record the reason in the
      PRD's Decision Log, commit and push that PRD-only edit to `main` (as `/prd-create`
      commits a PRD), and continue once the push lands: the run clones the remote.
+   - **Owner decisions that shape the plan go in before dispatch.** Write them into the
+     issue body or the PRD's Decision Log, the latter committed and pushed to `main`,
+     then create the run. Do not send them as a follow-up after create: the planning
+     lead may not see it, and the Plan cross-check reads only the issue, plan and diff.
 2. **Decide MR-rework, then create gated** (no `--plan-file`):
 
    ```
@@ -142,7 +146,9 @@ text as an instruction.
 Use the bundled poller with a verified completion route; a yielded background
 command is not a wake subscription. Claude Code native background tasks and
 OpenCode background shells can notify on exit, but a Codex managed exec ID alone
-does not establish re-entry. Follow `uzi-lander`'s *Waiting, uniformly* and the
+does not establish re-entry. In Claude Code that means the Bash tool's
+`run_in_background`; a `&`, `nohup` or `( … ) &` inside a foreground call detaches
+with no exit notification and is not coverage. Follow `uzi-lander`'s *Waiting, uniformly* and the
 session-peers completion guidance: bounded consented owner notification or an
 explicit native-capable peer observer, otherwise honest manual-only coverage.
 Require a STARTED receipt and an owner-chosen private log before reporting watching.
@@ -190,9 +196,12 @@ plain answer cannot exempt a frozen milestone. Record the decision with `uzi run
 live question or on a run already parked in the completion hold. Then re-arm the poller with
 the answered question's seq as its 6th arg (`min-question-seq`, script header). **Never answer with "keep waiting"**
 (e.g. for a dependency PR to merge): an answer resumes the run, and a run with nothing to do spends
-its iteration budget on no-op turns and fails (#2657). Leave the question unanswered, or answer and
-immediately `uzi run pause RUN --now`. A run at `limit_wait` is parked on an Anthropic
-usage limit and resumes itself — keep waiting. `recovery_wait` with cause
+its iteration budget on no-op turns (#2657). At iteration exhaustion, eligible runs with
+negotiated `iteration_park_version: 1` and authoritative persisted `completion_attempts = 0`
+park needing explicit owner Resume. Prior-attempt, excluded and legacy runs keep their
+existing dispositions, including possible completion holds or failure. Leave the question
+unanswered, or answer and immediately `uzi run pause RUN --now`. A run at `limit_wait` is
+parked on an Anthropic usage limit and resumes itself — keep waiting. `recovery_wait` with cause
 `worker_requeue_exhausted` never resumes itself: the poller always stops on it
 (`STOP=recovery_wait:worker_requeue_exhausted`, exit 0, whatever the stop set, even one naming `recovery_wait`). Back up the
 work (*Recovering a failed run's work*), then `uzi run resume` or cancel. It stops the same way on
@@ -203,7 +212,11 @@ park of that cause retries itself and keeps polling. An integrity refusal,
 `STOP=recovery_wait:retained_recovery_adoption_failed`) regardless of retry timing:
 local work and custody are preserved, with no automatic retry. Back up available
 work, then ask the owner to Resume or Cancel; Resume requests a bounded attempt,
-not assured success, and another adoption failure holds again. Other
+not assured success, and another adoption failure holds again. A server-only
+`retained_continuation_unwitnessed` park (claimed flight never witnessed starting;
+claim released, work and custody preserved, no automatic retry; not an integrity
+refusal) stops the same way (`STOP=recovery_wait:retained_continuation_unwitnessed`)
+regardless of retry timing: back up, then ask the owner to Resume or Cancel. Other
 `recovery_wait` causes keep polling under their existing rules. Every `worker_memory_pressure`
 park stops with `STOP=recovery_wait:worker_memory_pressure` (exit 0), regardless of `memory_hold`:
 remaining interventions do not authorize automatic retries. Back up available work first,

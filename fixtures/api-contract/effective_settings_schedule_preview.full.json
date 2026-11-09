@@ -1,0 +1,139 @@
+{
+  "version": 1,
+  "harness": {
+    "value": "x",
+    "source": "x",
+    "fixed_at": "x",
+    "notes": [
+      "x"
+    ]
+  },
+  "refusal": "x",
+  "refusal_detail": "x",
+  "worker_model": {
+    "harness": "x",
+    "model": "x",
+    "default_model": "x",
+    "default_source": "x",
+    "resolved_model": "x",
+    "source": "x",
+    "setting": "x",
+    "fixed_at": "x",
+    "ignored": {
+      "value": "x",
+      "source": "x"
+    },
+    "notes": [
+      "x"
+    ]
+  },
+  "worker_effort": {
+    "harness": "x",
+    "effort": "x",
+    "default_effort": "x",
+    "default_source": "x",
+    "resolved_effort": "x",
+    "source": "x",
+    "mode": "x",
+    "catalog_default": {
+      "state": "x",
+      "effort": "x",
+      "model": "x",
+      "runtime_version": "x",
+      "observed_at": "2020-01-02T03:04:05Z"
+    },
+    "setting": "x",
+    "fixed_at": "x",
+    "notes": [
+      "x"
+    ]
+  },
+  "credential": {
+    "kind": "x",
+    "source": "x",
+    "fixed_at": "x",
+    "auth_mode": "x"
+  },
+  "subagents": {
+    "mode": "x",
+    "lead_value": "x",
+    "pinned": [
+      {
+        "name": "x",
+        "model": "x"
+      }
+    ],
+    "pinned_truncated": true,
+    "notes": [
+      "x"
+    ]
+  },
+  "notes": [
+    "x"
+  ],
+  "alternatives": [
+    {
+      "harness": "x",
+      "worker_model": {
+        "harness": "x",
+        "model": "x",
+        "default_model": "x",
+        "default_source": "x",
+        "resolved_model": "x",
+        "source": "x",
+        "setting": "x",
+        "fixed_at": "x",
+        "ignored": {
+          "value": "x",
+          "source": "x"
+        },
+        "notes": [
+          "x"
+        ]
+      },
+      "worker_effort": {
+        "harness": "x",
+        "effort": "x",
+        "default_effort": "x",
+        "default_source": "x",
+        "resolved_effort": "x",
+        "source": "x",
+        "mode": "x",
+        "catalog_default": {
+          "state": "x",
+          "effort": "x",
+          "model": "x",
+          "runtime_version": "x",
+          "observed_at": "2020-01-02T03:04:05Z"
+        },
+        "setting": "x",
+        "fixed_at": "x",
+        "notes": [
+          "x"
+        ]
+      },
+      "credential": {
+        "kind": "x",
+        "source": "x",
+        "fixed_at": "x",
+        "auth_mode": "x"
+      },
+      "subagents": {
+        "mode": "x",
+        "lead_value": "x",
+        "pinned": [
+          {
+            "name": "x",
+            "model": "x"
+          }
+        ],
+        "pinned_truncated": true,
+        "notes": [
+          "x"
+        ]
+      },
+      "refusal": "x",
+      "refusal_detail": "x"
+    }
+  ]
+}

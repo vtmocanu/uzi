@@ -379,9 +379,9 @@ describe("RunRunner — data_volume_full park at clone/fetch (PRD #1809 M5, D6)"
   });
 });
 
-describe("RunRunner — the data_volume_full park releases the pre-clone custody hold (PRD #1809 M5b B1)", () => {
+describe("RunRunner — an unguarded data_volume_full park releases the pre-clone custody hold (PRD #1809 M5b B1)", () => {
   // ClaimRun opens a custody hold for every claim. The api's data_volume_full park settles none
-  // (a mid-run disk park keeps custody), and nothing later releases a pre-clone generation's hold,
+  // (a mid-run disk park keeps custody), and nothing later releases an unguarded pre-clone hold,
   // so the worker releases it itself, exactly like the forge pre-clone park's older-api fallback.
 
   it("typed: releases THIS generation's hold with positive proof BEFORE the park report", async () => {

@@ -9,11 +9,14 @@ import { openAuthorityStore, type SlotSnapshot } from "../src/completion-authori
 import { StubExecutor, type Executor, type ExecutorResult, type RunContext } from "../src/executor.js";
 import { ForeignCaptureBlockedError, GitCache } from "../src/git.js";
 import { RunRunner } from "../src/runner.js";
+import { formatAttemptId } from "../src/attempt-path.js";
+import type { RemediationRecovery } from "../src/git.js";
 import { portableTeardownTestDeps } from "./teardown-fixtures.js";
 import { followSuccessfulPush } from "./publication-fixture.js";
 import { testLockOptions } from "./authority-test-support.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
-import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
+import { noProofReseed, nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
+import type { Logger } from "../src/log.js";
 import {
   api, client, fakeGitlab as rawFakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith,
 } from "./runner-harness.js";
@@ -70,11 +73,11 @@ function stopAfterSeed(onRun: () => void = () => {}): (runId: string) => { homeD
 }
 
 /** A runner whose GitCache (carrying the authority hooks, required) is passed through the constructor. */
-function runnerOnHookedGit(r: Rig, makeExecutor: (runId: string) => { homeDir: string; executor: Executor }): RunRunner {
+function runnerOnHookedGit(r: Rig, makeExecutor: (runId: string) => { homeDir: string; executor: Executor }, logger: Logger = nullLogger()): RunRunner {
   const hooked = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({
     authority: r.rt.hooks, authorityRequired: true, gitleaksBin: defaultGitleaksShim(),
   }));
-  return new RunRunner(client, hooked, makeExecutor, nullLogger(), 20, undefined, {
+  return new RunRunner(client, hooked, makeExecutor, logger, 20, undefined, {
     pollMs: 5,
     planApprovalTimeoutMs: 0,
     questionTimeoutMs: 600,
@@ -426,5 +429,340 @@ describe("sink retirement and ownership at a flight's teardown", () => {
     assert.equal(slot?.state, "active", "the earlier flight's epoch is untouched");
     assert.equal(slot?.epoch, epoch);
     assert.equal(r.rt.heldByOtherSink(canonical, new Set()), true, "the earlier flight still owns the key");
+  });
+
+  it("issue #4066: a seed refused because the authority is sealed for shutdown stops quietly (stopOnHeldSource)", async () => {
+    const r = await rig();
+    const iid = 406601;
+    const bare = await git.ensureClone(fx.originPath);
+    fs.mkdirSync(path.dirname(git.runnerClonePath(bare, `issue-${iid}`)), { recursive: true });
+    let started = 0;
+    const claim = gitlabClaim(iid, { run_id: randomUUID() });
+    const runner = runnerOnHookedGit(r, stopAfterSeed(() => { started++; }));
+    r.rt.sealForShutdown();
+    await runner.execute(claim);
+    assert.equal(started, 0, "no model work");
+    assert.equal(failed(claim.run_id), false, "a shutdown refusal is never a failed report");
+  });
+
+  it("issue #4066: a re-seed after a reclaimed terminal orphan refused by a sealed authority stops quietly", async (t) => {
+    const r = await rig();
+    const iid = 406602;
+    const bare = await git.ensureClone(fx.originPath);
+    const canonical = git.runnerClonePath(bare, `issue-${iid}`);
+    fs.mkdirSync(path.dirname(canonical), { recursive: true });
+    const claim = gitlabClaim(iid, { run_id: randomUUID() });
+    const branch = `agent/issue-${iid}`;
+    let started = 0;
+    const { logger, lines } = recordingLogger();
+    const runner = runnerOnHookedGit(r, stopAfterSeed(() => { started++; }), logger);
+    // The reclaim itself is stubbed as succeeded, so the re-seed runs in reseedAfterReclaim (not the loop's retry).
+    t.mock.method(runner as unknown as { reclaimTerminalOrphan(): Promise<void> }, "reclaimTerminalOrphan", async () => undefined);
+    const internals = runner as unknown as { runnerCloneForClaim(...args: unknown[]): Promise<unknown> };
+    const real = internals.runnerCloneForClaim.bind(runner);
+    let calls = 0;
+    internals.runnerCloneForClaim = async (...args) => {
+      if (++calls === 1) throw new ForeignCaptureBlockedError(canonical, branch, randomUUID());
+      r.rt.sealForShutdown(); // the worker begins leaving between the reclaim and the re-seed
+      return real(...args);
+    };
+    let tornDown: { retainedLocalCustody?: boolean } | undefined;
+    const sealed = runner as unknown as { endFlightSourceUse(flight: object, log: unknown): Promise<void> };
+    const endFlight = sealed.endFlightSourceUse.bind(runner);
+    sealed.endFlightSourceUse = async (flight, log) => { tornDown = flight; return endFlight(flight, log); };
+    await runner.execute(claim);
+    assert.equal(calls, 2, "the re-seed after the reclaim was attempted");
+    assert.equal(tornDown?.retainedLocalCustody, true, "stopped through stopOnHeldSource: custody retained");
+    assert.ok((lines as Array<{ msg?: string }>).some((l) => l.msg === "authority sealed for worker shutdown; stopping claim for retry"));
+    assert.equal(started, 0, "no model work");
+    assert.equal(failed(claim.run_id), false, "no failed report");
+  });
+});
+
+
+// Git durability is stubbed only at the confirmed GitCache seam here. AuthorityRuntime, A/flock,
+// sink ownership, the persistent store and the successor incarnation are real; this is not full E2E.
+describe("pending remediation source end foundation", () => {
+  const q = "a".repeat(40);
+  const newerQ = "b".repeat(40);
+  const attemptId = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "0123456789abcdef");
+  type Pending = {
+    runId: string; clonePath?: string; attemptId?: string; barePath?: string; branch?: string;
+    requiredOIDs: string[]; requireDenial: boolean; bindingUncertain: boolean;
+  };
+  type Flight = Record<string, unknown> & {
+    sourceUsePaths: Set<string>; sourceAdmissionRetired?: boolean;
+    remediationRestrictions?: { roots: string[]; pending?: Pending };
+  };
+  type Subject = {
+    persistRemediationScan(flight: Flight, bare: string, branch: string, tip: string,
+      findings: Array<{ commit: string }>, origin?: "pre-exit"): Promise<void>;
+    endFlightSourceUse(flight: Flight, log: unknown): Promise<{ endedSlots: unknown[]; published: boolean }>;
+    publishFlightSource(...args: unknown[]): Promise<string>;
+  };
+  async function setup() {
+    const r = await rig();
+    const bare = await git.ensureClone(fx.originPath);
+    const canonical = git.runnerClonePath(bare, "issue-374701");
+    fs.mkdirSync(path.dirname(canonical), { recursive: true });
+    const sink = new Set<string>();
+    const lease = await r.rt.recordAdmissions(sink, () => r.rt.bindSource(canonical));
+    const runner = runnerWith(stopAfterSeed(), rawFakeGitlab({}).gitlab, undefined, undefined, { authority: r.rt });
+    const flight: Flight = {
+      runId: "run-pending", barePath: bare, branch: "agent/issue-374701",
+      worktreePath: canonical, runnerClone: { path: canonical, attemptId },
+      sourceUsePaths: sink, sourceLease: lease, sourceTailsJoined: true,
+      completionSourceBound: { clonePath: canonical },
+      cancel: new AbortController(), steering: { lifecycleSignal: () => new AbortController().signal },
+    };
+    const record: RemediationRecovery = {
+      version: 1, blocked: false, runId: "run-pending", clonePath: canonical, attemptId,
+      branch: "agent/issue-374701", sequence: 1, ownedTip: newerQ, flaggedOIDs: [q, newerQ], excludedRoots: [], edges: [],
+    };
+    return { r, bare, canonical, flight, record, subject: runner as unknown as Subject };
+  }
+
+
+  for (const phase of ["read", "fallback", "combined"] as const) {
+    it("pending lifecycle expiry keeps actual source epoch active: " + phase, async t => {
+      const { r, bare, canonical, flight, record, subject } = await setup();
+      const before = await slotOf(r.rt, canonical);
+      t.mock.method(git, "recordRemediationScan", async () => { throw new Error("producer sync failed"); });
+      await assert.rejects(subject.persistRemediationScan(flight, bare, record.branch, newerQ, [{ commit: newerQ }], "pre-exit"));
+      (flight.cancel as AbortController).abort(); // Authorized cleanup must ignore flight cancellation.
+      let wall = Date.now(), deadline = 0, reads = 0, writes = 0;
+      t.mock.method(Date, "now", () => wall);
+      const scope = () => (git as unknown as {
+        recoveryOperations: { getStore(): { deadline: number; signal: AbortSignal } };
+      }).recoveryOperations.getStore();
+      // These bodies are fixture proof responses, not actual RR config fsync grants.
+      t.mock.method(git, "readRuntimeRemediationRecovery", async () => {
+        assert.ok(r.rt.active());
+        assert.equal(scope().signal.aborted, false, "cancelled flight has a healthy cleanup allowance");
+        deadline = scope().deadline;
+        reads++;
+        if (phase === "read") { wall = deadline; return record; }
+        wall = phase === "combined" ? deadline - 1 : wall;
+        return { ...record, flaggedOIDs: [q] };
+      });
+      t.mock.method(git, "blockRemediationRecovery", async () => {
+        assert.ok(r.rt.active());
+        assert.equal(scope().deadline, deadline, "fallback consumes the original read allowance");
+        writes++;
+        wall = phase === "combined" ? wall + 1 : deadline;
+        return "confirmed";
+      });
+      const publish = t.mock.method(subject, "publishFlightSource", async () => { throw new Error("must not publish"); });
+      const end = t.mock.method(r.rt, "endSourceUse");
+      const result = await subject.endFlightSourceUse(flight, nullLogger());
+      assert.equal(reads, 1); assert.equal(writes, phase === "read" ? 0 : 1);
+      assert.deepEqual(result.endedSlots, []); assert.equal(result.published, false);
+      assert.equal(publish.mock.callCount(), 0); assert.equal(end.mock.callCount(), 0);
+      assert.equal(flight.sourceAdmissionRetired, true);
+      await r.rt.withTransaction(async () => undefined);
+      const after = await slotOf(r.rt, canonical);
+      assert.equal(after?.state, "active"); assert.equal(after?.epoch, before?.epoch);
+    });
+  }
+
+  for (const proof of ["read failure", "old body missing Q", "absent body"] as const) {
+    it(`pending foundation: ${proof} plus failed denial keeps the same owned epoch with no queued end`, async t => {
+      const { r, bare, canonical, flight, record, subject } = await setup();
+      const before = await slotOf(r.rt, canonical);
+      t.mock.method(git, "recordRemediationScan", async () => { throw new Error("producer sync failed"); });
+      await assert.rejects(subject.persistRemediationScan(flight, bare, record.branch, newerQ,
+        [{ commit: q }, { commit: newerQ }], "pre-exit"), /producer sync failed/);
+      let confirmedUnderA = false;
+      t.mock.method(git, "readRuntimeRemediationRecovery", async (_bare: string, _branch: string, source: { runId: string; clonePath: string; attemptId?: string }) => {
+        assert.ok(r.rt.active(), "owning A is held");
+        assert.equal(flight.sourceAdmissionRetired, undefined);
+        assert.deepEqual(source, { runId: record.runId, clonePath: canonical, attemptId });
+        assert.equal(r.rt.heldByOtherSink(canonical, flight.sourceUsePaths), false);
+        confirmedUnderA = true;
+        if (proof === "read failure") throw new Error("consumer sync failed");
+        return proof === "absent body" ? undefined : { ...record, flaggedOIDs: [q] };
+      });
+      const denial = t.mock.method(git, "blockRemediationRecovery", async () => { throw new Error("denial config failed"); });
+      const publish = t.mock.method(subject, "publishFlightSource", async () => { throw new Error("must not publish"); });
+      const end = t.mock.method(r.rt, "endSourceUse");
+      const result = await subject.endFlightSourceUse(flight, nullLogger());
+      assert.equal(confirmedUnderA, true);
+      assert.equal(denial.mock.callCount(), 1);
+      assert.deepEqual(result.endedSlots, []);
+      assert.equal(result.published, false);
+      assert.equal(publish.mock.callCount(), 0);
+      assert.equal(end.mock.callCount(), 0, "no call that could queue a failed end");
+      assert.equal(flight.sourceAdmissionRetired, true);
+      const pending = structuredClone(flight.remediationRestrictions);
+      await assert.rejects(subject.persistRemediationScan(flight, bare, record.branch, newerQ, [{ commit: q }], "pre-exit"),
+        e => e instanceof SourceUseHeldRefusal);
+      assert.deepEqual(flight.remediationRestrictions, pending, "late callbacks cannot alter pending knowledge");
+      await assert.rejects(r.rt.recordAdmissions(flight.sourceUsePaths,
+        () => r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(canonical, "capture"))),
+        e => e instanceof SourceUseHeldRefusal);
+      // Several later real transactions cannot drain an end that was never queued.
+      await r.rt.withTransaction(async () => undefined);
+      const after = await slotOf(r.rt, canonical);
+      assert.equal(after?.state, "active");
+      assert.equal(after?.epoch, before?.epoch);
+      assert.equal(r.rt.ownedSourceEpoch(canonical, flight.sourceUsePaths), before?.epoch);
+      await assert.rejects(r.rt.recordAdmissions(new Set(),
+        () => r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(canonical, "capture"))),
+        e => e instanceof SourceUseHeldRefusal);
+      const next = r.successor();
+      await assert.rejects(next.rt.withTransaction(() => next.rt.hooks.admitSourceUse(canonical, "capture")),
+        /active under another worker incarnation/);
+    });
+  }
+
+  it("pending foundation: confirmed permanent denial ends ineligible without publication", async t => {
+    const { r, bare, canonical, flight, record, subject } = await setup();
+    t.mock.method(git, "recordRemediationScan", async () => { throw new Error("producer failed"); });
+    await assert.rejects(subject.persistRemediationScan(flight, bare, record.branch, newerQ, [{ commit: newerQ }], "pre-exit"));
+    (flight.cancel as AbortController).abort();
+    t.mock.method(git, "readRuntimeRemediationRecovery", async () => ({ ...record, flaggedOIDs: [q] }));
+    t.mock.method(git, "blockRemediationRecovery", async () => {
+      assert.ok(r.rt.active());
+      assert.equal(flight.sourceAdmissionRetired, undefined);
+      assert.equal(r.rt.heldByOtherSink(canonical, flight.sourceUsePaths), false);
+      return "confirmed";
+    });
+    const publish = t.mock.method(subject, "publishFlightSource", async () => { throw new Error("must not publish"); });
+    const result = await subject.endFlightSourceUse(flight, nullLogger());
+    assert.equal(result.endedSlots.length, 1);
+    assert.equal(result.published, false);
+    assert.equal(publish.mock.callCount(), 0);
+    assert.equal((await slotOf(r.rt, canonical))?.state, "ineligible");
+  });
+
+  it("pending foundation: independently complete NEW body after producer sync failure permits normal end", async t => {
+    const { r, bare, canonical, flight, record, subject } = await setup();
+    t.mock.method(git, "recordRemediationScan", async () => { throw new Error("producer sync failed"); });
+    await assert.rejects(subject.persistRemediationScan(flight, bare, record.branch, newerQ, [{ commit: newerQ }], "pre-exit"));
+    (flight.cancel as AbortController).abort();
+    t.mock.method(git, "readRuntimeRemediationRecovery", async () => {
+      assert.ok(r.rt.active());
+      assert.equal(flight.sourceAdmissionRetired, undefined);
+      return record;
+    });
+    const denial = t.mock.method(git, "blockRemediationRecovery", async () => { throw new Error("unneeded denial"); });
+    const publish = t.mock.method(subject, "publishFlightSource", async () => "unpublished");
+    const result = await subject.endFlightSourceUse(flight, nullLogger());
+    assert.equal(denial.mock.callCount(), 0);
+    assert.equal(publish.mock.callCount(), 1, "normal publication path remains reachable");
+    assert.equal(result.endedSlots.length, 1);
+    assert.equal((await slotOf(r.rt, canonical))?.state, "ineligible");
+    assert.deepEqual(flight.remediationRestrictions?.pending?.requiredOIDs, [newerQ], "producer success never clears pending knowledge");
+  });
+
+  it("pending foundation: unavailable A retires the sink and retains the epoch without end", async t => {
+    const { r, bare, canonical, flight, record, subject } = await setup();
+    t.mock.method(git, "recordRemediationScan", async () => { throw new Error("producer failed"); });
+    await assert.rejects(subject.persistRemediationScan(flight, bare, record.branch, newerQ, [{ commit: q }], "pre-exit"));
+    const transaction = t.mock.method(r.rt, "withTransaction", async () => { throw new Error("A unavailable"); });
+    const end = t.mock.method(r.rt, "endSourceUse");
+    const result = await subject.endFlightSourceUse(flight, nullLogger());
+    assert.equal(result.endedSlots.length, 0);
+    assert.equal(end.mock.callCount(), 0);
+    assert.equal(flight.sourceAdmissionRetired, true);
+    transaction.mock.restore();
+    assert.equal((await slotOf(r.rt, canonical))?.state, "active");
+    await assert.rejects(r.rt.recordAdmissions(flight.sourceUsePaths,
+      () => r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(canonical, "capture"))),
+      e => e instanceof SourceUseHeldRefusal);
+  });
+
+  for (const invalid of [false, true]) {
+    it(`pending foundation: ${invalid ? "invalid OID" : "Q65"} requires denial and cannot borrow a complete positive body`, async t => {
+      const { r, bare, canonical, flight, record, subject } = await setup();
+      const findings = invalid ? [{ commit: "invalid" }] :
+        Array.from({ length: 65 }, (_, i) => ({ commit: (i + 1).toString(16).padStart(40, "0") }));
+      t.mock.method(git, "recordRemediationScan", async () => { throw new Error("producer failed"); });
+      await assert.rejects(subject.persistRemediationScan(flight, bare, record.branch, newerQ, findings, "pre-exit"));
+      const read = t.mock.method(git, "readRuntimeRemediationRecovery", async () => record);
+      t.mock.method(git, "blockRemediationRecovery", async () => { throw new Error("denial failed"); });
+      const end = t.mock.method(r.rt, "endSourceUse");
+      await subject.endFlightSourceUse(flight, nullLogger());
+      assert.equal(read.mock.callCount(), 0);
+      assert.equal(end.mock.callCount(), 0);
+      assert.equal((await slotOf(r.rt, canonical))?.state, "active");
+    });
+  }
+
+  it("pending foundation: producer success still requires independent consumer confirmation", async t => {
+    const { r, bare, canonical, flight, record, subject } = await setup();
+    t.mock.method(git, "recordRemediationScan", async () => {});
+    await subject.persistRemediationScan(flight, bare, record.branch, newerQ, [{ commit: newerQ }], "pre-exit");
+    const read = t.mock.method(git, "readRuntimeRemediationRecovery", async () => { throw new Error("later read failed"); });
+    t.mock.method(git, "blockRemediationRecovery", async () => { throw new Error("denial failed"); });
+    await subject.endFlightSourceUse(flight, nullLogger());
+    assert.equal(read.mock.callCount(), 1);
+    assert.equal((await slotOf(r.rt, canonical))?.state, "active");
+  });
+
+  it("pending foundation: changed knowledge while confirming keeps custody before retirement", async t => {
+    const { r, bare, canonical, flight, record, subject } = await setup();
+    t.mock.method(git, "recordRemediationScan", async () => {});
+    await subject.persistRemediationScan(flight, bare, record.branch, newerQ, [{ commit: q }], "pre-exit");
+    t.mock.method(git, "readRuntimeRemediationRecovery", async () => {
+      await subject.persistRemediationScan(flight, bare, record.branch, newerQ, [{ commit: newerQ }], "pre-exit");
+      return record;
+    });
+    const end = t.mock.method(r.rt, "endSourceUse");
+    await subject.endFlightSourceUse(flight, nullLogger());
+    assert.equal(end.mock.callCount(), 0);
+    assert.equal(flight.sourceAdmissionRetired, true);
+    assert.equal((await slotOf(r.rt, canonical))?.state, "active");
+  });
+
+  // Partial Git seam only: real authority epochs and retirement, stubbed Git evidence.
+  for (const producer of ["positive", "negative"] as const) {
+    it(`source finding unit: predecessor ${producer} uses independent selected attempt through source end`, async t => {
+      const { r, bare, canonical, flight, record, subject } = await setup();
+      flight.predecessorCapture = true;
+      flight.remediationPredecessorAttempt = attemptId;
+      flight.runnerClone = { path: canonical + "-different", attemptId: "not-the-predecessor" };
+      const writer = t.mock.method(git,
+        producer === "positive" ? "recordRemediationScan" : "recordRemediationRestrictions",
+        async (_bare: string, _branch: string, source: { runId: string; clonePath: string; attemptId: string }) => {
+          assert.ok(r.rt.active());
+          assert.deepEqual(source, { runId: record.runId, clonePath: canonical, attemptId });
+        });
+      const negative = subject as unknown as {
+        persistRemediationRestrictions(flight: Flight, bare: string, branch: string, tip: string,
+          findings: Array<{ commit: string }>): Promise<void>;
+      };
+      if (producer === "positive")
+        await subject.persistRemediationScan(flight, bare, record.branch, newerQ, [{ commit: newerQ }], "pre-exit");
+      else
+        await negative.persistRemediationRestrictions(flight, bare, record.branch, newerQ, [{ commit: newerQ }]);
+      assert.equal(writer.mock.callCount(), 1);
+      assert.equal(flight.remediationRestrictions?.pending?.attemptId, attemptId);
+      t.mock.method(git, "readRuntimeRemediationRecovery", async (_bare: string, _branch: string,
+        source: { runId: string; clonePath: string; attemptId?: string }) => {
+        assert.ok(r.rt.active());
+        assert.deepEqual(source, { runId: record.runId, clonePath: canonical, attemptId });
+        return record;
+      });
+      const denial = t.mock.method(git, "blockRemediationRecovery", async () => { throw new Error("unneeded denial"); });
+      t.mock.method(subject, "publishFlightSource", async () => "unpublished");
+      const result = await subject.endFlightSourceUse(flight, nullLogger());
+      assert.equal(denial.mock.callCount(), 0);
+      assert.equal(result.endedSlots.length, 1);
+      assert.equal((await slotOf(r.rt, canonical))?.state, "ineligible");
+    });
+  }
+
+  it("pending foundation: mismatched selected source cannot confirm or deny another source", async t => {
+    const { r, bare, canonical, flight, record, subject } = await setup();
+    t.mock.method(git, "recordRemediationScan", async () => {});
+    await subject.persistRemediationScan(flight, bare, record.branch, newerQ, [{ commit: q }], "pre-exit");
+    flight.runnerClone = { path: canonical, attemptId: "another-attempt" };
+    const read = t.mock.method(git, "readRuntimeRemediationRecovery", async () => record);
+    const denial = t.mock.method(git, "blockRemediationRecovery", async () => "confirmed");
+    await subject.endFlightSourceUse(flight, nullLogger());
+    assert.equal(read.mock.callCount(), 0);
+    assert.equal(denial.mock.callCount(), 0);
+    assert.equal((await slotOf(r.rt, canonical))?.state, "active");
   });
 });

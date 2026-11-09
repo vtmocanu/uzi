@@ -64,13 +64,17 @@ WHERE id = $1 RETURNING plan_cross_check_enabled, code_cross_check_enabled`, use
 		// codex_harness_v1 worker), and a Codex lead on Claude (PRD #2460, a worker that
 		// advertises cross_check_codex_lead_v1). Each is probed separately so the warning
 		// names the family that has no capable worker.
-		var codexCheckerAvailable, claudeCheckerAvailable bool
+		// Issue #3841: a plan round freezes owner steering, so its checker child also needs
+		// cross_check_owner_steering_v1; it is probed last and warned only when both
+		// directions are otherwise covered.
+		var codexCheckerAvailable, claudeCheckerAvailable, steeringCheckerAvailable bool
 		err = h.pool.QueryRow(r.Context(), `SELECT
 COALESCE(bool_or('codex_harness_v1' = ANY(protocol_capabilities)), false),
-COALESCE(bool_or('cross_check_codex_lead_v1' = ANY(protocol_capabilities)), false)
+COALESCE(bool_or('cross_check_codex_lead_v1' = ANY(protocol_capabilities)), false),
+COALESCE(bool_or('cross_check_owner_steering_v1' = ANY(protocol_capabilities)), false)
 FROM workers WHERE user_id = $1 AND status = 'online'
 AND fn_worker_accepts_new_intake(workers) AND NOT ephemeral AND NOT isolated_lane
-AND 'cross_check_v1' = ANY(protocol_capabilities)`, user.ID).Scan(&codexCheckerAvailable, &claudeCheckerAvailable)
+AND 'cross_check_v1' = ANY(protocol_capabilities)`, user.ID).Scan(&codexCheckerAvailable, &claudeCheckerAvailable, &steeringCheckerAvailable)
 		if err != nil {
 			slog.Error("check cross-check workers", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -81,6 +85,8 @@ AND 'cross_check_v1' = ANY(protocol_capabilities)`, user.ID).Scan(&codexCheckerA
 			response["warning"] = "No online worker can run Codex plan cross-checks; enable ephemeral workers or upgrade a worker."
 		case !claudeCheckerAvailable:
 			response["warning"] = "No online worker can run Claude plan cross-checks for Codex-lead runs; enable ephemeral workers or upgrade a worker."
+		case !steeringCheckerAvailable:
+			response["warning"] = "No online worker supports owner-steering plan cross-checks (cross_check_owner_steering_v1); plan checks wait until a worker rolls to a release with it, and fall back to the human plan gate at their deadline."
 		}
 	}
 	if codeEnabled {

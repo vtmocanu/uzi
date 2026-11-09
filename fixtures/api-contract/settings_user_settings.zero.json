@@ -9,6 +9,7 @@
   "judge_model": null,
   "codex_judge_model": null,
   "summary_model": null,
+  "codex_summary_model": null,
   "theme": null,
   "mr_rework_enabled": null,
   "now_summary_enabled": null,
@@ -20,8 +21,10 @@
   "typeface": null,
   "default_harness": null,
   "judge_models": null,
+  "summary_models": null,
   "effort_settings": null,
   "weekly_reserve_pct": null,
   "weekly_reserve_pause_running": false,
-  "codex_account_mode": ""
+  "codex_account_mode": "",
+  "harness_overflow_enabled": false
 }

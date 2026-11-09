@@ -100,12 +100,11 @@ RELRUN="$(gh run list --workflow release.yml --branch "$TAG" --limit 1 \
 if [ -z "$RELRUN" ]; then
   fail "no release.yml run found for $TAG (cannot prove signing)"
 else
-  # cosign prints "Pushing signature to: <ref>" once per signed artifact. Six
-  # publish jobs sign (5 images + chart), so expect at least 6 lines.
+  # cosign prints "Pushing signature to: <ref>" once per signed artifact.
   # Expected signatures = the signing steps that actually ran (success), NOT a hardcoded
-  # count. Every release signs api/web/controller/chart and both agent release images (6);
-  # a publish-agent job ALSO signs a runtime base when its input key was absent (#1720), so
-  # a correct release signs 6 to 8. Match the two signing-step
+  # count. Every release signs api/web/controller/chart, each agent release image per arch
+  # and each agent index (10); a publish-agent leg ALSO signs a runtime base when its input
+  # key was absent (#1720), so a correct release signs 10 to 14. Match the two signing-step
   # names DIRECTLY ("Sign image (cosign keyless)" and "Package + push + sign chart").
   # Do NOT match on a bare "sign" and exclude "installer": the cosign install step is
   # named "Run ./.github/actions/install-cosign", which contains "cosign" (so it matches

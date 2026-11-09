@@ -105,6 +105,7 @@ services:
       # is non-fatal (logged and skipped); a bad static config (PAT without email,
       # non-allowlisted base URL) refuses to boot.
       UZI_SEED_FORGE_PAT: ${UZI_SEED_FORGE_PAT:-}
+      UZI_SEED_FORGE_TYPE: ${UZI_SEED_FORGE_TYPE:-}
       UZI_SEED_FORGE_BASE_URL: ${UZI_SEED_FORGE_BASE_URL:-}
       UZI_SEED_FORGE_REPOS: ${UZI_SEED_FORGE_REPOS:-}
       # Optional startup Anthropic-token seed (belongs to the admin above), so a
@@ -205,8 +206,8 @@ services:
       # NEITHER bound is durable, and that applies to BOTH of them for one reason:
       # each is held in worker memory (a park counter and a park timer), so a worker
       # death re-queues the run and both restart. Both are per RUN-ATTEMPT, not per
-      # park: questionDeadlines is set once on the first park and cleared only by the
-      # terminal finally, so N questions in one attempt SHARE one deadline. The lifetime
+      # park: questionParkBudgets charges only time parked on a question and is cleared only
+      # when the attempt's execute() ends, so N questions in one attempt SHARE one budget. The lifetime
       # ceilings are each value x (RUN_MAX_REQUEUES + 1) — on defaults, 20 questions
       # and 96h of waiting, rather than the per-attempt 5 and 24h. A run that used the one-shot #1742
       # finalize-resume allowance gets one more attempt: x (RUN_MAX_REQUEUES + 2).
@@ -312,6 +313,9 @@ services:
       args:
         UZI_SRC_SHA: ${UZI_SRC_SHA:-}
     profiles: ["agent"]
+    # The worker's shutdown result deadline is 35 s from the first SIGTERM
+    # (SHUTDOWN_RESULT_DEADLINE_MS in agent/src/main.ts); 5 s margin.
+    stop_grace_period: 40s
     security_opt:
       # Blocks suid privilege GAIN; does NOT block the entrypoint's root -> worker
       # drop (a setuid to a LOWER uid). Stays on post-drop.

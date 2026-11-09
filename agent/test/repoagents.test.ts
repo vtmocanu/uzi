@@ -14,15 +14,22 @@ import {
   REPO_AGENT_MAX_DESCRIPTION_LEN,
   describeRepoAgentNote,
   detectRepoAgents,
+  filterRepoAgentModel,
   repoAgentSummaries,
   repoAgentsDir,
   type RepoAgentNoteReason,
 } from "../src/repoagents.js";
-import { assembleAgents } from "../src/agents.js";
+import { assembleAgents, subagentsFromTemplates } from "../src/agents.js";
+import { REQUESTED_SOURCE_TABLE, NO_ROSTER_NOTE, caseLabel } from "./requested-agent-source-table.js";
 import {
+  type AgentSelection,
+  type AgentSelectionParse,
+  type AgentSource,
+  type AgentTemplate,
   AGENT_EXCLUSIONS_MAX,
   encodeAgentSelection,
   parseAgentSelection,
+  planAgentSource,
   resolveAgentSelection,
   seedAgentSelection,
 } from "../src/protocol.js";
@@ -57,6 +64,35 @@ const CODER = [
   "Implement the requested change.",
   "",
 ].join("\n");
+
+describe("filterRepoAgentModel", () => {
+  const roleModels = ["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"];
+  const claudeModels = ["opus", "sonnet", "haiku", "claude-opus-4-8", "customClaude", "vgpt-6-sol", "gpt-6-solv"];
+  for (const harness of ["claude", "codex"] as const) {
+    it(`${harness}: projects all role ids and Claude aliases/custom ids without mutating input`, () => {
+      for (const model of [...roleModels, ...claudeModels]) {
+        const template: AgentTemplate = Object.freeze({
+          name: "coder", description: "Works.", prompt_body: "Implement.", model, tools: ["Read"],
+        });
+        const expectedModel = (harness === "codex" ? roleModels : claudeModels).includes(model) ? model : undefined;
+        const result = filterRepoAgentModel(template, harness);
+        assert.equal(result.model, expectedModel, `${harness}: ${model}`);
+        assert.equal(Object.hasOwn(result, "model"), expectedModel !== undefined);
+        assert.deepEqual(result.tools, ["Read"]);
+        assert.equal(result.prompt_body, "Implement.");
+        assert.equal(template.model, model);
+        assert.notEqual(result, template);
+      }
+    });
+
+    it(`${harness}: preserves empty, explicitly undefined and absent pins`, () => {
+      for (const pin of [{}, { model: undefined }, { model: "" }]) {
+        const template: AgentTemplate = Object.freeze({ name: "coder", description: "Works.", prompt_body: "Implement.", ...pin });
+        assert.deepEqual(filterRepoAgentModel(template, harness), template);
+      }
+    });
+  }
+});
 
 describe("detectRepoAgents", { skip: !HAS_PROCFS ? "reads procfs (Linux only)" : realProcfsSkip("detectRepoAgents") }, () => {
   it("returns nothing when the repo has no .claude/agents", async () => {
@@ -298,6 +334,39 @@ describe("detectRepoAgents", { skip: !HAS_PROCFS ? "reads procfs (Linux only)" :
     assert.equal(notes[0]!.name, "spaced");
   });
 
+  it("regression (c): Markdown Codex pins never reach Claude SDK definitions", async () => {
+    const roleModels = ["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"];
+    for (const [i, model] of roleModels.entries()) {
+      writeAgent(`role-${i}.md`, `---\nname: role-${i}\ndescription: Codex role.\nmodel: ${model}\n---\n\nRole body.\n`);
+    }
+    writeAgent("lead.md", "---\nname: lead\ndescription: Repo lead.\nmodel: gpt-6-sol\n---\n\nRepo lead body.\n");
+    writeAgent("alias.md", CODER);
+    writeAgent("custom.md", "---\nname: custom\ndescription: Custom Claude.\nmodel: vgpt-6-sol\n---\n\nCustom body.\n");
+
+    const claude = await detectRepoAgents(clone, "claude");
+    const claudeDefinitions = subagentsFromTemplates(claude.agents, new Set());
+    assert.equal(claude.folder, ".claude/agents");
+    assert.deepEqual(claude.notes, []);
+    for (const name of ["lead", ...roleModels.map((_, i) => `role-${i}`)]) {
+      assert.ok(claudeDefinitions[name], `${name} remains an ordinary subagent`);
+      assert.equal(Object.hasOwn(claudeDefinitions[name]!, "model"), false, `${name}: Codex pin must not reach Claude SDK`);
+    }
+    assert.equal(claudeDefinitions.coder!.model, "opus");
+    assert.equal(claudeDefinitions.custom!.model, "vgpt-6-sol");
+
+    // No native Codex folder: the same Markdown roster is delivered as fallback.
+    const codex = await detectRepoAgents(clone, "codex");
+    assert.equal(codex.folder, ".claude/agents");
+    assert.deepEqual(codex.notes, [], "opposite-family pins are silently omitted");
+    for (const [i, model] of roleModels.entries()) {
+      assert.equal(codex.agents.find((a) => a.name === `role-${i}`)!.model, model);
+    }
+    assert.equal(codex.agents.find((a) => a.name === "lead")!.model, "gpt-6-sol");
+    for (const name of ["coder", "custom"]) {
+      assert.equal(Object.hasOwn(codex.agents.find((a) => a.name === name)!, "model"), false);
+    }
+  });
+
   it("keeps a repo file named `lead` as a subagent candidate (never filtered here)", async () => {
     // PRD Decision 3: the orchestrator always comes from the claim payload, so a repo
     // `lead.md` is just another subagent candidate. Detection must NOT drop it; the
@@ -528,6 +597,69 @@ describe("resolveAgentSelection — the fallback never resolves toward the untru
     assert.deepEqual(resolveAgentSelection({ status: "absent" }, false), {
       selection: { source: "own", exclusions: [] },
     });
+  });
+});
+
+describe("resolveAgentSelection — the requested source (PRD #3914)", () => {
+  const own = { source: "own" as const, exclusions: [] };
+  const repo = { source: "repo" as const, exclusions: [] };
+  const noRoster = "this clone has no repo agent roster; using your own agent templates";
+  const cases: [string, AgentSelectionParse, boolean, unknown, { selection: AgentSelection; note?: string }][] = [
+    ["absent, unset, roster", { status: "absent" }, true, undefined, { selection: repo }],
+    ["absent, unset, no roster", { status: "absent" }, false, undefined, { selection: own }],
+    ["absent, null, roster", { status: "absent" }, true, null, { selection: repo }],
+    ["absent, own, roster", { status: "absent" }, true, "own", { selection: own }],
+    ["absent, own, no roster", { status: "absent" }, false, "own", { selection: own }],
+    ["absent, repo, roster", { status: "absent" }, true, "repo", { selection: repo }],
+    ["absent, repo, no roster", { status: "absent" }, false, "repo", { selection: own, note: noRoster }],
+    ["absent, unknown value, roster", { status: "absent" }, true, "both", { selection: repo }],
+    ["absent, unknown value, no roster", { status: "absent" }, false, "both", { selection: own }],
+    ["ok own wins over repo", { status: "ok", selection: { source: "own", exclusions: ["x"] } }, true, "repo", { selection: { source: "own", exclusions: ["x"] } }],
+    ["ok repo wins over own", { status: "ok", selection: { source: "repo", exclusions: ["x"] } }, true, "own", { selection: { source: "repo", exclusions: ["x"] } }],
+    ["ok repo, no roster, own requested", { status: "ok", selection: { source: "repo", exclusions: ["x"] } }, false, "own", { selection: own, note: noRoster }],
+    ["invalid ignores a repo request", { status: "invalid" }, true, "repo", {
+      selection: own, note: "the submitted agent selection was malformed; using your own agent templates" }],
+  ];
+  for (const [name, parse, roster, requested, want] of cases) {
+    it(name, () => {
+      assert.deepEqual(resolveAgentSelection(parse, roster, requested as AgentSource | null | undefined), want);
+    });
+  }
+
+  for (const c of REQUESTED_SOURCE_TABLE) {
+    it(`shared call-site table: ${caseLabel(c)}`, () => {
+      const resolved = resolveAgentSelection(seedAgentSelection(undefined), c.roster, c.requested);
+      assert.equal(resolved.selection.source, c.want);
+      assert.equal(resolved.note === NO_ROSTER_NOTE, c.note);
+    });
+  }
+});
+
+describe("planAgentSource (PRD #3914 M3)", () => {
+  const sources: (AgentSource | null | undefined)[] = [undefined, null, "own", "repo"];
+  for (const persisted of sources) {
+    for (const requested of sources) {
+      for (const roster of [true, false]) {
+        const want: AgentSource = requested === "repo" && roster && persisted !== "own" ? "repo" : "own";
+        it(`persisted=${String(persisted)} requested=${String(requested)} roster=${roster} plans with ${want}`, () => {
+          assert.equal(planAgentSource(persisted, requested, roster), want);
+        });
+      }
+    }
+  }
+
+  it("an unset request with a persisted repo source from autopilot plans with owner templates", () => {
+    assert.equal(planAgentSource("repo", undefined, true), "own");
+    assert.equal(planAgentSource("repo", null, true), "own");
+  });
+
+  it("a persisted own source narrows a requested repo source to owner templates", () => {
+    assert.equal(planAgentSource("own", "repo", true), "own");
+  });
+
+  it("an unknown persisted or requested value never widens to repo", () => {
+    assert.equal(planAgentSource("both" as unknown as AgentSource, "repo", true), "own");
+    assert.equal(planAgentSource(undefined, "both" as unknown as AgentSource, true), "own");
   });
 });
 

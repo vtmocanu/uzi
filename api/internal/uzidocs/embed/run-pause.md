@@ -47,6 +47,14 @@ From the run view's **‖ Pause ▾** menu (beside **Stop run**), or
   checkpoint the current work before parking. Preservation can fail or the
   published checkpoint can be older than the latest local work; check the
   activity feed rather than assuming that every edit reached the forge.
+  A **Pause now** sent while a resumed run is still recovering kept work
+  (before any model turn) waits for that recovery to finish, then parks with
+  a checkpoint before the run starts new work. A recovery failure or
+  `recovery_wait` hold wins over the waiting pause, and a hold leaves the
+  request pending. The park can still be refused (`pause_failed`); the run is
+  then not paused and is left for the normal requeue path. If the worker never
+  hears the reply to its `paused` report, check the run page: the server may
+  already show it paused.
 
 A pending request is a flag on the still-running run, not a state of its
 own — withdraw it any time before the boundary with **Cancel pause** (CLI:
@@ -54,10 +62,10 @@ own — withdraw it any time before the boundary with **Cancel pause** (CLI:
 synchronous: the park lands on the worker's next report, so watch the run
 page or `uzi run get <id>`.
 
-**Only these kinds can be paused**: issue, non-interactive task, prompt, and
+**Only these kinds accept an owner pause**: issue, non-interactive task, prompt, and
 self-improve runs. A chat run already parks between turns, an interactive
-task parks after every turn, and judge/MR-rework/CI-fix runs are short and
-finish on their own — pausing any of those, or a run already sitting at a
+task parks after every turn, and judge/MR-rework/CI-fix runs do not accept
+owner pause requests — pausing any of those, or a run already sitting at a
 gate or an involuntary park, is refused (409) with the reason. Owner-only.
 
 ## Waiting on a dependency during implementation
@@ -98,20 +106,21 @@ not restart a paid/provider turn or retry parking until an explicit owner
 answer: `/park` authorizes one more attempt; prose returns to the lead;
 cancel ends the run. The fallback is ordinary `awaiting_input`: question
 wait time is banked out of the wall budget, but the worker slot stays held.
-It shares the run's absolute `QUESTION_TIMEOUT_SECONDS` deadline (when enabled);
-another question or retry does not reset it on that worker. An unattended
+It draws on the run's shared `QUESTION_TIMEOUT_SECONDS` parked-time budget (when
+enabled); a re-parked retry continues the same interval and another question gets
+only the remaining budget on that worker. An unattended
 run that needs this owner decision stops with a trusted refusal instead.
 
 ## What's durable, and where
 
-Parking works like the checkpoint the run already keeps pushing during
-normal work: the worker publishes its checkpoint to the forge *before*
+For an ordinary owner pause, parking works like the checkpoint the run
+already keeps pushing during normal work: the worker publishes its checkpoint to the forge *before*
 reporting itself paused, so the parked run's progress lives on the branch,
 not just on one worker's disk. The run's session and its HOME (skills, git
 credentials, in-progress state) stay on the worker that was running it,
 freeing its slot for other work in the meantime.
 
-**If the checkpoint can't be published, the run does not park.** The
+**If the checkpoint can't be published, an ordinary owner pause does not park.** The
 pending request is cleared without changing the status to `paused`, and the
 run's activity feed carries the reason (*"Could not pause: the checkpoint
 could not be published. The run is still running and has restarted the
@@ -256,6 +265,47 @@ a run and it then happens to hit a usage limit before reaching your
 requested boundary, your pause request survives that wait and takes effect
 at the first boundary once the run is running again — you don't have to ask
 twice.
+
+## Paused at the iteration limit
+
+On both Claude and Codex, an eligible run that completes its invocation's
+finite implement ⇄ review allowance before any completion attempt can park
+as `paused` with `hold_reason: iteration_budget_exhausted`. The eligible
+kinds are exactly `issue`, `mr_rework`, `ci_fix`, `task`, `prompt` and
+`self_improve`, non-interactive, with no review target and no isolated fetch.
+This needs API support advertised as `iteration_park_version: 1`; absent or
+unknown support keeps legacy failure handling, and old workers ignore the
+additive field. Eligibility requires an exact persisted
+`completion_attempts = 0`, not a missing count or a local assumption that no
+attempt happened. Runs with prior attempts keep their existing dispositions;
+idle stops and the [worker-initiated stall attempt](./run-completion-hold.md#what-youll-see)
+(#3139) are unchanged.
+
+1. Inspect the run and its capture notices. The worker makes a bounded,
+   best-effort capture and preserves clone, HOME, session and custody.
+   Failed checkpoint publication or degraded capture can still lead to a
+   park. Only a matching acknowledgement confirms `paused`: a refusal or
+   uncertain report stops the invocation retaining local material, without
+   claiming the server paused it.
+2. When ready, the owner explicitly chooses **Resume**
+   (`uzi run resume <id>`). Each resumed invocation gets a fresh finite
+   iteration allowance; completed iterations in that invocation, rather
+   than the lifetime iteration counter, exhaust it. Reaching it again
+   requires another owner Resume. Worker/session affinity is kept where
+   resolvable; a compatible session continues, otherwise the existing
+   recovery disclosure applies.
+3. Resume adds no wall time. If the wall budget is spent, **Extend**, then
+   **Resume**. Extend alone does not resume this iteration hold. An explicit
+   owner set-token-and-resume is also allowed under the same remaining-wall
+   guard; credential availability alone never resumes it. **Cancel** remains
+   available. This hold grants neither **Stop** nor publication authority.
+
+The hold waits without expiry and holds its lane and run-bound worker.
+Retained local material is not a durable backup: unpublished work still
+depends on that worker's storage. Check the published checkpoint and
+[recovery evidence](./run-recovery.md) before relying on another worker.
+This is distinct from an owner pause's publication requirement, a
+`completion_blocked` decision, and the wall park below.
 
 ## Not the same as running out of time
 

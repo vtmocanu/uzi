@@ -32,7 +32,7 @@ const APPROVAL_NOTIFY_CANDIDATES: Milestone[] = [
 
 // PRD #3244 lead_config demo fixtures. Rule 2 (run-queued: schedule pin, no rows), rule 3
 // (run-done: claimed by a worker that recorded nothing, still showing the schedule pin) and
-// rule 4 (run-failed: a requested-only row, the observed side not reported yet).
+// rule 4 (pool-tuning run: a requested-only row, the observed side not reported yet).
 const LEAD_CONFIG_NO_ROWS: RunLeadConfig = { applicable: true, claim_generation: 0, current: true, phases: [] };
 const LEAD_CONFIG_OPUS_MEDIUM: RunLeadConfig = {
   applicable: true,
@@ -90,6 +90,7 @@ const LEAD_CONFIG_CODEX_OBSERVED: RunLeadConfig = {
 
 export const mockRuns: Run[] = [
   {
+    harness_decision: null,
     // run-queued is parked in the queue, not yet claimed by a worker: it renders
     // the "queued" status badge (PRD #21 SC3 — violet under mission, gray under
     // ember) on issue 26's board card and in the runs list.
@@ -166,6 +167,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(1),
   },
   {
+    harness_decision: null,
     // PRD #411: an issue-LESS run (kind "task", from `uzi handoff`) so the muted
     // kind chip renders in place of a "#<iid>" in mock mode, and the M4 tests have a
     // positive fixture for the issue-less branch. issue_iid + issue_web_url are null.
@@ -241,6 +243,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(2),
   },
   {
+    harness_decision: null,
     // PRD #700 M6: an mr_rework run, the "reworking" branch of the MR-review
     // watcher. It is issue-LESS — CreateAutoMRReworkRun leaves issue_iid NULL and
     // carries the human summary in issue_title/issue_description — so RunIssueRef
@@ -313,6 +316,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(1),
   },
   {
+    harness_decision: null,
     // PRD #320 M6 demo: a DEMOTED background run — a self_improve sweep yielding to
     // interactive work while it waits, so its "Deprioritized" pill and the owner's
     // Expedite control are visible on /runs in mock mode. Owned by the session (absent
@@ -382,6 +386,15 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(4),
   },
   {
+    // Creation-time overflow into Claude, before claim binds an Anthropic token.
+    // Current gauges/settings may differ from this historical comparison.
+    harness_decision: {
+      preferred: "codex", chosen: "claude", reason: "overflow",
+      preferred_score: 0, other_score: 65,
+      preferred_measured: 37.5, other_measured: 65,
+      preferred_held: true, other_held: false,
+      preferred_weekly_reset_at: null, other_weekly_reset_at: null,
+    },
     // PRD #320 M6 demo: an EXPEDITED interactive run the owner bumped to the front, so
     // its "Expedited" pill and the "Undo" control render. Owned by the session.
     id: "run-expedited",
@@ -449,6 +462,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(1),
   },
   {
+    harness_decision: null,
     // A repo-less judge meta-run (PRD #239 Decision 4). It is NON-terminal on
     // purpose: it exists so the Runs-badge parity test can prove the count EXCLUDES
     // kind "judge" — a judge run that could not be counted would pin nothing. It is
@@ -518,6 +532,15 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(1),
   },
   {
+    // Automatic default with both accounts qualified: Claude's weekly allowance resets sooner.
+    harness_decision: {
+      preferred: "claude", chosen: "claude", reason: "auto_soonest_reset",
+      preferred_score: 80, other_score: 70,
+      preferred_measured: 80, other_measured: 70,
+      preferred_held: false, other_held: false,
+      preferred_weekly_reset_at: minsAhead(2 * 24 * 60),
+      other_weekly_reset_at: minsAhead(5 * 24 * 60),
+    },
     id: LIVE_RUN_ID,
     repo_id: "repo-uzi",
     issue_iid: 24,
@@ -620,6 +643,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(1),
   },
   {
+    harness_decision: null,
     // run-awaiting is parked at the plan gate (PRD #12): it drives the board's
     // attention strip + loud card and renders the run view's plan-approval panel.
     id: "run-awaiting",
@@ -755,6 +779,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(6),
   },
   {
+    harness_decision: null,
     // run-seeded (PRD #209 M5): a run created WITH a user-authored plan (plan_source
     // "seeded"). It skips the Phase-1 planning turn and the approval gate, so it NEVER
     // enters awaiting_approval and PlanPanel never renders — SeededPlanPanel is the only
@@ -832,6 +857,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(1),
   },
   {
+    harness_decision: null,
     // run-unreadable-question is parked on a clarification question whose payload the
     // UI CANNOT render (PRD #88): the `question` message carries no `question_id`.
     //
@@ -919,6 +945,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(14),
   },
   {
+    harness_decision: null,
     // run-awaiting-followup is parked on a follow-up (PRD #517): the interactive run
     // finished the turn it was steered to and stopped to wait for its owner's NEXT
     // follow-up, holding its worker slot open the whole time. It is the ONLY
@@ -1004,6 +1031,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(3),
   },
   {
+    harness_decision: null,
     id: "run-done",
     repo_id: "repo-uzi",
     issue_iid: 18,
@@ -1125,6 +1153,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(184),
   },
   {
+    harness_decision: null,
     // run-ci-halted (PRD #1650 D3a): a COMPLETED issue run whose MR is still open and whose
     // branch pipeline is red after automatic CI fixing gave up. It is issue 22's latest run
     // on the board, because the server reads the halt through the latest run's branch
@@ -1200,6 +1229,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(1682),
   },
   {
+    harness_decision: null,
     // run-rework-capped (PRD #1202): a COMPLETED issue run whose MR is still OPEN and whose
     // AUTOMATIC rework loop has hit its cap (5 of 5 cycles). It exercises the run view's
     // past-cap panel: the "Automatic rework: 5 of 5 cycles used · stopped" line and the
@@ -1293,6 +1323,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(96),
   },
   {
+    harness_decision: null,
     // run-report-only: a COMPLETED issue run that intentionally opened NO merge request
     // (issue #279). Its deliverable is report_md — the lead's server-scrubbed findings —
     // not a code change, so branch and mr_iid are null. This is the fixture that exercises
@@ -1376,15 +1407,16 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(58),
   },
   {
+    harness_decision: null,
     // run-unjudged: the NEVER-JUDGED fixture (PRD #119 follow-up). Terminal and
     // judge-eligible (kind "issue"), with NO seeded review and NO entry in
     // mockPendingJudges — the only combination that renders the run-review panel's
     // untouched empty state, "This run hasn't been judged yet.", beside an ENABLED
     // Run judge button.
     //
-    // 🔴 IT EXISTS BECAUSE #119 CONSUMED THE FIXTURE THAT USED TO REACH IT. run-failed
+    // 🔴 IT EXISTS BECAUSE #119 CONSUMED THE FIXTURE THAT USED TO REACH IT. pool-tuning run
     // was the one terminal run with no review, and giving it a scheduled auto-judge
-    // left run-done (review, settled), run-closed (review + running) and run-failed
+    // left run-done (review, settled), closed-MR run (review + running) and pool-tuning run
     // (no review + scheduled) — three of the panel's four states, with the fourth, the
     // control state the PRD promises is UNCHANGED, unreachable in the browser. The
     // regression is invisible to the suite, which mounts JudgePanel against stubbed
@@ -1461,10 +1493,11 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(470),
   },
   {
-    // run-closed: a completed run whose MR was later closed unmerged (PRD #24). It
+    harness_decision: null,
+    // closed-MR run: a completed run whose MR was later closed unmerged (PRD #24). It
     // renders the muted, struck-through "!8 closed" chip in the runs list, the
     // dashboard, and on its board card.
-    id: "run-closed",
+    id: "c57b3989-105a-4e08-bf74-77ebc28e5a02",
     repo_id: "repo-uzi",
     issue_iid: 12,
     issue_title: "Retry the flaky worker heartbeat probe",
@@ -1533,7 +1566,10 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(120),
   },
   {
-    id: "run-failed",
+    harness_decision: null,
+    id: "c57b3989-105a-4e08-bf74-77ebc28e5a01",
+    // Committed recovery work is retained for manual landing in the normal demo.
+    landing_state: "needs_landing",
     usage_estimated_tail: demoTailEstimated,
     repo_id: "repo-atlas",
     issue_iid: 7,
@@ -1565,10 +1601,10 @@ export const mockRuns: Run[] = [
     failure_reason: "run timed out after 2h0m0s (RUN_TIMEOUT)",
     // PRD #1867: a promoted salvage, so mock mode shows the Salvage panel's saved state
     // with the fetch command. The ref names this run's own id (the server builds it from the
-    // run's UUID; mock run ids are slugs), because the panel shows the ref and the command
+    // run's UUID), because the panel shows the ref and the command
     // only for refs/uzi-salvage/<this run's id>.
     salvage_state: "promoted",
-    salvage_ref: "refs/uzi-salvage/run-failed",
+    salvage_ref: "refs/uzi-salvage/c57b3989-105a-4e08-bf74-77ebc28e5a01",
     salvage_tip: "9c41e07b2d5a8f3e61b0c7d94a2e5f18b3c6d0a7",
     salvage_expires_at: minsAhead(60 * 24 * 13),
     salvage_last_error: null,
@@ -1629,11 +1665,12 @@ export const mockRuns: Run[] = [
     updated_at: daysAgo(1.1),
   },
   {
+    harness_decision: null,
     // PRD #377 M2: a GitHub run whose branch touched .github/workflows/** — the bot's
     // repo-only PAT can't push workflow files, so uzi fails the run early with a typed
     // reason and PRESERVES the agent's diff (preserved_patch) for a human to land as a PR.
     // The diff is an in-memory synthetic string, NOT a real workflow file.
-    id: "run-workflow-scope",
+    id: "c57b3989-105a-4e08-bf74-77ebc28e5a03",
     repo_id: "repo-atlas",
     issue_iid: 9,
     issue_title: "Add a main-branch guard workflow",
@@ -1736,6 +1773,7 @@ export const mockRuns: Run[] = [
     updated_at: daysAgo(0.55),
   },
   {
+    harness_decision: null,
     id: "run-cancelled",
     usage_estimated_tail: demoTailUnpriced,
     repo_id: "repo-atlas",
@@ -1805,6 +1843,7 @@ export const mockRuns: Run[] = [
     updated_at: daysAgo(3),
   },
   {
+    harness_decision: null,
     // PRD #35: a run PARKED on an Anthropic usage limit — the only fixture whose
     // status is `limit_wait`, so it is the only one that renders the warn pill, the
     // resume countdown, and the per-run toggle in its parked form.
@@ -1890,6 +1929,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(6),
   },
   {
+    harness_decision: null,
     // PRD #35, second parked run: the DEGRADED countdown states, which the first
     // fixture cannot reach. Added because the browser validator had to override
     // Date.now() inside the page to see them at all, and a state reachable only by
@@ -1972,6 +2012,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(3),
   },
   {
+    harness_decision: null,
     // Issue #754: an `auto`-lane run parked because the owner's Anthropic token pool
     // is genuinely EMPTY. It is NOT a usage-limit park, and the fixture asserts that
     // difference deliberately:
@@ -2052,6 +2093,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(9),
   },
   {
+    harness_decision: null,
     // PRD #1190: a run its OWNER paused — the only fixture whose status is `paused`, so
     // the only one that renders the `‖ paused` info pill, the conditional Resume header
     // action, the "· clock stopped" elapsed, and the PausedPanel. It parked after
@@ -2157,8 +2199,8 @@ export const mockRuns: Run[] = [
 ];
 
 mockRuns.push({
-  ...mockRuns.find((r) => r.id === "run-failed")!,
-  id: "run-rejected", issue_iid: 10,
+  ...mockRuns.find((r) => r.id === "c57b3989-105a-4e08-bf74-77ebc28e5a01")!,
+  id: "c57b3989-105a-4e08-bf74-77ebc28e5a04", issue_iid: 10,
   issue_title: "Refresh pool metrics after base update",
   issue_description: "", branch: "agent/issue-10",
   fail_origin: "base_diverged",
@@ -2197,6 +2239,14 @@ for (const [id, max, sourceOnly] of [
   });
 }
 mockRuns.push(
+  { ...pausedBase, id: "run-iteration-hold", hold_reason: "iteration_budget_exhausted",
+    budget_wall_seconds: null, budget_total_seconds: 3600, budget_used_seconds: 1800,
+    budget_extension_seconds: 0, budget_extension_cap_seconds: 7200,
+    completion_phase: "", completion_attempts: 0 },
+  { ...pausedBase, id: "run-iteration-spent", hold_reason: "iteration_budget_exhausted",
+    budget_wall_seconds: null, budget_total_seconds: 3600, budget_used_seconds: 3600,
+    budget_extension_seconds: 0, budget_extension_cap_seconds: 7200,
+    completion_phase: "", completion_attempts: 0 },
   { ...pausedBase, id: "run-provider-hold", hold_reason: "provider_unavailable",
     provider_park_count: 12, provider_park_streak_started_at: daysAgo(2),
     can_stop_at_provider_hold: true },
@@ -2330,5 +2380,29 @@ mockRuns.push(
     created_at: minsAgo(31),
     status_since: minsAgo(22),
     updated_at: minsAgo(22),
+  },
+  {
+    // PRD #3989 M3: a Claude issue run parked after an admin reset deleted every credential.
+    // No Resume (the server refuses it); it resumes once a credential is added in Settings.
+    ...pausedBase,
+    id: "run-cred-reset",
+    issue_iid: 193,
+    issue_title: "Document the worker image rebuild cadence",
+    issue_description: "See prds/193-image-rebuild-cadence.md.",
+    branch: "agent/issue-193",
+    hold_reason: "credentials_reset",
+    credential_override: null,
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
+    anthropic_select_reason: null,
+    anthropic_headroom_pct: null,
+    milestones_completed: [],
+    checkpoint_tip_at: null,
+    budget_used_seconds: 300,
+    claimed_at: minsAgo(25),
+    started_at: minsAgo(25),
+    created_at: minsAgo(26),
+    status_since: minsAgo(9),
+    updated_at: minsAgo(9),
   },
 );

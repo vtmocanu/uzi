@@ -107,7 +107,7 @@ describe("runner entry points that reach a mutating hook", () => {
       evidence: unknown, flight: unknown): Promise<{ path: string }>;
     bindFlightSource(flight: unknown, clonePath: string): Promise<void>;
     admitPredecessorSource(flight: unknown, clonePath: string, wait: object): Promise<void>;
-    requireLaunchAuthority(flight: unknown): Promise<void>;
+    requireLaunchAuthority(flight: unknown): Promise<() => void>;
     endFlightSourceUse(flight: unknown, log: unknown): Promise<void>;
     reconcileConfirmedOwed(flight: unknown, bare: string, sha: string): Promise<void>;
     settler: { cleanup: { deleteRecoveryPin(bare: string, runId: string, generation: number): Promise<void> } };
@@ -215,7 +215,7 @@ describe("runner entry points that reach a mutating hook", () => {
 
 // ---- the runner's call-site inventory -------------------------------------------------------
 
-describe("runner.ts call sites: A wraps exactly the git calls that can reach a mutating hook", () => {
+describe("runner.ts call sites: direct A wrappers exclude phased import transport", () => {
   const source = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "runner.ts"), "utf8");
   const WRAPPERS = /(?:inAuthority|inFlightAuthority|seedInAuthority)\(/g;
 
@@ -238,7 +238,10 @@ describe("runner.ts call sites: A wraps exactly the git calls that can reach a m
   // Methods whose body reaches admitSourceUse, beginBareMutation or beginDestructive.
   const NEEDS_A = ["reconcileOwedCandidates", "deleteRecoveryPin", "normalizeRetainedSourceObjects", "prepareRecoverySuccessor",
     "createOrAttachRunnerClone", "runnerCloneForBranch"];
-  // Methods whose only authority hook is the transaction-free assertBareClear.
+  // Lexical inventory only: fetchAgentBranch receives a trusted callback for its A -> B
+  // proof phases. It must not hold A across transport. The bootstrap runtime controls
+  // exercise that callback with real authority hooks; lexical wrapping cannot prove it.
+  // The remaining methods use only the transaction-free assertBareClear hook.
   const NO_A = ["fetchAgentBranch", "updateTrackingRef", "retainCurrentOwedCandidate", "anchorRecoveryHead"];
 
   for (const method of NEEDS_A) {
@@ -249,7 +252,7 @@ describe("runner.ts call sites: A wraps exactly the git calls that can reach a m
     });
   }
   for (const method of NO_A) {
-    it(`${method}: no call holds A (assertBareClear needs none)`, () => {
+    it(`${method}: call is outside an A wrapper`, () => {
       const found = sites(method);
       assert.ok(found.length > 0, "the site exists");
       for (const index of found) assert.equal(wrapped(index), false, `this.git.${method}( at offset ${index} is wrapped in A`);

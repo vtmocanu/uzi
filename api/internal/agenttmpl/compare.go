@@ -2,8 +2,8 @@ package agenttmpl
 
 import "slices"
 
-// SameContent reports whether two definitions carry the same content: the four
-// mutable columns of an agent template — description, model, tools and prompt
+// SameContent reports whether two definitions carry the same content: the five
+// mutable columns of an agent template — description, model, codex_model, tools and prompt
 // body.
 //
 // It lives here, and not in handler, because it is the ONE answer to "has this
@@ -17,7 +17,7 @@ import "slices"
 // lookup key: the shipped side is always obtained by BuiltinByName(row.Name),
 // whose loop condition is d.Name == name, so equality holds by construction — and
 // the column is immutable after create (UpdateAgentTemplate does not carry it).
-// A fifth term here could never be false and would send a reader hunting a case
+// A sixth term here could never be false and would send a reader hunting a case
 // that cannot exist.
 //
 // Nothing is normalized, in either direction:
@@ -34,9 +34,9 @@ import "slices"
 //     TrimSpace cannot make a pristine row look drifted.
 //
 // IT DOES NOT RENDER EITHER SIDE AND COMPARE THE BYTES, which is the tempting
-// shortcut, and no case in this suite discriminates the two today — which is
-// exactly why it is written the column way now and would be expensive to change
-// later. Two reasons it must stay this way:
+// shortcut. CodexModel deliberately has no rendered representation; comparing
+// rendered bytes would miss changes to that pin. Two more reasons it stays
+// column-based:
 //
 //   - Render serializes the FRONTMATTER, so anything a future release adds there
 //     enters the comparison for free. PRD #85 M2 stamps a `version:` line into the
@@ -49,6 +49,7 @@ import "slices"
 func SameContent(a, b Definition) bool {
 	return a.Description == b.Description &&
 		a.Model == b.Model &&
+		a.CodexModel == b.CodexModel &&
 		a.PromptBody == b.PromptBody &&
 		slices.Equal(a.Tools, b.Tools)
 }

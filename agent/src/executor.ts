@@ -49,6 +49,54 @@ import { unmarkedSpawnEnv, type RecordedRoot } from "./worker-spawn-mark.js";
 
 const execFileAsync = promisify(execFile);
 
+/** A single exact-marker fixture wait, bounded to 180 seconds and the original abort signal. */
+export async function waitForStubOutboxCut(
+  runId: string,
+  signal: AbortSignal | undefined,
+  ready: () => void,
+): Promise<void> {
+  if (!/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(runId))
+    throw new Error("invalid stub outbox barrier run id");
+  const name = `cdr-outbox-cut-${runId}`;
+  const file = path.join("/tmp", name);
+  try {
+    signal?.throwIfAborted();
+    await new Promise<void>((resolve, reject) => {
+      let done = false;
+      let watcher: ReturnType<typeof watch> | undefined;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const finish = (failed: boolean, error?: unknown) => {
+        if (done) return;
+        done = true;
+        watcher?.close();
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", abort);
+        if (failed) reject(error); else resolve();
+      };
+      const abort = () => finish(true, signal?.reason ?? new Error("stub outbox barrier aborted"));
+      const check = () => {
+        if (done) return;
+        void fs.access(file).then(() => finish(false), error => {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") finish(true, error);
+        });
+      };
+      try {
+        watcher = watch("/tmp", (_event, changed) => { if (changed === name) check(); });
+        watcher.on("error", error => finish(true, error));
+        timer = setTimeout(() => finish(true, new Error("stub outbox cut barrier timeout")), 180_000);
+        signal?.addEventListener("abort", abort, { once: true });
+        if (signal?.aborted) { abort(); return; }
+        check();
+        ready();
+      } catch (error) { finish(true, error); }
+    });
+    signal?.throwIfAborted();
+  } finally {
+    // Marker removal is best-effort and must not replace the original abort/failure.
+    await fs.unlink(file).catch(() => undefined);
+  }
+}
+
 /**
  * The resolution of an interactive-task follow-up park (PRD #517 M3). Returned by
  * `RunContext.awaitFollowUp`. Discriminated so the loop can tell "keep going with a new
@@ -96,6 +144,9 @@ export interface EmittedMessage {
  */
 export type WallParkOutcome = "parked" | "undeliverable" | "refused" | "cancelled";
 
+/** Both outcomes end the exhausted flight without finalization; retained-stop keeps its work. */
+export type IterationParkOutcome = "parked" | "retained-stop";
+
 /**
  * Issue #1600: the run's budget as the server reported it on a REFUSED wall park's 409 body
  * ({@link RunContext.takeWallParkRefresh}). `totalSeconds` is the served three-term total wall and
@@ -134,9 +185,17 @@ export interface RunContext {
   runId: string;
   /** Current server claim fence; required to consume a checked plan approval. */
   claimGeneration?: number;
+  /** Issue #3870, Claude run flight only (the runner sets it; Codex never does): the managed Go
+   *  work dir `<runHome>/.uzi-go-work/g<gen>`. It becomes GOTMPDIR for the lead CLI and the
+   *  pre-plan JS-deps install, and is inherited by Bash, subagents and the guarded command lane.
+   *  Absent when the runner could not prepare one (launch proceeds without GOTMPDIR). */
+  managedGoWorkDir?: string;
   /** PRD #3244: the claim's single lead-config reporter, constructed by the runner only. Executors
    *  call `enterPhase` before a lead turn; absent for stub/test executors and non-lead lanes. */
   leadConfig?: import("./lead-config-report.js").LeadConfigReporter;
+  /** Issue #3251: the claim's single Codex catalog default reporter, built by the runner only when
+   *  the claim carries a well-formed `codex_catalog_context`. Absent otherwise. */
+  codexCatalogReport?: import("./codex/catalog-report.js").CodexCatalogReporter;
   /** Negotiated before execution/capture; remains binding if registration features shrink. */
   codexIdleStallRecovery?: boolean;
   /** Claim support assertion; absent means false. The runner separately gates root and phase. */
@@ -405,6 +464,8 @@ export interface RunContext {
    *  field), and the executor then applies resolveAgentSelection's absent-default —
    *  which is the CORRECT answer for a gate-less run, not a fallback to tolerate. */
   approvedSelection?: AgentSelection;
+  requestedAgentSource?: AgentSource | null;
+  reportPlanAgentSource?(source: AgentSource): Promise<void>;
   /** Called once with the SDK session id when first observed (for /state). */
   onSessionId?(sessionId: string): void;
   /** Aborts the SDK subprocess when signalled (cancel/shutdown; wired in M4). */
@@ -569,8 +630,12 @@ export interface RunContext {
    * commit, then it gates again on the next done; `fail` exits WITHOUT the done checkpoint so the
    * flagged commit is never published, and the runner reports `push_secret_blocked` at finalize.
    * Absent on the stub/test executors (treated as `proceed`).
+   * An iteration-park-capable resumed invocation may also call with unpublishedOnly
+   * before its first work turn to regenerate lost guidance. That advisory call skips
+   * fully published ranges; only remediate changes the prompt, never the turn budget
+   * or the authority of the done/checkpoint/finalize guards.
    */
-  secretRemediationGate?(): Promise<SecretRemediationDecision>;
+  secretRemediationGate?(options?: { unpublishedOnly: true }): Promise<SecretRemediationDecision>;
   /** Advisory code gate at a finalizing done exit; permits one repair pass. `repairAvailable: false` means no
    *  implementation iteration remains: the gate must not start a repair (findings stay unreported) and never
    *  extends the iteration budget. Absent is treated as available. */
@@ -651,6 +716,8 @@ export interface RunContext {
    * legacy behaviour (the caller treats the absent seam as "no park").
    */
   parkForWall?(at: { completedCount: number; total?: number }): Promise<WallParkOutcome>;
+  /** Iteration exhaustion sink: every outcome stops the flight, including refusals and unknown ACKs. */
+  parkForIteration?(at: { iterationCount: number; maxIterations: number }): Promise<IterationParkOutcome>;
   /**
    * Issue #1600: the budget the server returned with the most recent REFUSED wall park, consumed
    * once (a second call returns undefined until the next refusal). A caller that re-drives a turn
@@ -922,6 +989,8 @@ export interface ExecutorResult {
    *  the trip used (REASON_WALL). NOT gated on run kind (all six timed kinds park at the wall) or on
    *  harness (both Claude and Codex). Absent on every normal completion. StubExecutor never sets it. */
   walled?: { reason: string };
+  /** Disposition for every iteration sink outcome. The runner must skip finalization for either. */
+  iterationParked?: { outcome: IterationParkOutcome };
   /** PRD #1247 M5b (data-integrity fix): set when a held-state credential switch RELEASED the claim
    *  IN PLACE — `ctx.attemptCredentialSwitch` returned "released" from the implement loop, the plan
    *  gate, an ask_user question, or an interactive follow-up wait. The switch already drained the
@@ -1003,7 +1072,11 @@ export interface Executor {
    * complete. Absent on the stub/test and
    * Codex executors.
    */
-  reapAttributedProcesses?(): Promise<RunProcessReap>;
+  reapAttributedProcesses?(opts?: {
+    /** issue #3980: absolute epoch-ms deadline of a bounded gate checkpoint. Past it nothing new is
+     *  admitted and a join that is still pending reads as an unconfirmed (incomplete) reap. */
+    deadlineAt?: number;
+  }): Promise<RunProcessReap>;
   /**
    * Issue #2471: dispose and confirm the model commands of a memory-guard-bound Claude flight
    * within `deadlineMs`, and refuse new ones until the next turn. `confirmed: false` means a
@@ -1927,32 +2000,9 @@ export class StubExecutor implements Executor {
       if (firstClaimBarrier && (!Number.isSafeInteger(ctx.claimGeneration) || ctx.claimGeneration! < 1))
         throw new Error("invalid stub outbox barrier claim generation");
       if (cutBarrier || (firstClaimBarrier && ctx.claimGeneration === 1)) {
-        if (!/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(ctx.runId))
-          throw new Error("invalid stub outbox barrier run id");
-        const name = `cdr-outbox-cut-${ctx.runId}`;
-        const file = path.join("/tmp", name);
-        await new Promise<void>((resolve, reject) => {
-          let done = false;
-          const finish = (error?: unknown) => {
-            if (done) return;
-            done = true;
-            watcher.close();
-            clearTimeout(timer);
-            ctx.signal?.removeEventListener("abort", abort);
-            if (error) reject(error); else resolve();
-          };
-          const abort = () => finish(ctx.signal?.reason ?? new Error("stub outbox barrier aborted"));
-          const check = () => { void fs.access(file).then(() => finish(), error => {
-            if ((error as NodeJS.ErrnoException).code !== "ENOENT") finish(error);
-          }); };
-          const watcher = watch("/tmp", (_event, changed) => { if (changed === name) check(); });
-          watcher.on("error", finish);
-          const timer = setTimeout(() => finish(new Error("stub outbox cut barrier timeout")), 180_000);
-          ctx.signal?.addEventListener("abort", abort, { once: true });
-          if (ctx.signal?.aborted) abort(); else check();
+        await waitForStubOutboxCut(ctx.runId, ctx.signal, () => {
           ctx.emit({ kind: "status", agent: "worker", payload: { text: "stub: outbox waiting for API cut" } });
         });
-        await fs.unlink(file).catch(() => undefined);
       }
       return;
     }

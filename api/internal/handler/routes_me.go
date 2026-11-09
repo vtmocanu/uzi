@@ -230,6 +230,10 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 	// two modes, both valid. Identity is the session user, never the body.
 	r.With(h.requireUser()).Put("/me/codex-account-mode", h.SetCodexAccountMode)
 
+	// Harness overflow chooses among the caller's existing harness credentials. Like
+	// account mode, it is owner-scoped and Bearer-reachable; cookie writes require CSRF.
+	r.With(h.requireUser()).Put("/me/harness-overflow", h.SetHarnessOverflowEnabled)
+
 	// Current-user Claude rate-limit meters (PRD #53): the caller's own 5h/7d
 	// windows. Self-scoped; admins use /api/admin/rate-limits for everyone.
 	//
@@ -278,4 +282,12 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 		r.With(h.requireUser()).Get("/", h.GetMySettings)
 		r.With(h.requireAuth()).Put("/", h.PutMySettings)
 	})
+
+	// Effective settings (PRD #3254): what model, effort and harness a run would use. Owner-scoped
+	// reads of the caller's own state, so RequireUser (reachable from a uzc_ CLI token, like GET
+	// /me/settings), no limiter, no forge or provider call. start-preview is a POST only because
+	// it carries a token choice, and schedule-preview takes a draft or a schedule id; neither writes anything.
+	r.With(h.requireUser()).Get("/me/effective-settings", h.GetEffectiveSettings)
+	r.With(h.requireUser()).Post("/me/effective-settings/start-preview", h.PreviewStartSettings)
+	r.With(h.requireUser()).Post("/me/effective-settings/schedule-preview", h.PreviewScheduleSettings)
 }

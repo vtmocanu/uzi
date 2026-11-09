@@ -166,9 +166,12 @@ with the bot, so the sender is already `uzi`. Glyph legend:
   prefers the run harness's native folder. A present preferred folder is final
   even if empty or invalid; see [Repo agents](./repo-agents.md#which-folder-is-read).
   The repo card is a whole-roster choice only; to exclude individual agents,
-  approve from the web UI instead. With no detected roster, the gate shows the
-  single **Approve** button (your templates). Mere directory existence does not
-  enable the repo choice.
+  approve from the web UI instead. **Approve · repo agents (N)** comes first
+  and is the primary button, unless the run's [default for the
+  repo](./repo-agents.md#set-a-default-for-your-runs-on-a-repo) is **uzi
+  templates**: then **Approve · my templates** comes first and is the primary
+  button. With no detected roster, the gate shows the single **Approve** button
+  (your templates). Mere directory existence does not enable the repo choice.
 - **Answering a question**: an agent that hits a fork it shouldn't resolve
   alone can stop and ask you. The run parks, its status reads **needs your
   answer**, and the question is posted into the run thread with any suggested
@@ -189,9 +192,10 @@ with the bot, so the sender is already `uzi`. Glyph legend:
   - **One reply answers the whole card.** When the agent batches several
     questions into one message, cover them in a single reply; the agent reads
     it in full. It may re-ask anything you left unaddressed.
-  - **Nobody answers ⇒ the run fails** once the answer deadline passes (24
-    hours by default, `QUESTION_TIMEOUT_SECONDS`). The timer is held by the
-    worker, so if that worker dies and the run is picked up again the clock
+  - **Nobody answers ⇒ the run fails** once its parked-time answer
+    budget is spent (24 hours by default, `QUESTION_TIMEOUT_SECONDS`, counted only
+    while the run waits on a question). The budget is held by the
+    worker, so if that worker dies and the run is picked up again it
     restarts. With no other fresh executor execution, worker-death retries
     contribute `QUESTION_TIMEOUT_SECONDS × (RUN_MAX_REQUEUES + 1)` and
     `QUESTION_MAX × (RUN_MAX_REQUEUES + 1)` (96h and 20 questions on defaults).
@@ -275,6 +279,17 @@ with the bot, so the sender is already `uzi`. Glyph legend:
   cross-check's reason can appear on the parent run's plan-gate message;
   code cross-check findings go to the merge request's Code cross-check
   section (see [Cross-check](./cross-check.md)).
+- **Incomplete Code cross-check**: when a completed run's advisory Code
+  cross-check failed (and was not interrupted or superseded), the run's
+  completion message in the thread adds one line such as `Code cross-check
+  incomplete: model error. Publication continued.` The reason is one of a
+  fixed set of phrases (`reason unavailable` for anything else), never
+  checker output or findings. "Publication continued." appears only when the
+  run recorded a valid merge request link. The line rides the existing
+  completion message, so it adds no separate message, mention or nudge. If
+  the run has no Slack message yet when it completes (for example Slack was
+  linked mid-run), only the top-level message is posted and the line is not
+  shown.
 - **Run health nudges**: if a run you own gets flagged (stalled, looping,
   near timeout, waiting for a worker, or stuck too long awaiting approval —
   see [Run health](./run-health.md)), the root DM's `context` block picks up

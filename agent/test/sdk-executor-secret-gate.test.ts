@@ -92,6 +92,113 @@ afterEach(() => {
 
 const REMEDIATE = "REMEDIATE-SECRET-MARKER: rewrite the flagged commit";
 
+describe("iteration resume remediation preflight", () => {
+  for (const resumed of [false, true]) {
+    it(`SDK preflight requires resume and park capability; resumed=${resumed}`, async () => {
+      const { queryFn } = fakeTurns([[signalDone(), resultSuccess()]]);
+      let preflights = 0;
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({
+        kind: "issue", sessionId: "sess-1", resumed, planApproved: true, approvedPlan: "approved",
+        config: { max_iterations: 1, ...(resumed ? {} : { iteration_park_version: 1 }) },
+        parkForIteration: async () => "parked",
+        secretRemediationGate: async options => { if (options) preflights++; return { action: "proceed" }; },
+      }));
+      assert.equal(preflights, 0);
+    });
+  }
+  for (const sessionId of ["sess-1", null]) {
+    for (const action of ["remediate", "proceed", "fail"] as const) {
+      it(`SDK preflight session=${sessionId} action=${action} owns only the first work turn`, async () => {
+        const { queryFn, prompts } = fakeTurns([[resultSuccess()]]);
+        let checks = 0;
+        let ownerPulls = 0;
+        const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({
+          kind: "issue", resumed: true, sessionId, seeded: true,
+          planApproved: true, approvedPlan: "approved work",
+          config: { max_iterations: 2, iteration_park_version: 1 },
+          reportIteration: async () => ({ completionAttempts: 0 }),
+          parkForIteration: async () => "parked",
+          pullFollowUps: () => { ownerPulls++; return []; },
+          secretRemediationGate: async options => {
+            checks++;
+            assert.deepEqual(options, { unpublishedOnly: true });
+            return action === "remediate" ? { action, followUp: REMEDIATE } : { action };
+          },
+        }));
+        assert.equal(checks, 1);
+        assert.equal(prompts.length, 2, "preflight does not add an implementation turn");
+        assert.equal(prompts[0]!.includes(REMEDIATE), action === "remediate");
+        assert.equal(prompts[1]!.includes(REMEDIATE), false, "guidance is not replayed on later ordinary turns");
+        if (action === "remediate") assert.equal(ownerPulls, 1, "system guidance owns the first turn only");
+        assert.deepEqual(result.iterationParked, { outcome: "parked" });
+      });
+    }
+  }
+
+  it("SDK preflight cancellation during scan dispatches no model work", async () => {
+    const { queryFn, prompts } = fakeTurns([[resultSuccess()]]);
+    let cancelled = false;
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({
+      kind: "issue", resumed: true, sessionId: "sess-1", planApproved: true, approvedPlan: "approved",
+      config: { max_iterations: 1, iteration_park_version: 1 }, parkForIteration: async () => "parked",
+      cancelRequested: () => cancelled,
+      secretRemediationGate: async () => { cancelled = true; return { action: "remediate", followUp: REMEDIATE }; },
+    })), /cancel/i);
+    assert.equal(prompts.length, 0);
+  });
+
+  for (const control of ["wall", "disk", "switch"] as const) {
+    it(`SDK preflight preserves ${control} arriving during its await`, async () => {
+      const { queryFn, prompts } = fakeTurns([[resultSuccess()]]);
+      let mode: "wall" | "disk" | null = null;
+      let pause: (() => void) | undefined;
+      let credentialSwitch: (() => void) | undefined;
+      let switches = 0;
+      const running = new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({
+        kind: "issue", resumed: true, sessionId: "sess-1", planApproved: true, approvedPlan: "approved",
+        config: { max_iterations: 1, iteration_park_version: 1 }, parkForIteration: async () => "parked",
+        pauseModeRequested: () => mode, onPauseNow: callback => { pause = callback; },
+        onCredentialSwitch: callback => { credentialSwitch = callback; },
+        attemptCredentialSwitch: async () => { switches++; return "released"; },
+        parkForWall: async () => "parked",
+        secretRemediationGate: async () => {
+          if (control === "switch") { assert.ok(credentialSwitch); credentialSwitch(); }
+          else { mode = control; if (control === "wall") { assert.ok(pause); pause(); } }
+          return { action: "remediate", followUp: REMEDIATE };
+        },
+      }));
+      if (control === "disk") await assert.rejects(running, error => error instanceof Error && error.constructor.name === "DiskParkSignal");
+      else {
+        const result = await running;
+        if (control === "switch") { assert.equal(switches, 1); assert.equal(result.switchReleased, true); }
+        else assert.ok(result.walled);
+      }
+      assert.equal(prompts.length, 0, "control wins before model dispatch");
+    });
+  }
+
+  it("SDK preflight is regenerated after a crash before first model evidence", async () => {
+    const { queryFn, prompts } = fakeTurns([[resultSuccess()]]);
+    let checks = 0;
+    const context = () => makeCtx({
+      kind: "issue", resumed: true, sessionId: null, seeded: true,
+      planApproved: true, approvedPlan: "approved",
+      config: { max_iterations: 1, iteration_park_version: 1 },
+      reportIteration: async () => ({ completionAttempts: 0 }), parkForIteration: async () => "parked",
+      secretRemediationGate: async () => {
+        if (++checks === 1) throw new Error("simulated crash before model evidence");
+        return { action: "remediate", followUp: REMEDIATE };
+      },
+    });
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(context()), /simulated crash/);
+    assert.equal(prompts.length, 0);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(context());
+    assert.equal(checks, 2);
+    assert.equal(prompts.length, 1);
+    assert.ok(prompts[0]!.includes(REMEDIATE));
+  });
+});
+
 describe("SdkExecutor secret remediation gate (Issue #1932)", () => {
   for (const interlocked of [false, true]) {
     const label = interlocked ? "interlocked" : "non-interlocked";

@@ -438,6 +438,12 @@ func resultIsError(payload json.RawMessage) bool {
 // transcriptBudgetWithoutCard shares the existing chrome accounting with the card.
 // It excludes the pane title, and deliberately has no minimum floor.
 func (m tuiModel) transcriptBudgetWithoutCard() int {
+	return m.transcriptBudgetWithoutDiskGuidance() - len(m.diskHoldDetailLines())
+}
+
+// transcriptBudgetWithoutDiskGuidance counts the existing chrome without the disk
+// guidance or question card. It is pure and does not call either layout builder.
+func (m tuiModel) transcriptBudgetWithoutDiskGuidance() int {
 	lineCount := func(s string) int {
 		if s == "" {
 			return 0
@@ -447,6 +453,7 @@ func (m tuiModel) transcriptBudgetWithoutCard() int {
 	chrome := len(forgeRunLines(m.detail.run)) + len(workerExhaustionTUILines(m.detail.run)) + len(m.detailHeaderLines()) // the priority header: always 1 row (detailHeaderLines)
 	// Wrapped provider copy: each element is one physical row.
 	chrome += len(m.providerDetailLines())
+	chrome += len(m.iterationDetailLines())
 	providerHold := isProviderUnavailableHold(m.detail.run)
 	if limitWaitLine(m.detail.run, time.Now()) != "" ||
 		(nearTimeoutLine(m.detail.run, time.Now()) != "" && !providerHold && providerParkLine(m.detail.run) == "") ||
@@ -460,8 +467,8 @@ func (m tuiModel) transcriptBudgetWithoutCard() int {
 		// so together they add at most one physical row that renderDetail must be charged for.
 		// The width-shed fitNearTimeoutLine draws the same single row; presence is width-free.
 	}
-	if credentialDisabledLine(m.detail.run) != "" ||
-		(!providerHold && (m.detail.run.Status == statusPaused || m.detail.run.PauseRequestedAt != nil)) {
+	if credentialHoldLine(m.detail.run) != "" ||
+		(!providerHold && !isIterationHold(m.detail.run) && (m.detail.run.Status == statusPaused || m.detail.run.PauseRequestedAt != nil)) {
 		chrome++ // the pause row-2 slot (PRD #1190 M4 paused / pause-requested, PRD #1732 credential
 		// hold): its own row in renderDetail, independent of the park slot above, so a parked run
 		// with a pending pause (limit_wait + pause_requested_at) is charged two rows. The three

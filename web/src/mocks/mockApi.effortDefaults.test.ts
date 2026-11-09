@@ -82,6 +82,36 @@ describe("mock effort defaults vs fixtures/effort-defaults/cases.json", () => {
     assertExercised("validators", got, cases.validators);
   });
 
+  // Issue #3251: the Codex cell carries a static catalog_default sample; Claude never does.
+  it("serves a static catalog_default on the Codex cell only, defaulting to known", async () => {
+    const api = await reload();
+    const { settings } = await api.getMySettings();
+    const [claude, codex] = settings.effort_settings!;
+    expect(codex.catalog_default).toMatchObject({ state: "known", effort: "medium", model: "gpt-6.1-sol", runtime_version: "0.164.0" });
+    expect(claude).not.toHaveProperty("catalog_default");
+  });
+
+  it("serves each sample state on the Codex cell and restores known on reload", async () => {
+    const expected = {
+      known: { state: "known", effort: "medium" },
+      none: { state: "known", effort: "none" },
+      varies: { state: "varies", effort: "medium" },
+      unknown: { state: "unknown", effort: null, model: null, runtime_version: null, observed_at: null },
+    } as const;
+    vi.resetModules();
+    const { mockApi } = await import("./mockApi");
+    const { setMockCodexCatalogSample } = await import("./mockApi/settings");
+    for (const [sample, want] of Object.entries(expected)) {
+      setMockCodexCatalogSample(sample as keyof typeof expected);
+      const { settings } = await mockApi.getMySettings();
+      expect(settings.effort_settings!.find((c) => c.harness === "codex")!.catalog_default, sample).toMatchObject(want);
+      expect(settings.effort_settings!.find((c) => c.harness === "claude")!, sample).not.toHaveProperty("catalog_default");
+    }
+    const { settings } = await (await reload()).getMySettings();
+    expect(settings.effort_settings![1].catalog_default?.state).toBe("known");
+    expect(settings.effort_settings![1].catalog_default?.effort).toBe("medium");
+  });
+
   it("keeps checker effort independent of the ordinary preference", async () => {
     const got = new Set<string>();
     for (const c of cases.checker) {

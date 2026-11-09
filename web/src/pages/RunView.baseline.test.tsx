@@ -40,6 +40,7 @@ function anActivity(over: Partial<RunActivity> = {}): RunActivity {
 
 function run(over: Partial<Run>): Run {
   return {
+    harness_decision: null,
     id: "r1",
     repo_id: "repo1",
     forge_type: "gitlab",

@@ -211,6 +211,7 @@ beforeEach(() => {
   // PRD #1429 M4a review Fix 1: the viewer's default_harness, no preference by default.
   mockApi.getMySettings.mockResolvedValue({
     settings: {
+      harness_overflow_enabled: false,
       default_harness: null,
       default_model: null,
       default_effort: null,
@@ -300,6 +301,16 @@ describe("IssueView run history — forge-aware MR/PR link when mr_web_url is nu
     // Non-vacuous: the old hard-coded path would have produced /-/merge_requests/799.
     expect(container.querySelector('a[href*="merge_requests"]')).toBeNull();
   });
+});
+
+it.each([["paused", "Codex policy hold"], ["queued", "queued"], ["completed", "completed"]] as const)("policy history label for %s", async (status, label) => {
+  setAuth();
+  mockApi.getIssue.mockResolvedValue({ issue: anIssue() });
+  mockApi.listRuns.mockResolvedValue({ runs: [aRunItem({ status, hold_reason: "codex_policy_hold" })] });
+  renderIssueView();
+  expect(await screen.findByText(label)).toBeTruthy();
+  expect(screen.queryByText("codex policy_hold")).toBeNull();
+  if (status !== "paused") expect(screen.queryByText("Codex policy hold")).toBeNull();
 });
 
 // issue #2004: a resumed run's started_at is reset to the last leg, so the history row's
@@ -627,9 +638,9 @@ describe("IssueView Start gate (PRD #764)", () => {
   });
 
   // Positive control: a both-usable user with the harness picker left on inherit (the
-  // untouched default) also still sees the Anthropic picker — D11 rule 4 resolves
-  // inherit to Claude when both are usable and no default is set, so hiding it here
-  // would be wrong.
+  // untouched default) also still sees the Anthropic picker. The usage-free resolver
+  // answer for inherit with both usable is Claude; creation of an eligible implicit issue
+  // run may pick by weekly limits instead (#3845), so hiding it here would be wrong.
   it("still shows the Anthropic token picker for a both-usable user on the untouched inherit default", async () => {
     setAuth();
     mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
@@ -659,6 +670,7 @@ describe("IssueView Start gate (PRD #764)", () => {
     });
     mockApi.getMySettings.mockResolvedValue({
       settings: {
+        harness_overflow_enabled: false,
         default_harness: "codex",
         default_model: null,
         default_effort: null,
@@ -1551,6 +1563,16 @@ it.each([null, "2099-01-01T00:00:00Z"])("adoption refusal history uses integrity
   mockApi.listRuns.mockResolvedValue({ runs: [aRunItem({ status: "recovery_wait", recovery_wait_cause: "retained_recovery_adoption_failed", recovery_retry_not_before: stamp } as Partial<RunListItem>)] });
   renderIssueView();
   const badge = await screen.findByText("retained recovery integrity hold");
+  expect(badge.classList.contains("text-warn")).toBe(true);
+  expect(screen.queryByText("retained recovery retrying")).toBeNull();
+});
+
+it.each([null, "2099-01-01T00:00:00Z"])("unwitnessed continuation history uses its hold label with timestamp %s", async (stamp) => {
+  setAuth();
+  mockApi.getIssue.mockResolvedValue({ issue: anIssue() });
+  mockApi.listRuns.mockResolvedValue({ runs: [aRunItem({ status: "recovery_wait", recovery_wait_cause: "retained_continuation_unwitnessed", recovery_retry_not_before: stamp } as Partial<RunListItem>)] });
+  renderIssueView();
+  const badge = await screen.findByText("unwitnessed continuation hold");
   expect(badge.classList.contains("text-warn")).toBe(true);
   expect(screen.queryByText("retained recovery retrying")).toBeNull();
 });

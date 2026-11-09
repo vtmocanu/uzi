@@ -82,7 +82,8 @@ func (f *maintenanceFake) TransitionDinD(_ context.Context, _ string, op protoco
 func TestDinDMaintenanceMultiTick(t *testing.T) {
 	ctx := context.Background()
 	cfg := dockerTestConfig()
-	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Docker: true, DiskPressure: false, DiskPressureVolumes: []string{"dind"}}
+	// #3852: durable data pressure must not starve the full DinD lifecycle.
+	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Docker: true, DiskPressure: true, DiskPressureVolumes: []string{"data", "dind"}}
 	spec, err := testResolver(t).Resolve(w.Template, w.Size)
 	if err != nil {
 		t.Fatal(err)

@@ -1,0 +1,540 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
+import { test, type TestContext } from "node:test";
+import { GitCache, type CheckpointRange } from "../src/git.js";
+import { RunRunner } from "../src/runner.js";
+import { acquireWorkerLifetime } from "../src/authority-lock.js";
+import { AuthorityRuntime } from "../src/authority-runtime.js";
+import { openAuthorityStore } from "../src/completion-authority.js";
+import { testLockOptions } from "./authority-test-support.js";
+import { formatAttemptId } from "../src/attempt-path.js";
+import { noProofReseed, nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
+import { portableTeardownTestDeps } from "./teardown-fixtures.js";
+import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness } from "./runner-harness.js";
+
+installHarness();
+function command(dir: string, ...args: string[]): string {
+  return execFileSync("git", ["-C", dir, ...args], {
+    env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
+    encoding: "utf8", stdio: "pipe",
+  }).trim();
+}
+
+const custodyRoute = /\/(?:archives|recovery-holds|completion\/hold|base-attestation-hold)(?:\/|$)/;
+
+// This is a local wire fixture, not store SQL. Unscripted requests are observations
+// with unknown outcome, even when the delegated HTTP request rejects. Only an
+// explicitly accepted fixture response below may mutate modeled custody.
+function custodyFixture(t: TestContext, runId: string) {
+  const baseline = {
+    claim: { runId, generation: 2, worker: "fixture-worker", status: "running" },
+    heartbeat: { worker: "fixture-worker", fresh: true },
+    holds: [{ id: "current", runId, generation: 2, open: true },
+      { id: "prior", runId, generation: 1, open: true },
+      { id: "other", runId: "other-run", generation: 1, open: true }],
+    captures: [{ id: "fixed-capture", status: "available", generation: 1 }],
+  } as const;
+  // All updates target this clone; baseline inputs never alias mutable state.
+  const custody: {
+    claim: { runId: string; generation: number; worker: string; status: string };
+    heartbeat: { worker: string; fresh: boolean };
+    holds: { id: string; runId: string; generation: number; open: boolean }[];
+    captures: { id: string; status: string; generation: number }[];
+  } = structuredClone({
+    ...baseline,
+    holds: baseline.holds.map(h => ({ ...h })),
+    captures: baseline.captures.map(c => ({ ...c })),
+  });
+  const observations: { path: string; body: unknown; outcome: "accepted-fixture" | "unknown" }[] = [];
+  let accepted: "close" | "create" | undefined;
+  const postJSON = (client as any).postJSON.bind(client);
+  const requests = t.mock.method(client as any, "postJSON", async (route: string, body: any, ...rest: any[]) => {
+    if (!custodyRoute.test(route)) return postJSON(route, body, ...rest);
+    const observation = { path: route, body: structuredClone(body),
+      outcome: "unknown" as "accepted-fixture" | "unknown" };
+    observations.push(observation);
+    // These exact scripted responses are the only fixture acceptance rules.
+    if (accepted === "close" && route === `/api/worker/runs/${runId}/archives/release`) {
+      accepted = undefined;
+      const hold = custody.holds.find(h => h.runId === runId && h.generation === body.generation && h.open);
+      assert.ok(hold, "accepted fixture release must name an open hold");
+      hold.open = false;
+      observation.outcome = "accepted-fixture";
+      return { run_id: runId, released: true, holds_released: 1, generation: body.generation };
+    }
+    if (accepted === "create" && route === `/api/worker/runs/${runId}/archives/reserve`) {
+      accepted = undefined;
+      custody.captures.push({ id: body.idempotency_key, status: "preparing", generation: body.generation });
+      observation.outcome = "accepted-fixture";
+      return { capture_id: body.idempotency_key, state: "preparing" };
+    }
+    return postJSON(route, body, ...rest);
+  });
+  return {
+    requests,
+    acceptNext: (effect: "close" | "create") => { accepted = effect; },
+    snapshot: () => {
+      // FakeApi records accepted state reports; attempted HTTP reports are not status facts.
+      const status = api.states.findLast(s => s.runId === runId)?.body.status ?? custody.claim.status;
+      const open = custody.holds.filter(h => h.open);
+      const live = custody.heartbeat.fresh && custody.claim.worker === custody.heartbeat.worker && status === "running";
+      const discount = live ? new Set(open.filter(h => h.runId === custody.claim.runId &&
+        h.generation === custody.claim.generation).map(h => h.runId)).size : 0;
+      return structuredClone({ custody: { ...custody, claim: { ...custody.claim, status } },
+        totalOpen: open.length, liveClaimDiscount: discount, admissionCharged: open.length - discount,
+        captureCount: custody.captures.length, observations,
+        uncertainAttempts: observations.filter(o => o.outcome === "unknown").length });
+    },
+  };
+}
+
+test("custody accounting sensitivity: accepted close and create at client postJSON", async t => {
+  const model = custodyFixture(t, "fixture-run");
+  const before = model.snapshot();
+  model.acceptNext("close");
+  await client.releaseRecoveryCustody("fixture-run", 1);
+  assert.equal(model.snapshot().totalOpen, 2);
+  assert.equal(model.snapshot().admissionCharged, 1);
+  assert.equal(before.totalOpen, 3, "snapshots do not alias the model");
+  model.acceptNext("create");
+  await client.reserveRecoveryCapture("fixture-run", {
+    run_id: "fixture-run", generation: 2, idempotency_key: "new-capture", source_sha: "a".repeat(40),
+  });
+  assert.equal(model.snapshot().captureCount, 2);
+  assert.equal(model.snapshot().uncertainAttempts, 0);
+  assert.equal(model.requests.mock.callCount(), 2);
+});
+
+test("custody accounting sensitivity: rejected custody attempt retains counts with uncertainty", async t => {
+  const model = custodyFixture(t, "fixture-run");
+  await assert.rejects(client.releaseRecoveryCustody("fixture-run", 1));
+  const after = model.snapshot();
+  assert.equal(after.totalOpen, 3);
+  assert.equal(after.admissionCharged, 2);
+  assert.equal(after.uncertainAttempts, 1);
+  assert.equal(model.requests.mock.callCount(), 1);
+});
+
+test("custody accounting sensitivity: accepted fake status invalidates live claim", async t => {
+  const model = custodyFixture(t, "fixture-run");
+  await client.reportState("fixture-run", { status: "failed" });
+  const after = model.snapshot();
+  assert.equal(after.totalOpen, 3);
+  assert.equal(after.liveClaimDiscount, 0);
+  assert.equal(after.admissionCharged, 3);
+});
+
+// The scanner reports and default-empty process view are harness seams, not hosted
+// quiescence proof. Late-seed separately checks real persisted authority epochs.
+for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "excluded", "scan-floor", "missing-pending",
+  "missing-RR", "historical", "late-scan-pending", "late-scan-root", "late-seed", "late-launch-denial",
+  "marker", "marker-plain", "marker-staged", "marker-historical", "marker-floor", "marker-exclude", "marker-published-floor",
+  "marker-late-scan", "marker-late-seed", "marker-credential", "marker-pack-floor", "marker-default-blob",
+  "admission-unavailable", "admission-blocked", "restore-denial", "historical-revision"] as const) {
+  test("production remediation adoption: " + mode, async t => {
+    const peel = mode.startsWith("marker");
+    const lateSeed = mode === "late-seed" || mode === "marker-late-seed";
+    const lateScan = mode === "late-scan-pending" || mode === "marker-late-scan";
+    const finding = mode === "historical" || mode === "marker-historical" || mode === "marker-staged";
+    const admissionRefusal = mode === "admission-unavailable" || mode === "admission-blocked" || mode === "restore-denial";
+    const succeeds = mode === "clean" || mode === "clean-no-pending" || mode === "marker" || mode === "marker-plain" ||
+      mode === "historical-revision";
+    const claim = gitlabClaim(3747, { claim_generation: 2, session_id: "predecessor-session" });
+    const branch = "agent/issue-3747";
+    const attemptId = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "0123456789abcdef");
+    const bare = await git.ensureClone(fx.originPath);
+    fs.chmodSync(path.dirname(bare), 0o700); fs.chmodSync(bare, 0o700);
+    const base = command(bare, "rev-parse", "refs/remotes/origin/main");
+    const clone = await git.createOrAttachRunnerClone(bare, 3747, noProofReseed, claim.run_id, false, undefined,
+      { attemptId, isLive: () => false, beforeSeed: async () => {} });
+    const source = { runId: claim.run_id, clonePath: clone.path, attemptId };
+    await git.markRecoveryCapture(bare, clone.path, branch, claim.run_id, attemptId);
+    const fetch = () => git.fetchAgentBranch(bare, clone.path, branch, claim.run_id, {
+      context: { runId: claim.run_id, generation: 1, kind: "issue", branch, barePath: bare,
+        defaultIdentity: { ref: "refs/remotes/origin/main", sha: base } }, producingSource: source,
+    });
+    const commit = (label: string, parent = base) => {
+      const oid = command(clone.path, "-c", "user.name=t", "-c", "user.email=t@example.com",
+        "commit-tree", base + "^{tree}", "-p", parent, "-m", label);
+      command(clone.path, "reset", "--hard", oid);
+      return oid;
+    };
+    await fetch();
+    const x = commit("actual excluded inventory root");
+    const q = commit("previously flagged", x); await fetch();
+    await git.recordRemediationScan(bare, branch, source, { trusted: true, tip: q, flaggedOIDs: [q], origin: "pre-exit" });
+    const historical = command(bare, "-c", "user.name=t", "-c", "user.email=t@example.com",
+      "commit-tree", base + "^{tree}", "-p", base, "-m", "historical only finding");
+    let s = commit("clean replacement", mode === "historical" || mode === "marker-historical" ? historical : base);
+    await fetch();
+    let execution = s;
+    if (peel) {
+      execution = commit("ordinary execution parent", s);
+      fs.writeFileSync(path.join(clone.path, "marker-content.txt"), "staged marker content\n");
+      command(clone.path, "add", "marker-content.txt");
+      assert.equal(await git.commitWipMarker(clone.path), true);
+      s = command(clone.path, "rev-parse", "HEAD");
+      await fetch();
+      assert.notEqual(command(bare, "rev-parse", s + "^{tree}"), command(bare, "rev-parse", execution + "^{tree}"));
+    }
+    const foundOID = mode === "marker-staged" ? s : historical;
+    assert.equal(await git.ancestry(bare, q, s), "divergent");
+    if (mode === "historical") assert.equal(await git.ancestry(bare, historical, s), "ancestor");
+    const key = "uzi-recovery." + branch + ".clone";
+    const read = () => JSON.parse(command(bare, "config", key));
+    const before = read().remediationRecovery;
+    const pins = command(bare, "for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi-owed/");
+    if (mode === "missing-RR") {
+      const j = read(); delete j.remediationRecovery; command(bare, "config", key, JSON.stringify(j));
+    }
+    // Reconstruct cache, runner and its coordinator from persisted predecessor artifacts;
+    // the cases below explicitly inject any additional worker-local negative knowledge.
+    const authority = lateSeed ? new AuthorityRuntime({
+      lifetime: await acquireWorkerLifetime(fs.realpathSync(fx.dataDir), testLockOptions()),
+      workerToken: "fixture-adoption-authority", timeoutMs: 5000,
+    }) : undefined;
+    const cache = new GitCache(fx.dataDir, nullLogger(), undefined,
+      testGitCacheOptions({ gitleaksBin: (git as any).gitleaksBin,
+        ...(authority ? { authority: authority.hooks, authorityRequired: true } : {}) }));
+    let models = 0, callbacks = 0, scans = 0, writes = 0, underB = false;
+    let oldFactsInstalled = false;
+    let flight: any, callbackError: unknown;
+    const proofErrors: unknown[] = [];
+    const checkProof = async (proof: () => void | Promise<void>) => {
+      try { await proof(); } catch (error) { proofErrors.push(error); }
+    };
+    const logs = recordingLogger();
+    const runner = new RunRunner(client, cache, runId => ({ homeDir: path.join(homeDir, runId), executor: {
+      run: async ctx => {
+        models++;
+        try {
+          assert.ok(succeeds);
+          assert.equal(ctx.sessionId, undefined, "the predecessor provider session is not reused");
+          assert.equal(command(ctx.worktreePath, "rev-parse", "HEAD"), execution);
+          assert.equal(command(ctx.worktreePath, "write-tree"), command(bare, "rev-parse", s + "^{tree}"));
+          if (peel) {
+            assert.equal(command(ctx.worktreePath, "diff", "--name-only"), "");
+            assert.equal(command(ctx.worktreePath, "diff", "--cached", "--name-only"), "marker-content.txt");
+            assert.equal(read().remediationRecovery.ownedTip, execution);
+            assert.ok(read().remediationRecovery.excludedRoots.includes(s));
+            assert.equal(read().remediationRecovery.sequence, before.sequence);
+          }
+          assert.equal(read().remediationRecovery.active, undefined);
+          assert.deepEqual(read().remediationRecovery.edges, before.edges);
+          assert.equal(flight.remediationRestrictions.pending.attemptId, read().attemptId);
+          assert.equal(flight.remediationRestrictions.pending.clonePath, ctx.worktreePath);
+        } catch (error) { callbackError = error; }
+        throw new Error("fixture ends successor");
+      },
+    } }), logs.logger, 20, undefined, { gitlab: fakeGitlab().gitlab,
+      teardownTestDeps: portableTeardownTestDeps, recoveryRetryMs: 1, authority });
+    const endSource = authority ? t.mock.method(authority, "endSourceUse") : undefined;
+    const publication = t.mock.method(runner as any, "publishFlightSource");
+    let retained = false, captured = false, admissionQueries = 0, unavailableQueries = 0;
+    let capturedRestrictions: unknown;
+    let restoreDenial: string | undefined;
+    const recover = (runner as any).recoverRetainedClaim.bind(runner);
+    t.mock.method(runner as any, "recoverRetainedClaim", async (...args: any[]) => {
+      if (mode === "historical-revision") args[1].remediationRestrictions = { roots: [], denialRevision: 7 };
+      retained = true;
+      try { return await recover(...args); } finally { retained = false; }
+    });
+    const facts = cache.readRemediationRestrictionFacts.bind(cache);
+    t.mock.method(cache, "readRemediationRestrictionFacts", async (...args: Parameters<typeof facts>) => {
+      const result = await facts(...args);
+      if (retained && captured) admissionQueries++;
+      if (retained && mode === "admission-unavailable") {
+        unavailableQueries++;
+        throw new Error("custody facts temporarily unavailable");
+      }
+      if (retained && mode === "admission-blocked") {
+        unavailableQueries++;
+        // Defensive custody-only input: blocked must deny even if enrollment is false.
+        return { ...result, enrolled: false, blocked: true };
+      }
+      return result;
+    });
+    if (mode === "marker-credential") client.protocolFeatures = ["claim_generation_fence"];
+    api.setOwnershipStatus(claim.run_id, "running", 2);
+    const latch = () => (runner as any).latchRemediationFindings(flight, bare, branch, [{ commit: q }]);
+    // Supply a genuine C[D,S] coverage artifact at the existing capture seam. X is an
+    // eligible ancestor of D but divergent from S, so its proposed exclusion is new.
+    const capture = cache.recordRecoveryCapture.bind(cache);
+    t.mock.method(cache, "recordRecoveryCapture", async (...args: Parameters<typeof capture>) => {
+      const coverage = await cache.buildRecoveryCoverage(bare, {
+        runId: claim.run_id, generation: 2, kind: "issue", branch, barePath: bare,
+        defaultIdentity: { ref: "refs/remotes/origin/main", sha: base },
+      }, [q, x, s], s);
+      args[5] = mode === "marker-plain" ? s : coverage.sha; args[6] = s;
+      const result = await capture(...args);
+      captured = true;
+      if (admissionRefusal) capturedRestrictions = structuredClone(read().remediationRecovery);
+      return result;
+    });
+    const custodyModel = custodyFixture(t, claim.run_id);
+    const accounting = custodyModel.snapshot;
+    const mutations = [
+      t.mock.method(client, "reserveRecoveryCapture"),
+      t.mock.method(client, "uploadRecoveryBundle"),
+      t.mock.method(client, "releaseRecoveryCustody"),
+      t.mock.method(client, "reconcileRecoveryCapture"),
+      t.mock.method(client, "settleRecoveryHold"),
+      t.mock.method(client, "settleRecoveryHoldLive"),
+      t.mock.method(client, "requestCompletionHold"),
+      t.mock.method(client, "requestBaseAttestationHold"),
+    ];
+    // WorkerClient has no owner-discard operation; observe the real request seam as
+    // well for JSON custody routes; the upload method above uses a separate transport.
+    assert.deepEqual(Object.getOwnPropertyNames(Object.getPrototypeOf(client))
+      .filter(n => /discard.*(?:custody|recovery|hold)|(?:custody|recovery|hold).*discard/i.test(n)), []);
+    const requests = custodyModel.requests;
+    const prepare = cache.prepareRecoverySuccessor.bind(cache);
+    const prepareCalls = t.mock.method(cache, "prepareRecoverySuccessor", async (...args: Parameters<typeof prepare>) => {
+      const original = args[6]!.admitRemediationSource!;
+      args[6] = { ...args[6], admitRemediationSource: async input => {
+        callbacks++; underB = true;
+        try {
+          await checkProof(() => {
+            assert.equal(input.executionTip ?? input.sourceTip, execution);
+            if (peel) assert.ok(input.restrictedRoots.includes(s));
+            if (mode !== "marker-plain") assert.ok(input.restrictedRoots.includes(x));
+            assert.ok(!input.flaggedOIDs.includes(x), "a proposed excluded root is not global finding evidence");
+            assert.ok(!flight.remediationRestrictions.roots.includes(x));
+          });
+          return await original(input);
+        } finally { underB = false; }
+      } };
+      const counts = accounting();
+      const oldRoots = await cache.enumerateOwedCandidates(bare, claim.run_id);
+      await checkProof(() => {
+        assert.equal(counts.totalOpen, 3);
+        assert.equal(counts.liveClaimDiscount, 1);
+        assert.equal(counts.admissionCharged, 2);
+        assert.ok(oldRoots.length > 0);
+      });
+      const oldPins = command(bare, "for-each-ref", "--format=%(refname) %(objectname)",
+        "refs/uzi-owed/", "refs/uzi-coverage/", "refs/uzi-recovery-pin/", "refs/uzi-recovery-episode/").split("\n").filter(Boolean);
+      const mutationCounts = mutations.map(m => m.mock.callCount());
+      const requestStart = requests.mock.callCount();
+      const states = structuredClone(api.states);
+      let result: Awaited<ReturnType<typeof prepare>>;
+      try {
+        result = await prepare(...args);
+      } finally {
+        await checkProof(async () => {
+          assert.deepEqual(accounting(), counts, "adoption changes no modeled custody/admission input or request uncertainty");
+          assert.deepEqual(api.states, states, "no status transition inside adoption");
+          assert.deepEqual(mutations.map(m => m.mock.callCount()), mutationCounts,
+            "adoption neither reserves/releases custody nor creates/settles holds");
+          const custodyRequests = requests.mock.calls.slice(requestStart).filter((call: any) =>
+            custodyRoute.test(call.arguments[0]));
+          assert.deepEqual(custodyRequests, [], "no custody mutation HTTP request, including discard");
+          const rootsAfter = await cache.enumerateOwedCandidates(bare, claim.run_id);
+          for (const root of oldRoots) assert.deepEqual(rootsAfter.find(r => r.sha === root.sha), root,
+            "every original root retains all original contexts");
+          const pinsAfter = command(bare, "for-each-ref", "--format=%(refname) %(objectname)",
+            "refs/uzi-owed/", "refs/uzi-coverage/", "refs/uzi-recovery-pin/", "refs/uzi-recovery-episode/").split("\n");
+          for (const pin of oldPins) {
+            assert.ok(pinsAfter.includes(pin), "original owed/coverage/episode pin unchanged: " + pin);
+            const [ref, oid] = pin.split(" ");
+            assert.equal(command(bare, "rev-parse", ref! + "^{commit}"), oid);
+          }
+        });
+      }
+      // Trip AFTER the durable Git result. The worker must first synchronously adopt the
+      // verified tuple, so credential-switch custody verification sees the new source.
+      if (mode === "marker-credential") flight.steering.tripCredentialSwitch(2);
+      return result;
+    });
+    // Install independently selected old facts immediately before the production restore.
+    const restore = (runner as any).restoreRemediationRestrictions.bind(runner);
+    t.mock.method(runner as any, "restoreRemediationRestrictions", async (f: any) => {
+      flight = f;
+      if (!oldFactsInstalled && f.predecessorCapture) {
+        oldFactsInstalled = true;
+        if (mode === "marker-published-floor") f.publishedRealTips = [s];
+        if (mode !== "clean-no-pending")
+          (runner as any).latchRemediationFindings(f, bare, branch,
+            lateScan || lateSeed ? [] :
+              [{ commit: mode === "missing-pending" ? x : q }]);
+        else assert.equal(f.remediationRestrictions.pending, undefined);
+      }
+      const result = await restore(f);
+      if (mode === "restore-denial" && retained && captured && restoreDenial === undefined) {
+        const faulty = t.mock.method(cache, "readRemediationRestrictionFacts", (...args: Parameters<typeof facts>) =>
+          facts(args[0], args[1], args[2], undefined, { readback: async () => "different" }));
+        try { restoreDenial = (await (runner as any).bootstrapRemediationRestrictions(f)).kind; }
+        finally { faulty.mock.restore(); }
+      }
+      return result;
+    });
+    // Trusted scanner stub: Git range resolution, history and adoption remain real.
+    t.mock.method(cache, "secretScanCheckpointRange", async (_bare: string, range: CheckpointRange) => {
+      if (!underB) return { trusted: true as const, findings: [] };
+      scans++; assert.equal(range.tipSha, s);
+      await Promise.resolve();
+      if (lateScan) {
+        assert.deepEqual(flight.remediationRestrictions.pending.requiredOIDs, []);
+        latch();
+      }
+      if (mode === "late-scan-root") flight.remediationRestrictions.roots.push(base);
+      if (mode === "untrusted") return { trusted: false as const, reason: "fixture untrusted", findings: [] };
+      return { trusted: true as const, findings: finding ? [{ commit: foundOID } as any] : [] };
+    });
+    const range = cache.resolveCheckpointRange.bind(cache);
+    t.mock.method(cache, "resolveCheckpointRange", async (...args: Parameters<typeof range>) => {
+      const value = await range(...args);
+      if (underB && value && mode === "marker-pack-floor") return { ...value, packExcludeShas: [s] };
+      if (underB && value && mode === "marker-default-blob") return { ...value, defaultBlobSha: s };
+      if (underB && value && mode === "marker-exclude") return { ...value, excludeSha: s };
+      if (underB && value && mode === "marker-floor") return { ...value, scanFloorShas: [s] };
+      if (underB && value && mode === "excluded") return { ...value, excludeSha: q };
+      if (underB && value && mode === "scan-floor") return { ...value, scanFloorShas: [q] };
+      return value;
+    });
+    const ancestry = cache.ancestry.bind(cache);
+    t.mock.method(cache, "ancestry", async (...args: Parameters<typeof ancestry>) =>
+      underB && mode === "unknown" ? "unknown" : ancestry(...args));
+    const seed = (cache as any).seedRunnerClone.bind(cache);
+    t.mock.method(cache as any, "seedRunnerClone", async (...args: any[]) => {
+      const result = await seed(...args);
+      if (lateSeed) latch();
+      return result;
+    });
+    const persist = cache.recordRemediationRestrictions.bind(cache);
+    t.mock.method(cache, "recordRemediationRestrictions", async (...args: Parameters<typeof persist>) => {
+      assert.equal(underB, false); writes++;
+      assert.ok(flight.remediationRestrictions.pending.requiredOIDs.includes(foundOID));
+      return persist(...args);
+    });
+    if (mode === "late-launch-denial") {
+      const admission = (runner as any).requireLaunchAuthority.bind(runner);
+      t.mock.method(runner as any, "requireLaunchAuthority", async (f: any) => {
+        const result = await admission(f);
+        assert.equal(f.remediationRestrictions.denialRevision ?? 0, 0);
+        const readFacts = cache.readRemediationRestrictionFacts.bind(cache);
+        const faulty = t.mock.method(cache, "readRemediationRestrictionFacts",
+          (...args: Parameters<typeof readFacts>) =>
+            readFacts(args[0], args[1], args[2], undefined, { readback: async () => "different" }));
+        try {
+          // Control the promise-resolution gap at the production sink; no process proof.
+          assert.deepEqual(await (runner as any).bootstrapRemediationRestrictions(f), { kind: "unavailable" });
+        } finally { faulty.mock.restore(); }
+        assert.equal(f.remediationRestrictions.denialRevision, 1);
+        return result;
+      });
+    }
+    try {
+      await runner.execute(claim);
+      if (proofErrors.length) throw new AggregateError(proofErrors, "remediation adoption proof failed");
+      if (admissionRefusal) {
+        assert.equal(captured, true, "private capture completes despite custody-only facts");
+        assert.equal(models, 0, "unconfirmed facts grant no model admission");
+        assert.equal(prepareCalls.mock.callCount(), 0, "refuse before Git can persist any successor");
+        assert.equal(read().recovery.successor, undefined);
+        assert.notEqual(read().recovery.stage, "ready-for-model");
+        assert.equal(read().clonePath, source.clonePath);
+        assert.equal(read().attemptId, source.attemptId);
+        assert.deepEqual(read().remediationRecovery, capturedRestrictions, "the captured predecessor evidence is retained");
+        assert.ok(fs.existsSync(clone.path));
+        const retainedPins = command(bare, "for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi-owed/").split("\n");
+        for (const pin of pins.split("\n")) assert.ok(retainedPins.includes(pin));
+        if (mode === "restore-denial") assert.equal(restoreDenial, "unavailable");
+        else assert.ok(unavailableQueries > 0, "preservation consumed the unavailable or blocked facts");
+        assert.equal(admissionQueries, 1, "admission consumes one additional fresh custody read");
+        assert.equal(mutations[2]!.mock.callCount(), 0, "no custody release");
+        assert.equal(mutations[4]!.mock.callCount(), 0, "no hold settlement");
+        return;
+      }
+      assert.equal(models, succeeds ? 1 : 0, JSON.stringify({ states: api.states, logs }));
+      if (mode === "historical-revision") {
+        assert.equal(flight.remediationRestrictions.denialRevision, 7, "fresh proof never resets historical denials");
+      }
+      if (callbackError) throw callbackError;
+      assert.equal(callbacks, mode === "missing-pending" || mode === "missing-RR" ? 0 : 1, JSON.stringify({ states: api.states, logs }));
+      if (callbacks) assert.equal(scans, 1);
+      const actualPins = command(bare, "for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi-owed/");
+      for (const pin of pins.split("\n")) assert.ok(actualPins.split("\n").includes(pin));
+      if (peel && (succeeds || lateSeed || mode === "marker-credential")) assert.ok(actualPins.includes(`refs/uzi-owed/${claim.run_id}/${execution} ${execution}`));
+      else assert.equal(actualPins, pins);
+      assert.ok(fs.existsSync(clone.path));
+      if (mode === "late-launch-denial") {
+        assert.equal(flight.remediationRestrictions.denialRevision, 1);
+        assert.equal(flight.preserveRecoveryClone, true);
+        assert.equal(flight.worktreePath, read().clonePath);
+        assert.equal(flight.attemptId, read().attemptId);
+        assert.equal(flight.remediationRestrictions.pending.clonePath, read().clonePath);
+        assert.equal(flight.remediationRestrictions.pending.attemptId, read().attemptId);
+        assert.equal(read().recovery.stage, "ready-for-model");
+        assert.equal(read().remediationRecovery.ownedTip, s);
+        assert.equal(read().remediationRecovery.active, undefined);
+        assert.deepEqual(read().remediationRecovery.edges, before.edges);
+        assert.ok(flight.remediationRestrictions.roots.includes(x));
+        assert.equal(publication.mock.callCount(), 0);
+      }
+      if (!succeeds && mode !== "marker-credential" && mode !== "late-launch-denial") {
+        assert.equal(flight.remediationRestrictions.pending.clonePath, source.clonePath);
+        assert.equal(flight.remediationRestrictions.pending.attemptId, source.attemptId);
+        if (mode === "missing-pending") {
+          assert.ok(flight.remediationRestrictions.roots.includes(x), "unconfirmed finding knowledge remains latched");
+          assert.ok(!read().remediationRecovery.flaggedOIDs.includes(x));
+        } else {
+          assert.ok(!flight.remediationRestrictions.roots.includes(x), "proposal never installs exclusions on refusal");
+        }
+      }
+      if (mode === "marker-credential") {
+        assert.equal(read().recovery.stage, "ready-for-model");
+        assert.equal(read().remediationRecovery.ownedTip, execution);
+        assert.equal(read().remediationRecovery.active, undefined);
+        assert.equal(flight.worktreePath, read().clonePath);
+        assert.equal(flight.attemptId, read().attemptId);
+        assert.deepEqual(api.states.filter(s => s.body.status === "credential_switch" || s.body.status === "credential_switch_failed")
+          .map(s => [s.body.status, s.body.claim_generation]), [["credential_switch", 2]]);
+      }
+      if (finding) {
+        assert.equal(writes, 1);
+        assert.ok(read().remediationRecovery.flaggedOIDs.includes(foundOID));
+        assert.deepEqual(read().remediationRecovery.active, before.active, "negative finding grants no origin");
+        const restarted = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+        assert.ok((await restarted.readRuntimeRemediationRecovery(bare, branch, source))!.flaggedOIDs.includes(foundOID));
+        // A fresh consumer must honor the persisted fact even if the scanner now
+        // excludes that history and reports clean. This is negative admission proof,
+        // not permission to execute in the predecessor or a process-quiescence test.
+        const resolve = restarted.resolveCheckpointRange.bind(restarted);
+        t.mock.method(restarted, "resolveCheckpointRange", async (...args: Parameters<typeof resolve>) => {
+          const actual = await resolve(...args);
+          return actual ? { ...actual, excludeSha: foundOID } : actual;
+        });
+        t.mock.method(restarted, "secretScanCheckpointRange", async () => ({ trusted: true as const, findings: [] }));
+        const fresh = new RunRunner(client, restarted, runId => ({ homeDir: path.join(homeDir, runId),
+          executor: { run: async () => { throw new Error("unused executor"); } } }), nullLogger(), 20,
+          undefined, { gitlab: fakeGitlab().gitlab, teardownTestDeps: portableTeardownTestDeps });
+        try {
+          await assert.rejects((fresh as any).requireLaunchAuthority({
+            runId: claim.run_id, barePath: bare, branch, worktreePath: clone.path,
+            runnerClone: clone, cancel: new AbortController(),
+            steering: { lifecycleSignal: () => new AbortController().signal },
+          }), /remediation continuation published floor conflict/);
+        } finally { fresh.shutdown(); }
+      }
+      if (lateSeed) {
+        assert.equal(read().recovery.stage, "ready-for-model");
+        assert.equal(flight.sourceTailsJoined, true, "production teardown positively joined its tails");
+        assert.equal(flight.evidenceProcessJoined, flight.executor);
+        assert.equal(flight.sourceUsePaths.size, 2, "A recorded old and successor admissions");
+        assert.equal(endSource!.mock.callCount(), 0, "no end can be queued");
+        assert.equal(publication.mock.callCount(), 0);
+        await authority!.withTransaction(async () => undefined);
+        for (const admitted of flight.sourceUsePaths) {
+          const slot = await authority!.withTransaction(async tx => {
+            const store = await openAuthorityStore(tx, { workerToken: "fixture-adoption-authority" });
+            return store.readSlot(tx, await store.slotKey(tx, admitted));
+          });
+          assert.equal(slot?.state, "active");
+        }
+      }
+    } finally { runner.shutdown(); }
+  });
+}

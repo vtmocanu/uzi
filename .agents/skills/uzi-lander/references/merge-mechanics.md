@@ -44,10 +44,59 @@ stop rather than forcing.
   **Never route around a classifier denial by other means** — retry, or hand the exact
   command to the user to run via a `!`-prefixed shell line, or ask them to add a
   `gh pr merge` allow rule.
-- **`BEHIND` after an earlier merge** is expected (main moved). `--admin` bypasses the
-  strict check; otherwise `gh pr update-branch` the PR and re-wait for CI. A BEHIND PR that
-  also carries a migration-number collision or a conflict needs `scripts/land-prep.sh`
+- **`BEHIND` after an earlier merge** is expected (main moved). A BEHIND PR that also
+  carries a migration-number collision or a conflict needs `scripts/land-prep.sh`
   (rebase or merge + renumber + lease push) first.
+- **Merging behind main.** `--admin` may land a BEHIND PR on its existing exact-head CI,
+  with no fresh run on a head containing current main, only when every condition below
+  holds, rechecked immediately before `merge.sh`. Otherwise, or when unsure, update the
+  branch, get the rebase-lane buddy review and wait for fresh exact-head CI.
+  - Required CI is green on the exact head, and that run finished within the last 24 hours.
+  - `main` is not red. No required check on its current tip has failed. Its latest
+    completed, non-cancelled required CI result passed, judged across the whole required
+    check set, not a single green job or a partial dispatch. An in-progress tip does not
+    block (main CI cancels in-progress runs on every push). Any observed required-check
+    failure does, except for the fix itself, even while sibling jobs still run. A later-finishing rerun on
+    an older SHA never hides a failure on a newer `main` commit. If the result cannot be
+    established, wait. Leave at least 5 minutes between merges to `main`, and follow a merge
+    coordinator's GO/WAIT when one is running.
+  - The buddy's `APPROVE` is pinned to the head, and the merge is clean (no conflict).
+  - The main delta (`merge-base..origin/main`) and the PR are independent. Use the whole
+    component as the unit: `api/` (with `docs/`, which `api` embeds), `controller/`,
+    `web/`, `agent/`, `deploy/`. Separate Go directories in one module are not independent.
+    Documentation paths (`prds/`, `adr/`, `changelog.d/`, `specs/`) are independent only
+    after checking what repository checks read them: doc links (`check-docs:web`), spec
+    numbering, changelog checks and embeds. A move, deletion or shared validation input
+    there takes fresh CI.
+  - Neither the PR nor the main delta touches a migration, a generated or shared contract
+    (sqlc output and `queries/`, `api/openapi/`, `fixtures/`, run-kind or protocol lists), or
+    build and test infrastructure (`Taskfile.yml`, `.github/workflows/`, `scripts/`,
+    `go.mod`/`go.sum`, `package.json`, lockfiles, `tsconfig*`, `.golangci.yml`, vite/vitest
+    config).
+  - Neither side is trust-boundary, auth, untrusted-input or security work.
+
+  Before merging, record an eligibility receipt in the trail or the merge note:
+  - the tested head, its CI run id and completion time;
+  - the tested base when known; otherwise compare from the PR's merge-base and do not claim
+    an unverified tested base;
+  - the current main SHA and its observed tip check state, kept apart from the evidence
+    used: the SHA, run ids, conclusions and completion times of the completed required CI
+    cited (it may be an ancestor);
+  - the coordinator's GO/WAIT, when one runs, and the previous merge time for the spacing;
+  - the full delta, including renames as old and new paths;
+  - the component, dependency and exclusion assessment;
+  - the pinned buddy verdict.
+  Re-read head and main immediately before `merge.sh`; any change voids the receipt until
+  it is recomputed. Unclear inputs take fresh CI; no dependency-analysis tooling is needed.
+
+  Examples: a `web/`-only PR after main changed only `api/` merges on its green head, but
+  only if every other condition holds and the API/DTO contract the web side uses is
+  unchanged. Component separation alone does not prove that. An `agent/test` PR after main
+  changed `agent/src` needs fresh CI; any PR after main touched `Taskfile.yml` needs fresh
+  CI. Post-merge main CI detects a residual integration failure; it does not prevent one.
+  This default never bypasses another required check, review, classifier refusal or a
+  stronger repository rule. A user's per-queue rule, stricter or looser, overrides it for
+  that queue.
 - Merging is **outward-facing**: unless the user pre-authorized it (they chose Auto mode,
   or said "merge as admin"), surface the MR + your review and get their OK first.
 - **Merge each PR the moment it is review-clean and CI-green — do NOT hold the whole
@@ -119,7 +168,10 @@ has a completed run for the target SHA.)*
 
 On red, read each failed job and classify: **code / conflict / missing-file** → fix on a
 branch, PR, merge, re-watch (never push code to `main`); **flaky** (passes on isolated
-re-run; `gh run rerun <run-id> --failed`) → file an issue, do not chase; **infra / can't-fix**
+re-run; `gh run rerun <run-id> --failed`) → file an issue, do not chase. Rerun only while
+that SHA is still the `main` head: a rerun of an older SHA joins the `ci-refs/heads/main`
+concurrency group and cancels the head's run, and the next push cancels the rerun. Otherwise
+watch the current head's run, which covers your change; **infra / can't-fix**
 → report and stop. Green = done. This is the local session fixing CI, NOT uzi's `ci_autofix`
 (which only touches pre-merge `agent/*` branches). The watcher prints two commands per
 failed job. Its `gh api --allow-escape-sequences repos/O/R/actions/jobs/JOB/logs` command

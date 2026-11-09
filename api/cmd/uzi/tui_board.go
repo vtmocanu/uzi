@@ -234,7 +234,7 @@ func runBand(status string, isRevising bool) int {
 // holds also require the owner to Resume, Stop or Cancel. Both are NEEDS YOU. Every band decision on the board
 // (the ordering, the eyebrow counts, the row's title ink) goes through here so they agree.
 func runBandOf(r apitypes.RunListItemDTO) int {
-	if isForgeOwnerHold(r.RunDTO) || codexReloginHold(r.RunDTO) || isCredentialDisabledHold(r.RunDTO) || isOwnerRequiredWorkerHold(r.RunDTO) || isProviderUnavailableHold(r.RunDTO) || isCredentialSwitchHold(r.RunDTO) {
+	if isDiskOwnerHold(r.RunDTO) || isIterationHold(r.RunDTO) || isForgeOwnerHold(r.RunDTO) || codexReloginHold(r.RunDTO) || isCredentialDisabledHold(r.RunDTO) || isCredentialsResetHold(r.RunDTO) || isOwnerRequiredWorkerHold(r.RunDTO) || isProviderUnavailableHold(r.RunDTO) || isCredentialSwitchHold(r.RunDTO) {
 		return bandNeedsYou
 	}
 	return runBand(r.Status, r.IsRevising)
@@ -243,6 +243,12 @@ func runBandOf(r apitypes.RunListItemDTO) int {
 // runStateWord is the human status word the board row draws for r (runStateToken's word),
 // which the `/` filter matches alongside the effective status.
 func runStateWord(r apitypes.RunListItemDTO) string {
+	if isDiskOwnerHold(r.RunDTO) {
+		return "disk held"
+	}
+	if isIterationHold(r.RunDTO) {
+		return "iter limit"
+	}
 	if isForgeOwnerHold(r.RunDTO) {
 		if isPublicationPark(r.RunDTO) {
 			return publicationHeldWord
@@ -266,6 +272,9 @@ func runStateWord(r apitypes.RunListItemDTO) string {
 	}
 	if isCredentialDisabledHold(r.RunDTO) {
 		return credDisabledWord
+	}
+	if isCredentialsResetHold(r.RunDTO) {
+		return credsResetWord
 	}
 	if isCredentialSwitchSettlingHold(r.RunDTO) {
 		return credSwitchSettlingWord
@@ -1268,14 +1277,14 @@ func (m tuiModel) syncedScrollAt(capacity int) int {
 // Zero-count segments are dropped, so a healthy factory reads simply "N runs". Computed
 // over m.board.runs so it does not shrink under a filter. Approval, input, follow-up
 // and Codex relogin each have a segment. The ⊘ segment counts credential-disabled
-// and provider-unavailable owner holds; their rows distinguish the typed reason.
+// provider-unavailable and iteration owner holds; their rows distinguish the typed reason.
 func (m tuiModel) boardSummary() string {
 	approvals, inputs, followups, relogins, ownerHolds, warn := 0, 0, 0, 0, 0, 0
 	for _, r := range m.board.runs {
 		if codexReloginHold(r.RunDTO) {
 			relogins++
 		}
-		if isCredentialDisabledHold(r.RunDTO) || isProviderUnavailableHold(r.RunDTO) || isCredentialSwitchHold(r.RunDTO) {
+		if isIterationHold(r.RunDTO) || isCredentialDisabledHold(r.RunDTO) || isCredentialsResetHold(r.RunDTO) || isProviderUnavailableHold(r.RunDTO) || isCredentialSwitchHold(r.RunDTO) {
 			ownerHolds++
 		}
 		switch r.Status {
@@ -1293,7 +1302,7 @@ func (m tuiModel) boardSummary() string {
 			followups++
 		}
 		// Match the token: human stops and recovery waits ignore stale health.
-		if runpresentation.HumanStopReason(r.Status, strOr(r.StopKind, "")) == "" && r.Status != statusRecoveryWait && !isProviderUnavailableHold(r.RunDTO) && stalledHealth[r.Health] {
+		if runpresentation.HumanStopReason(r.Status, strOr(r.StopKind, "")) == "" && r.Status != statusRecoveryWait && !isProviderUnavailableHold(r.RunDTO) && !isIterationHold(r.RunDTO) && stalledHealth[r.Health] {
 			warn++
 		}
 	}

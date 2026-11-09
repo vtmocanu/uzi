@@ -122,14 +122,59 @@ reason-carrying worker question. No paid/provider turn or park attempt
 restarts without an explicit owner answer: a consumed `/park` authorizes
 one attempt; prose returns to the lead; cancel wins. The fallback uses
 ordinary `awaiting_input`, whose wait is banked out of the wall budget by
-`SetRunRunning` while its run slot remains occupied. It shares
-`parkQuestion`'s absolute per-run `QUESTION_TIMEOUT_SECONDS` deadline when enabled,
-rather than granting a fresh deadline for each refusal or retry. That
-deadline is worker memory, not durable across worker death. Unattended
+`SetRunRunning` while its run slot remains occupied. It draws on
+`parkQuestion`'s shared per-run `QUESTION_TIMEOUT_SECONDS` parked-time budget when enabled,
+rather than granting a fresh window for each refusal or retry. That
+budget is worker memory, not durable across worker death. Unattended
 runs needing this owner decision throw `TrustedExecutionRefusal` instead
 of entering the question wait. Ambiguous transport or lost ownership uses
 the existing retained-recovery/stale-claim fences rather than assuming
 authority to ask or resume.
+
+## Amendment 2026-11-06 — #3995: owner pause during retained recovery
+
+An owner `now` pause delivered while a retained re-claim runs
+`recoverRetainedClaim` (before any model) used to abort the shared lifecycle and
+stop recovery, leaving the run to an automatic requeue charged against the
+requeue budget. It now behaves like a pause pending at claim time.
+
+- **Window.** `recoverRetainedClaim` opens `SteeringChannel.deferOwnerPauseNow`
+  for the recovery body and releases it in a `finally`. Inside it a routed
+  owner `now` is only recorded (no cancel or lifecycle abort, no interrupt).
+  A `wall` keeps its immediate drop. A `now` routed while a `wall` is already
+  pending is not deferred: it takes the existing immediate path (which, as
+  before the window existed, also records `now` as the mode), and the wall's
+  earlier lifecycle abort has already stopped recovery. The server refuses an
+  owner `now` while a wall request is pending. `pause_cancel` clears the record. A publication-only retained claim
+  (`publication_resume`) opens no window and keeps the immediate stop.
+- **Settlement.** At the start of `phasePreflightHandoff`, after recovery
+  returns and before the executor, the runner throws the ordinary
+  `PauseNowSignal` only when a deferred pause is pending and no stronger control
+  is: cancel, credential switch, wall, fence, worker shutdown, or a
+  lifecycle or checkpoint-authority abort. No planning turn, summary or provider
+  call precedes it.
+- **I4 and I6 preserved.** The run is paused only through `handlePausePark`:
+  checkpoint first, then a confirmed `paused` reply. A refused park
+  (`pause_failed`) leaves the run unpaused and, with no further executor
+  iteration, on the existing requeue path when its prerequisites hold. A lost
+  or uncertain reply is different: the worker does not count the run as paused,
+  but `SetRunPaused` may already have committed, in which case the server row is
+  `paused` and excluded from automatic requeue. A missing worker ACK establishes
+  neither an unpaused row nor requeue eligibility. A
+  `recovery_wait` hold leaves the pause request pending server-side (I4).
+- **Precedence.** Recovery failure, budget exhaustion and adoption-failed holds
+  win over the waiting pause; wall, disk, cancel, fence, switch and shutdown
+  during recovery keep their immediate outcomes. Milestone pauses and pauses
+  pending at claim time are unchanged.
+- **Boundaries.** A `now` arriving during retained discovery (before recovery
+  starts) or after recovery returns keeps its previous handling. The pause waits
+  for recovery, which is bounded by the recovery episode clock, not by anything
+  new. No API, wire, status or budget change.
+- **Diagnostics.** The HOME-preservation log for a retained recovery stop now
+  reads "retained recovery stopped" (naming a pending owner pause).
+- **Outstanding acceptance.** A combined regression with #3994's post-adoption
+  ownership-read retry (PR #4004) has not run. It is assigned to whichever of the
+  two lands second; #3995 stays open until it is green.
 
 ## Consequences
 

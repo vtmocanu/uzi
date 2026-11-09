@@ -164,6 +164,27 @@ export class DataVolumeGuard {
   }
 
   /**
+   * issue #3865: the raw statfs of the data volume, but only when `destination` (an existing path)
+   * is on it, judged by device id alone. `other_volume`: it is on another device. `unknown`: a stat
+   * or statfs failed or a device id is not a finite non-negative number. The sample is returned
+   * unfiltered: the caller decides which byte or inode pair is valid. Never throws.
+   */
+  async attributedStatfs(
+    destination: string,
+  ): Promise<{ kind: "sample"; raw: StatfsSample } | { kind: "other_volume" } | { kind: "unknown" }> {
+    try {
+      const [data, dest] = await Promise.all([this.stat(this.opts.dataDir), this.stat(destination)]);
+      if ([data.dev, dest.dev].some((dev) => typeof dev !== "number" || !Number.isFinite(dev) || dev < 0)) {
+        return { kind: "unknown" };
+      }
+      if (data.dev !== dest.dev) return { kind: "other_volume" };
+      return { kind: "sample", raw: this.statfs(this.opts.dataDir) };
+    } catch {
+      return { kind: "unknown" };
+    }
+  }
+
+  /**
    * Classify a failed write whose destination is `destination`. See the module header. `before`
    * is an optional sample taken before the write; the verdict then uses the lower free bytes and
    * free inodes of it and the sample taken now. A current statfs failure stays "unknown".

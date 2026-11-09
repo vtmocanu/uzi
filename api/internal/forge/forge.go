@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/go-retryablehttp"
@@ -149,6 +150,34 @@ const (
 	// TypeGitHub is the GitHub REST driver (github.com only, classic PAT).
 	TypeGitHub Type = "github"
 )
+
+// SupportedTypes lists every forge driver, in the order the connect UI offers
+// them. It is the one list the connect API, its config advert and the startup
+// seed validate against.
+func SupportedTypes() []Type {
+	return []Type{TypeGitLab, TypeForgejo, TypeGitHub}
+}
+
+// ParseType returns the driver named by s, or false when s names none.
+// Matching is exact: the stored forge_type column is lowercase.
+func ParseType(s string) (Type, bool) {
+	for _, t := range SupportedTypes() {
+		if string(t) == s {
+			return t, true
+		}
+	}
+	return "", false
+}
+
+// SupportedTypesList renders SupportedTypes for an error message:
+// "gitlab, forgejo, github".
+func SupportedTypesList() string {
+	names := make([]string, 0, 3)
+	for _, t := range SupportedTypes() {
+		names = append(names, string(t))
+	}
+	return strings.Join(names, ", ")
+}
 
 // Role is a bot's effective permission level on a project, in forge-neutral
 // terms. It deliberately carries no number: GitLab's access levels (30 =

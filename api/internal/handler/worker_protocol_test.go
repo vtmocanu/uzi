@@ -35,15 +35,18 @@ import (
 // the tested paths reach.
 type protocolStore struct {
 	workersvc.Store
-	priorWorker   store.Worker
-	priorReadID   uuid.UUID
-	registerArg   store.RegisterWorkerParams
-	failArg       store.FailWorkerRunsOverCapParams
-	claimErr      error
-	ownedRun      store.Run
-	ownedErr      error
-	completedRows int64
-	heartbeatArg  store.HeartbeatWorkerParams
+	priorWorker store.Worker
+	priorReadID uuid.UUID
+	registerArg store.RegisterWorkerParams
+	failArg     store.FailWorkerRunsOverCapParams
+	claimErr    error
+	ownedRun    store.Run
+	ownedErr    error
+	// Issue #3937: the explicitly configured signal GetRunOwnershipByWorker returns alongside
+	// ownedRun/ownedErr.
+	cancellationRequested bool
+	completedRows         int64
+	heartbeatArg          store.HeartbeatWorkerParams
 	// Orphan-classification read (issue #1319): the owner-run row/error the orphan query returns.
 	orphanRow store.GetRunOrphanIdentityRow
 	orphanErr error
@@ -74,6 +77,9 @@ func (p *protocolStore) ClaimRun(context.Context, store.ClaimRunParams) (store.R
 }
 func (p *protocolStore) GetRunOwnedByWorker(context.Context, store.GetRunOwnedByWorkerParams) (store.Run, error) {
 	return p.ownedRun, p.ownedErr
+}
+func (p *protocolStore) GetRunOwnershipByWorker(context.Context, store.GetRunOwnershipByWorkerParams) (store.GetRunOwnershipByWorkerRow, error) {
+	return store.GetRunOwnershipByWorkerRow{Run: p.ownedRun, CancellationRequested: p.cancellationRequested}, p.ownedErr
 }
 func (p *protocolStore) GetRunOrphanIdentity(context.Context, store.GetRunOrphanIdentityParams) (store.GetRunOrphanIdentityRow, error) {
 	return p.orphanRow, p.orphanErr
@@ -1385,6 +1391,54 @@ func TestWorkerRunOwnershipTerminalReturnsStatus(t *testing.T) {
 	}
 	if got.Status != "completed" {
 		t.Fatalf("status = %q, want %q", got.Status, "completed")
+	}
+}
+
+// TestWorkerRunOwnershipCarriesCancellationRequested pins issue #3860's additive field: the
+// probe always carries cancellation_requested as an explicit boolean. The required
+// GetRunOwnershipByWorker query reports false here (issue #3937), so the probe reports false even
+// for a run stamped stop_kind='cancelled'.
+func TestWorkerRunOwnershipCarriesCancellationRequested(t *testing.T) {
+	runID := uuid.New()
+	h := newProtocolHandler(t, &protocolStore{ownedRun: store.Run{
+		ID: runID, Status: "running", ClaimGeneration: 3,
+		StopKind: pgtype.Text{String: "cancelled", Valid: true},
+	}})
+	rec := httptest.NewRecorder()
+	h.WorkerRunOwnership(rec, workerReq(http.MethodGet, "", runID))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	v, present := got["cancellation_requested"]
+	if !present {
+		t.Fatalf("ownership probe missing cancellation_requested (body %q)", rec.Body.String())
+	}
+	if b, isBool := v.(bool); !isBool || b {
+		t.Fatalf("cancellation_requested = %v, want false from the query's explicit false", v)
+	}
+}
+
+func TestWorkerRunOwnershipCarriesRequestedCancellation(t *testing.T) {
+	runID := uuid.New()
+	h := newProtocolHandler(t, &protocolStore{cancellationRequested: true, ownedRun: store.Run{
+		ID: runID, Status: "running", ClaimGeneration: 3,
+		StopKind: pgtype.Text{String: "cancelled", Valid: true},
+	}})
+	rec := httptest.NewRecorder()
+	h.WorkerRunOwnership(rec, workerReq(http.MethodGet, "", runID))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if v, present := got["cancellation_requested"]; !present || v != true {
+		t.Fatalf("cancellation_requested = %v (present=%v), want true from the signal-bearing query", v, present)
 	}
 }
 

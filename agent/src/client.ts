@@ -1,3 +1,4 @@
+import { validatePolicyHoldRequest, decodePolicyHoldReply, POLICY_HOLD_MAX_BYTES } from "./protocol.js";
 import { decodeCodexOperationDecision, validCodexOperationRequest } from "./codex-operation-admission.js";
 import type { CodexOperationRequest, CodexOperationDecision } from "./protocol.js";
 import { CodexAdmissionReporter } from "./codex/admission-signal.js";
@@ -7,11 +8,12 @@ import { decodeCodeCoverage, type CodeCoverage } from "./code-cross-check-covera
 import { decodePublicationContext, validatePublicationContextRequest } from "./publication-context.js";
 import type { PublicationContextRequest, PublicationContextResponse } from "./protocol.js";
 import type { PublicationIntentRequest, PublicationIntentResult } from "./publication-intent.js";
-import type { LeadConfigReportBody } from "./protocol.js";
+import type { CodexCatalogDefaultBody, LeadConfigReportBody } from "./protocol.js";
 import { decodeCompletionPending, type CompletionPending } from "./completion-pending.js";
 import { SEMANTIC_GATE_ACK_MAX_BYTES, semanticGateAckSchema } from "./semantic-gate-wire.js";
 import { decodeInterruptedCalls, interruptedRegistration, type InterruptedRegistration, type InterruptedCalls } from "./interrupted-calls.js";
 import { Readable } from "node:stream";
+import { checkpointPublishDispatcher } from "./checkpoint-publish-transport.js";
 import type { ReadableStreamReadResult } from "node:stream/web";
 import { MaintenanceResources } from "./recovery-maintenance.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
@@ -24,6 +26,7 @@ import type { UsageWireRequest } from "./usage-recorder.js";
 import {
   WORKER_API_PREFIX,
   CAPABILITY_INFERENCE_EVIDENCE_FEATURE,
+  RUN_REGISTRATION_EVIDENCE_FEATURE,
   type MemoryBinding,
   type MemoryPolicy,
   type MemoryOutcome,
@@ -64,6 +67,9 @@ import {
   type CompletionPermitRequest,
   type CompletionPermitResponse,
   type WallParkRequest,
+  type IterationParkRequest,
+  type IterationParkResult,
+  type IterationParkRefusalReason,
   type ReportFindingRequest,
   type HeartbeatRequest,
   type DindMaintenance,
@@ -74,6 +80,7 @@ import {
   type RegisterRequest,
   type RegisterResponse,
   type StateAck,
+  type RunRegistrationEvidence,
   type CompletedPublicationReceipt,
   type CompletedPublicationReason,
   type PlanCrossCheckReconciliation,
@@ -124,13 +131,14 @@ import {
   type RecoverySettleResponse,
   type BaseAttestationHoldOutcome,
   BASE_ATTESTATION_HOLD_REASON,
+  REPO_AGENT_SOURCE_HOLD_REASON,
 } from "./protocol.js";
 
 export type PlanCrossCheckGateReason = "revise" | "block" | "malformed" | "model_error" | "model_timeout"
   | "checker_unavailable" | "confinement_failed" | "timed_out" | "superseded"
   | "codex_lead_unsupported" | "planning_diff_refused" | "interrupted" | "candidate_refused" | "checker_failed"
   | "approved_not_stored" | "revisions_exhausted";
-import { decodeCodeSnapshotCleanup, type CodeSnapshotCleanup, decodeCrossCheckClaim, decodeCodeCrossCheckStatus, decodeCodeFindings, type CodeCrossCheckStatus, type CodeFinding, decodeCodeCrossCheckDispositions, type CodeCrossCheckDispositionBatch, type CodeCrossCheckInstructions } from "./code-cross-check-contract.js";
+import { decodeCodeSnapshotCleanup, type CodeSnapshotCleanup, decodeCrossCheckClaim, decodeOwnerSteering, OWNER_STEERING_HEADER, OWNER_STEERING_WIRE_MAX_BYTES, decodeCodeCrossCheckStatus, decodeCodeFindings, type CodeCrossCheckStatus, type CodeFinding, decodeCodeCrossCheckDispositions, type CodeCrossCheckDispositionBatch, type CodeCrossCheckInstructions } from "./code-cross-check-contract.js";
 
 export type ClaimResponse = ProtocolClaimResponse & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
 export type WorkerRunDetail = ProtocolWorkerRunDetail & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
@@ -345,11 +353,41 @@ export interface InputReceipt {
   reason?: string;
 }
 
-/** Error carrying the server's HTTP status + (truncated) body for retry logic. */
 /** Issue #2545 step A: the per-request timeout of the held-publication upload, and of no other route.
  *  The api's write deadline for the route is 120 s upload + 150 s service + 30 s answer grace = 300 s;
- *  30 s of margin lets an answer written at the server's deadline still arrive. */
+ *  30 s of signal margin lets an answer written at the server's deadline still arrive. This route
+ *  keeps native fetch's 300 s defaults: HTTP/1.1 re-arms its header wait at upload completion,
+ *  and HTTP/2 uses an inactivity timer refreshed by upload writes. The post-upload service (150 s),
+ *  detached outcome write (10 s) and answer grace (30 s) fit below that timeout. */
 export const HELD_PUBLICATION_TIMEOUT_MS = 330_000;
+
+/** The logical-operation allowance of one checkpoint publish (POST .../runs/{id}/publish), and of no
+ *  other route: a streamed pack upload can legitimately outlive WORKER_HTTP_TIMEOUT (30 s), which is
+ *  deliberately NOT raised. The api extends this route's own write deadline to cover 60 s of upload,
+ *  the service bound and a 15 s answer grace; this value adds transit margin on top, so an answer
+ *  written at the api's deadline still arrives (the committed fixture fixtures/checkpoint-publish-budget.json
+ *  pins both numbers). It is an UPPER bound only: the caller's boundary signal, a current
+ *  MaintenanceBudget (see maintenanceSignal) and the runner's shared allowance all win when earlier.
+ *
+ *  Callers of publishCheckpointOutcome and the limit that actually applies (verified in runner.ts):
+ *   1 Codex milestone, in a permit: any(permit.signal, soft) -> 10 s soft / 30 s hard
+ *   2 Claude milestone, deferred post-permit publish, iteration boundary (reap:false): no signal -> 480 s
+ *   3 mid-turn tick: tick signal, MIDTURN_TICK_TIMEOUT_MS 120 s cap
+ *   4 done checkpoint: any(permit.signal, soft) -> 60 s soft / 90 s hard
+ *   5 shutdown: Codex bounded by the boundary permit signal; Claude: the 15 s shutdown race
+ *     (shutdownPublishTimeoutMs) abandons the wait, but the request itself is bounded only by the
+ *     allowance or process exit (cause.deadlineAt feeds remediation hold/admission, never the request
+ *     signal, and the workerShutdown stopSignal has no timer)
+ *   6 limit-wait park: permit?.signal (Codex boundary 30 s); none on Claude -> 480 s
+ *   7 pause park: held.signal (Codex: capture-context deadline; Claude: caller signal, may be none -> 480 s)
+ *   8 recovery capture, credential-free: opts.signal (episode signal; none or never fired -> 480 s)
+ *   9 recovery capture, overlay: opts.signal ?? permit?.signal (same fallback)
+ *  10 completion hold: heldAuthenticated?.signal ?? permit?.signal (same fallback)
+ *  11 retained free capture: held.signal (same rule as 7)
+ *  Any caller whose signal never fires (rows 2, 6 on Claude, 7-11) is bounded by this 480 s alone.
+ *  A MaintenanceBudget (600 s default) becomes current only once a cancellation was observed for the
+ *  attempt (observeCancellation), so rows 1-4 normally run without one. */
+export const CHECKPOINT_PUBLISH_TIMEOUT_MS = 480_000;
 
 /** The held-publication feature string, advertised by the worker and by the api's protocol_features. */
 export const HELD_PUBLICATION_FEATURE = "recovery_held_publication_v1";
@@ -917,6 +955,8 @@ export interface ClientOptions {
   /** Monotonic clock in ms, for the permit retry deadline. Injected by tests. */
   now?: () => number;
   httpTimeoutMs?: number;
+  /** Test seam: overrides {@link CHECKPOINT_PUBLISH_TIMEOUT_MS}, the allowance of one checkpoint publish. */
+  checkpointPublishTimeoutMs?: number;
   /** Codex external-auth worker→API slice. Kept below app-server's fixed 10s callback
    *  deadline; the API finishes within 7.5s, leaving response-delivery margin. */
   codexHTTPTimeoutMs?: number;
@@ -1255,6 +1295,8 @@ type CompletionReservation = { live: boolean; tickets: Set<CompletionTicket> };
 
 /** issue #3181: the registration feature that lets a worker hold a credential switch it cannot settle. */
 export const CREDENTIAL_SWITCH_HOLD_FEATURE = "credential_switch_hold";
+/** Issue #3985: the server accepts `clarification_settled` after a human revise's clarification. */
+export const CLARIFICATION_REVISION_SETTLEMENT_FEATURE = "clarification_revision_settlement_v1";
 
 /** Issue #1324: the api accepts NEW publication intents and the typed publication-phase park. */
 const PUBLICATION_RESUME_FEATURE = "publication_resume_v1";
@@ -1267,6 +1309,7 @@ const PUBLICATION_HOLD_REASONS: ReadonlySet<string> = new Set([
 export class WorkerClient {
   private registeredWorkerId: string | undefined;
   private hasExactHoldCapability = false;
+  private hasBindinglessHoldCapability = false;
   /** Issue #3142: this registration advertised worker_memory_authority_claim_v1. */
   private hasMemoryAuthorityClaimCapability = false;
   private memoryAuthorityLostLogged = false;
@@ -1336,6 +1379,7 @@ export class WorkerClient {
   private readonly permitRetryBudgetMs: number;
   private readonly now: () => number;
   private readonly httpTimeoutMs: number;
+  private readonly checkpointPublishTimeoutValue: number;
   private readonly codexHTTPTimeoutMs: number;
   private readonly interruptedCallsTimeoutMs: number;
   /**
@@ -1348,6 +1392,8 @@ export class WorkerClient {
   private operationNegotiation = 0;
   private readonly operationFlights = new Map<string, { generation: number; token: symbol; reportingUnavailable?: boolean }>();
 
+  /** The allowance of one checkpoint publish; the runner shares one of this length across its retries. */
+  get checkpointPublishTimeoutMs(): number { return this.checkpointPublishTimeoutValue; }
   /** Positive negotiation serial survives feature clearing and worker re-registration. */
   get codexOperationNegotiation(): number { return this.operationNegotiation; }
 
@@ -1426,7 +1472,7 @@ export class WorkerClient {
   }
 
   private sealCodexAdmission(path: string, body: unknown): void {
-    const match = /^\/api\/worker\/runs\/([^/]+)\/(state|cross-check-verdict|wall-park|pause|completion\/hold|base-attestation-hold|completion\/attempt|archives\/release)$/.exec(path);
+    const match = /^\/api\/worker\/runs\/([^/]+)\/(state|cross-check-verdict|wall-park|iteration-park|pause|completion\/hold|base-attestation-hold|completion\/attempt|archives\/release)$/.exec(path);
     if (!match || !isRecord(body)) return;
     const runId = decodeURIComponent(match[1]!);
     const owned = this.codexAdmission.get(runId);
@@ -1520,6 +1566,10 @@ export class WorkerClient {
    * optimistic so the next request self-recovers once the api rolls forward).
    */
   private hasCredentialSwitchCapability = false;
+  /** Issue #3859: set when this registration's api proved (strict-decode 400) it cannot decode
+   *  `registration_evidence`. Sticky until the next register(); a heartbeat feature refresh does
+   *  not reopen it, which is why it is not simply dropFeature(). */
+  private registrationEvidenceDropped = false;
 
   /**
    * The per-registration nonce the api minted on the last successful register (PRD #1390
@@ -1577,6 +1627,17 @@ export class WorkerClient {
    *  capability-aware degradation for a pre-clone forge-unreachable park. Backed by
    *  `serverFeatures` so the two views never diverge and a rollback clear empties both. The
    *  setter routes through the same set (a test that skips register can seed it directly). */
+  /** Both sides must have negotiated the compact contract; this does not advertise readiness. */
+  get supportsScopedPendingClaim(): boolean {
+    return this.hasFeature("pending_outcome_scoped_claim_v1") &&
+      this.registrationReport?.protocol_capabilities.includes("pending_outcome_scoped_claim_v1") === true;
+  }
+
+  get supportsPolicyHold(): boolean {
+    return this.hasFeature("provider_policy_hold_v1") &&
+      this.registrationReport?.protocol_capabilities.includes("provider_policy_hold_v1") === true;
+  }
+
   get protocolFeatures(): string[] {
     return [...this.serverFeatures];
   }
@@ -1624,7 +1685,7 @@ export class WorkerClient {
     }
     const reason = typeof parsed.reason === "string" ? parsed.reason
       : typeof parsed.error === "string" && /^publication_[a-z_]+$/.test(parsed.error) ? parsed.error : "";
-    if (res.status === 409 && parsed.disposition === "stale_claim") return { kind: "refused", status: 409, reason: "stale_claim" };
+    if (res.status === 409 && parsed.disposition === "stale_claim") return { kind: "refused", status: 409, reason: "stale_claim", disposition: "stale_claim" };
     // The api's 503 for a disabled feature is a definite refusal; any other 5xx, and 429, may be transient.
     if (res.status === 503 && reason === "publication_resume_disabled") return { kind: "refused", status: 503, reason };
     if (res.status >= 500 || res.status === 429) return { kind: "unknown", detail: `http ${res.status}` };
@@ -1710,6 +1771,7 @@ export class WorkerClient {
     this.permitRetryBudgetMs = opts.permitRetryBudgetMs ?? DEFAULT_PERMIT_RETRY_BUDGET_MS;
     this.now = opts.now ?? (() => performance.now());
     this.httpTimeoutMs = opts.httpTimeoutMs ?? 30_000;
+    this.checkpointPublishTimeoutValue = opts.checkpointPublishTimeoutMs ?? CHECKPOINT_PUBLISH_TIMEOUT_MS;
     this.codexHTTPTimeoutMs = opts.codexHTTPTimeoutMs ?? 8_000;
     this.interruptedCallsTimeoutMs = opts.interruptedCallsTimeoutMs ?? 2_000;
   }
@@ -1754,7 +1816,11 @@ export class WorkerClient {
   }
 
   private snapshotForServer(snapshot: ActiveSnapshot): ActiveSnapshot {
-    return { ...snapshot, active: snapshot.active.map(entry => {
+    const { pending_policy_protection, pending_inventory_incomplete, ...legacy } = snapshot;
+    return { ...legacy,
+      ...(this.supportsScopedPendingClaim && pending_policy_protection !== undefined ? { pending_policy_protection } : {}),
+      ...(this.supportsScopedPendingClaim && pending_inventory_incomplete === true ? { pending_inventory_incomplete } : {}),
+      active: snapshot.active.map(entry => {
       const { account_cooldown, ...rest } = entry;
       return (this.hasFeature("codex_account_operation_admission_v1") ||
         this.operationFlights.get(entry.run_id)?.generation === entry.claim_generation) && account_cooldown !== undefined
@@ -1780,8 +1846,10 @@ export class WorkerClient {
     this.inputObservationEpoch++;
     this.registeredWorkerId = undefined;
     this.hasExactHoldCapability = false;
+    this.hasBindinglessHoldCapability = false;
     this.latestDindMaintenanceValue = undefined;
     this.registerNonce = undefined;
+    this.registrationEvidenceDropped = false;
     this.registrationReport = undefined;
     const originalCapabilities = Array.isArray(protocolCapabilities) ? [...protocolCapabilities] : undefined;
     const body: RegisterRequest = { name, version: this.version };
@@ -1848,6 +1916,7 @@ export class WorkerClient {
     // are fenced server-side) even when a one-shot register missed the negotiated feature.
     this.hasCredentialSwitchCapability = originalCapabilities?.includes("credential_switch_v1") ?? false;
     this.hasExactHoldCapability = originalCapabilities?.includes("recovery_held_publication_v2") ?? false;
+    this.hasBindinglessHoldCapability = originalCapabilities?.includes("recovery_bindingless_closed_v1") ?? false;
     this.hasMemoryAuthorityClaimCapability = originalCapabilities?.includes("worker_memory_authority_claim_v1") ?? false;
     // PRD #1390 M2a: capture the per-registration nonce the api minted, stamped onto every
     // ActiveSnapshot the worker sends. A string only (defensive); absent on an older api ⇒
@@ -1919,9 +1988,11 @@ export class WorkerClient {
     activeSnapshot?: ActiveSnapshot,
     maintenance?: { sample?: DindMeterSample | null; ack?: DindMaintenanceReadyACK },
     quarantine?: ResidueQuarantineState,
+    outboxRootUnusable?: "symlink" | "unreadable",
   ): Promise<boolean | undefined> {
     this.latestDindMaintenanceValue = undefined;
     const body: HeartbeatRequest = { version: this.version };
+    if (this.hasFeature("heartbeat_outbox_root_unusable")) body.outbox_root_unusable = outboxRootUnusable ?? null;
     // Only attach stats when the collector produced a sample (PRD #49): an absent
     // field is the same wire shape as today, so a pre-#49 server ignores the extra
     // bytes and a collector-less tick is indistinguishable from an old worker.
@@ -1974,11 +2045,17 @@ export class WorkerClient {
       };
     }
     const includeExtension = body.protocol_refresh !== undefined || includeOutbox || includeSnapshot || body.dind_meter !== undefined ||
-      body.dind_maintenance_ready_ack !== undefined || includeQuarantine;
+      body.dind_maintenance_ready_ack !== undefined || includeQuarantine || body.outbox_root_unusable !== undefined;
     try {
       try {
         return await this.postHeartbeat(body);
       } catch (err) {
+        // A diagnostic rejected after API rollback must not strip protection fields.
+        if (body.outbox_root_unusable !== undefined && isStrictDecodeError(err)) {
+          delete body.outbox_root_unusable;
+          this.dropFeature("heartbeat_outbox_root_unusable");
+          return await this.postHeartbeat(body);
+        }
         // A stale ACK gets one ACK-free resync; sibling extensions remain intact.
         // Any failure of that request reaches the usual strict-decode fallback below.
         if (!body.dind_maintenance_ready_ack || !(err instanceof RequestError) || err.status !== 409) throw err;
@@ -2124,9 +2201,18 @@ export class WorkerClient {
       }
       // Dedicated requests are bounded even without a marker; unmarked ordinary
       // claims are read under CLAIM_RESPONSE_MAX_BYTES.
+      // Owner steering (issue #3841): only the exact value v1, on a cross-check claim, grants the
+      // read the steering field's own wire allowance on top of the existing cap.
+      const steeringHeader = res.headers.get(OWNER_STEERING_HEADER);
+      if (steeringHeader !== null && steeringHeader !== "v1") {
+        if (ownedResponses.has(res)) await discardResponse(res);
+        else await res.body?.cancel();
+        throw new Error("unknown owner steering marker");
+      }
+      const steeringAllowance = steeringHeader === "v1" && (dedicated || marker === "cross_check") ? OWNER_STEERING_WIRE_MAX_BYTES : 0;
       const claim = (dedicated || marker === "cross_check" || res.headers.has("X-Uzi-Candidate-Identity-Version")
         ? JSON.parse(await readCrossCheckText(res, 2 * 1024 * 1024, deadline,
-          dedicated || marker === "cross_check" ? "claim" : undefined))
+          dedicated || marker === "cross_check" ? "claim" : undefined, steeringAllowance))
         : JSON.parse(await readBoundedText(res, CLAIM_RESPONSE_MAX_BYTES, true, deadline))) as ClaimResponse;
       if (isRecord(claim) && (!Number.isSafeInteger(claim.worker_recovery_episode) ||
           (claim.worker_recovery_episode as number) < 0)) delete claim.worker_recovery_episode;
@@ -2162,6 +2248,13 @@ export class WorkerClient {
       if (claim?.kind === "cross_check" && claim.cross_check !== undefined) {
         claim.cross_check = decodeCrossCheckClaim(claim.cross_check);
       }
+      // The header and the field must agree, and the field is a plan cross-check claim's alone.
+      const hasSteeringField = isRecord(claim) && claim.cross_check_owner_steering !== undefined;
+      if ((steeringHeader !== null) !== hasSteeringField ||
+          (hasSteeringField && (claim.kind !== "cross_check" || steeringAllowance === 0))) {
+        throw new Error("owner steering header and field disagree");
+      }
+      if (hasSteeringField) claim.cross_check_owner_steering = decodeOwnerSteering(claim.cross_check_owner_steering, claim.cross_check?.stage);
       // PRD #1798 D9: the pr_description is validated or dropped, never cast (decodePrState, the
       // same check as the bind / lookup / ack responses). The warning carries the run id only,
       // never the value (untrusted text). The isRecord guard keeps a `null` (or other non-object)
@@ -2509,6 +2602,17 @@ export class WorkerClient {
     return ack;
   }
 
+  /** One bounded attempt. No legacy /state fallback or generation downgrade is safe here. */
+  async reportPolicyHold(runId: string, body: import("./protocol.js").PolicyHoldRequest, signal?: AbortSignal): Promise<import("./protocol.js").PolicyHoldReply> {
+    const request = validatePolicyHoldRequest(body);
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/policy-hold`;
+    const res = await this.fetchRaw("POST", path, request, this.httpTimeoutMs, signal);
+    if (res.status !== 200 && res.status !== 409) throw await this.toError("POST", path, res);
+    const reply = decodePolicyHoldReply(JSON.parse(await readBoundedText(res, POLICY_HOLD_MAX_BYTES, true, signal)), request);
+    if ((res.status === 409) !== (reply.disposition === "pending")) throw new Error("invalid policy hold HTTP disposition");
+    return reply;
+  }
+
   /**
    * Report a run state and return what the server made of it. Every report —
    * terminal (completed/failed) and non-terminal (running/awaiting_approval/
@@ -2535,8 +2639,21 @@ export class WorkerClient {
    * so parsing a 409's status back out of the error text would work in tests and
    * fail on real runs.
    */
-  async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
+  async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal,
+    options?: { iterationCancellation?: true; registrationEpoch?: number }): Promise<StateAck> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
+    if (options?.iterationCancellation) {
+      // Snapshot before any asynchronous work; only the iteration sink cancellation
+      // may bypass compatibility negotiation, with its exact claim authority intact.
+      const frozen = Object.freeze(structuredClone(body));
+      if (frozen.status !== "failed" || frozen.failure_reason !== "run cancelled" ||
+          !Number.isSafeInteger(frozen.claim_generation) || (frozen.claim_generation ?? 0) <= 0 ||
+          (frozen.session_id !== undefined && typeof frozen.session_id !== "string") ||
+          Object.keys(frozen).some(key => !["status", "failure_reason", "claim_generation", "session_id"].includes(key)))
+        throw new Error("iteration cancellation requires exact cancellation body and positive generation");
+      this.sealCodexAdmission(path, frozen);
+      return this.reportStateOnce(runId, path, frozen, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
+    }
     this.sealCodexAdmission(path, body);
     if (body.source_publication !== undefined) {
       // Snapshot nested proof once, before either transport retries or caller mutation.
@@ -2635,6 +2752,16 @@ export class WorkerClient {
         throw new Error("credential switch hold report requires the credential_switch_hold feature, a registration nonce and a positive claim_generation");
       return this.reportStateOnce(runId, path, { ...body, register_nonce: nonce }, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
     }
+    if (body.status === "clarification_settled") {
+      // Issue #3985: a settlement is not an ordinary running report. It is sent once, whole, and
+      // never stripped, downgraded or re-sent as an unqualified `running` (the server refuses that
+      // for a human-revise clarification), so it bypasses every legacy strip-and-retry path.
+      if (!this.hasFeature(CLARIFICATION_REVISION_SETTLEMENT_FEATURE) ||
+          !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0 ||
+          !body.clarification_settlement)
+        throw new Error("clarification settlement requires the clarification_revision_settlement_v1 feature, a positive claim_generation and clarification_settlement");
+      return this.reportStateOnce(runId, path, body, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
+    }
     // Once a source fence is negotiated, never retry its write without that fence
     // on a rolled-back strict decoder. Initial older-API calls retain compatibility.
     if (hasRevisionSourceFields(body))
@@ -2670,6 +2797,13 @@ export class WorkerClient {
     if (!this.hasFeature("recovery_completed_publication_v1")) delete outbound.completion_final_head;
     const included = this.includeClaimGeneration(body.claim_generation);
     if (!included) delete outbound.provider_progress_turns;
+    // Issue #3859: the registration witness. Only this generic path can carry it: a `running`
+    // report never takes the credential-switch, memory-park, publication, retained-recovery,
+    // require_running or revision-source early returns above (those are other statuses or
+    // fields), and a caller-supplied copy is discarded so the client alone chooses presence.
+    delete outbound.registration_evidence;
+    const witness = this.registrationEvidenceFor(body, included, options?.registrationEpoch);
+    if (witness) outbound.registration_evidence = witness;
     // PRD #1795 M3: the api refuses an id-bearing awaiting_approval report without
     // claim_generation (400 claim_generation_required), and the strict-decode fallback exists for
     // an api that rolled back past the fields. So whenever claim_generation is NOT on the wire, the
@@ -2691,7 +2825,36 @@ export class WorkerClient {
         b.claim_generation,
       );
     try {
-      if (outbound.capability_inference_evidence !== undefined && this.hasFeature(CAPABILITY_INFERENCE_EVIDENCE_FEATURE)) {
+      if (outbound.registration_evidence !== undefined) {
+        // Issue #3859. Ordering with the older claim_generation fallback: the evidence strip comes
+        // FIRST (it is the newer field). Attempt 1 carries evidence and claim_generation; on the
+        // exact strict-decode 400 attempt 2 is the identical body with ONLY registration_evidence
+        // removed (claim_generation and every other field intact). If attempt 2 itself gets the
+        // strict-decode 400 (a stale advertised feature set against an api that decodes neither
+        // field), the evidence-free body continues into the pre-existing claim_generation
+        // fallback exactly as before this feature: one more send with claim_generation stripped.
+        // Evidence is never re-attached and there is no second evidence-stripping resend, so the
+        // worst case is three sends. A transient failure is retried inside reportStateVariant
+        // with the SAME variant, never with evidence stripped.
+        try {
+          ack = await sendWith(outbound)(true);
+        } catch (err) {
+          // The exact one-key decoder refusal only (StateDecodeRefusalError), narrower than the
+          // loose generation-fallback regex: prose that merely mentions the phrase is not a rollback.
+          if (!isStrictDecodeError(err) || !(err instanceof StateDecodeRefusalError)) throw err;
+          const stripped = { ...outbound };
+          delete stripped.registration_evidence;
+          this.registrationEvidenceDropped = true;
+          this.log.warn("registration evidence rejected by an api that cannot decode it; re-sent without it and stopped sending it for this registration", { run_id: runId });
+          try {
+            ack = await sendWith(stripped)(true);
+          } catch (err2) {
+            if (!isStrictDecodeError(err2)) throw err2;
+            if (!this.hasCredentialSwitchCapability) this.clearFeatures();
+            ack = await sendWith(stripped)(false);
+          }
+        }
+      } else if (outbound.capability_inference_evidence !== undefined && this.hasFeature(CAPABILITY_INFERENCE_EVIDENCE_FEATURE)) {
         // Advisory rollback is resolved before the legacy generation fallback.
         // A refusal of its stripped variant must never select an unfenced third body.
         ack = await sendWith(outbound)(included);
@@ -2734,6 +2897,20 @@ export class WorkerClient {
     }
     if (body.completion_final_head !== undefined && !this.hasFeature("recovery_completed_publication_v1")) ack.completedPublicationReason = "unsupported_feature";
     return ack;
+  }
+
+  /** Issue #3859: the registration witness for a `running` report, or undefined. Every guard is
+   *  required: negotiated and not dropped for this registration, a known register nonce, a
+   *  supplied epoch (non-negative safe integer), and a claim generation that is a safe integer
+   *  >= 1 which `included` says is really on the wire (the witness must name the same generation
+   *  the report is fenced on). Never for a non-running report. */
+  private registrationEvidenceFor(body: StateRequest, included: boolean, epoch: number | undefined): RunRegistrationEvidence | undefined {
+    const generation = body.claim_generation;
+    if (body.status !== "running" || !included || this.registrationEvidenceDropped ||
+        !this.hasFeature(RUN_REGISTRATION_EVIDENCE_FEATURE) || !this.registerNonce ||
+        epoch === undefined || !Number.isSafeInteger(epoch) || epoch < 0 ||
+        generation === undefined || !Number.isSafeInteger(generation) || generation < 1) return undefined;
+    return { register_nonce: this.registerNonce, claim_generation: generation, registration_epoch: epoch };
   }
 
   /** Validate proof only at the authenticated state-report seam. This does not settle local custody. */
@@ -2916,6 +3093,8 @@ export class WorkerClient {
           // can recognise a SERVER-side wall park (paused + budget_exhausted) on a fenced stale ACK.
           if (fields.holdReason !== undefined)
             ack.holdReason = fields.holdReason;
+          if (fields.repoAgentSourceCommit !== undefined)
+            ack.repoAgentSourceCommit = fields.repoAgentSourceCommit;
           if (fields.budgetMaxIterations !== undefined)
             ack.budgetMaxIterations = fields.budgetMaxIterations;
           if (fields.budgetWallSeconds !== undefined)
@@ -2965,6 +3144,8 @@ export class WorkerClient {
           if (fields.credentialSwitchHeld !== undefined) ack.credentialSwitchHeld = fields.credentialSwitchHeld;
           if (fields.credentialSwitchHoldSettled !== undefined)
             ack.credentialSwitchHoldSettled = fields.credentialSwitchHoldSettled;
+          // Issue #3985: only a 200 can confirm a clarification settlement; a 409 is a refusal.
+          if (res.status === 200 && fields.clarificationSettled === true) ack.clarificationSettled = true;
           // PRD #1795 M1 (decision 5): the revision an awaiting_approval report was answered with,
           // read like contractRevision off the same single-use body (top-level, beside `run`).
           if (fields.gateRevision !== undefined) ack.gateRevision = fields.gateRevision;
@@ -2976,6 +3157,10 @@ export class WorkerClient {
           if (ack.applied && fields.reconciliation !== undefined &&
               fields.reconciliation.claimGeneration === body.claim_generation)
             ack.reconciliation = fields.reconciliation;
+          if (body.registration_evidence !== undefined && fields.registrationEvidence !== undefined) {
+            ack.registrationEvidence = fields.registrationEvidence;
+            this.log.info("registration evidence answered", { run_id: runId, registration_evidence: fields.registrationEvidence });
+          }
           if (!ack.applied) {
             this.log.info("state report not applied server-side", {
               run_id: runId,
@@ -3043,9 +3228,14 @@ export class WorkerClient {
    * (`published: false`). The acknowledgment is read through {@link readBoundedText} under
    * {@link CHECKPOINT_PUBLISH_ACK_MAX_BYTES}: an oversized body, a read failure or an abort
    * THROWS (a `ResponseBodyOverflowError` for overflow), which leaves the publish outcome
-   * ambiguous for the caller. The bearer/version header assembly mirrors fetchRaw; the same
-   * per-request timeout is used — generous enough for a real pack, and an abort is just
-   * another best-effort miss (it throws, caught by the caller's warn-and-swallow).
+   * ambiguous for the caller. The bearer/version header assembly mirrors fetchRaw; the request
+   * is bounded by {@link CHECKPOINT_PUBLISH_TIMEOUT_MS} (not httpTimeoutMs, which is too short for
+   * a real pack), or earlier by the caller's boundary signal or a current MaintenanceBudget, and
+   * undici's own 300 s headers/body timeouts are raised to that allowance for this request
+   * ({@link checkpointPublishDispatcher}). The caller
+   * retries an explicit 5xx (250 ms, 1 s backoff) up to three requests, all inside one shared
+   * allowance of this size. An abort is just another best-effort miss (it throws, caught by the
+   * caller's warn-and-swallow).
    */
   async publishCheckpoint(
     runId: string,
@@ -3060,8 +3250,8 @@ export class WorkerClient {
       ? `?claim_generation=${encodeURIComponent(claimGeneration)}` : "";
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/publish${query}`;
     const signal = boundarySignal
-      ? AbortSignal.any([boundarySignal, maintenanceSignal(this.httpTimeoutMs)])
-      : maintenanceSignal(this.httpTimeoutMs);
+      ? AbortSignal.any([boundarySignal, maintenanceSignal(this.checkpointPublishTimeoutMs)])
+      : maintenanceSignal(this.checkpointPublishTimeoutMs);
     const init: RequestInit = {
       method: "POST",
       headers: {
@@ -3077,22 +3267,30 @@ export class WorkerClient {
       duplex: "half",
       signal,
     };
-    const res = await maintenanceFetch(fetch, this.baseUrl + path, init);
-    if (res.status < 200 || res.status >= 300) {
-      // Discard remote content without exposing it or changing the HTTP outcome.
-      if (ownedResponses.has(res)) await discardResponse(res);
-      else if (MaintenanceBudget.current()) void res.body?.cancel().catch(() => undefined);
-      else await res.body?.cancel().catch(() => undefined);
-      MaintenanceBudget.current()?.check();
-      return { ok: false, httpStatus: res.status };
+    const dispatcher = checkpointPublishDispatcher(this.checkpointPublishTimeoutMs);
+    Object.assign(init, { dispatcher });
+    try {
+      const res = await maintenanceFetch(fetch, this.baseUrl + path, init);
+      if (res.status < 200 || res.status >= 300) {
+        // Discard remote content without exposing it or changing the HTTP outcome.
+        if (ownedResponses.has(res)) await discardResponse(res);
+        else if (MaintenanceBudget.current()) void res.body?.cancel().catch(() => undefined);
+        else await res.body?.cancel().catch(() => undefined);
+        MaintenanceBudget.current()?.check();
+        return { ok: false, httpStatus: res.status };
+      }
+      // Bounded by streamed bytes: an overflow, a read failure or an abort throws, so the caller
+      // records the publish as ambiguous instead of reading an unbounded acknowledgment.
+      const text = await readBoundedText(res, CHECKPOINT_PUBLISH_ACK_MAX_BYTES, true, signal);
+      // A 2xx with no body cannot confirm the publish landed; treat it as a non-confirming
+      // outcome carrying the 2xx code rather than fabricating a body.
+      if (!text) return { ok: false, httpStatus: res.status };
+      return { ok: true, body: JSON.parse(text) as PublishResponse };
+    } finally {
+      // Destroy rather than graceful-close: failed/aborted uploads and partially read ACKs must
+      // not keep a pool alive or delay a caller's cancellation waiting for an idle connection.
+      await dispatcher.destroy();
     }
-    // Bounded by streamed bytes: an overflow, a read failure or an abort throws, so the caller
-    // records the publish as ambiguous instead of reading an unbounded acknowledgment.
-    const text = await readBoundedText(res, CHECKPOINT_PUBLISH_ACK_MAX_BYTES, true, signal);
-    // A 2xx with no body cannot confirm the publish landed; treat it as a non-confirming
-    // outcome carrying the 2xx code rather than fabricating a body.
-    if (!text) return { ok: false, httpStatus: res.status };
-    return { ok: true, body: JSON.parse(text) as PublishResponse };
   }
 
   /**
@@ -3465,9 +3663,57 @@ export class WorkerClient {
     if (incarnation !== this.completionIncarnation || worker !== this.registeredWorkerId ||
         !this.hasExactHoldCapability ||
         !isRecord(body) || body.run_id !== runId || !isRecord(body.exact_hold)) return undefined;
-    const value = body.exact_hold;
-    if (value.run_id !== runId || value.generation !== generation || value.hold_id !== expected.holdId ||
-        value.repo_id !== expected.repoId || value.original_worker_id !== worker ||
+    return this.validateExactRecoveryHold(body.exact_hold, runId, generation, worker, expected);
+  }
+
+  /** Authenticated observation without local hold/repo binding. Closed facts may
+   * support refusal-only persistence; never an ACK, cleanup or producer authority. */
+  async getBindinglessRecoveryHold(
+    runId: string,
+    generation: number,
+    signal?: AbortSignal,
+  ): Promise<RecoveryExactHold | undefined> {
+    const supported = () => this.hasBindinglessHoldCapability && this.hasFeature("recovery_bindingless_closed_v1");
+    const worker = this.registeredWorkerId;
+    if (!supported() || !worker || !terminalUUID(runId) || !terminalGeneration(generation) || generation <= 0)
+      return undefined;
+    const epoch = this.inputObservationEpoch;
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/recovery-holds?generation=${generation}`;
+    const res = await this.fetchRaw("GET", path, undefined, this.httpTimeoutMs, signal);
+    if (res.status !== 200 || res.headers.get("Uzi-Recovery-Observation") !== "recovery_bindingless_closed_v1") {
+      if (ownedResponses.has(res)) await discardResponse(res);
+      else void res.body?.cancel().catch(() => undefined);
+      MaintenanceResources.checkIfActive();
+      MaintenanceBudget.current()?.check();
+      MaintenanceBudget.signal()?.throwIfAborted();
+      signal?.throwIfAborted();
+      return undefined;
+    }
+    let body: unknown;
+    try { body = JSON.parse(await readBoundedText(res, COMPLETION_HOLDS_MAX_BYTES, true, signal)); }
+    catch {
+      MaintenanceResources.checkIfActive();
+      MaintenanceBudget.current()?.check();
+      MaintenanceBudget.signal()?.throwIfAborted();
+      signal?.throwIfAborted();
+      return undefined;
+    }
+    MaintenanceResources.checkIfActive();
+    MaintenanceBudget.current()?.check();
+    MaintenanceBudget.signal()?.throwIfAborted();
+    signal?.throwIfAborted();
+    if (epoch !== this.inputObservationEpoch || worker !== this.registeredWorkerId || !supported() ||
+        !isRecord(body) || body.run_id !== runId || !isRecord(body.exact_hold)) return undefined;
+    return this.validateExactRecoveryHold(body.exact_hold, runId, generation, worker);
+  }
+
+  private validateExactRecoveryHold(
+    value: Record<string, unknown>, runId: string, generation: number, worker: string,
+    expected?: { holdId: string; repoId: string },
+  ): RecoveryExactHold | undefined {
+    if (value.run_id !== runId || value.generation !== generation || !terminalUUID(value.hold_id) || !terminalUUID(value.repo_id) ||
+        (expected !== undefined && (value.hold_id !== expected.holdId || value.repo_id !== expected.repoId)) ||
+        value.original_worker_id !== worker ||
         typeof value.original_worker_identity !== "string" || !value.original_worker_identity.trim() ||
         value.inventory_guarded !== true || (value.run_worker_id !== undefined && !terminalUUID(value.run_worker_id)) ||
         (value.recovery_wait_cause !== undefined && typeof value.recovery_wait_cause !== "string") || !terminalGeneration(value.current_claim_generation) ||
@@ -3684,13 +3930,13 @@ export class WorkerClient {
     )) as RecoverySettleResponse;
   }
 
-  async getInputs(runId: string, claimGeneration?: number): Promise<{ inputs: UserInput[]; staleObservation?: true; terminalCancelled?: { run_id: string; generation: number }; credentialSwitch?: { generation: number }; receipts?: boolean; nowSummary?: boolean }> {
+  async getInputs(runId: string, claimGeneration?: number, signal?: AbortSignal, maxResponseBytes?: number): Promise<{ inputs: UserInput[]; staleObservation?: true; terminalCancelled?: { run_id: string; generation: number }; credentialSwitch?: { generation: number }; receipts?: boolean; nowSummary?: boolean }> {
     const query = claimGeneration !== undefined && claimGeneration > 0
       ? `?claim_generation=${encodeURIComponent(claimGeneration)}` : "";
     const epoch = this.inputObservationEpoch;
     let res: InputsResponse;
     try {
-      res = (await this.inputJSON("GET", `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/inputs${query}`)) as InputsResponse;
+      res = (await this.inputJSON("GET", `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/inputs${query}`, undefined, signal, maxResponseBytes)) as InputsResponse;
     } catch (err) {
       if (epoch !== this.inputObservationEpoch) return { inputs: [], staleObservation: true };
       throw err;
@@ -4300,13 +4546,32 @@ export class WorkerClient {
       return { outcome: "unknown", detail: "no claim generation to fence the hold" };
     }
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/base-attestation-hold`;
+    return this.requestPreflightHold(path, { head: args.head, claim_generation: args.claimGeneration }, BASE_ATTESTATION_HOLD_REASON, signal);
+  }
+
+  async requestRepoAgentSourceHold(
+    runId: string,
+    args: { commit: string; claimGeneration: number },
+    signal?: AbortSignal,
+  ): Promise<BaseAttestationHoldOutcome> {
+    if (!Number.isSafeInteger(args.claimGeneration) || args.claimGeneration <= 0) {
+      return { outcome: "unknown", detail: "no claim generation to fence the hold" };
+    }
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/repo-agent-source-hold`;
+    return this.requestPreflightHold(path, { commit: args.commit, claim_generation: args.claimGeneration }, REPO_AGENT_SOURCE_HOLD_REASON, signal);
+  }
+
+  private async requestPreflightHold(
+    path: string,
+    body: Record<string, unknown>,
+    reason: string,
+    signal?: AbortSignal,
+  ): Promise<BaseAttestationHoldOutcome> {
     try {
-      const res = await this.fetchRaw(
-        "POST", path, { head: args.head, claim_generation: args.claimGeneration }, this.httpTimeoutMs, signal,
-      );
+      const res = await this.fetchRaw("POST", path, body, this.httpTimeoutMs, signal);
       if (res.status === 200) {
         const fields = await readRunAck(res);
-        if (fields.status === "paused" && fields.holdReason === BASE_ATTESTATION_HOLD_REASON) {
+        if (fields.status === "paused" && fields.holdReason === reason) {
           return { outcome: "held", status: fields.status };
         }
         return { outcome: "unknown", detail: `unexpected hold acknowledgement (status ${fields.status ?? "none"})` };
@@ -4368,6 +4633,51 @@ export class WorkerClient {
       // A 2xx we do not model: no status came back, so it cannot confirm a park.
       return { applied: false, status: "" };
     });
+  }
+
+  /** One fenced request; the caller owns episode retries. All response bodies are bounded before
+   * decoding, including errors. Unknown delivery never becomes a generic run failure. */
+  async reportIterationPark(runId: string, request: IterationParkRequest, signal?: AbortSignal): Promise<IterationParkResult> {
+    const body = { ...request };
+    const positiveGeneration = (value: unknown): value is number =>
+      typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+    const positiveInt = (value: unknown): value is number =>
+      positiveGeneration(value) && value <= 2147483647;
+    if (!isRecord(body) || !positiveGeneration(body.claim_generation) || !positiveInt(body.iteration_count)
+      || !positiveInt(body.max_iterations) || body.iteration_count < body.max_iterations
+      || body.iteration_count - body.max_iterations > 1 || typeof body.head !== "string"
+      || Buffer.from(body.head, "utf8").toString("utf8") !== body.head || Buffer.byteLength(body.head, "utf8") > 128
+      || typeof body.published !== "boolean"
+      || (body.checkpoint_contains_latest !== undefined && typeof body.checkpoint_contains_latest !== "boolean"))
+      throw new Error("invalid iteration park evidence");
+    const serialized = JSON.stringify(body);
+    const keys = ["claim_generation", "iteration_count", "max_iterations", "head", "published", "checkpoint_contains_latest"];
+    if (Buffer.byteLength(serialized, "utf8") > 16 * 1024
+      || Object.keys(body).some(key => !keys.includes(key)))
+      throw new Error("invalid iteration park evidence");
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/iteration-park`;
+    const deadline = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(this.httpTimeoutMs)]);
+    try {
+      const res = await this.fetchRaw("POST", path, body, this.httpTimeoutMs, deadline);
+      const raw = await readBoundedBytes(res, 16 * 1024, true, deadline);
+      const ack: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw));
+      if (!isRecord(ack)) return { outcome: "unknown" };
+      if (res.status === 200 && ack.applied === true && ack.status === "paused"
+        && ack.hold_reason === "iteration_budget_exhausted" && ack.claim_generation === body.claim_generation)
+        return { outcome: "parked" };
+      const reasons: readonly IterationParkRefusalReason[] = ["prior_attempt", "ineligible_lane", "not_running",
+        "allowance_mismatch", "stale_claim", "released_claim", "pending_control"];
+      const statuses = ["queued", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup",
+        "pool_wait", "limit_wait", "recovery_wait", "paused", "completed", "failed", "cancelled"];
+      if (res.status === 409 && ack.applied === false && typeof ack.reason === "string"
+        && reasons.includes(ack.reason as IterationParkRefusalReason) && typeof ack.status === "string"
+        && statuses.includes(ack.status) && positiveGeneration(ack.claim_generation) && typeof ack.hold_reason === "string")
+        return { outcome: "refused", reason: ack.reason as IterationParkRefusalReason,
+          status: ack.status, claimGeneration: ack.claim_generation };
+      return { outcome: "unknown" };
+    } catch {
+      return { outcome: "unknown" };
+    }
   }
 
   /** Request an ordinary pause. A running ACK records intent; only a paused status confirms a park.
@@ -4594,6 +4904,24 @@ export class WorkerClient {
         }
         return { kind: "http", status: err.status, ...(code !== undefined ? { error: code } : {}) };
       }
+      return { kind: "transport", error: err };
+    }
+  }
+
+  // ── Codex catalog default report (issue #3251) ─────────────────────────────
+  /** POST /worker/runs/:id/codex-catalog-default (204, no body). One attempt, never throws: a
+   *  refusal (404 from an older API, 409 stale claim/context, 400) is `http`, a network failure or
+   *  timeout is `transport`. */
+  async recordCodexCatalogDefault(
+    runId: string,
+    body: CodexCatalogDefaultBody,
+    timeoutMs = 5_000,
+  ): Promise<LeadConfigPostOutcome> {
+    try {
+      await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/codex-catalog-default`, body, timeoutMs);
+      return { kind: "ok" };
+    } catch (err) {
+      if (err instanceof RequestError) return { kind: "http", status: err.status };
       return { kind: "transport", error: err };
     }
   }
@@ -4956,15 +5284,17 @@ export class WorkerClient {
 
   /** Input polling/receipts share one deadline through response-body consumption, including
    * injected transports whose Response stream does not inherit fetch's abort signal. */
-  private async inputJSON(method: "GET" | "POST", path: string, body?: unknown): Promise<unknown> {
-    const signal = AbortSignal.timeout(this.httpTimeoutMs);
+  private async inputJSON(method: "GET" | "POST", path: string, body?: unknown, callerSignal?: AbortSignal,
+    maxResponseBytes = Number.MAX_SAFE_INTEGER): Promise<unknown> {
+    const signal = AbortSignal.any([AbortSignal.timeout(this.httpTimeoutMs), ...(callerSignal ? [callerSignal] : [])]);
+    signal.throwIfAborted();
     const res = await this.fetchRaw(method, path, body, this.httpTimeoutMs, signal);
     if (res.status >= 400) {
       const text = await readBoundedText(res, ERROR_BODY_MAX_BYTES, false, signal);
       throw new RequestError(method, path, res.status, text.slice(0, 4096), retryAfterMsOf(res.headers.get("Retry-After")));
     }
     if (res.status === 204) return undefined;
-    const text = await readBoundedText(res, Number.MAX_SAFE_INTEGER, true, signal);
+    const text = await readBoundedText(res, maxResponseBytes, true, signal);
     return text ? JSON.parse(text) : undefined;
   }
 
@@ -5094,16 +5424,33 @@ function maintenanceSignal(timeoutMs: number): AbortSignal {
   return AbortSignal.any([budget.signal, AbortSignal.timeout(duration), ...(pending ? [pending] : [])]);
 }
 
+// Rejections of the transport (fetch) promise itself, as opposed to budget checks or body reads.
+const fetchRejections = new WeakSet<object>();
+
+function markTransportRejection<T>(p: Promise<T>, signal?: AbortSignal | null): Promise<T> {
+  return p.catch((error: unknown) => {
+    // undici rejects with `signal.reason` itself on abort; that is an abort, not a transport failure.
+    if (signal?.aborted && error === signal.reason) throw error;
+    if ((typeof error === "object" || typeof error === "function") && error !== null) fetchRejections.add(error);
+    throw error;
+  });
+}
+
+/** True only for an error object that the transport promise rejected with (identity-preserved). */
+export function isFetchRejection(error: unknown): boolean {
+  return (typeof error === "object" || typeof error === "function") && error !== null && fetchRejections.has(error);
+}
+
 async function maintenanceFetch(transport: typeof fetch, url: string, init: RequestInit): Promise<Response> {
   MaintenanceResources.consumeIfActive("rpcAttempts", 1);
   const resourceSignal = MaintenanceResources.signalIfActive();
   if (resourceSignal) init = { ...init, signal: AbortSignal.any([resourceSignal, ...(init.signal ? [init.signal] : [])]) };
   const budget = MaintenanceBudget.current();
-  if (!budget && !resourceSignal && !MaintenanceBudget.ownedSignal()) return transport(url, init);
+  if (!budget && !resourceSignal && !MaintenanceBudget.ownedSignal()) return markTransportRejection(transport(url, init), init.signal);
   if (!budget || MaintenanceBudget.ownedSignal()) {
     budget?.check();
     init.signal?.throwIfAborted();
-    const res = await transport(url, init);
+    const res = await markTransportRejection(transport(url, init), init.signal);
     if (init.signal) responseSignals.set(res, init.signal);
     ownResponse(res, init.signal);
     if (MaintenanceBudget.ownedSignal()) {
@@ -5114,7 +5461,7 @@ async function maintenanceFetch(transport: typeof fetch, url: string, init: Requ
   }
   budget.check();
   const signal = AbortSignal.any([budget.signal, ...(init.signal ? [init.signal] : [])]);
-  const res = await budget.raceIO(() => transport(url, { ...init, signal }), late => {
+  const res = await budget.raceIO(() => markTransportRejection(transport(url, { ...init, signal }), signal), late => {
     // One detached cancellation attempt; an uncooperative body cannot block the caller.
     void late.body?.cancel().catch(() => undefined);
   }, signal);
@@ -5228,14 +5575,14 @@ async function readBoundedText(res: Response, maxBytes: number, rejectOverflow =
 /** The server marker grants a bounded transport budget only. The complete
  * semantic candidate and its enclosing digest must still validate after reading. */
 async function readCrossCheckText(res: Response, maxBytes: number, signal?: AbortSignal,
-  semanticContext?: { generation: number; round: number } | "claim"): Promise<string> {
+  semanticContext?: { generation: number; round: number } | "claim", allowanceBytes = 0): Promise<string> {
   const marker = res.headers.get("X-Uzi-Candidate-Identity-Version");
   if (marker !== null && (marker !== "semantic_v1" || !semanticContext)) {
     if (ownedResponses.has(res)) await discardResponse(res);
     else void res.body?.cancel().catch(() => undefined);
     throw new Error("invalid cross-check candidate identity marker");
   }
-  const raw = await readBoundedBytes(res, marker === "semantic_v1" ? SEMANTIC_ENVELOPE_MAX_BYTES : maxBytes, true, signal);
+  const raw = await readBoundedBytes(res, (marker === "semantic_v1" ? SEMANTIC_ENVELOPE_MAX_BYTES : maxBytes) + allowanceBytes, true, signal);
   const text = new TextDecoder().decode(raw);
   if (semanticContext) {
     const wire: unknown = text ? JSON.parse(text) : undefined;
@@ -5383,6 +5730,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   memoryParkUndisposed?: boolean;
   status?: string;
   holdReason?: string | null;
+  repoAgentSourceCommit?: string;
   budgetMaxIterations?: number;
   budgetWallSeconds?: number;
   contractRevision?: number;
@@ -5402,11 +5750,13 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   credentialSwitchReleased?: boolean;
   credentialSwitchHeld?: boolean;
   credentialSwitchHoldSettled?: boolean;
+  clarificationSettled?: boolean;
   gateRevision?: number;
   revisionInputId?: number;
   supersededRevisionInputIds?: number[];
   staleRevisionSource?: boolean;
   reconciliation?: PlanCrossCheckReconciliation;
+  registrationEvidence?: "recorded" | "refused";
 }> {
   const pendingMarker = res.headers.get(COMPLETION_PENDING_HEADER);
   const ackCap = maxAckBytes === undefined ? undefined
@@ -5433,6 +5783,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
         // PRD #1497 M2: the run's hold_reason on the RunDTO, read beside `status` to recognise a
         // SERVER-side wall park (paused + budget_exhausted) from a fenced stale-claim ACK.
         hold_reason?: unknown;
+        repo_agent_source_commit?: unknown;
         budget_max_iterations?: unknown;
         budget_wall_seconds?: unknown;
         // Issue #1626: the frozen completion-contract revision (RunDTO.completion_revision).
@@ -5457,6 +5808,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       gate_revision?: unknown;
       revision_input_id?: unknown;
       superseded_revision_input_ids?: unknown;
+      // Issue #3859: top-level answer to a report that carried registration_evidence.
+      registration_evidence?: unknown;
     };
     const run = parsed?.run;
     const out: {
@@ -5474,6 +5827,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       memoryParkUndisposed?: boolean;
       status?: string;
       holdReason?: string | null;
+      repoAgentSourceCommit?: string;
       budgetMaxIterations?: number;
       budgetWallSeconds?: number;
       contractRevision?: number;
@@ -5493,11 +5847,13 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       credentialSwitchReleased?: boolean;
       credentialSwitchHeld?: boolean;
       credentialSwitchHoldSettled?: boolean;
+      clarificationSettled?: boolean;
       gateRevision?: number;
       revisionInputId?: number;
       supersededRevisionInputIds?: number[];
       staleRevisionSource?: boolean;
       reconciliation?: PlanCrossCheckReconciliation;
+      registrationEvidence?: "recorded" | "refused";
     } = {};
     if (isRecord(parsed) && (Object.hasOwn(parsed, "semantic_presentation") || Object.hasOwn(parsed, "semantic_approval"))) {
       try {
@@ -5533,6 +5889,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     // non-string (older server that omits it, a null hold, an unparseable value) leaves it absent,
     // which the ServerWallParkedError check reads as "no hold" (never a wall park).
     if (typeof run?.hold_reason === "string") out.holdReason = run.hold_reason;
+    if (typeof run?.repo_agent_source_commit === "string" && /^[0-9a-f]{40}$/.test(run.repo_agent_source_commit))
+      out.repoAgentSourceCommit = run.repo_agent_source_commit;
     if (typeof run?.budget_max_iterations === "number")
       out.budgetMaxIterations = run.budget_max_iterations;
     if (typeof run?.budget_wall_seconds === "number")
@@ -5626,6 +5984,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     // acknowledgement applied (`hold_settled`). Read only off the 200 ack, like `released`.
     if (parsed?.disposition === "held") out.credentialSwitchHeld = true;
     if (parsed?.disposition === "hold_settled") out.credentialSwitchHoldSettled = true;
+    // Issue #3985: the clarification settlement applied; read only off the 200 ack.
+    if (parsed?.disposition === "clarification_settled") out.clarificationSettled = true;
     // PRD #1795 M1 (decision 5): the gate revision an awaiting_approval report was answered with. A
     // positive integer only; anything else (absent on an older api or another report, garbled)
     // leaves it undefined, which the gate reads as "no revision confirmed" (bound verdicts wait).
@@ -5640,6 +6000,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       out.revisionInputId = revisionId;
       out.supersededRevisionInputIds = superseded;
     }
+    if (parsed?.registration_evidence === "recorded" || parsed?.registration_evidence === "refused")
+      out.registrationEvidence = parsed.registration_evidence;
     const gateRev = parsed?.gate_revision;
     if (typeof gateRev === "number" && Number.isSafeInteger(gateRev) && gateRev >= 1) out.gateRevision = gateRev;
     const reconciliation = readPlanCrossCheckReconciliation(parsed);

@@ -22,6 +22,7 @@ WTOKEN="$(apipost /api/workers '{"name":"e2e-worker"}' | jq -r '.token')"
 # `provides: … UZI_WORKER_TOKEN` above, and `requires: UZI_WORKER_TOKEN` on the consumers.
 # The entrypoint hardens /run/secrets/worker_token to 0400 worker on each start.
 export UZI_WORKER_TOKEN="$WTOKEN"
+capture_agent_logs 13-worker-join-online initial-up absent-ok
 "${COMPOSE[@]}" up -d --wait agent
 wait_worker_online
 pass "worker registered and is online"

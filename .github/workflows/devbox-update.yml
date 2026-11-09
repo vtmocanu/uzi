@@ -35,7 +35,7 @@ name: Devbox toolchain update
 "on":
   schedule:
     # 06:41 UTC Mondays, off the hour and distinct from the other weekly jobs
-    # (roles-manifest-refresh 06:27, main-guard 05:43, e2e 01:17) to dodge scheduler
+    # (roles-manifest-refresh 06:27, main-guard 05:43, e2e 21:17) to dodge scheduler
     # contention. Weekly keeps each bump's delta small so a major shows up isolated.
     - cron: "41 6 * * 1"
   workflow_dispatch:

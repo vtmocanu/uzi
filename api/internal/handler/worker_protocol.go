@@ -429,10 +429,12 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		{"memory_park_settlement_v1"},        // issue #3639: this api accepts the memory-park settlement receipt and answers the claim body's memory_park_reference
 		{"worker_memory_authority_claim_v1"}, // issue #3142: this api accepts the run-lane claim body's memory_authority member
 		{"recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "recovery_archive_redundancy_v1"}, // PRD #1392 M1; issue #2625 adds the redundancy route
-		{"heartbeat_outbox"},          // PRD #1391 M5, Run A
-		{"worker_residue_quarantine"}, // issue #2213: this api accepts the heartbeat's residue_quarantine member
-		{"claim_generation_fence"},    // PRD #1247 M5 (D11): this api fences message/report inserts on claim_generation for a credential_switch_v1 worker
-		{"terminal_fence"},            // PRD #1391 Run B M3c: this api fences a terminal transition on messages_through_seq contiguity
+		{capability.RecoveryBindinglessClosedV1}, // Historical reads are independent of publication write switches.
+		{"heartbeat_outbox"},                     // PRD #1391 M5, Run A
+		{"heartbeat_outbox_root_unusable"},       // optional worker-global diagnostic
+		{"worker_residue_quarantine"},            // issue #2213: this api accepts the heartbeat's residue_quarantine member
+		{"claim_generation_fence"},               // PRD #1247 M5 (D11): this api fences message/report inserts on claim_generation for a credential_switch_v1 worker
+		{"terminal_fence"},                       // PRD #1391 Run B M3c: this api fences a terminal transition on messages_through_seq contiguity
 		// Issue #1766 M2: this api accepts {status:"recovery_wait", recovery_cause:"vault_locked"}
 		// and stores the cause. Advertised UNCONDITIONALLY (no config gates the park): a worker
 		// must see it before sending the cause, because an older api 400s an unknown recovery_cause.
@@ -452,6 +454,16 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		// the cause or the flag, because an older api 400s both.
 		{"recovery_cause_codex_idle_stall_v1"},
 		{"recovery_cause_retained_recovery_exhausted"},
+		// Issue #4046: this api accepts retained_capacity_only on a retained_recovery_exhausted
+		// park and holds it owner-side without counting it. A worker sends the marker ONLY after
+		// seeing this token, because an older api's strict decoder 400s the unknown field.
+		{workersvc.RetainedCapacityHoldFeature},
+		// Issue #3859: this api accepts the nested registration_evidence object on a `running`
+		// report ({register_nonce, claim_generation, registration_epoch}) and answers
+		// registration_evidence "recorded" | "refused" on the ACK, whether or not the status write
+		// applied. Advertised UNCONDITIONALLY: a worker sends the object ONLY after seeing this
+		// token, because an older api's strict decoder 400s the unknown field.
+		{"run_registration_evidence_v1"},
 		{"recovery_cause_retained_recovery_adoption_failed"},
 		{"recovery_cause_data_volume_full"},
 		// PRD #1733: this api accepts {status:"recovery_wait", recovery_cause:"provider_outage"}
@@ -474,6 +486,8 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		// the roster. Advertised UNCONDITIONALLY: an older api's strict decoder 400s the
 		// unknown field, so a worker sends it only after seeing this token.
 		{"repo_agent_folder"},
+		{workersvc.RepoAgentSourceFeature},
+		{workersvc.PlanAgentSourceFeature},
 		{"terminal_rejection_report"}, // Issue #1974 M1; independent of active snapshots.
 		// Issue #3181: this api accepts {status:"credential_switch_held"} and
 		// {status:"credential_switch_hold_settled"} (each with claim_generation AND the reporting worker's
@@ -481,6 +495,13 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		// with disposition "held" / "hold_settled". Advertised UNCONDITIONALLY: a worker sends
 		// the two reports ONLY after seeing this token, because an older api 400s the unknown states.
 		{"credential_switch_hold"},
+		// Issue #3985: this api accepts {status:"clarification_settled", claim_generation,
+		// clarification_settlement:{question_id, revision_input_id, gate_revision}} and answers it
+		// with disposition "clarification_settled". It returns a plan cross-check run parked at
+		// awaiting_input, after a clarification asked during a human revision was answered, to its
+		// awaiting_approval gate. Advertised UNCONDITIONALLY: a worker sends the report ONLY after
+		// seeing this token, because an older api 400s the unknown state and field.
+		{"clarification_revision_settlement_v1"},
 	}
 	if publicationResumeEnabled {
 		// Issue #1324: this api accepts NEW publication intents. Omitted when
@@ -490,7 +511,7 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		groups = append(groups, []string{workersvc.PublicationResumeFeature})
 	}
 	if activeSnapshotEnabled {
-		groups = append(groups, []string{"active_run_snapshot"}) // PRD #1390 M2a
+		groups = append(groups, []string{"active_run_snapshot", capability.PendingOutcomeScopedClaimV1}) // PRD #1390 M2a
 	}
 	if heldPublicationEnabled {
 		// Issue #2545: this api accepts the step-A held-work upload. Its own group, separate from
@@ -552,6 +573,7 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 		// `heartbeat_outbox` AND a run has depth, so an older api never sees it and a
 		// current worker on a rolled-back api strips it on the generic-400 retry (D8).
 		Outbox                  json.RawMessage                    `json:"outbox"`
+		OutboxRootUnusable      json.RawMessage                    `json:"outbox_root_unusable"`
 		DindMeter               json.RawMessage                    `json:"dind_meter"`
 		DindMaintenanceReadyACK *workersvc.DindMaintenanceReadyACK `json:"dind_maintenance_ready_ack"`
 		// ActiveSnapshot is the worker's active-run snapshot (PRD #1390 M2a), its OWN isolated
@@ -610,6 +632,12 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	var rootUnusable string
+	// Isolated enum parsing drops invalid telemetry without failing liveness.
+	if len(req.OutboxRootUnusable) <= 32 {
+		_ = json.Unmarshal(req.OutboxRootUnusable, &rootUnusable)
+	}
+	h.wsvc.RecordOutboxRootUnusable(wkr.ID, rootUnusable)
 	dto := workerDTOFromWorker(updated, 0, false, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
 	h.overlayEphemeralLease(&dto, updated.LeaseSince, updated.DrainingSince)
 	h.overlayWorkerReports(&dto, updated.ID)
@@ -800,12 +828,14 @@ func parseWorkerOutbox(raw json.RawMessage, workerID uuid.UUID) []workersvc.Outb
 	out := make([]workersvc.OutboxEntry, 0, len(rawItems))
 	for _, rawItem := range rawItems {
 		var it struct {
-			RunID           string       `json:"run_id"`
-			PendingMessages *json.Number `json:"pending_messages"`
-			PendingTerminal *json.Number `json:"pending_terminal"`
-			StaleRetired    *json.Number `json:"stale_retired"`
-			BlockedReason   string       `json:"blocked_reason"`
-			Since           *json.Number `json:"since"`
+			RunID                         string          `json:"run_id"`
+			PendingMessages               *json.Number    `json:"pending_messages"`
+			PendingTerminal               *json.Number    `json:"pending_terminal"`
+			StaleRetired                  *json.Number    `json:"stale_retired"`
+			BlockedReason                 string          `json:"blocked_reason"`
+			Since                         *json.Number    `json:"since"`
+			PolicyPendingOutcomeID        json.RawMessage `json:"policy_pending_outcome_id"`
+			PolicyPendingSourceGeneration json.RawMessage `json:"policy_pending_source_generation"`
 		}
 		if err := json.Unmarshal(rawItem, &it); err != nil {
 			continue // wrong-typed entry → drop only this entry
@@ -830,7 +860,22 @@ func parseWorkerOutbox(raw json.RawMessage, workerID uuid.UUID) []workersvc.Outb
 		if !ok {
 			continue
 		}
+		// Bad optional evidence drops only those facts, never the ordinary depth.
+		var policyID string
+		var policyGeneration int64
+		var policyUUID uuid.UUID
+		if json.Unmarshal(it.PolicyPendingOutcomeID, &policyID) == nil &&
+			json.Unmarshal(it.PolicyPendingSourceGeneration, &policyGeneration) == nil &&
+			policyGeneration > 0 && policyGeneration <= (1<<53)-1 {
+			if parsed, err := uuid.Parse(policyID); err == nil && parsed != uuid.Nil && parsed.String() == policyID {
+				policyUUID = parsed
+			}
+		}
+		if policyUUID == uuid.Nil {
+			policyGeneration = 0
+		}
 		out = append(out, workersvc.OutboxEntry{
+			PolicyPendingOutcomeID: policyUUID, PolicyPendingSourceGeneration: policyGeneration,
 			RunID:           id,
 			PendingMessages: pm,
 			PendingTerminal: pt,
@@ -1439,6 +1484,10 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			httpx.ErrorReason(w, http.StatusBadRequest, "presentation_id and adopt_gate_revision require claim_generation", "claim_generation_required")
 			return
 		}
+		if errors.Is(err, workersvc.ErrRepoAgentSourceConflict) {
+			httpx.ErrorReason(w, http.StatusConflict, err.Error(), "repo_agent_source_conflict")
+			return
+		}
 		// PRD #1392 M1: the two forge-park precedence refusals are 409 with a {run, reason}
 		// body — the worker dispatches on `reason` (stale_claim stops silently; custody_unsettled
 		// falls to today's failed path). recovery_retry_not_before rides on the run (RunDTO), not
@@ -1479,10 +1528,14 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			// further reports. The 409 status is shared with an ordinary not-applied ack (an old
 			// worker that ignores the extra field still treats it as "changed nothing"); the
 			// disposition is what distinguishes a stale claim from a benign no-op.
-			httpx.JSON(w, http.StatusConflict, map[string]any{
+			stale := map[string]any{
 				"run":         h.workerRunDTO(r.Context(), run),
 				"disposition": "stale_claim",
-			})
+			}
+			if result.RegistrationEvidence != "" {
+				stale["registration_evidence"] = result.RegistrationEvidence
+			}
+			httpx.JSON(w, http.StatusConflict, stale)
 		case errors.Is(err, workersvc.ErrRunNotOwned):
 			// Issue #2950: a machine-readable reason so the worker can BLOCK (not retire) its
 			// write-ahead terminal journal instead of retrying a 404 forever. Body is exactly
@@ -1503,12 +1556,17 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			}
 			ack["applied"] = false
 			ack["reason"] = "wall_expired"
+			if result.RegistrationEvidence != "" {
+				ack["registration_evidence"] = result.RegistrationEvidence
+			}
 			httpx.JSON(w, http.StatusConflict, ack)
+		case errors.Is(err, workersvc.ErrInvalidRegistrationEvidence):
+			httpx.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, workersvc.ErrJobNeverParks):
 			// The service error text already reads "invalid run state: a job run never parks (<state>)".
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, workersvc.ErrInvalidState):
-			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, credential_switch_held, credential_switch_hold_settled, completed, failed")
+			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, credential_switch_held, credential_switch_hold_settled, clarification_settled, completed, failed")
 		default:
 			slog.Error("worker run state", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -1545,6 +1603,9 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 				ack["reason"] = "wall_pending"
 			}
 		}
+		if result.RegistrationEvidence != "" {
+			ack["registration_evidence"] = result.RegistrationEvidence
+		}
 		httpx.JSON(w, http.StatusConflict, ack)
 		return
 	}
@@ -1552,6 +1613,9 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 	if ackErr != nil {
 		httpx.Error(w, http.StatusInternalServerError, "semantic completion authority unavailable")
 		return
+	}
+	if result.RegistrationEvidence != "" {
+		ack["registration_evidence"] = result.RegistrationEvidence
 	}
 	if result.RevisionInputID != nil {
 		ack["revision_input_id"] = *result.RevisionInputID
@@ -1584,6 +1648,10 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		// Issue #3181: the settlement acknowledgement applied (or replayed): the hold is now
 		// credential_switch_unsettled and the owner's Resume is open.
 		ack["disposition"] = "hold_settled"
+	case "clarification_settled":
+		// Issue #3985: the settlement applied (or replayed): the run is back at awaiting_approval
+		// with the human revise still pending. The worker keys on this.
+		ack["disposition"] = "clarification_settled"
 	}
 	if req.State == "awaiting_approval" && gateRevision > 0 {
 		// PRD #1795 M1 (decision 5): the revision this report was answered with, allocated or
@@ -1824,7 +1892,7 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 		h.workerCodeSnapshotCleanup(w, r, wkr, runID)
 		return
 	}
-	status, recoveryRetryNotBefore, claimGeneration, holdReason, claimReleased, gateRevision, err := h.wsvc.RunOwnership(r.Context(), wkr, runID)
+	status, recoveryRetryNotBefore, claimGeneration, holdReason, claimReleased, gateRevision, cancellationRequested, err := h.wsvc.RunOwnership(r.Context(), wkr, runID)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrRunNotOwned) {
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
@@ -1847,7 +1915,12 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	body := map[string]any{"status": status, "claim_generation": claimGeneration, "inventory_guarded": guarded, "hold_reason": holdReason, "claim_released": claimReleased, "gate_revision": gateRevision}
+	// Issue #3860: cancellation_requested is the read-only signal the worker's held-seam
+	// refusal path reads. It is true only for a stop_kind='cancelled' run with a deliverable
+	// cancel input; it carries no generation or status filter of its own, so the worker acts
+	// on it only with a claimed/running status, its own claim_generation and
+	// claim_released=false from this same body. Always present, false when unknown.
+	body := map[string]any{"status": status, "claim_generation": claimGeneration, "inventory_guarded": guarded, "hold_reason": holdReason, "claim_released": claimReleased, "gate_revision": gateRevision, "cancellation_requested": cancellationRequested}
 	if recoveryRetryNotBefore != nil || status == "recovery_wait" {
 		body["recovery_retry_not_before"] = recoveryRetryNotBefore
 	}
@@ -2378,7 +2451,29 @@ func (h *Handler) WorkerListMemory(w http.ResponseWriter, r *http.Request) {
 //
 // This is a best-effort durability path: a 500 is ignored by the worker, and the
 // benign "origin moved / unsupported" outcomes are 200 skips, not errors.
+//
+// The base listeners time a request out after 15 s, too short for an upload followed by a forge
+// push, so this route extends its own deadlines through http.NewResponseController (the
+// WorkerRunHeldPublication precedent). Every budget is measured from start, captured on handler
+// entry (before the header and query validation); the deadlines themselves are set once that
+// validation has passed:
+//
+//	upload    60 s  read deadline start+upload: the body read (a stalled upload is a 408 and never
+//	                reaches the publisher)
+//	context  workersvc.PublishContextBudget  the one context handed to PublishAttested: a
+//	                live-routed push is sent within its pre-push budget and the broker waits on
+//	                it for its own ceiling
+//	service  workersvc.PublishServiceBound  PublishAttested from entry to return: the context
+//	                budget plus the detached retention work that can still run after it expires
+//	grace     15 s  writing the answer
+//
+// and the write deadline is start + upload + service + grace. The vars (worker_publish_deadline.go) are
+// named so a test can scale them, keeping the ratio. No other wrapper deadline is added: the
+// service's own bounds are the argument, and cutting the context shorter would cut the
+// request-context persist and track writes of the publish. (The detached retention bookkeeping
+// runs on retentionBookkeepingCtx, which is WithoutCancel, and is not affected.)
 func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	wkr, ok := mw.WorkerFromContext(r.Context())
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
@@ -2419,17 +2514,26 @@ func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
 	// Raw octet-stream body, NOT JSON: httpx.DecodeJSON is JSON+1 MiB only. Cap with
 	// MaxBytesReader so an over-cap pack is a truthful 413 (a split/too-large signal),
 	// not a silently truncated — and thus malformed — pack.
+	rc := http.NewResponseController(w)
+	_ = rc.SetReadDeadline(start.Add(publishUploadBudget))
+	_ = rc.SetWriteDeadline(start.Add(publishUploadBudget + publishServiceBound + publishResponseGrace))
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxPackBytes))
 	if err != nil {
 		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
+		switch {
+		case errors.As(err, &tooLarge):
 			httpx.Error(w, http.StatusRequestEntityTooLarge, "checkpoint pack too large")
-			return
+		case isUploadTimeout(err):
+			// An incomplete upload never reaches the publisher.
+			httpx.Error(w, http.StatusRequestTimeout, "checkpoint pack upload timed out")
+		default:
+			httpx.Error(w, http.StatusBadRequest, "could not read checkpoint pack")
 		}
-		httpx.Error(w, http.StatusBadRequest, "could not read checkpoint pack")
 		return
 	}
-	res, err := h.wsvc.PublishAttested(r.Context(), wkr, runID, tip, attestedSource, body, claimGeneration)
+	ctx, cancel := context.WithTimeout(r.Context(), publishContextBudget)
+	defer cancel()
+	res, err := h.wsvc.PublishAttested(ctx, wkr, runID, tip, attestedSource, body, claimGeneration)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrMissingClaimGeneration) || errors.Is(err, workersvc.ErrStaleClaim) {
 			httpx.ErrorReason(w, http.StatusConflict, "checkpoint publish claim is stale", "stale_claim")

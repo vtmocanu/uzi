@@ -1435,6 +1435,10 @@ other deterministic blockers.
   and `recovery_retry_not_before` is NULL: the fourth exhaustion is owner-held
   by default. Both forms increment lifetime `recovery_wait_count`, which does
   not set this cause's cadence. Owner Resume preserves the count and cap.
+  Since #4046 a park carrying the validated `retained_capacity_only: true`
+  marker takes the at-cap form at any prior count: no increment, NULL retry
+  ([#4046 amendment](#amendment-2026-11-07-4046-capacity-only-retained-exhaustion-holds-for-the-owner)).
+  An unmarked park keeps the rule above. (AI-synced 2026-11-07)
 - Automatic parks do not change stored `worker_recovery_episode` or
   `requeue_episode_baseline`. All four claim builders (ordinary, chat, job,
   judge) project `worker_recovery_episode = stored worker_recovery_episode +
@@ -1471,6 +1475,15 @@ Transport/server errors and unconfirmed 2xx responses enter bounded
 reconciliation and preserve a nonterminal retained stop. Only returned status
 and cause confirm the park; stale, cancelled or newer outcomes stop without a
 terminal report. Budget exhaustion does not require a new capture it prevents.
+
+Since #4046 (AI-synced 2026-11-07), after the same readback the worker first
+sends the park with `retained_capacity_only: true` when the window was
+capacity-only and the API advertised `retained_recovery_capacity_hold_v1`; the
+same two-report reconciliation applies per pass. An explicit 400 to the marked
+report leads to exactly one unmarked pass, which follows the rules above,
+except that after an unresolved marked report a 400 in the unmarked pass stops
+the flight nonterminally instead of taking the terminal fallback. See the
+[#4046 amendment](#amendment-2026-11-07-4046-capacity-only-retained-exhaustion-holds-for-the-owner).
 
 An applied park atomically releases the **execution claim** and fences late
 same-generation state, completion and snapshot reports. It retains `worker_id`,
@@ -1809,3 +1822,211 @@ Mixed-version limits, all fail closed:
 - C1b binary against the C2 schema: it never writes the new `prerequisite_closure` evidence or `final_closure_id`.
 
 Accepted residuals: a thin FINAL stays stuck and is retried while the pin or the feature is unavailable; available-pin audits run at about 24 hours, so an external deletion can go unnoticed for up to a day before release-time listing records the absence and refuses; an external writer deleting or rewriting the pin after release defeats restore (the external-writer residual above is unchanged). A closure-released hold remains not history-safe for forge placement (`fn_forge_source_history_safe` is unchanged).
+
+## Amendment 2026-11-06, #3994: transient API connection failures retry the ownership check in place
+
+Decision record (AI-synced 2026-11-06). This qualifies the #3527 owner hold
+([amendment](#amendment-2026-10-27-3527-owner-held-retained-adoption-retry)) for a class of
+failures, motivated by one observed failure: during a release rollout, the worker's post-adoption
+ownership check failed (logged `fetch failed`, then
+`retained_successor_post_adoption_check`) for a verified, journaled retained
+successor. The rollout timing is consistent with temporary API unavailability,
+but the evidence does not identify the error (cause code) of the ownership
+request, and the adoption-failure owner hold in that generation was not
+confirmed. If that error was not one of the codes retried below (for example a
+DNS failure or a timeout), this change would not have avoided the hold. Before
+this change, any failure of that check that was not a stop followed the
+`adoption_failed` path, including a short connection outage in which no
+integrity check had failed.
+
+**Decision.** After `prepareRecoverySuccessor` has verified and journaled the
+successor, the worker's read-only ownership check (and the second check in the
+Codex/safety branch after executor disposal) retries in place when, and only
+when, the failure is positively classified as a temporary API connection
+problem. It runs on the same claim and successor: no recapture, no second
+successor and no extra recovery-attempt charge.
+
+**Classifier.** Qualifying: a request that failed before any response whose
+cause code is `ECONNREFUSED`, `ECONNRESET` or `UND_ERR_SOCKET`, or an ownership
+route answer of 502, 503 or 504. The transport case requires a marker recorded
+on the rejection of the fetch promise itself, so a failure while reading a
+response body (a truncated 200 surfaces with the same `UND_ERR_SOCKET` shape)
+never qualifies. The marker is by object identity, and abort reasons are not
+marked. Unknown errors, malformed responses, other statuses, deadline expiry,
+ownership or claim loss, and cancel, pause, stop or credential switch keep their
+existing outcomes.
+
+**Cap and deadline.** At most 5 attempts, with delays of 1, 2, 4 and 8 times the
+recovery retry interval (about 15 s by default), always inside the iteration's
+existing deadline. If the deadline actually passes, the outcome is the existing
+`budget_exhausted`. If retries are exhausted, the failure is not positively
+transient, or the next wait would not fit before the deadline, the helper gives
+up and the site's existing outcome follows. For the first check that is the
+existing `adoption_failed` path: an owner hold at `recovery_wait` /
+`retained_recovery_adoption_failed` when its existing preconditions hold (API
+feature, persisted blocker, proven quiescence), otherwise the existing generic
+failure with custody kept. For the second check in the Codex/safety branch it is
+the existing `quiescence_failed` blocker, a failure with custody kept and not an
+owner hold.
+
+**Unchanged.** No new status, no API change and no persistence: retry state is
+in-process only, so a worker restart starts the check afresh. The #3527 hold
+keeps no automatic retry, and a genuine adoption failure still holds. This makes
+no durability claim beyond the bounded in-process window.
+
+## Amendment 2026-11-07, #4046: capacity-only retained exhaustion holds for the owner
+
+Decision record (AI-synced 2026-11-07). Owner-approved policy (2026-11-07): this
+narrows the [#3495 amendment](#amendment-2026-10-26-3495-bounded-retained-recovery-parks)
+and the [ADR-1809](1809-per-run-cache-bounds.md) #3865 seed-admission text for
+one case. When every recovery attempt in a retained window was refused because
+the successor volume lacked capacity (`RetainedSeedCapacityShortfall`), timed
+retries only repeat the same refusal against the same volume and spend the
+retained-park allowance. Such a window now holds for the owner instead.
+
+**Worker authorization.** The worker keeps an in-memory tally of the
+reservations its own flight witnessed in the window. It marks the park only
+when all of these hold:
+
+- the window began in this flight (its first witnessed reservation was attempt
+  1), at least one iteration was observed, and the observed count equals the
+  witnessed attempts;
+- every observed iteration failed with the capacity shortfall; a reservation
+  step that then fails only because the window or clock is spent (typed
+  `RecoveryBudgetExhaustedError` / `RecoveryDeadlineExhaustedError`) does not
+  count against it, but any other reservation failure does;
+- the persisted `budget_exhausted` blocker was read back with the exact
+  witnessed start, deadline, attempts, episode and claim generation;
+- the API advertised `retained_recovery_capacity_hold_v1` at register.
+
+Mixed windows (any non-capacity failure), deadline-only windows, a window
+charged by an earlier flight and a blocked-journal re-hold send today's
+unmarked park. The cause is unchanged (`retained_recovery_exhausted`); the
+marker is request-only and the worker records nothing new.
+
+**API.** `retained_capacity_only` is validated before any SQL or
+registration-evidence write: it must be `true` and ride `recovery_wait` with
+cause `retained_recovery_exhausted` and a positive `claim_generation`, else
+400 (`ErrInvalidState`). A valid marked park takes the at-cap branch at every
+prior count: `retained_park_count` is not incremented and
+`recovery_retry_not_before` is NULL, so the run is an owner-held
+`recovery_wait`. Everything else is the existing park: execution claim released
+and late same-generation reports fenced, `worker_id`, session and open custody
+holds kept, `recovery_wait_count` incremented. It is not a disk park
+(`disk_park_count` unchanged) and resets no budget. Nothing is persisted, so
+CLI, TUI and web show the same owner-held state as an at-cap hold. Enforcing
+code: `validateRetainedCapacityOnly` and `parkRetainedRecovery` in
+[retainedpark.go](../api/internal/workersvc/retainedpark.go).
+
+**Worker reporting.** One body object serves each pass, so a lost-ACK replay is
+byte-identical. A 400 to the marked report means the API may not understand the
+marker (rollback-safe): exactly one unmarked pass follows. If an earlier marked
+report was left unresolved (the park may already have landed), a 400 in the
+unmarked pass stops the flight nonterminally and never fails the run. A
+confirmed marked park emits one run-feed status ("retained recovery held for
+owner: ..."). Mechanism: `parkRetainedRecoveryExhausted` and the retained loop
+in `agent/src/runner.ts`.
+
+**Owner actions.** Existing Resume renews through stored
+`worker_recovery_episode + 1` and grants one more window; a further
+capacity-only window holds again. Cancel is unchanged. A #3995 deferred owner
+pause is unchanged: the owner hold wins and the pause stays pending
+server-side ([ADR-1190 #3995 amendment](1190-run-pause-invariants.md#amendment-2026-11-06--3995-owner-pause-during-retained-recovery)).
+
+**Trade-offs.** Freeing headroom alone no longer auto-resumes such a run; owner
+Resume is required. The hold keeps `worker_id`, so it can delay that worker's
+image roll. A non-claim after Resume is the separate capability and image-roll
+cycle tracked in #4047, not part of this hold. Deploy order is unchanged:
+API first; an older API omits the feature and the worker sends no marker.
+
+**Related.** #2969 (predecessor guarded-hold settlement; its PR #3992 is in
+this base, see the [ADR-1296 #2969 amendment](1296-durable-run-recovery.md#amendment-2969-predecessor-guarded-hold-settlement-is-built-and-disabled-in-production)),
+#4001 and #4003 are related retained-recovery work; this amendment changes none
+of them.
+
+## Amendment 2026-11-07, #4058: a successor holds for its owner when a terminal predecessor's source is under remediation
+
+Decision record (AI-synced 2026-11-07). This extends the admission in the #3527 owner hold
+([amendment](#amendment-2026-10-27-3527-owner-held-retained-adoption-retry)) to one exact
+owner-journal classification, made before any effect, and qualifies the #3527 wording that the
+`retained_recovery_adoption_failed` cause means persisted `adoption_failed`, proven quiescence and
+preserved local work. For this classification the cause means only that the worker did not start the
+agent because the predecessor's source is held under secret-scan remediation. Nothing was adopted and
+no quiescence was proven.
+
+**The case.** A successor run reclaims an orphaned attempt whose predecessor is terminal (for example
+cancelled). The predecessor's recovery journal carries an active secret-scan `remediationRecovery`
+record bound to the same run, clone path and branch. Before this change the release or retire refused
+with an untyped error (subreason `unknown`) and the successor failed terminally; a retained journal was
+instead detached and the successor proceeded.
+
+**Decision.**
+
+- **Classification.** `readOrphanJournalFence` reports `remediation: "exact"` only when the record's
+  branch equals the classifier's branch. A schema-valid cross-branch record is `mismatch`, which keeps
+  the existing path_error refusal. The three refusal sites (release, retire and the new guard in
+  `detachTerminalRetained`) throw a typed `RemediationRecoveryRetainedError`. The closed subreason is
+  `remediation_retained`.
+- **Before any effect.** An exact classification emits `orphan_reclaim_refused` (stage
+  `completion_handoff`, reason `completion_retirement_pending`, subreason `remediation_retained`)
+  before the fenced handoff, retained detach, quiescence, release or retire. The worker then touches
+  nothing of the predecessor: journal, ledger, descriptors, source and custody hold are left as they
+  are.
+- **No quiescence proof.** The #3527 hold requires fresh quiescence because it reports on a source the
+  worker adopted. Here nothing is touched or adopted, so there is nothing to prove quiescent.
+- **Guidance and park.** The worker sends a status message naming only the predecessor run id. It says
+  the agent did not start, the source is held under secret-scan remediation and requires review, Resume
+  on this worker holds again and adds at least one admission-counted custody hold, Cancel ends the run,
+  and `uzi run recovery <predecessor>` inspects it. It confirms delivery (10 s) and parks even if
+  delivery is unconfirmed. It parks through the existing writer at `recovery_wait` /
+  `retained_recovery_adoption_failed`, then stops nonterminal. There is no new cause, wire field or
+  schema change. A 400 refusal of the park is logged and followed by a corrected status.
+- **Races.** A remediation record that appears after classification hits the typed refusal, and a
+  re-read then holds (exact), refuses (mismatch), readmits (changed or absent) or stops nonterminal
+  (unreadable or expired).
+- **No new authority.** Nothing here retires, rebinds or discards remediation. Resume grants no
+  remediation authority: the next claim classifies the same journal and holds again.
+  The ADR-1296 enrolled-retirement refusal is unchanged (see its amendment note).
+
+**Accounting (measured by LiveDB in `remediation_hold_accounting_livedb_test.go`; the writers are unchanged).**
+
+- A positively ACKed immediate park ends that claim: retry NULL, `requeue_count` and
+  `retained_park_count` unchanged, claim released, affinity kept. The positively confirmed claim adds
+  one hold. Earlier unconfirmed claims in the same episode remain counted, so this is not one claim
+  per episode.
+- Charged paths consume `RUN_MAX_REQUEUES` per episode and end at `recovery_wait` /
+  `worker_requeue_exhausted`, never `failed`: running omissions
+  (`RequeueRunsMissingFromSnapshot`, `failRunsMissingFromSnapshotLocked`), genuine departure stamps
+  (`LockClaimedNeverStartedContinuations`) and a worker re-register. Register's orphan recovery
+  (`RequeueWorkerRuns`) charges `requeue_count`, and over the cap `failWorkerRunsOverCapLocked` parks
+  the run (measured: 4 claims and 4 holds at `RUN_MAX_REQUEUES=3`). A worker restart is therefore a
+  charged path. When `custody_hold_limit` is below the claims that path needs (L ≤ `RUN_MAX_REQUEUES`, for example L=3
+  with `RUN_MAX_REQUEUES=3`), admission refuses the next claim first and the run stays queued for capacity
+  rather than reaching the exhaustion park (derived from the admission rule `own holds >= L`, not measured
+  on the restart path). After a fenced completion handoff, an expired or unreadable re-read sees no record,
+  so a record enrolled during the handoff leaves the handoff outcome's own disposition in place (an
+  accepted race; never a hold without exact evidence).
+- A claim lost before any running report, listing or registration evidence, with no restart, is reset
+  uncharged by `SweepClaimedNeverStarted`, repeatedly, including after Resume. It is bounded only by
+  the run's own open holds reaching `custody_hold_limit` L (default 8): then `ClaimRun` refuses and the
+  run stays queued with the custody-capacity reason. That queued state is not an owner park. Measured: 8
+  at L=8, 3 at L=3, 7 more after a park plus Resume.
+- A worker that is online with current presence parks as `recovery_wait` /
+  `retained_continuation_unwitnessed`, uncharged (measured for a continuation claim whose running
+  report never landed). The successor reports `running` before the orphan reclaim, so this arm and the
+  uncharged reset above apply only when that first running report is lost or refused.
+- Run-lifetime bound: this run's own open holds stay at or below L, on the premise that none is
+  released. This does not claim that owner aggregate custody is a transactional ceiling, or that the
+  owner's other runs are always blocked.
+- Disclosed: while held or queued, the run's holds are admission-counted and can reduce the owner's
+  capacity. While held it blocks the worker's upgrade or drain, like any owner-held cause. Owner Cancel
+  of a held successor is terminal and leaves its open hold or holds open (measured 1 to 1) for owner
+  discard; cleanup uses the existing owner discard after normal inspection.
+
+**Fallback.** If the api lacks the retained-recovery feature, the worker does not park, and the guidance
+says so. The same charged and uncharged arms above apply, with no owner hold.
+
+**Observed, not authorized.** `agent/test/git-orphan-remediation.test.ts` pins that the existing
+protected `discardProtectedSource` removes the source and clears the journal, remediation record
+included. That is observed behaviour of the existing owner discard, which requires review. It is not an
+authorized disposal route for remediation, and this amendment names none.

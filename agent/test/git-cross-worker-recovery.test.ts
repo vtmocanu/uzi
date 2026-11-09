@@ -7,7 +7,7 @@ import path from "node:path";
 import type { Readable } from "node:stream";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, recordingLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
-import { GitCache, WIP_PARK_COMMIT_PREFIX } from "../src/git.js";
+import { GitCache, OVERLAY_COMMIT_PREFIX, WIP_PARK_COMMIT_PREFIX } from "../src/git.js";
 import { TickSpawner } from "../src/tick-spawner.js";
 import { createHash } from "node:crypto";
 
@@ -298,6 +298,7 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
       sourceAllowance: 5, indexAllowance: 2 * 1024 * 1024,
       pathAllowance: 20000, entryAllowance: 30000, directoryAllowance: 2048,
       ignoreAllowance: 128 * 1024 * 1024, ignorePipeAllowance: 2 * 1024 * 1024,
+      baseDiscoveryEntryCap: 1_200_000, baseDiscoveryPathByteCap: 96 * 1024 * 1024,
     });
     assert.equal(await captureRecovered(gitB, rc, bareB), "");
     // The recovered M1/M2 and default files exceed five bytes; only new source consumes the allowance.
@@ -1131,8 +1132,540 @@ describe("GitCache.hasCommittedCheckpoint (#2967 floor-tree recovery coverage)",
     assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch), true);
   });
 
+  it("#2753 allows a chain C=[M, M2] of two marker-only parks over the floor, blocks C=[M, N] with real N", async () => {
+    const f = await coverageFixture();
+    const subject = `${WIP_PARK_COMMIT_PREFIX} interrupted work auto-saved`;
+    const chainSubject = "ckpt(overlay): chain .github/workflows from checkpoint (test)";
+    // Parked WIP changes the tree, so a marker's tree is not the floor's tree.
+    const wipTree = gitIn(f.bare, ["mktree"]);
+    assert.notEqual(wipTree, f.tree);
+    const m = mkCommit(f.bare, wipTree, [f.floor], subject);
+    const m2 = mkCommit(f.bare, wipTree, [f.floor], `${subject} again`);
+    const c = mkCommit(f.bare, wipTree, [m, m2], chainSubject);
+    gitIn(f.bare, ["update-ref", `refs/uzi-checkpoints/${f.branch}`, c]);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch), false,
+      "marker-only chain over the floor is not committed work");
+    const n = mkCommit(f.bare, wipTree, [f.floor], "real committed work");
+    const cn = mkCommit(f.bare, wipTree, [m, n], chainSubject);
+    gitIn(f.bare, ["update-ref", `refs/uzi-checkpoints/${f.branch}`, cn]);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch), true,
+      "a chain whose real tip is committed work still blocks");
+    // The peel's history check: a real side parent is committed work, so no peel.
+    const cx = mkCommit(f.bare, wipTree, [n, m2], chainSubject);
+    gitIn(f.bare, ["update-ref", `refs/uzi-checkpoints/${f.branch}`, cx]);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch), true,
+      "a chain with a real committed side parent still blocks");
+    // A merge-shaped look-alike marker as the peeled tip is not a park marker.
+    const forged = mkCommit(f.bare, wipTree, [f.floor, n], `${subject} forged`);
+    const cf = mkCommit(f.bare, wipTree, [m, forged], chainSubject);
+    gitIn(f.bare, ["update-ref", `refs/uzi-checkpoints/${f.branch}`, cf]);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch), true,
+      "a two-parent marker under a chain still blocks");
+  });
+
   it("#2967 still allows an absent checkpoint without a confirmed publication", async () => {
     const f = await coverageFixture();
     assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch), false);
+  });
+});
+
+describe("GitCache.hasCommittedCheckpoint (#3944 stale local mirror, attempted tip, tri-state proof)", () => {
+  const MARKER = `${WIP_PARK_COMMIT_PREFIX} interrupted work auto-saved`;
+  /** A tree no other object shares: deleting it breaks nothing else. */
+  function uniqueTree(bare: string, content: string): string {
+    const blob = execFileSync("git", ["-C", bare, "hash-object", "-w", "--stdin"],
+      { env: GIT_ENV, input: content, encoding: "utf8" }).trim();
+    return execFileSync("git", ["-C", bare, "mktree"],
+      { env: GIT_ENV, input: `100644 blob ${blob}\tfile.txt\n`, encoding: "utf8" }).trim();
+  }
+
+  function rmObject(bare: string, oid: string): void {
+    fs.unlinkSync(path.join(bare, "objects", oid.slice(0, 2), oid.slice(2)));
+  }
+
+  /** Counts calls of the private origin probe without changing its behaviour. */
+  function spyProbe(git: GitCache): { calls: number } {
+    const counter = { calls: 0 };
+    const target = git as unknown as { originCheckpointRefState: (...args: unknown[]) => Promise<unknown> };
+    const original = target.originCheckpointRefState.bind(git);
+    target.originCheckpointRefState = (...args: unknown[]) => {
+      counter.calls++;
+      return original(...args);
+    };
+    return counter;
+  }
+
+  async function fixture() {
+    // origin/main has a parent so an OLDER boundary commit (olderFloor) exists below the floor.
+    advanceOriginMain("advanced.txt", "default branch advanced\n");
+    const git = worker("stale-mirror");
+    const bare = await git.ensureClone(fx.originPath);
+    const branch = "agent/issue-3944";
+    const ref = `refs/uzi-checkpoints/${branch}`;
+    const floor = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
+    const olderFloor = gitIn(bare, ["rev-parse", `${floor}^`]);
+    const floorTree = gitIn(bare, ["rev-parse", `${floor}^{tree}`]);
+    const olderTree = gitIn(bare, ["rev-parse", `${olderFloor}^{tree}`]);
+    const workTree = uniqueTree(bare, "predecessor work\n");
+    const work = mkCommit(bare, workTree, [olderFloor], "predecessor work");
+    // The incident shape: a single commit carrying its parent's (the floor's) tree.
+    const contentFree = mkCommit(bare, floorTree, [floor], "uzi recovery coverage round 0 batch 0");
+    const mirror = (tip: string) => gitIn(bare, ["update-ref", ref, tip]);
+    const originRef = (tip: string) => gitIn(bare, ["push", fx.originPath, `${tip}:${ref}`]);
+    return { git, bare, branch, ref, floor, olderFloor, floorTree, olderTree, workTree, work, contentFree, mirror, originRef };
+  }
+
+  it("g1 discounts a provably work-bearing stale mirror only with the origin probe, and absent-on-origin", async () => {
+    const f = await fixture();
+    f.mirror(f.work);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch), true, "no opts: unchanged blocking");
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, {}), true,
+      "opts without a probe: unchanged blocking");
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), false,
+      "provable work, origin answers absent: discounted");
+  });
+
+  it("g14 a failed read of the origin-branch floor is unprovable: no fallback floor, no probe, blocks", async () => {
+    const f = await fixture();
+    f.mirror(f.work);
+    // The default floor stays readable; only reads naming origin's copy of the branch fail with a
+    // real non-1 exit. A collapsed "absent" answer would fall back to the default floor, find
+    // provable work there and let the origin probe discount it.
+    const branchFloor = `refs/remotes/origin/${f.branch}`;
+    const seam = f.git as unknown as { execScoped: (cmd: string, args: string[], ...rest: unknown[]) => Promise<unknown> };
+    const original = seam.execScoped.bind(f.git);
+    seam.execScoped = async (cmd, args, ...rest) => {
+      if (args.some(a => a.includes(branchFloor))) {
+        throw Object.assign(new Error(`Command failed: git ${args.join(" ")}`), { code: 128, stderr: "fatal: unable to read ref" });
+      }
+      return original(cmd, args, ...rest);
+    };
+    const probe = spyProbe(f.git);
+    try {
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), true,
+        "an unreadable branch floor must not fall back to the default floor and be discounted");
+      assert.equal(probe.calls, 0, "unprovable proof never consults the origin probe");
+    } finally {
+      seam.execScoped = original;
+    }
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), false,
+      "control: with the floor read restored the same state is discounted");
+  });
+
+  it("g15 a real corrupt loose origin-branch floor ref is not proven absent: blocks, no probe", async () => {
+    const f = await fixture();
+    f.mirror(f.work);
+    // A broken loose ref file: show-ref/rev-parse report it exactly like a missing ref (exit 1),
+    // so an exit-code absence check would fall back to the default floor and discount the work.
+    const refFile = path.join(f.bare, "refs", "remotes", "origin", ...f.branch.split("/"));
+    fs.mkdirSync(path.dirname(refFile), { recursive: true });
+    fs.writeFileSync(refFile, "not-an-object-id\n");
+    const probe = spyProbe(f.git);
+    try {
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), true,
+        "a corrupt branch-floor ref must not be read as absent");
+      assert.equal(probe.calls, 0, "unprovable proof never consults the origin probe");
+    } finally {
+      fs.unlinkSync(refFile);
+    }
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), false,
+      "control: with the ref genuinely absent the same state is discounted");
+  });
+
+  it("g16 a real dangling symref at the origin-branch floor is not proven absent: blocks, no probe", async () => {
+    const f = await fixture();
+    f.mirror(f.work);
+    // for-each-ref skips a dangling symref silently (rc 0, no output, no warning), exactly like a
+    // missing ref; only the loose ref file betrays it.
+    const refFile = path.join(f.bare, "refs", "remotes", "origin", ...f.branch.split("/"));
+    fs.mkdirSync(path.dirname(refFile), { recursive: true });
+    fs.writeFileSync(refFile, "ref: refs/heads/no-such-branch\n");
+    const probe = spyProbe(f.git);
+    try {
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), true,
+        "a dangling symref branch floor must not be read as absent");
+      assert.equal(probe.calls, 0, "unprovable proof never consults the origin probe");
+    } finally {
+      fs.unlinkSync(refFile);
+    }
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), false,
+      "control: with the ref genuinely absent the same state is discounted");
+  });
+
+  it("g12 a discount writes no ref in the bare or on origin", async () => {
+    const f = await fixture();
+    f.mirror(f.work);
+    const before = gitIn(f.bare, ["for-each-ref", "refs/"]);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), false);
+    assert.equal(gitIn(f.bare, ["for-each-ref", "refs/"]), before, "bare refs unchanged by the discount");
+    assert.equal(gitIn(f.bare, ["rev-parse", f.ref]), f.work, "the mirror still names the predecessor tip");
+    assert.equal(gitIn(fx.originPath, ["for-each-ref", "refs/uzi-checkpoints/"]), "", "origin gained no ref");
+  });
+
+  it("g2 blocks when the mirror ref is present on origin", async () => {
+    const f = await fixture();
+    f.mirror(f.work);
+    f.originRef(f.work);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), true);
+  });
+
+  it("g3 blocks when the origin probe fails", async () => {
+    const f = await fixture();
+    f.mirror(f.work);
+    const url = gitIn(f.bare, ["config", "--get", "remote.origin.url"]);
+    gitIn(f.bare, ["config", "remote.origin.url", path.join(fx.dataDir, "no-such-origin")]);
+    try {
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), true);
+    } finally {
+      gitIn(f.bare, ["config", "remote.origin.url", url]);
+    }
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), false,
+      "control: with the URL restored the same state is discounted");
+  });
+
+  /** Scope a runGit stub to the `ls-remote` call only; every other call goes to the real runGit. */
+  function stubLsRemote(git: GitCache, answer: string): () => void {
+    const target = git as unknown as { runGit: (...args: unknown[]) => Promise<string> };
+    const original = target.runGit.bind(git);
+    target.runGit = (...args: unknown[]) => {
+      const argv = args[1] as string[];
+      return argv.includes("ls-remote") ? Promise.resolve(answer) : original(...args);
+    };
+    return () => { target.runGit = original; };
+  }
+
+  const SHA_A = "a".repeat(40);
+  const SHA_B = "b".repeat(40);
+  for (const [name, answer] of [
+    ["a well-formed line naming a different ref", `${SHA_A}\trefs/uzi-checkpoints/agent/issue-other\n`],
+    ["two lines", `${SHA_A}\trefs/uzi-checkpoints/agent/issue-3944\n${SHA_B}\trefs/uzi-checkpoints/agent/issue-3944\n`],
+    ["a malformed line", "not-a-sha refs/uzi-checkpoints/agent/issue-3944\n"],
+    ["a short sha", `${"a".repeat(39)}\trefs/uzi-checkpoints/agent/issue-3944\n`],
+  ] as const) {
+    it(`g3 blocks when ls-remote answers ${name} (unknown, not absent)`, async () => {
+      const f = await fixture();
+      f.mirror(f.work);
+      const restore = stubLsRemote(f.git, answer);
+      try {
+        assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), true);
+      } finally {
+        restore();
+      }
+    });
+  }
+
+  it("g3 control: an empty ls-remote answer through the same stub is absent (discounted)", async () => {
+    const f = await fixture();
+    f.mirror(f.work);
+    const restore = stubLsRemote(f.git, "");
+    try {
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), false);
+    } finally {
+      restore();
+    }
+  });
+
+  it("g3 the probe's ls-remote receives pat, the http scope of the repo url, and username", async () => {
+    const f = await fixture();
+    f.mirror(f.work);
+    const target = f.git as unknown as { runGit: (...args: unknown[]) => Promise<string> };
+    const original = target.runGit.bind(f.git);
+    let lsRemote: unknown[] | undefined;
+    target.runGit = (...args: unknown[]) => {
+      if ((args[1] as string[]).includes("ls-remote")) {
+        lsRemote = args;
+        return Promise.resolve("");
+      }
+      return original(...args);
+    };
+    const probe = { pat: "fixture-pat-value", repoUrl: "https://forge.example.test/org/repo.git", username: "fixture-user-value" };
+    try {
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: probe }), false);
+    } finally {
+      target.runGit = original;
+    }
+    assert.ok(lsRemote, "ls-remote ran");
+    assert.deepEqual(lsRemote!.slice(2), ["fixture-pat-value", "https://forge.example.test/", "fixture-user-value"]);
+  });
+
+  it("g13 marker path: a non-0/1 merge-base exit or an unreadable/malformed parents row is refused", async () => {
+    const f = await fixture();
+    const onFloor = mkCommit(f.bare, f.workTree, [f.floor], MARKER);
+    const opts = { attemptedTip: onFloor };
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), false, "control");
+    // The marker-path parents read goes through runGitWithEnv (original-object read env).
+    const target = f.git as unknown as {
+      runGitWithEnv: (...args: unknown[]) => Promise<string>;
+      tryGitExit: (...args: unknown[]) => Promise<number | null>;
+    };
+    const origRun = target.runGitWithEnv.bind(f.git);
+    const origExit = target.tryGitExit.bind(f.git);
+    try {
+      target.tryGitExit = (...args: unknown[]) => {
+        const argv = args[1] as string[];
+        return argv.includes("--is-ancestor") ? Promise.resolve(128) : origExit(...args);
+      };
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), true, "exit 128");
+      target.tryGitExit = origExit;
+      for (const behaviour of ["throw", "malformed"] as const) {
+        target.runGitWithEnv = (...args: unknown[]) => {
+          const argv = args[1] as string[];
+          if (argv.includes("rev-list") && argv.includes("--no-replace-objects")) {
+            return behaviour === "throw" ? Promise.reject(new Error("boom")) : Promise.resolve("garbage\n");
+          }
+          return origRun(...args);
+        };
+        assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), true, behaviour);
+      }
+    } finally {
+      target.runGitWithEnv = origRun;
+      target.tryGitExit = origExit;
+    }
+  });
+
+  it("g13 marker path: the floor-ancestry check ignores refs/replace (a replaced floor must not hide parent work)", async () => {
+    const f = await fixture();
+    // The marker's single parent carries work and is not an ancestor of the real floor.
+    const marker = mkCommit(f.bare, f.floorTree, [f.work], MARKER);
+    const opts = { attemptedTip: marker };
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), true, "control: real parent blocks");
+    // Replace the FLOOR with a commit that lists the work as a parent: honouring replace objects
+    // would make the work look like an ancestor of the floor, i.e. marker-only.
+    const replacement = mkCommit(f.bare, f.floorTree, [f.olderFloor, f.work], "replacement floor");
+    gitIn(f.bare, ["replace", f.floor, replacement]);
+    assert.ok(gitIn(f.bare, ["rev-list", "-n", "1", "--parents", "refs/remotes/origin/main"]).split(" ").includes(f.work),
+      "sanity: with replace objects honoured the floor lists the work as a parent");
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), true,
+      "a replace ref on the floor must not turn parent work into marker-only");
+  });
+
+  for (const [label, subject] of [
+    ["wip(park) marker", MARKER],
+    // Single-parent replacement: this variant only covers the tip's own subject read; the overlay
+    // peel needs a two-parent tip and is covered by the "peel" tests below.
+    ["single-parent ckpt(overlay) look-alike (no peel reached)", `${OVERLAY_COMMIT_PREFIX} look-alike`],
+  ] as const) {
+    it(`g13 a refs/replace commit with a ${label} subject must not hide a content-bearing attempted tip`, async () => {
+      const f = await fixture();
+      // Substantive commit over the floor; its replacement has the same parent but a marker subject.
+      const substantive = mkCommit(f.bare, f.workTree, [f.floor], "substantive attempted work");
+      const opts = { attemptedTip: substantive };
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), true, "control: no replace");
+      const lookAlike = mkCommit(f.bare, f.floorTree, [f.floor], subject);
+      gitIn(f.bare, ["replace", substantive, lookAlike]);
+      assert.ok(gitIn(f.bare, ["log", "-1", "--format=%s", substantive]).startsWith(subject.split(":")[0]!),
+        "sanity: a plain read honours the replacement");
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), true,
+        "the replace ref must not make the substantive tip look like a content-free marker");
+    });
+  }
+
+  /** Peel-shaped tip: overlay C with parents [M, L]; L a genuine single-parent wip(park) marker over
+   *  the under-floor commit, M a published marker over the same commit. `tipTree` is C's own tree. */
+  function peelShape(f: Awaited<ReturnType<typeof fixture>>, lTree: string, tipTree: string) {
+    // Distinct subjects: commit-tree is deterministic within a second, so equal inputs would give M === L.
+    const marker = mkCommit(f.bare, f.workTree, [f.olderFloor], `${MARKER} (published)`);
+    const last = mkCommit(f.bare, lTree, [f.olderFloor], MARKER);
+    const overlay = mkCommit(f.bare, tipTree, [marker, last], `${OVERLAY_COMMIT_PREFIX} transport`);
+    return { marker, last, overlay };
+  }
+
+  it("g13 peel: a wrapper-only overlay over a genuine park marker peels to content_free (control)", async () => {
+    const f = await fixture();
+    const p = peelShape(f, f.olderTree, f.olderTree);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, { attemptedTip: p.overlay }), false);
+    // And the peel is what decides it: the same overlay carrying real work in its own tree blocks.
+    const withWork = peelShape(f, f.olderTree, f.workTree);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, { attemptedTip: withWork.overlay }), true);
+  });
+
+  it("g13 peel: a replace ref that makes a work-bearing overlay look wrapper-only must not enable the peel", async () => {
+    const f = await fixture();
+    const real = peelShape(f, f.olderTree, f.workTree);
+    const opts = { attemptedTip: real.overlay };
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), true, "control: no replace");
+    // Same parents and subject, but L's tree: diff-tree L..C' is empty (merge-shaped), so the
+    // wrapper-only check passes if it reads the replacement.
+    const replacement = mkCommit(f.bare, f.olderTree, [real.marker, real.last], `${OVERLAY_COMMIT_PREFIX} transport`);
+    gitIn(f.bare, ["replace", real.overlay, replacement]);
+    assert.equal(gitIn(f.bare, ["rev-parse", `${real.overlay}^{tree}`]), f.olderTree, "sanity: a plain read honours the replacement");
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), true,
+      "the replacement must not make the original overlay's work look like a workflow-only swap");
+  });
+
+  for (const [label, victim] of [["overlay tip", "overlay"], ["last parent", "last"]] as const) {
+    it(`g13 peel: a replaced ${label} subject must not defeat a genuine peel`, async () => {
+      const f = await fixture();
+      // L's tree carries the WIP (as real park markers do); only the peel makes this content-free.
+      const p = peelShape(f, f.workTree, f.workTree);
+      const opts = { attemptedTip: p.overlay };
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), false, "control: no replace");
+      const target = victim === "overlay" ? p.overlay : p.last;
+      const parents = victim === "overlay" ? [p.marker, p.last] : [f.olderFloor];
+      gitIn(f.bare, ["replace", target, mkCommit(f.bare, f.workTree, parents, "plain commit")]);
+      assert.equal(gitIn(f.bare, ["log", "-1", "--format=%s", target]), "plain commit", "sanity: a plain read honours the replacement");
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), false,
+        "original-object subjects decide the peel");
+    });
+  }
+
+  describe("info/grafts (N1)", () => {
+    function writeGrafts(bare: string, lines: string[]): void {
+      fs.mkdirSync(path.join(bare, "info"), { recursive: true });
+      fs.writeFileSync(path.join(bare, "info", "grafts"), `${lines.join("\n")}\n`);
+    }
+
+    it("g13 a graft re-parenting the floor onto the work must not turn a marker's work-bearing parent marker-only", async () => {
+      const f = await fixture();
+      const marker = mkCommit(f.bare, f.floorTree, [f.work], MARKER);
+      const opts = { attemptedTip: marker };
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), true, "control: no graft");
+      writeGrafts(f.bare, [`${f.floor} ${f.olderFloor} ${f.work}`]);
+      assert.ok(gitIn(f.bare, ["rev-list", "-n", "1", "--parents", "refs/remotes/origin/main"]).split(" ").includes(f.work),
+        "sanity: a plain read honours the graft");
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), true);
+    });
+
+    it("g13 a graft re-parenting the marker onto the floor must not hide the work below it", async () => {
+      const f = await fixture();
+      const marker = mkCommit(f.bare, f.floorTree, [f.work], MARKER);
+      writeGrafts(f.bare, [`${marker} ${f.floor}`]);
+      assert.equal(gitIn(f.bare, ["rev-parse", `${marker}^`]), f.floor, "sanity: a plain read honours the graft");
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, { attemptedTip: marker }), true);
+    });
+
+    it("g13 a graft re-parenting a content-bearing tip onto the floor must not make the boundary walk content-free", async () => {
+      const f = await fixture();
+      const chained = mkCommit(f.bare, f.floorTree, [f.work], "tree restored on top");
+      writeGrafts(f.bare, [`${chained} ${f.floor}`]);
+      assert.equal(gitIn(f.bare, ["rev-parse", `${chained}^`]), f.floor, "sanity: a plain read honours the graft");
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, { attemptedTip: chained }), true);
+    });
+  });
+
+  it("g4 blocks a content-bearing attempted tip even with no mirror (and with a null key)", async () => {
+    const f = await fixture();
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { attemptedTip: f.work }), true);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, { attemptedTip: f.work }), true);
+  });
+
+  it("g5 the incident: content-free attempted tip plus a discounted stale mirror completes (false)", async () => {
+    const f = await fixture();
+    f.mirror(f.work);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch,
+      { attemptedTip: f.contentFree, originProbe: {} }), false);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch,
+      { attemptedTip: f.contentFree }), true, "without the probe the stale mirror still blocks");
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null,
+      { attemptedTip: f.contentFree }), false, "a null key ignores the mirror");
+  });
+
+  it("g6 blocks attempted tips that hide content behind an equal tip tree", async () => {
+    const f = await fixture();
+    const intermediate = mkCommit(f.bare, f.workTree, [f.floor], "intermediate work");
+    const chained = mkCommit(f.bare, f.floorTree, [intermediate], "tree restored on top");
+    const merged = mkCommit(f.bare, f.floorTree, [f.floor, intermediate], "retained merge parent");
+    for (const attemptedTip of [chained, merged]) {
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, { attemptedTip }), true);
+    }
+  });
+
+  it("g7 blocks an unreadable attempted tip or boundary", async () => {
+    const f = await fixture();
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null,
+      { attemptedTip: "a".repeat(40) }), true);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null,
+      { attemptedTip: "not-a-sha" }), true);
+    rmObject(f.bare, f.floorTree);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null,
+      { attemptedTip: f.contentFree }), true, "an unreadable boundary tree is not content-free");
+  });
+
+  it("g8 marker parents: missing blocks both legs; genuine root and floor-parent markers pass; real parent blocks", async () => {
+    const f = await fixture();
+    const missing = mkCommit(f.bare, f.workTree, [f.floor], "soon deleted");
+    const dangling = mkCommit(f.bare, f.floorTree, [missing], MARKER);
+    rmObject(f.bare, missing);
+    f.mirror(dangling);
+    f.originRef(f.floor);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, { attemptedTip: dangling }), true);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), true);
+
+    const root = mkCommit(f.bare, f.floorTree, [], MARKER);
+    const onFloor = mkCommit(f.bare, f.workTree, [f.floor], MARKER);
+    for (const tip of [root, onFloor]) {
+      f.mirror(tip);
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { attemptedTip: tip }), false,
+        `marker ${tip === root ? "root" : "over the floor"} is content-free on both legs`);
+    }
+    const overWork = mkCommit(f.bare, f.floorTree, [f.work], MARKER);
+    f.mirror(overWork);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, { attemptedTip: overWork }), true);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), true,
+      "origin still holds the ref: not discounted");
+    gitIn(fx.originPath, ["update-ref", "-d", f.ref]);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), false,
+      "work below a marker is carries_work: discounted only because origin has no such ref");
+  });
+
+  it("g9 a two-parent wip(park) look-alike is not the marker exception, on both legs", async () => {
+    const f = await fixture();
+    const lookAlike = mkCommit(f.bare, f.floorTree, [f.floor, f.work], MARKER);
+    f.mirror(lookAlike);
+    f.originRef(lookAlike);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, { attemptedTip: lookAlike }), true);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), true);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch), true);
+  });
+
+  for (const kind of ["tip", "boundary", "marker-parent", "outside-tree"] as const) {
+    for (const attempted of ["unset", "content-free"] as const) {
+      it(`g10 unreadable mirror proof (${kind}, attempted ${attempted}) blocks with origin absent and never probes`, async () => {
+        const f = await fixture();
+        const spy = spyProbe(f.git);
+        let mirrorTip = f.work;
+        if (kind === "tip") {
+          f.mirror(f.work);
+          rmObject(f.bare, f.work);
+        } else if (kind === "boundary") {
+          rmObject(f.bare, f.olderTree);
+        } else if (kind === "marker-parent") {
+          const parent = mkCommit(f.bare, uniqueTree(f.bare, "parent work\n"), [f.olderFloor], "parent work");
+          mirrorTip = mkCommit(f.bare, f.floorTree, [parent], MARKER);
+          rmObject(f.bare, parent);
+        } else {
+          rmObject(f.bare, f.workTree);
+        }
+        if (kind !== "tip") f.mirror(mirrorTip);
+        const opts = {
+          originProbe: {},
+          ...(attempted === "content-free" ? { attemptedTip: f.contentFree } : {}),
+        };
+        assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, opts), true);
+        assert.equal(spy.calls, 0, "an unprovable mirror never reaches the origin probe");
+      });
+    }
+  }
+
+  it("g11 a shallow bare is unprovable on both legs and never probes", async () => {
+    const f = await fixture();
+    const spy = spyProbe(f.git);
+    const markerOnly = mkCommit(f.bare, f.floorTree, [f.floor], MARKER);
+    const overWork = mkCommit(f.bare, f.floorTree, [f.floor, f.work], MARKER);
+    const shallowFile = path.join(f.bare, "shallow");
+    fs.writeFileSync(shallowFile, `${f.floor}\n`);
+    try {
+      assert.equal(gitIn(f.bare, ["rev-parse", "--is-shallow-repository"]), "true", "precondition");
+      for (const tip of [markerOnly, overWork, f.contentFree]) {
+        f.mirror(tip);
+        assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, { attemptedTip: tip }), true);
+        assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), true);
+      }
+      assert.equal(spy.calls, 0);
+    } finally {
+      fs.rmSync(shallowFile, { force: true });
+    }
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, { attemptedTip: f.contentFree }),
+      false, "control: the same tip is content-free once the repository is not shallow");
   });
 });

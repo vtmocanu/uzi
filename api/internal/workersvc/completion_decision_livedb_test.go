@@ -285,10 +285,10 @@ func TestCompletionDecisionAwaitingInputEmptyGuidanceSendsContinueSentinelLiveDB
 }
 
 // TestCompletionDecisionNotBlockedRefusedLiveDB (PRD #1226 M5, D7): a run in NEITHER
-// completion-blocked state is refused with ErrCompletionNotBlocked, and no rows are written. Four
-// shapes: a plain running interlocked run with no attempt, a paused run held for a DIFFERENT reason
-// (owner pause, hold_reason NULL), an awaiting_input run with NO completion-question marker (an
-// ordinary clarification), and a marker-set awaiting_input run missing its open_question_id.
+// completion-blocked state is refused with ErrCompletionNotBlocked, and no rows are written.
+// Shapes include a plain running interlocked run with no attempt, an owner pause, an iteration
+// hold, an awaiting_input run with NO completion-question marker (an ordinary clarification),
+// and a marker-set awaiting_input run missing its open_question_id.
 func TestCompletionDecisionNotBlockedRefusedLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
 	svc := e.permitService(t)
@@ -326,6 +326,22 @@ func TestCompletionDecisionNotBlockedRefusedLiveDB(t *testing.T) {
 		assertRefused(t, runID)
 		if s := e.runStatus(t, runID); s != "paused" {
 			t.Fatalf("a refused decision must leave status unchanged; got %q", s)
+		}
+	})
+
+	t.Run("iteration hold requires Resume rather than a completion decision", func(t *testing.T) {
+		runID := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+		e.exec(t, `UPDATE runs SET status = 'paused', hold_reason = 'iteration_budget_exhausted',
+ hold_captured_head = 'iteration-head' WHERE id = $1`, runID)
+		assertRefused(t, runID)
+		var status, reason, head string
+		var released bool
+		if err := e.pool.QueryRow(e.ctx, `SELECT status, hold_reason, hold_captured_head,
+ claim_released_at IS NOT NULL FROM runs WHERE id=$1`, runID).Scan(&status, &reason, &head, &released); err != nil {
+			t.Fatal(err)
+		}
+		if status != "paused" || reason != "iteration_budget_exhausted" || head != "iteration-head" || released {
+			t.Fatalf("completion decision changed iteration hold: %s %s %s released=%v", status, reason, head, released)
 		}
 	})
 

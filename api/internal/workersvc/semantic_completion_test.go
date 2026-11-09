@@ -322,3 +322,47 @@ func TestSemanticCompletionPendingWireBound(t *testing.T) {
 		t.Fatalf("pending wire estimate drifted: %d", len(raw))
 	}
 }
+
+func TestSemanticHeadlessOwnerDeferral(t *testing.T) {
+	base := semanticCompletionFixture(t, false)
+	c, err := parseCompletionContract(base.CompletionContract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	build := func(rev int32, scope *scopeBlock) store.Run {
+		run := base
+		cc := c
+		cc.Revision, cc.Scope = int(rev), scope
+		run.CompletionContract = semanticJSON(t, cc)
+		run.ContractRevision = pgtype.Int4{Int32: rev, Valid: true}
+		run.MilestonesFrozen = frozenJSON(t, "m1", "m2")
+		return run
+	}
+	out := func(rev int) []deferredEntry {
+		return []deferredEntry{{MilestoneID: "m2", Reason: "later", Revision: rev}}
+	}
+	valid := &scopeBlock{In: []string{"m1"}, Out: out(2)}
+	for _, tc := range []struct {
+		name      string
+		scope     *scopeBlock
+		completed []byte
+		want      bool
+	}{
+		{"m1 completed", valid, idsJSON(t, "m1"), true},
+		{"m1 undeclared", valid, idsJSON(t), false},
+		{"only deferred completed", valid, idsJSON(t, "m2"), false},
+		{"bad partition", &scopeBlock{In: []string{"m1"}}, idsJSON(t, "m1", "m2"), false},
+		{"out revision zero", &scopeBlock{In: []string{"m1"}, Out: out(0)}, idsJSON(t, "m1"), false},
+		{"out revision above contract", &scopeBlock{In: []string{"m1"}, Out: out(3)}, idsJSON(t, "m1"), false},
+		{"empty in-scope", &scopeBlock{Out: []deferredEntry{
+			{MilestoneID: "m1", Reason: "later", Revision: 2}, {MilestoneID: "m2", Reason: "later", Revision: 2}}}, idsJSON(t, "m1", "m2"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			run := build(2, tc.scope)
+			run.MilestonesCompleted = tc.completed
+			if _, got := headlessCompletedUnion(run, StateRequest{}); got != tc.want {
+				t.Fatalf("valid=%v want %v", got, tc.want)
+			}
+		})
+	}
+}

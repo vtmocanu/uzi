@@ -106,7 +106,8 @@ test("real computed MAC failure is content free, not trusted or adopted; ACK/sta
   const restarted = new Outbox({ root, log: log.logger, runMaxBytes: 1e6, maxBytes: 1e7, retentionMs: 1 });
   outboxes.push(restarted);
   await restarted.init();
-  assert.deepEqual(restarted.listPendingTerminals(), []);
+  assert.equal(restarted.listPendingTerminals()[0]?.outcome_kind, "unknown");
+  assert.equal(await restarted.hasPendingPolicyOutcome(run), true);
   assert.equal(await restarted.readTerminalJournal(run, 3), undefined);
   assert.equal((await restarted.observeTerminalAuthentication(run, 3)).kind, "mac_failure");
   assert.equal((await restarted.journalTerminal(run, 3, "implement", 0, { status: "completed" })).journaled, false);
@@ -172,6 +173,7 @@ test("unsafe generations stay unknown, leading-zero aliases preserve exact names
   const unsafe = all.find(o => o.fileName === "terminal-9007199254740993.json")!;
   assert.equal(unsafe.generation, undefined);
   assert.equal(unsafe.kind, "malformed");
+  assert.equal(box.policyInventoryCoverageAvailable(), false, "EOF does not certify unsafe source coverage");
   assert.ok((await box.scanTerminalObservationsPage()).observations.length > 0);
   await box.retireRun(run);
   assert.ok(await fs.stat(path.join(root, run, unsafe.fileName)));
@@ -377,17 +379,32 @@ test("startup selects valid leading-zero alias; bad canonical observations prese
   await reject(file);
   const restarted = new Outbox({ root, log: log.logger, runMaxBytes: 1e6, maxBytes: 1e7, retentionMs: 1 });
   outboxes.push(restarted);
-  await restarted.init();
+  // Linux may enumerate the rejected canonical file first. Pin that order so
+  // the valid alias must displace an unauthenticated scheduling placeholder.
+  await withProtectionReads({ last: { directory: path.join(root, run), name: path.basename(alias) } }, async visited => {
+    await restarted.init();
+    const names = visited.get(path.join(root, run))!;
+    assert.ok(names.includes(path.basename(file)), "the rejected canonical source was visited");
+    assert.ok(names.indexOf(path.basename(file)) < names.indexOf(path.basename(alias)));
+  });
   assert.equal(restarted.hasPendingTerminal(run, 3), true);
   assert.equal((await restarted.observeTerminalAuthentication(run, 3)).kind, "mac_failure");
   await restarted.scanTerminalObservationsPage();
   assert.equal(restarted.hasPendingTerminal(run, 3), true);
   assert.equal((await restarted.readTerminalJournal(run, 3))!.body.error, "private body");
+  assert.ok(restarted.listPendingOutcomeSources().some(p => p.outcome_kind === "unknown" && p.claim_generation === 3),
+    "the rejected canonical bytes retain their own source obligation");
+  const reservations = Array.from({ length: 1023 }, (_, i) => restarted.reservePolicyFlight(worker, i + 10));
+  try {
+    assert.ok(reservations.every(Boolean), "the rejection retains exactly one catalog slot");
+    assert.equal(restarted.reservePolicyFlight(worker, 2000), undefined, "the rejected canonical source is still counted");
+  } finally { for (const token of reservations) if (token) restarted.releasePolicyFlight(token); }
   await restarted.markTerminalBlocked(run, 3, "gap_unrecoverable");
   assert.equal((await restarted.readTerminalJournal(run, 3))!.blocked, true);
   await restarted.retireTerminal(run, 3);
   await assert.rejects(fs.stat(alias), { code: "ENOENT" });
   assert.ok(await fs.stat(file));
+  assert.equal(await restarted.hasPendingPolicyOutcome(run), true, "ACK of the alias does not settle rejected canonical evidence");
   // The original selected canonical winner must lose trust when scan confirms its rejection.
   await box.scanTerminalObservationsPage();
   assert.equal(box.hasPendingTerminal(run, 3), false);

@@ -131,6 +131,9 @@ type Handler struct {
 	svc                  *forgesvc.Service
 	wsvc                 *workersvc.Service
 	heldSvc              heldPublisher // test seam for WorkerRunHeldPublication; nil = wsvc
+	// catalogDefaults is the test seam for the settings cell's Codex catalog default read
+	// (issue #3251); nil = wsvc, and a nil wsvc reads unknown.
+	catalogDefaults codexCatalogReader
 	// pcheck runs the PAT least-privilege checks (PRD #5): the save-time token
 	// gate and the on-demand full connection check.
 	pcheck *privcheck.Service
@@ -952,6 +955,11 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		// Do NOT wrap the whole /runs group in RequireUser — that shortcut passes the trio
 		// 404 and the admin checks while silently exposing those two; the inner split is the
 		// point.
+		r.Group(func(r chi.Router) {
+			r.Use(h.requireUser())
+			r.Get("/cross-checks/availability", h.CrossCheckHistoryAvailability)
+			r.Get("/cross-checks", h.ListCrossCheckHistory)
+		})
 		r.Route("/runs", func(r chi.Router) {
 			r.Group(func(r chi.Router) {
 				r.Use(h.requireUser())
@@ -1196,6 +1204,9 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// NOT lane-allowlisted: an isolated-lane run is not a Claude run-lane flight that posts it.
 		r.Post("/runs/{id}/usage", h.WorkerRunUsage)
 		r.Post("/runs/{id}/state", h.WorkerRunState)
+		// Bounded local lifecycle outcome, like /state and memory outcomes: no rate
+		// limiter or upstream I/O. Strict 17 KiB decoding and worker/run fences apply.
+		r.Post("/runs/{id}/policy-hold", h.WorkerRunPolicyHold)
 		r.Post("/runs/{id}/forge-clone-success", h.WorkerForgeCloneSuccess)
 		// Bound intent body-decoding and enrollment writes per worker, like the semantic candidate.
 		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/publication-intent", h.WorkerPublicationIntent)
@@ -1248,11 +1259,13 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// three-term deadline. paused = parked (clean up), anything else = the owner extended in the
 		// window, restart the turn. Mirrors the completion/hold ack contract.
 		r.Post("/runs/{id}/wall-park", h.WorkerRunWallPark)
+		r.Post("/runs/{id}/iteration-park", h.WorkerRunIterationPark)
 		r.Post("/runs/{id}/pause", h.WorkerRunPause)
 		// issue #3194: the --require-base base-attestation HOLD. The worker's preflight guard found
 		// retained work no checkpoint attests; the service parks its own live claim (running ->
 		// paused, hold_reason='base_attestation_missing') before the agent ever runs.
 		r.Post("/runs/{id}/base-attestation-hold", h.WorkerRunBaseAttestationHold)
+		r.Post("/runs/{id}/repo-agent-source-hold", h.WorkerRunRepoAgentSourceHold)
 
 		// Ownership/terminality probe (#559): worker-authenticated, run-scoped,
 		// READ ONLY. The interactive park-SKIP path polls it to detect a mid-turn
@@ -1314,6 +1327,11 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// Lead-config record (PRD #3244): the worker reports what its lead agent was configured
 		// to use and what the runtime reported, one claim-fenced row per report.
 		r.With(h.refuseJobRuns).Post("/runs/{id}/lead-config", h.WorkerRecordLeadConfig)
+
+		// Codex catalog default (issue #3251): the claim holder reports the Codex catalog's default
+		// reasoning effort for the credential revision the claim released, one claim-fenced,
+		// context-checked row per report.
+		r.With(h.refuseJobRuns).Post("/runs/{id}/codex-catalog-default", h.WorkerRecordCodexCatalogDefault)
 		r.With(interruptedCallsDeadline, h.refuseJobRuns).Get("/runs/{id}/interrupted-calls", h.WorkerInterruptedCalls)
 
 		// Forge read surface (PRD #158 M1): worker-authenticated, run-scoped, READ

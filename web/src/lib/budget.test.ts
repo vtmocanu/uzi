@@ -112,6 +112,59 @@ describe("extendBudgetView (PRD #1189)", () => {
     expect(v.remainingSec).toBe(28800 - 13320); // 4h18m
   });
 
+  it("uses the paused server total including fallback wall and finalize reserve without aging", () => {
+    const run: BudgetRun = { status: "paused", budget_wall_seconds: null,
+      budget_total_seconds: 9000, budget_extension_seconds: 3600, budget_used_seconds: 6000 };
+    expect(extendBudgetView(run, nowMs)).toMatchObject({ remainingSec: 3000, usedSec: 6000, running: false });
+    expect(extendBudgetView(run, nowMs + 86400000)).toMatchObject({ remainingSec: 3000 });
+    expect(extendBudgetView({ ...run, budget_wall_seconds: 3600 }, nowMs)).toMatchObject({ remainingSec: 3000 });
+    expect(extendBudgetView({ ...run, budget_used_seconds: null }, nowMs)).toBeNull();
+  });
+
+  it.each(["paused", "running"])("explicit wall variant displays finalization reserve for %s", (status) => {
+    const view = extendBudgetView({
+      status,
+      budget_wall_seconds: 3600,
+      budget_extension_seconds: 3600,
+      budget_total_seconds: 9000,
+      budget_used_seconds: 6000,
+    }, nowMs)!;
+    expect(view).toMatchObject({ wallSec: 3600, extSec: 3600, finalizeSec: 1800, remainingSec: 3000 });
+    expect(`${formatBudgetDuration(view.usedSec)} / ${budgetRightLabel(view)} · ${formatBudgetDuration(view.remainingSec)} left`)
+      .toBe("1h 40m / 1h+1h+30m finalization reserve · 50m left");
+  });
+
+  it.each(["paused", "running"])("keeps an unknown frozen wall aggregated for %s", (status) => {
+    const view = extendBudgetView({
+      status,
+      budget_total_seconds: 9000,
+      budget_extension_seconds: 3600,
+      budget_used_seconds: 6000,
+    }, nowMs)!;
+    expect(view).toMatchObject({ wallSec: 5400, extSec: 3600, finalizeSec: 0, remainingSec: 3000 });
+    expect(budgetRightLabel(view)).toBe("1h 30m+1h");
+  });
+
+  it.each(["paused", "running"])("does not fabricate reserve from overrun usage for %s", (status) => {
+    const view = extendBudgetView({
+      status,
+      budget_wall_seconds: 3600,
+      budget_extension_seconds: 3600,
+      budget_total_seconds: 7200,
+      budget_used_seconds: 10000,
+    }, nowMs)!;
+    expect(view).toMatchObject({ usedSec: 10000, remainingSec: 0, finalizeSec: 0 });
+    expect(budgetRightLabel(view)).toBe("1h+1h");
+  });
+
+  it("does not infer reserve without a server total or from a negative difference", () => {
+    const run = { status: "paused", budget_wall_seconds: 3600, budget_used_seconds: 600 };
+    expect(budgetRightLabel(extendBudgetView(run, nowMs)!)).toBe("1h");
+    const view = extendBudgetView({ ...run, budget_total_seconds: 3000 }, nowMs)!;
+    expect(view.finalizeSec).toBe(0);
+    expect(budgetRightLabel(view)).toBe("1h");
+  });
+
   it("returns null when there is no budget to show (rollout skew or a null-budget kind)", () => {
     expect(extendBudgetView({ status: "running", budget_total_seconds: null }, nowMs)).toBeNull();
     expect(extendBudgetView({ status: "running" }, nowMs)).toBeNull(); // older api omits it
@@ -130,6 +183,8 @@ describe("budgetRightLabel / extendEnabled / formatLocalTime", () => {
   it("budgetRightLabel appends +<ext> only when extended", () => {
     expect(budgetRightLabel({ wallSec: 28800, extSec: 0 } as never)).toBe("8h");
     expect(budgetRightLabel({ wallSec: 28800, extSec: 7200 } as never)).toBe("8h+2h");
+    expect(budgetRightLabel({ wallSec: 3600, extSec: 0, finalizeSec: 1800 } as never))
+      .toBe("1h+30m finalization reserve");
   });
 
   it("extendEnabled treats undefined (unknown) and 0 (off) the same for VISIBILITY: hidden", () => {

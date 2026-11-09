@@ -4,7 +4,7 @@ import { AsyncResource } from "node:async_hooks";
 import assert from "node:assert/strict";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { promisify } from "node:util";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { PassThrough, type Readable } from "node:stream";
@@ -15,6 +15,7 @@ import type { BoundaryPermit, BoundaryProcessRequest, CodexExecutionSafety } fro
 import { CodexBoundaryError } from "../src/codex/safety.js";
 import { codexRig } from "./runner-codex-sinks-fixture.js";
 import { GitCache } from "../src/git.js";
+import { PauseNowSignal } from "../src/steering.js";
 import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
 import { defaultGitleaksShim, shimCalls, writeGitleaksShim as writeShim } from "./gitleaks-shim.js";
 import { realProcfsSkip } from "./real-procfs.js";
@@ -2774,7 +2775,7 @@ for (const state of ["persisted", "absent", "attempt-only"] as const) {
     const broker = brokerPublish(fx.originPath, ref, () => undefined,
       () => state === "persisted" ? tip : undefined);
     const pub = stubPublish(broker.impl);
-    const flight = { runId: "same-tip", runKind: "issue", claimGeneration: 1,
+    const flight = { runId: "same-tip", runKind: "issue", claimGeneration: 1, barePath: bare, branch,
       owedContext: Promise.resolve(context), lastCheckpointRefTip: state === "persisted" ? tip : "OLD",
       lastAttemptedCheckpointRefTip: state === "attempt-only" ? tip : undefined,
       reportedPublishOutcomes: new Set<string>(), runLog: nullLogger(), batcher: { emit() {} } };
@@ -3020,6 +3021,256 @@ describe("issue #2733 raw checkpoint publishes chain over a prior overlay", () =
       pub.restore();
     }
   });
+});
+
+// issue #2753: a park publishes a `wip(park):` marker M (parent R) to the checkpoint ref. The resume
+// adopts M, restores its work UNCOMMITTED and soft-resets to R, so the agent's recommit N has parent R,
+// not M, and a raw N was refused `not_descendant` forever. A confirmed marker is now chained over:
+// C = [M, N]. Every publish below goes through the broker-ancestry fake (brokerPublish).
+describe("issue #2753 checkpoints advance after a marker-restored resume", () => {
+  const workflow = ".github/workflows/ci.yml";
+  const progress = { completed: ["m1"], in_progress: [] };
+  const MARKER_SUBJECT = "wip(park): interrupted work auto-saved (test)";
+  const parentsIn = (dir: string, sha: string): string[] =>
+    gitIn(dir, ["rev-list", "--parents", "-n", "1", sha]).split(" ").slice(1);
+  type Forge = "gitlab" | "github";
+  const claimFor = (forge: Forge, iid: number, overrides: Record<string, unknown> = {}) => {
+    const claim = gitlabClaim(iid, overrides);
+    if (forge === "github") claim.repo = { ...claim.repo!, url: "https://github.com/org/repo", forge_type: "github" };
+    return claim;
+  };
+  /** True when `ancestor` is reachable from `descendant`, proven non-vacuous: both objects exist in `dir`. */
+  const reaches = (dir: string, ancestor: string, descendant: string): boolean => {
+    gitIn(dir, ["cat-file", "-e", `${ancestor}^{commit}`]);
+    gitIn(dir, ["cat-file", "-e", `${descendant}^{commit}`]);
+    return isAncestorIn(dir, ancestor, descendant);
+  };
+
+  interface Seed { r: string; m: string; o?: string; tip: string; ref: string; tmp: string }
+
+  /** Origin's main tip is R. A scratch clone commits the parked work (wip.txt) as a `wip(park):` marker
+   *  M with parent R and publishes it to the origin's checkpoint ref. With `overlay`, origin main then
+   *  advances its workflow file and a `ckpt(overlay):` O (parent M, workflows-only diff vs M) is
+   *  published instead, as a park on a branch behind main on workflows does. */
+  function seedMarker(iid: number, overlay: boolean): Seed {
+    const ref = `refs/uzi-checkpoints/agent/issue-${iid}`;
+    const tmp = scratchDir("2753");
+    const clone = path.join(tmp, "seed");
+    execFileSync("git", ["clone", "-q", fx.originPath, clone], { env: GIT_ENV });
+    const r = gitIn(clone, ["rev-parse", "HEAD"]);
+    fs.writeFileSync(path.join(clone, "wip.txt"), "parked work\n");
+    gitIn(clone, ["add", "-A"]);
+    gitIn(clone, [...IDENT, "commit", "-m", MARKER_SUBJECT]);
+    const m = gitIn(clone, ["rev-parse", "HEAD"]);
+    let tip = m;
+    let o: string | undefined;
+    if (overlay) {
+      commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# advanced ${iid}\n`);
+      gitIn(clone, ["fetch", "-q", "origin", "main"]);
+      gitIn(clone, ["checkout", "-q", "FETCH_HEAD", "--", ".github/workflows"]);
+      gitIn(clone, [...IDENT, "commit", "-m", "ckpt(overlay): swap workflows to the default (test)"]);
+      o = gitIn(clone, ["rev-parse", "HEAD"]);
+      tip = o;
+      assert.deepEqual(gitIn(clone, ["diff", "--name-only", m, o]).split("\n"), [workflow], "scene: workflows-only diff vs M");
+      assert.equal(parentsIn(clone, o).at(-1), m, "scene: O's last parent is M");
+    }
+    gitIn(clone, ["push", "-q", "origin", `${tip}:${ref}`]);
+    assert.equal(refOr(fx.originPath, ref), tip, "scene: the checkpoint ref holds the confirmed tip");
+    return { r, m, ...(o ? { o } : {}), tip, ref, tmp };
+  }
+
+  const resumed = (forge: Forge, iid: number, tip: string) =>
+    claimFor(forge, iid, { run_id: `27530000-0000-4000-8000-${String(iid).padStart(12, "0")}`, session_id: "sess-a", checkpoint_tip: tip });
+
+  /** In-turn proof that the resume restored M's work uncommitted on HEAD == R. */
+  function assertRestored(ctx: RunContext, g: GitCache, seed: Seed): void {
+    assert.equal(gitIn(ctx.worktreePath, ["rev-parse", "HEAD"]), seed.r, "HEAD is R, the marker's parent");
+    assert.match(gitIn(ctx.worktreePath, ["status", "--porcelain"]), /wip\.txt/, "M's work is uncommitted");
+    assert.equal(reaches(g.barePathFor(fx.originPath), seed.m, gitIn(ctx.worktreePath, ["rev-parse", "HEAD"])), false,
+      "M is not an ancestor of the worktree HEAD");
+  }
+
+  for (const forge of ["gitlab", "github"] as const) {
+    for (const boundary of ["tick", "iteration"] as const) {
+      for (const shape of forge === "github" ? ["marker", "overlay"] as const : ["marker"] as const) {
+        it(`${forge}/${boundary}: a recommit after a marker-restored resume (${shape} tip) advances the ref over [tip, N]`, async () => {
+          const iid = 2753_100 + (forge === "github" ? 20 : 0) + (boundary === "tick" ? 0 : 10) + (shape === "overlay" ? 5 : 0);
+          commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# base ${iid}\n`);
+          const seed = seedMarker(iid, shape === "overlay");
+          const g = mkGit(fx.dataDir);
+          const ctl = control();
+          const { github } = fakeGitHub();
+          const broker = brokerPublish(fx.originPath, seed.ref, undefined, () => seed.tip);
+          const pub = stubPublish(broker.impl);
+          try {
+            await mkRunner(g, turn(async (ctx) => {
+              assertRestored(ctx, g, seed);
+              const n = commitIn(ctx.worktreePath, "n.txt", "recommitted work\n");
+              ctl.advance(INTERVAL_MS + 1);
+              if (boundary === "tick") assert.equal(await ctl.fire(), "published", "the tick publish must land");
+              else await ctx.checkpoint!({ reap: false, progress });
+              assert.equal(pub.count(), 1, "exactly one publish request");
+              const chain = pub.tips[0]!;
+              assert.deepEqual(parentsIn(fx.originPath, chain), [seed.tip, n], "chain parents are [confirmed tip, N]");
+              assert.equal(refOr(fx.originPath, seed.ref), chain, "the ref advanced to the chain");
+              const body = (broker.answers[0]!.answer as { body?: { published?: boolean; skipped?: string } }).body;
+              assert.deepEqual([body?.published, body?.skipped], [true, undefined], "published, not not_descendant");
+              assert.equal(reaches(fx.originPath, seed.m, chain), true, "the parked work stays reachable through the chain");
+              const head = gitIn(ctx.worktreePath, ["rev-parse", "HEAD"]);
+              assert.equal(head, n, "the agent's branch HEAD is N");
+              assert.equal(reaches(g.barePathFor(fx.originPath), seed.m, head), false, "M is still not an ancestor of HEAD");
+            }), ctl, { github }).execute(resumed(forge, iid, seed.tip));
+            if (turnErrors.length > 0) throw turnErrors[0];
+          } finally {
+            pub.restore();
+            fs.rmSync(seed.tmp, { recursive: true, force: true });
+          }
+        });
+      }
+    }
+  }
+
+  // Control: nothing was recommitted (HEAD == R), so there is no new work to publish; the ref must
+  // stay at M and the restored files stay uncommitted. Holds before and after the fix.
+  it("no recommit: a tick with HEAD == R does not advance the ref and leaves the restored work uncommitted", async () => {
+    const iid = 2753_190;
+    const seed = seedMarker(iid, false);
+    const g = mkGit(fx.dataDir);
+    const ctl = control();
+    const broker = brokerPublish(fx.originPath, seed.ref, undefined, () => seed.tip);
+    const pub = stubPublish(broker.impl);
+    try {
+      await mkRunner(g, turn(async (ctx) => {
+        assertRestored(ctx, g, seed);
+        ctl.advance(INTERVAL_MS + 1);
+        await ctl.fire();
+        assert.equal(refOr(fx.originPath, seed.ref), seed.m, "the ref stays at M");
+        assert.equal(broker.answers.filter((a) => (a.answer as { body?: { published?: boolean } }).body?.published === true).length, 0,
+          "no publish landed");
+        assertRestored(ctx, g, seed);
+      }), ctl).execute(resumed("gitlab", iid, seed.tip));
+      if (turnErrors.length > 0) throw turnErrors[0];
+    } finally {
+      pub.restore();
+      fs.rmSync(seed.tmp, { recursive: true, force: true });
+    }
+  });
+
+  // Unlanded marker: the ref sits at the confirmed M; the agent's own (locally created) marker commit
+  // Mx ships on a tick and its ACK is dropped (never indexed by the broker), so the attempted tip is
+  // the unlanded chain over M and Mx, while confirmed stays M. Approach: a hand-made `wip(park):`
+  // commit on the run branch published by the real tick path (the real owner pause sink is driven by
+  // the test after this loop). The next publish after Mx is undone must chain over M, never the
+  // unlanded tip.
+  for (const forge of ["gitlab", "github"] as const) {
+    it(`${forge}: a chain after a dropped-ACK unlanded marker is based on the confirmed M and never ships its blob`, async () => {
+      const iid = 2753_200 + (forge === "github" ? 10 : 0);
+      commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# base ${iid}\n`);
+      const seed = seedMarker(iid, false);
+      const g = mkGit(fx.dataDir);
+      const ctl = control();
+      const { github } = fakeGitHub();
+      const broker = brokerPublish(fx.originPath, seed.ref, (call) => (call <= 2 ? "dropped" : undefined), () => seed.tip);
+      const pub = stubPublish(broker.impl);
+      try {
+        await mkRunner(g, turn(async (ctx) => {
+          assertRestored(ctx, g, seed);
+          const w = ctx.worktreePath;
+          const unlanded = `unlanded unique work ${iid}\n`;
+          fs.writeFileSync(path.join(w, "unlanded.txt"), unlanded);
+          const blob = gitIn(w, ["hash-object", "unlanded.txt"]);
+          gitIn(w, ["add", "-A"]);
+          gitIn(w, [...IDENT, "commit", "-m", MARKER_SUBJECT]);
+          ctl.advance(INTERVAL_MS + 1);
+          assert.notEqual(await ctl.fire(), "published", "the marker's ACK is dropped");
+          assert.equal(pub.count(), 3, "three dropped requests");
+          assert.equal(refOr(fx.originPath, seed.ref), seed.m, "the ref is still the confirmed M");
+          const unlandedTip = pub.tips[0]!;
+          // Undo the marker (as a resume does) and recommit without the unlanded file.
+          gitIn(w, ["reset", "-q", "--soft", seed.r]);
+          gitIn(w, ["rm", "-q", "-f", "--cached", "unlanded.txt"]);
+          fs.rmSync(path.join(w, "unlanded.txt"));
+          const n2 = commitIn(w, "n2.txt", "second recommit\n");
+          ctl.advance(INTERVAL_MS + 1);
+          assert.equal(await ctl.fire(), "published", "the next tick lands");
+          assert.equal(pub.count(), 4);
+          const chain = pub.tips[3]!;
+          assert.notEqual(chain, unlandedTip);
+          assert.deepEqual(parentsIn(fx.originPath, chain), [seed.m, n2], "first parent is the confirmed M, never the unlanded tip");
+          assert.equal(refOr(fx.originPath, seed.ref), chain);
+          assert.throws(() => gitIn(fx.originPath, ["cat-file", "-e", blob]), "the unlanded marker's blob is not in the origin");
+          assert.throws(() => gitIn(fx.originPath, ["cat-file", "-e", `${unlandedTip}^{commit}`]), "the unlanded tip is not in the origin");
+        }), ctl, { github }).execute(resumed(forge, iid, seed.tip));
+        if (turnErrors.length > 0) throw turnErrors[0];
+      } finally {
+        pub.restore();
+        fs.rmSync(seed.tmp, { recursive: true, force: true });
+      }
+    });
+  }
+
+  // The REAL owner pause sink: the ref sits at the confirmed M, the work is restored uncommitted, the
+  // agent holds a uniquely-content file, and an owner `pause --now` (ctx.parkForPause) builds a new
+  // pause marker whose publish the broker DROPS (HTTP 500, nothing lands). The run reports
+  // pause_failed and keeps running; a later TICK (fake clock) after the agent commits N2 must chain
+  // over the confirmed M and never ship the unlanded pause marker's blob.
+  for (const forge of ["gitlab", "github"] as const) {
+    it(`${forge}: a dropped-ACK pause marker followed by a tick chains over the confirmed M and never ships the marker blob`, async () => {
+      const iid = 2753_400 + (forge === "github" ? 10 : 0);
+      commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# base ${iid}\n`);
+      const seed = seedMarker(iid, false);
+      const g = mkGit(fx.dataDir);
+      const ctl = control();
+      const { github } = fakeGitHub();
+      let dropping = false;
+      const broker = brokerPublish(fx.originPath, seed.ref, () => (dropping ? "dropped" : undefined), () => seed.tip);
+      const pub = stubPublish(broker.impl);
+      const claim = resumed(forge, iid, seed.tip);
+      try {
+        await mkRunner(g, turn(async (ctx) => {
+          assertRestored(ctx, g, seed);
+          const w = ctx.worktreePath;
+          fs.writeFileSync(path.join(w, "pause-unique.txt"), `pause marker unique work ${iid}\n`);
+          const blob = gitIn(w, ["hash-object", "pause-unique.txt"]);
+          dropping = true;
+          const parked = await ctx.parkForPause!({ completedCount: 1, total: 2 });
+          dropping = false;
+          assert.equal(parked, false, "the dropped pause publish does not park: the run keeps running");
+          const droppedCalls = pub.count();
+          assert.ok(droppedCalls >= 1, "the pause marker was offered to the broker");
+          assert.equal(broker.answers.every((a) => (a.answer as { ok?: boolean }).ok === false), true, "every pause request was dropped");
+          assert.equal(refOr(fx.originPath, seed.ref), seed.m, "the ref is still the confirmed M");
+          const pauseTips = pub.tips.slice();
+          assert.throws(() => gitIn(fx.originPath, ["cat-file", "-e", blob]), "the pause marker blob is not in the origin yet");
+
+          // The agent keeps working: commit N2 (without the pause-only file) and let a tick fire.
+          // (commitIn stages everything, so drop the pause-only file first: N2 must not carry its blob.)
+          fs.rmSync(path.join(w, "pause-unique.txt"));
+          const n2 = commitIn(w, "n2.txt", "work after the failed pause\n");
+          ctl.advance(INTERVAL_MS + 1);
+          assert.equal(await ctl.fire(), "published", "the tick publish lands");
+          assert.equal(pub.count(), droppedCalls + 1, "exactly one more request: the tick's");
+          const chain = pub.tips.at(-1)!;
+          assert.equal(pauseTips.includes(chain), false, "the tick chain is not the unlanded pause chain");
+          assert.deepEqual(parentsIn(fx.originPath, chain), [seed.m, n2], "first parent is the confirmed M, never the unlanded pause marker");
+          assert.equal(refOr(fx.originPath, seed.ref), chain, "the ref advanced to the chain");
+          const body = (broker.answers.at(-1)!.answer as { body?: { published?: boolean; skipped?: string } }).body;
+          assert.deepEqual([body?.published, body?.skipped], [true, undefined], "the broker answered published");
+          assert.throws(() => gitIn(fx.originPath, ["cat-file", "-e", blob]), "the pause marker's unique blob never reached the origin");
+          for (const t of pauseTips) {
+            assert.throws(() => gitIn(fx.originPath, ["cat-file", "-e", `${t}^{commit}`]), "no unlanded pause commit reached the origin");
+          }
+        }), ctl, { github }).execute(claim);
+        if (turnErrors.length > 0) throw turnErrors[0];
+        const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
+        assert.ok(statuses.includes("pause_failed"), `pause_failed reported, got ${JSON.stringify(statuses)}`);
+        assert.ok(!statuses.includes("paused"), `never paused, got ${JSON.stringify(statuses)}`);
+      } finally {
+        pub.restore();
+        fs.rmSync(seed.tmp, { recursive: true, force: true });
+      }
+    });
+  }
 });
 
 describe("mid-turn checkpoint round 3 (issue #1597 M2)", () => {
@@ -4048,6 +4299,558 @@ describe("mid-turn checkpoint round 4: gate_busy quick retry (issue #1597 M2)", 
       assert.deepEqual(seen, ["gate_busy", "gate_busy", "published", "time_gate_closed"]);
       assert.deepEqual(delays, [1_000, 1_000, TICK_MS], "one quick retry, then the normal cadence");
       assert.equal(pub.tips.at(-1), sha);
+    } finally {
+      pub.restore();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── issue #3780 — a tick's stop is SOFT unless authority is revoked ───────────────────────────
+//
+// A hard abort between GitCache.promoteTrackingUnderLock's pending receipt write and its tracking-ref
+// CAS strands a `phase:"pending"` receipt (later imports: ownership_unknown; finalize fails). The tick
+// therefore stops cooperatively (sink-gate preemption, stop(), PauseNow, graceful shutdown before its
+// deadline), which the scope masks across the ownership section, and hard only on a revocation.
+
+/** Replace the GitCache's receipt writer so that ONLY the first `phase:"pending"` receipt write runs
+ *  the original and then `hook` (the point where a hard abort would strand the receipt). */
+function afterPendingReceipt(g: GitCache, hook: () => Promise<void>): () => void {
+  const internals = g as unknown as { writeOwedFile(bare: string, name: string, value: unknown): Promise<void> };
+  const original = internals.writeOwedFile.bind(g);
+  let fired = false;
+  internals.writeOwedFile = async (bare, name, value) => {
+    await original(bare, name, value);
+    if (!fired && name.startsWith("receipt-") && (value as { phase?: string }).phase === "pending") {
+      fired = true;
+      await hook();
+    }
+  };
+  return () => {
+    internals.writeOwedFile = original;
+  };
+}
+
+const yieldLoop = async (n = 10): Promise<void> => {
+  for (let i = 0; i < n; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+};
+
+/** The bare's tracking ref and the branch's receipt phase, read synchronously. */
+function trackingState(g: GitCache, branch: string): { tip: string | null; phase: string | undefined } {
+  const bare = g.barePathFor(fx.originPath);
+  const receipt = path.join(bare, "uzi-owed", `receipt-${createHash("sha256").update(branch).digest("hex")}.json`);
+  let phase: string | undefined;
+  try {
+    phase = (JSON.parse(fs.readFileSync(receipt, "utf8")) as { phase?: string }).phase;
+  } catch {
+    phase = undefined;
+  }
+  return { tip: refOr(bare, `refs/uzi-runner/${branch}`), phase };
+}
+
+type ReceiptStop =
+  | "pause" | "cancel" | "switch" | "pause then disk stop" | "shutdown" | "shutdown past deadline";
+
+/** One tick whose import is stopped by `stop` right after its pending receipt is written. Returns the
+ *  tracking state captured the instant the tick reported its outcome. */
+async function receiptStopScenario(iid: number, stop: ReceiptStop): Promise<{
+  outcome: string; sha: string; state: { tip: string | null; phase: string | undefined };
+}> {
+  const tmp = scratchDir(`rcpt-${iid}`);
+  const ctl = control();
+  // The shutdown deadline timer is captured (not armed) while runner.shutdown() runs, so the test
+  // fires it explicitly, early, instead of racing a real timer against the clock.
+  let capturing = false;
+  const captured: Array<() => void> = [];
+  const realSetTimer = ctl.setTimer;
+  ctl.setTimer = (cb, ms) => {
+    if (!capturing) return realSetTimer(cb, ms);
+    captured.push(cb);
+    return () => {};
+  };
+  const g = mkGit(fx.dataDir, writeShim(tmp, "detect"));
+  const claim = gitlabClaim(iid, { claim_generation: 1 });
+  const branch = `agent/issue-${iid}`;
+  let state: { tip: string | null; phase: string | undefined } | undefined;
+  const reported = ctl.hooks.onTickOutcome!;
+  ctl.hooks.onTickOutcome = (o) => {
+    state ??= trackingState(g, branch);
+    reported(o);
+  };
+  let sha = "";
+  let outcome = "";
+  let runner: RunRunner | undefined;
+  let restore: (() => void) | undefined;
+  try {
+    runner = mkRunner(g, turn(async (ctx) => {
+      sha = commitIn(ctx.worktreePath, "S.txt", "s\n");
+      restore = afterPendingReceipt(g, async () => {
+        if (stop === "pause" || stop === "pause then disk stop") {
+          api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]);
+          await waitAbort(ctx.signal!);
+          if (stop === "pause then disk stop") {
+            // Fires ONLY the checkpoint-authority signal: the lifecycle is already aborted by the
+            // pause, and a PauseNow reason never reaches the terminal signal.
+            await yieldLoop();
+            const active = (runner as unknown as {
+              activeRuns: Map<string, { steering: { requestDiskStop(): void } }>;
+            }).activeRuns;
+            [...active.values()][0]!.steering.requestDiskStop();
+          }
+        } else if (stop === "cancel") {
+          api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
+          await waitFor(() => ctx.cancelRequested?.() === true);
+        } else if (stop === "switch") {
+          api.requestCredentialSwitch(claim.run_id, 1);
+          await waitAbort(ctx.signal!);
+        } else {
+          capturing = true;
+          runner!.shutdown();
+          capturing = false;
+          if (stop === "shutdown past deadline") {
+            assert.equal(captured.length, 1, "exactly the shutdown deadline timer was armed");
+            captured[0]!();
+          }
+        }
+        await yieldLoop();
+      });
+      ctl.advance(INTERVAL_MS + 1);
+      outcome = await bounded(ctl.fire(), TEARDOWN_MS, "tick outcome");
+    }), ctl, { recoveryRetryMs: 1, shutdownPublishTimeoutMs: 60_000 });
+    await runner.execute(claim);
+    assert.ok(state, "the tick reported an outcome");
+    return { outcome, sha, state };
+  } finally {
+    await settleAndClean({ ctl, runners: runner ? [runner] : [], restore, paths: [tmp] });
+  }
+}
+
+describe("mid-turn checkpoint soft stop (issue #3780)", () => {
+  for (const stop of ["pause", "shutdown"] as const) {
+    it(`a ${stop} during the ownership section is soft: the pending receipt reaches committed and the tick is aborted`, async () => {
+      const r = await receiptStopScenario(stop === "pause" ? 3780_101 : 3780_102, stop);
+      assert.equal(r.outcome, "aborted");
+      assert.equal(r.state.tip, r.sha, "the tracking ref was promoted to the incoming tip");
+      assert.equal(r.state.phase, "committed", "no pending receipt is stranded");
+    });
+  }
+
+  const hard: ReceiptStop[] = ["cancel", "switch", "pause then disk stop", "shutdown past deadline"];
+  for (const [i, stop] of hard.entries()) {
+    it(`${stop} is a hard stop: the ownership section is aborted before the tracking-ref update`, async () => {
+      const r = await receiptStopScenario(3780_110 + i, stop);
+      assert.equal(r.outcome, "aborted");
+      assert.notEqual(r.state.tip, r.sha, "the hard abort stopped before the CAS");
+    });
+  }
+
+  it("a turn-end stop() escalates to hard when the classification is hard", async () => {
+    // A graceful shutdown starts soft (deadline not yet reached, its timer never fires here). The
+    // clock then passes the deadline with no event: only stop() at the turn's end can notice.
+    const tmp = scratchDir("stop-hard");
+    let skew = 0;
+    const ctl = control({ absoluteNow: () => Date.now() + skew });
+    const g = mkGit(fx.dataDir, writeShim(tmp, "detect"));
+    const claim = gitlabClaim(3780_140, { claim_generation: 1 });
+    const branch = `agent/issue-${3780_140}`;
+    let state: { tip: string | null; phase: string | undefined } | undefined;
+    const reported = ctl.hooks.onTickOutcome!;
+    ctl.hooks.onTickOutcome = (o) => {
+      state ??= trackingState(g, branch);
+      reported(o);
+    };
+    let sha = "";
+    let runner: RunRunner | undefined;
+    let restore: (() => void) | undefined;
+    let atReceipt: () => void = () => {};
+    const receiptWritten = new Promise<void>((resolve) => { atReceipt = resolve; });
+    try {
+      runner = mkRunner(g, turn(async (ctx) => {
+        sha = commitIn(ctx.worktreePath, "S.txt", "s\n");
+        restore = afterPendingReceipt(g, async () => {
+          runner!.shutdown();
+          atReceipt();
+          // Hold the import here until the turn has ended and stop() has classified.
+          await sleepMs(600);
+        });
+        ctl.advance(INTERVAL_MS + 1);
+        ctl.fireNoWait();
+        await receiptWritten;
+        skew = 10 * 60_000_000;
+      }), ctl, { recoveryRetryMs: 1, shutdownPublishTimeoutMs: 60_000 });
+      await runner.execute(claim);
+      await ctl.settled(TEARDOWN_MS);
+      assert.deepEqual(ctl.outcomes, ["aborted"]);
+      assert.ok(state, "the tick reported an outcome");
+      assert.notEqual(state.tip, sha, "stop() aborted hard before the tracking-ref update");
+    } finally {
+      await settleAndClean({ ctl, runners: runner ? [runner] : [], restore, paths: [tmp] });
+    }
+  });
+
+  it("sink-gate preemption by the ACTUAL done checkpoint leaves a committed receipt, and finalize still opens the MR", async () => {
+    const tmp = scratchDir("preempt-done");
+    const shim = writeShim(tmp, "detect");
+    const ctl = control();
+    const codex = fakeCodex();
+    const fg = fakeGitlab();
+    const g = mkGit(fx.dataDir, shim);
+    const iid = 3780_120;
+    const claim = gitlabClaim(iid);
+    const branch = `agent/issue-${iid}`;
+    const pub = stubPublish(async (_n, _tip, pack) => {
+      await drain(pack);
+      return LANDED;
+    });
+    let state: { tip: string | null; phase: string | undefined } | undefined;
+    const reported = ctl.hooks.onTickOutcome!;
+    ctl.hooks.onTickOutcome = (o) => {
+      state ??= trackingState(g, branch);
+      reported(o);
+    };
+    let sha = "";
+    let done: Promise<void> | undefined;
+    let restore: (() => void) | undefined;
+    try {
+      const factory: ExecutorFactory = () => ({
+        executor: {
+          run: async (ctx: RunContext) => {
+            await recordingTurnErrors(async () => {
+              sha = commitIn(ctx.worktreePath, "D.txt", "d\n");
+              restore = afterPendingReceipt(g, async () => {
+                // The run's real done checkpoint, NOT awaited: withDoneAttempt preempts this tick
+                // through flight.sinkGate while it sits between the pending receipt and the CAS.
+                done = ctx.checkpoint!({ reap: true, sink: "done_checkpoint" });
+                done.catch(() => undefined);
+                await yieldLoop();
+              });
+              ctl.advance(INTERVAL_MS + 1);
+              assert.equal(await bounded(ctl.fire(), TEARDOWN_MS, "preempted tick"), "aborted");
+              await bounded(done!, TEARDOWN_MS, "done checkpoint");
+            });
+            return { branch: ctx.branch };
+          },
+          safety: codex.safety,
+          withCredentialFreeCapture: codex.withCredentialFreeCapture,
+          settleForCredentialFreeCapture: codex.settleForCredentialFreeCapture,
+        },
+      });
+      await mkRunner(g, factory, ctl, { gitlab: fg.gitlab }).execute(claim);
+      assert.deepEqual(state, { tip: sha, phase: "committed" }, "tracking state when the preempted tick settled");
+      assert.equal(finalStatus(claim.run_id), "completed");
+      assert.ok(fg.calls.some((c) => c.method === "POST"), "the finalize import succeeded and the MR was created");
+    } finally {
+      await settleAndClean({ ctl, restore: () => { restore?.(); pub.restore(); }, paths: [tmp] });
+    }
+  });
+
+  it("a turn ending during the secret scan stops the scan promptly", async () => {
+    const tmp = scratchDir("scan-soft");
+    const shim = writeShim(tmp, "slowclean", { sleepMs: 30_000 });
+    const ctl = control();
+    const claim = gitlabClaim(3780_130);
+    const pub = stubPublish(async (_n, _tip, pack) => {
+      await drain(pack);
+      return LANDED;
+    });
+    let scanStartedAt = 0;
+    let outcomeAt = 0;
+    const reported = ctl.hooks.onTickOutcome!;
+    ctl.hooks.onTickOutcome = (o) => {
+      outcomeAt = Date.now();
+      reported(o);
+    };
+    try {
+      await mkRunner(mkGit(fx.dataDir, shim), turn(async (ctx) => {
+        commitIn(ctx.worktreePath, "C.txt", "c\n");
+        ctl.advance(INTERVAL_MS + 1);
+        ctl.fireNoWait();
+        await waitFor(() => shimCalls(shim).length >= 1, 20_000);
+        scanStartedAt = Date.now();
+      }), ctl).execute(claim);
+      assert.deepEqual(ctl.outcomes, ["aborted"]);
+      assert.ok(scanStartedAt > 0 && outcomeAt >= scanStartedAt, "the tick reported after the scanner started");
+      assert.ok(outcomeAt - scanStartedAt < 15_000, "the 30 s scanner was stopped by the soft stop, not waited out");
+    } finally {
+      await settleAndClean({ ctl, restore: pub.restore, paths: [tmp] });
+    }
+  });
+});
+
+// ── issue #3780 M2 — a stranded ownership update is finished by the SAME flight's later import ──────
+//
+// The tick's 120 s hard cap fires after the pending receipt write, stranding `phase:"pending"` with the
+// ref unchanged. The same flight's done checkpoint and finalize import must finish it (not fail the run
+// with ownership_unknown), but only while the flight's repair authority holds.
+describe("stranded ownership repair across the same flight (issue #3780 M2)", () => {
+  type Stranded = {
+    claim: ReturnType<typeof gitlabClaim>; g: GitCache; branch: string; sha: string; fg: ReturnType<typeof fakeGitlab>;
+    afterTick: { tip: string | null; phase: string | undefined };
+    stamp: () => string | undefined;
+  };
+
+  /** Strand the receipt with the tick hard cap, then run `between` (still inside the turn) and let the
+   *  run end normally so its done checkpoint and finalize import. */
+  async function strandedFlight(iid: number,
+    between: (steering: { abortLifecycle(reason?: unknown, terminal?: boolean): void }, s: Stranded) => void | (() => void),
+    check: (s: Stranded) => Promise<void>,
+    inTurn?: (s: Stranded, ctx: RunContext) => Promise<void>): Promise<void> {
+    const tmp = scratchDir(`m2-repair-${iid}`);
+    const ctl = control();
+    let capturing = false;
+    let hardCap: (() => void) | undefined;
+    const realSetTimer = ctl.setTimer;
+    ctl.setTimer = (cb, ms) => {
+      if (capturing && ms === 120_000) { hardCap = cb; return () => {}; }
+      return realSetTimer(cb, ms);
+    };
+    const fg = fakeGitlab();
+    const g = mkGit(fx.dataDir, writeShim(tmp, "detect"));
+    const claim = gitlabClaim(iid, { claim_generation: 1 });
+    const branch = `agent/issue-${iid}`;
+    const pub = stubPublish(async (_n, _tip, pack) => { await drain(pack); return LANDED; });
+    const stampOf = (): string | undefined => {
+      try {
+        return execFileSync("git", ["-C", g.barePathFor(fx.originPath), "config", "--local", "--get",
+          `uzi-trackowner.${branch}.owner`], { encoding: "utf8", env: GIT_ENV }).trim();
+      } catch { return undefined; }
+    };
+    const s: Stranded = { claim, g, branch, sha: "", fg, afterTick: { tip: null, phase: undefined }, stamp: stampOf };
+    let restore: (() => void) | undefined;
+    let undoBetween: (() => void) | void;
+    let runner: RunRunner | undefined;
+    try {
+      const factory: ExecutorFactory = () => ({
+        executor: {
+          run: async (ctx: RunContext) => {
+            await recordingTurnErrors(async () => {
+              s.sha = commitIn(ctx.worktreePath, "R.txt", "r\n");
+              restore = afterPendingReceipt(g, async () => { hardCap!(); await yieldLoop(); });
+              ctl.advance(INTERVAL_MS + 1);
+              capturing = true;
+              try { assert.equal(await bounded(ctl.fire(), TEARDOWN_MS, "hard-capped tick"), "aborted"); }
+              finally { capturing = false; }
+              s.afterTick = trackingState(g, branch);
+              assert.equal(s.afterTick.phase, "pending", "the hard cap stranded the pending receipt");
+              assert.notEqual(s.afterTick.tip, s.sha, "the hard cap stopped before the CAS");
+              const active = (runner as unknown as {
+                activeRuns: Map<string, { steering: { abortLifecycle(reason?: unknown, terminal?: boolean): void } }>;
+              }).activeRuns;
+              undoBetween = between([...active.values()][0]!.steering, s);
+              await inTurn?.(s, ctx);
+            });
+            return { branch: ctx.branch };
+          },
+        },
+      });
+      runner = mkRunner(g, factory, ctl, { gitlab: fg.gitlab });
+      await runner.execute(claim);
+      await check(s);
+    } finally {
+      await settleAndClean({ ctl, runners: runner ? [runner] : [], restore: () => { restore?.(); undoBetween?.(); pub.restore(); }, paths: [tmp] });
+    }
+  }
+
+  it("(i) the same flight's done checkpoint and finalize finish the stranded update and create the MR", async () => {
+    await strandedFlight(3780_201, () => undefined, async (s) => {
+      assert.equal(finalStatus(s.claim.run_id), "completed");
+      assert.deepEqual(trackingState(s.g, s.branch), { tip: s.sha, phase: "committed" });
+      assert.equal(s.stamp(), s.claim.run_id);
+      assert.ok(s.fg.calls.some((c) => c.method === "POST"), "the finalize import succeeded and the MR was created");
+    });
+  });
+
+  // Claude-style executor (no Codex safety registry): the approved plan does not require a Codex executor here.
+  it("(v) the run's explicit done checkpoint repairs the stranded update; finalize then creates the MR", async () => {
+    await strandedFlight(3780_205, () => undefined, async (s) => {
+      assert.equal(finalStatus(s.claim.run_id), "completed");
+      assert.deepEqual(trackingState(s.g, s.branch), { tip: s.sha, phase: "committed" });
+      assert.ok(s.fg.calls.some((c) => c.method === "POST"), "the finalize import succeeded and the MR was created");
+    }, async (s, ctx) => {
+      await bounded(ctx.checkpoint!({ reap: true, sink: "done_checkpoint" }), TEARDOWN_MS, "done checkpoint");
+      assert.deepEqual(trackingState(s.g, s.branch), { tip: s.sha, phase: "committed" },
+        "the done checkpoint itself repaired the stranded state");
+      assert.equal(s.stamp(), s.claim.run_id);
+    });
+  });
+
+  const refused = async (s: Stranded): Promise<void> => {
+    assert.equal(finalStatus(s.claim.run_id), "failed");
+    assert.deepEqual(trackingState(s.g, s.branch), { tip: s.afterTick.tip, phase: "pending" }, "nothing was written");
+    assert.equal(s.stamp(), undefined);
+    assert.ok(!s.fg.calls.some((c) => c.method === "POST"), "nothing was published");
+  };
+
+  it("(ii) a terminal abort before finalize refuses the repair", async () => {
+    await strandedFlight(3780_202, (steering) => { steering.abortLifecycle(new Error("terminal fixture")); }, refused);
+  });
+
+  it("(iv) a PauseNow followed by a terminal abort before the repair is refused", async () => {
+    await strandedFlight(3780_204, (steering) => {
+      steering.abortLifecycle(new PauseNowSignal(), false);
+      steering.abortLifecycle(new Error("terminal fixture"));
+    }, refused);
+  });
+
+  it("(iii) a terminal abort right after the repair CAS stops the repair: no stamp, no committed receipt, nothing published", async () => {
+    let restoreGit: (() => void) | undefined;
+    await strandedFlight(3780_203, (steering, s) => {
+      const internals = s.g as unknown as {
+        execScoped(command: string, args: string[], options: unknown): Promise<{ stdout: string; stderr: string }>;
+      };
+      const original = internals.execScoped.bind(s.g);
+      internals.execScoped = async (command, args, options) => {
+        const result = await original(command, args, options);
+        // The tick's own CAS never ran, so the first update of the tracking ref to the incoming sha is the repair's.
+        if (command === "git" && args.includes("update-ref") && args.includes(`refs/uzi-runner/${s.branch}`) && args.includes(s.sha)) {
+          steering.abortLifecycle(new Error("terminal fixture"));
+        }
+        return result;
+      };
+      restoreGit = () => { internals.execScoped = original; };
+      return restoreGit;
+    }, async (s) => {
+      assert.equal(finalStatus(s.claim.run_id), "failed");
+      assert.deepEqual(trackingState(s.g, s.branch), { tip: s.sha, phase: "pending" }, "the CAS landed; no committed receipt followed");
+      assert.equal(s.stamp(), undefined, "no stamp write after authority was revoked");
+      assert.ok(!s.fg.calls.some((c) => c.method === "POST"), "nothing was published");
+    });
+  });
+});
+
+// issue #3780 M2 — the admission predicate GitCache checks before each repair write.
+describe("ownershipRepairAdmitted (issue #3780 M2)", () => {
+  type Flight = Record<string, unknown>;
+  const admitted = (flight: Flight): boolean =>
+    (RunRunner.prototype as unknown as { ownershipRepairAdmitted(f: Flight): boolean }).ownershipRepairAdmitted.call(undefined, flight);
+  const base = (over: Flight = {}): Flight => ({
+    steering: { ownershipRepairAuthority: () => true }, owedLimitStop: undefined, executor: undefined,
+    survivingTickGroups: [], retainedBareLocks: [], ...over,
+  });
+  const safety = (state: string): Flight => ({ executor: { safety: { registryState: () => state } } });
+
+  it("admits a flight with authority, no stop, no survivors and no retained lock", () => {
+    assert.equal(admitted(base()), true);
+  });
+  it("refuses when steering authority is revoked or the owed cap stopped the run", () => {
+    assert.equal(admitted(base({ steering: { ownershipRepairAuthority: () => false } })), false);
+    assert.equal(admitted(base({ owedLimitStop: new Error("owed cap") })), false);
+  });
+  it("refuses while a surviving tick group is still tracked", () => {
+    assert.equal(admitted(base({ survivingTickGroups: [{ pgid: 1 }] })), false);
+  });
+  it("refuses while a retained bare lock is held", () => {
+    assert.equal(admitted(base({ retainedBareLocks: ["/bare.git"] })), false);
+  });
+  it("refuses a poisoned or disposed Codex registry and admits a closed one", () => {
+    assert.equal(admitted(base(safety("poisoned"))), false);
+    assert.equal(admitted(base(safety("disposed"))), false);
+    assert.equal(admitted(base(safety("closed"))), true);
+  });
+});
+
+describe("mid-turn checkpoint tick step logging (issue #3896)", () => {
+  const TICK_STEP = "mid-turn checkpoint tick step";
+  const tickSteps = (lines: unknown[]): Array<Record<string, unknown>> =>
+    (lines as Array<Record<string, unknown>>).filter((l) => l.msg === TICK_STEP);
+
+  it("a publishing tick logs its steps in order, each carrying the run id", async () => {
+    const tmp = scratchDir("tickstep");
+    const shim = writeShim(tmp, "detect");
+    const ctl = control();
+    const pub = stubPublish(async (_n, _tip, pack) => {
+      await drain(pack);
+      return LANDED;
+    });
+    const claim = gitlabClaim(3896_001);
+    const { logger, lines } = recordingLogger();
+    let outcome = "";
+    let before = 0;
+    let during: Array<Record<string, unknown>> = [];
+    try {
+      await mkRunner(
+        mkGit(fx.dataDir, shim),
+        turn(async (ctx) => {
+          commitIn(ctx.worktreePath, "T.txt", "t\n");
+          ctl.advance(INTERVAL_MS + 1);
+          before = tickSteps(lines).length;
+          outcome = await ctl.fire();
+          during = tickSteps(lines).slice(before);
+        }),
+        ctl,
+        {},
+        logger,
+      ).execute(claim);
+      assert.equal(outcome, "published");
+      const steps = during.map((l) => l.step);
+      // The expected subsequence the tick passes through; repeats between them are allowed.
+      const expected = ["fetch_back", "checkpoint_post_import", "checkpoint_steer", "checkpoint_bridge", "checkpoint_overlay"];
+      let at = 0;
+      for (const s of steps) if (s === expected[at]) at++;
+      assert.equal(at, expected.length, `ordered subsequence ${expected.join(",")} in ${JSON.stringify(steps)}`);
+      for (const l of during) {
+        assert.equal(l.run_id, claim.run_id);
+        assert.equal(l.level, "info");
+      }
+      assert.ok(during.every((l) => l.durationMs === undefined && l.outcome === undefined), "enter-only: no duration or outcome fields");
+    } finally {
+      pub.restore();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("the owed publish (a done checkpoint with no ticker) emits no tick step lines", async () => {
+    const tmp = scratchDir("owedstep");
+    const shim = writeShim(tmp, "detect");
+    const safety: CodexExecutionSafety = {
+      kind: "codex",
+      acceptsTerminalDisposal: () => false,
+      withBoundary: async (req, action) => {
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(new Error("boundary deadline")), req.deadlineMs);
+        try {
+          return await action({ epoch: 1, boundary: req.boundary, signal: ac.signal } as unknown as BoundaryPermit);
+        } finally {
+          clearTimeout(timer);
+        }
+      },
+      spawnBoundaryProcess: async (_permit, request) => {
+        const [command, ...args] = request.argv;
+        const child = spawn(command!, args, { cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"] });
+        const completed = new Promise<{ code: number }>((resolve, reject) => {
+          child.once("error", reject);
+          child.once("exit", (code, sig) => resolve({ code: code ?? (sig ? 128 : 1) }));
+        });
+        return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, cancel: async () => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await completed; }, completed };
+      },
+      dispose: async () => ({ kind: "disposed" }),
+    };
+    const pub = stubPublish(async (_n, _tip, pack) => {
+      await drain(pack);
+      return LANDED;
+    });
+    const ctl = control();
+    const claim = gitlabClaim(3896_002);
+    const { logger, lines } = recordingLogger();
+    let sha = "";
+    try {
+      const factory: ExecutorFactory = () => ({
+        executor: {
+          run: async (ctx: RunContext) => {
+            sha = commitIn(ctx.worktreePath, "O.txt", "o\n");
+            await ctx.checkpoint!({ reap: true, sink: "done_checkpoint" });
+            return { branch: ctx.branch };
+          },
+          safety,
+        },
+      });
+      await mkRunner(mkGit(fx.dataDir, shim), factory, ctl, { checkpointTickIntervalMs: 0, codexBoundaryDeadlineMs: 5_000 }, logger).execute(claim);
+      assert.ok(
+        (lines as Array<Record<string, unknown>>).some((l) => l.msg === "checkpoint publish deferred out of the Codex permit (scan_deferred)"),
+        "the done checkpoint deferred its publish, so the owed publish ran",
+      );
+      assert.ok(pub.tips.includes(sha), "the owed publish went out");
+      assert.deepEqual(tickSteps(lines), []);
     } finally {
       pub.restore();
       fs.rmSync(tmp, { recursive: true, force: true });

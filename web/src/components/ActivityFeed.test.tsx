@@ -55,6 +55,7 @@ function m(
 // filler the DTO requires.
 function runFixture(over: Partial<Run> = {}): Run {
   return {
+    harness_decision: null,
     id: "r1",
     repo_id: "repo1",
     forge_type: "gitlab",
@@ -175,6 +176,18 @@ describe("draft capture presentation", () => {
       expect(r.getByRole("heading", { name: "Full stream latest" })).toBeTruthy();
       expect(r.queryByRole("heading", { name: "Stale suffix" })).toBeNull();
       expect(JSON.stringify(messages)).toBe(original);
+    });
+  }
+});
+
+describe("summary skipped note (#3248)", () => {
+  const text = "Plan summary skipped: the run's Codex account is unavailable. The run continues.";
+  for (const view of ["agent", "timeline"] as const) {
+    it(`shows the fixed worker text in the ${view} view`, () => {
+      window.localStorage.setItem("uzi.activity.view", JSON.stringify(view));
+      const messages = [m(1, "status", { text, event: "summary_skipped", pass: "plan", reason: "account_unavailable" }, "worker")];
+      const r = renderFeed(messages);
+      expect(r.getAllByText(text).length).toBeGreaterThan(0);
     });
   }
 });

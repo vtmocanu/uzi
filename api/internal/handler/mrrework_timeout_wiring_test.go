@@ -68,6 +68,7 @@ func TestMRReworkAssessmentTimeoutWiring(t *testing.T) {
 				t.Fatal("unsupported params package")
 			}
 			fields := 0
+			recheck := ""
 			for _, elt := range literal.Elts {
 				kv, ok := elt.(*ast.KeyValueExpr)
 				if !ok {
@@ -76,6 +77,15 @@ func TestMRReworkAssessmentTimeoutWiring(t *testing.T) {
 				key, ok := kv.Key.(*ast.Ident)
 				if !ok {
 					t.Fatal("unsupported params key")
+				}
+				if key.Name == "RecheckNotEligible" {
+					// Issue #3422: only the owner's manual rework bypasses the not-eligible cache.
+					v, ok := kv.Value.(*ast.Ident)
+					if !ok {
+						t.Fatal("RecheckNotEligible must be a literal true or false")
+					}
+					recheck = v.Name
+					continue
 				}
 				if key.Name != "AssessmentTimeout" {
 					continue
@@ -99,6 +109,12 @@ func TestMRReworkAssessmentTimeoutWiring(t *testing.T) {
 			}
 			if fields > 1 || (tc.interactive && fields != 1) {
 				t.Fatalf("AssessmentTimeout fields=%d", fields)
+			}
+			if tc.interactive && recheck != "true" {
+				t.Fatalf("manual rework must set RecheckNotEligible: true, got %q", recheck)
+			}
+			if !tc.interactive && recheck != "" && recheck != "false" {
+				t.Fatalf("automatic watcher must keep the not-eligible cache, got RecheckNotEligible: %s", recheck)
 			}
 		})
 	}

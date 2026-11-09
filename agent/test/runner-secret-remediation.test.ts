@@ -142,6 +142,7 @@ interface Drive {
 async function drive(opts: {
   iid: number;
   forge: "github" | "gitlab";
+  attemptPaths?: boolean;
   body: (ctx: RunContext, gate: () => Promise<SecretRemediationDecision>, d: () => Drive) => Promise<void>;
   configure?: (g: GitCache) => void;
   /** Runs on the runner instance right after construction (e.g. to stub a private method). */
@@ -158,6 +159,10 @@ async function drive(opts: {
     pushed++;
     pushedTips.push(trackingOf(bare, branch));
   };
+  if (opts.attemptPaths) {
+    const bare = await g.ensureClone(fx.originPath);
+    gitIn(bare, ["config", "uzi-attemptmode.issue-" + opts.iid + ".enabled", "true"]);
+  }
   opts.configure?.(g);
   const pub = stubPublish();
   const claim = forgeClaim(opts.iid, opts.forge);
@@ -288,6 +293,68 @@ const trackingOf = (bare: string, branch: string): string =>
   execFileSync("git", ["--git-dir", bare, "rev-parse", `refs/uzi-runner/${branch}`], { encoding: "utf8" }).trim();
 
 describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
+  it("iteration resume preflight skips a published-only range without a secret scan", { skip }, async () => {
+    let scans = 0;
+    await drive({
+      iid: 1932_901, forge: "github",
+      configure: g => {
+        const original = g.secretScanCheckpointRange.bind(g);
+        g.secretScanCheckpointRange = async (...args) => { scans++; return original(...args); };
+      },
+      body: async ctx => {
+        const before = scans;
+        assert.deepEqual(await ctx.secretRemediationGate!({ unpublishedOnly: true }), { action: "proceed" });
+        assert.equal(scans, before, "published history is not scanned by advisory preflight");
+      },
+    });
+  });
+
+  it("iteration resume preflight regenerates guidance from unpublished commits", { skip }, async t => {
+    let elapsed = 0;
+    await drive({
+      iid: 1932_902, forge: "github",
+      body: async ctx => {
+        commitIn(ctx.worktreePath, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        const started = performance.now();
+        const decision = await ctx.secretRemediationGate!({ unpublishedOnly: true });
+        elapsed = performance.now() - started;
+        assert.equal(decision.action, "remediate");
+        if (decision.action === "remediate") assert.match(decision.followUp, /rewrite|fixup/);
+        // This test exercises guidance, not permission to publish a flagged tip.
+      },
+    });
+    t.diagnostic(`unpublished-range preflight elapsed_ms=${elapsed.toFixed(1)}`);
+  });
+
+  it("iteration resume preflight never requests a rewrite at the published floor", { skip }, async () => {
+    let published = "";
+    await drive({
+      iid: 1932_904, forge: "github",
+      seedFlight: flight => { if (published) flight.publishedRealTips = [published]; },
+      body: async (ctx, gate) => {
+        published = commitIn(ctx.worktreePath, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        // Seed the same published-only floor used by the existing done gate.
+        assert.equal((await gate()).action, "proceed");
+        assert.deepEqual(await ctx.secretRemediationGate!({ unpublishedOnly: true }), { action: "proceed" });
+      },
+    });
+  });
+
+  it("iteration resume preflight with an untrusted scan remains advisory", { skip }, async () => {
+    let scans = 0;
+    await drive({
+      iid: 1932_903, forge: "github",
+      configure: g => {
+        g.secretScanCheckpointRange = async () => { scans++; return { trusted: false, findings: [] }; };
+      },
+      body: async ctx => {
+        commitIn(ctx.worktreePath, "work.txt", "unpublished work\n");
+        assert.deepEqual(await ctx.secretRemediationGate!({ unpublishedOnly: true }), { action: "proceed" });
+        assert.ok(scans > 0, "the preflight exercised the untrusted scanner");
+      },
+    });
+  });
+
   it("(a) a flagged final commit above the floor is remediated by a fixup rewrite, then the run completes with a push", { skip }, async () => {
     const decisions: SecretRemediationDecision[] = [];
     let flagged = "";
@@ -1649,4 +1716,61 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
     assert.equal(d.pub.count(), 1);
     assert.ok(d.completed());
   });
+});
+
+
+for (const origin of ["checkpoint-pending", "pre-exit"] as const) {
+  it("M1 production " + origin + " persists exact attempt provenance", { skip }, async () => {
+    let observed = false;
+    const outcome = await drive({
+      iid: origin === "pre-exit" ? 3747_101 : 3747_102,
+      forge: origin === "pre-exit" ? "github" : "gitlab",
+      attemptPaths: true,
+      body: async (ctx, gate, d) => {
+        const q = commitIn(ctx.worktreePath, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        if (origin === "pre-exit") assert.equal((await gate()).action, "remediate");
+        else await ctx.checkpoint!({ reap: true });
+        const journal = JSON.parse(gitIn(d().bare, ["config", "--get", "uzi-recovery." + ctx.branch + ".clone"]));
+        const r = journal.remediationRecovery;
+        assert.ok(r);
+        assert.equal(r.active.origin, origin);
+        assert.equal(r.active.scannedTip, q);
+        assert.deepEqual(r.active.flaggedOIDs, [q]);
+        assert.deepEqual(r.active.originSource, {
+          runId: journal.runId, clonePath: ctx.worktreePath, attemptId: journal.attemptId,
+        });
+        observed = true;
+      },
+    });
+    assert.ok(observed, outcome.everything());
+    assert.deepEqual(errors, []);
+  });
+}
+
+it("M1 production checkpoint refuses mixed valid and invalid finding identities atomically", { skip }, async () => {
+  let observed = false;
+  let scanned = false;
+  await drive({
+    iid: 3747_103, forge: "gitlab", attemptPaths: true,
+    configure: g => {
+      const scan = g.secretScanCheckpointRange.bind(g);
+      g.secretScanCheckpointRange = async (...args) => {
+        const result = await scan(...args);
+        scanned ||= result.findings.length > 0;
+        return result.findings.length
+          ? { ...result, findings: [...result.findings, { ...result.findings[0]!, commit: "invalid" }] }
+          : result;
+      };
+    },
+    body: async (ctx, _gate, d) => {
+      commitIn(ctx.worktreePath, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+      await ctx.checkpoint!({ reap: true });
+      const journal = JSON.parse(gitIn(d().bare, ["config", "--get", "uzi-recovery." + ctx.branch + ".clone"]));
+      assert.equal(journal.remediationRecovery, undefined);
+      observed = true;
+    },
+  });
+  assert.ok(observed);
+  assert.ok(scanned);
+  assert.deepEqual(errors, []);
 });

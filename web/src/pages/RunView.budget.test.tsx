@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { NearTimeoutPanel, RunView } from "./RunView";
+import { ExtendTimePopover } from "../components/ExtendTimePopover";
 import { useRunStream } from "../lib/useRunStream";
 import { api, type Run } from "../lib/api";
 
@@ -56,6 +57,7 @@ beforeEach(() => {
 
 function run(over: Partial<Run>): Run {
   return {
+    harness_decision: null,
     id: "r1",
     repo_id: "repo1",
     forge_type: "gitlab",
@@ -165,6 +167,43 @@ function renderPage(over: Partial<Run>, canSteer = true) {
 }
 
 describe("RunView — budget-aware elapsed (PRD #1189)", () => {
+  it("shows the known finalization reserve beside frozen wall and extension in the parked header", async () => {
+    renderPage(budgeted({
+      status: "paused",
+      deadline_at: null,
+      budget_wall_seconds: 3600,
+      budget_extension_seconds: 3600,
+      budget_total_seconds: 9000,
+      budget_used_seconds: 6000,
+    }));
+    await screen.findByText("Add rate limiting");
+    const budget = screen.getByText("/ 1h+1h+30m finalization reserve · 50m left when resumed · clock stopped");
+    expect(budget.parentElement?.textContent).toBe("1h 40m / 1h+1h+30m finalization reserve · 50m left when resumed · clock stopped");
+  });
+
+  it("shows the shared complete budget in Extend facts while keeping extension and cap facts", () => {
+    render(
+      <ExtendTimePopover
+        run={run(budgeted({
+          status: "paused",
+          deadline_at: null,
+          budget_wall_seconds: 3600,
+          budget_extension_seconds: 3600,
+          budget_total_seconds: 9000,
+          budget_used_seconds: 6000,
+        }))}
+        busy={false}
+        onSubmit={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /extend time/i }));
+    const panel = within(screen.getByRole("dialog", { name: "Extend this run" }));
+    expect(panel.getByText("1h 40m of 1h+1h+30m finalization reserve")).toBeTruthy();
+    expect(panel.getByText("Extended so far").nextElementSibling?.textContent).toBe("1h");
+    expect(panel.getByText("Up to 16h per extension")).toBeTruthy();
+    expect(panel.getByText("2h 50m left when resumed")).toBeTruthy();
+  });
+
   it("shows `/ 8h` for a running issue run that carries a budget", async () => {
     renderPage(budgeted());
     await screen.findByText("Add rate limiting");

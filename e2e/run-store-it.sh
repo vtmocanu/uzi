@@ -14,7 +14,8 @@
 # Spins up a THROWAWAY Postgres, points UZI_TEST_DATABASE_URL at it, applies the
 # real goose migrations, seeds fixtures, and runs every *LiveDB test in the seven
 # packages that carry one (store, handler, forgesvc, schedsvc, workersvc, recovery, poller -- the
-# list on the `go test` line below, mirrored in .github/workflows/ci.yml).
+# list on the `go test` line below; ci.yml runs this script once, via
+# `task test:codex-refresh-lostreply-e2e`, for both CI contexts).
 # Isolated: unique container + published loopback port, torn down on exit; never
 # touches the user's own stacks or DBs.
 #
@@ -117,7 +118,7 @@ cd "$ROOT/api"
 # here, not by ci.yml -- while their own skip messages named this script. A *LiveDB
 # test in a package this line does not list never runs anywhere, and `go test
 # ./...` prints `ok` for it all the same. When a *LiveDB test lands in a new
-# package, add the package HERE and in ci.yml's "LiveDB tests" step, in the same
+# package, add the package HERE (the one list; ci.yml carries none), in the same
 # commit.
 #
 # -p 1 IS LOAD-BEARING, NOT A SPEED KNOB — do not drop it to parallelize the run.
@@ -137,7 +138,7 @@ cd "$ROOT/api"
 # second one failed on the UNIQUE constraint). Derive token hashes from a fresh
 # uuid, the way handler/hosted_provision_livedb_test.go documents.
 #
-# PKGS is the ONE list; ci.yml's "LiveDB tests" step carries the same seven, and the
+# PKGS is the ONE list (ci.yml runs this script, not a copy), and the
 # per-package check below is what makes a stale list visible: a listed package that
 # contributes zero *LiveDB tests prints `ok <pkg> 0.01s [no tests to run]`, which the
 # aggregate exit code and the aggregate PASS count both read as green.
@@ -176,12 +177,12 @@ for p in "${PKGS[@]}"; do
     -timeout "$timeout" -run 'LiveDB$' "$p" 2>&1 | tee -a "$LOG"
 done
 
-# Gate on the gate, mirrored from ci.yml. (1) Aggregate: the suite must have RUN
+# Gate on the gate. (1) Aggregate: the suite must have RUN
 # something and SKIPPED nothing -- with the DSN unset or Postgres unreachable every test
 # self-skips and `go test` still prints ok. (2) Per package: each listed package must
 # have produced an `ok <pkg> <N>s` line with NO `[no tests to run]` suffix, so a package
 # whose LiveDB tests were renamed, moved, or never existed cannot hide behind the others.
-# The aggregate check (ran > 0, no skip at ANY indentation) is shared with ci.yml.
+# The aggregate check (ran > 0, no skip at ANY indentation) is no longer duplicated in ci.yml.
 if ! "$ROOT/scripts/livedb-skip-guard.sh" "$LOG"; then
   printf '\n\033[1;31m==> FAIL: the live-DB tests did not actually run against Postgres.\033[0m\n' >&2
   exit 1
@@ -242,13 +243,13 @@ fi
 if [ -n "${UZI_CODEX_REFRESH_LOSTREPLY_E2E:-}" ]; then
   E2E_LOG="$(mktemp "${TMPDIR:-/tmp}/codex-recovery-log.XXXXXX")"
   UZI_TEST_DATABASE_URL="$DSN" go test -buildvcs=false -count=1 -v -race -p 1 \
-    -run '^Test(Codex(RefreshLostReply|RetainedStop)|PrerequisiteClosureRelease)E2E$' ./internal/handler/... 2>&1 | tee "$E2E_LOG"
+    -run '^Test(Codex(RefreshLostReply|RetainedStop)|PrerequisiteClosureRelease|RecoveryRestoreWorkerClientSmall)E2E$' ./internal/handler/... 2>&1 | tee "$E2E_LOG"
   # A named RUN and PASS are mandatory; inspect all indentation levels for skips.
   if grep -q -- '--- SKIP:' "$E2E_LOG"; then
     echo "combined Codex proof skipped: $E2E_LOG" >&2
     exit 1
   fi
-  for proof in TestCodexRefreshLostReplyE2E TestCodexRetainedStopE2E TestPrerequisiteClosureReleaseE2E; do
+  for proof in TestCodexRefreshLostReplyE2E TestCodexRetainedStopE2E TestPrerequisiteClosureReleaseE2E TestRecoveryRestoreWorkerClientSmallE2E; do
     if ! grep -Fxq "=== RUN   $proof" "$E2E_LOG" ||
       ! grep -q "^--- PASS: $proof " "$E2E_LOG"; then
       echo "combined Codex proof did not run and pass: $proof ($E2E_LOG)" >&2

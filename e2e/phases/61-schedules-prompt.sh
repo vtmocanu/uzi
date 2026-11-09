@@ -49,9 +49,12 @@ RUN_P_JSON="$(apiget "/api/runs/$RUN_P")"
 pass "prompt run $RUN_P is kind=prompt with a null issue_iid"
 
 wait_status "$RUN_P" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
-MR_P="$(apiget "/api/runs/$RUN_P" | jq -r '.run.mr_iid')"
+RUN_P_JSON="$(apiget "/api/runs/$RUN_P")"
+MR_P="$(echo "$RUN_P_JSON" | jq -r '.run.mr_iid')"
 { [ "$MR_P" != null ] && [ "$MR_P" -gt 0 ]; } || fail "prompt run opened no MR (got $MR_P)"
-pass "prompt run $RUN_P completed through the stub and opened MR !$MR_P"
+echo "$RUN_P_JSON" | jq -e '.run | has("created_issues") | not' >/dev/null \
+  || fail "an MR-mode prompt run must omit created_issues"
+pass "prompt run $RUN_P completed through the stub and opened MR !$MR_P without created issues"
 
 uzi_cli schedule delete "$SID" >/dev/null || fail "schedule delete failed (exit $?)"
 pass "deleted prompt schedule $SID; run terminal (quarantine-clean)"

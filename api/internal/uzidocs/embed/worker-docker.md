@@ -103,7 +103,11 @@ containers. These checks do not establish daemon-wide exclusion: accepted
 Docker work may still overlap. Unknown, missing, or stale custody skips the
 attempt. Look for `dind-prune-completed`,
 `dind-prune-failed`, `dind-prune-insufficient`, or `dind-prune-deferred` in
-the worker's logs to see what it did.
+the worker's logs to see what it did. The pressure-only anonymous-volume leg
+(below) logs its own tokens: `dind-volume-prune-completed`,
+`dind-volume-prune-after`, `dind-volume-prune-refused`,
+`dind-volume-prune-conflict`, `dind-volume-prune-rejected`,
+`dind-volume-prune-unknown`, and `dind-volume-prune-deferred`.
 
 Custody is **worker-wide at prune admission**: an open recovery hold keeps a
 new attempt out of this original cache/image-prune sequence, even when other
@@ -113,7 +117,8 @@ Classifying DinD as scratch does not alone supersede the D5 custody gate.
 The [M1 investigation](../adr/1759-dind-data-metering-and-prune.md#investigation-checkpoint--3653-m1-2026-10-30)
 found that native BuildKit protects acquired cache references, supporting a
 proposal for a narrow builder-only amendment at a new gate. That proposal
-is not activated policy or permission to prune while custody is held.
+is not activated policy or permission to prune images or build cache while
+custody is held. The anonymous-volume leg below is a separate, narrower path.
 
 **Cache prune leaves containers and volumes in place.** It is tried first when
 eligible, but a skip, failure, timeout, or insufficient relief does not
@@ -123,6 +128,64 @@ anonymous-volume and PVC gates (#2257), unchanged below. Busy-worker
 deferral, a pending maintenance drain, and insufficient relief are distinct
 conditions. The investigation measured disposable fixtures; hosted reclaimed
 bytes remain unmeasured. Cache and maintenance thresholds are unchanged.
+
+### Pressure-only anonymous-volume prune
+
+A worker that is always busy or custody-held never reaches the cache prune or
+the terminal-only maintenance gate, so leaked anonymous volumes could fill the
+data root with no reclaim path. A separate leg (#3891) covers that case. It is
+controlled by `UZI_DIND_PRUNE_ENABLED` (hosted Docker wiring on a non-ephemeral
+worker; the chart renders it from `workers.diskRecycleEnabled`) and it runs on
+busy and custody-held workers alike.
+
+- **Trigger.** Two distinct fresh meter samples at or above 85% of bytes **or**
+  inodes.
+- **Commands.** Exactly one `docker version --format {{.Server.APIVersion}}`
+  check, which must report API 1.42 or newer, then `docker volume prune -f`.
+  Both run with `DOCKER_API_VERSION=1.42` in the leg's own child environment
+  only (an unpinned client could otherwise send a lower request version that
+  also prunes unused named volumes); no other Docker command's environment
+  changes. The timeouts are 30s for the version check and 5 minutes for the
+  prune. The leg is single-flight, with one prune exec per attempt and no
+  retry at another API version.
+- **Backoff.** 1 hour, re-armed early when both bytes and inodes are below 75%.
+  After an `unknown` outcome the full hour always applies (backoff state is kept in the worker process, so a worker restart re-arms the leg).
+- **What it does not do.** It never closes the claim gate and never waits for
+  idle, terminal runs or custody; claims, parked resumes and model commands
+  continue. It defers (`dind-volume-prune-deferred`) only while DinD
+  maintenance holds its fence. It does not touch images, build cache,
+  containers, named volumes, networks, PVCs or `/data/runner`.
+- **Outcomes.** `completed` logs the before-sample ratios and the numeric
+  reclaimed size, then `after` logs the first fresh sample following the prune.
+  `refused` means nothing was submitted (spawn failure, or a server API below
+  1.42 or unreadable). `conflict` means the daemon reports a prune already
+  running. `rejected` is any other daemon error response. `unknown` means the
+  command was submitted but its result is not known (timeout, shutdown, output
+  overflow, or a lost response). `rejected` and `unknown` log the note
+  "outcome not proven; no reclamation or preservation claimed", and neither is
+  success.
+- **Engine behavior relied on.** Checked against the Moby source at commit
+  `3ce5872b7950c63ba2ffbc5123101019ff3e6682`: reference acquisition and removal
+  share a per-name volume lock and removal rechecks references under it, so
+  volumes referenced by running or stopped containers survive; a second
+  concurrent prune gets a Conflict; anonymous volumes created with
+  local-driver options are excluded. An accepted-but-not-yet-visible volume
+  create is not itself a reference, so the prune can remove that volume before
+  the reference is recorded. That is the owner-accepted scratch boundary, not
+  complete Docker-operation exclusion; the leg does not solve #1860 or #3387.
+  If maintenance fences while a leg prune is in flight, maintenance's own prune
+  may get a Conflict and then follows its unchanged skip-to-recycle path.
+- **Default-on.** Already-enabled persistent Docker workers get this leg once
+  the fixed worker deploys. The opt-out is `workers.diskRecycleEnabled: false`
+  / `UZI_WORKER_DISK_RECYCLE_ENABLED=false`. It is not leg-only: it also
+  disables PVC recycle and the cache prune, and flipping it rolls
+  non-ephemeral Docker worker pods.
+- **Proof.** `task test:dind-volume-prune` ran against a disposable daemon
+  reporting Server 29.8.0, GitCommit `3ce5872` and MinAPIVersion 1.40 (see
+  [e2e/dind-recycle/README.md](../e2e/dind-recycle/README.md)). It is
+  sequential and does not exercise a create racing the prune. Hosted behavior
+  under real pressure is not yet verified; that acceptance is maintainer-owned
+  after deploy.
 
 ### DinD scratch and pressure recycle
 
@@ -162,7 +225,10 @@ Once the server atomically proves no nonterminal claims and fences all
 claims, the worker must also prove zero local activity and fresh
 post-activity custody clearance for the matching maintenance identity.
 Within that gate it may make one read-only Docker **server** API version
-check; at API 1.42 or newer it runs exactly `docker volume prune -f`.
+check; at API 1.42 or newer it runs exactly `docker volume prune -f`. This
+maintenance prune stays terminal- and custody-gated; the
+[pressure-only leg](#pressure-only-anonymous-volume-prune) is the one
+exception, for busy and custody-held workers.
 This removes unreferenced anonymous volumes, keeping named volumes and
 volumes referenced by any container, including stopped containers. A newer
 fresh sample below the watermark reopens admission without recycling.
@@ -187,10 +253,13 @@ maintenance; compose keeps its manual cleanup path.
 **Manual fallback.** Delete the worker and reprovision it (the
 [Workers page](./hosted-workers.md), or `uzi worker rm <worker-id>` +
 re-provision): this tears down the pod and its `dind-data` PVC and re-creates
-it empty. That's a heavier lever than the automatic `/nix`/`/data` recycle
-([ADR-837](../adr/0837-worker-disk-lifecycle.md)), which reclaims those two
-volumes by deleting and re-creating the PVCs in place, without deleting the
-worker itself. A compose worker has no meter or automatic prune (`dind-meter`
+it empty. Worker removal also destroys the data PVC and run clones; it is
+not the supported settled-tree cleanup procedure for a full data volume.
+Automatic Docker pressure recycle preserves `/data` and selects Nix only
+when the latest pressure causes explicitly include `nix`
+([ADR-837](../adr/0837-worker-disk-lifecycle.md)); data-only pressure yields
+to eligible DinD maintenance. Nix size drift is independent and unchanged.
+A compose worker has no meter or automatic prune (`dind-meter`
 is a hosted-only sidecar); reclaim its `dinddata` volume the same way as
 `agentnix` — see [Worker setup](./worker-setup.md#resource-stats-and-sizing).
 
@@ -205,15 +274,26 @@ per-pod `emptyDir`.
 - **Pod replacement keeps clones.** Eviction, a reschedule, a roll or a
   deleted pod no longer loses a run's clone or its uncommitted edits on a
   worker that runs this layout. A reschedule to another node also depends on
-  the data StorageClass supporting reattach, which has not been verified. Deleting or recycling the `/data` volume
-  itself still deletes it, as on a non-Docker worker: the automatic
-  `/nix`+`/data` recycle of a worker that holds no recovery custody, and
-  removal of an ephemeral worker. A DinD-only maintenance recycle keeps
+  the data StorageClass supporting reattach, which has not been verified.
+  Manual data-PVC deletion and ephemeral-worker teardown still physically
+  delete clones. Since #3852, automatic pressure recycle preserves Docker
+  `/data` regardless of custody or layout, including under ForceRoll or an
+  elapsed deadline. **Deploy the fixed controller:** old controllers can
+  still delete data. A DinD-only maintenance recycle keeps
   `/data/runner`. Scratch under `TMPDIR` (`/data/runner/.tmp`) is excluded
   from these durability guarantees.
 - **The data volume now holds more.** Clones and daemon-owned bytes count
   against the volume's existing pressure thresholds; there is no Docker-specific
-  threshold, and the volume sizes are unchanged.
+  threshold, and the volume sizes are unchanged. A full Docker data PVC can
+  leave capacity degraded. Existing run park-and-trim and supported manual
+  settled-tree cleanup remain the reclaim paths; see
+  [Run recovery](./run-recovery.md). PRD #3431 M1b settlement/deletion is not
+  started and #3329's genuine-idle reclaim roll remains deferred; no new
+  reclaim authority is granted. Data-pressure deferral neither requests nor
+  clears drains: existing pressure drains persist until pressure clears,
+  and the worker stays out of roll coverage. Independent Nix pressure can
+  still deadline-interrupt a busy pod; that separate owner question remains
+  outside #3852.
 - **Rootless dind cannot write into run checkouts.** A
   rootless dind container runs as host uid 1000 (typically a 100000+ subuid
   range for a non-root container user; the range depends on the image and is
@@ -265,6 +345,15 @@ carries extra fields (a count only; list entries carry no marker). Partial or un
 The line also carries `authority` (`undeclared`, `legacy_evidence`,
 `contradicted`, `unproven` or `attested`, with a fixed reason),
 `evidence_version` and, once version-2 binding and prefix checks pass, the node's kernel release.
+
+For `inventory_partial`, the log's `partial_causes` contains sparse, bounded
+event counters. `measurement_entry_cap` records a measurement limit and
+`measurement_filesystem_error` a filesystem failure; `ownership_read_` and
+`holds_read_` keys classify failures at those read stages. Counters saturate at
+**65535**; a missing counter does not establish that unvisited work was clean.
+No raw errors, URLs, paths or IDs appear in this object, and eligibility and
+authority are unchanged. See the
+[full #3775 diagnostic contract](../prds/3431-pod-epoch-reclaim.md#3775-partial-shadow-diagnostic-contract).
 
 **This is shadow reporting:** the pass deletes no attempt trees, settles no
 records, releases no recovery holds and removes no stopped containers. Existing
@@ -380,6 +469,27 @@ hold](./run-recovery.md#retained-sources-with-no-open-hold-worker-local-inspect-
 and the residuals in
 [ADR-3153](../adr/3153-runner-shared-pvc-subpath.md)). Disk pressure never
 authorizes bypassing recovery custody or writer exclusion.
+
+## DinD data volume size and expansion
+
+A hosted Docker worker's `dind-data` PVC defaults per worker size: **20Gi** for `s` and
+`m`, **50Gi** for `l` and `l-highmem`. Setting the chart value `workers.docker.dindDataSize`
+(`UZI_WORKER_DIND_DATA_SIZE`) overrides every size, including a retained `20Gi`, an explicit
+`30Gi`, or a value kept by `helm upgrade --reuse-values`: an explicit `30Gi` does not become
+`50Gi`. The chart default is empty; clear the value to use the per-size defaults.
+
+The controller grows an existing `dind-data` (and `/data`) claim to the current size when its
+StorageClass allows volume expansion and the controller can read that class
+(`workers.storageClassRead.create`, on by default). It never shrinks, deletes or recreates the
+claim and rolls no pod. It waits while the worker's roll entry is not admitted (a roll active anywhere in its coverage pool,
+or missing roll evidence), during active DinD maintenance, while the roll state is uncertain, (data volume
+only) while a roll reservation is held, or when the claim's identity changed, and logs `pvc-expand-deferred` with the reason.
+Accepted growth raises the request first; the filesystem can stay pending until the driver
+finishes online; otherwise it stays pending (`pvc-resize-pending`) until the next independently authorized idle roll remounts it (for example an image or spec change rolled while idle, or an operator-initiated idle restart per [the supported procedure](https://github.com/vtmocanu/uzi/blob/main/deploy/README.md#remounting-a-pending-expansion-at-an-idle-restart)). Expansion never triggers a roll. The default
+Docker-tier storage quota is 1200Gi for ten workers; a quota kept at 900Gi can refuse the growth once the tier's
+claims reach the quota (a full 10-worker `l` fleet needs 1200Gi); the refusal is logged as `pvc-expand-failed reason=forbidden`. Design and the full log
+token list: [ADR-3890](../adr/3890-worker-pvc-expansion.md); operator procedure:
+[deploy/README.md](https://github.com/vtmocanu/uzi/blob/main/deploy/README.md#expanding-existing-worker-data-volumes).
 
 ## Cost
 

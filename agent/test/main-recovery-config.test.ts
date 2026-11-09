@@ -1,9 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { randomUUID } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import { loadConfig } from "../src/config.js";
-import { buildWorkerGitCache, buildRecoveryLiveTiming } from "../src/main.js";
+import { buildWorkerGitCache, buildRecoveryLiveTiming, buildAfterPublicationEnrolled } from "../src/main.js";
 import { GitCache } from "../src/git.js";
 import { RecoveryClosureLimitError } from "../src/recovery-closure.js";
 import { makeFixture } from "./fixture-repo.js";
@@ -85,3 +86,37 @@ for (const override of [undefined, "4096", "1"]) {
     } finally { fx.cleanup(); }
   });
 }
+
+test("publication cut builder is absent for sdk/codex and inert without its exclusive sentinel", async () => {
+  const log = nullLogger();
+  log.info = () => { throw new Error("unexpected readiness"); };
+  assert.equal(buildAfterPublicationEnrolled("sdk", log), undefined);
+  // Claude and Codex both use the sdk executor configuration.
+  assert.equal(buildAfterPublicationEnrolled(loadConfig({ UZI_API_URL: "http://api:8080",
+    UZI_WORKER_TOKEN: "fixture-token", UZI_EXECUTOR: "sdk" }).executor, log), undefined);
+  const callback = buildAfterPublicationEnrolled("stub", log)!;
+  const before = process.getActiveResourcesInfo().sort();
+  for (const issueDescription of ["", "UZI_STUB_OUTBOX_CUT_BARRIER", "UZI_STUB_OUTBOX_FIRST_CUT_BARRIER"]) {
+    await callback({ runId: "invalid-inert-id", claimGeneration: 1, issueDescription });
+  }
+  assert.deepEqual(process.getActiveResourcesInfo().sort(), before);
+  const main = fs.readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+  assert.match(main, /afterPublicationEnrolled: buildAfterPublicationEnrolled\(config.executor, log\)/);
+});
+
+test("publication sentinel announces only stable identity fields after arming the marker wait", async () => {
+  const runId = randomUUID(), marker = `/tmp/cdr-outbox-cut-${runId}`;
+  const log = nullLogger();
+  const lines: unknown[] = [];
+  log.info = (message, fields) => {
+    lines.push({ message, fields });
+    fs.writeFileSync(marker, "cut");
+  };
+  try {
+    await buildAfterPublicationEnrolled("stub", log)!({ runId, claimGeneration: 4,
+      issueDescription: "UZI_STUB_OUTBOX_PUBLICATION_CUT_BARRIER" });
+    assert.deepEqual(lines, [{ message: "stub: outbox publication enrolled waiting for API cut",
+      fields: { run_id: runId, claim_generation: 4 } }]);
+    assert.equal(fs.existsSync(marker), false);
+  } finally { fs.rmSync(marker, { force: true }); }
+});

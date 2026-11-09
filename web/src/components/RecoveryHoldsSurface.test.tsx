@@ -61,10 +61,10 @@ function listing(holds: RecoveryCustodyHold[], over: Partial<RecoveryCustodyHold
   };
 }
 
-async function renderSurface(resp: RecoveryCustodyHolds) {
+async function renderSurface(resp: RecoveryCustodyHolds, initialEntries?: string[]) {
   mockApi.getRecoveryHolds.mockResolvedValue(resp);
   const utils = render(
-    <MemoryRouter>
+    <MemoryRouter initialEntries={initialEntries}>
       <RecoveryHoldsSurface />
     </MemoryRouter>,
   );
@@ -103,7 +103,7 @@ describe("RecoveryHoldsSurface", () => {
     fireEvent.click(screen.getByRole("button", { name: /Discard held work/ }));
     const group = screen.getByRole("group", { name: "Discard held work for run run-xyz on jvm-worker, generation 4" });
     const warning = document.getElementById(group.getAttribute("aria-describedby")!)!;
-    expect(warning.textContent).toContain("An earlier available archive can restore older work but may not cover the latest worker-local work.");
+    expect(warning.textContent).toContain("An earlier available archive requires its prerequisite commits to restore older work and may not cover the latest worker-local work.");
     expect(warning.textContent).toContain("The latest worker-local source may be the only copy.");
     expect(warning.textContent).not.toContain("no server archive can restore it");
     expect(warning.textContent).toContain("hold h-src");
@@ -627,6 +627,56 @@ describe("RecoveryHoldsSurface", () => {
       const section = screen.getByRole("region", { name: "Counting toward the limit" });
       expect(within(section).getAllByRole("listitem")).toHaveLength(1);
       expect(within(section).queryByRole("button", { name: /Discard held work/ })).toBeNull();
+    });
+  });
+
+  describe("requested holds (?hold=)", () => {
+    const healthy = () => listing([hold({ id: "hold-ok", run_id: "run-ok", attention: "active" })]);
+
+    it("renders nothing for a healthy listing without the param", async () => {
+      const { container } = await renderSurface(healthy());
+      expect(container.textContent).toBe("");
+    });
+
+    it("pins a requested healthy hold with its id, focus, and no discard affordance", async () => {
+      await renderSurface(healthy(), ["/workers?tab=workers&hold=hold-ok"]);
+      const section = screen.getByRole("region", { name: "Requested holds" });
+      const li = document.getElementById("recovery-hold-hold-ok");
+      expect(li).toBeTruthy();
+      expect(section.contains(li)).toBe(true);
+      expect(within(li as HTMLElement).queryByRole("button", { name: /Discard/ })).toBeNull();
+      expect(document.activeElement).toBe(li);
+    });
+
+    it("does not render a decision-group hold twice and focuses it in place", async () => {
+      await renderSurface(
+        listing([hold({ id: "hold-src", run_id: "run-src", attention: "source_only" })]),
+        ["/workers?hold=hold-src"],
+      );
+      expect(document.querySelectorAll("#recovery-hold-hold-src")).toHaveLength(1);
+      expect(screen.queryByRole("region", { name: "Requested holds" })).toBeNull();
+      expect(document.activeElement).toBe(document.getElementById("recovery-hold-hold-src"));
+    });
+
+    it("says a requested hold that is not open anymore", async () => {
+      await renderSurface(healthy(), ["/workers?hold=gone-1234567890"]);
+      const section = screen.getByRole("region", { name: "Requested holds" });
+      expect(section.textContent).toContain("This hold is no longer open.");
+      expect(section.textContent).toContain("gone-123");
+    });
+
+    it("focuses once per requested set and does not steal focus on a poll", async () => {
+      await renderSurface(healthy(), ["/workers?hold=hold-ok"]);
+      const li = document.getElementById("recovery-hold-hold-ok") as HTMLElement;
+      expect(document.activeElement).toBe(li);
+      li.blur();
+      mockApi.getRecoveryHolds.mockResolvedValue(healthy());
+      // Re-load via visibility poll equivalent: fire a visibilitychange.
+      await act(async () => {
+        document.dispatchEvent(new Event("visibilitychange"));
+        await Promise.resolve();
+      });
+      expect(document.activeElement).not.toBe(document.getElementById("recovery-hold-hold-ok"));
     });
   });
 });

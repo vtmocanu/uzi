@@ -13,7 +13,17 @@ import type { CanonicalReseedOptions, GitCacheOptions } from "../src/git.js";
 import type { Logger } from "../src/log.js";
 import type { WorkerClient } from "../src/client.js";
 import { ChatSteering, SteeringChannel } from "../src/steering.js";
-import type { ClaimResponse, UserInput } from "../src/protocol.js";
+import type { AgentTemplate, ClaimResponse, UserInput } from "../src/protocol.js";
+
+/** Preserve the delivered roster order and names; a null fixture pin means no model key. */
+export function leadRequestCaseAgents(c: {
+  id: string; templateModel?: string; agents?: Array<{ name: string; model?: string | null }>;
+}): AgentTemplate[] {
+  return (c.agents ?? [{ name: "lead", model: c.templateModel }]).map((t, i) => ({
+    name: t.name, description: `fixture ${c.id} ${i}`, prompt_body: `OWNER ${c.id} BODY ${i}`,
+    ...(t.model != null ? { model: t.model } : {}),
+  }));
+}
 
 /** issue #1783 M3 (N5): the canonical-reseed options for suites whose subject is not the canonical
  *  free. The git layer requires them on every entry point (there is no unproven plain-`fs.rm`
@@ -88,6 +98,24 @@ export function recordingLogger(): { logger: Logger; lines: unknown[] } {
     return self;
   };
   return { logger: make({}), lines };
+}
+
+const GIT_LOCATION_VARS = [
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_INDEX_FILE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_COMMON_DIR",
+  "GIT_NAMESPACE",
+  "GIT_CEILING_DIRECTORIES",
+  "GIT_PREFIX",
+];
+
+export function hermeticGitEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of GIT_LOCATION_VARS) delete env[key];
+  return { ...env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
 }
 
 /** A minimal valid claim; override any field per test. */

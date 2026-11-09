@@ -49,13 +49,14 @@ say "PRD #108 M5: auto-stop kills a run whose messages can't be saved (direct-to
 login  # fresh admin session: unlocks the vault so a claim can assemble its payload
 
 # Mint the synthetic worker's join token, register it, and land one heartbeat.
-# It advertises completion_interlock_v1 because the completion interlock is on by default
-# for Claude issue runs (issue #1626): an unadvertised worker could never claim these runs.
+# Use the shared claim-only capabilities, including the frozen repo-agent reader
+# required for new claims (#3940), without promising executor/recovery protocols.
 ASW="$(apipost /api/workers '{"name":"e2e-autostop"}')"
 WTOK="$(printf '%s' "$ASW" | jq -r '.token')"
 { [ -n "$WTOK" ] && [ "$WTOK" != null ]; } || fail "auto-stop phase: could not mint the synthetic worker token"
 curl -fsS -X POST "$BASE/api/worker/register" -H "Authorization: Bearer $WTOK" \
-  -H 'Content-Type: application/json' -d '{"version":"0.9.0-e2e","max_concurrent_runs":2,"protocol_capabilities":["completion_interlock_v1"]}' >/dev/null \
+  -H 'Content-Type: application/json' \
+  -d "$(jq -cn --argjson caps "$(synthetic_issue_worker_capabilities)" '{version:"0.9.0-e2e",max_concurrent_runs:2,protocol_capabilities:$caps}')" >/dev/null \
   || fail "auto-stop phase: synthetic worker register failed"
 curl -fsS -X POST "$BASE/api/worker/heartbeat" -H "Authorization: Bearer $WTOK" \
   -H 'Content-Type: application/json' -d '{}' >/dev/null \
@@ -239,7 +240,7 @@ pass "doc remedy proven: 'uzi worker list' shows the VERSION column and the work
 # LIVE poller for B, so the cancel is only enqueued (stop_kind='cancelled' stamped) and
 # waits for the worker; it never polls inputs, so B stayed `running` and the driver's
 # quarantine logged a LEAK. Do the worker's half the way a real one does after consuming
-# a cancel: report `failed`, which the api routes to CancelRunByWorker because
+# a cancel: report `failed`, which the api routes to CancelRunByWorkerSettlingCancel because
 # stop_kind is already 'cancelled' (workersvc SetState, "failed" arm).
 # Report `failed` only after the cancel was accepted: without the stamped stop_kind the
 # report would record an ordinary agent failure instead of a cancellation.

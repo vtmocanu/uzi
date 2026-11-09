@@ -326,6 +326,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		// PRD #1809 M5: the disk-only lifetime counter of counted data_volume_full parks.
 		DiskParkCount: int(r.DiskParkCount),
 		// PRD #1733: the open provider-park streak (count, and when it began; null when none).
+		PolicyHold:                  policyHoldDTO(r),
 		ProviderParkCount:           int(r.ProviderParkCount),
 		ProviderParkStreakStartedAt: timePtr(r.ProviderParkStreakStartedAt.Valid, r.ProviderParkStreakStartedAt.Time),
 		// PRD #1809 M6 (D8): the latest park's checkpoint-durability report (absent = not reported).
@@ -423,12 +424,16 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 	} else {
 		dto.RepoAgents = agents
 	}
+	dto.RepoAgentSourceCommit = textPtrValue(r.RepoAgentSourceCommit.Valid, r.RepoAgentSourceCommit.String)
 	if excl, err := workersvc.DecodeExclusions(r.AgentExclusions); err != nil {
 		slog.Error("decode run agent exclusions", "run_id", r.ID, "error", err)
 	} else {
 		dto.AgentExclusions = excl
 	}
 	dto.AgentSource = textPtrValue(r.AgentSource.Valid, r.AgentSource.String)
+	dto.AgentSourceRequested = textPtrValue(r.AgentSourceRequested.Valid, r.AgentSourceRequested.String)
+	dto.AgentSourceRequestedBasis = textPtrValue(r.AgentSourceRequestedBasis.Valid, r.AgentSourceRequestedBasis.String)
+	dto.PlanAgentSource = textPtrValue(r.PlanAgentSource.Valid, r.PlanAgentSource.String)
 	// PRD #122 M1: the FROZEN milestone list. Degrades gracefully on a decode error
 	// (impossible in practice — every write is validated and the column carries a
 	// jsonb_typeof CHECK), logged and treated as "no list" rather than failing the read.
@@ -829,7 +834,7 @@ func runJobDTO(d *workersvc.JobRunDetail) *apitypes.RunJobDTO {
 // Evidence is historical; it never asserts latest work or current forge availability.
 func workerRecoveryDTO(r store.Run, limit int) *apitypes.WorkerRecoveryDTO {
 	if r.WorkerRecoveryEpisode == 0 && len(r.WorkerRecoveryEvidence) == 0 &&
-		(!r.RecoveryWaitCause.Valid || (r.RecoveryWaitCause.String != "worker_requeue_exhausted" && r.RecoveryWaitCause.String != "retained_recovery_exhausted" && r.RecoveryWaitCause.String != "retained_recovery_adoption_failed")) {
+		(!r.RecoveryWaitCause.Valid || (r.RecoveryWaitCause.String != "worker_requeue_exhausted" && r.RecoveryWaitCause.String != "retained_recovery_exhausted" && r.RecoveryWaitCause.String != "retained_recovery_adoption_failed" && r.RecoveryWaitCause.String != "retained_continuation_unwitnessed")) {
 		return nil
 	}
 	used := r.RequeueCount - r.RequeueEpisodeBaseline
@@ -924,4 +929,33 @@ func overlayAdmissionReason(reason *string, queueReason string, class *string, e
 		return reason
 	}
 	return &current
+}
+
+// harnessDecisionForViewer projects quota evidence only for the owner. Generic
+// runToDTO and worker responses leave it null, including admin mutation responses.
+func harnessDecisionForViewer(r store.Run, viewer store.User) *apitypes.HarnessDecisionDTO {
+	if viewer.ID == uuid.Nil || viewer.ID != r.UserID || !r.HarnessDecisionReason.Valid || !r.HarnessPreferred.Valid {
+		return nil
+	}
+	nullableFloat := func(v pgtype.Float8) *float64 {
+		if !v.Valid {
+			return nil
+		}
+		return &v.Float64
+	}
+	nullableTime := func(v pgtype.Timestamptz) *time.Time {
+		if !v.Valid {
+			return nil
+		}
+		t := v.Time.UTC()
+		return &t
+	}
+	return &apitypes.HarnessDecisionDTO{
+		PreferredWeeklyResetAt: nullableTime(r.HarnessPreferredWeeklyResetAt),
+		OtherWeeklyResetAt:     nullableTime(r.HarnessOtherWeeklyResetAt),
+		Preferred:              r.HarnessPreferred.String, Chosen: r.Harness, Reason: r.HarnessDecisionReason.String,
+		PreferredScore: nullableFloat(r.HarnessPreferredScore), OtherScore: nullableFloat(r.HarnessOtherScore),
+		PreferredMeasured: nullableFloat(r.HarnessPreferredMeasured), OtherMeasured: nullableFloat(r.HarnessOtherMeasured),
+		PreferredHeld: r.HarnessPreferredHeld.Bool, OtherHeld: r.HarnessOtherHeld.Bool,
+	}
 }

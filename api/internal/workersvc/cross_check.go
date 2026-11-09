@@ -278,6 +278,14 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 			}
 			return store.Run{}, e
 		}
+		// Issue #3841: freeze the owner's steering in this same transaction. Any failure aborts the
+		// round; the retry paths above return the prior round and never write.
+		if e := freezeOwnerSteering(ctx, txq, leadID, existing.ID); e != nil {
+			if errors.Is(e, ErrCrossCheckRefused) {
+				return store.Run{}, e
+			}
+			return store.Run{}, fmt.Errorf("freeze owner steering: %w", e)
+		}
 		return child, nil
 	})
 	if errors.Is(err, errRetry) {
@@ -425,6 +433,11 @@ func (s *Service) DecidePlanCrossCheck(ctx context.Context, worker store.Worker,
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	q := store.New(tx)
+	// Workers before runs: see LockPlanCrossCheckLeadWorkerForVerdict. No row means the lead has
+	// no worker to order against; the locking statement below decides whether the verdict applies.
+	if _, err = q.LockPlanCrossCheckLeadWorkerForVerdict(ctx, pgconv.UUID(childID)); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return store.CrossCheck{}, err
+	}
 	lead, err := q.LockPlanCrossCheckLeadForVerdict(ctx, store.LockPlanCrossCheckLeadForVerdictParams{
 		ChildID: childID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: generation,
 	})

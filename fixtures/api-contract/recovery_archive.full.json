@@ -1,4 +1,13 @@
 {
+  "prerequisite_closure": {
+    "state": "x",
+    "reason": "x",
+    "pin_ref": "x",
+    "pin_tip": "x",
+    "absence_unconfirmed": true,
+    "cleanup_exhausted": true,
+    "updated_at": "2020-01-02T03:04:05Z"
+  },
   "id": "x",
   "run_id": "x",
   "hold_id": "x",

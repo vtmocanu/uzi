@@ -513,8 +513,10 @@ test("the supervisor root is recorded synchronously at spawn and removed on a co
   assert.match(text(await pending), /^Exit code: 0/);
   assert.deepEqual(h.lane.recordedRoots(), [], "dropped after the drain");
 
-  // A root whose start time could not be read cannot be recorded by identity.
-  const noTime = harness({ launch: async (spec) => {
+  // A root whose start time could not be read cannot be recorded by identity. issue #3915: it
+  // is logged, since a peer run's quiescence proof then cannot attribute that supervisor.
+  const warns: Array<[string, unknown]> = [];
+  const noTime = harness({ log: { ...log, warn: (msg: string, fields?: unknown) => { warns.push([msg, fields]); } }, launch: async (spec) => {
     const root = fakeRoot();
     spec.onSpawned?.({ pid: 78, startTime: undefined }, root.child);
     setImmediate(() => root.exitWith(0));
@@ -522,6 +524,7 @@ test("the supervisor root is recorded synchronously at spawn and removed on a co
   } });
   await noTime.call({ command: "echo hi" });
   assert.deepEqual(noTime.lane.recordedRoots(), []);
+  assert.deepEqual(warns, [["guarded command supervisor root not recorded: start time unreadable", { pid: 78 }]]);
 });
 
 // -- deadline, abort, output -------------------------------------------------------------------

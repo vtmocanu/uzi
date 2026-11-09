@@ -16,6 +16,105 @@ the other family reads the committed code and its findings go into the merge
 request, but it never blocks publication (see
 [Code cross-check](#code-cross-check)).
 
+## Browse retained cross-checks
+
+1. Open **Runs** and choose **Cross-checks** in **What to list**. **Active**
+   stays at `/runs`; **Past checks** stays at `/runs/history`. Parent and
+   checker links open their existing run pages.
+2. Choose **All stages**, **Plan** or **Code**. On **Past checks**, optionally
+   choose **Didn't finish**, **Raised issues**, **Passed** or **Replaced**.
+3. Expand **Show attempt details**, or select a round in the attempt ladder.
+   Use **Load older attempts** for earlier rounds and **Load more groups**
+   for the next parent page.
+
+History is owner-only, including for admins: it groups your retained Plan and
+Code attempts by parent work run. Disabling either cross-check setting does
+not hide retained history. The scope control appears when the server confirms
+that your account has retained evidence, independently of current settings or
+the selected page. While availability is loading, empty, unavailable or in
+error, the page shows Runs; an error offers **Retry availability**.
+
+Clicking a scope saves a browser preference under your user ID and updates
+`scope=runs` or `scope=cross-checks` in the URL. A valid URL scope overrides
+the saved preference for that visit without saving it. Preferences and pending
+responses are guarded by account identity; blocked browser storage can prevent
+saving the choice. See [Runs navigation](./run-activity.md#find-a-run-or-cross-check).
+
+### Active groups and attempt filters
+
+A group is Active if any retained attempt is pending without a recorded
+interruption, or has a valid linked checker child whose status is not
+completed, failed or cancelled. The child must match the owner, parent,
+cross-check kind and checker harness. This union includes earlier attempts,
+independently of the parent run's status. A completed parent can therefore
+have an Active check group. Past checks have no active retained attempt.
+
+Stage and outcome filters select attempts, not lifecycle. A group with no
+matching attempts is absent from that filtered page; hiding an active attempt
+does not make the group Past. Hidden-active context explains active evidence
+outside the loaded slice or filters.
+
+Read **Check**, **Verdict** and **Effect on run** separately. Execution
+describes pending/running, finished, failed-to-finish, could-not-start,
+replaced or interrupted evidence; a recorded review can survive missing child
+metadata without proving that execution finished. Missing or unrecognized
+values remain unknown or not recorded. An absent valid child has no checker
+link. A historical approval concerns an earlier plan candidate and does not
+certify a later candidate or human revision. A Plan verdict recorded before the
+lead lost custody shows as that verdict (passed or raised issues) rather than
+as interrupted, keeps its interruption time, and stays historical. Cause, next action and effect
+can be unrecorded; the history view grants no new approval or policy effect.
+
+### Page sizes and continuation
+
+The group count is **groups on this page**, not a global total. Each group
+shows loaded attempts, attempts excluded by filters, remaining matching
+attempts and **Loaded range:**. **Earlier rounds omitted: load older attempts**
+means the bounded slice has more matching history. CLI counts likewise
+distinguish shown, matching retained, filtered out and total retained attempts.
+
+The default group page has up to 25 parents (maximum 25, minimum 1), ordered
+by latest retained attempt creation time, then parent ID, descending. Each
+parent initially returns up to 10 attempts (range 2–20). Selection takes the
+newest bounded window, Code before descending Plan rounds; display then runs
+chronologically through Plan rounds followed by Code. Earlier attempts need
+explicit continuation; they are not automatically drained.
+
+Active checks poll every 10 seconds while visible. For groups still on the
+same query page, refresh retains loaded older windows, uses fresh evidence
+for overlapping rounds and preserves the explicitly advanced older cursor.
+Older loaded attempts outside the refreshed window show **Last observed** and
+**not refreshed** labels. Their previous active flags do not count as current
+activity; the group explains active evidence outside its refreshed attempts.
+Reload the page, then load older attempts again to refresh that evidence.
+Changing filters or pages resets that loaded query. Separate requests are not
+a snapshot: groups can move, attempts can change and continuations can report
+`refresh_needed` when lifecycle no longer matches. Refresh without cursors
+using the same filters in that case.
+
+The owner-scoped API is `GET /api/cross-checks`, with availability at
+`GET /api/cross-checks/availability`. It accepts `lifecycle` (active/past),
+`stage` (all/plan/code), `outcome` (any or the Past-only choices above),
+`limit`, `attempt_limit`, `cursor` and repeated `attempt_cursor`.
+Group cursors are limited to 512 encoded bytes; attempt cursors to 256 encoded
+bytes each, at most eight distinct parents per vector and 3072 aggregate
+encoded bytes. The full request target is limited to 4096 bytes. Group and
+attempt cursors cannot be combined; keep lifecycle, stage and outcome
+unchanged when continuing. Cursors are opaque keysets, reauthorized for the
+current owner on each request, not authority or a snapshot.
+
+The JSON envelope is `groups` plus optional `next_cursor`, bounded to 2 MiB.
+Each group carries parent identity/status, `latest_at`, `active`,
+`total_attempts`, `matching_attempts`, `active_attempts`, `active_hidden`,
+optional `active_context`, `attempts`, optional `older_cursor` and
+`omission`, and `refresh_needed`. Attempts carry stage/round, raw normalized
+`result`, `review`, `execution`, cause in `reason`, nullable `findings_count`,
+`created_at`, nullable `decided_at`/`interrupted_at`, `deadline_at`,
+nullable `child_id`/`child_status`, `child_context`, nullable `model`/`effort`,
+`historical`, `active`, `effect` and `next_action`. This bounded summary
+does not fetch full findings, candidate text or checker activity.
+See [CLI history](./cli.md#cross-check-history) for explicit continuations.
+
 ## 1. Enable Plan cross-check
 
 In **Settings → Run defaults → Cross-check**, enable **Plan cross-check**.
@@ -101,7 +200,8 @@ slots. Explicitly disabling the lane with `WORKER_CROSS_CHECK_SLOTS=0` does
 not enable that fallback; incomplete lane-aware negotiation cannot fall back
 either. See [worker setup](./worker-setup.md#cross-check-slots)
 for capacity and isolation limits. Checker children remain hidden from the
-Runs list; worker capacity shows runs and cross-checks separately.
+ordinary Runs scope; the Cross-checks scope groups retained attempts by parent.
+Worker capacity shows runs and cross-checks separately.
 
 A non-null Codex model or effort pin also requires
 `cross_check_pins_v1`; a custom resolved Codex model independently requires
@@ -219,10 +319,37 @@ When the dormant semantic human-gate path drops the checker approval, it also
 drops this advice. This adds no wire/API/schema fields, capability or
 persistence. During mixed-worker rollout, an old lead drops approving findings;
 an old checker supplies no new coverage account, and a new lead renders the
-findings it receives. The code-stage revision prompt's bytes are unchanged.
+findings it receives. The code-stage revision prompt's bytes are unchanged
+by that amendment; #3832 (2026-11-03) later appended a Code batching
+clarification (see [Code cross-check](#code-cross-check)).
 See the [dated ADR amendment](../adr/2149-cross-check.md#advisory-plan-coverage-amendment-2026-10-23-3334--3168-m1)
 and [PRD #3168](../prds/3168-plan-cross-check-coverage.md) for validation and
 remaining replay scope.
+
+### Owner steering in the plan check
+
+Each plan check round also receives a frozen, bounded snapshot of your own
+answers to the lead's questions and your plan revise feedback, so the checker
+can verify a plan claim such as "the owner agreed to X" instead of leaving it
+unverified. The snapshot is taken when the round starts and is identical for
+every claim of that round; an answer or revise you send afterwards appears in
+the next round. The question an answer responded to is shown as lead- or
+worker-authored context, never as your words. Automatic system answers (such as
+a completion continue) are not included.
+
+Limits: the 32 newest entries, 8 KiB per answer or revise entry, 4 KiB of
+question context per answer and 64 KiB in total; anything cut is marked. An
+entry that is missing, truncated or unparseable, or an answer whose question is
+unavailable, ambiguous, malformed or truncated, cannot by itself establish an exception, so such a
+claim stays unverified. Code cross-check is unchanged.
+
+Rollout: only plan checks with such a snapshot need a worker that advertises
+`cross_check_owner_steering_v1`. Hosted workers pick it up when they next roll
+while idle; other workers when they are upgraded. Until one is online the plan
+cross-check run shows "Plan cross-check is waiting: no online
+worker supports owner-steering checks", and at the deadline the check falls
+back to the ordinary human plan gate. See the
+[dated ADR amendment](../adr/2149-cross-check.md#amendment-2026-11-03--3841-owner-steering-in-plan-checker-input).
 
 ## Checked before your review
 
@@ -343,16 +470,25 @@ comparison, not a bill. See [run cost](./run-cost.md#metered-subscription-and-un
 After a human revision,
 **Earlier-plan evidence** does not certify the current plan. Approve, request
 changes or reject the plan shown at the current gate; the original check stays
-as history, without an automatic new checker round.
+as history, without an automatic new checker round. If the lead asks you a
+question while working your requested changes, your answer returns the run to
+the plan gate; it never approves the plan, and the revised plan is shown at
+the next gate.
 
 [CLI](./cli.md#plan-cross-check-evidence) shows the reason and findings;
 [Slack](./slack.md#using-it) shows the reason without findings.
 
 ## Claude checker isolation
 
-The Claude checker has only the `Read`, `Grep` and `Glob` tools: no shell, web,
-nested-agent or write tools, and no repository settings, plugins, skills or MCP
-servers. It runs with an isolated environment holding only your Anthropic token
+The Claude checker's repository access tools are `Read`, `Grep` and `Glob`: no
+shell, web, nested-agent or write tools, and no repository settings, plugins,
+skills or MCP servers. Besides those it has only the SDK's end-turn
+`StructuredOutput` tool, which returns its final verdict and touches no files or
+network. When that verdict does not match the expected schema, the SDK re-asks
+within the same session (up to five attempts, same turn limit, deadline and
+usage); if those retries are exhausted the check fails as malformed. A verdict
+that matches the schema but fails uzi's other verdict checks (size caps,
+duplicate finding ids and the like) is not retried and also fails as malformed. It runs with an isolated environment holding only your Anthropic token
 (a Codex checker holds only Codex credentials), as the worker's runner user.
 Direct reads are limited to its own checkout, plus its own SDK spill files for
 oversized tool output. Glob and Grep patterns that are absolute, home-relative
@@ -380,6 +516,9 @@ fail the check.
   covers a search that stopped at its time, operation, directory, entry or byte
   ceiling, or skipped a file over 1 MiB: the matches found so far are kept, the
   coverage is incomplete, and `0+` is not evidence that the text is absent.
+  A Claude-checker search that returns matching lines rather than a count or
+  file names records no count unless nothing matched, because its line total
+  includes context lines.
 - Never the search query, glob or pattern, tool arguments or file contents.
 - An attempt outside the checkout is recorded as a category with no path:
   `outside checkout`. `policy` covers a path the recorder refuses to show
@@ -625,8 +764,17 @@ index, path, walk and ignore budgets also scale from the verified base;
 see the [counter definitions and bounds](../adr/2149-cross-check.md#planning-diff-capture-symlinks-gitlinks-and-budgets-2026-10-07-2410).
 
 There is no object-store snapshot copy or snapshot budget. Base discovery
-has per-object, depth and deadline bounds, with no aggregate base cap or
-cache. No additional absolute ceiling applies to the relative totals. Limits remain: 4 MiB per file, 2 MiB per commit/tree object, depth 64,
+has per-object, depth and deadline bounds plus two absolute aggregate caps:
+1,200,000 tree-entry occurrences (a shared subtree counts each time it is
+walked; there is no cache) and 96 MiB of cumulative relative-path bytes
+(directories included). Exceeding either refuses the capture as
+`diff_too_large`; the caps are at least 2x the largest realistic trees
+measured. See the [dated ADR amendment](../adr/2149-cross-check.md#amendment-2026-11-06--3543-aggregate-base-discovery-bound).
+A base just under both caps, measured with the deadline lifted for validation (not production
+timing), peaked at about 985 MiB in a 1536 MiB / 1 CPU container. That covers discovery and
+the sizing batch; the post-discovery phase on a real checkout was not measured. See the
+[measurement](../e2e/planning-base-discovery-measure/RESULTS.md).
+Other limits remain: 4 MiB per file, 2 MiB per commit/tree object, depth 64,
 64 KiB per ignore/exclude read, 512 KiB patch/output and 200 non-ignored
 untracked files. The helper has 28 s and the outer capture 30 s; yielding
 during discovery and reads allows cancellation cleanup within the production
@@ -702,7 +850,10 @@ model and effort pins for each checker family, beside the Plan row (see
    finding, fixes what it accepts, and reports a disposition for every
    finding through the `report_cross_check_dispositions` tool: `addressed` or
    `declined`, each with a reason. A finding with no disposition shows as
-   "not reported". The repair is not checked again; there is no second check.
+   "not reported". One `report_cross_check_dispositions` call may list several
+   finding IDs, still one entry per ID with its own disposition and reason;
+   entries may share the same explanation. The repair is not checked again;
+   there is no second check.
 
 `CODE_CROSS_CHECK_TIMEOUT` (default `30m`, at most `2h`; see
 [Configuration](./configuration.md#cross-check-settings)) is the checker's
@@ -717,7 +868,29 @@ The merge request gets a **Code cross-check** section with the checked short
 SHA, the checker's family, model and effort, then either "no findings" or
 "N findings: A addressed, D declined", plus ", U not reported" when any
 finding has no disposition. One line per finding follows, with its
-disposition and reason. When the repository has owner guidance, a "custom
+disposition and reason.
+
+In the merge request section, findings whose title starts exactly with
+`Coverage uncertainty:` are grouped after the graded findings under "Verification caveats (evidence the read-only
+checker could not verify; a disposition never marks a criterion met or waives
+a landing obligation):". The match is on the title only, with no trimming;
+`Requirement gap:` and all other findings stay graded. With at least one
+caveat the counts read "N findings: G graded (A addressed, D declined, U not
+reported), C verification caveats (...)", the "not reported" part appearing
+only when nonzero. With caveats but no graded findings an extra line says
+"No graded findings; verification caveats are not a certification that the
+change has no defects." With no caveats the counts and finding lines are
+unchanged. Dispositions stay per finding ID and the stored findings are
+unchanged. The run page and `uzi run get` list the same findings without this
+grouping.
+
+The section stays within 4 KiB. When it does not fit, unassessed paths drop
+first, then caveat lines, then graded lines. Omissions are counted in "K graded
+findings not shown; see the run for the full stored account." and "K
+verification caveats not shown; see the run for the full stored account."; the
+"Changes after the check were not cross-checked." footer is always kept.
+
+When the repository has owner guidance, a "custom
 guidance applied (sha256 ...)" line shows the first 12 hex characters of its
 digest. A completed check ends with "Changes after the check were not
 cross-checked." An incomplete check renders as prose instead, for example
@@ -726,6 +899,9 @@ cross-checked." An incomplete check renders as prose instead, for example
 
 The run page has a **Code cross-check** panel with the same evidence, and
 `uzi run get <id>` prints it (see [CLI](./cli.md#code-cross-check-evidence)).
+When a check failed and was not interrupted or superseded, the run's Slack completion
+message adds one line naming the reason, with no findings (see
+[Slack](./slack.md#using-it)).
 
 ### Criteria guidance
 

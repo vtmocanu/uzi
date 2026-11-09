@@ -184,13 +184,18 @@ type validatedConnection struct {
 // verification, least-privilege check, encryption. Shared by ConnectForge and
 // ConnectForgeCreateOnly so the two cannot drift.
 func (s *Service) validateConnection(ctx context.Context, forgeType, baseURL, token string) (validatedConnection, error) {
-	forgeType = strings.TrimSpace(forgeType)
-	if forgeType == "" {
-		forgeType = string(forge.TypeGitLab)
+	// The caller names the forge; uzi never guesses it from the URL or a
+	// default (issue #3785), since a guessed driver verifies the token against
+	// the wrong forge.
+	rawType := strings.TrimSpace(forgeType)
+	if rawType == "" {
+		return validatedConnection{}, &Error{Kind: KindBadRequest, Message: "forge_type is required; supported values: " + forge.SupportedTypesList()}
 	}
-	if forgeType != string(forge.TypeGitLab) && forgeType != string(forge.TypeForgejo) && forgeType != string(forge.TypeGitHub) {
-		return validatedConnection{}, &Error{Kind: KindBadRequest, Message: "unsupported forge type"}
+	parsedType, ok := forge.ParseType(rawType)
+	if !ok {
+		return validatedConnection{}, &Error{Kind: KindBadRequest, Message: "unsupported forge type; supported values: " + forge.SupportedTypesList()}
 	}
+	forgeType = string(parsedType)
 	if strings.TrimSpace(token) == "" {
 		return validatedConnection{}, &Error{Kind: KindBadRequest, Message: "a bot token is required"}
 	}

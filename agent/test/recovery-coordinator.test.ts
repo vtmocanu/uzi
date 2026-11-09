@@ -9,6 +9,7 @@ import path from "node:path";
 import type { Readable } from "node:stream";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { GitCache, type RecoveryBundleResult } from "../src/git.js";
+import { makeFixture } from "./fixture-repo.js";
 import { RUN_KINDS, type RunKind } from "../src/protocol.js";
 import {
   canonicalJson,
@@ -501,6 +502,52 @@ describe("RecoveryCoordinator — byte-identical restart re-upload with NO forge
   };
   const rawGit = (cwd: string, args: string[]): string =>
     execFileSync("git", ["-C", cwd, ...args], { env: GIT_ENV, encoding: "utf8" }).trim();
+
+  for (const boundary of ["pin", "capture"] as const) {
+    it(`an unrelated unknown bare does not suppress an ordinary ${boundary} (#3831 tripwire)`, async t => {
+      const fixture = makeFixture();
+      t.after(() => fixture.cleanup());
+      const git = new GitCache(fixture.dataDir, nullLogger(), undefined, testGitCacheOptions());
+      const bare = await git.ensureClone(fixture.originPath);
+      fs.chmodSync(path.dirname(bare), 0o700);
+      fs.chmodSync(bare, 0o700);
+      rawGit(fixture.originPath, ["checkout", "-b", "agent/unrelated-run"]);
+      fs.writeFileSync(path.join(fixture.originPath, "unpublished.txt"), "preserved ordinary work\n");
+      rawGit(fixture.originPath, ["add", "unpublished.txt"]);
+      rawGit(fixture.originPath, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
+        "-c", "commit.gpgsign=false", "commit", "-m", "unpublished work"]);
+      const sourceSha = rawGit(fixture.originPath, ["rev-parse", "HEAD"]);
+      rawGit(bare, ["fetch", fixture.originPath, "agent/unrelated-run:refs/heads/unrelated-run"]);
+      const client = new FakeClient();
+      // Keep the real produced bundle journaled, without authorizing any custody release.
+      client.uploadShouldThrow = true;
+      const coordinator = makeCoordinator({ client, git });
+      const input = { runId: "run-unrelated-bare", generation: 1, sourceSha,
+        kind: "issue" as const, branch: "agent/unrelated-run" };
+      const before = boundary === "capture" ? await coordinator.pin(input) : undefined;
+      if (boundary === "capture") assert.ok(before, "the capture control starts with a real authenticated pin");
+      // No saved-pin metadata exists. Only this unrelated directory entry is uncertain.
+      const unknown = path.join(path.dirname(bare), "unrelated-unknown.git");
+      fs.symlinkSync(path.join(fixture.dataDir, "missing-unrelated-repository"), unknown);
+      assert.ok(fs.lstatSync(unknown).isSymbolicLink());
+      if (boundary === "pin") {
+        const pinned = await coordinator.pin(input);
+        assert.ok(pinned, "an unrelated unknown bare must not suppress the ordinary pin");
+        const saved = await coordinator.inspect(input.runId);
+        assert.equal(saved.length, 1);
+        assert.equal(saved[0]!.sourceSha, sourceSha);
+      } else {
+        const outcome = await coordinator.captureAndUpload({ record: before!, barePath: bare,
+          defaultBranch: "main", forgePat: "fixture-unused-for-local-fetch" });
+        assert.equal(outcome.state, "needs_action", "the actual upload failure, not a skipped capture, retains the bundle");
+        assert.equal(client.uploadCalls.length, 1, "the real bundle reached upload");
+        const saved = (await coordinator.inspect(input.runId))[0]!;
+        assert.ok(saved.bundlePath && fs.statSync(saved.bundlePath).size > 0, "the produced bytes remain journaled");
+        assert.equal(saved.sourceSha, sourceSha);
+        assert.equal(client.releaseCalls.length, 0);
+      }
+    });
+  }
 
   it("re-uploads the exact journaled bytes after restart, never re-fetching or re-deriving", async () => {
     // Build a small local topology: a forge bare with `main` at B, and a trusted worker

@@ -137,3 +137,34 @@ func (h *Handler) PatchCodexAuthAutoEligible(w http.ResponseWriter, r *http.Requ
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"secret": dto})
 }
+
+// SetHarnessOverflowEnabled changes only the authenticated caller's preference.
+func (h *Handler) SetHarnessOverflowEnabled(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var req struct {
+		Enabled *bool `json:"harness_overflow_enabled"`
+	}
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Enabled == nil {
+		httpx.Error(w, http.StatusBadRequest, "harness_overflow_enabled is required")
+		return
+	}
+	n, err := h.q.SetUserHarnessOverflowEnabled(r.Context(), store.SetUserHarnessOverflowEnabledParams{Enabled: *req.Enabled, ID: user.ID})
+	if err != nil {
+		slog.Error("set harness overflow", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if n == 0 {
+		httpx.Error(w, http.StatusNotFound, "user not found")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"harness_overflow_enabled": *req.Enabled})
+}

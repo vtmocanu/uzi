@@ -1,0 +1,11 @@
+{
+  "schedule_id": "x",
+  "target": "x",
+  "harness": "x",
+  "model": "x",
+  "override_subagent_model": true,
+  "credential_override": {
+    "mode": "x",
+    "secret_id": "x"
+  }
+}

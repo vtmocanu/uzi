@@ -66,6 +66,16 @@ func (f *FakeClient) SetCodexAccountMode(_ context.Context, mode string) (string
 	return mode, nil
 }
 
+func (f *FakeClient) SetHarnessOverflowEnabled(_ context.Context, enabled bool) (bool, error) {
+	f.LastHarnessOverflowEnabled = enabled
+	f.HarnessOverflowCalls++
+	if f.Err != nil {
+		return false, f.Err
+	}
+	f.Settings.HarnessOverflowEnabled = enabled
+	return enabled, nil
+}
+
 func (f *FakeClient) SelfUsage(context.Context) (apitypes.SelfUsageDTO, error) {
 	if f.Err != nil {
 		return apitypes.SelfUsageDTO{}, f.Err
@@ -92,6 +102,29 @@ func (f *FakeClient) GetMySettings(context.Context) (apitypes.UserSettingsDTO, e
 		return apitypes.UserSettingsDTO{}, f.Err
 	}
 	return f.Settings, nil
+}
+
+// GetEffectiveSettings serves Effective; unset it answers 404 like a server that predates the route.
+func (f *FakeClient) GetEffectiveSettings(context.Context) (apitypes.EffectiveSettingsDTO, error) {
+	if f.EffectiveErr != nil {
+		return apitypes.EffectiveSettingsDTO{}, f.EffectiveErr
+	}
+	if f.Effective == nil {
+		return apitypes.EffectiveSettingsDTO{}, Exitf(ExitNotFound, "not found")
+	}
+	return *f.Effective, nil
+}
+
+// PreviewScheduleSettings serves SchedulePreview and records the id; unset it answers 404.
+func (f *FakeClient) PreviewScheduleSettings(_ context.Context, scheduleID string) (apitypes.ScheduleSettingsPreviewDTO, error) {
+	f.SchedulePreviewIDs = append(f.SchedulePreviewIDs, scheduleID)
+	if f.SchedulePreviewErr != nil {
+		return apitypes.ScheduleSettingsPreviewDTO{}, f.SchedulePreviewErr
+	}
+	if f.SchedulePreview == nil {
+		return apitypes.ScheduleSettingsPreviewDTO{}, Exitf(ExitNotFound, "not found")
+	}
+	return *f.SchedulePreview, nil
 }
 
 func (f *FakeClient) SetUsageReserve(_ context.Context, thresholdPct *int, pauseRunning bool) (apitypes.UserDTO, error) {

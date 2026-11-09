@@ -8,6 +8,7 @@
   "issue_title": "",
   "issue_description": "",
   "harness": "",
+  "harness_decision": null,
   "has_prd_link": false,
   "title": null,
   "resume_of_run_id": null,
@@ -106,8 +107,12 @@
   "updated_at": "0001-01-01T00:00:00Z",
   "status_since": null,
   "repo_agents": null,
+  "repo_agent_source_commit": null,
   "agent_source": null,
   "agent_exclusions": null,
+  "agent_source_requested": null,
+  "agent_source_requested_basis": null,
+  "plan_agent_source": null,
   "own_agents": null,
   "anthropic_secret_id": null,
   "anthropic_secret_label": null,
@@ -149,5 +154,6 @@
   "repo_path": "",
   "worker_name": null,
   "judge_verdict": null,
-  "judge_todo_count": 0
+  "judge_todo_count": 0,
+  "cross_check_active": null
 }

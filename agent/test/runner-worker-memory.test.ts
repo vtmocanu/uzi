@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import { Outbox } from "../src/outbox.js";
@@ -20,6 +20,19 @@ import { api, client, git, homeDir, fakeGitlab, gitlabClaim, input, installHarne
 import { codexRig } from "./runner-codex-sinks-fixture.js";
 
 installHarness();
+
+function mockUnenrolledSource(t: TestContext, claim: ClaimResponse): () => void {
+  const expected = [git.barePathFor(claim.repo.clone_url), "agent/issue-2396", claim.run_id];
+  const calls: string[][] = [];
+  t.mock.method(git, "readRemediationRestrictionFacts", async (bare: string, branch: string, runId: string) => {
+    calls.push([bare, branch, runId]);
+    return { enrolled: false, blocked: false, roots: [], flaggedOIDs: [], fingerprint: "memory-unenrolled-fixture" };
+  });
+  return () => {
+    assert.ok(calls.length > 0, "the unenrolled source fixture must observe a restriction read");
+    for (const call of calls) assert.deepEqual(call, expected, "restriction reads use the exact source identity");
+  };
+}
 
 function realCapture(prepare: () => void | Promise<void> = () => {}): NonNullable<Executor["withCredentialFreeCapture"]> {
   const rig = codexRig();
@@ -208,6 +221,37 @@ test("runner pressure joins the original tool/feed, refuses retries, rearms at s
     assert.equal(JSON.stringify(feed).includes("original-memory-registration"), false);
     assert.equal(f.reservations.length, 1);
   } finally { await f.memory.stop(); await monitoring; }
+});
+
+test("runner status feed carries memory_diagnostics only when the port supplies it; the stored result never does", async () => {
+  const f = await setup();
+  let executorError: unknown;
+  const executor: Executor = { run: async ctx => {
+    try {
+      const captured = ctx.capturedMemory!()!;
+      const sinks = (f.memory as unknown as { sinks: WeakMap<object, { prepareFeedback: (c: unknown, r: unknown, d?: unknown) => void; feedback: (r: unknown, c: unknown, s: AbortSignal, ms: number) => Promise<void> }> }).sinks;
+      const sink = sinks.get(captured.context)!;
+      const result = (id: string) => ({ code: "worker_memory_pressure", claim_generation: 7, intervention_id: id });
+      sink.prepareFeedback(captured.context, result("with-diagnostics"), { version: 1, unavailable: "error" });
+      sink.prepareFeedback(captured.context, result("without-diagnostics"));
+      const stored = (captured.flight as unknown as { workerMemory: { feedback: Map<string, { result: object }> } }).workerMemory.feedback;
+      assert.equal(stored.size, 2);
+      for (const { result: kept } of stored.values()) assert.equal("memory_diagnostics" in kept, false, "stored result is unchanged");
+      // Deliver through the flight's own flush so the status feed reaches the API.
+      await sink.feedback(result("with-diagnostics"), captured.context, new AbortController().signal, 1000);
+    } catch (error) { executorError = error; throw error; }
+    throw new Error("fixture completed its proof");
+  } };
+  try {
+    await runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined,
+      { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 1000 }).execute(f.claim);
+    if (executorError) throw executorError;
+    const feed = api.messages(f.claim.run_id).filter(m => m.payload.event === "worker_memory_pressure");
+    const byId = new Map(feed.map(m => [m.payload.intervention_id, m.payload]));
+    assert.deepEqual(byId.get("with-diagnostics")?.memory_diagnostics, { version: 1, unavailable: "error" });
+    assert.equal("memory_diagnostics" in byId.get("without-diagnostics")!, false);
+    assert.equal(byId.size, 2);
+  } finally { await f.memory.stop(); }
 });
 
 test("runner human revise keeps the original phase context without a premature Running write", async () => {
@@ -853,8 +897,11 @@ test("execution owner ordinary observation follows tail deletion", async () => {
 });
 
 for (const claimCredential of [true, false]) {
-test(`M3 late native park ACK stays owned after deadline and cannot mutate a reclaimed successor credential=${claimCredential}`, async () => {
+test(`M3 late native park ACK stays owned after deadline and cannot mutate a reclaimed successor credential=${claimCredential}`, async t => {
   const f = await setup(1);
+  // This source is unenrolled. Keep unrelated remediation I/O out of the 200 ms
+  // late-ACK budget; the drained capture scope, native ACK and stale-owner fences remain real.
+  const verifyUnenrolledReads = mockUnenrolledSource(t, f.claim);
   const successorCredential = f.claim.secrets.codex;
   const monitoring = f.memory.run();
   const release = releaseGate();
@@ -1043,6 +1090,7 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
     await f.memory.stop(); await monitoring;
     await Promise.allSettled(f.memory.sinkReceipts.map(receipt => receipt.completion));
   }
+  verifyUnenrolledReads();
 });
 }
 
@@ -1672,8 +1720,10 @@ for (const mode of ["now", "milestone"] as const) for (const originalFailure of 
 }
 
 for (const scenario of ["wall", "disk", "withdrawn", "cancel", "shutdown", "claim-fence", "credential-switch", "registration", "unsettled", "expired", "already-parked"] as const) {
-  test(`memory pause handoff retains custody without an owner-pause disposition (${scenario})`, async () => {
+  test(`memory pause handoff retains custody without an owner-pause disposition (${scenario})`, async t => {
     const f = await setup(1);
+    const verifyUnenrolledReads = scenario === "unsettled" || scenario === "expired"
+      ? mockUnenrolledSource(t, f.claim) : undefined;
     const monitoring = f.memory.run();
     const release = releaseGate();
     let context: RunContext | undefined, captured: MemoryFlightProof | undefined;
@@ -1754,6 +1804,7 @@ for (const scenario of ["wall", "disk", "withdrawn", "cancel", "shutdown", "clai
       await captured?.workerMemory?.operation;
       await f.memory.stop(); await monitoring;
     }
+    verifyUnenrolledReads?.();
   });
 }
 

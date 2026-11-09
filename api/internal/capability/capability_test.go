@@ -467,3 +467,16 @@ func TestFilterProtocol_KeepsSemanticTokens(t *testing.T) {
 		t.Errorf("semantic tokens drifted: %q %q", CrossCheckSemanticPlanV1, CompletionSemanticPublicationV1)
 	}
 }
+
+func TestCrossCheckOwnerSteeringProtocolToken(t *testing.T) {
+	if CrossCheckOwnerSteeringV1 != "cross_check_owner_steering_v1" {
+		t.Fatalf("token drifted: %q", CrossCheckOwnerSteeringV1)
+	}
+	got := FilterProtocol([]string{CrossCheckOwnerSteeringV1, "cross_check_owner_steering_v2"})
+	if len(got) != 1 || got[0] != CrossCheckOwnerSteeringV1 {
+		t.Fatalf("FilterProtocol = %v", got)
+	}
+	if len(Filter([]string{CrossCheckOwnerSteeringV1})) != 0 {
+		t.Fatal("protocol token offered as a repo capability")
+	}
+}

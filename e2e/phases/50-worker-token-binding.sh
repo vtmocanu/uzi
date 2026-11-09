@@ -8,7 +8,7 @@
 # provides: -
 # handoff:  -
 # mutates:  compose:agent(stopped); spare anthropic_token(console-key, deleted); binding-test worker and cancelled runs; isolated owner, connection/repos, vault credential, CLI token, persistent/ephemeral workers and run; cordon AUDIT snapshots intentionally retained
-# restores: isolated owner resources cascade-delete after run terminalization via guarded EXIT cleanup (failure FAILs); cordon AUDIT snapshots intentionally retained; original agent stays stopped for 51, restart ENFORCED by 59-restart-agent providing SCHED_AGENT_UP for 60-62
+# restores: console-key deleted by EXIT cleanup even on early failure (cleanup failure FAILs); isolated owner resources cascade-delete after run terminalization via guarded EXIT cleanup; cordon AUDIT snapshots intentionally retained; agent stays stopped for 51, restarted by 59
 # ---------------------------------------------------------------------------
 # PRD #104: a worker's token binding reaches the CLAIM PAYLOAD, and a rebind takes
 # effect on the very next claim with no restart.
@@ -39,11 +39,36 @@ login
 # synthetic workers, but they add no custody. Wait while the real agent can settle
 # its pending final inventories, before stopping it for the payload-only claims.
 wait_custody_headroom 1
+capture_agent_logs 50-worker-token-binding before-stop
 "${COMPOSE[@]}" stop agent >/dev/null 2>&1 || true
 
 # A SECOND credential with a DISTINCT value — distinct is the whole test: the two
 # claims below are told apart by which plaintext came back, so equal values would
 # make both assertions pass vacuously.
+# Do not adopt or delete a token left by another invocation. Arm cleanup before
+# POST, so even a lost create response can be recovered by this absent-before label.
+apiget /api/me/secrets | jq -e '[.secrets[] | select(.kind == "anthropic_token" and .label == "console-key")] | length == 0' >/dev/null \
+  || fail "console-key already exists; left untouched"
+binding_token_cleanup() {
+  local secrets id
+  secrets="$(apiget /api/me/secrets)" || return 1
+  id="$(printf '%s' "$secrets" | jq -er '[.secrets[] | select(.kind == "anthropic_token" and .label == "console-key")] |
+    if length == 0 then "" elif length == 1 then .[0].id else error("ambiguous console-key") end')" || return 1
+  [ -n "$id" ] || return 0
+  [[ "$id" =~ ^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ ]] || return 1
+  curl -fsS -b "$JAR" -X DELETE "$BASE/api/me/secrets/anthropic_token/$id" \
+    -H "X-CSRF-Token: $(csrf)" >/dev/null || return 1
+  apiget /api/me/secrets | jq -e '[.secrets[] | select(.kind == "anthropic_token" and .label == "console-key")] | length == 0' >/dev/null
+}
+binding_exit() {
+  local rc=$?
+  if ! binding_token_cleanup; then
+    echo 'token binding: console-key cleanup failed' >&2
+    rc=1
+  fi
+  exit "$rc"
+}
+trap binding_exit EXIT
 DUMMY_ANTHROPIC_2="sk-ant-e2e-dummy-second-do-not-use-111111"
 [ "$DUMMY_ANTHROPIC_2" != "$DUMMY_ANTHROPIC" ] || fail "the two e2e token fixtures must differ or the binding assertions are vacuous"
 apipost /api/me/secrets/anthropic_token \
@@ -62,12 +87,11 @@ BINDW_ID="$(printf '%s' "$BINDW" | jq -r '.worker.id')"
 BINDW_TOKEN="$(printf '%s' "$BINDW" | jq -r '.token')"
 { [ -n "$BINDW_ID" ] && [ "$BINDW_ID" != null ] && [ -n "$BINDW_TOKEN" ] && [ "$BINDW_TOKEN" != null ]; } \
   || fail "could not mint the binding-test worker"
-# Register it advertising completion_interlock_v1: the completion interlock is on by
-# default for Claude issue runs (issue #1626), and ClaimRun never hands an interlocked run
-# to a worker whose registered protocol capabilities lack it.
+# The shared claim-only fixture capabilities include the frozen repo-agent reader
+# required on first claims, even before any revision has been recorded (#3940).
 curl -fsS -X POST "$BASE/api/worker/register" -H "Authorization: Bearer $BINDW_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"name":"e2e-binding-worker","version":"0.0.0-e2e","protocol_capabilities":["completion_interlock_v1"]}' >/dev/null \
+  -d "$(jq -cn --argjson caps "$(synthetic_issue_worker_capabilities)" '{name:"e2e-binding-worker",version:"0.0.0-e2e",protocol_capabilities:$caps}')" >/dev/null \
   || fail "could not register the binding-test worker"
 
 # claim_token DESC — POST a claim as the binding-test worker and leave the delivered
@@ -321,7 +345,7 @@ pass "binding-phase cleanup: the three claimed binding runs terminated so they c
     || fail "manual intake: persistent worker ownership mismatch"
   curl -fsS -X POST "$BASE/api/worker/register" -H "Authorization: Bearer $M5_JOIN" \
     -H 'Content-Type: application/json' \
-    -d "{\"name\":\"manual-$M5_FIXTURE\",\"version\":\"0.0.0-e2e\",\"protocol_capabilities\":[\"completion_interlock_v1\"]}" >/dev/null
+    -d "$(jq -cn --arg name "manual-$M5_FIXTURE" --argjson caps "$(synthetic_issue_worker_capabilities)" '{name:$name,version:"0.0.0-e2e",protocol_capabilities:$caps}')" >/dev/null
   m5_heartbeat() {
     curl -fsS --max-time 10 -X POST "$BASE/api/worker/heartbeat" -H "Authorization: Bearer $M5_JOIN" \
       -H 'Content-Type: application/json' -d '{}' >/dev/null

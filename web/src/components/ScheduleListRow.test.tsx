@@ -36,6 +36,40 @@ describe("schedule capacity options", () => {
   });
 });
 
+describe("schedule model chips", () => {
+  const base = async (over: Partial<Schedule>) => {
+    const template = (await mockApi.listSchedules()).find((s) => s.target === "sweep")!;
+    return { ...template, model: null, override_subagent_model: false, ...over } as Schedule;
+  };
+  it("default-origin row: unpinned reads default, pinned is marked, + agents only when set", async () => {
+    const view = row(await base({ origin: "default" }));
+    expect(screen.getByText("model: default")).toBeTruthy();
+    expect(screen.queryByText("+ agents")).toBeNull();
+    view.unmount();
+    row(await base({ origin: "default", model: "claude-opus-4-1", override_subagent_model: true }));
+    expect(screen.getByText("model: claude-opus-4-1 · pinned")).toBeTruthy();
+    expect(screen.getByText("+ agents")).toBeTruthy();
+  });
+  it("user-origin row shows the model chip with and without a pin, and + agents", async () => {
+    const view = row(await base({ origin: "user" }));
+    expect(screen.getByText("model: default")).toBeTruthy();
+    expect(screen.queryByText("+ agents")).toBeNull();
+    view.unmount();
+    row(await base({ origin: "user", model: "claude-opus-4-1", override_subagent_model: true }));
+    expect(screen.getByText("model: claude-opus-4-1 · pinned")).toBeTruthy();
+    expect(screen.getByText("+ agents")).toBeTruthy();
+  });
+  it("a user row with no run flags still shows defaults beside the model chip", async () => {
+    const s = await base({
+      origin: "user", target: "prompt", model: "claude-opus-4-1", wait_on_limit: false,
+      auto_approve: false, mr_rework_enabled: null,
+    });
+    row(s);
+    expect(screen.getByText("defaults")).toBeTruthy();
+    expect(screen.getByText("model: claude-opus-4-1 · pinned")).toBeTruthy();
+  });
+});
+
  it.each(["user", "default"] as const)("shows removes label only for enabled removal on %s rows", async (origin) => {
    const template = (await mockApi.listSchedules()).find((s) => s.target === "sweep")!;
    const view = row({ ...template, origin, remove_label_on_dispatch: true });

@@ -74,6 +74,8 @@ func contractCases() []contractCase {
 		newContractCase[RunDTO]("run"),
 		newContractCase[RunListItemDTO]("run_list_item"),
 		newContractCase[RunSummaryItemDTO]("run_summary_item"),
+		newContractCase[CrossCheckHistoryDTO]("cross_check_history"),
+		newContractCase[CrossCheckHistoryAvailabilityDTO]("cross_check_history_availability"),
 		// M2 — the rest of the apitypes hot set.
 		newContractCase[RepoDTO]("repo"),
 		newContractCase[AdminDockerAllowlistRepoDTO]("admin_docker_allowlist_repo"),
@@ -99,6 +101,18 @@ func contractCases() []contractCase {
 		newContractCase[AdminUsageDTO]("admin_usage"),
 		newContractCase[RunOutcomesDTO]("run_outcomes"),
 		newContractCase[UserSettingsDTO]("user_settings"),
+		// PRD #3254 M2: the effective-settings view. The model and effort cells embed the shared
+		// settings cells, so the full fixtures carry the embedded fields inline (like
+		// RunListItemDTO). The start-preview body is a request too: its full.json round-trips
+		// through DisallowUnknownFields.
+		newContractCase[EffectiveSettingsDTO]("effective_settings"),
+		newContractCase[StartPreviewRequest]("effective_settings_start_preview_request"),
+		newContractCase[StartPreviewDTO]("effective_settings_start_preview"),
+		// PRD #3254 M3: the schedule preview. Its request keeps presence for harness, model and
+		// credential_override (omitted is as stored, null clears), so the full request fixture is the
+		// all-present shape; the full response carries a refused alternative.
+		newContractCase[ScheduleSettingsPreviewRequest]("effective_settings_schedule_preview_request"),
+		newContractCase[ScheduleSettingsPreviewDTO]("effective_settings_schedule_preview"),
 		newContractCase[CatalogEntryDTO]("catalog_entry"),
 		newContractCase[AdminCLITokenDTO]("cli_token"),
 		// PRD #1183 M3: the first fixture pair for the Findings backlog row, so its Go/TS
@@ -128,6 +142,7 @@ func contractCases() []contractCase {
 		// normalizes to []). Their nested RecoveryArchiveStateCountsDTO rides inside the
 		// summary fixtures (no standalone row — it is never returned alone).
 		newContractCase[RecoveryArchiveDTO]("recovery_archive"),
+		newContractCase[RecoveryPrerequisiteClosureDTO]("recovery_prerequisite_closure"),
 		newContractCase[RecoveryArchiveSummaryDTO]("recovery_archive_summary"),
 		// PRD #1349 M1: the owner-facing custody-hold DTOs. RecoveryCustodyHoldDTO's only
 		// nullable field is released_at (*time.Time omitempty, dropped on the zero value) and
@@ -227,6 +242,12 @@ func contractCases() []contractCase {
 		// run.zero.json is unchanged) and nested in run.full.json; the standalone pair pins
 		// its own nullability surface (origin members, result).
 		newContractCase[RunJobDTO]("run_job"),
+		// PRD #3989: the admin-issued account reset link (issue response, preview request and
+		// response, redeem request).
+		newContractCase[AccountResetLinkDTO]("account_reset_link"),
+		newContractCase[ResetLinkPreviewRequest]("reset_link_preview_request"),
+		newContractCase[ResetLinkPreviewDTO]("reset_link_preview"),
+		newContractCase[ResetLinkRedeemRequest]("reset_link_redeem_request"),
 	}
 }
 

@@ -536,6 +536,8 @@ type RetainedSwitchOptions = {
   cancelOnly?: boolean;
   /** Collects every quiescence request the runner makes (the real proof still runs). */
   quiesceRequests?: import("../src/run-quiescence.js").QuiesceRunRequest[];
+  /** Case-specific signal assertions, run right after execute() and before the shared ones. */
+  afterExecute?: () => void;
 };
 
 for (const ack of ["lost", "statusless", "stale", "idempotent"] as const) {
@@ -593,25 +595,48 @@ it("retained recovery credential switch during successor adoption keeps both clo
 it("retained recovery credential switch during discovery keeps unknown custody", async () => {
   await retainedSwitchRegression("discovery", false);
 });
+
+/** Test-owned bound on a fixture's signal wait: far above the 50 ms / 1 s verification deadlines,
+ *  far below the 120 s Node cap. It records its own expiry and settles the waiter without touching
+ *  the observed signal; each case asserts on the record outside production's catch. */
+const SIGNAL_WATCHDOG_MS = 10_000;
+type SignalWait = { signal?: AbortSignal; watchdogFired: boolean };
+function awaitSignalOrWatchdog(record: SignalWait, signal: AbortSignal | undefined): Promise<"aborted" | "watchdog" | "missing"> {
+  record.signal = signal;
+  if (!signal) return Promise.resolve("missing");
+  if (signal.aborted) return Promise.resolve("aborted");
+  return new Promise(resolve => {
+    const onAbort = () => { clearTimeout(timer); resolve("aborted"); };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      record.watchdogFired = true;
+      resolve("watchdog");
+    }, SIGNAL_WATCHDOG_MS);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+function assertRecoveryDeadline(signal: AbortSignal, what: string): void {
+  assert.ok(signal.reason instanceof Error && signal.reason.message === "recovery deadline exhausted",
+    `${what} aborted by its own recovery deadline, not another signal: ${String(signal.reason)}`);
+}
 it("retained recovery credential switch completes bounded ownership verification on deadline", async () => {
   await retainedSwitchRegression("ownership", false, { deadline: true });
 });
 it("retained recovery credential switch aborts drain at its operation deadline", async t => {
   let drains = 0;
-  let drainSignal: AbortSignal | undefined;
+  const drainWait: SignalWait = { watchdogFired: false };
   t.mock.method(MessageBatcher.prototype, "close", async (signal?: AbortSignal) => {
     drains++;
-    drainSignal = signal;
     // Missing propagation must fail promptly instead of hanging the regression.
-    if (!signal) return;
-    await new Promise<void>(resolve => {
-      if (signal.aborted) resolve();
-      else signal.addEventListener("abort", () => resolve(), { once: true });
-    });
+    await awaitSignalOrWatchdog(drainWait, signal);
   });
-  await retainedSwitchRegression("ownership", false, { drainDeadline: true });
-  assert.ok(drainSignal, "drain receives the independent operation signal");
-  assert.equal(drainSignal.aborted, true, "drain settled only after deadline abort");
+  await retainedSwitchRegression("ownership", false, { drainDeadline: true, afterExecute: () => {
+    const drainSignal = drainWait.signal;
+    assert.ok(drainSignal, "drain receives the independent operation signal");
+    assert.equal(drainWait.watchdogFired, false, "drain ended before the test watchdog");
+    assert.equal(drainSignal.aborted, true, "drain settled only after deadline abort");
+    assertRecoveryDeadline(drainSignal, "drain");
+  } });
   assert.equal(drains, 1, "outer cleanup joins the bounded drain rather than draining again");
 });
 for (const proofTerminal of ["shutdown", "fence", "cancel"] as const) {
@@ -641,9 +666,14 @@ async function retainedSwitchRegression(seam: "capture" | "ownership" | "adoptio
   let models = 0, captures = 0, releases = 0, injected = false, proofInterrupted = false;
   let flight: any;
   const log = recordingLogger();
+  const ownershipWait: SignalWait = { watchdogFired: false };
   const r = runnerWith(factory(async () => { models++; throw new Error("must not resume model"); }),
     fakeGitlab().gitlab, "fixture-journal-key", log.logger, {
       recoveryRetryMs: 1,
+      // The verification allowance is resolved at construction; trip()'s later
+      // codexBoundaryDeadlineMs assignment does not reach it.
+      ...(options.deadline ? { retainedSwitchVerificationMs: 50 } : {}),
+      ...(options.drainDeadline ? { retainedSwitchVerificationMs: 1_000 } : {}),
       ...(options.quiesceRequests ? { quiesceRun: (req: import("../src/run-quiescence.js").QuiesceRunRequest) => {
         options.quiesceRequests!.push(req);
         return quiesceRunAttempt(req);
@@ -659,14 +689,11 @@ async function retainedSwitchRegression(seam: "capture" | "ownership" | "adoptio
     if (injected && (options.deadline || options.proofTerminal) && !proofInterrupted) {
       proofInterrupted = true;
       if (options.deadline) {
-        assert.ok(args[1], "verification passes its independent bounded signal");
-        return new Promise<Awaited<ReturnType<typeof owner>>>((_resolve, reject) => {
-          const signal = args[1] instanceof AbortSignal ? args[1] : args[1]?.signal;
-          assert.ok(signal);
-          const aborted = () => reject(signal.reason);
-          if (signal.aborted) aborted();
-          else signal.addEventListener("abort", aborted, { once: true });
-        });
+        // Assertions inside this override would be swallowed by production's verification
+        // catch: record the signal and assert on it after execute() returns.
+        const signal = args[1] instanceof AbortSignal ? args[1] : args[1]?.signal;
+        const settled = await awaitSignalOrWatchdog(ownershipWait, signal);
+        throw settled === "aborted" ? signal!.reason : new Error(`fixture ownership wait ended: ${settled}`);
       }
       if (options.proofTerminal === "shutdown") (r as any).shuttingDownGlobal = true;
       if (options.proofTerminal === "fence") flight.steering.claimFence = () => ({ kind: "superseded" });
@@ -699,6 +726,7 @@ async function retainedSwitchRegression(seam: "capture" | "ownership" | "adoptio
         }
       };
     }
+    // Kept for the other boundaries; the verification deadline comes from the constructor option.
     if (options.deadline) (r as any).codexBoundaryDeadlineMs = 50;
     if (options.drainDeadline) (r as any).codexBoundaryDeadlineMs = 1_000;
     if (options.cancelOnly) {
@@ -763,6 +791,14 @@ async function retainedSwitchRegression(seam: "capture" | "ownership" | "adoptio
   };
   client.releaseRecoveryCustody = async () => { releases++; throw new Error("custody must remain"); };
   await r.execute(claim);
+  if (options.deadline) {
+    const signal = ownershipWait.signal;
+    assert.ok(signal, "verification passes its independent bounded signal");
+    assert.equal(ownershipWait.watchdogFired, false, "verification ended before the test watchdog");
+    assert.equal(signal.aborted, true, "verification settled only after deadline abort");
+    assertRecoveryDeadline(signal, "verification");
+  }
+  options.afterExecute?.();
   assert.equal(injected, true, "actual retained recovery await received the switch");
   if (options.interruption !== "execution") assert.ok(flight.cancel.signal.reason instanceof CredentialSwitchSignal);
   assert.equal(models, 0);
@@ -915,6 +951,122 @@ for (const stage of ["reservation", "discovery"] as const) {
     assert.equal(models, 0);
     assert.equal(api.states.some(s => ["failed", "recovery_wait"].includes(s.body.status)), false);
     assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "only local dirty work\n");
+  });
+}
+
+for (const control of ["cancel", "deadline", "child cancel"] as const) {
+  it(`retained bootstrap ${control} settles its scoped query on lifecycle stop`, async t => {
+    const { claim, bare, clone, key } = await seed();
+    const source = readJournal(bare, clone.branch);
+    await git.reserveRecoveryIteration(bare, clone.branch, key, source, 1, claim.claim_generation);
+    const before = readJournal(bare, clone.branch);
+    const expire = control === "deadline" ? episodeDeadline(t, before.recovery.deadline) : undefined;
+    git.recoveryAttemptMode = async () => false;
+    git.discoverRetainedRecovery = async () => ({ barePath: bare, journal: before });
+    let reserved!: () => void, acquired!: () => void, release!: () => void, queried!: () => void;
+    const reservationDone = new Promise<void>(resolve => { reserved = resolve; });
+    const held = new Promise<void>(resolve => { acquired = resolve; });
+    const entry = new Promise<void>(resolve => { queried = resolve; });
+    let reservationCompleted = false, holderActive = false, childEntered = false;
+    let queryPhase: { stage: string; finiteDeadline: boolean; liveSignal: boolean; holderActive: boolean } | undefined;
+    const reserve = git.reserveRecoveryIteration.bind(git);
+    t.mock.method(git, "reserveRecoveryIteration", async (...args: Parameters<typeof reserve>) => {
+      const result = await reserve(...args);
+      reservationCompleted = true;
+      reserved();
+      await held;
+      return result;
+    });
+    let childCancelled = false, childSettled = false;
+    const childStop = new AbortController();
+    let finish!: (value: { code: number }) => void;
+    const completed = new Promise<{ code: number }>(resolve => { finish = resolve; });
+    const read = git.readRemediationRestrictionFacts.bind(git);
+    let queries = 0;
+    t.mock.method(git, "readRemediationRestrictionFacts", (...args: Parameters<typeof read>) => {
+      queries++;
+      const scope = (git as any).recoveryOperations.getStore();
+      queryPhase = {
+        stage: reservationCompleted ? "post-reservation query" : "early bootstrap query",
+        finiteDeadline: Number.isFinite(scope?.deadline),
+        liveSignal: scope?.signal instanceof AbortSignal && !scope.signal.aborted,
+        holderActive,
+      };
+      if (control === "child cancel") return git.withBoundaryProcessSpawner(async () => {
+        childEntered = true;
+        queried();
+        return {
+          stdout: Readable.from([]), stderr: Readable.from([]), stdin: null, completed,
+          cancel: async () => { childCancelled = true; childSettled = true; finish({ code: -1 }); },
+        };
+      }, childStop.signal, () => read(...args));
+      const result = read(...args);
+      queried();
+      return result;
+    });
+    const retainedHome = path.join(homeDir, claim.run_id);
+    fs.mkdirSync(retainedHome, { recursive: true });
+    const session = path.join(retainedHome, "retained-session.jsonl");
+    fs.writeFileSync(session, "predecessor session evidence\n");
+    const pins = command(bare, "for-each-ref", "--format=%(refname) %(objectname)");
+    let models = 0, admissions = 0, captures = 0, proofs = 0, settled = false;
+    const r = runnerWith(factory(async () => { models++; throw new Error("must not model"); }),
+      fakeGitlab().gitlab, undefined, nullLogger(), { codexBoundaryDeadlineMs: 100 });
+    t.mock.method(r as any, "admitPredecessorSource", async () => { admissions++; throw new Error("must not admit"); });
+    t.mock.method(r as any, "runFreeCapture", async () => { captures++; throw new Error("must not capture"); });
+    t.mock.method(r as any, "quiesceRun", async () => { proofs++; throw new Error("must not prove"); });
+    const execution = r.execute(claim).finally(() => { settled = true; });
+    let holder: Promise<void> | undefined;
+    let config: Buffer | undefined;
+    try {
+      await requireEpisodeEntry(reservationDone, execution);
+      // Start the holder from the test's context AFTER the real reservation released B.
+      // It must not inherit the recovery operation's cancellation signal.
+      if (control === "child cancel") acquired();
+      else {
+        holder = git.withBareLock(bare, async () => {
+          holderActive = true;
+          try {
+            acquired();
+            await new Promise<void>(resolve => { release = resolve; });
+          } finally {
+            holderActive = false;
+          }
+        });
+        await held;
+      }
+      config = fs.readFileSync(path.join(bare, "config"));
+      await requireEpisodeEntry(entry, execution);
+      assert.deepEqual(queryPhase, {
+        stage: "post-reservation query", finiteDeadline: true, liveSignal: true,
+        holderActive: control !== "child cancel",
+      }, "query enters after real reservation in a live finite recovery scope");
+      if (control === "child cancel") {
+        assert.equal(childEntered, true, "real query acquired its native child before cancellation");
+      } else {
+        assert.equal(holderActive, true, "independent bare lock holder remains active at cancellation");
+      }
+      if (expire) expire();
+      else (r as any).activeRuns.get(claim.run_id).cancel.abort();
+      await execution;
+      assert.equal(settled, true, "query and execute settle before the independent holder is released");
+      assert.equal(queries, 1);
+      if (control === "child cancel") {
+        assert.equal(childCancelled, true);
+        assert.equal(childSettled, true, "fake child completion was signalled during cancellation");
+      }
+    } finally {
+      (r as any).activeRuns.get(claim.run_id)?.cancel.abort(new Error("fixture cleanup"));
+      childStop.abort(new Error("fixture cleanup"));
+      release?.();
+      await Promise.allSettled([execution, ...(holder ? [holder] : [])]);
+    }
+    await git.withBareLock(bare, async () => {});
+    assert.deepEqual(fs.readFileSync(path.join(bare, "config")), config, "no late query or finalization mutation after unlock");
+    assert.equal(command(bare, "for-each-ref", "--format=%(refname) %(objectname)"), pins);
+    assert.equal(fs.readFileSync(session, "utf8"), "predecessor session evidence\n");
+    assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "only local dirty work\n");
+    assert.deepEqual({ models, admissions, captures, proofs }, { models: 0, admissions: 0, captures: 0, proofs: 0 });
   });
 }
 
@@ -1188,6 +1340,7 @@ it("retained dirty work resumes locally on a fresh unwired path and resets only 
     assert.notEqual(ctx.worktreePath, clone.path);
     assert.match(ctx.worktreePath, /\.attempt-.*-g2-/);
     assert.equal(ctx.sessionId, undefined);
+    assert.ok(process.platform !== "linux" || ctx.managedGoWorkDir?.endsWith("/.uzi-go-work/g2"), `leaf: ${ctx.managedGoWorkDir}`);
     assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "retained.txt"), "utf8"), "only local dirty work\n");
     const journal = readJournal(bare, clone.branch);
     assert.equal(journal.recovery.attempts, 1);

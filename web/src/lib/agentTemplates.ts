@@ -4,7 +4,9 @@
 // /rendered endpoint) and the hard secret guardrail; these mirror that behavior
 // for live UI feedback only.
 
-import type { AgentTemplate, AgentTemplateScope } from "./api";
+import type { AgentTemplate, AgentTemplateScope, Harness } from "./api";
+import { DEFAULT_CODEX_MODEL } from "../components/ModelSelect";
+import { CODEX_ROLE_MODELS } from "./codexModels";
 
 // TEMPLATE_SCOPE_LABEL / templateScopeBadgeTone mirror the skills scope helpers
 // (lib/skills.ts) so agent templates and skills badge scope identically (PRD #18
@@ -172,6 +174,27 @@ export function modelFieldWarning(model: string): string {
   return "";
 }
 
+// templateModelFieldWarning mirrors ValidateTemplatePin for editor feedback;
+// the server remains authoritative. Generic modelFieldWarning callers keep their
+// existing syntax rules; template pins also enforce the API's UTF-8 byte cap.
+export function templateModelFieldWarning(model: string, harness: Harness): string {
+  const syntaxWarning = modelFieldWarning(model);
+  if (syntaxWarning) return syntaxWarning;
+  const m = model.trim();
+  if (new TextEncoder().encode(m).length > MAX_MODEL_LEN) {
+    return `Model is too long (max ${MAX_MODEL_LEN} bytes); use a shorter alias or model ID.`;
+  }
+  if (m === "") return "";
+  const codexRole = CODEX_ROLE_MODELS.includes(m);
+  if (harness === "claude" && codexRole) {
+    return "Claude template model must not be a Codex role model ID.";
+  }
+  if (harness === "codex" && !codexRole) {
+    return "Codex template model must be a supported Codex role model ID.";
+  }
+  return "";
+}
+
 // frontmatterFieldWarning mirrors the server rejection of newline/control
 // characters (and commas in tool names) in the single-line frontmatter fields,
 // plus the tightened model rules (modelFieldWarning). The server is
@@ -202,10 +225,19 @@ export function isLeadTemplateName(name: string): boolean {
   return /^(lead|orchestrator)$/i.test(name);
 }
 
-// templateModelDefaultLabel names what an unset template model resolves to: the lead
-// falls through to the SDK/account default, any other template to the lead's model.
-export function templateModelDefaultLabel(name: string): string {
-  return isLeadTemplateName(name) ? "Default · SDK/account default (built-in)" : "Default · lead's model";
+// templateModelDefaultLabel names what an unset pin resolves to: the lead uses
+// its harness's built-in default, any other template follows the lead's model.
+export function templateModelDefaultLabel(name: string, harness: Harness = "claude"): string {
+  if (!isLeadTemplateName(name)) return "Default · lead's model";
+  return harness === "codex"
+    ? `Default · built-in (${DEFAULT_CODEX_MODEL})`
+    : "Default · SDK/account default (built-in)";
+}
+
+// templateModelsLabel is shared by the list and detail surfaces so both pins
+// and their harness-specific Default labels have one presentation.
+export function templateModelsLabel(t: Pick<AgentTemplate, "name" | "model" | "codex_model">): string {
+  return `Claude: ${t.model || templateModelDefaultLabel(t.name, "claude")} · Codex: ${t.codex_model || templateModelDefaultLabel(t.name, "codex")}`;
 }
 
 // looseSecretWarning returns a warning string if the text looks like it might
@@ -220,17 +252,18 @@ export function looseSecretWarning(text: string): string {
   return "";
 }
 
-// TemplateContent is the four mutable columns the drift comparison reads —
+// TemplateContent is the five mutable columns the drift comparison reads —
 // exactly the fields agenttmpl.Definition carries, minus the name, which is the
 // lookup key rather than content.
 export interface TemplateContent {
   description: string;
   model: string | null;
+  codex_model: string | null;
   tools: string[] | null;
   prompt_body: string;
 }
 
-// driftedColumns names which of the four columns differ between the shipped
+// driftedColumns names which of the five columns differ between the shipped
 // definition and a template's current values, in display order.
 //
 // IT IS THE ONLY CLIENT-SIDE COPY OF THESE RULES, and it lives here rather than
@@ -244,6 +277,7 @@ export function driftedColumns(shipped: TemplateContent, current: TemplateConten
   const out: string[] = [];
   if (shipped.description !== current.description) out.push("description");
   if ((shipped.model ?? "") !== (current.model ?? "")) out.push("model");
+  if ((shipped.codex_model ?? "") !== (current.codex_model ?? "")) out.push("codex model");
   const a = shipped.tools ?? [];
   const b = current.tools ?? [];
   if (a.length !== b.length || a.some((t, i) => t !== b[i])) out.push("tools");

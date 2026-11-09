@@ -8,10 +8,15 @@ WITH RECURSIVE
 request AS (
  SELECT r0.* FROM runs r0 WHERE r0.id = @run_id AND r0.user_id = @user_id
 ),
+-- ci_fix_mr_iid (#4079): NULL means the ci_fix is unbound and both arms behave as they always
+-- did. A bound ci_fix sees only the bound PR's runs on the branch and their mr_rework ancestry
+-- (the walk follows target_run_id unfiltered). Same-branch rows with a NULL mr_iid are
+-- deliberately excluded for a bound ci_fix.
 ci_branch_ids AS MATERIALIZED (
  SELECT a.id FROM request r JOIN LATERAL (
   SELECT s.id FROM runs s WHERE r.kind = 'ci_fix'
    AND s.user_id = r.user_id AND s.repo_id = r.repo_id AND s.branch = r.pipeline_ref
+   AND (r.ci_fix_mr_iid IS NULL OR s.mr_iid = r.ci_fix_mr_iid)
   LIMIT 4097
  ) a ON true
 ),
@@ -20,6 +25,7 @@ ci_rework_ids AS MATERIALIZED (
   SELECT s.id FROM runs s WHERE r.kind = 'ci_fix' AND s.id <> r.id
    AND s.user_id = r.user_id AND s.repo_id = r.repo_id
    AND s.kind = 'mr_rework' AND s.pipeline_ref = r.pipeline_ref
+   AND (r.ci_fix_mr_iid IS NULL OR s.mr_iid = r.ci_fix_mr_iid)
   LIMIT 4097
  ) a ON true
 ),
@@ -63,7 +69,7 @@ roots AS (
 ),
 authority AS NOT MATERIALIZED (
  SELECT id, user_id, repo_id, worker_id, kind, status, claim_generation, claim_released_at,
- branch, pipeline_ref, mr_iid, target_run_id, issue_iid, report_only, stop_kind,
+ branch, pipeline_ref, mr_iid, ci_fix_mr_iid, target_run_id, issue_iid, report_only, stop_kind,
  completion_non_closing_reason, completion_contract_version, contract_revision,
  CASE WHEN octet_length(completion_contract::text) <= 1048576 THEN completion_contract ELSE 'null'::jsonb END AS completion_contract,
  CASE WHEN octet_length(milestones_frozen::text) <= 131072 THEN milestones_frozen ELSE 'null'::jsonb END AS milestones_frozen,
@@ -79,6 +85,8 @@ SELECT jsonb_build_object(
  ORDER BY a.id) FROM roots z JOIN authority a ON a.id = z.id), '[]'::jsonb),
  'ancestry_unknown', (SELECT ancestry_unknown FROM summary),
  'association_unknown', (SELECT overflow FROM association_budget) OR (SELECT association_unknown FROM summary),
+ -- Redundant for a bound ci_fix (the arms already filter to its PR); kept for the unbound
+ -- case and as the fail-closed check when a bound run finds zero roots.
  'ci_mr_conflict', EXISTS (
  SELECT 1 FROM association_ids i JOIN runs x ON x.id = i.id
  WHERE r.kind = 'ci_fix' AND x.branch = r.pipeline_ref AND x.mr_iid IS NOT NULL

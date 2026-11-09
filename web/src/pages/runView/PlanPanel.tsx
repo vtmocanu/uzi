@@ -21,7 +21,7 @@ import { stripUnsafeChars } from "../../lib/safeText";
 import { CapabilitySources } from "./CapabilitySources";
 import { effectiveWorkerCaps } from "../../lib/workerCaps";
 import { CAPABILITY_VOCABULARY } from "../../lib/capabilityVocabulary";
-import { AgentPicker, selectionLabel, type OwnTemplate } from "../../components/AgentPicker";
+import { AgentPicker, gateDefaultSource, selectionLabel, type OwnTemplate } from "../../components/AgentPicker";
 import { PlanCrossCheck } from "../../components/PlanCrossCheck";
 import { Markdown } from "../../components/Markdown";
 import { TokenPicker } from "../../components/TokenPicker";
@@ -399,10 +399,10 @@ export function PlanPanel({
   );
 
   // The picker reports the live selection here; the approve button submits it. The
-  // default (repo when detected, else own, no exclusions) is what the picker emits
+  // default (gateDefaultSource, no exclusions) is what the picker emits
   // on mount, so approving without touching anything sends the right thing.
   const [selection, setSelection] = useState<AgentSelectionInput>({
-    source: repoDetected ? "repo" : "own",
+    source: gateDefaultSource(run.agent_source_requested, repoDetected),
     exclusions: [],
   });
   const onSelectionChange = useCallback((s: AgentSelectionInput) => setSelection(s), []);
@@ -754,7 +754,7 @@ export function PlanPanel({
             shown only to someone who can approve. The locked-in roster is a separate,
             read-only card (AgentRosterSummary) once the run is past the gate. */}
         {canSteer && (
-          <AgentPicker repoAgents={repoAgents} ownTemplates={ownTemplates} onChange={onSelectionChange} />
+          <AgentPicker repoAgents={repoAgents} ownTemplates={ownTemplates} requested={run.agent_source_requested} onChange={onSelectionChange} />
         )}
 
         {/* PRD #1247 M7: the gate token picker — the natural sibling of the agent picker.

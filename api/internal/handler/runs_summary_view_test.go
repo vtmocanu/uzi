@@ -17,20 +17,21 @@ import (
 // Issue #2661: GET /api/runs and /api/admin/runs accept ?view=summary, which drops the four
 // heavy detail keys from every row and changes nothing else.
 
-var summaryHeavyKeys = []string{"plan_md", "repo_agents", "issue_description", "preserved_patch"}
+var summaryHeavyKeys = []string{"plan_md", "repo_agents", "repo_agent_source_commit", "issue_description", "preserved_patch"}
 
 // heavyRun is a store.Run with all four heavy fields populated, so the default view really
 // carries them and a leaked key in the summary view is detectable.
 func heavyRun(ownerID uuid.UUID) store.Run {
 	return store.Run{
-		ID:               uuid.New(),
-		UserID:           ownerID,
-		Status:           "running",
-		Kind:             "issue",
-		IssueDescription: "the long issue description",
-		PlanMd:           pgtype.Text{String: "# the long plan", Valid: true},
-		PreservedPatch:   pgtype.Text{String: "diff --git a/x b/x", Valid: true},
-		RepoAgents:       []byte(`[{"name":"coder","description":"writes code"}]`),
+		ID:                    uuid.New(),
+		UserID:                ownerID,
+		Status:                "running",
+		Kind:                  "issue",
+		IssueDescription:      "the long issue description",
+		PlanMd:                pgtype.Text{String: "# the long plan", Valid: true},
+		PreservedPatch:        pgtype.Text{String: "diff --git a/x b/x", Valid: true},
+		RepoAgents:            []byte(`[{"name":"coder","description":"writes code"}]`),
+		RepoAgentSourceCommit: pgtype.Text{String: "1111111111111111111111111111111111111111", Valid: true},
 	}
 }
 

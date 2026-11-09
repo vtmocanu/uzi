@@ -138,7 +138,9 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 	logs := &cobra.Command{
 		Use:   "logs <run-id>",
 		Short: "Print a run's message history (REST polling)",
-		Args:  cobra.ExactArgs(1),
+		Long: "Print a run's message history. With --follow, keep polling through timed retries; " +
+			"stop at an owner-held disk or forge recovery park and report Resume/Cancel guidance.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := env.client(gf)
 			if err != nil {
@@ -234,6 +236,12 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 				// NDJSON there for an agent to parse line by line (renderMessage). A
 				// human-readable notice on that stream would corrupt the contract. This
 				// is the same split cobra's deprecation notice already uses here.
+				if isDiskOwnerHold(run) {
+					for _, line := range append([]string{diskParkLine(run)}, diskHoldLines(run)...) {
+						_, _ = fmt.Fprintf(env.Stderr, "run %s %s\n", cellText(args[0]), line)
+					}
+					return drain()
+				}
 				if isForgeOwnerHold(run) {
 					for _, line := range append([]string{forgeParkLine(run)}, forgeHoldLines(run)...) {
 						_, _ = fmt.Fprintln(env.Stderr, line)
@@ -242,7 +250,7 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 				}
 				holdKey := workerHoldNoticeKey(run)
 				if run.Status == statusLimitWait || run.Status == statusPoolWait || run.Status == statusRecoveryWait ||
-					isCredentialDisabledHold(run) || isProviderUnavailableHold(run) || isCredentialSwitchHold(run) || isBaseAttestationHold(run) {
+					isIterationHold(run) || isCredentialDisabledHold(run) || isCredentialsResetHold(run) || isProviderUnavailableHold(run) || isCredentialSwitchHold(run) || isBaseAttestationHold(run) {
 					if parkedIn != holdKey {
 						parkedIn = holdKey
 						// pool_wait and recovery_wait are the sibling silences limit_wait is
@@ -254,7 +262,7 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 						// hold to another is announced as the new hold.
 						switch run.Status {
 						case statusPaused:
-							if isProviderUnavailableHold(run) || isCredentialSwitchHold(run) || isBaseAttestationHold(run) {
+							if isIterationHold(run) || isProviderUnavailableHold(run) || isCredentialSwitchHold(run) || isBaseAttestationHold(run) || isCredentialsResetHold(run) {
 								_, _ = fmt.Fprintf(env.Stderr, "run %s %s; still following\n", cellText(args[0]), pausedHoldNotice(run))
 								break
 							}
@@ -302,11 +310,10 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 									"run %s %s; still following\n",
 									args[0], line)
 							} else if line := diskParkLine(run); line != "" {
-								// PRD #1809 M5: the worker's data volume is full or nearly
-								// full. It resumes at its next retry; uzi frees space meanwhile.
+								// Timed disk parks and unknown timing keep following; owner holds stop above.
 								_, _ = fmt.Fprintf(env.Stderr,
 									"run %s %s; still following\n",
-									args[0], line)
+									cellText(args[0]), line)
 							} else {
 								_, _ = fmt.Fprintf(env.Stderr,
 									"run %s recovering — a transient interruption parked it; still following, it resumes on its own\n",

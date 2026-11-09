@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -449,44 +450,58 @@ func TestJudgeSpendGuardValidation(t *testing.T) {
 	}
 }
 
-// TestSummaryModelAccessor pins PRD #362 Decision 8 at the settings layer: the
-// run-summary model defaults to "haiku" (unlike the judge's "opus"), a stored value
-// is returned verbatim, the key is Known/writable, and validation accepts an alias
-// and a full id but rejects blank/over-long/garbage — reusing validateModelAlias,
-// exactly the judge_model validator.
-func TestSummaryModelAccessor(t *testing.T) {
-	// Empty table → the compiled-in cheap default.
-	c := New(&fakeStore{}, time.Minute)
-	if got, err := c.SummaryModel(context.Background()); err != nil || got != DefaultSummaryModel {
-		t.Fatalf("SummaryModel default = %q, %v; want %q", got, err, DefaultSummaryModel)
-	}
-	// Pin the literal default so an accidental flip is caught (Decision 8: haiku, the
-	// cheap per-run default, NOT the judge's opus).
+// TestSummaryModelValidation pins the summary_model (Claude lane) and
+// codex_summary_model (Codex lane) write-time rules (PRD #3248): both keys are
+// Known/writable and default to their built-ins, blank and whitespace are the
+// explicit reset, each lane refuses the other family's ids, and the Claude lane
+// refuses every Codex role id.
+func TestSummaryModelValidation(t *testing.T) {
 	if DefaultSummaryModel != "haiku" {
 		t.Fatalf("DefaultSummaryModel = %q, want \"haiku\"", DefaultSummaryModel)
 	}
-
-	// A configured value is returned verbatim.
-	c = New(&fakeStore{rows: []store.AppSetting{row(KeySummaryModel, "sonnet")}}, time.Minute)
-	if got, _ := c.SummaryModel(context.Background()); got != "sonnet" {
-		t.Fatalf("SummaryModel = %q, want sonnet", got)
+	if Defaults[KeyCodexSummaryModel] != "gpt-6-luna" {
+		t.Fatalf("Defaults[codex_summary_model] = %q, want gpt-6-luna", Defaults[KeyCodexSummaryModel])
 	}
-
-	// Writable through the settings PUT.
-	if !Known(KeySummaryModel) {
-		t.Errorf("%s should be Known (admin-writable)", KeySummaryModel)
+	for _, k := range []string{KeySummaryModel, KeyCodexSummaryModel} {
+		if !Known(k) {
+			t.Errorf("%s should be Known (admin-writable)", k)
+		}
+		for _, blank := range []string{"", "   "} {
+			if err := Validate(k, blank); err != nil {
+				t.Errorf("Validate(%s, %q) = %v, want nil", k, blank, err)
+			}
+			if got := NormalizeForStorage(k, blank); got != "" {
+				t.Errorf("NormalizeForStorage(%s, %q) = %q, want empty", k, blank, got)
+			}
+		}
 	}
-
-	// Validation accepts an alias and a full id; rejects blank, whitespace, and over-long.
 	for _, ok := range []string{"haiku", "sonnet", "opus", "fable", "claude-3-5-haiku-20241022"} {
 		if err := Validate(KeySummaryModel, ok); err != nil {
 			t.Errorf("Validate(%s, %q) = %v, want nil", KeySummaryModel, ok, err)
 		}
 	}
-	for _, bad := range []string{"", "   ", "two words", strings.Repeat("x", 101)} {
+	for _, bad := range []string{"two words", strings.Repeat("x", 101)} {
 		if err := Validate(KeySummaryModel, bad); err == nil {
 			t.Errorf("Validate(%s, %q) = nil, want an error", KeySummaryModel, bad)
 		}
+	}
+	for m := range agenttmpl.CodexRoleModels {
+		if err := Validate(KeySummaryModel, m); err == nil {
+			t.Errorf("Validate(%s, %q) = nil, want the Codex id refused", KeySummaryModel, m)
+		}
+		if err := Validate(KeyCodexSummaryModel, m); err != nil {
+			t.Errorf("Validate(%s, %q) = %v, want nil", KeyCodexSummaryModel, m, err)
+		}
+	}
+	for _, bad := range []string{"opus", "gpt-7-x", "two words"} {
+		if err := Validate(KeyCodexSummaryModel, bad); err == nil {
+			t.Errorf("Validate(%s, %q) = nil, want an error", KeyCodexSummaryModel, bad)
+		}
+	}
+	errClaude := Validate(KeyCodexSummaryModel, "opus")
+	errOther := Validate(KeyCodexSummaryModel, "gpt-7-x")
+	if errClaude == nil || errOther == nil || errClaude.Error() == errOther.Error() {
+		t.Errorf("Claude-alias and unknown-id errors should differ: %v / %v", errClaude, errOther)
 	}
 }
 
@@ -511,7 +526,6 @@ func TestJudgeWritability(t *testing.T) {
 	// Per-value validation rejects the obvious bad inputs.
 	for _, tc := range []struct{ key, value string }{
 		{KeyJudgeEnabled, "yes"},
-		{KeySummaryModel, ""},
 		{KeyJudgeModel, "two words"},
 	} {
 		if err := Validate(tc.key, tc.value); err == nil {

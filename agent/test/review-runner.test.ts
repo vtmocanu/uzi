@@ -597,6 +597,43 @@ describe("ReviewRunner", () => {
     assert.equal(reqModel, "gpt-6-sol", "the built-in review model is gpt-6-sol");
   });
 
+  // #3254: neither task-review pass sends a reasoning effort, and the Claude pass sends no model
+  // (the SDK default). The effective-settings preview relies on both facts.
+  it("the Codex review pass sends a model and no effort", async () => {
+    const { client } = fakeClient();
+    const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+    let seen: { model?: string; effort?: string } | undefined;
+    const fakeHarness = {
+      kind: "codex" as const,
+      run: async (req: { model?: string; effort?: string }) => {
+        seen = req;
+        return { text: JSON.stringify({ summary: "codex review", findings: [] }), end: { kind: "terminal", terminal: { outcome: "success" } } };
+      },
+    };
+    const codexAdviceHarnessFactory = (async () => fakeHarness) as never;
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: forbiddenQueryFn(), codexAdviceHarnessFactory });
+    await runner.execute(reviewClaim({ secrets: { forge_pat: "pat", codex: { auth_mode: "api_key", access_token: "codex-tok", capability: "cap-1" } } as never }));
+    assert.equal(seen?.model, CODEX_TASK_REVIEW_MODEL);
+    assert.equal(seen?.effort, undefined, "the Codex review pass must not send an effort");
+  });
+
+  it("the Claude review pass sends no model and no effort", async () => {
+    const { client, calls } = fakeClient();
+    const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+    let options: Record<string, unknown> | undefined;
+    const queryFn = (async function* (args: { options?: Record<string, unknown> }) {
+      options = args.options;
+      yield { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: goodModelJson }] } };
+      yield { type: "result", subtype: "success", is_error: false };
+    }) as unknown as SdkQueryFn;
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn });
+    await runner.execute(reviewClaim({ config: { default_model: "opus", default_effort: "high" } as never }));
+    assert.equal(calls.review?.review.status, "complete");
+    assert.ok(options, "the Claude pass must have called the query");
+    assert.equal(options.model, undefined, "the Claude review pass must send no model");
+    assert.equal(options.effort, undefined, "the Claude review pass must send no effort");
+  });
+
   // PRD #1429 M3: the control — an ordinary Claude claim (no codex block) must never touch
   // the injected Codex advice-harness factory, even when one is wired.
   it("a Claude review claim never touches the injected Codex advice-harness factory", async () => {
@@ -799,4 +836,58 @@ it("stale initial subscription review releases its operation scope and active re
     assert.doesNotThrow(() => next.bind(async () => () => true), "reacquisition must get a fresh scope");
   } finally { next.close(); }
   assert.equal(retained, 0);
+});
+
+
+import * as r1fs from "node:fs/promises";
+import * as r1os from "node:os";
+import * as r1path from "node:path";
+import { makeScratchRoot } from "./fixture-repo.js";
+
+const r1Modes = ["empty", "other-policy", "other-unknown", "same-policy", "same-unknown"] as const;
+async function r1DisabledStore(mode: typeof r1Modes[number]) {
+  const root = makeScratchRoot("r1-producer-", await r1fs.realpath(r1os.tmpdir()));
+  const storeRoot = r1path.join(root, "outbox");
+  const options = { root: storeRoot, log: nullLogger(), runMaxBytes: mode.endsWith("unknown") ? 1 : 1e6,
+    maxBytes: mode.endsWith("unknown") ? 1 : 1e6, retentionMs: 86400000 };
+  await new Outbox(options).init();
+  await r1fs.writeFile(r1path.join(storeRoot, ".key"), "invalid");
+  const outbox = new Outbox(options);
+  await outbox.init();
+  assert.equal(outbox.isDisabled(), true);
+  assert.deepEqual(outbox.listPendingTerminals(), [], "construct the runner with an empty disabled store");
+  return { root, outbox };
+}
+async function r1LateEvidence(outbox: Outbox, mode: typeof r1Modes[number], current: string) {
+  if (mode === "empty") return;
+  const result = await outbox.journalPolicyHold(mode.startsWith("same") ? current : "cccccccc-cccc-4ccc-8ccc-cccccccccccc", {
+    outcome_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", source_generation: 1, claim_generation: 1,
+    detail: "refused", continuation_mode: "same_conversation", published: false,
+    tag: "cyberPolicy", phase: "implementation", correlation_id: "pr-" + "a".repeat(32) + "-1",
+  });
+  assert.equal(result.journaled, false);
+  assert.equal(outbox.listPendingTerminals()[0]?.outcome_kind, mode.endsWith("unknown") ? "unknown" : "policy_hold");
+}
+
+for (const mode of r1Modes) it("R1 disabled review-runner cached empty then " + mode, async () => {
+  const { root, outbox } = await r1DisabledStore(mode);
+  const current = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const expected = mode.startsWith("same") ? 0 : 1;
+  try {
+
+  const { client, calls } = journalingClient(false);
+  let sends = 0;
+  client.reportState = async (_id, body) => {
+    if (body.status === "completed" || body.status === "failed") sends++;
+    return { applied: true, status: body.status };
+  };
+  const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+  const actual = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT,
+    queryFn: replyingQueryFn(goodModelJson), outbox, outboxTerminalMaxBytes: 1 << 20, gapFillMax: 100 });
+  await r1LateEvidence(outbox, mode, current);
+  await actual.execute(reviewClaim({ run_id: current, claim_generation: 8 }));
+  assert.equal(calls.reviewPosts, 1, "the actual reviewer posted its result");
+  assert.equal(sends, expected, "actual review terminal HTTP calls");
+
+  } finally { await r1fs.rm(root, { recursive: true, force: true }); }
 });

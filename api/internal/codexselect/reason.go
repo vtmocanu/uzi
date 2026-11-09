@@ -20,7 +20,8 @@ const (
 	// ReasonPoolEmpty: mode 'auto' but the user pooled no Codex alias, so the owner's
 	// default paid.
 	ReasonPoolEmpty Reason = "pool_empty"
-	// ReasonAuto: picked from the pool by headroom with at least MinHeadroom to spare.
+	// ReasonAuto: picked from the pool, by Policy.Order, among accounts with at least
+	// MinHeadroom to spare.
 	ReasonAuto Reason = "auto"
 	// ReasonBestOfPool: every measurable account was below MinHeadroom, so the emptiest
 	// of them was picked anyway.

@@ -532,7 +532,9 @@ func confine(root string, fds grantFds, abi int) error {
 	if abi >= 3 {
 		handled |= unix.LANDLOCK_ACCESS_FS_TRUNCATE
 	}
-	attr := unix.LandlockRulesetAttr{Access_fs: handled}
+	// x/sys names the handled-rights field explicitly; leave network, scope and
+	// quiet/audit masks zero so the confinement policy remains unchanged.
+	attr := unix.LandlockRulesetAttr{Handled_access_fs: handled}
 	fd, _, errno := syscall.Syscall(
 		unix.SYS_LANDLOCK_CREATE_RULESET,
 		uintptr(unsafe.Pointer(&attr)),

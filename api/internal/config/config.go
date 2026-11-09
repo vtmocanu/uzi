@@ -20,6 +20,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/auth"
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
+	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/workersize"
@@ -266,9 +267,11 @@ type Config struct {
 	// 100 is not satisfiable by any reading, so it is clamped with a warning rather
 	// than left to silently disable auto-selection entirely.
 	AutoselectMinHeadroom int
-	// AutoselectHeadroomTiePct is M4's clustering tolerance T: tokens within this
-	// many points of the emptiest are treated as tied and broken by soonest reset.
-	// Default 5. 0 means "only an exact tie counts", which is a coherent policy.
+	// AutoselectHeadroomTiePct is M4's clustering tolerance T: under headroom_first,
+	// tokens within this many points of the emptiest are treated as tied and broken by
+	// soonest reset. Default 5. 0 means "only an exact tie counts", which is a coherent
+	// policy. Under reset_first (#3844) it is ignored for ReasonAuto picks, which rank
+	// by weekly reset; best_of_pool still clusters with it under either order.
 	AutoselectHeadroomTiePct int
 	// AutoselectMaxStaleness bounds how old a gauge reading may be and still steer a
 	// choice — steering on numbers Anthropic has since moved past is worse than not
@@ -286,8 +289,17 @@ type Config struct {
 	// AutoselectInflightPenalty is M4's herd control: points subtracted from a
 	// token's ranking headroom per run currently spending it, so several claims
 	// inside one poll interval do not all pile onto the same emptiest credential.
-	// Default 3. 0 disables the bias, leaving pure headroom ranking.
+	// Default 3. 0 disables the bias. Under reset_first (#3844) a ReasonAuto pick uses
+	// it only to break exact weekly-reset ties; under headroom_first, and for
+	// best_of_pool under either order, it shifts the headroom ranking.
 	AutoselectInflightPenalty int
+	// AutoselectOrder is how the eligible set is ranked (UZI_AUTOSELECT_ORDER, #3844):
+	// "reset_first" (default) picks the soonest weekly reset among tokens at or above
+	// the floor, because the weekly window is the one Claude and Codex subscriptions
+	// always report; "headroom_first" is the earlier most-headroom ranking. Under
+	// reset_first HeadroomTiePct is ignored for those picks (best_of_pool keeps the
+	// headroom ranking). An unknown value falls back to reset_first with a boot warning.
+	AutoselectOrder autoselect.Order
 	// UsageProbe enables the ~1-token Messages header probe fallback (PRD #53 D2).
 	// Default true; false makes users the free usage endpoint refuses show
 	// `unavailable` rather than spend a token. A security/spend control, so a
@@ -349,7 +361,11 @@ type Config struct {
 	// startup. Empty SeedForgePAT disables it. Requires SeedEmail; the base URL
 	// must be allowlisted. Validated at boot (see loadSeedForge). SeedForgeBaseURL
 	// is stored normalized to match how a connection's base_url is stored.
+	// SeedForgeType is the forge driver the seed builds and stores
+	// (UZI_SEED_FORGE_TYPE, default gitlab); it is the seed's one forge-type
+	// site, read by the presence check, the client build and the stored row.
 	SeedForgePAT     string
+	SeedForgeType    forge.Type
 	SeedForgeBaseURL string
 	SeedForgeRepos   []string
 
@@ -536,8 +552,8 @@ type Config struct {
 	// failed disk-full (after its reclaim and one retry) parks the run in 'recovery_wait' with
 	// recovery_wait_cause='data_volume_full'; disk_park_count is its DISK-ONLY lifetime counter
 	// (distinct from recovery_wait_count and forge_park_count), and this is the cap the
-	// park-or-fail decision consults inside SetState. Past the cap the run fails with
-	// fail_origin='data_volume_full'. A PREVENTIVE park (the worker stopped the run before the
+	// park-or-hold decision consults inside SetState. Past the cap the run holds for
+	// owner Resume with no automatic retry time. A PREVENTIVE park (the worker stopped the run before the
 	// volume filled) is neither counted nor capped. 0 = unlimited; the default (3) lives in Load.
 	RunDiskParkMax int
 	// Provider-transient park bound (PRD #1733, RUN_PROVIDER_PARK_MAX_DURATION). An unbroken
@@ -907,7 +923,6 @@ func Load() (Config, error) {
 	cfg := Config{
 		Addr:            getenv("API_ADDR", ":8080"),
 		TLSAddr:         getenv("API_TLS_ADDR", ":8443"),
-		DatabaseURL:     os.Getenv("DATABASE_URL"),
 		FrontendOrigin:  getenv("FRONTEND_ORIGIN", "http://127.0.0.1:8080"),
 		AuthTokenTTL:    parseDuration("AUTH_TOKEN_TTL", 168*time.Hour),
 		RateLimitMax:    parseInt("RATE_LIMIT_MAX", 10),
@@ -915,11 +930,22 @@ func Load() (Config, error) {
 		TrustedProxies:  parseTrustedProxies(os.Getenv("TRUSTED_PROXIES")),
 	}
 
+	// The three boot secrets each come from the plain variable or from a
+	// <NAME>_FILE path (a mounted Docker/Kubernetes secret), never both.
+	dbURL, dbSource, err := resolveSecret("DATABASE_URL")
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.DatabaseURL = dbURL
 	if strings.TrimSpace(cfg.DatabaseURL) == "" {
-		return Config{}, fmt.Errorf("DATABASE_URL is required")
+		return Config{}, fmt.Errorf("%s is required", dbSource)
 	}
 
-	secret, err := validateSecret(os.Getenv("JWT_SECRET"))
+	jwtRaw, jwtSource, err := resolveSecret("JWT_SECRET")
+	if err != nil {
+		return Config{}, err
+	}
+	secret, err := validateSecret(jwtSource, jwtRaw)
 	if err != nil {
 		return Config{}, err
 	}
@@ -939,7 +965,11 @@ func Load() (Config, error) {
 	// Boot guard for the at-rest encryption key, same stance as JWT_SECRET: a
 	// missing/short/mis-encoded UZI_SECRET_KEY aborts start rather than running
 	// with unencryptable or guessable-keyed token storage.
-	key, err := secretbox.LoadKey("UZI_SECRET_KEY")
+	keyRaw, keySource, err := resolveSecret("UZI_SECRET_KEY")
+	if err != nil {
+		return Config{}, err
+	}
+	key, err := secretbox.DecodeKey(keySource, keyRaw)
 	if err != nil {
 		return Config{}, fmt.Errorf("%w; generate one with: openssl rand -base64 32", err)
 	}
@@ -1077,6 +1107,15 @@ func Load() (Config, error) {
 	// 0 — nothing is ever fresh — which is the correct answer for a gauge nothing
 	// updates, and matches what rateLimitStale already reports for the same case.
 	cfg.AutoselectMaxStaleness = parseNonNegDuration("UZI_AUTOSELECT_MAX_STALENESS", 3*cfg.UsagePollInterval)
+	// Ordering (#3844). A typo falls back to the default with a boot warning rather than
+	// failing startup, the same shape as UZI_EPHEMERAL_DEFAULT_SIZE.
+	cfg.AutoselectOrder = autoselect.Order(strings.TrimSpace(getenv("UZI_AUTOSELECT_ORDER", string(autoselect.OrderResetFirst))))
+	if cfg.AutoselectOrder != autoselect.OrderResetFirst && cfg.AutoselectOrder != autoselect.OrderHeadroomFirst {
+		slog.Warn("UZI_AUTOSELECT_ORDER is not a known order; falling back to \"reset_first\"",
+			"configured", string(cfg.AutoselectOrder),
+			"valid", []string{string(autoselect.OrderResetFirst), string(autoselect.OrderHeadroomFirst)})
+		cfg.AutoselectOrder = autoselect.OrderResetFirst
+	}
 
 	usageProbe, err := parseBool("UZI_USAGE_PROBE", true)
 	if err != nil {
@@ -1538,7 +1577,7 @@ func (c Config) OIDCEnabled() bool { return c.OIDCIssuerURL != "" }
 // (fetcher_control.go), so nothing could serve a profile-bound run anyway.
 func (c Config) IsolatedLaneEnabled() bool { return len(c.FetcherTokenSHA256) != 0 }
 
-// AutoselectPolicy assembles the four UZI_AUTOSELECT_* knobs into the pure ranker's
+// AutoselectPolicy assembles the UZI_AUTOSELECT_* knobs into the pure ranker's
 // Policy (PRD #111 D6).
 //
 // 🔴 IT IS A METHOD SO THERE CAN ONLY BE ONE. The policy is read in two places that
@@ -1554,6 +1593,7 @@ func (c Config) AutoselectPolicy() autoselect.Policy {
 		HeadroomTiePct:  c.AutoselectHeadroomTiePct,
 		MaxStaleness:    c.AutoselectMaxStaleness,
 		InflightPenalty: c.AutoselectInflightPenalty,
+		Order:           c.AutoselectOrder,
 	}
 }
 
@@ -1885,7 +1925,8 @@ func loadSeedAdmin(cfg *Config) error {
 // FORGE_ALLOWED_BASE_URLS allowlist, or boot fails — a set-but-invalid seed is a
 // loud misconfiguration, consistent with the other static boot guards.
 // UZI_SEED_FORGE_BASE_URL defaults to the first allowlisted entry and is stored
-// normalized so it matches how a connection's base_url is stored. Runtime forge
+// normalized so it matches how a connection's base_url is stored.
+// UZI_SEED_FORGE_TYPE defaults to gitlab; an unknown value refuses boot. Runtime forge
 // failures at seed time are handled non-fatally by the seeder, not here.
 func loadSeedForge(cfg *Config) error {
 	pat := strings.TrimSpace(os.Getenv("UZI_SEED_FORGE_PAT"))
@@ -1906,7 +1947,19 @@ func loadSeedForge(cfg *Config) error {
 	if err != nil {
 		return fmt.Errorf("UZI_SEED_FORGE_BASE_URL: %w", err)
 	}
+	// The forge is configured, never detected from the URL or the token: the
+	// driver must be chosen before the token can be verified (PRD #65 D11).
+	// Unset keeps the pre-#3785 behaviour, GitLab.
+	forgeType := forge.TypeGitLab
+	if raw := strings.TrimSpace(os.Getenv("UZI_SEED_FORGE_TYPE")); raw != "" {
+		t, ok := forge.ParseType(raw)
+		if !ok {
+			return fmt.Errorf("UZI_SEED_FORGE_TYPE %q is not a supported forge type; supported values: %s", raw, forge.SupportedTypesList())
+		}
+		forgeType = t
+	}
 	cfg.SeedForgePAT = pat
+	cfg.SeedForgeType = forgeType
 	cfg.SeedForgeBaseURL = norm
 	cfg.SeedForgeRepos = parseCommaList(os.Getenv("UZI_SEED_FORGE_REPOS"))
 	return nil
@@ -2180,18 +2233,43 @@ func (c Config) AgentSourceBaseURLAllowed(raw string) bool {
 
 // validateSecret enforces the boot guard: reject missing, empty, placeholder,
 // or too-short secrets.
-func validateSecret(raw string) ([]byte, error) {
+func validateSecret(name, raw string) ([]byte, error) {
 	s := strings.TrimSpace(raw)
 	if s == "" {
-		return nil, fmt.Errorf("JWT_SECRET is required and must not be empty; generate one with: openssl rand -hex 64")
+		return nil, fmt.Errorf("%s is required and must not be empty; generate one with: openssl rand -hex 64", name)
 	}
 	if _, bad := placeholderSecrets[strings.ToLower(s)]; bad {
-		return nil, fmt.Errorf("JWT_SECRET is set to a well-known placeholder value; generate a real one with: openssl rand -hex 64")
+		return nil, fmt.Errorf("%s is set to a well-known placeholder value; generate a real one with: openssl rand -hex 64", name)
 	}
 	if len(s) < minSecretLen {
-		return nil, fmt.Errorf("JWT_SECRET is too short (%d chars, need >= %d); generate one with: openssl rand -hex 64", len(s), minSecretLen)
+		return nil, fmt.Errorf("%s is too short (%d chars, need >= %d); generate one with: openssl rand -hex 64", name, len(s), minSecretLen)
 	}
 	return []byte(s), nil
+}
+
+// resolveSecret reads a boot secret from the variable name or from the file
+// that name+"_FILE" points at (issue #3938). A variable counts as set when it
+// is non-empty after trimming spaces, so a deployment that renders an empty
+// NAME beside NAME_FILE still boots. Both set is a refusal, not a precedence
+// rule: the operator must say which one is meant. File content loses exactly
+// one trailing newline (what `echo` and most editors add) and nothing else.
+// source names where the value came from, so later validation errors point
+// the operator at the right variable.
+func resolveSecret(name string) (value, source string, err error) {
+	fileVar := name + "_FILE"
+	direct := os.Getenv(name)
+	path := strings.TrimSpace(os.Getenv(fileVar))
+	if strings.TrimSpace(direct) != "" && path != "" {
+		return "", "", fmt.Errorf("%s and %s are both set; set only one of them", name, fileVar)
+	}
+	if path == "" {
+		return direct, name, nil
+	}
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: operator config naming the mounted secret file.
+	if err != nil {
+		return "", "", fmt.Errorf("%s: read %s: %w", fileVar, path, err)
+	}
+	return strings.TrimSuffix(string(raw), "\n"), fileVar, nil
 }
 
 // originIsHTTPS reports whether the given origin uses the https scheme, which

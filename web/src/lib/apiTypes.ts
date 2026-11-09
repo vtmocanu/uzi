@@ -5,6 +5,59 @@
 
 import type { RunKind } from "./runKind";
 
+export interface CrossCheckHistoryAvailabilityDTO { available: boolean }
+export interface CrossCheckHistoryDTO {
+  groups: CrossCheckHistoryGroupDTO[];
+  next_cursor?: string;
+}
+export interface CrossCheckHistoryGroupDTO {
+  parent_id: string;
+  parent_title: string;
+  parent_status: string;
+  latest_at: string;
+  active: boolean;
+  total_attempts: number;
+  matching_attempts: number;
+  active_attempts: number;
+  active_hidden: number;
+  active_context?: string;
+  attempts: CrossCheckHistoryAttemptDTO[];
+  older_cursor?: string;
+  omission?: string;
+  refresh_needed: boolean;
+}
+export interface CrossCheckHistoryAttemptDTO {
+  stage: string;
+  round: number;
+  result: string;
+  review: string;
+  execution: string;
+  reason: string;
+  findings_count: number | null;
+  created_at: string;
+  decided_at: string | null;
+  interrupted_at: string | null;
+  deadline_at: string;
+  child_id: string | null;
+  child_status: string | null;
+  child_context: string;
+  model: string | null;
+  effort: string | null;
+  historical: boolean;
+  active: boolean;
+  effect: string;
+  next_action: string;
+}
+export interface CrossCheckHistoryParams {
+  lifecycle?: "active" | "past";
+  stage?: "all" | "plan" | "code";
+  outcome?: "any" | "didnt_finish" | "raised_issues" | "passed" | "replaced";
+  limit?: number;
+  attempt_limit?: number;
+  cursor?: string;
+  attempt_cursor?: string[];
+}
+
 export interface User {
   id: string;
   email: string;
@@ -62,7 +115,7 @@ export interface User {
   judge_anthropic_secret_label: string | null;
   // Which bind mode this user's RETROSPECTIVES use (PRD #1140): default / pinned /
   // auto. The EFFECTIVE mode (a pinned binding whose token was deleted reports
-  // default). auto spreads retrospectives across the user's pooled tokens.
+  // default). auto picks retrospectives' token from the user's pool.
   judge_anthropic_bind_mode: BindMode;
   created_at: string;
   last_login: string | null;
@@ -175,6 +228,207 @@ export interface EffortSettingCell {
   resolved_effort: string | null;
   source: string;
   mode: "explicit" | "runtime_default";
+  /** Codex cell only (issue #3251): the effort the Codex model catalog applies when no
+   *  level is sent. Absent on the Claude cell and on an older server. */
+  catalog_default?: CatalogDefault;
+}
+
+/** What a Codex run's catalog reported as its default effort (issue #3251). `state` is
+ *  known, unknown (nothing reported yet; effort/model/runtime_version are null) or
+ *  varies (workers disagree). effort "none" means the catalog requests no level. */
+export interface CatalogDefault {
+  state: "known" | "unknown" | "varies";
+  effort: string | null;
+  model: string | null;
+  runtime_version: string | null;
+  observed_at: string | null;
+}
+
+/** PRD #3254: the closed provenance vocabularies of the effective-settings view, mirroring the
+ *  Go constants (handler/effective_settings.go, workersvc/effective_settings.go) and the
+ *  source_labels of fixtures/model-settings/contract.json. */
+type EffectiveModelSource =
+  | "user_default" | "instance_default" | "builtin" | "schedule_pin" | "template"
+  | "cross_check_pin" | "cross_check_worker_default";
+type EffectiveEffortSource =
+  | "user_default" | "builtin" | "cross_check_pin" | "cross_check_default";
+type EffectiveHarnessSource = "run_override" | "schedule_pin" | "user_default" | "automatic" | "chosen_at_create";
+type EffectiveCredentialSource =
+  | "claim_selection" | "codex_default_credential" | "chosen_at_create" | "auto_selection" | "owner_default" | "token_override";
+type EffectiveRefusal =
+  | "no_credential_for_harness" | "no_usable_credential" | "credential_disabled" | "credential_not_found"
+  | "credential_override_harness_unsupported" | "credential_override_invalid";
+type EffectiveRefusalDetail = "credential_disabled" | "codex_pool_unavailable";
+type EffectiveModelSetting = "worker_model" | "judge_model" | "summary_model" | "task_review_model" | "cross_check_plan" | "cross_check_code";
+type EffectiveEffortSetting = "worker_effort" | "task_review_effort" | "cross_check_plan" | "cross_check_code";
+
+/** PRD #3254: a supplied value that does not apply (a schedule's model pin on the other harness). */
+export interface EffectiveIgnored {
+  value: string;
+  source: string;
+}
+
+/** PRD #3254: one harness's model cell of a setting (the shared ModelSettingCell, flattened)
+ *  plus which setting it is and when the value is fixed. `resolved_model` "" means the runtime
+ *  decides (note `sdk_default`). `fixed_at` is create or claim. */
+export interface EffectiveModelCell extends ModelSettingCell {
+  source: EffectiveModelSource;
+  setting: EffectiveModelSetting;
+  fixed_at: string;
+  ignored: EffectiveIgnored | null;
+  notes: string[];
+}
+
+/** PRD #3254: one harness's effort cell (the shared EffortSettingCell, flattened). */
+export interface EffectiveEffortCell extends EffortSettingCell {
+  source: EffectiveEffortSource;
+  setting: EffectiveEffortSetting;
+  fixed_at: string;
+  notes: string[];
+}
+
+/** PRD #3254: which credential a run would use and when that is fixed, never which one.
+ *  `kind` is anthropic or codex; `auth_mode` (codex only) is subscription or api_key. */
+export interface Credential {
+  kind: string;
+  source: EffectiveCredentialSource;
+  fixed_at: string;
+  auth_mode: string | null;
+}
+
+/** PRD #3254: a predicted harness. `value` is null with source chosen_at_create when a
+ *  creation-time policy (a note: automatic_weekly_reset or overflow) picks it at creation. */
+export interface HarnessValue {
+  value: string | null;
+  source: EffectiveHarnessSource;
+  fixed_at: string;
+  notes: string[];
+}
+
+export interface EffectiveHarness {
+  harness: Harness;
+  usable: boolean;
+  refusal: EffectiveRefusal | null;
+  refusal_detail: EffectiveRefusalDetail | null;
+  credential: Credential | null;
+}
+
+export interface EffectiveStartChoice {
+  choice: string;
+  harness: HarnessValue | null;
+  refusal: EffectiveRefusal | null;
+  refusal_detail: EffectiveRefusalDetail | null;
+  anthropic_override_allowed: boolean;
+}
+
+/** GET /api/me/effective-settings (PRD #3254). */
+export interface EffectiveSettings {
+  version: number;
+  harnesses: EffectiveHarness[];
+  start: EffectiveStartChoice[];
+  models: EffectiveModelCell[];
+  efforts: EffectiveEffortCell[];
+  cross_check: { models: EffectiveModelCell[]; efforts: EffectiveEffortCell[] };
+}
+
+export interface StartPreviewCredentialOverride {
+  mode: string;
+  secret_id?: string;
+}
+
+/** POST /api/me/effective-settings/start-preview body. */
+export interface StartPreviewRequest {
+  harness: string | null;
+  credential_override: StartPreviewCredentialOverride | null;
+}
+
+/** One harness a creation-time policy might choose, computed as if it were chosen. A refused
+ *  branch has a null credential and its own refusal; both are null on a valid branch. */
+export interface StartPreviewAlternative {
+  harness: string;
+  credential: Credential | null;
+  refusal: EffectiveRefusal | null;
+  refusal_detail: EffectiveRefusalDetail | null;
+}
+
+/** The start-preview response. When the harness is chosen at creation, `credential` is null and
+ *  `alternatives` lists Claude then Codex. A top-level `refusal` is set only for a failure before
+ *  a harness is decided, or when every alternative is refused for the same reason. */
+export interface StartPreview {
+  version: number;
+  harness: HarnessValue | null;
+  refusal: EffectiveRefusal | null;
+  refusal_detail: EffectiveRefusalDetail | null;
+  credential: Credential | null;
+  alternatives?: StartPreviewAlternative[];
+}
+
+/** PRD #3254 M3: the schedule preview's refusals, the start-preview set plus the save-step
+ *  (invalid_model, credential_override_lane_not_switchable) and fire-step (codex_override_conflict,
+ *  codex_pool_unavailable) ones, mirroring handler/effective_settings_schedule.go and the
+ *  scheduler's skip reasons it maps. */
+type ScheduleRefusal =
+  | EffectiveRefusal | "invalid_model" | "credential_override_lane_not_switchable"
+  | "codex_override_conflict" | "codex_pool_unavailable";
+
+/** POST /api/me/effective-settings/schedule-preview body. Without `schedule_id` it is a draft and
+ *  `target` is required; with it, supplied fields replace the stored ones. `harness`, `model` and
+ *  `credential_override` distinguish omitted (as stored) from null (clear). */
+export interface ScheduleSettingsPreviewRequest {
+  schedule_id?: string;
+  target?: string;
+  harness?: string | null;
+  model?: string | null;
+  override_subagent_model?: boolean;
+  credential_override?: StartPreviewCredentialOverride | null;
+}
+
+/** One own subagent whose template pins a model for the harness. */
+export interface EffectiveSubagentPin {
+  name: string;
+  model: string;
+}
+
+/** How a run's subagents pick a model. `lead_value` "" means the SDK decides. `pinned` lists at
+ *  most 32 subagents sorted by name; `pinned_truncated` says there were more. */
+export interface EffectiveSubagents {
+  mode: "follow_lead" | "own_pins";
+  lead_value: string;
+  pinned: EffectiveSubagentPin[];
+  pinned_truncated: boolean;
+  /** Labels; `repo_agents_not_predicted` is always present. */
+  notes: string[];
+}
+
+/** One harness a creation-time policy might choose for a schedule fire, computed as if it were
+ *  chosen. A refused branch has null worker_model, worker_effort, credential and subagents and
+ *  carries its own refusal; both refusal fields are null on a valid branch. */
+export interface ScheduleAlternative {
+  harness: string;
+  worker_model: EffectiveModelCell | null;
+  worker_effort: EffectiveEffortCell | null;
+  credential: Credential | null;
+  subagents: EffectiveSubagents | null;
+  refusal: ScheduleRefusal | null;
+  refusal_detail: EffectiveRefusalDetail | null;
+}
+
+/** The schedule-preview response: what firing the schedule now and claiming the run would use.
+ *  When the harness is chosen at creation, `harness.value` is null, the four harness-dependent
+ *  fields are null and `alternatives` lists Claude then Codex. A top-level `refusal` is set for a
+ *  save-step failure, a failure before the harness is decided, a fire-rule refusal on a known
+ *  harness, or when every alternative is refused for the same reason. */
+export interface ScheduleSettingsPreview {
+  version: number;
+  harness: HarnessValue | null;
+  refusal: ScheduleRefusal | null;
+  refusal_detail: EffectiveRefusalDetail | null;
+  worker_model: EffectiveModelCell | null;
+  worker_effort: EffectiveEffortCell | null;
+  credential: Credential | null;
+  subagents: EffectiveSubagents | null;
+  notes: string[];
+  alternatives?: ScheduleAlternative[];
 }
 
 export interface UserSettings {
@@ -218,6 +472,12 @@ export interface UserSettings {
    *  instance summary_model (which itself falls back to haiku). Written through
    *  PUT /me/settings alongside judge_model, validated by the same model rules. */
   summary_model: string | null;
+  /** Per-user Codex summary model (PRD #3248); null inherits the instance Codex summary
+   *  model, then the built-in. A Codex role id when set. Optional for older servers. */
+  codex_summary_model?: string | null;
+  /** Read-only resolved view of both summary lanes (PRD #3248), claude then codex.
+   *  Never sent on a PUT. Optional for older servers. */
+  summary_models?: ModelSettingCell[];
   theme: string | null;
   /** PRD #1167 "Lights on" (m2): the four RAW per-user appearance overrides, each
    *  null = inherit the instance default. appearance_mode is system|light|dark;
@@ -253,6 +513,8 @@ export interface UserSettings {
   /** Issue #3719: how a new Codex run chooses its login. "default" binds the default alias;
    *  "auto" picks among the pooled aliases. Absent on a server that predates the setting. */
   codex_account_mode?: CodexAccountMode | string;
+  /** Owner opt-in, written only through PUT /me/harness-overflow. */
+  harness_overflow_enabled: boolean;
   /** Per-user default harness (PRD #1429 M1 / D3); null = "no preference", so implicit run
    *  creation falls through the D11 resolver. One of claude|codex when set; the web Run
    *  Defaults page writes it. */
@@ -285,6 +547,8 @@ export interface UserSettingsPatch {
   codex_judge_model?: string | null;
   /** Per-user run-summary model (PRD #362 M2); present-null clears back to inherit. */
   summary_model?: string | null;
+  /** Per-user Codex summary model (PRD #3248); present-null clears back to inherit. */
+  codex_summary_model?: string | null;
   theme?: string | null;
   /** PRD #1167 "Lights on" (m2): tri-state appearance override fields — absent leaves
    *  the field unchanged, present-null clears it back to inherit, a value sets it
@@ -333,13 +597,14 @@ export interface SlackLink {
 }
 
 // AgentTemplate is a stored agent definition. tools is null when the template
-// inherits all tools; model is null when it inherits the model. scope/user_id
+// inherits all tools; model/codex_model are the nullable Claude/Codex pins. scope/user_id
 // carry the M6 ownership model; is_builtin is retained (== scope 'builtin').
 export interface AgentTemplate {
   id: string;
   name: string;
   description: string;
   model: string | null;
+  codex_model: string | null;
   tools: string[] | null;
   prompt_body: string;
   is_builtin: boolean;
@@ -347,7 +612,7 @@ export interface AgentTemplate {
   user_id: string | null;
   updated_by: string | null;
   // differs_from_builtin is computed server-side per request (issue #201 M4a):
-  // whether this row's four mutable columns still match the definition the
+  // whether this row's five mutable columns still match the definition the
   // running release ships under the same name. It is false for anything that has
   // no shipped counterpart — a global row, a user row that merely shares a
   // builtin's name, and a builtin this release no longer ships.
@@ -383,6 +648,7 @@ export interface BuiltinDefinition {
   name: string;
   description: string;
   model: string | null;
+  codex_model: string | null;
   tools: string[] | null;
   prompt_body: string;
 }
@@ -395,6 +661,8 @@ export interface AgentTemplateInput {
   name?: string;
   description: string;
   model: string | null;
+  // Omitted on PUT preserves the stored pin; null or blank clears it.
+  codex_model?: string | null;
   tools: string[] | null;
   prompt_body: string;
   scope?: "global" | "user";
@@ -584,6 +852,7 @@ export interface Repo {
   // skills from the repo's own .claude/skills/ (skills only, never hooks/
   // settings/commands). Default false.
   repo_skills_enabled: boolean;
+  agent_source_default?: AgentSource | null;
   // Repo-instructions opt-in (PRD #246): when true, the lead reads the repo's
   // root CLAUDE.md as nonce-fenced, advisory, lead-only context. It is the second
   // capability behind the "Trusted repo" affordance, independently revocable from
@@ -905,10 +1174,13 @@ export interface LatestRun {
   // hold_reason (PRD #1226/#1497/#1732): why a `paused` run is server-held, null for an owner
   // pause or a non-paused run. Non-sensitive, so the board projection sends it on every card
   // (api/internal/handler/board.go latestRunDTO.HoldReason). effectiveRunStatus overlays
-  // 'credential_disabled' so the card reads "waiting: credential disabled", not "paused", and
+  // 'credential_disabled' so the card reads "waiting: credential disabled", not "paused",
+  // 'credentials_reset' (PRD #3989) likewise reads "waiting: credentials were reset", and
   // the issue #3181 token-switch holds ('credential_switch_settling' / 'credential_switch_unsettled')
   // so they read "settling: token switch" / "held: token switch".
   // 'base_attestation_missing' (issue #3194) reads "base unverified: owner hold" likewise.
+  // 'iteration_budget_exhausted' is a nonterminal owner hold: "Iteration limit reached".
+  // Resume grants a fresh finite allowance; Extend adds wall time without resuming; Cancel ends it.
   // Optional for api/web rollout skew: an absent key reads as no hold.
   hold_reason?: string | null;
   owner_name: string;
@@ -1114,6 +1386,11 @@ export interface AppSettings {
   // generator runs on (haiku by default), served as a raw string like every other
   // setting. Mirrors judge_model's admin machinery but delivers on the issue-run claim.
   summary_model: string;
+  // codex_summary_model (PRD #3248) is the instance Codex-lane summary model: a Codex role
+  // id, or "" for the built-in (the admin GET reports the built-in with source "default").
+  // summary_model likewise accepts "" as the reset to the built-in haiku.
+  // Optional so an older server (and fixtures that predate it) stay valid.
+  codex_summary_model?: string;
   // Run-health detector keys (PRD #47, #1170). health_enabled is the text "true"/"false".
   // The *_seconds keys are integer seconds as strings; health_near_timeout_pct is a
   // percent of the run's wall-clock budget (0 to disable, else [50, 99]). The API serves
@@ -1315,7 +1592,11 @@ export interface AgentSourceStagedRole {
   ok: boolean;
   reason?: string;
   description?: string;
+  // Raw source model remains optional for compatibility with older staged JSON.
   model?: string;
+  // Review pins are always present; empty means Default for that harness.
+  claude_model: string;
+  codex_model: string;
   tools?: string[];
   prompt_body?: string;
   // True when the displayed `prompt_body` differs from the raw applied body because
@@ -1973,6 +2254,39 @@ export interface CliAuthRequestMeta {
   client_desc: string;
   status: CliAuthStatus;
   expires_at: string;
+}
+
+// ── Admin-issued account reset link (PRD #3989) ───────────────────────────────
+// kind says what redeeming does: "password" sets a new login password, "vault_only"
+// (an SSO-only account, M2) only resets the vault. Both delete every model credential.
+export type ResetLinkKind = "password" | "vault_only";
+
+// AccountResetLink is the 201 of POST /api/admin/users/{id}/reset-link. The plaintext
+// token appears here exactly once (only its hash is stored); the web composes
+// `${origin}/reset#<token>` and never sends the token anywhere but a POST body.
+export interface AccountResetLink {
+  token: string;
+  expires_at: string;
+  kind: ResetLinkKind;
+  target_is_admin: boolean;
+}
+
+// ResetLinkPreview is the 200 of POST /api/auth/reset/preview. Every invalid-link
+// cause is one generic 404 instead.
+export interface ResetLinkPreview {
+  kind: ResetLinkKind;
+  expires_at: string;
+}
+
+// Request bodies of the two unauthenticated reset endpoints. The token rides the
+// body, never a path or query. password is required for kind=password and must be
+// absent for kind=vault_only.
+export interface ResetLinkPreviewRequest {
+  token: string;
+}
+export interface ResetLinkRedeemRequest {
+  token: string;
+  password?: string;
 }
 
 // ── OAuth consent flow (PRD #1910 M2) ─────────────────────────────────────────
@@ -2694,7 +3008,7 @@ export interface Worker {
   anthropic_secret_label: string | null;
   /** How this worker's run-lane claims choose a credential (PRD #111 M3):
    *  "default" (the owner's default), "pinned" (the id above), or "auto" (uzi picks
-   *  per claim from the owner's opted-in pool, preferring the most headroom).
+   *  per claim from the owner's opted-in pool, by the server's auto-select order).
    *
    *  🔴 It is the EFFECTIVE mode, not the stored column. Deleting a pinned token
    *  nulls the worker's id server-side and leaves the stored mode alone, so the
@@ -2729,6 +3043,8 @@ export interface Worker {
   // outbox_blocked describes), shown to the worker's owner. Untrusted worker text: never
   // joined to a run's title or status.
   outbox_blocked_run_id?: string | null;
+  /** Worker-global root diagnostic, distinct from per-run arbitration. */
+  outbox_root_unusable?: string | null;
   // The worker's residue-quarantine latch (issue #2213): it found an unreadable,
   // unattributed process running as its own uid, so it claims nothing and starts no
   // forge-credentialed git and no new Claude/Codex turn until its container restarts.
@@ -3168,7 +3484,39 @@ export interface RunLeadConfig {
   phases: LeadPhaseConfig[];
 }
 
+/** Stored creation-time evidence; null on legacy or redacted run responses. */
+export interface HarnessDecision {
+  preferred: string;
+  chosen: string;
+  reason: string;
+  preferred_score: number | null;
+  other_score: number | null;
+  preferred_measured: number | null;
+  other_measured: number | null;
+  preferred_held: boolean;
+  other_held: boolean;
+  /** Weekly reset of the preferred (auto_*: Claude) / other (auto_*: Codex) account; null when unknown or pre-change rows. */
+  preferred_weekly_reset_at: string | null;
+  other_weekly_reset_at: string | null;
+}
+
 export interface Run {
+  policy_hold?: {
+    preserve_required: boolean;
+    pending_fresh: boolean;
+    outcome_id: string;
+    continuation_mode: "same_conversation" | "fresh_from_saved_work";
+    resolved_at: string | null;
+    applying_worker_id: string | null;
+    applying_generation: number;
+    source_generation: number;
+    refusal_count: number;
+    policy_tag: "cyberPolicy" | "misalignmentPolicyViolation" | null;
+    phase: "planning" | "implementation" | null;
+    correlation_id: string | null;
+    published: boolean | null;
+    captured_head?: string | null;
+  };
   forge_origin_cooldown?: ForgeOriginCooldown;
   capability_provenance?: {
     hints_known: boolean;
@@ -3211,6 +3559,7 @@ export interface Run {
    *  "claude"). The web marks every run with its provider chip (HarnessBadge, PRD #1653
    *  D-W5), and keys the model/effort vocabulary on it (M4). */
   harness: Harness;
+  harness_decision: HarnessDecision | null;
   /** Chat conversation title (PRD #39), first-message derived; null for other kinds
    *  and until derived. resume_of_run_id points a continued chat at the ended one. */
   title: string | null;
@@ -3304,6 +3653,8 @@ export interface Run {
   /** Forge-supplied issue web URL (PRD #411), null for issue-less runs or when the
    *  issue is no longer cached. Rendered through isHttpsUrl into the #<iid> link. */
   issue_web_url: string | null;
+  /** Confirmed issues created by a scheduled prompt; detail read only. */
+  created_issues?: { iid: number; title: string; web_url: string }[];
   /** PRD #764 M2: whether the run's issue links a `prds/*.md` file, so the run view can
    *  show a neutral "PRD" presence badge. OPTIONAL for api/web rollout skew: a pre-#764
    *  api pod omits the key, and an absent value reads as no PRD (the badge stays hidden). */
@@ -3478,11 +3829,15 @@ export interface Run {
    *  none (the plan gate's repo card is inert, NOT the same as null). Names +
    *  descriptions only — REPO-SUPPLIED, untrusted text; render as plain JSX. */
   repo_agents: RepoAgent[] | null;
+  repo_agent_source_commit?: string | null;
   /** PRD #37: which roster the run's subagents came from, once a selection is made
    *  (at the gate, or an autopilot run's resolved default). null before then. */
   agent_source: AgentSource | null;
   /** PRD #37: the names excluded from the chosen source. null before a selection. */
   agent_exclusions: string[] | null;
+  agent_source_requested?: AgentSource | null;
+  agent_source_requested_basis?: AgentSourceRequestedBasis | null;
+  plan_agent_source?: AgentSource | null;
   /** PRD #37 M4-fix: the owner's OWN-source subagent roster (name + description) —
    *  exactly the allocation-resolved templates the worker runs for source="own",
    *  lead already stripped. The plan gate's "My agent templates" card is built from
@@ -3656,12 +4011,17 @@ export interface Run {
    *  credential refresh or release found the run owner's vault locked; the run resumes at its
    *  next retry, `recovery_retry_not_before`, once the vault is unlocked, and waits `queued`
    *  while it stays locked), and "data_volume_full" (PRD #1809 M5: the worker's data volume
-   *  was full or about to fill; the run resumes at its next retry, see disk_park_count);
+   *  was full or about to fill; explicit null retry timing holds for the owner,
+   *  a finite timestamp schedules a retry, see disk_park_count);
    *  "provider_outage" is a counted provider interruption with a scheduled retry;
    *  "retained_recovery_exhausted" can be timed or owner-held (see recovery_retry_not_before);
-   *  "retained_recovery_adoption_failed" means integrity checks refused adoption of retained
-   *  work: always owner-held with local work and custody preserved, no automatic retry.
+   *  "retained_recovery_adoption_failed" is an integrity hold: retained adoption or a predecessor
+   *  remediation record refused source use (the agent did not start): always owner-held with local work and custody preserved, no automatic retry.
    *  Only the owner can Resume or Cancel, through the existing owner authorization.
+   *  "retained_continuation_unwitnessed" (issue #3859) means a retained-custody continuation's
+   *  claimed worker flight was never witnessed starting or departing within a bounded window;
+   *  the claim was released, local work and custody are kept, and only the owner can Resume or
+   *  Cancel. Owner-held with no automatic retry, and not an integrity refusal.
    *  "empty_turn" remains reserved. Render an unrecognised value honestly (a
    *  newer server may ship a cause this build has not heard of), the same rule as
    *  rate_limit_type. */
@@ -3710,7 +4070,8 @@ export interface Run {
    *  recovery-parked. For forge_unreachable and retained_recovery_exhausted, explicit null means owner-held;
    *  a valid timestamp means timed retry (including when already due). Missing or invalid
    *  timing is unknown. For retained_recovery_adoption_failed this is always null and must
-   *  never produce a retry countdown, even if a malformed response supplies a timestamp.
+   *  never produce a retry countdown, even if a malformed response supplies a timestamp;
+   *  the same holds for retained_continuation_unwitnessed.
    *  ISO-8601 string, like every other timestamp on this type. */
   recovery_retry_not_before?: string | null;
   /** PRD #1392 M1: how many times this run has forge-parked in its lifetime — the
@@ -3822,7 +4183,9 @@ export interface Run {
    *
    *  `hold_reason` names why a `paused` run is server-held, else null: 'completion_blocked' for
    *  a completion hold, 'credential_disabled' for a run waiting on a disabled credential
-   *  (PRD #1732 D14; resumes on Enable, never on a plain Resume), 'budget_exhausted' for a
+   *  (PRD #1732 D14; resumes on Enable, never on a plain Resume), 'credentials_reset' for a run
+   *  created before an account reset that waits for a new credential (PRD #3989; resumes
+   *  automatically once one exists), 'budget_exhausted' for a
    *  wall-clock park (PRD #1497), and 'provider_unavailable' for a provider outage bound
    *  reached (PRD #1733; owner Resume, scoped Stop when permitted, or Cancel).
    *  Issue #3181: 'credential_switch_settling' when an owner token switch on a retained-recovery
@@ -3836,6 +4199,9 @@ export interface Run {
    *  Issue #3194: 'base_attestation_missing' for a --require-base run that adopted retained work no
    *  checkpoint attests to the planned base (issue #3194; the agent was not started, nothing
    *  automatic leaves the hold, Resume and extend are refused; recover or start a successor).
+   *  'iteration_budget_exhausted' is a nonterminal iteration hold: owner Resume or Cancel,
+   *  never completed-scope Stop. Extend wall time first only when remaining wall is spent;
+   *  Extend leaves it paused, and credential changes never retry it automatically.
    *  Render an unrecognised value honestly.
    *  `hold_context` is the constant "unavailable(same_worker_only)" ONLY while held, else null:
    *  the UI/CLI state the hold's durability HONESTLY from it — the hold is same-worker-only and
@@ -4174,6 +4540,17 @@ export interface RunListItem extends Run {
   judge_verdict: JudgeVerdict | null;
   judge_todo_count: number;
 
+  /** PRD #4040: a one-line, sanitized excerpt (at most 280 characters plus " (+N more)")
+   *  of the newest pending question, set only on the viewer's own awaiting_input rows of
+   *  GET /api/runs. Absent otherwise, and never on the admin list. Untrusted model text:
+   *  render as plain text. */
+  pending_question?: string;
+
+  /** Which cross-check is live for this run: "plan" or "code". Non-null only while the
+   *  run's plan or code cross-check is live. Older APIs omit it, and an absent value
+   *  shows no tag. */
+  cross_check_active?: "plan" | "code" | null;
+
   repo_path: string;
   worker_name: string | null;
   owner_email?: string;
@@ -4185,10 +4562,10 @@ export interface RunListItem extends Run {
  *  or ordering reads only these keys; the run detail page fetches the full Run. */
 export type RunSummaryItem = Omit<
   RunListItem,
-  "plan_md" | "repo_agents" | "issue_description" | "preserved_patch"
+  "plan_md" | "repo_agents" | "repo_agent_source_commit" | "issue_description" | "preserved_patch"
   | "reset_state_digest" | "milestone_reconciliations" | "milestone_reconciliations_next_before_gate_revision"
   | "semantic_gate" | "completion_pending" | "semantic_drift"
-  | "capability_provenance" | "lead_config"
+  | "capability_provenance" | "lead_config" | "created_issues"
 >;
 
 // RunOutcomes is the failed-run rate aggregate for one scope+window (PRD #1293).
@@ -5116,6 +5493,7 @@ export interface SteerInput {
 // own agent folder (.claude/agents/ or .codex/agents/), or the user's uzi templates. The lead orchestrator is
 // always uzi's builtin and is never selectable.
 export type AgentSource = "repo" | "own";
+export type AgentSourceRequestedBasis = "explicit" | "repo_default";
 
 // RepoAgent is one agent the worker detected in the cloned repo's .claude/agents/
 // or .codex/agents/
@@ -5409,7 +5787,18 @@ export interface CIRunDetail extends CIRun {
 // until the capture reaches the relevant lifecycle stage: attempted_head_sha (H') is
 // absent when no publish was attempted; byte_size/checksum are absent until the manifest
 // is bound; expires_at is absent until the artifact is available.
+export interface RecoveryPrerequisiteClosure {
+  state: string;
+  reason?: string;
+  pin_ref: string;
+  pin_tip?: string;
+  absence_unconfirmed: boolean;
+  cleanup_exhausted: boolean;
+  updated_at: string;
+}
+
 export interface RecoveryArchive {
+  prerequisite_closure?: RecoveryPrerequisiteClosure;
   id: string;
   run_id: string;
   hold_id: string;

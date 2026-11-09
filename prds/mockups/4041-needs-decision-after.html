@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!-- Target design for the Overview preview "Needs your decision" card after #4041 (grouping by kind, order, icons, plan details, two-column rule) and #4040 (inline question text). Example data only. Open this file directly in a browser. -->
+<title>Needs Your Decision, After</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one review column; each scenario is a labelled frame holding the card exactly as the Overview preview would render it. */
+:root {
+  --bg: #f2f3f6; --surface: #ffffff; --edge: #dfe2e8; --fg: #1d2129; --muted: #626a78; --faint: #8a91a0;
+  --amber: #9a5b13; --amber-tile: #fbf3e8; --amber-edge: #b57a3a;
+  --green: #2f6b4f; --green-tile: #edf6f0; --green-edge: #4f8a6c;
+  --btn: #eef0f3; --btn-edge: #d5d9e0; --note-bg: #fff8e9; --note-edge: #ecd3a6; --tag: #e7ecf7; --tag-fg: #34508a;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #15171c; --surface: #1d2027; --edge: #2e333d; --fg: #e8eaee; --muted: #a2a9b6; --faint: #7f8796;
+  --amber: #e2a75e; --amber-tile: #2b2219; --amber-edge: #a87437;
+  --green: #7cc7a0; --green-tile: #18271f; --green-edge: #3f7a5b;
+  --btn: #262a33; --btn-edge: #3a404c; --note-bg: #2a2418; --note-edge: #5c4a28; --tag: #222b3d; --tag-fg: #a9bfee; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #15171c; --surface: #1d2027; --edge: #2e333d; --fg: #e8eaee; --muted: #a2a9b6; --faint: #7f8796;
+  --amber: #e2a75e; --amber-tile: #2b2219; --amber-edge: #a87437;
+  --green: #7cc7a0; --green-tile: #18271f; --green-edge: #3f7a5b;
+  --btn: #262a33; --btn-edge: #3a404c; --note-bg: #2a2418; --note-edge: #5c4a28; --tag: #222b3d; --tag-fg: #a9bfee; color-scheme: dark }
+
+body { background: var(--bg); color: var(--fg); font-family: var(--sans); font-size: 14px; line-height: 1.45; }
+.page { max-width: 1060px; margin: 0 auto; padding-block: 28px 56px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); display: grid; gap: 28px; }
+h1 { font-size: 22px; font-weight: 600; margin: 0; text-wrap: balance; }
+.lede { color: var(--muted); margin: 6px 0 0; max-width: 68ch; }
+.legend { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 12px; font-size: 12px; color: var(--muted); }
+.tag { display: inline-block; font-family: var(--mono); font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--tag); color: var(--tag-fg); white-space: nowrap; }
+.scenario { display: grid; gap: 10px; }
+.scenario h2 { font-size: 13px; font-weight: 600; margin: 0; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+.scenario p.why { margin: 0; color: var(--muted); font-size: 13px; max-width: 72ch; }
+
+.card { background: var(--surface); border: 1px solid var(--edge); border-radius: 14px; padding: 22px 26px; min-width: 0; }
+.card-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+.stitle { font-size: 12px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); margin: 0; }
+.count { font-size: 13px; color: var(--muted); }
+.list { list-style: none; margin: 0; padding: 0; display: grid; column-gap: 40px; }
+.list.two { grid-template-columns: 1fr 1fr; }
+.row { display: grid; grid-template-columns: 34px minmax(0,1fr) auto; gap: 14px; align-items: center; padding: 14px 0; border-bottom: 1px solid var(--edge); min-width: 0; }
+.list.two .row:nth-last-child(-n+2), .list:not(.two) .row:last-child { border-bottom: 0; }
+.tile { width: 34px; height: 34px; border-radius: 9px; display: grid; place-items: center; border: 1.5px solid var(--amber-edge); background: var(--amber-tile); color: var(--amber); }
+.tile.pr { border-color: var(--green-edge); background: var(--green-tile); color: var(--green); }
+.tile svg { width: 17px; height: 17px; }
+.body { min-width: 0; }
+.title { margin: 0; font-weight: 500; font-size: 15px; line-height: 1.35; }
+.title .ref { color: var(--muted); font-weight: 400; margin-right: 4px; }
+.meta { margin: 3px 0 0; color: var(--muted); font-size: 13px; display: flex; flex-wrap: wrap; gap: 2px 14px; }
+.age { color: var(--amber); }
+.quote { margin: 4px 0 0; font-style: italic; color: var(--muted); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.prs { margin: 4px 0 0; padding: 0; list-style: none; display: grid; gap: 2px; font-size: 13px; color: var(--muted); }
+.prs a { color: var(--fg); text-decoration: none; font-family: var(--mono); font-size: 12.5px; }
+.prs a:hover { text-decoration: underline; }
+.prs .t { color: var(--muted); }
+.prs li { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.note { color: var(--faint); font-size: 12px; margin-top: 4px; }
+.btn { font: inherit; font-size: 13.5px; font-weight: 500; color: var(--fg); background: var(--btn); border: 1px solid var(--btn-edge); border-radius: 999px; padding: 6px 15px; cursor: pointer; white-space: nowrap; text-decoration: none; }
+.btn:hover { filter: brightness(.97); }
+.btn:focus-visible, .prs a:focus-visible { outline: 2px solid var(--tag-fg); outline-offset: 2px; }
+.mark { margin-left: 6px; vertical-align: 1px; }
+.diff { display: grid; gap: 6px; font-size: 13px; color: var(--muted); margin: 0; padding-left: 18px; }
+@media (max-width: 760px) {
+  .list.two { grid-template-columns: 1fr; }
+  .list.two .row:nth-last-child(2) { border-bottom: 1px solid var(--edge); }
+  .card { padding: 18px 16px; }
+  .row { grid-template-columns: 30px minmax(0,1fr); }
+  .row .btn { grid-column: 2; justify-self: start; }
+  .tile { width: 30px; height: 30px; }
+}
+@media (prefers-reduced-motion: no-preference) { .prs li.more { animation: in .18s ease-out; } @keyframes in { from { opacity: .3 } to { opacity: 1 } } }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-plan" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 4v16M18 4v16M6 9h12M6 15h12"/></symbol>
+  <symbol id="i-q" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16v11H9l-5 4z"/><path d="M10 9a2 2 0 1 1 3 1.7c-.6.4-1 .8-1 1.5M12 14.2v.1"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6z"/></symbol>
+  <symbol id="i-pr" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="19" r="2"/><path d="M6 7v10M18 17V9a3 3 0 0 0-3-3h-4m2-2-2 2 2 2"/></symbol>
+</svg>
+
+<main class="page">
+  <header>
+    <h1>Needs your decision, after #4041 and #4040</h1>
+    <p class="lede">How the Overview preview card should look once both follow-ups land. Example data mirrors today's screenshot (8 open PRs, held work) plus a plan review and a question, so every row kind shows. Links and buttons are illustrative.</p>
+    <div class="legend"><span><span class="tag">#4041</span> grouping, order, icons, plan details, two-column rule (web only)</span><span><span class="tag">#4040</span> inline question text (server excerpt)</span></div>
+  </header>
+
+  <section class="scenario" aria-labelledby="s1">
+    <h2 id="s1">1 · Busy, 4 rows: two columns on wide screens</h2>
+    <p class="why">Blocking items first, PRs last as one grouped row. Four rows or fewer use two columns on desktop; at phone width they stack.</p>
+    <div class="card">
+      <div class="card-head"><h3 class="stitle">Needs your decision</h3><span class="count">3 decisions, 8 PR reviews</span></div>
+      <ul class="list two">
+        <li class="row">
+          <span class="tile" aria-hidden="true"><svg><use href="#i-shield"/></svg></span>
+          <div class="body"><p class="title">Held work needs 2 decisions</p><p class="meta"><span>Custody</span><span class="age">waiting 3h</span></p></div>
+          <a class="btn" href="#">Review held work</a>
+        </li>
+        <li class="row">
+          <span class="tile" aria-hidden="true"><svg><use href="#i-plan"/></svg></span>
+          <div class="body"><p class="title"><span class="ref">#3881</span>Overview preview, usage with a by-user table</p><p class="meta"><span>Plan ready, 2 milestones</span><span class="age">waiting 14m</span><span class="tag mark">#4041</span></p></div>
+          <a class="btn" href="#">Review plan</a>
+        </li>
+        <li class="row">
+          <span class="tile" aria-hidden="true"><svg><use href="#i-q"/></svg></span>
+          <div class="body"><p class="title"><span class="ref">#3543</span>Cross-check base discovery aggregate bound</p><p class="quote" title="“The joint-cap fixture does not finish within the lifted deadline on this worker. Lower the caps to the 2× Chromium floor, or keep them and record the measurement as not obtained?”">“The joint-cap fixture does not finish within the lifted deadline on this worker. Lower the caps to the 2× Chromium floor, or keep them and record the measurement as not obtained?”</p><p class="meta"><span class="age">Asked 25m ago</span><span class="tag mark">#4040</span></p></div>
+          <a class="btn" href="#">Answer</a>
+        </li>
+        <li class="row" id="prrow">
+          <span class="tile pr" aria-hidden="true"><svg><use href="#i-pr"/></svg></span>
+          <div class="body">
+            <p class="title">8 pull requests are open for your review</p>
+            <ul class="prs" id="prlist"></ul>
+            <p class="note">PR state as last seen by uzi <span class="tag mark">#4041</span></p>
+          </div>
+          <button class="btn" id="prbtn" type="button" aria-expanded="false" aria-controls="prlist">Review PRs</button>
+        </li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="scenario" aria-labelledby="s2">
+    <h2 id="s2">2 · Today's real case: held work plus 8 PRs</h2>
+    <p class="why">Today this was 9 rows (one per PR, the "last seen" note repeated each time). After: 2 rows.</p>
+    <div class="card">
+      <div class="card-head"><h3 class="stitle">Needs your decision</h3><span class="count">2 decisions, 8 PR reviews</span></div>
+      <ul class="list two">
+        <li class="row">
+          <span class="tile" aria-hidden="true"><svg><use href="#i-shield"/></svg></span>
+          <div class="body"><p class="title">Held work needs 2 decisions</p><p class="meta"><span>Custody</span><span class="age">waiting 3h</span></p></div>
+          <a class="btn" href="#">Review held work</a>
+        </li>
+        <li class="row">
+          <span class="tile pr" aria-hidden="true"><svg><use href="#i-pr"/></svg></span>
+          <div class="body">
+            <p class="title">8 pull requests are open for your review</p>
+            <ul class="prs">
+              <li><a href="#">vtmocanu/uzi #3995</a> <span class="t">Honor a delivered owner pause during retained recovery…</span></li>
+              <li><a href="#">vtmocanu/uzi #3985</a> <span class="t">Clarification during human plan revision fails settlement…</span></li>
+              <li><a href="#">vtmocanu/uzi #3986</a> <span class="t">Reduced motion does not stop the connect-form animation</span></li>
+              <li class="t">+5 more · oldest waiting 9h</li>
+            </ul>
+            <p class="note">PR state as last seen by uzi</p>
+          </div>
+          <a class="btn" href="#">Review PRs</a>
+        </li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="scenario" aria-labelledby="s3">
+    <h2 id="s3">3 · Several of a kind: grouped like PRs, then one column</h2>
+    <p class="why">Two or more decisions of the same kind become one row, like PR reviews: up to 3 listed, "+N more", and the button expands the full list in place with each item's own action. A single item stays a normal row. Here 5 rows remain, so the card uses one column.</p>
+    <div class="card">
+      <div class="card-head"><h3 class="stitle">Needs your decision</h3><span class="count">7 decisions, 3 PR reviews</span></div>
+      <ul class="list" id="grouped"></ul>
+    </div>
+  </section>
+
+  <section class="scenario" aria-labelledby="s4">
+    <h2 id="s4">What changes against today</h2>
+    <ul class="diff">
+      <li>PR reviews collapse into one row: up to 3 listed (oldest first) with "+N more"; <b>Review PRs</b> expands the full list in place (try it in scenario 1).</li>
+      <li>"PR state as last seen by uzi" shows once, on the PR row.</li>
+      <li>Kind icons: shield for held work and owner parks, plan, question, PR.</li>
+      <li>Plan rows add "Plan ready, N milestones" from data the page already loads (the cross-check outcome needs a server change and is left out).</li>
+      <li>Question rows quote the pending question in one line, full text on hover, from a sanitized 280-character server excerpt (#4040).</li>
+      <li>Two or more decisions of the same kind (plans; questions and follow-ups; runs waiting on you) group into one row like PRs; the button expands them in place, each with its own action (try scenario 3).</li>
+      <li>Two columns only at 4 rows or fewer on wide screens; one column otherwise and always at phone width.</li>
+    </ul>
+  </section>
+</main>
+
+<script>
+(() => {
+  const prs = [
+    ["#3995", "Honor a delivered owner pause during retained recovery without spending automatic requeues", "9h"],
+    ["#3985", "Clarification during human plan revision fails settlement on cross-check runs", "6h"],
+    ["#3986", "Reduced motion does not stop the connect-form .forge-flash animation", "6h"],
+    ["#3987", "Mock admin run list shows judge and cross-check runs the real API excludes", "6h"],
+    ["#3988", "Schedule modal says \"Anthropic\" in its header for Codex schedules", "5h"],
+    ["#3431", "PRD: Delete settled attempt trees at a verified pod epoch", "3h"],
+    ["#3543", "Cross-check base discovery aggregate bound", "3h"],
+    ["#4013", "Test fixture race: recovery-pass shutdown-join reads an empty child.pid", "1h"],
+  ];
+  const list = document.getElementById("prlist");
+  const btn = document.getElementById("prbtn");
+  let open = false;
+  function render() {
+    list.textContent = "";
+    const shown = open ? prs : prs.slice(0, 3);
+    shown.forEach(([n, t, age], i) => {
+      const li = document.createElement("li");
+      if (open && i >= 3) li.className = "more";
+      const a = document.createElement("a"); a.href = "#"; a.textContent = "vtmocanu/uzi " + n;
+      const s = document.createElement("span"); s.className = "t"; s.textContent = " " + t + (open ? " · " + age : "");
+      li.append(a, s); list.append(li);
+    });
+    if (!open) { const li = document.createElement("li"); li.className = "t"; li.textContent = "+" + (prs.length - 3) + " more · oldest waiting 9h"; list.append(li); }
+    btn.textContent = open ? "Show fewer" : "Review PRs";
+    btn.setAttribute("aria-expanded", String(open));
+  }
+  btn.addEventListener("click", () => { open = !open; render(); });
+  render();
+})();
+
+(() => {
+  const groups = [
+    { kind: "held", icon: "i-shield", single: { title: "Held work needs 2 decisions", meta: ["Custody"], age: "waiting 3h", action: "Review held work" } },
+    { kind: "plan", icon: "i-plan", noun: ["plan is ready for review", "plans are ready for review"], btn: "Review plans", each: "Review plan", items: [
+      { ref: "#4041", title: "Group PR reviews in Needs your decision", detail: "Plan ready, 1 milestone", age: "waiting 2h" },
+      { ref: "#4040", title: "Show the pending question inline", detail: "Plan ready, 1 milestone", age: "waiting 40m" },
+      { ref: "#3876", title: "Per-user Claude / Codex split in admin usage", detail: "Plan ready, 2 milestones", age: "waiting 25m" },
+      { ref: "#3875", title: "Command menu for navigation and your decisions", detail: "Plan ready, 2 milestones", age: "waiting 10m" } ] },
+    { kind: "question", icon: "i-q", noun: ["run needs your input", "runs need your input"], btn: "Open runs", each: "Answer", items: [
+      { ref: "#3543", title: "Cross-check base discovery aggregate bound", quote: "Lower the caps to the 2× Chromium floor, or keep them and record the measurement as not obtained?", age: "asked 25m ago" },
+      { ref: "#3877", title: "Promote the new Overview and retire the old one", quote: "Keep the old Overview behind a per-user setting, or delete it?", age: "asked 1h ago" } ] },
+    { kind: "park", icon: "i-shield", noun: ["run waits on you", "runs wait on you"], btn: "Resume runs", each: "Resume", items: [
+      { ref: "#3431", title: "Delete settled attempt trees at a verified pod epoch", detail: "Paused, wall-clock budget used", age: "waiting 5h" } ] },
+    { kind: "pr", icon: "i-pr", pr: true, noun: ["pull request is open for your review", "pull requests are open for your review"], btn: "Review PRs", each: "Review PR", note: "PR state as last seen by uzi", items: [
+      { ref: "vtmocanu/uzi #4013", title: "Test fixture race: recovery-pass shutdown-join…", age: "1h" },
+      { ref: "vtmocanu/uzi #3988", title: "Schedule modal says \"Anthropic\" for Codex schedules", age: "5h" },
+      { ref: "vtmocanu/uzi #3987", title: "Mock admin run list shows judge and cross-check runs", age: "6h" } ] },
+  ];
+  const ul = document.getElementById("grouped");
+  const el = (t, c, txt) => { const e = document.createElement(t); if (c) e.className = c; if (txt != null) e.textContent = txt; return e; };
+  const tile = (g) => { const s = el("span", "tile" + (g.pr ? " pr" : "")); s.setAttribute("aria-hidden", "true"); s.innerHTML = '<svg><use href="#' + g.icon + '"/></svg>'; return s; };
+  groups.forEach((g, gi) => {
+    const li = el("li", "row"); li.append(tile(g));
+    const body = el("div", "body");
+    if (g.single || g.items.length === 1) {
+      const it = g.single || g.items[0];
+      const t = el("p", "title"); if (it.ref && !g.pr) t.append(el("span", "ref", it.ref)); t.append(it.title); body.append(t);
+      if (it.quote) body.append(el("p", "quote", "\u201c" + it.quote + "\u201d"));
+      const m = el("p", "meta"); (it.meta || (it.detail ? [it.detail] : [])).forEach((x) => m.append(el("span", null, x))); m.append(el("span", "age", it.age)); body.append(m);
+      const a = el("a", "btn", it.action || g.each); a.href = "#"; li.append(body, a); ul.append(li); return;
+    }
+    const n = g.items.length;
+    body.append(el("p", "title", n + " " + g.noun[1]));
+    const list = el("ul", "prs"); list.id = "grp-" + gi; body.append(list);
+    if (g.note) body.append(el("p", "note", g.note));
+    const btn = el("button", "btn", g.btn); btn.type = "button"; btn.setAttribute("aria-controls", list.id);
+    let open = false;
+    const render = () => {
+      list.textContent = "";
+      (open ? g.items : g.items.slice(0, 3)).forEach((it) => {
+        const row = el("li");
+        const a = el("a", null, it.ref); a.href = "#"; row.append(a, el("span", "t", " " + (it.quote ? "\u201c" + it.quote + "\u201d" : it.title)));
+        if (open) { row.append(el("span", "t", " · " + it.age + " · ")); const act = el("a", null, it.quote ? "Answer" : g.each); act.href = "#"; row.append(act); }
+        list.append(row);
+      });
+      if (!open && n > 3) list.append(el("li", "t", "+" + (n - 3) + " more"));
+      btn.textContent = open ? "Show fewer" : g.btn; btn.setAttribute("aria-expanded", String(open));
+    };
+    btn.addEventListener("click", () => { open = !open; render(); });
+    render(); li.append(body, btn); ul.append(li);
+  });
+})();
+</script>
+</body>
+</html>

@@ -53,6 +53,20 @@ it("preserves manual health attribution in a sanitized cell title without changi
   expect(hostile?.kind === "badge" && hostile.title).toBeUndefined();
 });
 
+it.each(["", "checking", "reworking", "blocked"] as const)("policy hold overrides retained completion %s without a retry promise", completion_phase => {
+  const r = { ...run({ status: "paused", hold_reason: "codex_policy_hold" }), completion_phase };
+  expect(effectiveRunStatus(r)).toBe("codex_policy_hold");
+  expect(parkLabel(r)).toBe("Codex policy hold");
+  expect(runBadge(r, 0)).toMatchObject({ kind: "badge", label: "Codex policy hold", tone: "warning", pulse: false });
+  expect(runStatusTone("codex_policy_hold", null)).toBe("warning");
+  expect(needsHumanAttention("codex_policy_hold")).toBe(true);
+  const badge = runBadge(r, 0);
+  expect(badge.kind === "badge" && badge.title).toContain("Resume and policy-specific Stop are unavailable");
+});
+it.each(["queued", "running", "completed", "failed", "cancelled"] as const)("old policy marker does not overlay %s", status => {
+  expect(effectiveRunStatus(run({ status, hold_reason: "codex_policy_hold" }))).toBe(status);
+});
+
 it("provider hold badge uses projection hold reason without a retry promise", () => {
   const badge = runBadge(run({ status: "paused", hold_reason: "provider_unavailable" }), 0);
   expect(badge).toMatchObject({ label: "provider unavailable: owner hold", tone: "warning", pulse: false });
@@ -95,6 +109,18 @@ it("provider recovery badge only names provider when cause is available", () => 
   expect(runBadge({ ...run({ status: "recovery_wait" }), recovery_wait_cause: "provider_outage" }, 0))
     .toMatchObject({ label: "waiting for provider", pulse: false });
   expect(runBadge(run({ status: "recovery_wait" }), 0)).toMatchObject({ label: "recovery wait" });
+});
+
+it("iteration hold overrides completion phases and requests owner attention", () => {
+  const held = { ...run({ status: "paused", hold_reason: "iteration_budget_exhausted" }), completion_phase: "blocked" as const };
+  expect(effectiveRunStatus(held)).toBe("iteration_budget_exhausted");
+  expect(parkLabel(held)).toBe("Iteration limit reached");
+  expect(runBadge(held, 0)).toMatchObject({
+    kind: "badge", label: "Iteration limit reached", tone: "warning", pulse: false,
+  });
+  expect(needsHumanAttention(effectiveRunStatus(held))).toBe(true);
+  expect(runStatusTone(effectiveRunStatus(held), null)).toBe("warning");
+  expect(effectiveRunStatus({ ...held, status: "completed", completion_phase: "" })).toBe("completed");
 });
 
 // run builds a LatestRun with sane defaults, overridable per test.
@@ -1383,6 +1409,20 @@ describe("effectiveRunStatus — credential_disabled hold (PRD #1732)", () => {
   });
 });
 
+// PRD #3989 M3: an account reset deleted every credential; the run parks until one is added.
+describe("credentials_reset hold (PRD #3989)", () => {
+  it("overlays a paused run held on credentials_reset with the warn badge", () => {
+    expect(effectiveRunStatus({ status: "paused", hold_reason: "credentials_reset" })).toBe("credentials_reset");
+    expect(runStatusTone("credentials_reset", null)).toBe("warning");
+    expect(runBadge(run({ status: "paused", hold_reason: "credentials_reset" }), NOW)).toMatchObject({
+      kind: "badge",
+      label: "waiting: credentials were reset",
+      tone: "warning",
+      pulse: false,
+    });
+  });
+});
+
 // PRD #1732 D14, board shape: the board projection sends hold_reason on every card
 // (latestRunDTO.HoldReason), so a card whose latest run is parked on a disabled credential
 // arrives as a LatestRun with status "paused" + hold_reason "credential_disabled" and must
@@ -1557,7 +1597,7 @@ describe("Codex admission read-time projection", () => {
   it.each([
     "handoff setup has not finished",
     "your vault is locked, so this run can't start",
-    "you have too much unpublished work awaiting recovery; resolve or discard some recovery archives to start new runs",
+    "recovery custody capacity is full; retained holds still protect your work; resolve or discard a retained hold to free capacity",
     "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings",
   ])("preserves the higher-priority queued blocker %s", (reason) => {
     const text = codexAdmissionText(held, NOW);
@@ -1598,10 +1638,24 @@ it.each([null, undefined, "invalid", "2099-01-01T00:00:00Z", "2020-01-01T00:00:0
   expect(runStatusTone(status, null)).toBe("warning");
   const badge = runBadge(input, NOW);
   expect(badge).toMatchObject({ label: "retained recovery integrity hold", tone: "warning", pulse: false });
-  expect(badge.kind === "badge" && badge.title).toMatch(/Integrity checks refused/);
+  expect(badge.kind === "badge" && badge.title).toMatch(/Integrity hold.*remediation record/);
   expect(badge.kind === "badge" && badge.title).toMatch(/local work and its custody are preserved/i);
   expect(badge.kind === "badge" && badge.title).toMatch(/owner can Resume or Cancel.*no scheduled retry/);
   expect(badge.kind === "badge" && badge.title).not.toMatch(/automatically|retrying in|retry in/);
+  expect(effectiveRunStatus({ ...input, status: "running" })).toBe("running");
+});
+it.each([null, undefined, "invalid", "2099-01-01T00:00:00Z", "2020-01-01T00:00:00Z"])("unwitnessed continuation is owner-held regardless of retry timestamp %s", (stamp) => {
+  const input = { ...run({ status: "recovery_wait" }), recovery_wait_cause: "retained_continuation_unwitnessed", recovery_retry_not_before: stamp };
+  const status = effectiveRunStatus(input);
+  expect(status).toBe("retained_continuation_unwitnessed");
+  expect(parkLabel(input)).toBe("unwitnessed continuation hold");
+  expect(needsHumanAttention(status)).toBe(true);
+  expect(runStatusTone(status, null)).toBe("warning");
+  const badge = runBadge(input, NOW);
+  expect(badge).toMatchObject({ label: "unwitnessed continuation hold", tone: "warning", pulse: false });
+  expect(badge.kind === "badge" && badge.title).toMatch(/Local work and its custody are kept/);
+  expect(badge.kind === "badge" && badge.title).toMatch(/owner can Resume or Cancel.*no scheduled retry/);
+  expect(badge.kind === "badge" && badge.title).not.toMatch(/automatically|retrying in|retry in|integrity|quiescent|lost/i);
   expect(effectiveRunStatus({ ...input, status: "running" })).toBe("running");
 });
 it("omitted board cause and timing remain generic even if retry stamp is null", () => {

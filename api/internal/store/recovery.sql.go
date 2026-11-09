@@ -1032,9 +1032,17 @@ func (q *Queries) ListCaptureSourceShasForHold(ctx context.Context, arg ListCapt
 }
 
 const listCapturesForRunOwner = `-- name: ListCapturesForRunOwner :many
-SELECT id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at, reserved_bytes, coverage_digest, local_replica_worker_id, ready_retention_seconds, redundancy_proof, redundancy_refused_at, redundancy_refusal FROM recovery_captures
-WHERE run_id = $1 AND user_id = $2
-ORDER BY created_at
+SELECT c.id, c.hold_id, c.run_id, c.user_id, c.original_worker_id, c.original_worker_identity, c.source_sha, c.attempted_head_sha, c.idempotency_key, c.state, c.manifest_bound, c.byte_size, c.checksum, c.chunk_count, c.prerequisite_shas, c.reason, c.context, c.expires_at, c.created_at, c.updated_at, c.reserved_bytes, c.coverage_digest, c.local_replica_worker_id, c.ready_retention_seconds, c.redundancy_proof, c.redundancy_refused_at, c.redundancy_refusal, p.id AS closure_id, p.state AS closure_state,
+    p.reason AS closure_reason, p.pin_ref, p.pin_tip, p.absent_since,
+    p.cleanup_exhausted_at, p.updated_at AS closure_updated_at
+FROM recovery_captures c
+LEFT JOIN recovery_prerequisite_closures p
+    ON p.capture_id = c.id AND p.user_id = c.user_id AND p.run_id = c.run_id
+    AND p.hold_id = c.hold_id
+    AND p.repo_id = (SELECT h.repo_id FROM recovery_custody_holds h WHERE h.id = c.hold_id)
+    AND p.checksum = c.checksum AND p.prerequisite_shas = c.prerequisite_shas
+WHERE c.run_id = $1 AND c.user_id = $2
+ORDER BY c.created_at
 `
 
 type ListCapturesForRunOwnerParams struct {
@@ -1042,45 +1050,65 @@ type ListCapturesForRunOwnerParams struct {
 	UserID uuid.UUID `json:"user_id"`
 }
 
+type ListCapturesForRunOwnerRow struct {
+	RecoveryCapture    RecoveryCapture    `json:"recovery_capture"`
+	ClosureID          pgtype.UUID        `json:"closure_id"`
+	ClosureState       pgtype.Text        `json:"closure_state"`
+	ClosureReason      pgtype.Text        `json:"closure_reason"`
+	PinRef             pgtype.Text        `json:"pin_ref"`
+	PinTip             pgtype.Text        `json:"pin_tip"`
+	AbsentSince        pgtype.Timestamptz `json:"absent_since"`
+	CleanupExhaustedAt pgtype.Timestamptz `json:"cleanup_exhausted_at"`
+	ClosureUpdatedAt   pgtype.Timestamptz `json:"closure_updated_at"`
+}
+
 // D7: every retained capture for one run, owner-scoped, oldest-first. Feeds the run's
 // Recovery archives section (all states shown, not gated on availability).
-func (q *Queries) ListCapturesForRunOwner(ctx context.Context, arg ListCapturesForRunOwnerParams) ([]RecoveryCapture, error) {
+func (q *Queries) ListCapturesForRunOwner(ctx context.Context, arg ListCapturesForRunOwnerParams) ([]ListCapturesForRunOwnerRow, error) {
 	rows, err := q.db.Query(ctx, listCapturesForRunOwner, arg.RunID, arg.UserID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []RecoveryCapture{}
+	items := []ListCapturesForRunOwnerRow{}
 	for rows.Next() {
-		var i RecoveryCapture
+		var i ListCapturesForRunOwnerRow
 		if err := rows.Scan(
-			&i.ID,
-			&i.HoldID,
-			&i.RunID,
-			&i.UserID,
-			&i.OriginalWorkerID,
-			&i.OriginalWorkerIdentity,
-			&i.SourceSha,
-			&i.AttemptedHeadSha,
-			&i.IdempotencyKey,
-			&i.State,
-			&i.ManifestBound,
-			&i.ByteSize,
-			&i.Checksum,
-			&i.ChunkCount,
-			&i.PrerequisiteShas,
-			&i.Reason,
-			&i.Context,
-			&i.ExpiresAt,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.ReservedBytes,
-			&i.CoverageDigest,
-			&i.LocalReplicaWorkerID,
-			&i.ReadyRetentionSeconds,
-			&i.RedundancyProof,
-			&i.RedundancyRefusedAt,
-			&i.RedundancyRefusal,
+			&i.RecoveryCapture.ID,
+			&i.RecoveryCapture.HoldID,
+			&i.RecoveryCapture.RunID,
+			&i.RecoveryCapture.UserID,
+			&i.RecoveryCapture.OriginalWorkerID,
+			&i.RecoveryCapture.OriginalWorkerIdentity,
+			&i.RecoveryCapture.SourceSha,
+			&i.RecoveryCapture.AttemptedHeadSha,
+			&i.RecoveryCapture.IdempotencyKey,
+			&i.RecoveryCapture.State,
+			&i.RecoveryCapture.ManifestBound,
+			&i.RecoveryCapture.ByteSize,
+			&i.RecoveryCapture.Checksum,
+			&i.RecoveryCapture.ChunkCount,
+			&i.RecoveryCapture.PrerequisiteShas,
+			&i.RecoveryCapture.Reason,
+			&i.RecoveryCapture.Context,
+			&i.RecoveryCapture.ExpiresAt,
+			&i.RecoveryCapture.CreatedAt,
+			&i.RecoveryCapture.UpdatedAt,
+			&i.RecoveryCapture.ReservedBytes,
+			&i.RecoveryCapture.CoverageDigest,
+			&i.RecoveryCapture.LocalReplicaWorkerID,
+			&i.RecoveryCapture.ReadyRetentionSeconds,
+			&i.RecoveryCapture.RedundancyProof,
+			&i.RecoveryCapture.RedundancyRefusedAt,
+			&i.RecoveryCapture.RedundancyRefusal,
+			&i.ClosureID,
+			&i.ClosureState,
+			&i.ClosureReason,
+			&i.PinRef,
+			&i.PinTip,
+			&i.AbsentSince,
+			&i.CleanupExhaustedAt,
+			&i.ClosureUpdatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1348,6 +1376,62 @@ func (q *Queries) ListCustodyHoldsForWorkerRun(ctx context.Context, arg ListCust
 	return items, nil
 }
 
+const listOpenCustodyHoldsForWorker = `-- name: ListOpenCustodyHoldsForWorker :many
+SELECT h.id, h.run_id, h.generation,
+       COALESCE(r.kind, '')::text AS run_kind,
+       COALESCE(r.title, r.issue_title, '')::text AS run_title
+FROM recovery_custody_holds h
+LEFT JOIN runs r ON r.id = h.run_id AND r.user_id = h.user_id
+WHERE h.live_worker_id = $1::uuid AND h.user_id = $2 AND h.state = 'open'
+ORDER BY h.created_at, h.id
+LIMIT 10
+`
+
+type ListOpenCustodyHoldsForWorkerParams struct {
+	WorkerID uuid.UUID `json:"worker_id"`
+	UserID   uuid.UUID `json:"user_id"`
+}
+
+type ListOpenCustodyHoldsForWorkerRow struct {
+	ID         uuid.UUID `json:"id"`
+	RunID      uuid.UUID `json:"run_id"`
+	Generation int64     `json:"generation"`
+	RunKind    string    `json:"run_kind"`
+	RunTitle   string    `json:"run_title"`
+}
+
+// #3921: names the holds CountOpenCustodyHoldsForWorker counts, for the DeleteWorker 409
+// body. The predicate is byte-identical to the count's (live holder, owner-scoped, open),
+// so the listing and the total cannot disagree about which holds block the delete. Capped at
+// 10, oldest first (the #3390 ListWorkerNonTerminalRuns precedent); the caller's total comes
+// from the count. recovery_custody_holds.run_id has no FK to runs, so the join is LEFT and
+// owner-scoped: a missing run yields empty kind/title instead of dropping the hold.
+func (q *Queries) ListOpenCustodyHoldsForWorker(ctx context.Context, arg ListOpenCustodyHoldsForWorkerParams) ([]ListOpenCustodyHoldsForWorkerRow, error) {
+	rows, err := q.db.Query(ctx, listOpenCustodyHoldsForWorker, arg.WorkerID, arg.UserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListOpenCustodyHoldsForWorkerRow{}
+	for rows.Next() {
+		var i ListOpenCustodyHoldsForWorkerRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.Generation,
+			&i.RunKind,
+			&i.RunTitle,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listOpenCustodyHoldsForWorkers = `-- name: ListOpenCustodyHoldsForWorkers :many
 SELECT w.id AS worker_id, h.state, h.inventory_guarded,
        f.has_available_capture, f.capture_state, f.run_status, f.recovery_wait_cause, f.attention, f.decision_needed
@@ -1499,12 +1583,13 @@ SELECT h.id, h.user_id, h.repo_id, h.run_id, h.generation, h.state, h.original_w
     END::text AS reason
 FROM recovery_custody_holds h
 WHERE h.state = 'open' AND NOT h.inventory_guarded
-  -- Archive readiness cannot implicitly resolve an owner retry-exhaustion or memory-pressure decision,
+  -- Archive readiness cannot implicitly resolve an owner-held recovery decision,
   -- including an older available capture alongside a newer upload for this hold.
   AND NOT EXISTS (SELECT 1 FROM runs r
                     WHERE r.id = h.run_id
                       AND r.status = 'recovery_wait'
-                      AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed'))
+                      AND (r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')
+                           OR (r.recovery_wait_cause = 'data_volume_full' AND r.recovery_retry_not_before IS NULL)))
   AND (
       EXISTS (SELECT 1 FROM runs r
                 WHERE r.id = h.run_id
@@ -1977,7 +2062,7 @@ func (q *Queries) ReleaseClaimCustodyNoAdoptedSource(ctx context.Context, arg Re
 
 const releaseCustodyHold = `-- name: ReleaseCustodyHold :execrows
 WITH locked_run AS MATERIALIZED (
-    SELECT r.id, r.status, r.recovery_wait_cause
+    SELECT r.id, r.status, r.recovery_wait_cause, r.recovery_retry_not_before
     FROM runs r
     JOIN recovery_custody_holds h ON h.run_id = r.id
     WHERE h.id = $2
@@ -1991,7 +2076,8 @@ WHERE target.id = $2 AND target.state = 'open' AND NOT target.inventory_guarded
   AND NOT EXISTS (
       SELECT 1 FROM locked_run r
       WHERE r.status = 'recovery_wait'
-        AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed')
+        AND (r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')
+             OR (r.recovery_wait_cause = 'data_volume_full' AND r.recovery_retry_not_before IS NULL))
   )
 `
 
@@ -2027,7 +2113,7 @@ func (q *Queries) ReleaseCustodyHold(ctx context.Context, arg ReleaseCustodyHold
 
 const releaseCustodyHoldExact = `-- name: ReleaseCustodyHoldExact :execrows
 WITH locked_run AS MATERIALIZED (
-    SELECT r.id, r.status, r.recovery_wait_cause
+    SELECT r.id, r.status, r.recovery_wait_cause, r.recovery_retry_not_before
     FROM runs r WHERE r.id = $2
     FOR UPDATE OF r
 )
@@ -2040,7 +2126,8 @@ WHERE run_id = $2
   AND live_worker_id = $4::uuid
   AND state = 'open' AND NOT inventory_guarded
   AND NOT EXISTS (SELECT 1 FROM locked_run r WHERE r.status = 'recovery_wait'
-      AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed'))
+      AND (r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')
+           OR (r.recovery_wait_cause = 'data_volume_full' AND r.recovery_retry_not_before IS NULL)))
 `
 
 type ReleaseCustodyHoldExactParams struct {
@@ -2093,8 +2180,9 @@ WHERE h.id = $5 AND h.run_id = $6 AND h.user_id = $7
     AND (r.claim_generation > h.generation OR (r.claim_generation = h.generation AND
       (r.status IN ('completed', 'failed', 'cancelled') OR r.claim_released_at IS NOT NULL)))
     AND NOT (r.status = 'recovery_wait' AND r.recovery_wait_cause IS NOT NULL
-      AND r.recovery_wait_cause IN ('worker_requeue_exhausted',
-      'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed')))
+      AND (r.recovery_wait_cause IN ('worker_requeue_exhausted',
+      'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')
+           OR (r.recovery_wait_cause = 'data_volume_full' AND r.recovery_retry_not_before IS NULL))))
   AND EXISTS (SELECT 1 FROM recovery_captures c WHERE c.id = $1::uuid
     AND c.hold_id = h.id AND c.run_id = h.run_id AND c.user_id = h.user_id
     AND c.original_worker_id = h.original_worker_id AND c.source_sha = $2::text
@@ -2150,6 +2238,9 @@ UPDATE recovery_custody_holds h SET state = 'released', live_worker_id = NULL, l
 WHERE h.id = $6 AND h.run_id = $7 AND h.user_id = $8
   AND h.generation = $9 AND h.original_worker_id = $10::uuid
   AND h.live_worker_id = $10::uuid AND h.inventory_guarded AND h.state = 'open'
+  AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.id = h.run_id
+    AND r.status = 'recovery_wait' AND r.recovery_wait_cause = 'data_volume_full'
+    AND r.recovery_retry_not_before IS NULL)
   AND EXISTS (SELECT 1 FROM runs r WHERE r.id = h.run_id AND r.user_id = h.user_id
     AND (r.claim_generation > h.generation OR (r.claim_generation = h.generation AND
       (r.status IN ('completed', 'failed', 'cancelled') OR r.claim_released_at IS NOT NULL
@@ -2158,6 +2249,9 @@ WHERE h.id = $6 AND h.run_id = $7 AND h.user_id = $8
         -- A publication-phase park holds unpublished source and never settles custody.
         OR (r.status = 'recovery_wait' AND r.recovery_wait_cause = 'forge_unreachable'
           AND r.recovery_wait_phase IS NULL
+          AND $1::text = 'settled' AND $5::text = 'forge_no_output')
+        OR (r.status = 'paused' AND r.hold_reason = 'repo_agent_source_unavailable'
+          AND r.repo_agent_source_commit IS NULL
           AND $1::text = 'settled' AND $5::text = 'forge_no_output')))))
   AND (
     ($1::text = 'archive' AND $5::text = 'archive'

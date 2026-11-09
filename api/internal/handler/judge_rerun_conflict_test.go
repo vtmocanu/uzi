@@ -57,7 +57,6 @@ func (j judgeSwitch) JudgeEnforceAll(context.Context) (bool, error)         { re
 func (j judgeSwitch) JudgeCooldownSeconds(context.Context) (int, error)     { return 0, nil }
 func (j judgeSwitch) JudgeDailyBudget(context.Context) (int, error)         { return 0, nil }
 func (j judgeSwitch) InstanceModel(context.Context, string) (string, error) { return "", nil }
-func (j judgeSwitch) SummaryModel(context.Context) (string, error)          { return "", nil }
 func (j judgeSwitch) UziLabel(context.Context) (string, error)              { return "", nil }
 
 // rerunReq builds POST /api/runs/{id}/rejudge authenticated as user. The path is inert

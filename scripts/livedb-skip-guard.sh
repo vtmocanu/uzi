@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Aggregate LiveDB gate on the gate, shared by e2e/run-store-it.sh and the CI store-it job
-# so the two cannot drift. Reads a `go test -v` log and fails unless the suite RAN at least
+# Aggregate LiveDB gate on the gate, used by e2e/run-store-it.sh, which CI runs once (the
+# test-codex-refresh-lostreply-e2e job) for both required LiveDB contexts. Reads a `go test -v` log and fails unless the suite RAN at least
 # one top-level test and SKIPPED none at any depth: with the DSN unset or Postgres
 # unreachable every test self-skips and `go test` still prints ok. `go test -v` indents
 # subtest results, so a skipped subtest under a passing parent only shows as an indented

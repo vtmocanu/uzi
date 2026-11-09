@@ -28,6 +28,7 @@ import type { JsDepsResult } from "../src/js-deps.js";
 import { mrCompletionBlock } from "../src/runner.js";
 import { SEEDED_PLAN_RULES } from "../src/seeded-plan.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
+import { guardedCommandEnv } from "../src/claude-command/env.js";
 import { detectRepoAgents } from "../src/repoagents.js";
 import { FINDINGS_SERVER_NAME, reportIncidentalIssueToolName } from "../src/findings-tools.js";
 import {
@@ -39,6 +40,8 @@ import {
   GATE_APPROVED_FRESH_SESSION_GUIDANCE,
   CURRENT_EXECUTION_STATE_GUIDANCE,
   REVIEWED_RESUME_APPROVAL_GUIDANCE,
+  REPO_SUBAGENT_UNTRUSTED_APPEND,
+  REPO_SUBAGENT_PLANNING_APPEND,
 } from "../src/prompt.js";
 import type { WorkerClient } from "../src/client.js";
 import type {
@@ -50,8 +53,9 @@ import type {
 } from "../src/summary-runner.js";
 import { RequestError } from "../src/client.js";
 import { REASON_COMPLETION_STALL } from "../src/completion-attempt.js";
-import { makeClaim, nonexistentWorktreeFactory, nullLogger, recordingLogger } from "./helpers.js";
+import { leadRequestCaseAgents, makeClaim, nonexistentWorktreeFactory, nullLogger, recordingLogger } from "./helpers.js";
 import { makeGitRepo, PR_SUMMARY_EXPECTED, PR_SUMMARY_INPUT } from "./pr-summary-fixture.js";
+import { REQUESTED_SOURCE_TABLE, NO_ROSTER_NOTE, caseLabel } from "./requested-agent-source-table.js";
 
 // A worktree path that is UNIQUE PER PROCESS AND PER CALL, and that deliberately
 // never exists. Both halves matter. Non-existence is the point of these fixtures --
@@ -332,6 +336,30 @@ afterEach(() => {
     if (v === undefined) delete process.env[k];
     else process.env[k] = v;
   }
+});
+
+describe("issue #3870: managed Go work dir reaches the lead CLI env", () => {
+  const launchEnv = async (overrides: Partial<RunContext>) => {
+    const { queryFn, turns } = fakeTurns([[assistantText("model output"), signalDone(), resultSuccess()]]);
+    const { ctx } = makeCtx({ seeded: true, planApproved: true, approvedPlan: "# Approved", config: { max_iterations: 1 }, ...overrides });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx).catch(() => undefined);
+    assert.ok(turns.length > 0, "precondition: the SDK was queried");
+    return turns[0]!.options;
+  };
+
+  it("sets GOTMPDIR from ctx.managedGoWorkDir, keeps it through guardedCommandEnv, and gives subagents no env override", async () => {
+    const options = await launchEnv({ managedGoWorkDir: "/home/run/.uzi-go-work/g7" });
+    assert.equal(options.env?.GOTMPDIR, "/home/run/.uzi-go-work/g7");
+    assert.equal(guardedCommandEnv(options.env!).GOTMPDIR, "/home/run/.uzi-go-work/g7");
+    for (const [name, def] of Object.entries(options.agents ?? {})) {
+      assert.equal(Object.hasOwn(def as object, "env"), false, `subagent ${name} must inherit, not override, the env`);
+    }
+  });
+
+  it("launches without GOTMPDIR when the ctx carries no managed dir", async () => {
+    const options = await launchEnv({});
+    assert.equal(Object.hasOwn(options.env ?? {}, "GOTMPDIR"), false);
+  });
 });
 
 describe("settled model recovery notification", () => {
@@ -909,13 +937,13 @@ describe("SdkExecutor agent selection at the gate boundary (PRD #37)", () => {
     assert.ok(!append.includes("REPO LEAD BODY"), "the repo lead body never reaches the main-thread prompt");
   });
 
-  it("issue #2085: a .codex/agents TOML-sourced template gets the repo guards (untrusted passage, structural Agent denial, no tools or model)", { skip: !HAS_PROCFS ? "reads procfs (Linux only)" : realProcfsSkip("SdkExecutor: TOML repo guards") }, async () => {
+  it("issue #2085: a .codex/agents TOML-sourced template gets the repo guards (untrusted passage, structural Agent denial, no tools or Claude model pin)", { skip: !HAS_PROCFS ? "reads procfs (Linux only)" : realProcfsSkip("SdkExecutor: TOML repo guards") }, async () => {
     const clone = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-sdk-toml-"));
     try {
       fs.mkdirSync(path.join(clone, ".codex", "agents"), { recursive: true });
       fs.writeFileSync(
         path.join(clone, ".codex", "agents", "t.toml"),
-        'name = "toml-agent"\ndescription = "From toml."\ndeveloper_instructions = "TOML BODY"\nmodel = "gpt-5"\n',
+        'name = "toml-agent"\ndescription = "From toml."\ndeveloper_instructions = "TOML BODY"\nmodel = "gpt-6-luna"\n',
       );
       const detected = await detectRepoAgents(clone, "claude");
       assert.deepStrictEqual(detected.agents.map((a) => a.name), ["toml-agent"]);
@@ -1026,6 +1054,57 @@ describe("SdkExecutor agent selection at the gate boundary (PRD #37)", () => {
       plan.agents!["fact-checker"]!.mcpServers?.includes("forge"),
       `fact-checker must keep its forge mcpServers on the plan turn: ${JSON.stringify(plan.agents!["fact-checker"]!.mcpServers)}`,
     );
+  });
+
+  it("PRD #3914: an absent approval follows the run's requested source", async () => {
+    const absent: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+    const own = await runWith({ repoAgents: [repoCoder, repoAuditor], requestedAgentSource: "own" }, absent);
+    assert.deepStrictEqual(Object.keys(own.turns[1]!.options.agents ?? {}).sort(), ["coder", "reviewer"]);
+    assert.strictEqual(own.result.agentSelection!.source, "own");
+    const repo = await runWith({ repoAgents: [repoCoder, repoAuditor], requestedAgentSource: "repo" }, absent);
+    assert.deepStrictEqual(Object.keys(repo.turns[1]!.options.agents ?? {}).sort(), ["auditor", "coder"]);
+    assert.strictEqual(repo.result.agentSelection!.source, "repo");
+    const unset = await runWith({ repoAgents: [repoCoder, repoAuditor] }, absent);
+    assert.deepStrictEqual(Object.keys(unset.turns[1]!.options.agents ?? {}).sort(), ["auditor", "coder"]);
+  });
+
+  it("PRD #3914: an absent approval on a requested repo run keeps a saved own selection", async () => {
+    const absent: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+    const own = await runWith({ repoAgents: [repoCoder, repoAuditor], requestedAgentSource: "repo",
+      approvedSelection: { source: "own", exclusions: [] } }, absent);
+    assert.deepStrictEqual(Object.keys(own.turns[1]!.options.agents ?? {}).sort(), ["coder", "reviewer"]);
+    assert.strictEqual(own.result.agentSelection!.source, "own");
+  });
+
+  it("PRD #3914: an absent approval on a requested repo run keeps a saved repo selection's exclusions", async () => {
+    const absent: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+    const repo = await runWith({ repoAgents: [repoCoder, repoAuditor], requestedAgentSource: "repo",
+      approvedSelection: { source: "repo", exclusions: ["auditor"] } }, absent);
+    assert.deepStrictEqual(Object.keys(repo.turns[1]!.options.agents ?? {}).sort(), ["coder"]);
+    assert.strictEqual(repo.result.agentSelection!.source, "repo");
+  });
+
+  for (const c of REQUESTED_SOURCE_TABLE) {
+    it(`PRD #3914 shared call-site table at the gate: ${caseLabel(c)}`, async () => {
+      const absent: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+      const { probe, result } = await runWith({ repoAgents: c.roster ? [repoCoder, repoAuditor] : [], requestedAgentSource: c.requested }, absent);
+      assert.strictEqual(result.agentSelection!.source, c.want);
+      assert.strictEqual(probe.emits.some((m) => String(m.payload.text ?? "") === NO_ROSTER_NOTE), c.note);
+    });
+  }
+
+  it("PRD #3914: a requested repo source with no roster degrades to own with the no-roster note", async () => {
+    const absent: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+    const { turns, probe, result } = await runWith({ requestedAgentSource: "repo" }, absent);
+    assert.deepStrictEqual(Object.keys(turns[1]!.options.agents ?? {}).sort(), ["coder", "reviewer"]);
+    assert.strictEqual(result.agentSelection!.source, "own");
+    assert.ok(probe.emits.some((m) => String(m.payload.text ?? "").includes("this clone has no repo agent roster")));
+  });
+
+  it("PRD #3914: an explicit gate selection wins over the requested source", async () => {
+    const { turns, result } = await runWith({ repoAgents: [repoCoder, repoAuditor], requestedAgentSource: "own" }, approveWith("repo"));
+    assert.deepStrictEqual(Object.keys(turns[1]!.options.agents ?? {}).sort(), ["auditor", "coder"]);
+    assert.strictEqual(result.agentSelection!.source, "repo");
   });
 
   it("a malformed selection resolves to own, never the repo source", async () => {
@@ -2565,7 +2644,8 @@ describe("SdkExecutor guardrail options", () => {
           // worker secret. TMPDIR is not a secret. AGENT_BROWSER_ARGS is a non-secret browser launch
           // FLAG (buildSdkEnv, issue #709): it guarantees --no-sandbox survives a shim bypass, not a
           // credential — the no-PAT / no-join-token assertions below still hold.
-          const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENT_BROWSER_ARGS"]);
+          const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENT_BROWSER_ARGS",
+          "AGENT_BROWSER_EXECUTABLE_PATH", "CHROME_PATH"]);
           if (process.env.UZI_RUNNER_TMPDIR || process.env.TMPDIR) expected.add("TMPDIR");
           if (sqlcDir !== undefined) expected.add("UZI_SQLC_DIR");
           assert.deepStrictEqual(new Set(Object.keys(env)), expected);
@@ -2940,6 +3020,175 @@ describe("SdkExecutor model precedence on baseOptions", () => {
   });
 });
 
+describe("SdkExecutor plan turn agent source (PRD #3914 M3)", () => {
+  async function planWith(overrides: Partial<RunContext>, verdict: PlanVerdict = { kind: "approve", selection: { status: "absent" } }) {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const reported: string[] = [];
+    const probe = makeCtx({
+      agents: [lead, coder, reviewer],
+      reportPlanAgentSource: async (source) => { reported.push(source); },
+      ...overrides,
+    }, verdict);
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    return { turns, probe, result, reported };
+  }
+
+  function delegatesOf(prompt: string | undefined): string | undefined {
+    return (prompt ?? "").split("\n").find((l) => l.startsWith("Available subagents to delegate to:"));
+  }
+
+  async function agentDecision(options: SdkOptions, subagent: string): Promise<string | undefined> {
+    const guard = options.hooks!.PreToolUse!.find((m) => m.matcher === "Agent")!.hooks[0]!;
+    const out = await guard(
+      { hook_event_name: "PreToolUse", tool_name: "Agent", tool_input: { subagent_type: subagent } } as unknown as HookInput,
+      "tu",
+      { signal: new AbortController().signal },
+    );
+    return (out as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput?.permissionDecision;
+  }
+
+  it("a requested repo source with a roster plans with the repo agents, write tools stripped", async () => {
+    const { turns, reported, probe } = await planWith({ repoAgents: [repoCoder, repoAuditor], requestedAgentSource: "repo" });
+    const plan = turns[0]!.options;
+    assert.deepStrictEqual(Object.keys(plan.agents ?? {}), ["coder", "auditor"]);
+    assert.strictEqual(plan.agents!.coder!.prompt, withNudge("REPO CODER BODY"));
+    assert.deepStrictEqual(plan.agents!.coder!.tools, ["Read", "Bash", "WebFetch", FINDINGS_TOOL]);
+    for (const name of ["coder", "auditor"]) {
+      for (const t of ["Edit", "Write", "MultiEdit", "NotebookEdit"]) {
+        assert.ok(plan.agents![name]!.disallowedTools?.includes(t), `${name} is denied ${t} while planning`);
+      }
+      assert.ok(plan.agents![name]!.disallowedTools?.includes("Agent"), `${name} keeps the structural Agent denial`);
+    }
+    assert.strictEqual(plan.agents!.auditor!.tools, undefined);
+    assert.strictEqual(
+      delegatesOf(turns[0]!.promptText),
+      "Available subagents to delegate to: coder (can edit files), auditor (can edit files).",
+    );
+    assert.strictEqual(await agentDecision(plan, "reviewer"), "deny");
+    assert.notStrictEqual(await agentDecision(plan, "auditor"), "deny");
+    const append = appendOf(plan.systemPrompt);
+    assert.ok(append.includes(REPO_SUBAGENT_UNTRUSTED_APPEND), "the plan prompt carries the untrusted framing");
+    assert.ok(append.includes(REPO_SUBAGENT_PLANNING_APPEND), "the plan prompt says planning subagents do not change files");
+    assert.strictEqual(REPO_SUBAGENT_PLANNING_APPEND, "Planning subagents report findings; they do not change files.");
+    assert.deepStrictEqual(reported, ["repo"]);
+    assert.ok(probe.emits.some((m) => String(m.payload.text ?? "") === "planning with the repo's agents (coder, auditor)"));
+    assert.deepStrictEqual(Object.keys(turns[1]!.options.agents ?? {}).sort(), ["auditor", "coder"]);
+  });
+
+  it("an unset request plans with the owner templates and no untrusted framing", async () => {
+    const { turns, reported } = await planWith({ repoAgents: [repoCoder, repoAuditor] });
+    const plan = turns[0]!.options;
+    assert.deepStrictEqual(Object.keys(plan.agents ?? {}).sort(), ["coder", "reviewer"]);
+    assert.strictEqual(plan.agents!.coder!.prompt, withNudge("You implement."));
+    assert.ok(!appendOf(plan.systemPrompt).includes(REPO_SUBAGENT_UNTRUSTED_APPEND));
+    assert.ok(!appendOf(plan.systemPrompt).includes(REPO_SUBAGENT_PLANNING_APPEND));
+    assert.deepStrictEqual(reported, ["own"]);
+  });
+
+  it("a requested own source plans with the owner templates", async () => {
+    const { turns, reported } = await planWith({ repoAgents: [repoCoder, repoAuditor], requestedAgentSource: "own" });
+    assert.deepStrictEqual(Object.keys(turns[0]!.options.agents ?? {}).sort(), ["coder", "reviewer"]);
+    assert.ok(!appendOf(turns[0]!.options.systemPrompt).includes(REPO_SUBAGENT_UNTRUSTED_APPEND));
+    assert.deepStrictEqual(reported, ["own"]);
+  });
+
+  it("a requested repo source with no roster plans with the owner templates", async () => {
+    const { turns, reported } = await planWith({ requestedAgentSource: "repo" });
+    assert.deepStrictEqual(Object.keys(turns[0]!.options.agents ?? {}).sort(), ["coder", "reviewer"]);
+    assert.ok(!appendOf(turns[0]!.options.systemPrompt).includes(REPO_SUBAGENT_UNTRUSTED_APPEND));
+    assert.deepStrictEqual(reported, ["own"]);
+  });
+
+  it("a replan with a persisted own source plans with the owner templates", async () => {
+    const { turns, reported } = await planWith({
+      repoAgents: [repoCoder, repoAuditor], requestedAgentSource: "repo", approvedSelection: { source: "own", exclusions: [] },
+    });
+    assert.deepStrictEqual(Object.keys(turns[0]!.options.agents ?? {}).sort(), ["coder", "reviewer"]);
+    assert.ok(!appendOf(turns[0]!.options.systemPrompt).includes(REPO_SUBAGENT_UNTRUSTED_APPEND));
+    assert.deepStrictEqual(reported, ["own"]);
+  });
+
+  it("an unset request with a persisted repo source from autopilot plans with the owner templates", async () => {
+    const { turns, reported } = await planWith({
+      repoAgents: [repoCoder, repoAuditor], approvedSelection: { source: "repo", exclusions: [] },
+    });
+    assert.deepStrictEqual(Object.keys(turns[0]!.options.agents ?? {}).sort(), ["coder", "reviewer"]);
+    assert.ok(!appendOf(turns[0]!.options.systemPrompt).includes(REPO_SUBAGENT_UNTRUSTED_APPEND));
+    assert.deepStrictEqual(reported, ["own"]);
+  });
+
+  it("a persisted repo source keeps its exclusions on a repo-sourced replan", async () => {
+    const { turns, reported } = await planWith({
+      repoAgents: [repoCoder, repoAuditor], requestedAgentSource: "repo", approvedSelection: { source: "repo", exclusions: ["auditor"] },
+    });
+    assert.deepStrictEqual(Object.keys(turns[0]!.options.agents ?? {}), ["coder"]);
+    assert.strictEqual(await agentDecision(turns[0]!.options, "auditor"), "deny");
+    assert.deepStrictEqual(reported, ["repo"]);
+  });
+
+  it("a revision turn keeps the repo-sourced plan roster and framing", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [submitPlan("plan 2"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const reported: string[] = [];
+    const probe = makeCtx({
+      agents: [lead, coder, reviewer], repoAgents: [repoCoder, repoAuditor], requestedAgentSource: "repo",
+      reportPlanAgentSource: async (source) => { reported.push(source); },
+    }, [{ kind: "revise", feedback: "tighten it" } as PlanVerdict, { kind: "approve", selection: { status: "absent" } }]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    for (const turn of [turns[0]!, turns[1]!]) {
+      assert.deepStrictEqual(Object.keys(turn.options.agents ?? {}), ["coder", "auditor"]);
+      assert.ok(appendOf(turn.options.systemPrompt).includes(REPO_SUBAGENT_PLANNING_APPEND));
+    }
+    assert.deepStrictEqual(reported, ["repo"]);
+  });
+
+  it("the run model overrides a pinned repo planning agent", async () => {
+    const { turns } = await planWith({
+      repoAgents: [repoCoder, { ...repoAuditor, model: "opus" }], requestedAgentSource: "repo",
+      config: { default_model: "fable", override_subagent_model: true },
+    });
+    assert.strictEqual(turns[0]!.options.agents!.auditor!.model, "fable");
+  });
+
+  it("a repo agent whose tools are only write tools does not plan", async () => {
+    const penman: AgentTemplate = { name: "penman", description: "writes", prompt_body: "PENMAN", tools: ["Write", "Edit"] };
+    const { turns, probe } = await planWith({ repoAgents: [repoAuditor, penman], requestedAgentSource: "repo" });
+    assert.deepStrictEqual(Object.keys(turns[0]!.options.agents ?? {}), ["auditor"]);
+    assert.strictEqual(await agentDecision(turns[0]!.options, "penman"), "deny");
+    assert.ok(probe.emits.some((m) => String(m.payload.text ?? "").startsWith("not planning with penman")));
+  });
+
+  it("a pre-approved resume reports no plan source", async () => {
+    const { queryFn } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const reported: string[] = [];
+    const probe = makeCtx({
+      planApproved: true, sessionId: "sess-parked", approvedPlan: "# Approved plan",
+      agents: [lead, coder, reviewer], repoAgents: [repoCoder], requestedAgentSource: "repo",
+      reportPlanAgentSource: async (source) => { reported.push(source); },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.deepStrictEqual(reported, []);
+  });
+
+  it("a seeded run reports no plan source", async () => {
+    const { queryFn } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const reported: string[] = [];
+    const probe = makeCtx({
+      planApproved: true, seeded: true, approvedPlan: "# Seeded plan",
+      agents: [lead, coder, reviewer], repoAgents: [repoCoder], requestedAgentSource: "repo",
+      reportPlanAgentSource: async (source) => { reported.push(source); },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.deepStrictEqual(reported, []);
+  });
+});
+
 describe("SdkExecutor override_subagent_model (PRD #305 M4)", () => {
   // Decision 7: calibrate on a PINNED subagent whose pin ("opus") differs from the
   // run model ("fable"). An unpinned subagent already inherits the run model, so it
@@ -3174,13 +3423,14 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
   it("every claude request_case of the shared matrix is what the executor actually sends to the SDK", async () => {
     const contract = JSON.parse(
       fs.readFileSync(path.join(import.meta.dirname, "..", "..", "fixtures", "lead-config", "contract.json"), "utf8"),
-    ) as { request_cases: Array<{ id: string; harness: string; phase: "plan" | "implement"; config: ClaimConfig; templateModel?: string; expect: { model?: string; effort?: string } }> };
+    ) as { request_cases: Array<{ id: string; harness: string; phase: "plan" | "implement"; config: ClaimConfig; templateModel?: string; agents?: Array<{ name: string; model?: string | null }>; expect: import("../src/lead-config-report.js").LeadRequest }> };
     const cases = contract.request_cases.filter((c) => c.harness === "claude");
-    assert.ok(cases.length >= 5, "the claude matrix is loaded, not empty");
+    assert.equal(cases.length, 13, "all Claude request cases loaded");
     const visited: string[] = [];
     for (const c of cases) {
-      const { model: _drop, ...leadNoModel } = lead;
-      const leadT: AgentTemplate = c.templateModel !== undefined ? { ...leadNoModel, model: c.templateModel } : leadNoModel;
+      const agents = leadRequestCaseAgents(c);
+      const { posts, make } = reporterRig();
+      const reporter = make(c.config);
       const planPhase = c.phase === "plan";
       const { queryFn, turns } = fakeTurns(
         planPhase
@@ -3189,8 +3439,8 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
       );
       const { ctx } = makeCtx(
         planPhase
-          ? { agents: [leadT, coder], config: c.config }
-          : { agents: [leadT, coder], config: c.config, planApproved: true, seeded: true, sessionId: null, approvedPlan: "# Approved" },
+          ? { agents, config: c.config, leadConfig: reporter }
+          : { agents, config: c.config, leadConfig: reporter, planApproved: true, seeded: true, sessionId: null, approvedPlan: "# Approved" },
         approveWith("own"),
       );
       await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
@@ -3204,9 +3454,24 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
         if (c.expect.effort === undefined) assert.ok(!("effort" in t.options), `${c.id}: no effort key`);
         else assert.equal(t.options.effort, c.expect.effort, `${c.id}: sent effort`);
       }
+      const phasePosts = posts.filter((p) => p.phase === c.phase);
+      if (leadConfigActive(c.config)) {
+        assert.ok(phasePosts.length > 0, `${c.id}: requested report posted`);
+        for (const p of phasePosts) {
+          assert.deepEqual(
+            [p.requested_model, p.requested_model_source, p.requested_effort, p.requested_effort_mode, p.requested_effort_source],
+            [c.expect.model ?? null, c.expect.modelSource, c.expect.effort ?? null, c.expect.effortMode, c.expect.effortSource],
+            `${c.id}: requested report`,
+          );
+        }
+      } else {
+        assert.equal(reporter.enabled, false, c.id);
+        assert.equal(posts.length, 0, `${c.id}: old claims stay inactive`);
+      }
       visited.push(c.id);
     }
     assert.deepEqual(visited, cases.map((c) => c.id));
+    assert.equal(visited.length, 13);
   });
 
   /** fakeTurns plus init frames carrying `effort`, and an optional getSettings on each instance. */
@@ -4729,6 +4994,26 @@ describe("SdkExecutor JS dependency provisioning (PRD #121 M2)", () => {
     }
   });
 
+  it("issue #3870: the install env carries GOTMPDIR from ctx.managedGoWorkDir, and none without it", async () => {
+    const goWork = path.join(homeDir, ".uzi-go-work", "g1");
+    const seen: Array<NodeJS.ProcessEnv> = [];
+    for (const managedGoWorkDir of [goWork, undefined]) {
+      const { queryFn } = fakeTurns([
+        [submitPlan("# plan"), resultSuccess()],
+        [signalDone(), resultSuccess()],
+      ]);
+      const installDeps: SdkExecutorOptions["installDeps"] = async (_root, env) => {
+        seen.push(env);
+        return { results: [], truncated: false };
+      };
+      const probe = makeCtx(managedGoWorkDir ? { managedGoWorkDir } : {});
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn, installDeps }).run(probe.ctx);
+    }
+    assert.equal(seen.length, 2);
+    assert.strictEqual(seen[0]!.GOTMPDIR, goWork);
+    assert.strictEqual(seen[1]!.GOTMPDIR, undefined);
+  });
+
   it("says so plainly when the repo has no JS dependencies to install", async () => {
     const { queryFn } = fakeTurns([
       [submitPlan("# plan"), resultSuccess()],
@@ -4862,6 +5147,19 @@ describe("SdkExecutor — pre-approved resume skips the planning turn and the ga
     });
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
     assert.deepStrictEqual(Object.keys(turns[0]!.options.agents ?? {}).sort(), ["coder"]);
+  });
+
+  it("PRD #3914: a pre-approved resume with no persisted selection follows the requested source", async () => {
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const probe = makeCtx({
+      ...preApproved,
+      agents: [lead, coder, reviewer],
+      repoAgents: [repoCoder, repoAuditor],
+      approvedSelection: undefined,
+      requestedAgentSource: "own",
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.deepStrictEqual(Object.keys(turns[0]!.options.agents ?? {}).sort(), ["coder", "reviewer"]);
   });
 
   it("falls back to the absent-default when the claim carried no selection", async () => {
@@ -9265,8 +9563,303 @@ describe("SdkExecutor no-progress stall owner decision (issue #3139)", () => {
   }
   const rp1 = (): SDKMessage[] => [reportProgress(["m1"], []), resultSuccess()];
 
+  // M3: finite allowance parking is distinct from completion and idle-stall decisions.
+  const m3Config = { max_iterations: 2, iteration_park_version: 1 as const };
+  it("iteration park never retries capture through the switch give-up wrapper", async () => {
+    let parks = 0, switches = 0;
+    const r = await drive(m3Work, {
+      config: { max_iterations: 1, iteration_park_version: 1 }, served: 0, completionInterlock: false,
+      attemptCredentialSwitch: async () => { switches++; return "gave_up"; },
+      parkForIteration: async () => { parks++; throw new CredentialSwitchSignal(); },
+    });
+    assert.match(r.error ?? "", /credential switch/);
+    assert.equal(parks, 1);
+    assert.equal(switches, 0, "capture is outside the retry wrapper even on a misbehaving callback");
+    assert.equal(r.calls(), 1);
+  });
+  it("iteration park switch give-up repeats only idempotent settlement then captures once", async t => {
+    let notify: (() => void) | undefined;
+    let models = 0, parks = 0, switches = 0, settlements = 0, abortEffects = 0;
+    const close = SdkExecutor.prototype.closeAndSettlePlanSummary;
+    t.mock.method(SdkExecutor.prototype, "closeAndSettlePlanSummary", async function(this: SdkExecutor) {
+      if (models === 1) {
+        settlements++;
+        if (settlements === 1) {
+          const ctrl = new AbortController();
+          ctrl.signal.addEventListener("abort", () => { abortEffects++; }, { once: true });
+          const owned = this as unknown as { planFlights: Set<unknown> };
+          owned.planFlights.add({ closed: false, ctrl, done: Promise.resolve() });
+          assert.ok(notify); notify();
+        }
+      }
+      await close.call(this);
+    });
+    const r = await drive(c => { models = c; return m3Work(c); }, {
+      config: { max_iterations: 1, iteration_park_version: 1 }, served: 0, completionInterlock: false,
+      onCredentialSwitch: callback => { notify = callback; },
+      attemptCredentialSwitch: async () => { switches++; return "gave_up"; },
+      parkForIteration: async () => { parks++; return "parked"; },
+    });
+    assert.equal(r.error, null);
+    assert.deepEqual(r.result?.iterationParked, { outcome: "parked" });
+    assert.equal(models, 1);
+    assert.equal(switches, 1);
+    assert.ok(settlements >= 2, "give-up repeats the pre-entry guard and settlement");
+    assert.equal(abortEffects, 1, "real summary closure has one abort effect across retries");
+    assert.equal(parks, 1);
+  });
+  for (const when of ["before settlement", "after settlement", "during capture"] as const) {
+    it(`iteration park credential switch ${when} preserves the existing disposition`, async t => {
+      let notify: (() => void) | undefined;
+      let models = 0, parks = 0, switches = 0, tripped = false;
+      const close = SdkExecutor.prototype.closeAndSettlePlanSummary;
+      if (when !== "during capture") {
+        t.mock.method(SdkExecutor.prototype, "closeAndSettlePlanSummary", async function(this: SdkExecutor) {
+          if (when === "before settlement" && models === 1 && !tripped) {
+            assert.ok(notify); tripped = true; notify();
+          }
+          await close.call(this);
+          if (when === "after settlement" && models === 1 && !tripped) {
+            assert.ok(notify); tripped = true; notify();
+          }
+        });
+      }
+      const r = await drive(c => { models = c; return m3Work(c); }, {
+        config: { max_iterations: 1, iteration_park_version: 1 }, served: 0, completionInterlock: false,
+        onCredentialSwitch: callback => { notify = callback; },
+        attemptCredentialSwitch: async () => { switches++; return "released"; },
+        parkForIteration: async () => {
+          parks++;
+          if (when === "during capture") { assert.ok(notify); tripped = true; notify(); }
+          return "parked";
+        },
+      });
+      assert.ok(tripped);
+      assert.equal(models, 1, "no extra work turn after switch or park");
+      assert.equal(r.error, null);
+      if (when === "during capture") {
+        assert.deepEqual(r.result?.iterationParked, { outcome: "parked" });
+        assert.equal(parks, 1);
+        assert.equal(switches, 0, "committed park needs no local retained release");
+      } else {
+        assert.equal(r.result?.switchReleased, true);
+        assert.equal(parks, 0, "visible switch precedes capture");
+        assert.equal(switches, 1);
+      }
+    });
+  }
+  const m3Checkpoint: (c: number) => SDKMessage[] = () => [{ type: "assistant", session_id: "sess-1", message: { content: [{ type: "tool_use", id: "ck-m3", name: "mcp__uzi__checkpoint", input: {} }] } } as unknown as SDKMessage, resultSuccess()];
+  const m3Question: (c: number) => SDKMessage[] = () => [askUserTurn("Which endpoint?"), resultSuccess()];
+  const m3Work: (c: number) => SDKMessage[] = c => [readTool(), assistantText(`M3 work ${c}`), resultSuccess()];
+  function m3AssertPark(r: Awaited<ReturnType<typeof drive>>, outcome: "parked" | "retained-stop") {
+    assert.equal(r.error, null, "M3 finite allowance must park rather than throw");
+    assert.deepEqual(r.result?.iterationParked, { outcome });
+    assert.equal(r.result?.completionHeld, undefined);
+    assert.equal(r.result?.prSummary, undefined, "parking must not finalize");
+    assert.equal(r.result?.milestonesCompleted, undefined);
+    assert.deepEqual(r.fixture.attempts, [], "parking never manufactures a completion attempt");
+    assert.deepEqual(r.fixture.holds, []);
+    assert.deepEqual(r.fixture.questions, []);
+  }
+
+  for (const kind of ["issue", "task", "prompt", "self_improve", "mr_rework", "ci_fix"] as const) {
+    for (const outcome of ["parked", "retained-stop"] as const) {
+      it(`M3 ordinary zero-history ${kind} ${outcome} stops exactly at the finite allowance`, async () => {
+        const parks: unknown[] = [];
+        const r = await drive(m3Work, { kind, config: m3Config, served: 0,
+          parkForIteration: async at => { parks.push(at); return outcome; } });
+        m3AssertPark(r, outcome);
+        assert.equal(r.calls(), 2, "no extra model call after either park outcome");
+        assert.deepEqual(parks, [{ iterationCount: 2, maxIterations: 2 }]);
+        assert.deepEqual(r.fixture.iterations, [1, 2]);
+      });
+    }
+  }
+
+  for (const lift of [false, true]) {
+    it(`M3 repeated checkpoint preturn uses fresh ACK and completed count; lift=${lift}`, async () => {
+      const acks: number[] = [], parks: unknown[] = [];
+      const r = await drive(m3Checkpoint, { config: m3Config,
+        reportIteration: async n => {
+          acks.push(n);
+          assert.ok(n <= (lift ? 4 : 3), "checkpoint bypass must remain bounded");
+          return { completionAttempts: 0, ...(lift && n >= 3 ? { maxIterations: 3 } : {}) };
+        },
+        parkForIteration: async at => {
+          assert.equal(acks.at(-1), lift ? 4 : 3, "park sees the latest ACK");
+          parks.push(at); return "parked";
+        } });
+      m3AssertPark(r, "parked");
+      assert.equal(r.calls(), lift ? 3 : 2, "upward served allowance is honored before preturn park");
+      assert.deepEqual(acks, lift ? [1, 2, 3, 4] : [1, 2, 3]);
+      assert.deepEqual(parks, [{ iterationCount: lift ? 3 : 2, maxIterations: lift ? 3 : 2 }]);
+      assert.equal(r.fixture.checkpoints.filter(c => c.reap).length, lift ? 3 : 2);
+    });
+  }
+
+  it("M3 clarification keeps iteration identity until genuine next work turn", async () => {
+    const acks: number[] = [], parks: unknown[] = [];
+    const r = await drive(c => (c === 1 ? m3Question(c) : m3Work(c)), { config: m3Config,
+      askUser: async () => ({ kind: "answer", answers: ["Use the existing endpoint"] }),
+      reportIteration: async n => { acks.push(n); return { completionAttempts: 0 }; },
+      parkForIteration: async at => { parks.push(at); return "parked"; } });
+    m3AssertPark(r, "parked");
+    assert.equal(r.calls(), 3, "question and answer share the first iteration");
+    assert.deepEqual(acks, [1, 1, 2]);
+    assert.deepEqual(parks, [{ iterationCount: 2, maxIterations: 2 }]);
+    assert.match(r.prompts[1]!, /Use the existing endpoint/);
+  });
+
+  it("M3 checkpoint clarification preserves allowance one through answered continuation", async () => {
+    const acks: number[] = [], parks: unknown[] = [];
+    let answers = 0;
+    const r = await drive(c => c === 1
+      ? [...m3Checkpoint(c).slice(0, -1), ...m3Question(c)]
+      : m3Work(c), {
+      config: { max_iterations: 1, iteration_park_version: 1 },
+      askUser: async () => { answers++; return { kind: "answer", answers: ["Use the existing endpoint"] }; },
+      reportIteration: async n => { acks.push(n); return { completionAttempts: 0 }; },
+      parkForIteration: async at => { parks.push(at); return "parked"; },
+    });
+    m3AssertPark(r, "parked");
+    assert.equal(answers, 1);
+    assert.equal(r.calls(), 2, "checkpoint/question and genuine answered work only");
+    assert.deepEqual(acks, [1, 1], "the answer continues the uncompleted iteration");
+    assert.deepEqual(parks, [{ iterationCount: 1, maxIterations: 1 }]);
+    assert.equal(r.fixture.checkpoints.filter(c => c.reap).length, 1);
+    assert.match(r.prompts[1]!, /Use the existing endpoint/);
+  });
+
+  it("M3 park Resume new invocation genuine work then repeat park needs another Resume", async () => {
+    const io = await import("node:fs/promises");
+    const root = await io.mkdtemp(path.join(process.cwd(), "../.uzi/scratch/m3-resume-"));
+    const file = path.join(root, "work.txt");
+    let fingerprint = 0;
+    let resumes = 0, parks = 0;
+    try {
+      for (let flight = 0; flight < 3; flight++) {
+        if (flight) resumes++; // runner/server Resume is M4; each call is a fresh executor invocation.
+        const before = fingerprint;
+        const r = await drive(c => {
+          fs.writeFileSync(file, String(++fingerprint));
+          return m3Work(c);
+        }, { config: m3Config, served: 0, worktreePath: root,
+          worktreeFingerprint: async () => io.readFile(file, "utf8").catch(() => "unstarted"),
+          parkForIteration: async at => { parks++; assert.deepEqual(at, { iterationCount: 2, maxIterations: 2 }); return "parked"; } });
+        m3AssertPark(r, "parked");
+        assert.equal(r.calls(), 2, "each explicit Resume gets genuine finite work, then stops");
+        assert.ok(fingerprint > before, "real worktree activity prevents idle-stall masking");
+      }
+      assert.equal(resumes, 2); assert.equal(parks, 3);
+    } finally { await io.rm(root, { recursive: true, force: true }); }
+  });
+
+
+  for (const control of ["cancel", "pause", "scope", "success"] as const) {
+    it(`M3 ${control} wins before an unstarted or exhausted iteration park`, async () => {
+      let parks = 0, pauses = 0;
+      const acks: number[] = [];
+      const r = await drive(() => [signalDone(), resultSuccess()], {
+        config: { max_iterations: 1, iteration_park_version: 1 }, completionInterlock: false,
+        reportIteration: async n => {
+          acks.push(n);
+          return { completionAttempts: 0, pauseRequested: control === "pause",
+            ...(control === "scope" ? { scopeCeiling: 1, completedCount: 1 } : {}) };
+        },
+        cancelRequested: () => control === "cancel",
+        parkForPause: async () => { pauses++; return true; },
+        parkForIteration: async () => { parks++; return "parked"; },
+      });
+      assert.equal(parks, 0); assert.equal(r.result?.iterationParked, undefined);
+      if (control === "cancel") { assert.match(r.error ?? "", /cancel/); assert.equal(r.calls(), 0); }
+      else {
+        assert.equal(r.error, null);
+        assert.equal(r.calls(), control === "success" ? 1 : 0);
+        if (control === "pause") { assert.equal(pauses, 1); assert.ok(r.result?.pausedAt); }
+        if (control === "scope") assert.deepEqual(r.result?.scopeCapped, { completedCount: 1, total: 2 });
+      }
+    });
+  }
+
+  it("M3 fresh missing checkpoint ACK cannot reuse an older authoritative zero", async () => {
+    let parks = 0;
+    const acks: number[] = [];
+    const r = await drive(c => (c <= 2 ? m3Checkpoint(c) : m3Work(c)), {
+      config: m3Config,
+      reportIteration: async n => { acks.push(n); return n <= 2 ? { completionAttempts: 0 } : undefined; },
+      parkForIteration: async () => { parks++; return "parked"; },
+    });
+    assert.match(r.error ?? "", /iteration budget/);
+    assert.equal(r.calls(), 3); assert.equal(parks, 0);
+    assert.deepEqual(acks, [1, 2, 3]);
+  });
+
+
+  for (const lift of [false, true]) {
+    it(`M3 postattempt interlocked boundary preservation lift=${lift}`, async () => {
+      let parks = 0;
+      const acks: number[] = [];
+      const r = await drive(c => c === 1 ? [signalDone(), resultSuccess()] : m3Work(c), {
+        config: { max_iterations: 1, iteration_park_version: 1 },
+        reportIteration: async n => {
+          acks.push(n);
+          return { completionAttempts: n === 1 ? 0 : 1, ...(lift && n > 1 ? { maxIterations: 2 } : {}) };
+        },
+        parkForIteration: async () => { parks++; return "parked"; },
+      });
+      assert.equal(r.error, null); assert.equal(parks, 0);
+      assert.equal(r.calls(), lift ? 2 : 1);
+      assert.equal(r.fixture.attempts.length, 1);
+      assert.equal(r.fixture.holds.length, 1);
+      assert.match(r.result?.completionHeld?.reason ?? "", /iteration budget/);
+      assert.deepEqual(acks, [1, 2]);
+    });
+  }
+
+  for (const control of ["pause", "cancel"] as const) {
+    it(`M3 checkpoint fresh ${control} precedes exhausted preturn park`, async () => {
+      let cancel = false, parks = 0, pauses = 0;
+      const acks: number[] = [];
+      const r = await drive(m3Checkpoint, { config: m3Config,
+        reportIteration: async n => { acks.push(n); cancel = n === 3 && control === "cancel";
+          return { completionAttempts: 0, pauseRequested: n === 3 && control === "pause" }; },
+        cancelRequested: () => cancel,
+        parkForPause: async () => { pauses++; return true; },
+        parkForIteration: async () => { parks++; return "parked"; },
+      });
+      assert.equal(parks, 0); assert.equal(r.calls(), 2);
+      assert.deepEqual(acks, [1, 2, 3]);
+      if (control === "cancel") assert.match(r.error ?? "", /cancel/);
+      else { assert.equal(r.error, null); assert.equal(pauses, 1); assert.ok(r.result?.pausedAt); }
+    });
+  }
+
+  const m3LegacyControls: Array<[string, Partial<RunContext>]> = [
+    ["absent capability", { config: { max_iterations: 2 } }],
+    ["unknown capability", { config: { max_iterations: 2, iteration_park_version: 99 } as never }],
+    ["missing callback", { parkForIteration: undefined }],
+    ["interactive", { interactive: true }],
+    ["ineligible job", { kind: "job" }],
+    ...[undefined, -1, NaN, 0.5, 1].map(value => [
+      `history ${String(value)}`, { reportIteration: async () => ({ completionAttempts: value }) },
+    ] as [string, Partial<RunContext>]),
+    ["resumed sticky positive then zero", { reportIteration: async n => ({ completionAttempts: n === 1 ? 1 : 0 }) }],
+  ];
+  for (const [name, control] of m3LegacyControls) {
+    it(`M3 legacy control ${name} retains ordinary exhaustion`, async () => {
+      let parks = 0;
+      const r = await drive(m3Work, { config: m3Config, served: 0,
+        parkForIteration: async () => { parks++; return "parked"; }, ...control });
+      assert.match(r.error ?? "", /iteration budget/);
+      assert.equal(r.calls(), 2); assert.equal(parks, 0);
+      assert.equal(r.result?.iterationParked, undefined);
+      assert.deepEqual(r.fixture.attempts, []);
+    });
+  }
+
+
   it("a reworded stall reaches the no_progress_stall question and an expired window holds (regression pin: base hit max_iterations)", async () => {
-    const r = await drive((c) => (c === 1 ? rp1() : prose(c)));
+    const r = await drive((c) => (c === 1 ? rp1() : prose(c)), { config: { max_iterations: 8, iteration_park_version: 1 }, parkForIteration: async () => assert.fail("idle stall precedes iteration exhaustion") });
     assert.equal(r.error, null);
     assert.equal(r.calls(), 4, "tripped on the third consecutive stall turn");
     assert.deepEqual(r.fixture.questions, [[["m2"], { kind: "no_progress_stall" }]]);
@@ -9526,10 +10119,15 @@ describe("SdkExecutor no-progress stall owner decision (issue #3139)", () => {
       assert.equal(task.calls(), 6);
     });
 
-    it("real work (a tool call every turn) still ends on max_iterations", async () => {
-      const r = await drive((c) => (c === 1 ? rp1() : [readTool(), assistantText(`step ${c}`), resultSuccess()]), { config: { max_iterations: 6 } });
-      assert.match(r.error ?? "", REASON_ITER);
-      assert.equal(r.fixture.attempts.length, 0);
+    it("M3 #3139 real work parks at max_iterations with authoritative zero", async () => {
+      const parks: unknown[] = [];
+      const r = await drive((c) => (c === 1 ? rp1() : [readTool(), assistantText(`step ${c}`), resultSuccess()]), {
+        config: { max_iterations: 6, iteration_park_version: 1 }, served: 0,
+        parkForIteration: async at => { parks.push(at); return "parked"; },
+      });
+      m3AssertPark(r, "parked");
+      assert.equal(r.calls(), 6);
+      assert.deepEqual(parks, [{ iterationCount: 6, maxIterations: 6 }]);
     });
 
     it("a post-attempt stall still routes to the completion hold as before", async () => {

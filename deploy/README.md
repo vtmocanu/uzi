@@ -22,11 +22,16 @@
 > that wants to run candidates tracks the Helm `targetRevision` range `0.*-0` instead of the
 > `0.*` shown above.
 
-The release + deploy runbook for uzi (PRD #52). Two deploy topologies:
+The release + deploy runbook for uzi (PRD #52). Three deploy topologies:
 
 - **compose (laptop)** — the MVP path, unchanged. `docker compose up` on
   `127.0.0.1:8080`, real `./.env` secrets. See the repo `README.md` /
   `ARCHITECTURE.md`. Workers still run here (`docker compose --profile agent`).
+- **compose (VPS)** — signed release images from the dedicated
+  [server Compose file](compose/compose.yaml), versioned with the code. For a single
+  VPS without Kubernetes, follow the [VPS guide](../docs/vps-deployment.md) for HTTPS,
+  administrator bootstrap, a base-agent worker, and backups. Optional DinD services
+  are excluded from this file.
 - **k8s (dev-cluster)** — uzi deployed to the **dev-cluster** Kubernetes cluster
   via **ArgoCD**, GitOps, the way the rest of the platform deploys. This file is about
   that path: cutting a release and getting it live.
@@ -41,15 +46,16 @@ deploys. uzi follows the Model-B release shape.
 
 ## What deploys where
 
-| | compose (laptop) | k8s (dev-cluster) |
-| --- | --- | --- |
-| Brought up by | `docker compose up` | ArgoCD (auto-sync) from `argo-apps` `apps/uzi/` |
-| web / api images | built locally | `ghcr.io/vtmocanu/uzi/{web,api}:<tag>` |
-| controller / agent images | n/a (compose runs no controller) | `ghcr.io/vtmocanu/uzi/controller:<tag>`, `ghcr.io/vtmocanu/uzi/agent-{base,jvm}:<tag>` (PRD #58 M6) |
-| Postgres | `postgres:17` container | CNPG `Cluster` (`postgres-uzi-cluster`, 1 instance, `standard`) |
-| Secrets | `./.env` | Infisical (`/uzi` folder) + CNPG-generated `-app` creds |
-| Public URL | `http://127.0.0.1:8080` | `https://uzi.example.com` (ingress-nginx, `*.example.com` wildcard TLS) |
-| Worker | `docker compose --profile agent` | laptop workers unchanged; **hosted workers ship but are OFF** — see [Hosted workers](#hosted-workers-prd-58) |
+| | compose (laptop) | compose (VPS) | k8s (dev-cluster) |
+| --- | --- | --- | --- |
+| Configuration | root `docker-compose.yml` | [compose/compose.yaml](compose/compose.yaml); [VPS guide](../docs/vps-deployment.md) | `chart/` + GitOps values |
+| Brought up by | `docker compose up` | `docker compose -f compose.yaml up -d --no-build db api web` | ArgoCD (auto-sync) from `argo-apps` `apps/uzi/` |
+| web / api images | built locally | `ghcr.io/vtmocanu/uzi/{web,api}:${UZI_VERSION}` | `ghcr.io/vtmocanu/uzi/{web,api}:<tag>` |
+| controller / agent images | n/a (compose runs no controller) | no controller; `ghcr.io/vtmocanu/uzi/agent-base:${UZI_VERSION}` | `ghcr.io/vtmocanu/uzi/controller:<tag>`, `ghcr.io/vtmocanu/uzi/agent-{base,jvm}:<tag>` (PRD #58 M6) |
+| Postgres | `postgres:17` container | digest-pinned `postgres:17` container | CNPG `Cluster` (`postgres-uzi-cluster`, 1 instance, `standard`) |
+| Secrets | `./.env` | private `/opt/uzi/.env`; worker token mounted as a Compose secret | Infisical (`/uzi` folder) + CNPG-generated `-app` creds |
+| Public URL | `http://127.0.0.1:8080` | `https://your_domain` through an existing TLS proxy to loopback web | `https://uzi.example.com` (ingress-nginx, `*.example.com` wildcard TLS) |
+| Worker | `docker compose --profile agent` | `docker compose -f compose.yaml --profile agent up -d --no-build agent` | laptop workers unchanged; **hosted workers ship but are OFF** — see [Hosted workers](#hosted-workers-prd-58) |
 
 The ArgoCD `Application` is **multi-source** (example-app precedent): the released
 chart from the public GHCR OCI registry + the per-cluster values from the argo-apps GitOps
@@ -167,10 +173,9 @@ parent-proof exemption for docs or PRDs: their changed text has not passed its
 own checks. Automation does not dispatch CI, create a repair commit or select
 an older tip.
 
-Nightly attempts are scheduled for 04:47 Europe/Bucharest using GitHub's native
-timezone support, after the local maintenance window, aiming to cut near 05:00
-when on time. They are
-off until the user decides to activate and the maintainer sets
+Nightly attempts are scheduled for 01:47 Europe/Bucharest using GitHub's native
+timezone support. The earlier slot leaves room for observed scheduler delays.
+They are off until the user decides to activate and the maintainer sets
 `RELEASE_NIGHTLY_ENABLED=true`. Unset it or set it to `false` to pause nightly
 attempts; manual dispatch still works. Enablement is rechecked at job boundaries,
 so a not-yet-pushed attempt may stop there, possibly red with `nightly-disabled`.
@@ -189,7 +194,7 @@ The provisional push cutoff is strictly before 13:00 on the original run's
 Bucharest calendar date. A queued run does not gain a fresh window tomorrow.
 Scheduled tip waiting uses the lesser of three hours and the remaining time
 until 12:50, reserving a provisional 600 seconds from the existing cutter timeout,
-not a measured cut duration. An on-time 04:47 attempt can wait until 07:47; a late
+not a measured cut duration. An on-time 01:47 attempt can wait until 04:47; a late
 10:47 attempt can wait until 12:50. Waiting holds a runner under the 20-job cap.
 The prepare ceiling stays 210 minutes (180 waiting, ten cutting, 20 overhead).
 Manual waits remain 7200 seconds and their cutter timeout remains 600 seconds;
@@ -579,22 +584,47 @@ nothing else by design.
 
 ### Expanding existing worker data volumes
 
-New persistent L workers request 50Gi of `/data` (#2013). Existing PVCs keep their
-capacity; the controller creates missing claims but does not resize existing
-`/data` claims or revert an operator's expansion. M remains 25Gi, and run-bound
-workers use `workers.ephemeralWorkerDataSize` (40Gi by default). Expand an existing
-run-bound data PVC to 40Gi using the same procedure while retaining its contents.
+New persistent L workers request 50Gi of `/data` (#2013), and Docker workers' DinD
+data claims default per size (`s`/`m` 20Gi, `l`/`l-highmem` 50Gi; #3890). The controller
+converges an **existing** `/data` or DinD claim's request **upward** to the rendered size
+on its own, when the claim's StorageClass has `allowVolumeExpansion: true` and the
+controller can read the class (`workers.storageClassRead.create`, default `true`). It
+patches `spec.resources.requests.storage` only, fenced on the claim's uid and
+resourceVersion; it never shrinks, deletes, recreates or recycles a claim, never reverts
+an operator's larger expansion, and rolls no pod (sizes are not in the pod template). M
+remains 25Gi, and run-bound workers use `workers.ephemeralWorkerDataSize` (40Gi by
+default). An explicit `workers.docker.dindDataSize` is a cluster-wide override that wins at
+every size (a retained `20Gi`, an explicit `30Gi` or a `--reuse-values` value does not
+become `50Gi`); clear it to adopt the per-size defaults.
+
+An accepted patch grows the request, not the filesystem. Watch the controller logs for
+`pvc-expand-requested`, `pvc-expand-deferred` (a roll, maintenance or reservation fence;
+retried on later ticks), `pvc-expand-skipped` (for example `class-not-expandable`,
+`class-lookup-forbidden`, `no-storage-class`), `pvc-expand-failed` (for example
+`reason=forbidden` when the namespace quota is exhausted) and `pvc-resize-pending` /
+`pvc-resize-failed`. The filesystem finishes online on a driver that supports it;
+otherwise it stays pending until the next independently authorized idle roll (for example an image or spec change rolled while idle, or an operator-initiated idle restart, see [Remounting a pending expansion at an idle restart](#remounting-a-pending-expansion-at-an-idle-restart)) remounts the volume. Expansion itself never triggers a roll.
+The controller never forces a restart. With `workers.storageClassRead.create=false`, custom
+RBAC or an older chart the class lookup is refused and expansion fails closed
+(`class-lookup-forbidden`). The manual procedure below remains for operators and edge cases.
+See [ADR-3890](../adr/3890-worker-pvc-expansion.md).
 
 Before upgrading, raise any per-cluster overrides of both worker tiers'
 `limitRange.maxPVCStorage` to at least 50Gi. The controller refuses to start if a
 configured ceiling cannot admit the largest preset. Recalculate each tier's
 `quota.requestsStorage` for its worker count, maximum data size, 20Gi `/nix`, and
-the effective Docker `dindDataSize`. Defaults cover 20 restricted workers at
-`20 x (50 + 20) = 1400Gi` and 10 Docker workers at
-`10 x (50 + 20 + 20) = 900Gi`. For example, a 30Gi DinD override needs 1000Gi for
+the effective Docker DinD size (per-preset 20Gi for `s`/`m`, 50Gi for `l`/`l-highmem`
+when `dindDataSize` is empty; an explicit value overrides every preset). Defaults
+cover 20 restricted workers at `20 x (50 + 20) = 1400Gi` and 10 Docker workers at
+`10 x (50 + 20 + 50) = 1200Gi`. For example, a 30Gi DinD override needs 1000Gi for
 10 Docker workers. The isolated lane needs 600Gi for ten run-bound workers
 (`10 x (40 + 20)`), with a PVC ceiling of at least 40Gi. Its chart guard also checks
-run-bound data overrides. Allow budget for existing claims and their requested growth.
+run-bound data overrides. Allow budget for existing claims and their requested growth: a
+Docker quota kept at 900Gi can refuse the growth once the tier's claims reach the quota
+(a full 10-worker `l` fleet needs 1200Gi); the refusal is logged as `pvc-expand-failed reason=forbidden`.
+A request above the namespace LimitRange `maxPVCStorage` is expected to be refused at admission on
+update (logged `pvc-expand-failed reason=forbidden`); this has not been verified on a live cluster.
+The controller's boot check and the chart guards keep targets within the ceiling.
 
 The `l-highmem` worker size (#3383) requests 24Gi and is limited to 32Gi of memory.
 Before using it, raise any per-cluster override of `limitRange.max.memory` on all
@@ -641,6 +671,91 @@ retained work. Do not delete or recreate a custody-held data volume.
 The larger volume adds headroom; it does not bound build-cache growth. Existing
 cache-cap and disk-pressure safeguards remain enabled. Long-run acceptance for
 #2013 still requires a post-release measurement.
+
+#### Remounting a pending expansion at an idle restart
+
+A manual cordon alone does not remount anything: it changes no pod template, so it
+creates no drift and no roll. There is also no owner restart action in uzi. When the
+driver cannot finish online and no image or spec change is due, the one remaining way to
+remount is for a cluster operator (with `kubectl` access to the worker namespace) to
+delete the worker's current pod while the worker is idle. This is manual, outside
+controller protection, and unverified on a live cluster. Replace `<ns>`, `<claim>`,
+`<worker-id>` and `<pod-name>`; a worker's pod is `uzi-hw-<worker-id>-*`.
+
+1. **Confirm a remount is needed.** The request is above the capacity and the
+   filesystem resize is waiting on the node:
+
+   ```sh
+   kubectl get pvc -n <ns> <claim> \
+     -o jsonpath='{.spec.resources.requests.storage}{" "}{.status.capacity.storage}{" "}{.metadata.uid}{"\n"}'
+   kubectl get pvc -n <ns> <claim> \
+     -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}'
+   ```
+
+   Proceed only if the request exceeds `status.capacity` and `FileSystemResizePending=True`
+   is listed (controller log: `pvc-resize-pending`). If a `Resizing` or `*Error`
+   condition shows, or the controller logs `pvc-resize-failed`, stop: a restart will not
+   fix it. Record the claim UID(s) (the `/data` claim and, for Docker workers, the DinD
+   claim).
+2. **Check for an existing fence, then stop new intake.** Do this check first: once you
+   cordon, your own hold makes `effective_cordoned` true and so masks a maintenance-only
+   intake fence (a roll or automatic drain stays visible as `draining_since`).
+   Read the worker before cordoning:
+
+   ```sh
+   uzi worker get <worker-id> --json
+   ```
+
+   Proceed only if `effective_cordoned` is `false` and `draining_since` is `null`.
+   `effective_cordoned: true` with both `manual_cordoned_at` and `draining_since` null
+   is an intake fence (the table shows `· intake fenced`); a set `draining_since` with
+   no cordon of yours is an automatic drain or roll. Wait for either to clear and
+   re-read; do not delete into them. If `manual_cordoned_at` is set by your own earlier,
+   interrupted attempt, uncordon (`uzi worker uncordon <worker-id>`), re-read, and only
+   then continue. Then the worker's owner cordons it
+   ([manual cordon](../docs/hosted-workers.md#pause-new-work-with-a-manual-cordon)),
+   from the Workers page or `uzi worker cordon <worker-id> -m 'pvc remount'`. Cordon
+   needs a persistent worker and an owner; an admin cannot cordon another owner's worker.
+   Cordon does not cancel assigned runs.
+3. **Wait until the worker is idle, and stop if it is custody-held.**
+   - No assigned nonterminal run: `uzi worker list` shows no run in `RUN SLOTS` and no
+     pending outcomes in `RUNS`; the worker detail lists any assigned blockers
+     ([which runs block an upgrade](../docs/hosted-workers.md#see-which-assigned-runs-block-an-upgrade)).
+     Queued, paused and every wait or gate count as assigned.
+   - Not custody-held: `uzi worker get <worker-id> --json` shows
+     `retaining_unpublished_work: false`. It is `true` for any open custody hold, not
+     only your own. If it is `true`, **do not proceed**: deleting the pod puts the
+     unpublished committed work it protects at risk. Resolve it first
+     ([Run recovery](../docs/run-recovery.md)); `uzi run recovery` lists your own holds
+     for detail but is not the authority.
+   - No roll or drain started since step 2: re-read the same JSON immediately before
+     step 4 and require `draining_since` to be `null` (your own cordon shows only
+     `manual_cordoned_at`). A roll, automatic drain or pressure recycle sets
+     `draining_since` even on a manually cordoned worker; if it is set, do not delete
+     the pod — uncordon and let the controller finish. Only a maintenance-only intake
+     fence that began after your cordon cannot be seen here, because your cordon already
+     makes `effective_cordoned` true; the step-2 check is the gate for that case.
+4. **Restart only the pod.** Manual pod deletion is outside the controller's busy-run
+   protection, which is why steps 2 and 3 are mandatory.
+
+   ```sh
+   kubectl get pod -n <ns> -l uzi.dev/hosted-worker-id=<worker-id>
+   kubectl delete pod -n <ns> <pod-name>
+   ```
+
+   Delete only that pod: never the Deployment and never a PVC. The Deployment (strategy
+   `Recreate`) starts a replacement that mounts the same claims, and the kubelet
+   finishes the filesystem resize on mount.
+5. **Verify.** Re-run the two `kubectl get pvc` commands: each claim UID is unchanged,
+   `status.capacity` equals the request, `FileSystemResizePending` is gone. Check the
+   pod is `Ready` (`kubectl get pod -n <ns> -l uzi.dev/hosted-worker-id=<worker-id>`)
+   and the controller no longer logs `pvc-resize-pending` for the claim. Where exec is
+   permitted, `df -h /data` in the `worker` container (and, in the `dind` container via
+   `kubectl exec -c dind`, `df -h /var/lib/docker` for a non-rootless daemon or
+   `df -h /home/rootless/.local/share/docker` for the rootless default) should show
+   the new size.
+6. **Uncordon:** `uzi worker uncordon <worker-id>` (or the Workers page). This removes
+   only your manual hold; any automatic drain, maintenance or custody fence still applies.
 
 ### Cross-check capacity
 
@@ -732,10 +847,12 @@ which takes uzi down. It fails closed, but the blast radius is the whole product
 | `workers.controller.replicaCount` | `1` | Enabled controller rendering accepts `0` or `1`, with Recreate strategy. `0` stops reconciliation. Extra controllers outside the chart are unsupported; there is no multi-controller coordination. |
 | `workers.rollConcurrency` | `1` | Positive integer: concurrent admitted replacements per coverage pool after canary promotion. Busy draining reservations and unconfirmed writes consume slots. |
 | `workers.rollTargetVersion` | verified image stamp in published charts (`""` in source) | Exact verified baked version of the pinned worker image, including `+g<commit>`. Release packaging verifies each pinned template image signature and matching config at one resolved digest, then injects the common stamp. Per-cluster overrides still win; custom worker pins/source charts need a matching verified override. Remove a hand-set per-cluster `workers.rollTargetVersion` when using the published chart's worker pin: otherwise it becomes stale at the next pin bump and holds the roll again. ADR-1720's full stamp cannot be derived from those tags. Missing mapping holds ordinary paced rolls before their admission cordon; the separate migration drain below does not authorize replacement. Never infer the mapping from the replacement or strip metadata. |
-| `workers.drainDeadline` | `"24h"` | Compatible Go duration (`"1h"`, `"30m"`), with unchanged positive-only parsing; exposed as `UZI_WORKER_DRAIN_DEADLINE`. Now bounds only independent **nondrifted** pressure/nix-size maintenance, which can interrupt busy runs and delete /data unless custody-held. No elapsed timer permits busy spec-hash/generation replacement or associated recycle, even with no pacing entry/plain drain; shortening this value no longer forces image upgrades. No new knob. |
-| `workers.forceRoll` | `false` | **Global** emergency bypass of pacing, holds, incarnation proof and busy deferral for drifted workers, plus busy deferral for independent maintenance. May interrupt runs and lose all capacity; neither targeted nor a recovery guarantee. Custody-held data and independent DinD readiness/identity/pod-absence guards remain authoritative; DinD has no deadline or ForceRoll bypass. No automatic rollback. Restore `false` after the emergency. |
+| `workers.drainDeadline` | `"24h"` | Compatible Go duration (`"1h"`, `"30m"`), with unchanged positive-only parsing; exposed as `UZI_WORKER_DRAIN_DEADLINE`. Now bounds only independent **nondrifted** pressure/nix-size maintenance, which can interrupt busy runs. After the fixed #3852 controller deploys, Docker maintenance preserves /data even under ForceRoll; only plain hosted pressure recycle can delete it unless custody-held. No elapsed timer permits busy spec-hash/generation replacement or associated recycle, even with no pacing entry/plain drain; shortening this value no longer forces image upgrades. No new knob. |
+| `workers.forceRoll` | `false` | **Global** emergency bypass of pacing, holds, incarnation proof and busy deferral for drifted workers, plus busy deferral for independent maintenance. May interrupt runs and lose all capacity; neither targeted nor a recovery guarantee. Docker data and custody-held plain data remain protected, and independent DinD readiness/identity/pod-absence guards remain authoritative; DinD has no deadline or ForceRoll bypass. No automatic rollback. Restore `false` after the emergency. |
 | `workers.storageClass` | `""` (cluster default) | `standard` on dev-cluster. |
+| `workers.storageClassRead.create` | `true` | Renders the controller's one ClusterRole, `<fullname>-controller-storageclass-read` (`get` on `storageclasses`, nothing else), and its ClusterRoleBinding (#3890). Size-only PVC expansion reads the claim's StorageClass for `allowVolumeExpansion`, and a StorageClass is cluster-scoped, so a namespaced Role cannot grant it: an owner-authorized exception to the chart's namespace-only RBAC. `false` (or custom RBAC) makes expansion fail closed with `class-lookup-forbidden`; creation, recycling and rolls are unaffected. |
 | `workers.nodeSelector` | `kubernetes.io/arch: amd64` | Rendered onto every hosted worker pod (plain, docker, isolated), next to the docker tier's soft anti-affinity. The default exists because the published agent images are amd64 only. With your own arm64-capable `workers.image.repository`, override it or clear it with `nodeSelector: null` (`{}` does not clear it: Helm merges it into the default). Changing it re-hashes every worker's pod template: persistent workers roll through the normal paced drain, while run-bound workers are outside pacing but keep the busy-drift deferral. |
+| `workers.tolerations` | `[]` | Tolerations rendered onto every hosted worker pod (plain, docker, isolated), as Kubernetes toleration objects using operator `Equal` or `Exists` (the feature-gated `Lt`/`Gt` are refused at boot), e.g. `[{key: uzi, operator: Equal, value: "true", effect: NoSchedule}]` to run workers on tainted, dedicated nodes. A toleration only permits those nodes; to keep workers off all others, label the dedicated nodes and add the label to `workers.nodeSelector` (keep the arch key). The controller validates the list at boot. Empty renders nothing and leaves the worker pod template hash unchanged; changing it rolls the workers like a `workers.nodeSelector` change. The api, web and controller pods are not affected. |
 
 ### Deploying paced hosted rolls (#1470)
 
@@ -1064,6 +1181,14 @@ ledger saturation reports `consumption_full` without evaluation while preserving
 SH startup.
 A would-delete entry requires terminal ownership, fresh empty holds and an
 eligible retained-source disposition; a verdict grants no deletion authority.
+
+For `inventory_partial`, `partial_causes` supplies sparse, bounded event counters:
+`measurement_entry_cap` and `measurement_filesystem_error` explain measurement
+limits or filesystem failures; `ownership_read_` and `holds_read_` keys classify
+failures at those read stages. Each counter saturates at **65535**; a missing
+counter is not evidence that unvisited work was clean. The object carries no raw
+errors, URLs, paths or IDs and changes no eligibility or authority. See the
+[full #3775 diagnostic contract](../prds/3431-pod-epoch-reclaim.md#3775-partial-shadow-diagnostic-contract).
 
 **Authority and counts (PRD #3431 M1a).** The log line also carries
 `authority: {result, reason}`, `evidence_version` and, once version-2 binding

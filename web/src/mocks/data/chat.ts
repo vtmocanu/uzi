@@ -18,6 +18,7 @@ const CHAT_3 = "chat-uzi-3"; // ended, offers Continue
 function chatRun(over: Partial<Run> & { id: string; title: string; status: Run["status"] }): Run {
   const { title, ...rest } = over;
   return {
+    harness_decision: null,
     repo_id: null, // a chat run has no repo (runDTO repo_id is nullable, PRD #39)
     kind: "chat",
     issue_iid: null,

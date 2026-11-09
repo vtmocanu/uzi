@@ -82,7 +82,7 @@ var runDTOKeys = []string{
 	"id", "repo_id", "forge_type", "kind", "issue_iid", "continued_issue_iid", "issue_title", "issue_description",
 	// PRD #1429 M1 (D2): the run's actual stored harness (closed enum claude|codex), NOT NULL
 	// DEFAULT 'claude' so always on the wire ("claude" for every current run).
-	"harness",
+	"harness", "harness_decision",
 	// PRD #764 M2: server-computed PRD presence for the runs view, always on the wire
 	// (bool, false for issue-less run kinds whose description carries no prds link).
 	"has_prd_link",
@@ -220,8 +220,8 @@ var runDTOKeys = []string{
 	"claim_generation",
 	"finished_at", "created_at", "updated_at",
 	// issue #1727: when the run entered its current status; null only defensively.
-	"status_since", "repo_agents", "agent_source",
-	"agent_exclusions", "own_agents",
+	"status_since", "repo_agents", "repo_agent_source_commit", "agent_source",
+	"agent_exclusions", "agent_source_requested", "agent_source_requested_basis", "plan_agent_source", "own_agents",
 	// PRD #111 M1: which Anthropic credential the claim spent. The label is a
 	// snapshot and outlives the id, so both keys are always on the wire.
 	"anthropic_secret_id", "anthropic_secret_label",
@@ -376,7 +376,7 @@ func TestRunListItemDTOTags(t *testing.T) {
 	// worker_name field shadows the embedded one (json collapses the duplicate tag to one key), so it
 	// is NOT appended here any more.
 	// is_revising moved onto RunDTO (issue #2760), so it is in runDTOKeys.
-	want := append(append([]string{}, runDTOKeys...), "judge_verdict", "judge_todo_count")
+	want := append(append([]string{}, runDTOKeys...), "judge_verdict", "judge_todo_count", "cross_check_active")
 	assertTags(t, "RunListItemDTO(no owner)", RunListItemDTO{}, want...)
 	// owner_email present when set.
 	email := "u@example.test"
@@ -846,7 +846,7 @@ func TestSecretDTOTags(t *testing.T) {
 func TestRepoDTOTags(t *testing.T) {
 	assertTags(t, "RepoDTO", RepoDTO{},
 		"id", "connection_id", "forge_project_id", "path_with_namespace", "web_url",
-		"default_branch", "enabled", "repo_skills_enabled", "repo_claudemd_enabled", "repo_devbox_opt_in",
+		"default_branch", "enabled", "repo_skills_enabled", "agent_source_default", "repo_claudemd_enabled", "repo_devbox_opt_in",
 		"code_cross_check_guidance", "cross_check_repo_instructions_enabled",
 		// PRD #686 D1: the per-repo self-improve dogfooding capability (folds the
 		// improve_uzi backlog + selects the uzi worker directive). Default false.
@@ -1186,12 +1186,14 @@ func TestUserSettingsDTOTags(t *testing.T) {
 		"now_summary_enabled",
 		// PRD #3245: the Codex judge lane and the read-only resolved judge cells.
 		"codex_judge_model", "judge_models",
+		// PRD #3248: the Codex summary lane and the read-only resolved summary cells.
+		"codex_summary_model", "summary_models",
 		// PRD #3247: the read-only resolved ordinary effort cells.
 		"effort_settings",
 		// PRD #3522: the weekly usage reserve (null threshold ⇒ off).
 		"weekly_reserve_pct", "weekly_reserve_pause_running",
 		// Issue #3719: the user's Codex account mode (default|auto).
-		"codex_account_mode")
+		"codex_account_mode", "harness_overflow_enabled")
 }
 
 func TestModelSettingCellDTOTags(t *testing.T) {
@@ -1200,8 +1202,13 @@ func TestModelSettingCellDTOTags(t *testing.T) {
 }
 
 func TestEffortSettingCellDTOTags(t *testing.T) {
-	assertTags(t, "EffortSettingCellDTO", EffortSettingCellDTO{},
-		"harness", "effort", "default_effort", "default_source", "resolved_effort", "source", "mode")
+	assertTags(t, "EffortSettingCellDTO", EffortSettingCellDTO{CatalogDefault: &CatalogDefaultDTO{}},
+		"harness", "effort", "default_effort", "default_source", "resolved_effort", "source", "mode", "catalog_default")
+}
+
+func TestCatalogDefaultDTOTags(t *testing.T) {
+	assertTags(t, "CatalogDefaultDTO", CatalogDefaultDTO{},
+		"state", "effort", "model", "runtime_version", "observed_at")
 }
 
 func TestCrossCheckPinDTOTags(t *testing.T) {
@@ -1356,10 +1363,15 @@ func TestRecoveryArchiveDTOTags(t *testing.T) {
 	full := RecoveryArchiveDTO{
 		AttemptedHeadSha: &h, ByteSize: &sz, Checksum: "sha256:x", Reason: "quota",
 		PrerequisiteShas: []string{"deadbeef"}, ExpiresAt: &now,
+		PrerequisiteClosure: &RecoveryPrerequisiteClosureDTO{State: "pinned"},
 	}
 	assertTags(t, "RecoveryArchiveDTO(full)", full,
 		"id", "run_id", "hold_id", "state", "source_sha", "created_at",
-		"attempted_head_sha", "byte_size", "checksum", "reason", "prerequisite_shas", "expires_at")
+		"attempted_head_sha", "byte_size", "checksum", "reason", "prerequisite_shas", "expires_at", "prerequisite_closure")
+	assertTags(t, "RecoveryPrerequisiteClosureDTO", RecoveryPrerequisiteClosureDTO{},
+		"state", "pin_ref", "absence_unconfirmed", "cleanup_exhausted", "updated_at")
+	assertTags(t, "RecoveryPrerequisiteClosureDTO(full)", RecoveryPrerequisiteClosureDTO{Reason: "pin_unknown", PinTip: &h},
+		"state", "reason", "pin_ref", "pin_tip", "absence_unconfirmed", "cleanup_exhausted", "updated_at")
 }
 
 // The summary's counts is a fixed struct (all six state keys always present); archives is a
@@ -1460,5 +1472,36 @@ func TestRecoverySettleTargetValues(t *testing.T) {
 		if got != want {
 			t.Errorf("settle target wire value = %q, want %q", got, want)
 		}
+	}
+}
+
+func TestRunCreatedIssuesWire(t *testing.T) {
+	for _, issues := range [][]CreatedIssueDTO{nil, {}} {
+		raw, err := json.Marshal(RunDTO{CreatedIssues: issues})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(raw), "\"created_issues\"") {
+			t.Fatal("absent issues must be omitted")
+		}
+	}
+	want := []CreatedIssueDTO{{IID: 17, Title: "unsafe URL stays a coordinate", WebURL: ""}}
+	raw, err := json.Marshal(RunDTO{CreatedIssues: want})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatal(err)
+	}
+	if string(body["created_issues"]) != `[{"iid":17,"title":"unsafe URL stays a coordinate","web_url":""}]` {
+		t.Fatalf("wire=%s", body["created_issues"])
+	}
+	var decoded RunDTO
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.CreatedIssues) != 1 || decoded.CreatedIssues[0] != want[0] {
+		t.Fatalf("roundtrip=%+v", decoded.CreatedIssues)
 	}
 }

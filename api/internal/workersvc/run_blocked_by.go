@@ -14,7 +14,7 @@ import (
 )
 
 // blockedByQuestionPayload is the slice of the `question` run-message payload the
-// hint reads (shape: questionPayload in slacksvc/question.go, which is unexported).
+// hint reads (shape: runquestion.Payload).
 // Every string in it is model-authored and untrusted: only the digit runs
 // runprogress.IssueRefs extracts ever leave this file.
 type blockedByQuestionPayload struct {

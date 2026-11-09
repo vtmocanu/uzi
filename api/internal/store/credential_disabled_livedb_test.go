@@ -29,7 +29,7 @@ func TestCredentialDisabledParkPromoteLiveDB(t *testing.T) {
 	pgWorker := pgtype.UUID{Bytes: worker, Valid: true}
 	park := func(id uuid.UUID, w pgtype.UUID, gen int64) int64 {
 		t.Helper()
-		n, err := q.ParkCredentialDisabledRun(ctx, store.ParkCredentialDisabledRunParams{ID: id, WorkerID: w, ClaimGeneration: gen})
+		n, err := q.ParkCredentialDisabledRun(ctx, store.ParkCredentialDisabledRunParams{ID: id, WorkerID: w, ClaimGeneration: gen, HoldReason: "credential_disabled"})
 		if err != nil {
 			t.Fatalf("park: %v", err)
 		}
@@ -203,6 +203,7 @@ func TestCredentialDisabledSameWorkerReclaimLiveDB(t *testing.T) {
 	run := fx.run(wpRun{status: "claimed", worker: &worker, claimGen: 4, budgetWall: p32(36000)})
 	if n, err := fx.q.ParkCredentialDisabledRun(fx.ctx, store.ParkCredentialDisabledRunParams{
 		ID: run, WorkerID: pgtype.UUID{Bytes: worker, Valid: true}, ClaimGeneration: 4,
+		HoldReason: "credential_disabled",
 	}); err != nil || n != 1 {
 		t.Fatalf("park: rows=%d err=%v", n, err)
 	}

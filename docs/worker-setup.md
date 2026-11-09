@@ -111,7 +111,9 @@ Beyond the image's baked-in tools, a run can install **per-repo CLI tools** (kub
 - **Provisioning failure fails the run** with a clear message rather than silently continuing without the tool.
 - **The admin allowlist is gated to what the image bakes.** This is a server-side rule, not an egress one: allowlisting an unbaked package or saving it to a tool profile is rejected with a 400 naming it, and a run that reaches claim with one still fails the claim — enforced regardless of what a worker can reach. (A hosted kube-native worker can now resolve an arbitrary package name via the devbox resolver above — that egress was widened, not tightened, to unblock provisioning — so the resolver being reachable is not what enforces the baked-only rule.) So an admin can only allowlist a package the worker image already bakes into its shared devbox toolchain (`agent/devbox-global/devbox.json`). Allowlisting a new tool means baking it into that toolchain and rolling the worker image; the gate rejects the alternative with a clear message instead of letting a run hang. `kubectl` and `nodejs` are the two documented exceptions that stay allowlisted without being baked — see [Per-repo tools](./worker-tools.md#the-allowlist-admins).
 
-The worker image installs a **pinned** devbox binary and nix at build time (no floating installer, no first-run download). Storage: the nix store is the `agentnix` volume at `/nix`; devbox/nix per-user metadata lands HOME-derived under `/data` (the `agentdata` volume). Both persist across `docker compose down`/`up`, so only a fresh `down -v` re-downloads packages.
+The worker image installs a **pinned** devbox binary and nix at build time (no floating installer, no first-run download). Storage: the nix store is the `agentnix` volume at `/nix`; devbox/nix per-user metadata lands HOME-derived under `/data` (the `agentdata` volume).
+
+Both persist across Compose restarts. To refresh the nix store, first run `docker compose -p <project> rm -s -f agent`, then `docker volume rm <project>_agentnix`, replacing `<project>` with your actual Compose project name. Recreate the worker using `docker compose -p <project> up` with your existing Compose profiles and configuration so it re-downloads packages. These steps keep the database (`pgdata`) and the repositories (`agentdata`).
 
 ## Resource stats and sizing
 
@@ -146,7 +148,7 @@ resources:
     cpu: "2"
 ```
 
-**A [docker sidecar](#docker-sidecar) costs more** on top of either number above: budget roughly an extra **1-2 GiB memory / 1 CPU** for the `dind` daemon itself, plus its own storage for pulled images and build cache — a compose `dinddata` volume, or its k8s equivalent. Under compose, `dinddata` only grows: reclaim it the same way as `agentnix` (`docker compose down -v`, or `docker volume rm <project>_dinddata`) once you don't need what's cached. On a hosted k8s worker the equivalent is a persistent per-worker PVC (`dind-data`), and a `dind-meter` sidecar samples its fill level and supports automatic cache pruning and, under a stricter terminal-run maintenance gate, DinD PVC recycling under sustained pressure — see [Docker inside a worker](./worker-docker.md#dind-data-metering-and-automatic-pruning) for what that covers and what it doesn't. Expect a real workload — uzi's own e2e suite pulls `postgres:17` and builds `api`/`web`/`agent` through the sidecar — to land in the **5-20 GiB** range.
+**A [docker sidecar](#docker-sidecar) costs more** on top of either number above: budget roughly an extra **1-2 GiB memory / 1 CPU** for the `dind` daemon itself, plus its own storage for pulled images and build cache — a compose `dinddata` volume, or its k8s equivalent. Under compose, `dinddata` only grows: once you don't need what's cached, first run `docker compose -p <project> rm -s -f agent dind`, then `docker volume rm <project>_dinddata`, replacing `<project>` with your actual Compose project name. Recreate the services using `docker compose -p <project> up` with your existing [Docker-sidecar setup](#docker-sidecar), including its Compose profiles and configuration. These steps keep the database (`pgdata`) and the repositories (`agentdata`). On a hosted k8s worker the equivalent is a persistent per-worker PVC (`dind-data`), and a `dind-meter` sidecar samples its fill level and supports automatic cache pruning and, under a stricter terminal-run maintenance gate, DinD PVC recycling under sustained pressure — see [Docker inside a worker](./worker-docker.md#dind-data-metering-and-automatic-pruning) for what that covers and what it doesn't. Expect a real workload — uzi's own e2e suite pulls `postgres:17` and builds `api`/`web`/`agent` through the sidecar — to land in the **5-20 GiB** range.
 
 **On a hosted k8s worker, a per-pod Codex command cache draws on the pod's ephemeral storage, separately from the dind budget above**: it exists only under the uid split. A worker-only emptyDir (`codex-cmd-cache`) holds one directory per run with that run's Codex command build cache (`GOMODCACHE`/`GOCACHE`/npm). It is removed at the end of a run only when its command roots have all drained, its cache reservations have settled and no measurement is still running, and via `--remove-cache` after a cache-holder loss under the same conditions; otherwise it is kept on disk until the startup orphan reaper sweeps it. While a run is live, its cache is measured after commands and rotated to a fresh generation when a complete measurement reaches or exceeds the per-run budget, or when the measurement is unknown (incomplete, failed or timed out) (`UZI_CODEX_COMMAND_CACHE_RUN_BYTES`, default 4 GiB, `0` turns it off; see [Configuration](./configuration.md)). Rotation is best-effort with no hard size bound, and a command is never refused for cache size. It counts toward `workers.ephemeralRequest`/`workers.docker.ephemeralRequest`, the docker tier's 5Gi default adds provisional headroom for it (issue #1757), unmeasured; the plain tier's 512Mi does not yet, pending a hosted measurement of a Go-heavy Codex run's peak usage.
 
@@ -170,7 +172,7 @@ What the gauges mean:
   fill. It is sampled by the `dind-meter` sidecar and reported by
   the worker on its own heartbeat. On eligible persistent hosted workers,
   fresh sustained byte or inode pressure also drives gated DinD maintenance;
-  this is separate from the legacy `/nix`+`/data` recycle. **DinD state,
+  this is separate from legacy pressure recycling (Docker: nix only; plain: nix/data). **DinD state,
   including named volumes, can be lost; the shared run directory `/data/runner` is on the data PVC and is kept on pod replacement.** See
   [Docker inside a worker](./worker-docker.md#dind-data-metering-and-automatic-pruning).
 - A dropped or malformed sample self-clears the gauge for that one tick (by
@@ -255,8 +257,13 @@ and switches are unchanged. Five mechanisms:
    later write is not added to this classification or retry. The separate
    executor-failure deferral below can also produce a counted park. The
    claim/resume and clone/fetch park shares the lifetime cap
-   (`UZI_RUN_DISK_PARK_MAX`, shared with the hard-stop park); past it, the
-   run fails with `fail_origin=data_volume_full`. See [Worker data volume
+   (`UZI_RUN_DISK_PARK_MAX`, shared with the hard-stop park). At the default,
+   three counted parks are timed; the next counted park holds for owner
+   Resume/Cancel with a NULL retry time (#3969). The hold preserves the count,
+   custody, worker/session affinity and other budgets. Resume queues one ordinary
+   attempt, subject to admission; another counted park reholds. `0` means
+   unlimited timed counted parks; preventive parks remain uncounted and timed.
+   See [Worker data volume
    full](run-recovery-wait.md#worker-data-volume-full) for exactly what an
    owner sees and how counted parks differ from preventive ones.
 
@@ -285,18 +292,50 @@ and switches are unchanged. Five mechanisms:
    Capture retries are bounded; a safely quiescent run can park with an
    unverified capture while retaining its original clone, HOME, session,
    journal and custody. That degraded recovery requires this worker and can
-   lose newer work on another worker. The cap bounds repetition, not
-   misclassification; an unlimited configured cap remains unlimited. See
+   lose newer work on another worker. The cap bounds automatic counted retries,
+   not misclassification; an unlimited configured cap remains unlimited. See
    [Worker data volume full](run-recovery-wait.md#worker-data-volume-full)
    for recovery limits and [ADR-1809](../adr/1809-per-run-cache-bounds.md#full-volume-terminal-failure-deferral-1829)
    for the policy boundary.
 
+The disk hold adds no capacity-based auto-resume, cleanup or reclaim authority.
+Existing stop/quiesce and safe rebuildable-cache drops bound the park's resource
+activity; the held run runs no executor capacity-polling loop. Open source
+custody stays protected, including when the forge has no output; archives remain
+exportable and expire independently. Worker-local unpublished work is not
+guaranteed to survive worker or storage loss, and parking promises no power-loss
+durability. Finish the serving-API rollout before relying on owner holds: older
+APIs retain generic promotion behavior. The distinct #3865/#3882 successor-refusal
+path, #3330 recovery budgets and #3329 genuine-idle reclaim/no busy-pressure policy
+remain unchanged. See [Worker data volume full](run-recovery-wait.md#worker-data-volume-full).
+
+**Go build scratch** (#3870). A Claude run's Go temporary build tree
+(`$WORK`) lives in a per-run, per-claim directory under the run HOME,
+`.uzi-go-work/g<N>`, set as `GOTMPDIR` for the lead CLI and the pre-plan
+dependency install (Bash commands and subagents inherit it). The general
+`TMPDIR` and `DOCKER_HOST` are unchanged, and the run HOME is not visible to
+Docker-in-Docker, so stage anything a container needs in the worktree or the
+shared `TMPDIR`. `go build -work` directories can be inspected while the run
+is live, but they may disappear at a process-ended park, at a re-claim (older
+generations) or at terminal cleanup. A park, the periodic reclaim or a
+re-claim removes it only once no process of the run (by HOME, cwd or that
+`GOTMPDIR`) is left; terminal cleanup removes it with the HOME. If the worker
+cannot create it, the run launches without `GOTMPDIR`. It is not capped and
+does not count toward cache bytes, only toward the run HOME's size. Old
+shared `go-build*` residue in `TMPDIR` is not collected. See the
+[ADR-1809 amendment](../adr/1809-per-run-cache-bounds.md#amendment-3870-park-only-go-scratch).
+
 **The [disk self-heal recycle](hosted-workers.md#disk-self-heal) (PRD #837)
-is still the last resort**, unchanged by any of the above: a hosted worker's
-volume that fills up anyway (sustained at or above the disk-pressure
-threshold) still gets drained and recycled, losing everything on `/data`.
-Everything in this section exists to make that outcome rare, not to replace
-it — none of these mechanisms touch `/nix` or trigger a recycle themselves.
+remains a last resort on plain hosted workers**, where sustained pressure can
+drain and recycle nix/data, losing everything on `/data`. After the fixed #3852
+controller deploys, hosted Docker workers keep their data PVC: explicit nix
+pressure permits nix-only recycle; other causes defer with
+`disk-recycle-skipped-docker-data`. A full Docker data volume therefore relies
+on the run's park-and-trim and supported manual cleanup until #3431 M1b and
+#3329's idle roll land. Use the inspect/discard procedures in
+[Run recovery](run-recovery.md#retained-sources-with-no-open-hold-worker-local-inspect-and-discard),
+or enlarge the PVC where the StorageClass allows it; do not delete the PVC or
+pod by hand to free space. These worker-local mechanisms do not recycle `/nix`.
 See [configuration.md](configuration.md#worker-disk-safety-prd-1809) for
 every tunable in this section and its default.
 
@@ -560,8 +599,9 @@ The one exception is on the Claude run lane: `Read` may open a file directly
 inside that run's own SDK tool-result spill directory (the "Output too large ...
 Full output saved to" file); Write, Edit, Glob, Grep and the other lanes keep the
 worktree-only rule (see [ADR 2332](../adr/2332-sdk-spill-read-allowance.md)).
-The read-only Plan cross-check Claude checker (for a Codex lead) is stricter:
-`Read`, `Grep` and `Glob` only, with one path guard that confines them to its
+The read-only Claude Plan and Code cross-checker (for a Codex lead) is stricter:
+`Read`, `Grep` and `Glob` only (plus the SDK's end-turn `StructuredOutput`
+tool, which carries only its final verdict and touches no files), with one path guard that confines them to its
 own checkout, apart from its own SDK spill files under its home. It also denies
 absolute, home-relative and `..` Glob/Grep patterns as defense in depth; the
 runner uid it runs as is the boundary, not that pattern check. See

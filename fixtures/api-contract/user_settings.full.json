@@ -20,6 +20,7 @@
   "judge_model": "x",
   "codex_judge_model": "x",
   "summary_model": "x",
+  "codex_summary_model": "x",
   "theme": "x",
   "mr_rework_enabled": true,
   "now_summary_enabled": true,
@@ -46,6 +47,16 @@
       "source": "x"
     }
   ],
+  "summary_models": [
+    {
+      "harness": "x",
+      "model": "x",
+      "default_model": "x",
+      "default_source": "x",
+      "resolved_model": "x",
+      "source": "x"
+    }
+  ],
   "effort_settings": [
     {
       "harness": "x",
@@ -54,10 +65,18 @@
       "default_source": "x",
       "resolved_effort": "x",
       "source": "x",
-      "mode": "x"
+      "mode": "x",
+      "catalog_default": {
+        "state": "x",
+        "effort": "x",
+        "model": "x",
+        "runtime_version": "x",
+        "observed_at": "2020-01-02T03:04:05Z"
+      }
     }
   ],
   "weekly_reserve_pct": 1,
   "weekly_reserve_pause_running": true,
-  "codex_account_mode": "x"
+  "codex_account_mode": "x",
+  "harness_overflow_enabled": true
 }

@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, renderHook } from "@testing-library/react";
+import { useLayoutEffect } from "react";
 import { usePollWhileVisible } from "./usePollWhileVisible";
 
 // jsdom reports document.hidden as false and never changes it; override the getter
@@ -77,6 +78,23 @@ describe("usePollWhileVisible", () => {
     // If the effect had keyed on cb, swapping it would have torn down and
     // recreated the interval — resetting the clock so nothing fires at 1000ms.
     // The ref stash keeps the original interval and invokes the newest cb.
+    expect(first).not.toHaveBeenCalled();
+    expect(second).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses the committed callback for a visibility event before passive effects flush", () => {
+    const first = vi.fn();
+    const second = vi.fn();
+    const { rerender } = renderHook(({ cb, visible }) => {
+      usePollWhileVisible(cb, 1000);
+      // Model an event arriving after commit but before passive effects update refs.
+      useLayoutEffect(() => {
+        if (visible) document.dispatchEvent(new Event("visibilitychange"));
+      }, [visible]);
+    }, { initialProps: { cb: first, visible: false } });
+
+    expect(first).not.toHaveBeenCalled();
+    rerender({ cb: second, visible: true });
     expect(first).not.toHaveBeenCalled();
     expect(second).toHaveBeenCalledTimes(1);
   });

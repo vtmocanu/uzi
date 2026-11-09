@@ -121,7 +121,8 @@ uzi worker set-token <worker-id> --default     # clear the binding
 A worker can choose its token per claim instead of being pinned to one. Set
 its picker to **Auto-select from the pool** (or `uzi worker set-token
 <worker-id> --auto`) and each claim spends whichever of your **pooled**
-tokens has the most rate-limit headroom.
+tokens resets its weekly allowance soonest (see [How it
+chooses](#how-it-chooses)).
 
 Your **first (or only) token starts in the pool automatically** — a
 single-token account gets auto-selection for free, nothing to opt in. That's
@@ -142,8 +143,8 @@ else, which is the whole reason it starts out.
 > capability](./scheduling.md#auto-provisioning-a-worker-for-an-unmet-capability),
 > a hosted worker you provision yourself, or one you join with a plain join
 > token — comes up set to **Auto-select from the pool** as long as you have
-> at least one pooled token, so a burst of new workers spreads across your
-> pool instead of leaning on one credential. If your pool is empty at worker
+> at least one pooled token, so you don't have to pick a credential for each
+> new worker. If your pool is empty at worker
 > creation, the worker starts in **Default** mode instead. This is a
 > creation-time choice, not a fallback for an **Auto-select** worker: an
 > existing auto-select worker whose pool becomes empty holds its run and
@@ -178,17 +179,37 @@ account](codex-credentials.md#letting-uzi-pick-the-account).
 ### How it chooses
 
 Headroom is whichever window is fuller: `min(100 − 5-hour %, 100 − 7-day %)`.
-The emptiest token wins. When two are within a few points of each other, the
-one that **replenishes soonest** wins — and it is the reset of the window
-that is actually holding it back, because a 5-hour reset does not relieve a
-7-day cap. Ties beyond that are broken deterministically, so the same inputs
-always give the same answer. A token whose plan has no 5-hour window is ranked
-on its 7-day headroom alone.
+A token whose plan has no 5-hour window is measured on its 7-day headroom alone.
 
-A small bias spreads work: each run already in flight on a token counts
-slightly against it, so several claims arriving inside one polling interval
-do not all pile onto the same credential. It is a nudge, not a cap — an empty
-token still wins with a couple of runs on it.
+By default (`UZI_AUTOSELECT_ORDER=reset_first`) uzi spends the allowance that
+expires soonest. Among the tokens that are measurable, not held back and have at
+least the minimum headroom (`UZI_AUTOSELECT_MIN_HEADROOM`), the one whose
+**7-day window resets soonest** wins. Allowance left on a token when its week
+rolls over is lost, so it is spent first. Ties on the reset are broken by
+headroom (with the in-flight nudge below), then deterministically, so the same
+inputs always give the same answer. A token with no known upcoming 7-day reset
+sorts after every token that has one. The 5-hour window still counts toward
+headroom and the floor, and its reset still decides when a limit-paused run
+resumes; it just no longer decides which token goes first.
+
+If every measured token is below the minimum headroom, uzi falls back to the
+previous ranking: the emptiest token wins, and tokens within a few points
+(`UZI_AUTOSELECT_HEADROOM_TIE_PCT`) of each other go to whichever replenishes
+soonest, the reset of the window that is actually holding it back. This
+fallback applies under either order.
+
+**Cost:** reset-first deliberately concentrates work on the soonest-expiring
+token until it falls under the floor, instead of spreading it. Each run
+already in flight on a token counts slightly against it
+(`UZI_AUTOSELECT_INFLIGHT_PENALTY`), but under reset-first, for picks above
+the floor, that only breaks exact reset ties. A burst of claims inside one polling interval, such as a
+sweep firing several issues, therefore lands on one token that may sit just
+above the floor, which can mean more mid-run usage-limit pauses and resumes. If
+you prefer to spread work, set `UZI_AUTOSELECT_ORDER=headroom_first`: the
+emptiest token wins, near-ties go to the soonest reset, and the in-flight
+nudge spreads simultaneous claims. See
+[Configuration](configuration.md#auto-selecting-an-anthropic-token-prd-111).
+The decision is recorded in [ADR-3844](../adr/3844-reset-first-pool-order.md).
 
 A credential that just paused a run on a usage limit is excluded from that
 run's next claim, so an `auto` worker doesn't immediately pick the token that
@@ -509,7 +530,8 @@ whether personal credentials use password protection. The same choice covers
   eligible foreground browser request can re-unlock with a live browser
   grant; otherwise unlock with your password or vault passphrase. Losing
   both that secret and remaining usable key material makes protected
-  contents unrecoverable; there is no recovery workflow.
+  contents unrecoverable; the only way back is an
+  [admin reset link](#forgotten-password-admin-reset-link), which deletes them.
 - **Off (unprotected)** still encrypts credentials at rest, using the server
   key like forge bot tokens. Theft of both the database and server key exposes
   them. There is no vault wrapper, unlock step or lock notice; runs and usage
@@ -517,7 +539,9 @@ whether personal credentials use password protection. The same choice covers
 
 To turn On, verify your login password. If you use SSO without a password,
 create and confirm a dedicated vault passphrase of **12–1024 UTF-8 bytes**;
-this is create-only, with no passphrase change or recovery flow. Linking SSO
+this is create-only, with no passphrase change or recovery flow (an
+administrator's [reset link](#forgotten-password-admin-reset-link) deletes the
+vault so you can create a new passphrase). Linking SSO
 to a password account retains its mode and password-based vault semantics.
 To turn Off, first unlock your protected vault; your administrator must allow
 optional protection. Login, seed startup and ordinary unlock do not turn
@@ -556,9 +580,62 @@ revokes sessions and grants but leaves an already cached vault key available
 to runs. Turning off automatic re-unlock revokes grants without locking an
 already unlocked vault. Password changes, turning protection Off, vault
 recreation and account deactivation also revoke grants. A usable browser grant
-or cached key can preserve access after a forgotten password, but this adds
-no password-reset or passphrase-recovery feature. See the
+or cached key can preserve access after a forgotten password, but that is not
+a recovery feature. See the
 [threat model](./vault-threat-model.md#browser-re-unlock) for cookie-theft risks.
+
+### Forgotten password: admin reset link
+
+If you forget your password, an administrator can issue you a one-time reset
+link (Admin → Users → **Reset link**; valid for 1 hour). Opening it and choosing
+a new password:
+
+- **Deletes** all your Anthropic, OpenAI and Codex credentials, your Codex
+  logins and the vault. They cannot be recovered; add them again afterwards.
+- Ends all your browser sessions. It does not log you in. CLI tokens and OAuth
+  grants are kept.
+- Leaves you **protected** with no vault; your next password login creates a
+  fresh one, even if you had turned protection Off.
+- Does not stop runs that are already executing; they keep the credential their
+  worker was issued until they end. Queued runs are not claimed until your new
+  vault exists and is unlocked. After that, a Claude or chat run created before
+  the reset that can no longer get a model credential does not fail: it pauses
+  and shows "waiting: credentials were reset" (`credentials_reset`). It resumes
+  on its own once you add a credential, and pauses again if that credential
+  disappears before the run is claimed. Resuming it by hand is refused until you
+  add one. Judge, job and cross-check runs are unchanged, and runs created after
+  the reset fail if there is no credential. A Codex run created before the reset
+  fails, because its Codex login was fixed when the run was created and the
+  reset deleted it (see [Codex credentials](codex-credentials.md)). Claude runs
+  that resolve to an auto-bound worker wait in the credential pool
+  (`pool_wait`) until a credential exists.
+
+**If you sign in only through SSO** (your account has no password), the link is
+a vault-only reset and asks for no password. Opening it ends your browser
+sessions, refuses your approved CLI login requests and deletes the same
+credentials, Codex logins and vault as above. It leaves you protected with no
+vault and does not log you in. Sign in through SSO; uzi's banner then asks you
+to set a new vault passphrase (12–1024 UTF-8 bytes), after which you add your
+credentials again. An account linked to both SSO and a password gets the normal
+password link instead.
+
+A vault-only link does not prove who holds it: whoever has it can delete your
+credentials, Codex logins and vault and end your sessions, but it grants no
+access to the account.
+
+For a `password` link on an SSO-only instance (password login disabled) the web
+app offers no way to create the fresh vault: it is created at your first
+password sign-in once an administrator turns password sign-in on, or through
+`POST /api/vault/enable` with the new password from your SSO session. Until
+then you can sign in through SSO but cannot store model credentials.
+
+The seed admin cannot be reset with a link, and an admin cannot issue one for
+their own account. An admin can take over any other active account that has a
+password, other admins included, by issuing a password link and redeeming it
+with a password they choose; see the [threat model](./vault-threat-model.md#admin-issued-account-reset).
+If the page reports that the reset could not be confirmed, try signing in with
+the new password (password link) or through SSO (vault-only link), or ask for a
+new link.
 
 ### Enrollment and conversion
 

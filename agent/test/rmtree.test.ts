@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
@@ -15,7 +15,10 @@ import {
   rmHomeTree,
   rmTreeForce,
   restoreTreeWritability,
+  helperUidKillerFor,
+  runAgentHelper,
 } from "../src/rmtree.js";
+import { commandRootCommand, killCommandRootPid, killRunnerGroup, runnerCommand } from "../src/runner-uid.js";
 
 /**
  * PRD #108 M6. `fs.rm(recursive, force)` cannot delete a tree the Go module cache
@@ -542,6 +545,89 @@ describe("rmHomeSubtree (PRD #1809)", () => {
     }
   });
 
+  describe("park scratch leaf .uzi-go-work/g<N>", () => {
+    it("removes one leaf with a nested 0700 go-build-like tree, keeping siblings, other leaves and caches", async (t) => {
+      if (noProcFd) return t.skip(NO_PROC_FD);
+      const home = await mktmp();
+      try {
+        await seedHome(home);
+        const nested = path.join(home, ".uzi-go-work", "g3", "go-build123", "b001");
+        await fs.mkdir(nested, { recursive: true });
+        await fs.writeFile(path.join(nested, "a.o"), "o\n");
+        await fs.chmod(nested, 0o700);
+        await fs.mkdir(path.join(home, ".uzi-go-work", "g4"), { recursive: true });
+        await fs.writeFile(path.join(home, ".uzi-go-work", "g4", "file"), "keep\n");
+        assert.strictEqual(await rmHomeSubtree(home, ".uzi-go-work/g3"), "removed");
+        assert.strictEqual(await exists(path.join(home, ".uzi-go-work", "g3")), false);
+        assert.ok(await exists(path.join(home, ".uzi-go-work", "g4", "file")), "another generation stays");
+        assert.ok(await exists(path.join(home, ".cache", "go-build", "0a", "obj")), "caches stay");
+        await assertSiblingsKept(home);
+        assert.strictEqual(await rmHomeSubtree(home, ".uzi-go-work/g3"), "absent");
+      } finally {
+        await forceCleanup(home);
+      }
+    });
+
+    it("refuses every other spelling before any pass runs", async () => {
+      const home = await mktmp();
+      try {
+        const calls: string[] = [];
+        const passes = [recording(calls, "pass")];
+        for (const rel of [
+          ".uzi-go-work",
+          ".uzi-go-work/g0",
+          ".uzi-go-work/g01",
+          ".uzi-go-work/g1/x",
+          ".uzi-go-work/../x",
+          ".uzi-go-work/-g1",
+          ".uzi-go-workX/g1",
+          ".uzi-go-work/g1/",
+          ".uzi-go-work/g12345678901234567",
+          ".uzi-go-work/g9007199254740993",
+        ]) {
+          await assert.rejects(rmHomeSubtree(home, rel, { wrappers: passes }), /not a listed cache subtree/, rel);
+        }
+        assert.deepStrictEqual(calls, []);
+      } finally {
+        await forceCleanup(home);
+      }
+    });
+
+    it("refuses a symlink leaf and never touches its target", async (t) => {
+      if (noProcFd) return t.skip(NO_PROC_FD);
+      const home = await mktmp();
+      const outside = await mktmp();
+      try {
+        await fs.writeFile(path.join(outside, "precious"), "keep\n");
+        await fs.mkdir(path.join(home, ".uzi-go-work"));
+        await fs.symlink(outside, path.join(home, ".uzi-go-work", "g3"), "dir");
+        await assert.rejects(rmHomeSubtree(home, ".uzi-go-work/g3"), { code: "ELOOP", message: /refusing/ });
+        assert.ok(await exists(path.join(outside, "precious")));
+      } finally {
+        await forceCleanup(home);
+        await forceCleanup(outside);
+      }
+    });
+
+    it("a delayed helper for g3 cannot touch a g4 created after it pinned g3", async (t) => {
+      if (noProcFd) return t.skip(NO_PROC_FD);
+      const home = await mktmp();
+      try {
+        await fs.mkdir(path.join(home, ".uzi-go-work", "g3", "go-build1"), { recursive: true });
+        await fs.writeFile(path.join(home, ".uzi-go-work", "g3", "go-build1", "x"), "x\n");
+        const out = await removeWithSwap(home, ".uzi-go-work/g3", async () => {
+          await fs.mkdir(path.join(home, ".uzi-go-work", "g4"));
+          await fs.writeFile(path.join(home, ".uzi-go-work", "g4", "file"), "keep\n");
+        });
+        assert.deepStrictEqual(out, { v: "removed" });
+        assert.strictEqual(await exists(path.join(home, ".uzi-go-work", "g3")), false);
+        assert.ok(await exists(path.join(home, ".uzi-go-work", "g4", "file")), "the newer generation is intact");
+      } finally {
+        await forceCleanup(home);
+      }
+    });
+  });
+
   /**
    * B1 (TOCTOU). A live `runner`/`runner-cmd` process, e.g. another run's, can rename a
    * component of the chain and plant a symlink AFTER the walk verified it. The script's
@@ -817,5 +903,66 @@ describe("measureRunHome (PRD #1809 D8)", () => {
       await fs.rm(link, { force: true });
       await forceCleanup(home);
     }
+  });
+});
+
+describe("runAgentHelper joinOnTimeout (issue #3980)", () => {
+  /** A helper whose shell leaves a background `sleep` holding the stdout pipe, so the helper's own
+   *  `close` event only fires once that process is gone; the pid is written for the test to end it. */
+  async function withOrphan(run: (wrap: () => { command: string; args: string[] }, pidFile: string, endOrphan: () => void) => Promise<void>): Promise<void> {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "uzi-join-helper-"));
+    const pidFile = path.join(dir, "pid");
+    const endOrphan = (): void => {
+      try { process.kill(Number(readFileSync(pidFile, "utf8")), "SIGKILL"); } catch { /* gone */ }
+    };
+    try {
+      await run(() => ({ command: "/bin/sh", args: ["-c", `sleep 20 & echo $! > '${pidFile}'; wait`] }), pidFile, endOrphan);
+    } finally { endOrphan(); await fs.rm(dir, { recursive: true, force: true }); }
+  }
+  const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+  it("by default a timeout rejects at once, before the helper has closed", async () => {
+    await withOrphan(async (wrap, _pid, endOrphan) => {
+      const started = Date.now();
+      await assert.rejects(runAgentHelper(wrap, "void 0", [], 200), /timed out/);
+      assert.ok(Date.now() - started < 1500, "rejected without waiting for the orphan that holds the pipe");
+      endOrphan();
+    });
+  });
+
+  it("with joinOnTimeout the timeout is recorded, the helper is SIGKILLed, and the promise settles only after close", async () => {
+    await withOrphan(async (wrap, _pid, endOrphan) => {
+      const settled: { v: Error | "pending" | "resolved" } = { v: "pending" };
+      const pending = runAgentHelper(wrap, "void 0", [], 200, "", { joinOnTimeout: true })
+        .then(() => { settled.v = "resolved"; }, (error: Error) => { settled.v = error; });
+      await sleep(700);
+      assert.strictEqual(settled.v, "pending", "the helper has not closed (the orphan holds its stdout), so nothing settled");
+      endOrphan();
+      await pending;
+      const outcome: unknown = settled.v;
+      assert.ok(outcome instanceof Error && /timed out/.test(outcome.message), String(outcome));
+    });
+  });
+
+  it("with joinOnTimeout a spawn error also settles through close", async () => {
+    await assert.rejects(
+      runAgentHelper(() => ({ command: "/nonexistent/uzi-helper-binary", args: [] }), "void 0", [], 5000, "", { joinOnTimeout: true }),
+      /could not run|ENOENT/,
+    );
+  });
+
+  it("with joinOnTimeout a helper that finishes in time resolves normally", async () => {
+    const ok = await runAgentHelper((command, args) => ({ command, args: [...args] }), "process.stdout.write('hi')", [], 10_000, "", { joinOnTimeout: true });
+    assert.deepStrictEqual(ok, { code: 0, stdout: "hi" });
+  });
+});
+
+describe("helperUidKillerFor (issue #4089)", () => {
+  it("selects the same-uid kill by wrapper identity, only under the uid split", () => {
+    assert.strictEqual(helperUidKillerFor(runnerCommand, true), killRunnerGroup);
+    assert.strictEqual(helperUidKillerFor(commandRootCommand, true), killCommandRootPid);
+    assert.strictEqual(helperUidKillerFor(runnerCommand, false), undefined);
+    assert.strictEqual(helperUidKillerFor(commandRootCommand, false), undefined);
+    assert.strictEqual(helperUidKillerFor((command, args) => ({ command, args: [...args] }), true), undefined);
   });
 });

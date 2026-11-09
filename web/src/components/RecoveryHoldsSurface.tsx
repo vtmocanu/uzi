@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Link, useSearchParams } from "react-router-dom";
 
 import { api, type RecoveryCustodyHold, type RecoveryCustodyHolds } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
@@ -46,6 +46,24 @@ export function RecoveryHoldsSurface() {
   }, [load]);
   usePollWhileVisible(load, 10000);
 
+  // Holds a deep link asks for (?hold=<id>, repeatable), e.g. the "Resolve hold" link in a
+  // refused worker delete. The id set is keyed as a string so the focus effect fires once
+  // per requested set and not on every poll.
+  const [searchParams] = useSearchParams();
+  const requestedKey = searchParams.getAll("hold").join("\n");
+  const requestedIds = useMemo(() => (requestedKey ? requestedKey.split("\n") : []), [requestedKey]);
+  const focusedKey = useRef("");
+  useEffect(() => {
+    if (!holds || requestedIds.length === 0 || focusedKey.current === requestedKey) return;
+    const el = requestedIds
+      .map((id) => document.getElementById(`recovery-hold-${id}`))
+      .find((e): e is HTMLElement => e !== null);
+    if (!el) return;
+    focusedKey.current = requestedKey;
+    el.focus();
+    el.scrollIntoView?.({ block: "center" });
+  }, [holds, requestedIds, requestedKey]);
+
   if (!holds) return null;
   // Show owner decisions and exact MAC-rejected holds independently of attention.
   // The diagnostic changes visibility only; classification, actions and counts stay intact.
@@ -54,8 +72,24 @@ export function RecoveryHoldsSurface() {
   // them so the panel explains the "at the limit" alert instead of hiding.
   const info = admissionInfoHolds(holds);
   const hasInfo = info.counted.length > 0 || info.unreported.length > 0;
-  if (visibleHolds.length === 0 && !hasInfo) return null;
+  if (visibleHolds.length === 0 && !hasInfo && requestedIds.length === 0) return null;
   const groups = groupHoldsByWorker(visibleHolds);
+  // Requested holds are looked up in the UNFILTERED open listing: a healthy active hold the
+  // decision filter hides is still reachable by deep link. One already rendered above is
+  // not rendered twice (ids must stay unique); the focus effect finds it there.
+  const renderedIds = new Set<string>([
+    ...visibleHolds.map((h) => h.id),
+    ...info.counted.map((h) => h.id),
+    ...info.unreported.map((h) => h.id),
+  ]);
+  const openById = new Map(holds.holds.filter((h) => h.state === "open").map((h) => [h.id, h]));
+  const requestedExtra: RecoveryCustodyHold[] = [];
+  const requestedMissing: string[] = [];
+  for (const id of new Set(requestedIds)) {
+    const h = openById.get(id);
+    if (!h) requestedMissing.push(id);
+    else if (!renderedIds.has(id)) requestedExtra.push(h);
+  }
   // Open holds per run, counted over the FULL listing (not just the decision rows): the
   // retained checkpoint ref follows custody, so discarding a run's last open hold also deletes
   // that ref on the forge (PRD #1810). A healthy sibling hold filtered out above still counts.
@@ -130,6 +164,29 @@ export function RecoveryHoldsSurface() {
         ))}
       </div>
 
+      {(requestedExtra.length > 0 || requestedMissing.length > 0) && (
+        <section aria-label="Requested holds" className="space-y-2">
+          <h3 className="text-sm font-medium text-fg">Requested holds</h3>
+          {requestedMissing.map((id) => (
+            <p key={id} className="text-sm text-muted">
+              This hold is no longer open. <span className="font-mono text-xs text-faint">hold {shortId(stripUnsafeChars(id))}</span>
+            </p>
+          ))}
+          {requestedExtra.length > 0 && (
+            <ul className="space-y-2">
+              {requestedExtra.map((hold) => (
+                <HoldRow
+                  key={hold.id}
+                  hold={hold}
+                  isLastOpenHold={openHoldsByRun.get(hold.run_id) === 1}
+                  onChanged={load}
+                />
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
+
       {hasInfo && (
         <section aria-label="Admission information" className="space-y-3">
           <h3 className="text-sm font-medium text-fg">Admission information</h3>
@@ -185,7 +242,7 @@ function InfoSection({
 // decision: no discard, export or confirmation UI, only a link to the run for context.
 function InfoHoldRow({ hold, showReason }: { hold: RecoveryCustodyHold; showReason: boolean }) {
   return (
-    <li className="rounded-lg border border-edge bg-raised/40 p-3">
+    <li id={`recovery-hold-${hold.id}`} tabIndex={-1} className="scroll-mt-20 rounded-lg border border-edge bg-raised/40 p-3 outline-hidden focus:ring-2 focus:ring-ring">
       <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-2">
         <div className="min-w-0 space-y-1">
           <div className="flex flex-wrap items-center gap-1.5">
@@ -294,7 +351,7 @@ function HoldRow({
   const canDiscard = typed.trim().toLowerCase() === "discard";
 
   return (
-    <li className="rounded-lg border border-edge bg-raised/40 p-3">
+    <li id={`recovery-hold-${hold.id}`} tabIndex={-1} className="scroll-mt-20 rounded-lg border border-edge bg-raised/40 p-3 outline-hidden focus:ring-2 focus:ring-ring">
       <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-2">
         <div className="min-w-0 space-y-1">
           <div className="flex flex-wrap items-center gap-1.5">
@@ -377,7 +434,7 @@ function HoldRow({
             <span className="font-mono">{holdShort}</span>).{" "}
             {hold.has_available_capture ? (
               <>
-                An earlier available archive can restore older work but may not cover the latest
+                An earlier available archive requires its prerequisite commits to restore older work and may not cover the latest
                 worker-local work. The latest worker-local source may be the only copy.
               </>
             ) : (

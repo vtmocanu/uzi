@@ -13,6 +13,33 @@ import (
 
 const recoveryCauseRetainedRecoveryExhausted = "retained_recovery_exhausted"
 const recoveryCauseRetainedRecoveryAdoptionFailed = "retained_recovery_adoption_failed"
+const recoveryCauseRetainedContinuationUnwitnessed = "retained_continuation_unwitnessed"
+
+// RetainedCapacityHoldFeature is the register feature token an api advertises once it accepts
+// StateRequest.RetainedCapacityOnly (issue #4046). A worker sends the marker only after seeing it.
+const RetainedCapacityHoldFeature = "retained_recovery_capacity_hold_v1"
+
+// validateRetainedCapacityOnly refuses a retained_capacity_only marker unless it rides a
+// recovery_wait park with cause retained_recovery_exhausted, a positive claim_generation
+// and the value true. It runs before any SQL or registration-evidence write.
+func validateRetainedCapacityOnly(req StateRequest) error {
+	if req.RetainedCapacityOnly == nil {
+		return nil
+	}
+	if !*req.RetainedCapacityOnly {
+		return fmt.Errorf("%w: retained_capacity_only must be true when present", ErrInvalidState)
+	}
+	if req.State != "recovery_wait" {
+		return fmt.Errorf("%w: retained_capacity_only requires state recovery_wait", ErrInvalidState)
+	}
+	if req.RecoveryCause == nil || *req.RecoveryCause != recoveryCauseRetainedRecoveryExhausted {
+		return fmt.Errorf("%w: retained_capacity_only requires recovery_cause %q", ErrInvalidState, recoveryCauseRetainedRecoveryExhausted)
+	}
+	if req.ClaimGeneration == nil || *req.ClaimGeneration <= 0 {
+		return fmt.Errorf("%w: retained_capacity_only requires positive claim_generation", ErrInvalidState)
+	}
+	return nil
+}
 
 // claimRecoveryEpisode projects harness recovery restarts without changing the stored
 // worker-death allowance or its finalize/requeue predicates.
@@ -54,7 +81,10 @@ func (s *Service) parkRetainedRecovery(ctx context.Context, wkr store.Worker, ow
 	default:
 		return run, 0, nil
 	}
-	counted := *req.RecoveryCause == recoveryCauseRetainedRecoveryExhausted && int64(run.RetainedParkCount) < int64(s.p.RunRetainedRecoveryMaxParks)
+	// A validated capacity-only marker takes the at-cap branch: no counter increment and
+	// a NULL retry, an owner-held recovery_wait (issue #4046).
+	counted := *req.RecoveryCause == recoveryCauseRetainedRecoveryExhausted && req.RetainedCapacityOnly == nil &&
+		int64(run.RetainedParkCount) < int64(s.p.RunRetainedRecoveryMaxParks)
 	retry := pgtype.Timestamptz{}
 	if counted {
 		retry = pgconv.Time(s.now().Add(s.recoveryParkFallbackFor(run.RetainedParkCount) + recoveryParkJitter()))

@@ -40,7 +40,7 @@ func TestRunGetCodexAliasRowNamesTheReason(t *testing.T) {
 		id     *string
 		want   string
 	}{
-		{"auto", sptr("auto"), &id, "CODEX_ALIAS work-login — auto (most limit headroom)"},
+		{"auto", sptr("auto"), &id, "CODEX_ALIAS work-login — auto (picked from pool)"},
 		{"default", sptr("default"), &id, "CODEX_ALIAS work-login — default"},
 		{"deleted alias keeps the reason", sptr("pool_exhausted"), nil, "CODEX_ALIAS work-login (deleted) — auto (every login at capacity; soonest to release)"},
 		{"NULL reason is not recorded", nil, &id, "CODEX_ALIAS work-login — not recorded"},

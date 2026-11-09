@@ -8,11 +8,13 @@ import assert from "node:assert/strict";
 import { StubExecutor, type Executor, type ExecutorResult, type RunContext } from "../src/executor.js";
 import { FORGE_RETRY_SCHEDULE } from "../src/forge-retry.js";
 import { Outbox, type RawWriteSeam } from "../src/outbox.js";
-import { RunRunner } from "../src/runner.js";
+import { RunRunner, StaleClaimError } from "../src/runner.js";
+import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import type { Logger } from "../src/log.js";
 import type { StateAck, StateRequest } from "../src/protocol.js";
 import { PUBLICATION_RESUME_UNAVAILABLE } from "../src/publication-intent.js";
-import { WorkerClient } from "../src/client.js";
+import { RequestError, WorkerClient } from "../src/client.js";
+import { PauseNowSignal } from "../src/steering.js";
 import { RecoveryCoordinator } from "../src/recovery.js";
 import { FakeRecoveryClient } from "./codex-reap-fixture.js";
 import { api, baseUrl, client, fakeGitHub, fakeGitlab, fx, git, gitlabClaim, installHarness, TOKEN } from "./runner-harness.js";
@@ -184,26 +186,92 @@ it("a known not-enrolled outcome (local ENOSPC) still publishes ordinarily and s
   assert.ok(text.some(t => t.startsWith(`${PUBLICATION_RESUME_UNAVAILABLE}: enospc`) && t.includes("without the resume guarantee")), text.join(" | "));
 });
 
-it("an unknown enrollment outcome (lost ACK) makes no fetch, push or MR, keeps the record and does not fail the run", async () => {
-  client.protocolFeatures = FEATURES;
-  const outbox = await mkOutbox();
-  const events: string[] = [];
-  api.publicationIntentWire = () => "drop";
-  observeRemote(events);
-  const forge = fakeGitlab({ intercept: (req) => { events.push(`forge:${req.method}`); return undefined; } });
-  const claim = claimFor(5104);
-  const r = build(new StubExecutor(nullLogger()), { gitlab: forge.gitlab }, outbox);
-  await r.execute(claim);
-
-  assert.equal(api.publicationIntentRequests.length, 3, "bounded idempotent retries only");
-  assert.deepEqual(events, [], "no remote step ran on an unknown outcome");
-  assert.equal(forge.all.length, 0);
-  const loaded = await outbox.loadPublicationRecord(claim.run_id, GEN);
-  assert.equal(loaded.kind, "ok", "the local record is retained");
-  assert.equal(failed(claim.run_id).length, 0, "no false failure");
-  assert.equal(states(claim.run_id).filter(b => b.status === "completed").length, 0);
-  assert.equal(parks(claim.run_id).length, 0, "no guessed park either");
-});
+for (const storedBeforeDrop of [false, true]) {
+  it(`unknown enrollment stays in the live execute and completes after readoption (stored before drop: ${storedBeforeDrop})`, async () => {
+    client.protocolFeatures = [...FEATURES, "terminal_fence"];
+    const outbox = await mkOutbox();
+    const events: string[] = [];
+    const claim = claimFor(5104);
+    const registry = new ActiveRunRegistry();
+    const rec = recordingLogger();
+    let recover = false;
+    let stored: Record<string, unknown> | undefined;
+    let third!: () => void;
+    const initialExhausted = new Promise<void>(resolve => { third = resolve; });
+    let observedQueued!: () => void;
+    const queuedProbe = new Promise<void>(resolve => { observedQueued = resolve; });
+    api.publicationIntentWire = req => {
+      const n = api.publicationIntentRequests.length;
+      if (n <= 3) {
+        if (storedBeforeDrop) stored ??= req.body;
+        if (n === 3) third();
+        return "drop";
+      }
+      assert.equal(recover, true);
+      stored ??= req.body;
+      assert.deepEqual(req.body, stored, "idempotent retry keeps the original durable JSON");
+      return { status: 200, body: { enrollment_seq: 7, candidate_seq: 1, state: "active" } };
+    };
+    api.ownershipWire.set(claim.run_id, res => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ status: recover ? "running" : "queued", claim_generation: GEN, claim_released: false }));
+      if (!recover) observedQueued();
+    });
+    observeRemote(events);
+    const forge = fakeGitlab({ intercept: req => { events.push(`forge:${req.method}`); return undefined; } });
+    let executions = 0;
+    const stub = new StubExecutor(nullLogger());
+    const executor: Executor = { run: async ctx => { executions++; return stub.run(ctx); } };
+    const r = build(executor, { gitlab: forge.gitlab }, outbox, rec.log, { activeRuns: registry });
+    let settled = false;
+    const execution = r.execute(claim).finally(() => { settled = true; });
+    let interim!: {
+      pending: boolean; registered: boolean; generation: boolean; requests: number; events: number;
+      forge: number; record: string; failed: number; parks: number; completed: number;
+    };
+    try {
+      // Baseline settles; the repair observes queued ownership. Neither waits for the new log.
+      await initialExhausted;
+      await Promise.race([queuedProbe, execution]);
+      interim = {
+        pending: !settled, registered: registry.has(claim.run_id),
+        generation: registry.build().active.some(e => e.run_id === claim.run_id && e.claim_generation === GEN),
+        requests: api.publicationIntentRequests.length, events: events.length, forge: forge.all.length,
+        record: (await outbox.loadPublicationRecord(claim.run_id, GEN)).kind,
+        failed: failed(claim.run_id).length, parks: parks(claim.run_id).length,
+        completed: states(claim.run_id).filter(b => b.status === "completed").length,
+      };
+    } finally {
+      recover = true;
+      await execution;
+    }
+    assert.equal(states(claim.run_id).filter(b => b.status === "completed").length, 1,
+      "positive same-flight completion after ownership readoption");
+    assert.deepEqual(interim, {
+      pending: true, registered: true, generation: true, requests: 3, events: 0,
+      forge: 0, record: "ok", failed: 0, parks: 0, completed: 0,
+    }, "the original flight and durable intent remain pending without remote finalize");
+    assert.equal(executions, 1, "reconciliation never reexecutes the model");
+    assert.equal(api.publicationIntentRequests.length, 4);
+    assert.equal(forge.calls.filter(c => c.method === "POST").length, 1, "one logical MR");
+    const completed = states(claim.run_id).filter(b => b.status === "completed");
+    const messages = api.messages(claim.run_id);
+    assert.deepEqual(messages.map(m => m.seq), Array.from({ length: messages.length }, (_, i) => i + claim.last_seq + 1));
+    assert.equal(completed[0]?.messages_through_seq, messages.at(-1)?.seq, "terminal fences every emitted message");
+    const bodies = api.publicationIntentRequests.map(q => q.body);
+    for (const body of bodies) assert.deepEqual(body, bodies[0], "identical initial and recovery POSTs");
+    assert.equal(states(claim.run_id).filter(b => b.status === "completed").length, 1);
+    assert.equal(failed(claim.run_id).length, 0);
+    assert.equal(parks(claim.run_id).length, 0);
+    assert.equal(outbox.hasPublicationRecords(claim.run_id), false);
+    assert.ok(events.includes("pushBranch"));
+    const waits = rec.lines.filter(l => l.msg === "publication intent reconciliation waiting");
+    assert.deepEqual(waits.map(l => l.fields), [
+      { run_id: claim.run_id, claim_generation: GEN, reason: "ack_unknown" },
+      { run_id: claim.run_id, claim_generation: GEN, reason: "readoption_pending" },
+    ]);
+  });
+}
 
 // ── D2 transformed candidates ────────────────────────────────────────────────────────────────────────
 
@@ -378,6 +446,39 @@ it("a non-enrolled run keeps the existing typed failure for the same outage", as
   const claim = claimFor(5110);
   const r = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, await mkOutbox());
   await r.execute(claim);
+  assert.equal(parks(claim.run_id).length, 0);
+  assert.match(String(failed(claim.run_id)[0]?.failure_reason), /publication_forge_unreachable: push/);
+});
+
+// #3929: GitHub's bare ` ! [remote rejected] <sha> -> <branch> (failed)` is classified transient (cause unproven).
+const BARE_FAILED_STDERR =
+  "To https://github.com/org/repo.git\n ! [remote rejected] 0123456789abcdef0123456789abcdef01234567 -> agent/issue-5113 (failed)\n" +
+  "error: failed to push some refs to 'https://github.com/org/repo.git'\n";
+
+it("a sustained bare remote-rejected (failed) push on an enrolled run parks on the git surface", async () => {
+  client.protocolFeatures = FEATURES;
+  const outbox = await mkOutbox();
+  ackIntents([]);
+  let pushes = 0;
+  failGit("push", BARE_FAILED_STDERR, () => { pushes++; });
+  const claim = claimFor(5113);
+  const r = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, outbox);
+  await r.execute(claim);
+  assert.equal(pushes, ATTEMPTS);
+  const park = parks(claim.run_id);
+  assert.equal(park.length, 1);
+  assert.deepEqual([park[0]!.recovery_phase, park[0]!.publication_surface, park[0]!.publication_step], ["publication", "git", "push"]);
+  assert.equal(failed(claim.run_id).length, 0);
+});
+
+it("a sustained bare remote-rejected (failed) push on a non-enrolled run fails typed publication_forge_unreachable: push", async () => {
+  client.protocolFeatures = ["recovery_park_cause"];
+  let pushes = 0;
+  failGit("push", BARE_FAILED_STDERR, () => { pushes++; });
+  const claim = claimFor(5114);
+  const r = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, await mkOutbox());
+  await r.execute(claim);
+  assert.equal(pushes, ATTEMPTS);
   assert.equal(parks(claim.run_id).length, 0);
   assert.match(String(failed(claim.run_id)[0]?.failure_reason), /publication_forge_unreachable: push/);
 });
@@ -873,10 +974,20 @@ it("an adopted never-ACKed record (its ACK was lost) is posted as held, then adv
   const lax = (await outbox.loadPublicationRecord(claim.run_id, GEN));
   assert.equal(lax.kind, "ok");
   const { stored } = statefulIntentApi(lax.kind === "ok" ? ({ ...lax.record, enrollment_seq: undefined, candidate_seq: undefined, owner_kind: undefined } as unknown as WireIntent["intent"]) : undefined);
-  const flight = enrollFlight(claim.run_id);
-  const r = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, outbox);
+  const flight = reconciliationFlight(claim.run_id);
+  let ready = 0;
+  const r = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, outbox, nullLogger(), {
+    afterPublicationEnrolled: async () => {
+      ready++;
+      assert.equal(flight.publicationRecord?.candidate_seq, 2, "callback follows the strict advance");
+      assert.equal(flight.publicationRecord?.mr.title, "strict title");
+      const durable = await outbox.loadPublicationRecord(claim.run_id, GEN);
+      assert.equal(durable.kind === "ok" ? durable.record.candidate_seq : undefined, 2);
+    },
+  });
   const result = await (r as unknown as EnrollSeam).enrollPublication(claim, flight, intentInput(true, "agent/issue-5140"));
   assert.equal(result, "proceed");
+  assert.equal(ready, 1);
   const sent = api.publicationIntentRequests.map(q => q.body as unknown as WireIntent);
   assert.equal(sent.length, 2, "the held enrollment, then one advance");
   assert.deepEqual([sent[0]!.intent.mr.title, sent[0]!.candidate_seq], ["lax title", undefined], "the held content is posted unchanged");
@@ -938,3 +1049,242 @@ it("an abort during a transformed-candidate advance is rethrown: no unresolved h
   const after = await outbox.loadPublicationRecord(claim.run_id, GEN);
   assert.equal(after.kind, "ok", "the local record is kept");
 });
+
+// Focused orchestration controls keep the real durable store and HTTP enrollment seam.
+function reconciliationFlight(runId: string) {
+  const cancel = new AbortController();
+  const lifecycle = new AbortController();
+  const control = { cancelled: false, fence: undefined as undefined | string };
+  return {
+    ...enrollFlight(runId), cancel, active: { shuttingDown: false }, control,
+    steering: {
+      isCancelled: () => control.cancelled, claimFence: () => control.fence,
+      lifecycleSignal: () => lifecycle.signal, terminalLifecycleSignal: () => lifecycle.signal,
+    },
+  };
+}
+
+for (const exit of ["404", "generation", "released", "terminal", "cancel", "shutdown", "boundary", "flight"] as const) {
+  it(`enrollment reconciliation stops safely on ${exit} after unknown probes without resending`, async () => {
+    client.protocolFeatures = FEATURES;
+    const outbox = await mkOutbox();
+    const claim = claimFor(5150);
+    const flight = reconciliationFlight(claim.run_id);
+    // A consumed pause must neither suppress cancellation nor create a probe storm.
+    flight.cancel.abort(new PauseNowSignal());
+    const boundary = new AbortController();
+    const original = new Error("original finalize boundary abort");
+    api.publicationIntentWire = () => "drop";
+    const r = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, outbox);
+    let probes = 0;
+    const started = Date.now();
+    const seam = r as unknown as { getObservedRunOwnership: () => Promise<unknown> };
+    seam.getObservedRunOwnership = async () => {
+      probes++;
+      if (probes === 1) throw new Error("transport failed");
+      if (probes === 2) return { status: "running" }; // missing positive G/release evidence
+      if (exit === "404") throw new RequestError("GET", "/ownership", 404, "");
+      if (exit === "cancel") flight.control.cancelled = true;
+      if (exit === "shutdown") flight.active.shuttingDown = true;
+      if (exit === "boundary") boundary.abort(original);
+      if (exit === "flight") {
+        // Replace the consumed-pause controller with an actual flight abort.
+        flight.cancel = new AbortController();
+        flight.cancel.abort(original);
+      }
+      return { status: exit === "terminal" ? "completed" : "running",
+        claim_generation: exit === "generation" ? GEN + 1 : GEN, claim_released: exit === "released" };
+    };
+    const action = (r as unknown as EnrollSeam).enrollPublication(claim, flight, intentInput(false, "agent/issue-5150"), boundary.signal);
+    await assert.rejects(action, error => {
+      if (exit === "boundary" || exit === "flight") assert.equal(error, original);
+      if (["404", "generation", "released", "terminal"].includes(exit)) assert.ok(error instanceof StaleClaimError);
+      return true;
+    });
+    assert.equal(flight.completionHoldOutcome, "none", "typed interruption still reaches dispatch");
+    assert.equal(probes, 3);
+    assert.ok(Date.now() - started >= 15, "all three probes pay the configured backoff despite sticky pause");
+    assert.equal(api.publicationIntentRequests.length, 3, "failed and incomplete probes grant no resend");
+    assert.equal(outbox.hasPublicationRecords(claim.run_id), true);
+  });
+}
+
+for (const status of [400, 401, 403, 404, 405, 409, 410, 422]) {
+  it(`permanent ownership HTTP ${status} stops enrollment reconciliation without a resend`, async () => {
+    client.protocolFeatures = FEATURES;
+    const outbox = await mkOutbox();
+    const claim = claimFor(5154), flight = reconciliationFlight(claim.run_id);
+    api.publicationIntentWire = () => "drop";
+    const runner = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, outbox);
+    let probes = 0;
+    (runner as unknown as { getObservedRunOwnership: () => Promise<unknown> }).getObservedRunOwnership = async () => {
+      // A second 404 bounds the unfixed path so red is an assertion, not a timeout.
+      throw new RequestError("GET", "/ownership", ++probes === 1 ? status : 404, "");
+    };
+    await assert.rejects((runner as unknown as EnrollSeam).enrollPublication(claim, flight,
+      intentInput(false, "agent/issue-5154")), StaleClaimError);
+    assert.equal(probes, 1, "a permanent ownership refusal must end the original flight");
+    assert.equal(api.publicationIntentRequests.length, 3, "no enrollment resend without ownership");
+    assert.equal(flight.completionHoldOutcome, "none", "existing stale-claim dispatch remains reachable");
+    assert.equal(outbox.hasPublicationRecords(claim.run_id), true, "uncertain intent remains protected");
+  });
+}
+
+for (const status of [408, 429, 500, 503]) {
+  it(`retryable ownership HTTP ${status} waits for fresh proof before resending enrollment`, async () => {
+    client.protocolFeatures = FEATURES;
+    const outbox = await mkOutbox();
+    const claim = claimFor(5155), flight = reconciliationFlight(claim.run_id);
+    api.publicationIntentWire = () => api.publicationIntentRequests.length <= 3 ? "drop"
+      : { status: 200, body: { enrollment_seq: 1, candidate_seq: 1, state: "active" } };
+    const runner = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, outbox);
+    let probes = 0;
+    (runner as unknown as { getObservedRunOwnership: () => Promise<unknown> }).getObservedRunOwnership = async () => {
+      if (++probes === 1) throw new RequestError("GET", "/ownership", status, "");
+      return { status: "running", claim_generation: GEN, claim_released: false };
+    };
+    assert.equal(await (runner as unknown as EnrollSeam).enrollPublication(claim, flight,
+      intentInput(false, "agent/issue-5155")), "proceed");
+    assert.equal(probes, 2);
+    assert.equal(api.publicationIntentRequests.length, 4, "only fresh running proof permits the later POST");
+    assert.equal(flight.completionHoldOutcome, "none");
+  });
+}
+
+it("exact stale_claim retries once per fresh running probe and stops when ownership changes after unknown resend", async () => {
+  client.protocolFeatures = FEATURES;
+  const outbox = await mkOutbox();
+  const claim = claimFor(5151);
+  const flight = reconciliationFlight(claim.run_id);
+  api.publicationIntentWire = () => api.publicationIntentRequests.length === 1
+    ? { status: 409, body: { disposition: "stale_claim" } } : "drop";
+  const r = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, outbox);
+  let probes = 0;
+  (r as unknown as { getObservedRunOwnership: () => Promise<unknown> }).getObservedRunOwnership = async () => ({
+    status: "running", claim_generation: ++probes === 1 ? GEN : GEN + 1, claim_released: false,
+  });
+  await assert.rejects((r as unknown as EnrollSeam).enrollPublication(claim, flight, intentInput(false, "agent/issue-5151")), StaleClaimError);
+  assert.equal(flight.completionHoldOutcome, "none");
+  assert.equal(probes, 2, "ownership is rechecked after the unknown retry");
+  assert.equal(api.publicationIntentRequests.length, 2, "later enrollment orchestration gets one attempt");
+  assert.deepEqual(api.publicationIntentRequests[0]!.body, api.publicationIntentRequests[1]!.body);
+});
+
+for (const [status, body] of [
+  [403, { reason: "stale_claim" }],
+  [409, { reason: "stale_claim" }],
+  [403, { disposition: "stale_claim" }],
+] as const) {
+  it(`untyped or wrong-status stale claim retains without reconciling: ${status} ${JSON.stringify(body)}`, async () => {
+    client.protocolFeatures = FEATURES;
+    const outbox = await mkOutbox();
+    const claim = claimFor(5199);
+    const flight = reconciliationFlight(claim.run_id);
+    api.publicationIntentWire = () => ({ status, body });
+    const runner = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, outbox);
+    let probes = 0;
+    // If authority regresses, one running probe permits a resend, then changed G stops the loop.
+    (runner as unknown as { getObservedRunOwnership: () => Promise<unknown> }).getObservedRunOwnership = async () => ({
+      status: "running", claim_generation: ++probes === 1 ? GEN : GEN + 1, claim_released: false,
+    });
+    const result = await (runner as unknown as EnrollSeam).enrollPublication(claim, flight, intentInput(false, "agent/issue-5199"))
+      .catch(error => error instanceof StaleClaimError ? "stale-stop" : Promise.reject(error));
+    assert.deepEqual({ result, probes, posts: api.publicationIntentRequests.length },
+      { result: "retain", probes: 0, posts: 1 });
+    assert.equal(outbox.hasPublicationRecords(claim.run_id), true, "conservative retain keeps the durable record");
+  });
+}
+
+for (const reason of ["publication_intent_mismatch", "publication_enrollment_retired", "other_disagreement"]) {
+  it(`does not reconcile arbitrary server disagreement: ${reason}`, async () => {
+    client.protocolFeatures = FEATURES;
+    const outbox = await mkOutbox();
+    const claim = claimFor(5152);
+    api.publicationIntentWire = () => ({ status: 409, body: { reason } });
+    const r = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, outbox, nullLogger(), {
+      afterPublicationEnrolled: async () => { assert.fail("uncertain enrollment must never announce readiness"); },
+    });
+    assert.equal(await (r as unknown as EnrollSeam).enrollPublication(claim, enrollFlight(claim.run_id), intentInput(false, "agent/issue-5152")), "retain");
+    assert.equal(api.publicationIntentRequests.length, 1);
+    assert.equal(api.ownershipRequests.length, 0);
+  });
+}
+
+
+it("a local ACK recording failure remains conservative without ownership probes or retries", async () => {
+  client.protocolFeatures = FEATURES;
+  let writes = 0;
+  const outbox = await mkOutbox(async (write, ctx) => {
+    if (ctx.kind === "publication" && ctx.path.endsWith(".tmp") && ++writes > 1) throw new Error("local ACK write failed");
+    return write();
+  });
+  ackIntents([]);
+  const claim = claimFor(5153);
+  const flight = enrollFlight(claim.run_id);
+  const r = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, outbox);
+  assert.equal(await (r as unknown as EnrollSeam).enrollPublication(claim, flight, intentInput(false, "agent/issue-5153")), "retain");
+  assert.equal(api.publicationIntentRequests.length, 1);
+  assert.equal(api.ownershipRequests.length, 0);
+  assert.equal(outbox.hasPublicationRecords(claim.run_id), true);
+});
+
+it("durable matching ACK precedes publication callback and callback blocks every remote finalize step", async () => {
+  client.protocolFeatures = FEATURES;
+  const outbox = await mkOutbox();
+  const claim = claimFor(5160);
+  const events: string[] = [];
+  ackIntents(events);
+  observeRemote(events);
+  const forge = fakeGitlab({ intercept: req => { events.push(`forge:${req.method}`); return undefined; } });
+  let release!: () => void, ready!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const waiting = new Promise<void>(resolve => { ready = resolve; });
+  const callback: NonNullable<import("../src/runner.js").RunnerOptions["afterPublicationEnrolled"]> = async input => {
+    assert.ok(Object.isFrozen(input));
+    assert.deepEqual(Object.keys(input).sort(), ["claimGeneration", "issueDescription", "runId", "signal"]);
+    assert.equal(input.runId, claim.run_id);
+    assert.equal(input.claimGeneration, GEN);
+    assert.equal(input.issueDescription, claim.issue_description);
+    const loaded = await outbox.loadPublicationRecord(claim.run_id, GEN);
+    assert.equal(loaded.kind, "ok");
+    if (loaded.kind === "ok") {
+      assert.equal(loaded.record.enrollment_seq, 1);
+      assert.equal(loaded.record.candidate_seq, 1);
+    }
+    events.push("callback");
+    ready();
+    await gate;
+  };
+  const runner = build(new StubExecutor(nullLogger()), { gitlab: forge.gitlab }, outbox, nullLogger(), {
+    afterPublicationEnrolled: callback,
+  });
+  const work = runner.execute(claim);
+  try {
+    await Promise.race([waiting, work.then(() => { throw new Error("callback never entered"); })]);
+    assert.deepEqual(events, ["intent:enroll", "callback"]);
+    assert.equal(states(claim.run_id).filter(b => b.status === "completed").length, 0);
+  } finally { release(); await work; }
+  assert.equal(states(claim.run_id).filter(b => b.status === "completed").length, 1);
+  assert.ok(events.indexOf("pushBranch") > events.indexOf("callback"));
+});
+
+for (const abortSource of ["boundary", "flight"] as const) {
+  it(`publication callback observes the original ${abortSource} abort without an unresolved hold`, async () => {
+    client.protocolFeatures = FEATURES;
+    const outbox = await mkOutbox();
+    ackIntents([]);
+    const claim = claimFor(5161), flight = reconciliationFlight(claim.run_id);
+    const boundary = new AbortController(), reason = new Error(`original publication ${abortSource}`);
+    const runner = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, outbox, nullLogger(), {
+      afterPublicationEnrolled: async (input: { signal?: AbortSignal }) => {
+        assert.equal(input.signal?.aborted, false);
+        (abortSource === "boundary" ? boundary : flight.cancel).abort(reason);
+        assert.equal(input.signal?.reason, reason);
+      },
+    });
+    await assert.rejects((runner as unknown as EnrollSeam).enrollPublication(claim, flight,
+      intentInput(false, "agent/issue-5161"), boundary.signal), error => error === reason);
+    assert.equal(flight.completionHoldOutcome, "none");
+    assert.equal(outbox.hasPublicationRecords(claim.run_id), true);
+  });
+}

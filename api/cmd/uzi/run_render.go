@@ -128,6 +128,12 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 		// and still carries the raw enum (machine-facing, D1).
 		{"HEALTH", displayHealth(r.Health)},
 	}
+	for _, line := range harnessDecisionLines(r.HarnessDecision) {
+		// Keep this key within the existing table width so the unattributed
+		// milestone/NOW region retains its byte-for-byte baseline.
+		rows = append(rows, []string{"HARNESS_PICK", "at creation: " + line})
+	}
+	rows = append(rows, createdIssueRows(r.CreatedIssues)...)
 	rows = append(rows, leadConfigRows(r)...)
 	if len(r.AutoApproveBlockedReasons) > 0 {
 		rows = append(rows, []string{"AUTO_APPROVE_BLOCKED", strings.Join(r.AutoApproveBlockedReasons, ", ")})
@@ -169,10 +175,12 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 	if line := vaultParkLine(r); line != "" {
 		rows = append(rows, []string{"VAULT", line})
 	}
-	// DISK (PRD #1809 M5): a data_volume_full park, emit-only-when-parked, with its next retry
-	// and the run's lifetime disk-park count.
+	// DISK: current retry/hold timing and the lifetime disk-park count, only while parked.
 	if line := diskParkLine(r); line != "" {
 		rows = append(rows, []string{"DISK", line})
+		for _, guidance := range diskHoldLines(r) {
+			rows = append(rows, []string{"", guidance})
+		}
 	}
 	// HOME (PRD #1809 M6, D8): the run's HOME and cache size on its worker, emit-only-when-
 	// reported (the server sets them only from a fresh worker report).
@@ -255,6 +263,7 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 	if r.SizeClass != "" {
 		rows = append(rows, []string{"SIZE_CLASS", sanitizeTTY(r.SizeClass)})
 	}
+	rows = append(rows, agentSourceRows(r)...)
 	// Emitted only when set, like its two neighbours — every non-stopped run would
 	// otherwise carry a blank row. It is a server-controlled enum, so sanitizeTTY is
 	// not strictly required; applied anyway for uniformity with the free text above,
@@ -360,6 +369,9 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 	// renders byte-for-byte as before. Placed after the completion block so a completion hold
 	// reads its HOLD summary line just below the HOLD_CONTEXT durability row that block emits.
 	if row := holdRow(r, time.Now()); row != nil {
+		rows = append(rows, row)
+	}
+	if row := policyPendingRow(r); row != nil {
 		rows = append(rows, row)
 	}
 	if r.BudgetMaxIterations != nil {
@@ -571,7 +583,11 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 	}
 	// Resume retains this marker through queued/claimed until the running report.
 	// Only the paused state is still an owner hold.
-	if *r.HoldReason == holdProviderUnavailable && !isProviderUnavailableHold(r) {
+	if (*r.HoldReason == holdProviderUnavailable && !isProviderUnavailableHold(r)) ||
+		(*r.HoldReason == holdIterationExhausted && !isIterationHold(r)) {
+		return nil
+	}
+	if *r.HoldReason == holdCodexPolicy && !isCodexPolicyHold(r) {
 		return nil
 	}
 	clauses := []string{holdReasonLabel(*r.HoldReason), holdParkedClause(r, now)}
@@ -579,16 +595,24 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 		clauses = append(clauses, fmt.Sprintf("%d/%d milestones", done, total))
 	}
 	switch *r.HoldReason {
+	case holdIterationExhausted:
+		clauses = append(clauses, iterationHoldAction(r))
+	case holdCodexPolicy:
+		clauses = append(clauses, policyCaptureClause(r), policyHoldAction(r))
 	case holdBudgetExhausted:
 		clauses = append(clauses, "extend: uzi run extend "+r.ID+" --by 2h")
 	case holdCredentialDisabled:
 		clauses = append(clauses, credentialDisabledAction(r))
+	case holdCredentialsReset:
+		clauses = append(clauses, credentialsResetAction)
 	case holdProviderUnavailable:
 		clauses = append(clauses, providerHoldAction(r))
 	case holdCredentialSwitchSettling, holdCredentialSwitchUnsettled:
 		clauses = append(clauses, credentialSwitchAction(r))
 	case holdBaseAttestation:
 		clauses = append(clauses, baseAttestationAction(r))
+	case holdRepoAgentSource:
+		clauses = append(clauses, "resume once the repository can be fetched: uzi run resume "+cellText(r.ID))
 	case holdWeeklyReserve:
 		clauses = append(clauses, weeklyReserveAction(r))
 	}
@@ -599,12 +623,18 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 // in unknown reasons so a newer server still gets one terminal-safe notice.
 func holdReasonLabel(reason string) string {
 	switch reason {
+	case holdIterationExhausted:
+		return "Iteration limit reached"
+	case holdCodexPolicy:
+		return "Codex policy hold confirmed by server"
 	case holdBudgetExhausted:
 		return "time limit reached"
 	case holdCompletionBlocked:
 		return "completion blocked"
 	case holdCredentialDisabled:
 		return "credential disabled"
+	case holdCredentialsReset:
+		return "credentials were reset"
 	case holdProviderUnavailable:
 		return "provider unavailable"
 	case holdCredentialSwitchSettling:
@@ -613,6 +643,8 @@ func holdReasonLabel(reason string) string {
 		return "credential switch unsettled"
 	case holdBaseAttestation:
 		return "base not attested"
+	case holdRepoAgentSource:
+		return "repo agents unreadable"
 	case holdWeeklyReserve:
 		return "weekly usage reserve"
 	default:
@@ -646,6 +678,17 @@ func baseAttestationAction(r apitypes.RunDTO) string {
 func isCredentialDisabledHold(r apitypes.RunDTO) bool {
 	return r.Status == statusPaused && strOr(r.HoldReason, "") == holdCredentialDisabled
 }
+
+// isCredentialsResetHold reports whether r is parked because an admin reset its owner's account
+// and deleted every model credential (PRD #3989: status paused, hold_reason credentials_reset).
+func isCredentialsResetHold(r apitypes.RunDTO) bool {
+	return r.Status == statusPaused && strOr(r.HoldReason, "") == holdCredentialsReset
+}
+
+// credentialsResetAction is the owner's next step for a credentials_reset hold (PRD #3989). The
+// run resumes by itself once a credential exists, and the server refuses `uzi run resume` on it
+// (409), so it names Settings and no CLI verb.
+const credentialsResetAction = "add a credential in Settings; the run resumes automatically" //nolint:gosec // G101: owner-facing guidance text, not a credential.
 
 // credentialSwitchableLane reports whether the CLI offers a per-run token switch (`uzi run
 // set-token`) for r, the D16 rule the web's isCredentialSwitchRefusedLane applies: never a
@@ -683,14 +726,26 @@ func credentialDisabledAction(r apitypes.RunDTO) string {
 // (hold_reason null), and one whose wall budget is spent into budget_exhausted, so "resumed"
 // would be false there.
 func pausedHoldNotice(r apitypes.RunDTO, origin ...string) string {
+	if row := policyPendingRow(r); row != nil {
+		return row[1]
+	}
 	id := cellText(r.ID)
 	switch reason := strOr(r.HoldReason, ""); reason {
+	case holdIterationExhausted:
+		return "Iteration limit reached; " + iterationHoldAction(r)
+	case holdCodexPolicy:
+		if !isCodexPolicyHold(r) {
+			return ""
+		}
+		return holdReasonLabel(reason) + "; " + policyCaptureClause(r) + "; " + policyHoldAction(r)
 	case "":
 		return pauseOriginLabel(r, false, origin...) + "; resume with uzi run resume " + id
 	case holdBudgetExhausted:
 		return "parked at its time limit; extend: uzi run extend " + id + " --by 2h"
 	case holdCredentialDisabled:
 		return "held, a credential it needs is disabled; " + credentialDisabledAction(r)
+	case holdCredentialsReset:
+		return "held, your credentials were reset; " + credentialsResetAction
 	case holdProviderUnavailable:
 		return "held, provider unavailable; " + providerHoldAction(r)
 	case holdCredentialSwitchSettling:
@@ -715,6 +770,25 @@ func credentialDisabledLine(r apitypes.RunDTO) string {
 		return ""
 	}
 	return "waiting: credential disabled · " + credentialDisabledAction(r)
+}
+
+// credentialsResetLine is the one-line held-run sentence the TUI detail and board print for a
+// credentials_reset hold (PRD #3989), or "" for any other run; the twin of credentialDisabledLine.
+func credentialsResetLine(r apitypes.RunDTO) string {
+	if !isCredentialsResetHold(r) {
+		return ""
+	}
+	return "waiting: credentials were reset · " + credentialsResetAction
+}
+
+// credentialHoldLine is the held-run sentence for either credential park (credential_disabled or
+// credentials_reset), or "" for any other run. The TUI slots that draw one line for a credential
+// hold call this so neither reason falls through to the owner-pause wording.
+func credentialHoldLine(r apitypes.RunDTO) string {
+	if line := credentialDisabledLine(r); line != "" {
+		return line
+	}
+	return credentialsResetLine(r)
 }
 
 // holdParkedClause renders "parked HH:MM (dur)" from the instant the run entered its current
@@ -1895,10 +1969,20 @@ func renderMessage(p *uzicli.Printer, m apitypes.MessageDTO) error {
 	// starts at the same rune offset on every line.
 	payload := compactPayload(m.Payload)
 	// Cross-check activity events (PRD #3166) print as a human line built from validated
-	// fields, through the same capCell(cellText(...)) composition as renderer.Plain. Any
-	// other status payload, including an event this client does not know, keeps the generic row.
+	// fields, through the same capCell(cellText(...)) composition as renderer.Plain.
+	// Diagnostics use that sanitizer too; other payloads keep the generic row.
 	if line, ok := activityMessageLine(m.Kind, m.Payload); ok {
 		payload = capCell(cellText(line), 200)
+	} else if m.Kind == "status" {
+		var diagnostic struct {
+			Event string  `json:"event"`
+			Text  *string `json:"text"`
+		}
+		// Display worker-authored text without interpreting its code or cause.
+		// Missing, null or nonstring text keeps the generic payload row.
+		if json.Unmarshal(m.Payload, &diagnostic) == nil && diagnostic.Event == "cross_check_diagnostic" && diagnostic.Text != nil {
+			payload = capCell(cellText(*diagnostic.Text), 200)
+		}
 	}
 	p.Printf("#%-4d %-16s %-*s %s\n", m.Seq, m.Kind, actorCellWidth, actorCell(m), payload)
 	return nil
@@ -2084,7 +2168,7 @@ func steerStateWithRun(in apitypes.SteerInputDTO, runStatus string, recoveryCaus
 			}
 		}
 	}
-	if len(recoveryCause) > 0 && (recoveryCause[0] == workerRequeueExhaustedCause || recoveryCause[0] == workerMemoryPressureCause || recoveryCause[0] == retainedRecoveryAdoptionFailedCause) {
+	if len(recoveryCause) > 0 && (recoveryCause[0] == workerRequeueExhaustedCause || recoveryCause[0] == workerMemoryPressureCause || isAlwaysHeldRecoveryCause(recoveryCause[0])) {
 		recoveringSuffix = " (owner Resume/Cancel)"
 	}
 	if len(recoveryCause) > 0 && recoveryCause[0] == forgeUnreachableCause {
@@ -2104,7 +2188,15 @@ func steerStateWithRun(in apitypes.SteerInputDTO, runStatus string, recoveryCaus
 	// PRD #1809 M5: a run parked on a full worker data volume waits for disk space (the words
 	// diskParkLine and the web run page's "Waiting for disk space" heading use).
 	if len(recoveryCause) > 0 && recoveryCause[0] == dataVolumeFullCause {
-		recoveringSuffix = " (run waiting for disk space)"
+		recoveringSuffix = " (run waiting for disk space; retry timing unknown)"
+		if run != nil {
+			switch diskWaitOf(*run) {
+			case diskWaitHeld:
+				recoveringSuffix = " (disk held; owner Resume/Cancel)"
+			case diskWaitTimed:
+				recoveringSuffix = " (run waiting for disk space)"
+			}
+		}
 	}
 	if consumedAt == nil {
 		if terminalRunStatuses[runStatus] {
@@ -2278,10 +2370,8 @@ func checkpointDurabilityLine(r apitypes.RunDTO) string {
 }
 
 // dataVolumeFullCause is the RecoveryWaitCause of a run parked because its worker's data
-// volume was full or about to fill (PRD #1809 M5, D6), and the fail_origin of a run that failed
-// because the volume stayed full past the server's disk-park cap. Like the vault park it
-// resumes at its timer-based retry (RecoveryRetryNotBefore); the worker's reclaim frees space
-// in the meantime.
+// volume was full or about to fill (PRD #1809 M5, D6). Historical failed rows also use
+// this fail_origin; current cap exhaustion holds the run for its owner (#3969).
 const dataVolumeFullCause = "data_volume_full"
 
 // isDiskFullPark reports whether a recovery_wait run is parked on a full data volume (PRD #1809).
@@ -2301,30 +2391,43 @@ func diskParkCountClause(r apitypes.RunDTO) string {
 
 // diskParkLine is the data_volume_full park sentence (PRD #1809 M5) `uzi run get`'s DISK row,
 // the `run logs --follow` notice and the TUI share, "" for any other run. The retry clause is
-// HH:MM on the viewer's local wall clock (vaultRetryClause), dropped without a retry stamp.
+// HH:MM on the viewer's local wall clock for a finite retry; NULL holds and missing
+// or invalid timing never promise an automatic retry.
 func diskParkLine(r apitypes.RunDTO) string {
 	if !isDiskFullPark(r) {
 		return ""
 	}
-	return diskParkLead + ": the worker's data volume is full or nearly full; uzi frees space on the worker and the run resumes at " +
-		vaultRetryClause(r) + "; " + diskParkCountClause(r)
+	switch diskWaitOf(r) {
+	case diskWaitHeld:
+		return diskParkLead + ": automatic disk retries exhausted; owner-held; owner Resume/Cancel; no automatic resume; " + diskParkCountClause(r)
+	case diskWaitTimed:
+		return diskParkLead + ": the worker's data volume is full or nearly full; uzi frees space on the worker and the run resumes at " + vaultRetryClause(r) + "; " + diskParkCountClause(r)
+	default:
+		return diskParkLead + ": retry timing unknown; " + diskParkCountClause(r)
+	}
 }
 
 // fitDiskParkLine is diskParkLine shed to fit a physical width, for the TUI's one-row slots,
 // in the same order as fitVaultParkLine: the full sentence, then "waiting for disk space:
 // resumes at its next retry (HH:MM); counted disk parks: N", then the floor "waiting for disk space ·
-// retry HH:MM" (the bare lead without a stamp). The floor is never cut here; the caller's
+// retry HH:MM". Holds retain Resume/Cancel and unknown timing retains its label.
+// The floor is never cut here; the caller's
 // clampVisual is the narrow-terminal backstop. "" for any run that is not a disk park.
 func fitDiskParkLine(r apitypes.RunDTO, width int) string {
 	full := diskParkLine(r)
 	if full == "" {
 		return ""
 	}
-	floor := diskParkLead
-	if r.RecoveryRetryNotBefore != nil {
-		floor += " · retry " + r.RecoveryRetryNotBefore.Local().Format("15:04")
+	floor := "Disk wait · timing unknown"
+	short := floor + "; " + diskParkCountClause(r)
+	switch diskWaitOf(r) {
+	case diskWaitHeld:
+		floor = "Disk held · Resume/Cancel"
+		short = floor + "; " + diskParkCountClause(r)
+	case diskWaitTimed:
+		floor = diskParkLead + " · retry " + r.RecoveryRetryNotBefore.Local().Format("15:04")
+		short = diskParkLead + ": resumes at " + vaultRetryClause(r) + "; " + diskParkCountClause(r)
 	}
-	short := diskParkLead + ": resumes at " + vaultRetryClause(r) + "; " + diskParkCountClause(r)
 	for _, cand := range []string{full, short} {
 		if visualWidth(cand) <= width {
 			return cand
@@ -2334,7 +2437,7 @@ func fitDiskParkLine(r apitypes.RunDTO, width int) string {
 }
 
 // failOriginCell is `uzi run get`'s FAIL_ORIGIN cell: the typed fail_origin enum, with a plain
-// explanation for data_volume_full (PRD #1809 M5), whose raw name does not say that uzi parked
+// explanation for historical data_volume_full failures (PRD #1809 M5), whose raw name does not say that uzi parked
 // and retried before giving up. N is the counted parks only (preventive parks are uncounted). The enum is server-coerced, but an unrecognised value from a
 // newer server still prints as itself, through sanitizeTTY like the STOP_KIND row.
 func failOriginCell(r apitypes.RunDTO) string {
@@ -2447,11 +2550,21 @@ func runStatusCellAt(r apitypes.RunListItemDTO, now time.Time) string {
 	} else if isVaultLockedPark(r.RunDTO) {
 		s += " (waiting for vault unlock)"
 	} else if isDiskFullPark(r.RunDTO) {
-		s += " (waiting for disk space)"
+		switch diskWaitOf(r.RunDTO) {
+		case diskWaitHeld:
+			s += " (disk held; owner Resume/Cancel)"
+		case diskWaitTimed:
+			s += " (waiting for disk space)"
+		default:
+			s += " (waiting for disk space; retry timing unknown)"
+		}
 	}
 	if isCredentialDisabledHold(r.RunDTO) {
 		// PRD #1732 D14: say why the run is paused, so it does not read as an owner pause.
 		s += " (credential disabled)"
+	}
+	if isCredentialsResetHold(r.RunDTO) {
+		s += " (credentials were reset)"
 	}
 	switch {
 	case isCredentialSwitchSettlingHold(r.RunDTO):
@@ -2465,7 +2578,7 @@ func runStatusCellAt(r apitypes.RunListItemDTO, now time.Time) string {
 	}
 	if reason := runQueueReason(r.RunDTO); reason != "" {
 		s += " (" + reason + ")"
-	} else if reason := strOr(r.HealthReason, ""); r.Status == "queued" && (reason == "your Codex account is unavailable (quarantined or being re-linked), so this run can't start" || (admission != "" && reason != "" && !apitypes.IsCodexAdmissionReason(reason))) {
+	} else if reason := strOr(r.HealthReason, ""); r.Status == "queued" && (reason == "recovery custody capacity is full; retained holds still protect your work; resolve or discard a retained hold to free capacity" || reason == "your Codex account is unavailable (quarantined or being re-linked), so this run can't start" || (admission != "" && reason != "" && !apitypes.IsCodexAdmissionReason(reason))) {
 		// The API keeps higher-priority queued blockers in HealthReason. Retain
 		// them after maintenance and before the independent admission details.
 		s += " (" + reason + ")"
@@ -2799,4 +2912,62 @@ func accountCooldownLineAt(r apitypes.RunDTO, now time.Time) string {
 		return ""
 	}
 	return apitypes.AccountCooldownLine(*r.AccountCooldownClass, *r.AccountCooldownEligibleAt)
+}
+
+// isIterationHold requires the paused state; a retained reason after Resume is not a hold.
+func isIterationHold(r apitypes.RunDTO) bool {
+	return r.Status == statusPaused && strOr(r.HoldReason, "") == holdIterationExhausted
+}
+
+// iterationHoldAction uses the server's frozen wall projection. Missing budget fields
+// leave Resume authoritative rather than guessing the server's global timeout.
+func iterationHoldAction(r apitypes.RunDTO) string {
+	id := cellText(r.ID)
+	action := "Resume: uzi run resume " + id + "; Cancel: uzi run cancel " + id
+	if r.BudgetTotalSeconds != nil && r.BudgetUsedSeconds != nil && *r.BudgetUsedSeconds >= *r.BudgetTotalSeconds {
+		action += "; wall time exhausted; add time: uzi run extend " + id + " --by 2h; Extend adds time only, then Resume"
+	}
+	return action
+}
+
+func agentSourceLabel(source string) string {
+	switch source {
+	case "own":
+		return "my templates"
+	case "repo":
+		return "repo agents"
+	}
+	return sanitizeTTY(source)
+}
+
+func agentSourceRows(r apitypes.RunDTO) [][]string {
+	var rows [][]string
+	requested := strOr(r.AgentSourceRequested, "")
+	if requested != "" {
+		basis := "this run"
+		if strOr(r.AgentSourceRequestedBasis, "") == "repo_default" {
+			basis = "repo default"
+		}
+		rows = append(rows, []string{"AGENTS_REQUESTED", agentSourceLabel(requested) + " (" + basis + ")"})
+		planned := "—"
+		if source := strOr(r.PlanAgentSource, ""); source != "" {
+			planned = agentSourceLabel(source)
+			if source == requested {
+				planned += " (" + basis + ")"
+			}
+		}
+		rows = append(rows, []string{"PLANNED_WITH", planned})
+	}
+	if implemented := strOr(r.AgentSource, ""); implemented != "" {
+		cell := agentSourceLabel(implemented)
+		switch requested {
+		case "":
+		case implemented:
+			cell += " (as requested)"
+		default:
+			cell += " (changed at approval)"
+		}
+		rows = append(rows, []string{"IMPLEMENTED_WITH", cell})
+	}
+	return rows
 }

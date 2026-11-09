@@ -65,7 +65,8 @@ describe("effectiveHarnessIsCodex", () => {
   it("inherit with no default resolves Codex only when it is the SOLE usable harness", () => {
     expect(effectiveHarnessIsCodex("inherit", false, true)).toBe(true);
     expect(effectiveHarnessIsCodex("inherit", true, false)).toBe(false);
-    // Both usable, no default ⇒ Claude (D11 rule 4) — the token control stays visible.
+    // Both usable, no default ⇒ Claude (D11 rule 4) is the usage-free resolver answer; an eligible
+    // implicit issue run may pick by weekly limits at creation (#3845). The token control stays visible.
     expect(effectiveHarnessIsCodex("inherit", true, true)).toBe(false);
   });
 

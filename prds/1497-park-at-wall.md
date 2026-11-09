@@ -182,6 +182,27 @@ M1 is the risk and the long pole of run 1: checkpoint after it, and the watcher 
 
 ## Decision log
 
+- **D20 (2026-11-01, #3738): iteration exhaustion is a separate hold.**
+  Eligible exact-zero-attempt runs on either harness use
+  `iteration_budget_exhausted` with `iteration_park_version: 1`; absent or
+  unknown support keeps legacy failures and old workers ignore the field.
+  Explicit owner Resume grants a fresh finite invocation allowance, keeps
+  resolvable worker/session affinity and adds no wall time. If the wall is
+  spent, Extend then Resume; extension alone does not resume this hold.
+  Explicit owner set-token-and-resume obeys the same wall guard; credential
+  availability alone does not resume. Bounded best-effort capture preserves
+  local material even if publication fails or capture is degraded; only a
+  matching ACK confirms pause, and uncertain delivery stops with retention
+  without claiming server pause. Local retention is not durable backup.
+  The hold retains its lane/worker and grants no Stop or publication
+  authority. Prior-attempt dispositions, idle and #3139 remain unchanged.
+  See the [ADR addendum](../adr/1225-structural-completion-interlock-invariants.md#addendum--zero-attempt-iteration-hold-2026-11-01-3738)
+  and [owner instructions](../docs/run-pause.md#paused-at-the-iteration-limit).
+  This documentation pass leaves M4 (web), M5 (TUI/Slack/CLI polish),
+  M6 (the broader wall docs/specs/ADR/skills package), M7 (whole-tree
+  validation) and M8 (hosted acceptance) unchecked: none is established
+  complete by the iteration documentation. It does not move this PRD.
+
 - **D1 (owner, 2026-09-20): the park never expires.** No TTL, no auto-fail, no auto-finalize. A parked run waits until its owner extends, stops or cancels. Consequence accepted: it holds its lane (issue, schedule, merge request) and, on a hosted fleet, its run-bound worker and volume, for as long as it waits.
 - **D2 (owner, 2026-09-20): not configurable.** No admin setting, per-user setting or rollout flag. Park-at-the-wall replaces fail-at-the-wall outright, on both harnesses.
 - **D3: the sweep is the trigger, through the pause channel.** The server deadline is the clock that fires first by construction, and the 3s steering poll already aborts a turn in flight for a `now` pause. A served ACK flag alone (the #1226 shape) waits for the next report, which a long turn delays; the input reaches the worker in seconds. The columns also survive a worker death and re-arm on re-claim, which a one-shot flag does not.
@@ -230,7 +251,7 @@ M1 is the risk and the long pole of run 1: checkpoint after it, and the watcher 
 
 - An expiry, an auto-extend, or any setting for this behaviour (D1, D2).
 - Releasing a hosted run-bound worker while its run is parked on a durable checkpoint (the resume would become cross-worker). A real capacity lever; separate issue.
-- `REASON_IDLE` before a completion attempt, `MAX_ITERATIONS`, and the no-progress stall: they stay failures. `chat`, `judge` and interactive tasks never time out and are untouched.
+- Changing idle, iteration or no-progress policy is outside this wall PRD. Subsequent changes qualify the original failure boundary: #3139 adds an eligible worker-initiated stall attempt and completion decision; #3738 adds the negotiated, exact-zero-attempt [iteration hold](../docs/run-pause.md#paused-at-the-iteration-limit). Other dispositions, including idle handling and #3139's accepted residual, remain as documented in [ADR-1225](../adr/1225-structural-completion-interlock-invariants.md). `chat`, `judge` and interactive tasks are outside this wall-timeout policy.
 - Stop for non-milestone kinds (delivering a partial `prompt` or `self_improve` run).
 - Changing PRD #1226's hold route or its rollout, or PRD #1232's integration work (the `StampCompletionBudgetExhausted` deadline fix is a bug fix inside the existing route, not a route change).
 - Any `.github/workflows/**` change.

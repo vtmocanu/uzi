@@ -75,6 +75,10 @@ console.log('EPOCH_NPM_READY');
   assert.equal(originalMain.split(configBoundary).length, 2, "configuration interception applies once");
   const observeOwnership = `
   const config = await (async () => {
+    // Self-contained: the boundary may sit in a different function scope than the main probe.
+    const assert = (await import('node:assert/strict')).default;
+    const fs = (await import('node:fs')).default;
+    const os = (await import('node:os')).default;
     assert.equal(epochOwnership?.mode, 'shared', 'actual main holds SH before configuration');
     assert.ok(['fresh', 'existing'].includes(epochConsumption?.result ?? ''), 'actual main durably consumes before configuration');
     const ledger = fs.readFileSync(${JSON.stringify(data + '/.uzi-epoch-consumed')}, 'utf8');

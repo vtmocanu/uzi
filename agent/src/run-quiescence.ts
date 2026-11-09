@@ -896,7 +896,58 @@ export interface QuiesceProcess {
   comm: string;
   cwd: string;
   reason: string;
+  /** issue #3915: why an `unreadable_unattributed` process matched no recorded root. Diagnostic
+   *  only: it never changes a kill or unverified decision. */
+  attribution?: AttributionTrace;
 }
+
+/** How one attribution candidate (the process itself, its group, session or an ancestor) compared
+ *  with the recorded roots of other live attempts. `start_mismatch`: the pid is recorded but its
+ *  current start time is not; `start_unreadable`: the pid is recorded but its start time cannot be
+ *  read now; `not_recorded`: no recorded root has that pid. */
+export type AttributionMatch = "matched" | "start_mismatch" | "start_unreadable" | "not_recorded";
+
+export interface AttributionCandidate {
+  pid: number;
+  role: "self" | "pgid" | "sid" | "ancestor";
+  match: AttributionMatch;
+}
+
+/** issue #3915: the identities an unattributed process was checked by, bounded and numeric apart
+ *  from sanitized comms. Never carries argv, environment or cwd content. */
+export interface AttributionTrace {
+  startTime?: number;
+  ppid?: number;
+  pgid?: number;
+  sid?: number;
+  /** Up to {@link TRACE_MAX_ANCESTORS} ancestors, nearest first. */
+  ancestors: Array<{ pid: number; comm?: string; startTime?: number }>;
+  /** Up to {@link TRACE_MAX_CANDIDATES} candidates, in check order. */
+  candidates: AttributionCandidate[];
+  /** How many recorded roots the scan compared against. */
+  rootsCompared: number;
+}
+
+/** issue #3915: what the caller supplied as other live attempts' roots, for the refusal log. */
+export interface RootContext {
+  liveAttempts: number;
+  attemptRoots: number;
+  workerRoots: number;
+  /** Attempts whose recordedRootPids() threw (their roots were treated as none). The error text
+   *  is never kept: it is not redacted, only the count and the per-attempt marker are. */
+  rootReadErrors: number;
+  /** Per other live attempt (first {@link ROOT_CONTEXT_MAX_ATTEMPTS}): its run and how many roots it
+   *  supplied, or "error" when they could not be read. */
+  attempts: Array<{ runId: string; roots: number | "error" }>;
+}
+
+const ROOT_CONTEXT_MAX_ATTEMPTS = 8;
+
+const TRACE_MAX_ANCESTORS = 16;
+const TRACE_MAX_CANDIDATES = 20;
+/** Traced entries per scan pass: the rest stay listed without a trace, so many unreadable
+ *  processes cannot crowd the verdict out of the helper's bounded stdout. */
+const TRACE_MAX_PER_SCAN = 4;
 
 interface KillCandidate extends QuiesceProcess {
   /** Internal identity captured during classification; never included in ProcessQuiescence. */
@@ -967,6 +1018,57 @@ function attributedToOtherLive(pid: number, table: ProcTable, roots: RootIndex):
   return [...candidates].some((c) => isRecordedRoot(c, table, roots));
 }
 
+/** issue #3915: the stat facts the scan's first pass already read for every pid. The trace
+ *  reads nothing else, so it never spends procfs budget the proof itself needs. */
+interface StatSnapshot {
+  parentOf: ReadonlyMap<number, number>;
+  startTimeOf: ReadonlyMap<number, number>;
+  commOf: ReadonlyMap<number, string>;
+}
+
+/** issue #3915: how a candidate compares with the recorded roots (see {@link AttributionMatch}),
+ *  judged on the scan's snapshot rather than a fresh read. */
+function rootMatch(candidate: number, snap: StatSnapshot, roots: RootIndex): AttributionMatch {
+  const recorded = roots.get(candidate);
+  if (recorded === undefined) return "not_recorded";
+  const startTime = snap.startTimeOf.get(candidate);
+  if (startTime === undefined) return "start_unreadable";
+  return recorded.has(startTime) ? "matched" : "start_mismatch";
+}
+
+/** issue #3915: the bounded identity trace of an unreadable process that
+ *  {@link attributedToOtherLive} could not attribute, built only from facts already read. */
+function traceAttribution(pid: number, facts: StatFacts | undefined, snap: StatSnapshot, roots: RootIndex): AttributionTrace {
+  const ancestors: AttributionTrace["ancestors"] = [];
+  let cur = snap.parentOf.get(pid);
+  while (cur !== undefined && cur > 0 && ancestors.length < TRACE_MAX_ANCESTORS && !ancestors.some((a) => a.pid === cur)) {
+    const comm = snap.commOf.get(cur);
+    const startTime = snap.startTimeOf.get(cur);
+    ancestors.push({ pid: cur, ...(comm !== undefined ? { comm } : {}), ...(startTime !== undefined ? { startTime } : {}) });
+    if (cur === 1) break;
+    cur = snap.parentOf.get(cur);
+  }
+  const ordered: Array<{ pid: number; role: AttributionCandidate["role"] }> = [{ pid, role: "self" }];
+  if (facts) ordered.push({ pid: facts.pgid, role: "pgid" }, { pid: facts.sid, role: "sid" });
+  for (const a of ancestors) ordered.push({ pid: a.pid, role: "ancestor" });
+  const seen = new Set<number>();
+  const candidates: AttributionCandidate[] = [];
+  for (const c of ordered) {
+    if (seen.has(c.pid) || candidates.length >= TRACE_MAX_CANDIDATES) continue;
+    seen.add(c.pid);
+    candidates.push({ ...c, match: rootMatch(c.pid, snap, roots) });
+  }
+  let rootsCompared = 0;
+  for (const times of roots.values()) rootsCompared += times.size;
+  return {
+    ...(facts?.startTime !== undefined ? { startTime: facts.startTime } : {}),
+    ...(facts ? { ppid: facts.ppid, pgid: facts.pgid, sid: facts.sid } : {}),
+    ancestors,
+    candidates,
+    rootsCompared,
+  };
+}
+
 /** One pass over the process table. Pure apart from the reads; signals nothing. */
 export function scanOnce(
   req: ScanRequest,
@@ -987,14 +1089,17 @@ export function scanOnce(
   const excluded = new Set<number>([selfPid, ...ancestorsOf(selfPid, table)]);
   const parentOf = new Map<number, number>();
   const startTimeOf = new Map<number, number>();
+  const commOf = new Map<number, string>();
   for (const pid of pids) {
     const r = tryRead(() => table.readStat(pid));
     const facts = r.ok ? parseStat(r.value) : undefined;
     if (facts) {
       parentOf.set(pid, facts.ppid);
+      commOf.set(pid, facts.comm);
       if (facts.startTime !== undefined) startTimeOf.set(pid, facts.startTime);
     }
   }
+  const snapshot: StatSnapshot = { parentOf, startTimeOf, commOf };
   const isDescendant = (pid: number): boolean | undefined => {
     let cur = parentOf.get(pid);
     for (let depth = 0; depth < 256; depth++) {
@@ -1007,6 +1112,7 @@ export function scanOnce(
   };
   const liveMarkers = new Set(req.liveMarkers);
   const roots = indexRoots(req.liveRoots);
+  let traced = 0;
 
   for (const pid of pids) {
     if (excluded.has(pid)) continue;
@@ -1061,7 +1167,14 @@ export function scanOnce(
       ) {
         result.kill.push({ ...entry, reason: "unreadable_no_other_claim", startTime: facts.startTime });
       } else {
-        result.unverified.push(entry);
+        // issue #3915: say which identities were checked and how each missed a recorded root,
+        // for the first few such entries of this pass only.
+        if (traced < TRACE_MAX_PER_SCAN) {
+          traced += 1;
+          result.unverified.push({ ...entry, attribution: traceAttribution(pid, facts, snapshot, roots) });
+        } else {
+          result.unverified.push(entry);
+        }
       }
       continue;
     }
@@ -1279,6 +1392,9 @@ export interface ProcessQuiescence {
   /** Pids SIGKILLed during the reap. */
   killed: number[];
   detail: string;
+  /** issue #3915: the other-attempt roots the scan was given. Set by {@link quiesceRunAttempt} on
+   *  the worker side, never by the helper. */
+  rootContext?: RootContext;
 }
 
 const REAP_DEADLINE_MS = 5_000;
@@ -1298,6 +1414,9 @@ export interface ReapDeps {
    *  (e.g. its own TypeScript loader's service process, which inherits its env) is its own. */
   excludeAllDescendants?: boolean;
   reportBudget?: { signal: AbortSignal; deadline: number };
+  /** issue #3980: absolute epoch-ms deadline (see {@link QuiesceRunRequest.deadlineAt}). Unlike
+   *  `reportBudget` it keeps the normal multi-pass loop and kill behaviour, only capped at the deadline. */
+  deadlineAt?: number;
 }
 
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -1336,12 +1455,14 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
     return { state: "unverified", processes: [], killed: [], detail: "proc table helper work context mismatch" };
   let tableFailure: unknown;
   let bytes = 0;
+  const gateDeadline = deps.deadlineAt;
   const bounded = <T>(read: () => T, cap?: number): T => {
     try {
       ambient?.check();
       MaintenanceResources.checkIfActive();
       reportBudget?.signal?.throwIfAborted();
       if (reportBudget && Date.now() >= reportBudget.deadline) throw new Error("process proof deadline");
+      if (gateDeadline !== undefined && (deps.now ?? Date.now)() >= gateDeadline) throw new Error("process proof deadline");
       const result = read();
       if (typeof result === "string") {
         const work = helperWork.getStore();
@@ -1363,7 +1484,7 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
       throw error;
     }
   };
-  const table: ProcTable = reportBudget || ambient || scoped ? {
+  const table: ProcTable = reportBudget || ambient || scoped || gateDeadline !== undefined ? {
     listPids: () => bounded(() => {
       const pids = baseTable.listPids();
       const work = helperWork.getStore();
@@ -1391,7 +1512,7 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
   const sleep = deps.sleep ?? defaultSleep;
   const now = deps.now ?? Date.now;
   // Report observations never kill a writer after byte inspection.
-  const deadline = reportBudget ? now() : now() + (deps.deadlineMs ?? view?.deadlineMs ?? REAP_DEADLINE_MS);
+  const deadline = reportBudget ? now() : Math.min(now() + (deps.deadlineMs ?? view?.deadlineMs ?? REAP_DEADLINE_MS), gateDeadline ?? Infinity);
   const selfPid = deps.selfPid ?? process.pid;
   const killed: number[] = [];
   let last: ScanResult;
@@ -1400,8 +1521,13 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
       return { state: "unverified", processes: [], killed, detail: "maintenance deadline exhausted" };
     }
     MaintenanceResources.checkIfActive();
+    // issue #3980: a scan is admitted only before the gate deadline.
+    if (gateDeadline !== undefined && now() >= gateDeadline) {
+      return { state: "unverified", processes: [], killed, detail: "process proof deadline" };
+    }
     last = scanOnce(req, table, selfPid, deps.excludeAllDescendants ?? false);
-    if (last.tableError || tableFailure || helperWork.getStore()?.failed || (ambient && (ambient.signal.aborted || ambient.remainingMs() <= 0)) || (reportBudget && Date.now() >= reportBudget.deadline)) {
+    if (last.tableError || tableFailure || helperWork.getStore()?.failed || (ambient && (ambient.signal.aborted || ambient.remainingMs() <= 0)) || (reportBudget && Date.now() >= reportBudget.deadline) ||
+        (gateDeadline !== undefined && now() >= gateDeadline)) {
       return { state: "unverified", processes: [], killed, detail: last.tableError ?? String(tableFailure ?? (helperWork.getStore()?.failed ? "helper work exhausted" : "process proof deadline")) };
     }
     if (exclusiveScans !== undefined) {
@@ -1422,10 +1548,12 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
       if (p.startTime === undefined || currentStartTime !== p.startTime) continue;
       ambient?.check();
       if (remaining && remaining() <= 0) break;
+      if (gateDeadline !== undefined && now() >= gateDeadline) break;
       kill(p.pid);
       killed.push(p.pid);
     }
-    const delay = deps.intervalMs ?? view?.intervalMs ?? REAP_INTERVAL_MS;
+    const delay = gateDeadline === undefined ? deps.intervalMs ?? view?.intervalMs ?? REAP_INTERVAL_MS
+      : Math.max(0, Math.min(deps.intervalMs ?? view?.intervalMs ?? REAP_INTERVAL_MS, gateDeadline - now()));
     if (ambient) await ambient.raceIO(() => sleep(Math.min(delay, remaining!())));
     else await sleep(delay);
   }
@@ -1729,16 +1857,49 @@ function isProcessQuiescence(v: unknown): v is ProcessQuiescence {
 function sanitizeVerdict(v: ProcessQuiescence): ProcessQuiescence {
   return {
     state: v.state,
-    processes: v.processes.map((p) => ({
-      pid: p.pid,
-      uid: Number.isInteger(p.uid) ? p.uid : -1,
-      comm: sanitizeForLog(String(p.comm), 64),
-      cwd: sanitizeForLog(String(p.cwd)),
-      reason: sanitizeForLog(String(p.reason), 64),
-    })),
+    processes: v.processes.map((p) => {
+      const attribution = sanitizeAttributionTrace(p.attribution);
+      return {
+        pid: p.pid,
+        uid: Number.isInteger(p.uid) ? p.uid : -1,
+        comm: sanitizeForLog(String(p.comm), 64),
+        cwd: sanitizeForLog(String(p.cwd)),
+        reason: sanitizeForLog(String(p.reason), 64),
+        ...(attribution ? { attribution } : {}),
+      };
+    }),
     killed: v.killed,
     detail: sanitizeForLog(v.detail),
   };
+}
+
+const TRACE_ROLES = new Set(["self", "pgid", "sid", "ancestor"]);
+const TRACE_MATCHES = new Set(["matched", "start_mismatch", "start_unreadable", "not_recorded"]);
+
+/** issue #3915: a helper-supplied {@link AttributionTrace} rebuilt from validated, bounded fields
+ *  only (it crossed a uid boundary); anything malformed is dropped, never trusted. */
+export function sanitizeAttributionTrace(v: unknown): AttributionTrace | undefined {
+  if (typeof v !== "object" || v === null) return undefined;
+  const o = v as Record<string, unknown>;
+  const int = (x: unknown): number | undefined => (Number.isSafeInteger(x) && (x as number) >= 0 ? (x as number) : undefined);
+  if (!Array.isArray(o.ancestors) || !Array.isArray(o.candidates) || int(o.rootsCompared) === undefined) return undefined;
+  const ancestors = o.ancestors.slice(0, TRACE_MAX_ANCESTORS).flatMap((a) => {
+    if (typeof a !== "object" || a === null) return [];
+    const r = a as Record<string, unknown>;
+    const pid = int(r.pid);
+    if (pid === undefined) return [];
+    const startTime = int(r.startTime);
+    return [{ pid, ...(typeof r.comm === "string" ? { comm: sanitizeForLog(r.comm, 64) } : {}), ...(startTime !== undefined ? { startTime } : {}) }];
+  });
+  const candidates = o.candidates.slice(0, TRACE_MAX_CANDIDATES).flatMap((c) => {
+    if (typeof c !== "object" || c === null) return [];
+    const r = c as Record<string, unknown>;
+    const pid = int(r.pid);
+    if (pid === undefined || !TRACE_ROLES.has(r.role as string) || !TRACE_MATCHES.has(r.match as string)) return [];
+    return [{ pid, role: r.role as AttributionCandidate["role"], match: r.match as AttributionMatch }];
+  });
+  const optional = (k: "startTime" | "ppid" | "pgid" | "sid") => (int(o[k]) !== undefined ? { [k]: int(o[k]) } : {});
+  return { ...optional("startTime"), ...optional("ppid"), ...optional("pgid"), ...optional("sid"), ancestors, candidates, rootsCompared: int(o.rootsCompared)! };
 }
 
 /**
@@ -1769,7 +1930,9 @@ function parseHelperVerdict(stdout: string): ProcessQuiescence {
  */
 async function reapProcessesViaHelper(
   req: HelperScanRequest,
-  opts: { producerWorkLimits?: HelperWorkLimits; spawnHelper?: HelperSpawn; timeoutMs?: number; helperTmp?: HelperTmp; reportBudget?: { signal: AbortSignal; deadline: number } } = {},
+  opts: { producerWorkLimits?: HelperWorkLimits; spawnHelper?: HelperSpawn; timeoutMs?: number; helperTmp?: HelperTmp; reportBudget?: { signal: AbortSignal; deadline: number };
+    /** issue #3980: absolute epoch-ms deadline (see {@link QuiesceRunRequest.deadlineAt}). */
+    deadlineAt?: number } = {},
 ): Promise<ProcessQuiescence> {
   if (uidSplitActive() && hasReaperCaptureScope()) {
     return { state: "unverified", processes: [], killed: [], detail: "raw scoped helper refused" };
@@ -1786,6 +1949,13 @@ async function reapProcessesViaHelper(
   if (scoped) req = { ...req, reportDeadline: Math.floor(Math.min(req.reportDeadline ?? Infinity,
     Date.now() + MaintenanceResources.remainingMsIfActive())) };
   const unverified = (detail: string): ProcessQuiescence => ({ state: "unverified", processes: [], killed: [], detail });
+  // issue #3980: the absolute gate-checkpoint deadline. Every stage below is admitted only before it,
+  // the helper and the private-temp commands are killed and JOINED at it, and an expiry is unverified.
+  const gateDeadline = opts.deadlineAt;
+  const gateExpired = (): boolean => gateDeadline !== undefined && Date.now() >= gateDeadline;
+  if (gateExpired()) return unverified("gate checkpoint deadline exhausted");
+  const gateBudget = gateDeadline === undefined ? undefined
+    : { signal: AbortSignal.timeout(Math.max(1, gateDeadline - Date.now())), deadline: gateDeadline };
   let argv: string[];
   try {
     argv = helperArgv();
@@ -1799,7 +1969,7 @@ async function reapProcessesViaHelper(
     MaintenanceResources.checkIfActive();
     opts.reportBudget?.signal.throwIfAborted();
     if (opts.reportBudget && Date.now() >= opts.reportBudget.deadline) throw new Error("report helper setup deadline");
-    tmpDir = await helperTmp.make(opts.reportBudget);
+    tmpDir = await helperTmp.make(opts.reportBudget ?? gateBudget);
   } catch (err) {
     return unverified(`quiescence helper TMPDIR unavailable: ${(err as Error).message}`);
   }
@@ -1825,6 +1995,11 @@ async function reapProcessesViaHelper(
   if (opts.reportBudget && (opts.reportBudget.signal.aborted || Date.now() >= opts.reportBudget.deadline)) {
     if (!ambient && !scoped) await Promise.resolve().then(() => helperTmp.remove(tmpDir, cleanupBudget())).catch(() => undefined);
     return unverified("report helper setup expired");
+  }
+  if (gateExpired()) {
+    // Setup crossed the deadline: no helper is launched, and the private temp is removed (awaited).
+    await Promise.resolve().then(() => helperTmp.remove(tmpDir, cleanupBudget())).catch(() => undefined);
+    return unverified("gate checkpoint deadline exhausted");
   }
   const wrapped = runnerCommand(process.execPath, argv);
   const helperEnv: NodeJS.ProcessEnv = { PATH: runnerPath() ?? HELPER_PATH, TMPDIR: tmpDir, TSX_DISABLE_CACHE: "1" };
@@ -1854,6 +2029,12 @@ async function reapProcessesViaHelper(
           () => resolve(opts.reportBudget!.signal.aborted || Date.now() >= opts.reportBudget!.deadline
             ? unverified("report helper cleanup expired") : r),
           () => resolve(unverified("report helper cleanup failed")));
+      } else if (gateDeadline !== undefined) {
+        // The helper has closed. Await the private-temp removal before resolving; an expiry at any
+        // stage turns a quiescent verdict unverified (a non-quiescent one already fails closed).
+        Promise.resolve().then(() => helperTmp.remove(tmpDir, cleanupBudget())).then(
+          () => resolve(r.state === "quiescent" && gateExpired() ? unverified("gate checkpoint deadline exhausted") : r),
+          () => resolve(unverified("gate checkpoint helper cleanup failed")));
       } else { removeTmp(); resolve(r); }
     };
     let reportFailure: ProcessQuiescence | undefined;
@@ -1891,10 +2072,11 @@ async function reapProcessesViaHelper(
     if (opts.reportBudget?.signal.aborted || ambient?.signal.aborted || resourceSignal?.aborted) cancelReport();
     timer = setTimeout(() => {
       killRunnerGroup(child.pid);
-      if (opts.reportBudget || ambient || scoped) reportFailure = unverified("quiescence helper timed out");
+      if (opts.reportBudget || ambient || scoped || gateDeadline !== undefined) reportFailure = unverified("quiescence helper timed out");
       else done(unverified("quiescence helper timed out"));
     }, Math.min(remaining ? Math.max(1, remaining()) : opts.timeoutMs ?? HELPER_TIMEOUT_MS, opts.reportBudget ? Math.max(1, Math.min(opts.timeoutMs ?? HELPER_TIMEOUT_MS,
-      opts.reportBudget.deadline - Date.now())) : opts.timeoutMs ?? HELPER_TIMEOUT_MS));
+      opts.reportBudget.deadline - Date.now())) : opts.timeoutMs ?? HELPER_TIMEOUT_MS,
+      gateDeadline === undefined ? Infinity : Math.max(1, gateDeadline - Date.now())));
     const out: Buffer[] = [];
     let outBytes = 0;
     if (scoped) {
@@ -1906,7 +2088,7 @@ async function reapProcessesViaHelper(
         outBytes += c.length;
         if (outBytes > HELPER_STDOUT_MAX) {
           killRunnerGroup(child.pid);
-          if (opts.reportBudget || ambient) reportFailure = unverified("quiescence helper output exceeded 1 MiB");
+          if (opts.reportBudget || ambient || gateDeadline !== undefined) reportFailure = unverified("quiescence helper output exceeded 1 MiB");
           else done(unverified("quiescence helper output exceeded 1 MiB"));
           return;
         }
@@ -1919,7 +2101,7 @@ async function reapProcessesViaHelper(
     child.stdin?.on("error", () => undefined);
     child.on("error", (err) => {
       const failure = unverified(`quiescence helper spawn failed: ${err.message}`);
-      if (opts.reportBudget || ambient || scoped) { reportFailure = failure; if (ambient || scoped) killRunnerGroup(child.pid); }
+      if (opts.reportBudget || ambient || scoped || gateDeadline !== undefined) { reportFailure = failure; if (ambient || scoped || gateDeadline !== undefined) killRunnerGroup(child.pid); }
       else done(failure);
     });
     child.on("close", (code, signal) => within(() => {
@@ -1986,6 +2168,7 @@ export async function reapRunProcesses(req: ScanRequest, opts: ReapRunOptions = 
       helperTmp: opts.helperTmp,
       reportBudget: opts.reportBudget,
       producerWorkLimits: opts.producerWorkLimits,
+      ...(opts.deadlineAt === undefined ? {} : { deadlineAt: opts.deadlineAt }),
     });
   }
     // In-process work keeps actual scoped parent metering and a sticky local envelope.
@@ -2303,6 +2486,10 @@ export interface QuiesceRunRequest {
   /** The runner site asking (e.g. `finalize`, `park:after_runner_git` for a re-proof after a
    *  runner-clone git): diagnostic only, the proof itself never reads it. */
   site?: string;
+  /** issue #3980: absolute epoch-ms deadline of a bounded Claude gate checkpoint. With it, every process
+   *  read, scan, helper, scoped lane and Docker request is admitted only while time is left and ends at
+   *  it; an expiry is `unverified`. Absent: byte-for-byte the unbounded behaviour. */
+  deadlineAt?: number;
 }
 
 /** The two halves' results. `process` is undefined when the process half was skipped. */
@@ -2345,7 +2532,7 @@ function reapScopedRunProcesses(
   return runClosedReaper(attempt, async lane => {
     const ambient = MaintenanceBudget.current();
     const deadline = Math.floor(Math.min(lane.deadlineAt, reportBudget?.deadline ?? Infinity,
-      helperDeadline, ambient ? Date.now() + ambient.remainingMs() : Infinity));
+      helperDeadline, ambient ? Date.now() + ambient.remainingMs() : Infinity, req.deadlineAt ?? Infinity));
     if (!Number.isSafeInteger(deadline) || deadline <= Date.now()) throw new Error("scoped reaper deadline");
     const signal = AbortSignal.any([lane.signal, ...(reportBudget ? [reportBudget.signal] : []),
       ...(ambient ? [ambient.signal] : [])]);
@@ -2441,9 +2628,46 @@ function reapScopedRunProcesses(
   });
 }
 
+/**
+ * Other live attempts' recorded roots (Claude CLI groups, Codex provider supervisors) plus every
+ * long-lived runner-uid root this worker launched and recorded itself. An attempt whose roots
+ * cannot be read contributes none, as before; issue #3915 counts it in the returned context so a
+ * refusal log shows whether the scan was missing a peer's roots.
+ */
+export function collectLiveRoots(
+  others: readonly Pick<RunAttempt, "runId" | "recordedRootPids">[],
+  workerRoots: readonly RecordedRoot[],
+): { roots: RecordedRoot[]; context: RootContext } {
+  let rootReadErrors = 0;
+  const attempts: RootContext["attempts"] = [];
+  const attemptRoots = others.flatMap((a) => {
+    let roots: RecordedRoot[] | undefined;
+    try {
+      roots = a.recordedRootPids();
+    } catch {
+      rootReadErrors += 1;
+    }
+    if (attempts.length < ROOT_CONTEXT_MAX_ATTEMPTS) {
+      attempts.push({ runId: sanitizeForLog(a.runId, 64), roots: roots === undefined ? "error" : roots.length });
+    }
+    return roots ?? [];
+  });
+  return {
+    roots: [...attemptRoots, ...workerRoots],
+    context: {
+      liveAttempts: others.length,
+      attemptRoots: attemptRoots.length,
+      workerRoots: workerRoots.length,
+      rootReadErrors,
+      attempts,
+    },
+  };
+}
+
 /** The process reap (unless skipped), then the Docker teardown. Never throws. */
 export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRunDeps = {}): Promise<QuiesceRunOutcome> {
   let processResult: ProcessQuiescence | undefined;
+  let rootContext: RootContext | undefined;
   const producerWorkLimits = req.producerWorkLimits === undefined ? deps.reap?.producerWorkLimits : req.producerWorkLimits;
   try {
     validateProducerWorkLimits(producerWorkLimits, req.mode, req.workerWide);
@@ -2453,9 +2677,11 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
     return { process: { state: "unverified", processes: [], killed: [], detail: (err as Error).message },
       docker: { state: "not_wired", removed: [], detail: "" } };
   }
-  const reapOptions = { ...deps.reap, producerWorkLimits };
+  const reapOptions = { ...deps.reap, producerWorkLimits, ...(req.deadlineAt === undefined ? {} : { deadlineAt: req.deadlineAt }) };
   if (req.processes) {
     const others = req.registry.others(req.attempt?.marker);
+    const collected = collectLiveRoots(others, workerRunnerRootPids());
+    rootContext = collected.context;
     const scan: ScanRequest = {
       mode: req.mode,
       targetUid: deps.targetUid ?? defaultTargetUid(),
@@ -2466,18 +2692,7 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
       mayKillUnreadableUnattributed:
         req.workerWide !== true && uidSplitActive() && req.otherClaimInFlight === false && others.length === 0,
       ...(req.workerWide === true ? { workerWide: true } : {}),
-      // Other live attempts' recorded roots (Claude CLI groups, Codex provider supervisors) plus
-      // every long-lived runner-uid root this worker launched and recorded itself.
-      liveRoots: [
-        ...others.flatMap((a) => {
-          try {
-            return a.recordedRootPids();
-          } catch {
-            return [];
-          }
-        }),
-        ...workerRunnerRootPids(),
-      ],
+      liveRoots: collected.roots,
       workerNonce: workerSpawnNonce(),
     };
     if (uidSplitActive() && hasReaperCaptureScope()) {
@@ -2494,13 +2709,26 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
       req.reportBudget ? { ...reapOptions, reportBudget: req.reportBudget,
         deadlineMs: Math.max(0, req.reportBudget.deadline - Date.now()) } : reapOptions);
   }
-  const docker = await teardownDocker({ ...deps.docker, dockerHost: req.dockerHost, targetPaths: req.targetPaths }).catch(
-    (err: unknown): DockerTeardown => ({ state: "docker_error", removed: [], detail: (err as Error).message }),
-  );
+  // issue #3980: the Docker request is admitted only before the gate deadline and bounded by what is
+  // left; past it nothing is sent and a quiescent process verdict is withdrawn (unverified).
+  const dockerLeft = req.deadlineAt === undefined ? Infinity : req.deadlineAt - Date.now();
+  let docker: DockerTeardown;
+  if (dockerLeft <= 0) {
+    docker = { state: "docker_error", removed: [], detail: "deadline exhausted" };
+    if (processResult?.state === "quiescent") {
+      processResult = { state: "unverified", processes: [], killed: processResult.killed, detail: "gate checkpoint deadline exhausted" };
+    }
+  } else {
+    docker = await teardownDocker({ ...deps.docker, dockerHost: req.dockerHost, targetPaths: req.targetPaths,
+      ...(req.deadlineAt === undefined ? {} : { deadlineMs: Math.min(deps.docker?.deadlineMs ?? 15_000, dockerLeft) }) }).catch(
+      (err: unknown): DockerTeardown => ({ state: "docker_error", removed: [], detail: (err as Error).message }),
+    );
+  }
   const ambient = MaintenanceBudget.current();
   if (ambient && (ambient.signal.aborted || ambient.remainingMs() <= 0)) {
     processResult = { state: "unverified", processes: [], killed: processResult?.killed ?? [], detail: "maintenance deadline exhausted" };
   }
+  if (processResult && processResult.state !== "quiescent" && rootContext) processResult = { ...processResult, rootContext };
   return { process: processResult, docker };
 }
 
@@ -2608,5 +2836,20 @@ export function describeProcesses(q: ProcessQuiescence | undefined): Array<Recor
     reason: sanitizeForLog(p.reason, 64),
     // issue #1783 M2: say plainly which entries are the operator's to identify and kill.
     ...(p.reason === "unreadable_unattributed" ? { attribution: "could not be attributed" } : {}),
+    // issue #3915: which identities were checked against which recorded roots, and how they missed.
+    ...(p.attribution ? { attribution_trace: p.attribution } : {}),
   }));
+}
+
+/** issue #3915: log fields for the other-attempt roots a non-quiescent scan was given. */
+export function describeRootContext(q: ProcessQuiescence | undefined): Record<string, unknown> | undefined {
+  const c = q?.rootContext;
+  if (!c) return undefined;
+  return {
+    live_attempts: c.liveAttempts,
+    attempt_roots: c.attemptRoots,
+    worker_roots: c.workerRoots,
+    root_read_errors: c.rootReadErrors,
+    attempts: c.attempts.map((a) => ({ run_id: a.runId, roots: a.roots })),
+  };
 }

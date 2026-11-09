@@ -55,6 +55,7 @@ it.each([0, 3])("renders limit %s and historical evidence even after captures di
   expect(screen.getByText("Worker recovery needs your decision")).toBeTruthy();
   expect(screen.getByText(`Automatic recovery limit: ${limit}. Used: ${limit}. Remaining: 0.`)).toBeTruthy();
   expect(screen.getByText("Lifetime automatic requeues: 8.")).toBeTruthy();
+  expect(screen.queryByText(/Resume starts another recovery episode/)).toBeNull();
   expect(screen.getByText("The server recorded checkpoint abc123 before this hold. Current availability and the latest local edits are not verified.")).toBeTruthy();
   expect(screen.getByText("A recovery capture was recorded as available at 2026-10-07T04:00:00Z. It may later expire or be discarded; it may not contain the latest local edits.")).toBeTruthy();
   expect(screen.getByText(/Publication is pending or uncertain/)).toBeTruthy();
@@ -242,13 +243,14 @@ function adoptionFailed(stamp: string | null = null): Run {
 }
 it.each([null, "2099-01-01T00:00:00Z", "2020-01-01T00:00:00Z", "invalid"])("adoption integrity refusal ignores retry timestamp %s and uses owner actions", async (stamp) => {
   const { container } = render(view(adoptionFailed(stamp), true));
-  expect(screen.getByText("Retained recovery integrity check failed")).toBeTruthy();
-  expect(screen.getByText(/Integrity checks refused to adopt the retained work/, { selector: "p" })).toBeTruthy();
+  expect(screen.getByText("Integrity hold needs your decision")).toBeTruthy();
+  expect(screen.getByText(/remediation record refused source use, so the agent did not start/, { selector: "p" })).toBeTruthy();
   expect(screen.getByText(/Local work and its custody are preserved/, { selector: "p" })).toBeTruthy();
   expect(screen.getByText(/This hold has no scheduled retry. Only the run owner can Resume or Cancel/)).toBeTruthy();
+  expect(screen.getByText("Resume starts another recovery episode. If the underlying block persists, the run can hold again. Each new claim adds a custody hold. Resolve the cause before resuming.")).toBeTruthy();
   expect(container.textContent).not.toMatch(/retry automatically|retrying in|retry in|Automatic retry is due|Retry timing is unavailable/i);
   const notice = container.querySelector('div.sr-only[role="status"]')!;
-  await waitFor(() => expect(notice.textContent).toMatch(/Integrity checks refused/));
+  await waitFor(() => expect(notice.textContent).toMatch(/Integrity hold/));
   expect(notice.textContent).toMatch(/no scheduled retry/);
   expect(api.getRunArchives).toHaveBeenCalledWith("held");
   fireEvent.click(screen.getByRole("button", { name: /^Resume$/ }));
@@ -268,6 +270,40 @@ it("adoption refusal requires steer permission and reacts to owner proof changes
   rerender(view(adoptionFailed(), true));
   expect((screen.getByRole("button", { name: /^Resume$/ }) as HTMLButtonElement).disabled).toBe(false);
   rerender(view(adoptionFailed(), false));
+  expect(screen.queryByRole("button", { name: /^(Resume|Cancel|Stop)/ })).toBeNull();
+});
+
+function unwitnessed(stamp: string | null = null): Run {
+  return { ...held(), recovery_wait_cause: "retained_continuation_unwitnessed", recovery_retry_not_before: stamp };
+}
+it.each([null, "2099-01-01T00:00:00Z", "2020-01-01T00:00:00Z", "invalid"])("unwitnessed continuation hold ignores retry timestamp %s and uses owner actions", async (stamp) => {
+  const { container } = render(view(unwitnessed(stamp), true));
+  expect(screen.getByText("Unwitnessed continuation hold needs your decision")).toBeTruthy();
+  expect(screen.getByText(/The continuation was never confirmed to start/, { selector: "p" })).toBeTruthy();
+  expect(screen.getByText(/Local work and its custody are kept/, { selector: "p" })).toBeTruthy();
+  expect(screen.getByText(/This hold has no scheduled retry. Only the run owner can Resume or Cancel/)).toBeTruthy();
+  expect(container.textContent).not.toMatch(/retry automatically|retrying in|retry in|Automatic retry is due|Retry timing is unavailable|integrity|quiescent|lost/i);
+  const notice = container.querySelector('div.sr-only[role="status"]')!;
+  await waitFor(() => expect(notice.textContent).toMatch(/never confirmed to start/));
+  expect(notice.textContent).toMatch(/no scheduled retry/);
+  expect(api.getRunArchives).toHaveBeenCalledWith("held");
+  fireEvent.click(screen.getByRole("button", { name: /^Resume$/ }));
+  await waitFor(() => expect(api.resumeRun).toHaveBeenCalledWith("held"));
+  await waitFor(() => expect(refreshRun).toHaveBeenCalledOnce());
+  fireEvent.click(screen.getByRole("button", { name: /^Cancel$/ }));
+  await waitFor(() => expect(submit).toHaveBeenCalledWith("cancel", "", undefined, undefined, false));
+});
+it.each([undefined, false])("unwitnessed continuation hold requires confirmed owner proof %s", (proof) => {
+  render(view(unwitnessed("2099-01-01T00:00:00Z"), proof));
+  expect(screen.queryByRole("button", { name: /^(Resume|Cancel|Stop)/ })).toBeNull();
+  expect(api.getRunArchives).not.toHaveBeenCalled();
+});
+it("unwitnessed continuation hold requires steer permission and reacts to owner proof changes", () => {
+  const { rerender } = render(view(unwitnessed(), true, false));
+  expect(screen.queryByRole("button", { name: /^(Resume|Cancel|Stop)/ })).toBeNull();
+  rerender(view(unwitnessed(), true));
+  expect((screen.getByRole("button", { name: /^Resume$/ }) as HTMLButtonElement).disabled).toBe(false);
+  rerender(view(unwitnessed(), false));
   expect(screen.queryByRole("button", { name: /^(Resume|Cancel|Stop)/ })).toBeNull();
 });
 

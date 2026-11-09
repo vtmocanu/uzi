@@ -6,6 +6,7 @@ import type { FakePrDescApi, PrDescOp } from "./fake-pr-desc-api.js";
 import type {
   ClaimResponse,
   CompletionPermitResponse,
+  IterationParkRefusalReason,
   OutgoingMessage,
   RunOrphanClassificationResponse,
   StateRequest,
@@ -268,6 +269,14 @@ export class FakeApi {
   /** Per-run wire fixtures; absent entries preserve the legacy incomplete ownership DTO. */
   readonly completionHoldWire = new Map<string, (res: http.ServerResponse) => void>();
   readonly ownershipWire = new Map<string, (res: http.ServerResponse) => void>();
+  /** Issue #3860: per-run `cancellation_requested` served on the default ownership bodies. An absent
+   *  entry (the default) omits the field, as an older api does. Tests serving their own
+   *  {@link ownershipWire} read this map themselves. */
+  readonly cancellationRequested = new Map<string, unknown>();
+  /** Issue #3974: opt in (off by default) to serving `cancellation_requested` on the default ownership
+   *  bodies the way the server derives it: the run's stop kind is `cancelled` AND a cancel row of the
+   *  run is still unapplied. An explicit {@link cancellationRequested} entry wins. */
+  deriveCancellationRequested = false;
   readonly committedHoldOwnership = new Map<string, unknown>();
   guardedQuestionStatus: string | undefined;
   workerPauseRefused = false;
@@ -319,6 +328,12 @@ export class FakeApi {
   unauthorized = 0;
   stateAttempts = 0;
   readonly states: Array<{ runId: string; body: StateRequest }> = [];
+  readonly repoAgentSourceByRun = new Map<string, string>();
+  repoAgentSourceAckDelayMs = 0;
+  planAgentSourceAckHold: Promise<void> | undefined;
+  /** Issue #3859: every /state body as it arrived on the wire, including reports the fake then
+   *  refuses (which `states` omits because the real server persists nothing for a refusal). */
+  readonly stateWire: Array<{ runId: string; body: StateRequest }> = [];
   // PRD #1247 M5b: a GLOBAL, ordered log of the mutating requests as they land, so a test can pin
   // RELATIVE ORDER across the two endpoints the single `states`/`messageBatches` arrays cannot show
   // (e.g. that a message batch DRAINED before the credential_switch state report). Each accepted
@@ -408,6 +423,10 @@ export class FakeApi {
     runId: string;
     body: Record<string, unknown>;
   }> = [];
+  readonly iterationParkRequests: Array<{ runId: string; body: Record<string, unknown> }> = [];
+  private iterationParkResponse: { httpStatus: number; body: Record<string, unknown> } | undefined;
+  private iterationParkLoseFirstReply = false;
+  private readonly iterationParkCommits = new Map<string, Record<string, unknown>>();
   private wallParkStatus = "paused";
   private wallParkHttpStatus = 200;
   private wallParkLoseFirstReply = false;
@@ -468,6 +487,11 @@ export class FakeApi {
   } = { queue: [], fallback: { status: 204 } };
   readonly leadConfigPosts: Array<{ runId: string; body: Record<string, unknown> }> = [];
 
+  /** Issue #3251: the codex-catalog-default route. Every POST body is recorded; the answer is
+   *  `codexCatalogDefault.status` (default 204 = stored). */
+  codexCatalogDefault: { status: number } = { status: 204 };
+  readonly codexCatalogDefaultPosts: Array<{ runId: string; body: Record<string, unknown> }> = [];
+
   constructor(private readonly token: string) {
     this.server = http.createServer((req, res) => {
       this.handle(req, res).catch((err) => {
@@ -524,6 +548,36 @@ export class FakeApi {
     await new Promise<void>((resolve, reject) =>
       this.server.close((err) => (err ? reject(err) : resolve())),
     );
+  }
+
+  /** Claims served on POST /runs/claim (200 responses only). */
+  claimsServed = 0;
+  /** Requeues modelled by {@link requeueRun}. */
+  requeues = 0;
+
+  /** A MODEL of the server's requeue of a run whose flight is missing: it re-offers the run at
+   *  `nextGeneration` (the next claim) and counts one requeue. It does not reproduce the server's
+   *  detection or timing; a test calls it when it decides the server would have requeued. */
+  requeueRun(claim: ClaimResponse, nextGeneration: number): ClaimResponse {
+    this.requeues++;
+    const next = { ...claim, claim_generation: nextGeneration };
+    this.setOwnershipStatus(claim.run_id, "running", nextGeneration);
+    this.enqueueClaim(next);
+    return next;
+  }
+
+  /** Redispatches injected by {@link redispatchRun}. */
+  redispatches = 0;
+
+  /** A TEST-INJECTED redispatch: it re-offers the run at `nextGeneration` after a confirmed park, as
+   *  a test's stand-in for any later claim. It is NOT automatic requeue accounting: a confirmed owner
+   *  hold has no automatic retry, and this does not touch {@link requeues}. */
+  redispatchRun(claim: ClaimResponse, nextGeneration: number): ClaimResponse {
+    this.redispatches++;
+    const next = { ...claim, claim_generation: nextGeneration };
+    this.setOwnershipStatus(claim.run_id, "running", nextGeneration);
+    this.enqueueClaim(next);
+    return next;
   }
 
   enqueueClaim(claim: ClaimResponse): void {
@@ -919,6 +973,18 @@ export class FakeApi {
     return [...(this.inputsByRun.get(runId) ?? [])];
   }
 
+  /** Issue #3860: input rows the server still holds as pending (not yet applied/consumed). */
+  pendingInputRows(runId: string): UserInput[] {
+    const applied = this.appliedByRun.get(runId) ?? new Set<number>();
+    return (this.inputsByRun.get(runId) ?? []).filter(r => !applied.has(r.id));
+  }
+
+  /** Issue #3974: the derived `cancellation_requested`: stop_kind 'cancelled' with an unapplied cancel row. */
+  private cancelStillPending(runId: string): boolean {
+    return this.stopKindByRun.get(runId) === "cancelled" &&
+      this.pendingInputRows(runId).some((row) => row.kind === "cancel");
+  }
+
   isAcked(runId: string, id: number): boolean {
     return this.ackedByRun.get(runId)?.has(id) ?? false;
   }
@@ -1097,6 +1163,23 @@ export class FakeApi {
    *  answers with (default 200/"paused" = a landed park; 409 with a non-"paused" status models a
    *  REFUSED park the client must NOT throw on; a 404/5xx models an UNDELIVERABLE report the client
    *  THROWS on, D17). */
+  /** Flat iteration disposition; an omitted generation echoes the request's fence. */
+  setIterationParkResponse(body: Record<string, unknown>, httpStatus = 200): void {
+    this.iterationParkResponse = { body, httpStatus };
+  }
+
+  setIterationParkRefusal(reason: IterationParkRefusalReason, status = "running", claimGeneration?: number): void {
+    this.setIterationParkResponse({
+      applied: false, status, hold_reason: "", reason,
+      ...(claimGeneration === undefined ? {} : { claim_generation: claimGeneration }),
+    }, 409);
+  }
+
+  commitIterationParkThenLoseFirstReply(): void {
+    this.iterationParkLoseFirstReply = true;
+    this.iterationParkCommits.clear();
+  }
+
   setWallParkResponse(status: string, httpStatus = 200, budget?: { total?: number; used?: number; completionAttempts?: number }): void {
     this.wallParkStatus = status;
     this.wallParkHttpStatus = httpStatus;
@@ -1228,6 +1311,7 @@ export class FakeApi {
     if (req.method === "POST" && p === "/api/worker/runs/claim") {
       const claim = this.claimQueue.shift();
       if (!claim) return sendEmpty(res, 204);
+      this.claimsServed++;
       return send(res, 200, claim);
     }
 
@@ -1609,13 +1693,20 @@ export class FakeApi {
         return send(res, 200, this.committedHoldOwnership.get(runId));
       if (this.parkRunOwnership) return send(res, 200, this.parkRunOwnership);
       const o = this.ownershipByRun.get(runId);
+      const cr = this.cancellationRequested.has(runId) ? { cancellation_requested: this.cancellationRequested.get(runId) }
+        : this.deriveCancellationRequested ? {
+          cancellation_requested: this.cancelStillPending(runId),
+          // The server names the claim the answer is about; a probe only trusts a positive one.
+          claim_generation: o?.generation ?? this.receiptGeneration.get(runId), claim_released: false,
+        } : {};
       if (this.planRevisionRetries && (!o || o.httpStatus === 200)) return send(res, 200, {
         status: o?.status ?? this.lastRecordedStatus.get(runId) ?? "running",
         claim_generation: o?.generation ?? this.receiptGeneration.get(runId),
         gate_revision: this.gateByRun.get(runId)?.revision ?? 0,
         claim_released: false,
+        ...cr,
       });
-      if (!o) return send(res, 200, { status: "running" });
+      if (!o) return send(res, 200, { status: "running", ...cr });
       if (o.httpStatus !== 200)
         return send(res, o.httpStatus, { error: "run not found for this worker" });
       // PRD #1391 Run B M4: claim_generation is additive on the probe body; include it only when the
@@ -1624,6 +1715,7 @@ export class FakeApi {
       if (o.generation !== undefined) body.claim_generation = o.generation;
       if (o.inventoryGuarded !== undefined) body.inventory_guarded = o.inventoryGuarded;
       if (o.holdReason !== undefined) body.hold_reason = o.holdReason;
+      Object.assign(body, cr);
       return send(res, 200, body);
     }
 
@@ -1702,6 +1794,14 @@ export class FakeApi {
       return send(res, answer.status, answer.reason ? { error: "fake lead-config refusal", reason: answer.reason } : {});
     }
 
+    // Issue #3251: the Codex catalog default route.
+    const catalogDefaultMatch = /^\/api\/worker\/runs\/([^/]+)\/codex-catalog-default$/.exec(p);
+    if (catalogDefaultMatch && req.method === "POST") {
+      this.codexCatalogDefaultPosts.push({ runId: catalogDefaultMatch[1] as string, body: json as Record<string, unknown> });
+      if (this.codexCatalogDefault.status === 204) return sendEmpty(res, 204);
+      return send(res, this.codexCatalogDefault.status, { error: "fake codex-catalog-default refusal" });
+    }
+
     // PRD #1798 M6: the pr-description routes, answered by an in-memory model when a test installs
     // one (prDescription); without one they fall through to the 404 below, like an older api.
     const prDescMatch = /^\/api\/worker\/runs\/([^/]+)\/pr-description\/(stage|bind|lookup|ack)$/.exec(p);
@@ -1773,9 +1873,36 @@ export class FakeApi {
       });
     }
 
-    // PRD #1497 M2: the wall-park endpoint. Records the request and answers the configured
-    // {run:{status}} at the configured HTTP status (200 landed / 409 refused / 404|5xx undeliverable).
-    // On an undeliverable status the RunDTO is still shaped but the client throws on the non-200/409.
+    // Iteration parks use a flat, generation-bound disposition. A lost reply leaves
+    // the committed ownership visible and the duplicate request gets its original ACK.
+    const iterationParkMatch = /^\/api\/worker\/runs\/([^/]+)\/iteration-park$/.exec(p);
+    if (req.method === "POST" && iterationParkMatch) {
+      const runId = iterationParkMatch[1] as string;
+      this.iterationParkRequests.push({ runId, body: json });
+      const key = `${runId}:${String(json.claim_generation)}`;
+      const committed = this.iterationParkCommits.get(key);
+      if (committed) return send(res, 200, committed);
+      const ack: Record<string, unknown> = {
+        claim_generation: json.claim_generation,
+        ...(this.iterationParkResponse?.body ?? {
+          applied: true, status: "paused", hold_reason: "iteration_budget_exhausted",
+        }),
+      };
+      if ((this.iterationParkResponse?.httpStatus ?? 200) === 200 && ack.applied === true &&
+          ack.status === "paused" && ack.claim_generation === json.claim_generation &&
+          ack.hold_reason === "iteration_budget_exhausted") {
+        this.setOwnershipStatus(runId, "paused", json.claim_generation as number);
+      }
+      if (this.iterationParkLoseFirstReply) {
+        this.iterationParkLoseFirstReply = false;
+        this.iterationParkCommits.set(key, ack);
+        req.socket.destroy();
+        return;
+      }
+      return send(res, this.iterationParkResponse?.httpStatus ?? 200, ack);
+    }
+
+    // Wall parks retain their separate, legacy nested RunDTO protocol.
     const wallParkMatch = /^\/api\/worker\/runs\/([^/]+)\/wall-park$/.exec(p);
     if (req.method === "POST" && wallParkMatch) {
       const runId = wallParkMatch[1] as string;
@@ -1883,6 +2010,7 @@ export class FakeApi {
     json: Record<string, unknown>,
   ): Promise<void> {
     this.stateAttempts++;
+    this.stateWire.push({ runId, body: structuredClone(json) as unknown as StateRequest });
     if (this.strictDecodeStateRemaining > 0) {
       this.strictDecodeStateRemaining--;
       // The exact 400 shape httpx.DecodeJSON (DisallowUnknownFields) produces for an unknown field.
@@ -2046,6 +2174,15 @@ export class FakeApi {
         body: JSON.stringify(body), revision: gateRevision, inputId: body.revision_input_id, superseded: [...superseded],
       });
     }
+    if (body.repo_agent_source_commit !== undefined) {
+      if (this.repoAgentSourceAckDelayMs > 0) await new Promise((r) => setTimeout(r, this.repoAgentSourceAckDelayMs));
+      const stored = this.repoAgentSourceByRun.get(runId);
+      if (stored !== undefined && stored !== body.repo_agent_source_commit) {
+        return send(res, 409, { error: "the run already records a different repo-agent source revision", reason: "repo_agent_source_conflict" });
+      }
+      this.repoAgentSourceByRun.set(runId, body.repo_agent_source_commit);
+    }
+    if (body.plan_agent_source !== undefined && this.planAgentSourceAckHold) await this.planAgentSourceAckHold;
     if (this.checkedTransport && body.status === "awaiting_approval") this.checkedFencedRuns.add(runId);
     this.states.push({ runId, body });
     this.requestLog.push(`state:${body.status}`);
@@ -2107,6 +2244,7 @@ export class FakeApi {
       run: {
         id: runId,
         worker_id: this.registeredWorkerId,
+        ...(this.repoAgentSourceByRun.has(runId) ? { repo_agent_source_commit: this.repoAgentSourceByRun.get(runId) } : {}),
         ...(body.recovery_cause === "worker_memory_pressure" && this.memoryWorkerId &&
             body.register_nonce === this.memoryRegisterNonce ? {
           worker_id: this.memoryWorkerId, recovery_wait_cause: body.recovery_cause,

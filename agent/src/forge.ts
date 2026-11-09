@@ -54,10 +54,11 @@ export const MR_DETAIL_MAX_BYTES = 6 * 1_048_576 + 64 * 1024;
 
 /** PRD #1798 M6 (H1): the byte cap on the find-existing LIST read (findOpenMr on GitLab and GitHub).
  *  The list is filtered to open MRs/PRs for one source and target branch, and both forges allow only
- *  one open MR/PR per such pair, so it normally carries a single object: the cap admits one
+ *  one open MR/PR per such pair from one source project, so it normally carries a single object
+ *  (on GitLab, plus any fork MR reusing the branch name): the cap admits one
  *  worst-case object (MR_DETAIL_MAX_BYTES) with room to spare, while a list that grew past a few MiB
- *  (a forge ignoring the filter, or a hostile answer) is refused instead of buffered. Only the first
- *  element is ever used. */
+ *  (a forge ignoring the filter, or a hostile answer) is refused instead of buffered. GitLab scans the
+ *  list for an own-project match; GitHub uses only the first element. */
 export const MR_LIST_MAX_BYTES = 8 * 1_048_576;
 
 /** The bytes an error body is read to before it is cut (the message keeps 512 characters). */
@@ -104,11 +105,13 @@ export interface MergeRequestDetail {
 }
 
 export class ForgeError extends Error {
-  constructor(
-    readonly status: number,
-    readonly detail: string,
-  ) {
+  declare readonly status: number;
+  declare readonly detail: string;
+
+  constructor(status: number, detail: string) {
     super(`forge API returned ${status}: ${detail}`);
+    this.status = status;
+    this.detail = detail;
     this.name = "ForgeError";
   }
 }
@@ -118,8 +121,11 @@ export class ForgeError extends Error {
  *  classifyForgeError checks for it before reading a bare status 0 as a transport failure. Every
  *  caller treats it as an unreadable MR/PR. */
 export class ForgeResponseTooLarge extends ForgeError {
-  constructor(readonly maxBytes: number) {
+  declare readonly maxBytes: number;
+
+  constructor(maxBytes: number) {
     super(0, `response too large (over ${maxBytes} bytes)`);
+    this.maxBytes = maxBytes;
     this.name = "ForgeResponseTooLarge";
   }
 }
@@ -377,7 +383,20 @@ export class GitLabClient extends HttpForgeClient {
     const res = await this.request("GET", q, p.pat, undefined, signal);
     if (res.status !== 200) return undefined;
     const list = safeJson(await readCapped(res, MR_LIST_MAX_BYTES));
-    if (Array.isArray(list) && list.length > 0) return parseGitlabMr(list[0]);
+    if (!Array.isArray(list)) return undefined;
+    // The project-scoped list also returns MRs opened FROM FORKS into this project, and a
+    // fork can use the same branch name. Adopt only an open MR whose source project is the
+    // target project (both numeric, as GitLab sends them) on exactly these branches; anything
+    // else is not ours, and the create's 409 propagates.
+    for (const item of list) {
+      if (!item || typeof item !== "object") continue;
+      const rec = item as Record<string, unknown>;
+      const src = rec["source_project_id"];
+      if (typeof src !== "number" || src !== rec["target_project_id"]) continue;
+      if (rec["state"] !== "opened") continue;
+      if (rec["source_branch"] !== p.sourceBranch || rec["target_branch"] !== p.targetBranch) continue;
+      return parseGitlabMr(rec);
+    }
     return undefined;
   }
 

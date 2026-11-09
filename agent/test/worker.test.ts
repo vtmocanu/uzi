@@ -994,6 +994,7 @@ describe("Worker — job dispatch and capability (PRD #1908 M4)", () => {
     assert.ok(caps?.includes("cross_check_gated_v1"), "the gated plan cross-check capability (PRD #3708 M2) is advertised independently of Codex availability");
     assert.ok(caps?.includes("cross_check_semantic_plan_v1") && caps?.includes("completion_semantic_publication_v1"), "the dormant semantic capabilities are advertised independently of Codex availability");
     assert.ok(caps?.includes("ci_config_guard_v1"), "ci_config_guard_v1 (issue #2865) is advertised unconditionally, even when Codex is unavailable");
+    assert.ok(caps?.includes("repo_agent_source_v1"), "repo_agent_source_v1 (issue #3913) is advertised unconditionally");
     assert.equal(caps?.includes("ci_artifacts_v1"), process.platform === "linux", "artifact capability requires the descriptor-backed consumer");
   });
 });
@@ -1023,6 +1024,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     "forge_api_success_v1",
     "recovery_held_publication_v1",
     "recovery_held_publication_v2",
+    "recovery_bindingless_closed_v1",
     "recovery_prerequisite_closure_v1",
     "credential_switch_v1",
     "milestone_reconciliation_claim_v1",
@@ -1042,8 +1044,11 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     "cross_check_codex_lead_v1",
     "cross_check_gated_v1",
     "cross_check_semantic_plan_v1",
+    "cross_check_owner_steering_v1",
     "completion_semantic_publication_v1",
     "ci_config_guard_v1",
+    "repo_agent_source_v1",
+    "agent_source_request_v1",
     ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),
   ];
   // A client whose register() captures the protocol-capabilities argument (5th param) so a
@@ -1095,7 +1100,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     );
     assert.deepStrictEqual(
       caps,
-      [...ALWAYS_PRESENT_PROTOCOL_CAPS, CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY, CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY],
+      [...ALWAYS_PRESENT_PROTOCOL_CAPS, CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY, CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, "pending_outcome_scoped_claim_v1"],
       "an advertising result appends codex_harness_v1 then codex_custom_model_v1 (PRD #1551 D6) after the always-present protocol caps (v2 by PRD #1349 M1, credential_switch_v1 by PRD #1247 M5b, wall_park_v1 by PRD #1497 M2)",
     );
   });
@@ -1116,7 +1121,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     );
     assert.deepStrictEqual(
       caps,
-      ALWAYS_PRESENT_PROTOCOL_CAPS,
+      [...ALWAYS_PRESENT_PROTOCOL_CAPS, "pending_outcome_scoped_claim_v1"],
       "a non-advertising result leaves the always-present protocol caps unchanged (Claude service intact)",
     );
     assert.ok(!caps?.includes(CODEX_HARNESS_CAPABILITY), "codex_harness_v1 is absent when not advertising");
@@ -1129,7 +1134,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     const caps = await advertisedCapabilities(fakeConfig());
     assert.deepStrictEqual(
       caps,
-      ALWAYS_PRESENT_PROTOCOL_CAPS,
+      [...ALWAYS_PRESENT_PROTOCOL_CAPS, "pending_outcome_scoped_claim_v1"],
       "an absent availability result advertises only the always-present protocol caps",
     );
   });

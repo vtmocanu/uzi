@@ -626,6 +626,44 @@ describe("Claude cross-check activity evidence (PRD #3166)", () => {
     assert.doesNotMatch(JSON.stringify(all), /SECRET_QUERY_xyz/);
   });
 
+  it("a content-mode Grep that returned lines records no match count, never a false 0 (#3794)", async () => {
+    const { events } = await capture([
+      initFrame(),
+      use("c1", "Grep", { pattern: "q", path: "src", output_mode: "content" }),
+      done("c1", { mode: "content", numFiles: 0, filenames: [], content: "src/a.ts:1:q\nsrc/b.ts:4:q", numLines: 5, totalLines: 5 }),
+      resultFrame(APPROVE),
+    ]);
+    assert.deepEqual(events, [{ event: "check_activity", op: "search", outcome: "ok", path: "src" }]);
+  });
+
+  it("a Grep count comes only from its own mode's field and never falls back across modes", async () => {
+    const grep = (id: string, result: Record<string, unknown>) => [use(id, "Grep", { pattern: "q", path: "src" }), done(id, result)];
+    const { events } = await capture([
+      initFrame(),
+      ...grep("z", { mode: "content", numFiles: 0, filenames: [], content: "", numLines: 0, totalLines: 0 }),
+      ...grep("past", { mode: "content", numFiles: 0, filenames: [], content: "", numLines: 0, totalLines: 7, appliedOffset: 20 }),
+      ...grep("noTotal", { mode: "content", numFiles: 0, filenames: [], content: "", numLines: 0 }),
+      ...grep("negTotal", { mode: "content", numFiles: 0, filenames: [], content: "", numLines: 0, totalLines: -1 }),
+      ...grep("fracTotal", { mode: "content", numFiles: 0, filenames: [], content: "", numLines: 0, totalLines: 1.5 }),
+      ...grep("noMode", { numFiles: 3, filenames: ["a", "b", "c"] }),
+      ...grep("unknownMode", { mode: "other", numFiles: 3, filenames: ["a", "b", "c"] }),
+      ...grep("numericMode", { mode: 7, numFiles: 3, filenames: ["a", "b", "c"] }),
+      ...grep("countNoMatches", { mode: "count", numFiles: 4, filenames: [] }),
+      ...grep("count", { mode: "count", numFiles: 4, filenames: [], numMatches: 9 }),
+      ...grep("files", { mode: "files_with_matches", numFiles: 2, filenames: ["a", "b"] }),
+      resultFrame(APPROVE),
+    ]);
+    const ok = { event: "check_activity", op: "search", outcome: "ok", path: "src" };
+    assert.deepEqual(events, [
+      { ...ok, matches: 0 },
+      ok, ok, ok, ok,
+      ok, ok, ok,
+      ok,
+      { ...ok, matches: 9 },
+      { ...ok, matches: 2 },
+    ]);
+  });
+
   it("a read under the checker HOME is tool_output and carries no path", async () => {
     const s = scratch();
     const events: Record<string, unknown>[] = [];

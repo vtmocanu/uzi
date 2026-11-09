@@ -111,10 +111,18 @@ func (h *Handler) saveCrossCheckPins(ctx context.Context, patches []store.PatchU
 	return tx.Commit(ctx)
 }
 
-func (h *Handler) crossCheckPinSettings(ctx context.Context, userID uuid.UUID) ([]crossCheckPinDTO, error) {
+// crossCheckPinSettings returns the four pin cells and, as a second value, the lead
+// template's Codex pin (template_codex_model) from the same rows: the LATERAL
+// lead/orchestrator selection is the one rule, identical on every row, so the first
+// row carries it (invalid when there are no rows or no pin).
+func (h *Handler) crossCheckPinSettings(ctx context.Context, userID uuid.UUID) ([]crossCheckPinDTO, pgtype.Text, error) {
 	rows, err := h.q.ListUserCrossCheckPins(ctx, userID)
 	if err != nil {
-		return nil, err
+		return nil, pgtype.Text{}, err
+	}
+	var leadCodexPin pgtype.Text
+	if len(rows) > 0 {
+		leadCodexPin = rows[0].TemplateCodexModel
 	}
 	cells := make([]crossCheckPinDTO, 0, len(rows))
 	for _, row := range rows {
@@ -126,13 +134,15 @@ func (h *Handler) crossCheckPinSettings(ctx context.Context, userID uuid.UUID) (
 		}
 		resolved := agenttmpl.ResolveCrossCheck(row.Harness, model, effort,
 			textPtrValue(workerModel.Valid, workerModel.String),
-			textPtrValue(row.TemplateModel.Valid, row.TemplateModel.String))
+			textPtrValue(row.TemplateModel.Valid, row.TemplateModel.String),
+			textPtrValue(row.TemplateCodexModel.Valid, row.TemplateCodexModel.String))
 		workerDefault := agenttmpl.ResolveCrossCheck(row.Harness, nil, nil,
 			textPtrValue(workerModel.Valid, workerModel.String),
-			textPtrValue(row.TemplateModel.Valid, row.TemplateModel.String))
+			textPtrValue(row.TemplateModel.Valid, row.TemplateModel.String),
+			textPtrValue(row.TemplateCodexModel.Valid, row.TemplateCodexModel.String))
 		cells = append(cells, crossCheckPinDTO{Stage: row.Stage, Harness: row.Harness, WorkerDefaultModel: workerDefault.Model,
 			Model: model, Effort: effort, ResolvedModel: resolved.Model, ResolvedEffort: resolved.Effort,
 			ModelSource: resolved.ModelSource, EffortSource: resolved.EffortSource, Active: true})
 	}
-	return cells, nil
+	return cells, leadCodexPin, nil
 }

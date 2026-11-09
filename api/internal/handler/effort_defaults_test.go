@@ -103,9 +103,9 @@ func TestEffortDefaultsFixtureOrdinary(t *testing.T) {
 		// The settings DTO projection: the cell for this harness carries the same outcome.
 		var cells []apitypes.EffortSettingCellDTO
 		if c.Harness == "codex" {
-			cells = effortSettingCells(nil, c.Stored)
+			cells = effortSettingCells(nil, c.Stored, nil)
 		} else {
-			cells = effortSettingCells(c.Stored, nil)
+			cells = effortSettingCells(c.Stored, nil, nil)
 		}
 		if len(cells) != 2 || cells[0].Harness != "claude" || cells[1].Harness != "codex" {
 			t.Fatalf("%s: cells = %+v, want claude then codex", c.ID, cells)
@@ -157,7 +157,7 @@ func TestEffortDefaultsFixtureChecker(t *testing.T) {
 	var ids []string
 	for _, c := range f.Checker {
 		ids = append(ids, c.ID)
-		r := agenttmpl.ResolveCrossCheck(c.Family, nil, c.Pin, nil, nil)
+		r := agenttmpl.ResolveCrossCheck(c.Family, nil, c.Pin, nil, nil, nil)
 		if r.Effort != c.Expect.Effort || r.EffortSource != c.Expect.Source {
 			t.Errorf("%s: checker = %q/%q, want %q/%q", c.ID, r.Effort, r.EffortSource, c.Expect.Effort, c.Expect.Source)
 		}

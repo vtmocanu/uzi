@@ -6,11 +6,12 @@ import { acquireWorkerLifetime } from "./authority-lock.js";
 import { installWorkerLifetime, requireWorkerLifetime } from "./completion-authority.js";
 import { AuthorityRuntime } from "./authority-runtime.js";
 import { createLogger, type Logger } from "./log.js";
+import { startMainWatchdog } from "./main-watchdog.js";
 import { maintenanceBootstrapRoots, readMaintenancePosture, recordMaintenanceBootstrap, snapshotMaintenanceBootstrap, terminalMaintenanceProof } from "./run-quiescence.js";
 import { MaintenanceWriterExclusion } from "./maintenance-exclusion.js";
 import { WorkerClient, RequestError } from "./client.js";
 import { GitCache, type GitCacheOptions } from "./git.js";
-import { StubExecutor } from "./executor.js";
+import { StubExecutor, waitForStubOutboxCut } from "./executor.js";
 import { SdkExecutor } from "./sdk-executor.js";
 import { selectCodexBinding, CodexSelectionError } from "./codex/select.js";
 import { CodexExecutor, FailClosedExecutor, CODEX_PRODUCTION_PROVIDER, makeProductionCodexAdviceHarnessFactory } from "./codex/codex-executor.js";
@@ -34,6 +35,7 @@ import { stubJobQueryFn } from "./job-runner-stub.js";
 import { Worker } from "./worker.js";
 import { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
 import { createDindPrune, DindPruneGate } from "./dind-prune.js";
+import { createDindVolumePrune } from "./dind-volume-prune.js";
 import { RetainedSourceServer } from "./ops/retained-source-server.js";
 import { DindMaintenanceController } from "./dind-maintenance.js";
 import { reclaimStrandedRunHomes, type RunStatusLookup } from "./home-reclaim.js";
@@ -57,6 +59,7 @@ import { ensureRunnerTmpdir } from "./runner-tmpdir.js";
 import { createPodEpoch, restoreEpochRuntimeTmpdir } from "./pod-epoch-lock.js";
 import { inspectPodEpochBootstrap } from "./pod-epoch-bootstrap.js";
 import { PodEpochSettlementError, runPodEpochShadow } from "./pod-epoch-reclaim.js";
+import { armShutdownResultDeadline, finishWorkerShutdown, type ShutdownGate, type ShutdownLog } from "./shutdown-barrier.js";
 
 export function buildWorkerGitCache(
   config: Pick<Config, "dataDir" | "recoveryDecodedLimitBytes">,
@@ -72,6 +75,22 @@ export function buildWorkerGitCache(
     authority: authority.hooks,
     authorityRequired: true,
   });
+}
+
+/** The publication fixture is inert outside the stub lane and its exclusive sentinel. */
+export function buildAfterPublicationEnrolled(
+  executor: ExecutorKind,
+  log: Logger,
+): RunnerOptions["afterPublicationEnrolled"] {
+  if (executor !== "stub") return undefined;
+  return async ({ runId, claimGeneration, issueDescription, signal }) => {
+    if (!issueDescription.includes("UZI_STUB_OUTBOX_PUBLICATION_CUT_BARRIER")) return;
+    await waitForStubOutboxCut(runId, signal, () => {
+      log.info("stub: outbox publication enrolled waiting for API cut", {
+        run_id: runId, claim_generation: claimGeneration,
+      });
+    });
+  };
 }
 
 /** Only the stub lane may accelerate retry spacing. No predicates or pass cap change. */
@@ -171,6 +190,8 @@ export function startupReapVerdict(result: ReapOrphansResult | undefined, aborte
 let fatalLog: Logger | undefined;
 let lifecyclePhase: "config" | "startup" | "reap" | "worker" | "stopped" = "config";
 let shutdownSignal: "SIGINT" | "SIGTERM" | undefined;
+/** issue #4066: how long after the first signal (or barrier entry, when no signal came) the worker has to report its shutdown result (k8s grace is longer). */
+const SHUTDOWN_RESULT_DEADLINE_MS = 35_000;
 
 /** Dependencies {@link buildRunExecutor} needs, factored out of `main()`'s closure so
  *  the seam is callable in isolation (PRD #1429 M6 test). Production always supplies
@@ -347,13 +368,54 @@ async function main(): Promise<void> {
   // #3031 E1: the FIRST statement, after the static import graph and before any app spawn or
   // claim. It pins the exact tsx esbuild child (or none); nothing is ever enrolled later.
   recordMaintenanceBootstrap(snapshotMaintenanceBootstrap());
+  // #3896: observe-only main-thread watchdog; failure-isolated, never throws.
+  const watchdog = startMainWatchdog();
+  try {
+    await mainBody();
+  } finally {
+    await watchdog.stop();
+  }
+}
+
+async function mainBody(): Promise<void> {
   // Register cancellation before bounded lock waits, config/token reads or any
   // protected startup access. Runtime shutdown hooks are installed once built.
   const controller = new AbortController();
   let shutdownRuntime: (() => void) | undefined;
+  // issue #4066: the shutdown budget starts at the FIRST signal, or at barrier entry when no signal came; a repeated
+  // signal resets nothing. The observer is
+  // armed with a lazily bound snapshot: the authority runtime (and the git cache) may not exist yet at an early signal.
+  let shutdownDeadlineAt: number | undefined;
+  let shutdownBarrierStarted = false;
+  let shutdownAuthority: AuthorityRuntime | undefined;
+  let shutdownGit: GitCache | undefined;
+  const shutdownLog: ShutdownLog = {
+    info: (message, fields) => {
+      if (fatalLog) fatalLog.info(message, fields);
+      else process.stderr.write(JSON.stringify({ level: "info", msg: message, ...fields }) + "\n");
+    },
+    warn: (message, fields) => {
+      if (fatalLog) fatalLog.warn(message, fields);
+      else process.stderr.write(JSON.stringify({ level: "warn", msg: message, ...fields }) + "\n");
+    },
+  };
+  // Idempotent: the first call fixes the deadline and arms the one observer; a later call (a repeated signal, or the
+  // barrier after a signal) changes nothing.
+  const armShutdownObserver = (): number => {
+    const deadlineAt = (shutdownDeadlineAt ??= Date.now() + SHUTDOWN_RESULT_DEADLINE_MS);
+    armShutdownResultDeadline({
+      deadlineAt, log: shutdownLog,
+      snapshot: () => shutdownAuthority?.snapshot({
+        unsettled_delete: shutdownGit?.unsettledDeleteCount() ?? 0,
+        pin_continuation: shutdownGit?.pendingArchivedPinContinuations() ?? 0,
+      }),
+    });
+    return deadlineAt;
+  };
   for (const sig of ["SIGINT", "SIGTERM"] as const) {
     process.on(sig, () => {
       shutdownSignal = sig;
+      if (!shutdownBarrierStarted) armShutdownObserver();
       fatalLog?.info("shutting down", { signal: sig, phase: lifecyclePhase, cause: "signal" });
       try { shutdownRuntime?.(); } finally { controller.abort(); }
     });
@@ -532,6 +594,15 @@ async function main(): Promise<void> {
   // production path that reaches a hooked GitCache effect opens its transaction through it.
   const authority = new AuthorityRuntime({ lifetime: requireWorkerLifetime(), workerToken: config.workerToken, log });
   const git = buildWorkerGitCache(config, log, (runId) => outbox.hasPhysicalTerminalProtection(runId), authority);
+  shutdownAuthority = authority;
+  shutdownGit = git;
+  // issue #4066: every graceful exit below runs this barrier before its stop log (join, seal, drain, one decision).
+  const finishShutdown = async (): Promise<ShutdownGate> => {
+    // Every barrier entry is observed, including worker_returned with no signal.
+    const deadlineAt = shutdownBarrierStarted ? (shutdownDeadlineAt as number) : armShutdownObserver();
+    shutdownBarrierStarted = true;
+    return finishWorkerShutdown({ authority, git, deadlineAt, log });
+  };
 
   // PRD #1809 D6: the data-volume guard. It classifies a failed write as data-volume disk-full
   // (the bare clone/fetch, the fetch-back, the outbox reserve), preflights the volume at claim and
@@ -573,14 +644,17 @@ async function main(): Promise<void> {
   // as they start/transition/finish, and the worker reads to build the ActiveSnapshot that
   // rides every heartbeat and run-lane claim. ONE instance so the snapshot epoch is a single
   // process-monotonic counter across the heartbeat and claim loops.
-  // PRD #1391 Run B M4: thread the outbox pending-terminal lister + the live server quota
+  // Include retained physical source identities in snapshots; the terminal sender
+  // continues to use the installed-only listPendingTerminals inventory.
+  // PRD #1391 Run B M4: thread the outbox pending-source lister + the live server quota
   // into the registry (function seams, so the registry stays decoupled from Outbox/WorkerClient).
   // The live cap getter reads the latest valid register or ordinary heartbeat response, so each
   // snapshot uses the current quota; before register it reads undefined (cap 0), which matters if a build
   // ran that early (it does not — snapshots build after register).
   const activeRuns = new ActiveRunRegistry(
-    () => outbox.listPendingTerminals(),
+    () => outbox.listPendingOutcomeSources(),
     () => client.workerOutboxMaxPending,
+    () => outbox.policyInventoryCoverageAvailable(),
   );
   // Pin the SDK's HOME (session transcripts under $HOME/.claude/projects) onto
   // the persistent data volume so `docker compose down && up` doesn't wipe
@@ -693,6 +767,7 @@ async function main(): Promise<void> {
     // issue #3639: the guard timing the memory-receipt gate derives its sample wait from.
     ...(memoryGuardTiming ? { memoryGuardTiming } : {}),
     recoveryLiveTiming: buildRecoveryLiveTiming(config.executor, log),
+    afterPublicationEnrolled: buildAfterPublicationEnrolled(config.executor, log),
     pollMs: config.pollIntervalMs,
     onSourceRetained: () => notifyRetained?.(),
     planApprovalTimeoutMs: config.planApprovalTimeoutMs,
@@ -871,10 +946,14 @@ async function main(): Promise<void> {
   // UZI_DIND_PRUNE_ENABLED=true. Server maintenance shares its gate even when cache prune is off. Its idle
   // probe reads the worker's own active sets, hence the late-bound `worker` reference: the
   // probe is called from the controller loops, which the worker itself starts.
+  // issue #3891: the pressure-only anonymous-volume leg rides on the same enablement
+  // predicate and runs inside the controller's loop; it only reads the gate and needs no
+  // idle probe or custody (it runs on busy and custody-held workers by design).
   const dindPrune = createDindPrune(config, {
     gate: dindGate,
     isIdle: () => worker?.isIdle() ?? false,
     log,
+    volumeLeg: createDindVolumePrune(config, { gate: dindGate, log }),
   });
   if (dindPrune) log.info("dind prune enabled", { docker_host_wired: true });
   const dindMaintenance = config.dockerWiring.dockerHost !== undefined
@@ -990,6 +1069,7 @@ async function main(): Promise<void> {
   // Preserve shutdown ordering: revoke memory, initiate run-lane drain, then
   // abort loops. The early signal handler also cancels startup lock waits.
   shutdownRuntime = () => {
+    if (shutdownDeadlineAt !== undefined) authority.beginShutdown(shutdownDeadlineAt);
     void worker.shutdownMemory();
     runner.shutdown();
     isolatedRunner.shutdown();
@@ -1044,9 +1124,10 @@ async function main(): Promise<void> {
     process.exit(1);
   }
   if (verdict === "shutdown") {
+    const gate = await finishShutdown();
     lifecyclePhase = "stopped";
     log.info("uzi-agent stopped during the startup reap; the worker was not started", {
-      cause: "signal", signal: shutdownSignal ?? null, exit_code: 0,
+      cause: "signal", signal: shutdownSignal ?? null, exit_code: gate.exitCode, shutdown_result: gate.result,
     });
     return;
   }
@@ -1058,15 +1139,24 @@ async function main(): Promise<void> {
     });
     if (result !== undefined) log.info("pod_epoch_reclaim", { ...result });
   }
-  if (controller.signal.aborted) return;
+  if (controller.signal.aborted) {
+    const gate = await finishShutdown();
+    lifecyclePhase = "stopped";
+    log.info("uzi-agent stopped before the worker started", {
+      cause: "signal", signal: shutdownSignal ?? null, exit_code: gate.exitCode, shutdown_result: gate.result,
+    });
+    return;
+  }
 
   lifecyclePhase = "worker";
   await worker.run(controller.signal);
+  const gate = await finishShutdown();
   lifecyclePhase = "stopped";
   log.info("uzi-agent stopped", {
     cause: shutdownSignal ? "signal" : "worker_returned",
     signal: shutdownSignal ?? null,
-    exit_code: 0,
+    exit_code: gate.exitCode,
+    shutdown_result: gate.result,
   });
 }
 

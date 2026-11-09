@@ -36,6 +36,7 @@ type codexPoolPick struct {
 	ProviderUserID     string
 	WorkspaceAccountID string
 	Reason             codexselect.Reason
+	Candidate          codexselect.Candidate
 }
 
 // selectCodexPoolAlias scores the user's pooled accounts and picks one. It re-reads the pool,
@@ -79,99 +80,13 @@ func (s *Service) selectCodexPoolAlias(ctx context.Context, q *store.Queries, us
 		return codexPoolPick{}, errCodexPoolUnavailable
 	}
 
-	readings, err := q.GetCodexAccountRateLimitsForUser(ctx, userID)
-	if err != nil {
-		return codexPoolPick{}, fmt.Errorf("codex pool select: read limits: %w", err)
-	}
-	byAccount := make(map[uuid.UUID]store.GetCodexAccountRateLimitsForUserRow, len(readings))
-	for _, r := range readings {
-		byAccount[r.ProviderAccountID] = r
-	}
-	inflightRows, err := q.CountCodexInFlightByAccount(ctx, userID)
-	if err != nil {
-		return codexPoolPick{}, fmt.Errorf("codex pool select: count in-flight: %w", err)
-	}
-	inflight := make(map[uuid.UUID]int, len(inflightRows))
-	for _, r := range inflightRows {
-		inflight[r.ProviderAccountID] = int(r.InFlight)
-	}
-	snap, err := buildReserveSnapshot(ctx, q, userID, now, s.reserveIntervals())
-	if err != nil {
-		return codexPoolPick{}, fmt.Errorf("codex pool select: %w", err)
-	}
-	interval := s.p.CodexUsagePollInterval
-	// Vault state is read on the create transaction (q) so the read sees the state this
-	// transaction commits with, and no second pool connection is acquired while this one is held.
-	// A plain SELECT never waits on row locks, so lock waiting is not the reason.
-	vaultLocked := !s.codexVaultUnlocked(vault.WithStateReader(ctx, q), userID)
-
-	cands := make([]codexselect.Candidate, 0, len(order))
+	scoredRows := make([]store.ListCodexPoolAliasesRow, 0, len(order))
 	for _, id := range order {
-		row := accounts[id].row
-		c := codexselect.Candidate{AccountKey: id, AliasID: row.AliasID, Structural: true, InFlight: inflight[id]}
-
-		rl, haveRL := byAccount[id]
-		var reading codexselect.Reading
-		meterFresh := false
-		if haveRL {
-			var lastSuccess, lastAttempt *time.Time
-			if rl.LastSuccessAt.Valid {
-				t := rl.LastSuccessAt.Time
-				lastSuccess = &t
-			}
-			if rl.LastAttemptAt.Valid {
-				t := rl.LastAttemptAt.Time
-				lastAttempt = &t
-			}
-			meterFresh = usagereserve.CodexMeterStatus(interval, vaultLocked, rl.ReauthRequired, lastSuccess, lastAttempt, now) == usagereserve.CodexMeterFresh
-			// NULL buckets are a reading the D13 fence hides (not current): no reading.
-			if lastSuccess != nil && len(rl.Buckets) > 0 {
-				var buckets []apitypes.CodexRateLimitBucketDTO
-				// An undecodable body is "no reading": it can only make the score unknown.
-				if json.Unmarshal(rl.Buckets, &buckets) == nil {
-					reading = codexselect.Reading{Present: true, Buckets: buckets, LastSuccessAt: lastSuccess}
-				}
-			}
-		}
-		c.Score, c.ResetAt, c.ScoreKnown = codexselect.Score(reading, meterFresh, interval, now)
-
-		// Capacity. ReleaseAt is the latest known per-cause release time; any cause whose time
-		// is unknown makes the whole release unknown.
-		var release *time.Time
-		releaseKnown := true
-		addRelease := func(t *time.Time) {
-			if t == nil {
-				releaseKnown = false
-				return
-			}
-			if release == nil || t.After(*release) {
-				release = t
-			}
-		}
-		if meterFresh && reading.Present && codexselect.LimitReached(reading.Buckets) {
-			c.CapacityExcluded = true
-			addRelease(c.ResetAt)
-		}
-		if row.ThrottleEffectiveExpiry.Valid {
-			until := row.ThrottleEffectiveExpiry.Time
-			if row.ThrottleSpreadWidthMs.Valid {
-				until = until.Add(time.Duration(row.ThrottleSpreadWidthMs.Int32) * time.Millisecond)
-			}
-			if until.After(now) {
-				c.CapacityExcluded = true
-				addRelease(&until)
-			}
-		}
-		if snap.codexBlocked(row.AliasID) {
-			c.CapacityExcluded = true
-			if v := snap.codex[row.AliasID]; v.State == usagereserve.Held {
-				addRelease(v.ResetsAt)
-			} else {
-				addRelease(nil)
-			}
-		}
-		c.ReleaseAt, c.ReleaseKnown = release, releaseKnown && release != nil
-		cands = append(cands, c)
+		scoredRows = append(scoredRows, accounts[id].row)
+	}
+	cands, err := s.scoreCodexCandidates(ctx, q, userID, scoredRows, now)
+	if err != nil {
+		return codexPoolPick{}, err
 	}
 
 	out, err := codexselect.Select(cands, s.p.Autoselect, now)
@@ -182,12 +97,20 @@ func (s *Service) selectCodexPoolAlias(ctx context.Context, q *store.Queries, us
 		return codexPoolPick{}, errCodexPoolUnavailable
 	}
 	row := accounts[out.AccountKey].row
+	var evidence codexselect.Candidate
+	for _, c := range cands {
+		if c.AccountKey == out.AccountKey {
+			evidence = c
+			break
+		}
+	}
 	return codexPoolPick{
 		AliasID:            out.AliasID,
 		AccountID:          out.AccountKey,
 		ProviderUserID:     row.ProviderUserID.String,
 		WorkspaceAccountID: row.WorkspaceAccountID.String,
 		Reason:             out.Reason,
+		Candidate:          evidence,
 	}, nil
 }
 
@@ -265,4 +188,111 @@ func (s *Service) selectionNow() time.Time {
 		return s.now()
 	}
 	return time.Now()
+}
+
+// scoreCodexCandidates is shared by pooled selection and creation overflow's default
+// account path. Both use the current meter, revision-filtered reading, vault state,
+// reserve verdict and admission cooldown including spread.
+func (s *Service) scoreCodexCandidates(ctx context.Context, q *store.Queries, userID uuid.UUID, rows []store.ListCodexPoolAliasesRow, now time.Time) ([]codexselect.Candidate, error) {
+	readings, err := q.GetCodexAccountRateLimitsForUser(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("codex pool select: read limits: %w", err)
+	}
+	byAccount := make(map[uuid.UUID]store.GetCodexAccountRateLimitsForUserRow, len(readings))
+	for _, r := range readings {
+		byAccount[r.ProviderAccountID] = r
+	}
+	inflightRows, err := q.CountCodexInFlightByAccount(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("codex pool select: count in-flight: %w", err)
+	}
+	inflight := make(map[uuid.UUID]int, len(inflightRows))
+	for _, r := range inflightRows {
+		inflight[r.ProviderAccountID] = int(r.InFlight)
+	}
+	snap, err := buildReserveSnapshot(ctx, q, userID, now, s.reserveIntervals())
+	if err != nil {
+		return nil, fmt.Errorf("codex pool select: %w", err)
+	}
+	interval := s.p.CodexUsagePollInterval
+	// Vault state is read on the create transaction (q) so the read sees the state this
+	// transaction commits with, and no second pool connection is acquired while this one is held.
+	// A plain SELECT never waits on row locks, so lock waiting is not the reason.
+	vaultLocked := !s.codexVaultUnlocked(vault.WithStateReader(ctx, q), userID)
+
+	cands := make([]codexselect.Candidate, 0, len(rows))
+	for _, row := range rows {
+		id := uuid.UUID(row.ProviderAccountID.Bytes)
+		c := codexselect.Candidate{AccountKey: id, AliasID: row.AliasID, Structural: true, InFlight: inflight[id]}
+
+		rl, haveRL := byAccount[id]
+		var reading codexselect.Reading
+		meterFresh := false
+		if haveRL {
+			var lastSuccess, lastAttempt *time.Time
+			if rl.LastSuccessAt.Valid {
+				t := rl.LastSuccessAt.Time
+				lastSuccess = &t
+			}
+			if rl.LastAttemptAt.Valid {
+				t := rl.LastAttemptAt.Time
+				lastAttempt = &t
+			}
+			meterFresh = usagereserve.CodexMeterStatus(interval, vaultLocked, rl.ReauthRequired, lastSuccess, lastAttempt, now) == usagereserve.CodexMeterFresh
+			// NULL buckets are a reading the D13 fence hides (not current): no reading.
+			if lastSuccess != nil && len(rl.Buckets) > 0 {
+				var buckets []apitypes.CodexRateLimitBucketDTO
+				// An undecodable body is "no reading": it can only make the score unknown.
+				if json.Unmarshal(rl.Buckets, &buckets) == nil {
+					reading = codexselect.Reading{Present: true, Buckets: buckets, LastSuccessAt: lastSuccess}
+				}
+			}
+		}
+		c.Score, c.ResetAt, c.ScoreKnown = codexselect.Score(reading, meterFresh, interval, now)
+		// reset_first ranks on the weekly reset, not the binding one (#3844); ResetAt
+		// above still drives release timing.
+		if reading.Present && reading.LastSuccessAt != nil {
+			c.WeeklyResetAt = usagereserve.CodexMainWeeklyReset(reading.Buckets, *reading.LastSuccessAt, now)
+		}
+
+		// Capacity. ReleaseAt is the latest known per-cause release time; any cause whose time
+		// is unknown makes the whole release unknown.
+		var release *time.Time
+		releaseKnown := true
+		addRelease := func(t *time.Time) {
+			if t == nil {
+				releaseKnown = false
+				return
+			}
+			if release == nil || t.After(*release) {
+				release = t
+			}
+		}
+		if meterFresh && reading.Present && codexselect.LimitReached(reading.Buckets) {
+			c.CapacityExcluded = true
+			addRelease(c.ResetAt)
+		}
+		if row.ThrottleEffectiveExpiry.Valid {
+			until := row.ThrottleEffectiveExpiry.Time
+			if row.ThrottleSpreadWidthMs.Valid {
+				until = until.Add(time.Duration(row.ThrottleSpreadWidthMs.Int32) * time.Millisecond)
+			}
+			if until.After(now) {
+				c.CapacityExcluded = true
+				addRelease(&until)
+			}
+		}
+		if snap.codexBlocked(row.AliasID) {
+			c.CapacityExcluded = true
+			if v := snap.codex[row.AliasID]; v.State == usagereserve.Held {
+				addRelease(v.ResetsAt)
+			} else {
+				addRelease(nil)
+			}
+		}
+		c.ReleaseAt, c.ReleaseKnown = release, releaseKnown && release != nil
+		cands = append(cands, c)
+	}
+
+	return cands, nil
 }

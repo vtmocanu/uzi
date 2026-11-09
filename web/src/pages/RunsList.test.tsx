@@ -75,6 +75,7 @@ function renderRuns(initialPath = "/runs") {
 
 function aRun(over: Partial<RunListItem> = {}): RunListItem {
   return {
+    harness_decision: null,
     id: "run-1",
     repo_id: "repo-1",
     forge_type: "gitlab",
@@ -530,6 +531,43 @@ describe("RunsList — waiting for vault unlock (PRD #32)", () => {
     // …and no waiting badge can render here; the other owner's row reads plain.
     expect(screen.queryByText(/waiting for vault unlock/)).toBeNull();
     expect(screen.getByText("queued")).toBeTruthy();
+  });
+
+  // #3954: a factory row is another user's run, so its wait badge names the owner,
+  // while the viewer's own waiting run above keeps "waits on you".
+  it("admin factory list badges another user's waiting run as waiting on its owner", async () => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: true, email: "me@uzi.test" },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+    const waiting: Partial<RunListItem> = {
+      status: "awaiting_approval",
+      status_since: "2026-11-05T10:00:00Z",
+      progress: { state: "waiting", pct: null, milestone_done: 0, milestone_total: 0, active_milestone_id: "", phase: "" },
+    };
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "mine", issue_title: "My waiting run", owner_email: "me@uzi.test", ...waiting })],
+    });
+    mockApi.adminListWorkers.mockResolvedValue({ workers: [] });
+    mockApi.adminListRuns.mockResolvedValue({
+      runs: [aRun({ id: "theirs", issue_title: "Their waiting run", owner_email: "other@uzi.test", ...waiting })],
+    });
+
+    renderRuns();
+
+    const theirs = await screen.findByText("Their waiting run");
+    const card = screen.getByText("Factory status (admin)").parentElement!;
+    expect(card.contains(theirs)).toBe(true);
+    const ownerBadge = within(card).getByText(/waits on owner/);
+    expect(ownerBadge.closest("[title]")!.getAttribute("title")).toMatch(/^Waiting for the owner's plan approval/);
+    expect(within(card).queryByText(/waits on you/)).toBeNull();
+
+    // The viewer's own waiting run, outside the card, still waits on the viewer.
+    const mine = screen.getByText("My waiting run");
+    expect(card.contains(mine)).toBe(false);
+    const youBadges = screen.getAllByText(/waits on you/);
+    expect(youBadges).toHaveLength(1);
+    expect(youBadges[0].closest("[title]")!.getAttribute("title")).toMatch(/^Waiting for your plan approval/);
   });
 
   it("off users with an uncached vault get the ordinary queued state", async () => {
@@ -2105,6 +2143,14 @@ describe("RunsList — summary run projection (#2661)", () => {
     for (const call of mockApi.adminListRuns.mock.calls) expect((call as unknown[])[0]).toEqual({ view: "summary" });
     for (const call of mockApi.listRuns.mock.calls) expect(call[0]).toEqual({ view: "summary" });
   });
+});
+
+it("iteration-held list row names the owner hold without a completion label", () => {
+  const { container } = render(<MemoryRouter><ul><RunRow run={aRun({ status: "paused",
+    hold_reason: "iteration_budget_exhausted", completion_phase: "blocked" })} now={FIXED_NOW} /></ul></MemoryRouter>);
+  expect(screen.getAllByText("Iteration limit reached").length).toBeGreaterThan(0);
+  expect(container.querySelector("[data-attention]")).not.toBeNull();
+  expect(screen.queryByText("Completion blocked")).toBeNull();
 });
 
 describe("RunRow rejection presentation", () => {

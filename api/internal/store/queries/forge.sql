@@ -309,6 +309,18 @@ WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
 RETURNING *;
 
+-- name: SetRepoAgentSourceDefaultForUser :one
+UPDATE repos SET agent_source_default = sqlc.narg('agent_source_default')::text
+WHERE repos.id = @id
+  AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = @user_id)
+RETURNING *;
+
+-- name: SetRepoAgentSourceDefault :one
+UPDATE repos SET agent_source_default = sqlc.narg('agent_source_default')::text
+WHERE repos.id = @id
+  AND sqlc.narg('agent_source_default')::text IS DISTINCT FROM 'repo'
+RETURNING *;
+
 -- name: SetRepoFoldImproveUziBacklog :one
 -- Admin path for the per-repo capability flag (PRD #686 M1): not scoped to the owning
 -- user; gated on the caller being an admin in the handler.

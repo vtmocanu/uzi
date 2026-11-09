@@ -229,8 +229,10 @@ These are admission grants, checked when a pod is created. The worker ServiceAcc
 hold no API permissions and their pods mount no token. `anyuid` is not granted: its
 `allowedCapabilities` is empty, so it would not admit the uid-split containers anyway.
 
-The only new cluster-scoped object is the custom SCC. Installing it needs cluster-admin
-rights, like the chart's PriorityClasses.
+The new cluster-scoped objects are the custom SCC and, when `workers.storageClassRead.create`
+is true (the default), the controller's get-only `storageclasses` ClusterRole and its
+ClusterRoleBinding, which size-only PVC expansion needs (#3890). Installing them needs
+cluster-admin rights, like the chart's PriorityClasses.
 
 ## What the render checks cover
 

@@ -1,0 +1,44 @@
+{
+  "groups": [
+    {
+      "parent_id": "x",
+      "parent_title": "x",
+      "parent_status": "x",
+      "latest_at": "2020-01-02T03:04:05Z",
+      "active": true,
+      "total_attempts": 1,
+      "matching_attempts": 1,
+      "active_attempts": 1,
+      "active_hidden": 1,
+      "active_context": "x",
+      "attempts": [
+        {
+          "stage": "x",
+          "round": 1,
+          "result": "x",
+          "review": "x",
+          "execution": "x",
+          "reason": "x",
+          "findings_count": 1,
+          "created_at": "2020-01-02T03:04:05Z",
+          "decided_at": "2020-01-02T03:04:05Z",
+          "interrupted_at": "2020-01-02T03:04:05Z",
+          "deadline_at": "2020-01-02T03:04:05Z",
+          "child_id": "x",
+          "child_status": "x",
+          "child_context": "x",
+          "model": "x",
+          "effort": "x",
+          "historical": true,
+          "active": true,
+          "effect": "x",
+          "next_action": "x"
+        }
+      ],
+      "older_cursor": "x",
+      "omission": "x",
+      "refresh_needed": true
+    }
+  ],
+  "next_cursor": "x"
+}

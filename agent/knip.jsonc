@@ -46,12 +46,15 @@
   // go runs the existing real sanitizer helper for the opt-in offline evaluator.
   // `setpriv` (util-linux) is run ONLY by test/retained-source-channel.test.ts to connect to the
   // retained-source socket as the runner uids (a root-only case that skips otherwise).
-  "ignoreBinaries": ["mkfifo", "openssl", "task", "go", "setpriv"],
+  // `flock` is a system kernel-lock utility used by the real A-lock probe in
+  // test/authority-crash-proofs.test.ts, not an npm binary; a missing executable fails the test.
+  "ignoreBinaries": ["mkfifo", "openssl", "task", "go", "setpriv", "flock"],
 
   // The confinement probe and the standalone editor and code cross-check replay evaluators are opt-in entries. The operator
   // retained-source client is executed by path inside the image (`node /app/src/ops/retained-source.mjs`,
-  // issue #1786), never imported, so it is an entry.
-  "entry": ["test/cross-check-confinement-packaged.probe.ts", "test/codex-pins-sync.cli.ts", "src/pr-description-eval-cli.ts", "src/code-cross-check-replay-cli.ts", "src/ops/retained-source.mjs"],
+  // issue #1786), never imported, so it is an entry. src/main-watchdog-thread.mjs is
+  // loaded by URL as a worker_threads entry from src/main-watchdog.ts, so it is an entry too.
+  "entry": ["src/main-watchdog-thread.mjs", "test/cross-check-confinement-packaged.probe.ts", "test/codex-pins-sync.cli.ts", "src/pr-description-eval-cli.ts", "src/code-cross-check-replay-cli.ts", "src/ops/retained-source.mjs"],
 
   // The Node plugin inferred these entries when scripts.test contained --test.
   // Runtime discovery removes that trigger; retain the identical plugin entries

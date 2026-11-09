@@ -13,7 +13,7 @@ gh pr view <n> --json number,title,headRefName,mergeable,mergeStateStatus,files 
 S/claims.sh list          # PRs another lander already holds: leave them to their owner
 ```
 
-`BEHIND` = out of date with `main` (fine under an admin merge); `CONFLICTING` = a real
+`BEHIND` = out of date with `main` (see merge-mechanics.md, *Merging behind main*); `CONFLICTING` = a real
 conflict (SKILL.md step 5). Classify every PR up front: **green / red-repo-wide /
 red-defect / stale-base / Renovate-class** (references/renovate.md).
 

@@ -45,10 +45,15 @@ async function stop(child) {
 }
 
 async function contracts(t) {
-  assert.equal(typeof module.stripTypeScriptTypes, "function", "precondition: Node needs node:module.stripTypeScriptTypes (22.13+)");
-  const probe = module.stripTypeScriptTypes("export class Probe { constructor(public value: number) {} }", { mode: "transform" });
-  const { Probe } = await import(`data:text/javascript,${encodeURIComponent(probe)}`);
-  assert.equal(new Probe(7).value, 7, "precondition: TypeScript transform must support parameter properties");
+  assert.equal(typeof module.stripTypeScriptTypes, "function", "precondition: Node needs built-in TypeScript strip support via node:module.stripTypeScriptTypes");
+  const probe = module.stripTypeScriptTypes("export function probe(value: number): number { const result: number = value + 1; return result; }");
+  const { probe: erasableProbe } = await import(`data:text/javascript,${encodeURIComponent(probe)}`);
+  assert.equal(erasableProbe(7), 8, "precondition: default TypeScript stripping must execute erasable syntax");
+  assert.throws(
+    () => module.stripTypeScriptTypes("export class Probe { constructor(public value: number) {} }"),
+    { code: "ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX" },
+    "precondition: default stripping must reject parameter properties",
+  );
   console.log("#", run("go", ["version"], { env: goEnv }));
   for (const [tool, args] of [["git", ["--version"]], ["openssl", ["version"]]]) console.log("#", run(tool, args));
 
@@ -67,14 +72,47 @@ async function contracts(t) {
   writeFileSync(path.join(esm, "package.json"), '{"type":"module"}\n');
   for (const name of ["forge", "util"]) {
     const source = readFileSync(path.join(root, `agent/src/${name}.ts`), "utf8");
-    const transformed = module.stripTypeScriptTypes(source, { mode: "transform" });
+    const transformed = module.stripTypeScriptTypes(source);
     // Audit the complete transformed graph: a new static/dynamic dependency fails loudly.
     assert.doesNotMatch(transformed, /\bimport\s*\(/, "new dynamic dependency requires an explicit graph audit");
     const dependencies = [...transformed.matchAll(/(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s*)(["'])([^"']+)\1/g)].map((match) => match[2]);
     assert.deepEqual(dependencies, name === "forge" ? ["./util.js"] : ["node:timers/promises"], `unexpected runtime dependency in ${name}.ts`);
     writeFileSync(path.join(esm, `${name}.js`), transformed);
   }
-  const { forgeClientFor, ForgeError } = await import(pathToFileURL(path.join(esm, "forge.js")).href);
+  const { forgeClientFor, ForgeError, ForgeResponseTooLarge } = await import(pathToFileURL(path.join(esm, "forge.js")).href);
+  {
+    const error = new ForgeError(403, "denied");
+    assert.ok(error instanceof Error);
+    assert.ok(error instanceof ForgeError);
+    assert.equal(Object.getPrototypeOf(error), ForgeError.prototype);
+    assert.deepEqual(Object.keys(error), ["status", "detail", "name"]);
+    for (const [key, value] of Object.entries({ status: 403, detail: "denied", name: "ForgeError" })) {
+      assert.deepEqual(Object.getOwnPropertyDescriptor(error, key), {
+        value, writable: true, enumerable: true, configurable: true,
+      });
+    }
+    assert.deepEqual(Object.getOwnPropertyDescriptor(error, "message"), {
+      value: "forge API returned 403: denied", writable: true, enumerable: false, configurable: true,
+    });
+  }
+  {
+    const error = new ForgeResponseTooLarge(1024);
+    assert.ok(error instanceof Error);
+    assert.ok(error instanceof ForgeError);
+    assert.ok(error instanceof ForgeResponseTooLarge);
+    assert.equal(Object.getPrototypeOf(error), ForgeResponseTooLarge.prototype);
+    assert.deepEqual(Object.keys(error), ["status", "detail", "name", "maxBytes"]);
+    for (const [key, value] of Object.entries({
+      status: 0, detail: "response too large (over 1024 bytes)", name: "ForgeResponseTooLarge", maxBytes: 1024,
+    })) {
+      assert.deepEqual(Object.getOwnPropertyDescriptor(error, key), {
+        value, writable: true, enumerable: true, configurable: true,
+      });
+    }
+    assert.deepEqual(Object.getOwnPropertyDescriptor(error, "message"), {
+      value: "forge API returned 0: response too large (over 1024 bytes)", writable: true, enumerable: false, configurable: true,
+    });
+  }
   const cert = path.join(scratch, "cert.pem");
   const key = path.join(scratch, "key.pem");
   run("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=localhost", "-addext", "subjectAltName=IP:127.0.0.1", "-keyout", key, "-out", cert]);

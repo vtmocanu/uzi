@@ -235,6 +235,7 @@ uzi admin maintenance status [--json]
 uzi settings get
 uzi settings reserve --threshold <1..100|off> [--pause-running[=true|false]]
 uzi settings codex-mode default|auto
+uzi settings harness-overflow on|off
 uzi skill status | install [--force] | install-hook | uninstall-hook
 uzi docs list [--audience user|operator|design|contributor|all]
 uzi docs show <slug>
@@ -283,7 +284,13 @@ A few worth knowing:
   resolve one.** `run create --harness claude|codex` and `schedule create
   --harness claude|codex` request a specific harness outright; omitting the
   flag leaves the server's own resolution in charge (your effective default,
-  or whichever harness you have a usable credential for). `schedule edit
+  or whichever harness you have a usable credential for; with both usable and
+  no default, eligible new issue runs (manual, autopilot or schedule; no
+  explicit harness or issue harness label, model pin, Anthropic credential
+  override or Plan/Code cross-check) are
+  [chosen by weekly limits](./rate-limits.md#how-the-automatic-default-picks-a-harness)
+  and other runs keep the usual resolution; with an explicit default, [optional overflow](#harness-overflow) for
+  eligible new issue runs). `schedule edit
   --harness ""` clears a schedule's pin back to per-fire resolution; leaving
   the flag unset on edit leaves the stored pin unchanged. The resolved
   harness shows as a `HARNESS` row on `uzi run get`; on `uzi run list` it's
@@ -331,10 +338,24 @@ A few worth knowing:
   [Seeding a plan](./seeded-plans.md) for the full walkthrough, including the
   constraint that matters most: the plan must stand on its own, since a
   seeded run starts with no session and no memory of how it was written.
-  `--agent-source`/`--exclude-agents` (below) and `--planned-commit`/
-  `--require-base` (the base-commit staleness guard) are all optional and all
-  require `--plan-file`; an empty or oversized plan is rejected at create
-  time. A run created with no `--plan-file` is unchanged.
+  `--exclude-agents` (below) and `--planned-commit`/`--require-base` (the
+  base-commit staleness guard) are all optional and all require
+  `--plan-file`; `--agent-source` sets the seeded run's roster here and also
+  works without a plan file (below). An empty or oversized plan is rejected at
+  create time. A run created with no `--plan-file` is unchanged.
+- **`run create --agent-source own|repo` chooses this run's agents.** Without
+  `--plan-file` the choice is frozen onto the run as its agent-source request,
+  overriding your [per-repo default](repo-agents.md#set-a-default-for-your-runs-on-a-repo)
+  for this run only; `run get` shows it as `AGENTS_REQUESTED ... (this run)`.
+  It applies to implementation the same way a default does: an approval with
+  no agent choice and an autopilot run implement with it, and an explicit choice
+  at the plan gate still wins. A choice of `repo` also applies to planning; see
+  [Planning with repo agents](repo-agents.md#planning-with-repo-agents).
+  `--exclude-agents` without `--plan-file` is a usage error
+  (exit 2); exclude agents at the plan gate instead. Over the API, the same
+  choice is `"agent_selection": {"source": "own"|"repo"}` on
+  `POST /api/repos/{id}/runs` without `plan_md`; non-empty `exclusions`
+  without `plan_md` returns 400 `exclusions require a plan file or an approval`.
 - **`run create --force` re-runs an issue that already has an open MR.** By
   default, creating a run for an issue whose last completed run still owns an
   open MR is refused (a 409, exit 5) — re-running would spend budget building
@@ -344,16 +365,44 @@ A few worth knowing:
 - **`run get` names the repository.** The `REPO` row shows its full path;
   `--json` and `--field repo_path` expose the same value. A repo-less run or an
   unavailable repository has an empty `repo_path` and no `REPO` row.
+- **`run get` lists created proposal issues.** A scheduled prompt run adds one
+  `CREATED_ISSUE` row per returned output: `Created issue #<iid>`, its sanitized
+  title and a safe HTTPS URL when available; otherwise the coordinate stays
+  plain text. `uzi run get <id> --json` retains the optional `created_issues`
+  array of `{iid, title, web_url}`; an unsafe stored repository URL leaves
+  `web_url` blank. Missing or empty results add no rows. This best-effort,
+  detail-only lookup can be omitted on failure and excludes pending or unstamped
+  proposals. Historical stamped results remain discoverable without rerunning,
+  even after schedule deletion or output-mode changes. Source-issue fields keep
+  their originating meaning, independent of created outputs or an MR. See
+  [proposal output](./scheduling.md#proposal-output-mr-or-issues) for record scope
+  and ordering; run lists and summaries do not carry this field.
 - **`run approve` picks the subagent roster explicitly.** By default a run
-  uses its own default roster; `--agent-source own|repo` overrides it
+  uses its own default roster: the run's frozen
+  [per-repo default](repo-agents.md#set-a-default-for-your-runs-on-a-repo) when
+  one was set, else the repo roster when one is detected and your templates
+  otherwise. `--agent-source own|repo` overrides it
   (`own` = your template roster, `repo` = the agents the worker detected in
   the clone's `.claude/agents/` or `.codex/agents/`), and `--exclude-agents a,b`
   drops individual subagents from that source. `--exclude-agents` requires
   `--agent-source`. Detection reads one folder, never merges rosters, and prefers
   the run harness's native folder; a present preferred folder is final even if
   empty or invalid. See [Repo agents](repo-agents.md#which-folder-is-read).
-  `run create --plan-file` takes the same two flags, for the seeded run's
-  roster.
+  `run create` takes the same two flags (see `run create --agent-source`
+  above).
+- **`run get` shows the requested, planning and implemented agents.** A run that
+  carries a frozen agent-source request shows `AGENTS_REQUESTED` (for example
+  `repo agents (repo default)`, or `(this run)` for a source chosen at create or
+  a seeded plan's source) and `PLANNED_WITH`, the agents its plan turn used (with
+  the request's basis when they match it, or `—` when no plan turn was recorded,
+  as on a seeded run). Once a selection is recorded `IMPLEMENTED_WITH` shows the
+  roster used, with `(as requested)` or `(changed at approval)` when a request
+  exists. `--json` carries `agent_source_requested`, `agent_source_requested_basis` and
+  `plan_agent_source`.
+- **`repo list` shows each repo's default agents.** The `DEFAULT_AGENTS` column
+  reads `own`, `repo` or `unset`; `--json` carries `agent_source_default`
+  (`"own"`, `"repo"` or `null`). The setting is changed on the Repos page; the
+  CLI only reads it.
 - **`run approve <id> --override-capabilities`** clears this run's required
   capabilities and approves even when its assigned worker cannot satisfy them.
   Use it only when the plan can proceed without those capabilities. It does not
@@ -450,6 +499,10 @@ A few worth knowing:
   `milestone_reconciliations_next_before_gate_revision`; omitted cursor means
   no further page. Server-shortened reasons or omitted oversized snapshots
   are marked `reason_truncated` / `details_omitted`.
+  Before and after snapshots carry a fixed set of reconciliation fields
+  (milestones, contract, gate and claim state), not the whole run, so plan and
+  issue text do not count against the size limit; oversized milestone or
+  contract values can still be omitted.
 - **`run stop <id>`** gracefully winds down a run. On an **interactive**
   task run (one created with `uzi handoff --interactive`; see [Interactive
   mode](./handoff.md#interactive-mode)) the current turn
@@ -612,7 +665,7 @@ A few worth knowing:
   Success is an ordinary owner-resumed pause: wall stopped, run slot freed.
   A failed publication instead asks a worker question in `awaiting_input`
   (wall wait banked, slot held), with no provider turn or park retry until
-  an explicit answer and no reset of the shared absolute `QUESTION_TIMEOUT_SECONDS`.
+  an explicit answer and no fresh window for the shared `QUESTION_TIMEOUT_SECONDS` parked-time budget.
   An unattended run needing that decision stops with a trusted refusal.
   See [Dependency waits](./run-pause.md#waiting-on-a-dependency-during-implementation)
   for compatibility, checkpoint and retention limits.
@@ -1331,7 +1384,9 @@ uzi job file get <file-id> [-o path]
 When a run commits useful work but then fails to publish its head (a workflow or
 secret preflight, a rejected push, exhausted base alignment), uzi captures the run's
 original committed history into a durable, owner-only recovery archive — a real Git
-bundle that imports into a fresh clone even after the worker and its disk are gone.
+bundle retained independently of the worker and its disk. Thin bundles also need
+the declared prerequisite history in the destination clone; download verification
+alone does not establish importability. Follow the [confirmed-pin restore steps](run-recovery.md#restoring-with-a-confirmed-pin).
 `uzi run export` downloads that archive to a local file:
 
 ```
@@ -1366,10 +1421,41 @@ uzi run export <run-id> --output ./recovered.bundle
   `--json` instead prints the listed captures (archive DTOs, each with a `hold_id`) as a
   JSON array on stdout, still exiting 2 or 5.
 
-`uzi run get` also shows a metadata-only recovery summary for a terminal run that has
-captures (the archive count, per-state tally, and each available capture's id) so you
-know what `--capture` can fetch. It is metadata only and never claims an archive is
-available when it is not.
+The human `uzi run get` view also shows a metadata-only recovery summary for a terminal run that has
+captures: the archive count, per-state tally, and every retained capture's id, state,
+source, size, expiry and prerequisite-pin observations. Only `available` captures
+can be exported; the other states remain visible for inspection. These are recorded
+metadata, not a fresh forge probe or proof of Git importability.
+
+The optional owner `prerequisite_closure` is a persisted pin snapshot, with
+`state`, optional bounded `reason`, `pin_ref`, optional `pin_tip`,
+`absence_unconfirmed`, `cleanup_exhausted` and `updated_at`. It is not a
+fresh forge probe; `updated_at` is a record update, not last verification.
+
+- `pending`, `invoked` and `create_unknown`: protection not established;
+  uncertainty can persist indefinitely.
+- `pinned`: recorded protection conditional on external refs surviving;
+  `absence_unconfirmed` leaves availability uncertain.
+- `refused`, `foreign`, `lost` and `deleted`: respectively creation refused,
+  foreign content, lost pin and historical deletion; no protection by this pin.
+- `cleanup_exhausted` is independent, including alongside unconfirmed absence:
+  automatic deletes stopped; it grants no manual deletion permission.
+- No projection: older API or no matching row. Thin prerequisite availability is
+  unknown; a self-contained manifest reports no prerequisites and needs no pin.
+
+Capture details and export-choice refusals in `--json` preserve these facts.
+The human export-choice table shows only id, state, source, size and creation time;
+use `uzi run get` or `uzi run recovery <run-id>` for pin details. An available
+capture can be exported regardless of pin state, subject to a bound byte manifest
+and a successful download. Successful `export --json`
+still reports verified bytes/checksum only, with the existing result fields;
+it does not certify prerequisite availability or importability. Owner history
+is complete, with a constant two SQL queries for the summary, not bounded rows
+or response bytes. Pin metadata says nothing about latest local coverage,
+custody release, physical retirement or publication success. See the
+[restore procedure](run-recovery.md#restoring-with-a-confirmed-pin) for the
+explicit capture export, UUID-derived ref fetch and full recorded-tip comparison
+before native bundle verification/import.
 
 ### Reviewing and resolving held work: `uzi run recovery` / `uzi run discard`
 
@@ -1433,8 +1519,8 @@ uzi run recovery <run-id> [--json]
   automatically on archive readiness; guarded holds await final inventory acknowledgment.
   The narrow recovery-hold exception is an OPEN hold for `recovery_wait` /
   `worker_requeue_exhausted`, `worker_memory_pressure`,
-  `retained_recovery_exhausted` (timed or held), or
-  `retained_recovery_adoption_failed`: it remains `source_only`, or `needs_action` after a failed
+  `retained_recovery_exhausted` (timed or held),
+  `retained_recovery_adoption_failed`, or `retained_continuation_unwitnessed`: it remains `source_only`, or `needs_action` after a failed
   latest capture, even with an available archive or capture in flight. Retained
   exhaustion with a finite retry can retry automatically; its NULL retry requires
   owner Resume/Cancel. Adoption failure always requires owner Resume/Cancel.
@@ -1442,8 +1528,11 @@ uzi run recovery <run-id> [--json]
   The latest capture state and available archive are independent: an older download may
   omit latest work while a newer capture prepares/uploads. The same source, coverage,
   export and discard guidance as above follows. `--json` prints
-  the raw rows for scripting, each hold with a `captures` array (id, state, source_sha,
-  byte_size, created_at) whose ids `uzi run export --capture` takes; it's always `[]`
+  the rows for scripting, each hold with a `captures` array carrying id, state,
+  source_sha, byte_size, created_at and, when present, checksum,
+  prerequisite_shas (in recorded order), expires_at, attempted_head_sha and
+  prerequisite_closure. Its ids are accepted by
+  `uzi run export --capture`; it's always `[]`
   rather than null, including when the run itself was deleted (a released hold outlives
   its run) or the server predates capture-hold linking. Owner-only.
 - While the server retains the run's last published checkpoint on origin (PRD #1810), the
@@ -1491,15 +1580,16 @@ uzi run discard <run-id> --hold <hold-id> --yes
   only your own runs' holds.
 
 Prerequisite pins (`refs/uzi-prereq/<capture-id>`, #3591) are a separate
-API lifecycle. This CLI has no prerequisite-pin listing or expiry command;
-`run recovery`/`run held` do not show pin state. On a server that enables it for
-GitHub.com, a pinned thin archive can release custody through the archive FINAL
+API lifecycle. `run get` and `run recovery <run-id>` show recorded pin state
+with capture details; `run held` lists terminal held refs, not prerequisite pins.
+There is no dedicated prerequisite-pin listing or expiry command. On a server
+that enables it for GitHub.com, a pinned thin archive can release custody through the archive FINAL
 (#3727); otherwise it cannot authorize archive FINAL or local-source cleanup.
 Pinning alone never authorizes local cleanup: an ACK and the existing independent
 source, writer and shared-consumer guards still apply.
 See [prerequisite pin restore and backlog handling](run-recovery.md#prerequisite-pins-lifecycle-and-custody-release)
 for native Git restore, the release conditions and the frozen-binding/cleanup
-limits. Owner/CLI pin visibility belongs to C3.
+limits.
 
 ### Fetching and expiring terminal held refs: `uzi run held`
 
@@ -2871,7 +2961,7 @@ something to say:
 |---|---|---|
 | `HOME` | the server has a fresh worker report of the run's size | the run's HOME and cache size, e.g. `4.2 GiB (cache 3.0 GiB)`; `at least` leads when the size walk was truncated (both numbers are then lower bounds) |
 | `CHECKPOINT` | the run is parked (`limit_wait`, `recovery_wait`, or `paused`) and the worker reported it | whether the checkpoint published for this park contains the run's latest committed work: `contains the latest work`, or `does NOT contain the latest committed work (the worker keeps it)` |
-| `DISK` | the run is parked with cause `data_volume_full` | the [waiting-for-disk-space sentence](run-recovery-wait.md#worker-data-volume-full), the next retry time, and the run's lifetime count of counted disk parks |
+| `DISK` | the run is parked with cause `data_volume_full` | the [waiting-for-disk-space sentence](run-recovery-wait.md#worker-data-volume-full), the timed retry or owner Resume/Cancel guidance (unknown timing labeled separately), and the run's lifetime count of counted disk parks |
 | `EST. TAIL` | a Claude run has usage no result frame covered (an interrupted session) | the [estimated tail](run-cost.md#estimated-tail-of-an-interrupted-session), kept apart from `COST`: `~$1.23 estimated (price-table version) · 1.2M in/34k out · partial: <reasons>`, `<$0.01 estimated` under half a cent, or `cost unknown (unpriced)`; hidden for the all-zero, complete tail |
 
 `CHECKPOINT` shows while the run is actually parked (`limit_wait`,
@@ -2879,16 +2969,36 @@ something to say:
 claim and every `running` report, so a resumed run reports "not reported"
 until its next park, rather than carrying a stale value forward. `uzi run
 list` / `uzi admin runs` append `(waiting for disk space)` to the STATUS
-cell for a `data_volume_full` park, the same pattern as `(waiting for
-vault unlock)`.
+cell for a timed `data_volume_full` park; held parks show `(disk held;
+owner Resume/Cancel)` with no countdown. The CLI, TUI and web distinguish owner-held,
+timed and unknown timing; owner controls require confirmed ownership.
+Default `uzi run wait` and `uzi run logs --follow` stop at a disk owner hold;
+explicit `run wait --until` retains its requested status targets. Timed and
+unknown waits continue following.
 
-A run that **fails** because its worker's data volume stayed full past the
-disk-park cap gets a `FAIL_ORIGIN` row reading `data_volume_full (the
-worker's data volume stayed full after N counted disk parks)` instead of
-the bare enum — see [Worker data volume
-full](run-recovery-wait.md#worker-data-volume-full) for the full park and
-failure behavior, and [`UZI_RUN_DISK_PARK_MAX`](configuration.md#server-api)
-for the cap.
+At the default disk-park allowance, three counted parks are timed and the next
+counted park holds for owner Resume/Cancel (#3969). `0` means unlimited timed
+parks, and preventive parks stay uncounted and timed. Owner Resume queues one
+ordinary attempt without resetting counts or unrelated budgets; admission may
+refuse it and a subsequent counted park reholds. Clients send one bodyless
+`POST /api/runs/{id}/resume-now` per owner action, without automatic retry. Duplicate
+requests are idempotent for the current hold only: the bodyless request has no
+durable binding to the observed hold, so a delayed duplicate crossing a later
+hold after another claim and counted park is not durably fenced. That park can
+happen during preflight before model execution starts. No concrete single-action
+replay has been found. See [Resuming a disk hold](run-recovery-wait.md#resuming-a-disk-hold)
+for wall accounting, rollout and custody boundaries.
+
+An explicit `recovery_retry_not_before: null` identifies the hold; an omitted
+key means unknown timing. The Go DTO already uses
+`RecoveryRetryNotBeforePresent` to distinguish these, with no new wire field;
+malformed non-null JSON timestamps are rejected, and finite timestamps remain
+timed even when due. See [Retry timing contract](run-recovery-wait.md#retry-timing-contract).
+
+Historical failed rows retain the `FAIL_ORIGIN` rendering `data_volume_full (the
+worker's data volume stayed full after N counted disk parks)`. That stored
+origin is historical read compatibility, not the current cap outcome. See
+[`UZI_RUN_DISK_PARK_MAX`](configuration.md#server-api) for configuration.
 
 `set-token` takes a **label** (the name from `token list`), not an id, and
 takes effect on that worker's next claim — no restart and no re-minted join
@@ -3025,13 +3135,17 @@ for resolution, validation and capability requirements.
 
 After the cross-check table, the human output prints a **Model settings**
 table with the columns `SETTING  HARNESS  STORED  DEFAULT  RESOLVED  SOURCE`,
-with judge rows for `claude` and `codex` and two `effort` rows (one per
+with judge rows and run-summary rows (`summary`) for `claude` and `codex`, and two `effort` rows (one per
 harness) for your ordinary [reasoning effort](./worker-effort.md). `SOURCE` is
 `your choice`, `instance default` or `built-in`. `--json` carries the same
 cells as `judge_models` (ordered claude, codex: `harness`, `model`,
 `default_model`, `default_source`, `resolved_model`, `source`; read-only) and
-the stored Codex lane as `codex_judge_model`. See
-[Run judge](./judge.md#which-model-it-runs-on).
+the stored Codex lane as `codex_judge_model`. The `summary` rows are the
+intent/plan summary model for each harness; `--json` carries them as the
+read-only `summary_models` (same cell fields as `judge_models`) and the stored
+Codex lane as `codex_summary_model`. See
+[Run judge](./judge.md#which-model-it-runs-on) and
+[Run summaries](./run-summaries.md#which-model-it-runs-on).
 
 An effort row whose preference is **Runtime default** shows `runtime default`
 in `STORED` and in `RESOLVED` (Claude: `runtime default (value not reported)`),
@@ -3041,9 +3155,28 @@ for example:
 effort  claude  runtime default  medium  runtime default (value not reported)  your choice
 ```
 
+When the preference is Runtime default, the Codex row's `RESOLVED` shows the
+catalog default last reported for your credential by issue and other lead Codex
+runs ([details](./worker-effort.md#what-the-codex-catalog-default-means)):
+
+| `RESOLVED` | Meaning |
+| --- | --- |
+| `runtime default (catalog default: low, gpt-6.1-sol, Codex 0.164.0)` | Known. |
+| `runtime default (catalog default: none, no reasoning level requested, gpt-6.1-sol, Codex 0.164.0)` | Known; the level is `none`. |
+| `runtime default (catalog default: ultra, Codex substitutes another level, gpt-6.1-sol, Codex 0.164.0)` | Known; the level is `ultra`. |
+| `runtime default (catalog default: medium, gpt-6.1-sol, Codex 0.164.0) · may differ on workers still on another version` | Varies. |
+| `runtime default (catalog default unknown)` | Unknown (also shown for an absent or unrecognised state). |
+
+```text
+effort  codex  runtime default  medium  runtime default (catalog default: low, gpt-6.1-sol, Codex 0.164.0)  your choice
+```
+
 `--json` carries the effort rows as the read-only `effort_settings` (ordered
 claude, codex: `harness`, `effort`, `default_effort`, `default_source`,
-`resolved_effort`, `source`, `mode`). `resolved_effort` is `null` exactly when
+`resolved_effort`, `source`, `mode`, and on the `codex` cell only
+`catalog_default`: `state` (`known`, `unknown` or `varies`), `effort`, `model`,
+`runtime_version`, `observed_at`, the last four `null` when `state` is
+`unknown`). `resolved_effort` is `null` exactly when
 `mode` is `runtime_default`. The CLI cannot set effort: the write endpoint is
 cookie-only, so use **Settings → Run defaults → Reasoning effort**. See
 [Reasoning effort](./worker-effort.md#runtime-default).
@@ -3054,6 +3187,88 @@ your own switch for the model-written [Now summary](./run-activity.md#now-summar
 [kill switch](./admin-settings.md#run-summaries) can still turn it off for the
 instance). `--json` carries it as `now_summary_enabled` (`null` when unset). Change it in
 **Settings → Run defaults → Run summaries**; there is no CLI write verb for it.
+
+### Effective settings
+
+`uzi settings get` also reads the read-only [effective-settings
+view](./configuration.md#effective-settings) (`GET /api/me/effective-settings`)
+and, when the server has it, builds the **Model settings** table from it, so each
+setting prints once. The rows, in order:
+
+| `SETTING` | Rows | Notes |
+| --- | --- | --- |
+| `start (default)`, `start (claude)`, `start (codex)` | One each | `HARNESS`, `STORED` and `DEFAULT` show `-`. `RESOLVED` is the predicted harness, `claude or codex` when the harness is chosen when the run is created, or `refused: <token>` / `refused: <token> (<detail>)`. `SOURCE` is the harness source label (`your choice for this run`, `your default harness`, `automatic` or `chosen when the run is created`) plus its notes. |
+| `worker model` | `claude`, `codex` | `RESOLVED` and `DEFAULT` show `SDK/account default` when the runtime decides. |
+| `worker effort` | `claude`, `codex` | As the existing effort rows. |
+| `judge`, `summary` | `claude`, `codex` | Unchanged; printed from the settings read. |
+| `task review model` | `claude`, `codex` | Built-in; Codex notes `not configurable`, Claude `the SDK decides`. |
+| `task review effort` | `claude`, `codex` | `not sent` for both. |
+
+`SOURCE` appends each cell's notes after a `·`, for example `built-in · not sent`.
+When a start choice is chosen at creation, the table is followed by one block per
+such choice:
+
+```text
+start (default) is chosen when the run is created; it can run on:
+  claude: chosen when the run starts
+  codex: your default Codex credential
+```
+
+Each line is a harness's credential source label (a Codex account picked by
+headroom reads `chosen when the run is created`), or `refused:` and its token
+(with the detail in parentheses) for a harness that is not usable. A start
+choice is chosen at creation only when both harnesses are usable, so in practice
+both lines show credential labels. A harness that is not usable shows up in the
+`start (claude)` / `start (codex)` rows as `refused: no_credential_for_harness`,
+and `start (default)` shows `refused: no_usable_credential` when neither is
+usable. The CLI shows the `GET` only; it does not call the start-preview.
+`--schedule` adds the schedule preview, below.
+
+`--json` carries every key of the settings read plus an `effective` key holding
+the view's body: `version`, `harnesses`, `start`, `models`, `efforts` and
+`cross_check` (fields in [Configuration](./configuration.md#effective-settings)).
+`effective` is `null` when the server does not have the view or the read failed.
+In that case the human output falls back to the previous Model settings rows, a
+line goes to stderr (`Effective settings: not available on this server` for an
+older server, otherwise `Effective settings: unavailable (<error>)`), and the
+exit code stays 0.
+
+#### Previewing a schedule
+
+```sh
+uzi settings get --schedule <schedule-id>
+```
+
+`--schedule` previews what firing one of your saved schedules now, and
+claiming the run, would use (`POST /api/me/effective-settings/schedule-preview`;
+request fields, refusals and per-target behaviour in
+[Scheduling](./scheduling.md#settings-preview)). The CLI sends only the
+schedule id, so it previews the schedule as saved. After the Model settings
+table it prints `If fired and claimed now (schedule <id>)` and a second table in
+the same columns:
+
+| `SETTING` | `HARNESS` | Notes |
+| --- | --- | --- |
+| `schedule harness` | `-` | `RESOLVED` is the harness, `claude or codex` when it is chosen when the run is created, or `refused: <token>` (with the detail in parentheses). A refusal on a known harness reads `<harness>, refused: <token>`. |
+| `worker model`, `worker effort`, `credential`, `subagents` | `claude` or `codex` | One set per harness the fire can land on; with a single harness the rows are that harness's. |
+| `fire` | `claude` or `codex` | Replaces the set above for a harness whose fire is refused, as `refused: <token>`. |
+
+When the harness is chosen at creation, the rows for both harnesses follow
+(Claude then Codex) and a line says so. A model pin the harness cannot run is
+named on its own line (`codex: the model <model> from the schedule pin does not
+run on this harness; the default applies`).
+
+`--json` adds a `schedule_preview` key holding the response body
+(`version`, `harness`, `refusal`, `refusal_detail`, `worker_model`,
+`worker_effort`, `credential`, `subagents`, `notes` and, when the harness is
+chosen at creation, `alternatives`). The key is absent without `--schedule`.
+
+Exit codes follow the schedule being something you asked for: a schedule that
+does not exist for your account (or a server that predates the route) is a 404
+and the command fails with a non-zero exit before printing anything, as does any
+other 4xx. A 5xx or an unreachable server degrades instead: the settings still
+print, `schedule_preview` is absent, a line goes to stderr (`Schedule preview:
+unavailable (<error>)`) and the exit code stays 0.
 
 ### Weekly usage reserve
 
@@ -3076,8 +3291,9 @@ prints the result, for example `Weekly usage reserve: 70% (pause running runs:
 on)` or `Weekly usage reserve: off`; `--json` returns
 `weekly_reserve_pct` (`null` = off) and `weekly_reserve_pause_running`.
 
-`uzi settings get` ends with the same `Weekly usage reserve:` line (after the
-`Now summary:` line), and its `--json` carries both fields.
+`uzi settings get` shows the same `Weekly usage reserve:` line after the
+`Now summary:` line, followed by Codex account mode, the default harness and harness overflow;
+its `--json` carries both reserve fields.
 
 On a run the reserve touches, `uzi run get` shows:
 
@@ -3103,10 +3319,14 @@ uzi token pool work-codex --kind codex --on
 `uzi settings codex-mode default|auto` sets how a new Codex run chooses its
 login (`PUT /api/me/codex-account-mode`, which accepts a `uzc_` Bearer token).
 `default` binds your default Codex login. `auto` picks, at run creation, the
-pooled Codex login with the most limit headroom; you opt logins into the pool
-per login with `uzi token pool <label> --kind codex --on` (the pool is empty
-until you do, and `auto` then falls back to your default). Logins are created
-unpooled. `--kind` is required only when the label is held by both an Anthropic
+pooled Codex login whose weekly allowance resets soonest (the operator's
+`UZI_AUTOSELECT_ORDER`, default `reset_first`; under it, for picks above the
+headroom floor, the in-flight penalty only breaks exact weekly-reset ties, so a
+burst of runs can concentrate on one login just above that floor, meaning more
+mid-run limit pauses and resumes); you opt logins into the pool per login with
+`uzi token pool <label> --kind codex --on` (the pool is empty until you do, and
+`auto` then falls back to your default). Logins are created unpooled.
+`--kind` is required only when the label is held by both an Anthropic
 token and a Codex login: without it that is a usage error. Before Codex pooling
 existed, `uzi token pool <label>` silently picked the Anthropic token in that
 case, so a script that relied on it now needs `--kind anthropic`. An
@@ -3122,7 +3342,7 @@ a run created before auto-selection:
 |---|---|
 | `default` | `work-codex — default` |
 | `pool_empty` | `work-codex — default (auto mode, but no login is pooled)` |
-| `auto` | `work-codex — auto (most limit headroom)` |
+| `auto` | `work-codex — auto (picked from pool)` |
 | `best_of_pool` | `work-codex — auto (best of pool; every login was under the headroom floor)` |
 | `pool_stale` | `work-codex — auto (no usage reading yet; first pooled login)` |
 | `pool_exhausted` | `work-codex — auto (every login at capacity; soonest to release)` |
@@ -3145,6 +3365,139 @@ and an automatic MR rework is skipped. When every Codex login you hold is
 disabled, the existing disabled-credential refusal applies instead (a 422 with
 no reason; a schedule records `credential_disabled`). `uzi settings get` shows `Codex account
 mode:` after the reserve line, and `--json` carries `codex_account_mode`.
+
+### Harness overflow
+
+```sh
+uzi settings harness-overflow on
+uzi settings harness-overflow off
+uzi settings get
+uzi settings get --json
+```
+
+`uzi settings harness-overflow on|off` controls the per-user boolean
+`harness_overflow_enabled`, off by default. It matches **Settings → Run
+defaults → Overflow to the other harness when my default is near its limits**.
+The command writes `PUT /api/me/harness-overflow` with
+`{"harness_overflow_enabled":true}` (or `false`); `--json` returns that
+single boolean field. Other arguments are usage errors (exit 2). Human
+output reads `Harness overflow: on (new runs, at creation)` or
+`Harness overflow: off (new runs, at creation)`. The command reads your
+settings back after the write (human output only; `--json` returns the single
+boolean without the read-back); with the default harness automatic it prints
+`Harness overflow: on (inactive: default harness is automatic)` (or `off`
+likewise), and if the read-back fails it prints
+`Harness overflow: on (saved; default harness could not be read)` and
+reports the error. `uzi settings get` shows `Default harness: automatic
+(chosen per run by weekly limits when both harnesses are usable)` (or `Default harness: claude` / `codex`)
+after Codex account mode, then the same overflow line; its decoded settings
+JSON includes `harness_overflow_enabled`.
+
+Overflow applies at creation to new implicit issue runs started manually,
+by autopilot or by a schedule, with both harnesses usable, and only when your
+default harness is an explicit Claude or Codex: with the default automatic it
+is inactive, because uzi then
+[chooses the harness by weekly limits](./rate-limits.md#how-the-automatic-default-picks-a-harness)
+(reasons `auto_soonest_reset`, `auto_only_qualified` and `auto_fallback`).
+Every creation with an unset default that does not take that automatic path
+records `excluded`. Explicit
+harnesses (including issue harness labels), run/schedule model pins,
+Anthropic credential overrides and either raw saved Plan or Code cross-check
+enable flag exclude overflow, even when a checker would be inactive for that
+harness. Other run kinds and origins do not use overflow. A preferred score
+below 20%, an other-harness score of at least 30%, and an advantage of at
+least 15 percentage points are required; unknown comparisons keep the
+preferred harness. The decision freezes atomically with creation; overflow
+never changes an existing run or resume. See
+[Worker model](./worker-model.md#overflow-to-the-other-harness) for setup and
+[rate limits](./rate-limits.md#how-overflow-compares-headroom) for selected
+accounts, Claude aggregation and capacity holds.
+
+`uzi run get <id>` shows `HARNESS_PICK` rows headed `at creation:`. An `off`
+or `excluded` decision was recorded before any usage was read, so it shows
+only `preferred:`, `chosen:`, `reason:` and one line saying overflow was off
+(`overflow off in settings`) or not considered (`overflow not considered`);
+the stored reason does not say which exclusion applied, and `--json` still
+carries every field. For every other
+reason the last two rows are the weekly resets, `pref reset:` and `other reset:`, or
+`claude reset:` and `codex reset:` for an `auto_*` reason (whose score,
+measured and held rows are likewise labelled `claude` and `codex` instead of
+`preferred`/`pref` and `other`). A reset reads as an RFC3339 UTC timestamp, or `unknown`. The TUI detail rail has **HARNESS at creation**, fitted as a whole block
+when space permits; to fit the rail it shows a reset as `MM-DD HH:MMZ` UTC with the
+year omitted (the reset falls within about a week after the run's creation). The web run page shows the same stored explanation.
+These are owner-only readings, independent of live usage and claim-time
+credential metadata. Legacy or unavailable decisions read `not recorded`.
+
+In `uzi run get <id> --json`, `harness_decision` is an object with:
+
+| Field | Meaning |
+|---|---|
+| `preferred`, `chosen` | Preferred harness before overflow and the run's stored harness. |
+| `reason` | `off`, `excluded`, `unknown_usage`, `preferred` or `overflow`; for an unset default also `auto_soonest_reset`, `auto_only_qualified` or `auto_fallback`. |
+| `preferred_score`, `other_score` | Nullable comparison percentages used for the thresholds. |
+| `preferred_measured`, `other_measured` | Nullable measured headroom, kept separately from capacity holds. |
+| `preferred_held`, `other_held` | Capacity-hold flags; Claude preferred means the complete token set is held, Claude receiver means any token is held. |
+| `preferred_weekly_reset_at`, `other_weekly_reset_at` | Nullable RFC 3339 weekly resets of the compared accounts; `null` when unknown or already past at creation. Only `auto_*` reasons carry them. |
+
+For an `auto_*` reason `preferred` is always `claude`: the `preferred_*`
+fields describe Claude and the `other_*` fields describe Codex. A row created
+before the weekly-reset fields existed shows them as `null` (unknown); a row
+from before decisions were recorded reads `not recorded`.
+
+Unknown numeric evidence is `null`, distinct from a measured zero. A hold
+can make a preferred comparison zero with measured headroom still unknown.
+The whole object is `null` for a legacy/unrecorded decision or a foreign
+viewer, including an admin viewing another user's run. Generic mutation and
+worker responses also leave it `null`; reads do not trigger a usage lookup.
+
+### Cross-check history
+
+`uzi run cross-checks` reads one owner-only page of retained Plan and Code
+attempts grouped by parent work run, including after consent is disabled.
+Active/Past describes the union of retained attempt activity, independently
+of parent status. Stage and outcome filter attempts without changing group
+lifecycle. See [Cross-check history](./cross-check.md#browse-retained-cross-checks).
+
+| Flag | Values and default |
+|---|---|
+| `--lifecycle` | `active` (default), `past` |
+| `--stage` | `all` (default), `plan`, `code` |
+| `--outcome` | `any` (default); with `past`: `didnt_finish`, `raised_issues`, `passed`, `replaced` |
+| `--limit` | Groups per page, 1–25, default 25 |
+| `--attempt-limit` | Attempts per parent, 2–20, default 10 |
+| `--cursor` | Returned next-group cursor; excludes `--attempt-cursor` |
+| `--attempt-cursor` | Returned older-attempt cursor; repeat for up to eight distinct parents |
+| `--json` | Emit the bounded API envelope |
+
+```sh
+uzi run cross-checks
+uzi run cross-checks --lifecycle past --stage plan --outcome raised_issues
+uzi run cross-checks --lifecycle past --cursor '<next_cursor>'
+uzi run cross-checks --lifecycle past \
+  --attempt-cursor '<older_cursor_for_parent_a>' \
+  --attempt-cursor '<older_cursor_for_parent_b>' --json
+```
+
+Copy opaque cursors from the preceding response and keep lifecycle, stage and
+outcome unchanged. Group cursors allow 512 encoded bytes, attempt cursors 256
+each, with at most eight and 3072 aggregate encoded bytes; the request target
+allows 4096 bytes. These are explicit continuations, not a snapshot.
+For `refresh_needed`, reload without cursors using the same filters.
+
+Human output reports groups on this page, shown/matching/filtered/total
+retained attempts, hidden active context and **Earlier rounds omitted: load
+older attempts**. Attempts display in Plan-then-Code round order after the
+API selects its bounded newest window. Check execution, recorded verdict and
+effect on run are separate; unknown or missing checker evidence does not
+prove completion. A historical approval does not certify a later candidate.
+
+`--json` returns `{"groups":[...],"next_cursor":"..."}`, with
+`next_cursor` omitted when absent. Groups include counts, `attempts`,
+optional `older_cursor`/`omission` and `refresh_needed`; the
+[API summary](./cross-check.md#page-sizes-and-continuation) describes the fields.
+The command makes one request, never drains either cursor family automatically
+and never fetches full findings or checker detail. Use `uzi run get <id>`
+and `uzi run logs <checker-id>` for the existing detail surfaces.
 
 ### Plan cross-check evidence
 
@@ -3445,7 +3798,10 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   token](anthropic-token.md#letting-uzi-pick-the-token-auto-selection);
 - `recovery_wait` — parked to recover from a resumed turn that came back empty
   (no model activity) or hit a transient provider error; the sweep auto-resumes
-  it on a capped backoff. Empty-turn and resumed-gate recovery have no lifetime cap;
+  those interruptions on a capped backoff. Disk parks (`data_volume_full`) have
+  three timed counted retries by default, then hold for owner Resume/Cancel;
+  preventive parks stay uncounted and timed. See [Worker data volume full](run-recovery-wait.md#worker-data-volume-full).
+  Empty-turn and resumed-gate recovery have no lifetime cap;
   negotiated `codex_idle_stall` parks instead have three timed retries by default,
   then require owner Resume/Cancel. See [Codex idle stalls](#codex-idle-stalls).
   Typed `provider_outage` parks use the elapsed streak bound and can become
@@ -3455,9 +3811,12 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   without an automatic timer. Retained-source budget exhaustion can use cause
   `retained_recovery_exhausted`: three timed retries by default, then an owner
   hold with no countdown. An integrity refusal uses `retained_recovery_adoption_failed`,
-  requiring owner Resume or Cancel with no automatic retry. See
-  [Retained recovery exhausted](#retained-recovery-exhausted) and
-  [Retained recovery adoption failed](#retained-recovery-adoption-failed). A Codex credential
+  requiring owner Resume or Cancel with no automatic retry. A retained continuation
+  whose departure was never witnessed uses the server-only cause
+  `retained_continuation_unwitnessed`, with the same owner-only Resume or Cancel.
+  See [Retained recovery exhausted](#retained-recovery-exhausted),
+  [Retained recovery adoption failed](#retained-recovery-adoption-failed) and
+  [Unwitnessed continuation hold](#unwitnessed-continuation-hold). A Codex credential
   refresh or release that found the owner's vault locked also parks here
   (cause `vault_locked`); it takes the same capped backoff and no lifetime
   cap. The owner's successful explicit vault unlock or eligible foreground
@@ -3474,9 +3833,17 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   page or `uzi run resume <id>`. The requester does not determine the display
   path: `park_run` and the owner's `/park` answer share the lead-park execution
   path; `uzi run pause` uses the owner path. See [Pausing and resuming a
-  run](run-pause.md). An ordinary pause does **not** auto-resume. A `paused` run can instead
-  be a **completion-blocked hold** on a run whose [structural completion
-  interlock](run-completion-hold.md) couldn't finish a frozen milestone —
+  run](run-pause.md). An ordinary pause does **not** auto-resume. A `paused` run can also
+  show **Iteration limit reached** (`hold_reason: iteration_budget_exhausted`):
+  eligible runs with negotiated `iteration_park_version: 1` and authoritative
+  persisted `completion_attempts = 0` park at iteration exhaustion. The owner chooses
+  **Resume** or **Cancel**. Resume grants a fresh finite invocation allowance with
+  no added wall time; if the wall budget is spent, **Extend**, then **Resume**.
+  Extend alone leaves this hold paused; **Stop** is unavailable. See
+  [Paused at the iteration limit](run-pause.md#paused-at-the-iteration-limit).
+  Prior-attempt, excluded and legacy runs keep their existing dispositions.
+  A `paused` run can instead be a **completion-blocked hold** on a run whose
+  [structural completion interlock](run-completion-hold.md) couldn't finish a frozen milestone —
   same status, a different reason, and a different resume path
   (`uzi run decide <id> --continue`, not `run resume`). `run get` prints the
   distinction as a `COMPLETION` row reading `Completion blocked`, alongside
@@ -3495,6 +3862,14 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   Settings, or `uzi run set-token` where the run accepts a token switch),
   `run list` shows `paused (credential disabled)`, and the TUI draws it as
   `⊘ cred disabled` in NEEDS YOU.
+  A `paused` run can also be **waiting because your credentials were reset**
+  (`hold_reason: credentials_reset`): a Claude or chat run created before an
+  admin-issued [account reset](auth-design.md) found no model credential at
+  claim. `run get` prints a `HOLD` row reading `credentials were reset` with
+  the action "add a credential in Settings; the run resumes automatically",
+  and the web badge reads "waiting: credentials were reset". It resumes on its
+  own once you add a credential; `run resume` and `run set-token` are refused
+  with a 409 until then.
   A `paused` run can also be held after an owner token switch on a run with
   retained recovery work (`hold_reason: credential_switch_settling`, then
   `credential_switch_unsettled`). `run get` prints a `HOLD` row reading
@@ -3518,6 +3893,13 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   `uzi run recovery <id>`, recover the work with `uzi run export <id>
   --output <path>`, or start a successor run. See [Seeded
   plans](seeded-plans.md).
+  A `paused` run can also be **held because its repo agents could not be
+  read** (`hold_reason: repo_agent_source_unavailable`): the worker could not
+  resolve, record or read the default-branch revision it reads
+  `.claude/agents/` and `.codex/agents/` from, so the agent never started. `run get` prints a
+  `HOLD` row reading `repo agents unreadable`; resume the run with
+  `uzi run resume <id>` once the repository can be fetched, or cancel it. See
+  [Repo agents](repo-agents.md#which-revision-is-read).
 
 For an ordinary pause, human `run get` makes one supplemental message read
 (`tail=100`). Its pause detail reads **paused by the run's lead** for
@@ -3547,21 +3929,16 @@ hold presentation and remedies are unchanged. See
 
 `limit_wait` and timed `recovery_wait` causes auto-resume on a timer.
 `worker_requeue_exhausted` instead requires owner Resume or Cancel; the Codex
-account hold waits for its account. `codex_idle_stall` and
-`retained_recovery_exhausted` retry when
-their timestamp is finite (even if due); NULL instead needs owner Resume/Cancel,
-and omitted timing is unknown. `pool_wait` instead clears only when a token is
-
-account hold waits for its account. `retained_recovery_exhausted` retries when
-its timestamp is finite (even if due); NULL instead needs owner Resume/Cancel,
-and omitted timing is unknown. `retained_recovery_adoption_failed` requires
+account hold waits for its account. `codex_idle_stall`, `data_volume_full` and
+`retained_recovery_exhausted` retry when their timestamp is finite (even if due);
+explicit NULL instead needs owner Resume/Cancel, and omitted timing is unknown. `retained_recovery_adoption_failed` requires
 owner Resume/Cancel regardless of retry timing. `pool_wait` instead clears only when a token is
 opted into the pool (or on demand with `uzi run resume-now`), so waiting alone
 does not resume it.
 
 So to wait for a plan gate or a clarification, use **`uzi run wait <id>`** (next
-section) — leaning on `--follow` there blocks until the run truly finishes, which
-may be never while it waits on a human. If you see a `status` outside this list, the server is newer
+section). `--follow` can keep waiting at human gates; it stops at a disk owner
+hold with Resume/Cancel guidance. If you see a `status` outside this list, the server is newer
 than this binary — upgrade rather than trusting it to mean "active". (The live
 `/api/ws` stream and `uzi tui` rewrite an unrecognised status to `unknown`; plain
 `run get`/`run list --json` pass it through as-is.)
@@ -3762,8 +4139,11 @@ for renewal bounds, storage risks and rollout requirements.
 ### Retained recovery adoption failed
 
 `recovery_wait` / `retained_recovery_adoption_failed` means an integrity check
-refused adoption. Local work and custody are preserved; the run is owner-held
-with no automatic retry, regardless of a displayed retry timestamp.
+refused adoption, or that a predecessor's active secret-scan remediation record
+refused source use so the agent did not start. Local work and custody are
+preserved; the run is owner-held with no automatic retry, regardless of a
+displayed retry timestamp. In the remediation case, Resume holds again unless
+that remediation was resolved through a separately authorized route.
 
 Read `uzi run recovery <id>` and export an available archive before deciding.
 Use `uzi run resume <id>` (or `resume-now`) to request another bounded attempt,
@@ -3777,6 +4157,18 @@ NEEDS YOU. Explicit `--until` keeps its selected status set. See
 [Retained recovery adoption failed](run-recovery-wait.md#retained-recovery-adoption-failed)
 for storage risks and rollout requirements.
 
+### Unwitnessed continuation hold
+
+`recovery_wait` / `retained_continuation_unwitnessed` means a retained
+continuation (a run with an open custody hold from an earlier claim generation)
+was claimed, its `running` report was refused, and no flight departure was
+witnessed within twice the claim grace. The claim is released and local work and
+custody are kept; there is **no automatic retry**. `uzi run get`, `list`, the
+inputs view and the TUI show an owner hold. Read `uzi run recovery <id>`, then
+`uzi run resume <id>` or `uzi run cancel <id>`. Default `uzi run wait` and log
+follow stop for this decision; explicit `--until` keeps its status set. See
+[Unwitnessed continuation hold](run-recovery-wait.md#unwitnessed-continuation-hold).
+
 ### Waiting for a state: `uzi run wait`
 
 `uzi run wait <id>` blocks until the run reaches a state you can act on — the
@@ -3787,8 +4179,8 @@ built-in primitive for driving a gated run headless, replacing the hand-rolled
 rest (`queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/`recovery_wait`/`paused`),
 except a default wait also stops at `recovery_wait` with cause
 `worker_requeue_exhausted`, `worker_memory_pressure`,
-`retained_recovery_adoption_failed`, or owner-held `retained_recovery_exhausted`
-or `codex_idle_stall` (NULL retry), and at a `paused` run held on
+`retained_recovery_adoption_failed`, `retained_continuation_unwitnessed`, or
+owner-held `retained_recovery_exhausted` or `codex_idle_stall` (NULL retry), and at a `paused` run held on
 `base_attestation_missing`, for an owner decision:
 timed limit and recovery waits retry on a timer, pool waits need an available pooled token,
 and ordinary owner or lead pauses need `uzi run resume`. A bare `run wait` means

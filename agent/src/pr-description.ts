@@ -1247,7 +1247,8 @@ const CODE_CROSS_CHECK_REASON_PROSE: ReadonlyMap<string, string> = new Map([
   ["superseded", "superseded by a later change"],
 ]);
 
-/** Code data occupies escaped value slots only; the 4 KiB budget drops finding lines first. */
+/** Code data occupies escaped value slots only; the 4 KiB budget drops unassessed paths first,
+ *  then verification-caveat lines, then graded finding lines, leaving counted omission lines. */
 function renderCodeCrossCheck(summary: import("./code-cross-check-gate.js").CodeCrossCheckSummary): string {
   const value = (s: string | null | undefined, cap = 256): string => {
     // Strip complete ANSI sequences before dropping the remaining invisible controls.
@@ -1268,20 +1269,33 @@ function renderCodeCrossCheck(summary: import("./code-cross-check-gate.js").Code
   }
   if (!summary.head_commit || !summary.base_commit) return "Code cross-check incomplete: snapshot failed";
   const dispositions = new Map((summary.dispositions ?? []).map(d => [d.finding_id, d]));
-  let addressed = 0, declined = 0, missing = 0;
-  const findings = summary.findings.map(f => {
+  // A verification caveat is a finding whose raw title starts with the checker's fixed prefix;
+  // every other finding (Requirement gap: included) is graded.
+  const tally = { graded: { addressed: 0, declined: 0, missing: 0 }, caveat: { addressed: 0, declined: 0, missing: 0 } };
+  const findings: string[] = [];
+  const caveatLines: string[] = [];
+  for (const f of summary.findings) {
+    const isCaveat = f.title.startsWith("Coverage uncertainty:");
+    const group = isCaveat ? tally.caveat : tally.graded;
     const d = dispositions.get(f.id);
     const disposition = d?.disposition ?? "not_reported";
-    if (disposition === "addressed") addressed++;
-    else if (disposition === "declined") declined++;
-    else missing++;
-    return `- ${codeSpan(f.id)} · ${value(f.severity)} · ${value(f.path)}:${f.line} · ${value(f.title)} — ${disposition === "not_reported" ? "not reported" : value(disposition)}${d?.reason ? `: ${value(d.reason, 1024)}` : ""}`;
-  });
+    if (disposition === "addressed") group.addressed++;
+    else if (disposition === "declined") group.declined++;
+    else group.missing++;
+    (isCaveat ? caveatLines : findings).push(`- ${codeSpan(f.id)} · ${value(f.severity)} · ${value(f.path)}:${f.line} · ${value(f.title)} — ${disposition === "not_reported" ? "not reported" : value(disposition)}${d?.reason ? `: ${value(d.reason, 1024)}` : ""}`);
+  }
+  const gradedTotal = findings.length;
+  const caveatTotal = caveatLines.length;
+  const groupCounts = (g: { addressed: number; declined: number; missing: number }) =>
+    `${g.addressed} addressed, ${g.declined} declined${g.missing ? `, ${g.missing} not reported` : ""}`;
   const family = summary.checker_harness === "codex" ? "Codex" : summary.checker_harness === "claude" ? "Claude" : value(summary.checker_harness);
   const identity = `Code cross-check (checked ${codeSpan(summary.head_commit.slice(0, 7))}, ${family} ${value(summary.checker_model)}${summary.checker_effort ? ` · ${value(summary.checker_effort)}` : ""})`;
   const counts = summary.findings.length === 0
     ? `${identity}: no findings`
-    : `${identity}\n${summary.findings.length} ${summary.findings.length === 1 ? "finding" : "findings"}: ${addressed} addressed, ${declined} declined${missing ? `, ${missing} not reported` : ""}`;
+    : caveatTotal === 0
+      ? `${identity}\n${summary.findings.length} ${summary.findings.length === 1 ? "finding" : "findings"}: ${groupCounts(tally.graded)}`
+      : `${identity}\n${summary.findings.length} ${summary.findings.length === 1 ? "finding" : "findings"}: ${gradedTotal} graded (${groupCounts(tally.graded)}), ${caveatTotal} verification ${caveatTotal === 1 ? "caveat" : "caveats"} (${groupCounts(tally.caveat)})`
+        + (gradedTotal === 0 ? "\nNo graded findings; verification caveats are not a certification that the change has no defects." : "");
   // The digest is the frozen guidance's sha256; only its first 12 hex characters are shown.
   const guidance = summary.custom_guidance_applied
     ? [`custom guidance applied${summary.guidance_digest ? ` (sha256 ${codeSpan(summary.guidance_digest.slice(0, 12))})` : ""}`]
@@ -1310,11 +1324,18 @@ function renderCodeCrossCheck(summary: import("./code-cross-check-gate.js").Code
     coverageLines.push("Coverage is an advisory review account.");
   }
   const footer = "**Changes after the check were not cross-checked.**";
+  const caveatHeader = "Verification caveats (evidence the read-only checker could not verify; a disposition never marks a criterion met or waives a landing obligation):";
   const render = () => [counts, ...guidance, ...coverageLines, ...unassessedPaths,
     ...(unassessedTotal > unassessedPaths.length ? [`${unassessedTotal - unassessedPaths.length} more unassessed paths; see the run for the full stored account.`] : []),
-    ...findings, footer].join("\n");
-  // Drop displayed paths before existing findings; the full stored account remains on the run.
+    ...findings,
+    ...(gradedTotal > findings.length ? [`${gradedTotal - findings.length} graded ${gradedTotal - findings.length === 1 ? "finding" : "findings"} not shown; see the run for the full stored account.`] : []),
+    ...(caveatLines.length ? [caveatHeader] : []), ...caveatLines,
+    ...(caveatTotal > caveatLines.length ? [`${caveatTotal - caveatLines.length} verification ${caveatTotal - caveatLines.length === 1 ? "caveat" : "caveats"} not shown; see the run for the full stored account.`] : []),
+    footer].join("\n");
+  // Drop displayed paths first, then caveat lines, then graded lines; omission lines and the footer
+  // stay, and the full stored account remains on the run.
   while (unassessedPaths.length && Buffer.byteLength(render()) > 4096) unassessedPaths.pop();
+  while (caveatLines.length && Buffer.byteLength(render()) > 4096) caveatLines.pop();
   while (findings.length && Buffer.byteLength(render()) > 4096) findings.pop();
   return render();
 }

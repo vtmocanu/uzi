@@ -28,9 +28,12 @@ name: E2E
 # Quoted so yamllint's `truthy` rule does not read the key as the boolean `on`.
 "on":
   schedule:
-    # 01:17 UTC == 03:17 EET / 04:17 EEST. Off the top of the hour to avoid the
+    # 21:17 UTC == 23:17 EET / 00:17 EEST. GitHub has started this schedule
+    # 4.7-6.4h late (measured 2026-10-24..11-02). At that worst delay plus a
+    # 100-minute run it ends about 05:22 UTC (07:22 EET, 08:22 EEST): an
+    # estimate, not a guaranteed finish time. Off the top of the hour to avoid the
     # scheduler's high-load contention. Adjust freely.
-    - cron: "17 1 * * *"
+    - cron: "17 21 * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -130,6 +133,8 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      # Only scheduled or manual main runs update the nightly tracker; branch dispatches
+      # validate changes before merge and must not count against main's nightly streak.
       # On failure or a timed-out lane, keep exactly ONE open issue PER LANE: comment on the existing one,
       # else open it. Uses the built-in GITHUB_TOKEN (no PAT). The label is upserted
       # first so the `gh issue list --label` lookup cannot error on a missing label.
@@ -137,7 +142,7 @@ jobs:
       # and avoids a create race between the parallel matrix lanes. The body embeds
       # summary.md so the tracker shows every failing phase, not just a run URL.
       - name: Open or update failure issue
-        if: ${{ failure() || cancelled() }}
+        if: ${{ (failure() || cancelled()) && (github.event_name == 'schedule' || github.ref == 'refs/heads/main') }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FORGE_LANE: ${{ matrix.forge }}

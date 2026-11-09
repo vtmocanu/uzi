@@ -118,6 +118,10 @@ for (const reap of [false, true]) {
     assert.equal(failed.length, 1);
     assert.match(failed[0]?.body.failure_reason ?? "", new RegExp(`owed-head limit \\(${MAX_OWED_CANDIDATES_PER_RUN}\\)`));
     assert.equal(fs.existsSync(clone), true, "the working clone is kept");
+    assert.deepEqual(api.messages(claim.run_id)
+      .map(m => (m.payload as { text?: string }).text ?? "")
+      .filter(text => text.startsWith("tracking preservation refused (reason=")),
+    ["tracking preservation refused (reason=owed_limit); inspect retained-work status with uzi run recovery."]);
   });
 }
 

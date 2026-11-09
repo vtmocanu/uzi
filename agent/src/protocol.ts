@@ -17,6 +17,83 @@ import type { HarnessEffort } from "./harness.js";
 /** All worker endpoints live under this prefix and take a Bearer join token. */
 export const WORKER_API_PREFIX = "/api/worker";
 
+// Compact M1 transport only: this does not advertise provider_policy_hold_v1 readiness.
+export interface PolicyHoldRequest {
+  outcome_id: string;
+  source_generation: number;
+  claim_generation: number;
+  detail: "refused" | "resume_rejected";
+  continuation_mode: "same_conversation" | "fresh_from_saved_work";
+  tag?: "cyberPolicy" | "misalignmentPolicyViolation";
+  phase?: "planning" | "implementation";
+  correlation_id?: string;
+  session_id?: string;
+  head?: string;
+  published: boolean;
+  checkpoint_contains_latest?: boolean;
+}
+export interface PolicyHoldReply {
+  disposition: "applied" | "already_applied" | "resolved_newer_policy" | "pending" | "terminal";
+  outcome_id: string;
+  source_generation: number;
+  observed_status?: string;
+  hold_reason?: string;
+  observed_generation?: number;
+  applying_generation?: number;
+  reason?: string;
+}
+export const POLICY_HOLD_MAX_BYTES = 17 * 1024;
+const policyGeneration = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) > 0;
+const policyObject = (v: unknown): v is Record<string, unknown> =>
+  v !== null && typeof v === "object" && !Array.isArray(v);
+const policyKeys = new Set(["outcome_id", "source_generation", "claim_generation", "detail", "continuation_mode",
+  "tag", "phase", "correlation_id", "session_id", "head", "published", "checkpoint_contains_latest"]);
+export function validatePolicyHoldRequest(value: unknown): PolicyHoldRequest {
+  const invalid = () => { throw new Error("invalid policy hold request"); };
+  if (!policyObject(value) || Object.keys(value).some(k => !policyKeys.has(k))) return invalid();
+  // Validate the same own enumerable fields that can cross JSON. Inherited
+  // identities and serialization hooks cannot complete a closed request.
+  const v: Record<string, unknown> = Object.fromEntries(Object.entries(value));
+  if (typeof v.outcome_id !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\s\S])/.test(v.outcome_id) ||
+      v.outcome_id === "00000000-0000-0000-0000-000000000000" ||
+      !policyGeneration(v.source_generation) || !policyGeneration(v.claim_generation) || v.claim_generation < v.source_generation ||
+      !["refused", "resume_rejected"].includes(v.detail as string) ||
+      !["same_conversation", "fresh_from_saved_work"].includes(v.continuation_mode as string) || typeof v.published !== "boolean") return invalid();
+  if (v.detail === "refused" && (v.tag === undefined || v.phase === undefined || v.correlation_id === undefined)) return invalid();
+  if (v.tag !== undefined && v.tag !== "cyberPolicy" && v.tag !== "misalignmentPolicyViolation") return invalid();
+  if (v.phase !== undefined && v.phase !== "planning" && v.phase !== "implementation") return invalid();
+  if (v.correlation_id !== undefined && (typeof v.correlation_id !== "string" ||
+      !/^pr-[0-9a-f]{32}-[1-9][0-9]{0,15}(?![\s\S])/.test(v.correlation_id) ||
+      !policyGeneration(Number(v.correlation_id.slice(36))))) return invalid();
+  if (v.session_id !== undefined && (typeof v.session_id !== "string" || v.session_id.length > 1024 ||
+      Buffer.byteLength(v.session_id) > 1024 || v.session_id.includes("\0") || Buffer.from(v.session_id, "utf8").toString("utf8") !== v.session_id)) return invalid();
+  if (v.head !== undefined && (typeof v.head !== "string" || (v.head !== "" && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})(?![\s\S])/.test(v.head)))) return invalid();
+  if (v.checkpoint_contains_latest !== undefined && typeof v.checkpoint_contains_latest !== "boolean") return invalid();
+  if (v.checkpoint_contains_latest === true && v.published !== true) return invalid();
+  if ((v.published || v.checkpoint_contains_latest) && !v.head) return invalid();
+  if (Buffer.byteLength(JSON.stringify(v)) > POLICY_HOLD_MAX_BYTES) return invalid();
+  return JSON.parse(JSON.stringify(v)) as PolicyHoldRequest;
+}
+export function decodePolicyHoldReply(value: unknown, request: PolicyHoldRequest): PolicyHoldReply {
+  const invalid = () => { throw new Error("invalid policy hold receipt"); };
+  if (!policyObject(value)) return invalid();
+  const v = value;
+  if (Object.keys(v).some(k => !["disposition", "outcome_id", "source_generation", "observed_status",
+    "hold_reason", "observed_generation", "applying_generation", "reason"].includes(k)) ||
+      v.outcome_id !== request.outcome_id || v.source_generation !== request.source_generation ||
+      !["applied", "already_applied", "resolved_newer_policy", "pending", "terminal"].includes(v.disposition as string)) return invalid();
+  if (v.observed_status !== undefined && !["queued", "claimed", "running", "awaiting_approval", "awaiting_input", "limit_wait", "completed", "failed", "cancelled", "awaiting_followup", "pool_wait", "paused", "recovery_wait"].includes(v.observed_status as string)) return invalid();
+  for (const k of ["observed_generation", "applying_generation"]) if (v[k] !== undefined && !policyGeneration(v[k])) return invalid();
+  for (const k of ["reason", "hold_reason"]) if (v[k] !== undefined && (typeof v[k] !== "string" || v[k].length > 256)) return invalid();
+  if (v.disposition !== "pending" && (!policyGeneration(v.observed_generation) || v.observed_status === undefined)) return invalid();
+  if (v.disposition === "applied" && (v.observed_status !== "paused" || v.hold_reason !== "codex_policy_hold" ||
+      v.observed_generation !== request.claim_generation)) return invalid();
+  if (v.disposition === "resolved_newer_policy" && (!policyGeneration(v.applying_generation) ||
+      v.applying_generation <= request.source_generation || v.applying_generation > (v.observed_generation as number))) return invalid();
+  if (v.disposition === "terminal" && !["completed", "failed", "cancelled"].includes(v.observed_status as string)) return invalid();
+  return v as unknown as PolicyHoldReply;
+}
+
 /** Compile-time two-way tie between the SDK's EffortLevel and HARNESS_EFFORTS: this line fails
  *  to typecheck when either side drifts. */
 const effortSetsAligned: [EffortLevel] extends [HarnessEffort]
@@ -105,6 +182,11 @@ export type RunState =
   /** issue #3181: the worker's acknowledgement that the held flight's owned operations have
    *  joined (hold_reason credential_switch_unsettled). Same fences as the hold report. */
   | "credential_switch_hold_settled"
+  /** Issue #3985: a plan cross-check run whose lead asked a clarification after a HUMAN
+   *  revise_plan verdict has the owner's answer; the run returns to awaiting_approval with the
+   *  revise still pending (an answer is never plan approval). Carries `clarification_settlement`
+   *  and `claim_generation`; requires the `clarification_revision_settlement_v1` feature. */
+  | "clarification_settled"
   | "completed"
   | "failed";
 
@@ -588,6 +670,9 @@ export interface OutboxHeartbeatEntry {
   run_id: string;
   pending_messages: number;
   pending_terminal: number;
+  /** Presentation only: newest known unsettled original policy outcome. */
+  policy_pending_outcome_id?: string;
+  policy_pending_source_generation?: number;
   stale_retired: number;
   blocked_reason?: string;
   since: number;
@@ -666,9 +751,15 @@ export interface ActiveSnapshot {
    *  Only run_id/claim_generation; excludes finalize-pending records. Empty means complete empty
    *  coverage; omission means unavailable on older workers. Requires an accepted enclosing
    *  snapshot: duplicate active run IDs still reject it and provide no pending_all coverage.
-   *  The worker sends the full list even over the API identity-count limit; the API drops the
-   *  entire pending_all list when over that limit, never truncates it. No lifecycle authority. */
+   *  With no returned identity-count ceiling, workers omit coverage above the established
+   *  256-entry default. The API also rejects coverage above its configured ceiling, never
+   *  truncates it. No lifecycle authority. */
   pending_all?: { run_id: string; claim_generation: number }[];
+  /** Negotiated separately from policy production; current fenced ownership only. */
+  pending_policy_protection?: { run_id: string; owner_generation: number }[];
+  /** Negotiated intake only: inventory is unavailable, never complete empty.
+   * Overflow still excludes every candidate attributed to this worker. */
+  pending_inventory_incomplete?: true;
   /** Issue #1742: carried ONLY on the register snapshot — each run whose executor finished at the
    *  named exact claim generation and whose authenticated finalize-pending record survived a
    *  process restart with no journaled terminal outcome. Never an outcome and never a lease: the
@@ -756,6 +847,8 @@ export interface HeartbeatRequest {
    * field and the heartbeat wire stays byte-identical to today when it is unset.
    */
   outbox?: OutboxHeartbeatEntry[];
+  /** Optional worker-global root diagnostic; never per-run arbitration evidence. */
+  outbox_root_unusable?: "symlink" | "unreadable" | null;
   /**
    * The worker's active-run snapshot (PRD #1390 M2a). Sent ONLY when the server
    * advertised `active_run_snapshot` in the current API feature cache and an original
@@ -1010,6 +1103,16 @@ export interface LeadConfigReportBody {
   observed_effort_evidence: string | null;
 }
 
+/** Issue #3251: the body of POST /api/worker/runs/{id}/codex-catalog-default. The server schema is
+ *  closed (unknown fields are a 400). */
+export interface CodexCatalogDefaultBody {
+  claim_generation: number;
+  catalog_context: string;
+  model: string;
+  runtime_version: string;
+  default_effort: string;
+}
+
 /** Per-run caps the server may push down (PRD §Configuration). Advisory in M2.
  *  Field names + units match M1's claim.go: timeouts are in *seconds*; any
  *  future ms consumer converts at the use site. */
@@ -1023,11 +1126,14 @@ export interface ClaimConfig {
    *  constant (30m). Seconds, converted to ms at the park site. */
   task_idle_timeout_seconds?: number;
   max_iterations?: number;
+  /** Only version 1 supports iteration parking; absent or unknown versions are unsupported. */
+  iteration_park_version?: number;
   /** Bound on plan-revision rounds at the approval gate (PRD #41, env
    *  PLAN_MAX_REVISIONS). The worker enforces the same cap the server does. */
   plan_max_revisions?: number;
   /** PRD #88 clarification bounds: how many times one run may stop to ask the human,
-   *  and how long a single park waits before the run fails "clarification timed out".
+   *  and the cumulative time parked at awaiting_input (per worker execution) before the
+   *  run fails "clarification timed out".
    *  Both enforced worker-side (a question is an in-process ask_user signal, so unlike
    *  a revise_plan there is no input row for the server to count) but configured
    *  server-side and shipped here, because a worker env var is unreachable on hosted
@@ -1066,6 +1172,9 @@ export interface ClaimConfig {
   /** PRD #3244: where `default_effort` (or its absence) came from. Always present on a lead-lane
    *  claim of an upgraded API, which makes it the worker's lead-config reporting activation signal. */
   default_effort_source?: LeadEffortSource;
+  /** Issue #3251: the opaque catalog context (64 lowercase hex) of a Codex lead-lane claim with a
+   *  complete credential binding; echoed verbatim when reporting the catalog default effort. */
+  codex_catalog_context?: string;
   /** The run owner's AI-attribution opt-out (issue #916), read live per claim. When
    *  false, the worker suppresses the Agent SDK's Co-Authored-By: Claude commit trailer
    *  for this run. Always sent by an upgraded server (NOT null); absent on an older
@@ -1403,6 +1512,13 @@ export interface ClaimJob {
  * path consumes it, so it is declared below.
  */
 /** Server-stored, bounded plan candidate for one live read-only child claim. */
+export interface ClaimOwnerSteering {
+  /** Canonical v1 snapshot JSON text. */
+  snapshot: string;
+  /** Lowercase hex sha256 of `snapshot`. */
+  digest: string;
+}
+
 export interface ClaimPlanCrossCheck {
   candidate_identity_version?: "semantic_v1";
   semantic_candidate?: ReturnType<typeof import("./semantic-plan.js").parseSemanticCandidate>;
@@ -1550,6 +1666,8 @@ export interface ClaimResponse extends ClaimMemoryState {
   /** Protection requires this exact-generation assertion AND recovery_inventory_v1. */
   inventory_guarded?: boolean;
   cross_check?: ClaimPlanCrossCheck | ClaimCodeCrossCheck;
+  /** Frozen owner steering for a plan cross-check (issue #3841); decoded by decodeOwnerSteering. */
+  cross_check_owner_steering?: ClaimOwnerSteering;
   run_id: string;
   /** Run kind (PRD #6). "issue": work issue_iid's card. "ci_fix": diagnose + fix
    *  the failed `pipeline`. Absent on older servers ⇒ treat as "issue". */
@@ -1809,6 +1927,7 @@ export interface ClaimResponse extends ClaimMemoryState {
    *  (PRD #209 M4 Open Question 3, `--require-base`). Meaningful only alongside
    *  planned_base_commit. Absent on an older server ⇒ false, i.e. warn-and-implement. */
   require_base_match?: boolean;
+  repo_agent_source_commit?: string | null;
   /** The run's PERSISTED subagent selection (`runs.agent_source` /
    *  `agent_exclusions`), replayed on every claim (PRD #35).
    *
@@ -1826,6 +1945,7 @@ export interface ClaimResponse extends ClaimMemoryState {
    *  missing key as "absent", never as "source own with no exclusions". Also absent
    *  from an older server, which is the same case and wants the same handling. */
   agent_selection?: AgentSelection;
+  requested_agent_source?: AgentSource | null;
   /** This run's usage-limit opt-in (PRD #35 Decision 7), read from the runs row on
    *  EVERY claim so a resumed or re-queued run keeps it — the same convention as
    *  `auto_approve` above, and for the same reason: an unattended resume must not
@@ -2221,6 +2341,12 @@ export interface CompletionPermitResponse {
  *  /api/worker/runs/:id/base-attestation-hold). Mirrors workersvc.HoldReasonBaseAttestationMissing. */
 export const BASE_ATTESTATION_HOLD_REASON = "base_attestation_missing";
 
+export const REPO_AGENT_SOURCE_HOLD_REASON = "repo_agent_source_unavailable";
+
+export const REPO_AGENT_SOURCE_FEATURE = "repo_agent_source_v1";
+
+export const PLAN_AGENT_SOURCE_FEATURE = "plan_agent_source_v1";
+
 /** issue #3194: what a base-attestation hold request established. `held` is the server's positive
  *  ACK for this flight's generation; `stale` is a fence refusal (the claim moved on); `unknown`
  *  covers every answer that proves neither (transport, 5xx, 404, 400, an unreadable body). */
@@ -2228,6 +2354,28 @@ export type BaseAttestationHoldOutcome =
   | { outcome: "held"; status: string }
   | { outcome: "stale"; status: string }
   | { outcome: "unknown"; detail: string };
+
+/** Dedicated iteration park evidence. Counters/allowances are positive int32 values;
+ * claim_generation is a positive safe integer. iteration_count is max_iterations or
+ * max_iterations + 1; head is at most 128 UTF8 bytes. */
+export interface IterationParkRequest {
+  claim_generation: number;
+  iteration_count: number;
+  max_iterations: number;
+  head: string;
+  published: boolean;
+  checkpoint_contains_latest?: boolean;
+}
+
+export type IterationParkRefusalReason =
+  | "prior_attempt" | "ineligible_lane" | "not_running" | "allowance_mismatch"
+  | "stale_claim" | "released_claim" | "pending_control";
+
+/** A refusal is advisory evidence, never permission to continue the exhausted flight. */
+export type IterationParkResult =
+  | { outcome: "parked" }
+  | { outcome: "refused"; reason: IterationParkRefusalReason; status: string; claimGeneration: number }
+  | { outcome: "unknown" };
 
 /** Request body for POST /api/worker/runs/:id/wall-park (PRD #1497 M2, D4/D15): the worker
  *  reports it dropped its turn at the run's wall-clock deadline and captured the tree, and the
@@ -2607,25 +2755,38 @@ export function parseAgentSelection(
 export function resolveAgentSelection(
   parse: AgentSelectionParse,
   repoAvailable: boolean,
+  requested?: AgentSource | null,
 ): { selection: AgentSelection; note?: string } {
   switch (parse.status) {
     case "ok":
-      if (parse.selection.source === "repo" && !repoAvailable)
-        return {
-          selection: { source: "own", exclusions: [] },
-          note: "this clone has no repo agent roster; using your own agent templates",
-        };
-      return { selection: parse.selection };
+      return degradeRepoWithoutRoster(parse.selection, repoAvailable);
     case "invalid":
       return {
         selection: { source: "own", exclusions: [] },
         note: "the submitted agent selection was malformed; using your own agent templates",
       };
     case "absent":
-      return {
-        selection: { source: repoAvailable ? "repo" : "own", exclusions: [] },
-      };
+      return degradeRepoWithoutRoster(
+        { source: requestedAgentSource(requested) ?? (repoAvailable ? "repo" : "own"), exclusions: [] },
+        repoAvailable,
+      );
   }
+}
+
+function degradeRepoWithoutRoster(
+  selection: AgentSelection,
+  repoAvailable: boolean,
+): { selection: AgentSelection; note?: string } {
+  if (selection.source === "repo" && !repoAvailable)
+    return {
+      selection: { source: "own", exclusions: [] },
+      note: "this clone has no repo agent roster; using your own agent templates",
+    };
+  return { selection };
+}
+
+function requestedAgentSource(raw: unknown): AgentSource | undefined {
+  return raw === "repo" || raw === "own" ? raw : undefined;
 }
 
 /**
@@ -2640,6 +2801,23 @@ export function resolveAgentSelection(
  */
 export function seedAgentSelection(persisted?: AgentSelection | null): AgentSelectionParse {
   return persisted ? { status: "ok", selection: persisted } : { status: "absent" };
+}
+
+export function planAgentSource(
+  persisted: AgentSource | null | undefined,
+  requested: AgentSource | null | undefined,
+  repoAvailable: boolean,
+): AgentSource {
+  const narrowed = persisted !== undefined && persisted !== null && persisted !== "repo";
+  return requestedAgentSource(requested) === "repo" && repoAvailable && !narrowed ? "repo" : "own";
+}
+
+export function gateVerdictSelection(
+  verdict: AgentSelectionParse,
+  persisted: AgentSelection | null | undefined,
+  requested: AgentSource | null | undefined,
+): AgentSelectionParse {
+  return verdict.status === "absent" && requested && persisted ? seedAgentSelection(persisted) : verdict;
 }
 
 /** Body of POST /runs/:id/state. Fields are set per target status.
@@ -2697,7 +2875,29 @@ export type CapabilityInferenceEvidence = Partial<Record<"docker" | "jvm", {
   truncated: boolean;
 }>>;
 
+/** Issue #3859: negotiated feature for the `running` report's registration witness. */
+export const RUN_REGISTRATION_EVIDENCE_FEATURE = "run_registration_evidence_v1";
+
+/** Issue #3859: the witness that this worker registered the flight at `registration_epoch`
+ *  under `register_nonce`. Attached by the client to a `running` report only. */
+export interface RunRegistrationEvidence {
+  register_nonce: string;
+  claim_generation: number;
+  registration_epoch: number;
+}
+
+/** Issue #3985: the identities a `clarification_settled` report binds. */
+export interface ClarificationSettlement {
+  question_id: string;
+  revision_input_id: number;
+  gate_revision: number;
+}
+
 export interface StateRequest {
+  /** Issue #3985: present only on a `clarification_settled` report. */
+  clarification_settlement?: ClarificationSettlement;
+  /** Issue #3859: set by the client alone, never by a caller. */
+  registration_evidence?: RunRegistrationEvidence;
   /** Memory-pressure park fence, bound to the current registration. */
   register_nonce?: string;
   /** Memory-pressure episode; zero is the first episode. */
@@ -2833,11 +3033,13 @@ export interface StateRequest {
    *  means "detected nothing" (the gate's repo card goes inert), while an absent
    *  field/NULL column means "pre-feature run". */
   repo_agents?: RepoAgentSummary[];
+  repo_agent_source_commit?: string;
   /** The selection an AUTOPILOT run resolved for itself (PRD #37 Decision 6):
    *  repo agents when detected, else the owner's templates, with no exclusions.
    *  Human-gated runs persist their selection through the `approve_plan` input
    *  instead, so this is absent there. */
   agent_selection?: AgentSelection;
+  plan_agent_source?: AgentSource;
   /** The plan's milestone breakdown (PRD #122 M1, Decision 2). Additive + optional
    *  and OMITTED ENTIRELY when absent — never `null` or `[]` — so an old worker's
    *  payload and a new worker's "no milestones" payload stay the same shape on the
@@ -3008,10 +3210,16 @@ export interface StateRequest {
   provider_progress_turns?: number;
   /** PRD #1809 D6: qualifies a `recovery_cause: "data_volume_full"` park. `true` parks WITHOUT
    *  counting toward the api's lifetime cap (UZI_RUN_DISK_PARK_MAX), for M4's soft cache-cap park;
-   *  absent or false is a counted park, and past the cap the api fails the run itself (fail_origin
-   *  data_volume_full). The api 400s it with any other cause, and only accepts it once it
+   *  absent or false is a counted park, and past the finite cap the api holds the run for owner
+   *  Resume with a NULL retry time and unchanged count. The api 400s it with any other cause, and only accepts it once it
    *  advertises `recovery_cause_data_volume_full`. The disk-full handling (M5) never sends it. */
   disk_park_preventive?: boolean;
+  /** Issue #4046: qualifies a `recovery_cause: "retained_recovery_exhausted"` park. `true` says every
+   *  recovery reservation this flight positively witnessed in the window ended in a data volume capacity
+   *  refusal, so the api holds the run for the owner (uncounted, NULL retry time) instead of retrying on
+   *  a timer. Sent only when the api advertised `retained_recovery_capacity_hold_v1` at register; absent
+   *  is today's counted park. */
+  retained_capacity_only?: boolean;
   /** PRD #1809 D8: on a process-ending park report that published a checkpoint (the usage-limit
    *  park, the owner pause park, a recovery park including the mid-run `data_volume_full` one),
    *  whether that published checkpoint contains the run's latest committed work. `false` when the
@@ -3127,6 +3335,9 @@ export interface StateAck {
   completedPublicationReceipt?: CompletedPublicationReceipt;
   completedPublicationReason?: CompletedPublicationReason;
   reconciliation?: PlanCrossCheckReconciliation;
+  /** Issue #3859: the server's top-level answer to a report that carried registration_evidence.
+   *  Logged only; no behavior branches on it. */
+  registrationEvidence?: "recorded" | "refused";
   /** Whether the server applied the transition. Diagnostics and logging only —
    *  see the warning above before branching on it. */
   applied: boolean;
@@ -3146,6 +3357,7 @@ export interface StateAck {
    *  a plain stop. null/absent (older server, an unparseable body, a run with no hold) leaves it
    *  undefined, treated as "no hold" — the safe default. */
   holdReason?: string | null;
+  repoAgentSourceCommit?: string;
   /** The server-computed effective per-run budget (PRD #122 M2, Decisions 5/5b), read
    *  off the SAME `{run: RunDTO}` body as `status`. `budgetMaxIterations` is the scaled
    *  total implement/review turn ceiling; `budgetWallSeconds` is the effective wall clock
@@ -3233,6 +3445,8 @@ export interface StateAck {
   credentialSwitchHeld?: boolean;
   /** issue #3181: true when the 200 ack carried `disposition: "hold_settled"`. */
   credentialSwitchHoldSettled?: boolean;
+  /** Issue #3985: true when the 200 ack carried `disposition: "clarification_settled"`. */
+  clarificationSettled?: boolean;
   /** PRD #1795 M1 (decision 5): the TOP-LEVEL `gate_revision` of an `awaiting_approval` ACK — the
    *  revision the report was answered with, allocated or returned inside the report's transaction.
    *  The gate confirms THIS revision for bound-verdict matching. A positive integer only; absent
@@ -3309,6 +3523,9 @@ export interface RunOwnershipResponse {
    *  ack) can still quote when it resumes. An RFC3339 string when the run is parked with a
    *  stamp; NULL means automatic forge retries exhausted; waiting for owner Resume or Cancel. An absent stamp retains historical backoff copy. */
   recovery_retry_not_before?: string | null;
+  /** Issue #3860: true only when the server sees `stop_kind = 'cancelled'` plus a deliverable pending
+   *  cancel input on the same row. A value absent from an older api means unknown, never a cancel. */
+  cancellation_requested?: boolean;
 }
 
 /** PRD #1391 Run B M3 (D3): one missing seq range in a run's message trace, as the message-gaps

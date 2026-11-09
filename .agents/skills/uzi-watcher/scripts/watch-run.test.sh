@@ -195,8 +195,20 @@ for v in NULL 2099-01-02T03:04:05Z OMIT FALSE; do
   [ "$v" = NULL ] || echo "$v" > "$WORK/retry"
   rc=0; out=$(WATCH_ATTENTION_POLLS=0 run) || rc=$?
   [ "$rc" -eq 0 ] || fail "adoption $v: want exit 0, got $rc: $out"
-  case "$out" in *"STOP=recovery_wait:retained_recovery_adoption_failed"*"owner decision"*"integrity check refused adoption"*"local work and custody preserved"*"no automatic retry"*"RESULT=stop:recovery_wait") ;; *) fail "adoption guidance missing: $out";; esac
+  case "$out" in *"STOP=recovery_wait:retained_recovery_adoption_failed"*"owner decision"*"integrity hold"*"remediation record refused source use"*"local work and custody preserved"*"no automatic retry"*"RESULT=stop:recovery_wait") ;; *) fail "adoption guidance missing: $out";; esac
   [ "$(cat "$WORK/poll")" -eq 1 ] || fail "adoption hold polled again"
+done
+
+# Unwitnessed continuation: owner decision regardless of retry timing; not an integrity refusal.
+for v in NULL 2099-01-02T03:04:05Z OMIT FALSE; do
+  reset recovery_wait stalled "" '[]'
+  echo retained_continuation_unwitnessed > "$WORK/cause"
+  [ "$v" = NULL ] || echo "$v" > "$WORK/retry"
+  rc=0; out=$(WATCH_ATTENTION_POLLS=0 run) || rc=$?
+  [ "$rc" -eq 0 ] || fail "unwitnessed $v: want exit 0, got $rc: $out"
+  case "$out" in *"STOP=recovery_wait:retained_continuation_unwitnessed"*"owner decision"*"never witnessed"*"local work and custody preserved"*"no automatic retry"*"RESULT=stop:recovery_wait") ;; *) fail "unwitnessed guidance missing: $out";; esac
+  case "$out" in *integrity*) fail "unwitnessed must not claim integrity: $out";; esac
+  [ "$(cat "$WORK/poll")" -eq 1 ] || fail "unwitnessed hold polled again"
 done
 
 # Every memory-pressure park requires an owner decision, regardless of remaining

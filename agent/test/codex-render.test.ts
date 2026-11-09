@@ -1,5 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { parseCodexAgentFile } from "../src/repoagents-codex.js";
+import { filterRepoAgentModel } from "../src/repoagents.js";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -403,6 +405,25 @@ describe("renderCodexRun — custom worker-root model passthrough (PRD #1551)", 
 });
 
 describe("renderCodexRun — per-role resolution and root-ness", () => {
+  it("resolves parsed and projected TOML pins through perRoleModels with unchanged effort", () => {
+    for (const pin of ['model = "gpt-6-luna"', "", 'model = ""']) {
+      const parsed = parseCodexAgentFile(
+        'name = "coder"\ndescription = "Works."\ndeveloper_instructions = "Implement."\n' + pin, "file",
+      );
+      assert.equal(parsed.ok, true);
+      if (!parsed.ok) return;
+      const template = filterRepoAgentModel(parsed.template, "codex");
+      const run = renderCodexRun(runRequest({
+        model: "gpt-6-astra", effort: "low",
+        agents: { coder: agent({ description: template.description, prompt: template.prompt_body, model: template.model ?? undefined }) },
+      }));
+      assert.deepEqual(run.perRoleModels.get("coder"), {
+        model: pin === 'model = "gpt-6-luna"' ? "gpt-6-luna" : "gpt-6-astra",
+        modelReasoningEffort: "low",
+      });
+    }
+  });
+
   it("an agent model overrides the request model; absent inherits it; effort is request-scoped", () => {
     const run = renderCodexRun(
       runRequest({
@@ -549,6 +570,20 @@ describe("renderCodexRun — prompts", () => {
       run.perRolePrompts.get("a"),
       `BODY\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}\n\n${CODEX_LONG_COMMAND_APPEND}\n\n${CODEX_REPO_INSTRUCTIONS_APPEND}\n\n${SUBAGENT_SAFETY_APPEND}`,
     );
+  });
+
+  it("renders the child turn budget and partial-handoff rule before the safety block when requested (#3804)", () => {
+    const run = renderCodexRun(runRequest({
+      childTurnBudgetMs: 900_000,
+      agents: { a: agent({ prompt: "BODY" }), b: agent({ prompt: "OTHER" }) },
+    }));
+    for (const name of ["a", "b"]) {
+      const prompt = run.perRolePrompts.get(name)!;
+      assert.match(prompt, /a 15-minute budget/);
+      assert.match(prompt, /truthful partial handoff/);
+      assert.match(prompt, /not a passed check or a completed milestone/);
+      assert.ok(prompt.endsWith(SUBAGENT_SAFETY_APPEND));
+    }
   });
 
   it("carries the command-lifetime rule but not the Claude-only long-command recipe", () => {

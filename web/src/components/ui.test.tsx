@@ -140,6 +140,11 @@ describe("StatusPill", () => {
 
   it.each([
     {
+      name: "iteration owner hold",
+      run: { status: "paused", hold_reason: "iteration_budget_exhausted" },
+      label: "Iteration limit reached", tone: "text-warn", pulse: false,
+    },
+    {
       name: "provider owner hold",
       run: { status: "paused", hold_reason: "provider_unavailable" },
       label: "provider unavailable: owner hold", tone: "text-warn", pulse: false,
@@ -168,6 +173,11 @@ describe("StatusPill", () => {
       name: "disabled credential",
       run: { status: "paused", hold_reason: "credential_disabled" },
       label: "waiting: credential disabled", tone: "text-warn", pulse: false,
+    },
+    {
+      name: "credentials reset (PRD #3989)",
+      run: { status: "paused", hold_reason: "credentials_reset" },
+      label: "waiting: credentials were reset", tone: "text-warn", pulse: false,
     },
     {
       name: "token switch settling",
@@ -408,6 +418,12 @@ it.each([
 it.each([null, undefined, "invalid", "2099-01-01T00:00:00Z", "2020-01-01T00:00:00Z"])("StatusPill renders adoption integrity hold regardless of timing %s", (stamp) => {
   const { container } = render(<StatusPill status="recovery_wait" recovery_wait_cause="retained_recovery_adoption_failed" recovery_retry_not_before={stamp} />);
   expect(container.textContent).toBe("retained recovery integrity hold");
+  expect(container.querySelector(".text-warn")).toBeTruthy();
+  expect(container.querySelector(".animate-pulse")).toBeNull();
+});
+it.each([null, undefined, "invalid", "2099-01-01T00:00:00Z", "2020-01-01T00:00:00Z"])("StatusPill renders unwitnessed continuation hold regardless of timing %s", (stamp) => {
+  const { container } = render(<StatusPill status="recovery_wait" recovery_wait_cause="retained_continuation_unwitnessed" recovery_retry_not_before={stamp} />);
+  expect(container.textContent).toBe("unwitnessed continuation hold");
   expect(container.querySelector(".text-warn")).toBeTruthy();
   expect(container.querySelector(".animate-pulse")).toBeNull();
 });

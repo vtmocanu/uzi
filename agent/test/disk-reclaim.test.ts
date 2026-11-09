@@ -15,6 +15,7 @@ import {
   type DiskReclaimDeps,
 } from "../src/disk-reclaim.js";
 import { dropRunCaches, type DropRunCachesOptions } from "../src/run-caches.js";
+import type { GoWorkRemoval } from "../src/go-work.js";
 import { noProcFd, RACED_FILES, seedRacedTree, startSwapRacer } from "./swap-racer.js";
 import { RunDiskLocks } from "../src/run-disk-locks.js";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
@@ -1264,5 +1265,148 @@ describe("DiskPressureController (PRD #1809 D5)", () => {
     });
     await c.requestReclaim("periodic");
     assert.ok(lines.some((l) => (l as { msg: string }).msg === "disk reclaim pass failed"));
+  });
+});
+
+// issue #3870 M3 (D7): the running reclaim also removes a parked run's managed Go work leaves
+// (`.uzi-go-work/g<N>`), under the same HOME-process proof as the cache drop, never for a live run.
+describe("runDiskReclaimPass: managed Go work scratch of a parked run (issue #3870 M3)", () => {
+  const PARENT = ".uzi-go-work";
+
+  /** A managed parent (0700, as the single-uid runner makes it) holding the given leaves. */
+  function seedGoWork(home: string, leaves: string[]): void {
+    const parent = path.join(home, PARENT);
+    fs.mkdirSync(parent, { recursive: true });
+    fs.chmodSync(parent, 0o700);
+    for (const leaf of leaves) {
+      fs.mkdirSync(path.join(parent, leaf, "go-build1"), { recursive: true });
+      fs.writeFileSync(path.join(parent, leaf, "go-build1", "x.o"), "obj");
+    }
+  }
+  const leaves = (home: string): string[] => (exists(path.join(home, PARENT)) ? fs.readdirSync(path.join(home, PARENT)).sort() : []);
+  const completeLine = (lines: unknown[]): Record<string, unknown> =>
+    lines.find((l) => (l as { msg: string }).msg === "disk reclaim pass complete") as Record<string, unknown>;
+  const retained = (failed: string[]): GoWorkRemoval => ({ parent: "ok", removed: [], absent: [], failed, skipped: [], truncated: false });
+
+  it("(d1) a parked run with clear processes loses its leaves (not the parent), is counted and memoized", { skip: LINUX_ONLY || SKIP_ROOT }, async () => {
+    const d = dataDir();
+    const run = seedRun(d);
+    seedGoWork(run.home, ["g1", "g2"]);
+    const memo = new CachesDroppedMemo();
+    const { logger, lines } = recordingLogger();
+    const s = await runDiskReclaimPass(deps(d, { cachesDropped: memo, statusOf: async () => "limit_wait", log: logger }));
+    assert.deepEqual(leaves(run.home), []);
+    assert.ok(exists(path.join(run.home, PARENT)), "the parent stays");
+    for (const rel of RESUME) assert.ok(exists(path.join(run.home, rel)), `${rel} kept`);
+    assert.equal(s.goScratchRemoved, 1);
+    assert.equal(s.goScratchRetained, 0);
+    assert.equal(s.failed, 0);
+    assert.ok(memo.has(run.id));
+    assert.equal(completeLine(lines)?.go_scratch_removed, 1);
+    assert.equal(completeLine(lines)?.go_scratch_retained, 0);
+  });
+
+  it("(d2) live processes keep the leaves and never call the scratch removal; so does a spent pass deadline", { skip: LINUX_ONLY || SKIP_ROOT }, async () => {
+    const d = dataDir();
+    const run = seedRun(d);
+    seedGoWork(run.home, ["g1"]);
+    let calls = 0;
+    const dropGoScratch: DiskReclaimDeps["dropGoScratch"] = async () => {
+      calls += 1;
+      return retained([]);
+    };
+    const live = await runDiskReclaimPass(deps(d, { statusOf: async () => "limit_wait", processesClear: async () => false, dropGoScratch }));
+    assert.equal(calls, 0);
+    assert.deepEqual(leaves(run.home), ["g1"]);
+    assert.equal(live.cachesKeptLiveProcesses, 1);
+    assert.equal(live.goScratchRemoved + live.goScratchRetained, 0, "neither counter moves when the scan keeps the run");
+
+    // The deadline passes while the process scan runs: the caches are skipped and the scratch is retained, not removed.
+    let clock = 0;
+    const memo = new CachesDroppedMemo();
+    const late = await runDiskReclaimPass(
+      deps(d, {
+        statusOf: async () => "limit_wait",
+        cachesDropped: memo,
+        now: () => clock,
+        deadlineMs: 1_000,
+        processesClear: async () => {
+          clock = 2_000;
+          return true;
+        },
+        dropGoScratch,
+      }),
+    );
+    assert.equal(calls, 0, "no budget left: the removal is not started");
+    assert.deepEqual(leaves(run.home), ["g1"]);
+    assert.equal(late.goScratchRetained, 1);
+    assert.equal(memo.has(run.id), false);
+  });
+
+  it("(d3) a scratch that is not clean is counted retained, not failed, not memoized, and retried next pass", { skip: LINUX_ONLY || SKIP_ROOT }, async () => {
+    const d = dataDir();
+    const run = seedRun(d);
+    const memo = new CachesDroppedMemo();
+    let calls = 0;
+    const { logger, lines } = recordingLogger();
+    const base = deps(d, {
+      cachesDropped: memo,
+      statusOf: async () => "limit_wait",
+      log: logger,
+      dropGoScratch: async () => {
+        calls += 1;
+        return retained(["g1"]);
+      },
+    });
+    const first = await runDiskReclaimPass(base);
+    assert.equal(first.goScratchRetained, 1);
+    assert.equal(first.goScratchRemoved, 0);
+    assert.equal(first.failed, 0, "disposable scratch is not a reclaim failure");
+    assert.equal(memo.has(run.id), false);
+    assert.equal(completeLine(lines)?.go_scratch_retained, 1);
+    await runDiskReclaimPass(base);
+    assert.equal(calls, 2, "not memoized, so the next pass calls it again");
+  });
+
+  it("(d4) a refused parent (symlink) is retained and not memoized; a real parent on the next pass is removed and memoized", { skip: LINUX_ONLY || SKIP_ROOT }, async () => {
+    const d = dataDir();
+    const run = seedRun(d);
+    const elsewhere = path.join(path.dirname(d.home), "elsewhere");
+    fs.mkdirSync(path.join(elsewhere, "g1"), { recursive: true });
+    fs.symlinkSync(elsewhere, path.join(run.home, PARENT));
+    const memo = new CachesDroppedMemo();
+    const base = deps(d, { cachesDropped: memo, statusOf: async () => "limit_wait" });
+    const first = await runDiskReclaimPass(base);
+    assert.equal(first.goScratchRetained, 1);
+    assert.equal(memo.has(run.id), false);
+    assert.ok(exists(path.join(elsewhere, "g1")), "nothing was removed through the symlink");
+    assert.ok(fs.lstatSync(path.join(run.home, PARENT)).isSymbolicLink());
+
+    fs.rmSync(path.join(run.home, PARENT));
+    seedGoWork(run.home, ["g4"]);
+    const second = await runDiskReclaimPass(base);
+    assert.deepEqual(leaves(run.home), []);
+    assert.equal(second.goScratchRemoved, 1);
+    assert.equal(second.goScratchRetained, 0);
+    assert.equal(memo.has(run.id), true);
+  });
+
+  it("(d5) a terminal run's HOME goes with its Go work parent", { skip: LINUX_ONLY || SKIP_ROOT }, async () => {
+    const d = dataDir();
+    const run = seedRun(d);
+    seedGoWork(run.home, ["g3"]);
+    let calls = 0;
+    const s = await runDiskReclaimPass(
+      deps(d, {
+        statusOf: async () => "completed",
+        dropGoScratch: async () => {
+          calls += 1;
+          return retained([]);
+        },
+      }),
+    );
+    assert.equal(exists(run.home), false);
+    assert.equal(s.terminalHomesRemoved, 1);
+    assert.equal(calls, 0, "the terminal branch removes the whole tree and does not use the parked-run scratch removal");
   });
 });

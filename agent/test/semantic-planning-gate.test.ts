@@ -133,3 +133,38 @@ it("M3 a pause or credential switch during reservation keeps its identity for th
     await assert.rejects(gate.reviewForGate(c, structural.plan_md, sources), error => error === signal, signal.name);
   }
 });
+
+it("M3 a signal provider hands each call the live lifecycle signal, and an aborted one still aborts the call", async () => {
+  const client = {} as WorkerClient;
+  const events: string[] = [];
+  const server = semanticServer(client, events);
+  const transport = await boundedTransport("claude", server.report, events);
+  // Calls honour the signal they receive, as the real client does.
+  const seen: AbortSignal[] = [];
+  for (const name of ["submitSemanticCandidate", "semanticCoverageStatus"] as const) {
+    const inner = (client[name] as (...a: unknown[]) => Promise<unknown>).bind(client);
+    (client as unknown as Record<string, unknown>)[name] = async (...args: unknown[]) => {
+      const signal = args[args.length - 1] as AbortSignal;
+      seen.push(signal);
+      signal.throwIfAborted();
+      return inner(...args);
+    };
+  }
+  let controller = new AbortController();
+  const gate = new SemanticPlanningGate(client, "run", 1, () => controller.signal, transport);
+  // The controller in force at construction is replaced (aborted by a switch, then renewed).
+  const stale = controller;
+  stale.abort(new CredentialSwitchSignal());
+  controller = new AbortController();
+  const c = await gate.compile(structural, proposal(), sources);
+  assert.equal((await gate.reviewForGate(c, structural.plan_md, sources)).outcome, "complete");
+  assert.ok(seen.length >= 2);
+  assert.ok(seen.every(s => s === controller.signal && !s.aborted), "every call used the live signal");
+  // A provider that returns an aborted signal aborts the call with the owner's reason.
+  const aborted = new AbortController();
+  const reason = new Error("owner cancelled");
+  aborted.abort(reason);
+  const dead = new SemanticPlanningGate(client, "run", 1, () => aborted.signal, transport);
+  await assert.rejects(dead.compile(structural, proposal(), sources), error => error === reason);
+  await assert.rejects(dead.reviewForGate(c, structural.plan_md, sources), error => error === reason);
+});

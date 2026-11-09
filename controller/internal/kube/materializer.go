@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -119,6 +121,10 @@ type Materializer struct {
 	// recycle is the disk self-heal toggle + cooldown (PRD #837 M4). See RecyclePolicy.
 	recycle RecyclePolicy
 	log     *slog.Logger
+	// claimLog dedups the pvc-expand-* / pvc-resize-* log tokens (issue #3890); see
+	// claimEvent. Process-local and best-effort: a restart merely re-logs once.
+	claimLogMu sync.Mutex
+	claimLog   map[string]string
 	// now is the clock seam for roll-health's age arm (PRD #113 M3). A bare
 	// time.Now() at the comparison site would make stuckAge testable only by
 	// sleeping for ten minutes. Defaulted in New; overridden directly by tests,
@@ -360,7 +366,9 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		switch p.Name {
 		case dataPVCName(id):
 			o.HasDataPVC = true // exists-in-ANY-state (gates the create, UNCHANGED)
-			if !terminating {   // a LIVE data PVC: liveness proxy + mint time for the M4 recycle
+			dataClaim := claimObservationOf(ns, id, p)
+			o.DataClaim = &dataClaim // any state, Terminating included (issue #3890)
+			if !terminating {        // a LIVE data PVC: liveness proxy + mint time for the M4 recycle
 				o.DataPVCLive = true
 				t := p.CreationTimestamp.Time
 				o.DataPVCCreatedAt = &t
@@ -383,6 +391,8 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 			// simply never taken for one.
 			o.HasDinDDataPVC = true
 			o.DinDPVCUID = string(p.UID)
+			dindClaim := claimObservationOf(ns, id, p)
+			o.DinDClaim = &dindClaim // any state, Terminating included (issue #3890)
 			if !terminating {
 				o.DinDPVCLive = true
 				o.DinDPVCPhase = string(p.Status.Phase)
@@ -609,6 +619,12 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 	desiredIDs := make(map[string]bool, len(desired))
 	for _, w := range desired {
 		desiredIDs[w.ID] = true
+		// Report durable-data deferral before image admission or DinD handling
+		// can consume the tick, and independently of the recycle cooldown.
+		if m.recycle.Enabled && !w.Ephemeral && !w.CustodyHeld && w.Docker &&
+			w.DiskPressure && !slices.Contains(w.DiskPressureVolumes, "nix") {
+			m.log.Info(fmt.Sprintf("disk-recycle-skipped-docker-data worker=%s", w.ID))
+		}
 	}
 
 	observedByID := make(map[string]reconcile.ObservedWorker, len(observed))
@@ -621,6 +637,7 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 	errs = append(errs, tick.errors...)
 	ctx = context.WithValue(ctx, rollTickKey{}, tick)
 	m.logLayoutMigrationHeld(desired, observedByID, tick)
+	m.reportClaimStates(desired, observedByID, tick)
 	uncertain := tick.uncertain
 
 	// Pass 2: create / roll the renderable workers. A failure here is collected and
@@ -688,7 +705,7 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 }
 
 // recycleVolumes selects which of a worker's PVCs a recycle tears down: {Nix} for the
-// size-drift arm, {Nix, Data} for legacy disk pressure. DinD is handled by its
+// size-drift arm and Docker pressure, {Nix, Data} for plain disk pressure. DinD is handled by its
 // separately fenced lifecycle; legacy deletion refuses selectors containing it.
 type recycleVolumes struct {
 	Pressure bool
@@ -699,7 +716,8 @@ type recycleVolumes struct {
 
 // recycleWorkerVolumes stops a worker and tears selected PVC(s) down so the
 // next tick reprovisions them in place — a delete + recreate, NOT a live PVC resize
-// (PVC specs are near-immutable). It keeps the Secret, the worker row/uuid, and any
+// (the only in-place size change is expandClaims' upward data/DinD request patch,
+// issue #3890; nix drift and pressure recycle still come through here). It keeps the Secret, the worker row/uuid, and any
 // PVC not named in vols.
 //
 // It implements PHASES 0-2 only. The reprovision itself (phase 3, the PVC-create gate)
@@ -719,6 +737,14 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 	// DinD destruction requires its fenced lifecycle; this legacy helper fails
 	// closed even for combined selectors and force/deadline overrides.
 	if vols.DinD {
+		return nil
+	}
+	// Docker /data holds durable work independently of custody, force and deadline.
+	// Filter before busy handling so a data-only request cannot even drain a worker.
+	if w.Docker {
+		vols.Data = false
+	}
+	if !vols.Nix && !vols.Data {
 		return nil
 	}
 	// Phase 0, first of all: scaling to zero or deleting the Deployment replaces the
@@ -927,6 +953,10 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 		}
 	}
 
+	// Deferring durable data recycling does not defer DinD maintenance.
+	// Reconcile has already logged the deferral before image admission.
+	dockerDataPressure := legacy && m.recycle.Enabled && !w.Ephemeral && !w.CustodyHeld &&
+		w.Docker && w.DiskPressure && !slices.Contains(w.DiskPressureVolumes, "nix")
 	if legacy {
 		if handled, err := m.reconcileDinD(ctx, w, obs, ns, spec); handled || err != nil {
 			return err
@@ -944,9 +974,9 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 		return m.recycleWorkerVolumes(ctx, w, obs, ns, recycleVolumes{Nix: true})
 	}
 
-	// M4: disk-pressure recycle (nix + data). Ephemeral (run-bound) workers excluded.
-	// Within-cooldown = a just-recycled worker back at pressure = a CAPACITY signal, surfaced
-	// via a fixed token, NOT recycled again. Otherwise drain-then-recycle both volumes.
+	// M4: plain pressure recycles nix + data; Docker recycles only explicitly
+	// pressured nix. Ephemeral workers are excluded. Within-cooldown pressure is
+	// a capacity signal surfaced via a fixed token rather than another recycle.
 	// PRD #1296 D3: a custody-held worker is ALSO excluded (effectively `&& !w.CustodyHeld`)
 	// — its /data may hold unpublished committed work, and disk pressure is never consent to
 	// discard it. It falls through to normal reconcile (like the cooldown case) with a fixed
@@ -957,17 +987,21 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 		case w.CustodyHeld:
 			m.log.Info(fmt.Sprintf("disk-recycle-skipped-custody worker=%s", w.ID))
 			// custody protects unpublished work: fall through to normal reconcile; do NOT recycle.
+		case dockerDataPressure:
+			// The durable-data deferral was already logged before DinD handling.
 		case m.withinRecycleCooldown(obs):
 			m.log.Info(fmt.Sprintf("disk-recycle-skipped-cooldown worker=%s", w.ID))
 			// display-only capacity-warn: fall through to normal reconcile; do NOT return.
-		default:
-			return m.recycleWorkerVolumes(ctx, w, obs, ns, recycleVolumes{Nix: true, Data: true, Pressure: true})
+		case m.pressureRecycleEligible(w, obs):
+			return m.recycleWorkerVolumes(ctx, w, obs, ns, recycleVolumes{Nix: true, Data: !w.Docker, Pressure: true})
 		}
 	}
 
-	// The PVCs. Same create/AlreadyExists shape as the Deployment below, and never
-	// patched: PVC specs are near-immutable, so a size change is delete + reprovision,
-	// not a live edit.
+	// The PVCs. Same create/AlreadyExists shape as the Deployment below. A create
+	// carries the render size only; an existing /data or DinD claim whose request is
+	// below the render size is converged UPWARD afterwards by expandClaims (issue
+	// #3890), never shrunk, deleted or recreated. A /nix size change stays the M3
+	// delete + reprovision above.
 	//
 	// Gate the create on the observed flag (issue #114 BUG 3), exactly as the Deployment
 	// does with obs.HasDeployment. An UNCONDITIONAL create every ~10s tick charged the
@@ -1007,6 +1041,13 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 		if err == nil && pvc.Name == dindDataPVCName(w.ID) {
 			m.recordEpochMint(ctx, w.ID, created)
 		}
+	}
+
+	// Size-only PVC expansion (issue #3890): never touches the Deployment, the pod
+	// template or any roll state, and never returns an error that would abort this
+	// reconcile.
+	if legacy {
+		m.expandClaims(ctx, w, obs, ns, spec)
 	}
 
 	// The Deployment.
@@ -1139,11 +1180,12 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 // and no mounted token). A strategic-merge or apply-based patch would close it if
 // this ever needs to be true in general.
 //
-// The nodeSelector is the one map this patch does make convergent, because operators
-// are expected to change it (workers.nodeSelector): liveSelector is the observed
-// template's, and every key of it the desired template dropped is sent as null.
+// The nodeSelector and tolerations are the scheduling fields this patch does make
+// convergent, because operators are expected to change them (workers.nodeSelector,
+// workers.tolerations); see templateForMergePatch. liveSelector is the observed
+// template's selector.
 func patchFor(dep *appsv1.Deployment, liveSelector map[string]string) ([]byte, error) {
-	tmpl, err := templateWithSelectorDeletes(dep.Spec.Template, liveSelector)
+	tmpl, err := templateForMergePatch(dep.Spec.Template, liveSelector)
 	if err != nil {
 		return nil, err
 	}
@@ -1167,22 +1209,14 @@ func patchFor(dep *appsv1.Deployment, liveSelector map[string]string) ([]byte, e
 	return raw, nil
 }
 
-// templateWithSelectorDeletes returns tmpl as the generic JSON a merge patch sends,
-// with spec.nodeSelector set to tmpl's selector plus a null for each live key it
-// lacks. With nothing to delete it is tmpl unchanged.
-func templateWithSelectorDeletes(tmpl corev1.PodTemplateSpec, live map[string]string) (any, error) {
-	sel := map[string]any{}
-	for k := range live {
-		if _, keep := tmpl.Spec.NodeSelector[k]; !keep {
-			sel[k] = nil
-		}
-	}
-	if len(sel) == 0 {
-		return tmpl, nil
-	}
-	for k, v := range tmpl.Spec.NodeSelector {
-		sel[k] = v
-	}
+// templateForMergePatch returns tmpl as the generic JSON a merge patch sends, made
+// convergent for the two scheduling fields operators are expected to change:
+//   - spec.nodeSelector is tmpl's selector plus a null for each live key it lacks;
+//   - spec.tolerations is always present, as null when tmpl has none. A list is
+//     replaced wholesale by a merge patch, but an omitted (omitempty) one is left
+//     alone, so without the null a cleared workers.tolerations would never reach an
+//     existing worker. A null on a template that has no tolerations is a no-op.
+func templateForMergePatch(tmpl corev1.PodTemplateSpec, live map[string]string) (any, error) {
 	raw, err := json.Marshal(tmpl)
 	if err != nil {
 		return nil, fmt.Errorf("marshal pod template: %w", err)
@@ -1194,6 +1228,21 @@ func templateWithSelectorDeletes(tmpl corev1.PodTemplateSpec, live map[string]st
 	spec, ok := generic["spec"].(map[string]any)
 	if !ok {
 		return nil, fmt.Errorf("pod template has no spec object")
+	}
+	if len(tmpl.Spec.Tolerations) == 0 {
+		spec["tolerations"] = nil
+	}
+	sel := map[string]any{}
+	for k := range live {
+		if _, keep := tmpl.Spec.NodeSelector[k]; !keep {
+			sel[k] = nil
+		}
+	}
+	if len(sel) == 0 {
+		return generic, nil
+	}
+	for k, v := range tmpl.Spec.NodeSelector {
+		sel[k] = v
 	}
 	spec["nodeSelector"] = sel
 	return generic, nil

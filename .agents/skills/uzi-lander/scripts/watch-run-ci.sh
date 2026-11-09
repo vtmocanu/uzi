@@ -26,7 +26,7 @@
 # Use a verified native callback or consented completion adapter; background execution
 # alone does not establish owner re-entry. Do not block a
 # foreground turn on it. Polling the whole-run `status` and reacting only at `completed`
-# is the bug this replaces: a long job (test-api-store-it) keeps the run in_progress for
+# is the bug this replaces: a long job (test-codex-refresh-lostreply-e2e) keeps the run in_progress for
 # minutes after a fast job (validate-api) has already gone red. Each pending tick prints
 # one `[tick N] pending after Ns: ...` line, so an empty output means no tick finished yet.
 #

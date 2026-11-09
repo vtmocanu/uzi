@@ -14,6 +14,18 @@ import (
 // steady state (no outbox), the pending-message count when the worker buffered
 // updates during an api outage, and a "(blocked)"/"blocked" annotation when an
 // outcome is held.
+func TestWorkerListRootDiagnosticPreservesBlocked(t *testing.T) {
+	reason, blocked := "symlink", "reserve_exhausted"
+	w := apitypes.WorkerDTO{OutboxRootUnusable: &reason, OutboxBlocked: &blocked}
+	if got := outboxCell(w); got != "blocked (disabled:symlink)" {
+		t.Fatalf("got %q", got)
+	}
+	w.OutboxBlocked = nil
+	if got := outboxCell(w); got != "disabled:symlink" {
+		t.Fatalf("got %q", got)
+	}
+}
+
 func TestWorkerListShowsOutboxColumn(t *testing.T) {
 	four := 4
 	zero := 0
@@ -359,6 +371,123 @@ func TestWorkerRmCustodyConflictJSON(t *testing.T) {
 	}
 	if !strings.Contains(out, `"deleted": false`) || !strings.Contains(out, `"custody_holds": 2`) {
 		t.Errorf("rm --json custody = %q, want a structured refusal carrying the count", out)
+	}
+}
+
+const custodyGuidanceWant = "worker holds 2 unpublished-work custody hold(s); list `uzi run recovery <run-id>`, " +
+	"then `uzi run export` or `uzi run discard <run-id> --hold <hold-id> --yes`, and retry"
+
+func custodyErr(holds, total int64, list ...uzicli.WorkerBlockingHold) *uzicli.WorkerCustodyConflictError {
+	return &uzicli.WorkerCustodyConflictError{
+		Holds: holds, BlockingHolds: list, BlockingHoldsTotal: total,
+		Err: uzicli.Exitf(uzicli.ExitConflict, "custody"),
+	}
+}
+
+// TestWorkerRmCustodyConflictListsBlockingHolds: text mode names each hold with its FULL
+// hold and run ids (discard needs them), gen, kind and title, says how many more there are,
+// and leaves the guidance line and exit code unchanged.
+func TestWorkerRmCustodyConflictListsBlockingHolds(t *testing.T) {
+	fc := &uzicli.FakeClient{Err: custodyErr(2, 5,
+		uzicli.WorkerBlockingHold{HoldID: "aaaaaaaa-1111-2222-3333-444444444444", RunID: "bbbbbbbb-1111-2222-3333-444444444444", Generation: 3, Kind: "decision_needed", Title: "Fix login"},
+		uzicli.WorkerBlockingHold{HoldID: "cccccccc-1111-2222-3333-444444444444", RunID: "dddddddd-1111-2222-3333-444444444444", Generation: 1, Kind: "decision_needed", Title: ""},
+	)}
+	_, errb, code := runCLI(t, fakeEnv(fc), "worker", "rm", "w1")
+	if code != uzicli.ExitConflict {
+		t.Fatalf("exit = %d, want %d", code, uzicli.ExitConflict)
+	}
+	for _, want := range []string{
+		"worker is the live holder of 5 open custody hold(s):",
+		"hold aaaaaaaa-1111-2222-3333-444444444444  run bbbbbbbb-1111-2222-3333-444444444444  gen 3  decision_needed  Fix login",
+		"hold cccccccc-1111-2222-3333-444444444444  run dddddddd-1111-2222-3333-444444444444  gen 1  decision_needed  dddddddd",
+		"and 3 more",
+		custodyGuidanceWant,
+	} {
+		if !strings.Contains(errb, want) {
+			t.Errorf("custody refusal missing %q; stderr=%q", want, errb)
+		}
+	}
+}
+
+// TestWorkerRmCustodyConflictNoMoreWhenAllListed: no "and N more" when the list is complete.
+func TestWorkerRmCustodyConflictNoMoreWhenAllListed(t *testing.T) {
+	fc := &uzicli.FakeClient{Err: custodyErr(1, 1,
+		uzicli.WorkerBlockingHold{HoldID: "h1", RunID: "r1", Generation: 1, Kind: "decision_needed", Title: "t"},
+	)}
+	_, errb, _ := runCLI(t, fakeEnv(fc), "worker", "rm", "w1")
+	if strings.Contains(errb, "more") {
+		t.Errorf("stderr = %q, want no 'and N more' line", errb)
+	}
+}
+
+// TestWorkerRmCustodyConflictSanitizesHolds: hold text is untrusted, so control bytes and
+// ANSI escapes must not reach the terminal.
+func TestWorkerRmCustodyConflictSanitizesHolds(t *testing.T) {
+	fc := &uzicli.FakeClient{Err: custodyErr(1, 1,
+		uzicli.WorkerBlockingHold{HoldID: "h\x1b[2J1", RunID: "r\x071", Generation: 1, Kind: "k\x1b[31m", Title: "\x1b[31mevil\x07\nsecond"},
+	)}
+	_, errb, code := runCLI(t, fakeEnv(fc), "worker", "rm", "w1")
+	if code != uzicli.ExitConflict {
+		t.Fatalf("exit = %d, want %d", code, uzicli.ExitConflict)
+	}
+	if strings.ContainsAny(errb, "\x1b\x07") {
+		t.Errorf("stderr carries control bytes: %q", errb)
+	}
+	if !strings.Contains(errb, "evil") {
+		t.Errorf("stderr = %q, want the sanitized title text", errb)
+	}
+	if got := strings.Count(errb, "\nsecond"); got != 0 {
+		t.Errorf("a newline in the title must not start a new line: %q", errb)
+	}
+}
+
+// TestWorkerRmCustodyConflictJSONCarriesBlockingHolds: --json carries the exact entries and
+// the total, and keeps the original keys and the guidance.
+func TestWorkerRmCustodyConflictJSONCarriesBlockingHolds(t *testing.T) {
+	hold := uzicli.WorkerBlockingHold{HoldID: "h1", RunID: "r1", Generation: 2, Kind: "decision_needed", Title: "Fix login"}
+	fc := &uzicli.FakeClient{Err: custodyErr(2, 4, hold)}
+	out, errb, code := runCLI(t, fakeEnv(fc), "worker", "rm", "w1", "--json")
+	if code != uzicli.ExitConflict {
+		t.Fatalf("exit = %d, want %d", code, uzicli.ExitConflict)
+	}
+	var got struct {
+		ID           string                      `json:"id"`
+		Deleted      bool                        `json:"deleted"`
+		Error        string                      `json:"error"`
+		CustodyHolds int64                       `json:"custody_holds"`
+		Blocking     []uzicli.WorkerBlockingHold `json:"blocking_holds"`
+		Total        int64                       `json:"blocking_holds_total"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, out)
+	}
+	if got.ID != "w1" || got.Deleted || got.CustodyHolds != 2 || got.Total != 4 || got.Error != custodyGuidanceWant {
+		t.Errorf("json = %+v", got)
+	}
+	if len(got.Blocking) != 1 || got.Blocking[0] != hold {
+		t.Errorf("blocking_holds = %+v, want [%+v]", got.Blocking, hold)
+	}
+	if strings.Contains(errb, "live holder") {
+		t.Errorf("--json must not print hold lines on stderr: %q", errb)
+	}
+}
+
+// TestWorkerRmCustodyConflictOlderServer: no listing from the server means an empty (not
+// null) blocking_holds in --json, the total falling back to custody_holds, and no hold lines.
+func TestWorkerRmCustodyConflictOlderServer(t *testing.T) {
+	fc := &uzicli.FakeClient{Err: &uzicli.WorkerCustodyConflictError{
+		Holds: 2, BlockingHoldsTotal: 2, Err: uzicli.Exitf(uzicli.ExitConflict, "custody"),
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "worker", "rm", "w1", "--json")
+	if code != uzicli.ExitConflict {
+		t.Fatalf("exit = %d, want %d", code, uzicli.ExitConflict)
+	}
+	if !strings.Contains(out, `"blocking_holds": []`) || !strings.Contains(out, `"blocking_holds_total": 2`) {
+		t.Errorf("rm --json = %q, want an empty array and total 2", out)
+	}
+	_, errb, _ := runCLI(t, fakeEnv(fc), "worker", "rm", "w1")
+	if strings.Contains(errb, "live holder") || !strings.Contains(errb, custodyGuidanceWant) {
+		t.Errorf("stderr = %q, want only the guidance", errb)
 	}
 }
 

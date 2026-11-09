@@ -217,7 +217,9 @@ var limiterNames = [...]string{
 // /api/admin/cli-tokens.
 // PRD #3244 M1 added POST /api/worker/runs/{id}/lead-config (noLimiter, like decisions-memo);
 // the table had 388 rows after it. PRD #3244 M3 added GET /api/runs/{id}/lead-config (noLimiter, an
-// owner-or-admin read like /review), making it 389 rows. The earlier history figures above were not re-tallied.
+// owner-or-admin read like /review), making it 389 rows. Issue #3811 adds the two owner-only
+// cross-check history reads, making it 391 rows. The earlier history figures above were not re-tallied.
+// Issue #3251 adds POST /api/worker/runs/{id}/codex-catalog-default (noLimiter, like lead-config).
 // THIS SENTENCE IS DOWNSTREAM OF ANY NEW ROUTE — see the note above wantRouteMounts for
 // which lines a mount-adder owns.
 //
@@ -300,6 +302,8 @@ var wantRouteMounts = []routeMount{
 	// writes cookie-only; every one a local DB statement with no forge call → noLimiter.
 	{"GET", "/api/admin/egress-profiles", noLimiter},
 	{"GET", "/api/admin/egress-profiles/{name}", noLimiter},
+	// PRD #3989: admin-issued reset link, a cookie-only admin DB write with no per-user limiter.
+	{"POST", "/api/admin/users/{id}/reset-link", noLimiter},
 	{"POST", "/api/admin/egress-profiles", noLimiter},
 	{"PUT", "/api/admin/egress-profiles/{name}", noLimiter},
 	{"DELETE", "/api/admin/egress-profiles/{name}", noLimiter},
@@ -492,6 +496,9 @@ var wantRouteMounts = []routeMount{
 	// PRD #1209 M3: the caller's own per-account Codex rate-limit read — an owner-scoped
 	// store read, RequireUser, no limiter, like /me/rate-limits beside it.
 	{"GET", "/api/me/codex-rate-limits", noLimiter},
+	// PRD #3254: the effective-settings view. Owner-scoped reads of the caller's own state, no
+	// forge or provider call, no token spend → noLimiter, like /me/settings.
+	{"GET", "/api/me/effective-settings", noLimiter},
 	{"GET", "/api/me/secrets/", noLimiter},
 	{"GET", "/api/me/secrets/{kind}/{id}/dependents", noLimiter},
 	{"GET", "/api/me/settings/", noLimiter},
@@ -521,6 +528,9 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/repos/{id}/ci/runs", limForge},
 	{"GET", "/api/repos/{id}/ci/runs/{run_id}", limForge},
 	{"GET", "/api/repos/{id}/tool-profile", noLimiter},
+	// Issue #3811: owner-only bounded local history reads, no forge call or token spend.
+	{"GET", "/api/cross-checks", noLimiter},
+	{"GET", "/api/cross-checks/availability", noLimiter},
 	{"GET", "/api/runs/", noLimiter},
 	{"GET", "/api/runs/{id}", noLimiter},
 	// PRD #1296 M2 owner recovery-archive routes. noLimiter — owner-scoped DB reads/writes
@@ -683,6 +693,10 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/auth/login", noLimiter},
 	{"POST", "/api/auth/logout", noLimiter},
 	{"POST", "/api/auth/register", noLimiter},
+	// PRD #3989: the public account-reset routes ride the PER-IP auth limiter, so they read
+	// as noLimiter here; TestResetLinkRoutesAreBehindThePerIPAuthLimiter pins the mount.
+	{"POST", "/api/auth/reset/preview", noLimiter},
+	{"POST", "/api/auth/reset/redeem", noLimiter},
 	{"POST", "/api/chats/", limChat},
 	// PRD #322 M1: cancel from a chat card is an emergency stop with no forge call, so it
 	// carries NO per-user limiter (mounted like /{id}/end), NOT the forge budget the
@@ -739,6 +753,10 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/forge/connections/{id}/verify", limForge},
 	{"POST", "/api/me/cli-tokens/", noLimiter},
 	{"POST", "/api/me/cli-tokens/revoke-all", noLimiter},
+	// PRD #3254: start-preview is a read that takes a token choice in a body; it writes nothing.
+	{"POST", "/api/me/effective-settings/start-preview", noLimiter},
+	// PRD #3254 M3: schedule-preview is the same kind of read (a draft or a schedule id in the body).
+	{"POST", "/api/me/effective-settings/schedule-preview", noLimiter},
 	// PRD #1907 M5: the product-token MINT rides the credential-surface limiter per user
 	// (a (pattern, user) bucket), on top of the handler's per-product cap (D15).
 	{"POST", "/api/me/product-tokens/", limAuth},
@@ -875,9 +893,11 @@ var wantRouteMounts = []routeMount{
 	// own run with no forge call → noLimiter, exactly like the completion/hold report beside it (both
 	// are fenced server-side, not by a per-user limiter).
 	{"POST", "/api/worker/runs/{id}/wall-park", noLimiter},
+	{"POST", "/api/worker/runs/{id}/iteration-park", noLimiter},
 	{"POST", "/api/worker/runs/{id}/pause", noLimiter},
 	// issue #3194: the base-attestation HOLD report, fenced server-side like the wall park above.
 	{"POST", "/api/worker/runs/{id}/base-attestation-hold", noLimiter},
+	{"POST", "/api/worker/runs/{id}/repo-agent-source-hold", noLimiter},
 	// PRD #333 M2: the incidental-findings capture route. It rides
 	// proposalLimiter.PerWorkerMiddleware (a per-WORKER, IP-fallback mount), which this
 	// per-USER probe reads as noLimiter — same as the proposals route below it.
@@ -918,6 +938,7 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/memory", noLimiter},
 	{"POST", "/api/worker/runs/{id}/decisions-memo", noLimiter},
 	{"POST", "/api/worker/runs/{id}/lead-config", noLimiter},
+	{"POST", "/api/worker/runs/{id}/codex-catalog-default", noLimiter},
 	{"POST", "/api/worker/runs/{id}/messages", noLimiter},
 	{"POST", "/api/worker/runs/{id}/usage", noLimiter},
 	{"POST", "/api/worker/runs/{id}/proposals", noLimiter},
@@ -936,6 +957,9 @@ var wantRouteMounts = []routeMount{
 	// PRD #1909 M4: the worker output-file upload, worker-authenticated and unlimited like the download above (bounded by the upload slots).
 	{"POST", "/api/worker/runs/{id}/files", noLimiter},
 	{"POST", "/api/worker/runs/{id}/state", noLimiter},
+	// Bounded local lifecycle report, no forge/provider I/O; both actual router
+	// chains are also pinned by TestPolicyHoldRouteHasNoRateLimiter.
+	{"POST", "/api/worker/runs/{id}/policy-hold", noLimiter},
 	// Semantic planning uses worker authentication and claim-generation fences.
 	// Writes ride proposalLimiter.PerWorkerMiddleware; this per-USER table reads
 	// them as noLimiter. TestSemanticWorkerWritesUseWorkerLimiter proves their worker buckets.
@@ -1018,6 +1042,7 @@ var wantRouteMounts = []routeMount{
 	// columns, no spend, no forge write, no fan-out: the same shape as /me/notify-early-reset.
 	{"PUT", "/api/me/usage-reserve", noLimiter},
 	{"PUT", "/api/me/codex-account-mode", noLimiter},
+	{"PUT", "/api/me/harness-overflow", noLimiter},
 	// PRD #46: the run-judge consent toggle (SetJudgeEnabled). A single boolean
 	// UPDATE on the caller's own users row, spends no Anthropic token at toggle time
 	// — noLimiter, matching /me/autopilot and /me/ci-autofix beside it. Its route
@@ -1363,6 +1388,38 @@ func TestOAuthAuthorizeIsBehindThePerIPAuthLimiter(t *testing.T) {
 	}
 	if rec := get("192.0.2.11:4000"); rec.Code != http.StatusBadRequest {
 		t.Fatalf("first request from another address = %d, want 400: the budget is per IP", rec.Code)
+	}
+}
+
+// TestResetLinkRoutesAreBehindThePerIPAuthLimiter pins PRD #3989: the unauthenticated POST
+// /api/auth/reset/preview and /redeem are fronted by authLimiter's per-IP Middleware. The
+// probe budget is one request per address, and a malformed body dies in the handler before any
+// store (this Handler has none), so the first request is the handler's 400 and the second from
+// the same address is the limiter's 429.
+func TestResetLinkRoutesAreBehindThePerIPAuthLimiter(t *testing.T) {
+	for _, path := range []string{"/api/auth/reset/preview", "/api/auth/reset/redeem"} {
+		t.Run(path, func(t *testing.T) {
+			limiters := newProbeLimiters()
+			h := &Handler{cfg: config.Config{}}
+			router := h.Routes(limiters[0], limiters[1], limiters[2], limiters[3],
+				limiters[4], limiters[5], limiters[6], limiters[7], limiters[8], limiters[9], limiters[10])
+			post := func(remote string) *httptest.ResponseRecorder {
+				req := httptest.NewRequest(http.MethodPost, path, strings.NewReader("{"))
+				req.RemoteAddr = remote
+				rec := httptest.NewRecorder()
+				router.ServeHTTP(rec, req)
+				return rec
+			}
+			if rec := post("192.0.2.20:4000"); rec.Code != http.StatusBadRequest {
+				t.Fatalf("first request = %d, want the handler's 400", rec.Code)
+			}
+			if rec := post("192.0.2.20:4001"); rec.Code != http.StatusTooManyRequests {
+				t.Fatalf("second request from the same address = %d, want 429 from authLimiter", rec.Code)
+			}
+			if rec := post("192.0.2.21:4000"); rec.Code != http.StatusBadRequest {
+				t.Fatalf("first request from another address = %d, want 400: the budget is per IP", rec.Code)
+			}
+		})
 	}
 }
 

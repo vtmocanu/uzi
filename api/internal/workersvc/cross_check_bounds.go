@@ -29,6 +29,9 @@ func ValidateCrossCheckClaim(payload *ClaimPayload) error {
 		return ErrCrossCheckRefused
 	}
 	if payload.Kind != runkind.CrossCheck {
+		if payload.CrossCheckOwnerSteering != nil {
+			return ErrCrossCheckRefused
+		}
 		return nil
 	}
 	if err := validateCrossCheckContext(payload.IssueTitle, payload.IssueDescription); err != nil {
@@ -71,6 +74,11 @@ func ValidateCrossCheckClaim(payload *ClaimPayload) error {
 		input.GuidanceDigest != "" || input.RepoInstructionsDigest != "" || input.RepoInstructionsText != "" {
 		return ErrCrossCheckRefused
 	}
+	if payload.CrossCheckOwnerSteering != nil {
+		if input.Stage != "plan" || verifyOwnerSteering(payload.CrossCheckOwnerSteering) != nil {
+			return ErrCrossCheckRefused
+		}
+	}
 	if input.CandidateIdentityVersion != "" || input.SemanticCandidate != nil {
 		if input.Stage != "plan" || validateSemanticCheckerCandidate(input.PlanCrossCheckCandidate, digest) != nil {
 			return ErrCrossCheckRefused
@@ -100,7 +108,15 @@ func MarshalCrossCheckClaim(payload *ClaimPayload) ([]byte, error) {
 	if err := ValidateCrossCheckClaim(payload); err != nil {
 		return nil, err
 	}
+	// The envelope limit is evaluated on the payload WITHOUT the steering field, so a claim's
+	// accept/refuse decision never depends on whether steering rides along. The field's own
+	// growth is bounded separately by ownerSteeringWireMaxBytes.
+	steering := payload.CrossCheckOwnerSteering
+	if steering != nil {
+		payload.CrossCheckOwnerSteering = nil
+	}
 	raw, err := json.Marshal(payload)
+	payload.CrossCheckOwnerSteering = steering
 	if err != nil {
 		if payload.Kind == runkind.CrossCheck {
 			return nil, ErrCrossCheckRefused
@@ -115,6 +131,13 @@ func MarshalCrossCheckClaim(payload *ClaimPayload) ([]byte, error) {
 		}
 		if len(raw) >= limit {
 			return nil, ErrCrossCheckRefused
+		}
+		if steering != nil {
+			with, err := json.Marshal(payload)
+			if err != nil || len(with)-len(raw) > ownerSteeringWireMaxBytes {
+				return nil, ErrCrossCheckRefused
+			}
+			raw = with
 		}
 	}
 	return append(raw, '\n'), nil

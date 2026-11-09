@@ -111,7 +111,7 @@ func TestCheckpointCoordinatesArchivedAdmissionLiveDB(t *testing.T) {
 						params = p
 					}
 					if name == "FrozenReadoptRunsFromSnapshot" {
-						locks, err := captureWorkerRecoveryLocks(env.ctx, q, f.workerID, []validatedEntry{{runID: run.ID}}, validatedFinalizeResume{})
+						locks, err := captureWorkerRecoveryLocks(env.ctx, q, f.workerID, []validatedEntry{{runID: run.ID}})
 						if err != nil {
 							t.Fatal(err)
 						}

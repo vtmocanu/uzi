@@ -8,6 +8,7 @@ import type { UserSettings } from "../lib/apiTypes";
 vi.mock("../lib/api", () => ({ api: {} }));
 afterEach(cleanup);
 const settings: UserSettings = {
+  harness_overflow_enabled: false,
   default_model: null, default_harness: null, default_claude_model: "allocated-custom-model",
   default_codex_model: null, default_effort: null, judge_model: null, summary_model: null,
   theme: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null,

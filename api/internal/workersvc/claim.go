@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -44,7 +45,10 @@ type ClaimPayload struct {
 	MemoryInterventionCount int32                `json:"memory_intervention_count"`
 	MemoryPolicy            *MemoryPolicy        `json:"memory_policy"`
 	CrossCheck              *ClaimPlanCrossCheck `json:"cross_check,omitempty"`
-	RunID                   string               `json:"run_id"`
+	// CrossCheckOwnerSteering (issue #3841) is the frozen owner-steering snapshot of a plan-stage
+	// checker child, delivered unchanged on every claim; nil (omitted) for every other claim.
+	CrossCheckOwnerSteering *ClaimOwnerSteering `json:"cross_check_owner_steering,omitempty"`
+	RunID                   string              `json:"run_id"`
 	// Kind is the run kind (one of the runkind values; PRD #6). The worker branches on it: an
 	// issue run works IssueIID's card; a ci_fix run diagnoses + fixes Pipeline.
 	Kind string `json:"kind"`
@@ -260,7 +264,8 @@ type ClaimPayload struct {
 	// the feed (runs.require_base_match, PRD #209 M4 Open Question 3). Always present (the
 	// column is NOT NULL); false for every run that did not opt in, so an old worker that
 	// ignores it, and every non-seeded run, keep today's behaviour.
-	RequireBaseMatch bool `json:"require_base_match"`
+	RequireBaseMatch      bool    `json:"require_base_match"`
+	RepoAgentSourceCommit *string `json:"repo_agent_source_commit,omitempty"`
 	// AgentSelection is the run's PERSISTED subagent selection (runs.agent_source /
 	// agent_exclusions), replayed on every claim. Omitted when the run has none.
 	//
@@ -284,7 +289,8 @@ type ClaimPayload struct {
 	// Nil, not an empty selection, when the run never reached a gate — the worker's
 	// absent-default is correct there and must stay reachable. Additive on the wire:
 	// an old worker ignores the key and behaves exactly as it does today.
-	AgentSelection *AgentSelection `json:"agent_selection,omitempty"`
+	AgentSelection       *AgentSelection `json:"agent_selection,omitempty"`
+	RequestedAgentSource *string         `json:"requested_agent_source,omitempty"`
 
 	// Milestones is the run's FROZEN, human-approved milestone list (PRD #122 M1),
 	// decoded from runs.milestones_frozen and replayed on every claim so a resumed
@@ -307,11 +313,12 @@ type ClaimPayload struct {
 	// JudgeModel is the model alias a JUDGE run runs on (PRD #46 Decision 7), resolved
 	// from the judge_model setting at claim assembly. Present only for kind=judge.
 	JudgeModel *string `json:"judge_model,omitempty"`
-	// SummaryModel is the model alias the inline run-summary generator runs on (PRD
-	// #362 Decision 8), resolved user-value-wins from users.summary_model over the
-	// instance summary_model at ISSUE-run claim assembly. Unlike JudgeModel it rides
-	// the issue-run claim, not the judge claim; nil (omitted) when unresolved so an
-	// old worker's wire shape is unchanged.
+	// SummaryModel is the summary model for this claim's harness (PRD #362 Decision 8,
+	// PRD #3248 D3): the inline run-summary generator's model, resolved user-value-wins
+	// over the instance value and the built-in from the harness's own lane
+	// (summary_model for Claude, codex_summary_model for Codex) at ISSUE-run claim
+	// assembly. Unlike JudgeModel it rides the issue-run claim, not the judge claim;
+	// nil (omitted) when no settings are wired so an old worker's wire shape is unchanged.
 	SummaryModel *string `json:"summary_model,omitempty"`
 	// SummaryIntentPresent tells the worker the run's intent summary is ALREADY set
 	// (PRD #362 M3c, Decision 3), so the executor skips INTENT generation on a
@@ -628,21 +635,23 @@ type ClaimConfig struct {
 	// omitempty keeps every other claim byte-identical to today's wire, and an older
 	// worker (or a missing field) falls back to its own TASK_FOLLOWUP_IDLE_MS constant.
 	TaskIdleTimeoutSeconds int `json:"task_idle_timeout_seconds,omitempty"`
+	IterationParkVersion   int `json:"iteration_park_version,omitempty"`
 	MaxIterations          int `json:"max_iterations"`
 	// PlanMaxRevisions is the PRD #41 plan-revision cap the worker enforces at the
 	// approval gate (server-authoritative; the server also caps in SubmitInput).
 	PlanMaxRevisions int `json:"plan_max_revisions"`
 	// QuestionMax and QuestionTimeoutSeconds bound the PRD #88 clarification loop:
-	// how many times one run may stop to ask the human, and how long a single park
-	// waits before the run fails with "clarification timed out". Both are enforced
+	// how many times one run may stop to ask the human, and the cumulative
+	// parked-time budget before the run fails with "clarification timed out". Both are enforced
 	// worker-side — the cap counts in-process ask_user parks (there is no input row to
-	// count, unlike a revise_plan), and the deadline is a worker-held timer.
+	// count, unlike a revise_plan), and the budget is worker-held.
 	//
-	// The deadline is therefore NOT durable: a worker death re-queues the run and the
-	// resumed worker starts a fresh clock, so the honest worst case is
-	// QuestionTimeoutSeconds × (RUN_MAX_REQUEUES + 1) — or × (RUN_MAX_REQUEUES + 2) for a run that
-	// used the one-shot finalize-resume allowance (#1742, runs.finalize_resume_generation), which
-	// gets exactly one more attempt.
+	// The budget is therefore NOT durable: a worker death re-queues the run and the
+	// resumed worker starts a fresh budget. With no other fresh executor execution,
+	// worker-death retries contribute QuestionTimeoutSeconds × (RUN_MAX_REQUEUES + 1), or
+	// × (RUN_MAX_REQUEUES + 2) for a run that used the one-shot finalize-resume allowance
+	// (#1742, runs.finalize_resume_generation). Ordinary transient/limit/credential redispatch
+	// also starts a fresh execution and budget, so this is not an unconditional bound.
 	QuestionMax            int `json:"question_max"`
 	QuestionTimeoutSeconds int `json:"question_timeout_seconds"`
 	// CompletionHoldWindowSeconds is the PRD #1226 M5 (D6) live owner-continue window before a
@@ -672,6 +681,12 @@ type ClaimConfig struct {
 	// user_default or builtin today). PRD #3244: present on every lead-lane claim, which makes
 	// it the worker's activation signal for the lead-config reporter; absent otherwise.
 	DefaultEffortSource *string `json:"default_effort_source,omitempty"`
+	// CodexCatalogContext is the opaque catalog context (issue #3251): lowercase hex SHA-256 of
+	// the credential revision this claim releases (user, secret id, auth mode, material revision,
+	// subscription account key). The worker echoes it verbatim when it reports the Codex catalog's
+	// default reasoning effort. Present only on a Codex lead-lane claim whose frozen binding is
+	// complete; omitempty keeps every other claim byte-identical.
+	CodexCatalogContext *string `json:"codex_catalog_context,omitempty"`
 	// AttributionEnabled is the run owner's AI-attribution opt-out (issue #916), read
 	// LIVE from the owner's users row on every claim. When false, the worker suppresses
 	// the Agent SDK's Co-Authored-By: Claude commit trailer for this run (agent-side, a
@@ -796,7 +811,7 @@ type CompletionScopeAccepted struct {
 // the jsonb tools allowlist (NULL/empty ⇒ inherit-all ⇒ nil) and attaching each
 // template's surviving skill names from perTemplateSkills (nil ⇒ empty list, so
 // the JSON carries `skills: []`, never null).
-func agentsFromTemplates(rows []store.AgentTemplate, perTemplateSkills map[string][]string) []ClaimAgent {
+func agentsFromTemplates(rows []store.AgentTemplate, perTemplateSkills map[string][]string, harness string) []ClaimAgent {
 	out := make([]ClaimAgent, 0, len(rows))
 	for _, t := range rows {
 		skills := perTemplateSkills[t.Name]
@@ -810,8 +825,14 @@ func agentsFromTemplates(rows []store.AgentTemplate, perTemplateSkills map[strin
 			Tools:       decodeTools(t.Tools),
 			Skills:      skills,
 		}
+		claudePin, codexPin := "", ""
 		if t.Model.Valid {
-			m := t.Model.String
+			claudePin = t.Model.String
+		}
+		if t.CodexModel.Valid {
+			codexPin = t.CodexModel.String
+		}
+		if m := agenttmpl.PinForHarness(harness, claudePin, codexPin); m != "" {
 			a.Model = &m
 		}
 		out = append(out, a)

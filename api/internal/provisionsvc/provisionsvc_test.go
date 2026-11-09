@@ -157,15 +157,50 @@ func TestConnectForgeStoresSealedToken(t *testing.T) {
 	st := &fakeStore{}
 	svc := New(st, fakeForges{&fakeForge{identity: forge.BotIdentity{Username: "bot", ForgeUserID: 7}}}, &fakeGuard{}, allowAll)
 
-	conn, err := svc.ConnectForge(context.Background(), uuid.New(), "", "https://forge.example/", "tok")
+	conn, err := svc.ConnectForge(context.Background(), uuid.New(), "forgejo", "https://forge.example/", "tok")
 	if err != nil {
 		t.Fatalf("ConnectForge: %v", err)
 	}
-	if conn.ForgeType != "gitlab" {
-		t.Fatalf("empty forge type must default to gitlab, got %q", conn.ForgeType)
+	if conn.ForgeType != "forgejo" {
+		t.Fatalf("forge type = %q, want forgejo", conn.ForgeType)
 	}
 	if st.conn == nil || string(st.conn.TokenCiphertext) != "sealed:tok" || st.conn.BotUsername != "bot" {
 		t.Fatalf("stored connection = %+v", st.conn)
+	}
+}
+
+// Issue #3785: a connect never guesses the forge. Both connect paths share
+// validateConnection, so a missing or unknown type is refused before any forge
+// call or store write, and the message names the supported values.
+func TestConnectForgeRequiresForgeType(t *testing.T) {
+	cases := []struct{ name, forgeType, want string }{
+		{"empty", "", "forge_type is required; supported values: gitlab, forgejo, github"},
+		{"blank", "  ", "forge_type is required; supported values: gitlab, forgejo, github"},
+		{"unknown", "bitbucket", "unsupported forge type; supported values: gitlab, forgejo, github"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &fakeStore{}
+			svc := New(st, fakeForges{&fakeForge{identity: forge.BotIdentity{Username: "bot"}}}, &fakeGuard{}, allowAll)
+			for _, connect := range []func() error{
+				func() error {
+					_, err := svc.ConnectForge(context.Background(), uuid.New(), tc.forgeType, "https://forge.example/", "tok")
+					return err
+				},
+				func() error {
+					_, _, err := svc.ConnectForgeCreateOnly(context.Background(), uuid.New(), tc.forgeType, "https://forge.example/", "tok")
+					return err
+				},
+			} {
+				var pe *Error
+				if err := connect(); !errors.As(err, &pe) || pe.Kind != KindBadRequest || pe.Message != tc.want {
+					t.Fatalf("err = %v, want KindBadRequest %q", err, tc.want)
+				}
+			}
+			if st.conn != nil || st.created != nil {
+				t.Fatalf("nothing may be stored: conn=%+v created=%+v", st.conn, st.created)
+			}
+		})
 	}
 }
 

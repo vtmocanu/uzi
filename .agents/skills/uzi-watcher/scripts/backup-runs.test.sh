@@ -180,14 +180,15 @@ STUB
 # listing and passes the concrete selected clone to the capture, which is the
 # production behavior under test.
 run_backup() {
-  local dest="$WORK/out.$1"; local rid="${2:-run-4242}"
+  local dest="$WORK/out.$1"; local rid="${2:-run-4242}"; local rc=0
   rm -rf "$dest"
   UZI_CTX=test-ctx UZI_WORKER_NS=ns UZI_REPO_SLUG=testrepo \
     UZI_RUNNER_BASE="${TEST_RUNNER_BASE:-$WORK/runner}" \
     UZI_REPOS_BASE="$REPOS" \
     UZI_BACKUP_DIR="$dest" UZI_KUBECTL="$KSTUB" UZI_BIN="$WORK/uzi" \
-    bash "$SCRIPT" "$rid" >/dev/null 2>&1
+    bash "$SCRIPT" "$rid" >/dev/null 2>&1 || rc=$?
   echo "$dest/latest"
+  return "$rc"
 }
 
 WID=w0rker
@@ -204,7 +205,18 @@ git --git-dir="$BARE" config 'uzi-recovery.agent/issue-4242.clone' \
   "{\"runId\":\"run-4242\",\"clonePath\":\"$RUNNER\"}"
 echo dirty >> "$RUNNER/f.txt"   # uncommitted change only
 
-L1="$(run_backup 1)"
+# The standalone coordinator compatibility proof supplies authentic signed bytes.
+# These are opaque untracked clone payloads, not Git-config attribution descriptors.
+if [ -n "${UZI_TEST_SIGNED_JSON_INPUT:-}${UZI_TEST_SIGNED_JSON_OUTPUT:-}" ]; then
+  [ -n "${UZI_TEST_SIGNED_JSON_INPUT:-}" ] && [ -n "${UZI_TEST_SIGNED_JSON_OUTPUT:-}" ] \
+    || fail "signed payload: both input and output directories are required"
+  for phase in before after; do
+    cp -p "$UZI_TEST_SIGNED_JSON_INPUT/$phase.json" "$RUNNER/compat-$phase.json" \
+      || fail "signed payload: copy $phase"
+  done
+fi
+
+L1="$(run_backup 1)" || fail "case1: real backup script failed"
 [ -f "$L1/issue-4242.tgz" ] || fail "case1: no .tgz produced"
 if tar tzf "$L1/issue-4242.tgz" 2>/dev/null | grep -q 'issue-4242[.]bundle'; then
   fail "case1: .tgz contains a bundle (full-history dump not skipped)"
@@ -213,6 +225,22 @@ grep -q "^.*PART .*run-4242" "$L1/backup.log" || fail "case1: expected PART in l
 tar tzf "$L1/issue-4242.tgz" 2>/dev/null | grep -q 'issue-4242[.]uncommitted[.]patch' \
   || fail "case1: uncommitted.patch missing (the work was not captured)"
 echo "PASS case1: uncommitted-only -> no bundle, PART, patch kept"
+
+if [ -n "${UZI_TEST_SIGNED_JSON_INPUT:-}" ]; then
+  mkdir "$WORK/signed-outer" "$UZI_TEST_SIGNED_JSON_OUTPUT" || fail "signed payload: output directories"
+  tar -xzf "$L1/issue-4242.tgz" -C "$WORK/signed-outer" || fail "signed payload: outer archive"
+  tar -xzf "$WORK/signed-outer/issue-4242.untracked.tar.gz" -C "$UZI_TEST_SIGNED_JSON_OUTPUT" \
+    || fail "signed payload: untracked archive"
+  for phase in before after; do
+    cmp "$UZI_TEST_SIGNED_JSON_INPUT/$phase.json" "$UZI_TEST_SIGNED_JSON_OUTPUT/compat-$phase.json" \
+      || fail "signed payload: changed $phase bytes"
+    rm "$RUNNER/compat-$phase.json" || fail "signed payload: fixture cleanup"
+  done
+  echo "PASS signed payload: authentic coordinator bytes retained through real backup archive"
+  # The historical-reader proof has a per-test budget; ordinary suite runs
+  # continue through every backup case without this explicit focused selector.
+  [ "${UZI_TEST_SIGNED_JSON_ONLY:-}" != 1 ] || exit 0
+fi
 
 # The worker container can exec as a different UID than the runner clone owner.
 # Git then refuses every clone operation unless this exact clone is trusted.
@@ -548,6 +576,78 @@ expect_pick() {
   tar -xOzf "$l/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF "+$3" \
     || fail "$1: expected WIP marker $3 missing"
 }
+
+# M1 remediationRecovery parity: both journal readers retain a valid record and
+# refuse the whole descriptor for malformed bounded provenance or rewrite graphs.
+for kind in protected ordinary; do
+  reset_layout
+  rid=completed-1
+  [ "$kind" = protected ] || rid=run-4242
+  predecessor="$RB/issue-4242.attempt-$A1"
+  make_clone "$predecessor" agent/issue-4242 remediation-dirty
+  rr_journal="$(jq -cn --arg rid "$rid" --arg p "$predecessor" --arg a "$A1" '
+    {runId:$rid,clonePath:$p,attemptId:$a} as $s
+    | ("a"*40) as $q | ("b"*40) as $t
+    | {id:1,origin:"checkpoint-pending",originSource:$s,scannedTip:$q,flaggedOIDs:[$q]} as $g
+    | $s + {remediationRecovery:($s + {version:1,branch:"agent/issue-4242",sequence:1,
+      ownedTip:$t,flaggedOIDs:[$q],active:$g,
+      edges:[{from:$q,to:$t,grant:$g,context:("context-"+("c"*64)+".json"),phase:"committed"}]})}')"
+  if [ "$kind" = protected ]; then
+    ledger "$A1" "$rid" "$predecessor" live
+    rr_journal="$(printf '%s' "$rr_journal" | jq '. + {retainedSources:[{runId,clonePath,attemptId}]}')"
+  fi
+  for variant in valid blocked clear roots roots-many roots-null roots-type roots-duplicate roots-oid roots-overflow malformed-blocked null-blocked unknown version identity path attempt origin-source origin-extra origin-missing control bounds flags edges grant conflict cycle overflow; do
+    value="$rr_journal"
+    case "$variant" in
+      blocked) filter='.remediationRecovery.blocked=true' ;;
+      roots) filter='.remediationRecovery.excludedRoots=[]' ;;
+      roots-many) filter='.remediationRecovery.excludedRoots=[range(100) | tostring | "0"*(40-length)+.]' ;;
+      roots-null) filter='.remediationRecovery.excludedRoots=null' ;;
+      roots-type) filter='.remediationRecovery.excludedRoots={}' ;;
+      roots-duplicate) filter='.remediationRecovery.excludedRoots=[("a"*40),("a"*40)]' ;;
+      roots-oid) filter='.remediationRecovery.excludedRoots=[("a"*39)]' ;;
+      roots-overflow) filter='.remediationRecovery.excludedRoots=[range(1525) | tostring | "0"*(40-length)+.]' ;;
+      clear) filter='.remediationRecovery.blocked=false' ;;
+      malformed-blocked) filter='.remediationRecovery.blocked="false"' ;;
+      null-blocked) filter='.remediationRecovery.blocked=null' ;;
+      unknown) filter='.remediationRecovery.extra=1' ;;
+      version) filter='.remediationRecovery.version=2' ;;
+      identity) filter='.remediationRecovery.runId="other"' ;;
+      path) filter='.remediationRecovery.clonePath="/outside/source"' ;;
+      attempt) filter='.remediationRecovery.attemptId="invalid"' ;;
+      origin-source) filter='.remediationRecovery.active.originSource.clonePath="/outside/source"' ;;
+      origin-extra) filter='.remediationRecovery.active.originSource.extra=1' ;;
+      origin-missing) filter='del(.remediationRecovery.active.originSource.attemptId)' ;;
+      control) filter='.remediationRecovery.branch="agent/\u202eunsafe"' ;;
+      bounds) filter='.remediationRecovery.sequence=9007199254740992' ;;
+      flags) filter='.remediationRecovery.flaggedOIDs = [("a"*40)] + [range(64) | tostring | "0"*(40-length)+.]' ;;
+      edges) filter='.remediationRecovery.edges |= (. as $e | [range(65) as $i | $e[0] | .from = ($i | tostring | "0"*(40-length)+.)])' ;;
+      grant) filter='.remediationRecovery.active.origin="request"' ;;
+      conflict) filter='.remediationRecovery.active.scannedTip=("d"*40)' ;;
+      cycle) filter='.remediationRecovery.edges += [(.remediationRecovery.edges[0] | .from=("b"*40) | .to=("a"*40))]' ;;
+      overflow) filter='.remediationRecovery.branch=("x"*65536)' ;;
+      valid) filter='.' ;;
+    esac
+    value="$(printf '%s' "$value" | jq "$filter")"
+    if [ "$kind" = protected ]; then
+      value="$(printf '%s' "$value" | jq '{version:1,branch:"agent/issue-4242",key:"issue-4242",journal:.}')"
+      git --git-dir="$BARE" config "uzi-retained.$rid.journal" "$value"
+    else
+      git --git-dir="$BARE" config "$JKEY" "$value"
+    fi
+    dest="$WORK/out.remediation-$kind-$variant"
+    rc="$(backup_rc "$dest" "$rid")"
+    if [ "$variant" = valid ] || [ "$variant" = blocked ] || [ "$variant" = clear ] || [ "$variant" = roots ] || [ "$variant" = roots-many ]; then
+      [ "$rc" -eq 0 ] || fail "remediation $kind: valid record rejected; $(cat "$dest/latest-attempt/backup.log")"
+      tar -xOzf "$dest/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+remediation-dirty' \
+        || fail "remediation $kind: dirty bytes missing"
+    else
+      [ "$rc" -ne 0 ] || fail "remediation $kind/$variant: invalid record accepted"
+      [ ! -e "$dest/latest-attempt/issue-4242.tgz" ] || fail "remediation $kind/$variant: invalid record attributed bytes"
+    fi
+    echo "PASS remediation $kind/$variant"
+  done
+done
 
 # #2958: detached protected descriptors and ordinary journals carry an optional
 # positive safe-integer claim fence. Missing fences remain valid legacy progress.

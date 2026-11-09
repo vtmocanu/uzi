@@ -21,16 +21,18 @@ func TestResolveHarness(t *testing.T) {
 	none := harnessAvailability{claudeUsable: false, codexUsable: false}
 
 	tests := []struct {
-		name    string
-		in      resolveHarnessInput
-		want    Harness
-		wantErr error
+		name     string
+		in       resolveHarnessInput
+		want     Harness
+		wantRule harnessRule
+		wantErr  error
 	}{
 		// --- (1) explicit selection: used if usable, else a typed refusal with NO fallback.
 		{
-			name: "explicit claude usable",
-			in:   resolveHarnessInput{explicit: h(HarnessClaude), avail: both},
-			want: HarnessClaude,
+			name:     "explicit claude usable",
+			in:       resolveHarnessInput{explicit: h(HarnessClaude), avail: both},
+			want:     HarnessClaude,
+			wantRule: harnessRuleExplicit,
 		},
 		{
 			name:    "explicit claude unusable -> error",
@@ -38,9 +40,10 @@ func TestResolveHarness(t *testing.T) {
 			wantErr: errNoCredentialForHarness,
 		},
 		{
-			name: "explicit codex usable",
-			in:   resolveHarnessInput{explicit: h(HarnessCodex), avail: both},
-			want: HarnessCodex,
+			name:     "explicit codex usable",
+			in:       resolveHarnessInput{explicit: h(HarnessCodex), avail: both},
+			want:     HarnessCodex,
+			wantRule: harnessRuleExplicit,
 		},
 		{
 			// The no-fallback guarantee: explicit Codex with Codex unusable but Claude
@@ -64,26 +67,30 @@ func TestResolveHarness(t *testing.T) {
 
 		// --- (2) usable user default wins over the availability tiebreak.
 		{
-			name: "default claude used when both usable",
-			in:   resolveHarnessInput{userDefault: h(HarnessClaude), avail: both},
-			want: HarnessClaude,
+			name:     "default claude used when both usable",
+			in:       resolveHarnessInput{userDefault: h(HarnessClaude), avail: both},
+			want:     HarnessClaude,
+			wantRule: harnessRuleUserDefault,
 		},
 		{
-			name: "default codex wins the tiebreak when both usable",
-			in:   resolveHarnessInput{userDefault: h(HarnessCodex), avail: both},
-			want: HarnessCodex,
+			name:     "default codex wins the tiebreak when both usable",
+			in:       resolveHarnessInput{userDefault: h(HarnessCodex), avail: both},
+			want:     HarnessCodex,
+			wantRule: harnessRuleUserDefault,
 		},
 		{
 			// A default set to a harness with no usable credential is SKIPPED (fall
 			// through to the availability rules), not an error.
-			name: "default codex set but unusable falls through to sole claude",
-			in:   resolveHarnessInput{userDefault: h(HarnessCodex), avail: claudeOnly},
-			want: HarnessClaude,
+			name:     "default codex set but unusable falls through to sole claude",
+			in:       resolveHarnessInput{userDefault: h(HarnessCodex), avail: claudeOnly},
+			want:     HarnessClaude,
+			wantRule: harnessRuleSoleUsable,
 		},
 		{
-			name: "default claude set but unusable falls through to sole codex",
-			in:   resolveHarnessInput{userDefault: h(HarnessClaude), avail: codexOnly},
-			want: HarnessCodex,
+			name:     "default claude set but unusable falls through to sole codex",
+			in:       resolveHarnessInput{userDefault: h(HarnessClaude), avail: codexOnly},
+			want:     HarnessCodex,
+			wantRule: harnessRuleSoleUsable,
 		},
 		{
 			// Default set but unusable AND nothing else usable → the neither-usable
@@ -95,21 +102,24 @@ func TestResolveHarness(t *testing.T) {
 
 		// --- (3) sole available harness.
 		{
-			name: "sole claude",
-			in:   resolveHarnessInput{avail: claudeOnly},
-			want: HarnessClaude,
+			name:     "sole claude",
+			in:       resolveHarnessInput{avail: claudeOnly},
+			want:     HarnessClaude,
+			wantRule: harnessRuleSoleUsable,
 		},
 		{
-			name: "sole codex",
-			in:   resolveHarnessInput{avail: codexOnly},
-			want: HarnessCodex,
+			name:     "sole codex",
+			in:       resolveHarnessInput{avail: codexOnly},
+			want:     HarnessCodex,
+			wantRule: harnessRuleSoleUsable,
 		},
 
 		// --- (4) both usable, no usable default -> Claude.
 		{
-			name: "both usable no default -> claude",
-			in:   resolveHarnessInput{avail: both},
-			want: HarnessClaude,
+			name:     "both usable no default -> claude",
+			in:       resolveHarnessInput{avail: both},
+			want:     HarnessClaude,
+			wantRule: harnessRuleBothClaude,
 		},
 
 		// --- (5) neither usable.
@@ -122,7 +132,7 @@ func TestResolveHarness(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := resolveHarness(tt.in)
+			got, rule, err := resolveHarness(tt.in)
 			if tt.wantErr != nil {
 				if !errors.Is(err, tt.wantErr) {
 					t.Fatalf("err = %v, want %v", err, tt.wantErr)
@@ -138,6 +148,9 @@ func TestResolveHarness(t *testing.T) {
 			if got != tt.want {
 				t.Fatalf("harness = %q, want %q", got, tt.want)
 			}
+			if rule != tt.wantRule {
+				t.Fatalf("rule = %q, want %q", rule, tt.wantRule)
+			}
 		})
 	}
 }
@@ -147,7 +160,7 @@ func TestResolveHarness(t *testing.T) {
 // credential-unavailable sentinel keeps the existing refusal/failure behavior (D4)
 // while the resolver-specific sentinel is still independently assertable.
 func TestResolveHarnessNoUsableCredentialRetainsRefusal(t *testing.T) {
-	_, err := resolveHarness(resolveHarnessInput{avail: harnessAvailability{}})
+	_, _, err := resolveHarness(resolveHarnessInput{avail: harnessAvailability{}})
 	if !errors.Is(err, errNoUsableCredential) {
 		t.Fatalf("err = %v, want errNoUsableCredential", err)
 	}

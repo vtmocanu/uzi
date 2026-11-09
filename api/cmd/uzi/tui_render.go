@@ -298,7 +298,7 @@ func stateGlyphWord(status, health string, isPlanning, isRevising bool, landingS
 		// two apart at a glance.
 		return "~", "pool wait"
 	case statusRecoveryWait:
-		if len(cause) > 0 && cause[0] == retainedRecoveryAdoptionFailedCause {
+		if len(cause) > 0 && isAlwaysHeldRecoveryCause(cause[0]) {
 			return "!", "recovery held"
 		}
 		if len(cause) > 0 && cause[0] == workerMemoryPressureCause {
@@ -429,6 +429,9 @@ const (
 const (
 	credDisabledGlyph = "⊘"
 	credDisabledWord  = "cred disabled"
+	// credsResetWord is the word of a credentials_reset hold (PRD #3989): same glyph and amber
+	// NEEDS YOU treatment, since the owner must add a credential. 11 runes, within boardStatusWordWidth.
+	credsResetWord = "creds reset"
 )
 
 const (
@@ -443,6 +446,12 @@ func tuiRejectedRun(r apitypes.RunDTO) bool {
 // runStateToken gives typed provider, Codex relogin and credential holds their
 // own tokens; other runs use stateToken. Provider markers require matching status.
 func (p palette) runStateToken(r apitypes.RunDTO, isRevising bool) runToken {
+	if isDiskOwnerHold(r) {
+		return runToken{glyph: "!", word: "disk held", color: p.amber}
+	}
+	if isIterationHold(r) {
+		return runToken{glyph: "⊘", word: "iter limit", color: p.amber}
+	}
 	if isForgeOwnerHold(r) {
 		if isPublicationPark(r) {
 			return runToken{glyph: "!", word: publicationHeldWord, color: p.amber}
@@ -472,6 +481,9 @@ func (p palette) runStateToken(r apitypes.RunDTO, isRevising bool) runToken {
 	}
 	if isCredentialDisabledHold(r) {
 		return runToken{glyph: credDisabledGlyph, word: credDisabledWord, color: p.amber}
+	}
+	if isCredentialsResetHold(r) {
+		return runToken{glyph: credDisabledGlyph, word: credsResetWord, color: p.amber}
 	}
 	if isCredentialSwitchSettlingHold(r) {
 		return runToken{glyph: credSwitchGlyph, word: credSwitchSettlingWord, color: p.amber}

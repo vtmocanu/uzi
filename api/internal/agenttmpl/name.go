@@ -32,3 +32,13 @@ func IsValidName(name string) bool {
 
 // IsLeadName reports whether name is reserved for the lead orchestrator.
 func IsLeadName(name string) bool { return LeadNameRe.MatchString(name) }
+
+// SelectLead returns the first lead-shaped name in the supplied order.
+func SelectLead(names []string) (int, bool) {
+	for i, name := range names {
+		if IsLeadName(name) {
+			return i, true
+		}
+	}
+	return 0, false
+}

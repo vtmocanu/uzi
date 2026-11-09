@@ -83,6 +83,11 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 			}
 		}
 		workerKey := workerHoldNoticeKey(run)
+		if isDiskFullPark(run) && workerKey != lastWorkerHoldKey {
+			for _, line := range append([]string{diskParkLine(run)}, diskHoldLines(run)...) {
+				_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", cellText(runID), line)
+			}
+		}
 		if (isOwnerRequiredWorkerHold(run) || isRecoveryDecisionPark(run)) && workerKey != lastWorkerHoldKey {
 			_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", runID, workerExhaustionLine(run))
 		}
@@ -114,12 +119,14 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 				_, _ = fmt.Fprintf(env.Stderr,
 					"run %s: parked at its time limit; waiting for the owner (uzi run extend %s --by 2h)\n", runID, runID)
 			}
-			// PRD #1732 D14: likewise a run held because a credential it needs is disabled. It
-			// resumes by itself once that credential is enabled, so the wait keeps going.
-			if isProviderUnavailableHold(run) {
+			// Iteration and provider holds require an owner action; paused remains nonterminal.
+			if isIterationHold(run) || isProviderUnavailableHold(run) {
 				_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", cellText(runID), pausedHoldNotice(run))
 			}
 			if isCredentialSwitchHold(run) {
+				_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", cellText(runID), pausedHoldNotice(run))
+			}
+			if isCredentialsResetHold(run) {
 				_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", cellText(runID), pausedHoldNotice(run))
 			}
 			if isCredentialDisabledHold(run) {
@@ -150,7 +157,7 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 				runID, cellText(run.Status))
 		}
 
-		if targets[run.Status] || (defaultUntil && (isForgeOwnerHold(run) || isOwnerRequiredWorkerHold(run) || isCredentialSwitchHold(run) || isBaseAttestationHold(run))) {
+		if targets[run.Status] || (defaultUntil && (isDiskOwnerHold(run) || isForgeOwnerHold(run) || isOwnerRequiredWorkerHold(run) || isCredentialSwitchHold(run) || isBaseAttestationHold(run))) {
 			// PRD #603: `--min-plan-seq N` (N >= 0) gates ONLY the awaiting_approval
 			// stop so a wait after `run revise` returns on the REVISED plan, not the
 			// stale gate left by the pre-revise plan. Every other target — terminals,
@@ -248,7 +255,7 @@ func newRunWaitCmd(env Env, gf *globalFlags) *cobra.Command {
 		Short: "Block until a run reaches a chosen state",
 		Long: "Poll a run until its status enters the `--until` set, then exit 0 (PRD #264).\n\n" +
 			"With no `--until`, it stops on any state that needs you or ends the run: " +
-			strings.Join(defaultWaitStates, ", ") + ", or forge automatic retries exhausted / worker recovery exhausted / worker memory pressure / owner-held retained recovery exhausted / owner-held Codex idle stall (recovery_wait; owner Resume or Cancel), " +
+			strings.Join(defaultWaitStates, ", ") + ", or disk automatic retries exhausted / forge automatic retries exhausted / worker recovery exhausted / worker memory pressure / owner-held retained recovery exhausted / owner-held Codex idle stall (recovery_wait; owner Resume or Cancel), " +
 			"or a --require-base run held because its kept work is not attested against the planned base (paused, " +
 			"base_attestation_missing; recover its kept work with the run recovery or run export commands). " +
 			"Explicit --until uses only the named statuses. Ordinary transient recovery_wait keeps polling. It does NOT stop " +

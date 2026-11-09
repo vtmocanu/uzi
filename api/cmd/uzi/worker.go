@@ -229,13 +229,38 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 						"worker holds %d unpublished-work custody hold(s); list `uzi run recovery <run-id>`, "+
 							"then `uzi run export` or `uzi run discard <run-id> --hold <hold-id> --yes`, and retry",
 						custody.Holds)
+					holds := custody.BlockingHolds
+					if holds == nil {
+						holds = []uzicli.WorkerBlockingHold{}
+					}
 					if p := env.printer(gf); p.Format == uzicli.FormatJSON {
 						_ = p.JSON(map[string]any{
-							"id":            args[0],
-							"deleted":       false,
-							"error":         guidance,
-							"custody_holds": custody.Holds,
+							"id":                   args[0],
+							"deleted":              false,
+							"error":                guidance,
+							"custody_holds":        custody.Holds,
+							"blocking_holds":       holds,
+							"blocking_holds_total": custody.BlockingHoldsTotal,
 						})
+					} else if len(holds) > 0 {
+						// Per-hold lines are separate stderr writes (not part of the
+						// 200-rune-capped guidance line). Full hold and run ids are printed
+						// because the discard verb needs them; kind and title are
+						// server/forge text, so every field goes through cellText. No line
+						// starts with the binary name.
+						w := cmd.ErrOrStderr()
+						_, _ = fmt.Fprintf(w, "worker is the live holder of %d open custody hold(s):\n", custody.BlockingHoldsTotal)
+						for _, h := range holds {
+							title := cellText(h.Title)
+							if title == "" {
+								title = cellText(shortID(h.RunID))
+							}
+							_, _ = fmt.Fprintf(w, "hold %s  run %s  gen %d  %s  %s\n",
+								cellText(h.HoldID), cellText(h.RunID), h.Generation, cellText(h.Kind), title)
+						}
+						if more := custody.BlockingHoldsTotal - int64(len(holds)); more > 0 {
+							_, _ = fmt.Fprintf(w, "and %d more\n", more)
+						}
 					}
 					return uzicli.Exitf(uzicli.ExitConflict, "%s", guidance)
 				}
@@ -307,8 +332,7 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 			"  <label>     pin the worker to that named token\n" +
 			"  --default   use your default token\n" +
 			"  --auto      let uzi pick per claim, from the tokens you opted into the\n" +
-			"              pool with `uzi token pool` — preferring the account with the\n" +
-			"              most rate-limit headroom\n\n" +
+			"              pool with `uzi token pool` that still have headroom to spare\n\n" +
 			"An --auto worker spends ONLY pooled tokens: if the pool has tokens it\n" +
 			"floors onto the best available one (never your out-of-pool default); if\n" +
 			"the pool is genuinely empty the run HOLDS, waiting for a token to be\n" +
@@ -647,15 +671,24 @@ func outboxCell(w apitypes.WorkerDTO) string {
 	if w.OutboxPendingMessages != nil {
 		pending = *w.OutboxPendingMessages
 	}
+	s := "-"
 	if pending == 0 {
 		if blocked {
-			return "blocked"
+			s = "blocked"
 		}
-		return "-"
+	} else {
+		s = strconv.Itoa(pending)
+		if blocked {
+			s += " (blocked)"
+		}
 	}
-	s := strconv.Itoa(pending)
-	if blocked {
-		s += " (blocked)"
+	if w.OutboxRootUnusable != nil {
+		diagnostic := "disabled:" + cellText(*w.OutboxRootUnusable)
+		if s == "-" {
+			s = diagnostic
+		} else {
+			s += " (" + diagnostic + ")"
+		}
 	}
 	return s
 }

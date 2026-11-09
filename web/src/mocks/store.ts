@@ -7,6 +7,7 @@
 import type { Board, BoardPrefs, IssueProposal, LatestRun, Run, RunMessage, RunStatus, User, VaultMode, WsEvent } from "../lib/api";
 import { seedUnifiedProgress } from "./data/unifiedProgress";
 import { mockGatedCheckedMessages } from "./data/planCrossCheckGated";
+import { overviewNextOtherRunOwners, overviewNextOwnAskingMessages, overviewNextRuns } from "./data/overviewNext";
 import { deriveMockProgress, foreignCooldownRun } from "./runProgress";
 import { mockScenario } from "./mockScenario";
 import {
@@ -28,6 +29,7 @@ import {
   mockLimitWaitMessages,
   mockLiveMessages,
   mockLiveTokensMessages,
+  mockOtherRunOwners,
   mockOtherUserRuns,
   mockProposals,
   mockRuns,
@@ -87,7 +89,7 @@ function seed(): MockState {
   // anything other than legacy role lanes.
   for (const r of mockLaneRuns) runs.set(r.id, seedRun(r));
   // Generated terminal history (ux-tweaks item 3): what makes the runs page's date
-  // grouping + "Show 50 more" reveal exhibitable. The distinct run-hist- prefix
+  // grouping + "Show 50 more" reveal exhibitable. The distinct a015de00 UUID prefix
   // cannot collide with a hand-written fixture id.
   for (const r of mockHistoryRuns) runs.set(r.id, seedRun(r));
   // Other users' active runs (ux-tweaks amendment 2): in state.runs so an admin can
@@ -96,6 +98,17 @@ function seed(): MockState {
   for (const r of mockOtherUserRuns) runs.set(r.id, seedRun(r));
   // PRD #1908: repo-less job runs (queued + completed with a hostile result).
   for (const r of mockJobRuns) runs.set(r.id, seedRun(r));
+  // ?mock=overview-next (PRD #3878): more other-user runs (attributed through the owner
+  // column, so they stay out of the caller-scoped listRuns) and a duplicate-MR own run.
+  // Seeded only under the scenario so no other mock test or scenario changes.
+  if (mockScenario() === "overview-next") {
+    Object.assign(mockOtherRunOwners, overviewNextOtherRunOwners);
+    for (const r of overviewNextRuns) runs.set(r.id, seedRun(r));
+    // #4082: run-seeded carries this scenario's live code check (overviewNextCrossCheckActive),
+    // which the server reports only for a lead that requires a code cross-check.
+    const seeded = runs.get("run-seeded");
+    if (seeded) runs.set(seeded.id, { ...seeded, code_cross_check_required: true });
+  }
   const messages = new Map<string, RunMessage[]>();
   messages.set("run-crew", mockCrewMessages.map((m) => ({ ...m })));
   messages.set("run-lanes", mockLaneMessages.map((m) => ({ ...m })));
@@ -107,9 +120,9 @@ function seed(): MockState {
   messages.set("run-stalled", mockBusyMessages.map((m) => ({ ...m })));
   messages.set("run-degraded", mockDegradedMessages.map((m) => ({ ...m })));
   messages.set("run-done", [...mockDoneMessages]);
-  // run-closed is a completed run (its MR was later closed unmerged); reuse the
+  // closed-MR run is a completed run (its MR was later closed unmerged); reuse the
   // done stream so it also shows the run-view usage surfaces (PRD #40 web-ux).
-  messages.set("run-closed", [...mockDoneMessages]);
+  messages.set("c57b3989-105a-4e08-bf74-77ebc28e5a02", [...mockDoneMessages]);
   // run-ci-halted (PRD #1650 D3a) is a completed run too; the CI halt is board-card state,
   // not a feed row, so the done stream is enough to open its run view.
   messages.set("run-ci-halted", [...mockDoneMessages]);
@@ -124,7 +137,7 @@ function seed(): MockState {
   // PRD #88: the run parked on a question the UI cannot render. Seeded rather than
   // scripted, so the empty state is reachable by URL without walking the journey.
   messages.set("run-unreadable-question", [...mockUnreadableQuestionMessages]);
-  messages.set("run-failed", [...mockFailedMessages]);
+  messages.set("c57b3989-105a-4e08-bf74-77ebc28e5a01", [...mockFailedMessages]);
   // PRD #35: the only stream carrying `limit_wait` / `limit_hit` rows. The
   // degraded-countdown fixture shares it — the rows are the same shape and it exists
   // for the run-row states (expired stamp, 7-day window, suppressed attempt), not for
@@ -142,6 +155,7 @@ function seed(): MockState {
   // hold carries no feed rows of its own, and an empty log opens the run view.
   messages.set("run-cred-disabled", []);
   messages.set("run-cred-disabled-codex", []);
+  messages.set("run-cred-reset", []);
   // Issue #3181: the token-switch holds, empty logs for the same reason.
   messages.set("run-cred-switch-settling", []);
   messages.set("run-cred-switch-unsettled", []);
@@ -151,21 +165,25 @@ function seed(): MockState {
   // DTO. Copied so the script's appends never mutate the shared fixture.
   messages.set("run-live", mockLiveMessages.map((m) => ({ ...m })));
   messages.set("run-cancelled", []);
-  messages.set("run-rejected", []);
+  messages.set("c57b3989-105a-4e08-bf74-77ebc28e5a04", []);
   // The never-judged control fixture (PRD #119): a terminal run with no review AND no
   // pending judge, so the run page's unchanged "hasn't been judged yet" empty state and
-  // its live Run-judge button stay demoable — run-failed used to be that fixture and now
+  // its live Run-judge button stay demoable — pool-tuning run used to be that fixture and now
   // carries a scheduled judge. An empty log rather than no entry: getRunMessages 404s on
   // an unseeded id, which the real API does not do for a run that exists.
   messages.set("run-unjudged", []);
-  // Generated history runs reuse the done transcript (the run-closed precedent
+  // Generated history runs reuse the done transcript (the closed-MR run precedent
   // above): opening one from the past list shows a full run view, not a 404 alert.
-  // Shared row objects, same as run-closed — nothing mutates a seeded message.
+  // Shared row objects, same as closed-MR run — nothing mutates a seeded message.
   for (const r of mockHistoryRuns) messages.set(r.id, [...mockDoneMessages]);
   // Other users' runs: the running one shows the busy stream, the queued one an
   // empty log (a queued run has no transcript yet) — both open without a 404.
   messages.set("run-mira-embed", mockBusyMessages.map((m) => ({ ...m })));
   messages.set("run-andrei-queued", []);
+  // ?mock=overview-next runs open without a 404 (empty logs).
+  for (const r of overviewNextRuns) if (runs.has(r.id)) messages.set(r.id, []);
+  // PRD #4040: the viewer's own asking run carries the question its excerpt quotes.
+  if (runs.has("run-ov-own-asking")) messages.set("run-ov-own-asking", overviewNextOwnAskingMessages.map((m) => ({ ...m })));
   // Job runs: empty logs, so both open without a 404 (their deliverable is the result panel).
   for (const r of mockJobRuns) messages.set(r.id, []);
   for (const [id, log] of Object.entries(mockChatMessages)) messages.set(id, log.map((m) => ({ ...m })));
@@ -201,6 +219,21 @@ function seed(): MockState {
       r.health_reason = id === "run-stalled" ? "near timeout" : "waiting for account cooldown";
       if (id === "run-stalled") r.deadline_at = new Date(Date.now() + 60_000).toISOString();
       r.progress = deriveMockProgress(r);
+    }
+  }
+  // ?mock=overview-calm (PRD #3878): the viewer has active runs but nothing needs a decision,
+  // so the Overview preview's decision card stays hidden. Drop every own run that could list
+  // as one: a plan/question wait, a parked run, or a finished run with a pull request. (The
+  // mock graph cannot import lib/overview, so mockApi.overviewCalm.test.ts checks the result
+  // against overviewDecisions.)
+  if (mockScenario() === "overview-calm") {
+    const decisionStatus = new Set<string>([
+      "awaiting_approval", "awaiting_input", "awaiting_followup",
+      "paused", "limit_wait", "pool_wait", "recovery_wait",
+    ]);
+    for (const r of runs.values()) {
+      if (r.id in mockOtherRunOwners) continue;
+      if (decisionStatus.has(r.status) || r.mr_iid != null) runs.delete(r.id);
     }
   }
   const proposals = new Map<string, IssueProposal>();

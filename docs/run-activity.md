@@ -11,6 +11,25 @@ with its own status dot, collapsed-by-default logs so a live run doesn't
 drag your scroll position around, and a steer queue that tells you whether
 a follow-up you sent actually reached the worker.
 
+## Find a run or cross-check
+
+Open **Runs** at `/runs` for active work and **Past runs** at
+`/runs/history` for the archive. Open a work run to reach this activity pane.
+
+When your account has retained cross-check evidence, **What to list** offers
+**Runs** and **Cross-checks**. In Cross-checks scope the same routes show
+**Active** and **Past checks**, with Plan and Code attempts grouped by parent
+work run. The view is owner-only, including for admins. Parent and checker
+links use the existing run detail routes.
+
+A scope click updates the URL and saves a browser preference per user ID.
+A valid `scope=runs` or `scope=cross-checks` URL overrides that preference
+without saving it. The retained-history availability guard falls back to
+Runs while loading, empty or unavailable, and offers retry on an error.
+Disabling cross-check settings does not remove retained evidence.
+See [Browse retained cross-checks](./cross-check.md#browse-retained-cross-checks)
+for lifecycle, filters, page counts and loading earlier attempts.
+
 ## Plan approval gate
 
 Before implementation starts, a run parks at `awaiting_approval` with the
@@ -184,9 +203,10 @@ A few things worth knowing:
   resend. A Slack thread reply is shorter still: anything past 2,000
   characters is cut before it is sent, so answer long data on the web or CLI.
 - **Nobody answers ⇒ the run fails**, "clarification timed out", once the
-  answer deadline passes (`QUESTION_TIMEOUT_SECONDS`, 24h by default) — there
-  is no configurable default action. The timer is held by the worker, so if
-  it dies and the run is picked up again the clock restarts. With no other
+  run has spent its answer budget parked on questions (`QUESTION_TIMEOUT_SECONDS`,
+  24h by default; time spent working or at the plan gate between questions is not
+  counted) — there is no configurable default action. The budget is held by the
+  worker, so if it dies and the run is picked up again it restarts. With no other
   fresh executor execution, worker-death retries contribute
   `QUESTION_TIMEOUT_SECONDS × (RUN_MAX_REQUEUES + 1)` — 96h on defaults.
   The question cap (`QUESTION_MAX`, default 5 per attempt) resets the same
@@ -219,7 +239,7 @@ plain text, never markdown), and, on an attended (non-autopilot) run, the run pa
 `awaiting_input` on a uzi-authored question headed **Plan missing**. Answering
 with guidance resumes planning in the same session, but that answer is never
 plan approval: a plan still has to be submitted and go through the approval
-gate. You can also cancel the run instead. The usual answer deadline applies.
+gate. You can also cancel the run instead. The usual answer budget applies.
 There's no "revise the PRD and retry" option here: to change the PRD or issue,
 cancel and re-dispatch. If planning is still prose-only after your guidance,
 or the run is autopilot (or otherwise has no one to ask), the run fails
@@ -791,6 +811,45 @@ most of the places that check are not the end of the run:
   cleared, the run normally continues on the old credential in place (its
   clone and session are kept); otherwise it is stopped and left to be
   requeued rather than continuing on uncertain ground.
+- A credential switch requested during an automatic plan cross-check does not
+  fail the run: it waits for the check to settle, then switches. With the
+  default 30-minute checker deadline the wait is up to about 31 minutes when
+  the check ends in an approve or revise, and up to about 53 minutes when it
+  ends at a first human gate; with the 2-hour maximum, about 2 h 1 min and
+  2 h 23 min. A human gate on a re-plan after an approval whose milestones
+  changed adds a checkpoint step of about 76 seconds when its operations return (usually
+  about a minute), so about 54 minutes by default and about 2 h 24 min at the
+  maximum on the same condition.
+  If the switch cannot complete and the run continues on its current
+  credential, an approved plan is kept and not re-checked, an automatic revise
+  runs its revision turn, and a checked human gate stays presented with no
+  republish. If the switch releases the run to another claim, that claim
+  re-presents the plan for human approval after an approve or a human gate,
+  and continues with the next checker round after an automatic revise. A cancel or other failure during the wait keeps its
+  normal outcome ([ADR-2149](../adr/2149-cross-check.md)).
+  An owner **Cancel** pressed during this wait takes effect promptly (#3974).
+  The server still holds the Cancel back behind the pending switch, but on
+  each poll while the switch waits the worker makes one short, read-only check
+  for a requested cancel. It sees the Cancel at its next poll and ends the run
+  **cancelled**. The switch is never serviced, no plan is stored and no gate
+  is presented afterwards. The pending checker round is recorded as failed and
+  the checker run is cancelled. Kept work is handled as for any other Cancel.
+  The same applies during an automatic revise's revision turn, including a
+  question it asks you.
+  **Known limits:** on a re-plan gate after an approval whose milestones
+  changed, the worker sees the Cancel promptly, but if the gate checkpoint
+  step is already running, the run's final status waits for that step to
+  return, about 76 seconds (usually about a minute) on Claude when its
+  operations return; the step fails closed at its 60-second deadline, but a
+  stuck process check or kill, or a child that never closes, can delay it
+  further (#3980). A Cancel is still held until the
+  switch is serviced when the server or worker predates this check (#3860,
+  #3974). Graceful **Stop** is held this way too, and so is auto-stop, unless the
+  server's 60-second escalation fails a run that is still running. A Cancel pressed during the wait that the
+  switch releases before the worker sees it waits for the next claim; pressing
+  Cancel again after the release takes effect at once. If an earlier
+  "pause now" was refused, the agent's current turn stops at its next step
+  boundary rather than immediately.
 - A Claude recovery capture that cannot prove the clone stopped is retried a
   bounded number of times; if proof still fails, the run fails the same way
   finalize does (see below), with the clone kept. Codex ordinary recovery can
