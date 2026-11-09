@@ -258,6 +258,56 @@ func (q *Queries) CountOpenCustodyHoldsForRepo(ctx context.Context, repoID uuid.
 	return count, err
 }
 
+const createForgeConnectionIfAbsent = `-- name: CreateForgeConnectionIfAbsent :one
+INSERT INTO forge_connections (
+    user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, last_verified_at
+) VALUES ($1, $2, $3, $4, $5, $6, now())
+ON CONFLICT (user_id, forge_type, base_url) DO NOTHING
+RETURNING id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at, privilege_report, privilege_checked_at, privilege_status, human_username
+`
+
+type CreateForgeConnectionIfAbsentParams struct {
+	UserID          uuid.UUID `json:"user_id"`
+	ForgeType       string    `json:"forge_type"`
+	BaseUrl         string    `json:"base_url"`
+	BotUsername     string    `json:"bot_username"`
+	BotForgeUserID  int64     `json:"bot_forge_user_id"`
+	TokenCiphertext []byte    `json:"token_ciphertext"`
+}
+
+// Create-only counterpart of UpsertForgeConnection for the operator setup
+// command (PRD #3760): it never updates an existing row, so a concurrent or
+// earlier connection keeps its token and bot identity. No row is returned on a
+// (user, forge_type, base_url) conflict; the caller then reads the winner with
+// GetForgeConnectionByTarget.
+func (q *Queries) CreateForgeConnectionIfAbsent(ctx context.Context, arg CreateForgeConnectionIfAbsentParams) (ForgeConnection, error) {
+	row := q.db.QueryRow(ctx, createForgeConnectionIfAbsent,
+		arg.UserID,
+		arg.ForgeType,
+		arg.BaseUrl,
+		arg.BotUsername,
+		arg.BotForgeUserID,
+		arg.TokenCiphertext,
+	)
+	var i ForgeConnection
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.ForgeType,
+		&i.BaseUrl,
+		&i.BotUsername,
+		&i.BotForgeUserID,
+		&i.TokenCiphertext,
+		&i.CreatedAt,
+		&i.LastVerifiedAt,
+		&i.PrivilegeReport,
+		&i.PrivilegeCheckedAt,
+		&i.PrivilegeStatus,
+		&i.HumanUsername,
+	)
+	return i, err
+}
+
 const deleteBoardColumnsByRepo = `-- name: DeleteBoardColumnsByRepo :exec
 DELETE FROM board_columns WHERE repo_id = $1
 `
@@ -390,6 +440,38 @@ func (q *Queries) DeleteRepoForUser(ctx context.Context, arg DeleteRepoForUserPa
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const getForgeConnectionByTarget = `-- name: GetForgeConnectionByTarget :one
+SELECT id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at, privilege_report, privilege_checked_at, privilege_status, human_username FROM forge_connections
+WHERE user_id = $1 AND forge_type = $2 AND base_url = $3
+`
+
+type GetForgeConnectionByTargetParams struct {
+	UserID    uuid.UUID `json:"user_id"`
+	ForgeType string    `json:"forge_type"`
+	BaseUrl   string    `json:"base_url"`
+}
+
+func (q *Queries) GetForgeConnectionByTarget(ctx context.Context, arg GetForgeConnectionByTargetParams) (ForgeConnection, error) {
+	row := q.db.QueryRow(ctx, getForgeConnectionByTarget, arg.UserID, arg.ForgeType, arg.BaseUrl)
+	var i ForgeConnection
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.ForgeType,
+		&i.BaseUrl,
+		&i.BotUsername,
+		&i.BotForgeUserID,
+		&i.TokenCiphertext,
+		&i.CreatedAt,
+		&i.LastVerifiedAt,
+		&i.PrivilegeReport,
+		&i.PrivilegeCheckedAt,
+		&i.PrivilegeStatus,
+		&i.HumanUsername,
+	)
+	return i, err
 }
 
 const getForgeConnectionForUser = `-- name: GetForgeConnectionForUser :one
@@ -721,6 +803,30 @@ type InsertBoardColumnParams struct {
 // hitting the (repo_id, label_name) unique violation.
 func (q *Queries) InsertBoardColumn(ctx context.Context, arg InsertBoardColumnParams) error {
 	_, err := q.db.Exec(ctx, insertBoardColumn, arg.RepoID, arg.LabelName, arg.Position)
+	return err
+}
+
+const insertDefaultBoardColumns = `-- name: InsertDefaultBoardColumns :exec
+INSERT INTO board_columns (repo_id, label_name, position)
+SELECT $1::uuid, c.label_name, (c.ord - 1)::int
+FROM unnest($2::text[]) WITH ORDINALITY AS c(label_name, ord)
+WHERE NOT EXISTS (SELECT 1 FROM board_columns b WHERE b.repo_id = $1::uuid)
+ON CONFLICT (repo_id, label_name) DO NOTHING
+`
+
+type InsertDefaultBoardColumnsParams struct {
+	RepoID     uuid.UUID `json:"repo_id"`
+	LabelNames []string  `json:"label_names"`
+}
+
+// One statement, so a repo gets every default column or none: a failure part
+// way through rolls the whole insert back, and a retry starts from no columns
+// instead of mistaking a partial board for a complete one. Position is the
+// label's 0-based index in @label_names. NOT EXISTS leaves a repo that already
+// has any column (custom columns included) untouched; DO NOTHING keeps two
+// concurrent seeds of the same empty repo from a unique violation.
+func (q *Queries) InsertDefaultBoardColumns(ctx context.Context, arg InsertDefaultBoardColumnsParams) error {
+	_, err := q.db.Exec(ctx, insertDefaultBoardColumns, arg.RepoID, arg.LabelNames)
 	return err
 }
 

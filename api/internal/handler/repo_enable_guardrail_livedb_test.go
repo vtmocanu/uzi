@@ -64,6 +64,9 @@ type fakeGuardForge struct {
 	server *httptest.Server
 	mu     sync.Mutex
 	prot   map[int64]protMode
+	// labelsRefused makes every label call answer 403, the forge refusing the
+	// board column labels.
+	labelsRefused bool
 }
 
 func newFakeGuardForge(t *testing.T) *fakeGuardForge {
@@ -71,10 +74,29 @@ func newFakeGuardForge(t *testing.T) *fakeGuardForge {
 	fg := &fakeGuardForge{prot: map[int64]protMode{}}
 	fg.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
+		fg.mu.Lock()
+		labelsRefused := fg.labelsRefused
+		fg.mu.Unlock()
 		switch {
+		case labelsRefused && strings.HasSuffix(path, "/labels"):
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"403 Forbidden"}`))
+			return
 		case strings.HasSuffix(path, "/api/v4/user"):
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": guardBotUserID, "username": "uzi-bot"})
+			return
+		case strings.HasSuffix(path, "/labels") && r.Method == http.MethodGet:
+			// Enabling a repo now ensures its board labels; an empty list lets the
+			// create calls (answered by the catch-all below) succeed.
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte("[]"))
+			return
+		case strings.HasSuffix(path, "/issues") && r.Method == http.MethodGet:
+			// One open uzi issue, so an import after the enable has a card to
+			// cache. Every list fetch of the full sync gets the same issue.
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[{"id":9001,"iid":5,"title":"First card","state":"opened","labels":["uzi"],"web_url":"https://forge.e2e/g/r/-/issues/5","updated_at":"2026-11-01T00:00:00Z"}]`))
 			return
 		case strings.Contains(path, "/members/all/"):
 			// The bot is exactly a Developer (30, the compliant write role): a clean
@@ -278,6 +300,64 @@ func TestSetRepoEnableGuardAllowsCleanLiveDB(t *testing.T) {
 	if !f.repoEnabled(ctx, t, repoID) {
 		t.Errorf("a clean repo must be enabled after a 200")
 	}
+	// PRD #3760 Decision 13: the web enable creates the default board columns, so
+	// the run lifecycle can resolve a card's column without a board read first.
+	if got := f.boardColumns(ctx, t, repoID); got != 4 {
+		t.Errorf("board_columns after enable = %d, want 4", got)
+	}
+}
+
+// Enabling a repo creates its columns, so the first board open no longer runs
+// the seed that imported issues. The enable itself imports them, best effort,
+// so a newly enabled repo shows its cards without waiting for the poller
+// (PR #3956 review, item 6).
+func TestSetRepoEnableImportsIssuesLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newEnableGuardFixture(ctx, t)
+	repoID := f.seedRepo(ctx, t, 108, false, protClean)
+
+	w := f.setEnabled(t, repoID, true)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", w.Code, w.Body.String())
+	}
+	var n int
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM issues WHERE repo_id = $1`, repoID).Scan(&n); err != nil {
+		t.Fatalf("count issues: %v", err)
+	}
+	if n == 0 {
+		t.Errorf("no issues cached after the enable; the first board open would show an empty board")
+	}
+}
+
+// The forge refuses the board column labels → 502, the repo stays disabled and
+// has no columns (PRD #3760 Decision 13).
+func TestSetRepoEnableLabelsRefusedIs502LiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newEnableGuardFixture(ctx, t)
+	repoID := f.seedRepo(ctx, t, 107, false, protClean)
+	f.forge.mu.Lock()
+	f.forge.labelsRefused = true
+	f.forge.mu.Unlock()
+
+	w := f.setEnabled(t, repoID, true)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (body %s)", w.Code, w.Body.String())
+	}
+	if f.repoEnabled(ctx, t, repoID) {
+		t.Errorf("a repo whose labels the forge refused must stay disabled")
+	}
+	if got := f.boardColumns(ctx, t, repoID); got != 0 {
+		t.Errorf("board_columns after a refused enable = %d, want 0", got)
+	}
+}
+
+func (f enableGuardFixture) boardColumns(ctx context.Context, t *testing.T, repoID uuid.UUID) int {
+	t.Helper()
+	var n int
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM board_columns WHERE repo_id = $1`, repoID).Scan(&n); err != nil {
+		t.Fatalf("count board_columns: %v", err)
+	}
+	return n
 }
 
 // A branch-protection read error refuses the enable (fail closed, D3).
