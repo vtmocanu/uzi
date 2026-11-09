@@ -63,10 +63,11 @@ A successful empty result = maintainer-only backlog. If it looks wrong, compare 
 .agents/skills/issue-triage/scripts/external-activity.sh --days 14
 ```
 
-- Labels are facts, not verdicts: `external-last`, `maintainer-later`, `authored-open`. A later maintainer comment may answer something else.
-- Read the linked activity of every row in full, `external-last` first, before reporting that nothing is owed.
+- Labels are facts, not verdicts. `external-last`: the newest non-automation activity is external. `maintainer-later`: a maintainer commented or reviewed after it, maybe about something else. `authored-open`: an external account opened it, no external activity in the window.
+- For every row, `external-last` first, read the item's conversation and review threads in full, earlier external questions included, not just the newest permalink.
 - Per item, propose a reply or a disposition (none needed, handled elsewhere) under the review and approval rules for that reply.
-- Exit 3 means a lookup failed and nothing was printed: report it, never read it as no activity. Report its `LIMITATION` lines.
+- Scope any "nothing owed" to the items read and the window. A `LIMITATION` line on truncated reviews blocks an all-clear until those PRs are read by hand.
+- Exit 3 means a lookup failed or returned an unexpected shape, and nothing was printed: report it, never read it as no activity.
 
 ## Queue audit (what fires next)
 
