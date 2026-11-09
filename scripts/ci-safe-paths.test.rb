@@ -156,15 +156,44 @@ end
 safe_step = jobs.fetch('changes').fetch('steps').find { |step| step['id'] == 'safe' }
 raise 'missing safe classification step' unless safe_step
 assert.call(jobs.fetch('changes').fetch('outputs').fetch('skip_components'), '${{ steps.safe.outputs.skip_components }}', 'classification output wiring')
-assert.call(safe_step.fetch('env'), {'ALL_COUNT' => '${{ steps.filter.outputs.all_count }}', 'SAFE_COUNT' => '${{ steps.filter.outputs.component_safe_count }}', 'EXPECTED_COUNT' => '${{ github.event.pull_request.changed_files }}'}, 'count source wiring')
-classify = lambda do |all, safe, expected|
+safe_env = safe_step.fetch('env')
+assert.call(safe_env.reject { |key, _| key == 'SAFE_ROOTS' }, {'ALL_COUNT' => '${{ steps.filter.outputs.all_count }}', 'SAFE_COUNT' => '${{ steps.filter.outputs.component_safe_count }}', 'EXPECTED_COUNT' => '${{ github.event.pull_request.changed_files }}'}, 'count source wiring')
+# A pin-veto fixture repo: a tracked file under each safe root, optionally holding text.
+pin_repo = lambda do |text|
+  dir = Dir.mktmpdir('ci-safe-pins')
+  git_env = {'GIT_CONFIG_GLOBAL' => '/dev/null', 'GIT_CONFIG_SYSTEM' => '/dev/null'}
+  Open3.capture3(git_env, 'git', 'init', '-q', dir)
+  safe_env.fetch('SAFE_ROOTS').split.each do |root_path|
+    FileUtils.mkdir_p(File.join(dir, root_path))
+    File.write(File.join(dir, root_path, 'SKILL.md'), "# skill\n#{text}\n")
+  end
+  File.write(File.join(dir, 'outside.md'), "codex-cli 0.0.1\n")
+  _, err, status = Open3.capture3(git_env, 'git', '-C', dir, 'add', '-A')
+  raise err unless status.success?
+  dir
+end
+clean_repo = pin_repo.call('no pins here')
+classify = lambda do |all, safe, expected, dir = clean_repo|
   Tempfile.create('ci-safe-output') do |file|
-    _, err, status = Open3.capture3({'ALL_COUNT' => all, 'SAFE_COUNT' => safe, 'EXPECTED_COUNT' => expected, 'GITHUB_OUTPUT' => file.path}, 'bash', '-e', '-c', safe_step.fetch('run'))
+    env = {'ALL_COUNT' => all, 'SAFE_COUNT' => safe, 'EXPECTED_COUNT' => expected, 'SAFE_ROOTS' => safe_env.fetch('SAFE_ROOTS'), 'GITHUB_OUTPUT' => file.path, 'GIT_CONFIG_GLOBAL' => '/dev/null', 'GIT_CONFIG_SYSTEM' => '/dev/null'}
+    _, err, status = Open3.capture3(env, 'bash', '-e', '-c', safe_step.fetch('run'), chdir: dir)
     raise err unless status.success?
     File.read(file.path).strip
   end
 end
 assert.call(classify.call('2', '2', '2'), 'skip_components=1', 'nonempty complete safe list')
+# The Codex pin scan in test-agent greps every tracked file, safe roots included; a pin
+# prefix under a safe root must run full CI, a pin outside them is not this veto's concern.
+pin_prefixes = ['/opt/uzi-codex/', 'codex-cli ', 'Codex worker uses runtime ']
+pin_prefixes.each do |prefix|
+  assert.call(classify.call('2', '2', '2', pin_repo.call("#{prefix}9.9.9")), 'skip_components=0', "pin prefix #{prefix.inspect} vetoes the skip")
+end
+not_a_repo = Dir.mktmpdir('ci-safe-norepo')
+assert.call(classify.call('2', '2', '2', not_a_repo), 'skip_components=0', 'git grep error runs full CI')
+assert.call(safe_step.fetch('run').scan(/-e '([^']+)'/).flatten, pin_prefixes, 'veto greps exactly the pin prefixes')
+pin_source = File.read(File.join(root, 'agent/test/codex-pins.ts'))
+scan_pattern = pin_source[/PIN_SCAN_PATTERN = `\(([^)]*)\)/, 1] or raise 'PIN_SCAN_PATTERN not found'
+assert.call(scan_pattern.split('|'), pin_prefixes, 'veto prefixes match the agent pin scan')
 [['2', '1', '2'], ['0', '0', '0'], ['', '', ''], ['x', 'x', 'x'], ['01', '01', '01'], ['2', '2', '3'], ['2', '2', ''], ['3000', '3000', '3001']].each do |counts|
   assert.call(classify.call(*counts), 'skip_components=0', "unsafe/malformed/truncated counts #{counts}")
 end
@@ -172,6 +201,7 @@ filter_step = jobs.fetch('changes').fetch('steps').find { |step| step['id'] == '
 rules = YAML.safe_load(filter_step.fetch('with').fetch('filters'))
 assert.call(rules.fetch('all'), ['**'], 'all changed paths counted')
 assert.call(rules.fetch('component_safe'), [{'added|modified' => '.agents/skills/uzi-lander/**'}], 'only audited additions/modifications allowed')
+assert.call(safe_env.fetch('SAFE_ROOTS').split, rules.fetch('component_safe').map { |rule| rule.values.first.delete_suffix('/**') }, 'veto roots are exactly the component_safe roots')
 flags = File::FNM_PATHNAME | File::FNM_DOTMATCH
 allowed = rules.fetch('component_safe').first
 statuses, pattern = allowed.first
