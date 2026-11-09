@@ -98,8 +98,8 @@ func checkpointCoordinatesForWorker(worker store.Worker, run store.Run) (*Checkp
 	return pair, nil
 }
 
-// publicationCoordinates consumes only enrolled task descriptors. Legacy issue
-// and self-improvement runs retain their server-derived, single-branch contract.
+// publicationCoordinates consumes only enrolled task descriptors. Legacy issue,
+// self-improvement and prompt runs retain their server-derived, single-branch contract.
 func publicationCoordinates(run store.Run) (*CheckpointCoordinates, error) {
 	pair, err := frozenCheckpointCoordinates(run)
 	if err != nil || pair != nil {

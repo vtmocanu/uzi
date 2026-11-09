@@ -10,8 +10,8 @@ import { RUN_KIND_PROFILES } from "../src/run-kind.js";
 // the Go half is api/internal/workersvc/checkpoint_branch_contract_test.go. Neither reads
 // the other: each folds its OWN production derivation and compares against the SAME
 // hand-authored fixture, fixtures/checkpoint-branch/cases.json. This side folds the
-// worker's actual per-kind derivation (RUN_KIND_PROFILES.self_improve.cloneBranch for a
-// self_improve run; the `agent/issue-${iid}` createOrAttachRunnerClone default for an
+// worker's actual per-kind derivation (RUN_KIND_PROFILES.<kind>.cloneBranch for a
+// self_improve or prompt run; the `agent/issue-${iid}` createOrAttachRunnerClone default for an
 // issue run, which has no cloneBranch profile). See the fixture's README.
 
 interface CheckpointBranchCases {
@@ -61,6 +61,11 @@ describe("checkpoint branch derivation contract (PRD #1062 M3)", () => {
           undefined,
           "issue kind must have no cloneBranch profile (it falls through to createOrAttachRunnerClone)",
         );
+      } else if (c.kind === "prompt") {
+        // Issue #4116: prompt's cloneBranch delegates to deriveCloneKey (uzi/prompt-<runId>).
+        const claim = { issue_iid: null } as unknown as ClaimResponse;
+        const derived = RUN_KIND_PROFILES.prompt.cloneBranch?.(claim, c.run_id);
+        assert.strictEqual(derived?.branch, c.branch, `prompt run ${c.run_id} should derive branch ${c.branch}`);
       } else {
         assert.fail(`fixture eligible case has an unhandled kind: ${c.kind}`);
       }
