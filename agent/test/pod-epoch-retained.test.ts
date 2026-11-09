@@ -28,17 +28,58 @@ beforeEach(async () => {
 afterEach(() => { mock.restoreAll(); fixture.cleanup(); });
 
 /** Real bare metadata and production attempt identities; absent paths still consume capacity. */
-function attempts(count: number, target = bare, offset = 0) {
+function attempts(count: number, target = bare, offset = 0,
+  state: "abandoned" | "retired" | "live" = "abandoned", key = "issue-3430", branch = "agent/issue-3430") {
   const entries = [];
   for (let i = offset; i < offset + count; i++) {
     const attemptId = formatAttemptId(new Date(Date.UTC(2026, 0, 1, 0, 0, i)), 1, (i + 1).toString(16).padStart(16, "0"));
-    const clonePath = cache.runnerClonePath(target, "issue-3430") + ".attempt-" + attemptId;
-    const entry = { attemptId, runId: "epoch-run", clonePath, state: "abandoned" as const };
-    git(target, ["config", "--local", "--add", "uzi-attempts.agent/issue-3430.entry", JSON.stringify(entry)]);
+    const clonePath = cache.runnerClonePath(target, key) + ".attempt-" + attemptId;
+    const entry = { attemptId, runId: "epoch-run", clonePath, state };
+    git(target, ["config", "--local", "--add", `uzi-attempts.${branch}.entry`, JSON.stringify(entry)]);
     entries.push(entry);
   }
   return entries;
 }
+
+it("completed retired pairs do not exhaust the epoch path cap before one live attempt", async () => {
+  // The epoch proof requires canonical ancestors; macOS os.tmpdir() may spell /var through a symlink.
+  const dataDir = fs.realpathSync(fixture.dataDir);
+  bare = fs.realpathSync(bare);
+  cache = new GitCache(dataDir, nullLogger(), undefined, testGitCacheOptions());
+  const completed = attempts(201, bare, 0, "retired");
+  fs.mkdirSync(path.dirname(completed[0]!.clonePath), { recursive: true });
+  git(bare, ["config", "--local", "uzi-recovery.agent/issue-3430.clone", ""]);
+  const [live] = attempts(1, bare, 201, "live", "issue-live", "agent/issue-live");
+  fs.mkdirSync(live!.clonePath, { recursive: true });
+  fs.writeFileSync(path.join(live!.clonePath, "payload"), "retained");
+  git(bare, ["config", "--local", "uzi-recovery.agent/issue-live.clone",
+    JSON.stringify({ runId: live!.runId, clonePath: live!.clonePath, attemptId: live!.attemptId })]);
+  assert.deepEqual(await cache.readEpochJournalVector(bare, "agent/issue-3430"), [""]);
+  const repair = await cache.inspectRetainedSources({ epoch: true, barePath: bare,
+    selector: { runId: "epoch-run", generation: 1, attempt: completed[0]!.attemptId },
+    holds: { state: "read", holds: [] }, lifecycle: { state: "terminal", status: "completed" },
+    isLivePath: () => false });
+  assert.equal(repair.sources.length, 1, "the completed pair still appears as repair evidence");
+  const retired = new Set(completed.map(e => e.clonePath));
+  const authority = {
+    admitSourceUse: async () => {},
+    beginBareMutation: async () => ({ settle: async () => {} }),
+    assertBareClear: async () => {},
+    beginDestructive: async () => ({ settle: async () => {} }),
+    isRetiredSource: async (clonePath: string) => retired.has(clonePath),
+  };
+  cache = new GitCache(dataDir, nullLogger(), undefined, testGitCacheOptions({ authority }));
+  const census = await cache.discoverEpochRetainedSources({ deadline: Date.now() + 90_000 });
+  assert.equal(census.inventoryComplete, true);
+  assert.equal(census.physicalPaths, 1, "only the tree that still needs work consumes the cap");
+  assert.equal(census.overflow, 0);
+  assert.deepEqual(census.groups.map(g => g.paths), [[live!.clonePath]]);
+
+  retired.delete(completed[0]!.clonePath);
+  const uncertain = await cache.discoverEpochRetainedSources({ deadline: Date.now() + 90_000 });
+  assert.equal(uncertain.physicalPaths, 2, "an unproven retired pair still consumes capacity");
+  assert.equal(uncertain.groups.length, 2);
+});
 function inspect(over: Partial<Parameters<GitCache["inspectRetainedSources"]>[0]> = {}) {
   return cache.inspectRetainedSources({ isLivePath: () => false, barePath: bare, budgetMs: 90_000, ...over });
 }
@@ -315,9 +356,9 @@ it("a measurement directory-close failure is partial rather than a complete byte
   assert.equal(result.sources[0]!.allocatedBytes, null);
 });
 
-it("the production 8 MiB epoch output cap refuses a bare while operator inspection stays compatible", async () => {
+it("the production 16 MiB epoch output cap (R9) refuses a bare while operator inspection stays compatible", async () => {
   attempts(1);
-  fs.appendFileSync(path.join(bare, "config"), "\n[epoch]\n\tpayload = " + "x".repeat(8 * 1024 * 1024 + 1) + "\n");
+  fs.appendFileSync(path.join(bare, "config"), "\n[epoch]\n\tpayload = " + "x".repeat(16 * 1024 * 1024 + 1) + "\n");
   const result = await cache.discoverEpochRetainedSources({ deadline: Date.now() + 90_000 });
   assert.equal(result.inventoryComplete, false);
   assert.equal(result.groups.length, 0);
