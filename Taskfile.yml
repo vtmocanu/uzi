@@ -1596,9 +1596,10 @@ tasks:
     # to catch quoting/word-splitting differences; print a bash-only note if absent.
     # Local zsh verification is required when editing these workstation snippets.
     # No forge reads: the regression mocks gh and exercises SKILL.md's real pipelines.
-    desc: reject terminal-control and bidi bytes in issue-triage renderers
+    desc: reject terminal-control and bidi bytes in issue-triage renderers; offline external-activity collector regression
     cmds:
       - python3 -B .agents/skills/issue-triage/scripts/test-rendering.py
+      - python3 -B .agents/skills/issue-triage/scripts/test-external-activity.py
 
   check:skill-size:
     desc: no repo skill's SKILL.md exceeds the 65536-byte runtime cap (over-cap skills are dropped silently at run time), with a canary proving the detector fired
