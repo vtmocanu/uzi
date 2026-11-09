@@ -234,8 +234,8 @@ RUN SQLC_PIN="$(awk -F '"' '/^SQLC_LINUX_AMD64_VERSION=/{print $2}' /tmp/worker-
 # toolchain ENV above; GOBIN=/usr/local/bin puts the binary on the image PATH (agent-browser is
 # installed there too and used). GOFLAGS=-buildvcs=false avoids VCS stamping. The trailing
 # `gitleaks version` is a fail-closed BUILD-time check (mirrors the toolchain guard idiom) so a
-# broken install fails the BUILD, not every run. Pinned to v8.30.1 to match the repo's gate:repo
-# scan (Taskfile.yml:913 / scripts/scan-secrets.sh). CI-verified: this image build cannot run in
+# broken install fails the BUILD, not every run. Pinned to the same version as the repo's gate:repo
+# scan (Taskfile.yml GITLEAKS_VERSION / scripts/scan-secrets.sh; Renovate moves all three). CI-verified: this image build cannot run in
 # the worker itself. MIRRORED in templates/jvm (jvm is NOT `FROM base`) — keep in lockstep.
 # renovate: datasource=github-releases depName=gitleaks/gitleaks
 RUN GOFLAGS=-buildvcs=false GOBIN=/usr/local/bin go install github.com/zricethezav/gitleaks/v8@v8.30.1 && gitleaks version

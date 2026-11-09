@@ -214,7 +214,8 @@ assert(manual.prBodyNotes.some(note => note.includes("lock")), "worker Go PR mus
 
 
 // Inline `module@vX.Y.Z` tool pins: Renovate sees only those with a `# renovate:` (or
-// `# renovate-tarball:`) annotation on the line directly above. deadcode sat untracked on
+// `# renovate-tarball:`) annotation on the line directly above. Scope matches the generic
+// manager: top-level scripts/*.sh, not scripts/lib/. deadcode sat untracked on
 // v0.48.0 for months while upstream fixed the memory blow-up it hit (#4108). Hermetic
 // fixtures (*.test.sh) are not pins.
 const { readdirSync, existsSync } = await import("node:fs");
