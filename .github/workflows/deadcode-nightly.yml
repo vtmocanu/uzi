@@ -4,7 +4,7 @@
 # empty baseline) left PR and main CI: it took 48-60 min and held a job slot on
 # every run (memory growth: #4108). Recorded policy: deadcode no longer gates
 # merges, green main CI or releases. An exported unreachable function can reach
-# main and is reported here the next night; Go `unused` (golangci-lint in
+# main and is reported on a subsequent scheduled run; Go `unused` (golangci-lint in
 # ci.yml's lint-api) still catches unexported dead code before merge.
 # `task gate:api` still runs it locally.
 #
@@ -36,17 +36,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
-          # Latest patch of this Go minor, so a stdlib CVE fixed in a patch release
-          # does not redden the vulncheck gate on a stale toolchain. check-latest is
-          # load-bearing: without it setup-go resolves the minor to whatever patch the
-          # assigned runner image happens to preinstall (observed to differ between
-          # runners), so the "latest patch" promise only holds with the forced
-          # manifest lookup. This is the bootstrap Go, like the Dockerfiles'
-          # golang:<minor> builder base: go.mod's `go` line is the language floor and
-          # its `toolchain` line, which Go auto-downloads when newer, is the floor for
-          # the Go that actually builds. Renovate groups the toolchain line, this
-          # go-version and the builder image on a minor bump; the `go` floor is
-          # raised by hand (Renovate leaves that directive alone by default).
+          # Same Go minor and latest patch as ci.yml's lint-api, so deadcode analyses the
+          # tree with the toolchain CI builds it with (go.mod's toolchain line still wins
+          # when newer; Renovate keeps this go-version in its Go group).
           go-version: "1.27"
           check-latest: true
           # Per-job-class cache below instead (.github/actions/go-cache).
