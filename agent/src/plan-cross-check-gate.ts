@@ -10,6 +10,7 @@ import type { StateAck } from "./protocol.js";
 /** Execution-local context only. Status proofs never create or replace a presentation. */
 export interface CheckedHumanGate {
   phase: "publishinginitial" | "confirmedwait" | "revisionplanning" | "publishingrevised" | "terminal";
+  /** Single-flight (issue #3854): concurrent callers join one in-flight presentation and wait. */
   continueWait?: () => Promise<import("./steering.js").PlanVerdict>;
   onApplied?: (ack: StateAck) => void | Promise<void>;
 }
