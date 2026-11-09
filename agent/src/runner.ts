@@ -17878,8 +17878,11 @@ export class RunRunner {
     // Callers reachable while the guard is armed (restorePredecessor is set from route selection to the seed's success):
     //   covered here   retainStoppedSource (claim_fence, stale_claim, plan_revision_recovery_stopped, input_receipt_unconfirmed, the
     //                  deferred terminal release) -> quiesceRun, so the claimFence and StaleClaimError arms stay effect-free;
-    //                  the shutdown arm's reapForSink -> quiesceOrBlockSink skips its body on the blocked proof; reportGenericFailure's
-    //                  terminal_retire and custody settles; the finally's terminal_retire; settleRetainedSwitch's quiesceRun.
+    //                  reportGenericFailure's terminal_retire and custody settles; the finally's terminal_retire; settleRetainedSwitch's
+    //                  quiesceRun.
+    //   not reached    the shutdown arm's reapForSink -> quiesceOrBlockSink: RestoreRouteStop / RetainedRecoveryStop are excluded from
+    //                  that arm, so it is unreachable in the window. Were it ever reached on a Codex executor, safety.withBoundary
+    //                  would run BEFORE this guard, so the guard alone would not protect P there.
     //   permitted      the seed's own beforeSeed sweep (S's executor, explicit P-free targets).
     //   covered else   settleForCredentialCapture and the credential switch: enterRetainedCredentialSwitch stops before settling
     //                  (3.4 b); the finally's park reap and HOME teardown skip P's HOME (3.4 d, restoreUnsupportedHold).
@@ -27471,6 +27474,14 @@ export class RunRunner {
     try { held = await this.parkRetainedRecoveryExhausted(flight, "retained_recovery_adoption_failed"); }
     catch (error) {
       if (!(error instanceof RetainedRecoveryStop) || error instanceof RetainedRecoveryCancelled) throw error;
+      // parkRetainedRecoveryExhausted re-wraps every failure as RetainedRecoveryStop({ cause }). A stale claim, a credential switch
+      // and a cancel own an executeClaim arm each, so their cause is rethrown unchanged to it; a lost ownership has no arm of its
+      // own (a raw rethrow would end the run as failed), so the wrapper itself is rethrown into the nonterminal
+      // RetainedRecoveryStop arm, as holdForPredecessorRemediation's park does. None logs "hold unconfirmed" or flushes the item-7
+      // line to a run another claim may own.
+      const cause = error.cause;
+      if (cause instanceof StaleClaimError || cause instanceof RetainedRecoveryCancelled || cause instanceof CredentialSwitchSignal) throw cause;
+      if (isRunOwnershipLost(cause, flight.runId)) throw error;
     }
     if (held) {
       flight.runLog.info("restore unsupported predecessor held", { unsupported, claim_generation: claim.claim_generation });

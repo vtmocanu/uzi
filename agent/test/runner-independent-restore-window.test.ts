@@ -147,8 +147,8 @@ describe("the window between route selection and the seed leaves P's processes a
       const w = await window();
       onceBefore(w.r.runner as unknown as object, "memoryReparkOwner", tripSwitch, 1);
       const { before, traps } = await drive(w.r);
-    await assertPUntouched(w, before, traps);
-        assert.equal(logged(w.r, "retained credential switch deferred: the restore route's predecessor is untouchable until the successor is seeded").length, 1);
+      await assertPUntouched(w, before, traps);
+      assert.equal(logged(w.r, "retained credential switch deferred: the restore route's predecessor is untouchable until the successor is seeded").length, 1);
       assert.equal(api.states.filter(s => s.runId === w.r.runId && String(s.body.status).startsWith("credential_switch")).length, 0, "no switch report");
       assert.equal(failed(w.r).length, 0);
     });
@@ -157,8 +157,8 @@ describe("the window between route selection and the seed leaves P's processes a
       const w = await window();
       onceBefore(w.r.runner as unknown as object, "memoryReparkOwner", flight => { flight.steering.claimFence = () => "stale"; }, 1);
       const { before, traps } = await drive(w.r);
-    await assertPUntouched(w, before, traps);
-        assert.ok(logged(w.r, REFUSED).length >= 1, "the guard refused the proof");
+      await assertPUntouched(w, before, traps);
+      assert.ok(logged(w.r, REFUSED).length >= 1, "the guard refused the proof");
       assert.ok(w.r.logs.lines.some(l => String((l as { msg: string }).msg).startsWith("input receipt fenced this claim")), "the claim-fence arm ran");
     });
   });
@@ -188,8 +188,8 @@ describe("the window between route selection and the seed leaves P's processes a
       const w = await window();
       seedFailsAfter(w, flight => { flight.steering.claimFence = () => "stale"; });
       const { before, traps } = await drive(w.r);
-    await assertPUntouched(w, before, traps);
-        assert.equal(w.r.factoryCalls.some(c => c.generation !== undefined), true, "the executor was swapped first");
+      await assertPUntouched(w, before, traps);
+      assert.equal(w.r.factoryCalls.some(c => c.generation !== undefined), true, "the executor was swapped first");
       assert.ok(logged(w.r, REFUSED).length >= 1, "the stopped-source proof of P was refused");
     });
 
@@ -197,18 +197,34 @@ describe("the window between route selection and the seed leaves P's processes a
       const w = await window();
       seedFailsAfter(w, tripSwitch);
       const { before, traps } = await drive(w.r);
-    await assertPUntouched(w, before, traps);
-        assert.equal(w.r.factoryCalls.some(c => c.generation !== undefined), true, "the executor was swapped first");
+      await assertPUntouched(w, before, traps);
+      assert.equal(w.r.factoryCalls.some(c => c.generation !== undefined), true, "the executor was swapped first");
       assert.equal(logged(w.r, "retained credential switch deferred: the restore route's predecessor is untouchable until the successor is seeded").length, 1);
     });
 
-    it("(vii) a seed failure: the guard stays armed through the stop and the teardown", async () => {
+    it("(vii) a seed failure: P is untouched through the stop and the teardown, and the guard field stays set", async () => {
       const w = await window();
       seedFailsAfter(w, () => {});
       const { before, traps } = await drive(w.r);
-    await assertPUntouched(w, before, traps);
-        assert.equal(logged(w.r, "independent restore refused; predecessor retained")[0]?.reason, "seed_failed");
+      await assertPUntouched(w, before, traps);
+      assert.equal(logged(w.r, "independent restore refused; predecessor retained")[0]?.reason, "seed_failed");
       assert.notEqual(w.flight().restorePredecessor, undefined, "P stays untouchable on every exit but the seed's success");
+    });
+
+    it("(vii-b) P's executor is refused even for explicit targets unrelated to P", async () => {
+      const w = await window();
+      const outcomes: { blocked: boolean }[] = [];
+      seedFailsAfter(w, async flight => {
+        const p = (flight.restorePredecessor as { executor: Executor }).executor;
+        const unrelated = path.join(w.r.homeRoot, "unrelated-target");
+        const runner = w.r.runner as unknown as { quiesceRun(f: unknown, e: Executor, o: unknown): Promise<{ blocked: boolean }> };
+        outcomes.push(await runner.quiesceRun(flight, p, { mode: "seed", site: "executor_arm_probe", targetPaths: [unrelated] }));
+      });
+      const { before, traps } = await drive(w.r);
+      assert.equal(outcomes.length, 1);
+      assert.equal(outcomes[0]!.blocked, true, "the request was refused");
+      assert.equal(logged(w.r, REFUSED).filter(l => l.site === "executor_arm_probe").length, 1);
+      await assertPUntouched(w, before, traps);
     });
   });
 
@@ -227,8 +243,8 @@ describe("the window between route selection and the seed leaves P's processes a
       const w = await window({ pShape: "canonical", features: PARK_FEATURES });
       park(true);
       const { before, traps } = await drive(w.r);
-    await assertPUntouched(w, before, traps);
-        assert.equal(logged(w.r, "restore unsupported predecessor held").length, 1);
+      await assertPUntouched(w, before, traps);
+      assert.equal(logged(w.r, "restore unsupported predecessor held").length, 1);
       assert.equal(w.flight().parked, true);
       assert.equal(w.flight().restoreUnsupportedHold, true);
     });
@@ -240,16 +256,16 @@ describe("the window between route selection and the seed leaves P's processes a
         return original();
       });
       const { before, traps } = await drive(w.r);
-    await assertPUntouched(w, before, traps);
-        assert.equal(logged(w.r, "restore unsupported predecessor hold unconfirmed").length, 1);
+      await assertPUntouched(w, before, traps);
+      assert.equal(logged(w.r, "restore unsupported predecessor hold unconfirmed").length, 1);
     });
 
     it("an unknown ACK (status only, no typed cause): unconfirmed, P untouched", async () => {
       const w = await window({ pShape: "canonical", features: PARK_FEATURES });
       park(false);
       const { before, traps } = await drive(w.r);
-    await assertPUntouched(w, before, traps);
-        assert.equal(logged(w.r, "restore unsupported predecessor hold unconfirmed").length, 1);
+      await assertPUntouched(w, before, traps);
+      assert.equal(logged(w.r, "restore unsupported predecessor hold unconfirmed").length, 1);
     });
 
     it("a credential switch during the park reconciliation", async () => {
@@ -260,8 +276,8 @@ describe("the window between route selection and the seed leaves P's processes a
         return original();
       });
       const { before, traps } = await drive(w.r);
-    await assertPUntouched(w, before, traps);
-        assert.equal(tripped, true);
+      await assertPUntouched(w, before, traps);
+      assert.equal(tripped, true);
       assert.equal(logged(w.r, "retained credential switch deferred: the restore route's predecessor is untouchable until the successor is seeded").length, 1);
       assert.equal(logged(w.r, "restore unsupported predecessor held").length, 0, "the switch preempted the confirmation");
     });

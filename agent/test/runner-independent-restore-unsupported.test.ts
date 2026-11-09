@@ -146,6 +146,9 @@ describe("negative controls: everything else keeps the unchanged refusal and sen
   describe("a canonical-shaped journal that fails an absence check is not a canonical candidate", () => {
     it("a stopped marker of the run", () => item7("conflicting_attribution", { pShape: "canonical" }, r => { cfgAdd(r, `uzi-stopped.${r.runId}.entry`, "{}"); })
       .then(() => undefined));
+    it("a protected descriptor key whose value names neither the run nor the clone path", () => item7("conflicting_attribution", { pShape: "canonical" }, r => {
+      cfgAdd(r, `uzi-retained.${r.runId}.journal`, "{}");
+    }).then(() => undefined));
     it("another key naming the predecessor's path", () => item7("conflicting_attribution", { pShape: "canonical" }, r => {
       cfgSet(r, "uzi-recovery.agent/issue-9998.clone", JSON.stringify({ runId: "another-run", clonePath: r.pPath }));
     }).then(() => undefined));
@@ -220,7 +223,7 @@ describe("the park acknowledgement", () => {
     await assertStoppedUntouched(r, before, traps);
   });
 
-  it("a lost ACK followed by a stale_claim replay: the claim is superseded, the hold is unconfirmed, nothing is failed", async () => {
+  it("a lost ACK followed by a stale_claim replay: the stale claim reaches its own arm, no unconfirmed-hold log, no item-7 line, nothing is failed", async () => {
     const r = await buildRig({ pShape: "canonical", features: PARK_FEATURES });
     let reports = 0;
     parkAcks(async (body, original) => {
@@ -234,9 +237,31 @@ describe("the park acknowledgement", () => {
     const seen = spyFlight(r);
     const { before, traps } = await drive(r);
     assert.equal(reports, 2, "the lost report was replayed once");
-    unconfirmed(r);
+    assert.equal(logged(r, "restore unsupported predecessor hold unconfirmed").length, 0, "a stale claim is not an unresolved hold");
+    assert.equal(logged(r, "restore unsupported predecessor held").length, 0);
+    assert.equal(logged(r, "run claim superseded server-side (stale_claim); stopping this flight").length, 1, "the stale-claim arm ran");
+    assert.equal(itemSevenLines(r).length, 0, "no refusal line is emitted for a run another claim may own");
     assert.equal(seen.flight?.restoreUnsupportedHold, true);
     assert.notEqual(seen.flight?.parked, true, "a stale replay confirms nothing");
+    assert.equal(failed(r).length, 0);
+    await assertStoppedUntouched(r, before, traps);
+  });
+
+  it("a lost ACK followed by a lost ownership probe: the ownership loss propagates, no unconfirmed-hold log, no item-7 line, nothing is failed", async () => {
+    const r = await buildRig({ pShape: "canonical", features: PARK_FEATURES });
+    parkAcks(async (body, original) => {
+      if (body.status === "recovery_wait") {
+        api.setOwnershipNotOwned(r.runId);
+        throw new Error("connection reset before the park was acknowledged");
+      }
+      return original();
+    });
+    const seen = spyFlight(r);
+    const { before, traps } = await drive(r);
+    assert.equal(logged(r, "restore unsupported predecessor hold unconfirmed").length, 0, "a lost ownership is not an unresolved hold");
+    assert.equal(logged(r, "restore unsupported predecessor held").length, 0);
+    assert.equal(itemSevenLines(r).length, 0, "no refusal line is emitted for a run another claim may own");
+    assert.notEqual(seen.flight?.parked, true);
     assert.equal(failed(r).length, 0);
     await assertStoppedUntouched(r, before, traps);
   });
