@@ -88,7 +88,7 @@ assert = lambda do |actual, expected, label|
 end
 components = %w[validate-api lint-api test-api test-api-store-it test-codex-refresh-lostreply-e2e validate-controller lint-controller test-controller validate-web test-web test-web-browser validate-agent test-agent-shard]
 context = {
-  'github.event_name' => 'pull_request', 'needs.changes.result' => 'success',
+  'github.event_name' => 'pull_request', 'github.ref' => 'refs/pull/1/merge', 'needs.changes.result' => 'success',
   'needs.changes.outputs.skip_components' => '1',
   'needs.changes.outputs.worker_uid' => 'false', 'needs.validate-agent.result' => 'success',
   'needs.test-agent-shard.result' => 'skipped', 'needs.test-agent-worker-uid.result' => 'skipped',
@@ -117,6 +117,18 @@ components.each do |job|
   # test-api-store-it uses always() (the test-agent pattern) and is asserted below.
   assert.call(run_job.call(job, 'cancelled' => true), false, "supersession cancels #{job}") unless job == 'test-api-store-it'
 end
+assert.call(jobs.key?('deadcode-api'), false, 'no deadcode job in PR/main CI (#4109: nightly)')
+assert.call(jobs.fetch('lint-api').fetch('steps').map { |step| step['run'].to_s }.join.include?('task deadcode:api'), false, 'lint-api no longer runs deadcode')
+nightly = YAML.safe_load(File.read(File.join(root, '.github/workflows/deadcode-nightly.yml')))
+assert.call(nightly.fetch('on').keys.sort, %w[schedule workflow_dispatch], 'deadcode runs nightly and on dispatch only')
+assert.call(nightly.fetch('permissions'), {'contents' => 'read'}, 'nightly deadcode token is read-only')
+dc_job = nightly.fetch('jobs').fetch('deadcode-api')
+assert.call(dc_job.key?('permissions'), false, 'the job running the Go tool keeps the read-only token')
+assert.call(dc_job.fetch('steps').map { |step| step['run'].to_s }.join.include?('task deadcode:api'), true, 'nightly runs the gate target')
+reporter = nightly.fetch('jobs').fetch('report')
+assert.call(reporter.fetch('permissions'), {'issues' => 'write'}, 'only the reporter writes issues')
+assert.call(reporter.fetch('steps').any? { |step| step['uses'].to_s.include?('checkout') }, false, 'the reporter checks out no code')
+assert.call(reporter.fetch('if').include?("github.ref == 'refs/heads/main'"), true, 'the reporter files only for main')
 assert.call(jobs.fetch('lint-repo').key?('needs'), false, 'repo gate remains independent')
 assert.call(jobs.fetch('lint-repo').key?('if'), false, 'repo gate remains unconditional')
 assert.call(workflow.fetch('on').keys.sort, %w[pull_request push], 'triggers unchanged')

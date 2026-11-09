@@ -10,6 +10,7 @@ rules:
   self-repository:
     ignore:
       - ci.yml
+      - deadcode-nightly.yml
       - main-guard.yml
       - pricing-freshness.yml
       - release.yml
