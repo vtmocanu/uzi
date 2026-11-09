@@ -27,7 +27,8 @@ import { portableTeardownTestDeps } from "./teardown-fixtures.js";
 import { testLockOptions } from "./authority-test-support.js";
 import { quiesceRunAttempt, type QuiesceRunRequest } from "../src/run-quiescence.js";
 import { SteeringChannel } from "../src/steering.js";
-import type { PlanCrossCheckStateRequest } from "../src/client.js";
+import { RequestError, type PlanCrossCheckStateRequest } from "../src/client.js";
+import { setTimeout as delay } from "node:timers/promises";
 import type { OutgoingMessage } from "../src/protocol.js";
 import type { Logger } from "../src/log.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
@@ -57,6 +58,9 @@ const NORMALIZED = "# PLAN\n- server normalized proposal";
 const digest = "a".repeat(64);
 const child = "11111111-1111-4111-8111-111111111111";
 const timing = { preparationMs: 100, backoffMs: [1, 2] as const, requestMs: 100, pollMs: 5 };
+/** Issue #4099: a first preparation that must deliver an owed backlog gets the production budget (also the
+ *  gate's cap), so a loaded runner does not expire it; expiry cases keep `timing`. */
+const preparedTiming = { ...timing, preparationMs: 3000 };
 const SHA = "cafef00dcafef00dcafef00dcafef00dcafef00d";
 // Runner paths that reach native planning capture walk Linux /proc; Linux CI runs them.
 const LINUX_CAPTURE = process.platform !== "linux" && "Linux /proc capture required";
@@ -126,9 +130,10 @@ interface DriveControl {
 }
 /** Observe the candidate reservation (reserve/release), landed state reports and landed messages in
  *  ONE ordered list. Returns the restore function for the shared batcher prototype. */
-function observe(runId: string, tl: Timeline, opts: { prefix?: string; failAfterRelease?: boolean; healAtReserve?: boolean } = {}) {
+function observe(runId: string, tl: Timeline, opts: { prefix?: string; failAfterRelease?: boolean; heal?: () => void } = {}) {
   const reserve = MessageBatcher.prototype.reserveCandidateTransport;
   const reservations = { installed: 0, released: 0 };
+  let ownedAtReserve = false;
   const noteRelease = (): void => {
     reservations.released++; tl.events.push("release");
     // The held events were assigned seqs by the release: fail their first flush (assigned replay).
@@ -140,7 +145,12 @@ function observe(runId: string, tl: Timeline, opts: { prefix?: string; failAfter
       api.failMessagesNext(1);
     }
     // Deliveries failed until now (the owed assigned replay); the reservation's prepare can land them.
-    if (opts.healAtReserve) api.failMessagesNext(0);
+    // Issue #4099: a failed background flush still owned here would fail the first preparation
+    // ("owned request failed") whatever its budget; record it so the case fails by name.
+    if (opts.heal) {
+      ownedAtReserve ||= (this as unknown as { inFlight?: Promise<void> }).inFlight !== undefined;
+      opts.heal();
+    }
     const reservation = reserve.call(this);
     reservations.installed++;
     tl.events.push("reserve");
@@ -175,7 +185,7 @@ function observe(runId: string, tl: Timeline, opts: { prefix?: string; failAfter
     tl.events.push(`state:${b.status}`);
     tl.callsAt[b.status] ??= tl.counter.calls;
   });
-  return { reservations, refused, restore: () => {
+  return { reservations, refused, ownedAtReserve: () => ownedAtReserve, restore: () => {
     MessageBatcher.prototype.reserveCandidateTransport = reserve;
     MessageBatcher.prototype.emit = emit;
     client.postMessages = post;
@@ -283,6 +293,9 @@ interface DriveOpts {
   /** An owed assigned replay: a status emitted (and so seq-assigned) during planning whose delivery keeps
    *  failing until the reservation installs, whose prepare then delivers it before the candidate is submitted. */
   owed?: string;
+  /** Issue #4099: delay the first owed delivery after the reservation installs (a loaded runner), honouring
+   *  the preparation's own expiry signal. */
+  owedDeliveryDelayMs?: number;
   dropFirstPost?: boolean;
   /** Reject the human gate once the give-up is confirmed (a gate left presented by the old claim). */
   rejectAfterGiveUp?: boolean;
@@ -417,11 +430,24 @@ async function drive(o: DriveOpts) {
   const tl: Timeline = { events: [], callsAt: {}, counter };
   const failedPosts = { count: 0 };
   const realPost = client.postMessages;
+  // Issue #4099: owed deliveries fail at call time, with no I/O, rather than through the HTTP fake, so a
+  // failing background flush settles before any later macrotask can install the reservation.
+  const owedFailing = { on: false };
+  let owedDelayed = false;
   if (o.owed) client.postMessages = async (...args: Parameters<typeof realPost>) => {
+    if (owedFailing.on && args[0] === c.run_id) {
+      failedPosts.count++;
+      throw new RequestError("POST", `/api/worker/runs/${c.run_id}/messages`, 503, JSON.stringify({ error: "injected failure" }));
+    }
+    if (o.owedDeliveryDelayMs !== undefined && !owedDelayed && args[0] === c.run_id && probe.reservations.installed > 0) {
+      owedDelayed = true;
+      await delay(o.owedDeliveryDelayMs, undefined, { signal: args[3] });
+    }
     try { return await realPost.apply(client, args); }
     catch (error) { if (args[0] === c.run_id) failedPosts.count++; throw error; }
   };
-  const probe = observe(c.run_id, tl, { failAfterRelease: o.failAfterRelease, prefix: o.prefix, healAtReserve: o.owed !== undefined });
+  const probe = observe(c.run_id, tl, { failAfterRelease: o.failAfterRelease, prefix: o.prefix,
+    ...(o.owed ? { heal: () => { owedFailing.on = false; } } : {}) });
   const switchSeen = watchSwitchDelivery();
   const decided = new Map<number, ReturnType<typeof answer>>();
   const leadSeqs: number[] = [];
@@ -543,7 +569,7 @@ async function drive(o: DriveOpts) {
   const exec: Executor = { run: async (ctx) => {
     emit = ctx.emit;
     if (o.owed) {
-      api.failMessagesNext(1000);
+      owedFailing.on = true;
       ctx.emit({ kind: "status", payload: { text: o.owed } });
       assert.ok(await until(() => failedPosts.count > 0), "the assigned replay's first delivery failed");
     }
@@ -579,6 +605,8 @@ async function drive(o: DriveOpts) {
     probe.restore(); client.postMessages = realPost; client.reportPlanCrossCheckGateState = report; api.failMessagesNext(0);
     client.getRunOwnership = ownership;
   }
+  if (o.owed) assert.equal(probe.ownedAtReserve(), false,
+    "no failed owed flush was still owned when the reservation installed (it would fail the first preparation)");
   const heldSeqs = api.messages(c.run_id).filter((m) => (m.payload as { text?: string }).text?.startsWith("held during"))
     .map((m) => m.seq);
   return { c, tl, counter, forge, probe, storage, attempts, sentinel, trace, cancelIds, gaveUp: () => gaveUp, heldSeqs, leadSeqs,
@@ -1051,7 +1079,9 @@ function assertReplayThenHeld(d: Driven, prefix: string): void {
 }
 
 describe("issue #3953 m3: an assigned replay and held unassigned events together", () => {
-  const combined: Omit<DriveOpts, "capture"> = { switchRounds: [1], emitHeld: true, owed: "assigned replay", failAfterRelease: true };
+  // The first preparation delivers the owed backlog, so it runs on the production budget (issue #4099).
+  const combined: Omit<DriveOpts, "capture"> = { switchRounds: [1], emitHeld: true, owed: "assigned replay", failAfterRelease: true,
+    runnerOpts: { planCrossCheckTiming: preparedTiming } };
 
   it("S1 release: replay then held events are delivered once before the release report; the next claim continues the seqs", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
     const d = await drive({ capture: "release", ...combined });
@@ -1084,7 +1114,8 @@ describe("issue #3953 m3: an assigned replay and held unassigned events together
   });
 
   it("S1 give-up: replay then held events are delivered once and the adopted approve continues the run", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
-    const d = await drive({ capture: "giveup", ...combined });
+    // Issue #4099: the owed delivery is slowed past the old 100 ms budget, as on a loaded runner.
+    const d = await drive({ capture: "giveup", ...combined, owedDeliveryDelayMs: 400 });
     assertServicedAfterRelease(d);
     assert.deepEqual(d.attempts, ["attempt", "gave_up"]);
     assertReplayThenHeld(d, "assigned replay");
