@@ -34,6 +34,12 @@ function loseOwnershipAt(r: Rig, target: object, method: string): void {
   });
 }
 
+/** An executor distinct from the rig's initial one: with a shared executor the seed's own quiesce sweep is refused as
+ *  touching the predecessor and the seed never becomes durable. */
+function distinctSuccessor(): Executor {
+  return Object.create(new StubExecutor(nullLogger())) as Executor;
+}
+
 function captureFlight(r: Rig): { flight?: Record<string, unknown> } {
   const holder: { flight?: Record<string, unknown> } = {};
   const runner = r.runner as unknown as { registerEvidenceExecutor(f: Record<string, unknown>): void };
@@ -62,7 +68,7 @@ describe("ownership is confirmed around the independent restore seed (issue #364
   });
 
   it("a claim the server moved after the seed keeps S: the restore entry stays, the stop is nonterminal and the next claim is refused", async () => {
-    const r = await buildRig({ addrAware: true });
+    const r = await buildRig({ addrAware: true, successorExecutor: distinctSuccessor() });
     const original = git.seedIndependentAttempt.bind(git);
     mock.method(git, "seedIndependentAttempt", async (...args: Parameters<typeof original>) => {
       const seeded = await original(...args);
@@ -75,6 +81,10 @@ describe("ownership is confirmed around the independent restore seed (issue #364
     assert.equal(r.counters.ran, 0, "no model turn on S");
     const value = parseRestoreValue(cfgGet(r, restoreKey)!);
     assert.equal(value.kind, "entry", "S's restore entry is preserved");
+    assert.equal(value.kind === "entry" ? value.stage : undefined, "ready", "the seed completed: the entry is past seeding");
+    assert.equal(refusals(r).length, 0, "the seed was not refused");
+    // The "seeded" note is emitted after the post-adoption ownership check, so a lost claim stops before it.
+    assert.equal(logged(r, "independent restore seeded").length, 0, "the stop came before the seeded note");
     assert.equal(fs.existsSync(markerFile(r)), true);
     assert.equal(cfgAll(r, r.ledgerKey).length, 2, "P's and S's ledger entries");
     assert.equal(holder.flight!.preserveRecoveryClone, true);
@@ -90,18 +100,97 @@ describe("ownership is confirmed around the independent restore seed (issue #364
   });
 
   it("a control error once the seed is durable sets every preserve flag before it is rethrown", async () => {
-    const r = await buildRig({ addrAware: true });
+    const r = await buildRig({ addrAware: true, successorExecutor: distinctSuccessor() });
     const runner = r.runner as unknown as { bindFlightSource(...a: unknown[]): Promise<void> };
     mock.method(runner, "bindFlightSource", async () => { throw new CredentialSwitchSignal(); });
     const holder = captureFlight(r);
     await r.runner.execute(r.claim);
     assert.equal(logged(r, "independent restore seeded").length, 0, "the failure came before the seeded note");
-    assert.equal(parseRestoreValue(cfgGet(r, restoreKey)!).kind, "entry", "the seed is durable");
+    const value = parseRestoreValue(cfgGet(r, restoreKey)!);
+    assert.equal(value.kind, "entry", "the seed is durable");
+    assert.equal(value.kind === "entry" ? value.stage : undefined, "ready", "the seed completed: the entry is past seeding");
+    assert.equal(refusals(r).length, 0, "the seed was not refused");
     const f = holder.flight!;
     assert.equal(f.preserveRecoveryClone, true);
     assert.equal(f.preserveSession, true);
     assert.equal(f.keepGuardedInventoryOpen, true);
     assert.equal(f.retainedLocalCustody, true);
+  });
+});
+
+describe("a generic failure handing the seeded attempt to the flight keeps S and refuses the next claim (issue #3644 m4)", () => {
+  /** Drives a claim whose seed is durable and whose hand-off to the flight fails with a plain (non-control) Error, then a later
+   *  claim; asserts the first is a nonterminal stop with S kept and the second writes nothing. */
+  async function failAfterSeed(inject: (r: Rig, boom: Error) => void): Promise<void> {
+    // A successor executor distinct from the initial one: with a shared executor the seed's own quiesce sweep is refused as
+    // touching the predecessor and the seed never happens.
+    const successorExecutor = Object.create(new StubExecutor(nullLogger())) as Executor;
+    const r = await buildRig({ addrAware: true, successorExecutor });
+    const boom = new Error("injected generic failure after the seed");
+    inject(r, boom);
+    const holder = captureFlight(r);
+    await r.runner.execute(r.claim);
+    assert.equal(failed(r).length, 0, "no failed report");
+    assert.equal(api.states.filter(s => s.runId === r.runId && s.body.status === "completed").length, 0);
+    assert.equal(r.logs.lines.filter(l => /could not be handed to the flight/.test(String((l as { msg: string }).msg))).length, 1, "the injected failure fired");
+    assert.equal(r.counters.ran, 0, "no model turn on S");
+    assert.equal(logged(r, "independent restore seeded").length, 0, "the failure came before the seeded note");
+    const f = holder.flight!;
+    assert.equal(f.preserveRecoveryClone, true);
+    assert.equal(f.preserveSession, true);
+    assert.equal(f.keepGuardedInventoryOpen, true);
+    assert.equal(f.retainedLocalCustody, true);
+    const value = parseRestoreValue(cfgGet(r, restoreKey)!);
+    assert.equal(value.kind, "entry", "S's restore entry is kept");
+    assert.equal(value.kind === "entry" ? value.stage : undefined, "ready", "the seed completed: the entry is past seeding");
+    assert.equal(refusals(r).length, 0, "the seed was not refused");
+    const ledger = cfgAll(r, r.ledgerKey);
+    assert.equal(ledger.length, 2, "P's and S's ledger entries");
+    const s = JSON.parse(ledger[1]!) as { clonePath: string; state: string };
+    assert.notEqual(s.clonePath, r.pPath);
+    assert.equal(s.state, "live", "S's ledger entry is not retired");
+    assert.equal(fs.existsSync(s.clonePath), true, "S's attempt clone directory exists");
+    assert.equal(fs.existsSync(markerFile(r)), true);
+
+    const config = configText(r);
+    const entry = cfgGet(r, restoreKey);
+    const sDigest = treeDigest(s.clonePath);
+    const before = await snapshot(r);
+    const logsBefore = r.logs.lines.length;
+    mock.restoreAll();
+    api.setOwnershipStatus(r.runId, "running", 3);
+    await r.runner.execute({ ...r.claim, claim_generation: 3 });
+    assert.equal(logged(r, "restore entry present; claim stopped").length, 1, "the next claim stops on S's live restore entry");
+    assert.ok(r.logs.lines.length > logsBefore);
+    assert.equal(failed(r).length, 0);
+    assert.equal(configText(r), config, "the bare's config is byte-identical");
+    assert.equal(cfgGet(r, restoreKey), entry);
+    assert.deepEqual(cfgAll(r, r.ledgerKey), ledger);
+    assert.equal(treeDigest(s.clonePath), sDigest, "S's clone is byte-identical");
+    assert.deepEqual(await snapshot(r), before, "P's key, slot, clone, HOME and provision are unchanged");
+    assert.equal(logged(r, "independent restore seeded").length, 0);
+    assert.equal(r.factoryCalls.filter(c => c.generation === 3).length, 0, "no successor executor was built for the next claim");
+  }
+
+  it("bindFlightSource failing with a plain Error stops nonterminally with S kept; the next claim stops on the live entry and writes nothing", async () => {
+    await failAfterSeed((r, boom) => {
+      const runner = r.runner as unknown as { bindFlightSource(...a: unknown[]): Promise<void> };
+      const original = runner.bindFlightSource.bind(runner);
+      mock.method(runner, "bindFlightSource", async (...args: unknown[]) => {
+        if (args[1] !== r.pPath) throw boom;
+        return original(...args);
+      });
+    });
+  });
+
+  it("markRecoveryCapture failing with a plain Error for S's path stops nonterminally with S kept; the next claim stops on the live entry and writes nothing", async () => {
+    await failAfterSeed((r, boom) => {
+      const original = git.markRecoveryCapture.bind(git);
+      mock.method(git, "markRecoveryCapture", async (...args: Parameters<typeof original>) => {
+        if (args[1] !== r.pPath) throw boom;
+        return original(...args);
+      });
+    });
   });
 });
 

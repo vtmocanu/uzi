@@ -224,7 +224,7 @@ describe("the restored attempt completes through the certified completion path (
   }
 
   /** The certified completion of a restored attempt (P unpinned work, S through checkpoint, PR and receipt). Returns the rig and the facts. */
-  async function completeRestore(t: TestContext) {
+  async function completeRestore(t: TestContext, interrupt?: { arm: (r: Rig) => void; resume?: boolean }) {
     api.setRegisterProtocolFeatures(FEATURES);
     const forge = fakeGitlab();
     let finalHead = "", checkpointHead = "", clone = "";
@@ -294,6 +294,13 @@ describe("the restored attempt completes through the certified completion path (
     });
     const retires = t.mock.method(git, "retireRunnerClone");
     const before = await pFacts(r);
+    if (interrupt) {
+      // A crash window: the caller injects the interruption; nothing below asserts the happy path.
+      interrupt.arm(r);
+      await r.runner.execute(claim);
+      if (interrupt.resume) await r.runner.resumePendingRecoveries();
+      return { r, claim, clone, before, checkpointHead, finalHead, retires, registration };
+    }
     await r.runner.execute(claim);
     assert.equal(failed(r).length, 0, JSON.stringify(api.states.filter(s => s.body.status === "failed").map(s => s.body)));
     assert.equal(api.states.filter(s => s.body.status === "completed").length, 1);
@@ -333,6 +340,111 @@ describe("the restored attempt completes through the certified completion path (
     assert.deepEqual(await pFacts(r), after.p);
     assert.equal(fs.readFileSync(markerFile(r), "utf8"), after.marker);
     assert.equal(cfgGet(r, r.journalKey), before.journal, "P's key is never cleared");
+  });
+
+  // ---- crash windows of the completion path: a restart meets a half-retired S and must neither seed nor touch anything ----
+  /** A restarted worker: a fresh runner over a fresh-incarnation authority on the same data dir and bare. */
+  function restarted(r: Rig): Rig["runner"] {
+    const again = new AuthorityRuntime({ lifetime: r.lifetime, workerToken: AUTH_TOKEN, workerIncarnation: randomUUID(), timeoutMs: 5000 });
+    return runnerWith(() => ({ executor: r.executor, homeDir: r.runHome }), fakeGitlab().gitlab, AUTH_TOKEN, r.logs.logger, {
+      authority: again, codexBoundaryDeadlineMs: 5000, recoveryRetryMs: 5, independentRestore: true,
+      restoreIdentity: { procRoot: r.sProc, hostname: () => CID.slice(0, 12) } });
+  }
+
+  /** The next claim after a restart stops nonterminally, never seeds and writes nothing to P or S. */
+  async function assertRestartStopsUntouched(r: Rig, claim: Rig["claim"], sClone: string): Promise<void> {
+    const config = configText(r);
+    const entry = cfgGet(r, restoreKey);
+    const ledger = cfgAll(r, r.ledgerKey);
+    const marker = fs.existsSync(markerFile(r)) ? fs.readFileSync(markerFile(r), "utf8") : undefined;
+    const p = await pFacts(r);
+    const sDigest = fs.existsSync(sClone) ? treeDigest(sClone) : undefined;
+    const dirs = fs.readdirSync(path.dirname(r.pPath)).sort();
+    const seededBefore = logged(r, "independent restore seeded").length;
+    const factoryBefore = r.factoryCalls.length;
+    const completedBefore = api.states.filter(s => s.runId === r.runId && s.body.status === "completed").length;
+    const stopsBefore = logged(r, "restore entry present; claim stopped").length;
+    const runner2 = restarted(r);
+    api.setOwnershipStatus(r.runId, "running", 3);
+    await runner2.execute({ ...claim, claim_generation: 3 });
+    assert.equal(logged(r, "restore entry present; claim stopped").length, stopsBefore + 1, "the claim stopped on S's live restore entry");
+    assert.equal(failed(r).length, 0, "no failed report");
+    assert.equal(api.states.filter(s => s.runId === r.runId && s.body.status === "completed").length, completedBefore, "no new completed report");
+    assert.equal(logged(r, "independent restore seeded").length, seededBefore, "no new seed");
+    assert.equal(r.factoryCalls.length, factoryBefore, "no executor was built for the restarted claim");
+    assert.equal(cfgAll(r, r.ledgerKey).length, ledger.length, "no new attempt ledger entry");
+    assert.deepEqual(cfgAll(r, r.ledgerKey), ledger, "the attempt ledger is unchanged");
+    assert.equal(cfgGet(r, restoreKey), entry, "S's restore value is byte-identical");
+    assert.equal(configText(r), config, "the bare's config is byte-identical");
+    assert.deepEqual(await pFacts(r), p, "P's key, slot, clone, HOME and provision are unchanged");
+    assert.equal(fs.existsSync(markerFile(r)) ? fs.readFileSync(markerFile(r), "utf8") : undefined, marker);
+    assert.equal(fs.existsSync(sClone) ? treeDigest(sClone) : undefined, sDigest, "S's clone is byte-identical");
+    assert.deepEqual(fs.readdirSync(path.dirname(r.pPath)).sort(), dirs, "no new attempt directory");
+  }
+
+  it("crash between the completion source fence and its publication: a restarted worker stops nonterminally, never seeds, and S stays a fenced entry", async t => {
+    const fired: string[] = [];
+    const { r, claim, clone, before } = await completeRestore(t, { arm: () => {
+      const original = git.installCompletionSourceFence.bind(git);
+      t.mock.method(git, "installCompletionSourceFence", async (...args: Parameters<typeof original>) => {
+        await original(...args);
+        fired.push("fence installed");
+        throw new Error("simulated crash right after the completion source fence");
+      });
+    } });
+    assert.deepEqual(fired, ["fence installed"], "the fence was written and the flight died right after it");
+    // The window is on disk: S's entry carries the fence, nothing was published or retired.
+    const fenced = restoreValue(r);
+    assert.equal(fenced.kind, "entry", "S's entry is not a tombstone");
+    assert.equal(fenced.kind === "entry" ? fenced.stage : undefined, "ready");
+    assert.notEqual(fenced.kind === "entry" ? fenced.remainder.completionSourceFence : undefined, undefined, "S's journal carries its completion source fence");
+    // The flight degrades to an unpublished source (it may still report completion); the slot never reached its published state.
+    const slot = await slotOf(r, clone);
+    assert.notEqual(slot?.state, "claude_ready", "the slot never reached its published state");
+    assert.equal(slot?.publication ?? null, null, "no publication was committed");
+    const sLedger = cfgAll(r, r.ledgerKey).map(l => JSON.parse(l) as { clonePath: string; state: string }).find(l => l.clonePath === clone);
+    assert.equal(sLedger?.state, "live", "S is not retired");
+    assert.equal(fs.existsSync(clone), true, "S's clone is still there");
+    t.mock.restoreAll();
+    assert.deepEqual(await pFacts(r), before, "P is untouched by the crashed completion");
+    const fenceRaw = JSON.stringify((fenced as { remainder: Record<string, unknown> }).remainder.completionSourceFence);
+    await assertRestartStopsUntouched(r, claim, clone);
+    const after = restoreValue(r);
+    assert.equal(after.kind, "entry");
+    assert.equal(JSON.stringify((after as { remainder: Record<string, unknown> }).remainder.completionSourceFence), fenceRaw, "S's fence is intact");
+  });
+
+  it("retirement interrupted between the S ledger `retired` and the tombstone: the entry stays ready, a restarted worker stops nonterminally and never seeds", async t => {
+    const fired: Array<{ ledger: string | undefined; fromRetire: boolean }> = [];
+    let sPath = "";
+    const { r, claim, clone, before } = await completeRestore(t, { arm: r2 => {
+      const target = git as unknown as { advanceRestoreEntryUnderLock(...a: unknown[]): Promise<void> };
+      const original = target.advanceRestoreEntryUnderLock.bind(git);
+      t.mock.method(target, "advanceRestoreEntryUnderLock", async (...args: unknown[]) => {
+        if (args[2] === "retired") {
+          const entries = cfgAll(r2, r2.ledgerKey).map(l => JSON.parse(l) as { clonePath: string; state: string });
+          const last = entries.filter(e => e.clonePath !== r2.pPath).pop();
+          sPath = last?.clonePath ?? "";
+          fired.push({ ledger: last?.state, fromRetire: (new Error().stack ?? "").includes("retireRunnerClone") });
+          // Persistent (not EIO, so the one-shot metadata retry does not apply): the tombstone write never lands.
+          throw new Error("simulated crash before the tombstone");
+        }
+        return original(...args);
+      });
+    }, resume: true });
+    t.mock.restoreAll();
+    assert.ok(fired.length >= 1, "the retirement's tombstone write was reached");
+    assert.deepEqual(fired.filter(f => f.ledger !== "retired" || !f.fromRetire), [], "every injected call is the completion retirement's, after the ledger said retired");
+    assert.equal(sPath, clone);
+    // On disk: the window.
+    const entry = restoreValue(r);
+    assert.equal(entry.kind, "entry", "the successor is still an entry, not a tombstone");
+    assert.equal(entry.kind === "entry" ? entry.stage : undefined, "ready", "restoreStage is still ready");
+    const sLedger = cfgAll(r, r.ledgerKey).map(l => JSON.parse(l) as { clonePath: string; state: string }).filter(l => l.clonePath === clone);
+    assert.equal(sLedger.at(-1)?.state, "retired", "S's matching ledger entry is retired");
+    assert.deepEqual(await pFacts(r), before, "P is untouched");
+    await assertRestartStopsUntouched(r, claim, clone);
+    assert.equal(restoreValue(r).kind, "entry", "still no tombstone after the restart");
   });
 
   // ---- 3.9: the predecessor's generation G stays held after S has stopped executing ------------------------------------------
