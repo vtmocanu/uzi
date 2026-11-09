@@ -8,8 +8,8 @@
 # requires: UZI_WORKER_TOKEN
 # provides: -
 # handoff:  -
-# mutates: owner autopilot disabled; group/repo2 enabled; agent cap 2; creates cap-test runs
-# restores: owner autopilot stays disabled to isolate later phases; repo2 stays enabled and agent stays at cap 2 for the next phase
+# mutates: owner autopilot disabled; group/repo2 enabled; agent cap 2; creates cap-test runs; wires the DinD sidecar for the cap-2 and kill scenarios when the stack is not already wired (starts dind/dind-init, appends UZI_DIND_SOCKET to $ENVFILE, force-recreates agent); a fresh canonical-control run is killed, refused and cancelled after the posture is restored
+# restores: owner autopilot stays disabled to isolate later phases; repo2 stays enabled and agent stays at cap 2 for the next phase; the entry Docker posture (docker_restore_posture: stops and removes only the sidecar services this phase started, removes only the env line it appended, then force-recreates agent and asserts it unwired; nothing changes when the stack was already wired); open custody holds left <= the entry census
 # =============================================================================
 # PRD #42 — bounded worker concurrency (cap 2). ADDITIVE + LAST: the entire suite
 # above ran the single worker at the DEFAULT cap (1 — the pre-#42 serial loop),
@@ -77,6 +77,11 @@ else
   # via phase 13's `provides` round-trip (see `requires: UZI_WORKER_TOKEN` above), so the
   # force-recreated container re-reads the SAME join token and re-registers into its
   # existing row; without the provide it would read the --env-file placeholder and 401.
+  #
+  # #3644: the kill scenarios below need attempt-shaped predecessors, and the agent resolves its Docker
+  # wiring once at startup, so wire the DinD sidecar BEFORE this recreate (docker_wire_prepare starts it
+  # and appends UZI_DIND_SOCKET; this recreate is the one that picks it up) and assert it right after.
+  docker_wire_prepare
   printf 'UZI_E2E_MAX_CONCURRENT_RUNS=2\n' >> "$ENVFILE"
   capture_agent_logs 45-bounded-concurrency before-recreate-cap2
   "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null
@@ -93,6 +98,13 @@ else
   done
   [ "$CAP" = 2 ] || fail "worker did not advertise max_concurrent_runs=2 after recreate (got ${CAP:-none})"
   pass "worker back online advertising cap 2"
+  # Before any run exists: the new container wired the sidecar and registered the docker capability.
+  docker_wire_assert
+
+  # Entry custody census: this phase must leave no more open holds than it found (asserted at the end).
+  E45="$(hold_open_count)" || fail "phase 45: cannot read the entry open custody hold count"
+  log_hold_census "phase 45 entry (E45=$E45)"
+  wait_custody_headroom 2
 
   # --- (b) two runs on two DIFFERENT repos, genuinely concurrent ---------------
   say "PRD #42: two runs on two different repos → both reach the gate concurrently (cap-1 could not)"
@@ -146,6 +158,11 @@ else
   apipost "/api/runs/$RUN_B/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
   wait_status "$RUN_A" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
   wait_status "$RUN_B" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+  # Completed precedes the worker's final custody ACK: wait for each run's own receipt so the census
+  # returns to the entry baseline before the kill scenario needs admission headroom.
+  wait_completed_custody_receipt "$RUN_A"
+  wait_completed_custody_receipt "$RUN_B"
+  log_run_hold_census "after runs A and B" "$RUN_A" "$RUN_B"
   FA="$(apiget "/api/runs/$RUN_A")"; FB="$(apiget "/api/runs/$RUN_B")"
   [ "$(echo "$FA" | jq -r '.run.branch')" = "agent/issue-$IID_A" ] || fail "run A branch mismatch"
   [ "$(echo "$FB" | jq -r '.run.branch')" = "agent/issue-$IID_B" ] || fail "run B branch mismatch"
@@ -194,6 +211,7 @@ else
   # in the env-file), so the sweeper's worker-loss recovery is bounded here with no dedicated
   # api recreate — 15s is still 3× the 5s heartbeat, so a LIVE worker is never spuriously swept.
 
+  wait_custody_headroom 2
   IID_KA="$(apipost "/api/repos/$REPO_ID/issues" \
     '{"title":"E2E cap2 kill A","description":"implements prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"
   IID_KB="$(apipost "/api/repos/$REPO2_ID/issues" \
@@ -207,6 +225,10 @@ else
   pass "two fresh runs in-flight (both parked at the gate, each holding a slot)"
   GEN_KA_ORIGINAL="$(db_psql "SELECT claim_generation FROM runs WHERE id='$RUN_KA'")"
   GEN_KB_ORIGINAL="$(db_psql "SELECT claim_generation FROM runs WHERE id='$RUN_KB'")"
+  # The wired worker seeds attempt-shaped predecessors (attemptId in the journal, a `.attempt-` clone path).
+  # Prove that before the kill, so the restore assertions below cannot pass on a canonical predecessor.
+  restore_check_p_shape "$RUN_KA" "agent/issue-$IID_KA" attempt || fail "phase 45: predecessor of run KA is not attempt-shaped before the kill"
+  restore_check_p_shape "$RUN_KB" "agent/issue-$IID_KB" attempt || fail "phase 45: predecessor of run KB is not attempt-shaped before the kill"
 
   # Hard-kill the agent: no graceful drain, no re-register — only the server-side
   # sweeper can recover the two orphaned runs. Do NOT restart the worker yet, so
@@ -253,9 +275,49 @@ else
   { [ "$MRKA" != null ] && [ "$MRKA" -gt 0 ] && [ "$MRKB" != null ] && [ "$MRKB" -gt 0 ]; } \
     || fail "re-queued runs must still land their MRs after the restart (got A=$MRKA B=$MRKB)"
   pass "both re-queued runs completed after restart (requeue_count>=1), MRs !$MRKA + !$MRKB"
+  # The successor generation's own custody hold is released at completion: observe that, per run.
+  wait_completed_custody_receipt "$RUN_KA"
+  wait_completed_custody_receipt "$RUN_KB"
   # The phase created and killed these exact originals. Their preservation was
   # asserted above; now record the fixture owner's decision, keeping ready archives.
   resolve_fixture_source_hold "$RUN_KA" "$GEN_KA_ORIGINAL"
   resolve_fixture_source_hold "$RUN_KB" "$GEN_KB_ORIGINAL"
+  log_run_hold_census "after the KA/KB discards" "$RUN_KA" "$RUN_KB"
+
+  # --- ISOLATED CANONICAL CONTROL (#3644) ---------------------------------------------------------
+  # Runs only after the sidecar and env line this phase added are gone and the FINAL agent container
+  # proved unwired (docker_restore_posture step 4), and only after the KA/KB discards above, so its
+  # custody admission and attribution are its own. A fresh issue is a fresh, never-wired branch key: the
+  # predecessor is canonical-shaped ({runId, clonePath}), which this release does not restore independently.
+  docker_restore_posture
+  say "#3644 canonical control: a canonical-shaped predecessor killed mid-gate is refused, not restored"
+  wait_custody_headroom 1
+  IID_C="$(apipost "/api/repos/$REPO_ID/issues" \
+    '{"title":"E2E canonical control","description":"implements prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"
+  [ -n "$IID_C" ] && [ "$IID_C" != null ] || fail "could not create the canonical control issue"
+  RUN_C="$(create_run "$REPO_ID" "$IID_C")" || fail "canonical control run-create failed (non-transient; see stderr)"
+  [ -n "$RUN_C" ] && [ "$RUN_C" != null ] || fail "the canonical control run was not created"
+  wait_status "$RUN_C" awaiting_approval
+  GEN_C_ORIGINAL="$(db_psql "SELECT claim_generation FROM runs WHERE id='$RUN_C'")"
+  restore_check_p_shape "$RUN_C" "agent/issue-$IID_C" canonical || fail "phase 45: predecessor of the canonical control is not the canonical {runId, clonePath} shape"
+  pass "canonical control run $RUN_C parked at the gate with a canonical-shaped predecessor"
+  AGENT_IDENTITY_BEFORE_C="$(restore_agent_identity)" || fail "phase 45: cannot read the agent container identity before the canonical kill"
+  capture_agent_logs 45-bounded-concurrency before-sigkill-canonical
+  "${COMPOSE[@]}" kill -s KILL agent >/dev/null
+  wait_status "$RUN_C" queued 60
+  capture_agent_logs 45-bounded-concurrency before-restart-canonical
+  "${COMPOSE[@]}" up -d --wait agent >/dev/null
+  wait_worker_online
+  restore_assert_agent_identity "phase 45 canonical kill/start" "$AGENT_IDENTITY_BEFORE_C"
+  wait_status "$RUN_C" recovery_wait 90
+  restore_assert_canonical_refusal "$RUN_C" "$((GEN_C_ORIGINAL + 1))" 90
+  sleep 6 # three sweep ticks: the hold must not promote or re-claim on its own
+  restore_assert_canonical_refusal "$RUN_C" "$((GEN_C_ORIGINAL + 1))" 10
+  # Owner Cancel keeps the recovery evidence; then record the fixture owner's decision for both generations.
+  apipost "/api/runs/$RUN_C/inputs" '{"kind":"cancel","body":""}' >/dev/null
+  wait_status "$RUN_C" cancelled 30
+  resolve_fixture_source_hold "$RUN_C" "$GEN_C_ORIGINAL"
+  resolve_fixture_source_hold "$RUN_C" "$((GEN_C_ORIGINAL + 1))"
   log_hold_census "after phase 45"
+  assert_hold_count_le "phase 45 exit" "$E45"
 fi

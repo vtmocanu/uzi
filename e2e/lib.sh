@@ -388,6 +388,232 @@ log_custody_entry_census() {
   done
   return 0
 }
+# hold_open_count — the owner's open custody hold count as the API aggregate reports it (an integer, or non-zero).
+hold_open_count() {
+  apiget /api/recovery/holds | jq -er '.aggregate.open_holds | select(type == "number" and . >= 0 and . == floor)'
+}
+# assert_hold_count_le LABEL BASELINE — the open custody hold count has not grown past a measured entry baseline.
+assert_hold_count_le() {
+  local label="$1" baseline="$2" count
+  [[ "$baseline" =~ ^[0-9]+$ ]] || fail "hold census ($label): invalid baseline [$baseline]"
+  count="$(hold_open_count)" || fail "hold census ($label): the open hold count is unreadable"
+  if [ "$count" -gt "$baseline" ]; then
+    log_hold_census "$label"
+    fail "hold census ($label): $count open custody holds exceed the entry baseline $baseline"
+  fi
+  pass "hold census ($label): $count open custody holds, entry baseline $baseline"
+}
+# log_run_hold_census LABEL RUN... — logging only: each run's custody holds (generation, state, attention),
+# attributed by run id. Never fails.
+log_run_hold_census() {
+  local label="$1" run snap
+  shift
+  snap="$(apiget /api/recovery/holds)" || { echo "run hold census ($label): holds unreadable"; return 0; }
+  for run in "$@"; do
+    [ -n "$run" ] || continue
+    printf '%s' "$snap" | jq -r --arg l "$label" --arg r "$run" '"run hold census (\($l)): run \($r): " + (
+      [.holds[] | select(.run_id == $r) | "(generation=\(.generation) state=\(.state) attention=\(.attention))"]
+      | if length == 0 then "none" else join(" ") end)' || echo "run hold census ($label): holds of run $run unreadable"
+  done
+  return 0
+}
+# assert_no_open_run_holds LABEL RUN... — none of these runs still has an OPEN custody hold (the declared
+# discards and receipts have all landed).
+assert_no_open_run_holds() {
+  local label="$1" run snap open
+  shift
+  snap="$(apiget /api/recovery/holds)" || fail "hold census ($label): holds unreadable"
+  for run in "$@"; do
+    [ -n "$run" ] || continue
+    open="$(printf '%s' "$snap" | jq -r --arg r "$run" '[.holds[] | select(.run_id == $r and .state == "open") | "generation=\(.generation)"] | join(" ")')" \
+      || fail "hold census ($label): holds of run $run unreadable"
+    [ -z "$open" ] || fail "hold census ($label): run $run still has open custody holds beyond the declared discards: $open"
+  done
+  pass "hold census ($label): no open custody hold remains on the phase's runs"
+}
+
+# --- #3644 Docker wiring posture -----------------------------------------------
+# The agent resolves its Docker wiring ONCE at startup and the runner caches attempt paths from it, so a
+# phase that must run attempt-shaped predecessors wires the sidecar BEFORE the agent (re)create it already
+# performs and restores the entry posture afterwards. Bookkeeping lives in shell variables owned by the
+# calling phase (each phase is its own subshell): DOCKER_WIRE_OWNED (1 when this phase wired the stack),
+# DOCKER_WIRE_STARTED (the sidecar services this phase started), DOCKER_WIRE_LINE_OWNED (1 when this phase
+# appended the env line). Never `down`, never `-v`, never a volume removal.
+DOCKER_WIRE_LINE='UZI_DIND_SOCKET=/run/dind/docker.sock'
+# _docker_wire_service_running SERVICE — 0 running, 1 not running, 2 unreadable.
+_docker_wire_service_running() {
+  local ids
+  ids="$("${COMPOSE[@]}" --profile agent-docker ps -q "$1" 2>/dev/null)" || return 2
+  [ -n "$ids" ]
+}
+# docker_wire_prepare — record the entry posture; when the stack is not already wired, start the sidecar and
+# append UZI_DIND_SOCKET to $ENVFILE. The caller performs its own agent force-recreate afterwards. A second
+# call in the same phase is a no-op so it cannot clobber the recorded ownership.
+docker_wire_prepare() {
+  local svc rc running=0 has_line=0
+  if [ "${DOCKER_WIRE_OWNED:-0}" = 1 ]; then return 0; fi
+  DOCKER_WIRE_OWNED=0 DOCKER_WIRE_STARTED="" DOCKER_WIRE_LINE_OWNED=0
+  rc=0; _docker_wire_service_running dind || rc=$?
+  case "$rc" in 0) running=1 ;; 1) ;; *) fail "docker wiring: cannot read the dind service state at entry" ;; esac
+  if grep -qxF "$DOCKER_WIRE_LINE" "$ENVFILE" 2>/dev/null; then has_line=1; fi
+  if [ "$running" = 1 ] && [ "$has_line" = 1 ]; then
+    echo "docker wiring: the sidecar is already running and wired at entry; this phase owns nothing"
+    return 0
+  fi
+  # Only two entry postures are meaningful: fully unwired, or fully wired. A half-wired stack has no
+  # well-defined posture to restore, so refuse it by name rather than guess which half is ours.
+  [ "$running" = "$has_line" ] \
+    || fail "docker wiring: inconsistent entry posture (dind running=$running, $DOCKER_WIRE_LINE in the env file=$has_line); refusing to wire on top of it"
+  for svc in dind-init dind; do
+    rc=0; _docker_wire_service_running "$svc" || rc=$?
+    case "$rc" in
+      0) ;;
+      1) DOCKER_WIRE_STARTED="${DOCKER_WIRE_STARTED:+$DOCKER_WIRE_STARTED }$svc" ;;
+      *) fail "docker wiring: cannot read the $svc service state at entry" ;;
+    esac
+  done
+  DOCKER_WIRE_OWNED=1
+  "${COMPOSE[@]}" --profile agent-docker up -d --wait dind >/dev/null 2>&1 \
+    || fail "docker wiring: the DinD sidecar did not become healthy (up -d --wait dind)"
+  if [ "$has_line" = 0 ]; then
+    printf '%s\n' "$DOCKER_WIRE_LINE" >> "$ENVFILE" || fail "docker wiring: could not append $DOCKER_WIRE_LINE to the env file"
+    DOCKER_WIRE_LINE_OWNED=1
+  fi
+  pass "docker wiring prepared: started [${DOCKER_WIRE_STARTED:-nothing}], env line appended=$DOCKER_WIRE_LINE_OWNED"
+}
+# _docker_wire_check WANT(true|false) TIMEOUT LABEL — judge the CURRENT agent container's own startup log and
+# the API worker row of the worker that container registered, never an earlier container's evidence.
+_docker_wire_check() {
+  local want="$1" timeout="$2" label="$3" cid logs wid="" state want_state deadline=$((SECONDS + $2))
+  cid="$(restore_agent_container)" || fail "docker wiring ($label): cannot identify the single agent container"
+  while :; do
+    logs="$(docker logs "$cid" 2>&1)" || fail "docker wiring ($label): cannot read the logs of agent container ${cid:0:12}"
+    wid="$(printf '%s' "$logs" | jq -Rsr '[split("\n")[] | sub("^[^{]*"; "") | fromjson?
+      | select(type == "object" and .msg == "registered" and ((.worker_id // "") | type == "string" and length > 0))]
+      | last | .worker_id // empty')" || wid=""
+    if [ "$want" = false ] && [[ "$logs" == *'"docker_wired":true'* ]]; then
+      fail "docker wiring ($label): agent container ${cid:0:12} logged \"docker_wired\":true although the sidecar must be unwired"
+    fi
+    if [[ "$logs" == *"\"docker_wired\":$want"* ]] && [ -n "$wid" ]; then break; fi
+    [ "$SECONDS" -lt "$deadline" ] \
+      || fail "docker wiring ($label): agent container ${cid:0:12} startup log lacks \"docker_wired\":$want or a registered worker id after ${timeout}s"
+    sleep 1
+  done
+  if [ "$want" = true ]; then
+    [[ "$logs" == *'"capabilities":["docker"]'* ]] \
+      || fail "docker wiring ($label): agent container ${cid:0:12} did not report capabilities:[\"docker\"] at register"
+    want_state=docker
+  else
+    want_state=nodocker
+  fi
+  deadline=$((SECONDS + timeout))
+  while :; do
+    state="$(apiget /api/workers | jq -r --arg w "$wid" '[.workers[] | select(.id == $w)]
+      | if length != 1 then "norow" elif ((.[0].capabilities // []) | index("docker")) != null then "docker" else "nodocker" end')" || state=unreadable
+    [ "$state" = "$want_state" ] && break
+    [ "$SECONDS" -lt "$deadline" ] \
+      || fail "docker wiring ($label): API worker row $wid is [$state], want [$want_state] for the docker capability after ${timeout}s"
+    sleep 1
+  done
+  pass "docker wiring ($label): container ${cid:0:12} logged docker_wired:$want; worker $wid docker capability is $want_state"
+}
+# docker_wire_assert [TIMEOUT] — after wait_worker_online, before any run is created: the new agent
+# container wired the sidecar and registered the docker capability.
+docker_wire_assert() {
+  _docker_wire_check true "${1:-60}" wired
+}
+# docker_restore_posture — if this phase wired the stack: (1) stop and remove ONLY the sidecar services it
+# started, (2) remove the env line it appended, (3) THEN force-recreate the agent (the agent resolves wiring
+# once, at startup, so removing the sidecar alone leaves it wired) and wait for the new registration,
+# (4) assert the FINAL container is unwired. If the phase wired nothing it changes nothing.
+docker_restore_posture() {
+  local svc before after tmp
+  local -a svcs=()
+  if [ "${DOCKER_WIRE_OWNED:-0}" != 1 ]; then
+    echo "docker wiring: the entry posture was already wired; nothing to restore"
+    return 0
+  fi
+  for svc in dind dind-init; do
+    case " ${DOCKER_WIRE_STARTED:-} " in *" $svc "*) svcs+=("$svc") ;; esac
+  done
+  if [ "${#svcs[@]}" -gt 0 ]; then
+    "${COMPOSE[@]}" --profile agent-docker stop "${svcs[@]}" >/dev/null || fail "docker wiring: could not stop ${svcs[*]}"
+    "${COMPOSE[@]}" --profile agent-docker rm -f "${svcs[@]}" >/dev/null || fail "docker wiring: could not remove ${svcs[*]}"
+  fi
+  if [ "${DOCKER_WIRE_LINE_OWNED:-0}" = 1 ]; then
+    tmp="$ENVFILE.unwire"
+    { grep -vxF "$DOCKER_WIRE_LINE" "$ENVFILE" > "$tmp" || [ "$?" = 1 ]; } \
+      && cat "$tmp" > "$ENVFILE" && rm -f "$tmp" \
+      || fail "docker wiring: could not remove $DOCKER_WIRE_LINE from the env file"
+  fi
+  before="$(restore_agent_container 2>/dev/null)" || before=""
+  capture_agent_logs docker-wire before-unwire-recreate
+  "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null || fail "docker wiring: could not recreate the agent to unwire it"
+  wait_worker_online
+  after="$(restore_agent_container)" || fail "docker wiring: cannot identify the agent container after the unwire recreate"
+  [ "$after" != "$before" ] || fail "docker wiring: the agent container was not recreated by the unwire step (${after:0:12})"
+  _docker_wire_check false "${DOCKER_WIRE_TIMEOUT:-60}" unwired
+  DOCKER_WIRE_OWNED=0 DOCKER_WIRE_STARTED="" DOCKER_WIRE_LINE_OWNED=0
+}
+
+# --- #3644 predecessor shape and canonical-refusal witnesses -------------------
+# restore_check_p_shape RUN BRANCH MODE — MODE attempt: P's recovery journal names an attemptId and a
+# `.attempt-` clone path; MODE canonical: it is exactly {runId, clonePath} at a path without `.attempt-`.
+# Read through the read-only witness, so it works while the agent runs. Returns non-zero with a stderr
+# message (never calls fail), so a caller holding the api down can judge it after restoring.
+restore_check_p_shape() {
+  local run="$1" branch="$2" mode="$3" rows journal
+  rows="$(restore_witness_exec journals "$branch")" || { echo "issue 3644: witness could not read the bare journals for $run" >&2; return 1; }
+  journal="$(_restore_journal_value "$rows" "uzi-recovery.$branch.clone" "$run")"
+  [ -n "$journal" ] && [ "$(printf '%s\n' "$journal" | grep -c .)" = 1 ] \
+    || { echo "issue 3644: expected exactly one predecessor journal for run $run on $branch" >&2; return 1; }
+  case "$mode" in
+    attempt)
+      printf '%s' "$journal" | jq -e '(.attemptId | type == "string" and length > 0) and (.clonePath | type == "string" and contains(".attempt-"))' >/dev/null \
+        || { echo "issue 3644: predecessor journal of run $run is not attempt-shaped: $journal" >&2; return 1; } ;;
+    canonical)
+      printf '%s' "$journal" | jq -e 'keys == ["clonePath", "runId"] and (.clonePath | type == "string" and length > 0 and (contains(".attempt-") | not))' >/dev/null \
+        || { echo "issue 3644: predecessor journal of run $run is not the canonical {runId, clonePath} shape: $journal" >&2; return 1; } ;;
+    *) echo "issue 3644: unknown predecessor shape mode [$mode]" >&2; return 1 ;;
+  esac
+}
+# restore_assert_canonical_refusal RUN GEN [TIMEOUT] — a canonical-shaped predecessor killed and re-claimed at
+# generation GEN is refused, not restored: exactly one successor claim, no `independent restore seeded`, the
+# frozen refusal line (unsupported canonical) and the held-or-unconfirmed line in the agent log, the
+# frozen feed text, and the run at recovery_wait / retained_recovery_adoption_failed with no retry stamp.
+restore_assert_canonical_refusal() {
+  local run="$1" gen="$2" timeout="${3:-90}" deadline=$((SECONDS + ${3:-90}))
+  local log_file="$RUNROOT/.restore-3644-canonical.log" counts claims seeded refused held unconfirmed missing row feed
+  while :; do
+    "${COMPOSE[@]}" logs --no-color agent > "$log_file" 2>/dev/null || fail "issue 3644: could not read canonical-refusal evidence for $run"
+    counts="$(jq -Rsr --arg run "$run" '
+      [split("\n")[] | sub("^[^{]*"; "") | fromjson? | select(type == "object")] as $e |
+      def n(f): [$e[] | select(f)] | length;
+      [n(.run_id == $run and .msg == "run claimed"),
+       n(.run_id == $run and .msg == "independent restore seeded"),
+       n(.msg == "independent restore refused; predecessor retained" and .unsupported == "canonical" and ((.run_id // $run) == $run)),
+       n(.msg == "restore unsupported predecessor held" and ((.run_id // $run) == $run)),
+       n(.msg == "restore unsupported predecessor hold unconfirmed" and ((.run_id // $run) == $run))] | @tsv' "$log_file")" \
+      || fail "issue 3644: could not decode canonical-refusal evidence for $run"
+    IFS=$'\t' read -r claims seeded refused held unconfirmed <<<"$counts"
+    [ "${seeded:-0}" = 0 ] || fail "issue 3644: canonical predecessor of run $run was independently restored ($seeded 'independent restore seeded' lines)"
+    [ "${claims:-0}" -le 2 ] || fail "issue 3644: run $run was claimed $claims times, want exactly one successor claim"
+    missing=""
+    [ "${claims:-0}" = 2 ] || missing="$missing successor-claim(claims=${claims:-0})"
+    [ "${refused:-0}" -ge 1 ] || missing="$missing refusal-log"
+    [ $((${held:-0} + ${unconfirmed:-0})) -ge 1 ] || missing="$missing held-log"
+    feed="$(apiget "/api/runs/$run/messages" | jq -r --arg s 'this release does not support this predecessor' '[.messages[] | tojson | contains($s)] | any')" || feed=unreadable
+    [ "$feed" = true ] || missing="$missing feed-text"
+    row="$(db_psql "SELECT status||'|'||COALESCE(recovery_wait_cause,'')||'|'||COALESCE(recovery_retry_not_before::text,'')||'|'||claim_generation FROM runs WHERE id = '$run'")" || row=unreadable
+    [ "$row" = "recovery_wait|retained_recovery_adoption_failed||$gen" ] || missing="$missing run-state([$row])"
+    if [ -z "$missing" ]; then
+      pass "run $run: canonical predecessor refused at generation $gen (one successor claim, refusal $refused, held $held, unconfirmed $unconfirmed, feed text, recovery_wait/retained_recovery_adoption_failed, no retry stamp)"
+      return 0
+    fi
+    [ "$SECONDS" -lt "$deadline" ] || fail "issue 3644: run $run lacks the canonical refusal after ${timeout}s; missing:$missing"
+    sleep 0.5
+  done
+}
 # --- output helpers ----------------------------------------------------------
 say()  { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
 # Read-only, bounded allocation evidence; no contents, credentials or reclamation.
