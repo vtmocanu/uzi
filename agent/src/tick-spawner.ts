@@ -52,10 +52,18 @@ export interface SurvivingGroup {
  * split an identity-`command` group is probed as the runner uid, and a non-zero `kill -0` counts as
  * gone only when kill says so (a permission or any other failure counts as alive).
  */
-export function processGroupAlive(pgid: number, identity: BoundaryProcessRequest["identity"]): boolean {
+export function processGroupAlive(pgid: number, identity: BoundaryProcessRequest["identity"], fixedHelper = false): boolean {
   if (identity === "command" && uidSplitActive()) {
-    const w = runnerCommand("kill", ["-0", `-${pgid}`]);
-    const r = spawnSync(w.command, w.args, { env: workerSpawnEnv(), stdio: ["ignore", "ignore", "pipe"], encoding: "utf8" });
+    // Fixed observational helper: setpriv execs only the kill applet with group-only
+    // argv. It cannot write trees, refs or config and receives no epoch EX descriptor.
+    const w = runnerCommand(fixedHelper ? "/bin/kill" : "kill", ["-0", `-${pgid}`]);
+    const r = spawnSync(w.command, w.args, { env: fixedHelper ? { PATH: "/usr/bin:/bin", LC_ALL: "C" } : workerSpawnEnv(), stdio: ["ignore", "ignore", "pipe"], encoding: "utf8", ...(fixedHelper ? { timeout: 1_000 } : {}) });
+    if (fixedHelper) {
+      // Only the fixed BusyBox applet diagnostic for this exact group proves
+      // absence. Wrapper, timeout and launch failures remain unknown/alive.
+      return !(r.error === undefined && r.status === 1 &&
+        String(r.stderr ?? "").trim() === `kill: can't kill pid -${pgid}: No such process`);
+    }
     return !killProbeSaysGone(r.status, String(r.stderr ?? ""));
   }
   try {

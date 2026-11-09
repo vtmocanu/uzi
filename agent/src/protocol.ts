@@ -3811,6 +3811,9 @@ export interface RecoveryExactHold {
 export interface RecoveryHoldsResponse {
   run_id: string;
   holds: RecoveryHold[];
+  /** Run-wide open-hold count across every worker and generation (issue #3431). Present only when the api
+   *  read it for a worker that advertised recovery_run_open_holds_v1; ABSENT is unknown, never zero. */
+  run_open_holds?: { run_id: string; count: number };
 }
 
 /** RecoverySettleRequest is the worker's request that the api settle ONE older-generation
