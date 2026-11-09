@@ -219,9 +219,11 @@ func TestPromptCheckpointSalvageLiveDB(t *testing.T) {
 }
 
 // TestPromptCheckpointRepoLessLiveDB: a repo-less prompt run cannot exist (runs_kind_shape), and
-// if one did, fn_checkpoint_coordinates resolves no key for it, so its publication would answer
-// no_ref rather than publish anywhere. The synthetic record is the stored prompt row with its repo
-// cleared; the repo-backed row itself resolves its prompt key (the control).
+// if one did, fn_checkpoint_coordinates (the retention, salvage and recovery derivation) resolves
+// no key for it. Its publication would answer no_ref, but from GetRunClaimContext's repo join, not
+// from this function. The NULL comes from the general repo_id guard ahead of every kind arm, so it
+// is not specific to the prompt arm; the repo-backed row resolving its prompt key is the control
+// that is. The synthetic record is the stored prompt row with its repo cleared.
 func TestPromptCheckpointRepoLessLiveDB(t *testing.T) {
 	f := newPromptLifecycleFix(t)
 	env := f.env

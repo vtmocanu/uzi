@@ -157,7 +157,7 @@ func newPPCEnv(t *testing.T) *ppcEnv {
 }
 
 // seedQueued inserts a queued, claimable run of kind and returns its id, the checkpoint key and
-// work branch the api must publish to, and the issue iid (0 when the kind has none).
+// work branch the api must publish to.
 func (e *ppcEnv) seedQueued(kind string) (id uuid.UUID, key, work string) {
 	e.t.Helper()
 	id = uuid.New()
@@ -286,7 +286,7 @@ func TestPromptPauseCheckpointRoutesLiveDB(t *testing.T) {
 
 				// (1) The owner pause is accepted and leaves the run running with a pending request.
 				rec := e.ownerInput(id, "pause", mode)
-				if rec.Code != http.StatusOK && rec.Code != http.StatusCreated && rec.Code != http.StatusAccepted {
+				if rec.Code != http.StatusAccepted {
 					t.Fatalf("owner pause = %d %s", rec.Code, rec.Body.String())
 				}
 				r := e.run(id)
@@ -331,6 +331,14 @@ func TestPromptPauseCheckpointRoutesLiveDB(t *testing.T) {
 				next := e.claim(e.tokA, id)
 				if next.ClaimGeneration != gen+1 || next.CheckpointTip == nil || *next.CheckpointTip != ppcTip {
 					t.Fatalf("resume claim: generation=%d tip=%v; want generation %d tip %s", next.ClaimGeneration, next.CheckpointTip, gen+1, ppcTip)
+				}
+
+				// (5) The superseded (older) generation can no longer publish once the run was reclaimed.
+				if rec = e.publish(e.tokA, id, gen); rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), `"stale_claim"`) {
+					t.Fatalf("superseded generation publish = %d %s; want 409 stale_claim", rec.Code, rec.Body.String())
+				}
+				if got := e.recorded(); len(got) != 1 {
+					t.Fatalf("a superseded publish reached the forge push: %+v", got)
 				}
 			})
 		}
@@ -380,13 +388,15 @@ func TestPromptPauseCheckpointGuardsLiveDB(t *testing.T) {
 		e := newPPCEnv(t)
 		id, _, _ := e.seedQueued("task")
 		gen := e.startRunning(id)
+		// interactive is fixed at create on a real run; flipping it after the claim is enough here
+		// because the pause refusal reads only the run's kind and interactive flag.
 		e.exec("UPDATE runs SET interactive=true WHERE id=$1", id)
 		rec := e.ownerInput(id, "pause", "now")
-		if rec.Code != http.StatusConflict {
-			t.Fatalf("interactive task pause = %d %s; want 409", rec.Code, rec.Body.String())
+		if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "interactive tasks park after each turn") {
+			t.Fatalf("interactive task pause = %d %s; want 409 naming the interactive refusal", rec.Code, rec.Body.String())
 		}
 		if r := e.run(id); r.Status != "running" || r.PauseRequestedAt.Valid || r.ClaimGeneration != gen {
-			t.Fatalf("refused pause changed the run: status=%s pending=%v", r.Status, r.PauseRequestedAt)
+			t.Fatalf("refused pause changed the run: status=%s pending=%v generation=%d", r.Status, r.PauseRequestedAt, r.ClaimGeneration)
 		}
 		var n int
 		if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM run_user_inputs WHERE run_id=$1 AND kind='pause'`, id).Scan(&n); err != nil || n != 0 {
