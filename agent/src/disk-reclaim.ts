@@ -705,6 +705,11 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
         summary.skippedLive += 1;
         return;
       }
+      // A restore's retained-home marker may have been written during the status lookup above.
+      if (parsed.generation === undefined && (await hasMarker(runId))) {
+        summary.skippedRetainedHome += 1;
+        return;
+      }
       if (!terminal) {
         // issue #1828: a process the pinned CLI detached can outlive the park and still write the
         // caches. Past the pass deadline, or with a live or unproven one, keep them and do not

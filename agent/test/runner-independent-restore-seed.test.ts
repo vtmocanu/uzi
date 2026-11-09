@@ -23,7 +23,7 @@ import { boundaryFileName } from "../src/restore-boundary.js";
 import { mintAttemptId } from "../src/run-quiescence.js";
 import { nullLogger } from "./helpers.js";
 import { Outbox } from "../src/outbox.js";
-import type { StateRequest } from "../src/protocol.js";
+import { REPO_AGENT_SOURCE_FEATURE, type StateRequest } from "../src/protocol.js";
 import { api, baseUrl, client, fakeGitlab, fx, git, installHarness, runnerWith } from "./runner-harness.js";
 import {
   AUTH_TOKEN, BRANCH, CID, FEATURES, PARK_FEATURE, armTraps, buildRig, cfgAdd, cfgAll, cfgGet, cfgSet, cleanupRig, failed, gitIn, journalOf, logged, makeProc, refusals, resetRigRoots, rigDefaults, slotOf,
@@ -1204,3 +1204,73 @@ describe("later claims never reach the legacy path (issue #3644 3.10)", () => {
   });
 });
 
+
+describe("the restored flight's repo-agent source and required base (issue #3644 review fixes)", () => {
+  beforeEach(() => { resetRigRoots(); });
+
+  const SOURCE_FEATURES = [...FEATURES, REPO_AGENT_SOURCE_FEATURE];
+
+  /** Spies the repo-agent source hold request; the restore itself must reach no fetch (ensureClone / ensureCommitPresent). */
+  function spies() {
+    const holds: Array<{ runId: string; commit: string }> = [];
+    const orig = client.requestRepoAgentSourceHold.bind(client);
+    (client as unknown as { requestRepoAgentSourceHold: unknown }).requestRepoAgentSourceHold = async (runId: string, args: { commit: string }) => {
+      holds.push({ runId, commit: args.commit });
+      return { outcome: "held", status: "paused" };
+    };
+    const ensureClone = mock.method(git, "ensureClone");
+    const ensureCommitPresent = mock.method(git, "ensureCommitPresent");
+    return { holds, ensureClone, ensureCommitPresent, restore: () => { (client as unknown as { requestRepoAgentSourceHold: unknown }).requestRepoAgentSourceHold = orig; } };
+  }
+
+  it("an unpinned restored claim resolves its repo-agent source from the bare's origin default-branch ref, with no fetch", async () => {
+    const { r } = await restoreRig({ features: SOURCE_FEATURES });
+    const spy = spies();
+    try { await r.runner.execute(r.claim); } finally { spy.restore(); }
+    assert.deepEqual(spy.holds, [], "no repo-agent source hold");
+    assert.equal(logged(r, "independent restore seeded").length, 1);
+    assert.equal(failed(r).length, 0);
+    assert.equal(api.repoAgentSourceByRun.get(r.runId), r.pinSha, "the source is the bare's origin default-branch tip");
+    assert.equal(spy.ensureClone.mock.callCount(), 0, "no ensureClone after the seed");
+    assert.equal(spy.ensureCommitPresent.mock.callCount(), 0, "no fetch");
+  });
+
+  it("a default branch absent from the bare still fails closed into the repo-agent source hold", async () => {
+    const { r } = await restoreRig({ features: SOURCE_FEATURES });
+    gitIn(r.bare, ["update-ref", "-d", "refs/remotes/origin/main"]);
+    const spy = spies();
+    try { await r.runner.execute(r.claim); } finally { spy.restore(); }
+    assert.equal(logged(r, "independent restore seeded").length, 1, "the seed itself succeeded");
+    assert.equal(spy.holds.length, 1, "the run is held");
+    assert.equal(api.repoAgentSourceByRun.has(r.runId), false);
+    assert.equal(spy.ensureClone.mock.callCount(), 0);
+  });
+
+  it("a claim that already records its repo-agent source commit is read at that commit, as before", async () => {
+    const { r } = await restoreRig({ features: SOURCE_FEATURES });
+    r.claim.repo_agent_source_commit = r.pinSha;
+    const spy = spies();
+    try { await r.runner.execute(r.claim); } finally { spy.restore(); }
+    assert.deepEqual(spy.holds, []);
+    assert.equal(failed(r).length, 0);
+    assert.equal(api.repoAgentSourceByRun.get(r.runId), r.pinSha, "the roster is reported at the recorded commit");
+    assert.equal(spy.ensureClone.mock.callCount(), 0);
+  });
+
+  it("a restored flight is a continuation: a --require-base planned commit that differs from the pin holds for attestation instead of diverging", async () => {
+    const { r } = await restoreRig();
+    const planned = gitIn(r.bare, [...IDENT, "commit-tree", `${r.pinSha}^{tree}`, "-p", r.pinSha, "-m", "planned base"]);
+    assert.notEqual(planned, r.pinSha);
+    r.claim.require_base_match = true;
+    r.claim.planned_base_commit = planned;
+    const holds: Array<{ runId: string }> = [];
+    const orig = client.requestBaseAttestationHold.bind(client);
+    (client as unknown as { requestBaseAttestationHold: unknown }).requestBaseAttestationHold = async (runId: string) => {
+      holds.push({ runId });
+      return { outcome: "held", status: "paused" };
+    };
+    try { await r.runner.execute(r.claim); } finally { (client as unknown as { requestBaseAttestationHold: unknown }).requestBaseAttestationHold = orig; }
+    assert.equal(failed(r).length, 0, "not failed base_diverged");
+    assert.equal(holds.length, 1, "the BaseAttestationMissing owner hold was requested");
+  });
+});

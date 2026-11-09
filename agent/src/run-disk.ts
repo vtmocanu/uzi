@@ -261,7 +261,8 @@ export class RunDiskSampler {
       // A run's entry is replaced only when this sample decided EVERY HOME of the run; otherwise (a HOME was not reached, or
       // not measured) the previous full reading is kept in place of a partial sum.
       const dirsOfRun = namesOfRun.get(prev.run_id) ?? [prev.run_id];
-      if (dirsOfRun.every((n) => reached.has(n))) continue;
+      // A truncated listing may have missed a sibling HOME (`<id>` vs `<id>.g<N>`), so the fresh sum is partial as well.
+      if (!listingTruncated && dirsOfRun.every((n) => reached.has(n))) continue;
       let owned = false;
       for (const n of dirsOfRun) {
         try {
@@ -277,7 +278,7 @@ export class RunDiskSampler {
     // A partial sum of a run with no previous reading to fall back on is reported, marked truncated (a lower bound).
     for (const e of entries) {
       if (e.truncated || previous.has(e.run_id) || !fresh.some((f) => f.run_id === e.run_id)) continue;
-      if ((namesOfRun.get(e.run_id) ?? []).some((n) => !reached.has(n))) e.truncated = true;
+      if (listingTruncated || (namesOfRun.get(e.run_id) ?? []).some((n) => !reached.has(n))) e.truncated = true;
     }
 
     const partial = stoppedEarly !== undefined || listingTruncated || lookupFailures > 0 || measureFailures > 0;

@@ -14865,7 +14865,7 @@ export class RunRunner {
           plannedBase: claim.planned_base_commit!,
           identity,
           attestedSource: flight.checkpointClaimEvidence.attestedSource,
-          continuation: runnerClone.seededFrom === "tracking" || runnerClone.seededFrom === "checkpoint",
+          continuation: runnerClone.seededFrom === "tracking" || runnerClone.seededFrom === "checkpoint" || runnerClone.seededFrom === "restore_pin",
           wipCherryPicked: runnerClone.wipCherryPicked === true,
           planned: await this.git.resolveCommitUnique(barePath, claim.planned_base_commit!),
           identityTree: await this.git.commitTreeOid(barePath, identity),
@@ -27695,6 +27695,9 @@ export class RunRunner {
       await this.confirmPostAdoptionOwnership(flight, Date.now() + this.codexBoundaryDeadlineMs, lifecycle);
       await this.bindFlightSource(flight, seeded.path);
       await this.git.markRecoveryCapture(bare, seeded.path, flight.branch, runId, attemptId);
+      // The legacy path captures this after ensureClone; restore must not fetch, so read the bare's existing origin ref only.
+      const defaultBranch = this.defaultBranchCapture(claim);
+      if (defaultBranch) flight.defaultBranchTip = await this.git.defaultBranchTip(bare, defaultBranch.name);
       await this.inFlightAuthority(flight, () => this.withRemediationLifecycle(lifecycle, async () => {
         const negative = await this.bootstrapRemediationRestrictions(flight);
         if (negative.kind === "unavailable") throw new Error("remediation restriction facts unavailable");

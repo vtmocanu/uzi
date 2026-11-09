@@ -6427,7 +6427,8 @@ export class GitCache {
     return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
   }
 
-  private async defaultBranchTip(barePath: string, name: string): Promise<string | undefined> {
+  /** Read-only: the bare's origin ref tip for the default branch, or undefined when the name or ref is absent. */
+  async defaultBranchTip(barePath: string, name: string): Promise<string | undefined> {
     if (!(await this.isRemoteBranchName(barePath, name))) return undefined;
     return (await this.originBranchTip(barePath, name)) ?? undefined;
   }

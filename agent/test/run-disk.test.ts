@@ -15,6 +15,7 @@ import type { JudgeRunner } from "../src/judge-runner.js";
 import type { ReviewRunner } from "../src/review-runner.js";
 import type { ChatClaimResponse, ClaimResponse, RunDiskEntry, WorkerStats } from "../src/protocol.js";
 import { StatsCollector } from "../src/stats.js";
+import { runDirKey } from "../src/util.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
 
 // PRD #1809 D8: the per-run HOME size on the heartbeat. The sampler measures in the background
@@ -396,6 +397,43 @@ describe("RunDiskSampler (PRD #1809 D8) — sampled_at, partial samples and rota
         [id(5), id(4), id(3), id(2), id(1)],
         "every HOME is in the reading, the trailing ones included",
       );
+    });
+  });
+});
+
+describe("RunDiskSampler (issue #3644) — truncated directory listing and sibling HOMEs", () => {
+  const sibling = (n: number): string => runDirKey(id(n), 2);
+  const sized = (home: string): RunHomeBytes => ({
+    homeBytes: path.basename(home) === id(1) ? 3 : 4, cacheBytes: 0, entries: 1, truncated: false });
+
+  it("a truncated listing keeps the previous complete reading of a run instead of a partial sum of its HOMEs", async () => {
+    await withRoot(async (root) => {
+      fs.mkdirSync(path.join(root, id(1)));
+      fs.mkdirSync(path.join(root, sibling(1)));
+      const clock = { now: 0 };
+      const { o } = opts(root, new Map(), { measure: async (home) => sized(home), maxDirReads: 1_000, now: () => clock.now });
+      const sampler = new RunDiskSampler(o);
+      const tick = async (): Promise<RunDiskEntry[] | undefined> => {
+        clock.now += 10 * 60_000;
+        sampler.current();
+        await sampler.settled();
+        return sampler.current();
+      };
+      assert.deepStrictEqual(sizesOf(await tick()), [{ run_id: id(1), home_bytes: 7, cache_bytes: 0 }]);
+      // The next listing stops after one dirent, so one of the run's two HOMEs is missed.
+      o.maxDirReads = 1;
+      assert.deepStrictEqual(sizesOf(await tick()), [{ run_id: id(1), home_bytes: 7, cache_bytes: 0 }]);
+    });
+  });
+
+  it("a truncated listing with no previous reading marks the run's partial sum as truncated", async () => {
+    await withRoot(async (root) => {
+      fs.mkdirSync(path.join(root, id(1)));
+      fs.mkdirSync(path.join(root, sibling(1)));
+      const { o } = opts(root, new Map(), { measure: async (home) => sized(home), maxDirReads: 1 });
+      const entries = await new RunDiskSampler(o).sample();
+      assert.strictEqual(entries.length, 1);
+      assert.strictEqual(entries[0]!.truncated, true);
     });
   });
 });
