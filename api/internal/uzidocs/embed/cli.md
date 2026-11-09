@@ -4142,9 +4142,9 @@ for renewal bounds, storage risks and rollout requirements.
 
 ### Retained recovery adoption failed
 
-`recovery_wait` / `retained_recovery_adoption_failed` means an integrity check
-refused adoption, or that a predecessor's active secret-scan remediation record
-refused source use so the agent did not start. Local work and custody are
+`recovery_wait` / `retained_recovery_adoption_failed` means retained adoption failed,
+a predecessor needs secret-scan remediation review, or this release does not support
+the predecessor for independent restore. The agent did not start. Local work and custody are
 preserved; the run is owner-held with no automatic retry, regardless of a
 displayed retry timestamp. In the remediation case, Resume holds again unless
 that remediation was resolved through a separately authorized route. The same cause
