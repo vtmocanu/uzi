@@ -1,10 +1,13 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"net/mail"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
@@ -34,12 +37,14 @@ func (c SetupConfig) ForgeBaseURLAllowed(raw string) bool {
 // seed-email validators with Load, requires UZI_SEED_EMAIL, and never reads
 // UZI_SEED_PASSWORD. Like Load, each boot secret comes from the plain variable
 // or its <NAME>_FILE path, never both, so a server configured with mounted
-// secret files runs setup unchanged.
+// secret files runs setup unchanged. Unlike Load, a <NAME>_FILE must name a
+// regular file (readRegularSecretFile): setup runs before its deadline applies,
+// so a FIFO with no writer would otherwise hang it.
 func LoadSetup() (SetupConfig, error) {
 	cfg := SetupConfig{
 		ForgeHTTPTimeout: parseDuration("FORGE_HTTP_TIMEOUT", 15*time.Second),
 	}
-	dbURL, dbSource, err := resolveSecret("DATABASE_URL")
+	dbURL, dbSource, err := resolveSecretWith("DATABASE_URL", readRegularSecretFile)
 	if err != nil {
 		return SetupConfig{}, err
 	}
@@ -47,7 +52,7 @@ func LoadSetup() (SetupConfig, error) {
 		return SetupConfig{}, fmt.Errorf("%s is required", dbSource)
 	}
 	cfg.DatabaseURL = dbURL
-	keyRaw, keySource, err := resolveSecret("UZI_SECRET_KEY")
+	keyRaw, keySource, err := resolveSecretWith("UZI_SECRET_KEY", readRegularSecretFile)
 	if err != nil {
 		return SetupConfig{}, err
 	}
@@ -70,6 +75,31 @@ func LoadSetup() (SetupConfig, error) {
 	}
 	cfg.SeedEmail = email
 	return cfg, nil
+}
+
+// errNotRegularSecretFile marks a <NAME>_FILE that is not a regular file;
+// resolveSecretWith wraps it with the variable's name.
+var errNotRegularSecretFile = errors.New("must name a regular file (a FIFO, device or directory is refused)")
+
+// readRegularSecretFile reads a secret file for the setup command without
+// blocking on a special file. A plain open of a FIFO with no writer blocks in
+// the kernel, before any deadline can apply, so the open is non-blocking
+// (O_NONBLOCK has no effect on a regular file) and the type is checked on the
+// opened descriptor, which a path swap cannot change.
+func readRegularSecretFile(path string) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0) //nolint:gosec // G304: operator config naming the mounted secret file.
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errNotRegularSecretFile
+	}
+	return io.ReadAll(f)
 }
 
 // parseSeedEmail normalises a UZI_SEED_EMAIL value the way registration stores

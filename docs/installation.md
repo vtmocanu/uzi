@@ -68,7 +68,7 @@ Before you run it:
 - The API has started once, so the database is migrated. Setup never migrates and refuses (exit 2) a database that is not at the API's schema version.
 - `UZI_SEED_EMAIL` names an existing admin account. Setup acts for that user and never creates or promotes one. It does not need `UZI_SEED_PASSWORD`.
 - The forge base URL is in `FORGE_ALLOWED_BASE_URLS`.
-- Setup reads the API's own `DATABASE_URL` and `UZI_SECRET_KEY`, or their `_FILE` variants (a mounted secret file), with the same rules as the API: see [configuration.md](configuration.md).
+- Setup reads the API's own `DATABASE_URL` and `UZI_SECRET_KEY`, or their `_FILE` variants (a mounted secret file), with the same rules as the API: see [configuration.md](configuration.md). A `_FILE` path must name a regular file: setup refuses a FIFO or device instead of waiting on it.
 
 Docker Compose, with the token on stdin:
 

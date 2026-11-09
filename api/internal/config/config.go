@@ -2256,6 +2256,13 @@ func validateSecret(name, raw string) ([]byte, error) {
 // source names where the value came from, so later validation errors point
 // the operator at the right variable.
 func resolveSecret(name string) (value, source string, err error) {
+	return resolveSecretWith(name, os.ReadFile)
+}
+
+// resolveSecretWith is resolveSecret with the file read supplied by the
+// caller, so the setup command can refuse a file that would block (PRD #3760)
+// while the server keeps its plain read. Every other rule is shared.
+func resolveSecretWith(name string, readFile func(path string) ([]byte, error)) (value, source string, err error) {
 	fileVar := name + "_FILE"
 	direct := os.Getenv(name)
 	path := strings.TrimSpace(os.Getenv(fileVar))
@@ -2265,7 +2272,7 @@ func resolveSecret(name string) (value, source string, err error) {
 	if path == "" {
 		return direct, name, nil
 	}
-	raw, err := os.ReadFile(path) //nolint:gosec // G304: operator config naming the mounted secret file.
+	raw, err := readFile(path)
 	if err != nil {
 		return "", "", fmt.Errorf("%s: read %s: %w", fileVar, path, err)
 	}

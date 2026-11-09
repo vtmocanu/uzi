@@ -9,6 +9,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/vtmocanu/uzi/api/internal/config"
 )
 
 // A --forge-token-file that names a FIFO with no writer must not hang setup
@@ -39,5 +41,38 @@ func TestRunRefusesAFIFOTokenFileWithoutBlocking(t *testing.T) {
 	}
 	if h.opened || h.st.writes != 0 {
 		t.Errorf("opened=%v writes=%d", h.opened, h.st.writes)
+	}
+}
+
+// The same hang class for the boot secrets: the production LoadConfig
+// (config.LoadSetup) must refuse a FIFO DATABASE_URL_FILE without blocking,
+// and Run must stop before opening the database or writing anything.
+func TestRunRefusesAFIFOSecretFileWithoutBlocking(t *testing.T) {
+	fifo := filepath.Join(t.TempDir(), "db.fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+	t.Setenv("DATABASE_URL", "")
+	t.Setenv("DATABASE_URL_FILE", fifo)
+	h := newHarness()
+	env := h.env()
+	env.LoadConfig = config.LoadSetup
+	done := make(chan int, 1)
+	go func() {
+		done <- Run(context.Background(), baseArgs("--repos", "acme/app"), h.stdin, &h.stdout, &h.stderr, env)
+	}()
+	select {
+	case code := <-done:
+		if code != ExitUsage {
+			t.Fatalf("exit = %d, want 2; stdout:\n%s", code, h.stdout.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("setup blocked opening a FIFO DATABASE_URL_FILE with no writer")
+	}
+	if out := h.stdout.String() + h.stderr.String(); !strings.Contains(out, "DATABASE_URL_FILE") {
+		t.Errorf("the refusal does not name DATABASE_URL_FILE:\n%s", out)
+	}
+	if h.opened || h.st.writes != 0 {
+		t.Errorf("opened=%v writes=%d, want neither", h.opened, h.st.writes)
 	}
 }
