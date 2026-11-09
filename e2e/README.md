@@ -238,6 +238,7 @@ headers, not the rows.
 | NN | slug | lane | critical | title |
 |---|---|---|---|---|
 | 00 | preflight | any | yes | PRD #966 M3: preflight — harness invariants (#366 dubious-ownership / #372 cross-uid push race) |
+| 02 | server-setup | gitlab | no | PRD #3760: `/server setup` reuses the seeded connection and enables the seeded repo, then a disabled columnless one |
 | 05 | lane-forgejo | forgejo | no | PRD #65 M9: the Forgejo lane (UZI_E2E_FORGE=forgejo) |
 | 06 | lane-github | github | no | PRD #238 M8: the GitHub lane (UZI_E2E_FORGE=github) |
 | 10 | least-privilege | gitlab | no | PRD #5 privilege checks: over-privileged connect is rejected + stored nothing; compliant connection is least-privilege |

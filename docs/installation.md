@@ -59,6 +59,91 @@ This builds and starts three services (`db`, `api`, `web`) in dependency order: 
 
 Register the first account — it becomes admin automatically. Subsequent registrations are regular users.
 
+## First setup from a script
+
+`/server setup` connects the forge and enables repos for the seed admin without the web UI. It is a subcommand of the API binary. You run it inside the deployment, so it needs no admin password and no new token. It applies the same checks as the web UI: the bot token must be least-privilege, a repo is enabled only if the default branch is protected, and an enabled repo gets its board columns.
+
+Before you run it:
+
+- The API has started once, so the database is migrated. Setup never migrates and refuses (exit 2) a database that is not at the API's schema version.
+- `UZI_SEED_EMAIL` names an existing admin account. Setup acts for that user and never creates or promotes one. It does not need `UZI_SEED_PASSWORD`.
+- The forge base URL is in `FORGE_ALLOWED_BASE_URLS`.
+- Setup reads the API's own `DATABASE_URL` and `UZI_SECRET_KEY`, or their `_FILE` variants (a mounted secret file), with the same rules as the API: see [configuration.md](configuration.md). A `_FILE` path must name a regular file: setup refuses a FIFO or device instead of waiting on it.
+
+Docker Compose, with the token on stdin:
+
+```sh
+printf '%s' "$PAT" | docker compose exec -T api /server setup \
+  --forge-type github --forge-base-url https://github.com \
+  --forge-token-file - --repos acme/app,acme/lib
+```
+
+Kubernetes (Helm chart). The API pod must have `UZI_SEED_EMAIL` set (see the `UZI_SEED_*` notes in the chart values). Use `-i` so stdin reaches the container:
+
+```sh
+printf '%s' "$PAT" | kubectl exec -i deploy/<release>-api -- /server setup \
+  --forge-type github --forge-base-url https://github.com \
+  --forge-token-file - --repos acme/app,acme/lib
+```
+
+Flags:
+
+| Flag | Meaning |
+|---|---|
+| `--forge-type` | Required: `gitlab`, `forgejo` or `github`. No default, no detection. |
+| `--forge-base-url` | Required: the forge URL; it must be in `FORGE_ALLOWED_BASE_URLS`. |
+| `--forge-token-file PATH` | Required: a file holding the bot token, or `-` for stdin. The token is never read from a flag value or an environment variable. At most 16 KiB. |
+| `--repos a/b,c/d` | Comma-separated `path_with_namespace` values to enable, spelled with the same case as on the forge. At most 200. |
+| `--worker-name NAME` | Optional: create the first self-hosted worker with this name (at most 200 bytes). Without it setup skips the worker step and reports `not_requested`. |
+| `--worker-template NAME` | Optional, needs `--worker-name`: the worker template. |
+
+Setup validates every flag before it writes anything; invalid input exits 2.
+
+### The first worker
+
+With `--worker-name`, setup creates a self-hosted worker for the seed admin and prints its join token. The step is create-only. It runs only after the forge and every requested repo succeeded, so one refused repo means no worker and no token (`skipped_dependency`). If the seed admin already owns any worker, setup creates nothing and prints no token: a join token is stored as a hash and cannot be shown again, and setup never rotates one. The existence check and the creation run in one database transaction under a per-owner lock, so two setup runs at the same time cannot create two workers.
+
+The join token appears once, in the `join_token` field of the `worker` entry of the stdout document, and nowhere else: not on stderr, not in a log. Capture stdout, extract the field and write it into `UZI_WORKER_TOKEN` in `.env`. If the document is lost, the token is lost; delete the worker in Settings → Workers and create a new one.
+
+```sh
+install -m 600 /dev/null setup.json   # private before it holds the join token
+rc=0
+printf '%s' "$PAT" | docker compose exec -T api /server setup \
+  --forge-type github --forge-base-url https://github.com \
+  --forge-token-file - --repos acme/app,acme/lib --worker-name vps-1 > setup.json || rc=$?
+token=$(jq -r '.worker.join_token // empty' setup.json)
+if [ "$rc" -eq 0 ] && [ -n "$token" ]; then
+  printf 'UZI_WORKER_TOKEN=%s\n' "$token" >> .env
+  docker compose --profile agent up -d
+else
+  echo "setup exited $rc and issued no join token; .env is unchanged" >&2
+fi
+```
+
+The example writes `UZI_WORKER_TOKEN` only when setup exits `0` and the report carries a token. On exit `3` (a worker already exists) there is no token, and an empty `UZI_WORKER_TOKEN=` line would override the existing worker's token. `setup.json` holds the join token; delete it after you copy the token. See [configuration.md](configuration.md) for `UZI_WORKER_TOKEN` and `UZI_WORKER_TOKEN_FILE`.
+
+On Kubernetes the primary worker path is hosted workers, which the controller creates; see [openshift.md](openshift.md) and the `workers.*` chart values. Setup creates join-token workers only, so on a hosted-worker install omit `--worker-name`: the step reports `not_requested` and exit codes work as before. Use `--worker-name` on Kubernetes only to start a self-hosted worker outside the cluster.
+
+Setup writes one JSON document to stdout and progress notes and log lines to stderr. Neither stream carries the forge token: setup replaces it in every report field, note and log line. The one secret on stdout is the worker join token, printed once on purpose. A database connection error prints a fixed message, not the raw error, which can hold the password. The document has `schema_version`, an overall `status`, and one entry per step (`forge`, `discovery`, each repo in `repos`, `worker`). Step statuses:
+
+| Status | Meaning |
+|---|---|
+| `connected` | The forge connection was created. |
+| `present` | A connection for the same forge type and base URL already existed. Setup reuses it untouched: it does not re-verify it, and a different token never replaces it. |
+| `done` | Discovery listed the forge's repos. |
+| `enabled` | The repo is enabled and has its board columns. Re-running re-checks the guard and reports `enabled` again. |
+| `refused` | The token is over-privileged, or the repo guard blocked the repo. `findings` lists the reasons, the same as the web UI shows. |
+| `not_found` | The bot cannot see the repo on the forge. |
+| `failed` | The forge or the database failed; `message` says which step. |
+| `skipped_dependency` | An earlier step failed, so this one did not run. |
+| `not_requested` | Not asked for (the `worker` entry without `--worker-name`). |
+| `created` | The worker was created. The `worker` entry carries `worker_id`, `name` and the one-time `join_token`. |
+| `exists` | The seed admin already owns a worker. No token is issued and none can be recovered. |
+
+Exit codes: `0` every requested step is done or already present; `1` a step failed or was refused, and the report says which; `2` a usage, configuration, schema or owner precondition failed and nothing was written; `3` everything else succeeded but the worker already exists, so no token was issued (the report `status` is `worker_exists`). Exit `1` wins over exit `3`. Writes that completed stay in place. Fix the cause and run the same command again.
+
+Setup runs in its own process, so it cannot wake the API's repo sync. The report sets `issue_sync` to `pending`: the poller imports the new repos' issues on its next interval (`FORGE_POLL_INTERVAL`).
+
 ## Codex account admission upgrades
 
 Deploy the **API first, then workers**. The API applies the additive
