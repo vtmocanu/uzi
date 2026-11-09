@@ -71,6 +71,30 @@ const passDeps = (over: Partial<DiskReclaimDeps> = {}): DiskReclaimDeps => ({
 });
 
 describe("runDiskReclaimPass: markers and .g<N> directories", () => {
+  it("a late retained-home marker does not refund the status-lookup budget", async () => {
+    const other = randomUUID();
+    seed(path.join(home, run), "first");
+    seed(path.join(home, other), "second");
+    const lookedUp: string[] = [], removed: string[] = [];
+    const s = await runDiskReclaimPass(passDeps({
+      maxEntries: 1,
+      statusOf: async (id) => {
+        lookedUp.push(id);
+        await writeRetainedHomeMarker(root, {
+          version: 1, runId: id, predecessorGeneration: 1,
+          predecessorAttemptId: "a1", barePath: "/data/git/x.git",
+        });
+        return "failed";
+      },
+      removeTree: async (_parent, name) => { removed.push(name); },
+    }));
+    assert.equal(lookedUp.length, 1, "a completed lookup spends its budget even when the in-lock marker check skips reclamation");
+    assert.deepEqual(removed, []);
+    assert.equal(s.skippedRetainedHome, 1);
+    assert.equal(s.unexamined, 1);
+    assert.equal(s.stoppedEarly, "budget");
+  });
+
   it("a terminal run with a marker keeps its legacy HOME and provision dir byte for byte; the successor's .g2 dirs are removed", { skip: LINUX_ONLY }, async () => {
     const t = seedBoth();
     await marker();

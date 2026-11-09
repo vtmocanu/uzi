@@ -491,6 +491,7 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
   const now = deps.now ?? Date.now;
   const modelPassMinAgeMs = deps.modelPassMinAgeMs ?? DEFAULT_MODEL_PASS_MIN_AGE_MS;
   const maxEntries = deps.maxEntries ?? DEFAULT_PASS_MAX_ENTRIES;
+  let runBudgetUsed = 0;
   const maxDirReads = deps.maxDirReads ?? DEFAULT_PASS_MAX_DIR_READS;
   const cursors = deps.dirCursors ?? DEFAULT_DIR_CURSORS;
   const runCursors = deps.runCursors ?? DEFAULT_RUN_CURSORS;
@@ -654,11 +655,12 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
       summary.skippedRetainedHome += 1;
       continue;
     }
-    if (summary.runsExamined >= maxEntries) {
+    if (runBudgetUsed >= maxEntries) {
       summary.stoppedEarly = "budget";
       runBudgetStop = true;
       break;
     }
+    runBudgetUsed += 1;
     summary.runsExamined += 1;
     firstExamined ??= dirName;
     lastExamined = dirName;
@@ -707,7 +709,7 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
       }
       // A restore's retained-home marker may have been written during the status lookup above.
       if (parsed.generation === undefined && (await hasMarker(runId))) {
-        summary.runsExamined -= 1; // counted once, as skipped: unexamined subtracts both buckets
+        summary.runsExamined -= 1; // one summary bucket; the completed lookup still spent runBudgetUsed
         summary.skippedRetainedHome += 1;
         return;
       }
