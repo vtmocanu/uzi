@@ -12,7 +12,7 @@ import { mockOtherUserRuns } from "./runHistories";
 //     wait. The existing run-mira-embed and run-andrei-queued fixtures add a running and a
 //     queued one. They show up only in the admin all-users list.
 //   - More other-user runs for the issue-work line (PRD #3879): one planning, one asking, one
-//     Other work (a prompt run). With the base fixtures and the viewer's own revising,
+//     Other work (a prompt run). With the base fixtures and the viewer's own planning, revising,
 //     account-cooldown and ci_fix runs below, every stage of the line holds at least one run.
 //   - One of the viewer's OWN completed issue runs whose open MR shares repo_id + mr_iid with
 //     run-ci-halted, so the pull-request list has a duplicate to collapse.
@@ -52,12 +52,16 @@ const otherRuns: Run[] = [
     issue_title: "Cache the board column counts",
     status: "awaiting_approval",
     updated_at: minsAgo(55),
+    // #4082: no checker could run on its worker, so the plan went to its owner's gate.
+    plan_cross_check_required: true,
+    plan_cross_check_gate_reason: "worker_unsupported",
   }),
   otherUserRun({
     id: "run-ov-sam-running",
     issue_iid: 91,
     issue_title: "Paginate the audit log export",
     status: "running",
+    code_cross_check_required: true,
     worker_id: "w-mira",
     iteration_count: 1,
     claimed_at: minsAgo(12),
@@ -81,6 +85,7 @@ const otherRuns: Run[] = [
     issue_iid: 97,
     issue_title: "Add a dry-run flag to the importer",
     status: "running",
+    plan_cross_check_required: true,
     is_planning: true,
     worker_id: "w-mira",
     claimed_at: minsAgo(6),
@@ -106,9 +111,10 @@ const otherRuns: Run[] = [
   }),
 ];
 
-// The viewer's own runs for the issue-work line: one re-planning after a revise (it counts
-// under Planning, not at the gate), one holding for an account cooldown (Parked, though its
-// status is running), and one CI fix (Other work).
+// The viewer's own runs for the issue-work line: one planning its first plan with the plan
+// cross-check on (#4082), one re-planning after a revise (both count under Planning, not at
+// the gate), one holding for an account cooldown (Parked, though its status is running), and
+// one CI fix (Other work).
 const queuedBase = mockRuns.find((r) => r.id === "run-queued")!;
 
 function ownRun(over: Partial<Run> & Pick<Run, "id" | "issue_iid" | "issue_title" | "status">): Run {
@@ -124,6 +130,21 @@ function ownRun(over: Partial<Run> & Pick<Run, "id" | "issue_iid" | "issue_title
 }
 
 const ownLineRuns: Run[] = [
+  // #4082: mid first turn, no plan yet; its first plan is with the checker (the seed below).
+  ownRun({
+    id: "run-ov-own-planning",
+    issue_iid: 95,
+    issue_title: "Warn before a run's budget runs out",
+    status: "running",
+    is_planning: true,
+    iteration_count: 0,
+    plan_md: null,
+    plan_cross_check_required: true,
+    branch: "agent/issue-95",
+    worker_id: mockWorkers[0].id,
+    claimed_at: minsAgo(9),
+    started_at: minsAgo(9),
+  }),
   ownRun({
     id: "run-ov-own-revising",
     issue_iid: 96,
@@ -206,6 +227,27 @@ export const overviewNextPendingQuestions: Readonly<Record<string, string>> = {
 };
 
 export const overviewNextRuns: Run[] = [...otherRuns, ...ownLineRuns, ownDuplicateMrRun, ownAskingRun];
+
+// Issue #4082: the list-only `cross_check_active` value the server joins from a live checker
+// child, standing in for that join. Issue runs only; mockListRuns and mockAdminListRuns read
+// it under this scenario and set null on every other row. Each seeded run is in a state the
+// server's live predicates can match (the mock test pins this): a plan check on a claimed or
+// running run with plan_cross_check_required, a code check on a running run with
+// code_cross_check_required (run-seeded gets that flag in store.ts under this scenario only).
+// The chips it drives:
+//   - Planning: run-ov-own-planning (yours, its first plan is being checked) and
+//     run-ov-lena-planning (another user's) read "cross-checking";
+//   - Building: run-seeded (yours, a base fixture, overlaid only here) and run-ov-sam-running
+//     (another user's) read "cross-checking";
+//   - Plan review: run-awaiting (yours, base gate reason "revise") reads "cross-check: revise"
+//     and run-ov-priya-approval (gate reason "worker_unsupported") "cross-check: unavailable".
+// No `kind: "cross_check"` child is seeded: the lists exclude them, as the server does.
+export const overviewNextCrossCheckActive: Readonly<Record<string, "plan" | "code">> = {
+  "run-ov-own-planning": "plan",
+  "run-ov-lena-planning": "plan",
+  "run-seeded": "code",
+  "run-ov-sam-running": "code",
+};
 
 // The owner fleet for the Capacity rail (PRD #3880 M1): full, draining mid-roll, manually
 // cordoned, offline, with no advertised cap and with no stats. Replaces the default seeded

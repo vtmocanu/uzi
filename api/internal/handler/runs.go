@@ -137,6 +137,7 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 		applyRevising(&item.RunDTO, revising[row.Run.ID])   // nil map ⇒ false (issue #750)
 		item.CurrentActivity = activity[row.Run.ID]         // nil map ⇒ null (PRD #1064)
 		item.PendingQuestion = pendingQuestions[row.Run.ID] // nil map ⇒ "" ⇒ omitted (PRD #4040)
+		item.CrossCheckActive = crossCheckActive(row.HasLivePlanCrossCheck, row.HasLiveCodeCrossCheck)
 		setProgressPhase(&item.RunDTO)
 		// issue #1418: override runToDTO's capture-unaware landing_state with the
 		// capture-aware value from the query's has_available_capture column, so the list
@@ -207,11 +208,27 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 		item.IssueWebURL = textPtrValue(row.IssueWebUrl.Valid, row.IssueWebUrl.String)
 		applyRevising(&item.RunDTO, revising[row.Run.ID]) // nil map ⇒ false (issue #750)
 		item.CurrentActivity = activity[row.Run.ID]       // nil map ⇒ null (PRD #1064)
+		item.CrossCheckActive = crossCheckActive(row.HasLivePlanCrossCheck, row.HasLiveCodeCrossCheck)
 		setProgressPhase(&item.RunDTO)
 		out = append(out, item)
 	}
 	h.overlayListDecorations(r, out)
 	writeRunList(w, r, out)
+}
+
+// crossCheckActive maps the list query's two live-cross-check flags onto the list-only
+// cross_check_active value (issue #4082): "plan" first, then "code", else nil (JSON null).
+func crossCheckActive(plan, code bool) *string {
+	var s string
+	switch {
+	case plan:
+		s = "plan"
+	case code:
+		s = "code"
+	default:
+		return nil
+	}
+	return &s
 }
 
 // writeRunList writes the decorated run list. With ?view=summary (issue #2661) each row is
