@@ -925,6 +925,12 @@ then report missing or partly delivered criteria:
 - Use minor `Coverage uncertainty:` findings for hosted, live or maintainer-only
   verification. Grade missing worker-deliverable implementation or regression
   tests by impact.
+- The worker's own command results (gate, build, lint, test, red/green and
+  mutation runs, and their logs) are not supplied to the checker. Their absence
+  alone is neither a defect nor a criterion finding, and run results claimed in
+  committed text or the plan are unverified claims, not evidence. A criterion
+  that itself requires a run result gets a minor `Coverage uncertainty:`
+  finding. Tests and validation are judged from the committed code.
 - Treat a missing requirement stated by the issue as a safety, security or
   data-integrity constraint as a critical or major defect, without either prefix.
   Defect titles must not use criterion prefixes.
