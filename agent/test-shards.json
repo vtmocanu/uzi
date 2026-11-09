@@ -1,6 +1,7 @@
 {
   "1/2": [
     "test/clone-attempt-paths.test.ts",
+    "test/epoch-settlement.test.ts",
     "test/git-owed-candidates.test.ts",
     "test/retained-source-ops.test.ts",
     "test/runner-base-align.test.ts",
@@ -15,6 +16,8 @@
     "test/runner-pause-park.test.ts",
     "test/runner-pr-description.test.ts",
     "test/runner-provider-outage-park.test.ts",
+    "test/runner-publication-resume.test.ts",
+    "test/runner-remediation-adoption.test.ts",
     "test/runner-secret-remediation.test.ts",
     "test/runner-terminal-disk-deferral-refusal-context.test.ts",
     "test/runner-terminal-disk-deferral-refusal-direct.test.ts",
