@@ -8,8 +8,8 @@
 
 Task review and then-fix runs inherit a root task's work branch. Reusing that
 branch as their checkpoint identity would mix distinct runs' publication and
-custody evidence. Issue and self-improvement checkpoint keys already have a
-stable legacy contract. This decision separates task recovery coordinates
+custody evidence. Issue, self-improvement and (since #4116) prompt checkpoint
+keys already have a stable legacy contract. This decision separates task recovery coordinates
 without changing task branch publication, MR finalization or read-only review.
 
 ## Decision

@@ -1790,7 +1790,9 @@ process-proof / daemon pending-create residual described above are unchanged.
 
 Checkpoint keys identify the broker's recovery ref separately from the work
 branch. The existing keys stay exactly `agent/issue-<iid>` for issue runs and
-`uzi/self-improve/<run-id>` for self-improvement runs. An enrolled task uses
+`uzi/self-improve/<run-id>` for self-improvement runs. A prompt run uses
+`uzi/prompt-<run-id>`, derived server-side, so an owner pause parks it on a
+published checkpoint like an issue or self-improvement run. An enrolled task uses
 `uzi/task/<its-own-run-id>` as its key. A root task works on that same-named
 branch; a review or then-fix descendant inherits the validated root's
 `uzi/task/<root-run-id>` work branch while keeping its own checkpoint key.
@@ -2937,7 +2939,9 @@ Salvage is **off by default**. An operator turns it on per forge kind with
 `UZI_SALVAGE_FORGES`, a comma list of `github`, `gitlab`, `forgejo`; a forge
 should be added only after the maintainer's real-forge check for that forge
 has passed. With the setting empty, or for an unlisted forge, nothing about
-a failed run's checkpoint changes.
+a failed run's checkpoint changes. Only runs with a checkpoint key are
+eligible: issue, self-improvement, prompt (`uzi/prompt-<run-id>`, since
+#4116) and enrolled task runs.
 
 On an enabled forge, a periodic sweep verifies the tip is still current —
 still at the run's checkpoint ref, `refs/uzi-checkpoints/<checkpoint-key>`,

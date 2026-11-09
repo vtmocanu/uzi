@@ -1761,7 +1761,8 @@ chain in the diagram above, with no intervening `running`.
   identity commit before the bounded API forge proof. The server derives the
   branch from `agentIssueBranch(issue)`, frozen MR-rework `pipeline_ref`, or
   `selfImproveBranch(runID)` (`uzi/self-improve/<run-id>`), respectively;
-  tracking issues, self-improvement pipelines and worker-reported branches
+  `prompt` runs, checkpoint-eligible under `uzi/prompt-<run-id>` since #4116,
+  are not on this path (deferred); tracking issues, self-improvement pipelines and worker-reported branches
   are not proof authority. The recorded MR in the own repository must name
   that branch; BranchHead H must equal MR HeadSHA and CompareAncestry must
   prove H contains or equals the durably reported final SHA. A matching
