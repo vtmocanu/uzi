@@ -64,6 +64,9 @@
 #      mergeability lag) — poll `gh pr view --json state` yourself before the CI watch
 #  10  a `chore(release):` commit's CI is still running on main: merging now would supersede
 #      it and force the release to re-cut. Wait for it (or ask its releaser), then re-run.
+#      Allowed: a run already IN PROGRESS in ci.yml or kind-smoke.yml when live main's file
+#      keeps running main runs (#4107) and this PR does not touch it: a merge then only
+#      replaces a still-pending run. Queued/pending runs, other workflows keep the refusal.
 #      Exception, each run decided and named on its own: allowed when its tag is already on
 #      origin at that commit AND release-ci-coverage.py reports the tag covered without the run
 #      (see release_run_unneeded); any error or unknown keeps the refusal
@@ -317,6 +320,31 @@ fi
 # --wait 0, no --tag so the unverified-hotfix exception never counts), reports success. A pending
 # run is never evidence in that script, so success means coverage holds without it. Prints the
 # rule that decided; returns 0 only when allowed. Any error or unknown state returns 1.
+# A merge's own new main run decides, through ITS workflow's cancel-in-progress, whether a
+# running run in the group is cancelled. Since #4107 ci.yml and kind-smoke.yml on main keep a
+# running main run and only replace a pending one. So a release run is allowed when it is
+# in_progress in one of those two workflows, the merge will not change that file (the PR does not
+# touch it), and live main's copy (contents API, ref main) carries the main-finishes expression as
+# a complete active line. Anything else returns 1 and falls through to release_run_unneeded.
+MAIN_FINISHES_LINE="  cancel-in-progress: \${{ github.ref != 'refs/heads/main' }}"
+running_run_finishes() {  # $1 = run status, $2 = run workflow path
+  local st=$1 path=${2%%@*} files body
+  [ "$st" = in_progress ] || { echo "run is $st, and a merge replaces a run that has not started"; return 1; }
+  case "$path" in
+    .github/workflows/ci.yml|.github/workflows/kind-smoke.yml) ;;
+    *) echo "workflow ${path:-unknown} may still cancel a running main run"; return 1 ;;
+  esac
+  files=$(migration_pr_files "$REPO" "$PR") || { echo "PR files unreadable"; return 1; }
+  printf '%s' "$files" | jq -e --arg p "$path" 'any(.[]; .filename == $p or .previous_filename == $p)' >/dev/null 2>&1 \
+    && { echo "this PR changes $path"; return 1; }
+  body=$(gh api "repos/$REPO/contents/$path?ref=main" 2>/dev/null | jq -r '.content // empty' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null) \
+    && [ -n "$body" ] || { echo "main's $path unreadable"; return 1; }
+  printf '%s\n' "$body" | grep -qxF "$MAIN_FINISHES_LINE" \
+    || { echo "main's $path still cancels running main runs"; return 1; }
+  echo "it is already running in $path, whose main runs finish rather than cancel (#4107)"
+  return 0
+}
+
 release_run_unneeded() {  # $1 = run head sha, $2 = run title
   local sha=$1 title=$2 tag ref typ osha root out
   [ -n "$sha" ] || { echo "run has no head sha"; return 1; }
@@ -342,8 +370,9 @@ release_run_unneeded() {  # $1 = run head sha, $2 = run title
 }
 
 # ---- a release cut waiting on main CI — FAIL CLOSED -----------------------------------------
-# A merge supersedes main's in-flight runs (concurrency), so landing while a
-# `chore(release):` commit's CI runs cancels it and forces the release to re-cut (exit 10).
+# A merge supersedes main's pending runs (concurrency), and in-flight runs of workflows that
+# still cancel, so landing then would cancel a `chore(release):` commit's CI and force the
+# release to re-cut (exit 10). A run already in progress in ci.yml or kind-smoke.yml finishes.
 # Ordinary in-flight main CI does not block. Every non-completed run is enumerated (one
 # paginated Actions query per active status, no recency window). Refuses (exit 2) on a failed
 # or empty page set, a record missing the fields the decision reads, or an incomplete listing:
@@ -364,16 +393,18 @@ for st in queued in_progress waiting requested pending; do
     | map(if type == "object" and (.status|type) == "string" and (.display_title|type) == "string"
             and (.head_sha|type) == "string" and (.id|type) == "number" then . else error("record") end)
     | [.[] | select(.status != "completed" and (.display_title|startswith("chore(release):")))
-        | "\(.head_sha)\t\(.name // "?") #\(.id) \(.head_sha[0:8])\t\(.display_title)"] | join("\n")' 2>/dev/null) \
+        | "\(.head_sha)\t\(.name // "?") #\(.id) \(.head_sha[0:8])\t\(.display_title)\t\(.status)\t\(.path // "-")"] | join("\n")' 2>/dev/null) \
     || { echo "cannot parse main's $st workflow runs; not merging"; exit 2; }
   [ -n "$hit" ] && rel="${rel:+$rel
 }$hit"
 done
 if [ -n "$rel" ]; then
   blocked=""
-  while IFS=$'\t' read -r rsha rdesc rtitle; do
+  while IFS=$'\t' read -r rsha rdesc rtitle rstatus rpath; do
     [ -n "$rsha" ] || continue
-    if why=$(release_run_unneeded "$rsha" "$rtitle"); then
+    if why=$(running_run_finishes "$rstatus" "$rpath"); then
+      echo "  release run $rdesc allowed: $why"
+    elif why=$(release_run_unneeded "$rsha" "$rtitle"); then
       echo "  release run $rdesc allowed: $why"
     else
       echo "  release run $rdesc refused: $why"

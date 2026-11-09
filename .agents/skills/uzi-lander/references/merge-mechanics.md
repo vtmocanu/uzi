@@ -193,7 +193,8 @@ every commit merged since the previous finished run, so confirm the run that inc
 commit (`git merge-base --is-ancestor <yours> <run head>`) goes green. If a peer session
 owns that newer commit (coordinate via SendMessage), its green is theirs to watch and
 report. Rerun only the current tip: rerunning an older `main` commit replaces the pending
-tip run.
+tip run. On a PR, rerun only the current head's run: a rerun of a superseded head's run joins
+the PR's concurrency group and cancels the current head's run (2026-11-09, #4113).
 
 ## Post-merge publish steps
 
