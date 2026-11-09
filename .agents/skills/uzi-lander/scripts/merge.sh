@@ -64,6 +64,9 @@
 #      mergeability lag) — poll `gh pr view --json state` yourself before the CI watch
 #  10  a `chore(release):` commit's CI is still running on main: merging now would supersede
 #      it and force the release to re-cut. Wait for it (or ask its releaser), then re-run.
+#      Allowed: a run already IN PROGRESS in a workflow whose main runs finish rather than
+#      cancel (ci.yml, kind-smoke.yml since #4107; read from the workflow file) — a merge only
+#      replaces a still-pending run. A queued or pending release run keeps the refusal.
 #      Exception, each run decided and named on its own: allowed when its tag is already on
 #      origin at that commit AND release-ci-coverage.py reports the tag covered without the run
 #      (see release_run_unneeded); any error or unknown keeps the refusal
@@ -317,6 +320,26 @@ fi
 # --wait 0, no --tag so the unverified-hotfix exception never counts), reports success. A pending
 # run is never evidence in that script, so success means coverage holds without it. Prints the
 # rule that decided; returns 0 only when allowed. Any error or unknown state returns 1.
+# A main run already in progress is no longer cancelled by a merge in ci.yml and kind-smoke.yml
+# (#4107): their group keeps it running and only replaces a pending run. Allowed only when the run
+# is in_progress, its workflow path is one of those two, and that file at this checkout still
+# carries the main-finishes expression. Anything else (queued, other workflows, a reverted pilot)
+# returns 1 and falls through to release_run_unneeded.
+running_run_finishes() {  # $1 = run status, $2 = run workflow path
+  local st=$1 path=${2%%@*} root
+  [ "$st" = in_progress ] || { echo "run is $st, and a merge replaces a run that has not started"; return 1; }
+  case "$path" in
+    .github/workflows/ci.yml|.github/workflows/kind-smoke.yml) ;;
+    *) echo "workflow ${path:-unknown} may still cancel a running main run"; return 1 ;;
+  esac
+  root=$(git -C "$HERE" rev-parse --show-toplevel 2>/dev/null) && [ -f "$root/$path" ] \
+    || { echo "$path not found next to this checkout"; return 1; }
+  grep -qF "cancel-in-progress: \${{ github.ref != 'refs/heads/main' }}" "$root/$path" \
+    || { echo "$path still cancels running main runs"; return 1; }
+  echo "it is already running in $path, whose main runs finish rather than cancel (#4107)"
+  return 0
+}
+
 release_run_unneeded() {  # $1 = run head sha, $2 = run title
   local sha=$1 title=$2 tag ref typ osha root out
   [ -n "$sha" ] || { echo "run has no head sha"; return 1; }
@@ -342,8 +365,9 @@ release_run_unneeded() {  # $1 = run head sha, $2 = run title
 }
 
 # ---- a release cut waiting on main CI — FAIL CLOSED -----------------------------------------
-# A merge supersedes main's in-flight runs (concurrency), so landing while a
-# `chore(release):` commit's CI runs cancels it and forces the release to re-cut (exit 10).
+# A merge supersedes main's pending runs (concurrency), and in-flight runs of workflows that
+# still cancel, so landing then would cancel a `chore(release):` commit's CI and force the
+# release to re-cut (exit 10). A run already in progress in ci.yml or kind-smoke.yml finishes.
 # Ordinary in-flight main CI does not block. Every non-completed run is enumerated (one
 # paginated Actions query per active status, no recency window). Refuses (exit 2) on a failed
 # or empty page set, a record missing the fields the decision reads, or an incomplete listing:
@@ -364,16 +388,18 @@ for st in queued in_progress waiting requested pending; do
     | map(if type == "object" and (.status|type) == "string" and (.display_title|type) == "string"
             and (.head_sha|type) == "string" and (.id|type) == "number" then . else error("record") end)
     | [.[] | select(.status != "completed" and (.display_title|startswith("chore(release):")))
-        | "\(.head_sha)\t\(.name // "?") #\(.id) \(.head_sha[0:8])\t\(.display_title)"] | join("\n")' 2>/dev/null) \
+        | "\(.head_sha)\t\(.name // "?") #\(.id) \(.head_sha[0:8])\t\(.display_title)\t\(.status)\t\(.path // "-")"] | join("\n")' 2>/dev/null) \
     || { echo "cannot parse main's $st workflow runs; not merging"; exit 2; }
   [ -n "$hit" ] && rel="${rel:+$rel
 }$hit"
 done
 if [ -n "$rel" ]; then
   blocked=""
-  while IFS=$'\t' read -r rsha rdesc rtitle; do
+  while IFS=$'\t' read -r rsha rdesc rtitle rstatus rpath; do
     [ -n "$rsha" ] || continue
-    if why=$(release_run_unneeded "$rsha" "$rtitle"); then
+    if why=$(running_run_finishes "$rstatus" "$rpath"); then
+      echo "  release run $rdesc allowed: $why"
+    elif why=$(release_run_unneeded "$rsha" "$rtitle"); then
       echo "  release run $rdesc allowed: $why"
     else
       echo "  release run $rdesc refused: $why"

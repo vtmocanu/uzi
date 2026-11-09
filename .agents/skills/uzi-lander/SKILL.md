@@ -485,8 +485,8 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    Exit 13 (`MIGRATION_COLLISION`) means an added, renamed or copied migration destination is at or below the live base head: run `land-prep.sh` to renumber, then require fresh exact-head CI and review. Unreadable PR files or base migrations refuse with exit 2. The final check shares takeover's parser; a base move outside the lander lock after the snapshot remains a race.
    It refuses on a moved head, an active rework, red, pending or no passing required checks, a
    git conflict, or (exit 5) any unresolved thread, open code-scanning alert or
-   unacknowledged comment, or (exit 10) a `chore(release):` commit's CI still running on
-   `main` (merging would cancel it; wait, unless its tag is already on origin and `release-ci-coverage.py` reports it covered without that run: the refusal then names the rule), takes the repo-wide merge lock (exit 7 = another lander is merging; wait
+   unacknowledged comment, or (exit 10) a `chore(release):` commit's CI still pending on
+   `main` (merging would replace it; a run already in progress in `ci.yml`/`kind-smoke.yml` finishes since #4107 and is allowed; also allowed when its tag is already on origin and `release-ci-coverage.py` reports it covered without that run: the line names the rule), takes the repo-wide merge lock (exit 7 = another lander is merging; wait
    for its `main` run to appear), confirms `MERGED`, prints `MERGE_SHA`, writes the trail
    line and releases the claim. A classifier block prints the exact command for the
    user's `!` line; after they run it, reconcile the evidence the out-of-band merge skipped

@@ -552,6 +552,28 @@ rel_case relmixed 10
 [ ! -e "$WORK/merge.log" ] || fail "merged over a second, uncovered release run"
 unset TAG_REF_JSON COV_RC
 unset MAIN_RUNS_JSON
+# 8c. Since #4107 a merge no longer cancels a RUNNING ci.yml / kind-smoke.yml main run, only a
+#     pending one. A release run already in progress there is allowed (no tag needed); a queued
+#     one, or one in another workflow, keeps exit 10.
+prun() { jq -nc --arg s "$1" --arg p "$2" --argjson id "$3" '{status:$s,display_title:"chore(release): v0.86.0-rc.30",head_sha:"5f9145cbaaaa0000",name:"CI",path:$p,id:$id}'; }
+MAIN_RUNS_JSON="[$(prun in_progress .github/workflows/ci.yml 911),$(prun in_progress '.github/workflows/kind-smoke.yml@refs/heads/main' 912)]"; export MAIN_RUNS_JSON
+merge_run relrunning
+[ "$rc" -ne 10 ] || fail "a running release run in a no-cancel workflow still refused: $(cat "$WORK/m.relrunning")"
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "running no-cancel release run did not merge: $(cat "$WORK/m.relrunning")"
+grep -q 'whose main runs finish rather than cancel' "$WORK/m.relrunning" || fail "finish rule not printed: $(cat "$WORK/m.relrunning")"
+MAIN_RUNS_JSON="[$(prun queued .github/workflows/ci.yml 913)]"; export MAIN_RUNS_JSON
+merge_run relqueued
+[ "$rc" -eq 10 ] || fail "a queued release run (a merge replaces it) did not refuse, rc=$rc: $(cat "$WORK/m.relqueued")"
+[ ! -e "$WORK/merge.log" ] || fail "merged over a queued release run"
+MAIN_RUNS_JSON="[$(prun in_progress .github/workflows/codeql.yml 914)]"; export MAIN_RUNS_JSON
+merge_run relcodeql
+[ "$rc" -eq 10 ] || fail "a running release run in a cancelling workflow did not refuse, rc=$rc: $(cat "$WORK/m.relcodeql")"
+[ ! -e "$WORK/merge.log" ] || fail "merged over a running release run in another workflow"
+MAIN_RUNS_JSON="[$(prun in_progress .github/workflows/ci.yml 915),$(prun queued .github/workflows/kind-smoke.yml 916)]"; export MAIN_RUNS_JSON
+merge_run relhalf
+[ "$rc" -eq 10 ] || fail "a running run did not excuse a queued sibling, rc=$rc: $(cat "$WORK/m.relhalf")"
+[ ! -e "$WORK/merge.log" ] || fail "merged over a queued sibling release run"
+unset MAIN_RUNS_JSON
 export RUNS_FAIL=1
 merge_run runsfail
 [ "$rc" -eq 2 ] || fail "an unreadable main run page did not refuse, rc=$rc: $(cat "$WORK/m.runsfail")"
@@ -897,4 +919,4 @@ unset POLICY_FETCH_FAIL
 echo 'PASS merge-policy: six changes/admin modes/repo spellings refuse stale policy; rebase/unrelated-main/own-policy-edit/remote-head accept; Git errors refuse; optional lock still checks; confirm-only skips'
 if [ "${UZI_MERGE_POLICY_ONLY:-0}" = 1 ]; then exit 0; fi
 
-echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only/unregistered required checks refuse; a conflicting PR names the conflict; every unresolved thread (bots included), alerts and unacknowledged comments refuse; an in-flight release run on main refuses unless its tag is on origin and coverage holds without it; --expect-closes refuses a closing-reference mismatch"
+echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only/unregistered required checks refuse; a conflicting PR names the conflict; every unresolved thread (bots included), alerts and unacknowledged comments refuse; an in-flight release run on main refuses unless it is already running in a no-cancel workflow (#4107) or its tag is on origin and coverage holds without it; --expect-closes refuses a closing-reference mismatch"
