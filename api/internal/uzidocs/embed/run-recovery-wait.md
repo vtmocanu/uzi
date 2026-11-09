@@ -347,7 +347,7 @@ agent did not start, nothing was adopted, and neither quiescence nor adoption wa
 attempted. See the remediation paragraph in [Run recovery](run-recovery.md).
 
 It also holds a run whose predecessor an independent restore does not support (a
-canonical or hosted worker's predecessor, or one with no boundary record, when the
+canonical-path predecessor, a predecessor met by a hosted worker, or one with no boundary record, when the
 earlier checks pass): the worker refused before any source effect, so nothing was
 adopted, no adoption blocker was recorded and no quiescence was proven. Resume holds
 again on the same release; an owner-held hosted run blocks its worker's ordinary image

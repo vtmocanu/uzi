@@ -2359,12 +2359,13 @@ in the attempt-path mode only, the new attempt already retired before the rollba
 roll-forward then refuses and the predecessor's bytes stay (issue #3981 is open). In the
 holding-root mode a retired new attempt does not cause that refusal; it still completes. The crash model is process and
 container crashes and injected faults only; no storage or power-loss guarantee is claimed.
-The boundary record, the seed's ledger append, the seeding and ready entry writes and the
-retirement tombstone are config renames followed by a sync; the entry writes and the
-tombstone are also read back, while the seed's ledger append is only checked indirectly
-when the next `seeding` write re-reads the config. The writers with no following sync are
-later live successor journal rewrites and the atomic config rewrite (no directory sync);
-the exit's config replacement renames before its sync. Design and
+The boundary record is its own file, published with a non-replacing link, synced and read
+back. The seed's ledger append, the seeding and ready entry writes and the retirement
+tombstone are Git config renames followed by a sync; the entry writes and the tombstone
+are also read back, while the seed's ledger append is only checked indirectly when the
+next `seeding` write re-reads the config. Later live successor journal rewrites have no
+following sync. The restore exit's atomic config rewrite syncs its temporary file but not
+the directory, then the exit syncs. Design and
 evidence: [ADR-1783](../adr/1783-run-quiescence-and-attempt-clone-paths.md#amendment-2026-11-08--3644-independent-restore).
 
 ### Retained sources with no open hold (worker-local inspect and discard)

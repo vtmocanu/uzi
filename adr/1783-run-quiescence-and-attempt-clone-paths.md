@@ -1725,13 +1725,14 @@ nonterminal stop and its server-side accounting.
 
 ### Failure model
 
-Narrowed to process and container crashes and injected faults. The boundary record, the
-seed's ledger append, the seeding and ready entry writes and the retirement tombstone are
-config renames followed by a sync. The entry writes and the tombstone are also read back;
-the seed's ledger append has no direct read-back (the following `seeding` write re-reads
-the config and so checks it indirectly). The writers without a following sync are
-later live successor `writeRestoreJournal` replacements and `rewriteConfigAtomically`
-(no directory sync); the exit's config replacement renames before `syncRestoreWrite`. No storage or power-loss guarantee is claimed. What holds is
+Narrowed to process and container crashes and injected faults. The boundary record is its
+own file, published with a non-replacing link, synced and read back. The seed's ledger
+append, the seeding and ready entry writes and the retirement tombstone are Git config
+renames followed by a sync. The entry writes and the tombstone are also read back; the
+seed's ledger append has no direct read-back (the following `seeding` write re-reads the
+config and so checks it indirectly). Later live successor `writeRestoreJournal`
+replacements have no following sync. The restore exit's `rewriteConfigAtomically` syncs
+its temporary file but not the directory, and the exit then calls `syncRestoreWrite`. No storage or power-loss guarantee is claimed. What holds is
 that a crash leaves a refusal, never a reuse of P.
 
 ### Rollback
