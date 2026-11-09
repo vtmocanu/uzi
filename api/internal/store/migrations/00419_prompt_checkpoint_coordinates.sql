@@ -92,8 +92,12 @@ DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM runs WHERE kind = 'prompt' AND checkpoint_tip IS NOT NULL) THEN
         RAISE EXCEPTION 'cannot downgrade with a published prompt checkpoint';
     END IF;
-    IF EXISTS (SELECT 1 FROM checkpoint_publish_attempts a JOIN runs r ON r.id = a.run_id
-               WHERE r.kind = 'prompt') THEN
+    IF EXISTS (
+        SELECT 1 FROM checkpoint_publish_attempts a
+        WHERE a.branch LIKE 'uzi/prompt-%'
+           OR a.ref LIKE 'refs/uzi-checkpoints/uzi/prompt-%'
+           OR EXISTS (SELECT 1 FROM runs r WHERE r.id = a.run_id AND r.kind = 'prompt')
+    ) THEN
         RAISE EXCEPTION 'cannot downgrade with an unresolved prompt checkpoint publication';
     END IF;
     IF EXISTS (SELECT 1 FROM checkpoint_retentions WHERE branch LIKE 'uzi/prompt-%') THEN

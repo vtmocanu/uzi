@@ -194,7 +194,7 @@ func TestPromptCheckpointMigrationLifecycleLiveDB(t *testing.T) {
 		{"published checkpoint tip", func() {
 			exec(`UPDATE runs SET checkpoint_tip=$2 WHERE id=$1`, run1, tip)
 		}, "cannot downgrade with a published prompt checkpoint"},
-		{"orphaned publish attempt", func() {
+		{"unresolved publish attempt with run row", func() {
 			// The run has no checkpoint_tip and no retention or salvage row.
 			exec(`INSERT INTO checkpoint_publish_attempts(run_id,branch,ref,tip) VALUES($1,$2,$3,$4)`,
 				run1, "uzi/prompt-"+run1.String(), "refs/uzi-checkpoints/uzi/prompt-"+run1.String(), tip)
@@ -208,6 +208,23 @@ func TestPromptCheckpointMigrationLifecycleLiveDB(t *testing.T) {
 				t.Fatal(err)
 			}
 		}, "cannot downgrade with a prompt salvage record"},
+		{"publish attempt with no run row", func() {
+			// 00267 deliberately has no run FK: deleting the run cannot erase a push
+			// that may still reach the forge. Down must protect this orphan directly.
+			missingRun := uuid.New()
+			exec(`INSERT INTO checkpoint_publish_attempts(run_id,branch,ref,tip) VALUES($1,$2,$3,$4)`,
+				missingRun, "uzi/prompt-"+missingRun.String(), "refs/uzi-checkpoints/uzi/prompt-"+missingRun.String(), tip)
+		}, "cannot downgrade with an unresolved prompt checkpoint publication"},
+		{"missing run with prompt branch alone", func() {
+			missingRun := uuid.New()
+			exec(`INSERT INTO checkpoint_publish_attempts(run_id,branch,ref,tip) VALUES($1,$2,$3,$4)`,
+				missingRun, "uzi/prompt-"+missingRun.String(), "refs/uzi-checkpoints/agent/issue-1", tip)
+		}, "cannot downgrade with an unresolved prompt checkpoint publication"},
+		{"missing run with prompt ref alone", func() {
+			missingRun := uuid.New()
+			exec(`INSERT INTO checkpoint_publish_attempts(run_id,branch,ref,tip) VALUES($1,$2,$3,$4)`,
+				missingRun, "agent/issue-1", "refs/uzi-checkpoints/uzi/prompt-"+missingRun.String(), tip)
+		}, "cannot downgrade with an unresolved prompt checkpoint publication"},
 	}
 	for _, tc := range cases {
 		t.Run("Down refuses: "+tc.name, func(t *testing.T) {

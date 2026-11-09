@@ -28,7 +28,8 @@ import (
 
 // Issue #4116: an owner pause of a running prompt run was accepted, but the worker's checkpoint
 // publish was answered Skipped:"unsupported" because the api derived no checkpoint key for the
-// prompt kind, so the run parked with no durable checkpoint. These tests drive the whole
+// prompt kind. The old API returned unsupported for prompt publication, so the worker reported
+// pause_failed instead of parking on a checkpoint. These tests drive the whole
 // authenticated path with the real routers and Postgres: the owner pause (POST
 // /api/runs/{id}/inputs with a uzc_ Bearer, the route the CLI uses), the run's real claim, the
 // worker's publish and paused ACK, the owner resume and the next real claim. Only the forge push
