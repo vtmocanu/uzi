@@ -303,6 +303,7 @@ describe("the park acknowledgement", () => {
     const { before, traps } = await drive(r);
     assert.equal(parks(r).length, 0, "the stop came before the send");
     assert.equal(logged(r, "restore unsupported predecessor held").length, 0);
+    assert.equal(guidance(r).length, 1, "conditional guidance was emitted before the send was stopped");
     for (const text of guidance(r)) {
       assert.ok(text.includes("The worker is requesting an owner hold; the run's status shows whether it was applied"));
       assert.ok(text.includes("If not held, automatic retries follow the ordinary requeue accounting"));
