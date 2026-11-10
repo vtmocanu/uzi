@@ -12211,6 +12211,9 @@ export class GitCache {
    * means "not covered". The `refs/stash` refusal is a belt: stash commits are never reachable
    * from the bare. Any failed read is `false`.
    *
+   * Any stderr from the `for-each-ref` read (e.g. `ignoring broken ref` for an unreadable loose ref,
+   * which Git reports with exit 0 and omits) is not provable and returns `false`.
+   *
    * The transient {@link RECOVERY_BUNDLE_REF} is excluded from `--all`: an aborted bundle pass may
    * leave it behind, and it only retains objects, never proves a side ref held.
    *
@@ -12225,6 +12228,8 @@ export class GitCache {
    */
   private async localRefsReachableFrom(barePath: string, cwd: string, head: string, automatic?: AutomaticPreservation): Promise<boolean> {
     const read = <T>(action: () => Promise<T>) => this.automaticPreservationRead(automatic, action);
+    let refsStderr = "";
+    let refsStderrOversized = false;
     try {
       // Per-worktree HEADs and refs of a linked worktree are invisible to for-each-ref and status,
       // so any `.git/worktrees/` entry (or an unreadable directory) makes coverage unprovable.
@@ -12238,8 +12243,20 @@ export class GitCache {
       if (automatic?.roots.length) {
         return await this.automaticObjectCoverage(barePath, cwd, head, automatic);
       }
-      const refs = () => read(() => this.runGitAsRunner(cwd, ["for-each-ref", "--format=%(objectname) %(refname)"], { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } }));
+      const refs = () => read(() => this.runGitAsRunner(cwd, ["for-each-ref", "--format=%(objectname) %(refname)"], {
+        env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL },
+        onStderr: (text) => {
+          if (refsStderrOversized || text === "") return;
+          if (refsStderr.length + text.length > 4096) { refsStderr = ""; refsStderrOversized = true; }
+          else refsStderr += text;
+        },
+      }));
       const out = await refs();
+      if (refsStderr !== "" || refsStderrOversized) {
+        this.log.warn("stopped source local refs read reported a problem on stderr; not provable", { cwd,
+          stderr: refsStderrOversized ? "[diagnostic omitted: oversized]" : boundedGitDiagnostic(this.log, refsStderr) });
+        return false;
+      }
       if (automatic) this.automaticCollection(out, "\n");
       const shas = new Set<string>();
       for (const line of out.split("\n")) {
@@ -12264,7 +12281,11 @@ export class GitCache {
       return true;
     } catch (err) {
       if (err instanceof AutomaticCompletenessUnknown) throw err;
-      this.log.debug("stopped source local refs could not be proven held", { cwd, error: gitErrorMessage(err) });
+      if (automatic) this.log.debug("stopped source local refs could not be proven held", { cwd, error: gitErrorMessage(err) });
+      else this.log.warn("stopped source local refs could not be proven held", { cwd,
+        ...(refsStderr !== "" || refsStderrOversized ?
+          { stderr: refsStderrOversized ? "[diagnostic omitted: oversized]" : boundedGitDiagnostic(this.log, refsStderr) } :
+          { error: boundedGitDiagnostic(this.log, gitErrorMessage(err)) }) });
       return false;
     }
   }
@@ -12286,6 +12307,11 @@ export class GitCache {
    * `--ignore-submodules=none`. A `.git/modules` store or a populated (non-empty or non-directory)
    * gitlink path is `false`, since the parent proof cannot cover a submodule's own files, commits and refs.
    *
+   * Any stderr from the `status` read is not provable: Git exits 0 with empty stdout and a warning for
+   * an unreadable directory, so the omission would otherwise read as clean. Benign warnings (a
+   * deprecated config key, CRLF warnings included) therefore retain conservatively. Status uses
+   * capture's HOME and attribute inputs; an unreadable HOME attributes file also retains.
+   *
    * This is the LEGACY proof. With `automatic` it delegates to {@link worktreeProvenCleanAutomatic},
    * which does not run `status` over anything it has not first bounded and typed itself; the
    * code below never sees `automatic`.
@@ -12298,6 +12324,8 @@ export class GitCache {
       "-c", "core.checkStat=default", "-c", "core.fileMode=true", "-c", "core.ignoreCase=false",
       "-c", "status.showUntrackedFiles=all", "-c", "core.untrackedCache=false", "-c", "core.fsmonitor=false",
     ];
+    let statusStderr = "";
+    let statusStderrOversized = false;
     try {
       const attributes = await read(() => fs.lstat(path.join(cwd, ".git", "info", "attributes"))).then(() => true, (err: NodeJS.ErrnoException) => {
         if (err.code === "ENOENT") return false;
@@ -12337,7 +12365,19 @@ export class GitCache {
         if (!st.isDirectory() || st.isSymbolicLink()) return false;
         if ((await fs.readdir(gitlink)).length > 0) return false;
       }
-      const status = await read(() => this.runGitAsRunner(cwd, [...hardened, "status", "--porcelain", "--ignore-submodules=none"], { env: { ...READ_ONLY_STATUS.env, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } }));
+      const status = await read(() => this.runGitAsRunner(cwd, [...hardened, "status", "--porcelain", "--ignore-submodules=none"], {
+        env: { ...READ_ONLY_STATUS.env, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL },
+        onStderr: (text) => {
+          if (statusStderrOversized || text === "") return;
+          if (statusStderr.length + text.length > 4096) { statusStderr = ""; statusStderrOversized = true; }
+          else statusStderr += text;
+        },
+      }));
+      if (statusStderr !== "" || statusStderrOversized) {
+        this.log.warn("stopped source status reported a problem on stderr; not provable", { cwd,
+          stderr: statusStderrOversized ? "[diagnostic omitted: oversized]" : boundedGitDiagnostic(this.log, statusStderr) });
+        return false;
+      }
       if (status.split("\n").some((l) => l.length > 0)) return false;
       const flags = await read(() => this.runGitAsRunner(cwd, ["-c", "core.fsmonitor=false", "ls-files", "-v", "-z"], { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } }));
       for (const entry of flags.split("\0")) {
@@ -12347,7 +12387,11 @@ export class GitCache {
       }
       return true;
     } catch (err) {
-      this.log.debug("stopped source status could not be proven clean", { cwd, error: gitErrorMessage(err) });
+      if (err instanceof AutomaticCompletenessUnknown) throw err;
+      this.log.warn("stopped source status could not be proven clean", { cwd,
+        ...(statusStderr !== "" || statusStderrOversized ?
+          { stderr: statusStderrOversized ? "[diagnostic omitted: oversized]" : boundedGitDiagnostic(this.log, statusStderr) } :
+          { error: boundedGitDiagnostic(this.log, gitErrorMessage(err)) }) });
       return false;
     }
   }
@@ -27082,6 +27126,13 @@ function gitErrorMessage(err: unknown): string {
   const stderr = typeof e.stderr === "string" ? e.stderr.trim() : "";
   if (stderr) return stderr;
   return typeof e.message === "string" ? e.message : String(err);
+}
+
+/** A diagnostic is scrubbed with the logger's live registry before it is shortened.
+ * Missing redaction support or an oversized raw value yields no attacker-supplied text. */
+function boundedGitDiagnostic(log: Logger, raw: string): string {
+  if (raw.length > 4096) return "[diagnostic omitted: oversized]";
+  return sanitizeForLog(log.redactDiagnostic?.(raw) ?? "[diagnostic omitted: redactor unavailable]", 253);
 }
 
 /** issue #1769: the env materializeRunnerClone runs its runner-uid git under — `base` (the

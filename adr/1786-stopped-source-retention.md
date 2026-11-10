@@ -158,6 +158,21 @@ below). It returns `covered` only if these checks pass (AI-synced 2026-10-24):
   `.git/modules` store or an index gitlink whose path holds anything but nothing or an empty
   directory is `not_covered`, including under `ignore=all` (set in `.gitmodules` or config),
   since the parent proof says nothing about a submodule's own files, commits or refs;
+- the legacy (non-automatic) proof's hardened `git status --porcelain` read and its
+  `for-each-ref` read of the clone's local refs both leave stderr empty. Any nonempty stderr
+  from either read is `not_covered` (AI-synced 2026-11-10, #4141): Git exits 0 with empty
+  stdout and only warns when it cannot read part of the worktree (`warning: could not open
+  directory 'x/': Permission denied`) or a loose ref (`warning: ignoring broken ref`), so an
+  empty status alone is not proof of a clean tree. No warning text is matched and there is no
+  allowlist, so a benign warning retains conservatively: `core.fsyncObjectFiles=true` in the
+  clone's config (a deprecation warning) makes a clean clone `not_covered` and kept. A
+  CRLF-conversion warning, if `status` emits one, likewise makes the clone `not_covered` and
+  kept; no `core.safecrlf` override is added. The status read still pins
+  `core.excludesFile=/dev/null` but uses capture's HOME and attribute inputs. An unreadable
+  `~/.config/git/attributes` under that HOME can warn when status consults attributes (for
+  example for a stat-dirty tracked file), making even a clean clone `not_covered` and kept. Residual: Git silently
+  omits refs inside an unreadable refs directory (no stderr), so that case is not detected by
+  this rule. The automatic mode, `worktreeStatus` (exit captures) and custody are unchanged;
 - where the final process scan runs, it reaped no writer: a writer reaped after
   the byte checks invalidates them. A writer that writes and exits between reads
   and that scan remains invisible; Codex release instead requires C's live witness;
@@ -196,7 +211,9 @@ Status reads on a kept clone run with `GIT_OPTIONAL_LOCKS=0`, so they never rewr
 index stat cache.
 
 Anything else (unknown, changed, unanchored, unreadable, blocked) is `not_covered` and the
-source is retained. The accepted residuals are stated in `docs/run-recovery.md`: gitignored
+source is retained; on a terminal `record: "none"` exit the clone, its keep flag and the plain
+journal remain, with no stopped marker (AI-synced 2026-11-10, #4141: this includes a read that
+reports a problem on stderr, per the stderr bullet above). The accepted residuals are stated in `docs/run-recovery.md`: gitignored
 files are not covered by any capture; commits reachable only from the reflog (for example
 after `git reset --hard`) are not counted as source; and a bare ref that justified coverage
 can later move (a forge force-push, pin settlement). Refs that exist only because the seed
