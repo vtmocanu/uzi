@@ -484,10 +484,10 @@ _dw_diag_show() {
 # object or its environment), plus the host's userns sysctls (read-only; on their own they do not establish
 # the cause). Evidence goes to stderr and a unique artifacts/docker-wiring/startup-* dir (never
 # artifacts/<phase>/, whose existence makes the driver skip its FAIL capture). Docker reads total at most
-# 62s (60s budget, 10s per read, 2s kill grace). Always returns 0; call it in a subshell so nothing in it
-# can pre-empt the caller's own fail.
+# 62s (a 59s budget, since whole-second SECONDS can under-count elapsed time by up to 1s; 10s per read;
+# 2s kill grace). Always returns 0; call it in a subshell so nothing in it can pre-empt the caller's fail.
 _docker_wire_startup_diagnostics() {
-  local uplog="${1:-}" _dw_start=$SECONDS _dw_budget=60 _dw_cap=10 _dw_limiter="" _dw_diagfile=/dev/null
+  local uplog="${1:-}" _dw_start=$SECONDS _dw_budget=59 _dw_cap=10 _dw_limiter="" _dw_diagfile=/dev/null
   local d="" tmpd="" scratch svc id ids key val host="" fmt
   fmt='name={{.Name}} ExitCode={{.State.ExitCode}} OOMKilled={{.State.OOMKilled}} Error={{.State.Error}} Health={{if .State.Health}}{{.State.Health.Status}} FailingStreak={{.State.Health.FailingStreak}}{{else}}none{{end}}'
   echo "docker wiring diagnostics: the DinD sidecar did not start; capturing its state before cleanup" >&2

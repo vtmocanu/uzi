@@ -2715,7 +2715,7 @@ docker() {
 # read killed at its deadline (DIAG_HANG=ps|logs|inspect|all -> 124 without running it), else runs CMD.
 diag_limiter_stub() {
   local t verb="" a
-  if [ "${1:-}" = -k ]; then shift 2; fi
+  if [ "${1:-}" = -k ] && [ "${2:-}" = 2 ]; then shift 2; else echo "$*" >> "$S/limiter-nokill"; fi
   t="$1"; shift
   printf '%s %s\n' "$t" "$*" >> "$S/limiter-calls"
   if [ -n "${DIAG_SLOW:-}" ]; then SECONDS=$((SECONDS + DIAG_SLOW)); fi
@@ -2804,7 +2804,9 @@ for f in docker_wire_prepare docker_wire_assert docker_restore_posture docker_wi
   type "$f" >/dev/null 2>&1 || { echo "fail: $f not extracted from $LIB" >&2; exit 2; }
 done
 # The shipped limiter resolves a real timeout binary, which cannot exec these shell-function stubs; the
-# harness bounds the same reads through diag_limiter_stub instead (after the extraction check above).
+# harness bounds the same reads through diag_limiter_stub instead (after the extraction check above). The
+# shipped resolver is kept as shipped_docker_wire_diag_limiter for its own PATH-fixture check.
+eval "shipped$(declare -f _docker_wire_diag_limiter)"
 _docker_wire_diag_limiter() { echo diag_limiter_stub; }
 # dw_bounded_run SETUP — reset, then run docker_wire_prepare against a failing `up dind` after eval'ing
 # SETUP in the same subshell. Sets OUT; requires the ORIGINAL failure (message and exit 17) and no other fail.
@@ -2940,6 +2942,7 @@ case "$SCENARIO" in
     [ "$reads" = 8 ] && [ "$(dw_count . "$S/limiter-calls")" = 8 ] \
       || fail "limiter parity: $reads diagnostic reads vs $(dw_count . "$S/limiter-calls") limiter calls: $(cat "$S/limiter-calls")"
     awk '!($1 >= 1 && $1 <= 10) { bad = 1 } END { exit bad }' "$S/limiter-calls" || fail "a read exceeded the 10s cap: $(cat "$S/limiter-calls")"
+    [ ! -e "$S/limiter-nokill" ] || fail "every read needs the 2s kill grace (-k 2): $(cat "$S/limiter-nokill")"
     [ ! -e "$S/inspect-rejected" ] || fail "inspect used a non-allowlisted projection: $(cat "$S/inspect-rejected")"
     case "$OUT" in *ENV-SECRET-MARKER*) fail "the environment leaked into the diagnostics" ;; esac
     ! grep -rqF ENV-SECRET-MARKER "$S/artifacts" || fail "the environment leaked into the artifacts"
@@ -2958,11 +2961,19 @@ case "$SCENARIO" in
     [ "$(dw_count . "$S/limiter-calls")" = 6 ] || fail "timeout: expected 6 bounded reads: $(cat "$S/limiter-calls")"
     [ "$(grep -c 'MISSING-EVIDENCE: docker wiring diagnostics: timed out after 10s' <<< "$OUT")" = 6 ] || fail "timeout: each read must report MISSING-EVIDENCE: $OUT"
     [ "$(dw_count '^(ps -a|logs --no-color)' "$S/calls")" = 0 ] && [ ! -e "$S/inspect-calls" ] || fail "timeout: a read ran past the limiter"
-    # (b) the 60s budget runs out after three 25s reads: the rest are never issued.
+    # (b) the 59s budget runs out after three 25s reads (remaining 59, 34, 9): the rest are never issued.
     dw_bounded_run 'DIAG_SLOW=25'
     [ "$(dw_count . "$S/limiter-calls")" = 3 ] || fail "budget: expected exactly 3 issued reads: $(cat "$S/limiter-calls")"
     [ "$(grep -c 'MISSING-EVIDENCE: docker wiring diagnostics: budget exhausted, skipped' <<< "$OUT")" = 4 ] || fail "budget: 4 skipped reads must be reported: $OUT"
-    awk '!($1 >= 1 && $1 <= 10) { bad = 1 } END { exit bad }' "$S/limiter-calls" || fail "budget: a read exceeded the cap"
+    [ "$(cut -d' ' -f1 "$S/limiter-calls" | tr '\n' ' ')" = '10 10 9 ' ] || fail "budget: per-read limits must be 10 10 9: $(cat "$S/limiter-calls")"
+    # The last read is clamped to the remaining budget (remaining 59, 32, 5), so the total stays bounded.
+    dw_bounded_run 'DIAG_SLOW=27'
+    [ "$(cut -d' ' -f1 "$S/limiter-calls" | tr '\n' ' ')" = '10 10 5 ' ] || fail "budget: the last read must be clamped to 5s: $(cat "$S/limiter-calls")"
+    # The shipped resolver finds timeout, else gtimeout, else nothing (PATH fixtures; command -v is a builtin).
+    mkdir -p "$S/fx-t" "$S/fx-g" "$S/fx-none"; : > "$S/fx-t/timeout"; : > "$S/fx-g/gtimeout"; chmod +x "$S/fx-t/timeout" "$S/fx-g/gtimeout"
+    [ "$(PATH="$S/fx-t" shipped_docker_wire_diag_limiter)" = "$S/fx-t/timeout" ] || fail "the shipped resolver must find timeout"
+    [ "$(PATH="$S/fx-g" shipped_docker_wire_diag_limiter)" = "$S/fx-g/gtimeout" ] || fail "the shipped resolver must fall back to gtimeout"
+    [ -z "$(PATH="$S/fx-none" shipped_docker_wire_diag_limiter)" ] || fail "the shipped resolver must be empty without either"
     # (c) no timeout command: no Docker read at all (no unbounded fallback); local evidence still written.
     dw_bounded_run '_docker_wire_diag_limiter() { :; }'
     case "$OUT" in *'MISSING-EVIDENCE: docker wiring diagnostics: no timeout command; Docker reads skipped'*) ;; *) fail "absent limiter not reported: $OUT" ;; esac
