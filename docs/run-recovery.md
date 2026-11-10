@@ -2298,9 +2298,10 @@ was attempted, so no `adoption_failed` blocker is persisted and no quiescence is
 proven. The feed shows `Independent continuation was refused before any source effect:
 this release does not support this predecessor (<class>).` The worker log records
 `restore unsupported predecessor held`. An owner-held hosted run blocks its worker's
-ordinary image roll until you cancel or discard it. In this release the CLI, web and
-watcher descriptions of this hold still describe the cause's earlier two meanings
-(presentation deferred, [#4000](https://github.com/vtmocanu/uzi/issues/4000)).
+ordinary image roll until you cancel or discard it. The CLI and web descriptions of this
+hold name this third meaning; in this release the watcher skill's description still covers
+only the cause's earlier two meanings (presentation deferred,
+[#4000](https://github.com/vtmocanu/uzi/issues/4000)).
 
 This is a behaviour change for hosted workers, canonical predecessors and predecessors
 started by an older build. Before this release, a claim that found its predecessor still
