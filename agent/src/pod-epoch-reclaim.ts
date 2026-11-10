@@ -507,8 +507,8 @@ async function scratchBody(ctx: ScratchContext, layout: ScratchLayout, pin: Scra
     } else ctx.failFatal();
   }
   // The proof once more after the last join. Everything deleted is already settled, so a failure here only
-  // records that the idle interval cannot be vouched for to its end (the phase is stopped `not_idle`, never fatal).
-  if (launched > 0 && !(await idle(true))) { out.not_idle_after = true; stopPhase("not_idle"); }
+  // records that the idle interval cannot be vouched for to its end (never fatal). An earlier stop reason is kept.
+  if (launched > 0 && !(await idle(true))) { out.not_idle_after = true; if (out.state === "ran") stopPhase("not_idle"); }
   const freeAfter = freeBytes();
   if (freeBefore !== null && freeAfter !== null) {
     const delta = freeAfter - freeBefore;

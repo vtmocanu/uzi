@@ -39,8 +39,8 @@ function strictArgs(root: string, name: string, o: { expect?: string; rootExpect
   return [root, name, "2000000", "60000", o.mode ?? "remove", o.expect ?? devIno(path.join(root, name)), o.sync ?? "", o.phase ?? "pinned",
     o.rootExpect ?? devIno(root), o.oneFs ?? "1", String(o.depth ?? 256)];
 }
-function startHelper(args: string[]): { done: Promise<Run> } {
-  const child = spawn(process.execPath, ["-e", PINNED_SUBTREE_SCRIPT, ...args], { cwd: "/", stdio: ["ignore", "pipe", "ignore"] });
+function startHelper(args: string[], cwd = "/"): { done: Promise<Run> } {
+  const child = spawn(process.execPath, ["-e", PINNED_SUBTREE_SCRIPT, ...args], { cwd, stdio: ["ignore", "pipe", "ignore"] });
   let stdout = "";
   child.stdout.on("data", (b: Buffer) => { stdout += b.toString(); });
   return { done: new Promise(resolve => child.on("close", code => resolve({ code, stdout }))) };
@@ -260,6 +260,20 @@ describe("strict scratch delete script", { skip: fs.existsSync("/proc/self/fd") 
       assert.equal(await exists(path.join(leaf, "a.txt")), false, "same-device content is still removed");
       assert.equal(await exists(leaf), true);
     } finally { await cleanup(syncDir); await cleanup(dir); }
+  });
+
+  it("the other-device seam is inert with an empty sync: a relative .otherdev in the cwd changes nothing", async () => {
+    const { dir, root, leaf } = await fixtureTree();
+    const cwdDir = await mktmp();
+    try {
+      // With sync "" the seam path would be the relative ".otherdev", resolved against the helper's cwd.
+      await fsp.writeFile(path.join(cwdDir, ".otherdev"), "sub");
+      const expect = devIno(leaf);
+      const out = await startHelper(strictArgs(root, "leaf", { sync: "" }), cwdDir).done;
+      assert.equal(out.code, 0);
+      assert.equal(out.stdout, `UZI-SCRATCH-REMOVED ${expect}\n`);
+      assert.equal(await exists(leaf), false);
+    } finally { await cleanup(cwdDir); await cleanup(dir); }
   });
 });
 

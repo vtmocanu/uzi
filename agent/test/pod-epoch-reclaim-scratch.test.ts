@@ -318,8 +318,9 @@ test("weakened fence with a live writer: a held-open leaf is kept, whether held 
       w.fence = FUTURE_FENCE;
       w.census = fakeCensus(() => [dirEntry("a", 1)]);
       w.discard = async () => removed();
-      // The census-time scan passes every name; the pre-delete scan passes exactly the one leaf.
-      w.scan = names => ({ held: new Set(heldAtCensus || names.length === 1 ? ["a"] : []) });
+      // Scan 1 is the pre-census probe, scan 2 the census-time scan, scan 3 the pre-delete scan of the leaf.
+      let scans = 0;
+      w.scan = () => ({ held: new Set(++scans >= (heldAtCensus ? 2 : 3) ? ["a"] : []) });
       const result = await run(w);
       assert.equal(result.scratch.kept.held_open, 1, `heldAtCensus=${heldAtCensus}`);
       assert.equal(result.scratch.deleted, 0);
@@ -905,6 +906,27 @@ test("settlement: the idle proof is run again after the last join; a failure the
     assert.equal(w.calls.quiesce, 3); assert.equal(result.scratch.not_idle_after, false);
     assert.equal(result.scratch.state, "ran");
   });
+});
+
+test("settlement: a failing final idle proof records not_idle_after but keeps an earlier stop reason", async () => {
+  const cases: Array<[string, { outcome: "residue"; bytesLowerBound: number; kind: string; stopPhase: boolean }]> = [
+    ["helper_failed", { outcome: "residue", bytesLowerBound: 0, kind: "helper_failed", stopPhase: true }],
+    ["retained_cap", { outcome: "residue", bytesLowerBound: 1000, kind: "retained", stopPhase: false }],
+  ];
+  for (const [reason, settlement] of cases) {
+    await withWorld(["a", "b", "c", "d"], async w => {
+      w.census = fakeCensus(() => ["a", "b", "c", "d"].map((n, i) => dirEntry(n, i + 1)));
+      w.discard = async () => settlement as never;
+      // Proofs: one initial, one before each delete (1 leaf for helper_failed, 3 for retained_cap), one final.
+      // Only the final proof fails.
+      const finalProof = reason === "helper_failed" ? 3 : 5;
+      let q = 0;
+      w.quiesce = async () => ++q < finalProof;
+      const result = await run(w);
+      assert.equal(result.scratch.not_idle_after, true, reason);
+      assert.equal(result.scratch.state, "stopped"); assert.equal(result.scratch.reason, reason);
+    });
+  }
 });
 
 test("the pool free-bytes delta is reported as an unattributed number, null when unreadable", async () => {

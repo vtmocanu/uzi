@@ -458,7 +458,7 @@ function drain(dirFd, limit, spend, skip, each, onFirst) {
  * When several apply, the exit code precedence is 3 > 9 > 8 > 4. The extra test-only seam phases
  * `rechecked` (after the descendant re-pin comparison, before its `rmdir`) and `final` (after the
  * name pinned `<expect>`, before the final `rmdir`) exist only with a non-empty `<sync>`; so does the
- * `<sync>.otherdev` file, whose content names a descendant that then reads as another st_dev.
+ * `<sync>.otherdev` file, whose content names a descendant that is then skipped as if on another st_dev (the seam can only skip, never equalise).
  */
 export const PINNED_SUBTREE_SCRIPT = `${PINNED_PRELUDE}${STREAM_PRELUDE}
 const [home, rel, maxArg, budgetArg, mode = "remove", expect = "-", sync, phase = "pinned",
@@ -492,7 +492,7 @@ function pause(point) {
   const until = Date.now() + 10000;
   while (!fs.existsSync(sync + ".go") && Date.now() < until) Atomics.wait(cell, 0, 0, 10);
 }
-// Test seam, live only with a non-empty sync: sync.otherdev holding a name makes that descendant read as another st_dev.
+// Test seam, live only with a non-empty sync: sync.otherdev holding a name makes that descendant be skipped as another st_dev.
 function otherDev(name) {
   if (!sync) return false;
   try { return fs.readFileSync(sync + ".otherdev", "utf8") === name; } catch { return false; }
@@ -554,7 +554,7 @@ function removeEntry(dirFd, e, depth) {
   if (strict) {
     try {
       const st = fs.fstatSync(pin, { bigint: true });
-      if ((otherDev(e.name) ? st.dev + 1n : st.dev) !== rootDev) { fs.closeSync(pin); devSkipped = true; return false; }
+      if (otherDev(e.name) || st.dev !== rootDev) { fs.closeSync(pin); devSkipped = true; return false; }
       pinId = st.dev + ":" + st.ino;
     } catch { fs.closeSync(pin); changed = true; return false; }
   }
