@@ -74,7 +74,10 @@ it("lays the judge card out in one column at 400px with Codex chosen and the Cla
   expect(document.activeElement).toBe(runsOn);
   await userEvent.selectOptions(runsOn, "codex");
   await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ judge_runs_on: "codex" }));
-  await waitFor(() => expect(runsOn.disabled).toBe(false));
+  await waitFor(() => expect(runsOn.getAttribute("aria-busy")).toBeNull());
+  // The select stays enabled through the save, so keyboard focus never drops to <body>.
+  expect(runsOn.disabled).toBe(false);
+  expect(document.activeElement).toBe(runsOn);
   expect(runsOn.value).toBe("codex");
 
   const codexLane = screen.getByLabelText("Codex judge model");
@@ -104,4 +107,32 @@ it("lays the judge card out in one column at 400px with Codex chosen and the Cla
   // The dimmed picker is still operable from the keyboard.
   (token as HTMLSelectElement).focus();
   expect(document.activeElement).toBe(token);
+});
+
+it("keeps keyboard focus on the select through a save, so a second ArrowDown still moves it", async () => {
+  // Hold the first PUT open so the second key press lands mid-save.
+  let release: () => void = () => {};
+  mockApi.putMySettings.mockImplementationOnce((patch: UserSettingsPatch) => new Promise((resolve) => {
+    release = () => resolve({ settings: settings(patch.judge_runs_on ?? null) });
+  }));
+  render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+  const runsOn = (await screen.findByLabelText("Judge runs on")) as HTMLSelectElement;
+  await screen.findByLabelText("Token the judge spends");
+  runsOn.focus();
+
+  await userEvent.keyboard("{ArrowDown}");
+  await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ judge_runs_on: "claude" }));
+  expect(document.activeElement).toBe(runsOn);
+  expect(runsOn.getAttribute("aria-busy")).toBe("true");
+
+  await userEvent.keyboard("{ArrowDown}");
+  expect(runsOn.value).toBe("codex");
+  // Queued behind the in-flight save, not sent alongside it.
+  expect(mockApi.putMySettings).toHaveBeenCalledTimes(1);
+  release();
+  await waitFor(() => expect(mockApi.putMySettings).toHaveBeenLastCalledWith({ judge_runs_on: "codex" }));
+  await waitFor(() => expect(runsOn.getAttribute("aria-busy")).toBeNull());
+  expect(mockApi.putMySettings).toHaveBeenCalledTimes(2);
+  expect(runsOn.value).toBe("codex");
+  expect(document.activeElement).toBe(runsOn);
 });

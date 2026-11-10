@@ -83,7 +83,11 @@ func effectiveSettingsRows(s apitypes.UserSettingsDTO, e *apitypes.EffectiveSett
 	for _, r := range modelSettingRows("judge", s.JudgeModels) {
 		for _, c := range e.Models[:min(len(e.Models), 12)] {
 			if c.Setting == "judge_model" && c.Harness == r.Harness {
-				r.Notes = c.Notes
+				for _, n := range c.Notes {
+					if n == "not_used" {
+						r.Notes = append(r.Notes, n)
+					}
+				}
 			}
 		}
 		rows = append(rows, r)

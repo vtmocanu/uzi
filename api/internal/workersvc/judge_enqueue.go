@@ -143,12 +143,13 @@ func (s *Service) maybeEnqueueJudgeByID(ctx context.Context, runID uuid.UUID) {
 // notify seam is never trusted for a spend decision. It is BEST-EFFORT: it never
 // errors the transition that triggered it; every failure is logged and swallowed.
 //
-// Gates, cheap-first: eligible terminal status (completed|failed only — a
+// Gates, in order: eligible terminal status (completed|failed only — a
 // user-cancelled run is not judged, Decision 2), eligible kind (allowlist — no
 // recursion), global judge_enabled, owner opted in, the 4b fail-origin skip sets, the spend
-// guards, and — when the judge's resolved harness is Claude — that the owner has an Anthropic
-// token. The judge's harness is the owner's "Judge runs on" choice, else the run's own
-// (judgeHarnessFor). The one-active-judge-per-target unique index is the final guard: a
+// guards, and then — when the judge's resolved harness is Claude — that the owner has an
+// Anthropic token. The token presence check deliberately runs after the spend guards (PRD
+// #3257), because the harness it depends on is resolved from the owner's setting. The
+// judge's harness is the owner's "Judge runs on" choice, else the run's own (judgeHarnessFor). The one-active-judge-per-target unique index is the final guard: a
 // duplicate raises 23505, treated as "already being judged".
 func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	// Gate 0: only completed/failed are judged. cancelled and non-terminal never are.

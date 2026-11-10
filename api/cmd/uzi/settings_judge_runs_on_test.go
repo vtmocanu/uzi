@@ -107,3 +107,38 @@ func TestSettingsGetJudgeNotUsedNote(t *testing.T) {
 		t.Fatalf("codex judge row = %q, want a row without the not-used note", codex)
 	}
 }
+
+// TestSettingsGetJudgeRowCarriesOnlyNotUsed pins that a note other than not_used on a judge_model
+// cell is not printed on the judge row, while not_used on the same cell still is.
+func TestSettingsGetJudgeRowCarriesOnlyNotUsed(t *testing.T) {
+	judgeRow := func(notes map[string][]string, harness string) string {
+		e := effectiveFixture()
+		for i, c := range e.Models {
+			if c.Setting == "judge_model" {
+				e.Models[i].Notes = notes[c.Harness]
+			}
+		}
+		fc := &uzicli.FakeClient{Settings: settingsWithLegacyCells(), Effective: e}
+		out, stderr, code := runCLI(t, fakeEnv(fc), "settings", "get")
+		if code != 0 || stderr != "" {
+			t.Fatalf("exit %d, stderr %q", code, stderr)
+		}
+		for _, l := range strings.Split(out, "\n") {
+			if f := fields(l); strings.HasPrefix(f, "judge "+harness+" ") {
+				return f
+			}
+		}
+		t.Fatalf("no judge %s row in %q", harness, out)
+		return ""
+	}
+	base := judgeRow(nil, "claude")
+	other := judgeRow(map[string][]string{"claude": {"instance_settings_unavailable"}}, "claude")
+	if other != base {
+		t.Fatalf("judge row with an unrelated note = %q, want it unchanged from %q", other, base)
+	}
+	mixed := judgeRow(map[string][]string{"claude": {"instance_settings_unavailable", "not_used"}}, "claude")
+	want := base + " · not used: the judge runs on the other harness"
+	if mixed != want {
+		t.Fatalf("judge row with both notes = %q, want %q", mixed, want)
+	}
+}

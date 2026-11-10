@@ -83,8 +83,10 @@ The choice is frozen onto the judge run when it is created. An explicit choice
 is never silently replaced: if you pick Claude or Codex and have no usable
 credential for it, the judge is skipped for that run rather than running on
 the other provider or on the run's own harness. The **Run judge** button
-refuses with a message naming the harness ("the judge's harness (<harness>)
-has no usable credential"). The judge always spends your own credential for
+refuses instead, with a message naming the missing credential or the judge's
+harness (for example "add an Anthropic token before running the judge", or
+"the judge's harness (<harness>) has no usable credential"), and never falls
+back to the other provider. The judge always spends your own credential for
 the harness it runs on, never a shared one.
 
 The model, reasoning effort and token controls below apply to the harness the

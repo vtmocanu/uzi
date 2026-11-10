@@ -5,7 +5,7 @@
 // in one scroll; the discriminator is that everything here shapes future runs,
 // while everything on Account is who you are and what you hold.
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, type UserSettingsPatch } from "../lib/api";
@@ -89,7 +89,7 @@ function judgeRunsOnHelp(choice: JudgeRunsOnChoice): string {
   }
   const on = HARNESS_LABEL[choice];
   const other = HARNESS_LABEL[choice === "claude" ? "codex" : "claude"];
-  return `Every run is judged on ${on}, so ${other} runs get a ${on} judge. If ${on} can't run, the judge is skipped with a reason on the run page, never charged to ${other}.`;
+  return `Every run is judged on ${on}, so ${other} runs get a ${on} judge. If ${on} can't run, the judge is skipped, never charged to ${other}.`;
 }
 
 export function RunDefaults() {
@@ -365,19 +365,41 @@ export function RunDefaults() {
   const [judgeRunsOnBusy, setJudgeRunsOnBusy] = useState(false);
   const [judgeRunsOnError, setJudgeRunsOnError] = useState("");
 
+  // The select stays enabled while saving (disabling the focused control drops keyboard
+  // focus to <body>), so a change made mid-save is queued, latest wins, and sent after the
+  // in-flight PUT: one request at a time, in order. A failure falls back to the last saved
+  // value and drops the queue.
+  const judgeRunsOnSaving = useRef(false);
+  const judgeRunsOnQueued = useRef<JudgeRunsOnChoice | null>(null);
+
   const saveJudgeRunsOn = async (next: JudgeRunsOnChoice) => {
-    const previous = judgeRunsOn;
     setJudgeRunsOnError("");
     setJudgeRunsOn(next);
+    if (judgeRunsOnSaving.current) {
+      judgeRunsOnQueued.current = next;
+      return;
+    }
+    judgeRunsOnSaving.current = true;
     setJudgeRunsOnBusy(true);
+    // No save is in flight, so the shown value is the stored one.
+    let stored = judgeRunsOn;
+    let target: JudgeRunsOnChoice | null = next;
     try {
-      const { settings } = await api.putMySettings({ judge_runs_on: next === "" ? null : next });
-      setCommittedSettings(current => current && ({ ...current, judge_runs_on: settings.judge_runs_on }));
-      setJudgeRunsOn(settings.judge_runs_on ?? "");
+      while (target !== null) {
+        const { settings } = await api.putMySettings({ judge_runs_on: target === "" ? null : target });
+        stored = settings.judge_runs_on ?? "";
+        setCommittedSettings(current => current && ({ ...current, judge_runs_on: settings.judge_runs_on }));
+        const queued = judgeRunsOnQueued.current;
+        judgeRunsOnQueued.current = null;
+        target = queued !== null && queued !== stored ? queued : null;
+      }
+      setJudgeRunsOn(stored);
     } catch (err) {
-      setJudgeRunsOn(previous);
+      judgeRunsOnQueued.current = null;
+      setJudgeRunsOn(stored);
       setJudgeRunsOnError(errorMessage(err, "Failed to change where the judge runs"));
     } finally {
+      judgeRunsOnSaving.current = false;
       setJudgeRunsOnBusy(false);
     }
   };
@@ -995,7 +1017,7 @@ export function RunDefaults() {
               id="judge-runs-on"
               className="sm:max-w-xs"
               value={judgeRunsOn}
-              disabled={judgeRunsOnBusy}
+              aria-busy={judgeRunsOnBusy || undefined}
               aria-describedby={`judge-runs-on-help${judgeHarnessUnusable ? " judge-runs-on-unusable" : ""}`}
               onChange={(e) => saveJudgeRunsOn(e.target.value as JudgeRunsOnChoice)}
             >
@@ -1185,8 +1207,8 @@ export function RunDefaults() {
           </Button>
         </div>
         <p className="border-t border-edge pt-3 text-xs text-faint">
-          If the judge&rsquo;s harness can&rsquo;t run, the judge is skipped with a reason on the run page,
-          never charged to the other provider.
+          If the judge&rsquo;s harness can&rsquo;t run, the judge is skipped, never charged to the other
+          provider.
         </p>
       </Card>
 

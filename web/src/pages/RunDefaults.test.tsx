@@ -2640,20 +2640,90 @@ describe("Run defaults — Judge runs on (PRD #3257)", () => {
     await screen.findByLabelText("Codex judge model");
     fireEvent.change(runsOn(), { target: { value: "codex" } });
     await waitFor(() => expect(mockApi.putMySettings).toHaveBeenLastCalledWith({ judge_runs_on: "codex" }));
-    await waitFor(() => expect(runsOn().disabled).toBe(false));
+    await waitFor(() => expect(runsOn().getAttribute("aria-busy")).toBeNull());
     expect(runsOn().value).toBe("codex");
     expect(document.getElementById("judge-runs-on-help")?.textContent).toBe(
-      "Every run is judged on Codex, so Claude runs get a Codex judge. If Codex can't run, the judge is skipped with a reason on the run page, never charged to Claude.",
+      "Every run is judged on Codex, so Claude runs get a Codex judge. If Codex can't run, the judge is skipped, never charged to Claude.",
     );
     fireEvent.change(runsOn(), { target: { value: "claude" } });
     await waitFor(() => expect(mockApi.putMySettings).toHaveBeenLastCalledWith({ judge_runs_on: "claude" }));
-    await waitFor(() => expect(runsOn().disabled).toBe(false));
+    await waitFor(() => expect(runsOn().getAttribute("aria-busy")).toBeNull());
     expect(runsOn().value).toBe("claude");
     fireEvent.change(runsOn(), { target: { value: "" } });
     await waitFor(() => expect(mockApi.putMySettings).toHaveBeenLastCalledWith({ judge_runs_on: null }));
-    await waitFor(() => expect(runsOn().disabled).toBe(false));
+    await waitFor(() => expect(runsOn().getAttribute("aria-busy")).toBeNull());
     expect(runsOn().value).toBe("");
     expect(mockApi.putMySettings).toHaveBeenCalledTimes(3);
+  });
+
+  // A deferred PUT the test settles by hand, so it can observe the select mid-save.
+  const deferredPut = () => {
+    const pending: Array<{ patch: Parameters<typeof api.putMySettings>[0]; resolve: () => void; reject: (e: unknown) => void }> = [];
+    mockApi.putMySettings.mockImplementation((patch) => new Promise((resolve, reject) => {
+      pending.push({ patch, resolve: () => resolve(judgeSettings(patch.judge_runs_on ?? null)), reject });
+    }));
+    return pending;
+  };
+
+  it("keeps the select enabled and focused while the save is in flight", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
+    mockApi.getMySettings.mockResolvedValue(judgeSettings(null));
+    const pending = deferredPut();
+    renderPage();
+    await screen.findByLabelText("Codex judge model");
+    runsOn().focus();
+    expect(document.activeElement).toBe(runsOn());
+    fireEvent.change(runsOn(), { target: { value: "codex" } });
+    await waitFor(() => expect(pending).toHaveLength(1));
+    // Disabling the focused select would drop focus to <body> in a real browser, so a second
+    // ArrowDown would do nothing: it stays enabled and reports busy instead.
+    expect(runsOn().getAttribute("aria-busy")).toBe("true");
+    expect(runsOn().disabled).toBe(false);
+    expect(document.activeElement).toBe(runsOn());
+    pending[0].resolve();
+    await waitFor(() => expect(runsOn().getAttribute("aria-busy")).toBeNull());
+    expect(runsOn().value).toBe("codex");
+    expect(document.activeElement).toBe(runsOn());
+  });
+
+  it("queues a change made mid-save and sends it after the first, never interleaved", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
+    mockApi.getMySettings.mockResolvedValue(judgeSettings(null));
+    const pending = deferredPut();
+    renderPage();
+    await screen.findByLabelText("Codex judge model");
+    fireEvent.change(runsOn(), { target: { value: "claude" } });
+    await waitFor(() => expect(pending).toHaveLength(1));
+    fireEvent.change(runsOn(), { target: { value: "codex" } });
+    // Only one request is ever in flight; the select shows the latest pending choice.
+    expect(pending).toHaveLength(1);
+    expect(runsOn().value).toBe("codex");
+    pending[0].resolve();
+    await waitFor(() => expect(pending).toHaveLength(2));
+    expect(pending.map((p) => p.patch)).toEqual([{ judge_runs_on: "claude" }, { judge_runs_on: "codex" }]);
+    expect(runsOn().value).toBe("codex");
+    pending[1].resolve();
+    await waitFor(() => expect(runsOn().getAttribute("aria-busy")).toBeNull());
+    expect(runsOn().value).toBe("codex");
+    expect(mockApi.putMySettings).toHaveBeenCalledTimes(2);
+  });
+
+  it("falls back to the last saved choice when a queued save fails", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
+    mockApi.getMySettings.mockResolvedValue(judgeSettings(null));
+    const pending = deferredPut();
+    renderPage();
+    await screen.findByLabelText("Codex judge model");
+    fireEvent.change(runsOn(), { target: { value: "claude" } });
+    await waitFor(() => expect(pending).toHaveLength(1));
+    fireEvent.change(runsOn(), { target: { value: "codex" } });
+    pending[0].resolve();
+    await waitFor(() => expect(pending).toHaveLength(2));
+    pending[1].reject(new ApiError(500, "boom"));
+    await waitFor(() => expect(runsOn().getAttribute("aria-busy")).toBeNull());
+    // Claude was saved; the failed Codex save falls back to it, not to the original value.
+    expect(runsOn().value).toBe("claude");
+    expect(screen.getByText(/boom|Failed to change where the judge runs/)).toBeTruthy();
   });
 
   it("falls back to the stored choice and says why when the save fails", async () => {
@@ -2664,7 +2734,7 @@ describe("Run defaults — Judge runs on (PRD #3257)", () => {
     await screen.findByLabelText("Claude judge model");
     await waitFor(() => expect(runsOn().value).toBe("claude"));
     fireEvent.change(runsOn(), { target: { value: "codex" } });
-    await waitFor(() => expect(runsOn().disabled).toBe(false));
+    await waitFor(() => expect(runsOn().getAttribute("aria-busy")).toBeNull());
     expect(runsOn().value).toBe("claude");
     expect(screen.getByText(/boom|Failed to change where the judge runs/)).toBeTruthy();
   });
@@ -2765,7 +2835,7 @@ describe("Run defaults — Judge runs on (PRD #3257)", () => {
     renderPage();
     await screen.findByLabelText("Claude judge model");
     expect(screen.getByText(/If the judge’s harness can’t run/).textContent).toBe(
-      "If the judge’s harness can’t run, the judge is skipped with a reason on the run page, never charged to the other provider.",
+      "If the judge’s harness can’t run, the judge is skipped, never charged to the other provider.",
     );
   });
 });
