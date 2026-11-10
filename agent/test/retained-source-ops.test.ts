@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { createLogger } from "../src/log.js";
 import { attemptGeneration, formatAttemptId } from "../src/attempt-path.js";
 import {
   GitCache,
@@ -920,6 +921,48 @@ describe("verifyStoppedSourceCovered", () => {
           assert.ok(!(warn.error ?? "").includes("\u001b"), "fallback error is sanitized");
         }
       });
+    }
+
+    for (const site of ["refs", "status"] as const) {
+      for (const mode of ["stderr", "fallback"] as const) {
+        it("redacts a registered secret before bounding failed " + site + " " + mode + " diagnostics", async t => {
+          const { a, head } = await capturedWith({});
+          if (site === "status") gitIn(a.path, ["config", "--local", "core.ignoreCase", "false"]);
+          const secret = "registered-secret-" + "0123456789abcdef".repeat(2);
+          const raw = "warning:" + "x".repeat(220) + secret;
+          const logger = createLogger("warn");
+          logger.addSecret(secret);
+          const warnings: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
+          t.mock.method(logger, "warn", (msg: string, fields?: Record<string, unknown>) => { warnings.push({ msg, fields }); });
+          git = new GitCache(fx.dataDir, logger, undefined, testGitCacheOptions());
+          const reader = git as unknown as { runGitAsRunner: (cwd: string | undefined, args: string[],
+            opts?: { env?: NodeJS.ProcessEnv; onStderr?: (text: string) => void }) => Promise<string> };
+          const original = reader.runGitAsRunner.bind(git);
+          let reached = 0;
+          t.mock.method(reader, "runGitAsRunner", async (cwd: string | undefined, args: string[],
+            opts?: { env?: NodeJS.ProcessEnv; onStderr?: (text: string) => void }) => {
+            if (args.includes(site === "refs" ? "for-each-ref" : "status")) {
+              reached++;
+              if (mode === "stderr") opts?.onStderr?.(raw);
+              throw new Error(mode === "fallback" ? raw : "injected Git failure");
+            }
+            return original(cwd, args, opts);
+          });
+          const covered = site === "refs" ? await git["localRefsReachableFrom"](bare, a.path, head) :
+            await git["worktreeCleanHardened"](a.path);
+          assert.equal(covered, false);
+          assert.equal(reached, 1, "the target Git read was reached");
+          const message = site === "refs" ? "stopped source local refs could not be proven held" :
+            "stopped source status could not be proven clean";
+          const warning = warnings.find(w => w.msg === message);
+          assert.ok(warning, "the failed read emits a warning");
+          const detail = warning.fields?.[mode === "stderr" ? "stderr" : "error"];
+          assert.equal(typeof detail, "string");
+          assert.ok((detail as string).length <= 256, "the diagnostic is bounded");
+          assert.ok((detail as string).includes("***REDACTED***"), "the logger registry scrubbed the full secret");
+          assert.ok(!(detail as string).includes(secret.slice(0, 8)), "no long secret prefix survives the bound");
+        });
+      }
     }
 
     // The legacy proof uses capture's HOME and attribute inputs. Git warns when it cannot

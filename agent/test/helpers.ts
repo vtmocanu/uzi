@@ -72,6 +72,7 @@ export function nullLogger(): Logger {
     error() {},
     addSecret() {},
     removeSecret() {},
+    redactDiagnostic: text => text,
     child() {
       return self;
     },
@@ -93,6 +94,7 @@ export function recordingLogger(): { logger: Logger; lines: unknown[] } {
       error: (m, f) => record("error", m, f),
       addSecret() {},
       removeSecret() {},
+      redactDiagnostic: text => text,
       child: (fields) => make({ ...base, ...fields }),
     };
     return self;
