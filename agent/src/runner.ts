@@ -10785,9 +10785,10 @@ export class RunRunner {
       }
     }
 
-    // Self-improvement MR evidence (PRD #46 Decision 10): with no CI on the uzi
-    // repo, the worker itself runs the test suites and flags any guard-critical
-    // path the change touched, folding both into the MR description. Best-effort —
+    // Self-improvement MR evidence (PRD #46 Decision 10, written before uzi had CI):
+    // the worker itself runs the test suites and flags any guard-critical path the
+    // change touched, folding both into the MR description. The PR's exact-head CI
+    // remains the required proof. Best-effort —
     // gathered before the push so the MR opens with its evidence, and a suite that
     // can't run is reported "skipped", never failing the run.
     let selfImproveSection: KindSection | undefined;
