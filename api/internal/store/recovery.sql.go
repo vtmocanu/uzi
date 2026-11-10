@@ -632,17 +632,27 @@ SELECT
     (SELECT count(*) FROM recovery_custody_holds h
         WHERE h.user_id = $1::uuid AND h.state = 'open')::bigint AS open_holds,
     (CASE
+        -- Owner at/over the limit in units: a queued run is blocked unless it is continuation
+        -- exempt, and a run at its own hold bound is blocked regardless.
         WHEN $2::int > 0
              AND admission.counted >= $2::int
         THEN (SELECT count(*) FROM runs r
                 WHERE r.user_id = $1::uuid
                   AND r.status = 'queued'
                   AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
-                  AND NOT (r.claim_generation >= 1
-                           AND EXISTS (SELECT 1 FROM recovery_custody_holds oh
-                                         WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open')
-                           AND (SELECT count(*) FROM recovery_custody_holds oh2
-                                  WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < $2::int))
+                  AND ((SELECT count(*) FROM recovery_custody_holds oh2
+                          WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') >= $2::int
+                       OR NOT (r.claim_generation >= 1
+                               AND EXISTS (SELECT 1 FROM recovery_custody_holds oh
+                                             WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open'))))
+        -- Owner below the limit: only the hard per-run bound blocks.
+        WHEN $2::int > 0
+        THEN (SELECT count(*) FROM runs r
+                WHERE r.user_id = $1::uuid
+                  AND r.status = 'queued'
+                  AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
+                  AND (SELECT count(*) FROM recovery_custody_holds oh2
+                         WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') >= $2::int)
         ELSE 0
      END)::bigint AS blocked_runs
 FROM admission
@@ -661,17 +671,19 @@ type GetCustodyAggregateForOwnerRow struct {
 }
 
 // PRD #1349 M1 (D6/D10): the owner-level custody aggregate the board alert and one-per-episode
-// Slack DM read (M6). open_holds is total open custody; admission_counted_holds is the
-// shared live-claim-discounted admission signal (ADR-2445). blocked_runs counts the owner's QUEUED
-// code-publishing runs currently blocked by the custody-admission predicate: it mirrors the
-// reasonCustodyLimit predicate in workersvc/health.go — a run stays queued for custody ONLY when
-// the owner is AT/OVER the limit — so it is 0 unless admission_counted_holds >= @custody_hold_limit (and a
-// non-positive @custody_hold_limit DISABLES the gate exactly like the claim path, yielding 0).
+// Slack DM read (M6). open_holds is total open custody; admission_counted_holds is the shared
+// admission-UNIT signal (ADR-2445, issue #4162: one run's holds on one original worker are one
+// unit). blocked_runs counts the owner's QUEUED code-publishing runs the ClaimRun custody
+// predicate currently refuses, i.e. exactly NOT(that clause): a run is blocked when its OWN open
+// holds (every open hold, counted or not) reach @custody_hold_limit (the hard per-run bound,
+// counted even when the owner is below the limit) OR the owner is AT/OVER the limit in units and
+// the run is not continuation-exempt. A non-positive @custody_hold_limit DISABLES the gate
+// exactly like the claim path, yielding 0.
 // The code-publishing kinds match ClaimRun's custody-hold CTE (issue/ci_fix/self_improve/prompt/
 // task/mr_rework). Issue #1751 / ADR-1751: a CONTINUATION-EXEMPT queued run (claim_generation >= 1
 // AND its own owner-scoped open-hold count at least 1 and below @custody_hold_limit, the per-run
-// bound that stops a never-started sweep loop) is NOT blocked — ClaimRun admits it at/over the
-// cap — so blocked_runs excludes it with the SAME expression ClaimRun and
+// bound that stops a never-started sweep loop) is NOT blocked by the owner arm — ClaimRun admits
+// it at/over the cap — so the owner arm excludes it with the SAME expression ClaimRun and
 // GetCustodyAdmissionForRun use (parity: the aggregate, the pill and the claim agree).
 // Count columns are cast ::bigint so sqlc types them as int64, never interface{}.
 // Every column is table-qualified and @user_id carries an explicit ::uuid cast: this is a
@@ -1167,7 +1179,8 @@ type ListCustodyAdmissionMembersForOwnerRow struct {
 
 // Issue #2970: per-hold custody admission membership for the owner hold list, one row per
 // state='open' hold. counted mirrors fn_custody_admission_count membership and reason names the
-// first matching cause (closed vocabulary, see migration 00336). Read-only visibility only:
+// first matching cause (closed vocabulary, see migrations 00336 and 00424: same_run_group marks a
+// hold counted once with its run's representative hold on the same worker). Read-only visibility only:
 // admission accounting stays on fn_custody_admission_count. Callers pass the SAME
 // @heartbeat_cutoff as GetCustodyAggregateForOwner so both read one cutoff. Explicit casts type
 // the columns as uuid/bool/string, never interface{}.

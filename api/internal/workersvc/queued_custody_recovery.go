@@ -130,7 +130,6 @@ func (s *Service) parkQueuedCustodyWithHolds(ctx context.Context, qtx *store.Que
 		FrozenTargets: frozen, LockedParentIds: parents, CustodyHoldLimit: limit,
 		LockedHoldIds:       holdIDs,
 		MaxRequeues:         int32(s.p.RunMaxRequeues), //nolint:gosec // bounded configuration, as in the active-run recovery paths.
-		HeartbeatCutoff:     pgconv.Time(now.Add(-s.p.WorkerHeartbeatStale)),
 		SnapshotFreshCutoff: pgconv.Time(now.Add(-(s.p.WorkerHeartbeatStale + s.p.WorkerHeartbeatInterval))),
 	})
 	if err != nil {

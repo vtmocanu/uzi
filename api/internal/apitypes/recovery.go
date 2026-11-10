@@ -396,16 +396,26 @@ type RecoveryCustodyHoldDTO struct {
 	// never re-derived by a client. nil / empty means unknown or not applicable (a non-open hold,
 	// or no membership row), never false. AdmissionReason is a closed vocabulary: live_claim,
 	// duplicate_hold, decision_needed, terminal_run, run_not_live, claim_released,
-	// earlier_generation, other_generation, unknown_evidence, identity_mismatch, stale_heartbeat.
-	// CountsTowardAdmission is true exactly when the hold counts toward AdmissionCountedHolds.
+	// earlier_generation, other_generation, unknown_evidence, identity_mismatch, stale_heartbeat,
+	// and same_run_group (issue #4162: a non-representative hold counted once with its run's
+	// representative hold on the same original worker). CountsTowardAdmission is true exactly
+	// when the hold counts toward AdmissionCountedHolds (an admission unit's representative).
 	CountsTowardAdmission *bool  `json:"counts_toward_admission,omitempty"`
 	AdmissionReason       string `json:"admission_reason,omitempty"`
 }
 
+// ReasonCustodyRunHoldBound is the queued-run health reason when the run's OWN open custody
+// holds have reached the custody hold limit (issue #4162, ClaimRun's hard per-run bound). It is
+// shared by workersvc (which sets it), slacksvc, handler and the CLI, so the wording is never
+// mirrored.
+const ReasonCustodyRunHoldBound = "this run has reached its own custody hold limit; retained holds still protect its work; resolve or discard this run's own retained holds to let it start"
+
 // RecoveryCustodyAggregateDTO is the owner-level custody summary the board alert and the
 // one-per-episode Slack DM read (PRD #1349 M1 D6/D10). OpenHolds is the owner's unresolved
 // (state='open') hold count; CustodyHoldLimit is the configured per-owner admission ceiling;
-// AdmissionCountedHolds is the subset counted by the custody-admission predicate.
+// AdmissionCountedHolds is the owner's custody admission UNITS (issue #4162): the open holds
+// that count toward the limit after the live-claim exclusion, with one run's holds on one
+// original worker counted once. The JSON field name is unchanged for old clients.
 // DecisionNeeded is how many holds await an owner decision; BlockedRuns is the count of the
 // owner's queued code-publishing runs blocked by the custody-admission gate. All five are
 // plain ints (0 is meaningful), always on the wire.

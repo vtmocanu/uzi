@@ -1294,16 +1294,27 @@ WITH checker_template_pins AS MATERIALIZED (
       -- same exemption expression is mirrored by GetCustodyAdmissionForRun (health reason) and
       -- GetCustodyAggregateForOwner.blocked_runs, so the pill, the aggregate and the claim
       -- agree.
+      --
+      -- Issue #4162 / ADR-2445 amendment: the bound is HARD. A run whose own open holds (every
+      -- open hold, counted or not) reach @custody_hold_limit is refused here whatever the owner
+      -- count says; it is ANDed with the owner arm below, not ORed. The owner count is in
+      -- admission UNITS (fn_custody_admission_count groups one run's holds on one original
+      -- worker into a single unit). This is an admission gate with ADR-2445 D6 statement-snapshot
+      -- semantics, not a transactional ceiling: the predicate is evaluated in the candidate scan
+      -- before FOR UPDATE OF r SKIP LOCKED, so a claim plus requeue committed between another
+      -- claimant's snapshot and its row lock can be missed. Sequential claims see every
+      -- committed hold. A refused claim inserts no hold (the generation hold INSERT is fed only
+      -- by the claimed row).
       -- Report-only checkers open no custody hold; their exemption is independent
       -- of the bounded continuation exemption for code-publishing runs above.
       AND (@custody_hold_limit::int <= 0
            OR r.kind = 'cross_check'
-           OR (r.claim_generation >= 1
-               AND EXISTS (SELECT 1 FROM recovery_custody_holds oh
-                             WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open')
-               AND (SELECT count(*) FROM recovery_custody_holds oh2
-                      WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < @custody_hold_limit::int)
-           OR (SELECT fn_custody_admission_count(@user_id::uuid, @heartbeat_cutoff::timestamptz)) < @custody_hold_limit::int)
+           OR ((SELECT count(*) FROM recovery_custody_holds oh2
+                  WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < @custody_hold_limit::int
+               AND ((r.claim_generation >= 1
+                     AND EXISTS (SELECT 1 FROM recovery_custody_holds oh
+                                   WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open'))
+                    OR (SELECT fn_custody_admission_count(@user_id::uuid, @heartbeat_cutoff::timestamptz)) < @custody_hold_limit::int)))
       -- PRD #3522 M3: the weekly usage reserve admission gate. @reserve_on is true only when the run
       -- owner has a threshold set (users.weekly_reserve_pct); every other @reserve_* param is then
       -- precomputed in Go (workersvc/usage_reserve.go, reserveSnapshot) from the owner's fresh
@@ -2060,16 +2071,19 @@ HAVING count(*) >= @custody_hold_limit::int AND @custody_hold_limit::int > 0;
 
 -- name: GetCustodyAdmissionForRun :one
 -- Issue #1751 / ADR-1751: the per-run custody-admission facts the health resolver reads so
--- its reasonCustodyLimit pill agrees with ClaimRun. open_holds is total open custody;
--- admission_counted_holds is the shared live-claim-discounted count compared against
--- @custody_hold_limit (ADR-2445); continuation_exempt is ClaimRun's continuation exemption, byte-for-byte
--- the same expression: the run was claimed before (claim_generation >= 1) AND its OWN open
--- custody-hold count (owner-scoped) is at least 1 and below @custody_hold_limit. The upper bound
--- stops a run that the never-started sweep keeps requeueing from opening holds forever (see
--- ClaimRun). A continuation-exempt run is never blocked by the custody cap. The separate
--- kind='cross_check' exemption is handled before this health read; hold-free children do not
--- become continuation-exempt. A run that does not exist (or
--- belongs to another owner), or a non-positive limit, yields continuation_exempt = false.
+-- its custody pills agree with ClaimRun. open_holds is total open custody;
+-- admission_counted_holds is the shared admission-UNIT count compared against
+-- @custody_hold_limit (ADR-2445, issue #4162: the live-claim-discounted count with one run's
+-- holds on one original worker grouped into one unit); continuation_exempt is ClaimRun's
+-- continuation exemption, byte-for-byte the same expression: the run was claimed before
+-- (claim_generation >= 1) AND its OWN open custody-hold count (owner-scoped) is at least 1 and
+-- below @custody_hold_limit. own_open_holds is that same own count (every open hold of the run,
+-- counted or not) and run_hold_bound_reached is ClaimRun's hard per-run bound: the limit is
+-- positive and own_open_holds >= the limit. A bound-reached run is refused by ClaimRun even when
+-- the owner is below the limit. The separate kind='cross_check' exemption is handled before this
+-- health read; hold-free children do not become continuation-exempt. A run that does not exist
+-- (or belongs to another owner), or a non-positive limit, yields continuation_exempt = false and
+-- run_hold_bound_reached = false.
 SELECT
     fn_custody_admission_count(@user_id::uuid, @heartbeat_cutoff::timestamptz)::bigint AS admission_counted_holds,
     (SELECT count(*) FROM recovery_custody_holds h
@@ -2080,7 +2094,17 @@ SELECT
                       AND (SELECT count(*) FROM recovery_custody_holds oh2
                              WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < @custody_hold_limit::int)
                 FROM runs r
-                WHERE r.id = @run_id::uuid AND r.user_id = @user_id::uuid), false)::boolean AS continuation_exempt;
+                WHERE r.id = @run_id::uuid AND r.user_id = @user_id::uuid), false)::boolean AS continuation_exempt,
+    COALESCE((SELECT count(*) FROM recovery_custody_holds oh2
+                WHERE oh2.user_id = @user_id::uuid AND oh2.run_id = @run_id::uuid
+                  AND oh2.state = 'open'
+                  AND EXISTS (SELECT 1 FROM runs r
+                                WHERE r.id = @run_id::uuid AND r.user_id = @user_id::uuid)), 0)::bigint AS own_open_holds,
+    COALESCE((SELECT (@custody_hold_limit::int > 0
+                      AND (SELECT count(*) FROM recovery_custody_holds oh2
+                             WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') >= @custody_hold_limit::int)
+                FROM runs r
+                WHERE r.id = @run_id::uuid AND r.user_id = @user_id::uuid), false)::boolean AS run_hold_bound_reached;
 
 -- name: GetRunClaimContext :one
 -- The repo + connection facts the claim payload needs, alongside the run. The

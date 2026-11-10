@@ -1282,7 +1282,7 @@ type healthEligibilityResult struct {
 // must not keep outranking an active cooldown after maintenance ends.
 func QueuedReasonPrecedesCodexAdmission(reason string) bool {
 	switch reason {
-	case reasonHandoffSetup, reasonVaultLocked, reasonCustodyLimit,
+	case reasonHandoffSetup, reasonVaultLocked, reasonCustodyLimit, apitypes.ReasonCustodyRunHoldBound,
 		reasonCustodyLimitUnavailable, reasonCodexAccountUnavailable:
 		return true
 	default:
@@ -1801,7 +1801,7 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 
 func (s *Service) youngQueuedTarget(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds) (string, string) {
 	if reason := s.queuedPrerequisiteReason(ctx, now, r, th); reason != "" {
-		if reason == reasonCustodyLimit {
+		if reason == reasonCustodyLimit || reason == apitypes.ReasonCustodyRunHoldBound {
 			return healthWaitingWorker, reason
 		}
 		return healthOK, ""
@@ -1980,7 +1980,8 @@ func (s *Service) repoNotDockerAllowedReason(ctx context.Context, ownerID uuid.U
 }
 
 // queuedCustodyReason shares the claim admission formula between the early
-// custody diagnostic and the full queued reason ladder. A failed per-run read
+// custody diagnostic and the full queued reason ladder. The per-run hold bound
+// (apitypes.ReasonCustodyRunHoldBound) is resolved before the owner-limit arm. A failed per-run read
 // falls through; an unavailable setting remains a distinct prerequisite.
 func (s *Service) queuedCustodyReason(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds) string {
 	if r.Kind != "cross_check" {
@@ -1998,6 +1999,10 @@ func (s *Service) queuedCustodyReason(ctx context.Context, now time.Time, r stor
 		})
 		if cerr != nil {
 			slog.Error("health: read custody admission", "run_id", r.ID, "error", cerr)
+		} else if adm.RunHoldBoundReached {
+			// ClaimRun's hard per-run bound (issue #4162) refuses the run whatever the owner count
+			// says, so it is the binding cause and outranks the owner-limit reason.
+			return apitypes.ReasonCustodyRunHoldBound
 		} else if !adm.ContinuationExempt && adm.AdmissionCountedHolds >= int64(th.custodyLimit) {
 			return reasonCustodyLimit
 		}
