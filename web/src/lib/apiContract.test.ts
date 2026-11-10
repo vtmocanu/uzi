@@ -887,6 +887,11 @@ void _releaseCheckStatusFull;
   const extra15: never = null as unknown as Exclude<keyof typeof value15, keyof Harness>;
   const full15: Widen<Harness> = value15;
   void missing15; void extra15; void full15;
+  const value16 = adminUsageFull.users[0].last7_harness_runs;
+  const missing16: never = null as unknown as Exclude<keyof Harness, keyof typeof value16>;
+  const extra16: never = null as unknown as Exclude<keyof typeof value16, keyof Harness>;
+  const full16: Widen<Harness> = value16;
+  void missing16; void extra16; void full16;
   // Fixture-only nulls: AdminUsage allocates users; runOutcomes normalizes origins;
   // the new per-user handler always allocates last_7_days, even for zero usage.
   type OutcomeZero = ZeroOf<RunOutcomes, "fail_origins">;

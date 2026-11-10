@@ -42,7 +42,12 @@ func TestRenderAdminUsageHarnessColumn(t *testing.T) {
 		{"lifetime", "a@example.com 10 7/3 ", "b@example.com 0 0/0 "},
 		{"last_7_days", "a@example.com 4 1/3 ", "b@example.com 0 0/0 "},
 	} {
-		out := renderUsageWindow(t, harnessUsageFixture(), tc.window)
+		u := harnessUsageFixture()
+		out := renderUsageWindow(t, u, tc.window)
+		// The seven-day rewrite works on a copy: the caller's lifetime split is untouched.
+		if h := u.Users[0].HarnessRuns; h == nil || h.Claude != 7 || h.Codex != 3 {
+			t.Errorf("%s render mutated the caller's harness_runs: %+v", tc.window, h)
+		}
 		if got := strings.Fields(firstHeaderLine(t, out)); !equalStringSlices(got, wantHeader) {
 			t.Errorf("%s header=%v want %v", tc.window, got, wantHeader)
 		}

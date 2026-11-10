@@ -102,8 +102,8 @@ function ByUserTable({ admin, window, viewerId, ref }: { admin: AdminUsage; wind
         <p className="mt-2 text-sm text-faint">No usage across the factory yet.</p>
       ) : (
         <div data-testid="by-user-scroll" role="region" aria-label="By user, scrollable" className="mt-2 overflow-x-auto">
-          {/* The Claude / Codex column (#3876) widens the floor; without it the table keeps 640px. */}
-          <table aria-label="By user" className={`w-full ${showHarness ? "min-w-[720px]" : "min-w-[640px]"} border-collapse text-[13px]`}>
+          {/* The Claude / Codex column (#3876) widens the floor to the mock's 780px; without it the table keeps 640px. */}
+          <table aria-label="By user" className={`w-full ${showHarness ? "min-w-[780px]" : "min-w-[640px]"} border-collapse text-[13px]`}>
             <thead>
               <tr>
                 <Th variant="preview" left>User</Th>

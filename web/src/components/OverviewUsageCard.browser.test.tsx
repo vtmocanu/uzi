@@ -18,8 +18,8 @@ function Harness({ self, admin }: { self: SelfUsage; admin: AdminUsage }) {
 }
 
 // Without the harness split (an older API) the floor stays 640px; with it the Claude / Codex
-// column (#3876) raises it to 720px.
-for (const [label, harness, floor] of [["without", false, 640], ["with", true, 720]] as const) {
+// column (#3876) raises it to 780px, as in the mock.
+for (const [label, harness, floor] of [["without", false, 640], ["with", true, 780]] as const) {
   it(`scrolls the by-user table inside its wrapper at 400px without overflowing the page, ${label} the harness split`, async () => {
     await page.viewport(400, 900);
     const [self, admin] = await Promise.all([mockApi.getUsage(), mockApi.getAdminUsage()]);
