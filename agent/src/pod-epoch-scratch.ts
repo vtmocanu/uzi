@@ -689,8 +689,10 @@ export type Settlement =
 
 /** The plan 1e table. A receipt (exit 0, exactly `UZI-SCRATCH-REMOVED <expect>`, one trailing newline
  * allowed) settles `removed` only when the name no longer pins `expect`; a missing receipt settles
- * `residue` only when the name still pins `expect` with a complete re-census. Everything else, including
- * a receipt next to a name that still pins `expect`, is unresolved. */
+ * `residue` only when the name still pins `expect` with a complete re-census and the helper wrote
+ * nothing to stdout (its only stdout write is the receipt, so any other text is a malformed or
+ * mismatched receipt). Everything else, including a receipt next to a name that still pins `expect`,
+ * is unresolved. */
 export function classifyScratchSettlement(input: SettlementInput): Settlement {
   const unresolved: Settlement = { outcome: "unresolved" };
   if (!input.joined || !input.rootRepinOk || !input.mountsOk) return unresolved;
@@ -700,7 +702,7 @@ export function classifyScratchSettlement(input: SettlementInput): Settlement {
   if (gotReceipt) {
     return post.state === "absent" || post.state === "other" ? { outcome: "removed", bytes: input.bytesBefore } : unresolved;
   }
-  if (post.state !== "same" || !post.complete) return unresolved;
+  if (post.state !== "same" || !post.complete || input.stdout !== "") return unresolved;
   const kind = !input.spawned || input.code === null ? "helper_failed"
     : input.code === 2 || input.code === 3 ? "changed"
       : input.code === 4 || input.code === 8 || input.code === 9 ? "retained" : "helper_failed";

@@ -336,7 +336,9 @@ nothing is deleted. The only visible change is a `scratch` object on the
 `pod_epoch_reclaim` log line that reads `state: "not_run"`. Do not expect
 `TMPDIR` scratch to be reclaimed yet; a full data volume still relies on the
 paths above. When an owner enables the phase, it acts only at a verified pod
-epoch and removes only leaves that every guard proves unused. The `scratch`
+epoch and removes only leaves that pass every epoch admission check, subject to
+the residual risks recorded in ADR-3153 (for example a historical-pod writer the
+checks cannot exclude) and the owner's activation decision. The `scratch`
 object then reports `state` and `reason` (fixed tokens), `layout`, the counts
 `examined`, `kept` by reason, `eligible` (admitted at census time; a leaf
 demoted before its delete is also counted under `kept`), `deleted`, `residue`

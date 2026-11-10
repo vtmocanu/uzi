@@ -729,3 +729,15 @@ test("residue needs a complete post-census, an intact root and mounts", () => {
   assert.deepEqual(settle({ ...base, postCensus: same(100), mountsOk: false }), UNRESOLVED);
   assert.deepEqual(settle({ ...base, postCensus: same(100), joined: false }), UNRESOLVED);
 });
+
+test("no valid receipt with any stdout is unresolved even when the name still pins expect", () => {
+  const cases: Array<[string, Partial<SettlementInput>]> = [
+    ["malformed receipt", { code: 0, stdout: "UZI-SCRATCH-REMOVED garbage\n" }],
+    ["receipt for another dev:ino", { code: 0, stdout: "UZI-SCRATCH-REMOVED 1:3\n" }],
+    ["right receipt with a non-zero exit", { code: 4, stdout: "UZI-SCRATCH-REMOVED 1:2\n" }],
+    ["extra trailing text", { code: 0, stdout: "UZI-SCRATCH-REMOVED 1:2\nextra" }],
+  ];
+  for (const [name, over] of cases) assert.deepEqual(settle({ ...over, postCensus: same(3000) }), UNRESOLVED, name);
+  assert.deepEqual(settle({ code: 4, stdout: "", postCensus: same(3000) }),
+    { outcome: "residue", bytesLowerBound: 5192, kind: "retained", stopPhase: false }, "empty stdout still settles residue");
+});

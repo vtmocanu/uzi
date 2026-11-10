@@ -198,7 +198,8 @@ interface ScratchVerdict {
   reclaim_bytes_state: "estimated" | "unknown";
   /** The root listing hit its entry cap, so some top-level names were never seen. */
   list_overflow: boolean;
-  /** The idle proof failed after the last delete joined (everything deleted was already settled). */
+  /** The idle proof failed after the last delete joined (everything deleted was already settled); the phase then
+   *  reports `stopped`/`not_idle` with the settled counts kept. */
   not_idle_after: boolean;
 }
 const emptyScratch = (): ScratchVerdict => ({
@@ -506,8 +507,8 @@ async function scratchBody(ctx: ScratchContext, layout: ScratchLayout, pin: Scra
     } else ctx.failFatal();
   }
   // The proof once more after the last join. Everything deleted is already settled, so a failure here only
-  // records that the idle interval cannot be vouched for to its end.
-  if (launched > 0 && !(await idle(true))) out.not_idle_after = true;
+  // records that the idle interval cannot be vouched for to its end (the phase is stopped `not_idle`, never fatal).
+  if (launched > 0 && !(await idle(true))) { out.not_idle_after = true; stopPhase("not_idle"); }
   const freeAfter = freeBytes();
   if (freeBefore !== null && freeAfter !== null) {
     const delta = freeAfter - freeBefore;

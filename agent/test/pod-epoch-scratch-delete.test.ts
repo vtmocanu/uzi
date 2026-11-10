@@ -243,7 +243,24 @@ describe("strict scratch delete script", { skip: fs.existsSync("/proc/self/fd") 
       assert.equal(await exists(leaf), false);
     } finally { await cleanup(dir); }
   });
-  // A directory on another st_dev (exit 9) needs a mount, which an unprivileged test cannot build.
+  // A real mount cannot be built unprivileged, so the test-only `<sync>.otherdev` seam (live only with a
+  // non-empty sync) makes one named descendant read as another st_dev.
+  it("a descendant on another device is skipped, never entered or removed: exit 9, no receipt", async () => {
+    const { dir, root, leaf } = await fixtureTree();
+    const syncDir = await mktmp();
+    try {
+      const sync = path.join(syncDir, "sync");
+      await fsp.writeFile(`${sync}.otherdev`, "sub");
+      await fsp.writeFile(`${sync}.go`, "");
+      const out = await runHelper(strictArgs(root, "leaf", { sync }));
+      assert.equal(out.code, 9);
+      assert.equal(out.stdout, "");
+      assert.equal(await exists(path.join(leaf, "sub", "b.txt")), true);
+      assert.equal(await exists(path.join(leaf, "sub", "deeper", "c.txt")), true);
+      assert.equal(await exists(path.join(leaf, "a.txt")), false, "same-device content is still removed");
+      assert.equal(await exists(leaf), true);
+    } finally { await cleanup(syncDir); await cleanup(dir); }
+  });
 });
 
 // ---- the shared spawn/join core -------------------------------------------------------------------
@@ -621,6 +638,35 @@ describe("GitCache.discardEpochScratchLeaf", () => {
         assert.equal(x.f.pending(), 0);
         assert.equal(x.internal.unsettledDeletes.size, 0);
       } finally { await cleanup(x.dir); }
+    });
+
+    it("a descendant on another device settles residue retained through discardEpochScratchLeaf; the leaf stays", async () => {
+      const x = await realFixture();
+      const syncDir = await mktmp();
+      try {
+        const sync = path.join(syncDir, "sync");
+        await fsp.writeFile(`${sync}.otherdev`, "sub");
+        await fsp.writeFile(`${sync}.go`, "");
+        // The launch validator has already admitted the fixed argv (sync ""); only the spawn is rewritten.
+        let closed = false;
+        x.internal.epochNativeTestDependencies = {
+          spawn: ((command: string, args: string[], options: Parameters<typeof spawn>[2]) => {
+            const patched = [...args];
+            patched[patched.indexOf(PINNED_SUBTREE_SCRIPT) + 7] = sync;
+            const child = spawn(command, patched, options);
+            child.once("close", () => { closed = true; });
+            return child;
+          }) as unknown as typeof spawn,
+          alive: () => !closed, kill: () => undefined, joinMs: 2000,
+        };
+        const settlement = await x.git.discardEpochScratchLeaf(x.input);
+        assert.equal(settlement.outcome, "residue");
+        if (settlement.outcome === "residue") { assert.equal(settlement.kind, "retained"); assert.equal(settlement.stopPhase, false); }
+        assert.equal(await exists(path.join(x.leaf, "sub", "b.txt")), true);
+        assert.equal(await exists(x.leaf), true);
+        assert.equal(x.f.pending(), 0);
+        assert.equal(x.internal.unsettledDeletes.size, 0);
+      } finally { await cleanup(syncDir); await cleanup(x.dir); }
     });
 
     it("a leaf it cannot empty settles residue", { skip: asRoot ? "root bypasses directory modes" : false }, async () => {

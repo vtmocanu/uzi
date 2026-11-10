@@ -251,7 +251,11 @@ binding. The amendment of 2026-11-06 above is unaffected.
   top-level entries, 200,000 entries per leaf and 2,000,000 in total, to depth 256, within the pass
   budget minus the 5 s settlement reserve and a 10 s margin; each per-leaf re-census is capped at 30 s; each delete helper at
   2,000,000 entries, depth 256 and 300 s; the whole phase stays inside the existing 600 s pass
-  with its 5 s settlement reserve. With the gate off none of this runs. The real-UID image lane's
+  with its 5 s settlement reserve. With the gate off none of this runs. A bounded synthetic
+  measurement on one development host (2026-11-10, ext-family filesystem, single uid, warm cache;
+  wall time, not reclaimed bytes) took about 0.1 s to census 1,050 entries, 0.35 s for 20,250 and
+  1.1 s for 100,500 (100 leaves), and under 0.1 s for the strict helper to remove one 1,005-entry
+  leaf with its receipt. Hosted volumes will differ; these are not acceptance figures. The real-UID image lane's
   runtime change from the new split-mode leaf is unmeasured (that lane could not run in-run).
 - **Residuals, not accepted until activation.** A historical-pod writer (the #3431 residual) can
   still write inside the revalidation windows between the last re-check and the helper's pin; a

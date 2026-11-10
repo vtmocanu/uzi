@@ -289,6 +289,73 @@ test("kept with a fixed reason: an open descriptor, a mount, an active quiesce h
   });
 });
 
+test("single-UID layout: one pass over a mixed root deletes only the safe orphan", async () => {
+  await withWorld(["orphan", "uzi-worker", "uzi-runner", "uzi-quiesce-1", "cur", "dind"], async w => {
+    // The exact single-UID environment: no split variables, TMPDIR at the shared pool root.
+    w.env = { TMPDIR: "/data/runner/.tmp" };
+    w.options.scratch!.seams!.layout = { mode: "single", root: w.root, ownerUid: process.getuid!(), modes: [0o700] };
+    w.fence = () => ({ t0Ms: 1000 });
+    w.binds = () => ({ state: "read", sources: [join(w.root, "dind", "sub")] });
+    w.census = fakeCensus(() => [dirEntry("orphan", 1), dirEntry("uzi-worker", 2), dirEntry("uzi-runner", 3), dirEntry("uzi-quiesce-1", 4),
+      dirEntry("cur", 5, { ctime: 5000 }), dirEntry("dind", 6)]);
+    w.discard = async input => { await rm(join(w.root, input.name), { recursive: true }); return removed(); };
+    const result = await run(w);
+    const s = result.scratch;
+    assert.equal(s.state, "ran"); assert.equal(s.layout, "single");
+    assert.equal(s.examined, 6); assert.equal(s.eligible, 1); assert.equal(s.deleted, 1); assert.equal(s.residue, 0);
+    assert.deepEqual(s.kept, { protected_name: 2, not_directory: 0, name_refused: 0, active_helper: 1, foreign_owner: 0, mount: 0,
+      incomplete: 0, current_pod: 1, protected_record: 0, bind_referenced: 1, held_open: 0, cap: 0, changed: 0 });
+    assert.deepEqual(w.calls.discards, ["orphan"]);
+    await untouched(w, ["cur", "dind", "uzi-quiesce-1", "uzi-runner", "uzi-worker"]);
+  });
+});
+
+// A clock stepped back and forward leaves every leaf's ctime below T0, so the fence admits everything
+// (FUTURE_FENCE is exactly that). Only the live-writer checks remain between a leaf and its delete.
+test("weakened fence with a live writer: a held-open leaf is kept, whether held at the census or only before the delete", async () => {
+  for (const heldAtCensus of [true, false]) {
+    await withWorld(["a"], async w => {
+      w.fence = FUTURE_FENCE;
+      w.census = fakeCensus(() => [dirEntry("a", 1)]);
+      w.discard = async () => removed();
+      // The census-time scan passes every name; the pre-delete scan passes exactly the one leaf.
+      w.scan = names => ({ held: new Set(heldAtCensus || names.length === 1 ? ["a"] : []) });
+      const result = await run(w);
+      assert.equal(result.scratch.kept.held_open, 1, `heldAtCensus=${heldAtCensus}`);
+      assert.equal(result.scratch.deleted, 0);
+      assert.deepEqual(w.calls.discards, []);
+      await untouched(w, ["a"]);
+    });
+  }
+});
+
+test("weakened fence with a live writer: a leaf that changes between the census and the re-census is kept changed", async () => {
+  await withWorld(["a"], async w => {
+    w.fence = FUTURE_FENCE;
+    let calls = 0;
+    w.census = fakeCensus(() => [dirEntry("a", 1, { bytes: ++calls === 1 ? 4096 : 8192 })]);
+    w.discard = async () => removed();
+    const result = await run(w);
+    assert.equal(result.scratch.kept.changed, 1); assert.equal(result.scratch.deleted, 0);
+    assert.deepEqual(w.calls.discards, []);
+    await untouched(w, ["a"]);
+  });
+});
+
+test("weakened fence with a live writer: a failed idle proof before the delete stops the phase and keeps the leaf", async () => {
+  await withWorld(["a"], async w => {
+    w.fence = FUTURE_FENCE;
+    w.census = fakeCensus(() => [dirEntry("a", 1)]);
+    w.discard = async () => removed();
+    let q = 0;
+    w.quiesce = async () => ++q < 2;
+    const result = await run(w);
+    assert.equal(result.scratch.state, "stopped"); assert.equal(result.scratch.reason, "not_idle");
+    assert.deepEqual(w.calls.discards, []);
+    await untouched(w, ["a"]);
+  });
+});
+
 test("a leaf whose census is incomplete, foreign-owned or on another filesystem is never admitted", async () => {
   await withWorld(["inc", "foreign", "fs", "good"], async w => {
     w.discard = async () => removed();
@@ -819,7 +886,7 @@ test("settlement: the shared scope's finish consults the scratch git for an unse
   });
 });
 
-test("settlement: the idle proof is run again after the last join; a failure there is recorded, not fatal", async () => {
+test("settlement: the idle proof is run again after the last join; a failure there stops the phase not_idle, not fatal", async () => {
   await withWorld(["a"], async w => {
     w.census = fakeCensus(() => [dirEntry("a", 1)]);
     w.discard = async () => removed();
@@ -828,7 +895,7 @@ test("settlement: the idle proof is run again after the last join; a failure the
     const result = await run(w);
     assert.equal(q, 3);
     assert.equal(result.scratch.not_idle_after, true); assert.equal(result.scratch.deleted, 1);
-    assert.equal(result.scratch.state, "ran");
+    assert.equal(result.scratch.state, "stopped"); assert.equal(result.scratch.reason, "not_idle");
     assert.equal(w.calls.handovers, 1);
   });
   await withWorld(["a"], async w => {
@@ -836,6 +903,7 @@ test("settlement: the idle proof is run again after the last join; a failure the
     w.discard = async () => removed();
     const result = await run(w);
     assert.equal(w.calls.quiesce, 3); assert.equal(result.scratch.not_idle_after, false);
+    assert.equal(result.scratch.state, "ran");
   });
 });
 
