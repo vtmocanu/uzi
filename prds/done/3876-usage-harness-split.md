@@ -54,7 +54,7 @@ Acceptance: counts sum to Runs per window; older-server behaviour unchanged; moc
 **Delivered** (2026-11-10):
 - `AdminUsagePerUser` (`api/internal/store/queries/runtime.sql`) adds `claude_run_count`, `codex_run_count`, `last7_claude_run_count` and `last7_codex_run_count` as `FILTER` aggregates over the same `count(t.run_id)` population as `run_count`. A live-DB test (`api/internal/store/admin_usage_harness_runs_livedb_test.go`) asserts that the counts sum to Runs per user and window, including single-harness users.
 - `AdminUserUsageDTO` carries `harness_runs` / `last7_harness_runs` (`HarnessRunsDTO`, pointer with omitempty). The handler sets both on every row, `{0,0}` on zero-usage rows. The contract fixtures were re-recorded and `apiTypes.ts` updated.
-- Query cost at 100k usage-bearing runs over 50 users: median 2985 ms before, 3174 ms after (+6%), with an identical plan. The time is dominated by the existing `run_usage_totals` view.
+- Query cost at 100k usage-bearing runs over 50 users: median 2986 ms before, 3174 ms after (+6%), with an identical plan. The time is dominated by the existing `run_usage_totals` view.
 - `uzi admin usage` shows a `CLAUDE/CODEX` column (e.g. `7/3`) and `--json` passes the fields through. `docs/cli.md` is updated and synced.
 - The Overview preview's By user table shows the "Claude / Codex" column (a two-part bar and "70 / 30"), hidden when any row lacks the selected window's split. The mock API returns the fields.
 
@@ -65,7 +65,7 @@ Acceptance: counts sum to Runs per window; older-server behaviour unchanged; moc
 - **Additive, optional fields**: older web and CLI builds ignore them; a newer web build hides the column against an older server.
 - **Pointer with omitempty** (`harness_runs,omitempty`): an older server's absence decodes to nil, so the CLI can tell "not sent" from 0/0, and `--json` re-emits it absent rather than `null`. This follows the existing optional-field pattern (`agent_source.go` `Counts`). Rejected: a plain struct, which reads as a fabricated 0/0 against an older server.
 - **Hidden on absence, in both clients**: the column shows only when every row carries the selected window's split, the same rule as the PR counts. The CLI omits the column the same way.
-- **"—" for a user with no runs in the window**, never "0 / 0" or an empty bar.
+- **On the web, "—" for a user with no runs in the window**, never "0 / 0" or an empty bar; the CLI prints the raw counts (`0/0`).
 - **Rounding**: Claude's share is rounded and Codex takes the remainder, so the pair always sums to 100. A minority harness can therefore read 0 (1 Codex run of 201 shows "100 / 0"); the cell title keeps the exact counts.
 - **Cross-check children count under the harness they ran on**: a cross-check child runs on the lead's opposite harness under the same user, and `AdminUsagePerUser` counts children, so a Claude-only lead can show Codex runs. The header tooltip says so.
 - **CLI column order deviates from the web**: `CLAUDE/CODEX` sits after `RUNS` in the CLI but last on the web, because the CLI's COST cell carries a long disclosure string that would push a trailing column off-screen. Recorded in `api/cmd/uzi/admin_usage_test.go`.

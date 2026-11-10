@@ -159,7 +159,7 @@ describe("harnessShare (#3876)", () => {
     expect(harnessShare(undefined)).toBeNull();
   });
 
-  it("gives Codex the rounding remainder on a half-way tie (1 / 7 is 13 / 87, not 13 / 88)", () => {
+  it("gives Codex the rounding remainder on a half-way tie (1 Claude / 7 Codex, 12.5%, is 13 / 87, not 13 / 88)", () => {
     expect(harnessShare({ claude: 1, codex: 7 })).toEqual({ claude: 13, codex: 87 });
   });
 
