@@ -252,7 +252,7 @@ type EffectiveModelSource =
   | "cross_check_pin" | "cross_check_worker_default";
 type EffectiveEffortSource =
   | "user_default" | "builtin" | "cross_check_pin" | "cross_check_default";
-type EffectiveHarnessSource = "run_override" | "schedule_pin" | "user_default" | "automatic" | "chosen_at_create";
+type EffectiveHarnessSource = "run_override" | "schedule_pin" | "user_default" | "automatic" | "chosen_at_create" | "same_as_run";
 type EffectiveCredentialSource =
   | "claim_selection" | "codex_default_credential" | "chosen_at_create" | "auto_selection" | "owner_default" | "token_override";
 type EffectiveRefusal =
@@ -297,7 +297,8 @@ export interface Credential {
 }
 
 /** PRD #3254: a predicted harness. `value` is null with source chosen_at_create when a
- *  creation-time policy (a note: automatic_weekly_reset or overflow) picks it at creation. */
+ *  creation-time policy (a note: automatic_weekly_reset or overflow) picks it at creation. The
+ *  judge_harness cell (PRD #3257) is null with source same_as_run when "Judge runs on" is unset. */
 export interface HarnessValue {
   value: string | null;
   source: EffectiveHarnessSource;
@@ -329,6 +330,8 @@ export interface EffectiveSettings {
   models: EffectiveModelCell[];
   efforts: EffectiveEffortCell[];
   cross_check: { models: EffectiveModelCell[]; efforts: EffectiveEffortCell[] };
+  /** PRD #3257: the harness a judge run would use; always present. */
+  judge_harness: HarnessValue;
 }
 
 export interface StartPreviewCredentialOverride {
@@ -519,6 +522,9 @@ export interface UserSettings {
    *  creation falls through the D11 resolver. One of claude|codex when set; the web Run
    *  Defaults page writes it. */
   default_harness: Harness | null;
+  /** Per-user "Judge runs on" (PRD #3257); null = same as the run being reviewed. One of
+   *  claude|codex when set. */
+  judge_runs_on?: Harness | null;
 }
 
 // UserSettingsPatch is the PATCH-like body of PUT /me/settings: a field present
@@ -574,6 +580,9 @@ export interface UserSettingsPatch {
   /** Per-user default harness (PRD #1429 M1 / D3); present-value sets the pin (claude|codex),
    *  present-null clears back to "no preference", absent leaves it unchanged. */
   default_harness?: Harness | null;
+  /** Per-user "Judge runs on" (PRD #3257); same tri-state as default_harness: a value sets the
+   *  judge harness, null clears back to "same as the run", absent leaves it unchanged. */
+  judge_runs_on?: Harness | null;
 }
 
 // AgentTemplateScope mirrors the skill scopes (PRD #18 M6): builtin (shipped),

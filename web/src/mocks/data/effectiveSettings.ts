@@ -363,6 +363,12 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
             "notes": []
           }
         ]
+      },
+      "judge_harness": {
+        "value": null,
+        "source": "same_as_run",
+        "fixed_at": "create",
+        "notes": []
       }
     },
     "start_previews": [
@@ -1688,6 +1694,12 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
             "notes": []
           }
         ]
+      },
+      "judge_harness": {
+        "value": null,
+        "source": "same_as_run",
+        "fixed_at": "create",
+        "notes": []
       }
     },
     "start_previews": [
@@ -2279,6 +2291,12 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
             "notes": []
           }
         ]
+      },
+      "judge_harness": {
+        "value": null,
+        "source": "same_as_run",
+        "fixed_at": "create",
+        "notes": []
       }
     },
     "start_previews": [

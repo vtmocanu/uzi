@@ -145,9 +145,11 @@ func (s *Service) maybeEnqueueJudgeByID(ctx context.Context, runID uuid.UUID) {
 //
 // Gates, cheap-first: eligible terminal status (completed|failed only — a
 // user-cancelled run is not judged, Decision 2), eligible kind (allowlist — no
-// recursion), global judge_enabled, owner opted in, owner has an Anthropic token. The
-// one-active-judge-per-target unique index is the final guard: a duplicate raises
-// 23505, treated as "already being judged".
+// recursion), global judge_enabled, owner opted in, the 4b fail-origin skip sets, the spend
+// guards, and — when the judge's resolved harness is Claude — that the owner has an Anthropic
+// token. The judge's harness is the owner's "Judge runs on" choice, else the run's own
+// (judgeHarnessFor). The one-active-judge-per-target unique index is the final guard: a
+// duplicate raises 23505, treated as "already being judged".
 func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	// Gate 0: only completed/failed are judged. cancelled and non-terminal never are.
 	if run.Status != "completed" && run.Status != "failed" {
@@ -173,7 +175,7 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	// judge for every run (PRD #69), in which case the per-user opt-in is bypassed. The
 	// enforce read is best-effort: an error reads as false (opt-in still required), so a
 	// settings hiccup never forces token spend on. The owner load is still needed for the
-	// Gate 4 token check even in enforced mode.
+	// judge harness (users.judge_runs_on) even in enforced mode.
 	owner, err := s.q.GetUserByID(ctx, run.UserID)
 	if err != nil {
 		slog.Warn("judge enqueue: load owner", "run", run.ID, "error", err)
@@ -187,28 +189,10 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	if !enforceAll && !owner.JudgeEnabled {
 		return
 	}
-	// Gate 4 (PRD #1429 M3, D4): usability of the TARGET run's INHERITED harness, not a
-	// hardcoded Anthropic-token presence check. The judge inherits run.Harness as an
-	// EXPLICIT selection (D4's derived-run inheritance rule), so a Codex-only target must
-	// enqueue a Codex judge and a Claude target must still require Anthropic usability.
-	// Mirrors the mr_rework on-demand door gate (task.go StartMRReworkForRun): a Claude
-	// target keeps the existing Anthropic-token presence check (byte-identical to before
-	// this repair); a Codex target's usability is the resolver's own per-harness usability
-	// (workersvc.resolveUsableCodexCredential), enforced authoritatively a few lines below
-	// by the atomic create (createRunResolved fails ErrNoCredentialForHarness for an
-	// inherited-but-unusable Codex harness) — presence-only here would be the same wrong
-	// shape this repair replaces, so Codex gets no separate presence pre-check.
-	if Harness(run.Harness) != HarnessCodex {
-		if _, err := s.q.GetUserSecretCiphertext(ctx, store.GetUserSecretCiphertextParams{
-			UserID: run.UserID,
-			Kind:   store.KindAnthropicToken,
-		}); err != nil {
-			if !errors.Is(err, pgx.ErrNoRows) {
-				slog.Warn("judge enqueue: token presence check", "run", run.ID, "error", err)
-			}
-			return // no token ⇒ nothing to spend ⇒ no judge run
-		}
-	}
+	// The judge's harness (PRD #3257): the owner's "Judge runs on" choice, else the harness of
+	// the run being judged. Resolved from the owner row read above; a failed read already
+	// returned, so there is no silent fallback to the target's harness.
+	judgeHarness := judgeHarnessFor(owner.JudgeRunsOn, Harness(run.Harness))
 	// Gate 4b (PRD #69 M7a Pass B, Decision 12; PRD #1392 M1; issue #1418): skip the judge for a
 	// failure with no agent behavior to retrospect. Three disjoint sets, differing ONLY in whether
 	// the skip is gated on iteration_count:
@@ -273,16 +257,37 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	if !s.judgeSpendGuardsAllow(ctx, run) {
 		return
 	}
+	// Gate 4 (PRD #1429 M3, D4; PRD #3257): usability of the JUDGE's harness. It sits after
+	// the spend guards so a credential refusal is only ever reported for a run the judge
+	// would otherwise review. The judge harness is passed to createRunResolved below as an
+	// EXPLICIT selection, so a Claude judge keeps the Anthropic-token presence check
+	// (byte-identical to before) while a Codex judge's usability is the resolver's own
+	// per-harness usability (workersvc.resolveUsableCodexCredential), enforced
+	// authoritatively by the atomic create (ErrNoCredentialForHarness for an unusable Codex
+	// harness) — presence-only here would be the same wrong shape this repair replaces, so
+	// Codex gets no separate presence pre-check. Keyed on the RESOLVED judge harness, not
+	// the target's: a Claude target judged on Codex needs no Anthropic token, a Codex target
+	// judged on Claude does.
+	if judgeHarness != HarnessCodex {
+		if _, err := s.q.GetUserSecretCiphertext(ctx, store.GetUserSecretCiphertextParams{
+			UserID: run.UserID,
+			Kind:   store.KindAnthropicToken,
+		}); err != nil {
+			if !errors.Is(err, pgx.ErrNoRows) {
+				slog.Warn("judge enqueue: token presence check", "run", run.ID, "error", err)
+			}
+			return // no token ⇒ nothing to spend ⇒ no judge run
+		}
+	}
 	// Enqueue. The judge run is owned by the SAME user (never cross-user) and targets
 	// this run. A concurrent duplicate trips the one-active-judge-per-target index.
 	//
-	// PRD #1429 M3 (D4): routed through the M2 createRunResolved funnel with the TARGET's
-	// harness as an EXPLICIT selection (replacing the M1 HarnessClaude stopgap), so D11
-	// resolution + the INSERT + (for a Codex target) the binding freeze commit atomically —
-	// the judge is FROZEN onto the inherited harness rather than silently alternating onto
-	// the other provider, and an inherited-but-unusable harness fails closed
-	// (ErrNoCredentialForHarness) instead of inserting a stranded row.
-	judgeHarness := Harness(run.Harness)
+	// PRD #1429 M3 (D4); PRD #3257: routed through the M2 createRunResolved funnel with the
+	// JUDGE's harness (the owner's choice, else the target's) as an EXPLICIT selection, so D11
+	// resolution + the INSERT + (for a Codex judge) the binding freeze commit atomically —
+	// the judge is FROZEN onto that harness rather than silently alternating onto the other
+	// provider, and a chosen-but-unusable harness fails closed (ErrNoCredentialForHarness)
+	// instead of inserting a stranded row.
 	judge, err := s.createRunResolved(ctx, run.UserID, &judgeHarness, func(q Store, resolved resolvedHarness) (store.Run, error) {
 		return q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{
 			UserID:           run.UserID,
@@ -300,11 +305,11 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 		}
 		if errors.Is(err, ErrNoCredentialForHarness) {
 			// Legible harness-specific skip (PRD #1429 D4: "no derived run created" without a
-			// visible reason is not accepted): the inherited harness became unusable between
+			// visible reason is not accepted): the judge's harness became unusable between
 			// Gate 4's pre-check and this atomic create (a credential deleted mid-race), or —
-			// for a Codex target, which has no separate pre-check — right here.
-			slog.Debug("judge enqueue: inherited harness has no usable credential, skipping judge",
-				"run", run.ID, "harness", run.Harness)
+			// for a Codex judge, which has no separate pre-check — right here.
+			slog.Debug("judge enqueue: judge harness has no usable credential, skipping judge",
+				"run", run.ID, "harness", judgeHarness)
 			return
 		}
 		slog.Warn("judge enqueue: create judge run", "run", run.ID, "error", err)

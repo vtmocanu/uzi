@@ -20,6 +20,7 @@
   "dark_theme": null,
   "typeface": null,
   "default_harness": null,
+  "judge_runs_on": null,
   "judge_models": null,
   "summary_models": null,
   "effort_settings": null,

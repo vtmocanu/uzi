@@ -1826,6 +1826,7 @@ type User struct {
 	HarnessOverflowEnabled    bool               `json:"harness_overflow_enabled"`
 	CodexSummaryModel         pgtype.Text        `json:"codex_summary_model"`
 	CredentialsResetAt        pgtype.Timestamptz `json:"credentials_reset_at"`
+	JudgeRunsOn               pgtype.Text        `json:"judge_runs_on"`
 }
 
 type UserCrossCheckPin struct {

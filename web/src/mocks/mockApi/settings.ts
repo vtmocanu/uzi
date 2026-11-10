@@ -113,6 +113,8 @@ const SEED_USER_SETTINGS: UserSettings = {
   now_summary_enabled: null,
   // PRD #1429 M1 (D3): per-user default harness; null = no preference (falls through D11).
   default_harness: null,
+  // PRD #3257: per-user "Judge runs on"; null = same as the run being reviewed.
+  judge_runs_on: null,
   harness_overflow_enabled: false,
   // Issue #3719: how a new Codex run chooses its login. Seeded "auto" so the demo shows the
   // pool at work (a pooled login sits in mocks/data/secrets.ts); the server's own default is
@@ -301,6 +303,8 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     // PRD #1429 M1: optional so a pre-feature blob stays valid; absent/null reads as "no
     // preference" and the SEED fills default_harness=null on load (no key bump needed).
     (u.default_harness === undefined || u.default_harness === null || typeof u.default_harness === "string") &&
+    // PRD #3257: optional so a pre-feature blob stays valid; the SEED fills judge_runs_on=null.
+    (u.judge_runs_on === undefined || u.judge_runs_on === null || typeof u.judge_runs_on === "string") &&
     // Optional for older blobs; the seed fills the default-off overflow setting.
     (u.harness_overflow_enabled === undefined || typeof u.harness_overflow_enabled === "boolean") &&
     // Issue #3719: optional so a pre-feature blob stays valid; the SEED fills it on load.
@@ -1692,6 +1696,14 @@ export const settingsApi = {
         throw new ApiError(400, "default_harness: must be one of claude, codex");
       }
       next = { ...next, default_harness: patch.default_harness };
+    }
+    if (patch.judge_runs_on !== undefined) {
+      // Tri-state like default_harness (PRD #3257): null clears to "same as the run"; anything
+      // but claude|codex is a 400, as the server's validateJudgeRunsOn.
+      if (patch.judge_runs_on !== null && patch.judge_runs_on !== "claude" && patch.judge_runs_on !== "codex") {
+        throw new ApiError(400, "invalid judge_runs_on");
+      }
+      next = { ...next, judge_runs_on: patch.judge_runs_on };
     }
     // Every field validated: commit the staged copy in one shot, then persist.
     userSettings = next;

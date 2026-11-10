@@ -91,6 +91,16 @@
       "label": "chosen when the run is created"
     },
     {
+      "field": "judge_harness",
+      "token": "user_default",
+      "label": "your setting"
+    },
+    {
+      "field": "judge_harness",
+      "token": "same_as_run",
+      "label": "same as the run"
+    },
+    {
       "field": "credential",
       "token": "chosen_at_create",
       "label": "chosen when the run is created"
@@ -139,6 +149,11 @@
       "field": "note",
       "token": "not_sent",
       "label": "not sent"
+    },
+    {
+      "field": "note",
+      "token": "not_used",
+      "label": "not used: the judge runs on the other harness"
     },
     {
       "field": "note",

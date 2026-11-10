@@ -82,6 +82,7 @@ func newSettingsCmd(env Env, gf *globalFlags) *cobra.Command {
 			p.Println(settingsCodexModeLine(settings))
 			p.Println(settingsDefaultHarnessLine(settings.DefaultHarness))
 			p.Println(harnessOverflowLine(settings.HarnessOverflowEnabled, settings.DefaultHarness))
+			p.Println(settingsJudgeRunsOnLine(settings, effective))
 			return nil
 		},
 	}
@@ -99,6 +100,27 @@ func settingsDefaultHarnessLine(h *string) string {
 		return "Default harness: automatic (chosen per run by weekly limits when both harnesses are usable)"
 	}
 	return "Default harness: " + cellText(*h)
+}
+
+// settingsJudgeRunsOnLine renders the per-user "Judge runs on" setting (PRD #3257). The
+// effective view's judge_harness cell is preferred (it carries the source token); without
+// it the stored setting is shown, where null is the default, "same as the run".
+func settingsJudgeRunsOnLine(s apitypes.UserSettingsDTO, effective *apitypes.EffectiveSettingsDTO) string {
+	value, source := s.JudgeRunsOn, "user_default"
+	if effective != nil {
+		value, source = effective.JudgeHarness.Value, effective.JudgeHarness.Source
+	}
+	if value == nil {
+		return "Judge runs on: Same as the run (default)"
+	}
+	name := cellText(*value)
+	switch *value {
+	case "claude":
+		name = "Claude"
+	case "codex":
+		name = "Codex"
+	}
+	return "Judge runs on: " + name + " (" + modelSettingSource("judge_harness", source) + ")"
 }
 
 func settingsCrossCheckRows(s apitypes.UserSettingsDTO) [][]string {

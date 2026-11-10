@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 
@@ -490,11 +491,17 @@ func (h *Handler) RerunJudge(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, workersvc.ErrCodexPoolUnavailable):
 			httpx.JSON(w, http.StatusUnprocessableEntity, codexPoolUnavailableBody())
 		case errors.Is(err, workersvc.ErrNoCredentialForHarness):
-			// PRD #1429 M3 (D4): the judge INHERITS the target run's harness explicitly; if
-			// that harness is no longer usable, creation refuses with no fallback. Same 422
-			// shape mrrework_run.go's identical case uses.
+			// PRD #1429 M3 (D4); PRD #3257: the judge is created on an explicit harness (the
+			// owner's "Judge runs on" choice, else the target's); if that harness is not usable,
+			// creation refuses with no fallback. Same 422 shape mrrework_run.go's identical case
+			// uses; the message names the judge's harness, carried by JudgeHarnessError.
+			msg := "the judge's harness has no usable credential"
+			var jhe *workersvc.JudgeHarnessError
+			if errors.As(err, &jhe) {
+				msg = fmt.Sprintf("the judge's harness (%s) has no usable credential", jhe.Harness)
+			}
 			httpx.JSON(w, http.StatusUnprocessableEntity, map[string]any{
-				"error": "the target run's harness has no usable credential",
+				"error": msg,
 				"code":  "no_credential_for_harness",
 			})
 		case errors.Is(err, workersvc.ErrJudgeAlreadyActive):

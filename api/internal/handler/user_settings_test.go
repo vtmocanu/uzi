@@ -26,7 +26,7 @@ import (
 // SetUserDefaultEffort/SetUserJudgeModel/SetUserSummaryModel/SetUserTheme UPDATEs QueryRow a
 // single Text RETURNING column (discarded by the handler) and SetUserSidebarTokens a uuid[]
 // one; SetUserHarnessModels (PRD #1551 M1) PATCHes the harness, both lanes and the legacy
-// default_model in one conditional UPDATE; GetUserSettings QueryRows twenty-one (default_model,
+// default_model in one conditional UPDATE; GetUserSettings QueryRows twenty-two (default_model,
 // default_effort, judge_model, summary_model, theme, sidebar_token_ids,
 // mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface — the four
 // appearance columns joined the read in PRD #1167 M1 — default_harness, which joined
@@ -40,6 +40,7 @@ type fakeSettingsDB struct {
 	codexEffort     pgtype.Text
 	judge           pgtype.Text
 	codexJudge      pgtype.Text
+	judgeRunsOn     pgtype.Text
 	summary         pgtype.Text
 	codexSummary    pgtype.Text
 	theme           pgtype.Text
@@ -140,6 +141,10 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		if j, ok := args[0].(pgtype.Text); ok {
 			f.codexJudge = j // SetUserCodexJudgeModel: $1 = codex_judge_model
 		}
+	case strings.Contains(sql, "UPDATE users SET judge_runs_on") && len(args) >= 1:
+		if j, ok := args[0].(pgtype.Text); ok {
+			f.judgeRunsOn = j // SetUserJudgeRunsOn: $1 = judge_runs_on (PRD #3257)
+		}
 	case strings.Contains(sql, "UPDATE users SET codex_summary_model") && len(args) >= 1:
 		if s, ok := args[0].(pgtype.Text); ok {
 			f.codexSummary = s // SetUserCodexSummaryModel: $1 = codex_summary_model
@@ -205,6 +210,7 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		codexEffort:     f.codexEffort,
 		judge:           f.judge,
 		codexJudge:      f.codexJudge,
+		judgeRunsOn:     f.judgeRunsOn,
 		summary:         f.summary,
 		codexSummary:    f.codexSummary,
 		theme:           f.theme,
@@ -230,6 +236,7 @@ type fakeSettingsRow struct {
 	codexEffort     pgtype.Text
 	judge           pgtype.Text
 	codexJudge      pgtype.Text
+	judgeRunsOn     pgtype.Text
 	summary         pgtype.Text
 	codexSummary    pgtype.Text
 	theme           pgtype.Text
@@ -279,7 +286,7 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[3].(*pgtype.Text); ok {
 			*p = r.typeface
 		}
-	case 21:
+	case 22:
 		// GetUserSettings: SELECT default_model, default_effort, judge_model,
 		// codex_judge_model, summary_model, codex_summary_model, theme, sidebar_token_ids, mr_rework_enabled,
 		// appearance_mode, light_theme, dark_theme, typeface, default_harness,
@@ -353,6 +360,10 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		}
 		if p, ok := dest[20].(*bool); ok {
 			*p = r.weeklyPause
+		}
+		// judge_runs_on (PRD #3257) is the 22nd column.
+		if p, ok := dest[21].(*pgtype.Text); ok {
+			*p = r.judgeRunsOn
 		}
 	}
 	return nil

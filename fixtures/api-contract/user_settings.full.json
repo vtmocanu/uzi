@@ -35,6 +35,7 @@
   "dark_theme": "x",
   "typeface": "x",
   "default_harness": "x",
+  "judge_runs_on": "x",
   "default_claude_model": "x",
   "default_codex_model": "x",
   "judge_models": [

@@ -88,6 +88,10 @@ type userSettingsDTO struct {
 	// null = "no preference", so implicit run creation falls through D11 rather than pinning.
 	// A non-null value is one of the closed claude|codex set (validateHarness gates the write).
 	DefaultHarness *string `json:"default_harness"`
+	// JudgeRunsOn is the harness the user's judge runs on (PRD #3257), nullable: null =
+	// "same as the run" (the judge runs on the harness of the run it reviews). A non-null
+	// value is claude|codex (validateJudgeRunsOn gates the write).
+	JudgeRunsOn *string `json:"judge_runs_on"`
 	// JudgeModels is the read-only resolved view of both judge lanes (PRD #3245), ordered
 	// claude then codex. It is never accepted on a PUT.
 	JudgeModels []apitypes.ModelSettingCellDTO `json:"judge_models"`
@@ -211,6 +215,7 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 			DarkTheme:              textPtrValue(s.DarkTheme.Valid, s.DarkTheme.String),
 			Typeface:               textPtrValue(s.Typeface.Valid, s.Typeface.String),
 			DefaultHarness:         textPtrValue(s.DefaultHarness.Valid, s.DefaultHarness.String),
+			JudgeRunsOn:            textPtrValue(s.JudgeRunsOn.Valid, s.JudgeRunsOn.String),
 			JudgeModels:            judgeModelCells(judgeLane, codexJudgeLane, instance),
 			SummaryModels:          summaryModelCells(summaryLane, codexSummaryLane, instance),
 			EffortSettings: effortSettingCells(
@@ -315,6 +320,10 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		// fields: absent ⇒ column unchanged, null ⇒ clear to NULL ("no preference"), a
 		// claude|codex value ⇒ validated then set.
 		DefaultHarness json.RawMessage `json:"default_harness"`
+		// judge_runs_on (PRD #3257), same absent/null/value tri-state as default_harness:
+		// absent ⇒ column unchanged, null ⇒ clear to NULL ("same as the run"), a
+		// claude|codex value ⇒ validated then set.
+		JudgeRunsOn json.RawMessage `json:"judge_runs_on"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -548,6 +557,24 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		harnessVal = v
 	}
 
+	var judgeRunsOnVal pgtype.Text
+	judgeRunsOnPresent := req.JudgeRunsOn != nil
+	if judgeRunsOnPresent {
+		var raw *string
+		if err := json.Unmarshal(req.JudgeRunsOn, &raw); err != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid judge_runs_on")
+			return
+		}
+		// Validated in phase 1 with the other fields so a bad value leaves nothing
+		// half-written.
+		v, err := validateJudgeRunsOn(raw)
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		judgeRunsOnVal = v
+	}
+
 	var mrVal pgtype.Bool
 	mrPresent := req.MrReworkEnabled != nil
 	if mrPresent {
@@ -739,6 +766,17 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			CodexJudgeModel: codexJudgeVal,
 		}); err != nil {
 			slog.Error("set user codex judge model", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	if judgeRunsOnPresent {
+		if _, err := h.q.SetUserJudgeRunsOn(r.Context(), store.SetUserJudgeRunsOnParams{
+			ID:          user.ID,
+			JudgeRunsOn: judgeRunsOnVal,
+		}); err != nil {
+			slog.Error("set user judge runs on", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
@@ -1078,6 +1116,24 @@ func validateHarness(raw *string) (pgtype.Text, error) {
 		return pgtype.Text{String: *raw, Valid: true}, nil
 	default:
 		return pgtype.Text{}, fmt.Errorf("default_harness: must be one of %s, %s", workersvc.HarnessClaude, workersvc.HarnessCodex)
+	}
+}
+
+// validateJudgeRunsOn maps a nullable judge_runs_on value to its storage type (PRD #3257):
+// a nil pointer clears to NULL ("same as the run"), "claude"/"codex" becomes a set
+// pgtype.Text, and anything else is a 400. The closed set mirrors the
+// users_judge_runs_on_check CHECK (migration 00424); the tokens come from workersvc so the
+// API and the resolver cannot drift. Like validateHarness it does not trim a blank string
+// to NULL: only JSON null clears.
+func validateJudgeRunsOn(raw *string) (pgtype.Text, error) {
+	if raw == nil {
+		return pgtype.Text{}, nil
+	}
+	switch *raw {
+	case string(workersvc.HarnessClaude), string(workersvc.HarnessCodex):
+		return pgtype.Text{String: *raw, Valid: true}, nil
+	default:
+		return pgtype.Text{}, errors.New("invalid judge_runs_on")
 	}
 }
 

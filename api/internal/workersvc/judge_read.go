@@ -198,6 +198,18 @@ func (s *Service) judgeRunUsageForTarget(ctx context.Context, targetRunID uuid.U
 	}
 }
 
+// JudgeHarnessError wraps a createRunResolved refusal of RerunJudge with the harness the
+// judge was resolved to (PRD #3257), which the target's own harness no longer implies. It
+// unwraps to the original error, so errors.Is(err, ErrNoCredentialForHarness) and the Codex
+// pool matching still hold.
+type JudgeHarnessError struct {
+	Harness Harness
+	Err     error
+}
+
+func (e *JudgeHarnessError) Error() string { return e.Err.Error() }
+func (e *JudgeHarnessError) Unwrap() error { return e.Err }
+
 // RerunJudge enqueues a fresh judge run for a terminal run at the OWNER's explicit
 // request (PRD #46 Decision 8 — the "re-run judge" action). Spend is owner-scoped
 // (audit H3): the judge spends the run owner's Anthropic OR Codex credential, so only
@@ -208,10 +220,11 @@ func (s *Service) judgeRunUsageForTarget(ctx context.Context, targetRunID uuid.U
 // Gates mirror the automatic funnel (maybeEnqueueJudge) except the per-user opt-in: the
 // explicit click on one's own run IS the consent (the opt-in flag gates the automatic
 // path, not a deliberate one-off). Still enforced: eligible terminal status + kind, the
-// global kill-switch, and — PRD #1429 M3, D4 — usability of the TARGET's inherited
-// harness rather than a hardcoded Anthropic check: a Claude target keeps the existing
-// Anthropic-token presence check, a Codex target's usability is the atomic
-// createRunResolved call itself (ErrNoCredentialForHarness, no fallback). The
+// global kill-switch, and — PRD #1429 M3, D4; PRD #3257 — usability of the JUDGE's harness
+// (the owner's "Judge runs on" choice, else the target's; judgeHarnessFor) rather than a
+// hardcoded Anthropic check: a Claude judge keeps the existing Anthropic-token presence
+// check, a Codex judge's usability is the atomic createRunResolved call itself
+// (ErrNoCredentialForHarness, wrapped in JudgeHarnessError, no fallback). The
 // one-active-judge-per-target unique index dedupes a double-click (23505 →
 // ErrJudgeAlreadyActive); a prior review is replaced by the new judge's PostReview UPSERT.
 func (s *Service) RerunJudge(ctx context.Context, userID uuid.UUID, isAdmin bool, targetRunID uuid.UUID) (store.Run, error) {
@@ -238,10 +251,19 @@ func (s *Service) RerunJudge(ctx context.Context, userID uuid.UUID, isAdmin bool
 	if !enabled {
 		return store.Run{}, ErrJudgeDisabled
 	}
-	// PRD #1429 M3 (D4): a Claude target keeps the existing Anthropic-token presence
-	// check (byte-identical to before this repair); a Codex target's usability is
-	// enforced by the atomic create below, not a hardcoded Anthropic check.
-	if Harness(target.Harness) != HarnessCodex {
+	// PRD #3257: the judge's harness is the owner's "Judge runs on" choice, else the target's,
+	// read at the click so a retry after fixing settings or credentials sees the current
+	// state. A failed owner read creates nothing and never falls back to the target's harness.
+	owner, err := s.q.GetUserByID(ctx, target.UserID)
+	if err != nil {
+		return store.Run{}, err
+	}
+	judgeHarness := judgeHarnessFor(owner.JudgeRunsOn, Harness(target.Harness))
+	// PRD #1429 M3 (D4): a Claude judge keeps the existing Anthropic-token presence check
+	// (byte-identical to before this repair), keyed on the RESOLVED judge harness; a Codex
+	// judge's usability is enforced by the atomic create below, not a hardcoded Anthropic
+	// check.
+	if judgeHarness != HarnessCodex {
 		if _, err := s.q.GetUserSecretCiphertext(ctx, store.GetUserSecretCiphertextParams{
 			UserID: target.UserID,
 			Kind:   store.KindAnthropicToken,
@@ -252,11 +274,10 @@ func (s *Service) RerunJudge(ctx context.Context, userID uuid.UUID, isAdmin bool
 			return store.Run{}, err
 		}
 	}
-	// PRD #1429 M3 (D4): routed through the M2 createRunResolved funnel with the TARGET's
-	// harness as an EXPLICIT selection (replacing the M1 HarnessClaude stopgap), so D11
-	// resolution + the INSERT + (for a Codex target) the binding freeze commit atomically.
-	targetHarness := Harness(target.Harness)
-	judge, err := s.createRunResolved(ctx, target.UserID, &targetHarness, func(q Store, resolved resolvedHarness) (store.Run, error) {
+	// PRD #1429 M3 (D4); PRD #3257: routed through the M2 createRunResolved funnel with the
+	// JUDGE's harness as an EXPLICIT selection, so D11 resolution + the INSERT + (for a Codex
+	// judge) the binding freeze commit atomically.
+	judge, err := s.createRunResolved(ctx, target.UserID, &judgeHarness, func(q Store, resolved resolvedHarness) (store.Run, error) {
 		return q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{
 			UserID:           target.UserID,
 			TargetRunID:      pgconv.UUID(target.ID),
@@ -270,6 +291,11 @@ func (s *Service) RerunJudge(ctx context.Context, userID uuid.UUID, isAdmin bool
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 			return store.Run{}, ErrJudgeAlreadyActive
+		}
+		if errors.Is(err, ErrNoCredentialForHarness) {
+			// Name the judge's harness: it may differ from the target's, and the refusal text
+			// must say which credential is missing.
+			return store.Run{}, &JudgeHarnessError{Harness: judgeHarness, Err: err}
 		}
 		return store.Run{}, err
 	}
