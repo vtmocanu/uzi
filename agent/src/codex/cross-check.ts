@@ -28,6 +28,11 @@ type CrossCheckMalformedSubreason = "invalid_json" | "verdict_schema" | "finding
  | "foreign_item" | "delta_after_completion" | "invalid_item_identity" | "stream_cap" | "completion_invalid" | "stream_mismatch" | "invalid_phase" | "structured_output_retries";
 
 export class CrossCheckMalformedError extends Error {
+ finalTextShape?: {
+  final_text_bytes: number;
+  final_text_empty: boolean;
+  final_text_starts_with_code_fence: boolean;
+ };
  constructor(message: string, readonly subreason?: CrossCheckMalformedSubreason) {
   super(message);
  }
@@ -496,6 +501,7 @@ export class CodexCrossCheck {
    const turn = await startupRequest<{ turn?: { id?: string } }>("turn/start", {
     threadId, model, ...(claim.config?.default_effort ? { effort: claim.config.default_effort } : {}),
     input: [{ type: "text", text: prompt }], environments: [],
+    ...(claim.cross_check?.stage === "plan" ? { outputSchema: PLAN_VERDICT_SCHEMA } : {}),
    });
    startingTurn = false;
    const turnId = turn.turn?.id;
@@ -630,7 +636,17 @@ export class CodexCrossCheck {
      }
      if (claim.cross_check?.stage === "code") {
       validateCodeFindings(verdictText);
-     } else validateVerdict(verdictText);
+     } else {
+      try { validateVerdict(verdictText); }
+      catch (error) {
+       if (error instanceof CrossCheckMalformedError) error.finalTextShape = {
+        final_text_bytes: Buffer.byteLength(verdictText, "utf8"),
+        final_text_empty: verdictText.length === 0,
+        final_text_starts_with_code_fence: verdictText.startsWith("```"),
+       };
+       throw error;
+      }
+     }
      await auth.drainInterceptedRequests();
      signal.throwIfAborted();
      if (transport.protocolFailure) throw transport.protocolFailure;
@@ -680,9 +696,9 @@ function hasOutput(usage: CodexThreadTokenUsage): boolean {
 }
 
 /**
- * JSON Schema for the Claude checker's structured plan verdict. It mirrors validateVerdict as a
- * model retry aid only and is never stricter than it: a character maxLength is at most the
- * validator's byte caps, and the per-item and total byte caps stay validator-only.
+ * Shared JSON Schema for Claude and Codex structured plan verdicts. It aids model output;
+ * validateVerdict remains authoritative: character limits do not enforce UTF-8 byte caps,
+ * and the per-item and total serialized byte caps stay validator-only.
  */
 export const PLAN_VERDICT_SCHEMA = {
  type: "object",
