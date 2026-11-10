@@ -212,4 +212,54 @@ assertEqual(JSON.stringify(manual.schedule), JSON.stringify(["* 0-5 1-7 * 6"]), 
 assertEqual(manual.minimumReleaseAgeBehaviour, "timestamp-optional", "git-refs has no release timestamp");
 assert(manual.prBodyNotes.some(note => note.includes("lock")), "worker Go PR must explain lock work");
 
+
+// Inline `module@vX.Y.Z` tool pins: Renovate sees only those with a `# renovate:` (or
+// `# renovate-tarball:`) annotation on the line directly above. Scope matches the generic
+// manager: top-level scripts/*.sh, not scripts/lib/. deadcode sat untracked on
+// v0.48.0 for months while upstream fixed the memory blow-up it hit (#4108). Hermetic
+// fixtures (*.test.sh) are not pins.
+const { readdirSync, existsSync } = await import("node:fs");
+const listed = (dir, keep) => readdirSync(path.join(repoRoot, dir)).filter(keep).map((name) => `${dir}/${name}`);
+const pinFiles = [
+  "Taskfile.yml",
+  ...listed("scripts", (name) => name.endsWith(".sh") && !name.endsWith(".test.sh")),
+  ...listed(".github/workflows", (name) => /\.ya?ml$/.test(name)),
+  ...readdirSync(path.join(repoRoot, "agent/templates")).map((dir) => `agent/templates/${dir}/Dockerfile`)
+    .filter((file) => existsSync(path.join(repoRoot, file))),
+];
+const inlinePin = /[a-z0-9-]+(?:\.[a-z0-9-]+)+\/[A-Za-z0-9._/-]+@v\d+\.\d+\.\d+/;
+for (const file of pinFiles) {
+  const lines = read(file).split("\n");
+  lines.forEach((line, index) => {
+    if (!inlinePin.test(line) || /^\s*#/.test(line)) return;
+    assert(/#\s*renovate(?:-tarball)?:/.test(lines[index - 1] ?? ""),
+      `${file}:${index + 1} pins a tool inline without a renovate annotation above it`);
+  });
+}
+for (const file of pinFiles) {
+  const patterns = genericManager.managerFilePatterns.filter((pattern) => matchesPattern(file, pattern));
+  if (/renovate:\s*datasource=/.test(read(file))) assert(patterns.length > 0, `${file} carries annotations the generic manager does not read`);
+}
+
+const taskfileDeps = extract(genericManager, read("Taskfile.yml"), "Taskfile.yml");
+const deadcodeDeps = taskfileDeps.filter((dep) => dep.depName === "deadcode-taskfile");
+assertEqual(deadcodeDeps.length, 1, "one deadcode pin for both modules");
+assertEqual(deadcodeDeps[0].packageName, "golang.org/x/tools", "deadcode packageName");
+assertEqual(deadcodeDeps[0].datasource, "go", "deadcode datasource");
+assertEqual((read("Taskfile.yml").match(/cmd\/deadcode@\{\{\.DEADCODE_VERSION\}\}/g) ?? []).length, 4, "deadcode uses the one pin");
+const coberturaDeps = taskfileDeps.filter((dep) => dep.depName === "gocover-cobertura-taskfile");
+assertEqual(coberturaDeps.length, 1, "one gocover-cobertura pin");
+assertEqual(coberturaDeps[0].packageName, "github.com/boumenot/gocover-cobertura", "gocover-cobertura packageName");
+
+// The worker images build gitleaks from source; one depName across the Taskfile and both
+// image templates puts every copy in one Renovate PR, so the pins cannot skew.
+const gitleaksDeps = [
+  ...taskfileDeps,
+  ...extract(genericManager, read("agent/templates/base/Dockerfile"), "agent/templates/base/Dockerfile"),
+  ...extract(genericManager, read("agent/templates/jvm/Dockerfile"), "agent/templates/jvm/Dockerfile"),
+].filter((dep) => dep.depName === "gitleaks/gitleaks");
+assertEqual(gitleaksDeps.map((dep) => dep.packageFile).sort().join(","),
+  "Taskfile.yml,agent/templates/base/Dockerfile,agent/templates/jvm/Dockerfile", "gitleaks pin files");
+assertEqual(new Set(gitleaksDeps.map((dep) => dep.currentValue.replace(/^v/, ""))).size, 1, "gitleaks pins must agree");
+
 console.log("Renovate Go-toolchain contract: PASS");

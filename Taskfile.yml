@@ -176,6 +176,14 @@ vars:
   # resolved version. The wrapper carries the per-arch sha256 pins and refuses any other version.
   # renovate: datasource=github-releases depName=oasdiff-taskfile packageName=oasdiff/oasdiff
   OASDIFF_VERSION: v1.34.1
+  # deadcode for both Go modules (deadcode:api / :controller and their :all reports). The four
+  # uses were inline pins Renovate could not see, so they sat on v0.48.0, whose SSA
+  # method-value path took ~19 GB on api's -test run (#4108).
+  # renovate: datasource=go depName=deadcode-taskfile packageName=golang.org/x/tools
+  DEADCODE_VERSION: "v0.52.0"
+  # Coverage XML converter for the api and controller coverage targets.
+  # renovate: datasource=go depName=gocover-cobertura-taskfile packageName=github.com/boumenot/gocover-cobertura
+  GOCOVER_COBERTURA_VERSION: "v1.4.0"
 
 # THE TWO SANCTIONED INCLUDES (rule 3), and they are LOCAL, not remote. Both reuse
 # `./homebrew-tap.yml`, a VENDORED copy of vtmocanu/task's reusable brew mechanic (see its
@@ -2219,6 +2227,9 @@ tasks:
       # On that worker, among the GOMEMLIMIT rows, 12GiB gave most of the observed
       # reduction for the smallest observed time increase.
       # Subsequent CI measurements and the swap mitigation are recorded in #3433 and #3762.
+      # Those rows are deadcode v0.48.0. v0.52.0 (upstream go/ssa MethodValue and rta
+      # allocation fixes) on the same tree in CI: 1:54 wall, 6.56 GB peak RSS, 0 major page
+      # faults, 0 findings, against 61:08, 15.6 GB and 25.6M faults for v0.48.0 (#4108).
       #
       # The value is fixed on purpose: `env GOMEMLIMIT=...` overrides an inherited
       # GOMEMLIMIT, so the limit is identical locally and in CI (GOGC and hardware
@@ -2226,7 +2237,7 @@ tasks:
       # `12GB`) makes `go` itself die with `malformed GOMEMLIMIT`, exit 2, which
       # the gate reports as a load error. The hand-run `--write` command in
       # api/.deadcode-baseline's header does not carry the limit.
-      - env GOMEMLIMIT=12GiB ./scripts/deadcode-gate.sh api golang.org/x/tools/cmd/deadcode@v0.48.0
+      - env GOMEMLIMIT=12GiB ./scripts/deadcode-gate.sh api "golang.org/x/tools/cmd/deadcode@{{.DEADCODE_VERSION}}"
 
   deadcode:api:all:
     desc: api - unreachable funcs WITHOUT -test; reported, never gating, ALWAYS EXITS 0
@@ -2264,7 +2275,7 @@ tasks:
       # and the commit that WROTE the 44 landed after the one that invalidated
       # it. A date cannot separate two commits landed the same afternoon, and
       # both of these were. See PRD #103 Decision 10.
-      - go run golang.org/x/tools/cmd/deadcode@v0.48.0 ./...
+      - go run "golang.org/x/tools/cmd/deadcode@{{.DEADCODE_VERSION}}" ./...
 
   vulncheck:api:
     desc: api - govulncheck over CALLED vulnerabilities. NOT in `gate` -- see `vulncheck`
@@ -2401,7 +2412,7 @@ tasks:
       # documented class-path correction is what turns that into `api/internal/...`.
       # Verified locally only as far as the XML's own shape; the annotation itself
       # needs a pipeline, and is called out as unverified in the MR.
-      - go run github.com/boumenot/gocover-cobertura@v1.4.0 -by-files < coverage.out > coverage.xml
+      - go run "github.com/boumenot/gocover-cobertura@{{.GOCOVER_COBERTURA_VERSION}}" -by-files < coverage.out > coverage.xml
 
   # ------------------------------------------------------ controller (Go) -----
   fmt-check:controller:
@@ -2478,7 +2489,7 @@ tasks:
       #
       # The GOMEMLIMIT in deadcode:api is api-only, per #3433's scope ("for that
       # one command"), so this target keeps its inherited environment.
-      - ./scripts/deadcode-gate.sh controller golang.org/x/tools/cmd/deadcode@v0.48.0
+      - ./scripts/deadcode-gate.sh controller "golang.org/x/tools/cmd/deadcode@{{.DEADCODE_VERSION}}"
 
   deadcode:controller:all:
     desc: controller - unreachable funcs WITHOUT -test; reported, never gating, ALWAYS EXITS 0
@@ -2493,7 +2504,7 @@ tasks:
       # are exported, so `golangci-lint unused` does not report them, and the
       # fourth is called by two of the other three within its own package, so
       # `unused` considers it used. Nothing else in the gate sees them.
-      - go run golang.org/x/tools/cmd/deadcode@v0.48.0 ./...
+      - go run "golang.org/x/tools/cmd/deadcode@{{.DEADCODE_VERSION}}" ./...
 
   vulncheck:controller:
     desc: controller - govulncheck over CALLED vulnerabilities. NOT in `gate` -- see `vulncheck`
@@ -2548,7 +2559,7 @@ tasks:
     dir: controller
     cmds:
       # Same recipe, same reasons, one module over - read coverage-xml:api's comment.
-      - go run github.com/boumenot/gocover-cobertura@v1.4.0 -by-files < coverage.out > coverage.xml
+      - go run "github.com/boumenot/gocover-cobertura@{{.GOCOVER_COBERTURA_VERSION}}" -by-files < coverage.out > coverage.xml
 
   # ------------------------------------------------------------- web (npm) ----
   deps-check:web:
