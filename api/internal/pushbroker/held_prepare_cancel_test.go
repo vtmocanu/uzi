@@ -16,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-git/go-git/v5/plumbing"
+
 	"github.com/vtmocanu/uzi/api/internal/pushbroker"
 )
 
@@ -156,7 +158,7 @@ func heldCISetup(t *testing.T, f *gitFixture) (opts pushbroker.HeldPackOptions, 
 func TestPrepareHeldPackNullCoordinatesRequestsOnlyDefaultBranch(t *testing.T) {
 	trustLoopbackTLS(t)
 	f := newGitFixture(t)
-	opts, mainTip, decoys := heldCISetup(t, f)
+	opts, mainTip, _ := heldCISetup(t, f)
 	for _, ref := range []string{"refs/heads/agent/issue-4140", "refs/uzi-checkpoints/agent/issue-4140"} {
 		if f.originRef(ref) == "" {
 			t.Fatalf("decoy ref %s missing on origin", ref)
@@ -172,24 +174,18 @@ func TestPrepareHeldPackNullCoordinatesRequestsOnlyDefaultBranch(t *testing.T) {
 	if len(wants) != 1 || wants[0] != mainTip {
 		t.Fatalf("upload-pack want lines = %v, want exactly the default branch tip %s", wants, mainTip)
 	}
-	for _, w := range wants {
-		for _, d := range decoys {
-			if w == d {
-				t.Fatalf("decoy tip %s was requested", d)
-			}
-		}
-	}
 }
 
 // causeKept reports whether the context cause is visible to errors.Is at a stage. LIMITATION
 // (go-git as pinned): at the "list" stage (info/refs) the transport error wraps the context
 // error, so errors.Is works. At the "post" stage (the git-upload-pack POST inside fetch) go-git
-// rewraps the client error as "unexpected client error: %s" with the message only, so
-// errors.Is(err, context.Canceled) and errors.Is(err, context.DeadlineExceeded) are BOTH false
-// and only the error text ("context canceled" / "context deadline exceeded") identifies the
-// cause. Anything classifying a PrepareHeldPack error by errors.Is therefore misses the post
-// stage; the hosted "pack pre-verify failed ... context canceled" text is consistent with
-// either stage.
+// wraps the client error in a *plumbing.UnexpectedError, which holds the original error in its Err
+// field but has no Unwrap method, so errors.Is(err, context.Canceled) and
+// errors.Is(err, context.DeadlineExceeded) are BOTH false on the returned error. The cause is
+// still recoverable via errors.As to *plumbing.UnexpectedError and errors.Is on its Err, and by
+// the error text. Anything classifying a PrepareHeldPack error by errors.Is alone therefore
+// misses the post stage; the hosted "pack pre-verify failed ... context canceled" text is
+// consistent with either stage.
 var causeKept = map[string]bool{"list": true, "post": false}
 
 // assertCause checks the cause at a stage: through errors.Is where go-git keeps it, and by
@@ -208,6 +204,15 @@ func assertCause(t *testing.T, stage string, err error, want error, wantText str
 	}
 	if !strings.Contains(err.Error(), wantText) {
 		t.Fatalf("stage %s error text lacks %q: %v", stage, wantText, err)
+	}
+	if stage == "post" {
+		var ue *plumbing.UnexpectedError
+		if !errors.As(err, &ue) {
+			t.Fatalf("stage post error is not a *plumbing.UnexpectedError: %T %v", err, err)
+		}
+		if !errors.Is(ue.Err, want) || errors.Is(ue.Err, other) {
+			t.Fatalf("UnexpectedError.Err = %v, want cause %v and not %v", ue.Err, want, other)
+		}
 	}
 }
 
