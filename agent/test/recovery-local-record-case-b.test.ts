@@ -460,6 +460,37 @@ test("an absent run-wide open-hold count is unknown, never zero: Case B refuses 
   assert.equal(await fresh.classification(), "holds_unknown");
 });
 
+test("a malformed run-wide open-hold count is unknown on every Case B track; a well-formed one is read exactly", async () => {
+  const malformed: Array<[string, (runId: string) => unknown]> = [
+    ["mismatched run_id", () => ({ run_id: id(55), count: 0 })],
+    ["missing run_id", () => ({ count: 0 })],
+    ["count 0.5", runId => ({ run_id: runId, count: 0.5 })],
+    ["count \"0\"", runId => ({ run_id: runId, count: "0" })],
+    ["count NaN", runId => ({ run_id: runId, count: Number.NaN })],
+    ["count -1", runId => ({ run_id: runId, count: -1 })],
+    ["null", () => null],
+  ];
+  for (const track of TRACKS) {
+    for (const [name, make] of malformed) {
+      const w = await world(track);
+      const digest = await w.digest();
+      w.client.listRecoveryHolds = async () => ({ run_id: w.runId, holds: [], run_open_holds: make(w.runId) as never });
+      const view = await w.view();
+      assert.equal(view?.classification, "holds_unknown", `${track}: ${name}`);
+      assert.equal(view?.digest, undefined, `${track}: ${name}: no digest`);
+      const before = await w.state();
+      assert.deepEqual(await w.resolve(digest), { kind: "refused", reason: "holds_unknown" }, `${track}: ${name}`);
+      await w.assertUntouched(before);
+    }
+    const zero = await world(track);
+    zero.client.listRecoveryHolds = async () => ({ run_id: zero.runId, holds: [], run_open_holds: { run_id: zero.runId, count: 0 } });
+    assert.equal(await zero.classification(), "case_b_owner_discard", track + ": count 0");
+    const two = await world(track);
+    two.client.listRecoveryHolds = async () => ({ run_id: two.runId, holds: [], run_open_holds: { run_id: two.runId, count: 2 } });
+    assert.equal(await two.classification(), "run_hold_open", track + ": count 2");
+  }
+});
+
 test("a discarded merged-predecessor policy outcome is retained even when confirmed, and unknown discard evidence is not Case B", async () => {
   for (const final_receipt of [undefined, { kind: "settled", coverage_digest: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" }] as const) {
     const w = await world();
