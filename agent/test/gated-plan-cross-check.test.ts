@@ -15,7 +15,7 @@ import type { ExecutorFactory } from "../src/runner.js";
 import { LimitReachedError } from "../src/limit.js";
 import { CI_CONFIG_MARKER } from "../src/prompt.js";
 import type { ClaimResponse, StateRequest } from "../src/protocol.js";
-import type { PlanVerdict } from "../src/steering.js";
+import { SteeringChannel, type PlanVerdict } from "../src/steering.js";
 import type { PlanCrossCheckStateRequest } from "../src/client.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runner, runnerWith } from "./runner-harness.js";
 import { feed, freshClaim, gates, newApi, row, send, until } from "./gate-revision-harness.js";
@@ -326,6 +326,68 @@ describe("gated plan cross-check: human gate settlement", () => {
     assert.equal(gates(c.run_id).length, 1, "the gate was not re-presented");
     assert.equal(planMessages(c.run_id).length, 1, "the plan was not re-emitted");
   });
+
+  // Issue #3854: a re-entry while the first presentation's ACK is still in flight joins that
+  // presentation and its wait. The ACK is held server-side after the report is persisted, so the
+  // re-entry deterministically lands inside the window; no sleep decides the ordering.
+  for (const path of ["gated_pass", "forced block"] as const) {
+    it(`a re-entry during an unacknowledged presentation joins it (${path})`, { skip: LINUX_CAPTURE }, async () => {
+      const c = gatedClaim();
+      if (path === "gated_pass") checkerSays("approve");
+      else checkerSays("block", "block");
+      let releaseAck!: () => void;
+      const held = new Promise<void>((r) => { releaseAck = r; });
+      api.afterPersistState(c.run_id, (b) => b.status === "awaiting_approval", held);
+      let persisted!: () => void;
+      const presented = new Promise<void>((r) => { persisted = r; });
+      api.onState(c.run_id, (b) => { if (b.status === "awaiting_approval") persisted(); });
+      let bumps = 0;
+      let releases = 0;
+      const bump = SteeringChannel.prototype.bumpEpoch;
+      SteeringChannel.prototype.bumpEpoch = function (this: SteeringChannel) { bumps++; return bump.call(this); };
+      const reserve = MessageBatcher.prototype.reserveCandidateTransport;
+      MessageBatcher.prototype.reserveCandidateTransport = function (this: MessageBatcher) {
+        const reservation = reserve.call(this);
+        const release = reservation.releaseAppliedGate.bind(reservation);
+        reservation.releaseAppliedGate = (ack) => { releases++; return release(ack); };
+        return reservation;
+      };
+      let otherwise = 0;
+      const verdicts: PlanVerdict[] = [];
+      const exec: Executor = { run: async (ctx) => {
+        const first = ctx.gatePlan!(PLAN);
+        await presented;
+        const reentry = ctx.continueExistingPlanGate!(async () => { otherwise++; return { kind: "reject", reason: "re-planned" } as PlanVerdict; });
+        releaseAck();
+        send(c.run_id, row("approve_plan"));
+        verdicts.push(...await Promise.all([first, reentry]));
+        return { branch: ctx.branch };
+      } };
+      try {
+        await start(exec, c);
+      } finally {
+        SteeringChannel.prototype.bumpEpoch = bump;
+        MessageBatcher.prototype.reserveCandidateTransport = reserve;
+      }
+      assert.equal(gates(c.run_id).length, 1, "one presentation, not a second report");
+      assert.equal(bumps, 0, "the first gate keeps epoch 0");
+      assert.equal(releases, 1, "the applied gate released its reservation once");
+      assert.equal(otherwise, 0, "the fallback planner was not used");
+      assert.equal(api.crossCheckRequests.length, 1, "nothing re-submitted");
+      assert.equal(planMessages(c.run_id).length, 1, "the plan was not re-emitted");
+      assert.deepEqual(verdicts.map((v) => v.kind), ["approve", "approve"], "both callers settle on the one verdict");
+      const [gate] = gates(c.run_id);
+      if (path === "gated_pass") {
+        assert.equal(gate!.candidate_digest, digest);
+        for (const v of verdicts) assert.equal((v as { canonical?: { plan?: string } }).canonical?.plan, NORMALIZED);
+      } else {
+        assert.equal(gate!.plan_md, PLAN, "the forced gate presents the lead's own plan");
+        assert.equal(Object.hasOwn(gate!, "candidate_digest"), false);
+        assert.equal(gateReason(gate!), "block");
+        for (const v of verdicts) assert.equal((v as { canonical?: unknown }).canonical, undefined);
+      }
+    });
+  }
 });
 
 describe("gated plan cross-check: semantic candidate", () => {

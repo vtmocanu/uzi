@@ -30,8 +30,6 @@ concurrency:
 jobs:
   deadcode-api:
     runs-on: ubuntu-latest
-    outputs:
-      deadcode: ${{ steps.deadcode.outcome }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
@@ -153,12 +151,14 @@ jobs:
 
   # One open tracking issue: comment on it, else open it. Neutral wording: `task`
   # exits non-zero for findings and for load/tool errors alike. Never auto-closed;
-  # a person closes it after verifying the fix.
+  # a person closes it after verifying the fix. Keyed on the JOB result, not the
+  # deadcode step's outcome: a failed setup step skips that step, so its outcome
+  # would read `skipped` and a red nightly would file nothing.
   report:
     needs: deadcode-api
     if: >-
       always() && github.ref == 'refs/heads/main' &&
-      needs.deadcode-api.outputs.deadcode == 'failure'
+      needs.deadcode-api.result == 'failure'
     runs-on: ubuntu-latest
     permissions:
       issues: write
@@ -184,7 +184,7 @@ jobs:
               --title "Nightly API deadcode check failed" \
               --label "$LABEL" \
               --body "$(printf '%s\n\n%s\n%s\n' \
-                'The nightly `task deadcode:api` run failed on main: either an unreachable function (delete it, see the run log) or a load/tool error. Close this after verifying the fix.' \
+                'The nightly `task deadcode:api` run failed on main: an unreachable function (delete it, see the run log), a load/tool error, or a failed setup step. Close this after verifying the fix.' \
                 "First failing run: ${RUN_URL}" \
                 "Commit: ${GITHUB_SHA}")"
           fi

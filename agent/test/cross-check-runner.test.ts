@@ -441,7 +441,7 @@ class SentinelXyzError extends Error {}
 class DiagnosticSyntaxError extends SyntaxError {}
 
 const diagnosticRunnerModes = [
- "typed explicit", "typed structured retries", "typed unannotated", "plain JSON error", "returned invalid JSON",
+ "typed explicit", "typed structured retries", "typed unannotated", "plain JSON error", "returned invalid JSON", "returned invalid keys",
  "exact SyntaxError", "exact TypeError", "exact RangeError", "exact Error",
  "custom alphabetic class", "built-in subclass", "name spoof", "constructor-name spoof",
 ] as const;
@@ -509,6 +509,7 @@ for (const stage of ["plan", "code"] as const) {
        Object.defineProperty(error, "constructor", { value: { name: "SyntaxError" } });
        throw error;
       }
+      if (mode === "returned invalid keys") return JSON.stringify({ verdict: "approve", summary: sentinel, items: [], extra: true });
       return "{invalid JSON " + sentinel;
      } },
     }).execute(c);
@@ -527,11 +528,11 @@ for (const stage of ["plan", "code"] as const) {
      assert.equal(serialized.includes(forbidden), false, "diagnostics must not expose " + forbidden);
     }
     const typed = mode === "typed explicit" || mode === "typed structured retries" || mode === "typed unannotated";
-    const codeFindings = mode === "returned invalid JSON" && stage === "code";
+    const codeFindings = (mode === "returned invalid JSON" || mode === "returned invalid keys") && stage === "code";
     const errorName = mode === "exact SyntaxError" || (mode === "returned invalid JSON" && stage === "plan") ? "SyntaxError"
      : mode === "exact TypeError" ? "TypeError"
      : mode === "exact RangeError" ? "RangeError"
-     : mode === "exact Error" || mode === "plain JSON error" ? "Error" : "unknown";
+     : mode === "exact Error" || mode === "plain JSON error" || mode === "returned invalid keys" ? "Error" : "unknown";
     const warnings = recorded.lines.filter((line) => (line as { level?: string }).level === "warn");
     assert.deepEqual(warnings, [{
      level: "warn", msg: "cross-check verdict malformed", run_id: "check", stage,
@@ -542,6 +543,59 @@ for (const stage of ["plan", "code"] as const) {
    } finally { await fs.rm(root, { recursive: true, force: true }); }
   });
  }
+}
+
+for (const family of ["codex", "claude"] as const) {
+ it("M2 actual checker error reaches runner warning with only Codex Plan shape: " + family, async () => {
+  const root = await fs.mkdtemp(path.join(path.resolve(import.meta.dirname, "../../.uzi/scratch"), "plan-shape-runner-"));
+  const recorded = recordingLogger();
+  const sentinel = "SENTINEL-final-shape-4103";
+  const text = "```json\n" + JSON.stringify({ verdict: "approve", summary: sentinel, items: [] }) + "\n```";
+  const r = rig({ notes: emit => r.terminal(emit, text) });
+  const states: unknown[] = [];
+  const decisions: unknown[] = [];
+  const messages: unknown[] = [];
+  let calls = 0;
+  let original: CrossCheckMalformedError | undefined;
+  const c = { ...claim(), claim_generation: 7 };
+  if (family === "claude") c.secrets = { forge_pat: "", anthropic_oauth_token: "synthetic-key" };
+  const client = {
+   reportState: async (_id: string, body: unknown) => { states.push(body); return { applied: true }; },
+   getInputs: async () => ({ inputs: [] }),
+   postMessages: async (_id: string, batch: unknown[]) => { messages.push(...batch); },
+   reportCrossCheckVerdict: async (_id: string, _generation: number, body: unknown) => { decisions.push(body); },
+  } as unknown as WorkerClient;
+  const git = { ensureClone: async () => "/bare", runnerCloneAtCommit: async () => "/checkout", removeRunnerClone: async () => {} } as unknown as GitCache;
+  try {
+   await new CrossCheckRunner(client, git, recorded.logger, { homeRoot: root, pollMs: 1, modelTimeoutMs: 1000,
+    [family === "codex" ? "model" : "claudeModel"]: { run: async (_claim: ClaimResponse, _checkout: string, _home: string, signal: AbortSignal) => {
+     calls++;
+     try { return await r.run(signal); }
+     catch (error) {
+      assert.ok(error instanceof CrossCheckMalformedError);
+      original = error;
+      // Inject an unrelated metadata key to prove the warning projects explicitly.
+      Object.assign(error.finalTextShape!, { unrelated: sentinel });
+      throw error;
+     }
+    } },
+   }).execute(c);
+   assert.equal(calls, 1);
+   assert.ok(original instanceof CrossCheckMalformedError);
+   assert.equal(original.message, "cross-check invalid verdict JSON");
+   assert.equal(original.subreason, "invalid_json");
+   assert.deepEqual(recorded.lines.filter((line: any) => line.level === "warn"), [{
+    level: "warn", msg: "cross-check verdict malformed", run_id: "check", stage: "plan", subreason: "invalid_json",
+    ...(family === "codex" ? { final_text_bytes: Buffer.byteLength(text, "utf8"),
+     final_text_empty: false, final_text_starts_with_code_fence: true } : {}),
+   }]);
+   assert.deepEqual(decisions, [{ verdict: "failed", reason_class: "malformed", summary: "The cross-check did not complete.", items: [] }]);
+   assert.deepEqual(states, [{ status: "running", claim_generation: 7 },
+    { status: "failed", failure_reason: "The cross-check did not complete.", claim_generation: 7 }]);
+   assert.equal(JSON.stringify({ logs: recorded.lines, messages, decisions, states }).includes(sentinel), false);
+   assert.equal(r.requests.filter(frame => frame.method === "turn/start").length, 1);
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+ });
 }
 
 it("exact-commit clone stays on immutable base after default and tracking refs advance", async () => {

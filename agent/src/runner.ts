@@ -28678,7 +28678,7 @@ export class RunRunner {
     let confirmed = false;
     let appliedAck: StateAck | undefined;
     let epoch: number;
-    const publishAndWait = async (): Promise<PlanVerdict> => {
+    const presentAndWait = async (): Promise<PlanVerdict> => {
     if (!confirmed) {
     let ack: StateAck;
     try { ack = appliedAck ?? await (revisionRecovery ? revisionRecovery.publish(request, reportState) : reportState(request)); }
@@ -28825,6 +28825,13 @@ export class RunRunner {
       gateWaitAbort.abort(new Error("gate wait settled"));
     }
     };
+    // Issue #3854: single-flight. A re-entry (continueWait) while this gate is still presenting or
+    // waiting joins that operation, so one report, ACK, onApplied, epoch decision, waiter, timer and
+    // settle serve every caller. Cleared on settle: a re-entry after a rejection starts afresh and
+    // takes the retained appliedAck/confirmed (or re-sends the same body and presentation id).
+    let inflight: Promise<PlanVerdict> | undefined;
+    const publishAndWait = (): Promise<PlanVerdict> =>
+      inflight ??= presentAndWait().finally(() => { inflight = undefined; });
     if (associated) associated.continueWait = publishAndWait;
     return publishAndWait();
   }
