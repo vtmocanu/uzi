@@ -469,7 +469,7 @@ if (mode !== "remove" && mode !== "empty") process.exit(6);
 if (oneFs !== "" && oneFs !== "1") process.exit(6);
 const strict = oneFs === "1";
 const maxDepth = strict ? Number(maxDepthArg) : Infinity;
-if (strict && (mode !== "remove" || rel.includes("/") || !/^\\d+:\\d+$/.test(expect) || !/^\\d+:\\d+$/.test(rootExpect) ||
+if (strict && (mode !== "remove" || rel.includes("/") || rel === "." || rel === ".." || !/^\\d+:\\d+$/.test(expect) || !/^\\d+:\\d+$/.test(rootExpect) ||
     !(Number.isInteger(maxDepth) && maxDepth >= 0))) process.exit(6);
 let rootDev;
 let changed = false;

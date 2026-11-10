@@ -124,6 +124,18 @@ describe("strict scratch delete script", { skip: fs.existsSync("/proc/self/fd") 
     } finally { await cleanup(dir); }
   });
 
+  it("the entry cap keeps the leaf and exits 8", async () => {
+    const { dir, root, leaf } = await fixtureTree();
+    try {
+      const args = strictArgs(root, "leaf");
+      args[2] = "2";
+      const out = await runHelper(args);
+      assert.equal(out.code, 8);
+      assert.equal(out.stdout, "");
+      assert.equal(await exists(leaf), true);
+    } finally { await cleanup(dir); }
+  });
+
   it("refuses bad strict arguments with exit 6", async () => {
     const { dir, root } = await fixtureTree();
     try {
@@ -134,6 +146,9 @@ describe("strict scratch delete script", { skip: fs.existsSync("/proc/self/fd") 
         strictArgs(root, "leaf", { expect: "-" }),
         strictArgs(root, "leaf", { rootExpect: "" }),
         strictArgs(root, "leaf/sub"),
+        // "." and ".." are refused by the script itself, not only by its caller's validator.
+        strictArgs(root, ".", { expect: devIno(root) }),
+        strictArgs(root, "..", { expect: devIno(path.dirname(root)) }),
       ]) assert.equal((await runHelper(args)).code, 6, args.join(" "));
       assert.equal(await exists(path.join(root, "leaf", "a.txt")), true);
     } finally { await cleanup(dir); }
@@ -393,6 +408,8 @@ describe("GitCache.discardEpochScratchLeaf", () => {
       ["name ..", () => { const a = build({ 3: ".." }); internal.validateEpochScratchLaunch(a.command, a.args, env, "/", "command", root); }],
       ["name with slash", () => { const a = build({ 3: "a/b" }); internal.validateEpochScratchLaunch(a.command, a.args, env, "/", "command", root); }],
       ["dot name", () => { const a = build({ 3: ".hidden" }); internal.validateEpochScratchLaunch(a.command, a.args, env, "/", "command", root); }],
+      ...["uzi-worker", "uzi-runner", "uzi-quiesce-abc"].map((n): [string, () => void] => [`protected ${n}`,
+        () => { const a = build({ 3: n }); internal.validateEpochScratchLaunch(a.command, a.args, env, "/", "command", root); }]),
       ["other root", () => { const a = build({ 2: "/data/runner" }); internal.validateEpochScratchLaunch(a.command, a.args, env, "/", "command", root); }],
       ["max entries", () => { const a = build({ 4: "1" }); internal.validateEpochScratchLaunch(a.command, a.args, env, "/", "command", root); }],
       ["mode empty", () => { const a = build({ 6: "empty" }); internal.validateEpochScratchLaunch(a.command, a.args, env, "/", "command", root); }],
@@ -509,6 +526,32 @@ describe("GitCache.discardEpochScratchLeaf", () => {
       assert.equal(x.internal.unsettledDeletes.get(x.key), 1);
     });
   }
+
+  it("a receipt from a child the core reports as failed is never a receipt: unresolved", async () => {
+    const x = discardFixture({}, () => censusText("leaf-1", "absent"));
+    const child = fakeChildDeps(x.internal, { outcome: { stdout: `UZI-SCRATCH-REMOVED ${EXPECT}\n`, code: 0 } });
+    // The receipt and exit 0 are already collected when a late child error marks the launch failed.
+    child.stdout.once("end", () => child.emit("error", new Error("late child error")));
+    await assert.rejects(x.git.discardEpochScratchLeaf(x.input),
+      (error: Error & { epochScratchUnresolved?: boolean }) => error.epochScratchUnresolved === true);
+    assert.equal(x.f.stopped(), true);
+    assert.equal(x.f.pending(), 1);
+    assert.equal(x.internal.unsettledDeletes.get(x.key), 1);
+  });
+
+  it("a settled outcome removes the unsettledDeletes entry before it settles the ticket", async () => {
+    const x = discardFixture();
+    const begin = x.f.scope.beginMutation.bind(x.f.scope);
+    let entryAtSettle: number | undefined = -1;
+    x.f.scope.beginMutation = () => {
+      const ticket = begin();
+      return { settle() { entryAtSettle = x.internal.unsettledDeletes.get(x.key); ticket.settle(); } };
+    };
+    fakeChildDeps(x.internal, { outcome: { stdout: `UZI-SCRATCH-REMOVED ${EXPECT}\n`, code: 0 } });
+    assert.equal((await x.git.discardEpochScratchLeaf(x.input)).outcome, "removed");
+    assert.equal(entryAtSettle, undefined, "entry already removed when the ticket settles");
+    assert.equal(x.f.pending(), 0);
+  });
 
   it("an unconfirmed join is unresolved without a census: scope stopped, entry and ticket pending", async () => {
     const x = discardFixture();
