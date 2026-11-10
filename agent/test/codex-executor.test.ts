@@ -30195,6 +30195,10 @@ describe("compact policy hold: fake-provider continuation matrix (production run
         const store = path.join(r.runHome, "codex-session-store", "sessions");
         await fs.mkdir(store, { recursive: true });
         await fs.writeFile(path.join(store, "session.jsonl"), "disposable terminal transcript\n");
+        // Backdate the stranded HOME: Date.now() is whole milliseconds while mtimeMs is finer, so a
+        // just-written HOME can read a negative age and be skipped as too recent even at minAgeMs 0.
+        const stranded = new Date(Date.now() - 60_000);
+        await fs.utimes(r.runHome, stranded, stranded);
         if (cleanup === "periodic") {
           // The existing lifecycle fixture supplies removal off Linux, where /proc/self/fd is
           // unavailable. Linux CI uses the real descriptor-pinned removal unchanged.
